@@ -1,0 +1,3 @@
+(library
+ (name camlcoin)
+ (public_name camlcoin))

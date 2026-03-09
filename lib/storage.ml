@@ -198,7 +198,7 @@ module ChainDB = struct
       Cstruct.to_string (Serialize.writer_to_cstruct w) in
     FileStorage.delete t.db key
 
-  (* Chain state - tip hash and height *)
+  (* Chain state - tip hash and height (validated blocks) *)
   let set_chain_tip t (hash : Types.hash256) (height : int) =
     FileStorage.put t.db
       (prefix_chain_state ^ "tip_hash") (Cstruct.to_string hash);
@@ -208,6 +208,23 @@ module ChainDB = struct
   let get_chain_tip t : (Types.hash256 * int) option =
     match FileStorage.get t.db (prefix_chain_state ^ "tip_hash"),
           FileStorage.get t.db (prefix_chain_state ^ "tip_height") with
+    | Some hash_str, Some height_str ->
+      let hash = Cstruct.of_string hash_str in
+      let height = decode_height height_str in
+      Some (hash, height)
+    | _ -> None
+
+  (* Header tip - separate from chain tip (headers can be ahead of validated blocks) *)
+  (* IMPORTANT: header_tip tracks downloaded headers, chain_tip tracks validated blocks *)
+  let set_header_tip t (hash : Types.hash256) (height : int) =
+    FileStorage.put t.db
+      (prefix_chain_state ^ "header_tip_hash") (Cstruct.to_string hash);
+    FileStorage.put t.db
+      (prefix_chain_state ^ "header_tip_height") (encode_height height)
+
+  let get_header_tip t : (Types.hash256 * int) option =
+    match FileStorage.get t.db (prefix_chain_state ^ "header_tip_hash"),
+          FileStorage.get t.db (prefix_chain_state ^ "header_tip_height") with
     | Some hash_str, Some height_str ->
       let hash = Cstruct.of_string hash_str in
       let height = decode_height height_str in
@@ -264,6 +281,12 @@ module ChainDB = struct
       (prefix_chain_state ^ "tip_hash") (Cstruct.to_string hash);
     FileStorage.batch_put batch
       (prefix_chain_state ^ "tip_height") (encode_height height)
+
+  let batch_set_header_tip batch (hash : Types.hash256) (height : int) =
+    FileStorage.batch_put batch
+      (prefix_chain_state ^ "header_tip_hash") (Cstruct.to_string hash);
+    FileStorage.batch_put batch
+      (prefix_chain_state ^ "header_tip_height") (encode_height height)
 
   let batch_write t batch = FileStorage.batch_write t.db batch
 

@@ -26,6 +26,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Peer manager and discovery (DNS seeds, connection pool, addr relay)
 - [x] Header synchronization (BIP-130, block locators, proof-of-work tracking)
 - [x] Block synchronization (IBD, parallel downloads, chain reorganization)
+- [x] UTXO set with cache (block connect/disconnect, undo data, maturity)
 - [ ] Mempool
 - [ ] JSON-RPC interface
 - [ ] Wallet functionality
@@ -54,6 +55,7 @@ camlcoin/
     consensus.ml      consensus parameters
     validation.ml     block/tx validation
     storage.ml        block/utxo storage
+    utxo.ml           UTXO set and chain state
     p2p.ml            network protocol
     peer.ml           peer connections
     peer_manager.ml   connection pool and discovery

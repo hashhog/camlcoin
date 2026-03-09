@@ -17,3 +17,4 @@ module Mining = Mining
 module Rpc = Rpc
 module Wallet = Wallet
 module Cli = Cli
+module Perf = Perf

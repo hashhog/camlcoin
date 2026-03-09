@@ -18,6 +18,11 @@ let test_hash256_display_reverse () =
 
 let test_zero_hash () =
   let zero = Types.zero_hash in
+  Alcotest.(check int) "length" 32 (Cstruct.length zero);
+  (* Check all bytes are zero *)
+  for i = 0 to 31 do
+    Alcotest.(check int) "zero byte" 0 (Cstruct.get_uint8 zero i)
+  done;
   let hex = Types.hash256_to_hex zero in
   let expected = "0000000000000000000000000000000000000000000000000000000000000000" in
   Alcotest.(check string) "zero hash" expected hex

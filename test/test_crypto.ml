@@ -198,10 +198,49 @@ let merkle_tests = [
   Alcotest.test_case "merkle four" `Quick test_merkle_root_four;
 ]
 
+(* Genesis block hash tests *)
+let test_mainnet_genesis_hash () =
+  let header = Consensus.mainnet_genesis_header in
+  let hash = Crypto.compute_block_hash header in
+  let display = Types.hash256_to_hex_display hash in
+  Alcotest.(check string) "mainnet genesis hash"
+    "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+    display
+
+let test_regtest_genesis_hash () =
+  let header = Consensus.regtest.genesis_header in
+  let hash = Crypto.compute_block_hash header in
+  let display = Types.hash256_to_hex_display hash in
+  Alcotest.(check string) "regtest genesis hash"
+    "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
+    display
+
+let genesis_tests = [
+  Alcotest.test_case "mainnet genesis hash" `Quick test_mainnet_genesis_hash;
+  Alcotest.test_case "regtest genesis hash" `Quick test_regtest_genesis_hash;
+]
+
+(* QCheck property-based tests *)
+let qcheck_sign_verify_roundtrip =
+  QCheck.Test.make ~count:20 ~name:"sign_verify roundtrip"
+    QCheck.string
+    (fun msg ->
+      let privkey = Crypto.generate_private_key () in
+      let pubkey = Crypto.derive_public_key privkey in
+      let msg_hash = Crypto.sha256d (Cstruct.of_string msg) in
+      let signature = Crypto.sign privkey msg_hash in
+      Crypto.verify pubkey msg_hash signature)
+
+let qcheck_tests = [
+  QCheck_alcotest.to_alcotest qcheck_sign_verify_roundtrip;
+]
+
 let () = Alcotest.run "test_crypto" [
   ("sha256", sha256_tests);
   ("hash160", hash160_tests);
   ("keygen", keygen_tests);
   ("signing", signing_tests);
   ("merkle", merkle_tests);
+  ("genesis", genesis_tests);
+  ("property", qcheck_tests);
 ]

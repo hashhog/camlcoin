@@ -367,3 +367,216 @@ let compute_stats (utxo : UtxoSet.t) : utxo_stats =
     cache_misses;
     cache_size = UtxoSet.cache_size utxo;
   }
+
+(* ============================================================================
+   Optimized UTXO Set with LRU Cache
+   ============================================================================
+
+   Enhanced UTXO set implementation that uses an LRU cache for frequently
+   accessed UTXOs. The default cache size of 500,000 entries covers the
+   typical UTXO working set during normal operation.
+
+   During IBD, the most recently created UTXOs are the most likely to be
+   spent, so an LRU eviction policy is ideal. *)
+
+module OptimizedUtxoSet = struct
+  type t = {
+    db : Storage.ChainDB.t;
+    cache : (string, utxo_entry) Perf.LRU.t;
+    mutable stats : Perf.utxo_cache_stats;
+  }
+
+  let create ?(cache_size=500_000) db = {
+    db;
+    cache = Perf.LRU.create cache_size;
+    stats = Perf.create_utxo_stats ();
+  }
+
+  (* Create a cache key from txid and output index *)
+  let utxo_key (txid : Types.hash256) (vout : int) : string =
+    let w = Serialize.writer_create () in
+    Serialize.write_bytes w txid;
+    Serialize.write_int32_le w (Int32.of_int vout);
+    Cstruct.to_string (Serialize.writer_to_cstruct w)
+
+  (* Get a UTXO entry, checking LRU cache first then database *)
+  let get (t : t) (txid : Types.hash256) (vout : int)
+      : utxo_entry option =
+    let key = utxo_key txid vout in
+    t.stats.lookups <- t.stats.lookups + 1;
+    match Perf.LRU.get t.cache key with
+    | Some entry ->
+      t.stats.cache_hits <- t.stats.cache_hits + 1;
+      Some entry
+    | None ->
+      match Storage.ChainDB.get_utxo t.db txid vout with
+      | None ->
+        t.stats.misses <- t.stats.misses + 1;
+        None
+      | Some data ->
+        t.stats.db_hits <- t.stats.db_hits + 1;
+        let r = Serialize.reader_of_cstruct
+          (Cstruct.of_string data) in
+        let entry = deserialize_utxo_entry r in
+        Perf.LRU.put t.cache key entry;
+        Some entry
+
+  (* Add a UTXO entry to both cache and database *)
+  let add (t : t) (txid : Types.hash256) (vout : int)
+      (entry : utxo_entry) : unit =
+    let key = utxo_key txid vout in
+    Perf.LRU.put t.cache key entry;
+    let w = Serialize.writer_create () in
+    serialize_utxo_entry w entry;
+    Storage.ChainDB.store_utxo t.db txid vout
+      (Cstruct.to_string (Serialize.writer_to_cstruct w))
+
+  (* Remove a UTXO entry, returning the removed entry if it existed *)
+  let remove (t : t) (txid : Types.hash256) (vout : int)
+      : utxo_entry option =
+    let key = utxo_key txid vout in
+    let existing = Perf.LRU.get t.cache key in
+    Perf.LRU.remove t.cache key;
+    Storage.ChainDB.delete_utxo t.db txid vout;
+    match existing with
+    | Some _ -> existing
+    | None ->
+      (* Was in DB but not cache - need to deserialize *)
+      match Storage.ChainDB.get_utxo t.db txid vout with
+      | None -> None
+      | Some data ->
+        let r = Serialize.reader_of_cstruct
+          (Cstruct.of_string data) in
+        Some (deserialize_utxo_entry r)
+
+  (* Check if a UTXO exists *)
+  let exists (t : t) (txid : Types.hash256) (vout : int) : bool =
+    let key = utxo_key txid vout in
+    if Perf.LRU.mem t.cache key then true
+    else Option.is_some (Storage.ChainDB.get_utxo t.db txid vout)
+
+  (* Get cache hit rate *)
+  let hit_rate t =
+    Perf.utxo_hit_rate t.stats
+
+  (* Get cache statistics *)
+  let get_stats t = t.stats
+
+  (* Get cache size *)
+  let cache_size t = Perf.LRU.size t.cache
+
+  (* Clear the in-memory cache (DB unchanged) *)
+  let clear_cache t =
+    Perf.LRU.clear t.cache;
+    t.stats <- Perf.create_utxo_stats ()
+end
+
+(* ============================================================================
+   Batch Block Connection for IBD
+   ============================================================================
+
+   Process multiple blocks in sequence with reduced overhead.
+   Returns the number of blocks successfully connected or an error. *)
+
+let connect_block_optimized (utxo : OptimizedUtxoSet.t) (block : Types.block)
+    (height : int)
+    : (undo_data, string) result =
+  let spent = ref [] in
+  let error = ref None in
+  let total_fees = ref 0L in
+
+  (* Process each transaction *)
+  List.iteri (fun tx_idx tx ->
+    if !error = None then begin
+      let txid = Crypto.compute_txid tx in
+      let is_coinbase = tx_idx = 0 in
+
+      if not is_coinbase then begin
+        (* Consume inputs *)
+        let input_sum = ref 0L in
+        List.iter (fun inp ->
+          if !error = None then begin
+            let prev = inp.Types.previous_output in
+            match OptimizedUtxoSet.get utxo prev.txid
+                    (Int32.to_int prev.vout) with
+            | None ->
+              error := Some (Printf.sprintf
+                "Missing UTXO: %s:%ld"
+                (Types.hash256_to_hex_display prev.txid)
+                prev.vout)
+            | Some entry ->
+              (* Check coinbase maturity (100 blocks) *)
+              if entry.is_coinbase &&
+                 height - entry.height < Consensus.coinbase_maturity then
+                error := Some "Immature coinbase spend"
+              else begin
+                spent := (prev, entry) :: !spent;
+                input_sum := Int64.add !input_sum entry.value;
+                ignore (OptimizedUtxoSet.remove utxo prev.txid
+                  (Int32.to_int prev.vout))
+              end
+          end
+        ) tx.inputs;
+
+        (* Compute fee *)
+        if !error = None then begin
+          let output_sum = List.fold_left
+            (fun acc out -> Int64.add acc out.Types.value)
+            0L tx.outputs in
+          if output_sum > !input_sum then
+            error := Some "Output exceeds input"
+          else
+            total_fees :=
+              Int64.add !total_fees
+                (Int64.sub !input_sum output_sum)
+        end
+      end;
+
+      (* Create new outputs (for both coinbase and regular tx) *)
+      if !error = None then
+        List.iteri (fun vout out ->
+          OptimizedUtxoSet.add utxo txid vout {
+            value = out.Types.value;
+            script_pubkey = out.script_pubkey;
+            height;
+            is_coinbase;
+          }
+        ) tx.outputs
+    end
+  ) block.transactions;
+
+  match !error with
+  | Some e -> Error e
+  | None ->
+    (* Verify coinbase value <= subsidy + total_fees *)
+    let subsidy = Consensus.block_subsidy height in
+    let max_coinbase = Int64.add subsidy !total_fees in
+    let coinbase = List.hd block.transactions in
+    let coinbase_out = List.fold_left
+      (fun acc out -> Int64.add acc out.Types.value)
+      0L coinbase.outputs in
+    if coinbase_out > max_coinbase then
+      Error (Printf.sprintf
+        "Coinbase too large: %Ld > %Ld"
+        coinbase_out max_coinbase)
+    else
+      Ok { height; spent_outputs = !spent }
+
+(* Process multiple blocks in batch during IBD *)
+let process_blocks_batch (blocks : Types.block list)
+    (utxo : OptimizedUtxoSet.t) (start_height : int)
+    : (int, string) result =
+  let height = ref start_height in
+  let error = ref None in
+  List.iter (fun block ->
+    if !error = None then begin
+      match connect_block_optimized utxo block !height with
+      | Ok _undo ->
+        incr height
+      | Error e ->
+        error := Some e
+    end
+  ) blocks;
+  match !error with
+  | Some e -> Error e
+  | None -> Ok (!height - start_height)

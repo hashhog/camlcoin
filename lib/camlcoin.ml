@@ -12,6 +12,7 @@ module Peer = Peer
 module Peer_manager = Peer_manager
 module Sync = Sync
 module Mempool = Mempool
+module Fee_estimation = Fee_estimation
 module Rpc = Rpc
 module Wallet = Wallet
 module Cli = Cli

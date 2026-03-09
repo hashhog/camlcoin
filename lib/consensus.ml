@@ -55,58 +55,72 @@ let block_subsidy (height : int) : int64 =
   if halvings >= 64 then 0L
   else Int64.shift_right 5_000_000_000L halvings  (* 50 BTC initial *)
 
-(* Compact target format (nBits) conversion to 256-bit target *)
+(* Compact target format (nBits) conversion to 256-bit target.
+
+   The compact format is: bits[31:24] = exponent, bits[22:0] = mantissa
+   Target = mantissa * 256^(exponent - 3)
+
+   The result is stored in little-endian format (byte 0 = LSB, byte 31 = MSB).
+   For regtest 0x207fffff: mantissa=0x7fffff, exp=32, target=0x7fffff * 256^29
+   This puts bytes at indices 29, 30, 31 in little-endian storage. *)
 let compact_to_target (bits : int32) : Cstruct.t =
   let bits_i = Int32.to_int bits in
   let exponent = (bits_i lsr 24) land 0xFF in
   let mantissa = bits_i land 0x7FFFFF in
-  (* Note: negative targets are invalid in Bitcoin, but we handle the format *)
-  let _negative = bits_i land 0x800000 <> 0 in
   let target = Cstruct.create 32 in
-  (* Target is stored in little-endian format *)
-  if exponent <= 3 then begin
-    (* mantissa fits in low bytes, shift right *)
-    let m = mantissa lsr (8 * (3 - exponent)) in
-    Cstruct.set_uint8 target 31 (m land 0xFF);
-    if exponent >= 2 then
-      Cstruct.set_uint8 target 30 ((m lsr 8) land 0xFF);
-    if exponent >= 3 then
-      Cstruct.set_uint8 target 29 ((m lsr 16) land 0xFF)
-  end else begin
-    (* mantissa at higher byte positions *)
-    let offset = exponent - 3 in
-    let pos = 32 - offset - 3 in
-    if pos >= 0 && pos < 32 then
-      Cstruct.set_uint8 target pos ((mantissa lsr 16) land 0xFF);
-    if pos + 1 >= 0 && pos + 1 < 32 then
-      Cstruct.set_uint8 target (pos + 1) ((mantissa lsr 8) land 0xFF);
-    if pos + 2 >= 0 && pos + 2 < 32 then
-      Cstruct.set_uint8 target (pos + 2) (mantissa land 0xFF)
-  end;
-  target
 
-(* Convert 256-bit target back to compact nBits format *)
+  if exponent = 0 || mantissa = 0 then
+    target  (* Zero target *)
+  else if exponent <= 3 then begin
+    (* Small exponent: mantissa is shifted right *)
+    let shift = 8 * (3 - exponent) in
+    let m = mantissa lsr shift in
+    (* Place at low bytes (little-endian, so at start of array) *)
+    Cstruct.set_uint8 target 0 (m land 0xFF);
+    if exponent >= 2 then
+      Cstruct.set_uint8 target 1 ((m lsr 8) land 0xFF);
+    if exponent >= 3 then
+      Cstruct.set_uint8 target 2 ((m lsr 16) land 0xFF);
+    target
+  end else begin
+    (* Normal case: mantissa shifted left by (exponent - 3) bytes *)
+    (* In little-endian, byte position starts at (exponent - 3) *)
+    let base_pos = exponent - 3 in
+    (* Mantissa low byte at base_pos, high byte at base_pos + 2 *)
+    if base_pos < 32 then
+      Cstruct.set_uint8 target base_pos (mantissa land 0xFF);
+    if base_pos + 1 < 32 then
+      Cstruct.set_uint8 target (base_pos + 1) ((mantissa lsr 8) land 0xFF);
+    if base_pos + 2 < 32 then
+      Cstruct.set_uint8 target (base_pos + 2) ((mantissa lsr 16) land 0xFF);
+    target
+  end
+
+(* Convert 256-bit target back to compact nBits format.
+   Target is in little-endian: byte 0 = LSB, byte 31 = MSB. *)
 let target_to_compact (target : Cstruct.t) : int32 =
-  (* Find the first non-zero byte (big-endian perspective) *)
-  let rec find_first_nonzero i =
-    if i >= 32 then 32
+  (* Find the highest non-zero byte (MSB position in little-endian) *)
+  let rec find_msb_position i =
+    if i < 0 then (-1)  (* All zeros *)
     else if Cstruct.get_uint8 target i <> 0 then i
-    else find_first_nonzero (i + 1)
+    else find_msb_position (i - 1)
   in
-  let first_nonzero = find_first_nonzero 0 in
-  if first_nonzero >= 32 then 0l  (* Zero target *)
+  let msb_pos = find_msb_position 31 in
+  if msb_pos < 0 then 0l  (* Zero target *)
   else begin
-    let size = 32 - first_nonzero in
+    (* Exponent is (position + 1), as that's the number of significant bytes *)
+    let size = msb_pos + 1 in
+    (* Extract 3-byte mantissa from highest bytes, reading high to low *)
     let mantissa =
       if size >= 3 then
-        (Cstruct.get_uint8 target first_nonzero lsl 16) lor
-        (Cstruct.get_uint8 target (first_nonzero + 1) lsl 8) lor
-        Cstruct.get_uint8 target (first_nonzero + 2)
+        (Cstruct.get_uint8 target msb_pos lsl 16) lor
+        (Cstruct.get_uint8 target (msb_pos - 1) lsl 8) lor
+        Cstruct.get_uint8 target (msb_pos - 2)
       else if size = 2 then
-        (Cstruct.get_uint8 target first_nonzero lsl 16) lor
-        (Cstruct.get_uint8 target (first_nonzero + 1) lsl 8)
+        (Cstruct.get_uint8 target msb_pos lsl 16) lor
+        (Cstruct.get_uint8 target (msb_pos - 1) lsl 8)
       else
-        Cstruct.get_uint8 target first_nonzero lsl 16
+        Cstruct.get_uint8 target msb_pos lsl 16
     in
     (* If MSB of mantissa is set, we need to shift to avoid sign confusion *)
     let mantissa, size =
@@ -127,7 +141,7 @@ let hash_meets_target (hash : Types.hash256) (bits : int32) : bool =
   let rec compare_bytes i =
     if i < 0 then true  (* Equal, meets target *)
     else begin
-      let h = Cstruct.get_uint8 hash (31 - i) in
+      let h = Cstruct.get_uint8 hash i in
       let t = Cstruct.get_uint8 target i in
       if h < t then true
       else if h > t then false

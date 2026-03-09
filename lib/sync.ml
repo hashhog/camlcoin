@@ -36,14 +36,16 @@ type chain_state = {
 }
 
 (* Compute proof-of-work from compact target (nBits).
-   Work = 2^256 / target. Higher work = more difficult. *)
+   Work = 2^256 / target. Higher work = more difficult.
+   Target is in little-endian format (byte 0 = LSB, byte 31 = MSB). *)
 let work_from_bits (bits : int32) : float =
   let target = Consensus.compact_to_target bits in
   let target_f = ref 0.0 in
   for i = 0 to 31 do
+    (* Little-endian: byte i contributes 2^(8*i) *)
     target_f := !target_f +.
       (float_of_int (Cstruct.get_uint8 target i)) *.
-      (2.0 ** (float_of_int (8 * (31 - i))))
+      (2.0 ** (float_of_int (8 * i)))
   done;
   if !target_f = 0.0 then 0.0
   else (2.0 ** 256.0) /. !target_f

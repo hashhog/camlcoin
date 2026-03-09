@@ -216,6 +216,29 @@ let test_version_msg_roundtrip () =
   Alcotest.(check int32) "start_height" msg.start_height result.start_height;
   Alcotest.(check bool) "relay" msg.relay result.relay
 
+(* Integer roundtrip tests *)
+let test_int32_le_roundtrip () =
+  let values = [0l; 1l; 0xFFl; 0xFFFFl; 0x7FFFFFFFl; -1l] in
+  List.iter (fun v ->
+    let w = Serialize.writer_create () in
+    Serialize.write_int32_le w v;
+    let cs = Serialize.writer_to_cstruct w in
+    let r = Serialize.reader_of_cstruct cs in
+    let result = Serialize.read_int32_le r in
+    Alcotest.(check int32) "int32 roundtrip" v result
+  ) values
+
+let test_int64_le_roundtrip () =
+  let values = [0L; 1L; 0xFFL; 0xFFFFL; 0x7FFFFFFFL; -1L; 5_000_000_000L] in
+  List.iter (fun v ->
+    let w = Serialize.writer_create () in
+    Serialize.write_int64_le w v;
+    let cs = Serialize.writer_to_cstruct w in
+    let r = Serialize.reader_of_cstruct cs in
+    let result = Serialize.read_int64_le r in
+    Alcotest.(check int64) "int64 roundtrip" v result
+  ) values
+
 (* QCheck property tests for CompactSize *)
 let qcheck_compact_size_roundtrip =
   QCheck.Test.make ~count:1000 ~name:"compact_size roundtrip"
@@ -228,6 +251,17 @@ let qcheck_compact_size_roundtrip =
       let result = Serialize.read_compact_size r in
       result = n)
 
+let qcheck_int32_roundtrip =
+  QCheck.Test.make ~count:1000 ~name:"int32_le roundtrip"
+    QCheck.int32
+    (fun v ->
+      let w = Serialize.writer_create () in
+      Serialize.write_int32_le w v;
+      let cs = Serialize.writer_to_cstruct w in
+      let r = Serialize.reader_of_cstruct cs in
+      let result = Serialize.read_int32_le r in
+      result = v)
+
 let () =
   let open Alcotest in
   run "test_serialize" [
@@ -236,6 +270,10 @@ let () =
       test_case "0xFD marker" `Quick test_compact_size_fd;
       test_case "0xFE marker" `Quick test_compact_size_fe;
       test_case "roundtrip" `Quick test_compact_size_roundtrip;
+    ];
+    "integers", [
+      test_case "int32_le roundtrip" `Quick test_int32_le_roundtrip;
+      test_case "int64_le roundtrip" `Quick test_int64_le_roundtrip;
     ];
     "block_header", [
       test_case "size is 80 bytes" `Quick test_block_header_size;
@@ -249,7 +287,8 @@ let () =
     "version_msg", [
       test_case "roundtrip" `Quick test_version_msg_roundtrip;
     ];
-    "property tests", [
+    "property_tests", [
       QCheck_alcotest.to_alcotest qcheck_compact_size_roundtrip;
+      QCheck_alcotest.to_alcotest qcheck_int32_roundtrip;
     ];
   ]

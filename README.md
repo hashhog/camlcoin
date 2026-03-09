@@ -35,6 +35,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Wallet (key generation, UTXO tracking, coin selection, tx signing)
 - [x] Command-line interface
 - [x] Test suite (Alcotest unit tests, QCheck property-based tests)
+- [x] Performance optimization (LRU cache, compact headers, benchmarks)
 - [ ] Compact block relay (BIP 152)
 - [ ] Bloom filters (BIP 37)
 
@@ -47,6 +48,7 @@ opam install . --deps-only --with-test -y
 dune build
 dune exec camlcoin -- --help
 dune exec camlcoin -- --network regtest --debug
+dune exec camlcoin -- --benchmark
 ```
 
 ## Project structure
@@ -63,7 +65,7 @@ camlcoin/
     consensus.ml      consensus parameters
     validation.ml     block/tx validation
     storage.ml        block/utxo storage
-    utxo.ml           UTXO set and chain state
+    utxo.ml           UTXO set with LRU cache
     p2p.ml            network protocol
     peer.ml           peer connections
     peer_manager.ml   connection pool and discovery
@@ -73,6 +75,7 @@ camlcoin/
     mining.ml         block template and miner
     rpc.ml            JSON-RPC server
     wallet.ml         HD wallet, UTXO tracking, tx signing
+    perf.ml           performance utilities and benchmarks
     cli.ml            command line interface
     camlcoin.ml       library interface
   test/               unit tests

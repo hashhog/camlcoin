@@ -22,7 +22,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Storage layer (blocks, UTXOs, chain state, batch writes)
 - [x] Block and transaction validation (weight, sigops, Merkle, coinbase)
 - [x] P2P message serialization (version, inv, getdata, blocks, headers, tx)
-- [ ] P2P networking
+- [x] Peer connections and handshake (TCP/Lwt, version/verack, ping/pong)
 - [ ] Chain synchronization
 - [ ] Mempool
 - [ ] JSON-RPC interface

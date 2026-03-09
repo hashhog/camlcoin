@@ -16,7 +16,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Binary serialization (CompactSize, little-endian, segwit)
 - [x] Cryptographic primitives (SHA256d, RIPEMD160, secp256k1 ECDSA)
 - [x] Merkle root computation
-- [ ] Address encoding (Base58Check, Bech32)
+- [x] Address encoding (Base58Check, Bech32/Bech32m, WIF)
 - [ ] Script interpreter
 - [ ] Block and transaction validation
 - [ ] P2P networking

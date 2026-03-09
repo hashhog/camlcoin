@@ -19,6 +19,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Address encoding (Base58Check, Bech32/Bech32m, WIF)
 - [x] Script interpreter (opcodes, stack machine, P2PKH/P2SH/P2WPKH/P2WSH/P2TR)
 - [x] Consensus parameters (difficulty, rewards, network configs)
+- [x] Storage layer (blocks, UTXOs, chain state, batch writes)
 - [ ] Block and transaction validation
 - [ ] P2P networking
 - [ ] Chain synchronization

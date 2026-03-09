@@ -20,7 +20,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Script interpreter (opcodes, stack machine, P2PKH/P2SH/P2WPKH/P2WSH/P2TR)
 - [x] Consensus parameters (difficulty, rewards, network configs)
 - [x] Storage layer (blocks, UTXOs, chain state, batch writes)
-- [ ] Block and transaction validation
+- [x] Block and transaction validation (weight, sigops, Merkle, coinbase)
 - [ ] P2P networking
 - [ ] Chain synchronization
 - [ ] Mempool
@@ -48,7 +48,8 @@ camlcoin/
     crypto.ml         hash functions, signatures
     address.ml        address encoding
     script.ml         script interpreter
-    consensus.ml      validation rules
+    consensus.ml      consensus parameters
+    validation.ml     block/tx validation
     storage.ml        block/utxo storage
     p2p.ml            network protocol
     peer.ml           peer connections

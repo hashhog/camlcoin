@@ -28,8 +28,12 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Block synchronization (IBD, parallel downloads, chain reorganization)
 - [x] UTXO set with cache (block connect/disconnect, undo data, maturity)
 - [x] Mempool (fee-rate prioritization, eviction, dependency tracking, RBF)
-- [ ] JSON-RPC interface
-- [ ] Wallet functionality
+- [x] Fee estimation (bucket-based tracking, confirmation time analysis)
+- [x] JSON-RPC interface
+- [x] Wallet functionality
+- [x] Command-line interface
+- [ ] Compact block relay (BIP 152)
+- [ ] Bloom filters (BIP 37)
 
 ## Quick start
 
@@ -61,6 +65,7 @@ camlcoin/
     peer_manager.ml   connection pool and discovery
     sync.ml           chain synchronization
     mempool.ml        transaction pool
+    fee_estimation.ml fee rate estimation
     rpc.ml            JSON-RPC server
     wallet.ml         key management
     cli.ml            command line interface

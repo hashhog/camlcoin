@@ -21,6 +21,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Consensus parameters (difficulty, rewards, network configs)
 - [x] Storage layer (blocks, UTXOs, chain state, batch writes)
 - [x] Block and transaction validation (weight, sigops, Merkle, coinbase)
+- [x] P2P message serialization (version, inv, getdata, blocks, headers, tx)
 - [ ] P2P networking
 - [ ] Chain synchronization
 - [ ] Mempool

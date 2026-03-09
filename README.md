@@ -29,6 +29,8 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] UTXO set with cache (block connect/disconnect, undo data, maturity)
 - [x] Mempool (fee-rate prioritization, eviction, dependency tracking, RBF)
 - [x] Fee estimation (bucket-based tracking, confirmation time analysis)
+- [x] Block template construction (getblocktemplate, coinbase, witness commitment)
+- [x] CPU miner for regtest (proof-of-work search, nonce iteration)
 - [x] JSON-RPC interface
 - [x] Wallet functionality
 - [x] Command-line interface
@@ -66,6 +68,7 @@ camlcoin/
     sync.ml           chain synchronization
     mempool.ml        transaction pool
     fee_estimation.ml fee rate estimation
+    mining.ml         block template and miner
     rpc.ml            JSON-RPC server
     wallet.ml         key management
     cli.ml            command line interface

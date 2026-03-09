@@ -1,6 +1,7 @@
 (library
  (name camlcoin)
  (public_name camlcoin)
- (libraries cstruct cstruct-unix ctypes ctypes-foreign lwt lwt.unix
-            cohttp-lwt-unix yojson digestif cmdliner logs fmt)
+ (libraries cstruct cstruct-unix lwt lwt.unix bigstring
+            cohttp-lwt-unix yojson digestif cmdliner logs fmt
+            secp256k1-internal)
  (preprocess (pps lwt_ppx)))

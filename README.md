@@ -44,7 +44,8 @@ opam switch create . 4.14.2 --deps-only -y
 eval $(opam env)
 opam install . --deps-only --with-test -y
 dune build
-dune exec camlcoin
+dune exec camlcoin -- --help
+dune exec camlcoin -- --network regtest --debug
 ```
 
 ## Project structure

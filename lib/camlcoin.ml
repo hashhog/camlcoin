@@ -6,6 +6,7 @@ module Script = Script
 module Consensus = Consensus
 module Validation = Validation
 module Storage = Storage
+module Utxo = Utxo
 module P2p = P2p
 module Peer = Peer
 module Peer_manager = Peer_manager

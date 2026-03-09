@@ -34,6 +34,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] JSON-RPC interface
 - [x] Wallet (key generation, UTXO tracking, coin selection, tx signing)
 - [x] Command-line interface
+- [x] Test suite (Alcotest unit tests, QCheck property-based tests)
 - [ ] Compact block relay (BIP 152)
 - [ ] Bloom filters (BIP 37)
 

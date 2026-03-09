@@ -4,6 +4,7 @@ module Crypto = Crypto
 module Address = Address
 module Script = Script
 module Consensus = Consensus
+module Validation = Validation
 module Storage = Storage
 module P2p = P2p
 module Peer = Peer

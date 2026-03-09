@@ -313,6 +313,303 @@ let test_needs_header_sync () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* ============================================================================
+   IBD (Initial Block Download) Tests
+   ============================================================================ *)
+
+(* Test create_ibd_state initialization *)
+let test_create_ibd_state () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let chain = Sync.create_chain_state db Consensus.regtest in
+  let ibd = Sync.create_ibd_state chain in
+
+  (* IBD should start from height 1 (after genesis) *)
+  Alcotest.(check int) "next_download_height" 1 ibd.next_download_height;
+  Alcotest.(check int) "next_process_height" 1 ibd.next_process_height;
+  Alcotest.(check int) "total_blocks_in_flight" 0 ibd.total_blocks_in_flight;
+  Alcotest.(check int) "block_queue length" 0 (List.length ibd.block_queue);
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test fill_download_queue populates queue from headers *)
+let test_fill_download_queue () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let chain = Sync.create_chain_state db Consensus.regtest in
+
+  (* Add some headers to the chain (simulated) *)
+  (* For this test, we just verify the function works with genesis only *)
+  let ibd = Sync.create_ibd_state chain in
+  Sync.fill_download_queue ibd;
+
+  (* With only genesis block and no additional headers, queue should be empty *)
+  (* (genesis is at height 0, we start downloading from height 1) *)
+  Alcotest.(check int) "queue empty with no headers beyond genesis"
+    0 (List.length ibd.block_queue);
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test peer_download_state management *)
+let test_get_peer_state () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let chain = Sync.create_chain_state db Consensus.regtest in
+  let ibd = Sync.create_ibd_state chain in
+
+  (* Get state for a new peer *)
+  let peer_state = Sync.get_peer_state ibd 1 in
+  Alcotest.(check int) "new peer blocks_in_flight" 0 peer_state.blocks_in_flight;
+  Alcotest.(check int) "new peer consecutive_timeouts" 0 peer_state.consecutive_timeouts;
+  Alcotest.(check (float 0.001)) "new peer current_timeout"
+    Sync.base_block_timeout peer_state.current_timeout;
+
+  (* Modify peer state *)
+  peer_state.blocks_in_flight <- 5;
+  peer_state.consecutive_timeouts <- 2;
+
+  (* Get state again - should be the same instance *)
+  let peer_state2 = Sync.get_peer_state ibd 1 in
+  Alcotest.(check int) "same peer blocks_in_flight" 5 peer_state2.blocks_in_flight;
+  Alcotest.(check int) "same peer consecutive_timeouts" 2 peer_state2.consecutive_timeouts;
+
+  (* Different peer should have fresh state *)
+  let peer_state3 = Sync.get_peer_state ibd 2 in
+  Alcotest.(check int) "different peer blocks_in_flight" 0 peer_state3.blocks_in_flight;
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test block_download_state types *)
+let test_block_download_states () =
+  (* Test NotRequested state *)
+  let state1 = Sync.NotRequested in
+  let is_not_requested = match state1 with
+    | Sync.NotRequested -> true
+    | _ -> false
+  in
+  Alcotest.(check bool) "NotRequested" true is_not_requested;
+
+  (* Test Requested state *)
+  let state2 = Sync.Requested {
+    peer_id = 42;
+    requested_at = 1000.0;
+    timeout = 5.0;
+  } in
+  let peer_id = match state2 with
+    | Sync.Requested { peer_id; _ } -> peer_id
+    | _ -> -1
+  in
+  Alcotest.(check int) "Requested peer_id" 42 peer_id;
+
+  (* Test Downloaded state *)
+  let block = Types.{
+    header = Consensus.regtest.genesis_header;
+    transactions = [];
+  } in
+  let state3 = Sync.Downloaded block in
+  let is_downloaded = match state3 with
+    | Sync.Downloaded _ -> true
+    | _ -> false
+  in
+  Alcotest.(check bool) "Downloaded" true is_downloaded;
+
+  (* Test Validated state *)
+  let state4 = Sync.Validated in
+  let is_validated = match state4 with
+    | Sync.Validated -> true
+    | _ -> false
+  in
+  Alcotest.(check bool) "Validated" true is_validated
+
+(* Test UTXO encoding *)
+let test_encode_utxo () =
+  let value = 50_00_000_000L in (* 50 BTC *)
+  let script = Cstruct.of_string "\x76\xa9\x14" in (* Start of P2PKH *)
+  let height = 100 in
+  let is_coinbase = true in
+
+  let encoded = Sync.encode_utxo value script height is_coinbase in
+
+  (* Decode and verify *)
+  let r = Serialize.reader_of_cstruct (Cstruct.of_string encoded) in
+  let decoded_value = Serialize.read_int64_le r in
+  let script_len = Serialize.read_compact_size r in
+  let decoded_script = Serialize.read_bytes r script_len in
+  let decoded_height = Int32.to_int (Serialize.read_int32_le r) in
+  let decoded_is_coinbase = Serialize.read_uint8 r = 1 in
+
+  Alcotest.(check int64) "value" value decoded_value;
+  Alcotest.(check int) "script length" (Cstruct.length script) script_len;
+  Alcotest.(check string) "script"
+    (Cstruct.to_string script) (Cstruct.to_string decoded_script);
+  Alcotest.(check int) "height" height decoded_height;
+  Alcotest.(check bool) "is_coinbase" is_coinbase decoded_is_coinbase
+
+(* Test check_timeouts *)
+let test_check_timeouts () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let chain = Sync.create_chain_state db Consensus.regtest in
+  let ibd = Sync.create_ibd_state chain in
+
+  let hash = Types.hash256_of_hex
+    "0000000000000000000000000000000000000000000000000000000000000001" in
+
+  (* Create an entry that has timed out *)
+  let entry = Sync.{
+    hash;
+    height = 1;
+    download_state = Requested {
+      peer_id = 1;
+      requested_at = Unix.gettimeofday () -. 100.0; (* 100 seconds ago *)
+      timeout = 5.0;
+    };
+  } in
+  ibd.block_queue <- [entry];
+  ibd.total_blocks_in_flight <- 1;
+
+  (* Set up peer state *)
+  let peer_state = Sync.get_peer_state ibd 1 in
+  peer_state.blocks_in_flight <- 1;
+
+  (* Run timeout check *)
+  Sync.check_timeouts ibd;
+
+  (* Entry should be reset to NotRequested *)
+  let is_reset = match entry.download_state with
+    | Sync.NotRequested -> true
+    | _ -> false
+  in
+  Alcotest.(check bool) "entry reset after timeout" true is_reset;
+  Alcotest.(check int) "total_blocks_in_flight reset" 0 ibd.total_blocks_in_flight;
+  Alcotest.(check int) "peer blocks_in_flight reset" 0 peer_state.blocks_in_flight;
+
+  (* Peer timeout should have doubled *)
+  Alcotest.(check (float 0.001)) "timeout doubled"
+    (Sync.base_block_timeout *. 2.0) peer_state.current_timeout;
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test record_successful_download *)
+let test_record_successful_download () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let chain = Sync.create_chain_state db Consensus.regtest in
+  let ibd = Sync.create_ibd_state chain in
+
+  (* Set up peer state with elevated timeout *)
+  let peer_state = Sync.get_peer_state ibd 1 in
+  peer_state.blocks_in_flight <- 3;
+  peer_state.consecutive_timeouts <- 2;
+  peer_state.current_timeout <- 20.0;
+
+  (* Record successful download *)
+  Sync.record_successful_download ibd 1;
+
+  (* Verify state is reset *)
+  Alcotest.(check int) "blocks_in_flight decremented" 2 peer_state.blocks_in_flight;
+  Alcotest.(check int) "consecutive_timeouts reset" 0 peer_state.consecutive_timeouts;
+  Alcotest.(check (float 0.001)) "timeout reset to base"
+    Sync.base_block_timeout peer_state.current_timeout;
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test receive_block *)
+let test_receive_block () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let chain = Sync.create_chain_state db Consensus.regtest in
+  let ibd = Sync.create_ibd_state chain in
+
+  let genesis_hash = Crypto.compute_block_hash Consensus.regtest.genesis_header in
+  let block = Types.{
+    header = Consensus.regtest.genesis_header;
+    transactions = [];
+  } in
+
+  (* Add entry to queue *)
+  let entry = Sync.{
+    hash = genesis_hash;
+    height = 0;
+    download_state = Requested {
+      peer_id = 1;
+      requested_at = Unix.gettimeofday ();
+      timeout = 5.0;
+    };
+  } in
+  ibd.block_queue <- [entry];
+  ibd.total_blocks_in_flight <- 1;
+
+  (* Set up peer state *)
+  let peer_state = Sync.get_peer_state ibd 1 in
+  peer_state.blocks_in_flight <- 1;
+
+  (* Receive the block *)
+  let result = Sync.receive_block ibd block in
+  Alcotest.(check bool) "receive_block succeeds" true (Result.is_ok result);
+
+  (* Entry should be Downloaded *)
+  let is_downloaded = match entry.download_state with
+    | Sync.Downloaded _ -> true
+    | _ -> false
+  in
+  Alcotest.(check bool) "entry marked downloaded" true is_downloaded;
+  Alcotest.(check int) "total_blocks_in_flight decremented" 0 ibd.total_blocks_in_flight;
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test receive_block with unrequested block *)
+let test_receive_unrequested_block () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let chain = Sync.create_chain_state db Consensus.regtest in
+  let ibd = Sync.create_ibd_state chain in
+
+  let block = Types.{
+    header = Consensus.regtest.genesis_header;
+    transactions = [];
+  } in
+
+  (* Queue is empty *)
+  let result = Sync.receive_block ibd block in
+  Alcotest.(check bool) "receive unrequested block fails" true (Result.is_error result);
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test IBD constants *)
+let test_ibd_constants () =
+  Alcotest.(check int) "max_blocks_per_peer" 16 Sync.max_blocks_per_peer;
+  Alcotest.(check int) "max_total_blocks_in_flight" 128 Sync.max_total_blocks_in_flight;
+  Alcotest.(check (float 0.001)) "base_block_timeout" 5.0 Sync.base_block_timeout;
+  Alcotest.(check (float 0.001)) "max_block_timeout" 64.0 Sync.max_block_timeout;
+  Alcotest.(check int) "utxo_flush_interval" 2000 Sync.utxo_flush_interval;
+  Alcotest.(check int) "download_window_multiplier" 4 Sync.download_window_multiplier
+
+(* Test find_fork_point with same chain *)
+let test_find_fork_point_same () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let chain = Sync.create_chain_state db Consensus.regtest in
+
+  let genesis_entry = Option.get (Sync.get_tip chain) in
+
+  (* Fork point of genesis with itself should be genesis *)
+  let result = Sync.find_fork_point chain genesis_entry genesis_entry in
+  Alcotest.(check bool) "find_fork_point succeeds" true (Result.is_ok result);
+
+  let fork = Result.get_ok result in
+  Alcotest.(check int) "fork at genesis" 0 fork.height;
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
@@ -342,5 +639,26 @@ let () =
       test_case "has_header" `Quick test_has_header;
       test_case "sync_state_to_string" `Quick test_sync_state_to_string;
       test_case "needs_header_sync" `Quick test_needs_header_sync;
+    ];
+    "ibd_state", [
+      test_case "create_ibd_state" `Quick test_create_ibd_state;
+      test_case "fill_download_queue" `Quick test_fill_download_queue;
+      test_case "get_peer_state" `Quick test_get_peer_state;
+      test_case "block_download_states" `Quick test_block_download_states;
+      test_case "ibd_constants" `Quick test_ibd_constants;
+    ];
+    "ibd_utxo", [
+      test_case "encode_utxo" `Quick test_encode_utxo;
+    ];
+    "ibd_timeout", [
+      test_case "check_timeouts" `Quick test_check_timeouts;
+      test_case "record_successful_download" `Quick test_record_successful_download;
+    ];
+    "ibd_receive", [
+      test_case "receive_block" `Quick test_receive_block;
+      test_case "receive_unrequested_block" `Quick test_receive_unrequested_block;
+    ];
+    "reorganization", [
+      test_case "find_fork_point_same" `Quick test_find_fork_point_same;
     ];
   ]

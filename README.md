@@ -27,7 +27,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Header synchronization (BIP-130, block locators, proof-of-work tracking)
 - [x] Block synchronization (IBD, parallel downloads, chain reorganization)
 - [x] UTXO set with cache (block connect/disconnect, undo data, maturity)
-- [ ] Mempool
+- [x] Mempool (fee-rate prioritization, eviction, dependency tracking, RBF)
 - [ ] JSON-RPC interface
 - [ ] Wallet functionality
 

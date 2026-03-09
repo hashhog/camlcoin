@@ -1,4 +1,4 @@
 (executable
  (name main)
  (public_name camlcoin)
- (libraries camlcoin))
+ (libraries camlcoin cmdliner logs fmt fmt.tty logs.fmt lwt lwt.unix))

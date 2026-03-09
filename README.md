@@ -25,7 +25,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Peer connections and handshake (TCP/Lwt, version/verack, ping/pong)
 - [x] Peer manager and discovery (DNS seeds, connection pool, addr relay)
 - [x] Header synchronization (BIP-130, block locators, proof-of-work tracking)
-- [ ] Block synchronization
+- [x] Block synchronization (IBD, parallel downloads, chain reorganization)
 - [ ] Mempool
 - [ ] JSON-RPC interface
 - [ ] Wallet functionality

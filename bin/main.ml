@@ -75,35 +75,46 @@ let prune_arg =
   Arg.(value & opt int 0 &
     info ["prune"] ~docv:"SIZE" ~doc)
 
+let benchmark_arg =
+  let doc = "Run performance benchmarks and exit." in
+  Arg.(value & flag & info ["benchmark"] ~doc)
+
 (* ============================================================================
    Main Command
    ============================================================================ *)
 
 let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
-    p2p_port max_outbound max_inbound connect debug no_wallet prune =
-  let base = Camlcoin.Cli.config_for_network network in
-  let config : Camlcoin.Cli.config = {
-    network;
-    data_dir = (match datadir with
-      | Some d -> d
-      | None -> base.data_dir);
-    rpc_host;
-    rpc_port = (match rpc_port with
-      | Some p -> p
-      | None -> base.rpc_port);
-    rpc_user;
-    rpc_password;
-    p2p_port = (match p2p_port with
-      | Some p -> p
-      | None -> base.p2p_port);
-    max_outbound;
-    max_inbound;
-    connect;
-    debug;
-    wallet_enabled = not no_wallet;
-    prune;
-  } in
-  Lwt_main.run (Camlcoin.Cli.run config)
+    p2p_port max_outbound max_inbound connect debug no_wallet prune benchmark =
+  (* If benchmark flag is set, run benchmarks and exit *)
+  if benchmark then begin
+    Camlcoin.Cli.setup_logging debug;
+    Camlcoin.Perf.run_benchmarks ();
+    ()
+  end else begin
+    let base = Camlcoin.Cli.config_for_network network in
+    let config : Camlcoin.Cli.config = {
+      network;
+      data_dir = (match datadir with
+        | Some d -> d
+        | None -> base.data_dir);
+      rpc_host;
+      rpc_port = (match rpc_port with
+        | Some p -> p
+        | None -> base.rpc_port);
+      rpc_user;
+      rpc_password;
+      p2p_port = (match p2p_port with
+        | Some p -> p
+        | None -> base.p2p_port);
+      max_outbound;
+      max_inbound;
+      connect;
+      debug;
+      wallet_enabled = not no_wallet;
+      prune;
+    } in
+    Lwt_main.run (Camlcoin.Cli.run config)
+  end
 
 let cmd =
   let doc = "CamlCoin - Bitcoin full node implemented in OCaml" in
@@ -119,6 +130,8 @@ let cmd =
     `Pre "  camlcoin --network testnet --debug";
     `P "Run on regtest and connect to a specific peer:";
     `Pre "  camlcoin --network regtest --connect 127.0.0.1:18444";
+    `P "Run performance benchmarks:";
+    `Pre "  camlcoin --benchmark";
     `S Manpage.s_bugs;
     `P "Report bugs at https://github.com/camlcoin/camlcoin/issues";
   ] in
@@ -139,7 +152,8 @@ let cmd =
     $ connect_arg
     $ debug_arg
     $ no_wallet_arg
-    $ prune_arg)
+    $ prune_arg
+    $ benchmark_arg)
 
 (* ============================================================================
    Entry Point

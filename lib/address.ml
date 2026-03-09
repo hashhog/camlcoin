@@ -446,3 +446,34 @@ let is_segwit addr =
 
 let hash_length addr =
   Cstruct.length addr.hash
+
+(* ========== Simplified Address Encoding/Decoding ========== *)
+
+(* Encode a P2PKH address from pubkey hash and version byte *)
+let encode_p2pkh (version : int) (pubkey_hash : Types.hash160) : string =
+  let payload = Cstruct.create 21 in
+  Cstruct.set_uint8 payload 0 version;
+  Cstruct.blit pubkey_hash 0 payload 1 20;
+  base58check_encode payload
+
+(* Encode a private key in WIF format *)
+let encode_wif (version : int) (privkey : Cstruct.t) ~(compressed : bool) : string =
+  let payload_len = 1 + 32 + (if compressed then 1 else 0) in
+  let payload = Cstruct.create payload_len in
+  Cstruct.set_uint8 payload 0 version;
+  Cstruct.blit privkey 0 payload 1 32;
+  if compressed then Cstruct.set_uint8 payload 33 0x01;
+  base58check_encode payload
+
+(* Decode a WIF-encoded private key *)
+let decode_wif (s : string) : (Cstruct.t * bool, string) result =
+  match base58check_decode s with
+  | Error e -> Error e
+  | Ok payload ->
+    let len = Cstruct.length payload in
+    if len < 33 then Error "WIF too short"
+    else begin
+      let compressed = len = 34 && Cstruct.get_uint8 payload 33 = 0x01 in
+      let privkey = Cstruct.sub payload 1 32 in
+      Ok (privkey, compressed)
+    end

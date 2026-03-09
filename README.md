@@ -12,7 +12,8 @@ matching for opcode dispatch, and Lwt for async I/O.
 ## Current status
 
 - [x] Project scaffold and dune build system
-- [ ] Core types and serialization
+- [x] Core types (transactions, blocks, headers) with algebraic data types
+- [x] Binary serialization (CompactSize, little-endian, segwit)
 - [ ] Cryptographic primitives (SHA256, RIPEMD160, secp256k1)
 - [ ] Address encoding (Base58Check, Bech32)
 - [ ] Script interpreter

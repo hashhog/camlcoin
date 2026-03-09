@@ -24,7 +24,8 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] P2P message serialization (version, inv, getdata, blocks, headers, tx)
 - [x] Peer connections and handshake (TCP/Lwt, version/verack, ping/pong)
 - [x] Peer manager and discovery (DNS seeds, connection pool, addr relay)
-- [ ] Chain synchronization
+- [x] Header synchronization (BIP-130, block locators, proof-of-work tracking)
+- [ ] Block synchronization
 - [ ] Mempool
 - [ ] JSON-RPC interface
 - [ ] Wallet functionality

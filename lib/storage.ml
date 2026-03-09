@@ -95,6 +95,7 @@ let prefix_utxo         = "u"
 let prefix_block_height = "n"
 let prefix_tx_index     = "x"
 let prefix_chain_state  = "s"
+let prefix_undo_data    = "r"  (* undo data for chain reorg *)
 
 (* Higher-level chain database built on top of the storage layer *)
 module ChainDB = struct
@@ -309,4 +310,26 @@ module ChainDB = struct
   let has_block_header t (hash : Types.hash256) : bool =
     let key = prefix_block_header ^ Cstruct.to_string hash in
     Option.is_some (FileStorage.get t.db key)
+
+  (* Undo data storage - keyed by block hash for chain reorganizations *)
+  let store_undo_data t (block_hash : Types.hash256) (undo_data : string) =
+    let key = prefix_undo_data ^ Cstruct.to_string block_hash in
+    FileStorage.put t.db key undo_data
+
+  let get_undo_data t (block_hash : Types.hash256) : string option =
+    let key = prefix_undo_data ^ Cstruct.to_string block_hash in
+    FileStorage.get t.db key
+
+  let delete_undo_data t (block_hash : Types.hash256) =
+    let key = prefix_undo_data ^ Cstruct.to_string block_hash in
+    FileStorage.delete t.db key
+
+  (* Batch undo data operations *)
+  let batch_store_undo_data batch (block_hash : Types.hash256) (undo_data : string) =
+    let key = prefix_undo_data ^ Cstruct.to_string block_hash in
+    FileStorage.batch_put batch key undo_data
+
+  let batch_delete_undo_data batch (block_hash : Types.hash256) =
+    let key = prefix_undo_data ^ Cstruct.to_string block_hash in
+    FileStorage.batch_delete batch key
 end

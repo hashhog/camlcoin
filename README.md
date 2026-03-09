@@ -23,6 +23,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Block and transaction validation (weight, sigops, Merkle, coinbase)
 - [x] P2P message serialization (version, inv, getdata, blocks, headers, tx)
 - [x] Peer connections and handshake (TCP/Lwt, version/verack, ping/pong)
+- [x] Peer manager and discovery (DNS seeds, connection pool, addr relay)
 - [ ] Chain synchronization
 - [ ] Mempool
 - [ ] JSON-RPC interface
@@ -54,6 +55,7 @@ camlcoin/
     storage.ml        block/utxo storage
     p2p.ml            network protocol
     peer.ml           peer connections
+    peer_manager.ml   connection pool and discovery
     sync.ml           chain synchronization
     mempool.ml        transaction pool
     rpc.ml            JSON-RPC server

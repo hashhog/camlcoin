@@ -598,6 +598,17 @@ let handle_listunspent (_ctx : rpc_context)
   `List []
 
 (* ============================================================================
+   Performance Stats Handlers
+   ============================================================================ *)
+
+let handle_getperfstats (_ctx : rpc_context) : Yojson.Safe.t =
+  let report = Perf.Timer.report () in
+  `Assoc [
+    ("timers", Perf.Timer.to_json ());
+    ("timer_report", `String report);
+  ]
+
+(* ============================================================================
    Control Handlers
    ============================================================================ *)
 
@@ -653,6 +664,9 @@ let handle_help (_ctx : rpc_context)
       "help ( \"command\" )";
       "stop";
       "uptime";
+      "";
+      "== Performance ==";
+      "getperfstats";
     ])
   | [`String _cmd] ->
     (* Could provide help for specific command *)
@@ -754,6 +768,10 @@ let dispatch_rpc (ctx : rpc_context)
     Ok (handle_uptime ctx)
   | "help" ->
     Ok (handle_help ctx params)
+
+  (* Performance *)
+  | "getperfstats" ->
+    Ok (handle_getperfstats ctx)
 
   | _ ->
     Error (rpc_method_not_found, "Method not found: " ^ method_name)

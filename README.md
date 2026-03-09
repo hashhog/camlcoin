@@ -32,7 +32,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Block template construction (getblocktemplate, coinbase, witness commitment)
 - [x] CPU miner for regtest (proof-of-work search, nonce iteration)
 - [x] JSON-RPC interface
-- [x] Wallet functionality
+- [x] Wallet (key generation, UTXO tracking, coin selection, tx signing)
 - [x] Command-line interface
 - [ ] Compact block relay (BIP 152)
 - [ ] Bloom filters (BIP 37)
@@ -70,10 +70,11 @@ camlcoin/
     fee_estimation.ml fee rate estimation
     mining.ml         block template and miner
     rpc.ml            JSON-RPC server
-    wallet.ml         key management
+    wallet.ml         HD wallet, UTXO tracking, tx signing
     cli.ml            command line interface
     camlcoin.ml       library interface
   test/               unit tests
+  resources/          BIP39 wordlist
 ```
 
 ## Running tests

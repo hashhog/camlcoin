@@ -8,6 +8,7 @@ module Validation = Validation
 module Storage = Storage
 module P2p = P2p
 module Peer = Peer
+module Peer_manager = Peer_manager
 module Sync = Sync
 module Mempool = Mempool
 module Rpc = Rpc

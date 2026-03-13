@@ -20,6 +20,7 @@ let min_target_timespan = target_timespan / 4  (* 4x lower bound *)
 let max_tx_weight = 400_000
 let max_standard_tx_weight = 400_000
 let min_tx_weight = 4 * 60  (* 240 weight units *)
+let max_standard_tx_sigops_cost = 16_000
 let max_script_size = 10_000
 let max_script_element_size = 520
 let max_ops_per_script = 201
@@ -69,7 +70,13 @@ let compact_to_target (bits : int32) : Cstruct.t =
   let mantissa = bits_i land 0x7FFFFF in
   let target = Cstruct.create 32 in
 
-  if exponent = 0 || mantissa = 0 then
+  (* Negative bit set: return zero target *)
+  if bits_i land 0x00800000 <> 0 then
+    target
+  (* Exponent overflow: return zero target *)
+  else if exponent > 32 then
+    target
+  else if exponent = 0 || mantissa = 0 then
     target  (* Zero target *)
   else if exponent <= 3 then begin
     (* Small exponent: mantissa is shifted right *)
@@ -150,27 +157,6 @@ let hash_meets_target (hash : Types.hash256) (bits : int32) : bool =
   in
   compare_bytes 31
 
-(* Calculate next work required (difficulty adjustment) *)
-let next_work_required ~(last_retarget_time : int32)
-    ~(current_header : Types.block_header)
-    ~(current_bits : int32) : int32 =
-  (* Calculate actual time taken for last 2016 blocks *)
-  let actual_timespan =
-    Int32.to_int (Int32.sub current_header.timestamp last_retarget_time) in
-  (* Clamp to [min_target_timespan, max_target_timespan] *)
-  let adjusted_timespan =
-    min max_target_timespan (max min_target_timespan actual_timespan) in
-  (* Get current target and adjust *)
-  let target = compact_to_target current_bits in
-  (* Multiply target by (adjusted_timespan / target_timespan) *)
-  (* We need big integer arithmetic for this - using a simplified approach *)
-  (* For a full implementation, use Zarith or similar *)
-  let _ = target in
-  let _ = adjusted_timespan in
-  (* TODO: Implement proper 256-bit arithmetic for target adjustment *)
-  (* For now, return current bits unchanged *)
-  current_bits
-
 (* Network configuration type *)
 type network_config = {
   name : string;
@@ -187,9 +173,110 @@ type network_config = {
   bip65_height : int;  (* Height at which BIP65 (CLTV) activated *)
   bip66_height : int;  (* Height at which BIP66 (strict DER) activated *)
   segwit_height : int;  (* Height at which SegWit activated *)
+  taproot_height : int;  (* Height at which Taproot activated *)
   pow_allow_min_difficulty : bool;  (* Allow min difficulty blocks (testnet) *)
   pow_no_retargeting : bool;  (* Skip difficulty retargeting (regtest) *)
+  pow_limit : int32;  (* Compact nBits form of the maximum allowed target *)
+  minimum_chain_work : Cstruct.t;  (* 32-byte LE; tip must reach this before block sync *)
+  assume_valid_hash : Types.hash256 option;  (* Skip script verification at/below this block *)
+  checkpoints : (int * Types.hash256) list;  (* Known-good block hashes at specific heights *)
 }
+
+(* Multiply a LE byte-array target by a positive int, producing a result
+   that is (Cstruct.length target + 4) bytes long to hold overflow. *)
+let target_multiply (target : Cstruct.t) (factor : int) : Cstruct.t =
+  let len = Cstruct.length target in
+  let result = Cstruct.create (len + 4) in
+  let carry = ref 0 in
+  for i = 0 to len - 1 do
+    let v = (Cstruct.get_uint8 target i) * factor + !carry in
+    Cstruct.set_uint8 result i (v land 0xFF);
+    carry := v lsr 8
+  done;
+  (* Write remaining carry into the extra bytes *)
+  let c = ref !carry in
+  for i = len to len + 3 do
+    Cstruct.set_uint8 result i (!c land 0xFF);
+    c := !c lsr 8
+  done;
+  result
+
+(* Divide a LE byte-array by a positive int, producing a result truncated
+   to out_len bytes. Division proceeds from MSB to LSB (schoolbook). *)
+let target_divide (target : Cstruct.t) (divisor : int) (out_len : int) : Cstruct.t =
+  let len = Cstruct.length target in
+  let result = Cstruct.create out_len in
+  let remainder = ref 0 in
+  for i = len - 1 downto 0 do
+    let v = !remainder * 256 + Cstruct.get_uint8 target i in
+    let q = v / divisor in
+    remainder := v mod divisor;
+    if i < out_len then
+      Cstruct.set_uint8 result i q
+  done;
+  result
+
+(* Compare two 32-byte LE numbers. Returns negative if a < b, 0 if equal,
+   positive if a > b. Compares from MSB (byte 31) downward. *)
+let target_compare (a : Cstruct.t) (b : Cstruct.t) : int =
+  let rec cmp i =
+    if i < 0 then 0
+    else
+      let av = Cstruct.get_uint8 a i in
+      let bv = Cstruct.get_uint8 b i in
+      if av <> bv then av - bv
+      else cmp (i - 1)
+  in
+  cmp 31
+
+(* Calculate next work required (difficulty adjustment) *)
+let next_work_required ~(last_retarget_time : int32)
+    ~(current_header : Types.block_header)
+    ~(current_bits : int32)
+    ~(network : network_config) : int32 =
+  (* Regtest: no retargeting *)
+  if network.pow_no_retargeting then current_bits
+  else begin
+    (* Calculate actual time taken for last 2016 blocks *)
+    let actual_timespan =
+      Int32.to_int (Int32.sub current_header.timestamp last_retarget_time) in
+    (* Clamp to [min_target_timespan, max_target_timespan] *)
+    let adjusted_timespan =
+      min max_target_timespan (max min_target_timespan actual_timespan) in
+    (* Get current target and adjust:
+       new_target = old_target * adjusted_timespan / target_timespan *)
+    let old_target = compact_to_target current_bits in
+    let product = target_multiply old_target adjusted_timespan in
+    let new_target = target_divide product target_timespan 32 in
+    (* Clamp to pow_limit *)
+    let pow_limit_target = compact_to_target network.pow_limit in
+    let clamped =
+      if target_compare new_target pow_limit_target > 0 then pow_limit_target
+      else new_target
+    in
+    target_to_compact clamped
+  end
+
+(* Parse a big-endian hex string into a 32-byte little-endian Cstruct.
+   The hex string is in normal reading order (MSB first), but the Cstruct
+   stores bytes in LE (byte 0 = LSB). If the hex is shorter than 64 chars
+   it is zero-padded on the left (high bytes). *)
+let work_of_hex (hex : string) : Cstruct.t =
+  (* Pad to 64 hex chars *)
+  let padded =
+    let len = String.length hex in
+    if len >= 64 then hex
+    else String.make (64 - len) '0' ^ hex
+  in
+  let cs = Cstruct.create 32 in
+  for i = 0 to 31 do
+    (* BE hex byte i maps to LE byte (31 - i) *)
+    let byte = int_of_string ("0x" ^ String.sub padded (i * 2) 2) in
+    Cstruct.set_uint8 cs (31 - i) byte
+  done;
+  cs
+
+let zero_work : Cstruct.t = Cstruct.create 32
 
 (* Mainnet genesis block header *)
 let mainnet_genesis_header : Types.block_header = {
@@ -229,8 +316,32 @@ let mainnet : network_config = {
   bip65_height = 388381;
   bip66_height = 363725;
   segwit_height = 481824;
+  taproot_height = 709632;
   pow_allow_min_difficulty = false;
   pow_no_retargeting = false;
+  pow_limit = 0x1d00ffffl;
+  (* From Bitcoin Core chainparams.cpp (approximately block 804000) *)
+  minimum_chain_work = work_of_hex
+    "000000000000000000000000000000000000000052b2559353df4117b7348b64";
+  (* Mainnet assumevalid — block 804000 in internal LE byte order.
+     Display hash: 00000000000000000002a7c4c1e48d76c5a37902165a270156b7a8d72f8571c4 *)
+  assume_valid_hash = Some (Types.hash256_of_hex
+    "c471852fd7a8b75601275a160279a3c5768de4c1c4a702000000000000000000");
+  checkpoints = [
+    (11111, Types.hash256_of_hex "1d7c6eb2fd42f55925e92efad68b61edd22fba29fde8783df744e26900000000");
+    (33333, Types.hash256_of_hex "a6d0b5df7d0df069ceb1e736a216ad187a50b07aaa4e78748a58d52d00000000");
+    (74000, Types.hash256_of_hex "201a66b853f9e7814a820e2af5f5dc79c07144e31ce4c9a39339570000000000");
+    (105000, Types.hash256_of_hex "97dc6b1d15fbeef373a744fee0b254b0d2c820a3ae7f0228ce91020000000000");
+    (134444, Types.hash256_of_hex "feb0d2420d4a18914c81ac30f494a5d4ff34cd15d34cfd2fb105000000000000");
+    (168000, Types.hash256_of_hex "63b703835cb735cb9a89d733cbe66f212f63795e0172ea619e09000000000000");
+    (193000, Types.hash256_of_hex "17138bca83bdc3e6f60f01177c3877a98266de40735f2a459f05000000000000");
+    (210000, Types.hash256_of_hex "2e3471a19b8e22b7f939c63663076603cf692f19837e34958b04000000000000");
+    (216116, Types.hash256_of_hex "4edf231bf170234e6a811460f95c94af9464e41ee833b4f4b401000000000000");
+    (225430, Types.hash256_of_hex "32595730b165f097e7b806a679cf7f3e439040f750433808c101000000000000");
+    (250000, Types.hash256_of_hex "14d2f24d29bed75354f3f88a5fb50022fc064b02291fdf873800000000000000");
+    (279000, Types.hash256_of_hex "407ebde958e44190fa9e810ea1fc3a7ef601c3b0a0728cae0100000000000000");
+    (295000, Types.hash256_of_hex "83a93246c67003105af33ae0b29dd66f689d0f0ff54e9b4d0000000000000000");
+  ];
 }
 
 (* Testnet3 configuration *)
@@ -263,8 +374,13 @@ let testnet : network_config = {
   bip65_height = 581885;
   bip66_height = 330776;
   segwit_height = 834624;
+  taproot_height = 0;
   pow_allow_min_difficulty = true;
   pow_no_retargeting = false;
+  pow_limit = 0x1d00ffffl;
+  minimum_chain_work = zero_work;
+  assume_valid_hash = None;
+  checkpoints = [];
 }
 
 (* Regtest configuration (local testing) *)
@@ -292,8 +408,13 @@ let regtest : network_config = {
   bip65_height = 1351;
   bip66_height = 1251;
   segwit_height = 0;  (* SegWit active from genesis *)
+  taproot_height = 0;  (* Taproot active from genesis *)
   pow_allow_min_difficulty = true;
   pow_no_retargeting = true;
+  pow_limit = 0x207fffffl;
+  minimum_chain_work = zero_work;
+  assume_valid_hash = None;
+  checkpoints = [];
 }
 
 (* Encode block height in coinbase transaction (BIP-34) *)
@@ -347,3 +468,210 @@ let is_difficulty_adjustment_height (height : int) : bool =
 (* Genesis block coinbase is NOT spendable (not in UTXO set) *)
 let is_genesis_coinbase (height : int) (_txid : Types.hash256) : bool =
   height = 0
+
+(* ============================================================================
+   Script verification flags (duplicated from Script to avoid dependency)
+   ============================================================================ *)
+
+let script_verify_p2sh                  = 1 lsl 0   (* BIP-16 *)
+let script_verify_dersig                = 1 lsl 2   (* BIP-66 *)
+let script_verify_low_s                 = 1 lsl 3   (* BIP-62 rule 5 *)
+let script_verify_nulldummy             = 1 lsl 4   (* BIP-147 *)
+let script_verify_minimaldata           = 1 lsl 5   (* BIP-62 minimal push *)
+let script_verify_sigpushonly           = 1 lsl 6   (* scriptSig push-only *)
+let script_verify_cleanstack            = 1 lsl 7   (* exactly one stack element *)
+let script_verify_checklocktimeverify   = 1 lsl 9   (* BIP-65 *)
+let script_verify_witness               = 1 lsl 11  (* BIP-141 *)
+let script_verify_nullfail              = 1 lsl 12  (* BIP-146 *)
+let script_verify_witness_pubkeytype    = 1 lsl 14  (* BIP-141 compressed keys *)
+let script_verify_taproot               = 1 lsl 17  (* BIP-341/342 *)
+
+(* Compute the correct script verification flags for a given block height *)
+let get_block_script_flags (height : int) (network : network_config) : int =
+  (* P2SH is always on (BIP-16 activated at height 173805 on mainnet,
+     but we treat it as always-on for simplicity) *)
+  let flags = script_verify_p2sh in
+  (* BIP-66: strict DER signatures *)
+  let flags =
+    if height >= network.bip66_height then flags lor script_verify_dersig
+    else flags
+  in
+  (* BIP-65: OP_CHECKLOCKTIMEVERIFY *)
+  let flags =
+    if height >= network.bip65_height then flags lor script_verify_checklocktimeverify
+    else flags
+  in
+  (* SegWit (BIP-141) and associated rules *)
+  let flags =
+    if height >= network.segwit_height then
+      flags
+      lor script_verify_witness
+      lor script_verify_nulldummy
+      lor script_verify_cleanstack
+      lor script_verify_sigpushonly
+      lor script_verify_nullfail
+      lor script_verify_low_s
+      lor script_verify_minimaldata
+      lor script_verify_witness_pubkeytype
+    else flags
+  in
+  (* Taproot (BIP-341/342) *)
+  let flags =
+    if height >= network.taproot_height then flags lor script_verify_taproot
+    else flags
+  in
+  flags
+
+(* ============================================================================
+   Testnet min-difficulty rule
+   ============================================================================ *)
+
+(* Target spacing in seconds (10 minutes) *)
+let target_spacing = 600
+
+(* On testnet, if a block's timestamp is more than 2 * target_spacing (20 min)
+   after the previous block, allow mining at the minimum difficulty (pow_limit).
+   Returns None if the rule does not apply, Some nbits if it does. *)
+let testnet_min_difficulty_bits ~(prev_block_time : int32)
+    ~(current_time : int32) ~(network : network_config) : int32 option =
+  if network.pow_allow_min_difficulty then begin
+    let elapsed = Int32.to_int (Int32.sub current_time prev_block_time) in
+    if elapsed > 2 * target_spacing then
+      Some network.pow_limit
+    else
+      None
+  end else
+    None
+
+(* ============================================================================
+   256-bit work addition
+   ============================================================================ *)
+
+(* Add two 32-byte little-endian integers with carry, returning a new 32-byte
+   result (overflow beyond 256 bits is silently truncated). *)
+(* Compare two 32-byte LE work values. Delegates to target_compare. *)
+let work_compare (a : Cstruct.t) (b : Cstruct.t) : int =
+  target_compare a b
+
+(* Compute proof-of-work for a compact target (nBits) as a 32-byte LE integer.
+   Uses Bitcoin Core's formula: work = (~target / (target + 1)) + 1
+   which avoids overflow since ~target + target + 1 = 2^256.
+   Returns zero-work if the target is zero. *)
+let work_from_compact (bits : int32) : Cstruct.t =
+  let target = compact_to_target bits in
+  (* Check for zero target *)
+  let is_zero = ref true in
+  for i = 0 to 31 do
+    if Cstruct.get_uint8 target i <> 0 then is_zero := false
+  done;
+  if !is_zero then Cstruct.create 32
+  else begin
+    (* Compute target + 1 *)
+    let target_plus_1 = Cstruct.create 32 in
+    Cstruct.blit target 0 target_plus_1 0 32;
+    let carry = ref 1 in
+    for i = 0 to 31 do
+      let v = Cstruct.get_uint8 target_plus_1 i + !carry in
+      Cstruct.set_uint8 target_plus_1 i (v land 0xFF);
+      carry := v lsr 8
+    done;
+    (* Compute ~target (bitwise NOT) *)
+    let not_target = Cstruct.create 32 in
+    for i = 0 to 31 do
+      Cstruct.set_uint8 not_target i (0xFF lxor Cstruct.get_uint8 target i)
+    done;
+    (* Divide ~target by (target + 1) using long division.
+       Both are 256-bit LE values. We do schoolbook division from MSB to LSB.
+       Quotient is at most 256 bits. *)
+    let quotient = Cstruct.create 32 in
+    (* We'll use a simple bit-by-bit long division.
+       Process bits from MSB (bit 255) to LSB (bit 0). *)
+    let remainder = Cstruct.create 33 in  (* Extra byte for overflow during shift *)
+    for bit = 255 downto 0 do
+      (* Left-shift remainder by 1 *)
+      let c = ref 0 in
+      for i = 0 to 32 do
+        let v = (Cstruct.get_uint8 remainder i lsl 1) lor !c in
+        Cstruct.set_uint8 remainder i (v land 0xFF);
+        c := v lsr 8
+      done;
+      (* Bring down next bit of not_target *)
+      let byte_idx = bit / 8 in
+      let bit_idx = bit mod 8 in
+      let b = (Cstruct.get_uint8 not_target byte_idx lsr bit_idx) land 1 in
+      let v = Cstruct.get_uint8 remainder 0 lor b in
+      Cstruct.set_uint8 remainder 0 v;
+      (* Compare remainder >= target_plus_1 *)
+      (* Compare from MSB: remainder has 33 bytes, target_plus_1 has 32 *)
+      let ge = ref true in
+      let decided = ref false in
+      if Cstruct.get_uint8 remainder 32 > 0 then begin
+        ge := true; decided := true  (* remainder has overflow byte *)
+      end;
+      if not !decided then begin
+        let i = ref 31 in
+        while !i >= 0 && not !decided do
+          let rv = Cstruct.get_uint8 remainder !i in
+          let tv = Cstruct.get_uint8 target_plus_1 !i in
+          if rv > tv then (ge := true; decided := true)
+          else if rv < tv then (ge := false; decided := true);
+          decr i
+        done
+      end;
+      if !ge then begin
+        (* Set quotient bit *)
+        let qbyte = bit / 8 in
+        let qbit = bit mod 8 in
+        Cstruct.set_uint8 quotient qbyte
+          (Cstruct.get_uint8 quotient qbyte lor (1 lsl qbit));
+        (* Subtract target_plus_1 from remainder *)
+        let borrow = ref 0 in
+        for i = 0 to 31 do
+          let v = Cstruct.get_uint8 remainder i
+                  - Cstruct.get_uint8 target_plus_1 i - !borrow in
+          if v < 0 then begin
+            Cstruct.set_uint8 remainder i (v + 256);
+            borrow := 1
+          end else begin
+            Cstruct.set_uint8 remainder i v;
+            borrow := 0
+          end
+        done;
+        (* Handle borrow from byte 32 *)
+        let v32 = Cstruct.get_uint8 remainder 32 - !borrow in
+        Cstruct.set_uint8 remainder 32 (max 0 v32)
+      end
+    done;
+    (* Add 1 to quotient *)
+    let carry = ref 1 in
+    for i = 0 to 31 do
+      let v = Cstruct.get_uint8 quotient i + !carry in
+      Cstruct.set_uint8 quotient i (v land 0xFF);
+      carry := v lsr 8
+    done;
+    quotient
+  end
+
+let work_add (a : Cstruct.t) (b : Cstruct.t) : Cstruct.t =
+  let result = Cstruct.create 32 in
+  let carry = ref 0 in
+  for i = 0 to 31 do
+    let sum = Cstruct.get_uint8 a i + Cstruct.get_uint8 b i + !carry in
+    Cstruct.set_uint8 result i (sum land 0xFF);
+    carry := sum lsr 8
+  done;
+  result
+
+(* ============================================================================
+   BIP-30 exception heights
+   ============================================================================ *)
+
+(* The two blocks where duplicate coinbase TXIDs were allowed (before BIP-34
+   enforced unique coinbase scripts via block height encoding). These blocks
+   contained coinbase transactions whose TXIDs matched earlier coinbases,
+   effectively destroying the earlier outputs. *)
+let bip30_exception_heights = [91842; 91880]
+
+(* Look up the expected block hash for a checkpoint height *)
+let get_checkpoint_hash (height : int) (network : network_config) : Types.hash256 option =
+  List.assoc_opt height network.checkpoints

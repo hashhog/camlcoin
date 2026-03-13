@@ -2437,11 +2437,11 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
         end
       end
     else begin
-      (* BIP-16: P2SH requires scriptSig to be push-only and exactly one push *)
+      (* BIP-16: P2SH requires scriptSig to be push-only *)
       let p2sh_pushonly_ok =
         try
           let sig_ops = parse_script script_sig in
-          List.for_all is_push_opcode sig_ops && List.length sig_ops = 1
+          List.for_all is_push_opcode sig_ops
         with _ -> false
       in
       if not p2sh_pushonly_ok then
@@ -2839,7 +2839,11 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                           st.stack <- wit_stack;
                           begin match run_script st tap_script with
                           | Error e -> Error e
-                          | Ok () -> check_stack_top st
+                          | Ok () ->
+                            if stack_size st <> 1 then
+                              Error "Stack not clean after execution"
+                            else
+                              check_stack_top st
                           end
                       end
                     end

@@ -790,6 +790,21 @@ let build_p2tr_script (hash : Types.hash256) : Cstruct.t =
   Cstruct.blit hash 0 s 2 32;
   s
 
+(* Build a change script matching the destination script type for privacy *)
+let build_change_script (dest_script : Cstruct.t) (change_pubkey : Cstruct.t) : Cstruct.t =
+  match Script.classify_script dest_script with
+  | Script.P2TR_script _ ->
+    (* P2TR change: use x-only pubkey (drop first byte of compressed key) *)
+    let xonly = Cstruct.sub change_pubkey 1 32 in
+    build_p2tr_script xonly
+  | Script.P2PKH_script _ ->
+    let change_hash = Crypto.hash160 change_pubkey in
+    build_p2pkh_script change_hash
+  | _ ->
+    (* Default to P2WPKH for P2WPKH, P2WSH, and other types *)
+    let change_hash = Crypto.hash160 change_pubkey in
+    build_p2wpkh_script change_hash
+
 (* Sign a transaction's inputs given the selected UTXOs *)
 let sign_transaction_inputs (w : t) (tx : Types.transaction)
     (input_utxos : wallet_utxo list) : Types.transaction =
@@ -898,8 +913,7 @@ let create_transaction (w : t) ~(dest_address : string)
       (* Add change output if significant *)
       if selection.change > dust_threshold then begin
         let change_kp = generate_change_key w in
-        let change_hash = Crypto.hash160 change_kp.public_key in
-        let change_script = build_p2wpkh_script change_hash in
+        let change_script = build_change_script dest_script change_kp.public_key in
         let change_output = { Types.value = selection.change; script_pubkey = change_script } in
         outputs := insert_at_random !outputs change_output
       end;
@@ -988,8 +1002,8 @@ let create_transaction_multi (w : t)
 
     if selection.change > dust_threshold then begin
       let change_kp = generate_change_key w in
-      let change_hash = Crypto.hash160 change_kp.public_key in
-      let change_script = build_p2wpkh_script change_hash in
+      let dest_script = (List.hd parsed_outputs).Types.script_pubkey in
+      let change_script = build_change_script dest_script change_kp.public_key in
       let change_output = { Types.value = selection.change; script_pubkey = change_script } in
       tx_outputs := insert_at_random !tx_outputs change_output
     end;
@@ -1195,8 +1209,8 @@ let bump_fee (w : t) ~(txid : Types.hash256) ~(new_fee_rate : float)
             let surplus = Int64.sub !extra_total extra_inputs_needed in
             if Int64.compare surplus dust_threshold > 0 then begin
               let change_kp = generate_change_key w in
-              let change_hash = Crypto.hash160 change_kp.public_key in
-              let change_script = build_p2wpkh_script change_hash in
+              let dest_script = (List.hd new_outputs).Types.script_pubkey in
+              let change_script = build_change_script dest_script change_kp.public_key in
               insert_at_random new_outputs { Types.value = surplus; script_pubkey = change_script }
             end else
               new_outputs

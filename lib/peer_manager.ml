@@ -465,8 +465,20 @@ let announce_block (pm : t) (header : Types.block_header) (hash : Types.hash256)
   ) ready
 
 (* Announce a new transaction to all connected peers via inv. *)
-let announce_tx (pm : t) (txid : Types.hash256) : unit Lwt.t =
-  broadcast pm (P2p.InvMsg [{ P2p.inv_type = P2p.InvTx; hash = txid }])
+let announce_tx (pm : t) ~(txid : Types.hash256) ~(wtxid : Types.hash256)
+    ~(fee_rate : int64) : unit Lwt.t =
+  let ready = get_ready_peers pm in
+  Lwt_list.iter_p (fun peer ->
+    Lwt.catch (fun () ->
+      (* Skip peers whose feefilter is above this tx's fee rate *)
+      if peer.Peer.feefilter > 0L && fee_rate < peer.Peer.feefilter then
+        Lwt.return_unit
+      else if peer.Peer.wtxid_relay then
+        Peer.send_message peer (P2p.InvMsg [{ P2p.inv_type = P2p.InvWitnessTx; hash = wtxid }])
+      else
+        Peer.send_message peer (P2p.InvMsg [{ P2p.inv_type = P2p.InvTx; hash = txid }])
+    ) (fun _exn -> Lwt.return_unit)
+  ) ready
 
 (* Check if a 16-byte address is an IPv4-mapped IPv6 address (::ffff:x.x.x.x) *)
 let is_ipv4_mapped (addr : Cstruct.t) : bool =

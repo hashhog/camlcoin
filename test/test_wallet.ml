@@ -343,7 +343,7 @@ let test_create_transaction () =
   Wallet.scan_block w block 100;
   (* Create transaction to another address *)
   let dest_addr = Wallet.get_new_address w in
-  match Wallet.create_transaction w ~dest_address:dest_addr ~amount:100_000L ~fee_rate:1.0 with
+  match Wallet.create_transaction w ~dest_address:dest_addr ~amount:100_000L ~fee_rate:1.0 () with
   | Error e -> Alcotest.fail ("tx creation failed: " ^ e)
   | Ok created_tx ->
     Alcotest.(check int) "has inputs" 1 (List.length created_tx.inputs);
@@ -373,7 +373,7 @@ let test_create_transaction_invalid_address () =
   } in
   Wallet.scan_block w block 100;
   (* Try invalid address *)
-  match Wallet.create_transaction w ~dest_address:"invalid" ~amount:100_000L ~fee_rate:1.0 with
+  match Wallet.create_transaction w ~dest_address:"invalid" ~amount:100_000L ~fee_rate:1.0 () with
   | Ok _ -> Alcotest.fail "should have failed"
   | Error _ -> ()
 
@@ -462,6 +462,127 @@ let persistence_tests = [
   Alcotest.test_case "load nonexistent" `Quick test_load_nonexistent;
 ]
 
+(* ============================================================================
+   BIP-39 Mnemonic Tests
+   ============================================================================ *)
+
+(* Helper to convert Cstruct to hex string *)
+let cstruct_to_hex cs =
+  let len = Cstruct.length cs in
+  let buf = Buffer.create (len * 2) in
+  for i = 0 to len - 1 do
+    Buffer.add_string buf (Printf.sprintf "%02x" (Cstruct.get_uint8 cs i))
+  done;
+  Buffer.contents buf
+
+let test_bip39_vector1_mnemonic () =
+  (* Test vector 1: 128-bit all-zeros entropy should produce known mnemonic *)
+  let expected_mnemonic =
+    "abandon abandon abandon abandon abandon abandon \
+     abandon abandon abandon abandon abandon about"
+  in
+  Alcotest.(check bool) "validate known mnemonic" true
+    (Bip39.validate_mnemonic expected_mnemonic)
+
+let test_bip39_vector1_seed () =
+  (* Test vector 1: known mnemonic with empty passphrase produces known seed *)
+  let mnemonic =
+    "abandon abandon abandon abandon abandon abandon \
+     abandon abandon abandon abandon abandon about"
+  in
+  let seed = Bip39.mnemonic_to_seed ~mnemonic () in
+  let expected_hex =
+    "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc1\
+     9a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4"
+  in
+  let seed_hex = cstruct_to_hex seed in
+  Alcotest.(check string) "seed matches test vector" expected_hex seed_hex;
+  Alcotest.(check int) "seed is 64 bytes" 64 (Cstruct.length seed)
+
+let test_bip39_validate_valid () =
+  let mnemonic =
+    "abandon abandon abandon abandon abandon abandon \
+     abandon abandon abandon abandon abandon about"
+  in
+  Alcotest.(check bool) "valid mnemonic" true
+    (Bip39.validate_mnemonic mnemonic)
+
+let test_bip39_validate_wrong_word () =
+  (* Replace a valid word with an invalid one *)
+  let mnemonic =
+    "abandon abandon abandon abandon abandon abandon \
+     abandon abandon abandon abandon abandon zzzznotaword"
+  in
+  Alcotest.(check bool) "invalid word rejected" false
+    (Bip39.validate_mnemonic mnemonic)
+
+let test_bip39_validate_wrong_count () =
+  (* Too few words *)
+  let mnemonic = "abandon abandon abandon" in
+  Alcotest.(check bool) "wrong count rejected" false
+    (Bip39.validate_mnemonic mnemonic)
+
+let test_bip39_validate_bad_checksum () =
+  (* Valid words but wrong checksum: change last word *)
+  let mnemonic =
+    "abandon abandon abandon abandon abandon abandon \
+     abandon abandon abandon abandon abandon abandon"
+  in
+  Alcotest.(check bool) "bad checksum rejected" false
+    (Bip39.validate_mnemonic mnemonic)
+
+let test_bip39_generate_mnemonic () =
+  (* Generate a mnemonic and validate it *)
+  let mnemonic = Bip39.generate_mnemonic () in
+  let words = String.split_on_char ' ' mnemonic in
+  Alcotest.(check int) "12 words generated" 12 (List.length words);
+  Alcotest.(check bool) "generated mnemonic is valid" true
+    (Bip39.validate_mnemonic mnemonic)
+
+let test_bip39_generate_mnemonic_256 () =
+  (* Generate a 256-bit mnemonic and validate it *)
+  let mnemonic = Bip39.generate_mnemonic ~strength:256 () in
+  let words = String.split_on_char ' ' mnemonic in
+  Alcotest.(check int) "24 words generated" 24 (List.length words);
+  Alcotest.(check bool) "generated 256-bit mnemonic is valid" true
+    (Bip39.validate_mnemonic mnemonic)
+
+let test_bip39_init_from_mnemonic () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let mnemonic =
+    "abandon abandon abandon abandon abandon abandon \
+     abandon abandon abandon abandon abandon about"
+  in
+  (* Should not raise *)
+  Wallet.init_from_mnemonic w mnemonic ();
+  (* Should be able to derive addresses after init *)
+  let addr = Wallet.get_new_address w in
+  Alcotest.(check bool) "address generated after mnemonic init" true
+    (String.length addr > 0)
+
+let test_bip39_init_from_mnemonic_invalid () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let mnemonic = "abandon abandon abandon" in
+  try
+    Wallet.init_from_mnemonic w mnemonic ();
+    Alcotest.fail "should have raised"
+  with Failure msg ->
+    Alcotest.(check bool) "error message" true
+      (String.length msg > 0)
+
+let bip39_tests = [
+  Alcotest.test_case "vector1 mnemonic valid" `Quick test_bip39_vector1_mnemonic;
+  Alcotest.test_case "vector1 seed" `Quick test_bip39_vector1_seed;
+  Alcotest.test_case "validate valid" `Quick test_bip39_validate_valid;
+  Alcotest.test_case "validate wrong word" `Quick test_bip39_validate_wrong_word;
+  Alcotest.test_case "validate wrong count" `Quick test_bip39_validate_wrong_count;
+  Alcotest.test_case "validate bad checksum" `Quick test_bip39_validate_bad_checksum;
+  Alcotest.test_case "generate mnemonic 128" `Quick test_bip39_generate_mnemonic;
+  Alcotest.test_case "generate mnemonic 256" `Quick test_bip39_generate_mnemonic_256;
+  Alcotest.test_case "init from mnemonic" `Quick test_bip39_init_from_mnemonic;
+  Alcotest.test_case "init from invalid mnemonic" `Quick test_bip39_init_from_mnemonic_invalid;
+]
+
 let () = Alcotest.run "test_wallet" [
   ("creation", creation_tests);
   ("key_management", key_management_tests);
@@ -471,4 +592,5 @@ let () = Alcotest.run "test_wallet" [
   ("coin_selection", coin_selection_tests);
   ("tx_creation", tx_creation_tests);
   ("persistence", persistence_tests);
+  ("bip39", bip39_tests);
 ]

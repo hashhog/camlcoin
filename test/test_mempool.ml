@@ -96,7 +96,7 @@ let create_test_mempool () =
     height = 0;
     is_coinbase = false;
   };
-  let mp = Mempool.create ~utxo ~current_height:100 in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
   (mp, utxo, db, txid1, txid2, txid3)
 
 (* ============================================================================
@@ -228,7 +228,7 @@ let test_mempool_reject_immature_coinbase () =
     is_coinbase = true;
   };
   (* Create mempool at height 100 (only 50 confirmations) *)
-  let mp = Mempool.create ~utxo ~current_height:100 in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
   let tx = make_regular_tx
     [make_test_input cb_txid 0l]
     [make_test_output 4_999_990_000L]

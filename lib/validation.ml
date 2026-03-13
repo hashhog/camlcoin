@@ -746,9 +746,9 @@ let _sequence_locktime_granularity = 9          (* 512 = 1 lsl 9 seconds *)
 
    utxo_heights: array of block heights where each input's UTXO was created.
    utxo_mtps: array of median-time-past values for each input's UTXO block.
-     TODO: For correct BIP68 time-based locks, we need the MTP of the block at
-     height (utxo_height - 1). For now, time-based locks use the provided MTP
-     approximation. Height-based locks are implemented correctly. *)
+     When get_mtp_at_height is provided, both this array and the time-based lock
+     check use MTP at (utxo_height - 1) per BIP68. Otherwise falls back to the
+     caller-supplied approximation. Height-based locks are implemented correctly. *)
 let check_sequence_locks (tx : Types.transaction) ~(block_height : int)
     ~(median_time : int32) ~(utxo_heights : int array) ~(utxo_mtps : int32 array)
     ?(get_mtp_at_height : (int -> int32) option) () : bool =
@@ -1032,9 +1032,9 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
                   match lookup inp.Types.previous_output with
                   | Some utxo ->
                     utxo_heights.(j) <- utxo.height;
-                    (* TODO: utxo_mtps should be the MTP at (utxo.height - 1).
-                       Using median_time as approximation for now. *)
-                    utxo_mtps.(j) <- median_time
+                    utxo_mtps.(j) <- (match get_mtp_at_height with
+                      | Some f -> f (utxo.height - 1)
+                      | None -> median_time)
                   | None -> ()
                 ) tx.inputs;
                 if not (check_sequence_locks tx ~block_height:height

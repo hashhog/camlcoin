@@ -266,7 +266,7 @@ let spending_input_size (script_pubkey : Cstruct.t) : int =
   match Script.classify_script script_pubkey with
   | Script.P2PKH_script _ -> 148
   | Script.P2SH_script _ -> 91
-  | Script.P2WPKH_script _ -> 68
+  | Script.P2WPKH_script _ -> 67
   | Script.P2WSH_script _ -> 109
   | Script.P2TR_script _ -> 58
   | Script.OP_RETURN_data _ -> 0  (* OP_RETURN outputs are unspendable *)

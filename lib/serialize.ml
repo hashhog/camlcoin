@@ -201,9 +201,13 @@ let deserialize_transaction r : Types.transaction =
   let out_count = read_compact_size r in
   let outputs = List.init out_count (fun _ -> deserialize_tx_out r) in
   let witnesses =
-    if has_witness then
-      List.init in_count (fun _ -> deserialize_witness r)
-    else []
+    if has_witness then begin
+      let w = List.init in_count (fun _ -> deserialize_witness r) in
+      (* Reject if witness marker/flag set but all stacks are empty *)
+      if List.for_all (fun wit -> wit.Types.items = []) w then
+        failwith "Superfluous witness record";
+      w
+    end else []
   in
   let locktime = read_int32_le r in
   { version; inputs; outputs; witnesses; locktime }

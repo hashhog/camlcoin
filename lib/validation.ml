@@ -518,41 +518,37 @@ let compute_witness_merkle_root (transactions : Types.transaction list)
 (* Verify the witness commitment in a block. *)
 let check_witness_commitment (block : Types.block)
     : (unit, block_validation_error) result =
-  if not (block_has_witness block) then
-    (* No witness data in any transaction, no commitment required *)
-    Ok ()
-  else begin
-    let coinbase = List.hd block.transactions in
-    match find_witness_commitment coinbase with
-    | None ->
-      (* Block has witness data but no commitment in coinbase *)
-      Error BlockBadWitnessCommitment
-    | Some commitment ->
-      (* Get the witness reserved value: first item in coinbase's witness stack.
-         Must be exactly 32 bytes. *)
-      let witness_nonce =
-        match coinbase.witnesses with
+  let coinbase = List.hd block.transactions in
+  match find_witness_commitment coinbase with
+  | Some commitment ->
+    (* Witness commitment found in coinbase — always validate it,
+       regardless of whether transactions have witness data *)
+    let witness_nonce =
+      match coinbase.witnesses with
+      | [] -> None
+      | w :: _ ->
+        match w.Types.items with
         | [] -> None
-        | w :: _ ->
-          match w.Types.items with
-          | [] -> None
-          | item :: _ ->
-            if Cstruct.length item = 32 then Some item
-            else None
-      in
-      match witness_nonce with
-      | None -> Error BlockBadWitnessCommitment
-      | Some nonce ->
-        (* Compute witness merkle root *)
-        let witness_root = compute_witness_merkle_root block.transactions in
-        (* Compute expected commitment: SHA256d(witness_merkle_root || witness_nonce) *)
-        let combined = Cstruct.concat [witness_root; nonce] in
-        let expected = Crypto.sha256d combined in
-        if Cstruct.equal expected commitment then
-          Ok ()
-        else
-          Error BlockBadWitnessCommitment
-  end
+        | item :: _ ->
+          if Cstruct.length item = 32 then Some item
+          else None
+    in
+    (match witness_nonce with
+    | None -> Error BlockBadWitnessCommitment
+    | Some nonce ->
+      let witness_root = compute_witness_merkle_root block.transactions in
+      let combined = Cstruct.concat [witness_root; nonce] in
+      let expected = Crypto.sha256d combined in
+      if Cstruct.equal expected commitment then
+        Ok ()
+      else
+        Error BlockBadWitnessCommitment)
+  | None ->
+    (* No commitment — reject if any transaction has witness data *)
+    if block_has_witness block then
+      Error BlockBadWitnessCommitment
+    else
+      Ok ()
 
 (* ============================================================================
    Block Validation

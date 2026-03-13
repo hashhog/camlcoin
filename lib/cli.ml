@@ -22,6 +22,7 @@ type config = {
   debug : bool;
   wallet_enabled : bool;
   prune : int;  (* 0 = no pruning *)
+  log_categories : string list;  (* empty = all enabled *)
 }
 
 (* ============================================================================
@@ -42,6 +43,7 @@ let default_config : config = {
   debug = false;
   wallet_enabled = true;
   prune = 0;
+  log_categories = [];
 }
 
 (* Network-specific configuration *)
@@ -61,10 +63,18 @@ let config_for_network = function
    Logging Setup
    ============================================================================ *)
 
-let setup_logging (debug : bool) : unit =
+let setup_logging (debug : bool) ?(categories : string list = []) () : unit =
   Fmt_tty.setup_std_outputs ();
-  Logs.set_level (Some (if debug then Logs.Debug else Logs.Info));
-  Logs.set_reporter (Logs_fmt.reporter ())
+  let default_level = if debug then Logs.Debug else Logs.Info in
+  Logs.set_level (Some default_level);
+  Logs.set_reporter (Logs_fmt.reporter ());
+  if categories <> [] then
+    List.iter (fun src ->
+      let name = Logs.Src.name src in
+      if not (List.mem (String.uppercase_ascii name)
+                (List.map String.uppercase_ascii categories)) then
+        Logs.Src.set_level src (Some Logs.Warning)
+    ) (Logs.Src.list ())
 
 (* ============================================================================
    Main Application Run Loop
@@ -73,7 +83,7 @@ let setup_logging (debug : bool) : unit =
 let run (config : config) : unit Lwt.t =
   let open Lwt.Syntax in
 
-  setup_logging config.debug;
+  setup_logging config.debug ~categories:config.log_categories ();
 
   Logs.info (fun m ->
     m "CamlCoin v%s starting on %s"
@@ -100,6 +110,7 @@ let run (config : config) : unit Lwt.t =
 
   (* Initialize or restore chain state *)
   let chain = Sync.restore_chain_state db network in
+  chain.prune_target <- config.prune;
   Logs.info (fun m ->
     m "Chain state initialized, headers at height %d"
       chain.headers_synced);

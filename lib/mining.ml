@@ -15,6 +15,10 @@
    witness merkle root (with coinbase witness = 32 zero bytes) and
    a witness nonce (also 32 zero bytes by convention). *)
 
+let log_src = Logs.Src.create "MINING" ~doc:"Mining"
+module Log = (val Logs.src_log log_src : Logs.LOG)
+let _ = Log.info  (* suppress unused module warning *)
+
 (* ============================================================================
    Block Template Type
    ============================================================================ *)

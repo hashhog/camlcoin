@@ -52,16 +52,18 @@ let read_compact_size r =
     v
   end
   else if first = 0xFE then begin
-    let v = Int32.to_int (read_int32_le r) in
-    if v < 0x10000 then failwith "non-canonical CompactSize";
-    if v > max_size then failwith "CompactSize exceeds max size";
-    v
+    let v32 = read_int32_le r in
+    if Int32.compare v32 0x10000l < 0 then failwith "non-canonical CompactSize";
+    if Int32.compare v32 0l < 0 then failwith "CompactSize exceeds max int";
+    if Int32.compare v32 (Int32.of_int max_size) > 0 then failwith "CompactSize exceeds max size";
+    Int32.to_int v32
   end
   else begin
-    let v = Int64.to_int (read_int64_le r) in
-    if v < 0x100000000 then failwith "non-canonical CompactSize";
-    if v > max_size then failwith "CompactSize exceeds max size";
-    v
+    let v64 = read_int64_le r in
+    if Int64.compare v64 0x100000000L < 0 then failwith "non-canonical CompactSize";
+    if Int64.compare v64 (Int64.of_int max_size) > 0 then failwith "CompactSize exceeds max size";
+    if Int64.compare v64 (Int64.of_int max_int) > 0 then failwith "CompactSize exceeds max int";
+    Int64.to_int v64
   end
 
 let read_string r =

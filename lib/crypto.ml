@@ -155,6 +155,28 @@ let schnorr_verify ~(pubkey_x : Cstruct.t) ~(msg : Cstruct.t) ~(signature : Cstr
         (cstruct_to_bigstring signature)
     with _ -> false
 
+(* Schnorr signature creation (BIP-340) *)
+external schnorr_sign_raw : Bigstring.t -> Bigstring.t -> Bigstring.t
+  = "caml_schnorr_sign"
+
+let schnorr_sign ~(privkey : Cstruct.t) ~(msg : Cstruct.t) : Cstruct.t =
+  if Cstruct.length privkey <> 32 || Cstruct.length msg <> 32 then
+    failwith "schnorr_sign: privkey must be 32 bytes, msg must be 32 bytes"
+  else
+    bigstring_to_cstruct (schnorr_sign_raw
+      (cstruct_to_bigstring privkey)
+      (cstruct_to_bigstring msg))
+
+(* Derive x-only public key from private key (32-byte output for Taproot) *)
+external derive_xonly_pubkey_raw : Bigstring.t -> Bigstring.t
+  = "caml_derive_xonly_pubkey"
+
+let derive_xonly_pubkey (privkey : Cstruct.t) : Cstruct.t =
+  if Cstruct.length privkey <> 32 then
+    failwith "derive_xonly_pubkey: privkey must be 32 bytes"
+  else
+    bigstring_to_cstruct (derive_xonly_pubkey_raw (cstruct_to_bigstring privkey))
+
 (* X-only pubkey tweak add check (for Taproot commitment verification) *)
 external xonly_tweak_add_check_raw : Bigstring.t -> Bigstring.t -> int -> Bigstring.t -> bool
   = "caml_xonly_pubkey_tweak_add_check"

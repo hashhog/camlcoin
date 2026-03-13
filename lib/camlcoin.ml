@@ -15,6 +15,7 @@ module Mempool = Mempool
 module Fee_estimation = Fee_estimation
 module Mining = Mining
 module Rpc = Rpc
+module Bip39 = Bip39
 module Wallet = Wallet
 module Cli = Cli
 module Perf = Perf

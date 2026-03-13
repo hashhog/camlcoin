@@ -1,7 +1,7 @@
 (library
  (name camlcoin)
  (public_name camlcoin)
- (libraries cstruct cstruct-unix lwt lwt.unix bigstring
+ (libraries cstruct cstruct-unix lwt lwt.unix unix bigstring
             cohttp-lwt-unix yojson digestif cmdliner
             logs logs.fmt fmt fmt.tty secp256k1-internal)
  (foreign_stubs

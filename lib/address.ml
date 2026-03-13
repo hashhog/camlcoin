@@ -8,6 +8,7 @@ type address_type =
   | P2WPKH      (* Pay to Witness Public Key Hash — bc1q... *)
   | P2WSH       (* Pay to Witness Script Hash — bc1q... (longer) *)
   | P2TR        (* Pay to Taproot — bc1p... *)
+  | WitnessUnknown of int  (* Future witness versions 2-16, BIP-141 forward compat *)
 
 type network = [`Mainnet | `Testnet | `Regtest]
 
@@ -292,6 +293,19 @@ let address_to_string (addr : address) : string =
      | Some data_5bit ->
        bech32_encode Bech32m hrp (witness_version :: data_5bit)
      | None -> failwith "convert_bits failed")
+  | WitnessUnknown v ->
+    let hrp = match addr.network with
+      | `Mainnet -> "bc"
+      | `Testnet -> "tb"
+      | `Regtest -> "bcrt"
+    in
+    let data_8bit = List.init (Cstruct.length addr.hash) (fun i ->
+      Cstruct.get_uint8 addr.hash i
+    ) in
+    (match convert_bits ~from_bits:8 ~to_bits:5 ~pad:true data_8bit with
+     | Some data_5bit ->
+       bech32_encode Bech32m hrp (v :: data_5bit)
+     | None -> failwith "convert_bits failed")
 
 let address_of_string (s : string) : (address, string) result =
   if String.length s = 0 then Error "Empty address"
@@ -316,23 +330,26 @@ let address_of_string (s : string) : (address, string) result =
      | Some (enc, hrp, data) when List.length data > 0 ->
        let witness_version = List.hd data in
        let data_5bit = List.tl data in
-       let network = match hrp with
-         | "bc" -> `Mainnet
-         | "bcrt" -> `Regtest
-         | _ -> `Mainnet
-       in
+       (match hrp with
+        | "bc" -> Ok `Mainnet
+        | "bcrt" -> Ok `Regtest
+        | _ -> Error (Printf.sprintf "Unknown bech32 HRP: %s" hrp))
+       |> (function
+        | Error e -> Error e
+        | Ok network ->
        (match convert_bits ~from_bits:5 ~to_bits:8 ~pad:false data_5bit with
         | Some data_8bit ->
           let hash = Cstruct.create (List.length data_8bit) in
           List.iteri (fun i b -> Cstruct.set_uint8 hash i b) data_8bit;
-          let addr_type = match witness_version, Cstruct.length hash, enc with
-            | 0, 20, Bech32 -> P2WPKH
-            | 0, 32, Bech32 -> P2WSH
-            | 1, 32, Bech32m -> P2TR
-            | _ -> P2WPKH (* fallback *)
-          in
-          Ok { addr_type; hash; network }
-        | None -> Error "convert_bits failed")
+          (match witness_version, Cstruct.length hash, enc with
+           | 0, 20, Bech32 -> Ok { addr_type = P2WPKH; hash; network }
+           | 0, 32, Bech32 -> Ok { addr_type = P2WSH; hash; network }
+           | 1, 32, Bech32m -> Ok { addr_type = P2TR; hash; network }
+           | v, len, Bech32m when v >= 2 && v <= 16 && len >= 2 && len <= 40 ->
+             Ok { addr_type = WitnessUnknown v; hash; network }
+           | v, len, _ ->
+             Error (Printf.sprintf "Invalid witness program: version=%d length=%d" v len))
+        | None -> Error "convert_bits failed"))
      | _ -> Error "Invalid bech32 address")
   | 't' | 'T' ->
     (* Bech32/Bech32m testnet *)
@@ -344,13 +361,14 @@ let address_of_string (s : string) : (address, string) result =
         | Some data_8bit ->
           let hash = Cstruct.create (List.length data_8bit) in
           List.iteri (fun i b -> Cstruct.set_uint8 hash i b) data_8bit;
-          let addr_type = match witness_version, Cstruct.length hash, enc with
-            | 0, 20, Bech32 -> P2WPKH
-            | 0, 32, Bech32 -> P2WSH
-            | 1, 32, Bech32m -> P2TR
-            | _ -> P2WPKH
-          in
-          Ok { addr_type; hash; network = `Testnet }
+          (match witness_version, Cstruct.length hash, enc with
+           | 0, 20, Bech32 -> Ok { addr_type = P2WPKH; hash; network = `Testnet }
+           | 0, 32, Bech32 -> Ok { addr_type = P2WSH; hash; network = `Testnet }
+           | 1, 32, Bech32m -> Ok { addr_type = P2TR; hash; network = `Testnet }
+           | v, len, Bech32m when v >= 2 && v <= 16 && len >= 2 && len <= 40 ->
+             Ok { addr_type = WitnessUnknown v; hash; network = `Testnet }
+           | v, len, _ ->
+             Error (Printf.sprintf "Invalid witness program: version=%d length=%d" v len))
         | None -> Error "convert_bits failed")
      | _ -> Error "Invalid bech32 testnet address")
   | 'm' | 'n' ->
@@ -383,7 +401,7 @@ let of_pubkey ?(network=`Mainnet) (addr_type : address_type) (pubkey : Cstruct.t
       pubkey
     in
     { addr_type; hash; network }
-  | P2SH | P2WSH -> failwith "Cannot create P2SH/P2WSH address from a single public key"
+  | P2SH | P2WSH | WitnessUnknown _ -> failwith "Cannot create P2SH/P2WSH/WitnessUnknown address from a single public key"
 
 (* Create P2SH address from script hash *)
 let of_script_hash ?(network=`Mainnet) (script_hash : Cstruct.t) : address =
@@ -415,14 +433,17 @@ let wif_decode (s : string) : (Cstruct.t * bool * network, string) result =
     if len < 33 then Error "WIF too short"
     else begin
       let version = Cstruct.get_uint8 payload 0 in
-      let network : network = match version with
-        | 0x80 -> `Mainnet
-        | 0xEF -> `Testnet
-        | _ -> `Mainnet
+      let network = match version with
+        | 0x80 -> Ok `Mainnet
+        | 0xEF -> Ok `Testnet
+        | _ -> Error (Printf.sprintf "Unknown WIF version: 0x%02x" version)
       in
-      let compressed = len = 34 && Cstruct.get_uint8 payload 33 = 0x01 in
-      let privkey = Cstruct.sub payload 1 32 in
-      Ok (privkey, compressed, network)
+      match network with
+      | Error e -> Error e
+      | Ok network ->
+        let compressed = len = 34 && Cstruct.get_uint8 payload 33 = 0x01 in
+        let privkey = Cstruct.sub payload 1 32 in
+        Ok (privkey, compressed, network)
     end
 
 (* ========== Address Type Utilities ========== *)
@@ -433,6 +454,7 @@ let address_type_to_string = function
   | P2WPKH -> "P2WPKH"
   | P2WSH -> "P2WSH"
   | P2TR -> "P2TR"
+  | WitnessUnknown v -> Printf.sprintf "WitnessUnknown(v%d)" v
 
 let network_to_string = function
   | `Mainnet -> "mainnet"
@@ -441,7 +463,7 @@ let network_to_string = function
 
 let is_segwit addr =
   match addr.addr_type with
-  | P2WPKH | P2WSH | P2TR -> true
+  | P2WPKH | P2WSH | P2TR | WitnessUnknown _ -> true
   | P2PKH | P2SH -> false
 
 let hash_length addr =

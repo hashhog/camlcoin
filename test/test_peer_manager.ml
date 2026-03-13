@@ -2,6 +2,13 @@
 
 open Camlcoin
 
+(* Create a dummy peer for testing handle_addr.
+   Uses a real socket fd so the Peer.make_peer constructor works. *)
+let make_dummy_peer () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd
+
 (* Test addr_source type *)
 let test_addr_source () =
   let _ : Peer_manager.addr_source = Peer_manager.Dns in
@@ -209,7 +216,8 @@ let test_get_peer_stats_empty () =
 (* Test handle_addr with empty list *)
 let test_handle_addr_empty () =
   let pm = Peer_manager.create Consensus.mainnet in
-  Peer_manager.handle_addr pm [];
+  let dummy = make_dummy_peer () in
+  Peer_manager.handle_addr pm dummy [];
   let stats = Peer_manager.get_addr_stats pm in
   Alcotest.(check int) "still empty" 0 stats.total_known
 
@@ -229,7 +237,8 @@ let test_handle_addr_adds () =
     addr = addr_bytes;
     port = 8333;
   } in
-  Peer_manager.handle_addr pm [(0l, net_addr)];
+  let dummy = make_dummy_peer () in
+  Peer_manager.handle_addr pm dummy [(0l, net_addr)];
   let stats = Peer_manager.get_addr_stats pm in
   Alcotest.(check int) "one address added" 1 stats.total_known
 
@@ -249,8 +258,9 @@ let test_handle_addr_dedupes () =
     port = 8333;
   } in
   (* Add same address twice *)
-  Peer_manager.handle_addr pm [(0l, net_addr)];
-  Peer_manager.handle_addr pm [(0l, net_addr)];
+  let dummy = make_dummy_peer () in
+  Peer_manager.handle_addr pm dummy [(0l, net_addr)];
+  Peer_manager.handle_addr pm dummy [(0l, net_addr)];
   let stats = Peer_manager.get_addr_stats pm in
   Alcotest.(check int) "still one" 1 stats.total_known
 

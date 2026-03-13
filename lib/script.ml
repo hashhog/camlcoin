@@ -149,9 +149,9 @@ type sig_version =
    Script Parsing
    ============================================================================ *)
 
-let parse_script (raw : Cstruct.t) : opcode list =
+let parse_script ?(sig_version = SigVersionBase) (raw : Cstruct.t) : opcode list =
   let len = Cstruct.length raw in
-  if len > max_script_size then
+  if sig_version <> SigVersionTapscript && len > max_script_size then
     failwith "Script exceeds maximum size";
   let r = Serialize.reader_of_cstruct raw in
   let ops = ref [] in
@@ -2311,7 +2311,7 @@ let eval_script (st : eval_state) (script : Cstruct.t) : (unit, string) result =
      See exec_opcode_inner for OP_PUSHDATA handling. *)
   let script_code = script in  (* Used for sighash computation *)
   try
-    let ops = parse_script script in
+    let ops = parse_script ~sig_version:st.sig_version script in
     let rec exec = function
       | [] ->
         if st.if_stack <> [] then

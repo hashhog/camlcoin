@@ -87,7 +87,7 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     p2p_port max_outbound max_inbound connect debug no_wallet prune benchmark =
   (* If benchmark flag is set, run benchmarks and exit *)
   if benchmark then begin
-    Camlcoin.Cli.setup_logging debug;
+    Camlcoin.Cli.setup_logging debug ();
     Camlcoin.Perf.run_benchmarks ();
     ()
   end else begin
@@ -112,6 +112,7 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       debug;
       wallet_enabled = not no_wallet;
       prune;
+      log_categories = [];
     } in
     Lwt_main.run (Camlcoin.Cli.run config)
   end

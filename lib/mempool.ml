@@ -19,6 +19,10 @@
    KNOWN PITFALL — When a transaction is removed, all dependent
    transactions must also be removed (descendants spending its outputs). *)
 
+let log_src = Logs.Src.create "MEMPOOL" ~doc:"Memory pool"
+module Log = (val Logs.src_log log_src : Logs.LOG)
+let _ = Log.info  (* suppress unused module warning *)
+
 (* ============================================================================
    Mempool Entry Type
    ============================================================================ *)
@@ -26,6 +30,7 @@
 type mempool_entry = {
   tx : Types.transaction;
   txid : Types.hash256;
+  wtxid : Types.hash256;
   fee : int64;
   weight : int;
   fee_rate : float;           (* satoshis per weight unit *)
@@ -267,6 +272,11 @@ let spending_input_size (script_pubkey : Cstruct.t) : int =
   | Script.OP_RETURN_data _ -> 0  (* OP_RETURN outputs are unspendable *)
   | Script.Nonstandard -> 148  (* Conservative: use P2PKH size *)
 
+let output_serialized_size (output : Types.tx_out) : int =
+  let script_len = Cstruct.length output.script_pubkey in
+  let varint_len = if script_len < 0xFD then 1 else if script_len <= 0xFFFF then 3 else 5 in
+  8 + varint_len + script_len
+
 (* Check if an output is dust. Dust = value < 3 * min_relay_fee * spending_size / 1000 *)
 let is_dust (min_relay_fee : int64) (output : Types.tx_out) : bool =
   match Script.classify_script output.script_pubkey with
@@ -277,7 +287,7 @@ let is_dust (min_relay_fee : int64) (output : Types.tx_out) : bool =
     else begin
       let threshold = Int64.of_float (
         3.0 *. Int64.to_float min_relay_fee *.
-        float_of_int spend_size /. 1000.0) in
+        float_of_int (output_serialized_size output + spend_size) /. 1000.0) in
       output.Types.value < threshold
     end
 
@@ -316,16 +326,47 @@ let is_standard_output (script_pubkey : Cstruct.t) : bool =
   | Script.OP_RETURN_data _ -> Cstruct.length script_pubkey <= 83
   | Script.Nonstandard -> false
 
-(* Count legacy sigops in a script (OP_CHECKSIG* = 1, OP_CHECKMULTISIG* = 20) *)
+(* Count legacy sigops in a script with accurate multisig counting.
+   OP_CHECKSIG/VERIFY = 1 sigop.
+   OP_CHECKMULTISIG/VERIFY = N sigops where N is the preceding OP_N (1-16),
+   or 20 if the preceding opcode is not an OP_N push. *)
 let count_script_sigops (script : Cstruct.t) : int =
+  let op_n_value = function
+    | Script.OP_1  -> Some 1  | Script.OP_2  -> Some 2
+    | Script.OP_3  -> Some 3  | Script.OP_4  -> Some 4
+    | Script.OP_5  -> Some 5  | Script.OP_6  -> Some 6
+    | Script.OP_7  -> Some 7  | Script.OP_8  -> Some 8
+    | Script.OP_9  -> Some 9  | Script.OP_10 -> Some 10
+    | Script.OP_11 -> Some 11 | Script.OP_12 -> Some 12
+    | Script.OP_13 -> Some 13 | Script.OP_14 -> Some 14
+    | Script.OP_15 -> Some 15 | Script.OP_16 -> Some 16
+    | _ -> None
+  in
   try
     let ops = Script.parse_script script in
-    List.fold_left (fun acc op ->
+    let (count, _) = List.fold_left (fun (acc, prev_op) op ->
       match op with
-      | Script.OP_CHECKSIG | Script.OP_CHECKSIGVERIFY -> acc + 1
-      | Script.OP_CHECKMULTISIG | Script.OP_CHECKMULTISIGVERIFY -> acc + 20
-      | _ -> acc
-    ) 0 ops
+      | Script.OP_CHECKSIG | Script.OP_CHECKSIGVERIFY -> (acc + 1, Some op)
+      | Script.OP_CHECKMULTISIG | Script.OP_CHECKMULTISIGVERIFY ->
+        let n = match prev_op with
+          | Some prev -> (match op_n_value prev with Some n -> n | None -> 20)
+          | None -> 20
+        in
+        (acc + n, Some op)
+      | _ -> (acc, Some op)
+    ) (0, None) ops in
+    count
+  with _ -> 0
+
+let last_push_data (ops : Script.opcode list) : Cstruct.t option =
+  List.fold_left (fun acc op -> match op with Script.OP_PUSHDATA (_, data) -> Some data | _ -> acc) None ops
+
+let count_p2sh_sigops (script_sig : Cstruct.t) : int =
+  try
+    let ops = Script.parse_script script_sig in
+    match last_push_data ops with
+    | Some redeem_script -> count_script_sigops redeem_script
+    | None -> 0
   with _ -> 0
 
 (* Count total legacy sigops cost for a transaction (legacy sigops * 4 for witness scale) *)
@@ -336,7 +377,27 @@ let count_tx_sigops_cost (tx : Types.transaction) : int =
   let output_sigops = List.fold_left (fun acc out ->
     acc + count_script_sigops out.Types.script_pubkey
   ) 0 tx.outputs in
-  (input_sigops + output_sigops) * 4  (* witness scale factor *)
+  let legacy_cost = (input_sigops + output_sigops) * 4 in
+  (* P2SH redeem script sigops, also at witness scale *)
+  let p2sh_cost = List.fold_left (fun acc (inp : Types.tx_in) ->
+    acc + count_p2sh_sigops inp.script_sig * 4
+  ) 0 tx.inputs in
+  (* P2SH-wrapped witness sigops at 1x weight *)
+  let witness_cost =
+    if tx.witnesses = [] then 0
+    else
+      List.fold_left (fun acc wit ->
+        let n = List.length wit.Types.items in
+        if n >= 2 then begin
+          let last_item = List.nth wit.items (n - 1) in
+          let last_len = Cstruct.length last_item in
+          if last_len = 20 then acc + 1  (* P2SH-P2WPKH: 1 sigop *)
+          else if last_len > 1 then acc + count_script_sigops last_item  (* P2SH-P2WSH witness script *)
+          else acc
+        end else acc
+      ) 0 tx.witnesses
+  in
+  legacy_cost + p2sh_cost + witness_cost
 
 (* Gap 2: Check P2WSH witness policy limits *)
 let check_p2wsh_witness_limits (tx : Types.transaction) : (unit, string) result =
@@ -671,8 +732,10 @@ let verify_tx_scripts (mp : mempool) (tx : Types.transaction)
    Transaction Addition
    ============================================================================ *)
 
-(* Validate and add a transaction to the mempool *)
-let add_transaction (mp : mempool) (tx : Types.transaction)
+(* Validate and add a transaction to the mempool.
+   When ~dry_run:true, all validation is performed but the transaction
+   is not actually inserted into the mempool. *)
+let add_transaction ?(dry_run=false) (mp : mempool) (tx : Types.transaction)
     : (mempool_entry, string) result =
   let txid = Crypto.compute_txid tx in
   let txid_key = Cstruct.to_string txid in
@@ -697,7 +760,7 @@ let add_transaction (mp : mempool) (tx : Types.transaction)
 
     (* Phase 1C: Per-tx sigops cost check *)
     let sigops_cost = count_tx_sigops_cost tx in
-    if sigops_cost > 16_000 then
+    if sigops_cost > 80_000 then
       Error "Transaction exceeds max standard sigops cost"
 
     (* Task 5: Locktime enforcement *)
@@ -784,9 +847,11 @@ let add_transaction (mp : mempool) (tx : Types.transaction)
             | Error e -> Error e
             | Ok () ->
 
+            let wtxid = Crypto.compute_wtxid tx in
             let entry = {
               tx;
               txid;
+              wtxid;
               fee;
               weight;
               fee_rate;
@@ -795,13 +860,15 @@ let add_transaction (mp : mempool) (tx : Types.transaction)
               depends_on = !depends;
             } in
 
-            Hashtbl.replace mp.entries txid_key entry;
-            mp.total_weight <- mp.total_weight + weight;
-            mp.total_fee <- Int64.add mp.total_fee fee;
+            if not dry_run then begin
+              Hashtbl.replace mp.entries txid_key entry;
+              mp.total_weight <- mp.total_weight + weight;
+              mp.total_fee <- Int64.add mp.total_fee fee;
 
-            (* Evict if over size limit *)
-            if mp.total_weight > mp.max_size_bytes / 4 then
-              evict_lowest_feerate mp;
+              (* Evict if over size limit *)
+              if mp.total_weight > mp.max_size_bytes / 4 then
+                evict_lowest_feerate mp
+            end;
 
             Ok entry
           end
@@ -965,12 +1032,31 @@ let replace_by_fee (mp : mempool) (tx : Types.transaction)
         else begin
           let new_fee = Int64.sub !input_sum output_sum in
 
+          (* Rule 3: Replacement must have higher feerate than each direct conflict *)
+          let new_weight = Validation.compute_tx_weight tx in
+          let new_vsize = max 1 (new_weight / 4) in
+          let new_feerate = Int64.to_float new_fee /. float_of_int new_vsize in
+          let low_feerate_conflict = List.find_opt (fun e ->
+            let conflict_vsize = max 1 (e.weight / 4) in
+            let conflict_feerate = Int64.to_float e.fee /. float_of_int conflict_vsize in
+            new_feerate <= conflict_feerate
+          ) conflicts in
+
+          match low_feerate_conflict with
+          | Some conflict ->
+            let conflict_vsize = max 1 (conflict.weight / 4) in
+            let conflict_feerate = Int64.to_float conflict.fee /. float_of_int conflict_vsize in
+            Error (Printf.sprintf
+              "Replacement feerate %.2f sat/vB not higher than conflicting tx feerate %.2f sat/vB (RBF Rule 3)"
+              new_feerate conflict_feerate)
+          | None ->
+
           (* Total fee of all conflicting transactions *)
           let total_conflict_fee = List.fold_left
             (fun acc e -> Int64.add acc e.fee)
             0L conflicts in
 
-          (* Rule 3 (original): New fee must be higher than total conflict fee *)
+          (* Rule 4: New fee must be higher than total conflict fee *)
           if new_fee <= total_conflict_fee then
             Error (Printf.sprintf
               "Replacement fee %Ld not higher than total conflicting fee %Ld"
@@ -998,7 +1084,7 @@ let replace_by_fee (mp : mempool) (tx : Types.transaction)
               Error "Replacement introduces new unconfirmed inputs (RBF Rule 2)"
 
             else begin
-              (* Rule 4: Replacement fee >= old fee + min_relay_fee * replacement_size / 1000 *)
+              (* Rule 5: Replacement fee >= old fee + min_relay_fee * replacement_size / 1000 *)
               let replacement_weight = Validation.compute_tx_weight tx in
               let replacement_vsize = (replacement_weight + 3) / 4 in
               let incremental_fee = Int64.of_float (
@@ -1012,7 +1098,7 @@ let replace_by_fee (mp : mempool) (tx : Types.transaction)
                   new_fee required_fee total_conflict_fee incremental_fee)
 
               else begin
-                (* Rule 5: Max 100 evicted transactions (originals + all descendants) *)
+                (* Rule 6: Max 100 evicted transactions (originals + all descendants) *)
                 let eviction_count = ref 0 in
                 List.iter (fun conflict_entry ->
                   incr eviction_count;  (* The conflict itself *)

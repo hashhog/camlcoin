@@ -732,11 +732,6 @@ let is_tx_final (tx : Types.transaction) ~(block_height : int) ~(block_time : in
    BIP68 Sequence Locks
    ============================================================================ *)
 
-(* BIP68 sequence lock constants *)
-let sequence_locktime_disable_flag = 1 lsl 31  (* bit 31 *)
-let sequence_locktime_type_flag = 1 lsl 22     (* bit 22: 0=height, 1=time *)
-let sequence_locktime_mask = 0xFFFF            (* lower 16 bits *)
-let _sequence_locktime_granularity = 9          (* 512 = 1 lsl 9 seconds *)
 
 (* Check BIP68 sequence locks for a transaction.
    For each input where tx.version >= 2 and the input's sequence doesn't have
@@ -751,43 +746,31 @@ let _sequence_locktime_granularity = 9          (* 512 = 1 lsl 9 seconds *)
      caller-supplied approximation. Height-based locks are implemented correctly. *)
 let check_sequence_locks (tx : Types.transaction) ~(block_height : int)
     ~(median_time : int32) ~(utxo_heights : int array) ~(utxo_mtps : int32 array)
-    ?(get_mtp_at_height : (int -> int32) option) () : bool =
-  (* BIP68 only applies to tx version >= 2 *)
-  if Int32.compare tx.version 2l < 0 then
-    true
+    ?(get_mtp_at_height : (int -> int32) option) ~flags () : bool =
+  if Int32.compare tx.version 2l < 0 then true
+  else if flags land Script.script_verify_checksequenceverify = 0 then true
   else begin
     let ok = ref true in
     List.iteri (fun i inp ->
       if !ok then begin
-        let seq = Int32.to_int inp.Types.sequence land 0x7FFFFFFF lor
-                  (if Int32.compare inp.Types.sequence 0l < 0 then 1 lsl 31 else 0) in
-        (* Use raw int32 bits for flag checks *)
-        let seq_int = Int32.to_int inp.Types.sequence in
-        let seq_unsigned =
-          if seq_int < 0 then seq_int + (1 lsl 31) + (1 lsl 31)
-          else seq_int
-        in
-        ignore seq;
+        let seq32 = inp.Types.sequence in
         (* Check if disable flag (bit 31) is set *)
-        if seq_unsigned land sequence_locktime_disable_flag <> 0 then
+        if Int32.logand seq32 0x80000000l <> 0l then
           ()  (* Sequence lock disabled for this input, skip *)
         else begin
-          let masked = seq_unsigned land sequence_locktime_mask in
-          if seq_unsigned land sequence_locktime_type_flag = 0 then begin
+          let masked = Int32.to_int (Int32.logand seq32 0xFFFFl) in
+          if Int32.logand seq32 0x00400000l = 0l then begin
             (* Height-based lock *)
             let required_height = utxo_heights.(i) + masked in
             if block_height < required_height then
               ok := false
           end else begin
             (* Time-based lock *)
-            (* When get_mtp_at_height is provided, compute the correct MTP at
-               (utxo_height - 1) per BIP68. Otherwise fall back to the caller-
-               supplied utxo_mtps array. *)
             let input_mtp = match get_mtp_at_height with
               | Some f -> f (utxo_heights.(i) - 1)
               | None -> utxo_mtps.(i)
             in
-            let time_offset = Int32.of_int (masked lsl 9) in  (* masked * 512 *)
+            let time_offset = Int32.of_int (masked lsl 9) in
             let required_time = Int32.add input_mtp time_offset in
             if Int32.compare median_time required_time < 0 then
               ok := false
@@ -1039,7 +1022,7 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
                 ) tx.inputs;
                 if not (check_sequence_locks tx ~block_height:height
                           ~median_time ~utxo_heights ~utxo_mtps
-                          ?get_mtp_at_height ()) then
+                          ?get_mtp_at_height ~flags ()) then
                   error := Some (BlockTxValidationFailed (i, TxSequenceLocksFailed))
               end;
 

@@ -806,10 +806,11 @@ let add_transaction ?(dry_run=false) (mp : mempool) (tx : Types.transaction)
       | Some e -> Error e
       | None ->
         (* Task 5: BIP68 sequence lock enforcement *)
+        let flags = Consensus.get_block_script_flags (mp.current_height + 1) mp.network in
         if not (Validation.check_sequence_locks tx
                   ~block_height:(mp.current_height + 1)
                   ~median_time:mp.current_median_time
-                  ~utxo_heights ~utxo_mtps ()) then
+                  ~utxo_heights ~utxo_mtps ~flags ()) then
           Error "Transaction sequence locks not satisfied (BIP68)"
         else begin
           let output_sum = List.fold_left

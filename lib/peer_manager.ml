@@ -450,6 +450,24 @@ let send_to_peer (pm : t) (peer_id : int) (payload : P2p.message_payload) : unit
       (fun () -> Peer.send_message peer payload)
       (fun _exn -> Lwt.return_unit)
 
+(* Announce a new block to all connected peers, respecting send_headers (BIP-130).
+   Peers that opted in via sendheaders receive the header directly;
+   others receive an inv containing the block hash. *)
+let announce_block (pm : t) (header : Types.block_header) (hash : Types.hash256) : unit Lwt.t =
+  let ready = get_ready_peers pm in
+  Lwt_list.iter_p (fun peer ->
+    Lwt.catch (fun () ->
+      if peer.Peer.send_headers then
+        Peer.send_message peer (P2p.HeadersMsg [header])
+      else
+        Peer.send_message peer (P2p.InvMsg [{ P2p.inv_type = P2p.InvBlock; hash }])
+    ) (fun _exn -> Lwt.return_unit)
+  ) ready
+
+(* Announce a new transaction to all connected peers via inv. *)
+let announce_tx (pm : t) (txid : Types.hash256) : unit Lwt.t =
+  broadcast pm (P2p.InvMsg [{ P2p.inv_type = P2p.InvTx; hash = txid }])
+
 (* Check if a 16-byte address is an IPv4-mapped IPv6 address (::ffff:x.x.x.x) *)
 let is_ipv4_mapped (addr : Cstruct.t) : bool =
   (* First 10 bytes must be 0x00, bytes 10-11 must be 0xFF *)

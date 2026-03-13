@@ -73,6 +73,11 @@ let sign (privkey : private_key) (msg_hash : Types.hash256) : signature =
   let sk = Secp.Key.read_sk_exn secp_ctx sk_bs in
   let msg_bs = cstruct_to_bigstring msg_hash in
   let sig_ = Secp.Sign.sign_exn secp_ctx ~sk msg_bs in
+  (* Normalize to low-S per BIP-62 rule 5 *)
+  let sig_ = match Secp.Sign.normalize secp_ctx sig_ with
+    | None -> sig_
+    | Some normalized -> normalized
+  in
   (* Serialize as DER *)
   let der_bs = Secp.Sign.to_bytes ~der:true secp_ctx sig_ in
   bigstring_to_cstruct der_bs

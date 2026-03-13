@@ -122,19 +122,19 @@ let test_verify_wrong_key () =
 
 (* Merkle root tests *)
 let test_merkle_root_empty () =
-  let result = Crypto.merkle_root [] in
+  let (result, _) = Crypto.merkle_root [] in
   Alcotest.(check string) "merkle empty" (String.make 64 '0') (cstruct_to_hex result)
 
 let test_merkle_root_single () =
   let hash = hex_to_cstruct "0000000000000000000000000000000000000000000000000000000000000001" in
-  let result = Crypto.merkle_root [hash] in
+  let (result, _) = Crypto.merkle_root [hash] in
   Alcotest.(check string) "merkle single" (cstruct_to_hex hash) (cstruct_to_hex result)
 
 let test_merkle_root_two () =
   (* With two hashes: merkle_root = SHA256d(h1 || h2) *)
   let h1 = hex_to_cstruct "0000000000000000000000000000000000000000000000000000000000000001" in
   let h2 = hex_to_cstruct "0000000000000000000000000000000000000000000000000000000000000002" in
-  let result = Crypto.merkle_root [h1; h2] in
+  let (result, _) = Crypto.merkle_root [h1; h2] in
   (* Compute expected: SHA256d(h1 || h2) *)
   let combined = Cstruct.concat [h1; h2] in
   let expected = Crypto.sha256d combined in
@@ -148,7 +148,7 @@ let test_merkle_root_three () =
   let h1 = hex_to_cstruct "0000000000000000000000000000000000000000000000000000000000000001" in
   let h2 = hex_to_cstruct "0000000000000000000000000000000000000000000000000000000000000002" in
   let h3 = hex_to_cstruct "0000000000000000000000000000000000000000000000000000000000000003" in
-  let result = Crypto.merkle_root [h1; h2; h3] in
+  let (result, _) = Crypto.merkle_root [h1; h2; h3] in
   (* Compute expected *)
   let l1_0 = Crypto.sha256d (Cstruct.concat [h1; h2]) in
   let l1_1 = Crypto.sha256d (Cstruct.concat [h3; h3]) in
@@ -161,7 +161,7 @@ let test_merkle_root_four () =
   let h2 = hex_to_cstruct "0000000000000000000000000000000000000000000000000000000000000002" in
   let h3 = hex_to_cstruct "0000000000000000000000000000000000000000000000000000000000000003" in
   let h4 = hex_to_cstruct "0000000000000000000000000000000000000000000000000000000000000004" in
-  let result = Crypto.merkle_root [h1; h2; h3; h4] in
+  let (result, _) = Crypto.merkle_root [h1; h2; h3; h4] in
   let l1_0 = Crypto.sha256d (Cstruct.concat [h1; h2]) in
   let l1_1 = Crypto.sha256d (Cstruct.concat [h3; h4]) in
   let expected = Crypto.sha256d (Cstruct.concat [l1_0; l1_1]) in

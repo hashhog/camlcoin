@@ -4,4 +4,9 @@
  (libraries cstruct cstruct-unix lwt lwt.unix bigstring
             cohttp-lwt-unix yojson digestif cmdliner
             logs logs.fmt fmt fmt.tty secp256k1-internal)
+ (foreign_stubs
+  (language c)
+  (names schnorr_stubs)
+  (include_dirs ../vendor/secp256k1/src ../vendor/secp256k1/include))
+ (c_library_flags (-Wl,--allow-multiple-definition))
  (preprocess (pps lwt_ppx)))

@@ -244,3 +244,32 @@ let compute_wtxid (tx : Types.transaction) : Types.hash256 =
 let witness_merkle_root (txs : Types.transaction list) : Types.hash256 =
   let wtxids = List.map compute_wtxid txs in
   fst (merkle_root wtxids)
+
+(* BIP-341 Taproot tree helper functions *)
+
+(* Compute tapleaf hash: tagged_hash("TapLeaf", leaf_version || compact_size(script_len) || script) *)
+let compute_tapleaf_hash (leaf_version : int) (script : Cstruct.t) : Cstruct.t =
+  let w = Serialize.writer_create () in
+  Serialize.write_uint8 w leaf_version;
+  Serialize.write_compact_size w (Cstruct.length script);
+  Serialize.write_bytes w script;
+  tagged_hash "TapLeaf" (Serialize.writer_to_cstruct w)
+
+(* Compute tapbranch hash: tagged_hash("TapBranch", sorted(left, right))
+   Per BIP-341, the lexicographically smaller hash goes first. *)
+let compute_tapbranch_hash (left : Cstruct.t) (right : Cstruct.t) : Cstruct.t =
+  let a, b =
+    if Cstruct.compare left right <= 0 then (left, right)
+    else (right, left)
+  in
+  tagged_hash "TapBranch" (Cstruct.concat [a; b])
+
+(* Compute taproot merkle root from a control block path.
+   The control block contains: leaf_version (1 byte) || internal_key (32 bytes) || path (32 bytes each)
+   This function takes the tapleaf hash and the path elements, and computes
+   the merkle root by iteratively combining with tapbranch hashes. *)
+let compute_taproot_merkle_root_from_path (leaf_hash : Cstruct.t)
+    (path : Cstruct.t list) : Cstruct.t =
+  List.fold_left (fun acc node ->
+    compute_tapbranch_hash acc node
+  ) leaf_hash path

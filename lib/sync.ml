@@ -414,10 +414,10 @@ let is_assume_valid (state : chain_state) (height : int) : bool =
 (* IBD configuration constants *)
 let max_blocks_per_peer = 16          (* Max in-flight blocks per peer *)
 let max_total_blocks_in_flight = 128  (* Global cap on blocks in flight *)
-let base_block_timeout = 5.0          (* Base timeout in seconds *)
-let max_block_timeout = 64.0          (* Max timeout after backoff *)
-let max_stall_timeout = 300.0         (* Max timeout for stalled downloads *)
-let max_consecutive_timeouts = 3      (* Disconnect peer after this many consecutive timeouts *)
+let base_block_timeout = 60.0           (* 60s base timeout — matches Bitcoin Core's conservative approach *)
+let max_block_timeout = 300.0           (* 5 min max timeout per block *)
+let max_stall_timeout = 1200.0          (* 20 min max stall — matches Bitcoin Core *)
+let max_consecutive_timeouts = 5        (* More forgiving before disconnect *)
 let utxo_flush_interval = 2000        (* Flush UTXOs every N blocks *)
 let block_download_window = 1024      (* Max blocks ahead to queue (matches Bitcoin Core BLOCK_DOWNLOAD_WINDOW) *)
 
@@ -700,6 +700,27 @@ let receive_block (ibd : ibd_state) (block : Types.block)
      | Some pid -> record_successful_download ibd pid
      | None -> ());
     Ok ()
+
+(* Handle notfound response — mark blocks as not requested so they can be
+   re-requested from a different peer. Score the peer for not having blocks. *)
+let handle_notfound (ibd : ibd_state) (peer_id : int)
+    (items : P2p.inv_vector list) : unit =
+  List.iter (fun (iv : P2p.inv_vector) ->
+    (* Find matching block queue entry and reset to NotRequested *)
+    List.iter (fun entry ->
+      match entry.download_state with
+      | Requested req when req.peer_id = peer_id &&
+                           Cstruct.equal entry.hash iv.hash ->
+        entry.download_state <- NotRequested;
+        ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
+        let peer_state = get_peer_state ibd peer_id in
+        peer_state.blocks_in_flight <- max 0 (peer_state.blocks_in_flight - 1);
+        Logs.debug (fun m ->
+          m "Notfound for block at height %d from peer %d, will retry"
+            entry.height peer_id)
+      | _ -> ()
+    ) ibd.block_queue
+  ) items
 
 (* Flush pending UTXO updates to database *)
 let flush_utxos (ibd : ibd_state) : unit =
@@ -1348,10 +1369,16 @@ let handle_mempool_msg (ibd : ibd_state) (peer : Peer.peer) : unit Lwt.t =
   | Some mp ->
     let count = ref 0 in
     let inv_items = ref [] in
+    let feefilter_rate = Int64.to_float peer.feefilter in
     Hashtbl.iter (fun _k (entry : Mempool.mempool_entry) ->
       if !count < max_mempool_inv_items then begin
-        inv_items := P2p.{ inv_type = InvTx; hash = entry.txid } :: !inv_items;
-        incr count
+        (* Convert fee_rate from sat/WU to sat/kB for feefilter comparison:
+           sat/kB = sat/WU * 4 * 1000 = sat/WU * 4000 *)
+        let fee_rate_per_kb = entry.fee_rate *. 4000.0 in
+        if fee_rate_per_kb >= feefilter_rate then begin
+          inv_items := P2p.{ inv_type = InvTx; hash = entry.txid } :: !inv_items;
+          incr count
+        end
       end
     ) mp.entries;
     if !inv_items <> [] then

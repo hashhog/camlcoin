@@ -72,7 +72,7 @@ let create_test_mempool () =
     height = 0;
     is_coinbase = false;
   };
-  let mp = Mempool.create ~utxo ~current_height:100 in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
   (mp, utxo, db, txid1, txid2, txid3)
 
 (* Create a test chain state *)
@@ -248,7 +248,7 @@ let test_select_transactions_fee_ordering () =
 let test_create_block_template_empty_mempool () =
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~utxo ~current_height:0 in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
   let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
 
   let template = Mining.create_block_template ~chain ~mp ~payout_script in
@@ -284,7 +284,7 @@ let test_create_block_template_with_transactions () =
     is_coinbase = false;
   };
 
-  let mp = Mempool.create ~utxo ~current_height:0 in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
   let tx = make_regular_tx
     [make_test_input txid1 0l]
     [make_test_output 990_000L]  (* 10k fee *)
@@ -311,7 +311,7 @@ let test_create_block_template_with_transactions () =
 let test_block_template_header_valid () =
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~utxo ~current_height:0 in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
   let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
 
   let template = Mining.create_block_template ~chain ~mp ~payout_script in
@@ -335,7 +335,7 @@ let test_block_template_header_valid () =
 let test_mine_block_regtest () =
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~utxo ~current_height:0 in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
   let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
 
   let template = Mining.create_block_template ~chain ~mp ~payout_script in
@@ -362,7 +362,7 @@ let test_mine_block_regtest () =
 let test_mine_block_no_solution () =
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~utxo ~current_height:0 in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
   let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
 
   let template = Mining.create_block_template ~chain ~mp ~payout_script in
@@ -388,7 +388,7 @@ let test_mine_block_no_solution () =
 let test_template_to_json () =
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~utxo ~current_height:0 in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
   let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
 
   let template = Mining.create_block_template ~chain ~mp ~payout_script in
@@ -421,7 +421,7 @@ let test_template_to_json () =
 let test_template_to_json_simple () =
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~utxo ~current_height:0 in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
   let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
 
   let template = Mining.create_block_template ~chain ~mp ~payout_script in

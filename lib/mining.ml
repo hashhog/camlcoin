@@ -36,32 +36,97 @@ type block_template = {
 (* Reserve weight units for coinbase transaction *)
 let coinbase_reserve_weight = 4000
 
-(* Select transactions from mempool greedily by fee rate.
-   Respects weight limits and transaction dependencies. *)
+(* Compute ancestor fee rate for a transaction, skipping already-selected ancestors.
+   ancestor_fee_rate = (tx_fee + sum of unselected ancestor fees) /
+                       (tx_weight + sum of unselected ancestor weights) *)
+let compute_ancestor_fee_rate (entry : Mempool.mempool_entry)
+    (mp : Mempool.mempool) (selected : (string, unit) Hashtbl.t) : float =
+  let ancestors = Mempool.get_ancestors mp entry.txid in
+  let unselected_ancestors = List.filter (fun (a : Mempool.mempool_entry) ->
+    not (Hashtbl.mem selected (Cstruct.to_string a.txid))
+  ) ancestors in
+  let total_fee = List.fold_left
+    (fun acc (a : Mempool.mempool_entry) -> Int64.add acc a.fee)
+    entry.fee unselected_ancestors in
+  let total_weight = List.fold_left
+    (fun acc (a : Mempool.mempool_entry) -> acc + a.weight)
+    entry.weight unselected_ancestors in
+  if total_weight = 0 then 0.0
+  else Int64.to_float total_fee /. float_of_int total_weight
+
+(* Select transactions from mempool using ancestor fee rate (CPFP).
+   Uses iterative approach: pick best ancestor-fee-rate tx, select it
+   and its unselected ancestors, update rates, repeat. *)
 let select_transactions (mp : Mempool.mempool) (max_weight : int)
     : (Types.transaction * int64) list =
-  let sorted = Mempool.get_sorted_transactions mp in
+  let all_entries = Mempool.get_sorted_transactions mp in
   let selected = ref [] in
   let current_weight = ref 0 in
+  let total_sigops_cost = ref 0 in
   let included_txids = Hashtbl.create 100 in
+  let available_weight = max_weight - coinbase_reserve_weight in
 
-  List.iter (fun entry ->
-    (* Check weight limit (reserve space for coinbase) *)
-    if !current_weight + entry.Mempool.weight <=
-       max_weight - coinbase_reserve_weight then begin
-      (* Check all dependencies are included *)
-      let deps_met = List.for_all (fun dep ->
-        Hashtbl.mem included_txids (Cstruct.to_string dep)
-      ) entry.depends_on in
+  (* Build a hashtbl of remaining (unselected, not yet skipped) entries *)
+  let remaining = Hashtbl.create 100 in
+  List.iter (fun (entry : Mempool.mempool_entry) ->
+    Hashtbl.replace remaining (Cstruct.to_string entry.txid) entry
+  ) all_entries;
 
-      if deps_met then begin
-        selected := (entry.tx, entry.fee) :: !selected;
-        current_weight := !current_weight + entry.weight;
-        Hashtbl.replace included_txids
-          (Cstruct.to_string entry.txid) ()
+  let continue = ref true in
+  while !continue do
+    (* Find the unselected entry with the best ancestor fee rate *)
+    let best = ref None in
+    let best_rate = ref neg_infinity in
+    Hashtbl.iter (fun _key (entry : Mempool.mempool_entry) ->
+      let rate = compute_ancestor_fee_rate entry mp included_txids in
+      if rate > !best_rate then begin
+        best_rate := rate;
+        best := Some entry
       end
-    end
-  ) sorted;
+    ) remaining;
+
+    match !best with
+    | None -> continue := false
+    | Some best_entry ->
+      (* Collect the package: unselected ancestors + the tx itself *)
+      let ancestors = Mempool.get_ancestors mp best_entry.txid in
+      let unselected_ancestors = List.filter (fun (a : Mempool.mempool_entry) ->
+        not (Hashtbl.mem included_txids (Cstruct.to_string a.txid))
+      ) ancestors in
+      (* Package = unselected ancestors (in dependency order) + best_entry *)
+      let package = unselected_ancestors @ [best_entry] in
+
+      (* Calculate total package weight *)
+      let pkg_weight = List.fold_left
+        (fun acc (e : Mempool.mempool_entry) -> acc + e.weight)
+        0 package in
+
+      (* Calculate total package sigops cost *)
+      let pkg_sigops = List.fold_left (fun acc (e : Mempool.mempool_entry) ->
+        acc + Mempool.count_tx_sigops_cost e.tx
+      ) 0 package in
+
+      if !total_sigops_cost + pkg_sigops > Consensus.max_block_sigops_cost then begin
+        (* Package exceeds sigops cost limit; skip it *)
+        Hashtbl.remove remaining (Cstruct.to_string best_entry.txid)
+      end else if !current_weight + pkg_weight <= available_weight then begin
+        (* Select the entire package *)
+        List.iter (fun (e : Mempool.mempool_entry) ->
+          let key = Cstruct.to_string e.txid in
+          if not (Hashtbl.mem included_txids key) then begin
+            selected := (e.tx, e.fee) :: !selected;
+            current_weight := !current_weight + e.weight;
+            Hashtbl.replace included_txids key ();
+            Hashtbl.remove remaining key
+          end
+        ) package;
+        total_sigops_cost := !total_sigops_cost + pkg_sigops
+      end else begin
+        (* Package doesn't fit; remove this entry from remaining
+           and try the next best *)
+        Hashtbl.remove remaining (Cstruct.to_string best_entry.txid)
+      end
+  done;
 
   List.rev !selected
 
@@ -88,7 +153,8 @@ let compute_witness_merkle_root (transactions : Types.transaction list)
   let wtxids = List.mapi (fun i tx ->
     compute_wtxid tx (i = 0)
   ) transactions in
-  Crypto.merkle_root wtxids
+  let (root, _mutated) = Crypto.merkle_root wtxids in
+  root
 
 (* Compute the witness commitment for the coinbase output.
    commitment = SHA256d(witness_merkle_root || witness_nonce)
@@ -232,7 +298,7 @@ let create_block_template ~(chain : Sync.chain_state)
   (* Build final transaction list for merkle root *)
   let all_txs = coinbase_tx :: selected_txs in
   let txids = List.map Crypto.compute_txid all_txs in
-  let merkle_root = Crypto.merkle_root txids in
+  let (merkle_root, _mutated) = Crypto.merkle_root txids in
 
   (* Current timestamp *)
   let timestamp = Int32.of_float (Unix.gettimeofday ()) in

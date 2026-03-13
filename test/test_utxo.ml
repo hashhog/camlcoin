@@ -63,7 +63,7 @@ let make_test_block height coinbase_value txs =
   let coinbase = make_coinbase_tx height [make_test_output coinbase_value] in
   let all_txs = coinbase :: txs in
   let txids = List.map Crypto.compute_txid all_txs in
-  let merkle_root = Crypto.merkle_root txids in
+  let (merkle_root, _) = Crypto.merkle_root txids in
   Types.{
     header = {
       version = 1l;

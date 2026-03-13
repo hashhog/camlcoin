@@ -40,7 +40,7 @@ let deserialize_utxo_entry r : utxo_entry =
   { value; script_pubkey; height; is_coinbase }
 
 (* ============================================================================
-   UTXO Set with Write-Through Cache
+   UTXO Set with Write-Through Cache (Legacy)
    ============================================================================ *)
 
 module UtxoSet = struct
@@ -140,16 +140,29 @@ type undo_data = {
   spent_outputs : (Types.outpoint * utxo_entry) list;
 }
 
-(* Serialize undo data for storage *)
+(* Serialize undo data for storage.
+   Format: [height][count][spent_outputs...][verification_count][sha256_checksum]
+   The trailing 4-byte count and 32-byte SHA256 checksum protect against
+   corruption of undo data (disk errors, partial writes). *)
 let serialize_undo_data w (undo : undo_data) =
   Serialize.write_int32_le w (Int32.of_int undo.height);
-  Serialize.write_compact_size w (List.length undo.spent_outputs);
+  let num_spent = List.length undo.spent_outputs in
+  Serialize.write_compact_size w num_spent;
   List.iter (fun (outpoint, entry) ->
     Serialize.serialize_outpoint w outpoint;
     serialize_utxo_entry w entry
-  ) undo.spent_outputs
+  ) undo.spent_outputs;
+  (* Append verification count (4 bytes) *)
+  Serialize.write_int32_le w (Int32.of_int num_spent);
+  (* Compute SHA256 checksum over everything serialized so far *)
+  let data_so_far = Serialize.writer_to_cstruct w in
+  let checksum = Crypto.sha256 data_so_far in
+  Serialize.write_bytes w checksum
 
-(* Deserialize undo data from storage *)
+(* Deserialize undo data from storage.
+   Backward-compatible: if data ends exactly after spent outputs (legacy format
+   with no trailing count+checksum), accept as-is. If extra bytes are present,
+   verify the 4-byte count and 32-byte SHA256 checksum. *)
 let deserialize_undo_data r : undo_data =
   let height = Int32.to_int (Serialize.read_int32_le r) in
   let count = Serialize.read_compact_size r in
@@ -158,6 +171,29 @@ let deserialize_undo_data r : undo_data =
     let entry = deserialize_utxo_entry r in
     (outpoint, entry)
   ) in
+  (* Check for trailing checksum data (new format) *)
+  let remaining = Cstruct.length r.Serialize.buf - r.Serialize.pos in
+  if remaining > 0 then begin
+    (* New format: 4-byte verification count + 32-byte SHA256 checksum = 36 bytes *)
+    if remaining <> 36 then
+      failwith (Printf.sprintf
+        "Undo data: unexpected trailing bytes (%d, expected 0 or 36)" remaining);
+    (* Position just before the verification count *)
+    let data_before_checksum_end = r.Serialize.pos + 4 in
+    (* Read and verify the count *)
+    let verify_count = Int32.to_int (Serialize.read_int32_le r) in
+    if verify_count <> count then
+      failwith (Printf.sprintf
+        "Undo data checksum verification failed: count mismatch (%d vs %d)"
+        count verify_count);
+    (* Read the 32-byte checksum *)
+    let stored_checksum = Serialize.read_bytes r 32 in
+    (* Compute expected checksum over data up to (but not including) the checksum *)
+    let data_to_hash = Cstruct.sub r.Serialize.buf 0 data_before_checksum_end in
+    let computed_checksum = Crypto.sha256 data_to_hash in
+    if not (Cstruct.equal stored_checksum computed_checksum) then
+      failwith "Undo data checksum verification failed: SHA256 mismatch"
+  end;
   { height; spent_outputs }
 
 (* ============================================================================
@@ -369,26 +405,35 @@ let compute_stats (utxo : UtxoSet.t) : utxo_stats =
   }
 
 (* ============================================================================
-   Optimized UTXO Set with LRU Cache
+   Optimized UTXO Set with Write-Back LRU Cache
    ============================================================================
 
    Enhanced UTXO set implementation that uses an LRU cache for frequently
-   accessed UTXOs. The default cache size of 500,000 entries covers the
-   typical UTXO working set during normal operation.
+   accessed UTXOs with write-back semantics. Changes are accumulated in a
+   dirty set and only flushed to disk when `flush` is called, using the
+   storage layer's atomic batch write for crash safety.
+
+   The default cache size of 500,000 entries covers the typical UTXO working
+   set during normal operation.
 
    During IBD, the most recently created UTXOs are the most likely to be
-   spent, so an LRU eviction policy is ideal. *)
+   spent, so an LRU eviction policy is ideal. The write-back strategy
+   dramatically reduces disk I/O by batching writes. *)
 
 module OptimizedUtxoSet = struct
+  type dirty_entry = [ `Added of utxo_entry | `Removed ]
+
   type t = {
     db : Storage.ChainDB.t;
     cache : (string, utxo_entry) Perf.LRU.t;
+    dirty : (string, dirty_entry) Hashtbl.t;
     mutable stats : Perf.utxo_cache_stats;
   }
 
   let create ?(cache_size=500_000) db = {
     db;
     cache = Perf.LRU.create cache_size;
+    dirty = Hashtbl.create 10_000;
     stats = Perf.create_utxo_stats ();
   }
 
@@ -399,61 +444,115 @@ module OptimizedUtxoSet = struct
     Serialize.write_int32_le w (Int32.of_int vout);
     Cstruct.to_string (Serialize.writer_to_cstruct w)
 
-  (* Get a UTXO entry, checking LRU cache first then database *)
+  (* Get a UTXO entry: check LRU cache, then dirty set, then database *)
   let get (t : t) (txid : Types.hash256) (vout : int)
       : utxo_entry option =
     let key = utxo_key txid vout in
     t.stats.lookups <- t.stats.lookups + 1;
+    (* 1. Check LRU cache first *)
     match Perf.LRU.get t.cache key with
     | Some entry ->
       t.stats.cache_hits <- t.stats.cache_hits + 1;
       Some entry
     | None ->
-      match Storage.ChainDB.get_utxo t.db txid vout with
-      | None ->
+      (* 2. Check dirty set - it may have entries not yet in cache
+             (e.g. evicted from LRU but not yet flushed) *)
+      match Hashtbl.find_opt t.dirty key with
+      | Some `Removed ->
+        (* Marked for deletion - does not exist *)
         t.stats.misses <- t.stats.misses + 1;
         None
-      | Some data ->
-        t.stats.db_hits <- t.stats.db_hits + 1;
-        let r = Serialize.reader_of_cstruct
-          (Cstruct.of_string data) in
-        let entry = deserialize_utxo_entry r in
+      | Some (`Added entry) ->
+        (* In dirty set but evicted from LRU - re-add to cache *)
+        t.stats.cache_hits <- t.stats.cache_hits + 1;
         Perf.LRU.put t.cache key entry;
         Some entry
+      | None ->
+        (* 3. Fall through to database *)
+        (match Storage.ChainDB.get_utxo t.db txid vout with
+        | None ->
+          t.stats.misses <- t.stats.misses + 1;
+          None
+        | Some data ->
+          t.stats.db_hits <- t.stats.db_hits + 1;
+          let r = Serialize.reader_of_cstruct
+            (Cstruct.of_string data) in
+          let entry = deserialize_utxo_entry r in
+          Perf.LRU.put t.cache key entry;
+          Some entry)
 
-  (* Add a UTXO entry to both cache and database *)
+  (* Add a UTXO entry to LRU cache and mark dirty. Does NOT write to disk. *)
   let add (t : t) (txid : Types.hash256) (vout : int)
       (entry : utxo_entry) : unit =
     let key = utxo_key txid vout in
     Perf.LRU.put t.cache key entry;
-    let w = Serialize.writer_create () in
-    serialize_utxo_entry w entry;
-    Storage.ChainDB.store_utxo t.db txid vout
-      (Cstruct.to_string (Serialize.writer_to_cstruct w))
+    Hashtbl.replace t.dirty key (`Added entry)
 
-  (* Remove a UTXO entry, returning the removed entry if it existed *)
+  (* Remove a UTXO entry. Marks as Removed in dirty set, removes from LRU.
+     Does NOT delete from disk immediately.
+     Returns the removed entry if it existed. *)
   let remove (t : t) (txid : Types.hash256) (vout : int)
       : utxo_entry option =
     let key = utxo_key txid vout in
-    let existing = Perf.LRU.get t.cache key in
+    (* Try to find existing entry: LRU cache, dirty set, then DB *)
+    let existing =
+      match Perf.LRU.get t.cache key with
+      | Some entry -> Some entry
+      | None ->
+        match Hashtbl.find_opt t.dirty key with
+        | Some (`Added entry) -> Some entry
+        | Some `Removed -> None
+        | None ->
+          match Storage.ChainDB.get_utxo t.db txid vout with
+          | None -> None
+          | Some data ->
+            let r = Serialize.reader_of_cstruct
+              (Cstruct.of_string data) in
+            Some (deserialize_utxo_entry r)
+    in
     Perf.LRU.remove t.cache key;
-    Storage.ChainDB.delete_utxo t.db txid vout;
-    match existing with
-    | Some _ -> existing
-    | None ->
-      (* Was in DB but not cache - need to deserialize *)
-      match Storage.ChainDB.get_utxo t.db txid vout with
-      | None -> None
-      | Some data ->
-        let r = Serialize.reader_of_cstruct
-          (Cstruct.of_string data) in
-        Some (deserialize_utxo_entry r)
+    Hashtbl.replace t.dirty key `Removed;
+    existing
 
   (* Check if a UTXO exists *)
   let exists (t : t) (txid : Types.hash256) (vout : int) : bool =
     let key = utxo_key txid vout in
     if Perf.LRU.mem t.cache key then true
-    else Option.is_some (Storage.ChainDB.get_utxo t.db txid vout)
+    else
+      match Hashtbl.find_opt t.dirty key with
+      | Some `Removed -> false
+      | Some (`Added _) -> true
+      | None -> Option.is_some (Storage.ChainDB.get_utxo t.db txid vout)
+
+  (* Flush all dirty entries to disk in a single atomic batch transaction.
+     This writes all Added entries and deletes all Removed entries, then
+     clears the dirty set. *)
+  let flush (t : t) : unit =
+    let count = Hashtbl.length t.dirty in
+    if count > 0 then begin
+      let batch = Storage.ChainDB.batch_create () in
+      Hashtbl.iter (fun key entry ->
+        (* Extract txid (32 bytes) and vout (4 bytes LE) from the key *)
+        let key_cs = Cstruct.of_string key in
+        let txid = Cstruct.sub key_cs 0 32 in
+        let vout = Int32.to_int (Cstruct.LE.get_uint32 key_cs 32) in
+        match entry with
+        | `Added utxo ->
+          let w = Serialize.writer_create () in
+          serialize_utxo_entry w utxo;
+          Storage.ChainDB.batch_store_utxo batch txid vout
+            (Cstruct.to_string (Serialize.writer_to_cstruct w))
+        | `Removed ->
+          Storage.ChainDB.batch_delete_utxo batch txid vout
+      ) t.dirty;
+      Storage.ChainDB.batch_write t.db batch;
+      Hashtbl.clear t.dirty;
+      Logs.debug (fun m -> m "Flushed %d dirty UTXO entries to disk" count)
+    end
+
+  (* Get the number of pending dirty entries *)
+  let dirty_count (t : t) : int =
+    Hashtbl.length t.dirty
 
   (* Get cache hit rate *)
   let hit_rate t =
@@ -465,9 +564,11 @@ module OptimizedUtxoSet = struct
   (* Get cache size *)
   let cache_size t = Perf.LRU.size t.cache
 
-  (* Clear the in-memory cache (DB unchanged) *)
+  (* Clear the in-memory cache and dirty set.
+     WARNING: Unflushed dirty entries will be lost! Call flush first. *)
   let clear_cache t =
     Perf.LRU.clear t.cache;
+    Hashtbl.clear t.dirty;
     t.stats <- Perf.create_utxo_stats ()
 end
 

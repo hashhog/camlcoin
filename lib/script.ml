@@ -2396,6 +2396,14 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
         end
       end
     end
+  | Some (0, _program) when flags land script_verify_witness <> 0 ->
+    (* Witness v0 with wrong program length — must be exactly 20 or 32 bytes.
+       Valid lengths are caught by classify_script as P2WPKH_script/P2WSH_script,
+       so reaching here means the length is invalid. *)
+    if Cstruct.length script_sig > 0 then
+      Error "scriptSig must be empty for witness program"
+    else
+      Error "Witness v0 program must be exactly 20 or 32 bytes"
   | _ ->
 
   match classify_script script_pubkey with
@@ -2550,6 +2558,16 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                     end
                   end
                 end
+              | Some (0, _) when flags land script_verify_witness <> 0 ->
+                (* P2SH-wrapped witness v0 with wrong program length *)
+                Error "Witness v0 program must be exactly 20 or 32 bytes"
+              | Some (v, _) when v >= 1 && flags land script_verify_witness <> 0 ->
+                (* P2SH-wrapped witness v1+: not executed as taproot per BIP-341.
+                   Succeeds unconditionally unless discourage flag is set. *)
+                if flags land script_verify_discourage_upgradable_witness <> 0 then
+                  Error "Upgradable witness program in P2SH"
+                else
+                  Ok true
               | _ ->
                 (* Regular P2SH: run redeem script with remaining stack *)
                 let st2 = create_eval_state ~tx ~input_index ~amount ~flags

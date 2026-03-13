@@ -15,6 +15,7 @@ let difficulty_adjustment_interval = 2016  (* blocks between adjustments *)
 let target_timespan = 14 * 24 * 60 * 60  (* 2 weeks in seconds = 1,209,600 *)
 let max_target_timespan = target_timespan * 4  (* 4x upper bound *)
 let min_target_timespan = target_timespan / 4  (* 4x lower bound *)
+let max_timewarp = 600  (* BIP-94: max seconds a retarget-boundary block can predate its parent *)
 
 (* Transaction limits *)
 let max_tx_weight = 400_000
@@ -465,6 +466,18 @@ let is_valid_money (value : int64) : bool =
 let is_difficulty_adjustment_height (height : int) : bool =
   height > 0 && height mod difficulty_adjustment_interval = 0
 
+(* BIP-94 timewarp protection: at difficulty adjustment boundaries, the new
+   block's timestamp must not be more than max_timewarp seconds before the
+   previous block's timestamp. Returns true if the block passes the check. *)
+let check_timewarp_rule ~(height : int) ~(header_time : int32)
+    ~(prev_block_time : int32) ~(network : network_config) : bool =
+  if network.pow_no_retargeting then true  (* Regtest skips this *)
+  else if height mod difficulty_adjustment_interval <> 0 then true  (* Not a boundary *)
+  else
+    (* header_time >= prev_block_time - max_timewarp *)
+    Int32.compare header_time
+      (Int32.sub prev_block_time (Int32.of_int max_timewarp)) >= 0
+
 (* Genesis block coinbase is NOT spendable (not in UTXO set) *)
 let is_genesis_coinbase (height : int) (_txid : Types.hash256) : bool =
   height = 0
@@ -531,15 +544,36 @@ let target_spacing = 600
 
 (* On testnet, if a block's timestamp is more than 2 * target_spacing (20 min)
    after the previous block, allow mining at the minimum difficulty (pow_limit).
+   When the block is NOT slow (elapsed <= 2*target_spacing), Bitcoin Core walks
+   backward to find the last block whose bits != pow_limit (or a retarget
+   boundary), and returns those bits instead.
    Returns None if the rule does not apply, Some nbits if it does. *)
 let testnet_min_difficulty_bits ~(prev_block_time : int32)
-    ~(current_time : int32) ~(network : network_config) : int32 option =
+    ~(current_time : int32) ~(network : network_config)
+    ?(get_bits_at_height : (int -> int32) option) ~(height : int) ()
+    : int32 option =
   if network.pow_allow_min_difficulty then begin
     let elapsed = Int32.to_int (Int32.sub current_time prev_block_time) in
     if elapsed > 2 * target_spacing then
       Some network.pow_limit
-    else
-      None
+    else begin
+      (* Walk backward to find the last non-min-difficulty block or a retarget
+         boundary. If no callback is provided, return None (caller uses
+         current_bits as before). *)
+      match get_bits_at_height with
+      | None -> None
+      | Some get_bits ->
+        let rec walk h =
+          if h < 0 then None
+          else
+            let bits = get_bits h in
+            if bits <> network.pow_limit || h mod difficulty_adjustment_interval = 0 then
+              Some bits
+            else
+              walk (h - 1)
+        in
+        walk (height - 1)
+    end
   end else
     None
 

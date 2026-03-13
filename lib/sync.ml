@@ -2,6 +2,10 @@
 (* Downloads all block headers before downloading full blocks,
    verifying the proof-of-work chain and building the header chain. *)
 
+let log_src = Logs.Src.create "VALIDATION" ~doc:"Block validation"
+module Log = (val Logs.src_log log_src : Logs.LOG)
+let _ = Log.info  (* suppress unused module warning *)
+
 (* Sync state machine *)
 type sync_state =
   | Idle
@@ -33,11 +37,21 @@ type chain_state = {
   mutable sync_peer : int option;
   mutable headers_synced : int;
   mutable blocks_synced : int;
+  mutable prune_target : int;    (* 0 = no pruning, else keep this many blocks *)
+  mutable prune_height : int;    (* last pruned height *)
+  headers_from_peer : (int, int) Hashtbl.t;  (* peer_id -> header count from that peer *)
 }
 
 (* Header flood prevention: reject new headers when this limit is reached
    and chain work is below the network's minimum_chain_work. *)
 let max_headers_in_memory = 1_000_000
+
+(* Header sync timeout constants *)
+let headers_download_timeout = 900.0  (* 15 min total for header download *)
+let headers_response_timeout = 120.0  (* 2 min per header response *)
+
+(* Per-peer header flood threshold *)
+let max_headers_per_peer = 10_000     (* Disconnect if peer sends this many with insufficient work *)
 
 (* Compute proof-of-work from compact target (nBits) as a 256-bit integer.
    Delegates to Consensus.work_from_compact which uses
@@ -56,6 +70,9 @@ let create_chain_state (db : Storage.ChainDB.t)
     sync_peer = None;
     headers_synced = 0;
     blocks_synced = 0;
+    prune_target = 0;
+    prune_height = 0;
+    headers_from_peer = Hashtbl.create 16;
   } in
   (* Insert genesis block header *)
   let genesis_hash = Crypto.compute_block_hash network.genesis_header in
@@ -86,6 +103,9 @@ let restore_chain_state (db : Storage.ChainDB.t)
     sync_peer = None;
     headers_synced = 0;
     blocks_synced = 0;
+    prune_target = 0;
+    prune_height = 0;
+    headers_from_peer = Hashtbl.create 16;
   } in
   (* Check for stored header tip *)
   match Storage.ChainDB.get_header_tip db with
@@ -116,6 +136,29 @@ let restore_chain_state (db : Storage.ChainDB.t)
   | None ->
     (* No stored state, create fresh with genesis *)
     create_chain_state db network
+
+(* Prune old block data to save disk space.
+   Keeps at least min_keep (288) blocks, matching Bitcoin Core MIN_BLOCKS_TO_KEEP.
+   Also deletes undo data for very old blocks beyond the keep window + 288. *)
+let prune_old_blocks (state : chain_state) (current_height : int) : unit =
+  if state.prune_target <= 0 then ()
+  else
+    let min_keep = 288 in  (* Bitcoin Core MIN_BLOCKS_TO_KEEP *)
+    let keep_blocks = max state.prune_target min_keep in
+    let prune_below = current_height - keep_blocks in
+    if prune_below <= state.prune_height then ()
+    else begin
+      for h = state.prune_height + 1 to prune_below do
+        match Storage.ChainDB.get_hash_at_height state.db h with
+        | None -> ()
+        | Some hash ->
+          Storage.ChainDB.delete_block state.db hash;
+          (* Also delete undo data for very old blocks *)
+          if h < current_height - keep_blocks - 288 then
+            Storage.ChainDB.delete_undo_data state.db hash
+      done;
+      state.prune_height <- prune_below
+    end
 
 (* Collect timestamps of the last n ancestors (including the given entry).
    Walks prev_block links in the in-memory header map. *)
@@ -278,53 +321,99 @@ let request_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
       hash_stop = Types.zero_hash;
     })
 
-(* Main header sync loop - requests headers repeatedly until caught up *)
+(* Main header sync loop - requests headers repeatedly until caught up.
+   Enforces headers_download_timeout (15 min total) and uses
+   read_message_with_timeout for per-response timeout (2 min). *)
 let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
   let open Lwt.Syntax in
   state.sync_state <- SyncingHeaders;
   state.sync_peer <- Some peer.id;
+  let sync_start_time = Unix.gettimeofday () in
   let rec loop () =
-    let* () = request_headers state peer in
-    let* msg = Peer.read_message peer in
-    match msg with
-    | P2p.HeadersMsg headers ->
-      let count = List.length headers in
-      Logs.info (fun m -> m "Received %d headers" count);
-      (match process_headers state headers with
-       | Ok accepted ->
-         Logs.info (fun m -> m "Accepted %d headers, tip at height %d"
-           accepted state.headers_synced);
-         if count = P2p.max_headers_count then
-           (* Peer may have more headers, continue requesting *)
-           loop ()
-         else begin
-           (* Got fewer than max, we're caught up with this peer.
-              Verify tip work >= minimum_chain_work before transitioning
-              to block sync (nMinimumChainWork check). *)
-           let tip_work = match state.tip with
-             | Some t -> t.total_work
-             | None -> Consensus.zero_work
-           in
-           if Consensus.work_compare tip_work
-                state.network.minimum_chain_work < 0 then begin
-             Logs.warn (fun m ->
-               m "Header chain work below minimum_chain_work, \
-                  not transitioning to block sync");
-             state.sync_state <- Idle;
-             Lwt.return_unit
-           end else begin
-             state.sync_state <- SyncingBlocks;
-             Lwt.return_unit
-           end
-         end
-       | Error e ->
-         Logs.err (fun m -> m "Header validation failed: %s" e);
-         state.sync_state <- Idle;
-         Lwt.return_unit)
-    | _ ->
-      Logs.warn (fun m -> m "Unexpected message during header sync: %s"
-        (P2p.command_to_string (P2p.payload_to_command msg)));
-      loop ()
+    (* Check total header download timeout *)
+    let elapsed = Unix.gettimeofday () -. sync_start_time in
+    if elapsed > headers_download_timeout then begin
+      Logs.err (fun m ->
+        m "Header sync timed out after %.0fs (limit: %.0fs)"
+          elapsed headers_download_timeout);
+      state.sync_state <- Idle;
+      Lwt.return_unit
+    end else begin
+      let* () = request_headers state peer in
+      let* msg_opt = Peer.read_message_with_timeout peer headers_response_timeout in
+      match msg_opt with
+      | None ->
+        Logs.err (fun m ->
+          m "Header sync: no response from peer %d within %.0fs"
+            peer.id headers_response_timeout);
+        state.sync_state <- Idle;
+        Lwt.return_unit
+      | Some (P2p.HeadersMsg headers) ->
+        let count = List.length headers in
+        Logs.info (fun m -> m "Received %d headers" count);
+        (* Track per-peer header count for flood detection *)
+        let prev_count =
+          match Hashtbl.find_opt state.headers_from_peer peer.id with
+          | Some c -> c
+          | None -> 0
+        in
+        let new_count = prev_count + count in
+        Hashtbl.replace state.headers_from_peer peer.id new_count;
+        (* Per-peer header flood check: if peer has sent > max_headers_per_peer
+           headers and total chain work is still below minimum, disconnect *)
+        if new_count > max_headers_per_peer then begin
+          let tip_work = match state.tip with
+            | Some t -> t.total_work
+            | None -> Consensus.zero_work
+          in
+          if Consensus.work_compare tip_work
+               state.network.minimum_chain_work < 0 then begin
+            Logs.warn (fun m ->
+              m "Peer %d sent %d headers with insufficient chain work, \
+                 disconnecting (header flood)" peer.id new_count);
+            state.sync_state <- Idle;
+            Lwt.return_unit
+          end else
+            process_and_continue state headers count loop
+        end else
+          process_and_continue state headers count loop
+      | Some msg ->
+        Logs.warn (fun m -> m "Unexpected message during header sync: %s"
+          (P2p.command_to_string (P2p.payload_to_command msg)));
+        loop ()
+    end
+  and process_and_continue state headers count loop_fn =
+    match process_headers state headers with
+    | Ok accepted ->
+      Logs.info (fun m -> m "Accepted %d headers, tip at height %d"
+        accepted state.headers_synced);
+      if count = P2p.max_headers_count then
+        (* Peer may have more headers, continue requesting *)
+        loop_fn ()
+      else begin
+        (* Got fewer than max, we're caught up with this peer.
+           Verify tip work >= minimum_chain_work before transitioning
+           to block sync (nMinimumChainWork check). *)
+        let tip_work = match state.tip with
+          | Some t -> t.total_work
+          | None -> Consensus.zero_work
+        in
+        if Consensus.work_compare tip_work
+             state.network.minimum_chain_work < 0 then begin
+          Logs.warn (fun m ->
+            m "Header chain work below minimum_chain_work, \
+               not transitioning to block sync");
+          state.sync_state <- Idle;
+          Lwt.return_unit
+        end else begin
+          state.sync_state <- SyncingBlocks;
+          Lwt.return_unit
+        end
+      end
+    | Error e ->
+      Logs.err (fun m -> m "Header validation failed: %s" e);
+      state.sync_state <- Idle;
+      Lwt.return_unit
   in
   loop ()
 
@@ -414,6 +503,7 @@ let is_assume_valid (state : chain_state) (height : int) : bool =
 (* IBD configuration constants *)
 let max_blocks_per_peer = 16          (* Max in-flight blocks per peer *)
 let max_total_blocks_in_flight = 128  (* Global cap on blocks in flight *)
+let stall_timeout = 2.0                 (* 2s stall detection — re-request from another peer *)
 let base_block_timeout = 60.0           (* 60s base timeout — matches Bitcoin Core's conservative approach *)
 let max_block_timeout = 300.0           (* 5 min max timeout per block *)
 let max_stall_timeout = 1200.0          (* 20 min max stall — matches Bitcoin Core *)
@@ -541,10 +631,11 @@ let check_timeouts (ibd : ibd_state) : unit =
   ) ibd.block_queue
 
 (* Check for stalled block downloads with exponential backoff and peer disconnect.
-   Iterates block queue entries in Requested state. If the request has exceeded its
-   timeout, resets the entry to NotRequested and increments the peer's consecutive
-   timeout counter. Applies exponential backoff (doubles timeout, capped at
-   max_stall_timeout). Returns a list of peer IDs that should be disconnected
+   Iterates block queue entries in Requested state. If the request has been pending
+   for > stall_timeout (2s) with no progress, reset to NotRequested so it can be
+   retried from a different peer. If the request has exceeded the full timeout,
+   apply exponential backoff and increment the peer's consecutive timeout counter.
+   Returns a list of peer IDs that should be disconnected
    (those exceeding max_consecutive_timeouts). *)
 let check_stalled_downloads (ibd : ibd_state) : int list =
   let now = Unix.gettimeofday () in
@@ -553,7 +644,7 @@ let check_stalled_downloads (ibd : ibd_state) : int list =
     match entry.download_state with
     | Requested { peer_id; requested_at; timeout } ->
       if now > requested_at +. timeout then begin
-        (* Timeout: reset block to NotRequested for re-download *)
+        (* Hard timeout: reset block to NotRequested for re-download *)
         entry.download_state <- NotRequested;
         ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
         let peer_state = get_peer_state ibd peer_id in
@@ -568,9 +659,21 @@ let check_stalled_downloads (ibd : ibd_state) : int list =
              (consecutive timeouts: %d, new timeout: %.1fs)"
             entry.height peer_id
             peer_state.consecutive_timeouts peer_state.current_timeout);
-        (* Mark peer for disconnect after max_consecutive_timeouts *)
+        (* Mark peer for disconnect after base_block_timeout worth of stalls *)
         if peer_state.consecutive_timeouts >= max_consecutive_timeouts then
           Hashtbl.replace peers_to_disconnect peer_id true
+      end else if now > requested_at +. stall_timeout then begin
+        (* Stall detection: block pending > 2s with no progress.
+           Reset to NotRequested so it can be re-requested from another peer.
+           Do NOT penalize the peer yet — only the hard timeout does that. *)
+        entry.download_state <- NotRequested;
+        ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
+        let peer_state = get_peer_state ibd peer_id in
+        peer_state.blocks_in_flight <- max 0 (peer_state.blocks_in_flight - 1);
+        Logs.debug (fun m ->
+          m "Stall detected for height %d from peer %d (%.1fs), \
+             re-requesting from another peer"
+            entry.height peer_id (now -. requested_at))
       end
     | _ -> ()
   ) ibd.block_queue;
@@ -878,10 +981,17 @@ let compute_expected_bits (state : chain_state) (height : int)
     | Some parent ->
       (* Testnet min-difficulty rule: if block timestamp is > 20 min after
          parent, allow mining at pow_limit *)
+      let get_bits h =
+        match get_header_at_height state h with
+        | Some hdr -> hdr.header.bits
+        | None -> network.pow_limit
+      in
       (match Consensus.testnet_min_difficulty_bits
                ~prev_block_time:parent.header.timestamp
                ~current_time:block_header.timestamp
-               ~network with
+               ~network
+               ~get_bits_at_height:get_bits
+               ~height () with
        | Some min_bits -> min_bits
        | None -> parent.header.bits)
     | None -> network.pow_limit
@@ -995,6 +1105,8 @@ let process_downloaded_blocks (ibd : ibd_state)
            ibd.chain.blocks_synced <- height;
            ibd.blocks_since_flush <- ibd.blocks_since_flush + 1;
            incr processed;
+           (* Prune old blocks if pruning is enabled *)
+           prune_old_blocks ibd.chain height;
            (* Periodic UTXO flush *)
            if ibd.blocks_since_flush >= utxo_flush_interval then begin
              flush_utxos ibd;
@@ -1101,13 +1213,13 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
       (* Collect blocks to connect (new chain from fork to new tip) *)
       let to_connect = collect_path state fork_point new_tip in
       (* Disconnect blocks in reverse order (tip back to fork): restore spent UTXOs *)
-      let disconnect_error = ref None in
       let disconnected_txs = ref [] in
-      List.iter (fun (entry : header_entry) ->
-        if !disconnect_error = None then
+      let rec disconnect_blocks = function
+        | [] -> Ok ()
+        | (entry : header_entry) :: rest ->
           match Storage.ChainDB.get_block state.db entry.hash with
           | None ->
-            disconnect_error := Some (Printf.sprintf
+            Error (Printf.sprintf
               "Missing block at height %d during reorg disconnect" entry.height)
           | Some block ->
             (* Collect non-coinbase transactions for mempool re-addition *)
@@ -1117,7 +1229,7 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
             ) block.transactions;
             match Storage.ChainDB.get_undo_data state.db entry.hash with
             | None ->
-              disconnect_error := Some (Printf.sprintf
+              Error (Printf.sprintf
                 "Missing undo data at height %d during reorg disconnect" entry.height)
             | Some undo_raw ->
               let r = Serialize.reader_of_cstruct (Cstruct.of_string undo_raw) in
@@ -1142,14 +1254,16 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
               (* Clean up stored undo data for disconnected block *)
               Storage.ChainDB.delete_undo_data state.db entry.hash;
               Logs.debug (fun m ->
-                m "Disconnected block at height %d" entry.height)
-      ) (List.rev to_disconnect);
-      (* Bail if disconnect failed *)
-      match !disconnect_error with
-      | Some e ->
-        flush_utxos ibd;
+                m "Disconnected block at height %d" entry.height);
+              disconnect_blocks rest
+      in
+      match disconnect_blocks (List.rev to_disconnect) with
+      | Error e ->
+        Logs.err (fun m -> m "Reorg aborted during disconnect: %s" e);
+        ibd.pending_utxo_deletes <- [];
+        ibd.pending_utxo_updates <- [];
         Error e
-      | None ->
+      | Ok () ->
       (* Flush pending UTXO changes from disconnect before connecting *)
       flush_utxos ibd;
       (* Re-add disconnected transactions to mempool if available *)
@@ -1253,6 +1367,8 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
                ) block.transactions;
                (* Flush after each connect to keep DB consistent for lookups *)
                flush_utxos ibd;
+               (* Prune old blocks if pruning is enabled *)
+               prune_old_blocks state height;
                (* Remove connected block's transactions from mempool *)
                (match ibd.mempool with
                 | Some mp -> Mempool.remove_for_block mp block height
@@ -1376,7 +1492,12 @@ let handle_mempool_msg (ibd : ibd_state) (peer : Peer.peer) : unit Lwt.t =
            sat/kB = sat/WU * 4 * 1000 = sat/WU * 4000 *)
         let fee_rate_per_kb = entry.fee_rate *. 4000.0 in
         if fee_rate_per_kb >= feefilter_rate then begin
-          inv_items := P2p.{ inv_type = InvTx; hash = entry.txid } :: !inv_items;
+          let inv_entry = if peer.Peer.wtxid_relay then
+            P2p.{ inv_type = InvWitnessTx; hash = entry.wtxid }
+          else
+            P2p.{ inv_type = InvTx; hash = entry.txid }
+          in
+          inv_items := inv_entry :: !inv_items;
           incr count
         end
       end

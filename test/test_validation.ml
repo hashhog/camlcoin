@@ -364,7 +364,7 @@ let test_check_block_bad_difficulty () =
     ()
   in
   let txid = Crypto.compute_txid coinbase in
-  let merkle = Crypto.merkle_root [txid] in
+  let (merkle, _) = Crypto.merkle_root [txid] in
   let header = make_header ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:100l () in
   let block = { Types.header; transactions = [coinbase] } in
   (* Expected bits don't match *)
@@ -395,7 +395,7 @@ let test_check_block_bad_timestamp () =
     ()
   in
   let txid = Crypto.compute_txid coinbase in
-  let merkle = Crypto.merkle_root [txid] in
+  let (merkle, _) = Crypto.merkle_root [txid] in
   (* Timestamp <= median_time should fail *)
   let header = make_header ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:50l () in
   let block = { Types.header; transactions = [coinbase] } in

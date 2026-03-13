@@ -33,17 +33,36 @@ let read_bytes r n =
   r.pos <- r.pos + n;
   cs
 
+(* Maximum serialized object size *)
+let max_size = 0x02000000  (* 32 MB *)
+
 (* Bitcoin CompactSize unsigned integer encoding:
    value < 0xFD        -> 1 byte
    value <= 0xFFFF     -> 0xFD followed by 2 bytes LE
    value <= 0xFFFFFFFF -> 0xFE followed by 4 bytes LE
-   value > 0xFFFFFFFF  -> 0xFF followed by 8 bytes LE *)
+   value > 0xFFFFFFFF  -> 0xFF followed by 8 bytes LE
+   Rejects non-minimal encodings per Bitcoin Core consensus rules. *)
 let read_compact_size r =
   let first = read_uint8 r in
   if first < 0xFD then first
-  else if first = 0xFD then read_uint16_le r
-  else if first = 0xFE then Int32.to_int (read_int32_le r)
-  else Int64.to_int (read_int64_le r)
+  else if first = 0xFD then begin
+    let v = read_uint16_le r in
+    if v < 0xFD then failwith "non-canonical CompactSize";
+    if v > max_size then failwith "CompactSize exceeds max size";
+    v
+  end
+  else if first = 0xFE then begin
+    let v = Int32.to_int (read_int32_le r) in
+    if v < 0x10000 then failwith "non-canonical CompactSize";
+    if v > max_size then failwith "CompactSize exceeds max size";
+    v
+  end
+  else begin
+    let v = Int64.to_int (read_int64_le r) in
+    if v < 0x100000000 then failwith "non-canonical CompactSize";
+    if v > max_size then failwith "CompactSize exceeds max size";
+    v
+  end
 
 let read_string r =
   let len = read_compact_size r in

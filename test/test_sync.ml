@@ -589,8 +589,8 @@ let test_receive_unrequested_block () =
 let test_ibd_constants () =
   Alcotest.(check int) "max_blocks_per_peer" 16 Sync.max_blocks_per_peer;
   Alcotest.(check int) "max_total_blocks_in_flight" 128 Sync.max_total_blocks_in_flight;
-  Alcotest.(check (float 0.001)) "base_block_timeout" 5.0 Sync.base_block_timeout;
-  Alcotest.(check (float 0.001)) "max_block_timeout" 64.0 Sync.max_block_timeout;
+  Alcotest.(check (float 0.001)) "base_block_timeout" 60.0 Sync.base_block_timeout;
+  Alcotest.(check (float 0.001)) "max_block_timeout" 300.0 Sync.max_block_timeout;
   Alcotest.(check int) "utxo_flush_interval" 2000 Sync.utxo_flush_interval;
   Alcotest.(check int) "block_download_window" 1024 Sync.block_download_window
 

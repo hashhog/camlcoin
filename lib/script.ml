@@ -2744,28 +2744,16 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                 (* Extract internal key (32 bytes starting at offset 1) *)
                 let internal_key = Cstruct.sub control 1 32 in
 
-                (* Compute tapleaf hash: tagged_hash("TapLeaf", leaf_version || compact_size(script_len) || script) *)
-                let tapleaf_w = Serialize.writer_create () in
-                Serialize.write_uint8 tapleaf_w leaf_version;
-                Serialize.write_compact_size tapleaf_w (Cstruct.length tap_script);
-                Serialize.write_bytes tapleaf_w tap_script;
-                let tapleaf_hash = Crypto.tagged_hash "TapLeaf" (Serialize.writer_to_cstruct tapleaf_w) in
+                (* Compute tapleaf hash using crypto helper *)
+                let tapleaf_hash = Crypto.compute_tapleaf_hash leaf_version tap_script in
 
-                (* Walk Merkle path to compute root *)
-                let rec walk_path hash idx =
-                  if idx >= path_len then hash
-                  else begin
-                    let sibling = Cstruct.sub control (33 + idx * 32) 32 in
-                    let branch_hash =
-                      if Cstruct.compare hash sibling <= 0 then
-                        Crypto.tagged_hash "TapBranch" (Cstruct.concat [hash; sibling])
-                      else
-                        Crypto.tagged_hash "TapBranch" (Cstruct.concat [sibling; hash])
-                    in
-                    walk_path branch_hash (idx + 1)
-                  end
-                in
-                let merkle_root = walk_path tapleaf_hash 0 in
+                (* Extract path elements from control block *)
+                let path = List.init path_len (fun idx ->
+                  Cstruct.sub control (33 + idx * 32) 32
+                ) in
+
+                (* Walk Merkle path to compute root using crypto helper *)
+                let merkle_root = Crypto.compute_taproot_merkle_root_from_path tapleaf_hash path in
 
                 (* Compute tweak: tagged_hash("TapTweak", internal_key || merkle_root) *)
                 let tweak = Crypto.tagged_hash "TapTweak" (Cstruct.concat [internal_key; merkle_root]) in

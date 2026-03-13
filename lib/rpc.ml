@@ -146,12 +146,23 @@ let handle_getblock (ctx : rpc_context)
          | Some e -> Types.hash256_to_hex_display e.total_work
          | None -> "0000000000000000000000000000000000000000000000000000000000000000"
        in
+       (* Compute block sizes *)
+       let w_total = Serialize.writer_create () in
+       Serialize.serialize_block w_total block;
+       let total_size = Cstruct.length (Serialize.writer_to_cstruct w_total) in
+       let total_weight =
+         (* Header weight = 80 * 4, plus sum of tx weights *)
+         80 * Consensus.witness_scale_factor +
+         List.fold_left (fun acc tx -> acc + Validation.compute_tx_weight tx) 0 block.transactions
+       in
+       (* Stripped size = (total_weight - total_size) / 3 *)
+       let stripped_size = (total_weight - total_size) / 3 in
        Ok (`Assoc [
          ("hash", `String hash_hex);
          ("confirmations", `Int 1);
-         ("size", `Int 0);
-         ("strippedsize", `Int 0);
-         ("weight", `Int 0);
+         ("size", `Int total_size);
+         ("strippedsize", `Int stripped_size);
+         ("weight", `Int total_weight);
          ("height", `Int height);
          ("version", `Int (Int32.to_int block.header.version));
          ("versionHex", `String (Printf.sprintf "%08lx" block.header.version));
@@ -496,16 +507,16 @@ let handle_getrawmempool (ctx : rpc_context)
       let descendantcount = 1 + List.length descendants in
       let descendantsize = (entry.weight +
         List.fold_left (fun s (e : Mempool.mempool_entry) -> s + e.weight) 0 descendants) / 4 in
-      let descendantfees = Int64.to_int (List.fold_left
+      let descendantfees = Int64.to_float (List.fold_left
         (fun s (e : Mempool.mempool_entry) -> Int64.add s e.fee)
-        entry.fee descendants) in
+        entry.fee descendants) /. 100_000_000.0 in
       let ancestors = Mempool.get_ancestors ctx.mempool entry.txid in
       let ancestorcount = 1 + List.length ancestors in
       let ancestorsize = (entry.weight +
         List.fold_left (fun s (e : Mempool.mempool_entry) -> s + e.weight) 0 ancestors) / 4 in
-      let ancestorfees = Int64.to_int (List.fold_left
+      let ancestorfees = Int64.to_float (List.fold_left
         (fun s (e : Mempool.mempool_entry) -> Int64.add s e.fee)
-        entry.fee ancestors) in
+        entry.fee ancestors) /. 100_000_000.0 in
       let info = `Assoc [
         ("vsize", `Int (entry.weight / 4));
         ("weight", `Int entry.weight);
@@ -515,10 +526,10 @@ let handle_getrawmempool (ctx : rpc_context)
         ("height", `Int entry.height_added);
         ("descendantcount", `Int descendantcount);
         ("descendantsize", `Int descendantsize);
-        ("descendantfees", `Int descendantfees);
+        ("descendantfees", `Float descendantfees);
         ("ancestorcount", `Int ancestorcount);
         ("ancestorsize", `Int ancestorsize);
-        ("ancestorfees", `Int ancestorfees);
+        ("ancestorfees", `Float ancestorfees);
         ("depends", `List (List.map (fun dep ->
           `String (Types.hash256_to_hex_display dep)
         ) entry.depends_on));
@@ -579,7 +590,7 @@ let handle_getmempoolentry (ctx : rpc_context)
     (match Hashtbl.find_opt ctx.mempool.entries txid_key with
      | Some entry ->
        Ok (`Assoc [
-         ("fee", `Int (Int64.to_int entry.Mempool.fee));
+         ("fee", `Float (Int64.to_float entry.Mempool.fee /. 100_000_000.0));
          ("weight", `Int entry.weight);
          ("time", `Float entry.time_added);
          ("depends", `List (List.map (fun dep ->
@@ -792,6 +803,76 @@ let handle_signrawtransactionwithwallet (ctx : rpc_context)
     Error "Invalid parameters: expected [hexstring]"
 
 (* ============================================================================
+   Address Validation Handler
+   ============================================================================ *)
+
+let handle_validateaddress (_ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String address] ->
+    (match Address.address_of_string address with
+     | Ok addr ->
+       let script_pubkey = Wallet.build_output_script addr in
+       let is_witness = match addr.Address.addr_type with
+         | Address.P2WPKH | Address.P2WSH | Address.P2TR -> true
+         | Address.P2PKH | Address.P2SH -> false
+       in
+       let witness_version = match addr.Address.addr_type with
+         | Address.P2WPKH | Address.P2WSH -> Some 0
+         | Address.P2TR -> Some 1
+         | _ -> None
+       in
+       let hex = Types.hash256_to_hex script_pubkey in
+       let base_fields = [
+         ("isvalid", `Bool true);
+         ("address", `String address);
+         ("scriptPubKey", `String hex);
+         ("isscript", `Bool (addr.Address.addr_type = Address.P2SH));
+         ("iswitness", `Bool is_witness);
+       ] in
+       let fields = match witness_version with
+         | Some v -> ("witness_version", `Int v) :: base_fields
+         | None -> base_fields
+       in
+       Ok (`Assoc fields)
+     | Error _ ->
+       Ok (`Assoc [("isvalid", `Bool false)]))
+  | _ -> Error "Invalid parameters: expected [address]"
+
+(* ============================================================================
+   UTXO Lookup Handler
+   ============================================================================ *)
+
+let handle_gettxout (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String txid_hex; `Int vout] ->
+    let txid = parse_txid_param txid_hex in
+    let utxo_set = Utxo.UtxoSet.create ctx.chain.db in
+    (match Utxo.UtxoSet.get utxo_set txid vout with
+     | None -> Ok `Null
+     | Some utxo ->
+       let tip_hash_hex = match ctx.chain.tip with
+         | Some t -> Types.hash256_to_hex_display t.hash
+         | None -> "0000000000000000000000000000000000000000000000000000000000000000"
+       in
+       let tip_height = match ctx.chain.tip with
+         | Some t -> t.height
+         | None -> 0
+       in
+       let confirmations = max 1 (tip_height - utxo.Utxo.height + 1) in
+       Ok (`Assoc [
+         ("bestblock", `String tip_hash_hex);
+         ("confirmations", `Int confirmations);
+         ("value", `Float (Int64.to_float utxo.Utxo.value /. 100_000_000.0));
+         ("scriptPubKey", `Assoc [
+           ("hex", `String (Types.hash256_to_hex utxo.Utxo.script_pubkey));
+         ]);
+         ("coinbase", `Bool utxo.Utxo.is_coinbase);
+       ]))
+  | _ -> Error "Invalid parameters: expected [txid, vout]"
+
+(* ============================================================================
    Performance Stats Handlers
    ============================================================================ *)
 
@@ -849,8 +930,12 @@ let handle_help (_ctx : rpc_context)
       "getrawtransaction \"txid\" ( verbose )";
       "sendrawtransaction \"hexstring\"";
       "";
+      "== Blockchain ==";
+      "gettxout \"txid\" vout";
+      "";
       "== Util ==";
       "estimatesmartfee conf_target";
+      "validateaddress \"address\"";
       "";
       "== Wallet ==";
       "getbalance";
@@ -903,6 +988,10 @@ let dispatch_rpc (ctx : rpc_context)
     Ok (handle_getbestblockhash ctx)
   | "getdifficulty" ->
     Ok (handle_getdifficulty ctx)
+  | "gettxout" ->
+    (match handle_gettxout ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
 
   (* Transactions *)
   | "getrawtransaction" ->
@@ -944,11 +1033,15 @@ let dispatch_rpc (ctx : rpc_context)
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
 
-  (* Fee estimation *)
+  (* Fee estimation / Util *)
   | "estimatesmartfee" ->
     (match handle_estimatesmartfee ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
+  | "validateaddress" ->
+    (match handle_validateaddress ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_invalid_address, msg))
 
   (* Mining *)
   | "getmininginfo" ->

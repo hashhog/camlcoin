@@ -23,6 +23,7 @@ type block_template = {
   header : Types.block_header;
   coinbase_tx : Types.transaction;
   transactions : Types.transaction list;
+  tx_fees : int64 list;  (* per-transaction fees, same order as transactions *)
   total_fee : int64;
   total_weight : int;
   height : int;
@@ -273,8 +274,9 @@ let create_block_template ~(chain : Sync.chain_state)
   let total_fee = List.fold_left
     (fun acc (_, fee) -> Int64.add acc fee) 0L selected in
 
-  (* Extract just the transactions *)
+  (* Extract transactions and per-transaction fees *)
   let selected_txs = List.map fst selected in
+  let tx_fees = List.map snd selected in
 
   (* Create extra nonce (8 bytes of random data) *)
   let extra_nonce = Cstruct.create 8 in
@@ -325,6 +327,7 @@ let create_block_template ~(chain : Sync.chain_state)
     header;
     coinbase_tx;
     transactions = selected_txs;
+    tx_fees;
     total_fee;
     total_weight;
     height;
@@ -408,12 +411,25 @@ let tx_to_hex (tx : Types.transaction) : string =
 (* Convert a block template to BIP-22/BIP-23 JSON format.
    This is the format expected by mining software. *)
 let template_to_json (template : block_template) : Yojson.Safe.t =
-  let txs_json = List.map (fun tx ->
+  (* Build txid -> index map for depends *)
+  let txid_to_idx = Hashtbl.create 16 in
+  List.iteri (fun i tx ->
     let txid = Crypto.compute_txid tx in
+    Hashtbl.replace txid_to_idx (Cstruct.to_string txid) (i + 1)
+  ) template.transactions;
+
+  let txs_json = List.mapi (fun _i tx ->
+    let txid = Crypto.compute_txid tx in
+    let fee = List.nth template.tx_fees _i in
+    (* Find depends: which inputs reference other template txs *)
+    let depends = List.filter_map (fun (inp : Types.tx_in) ->
+      Hashtbl.find_opt txid_to_idx (Cstruct.to_string inp.previous_output.txid)
+    ) tx.inputs in
     `Assoc [
       ("data", `String (tx_to_hex tx));
       ("txid", `String (Types.hash256_to_hex_display txid));
-      ("fee", `Int 0);  (* Would need to track per-tx fee *)
+      ("fee", `Int (Int64.to_int fee));
+      ("depends", `List (List.map (fun i -> `Int i) depends));
       ("sigops", `Int (Validation.count_tx_sigops tx));
       ("weight", `Int (Validation.compute_tx_weight tx));
     ]

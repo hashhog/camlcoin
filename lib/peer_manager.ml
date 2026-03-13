@@ -1,5 +1,8 @@
 (* Peer discovery and connection pool management using Lwt *)
 
+let log_src = Logs.Src.create "NET" ~doc:"P2P networking"
+module Log = (val Logs.src_log log_src : Logs.LOG)
+
 (* Source of peer address discovery *)
 type addr_source =
   | Dns      (* From DNS seed resolution *)
@@ -27,6 +30,7 @@ type config = {
   ban_duration : float;  (* Default ban duration in seconds *)
   ping_interval : float; (* Seconds between pings *)
   dead_timeout : float;  (* Seconds before peer considered dead *)
+  chain_sync_timeout : float; (* Seconds before evicting outbound peer behind our tip *)
 }
 
 let default_config : config = {
@@ -37,6 +41,7 @@ let default_config : config = {
   ban_duration = 86400.0;  (* 24 hours *)
   ping_interval = 120.0;   (* 2 minutes *)
   dead_timeout = 600.0;    (* 10 minutes *)
+  chain_sync_timeout = 1200.0; (* 20 minutes *)
 }
 
 (* Hardcoded fallback peers for testnet4 (DNS seeds are unreliable) *)
@@ -71,6 +76,8 @@ type t = {
   stale_tip_check_interval : float;          (* Default 1800.0 = 30 minutes *)
   addr_rate : (string, int * float) Hashtbl.t;  (* Per-peer addr rate limiting: (count, window_start) *)
   mutable listen_addr : string option;           (* Our own listening address, if known *)
+  chain_sync_behind_since : (int, float) Hashtbl.t; (* peer_id -> timestamp when first noticed behind *)
+  mutable db : Storage.ChainDB.t option;            (* Chain database for building locators *)
 }
 
 (* Create a new peer manager *)
@@ -88,11 +95,16 @@ let create ?(config = default_config) (network : Consensus.network_config) : t =
     stale_tip_check_interval = 1800.0;
     addr_rate = Hashtbl.create 256;
     listen_addr = None;
+    chain_sync_behind_since = Hashtbl.create 16;
+    db = None;
   }
 
 (* Update our known blockchain height *)
 let set_height (pm : t) (height : int32) : unit =
   pm.our_height <- height
+
+let set_db (pm : t) (db : Storage.ChainDB.t) : unit =
+  pm.db <- Some db
 
 (* Get current blockchain height *)
 let get_height (pm : t) : int32 =
@@ -128,9 +140,18 @@ let inbound_peer_count (pm : t) : int =
   List.length (List.filter (fun p ->
     p.Peer.direction = Peer.Inbound) pm.peers)
 
+(* Extract /16 netgroup from an IPv4 address string *)
+let netgroup_of addr =
+  match String.split_on_char '.' addr with
+  | a :: b :: _ -> a ^ "." ^ b
+  | _ -> addr
+
 (* Evict one low-quality inbound peer to make room for a new connection.
    Protects the best inbound peers from eviction:
    - Top 4 by lowest latency
+   - Top 4 by highest bytes_sent (upload contribution)
+   - Top 4 by highest bytes_received (download contribution)
+   - 1 per unique /16 subnet (up to 4 netgroups)
    - Top 4 by longest connection time (lowest peer id = earliest connection)
    From the remaining unprotected peers, evicts the one with highest latency. *)
 let evict_inbound_peer (pm : t) : unit Lwt.t =
@@ -151,6 +172,42 @@ let evict_inbound_peer (pm : t) : unit Lwt.t =
     List.iteri (fun i p ->
       if i < 4 then Hashtbl.replace protected p.Peer.id true
     ) by_latency;
+    (* Protect top 4 by highest bytes_sent (upload contribution) *)
+    let unprotected_for_sent = List.filter (fun p ->
+      not (Hashtbl.mem protected p.Peer.id)
+    ) inbound_ready in
+    let by_bytes_sent = List.sort (fun a b ->
+      compare b.Peer.bytes_sent a.Peer.bytes_sent
+    ) unprotected_for_sent in
+    List.iteri (fun i p ->
+      if i < 4 then Hashtbl.replace protected p.Peer.id true
+    ) by_bytes_sent;
+    (* Protect top 4 by highest bytes_received (download contribution) *)
+    let unprotected_for_recv = List.filter (fun p ->
+      not (Hashtbl.mem protected p.Peer.id)
+    ) inbound_ready in
+    let by_bytes_received = List.sort (fun a b ->
+      compare b.Peer.bytes_received a.Peer.bytes_received
+    ) unprotected_for_recv in
+    List.iteri (fun i p ->
+      if i < 4 then Hashtbl.replace protected p.Peer.id true
+    ) by_bytes_received;
+    (* Netgroup diversity: protect 1 peer per unique /16 subnet (up to 4) *)
+    let unprotected_for_netgroup = List.filter (fun p ->
+      not (Hashtbl.mem protected p.Peer.id)
+    ) inbound_ready in
+    let seen_netgroups = Hashtbl.create 8 in
+    let netgroup_protected = ref 0 in
+    List.iter (fun p ->
+      if !netgroup_protected < 4 then begin
+        let ng = netgroup_of p.Peer.addr in
+        if not (Hashtbl.mem seen_netgroups ng) then begin
+          Hashtbl.replace seen_netgroups ng true;
+          Hashtbl.replace protected p.Peer.id true;
+          incr netgroup_protected
+        end
+      end
+    ) unprotected_for_netgroup;
     (* Protect top 4 by longest connection time (lowest id = earliest) *)
     let by_age = List.sort (fun a b ->
       compare a.Peer.id b.Peer.id
@@ -170,8 +227,8 @@ let evict_inbound_peer (pm : t) : unit Lwt.t =
         compare b.Peer.latency a.Peer.latency
       ) unprotected in
       let victim = List.hd by_worst_latency in
-      Printf.eprintf "[peer_manager] evicting inbound peer %d (%s) latency=%.3fs\n%!"
-        victim.Peer.id victim.Peer.addr victim.Peer.latency;
+      Log.info (fun m -> m "Evicting inbound peer %d (%s) latency=%.3fs"
+        victim.Peer.id victim.Peer.addr victim.Peer.latency);
       Peer.disconnect victim |> fun lwt ->
         let open Lwt.Syntax in
         let* () = lwt in
@@ -302,6 +359,7 @@ let remove_peer (pm : t) (peer_id : int) : unit Lwt.t =
   | Some peer ->
     let* () = Peer.disconnect peer in
     pm.peers <- List.filter (fun p -> p.Peer.id <> peer_id) pm.peers;
+    Hashtbl.remove pm.chain_sync_behind_since peer_id;
     Lwt.return_unit
 
 (* Ban a peer *)
@@ -392,6 +450,46 @@ let send_to_peer (pm : t) (peer_id : int) (payload : P2p.message_payload) : unit
       (fun () -> Peer.send_message peer payload)
       (fun _exn -> Lwt.return_unit)
 
+(* Check if a 16-byte address is an IPv4-mapped IPv6 address (::ffff:x.x.x.x) *)
+let is_ipv4_mapped (addr : Cstruct.t) : bool =
+  (* First 10 bytes must be 0x00, bytes 10-11 must be 0xFF *)
+  let ok = ref true in
+  for i = 0 to 9 do
+    if Cstruct.get_uint8 addr i <> 0x00 then ok := false
+  done;
+  if Cstruct.get_uint8 addr 10 <> 0xFF then ok := false;
+  if Cstruct.get_uint8 addr 11 <> 0xFF then ok := false;
+  !ok
+
+(* Check if all 16 bytes of the address are zero (unspecified address) *)
+let is_unspecified (addr : Cstruct.t) : bool =
+  let ok = ref true in
+  for i = 0 to 15 do
+    if Cstruct.get_uint8 addr i <> 0 then ok := false
+  done;
+  !ok
+
+(* Format a 16-byte network address field as a string.
+   IPv4-mapped -> "x.x.x.x", native IPv6 -> "x:x:x:x:x:x:x:x",
+   unspecified (all zeros) -> None *)
+let format_address (addr : Cstruct.t) : string option =
+  if is_unspecified addr then
+    None
+  else if is_ipv4_mapped addr then
+    Some (Printf.sprintf "%d.%d.%d.%d"
+      (Cstruct.get_uint8 addr 12)
+      (Cstruct.get_uint8 addr 13)
+      (Cstruct.get_uint8 addr 14)
+      (Cstruct.get_uint8 addr 15))
+  else
+    (* Native IPv6: format as 8 groups of 16-bit hex values *)
+    let groups = Array.init 8 (fun i ->
+      Cstruct.BE.get_uint16 addr (i * 2)
+    ) in
+    Some (Printf.sprintf "%x:%x:%x:%x:%x:%x:%x:%x"
+      groups.(0) groups.(1) groups.(2) groups.(3)
+      groups.(4) groups.(5) groups.(6) groups.(7))
+
 (* Handle incoming addr message with rate limiting and validation *)
 let handle_addr (pm : t) (peer : Peer.peer) (addrs : (int32 * Types.net_addr) list) : unit =
   let now = Unix.gettimeofday () in
@@ -412,8 +510,8 @@ let handle_addr (pm : t) (peer : Peer.peer) (addrs : (int32 * Types.net_addr) li
   let remaining = max_addrs_per_day - count in
   if remaining <= 0 then begin
     (* Rate limit exceeded, ignore all addresses *)
-    Printf.eprintf "[peer_manager] addr rate limit exceeded for peer %d (%s)\n%!"
-      peer.Peer.id peer.Peer.addr;
+    Log.info (fun m -> m "Addr rate limit exceeded for peer %d (%s)"
+      peer.Peer.id peer.Peer.addr);
     ()
   end else begin
     (* Only process up to the remaining quota *)
@@ -424,13 +522,10 @@ let handle_addr (pm : t) (peer : Peer.peer) (addrs : (int32 * Types.net_addr) li
     in
     let processed = ref 0 in
     List.iter (fun (ts, addr) ->
-      (* Extract IPv4 address from IPv6-mapped format *)
-      let ip_str =
-        Printf.sprintf "%d.%d.%d.%d"
-          (Cstruct.get_uint8 addr.Types.addr 12)
-          (Cstruct.get_uint8 addr.addr 13)
-          (Cstruct.get_uint8 addr.addr 14)
-          (Cstruct.get_uint8 addr.addr 15) in
+      (* Extract address from 16-byte network address field *)
+      match format_address addr.Types.addr with
+      | None -> ()  (* Unspecified address, skip *)
+      | Some ip_str ->
       (* Timestamp validation: reject addresses > 600 seconds in the future *)
       let ts_float = Int32.to_float ts in
       if ts_float > now +. 600.0 then
@@ -550,35 +645,50 @@ let check_stale_tip (pm : t) : unit Lwt.t =
       Int32.compare b.Peer.best_height a.Peer.best_height
     ) higher_peers in
     let best_peer = List.hd sorted in
-    Printf.eprintf "[peer_manager] WARNING: stale tip detected (no update for %.0fs), \
-      peer %d reports height %ld vs our %ld\n%!"
-      time_since_update best_peer.Peer.id best_peer.Peer.best_height pm.our_height;
+    Log.info (fun m -> m "Stale tip detected (no update for %.0fs), \
+      peer %d reports height %ld vs our %ld"
+      time_since_update best_peer.Peer.id best_peer.Peer.best_height pm.our_height);
     (* Send getheaders to the peer with the highest reported height *)
     let getheaders = P2p.GetheadersMsg {
       version = 70016l;
-      locator_hashes = [];
+      locator_hashes = (match pm.db with
+        | Some db -> build_locator db (Int32.to_int pm.our_height)
+        | None -> []);
       hash_stop = Types.zero_hash;
     } in
     let* () = Lwt.catch
       (fun () -> Peer.send_message best_peer getheaders)
       (fun _exn -> Lwt.return_unit) in
-    (* If tip is very stale (2x interval), disconnect lowest peer and try a new one *)
+    (* If tip is very stale (2x interval), disconnect longest-behind peer and try a new one *)
     if time_since_update > 2.0 *. pm.stale_tip_check_interval then begin
-      Printf.eprintf "[peer_manager] WARNING: tip severely stale (%.0fs), \
-        rotating lowest-height peer\n%!" time_since_update;
-      (* Find the peer with the lowest reported height *)
-      let sorted_asc = List.sort (fun a b ->
-        Int32.compare a.Peer.best_height b.Peer.best_height
-      ) ready_peers in
-      match sorted_asc with
-      | [] -> Lwt.return_unit
-      | lowest :: _ ->
-        let* () = remove_peer pm lowest.Peer.id in
-        (* Attempt to connect a new peer *)
+      Log.info (fun m -> m "Tip severely stale (%.0fs), rotating longest-behind peer" time_since_update);
+      (* Find peer that has been behind the longest *)
+      let behind_peers = Hashtbl.fold (fun pid ts acc ->
+        (pid, ts) :: acc
+      ) pm.chain_sync_behind_since [] in
+      let sorted_behind = List.sort (fun (_, ts1) (_, ts2) ->
+        compare ts1 ts2  (* oldest timestamp first = behind longest *)
+      ) behind_peers in
+      match sorted_behind with
+      | (pid, _) :: _ ->
+        let* () = remove_peer pm pid in
         let candidates = get_connection_candidates pm 1 in
-        match candidates with
+        (match candidates with
+         | [] -> Lwt.return_unit
+         | c :: _ -> add_peer pm c.address c.port)
+      | [] ->
+        (* No tracked behind peers; fall back to lowest height *)
+        let sorted_asc = List.sort (fun a b ->
+          Int32.compare a.Peer.best_height b.Peer.best_height
+        ) ready_peers in
+        (match sorted_asc with
         | [] -> Lwt.return_unit
-        | c :: _ -> add_peer pm c.address c.port
+        | lowest :: _ ->
+          let* () = remove_peer pm lowest.Peer.id in
+          let candidates = get_connection_candidates pm 1 in
+          (match candidates with
+           | [] -> Lwt.return_unit
+           | c :: _ -> add_peer pm c.address c.port))
     end else
       Lwt.return_unit
   end else
@@ -621,6 +731,39 @@ let maintain_connections (pm : t) : unit Lwt.t =
       let* () = Lwt_list.iter_s (fun p ->
         remove_peer pm p.Peer.id
       ) dead in
+      (* Evict outbound peers behind our chain tip for too long *)
+      let* () =
+        let our_h = Int32.to_int pm.our_height in
+        let behind = List.filter (fun p ->
+          p.Peer.state = Peer.Ready &&
+          p.Peer.direction = Peer.Outbound &&
+          Int32.to_int p.Peer.best_height < our_h - 1
+        ) pm.peers in
+        (* Track when each outbound peer first fell behind *)
+        List.iter (fun p ->
+          if not (Hashtbl.mem pm.chain_sync_behind_since p.Peer.id) then
+            Hashtbl.replace pm.chain_sync_behind_since p.Peer.id now
+        ) behind;
+        (* Clear tracking for peers that caught up *)
+        let caught_up_ids = Hashtbl.fold (fun pid _ts acc ->
+          match List.find_opt (fun p -> p.Peer.id = pid) behind with
+          | Some _ -> acc
+          | None -> pid :: acc
+        ) pm.chain_sync_behind_since [] in
+        List.iter (fun pid ->
+          Hashtbl.remove pm.chain_sync_behind_since pid
+        ) caught_up_ids;
+        (* Disconnect peers behind for longer than chain_sync_timeout *)
+        let to_evict = Hashtbl.fold (fun pid ts acc ->
+          if now -. ts > pm.config.chain_sync_timeout then pid :: acc
+          else acc
+        ) pm.chain_sync_behind_since [] in
+        Lwt_list.iter_s (fun pid ->
+          Log.info (fun m -> m "Evicting outbound peer %d: behind our tip for >%.0fs"
+            pid pm.config.chain_sync_timeout);
+          remove_peer pm pid
+        ) to_evict
+      in
       (* Check for stale chain tip *)
       let* () = check_stale_tip pm in
       (* Sleep before next iteration *)

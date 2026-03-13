@@ -32,16 +32,18 @@ let make_test_header ~prev_block ~ts ~nc =
 let test_work_from_bits () =
   (* Low difficulty (regtest) should have low work per block *)
   let regtest_work = Sync.work_from_bits 0x207fffffl in
-  Alcotest.(check bool) "regtest work > 0" true (regtest_work > 0.0);
+  Alcotest.(check bool) "regtest work > 0" true
+    (Consensus.work_compare regtest_work Consensus.zero_work > 0);
 
   (* High difficulty (mainnet genesis) should have higher work *)
   let mainnet_work = Sync.work_from_bits 0x1d00ffffl in
   Alcotest.(check bool) "mainnet work > regtest work"
-    true (mainnet_work > regtest_work);
+    true (Consensus.work_compare mainnet_work regtest_work > 0);
 
   (* Zero target should give 0 work *)
   let zero_work = Sync.work_from_bits 0l in
-  Alcotest.(check (float 0.001)) "zero bits gives 0 work" 0.0 zero_work
+  Alcotest.(check bool) "zero bits gives 0 work" true
+    (Consensus.work_compare zero_work Consensus.zero_work = 0)
 
 (* Test create_chain_state initializes with genesis *)
 let test_create_chain_state () =
@@ -54,7 +56,7 @@ let test_create_chain_state () =
   Alcotest.(check bool) "tip exists" true (Option.is_some tip);
   let entry = Option.get tip in
   Alcotest.(check int) "tip height is 0" 0 entry.height;
-  Alcotest.(check bool) "tip has work" true (entry.total_work > 0.0);
+  Alcotest.(check bool) "tip has work" true (Consensus.work_compare entry.total_work Consensus.zero_work > 0);
 
   (* Header count should be 1 (just genesis) *)
   Alcotest.(check int) "header count" 1 (Sync.header_count state);
@@ -82,7 +84,7 @@ let test_validate_header_valid () =
   let ok = match result with
     | Ok entry ->
       Alcotest.(check int) "valid header height" 1 entry.height;
-      Alcotest.(check bool) "valid header has work" true (entry.total_work > 0.0);
+      Alcotest.(check bool) "valid header has work" true (Consensus.work_compare entry.total_work Consensus.zero_work > 0);
       true
     | Error "Insufficient proof of work" ->
       (* This is acceptable - we'd need to mine a valid header *)
@@ -576,9 +578,9 @@ let test_receive_unrequested_block () =
     transactions = [];
   } in
 
-  (* Queue is empty *)
+  (* Queue is empty - block is stored as orphan instead of rejected *)
   let result = Sync.receive_block ibd block in
-  Alcotest.(check bool) "receive unrequested block fails" true (Result.is_error result);
+  Alcotest.(check bool) "receive unrequested block stored as orphan" true (Result.is_ok result);
 
   Storage.ChainDB.close db;
   cleanup_test_db ()
@@ -590,7 +592,7 @@ let test_ibd_constants () =
   Alcotest.(check (float 0.001)) "base_block_timeout" 5.0 Sync.base_block_timeout;
   Alcotest.(check (float 0.001)) "max_block_timeout" 64.0 Sync.max_block_timeout;
   Alcotest.(check int) "utxo_flush_interval" 2000 Sync.utxo_flush_interval;
-  Alcotest.(check int) "download_window_multiplier" 4 Sync.download_window_multiplier
+  Alcotest.(check int) "block_download_window" 1024 Sync.block_download_window
 
 (* Test find_fork_point with same chain *)
 let test_find_fork_point_same () =

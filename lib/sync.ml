@@ -20,7 +20,7 @@ type header_entry = {
   header : Types.block_header;
   hash : Types.hash256;
   height : int;
-  total_work : float;  (* cumulative proof-of-work *)
+  total_work : Cstruct.t;  (* cumulative proof-of-work, 32-byte LE *)
 }
 
 (* Chain state - tracks sync progress and header chain *)
@@ -35,20 +35,15 @@ type chain_state = {
   mutable blocks_synced : int;
 }
 
-(* Compute proof-of-work from compact target (nBits).
-   Work = 2^256 / target. Higher work = more difficult.
-   Target is in little-endian format (byte 0 = LSB, byte 31 = MSB). *)
-let work_from_bits (bits : int32) : float =
-  let target = Consensus.compact_to_target bits in
-  let target_f = ref 0.0 in
-  for i = 0 to 31 do
-    (* Little-endian: byte i contributes 2^(8*i) *)
-    target_f := !target_f +.
-      (float_of_int (Cstruct.get_uint8 target i)) *.
-      (2.0 ** (float_of_int (8 * i)))
-  done;
-  if !target_f = 0.0 then 0.0
-  else (2.0 ** 256.0) /. !target_f
+(* Header flood prevention: reject new headers when this limit is reached
+   and chain work is below the network's minimum_chain_work. *)
+let max_headers_in_memory = 1_000_000
+
+(* Compute proof-of-work from compact target (nBits) as a 256-bit integer.
+   Delegates to Consensus.work_from_compact which uses
+   (~target / (target + 1)) + 1 to avoid 2^256 overflow. *)
+let work_from_bits (bits : int32) : Cstruct.t =
+  Consensus.work_from_compact bits
 
 (* Create initial chain state with genesis block *)
 let create_chain_state (db : Storage.ChainDB.t)
@@ -101,15 +96,15 @@ let restore_chain_state (db : Storage.ChainDB.t)
       | Some hash ->
         (match Storage.ChainDB.get_block_header db hash with
          | Some header ->
-           let parent_work = if h = 0 then 0.0 else
+           let parent_work = if h = 0 then Consensus.zero_work else
              match Hashtbl.find_opt state.headers
                  (Cstruct.to_string header.prev_block) with
              | Some parent -> parent.total_work
-             | None -> 0.0
+             | None -> Consensus.zero_work
            in
            let entry = {
              header; hash; height = h;
-             total_work = parent_work +. work_from_bits header.bits;
+             total_work = Consensus.work_add parent_work (work_from_bits header.bits);
            } in
            Hashtbl.replace state.headers (Cstruct.to_string hash) entry;
            if h = tip_height then state.tip <- Some entry
@@ -122,8 +117,25 @@ let restore_chain_state (db : Storage.ChainDB.t)
     (* No stored state, create fresh with genesis *)
     create_chain_state db network
 
+(* Collect timestamps of the last n ancestors (including the given entry).
+   Walks prev_block links in the in-memory header map. *)
+let collect_ancestor_timestamps (state : chain_state)
+    (entry : header_entry) (n : int) : int32 list =
+  let rec walk acc count cur =
+    if count >= n then acc
+    else
+      let acc = cur.header.timestamp :: acc in
+      if cur.height = 0 then acc
+      else
+        let parent_key = Cstruct.to_string cur.header.prev_block in
+        match Hashtbl.find_opt state.headers parent_key with
+        | Some parent -> walk acc (count + 1) parent
+        | None -> acc
+  in
+  walk [] 0 entry
+
 (* Validate a header against the current chain state.
-   Checks: not duplicate, parent exists, proof-of-work valid, timestamp reasonable *)
+   Checks: not duplicate, parent exists, proof-of-work valid, timestamp, MTP *)
 let validate_header (state : chain_state) (header : Types.block_header)
     : (header_entry, string) result =
   let hash = Crypto.compute_block_hash header in
@@ -143,15 +155,25 @@ let validate_header (state : chain_state) (header : Types.block_header)
       (* Check timestamp not too far in future (2 hours) *)
       else if Int32.to_float header.timestamp > Unix.gettimeofday () +. 7200.0 then
         Error "Header timestamp too far in future"
-      (* Check timestamp greater than median of last 11 blocks (simplified check) *)
-      else if Int32.compare header.timestamp parent.header.timestamp < 0 &&
-              parent.height > 0 then
-        (* Allow same timestamp but not earlier than parent as a basic check *)
-        Error "Header timestamp before parent"
       else begin
-        let height = parent.height + 1 in
-        let work = parent.total_work +. work_from_bits header.bits in
-        Ok { header; hash; height; total_work = work }
+        (* MTP validation: collect timestamps of last 11 ancestors *)
+        let ancestor_ts = collect_ancestor_timestamps state parent 11 in
+        let mtp = Consensus.median_time_past ancestor_ts in
+        if Int32.compare header.timestamp mtp <= 0 then
+          Error "Header timestamp not greater than median-time-past"
+        else begin
+          let height = parent.height + 1 in
+          (* Checkpoint enforcement: if this height has a checkpoint,
+             the header hash must match the expected checkpoint hash *)
+          match Consensus.get_checkpoint_hash height state.network with
+          | Some expected_hash when not (Cstruct.equal hash expected_hash) ->
+            Error (Printf.sprintf
+              "Header at checkpoint height %d does not match expected hash" height)
+          | _ ->
+          let work = Consensus.work_add parent.total_work
+              (work_from_bits header.bits) in
+          Ok { header; hash; height; total_work = work }
+        end
       end
   end
 
@@ -165,7 +187,7 @@ let accept_header (state : chain_state) (entry : header_entry) : unit =
   (* Update tip if this has more cumulative work *)
   let is_new_tip = match state.tip with
     | None -> true
-    | Some tip -> entry.total_work > tip.total_work
+    | Some tip -> Consensus.work_compare entry.total_work tip.total_work > 0
   in
   if is_new_tip then begin
     state.tip <- Some entry;
@@ -177,22 +199,33 @@ let accept_header (state : chain_state) (entry : header_entry) : unit =
    Returns Ok(accepted_count) or Error(reason) if validation fails *)
 let process_headers (state : chain_state)
     (headers : Types.block_header list) : (int, string) result =
-  let accepted = ref 0 in
-  let error = ref None in
-  List.iter (fun header ->
-    if !error = None then
-      match validate_header state header with
-      | Ok entry ->
-        accept_header state entry;
-        incr accepted
-      | Error "Header already known" ->
-        ()  (* Skip duplicates silently *)
-      | Error e ->
-        error := Some e
-  ) headers;
-  match !error with
-  | Some e when !accepted = 0 -> Error e
-  | _ -> Ok !accepted
+  (* Header flood prevention: reject if we already have too many headers
+     and chain work is below the minimum *)
+  let tip_work = match state.tip with
+    | Some t -> t.total_work
+    | None -> Consensus.zero_work
+  in
+  if Hashtbl.length state.headers >= max_headers_in_memory
+     && Consensus.work_compare tip_work state.network.minimum_chain_work < 0 then
+    Error "Header flood: too many headers with insufficient chain work"
+  else begin
+    let accepted = ref 0 in
+    let error = ref None in
+    List.iter (fun header ->
+      if !error = None then
+        match validate_header state header with
+        | Ok entry ->
+          accept_header state entry;
+          incr accepted
+        | Error "Header already known" ->
+          ()  (* Skip duplicates silently *)
+        | Error e ->
+          error := Some e
+    ) headers;
+    match !error with
+    | Some e when !accepted = 0 -> Error e
+    | _ -> Ok !accepted
+  end
 
 (* Build a block locator for getheaders request.
    Returns exponentially spaced block hashes from tip back to genesis. *)
@@ -265,9 +298,24 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
            (* Peer may have more headers, continue requesting *)
            loop ()
          else begin
-           (* Got fewer than max, we're caught up with this peer *)
-           state.sync_state <- SyncingBlocks;
-           Lwt.return_unit
+           (* Got fewer than max, we're caught up with this peer.
+              Verify tip work >= minimum_chain_work before transitioning
+              to block sync (nMinimumChainWork check). *)
+           let tip_work = match state.tip with
+             | Some t -> t.total_work
+             | None -> Consensus.zero_work
+           in
+           if Consensus.work_compare tip_work
+                state.network.minimum_chain_work < 0 then begin
+             Logs.warn (fun m ->
+               m "Header chain work below minimum_chain_work, \
+                  not transitioning to block sync");
+             state.sync_state <- Idle;
+             Lwt.return_unit
+           end else begin
+             state.sync_state <- SyncingBlocks;
+             Lwt.return_unit
+           end
          end
        | Error e ->
          Logs.err (fun m -> m "Header validation failed: %s" e);
@@ -351,13 +399,39 @@ type peer_download_state = {
   mutable current_timeout : float;
 }
 
+(* Check if a block at the given height/hash is at or below the assumevalid
+   checkpoint. If assume_valid_hash is set, we look up that hash in our
+   header map to find its height; any block at or below that height on the
+   best chain is considered assume-valid, so script verification is skipped. *)
+let is_assume_valid (state : chain_state) (height : int) : bool =
+  match state.network.assume_valid_hash with
+  | None -> false
+  | Some av_hash ->
+    match Hashtbl.find_opt state.headers (Cstruct.to_string av_hash) with
+    | None -> false  (* assumevalid block not in our chain yet *)
+    | Some av_entry -> height <= av_entry.height
+
 (* IBD configuration constants *)
 let max_blocks_per_peer = 16          (* Max in-flight blocks per peer *)
 let max_total_blocks_in_flight = 128  (* Global cap on blocks in flight *)
 let base_block_timeout = 5.0          (* Base timeout in seconds *)
 let max_block_timeout = 64.0          (* Max timeout after backoff *)
+let max_stall_timeout = 300.0         (* Max timeout for stalled downloads *)
+let max_consecutive_timeouts = 3      (* Disconnect peer after this many consecutive timeouts *)
 let utxo_flush_interval = 2000        (* Flush UTXOs every N blocks *)
-let download_window_multiplier = 4    (* Queue size = max_in_flight * multiplier *)
+let block_download_window = 1024      (* Max blocks ahead to queue (matches Bitcoin Core BLOCK_DOWNLOAD_WINDOW) *)
+
+(* Orphan block pool constants *)
+let max_orphan_blocks = 750
+let orphan_block_expire_seconds = 1800.0  (* 30 minutes *)
+
+(* Orphan block entry - stores blocks whose parents we haven't seen yet *)
+type orphan_block_entry = {
+  block : Types.block;
+  hash : Types.hash256;
+  prev_hash : Types.hash256;
+  received_time : float;
+}
 
 (* IBD state - tracks the full block download process *)
 type ibd_state = {
@@ -370,10 +444,14 @@ type ibd_state = {
   mutable blocks_since_flush : int;
   mutable pending_utxo_updates : (Types.hash256 * int * string) list;
   mutable pending_utxo_deletes : (Types.hash256 * int) list;
+  utxo_set : Utxo.OptimizedUtxoSet.t option;  (* Wire UTXO flush *)
+  mutable mempool : Mempool.mempool option;
+  orphan_blocks : (string, orphan_block_entry) Hashtbl.t;
 }
 
 (* Create IBD state from existing chain state *)
-let create_ibd_state (chain : chain_state) : ibd_state =
+let create_ibd_state ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
+    (chain : chain_state) : ibd_state =
   let start_height = chain.blocks_synced + 1 in
   { chain;
     block_queue = [];
@@ -383,7 +461,13 @@ let create_ibd_state (chain : chain_state) : ibd_state =
     peer_states = Hashtbl.create 16;
     blocks_since_flush = 0;
     pending_utxo_updates = [];
-    pending_utxo_deletes = [] }
+    pending_utxo_deletes = [];
+    utxo_set;
+    mempool = None;
+    orphan_blocks = Hashtbl.create 100 }
+
+let set_mempool (ibd : ibd_state) (mp : Mempool.mempool) =
+  ibd.mempool <- Some mp
 
 (* Get or create peer download state *)
 let get_peer_state (ibd : ibd_state) (peer_id : int) : peer_download_state =
@@ -409,7 +493,7 @@ let fill_download_queue (ibd : ibd_state) : unit =
     | Some t -> t.height
     | None -> 0
   in
-  let max_queue_size = max_total_blocks_in_flight * download_window_multiplier in
+  let max_queue_size = block_download_window in
   while ibd.next_download_height <= tip_height &&
         List.length ibd.block_queue < max_queue_size do
     let height = ibd.next_download_height in
@@ -455,6 +539,42 @@ let check_timeouts (ibd : ibd_state) : unit =
       end
     | _ -> ()
   ) ibd.block_queue
+
+(* Check for stalled block downloads with exponential backoff and peer disconnect.
+   Iterates block queue entries in Requested state. If the request has exceeded its
+   timeout, resets the entry to NotRequested and increments the peer's consecutive
+   timeout counter. Applies exponential backoff (doubles timeout, capped at
+   max_stall_timeout). Returns a list of peer IDs that should be disconnected
+   (those exceeding max_consecutive_timeouts). *)
+let check_stalled_downloads (ibd : ibd_state) : int list =
+  let now = Unix.gettimeofday () in
+  let peers_to_disconnect = Hashtbl.create 4 in
+  List.iter (fun entry ->
+    match entry.download_state with
+    | Requested { peer_id; requested_at; timeout } ->
+      if now > requested_at +. timeout then begin
+        (* Timeout: reset block to NotRequested for re-download *)
+        entry.download_state <- NotRequested;
+        ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
+        let peer_state = get_peer_state ibd peer_id in
+        peer_state.blocks_in_flight <- max 0 (peer_state.blocks_in_flight - 1);
+        (* Increment consecutive timeout counter *)
+        peer_state.consecutive_timeouts <- peer_state.consecutive_timeouts + 1;
+        (* Exponential backoff: double timeout, cap at max_stall_timeout *)
+        peer_state.current_timeout <- min max_stall_timeout
+          (peer_state.current_timeout *. 2.0);
+        Logs.debug (fun m ->
+          m "Stalled download for height %d from peer %d \
+             (consecutive timeouts: %d, new timeout: %.1fs)"
+            entry.height peer_id
+            peer_state.consecutive_timeouts peer_state.current_timeout);
+        (* Mark peer for disconnect after max_consecutive_timeouts *)
+        if peer_state.consecutive_timeouts >= max_consecutive_timeouts then
+          Hashtbl.replace peers_to_disconnect peer_id true
+      end
+    | _ -> ()
+  ) ibd.block_queue;
+  Hashtbl.fold (fun peer_id _ acc -> peer_id :: acc) peers_to_disconnect []
 
 (* Decay timeout on successful receipt *)
 let record_successful_download (ibd : ibd_state) (peer_id : int) : unit =
@@ -536,12 +656,37 @@ let receive_block (ibd : ibd_state) (block : Types.block)
     : (unit, string) result =
   let hash = Crypto.compute_block_hash block.header in
   let hash_key = Cstruct.to_string hash in
-  match List.find_opt (fun e ->
+  match List.find_opt (fun (e : block_queue_entry) ->
     Cstruct.to_string e.hash = hash_key
   ) ibd.block_queue with
   | None ->
-    (* Unrequested block - could be from announcement *)
-    Error "Unrequested block"
+    (* Unrequested block - store as orphan if pool isn't full *)
+    let prev_hash = block.header.prev_block in
+    let orphan_entry = {
+      block;
+      hash;
+      prev_hash;
+      received_time = Unix.gettimeofday ();
+    } in
+    if Hashtbl.length ibd.orphan_blocks >= max_orphan_blocks then begin
+      (* Pool is full - evict the oldest entry *)
+      let oldest_key = ref "" in
+      let oldest_time = ref infinity in
+      Hashtbl.iter (fun key entry ->
+        if entry.received_time < !oldest_time then begin
+          oldest_time := entry.received_time;
+          oldest_key := key
+        end
+      ) ibd.orphan_blocks;
+      if !oldest_key <> "" then
+        Hashtbl.remove ibd.orphan_blocks !oldest_key
+    end;
+    Hashtbl.replace ibd.orphan_blocks hash_key orphan_entry;
+    Logs.debug (fun m ->
+      m "Stored orphan block %s (pool size: %d)"
+        (Types.hash256_to_hex_display hash)
+        (Hashtbl.length ibd.orphan_blocks));
+    Ok ()
   | Some entry ->
     (* Record which peer sent it for timeout decay *)
     let peer_id = match entry.download_state with
@@ -572,7 +717,11 @@ let flush_utxos (ibd : ibd_state) : unit =
     ibd.pending_utxo_updates <- [];
     ibd.pending_utxo_deletes <- [];
     Logs.debug (fun m -> m "Flushed UTXO updates to disk")
-  end
+  end;
+  (* Also flush the OptimizedUtxoSet dirty entries if one is attached *)
+  match ibd.utxo_set with
+  | Some utxo -> Utxo.OptimizedUtxoSet.flush utxo
+  | None -> ()
 
 (* Encode UTXO data for storage *)
 let encode_utxo (value : int64) (script : Cstruct.t) (height : int)
@@ -584,6 +733,74 @@ let encode_utxo (value : int64) (script : Cstruct.t) (height : int)
   Serialize.write_int32_le w (Int32.of_int height);
   Serialize.write_uint8 w (if is_coinbase then 1 else 0);
   Cstruct.to_string (Serialize.writer_to_cstruct w)
+
+(* Expire orphan blocks older than orphan_block_expire_seconds *)
+let expire_orphan_blocks (ibd : ibd_state) : int =
+  let now = Unix.gettimeofday () in
+  let to_remove = Hashtbl.fold (fun key entry acc ->
+    if now -. entry.received_time > orphan_block_expire_seconds then
+      key :: acc
+    else
+      acc
+  ) ibd.orphan_blocks [] in
+  List.iter (fun key -> Hashtbl.remove ibd.orphan_blocks key) to_remove;
+  let removed = List.length to_remove in
+  if removed > 0 then
+    Logs.debug (fun m ->
+      m "Expired %d orphan blocks (pool size: %d)"
+        removed (Hashtbl.length ibd.orphan_blocks));
+  removed
+
+(* Process orphan blocks whose parent has arrived.
+   After a block with the given hash is successfully connected, check if any
+   orphans have prev_hash matching it. If found, add them to the block queue
+   and process recursively (an orphan may unblock another orphan). *)
+let process_orphan_blocks (ibd : ibd_state) (parent_hash : Types.hash256) : int =
+  let processed = ref 0 in
+  let rec process_children parent_h =
+    let parent_key = Cstruct.to_string parent_h in
+    (* Find all orphans whose prev_hash matches parent_h *)
+    let children = Hashtbl.fold (fun key entry acc ->
+      if Cstruct.to_string entry.prev_hash = parent_key then
+        (key, entry) :: acc
+      else
+        acc
+    ) ibd.orphan_blocks [] in
+    List.iter (fun (key, orphan) ->
+      (* Remove from orphan pool *)
+      Hashtbl.remove ibd.orphan_blocks key;
+      (* Add to block queue if we know the header *)
+      let orphan_hash_key = Cstruct.to_string orphan.hash in
+      (match Hashtbl.find_opt ibd.chain.headers orphan_hash_key with
+       | Some header_entry ->
+         (* Add to block queue as Downloaded so it can be processed *)
+         let queue_entry = {
+           hash = orphan.hash;
+           height = header_entry.height;
+           download_state = Downloaded orphan.block;
+         } in
+         ibd.block_queue <- ibd.block_queue @ [queue_entry];
+         incr processed;
+         Logs.debug (fun m ->
+           m "Moved orphan block %s (height %d) to block queue"
+             (Types.hash256_to_hex_display orphan.hash) header_entry.height)
+       | None ->
+         (* We don't have the header for this orphan - just re-receive it
+            via receive_block which will re-orphan it or process it *)
+         let result = receive_block ibd orphan.block in
+         (match result with
+          | Ok () -> incr processed
+          | Error _ -> ()));
+      (* Recursively process any orphans that depend on this one *)
+      process_children orphan.hash
+    ) children
+  in
+  process_children parent_hash;
+  if !processed > 0 then
+    Logs.debug (fun m ->
+      m "Processed %d orphan blocks from parent %s"
+        !processed (Types.hash256_to_hex_display parent_hash));
+  !processed
 
 (* Process downloaded blocks in height order *)
 let process_downloaded_blocks (ibd : ibd_state)
@@ -630,13 +847,37 @@ let process_downloaded_blocks (ibd : ibd_state)
             }
         in
         (* Validate block with UTXO tracking *)
-        let validation_flags = 0 in  (* Standard verification *)
+        let skip_scripts = is_assume_valid ibd.chain height in
+        let validation_flags =
+          if skip_scripts then 0
+          else Consensus.get_block_script_flags height ibd.chain.network
+        in
         (match Validation.validate_block_with_utxos block height
                  ~expected_bits ~median_time ~base_lookup:lookup
-                 ~flags:validation_flags with
+                 ~flags:validation_flags ~skip_scripts () with
          | Ok _fees ->
            (* Store block *)
            Storage.ChainDB.store_block ibd.chain.db entry.hash block;
+           (* Build and store undo data for chain reorganization *)
+           let undo_spent = ref [] in
+           List.iteri (fun tx_idx tx ->
+             if tx_idx > 0 then  (* Skip coinbase *)
+               List.iter (fun inp ->
+                 let prev = inp.Types.previous_output in
+                 let vout = Int32.to_int prev.Types.vout in
+                 match Storage.ChainDB.get_utxo ibd.chain.db prev.Types.txid vout with
+                 | None -> ()
+                 | Some data ->
+                   let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+                   let entry_utxo = Utxo.deserialize_utxo_entry r in
+                   undo_spent := (prev, entry_utxo) :: !undo_spent
+               ) tx.Types.inputs
+           ) block.transactions;
+           let undo : Utxo.undo_data = { height; spent_outputs = !undo_spent } in
+           let uw = Serialize.writer_create () in
+           Utxo.serialize_undo_data uw undo;
+           Storage.ChainDB.store_undo_data ibd.chain.db entry.hash
+             (Cstruct.to_string (Serialize.writer_to_cstruct uw));
            (* Update UTXOs - add new outputs, delete spent inputs *)
            List.iteri (fun tx_idx tx ->
              let txid = Crypto.compute_txid tx in
@@ -673,6 +914,8 @@ let process_downloaded_blocks (ibd : ibd_state)
              (* Also update chain tip in DB *)
              Storage.ChainDB.set_chain_tip ibd.chain.db entry.hash height
            end;
+           (* Check for orphan blocks that depend on this one *)
+           ignore (process_orphan_blocks ibd entry.hash);
            (* Remove validated entries from queue *)
            ibd.block_queue <- List.filter
              (fun e -> e.download_state <> Validated) ibd.block_queue
@@ -756,7 +999,7 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
     | None -> failwith "No current tip"
   in
   (* Avoid reorg if new tip isn't better *)
-  if new_tip.total_work <= current_tip.total_work then
+  if Consensus.work_compare new_tip.total_work current_tip.total_work <= 0 then
     Error "New tip does not have more work"
   else begin
     match find_fork_point state current_tip new_tip with
@@ -769,40 +1012,180 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
       let to_disconnect = collect_path state fork_point current_tip in
       (* Collect blocks to connect (new chain from fork to new tip) *)
       let to_connect = collect_path state fork_point new_tip in
-      (* Disconnect blocks: restore spent UTXOs *)
+      (* Disconnect blocks in reverse order (tip back to fork): restore spent UTXOs *)
+      let disconnect_error = ref None in
+      let disconnected_txs = ref [] in
       List.iter (fun (entry : header_entry) ->
-        match Storage.ChainDB.get_block state.db entry.hash with
-        | None ->
-          Logs.warn (fun m -> m "Missing block at height %d during reorg" entry.height)
-        | Some block ->
-          (* Process transactions in reverse order *)
-          let txs = List.rev block.transactions in
-          List.iter (fun tx ->
-            let txid = Crypto.compute_txid tx in
-            let is_cb = Validation.is_coinbase tx in
-            (* Remove outputs from UTXO set *)
-            List.iteri (fun vout _out ->
-              ibd.pending_utxo_deletes <- (txid, vout) :: ibd.pending_utxo_deletes
-            ) tx.Types.outputs;
-            (* Restore inputs to UTXO set (non-coinbase only) *)
-            (* NOTE: We'd need the original UTXO data here - this is simplified *)
-            if not is_cb then begin
-              (* In a full implementation, we'd store undo data *)
-              Logs.debug (fun m -> m "Would restore inputs for tx in reorg")
-            end
-          ) txs
-      ) to_disconnect;
-      (* Connect blocks: spend inputs, add outputs *)
-      (* This would require downloading and validating the new blocks *)
-      List.iter (fun (entry : header_entry) ->
-        Logs.debug (fun m -> m "Would connect block at height %d" entry.height)
-      ) to_connect;
-      (* Update tip *)
-      state.tip <- Some new_tip;
-      state.blocks_synced <- fork_point.height;  (* Reset to fork point *)
-      Storage.ChainDB.set_chain_tip state.db new_tip.hash new_tip.height;
+        if !disconnect_error = None then
+          match Storage.ChainDB.get_block state.db entry.hash with
+          | None ->
+            disconnect_error := Some (Printf.sprintf
+              "Missing block at height %d during reorg disconnect" entry.height)
+          | Some block ->
+            (* Collect non-coinbase transactions for mempool re-addition *)
+            List.iteri (fun tx_idx tx ->
+              if tx_idx > 0 then
+                disconnected_txs := tx :: !disconnected_txs
+            ) block.transactions;
+            match Storage.ChainDB.get_undo_data state.db entry.hash with
+            | None ->
+              disconnect_error := Some (Printf.sprintf
+                "Missing undo data at height %d during reorg disconnect" entry.height)
+            | Some undo_raw ->
+              let r = Serialize.reader_of_cstruct (Cstruct.of_string undo_raw) in
+              let undo = Utxo.deserialize_undo_data r in
+              (* Remove outputs created by this block (reverse tx order) *)
+              let txs = List.rev block.transactions in
+              List.iter (fun tx ->
+                let txid = Crypto.compute_txid tx in
+                List.iteri (fun vout _out ->
+                  ibd.pending_utxo_deletes <- (txid, vout) :: ibd.pending_utxo_deletes
+                ) tx.Types.outputs
+              ) txs;
+              (* Restore spent outputs from undo data *)
+              List.iter (fun (outpoint, utxo_entry) ->
+                let data = encode_utxo utxo_entry.Utxo.value
+                    utxo_entry.Utxo.script_pubkey utxo_entry.Utxo.height
+                    utxo_entry.Utxo.is_coinbase in
+                ibd.pending_utxo_updates <-
+                  (outpoint.Types.txid, Int32.to_int outpoint.Types.vout, data)
+                  :: ibd.pending_utxo_updates
+              ) undo.spent_outputs;
+              (* Clean up stored undo data for disconnected block *)
+              Storage.ChainDB.delete_undo_data state.db entry.hash;
+              Logs.debug (fun m ->
+                m "Disconnected block at height %d" entry.height)
+      ) (List.rev to_disconnect);
+      (* Bail if disconnect failed *)
+      match !disconnect_error with
+      | Some e ->
+        flush_utxos ibd;
+        Error e
+      | None ->
+      (* Flush pending UTXO changes from disconnect before connecting *)
       flush_utxos ibd;
-      Ok ()
+      (* Re-add disconnected transactions to mempool if available *)
+      (match ibd.mempool with
+       | Some mp ->
+         List.iter (fun tx ->
+           ignore (Mempool.add_transaction mp tx)
+         ) !disconnected_txs;
+         Logs.debug (fun m ->
+           m "Re-added %d disconnected transactions to mempool"
+             (List.length !disconnected_txs))
+       | None -> ());
+      (* Connect blocks on the new chain from fork forward *)
+      let connect_error = ref None in
+      List.iter (fun (entry : header_entry) ->
+        if !connect_error = None then
+          match Storage.ChainDB.get_block state.db entry.hash with
+          | None ->
+            connect_error := Some (Printf.sprintf
+              "Missing block at height %d during reorg connect" entry.height)
+          | Some block ->
+            let height = entry.height in
+            let expected_bits = block.header.bits in
+            let median_time = match get_header_at_height state (height - 1) with
+              | Some parent -> parent.header.timestamp
+              | None -> 0l
+            in
+            let lookup outpoint =
+              let vout = Int32.to_int outpoint.Types.vout in
+              match Storage.ChainDB.get_utxo state.db outpoint.Types.txid vout with
+              | None -> None
+              | Some data ->
+                let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+                let value = Serialize.read_int64_le r in
+                let script_len = Serialize.read_compact_size r in
+                let script = Serialize.read_bytes r script_len in
+                let stored_height = Int32.to_int (Serialize.read_int32_le r) in
+                let utxo_is_coinbase = Serialize.read_uint8 r = 1 in
+                Some Validation.{
+                  txid = outpoint.Types.txid;
+                  vout = outpoint.Types.vout;
+                  value;
+                  script_pubkey = script;
+                  height = stored_height;
+                  is_coinbase = utxo_is_coinbase;
+                }
+            in
+            let skip_scripts = is_assume_valid state height in
+            let validation_flags =
+              if skip_scripts then 0
+              else Consensus.get_block_script_flags height state.network
+            in
+            (match Validation.validate_block_with_utxos block height
+                     ~expected_bits ~median_time ~base_lookup:lookup
+                     ~flags:validation_flags ~skip_scripts () with
+             | Ok _fees ->
+               (* Store block if not already stored *)
+               if not (Storage.ChainDB.has_block state.db entry.hash) then
+                 Storage.ChainDB.store_block state.db entry.hash block;
+               (* Build and store undo data *)
+               let undo_spent = ref [] in
+               List.iteri (fun tx_idx tx ->
+                 if tx_idx > 0 then
+                   List.iter (fun inp ->
+                     let prev = inp.Types.previous_output in
+                     let vout = Int32.to_int prev.Types.vout in
+                     match Storage.ChainDB.get_utxo state.db prev.Types.txid vout with
+                     | None -> ()
+                     | Some data ->
+                       let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+                       let entry_utxo = Utxo.deserialize_utxo_entry r in
+                       undo_spent := (prev, entry_utxo) :: !undo_spent
+                   ) tx.Types.inputs
+               ) block.transactions;
+               let undo : Utxo.undo_data = { height; spent_outputs = !undo_spent } in
+               let uw = Serialize.writer_create () in
+               Utxo.serialize_undo_data uw undo;
+               Storage.ChainDB.store_undo_data state.db entry.hash
+                 (Cstruct.to_string (Serialize.writer_to_cstruct uw));
+               (* Update UTXOs *)
+               List.iteri (fun tx_idx tx ->
+                 let txid = Crypto.compute_txid tx in
+                 let is_cb = (tx_idx = 0) in
+                 if not (Consensus.is_genesis_coinbase height txid) then begin
+                   List.iteri (fun vout out ->
+                     let data = encode_utxo out.Types.value out.Types.script_pubkey
+                         height is_cb in
+                     ibd.pending_utxo_updates <-
+                       (txid, vout, data) :: ibd.pending_utxo_updates
+                   ) tx.Types.outputs
+                 end;
+                 if not is_cb then begin
+                   List.iter (fun inp ->
+                     ibd.pending_utxo_deletes <-
+                       (inp.Types.previous_output.Types.txid,
+                        Int32.to_int inp.Types.previous_output.Types.vout)
+                       :: ibd.pending_utxo_deletes
+                   ) tx.Types.inputs
+                 end
+               ) block.transactions;
+               (* Flush after each connect to keep DB consistent for lookups *)
+               flush_utxos ibd;
+               (* Remove connected block's transactions from mempool *)
+               (match ibd.mempool with
+                | Some mp -> Mempool.remove_for_block mp block height
+                | None -> ());
+               Logs.debug (fun m ->
+                 m "Connected block at height %d during reorg" height)
+             | Error e ->
+               connect_error := Some (Printf.sprintf
+                 "Block validation failed at height %d during reorg: %s"
+                 height (Validation.block_error_to_string e)))
+      ) to_connect;
+      (* Check for connect errors *)
+      match !connect_error with
+      | Some e -> Error e
+      | None ->
+        (* Update tip and chain state *)
+        state.tip <- Some new_tip;
+        state.blocks_synced <- new_tip.height;
+        Storage.ChainDB.set_chain_tip state.db new_tip.hash new_tip.height;
+        Logs.info (fun m ->
+          m "Reorganization complete, new tip at height %d" new_tip.height);
+        Ok ()
   end
 
 (* ============================================================================
@@ -826,7 +1209,21 @@ let run_ibd (ibd : ibd_state) (peers : Peer.peer list) : unit Lwt.t =
       ibd.chain.sync_state <- FullySynced;
       Lwt.return_unit
     end else begin
-      let%lwt () = request_blocks ibd peers in
+      (* Expire old orphan blocks *)
+      ignore (expire_orphan_blocks ibd);
+      (* Check for stalled downloads and disconnect bad peers *)
+      let stalled_peers = check_stalled_downloads ibd in
+      let active_peers = List.filter (fun p ->
+        not (List.mem p.Peer.id stalled_peers)
+      ) peers in
+      List.iter (fun peer_id ->
+        Logs.warn (fun m ->
+          m "Disconnecting peer %d after %d consecutive stalled downloads"
+            peer_id max_consecutive_timeouts);
+        (* Remove peer state so it won't be scheduled again *)
+        Hashtbl.remove ibd.peer_states peer_id
+      ) stalled_peers;
+      let%lwt () = request_blocks ibd active_peers in
       (* Short sleep to allow incoming messages *)
       let%lwt () = Lwt_unix.sleep 0.1 in
       (* Process any completed downloads *)
@@ -844,7 +1241,8 @@ let run_ibd (ibd : ibd_state) (peers : Peer.peer list) : unit Lwt.t =
   loop ()
 
 (* Start IBD if headers are synced but blocks aren't *)
-let start_ibd (state : chain_state) (peers : Peer.peer list) : unit Lwt.t =
+let start_ibd ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
+    (state : chain_state) (peers : Peer.peer list) : unit Lwt.t =
   if state.sync_state <> SyncingBlocks then
     Lwt.return_unit
   else begin
@@ -860,7 +1258,7 @@ let start_ibd (state : chain_state) (peers : Peer.peer list) : unit Lwt.t =
       Logs.info (fun m ->
         m "Starting IBD from height %d to %d"
           state.blocks_synced tip_height);
-      let ibd = create_ibd_state state in
+      let ibd = create_ibd_state ?utxo_set state in
       run_ibd ibd peers
     end
   end

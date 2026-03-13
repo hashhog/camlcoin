@@ -17,6 +17,10 @@ type tx_validation_error =
   | TxNonFinalLocktime
   | TxBadCoinbase
   | TxInvalidWitness
+  | TxUnexpectedCoinbase
+  | TxNullPrevout
+  | TxDuplicateTxid
+  | TxSequenceLocksFailed
 
 type block_validation_error =
   | BlockEmptyTransactions
@@ -29,6 +33,7 @@ type block_validation_error =
   | BlockBadCoinbaseValue of int64 * int64
   | BlockDuplicateTx
   | BlockTxValidationFailed of int * tx_validation_error
+  | BlockBadWitnessCommitment
 
 (* ============================================================================
    Error formatting
@@ -50,6 +55,10 @@ let tx_error_to_string = function
   | TxNonFinalLocktime -> "transaction is not final (locktime)"
   | TxBadCoinbase -> "invalid coinbase transaction"
   | TxInvalidWitness -> "invalid witness data"
+  | TxUnexpectedCoinbase -> "unexpected coinbase transaction (not first in block)"
+  | TxNullPrevout -> "non-coinbase transaction references null outpoint"
+  | TxDuplicateTxid -> "transaction has duplicate txid in UTXO set (BIP30)"
+  | TxSequenceLocksFailed -> "transaction sequence locks not satisfied (BIP68)"
 
 let block_error_to_string = function
   | BlockEmptyTransactions -> "block has no transactions"
@@ -65,6 +74,7 @@ let block_error_to_string = function
   | BlockDuplicateTx -> "block contains duplicate transactions"
   | BlockTxValidationFailed (i, e) ->
     Printf.sprintf "transaction %d validation failed: %s" i (tx_error_to_string e)
+  | BlockBadWitnessCommitment -> "witness commitment mismatch"
 
 (* ============================================================================
    Transaction Weight Computation (BIP-141)
@@ -102,8 +112,17 @@ let compute_tx_vsize (tx : Types.transaction) : int =
    Basic Transaction Validation
    ============================================================================ *)
 
-(* Check basic transaction structure *)
-let check_transaction (tx : Types.transaction) : (unit, tx_validation_error) result =
+(* Check if a transaction input references the null outpoint
+   (txid = all zeros AND vout = 0xFFFFFFFF) *)
+let is_null_outpoint (outpoint : Types.outpoint) : bool =
+  Cstruct.equal outpoint.Types.txid Types.zero_hash &&
+  outpoint.Types.vout = (-1l)  (* -1l = 0xFFFFFFFF as signed int32 *)
+
+(* Check basic transaction structure.
+   ~is_coinbase: when true, skip the null prevout check and duplicate input
+   check (coinbase always has a single null input). Default: false. *)
+let check_transaction ?(is_coinbase = false) (tx : Types.transaction)
+    : (unit, tx_validation_error) result =
   (* Must have at least one input *)
   if tx.inputs = [] then
     Error TxEmptyInputs
@@ -151,17 +170,30 @@ let check_transaction (tx : Types.transaction) : (unit, tx_validation_error) res
         ) tx.inputs;
 
         if !dup then Error TxDuplicateInputs
-        else Ok ()
+        else begin
+          (* Task 3: Check that non-coinbase inputs don't reference null outpoints *)
+          if not is_coinbase then begin
+            let has_null = List.exists (fun inp ->
+              is_null_outpoint inp.Types.previous_output
+            ) tx.inputs in
+            if has_null then Error TxNullPrevout
+            else Ok ()
+          end else
+            Ok ()
+        end
     end
   end
 
 (* Check if a transaction is a coinbase transaction *)
-let is_coinbase (tx : Types.transaction) : bool =
+let is_coinbase_tx (tx : Types.transaction) : bool =
   match tx.inputs with
   | [inp] ->
     Cstruct.equal inp.Types.previous_output.txid Types.zero_hash &&
     inp.Types.previous_output.vout = (-1l)
   | _ -> false
+
+(* Keep the old name as an alias for backward compatibility *)
+let is_coinbase = is_coinbase_tx
 
 (* ============================================================================
    Coinbase Transaction Validation
@@ -272,25 +304,251 @@ let count_witness_sigops (witness_script : Cstruct.t) : int =
   (* Same as P2SH counting for witness scripts *)
   count_p2sh_sigops witness_script
 
-(* Count total sigops for a transaction *)
+(* Extract the last push data from a script (used for P2SH redeem script).
+   Walks through the script tracking each push data element, returns the last
+   one found. Returns None if no push data is found or parsing fails. *)
+let extract_last_push_data (script : Cstruct.t) : Cstruct.t option =
+  try
+    let len = Cstruct.length script in
+    let last = ref None in
+    let i = ref 0 in
+    while !i < len do
+      let opcode = Cstruct.get_uint8 script !i in
+      if opcode >= 0x01 && opcode <= 0x4b then begin
+        (* Direct push: opcode is the number of bytes to push *)
+        if !i + 1 + opcode <= len then begin
+          last := Some (Cstruct.sub script (!i + 1) opcode);
+          i := !i + 1 + opcode
+        end else
+          i := len  (* Malformed, stop *)
+      end else if opcode = 0x4c then begin
+        (* OP_PUSHDATA1: next byte is length *)
+        if !i + 1 < len then begin
+          let push_len = Cstruct.get_uint8 script (!i + 1) in
+          if !i + 2 + push_len <= len then begin
+            last := Some (Cstruct.sub script (!i + 2) push_len);
+            i := !i + 2 + push_len
+          end else
+            i := len
+        end else
+          i := len
+      end else if opcode = 0x4d then begin
+        (* OP_PUSHDATA2: next 2 bytes (LE) are length *)
+        if !i + 2 < len then begin
+          let push_len = Cstruct.get_uint8 script (!i + 1)
+                       lor (Cstruct.get_uint8 script (!i + 2) lsl 8) in
+          if !i + 3 + push_len <= len then begin
+            last := Some (Cstruct.sub script (!i + 3) push_len);
+            i := !i + 3 + push_len
+          end else
+            i := len
+        end else
+          i := len
+      end else if opcode = 0x4e then begin
+        (* OP_PUSHDATA4: next 4 bytes (LE) are length *)
+        if !i + 4 < len then begin
+          let push_len = Cstruct.get_uint8 script (!i + 1)
+                       lor (Cstruct.get_uint8 script (!i + 2) lsl 8)
+                       lor (Cstruct.get_uint8 script (!i + 3) lsl 16)
+                       lor (Cstruct.get_uint8 script (!i + 4) lsl 24) in
+          if push_len >= 0 && !i + 5 + push_len <= len then begin
+            last := Some (Cstruct.sub script (!i + 5) push_len);
+            i := !i + 5 + push_len
+          end else
+            i := len
+        end else
+          i := len
+      end else begin
+        (* Non-push opcode, just skip *)
+        i := !i + 1
+      end
+    done;
+    !last
+  with _ -> None
+
+(* Count weighted sigops cost for a transaction per BIP-141.
+   prev_script_pubkey_lookup: returns the scriptPubKey of the previous output
+   for a given outpoint (None if not found, e.g. for coinbase). *)
+let count_tx_sigops_cost (tx : Types.transaction)
+    ~(prev_script_pubkey_lookup : Types.outpoint -> Cstruct.t option) : int =
+  let wsf = Consensus.witness_scale_factor in
+
+  (* Legacy sigops in scriptSig and scriptPubKey, weighted by scale factor *)
+  let legacy_cost =
+    let in_sigops = List.fold_left (fun acc inp ->
+      acc + count_sigops inp.Types.script_sig
+    ) 0 tx.Types.inputs in
+    let out_sigops = List.fold_left (fun acc out ->
+      acc + count_sigops out.Types.script_pubkey
+    ) 0 tx.Types.outputs in
+    (in_sigops + out_sigops) * wsf
+  in
+
+  (* Per-input sigops from P2SH redeem scripts and witness programs *)
+  let input_cost = List.fold_left (fun acc_cost (i, inp) ->
+    match prev_script_pubkey_lookup inp.Types.previous_output with
+    | None -> acc_cost  (* No previous output (coinbase), no extra sigops *)
+    | Some prev_spk ->
+      match Script.classify_script prev_spk with
+      | Script.P2SH_script _ ->
+        (* P2SH: extract redeem script from scriptSig (last push data) *)
+        begin match extract_last_push_data inp.Types.script_sig with
+        | None -> acc_cost
+        | Some redeem_script ->
+          (* Check if redeem script is a witness program (P2SH-wrapped segwit) *)
+          begin match Script.get_witness_program redeem_script with
+          | Some (0, program) when Cstruct.length program = 20 ->
+            (* P2SH-P2WPKH: 1 sigop, witness weight (not multiplied by 4) *)
+            acc_cost + 1
+          | Some (0, program) when Cstruct.length program = 32 ->
+            (* P2SH-P2WSH: count sigops in witness script (last witness item),
+               witness weight (not multiplied by 4) *)
+            let witness =
+              if i < List.length tx.witnesses then
+                List.nth tx.witnesses i
+              else { Types.items = [] }
+            in
+            begin match List.rev witness.Types.items with
+            | witness_script :: _ ->
+              acc_cost + count_witness_sigops witness_script
+            | [] -> acc_cost
+            end
+          | _ ->
+            (* Regular P2SH: count sigops in redeem script * 4 *)
+            acc_cost + count_p2sh_sigops redeem_script * wsf
+          end
+        end
+      | Script.P2WPKH_script _ ->
+        (* Native P2WPKH: 1 sigop, witness weight *)
+        acc_cost + 1
+      | Script.P2WSH_script _ ->
+        (* Native P2WSH: count sigops in witness script (last witness item),
+           witness weight *)
+        let witness =
+          if i < List.length tx.witnesses then
+            List.nth tx.witnesses i
+          else { Types.items = [] }
+        in
+        begin match List.rev witness.Types.items with
+        | witness_script :: _ ->
+          acc_cost + count_witness_sigops witness_script
+        | [] -> acc_cost
+        end
+      | _ -> acc_cost  (* Other script types: no extra sigops beyond legacy *)
+  ) 0 (List.mapi (fun i inp -> (i, inp)) tx.Types.inputs) in
+
+  legacy_cost + input_cost
+
+(* Count weighted sigops cost for entire block per BIP-141 *)
+let count_block_sigops_cost (block : Types.block)
+    ~(prev_script_pubkey_lookup : Types.outpoint -> Cstruct.t option) : int =
+  List.fold_left (fun acc tx ->
+    acc + count_tx_sigops_cost tx ~prev_script_pubkey_lookup
+  ) 0 block.transactions
+
+(* Legacy unweighted sigops count (backward compatibility for mining template).
+   Counts raw sigops in scriptSig and scriptPubKey without BIP-141 weighting. *)
 let count_tx_sigops (tx : Types.transaction) : int =
-  (* Count sigops in scriptSig of all inputs *)
   let in_sigops = List.fold_left (fun acc inp ->
     acc + count_sigops inp.Types.script_sig
   ) 0 tx.Types.inputs in
-
-  (* Count sigops in scriptPubKey of all outputs *)
   let out_sigops = List.fold_left (fun acc out ->
     acc + count_sigops out.Types.script_pubkey
   ) 0 tx.Types.outputs in
-
   in_sigops + out_sigops
 
-(* Count sigops for entire block *)
-let count_block_sigops (block : Types.block) : int =
-  List.fold_left (fun acc tx ->
-    acc + count_tx_sigops tx
-  ) 0 block.transactions
+(* ============================================================================
+   Witness Commitment Verification (BIP-141)
+   ============================================================================ *)
+
+(* Check if a block has any transactions with non-empty witness data *)
+let block_has_witness (block : Types.block) : bool =
+  List.exists (fun tx ->
+    List.exists (fun w -> w.Types.items <> []) tx.Types.witnesses
+  ) block.transactions
+
+(* Find the witness commitment in the coinbase transaction.
+   Scans coinbase outputs IN REVERSE for one whose scriptPubKey starts with
+   bytes [0x6a; 0x24; 0xaa; 0x21; 0xa9; 0xed] (OP_RETURN + push36 + magic).
+   Returns the 32-byte commitment hash if found. *)
+let find_witness_commitment (coinbase : Types.transaction) : Cstruct.t option =
+  let prefix = Cstruct.of_string "\x6a\x24\xaa\x21\xa9\xed" in
+  let outputs = List.rev coinbase.outputs in
+  let rec scan = function
+    | [] -> None
+    | out :: rest ->
+      let spk = out.Types.script_pubkey in
+      if Cstruct.length spk >= 38 then begin
+        let spk_prefix = Cstruct.sub spk 0 6 in
+        if Cstruct.equal spk_prefix prefix then
+          Some (Cstruct.sub spk 6 32)
+        else
+          scan rest
+      end else
+        scan rest
+  in
+  scan outputs
+
+(* Compute witness transaction ID (wtxid).
+   For coinbase, wtxid is always zero.
+   For other transactions, wtxid includes witness data (full serialization). *)
+let compute_wtxid (tx : Types.transaction) (is_cb : bool) : Types.hash256 =
+  if is_cb then
+    Types.zero_hash
+  else begin
+    let w = Serialize.writer_create () in
+    Serialize.serialize_transaction w tx;
+    Crypto.sha256d (Serialize.writer_to_cstruct w)
+  end
+
+(* Compute the witness merkle root from a list of transactions.
+   The first transaction (coinbase) has wtxid = 0. *)
+let compute_witness_merkle_root (transactions : Types.transaction list)
+    : Types.hash256 =
+  let wtxids = List.mapi (fun i tx ->
+    compute_wtxid tx (i = 0)
+  ) transactions in
+  let (root, _mutated) = Crypto.merkle_root wtxids in
+  root
+
+(* Verify the witness commitment in a block. *)
+let check_witness_commitment (block : Types.block)
+    : (unit, block_validation_error) result =
+  if not (block_has_witness block) then
+    (* No witness data in any transaction, no commitment required *)
+    Ok ()
+  else begin
+    let coinbase = List.hd block.transactions in
+    match find_witness_commitment coinbase with
+    | None ->
+      (* Block has witness data but no commitment in coinbase *)
+      Error BlockBadWitnessCommitment
+    | Some commitment ->
+      (* Get the witness reserved value: first item in coinbase's witness stack.
+         Must be exactly 32 bytes. *)
+      let witness_nonce =
+        match coinbase.witnesses with
+        | [] -> None
+        | w :: _ ->
+          match w.Types.items with
+          | [] -> None
+          | item :: _ ->
+            if Cstruct.length item = 32 then Some item
+            else None
+      in
+      match witness_nonce with
+      | None -> Error BlockBadWitnessCommitment
+      | Some nonce ->
+        (* Compute witness merkle root *)
+        let witness_root = compute_witness_merkle_root block.transactions in
+        (* Compute expected commitment: SHA256d(witness_merkle_root || witness_nonce) *)
+        let combined = Cstruct.concat [witness_root; nonce] in
+        let expected = Crypto.sha256d combined in
+        if Cstruct.equal expected commitment then
+          Ok ()
+        else
+          Error BlockBadWitnessCommitment
+  end
 
 (* ============================================================================
    Block Validation
@@ -348,7 +606,7 @@ let check_block (block : Types.block) (height : int)
             else begin
               (* Verify merkle root *)
               let txids = List.map Crypto.compute_txid txs in
-              let computed_merkle = Crypto.merkle_root txids in
+              let (computed_merkle, _mutated) = Crypto.merkle_root txids in
               if not (Cstruct.equal computed_merkle block.header.merkle_root) then
                 Error BlockBadMerkleRoot
               else begin
@@ -363,42 +621,42 @@ let check_block (block : Types.block) (height : int)
                   if total_weight > Consensus.max_block_weight then
                     Error (BlockOverweight total_weight)
                   else begin
-                    (* Check sigop limit *)
-                    let total_sigops = count_block_sigops block in
-                    if total_sigops > Consensus.max_block_sigops_cost / Consensus.witness_scale_factor then
-                      Error BlockTooManySigops
-                    else begin
-                      (* Validate each non-coinbase transaction *)
+                    (* Sigop cost check is deferred to validate_block_with_utxos
+                       which has UTXO context needed for BIP-141 weighted sigops
+                       cost calculation (P2SH redeem scripts, witness programs). *)
+                    begin
+                      (* Task 1 & 2: Validate ALL transactions including coinbase.
+                         Also check that non-first transactions are NOT coinbase. *)
                       let error = ref None in
                       List.iteri (fun i tx ->
-                        if i > 0 && !error = None then
-                          match check_transaction tx with
-                          | Error e ->
-                            error := Some (BlockTxValidationFailed (i, e))
-                          | Ok () -> ()
+                        if !error = None then begin
+                          (* Task 1: Non-first transactions must NOT be coinbase *)
+                          if i > 0 && is_coinbase tx then
+                            error := Some (BlockTxValidationFailed (i, TxUnexpectedCoinbase))
+                          else begin
+                            (* Task 2: Run check_transaction on ALL transactions
+                               including coinbase (i = 0). Pass ~is_coinbase for
+                               the coinbase so null prevout check is skipped. *)
+                            match check_transaction ~is_coinbase:(i = 0) tx with
+                            | Error e ->
+                              error := Some (BlockTxValidationFailed (i, e))
+                            | Ok () -> ()
+                          end
+                        end
                       ) txs;
 
                       match !error with
                       | Some e -> Error e
                       | None ->
-                        (* Check coinbase value
-                           Note: This is a simplified check. Full validation
-                           requires knowing the fees from all transactions. *)
-                        let subsidy = Consensus.block_subsidy height in
-                        let coinbase_value = List.fold_left (fun acc out ->
-                          Int64.add acc out.Types.value
-                        ) 0L coinbase.outputs in
-                        (* Coinbase can claim subsidy + fees
-                           Here we just check it doesn't exceed subsidy
-                           (fees would be added during full validation) *)
-                        if coinbase_value > subsidy then
-                          (* This is overly strict - real validation needs fees *)
-                          (* For now, allow some headroom for fees *)
-                          if coinbase_value > Int64.add subsidy Consensus.max_money then
-                            Error (BlockBadCoinbaseValue (coinbase_value, subsidy))
-                          else
-                            Ok ()
-                        else
+                        (* Task 6: Verify witness commitment *)
+                        match check_witness_commitment block with
+                        | Error e -> Error e
+                        | Ok () ->
+                          (* Coinbase value check is deferred to
+                             validate_block_with_utxos which has UTXO context
+                             to compute actual fees. Without knowing fees, any
+                             check here would either be too strict (rejecting
+                             valid blocks) or too loose to be useful. *)
                           Ok ()
                     end
                   end
@@ -457,6 +715,76 @@ let is_tx_final (tx : Types.transaction) ~(block_height : int) ~(block_time : in
   end
 
 (* ============================================================================
+   BIP68 Sequence Locks
+   ============================================================================ *)
+
+(* BIP68 sequence lock constants *)
+let sequence_locktime_disable_flag = 1 lsl 31  (* bit 31 *)
+let sequence_locktime_type_flag = 1 lsl 22     (* bit 22: 0=height, 1=time *)
+let sequence_locktime_mask = 0xFFFF            (* lower 16 bits *)
+let _sequence_locktime_granularity = 9          (* 512 = 1 lsl 9 seconds *)
+
+(* Check BIP68 sequence locks for a transaction.
+   For each input where tx.version >= 2 and the input's sequence doesn't have
+   the disable flag (bit 31) set:
+   - If bit 22 is clear (height-based): utxo_heights[i] + (sequence & 0xFFFF) <= block_height
+   - If bit 22 is set (time-based): use MTP-based comparison
+
+   utxo_heights: array of block heights where each input's UTXO was created.
+   utxo_mtps: array of median-time-past values for each input's UTXO block.
+     TODO: For correct BIP68 time-based locks, we need the MTP of the block at
+     height (utxo_height - 1). For now, time-based locks use the provided MTP
+     approximation. Height-based locks are implemented correctly. *)
+let check_sequence_locks (tx : Types.transaction) ~(block_height : int)
+    ~(median_time : int32) ~(utxo_heights : int array) ~(utxo_mtps : int32 array)
+    ?(get_mtp_at_height : (int -> int32) option) () : bool =
+  (* BIP68 only applies to tx version >= 2 *)
+  if Int32.compare tx.version 2l < 0 then
+    true
+  else begin
+    let ok = ref true in
+    List.iteri (fun i inp ->
+      if !ok then begin
+        let seq = Int32.to_int inp.Types.sequence land 0x7FFFFFFF lor
+                  (if Int32.compare inp.Types.sequence 0l < 0 then 1 lsl 31 else 0) in
+        (* Use raw int32 bits for flag checks *)
+        let seq_int = Int32.to_int inp.Types.sequence in
+        let seq_unsigned =
+          if seq_int < 0 then seq_int + (1 lsl 31) + (1 lsl 31)
+          else seq_int
+        in
+        ignore seq;
+        (* Check if disable flag (bit 31) is set *)
+        if seq_unsigned land sequence_locktime_disable_flag <> 0 then
+          ()  (* Sequence lock disabled for this input, skip *)
+        else begin
+          let masked = seq_unsigned land sequence_locktime_mask in
+          if seq_unsigned land sequence_locktime_type_flag = 0 then begin
+            (* Height-based lock *)
+            let required_height = utxo_heights.(i) + masked in
+            if block_height < required_height then
+              ok := false
+          end else begin
+            (* Time-based lock *)
+            (* When get_mtp_at_height is provided, compute the correct MTP at
+               (utxo_height - 1) per BIP68. Otherwise fall back to the caller-
+               supplied utxo_mtps array. *)
+            let input_mtp = match get_mtp_at_height with
+              | Some f -> f (utxo_heights.(i) - 1)
+              | None -> utxo_mtps.(i)
+            in
+            let time_offset = Int32.of_int (masked lsl 9) in  (* masked * 512 *)
+            let required_time = Int32.add input_mtp time_offset in
+            if Int32.compare median_time required_time < 0 then
+              ok := false
+          end
+        end
+      end
+    ) tx.inputs;
+    !ok
+  end
+
+(* ============================================================================
    Input Validation with UTXO Set
    ============================================================================ *)
 
@@ -480,57 +808,83 @@ type utxo_lookup = Types.outpoint -> utxo option
    transactions in the same block. The UTXO set must be updated
    during the validation loop, not after. *)
 let validate_tx_inputs (tx : Types.transaction) ~(lookup : utxo_lookup)
-    ~(block_height : int) ~(flags : int)
+    ~(block_height : int) ~(flags : int) ?(skip_scripts=false) ()
     : (int64, tx_validation_error) result =
   (* Skip coinbase transactions - they have no real inputs *)
   if is_coinbase tx then
     Ok 0L
   else begin
-    let total_in = ref 0L in
+    (* First pass: collect all UTXOs and check maturity *)
+    let n_inputs = List.length tx.inputs in
+    let utxos = Array.make n_inputs None in
     let error = ref None in
 
-    (* Process each input *)
     List.iteri (fun i inp ->
       if !error = None then begin
         match lookup inp.Types.previous_output with
         | None ->
           error := Some TxMissingInputs
         | Some utxo ->
-          (* Check coinbase maturity *)
-          if utxo.is_coinbase && block_height - utxo.height < Consensus.coinbase_maturity then
+          (* Task 7: Validate input value is in MoneyRange *)
+          if not (Consensus.is_valid_money utxo.value) then
+            error := Some TxOutputOverflow
+          else if utxo.is_coinbase && block_height - utxo.height < Consensus.coinbase_maturity then
             error := Some TxMissingInputs  (* Immature coinbase *)
-          else begin
-            (* Add to total input value *)
-            total_in := Int64.add !total_in utxo.value;
-
-            (* Get witness for this input *)
-            let witness =
-              if i < List.length tx.witnesses then
-                List.nth tx.witnesses i
-              else
-                { Types.items = [] }
-            in
-
-            (* Verify script *)
-            match Script.verify_script
-                    ~tx ~input_index:i
-                    ~script_pubkey:utxo.script_pubkey
-                    ~script_sig:inp.Types.script_sig
-                    ~witness
-                    ~amount:utxo.value
-                    ~flags with
-            | Error msg ->
-              error := Some (TxScriptFailed (i, msg))
-            | Ok false ->
-              error := Some (TxScriptFailed (i, "Script returned false"))
-            | Ok true -> ()
-          end
+          else
+            utxos.(i) <- Some utxo
       end
     ) tx.inputs;
 
     match !error with
     | Some e -> Error e
-    | None -> Ok !total_in
+    | None ->
+      (* Build prevouts list for Taproot sighash: (amount, scriptPubKey) for all inputs *)
+      let prevouts = Array.to_list (Array.map (fun opt ->
+        match opt with
+        | Some utxo -> (utxo.value, utxo.script_pubkey)
+        | None -> (0L, Cstruct.empty)  (* Should not happen *)
+      ) utxos) in
+
+      let total_in = ref 0L in
+
+      (* Second pass: verify scripts with prevouts context *)
+      List.iteri (fun i inp ->
+        if !error = None then begin
+          match utxos.(i) with
+          | None -> error := Some TxMissingInputs
+          | Some utxo ->
+            total_in := Int64.add !total_in utxo.value;
+
+            (* Task 7: Check cumulative total_in is in MoneyRange *)
+            if not (Consensus.is_valid_money !total_in) then
+              error := Some TxOutputOverflow
+            else if not skip_scripts then begin
+              let witness =
+                if i < List.length tx.witnesses then
+                  List.nth tx.witnesses i
+                else
+                  { Types.items = [] }
+              in
+
+              match Script.verify_script
+                      ~tx ~input_index:i
+                      ~script_pubkey:utxo.script_pubkey
+                      ~script_sig:inp.Types.script_sig
+                      ~witness
+                      ~amount:utxo.value
+                      ~flags ~prevouts () with
+              | Error msg ->
+                error := Some (TxScriptFailed (i, msg))
+              | Ok false ->
+                error := Some (TxScriptFailed (i, "Script returned false"))
+              | Ok true -> ()
+            end
+        end
+      ) tx.inputs;
+
+      match !error with
+      | Some e -> Error e
+      | None -> Ok !total_in
   end
 
 (* Calculate transaction fee *)
@@ -568,6 +922,23 @@ let calculate_tx_fee (tx : Types.transaction) ~(lookup : utxo_lookup)
    Full Block Validation with UTXO Set
    ============================================================================ *)
 
+(* BIP30 exception heights: these historical Bitcoin blocks had duplicate
+   coinbase txids that were later spent. *)
+let bip30_exception_heights = [91842; 91880]
+
+(* Check BIP30: no unspent outputs exist with the same txid.
+   We probe output indices 0 through n_outputs-1 in the UTXO set. *)
+let check_bip30 ~(lookup : utxo_lookup) ~(txid : Types.hash256)
+    ~(n_outputs : int) : bool =
+  let found = ref false in
+  for vout = 0 to n_outputs - 1 do
+    let outpoint = { Types.txid; vout = Int32.of_int vout } in
+    match lookup outpoint with
+    | Some _ -> found := true
+    | None -> ()
+  done;
+  not !found
+
 (* Validate block with full UTXO tracking
 
    IMPORTANT: This properly handles intra-block spending by updating
@@ -575,12 +946,26 @@ let calculate_tx_fee (tx : Types.transaction) ~(lookup : utxo_lookup)
 let validate_block_with_utxos (block : Types.block) (height : int)
     ~(expected_bits : int32) ~(median_time : int32)
     ~(base_lookup : utxo_lookup) ~(flags : int)
+    ?(skip_scripts=false) ()
     : (int64, block_validation_error) result =
 
   (* First do context-free checks *)
   match check_block block height ~expected_bits ~median_time with
   | Error e -> Error e
   | Ok () ->
+    (* BIP-141 weighted sigops cost check.
+       Build a script_pubkey lookup from the base UTXO set for sigop counting. *)
+    let prev_script_pubkey_lookup outpoint =
+      match base_lookup outpoint with
+      | Some utxo -> Some utxo.script_pubkey
+      | None -> None
+    in
+    let total_sigops_cost =
+      count_block_sigops_cost block ~prev_script_pubkey_lookup in
+    if total_sigops_cost > Consensus.max_block_sigops_cost then
+      Error BlockTooManySigops
+    else
+
     (* Build local UTXO set for intra-block spending *)
     let local_utxos : (string * int32, utxo) Hashtbl.t = Hashtbl.create 64 in
     let spent_in_block : (string * int32, unit) Hashtbl.t = Hashtbl.create 64 in
@@ -606,29 +991,68 @@ let validate_block_with_utxos (block : Types.block) (height : int)
         let txid = Crypto.compute_txid tx in
         let is_cb = (i = 0) in
 
-        (* Validate inputs (skip for coinbase) *)
-        if not is_cb then begin
-          match validate_tx_inputs tx ~lookup ~block_height:height ~flags with
-          | Error e ->
-            error := Some (BlockTxValidationFailed (i, e))
-          | Ok total_in ->
-            (* Calculate and accumulate fee *)
-            let total_out = List.fold_left (fun acc out ->
-              Int64.add acc out.Types.value
-            ) 0L tx.outputs in
-            let fee = Int64.sub total_in total_out in
-            if fee < 0L then
-              error := Some (BlockTxValidationFailed (i, TxInsufficientFee))
-            else begin
-              total_fees := Int64.add !total_fees fee;
+        (* Task 4: BIP30 duplicate txid check *)
+        if not (List.mem height bip30_exception_heights) then begin
+          let n_outputs = List.length tx.outputs in
+          if not (check_bip30 ~lookup:base_lookup ~txid ~n_outputs) then
+            error := Some (BlockTxValidationFailed (i, TxDuplicateTxid))
+        end;
 
-              (* Mark inputs as spent *)
-              List.iter (fun inp ->
-                let key = (Cstruct.to_string inp.Types.previous_output.txid,
-                           inp.Types.previous_output.vout) in
-                Hashtbl.add spent_in_block key ()
-              ) tx.inputs
-            end
+        (* Validate inputs (skip for coinbase) *)
+        if !error = None && not is_cb then begin
+          (* Check transaction finality (BIP-113: use median time past) *)
+          if not (is_tx_final tx ~block_height:height ~block_time:median_time) then
+            error := Some (BlockTxValidationFailed (i, TxNonFinalLocktime))
+          else begin
+            match validate_tx_inputs tx ~lookup ~block_height:height ~flags ~skip_scripts () with
+            | Error e ->
+              error := Some (BlockTxValidationFailed (i, e))
+            | Ok total_in ->
+              (* Task 5: BIP68 sequence locks *)
+              if !error = None then begin
+                let n_inputs = List.length tx.inputs in
+                let utxo_heights = Array.make n_inputs 0 in
+                let utxo_mtps = Array.make n_inputs 0l in
+                (* Collect UTXO heights for sequence lock checks *)
+                List.iteri (fun j inp ->
+                  match lookup inp.Types.previous_output with
+                  | Some utxo ->
+                    utxo_heights.(j) <- utxo.height;
+                    (* TODO: utxo_mtps should be the MTP at (utxo.height - 1).
+                       Using median_time as approximation for now. *)
+                    utxo_mtps.(j) <- median_time
+                  | None -> ()
+                ) tx.inputs;
+                if not (check_sequence_locks tx ~block_height:height
+                          ~median_time ~utxo_heights ~utxo_mtps ()) then
+                  error := Some (BlockTxValidationFailed (i, TxSequenceLocksFailed))
+              end;
+
+              if !error = None then begin
+                (* Calculate and accumulate fee *)
+                let total_out = List.fold_left (fun acc out ->
+                  Int64.add acc out.Types.value
+                ) 0L tx.outputs in
+                let fee = Int64.sub total_in total_out in
+                if fee < 0L then
+                  error := Some (BlockTxValidationFailed (i, TxInsufficientFee))
+                else begin
+                  total_fees := Int64.add !total_fees fee;
+
+                  (* Task 8: Fee overflow check *)
+                  if not (Consensus.is_valid_money !total_fees) then
+                    error := Some (BlockTxValidationFailed (i, TxOutputOverflow))
+                  else begin
+                    (* Mark inputs as spent *)
+                    List.iter (fun inp ->
+                      let key = (Cstruct.to_string inp.Types.previous_output.txid,
+                                 inp.Types.previous_output.vout) in
+                      Hashtbl.add spent_in_block key ()
+                    ) tx.inputs
+                  end
+                end
+              end
+          end
         end;
 
         (* Add outputs to local UTXO set for intra-block spending *)

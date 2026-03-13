@@ -367,6 +367,13 @@ let handle_sendrawtransaction (ctx : rpc_context)
       let tx = Serialize.deserialize_transaction r in
       match Mempool.add_transaction ctx.mempool tx with
       | Ok entry ->
+        (* Relay to peers *)
+        let wtxid = Crypto.compute_wtxid tx in
+        let fee_rate = Int64.div entry.fee (Int64.of_int (max 1 (entry.weight / 4))) in
+        Lwt.async (fun () ->
+          Peer_manager.announce_tx ctx.peer_manager
+            ~txid:entry.txid ~wtxid ~fee_rate
+        );
         Ok (`String (Types.hash256_to_hex_display entry.txid))
       | Error msg ->
         Error msg

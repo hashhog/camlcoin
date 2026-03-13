@@ -107,12 +107,16 @@ let run (config : config) : unit Lwt.t =
   (* Initialize UTXO set *)
   let utxo = Utxo.UtxoSet.create db in
 
+  (* Optimized UTXO set for IBD – dirty entries are flushed periodically
+     during block download and must be flushed on shutdown to avoid loss. *)
+  let optimized_utxo = Utxo.OptimizedUtxoSet.create db in
+
   (* Initialize mempool *)
   let current_height = match chain.tip with
     | Some t -> t.height
     | None -> 0
   in
-  let mempool = Mempool.create ~utxo ~current_height in
+  let mempool = Mempool.create ~utxo ~current_height () in
 
   (* Initialize fee estimator *)
   let fee_estimator = Fee_estimation.create () in
@@ -135,14 +139,24 @@ let run (config : config) : unit Lwt.t =
     ~chain ~mempool ~peer_manager
     ~wallet ~fee_estimator ~network in
 
-  (* Set up signal handlers for graceful shutdown *)
+  (* Set up signal handlers for graceful shutdown.
+     We use Lwt_unix.on_signal so that the signal wakes the Lwt event loop
+     rather than racing with it from an OCaml signal handler. *)
+  let shutdown_wakener, shutdown_waiter =
+    let (w, u) = Lwt.wait () in (u, w) in
   let shutdown = ref false in
-  let handle_signal _ =
-    Logs.info (fun m -> m "Shutdown signal received");
-    shutdown := true
-  in
-  ignore (Sys.signal Sys.sigint (Sys.Signal_handle handle_signal));
-  ignore (Sys.signal Sys.sigterm (Sys.Signal_handle handle_signal));
+  let _sig_int = Lwt_unix.on_signal Sys.sigint (fun _signum ->
+    if not !shutdown then begin
+      Logs.info (fun m -> m "Received SIGINT, initiating graceful shutdown");
+      shutdown := true;
+      Lwt.wakeup_later shutdown_wakener ()
+    end) in
+  let _sig_term = Lwt_unix.on_signal Sys.sigterm (fun _signum ->
+    if not !shutdown then begin
+      Logs.info (fun m -> m "Received SIGTERM, initiating graceful shutdown");
+      shutdown := true;
+      Lwt.wakeup_later shutdown_wakener ()
+    end) in
 
   (* Start RPC server *)
   let rpc_thread =
@@ -206,7 +220,7 @@ let run (config : config) : unit Lwt.t =
       (* Start block download if needed *)
       if chain.sync_state = Sync.SyncingBlocks then begin
         Logs.info (fun m -> m "Starting block download");
-        Sync.start_ibd chain (Peer_manager.get_ready_peers peer_manager)
+        Sync.start_ibd ~utxo_set:optimized_utxo chain (Peer_manager.get_ready_peers peer_manager)
       end else
         Lwt.return_unit
   in
@@ -236,21 +250,30 @@ let run (config : config) : unit Lwt.t =
     log_status ()
   in
 
-  (* Main event loop - checks for shutdown *)
-  let rec event_loop () =
-    if !shutdown then begin
-      Logs.info (fun m -> m "Shutting down...");
-      let* () = Peer_manager.stop peer_manager in
-      (match wallet with
-       | Some w -> Wallet.save w
-       | None -> ());
-      Storage.ChainDB.close db;
-      Logs.info (fun m -> m "Shutdown complete");
-      Lwt.return_unit
-    end else begin
-      let* () = Lwt_unix.sleep 1.0 in
-      event_loop ()
-    end
+  (* Graceful shutdown procedure: flush all pending state to disk *)
+  let graceful_shutdown () =
+    Logs.info (fun m -> m "Shutting down...");
+    let* () = Peer_manager.stop peer_manager in
+    (* Save wallet state *)
+    (match wallet with
+     | Some w -> Wallet.save w
+     | None -> ());
+    (* Flush pending UTXO updates from OptimizedUtxoSet *)
+    let dirty = Utxo.OptimizedUtxoSet.dirty_count optimized_utxo in
+    if dirty > 0 then
+      Logs.info (fun m -> m "Flushing %d dirty UTXO entries to disk" dirty);
+    Utxo.OptimizedUtxoSet.flush optimized_utxo;
+    (* Sync database to ensure all cached data is persisted *)
+    Storage.ChainDB.sync db;
+    Storage.ChainDB.close db;
+    Logs.info (fun m -> m "Shutdown complete");
+    Lwt.return_unit
+  in
+
+  (* Main event loop - waits for shutdown signal *)
+  let event_loop () =
+    let* () = shutdown_waiter in
+    graceful_shutdown ()
   in
 
   (* Run all threads concurrently, stopping when any finishes or shutdown *)

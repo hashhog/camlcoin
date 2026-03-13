@@ -69,6 +69,9 @@ let read_timeout = 30.0        (* seconds *)
 let ping_interval = 120.0      (* 2 minutes between pings *)
 let ping_timeout = 20.0        (* 20 seconds to receive pong *)
 
+(* Direction of a peer connection *)
+type peer_direction = Inbound | Outbound
+
 (* Peer connection state *)
 type peer = {
   id : int;
@@ -92,6 +95,12 @@ type peer = {
   network : Consensus.network_config;
   mutable send_headers : bool;   (* Peer requested sendheaders *)
   mutable wtxid_relay : bool;    (* Peer requested wtxidrelay *)
+  mutable sendaddrv2 : bool;     (* Peer requested sendaddrv2 *)
+  mutable misbehavior_score : int; (* Accumulated misbehavior score; ban at >= 100 *)
+  direction : peer_direction;    (* Inbound or outbound connection *)
+  mutable feefilter : int64;     (* Minimum fee rate (sat/kB) advertised by peer *)
+  mutable msg_count_window : int;   (* Messages received in current window *)
+  mutable msg_window_start : float; (* Start time of current rate-limit window *)
 }
 
 (* Generate random bytes from /dev/urandom *)
@@ -120,6 +129,36 @@ let make_local_addr () : Types.net_addr =
   Cstruct.set_uint8 addr 15 1;
   { services = services_to_int64 our_services; addr; port = 0 }
 
+(* Create a peer from an already-connected fd (used for both outbound and inbound) *)
+let make_peer ~(network : Consensus.network_config) ~(addr : string)
+    ~(port : int) ~(id : int) ~(direction : peer_direction)
+    ~(fd : Lwt_unix.file_descr) : peer =
+  let ic = Lwt_io.of_fd ~mode:Lwt_io.Input fd in
+  let oc = Lwt_io.of_fd ~mode:Lwt_io.Output fd in
+  { id; addr; port;
+    state = Connected;
+    version_msg = None;
+    services = empty_services;
+    best_height = 0l;
+    last_seen = Unix.gettimeofday ();
+    last_ping = 0.0;
+    ping_nonce = None;
+    latency = 0.0;
+    bytes_sent = 0;
+    bytes_received = 0;
+    msgs_sent = 0;
+    msgs_received = 0;
+    ic; oc; fd; network;
+    send_headers = false;
+    wtxid_relay = false;
+    sendaddrv2 = false;
+    misbehavior_score = 0;
+    direction;
+    feefilter = 0L;
+    msg_count_window = 0;
+    msg_window_start = Unix.gettimeofday ();
+  }
+
 (* Establish TCP connection to a peer with timeout *)
 let connect ~(network : Consensus.network_config) ~(addr : string)
     ~(port : int) ~(id : int) : peer Lwt.t =
@@ -138,26 +177,7 @@ let connect ~(network : Consensus.network_config) ~(addr : string)
       Lwt.fail_with "Connection timeout" in
     let do_connect = Lwt_unix.connect fd ai.ai_addr in
     let* () = Lwt.pick [do_connect; timeout] in
-    let ic = Lwt_io.of_fd ~mode:Lwt_io.Input fd in
-    let oc = Lwt_io.of_fd ~mode:Lwt_io.Output fd in
-    Lwt.return {
-      id; addr; port;
-      state = Connected;
-      version_msg = None;
-      services = empty_services;
-      best_height = 0l;
-      last_seen = Unix.gettimeofday ();
-      last_ping = 0.0;
-      ping_nonce = None;
-      latency = 0.0;
-      bytes_sent = 0;
-      bytes_received = 0;
-      msgs_sent = 0;
-      msgs_received = 0;
-      ic; oc; fd; network;
-      send_headers = false;
-      wtxid_relay = false;
-    }
+    Lwt.return (make_peer ~network ~addr ~port ~id ~direction:Outbound ~fd)
 
 (* Read a message from the peer with protection against stream desync.
    Uses Lwt.no_cancel to ensure TCP reads complete atomically. *)
@@ -230,19 +250,32 @@ let send_message (peer : peer)
   peer.msgs_sent <- peer.msgs_sent + 1;
   Lwt.return_unit
 
-(* Perform the version/verack handshake.
-   Protocol sequence:
-   1. We send our version message
-   2. Peer sends their version message
-   3. Both sides send verack
-   4. Optional feature negotiation (sendheaders, wtxidrelay) *)
-let perform_handshake (peer : peer)
-    (our_height : int32) : unit Lwt.t =
-  let open Lwt.Syntax in
-  peer.state <- HandshakeInProgress;
-  let nonce = random_nonce () in
-  let version_msg : Types.version_msg = {
-    protocol_version = Types.protocol_version;
+(* Helper: process a version message received from the remote peer *)
+let process_version_msg (peer : peer) (v : Types.version_msg) (nonce : int64)
+    : unit Lwt.t =
+  peer.version_msg <- Some v;
+  peer.services <- services_of_int64 v.services;
+  peer.best_height <- v.start_height;
+  if v.protocol_version < Consensus.min_peer_proto_version then
+    Lwt.fail_with (Printf.sprintf
+      "Peer protocol version too old: %ld (minimum: %ld)"
+      v.protocol_version Consensus.min_peer_proto_version)
+  else if v.nonce = nonce then
+    (* Self-connection detection *)
+    Lwt.fail_with "Connected to self (nonce collision)"
+  else if not peer.services.witness then
+    Lwt.fail_with "Peer does not support NODE_WITNESS (required)"
+  else if peer.direction = Outbound &&
+          not (peer.services.network || peer.services.network_limited) then
+    Lwt.fail_with
+      "Outbound peer does not support NODE_NETWORK or NODE_NETWORK_LIMITED"
+  else
+    Lwt.return_unit
+
+(* Build a version message for outgoing handshake *)
+let make_version_msg (peer : peer) (our_height : int32) (nonce : int64)
+    : Types.version_msg =
+  { protocol_version = Types.protocol_version;
     services = services_to_int64 our_services;
     timestamp = Int64.of_float (Unix.gettimeofday ());
     addr_recv = {
@@ -255,41 +288,14 @@ let perform_handshake (peer : peer)
     user_agent = "/CamlCoin:" ^ Types.version ^ "/";
     start_height = our_height;
     relay = true;
-  } in
-  (* Send our version *)
-  let* () = send_message peer (P2p.VersionMsg version_msg) in
-  (* Read their version with timeout *)
-  let* their_msg_opt = read_message_with_timeout peer read_timeout in
-  let* () = match their_msg_opt with
-    | None -> Lwt.fail_with "Timeout waiting for version message"
-    | Some (P2p.VersionMsg v) ->
-      peer.version_msg <- Some v;
-      peer.services <- services_of_int64 v.services;
-      peer.best_height <- v.start_height;
-      if v.protocol_version < Consensus.min_peer_proto_version then
-        Lwt.fail_with (Printf.sprintf
-          "Peer protocol version too old: %ld (minimum: %ld)"
-          v.protocol_version Consensus.min_peer_proto_version)
-      else if v.nonce = nonce then
-        (* Self-connection detection *)
-        Lwt.fail_with "Connected to self (nonce collision)"
-      else
-        Lwt.return_unit
-    | Some _ -> Lwt.fail_with "Expected version message"
-  in
-  (* Send verack *)
-  let* () = send_message peer P2p.VerackMsg in
-  (* Read their verack with timeout *)
-  let* their_verack_opt = read_message_with_timeout peer read_timeout in
-  let* () = match their_verack_opt with
-    | None -> Lwt.fail_with "Timeout waiting for verack"
-    | Some P2p.VerackMsg -> Lwt.return_unit
-    | Some _ -> Lwt.fail_with "Expected verack"
-  in
-  (* Post-handshake feature negotiation *)
-  (* Request headers announcements instead of inv (BIP-130) *)
-  let* () = send_message peer P2p.SendheadersMsg in
-  (* Request wtxid relay if peer supports witness (BIP-339) *)
+  }
+
+(* Send pre-verack feature negotiation messages (BIP-339 wtxidrelay,
+   BIP-155 sendaddrv2).  These MUST be sent after version exchange but
+   BEFORE verack per the respective BIPs. *)
+let send_feature_negotiation (peer : peer) : unit Lwt.t =
+  let open Lwt.Syntax in
+  (* Send wtxidrelay if peer supports witness (BIP-339) *)
   let* () =
     if peer.services.witness &&
        (match peer.version_msg with
@@ -298,6 +304,111 @@ let perform_handshake (peer : peer)
       send_message peer P2p.WtxidrelayMsg
     else Lwt.return_unit
   in
+  (* Send sendaddrv2 (BIP-155) *)
+  send_message peer P2p.SendaddrV2Msg
+
+(* Read messages until verack arrives, accepting feature negotiation messages
+   (wtxidrelay, sendaddrv2, sendcmpct, feefilter) that arrive before verack.
+   Returns unit on success or fails on timeout / unexpected messages. *)
+let read_until_verack (peer : peer) : unit Lwt.t =
+  let open Lwt.Syntax in
+  let deadline = Unix.gettimeofday () +. read_timeout in
+  let rec loop () =
+    let remaining = deadline -. Unix.gettimeofday () in
+    if remaining <= 0.0 then
+      Lwt.fail_with "Timeout waiting for verack"
+    else begin
+      let* msg_opt = read_message_with_timeout peer remaining in
+      match msg_opt with
+      | None -> Lwt.fail_with "Timeout waiting for verack"
+      | Some P2p.VerackMsg -> Lwt.return_unit
+      | Some P2p.WtxidrelayMsg ->
+        peer.wtxid_relay <- true;
+        loop ()
+      | Some P2p.SendaddrV2Msg ->
+        peer.sendaddrv2 <- true;
+        loop ()
+      | Some (P2p.SendcmpctMsg _) ->
+        (* Accept sendcmpct during feature negotiation *)
+        loop ()
+      | Some (P2p.FeefilterMsg feerate) ->
+        (* Accept feefilter during feature negotiation *)
+        peer.feefilter <- feerate;
+        loop ()
+      | Some _ -> Lwt.fail_with "Unexpected message before verack"
+    end
+  in
+  loop ()
+
+(* Perform the version/verack handshake for OUTBOUND connections.
+   Protocol sequence (BIP-339 / BIP-155 compliant):
+   1. We send our version message
+   2. Peer sends their version message
+   3. Send feature negotiation (wtxidrelay, sendaddrv2) BEFORE verack
+   4. Send verack
+   5. Read messages until peer's verack (accepting feature negotiation msgs)
+   6. Post-handshake: sendheaders *)
+let perform_handshake (peer : peer)
+    (our_height : int32) : unit Lwt.t =
+  let open Lwt.Syntax in
+  peer.state <- HandshakeInProgress;
+  let nonce = random_nonce () in
+  let version_msg = make_version_msg peer our_height nonce in
+  (* Send our version *)
+  let* () = send_message peer (P2p.VersionMsg version_msg) in
+  (* Read their version with timeout *)
+  let* their_msg_opt = read_message_with_timeout peer read_timeout in
+  let* () = match their_msg_opt with
+    | None -> Lwt.fail_with "Timeout waiting for version message"
+    | Some (P2p.VersionMsg v) ->
+      process_version_msg peer v nonce
+    | Some _ -> Lwt.fail_with "Expected version message"
+  in
+  (* Send feature negotiation messages BEFORE verack (BIP-339, BIP-155) *)
+  let* () = send_feature_negotiation peer in
+  (* Send verack *)
+  let* () = send_message peer P2p.VerackMsg in
+  (* Read messages until their verack, accepting feature negotiation msgs *)
+  let* () = read_until_verack peer in
+  (* Post-handshake feature negotiation *)
+  (* Request headers announcements instead of inv (BIP-130) *)
+  let* () = send_message peer P2p.SendheadersMsg in
+  peer.state <- Ready;
+  Lwt.return_unit
+
+(* Perform the version/verack handshake for INBOUND connections.
+   For inbound, the remote peer sends version first, then we respond.
+   Protocol sequence:
+   1. Read their version message
+   2. Send our version message
+   3. Send feature negotiation (wtxidrelay, sendaddrv2) BEFORE verack
+   4. Send verack
+   5. Read messages until peer's verack (accepting feature negotiation msgs)
+   6. Post-handshake: sendheaders *)
+let perform_inbound_handshake (peer : peer)
+    (our_height : int32) : unit Lwt.t =
+  let open Lwt.Syntax in
+  peer.state <- HandshakeInProgress;
+  let nonce = random_nonce () in
+  (* Read their version first (inbound peer initiates) *)
+  let* their_msg_opt = read_message_with_timeout peer read_timeout in
+  let* () = match their_msg_opt with
+    | None -> Lwt.fail_with "Timeout waiting for version message"
+    | Some (P2p.VersionMsg v) ->
+      process_version_msg peer v nonce
+    | Some _ -> Lwt.fail_with "Expected version message"
+  in
+  (* Send our version *)
+  let version_msg = make_version_msg peer our_height nonce in
+  let* () = send_message peer (P2p.VersionMsg version_msg) in
+  (* Send feature negotiation messages BEFORE verack (BIP-339, BIP-155) *)
+  let* () = send_feature_negotiation peer in
+  (* Send verack *)
+  let* () = send_message peer P2p.VerackMsg in
+  (* Read messages until their verack, accepting feature negotiation msgs *)
+  let* () = read_until_verack peer in
+  (* Post-handshake feature negotiation *)
+  let* () = send_message peer P2p.SendheadersMsg in
   peer.state <- Ready;
   Lwt.return_unit
 
@@ -350,6 +461,89 @@ let ping_timed_out (peer : peer) : bool =
     Unix.gettimeofday () -. peer.last_ping > ping_timeout
   | None -> false
 
+(* Record misbehavior for a peer.  Returns `Ban if the accumulated score
+   reaches the threshold (>= 100), otherwise `Ok. *)
+let record_misbehavior (peer : peer) (score : int)
+    : [`Ok | `Ban] =
+  peer.misbehavior_score <- peer.misbehavior_score + score;
+  if peer.misbehavior_score >= 100 then `Ban else `Ok
+
+(* Misbehavior scoring categories (Gap 14) *)
+let misbehavior_invalid_block = 100
+let misbehavior_invalid_header = 20
+let misbehavior_oversized_message = 20
+let misbehavior_bad_tx = 10
+let misbehavior_spam = 5
+
+let record_misbehavior_for (peer : peer) (infraction : string) : [`Ok | `Ban] =
+  let score = match infraction with
+    | "invalid_block" -> misbehavior_invalid_block
+    | "invalid_header" -> misbehavior_invalid_header
+    | "oversized_message" -> misbehavior_oversized_message
+    | "bad_tx" -> misbehavior_bad_tx
+    | "spam" -> misbehavior_spam
+    | _ -> 1
+  in
+  record_misbehavior peer score
+
+(* Message rate limiting (Gap 15) *)
+let check_rate_limit (peer : peer) : bool =
+  let now = Unix.gettimeofday () in
+  if now -. peer.msg_window_start > 60.0 then begin
+    peer.msg_window_start <- now;
+    peer.msg_count_window <- 1;
+    true
+  end else begin
+    peer.msg_count_window <- peer.msg_count_window + 1;
+    peer.msg_count_window <= 500
+  end
+
+(* Getdata handler (Gap 11) — process inventory requests from peers.
+   lookup_block and lookup_tx return serialized data as Cstruct.t option;
+   the caller (higher-level code) owns storage/mempool access. *)
+let handle_getdata (peer : peer) (items : P2p.inv_vector list)
+    ~(lookup_block : Types.hash256 -> Cstruct.t option)
+    ~(lookup_tx : Types.hash256 -> Cstruct.t option)
+    : unit Lwt.t =
+  let open Lwt.Syntax in
+  let max_getdata_items = 1000 in
+  if List.length items > max_getdata_items then begin
+    let _result = record_misbehavior_for peer "spam" in
+    Lwt.return_unit
+  end else
+    let not_found = ref [] in
+    let* () = Lwt_list.iter_s (fun (iv : P2p.inv_vector) ->
+      match iv.inv_type with
+      | P2p.InvBlock | P2p.InvWitnessBlock ->
+        begin match lookup_block iv.hash with
+        | Some data ->
+          let r = Serialize.reader_of_cstruct data in
+          let block = Serialize.deserialize_block r in
+          send_message peer (P2p.BlockMsg block)
+        | None ->
+          not_found := iv :: !not_found;
+          Lwt.return_unit
+        end
+      | P2p.InvTx | P2p.InvWitnessTx ->
+        begin match lookup_tx iv.hash with
+        | Some data ->
+          let r = Serialize.reader_of_cstruct data in
+          let tx = Serialize.deserialize_transaction r in
+          send_message peer (P2p.TxMsg tx)
+        | None ->
+          not_found := iv :: !not_found;
+          Lwt.return_unit
+        end
+      | _ ->
+        not_found := iv :: !not_found;
+        Lwt.return_unit
+    ) items in
+    (* Send notfound for items we couldn't provide *)
+    if !not_found <> [] then
+      send_message peer (P2p.NotfoundMsg (List.rev !not_found))
+    else
+      Lwt.return_unit
+
 (* Handle incoming message from peer *)
 let handle_message (peer : peer) (msg : P2p.message_payload)
     : [`Continue | `Disconnect of string] Lwt.t =
@@ -368,8 +562,14 @@ let handle_message (peer : peer) (msg : P2p.message_payload)
   | P2p.WtxidrelayMsg ->
     peer.wtxid_relay <- true;
     Lwt.return `Continue
+  | P2p.SendaddrV2Msg ->
+    peer.sendaddrv2 <- true;
+    Lwt.return `Continue
   | P2p.VerackMsg ->
     (* Ignore duplicate verack *)
+    Lwt.return `Continue
+  | P2p.FeefilterMsg feerate ->
+    peer.feefilter <- feerate;
     Lwt.return `Continue
   | P2p.VersionMsg _ ->
     (* Version message after handshake is a protocol violation *)
@@ -393,6 +593,8 @@ type peer_stats = {
   stat_msgs_received : int;
   stat_last_seen : float;
   stat_user_agent : string;
+  stat_direction : peer_direction;
+  stat_misbehavior : int;
 }
 
 let get_stats (peer : peer) : peer_stats =
@@ -411,6 +613,8 @@ let get_stats (peer : peer) : peer_stats =
     stat_user_agent = (match peer.version_msg with
       | Some v -> v.user_agent
       | None -> "");
+    stat_direction = peer.direction;
+    stat_misbehavior = peer.misbehavior_score;
   }
 
 (* Pretty print peer info *)
@@ -418,8 +622,11 @@ let peer_info (peer : peer) : string =
   let ua = match peer.version_msg with
     | Some v -> v.user_agent
     | None -> "unknown" in
-  Printf.sprintf "Peer %d [%s:%d] state=%s height=%ld ua=%s"
+  let dir = match peer.direction with
+    | Inbound -> "in"
+    | Outbound -> "out" in
+  Printf.sprintf "Peer %d [%s:%d] state=%s height=%ld ua=%s dir=%s misb=%d"
     peer.id peer.addr peer.port
     (peer_state_to_string peer.state)
     peer.best_height
-    ua
+    ua dir peer.misbehavior_score

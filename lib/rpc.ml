@@ -9,6 +9,10 @@
 
    KNOWN PITFALL: All RPC requests must be POST. GET requests are rejected. *)
 
+let log_src = Logs.Src.create "RPC" ~doc:"RPC server"
+module Log = (val Logs.src_log log_src : Logs.LOG)
+let _ = Log.info  (* suppress unused module warning *)
+
 (* ============================================================================
    Standard Bitcoin RPC Error Codes
    ============================================================================ *)
@@ -91,7 +95,7 @@ let handle_getblockchaininfo (ctx : rpc_context)
     | Some t -> Types.hash256_to_hex_display t.total_work
     | None -> "0000000000000000000000000000000000000000000000000000000000000000"
   in
-  `Assoc [
+  let base_fields = [
     ("chain", `String ctx.network.name);
     ("blocks", `Int tip_height);
     ("headers", `Int ctx.chain.headers_synced);
@@ -106,9 +110,16 @@ let handle_getblockchaininfo (ctx : rpc_context)
       `Bool (ctx.chain.sync_state <> Sync.FullySynced));
     ("chainwork", `String chainwork);
     ("size_on_disk", `Int 0);
-    ("pruned", `Bool false);
+    ("pruned", `Bool (ctx.chain.prune_target > 0));
+  ] @
+  (if ctx.chain.prune_target > 0 then
+    [("pruneheight", `Int ctx.chain.prune_height);
+     ("prune_target_size", `Int ctx.chain.prune_target)]
+   else []) @
+  [
     ("warnings", `String "");
-  ]
+  ] in
+  `Assoc base_fields
 
 let handle_getblockhash (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
@@ -644,19 +655,35 @@ let handle_getmininginfo (ctx : rpc_context) : Yojson.Safe.t =
   ]
 
 let handle_getblocktemplate (ctx : rpc_context)
-    (_params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
-  (* Create a simple P2PKH payout script *)
-  let payout_script = Cstruct.create 25 in
-  Cstruct.set_uint8 payout_script 0 0x76;  (* OP_DUP *)
-  Cstruct.set_uint8 payout_script 1 0xa9;  (* OP_HASH160 *)
-  Cstruct.set_uint8 payout_script 2 0x14;  (* Push 20 bytes *)
-  (* Use zeros for the pubkey hash - miner should provide their own *)
-  Cstruct.set_uint8 payout_script 23 0x88;  (* OP_EQUALVERIFY *)
-  Cstruct.set_uint8 payout_script 24 0xac;  (* OP_CHECKSIG *)
-
-  let template = Mining.create_block_template
-    ~chain:ctx.chain ~mp:ctx.mempool ~payout_script in
-  Ok (Mining.template_to_json template)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  (* Try to get coinbase_address from the first param object *)
+  let coinbase_address_opt = match params with
+    | (`Assoc fields) :: _ ->
+      (match List.assoc_opt "coinbase_address" fields with
+       | Some (`String addr) -> Some addr
+       | _ -> None)
+    | _ -> None
+  in
+  (* Resolve payout script: from provided address, wallet, or error *)
+  let payout_script_result = match coinbase_address_opt with
+    | Some addr_str ->
+      (match Address.address_of_string addr_str with
+       | Ok addr -> Ok (Wallet.build_output_script addr)
+       | Error e -> Error (Printf.sprintf "Invalid coinbase_address: %s" e))
+    | None ->
+      (match ctx.wallet with
+       | Some wallet ->
+         let kp = Wallet.generate_key wallet in
+         Ok (Wallet.build_output_script kp.address)
+       | None ->
+         Error "No coinbase_address provided and no wallet available")
+  in
+  match payout_script_result with
+  | Error msg -> Error msg
+  | Ok payout_script ->
+    let template = Mining.create_block_template
+      ~chain:ctx.chain ~mp:ctx.mempool ~payout_script in
+    Ok (Mining.template_to_json template)
 
 let handle_submitblock (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
@@ -693,12 +720,9 @@ let handle_getnewaddress (ctx : rpc_context)
     (_params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match ctx.wallet with
   | None -> Error "Wallet not loaded"
-  | Some _wallet ->
-    (* Generate a new address - stub implementation *)
-    let privkey = Crypto.generate_private_key () in
-    let pubkey = Crypto.derive_public_key privkey in
-    let pkh = Crypto.hash160 pubkey in
-    let addr = Address.encode_p2pkh ctx.network.pubkey_address_prefix pkh in
+  | Some wallet ->
+    let kp = Wallet.generate_key wallet in
+    let addr = Address.address_to_string kp.address in
     Ok (`String addr)
 
 let handle_listunspent (ctx : rpc_context)
@@ -726,15 +750,34 @@ let handle_listunspent (ctx : rpc_context)
 
 let handle_sendtoaddress (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  (* Extract conf_target from params (index 6 in Bitcoin Core RPC) *)
+  let conf_target = match List.nth_opt params 6 with
+    | Some (`Int n) -> Some n
+    | _ -> None
+  in
+  (* Determine fee rate: use estimator with conf_target, fall back to 1.0 sat/vB *)
+  let fee_rate = match conf_target with
+    | Some target ->
+      (match Fee_estimation.estimate_fee ctx.fee_estimator target with
+       | Some rate -> rate
+       | None -> 1.0)
+    | None ->
+      (match Fee_estimation.estimate_fee ctx.fee_estimator 6 with
+       | Some rate -> rate
+       | None -> 1.0)
+  in
   match params with
-  | [`String address; `Float amount_btc] | [`String address; `Float amount_btc; _] ->
+  | `String address :: `Float amount_btc :: _ ->
     (match ctx.wallet with
      | None -> Error "Wallet not loaded"
      | Some wallet ->
+       let current_height = match ctx.chain.tip with
+         | Some t -> Some t.height
+         | None -> None
+       in
        let amount_sats = Int64.of_float (amount_btc *. 100_000_000.0) in
-       (* Use a default fee rate of 1.0 sat/vB *)
        match Wallet.create_transaction wallet ~dest_address:address
-               ~amount:amount_sats ~fee_rate:1.0 with
+               ~amount:amount_sats ~fee_rate ?tip_height:current_height () with
        | Error e -> Error e
        | Ok tx ->
          match Mempool.add_transaction ctx.mempool tx with
@@ -746,10 +789,14 @@ let handle_sendtoaddress (ctx : rpc_context)
     (match ctx.wallet with
      | None -> Error "Wallet not loaded"
      | Some wallet ->
+       let current_height = match ctx.chain.tip with
+         | Some t -> Some t.height
+         | None -> None
+       in
        let amount_btc = float_of_int amount_sats_int in
        let amount_sats = Int64.of_float (amount_btc *. 100_000_000.0) in
        match Wallet.create_transaction wallet ~dest_address:address
-               ~amount:amount_sats ~fee_rate:1.0 with
+               ~amount:amount_sats ~fee_rate ?tip_height:current_height () with
        | Error e -> Error e
        | Ok tx ->
          match Mempool.add_transaction ctx.mempool tx with
@@ -803,6 +850,56 @@ let handle_signrawtransactionwithwallet (ctx : rpc_context)
     Error "Invalid parameters: expected [hexstring]"
 
 (* ============================================================================
+   Transaction History Handler
+   ============================================================================ *)
+
+let handle_listtransactions (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : Yojson.Safe.t =
+  match ctx.wallet with
+  | None -> `List []
+  | Some wallet ->
+    let count = match params with
+      | `Int c :: _ -> c
+      | _ -> 10
+    in
+    let skip = match params with
+      | _ :: `Int s :: _ -> s
+      | _ -> 0
+    in
+    (* Sort by timestamp descending *)
+    let sorted = List.sort (fun a b ->
+      compare b.Wallet.hist_timestamp a.Wallet.hist_timestamp
+    ) wallet.Wallet.tx_history in
+    (* Apply skip *)
+    let rec drop n lst = match n, lst with
+      | 0, l -> l
+      | _, [] -> []
+      | n, _ :: rest -> drop (n - 1) rest
+    in
+    let skipped = drop skip sorted in
+    (* Apply count *)
+    let rec take n lst = match n, lst with
+      | 0, _ -> []
+      | _, [] -> []
+      | n, x :: rest -> x :: take (n - 1) rest
+    in
+    let entries = take count skipped in
+    `List (List.map (fun h ->
+      `Assoc [
+        ("txid", `String h.Wallet.hist_txid);
+        ("category", `String (match h.Wallet.hist_category with
+          | `Send -> "send" | `Receive -> "receive"));
+        ("amount", `Float (Int64.to_float h.Wallet.hist_amount /. 100_000_000.0));
+        ("fee", `Float (Int64.to_float h.Wallet.hist_fee /. 100_000_000.0));
+        ("address", `String h.Wallet.hist_address);
+        ("confirmations", `Int h.Wallet.hist_confirmations);
+        ("blockhash", `String h.Wallet.hist_block_hash);
+        ("blockheight", `Int h.Wallet.hist_block_height);
+        ("time", `Int (int_of_float h.Wallet.hist_timestamp));
+      ]
+    ) entries)
+
+(* ============================================================================
    Address Validation Handler
    ============================================================================ *)
 
@@ -814,12 +911,13 @@ let handle_validateaddress (_ctx : rpc_context)
      | Ok addr ->
        let script_pubkey = Wallet.build_output_script addr in
        let is_witness = match addr.Address.addr_type with
-         | Address.P2WPKH | Address.P2WSH | Address.P2TR -> true
+         | Address.P2WPKH | Address.P2WSH | Address.P2TR | Address.WitnessUnknown _ -> true
          | Address.P2PKH | Address.P2SH -> false
        in
        let witness_version = match addr.Address.addr_type with
          | Address.P2WPKH | Address.P2WSH -> Some 0
          | Address.P2TR -> Some 1
+         | Address.WitnessUnknown v -> Some v
          | _ -> None
        in
        let hex = Types.hash256_to_hex script_pubkey in
@@ -873,6 +971,266 @@ let handle_gettxout (ctx : rpc_context)
   | _ -> Error "Invalid parameters: expected [txid, vout]"
 
 (* ============================================================================
+   testmempoolaccept Handler
+   ============================================================================ *)
+
+let handle_testmempoolaccept (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`List [`String hex_tx]] ->
+    (try
+      let data = Cstruct.of_hex hex_tx in
+      let r = Serialize.reader_of_cstruct data in
+      let tx = Serialize.deserialize_transaction r in
+      let txid = Crypto.compute_txid tx in
+      let hex_txid = Types.hash256_to_hex_display txid in
+      match Mempool.add_transaction ~dry_run:true ctx.mempool tx with
+      | Ok entry ->
+        let vsize = (entry.Mempool.weight + 3) / 4 in
+        let fee_btc = Int64.to_float entry.Mempool.fee /. 100_000_000.0 in
+        Ok (`List [`Assoc [
+          ("txid", `String hex_txid);
+          ("allowed", `Bool true);
+          ("vsize", `Int vsize);
+          ("fees", `Assoc [
+            ("base", `Float fee_btc);
+          ]);
+        ]])
+      | Error msg ->
+        Ok (`List [`Assoc [
+          ("txid", `String hex_txid);
+          ("allowed", `Bool false);
+          ("reject-reason", `String msg);
+        ]])
+    with exn ->
+      Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn)))
+  | _ ->
+    Error "Invalid parameters: expected [[rawtx]]"
+
+(* ============================================================================
+   signrawtransactionwithkey Handler
+   ============================================================================ *)
+
+let handle_signrawtransactionwithkey (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String hex_tx; `List wif_keys] | [`String hex_tx; `List wif_keys; _] ->
+    (try
+      let data = Cstruct.of_hex hex_tx in
+      let r = Serialize.reader_of_cstruct data in
+      let tx = Serialize.deserialize_transaction r in
+      (* Decode all WIF keys *)
+      let decoded_keys = List.filter_map (fun wif_json ->
+        match wif_json with
+        | `String wif ->
+          (match Address.wif_decode wif with
+           | Ok (privkey, _compressed, _network) ->
+             let pubkey = Crypto.derive_public_key ~compressed:true privkey in
+             let pkh = Crypto.hash160 pubkey in
+             let xonly = Crypto.derive_xonly_pubkey privkey in
+             Some (privkey, pubkey, pkh, xonly)
+           | Error _ -> None)
+        | _ -> None
+      ) wif_keys in
+      (* Look up UTXO info for each input *)
+      let utxo_set = Utxo.UtxoSet.create ctx.chain.db in
+      let input_utxos = List.map (fun inp ->
+        let prev = inp.Types.previous_output in
+        (* Try chain UTXO set first *)
+        match Utxo.UtxoSet.get utxo_set prev.txid (Int32.to_int prev.vout) with
+        | Some utxo -> Some utxo
+        | None ->
+          (* Try mempool *)
+          let txid_key = Cstruct.to_string prev.txid in
+          match Hashtbl.find_opt ctx.mempool.entries txid_key with
+          | Some parent_entry ->
+            let vout = Int32.to_int prev.vout in
+            if vout < List.length parent_entry.tx.outputs then
+              let out = List.nth parent_entry.tx.outputs vout in
+              Some { Utxo.value = out.Types.value;
+                     script_pubkey = out.script_pubkey;
+                     height = 0; is_coinbase = false }
+            else None
+          | None ->
+            (* Try chain db for confirmed tx *)
+            (match Storage.ChainDB.get_tx_index ctx.chain.db prev.txid with
+             | Some (block_hash, _tx_idx) ->
+               (match Storage.ChainDB.get_block ctx.chain.db block_hash with
+                | Some block ->
+                  let found = List.find_opt (fun btx ->
+                    Cstruct.equal (Crypto.compute_txid btx) prev.txid
+                  ) block.transactions in
+                  (match found with
+                   | Some btx ->
+                     let vout = Int32.to_int prev.vout in
+                     if vout < List.length btx.outputs then
+                       let out = List.nth btx.outputs vout in
+                       Some { Utxo.value = out.Types.value;
+                              script_pubkey = out.script_pubkey;
+                              height = 0; is_coinbase = false }
+                     else None
+                   | None -> None)
+                | None -> None)
+             | None -> None)
+      ) tx.inputs in
+      (* Build prevouts list for taproot sighash *)
+      let prevouts = List.map (fun utxo_opt ->
+        match utxo_opt with
+        | Some utxo -> (utxo.Utxo.value, utxo.Utxo.script_pubkey)
+        | None -> (0L, Cstruct.empty)
+      ) input_utxos in
+      (* Sign each input *)
+      let signed_count = ref 0 in
+      let total_inputs = List.length tx.inputs in
+      let new_witnesses = List.mapi (fun i _inp ->
+        match List.nth_opt input_utxos i with
+        | None | Some None ->
+          if i < List.length tx.witnesses then
+            List.nth tx.witnesses i
+          else
+            { Types.items = [] }
+        | Some (Some utxo) ->
+          let script_type = Script.classify_script utxo.Utxo.script_pubkey in
+          let matching_key = match script_type with
+            | Script.P2WPKH_script hash ->
+              List.find_opt (fun (_priv, _pub, pkh, _xonly) ->
+                Cstruct.equal pkh hash
+              ) decoded_keys
+            | Script.P2PKH_script hash ->
+              List.find_opt (fun (_priv, _pub, pkh, _xonly) ->
+                Cstruct.equal pkh hash
+              ) decoded_keys
+            | Script.P2TR_script xonly_hash ->
+              List.find_opt (fun (_priv, _pub, _pkh, xonly) ->
+                Cstruct.equal xonly xonly_hash
+              ) decoded_keys
+            | _ -> None
+          in
+          (match matching_key with
+           | None ->
+             if i < List.length tx.witnesses then
+               List.nth tx.witnesses i
+             else
+               { Types.items = [] }
+           | Some (privkey, pubkey, pkh, _xonly) ->
+             incr signed_count;
+             (match script_type with
+              | Script.P2TR_script _ ->
+                let sighash = Script.compute_sighash_taproot tx i prevouts 0x00 () in
+                let sig_bytes = Crypto.schnorr_sign ~privkey ~msg:sighash in
+                { Types.items = [sig_bytes] }
+              | Script.P2WPKH_script _ ->
+                let script_code = Wallet.build_p2pkh_script pkh in
+                let sighash = Script.compute_sighash_segwit
+                  tx i script_code utxo.Utxo.value Script.sighash_all in
+                let signature = Crypto.sign privkey sighash in
+                let sig_with_hashtype = Cstruct.concat [
+                  signature; Cstruct.of_string "\x01"
+                ] in
+                { Types.items = [sig_with_hashtype; pubkey] }
+              | Script.P2PKH_script _ ->
+                (* Legacy P2PKH needs scriptSig, not witness *)
+                if i < List.length tx.witnesses then
+                  List.nth tx.witnesses i
+                else
+                  { Types.items = [] }
+              | _ ->
+                if i < List.length tx.witnesses then
+                  List.nth tx.witnesses i
+                else
+                  { Types.items = [] }))
+      ) tx.inputs in
+      let signed_tx = { tx with witnesses = new_witnesses } in
+      let complete = !signed_count = total_inputs in
+      let w = Serialize.writer_create () in
+      Serialize.serialize_transaction w signed_tx;
+      let cs = Serialize.writer_to_cstruct w in
+      let signed_hex = Types.hash256_to_hex cs in
+      Ok (`Assoc [
+        ("hex", `String signed_hex);
+        ("complete", `Bool complete);
+      ])
+    with exn ->
+      Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn)))
+  | _ ->
+    Error "Invalid parameters: expected [hexstring, [privkeys]]"
+
+(* ============================================================================
+   getblockstats Handler
+   ============================================================================ *)
+
+let handle_getblockstats (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  let hash_opt = match params with
+    | [`Int height] | [`Int height; _] ->
+      Storage.ChainDB.get_hash_at_height ctx.chain.db height
+    | [`String hash_hex] | [`String hash_hex; _] ->
+      let hash_bytes = Types.hash256_of_hex hash_hex in
+      let hash = Cstruct.create 32 in
+      for i = 0 to 31 do
+        Cstruct.set_uint8 hash i (Cstruct.get_uint8 hash_bytes (31 - i))
+      done;
+      Some hash
+    | _ -> None
+  in
+  match hash_opt with
+  | None -> Error "Invalid parameters: expected [height] or [blockhash]"
+  | Some hash ->
+    (match Storage.ChainDB.get_block ctx.chain.db hash with
+     | None -> Error "Block not found"
+     | Some block ->
+       let entry = Sync.get_header ctx.chain hash in
+       let height = match entry with
+         | Some e -> e.height
+         | None -> 0
+       in
+       let txs = List.length block.transactions in
+       let ins = List.fold_left (fun acc tx ->
+         let is_cb = match tx.Types.inputs with
+           | inp :: _ -> Cstruct.equal inp.Types.previous_output.txid Types.zero_hash
+           | [] -> false
+         in
+         if is_cb then acc else acc + List.length tx.Types.inputs
+       ) 0 block.transactions in
+       let outs = List.fold_left (fun acc tx ->
+         acc + List.length tx.Types.outputs
+       ) 0 block.transactions in
+       let total_out = List.fold_left (fun acc tx ->
+         List.fold_left (fun a out -> Int64.add a out.Types.value) acc tx.Types.outputs
+       ) 0L block.transactions in
+       let subsidy = Consensus.block_subsidy height in
+       let total_weight =
+         80 * Consensus.witness_scale_factor +
+         List.fold_left (fun acc tx ->
+           acc + Validation.compute_tx_weight tx
+         ) 0 block.transactions in
+       let w_ser = Serialize.writer_create () in
+       Serialize.serialize_block w_ser block;
+       let total_size = Cstruct.length (Serialize.writer_to_cstruct w_ser) in
+       let coinbase_output = match block.transactions with
+         | cb :: _ ->
+           List.fold_left (fun acc out -> Int64.add acc out.Types.value) 0L cb.Types.outputs
+         | [] -> 0L
+       in
+       let totalfee = Int64.sub coinbase_output subsidy in
+       let totalfee = if totalfee < 0L then 0L else totalfee in
+       let avgfee = if txs > 1 then Int64.div totalfee (Int64.of_int (txs - 1)) else 0L in
+       let utxo_increase = outs - ins in
+       Ok (`Assoc [
+         ("avgfee", `Int (Int64.to_int avgfee));
+         ("height", `Int height);
+         ("ins", `Int ins);
+         ("outs", `Int outs);
+         ("subsidy", `Int (Int64.to_int subsidy));
+         ("total_out", `Int (Int64.to_int total_out));
+         ("total_size", `Int total_size);
+         ("total_weight", `Int total_weight);
+         ("totalfee", `Int (Int64.to_int totalfee));
+         ("txs", `Int txs);
+         ("utxo_increase", `Int utxo_increase);
+       ]))
+
+(* ============================================================================
    Performance Stats Handlers
    ============================================================================ *)
 
@@ -906,6 +1264,7 @@ let handle_help (_ctx : rpc_context)
       "getblockcount";
       "getblockhash height";
       "getblockheader \"blockhash\" ( verbose )";
+      "getblockstats hash_or_height";
       "getdifficulty";
       "";
       "== Mining ==";
@@ -919,6 +1278,7 @@ let handle_help (_ctx : rpc_context)
       "getmempoolentry \"txid\"";
       "getmempoolinfo";
       "getrawmempool ( verbose )";
+      "testmempoolaccept [\"rawtx\"]";
       "";
       "== Network ==";
       "getconnectioncount";
@@ -929,6 +1289,7 @@ let handle_help (_ctx : rpc_context)
       "decoderawtransaction \"hexstring\"";
       "getrawtransaction \"txid\" ( verbose )";
       "sendrawtransaction \"hexstring\"";
+      "signrawtransactionwithkey \"hexstring\" [\"privkey\",...]";
       "";
       "== Blockchain ==";
       "gettxout \"txid\" vout";
@@ -940,6 +1301,7 @@ let handle_help (_ctx : rpc_context)
       "== Wallet ==";
       "getbalance";
       "getnewaddress";
+      "listtransactions ( count skip )";
       "listunspent";
       "sendtoaddress \"address\" amount";
       "signrawtransactionwithwallet \"hexstring\"";
@@ -992,6 +1354,10 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_gettxout ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
+  | "getblockstats" ->
+    (match handle_getblockstats ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
 
   (* Transactions *)
   | "getrawtransaction" ->
@@ -1006,6 +1372,10 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_decoderawtransaction ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_deserialization_error, msg))
+  | "signrawtransactionwithkey" ->
+    (match handle_signrawtransactionwithkey ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
 
   (* Network *)
   | "getpeerinfo" ->
@@ -1032,6 +1402,10 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_getmempoolentry ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
+  | "testmempoolaccept" ->
+    (match handle_testmempoolaccept ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_verify_rejected, msg))
 
   (* Fee estimation / Util *)
   | "estimatesmartfee" ->
@@ -1062,6 +1436,8 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_getnewaddress ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_wallet_error, msg))
+  | "listtransactions" ->
+    Ok (handle_listtransactions ctx params)
   | "listunspent" ->
     Ok (handle_listunspent ctx params)
   | "sendtoaddress" ->

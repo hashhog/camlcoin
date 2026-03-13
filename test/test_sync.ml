@@ -411,7 +411,7 @@ let test_block_download_states () =
     header = Consensus.regtest.genesis_header;
     transactions = [];
   } in
-  let state3 = Sync.Downloaded block in
+  let state3 = Sync.Downloaded { block; peer_id = None } in
   let is_downloaded = match state3 with
     | Sync.Downloaded _ -> true
     | _ -> false

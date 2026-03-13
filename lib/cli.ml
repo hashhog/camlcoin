@@ -250,7 +250,15 @@ let run (config : config) : unit Lwt.t =
       (* Start block download if needed *)
       if chain.sync_state = Sync.SyncingBlocks then begin
         Logs.info (fun m -> m "Starting block download");
-        Sync.start_ibd ~utxo_set:optimized_utxo chain (Peer_manager.get_ready_peers peer_manager)
+        let misbehavior_handler peer_id infraction =
+          match Peer_manager.find_peer_by_id peer_manager peer_id with
+          | Some peer ->
+            ignore (Peer.record_misbehavior_for peer infraction)
+          | None -> ()
+        in
+        Sync.start_ibd ~utxo_set:optimized_utxo
+          ~misbehavior_handler
+          chain (Peer_manager.get_ready_peers peer_manager)
       end else
         Lwt.return_unit
   in

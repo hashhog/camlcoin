@@ -470,7 +470,7 @@ let has_header (state : chain_state) (hash : Types.hash256) : bool =
 type block_download_state =
   | NotRequested
   | Requested of { peer_id : int; requested_at : float; timeout : float }
-  | Downloaded of Types.block
+  | Downloaded of { block : Types.block; peer_id : int option }
   | Validated
 
 (* Block queue entry - tracks download progress for each block *)
@@ -537,10 +537,12 @@ type ibd_state = {
   utxo_set : Utxo.OptimizedUtxoSet.t option;  (* Wire UTXO flush *)
   mutable mempool : Mempool.mempool option;
   orphan_blocks : (string, orphan_block_entry) Hashtbl.t;
+  misbehavior_handler : (int -> string -> unit) option;
 }
 
 (* Create IBD state from existing chain state *)
 let create_ibd_state ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
+    ?(misbehavior_handler : (int -> string -> unit) option)
     (chain : chain_state) : ibd_state =
   let start_height = chain.blocks_synced + 1 in
   { chain;
@@ -554,7 +556,8 @@ let create_ibd_state ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
     pending_utxo_deletes = [];
     utxo_set;
     mempool = None;
-    orphan_blocks = Hashtbl.create 100 }
+    orphan_blocks = Hashtbl.create 100;
+    misbehavior_handler }
 
 let set_mempool (ibd : ibd_state) (mp : Mempool.mempool) =
   ibd.mempool <- Some mp
@@ -715,6 +718,12 @@ let request_blocks (ibd : ibd_state) (peers : Peer.peer list)
       if to_request_count <= 0 then
         Lwt.return_unit
       else begin
+        (* Mark blocks we already have as validated *)
+        List.iter (fun entry ->
+          if entry.download_state = NotRequested &&
+             Storage.ChainDB.has_block ibd.chain.db entry.hash then
+            entry.download_state <- Validated
+        ) ibd.block_queue;
         (* Find unrequested blocks *)
         let unrequested = List.filter (fun entry ->
           entry.download_state = NotRequested
@@ -796,7 +805,7 @@ let receive_block (ibd : ibd_state) (block : Types.block)
       | Requested { peer_id; _ } -> Some peer_id
       | _ -> None
     in
-    entry.download_state <- Downloaded block;
+    entry.download_state <- Downloaded { block; peer_id };
     ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
     (* Decay timeout for successful download *)
     (match peer_id with
@@ -901,7 +910,7 @@ let process_orphan_blocks (ibd : ibd_state) (parent_hash : Types.hash256) : int 
          let queue_entry = {
            hash = orphan.hash;
            height = header_entry.height;
-           download_state = Downloaded orphan.block;
+           download_state = Downloaded { block = orphan.block; peer_id = None };
          } in
          ibd.block_queue <- ibd.block_queue @ [queue_entry];
          incr processed;
@@ -1013,7 +1022,7 @@ let process_downloaded_blocks (ibd : ibd_state)
     ) ibd.block_queue with
     | Some entry -> begin
       match entry.download_state with
-      | Downloaded block ->
+      | Downloaded { block; peer_id } ->
         (* Validate the block *)
         let height = entry.height in
         (* Compute expected difficulty from chain state *)
@@ -1120,6 +1129,13 @@ let process_downloaded_blocks (ibd : ibd_state)
            ibd.block_queue <- List.filter
              (fun e -> e.download_state <> Validated) ibd.block_queue
          | Error e ->
+           (* Record misbehavior for the peer that sent this block *)
+           (match peer_id with
+            | Some pid ->
+              (match ibd.misbehavior_handler with
+               | Some handler -> handler pid "invalid_block"
+               | None -> ())
+            | None -> ());
            error := Some (Printf.sprintf
              "Block validation failed at height %d: %s"
              height (Validation.block_error_to_string e)))
@@ -1376,6 +1392,13 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
                Logs.debug (fun m ->
                  m "Connected block at height %d during reorg" height)
              | Error e ->
+               (* During reorg, blocks come from storage so no peer_id
+                  is available; log misbehavior if we ever gain context *)
+               (match ibd.misbehavior_handler with
+                | Some _handler ->
+                  Logs.warn (fun m ->
+                    m "Invalid block at height %d during reorg (no peer to penalize)" height)
+                | None -> ());
                connect_error := Some (Printf.sprintf
                  "Block validation failed at height %d during reorg: %s"
                  height (Validation.block_error_to_string e)))
@@ -1447,6 +1470,7 @@ let run_ibd (ibd : ibd_state) (peers : Peer.peer list) : unit Lwt.t =
 
 (* Start IBD if headers are synced but blocks aren't *)
 let start_ibd ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
+    ?(misbehavior_handler : (int -> string -> unit) option)
     (state : chain_state) (peers : Peer.peer list) : unit Lwt.t =
   if state.sync_state <> SyncingBlocks then
     Lwt.return_unit
@@ -1463,7 +1487,7 @@ let start_ibd ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
       Logs.info (fun m ->
         m "Starting IBD from height %d to %d"
           state.blocks_synced tip_height);
-      let ibd = create_ibd_state ?utxo_set state in
+      let ibd = create_ibd_state ?utxo_set ?misbehavior_handler state in
       run_ibd ibd peers
     end
   end

@@ -14,6 +14,12 @@
    insufficient data exists. *)
 
 (* ============================================================================
+   Estimate Mode
+   ============================================================================ *)
+
+type estimate_mode = Conservative | Economical
+
+(* ============================================================================
    Fee Bucket Type
    ============================================================================ *)
 
@@ -134,6 +140,19 @@ let record_confirmation (est : t) (txid : Types.hash256)
         List.filteri (fun i _ -> i < max_samples_per_bucket)
           bucket.blocks_to_confirm
 
+(* Remove a transaction that was evicted from the mempool without counting
+   it as a confirmation. This prevents evicted high-fee transactions from
+   incorrectly inflating fee estimates. *)
+let record_eviction (est : t) (txid : Types.hash256) : unit =
+  let txid_key = Cstruct.to_string txid in
+  match Hashtbl.find_opt est.tracked_txs txid_key with
+  | None -> ()
+  | Some (fee_rate, _added_height, _timestamp) ->
+    Hashtbl.remove est.tracked_txs txid_key;
+    let bucket_idx = find_bucket est fee_rate in
+    let bucket = est.buckets.(bucket_idx) in
+    bucket.total_unconfirmed <- Float.max 0.0 (bucket.total_unconfirmed -. 1.0)
+
 (* ============================================================================
    Exponential Decay
    ============================================================================ *)
@@ -174,26 +193,52 @@ let process_block (est : t) (block : Types.block) (height : int) : unit =
    Fee Estimation
    ============================================================================ *)
 
-(* Helper to compute median of a list *)
-let compute_median (samples : float list) : float option =
+(* Helper to compute a percentile of a sorted list.
+   [p] is in [0.0, 1.0]; 0.5 = median. *)
+let compute_percentile (samples : float list) (p : float) : float option =
   match samples with
   | [] -> None
   | _ ->
     let sorted = List.sort compare samples in
     let len = List.length sorted in
-    Some (List.nth sorted (len / 2))
+    let idx = int_of_float (p *. float_of_int (len - 1)) in
+    let idx = max 0 (min idx (len - 1)) in
+    Some (List.nth sorted idx)
+
+(* Helper to compute median of a list *)
+let compute_median (samples : float list) : float option =
+  compute_percentile samples 0.5
+
+(* Conservative-mode multiplier based on target_blocks.
+   Short targets get a larger safety margin because under-estimation
+   is more costly for urgent transactions. *)
+let conservative_multiplier (target_blocks : int) : float =
+  if target_blocks <= 2 then 1.5
+  else if target_blocks <= 6 then 1.25
+  else 1.10
 
 (* Estimate fee rate for target confirmation blocks.
    Searches from lowest fee rate up, finding the lowest fee-rate bucket
    where the median confirmation time meets the target. Higher fee rate
    buckets are expected to confirm faster, so we want the minimum fee
-   that achieves the target confirmation time. *)
-let estimate_fee (est : t) (target_blocks : int) : float option =
+   that achieves the target confirmation time.
+
+   [mode] controls conservatism:
+   - Economical (default): uses median confirmation time.
+   - Conservative: uses the 85th percentile for bucket matching and
+     multiplies the result by a safety factor. *)
+let estimate_fee ?(mode = Economical) (est : t) (target_blocks : int) : float option =
   let n = Array.length est.buckets in
   let target_f = float_of_int target_blocks in
+  (* Conservative mode uses the 85th percentile so that the bucket must
+     meet the target for the vast majority of observed transactions. *)
+  let percentile = match mode with
+    | Conservative -> 0.85
+    | Economical -> 0.5
+  in
 
   (* Search from lowest to highest fee rate, return first bucket that
-     has enough data AND median confirmation time <= target *)
+     has enough data AND confirmation percentile <= target *)
   let rec search_up i =
     if i >= n then
       (* No bucket meets the target *)
@@ -203,12 +248,17 @@ let estimate_fee (est : t) (target_blocks : int) : float option =
       if bucket.total_confirmed < float_of_int min_samples then
         search_up (i + 1)  (* not enough data, try higher fee rate *)
       else begin
-        match compute_median bucket.blocks_to_confirm with
+        match compute_percentile bucket.blocks_to_confirm percentile with
         | None -> search_up (i + 1)
-        | Some median ->
-          if median <= target_f then
-            Some bucket.min_fee_rate
-          else
+        | Some pct_val ->
+          if pct_val <= target_f then begin
+            let base_rate = bucket.min_fee_rate in
+            let rate = match mode with
+              | Conservative -> base_rate *. conservative_multiplier target_blocks
+              | Economical -> base_rate
+            in
+            Some rate
+          end else
             search_up (i + 1)  (* doesn't meet target, try higher fee rate *)
       end
     end

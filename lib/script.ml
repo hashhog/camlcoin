@@ -7,7 +7,7 @@
 type opcode =
   (* Constants *)
   | OP_0                    (* 0x00 -- push empty byte vector *)
-  | OP_PUSHDATA of Cstruct.t (* 0x01-0x4e -- push N bytes *)
+  | OP_PUSHDATA of int * Cstruct.t (* (opbyte, data) 0x01-0x4e -- push N bytes *)
   | OP_1NEGATE              (* 0x4f -- push -1 *)
   | OP_1                    (* 0x51 -- push 1, also OP_TRUE *)
   | OP_2  | OP_3  | OP_4  | OP_5  | OP_6  | OP_7  | OP_8
@@ -134,6 +134,9 @@ let script_verify_witness_pubkeytype = 1 lsl 14 (* BIP-141 compressed keys for w
 let script_verify_const_scriptcode   = 1 lsl 15 (* Making OP_CODESEP non-standard *)
 let script_verify_discourage_upgradable_nops    = 1 lsl 8  (* Discourage upgradable NOPs *)
 let script_verify_discourage_upgradable_witness = 1 lsl 16 (* Discourage unknown witness versions *)
+let script_verify_discourage_op_success = 1 lsl 18  (* Discourage OP_SUCCESSx in tapscript *)
+let script_verify_discourage_upgradable_taproot_version = 1 lsl 19  (* Discourage unknown taproot leaf versions *)
+let script_verify_discourage_upgradable_pubkeytype = 1 lsl 20  (* Discourage unknown pubkey types in tapscript *)
 
 (* Signature version for sighash computation *)
 type sig_version =
@@ -158,19 +161,19 @@ let parse_script (raw : Cstruct.t) : opcode list =
       | 0x00 -> OP_0
       | n when n >= 0x01 && n <= 0x4b ->
         if r.pos + n > len then failwith "Truncated PUSHDATA";
-        OP_PUSHDATA (Serialize.read_bytes r n)
+        OP_PUSHDATA (n, Serialize.read_bytes r n)
       | 0x4c ->
         let push_len = Serialize.read_uint8 r in
         if r.pos + push_len > len then failwith "Truncated PUSHDATA1";
-        OP_PUSHDATA (Serialize.read_bytes r push_len)
+        OP_PUSHDATA (0x4c, Serialize.read_bytes r push_len)
       | 0x4d ->
         let push_len = Serialize.read_uint16_le r in
         if r.pos + push_len > len then failwith "Truncated PUSHDATA2";
-        OP_PUSHDATA (Serialize.read_bytes r push_len)
+        OP_PUSHDATA (0x4d, Serialize.read_bytes r push_len)
       | 0x4e ->
         let push_len = Int32.to_int (Serialize.read_int32_le r) in
         if push_len < 0 || r.pos + push_len > len then failwith "Truncated PUSHDATA4";
-        OP_PUSHDATA (Serialize.read_bytes r push_len)
+        OP_PUSHDATA (0x4e, Serialize.read_bytes r push_len)
       | 0x4f -> OP_1NEGATE
       | 0x50 -> OP_RESERVED
       | 0x51 -> OP_1
@@ -228,23 +231,41 @@ let parse_script (raw : Cstruct.t) : opcode list =
 let serialize_opcode (w : Serialize.writer) (op : opcode) : unit =
   match op with
   | OP_0 -> Serialize.write_uint8 w 0x00
-  | OP_PUSHDATA data ->
+  | OP_PUSHDATA (opbyte, data) ->
     let len = Cstruct.length data in
-    if len <= 0x4b then begin
+    if opbyte >= 0x01 && opbyte <= 0x4b then begin
       Serialize.write_uint8 w len;
       Serialize.write_bytes w data
-    end else if len <= 0xff then begin
+    end else if opbyte = 0x4c then begin
       Serialize.write_uint8 w 0x4c;
       Serialize.write_uint8 w len;
       Serialize.write_bytes w data
-    end else if len <= 0xffff then begin
+    end else if opbyte = 0x4d then begin
       Serialize.write_uint8 w 0x4d;
       Serialize.write_uint16_le w len;
       Serialize.write_bytes w data
-    end else begin
+    end else if opbyte = 0x4e then begin
       Serialize.write_uint8 w 0x4e;
       Serialize.write_int32_le w (Int32.of_int len);
       Serialize.write_bytes w data
+    end else begin
+      (* Fallback: use minimal encoding *)
+      if len <= 0x4b then begin
+        Serialize.write_uint8 w len;
+        Serialize.write_bytes w data
+      end else if len <= 0xff then begin
+        Serialize.write_uint8 w 0x4c;
+        Serialize.write_uint8 w len;
+        Serialize.write_bytes w data
+      end else if len <= 0xffff then begin
+        Serialize.write_uint8 w 0x4d;
+        Serialize.write_uint16_le w len;
+        Serialize.write_bytes w data
+      end else begin
+        Serialize.write_uint8 w 0x4e;
+        Serialize.write_int32_le w (Int32.of_int len);
+        Serialize.write_bytes w data
+      end
     end
   | OP_1NEGATE -> Serialize.write_uint8 w 0x4f
   | OP_RESERVED -> Serialize.write_uint8 w 0x50
@@ -711,31 +732,33 @@ let check_pubkey_encoding (pk : Cstruct.t) (flags : int) (sig_version : sig_vers
 
 (* FindAndDelete: Remove all occurrences of a signature from script
    Only used for legacy sighash, NOT for witness v0 or tapscript *)
-let find_and_delete (script : Cstruct.t) (sig_data : Cstruct.t) : Cstruct.t =
+let find_and_delete (script : Cstruct.t) (sig_data : Cstruct.t) : Cstruct.t * bool =
   let sig_len = Cstruct.length sig_data in
-  if sig_len = 0 then script
+  if sig_len = 0 then (script, false)
   else
     (* Build the push encoding of the signature *)
     let push_encoded =
       let w = Serialize.writer_create () in
-      serialize_opcode w (OP_PUSHDATA sig_data);
+      serialize_opcode w (OP_PUSHDATA (Cstruct.length sig_data, sig_data));
       Serialize.writer_to_cstruct w
     in
     let push_len = Cstruct.length push_encoded in
     let script_len = Cstruct.length script in
     let result = Buffer.create script_len in
+    let removed = ref false in
     let i = ref 0 in
     while !i < script_len do
       if !i + push_len <= script_len &&
-         Cstruct.equal (Cstruct.sub script !i push_len) push_encoded then
+         Cstruct.equal (Cstruct.sub script !i push_len) push_encoded then begin
         (* Skip the signature *)
+        removed := true;
         i := !i + push_len
-      else begin
+      end else begin
         Buffer.add_char result (Char.chr (Cstruct.get_uint8 script !i));
         incr i
       end
     done;
-    Cstruct.of_string (Buffer.contents result)
+    (Cstruct.of_string (Buffer.contents result), !removed)
 
 (* Legacy sighash computation (pre-segwit) *)
 let compute_sighash_legacy (tx : Types.transaction) (input_index : int)
@@ -1051,7 +1074,7 @@ let build_p2pkh_script (hash : Types.hash160) : Cstruct.t =
 
 (* Check if an opcode is a push operation (doesn't count toward op limit) *)
 let is_push_opcode = function
-  | OP_0 | OP_PUSHDATA _ | OP_1NEGATE
+  | OP_0 | OP_PUSHDATA (_, _) | OP_1NEGATE
   | OP_1 | OP_2 | OP_3 | OP_4 | OP_5 | OP_6 | OP_7 | OP_8
   | OP_9 | OP_10 | OP_11 | OP_12 | OP_13 | OP_14 | OP_15 | OP_16 -> true
   | _ -> false
@@ -1125,6 +1148,11 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
     (* Disabled opcodes fail unconditionally, even in non-executing branches *)
     Error (Printf.sprintf "Disabled opcode 0x%02x" n)
 
+  | OP_CODESEPARATOR when st.sig_version = SigVersionBase &&
+                          st.flags land script_verify_const_scriptcode <> 0 ->
+    (* CONST_SCRIPTCODE: OP_CODESEPARATOR rejected even in non-executing branches *)
+    Error "CONST_SCRIPTCODE: OP_CODESEPARATOR in legacy script"
+
   | _ when not executing ->
     (* Skip all other opcodes when not executing *)
     Ok ()
@@ -1133,10 +1161,33 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
   | OP_0 ->
     stack_push st (Cstruct.create 0)
 
-  | OP_PUSHDATA data ->
+  | OP_PUSHDATA (opbyte, data) ->
     if st.sig_version <> SigVersionTapscript && Cstruct.length data > max_script_element_size then
       Error "Push data exceeds maximum size"
-    else
+    else if st.flags land script_verify_minimaldata <> 0 then begin
+      let dlen = Cstruct.length data in
+      let not_minimal =
+        if dlen = 0 then
+          (* Empty data should use OP_0 (separate opcode), so any OP_PUSHDATA with empty is non-minimal *)
+          true
+        else if dlen = 1 then begin
+          let byte = Cstruct.get_uint8 data 0 in
+          if byte >= 1 && byte <= 16 then true  (* Should use OP_1..OP_16 *)
+          else if byte = 0x81 then true  (* Should use OP_1NEGATE *)
+          else false
+        end
+        else false
+      in
+      let not_minimal = not_minimal ||
+        (dlen <= 75 && (opbyte = 0x4c || opbyte = 0x4d || opbyte = 0x4e)) ||
+        (dlen <= 255 && (opbyte = 0x4d || opbyte = 0x4e)) ||
+        (dlen <= 65535 && opbyte = 0x4e)
+      in
+      if not_minimal then
+        Error "Non-minimal push"
+      else
+        stack_push st data
+    end else
       stack_push st data
 
   | OP_1NEGATE ->
@@ -1672,6 +1723,13 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
           (* Tapscript OP_CHECKSIG: Schnorr verification *)
           if Cstruct.length pubkey = 0 then
             Error "Empty pubkey in tapscript OP_CHECKSIG"
+          else if Cstruct.length pubkey <> 32 then begin
+            (* Unknown pubkey type: treat as success unless discouraged *)
+            if st.flags land script_verify_discourage_upgradable_pubkeytype <> 0 then
+              Error "Discouraged unknown public key type in tapscript"
+            else
+              stack_push st (bool_to_stack true)
+          end
           else if Cstruct.length sig_bytes = 0 then begin
             (* Empty signature: push false, no sigops budget cost *)
             stack_push st (bool_to_stack false)
@@ -1735,15 +1793,22 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                     compute_subscript_from_pos script_code (st.codesep_pos + 1)
                   else script_code
                 in
-                let sighash = match st.sig_version with
+                let checksig_result = match st.sig_version with
                   | SigVersionBase ->
-                    let cleaned = find_and_delete effective_script_code sig_bytes in
-                    compute_sighash_legacy st.tx st.input_index cleaned hash_type
+                    let (cleaned, removed) = find_and_delete effective_script_code sig_bytes in
+                    if removed && st.flags land script_verify_const_scriptcode <> 0 then
+                      Error "CONST_SCRIPTCODE: find_and_delete modified scriptCode"
+                    else
+                      let sighash = compute_sighash_legacy st.tx st.input_index cleaned hash_type in
+                      Ok sighash
                   | SigVersionWitnessV0 ->
-                    compute_sighash_segwit st.tx st.input_index effective_script_code st.amount hash_type
+                    Ok (compute_sighash_segwit st.tx st.input_index effective_script_code st.amount hash_type)
                   | SigVersionTaproot | SigVersionTapscript ->
-                    compute_sighash_segwit st.tx st.input_index effective_script_code st.amount hash_type
+                    Ok (compute_sighash_segwit st.tx st.input_index effective_script_code st.amount hash_type)
                 in
+                match checksig_result with
+                | Error e -> Error e
+                | Ok sighash ->
                 let valid = Crypto.verify pubkey sighash sig_der in
                 if (not valid) && Cstruct.length sig_bytes > 0 &&
                    (st.flags land script_verify_nullfail <> 0) then
@@ -1768,6 +1833,13 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
           (* Tapscript OP_CHECKSIGVERIFY: Schnorr verification *)
           if Cstruct.length pubkey = 0 then
             Error "Empty pubkey in tapscript OP_CHECKSIGVERIFY"
+          else if Cstruct.length pubkey <> 32 then begin
+            (* Unknown pubkey type: treat as success unless discouraged *)
+            if st.flags land script_verify_discourage_upgradable_pubkeytype <> 0 then
+              Error "Discouraged unknown public key type in tapscript"
+            else
+              Ok ()
+          end
           else if Cstruct.length sig_bytes = 0 then
             Error "OP_CHECKSIGVERIFY failed (empty sig in tapscript)"
           else begin
@@ -1826,15 +1898,22 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                     compute_subscript_from_pos script_code (st.codesep_pos + 1)
                   else script_code
                 in
-                let sighash = match st.sig_version with
+                let checksig_result = match st.sig_version with
                   | SigVersionBase ->
-                    let cleaned = find_and_delete effective_script_code sig_bytes in
-                    compute_sighash_legacy st.tx st.input_index cleaned hash_type
+                    let (cleaned, removed) = find_and_delete effective_script_code sig_bytes in
+                    if removed && st.flags land script_verify_const_scriptcode <> 0 then
+                      Error "CONST_SCRIPTCODE: find_and_delete modified scriptCode"
+                    else
+                      let sighash = compute_sighash_legacy st.tx st.input_index cleaned hash_type in
+                      Ok sighash
                   | SigVersionWitnessV0 ->
-                    compute_sighash_segwit st.tx st.input_index effective_script_code st.amount hash_type
+                    Ok (compute_sighash_segwit st.tx st.input_index effective_script_code st.amount hash_type)
                   | SigVersionTaproot | SigVersionTapscript ->
-                    compute_sighash_segwit st.tx st.input_index effective_script_code st.amount hash_type
+                    Ok (compute_sighash_segwit st.tx st.input_index effective_script_code st.amount hash_type)
                 in
+                match checksig_result with
+                | Error e -> Error e
+                | Ok sighash ->
                 let valid = Crypto.verify pubkey sighash sig_der in
                 if valid then Ok ()
                 else if Cstruct.length sig_bytes > 0 &&
@@ -1935,10 +2014,18 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                         else script_code
                       in
                       (* Pre-clean scriptCode by removing ALL signatures (FindAndDelete) *)
+                      let any_removed = ref false in
                       let cleaned_script = List.fold_left (fun sc sig_bytes ->
-                        if Cstruct.length sig_bytes > 0 then find_and_delete sc sig_bytes
-                        else sc
+                        if Cstruct.length sig_bytes > 0 then begin
+                          let (result, removed) = find_and_delete sc sig_bytes in
+                          if removed then any_removed := true;
+                          result
+                        end else sc
                       ) effective_script_code sigs in
+                      if !any_removed && st.sig_version = SigVersionBase &&
+                         st.flags land script_verify_const_scriptcode <> 0 then
+                        Error "CONST_SCRIPTCODE: find_and_delete modified scriptCode"
+                      else
                       (* Verify signatures in order *)
                       let rec verify_sigs sigs pubkeys success =
                         match sigs with
@@ -2089,6 +2176,15 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
           | Ok sig_bytes ->
             if Cstruct.length pubkey = 0 then
               Error "Empty pubkey in tapscript OP_CHECKSIGADD"
+            else if Cstruct.length pubkey <> 32 then begin
+              (* Unknown pubkey type: treat as success unless discouraged *)
+              if st.flags land script_verify_discourage_upgradable_pubkeytype <> 0 then
+                Error "Discouraged unknown public key type in tapscript"
+              else begin
+                let n = script_num_of_bytes n_bytes in
+                stack_push st (bytes_of_script_num (Int64.add n 1L))
+              end
+            end
             else begin
               let n = script_num_of_bytes n_bytes in
               if Cstruct.length sig_bytes = 0 then
@@ -2131,7 +2227,9 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
   (* NOP operations *)
   | OP_NOP1 | OP_NOP4 | OP_NOP5 | OP_NOP6 | OP_NOP7
   | OP_NOP8 | OP_NOP9 | OP_NOP10 ->
-    Ok ()
+    if st.flags land script_verify_discourage_upgradable_nops <> 0 then
+      Error "Upgradable NOP used"
+    else Ok ()
 
   (* Reserved/Invalid *)
   | OP_RESERVED | OP_VER | OP_RESERVED1 | OP_RESERVED2 ->
@@ -2236,9 +2334,8 @@ let eval_script (st : eval_state) (script : Cstruct.t) : (unit, string) result =
    ============================================================================ *)
 
 (* Check that all witness items are within the maximum element size limit *)
-let check_witness_item_sizes ~sig_version (witness : Types.tx_witness) : (unit, string) result =
-  if sig_version = SigVersionTapscript then Ok ()
-  else if List.exists (fun item -> Cstruct.length item > max_script_element_size) witness.items then
+let check_witness_item_sizes ~sig_version:_ (witness : Types.tx_witness) : (unit, string) result =
+  if List.exists (fun item -> Cstruct.length item > max_script_element_size) witness.items then
     Error "Witness item exceeds maximum element size"
   else Ok ()
 
@@ -2278,6 +2375,8 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
       (* Native segwit: scriptSig must be empty *)
       if Cstruct.length script_sig > 0 then
         Error "scriptSig must be empty for witness program"
+      else if flags land script_verify_discourage_upgradable_witness <> 0 then
+        Error "Upgradable witness program used"
       else
         Ok true  (* Unconditional success for unknown witness versions *)
     end else begin
@@ -2338,11 +2437,11 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
         end
       end
     else begin
-      (* BIP-16: P2SH requires scriptSig to be push-only *)
+      (* BIP-16: P2SH requires scriptSig to be push-only and exactly one push *)
       let p2sh_pushonly_ok =
         try
           let sig_ops = parse_script script_sig in
-          List.for_all is_push_opcode sig_ops
+          List.for_all is_push_opcode sig_ops && List.length sig_ops = 1
         with _ -> false
       in
       if not p2sh_pushonly_ok then
@@ -2678,8 +2777,12 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                   Error "Taproot commitment verification failed"
                 else begin
                   (* LEAF VERSION GATING: only execute leaf version 0xC0 *)
-                  if leaf_version <> 0xC0 then
-                    Ok true  (* Unknown leaf version: succeed unconditionally *)
+                  if leaf_version <> 0xC0 then begin
+                    if flags land script_verify_discourage_upgradable_taproot_version <> 0 then
+                      Error "Discouraged unknown taproot leaf version"
+                    else
+                      Ok true  (* Unknown leaf version: succeed unconditionally *)
+                  end
                   else begin
                     (* OP_SUCCESSx pre-scan *)
                     let has_op_success_flag = ref false in
@@ -2711,8 +2814,12 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                       end
                     done;
 
-                    if !has_op_success_flag then
-                      Ok true  (* OP_SUCCESS makes script unconditionally succeed *)
+                    if !has_op_success_flag then begin
+                      if flags land script_verify_discourage_op_success <> 0 then
+                        Error "Discouraged OP_SUCCESS opcode in tapscript"
+                      else
+                        Ok true  (* OP_SUCCESS makes script unconditionally succeed *)
+                    end
                     else begin
                       (* Compute serialized witness size for sigops budget *)
                       let compact_size_len n =

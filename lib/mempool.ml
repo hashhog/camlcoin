@@ -77,6 +77,12 @@ let max_descendant_size = 101_000
 let max_rbf_evictions = 100
 let max_standard_tx_weight = 400_000
 
+(* TRUC/v3 transaction policy (BIP-431) *)
+let truc_version = 3l
+let truc_max_vsize = 10_000   (* max virtual size for v3 child transactions *)
+let truc_ancestor_limit = 2   (* max unconfirmed ancestors including self *)
+let truc_descendant_limit = 2 (* max unconfirmed descendants including self *)
+
 (* ============================================================================
    Mempool Creation
    ============================================================================ *)
@@ -293,7 +299,7 @@ let is_push_only_script_sig (script_sig : Cstruct.t) : bool =
         | Script.OP_5 | Script.OP_6 | Script.OP_7 | Script.OP_8
         | Script.OP_9 | Script.OP_10 | Script.OP_11 | Script.OP_12
         | Script.OP_13 | Script.OP_14 | Script.OP_15 | Script.OP_16 -> true
-        | Script.OP_PUSHDATA _ -> true
+        | Script.OP_PUSHDATA (_, _) -> true
         | _ -> false
       ) ops
     with _ -> false
@@ -386,7 +392,7 @@ let check_p2wsh_witness_limits (tx : Types.transaction) : (unit, string) result 
 let is_standard_tx (min_relay_fee : int64) (tx : Types.transaction) : (unit, string) result =
   (* Version must be 1 or 2 *)
   let version = Int32.to_int tx.version in
-  if version < 1 || version > 2 then
+  if version < 1 || version > 3 then
     Error "Non-standard transaction version"
   else begin
     (* Weight must not exceed 400,000 *)
@@ -401,7 +407,8 @@ let is_standard_tx (min_relay_fee : int64) (tx : Types.transaction) : (unit, str
           if not (is_standard_output out.Types.script_pubkey) then
             bad_output := Some (Printf.sprintf
               "Non-standard output script at index %d" i)
-          else if is_dust min_relay_fee out then
+          else if is_dust min_relay_fee out &&
+                  not (tx.version = 3l && out.Types.value = 0L) then
             bad_output := Some (Printf.sprintf
               "Dust output at index %d (value: %Ld)" i out.Types.value)
         end
@@ -495,6 +502,75 @@ let check_ancestor_descendant_limits (mp : mempool) (depends : Types.hash256 lis
       else
         Ok ()
     end
+  end
+
+(* ============================================================================
+   TRUC/v3 Transaction Policy (BIP-431)
+   ============================================================================ *)
+
+(* Check TRUC/v3 policy constraints for a transaction *)
+let check_truc_policy (mp : mempool) (tx : Types.transaction)
+    (depends : Types.hash256 list) (weight : int) : (unit, string) result =
+  let is_v3 = tx.version = truc_version in
+  if is_v3 then begin
+    let has_unconfirmed_parents = depends <> [] in
+    (* For child transactions (those with unconfirmed parents), enforce vsize limit *)
+    if has_unconfirmed_parents then begin
+      let vsize = (weight + 3) / 4 in
+      if vsize > truc_max_vsize then
+        Error (Printf.sprintf
+          "TRUC/v3 child transaction vsize %d exceeds limit %d"
+          vsize truc_max_vsize)
+      else
+        (* Check ancestor count (including self) *)
+        let all_ancestors = Hashtbl.create 16 in
+        List.iter (fun parent_txid ->
+          let parent_key = Cstruct.to_string parent_txid in
+          if not (Hashtbl.mem all_ancestors parent_key) then begin
+            Hashtbl.replace all_ancestors parent_key ();
+            let ancestors = get_ancestors mp parent_txid in
+            List.iter (fun a ->
+              Hashtbl.replace all_ancestors (Cstruct.to_string a.txid) ()
+            ) ancestors
+          end
+        ) depends;
+        let ancestor_count = Hashtbl.length all_ancestors + 1 in
+        if ancestor_count > truc_ancestor_limit then
+          Error (Printf.sprintf
+            "TRUC/v3 transaction exceeds ancestor limit (%d > %d)"
+            ancestor_count truc_ancestor_limit)
+        else
+          (* Check that no v3 parent already has an unconfirmed child (1 child limit) *)
+          let parent_has_child = List.exists (fun parent_txid ->
+            match Hashtbl.find_opt mp.entries (Cstruct.to_string parent_txid) with
+            | None -> false
+            | Some parent_entry ->
+              if parent_entry.tx.version = truc_version then begin
+                (* Check if parent already has a child in mempool *)
+                Hashtbl.fold (fun _ entry found ->
+                  found || (List.exists (fun d ->
+                    Cstruct.equal d parent_txid) entry.depends_on)
+                ) mp.entries false
+              end else
+                false
+          ) depends in
+          if parent_has_child then
+            Error "TRUC/v3 parent already has an unconfirmed child"
+          else
+            Ok ()
+    end else
+      Ok ()
+  end else begin
+    (* Non-v3 transaction: reject if it spends unconfirmed v3 outputs *)
+    let spends_v3 = List.exists (fun parent_txid ->
+      match Hashtbl.find_opt mp.entries (Cstruct.to_string parent_txid) with
+      | None -> false
+      | Some parent_entry -> parent_entry.tx.version = truc_version
+    ) depends in
+    if spends_v3 then
+      Error "Non-v3 transaction cannot spend unconfirmed v3 outputs"
+    else
+      Ok ()
   end
 
 (* ============================================================================
@@ -695,6 +771,11 @@ let add_transaction (mp : mempool) (tx : Types.transaction)
 
             (* Task 3 + Gap 6: Ancestor/descendant limits (count + size) *)
             else match check_ancestor_descendant_limits mp !depends txid weight with
+            | Error e -> Error e
+            | Ok () ->
+
+            (* TRUC/v3 policy (BIP-431) *)
+            match check_truc_policy mp tx !depends weight with
             | Error e -> Error e
             | Ok () ->
 
@@ -1068,3 +1149,88 @@ let clear (mp : mempool) : unit =
   Hashtbl.clear mp.entries;
   mp.total_weight <- 0;
   mp.total_fee <- 0L
+
+(* ============================================================================
+   Mempool Persistence (Gap 5)
+   ============================================================================ *)
+
+(* Save mempool to a binary file (atomic via temp file + rename) *)
+let save_mempool (mp : mempool) (path : string) : unit =
+  let tmp = path ^ ".tmp" in
+  let oc = open_out_bin tmp in
+  Fun.protect ~finally:(fun () -> close_out_noerr oc) (fun () ->
+    (* Write 4-byte BE count *)
+    let count = Hashtbl.length mp.entries in
+    let buf4 = Cstruct.create 4 in
+    Cstruct.BE.set_uint32 buf4 0 (Int32.of_int count);
+    output_string oc (Cstruct.to_string buf4);
+    (* Write each entry *)
+    Hashtbl.iter (fun _k entry ->
+      (* txid: 32 bytes *)
+      output_string oc (Cstruct.to_string entry.txid);
+      (* fee: 8 bytes BE *)
+      let buf8 = Cstruct.create 8 in
+      Cstruct.BE.set_uint64 buf8 0 entry.fee;
+      output_string oc (Cstruct.to_string buf8);
+      (* time_added: 8 bytes BE (Int64.bits_of_float) *)
+      let buf8t = Cstruct.create 8 in
+      Cstruct.BE.set_uint64 buf8t 0 (Int64.bits_of_float entry.time_added);
+      output_string oc (Cstruct.to_string buf8t);
+      (* tx_data: serialize transaction *)
+      let w = Serialize.writer_create () in
+      Serialize.serialize_transaction w entry.tx;
+      let tx_cs = Serialize.writer_to_cstruct w in
+      let tx_data = Cstruct.to_string tx_cs in
+      (* tx_data_len: 4 bytes BE *)
+      let buf4l = Cstruct.create 4 in
+      Cstruct.BE.set_uint32 buf4l 0 (Int32.of_int (String.length tx_data));
+      output_string oc (Cstruct.to_string buf4l);
+      (* tx_data: raw bytes *)
+      output_string oc tx_data
+    ) mp.entries
+  );
+  Sys.rename tmp path
+
+(* Load mempool from a binary file, returns count of loaded transactions *)
+let load_mempool (mp : mempool) (path : string) : int =
+  if not (Sys.file_exists path) then 0
+  else
+    let loaded = ref 0 in
+    (try
+      let ic = open_in_bin path in
+      Fun.protect ~finally:(fun () -> close_in_noerr ic) (fun () ->
+        (* Read 4-byte BE count *)
+        let hdr = Bytes.create 4 in
+        really_input ic hdr 0 4;
+        let hdr_cs = Cstruct.of_bytes hdr in
+        let count = Int32.to_int (Cstruct.BE.get_uint32 hdr_cs 0) in
+        for _i = 1 to count do
+          (* txid: 32 bytes *)
+          let txid_buf = Bytes.create 32 in
+          really_input ic txid_buf 0 32;
+          ignore (Cstruct.of_bytes txid_buf);  (* txid — used only for verification *)
+          (* fee: 8 bytes BE *)
+          let fee_buf = Bytes.create 8 in
+          really_input ic fee_buf 0 8;
+          ignore (Cstruct.BE.get_uint64 (Cstruct.of_bytes fee_buf) 0);  (* fee — recomputed by add_transaction *)
+          (* time_added: 8 bytes BE *)
+          let time_buf = Bytes.create 8 in
+          really_input ic time_buf 0 8;
+          ignore (Int64.float_of_bits (Cstruct.BE.get_uint64 (Cstruct.of_bytes time_buf) 0));  (* time_added — recomputed *)
+          (* tx_data_len: 4 bytes BE *)
+          let len_buf = Bytes.create 4 in
+          really_input ic len_buf 0 4;
+          let tx_data_len = Int32.to_int (Cstruct.BE.get_uint32 (Cstruct.of_bytes len_buf) 0) in
+          (* tx_data: raw bytes *)
+          let tx_buf = Bytes.create tx_data_len in
+          really_input ic tx_buf 0 tx_data_len;
+          let tx_cs = Cstruct.of_bytes tx_buf in
+          let r = Serialize.reader_of_cstruct tx_cs in
+          let tx = Serialize.deserialize_transaction r in
+          match add_transaction mp tx with
+          | Ok _ -> incr loaded
+          | Error _ -> ()  (* skip silently *)
+        done
+      )
+    with _ -> ());  (* handle corrupt files gracefully *)
+    !loaded

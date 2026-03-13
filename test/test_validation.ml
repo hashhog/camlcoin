@@ -189,18 +189,18 @@ let test_check_coinbase_valid () =
     ~outputs:[make_output ~value:(Consensus.block_subsidy 500) ()]
     ()
   in
-  match Validation.check_coinbase cb 500 with
+  match Validation.check_coinbase ~network:Consensus.regtest cb 500 with
   | Ok () -> ()
   | Error e -> Alcotest.fail (Validation.tx_error_to_string e)
 
 let test_check_coinbase_wrong_height () =
   let cb = make_tx
-    ~inputs:[make_coinbase_input ~height:100]
-    ~outputs:[make_output ~value:(Consensus.block_subsidy 100) ()]
+    ~inputs:[make_coinbase_input ~height:500]
+    ~outputs:[make_output ~value:(Consensus.block_subsidy 500) ()]
     ()
   in
-  (* Check against different height *)
-  match Validation.check_coinbase cb 200 with
+  (* Check against different height (both >= bip34_height=500 for regtest) *)
+  match Validation.check_coinbase ~network:Consensus.regtest cb 600 with
   | Error Validation.TxBadCoinbase -> ()
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.tx_error_to_string e)
   | Ok () -> Alcotest.fail "Should have failed with TxBadCoinbase"
@@ -213,7 +213,7 @@ let test_check_coinbase_multiple_inputs () =
     ~outputs:[make_output ~value:1000L ()]
     ()
   in
-  match Validation.check_coinbase cb 100 with
+  match Validation.check_coinbase ~network:Consensus.regtest cb 100 with
   | Error Validation.TxBadCoinbase -> ()
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.tx_error_to_string e)
   | Ok () -> Alcotest.fail "Should have failed with TxBadCoinbase"
@@ -229,7 +229,7 @@ let test_check_coinbase_script_too_short () =
     ~outputs:[make_output ~value:1000L ()]
     ()
   in
-  match Validation.check_coinbase cb 100 with
+  match Validation.check_coinbase ~network:Consensus.regtest cb 100 with
   | Error Validation.TxBadCoinbase -> ()
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.tx_error_to_string e)
   | Ok () -> Alcotest.fail "Should have failed with TxBadCoinbase"
@@ -335,7 +335,7 @@ let test_check_block_empty () =
     Types.header = make_header ();
     transactions = [];
   } in
-  match Validation.check_block block 0 ~expected_bits:0x207fffffl ~median_time:0l with
+  match Validation.check_block ~network:Consensus.regtest block 0 ~expected_bits:0x207fffffl ~median_time:0l with
   | Error Validation.BlockEmptyTransactions -> ()
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
   | Ok () -> Alcotest.fail "Should have failed with BlockEmptyTransactions"
@@ -352,7 +352,7 @@ let test_check_block_no_coinbase () =
     Types.header = make_header ();
     transactions = [regular_tx];
   } in
-  match Validation.check_block block 0 ~expected_bits:0x207fffffl ~median_time:0l with
+  match Validation.check_block ~network:Consensus.regtest block 0 ~expected_bits:0x207fffffl ~median_time:0l with
   | Error Validation.BlockNoCoinbase -> ()
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
   | Ok () -> Alcotest.fail "Should have failed with BlockNoCoinbase"
@@ -368,7 +368,7 @@ let test_check_block_bad_difficulty () =
   let header = make_header ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:100l () in
   let block = { Types.header; transactions = [coinbase] } in
   (* Expected bits don't match *)
-  match Validation.check_block block 0 ~expected_bits:0x1d00ffffl ~median_time:0l with
+  match Validation.check_block ~network:Consensus.regtest block 0 ~expected_bits:0x1d00ffffl ~median_time:0l with
   | Error Validation.BlockBadDifficulty -> ()
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
   | Ok () -> Alcotest.fail "Should have failed with BlockBadDifficulty"
@@ -382,7 +382,7 @@ let test_check_block_bad_merkle () =
   let wrong_merkle = Types.zero_hash in
   let header = make_header ~merkle_root:wrong_merkle ~bits:0x207fffffl ~timestamp:100l () in
   let block = { Types.header; transactions = [coinbase] } in
-  match Validation.check_block block 0 ~expected_bits:0x207fffffl ~median_time:0l with
+  match Validation.check_block ~network:Consensus.regtest block 0 ~expected_bits:0x207fffffl ~median_time:0l with
   | Error Validation.BlockBadMerkleRoot -> ()
   | Error Validation.BlockBadDifficulty -> ()  (* May fail difficulty first *)
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
@@ -399,7 +399,7 @@ let test_check_block_bad_timestamp () =
   (* Timestamp <= median_time should fail *)
   let header = make_header ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:50l () in
   let block = { Types.header; transactions = [coinbase] } in
-  match Validation.check_block block 100 ~expected_bits:0x207fffffl ~median_time:100l with
+  match Validation.check_block ~network:Consensus.regtest block 100 ~expected_bits:0x207fffffl ~median_time:100l with
   | Error Validation.BlockBadTimestamp -> ()
   | Error Validation.BlockBadDifficulty -> ()  (* May fail PoW check *)
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
@@ -422,7 +422,7 @@ let test_check_block_duplicate_tx () =
     Types.header = make_header ~timestamp:200l ();
     transactions = [coinbase; regular_tx; regular_tx];  (* Duplicate *)
   } in
-  match Validation.check_block block 100 ~expected_bits:0x207fffffl ~median_time:0l with
+  match Validation.check_block ~network:Consensus.regtest block 100 ~expected_bits:0x207fffffl ~median_time:0l with
   | Error Validation.BlockDuplicateTx -> ()
   | Error Validation.BlockBadMerkleRoot -> ()  (* May fail merkle first *)
   | Error Validation.BlockBadDifficulty -> ()  (* May fail PoW first *)
@@ -465,11 +465,121 @@ let test_block_error_strings () =
     Validation.BlockBadCoinbaseValue (100L, 50L);
     Validation.BlockDuplicateTx;
     Validation.BlockTxValidationFailed (0, Validation.TxEmptyInputs);
+    Validation.BlockBadVersion;
+    Validation.BlockMutatedMerkle;
   ] in
   List.iter (fun e ->
     let s = Validation.block_error_to_string e in
     Alcotest.(check bool) "error string not empty" true (String.length s > 0)
   ) errors
+
+(* ============================================================================
+   BIP-34 Conditional Enforcement Tests (Bug 1)
+   ============================================================================ *)
+
+let test_bip34_not_enforced_before_activation () =
+  (* Before bip34_height (regtest=500), height encoding is not checked *)
+  let cb = make_tx
+    ~inputs:[make_coinbase_input ~height:100]
+    ~outputs:[make_output ~value:(Consensus.block_subsidy 100) ()]
+    ()
+  in
+  (* Pass height=200 with coinbase encoded for height=100 -- should pass
+     because 200 < regtest bip34_height=500 *)
+  match Validation.check_coinbase ~network:Consensus.regtest cb 200 with
+  | Ok () -> ()
+  | Error e -> Alcotest.fail ("Should not enforce BIP34 before activation: " ^
+                              Validation.tx_error_to_string e)
+
+let test_bip34_enforced_after_activation () =
+  (* After bip34_height, height encoding IS checked *)
+  let cb = make_tx
+    ~inputs:[make_coinbase_input ~height:500]
+    ~outputs:[make_output ~value:(Consensus.block_subsidy 500) ()]
+    ()
+  in
+  (* Pass height=600 with coinbase encoded for height=500 -- should fail *)
+  match Validation.check_coinbase ~network:Consensus.regtest cb 600 with
+  | Error Validation.TxBadCoinbase -> ()
+  | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.tx_error_to_string e)
+  | Ok () -> Alcotest.fail "Should enforce BIP34 after activation height"
+
+(* ============================================================================
+   Block Version Enforcement Tests (Bug 5)
+   ============================================================================ *)
+
+let test_block_version_too_low_bip34 () =
+  (* At regtest bip34_height=500, version must be >= 2 *)
+  let coinbase = make_tx
+    ~inputs:[make_coinbase_input ~height:500]
+    ~outputs:[make_output ~value:(Consensus.block_subsidy 500) ()]
+    ()
+  in
+  let txid = Crypto.compute_txid coinbase in
+  let (merkle, _) = Crypto.merkle_root [txid] in
+  let header = make_header ~version:1l ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:100l () in
+  let block = { Types.header; transactions = [coinbase] } in
+  match Validation.check_block ~network:Consensus.regtest block 500
+          ~expected_bits:0x207fffffl ~median_time:0l with
+  | Error Validation.BlockBadVersion -> ()
+  | Error Validation.BlockBadDifficulty -> ()  (* May fail PoW first *)
+  | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have rejected version 1 block after BIP34"
+
+let test_block_version_ok_before_bip34 () =
+  (* Before bip34_height, version 1 is fine *)
+  let coinbase = make_tx
+    ~inputs:[make_coinbase_input ~height:100]
+    ~outputs:[make_output ~value:(Consensus.block_subsidy 100) ()]
+    ()
+  in
+  let txid = Crypto.compute_txid coinbase in
+  let (merkle, _) = Crypto.merkle_root [txid] in
+  let header = make_header ~version:1l ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:100l () in
+  let block = { Types.header; transactions = [coinbase] } in
+  match Validation.check_block ~network:Consensus.regtest block 100
+          ~expected_bits:0x207fffffl ~median_time:0l with
+  | Error Validation.BlockBadVersion ->
+    Alcotest.fail "Should NOT reject version 1 block before BIP34 activation"
+  | Error Validation.BlockBadDifficulty -> ()  (* Expected: PoW check may fail *)
+  | Error _ -> ()  (* Other errors are acceptable *)
+  | Ok () -> ()
+
+let test_block_version_too_low_bip66 () =
+  (* At regtest bip66_height=1251, version must be >= 3 *)
+  let coinbase = make_tx
+    ~inputs:[make_coinbase_input ~height:1251]
+    ~outputs:[make_output ~value:(Consensus.block_subsidy 1251) ()]
+    ()
+  in
+  let txid = Crypto.compute_txid coinbase in
+  let (merkle, _) = Crypto.merkle_root [txid] in
+  let header = make_header ~version:2l ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:100l () in
+  let block = { Types.header; transactions = [coinbase] } in
+  match Validation.check_block ~network:Consensus.regtest block 1251
+          ~expected_bits:0x207fffffl ~median_time:0l with
+  | Error Validation.BlockBadVersion -> ()
+  | Error Validation.BlockBadDifficulty -> ()
+  | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have rejected version 2 block after BIP66"
+
+let test_block_version_too_low_bip65 () =
+  (* At regtest bip65_height=1351, version must be >= 4 *)
+  let coinbase = make_tx
+    ~inputs:[make_coinbase_input ~height:1351]
+    ~outputs:[make_output ~value:(Consensus.block_subsidy 1351) ()]
+    ()
+  in
+  let txid = Crypto.compute_txid coinbase in
+  let (merkle, _) = Crypto.merkle_root [txid] in
+  let header = make_header ~version:3l ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:100l () in
+  let block = { Types.header; transactions = [coinbase] } in
+  match Validation.check_block ~network:Consensus.regtest block 1351
+          ~expected_bits:0x207fffffl ~median_time:0l with
+  | Error Validation.BlockBadVersion -> ()
+  | Error Validation.BlockBadDifficulty -> ()
+  | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have rejected version 3 block after BIP65"
 
 (* ============================================================================
    Test Registration
@@ -522,5 +632,15 @@ let () =
     "error_strings", [
       test_case "tx error strings" `Quick test_tx_error_strings;
       test_case "block error strings" `Quick test_block_error_strings;
+    ];
+    "bip34_conditional", [
+      test_case "not enforced before activation" `Quick test_bip34_not_enforced_before_activation;
+      test_case "enforced after activation" `Quick test_bip34_enforced_after_activation;
+    ];
+    "block_version", [
+      test_case "version too low at bip34" `Quick test_block_version_too_low_bip34;
+      test_case "version ok before bip34" `Quick test_block_version_ok_before_bip34;
+      test_case "version too low at bip66" `Quick test_block_version_too_low_bip66;
+      test_case "version too low at bip65" `Quick test_block_version_too_low_bip65;
     ];
   ]

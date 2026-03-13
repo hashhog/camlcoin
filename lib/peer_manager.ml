@@ -771,6 +771,64 @@ let get_addr_stats (pm : t) : addr_stats =
     connected = connected_count;
   }
 
+(* Ban persistence key prefix — must not collide with Storage prefixes *)
+let ban_prefix = "B"
+
+(* Save currently active bans to the database.
+   Each ban is stored with key "B<addr>" and value = 8-byte BE float
+   (Int64.bits_of_float banned_until). *)
+let save_bans (pm : t) (db : Storage.ChainDB.t) : unit =
+  let now = Unix.gettimeofday () in
+  (* First, remove stale ban entries from the DB *)
+  Storage.LogStorage.iter_prefix db.db ban_prefix (fun key _value ->
+    let addr = String.sub key 1 (String.length key - 1) in
+    match Hashtbl.find_opt pm.known_addrs addr with
+    | Some info when info.banned_until > now -> ()  (* still active, will overwrite *)
+    | _ -> Storage.LogStorage.delete db.db key
+  );
+  (* Write all active bans *)
+  Hashtbl.iter (fun addr info ->
+    if info.banned_until > now then begin
+      let key = ban_prefix ^ addr in
+      let cs = Cstruct.create 8 in
+      Cstruct.BE.set_uint64 cs 0 (Int64.bits_of_float info.banned_until);
+      Storage.LogStorage.put db.db key (Cstruct.to_string cs)
+    end
+  ) pm.known_addrs
+
+(* Load persisted bans from the database.
+   Returns the number of bans that are still active and were loaded. *)
+let load_bans (pm : t) (db : Storage.ChainDB.t) : int =
+  let now = Unix.gettimeofday () in
+  let count = ref 0 in
+  Storage.LogStorage.iter_prefix db.db ban_prefix (fun key value ->
+    if String.length value >= 8 then begin
+      let addr = String.sub key 1 (String.length key - 1) in
+      let cs = Cstruct.of_string value in
+      let banned_until = Int64.float_of_bits (Cstruct.BE.get_uint64 cs 0) in
+      if banned_until > now then begin
+        (match Hashtbl.find_opt pm.known_addrs addr with
+         | Some info ->
+           Hashtbl.replace pm.known_addrs addr
+             { info with banned_until }
+         | None ->
+           Hashtbl.replace pm.known_addrs addr
+             { address = addr;
+               port = 0;
+               services = 0L;
+               last_connected = 0.0;
+               last_attempt = 0.0;
+               failures = 0;
+               banned_until;
+               source = Addr });
+        incr count
+      end else
+        (* Expired ban — clean up from DB *)
+        Storage.LogStorage.delete db.db key
+    end
+  );
+  !count
+
 (* Find peer by address *)
 let find_peer_by_addr (pm : t) (addr : string) : Peer.peer option =
   List.find_opt (fun p -> p.Peer.addr = addr) pm.peers

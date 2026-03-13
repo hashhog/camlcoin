@@ -181,8 +181,13 @@ let test_classify_op_return () =
 let eval_simple_script script =
   let tx = make_test_tx () in
   let st = Script.create_eval_state ~tx ~input_index:0 ~amount:0L ~flags:0
-             ~sig_version:Script.SigVersionBase in
-  Script.eval_script st (hex_to_cstruct script)
+             ~sig_version:Script.SigVersionBase () in
+  match Script.eval_script st (hex_to_cstruct script) with
+  | Error e -> Error e
+  | Ok () ->
+    match st.stack with
+    | [] -> Ok false
+    | top :: _ -> Ok (Script.is_true top)
 
 let test_eval_op_1 () =
   match eval_simple_script "51" with (* OP_1 *)
@@ -323,11 +328,11 @@ let test_eval_hash160 () =
   (* Push "hello", then OP_HASH160 *)
   let tx = make_test_tx () in
   let st = Script.create_eval_state ~tx ~input_index:0 ~amount:0L ~flags:0
-             ~sig_version:Script.SigVersionBase in
+             ~sig_version:Script.SigVersionBase () in
   (* 0568656c6c6f = push 5 bytes "hello" *)
   let script = hex_to_cstruct "0568656c6c6fa9" in
   match Script.eval_script st script with
-  | Ok true ->
+  | Ok () ->
     (* Check the hash on the stack *)
     begin match st.stack with
     | [hash] ->
@@ -336,24 +341,22 @@ let test_eval_hash160 () =
       Alcotest.(check string) "hash160 result" expected (cstruct_to_hex hash)
     | _ -> Alcotest.fail "Expected single element on stack"
     end
-  | Ok false -> Alcotest.fail "Expected truthy result"
   | Error e -> Alcotest.fail e
 
 let test_eval_sha256 () =
   (* Push "hello", then OP_SHA256 *)
   let tx = make_test_tx () in
   let st = Script.create_eval_state ~tx ~input_index:0 ~amount:0L ~flags:0
-             ~sig_version:Script.SigVersionBase in
+             ~sig_version:Script.SigVersionBase () in
   let script = hex_to_cstruct "0568656c6c6fa8" in
   match Script.eval_script st script with
-  | Ok true ->
+  | Ok () ->
     begin match st.stack with
     | [hash] ->
       let expected = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" in
       Alcotest.(check string) "sha256 result" expected (cstruct_to_hex hash)
     | _ -> Alcotest.fail "Expected single element on stack"
     end
-  | Ok false -> Alcotest.fail "Expected truthy result"
   | Error e -> Alcotest.fail e
 
 (* ============================================================================
@@ -404,41 +407,38 @@ let test_eval_2dup () =
   (* Just verify we get a truthy result (top element is 2) *)
   let tx = make_test_tx () in
   let st = Script.create_eval_state ~tx ~input_index:0 ~amount:0L ~flags:0
-             ~sig_version:Script.SigVersionBase in
+             ~sig_version:Script.SigVersionBase () in
   let script = hex_to_cstruct "51526e" in (* OP_1 OP_2 OP_2DUP *)
   match Script.eval_script st script with
-  | Ok true ->
+  | Ok () ->
     Alcotest.(check int) "stack size after 2dup" 4 (List.length st.stack)
-  | Ok false -> Alcotest.fail "Expected true"
   | Error e -> Alcotest.fail e
 
 let test_eval_3dup () =
   (* OP_1 OP_2 OP_3 OP_3DUP -> stack has 6 elements *)
   let tx = make_test_tx () in
   let st = Script.create_eval_state ~tx ~input_index:0 ~amount:0L ~flags:0
-             ~sig_version:Script.SigVersionBase in
+             ~sig_version:Script.SigVersionBase () in
   let script = hex_to_cstruct "5152536f" in
   match Script.eval_script st script with
-  | Ok true ->
+  | Ok () ->
     Alcotest.(check int) "stack size" 6 (List.length st.stack)
-  | Ok false -> Alcotest.fail "Expected true"
   | Error e -> Alcotest.fail e
 
 let test_eval_rot () =
   (* OP_1 OP_2 OP_3 OP_ROT -> stack is [1,3,2] with 2 on top *)
   let tx = make_test_tx () in
   let st = Script.create_eval_state ~tx ~input_index:0 ~amount:0L ~flags:0
-             ~sig_version:Script.SigVersionBase in
+             ~sig_version:Script.SigVersionBase () in
   let script = hex_to_cstruct "5152537b" in
   match Script.eval_script st script with
-  | Ok true ->
+  | Ok () ->
     (* Top should be 1 (rot moves third to top) *)
     begin match st.stack with
     | top :: _ ->
       Alcotest.(check int64) "rot result" 1L (Script.script_num_of_bytes top)
     | _ -> Alcotest.fail "Stack empty"
     end
-  | Ok false -> Alcotest.fail "Expected true"
   | Error e -> Alcotest.fail e
 
 let test_eval_pick () =
@@ -446,48 +446,45 @@ let test_eval_pick () =
   (* Stack: [1,2,3], push 2, pick at index 2 -> copies 1 to top *)
   let tx = make_test_tx () in
   let st = Script.create_eval_state ~tx ~input_index:0 ~amount:0L ~flags:0
-             ~sig_version:Script.SigVersionBase in
+             ~sig_version:Script.SigVersionBase () in
   let script = hex_to_cstruct "5152535279" in (* OP_1 OP_2 OP_3 OP_2 OP_PICK *)
   match Script.eval_script st script with
-  | Ok true ->
+  | Ok () ->
     begin match st.stack with
     | top :: _ ->
       Alcotest.(check int64) "pick result" 1L (Script.script_num_of_bytes top)
     | _ -> Alcotest.fail "Stack empty"
     end
-  | Ok false -> Alcotest.fail "Expected true"
   | Error e -> Alcotest.fail e
 
 let test_eval_size () =
   (* Push 5 bytes, OP_SIZE -> should be 5 *)
   let tx = make_test_tx () in
   let st = Script.create_eval_state ~tx ~input_index:0 ~amount:0L ~flags:0
-             ~sig_version:Script.SigVersionBase in
+             ~sig_version:Script.SigVersionBase () in
   let script = hex_to_cstruct "0568656c6c6f82" in
   match Script.eval_script st script with
-  | Ok true ->
+  | Ok () ->
     begin match st.stack with
     | size_elem :: _ ->
       Alcotest.(check int64) "size" 5L (Script.script_num_of_bytes size_elem)
     | _ -> Alcotest.fail "Stack empty"
     end
-  | Ok false -> Alcotest.fail "Expected true"
   | Error e -> Alcotest.fail e
 
 let test_eval_depth () =
   (* OP_1 OP_2 OP_3 OP_DEPTH -> 3 *)
   let tx = make_test_tx () in
   let st = Script.create_eval_state ~tx ~input_index:0 ~amount:0L ~flags:0
-             ~sig_version:Script.SigVersionBase in
+             ~sig_version:Script.SigVersionBase () in
   let script = hex_to_cstruct "51525374" in
   match Script.eval_script st script with
-  | Ok true ->
+  | Ok () ->
     begin match st.stack with
     | depth :: _ ->
       Alcotest.(check int64) "depth" 3L (Script.script_num_of_bytes depth)
     | _ -> Alcotest.fail "Stack empty"
     end
-  | Ok false -> Alcotest.fail "Expected true"
   | Error e -> Alcotest.fail e
 
 (* ============================================================================

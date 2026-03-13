@@ -52,6 +52,10 @@ let mainnet_fallback_peers : (string * int) list = [
   ("seed.bitcoin.jonasschnelli.ch", 8333);
 ]
 
+(* Misbehavior handler callback: peer_id -> score -> reason -> unit Lwt.t
+   Higher-level code (e.g. sync.ml) calls this to report misbehavior. *)
+type misbehavior_handler = int -> int -> string -> unit Lwt.t
+
 (* Peer manager state *)
 type t = {
   network : Consensus.network_config;
@@ -62,6 +66,11 @@ type t = {
   mutable our_height : int32;
   mutable running : bool;
   mutable listeners : (P2p.message_payload -> Peer.peer -> unit Lwt.t) list;
+  mutable listener_fd : Lwt_unix.file_descr option;  (* TCP listen socket *)
+  mutable last_tip_update : float;           (* Timestamp of last chain tip update *)
+  stale_tip_check_interval : float;          (* Default 1800.0 = 30 minutes *)
+  addr_rate : (string, int * float) Hashtbl.t;  (* Per-peer addr rate limiting: (count, window_start) *)
+  mutable listen_addr : string option;           (* Our own listening address, if known *)
 }
 
 (* Create a new peer manager *)
@@ -74,6 +83,11 @@ let create ?(config = default_config) (network : Consensus.network_config) : t =
     our_height = 0l;
     running = false;
     listeners = [];
+    listener_fd = None;
+    last_tip_update = Unix.gettimeofday ();
+    stale_tip_check_interval = 1800.0;
+    addr_rate = Hashtbl.create 256;
+    listen_addr = None;
   }
 
 (* Update our known blockchain height *)
@@ -83,6 +97,10 @@ let set_height (pm : t) (height : int32) : unit =
 (* Get current blockchain height *)
 let get_height (pm : t) : int32 =
   pm.our_height
+
+(* Notify that the chain tip has been updated *)
+let notify_tip_updated (pm : t) : unit =
+  pm.last_tip_update <- Unix.gettimeofday ()
 
 (* Add a message listener *)
 let add_listener (pm : t) (listener : P2p.message_payload -> Peer.peer -> unit Lwt.t) : unit =
@@ -99,6 +117,67 @@ let peer_count (pm : t) : int =
 (* Get ready peer count *)
 let ready_peer_count (pm : t) : int =
   List.length (get_ready_peers pm)
+
+(* Count outbound peers *)
+let outbound_peer_count (pm : t) : int =
+  List.length (List.filter (fun p ->
+    p.Peer.direction = Peer.Outbound) pm.peers)
+
+(* Count inbound peers *)
+let inbound_peer_count (pm : t) : int =
+  List.length (List.filter (fun p ->
+    p.Peer.direction = Peer.Inbound) pm.peers)
+
+(* Evict one low-quality inbound peer to make room for a new connection.
+   Protects the best inbound peers from eviction:
+   - Top 4 by lowest latency
+   - Top 4 by longest connection time (lowest peer id = earliest connection)
+   From the remaining unprotected peers, evicts the one with highest latency. *)
+let evict_inbound_peer (pm : t) : unit Lwt.t =
+  (* Get all inbound peers in Ready state *)
+  let inbound_ready = List.filter (fun p ->
+    p.Peer.direction = Peer.Inbound && p.Peer.state = Peer.Ready
+  ) pm.peers in
+  if List.length inbound_ready <= 8 then
+    (* Not enough inbound peers to justify eviction *)
+    Lwt.return_unit
+  else begin
+    (* Build a set of protected peer ids *)
+    let protected = Hashtbl.create 16 in
+    (* Protect top 4 by lowest latency *)
+    let by_latency = List.sort (fun a b ->
+      compare a.Peer.latency b.Peer.latency
+    ) inbound_ready in
+    List.iteri (fun i p ->
+      if i < 4 then Hashtbl.replace protected p.Peer.id true
+    ) by_latency;
+    (* Protect top 4 by longest connection time (lowest id = earliest) *)
+    let by_age = List.sort (fun a b ->
+      compare a.Peer.id b.Peer.id
+    ) inbound_ready in
+    List.iteri (fun i p ->
+      if i < 4 then Hashtbl.replace protected p.Peer.id true
+    ) by_age;
+    (* Filter to unprotected peers *)
+    let unprotected = List.filter (fun p ->
+      not (Hashtbl.mem protected p.Peer.id)
+    ) inbound_ready in
+    match unprotected with
+    | [] -> Lwt.return_unit
+    | _ ->
+      (* Select the unprotected peer with highest latency *)
+      let by_worst_latency = List.sort (fun a b ->
+        compare b.Peer.latency a.Peer.latency
+      ) unprotected in
+      let victim = List.hd by_worst_latency in
+      Printf.eprintf "[peer_manager] evicting inbound peer %d (%s) latency=%.3fs\n%!"
+        victim.Peer.id victim.Peer.addr victim.Peer.latency;
+      Peer.disconnect victim |> fun lwt ->
+        let open Lwt.Syntax in
+        let* () = lwt in
+        pm.peers <- List.filter (fun p -> p.Peer.id <> victim.Peer.id) pm.peers;
+        Lwt.return_unit
+  end
 
 (* Check if address is banned *)
 let is_banned (pm : t) (addr : string) : bool =
@@ -162,7 +241,7 @@ let add_known_addr (pm : t) (info : peer_info) : unit =
 let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
   let open Lwt.Syntax in
   (* Check connection limits *)
-  let outbound_count = List.length (get_ready_peers pm) in
+  let outbound_count = outbound_peer_count pm in
   if outbound_count >= pm.config.max_outbound then
     Lwt.return_unit
   (* Check if already connected *)
@@ -258,6 +337,22 @@ let ban_addr (pm : t) (addr : string) ?(duration = 86400.0) () : unit =
         banned_until = Unix.gettimeofday () +. duration;
         source = Addr }
 
+(* Record misbehavior for a peer.  Bans the peer if accumulated score >= 100. *)
+let record_peer_misbehavior (pm : t) (peer_id : int) (score : int)
+    (_reason : string) : unit Lwt.t =
+  match List.find_opt (fun p -> p.Peer.id = peer_id) pm.peers with
+  | None -> Lwt.return_unit
+  | Some peer ->
+    (match Peer.record_misbehavior peer score with
+     | `Ok -> Lwt.return_unit
+     | `Ban -> ban_peer pm peer_id ())
+
+(* Get a misbehavior handler callback suitable for use from sync.ml etc.
+   Usage: let handler = get_misbehavior_handler pm in handler peer_id score reason *)
+let get_misbehavior_handler (pm : t) : misbehavior_handler =
+  fun peer_id score reason ->
+    record_peer_misbehavior pm peer_id score reason
+
 (* Get candidate addresses for connection *)
 let get_connection_candidates (pm : t) (count : int) : peer_info list =
   let now = Unix.gettimeofday () in
@@ -297,27 +392,70 @@ let send_to_peer (pm : t) (peer_id : int) (payload : P2p.message_payload) : unit
       (fun () -> Peer.send_message peer payload)
       (fun _exn -> Lwt.return_unit)
 
-(* Handle incoming addr message *)
-let handle_addr (pm : t) (addrs : (int32 * Types.net_addr) list) : unit =
-  List.iter (fun (_ts, addr) ->
-    (* Extract IPv4 address from IPv6-mapped format *)
-    let ip_str =
-      Printf.sprintf "%d.%d.%d.%d"
-        (Cstruct.get_uint8 addr.Types.addr 12)
-        (Cstruct.get_uint8 addr.addr 13)
-        (Cstruct.get_uint8 addr.addr 14)
-        (Cstruct.get_uint8 addr.addr 15) in
-    if not (Hashtbl.mem pm.known_addrs ip_str) then
-      Hashtbl.replace pm.known_addrs ip_str
-        { address = ip_str;
-          port = addr.port;
-          services = addr.services;
-          last_connected = 0.0;
-          last_attempt = 0.0;
-          failures = 0;
-          banned_until = 0.0;
-          source = Addr }
-  ) addrs
+(* Handle incoming addr message with rate limiting and validation *)
+let handle_addr (pm : t) (peer : Peer.peer) (addrs : (int32 * Types.net_addr) list) : unit =
+  let now = Unix.gettimeofday () in
+  let peer_key = Printf.sprintf "%s:%d" peer.Peer.addr peer.Peer.port in
+  let addr_window = 86400.0 in  (* 24-hour window *)
+  let max_addrs_per_day = 1000 in
+  (* Get or initialize rate limit state for this peer *)
+  let (count, window_start) =
+    match Hashtbl.find_opt pm.addr_rate peer_key with
+    | Some (c, ws) ->
+      if now -. ws > addr_window then
+        (* Window expired, reset *)
+        (0, now)
+      else
+        (c, ws)
+    | None -> (0, now)
+  in
+  let remaining = max_addrs_per_day - count in
+  if remaining <= 0 then begin
+    (* Rate limit exceeded, ignore all addresses *)
+    Printf.eprintf "[peer_manager] addr rate limit exceeded for peer %d (%s)\n%!"
+      peer.Peer.id peer.Peer.addr;
+    ()
+  end else begin
+    (* Only process up to the remaining quota *)
+    let to_process = if List.length addrs > remaining then
+      List.filteri (fun i _ -> i < remaining) addrs
+    else
+      addrs
+    in
+    let processed = ref 0 in
+    List.iter (fun (ts, addr) ->
+      (* Extract IPv4 address from IPv6-mapped format *)
+      let ip_str =
+        Printf.sprintf "%d.%d.%d.%d"
+          (Cstruct.get_uint8 addr.Types.addr 12)
+          (Cstruct.get_uint8 addr.addr 13)
+          (Cstruct.get_uint8 addr.addr 14)
+          (Cstruct.get_uint8 addr.addr 15) in
+      (* Timestamp validation: reject addresses > 600 seconds in the future *)
+      let ts_float = Int32.to_float ts in
+      if ts_float > now +. 600.0 then
+        ()  (* Skip future-timestamped addresses *)
+      (* Self-address filtering: don't store our own listening address *)
+      else if (match pm.listen_addr with
+               | Some our_addr -> ip_str = our_addr
+               | None -> false) then
+        ()  (* Skip our own address *)
+      else if not (Hashtbl.mem pm.known_addrs ip_str) then begin
+        Hashtbl.replace pm.known_addrs ip_str
+          { address = ip_str;
+            port = addr.port;
+            services = addr.services;
+            last_connected = 0.0;
+            last_attempt = 0.0;
+            failures = 0;
+            banned_until = 0.0;
+            source = Addr };
+        incr processed
+      end
+    ) to_process;
+    (* Update rate limit counter *)
+    Hashtbl.replace pm.addr_rate peer_key (count + !processed, window_start)
+  end
 
 (* Build block locator hashes for getheaders/getblocks.
    Returns hashes from tip backwards to genesis, using exponential stepping.
@@ -384,7 +522,7 @@ let peer_message_loop (pm : t) (peer : Peer.peer) : unit Lwt.t =
              ) pm.listeners in
              (* Handle addr messages specially *)
              (match msg with
-              | P2p.AddrMsg addrs -> handle_addr pm addrs
+              | P2p.AddrMsg addrs -> handle_addr pm peer addrs
               | _ -> ());
              loop ())
       ) (fun exn ->
@@ -396,15 +534,67 @@ let peer_message_loop (pm : t) (peer : Peer.peer) : unit Lwt.t =
   in
   loop ()
 
+(* Check for stale chain tip and take corrective action *)
+let check_stale_tip (pm : t) : unit Lwt.t =
+  let open Lwt.Syntax in
+  let now = Unix.gettimeofday () in
+  let time_since_update = now -. pm.last_tip_update in
+  let ready_peers = get_ready_peers pm in
+  (* Find peers reporting higher block heights than ours *)
+  let higher_peers = List.filter (fun p ->
+    p.Peer.best_height > pm.our_height
+  ) ready_peers in
+  if time_since_update > pm.stale_tip_check_interval && higher_peers <> [] then begin
+    (* Sort by best_height descending to find the peer with highest reported height *)
+    let sorted = List.sort (fun a b ->
+      Int32.compare b.Peer.best_height a.Peer.best_height
+    ) higher_peers in
+    let best_peer = List.hd sorted in
+    Printf.eprintf "[peer_manager] WARNING: stale tip detected (no update for %.0fs), \
+      peer %d reports height %ld vs our %ld\n%!"
+      time_since_update best_peer.Peer.id best_peer.Peer.best_height pm.our_height;
+    (* Send getheaders to the peer with the highest reported height *)
+    let getheaders = P2p.GetheadersMsg {
+      version = 70016l;
+      locator_hashes = [];
+      hash_stop = Types.zero_hash;
+    } in
+    let* () = Lwt.catch
+      (fun () -> Peer.send_message best_peer getheaders)
+      (fun _exn -> Lwt.return_unit) in
+    (* If tip is very stale (2x interval), disconnect lowest peer and try a new one *)
+    if time_since_update > 2.0 *. pm.stale_tip_check_interval then begin
+      Printf.eprintf "[peer_manager] WARNING: tip severely stale (%.0fs), \
+        rotating lowest-height peer\n%!" time_since_update;
+      (* Find the peer with the lowest reported height *)
+      let sorted_asc = List.sort (fun a b ->
+        Int32.compare a.Peer.best_height b.Peer.best_height
+      ) ready_peers in
+      match sorted_asc with
+      | [] -> Lwt.return_unit
+      | lowest :: _ ->
+        let* () = remove_peer pm lowest.Peer.id in
+        (* Attempt to connect a new peer *)
+        let candidates = get_connection_candidates pm 1 in
+        match candidates with
+        | [] -> Lwt.return_unit
+        | c :: _ -> add_peer pm c.address c.port
+    end else
+      Lwt.return_unit
+  end else
+    Lwt.return_unit
+
 (* Connection maintenance loop *)
 let maintain_connections (pm : t) : unit Lwt.t =
   let open Lwt.Syntax in
   let rec loop () =
     if not pm.running then Lwt.return_unit
     else begin
-      (* Count active connections *)
-      let active = List.filter (fun p -> p.Peer.state = Peer.Ready) pm.peers in
-      let needed = pm.config.max_outbound - List.length active in
+      (* Count active outbound connections *)
+      let active_outbound = List.filter (fun p ->
+        p.Peer.state = Peer.Ready && p.Peer.direction = Peer.Outbound
+      ) pm.peers in
+      let needed = pm.config.max_outbound - List.length active_outbound in
       (* Try to connect to more peers if needed *)
       let* () =
         if needed > 0 then begin
@@ -431,12 +621,97 @@ let maintain_connections (pm : t) : unit Lwt.t =
       let* () = Lwt_list.iter_s (fun p ->
         remove_peer pm p.Peer.id
       ) dead in
+      (* Check for stale chain tip *)
+      let* () = check_stale_tip pm in
       (* Sleep before next iteration *)
       let* () = Lwt_unix.sleep 10.0 in
       loop ()
     end
   in
   loop ()
+
+(* Accept an inbound connection and perform reverse handshake *)
+let accept_inbound (pm : t) (client_fd : Lwt_unix.file_descr)
+    (client_addr : Unix.sockaddr) : unit Lwt.t =
+  let open Lwt.Syntax in
+  let addr_str, port = match client_addr with
+    | Unix.ADDR_INET (ip, p) -> (Unix.string_of_inet_addr ip, p)
+    | Unix.ADDR_UNIX s -> (s, 0) in
+  (* Check inbound limits - try eviction before rejecting *)
+  let* () =
+    if inbound_peer_count pm >= pm.config.max_inbound then
+      evict_inbound_peer pm
+    else
+      Lwt.return_unit
+  in
+  if inbound_peer_count pm >= pm.config.max_inbound then begin
+    let* () = Lwt.catch
+      (fun () -> Lwt_unix.close client_fd)
+      (fun _ -> Lwt.return_unit) in
+    Lwt.return_unit
+  end
+  (* Check if banned *)
+  else if is_banned pm addr_str then begin
+    let* () = Lwt.catch
+      (fun () -> Lwt_unix.close client_fd)
+      (fun _ -> Lwt.return_unit) in
+    Lwt.return_unit
+  end
+  (* Check if already connected *)
+  else if List.exists (fun p -> p.Peer.addr = addr_str) pm.peers then begin
+    let* () = Lwt.catch
+      (fun () -> Lwt_unix.close client_fd)
+      (fun _ -> Lwt.return_unit) in
+    Lwt.return_unit
+  end
+  else begin
+    let id = pm.next_peer_id in
+    pm.next_peer_id <- pm.next_peer_id + 1;
+    Lwt.catch (fun () ->
+      let peer = Peer.make_peer ~network:pm.network ~addr:addr_str ~port
+        ~id ~direction:Peer.Inbound ~fd:client_fd in
+      let* () = Peer.perform_inbound_handshake peer pm.our_height in
+      pm.peers <- peer :: pm.peers;
+      (* Start the message loop for this inbound peer *)
+      Lwt.async (fun () -> peer_message_loop pm peer);
+      Lwt.return_unit
+    ) (fun _exn ->
+      (* Handshake failed, clean up *)
+      Lwt.catch
+        (fun () -> Lwt_unix.close client_fd)
+        (fun _ -> Lwt.return_unit)
+    )
+  end
+
+(* Start a TCP listener for inbound connections *)
+let start_listener (pm : t) (port : int) : unit Lwt.t =
+  let open Lwt.Syntax in
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Lwt_unix.setsockopt fd Unix.SO_REUSEADDR true;
+  let* () = Lwt_unix.bind fd (Unix.ADDR_INET (Unix.inet_addr_any, port)) in
+  Lwt_unix.listen fd 128;
+  pm.listener_fd <- Some fd;
+  let rec accept_loop () =
+    if not pm.running then Lwt.return_unit
+    else begin
+      Lwt.catch (fun () ->
+        let* (client_fd, client_addr) = Lwt_unix.accept fd in
+        (* Handle inbound connection asynchronously *)
+        Lwt.async (fun () -> accept_inbound pm client_fd client_addr);
+        accept_loop ()
+      ) (fun exn ->
+        if pm.running then begin
+          (* Log and continue on transient errors *)
+          let _ = exn in
+          let* () = Lwt_unix.sleep 0.1 in
+          accept_loop ()
+        end else
+          Lwt.return_unit
+      )
+    end
+  in
+  Lwt.async (fun () -> accept_loop ());
+  Lwt.return_unit
 
 (* Start the peer manager *)
 let start (pm : t) : unit Lwt.t =
@@ -458,7 +733,14 @@ let start (pm : t) : unit Lwt.t =
 
 (* Stop the peer manager *)
 let stop (pm : t) : unit Lwt.t =
+  let open Lwt.Syntax in
   pm.running <- false;
+  (* Close the listener socket if open *)
+  let* () = match pm.listener_fd with
+    | Some fd ->
+      pm.listener_fd <- None;
+      Lwt.catch (fun () -> Lwt_unix.close fd) (fun _ -> Lwt.return_unit)
+    | None -> Lwt.return_unit in
   Lwt_list.iter_s (fun p -> remove_peer pm p.Peer.id) pm.peers
 
 (* Request getaddr from all peers *)

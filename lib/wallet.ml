@@ -10,6 +10,21 @@
    - Fee bumping via RBF (BIP-125)
    - Wallet persistence to JSON *)
 
+let log_src = Logs.Src.create "WALLET" ~doc:"Wallet"
+module Log = (val Logs.src_log log_src : Logs.LOG)
+let _ = Log.info  (* suppress unused module warning *)
+
+(* Insert an item at a random position in a list (for output order privacy) *)
+let insert_at_random lst item =
+  let n = List.length lst in
+  let pos = Random.int (n + 1) in
+  let rec aux i acc = function
+    | [] -> List.rev (item :: acc)
+    | x :: xs ->
+      if i = pos then List.rev_append (item :: acc) (x :: xs)
+      else aux (i + 1) (x :: acc) xs
+  in aux 0 [] lst
+
 (* ============================================================================
    Secp256k1 Helpers (shared with Crypto module)
    ============================================================================ *)
@@ -81,7 +96,7 @@ let int32_to_bytes (v : int32) : Cstruct.t =
 let hardened_offset = 0x80000000l
 
 (* Derive a child key (BIP-32) *)
-let derive_child_key (parent : extended_key) (index : int32) : extended_key =
+let derive_child_key (parent : extended_key) (index : int32) : (extended_key, string) result =
   let data =
     if Int32.compare index hardened_offset >= 0 then begin
       (* Hardened derivation: HMAC-SHA512(chain_code, 0x00 || key || index_be) *)
@@ -104,44 +119,120 @@ let derive_child_key (parent : extended_key) (index : int32) : extended_key =
   let ir = Cstruct.sub i 32 32 in
   (* Child key = (parent_key + il) mod curve order.
      Use libsecp256k1's add_tweak which handles the mod order arithmetic. *)
-  let parent_sk_bs = cstruct_to_bigstring parent.key in
-  let parent_sk = Secp.Key.read_sk_exn secp_ctx parent_sk_bs in
-  let tweak_bs = cstruct_to_bigstring il in
-  let child_sk = Secp.Key.add_tweak secp_ctx parent_sk tweak_bs in
-  let child_key_bs = Secp.Key.to_bytes secp_ctx child_sk in
-  let child_key = bigstring_to_cstruct child_key_bs in
-  let fp = fingerprint_of_key parent in
-  { key = child_key;
-    chain_code = ir;
-    depth = parent.depth + 1;
-    parent_fingerprint = fp;
-    child_index = index }
+  try
+    let parent_sk_bs = cstruct_to_bigstring parent.key in
+    let parent_sk = Secp.Key.read_sk_exn secp_ctx parent_sk_bs in
+    let tweak_bs = cstruct_to_bigstring il in
+    let child_sk = Secp.Key.add_tweak secp_ctx parent_sk tweak_bs in
+    let child_key_bs = Secp.Key.to_bytes secp_ctx child_sk in
+    let child_key = bigstring_to_cstruct child_key_bs in
+    let fp = fingerprint_of_key parent in
+    Ok { key = child_key;
+      chain_code = ir;
+      depth = parent.depth + 1;
+      parent_fingerprint = fp;
+      child_index = index }
+  with _ ->
+    Error "BIP-32: invalid child key derived"
 
 (* Derive a hardened child *)
-let derive_hardened (parent : extended_key) (index : int) : extended_key =
+let derive_hardened (parent : extended_key) (index : int) : (extended_key, string) result =
   derive_child_key parent (Int32.add hardened_offset (Int32.of_int index))
 
 (* Derive a normal (non-hardened) child *)
-let derive_normal (parent : extended_key) (index : int) : extended_key =
+let derive_normal (parent : extended_key) (index : int) : (extended_key, string) result =
   derive_child_key parent (Int32.of_int index)
 
 (* Derive BIP-84 receive key: m/84'/0'/0'/0/n *)
-let derive_bip84_receive (master : extended_key) (n : int) : Cstruct.t =
-  let purpose = derive_hardened master 84 in
-  let coin_type = derive_hardened purpose 0 in
-  let account = derive_hardened coin_type 0 in
-  let change = derive_normal account 0 in
-  let child = derive_normal change n in
-  child.key
+let derive_bip84_receive (master : extended_key) (n : int) : (Cstruct.t, string) result =
+  let open Result in
+  let ( >>= ) = bind in
+  derive_hardened master 84 >>= fun purpose ->
+  derive_hardened purpose 0 >>= fun coin_type ->
+  derive_hardened coin_type 0 >>= fun account ->
+  derive_normal account 0 >>= fun change ->
+  derive_normal change n >>= fun child ->
+  Ok child.key
 
 (* Derive BIP-84 change key: m/84'/0'/0'/1/n *)
-let derive_bip84_change (master : extended_key) (n : int) : Cstruct.t =
-  let purpose = derive_hardened master 84 in
-  let coin_type = derive_hardened purpose 0 in
-  let account = derive_hardened coin_type 0 in
-  let change = derive_normal account 1 in
-  let child = derive_normal change n in
-  child.key
+let derive_bip84_change (master : extended_key) (n : int) : (Cstruct.t, string) result =
+  let open Result in
+  let ( >>= ) = bind in
+  derive_hardened master 84 >>= fun purpose ->
+  derive_hardened purpose 0 >>= fun coin_type ->
+  derive_hardened coin_type 0 >>= fun account ->
+  derive_normal account 1 >>= fun change ->
+  derive_normal change n >>= fun child ->
+  Ok child.key
+
+(* ============================================================================
+   Extended Key Serialization (xpub/xprv)
+   ============================================================================ *)
+
+(* Serialize extended private key to xprv Base58Check string *)
+let serialize_xprv (ek : extended_key) : string =
+  let buf = Cstruct.create 78 in
+  (* Version: mainnet xprv = 0x0488ADE4 *)
+  Cstruct.BE.set_uint32 buf 0 0x0488ADE4l;
+  (* Depth *)
+  Cstruct.set_uint8 buf 4 ek.depth;
+  (* Parent fingerprint *)
+  Cstruct.BE.set_uint32 buf 5 ek.parent_fingerprint;
+  (* Child index *)
+  Cstruct.BE.set_uint32 buf 9 ek.child_index;
+  (* Chain code *)
+  Cstruct.blit ek.chain_code 0 buf 13 32;
+  (* 0x00 prefix + private key *)
+  Cstruct.set_uint8 buf 45 0x00;
+  Cstruct.blit ek.key 0 buf 46 32;
+  Address.base58check_encode buf
+
+(* Serialize extended public key to xpub Base58Check string *)
+let serialize_xpub (ek : extended_key) : string =
+  let buf = Cstruct.create 78 in
+  (* Version: mainnet xpub = 0x0488B21E *)
+  Cstruct.BE.set_uint32 buf 0 0x0488B21El;
+  (* Depth *)
+  Cstruct.set_uint8 buf 4 ek.depth;
+  (* Parent fingerprint *)
+  Cstruct.BE.set_uint32 buf 5 ek.parent_fingerprint;
+  (* Child index *)
+  Cstruct.BE.set_uint32 buf 9 ek.child_index;
+  (* Chain code *)
+  Cstruct.blit ek.chain_code 0 buf 13 32;
+  (* Compressed public key *)
+  let pubkey = Crypto.derive_public_key ~compressed:true ek.key in
+  Cstruct.blit pubkey 0 buf 45 33;
+  Address.base58check_encode buf
+
+(* Deserialize a Base58Check-encoded extended key (xprv/xpub/tprv/tpub) *)
+let deserialize_extended_key (s : string) : (extended_key * bool, string) result =
+  match Address.base58check_decode s with
+  | Error e -> Error e
+  | Ok payload ->
+    if Cstruct.length payload <> 78 then
+      Error "deserialize_extended_key: payload must be 78 bytes"
+    else
+      let version = Cstruct.BE.get_uint32 payload 0 in
+      let is_private = match version with
+        | v when v = 0x0488ADE4l -> true   (* xprv *)
+        | v when v = 0x04358394l -> true   (* tprv *)
+        | v when v = 0x0488B21El -> false  (* xpub *)
+        | v when v = 0x043587CFl -> false  (* tpub *)
+        | _ -> failwith "deserialize_extended_key: unknown version"
+      in
+      let depth = Cstruct.get_uint8 payload 4 in
+      let parent_fingerprint = Cstruct.BE.get_uint32 payload 5 in
+      let child_index = Cstruct.BE.get_uint32 payload 9 in
+      let chain_code = Cstruct.sub payload 13 32 in
+      let key =
+        if is_private then
+          (* Skip 0x00 prefix byte *)
+          Cstruct.sub payload 46 32
+        else
+          Cstruct.sub payload 45 33
+      in
+      Ok ({ key; chain_code; depth; parent_fingerprint; child_index }, is_private)
 
 (* ============================================================================
    Wallet Types
@@ -162,6 +253,19 @@ type wallet_utxo = {
   confirmed : bool;
 }
 
+(* Transaction history entry *)
+type tx_history_entry = {
+  hist_txid : string;
+  hist_category : [`Send | `Receive];
+  hist_amount : int64;
+  hist_fee : int64;
+  hist_address : string;
+  hist_confirmations : int;
+  hist_block_hash : string;
+  hist_block_height : int;
+  hist_timestamp : float;
+}
+
 (* Wallet state *)
 type t = {
   mutable keys : key_pair list;
@@ -175,6 +279,7 @@ type t = {
   mutable receive_index : int;
   mutable change_index : int;
   sent_transactions : (string, Types.transaction) Hashtbl.t;
+  mutable tx_history : tx_history_entry list;
 }
 
 (* ============================================================================
@@ -194,7 +299,8 @@ let create ~(network : [`Mainnet | `Testnet | `Regtest])
     master_key = None;
     receive_index = 0;
     change_index = 0;
-    sent_transactions = Hashtbl.create 16 }
+    sent_transactions = Hashtbl.create 16;
+    tx_history = [] }
 
 (* ============================================================================
    HD Wallet Initialization
@@ -206,6 +312,14 @@ let init_from_seed (w : t) (seed : Cstruct.t) : unit =
   w.master_key <- Some master;
   w.receive_index <- 0;
   w.change_index <- 0
+
+(* Initialize wallet from a BIP-39 mnemonic phrase *)
+let init_from_mnemonic (w : t) (mnemonic : string) ?(passphrase = "") () : unit =
+  if not (Bip39.validate_mnemonic mnemonic) then
+    failwith "Invalid BIP-39 mnemonic"
+  else
+    let seed = Bip39.mnemonic_to_seed ~mnemonic ~passphrase () in
+    init_from_seed w seed
 
 (* ============================================================================
    Key Management
@@ -224,9 +338,16 @@ let list_find_index (pred : 'a -> bool) (lst : 'a list) : int option =
 let generate_key (w : t) : key_pair =
   let private_key = match w.master_key with
     | Some master ->
-      let pk = derive_bip84_receive master w.receive_index in
-      w.receive_index <- w.receive_index + 1;
-      pk
+      let rec try_derive idx =
+        match derive_bip84_receive master idx with
+        | Ok pk ->
+          w.receive_index <- idx + 1;
+          pk
+        | Error _ ->
+          (* Skip invalid index and try next *)
+          try_derive (idx + 1)
+      in
+      try_derive w.receive_index
     | None ->
       Crypto.generate_private_key ()
   in
@@ -242,9 +363,16 @@ let generate_key (w : t) : key_pair =
 let generate_change_key (w : t) : key_pair =
   let private_key = match w.master_key with
     | Some master ->
-      let pk = derive_bip84_change master w.change_index in
-      w.change_index <- w.change_index + 1;
-      pk
+      let rec try_derive idx =
+        match derive_bip84_change master idx with
+        | Ok pk ->
+          w.change_index <- idx + 1;
+          pk
+        | Error _ ->
+          (* Skip invalid index and try next *)
+          try_derive (idx + 1)
+      in
+      try_derive w.change_index
     | None ->
       Crypto.generate_private_key ()
   in
@@ -278,6 +406,11 @@ let is_mine (w : t) (script_pubkey : Cstruct.t)
     List.find_opt (fun kp ->
       let kp_hash = Crypto.hash160 kp.public_key in
       Cstruct.equal kp_hash hash
+    ) w.keys
+  | Script.P2TR_script xonly_hash ->
+    List.find_opt (fun kp ->
+      let xonly = Crypto.derive_xonly_pubkey kp.private_key in
+      Cstruct.equal xonly xonly_hash
     ) w.keys
   | _ -> None
 
@@ -320,10 +453,22 @@ let export_wif (w : t) (addr_str : string) : string option =
    UTXO Scanning and Balance Tracking
    ============================================================================ *)
 
+(* Convert Cstruct to hex string — forward declaration needed by scan_block *)
+let cstruct_to_hex (cs : Cstruct.t) : string =
+  let buf = Buffer.create (Cstruct.length cs * 2) in
+  for i = 0 to Cstruct.length cs - 1 do
+    Buffer.add_string buf (Printf.sprintf "%02x" (Cstruct.get_uint8 cs i))
+  done;
+  Buffer.contents buf
+
 (* Scan a block for wallet-relevant transactions *)
 let scan_block (w : t) (block : Types.block) (height : int) : unit =
+  let block_hash = Crypto.compute_block_hash block.header in
+  let block_hash_hex = cstruct_to_hex block_hash in
+  let block_timestamp = Int32.to_float block.header.timestamp in
   List.iter (fun tx ->
     let txid = Crypto.compute_txid tx in
+    let txid_hex = cstruct_to_hex txid in
 
     (* Check outputs for our addresses *)
     List.iteri (fun vout out ->
@@ -354,7 +499,20 @@ let scan_block (w : t) (block : Types.block) (height : int) : unit =
           confirmed = true;
         } in
         w.utxos <- wutxo :: w.utxos;
-        w.balance_confirmed <- Int64.add w.balance_confirmed out.Types.value
+        w.balance_confirmed <- Int64.add w.balance_confirmed out.Types.value;
+        (* Record receive history entry *)
+        let hist_entry = {
+          hist_txid = txid_hex;
+          hist_category = `Receive;
+          hist_amount = out.Types.value;
+          hist_fee = 0L;
+          hist_address = Address.address_to_string kp.address;
+          hist_confirmations = 1;
+          hist_block_hash = block_hash_hex;
+          hist_block_height = height;
+          hist_timestamp = block_timestamp;
+        } in
+        w.tx_history <- hist_entry :: w.tx_history
       | None -> ()
     ) tx.Types.outputs;
 
@@ -366,9 +524,27 @@ let scan_block (w : t) (block : Types.block) (height : int) : unit =
         wutxo.outpoint.vout = prev.vout
       ) w.utxos in
       List.iter (fun wutxo ->
-        w.utxos <- List.filter (fun u -> u != wutxo) w.utxos;
+        w.utxos <- List.filter (fun u -> not (Cstruct.equal u.outpoint.txid wutxo.outpoint.txid && u.outpoint.vout = wutxo.outpoint.vout)) w.utxos;
         w.balance_confirmed <-
-          Int64.sub w.balance_confirmed wutxo.utxo.Utxo.value
+          Int64.sub w.balance_confirmed wutxo.utxo.Utxo.value;
+        (* Record send history entry *)
+        let kp_opt = is_mine w wutxo.utxo.Utxo.script_pubkey in
+        let addr_str = match kp_opt with
+          | Some kp -> Address.address_to_string kp.address
+          | None -> ""
+        in
+        let hist_entry = {
+          hist_txid = txid_hex;
+          hist_category = `Send;
+          hist_amount = wutxo.utxo.Utxo.value;
+          hist_fee = 0L;
+          hist_address = addr_str;
+          hist_confirmations = 1;
+          hist_block_hash = block_hash_hex;
+          hist_block_height = height;
+          hist_timestamp = block_timestamp;
+        } in
+        w.tx_history <- hist_entry :: w.tx_history
       ) spent
     ) tx.Types.inputs
   ) block.transactions
@@ -411,7 +587,7 @@ let scan_transaction (w : t) (tx : Types.transaction) : unit =
       wutxo.outpoint.vout = prev.vout
     ) w.utxos in
     List.iter (fun wutxo ->
-      w.utxos <- List.filter (fun u -> u != wutxo) w.utxos;
+      w.utxos <- List.filter (fun u -> not (Cstruct.equal u.outpoint.txid wutxo.outpoint.txid && u.outpoint.vout = wutxo.outpoint.vout)) w.utxos;
       if wutxo.confirmed then
         w.balance_confirmed <- Int64.sub w.balance_confirmed wutxo.utxo.Utxo.value
       else
@@ -614,34 +790,62 @@ let build_p2tr_script (hash : Types.hash256) : Cstruct.t =
   Cstruct.blit hash 0 s 2 32;
   s
 
-(* Convert Cstruct to hex string *)
-let cstruct_to_hex (cs : Cstruct.t) : string =
-  let buf = Buffer.create (Cstruct.length cs * 2) in
-  for i = 0 to Cstruct.length cs - 1 do
-    Buffer.add_string buf (Printf.sprintf "%02x" (Cstruct.get_uint8 cs i))
-  done;
-  Buffer.contents buf
-
 (* Sign a transaction's inputs given the selected UTXOs *)
 let sign_transaction_inputs (w : t) (tx : Types.transaction)
     (input_utxos : wallet_utxo list) : Types.transaction =
-  let witnesses = List.mapi (fun i wutxo ->
+  let signed_inputs_and_witnesses = List.mapi (fun i wutxo ->
     let kp = match is_mine w wutxo.utxo.Utxo.script_pubkey with
       | Some kp -> kp
       | None -> failwith "Cannot find key for input"
     in
-    let pubkey_hash = Crypto.hash160 kp.public_key in
-    let script_code = build_p2pkh_script pubkey_hash in
-    let sighash = Script.compute_sighash_segwit
-      tx i script_code wutxo.utxo.Utxo.value
-      Script.sighash_all in
-    let signature = Crypto.sign kp.private_key sighash in
-    let sig_with_hashtype = Cstruct.concat [
-      signature; Cstruct.of_string "\x01"
-    ] in
-    { Types.items = [sig_with_hashtype; kp.public_key] }
+    let inp = List.nth tx.inputs i in
+    let script_type = Script.classify_script wutxo.utxo.Utxo.script_pubkey in
+    match script_type with
+    | Script.P2TR_script _ ->
+      (* Taproot key-path spend *)
+      let prevouts = List.map (fun wu ->
+        (wu.utxo.Utxo.value, wu.utxo.Utxo.script_pubkey)
+      ) input_utxos in
+      let sighash = Script.compute_sighash_taproot tx i prevouts 0x00 () in
+      let sig_bytes = Crypto.schnorr_sign ~privkey:kp.private_key ~msg:sighash in
+      (* SIGHASH_DEFAULT (0x00): no suffix byte *)
+      (inp, { Types.items = [sig_bytes] })
+    | Script.P2WPKH_script _ ->
+      (* BIP-143 SegWit signing *)
+      let pubkey_hash = Crypto.hash160 kp.public_key in
+      let script_code = build_p2pkh_script pubkey_hash in
+      let sighash = Script.compute_sighash_segwit
+        tx i script_code wutxo.utxo.Utxo.value
+        Script.sighash_all in
+      let signature = Crypto.sign kp.private_key sighash in
+      let sig_with_hashtype = Cstruct.concat [
+        signature; Cstruct.of_string "\x01"
+      ] in
+      (inp, { Types.items = [sig_with_hashtype; kp.public_key] })
+    | Script.P2PKH_script _ ->
+      (* Legacy P2PKH signing *)
+      let script_code = wutxo.utxo.Utxo.script_pubkey in
+      let sighash = Script.compute_sighash_legacy tx i script_code
+        Script.sighash_all in
+      let signature = Crypto.sign kp.private_key sighash in
+      let sig_with_hashtype = Cstruct.concat [
+        signature; Cstruct.of_string "\x01"
+      ] in
+      (* Build scriptSig: <sig_with_hashtype> <pubkey> *)
+      let sig_len = Cstruct.length sig_with_hashtype in
+      let pub_len = Cstruct.length kp.public_key in
+      let script_sig = Cstruct.create (1 + sig_len + 1 + pub_len) in
+      Cstruct.set_uint8 script_sig 0 sig_len;
+      Cstruct.blit sig_with_hashtype 0 script_sig 1 sig_len;
+      Cstruct.set_uint8 script_sig (1 + sig_len) pub_len;
+      Cstruct.blit kp.public_key 0 script_sig (1 + sig_len + 1) pub_len;
+      ({ inp with Types.script_sig }, { Types.items = [] })
+    | _ ->
+      failwith "sign_transaction_inputs: unsupported script type"
   ) input_utxos in
-  { tx with witnesses }
+  let inputs = List.map fst signed_inputs_and_witnesses in
+  let witnesses = List.map snd signed_inputs_and_witnesses in
+  { tx with inputs; witnesses }
 
 (* Build output script from an address *)
 let build_output_script (dest_addr : Address.address) : Cstruct.t =
@@ -662,11 +866,19 @@ let build_output_script (dest_addr : Address.address) : Cstruct.t =
     Cstruct.blit dest_addr.Address.hash 0 s 2 20;
     Cstruct.set_uint8 s 22 0x87; (* OP_EQUAL *)
     s
+  | Address.WitnessUnknown v ->
+    let hash_len = Cstruct.length dest_addr.Address.hash in
+    let s = Cstruct.create (2 + hash_len) in
+    Cstruct.set_uint8 s 0 (0x50 + v);  (* OP_v = OP_1 + (v-1) for witness version v *)
+    Cstruct.set_uint8 s 1 hash_len;    (* push N bytes *)
+    Cstruct.blit dest_addr.Address.hash 0 s 2 hash_len;
+    s
 
 (* Create and sign a transaction *)
 let create_transaction (w : t) ~(dest_address : string)
     ~(amount : int64) ~(fee_rate : float)
-    : (Types.transaction, string) result =
+    ?tip_height
+    () : (Types.transaction, string) result =
 
   (* Parse destination address *)
   match Address.address_of_string dest_address with
@@ -688,9 +900,8 @@ let create_transaction (w : t) ~(dest_address : string)
         let change_kp = generate_change_key w in
         let change_hash = Crypto.hash160 change_kp.public_key in
         let change_script = build_p2wpkh_script change_hash in
-        outputs := !outputs @ [
-          { Types.value = selection.change; script_pubkey = change_script }
-        ]
+        let change_output = { Types.value = selection.change; script_pubkey = change_script } in
+        outputs := insert_at_random !outputs change_output
       end;
 
       (* Build unsigned transaction inputs *)
@@ -700,13 +911,21 @@ let create_transaction (w : t) ~(dest_address : string)
           sequence = 0xFFFFFFFEl; }
       ) selection.selected in
 
+      (* Anti-fee-sniping locktime *)
+      let locktime = match tip_height with
+        | Some h ->
+          if Random.int 10 = 0 then Int32.of_int (max 0 (h - 1))
+          else Int32.of_int h
+        | None -> 0l
+      in
+
       (* Create unsigned transaction *)
       let tx : Types.transaction = {
         version = 2l;
         inputs;
         outputs = !outputs;
         witnesses = [];
-        locktime = 0l;
+        locktime;
       } in
 
       (* Sign *)
@@ -717,12 +936,34 @@ let create_transaction (w : t) ~(dest_address : string)
       let txid_hex = cstruct_to_hex txid in
       Hashtbl.replace w.sent_transactions txid_hex signed_tx;
 
+      (* Record send history entry *)
+      let total_input = List.fold_left (fun acc u ->
+        Int64.add acc u.utxo.Utxo.value
+      ) 0L selection.selected in
+      let total_output = List.fold_left (fun acc out ->
+        Int64.add acc out.Types.value
+      ) 0L signed_tx.Types.outputs in
+      let fee = Int64.sub total_input total_output in
+      let hist_entry = {
+        hist_txid = txid_hex;
+        hist_category = `Send;
+        hist_amount = amount;
+        hist_fee = fee;
+        hist_address = dest_address;
+        hist_confirmations = 0;
+        hist_block_hash = "";
+        hist_block_height = 0;
+        hist_timestamp = Unix.gettimeofday ();
+      } in
+      w.tx_history <- hist_entry :: w.tx_history;
+
       Ok signed_tx
 
 (* Create a transaction with multiple outputs *)
 let create_transaction_multi (w : t)
     ~(outputs : (string * int64) list) ~(fee_rate : float)
-    : (Types.transaction, string) result =
+    ?tip_height
+    () : (Types.transaction, string) result =
 
   (* Calculate total amount needed *)
   let total_amount = List.fold_left (fun acc (_, amt) ->
@@ -749,10 +990,17 @@ let create_transaction_multi (w : t)
       let change_kp = generate_change_key w in
       let change_hash = Crypto.hash160 change_kp.public_key in
       let change_script = build_p2wpkh_script change_hash in
-      tx_outputs := !tx_outputs @ [
-        { Types.value = selection.change; script_pubkey = change_script }
-      ]
+      let change_output = { Types.value = selection.change; script_pubkey = change_script } in
+      tx_outputs := insert_at_random !tx_outputs change_output
     end;
+
+    (* Anti-fee-sniping locktime *)
+    let locktime = match tip_height with
+      | Some h ->
+        if Random.int 10 = 0 then Int32.of_int (max 0 (h - 1))
+        else Int32.of_int h
+      | None -> 0l
+    in
 
     (* Build and sign transaction *)
     let inputs = List.map (fun wutxo ->
@@ -766,7 +1014,7 @@ let create_transaction_multi (w : t)
       inputs;
       outputs = !tx_outputs;
       witnesses = [];
-      locktime = 0l;
+      locktime;
     } in
 
     let signed_tx = sign_transaction_inputs w tx selection.selected in
@@ -775,6 +1023,29 @@ let create_transaction_multi (w : t)
     let txid = Crypto.compute_txid signed_tx in
     let txid_hex = cstruct_to_hex txid in
     Hashtbl.replace w.sent_transactions txid_hex signed_tx;
+
+    (* Record send history entries for each output *)
+    let total_input = List.fold_left (fun acc u ->
+      Int64.add acc u.utxo.Utxo.value
+    ) 0L selection.selected in
+    let total_output = List.fold_left (fun acc out ->
+      Int64.add acc out.Types.value
+    ) 0L signed_tx.Types.outputs in
+    let fee = Int64.sub total_input total_output in
+    List.iter (fun (addr_str, amt) ->
+      let hist_entry = {
+        hist_txid = txid_hex;
+        hist_category = `Send;
+        hist_amount = amt;
+        hist_fee = fee;
+        hist_address = addr_str;
+        hist_confirmations = 0;
+        hist_block_hash = "";
+        hist_block_height = 0;
+        hist_timestamp = Unix.gettimeofday ();
+      } in
+      w.tx_history <- hist_entry :: w.tx_history
+    ) outputs;
 
     Ok signed_tx
 
@@ -926,7 +1197,7 @@ let bump_fee (w : t) ~(txid : Types.hash256) ~(new_fee_rate : float)
               let change_kp = generate_change_key w in
               let change_hash = Crypto.hash160 change_kp.public_key in
               let change_script = build_p2wpkh_script change_hash in
-              new_outputs @ [{ Types.value = surplus; script_pubkey = change_script }]
+              insert_at_random new_outputs { Types.value = surplus; script_pubkey = change_script }
             end else
               new_outputs
           end else
@@ -970,6 +1241,14 @@ let bump_fee (w : t) ~(txid : Types.hash256) ~(new_fee_rate : float)
       end
     end
 
+(* Update confirmation counts based on current chain height *)
+let update_confirmations (w : t) (current_height : int) : unit =
+  w.tx_history <- List.map (fun entry ->
+    if entry.hist_block_height > 0 then
+      { entry with hist_confirmations = current_height - entry.hist_block_height + 1 }
+    else entry
+  ) w.tx_history
+
 (* ============================================================================
    Wallet Persistence
    ============================================================================ *)
@@ -1006,6 +1285,20 @@ let save (w : t) : unit =
     ]
   ) w.utxos in
 
+  let history_json = List.map (fun h ->
+    `Assoc [
+      ("txid", `String h.hist_txid);
+      ("category", `String (match h.hist_category with `Send -> "send" | `Receive -> "receive"));
+      ("amount", `String (Int64.to_string h.hist_amount));
+      ("fee", `String (Int64.to_string h.hist_fee));
+      ("address", `String h.hist_address);
+      ("confirmations", `Int h.hist_confirmations);
+      ("blockhash", `String h.hist_block_hash);
+      ("blockheight", `Int h.hist_block_height);
+      ("time", `Float h.hist_timestamp);
+    ]
+  ) w.tx_history in
+
   let network_str = match w.network with
     | `Mainnet -> "mainnet"
     | `Testnet -> "testnet"
@@ -1019,6 +1312,7 @@ let save (w : t) : unit =
     ("next_key_index", `Int w.next_key_index);
     ("balance_confirmed", `String (Int64.to_string w.balance_confirmed));
     ("balance_unconfirmed", `String (Int64.to_string w.balance_unconfirmed));
+    ("tx_history", `List history_json);
   ] in
 
   let oc = open_out w.db_path in
@@ -1116,6 +1410,43 @@ let load ~(network : [`Mainnet | `Testnet | `Regtest])
         | _ -> ());
        (match List.assoc_opt "balance_unconfirmed" fields with
         | Some (`String v) -> w.balance_unconfirmed <- Int64.of_string v
+        | _ -> ());
+
+       (* Load transaction history *)
+       (match List.assoc_opt "tx_history" fields with
+        | Some (`List entries) ->
+          List.iter (fun entry ->
+            match entry with
+            | `Assoc ef ->
+              let hist_txid = match List.assoc_opt "txid" ef with
+                | Some (`String s) -> s | _ -> "" in
+              let hist_category = match List.assoc_opt "category" ef with
+                | Some (`String "send") -> `Send
+                | _ -> `Receive in
+              let hist_amount = match List.assoc_opt "amount" ef with
+                | Some (`String s) -> Int64.of_string s | _ -> 0L in
+              let hist_fee = match List.assoc_opt "fee" ef with
+                | Some (`String s) -> Int64.of_string s | _ -> 0L in
+              let hist_address = match List.assoc_opt "address" ef with
+                | Some (`String s) -> s | _ -> "" in
+              let hist_confirmations = match List.assoc_opt "confirmations" ef with
+                | Some (`Int n) -> n | _ -> 0 in
+              let hist_block_hash = match List.assoc_opt "blockhash" ef with
+                | Some (`String s) -> s | _ -> "" in
+              let hist_block_height = match List.assoc_opt "blockheight" ef with
+                | Some (`Int n) -> n | _ -> 0 in
+              let hist_timestamp = match List.assoc_opt "time" ef with
+                | Some (`Float f) -> f
+                | Some (`Int n) -> float_of_int n
+                | _ -> 0.0 in
+              let h = {
+                hist_txid; hist_category; hist_amount; hist_fee;
+                hist_address; hist_confirmations; hist_block_hash;
+                hist_block_height; hist_timestamp;
+              } in
+              w.tx_history <- w.tx_history @ [h]
+            | _ -> ()
+          ) entries
         | _ -> ())
      | _ -> ());
     w

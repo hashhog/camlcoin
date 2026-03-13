@@ -20,8 +20,8 @@
 type fee_bucket = {
   min_fee_rate : float;        (* sat/vB *)
   max_fee_rate : float;
-  mutable total_confirmed : int;
-  mutable total_unconfirmed : int;
+  mutable total_confirmed : float;
+  mutable total_unconfirmed : float;
   mutable blocks_to_confirm : float list;
 }
 
@@ -32,8 +32,8 @@ type fee_bucket = {
 type t = {
   buckets : fee_bucket array;
   mutable block_height : int;
-  tracked_txs : (string, float * int) Hashtbl.t;
-  (* txid -> (fee_rate, height_added) *)
+  tracked_txs : (string, float * int * float) Hashtbl.t;
+  (* txid -> (fee_rate, height_added, timestamp) *)
 }
 
 (* ============================================================================
@@ -58,6 +58,13 @@ let default_high_priority = 20.0    (* 1 block target *)
 let default_medium_priority = 10.0  (* 6 block target *)
 let default_low_priority = 1.0      (* 25 block target *)
 
+(* Exponential decay factor applied per block.
+   0.998 per block ~ half-life of 346 blocks ~ 2.4 days at 10 min/block *)
+let decay_factor = 0.998
+
+(* Default maximum age for tracked mempool transactions: 14 days in seconds *)
+let default_max_tx_age = 14.0 *. 24.0 *. 3600.0
+
 (* ============================================================================
    Creation
    ============================================================================ *)
@@ -72,8 +79,8 @@ let create () : t =
     in
     { min_fee_rate = min_fr;
       max_fee_rate = max_fr;
-      total_confirmed = 0;
-      total_unconfirmed = 0;
+      total_confirmed = 0.0;
+      total_unconfirmed = 0.0;
       blocks_to_confirm = [] }
   ) in
   { buckets;
@@ -100,10 +107,11 @@ let find_bucket (est : t) (fee_rate : float) : int =
 let track_transaction (est : t) (txid : Types.hash256)
     (fee_rate : float) (height : int) : unit =
   let txid_key = Cstruct.to_string txid in
-  Hashtbl.replace est.tracked_txs txid_key (fee_rate, height);
+  let now = Unix.gettimeofday () in
+  Hashtbl.replace est.tracked_txs txid_key (fee_rate, height, now);
   let bucket_idx = find_bucket est fee_rate in
   est.buckets.(bucket_idx).total_unconfirmed <-
-    est.buckets.(bucket_idx).total_unconfirmed + 1
+    est.buckets.(bucket_idx).total_unconfirmed +. 1.0
 
 (* Record that a tracked transaction was confirmed *)
 let record_confirmation (est : t) (txid : Types.hash256)
@@ -111,13 +119,13 @@ let record_confirmation (est : t) (txid : Types.hash256)
   let txid_key = Cstruct.to_string txid in
   match Hashtbl.find_opt est.tracked_txs txid_key with
   | None -> ()
-  | Some (fee_rate, added_height) ->
+  | Some (fee_rate, added_height, _timestamp) ->
     Hashtbl.remove est.tracked_txs txid_key;
     let blocks = confirm_height - added_height in
     let bucket_idx = find_bucket est fee_rate in
     let bucket = est.buckets.(bucket_idx) in
-    bucket.total_confirmed <- bucket.total_confirmed + 1;
-    bucket.total_unconfirmed <- max 0 (bucket.total_unconfirmed - 1);
+    bucket.total_confirmed <- bucket.total_confirmed +. 1.0;
+    bucket.total_unconfirmed <- Float.max 0.0 (bucket.total_unconfirmed -. 1.0);
     bucket.blocks_to_confirm <-
       float_of_int blocks :: bucket.blocks_to_confirm;
     (* Keep only last max_samples_per_bucket samples *)
@@ -127,11 +135,36 @@ let record_confirmation (est : t) (txid : Types.hash256)
           bucket.blocks_to_confirm
 
 (* ============================================================================
+   Exponential Decay
+   ============================================================================ *)
+
+(* Apply exponential decay to all bucket counts. Called once per block to
+   gradually discount old data, preventing stale fee information from
+   dominating estimates after fee regime changes. Samples in
+   blocks_to_confirm are trimmed from the tail (oldest) to stay in line
+   with the decayed confirmed count. *)
+let apply_decay (est : t) : unit =
+  Array.iter (fun bucket ->
+    bucket.total_confirmed <- bucket.total_confirmed *. decay_factor;
+    bucket.total_unconfirmed <- bucket.total_unconfirmed *. decay_factor;
+    (* Trim oldest samples so sample count does not exceed the
+       decayed confirmed count (rounded up) *)
+    let max_keep = int_of_float (Float.round (bucket.total_confirmed +. 0.5)) in
+    let current_len = List.length bucket.blocks_to_confirm in
+    if current_len > max_keep then
+      bucket.blocks_to_confirm <-
+        List.filteri (fun i _ -> i < max_keep) bucket.blocks_to_confirm
+  ) est.buckets
+
+(* ============================================================================
    Block Processing
    ============================================================================ *)
 
 let process_block (est : t) (block : Types.block) (height : int) : unit =
   est.block_height <- height;
+  (* Apply decay before processing confirmations so that new data is
+     recorded at full weight while old data is discounted *)
+  apply_decay est;
   List.iter (fun tx ->
     let txid = Crypto.compute_txid tx in
     record_confirmation est txid height
@@ -167,7 +200,7 @@ let estimate_fee (est : t) (target_blocks : int) : float option =
       None
     else begin
       let bucket = est.buckets.(i) in
-      if bucket.total_confirmed < min_samples then
+      if bucket.total_confirmed < float_of_int min_samples then
         search_up (i + 1)  (* not enough data, try higher fee rate *)
       else begin
         match compute_median bucket.blocks_to_confirm with
@@ -231,8 +264,8 @@ let get_bucket_stats (est : t) (bucket_idx : int) : bucket_stats option =
     Some {
       min_rate = bucket.min_fee_rate;
       max_rate = bucket.max_fee_rate;
-      confirmed = bucket.total_confirmed;
-      unconfirmed = bucket.total_unconfirmed;
+      confirmed = int_of_float bucket.total_confirmed;
+      unconfirmed = int_of_float bucket.total_unconfirmed;
       sample_count = List.length bucket.blocks_to_confirm;
       median_blocks = compute_median bucket.blocks_to_confirm;
     }
@@ -251,11 +284,37 @@ let remove_transaction (est : t) (txid : Types.hash256) : unit =
   let txid_key = Cstruct.to_string txid in
   match Hashtbl.find_opt est.tracked_txs txid_key with
   | None -> ()
-  | Some (fee_rate, _) ->
+  | Some (fee_rate, _, _) ->
     Hashtbl.remove est.tracked_txs txid_key;
     let bucket_idx = find_bucket est fee_rate in
     let bucket = est.buckets.(bucket_idx) in
-    bucket.total_unconfirmed <- max 0 (bucket.total_unconfirmed - 1)
+    bucket.total_unconfirmed <- Float.max 0.0 (bucket.total_unconfirmed -. 1.0)
+
+(* ============================================================================
+   Time-based Expiration
+   ============================================================================ *)
+
+(* Remove tracked transactions older than [max_age] seconds (default 14 days).
+   This prevents the mempool tracker from accumulating entries for transactions
+   that were dropped or replaced without the node noticing. *)
+let expire_old_transactions ?(max_age = default_max_tx_age) (est : t) : int =
+  let now = Unix.gettimeofday () in
+  let cutoff = now -. max_age in
+  let to_remove = ref [] in
+  Hashtbl.iter (fun txid_key (_fee_rate, _height, timestamp) ->
+    if timestamp < cutoff then
+      to_remove := txid_key :: !to_remove
+  ) est.tracked_txs;
+  List.iter (fun txid_key ->
+    match Hashtbl.find_opt est.tracked_txs txid_key with
+    | None -> ()
+    | Some (fee_rate, _, _) ->
+      Hashtbl.remove est.tracked_txs txid_key;
+      let bucket_idx = find_bucket est fee_rate in
+      let bucket = est.buckets.(bucket_idx) in
+      bucket.total_unconfirmed <- Float.max 0.0 (bucket.total_unconfirmed -. 1.0)
+  ) !to_remove;
+  List.length !to_remove
 
 (* ============================================================================
    Clear All Data
@@ -264,7 +323,7 @@ let remove_transaction (est : t) (txid : Types.hash256) : unit =
 let clear (est : t) : unit =
   Hashtbl.clear est.tracked_txs;
   Array.iter (fun bucket ->
-    bucket.total_confirmed <- 0;
-    bucket.total_unconfirmed <- 0;
+    bucket.total_confirmed <- 0.0;
+    bucket.total_unconfirmed <- 0.0;
     bucket.blocks_to_confirm <- []
   ) est.buckets

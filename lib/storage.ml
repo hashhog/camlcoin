@@ -284,20 +284,6 @@ module FileStorage : STORAGE = struct
 
   let close _t = ()
 
-  (* Flush the in-memory cache to disk.  Every cached key that does NOT
-     already have a corresponding file on disk is written out.  This is a
-     best-effort durability measure – it does NOT use the WAL, so it is
-     not atomic, but it guarantees that no cached data is silently lost
-     when the process exits. *)
-  let sync (t : t) : unit =
-    Hashtbl.iter (fun key value ->
-      let path = key_to_path t key in
-      (* Only write if the file does not exist yet – avoids redundant I/O
-         for entries that were already persisted via put / batch_write. *)
-      if not (Sys.file_exists path) then
-        write_data_file path key value
-    ) t.cache
-
   let get t key =
     if Hashtbl.mem t.deleted_keys key then None
     else
@@ -342,6 +328,19 @@ module FileStorage : STORAGE = struct
       apply_ops t ops;
       wal_delete t
     end
+
+  (* Flush the in-memory cache to disk atomically via WAL-protected batch.
+     Every cached key that does NOT already have a corresponding file on
+     disk is collected into a batch and written atomically, ensuring no
+     partial state is visible on crash. *)
+  let sync (t : t) : unit =
+    let batch = batch_create () in
+    Hashtbl.iter (fun key value ->
+      let path = key_to_path t key in
+      if not (Sys.file_exists path) then
+        batch_put batch key value
+    ) t.cache;
+    batch_write t batch
 
   (* Iterate over all entries whose key starts with [prefix].
      Scans both the in-memory cache AND the on-disk files so that
@@ -429,13 +428,6 @@ module LogStorage : STORAGE = struct
     Bytes.set b 2 (Char.chr ((n lsr 8)  land 0xff));
     Bytes.set b 3 (Char.chr ( n         land 0xff));
     b
-
-  let read_be32_from buf off =
-    let b0 = Char.code (Bytes.get buf off) in
-    let b1 = Char.code (Bytes.get buf (off+1)) in
-    let b2 = Char.code (Bytes.get buf (off+2)) in
-    let b3 = Char.code (Bytes.get buf (off+3)) in
-    (b0 lsl 24) lor (b1 lsl 16) lor (b2 lsl 8) lor b3
 
   let data_log_path t = Filename.concat t.base_dir "data.log"
 
@@ -606,53 +598,39 @@ module LogStorage : STORAGE = struct
 
   let rebuild_index t =
     let path = data_log_path t in
-    (* Read entire file into memory for fast scanning *)
-    let ic = open_in_bin path in
-    let flen = in_channel_length ic in
-    let buf =
-      if flen > 0 then begin
-        let b = Bytes.create flen in
-        really_input ic b 0 flen;
-        b
-      end else
-        Bytes.empty
-    in
-    close_in ic;
-    let pos = ref 0 in
-    (try
-      while !pos < flen do
-        let op = Bytes.get buf !pos in
-        pos := !pos + 1;
-        match op with
-        | 'P' ->
-          if !pos + 4 > flen then raise Exit;
-          let klen = read_be32_from buf !pos in
-          pos := !pos + 4;
-          if !pos + klen > flen then raise Exit;
-          let key = Bytes.sub_string buf !pos klen in
-          pos := !pos + klen;
-          if !pos + 4 > flen then raise Exit;
-          let vlen = read_be32_from buf !pos in
-          pos := !pos + 4;
-          if !pos + vlen > flen then raise Exit;
-          let value_offset = !pos in
-          pos := !pos + vlen;
-          (* last write wins *)
-          Hashtbl.replace t.index key (value_offset, vlen);
-          Hashtbl.remove t.deleted key
-        | 'D' ->
-          if !pos + 4 > flen then raise Exit;
-          let klen = read_be32_from buf !pos in
-          pos := !pos + 4;
-          if !pos + klen > flen then raise Exit;
-          let key = Bytes.sub_string buf !pos klen in
-          pos := !pos + klen;
-          Hashtbl.remove t.index key;
-          Hashtbl.replace t.deleted key ()
-        | _ -> raise Exit  (* corrupt -- stop scanning *)
-      done
-    with Exit -> ());
-    t.data_offset <- flen
+    if not (Sys.file_exists path) then begin
+      t.data_offset <- 0
+    end else begin
+      let ic = open_in_bin path in
+      let flen = in_channel_length ic in
+      let last_valid_pos = ref 0 in
+      (try
+        while pos_in ic < flen do
+          let op = input_char ic in
+          match op with
+          | 'P' ->
+            let klen = read_be32 ic in
+            let key = really_input_string ic klen in
+            let vlen = read_be32 ic in
+            let value_offset = pos_in ic in
+            seek_in ic (value_offset + vlen);
+            Hashtbl.replace t.index key (value_offset, vlen);
+            Hashtbl.remove t.deleted key;
+            last_valid_pos := pos_in ic
+          | 'D' ->
+            let klen = read_be32 ic in
+            let key = really_input_string ic klen in
+            Hashtbl.remove t.index key;
+            Hashtbl.replace t.deleted key ();
+            last_valid_pos := pos_in ic
+          | _ -> raise Exit
+        done
+      with Exit | End_of_file -> ());
+      close_in ic;
+      if !last_valid_pos < flen then
+        Unix.truncate path !last_valid_pos;
+      t.data_offset <- !last_valid_pos
+    end
 
   (* --- Public API ------------------------------------------------------ *)
 
@@ -846,10 +824,10 @@ module ChainDB = struct
 
   (* Chain state - tip hash and height (validated blocks) *)
   let set_chain_tip t (hash : Types.hash256) (height : int) =
-    LogStorage.put t.db
-      (prefix_chain_state ^ "tip_hash") (Cstruct.to_string hash);
-    LogStorage.put t.db
-      (prefix_chain_state ^ "tip_height") (encode_height height)
+    let batch = LogStorage.batch_create () in
+    LogStorage.batch_put batch (prefix_chain_state ^ "tip_hash") (Cstruct.to_string hash);
+    LogStorage.batch_put batch (prefix_chain_state ^ "tip_height") (encode_height height);
+    LogStorage.batch_write t.db batch
 
   let get_chain_tip t : (Types.hash256 * int) option =
     match LogStorage.get t.db (prefix_chain_state ^ "tip_hash"),
@@ -863,10 +841,10 @@ module ChainDB = struct
   (* Header tip - separate from chain tip (headers can be ahead of validated blocks) *)
   (* IMPORTANT: header_tip tracks downloaded headers, chain_tip tracks validated blocks *)
   let set_header_tip t (hash : Types.hash256) (height : int) =
-    LogStorage.put t.db
-      (prefix_chain_state ^ "header_tip_hash") (Cstruct.to_string hash);
-    LogStorage.put t.db
-      (prefix_chain_state ^ "header_tip_height") (encode_height height)
+    let batch = LogStorage.batch_create () in
+    LogStorage.batch_put batch (prefix_chain_state ^ "header_tip_hash") (Cstruct.to_string hash);
+    LogStorage.batch_put batch (prefix_chain_state ^ "header_tip_height") (encode_height height);
+    LogStorage.batch_write t.db batch
 
   let get_header_tip t : (Types.hash256 * int) option =
     match LogStorage.get t.db (prefix_chain_state ^ "header_tip_hash"),
@@ -955,6 +933,14 @@ module ChainDB = struct
   let has_block_header t (hash : Types.hash256) : bool =
     let key = prefix_block_header ^ Cstruct.to_string hash in
     Option.is_some (LogStorage.get t.db key)
+
+  let delete_block t (hash : Types.hash256) =
+    let key = prefix_block_data ^ Cstruct.to_string hash in
+    LogStorage.delete t.db key
+
+  let batch_delete_block batch (hash : Types.hash256) =
+    let key = prefix_block_data ^ Cstruct.to_string hash in
+    LogStorage.batch_delete batch key
 
   (* Undo data storage - keyed by block hash for chain reorganizations *)
   let store_undo_data t (block_hash : Types.hash256) (undo_data : string) =

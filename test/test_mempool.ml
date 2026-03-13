@@ -583,6 +583,212 @@ let test_mempool_clear () =
   cleanup_test_db ()
 
 (* ============================================================================
+   TRUC/v3 Policy Tests (BIP-431)
+   ============================================================================ *)
+
+(* Helper to check if a string contains a substring *)
+let string_contains haystack needle =
+  let nlen = String.length needle in
+  let hlen = String.length haystack in
+  if nlen > hlen then false
+  else begin
+    let found = ref false in
+    for i = 0 to hlen - nlen do
+      if not !found && String.sub haystack i nlen = needle then
+        found := true
+    done;
+    !found
+  end
+
+(* Helper to create a v3 transaction *)
+let make_v3_tx inputs outputs =
+  Types.{
+    version = 3l;
+    inputs;
+    outputs;
+    witnesses = [];
+    locktime = 0l;
+  }
+
+(* A valid P2PKH script_pubkey with exactly 20 bytes of hash *)
+let standard_p2pkh_script =
+  Cstruct.of_string "\x76\xa9\x14\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x88\xac"
+
+(* Helper to create a standard test output (P2PKH with 20-byte hash) *)
+let make_standard_output value =
+  Types.{
+    value;
+    script_pubkey = standard_p2pkh_script;
+  }
+
+(* Helper to create a test mempool with require_standard enabled for v3 dust tests *)
+let create_test_mempool_standard () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let utxo = Utxo.UtxoSet.create db in
+  let txid1 = Types.hash256_of_hex
+    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b" in
+  let txid2 = Types.hash256_of_hex
+    "0e3e2357e806b6cdb1f70b54c3a3a17b6714ee1f0e68bebb44a74b1efd512098" in
+  let txid3 = Types.hash256_of_hex
+    "9b0fc92260312ce44e74ef369f5c66bbb85848f2eddd5a7a1cde251e54ccfdd5" in
+  Utxo.UtxoSet.add utxo txid1 0 Utxo.{
+    value = 50_000_000L;
+    script_pubkey = standard_p2pkh_script;
+    height = 0;
+    is_coinbase = false;
+  };
+  Utxo.UtxoSet.add utxo txid2 0 Utxo.{
+    value = 50_000_000L;
+    script_pubkey = standard_p2pkh_script;
+    height = 0;
+    is_coinbase = false;
+  };
+  Utxo.UtxoSet.add utxo txid3 0 Utxo.{
+    value = 50_000_000L;
+    script_pubkey = standard_p2pkh_script;
+    height = 0;
+    is_coinbase = false;
+  };
+  let mp = Mempool.create ~require_standard:true ~verify_scripts:false ~utxo ~current_height:100 () in
+  (mp, utxo, db, txid1, txid2, txid3)
+
+(* Test: v3 child tx with >10k vsize rejected *)
+let test_truc_vsize_limit () =
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  (* Add a v3 parent transaction *)
+  let parent_tx = make_v3_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L]
+  in
+  let parent_result = Mempool.add_transaction mp parent_tx in
+  Alcotest.(check bool) "v3 parent accepted" true (Result.is_ok parent_result);
+  let parent_entry = Result.get_ok parent_result in
+  (* Create a v3 child with many outputs to exceed 10k vsize *)
+  let many_outputs = List.init 500 (fun _ -> make_test_output 1_000L) in
+  let child_tx = make_v3_tx
+    [make_test_input parent_entry.txid 0l]
+    many_outputs
+  in
+  let result = Mempool.add_transaction mp child_tx in
+  Alcotest.(check bool) "v3 child >10k vsize rejected" true (Result.is_error result);
+  (match result with
+   | Error msg ->
+     Alcotest.(check bool) "error mentions vsize" true
+       (string_contains msg "vsize")
+   | Ok _ -> Alcotest.fail "expected error");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: v3 tx with 2+ unconfirmed parents rejected *)
+let test_truc_ancestor_limit () =
+  let (mp, _utxo, db, txid1, txid2, _) = create_test_mempool () in
+  (* Add two v3 parent transactions *)
+  let parent1_tx = make_v3_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L]
+  in
+  let parent1_result = Mempool.add_transaction mp parent1_tx in
+  Alcotest.(check bool) "v3 parent1 accepted" true (Result.is_ok parent1_result);
+  let parent1_entry = Result.get_ok parent1_result in
+  let parent2_tx = make_v3_tx
+    [make_test_input txid2 0l]
+    [make_test_output 1_990_000L]
+  in
+  let parent2_result = Mempool.add_transaction mp parent2_tx in
+  Alcotest.(check bool) "v3 parent2 accepted" true (Result.is_ok parent2_result);
+  let parent2_entry = Result.get_ok parent2_result in
+  (* Try to add a v3 child spending both parents *)
+  let child_tx = make_v3_tx
+    [make_test_input parent1_entry.txid 0l;
+     make_test_input parent2_entry.txid 0l]
+    [make_test_output 2_900_000L]
+  in
+  let result = Mempool.add_transaction mp child_tx in
+  Alcotest.(check bool) "v3 tx with 2+ ancestors rejected" true (Result.is_error result);
+  (match result with
+   | Error msg ->
+     Alcotest.(check bool) "error mentions ancestor" true
+       (string_contains msg "ancestor")
+   | Ok _ -> Alcotest.fail "expected error");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: v3 parent can only have 1 child *)
+let test_truc_one_child_limit () =
+  let (mp, _utxo, db, txid1, txid2, _) = create_test_mempool () in
+  (* Add v3 parent with two outputs *)
+  let parent_tx = make_v3_tx
+    [make_test_input txid1 0l]
+    [make_test_output 490_000L; make_test_output 490_000L]
+  in
+  let parent_result = Mempool.add_transaction mp parent_tx in
+  Alcotest.(check bool) "v3 parent accepted" true (Result.is_ok parent_result);
+  let parent_entry = Result.get_ok parent_result in
+  (* Add first child spending output 0 - should succeed *)
+  let child1_tx = make_v3_tx
+    [make_test_input parent_entry.txid 0l]
+    [make_test_output 480_000L]
+  in
+  let child1_result = Mempool.add_transaction mp child1_tx in
+  Alcotest.(check bool) "first v3 child accepted" true (Result.is_ok child1_result);
+  (* Add second child spending output 1 - should be rejected *)
+  (* Need a confirmed input for the second child to avoid ancestor issues *)
+  let child2_tx = make_v3_tx
+    [make_test_input parent_entry.txid 1l]
+    [make_test_output 480_000L]
+  in
+  let result = Mempool.add_transaction mp child2_tx in
+  Alcotest.(check bool) "second v3 child rejected" true (Result.is_error result);
+  (match result with
+   | Error msg ->
+     Alcotest.(check bool) "error mentions child" true
+       (string_contains msg "child")
+   | Ok _ -> Alcotest.fail "expected error");
+  ignore txid2;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: non-v3 tx spending unconfirmed v3 output rejected *)
+let test_truc_no_mixing () =
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  (* Add v3 parent *)
+  let parent_tx = make_v3_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L]
+  in
+  let parent_result = Mempool.add_transaction mp parent_tx in
+  Alcotest.(check bool) "v3 parent accepted" true (Result.is_ok parent_result);
+  let parent_entry = Result.get_ok parent_result in
+  (* Try to add a v1 child spending v3 parent *)
+  let child_tx = make_regular_tx
+    [make_test_input parent_entry.txid 0l]
+    [make_test_output 980_000L]
+  in
+  let result = Mempool.add_transaction mp child_tx in
+  Alcotest.(check bool) "non-v3 spending v3 rejected" true (Result.is_error result);
+  (match result with
+   | Error msg ->
+     Alcotest.(check bool) "error mentions v3" true
+       (string_contains msg "v3")
+   | Ok _ -> Alcotest.fail "expected error");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: v3 tx with zero-value output accepted (ephemeral dust exemption) *)
+let test_truc_ephemeral_dust () =
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool_standard () in
+  (* v3 tx with a zero-value output should be accepted *)
+  let tx = make_v3_tx
+    [make_test_input txid1 0l]
+    [make_standard_output 49_990_000L; make_standard_output 0L]
+  in
+  let result = Mempool.add_transaction mp tx in
+  Alcotest.(check bool) "v3 tx with zero-value output accepted" true (Result.is_ok result);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -626,5 +832,12 @@ let () =
     "stats", [
       test_case "get stats" `Quick test_mempool_stats;
       test_case "clear" `Quick test_mempool_clear;
+    ];
+    "truc_v3", [
+      test_case "v3 child >10k vsize rejected" `Quick test_truc_vsize_limit;
+      test_case "v3 ancestor limit" `Quick test_truc_ancestor_limit;
+      test_case "v3 one child limit" `Quick test_truc_one_child_limit;
+      test_case "non-v3 spending v3 rejected" `Quick test_truc_no_mixing;
+      test_case "v3 ephemeral dust" `Quick test_truc_ephemeral_dust;
     ];
   ]

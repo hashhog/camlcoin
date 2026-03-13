@@ -315,6 +315,105 @@ let test_priority_estimates_with_varied_data () =
   Alcotest.(check (float 0.01)) "low priority" 5.0 low
 
 (* ============================================================================
+   Estimate Mode Tests
+   ============================================================================ *)
+
+let test_conservative_gte_economical () =
+  let est = Fee_estimation.create () in
+  (* Populate bucket at 50 sat/vB with varied confirmation times so
+     the 85th percentile differs from the median.
+     Confirmations: 1,1,1,1,1,1,1,1,1,1,2,3,4,5,6 (15 samples)
+     Median (idx 7) = 1, 85th percentile (idx 11) = 3 *)
+  let confirm_times = [| 1;1;1;1;1;1;1;1;1;1;2;3;4;5;6 |] in
+  for i = 0 to Array.length confirm_times - 1 do
+    let txid = make_txid (500 + i) in
+    Fee_estimation.track_transaction est txid 50.0 100;
+    Fee_estimation.record_confirmation est txid (100 + confirm_times.(i))
+  done;
+  (* Also populate bucket at 100 sat/vB with tight 1-block confirmations *)
+  for i = 0 to 14 do
+    let txid = make_txid (600 + i) in
+    Fee_estimation.track_transaction est txid 100.0 100;
+    Fee_estimation.record_confirmation est txid 101
+  done;
+  (* For a 6-block target both modes should return something *)
+  let econ = Fee_estimation.estimate_fee ~mode:Economical est 6 in
+  let cons = Fee_estimation.estimate_fee ~mode:Conservative est 6 in
+  (match econ, cons with
+   | Some e, Some c ->
+     Alcotest.(check bool) "conservative >= economical" true (c >= e)
+   | None, Some _ ->
+     (* Conservative found a result but economical didn't — that's fine,
+        conservative picks a higher fee bucket *)
+     ()
+   | Some _, None ->
+     Alcotest.fail "economical has result but conservative does not"
+   | None, None ->
+     (* Both None is possible if no bucket meets the percentile threshold *)
+     ());
+  (* For a 1-block target, test the multiplier effect *)
+  let econ1 = Fee_estimation.estimate_fee ~mode:Economical est 1 in
+  let cons1 = Fee_estimation.estimate_fee ~mode:Conservative est 1 in
+  match econ1, cons1 with
+  | Some e, Some c ->
+    Alcotest.(check bool) "conservative >= economical (1 block)" true (c >= e)
+  | _ -> ()  (* If either is None, nothing to compare *)
+
+let test_conservative_multiplier () =
+  let est = Fee_estimation.create () in
+  (* All confirm in 1 block — median and 85th percentile both = 1 *)
+  for i = 0 to 14 do
+    let txid = make_txid (700 + i) in
+    Fee_estimation.track_transaction est txid 50.0 100;
+    Fee_estimation.record_confirmation est txid 101
+  done;
+  let econ = Fee_estimation.estimate_fee ~mode:Economical est 1 in
+  let cons = Fee_estimation.estimate_fee ~mode:Conservative est 1 in
+  match econ, cons with
+  | Some e, Some c ->
+    (* Conservative should be 1.5x for 1-block target *)
+    Alcotest.(check (float 0.01)) "conservative is 1.5x for 1 block"
+      (e *. 1.5) c
+  | _ -> Alcotest.fail "both modes should return a result"
+
+(* ============================================================================
+   Eviction Tests
+   ============================================================================ *)
+
+let test_record_eviction_removes_tx () =
+  let est = Fee_estimation.create () in
+  let txid = make_txid 900 in
+  Fee_estimation.track_transaction est txid 50.0 100;
+  Alcotest.(check int) "tracked before eviction" 1
+    (Fee_estimation.tracked_count est);
+  Fee_estimation.record_eviction est txid;
+  Alcotest.(check int) "removed after eviction" 0
+    (Fee_estimation.tracked_count est)
+
+let test_record_eviction_no_confirmation () =
+  let est = Fee_estimation.create () in
+  let txid = make_txid 901 in
+  Fee_estimation.track_transaction est txid 50.0 100;
+  Fee_estimation.record_eviction est txid;
+  (* Bucket should have zero confirmed and zero unconfirmed *)
+  match Fee_estimation.get_bucket_stats est 9 with
+  | None -> Alcotest.fail "bucket should exist"
+  | Some stats ->
+    Alcotest.(check int) "confirmed still 0" 0 stats.confirmed;
+    Alcotest.(check int) "unconfirmed decremented" 0 stats.unconfirmed;
+    Alcotest.(check int) "no samples added" 0 stats.sample_count
+
+let test_record_eviction_idempotent () =
+  let est = Fee_estimation.create () in
+  let txid = make_txid 902 in
+  Fee_estimation.track_transaction est txid 50.0 100;
+  Fee_estimation.record_eviction est txid;
+  (* Second eviction of same txid should be a no-op *)
+  Fee_estimation.record_eviction est txid;
+  Alcotest.(check int) "still 0 tracked" 0
+    (Fee_estimation.tracked_count est)
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -349,5 +448,14 @@ let () =
     ];
     "priorities", [
       test_case "varied data" `Quick test_priority_estimates_with_varied_data;
+    ];
+    "estimate_mode", [
+      test_case "conservative >= economical" `Quick test_conservative_gte_economical;
+      test_case "conservative multiplier" `Quick test_conservative_multiplier;
+    ];
+    "eviction", [
+      test_case "eviction removes tx" `Quick test_record_eviction_removes_tx;
+      test_case "eviction no confirmation" `Quick test_record_eviction_no_confirmation;
+      test_case "eviction idempotent" `Quick test_record_eviction_idempotent;
     ];
   ]

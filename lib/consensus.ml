@@ -672,6 +672,21 @@ let work_add (a : Cstruct.t) (b : Cstruct.t) : Cstruct.t =
    effectively destroying the earlier outputs. *)
 let bip30_exception_heights = [91842; 91880]
 
+(* Compute difficulty from compact bits format.
+   difficulty = max_target / current_target
+   max_target for mainnet genesis: 0x1d00ffff *)
+let difficulty_from_bits (bits : int32) : float =
+  let max_bits = 0x1d00ffffl in
+  let target_from_compact b =
+    let exp = Int32.to_int (Int32.shift_right_logical b 24) in
+    let mant = Int32.to_float (Int32.logand b 0x007fffffl) in
+    mant *. (2.0 ** (8.0 *. (float_of_int (exp - 3))))
+  in
+  let max_target = target_from_compact max_bits in
+  let current_target = target_from_compact bits in
+  if current_target = 0.0 then 0.0
+  else max_target /. current_target
+
 (* Look up the expected block hash for a checkpoint height *)
 let get_checkpoint_hash (height : int) (network : network_config) : Types.hash256 option =
   List.assoc_opt height network.checkpoints

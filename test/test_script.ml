@@ -111,7 +111,7 @@ let test_parse_pushdata () =
   let ops = Script.parse_script script in
   Alcotest.(check int) "pushdata parses" 1 (List.length ops);
   match List.hd ops with
-  | Script.OP_PUSHDATA data ->
+  | Script.OP_PUSHDATA (_, data) ->
     Alcotest.(check string) "pushed data" "aabbcc" (cstruct_to_hex data)
   | _ -> Alcotest.fail "Expected OP_PUSHDATA"
 
@@ -121,7 +121,7 @@ let test_parse_pushdata1 () =
   let ops = Script.parse_script script in
   Alcotest.(check int) "pushdata1 parses" 1 (List.length ops);
   match List.hd ops with
-  | Script.OP_PUSHDATA data ->
+  | Script.OP_PUSHDATA (_, data) ->
     Alcotest.(check string) "pushed data" "aabbcc" (cstruct_to_hex data)
   | _ -> Alcotest.fail "Expected OP_PUSHDATA"
 
@@ -131,7 +131,7 @@ let test_parse_p2pkh_pubkey_script () =
   let ops = Script.parse_script script in
   Alcotest.(check int) "P2PKH has 5 ops" 5 (List.length ops);
   match ops with
-  | [Script.OP_DUP; Script.OP_HASH160; Script.OP_PUSHDATA _; Script.OP_EQUALVERIFY; Script.OP_CHECKSIG] -> ()
+  | [Script.OP_DUP; Script.OP_HASH160; Script.OP_PUSHDATA (_, _); Script.OP_EQUALVERIFY; Script.OP_CHECKSIG] -> ()
   | _ -> Alcotest.fail "Expected P2PKH pattern"
 
 (* ============================================================================
@@ -653,6 +653,259 @@ let error_tests = [
   Alcotest.test_case "disabled opcode" `Quick test_eval_disabled_opcode;
 ]
 
+(* ============================================================================
+   Round 5 Phase 1 - Consensus-Critical Script Fix Tests
+   ============================================================================ *)
+
+(* Helper: eval with specific flags *)
+let eval_script_with_flags script_hex flags =
+  let tx = make_test_tx () in
+  let st = Script.create_eval_state ~tx ~input_index:0 ~amount:0L ~flags
+             ~sig_version:Script.SigVersionBase () in
+  match Script.eval_script st (hex_to_cstruct script_hex) with
+  | Error e -> Error e
+  | Ok () ->
+    match st.stack with
+    | [] -> Ok false
+    | top :: _ -> Ok (Script.is_true top)
+
+(* -- CONST_SCRIPTCODE: OP_CODESEPARATOR rejection -- *)
+
+let test_codesep_rejected_with_const_scriptcode () =
+  (* OP_1 OP_CODESEPARATOR should fail with CONST_SCRIPTCODE flag *)
+  (* 0x51 = OP_1, 0xAB = OP_CODESEPARATOR *)
+  let flags = Script.script_verify_const_scriptcode in
+  match eval_script_with_flags "51ab" flags with
+  | Error _ -> ()  (* Expected: error *)
+  | Ok _ -> Alcotest.fail "OP_CODESEPARATOR should be rejected with CONST_SCRIPTCODE"
+
+let test_codesep_allowed_without_const_scriptcode () =
+  (* OP_1 OP_CODESEPARATOR should succeed without CONST_SCRIPTCODE flag *)
+  match eval_script_with_flags "51ab" 0 with
+  | Ok true -> ()
+  | Ok false -> Alcotest.fail "Expected true on stack"
+  | Error e -> Alcotest.fail ("Should succeed without flag: " ^ e)
+
+let test_codesep_rejected_in_dead_branch () =
+  (* OP_0 OP_IF OP_CODESEPARATOR OP_ENDIF OP_1 -- even in dead IF branch *)
+  let flags = Script.script_verify_const_scriptcode in
+  match eval_script_with_flags "0063ab6851" flags with
+  | Error _ -> ()
+  | Ok _ -> Alcotest.fail "OP_CODESEPARATOR in dead branch should still be rejected"
+
+(* -- MINIMALDATA: check_minimal_push during execution -- *)
+
+let test_minimaldata_empty_push_rejected () =
+  (* OP_PUSHDATA1 with 0 bytes: 4c00 -- should use OP_0 *)
+  let flags = Script.script_verify_minimaldata in
+  match eval_script_with_flags "4c00" flags with
+  | Error _ -> ()
+  | Ok _ -> Alcotest.fail "Empty PUSHDATA should be rejected with MINIMALDATA"
+
+let test_minimaldata_push1_should_use_opn () =
+  (* Direct push of byte 0x05: 0105 -- should use OP_5 *)
+  let flags = Script.script_verify_minimaldata in
+  match eval_script_with_flags "0105" flags with
+  | Error _ -> ()
+  | Ok _ -> Alcotest.fail "Push of 0x05 should use OP_5 with MINIMALDATA"
+
+let test_minimaldata_push_0x81_should_use_1negate () =
+  (* Direct push of byte 0x81: 0181 -- should use OP_1NEGATE *)
+  let flags = Script.script_verify_minimaldata in
+  match eval_script_with_flags "0181" flags with
+  | Error _ -> ()
+  | Ok _ -> Alcotest.fail "Push of 0x81 should use OP_1NEGATE with MINIMALDATA"
+
+let test_minimaldata_pushdata1_small () =
+  (* PUSHDATA1 for 3 bytes: 4c03aabbcc -- should use direct push *)
+  let flags = Script.script_verify_minimaldata in
+  match eval_script_with_flags "4c03aabbcc" flags with
+  | Error _ -> ()
+  | Ok _ -> Alcotest.fail "PUSHDATA1 for 3-byte data should be rejected"
+
+let test_minimaldata_valid_direct_push () =
+  (* Direct push of 2 bytes 0xaa 0xbb: 02aabb -- valid minimal *)
+  let flags = Script.script_verify_minimaldata in
+  match eval_script_with_flags "02aabb" flags with
+  | Ok true -> ()
+  | Ok false -> Alcotest.fail "Expected true"
+  | Error e -> Alcotest.fail ("Valid minimal push should succeed: " ^ e)
+
+let test_minimaldata_no_flag () =
+  (* PUSHDATA1 for 3 bytes without flag should succeed *)
+  match eval_script_with_flags "4c03aabbcc" 0 with
+  | Ok true -> ()
+  | Ok false -> Alcotest.fail "Expected true"
+  | Error e -> Alcotest.fail ("Should succeed without MINIMALDATA: " ^ e)
+
+let test_minimaldata_opbyte_preserved_in_parsing () =
+  (* Test that the opcode byte is correctly preserved: direct push vs PUSHDATA1 *)
+  let script_direct = hex_to_cstruct "03aabbcc" in (* direct push of 3 bytes *)
+  let ops_direct = Script.parse_script script_direct in
+  (match List.hd ops_direct with
+   | Script.OP_PUSHDATA (opbyte, _) ->
+     Alcotest.(check int) "direct push opbyte" 3 opbyte
+   | _ -> Alcotest.fail "Expected OP_PUSHDATA");
+  let script_pd1 = hex_to_cstruct "4c03aabbcc" in (* PUSHDATA1 *)
+  let ops_pd1 = Script.parse_script script_pd1 in
+  (match List.hd ops_pd1 with
+   | Script.OP_PUSHDATA (opbyte, _) ->
+     Alcotest.(check int) "PUSHDATA1 opbyte" 0x4c opbyte
+   | _ -> Alcotest.fail "Expected OP_PUSHDATA")
+
+(* -- DISCOURAGE_UPGRADABLE_NOPS -- *)
+
+let test_discourage_nop1 () =
+  (* OP_1 OP_NOP1 -- should fail with discourage flag *)
+  let flags = Script.script_verify_discourage_upgradable_nops in
+  match eval_script_with_flags "51b0" flags with
+  | Error _ -> ()
+  | Ok _ -> Alcotest.fail "NOP1 should be rejected with DISCOURAGE_UPGRADABLE_NOPS"
+
+let test_nop1_allowed_without_flag () =
+  (* OP_1 OP_NOP1 -- should succeed without flag *)
+  match eval_script_with_flags "51b0" 0 with
+  | Ok true -> ()
+  | Ok false -> Alcotest.fail "Expected true"
+  | Error e -> Alcotest.fail ("NOP1 should succeed without flag: " ^ e)
+
+let test_discourage_nop4 () =
+  (* OP_1 OP_NOP4 (0xb3) *)
+  let flags = Script.script_verify_discourage_upgradable_nops in
+  match eval_script_with_flags "51b3" flags with
+  | Error _ -> ()
+  | Ok _ -> Alcotest.fail "NOP4 should be rejected with DISCOURAGE_UPGRADABLE_NOPS"
+
+let test_discourage_nop10 () =
+  (* OP_1 OP_NOP10 (0xb9) *)
+  let flags = Script.script_verify_discourage_upgradable_nops in
+  match eval_script_with_flags "51b9" flags with
+  | Error _ -> ()
+  | Ok _ -> Alcotest.fail "NOP10 should be rejected with DISCOURAGE_UPGRADABLE_NOPS"
+
+(* -- DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM -- *)
+
+let test_discourage_witness_v2 () =
+  (* A witness v2 program: OP_2 <20 bytes> = 5214 + 20 zero bytes *)
+  let tx = make_test_tx () in
+  let script_pubkey = hex_to_cstruct ("5214" ^ String.make 40 '0') in
+  let witness = { Types.items = [] } in
+  let flags = Script.script_verify_witness lor Script.script_verify_discourage_upgradable_witness in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+          ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
+  | Error _ -> ()
+  | Ok _ -> Alcotest.fail "Witness v2 should be discouraged"
+
+let test_witness_v2_allowed_without_flag () =
+  let tx = make_test_tx () in
+  let script_pubkey = hex_to_cstruct ("5214" ^ String.make 40 '0') in
+  let witness = { Types.items = [] } in
+  let flags = Script.script_verify_witness in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+          ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
+  | Ok true -> ()
+  | Ok false -> Alcotest.fail "Expected success"
+  | Error e -> Alcotest.fail ("Should succeed without discourage flag: " ^ e)
+
+(* -- DISCOURAGE_OP_SUCCESS flag constant -- *)
+
+let test_discourage_op_success_flag_exists () =
+  (* Just verify the flag constant is defined and non-zero *)
+  Alcotest.(check bool) "flag is non-zero" true
+    (Script.script_verify_discourage_op_success <> 0)
+
+(* -- OP_PUSHDATA type roundtrip through serialize -- *)
+
+let test_pushdata_serialize_roundtrip () =
+  (* Test that serialization preserves the encoding format *)
+  let script = hex_to_cstruct "4c03aabbcc" in (* PUSHDATA1 *)
+  let ops = Script.parse_script script in
+  let reserialized = Script.serialize_script ops in
+  Alcotest.(check string) "roundtrip preserves PUSHDATA1"
+    (cstruct_to_hex script) (cstruct_to_hex reserialized)
+
+let test_pushdata_direct_serialize_roundtrip () =
+  let script = hex_to_cstruct "03aabbcc" in (* direct push *)
+  let ops = Script.parse_script script in
+  let reserialized = Script.serialize_script ops in
+  Alcotest.(check string) "roundtrip preserves direct push"
+    (cstruct_to_hex script) (cstruct_to_hex reserialized)
+
+(* ============================================================================
+   Bug 7: Tapscript witness item size check
+   ============================================================================ *)
+
+let test_witness_item_size_checked_for_tapscript () =
+  (* check_witness_item_sizes should enforce 520-byte limit for tapscript too *)
+  let oversized_item = Cstruct.create 521 in
+  let witness = { Types.items = [oversized_item] } in
+  match Script.check_witness_item_sizes ~sig_version:Script.SigVersionTapscript witness with
+  | Error _ -> ()  (* Expected: oversized item rejected *)
+  | Ok () -> Alcotest.fail "Should reject oversized witness item in tapscript"
+
+let test_witness_item_size_ok_for_tapscript () =
+  (* A 520-byte item should be allowed *)
+  let ok_item = Cstruct.create 520 in
+  let witness = { Types.items = [ok_item] } in
+  match Script.check_witness_item_sizes ~sig_version:Script.SigVersionTapscript witness with
+  | Ok () -> ()
+  | Error e -> Alcotest.fail ("Should allow 520-byte witness item: " ^ e)
+
+(* ============================================================================
+   Bug 8: DISCOURAGE_UPGRADABLE_TAPROOT_VERSION flag
+   ============================================================================ *)
+
+let test_discourage_upgradable_taproot_version_flag_exists () =
+  Alcotest.(check bool) "flag is non-zero" true
+    (Script.script_verify_discourage_upgradable_taproot_version <> 0)
+
+let test_discourage_upgradable_taproot_version_flag_value () =
+  Alcotest.(check int) "flag is 1 lsl 19" (1 lsl 19)
+    Script.script_verify_discourage_upgradable_taproot_version
+
+(* ============================================================================
+   Bug 9: DISCOURAGE_UPGRADABLE_PUBKEYTYPE flag
+   ============================================================================ *)
+
+let test_discourage_upgradable_pubkeytype_flag_exists () =
+  Alcotest.(check bool) "flag is non-zero" true
+    (Script.script_verify_discourage_upgradable_pubkeytype <> 0)
+
+let test_discourage_upgradable_pubkeytype_flag_value () =
+  Alcotest.(check int) "flag is 1 lsl 20" (1 lsl 20)
+    Script.script_verify_discourage_upgradable_pubkeytype
+
+let bug7_8_9_tests = [
+  Alcotest.test_case "Tapscript witness item size enforced" `Quick test_witness_item_size_checked_for_tapscript;
+  Alcotest.test_case "Tapscript witness item size ok at 520" `Quick test_witness_item_size_ok_for_tapscript;
+  Alcotest.test_case "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION flag exists" `Quick test_discourage_upgradable_taproot_version_flag_exists;
+  Alcotest.test_case "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION flag value" `Quick test_discourage_upgradable_taproot_version_flag_value;
+  Alcotest.test_case "DISCOURAGE_UPGRADABLE_PUBKEYTYPE flag exists" `Quick test_discourage_upgradable_pubkeytype_flag_exists;
+  Alcotest.test_case "DISCOURAGE_UPGRADABLE_PUBKEYTYPE flag value" `Quick test_discourage_upgradable_pubkeytype_flag_value;
+]
+
+let round5_tests = [
+  Alcotest.test_case "CONST_SCRIPTCODE rejects OP_CODESEPARATOR" `Quick test_codesep_rejected_with_const_scriptcode;
+  Alcotest.test_case "OP_CODESEPARATOR allowed without flag" `Quick test_codesep_allowed_without_const_scriptcode;
+  Alcotest.test_case "CONST_SCRIPTCODE rejects in dead branch" `Quick test_codesep_rejected_in_dead_branch;
+  Alcotest.test_case "MINIMALDATA empty push rejected" `Quick test_minimaldata_empty_push_rejected;
+  Alcotest.test_case "MINIMALDATA push 0x05 uses OP_5" `Quick test_minimaldata_push1_should_use_opn;
+  Alcotest.test_case "MINIMALDATA push 0x81 uses OP_1NEGATE" `Quick test_minimaldata_push_0x81_should_use_1negate;
+  Alcotest.test_case "MINIMALDATA PUSHDATA1 small rejected" `Quick test_minimaldata_pushdata1_small;
+  Alcotest.test_case "MINIMALDATA valid direct push" `Quick test_minimaldata_valid_direct_push;
+  Alcotest.test_case "MINIMALDATA no flag allows non-minimal" `Quick test_minimaldata_no_flag;
+  Alcotest.test_case "MINIMALDATA opbyte preserved" `Quick test_minimaldata_opbyte_preserved_in_parsing;
+  Alcotest.test_case "DISCOURAGE NOP1" `Quick test_discourage_nop1;
+  Alcotest.test_case "NOP1 allowed without flag" `Quick test_nop1_allowed_without_flag;
+  Alcotest.test_case "DISCOURAGE NOP4" `Quick test_discourage_nop4;
+  Alcotest.test_case "DISCOURAGE NOP10" `Quick test_discourage_nop10;
+  Alcotest.test_case "DISCOURAGE witness v2" `Quick test_discourage_witness_v2;
+  Alcotest.test_case "Witness v2 allowed without flag" `Quick test_witness_v2_allowed_without_flag;
+  Alcotest.test_case "DISCOURAGE_OP_SUCCESS flag exists" `Quick test_discourage_op_success_flag_exists;
+  Alcotest.test_case "PUSHDATA serialize roundtrip (PUSHDATA1)" `Quick test_pushdata_serialize_roundtrip;
+  Alcotest.test_case "PUSHDATA serialize roundtrip (direct)" `Quick test_pushdata_direct_serialize_roundtrip;
+]
+
 let () = Alcotest.run "test_script" [
   ("script_num", script_num_tests);
   ("parsing", parsing_tests);
@@ -664,4 +917,6 @@ let () = Alcotest.run "test_script" [
   ("stack", stack_tests);
   ("boolean", boolean_tests);
   ("error", error_tests);
+  ("round5_phase1", round5_tests);
+  ("bug7_8_9", bug7_8_9_tests);
 ]

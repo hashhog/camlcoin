@@ -802,6 +802,74 @@ let process_orphan_blocks (ibd : ibd_state) (parent_hash : Types.hash256) : int 
         !processed (Types.hash256_to_hex_display parent_hash));
   !processed
 
+(* Compute the median time past (MTP) for a block at the given height.
+   MTP is the median of the timestamps of the previous 11 blocks (or fewer
+   if near genesis). Returns 0l if no ancestors are available. *)
+let compute_median_time_past (state : chain_state) (height : int) : int32 =
+  let rec collect acc h count =
+    if count <= 0 || h < 0 then acc
+    else match get_header_at_height state h with
+      | Some entry -> collect (entry.header.timestamp :: acc) (h - 1) (count - 1)
+      | None -> acc
+  in
+  (* Collect up to 11 timestamps from height-1 down to height-11 *)
+  let timestamps = collect [] (height - 1) 11 in
+  Consensus.median_time_past timestamps
+
+(* Compute the expected difficulty bits for a block at the given height.
+   - Genesis block (height 0): use genesis header bits
+   - Regtest (pow_no_retargeting): use parent's bits (every block same difficulty)
+   - Difficulty adjustment boundary (height mod 2016 = 0): compute retarget
+   - Testnet min-difficulty: if block timestamp > 20 min after parent, allow pow_limit
+   - Otherwise: use parent's bits *)
+let compute_expected_bits (state : chain_state) (height : int)
+    (block_header : Types.block_header) : int32 =
+  let network = state.network in
+  if height = 0 then
+    network.genesis_header.bits
+  else if network.pow_no_retargeting then
+    (* Regtest: no retargeting, use parent's bits *)
+    (match get_header_at_height state (height - 1) with
+     | Some parent -> parent.header.bits
+     | None -> network.pow_limit)
+  else if height mod Consensus.difficulty_adjustment_interval = 0 then begin
+    (* Difficulty adjustment boundary *)
+    let last_retarget_height = height - Consensus.difficulty_adjustment_interval in
+    let last_retarget_time =
+      match get_header_at_height state last_retarget_height with
+      | Some entry -> entry.header.timestamp
+      | None -> 0l
+    in
+    let parent =
+      match get_header_at_height state (height - 1) with
+      | Some entry -> entry.header
+      | None -> network.genesis_header
+    in
+    let current_bits = parent.bits in
+    Consensus.next_work_required
+      ~last_retarget_time
+      ~current_header:parent
+      ~current_bits
+      ~network
+  end else begin
+    (* Non-adjustment block *)
+    match get_header_at_height state (height - 1) with
+    | Some parent ->
+      (* Testnet min-difficulty rule: if block timestamp is > 20 min after
+         parent, allow mining at pow_limit *)
+      (match Consensus.testnet_min_difficulty_bits
+               ~prev_block_time:parent.header.timestamp
+               ~current_time:block_header.timestamp
+               ~network with
+       | Some min_bits -> min_bits
+       | None -> parent.header.bits)
+    | None -> network.pow_limit
+  end
+
+(* Compute MTP for a given height - used as callback for BIP-68 validation *)
+let get_mtp_for_height (state : chain_state) (h : int) : int32 =
+  compute_median_time_past state h
+
 (* Process downloaded blocks in height order *)
 let process_downloaded_blocks (ibd : ibd_state)
     : (int, string) result =
@@ -817,13 +885,10 @@ let process_downloaded_blocks (ibd : ibd_state)
       | Downloaded block ->
         (* Validate the block *)
         let height = entry.height in
-        (* Get expected difficulty from header *)
-        let expected_bits = block.header.bits in
-        (* Get median time past (simplified - use parent timestamp) *)
-        let median_time = match get_header_at_height ibd.chain (height - 1) with
-          | Some parent -> parent.header.timestamp
-          | None -> 0l
-        in
+        (* Compute expected difficulty from chain state *)
+        let expected_bits = compute_expected_bits ibd.chain height block.header in
+        (* Compute median time past from last 11 blocks *)
+        let median_time = compute_median_time_past ibd.chain height in
         (* Build UTXO lookup function *)
         let lookup outpoint =
           let _txid_key = Cstruct.to_string outpoint.Types.txid in
@@ -854,7 +919,9 @@ let process_downloaded_blocks (ibd : ibd_state)
         in
         (match Validation.validate_block_with_utxos block height
                  ~expected_bits ~median_time ~base_lookup:lookup
-                 ~flags:validation_flags ~skip_scripts () with
+                 ~flags:validation_flags ~skip_scripts
+                 ~network:ibd.chain.network
+                 ~get_mtp_at_height:(get_mtp_for_height ibd.chain) () with
          | Ok _fees ->
            (* Store block *)
            Storage.ChainDB.store_block ibd.chain.db entry.hash block;
@@ -1084,11 +1151,10 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
               "Missing block at height %d during reorg connect" entry.height)
           | Some block ->
             let height = entry.height in
-            let expected_bits = block.header.bits in
-            let median_time = match get_header_at_height state (height - 1) with
-              | Some parent -> parent.header.timestamp
-              | None -> 0l
-            in
+            (* Compute expected difficulty from chain state *)
+            let expected_bits = compute_expected_bits state height block.header in
+            (* Compute median time past from last 11 blocks *)
+            let median_time = compute_median_time_past state height in
             let lookup outpoint =
               let vout = Int32.to_int outpoint.Types.vout in
               match Storage.ChainDB.get_utxo state.db outpoint.Types.txid vout with
@@ -1116,7 +1182,9 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
             in
             (match Validation.validate_block_with_utxos block height
                      ~expected_bits ~median_time ~base_lookup:lookup
-                     ~flags:validation_flags ~skip_scripts () with
+                     ~flags:validation_flags ~skip_scripts
+                     ~network:state.network
+                     ~get_mtp_at_height:(get_mtp_for_height state) () with
              | Ok _fees ->
                (* Store block if not already stored *)
                if not (Storage.ChainDB.has_block state.db entry.hash) then
@@ -1262,3 +1330,33 @@ let start_ibd ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
       run_ibd ibd peers
     end
   end
+
+(* ============================================================================
+   Mempool Request Handler
+   ============================================================================ *)
+
+(* Maximum number of inventory items to send in response to a mempool message *)
+let max_mempool_inv_items = 50_000
+
+(* Handle a MempoolMsg from a peer: respond with an InvMsg listing
+   transaction IDs currently in the mempool. *)
+let handle_mempool_msg (ibd : ibd_state) (peer : Peer.peer) : unit Lwt.t =
+  match ibd.mempool with
+  | None ->
+    (* No mempool attached — nothing to advertise *)
+    Lwt.return_unit
+  | Some mp ->
+    let count = ref 0 in
+    let inv_items = ref [] in
+    Hashtbl.iter (fun _k (entry : Mempool.mempool_entry) ->
+      if !count < max_mempool_inv_items then begin
+        inv_items := P2p.{ inv_type = InvTx; hash = entry.txid } :: !inv_items;
+        incr count
+      end
+    ) mp.entries;
+    if !inv_items <> [] then
+      Lwt.catch
+        (fun () -> Peer.send_message peer (P2p.InvMsg !inv_items))
+        (fun _exn -> Lwt.return_unit)
+    else
+      Lwt.return_unit

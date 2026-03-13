@@ -959,11 +959,22 @@ module ChainDB = struct
   (* Undo data storage - keyed by block hash for chain reorganizations *)
   let store_undo_data t (block_hash : Types.hash256) (undo_data : string) =
     let key = prefix_undo_data ^ Cstruct.to_string block_hash in
-    LogStorage.put t.db key undo_data
+    let checksum = Crypto.sha256 (Cstruct.of_string undo_data) in
+    LogStorage.put t.db key (undo_data ^ Cstruct.to_string checksum)
 
   let get_undo_data t (block_hash : Types.hash256) : string option =
     let key = prefix_undo_data ^ Cstruct.to_string block_hash in
-    LogStorage.get t.db key
+    match LogStorage.get t.db key with
+    | None -> None
+    | Some raw ->
+      let len = String.length raw in
+      if len < 32 then None  (* too short for checksum *)
+      else
+        let data = String.sub raw 0 (len - 32) in
+        let stored_checksum = String.sub raw (len - 32) 32 in
+        let computed = Crypto.sha256 (Cstruct.of_string data) in
+        if Cstruct.to_string computed = stored_checksum then Some data
+        else None  (* checksum mismatch = corrupt *)
 
   let delete_undo_data t (block_hash : Types.hash256) =
     let key = prefix_undo_data ^ Cstruct.to_string block_hash in
@@ -972,7 +983,8 @@ module ChainDB = struct
   (* Batch undo data operations *)
   let batch_store_undo_data batch (block_hash : Types.hash256) (undo_data : string) =
     let key = prefix_undo_data ^ Cstruct.to_string block_hash in
-    LogStorage.batch_put batch key undo_data
+    let checksum = Crypto.sha256 (Cstruct.of_string undo_data) in
+    LogStorage.batch_put batch key (undo_data ^ Cstruct.to_string checksum)
 
   let batch_delete_undo_data batch (block_hash : Types.hash256) =
     let key = prefix_undo_data ^ Cstruct.to_string block_hash in

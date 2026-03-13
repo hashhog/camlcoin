@@ -34,6 +34,8 @@ type block_validation_error =
   | BlockDuplicateTx
   | BlockTxValidationFailed of int * tx_validation_error
   | BlockBadWitnessCommitment
+  | BlockBadVersion
+  | BlockMutatedMerkle
 
 (* ============================================================================
    Error formatting
@@ -75,6 +77,8 @@ let block_error_to_string = function
   | BlockTxValidationFailed (i, e) ->
     Printf.sprintf "transaction %d validation failed: %s" i (tx_error_to_string e)
   | BlockBadWitnessCommitment -> "witness commitment mismatch"
+  | BlockBadVersion -> "block version too low for active soft forks"
+  | BlockMutatedMerkle -> "merkle tree has mutated duplicate transactions"
 
 (* ============================================================================
    Transaction Weight Computation (BIP-141)
@@ -200,7 +204,7 @@ let is_coinbase = is_coinbase_tx
    ============================================================================ *)
 
 (* Check coinbase transaction structure *)
-let check_coinbase (tx : Types.transaction) (height : int)
+let check_coinbase ~network:(network : Consensus.network_config) (tx : Types.transaction) (height : int)
     : (unit, tx_validation_error) result =
   (* Coinbase must have exactly one input *)
   if List.length tx.inputs <> 1 then
@@ -222,7 +226,7 @@ let check_coinbase (tx : Types.transaction) (height : int)
       else begin
         (* BIP-34: Check block height encoding in coinbase script
            Only enforced at heights where BIP-34 is active *)
-        if height >= 0 then begin
+        if height >= network.bip34_height then begin
           let expected = Consensus.encode_height_in_coinbase height in
           let expected_len = Cstruct.length expected in
           if script_len < expected_len then
@@ -573,7 +577,7 @@ let check_duplicate_txids (transactions : Types.transaction list)
   check transactions
 
 (* Validate a full block *)
-let check_block (block : Types.block) (height : int)
+let check_block ~network:(network : Consensus.network_config) (block : Types.block) (height : int)
     ~(expected_bits : int32) ~(median_time : int32)
     : (unit, block_validation_error) result =
   let txs = block.transactions in
@@ -588,9 +592,17 @@ let check_block (block : Types.block) (height : int)
       Error BlockNoCoinbase
     else begin
       (* Validate coinbase structure *)
-      match check_coinbase coinbase height with
+      match check_coinbase ~network coinbase height with
       | Error e -> Error (BlockTxValidationFailed (0, e))
       | Ok () ->
+        (* Bug 5: Block version enforcement after BIP activation heights *)
+        if height >= network.bip34_height && Int32.compare block.header.version 2l < 0 then
+          Error BlockBadVersion
+        else if height >= network.bip66_height && Int32.compare block.header.version 3l < 0 then
+          Error BlockBadVersion
+        else if height >= network.bip65_height && Int32.compare block.header.version 4l < 0 then
+          Error BlockBadVersion
+        else
         (* Check difficulty target *)
         if block.header.bits <> expected_bits then
           Error BlockBadDifficulty
@@ -606,8 +618,10 @@ let check_block (block : Types.block) (height : int)
             else begin
               (* Verify merkle root *)
               let txids = List.map Crypto.compute_txid txs in
-              let (computed_merkle, _mutated) = Crypto.merkle_root txids in
-              if not (Cstruct.equal computed_merkle block.header.merkle_root) then
+              let (computed_merkle, mutated) = Crypto.merkle_root txids in
+              if mutated then
+                Error BlockMutatedMerkle
+              else if not (Cstruct.equal computed_merkle block.header.merkle_root) then
                 Error BlockBadMerkleRoot
               else begin
                 (* Check for duplicate txids *)
@@ -943,14 +957,14 @@ let check_bip30 ~(lookup : utxo_lookup) ~(txid : Types.hash256)
 
    IMPORTANT: This properly handles intra-block spending by updating
    a local UTXO view during validation. *)
-let validate_block_with_utxos (block : Types.block) (height : int)
+let validate_block_with_utxos ~network:(network : Consensus.network_config) (block : Types.block) (height : int)
     ~(expected_bits : int32) ~(median_time : int32)
     ~(base_lookup : utxo_lookup) ~(flags : int)
-    ?(skip_scripts=false) ()
+    ?(skip_scripts=false) ?get_mtp_at_height ()
     : (int64, block_validation_error) result =
 
   (* First do context-free checks *)
-  match check_block block height ~expected_bits ~median_time with
+  match check_block ~network block height ~expected_bits ~median_time with
   | Error e -> Error e
   | Ok () ->
     (* BIP-141 weighted sigops cost check.
@@ -1024,7 +1038,8 @@ let validate_block_with_utxos (block : Types.block) (height : int)
                   | None -> ()
                 ) tx.inputs;
                 if not (check_sequence_locks tx ~block_height:height
-                          ~median_time ~utxo_heights ~utxo_mtps ()) then
+                          ~median_time ~utxo_heights ~utxo_mtps
+                          ?get_mtp_at_height ()) then
                   error := Some (BlockTxValidationFailed (i, TxSequenceLocksFailed))
               end;
 

@@ -118,6 +118,16 @@ let run (config : config) : unit Lwt.t =
   in
   let mempool = Mempool.create ~utxo ~current_height () in
 
+  (* Load persisted mempool from previous session *)
+  let mempool_path = Filename.concat config.data_dir "mempool.dat" in
+  (try
+    let loaded = Mempool.load_mempool mempool mempool_path in
+    if loaded > 0 then
+      Logs.info (fun m -> m "Loaded %d transactions from mempool.dat" loaded)
+  with exn ->
+    Logs.warn (fun m ->
+      m "Failed to load mempool.dat: %s" (Printexc.to_string exn)));
+
   (* Initialize fee estimator *)
   let fee_estimator = Fee_estimation.create () in
 
@@ -127,6 +137,15 @@ let run (config : config) : unit Lwt.t =
               max_outbound = config.max_outbound;
               max_inbound = config.max_inbound }
     network in
+
+  (* Load persisted peer bans from previous session *)
+  (try
+    let loaded = Peer_manager.load_bans peer_manager db in
+    if loaded > 0 then
+      Logs.info (fun m -> m "Loaded %d peer bans from database" loaded)
+  with exn ->
+    Logs.warn (fun m ->
+      m "Failed to load peer bans: %s" (Printexc.to_string exn)));
 
   (* Initialize wallet *)
   let wallet = if config.wallet_enabled then begin
@@ -258,6 +277,22 @@ let run (config : config) : unit Lwt.t =
     (match wallet with
      | Some w -> Wallet.save w
      | None -> ());
+    (* Save mempool to disk *)
+    (try
+      let mempool_path = Filename.concat config.data_dir "mempool.dat" in
+      Mempool.save_mempool mempool mempool_path;
+      let (mp_count, _, _) = Mempool.get_info mempool in
+      Logs.info (fun m -> m "Saved %d mempool transactions to disk" mp_count)
+    with exn ->
+      Logs.warn (fun m ->
+        m "Failed to save mempool: %s" (Printexc.to_string exn)));
+    (* Save peer bans to disk *)
+    (try
+      Peer_manager.save_bans peer_manager db;
+      Logs.info (fun m -> m "Saved peer bans to disk")
+    with exn ->
+      Logs.warn (fun m ->
+        m "Failed to save bans: %s" (Printexc.to_string exn)));
     (* Flush pending UTXO updates from OptimizedUtxoSet *)
     let dirty = Utxo.OptimizedUtxoSet.dirty_count optimized_utxo in
     if dirty > 0 then

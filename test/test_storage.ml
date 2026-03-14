@@ -283,6 +283,137 @@ let test_height_encoding_order () =
   Alcotest.(check bool) "255 < 256" true (h255 < h256);
   Alcotest.(check bool) "256 < 1000" true (h256 < h1000)
 
+(* ============================================================================
+   Undo Data Tests
+   ============================================================================ *)
+
+(* Test tx_in_undo serialization roundtrip *)
+let test_tx_in_undo_roundtrip () =
+  let script = Cstruct.of_string "\x76\xa9\x14\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x88\xac" in
+  let u : Storage.tx_in_undo = {
+    value = 5000000000L;
+    script_pubkey = script;
+    height = 100;
+    is_coinbase = true;
+  } in
+  let w = Serialize.writer_create () in
+  Storage.serialize_tx_in_undo w u;
+  let data = Serialize.writer_to_cstruct w in
+  let r = Serialize.reader_of_cstruct data in
+  let u2 = Storage.deserialize_tx_in_undo r in
+  Alcotest.(check int64) "value" u.value u2.value;
+  Alcotest.(check bool) "script_pubkey" true (Cstruct.equal u.script_pubkey u2.script_pubkey);
+  Alcotest.(check int) "height" u.height u2.height;
+  Alcotest.(check bool) "is_coinbase" u.is_coinbase u2.is_coinbase
+
+(* Test tx_undo serialization roundtrip *)
+let test_tx_undo_roundtrip () =
+  let script1 = Cstruct.of_string "\x76\xa9\x14\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x88\xac" in
+  let script2 = Cstruct.of_string "\xa9\x14\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x87" in
+  let u : Storage.tx_undo = {
+    prev_outputs = [
+      { value = 1000000L; script_pubkey = script1; height = 50; is_coinbase = false };
+      { value = 2000000L; script_pubkey = script2; height = 75; is_coinbase = true };
+    ]
+  } in
+  let w = Serialize.writer_create () in
+  Storage.serialize_tx_undo w u;
+  let data = Serialize.writer_to_cstruct w in
+  let r = Serialize.reader_of_cstruct data in
+  let u2 = Storage.deserialize_tx_undo r in
+  Alcotest.(check int) "prev_outputs count" (List.length u.prev_outputs) (List.length u2.prev_outputs);
+  let o1 = List.nth u.prev_outputs 0 in
+  let o1' = List.nth u2.prev_outputs 0 in
+  Alcotest.(check int64) "first output value" o1.value o1'.value;
+  let o2 = List.nth u.prev_outputs 1 in
+  let o2' = List.nth u2.prev_outputs 1 in
+  Alcotest.(check bool) "second output is_coinbase" o2.is_coinbase o2'.is_coinbase
+
+(* Test block_undo serialization roundtrip with checksum *)
+let test_block_undo_roundtrip () =
+  let script = Cstruct.of_string "\x76\xa9\x14\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x88\xac" in
+  let u : Storage.block_undo = {
+    tx_undos = [
+      { prev_outputs = [
+          { value = 1000000L; script_pubkey = script; height = 50; is_coinbase = false }
+        ] };
+      { prev_outputs = [
+          { value = 2000000L; script_pubkey = script; height = 60; is_coinbase = false };
+          { value = 3000000L; script_pubkey = script; height = 70; is_coinbase = true };
+        ] };
+    ]
+  } in
+  let w = Serialize.writer_create () in
+  Storage.serialize_block_undo w u;
+  let data = Serialize.writer_to_cstruct w in
+  let r = Serialize.reader_of_cstruct data in
+  let u2 = Storage.deserialize_block_undo r in
+  Alcotest.(check int) "tx_undos count" (List.length u.tx_undos) (List.length u2.tx_undos);
+  let tx1 = List.nth u.tx_undos 0 in
+  let tx1' = List.nth u2.tx_undos 0 in
+  Alcotest.(check int) "tx1 prev_outputs count"
+    (List.length tx1.prev_outputs) (List.length tx1'.prev_outputs);
+  let tx2 = List.nth u.tx_undos 1 in
+  let tx2' = List.nth u2.tx_undos 1 in
+  Alcotest.(check int) "tx2 prev_outputs count"
+    (List.length tx2.prev_outputs) (List.length tx2'.prev_outputs)
+
+(* Test block_undo checksum verification fails on corruption *)
+let test_block_undo_checksum_failure () =
+  let script = Cstruct.of_string "\x76\xa9\x14\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x88\xac" in
+  let u : Storage.block_undo = {
+    tx_undos = [
+      { prev_outputs = [
+          { value = 1000000L; script_pubkey = script; height = 50; is_coinbase = false }
+        ] };
+    ]
+  } in
+  let w = Serialize.writer_create () in
+  Storage.serialize_block_undo w u;
+  let data = Serialize.writer_to_cstruct w in
+  (* Corrupt a byte in the middle *)
+  let len = Cstruct.length data in
+  if len > 10 then begin
+    (* Create a copy by going through bytes *)
+    let corrupted = Cstruct.create len in
+    Cstruct.blit data 0 corrupted 0 len;
+    Cstruct.set_uint8 corrupted 5 0xFF;
+    let r = Serialize.reader_of_cstruct corrupted in
+    let raised = ref false in
+    (try
+      let _ = Storage.deserialize_block_undo r in ()
+    with Failure _ -> raised := true);
+    Alcotest.(check bool) "checksum failure raises" true !raised
+  end
+
+(* Test empty block_undo *)
+let test_block_undo_empty () =
+  let u : Storage.block_undo = { tx_undos = [] } in
+  let w = Serialize.writer_create () in
+  Storage.serialize_block_undo w u;
+  let data = Serialize.writer_to_cstruct w in
+  let r = Serialize.reader_of_cstruct data in
+  let u2 = Storage.deserialize_block_undo r in
+  Alcotest.(check int) "empty tx_undos" 0 (List.length u2.tx_undos)
+
+(* Test disconnect_block with missing undo data *)
+let test_disconnect_block_missing_undo () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let block = make_test_block ~ver:1l ~ts:1231006505l ~nc:2083236893l in
+  let block_hash = Crypto.compute_block_hash block.header in
+  (* Don't store any undo data - just call disconnect *)
+  let add_utxo _txid _vout _u = () in
+  let remove_utxo _txid _vout = () in
+  let result = Storage.disconnect_block db block block_hash ~add_utxo ~remove_utxo in
+  (match result with
+   | Error (Storage.MissingUndoData _) ->
+     Alcotest.(check bool) "missing undo data error" true true
+   | _ ->
+     Alcotest.fail "expected MissingUndoData error");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
@@ -303,5 +434,13 @@ let () =
     ];
     "encoding", [
       test_case "height encoding order" `Quick test_height_encoding_order;
+    ];
+    "undo_data", [
+      test_case "tx_in_undo roundtrip" `Quick test_tx_in_undo_roundtrip;
+      test_case "tx_undo roundtrip" `Quick test_tx_undo_roundtrip;
+      test_case "block_undo roundtrip" `Quick test_block_undo_roundtrip;
+      test_case "block_undo checksum failure" `Quick test_block_undo_checksum_failure;
+      test_case "block_undo empty" `Quick test_block_undo_empty;
+      test_case "disconnect_block missing undo" `Quick test_disconnect_block_missing_undo;
     ];
   ]

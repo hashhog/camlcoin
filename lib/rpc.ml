@@ -367,30 +367,99 @@ let handle_getrawtransaction (ctx : rpc_context)
   | _ ->
     Error "Invalid parameters: expected [txid] or [txid, verbose]"
 
+(* Default constants for sendrawtransaction *)
+let default_max_raw_tx_fee_rate = 0.10  (* 0.10 BTC/kvB *)
+let default_max_burn_amount = 0L        (* 0 BTC by default *)
+
+(* Check if a scriptPubKey is provably unspendable (OP_RETURN or invalid ops) *)
+let is_unspendable_script (script : Cstruct.t) : bool =
+  if Cstruct.length script = 0 then false
+  else
+    (* OP_RETURN (0x6a) at the start makes it unspendable *)
+    Cstruct.get_uint8 script 0 = 0x6a
+
+(* Sum up the value of all unspendable (OP_RETURN) outputs in satoshis *)
+let sum_burn_amount (tx : Types.transaction) : int64 =
+  List.fold_left (fun acc out ->
+    if is_unspendable_script out.Types.script_pubkey then
+      Int64.add acc out.Types.value
+    else acc
+  ) 0L tx.outputs
+
 let handle_sendrawtransaction (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
-  match params with
-  | [`String hex] | [`String hex; _] ->
+  (* Parse parameters: hexstring [, maxfeerate [, maxburnamount]] *)
+  let parse_params params =
+    match params with
+    | [`String hex] ->
+      Ok (hex, default_max_raw_tx_fee_rate, default_max_burn_amount)
+    | [`String hex; `Float maxfeerate] ->
+      Ok (hex, maxfeerate, default_max_burn_amount)
+    | [`String hex; `Int maxfeerate] ->
+      Ok (hex, float_of_int maxfeerate, default_max_burn_amount)
+    | [`String hex; `Float maxfeerate; `Float maxburn] ->
+      (* Convert BTC to satoshis *)
+      let maxburn_sats = Int64.of_float (maxburn *. 100_000_000.0) in
+      Ok (hex, maxfeerate, maxburn_sats)
+    | [`String hex; `Float maxfeerate; `Int maxburn] ->
+      (* Integer BTC to satoshis *)
+      let maxburn_sats = Int64.mul (Int64.of_int maxburn) 100_000_000L in
+      Ok (hex, maxfeerate, maxburn_sats)
+    | [`String hex; `Int maxfeerate; `Float maxburn] ->
+      let maxburn_sats = Int64.of_float (maxburn *. 100_000_000.0) in
+      Ok (hex, float_of_int maxfeerate, maxburn_sats)
+    | [`String hex; `Int maxfeerate; `Int maxburn] ->
+      let maxburn_sats = Int64.mul (Int64.of_int maxburn) 100_000_000L in
+      Ok (hex, float_of_int maxfeerate, maxburn_sats)
+    | _ ->
+      Error "Invalid parameters: expected [hexstring] or [hexstring, maxfeerate] or [hexstring, maxfeerate, maxburnamount]"
+  in
+  match parse_params params with
+  | Error e -> Error e
+  | Ok (hex, max_fee_rate, max_burn_amount) ->
     (try
       let data = Cstruct.of_hex hex in
       let r = Serialize.reader_of_cstruct data in
       let tx = Serialize.deserialize_transaction r in
-      match Mempool.add_transaction ctx.mempool tx with
-      | Ok entry ->
-        (* Relay to peers *)
-        let wtxid = Crypto.compute_wtxid tx in
-        let fee_rate = Int64.div entry.fee (Int64.of_int (max 1 (entry.weight / 4))) in
-        Lwt.async (fun () ->
-          Peer_manager.announce_tx ctx.peer_manager
-            ~txid:entry.txid ~wtxid ~fee_rate
-        );
-        Ok (`String (Types.hash256_to_hex_display entry.txid))
-      | Error msg ->
-        Error msg
+
+      (* Check burn amount before mempool validation *)
+      let burn_amount = sum_burn_amount tx in
+      if burn_amount > max_burn_amount then
+        Error (Printf.sprintf
+          "Unspendable output exceeds maximum: %Ld > %Ld satoshis"
+          burn_amount max_burn_amount)
+      else
+        match Mempool.add_transaction ctx.mempool tx with
+        | Ok entry ->
+          (* Check fee rate limit (maxfeerate in BTC/kvB)
+             Convert to satoshis per vbyte: BTC/kvB * 100_000_000 / 1000 = sat/vB
+             Then multiply by vsize to get max acceptable fee *)
+          let vsize = (entry.weight + 3) / 4 in
+          let max_fee_sats =
+            if max_fee_rate <= 0.0 then Int64.max_int
+            else Int64.of_float (max_fee_rate *. 100_000_000.0 /. 1000.0 *. float_of_int vsize)
+          in
+          if entry.fee > max_fee_sats && max_fee_rate > 0.0 then begin
+            (* Transaction fee too high - remove from mempool and reject *)
+            Mempool.remove_transaction ctx.mempool entry.txid;
+            Error (Printf.sprintf
+              "Fee exceeds maximum: %Ld > %Ld satoshis (maxfeerate %.8f BTC/kvB)"
+              entry.fee max_fee_sats max_fee_rate)
+          end
+          else begin
+            (* Relay to peers *)
+            let wtxid = Crypto.compute_wtxid tx in
+            let fee_rate = Int64.div entry.fee (Int64.of_int (max 1 (entry.weight / 4))) in
+            Lwt.async (fun () ->
+              Peer_manager.announce_tx ctx.peer_manager
+                ~txid:entry.txid ~wtxid ~fee_rate
+            );
+            Ok (`String (Types.hash256_to_hex_display entry.txid))
+          end
+        | Error msg ->
+          Error msg
     with exn ->
       Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn)))
-  | _ ->
-    Error "Invalid parameters: expected [hexstring]"
 
 let handle_decoderawtransaction (_ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =

@@ -284,6 +284,210 @@ let test_height_encoding_order () =
   Alcotest.(check bool) "256 < 1000" true (h256 < h1000)
 
 (* ============================================================================
+   Flat File Storage Tests
+   ============================================================================ *)
+
+let test_flat_file_path = "/tmp/camlcoin_test_flat_files"
+
+let cleanup_flat_files () =
+  let rec rm_rf path =
+    if Sys.file_exists path then begin
+      if Sys.is_directory path then begin
+        Array.iter (fun f -> rm_rf (Filename.concat path f)) (Sys.readdir path);
+        Unix.rmdir path
+      end else
+        Unix.unlink path
+    end
+  in
+  rm_rf test_flat_file_path
+
+(* Test basic flat file write/read roundtrip *)
+let test_flat_file_basic () =
+  cleanup_flat_files ();
+  let storage = Storage.FlatFileStorage.create test_flat_file_path in
+  let block = make_test_block ~ver:1l ~ts:1231006505l ~nc:2083236893l in
+  let hash = Crypto.compute_block_hash block.header in
+  (* Write block *)
+  let pos = Storage.FlatFileStorage.write_block storage block 0 in
+  Alcotest.(check bool) "position not null" true (not (Storage.is_null_pos pos));
+  Alcotest.(check int) "file_num is 0" 0 pos.file_num;
+  (* Read block back *)
+  let retrieved = Storage.FlatFileStorage.read_block storage hash in
+  Alcotest.(check bool) "block retrieved" true (Option.is_some retrieved);
+  let b = Option.get retrieved in
+  Alcotest.(check int32) "block version" 1l b.header.version;
+  Alcotest.(check int32) "block timestamp" 1231006505l b.header.timestamp;
+  Alcotest.(check int32) "block nonce" 2083236893l b.header.nonce;
+  Storage.FlatFileStorage.close storage;
+  cleanup_flat_files ()
+
+(* Test has_block *)
+let test_flat_file_has_block () =
+  cleanup_flat_files ();
+  let storage = Storage.FlatFileStorage.create test_flat_file_path in
+  let block = make_test_block ~ver:1l ~ts:1231006505l ~nc:12345l in
+  let hash = Crypto.compute_block_hash block.header in
+  Alcotest.(check bool) "block not present before write" false
+    (Storage.FlatFileStorage.has_block storage hash);
+  let _ = Storage.FlatFileStorage.write_block storage block 0 in
+  Alcotest.(check bool) "block present after write" true
+    (Storage.FlatFileStorage.has_block storage hash);
+  Storage.FlatFileStorage.close storage;
+  cleanup_flat_files ()
+
+(* Test multiple blocks in same file *)
+let test_flat_file_multiple_blocks () =
+  cleanup_flat_files ();
+  let storage = Storage.FlatFileStorage.create test_flat_file_path in
+  let block1 = make_test_block ~ver:1l ~ts:1231006505l ~nc:1l in
+  let block2 = make_test_block ~ver:1l ~ts:1231006506l ~nc:2l in
+  let block3 = make_test_block ~ver:1l ~ts:1231006507l ~nc:3l in
+  let hash1 = Crypto.compute_block_hash block1.header in
+  let hash2 = Crypto.compute_block_hash block2.header in
+  let hash3 = Crypto.compute_block_hash block3.header in
+  let pos1 = Storage.FlatFileStorage.write_block storage block1 0 in
+  let pos2 = Storage.FlatFileStorage.write_block storage block2 1 in
+  let pos3 = Storage.FlatFileStorage.write_block storage block3 2 in
+  (* All in same file *)
+  Alcotest.(check int) "all in file 0" 0 pos1.file_num;
+  Alcotest.(check int) "all in file 0" 0 pos2.file_num;
+  Alcotest.(check int) "all in file 0" 0 pos3.file_num;
+  (* Positions should be increasing *)
+  Alcotest.(check bool) "pos2 > pos1" true (pos2.pos > pos1.pos);
+  Alcotest.(check bool) "pos3 > pos2" true (pos3.pos > pos2.pos);
+  (* Read all blocks back *)
+  let b1 = Storage.FlatFileStorage.read_block storage hash1 in
+  let b2 = Storage.FlatFileStorage.read_block storage hash2 in
+  let b3 = Storage.FlatFileStorage.read_block storage hash3 in
+  Alcotest.(check bool) "block1 found" true (Option.is_some b1);
+  Alcotest.(check bool) "block2 found" true (Option.is_some b2);
+  Alcotest.(check bool) "block3 found" true (Option.is_some b3);
+  Alcotest.(check int32) "block1 nonce" 1l (Option.get b1).header.nonce;
+  Alcotest.(check int32) "block2 nonce" 2l (Option.get b2).header.nonce;
+  Alcotest.(check int32) "block3 nonce" 3l (Option.get b3).header.nonce;
+  Storage.FlatFileStorage.close storage;
+  cleanup_flat_files ()
+
+(* Test index persistence *)
+let test_flat_file_index_persistence () =
+  cleanup_flat_files ();
+  let block1 = make_test_block ~ver:1l ~ts:1231006505l ~nc:100l in
+  let block2 = make_test_block ~ver:1l ~ts:1231006506l ~nc:200l in
+  let hash1 = Crypto.compute_block_hash block1.header in
+  let hash2 = Crypto.compute_block_hash block2.header in
+  (* Write blocks and close *)
+  let storage1 = Storage.FlatFileStorage.create test_flat_file_path in
+  let _ = Storage.FlatFileStorage.write_block storage1 block1 0 in
+  let _ = Storage.FlatFileStorage.write_block storage1 block2 1 in
+  Storage.FlatFileStorage.close storage1;
+  (* Reopen and verify blocks are still accessible *)
+  let storage2 = Storage.FlatFileStorage.create test_flat_file_path in
+  Alcotest.(check bool) "block1 still present" true
+    (Storage.FlatFileStorage.has_block storage2 hash1);
+  Alcotest.(check bool) "block2 still present" true
+    (Storage.FlatFileStorage.has_block storage2 hash2);
+  let b1 = Storage.FlatFileStorage.read_block storage2 hash1 in
+  let b2 = Storage.FlatFileStorage.read_block storage2 hash2 in
+  Alcotest.(check int32) "block1 nonce after reload" 100l (Option.get b1).header.nonce;
+  Alcotest.(check int32) "block2 nonce after reload" 200l (Option.get b2).header.nonce;
+  Storage.FlatFileStorage.close storage2;
+  cleanup_flat_files ()
+
+(* Test block count *)
+let test_flat_file_block_count () =
+  cleanup_flat_files ();
+  let storage = Storage.FlatFileStorage.create test_flat_file_path in
+  Alcotest.(check int) "empty storage has 0 blocks" 0
+    (Storage.FlatFileStorage.block_count storage);
+  let block1 = make_test_block ~ver:1l ~ts:1l ~nc:1l in
+  let block2 = make_test_block ~ver:1l ~ts:2l ~nc:2l in
+  let _ = Storage.FlatFileStorage.write_block storage block1 0 in
+  Alcotest.(check int) "1 block after first write" 1
+    (Storage.FlatFileStorage.block_count storage);
+  let _ = Storage.FlatFileStorage.write_block storage block2 1 in
+  Alcotest.(check int) "2 blocks after second write" 2
+    (Storage.FlatFileStorage.block_count storage);
+  Storage.FlatFileStorage.close storage;
+  cleanup_flat_files ()
+
+(* Test get_block_index *)
+let test_flat_file_get_index () =
+  cleanup_flat_files ();
+  let storage = Storage.FlatFileStorage.create test_flat_file_path in
+  let block = make_test_block ~ver:1l ~ts:1231006505l ~nc:42l in
+  let hash = Crypto.compute_block_hash block.header in
+  let pos = Storage.FlatFileStorage.write_block storage block 100 in
+  let entry = Storage.FlatFileStorage.get_block_index storage hash in
+  Alcotest.(check bool) "index entry found" true (Option.is_some entry);
+  let e = Option.get entry in
+  Alcotest.(check int) "height matches" 100 e.height;
+  Alcotest.(check int) "file_num matches" pos.file_num e.file_pos.file_num;
+  Alcotest.(check int) "pos matches" pos.pos e.file_pos.pos;
+  Alcotest.(check int) "n_tx is 0" 0 e.n_tx;
+  Storage.FlatFileStorage.close storage;
+  cleanup_flat_files ()
+
+(* Test read_block_at_pos *)
+let test_flat_file_read_at_pos () =
+  cleanup_flat_files ();
+  let storage = Storage.FlatFileStorage.create test_flat_file_path in
+  let block = make_test_block ~ver:1l ~ts:1231006505l ~nc:999l in
+  let pos = Storage.FlatFileStorage.write_block storage block 0 in
+  let retrieved = Storage.FlatFileStorage.read_block_at_pos storage pos in
+  Alcotest.(check bool) "block retrieved at pos" true (Option.is_some retrieved);
+  Alcotest.(check int32) "block nonce" 999l (Option.get retrieved).header.nonce;
+  (* Test null pos *)
+  let null_result = Storage.FlatFileStorage.read_block_at_pos storage Storage.null_pos in
+  Alcotest.(check bool) "null pos returns None" true (Option.is_none null_result);
+  Storage.FlatFileStorage.close storage;
+  cleanup_flat_files ()
+
+(* Test iter_blocks *)
+let test_flat_file_iter_blocks () =
+  cleanup_flat_files ();
+  let storage = Storage.FlatFileStorage.create test_flat_file_path in
+  let block1 = make_test_block ~ver:1l ~ts:1l ~nc:1l in
+  let block2 = make_test_block ~ver:1l ~ts:2l ~nc:2l in
+  let block3 = make_test_block ~ver:1l ~ts:3l ~nc:3l in
+  let _ = Storage.FlatFileStorage.write_block storage block1 0 in
+  let _ = Storage.FlatFileStorage.write_block storage block2 1 in
+  let _ = Storage.FlatFileStorage.write_block storage block3 2 in
+  let count = ref 0 in
+  let heights = ref [] in
+  Storage.FlatFileStorage.iter_blocks storage (fun _hash entry ->
+    incr count;
+    heights := entry.height :: !heights
+  );
+  Alcotest.(check int) "iterated 3 blocks" 3 !count;
+  let sorted = List.sort compare !heights in
+  Alcotest.(check (list int)) "heights" [0; 1; 2] sorted;
+  Storage.FlatFileStorage.close storage;
+  cleanup_flat_files ()
+
+(* Test network magic *)
+let test_flat_file_regtest_magic () =
+  cleanup_flat_files ();
+  let storage = Storage.FlatFileStorage.create
+    ~magic:Storage.regtest_magic test_flat_file_path in
+  let block = make_test_block ~ver:1l ~ts:1l ~nc:1l in
+  let _ = Storage.FlatFileStorage.write_block storage block 0 in
+  (* Verify the file contains regtest magic *)
+  let file_path = Filename.concat test_flat_file_path "blk00000.dat" in
+  let ic = open_in_bin file_path in
+  let b0 = input_byte ic in
+  let b1 = input_byte ic in
+  let b2 = input_byte ic in
+  let b3 = input_byte ic in
+  close_in ic;
+  let magic = Int32.logor (Int32.of_int b0)
+    (Int32.logor (Int32.shift_left (Int32.of_int b1) 8)
+      (Int32.logor (Int32.shift_left (Int32.of_int b2) 16)
+        (Int32.shift_left (Int32.of_int b3) 24))) in
+  Alcotest.(check bool) "regtest magic" true (Int32.equal magic Storage.regtest_magic);
+  Storage.FlatFileStorage.close storage;
+  cleanup_flat_files ()
+
+(* ============================================================================
    Undo Data Tests
    ============================================================================ *)
 
@@ -416,6 +620,7 @@ let test_disconnect_block_missing_undo () =
 
 let () =
   cleanup_test_db ();
+  cleanup_flat_files ();
   let open Alcotest in
   run "Storage" [
     "file_storage", [
@@ -442,5 +647,16 @@ let () =
       test_case "block_undo checksum failure" `Quick test_block_undo_checksum_failure;
       test_case "block_undo empty" `Quick test_block_undo_empty;
       test_case "disconnect_block missing undo" `Quick test_disconnect_block_missing_undo;
+    ];
+    "flat_file", [
+      test_case "basic write/read" `Quick test_flat_file_basic;
+      test_case "has_block" `Quick test_flat_file_has_block;
+      test_case "multiple blocks" `Quick test_flat_file_multiple_blocks;
+      test_case "index persistence" `Quick test_flat_file_index_persistence;
+      test_case "block count" `Quick test_flat_file_block_count;
+      test_case "get_block_index" `Quick test_flat_file_get_index;
+      test_case "read_block_at_pos" `Quick test_flat_file_read_at_pos;
+      test_case "iter_blocks" `Quick test_flat_file_iter_blocks;
+      test_case "regtest magic" `Quick test_flat_file_regtest_magic;
     ];
   ]

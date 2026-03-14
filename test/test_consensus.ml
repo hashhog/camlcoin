@@ -819,6 +819,134 @@ let test_testnet4_taproot () =
   Alcotest.(check bool) "testnet4 taproot active at genesis" true
     (state = Consensus.Active)
 
+(* ============================================================================
+   Checkpoint Verification Tests
+   ============================================================================ *)
+
+(* Test checkpoint verification at checkpoint height with correct hash *)
+let test_checkpoint_ok () =
+  (* Mainnet checkpoint at height 11111 *)
+  let height = 11111 in
+  let expected_hash = Types.hash256_of_hex
+    "1d7c6eb2fd42f55925e92efad68b61edd22fba29fde8783df744e26900000000" in
+  let result = Consensus.verify_checkpoint height expected_hash Consensus.mainnet in
+  Alcotest.(check bool) "checkpoint matches" true
+    (result = Consensus.CheckpointOk)
+
+(* Test checkpoint verification at checkpoint height with wrong hash *)
+let test_checkpoint_mismatch () =
+  (* Mainnet checkpoint at height 11111, but with wrong hash *)
+  let height = 11111 in
+  let wrong_hash = Types.hash256_of_hex
+    "0000000000000000000000000000000000000000000000000000000000000001" in
+  let result = Consensus.verify_checkpoint height wrong_hash Consensus.mainnet in
+  match result with
+  | Consensus.CheckpointMismatch { height = h; _ } ->
+    Alcotest.(check int) "mismatch at correct height" 11111 h
+  | Consensus.CheckpointOk ->
+    Alcotest.fail "expected checkpoint mismatch"
+
+(* Test checkpoint verification at non-checkpoint height *)
+let test_checkpoint_non_checkpoint_height () =
+  let height = 12345 in  (* Not a checkpoint height *)
+  let any_hash = Types.hash256_of_hex
+    "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef" in
+  let result = Consensus.verify_checkpoint height any_hash Consensus.mainnet in
+  Alcotest.(check bool) "non-checkpoint height is ok" true
+    (result = Consensus.CheckpointOk)
+
+(* Test checkpoint result to string *)
+let test_checkpoint_result_to_string () =
+  let ok_str = Consensus.checkpoint_result_to_string Consensus.CheckpointOk in
+  Alcotest.(check string) "ok string" "ok" ok_str;
+
+  let expected = Types.hash256_of_hex
+    "1d7c6eb2fd42f55925e92efad68b61edd22fba29fde8783df744e26900000000" in
+  let actual = Types.hash256_of_hex
+    "0000000000000000000000000000000000000000000000000000000000000001" in
+  let mismatch = Consensus.CheckpointMismatch { height = 11111; expected; actual } in
+  let mismatch_str = Consensus.checkpoint_result_to_string mismatch in
+  Alcotest.(check bool) "mismatch string contains height" true
+    (String.length mismatch_str > 0 &&
+     String.sub mismatch_str 0 10 = "checkpoint")
+
+(* Test get_checkpoint_hash for mainnet checkpoints *)
+let test_get_checkpoint_hash () =
+  (* Test that all mainnet checkpoints are retrievable *)
+  let test_heights = [11111; 33333; 74000; 105000; 134444; 168000; 193000;
+                      210000; 216116; 225430; 250000; 279000; 295000] in
+  List.iter (fun h ->
+    match Consensus.get_checkpoint_hash h Consensus.mainnet with
+    | Some _ -> ()
+    | None -> Alcotest.fail (Printf.sprintf "missing checkpoint at height %d" h)
+  ) test_heights;
+
+  (* Test non-checkpoint height returns None *)
+  Alcotest.(check bool) "no checkpoint at 12345" true
+    (Consensus.get_checkpoint_hash 12345 Consensus.mainnet = None)
+
+(* Test minimum chain work verification *)
+let test_meets_minimum_chain_work () =
+  (* Zero work should not meet mainnet minimum *)
+  let zero = Consensus.zero_work in
+  Alcotest.(check bool) "zero work < minimum" false
+    (Consensus.meets_minimum_chain_work zero Consensus.mainnet);
+
+  (* Regtest has zero minimum, so zero work should meet it *)
+  Alcotest.(check bool) "zero work meets regtest minimum" true
+    (Consensus.meets_minimum_chain_work zero Consensus.regtest);
+
+  (* Large work should meet mainnet minimum *)
+  let large_work = Consensus.work_of_hex
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" in
+  Alcotest.(check bool) "large work >= minimum" true
+    (Consensus.meets_minimum_chain_work large_work Consensus.mainnet)
+
+(* Test should_skip_scripts for assume_valid *)
+let test_should_skip_scripts () =
+  (* Without assume_valid height, should not skip *)
+  Alcotest.(check bool) "no assume_valid height" false
+    (Consensus.should_skip_scripts ~block_height:100
+       ~assume_valid_height:None ~network:Consensus.mainnet);
+
+  (* Block below assume_valid height should skip *)
+  Alcotest.(check bool) "below assume_valid height" true
+    (Consensus.should_skip_scripts ~block_height:100
+       ~assume_valid_height:(Some 200) ~network:Consensus.mainnet);
+
+  (* Block at assume_valid height should skip *)
+  Alcotest.(check bool) "at assume_valid height" true
+    (Consensus.should_skip_scripts ~block_height:200
+       ~assume_valid_height:(Some 200) ~network:Consensus.mainnet);
+
+  (* Block above assume_valid height should not skip *)
+  Alcotest.(check bool) "above assume_valid height" false
+    (Consensus.should_skip_scripts ~block_height:300
+       ~assume_valid_height:(Some 200) ~network:Consensus.mainnet);
+
+  (* Network without assume_valid_hash should not skip *)
+  Alcotest.(check bool) "no assume_valid_hash" false
+    (Consensus.should_skip_scripts ~block_height:100
+       ~assume_valid_height:(Some 200) ~network:Consensus.regtest)
+
+(* Test mainnet has assume_valid configured *)
+let test_mainnet_assume_valid () =
+  Alcotest.(check bool) "mainnet has assume_valid" true
+    (Consensus.mainnet.assume_valid_hash <> None);
+  Alcotest.(check bool) "regtest has no assume_valid" true
+    (Consensus.regtest.assume_valid_hash = None)
+
+(* Test mainnet has checkpoints *)
+let test_mainnet_checkpoints () =
+  Alcotest.(check bool) "mainnet has checkpoints" true
+    (List.length Consensus.mainnet.checkpoints > 0);
+  Alcotest.(check int) "mainnet has 13 checkpoints" 13
+    (List.length Consensus.mainnet.checkpoints);
+  Alcotest.(check bool) "testnet has no checkpoints" true
+    (List.length Consensus.testnet.checkpoints = 0);
+  Alcotest.(check bool) "regtest has no checkpoints" true
+    (List.length Consensus.regtest.checkpoints = 0)
+
 let () =
   let open Alcotest in
   run "Consensus" [
@@ -871,5 +999,16 @@ let () =
       test_case "versionbits cache" `Quick test_versionbits_cache;
       test_case "mainnet taproot" `Quick test_mainnet_taproot;
       test_case "testnet4 taproot" `Quick test_testnet4_taproot;
+    ];
+    "checkpoint_verification", [
+      test_case "checkpoint ok" `Quick test_checkpoint_ok;
+      test_case "checkpoint mismatch" `Quick test_checkpoint_mismatch;
+      test_case "non-checkpoint height" `Quick test_checkpoint_non_checkpoint_height;
+      test_case "checkpoint result to string" `Quick test_checkpoint_result_to_string;
+      test_case "get checkpoint hash" `Quick test_get_checkpoint_hash;
+      test_case "meets minimum chain work" `Quick test_meets_minimum_chain_work;
+      test_case "should skip scripts" `Quick test_should_skip_scripts;
+      test_case "mainnet assume valid" `Quick test_mainnet_assume_valid;
+      test_case "mainnet checkpoints" `Quick test_mainnet_checkpoints;
     ];
   ]

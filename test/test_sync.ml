@@ -880,6 +880,141 @@ let test_presync_constants () =
   Alcotest.(check int) "max_headers_per_message" 2000 Sync.max_headers_per_message;
   Alcotest.(check (float 0.001)) "getheaders_rate_limit" 2.0 Sync.getheaders_rate_limit
 
+(* ============================================================================
+   Block Invalidation Tests
+   ============================================================================ *)
+
+(* Test is_block_invalid initially returns false *)
+let test_is_block_invalid_initially_false () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let genesis_hash = Crypto.compute_block_hash Consensus.regtest.genesis_header in
+  Alcotest.(check bool) "genesis not initially invalid" false
+    (Sync.is_block_invalid state genesis_hash);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test invalidate_block marks block as invalid *)
+let test_invalidate_block_basic () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let genesis_hash = Crypto.compute_block_hash Consensus.regtest.genesis_header in
+  (* Cannot invalidate genesis block *)
+  (match Sync.invalidate_block state genesis_hash with
+   | Error msg ->
+     Alcotest.(check bool) "genesis block error" true
+       (String.length msg > 0 && msg = "Cannot invalidate genesis block")
+   | Ok _ ->
+     Alcotest.fail "Should not be able to invalidate genesis block");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test invalidate_block with non-existent block *)
+let test_invalidate_nonexistent_block () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let fake_hash = Cstruct.create 32 in
+  Cstruct.set_uint8 fake_hash 0 0xFF;
+  (match Sync.invalidate_block state fake_hash with
+   | Error msg ->
+     Alcotest.(check string) "block not found error" "Block not found" msg
+   | Ok _ ->
+     Alcotest.fail "Should fail for non-existent block");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test reconsider_block with non-existent block *)
+let test_reconsider_nonexistent_block () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let fake_hash = Cstruct.create 32 in
+  Cstruct.set_uint8 fake_hash 0 0xFF;
+  (match Sync.reconsider_block state fake_hash with
+   | Error msg ->
+     Alcotest.(check string) "block not found error" "Block not found" msg
+   | Ok _ ->
+     Alcotest.fail "Should fail for non-existent block");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test find_descendants with no descendants *)
+let test_find_descendants_empty () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let genesis_hash = Crypto.compute_block_hash Consensus.regtest.genesis_header in
+  let descendants = Sync.find_descendants state genesis_hash in
+  Alcotest.(check int) "genesis has no descendants initially" 0
+    (List.length descendants);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test find_best_valid_tip returns genesis when only genesis exists *)
+let test_find_best_valid_tip_genesis () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let best = Sync.find_best_valid_tip state in
+  Alcotest.(check bool) "best tip exists" true (Option.is_some best);
+  let entry = Option.get best in
+  Alcotest.(check int) "best tip is genesis" 0 entry.height;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test invalidation persists across restarts *)
+let test_invalidation_persistence () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let _state = Sync.create_chain_state db Consensus.regtest in
+  (* Create a fake block hash and mark it as invalidated *)
+  let fake_hash = Cstruct.create 32 in
+  Cstruct.set_uint8 fake_hash 0 0xAB;
+  Storage.ChainDB.set_block_invalidated db fake_hash;
+  Storage.ChainDB.sync db;
+  Storage.ChainDB.close db;
+  (* Reopen and check *)
+  let db2 = Storage.ChainDB.create test_db_path in
+  let is_invalid = Storage.ChainDB.is_block_invalidated db2 fake_hash in
+  Alcotest.(check bool) "invalidation persisted" true is_invalid;
+  Storage.ChainDB.close db2;
+  cleanup_test_db ()
+
+(* Test clear_block_invalidated removes invalidation *)
+let test_clear_block_invalidated () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let _state = Sync.create_chain_state db Consensus.regtest in
+  let fake_hash = Cstruct.create 32 in
+  Cstruct.set_uint8 fake_hash 0 0xCD;
+  Storage.ChainDB.set_block_invalidated db fake_hash;
+  Alcotest.(check bool) "block is invalidated" true
+    (Storage.ChainDB.is_block_invalidated db fake_hash);
+  Storage.ChainDB.clear_block_invalidated db fake_hash;
+  Alcotest.(check bool) "block is no longer invalidated" false
+    (Storage.ChainDB.is_block_invalidated db fake_hash);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test get_all_invalidated_blocks *)
+let test_get_all_invalidated_blocks () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let _state = Sync.create_chain_state db Consensus.regtest in
+  let hash1 = Cstruct.create 32 in
+  let hash2 = Cstruct.create 32 in
+  Cstruct.set_uint8 hash1 0 0x11;
+  Cstruct.set_uint8 hash2 0 0x22;
+  Storage.ChainDB.set_block_invalidated db hash1;
+  Storage.ChainDB.set_block_invalidated db hash2;
+  let all = Storage.ChainDB.get_all_invalidated_blocks db in
+  Alcotest.(check int) "two invalidated blocks" 2 (List.length all);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
@@ -944,5 +1079,16 @@ let () =
       test_case "needs_lowwork_sync" `Quick test_needs_lowwork_sync;
       test_case "presync_memory_footprint" `Quick test_presync_memory_footprint;
       test_case "presync_constants" `Quick test_presync_constants;
+    ];
+    "block_invalidation", [
+      test_case "is_block_invalid_initially_false" `Quick test_is_block_invalid_initially_false;
+      test_case "invalidate_block_basic" `Quick test_invalidate_block_basic;
+      test_case "invalidate_nonexistent_block" `Quick test_invalidate_nonexistent_block;
+      test_case "reconsider_nonexistent_block" `Quick test_reconsider_nonexistent_block;
+      test_case "find_descendants_empty" `Quick test_find_descendants_empty;
+      test_case "find_best_valid_tip_genesis" `Quick test_find_best_valid_tip_genesis;
+      test_case "invalidation_persistence" `Quick test_invalidation_persistence;
+      test_case "clear_block_invalidated" `Quick test_clear_block_invalidated;
+      test_case "get_all_invalidated_blocks" `Quick test_get_all_invalidated_blocks;
     ];
   ]

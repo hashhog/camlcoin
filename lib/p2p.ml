@@ -37,6 +37,7 @@ type command =
   | Reject
   | Sendheaders
   | Sendcmpct
+  | Cmpctblock
   | Feefilter
   | Getblocktxn
   | Blocktxn
@@ -64,6 +65,7 @@ let command_to_string = function
   | Reject -> "reject"
   | Sendheaders -> "sendheaders"
   | Sendcmpct -> "sendcmpct"
+  | Cmpctblock -> "cmpctblock"
   | Feefilter -> "feefilter"
   | Getblocktxn -> "getblocktxn"
   | Blocktxn -> "blocktxn"
@@ -92,6 +94,7 @@ let command_of_string s =
   | "reject" -> Reject
   | "sendheaders" -> Sendheaders
   | "sendcmpct" -> Sendcmpct
+  | "cmpctblock" -> Cmpctblock
   | "feefilter" -> Feefilter
   | "getblocktxn" -> Getblocktxn
   | "blocktxn" -> Blocktxn
@@ -170,6 +173,32 @@ let reject_code_of_int = function
   | 0x43 -> RejectCheckpoint
   | n -> RejectUnknown n
 
+(* Compact block prefilled transaction (BIP 152) *)
+type prefilled_tx = {
+  index : int;        (* differential index from last prefilled tx *)
+  tx : Types.transaction;
+}
+
+(* Compact block structure (BIP 152) *)
+type compact_block = {
+  header : Types.block_header;
+  nonce : int64;
+  short_ids : int64 list;      (* 6-byte short IDs stored as int64 *)
+  prefilled_txs : prefilled_tx list;
+}
+
+(* Block transactions request (BIP 152) *)
+type block_txns_request = {
+  block_hash : Types.hash256;
+  indexes : int list;          (* differential encoded indexes *)
+}
+
+(* Block transactions response (BIP 152) *)
+type block_txns = {
+  block_hash : Types.hash256;
+  txs : Types.transaction list;
+}
+
 (* Message payload types *)
 type message_payload =
   | VersionMsg of Types.version_msg
@@ -203,6 +232,9 @@ type message_payload =
     }
   | SendheadersMsg
   | SendcmpctMsg of { announce : bool; version : int64 }
+  | CmpctblockMsg of compact_block
+  | GetblocktxnMsg of block_txns_request
+  | BlocktxnMsg of block_txns
   | FeefilterMsg of int64
   | WtxidrelayMsg
   | SendaddrV2Msg
@@ -297,6 +329,94 @@ let deserialize_headers_msg r : Types.block_header list =
     header
   )
 
+(* BIP 152: Compact block constants *)
+let cmpctblock_version = 2L  (* Version 2 is witness-aware *)
+let max_compact_block_txs = 100_000
+
+(* Write a 6-byte short ID (lower 48 bits of int64) in little-endian *)
+let write_short_id w (id : int64) =
+  for i = 0 to 5 do
+    let byte = Int64.to_int (Int64.logand (Int64.shift_right_logical id (i * 8)) 0xFFL) in
+    Serialize.write_uint8 w byte
+  done
+
+(* Read a 6-byte short ID as int64 in little-endian *)
+let read_short_id r : int64 =
+  let result = ref 0L in
+  for i = 0 to 5 do
+    let byte = Int64.of_int (Serialize.read_uint8 r) in
+    result := Int64.logor !result (Int64.shift_left byte (i * 8))
+  done;
+  !result
+
+(* Serialize prefilled transaction: differential index + transaction *)
+let serialize_prefilled_tx w (ptx : prefilled_tx) =
+  Serialize.write_compact_size w ptx.index;
+  Serialize.serialize_transaction w ptx.tx
+
+(* Deserialize prefilled transaction *)
+let deserialize_prefilled_tx r : prefilled_tx =
+  let index = Serialize.read_compact_size r in
+  let tx = Serialize.deserialize_transaction r in
+  { index; tx }
+
+(* Serialize compact block (BIP 152) *)
+let serialize_compact_block w (cb : compact_block) =
+  Serialize.serialize_block_header w cb.header;
+  Serialize.write_int64_le w cb.nonce;
+  (* Short IDs *)
+  Serialize.write_compact_size w (List.length cb.short_ids);
+  List.iter (write_short_id w) cb.short_ids;
+  (* Prefilled transactions *)
+  Serialize.write_compact_size w (List.length cb.prefilled_txs);
+  List.iter (serialize_prefilled_tx w) cb.prefilled_txs
+
+(* Deserialize compact block (BIP 152) *)
+let deserialize_compact_block r : compact_block =
+  let header = Serialize.deserialize_block_header r in
+  let nonce = Serialize.read_int64_le r in
+  (* Short IDs *)
+  let short_id_count = Serialize.read_compact_size r in
+  if short_id_count > max_compact_block_txs then
+    failwith "compact block short ID count exceeds maximum";
+  let short_ids = List.init short_id_count (fun _ -> read_short_id r) in
+  (* Prefilled transactions *)
+  let prefilled_count = Serialize.read_compact_size r in
+  if prefilled_count > max_compact_block_txs then
+    failwith "compact block prefilled count exceeds maximum";
+  let prefilled_txs = List.init prefilled_count (fun _ -> deserialize_prefilled_tx r) in
+  { header; nonce; short_ids; prefilled_txs }
+
+(* Serialize block transactions request (getblocktxn) *)
+let serialize_block_txns_request w (req : block_txns_request) =
+  Serialize.write_bytes w req.block_hash;
+  Serialize.write_compact_size w (List.length req.indexes);
+  List.iter (fun idx -> Serialize.write_compact_size w idx) req.indexes
+
+(* Deserialize block transactions request (getblocktxn) *)
+let deserialize_block_txns_request r : block_txns_request =
+  let block_hash = Serialize.read_bytes r 32 in
+  let count = Serialize.read_compact_size r in
+  if count > max_compact_block_txs then
+    failwith "block txns request count exceeds maximum";
+  let indexes = List.init count (fun _ -> Serialize.read_compact_size r) in
+  { block_hash; indexes }
+
+(* Serialize block transactions response (blocktxn) *)
+let serialize_block_txns w (resp : block_txns) =
+  Serialize.write_bytes w resp.block_hash;
+  Serialize.write_compact_size w (List.length resp.txs);
+  List.iter (Serialize.serialize_transaction w) resp.txs
+
+(* Deserialize block transactions response (blocktxn) *)
+let deserialize_block_txns r : block_txns =
+  let block_hash = Serialize.read_bytes r 32 in
+  let count = Serialize.read_compact_size r in
+  if count > max_compact_block_txs then
+    failwith "block txns response count exceeds maximum";
+  let txs = List.init count (fun _ -> Serialize.deserialize_transaction r) in
+  { block_hash; txs }
+
 (* Unified payload serialization *)
 let serialize_payload w = function
   | VersionMsg v -> Serialize.serialize_version_msg w v
@@ -327,6 +447,9 @@ let serialize_payload w = function
   | SendcmpctMsg { announce; version } ->
     Serialize.write_uint8 w (if announce then 1 else 0);
     Serialize.write_int64_le w version
+  | CmpctblockMsg cb -> serialize_compact_block w cb
+  | GetblocktxnMsg req -> serialize_block_txns_request w req
+  | BlocktxnMsg resp -> serialize_block_txns w resp
   | FeefilterMsg feerate ->
     Serialize.write_int64_le w feerate
   | WtxidrelayMsg -> ()
@@ -358,6 +481,9 @@ let payload_to_command = function
   | RejectMsg _ -> Reject
   | SendheadersMsg -> Sendheaders
   | SendcmpctMsg _ -> Sendcmpct
+  | CmpctblockMsg _ -> Cmpctblock
+  | GetblocktxnMsg _ -> Getblocktxn
+  | BlocktxnMsg _ -> Blocktxn
   | FeefilterMsg _ -> Feefilter
   | WtxidrelayMsg -> Wtxidrelay
   | SendaddrV2Msg -> Sendaddrv2
@@ -414,6 +540,9 @@ let deserialize_payload (cmd : command) (r : Serialize.reader)
     let announce = Serialize.read_uint8 r <> 0 in
     let version = Serialize.read_int64_le r in
     SendcmpctMsg { announce; version }
+  | Cmpctblock -> CmpctblockMsg (deserialize_compact_block r)
+  | Getblocktxn -> GetblocktxnMsg (deserialize_block_txns_request r)
+  | Blocktxn -> BlocktxnMsg (deserialize_block_txns r)
   | Feefilter -> FeefilterMsg (Serialize.read_int64_le r)
   | Wtxidrelay -> WtxidrelayMsg
   | Sendaddrv2 -> SendaddrV2Msg
@@ -428,7 +557,7 @@ let deserialize_payload (cmd : command) (r : Serialize.reader)
       Cstruct.empty
     in
     RejectMsg { message; ccode; reason; data }
-  | Alert | Getblocktxn | Blocktxn | Unknown _ ->
+  | Alert | Unknown _ ->
     let remaining = Cstruct.length r.buf - r.pos in
     let payload = if remaining > 0 then
       Serialize.read_bytes r remaining
@@ -503,3 +632,185 @@ let ipv4_to_net_addr ?(services=0L) ipv4_bytes port : Types.net_addr =
   Cstruct.set_uint8 addr 11 0xFF;
   Cstruct.blit ipv4_bytes 0 addr 12 4;
   { services; addr; port }
+
+(* ============================================================================
+   BIP 152 Compact Block Functions
+   ============================================================================ *)
+
+(* Generate a random nonce for compact block *)
+let generate_compact_nonce () : int64 =
+  Random.int64 Int64.max_int
+
+(* Create a compact block from a full block.
+   Always includes coinbase (index 0) as prefilled.
+   Uses wtxid for all transactions except coinbase. *)
+let create_compact_block (block : Types.block) : compact_block =
+  let header = block.header in
+  let nonce = generate_compact_nonce () in
+  let header_hash = Crypto.compute_block_hash header in
+  let (k0, k1) = Crypto.SipHash.derive_keys header_hash nonce in
+
+  (* Coinbase is always prefilled at index 0 *)
+  let coinbase = List.hd block.transactions in
+  let prefilled_txs = [{ index = 0; tx = coinbase }] in
+
+  (* Compute short IDs for remaining transactions using wtxids *)
+  let short_ids =
+    List.mapi (fun i tx ->
+      if i = 0 then None  (* coinbase is prefilled *)
+      else
+        let wtxid = Crypto.compute_wtxid tx in
+        Some (Crypto.compute_short_txid k0 k1 wtxid)
+    ) block.transactions
+    |> List.filter_map (fun x -> x)
+  in
+
+  { header; nonce; short_ids; prefilled_txs }
+
+(* Compute the total transaction count from a compact block *)
+let compact_block_tx_count (cb : compact_block) : int =
+  (* Total = short_ids count + prefilled_txs count *)
+  List.length cb.short_ids + List.length cb.prefilled_txs
+
+(* Result type for block reconstruction *)
+type reconstruct_status =
+  | ReconstructComplete of Types.block
+  | ReconstructNeedTxs of int list  (* missing transaction indices *)
+  | ReconstructFailed of string
+
+(* Build a lookup table mapping wtxid to transaction *)
+type tx_lookup = {
+  by_short_id : (int64, Types.transaction) Hashtbl.t;
+}
+
+(* Create a transaction lookup from a list of transactions and SipHash keys *)
+let create_tx_lookup ~k0 ~k1 (txs : Types.transaction list) : tx_lookup =
+  let tbl = Hashtbl.create (List.length txs) in
+  List.iter (fun tx ->
+    let wtxid = Crypto.compute_wtxid tx in
+    let short_id = Crypto.compute_short_txid k0 k1 wtxid in
+    Hashtbl.replace tbl short_id tx
+  ) txs;
+  { by_short_id = tbl }
+
+(* Attempt to reconstruct a block from a compact block and available transactions.
+   Returns ReconstructComplete if all transactions found,
+   ReconstructNeedTxs with list of missing indices,
+   ReconstructFailed on error. *)
+let reconstruct_block (cb : compact_block) (lookup : tx_lookup)
+    : reconstruct_status =
+  (* Total number of transactions *)
+  let tx_count = List.length cb.short_ids + List.length cb.prefilled_txs in
+  if tx_count = 0 then
+    ReconstructFailed "compact block has no transactions"
+  else begin
+    (* Build transaction array - initially None *)
+    let txs = Array.make tx_count None in
+    let missing = ref [] in
+
+    (* Fill in prefilled transactions *)
+    let last_idx = ref (-1) in
+    List.iter (fun ptx ->
+      let abs_idx = !last_idx + ptx.index + 1 in
+      if abs_idx >= tx_count then
+        () (* invalid index, will fail later *)
+      else begin
+        txs.(abs_idx) <- Some ptx.tx;
+        last_idx := abs_idx
+      end
+    ) cb.prefilled_txs;
+
+    (* Fill in transactions from short IDs *)
+    let short_idx = ref 0 in
+    for i = 0 to tx_count - 1 do
+      if txs.(i) = None then begin
+        if !short_idx >= List.length cb.short_ids then
+          missing := i :: !missing
+        else begin
+          let short_id = List.nth cb.short_ids !short_idx in
+          incr short_idx;
+          match Hashtbl.find_opt lookup.by_short_id short_id with
+          | Some tx -> txs.(i) <- Some tx
+          | None -> missing := i :: !missing
+        end
+      end
+    done;
+
+    if !missing <> [] then
+      ReconstructNeedTxs (List.rev !missing)
+    else begin
+      (* All transactions found - build the block *)
+      let transactions = Array.to_list (Array.map Option.get txs) in
+      ReconstructComplete { header = cb.header; transactions }
+    end
+  end
+
+(* Fill in missing transactions from a blocktxn response.
+   Converts differential indices to absolute indices. *)
+let fill_missing_txs (cb : compact_block) (partial_txs : Types.transaction option array)
+    (missing_indices : int list) (received_txs : Types.transaction list)
+    : (Types.block, string) result =
+  if List.length missing_indices <> List.length received_txs then
+    Error "received transaction count mismatch"
+  else begin
+    (* Fill in the missing transactions *)
+    List.iteri (fun i idx ->
+      if idx < Array.length partial_txs then
+        partial_txs.(idx) <- Some (List.nth received_txs i)
+    ) missing_indices;
+
+    (* Check all slots are filled *)
+    let all_filled = Array.for_all (fun x -> x <> None) partial_txs in
+    if not all_filled then
+      Error "not all transactions filled"
+    else begin
+      let transactions = Array.to_list (Array.map Option.get partial_txs) in
+      Ok { Types.header = cb.header; transactions }
+    end
+  end
+
+(* Create getblocktxn request from missing indices.
+   Converts absolute indices to differential encoding. *)
+let make_getblocktxn_request (block_hash : Types.hash256) (missing : int list)
+    : block_txns_request =
+  (* Sort and convert to differential encoding *)
+  let sorted = List.sort compare missing in
+  let rec to_differential prev = function
+    | [] -> []
+    | idx :: rest ->
+      let diff = idx - prev - 1 in
+      diff :: to_differential idx rest
+  in
+  let indexes = match sorted with
+    | [] -> []
+    | first :: rest -> first :: to_differential first rest
+  in
+  { block_hash; indexes }
+
+(* Decode differential indices from getblocktxn to absolute indices *)
+let decode_differential_indices (indexes : int list) : int list =
+  let rec decode prev acc = function
+    | [] -> List.rev acc
+    | diff :: rest ->
+      let abs_idx = prev + diff + 1 in
+      decode abs_idx (abs_idx :: acc) rest
+  in
+  match indexes with
+  | [] -> []
+  | first :: rest -> decode first (first :: []) rest
+
+(* Create sendcmpct message for version 2 (segwit-aware) *)
+let make_sendcmpct_msg ~high_bandwidth : message_payload =
+  SendcmpctMsg { announce = high_bandwidth; version = cmpctblock_version }
+
+(* Create cmpctblock message *)
+let make_cmpctblock_msg (cb : compact_block) : message_payload =
+  CmpctblockMsg cb
+
+(* Create getblocktxn message *)
+let make_getblocktxn_msg (req : block_txns_request) : message_payload =
+  GetblocktxnMsg req
+
+(* Create blocktxn message *)
+let make_blocktxn_msg (resp : block_txns) : message_payload =
+  BlocktxnMsg resp

@@ -8,7 +8,9 @@
    - LRU cache for O(1) amortized UTXO lookups
    - Performance timers for profiling critical paths
    - Compact header storage for memory-efficient IBD
-   - Optimized hash functions with reduced allocations *)
+   - Optimized hash functions with reduced allocations
+   - Parallel validation utilities for multi-core CPUs
+   - Hardware-accelerated cryptographic benchmarks *)
 
 (* ============================================================================
    LRU Cache
@@ -376,3 +378,209 @@ let run_benchmarks () =
     m "Compact headers get: %.0f ops/sec" (1_000_000.0 /. elapsed));
 
   Logs.info (fun m -> m "Benchmarks complete")
+
+(* ============================================================================
+   Parallel Validation Utilities
+   ============================================================================
+
+   These utilities enable parallel validation of transactions across CPU cores.
+   Using Lwt_preemptive for OCaml 4.x compatibility. For OCaml 5.x, consider
+   using domains directly for better performance. *)
+
+module Parallel = struct
+  (* Maximum number of concurrent validation threads.
+     Default to 4, can be overridden for different hardware. *)
+  let max_parallelism = ref 4
+
+  let set_parallelism n = max_parallelism := max 1 n
+
+  (* Validate items in parallel using Lwt_preemptive.
+     Returns a list of results in the same order as inputs.
+     The validator function runs in a separate thread. *)
+  let validate_parallel (validator : 'a -> 'b) (items : 'a list) : 'b list Lwt.t =
+    let open Lwt.Syntax in
+    (* Split into chunks based on parallelism *)
+    let chunk_size = max 1 ((List.length items + !max_parallelism - 1) / !max_parallelism) in
+    let rec chunk_list lst acc =
+      match lst with
+      | [] -> List.rev acc
+      | _ ->
+        let chunk, rest =
+          let rec take n lst acc = match n, lst with
+            | 0, _ | _, [] -> (List.rev acc, lst)
+            | n, x :: xs -> take (n-1) xs (x :: acc)
+          in
+          take chunk_size lst []
+        in
+        chunk_list rest (chunk :: acc)
+    in
+    let chunks = chunk_list items [] in
+    (* Process chunks in parallel using Lwt threads *)
+    let* results = Lwt_list.map_p (fun chunk ->
+      Lwt_preemptive.detach (fun () ->
+        List.map validator chunk
+      ) ()
+    ) chunks in
+    Lwt.return (List.concat results)
+
+  (* Validate items in parallel, returning on first failure.
+     Returns Ok () if all items pass, or Error with the first failure. *)
+  let validate_all_ok (validator : 'a -> (unit, string) result) (items : 'a list)
+      : (unit, string) result Lwt.t =
+    let open Lwt.Syntax in
+    let failure = ref None in
+    let check_and_validate item =
+      if !failure <> None then ()
+      else match validator item with
+        | Ok () -> ()
+        | Error e -> failure := Some e
+    in
+    let* _ = validate_parallel check_and_validate items in
+    match !failure with
+    | None -> Lwt.return (Ok ())
+    | Some e -> Lwt.return (Error e)
+
+  (* Count items matching a predicate in parallel *)
+  let count_parallel (predicate : 'a -> bool) (items : 'a list) : int Lwt.t =
+    let open Lwt.Syntax in
+    let* results = validate_parallel predicate items in
+    Lwt.return (List.length (List.filter Fun.id results))
+end
+
+(* ============================================================================
+   Hardware-Accelerated Cryptographic Benchmarks
+   ============================================================================
+
+   Benchmark suite for comparing pure-OCaml vs C-accelerated crypto operations.
+   This helps identify the actual speedup on the current hardware. *)
+
+module CryptoBench = struct
+  type bench_result = {
+    name : string;
+    iterations : int;
+    total_time : float;
+    ops_per_sec : float;
+  }
+
+  let bench_result_to_json r : Yojson.Safe.t =
+    `Assoc [
+      ("name", `String r.name);
+      ("iterations", `Int r.iterations);
+      ("total_time_ms", `Float (r.total_time *. 1000.0));
+      ("ops_per_sec", `Float r.ops_per_sec);
+    ]
+
+  (* Run a benchmark and return results *)
+  let run_bench ?(iterations=10_000) name f =
+    (* Warmup *)
+    for _ = 1 to min 100 iterations do ignore (f ()) done;
+    (* Timed run *)
+    let start = Unix.gettimeofday () in
+    for _ = 1 to iterations do ignore (f ()) done;
+    let elapsed = Unix.gettimeofday () -. start in
+    {
+      name;
+      iterations;
+      total_time = elapsed;
+      ops_per_sec = float_of_int iterations /. elapsed;
+    }
+
+  (* Benchmark SHA256d *)
+  let bench_sha256d ?(iterations=100_000) () =
+    let data = Cstruct.create 80 in  (* Block header size *)
+    run_bench ~iterations "sha256d" (fun () ->
+      Crypto.sha256d data
+    )
+
+  (* Benchmark SHA256d (in-place, reduced allocations) *)
+  let bench_sha256d_fast ?(iterations=100_000) () =
+    let data = Cstruct.create 80 in
+    run_bench ~iterations "sha256d_fast" (fun () ->
+      sha256d_fast data
+    )
+
+  (* Benchmark ECDSA sign *)
+  let bench_ecdsa_sign ?(iterations=1_000) () =
+    let privkey = Crypto.generate_private_key () in
+    let msg = Crypto.sha256d (Cstruct.of_string "benchmark message") in
+    run_bench ~iterations "ecdsa_sign" (fun () ->
+      Crypto.sign privkey msg
+    )
+
+  (* Benchmark ECDSA verify (OCaml bindings) *)
+  let bench_ecdsa_verify ?(iterations=1_000) () =
+    let privkey = Crypto.generate_private_key () in
+    let pubkey = Crypto.derive_public_key privkey in
+    let msg = Crypto.sha256d (Cstruct.of_string "benchmark message") in
+    let sig_ = Crypto.sign privkey msg in
+    run_bench ~iterations "ecdsa_verify" (fun () ->
+      Crypto.verify pubkey msg sig_
+    )
+
+  (* Benchmark ECDSA verify (direct FFI) *)
+  let bench_ecdsa_verify_fast ?(iterations=1_000) () =
+    let privkey = Crypto.generate_private_key () in
+    let pubkey = Crypto.derive_public_key privkey in
+    let msg = Crypto.sha256d (Cstruct.of_string "benchmark message") in
+    let sig_ = Crypto.sign privkey msg in
+    run_bench ~iterations "ecdsa_verify_fast" (fun () ->
+      Crypto.verify_ecdsa_fast ~pubkey ~msg32:msg ~signature:sig_
+    )
+
+  (* Benchmark Schnorr sign *)
+  let bench_schnorr_sign ?(iterations=1_000) () =
+    let privkey = Crypto.generate_private_key () in
+    let msg = Crypto.sha256d (Cstruct.of_string "benchmark message") in
+    run_bench ~iterations "schnorr_sign" (fun () ->
+      Crypto.schnorr_sign ~privkey ~msg
+    )
+
+  (* Benchmark Schnorr verify *)
+  let bench_schnorr_verify ?(iterations=1_000) () =
+    let privkey = Crypto.generate_private_key () in
+    let pubkey_x = Crypto.derive_xonly_pubkey privkey in
+    let msg = Crypto.sha256d (Cstruct.of_string "benchmark message") in
+    let sig_ = Crypto.schnorr_sign ~privkey ~msg in
+    run_bench ~iterations "schnorr_verify" (fun () ->
+      Crypto.schnorr_verify ~pubkey_x ~msg ~signature:sig_
+    )
+
+  (* Benchmark batch Schnorr verify *)
+  let bench_schnorr_verify_batch ?(iterations=100) ?(batch_size=10) () =
+    (* Generate batch_size key/sig pairs *)
+    let items = List.init batch_size (fun i ->
+      let privkey = Crypto.generate_private_key () in
+      let pubkey_x = Crypto.derive_xonly_pubkey privkey in
+      let msg = Crypto.sha256d (Cstruct.of_string (Printf.sprintf "message %d" i)) in
+      let sig_ = Crypto.schnorr_sign ~privkey ~msg in
+      (pubkey_x, msg, sig_)
+    ) in
+    run_bench ~iterations (Printf.sprintf "schnorr_verify_batch_%d" batch_size) (fun () ->
+      Crypto.schnorr_verify_batch items
+    )
+
+  (* Run all crypto benchmarks *)
+  let run_all_benchmarks () =
+    Logs.info (fun m -> m "Running crypto benchmarks...");
+    let results = [
+      bench_sha256d ();
+      bench_sha256d_fast ();
+      bench_ecdsa_sign ();
+      bench_ecdsa_verify ();
+      bench_ecdsa_verify_fast ();
+      bench_schnorr_sign ();
+      bench_schnorr_verify ();
+      bench_schnorr_verify_batch ~batch_size:1 ();
+      bench_schnorr_verify_batch ~batch_size:10 ();
+      bench_schnorr_verify_batch ~batch_size:100 ();
+    ] in
+    List.iter (fun r ->
+      Logs.info (fun m ->
+        m "%s: %.0f ops/sec (%.3f ms total, %d iterations)"
+          r.name r.ops_per_sec (r.total_time *. 1000.0) r.iterations)
+    ) results;
+    results
+
+  let results_to_json results =
+    `List (List.map bench_result_to_json results)
+end

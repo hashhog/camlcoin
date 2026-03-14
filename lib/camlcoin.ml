@@ -25,3 +25,4 @@ module Psbt = Psbt
 module Descriptor = Descriptor
 module Miniscript = Miniscript
 module Assume_utxo = Assume_utxo
+module Zmq_notify = Zmq_notify

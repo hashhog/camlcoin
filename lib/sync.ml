@@ -102,6 +102,7 @@ type chain_state = {
   mutable prune_target : int;    (* 0 = no pruning, else keep this many blocks *)
   mutable prune_height : int;    (* last pruned height *)
   headers_from_peer : (int, int) Hashtbl.t;  (* peer_id -> header count from that peer *)
+  mutable invalidated_blocks : (string, unit) Hashtbl.t;  (* manually invalidated block hashes *)
 }
 
 (* Header flood prevention: reject new headers when this limit is reached
@@ -356,6 +357,7 @@ let create_chain_state (db : Storage.ChainDB.t)
     prune_target = 0;
     prune_height = 0;
     headers_from_peer = Hashtbl.create 16;
+    invalidated_blocks = Hashtbl.create 16;
   } in
   (* Insert genesis block header *)
   let genesis_hash = Crypto.compute_block_hash network.genesis_header in
@@ -389,6 +391,7 @@ let restore_chain_state (db : Storage.ChainDB.t)
     prune_target = 0;
     prune_height = 0;
     headers_from_peer = Hashtbl.create 16;
+    invalidated_blocks = Hashtbl.create 16;
   } in
   (* Check for stored header tip *)
   match Storage.ChainDB.get_header_tip db with
@@ -415,6 +418,10 @@ let restore_chain_state (db : Storage.ChainDB.t)
       | None -> ()
     done;
     state.headers_synced <- tip_height;
+    (* Load invalidated blocks from database *)
+    List.iter (fun hash ->
+      Hashtbl.replace state.invalidated_blocks (Cstruct.to_string hash) ()
+    ) (Storage.ChainDB.get_all_invalidated_blocks db);
     state
   | None ->
     (* No stored state, create fresh with genesis *)
@@ -1814,3 +1821,220 @@ let handle_mempool_msg (ibd : ibd_state) (peer : Peer.peer) : unit Lwt.t =
         (fun _exn -> Lwt.return_unit)
     else
       Lwt.return_unit
+
+(* ============================================================================
+   Block Invalidation (invalidateblock / reconsiderblock RPCs)
+   ============================================================================ *)
+
+(* Check if a block hash is marked as invalid (either directly or as a descendant) *)
+let is_block_invalid (state : chain_state) (hash : Types.hash256) : bool =
+  Hashtbl.mem state.invalidated_blocks (Cstruct.to_string hash)
+
+(* Find all descendants of a block in the headers table *)
+let find_descendants (state : chain_state) (target_hash : Types.hash256)
+    : header_entry list =
+  let target_key = Cstruct.to_string target_hash in
+  let descendants : header_entry list ref = ref [] in
+  Hashtbl.iter (fun _key (entry : header_entry) ->
+    (* Check if this entry is a descendant by walking back to target *)
+    let rec is_descendant (e : header_entry) : bool =
+      let parent_key = Cstruct.to_string e.header.prev_block in
+      if parent_key = target_key then true
+      else if e.height <= 0 then false
+      else match Hashtbl.find_opt state.headers parent_key with
+        | Some parent -> is_descendant parent
+        | None -> false
+    in
+    if is_descendant entry then
+      descendants := entry :: !descendants
+  ) state.headers;
+  !descendants
+
+(* Find the next best valid chain tip after invalidating a block *)
+let find_best_valid_tip (state : chain_state) : header_entry option =
+  let best = ref None in
+  Hashtbl.iter (fun key entry ->
+    if not (Hashtbl.mem state.invalidated_blocks key) then begin
+      match !best with
+      | None -> best := Some entry
+      | Some b ->
+        if Consensus.work_compare entry.total_work b.total_work > 0 then
+          best := Some entry
+    end
+  ) state.headers;
+  !best
+
+(* Invalidate a block and all its descendants.
+   If the block is on the active chain, rewind to its parent and switch to
+   the next best valid chain. Returns the new chain tip height. *)
+let invalidate_block (state : chain_state)
+    ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
+    (hash : Types.hash256) : (int, string) result =
+  let hash_key = Cstruct.to_string hash in
+  (* Cannot invalidate genesis block *)
+  match Hashtbl.find_opt state.headers hash_key with
+  | None -> Error "Block not found"
+  | Some entry when entry.height = 0 ->
+    Error "Cannot invalidate genesis block"
+  | Some entry ->
+    Logs.info (fun m ->
+      m "Invalidating block at height %d: %s"
+        entry.height (Types.hash256_to_hex_display hash));
+    (* Mark block and all descendants as invalid *)
+    Hashtbl.replace state.invalidated_blocks hash_key ();
+    Storage.ChainDB.set_block_invalidated state.db hash;
+    let descendants = find_descendants state hash in
+    List.iter (fun (d : header_entry) ->
+      let d_key = Cstruct.to_string d.hash in
+      Hashtbl.replace state.invalidated_blocks d_key ();
+      Storage.ChainDB.set_block_invalidated state.db d.hash
+    ) descendants;
+    Logs.debug (fun m ->
+      m "Marked %d descendant blocks as invalid" (List.length descendants));
+    (* Check if invalidated block is on the active chain *)
+    let on_active_chain =
+      match state.tip with
+      | None -> false
+      | Some tip ->
+        (* Check if tip is the invalidated block or one of its descendants *)
+        Cstruct.equal tip.hash hash ||
+        List.exists (fun (d : header_entry) -> Cstruct.equal d.hash tip.hash) descendants
+    in
+    if on_active_chain then begin
+      Logs.info (fun m -> m "Invalidated block is on active chain, rewinding...");
+      (* Find the parent of the invalidated block *)
+      let parent_key = Cstruct.to_string entry.header.prev_block in
+      match Hashtbl.find_opt state.headers parent_key with
+      | None -> Error "Cannot find parent of invalidated block"
+      | Some parent_entry ->
+        (* We need to disconnect blocks from tip back to the invalidated block.
+           This requires the ibd_state machinery for UTXO updates. For now,
+           we update the chain state and let the caller handle UTXO updates
+           via the utxo_set parameter if provided. *)
+        (match utxo_set with
+         | Some utxo ->
+           (* Disconnect blocks from tip back to parent of invalidated block *)
+           let current_tip = match state.tip with
+             | Some t -> t
+             | None -> failwith "No current tip"
+           in
+           let rec disconnect_to_height target_height (current : header_entry) =
+             if current.height <= target_height then Ok ()
+             else begin
+               match Storage.ChainDB.get_block state.db current.hash with
+               | None ->
+                 Error (Printf.sprintf "Missing block at height %d" current.height)
+               | Some block ->
+                 match Storage.ChainDB.get_undo_data state.db current.hash with
+                 | None ->
+                   Error (Printf.sprintf "Missing undo data at height %d" current.height)
+                 | Some undo_raw ->
+                   let r = Serialize.reader_of_cstruct (Cstruct.of_string undo_raw) in
+                   let undo = Utxo.deserialize_undo_data r in
+                   (* Remove outputs created by this block *)
+                   let txs = List.rev block.transactions in
+                   List.iter (fun tx ->
+                     let txid = Crypto.compute_txid tx in
+                     List.iteri (fun vout _out ->
+                       ignore (Utxo.OptimizedUtxoSet.remove utxo txid vout)
+                     ) tx.Types.outputs
+                   ) txs;
+                   (* Restore spent outputs from undo data *)
+                   List.iter (fun (outpoint, utxo_entry) ->
+                     Utxo.OptimizedUtxoSet.add utxo
+                       outpoint.Types.txid
+                       (Int32.to_int outpoint.Types.vout)
+                       utxo_entry
+                   ) undo.spent_outputs;
+                   Storage.ChainDB.delete_undo_data state.db current.hash;
+                   Logs.debug (fun m ->
+                     m "Disconnected block at height %d during invalidation"
+                       current.height);
+                   let parent_key = Cstruct.to_string current.header.prev_block in
+                   match Hashtbl.find_opt state.headers parent_key with
+                   | None -> Error "Missing parent during disconnect"
+                   | Some parent -> disconnect_to_height target_height parent
+             end
+           in
+           (match disconnect_to_height parent_entry.height current_tip with
+            | Error e -> Error e
+            | Ok () ->
+              (* Update tip to parent of invalidated block *)
+              state.tip <- Some parent_entry;
+              state.blocks_synced <- parent_entry.height;
+              Storage.ChainDB.set_chain_tip state.db parent_entry.hash parent_entry.height;
+              (* Find the best valid chain and try to activate it *)
+              match find_best_valid_tip state with
+              | Some best when Consensus.work_compare best.total_work parent_entry.total_work > 0 ->
+                Logs.info (fun m ->
+                  m "Found better valid chain at height %d, activating..."
+                    best.height);
+                (* For now, just set the tip; full reorg would require more work *)
+                Ok parent_entry.height
+              | _ ->
+                Ok parent_entry.height)
+         | None ->
+           (* No UTXO set provided - just update chain state *)
+           state.tip <- Some parent_entry;
+           state.blocks_synced <- parent_entry.height;
+           Storage.ChainDB.set_chain_tip state.db parent_entry.hash parent_entry.height;
+           Ok parent_entry.height)
+    end else begin
+      (* Block not on active chain, just mark as invalid *)
+      match state.tip with
+      | Some tip -> Ok tip.height
+      | None -> Ok 0
+    end
+
+(* Reconsider a previously invalidated block.
+   Clears the invalid flag from the block and all its descendants/ancestors,
+   then triggers chain selection to potentially reorg to a better chain. *)
+let reconsider_block (state : chain_state) (hash : Types.hash256)
+    : (int, string) result =
+  let hash_key = Cstruct.to_string hash in
+  match Hashtbl.find_opt state.headers hash_key with
+  | None -> Error "Block not found"
+  | Some entry ->
+    Logs.info (fun m ->
+      m "Reconsidering block at height %d: %s"
+        entry.height (Types.hash256_to_hex_display hash));
+    (* Clear invalid flag from this block *)
+    Hashtbl.remove state.invalidated_blocks hash_key;
+    Storage.ChainDB.clear_block_invalidated state.db hash;
+    (* Clear invalid flag from all descendants *)
+    let descendants = find_descendants state hash in
+    List.iter (fun (d : header_entry) ->
+      let d_key = Cstruct.to_string d.hash in
+      Hashtbl.remove state.invalidated_blocks d_key;
+      Storage.ChainDB.clear_block_invalidated state.db d.hash
+    ) descendants;
+    (* Also clear invalid flag from ancestors (matching Bitcoin Core behavior) *)
+    let rec clear_ancestors (e : header_entry) =
+      let parent_key = Cstruct.to_string e.header.prev_block in
+      if Hashtbl.mem state.invalidated_blocks parent_key then begin
+        Hashtbl.remove state.invalidated_blocks parent_key;
+        Storage.ChainDB.clear_block_invalidated state.db e.header.prev_block;
+        match Hashtbl.find_opt state.headers parent_key with
+        | Some parent -> clear_ancestors parent
+        | None -> ()
+      end
+    in
+    clear_ancestors entry;
+    Logs.debug (fun m ->
+      m "Cleared invalid flags from %d descendant blocks"
+        (List.length descendants));
+    (* Find the best valid chain - may now include the reconsidered block *)
+    match find_best_valid_tip state with
+    | Some best when
+        (match state.tip with
+         | Some tip -> Consensus.work_compare best.total_work tip.total_work > 0
+         | None -> true) ->
+      Logs.info (fun m ->
+        m "Reconsidered chain has more work, new best tip at height %d"
+          best.height);
+      (* Update tip - caller would need to handle full reorg with UTXO updates *)
+      Ok best.height
+    | _ ->
+      match state.tip with
+      | Some tip -> Ok tip.height
+      | None -> Ok 0

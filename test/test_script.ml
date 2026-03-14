@@ -884,6 +884,162 @@ let bug7_8_9_tests = [
   Alcotest.test_case "DISCOURAGE_UPGRADABLE_PUBKEYTYPE flag value" `Quick test_discourage_upgradable_pubkeytype_flag_value;
 ]
 
+(* ============================================================================
+   BIP-146 NULLFAIL Tests
+   ============================================================================ *)
+
+(* Test NULLFAIL flag exists and has correct value *)
+let test_nullfail_flag_exists () =
+  Alcotest.(check bool) "NULLFAIL flag is non-zero" true
+    (Script.script_verify_nullfail <> 0)
+
+let test_nullfail_flag_value () =
+  Alcotest.(check int) "NULLFAIL flag is 1 lsl 12" (1 lsl 12)
+    Script.script_verify_nullfail
+
+(* Test that NULLFAIL is enabled at SegWit height for mainnet *)
+let test_nullfail_enabled_at_segwit_height () =
+  let network = Consensus.mainnet in
+  let flags = Consensus.get_block_script_flags network.segwit_height network in
+  let has_nullfail = flags land Script.script_verify_nullfail <> 0 in
+  Alcotest.(check bool) "NULLFAIL enabled at SegWit height" true has_nullfail
+
+(* Test that NULLFAIL is NOT enabled before SegWit height *)
+let test_nullfail_disabled_before_segwit () =
+  let network = Consensus.mainnet in
+  let flags = Consensus.get_block_script_flags (network.segwit_height - 1) network in
+  let has_nullfail = flags land Script.script_verify_nullfail <> 0 in
+  Alcotest.(check bool) "NULLFAIL disabled before SegWit" false has_nullfail
+
+(* Test NULLFAIL on OP_CHECKSIG: non-empty failing signature must be rejected.
+
+   This test creates a simple script: <sig> <pubkey> OP_CHECKSIG
+   With a deliberately invalid signature (wrong pubkey), and NULLFAIL flag set,
+   the script must fail with a NULLFAIL error if the signature is non-empty. *)
+let test_nullfail_checksig_nonempty_sig_rejected () =
+  (* Create a script that pushes an invalid signature and pubkey, then CHECKSIG
+     Script: <fake_sig> <fake_pubkey> OP_CHECKSIG
+     The signature will fail because it doesn't match the pubkey.
+     With NULLFAIL, non-empty failing sig must cause NULLFAIL error. *)
+  (* Push a fake non-empty "signature" (9 bytes, looks like minimal DER but wrong)
+     0x30 0x06 0x02 0x01 0x01 0x02 0x01 0x01 0x01 (DER-ish + hashtype)
+     and a 33-byte compressed pubkey (fake) *)
+  let fake_sig = hex_to_cstruct "3006020101020101" in  (* 8 bytes, no hashtype *)
+  let fake_pubkey = hex_to_cstruct ("02" ^ String.make 64 'a') in (* 33 bytes *)
+
+  (* Build script: push sig, push pubkey, OP_CHECKSIG *)
+  let script_hex = Printf.sprintf "08%s21%sac"
+    (cstruct_to_hex fake_sig)
+    (cstruct_to_hex fake_pubkey) in
+
+  let flags = Script.script_verify_nullfail in
+  match eval_script_with_flags script_hex flags with
+  | Error msg ->
+    (* Should fail with NULLFAIL error *)
+    let msg_lower = String.lowercase_ascii msg in
+    let contains_nullfail =
+      let rec check i =
+        if i + 8 > String.length msg_lower then false
+        else if String.sub msg_lower i 8 = "nullfail" then true
+        else check (i + 1)
+      in check 0
+    in
+    if not contains_nullfail then
+      Alcotest.fail ("Expected NULLFAIL error, got: " ^ msg)
+  | Ok _ -> Alcotest.fail "Expected NULLFAIL error for non-empty failing signature"
+
+(* Test that empty signature on failing CHECKSIG does NOT trigger NULLFAIL.
+   With an empty signature, CHECKSIG should just push false (not an error). *)
+let test_nullfail_checksig_empty_sig_allowed () =
+  (* Script: OP_0 <pubkey> OP_CHECKSIG
+     Empty signature should result in false on stack, not an error *)
+  let fake_pubkey = hex_to_cstruct ("02" ^ String.make 64 'a') in
+  let script_hex = Printf.sprintf "0021%sac"
+    (cstruct_to_hex fake_pubkey) in
+
+  let flags = Script.script_verify_nullfail in
+  match eval_script_with_flags script_hex flags with
+  | Ok false -> ()  (* Expected: false on stack, no NULLFAIL error *)
+  | Ok true -> Alcotest.fail "Expected false on stack for empty sig"
+  | Error e -> Alcotest.fail ("Empty sig should not error: " ^ e)
+
+(* Test NULLFAIL without flag: non-empty failing sig should NOT cause error *)
+let test_nullfail_disabled_allows_nonempty_sig () =
+  let fake_sig = hex_to_cstruct "3006020101020101" in
+  let fake_pubkey = hex_to_cstruct ("02" ^ String.make 64 'a') in
+
+  let script_hex = Printf.sprintf "08%s21%sac"
+    (cstruct_to_hex fake_sig)
+    (cstruct_to_hex fake_pubkey) in
+
+  (* No NULLFAIL flag *)
+  let flags = 0 in
+  match eval_script_with_flags script_hex flags with
+  | Ok false -> ()  (* Expected: false on stack, no error *)
+  | Ok true -> Alcotest.fail "Expected false on stack"
+  | Error e -> Alcotest.fail ("Without NULLFAIL, should push false not error: " ^ e)
+
+(* Test NULLFAIL on OP_CHECKMULTISIG: all unused signatures must be empty.
+
+   Script: OP_0 <sig1> OP_2 <pk1> <pk2> OP_2 OP_CHECKMULTISIG
+
+   This is a 2-of-2 multisig, but we only provide 1 signature slot (plus dummy).
+   If the provided sig is non-empty and fails, NULLFAIL must trigger. *)
+let test_nullfail_checkmultisig_nonempty_sig_rejected () =
+  let fake_sig = hex_to_cstruct "3006020101020101" in  (* 8 bytes *)
+  let fake_pk1 = hex_to_cstruct ("02" ^ String.make 64 'a') in
+  let fake_pk2 = hex_to_cstruct ("03" ^ String.make 64 'b') in
+
+  (* Script: OP_0 (dummy) <fake_sig> OP_1 <pk1> <pk2> OP_2 OP_CHECKMULTISIG
+     This is a 1-of-2 multisig with one signature that will fail *)
+  let script_hex = Printf.sprintf "0008%s5121%s21%s52ae"
+    (cstruct_to_hex fake_sig)
+    (cstruct_to_hex fake_pk1)
+    (cstruct_to_hex fake_pk2) in
+
+  let flags = Script.script_verify_nullfail lor Script.script_verify_nulldummy in
+  match eval_script_with_flags script_hex flags with
+  | Error msg ->
+    let msg_lower = String.lowercase_ascii msg in
+    let contains_nullfail =
+      let rec check i =
+        if i + 8 > String.length msg_lower then false
+        else if String.sub msg_lower i 8 = "nullfail" then true
+        else check (i + 1)
+      in check 0
+    in
+    if not contains_nullfail then
+      Alcotest.fail ("Expected NULLFAIL error, got: " ^ msg)
+  | Ok _ -> Alcotest.fail "Expected NULLFAIL error for CHECKMULTISIG with non-empty failing sig"
+
+(* Test CHECKMULTISIG with all empty signatures passes (no NULLFAIL) *)
+let test_nullfail_checkmultisig_empty_sigs_allowed () =
+  let fake_pk1 = hex_to_cstruct ("02" ^ String.make 64 'a') in
+  let fake_pk2 = hex_to_cstruct ("03" ^ String.make 64 'b') in
+
+  (* Script: OP_0 (dummy) OP_0 (empty sig) OP_1 <pk1> <pk2> OP_2 OP_CHECKMULTISIG *)
+  let script_hex = Printf.sprintf "00005121%s21%s52ae"
+    (cstruct_to_hex fake_pk1)
+    (cstruct_to_hex fake_pk2) in
+
+  let flags = Script.script_verify_nullfail lor Script.script_verify_nulldummy in
+  match eval_script_with_flags script_hex flags with
+  | Ok false -> ()  (* Expected: false, but no NULLFAIL error *)
+  | Ok true -> Alcotest.fail "Expected false on stack for empty sigs"
+  | Error e -> Alcotest.fail ("Empty sigs should not cause error: " ^ e)
+
+let nullfail_tests = [
+  Alcotest.test_case "NULLFAIL flag exists" `Quick test_nullfail_flag_exists;
+  Alcotest.test_case "NULLFAIL flag value is 1 lsl 12" `Quick test_nullfail_flag_value;
+  Alcotest.test_case "NULLFAIL enabled at SegWit height" `Quick test_nullfail_enabled_at_segwit_height;
+  Alcotest.test_case "NULLFAIL disabled before SegWit" `Quick test_nullfail_disabled_before_segwit;
+  Alcotest.test_case "CHECKSIG non-empty failing sig rejected" `Quick test_nullfail_checksig_nonempty_sig_rejected;
+  Alcotest.test_case "CHECKSIG empty sig allowed" `Quick test_nullfail_checksig_empty_sig_allowed;
+  Alcotest.test_case "NULLFAIL disabled allows non-empty sig" `Quick test_nullfail_disabled_allows_nonempty_sig;
+  Alcotest.test_case "CHECKMULTISIG non-empty failing sig rejected" `Quick test_nullfail_checkmultisig_nonempty_sig_rejected;
+  Alcotest.test_case "CHECKMULTISIG empty sigs allowed" `Quick test_nullfail_checkmultisig_empty_sigs_allowed;
+]
+
 let round5_tests = [
   Alcotest.test_case "CONST_SCRIPTCODE rejects OP_CODESEPARATOR" `Quick test_codesep_rejected_with_const_scriptcode;
   Alcotest.test_case "OP_CODESEPARATOR allowed without flag" `Quick test_codesep_allowed_without_const_scriptcode;
@@ -919,4 +1075,5 @@ let () = Alcotest.run "test_script" [
   ("error", error_tests);
   ("round5_phase1", round5_tests);
   ("bug7_8_9", bug7_8_9_tests);
+  ("nullfail", nullfail_tests);
 ]

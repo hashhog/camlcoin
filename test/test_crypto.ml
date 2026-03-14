@@ -231,6 +231,129 @@ let qcheck_sign_verify_roundtrip =
       let signature = Crypto.sign privkey msg_hash in
       Crypto.verify pubkey msg_hash signature)
 
+(* Hardware-accelerated crypto tests *)
+let test_verify_ecdsa_fast () =
+  let privkey = Crypto.generate_private_key () in
+  let pubkey = Crypto.derive_public_key privkey in
+  let msg_hash = Crypto.sha256d (Cstruct.of_string "test message") in
+  let signature = Crypto.sign privkey msg_hash in
+  (* Fast verify should match regular verify *)
+  let valid_fast = Crypto.verify_ecdsa_fast ~pubkey ~msg32:msg_hash ~signature in
+  let valid_regular = Crypto.verify pubkey msg_hash signature in
+  Alcotest.(check bool) "fast verify matches regular" valid_regular valid_fast;
+  Alcotest.(check bool) "signature valid" true valid_fast
+
+let test_verify_ecdsa_fast_wrong_message () =
+  let privkey = Crypto.generate_private_key () in
+  let pubkey = Crypto.derive_public_key privkey in
+  let msg_hash = Crypto.sha256d (Cstruct.of_string "test message") in
+  let signature = Crypto.sign privkey msg_hash in
+  let wrong_hash = Crypto.sha256d (Cstruct.of_string "wrong message") in
+  let valid = Crypto.verify_ecdsa_fast ~pubkey ~msg32:wrong_hash ~signature in
+  Alcotest.(check bool) "wrong message fails" false valid
+
+let test_verify_ecdsa_normalized () =
+  let privkey = Crypto.generate_private_key () in
+  let pubkey = Crypto.derive_public_key privkey in
+  let msg_hash = Crypto.sha256d (Cstruct.of_string "test message") in
+  let signature = Crypto.sign privkey msg_hash in
+  (* Normalized verify should work *)
+  let valid = Crypto.verify_ecdsa_normalized ~pubkey ~msg32:msg_hash ~signature in
+  Alcotest.(check bool) "normalized verify works" true valid
+
+let test_schnorr_verify_batch_empty () =
+  let result = Crypto.schnorr_verify_batch [] in
+  Alcotest.(check bool) "empty batch is valid" true result
+
+let test_schnorr_verify_batch_single () =
+  let privkey = Crypto.generate_private_key () in
+  let pubkey_x = Crypto.derive_xonly_pubkey privkey in
+  let msg = Crypto.sha256d (Cstruct.of_string "test message") in
+  let sig_ = Crypto.schnorr_sign ~privkey ~msg in
+  let result = Crypto.schnorr_verify_batch [(pubkey_x, msg, sig_)] in
+  Alcotest.(check bool) "single batch valid" true result
+
+let test_schnorr_verify_batch_multiple () =
+  (* Generate 5 valid signatures *)
+  let items = List.init 5 (fun i ->
+    let privkey = Crypto.generate_private_key () in
+    let pubkey_x = Crypto.derive_xonly_pubkey privkey in
+    let msg = Crypto.sha256d (Cstruct.of_string (Printf.sprintf "message %d" i)) in
+    let sig_ = Crypto.schnorr_sign ~privkey ~msg in
+    (pubkey_x, msg, sig_)
+  ) in
+  let result = Crypto.schnorr_verify_batch items in
+  Alcotest.(check bool) "multiple batch valid" true result
+
+let test_schnorr_verify_batch_one_invalid () =
+  (* Generate 4 valid + 1 invalid *)
+  let items = List.init 5 (fun i ->
+    let privkey = Crypto.generate_private_key () in
+    let pubkey_x = Crypto.derive_xonly_pubkey privkey in
+    let msg = Crypto.sha256d (Cstruct.of_string (Printf.sprintf "message %d" i)) in
+    let sig_ = Crypto.schnorr_sign ~privkey ~msg in
+    if i = 2 then
+      (* Corrupt the signature for item 2 *)
+      let bad_sig = Cstruct.sub sig_ 0 64 in
+      Cstruct.set_uint8 bad_sig 0 (0xFF lxor Cstruct.get_uint8 bad_sig 0);
+      (pubkey_x, msg, bad_sig)
+    else
+      (pubkey_x, msg, sig_)
+  ) in
+  let result = Crypto.schnorr_verify_batch items in
+  Alcotest.(check bool) "batch with invalid fails" false result
+
+let test_is_valid_pubkey () =
+  let privkey = Crypto.generate_private_key () in
+  let pubkey_compressed = Crypto.derive_public_key ~compressed:true privkey in
+  let pubkey_uncompressed = Crypto.derive_public_key ~compressed:false privkey in
+  Alcotest.(check bool) "compressed pubkey valid" true
+    (Crypto.is_valid_pubkey pubkey_compressed);
+  Alcotest.(check bool) "uncompressed pubkey valid" true
+    (Crypto.is_valid_pubkey pubkey_uncompressed);
+  (* Invalid pubkeys *)
+  Alcotest.(check bool) "empty not valid" false
+    (Crypto.is_valid_pubkey (Cstruct.create 0));
+  Alcotest.(check bool) "wrong length not valid" false
+    (Crypto.is_valid_pubkey (Cstruct.create 20));
+  let bad_pubkey = Cstruct.create 33 in
+  Cstruct.set_uint8 bad_pubkey 0 0x04;  (* Wrong prefix for 33 bytes *)
+  Alcotest.(check bool) "bad prefix not valid" false
+    (Crypto.is_valid_pubkey bad_pubkey)
+
+let test_compress_pubkey () =
+  let privkey = Crypto.generate_private_key () in
+  let pubkey_uncompressed = Crypto.derive_public_key ~compressed:false privkey in
+  let pubkey_compressed = Crypto.derive_public_key ~compressed:true privkey in
+  (* Compress the uncompressed key *)
+  match Crypto.compress_pubkey pubkey_uncompressed with
+  | None -> Alcotest.fail "compression failed"
+  | Some compressed ->
+    Alcotest.(check int) "compressed length" 33 (Cstruct.length compressed);
+    Alcotest.(check bool) "compressed matches" true
+      (Cstruct.equal compressed pubkey_compressed)
+
+let test_compress_already_compressed () =
+  let privkey = Crypto.generate_private_key () in
+  let pubkey = Crypto.derive_public_key ~compressed:true privkey in
+  match Crypto.compress_pubkey pubkey with
+  | None -> Alcotest.fail "should return Some for already compressed"
+  | Some result ->
+    Alcotest.(check bool) "returns same" true (Cstruct.equal result pubkey)
+
+let hardware_accel_tests = [
+  Alcotest.test_case "verify_ecdsa_fast" `Quick test_verify_ecdsa_fast;
+  Alcotest.test_case "verify_ecdsa_fast wrong message" `Quick test_verify_ecdsa_fast_wrong_message;
+  Alcotest.test_case "verify_ecdsa_normalized" `Quick test_verify_ecdsa_normalized;
+  Alcotest.test_case "schnorr_verify_batch empty" `Quick test_schnorr_verify_batch_empty;
+  Alcotest.test_case "schnorr_verify_batch single" `Quick test_schnorr_verify_batch_single;
+  Alcotest.test_case "schnorr_verify_batch multiple" `Quick test_schnorr_verify_batch_multiple;
+  Alcotest.test_case "schnorr_verify_batch invalid" `Quick test_schnorr_verify_batch_one_invalid;
+  Alcotest.test_case "is_valid_pubkey" `Quick test_is_valid_pubkey;
+  Alcotest.test_case "compress_pubkey" `Quick test_compress_pubkey;
+  Alcotest.test_case "compress already compressed" `Quick test_compress_already_compressed;
+]
+
 let qcheck_tests = [
   QCheck_alcotest.to_alcotest qcheck_sign_verify_roundtrip;
 ]
@@ -243,4 +366,5 @@ let () = Alcotest.run "test_crypto" [
   ("merkle", merkle_tests);
   ("genesis", genesis_tests);
   ("property", qcheck_tests);
+  ("hardware_accel", hardware_accel_tests);
 ]

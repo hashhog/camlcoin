@@ -328,6 +328,98 @@ let test_process_batch_empty () =
   Alcotest.(check (result int string)) "empty batch" (Ok 0) result
 
 (* ============================================================================
+   Parallel Validation Tests
+   ============================================================================ *)
+
+let test_parallel_validate_basic () =
+  Lwt_main.run (
+    let items = [1; 2; 3; 4; 5] in
+    let%lwt results = Perf.Parallel.validate_parallel (fun x -> x * 2) items in
+    Alcotest.(check (list int)) "parallel results" [2; 4; 6; 8; 10] results;
+    Lwt.return_unit
+  )
+
+let test_parallel_validate_empty () =
+  Lwt_main.run (
+    let items = [] in
+    let%lwt results = Perf.Parallel.validate_parallel (fun x -> x * 2) items in
+    Alcotest.(check (list int)) "empty parallel" [] results;
+    Lwt.return_unit
+  )
+
+let test_parallel_validate_all_ok () =
+  Lwt_main.run (
+    let items = [1; 2; 3; 4; 5] in
+    let%lwt result = Perf.Parallel.validate_all_ok (fun _ -> Ok ()) items in
+    Alcotest.(check (result unit string)) "all ok" (Ok ()) result;
+    Lwt.return_unit
+  )
+
+let test_parallel_count () =
+  Lwt_main.run (
+    let items = [1; 2; 3; 4; 5; 6; 7; 8; 9; 10] in
+    let%lwt count = Perf.Parallel.count_parallel (fun x -> x mod 2 = 0) items in
+    Alcotest.(check int) "count evens" 5 count;
+    Lwt.return_unit
+  )
+
+let test_parallelism_setting () =
+  let original = !(Perf.Parallel.max_parallelism) in
+  Perf.Parallel.set_parallelism 8;
+  Alcotest.(check int) "set parallelism" 8 !(Perf.Parallel.max_parallelism);
+  Perf.Parallel.set_parallelism 0;  (* Should clamp to 1 *)
+  Alcotest.(check int) "clamp to 1" 1 !(Perf.Parallel.max_parallelism);
+  Perf.Parallel.set_parallelism original
+
+(* ============================================================================
+   Crypto Benchmark Tests
+   ============================================================================ *)
+
+let test_bench_result_to_json () =
+  let result : Perf.CryptoBench.bench_result = {
+    name = "test_bench";
+    iterations = 1000;
+    total_time = 0.5;
+    ops_per_sec = 2000.0;
+  } in
+  let json = Perf.CryptoBench.bench_result_to_json result in
+  match json with
+  | `Assoc fields ->
+    (match List.assoc_opt "name" fields with
+     | Some (`String "test_bench") -> ()
+     | _ -> Alcotest.fail "expected name=test_bench");
+    (match List.assoc_opt "iterations" fields with
+     | Some (`Int 1000) -> ()
+     | _ -> Alcotest.fail "expected iterations=1000");
+    (match List.assoc_opt "ops_per_sec" fields with
+     | Some (`Float f) when f > 1999.0 && f < 2001.0 -> ()
+     | _ -> Alcotest.fail "expected ops_per_sec ~2000")
+  | _ -> Alcotest.fail "expected json object"
+
+let test_run_bench () =
+  (* Do some actual work to ensure measurable time *)
+  let sum = ref 0 in
+  let result = Perf.CryptoBench.run_bench ~iterations:1000 "test" (fun () ->
+    for i = 0 to 100 do sum := !sum + i done
+  ) in
+  Alcotest.(check string) "bench name" "test" result.name;
+  Alcotest.(check int) "bench iterations" 1000 result.iterations;
+  (* Time might be very small but should be non-negative *)
+  Alcotest.(check bool) "total_time non-negative" true (result.total_time >= 0.0);
+  Alcotest.(check bool) "ops_per_sec positive" true (result.ops_per_sec > 0.0)
+
+let test_results_to_json () =
+  let results = [
+    { Perf.CryptoBench.name = "a"; iterations = 10; total_time = 0.1; ops_per_sec = 100.0 };
+    { Perf.CryptoBench.name = "b"; iterations = 20; total_time = 0.2; ops_per_sec = 100.0 };
+  ] in
+  let json = Perf.CryptoBench.results_to_json results in
+  match json with
+  | `List items ->
+    Alcotest.(check int) "json list length" 2 (List.length items)
+  | _ -> Alcotest.fail "expected json list"
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -375,5 +467,17 @@ let () =
       test_case "success" `Quick test_process_batch_success;
       test_case "failure" `Quick test_process_batch_failure;
       test_case "empty" `Quick test_process_batch_empty;
+    ];
+    "parallel_validation", [
+      test_case "basic" `Quick test_parallel_validate_basic;
+      test_case "empty" `Quick test_parallel_validate_empty;
+      test_case "all ok" `Quick test_parallel_validate_all_ok;
+      test_case "count" `Quick test_parallel_count;
+      test_case "parallelism setting" `Quick test_parallelism_setting;
+    ];
+    "crypto_bench", [
+      test_case "bench result to json" `Quick test_bench_result_to_json;
+      test_case "run bench" `Quick test_run_bench;
+      test_case "results to json" `Quick test_results_to_json;
     ];
   ]

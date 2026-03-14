@@ -453,7 +453,7 @@ let check_p2wsh_witness_limits (tx : Types.transaction) : (unit, string) result 
 let is_standard_tx (min_relay_fee : int64) (tx : Types.transaction) : (unit, string) result =
   (* Version must be 1 or 2 *)
   let version = Int32.to_int tx.version in
-  if version < 1 || version > 3 then
+  if version < 1 || version > 2 then
     Error "Non-standard transaction version"
   else begin
     (* Weight must not exceed 400,000 *)
@@ -743,6 +743,14 @@ let add_transaction ?(dry_run=false) (mp : mempool) (tx : Types.transaction)
   (* Check for duplicate *)
   if Hashtbl.mem mp.entries txid_key then
     Error "Transaction already in mempool"
+
+  (* Check for mempool input conflicts (double-spends) *)
+  else
+    let conflict = if not dry_run then check_conflict mp tx else None in
+    if conflict <> None then
+      let conflict_txid = Option.get conflict in
+      Error (Printf.sprintf "txn-mempool-conflict: spends same input as %s"
+        (Types.hash256_to_hex_display conflict_txid))
 
   (* Basic structure validation *)
   else match Validation.check_transaction tx with

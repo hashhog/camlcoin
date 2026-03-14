@@ -611,47 +611,6 @@ let make_v3_tx inputs outputs =
   }
 
 (* A valid P2PKH script_pubkey with exactly 20 bytes of hash *)
-let standard_p2pkh_script =
-  Cstruct.of_string "\x76\xa9\x14\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x88\xac"
-
-(* Helper to create a standard test output (P2PKH with 20-byte hash) *)
-let make_standard_output value =
-  Types.{
-    value;
-    script_pubkey = standard_p2pkh_script;
-  }
-
-(* Helper to create a test mempool with require_standard enabled for v3 dust tests *)
-let create_test_mempool_standard () =
-  cleanup_test_db ();
-  let db = Storage.ChainDB.create test_db_path in
-  let utxo = Utxo.UtxoSet.create db in
-  let txid1 = Types.hash256_of_hex
-    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b" in
-  let txid2 = Types.hash256_of_hex
-    "0e3e2357e806b6cdb1f70b54c3a3a17b6714ee1f0e68bebb44a74b1efd512098" in
-  let txid3 = Types.hash256_of_hex
-    "9b0fc92260312ce44e74ef369f5c66bbb85848f2eddd5a7a1cde251e54ccfdd5" in
-  Utxo.UtxoSet.add utxo txid1 0 Utxo.{
-    value = 50_000_000L;
-    script_pubkey = standard_p2pkh_script;
-    height = 0;
-    is_coinbase = false;
-  };
-  Utxo.UtxoSet.add utxo txid2 0 Utxo.{
-    value = 50_000_000L;
-    script_pubkey = standard_p2pkh_script;
-    height = 0;
-    is_coinbase = false;
-  };
-  Utxo.UtxoSet.add utxo txid3 0 Utxo.{
-    value = 50_000_000L;
-    script_pubkey = standard_p2pkh_script;
-    height = 0;
-    is_coinbase = false;
-  };
-  let mp = Mempool.create ~require_standard:true ~verify_scripts:false ~utxo ~current_height:100 () in
-  (mp, utxo, db, txid1, txid2, txid3)
 
 (* Test: v3 child tx with >10k vsize rejected *)
 let test_truc_vsize_limit () =
@@ -775,13 +734,14 @@ let test_truc_no_mixing () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
-(* Test: v3 tx with zero-value output accepted (ephemeral dust exemption) *)
+(* Test: v3 tx with zero-value output accepted (ephemeral dust exemption)
+   Uses non-standard mempool since v3 is not standard per policy *)
 let test_truc_ephemeral_dust () =
-  let (mp, _utxo, db, txid1, _, _) = create_test_mempool_standard () in
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
   (* v3 tx with a zero-value output should be accepted *)
   let tx = make_v3_tx
     [make_test_input txid1 0l]
-    [make_standard_output 49_990_000L; make_standard_output 0L]
+    [make_test_output 990_000L; make_test_output 0L]
   in
   let result = Mempool.add_transaction mp tx in
   Alcotest.(check bool) "v3 tx with zero-value output accepted" true (Result.is_ok result);

@@ -447,12 +447,240 @@ let test_ping_pong_property =
       | _ -> false
     )
 
+(* ============================================================================
+   BIP 152 Compact Block Tests
+   ============================================================================ *)
+
+(* Helper to create a test block *)
+let make_test_block () : Types.block =
+  let header : Types.block_header = {
+    version = 0x20000000l;
+    prev_block = test_hash ();
+    merkle_root = test_hash ();
+    timestamp = 1699999999l;
+    bits = 0x1d00ffffl;
+    nonce = 12345l;
+  } in
+  let coinbase : Types.transaction = {
+    version = 1l;
+    inputs = [{
+      previous_output = { txid = Types.zero_hash; vout = 0xFFFFFFFFl };
+      script_sig = Cstruct.of_string "\x03\x01\x02\x03";
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [{
+      value = 5000000000L;
+      script_pubkey = Cstruct.concat [Cstruct.of_string "\x00\x14"; Cstruct.create 20];
+    }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let tx1 : Types.transaction = {
+    version = 2l;
+    inputs = [{
+      previous_output = { txid = test_hash (); vout = 0l };
+      script_sig = Cstruct.empty;
+      sequence = 0xFFFFFFFEl;
+    }];
+    outputs = [{
+      value = 1000000L;
+      script_pubkey = Cstruct.concat [Cstruct.of_string "\x00\x14"; Cstruct.create 20];
+    }];
+    witnesses = [{ Types.items = [Cstruct.create 71; Cstruct.create 33] }];
+    locktime = 0l;
+  } in
+  { header; transactions = [coinbase; tx1] }
+
+(* Test compact block creation *)
+let test_compact_block_creation () =
+  let blk = make_test_block () in
+  let cb = P2p.create_compact_block blk in
+  (* Should have correct header *)
+  Alcotest.(check int32) "header version" blk.Types.header.Types.version cb.P2p.header.Types.version;
+  Alcotest.(check int32) "header timestamp" blk.Types.header.Types.timestamp cb.P2p.header.Types.timestamp;
+  (* Coinbase should be prefilled at index 0 *)
+  Alcotest.(check int) "prefilled count" 1 (List.length cb.P2p.prefilled_txs);
+  let ptx = List.hd cb.P2p.prefilled_txs in
+  Alcotest.(check int) "prefilled index" 0 ptx.P2p.index;
+  Alcotest.(check int32) "prefilled tx version" 1l ptx.P2p.tx.Types.version;
+  (* Should have short IDs for non-coinbase transactions *)
+  Alcotest.(check int) "short_ids count" 1 (List.length cb.P2p.short_ids)
+
+(* Test cmpctblock message serialization roundtrip *)
+let test_cmpctblock_roundtrip () =
+  let block = make_test_block () in
+  let cb = P2p.create_compact_block block in
+  let payload = P2p.CmpctblockMsg cb in
+  let serialized = P2p.serialize_message P2p.mainnet_magic payload in
+  let msg = P2p.deserialize_message serialized in
+  match msg.payload with
+  | P2p.CmpctblockMsg cb' ->
+    Alcotest.(check int32) "header version" cb.header.version cb'.header.version;
+    Alcotest.(check int64) "nonce" cb.nonce cb'.nonce;
+    Alcotest.(check int) "short_ids count"
+      (List.length cb.short_ids) (List.length cb'.short_ids);
+    Alcotest.(check int) "prefilled count"
+      (List.length cb.prefilled_txs) (List.length cb'.prefilled_txs);
+    (* Verify short IDs match *)
+    List.iter2 (fun a b ->
+      Alcotest.(check int64) "short_id" a b
+    ) cb.short_ids cb'.short_ids
+  | _ -> Alcotest.fail "Expected CmpctblockMsg"
+
+(* Test getblocktxn message serialization roundtrip *)
+let test_getblocktxn_roundtrip () =
+  let req : P2p.block_txns_request = {
+    block_hash = test_hash ();
+    indexes = [0; 2; 5];  (* differential encoded: 0, 1, 2 *)
+  } in
+  let payload = P2p.GetblocktxnMsg req in
+  let serialized = P2p.serialize_message P2p.mainnet_magic payload in
+  let msg = P2p.deserialize_message serialized in
+  match msg.payload with
+  | P2p.GetblocktxnMsg req' ->
+    Alcotest.(check bool) "block_hash"
+      true (Cstruct.equal req.block_hash req'.block_hash);
+    Alcotest.(check (list int)) "indexes" req.indexes req'.indexes
+  | _ -> Alcotest.fail "Expected GetblocktxnMsg"
+
+(* Test blocktxn message serialization roundtrip *)
+let test_blocktxn_roundtrip () =
+  let tx : Types.transaction = {
+    version = 2l;
+    inputs = [{
+      previous_output = { txid = test_hash (); vout = 1l };
+      script_sig = Cstruct.empty;
+      sequence = 0xFFFFFFFEl;
+    }];
+    outputs = [{
+      value = 500000L;
+      script_pubkey = Cstruct.concat [Cstruct.of_string "\x00\x14"; Cstruct.create 20];
+    }];
+    witnesses = [{ Types.items = [Cstruct.create 64] }];
+    locktime = 0l;
+  } in
+  let resp : P2p.block_txns = {
+    block_hash = test_hash ();
+    txs = [tx];
+  } in
+  let payload = P2p.BlocktxnMsg resp in
+  let serialized = P2p.serialize_message P2p.mainnet_magic payload in
+  let msg = P2p.deserialize_message serialized in
+  match msg.payload with
+  | P2p.BlocktxnMsg resp' ->
+    Alcotest.(check bool) "block_hash"
+      true (Cstruct.equal resp.block_hash resp'.block_hash);
+    Alcotest.(check int) "txs count"
+      (List.length resp.txs) (List.length resp'.txs);
+    let tx' = List.hd resp'.txs in
+    Alcotest.(check int32) "tx version" 2l tx'.version
+  | _ -> Alcotest.fail "Expected BlocktxnMsg"
+
+(* Test SipHash key derivation and short ID computation *)
+let test_siphash_short_id () =
+  let header_hash = test_hash () in
+  let nonce = 0x123456789ABCDEF0L in
+  let (k0, k1) = Crypto.SipHash.derive_keys header_hash nonce in
+  (* Keys should be deterministic *)
+  let (k0', k1') = Crypto.SipHash.derive_keys header_hash nonce in
+  Alcotest.(check int64) "k0 deterministic" k0 k0';
+  Alcotest.(check int64) "k1 deterministic" k1 k1';
+  (* Different nonce should give different keys *)
+  let (k0'', k1'') = Crypto.SipHash.derive_keys header_hash (Int64.add nonce 1L) in
+  Alcotest.(check bool) "different nonce different k0" true (k0 <> k0'' || k1 <> k1'');
+  ignore k1'';
+  (* Compute short ID *)
+  let wtxid = test_hash () in
+  let short_id = Crypto.compute_short_txid k0 k1 wtxid in
+  (* Short ID should be 6 bytes (48 bits) *)
+  let mask_6bytes = 0xFFFFFFFFFFFFL in
+  Alcotest.(check int64) "short_id is 6 bytes"
+    short_id (Int64.logand short_id mask_6bytes)
+
+(* Test block reconstruction *)
+let test_block_reconstruction () =
+  let blk : Types.block = make_test_block () in
+  let blk_txs : Types.transaction list = blk.transactions in
+  let cb = P2p.create_compact_block blk in
+  let header_hash = Crypto.compute_block_hash cb.header in
+  let (k0, k1) = Crypto.SipHash.derive_keys header_hash cb.nonce in
+
+  (* Create lookup table with all non-coinbase transactions *)
+  let non_coinbase = List.tl blk_txs in
+  let lookup = P2p.create_tx_lookup ~k0 ~k1 non_coinbase in
+
+  (* Attempt reconstruction *)
+  match P2p.reconstruct_block cb lookup with
+  | P2p.ReconstructComplete reconstructed ->
+    let recon_txs : Types.transaction list = reconstructed.transactions in
+    Alcotest.(check int32) "reconstructed header version"
+      blk.header.version reconstructed.header.version;
+    Alcotest.(check int) "reconstructed tx count"
+      (List.length blk_txs) (List.length recon_txs);
+    (* Verify transactions match *)
+    List.iteri (fun i (orig : Types.transaction) ->
+      let recon : Types.transaction = List.nth recon_txs i in
+      Alcotest.(check int32) (Printf.sprintf "tx %d version" i)
+        orig.version recon.version
+    ) blk_txs
+  | P2p.ReconstructNeedTxs missing ->
+    Alcotest.fail (Printf.sprintf "Missing %d transactions" (List.length missing))
+  | P2p.ReconstructFailed msg ->
+    Alcotest.fail msg
+
+(* Test reconstruction with missing transactions *)
+let test_block_reconstruction_missing () =
+  let blk = make_test_block () in
+  let cb = P2p.create_compact_block blk in
+
+  (* Create empty lookup table *)
+  let lookup : P2p.tx_lookup = { by_short_id = Hashtbl.create 0 } in
+
+  match P2p.reconstruct_block cb lookup with
+  | P2p.ReconstructNeedTxs missing ->
+    (* Should be missing non-coinbase transactions *)
+    Alcotest.(check int) "missing tx count" 1 (List.length missing)
+  | P2p.ReconstructComplete _ ->
+    Alcotest.fail "Should not complete with empty lookup"
+  | P2p.ReconstructFailed msg ->
+    Alcotest.fail msg
+
+(* Test differential index encoding *)
+let test_differential_indices () =
+  (* Absolute indices: 0, 5, 7, 10 *)
+  (* Differential: 0, (5-0-1)=4, (7-5-1)=1, (10-7-1)=2 *)
+  let hash = test_hash () in
+  let req = P2p.make_getblocktxn_request hash [0; 5; 7; 10] in
+  Alcotest.(check (list int)) "differential indices"
+    [0; 4; 1; 2] req.indexes;
+  (* Decode back to absolute *)
+  let decoded = P2p.decode_differential_indices req.indexes in
+  Alcotest.(check (list int)) "decoded absolute"
+    [0; 5; 7; 10] decoded
+
+(* Test compact block tx count *)
+let test_compact_block_tx_count () =
+  let blk = make_test_block () in
+  let cb = P2p.create_compact_block blk in
+  let count = P2p.compact_block_tx_count cb in
+  Alcotest.(check int) "tx count"
+    (List.length blk.Types.transactions) count
+
+(* Test cmpctblock command in command list *)
+let test_cmpctblock_command () =
+  let cmd = P2p.command_of_string "cmpctblock" in
+  Alcotest.(check bool) "cmpctblock command"
+    true (cmd = P2p.Cmpctblock);
+  let s = P2p.command_to_string P2p.Cmpctblock in
+  Alcotest.(check string) "cmpctblock string" "cmpctblock" s
+
 let () =
   let open Alcotest in
   run "P2P" [
     "commands", [
       test_case "command roundtrip" `Quick test_command_roundtrip;
       test_case "unknown command" `Quick test_command_unknown;
+      test_case "cmpctblock command" `Quick test_cmpctblock_command;
     ];
     "inv_types", [
       test_case "inv_type roundtrip" `Quick test_inv_type_roundtrip;
@@ -477,6 +705,9 @@ let () =
       test_case "tx roundtrip" `Quick test_tx_roundtrip;
       test_case "block roundtrip" `Quick test_block_roundtrip;
       test_case "empty payloads" `Quick test_empty_payloads;
+      test_case "cmpctblock roundtrip" `Quick test_cmpctblock_roundtrip;
+      test_case "getblocktxn roundtrip" `Quick test_getblocktxn_roundtrip;
+      test_case "blocktxn roundtrip" `Quick test_blocktxn_roundtrip;
     ];
     "network", [
       test_case "network magic" `Quick test_network_magic;
@@ -488,6 +719,14 @@ let () =
     "helpers", [
       test_case "empty_net_addr" `Quick test_empty_net_addr;
       test_case "ipv4_to_net_addr" `Quick test_ipv4_to_net_addr;
+    ];
+    "compact_blocks", [
+      test_case "compact block creation" `Quick test_compact_block_creation;
+      test_case "siphash short id" `Quick test_siphash_short_id;
+      test_case "block reconstruction" `Quick test_block_reconstruction;
+      test_case "reconstruction missing" `Quick test_block_reconstruction_missing;
+      test_case "differential indices" `Quick test_differential_indices;
+      test_case "compact block tx count" `Quick test_compact_block_tx_count;
     ];
     "property", [
       QCheck_alcotest.to_alcotest test_ping_pong_property;

@@ -22,3 +22,4 @@ module Perf = Perf
 module Block_index = Block_index
 module Psbt = Psbt
 module Descriptor = Descriptor
+module Miniscript = Miniscript

@@ -862,6 +862,97 @@ let test_sequence_lock_multiple_inputs () =
   Alcotest.(check bool) "second input not satisfied" false result_fail
 
 (* ============================================================================
+   Coinbase Maturity Tests
+   ============================================================================ *)
+
+(* Test: Coinbase maturity error type *)
+let test_coinbase_maturity_error_string () =
+  let err = Validation.TxCoinbaseMaturity 50 in
+  let s = Validation.tx_error_to_string err in
+  (* Check that error message mentions confirmations and maturity requirement *)
+  Alcotest.(check bool) "error has content" true (String.length s > 0);
+  Alcotest.(check bool) "error mentions confirmations" true
+    (Str.string_match (Str.regexp ".*50.*") s 0)
+
+(* Test: Coinbase maturity at exactly 100 blocks should succeed *)
+let test_coinbase_maturity_exact_100 () =
+  (* Create a UTXO lookup that returns a coinbase at height 0 *)
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  let lookup _outpoint =
+    Some {
+      Validation.txid;
+      vout = 0l;
+      value = 50_00000000L;
+      script_pubkey = Cstruct.of_string "\x76\xa9\x14\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x88\xac";
+      height = 0;
+      is_coinbase = true;
+    }
+  in
+  let tx = make_tx
+    ~inputs:[make_input ~txid ()]
+    ~outputs:[make_output ~value:49_99990000L ()]
+    ()
+  in
+  (* At height 100, coinbase from height 0 has exactly 100 confirmations *)
+  match Validation.validate_tx_inputs tx ~lookup ~block_height:100
+          ~flags:0 ~skip_scripts:true () with
+  | Ok _ -> ()  (* Should succeed *)
+  | Error e -> Alcotest.fail ("Should have succeeded: " ^ Validation.tx_error_to_string e)
+
+(* Test: Coinbase maturity at 99 blocks should fail *)
+let test_coinbase_maturity_99_blocks () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  let lookup _outpoint =
+    Some {
+      Validation.txid;
+      vout = 0l;
+      value = 50_00000000L;
+      script_pubkey = Cstruct.of_string "\x76\xa9\x14\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x88\xac";
+      height = 0;
+      is_coinbase = true;
+    }
+  in
+  let tx = make_tx
+    ~inputs:[make_input ~txid ()]
+    ~outputs:[make_output ~value:49_99990000L ()]
+    ()
+  in
+  (* At height 99, coinbase from height 0 has only 99 confirmations *)
+  match Validation.validate_tx_inputs tx ~lookup ~block_height:99
+          ~flags:0 ~skip_scripts:true () with
+  | Ok _ -> Alcotest.fail "Should have failed with coinbase maturity"
+  | Error (Validation.TxCoinbaseMaturity confs) ->
+    Alcotest.(check int) "confirmations" 99 confs
+  | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.tx_error_to_string e)
+
+(* Test: Non-coinbase UTXO has no maturity requirement *)
+let test_non_coinbase_no_maturity () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  let lookup _outpoint =
+    Some {
+      Validation.txid;
+      vout = 0l;
+      value = 1_00000000L;
+      script_pubkey = Cstruct.of_string "\x76\xa9\x14\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x88\xac";
+      height = 0;
+      is_coinbase = false;  (* Not a coinbase *)
+    }
+  in
+  let tx = make_tx
+    ~inputs:[make_input ~txid ()]
+    ~outputs:[make_output ~value:99990000L ()]
+    ()
+  in
+  (* At height 1, non-coinbase from height 0 can be spent immediately *)
+  match Validation.validate_tx_inputs tx ~lookup ~block_height:1
+          ~flags:0 ~skip_scripts:true () with
+  | Ok _ -> ()  (* Should succeed *)
+  | Error e -> Alcotest.fail ("Should have succeeded: " ^ Validation.tx_error_to_string e)
+
+(* ============================================================================
    Test Registration
    ============================================================================ *)
 
@@ -939,5 +1030,11 @@ let () =
       test_case "version 1 ignores locks" `Quick test_sequence_lock_version_1_ignored;
       test_case "no CSV flag skips check" `Quick test_sequence_lock_flag_not_set;
       test_case "multiple inputs" `Quick test_sequence_lock_multiple_inputs;
+    ];
+    "coinbase_maturity", [
+      test_case "error string" `Quick test_coinbase_maturity_error_string;
+      test_case "exact 100 confirmations" `Quick test_coinbase_maturity_exact_100;
+      test_case "99 confirmations fails" `Quick test_coinbase_maturity_99_blocks;
+      test_case "non-coinbase no maturity" `Quick test_non_coinbase_no_maturity;
     ];
   ]

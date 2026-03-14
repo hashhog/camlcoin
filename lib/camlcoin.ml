@@ -21,3 +21,4 @@ module Cli = Cli
 module Perf = Perf
 module Block_index = Block_index
 module Psbt = Psbt
+module Descriptor = Descriptor

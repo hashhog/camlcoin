@@ -891,6 +891,69 @@ let get_checkpoint_hash (height : int) (network : network_config) : Types.hash25
   List.assoc_opt height network.checkpoints
 
 (* ============================================================================
+   Checkpoint Verification
+   ============================================================================ *)
+
+(* Checkpoint verification result *)
+type checkpoint_result =
+  | CheckpointOk             (* Not at checkpoint height, or hash matches *)
+  | CheckpointMismatch of {  (* Block at checkpoint height doesn't match expected hash *)
+      height : int;
+      expected : Types.hash256;
+      actual : Types.hash256;
+    }
+
+(* Verify that a block hash matches the expected checkpoint at a given height.
+   Returns CheckpointOk if:
+   - The height is not a checkpoint height, OR
+   - The block hash matches the expected checkpoint hash
+   Returns CheckpointMismatch if the block is at a checkpoint height but has wrong hash.
+
+   This function should be called during accept_block_header and connect_block. *)
+let verify_checkpoint (height : int) (block_hash : Types.hash256)
+    (network : network_config) : checkpoint_result =
+  match get_checkpoint_hash height network with
+  | None -> CheckpointOk  (* Not a checkpoint height *)
+  | Some expected ->
+    if Cstruct.equal block_hash expected then
+      CheckpointOk
+    else
+      CheckpointMismatch { height; expected; actual = block_hash }
+
+(* Convert checkpoint result to string for error messages *)
+let checkpoint_result_to_string = function
+  | CheckpointOk -> "ok"
+  | CheckpointMismatch { height; expected; actual } ->
+    Printf.sprintf "checkpoint mismatch at height %d: expected %s, got %s"
+      height
+      (Types.hash256_to_hex_display expected)
+      (Types.hash256_to_hex_display actual)
+
+(* Check if chain work meets minimum_chain_work threshold.
+   This should be used to reject headers that would lead to a chain with less
+   total work than the hardcoded minimum. Returns true if work >= minimum. *)
+let meets_minimum_chain_work (work : Cstruct.t) (network : network_config) : bool =
+  work_compare work network.minimum_chain_work >= 0
+
+(* Check if a block hash is an ancestor of the assume_valid hash.
+   If assume_valid_hash is set and this block is at or below the assume_valid
+   block's height (which must be verified through the header chain), script
+   verification can be skipped.
+
+   Parameters:
+   - block_hash: the hash of the block being validated
+   - block_height: the height of the block being validated
+   - assume_valid_height: the height of the assume_valid block (if known)
+   - network: network configuration
+
+   Returns true if script verification should be skipped. *)
+let should_skip_scripts ~(block_height : int)
+    ~(assume_valid_height : int option) ~(network : network_config) : bool =
+  match network.assume_valid_hash, assume_valid_height with
+  | Some _, Some av_height -> block_height <= av_height
+  | _ -> false
+
+(* ============================================================================
    BIP9 Version Bits State Machine (versionbits)
    ============================================================================ *)
 

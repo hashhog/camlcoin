@@ -320,6 +320,338 @@ let test_sendrawtransaction_param_formats () =
   cleanup_test_db ()
 
 (* ============================================================================
+   getrawtransaction Tests
+   ============================================================================ *)
+
+(* Test: getrawtransaction returns hex for mempool transaction *)
+let test_getrawtransaction_mempool_hex () =
+  let (ctx, db, _, txid1, _) = create_test_context () in
+  (* Create and add a transaction to mempool *)
+  let tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 9_990_000L]
+  in
+  let hex = tx_to_hex tx in
+  let _ = Rpc.handle_sendrawtransaction ctx [`String hex] in
+
+  (* Now query with getrawtransaction *)
+  let txid = Crypto.compute_txid tx in
+  let txid_hex = Types.hash256_to_hex_display txid in
+  let params = [`String txid_hex] in
+  let result = Rpc.handle_getrawtransaction ctx params in
+  Alcotest.(check bool) "mempool tx found" true (Result.is_ok result);
+  (match result with
+   | Ok (`String returned_hex) ->
+     Alcotest.(check string) "hex matches" hex returned_hex
+   | _ -> Alcotest.fail "expected Ok(`String hex)");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: getrawtransaction verbose mode returns JSON with required fields *)
+let test_getrawtransaction_verbose () =
+  let (ctx, db, _, txid1, _) = create_test_context () in
+  (* Create and add a transaction to mempool *)
+  let tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 9_990_000L]
+  in
+  let hex = tx_to_hex tx in
+  let _ = Rpc.handle_sendrawtransaction ctx [`String hex] in
+
+  (* Query with verbose=true *)
+  let txid = Crypto.compute_txid tx in
+  let txid_hex = Types.hash256_to_hex_display txid in
+  let params = [`String txid_hex; `Bool true] in
+  let result = Rpc.handle_getrawtransaction ctx params in
+  Alcotest.(check bool) "verbose result ok" true (Result.is_ok result);
+  (match result with
+   | Ok (`Assoc fields) ->
+     (* Check required fields exist *)
+     Alcotest.(check bool) "has txid" true (List.mem_assoc "txid" fields);
+     Alcotest.(check bool) "has hash" true (List.mem_assoc "hash" fields);
+     Alcotest.(check bool) "has version" true (List.mem_assoc "version" fields);
+     Alcotest.(check bool) "has size" true (List.mem_assoc "size" fields);
+     Alcotest.(check bool) "has vsize" true (List.mem_assoc "vsize" fields);
+     Alcotest.(check bool) "has weight" true (List.mem_assoc "weight" fields);
+     Alcotest.(check bool) "has locktime" true (List.mem_assoc "locktime" fields);
+     Alcotest.(check bool) "has vin" true (List.mem_assoc "vin" fields);
+     Alcotest.(check bool) "has vout" true (List.mem_assoc "vout" fields);
+     Alcotest.(check bool) "has hex" true (List.mem_assoc "hex" fields);
+     (* Check txid matches *)
+     (match List.assoc_opt "txid" fields with
+      | Some (`String returned_txid) ->
+        Alcotest.(check string) "txid matches" txid_hex returned_txid
+      | _ -> Alcotest.fail "txid should be string")
+   | _ -> Alcotest.fail "expected Ok(`Assoc fields)");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: getrawtransaction verbose mode includes scriptPubKey type *)
+let test_getrawtransaction_scriptpubkey_type () =
+  let (ctx, db, _, txid1, _) = create_test_context () in
+  (* Create transaction with P2PKH output *)
+  let tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 9_990_000L]
+  in
+  let hex = tx_to_hex tx in
+  let _ = Rpc.handle_sendrawtransaction ctx [`String hex] in
+
+  let txid = Crypto.compute_txid tx in
+  let txid_hex = Types.hash256_to_hex_display txid in
+  let params = [`String txid_hex; `Bool true] in
+  let result = Rpc.handle_getrawtransaction ctx params in
+  (match result with
+   | Ok (`Assoc fields) ->
+     (match List.assoc_opt "vout" fields with
+      | Some (`List [vout0]) ->
+        (match vout0 with
+         | `Assoc vout_fields ->
+           (match List.assoc_opt "scriptPubKey" vout_fields with
+            | Some (`Assoc spk_fields) ->
+              Alcotest.(check bool) "has type" true (List.mem_assoc "type" spk_fields);
+              (match List.assoc_opt "type" spk_fields with
+               | Some (`String type_name) ->
+                 Alcotest.(check string) "type is pubkeyhash" "pubkeyhash" type_name
+               | _ -> Alcotest.fail "type should be string")
+            | _ -> Alcotest.fail "missing scriptPubKey")
+         | _ -> Alcotest.fail "vout0 should be assoc")
+      | _ -> Alcotest.fail "vout should be list with one element")
+   | _ -> Alcotest.fail "expected Ok(`Assoc fields)");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: getrawtransaction with verbosity=1 (int) *)
+let test_getrawtransaction_verbosity_int () =
+  let (ctx, db, _, txid1, _) = create_test_context () in
+  let tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 9_990_000L]
+  in
+  let hex = tx_to_hex tx in
+  let _ = Rpc.handle_sendrawtransaction ctx [`String hex] in
+
+  let txid = Crypto.compute_txid tx in
+  let txid_hex = Types.hash256_to_hex_display txid in
+  (* Test with verbosity as int *)
+  let params = [`String txid_hex; `Int 1] in
+  let result = Rpc.handle_getrawtransaction ctx params in
+  Alcotest.(check bool) "verbosity=1 returns object" true
+    (match result with Ok (`Assoc _) -> true | _ -> false);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: getrawtransaction with verbosity=0 returns hex *)
+let test_getrawtransaction_verbosity_zero () =
+  let (ctx, db, _, txid1, _) = create_test_context () in
+  let tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 9_990_000L]
+  in
+  let hex = tx_to_hex tx in
+  let _ = Rpc.handle_sendrawtransaction ctx [`String hex] in
+
+  let txid = Crypto.compute_txid tx in
+  let txid_hex = Types.hash256_to_hex_display txid in
+  let params = [`String txid_hex; `Int 0] in
+  let result = Rpc.handle_getrawtransaction ctx params in
+  Alcotest.(check bool) "verbosity=0 returns string" true
+    (match result with Ok (`String _) -> true | _ -> false);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: getrawtransaction for nonexistent tx returns error *)
+let test_getrawtransaction_not_found () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  let fake_txid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in
+  let params = [`String fake_txid] in
+  let result = Rpc.handle_getrawtransaction ctx params in
+  Alcotest.(check bool) "nonexistent tx returns error" true (Result.is_error result);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: getrawtransaction with invalid txid *)
+let test_getrawtransaction_invalid_txid () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  let params = [`String "not_a_valid_txid"] in
+  let result = Rpc.handle_getrawtransaction ctx params in
+  Alcotest.(check bool) "invalid txid returns error" true (Result.is_error result);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: getrawtransaction for confirmed transaction includes block info *)
+let test_getrawtransaction_confirmed_has_block_info () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let utxo = Utxo.UtxoSet.create db in
+
+  (* Create a transaction *)
+  let txid1 = Types.hash256_of_hex
+    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b" in
+  Utxo.UtxoSet.add utxo txid1 0 Utxo.{
+    value = 10_000_000L;
+    script_pubkey = make_p2pkh_script ();
+    height = 0;
+    is_coinbase = false;
+  };
+
+  let tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 9_990_000L]
+  in
+  let txid = Crypto.compute_txid tx in
+
+  (* Store the transaction and its index *)
+  Storage.ChainDB.store_transaction db txid tx;
+  let block_hash = Types.hash256_of_hex
+    "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f" in
+  Storage.ChainDB.store_tx_index db txid block_hash 0;
+
+  (* Create chain state with a tip *)
+  let chain = Sync.create_chain_state db Consensus.mainnet in
+  let pm = Peer_manager.create Consensus.mainnet in
+  let fe = Fee_estimation.create () in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
+
+  let ctx : Rpc.rpc_context = {
+    chain = chain;
+    mempool = mp;
+    peer_manager = pm;
+    wallet = None;
+    fee_estimator = fe;
+    network = Consensus.mainnet;
+  } in
+
+  let txid_hex = Types.hash256_to_hex_display txid in
+  let params = [`String txid_hex; `Bool true] in
+  let result = Rpc.handle_getrawtransaction ctx params in
+
+  Alcotest.(check bool) "confirmed tx found" true (Result.is_ok result);
+  (match result with
+   | Ok (`Assoc fields) ->
+     (* Confirmed txs should have blockhash *)
+     Alcotest.(check bool) "has blockhash" true (List.mem_assoc "blockhash" fields);
+     Alcotest.(check bool) "has confirmations" true (List.mem_assoc "confirmations" fields);
+     Alcotest.(check bool) "has time" true (List.mem_assoc "time" fields);
+     Alcotest.(check bool) "has blocktime" true (List.mem_assoc "blocktime" fields)
+   | _ -> Alcotest.fail "expected Ok(`Assoc fields)");
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: getrawtransaction with specific blockhash *)
+let test_getrawtransaction_with_blockhash () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let utxo = Utxo.UtxoSet.create db in
+
+  let txid1 = Types.hash256_of_hex
+    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b" in
+  Utxo.UtxoSet.add utxo txid1 0 Utxo.{
+    value = 10_000_000L;
+    script_pubkey = make_p2pkh_script ();
+    height = 0;
+    is_coinbase = false;
+  };
+
+  (* Create a transaction *)
+  let tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 9_990_000L]
+  in
+  let txid = Crypto.compute_txid tx in
+
+  (* Create a block containing the transaction *)
+  let block_hash = Types.hash256_of_hex
+    "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f" in
+  let block_hash_internal = Cstruct.create 32 in
+  for i = 0 to 31 do
+    Cstruct.set_uint8 block_hash_internal i (Cstruct.get_uint8 block_hash (31 - i))
+  done;
+
+  let block : Types.block = {
+    header = Consensus.mainnet.genesis_header;
+    transactions = [tx];
+  } in
+  Storage.ChainDB.store_block db block_hash_internal block;
+
+  let chain = Sync.create_chain_state db Consensus.mainnet in
+  let pm = Peer_manager.create Consensus.mainnet in
+  let fe = Fee_estimation.create () in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
+
+  let ctx : Rpc.rpc_context = {
+    chain = chain;
+    mempool = mp;
+    peer_manager = pm;
+    wallet = None;
+    fee_estimator = fe;
+    network = Consensus.mainnet;
+  } in
+
+  let txid_hex = Types.hash256_to_hex_display txid in
+  let block_hash_hex = Types.hash256_to_hex_display block_hash_internal in
+  let params = [`String txid_hex; `Bool true; `String block_hash_hex] in
+  let result = Rpc.handle_getrawtransaction ctx params in
+
+  Alcotest.(check bool) "tx found in specified block" true (Result.is_ok result);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: getrawtransaction with wrong blockhash returns error *)
+let test_getrawtransaction_wrong_blockhash () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let utxo = Utxo.UtxoSet.create db in
+
+  let txid1 = Types.hash256_of_hex
+    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b" in
+  Utxo.UtxoSet.add utxo txid1 0 Utxo.{
+    value = 10_000_000L;
+    script_pubkey = make_p2pkh_script ();
+    height = 0;
+    is_coinbase = false;
+  };
+
+  (* Create empty block - tx not in it *)
+  let block_hash = Types.hash256_of_hex
+    "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f" in
+  let block_hash_internal = Cstruct.create 32 in
+  for i = 0 to 31 do
+    Cstruct.set_uint8 block_hash_internal i (Cstruct.get_uint8 block_hash (31 - i))
+  done;
+
+  let block : Types.block = {
+    header = Consensus.mainnet.genesis_header;
+    transactions = [];  (* Empty - no transactions *)
+  } in
+  Storage.ChainDB.store_block db block_hash_internal block;
+
+  let chain = Sync.create_chain_state db Consensus.mainnet in
+  let pm = Peer_manager.create Consensus.mainnet in
+  let fe = Fee_estimation.create () in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
+
+  let ctx : Rpc.rpc_context = {
+    chain = chain;
+    mempool = mp;
+    peer_manager = pm;
+    wallet = None;
+    fee_estimator = fe;
+    network = Consensus.mainnet;
+  } in
+
+  (* Try to find tx that doesn't exist in this block *)
+  let fake_txid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" in
+  let block_hash_hex = Types.hash256_to_hex_display block_hash_internal in
+  let params = [`String fake_txid; `Bool true; `String block_hash_hex] in
+  let result = Rpc.handle_getrawtransaction ctx params in
+
+  Alcotest.(check bool) "tx not in block returns error" true (Result.is_error result);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* ============================================================================
    Broadcast Tests
    ============================================================================ *)
 
@@ -347,7 +679,7 @@ let test_sendrawtransaction_broadcasts_to_peers () =
 let () =
   cleanup_test_db ();
   let open Alcotest in
-  run "RPC_Sendrawtransaction" [
+  run "RPC" [
     "sendrawtransaction", [
       test_case "valid tx accepted" `Quick test_sendrawtransaction_valid;
       test_case "invalid hex rejected" `Quick test_sendrawtransaction_invalid_hex;
@@ -361,5 +693,17 @@ let () =
     ];
     "broadcast", [
       test_case "broadcasts to peers" `Quick test_sendrawtransaction_broadcasts_to_peers;
+    ];
+    "getrawtransaction", [
+      test_case "mempool tx returns hex" `Quick test_getrawtransaction_mempool_hex;
+      test_case "verbose returns json" `Quick test_getrawtransaction_verbose;
+      test_case "scriptPubKey type" `Quick test_getrawtransaction_scriptpubkey_type;
+      test_case "verbosity int 1" `Quick test_getrawtransaction_verbosity_int;
+      test_case "verbosity int 0" `Quick test_getrawtransaction_verbosity_zero;
+      test_case "not found error" `Quick test_getrawtransaction_not_found;
+      test_case "invalid txid error" `Quick test_getrawtransaction_invalid_txid;
+      test_case "confirmed has block info" `Quick test_getrawtransaction_confirmed_has_block_info;
+      test_case "with blockhash param" `Quick test_getrawtransaction_with_blockhash;
+      test_case "wrong blockhash error" `Quick test_getrawtransaction_wrong_blockhash;
     ];
   ]

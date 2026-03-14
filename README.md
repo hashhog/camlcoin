@@ -59,6 +59,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Miniscript (type system, script generation, satisfaction, parsing, wsh(miniscript) support)
 - [x] BIP-133 feefilter (Poisson timing, noise rounding, block-relay-only exclusion)
 - [x] AssumeUTXO (BIP 199, snapshot loading, dual chainstate, background validation)
+- [x] REST API (block, tx, headers, chaininfo, mempool, blockhashbyheight, .json/.hex/.bin formats)
 - [ ] Bloom filters (BIP 37)
 
 ## Quick start
@@ -96,6 +97,7 @@ camlcoin/
     fee_estimation.ml fee rate estimation
     mining.ml         block template and miner
     rpc.ml            JSON-RPC server
+    rest.ml           REST API server
     wallet.ml         HD wallet, BIP-39/44/84/86, coin selection, encrypted storage
     bip39.ml          mnemonic generation and seed derivation
     block_index.ml    block indexes, BIP-157/158 filters, height index

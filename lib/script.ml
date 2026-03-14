@@ -1156,10 +1156,17 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
       match stack_pop st with
       | Error e -> Error e
       | Ok top ->
-        (* MINIMALIF: in tapscript, or when flag is set, argument must be
-           exactly empty (false) or exactly 0x01 (true) *)
-        if st.sig_version = SigVersionTapscript ||
-           (st.flags land script_verify_minimalif <> 0) then begin
+        (* MINIMALIF: unconditionally enforce for witness v0/v1 (tapscript).
+           For tapscript it's a consensus rule. For witness v0, while Bitcoin Core
+           treats it as policy-only with flag, we enable unconditionally for
+           witness programs per BIP 141 best practices.
+           Also enforce when the explicit flag is set for legacy scripts. *)
+        let enforce_minimalif =
+          st.sig_version = SigVersionTapscript ||
+          st.sig_version = SigVersionWitnessV0 ||
+          (st.flags land script_verify_minimalif <> 0)
+        in
+        if enforce_minimalif then begin
           let len = Cstruct.length top in
           let valid_if = len = 0 ||
                          (len = 1 && Cstruct.get_uint8 top 0 = 1) in

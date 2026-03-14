@@ -174,6 +174,29 @@ let test_classify_op_return () =
   | Script.OP_RETURN_data _ -> ()
   | _ -> Alcotest.fail "Expected OP_RETURN_data"
 
+(* P2A (Pay-to-Anchor) script: OP_1 OP_PUSHBYTES_2 0x4e73 *)
+let test_classify_p2a () =
+  let p2a_script = hex_to_cstruct "51024e73" in
+  match Script.classify_script p2a_script with
+  | Script.P2A_script -> ()
+  | _ -> Alcotest.fail "Expected P2A_script"
+
+let test_is_p2a () =
+  let p2a_script = hex_to_cstruct "51024e73" in
+  Alcotest.(check bool) "is_p2a true" true (Script.is_p2a p2a_script);
+  (* Not P2A: wrong bytes *)
+  let not_p2a_1 = hex_to_cstruct "51024e74" in
+  Alcotest.(check bool) "is_p2a false (wrong byte)" false (Script.is_p2a not_p2a_1);
+  (* Not P2A: wrong length *)
+  let not_p2a_2 = hex_to_cstruct "51024e7300" in
+  Alcotest.(check bool) "is_p2a false (wrong length)" false (Script.is_p2a not_p2a_2);
+  (* Not P2A: P2TR *)
+  let p2tr = hex_to_cstruct ("5120" ^ String.make 64 '0') in
+  Alcotest.(check bool) "is_p2a false (P2TR)" false (Script.is_p2a p2tr)
+
+let test_p2a_dust_limit () =
+  Alcotest.(check int64) "P2A dust limit" 240L Script.p2a_dust_limit
+
 (* ============================================================================
    Simple Script Execution Tests
    ============================================================================ *)
@@ -589,7 +612,13 @@ let classification_tests = [
   Alcotest.test_case "classify P2WPKH" `Quick test_classify_p2wpkh;
   Alcotest.test_case "classify P2WSH" `Quick test_classify_p2wsh;
   Alcotest.test_case "classify P2TR" `Quick test_classify_p2tr;
+  Alcotest.test_case "classify P2A" `Quick test_classify_p2a;
   Alcotest.test_case "classify OP_RETURN" `Quick test_classify_op_return;
+]
+
+let p2a_tests = [
+  Alcotest.test_case "is_p2a detection" `Quick test_is_p2a;
+  Alcotest.test_case "P2A dust limit" `Quick test_p2a_dust_limit;
 ]
 
 let simple_execution_tests = [
@@ -2070,6 +2099,35 @@ let sighash_special_tests = [
   Alcotest.test_case "SIGHASH_SINGLE bug" `Quick test_sighash_single_bug;
 ]
 
+(* Test P2A script verification - succeeds unconditionally *)
+let test_p2a_verify_script_succeeds () =
+  let tx = make_test_tx () in
+  let p2a_script = hex_to_cstruct "51024e73" in
+  let witness = { Types.items = [] } in
+  let flags = Script.script_verify_witness lor Script.script_verify_taproot in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey:p2a_script
+          ~script_sig:(Cstruct.create 0) ~witness ~amount:240L ~flags () with
+  | Ok true -> ()  (* P2A succeeds unconditionally *)
+  | Ok false -> Alcotest.fail "P2A should return Ok true"
+  | Error e -> Alcotest.fail ("P2A should succeed: " ^ e)
+
+let test_p2a_with_nonempty_scriptsig_fails () =
+  let tx = make_test_tx () in
+  let p2a_script = hex_to_cstruct "51024e73" in
+  let witness = { Types.items = [] } in
+  let flags = Script.script_verify_witness in
+  (* Non-empty scriptSig should fail for witness programs *)
+  let script_sig = hex_to_cstruct "00" in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey:p2a_script
+          ~script_sig ~witness ~amount:240L ~flags () with
+  | Error _ -> ()  (* Expected: scriptSig must be empty *)
+  | Ok _ -> Alcotest.fail "P2A with non-empty scriptSig should fail"
+
+let p2a_verify_tests = [
+  Alcotest.test_case "P2A verify succeeds" `Quick test_p2a_verify_script_succeeds;
+  Alcotest.test_case "P2A with nonempty scriptSig fails" `Quick test_p2a_with_nonempty_scriptsig_fails;
+]
+
 let () = Alcotest.run "test_script" [
   ("script_num", script_num_tests);
   ("parsing", parsing_tests);
@@ -2093,4 +2151,6 @@ let () = Alcotest.run "test_script" [
   ("strip_codeseparator", strip_codeseparator_tests);
   ("subscript", subscript_tests);
   ("sighash_special", sighash_special_tests);
+  ("p2a", p2a_tests);
+  ("p2a_verify", p2a_verify_tests);
 ]

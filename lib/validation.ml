@@ -376,11 +376,70 @@ let extract_last_push_data (script : Cstruct.t) : Cstruct.t option =
     !last
   with _ -> None
 
+(* Count witness sigops for a specific witness program version.
+   Returns the number of sigops (not weighted - witness sigops cost 1 each).
+   Per BIP-141:
+   - Version 0, 20-byte program (P2WPKH): 1 sigop
+   - Version 0, 32-byte program (P2WSH): count sigops in witness script
+   - Other versions: 0 (reserved for future soft forks) *)
+let witness_sigops (wit_version : int) (program : Cstruct.t)
+    (witness : Types.tx_witness) : int =
+  if wit_version = 0 then begin
+    if Cstruct.length program = 20 then
+      (* P2WPKH: 1 sigop *)
+      1
+    else if Cstruct.length program = 32 && List.length witness.items > 0 then
+      (* P2WSH: count sigops in witness script (last stack item) *)
+      let witness_script = List.hd (List.rev witness.items) in
+      count_witness_sigops witness_script
+    else
+      0
+  end else
+    (* Future witness versions: 0 sigops for now *)
+    0
+
+(* Count witness sigops for an input given its scriptSig, scriptPubKey, and witness.
+   Per Bitcoin Core's CountWitnessSigOps in interpreter.cpp.
+   Returns 0 if SCRIPT_VERIFY_WITNESS flag is not set.
+   Handles both native SegWit and P2SH-wrapped SegWit. *)
+let count_input_witness_sigops ~(script_sig : Cstruct.t)
+    ~(script_pubkey : Cstruct.t) ~(witness : Types.tx_witness) ~(flags : int) : int =
+  (* If witness flag not set, no witness sigops *)
+  if flags land Script.script_verify_witness = 0 then
+    0
+  else begin
+    (* Check for native witness program *)
+    match Script.get_witness_program script_pubkey with
+    | Some (version, program) ->
+      witness_sigops version program witness
+    | None ->
+      (* Check for P2SH-wrapped witness program *)
+      match Script.classify_script script_pubkey with
+      | Script.P2SH_script _ when Script.is_push_only script_sig ->
+        begin match extract_last_push_data script_sig with
+        | Some redeem_script ->
+          begin match Script.get_witness_program redeem_script with
+          | Some (version, program) ->
+            witness_sigops version program witness
+          | None -> 0
+          end
+        | None -> 0
+        end
+      | _ -> 0
+  end
+
 (* Count weighted sigops cost for a transaction per BIP-141.
    prev_script_pubkey_lookup: returns the scriptPubKey of the previous output
-   for a given outpoint (None if not found, e.g. for coinbase). *)
+   for a given outpoint (None if not found, e.g. for coinbase).
+   flags: script verification flags (to check P2SH and WITNESS activation).
+
+   Per Bitcoin Core GetTransactionSigOpCost in tx_verify.cpp:
+   - Legacy sigops (scriptSig + scriptPubKey) × WITNESS_SCALE_FACTOR
+   - P2SH sigops (if P2SH flag set) × WITNESS_SCALE_FACTOR
+   - Witness sigops (if WITNESS flag set) × 1 (no multiplier) *)
 let count_tx_sigops_cost (tx : Types.transaction)
-    ~(prev_script_pubkey_lookup : Types.outpoint -> Cstruct.t option) : int =
+    ~(prev_script_pubkey_lookup : Types.outpoint -> Cstruct.t option)
+    ~(flags : int) : int =
   let wsf = Consensus.witness_scale_factor in
 
   (* Legacy sigops in scriptSig and scriptPubKey, weighted by scale factor *)
@@ -394,66 +453,68 @@ let count_tx_sigops_cost (tx : Types.transaction)
     (in_sigops + out_sigops) * wsf
   in
 
-  (* Per-input sigops from P2SH redeem scripts and witness programs *)
-  let input_cost = List.fold_left (fun acc_cost (i, inp) ->
-    match prev_script_pubkey_lookup inp.Types.previous_output with
-    | None -> acc_cost  (* No previous output (coinbase), no extra sigops *)
-    | Some prev_spk ->
-      match Script.classify_script prev_spk with
-      | Script.P2SH_script _ ->
-        (* P2SH: extract redeem script from scriptSig (last push data) *)
-        begin match extract_last_push_data inp.Types.script_sig with
-        | None -> acc_cost
-        | Some redeem_script ->
-          (* Check if redeem script is a witness program (P2SH-wrapped segwit) *)
-          begin match Script.get_witness_program redeem_script with
-          | Some (0, program) when Cstruct.length program = 20 ->
-            (* P2SH-P2WPKH: 1 sigop, witness weight (not multiplied by 4) *)
-            acc_cost + 1
-          | Some (0, program) when Cstruct.length program = 32 ->
-            (* P2SH-P2WSH: count sigops in witness script (last witness item),
-               witness weight (not multiplied by 4) *)
-            let witness =
-              if i < List.length tx.witnesses then
-                List.nth tx.witnesses i
-              else { Types.items = [] }
-            in
-            begin match List.rev witness.Types.items with
-            | witness_script :: _ ->
-              acc_cost + count_witness_sigops witness_script
-            | [] -> acc_cost
-            end
-          | _ ->
-            (* Regular P2SH: count sigops in redeem script * 4 *)
-            acc_cost + count_p2sh_sigops redeem_script * wsf
-          end
-        end
-      | Script.P2WPKH_script _ ->
-        (* Native P2WPKH: 1 sigop, witness weight *)
-        acc_cost + 1
-      | Script.P2WSH_script _ ->
-        (* Native P2WSH: count sigops in witness script (last witness item),
-           witness weight *)
-        let witness =
-          if i < List.length tx.witnesses then
-            List.nth tx.witnesses i
-          else { Types.items = [] }
-        in
-        begin match List.rev witness.Types.items with
-        | witness_script :: _ ->
-          acc_cost + count_witness_sigops witness_script
-        | [] -> acc_cost
-        end
-      | _ -> acc_cost  (* Other script types: no extra sigops beyond legacy *)
-  ) 0 (List.mapi (fun i inp -> (i, inp)) tx.Types.inputs) in
+  (* For coinbase, only legacy sigops count *)
+  if is_coinbase tx then
+    legacy_cost
+  else begin
+    (* P2SH sigops (if P2SH flag is set) *)
+    let p2sh_cost =
+      if flags land Script.script_verify_p2sh = 0 then 0
+      else
+        List.fold_left (fun acc inp ->
+          match prev_script_pubkey_lookup inp.Types.previous_output with
+          | None -> acc
+          | Some prev_spk ->
+            match Script.classify_script prev_spk with
+            | Script.P2SH_script _ ->
+              begin match extract_last_push_data inp.Types.script_sig with
+              | Some redeem_script ->
+                (* Don't count P2SH sigops for P2SH-wrapped witness programs;
+                   those are counted separately via CountWitnessSigOps *)
+                begin match Script.get_witness_program redeem_script with
+                | Some _ -> acc  (* Witness program, skip P2SH count *)
+                | None -> acc + count_p2sh_sigops redeem_script * wsf
+                end
+              | None -> acc
+              end
+            | _ -> acc
+        ) 0 tx.Types.inputs
+    in
 
-  legacy_cost + input_cost
+    (* Witness sigops (if WITNESS flag is set) *)
+    let witness_cost =
+      List.fold_left (fun acc_cost (i, inp) ->
+        match prev_script_pubkey_lookup inp.Types.previous_output with
+        | None -> acc_cost
+        | Some prev_spk ->
+          let witness =
+            if i < List.length tx.witnesses then
+              List.nth tx.witnesses i
+            else { Types.items = [] }
+          in
+          acc_cost + count_input_witness_sigops
+            ~script_sig:inp.Types.script_sig
+            ~script_pubkey:prev_spk
+            ~witness
+            ~flags
+      ) 0 (List.mapi (fun i inp -> (i, inp)) tx.Types.inputs)
+    in
+
+    legacy_cost + p2sh_cost + witness_cost
+  end
+
+(* Backward-compatible wrapper that uses full flags *)
+let count_tx_sigops_cost_simple (tx : Types.transaction)
+    ~(prev_script_pubkey_lookup : Types.outpoint -> Cstruct.t option) : int =
+  let flags = Script.script_verify_p2sh lor Script.script_verify_witness in
+  count_tx_sigops_cost tx ~prev_script_pubkey_lookup ~flags
 
 (* Count weighted sigops cost for entire block per BIP-141 *)
 let count_block_sigops_cost (block : Types.block)
-    ~(prev_script_pubkey_lookup : Types.outpoint -> Cstruct.t option) : int =
+    ~(prev_script_pubkey_lookup : Types.outpoint -> Cstruct.t option)
+    ~(flags : int) : int =
   List.fold_left (fun acc tx ->
-    acc + count_tx_sigops_cost tx ~prev_script_pubkey_lookup
+    acc + count_tx_sigops_cost tx ~prev_script_pubkey_lookup ~flags
   ) 0 block.transactions
 
 (* Legacy unweighted sigops count (backward compatibility for mining template).
@@ -960,7 +1021,7 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
       | None -> None
     in
     let total_sigops_cost =
-      count_block_sigops_cost block ~prev_script_pubkey_lookup in
+      count_block_sigops_cost block ~prev_script_pubkey_lookup ~flags in
     if total_sigops_cost > Consensus.max_block_sigops_cost then
       Error BlockTooManySigops
     else

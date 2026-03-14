@@ -582,6 +582,181 @@ let test_block_version_too_low_bip65 () =
   | Ok () -> Alcotest.fail "Should have rejected version 3 block after BIP65"
 
 (* ============================================================================
+   BIP68 Sequence Lock Tests
+   ============================================================================ *)
+
+(* Test: Sequence lock disabled (bit 31 set) *)
+let test_sequence_lock_disabled () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  (* Sequence with disable flag set (0x80000000) *)
+  let tx = make_tx
+    ~version:2l
+    ~inputs:[make_input ~txid ~sequence:0x80000010l ()]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  let utxo_heights = [| 100 |] in
+  let utxo_mtps = [| 1000000l |] in
+  let flags = Script.script_verify_checksequenceverify in
+  (* Even though relative lock would require height 116, the disable flag means it passes *)
+  let result = Validation.check_sequence_locks tx
+    ~block_height:101 ~median_time:1000100l
+    ~utxo_heights ~utxo_mtps ~flags () in
+  Alcotest.(check bool) "disabled lock passes" true result
+
+(* Test: Height-based relative lock - satisfied *)
+let test_sequence_lock_height_satisfied () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  (* Sequence = 10 (relative lock of 10 blocks) *)
+  let tx = make_tx
+    ~version:2l
+    ~inputs:[make_input ~txid ~sequence:10l ()]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  let utxo_heights = [| 100 |] in  (* UTXO mined at height 100 *)
+  let utxo_mtps = [| 0l |] in
+  let flags = Script.script_verify_checksequenceverify in
+  (* Block height 110 = utxo_height(100) + relative_lock(10), should pass *)
+  let result = Validation.check_sequence_locks tx
+    ~block_height:110 ~median_time:0l
+    ~utxo_heights ~utxo_mtps ~flags () in
+  Alcotest.(check bool) "height lock satisfied" true result
+
+(* Test: Height-based relative lock - not satisfied *)
+let test_sequence_lock_height_not_satisfied () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  (* Sequence = 10 (relative lock of 10 blocks) *)
+  let tx = make_tx
+    ~version:2l
+    ~inputs:[make_input ~txid ~sequence:10l ()]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  let utxo_heights = [| 100 |] in
+  let utxo_mtps = [| 0l |] in
+  let flags = Script.script_verify_checksequenceverify in
+  (* Block height 109 < utxo_height(100) + relative_lock(10), should fail *)
+  let result = Validation.check_sequence_locks tx
+    ~block_height:109 ~median_time:0l
+    ~utxo_heights ~utxo_mtps ~flags () in
+  Alcotest.(check bool) "height lock not satisfied" false result
+
+(* Test: Time-based relative lock - satisfied *)
+let test_sequence_lock_time_satisfied () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  (* Sequence = 0x00400002: type flag (bit 22) set, value = 2 x 512s = 1024s *)
+  let tx = make_tx
+    ~version:2l
+    ~inputs:[make_input ~txid ~sequence:0x00400002l ()]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  let utxo_heights = [| 100 |] in
+  let utxo_mtps = [| 1000000l |] in  (* MTP when UTXO was mined *)
+  let flags = Script.script_verify_checksequenceverify in
+  (* Required time = utxo_mtp + (2 * 512) = 1000000 + 1024 = 1001024 *)
+  (* Block MTP 1001100 > 1001024, should pass *)
+  let result = Validation.check_sequence_locks tx
+    ~block_height:200 ~median_time:1001100l
+    ~utxo_heights ~utxo_mtps ~flags () in
+  Alcotest.(check bool) "time lock satisfied" true result
+
+(* Test: Time-based relative lock - not satisfied *)
+let test_sequence_lock_time_not_satisfied () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  (* Sequence = 0x00400002: type flag (bit 22) set, value = 2 x 512s = 1024s *)
+  let tx = make_tx
+    ~version:2l
+    ~inputs:[make_input ~txid ~sequence:0x00400002l ()]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  let utxo_heights = [| 100 |] in
+  let utxo_mtps = [| 1000000l |] in
+  let flags = Script.script_verify_checksequenceverify in
+  (* Required time = 1000000 + 1024 = 1001024 *)
+  (* Block MTP 1001000 < 1001024, should fail *)
+  let result = Validation.check_sequence_locks tx
+    ~block_height:200 ~median_time:1001000l
+    ~utxo_heights ~utxo_mtps ~flags () in
+  Alcotest.(check bool) "time lock not satisfied" false result
+
+(* Test: BIP68 not enforced for tx version < 2 *)
+let test_sequence_lock_version_1_ignored () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  (* Sequence = 100 blocks, but tx version = 1 *)
+  let tx = make_tx
+    ~version:1l
+    ~inputs:[make_input ~txid ~sequence:100l ()]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  let utxo_heights = [| 100 |] in
+  let utxo_mtps = [| 0l |] in
+  let flags = Script.script_verify_checksequenceverify in
+  (* Would fail if enforced (height 101 < 100 + 100), but version 1 skips check *)
+  let result = Validation.check_sequence_locks tx
+    ~block_height:101 ~median_time:0l
+    ~utxo_heights ~utxo_mtps ~flags () in
+  Alcotest.(check bool) "version 1 ignores sequence locks" true result
+
+(* Test: BIP68 not enforced when CSV flag not set *)
+let test_sequence_lock_flag_not_set () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  let tx = make_tx
+    ~version:2l
+    ~inputs:[make_input ~txid ~sequence:100l ()]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  let utxo_heights = [| 100 |] in
+  let utxo_mtps = [| 0l |] in
+  let flags = 0 in  (* No CSV flag *)
+  (* Would fail if enforced, but flag not set skips check *)
+  let result = Validation.check_sequence_locks tx
+    ~block_height:101 ~median_time:0l
+    ~utxo_heights ~utxo_mtps ~flags () in
+  Alcotest.(check bool) "no CSV flag skips check" true result
+
+(* Test: Multiple inputs with different locks *)
+let test_sequence_lock_multiple_inputs () =
+  let txid1 = Cstruct.create 32 in
+  Cstruct.set_uint8 txid1 0 0x01;
+  let txid2 = Cstruct.create 32 in
+  Cstruct.set_uint8 txid2 0 0x02;
+  (* Input 0: 5 block relative lock, Input 1: 10 block relative lock *)
+  let tx = make_tx
+    ~version:2l
+    ~inputs:[
+      make_input ~txid:txid1 ~vout:0l ~sequence:5l ();
+      make_input ~txid:txid2 ~vout:0l ~sequence:10l ();
+    ]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  let utxo_heights = [| 100; 100 |] in
+  let utxo_mtps = [| 0l; 0l |] in
+  let flags = Script.script_verify_checksequenceverify in
+  (* Height 110 satisfies both (100+5=105, 100+10=110) *)
+  let result_pass = Validation.check_sequence_locks tx
+    ~block_height:110 ~median_time:0l
+    ~utxo_heights ~utxo_mtps ~flags () in
+  Alcotest.(check bool) "both inputs satisfied" true result_pass;
+  (* Height 107 satisfies first (105) but not second (110) *)
+  let result_fail = Validation.check_sequence_locks tx
+    ~block_height:107 ~median_time:0l
+    ~utxo_heights ~utxo_mtps ~flags () in
+  Alcotest.(check bool) "second input not satisfied" false result_fail
+
+(* ============================================================================
    Test Registration
    ============================================================================ *)
 
@@ -642,5 +817,15 @@ let () =
       test_case "version ok before bip34" `Quick test_block_version_ok_before_bip34;
       test_case "version too low at bip66" `Quick test_block_version_too_low_bip66;
       test_case "version too low at bip65" `Quick test_block_version_too_low_bip65;
+    ];
+    "bip68_sequence_locks", [
+      test_case "disabled lock (bit 31 set)" `Quick test_sequence_lock_disabled;
+      test_case "height lock satisfied" `Quick test_sequence_lock_height_satisfied;
+      test_case "height lock not satisfied" `Quick test_sequence_lock_height_not_satisfied;
+      test_case "time lock satisfied" `Quick test_sequence_lock_time_satisfied;
+      test_case "time lock not satisfied" `Quick test_sequence_lock_time_not_satisfied;
+      test_case "version 1 ignores locks" `Quick test_sequence_lock_version_1_ignored;
+      test_case "no CSV flag skips check" `Quick test_sequence_lock_flag_not_set;
+      test_case "multiple inputs" `Quick test_sequence_lock_multiple_inputs;
     ];
   ]

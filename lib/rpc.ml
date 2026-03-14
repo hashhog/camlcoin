@@ -986,6 +986,239 @@ let handle_submitblock (ctx : rpc_context)
     Error "Invalid parameters: expected [hexdata]"
 
 (* ============================================================================
+   Regtest Mining RPCs (generate, generatetoaddress, generateblock)
+   ============================================================================ *)
+
+(* Mine a single block with the given payout script.
+   Returns the block hash on success. *)
+let mine_single_block (ctx : rpc_context) (payout_script : Cstruct.t)
+    : (Types.hash256, string) result =
+  let template = Mining.create_block_template
+    ~chain:ctx.chain ~mp:ctx.mempool ~payout_script in
+  (* Regtest difficulty (0x207fffff) means almost any nonce works.
+     Use a generous limit to handle edge cases. *)
+  match Mining.mine_block template 100_000_000l with
+  | None -> Error "Failed to find valid nonce (unexpected on regtest)"
+  | Some block ->
+    match Mining.submit_block block ctx.chain ctx.mempool with
+    | Error msg -> Error msg
+    | Ok () ->
+      let hash = Crypto.compute_block_hash block.header in
+      Ok hash
+
+(* generate nblocks [maxtries]
+   Mine blocks immediately (regtest only).
+   Returns array of block hashes. *)
+let handle_generate (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  (* Only available on regtest *)
+  if ctx.network.network_type <> Consensus.Regtest then
+    Error "generate is only available on regtest"
+  else
+    let nblocks = match params with
+      | `Int n :: _ -> n
+      | _ -> 1
+    in
+    if nblocks < 0 || nblocks > 1000 then
+      Error "nblocks must be between 0 and 1000"
+    else begin
+      (* Get payout script from wallet *)
+      let payout_script = match ctx.wallet with
+        | Some wallet ->
+          let kp = Wallet.generate_key wallet in
+          Wallet.build_output_script kp.address
+        | None ->
+          (* Fallback: P2SH output to dummy script hash *)
+          let script = Cstruct.create 23 in
+          Cstruct.set_uint8 script 0 0xa9;  (* OP_HASH160 *)
+          Cstruct.set_uint8 script 1 0x14;  (* 20 bytes *)
+          (* Fill with zeros - valid but unspendable *)
+          Cstruct.set_uint8 script 22 0x87;  (* OP_EQUAL *)
+          script
+      in
+      let rec mine_blocks acc remaining =
+        if remaining <= 0 then Ok (List.rev acc)
+        else
+          match mine_single_block ctx payout_script with
+          | Error msg -> Error msg
+          | Ok hash ->
+            mine_blocks (hash :: acc) (remaining - 1)
+      in
+      match mine_blocks [] nblocks with
+      | Error msg -> Error msg
+      | Ok hashes ->
+        Ok (`List (List.map (fun h ->
+          `String (Types.hash256_to_hex_display h)
+        ) hashes))
+    end
+
+(* generatetoaddress nblocks address [maxtries]
+   Mine blocks to a specified address (regtest only).
+   Returns array of block hashes. *)
+let handle_generatetoaddress (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  (* Only available on regtest *)
+  if ctx.network.network_type <> Consensus.Regtest then
+    Error "generatetoaddress is only available on regtest"
+  else
+    match params with
+    | `Int nblocks :: `String address :: _ ->
+      if nblocks < 0 || nblocks > 1000 then
+        Error "nblocks must be between 0 and 1000"
+      else begin
+        (* Parse address and build output script *)
+        match Address.address_of_string address with
+        | Error e -> Error (Printf.sprintf "Invalid address: %s" e)
+        | Ok addr ->
+          let payout_script = Wallet.build_output_script addr in
+          let rec mine_blocks acc remaining =
+            if remaining <= 0 then Ok (List.rev acc)
+            else
+              match mine_single_block ctx payout_script with
+              | Error msg -> Error msg
+              | Ok hash ->
+                mine_blocks (hash :: acc) (remaining - 1)
+          in
+          match mine_blocks [] nblocks with
+          | Error msg -> Error msg
+          | Ok hashes ->
+            Ok (`List (List.map (fun h ->
+              `String (Types.hash256_to_hex_display h)
+            ) hashes))
+      end
+    | _ ->
+      Error "Invalid parameters: expected [nblocks, address]"
+
+(* generateblock output [transactions]
+   Mine a block with specific transactions (regtest only).
+   output: address or descriptor for coinbase
+   transactions: array of hex-encoded raw transactions or txids
+   Returns {"hash": blockhash}. *)
+let handle_generateblock (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  (* Only available on regtest *)
+  if ctx.network.network_type <> Consensus.Regtest then
+    Error "generateblock is only available on regtest"
+  else
+    match params with
+    | `String output :: rest ->
+      (* Parse output address *)
+      let payout_script_result = match Address.address_of_string output with
+        | Ok addr -> Ok (Wallet.build_output_script addr)
+        | Error e -> Error (Printf.sprintf "Invalid output address: %s" e)
+      in
+      (match payout_script_result with
+       | Error msg -> Error msg
+       | Ok payout_script ->
+         (* Parse optional transactions array *)
+         let txs_result = match rest with
+           | `List txs :: _ ->
+             (* Each element can be a raw tx hex or a txid to pull from mempool *)
+             let rec parse_txs acc = function
+               | [] -> Ok (List.rev acc)
+               | `String hex :: rest ->
+                 if String.length hex = 64 then begin
+                   (* Looks like a txid - try to get from mempool *)
+                   let txid = parse_txid_param hex in
+                   let key = Cstruct.to_string txid in
+                   match Hashtbl.find_opt ctx.mempool.entries key with
+                   | Some entry -> parse_txs (entry.tx :: acc) rest
+                   | None -> Error (Printf.sprintf "Transaction not in mempool: %s" hex)
+                 end else begin
+                   (* Raw transaction hex *)
+                   try
+                     let data = Cstruct.of_hex hex in
+                     let r = Serialize.reader_of_cstruct data in
+                     let tx = Serialize.deserialize_transaction r in
+                     parse_txs (tx :: acc) rest
+                   with exn ->
+                     Error (Printf.sprintf "Invalid transaction: %s"
+                              (Printexc.to_string exn))
+                 end
+               | _ -> Error "Invalid transaction format (expected hex string)"
+             in
+             parse_txs [] txs
+           | _ -> Ok []  (* No transactions specified *)
+         in
+         match txs_result with
+         | Error msg -> Error msg
+         | Ok transactions ->
+           (* Build block template manually with specified transactions *)
+           let tip = match ctx.chain.tip with
+             | Some t -> t
+             | None -> failwith "No chain tip"
+           in
+           let height = tip.height + 1 in
+           (* Calculate fees for specified transactions *)
+           let total_fee = List.fold_left (fun acc tx ->
+             let key = Cstruct.to_string (Crypto.compute_txid tx) in
+             match Hashtbl.find_opt ctx.mempool.entries key with
+             | Some entry -> Int64.add acc entry.Mempool.fee
+             | None -> acc  (* Unknown fee, assume 0 *)
+           ) 0L transactions in
+           (* Create coinbase *)
+           let extra_nonce = Cstruct.create 8 in
+           let ts = Int64.of_float (Unix.gettimeofday () *. 1000000.0) in
+           Cstruct.LE.set_uint64 extra_nonce 0 ts;
+           (* Compute witness commitment if any segwit transactions *)
+           let placeholder_coinbase = Mining.create_coinbase
+             ~height ~total_fee ~payout_script ~extra_nonce ~witness_root:None in
+           let all_txs_for_witness = placeholder_coinbase :: transactions in
+           let witness_root = Mining.compute_witness_merkle_root all_txs_for_witness in
+           let coinbase_tx = Mining.create_coinbase
+             ~height ~total_fee ~payout_script ~extra_nonce
+             ~witness_root:(Some witness_root) in
+           (* Build block *)
+           let all_txs = coinbase_tx :: transactions in
+           let txids = List.map Crypto.compute_txid all_txs in
+           let (merkle_root, _mutated) = Crypto.merkle_root txids in
+           (* Calculate MTP to ensure timestamp is valid *)
+           let rec collect_ts acc count entry =
+             if count >= 11 then acc
+             else
+               let acc = entry.Sync.header.timestamp :: acc in
+               if entry.height = 0 then acc
+               else
+                 let parent_key = Cstruct.to_string entry.header.prev_block in
+                 match Hashtbl.find_opt ctx.chain.headers parent_key with
+                 | Some parent -> collect_ts acc (count + 1) parent
+                 | None -> acc
+           in
+           let ancestor_ts = collect_ts [] 0 tip in
+           let mtp = Consensus.median_time_past ancestor_ts in
+           let now = Int32.of_float (Unix.gettimeofday ()) in
+           let timestamp = max (Int32.add mtp 1l) now in
+           let header : Types.block_header = {
+             version = 0x20000000l;
+             prev_block = tip.hash;
+             merkle_root;
+             timestamp;
+             bits = ctx.network.pow_limit;  (* Use regtest min difficulty *)
+             nonce = 0l;
+           } in
+           let template : Mining.block_template = {
+             header;
+             coinbase_tx;
+             transactions;
+             tx_fees = [];
+             total_fee;
+             total_weight = 0;
+             height;
+             target = Consensus.compact_to_target ctx.network.pow_limit;
+           } in
+           (* Mine the block *)
+           match Mining.mine_block template 100_000_000l with
+           | None -> Error "Failed to find valid nonce"
+           | Some block ->
+             match Mining.submit_block block ctx.chain ctx.mempool with
+             | Error msg -> Error msg
+             | Ok () ->
+               let hash = Crypto.compute_block_hash block.header in
+               Ok (`Assoc [("hash", `String (Types.hash256_to_hex_display hash))]))
+    | _ ->
+      Error "Invalid parameters: expected [output, transactions?]"
+
+(* ============================================================================
    Wallet Handlers (Stub implementations)
    ============================================================================ *)
 
@@ -1713,6 +1946,11 @@ let handle_help (_ctx : rpc_context)
       "getmininginfo";
       "submitblock \"hexdata\"";
       "";
+      "== Regtest Mining ==";
+      "generate nblocks (regtest only)";
+      "generatetoaddress nblocks \"address\" (regtest only)";
+      "generateblock \"output\" [\"rawtx\",...] (regtest only)";
+      "";
       "== Mempool ==";
       "getmempoolancestors \"txid\"";
       "getmempooldescendants \"txid\"";
@@ -1889,6 +2127,18 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_submitblock ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_verify_rejected, msg))
+  | "generate" ->
+    (match handle_generate ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "generatetoaddress" ->
+    (match handle_generatetoaddress ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "generateblock" ->
+    (match handle_generateblock ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
 
   (* Wallet *)
   | "getbalance" ->

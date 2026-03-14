@@ -843,6 +843,162 @@ let test_single_request_still_works () =
   cleanup_test_db ()
 
 (* ============================================================================
+   Regtest Mining RPC Tests
+   ============================================================================ *)
+
+(* Create a regtest context for mining tests *)
+let create_regtest_context () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let utxo = Utxo.UtxoSet.create db in
+
+  (* Use regtest network config *)
+  let chain = Sync.create_chain_state db Consensus.regtest in
+  let pm = Peer_manager.create Consensus.regtest in
+  let fe = Fee_estimation.create () in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
+
+  let ctx : Rpc.rpc_context = {
+    chain = chain;
+    mempool = mp;
+    peer_manager = pm;
+    wallet = None;
+    fee_estimator = fe;
+    network = Consensus.regtest;
+  } in
+  (ctx, db, utxo)
+
+(* Test: generate RPC is only available on regtest *)
+let test_generate_regtest_only () =
+  let (ctx, db, _, _, _) = create_test_context () in  (* mainnet context *)
+  let params = [`Int 1] in
+  let result = Rpc.handle_generate ctx params in
+  Alcotest.(check bool) "generate rejected on mainnet" true (Result.is_error result);
+  (match result with
+   | Error msg ->
+     Alcotest.(check bool) "error mentions regtest" true
+       (String.length msg > 0)
+   | Ok _ -> Alcotest.fail "expected error on mainnet");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: generate mines blocks on regtest *)
+let test_generate_mines_blocks () =
+  let (ctx, db, _) = create_regtest_context () in
+  let params = [`Int 3] in
+  let result = Rpc.handle_generate ctx params in
+  (match result with
+   | Error msg -> Alcotest.failf "generate failed: %s" msg
+   | Ok (`List hashes) ->
+     Alcotest.(check int) "3 blocks mined" 3 (List.length hashes);
+     (* Verify chain tip advanced *)
+     let tip_height = match ctx.chain.tip with
+       | Some t -> t.height
+       | None -> 0
+     in
+     Alcotest.(check int) "chain at height 3" 3 tip_height
+   | Ok other -> Alcotest.failf "unexpected result: %s" (Yojson.Safe.to_string other));
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: generate with 0 blocks returns empty list *)
+let test_generate_zero_blocks () =
+  let (ctx, db, _) = create_regtest_context () in
+  let params = [`Int 0] in
+  let result = Rpc.handle_generate ctx params in
+  Alcotest.(check bool) "generate 0 succeeds" true (Result.is_ok result);
+  (match result with
+   | Ok (`List hashes) ->
+     Alcotest.(check int) "0 blocks mined" 0 (List.length hashes)
+   | _ -> Alcotest.fail "expected Ok(`List [])");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: generatetoaddress mines to specific address *)
+let test_generatetoaddress_mines_to_address () =
+  let (ctx, db, _) = create_regtest_context () in
+  (* Generate a valid regtest address using the wallet *)
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let address = Wallet.get_new_address w in
+  let params = [`Int 2; `String address] in
+  let result = Rpc.handle_generatetoaddress ctx params in
+  (match result with
+   | Error msg -> Alcotest.failf "generatetoaddress failed: %s" msg
+   | Ok (`List hashes) ->
+     Alcotest.(check int) "2 blocks mined" 2 (List.length hashes);
+     let tip_height = match ctx.chain.tip with
+       | Some t -> t.height
+       | None -> 0
+     in
+     Alcotest.(check int) "chain at height 2" 2 tip_height
+   | Ok other -> Alcotest.failf "unexpected result: %s" (Yojson.Safe.to_string other));
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: generatetoaddress rejects invalid address *)
+let test_generatetoaddress_invalid_address () =
+  let (ctx, db, _) = create_regtest_context () in
+  let params = [`Int 1; `String "invalid_address"] in
+  let result = Rpc.handle_generatetoaddress ctx params in
+  Alcotest.(check bool) "invalid address rejected" true (Result.is_error result);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: generatetoaddress is regtest only *)
+let test_generatetoaddress_regtest_only () =
+  let (ctx, db, _, _, _) = create_test_context () in  (* mainnet context *)
+  let address = "bc1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9e75rs" in
+  let params = [`Int 1; `String address] in
+  let result = Rpc.handle_generatetoaddress ctx params in
+  Alcotest.(check bool) "generatetoaddress rejected on mainnet" true (Result.is_error result);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: generateblock with empty transactions list *)
+let test_generateblock_empty_txs () =
+  let (ctx, db, _) = create_regtest_context () in
+  (* Generate a valid regtest address using the wallet *)
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let address = Wallet.get_new_address w in
+  let params = [`String address; `List []] in
+  let result = Rpc.handle_generateblock ctx params in
+  (match result with
+   | Error msg -> Alcotest.failf "generateblock failed: %s" msg
+   | Ok (`Assoc fields) ->
+     Alcotest.(check bool) "has hash field" true (List.mem_assoc "hash" fields)
+   | Ok other -> Alcotest.failf "unexpected result: %s" (Yojson.Safe.to_string other));
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: generateblock is regtest only *)
+let test_generateblock_regtest_only () =
+  let (ctx, db, _, _, _) = create_test_context () in  (* mainnet context *)
+  let address = "bc1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq9e75rs" in
+  let params = [`String address; `List []] in
+  let result = Rpc.handle_generateblock ctx params in
+  Alcotest.(check bool) "generateblock rejected on mainnet" true (Result.is_error result);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: generate rejects negative nblocks *)
+let test_generate_rejects_negative () =
+  let (ctx, db, _) = create_regtest_context () in
+  let params = [`Int (-1)] in
+  let result = Rpc.handle_generate ctx params in
+  Alcotest.(check bool) "negative nblocks rejected" true (Result.is_error result);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: generate rejects too many blocks *)
+let test_generate_rejects_too_many () =
+  let (ctx, db, _) = create_regtest_context () in
+  let params = [`Int 1001] in
+  let result = Rpc.handle_generate ctx params in
+  Alcotest.(check bool) "too many blocks rejected" true (Result.is_error result);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -884,5 +1040,17 @@ let () =
       test_case "many calls" `Quick test_batch_many_calls;
       test_case "handle_single_request" `Quick test_handle_single_request;
       test_case "single request works" `Quick test_single_request_still_works;
+    ];
+    "regtest_mining", [
+      test_case "generate regtest only" `Quick test_generate_regtest_only;
+      test_case "generate mines blocks" `Slow test_generate_mines_blocks;
+      test_case "generate zero blocks" `Quick test_generate_zero_blocks;
+      test_case "generatetoaddress mines" `Slow test_generatetoaddress_mines_to_address;
+      test_case "generatetoaddress invalid addr" `Quick test_generatetoaddress_invalid_address;
+      test_case "generatetoaddress regtest only" `Quick test_generatetoaddress_regtest_only;
+      test_case "generateblock empty txs" `Slow test_generateblock_empty_txs;
+      test_case "generateblock regtest only" `Quick test_generateblock_regtest_only;
+      test_case "generate rejects negative" `Quick test_generate_rejects_negative;
+      test_case "generate rejects too many" `Quick test_generate_rejects_too_many;
     ];
   ]

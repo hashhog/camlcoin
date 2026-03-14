@@ -134,6 +134,7 @@ let create_test_context () =
     mempool = mp;
     peer_manager = pm;
     wallet = None;
+    wallet_manager = None;
     fee_estimator = fe;
     network = Consensus.mainnet;
   } in
@@ -518,6 +519,7 @@ let test_getrawtransaction_confirmed_has_block_info () =
     mempool = mp;
     peer_manager = pm;
     wallet = None;
+    wallet_manager = None;
     fee_estimator = fe;
     network = Consensus.mainnet;
   } in
@@ -585,6 +587,7 @@ let test_getrawtransaction_with_blockhash () =
     mempool = mp;
     peer_manager = pm;
     wallet = None;
+    wallet_manager = None;
     fee_estimator = fe;
     network = Consensus.mainnet;
   } in
@@ -637,6 +640,7 @@ let test_getrawtransaction_wrong_blockhash () =
     mempool = mp;
     peer_manager = pm;
     wallet = None;
+    wallet_manager = None;
     fee_estimator = fe;
     network = Consensus.mainnet;
   } in
@@ -863,6 +867,7 @@ let create_regtest_context () =
     mempool = mp;
     peer_manager = pm;
     wallet = None;
+    wallet_manager = None;
     fee_estimator = fe;
     network = Consensus.regtest;
   } in

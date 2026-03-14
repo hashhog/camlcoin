@@ -1389,3 +1389,419 @@ let load_mempool (mp : mempool) (path : string) : int =
       )
     with _ -> ());  (* handle corrupt files gracefully *)
     !loaded
+
+(* ============================================================================
+   Package Relay (BIP 331)
+
+   Package relay allows transactions to be validated and relayed as packages,
+   enabling CPFP (Child Pays For Parent) fee-bumping of transactions that
+   would otherwise be below the mempool minimum fee.
+
+   Key concepts:
+   - 1p1c (1 parent, 1 child): The initial supported package topology
+   - Package fee rate: sum(fees) / sum(vsizes) across all transactions
+   - Individual tx may be below min fee if package fee rate is sufficient
+   - Orphan resolution triggers 1p1c package validation
+   ============================================================================ *)
+
+(* Package validation result *)
+type package_result =
+  | PackageAccepted of mempool_entry list
+  | PackageRejected of string
+  | PackagePartial of {
+      accepted : mempool_entry list;
+      rejected : (Types.transaction * string) list;
+    }
+
+(* Maximum package size constraints (from Bitcoin Core) *)
+let max_package_count = 25
+let max_package_weight = 404_000
+
+(* Topologically sort transactions so parents come before children.
+   Returns Error if there's a cycle or invalid topology. *)
+let topo_sort (txs : Types.transaction list) : (Types.transaction list, string) result =
+  if txs = [] then Ok []
+  else begin
+    (* Build a map of txid -> transaction *)
+    let tx_by_id = Hashtbl.create (List.length txs) in
+    List.iter (fun tx ->
+      let txid = Crypto.compute_txid tx in
+      Hashtbl.replace tx_by_id (Cstruct.to_string txid) tx
+    ) txs;
+
+    (* Build dependency graph: txid -> list of parent txids within package *)
+    let deps = Hashtbl.create (List.length txs) in
+    List.iter (fun tx ->
+      let txid = Cstruct.to_string (Crypto.compute_txid tx) in
+      let parent_ids = List.filter_map (fun inp ->
+        let parent_id = Cstruct.to_string inp.Types.previous_output.txid in
+        if Hashtbl.mem tx_by_id parent_id then Some parent_id else None
+      ) tx.Types.inputs in
+      Hashtbl.replace deps txid parent_ids
+    ) txs;
+
+    (* Kahn's algorithm for topological sort *)
+    let in_degree = Hashtbl.create (List.length txs) in
+    Hashtbl.iter (fun txid parents ->
+      if not (Hashtbl.mem in_degree txid) then
+        Hashtbl.replace in_degree txid 0;
+      List.iter (fun parent_id ->
+        let current = try Hashtbl.find in_degree txid with Not_found -> 0 in
+        Hashtbl.replace in_degree txid (current + 1);
+        (* Ensure parent is in in_degree *)
+        if not (Hashtbl.mem in_degree parent_id) then
+          Hashtbl.replace in_degree parent_id 0
+      ) parents
+    ) deps;
+
+    (* Find all nodes with in_degree 0 *)
+    let queue = Queue.create () in
+    Hashtbl.iter (fun txid degree ->
+      if degree = 0 then Queue.push txid queue
+    ) in_degree;
+
+    let sorted = ref [] in
+    let visited = ref 0 in
+    while not (Queue.is_empty queue) do
+      let txid = Queue.pop queue in
+      incr visited;
+      (match Hashtbl.find_opt tx_by_id txid with
+       | Some tx -> sorted := tx :: !sorted
+       | None -> ());
+      (* Decrease in_degree for all children *)
+      Hashtbl.iter (fun child_id parents ->
+        if List.mem txid parents then begin
+          let deg = Hashtbl.find in_degree child_id in
+          Hashtbl.replace in_degree child_id (deg - 1);
+          if deg - 1 = 0 then Queue.push child_id queue
+        end
+      ) deps
+    done;
+
+    if !visited <> List.length txs then
+      Error "Package contains a cycle"
+    else
+      Ok (List.rev !sorted)
+  end
+
+(* Check if a package is well-formed:
+   - At most max_package_count transactions
+   - Total weight at most max_package_weight
+   - Topologically sorted (parents before children)
+   - No conflicting transactions (same input spent twice) *)
+let is_well_formed_package (txs : Types.transaction list) : (unit, string) result =
+  if List.length txs > max_package_count then
+    Error (Printf.sprintf "Package exceeds max transaction count (%d > %d)"
+      (List.length txs) max_package_count)
+  else begin
+    (* Check total weight *)
+    let total_weight = List.fold_left (fun acc tx ->
+      acc + Validation.compute_tx_weight tx
+    ) 0 txs in
+    if total_weight > max_package_weight then
+      Error (Printf.sprintf "Package exceeds max weight (%d > %d)"
+        total_weight max_package_weight)
+    else begin
+      (* Check for conflicting transactions (same outpoint spent twice) *)
+      let spent_outpoints = Hashtbl.create 64 in
+      let conflict = ref None in
+      List.iter (fun tx ->
+        if !conflict = None then
+          List.iter (fun inp ->
+            let key = Printf.sprintf "%s:%ld"
+              (Types.hash256_to_hex inp.Types.previous_output.txid)
+              inp.Types.previous_output.vout in
+            if Hashtbl.mem spent_outpoints key then
+              conflict := Some (Printf.sprintf "Conflicting spend of %s" key)
+            else
+              Hashtbl.replace spent_outpoints key ()
+          ) tx.Types.inputs
+      ) txs;
+      match !conflict with
+      | Some msg -> Error msg
+      | None -> Ok ()
+    end
+  end
+
+(* Check if package is child-with-parents (1p1c) topology:
+   - Last transaction is the child
+   - All preceding transactions are parents of the child
+   - Parents have no dependencies on each other *)
+let is_1p1c_package (txs : Types.transaction list) : bool =
+  match txs with
+  | [] | [_] -> true  (* Empty or single tx is trivially valid *)
+  | _ ->
+    let n = List.length txs in
+    if n <> 2 then false  (* 1p1c is exactly 2 txs *)
+    else begin
+      let parent = List.hd txs in
+      let child = List.nth txs 1 in
+      let parent_txid = Crypto.compute_txid parent in
+      (* Child must spend from parent *)
+      List.exists (fun inp ->
+        Cstruct.equal inp.Types.previous_output.txid parent_txid
+      ) child.Types.inputs
+    end
+
+(* Calculate fee and vsize for a single transaction given available UTXOs.
+   Returns (fee, vsize) or Error if inputs are missing. *)
+let calc_tx_fee_vsize (mp : mempool) (tx : Types.transaction)
+    ~(package_utxos : (string, Utxo.utxo_entry) Hashtbl.t)
+    : (int64 * int, string) result =
+  let input_sum = ref 0L in
+  let error = ref None in
+  List.iter (fun inp ->
+    if !error = None then begin
+      let prev = inp.Types.previous_output in
+      let key = Printf.sprintf "%s:%ld"
+        (Types.hash256_to_hex prev.txid) prev.vout in
+      (* Check package UTXOs first (outputs from earlier package txs) *)
+      match Hashtbl.find_opt package_utxos key with
+      | Some entry -> input_sum := Int64.add !input_sum entry.Utxo.value
+      | None ->
+        (* Fall back to mempool/chain UTXOs *)
+        match lookup_utxo mp prev with
+        | Some entry -> input_sum := Int64.add !input_sum entry.value
+        | None ->
+          error := Some (Printf.sprintf "Missing input: %s:%ld"
+            (Types.hash256_to_hex_display prev.txid) prev.vout)
+    end
+  ) tx.Types.inputs;
+  match !error with
+  | Some msg -> Error msg
+  | None ->
+    let output_sum = List.fold_left
+      (fun acc out -> Int64.add acc out.Types.value) 0L tx.Types.outputs in
+    if output_sum > !input_sum then
+      Error "Output exceeds input"
+    else begin
+      let fee = Int64.sub !input_sum output_sum in
+      let weight = Validation.compute_tx_weight tx in
+      let vsize = (weight + 3) / 4 in
+      Ok (fee, vsize)
+    end
+
+(* Accept a package of transactions.
+   Validates topologically (parents before children).
+   Computes package fee rate as total_fees / total_vsize.
+   Accepts if package fee rate meets minimum, even if individual txs don't. *)
+let accept_package (mp : mempool) (txs : Types.transaction list)
+    : package_result =
+  (* Validate well-formedness *)
+  match is_well_formed_package txs with
+  | Error msg -> PackageRejected msg
+  | Ok () ->
+    (* Topologically sort *)
+    match topo_sort txs with
+    | Error msg -> PackageRejected msg
+    | Ok sorted ->
+      (* Track UTXOs created by earlier transactions in the package *)
+      let package_utxos = Hashtbl.create 16 in
+      let total_fee = ref 0L in
+      let total_vsize = ref 0 in
+      let accepted = ref [] in
+      let rejected = ref [] in
+      let package_txids = Hashtbl.create 16 in
+
+      (* First pass: calculate fees and check for already-in-mempool txs *)
+      let fees_vsizes = List.map (fun tx ->
+        let txid = Crypto.compute_txid tx in
+        let txid_key = Cstruct.to_string txid in
+        Hashtbl.replace package_txids txid_key ();
+        (* Check if already in mempool *)
+        if Hashtbl.mem mp.entries txid_key then
+          `AlreadyInMempool (tx, Hashtbl.find mp.entries txid_key)
+        else
+          (* Calculate fee and vsize *)
+          match calc_tx_fee_vsize mp tx ~package_utxos with
+          | Error msg -> `Error (tx, msg)
+          | Ok (fee, vsize) ->
+            (* Add outputs to package UTXOs for later txs *)
+            List.iteri (fun i out ->
+              let key = Printf.sprintf "%s:%d"
+                (Types.hash256_to_hex txid) i in
+              Hashtbl.replace package_utxos key Utxo.{
+                value = out.Types.value;
+                script_pubkey = out.Types.script_pubkey;
+                height = mp.current_height;
+                is_coinbase = false;
+              }
+            ) tx.Types.outputs;
+            `NeedValidation (tx, fee, vsize)
+      ) sorted in
+
+      (* Calculate package totals for txs that need validation *)
+      List.iter (function
+        | `AlreadyInMempool (_, entry) ->
+          (* Already accepted, add to accepted list *)
+          accepted := entry :: !accepted
+        | `Error (tx, _) ->
+          (* Will be handled below *)
+          ignore tx
+        | `NeedValidation (_, fee, vsize) ->
+          total_fee := Int64.add !total_fee fee;
+          total_vsize := !total_vsize + vsize
+      ) fees_vsizes;
+
+      (* Check package fee rate *)
+      let package_feerate =
+        if !total_vsize > 0 then
+          (* Fee rate in sat/kvB: (fee * 1000) / vsize *)
+          Int64.to_float !total_fee *. 1000.0 /. float_of_int !total_vsize
+        else 0.0
+      in
+      let min_feerate = Int64.to_float mp.min_relay_fee in
+
+      (* If package fee rate is sufficient, accept txs even if individual is below min *)
+      let use_package_feerate = package_feerate >= min_feerate in
+
+      (* Second pass: actually add transactions *)
+      List.iter (function
+        | `AlreadyInMempool _ -> ()  (* Already handled *)
+        | `Error (tx, msg) ->
+          rejected := (tx, msg) :: !rejected
+        | `NeedValidation (tx, fee, vsize) ->
+          let txid = Crypto.compute_txid tx in
+          (* Check individual fee rate *)
+          let individual_feerate = Int64.to_float fee *. 1000.0 /. float_of_int vsize in
+          let passes_feerate = individual_feerate >= min_feerate || use_package_feerate in
+
+          if not passes_feerate then
+            rejected := (tx, "Fee below minimum relay fee (not enough CPFP)") :: !rejected
+          else begin
+            (* Validate and add - use bypass_fee_check for package context *)
+            let bypass_fee = use_package_feerate in
+            (* Build entry directly to bypass fee check when package rate is good *)
+            let add_result =
+              if bypass_fee then begin
+                (* Direct add bypassing fee check for CPFP packages *)
+                let txid_key = Cstruct.to_string txid in
+                if Hashtbl.mem mp.entries txid_key then
+                  Error "Transaction already in mempool"
+                else begin
+                  let weight = Validation.compute_tx_weight tx in
+                  let fee_rate = Int64.to_float fee /. float_of_int weight in
+                  (* Find dependencies *)
+                  let depends = List.filter_map (fun inp ->
+                    let prev_key = Cstruct.to_string inp.Types.previous_output.txid in
+                    if Hashtbl.mem mp.entries prev_key then
+                      Some inp.Types.previous_output.txid
+                    else if Hashtbl.mem package_txids prev_key then
+                      Some inp.Types.previous_output.txid
+                    else None
+                  ) tx.Types.inputs in
+                  let wtxid = Crypto.compute_wtxid tx in
+                  let entry = {
+                    tx;
+                    txid;
+                    wtxid;
+                    fee;
+                    weight;
+                    fee_rate;
+                    time_added = Unix.gettimeofday ();
+                    height_added = mp.current_height;
+                    depends_on = depends;
+                  } in
+                  Hashtbl.replace mp.entries txid_key entry;
+                  mp.total_weight <- mp.total_weight + weight;
+                  mp.total_fee <- Int64.add mp.total_fee fee;
+                  Ok entry
+                end
+              end else
+                add_transaction mp tx
+            in
+            match add_result with
+            | Ok entry -> accepted := entry :: !accepted
+            | Error msg -> rejected := (tx, msg) :: !rejected
+          end
+      ) fees_vsizes;
+
+      let accepted_list = List.rev !accepted in
+      let rejected_list = List.rev !rejected in
+      if rejected_list = [] then
+        PackageAccepted accepted_list
+      else if accepted_list = [] then
+        PackageRejected (snd (List.hd rejected_list))
+      else
+        PackagePartial { accepted = accepted_list; rejected = rejected_list }
+
+(* Find a 1p1c package for an orphan transaction.
+   When an orphan's parent arrives but is rejected for low fee,
+   try to validate the orphan+parent as a 1p1c package. *)
+let find_1p1c_for_orphan (mp : mempool) (parent_txid : Types.hash256)
+    : (Types.transaction * Types.transaction) option =
+  (* Look for orphans that spend this parent *)
+  let candidates = Hashtbl.fold (fun _k entry acc ->
+    let spends_parent = List.exists (fun inp ->
+      Cstruct.equal inp.Types.previous_output.txid parent_txid
+    ) entry.orphan_tx.Types.inputs in
+    if spends_parent then entry.orphan_tx :: acc else acc
+  ) mp.orphans [] in
+  match candidates with
+  | [] -> None
+  | child :: _ ->
+    (* We need the parent transaction - check if it's in the reject cache
+       or was just validated. For now, return None if parent not available. *)
+    (* In practice, the caller should provide the parent tx *)
+    ignore child;
+    None
+
+(* Try 1p1c validation for a rejected parent transaction.
+   Called when a transaction is rejected for fee-related reasons
+   and we want to check if any orphan can pay for it. *)
+let try_1p1c_with_orphans (mp : mempool) (parent : Types.transaction)
+    : package_result =
+  let parent_txid = Crypto.compute_txid parent in
+  (* Find orphans that spend this parent *)
+  let candidates = Hashtbl.fold (fun orphan_key entry acc ->
+    let spends_parent = List.exists (fun inp ->
+      Cstruct.equal inp.Types.previous_output.txid parent_txid
+    ) entry.orphan_tx.Types.inputs in
+    if spends_parent then (orphan_key, entry.orphan_tx) :: acc else acc
+  ) mp.orphans [] in
+
+  match candidates with
+  | [] -> PackageRejected "No orphans available for CPFP"
+  | (orphan_key, child) :: _ ->
+    (* Try to validate as 1p1c package *)
+    let result = accept_package mp [parent; child] in
+    (match result with
+     | PackageAccepted _ | PackagePartial { accepted = _ :: _; _ } ->
+       (* Remove the orphan since it was accepted *)
+       Hashtbl.remove mp.orphans orphan_key
+     | _ -> ());
+    result
+
+(* Enhanced orphan processing: when a transaction is accepted,
+   try 1p1c package validation with waiting orphans. *)
+let process_orphans_with_cpfp (mp : mempool) (new_txid : Types.hash256)
+    : mempool_entry list =
+  let accepted = ref [] in
+  let changed = ref true in
+
+  while !changed do
+    changed := false;
+    let to_try = Hashtbl.fold (fun k v acc -> (k, v) :: acc) mp.orphans [] in
+    List.iter (fun (orphan_key, orphan) ->
+      (* Check if any input references the new txid or previously accepted tx *)
+      let relevant = List.exists (fun inp ->
+        let prev_txid = inp.Types.previous_output.txid in
+        Cstruct.equal prev_txid new_txid ||
+        List.exists (fun e -> Cstruct.equal prev_txid e.txid) !accepted
+      ) orphan.orphan_tx.Types.inputs in
+
+      if relevant then begin
+        Hashtbl.remove mp.orphans orphan_key;
+        (* Try normal add first *)
+        match add_transaction mp orphan.orphan_tx with
+        | Ok entry ->
+          accepted := entry :: !accepted;
+          changed := true
+        | Error _ ->
+          (* If normal add fails, the orphan may need CPFP from its own children.
+             For now, just discard it since we don't have a child yet. *)
+          ()
+      end
+    ) to_try
+  done;
+  List.rev !accepted

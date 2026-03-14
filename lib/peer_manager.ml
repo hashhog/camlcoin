@@ -204,6 +204,8 @@ type t = {
   (* Stale peer eviction state *)
   stale_state : (int, stale_peer_state) Hashtbl.t;  (* peer_id -> stale tracking state *)
   mutable stale_check_running : bool;               (* Whether the 45s check timer is running *)
+  (* Mempool for feefilter (BIP-133) *)
+  mutable mempool : Mempool.mempool option;         (* Mempool for min_relay_fee *)
 }
 
 (* Generate a random bucket key for address hashing *)
@@ -241,7 +243,12 @@ let create ?(config = default_config) (network : Consensus.network_config) : t =
     outbound_netgroups = Hashtbl.create 16;
     stale_state = Hashtbl.create 64;
     stale_check_running = false;
+    mempool = None;
   }
+
+(* Set the mempool reference for feefilter (BIP-133) *)
+let set_mempool (pm : t) (mp : Mempool.mempool) : unit =
+  pm.mempool <- Some mp
 
 (* Update our known blockchain height *)
 let set_height (pm : t) (height : int32) : unit =
@@ -1281,7 +1288,20 @@ let peer_message_loop (pm : t) (peer : Peer.peer) : unit Lwt.t =
         let* msg_opt = Peer.read_message_with_timeout peer 30.0 in
         match msg_opt with
         | None ->
-          (* Timeout, check if peer needs ping *)
+          (* Timeout - perform periodic maintenance *)
+          (* Check if we should send feefilter (BIP-133) *)
+          let* () =
+            if Peer.should_send_feefilter peer then
+              let min_fee = match pm.mempool with
+                | Some mp -> mp.Mempool.min_relay_fee
+                | None -> 1000L (* default 1 sat/vB *)
+              in
+              let* _sent = Peer.maybe_send_feefilter peer min_fee in
+              Lwt.return_unit
+            else
+              Lwt.return_unit
+          in
+          (* Check if peer needs ping *)
           if Peer.needs_ping peer then begin
             let* () = Peer.send_ping peer in
             loop ()

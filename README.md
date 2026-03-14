@@ -52,7 +52,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Coinbase maturity (100-block delay for coinbase spends, enforced in block validation and mempool)
 - [x] Wallet encryption (encryptwallet, walletpassphrase, walletlock, passphrase change, timeout-based auto-lock)
 - [x] Block indexes (hash index, height index, BIP-157/158 compact block filters with GCS)
-- [ ] Compact block relay (BIP 152)
+- [x] Compact block relay (BIP 152, SipHash, short IDs, block reconstruction)
 - [ ] Bloom filters (BIP 37)
 
 ## Quick start

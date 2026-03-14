@@ -434,7 +434,7 @@ let template_to_json (template : block_template) : Yojson.Safe.t =
       ("txid", `String (Types.hash256_to_hex_display txid));
       ("fee", `Int (Int64.to_int fee));
       ("depends", `List (List.map (fun i -> `Int i) depends));
-      ("sigops", `Int (Validation.count_tx_sigops tx));
+      ("sigops", `Int (Mempool.count_tx_sigops_cost tx));
       ("weight", `Int (Validation.compute_tx_weight tx));
     ]
   ) template.transactions in
@@ -456,7 +456,7 @@ let template_to_json (template : block_template) : Yojson.Safe.t =
     ("mutable",
       `List [`String "time"; `String "transactions"; `String "prevblock"]);
     ("noncerange", `String "00000000ffffffff");
-    ("sigoplimit", `Int (Consensus.max_block_sigops_cost / 4));
+    ("sigoplimit", `Int Consensus.max_block_sigops_cost);
     ("sizelimit", `Int 1000000);
     ("weightlimit", `Int Consensus.max_block_weight);
     ("curtime",

@@ -30,7 +30,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Block synchronization (IBD, parallel downloads, chain reorganization)
 - [x] UTXO set with cache (block connect/disconnect, maturity checks)
 - [x] Undo data for chain reorganizations (tx_undo, block_undo, checksums)
-- [x] Mempool (fee-rate prioritization, eviction, dependency tracking, RBF)
+- [x] Mempool (fee-rate prioritization, eviction, dependency tracking, RBF, ancestor/descendant limits)
 - [x] Fee estimation (bucket-based tracking, confirmation time analysis)
 - [x] Block template construction (getblocktemplate, coinbase, witness commitment)
 - [x] CPU miner for regtest (proof-of-work search, nonce iteration)

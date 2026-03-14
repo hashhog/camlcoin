@@ -317,3 +317,114 @@ let compute_taproot_merkle_root_from_path (leaf_hash : Cstruct.t)
   List.fold_left (fun acc node ->
     compute_tapbranch_hash acc node
   ) leaf_hash path
+
+(* ============================================================================
+   SipHash-2-4 (BIP 152 compact blocks)
+
+   SipHash is a fast pseudorandom hash function used for compact block short
+   transaction IDs. The implementation follows Bitcoin Core's crypto/siphash.cpp.
+   ============================================================================ *)
+
+module SipHash = struct
+  (* SipHash constants *)
+  let c0 = 0x736f6d6570736575L
+  let c1 = 0x646f72616e646f6dL
+  let c2 = 0x6c7967656e657261L
+  let c3 = 0x7465646279746573L
+
+  (* Left rotate 64-bit value *)
+  let rotl64 (x : int64) (n : int) : int64 =
+    Int64.logor
+      (Int64.shift_left x n)
+      (Int64.shift_right_logical x (64 - n))
+
+  (* SipRound: the core mixing function *)
+  let sipround (v0, v1, v2, v3) =
+    let v0 = Int64.add v0 v1 in
+    let v1 = rotl64 v1 13 in
+    let v1 = Int64.logxor v1 v0 in
+    let v0 = rotl64 v0 32 in
+    let v2 = Int64.add v2 v3 in
+    let v3 = rotl64 v3 16 in
+    let v3 = Int64.logxor v3 v2 in
+    let v0 = Int64.add v0 v3 in
+    let v3 = rotl64 v3 21 in
+    let v3 = Int64.logxor v3 v0 in
+    let v2 = Int64.add v2 v1 in
+    let v1 = rotl64 v1 17 in
+    let v1 = Int64.logxor v1 v2 in
+    let v2 = rotl64 v2 32 in
+    (v0, v1, v2, v3)
+
+  (* Initialize SipHash state from k0, k1 *)
+  let init (k0 : int64) (k1 : int64) =
+    (Int64.logxor c0 k0, Int64.logxor c1 k1,
+     Int64.logxor c2 k0, Int64.logxor c3 k1)
+
+  (* Read a little-endian uint64 from a Cstruct *)
+  let get_uint64_le (cs : Cstruct.t) (off : int) : int64 =
+    Cstruct.LE.get_uint64 cs off
+
+  (* Hash a uint256 (32 bytes) with the given SipHash state.
+     This is the PresaltedSipHasher::operator()(const uint256&) equivalent. *)
+  let hash_uint256 (k0 : int64) (k1 : int64) (data : Cstruct.t) : int64 =
+    if Cstruct.length data <> 32 then
+      failwith "SipHash.hash_uint256: expected 32 bytes";
+    let (v0, v1, v2, v3) = init k0 k1 in
+    (* Process 4 x 8-byte words *)
+    let d0 = get_uint64_le data 0 in
+    let v3 = Int64.logxor v3 d0 in
+    let (v0, v1, v2, v3) = sipround (v0, v1, v2, v3) in
+    let (v0, v1, v2, v3) = sipround (v0, v1, v2, v3) in
+    let v0 = Int64.logxor v0 d0 in
+
+    let d1 = get_uint64_le data 8 in
+    let v3 = Int64.logxor v3 d1 in
+    let (v0, v1, v2, v3) = sipround (v0, v1, v2, v3) in
+    let (v0, v1, v2, v3) = sipround (v0, v1, v2, v3) in
+    let v0 = Int64.logxor v0 d1 in
+
+    let d2 = get_uint64_le data 16 in
+    let v3 = Int64.logxor v3 d2 in
+    let (v0, v1, v2, v3) = sipround (v0, v1, v2, v3) in
+    let (v0, v1, v2, v3) = sipround (v0, v1, v2, v3) in
+    let v0 = Int64.logxor v0 d2 in
+
+    let d3 = get_uint64_le data 24 in
+    let v3 = Int64.logxor v3 d3 in
+    let (v0, v1, v2, v3) = sipround (v0, v1, v2, v3) in
+    let (v0, v1, v2, v3) = sipround (v0, v1, v2, v3) in
+    let v0 = Int64.logxor v0 d3 in
+
+    (* Finalize: length byte (32 = 0x20) in top byte + padding *)
+    (* For 32 bytes: ((uint64_t{4}) << 59) which is 4*8=32 bytes *)
+    let len_word = Int64.shift_left 4L 59 in
+    let v3 = Int64.logxor v3 len_word in
+    let (v0, v1, v2, v3) = sipround (v0, v1, v2, v3) in
+    let (v0, v1, v2, v3) = sipround (v0, v1, v2, v3) in
+    let v0 = Int64.logxor v0 len_word in
+
+    let v2 = Int64.logxor v2 0xFFL in
+    let (v0, v1, v2, v3) = sipround (v0, v1, v2, v3) in
+    let (v0, v1, v2, v3) = sipround (v0, v1, v2, v3) in
+    let (v0, v1, v2, v3) = sipround (v0, v1, v2, v3) in
+    let (v0, v1, v2, v3) = sipround (v0, v1, v2, v3) in
+    Int64.logxor (Int64.logxor (Int64.logxor v0 v1) v2) v3
+
+  (* Derive SipHash keys from block header hash and nonce.
+     Per BIP 152: SHA256(block_header || nonce) -> first 16 bytes as (k0, k1). *)
+  let derive_keys (header_hash : Cstruct.t) (nonce : int64) : (int64 * int64) =
+    let nonce_cs = Cstruct.create 8 in
+    Cstruct.LE.set_uint64 nonce_cs 0 nonce;
+    let preimage = Cstruct.concat [header_hash; nonce_cs] in
+    let hash = sha256 preimage in
+    let k0 = get_uint64_le hash 0 in
+    let k1 = get_uint64_le hash 8 in
+    (k0, k1)
+end
+
+(* Compute short transaction ID for compact blocks (BIP 152).
+   Returns lower 6 bytes of SipHash output as int64. *)
+let compute_short_txid (k0 : int64) (k1 : int64) (wtxid : Types.hash256) : int64 =
+  let hash = SipHash.hash_uint256 k0 k1 wtxid in
+  Int64.logand hash 0xFFFFFFFFFFFFL  (* lower 48 bits = 6 bytes *)

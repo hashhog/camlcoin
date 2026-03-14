@@ -685,6 +685,7 @@ let spending_input_size (script_pubkey : Cstruct.t) : int =
   | Script.P2WPKH_script _ -> 67
   | Script.P2WSH_script _ -> 109
   | Script.P2TR_script _ -> 58
+  | Script.P2A_script -> 41  (* P2A: minimal input, empty witness *)
   | Script.OP_RETURN_data _ -> 0  (* OP_RETURN outputs are unspendable *)
   | Script.Nonstandard -> 148  (* Conservative: use P2PKH size *)
 
@@ -693,10 +694,14 @@ let output_serialized_size (output : Types.tx_out) : int =
   let varint_len = if script_len < 0xFD then 1 else if script_len <= 0xFFFF then 3 else 5 in
   8 + varint_len + script_len
 
-(* Check if an output is dust. Dust = value < 3 * min_relay_fee * spending_size / 1000 *)
+(* Check if an output is dust. Dust = value < 3 * min_relay_fee * spending_size / 1000
+   P2A outputs have a fixed dust limit of 240 satoshis *)
 let is_dust (min_relay_fee : int64) (output : Types.tx_out) : bool =
   match Script.classify_script output.script_pubkey with
   | Script.OP_RETURN_data _ -> false  (* OP_RETURN is not dust *)
+  | Script.P2A_script ->
+    (* P2A outputs must have exactly 240 satoshis -- the P2A dust limit *)
+    output.Types.value <> Script.p2a_dust_limit
   | _ ->
     let spend_size = spending_input_size output.script_pubkey in
     if spend_size = 0 then false
@@ -739,6 +744,7 @@ let is_standard_output (script_pubkey : Cstruct.t) : bool =
   | Script.P2WPKH_script _ -> true
   | Script.P2WSH_script _ -> true
   | Script.P2TR_script _ -> true
+  | Script.P2A_script -> true  (* P2A is standard -- BIP-PR-3535 *)
   | Script.OP_RETURN_data _ -> Cstruct.length script_pubkey <= 83
   | Script.Nonstandard -> false
 
@@ -1170,18 +1176,24 @@ let verify_tx_scripts (mp : mempool) (tx : Types.transaction)
           else
             { Types.items = [] }
         in
-        match Script.verify_script
-                ~tx ~input_index:i
-                ~script_pubkey:utxo_entry.Utxo.script_pubkey
-                ~script_sig:inp.Types.script_sig
-                ~witness
-                ~amount:utxo_entry.Utxo.value
-                ~flags ~prevouts () with
-        | Error msg ->
-          error := Some (Printf.sprintf "Script verification failed for input %d: %s" i msg)
-        | Ok false ->
-          error := Some (Printf.sprintf "Script returned false for input %d" i)
-        | Ok true -> ()
+        (* P2A witness stuffing prevention (policy): P2A spends must have empty witness *)
+        if Script.is_p2a utxo_entry.Utxo.script_pubkey &&
+           witness.Types.items <> [] then
+          error := Some (Printf.sprintf
+            "P2A input %d has non-empty witness (witness stuffing)" i)
+        else
+          match Script.verify_script
+                  ~tx ~input_index:i
+                  ~script_pubkey:utxo_entry.Utxo.script_pubkey
+                  ~script_sig:inp.Types.script_sig
+                  ~witness
+                  ~amount:utxo_entry.Utxo.value
+                  ~flags ~prevouts () with
+          | Error msg ->
+            error := Some (Printf.sprintf "Script verification failed for input %d: %s" i msg)
+          | Ok false ->
+            error := Some (Printf.sprintf "Script returned false for input %d" i)
+          | Ok true -> ()
     end
   ) tx.inputs;
 

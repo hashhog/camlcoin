@@ -1705,6 +1705,154 @@ let process_orphans (mp : mempool) (new_txid : Types.hash256)
   done;
   List.rev !accepted
 
+(* ============================================================================
+   Ephemeral Anchor Policy
+
+   Ephemeral anchors are zero-value (dust) outputs that are exempt from dust
+   limits if they are spent by a child transaction in the same package.
+
+   This policy ensures dust outputs don't enter the UTXO set by requiring:
+   1. PreCheckEphemeralTx: tx with dust outputs must have 0 fee (disincentivize
+      mining alone)
+   2. CheckEphemeralSpends: all dust outputs from parents must be spent by
+      children in the package
+
+   Reference: Bitcoin Core /src/policy/ephemeral_policy.cpp
+   ============================================================================ *)
+
+(* Maximum number of dust outputs allowed per transaction *)
+let max_dust_outputs_per_tx = 1
+
+(* Check if an output is dust (would fail is_dust check).
+   Zero-value outputs are always dust. Returns list of dust output indices. *)
+let get_dust_outputs (min_relay_fee : int64) (tx : Types.transaction)
+    : int list =
+  List.mapi (fun i out ->
+    if is_dust min_relay_fee out then Some i else None
+  ) tx.outputs |> List.filter_map Fun.id
+
+(* PreCheckEphemeralTx: A transaction with dust outputs must have 0 fee.
+   This prevents miners from having incentive to mine the tx alone, which
+   would leave dust in the UTXO set.
+   Reference: Bitcoin Core PreCheckEphemeralTx *)
+let pre_check_ephemeral_tx (min_relay_fee : int64) (tx : Types.transaction)
+    (fee : int64) : (unit, string) result =
+  let dust_outs = get_dust_outputs min_relay_fee tx in
+  if dust_outs <> [] && fee <> 0L then
+    Error "tx with dust output must be 0-fee"
+  else
+    Ok ()
+
+(* Check if a transaction's parents have any dust outputs.
+   Returns a list of (parent_txid, outpoint_index) for all dust outputs. *)
+let find_parent_dust_outputs (mp : mempool) (tx : Types.transaction)
+    ~(package_txs : (string, Types.transaction) Hashtbl.t)
+    ~(processed : (string, unit) Hashtbl.t)
+    : (Types.hash256 * int) list =
+  let dust_list = ref [] in
+  List.iter (fun inp ->
+    let parent_txid = inp.Types.previous_output.txid in
+    let parent_key = Cstruct.to_string parent_txid in
+    (* Skip already processed parents *)
+    if not (Hashtbl.mem processed parent_key) then begin
+      Hashtbl.replace processed parent_key ();
+      (* Find parent in package or mempool *)
+      let parent_tx_opt =
+        match Hashtbl.find_opt package_txs parent_key with
+        | Some tx -> Some tx
+        | None ->
+          match Hashtbl.find_opt mp.entries parent_key with
+          | Some entry -> Some entry.tx
+          | None -> None
+      in
+      match parent_tx_opt with
+      | Some parent_tx ->
+        (* Check each output of the parent for dust *)
+        let dust_indices = get_dust_outputs mp.min_relay_fee parent_tx in
+        List.iter (fun idx ->
+          dust_list := (parent_txid, idx) :: !dust_list
+        ) dust_indices
+      | None -> ()
+    end
+  ) tx.Types.inputs;
+  !dust_list
+
+(* CheckEphemeralSpends: Ensure all dust outputs from parents are spent.
+   Each transaction in the package must spend ALL dust outputs from its
+   parents (either in-package or in-mempool).
+   Reference: Bitcoin Core CheckEphemeralSpends *)
+let check_ephemeral_spends (mp : mempool) (package : Types.transaction list)
+    : (unit, string * Types.hash256) result =
+  (* Build a map of package txid -> transaction *)
+  let package_txs = Hashtbl.create (List.length package) in
+  List.iter (fun tx ->
+    let txid = Crypto.compute_txid tx in
+    Hashtbl.replace package_txs (Cstruct.to_string txid) tx
+  ) package;
+
+  let error = ref None in
+
+  List.iter (fun tx ->
+    if !error = None then begin
+      let txid = Crypto.compute_txid tx in
+      let processed = Hashtbl.create 8 in
+
+      (* Find all dust outputs from parents *)
+      let parent_dust = find_parent_dust_outputs mp tx
+        ~package_txs ~processed in
+
+      if parent_dust <> [] then begin
+        (* Build set of inputs that this tx spends *)
+        let spent_outpoints = Hashtbl.create 8 in
+        List.iter (fun inp ->
+          let key = Printf.sprintf "%s:%ld"
+            (Cstruct.to_string inp.Types.previous_output.txid)
+            inp.Types.previous_output.vout in
+          Hashtbl.replace spent_outpoints key ()
+        ) tx.Types.inputs;
+
+        (* Check that all dust outputs are spent *)
+        let unspent_dust = List.filter (fun (parent_txid, idx) ->
+          let key = Printf.sprintf "%s:%d"
+            (Cstruct.to_string parent_txid) idx in
+          not (Hashtbl.mem spent_outpoints key)
+        ) parent_dust in
+
+        if unspent_dust <> [] then begin
+          let (unspent_parent, unspent_idx) = List.hd unspent_dust in
+          error := Some (
+            Printf.sprintf "tx %s did not spend parent's ephemeral dust at output %d of %s"
+              (Types.hash256_to_hex_display txid)
+              unspent_idx
+              (Types.hash256_to_hex_display unspent_parent),
+            txid
+          )
+        end
+      end
+    end
+  ) package;
+
+  match !error with
+  | Some (msg, txid) -> Error (msg, txid)
+  | None -> Ok ()
+
+(* Check ephemeral anchor policy for a single transaction.
+   For standalone txs, this just checks that there are no dust outputs
+   (since dust is only allowed with package validation). *)
+let check_ephemeral_single (mp : mempool) (tx : Types.transaction)
+    (fee : int64) : (unit, string) result =
+  match pre_check_ephemeral_tx mp.min_relay_fee tx fee with
+  | Error msg -> Error msg
+  | Ok () ->
+    (* Standalone tx with dust is rejected unless it has 0 fee
+       and will be validated as part of a package *)
+    let dust_outs = get_dust_outputs mp.min_relay_fee tx in
+    if List.length dust_outs > max_dust_outputs_per_tx then
+      Error (Printf.sprintf "Too many dust outputs (%d > %d)"
+        (List.length dust_outs) max_dust_outputs_per_tx)
+    else
+      Ok ()
+
 (* Get orphan pool size *)
 let orphan_count (mp : mempool) : int =
   Hashtbl.length mp.orphans
@@ -2200,12 +2348,24 @@ let accept_package (mp : mempool) (txs : Types.transaction list)
 
       let accepted_list = List.rev !accepted in
       let rejected_list = List.rev !rejected in
-      if rejected_list = [] then
-        PackageAccepted accepted_list
-      else if accepted_list = [] then
+
+      (* Check ephemeral anchor policy: all dust outputs must be spent *)
+      if rejected_list = [] && accepted_list <> [] then begin
+        match check_ephemeral_spends mp sorted with
+        | Error (msg, _txid) ->
+          PackageRejected (Printf.sprintf "missing-ephemeral-spends: %s" msg)
+        | Ok () ->
+          PackageAccepted accepted_list
+      end else if accepted_list = [] then
         PackageRejected (snd (List.hd rejected_list))
       else
-        PackagePartial { accepted = accepted_list; rejected = rejected_list }
+        (* Partial acceptance - still check ephemeral spends for accepted txs *)
+        let accepted_txs = List.map (fun e -> e.tx) accepted_list in
+        match check_ephemeral_spends mp accepted_txs with
+        | Error (msg, _txid) ->
+          PackageRejected (Printf.sprintf "missing-ephemeral-spends: %s" msg)
+        | Ok () ->
+          PackagePartial { accepted = accepted_list; rejected = rejected_list }
 
 (* Find a 1p1c package for an orphan transaction.
    When an orphan's parent arrives but is rejected for low fee,

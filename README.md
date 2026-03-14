@@ -35,7 +35,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Block template construction (getblocktemplate, coinbase, witness commitment)
 - [x] CPU miner for regtest (proof-of-work search, nonce iteration)
 - [x] JSON-RPC interface (batch requests, parallel processing)
-- [x] Wallet (key generation, UTXO tracking, coin selection, tx signing)
+- [x] Wallet (BIP-39 mnemonic, BIP-32/44/84/86 derivation, coin selection with BnB+SRD, encrypted storage)
 - [x] Command-line interface
 - [x] Test suite (Alcotest unit tests, QCheck property-based tests)
 - [x] Performance optimization (LRU cache, compact headers, benchmarks)
@@ -87,7 +87,8 @@ camlcoin/
     fee_estimation.ml fee rate estimation
     mining.ml         block template and miner
     rpc.ml            JSON-RPC server
-    wallet.ml         HD wallet, UTXO tracking, tx signing
+    wallet.ml         HD wallet, BIP-39/44/84/86, coin selection, encrypted storage
+    bip39.ml          mnemonic generation and seed derivation
     perf.ml           performance utilities and benchmarks
     cli.ml            command line interface
     camlcoin.ml       library interface

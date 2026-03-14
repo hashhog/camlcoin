@@ -1702,6 +1702,51 @@ let test_get_worst_chunk () =
 let test_cluster_constants () =
   Alcotest.(check int) "max_cluster_count" 101 Mempool.max_cluster_count
 
+(* ============================================================================
+   P2A (Pay-to-Anchor) Tests
+   ============================================================================ *)
+
+(* Helper to create a P2A script: OP_1 OP_PUSHBYTES_2 0x4e73 *)
+let make_p2a_script () =
+  let cs = Cstruct.create 4 in
+  Cstruct.set_uint8 cs 0 0x51;  (* OP_1 *)
+  Cstruct.set_uint8 cs 1 0x02;  (* PUSHBYTES_2 *)
+  Cstruct.set_uint8 cs 2 0x4e;
+  Cstruct.set_uint8 cs 3 0x73;
+  cs
+
+(* Helper to create P2A output with specified value *)
+let make_p2a_output value =
+  Types.{
+    value;
+    script_pubkey = make_p2a_script ();
+  }
+
+(* Test: P2A output is recognized as standard *)
+let test_p2a_is_standard () =
+  let p2a_script = make_p2a_script () in
+  Alcotest.(check bool) "P2A is standard" true (Mempool.is_standard_output p2a_script)
+
+(* Test: P2A output with correct dust value (240) is not dust *)
+let test_p2a_dust_correct_value () =
+  let output = make_p2a_output 240L in
+  let is_dust = Mempool.is_dust 1000L output in
+  Alcotest.(check bool) "240 sat P2A is not dust" false is_dust
+
+(* Test: P2A output with incorrect value is considered dust *)
+let test_p2a_dust_wrong_value () =
+  let output_too_low = make_p2a_output 239L in
+  let output_too_high = make_p2a_output 241L in
+  Alcotest.(check bool) "239 sat P2A is dust" true (Mempool.is_dust 1000L output_too_low);
+  Alcotest.(check bool) "241 sat P2A is dust" true (Mempool.is_dust 1000L output_too_high)
+
+(* Test: P2A spending input size is reasonable *)
+let test_p2a_spending_size () =
+  let p2a_script = make_p2a_script () in
+  let size = Mempool.spending_input_size p2a_script in
+  Alcotest.(check bool) "P2A spending size > 0" true (size > 0);
+  Alcotest.(check bool) "P2A spending size < 100" true (size < 100)
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
@@ -1789,5 +1834,11 @@ let () =
       test_case "cluster size limit" `Quick test_cluster_size_limit;
       test_case "get_worst_chunk" `Quick test_get_worst_chunk;
       test_case "cluster constants" `Quick test_cluster_constants;
+    ];
+    "p2a", [
+      test_case "P2A is standard" `Quick test_p2a_is_standard;
+      test_case "P2A correct dust value" `Quick test_p2a_dust_correct_value;
+      test_case "P2A wrong dust value" `Quick test_p2a_dust_wrong_value;
+      test_case "P2A spending size" `Quick test_p2a_spending_size;
     ];
   ]

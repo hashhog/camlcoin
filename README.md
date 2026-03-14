@@ -28,7 +28,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Header synchronization (BIP-130, block locators, proof-of-work tracking, anti-DoS)
 - [x] Header-sync anti-DoS (PRESYNC/REDOWNLOAD strategy, constant memory per peer)
 - [x] Block synchronization (IBD, parallel downloads, chain reorganization)
-- [x] UTXO set with cache (block connect/disconnect, maturity checks)
+- [x] UTXO set with cache (block connect/disconnect, maturity checks, layered cache with batch flushing)
 - [x] Undo data for chain reorganizations (tx_undo, block_undo, checksums)
 - [x] Mempool (fee-rate prioritization, eviction, dependency tracking, RBF, ancestor/descendant limits)
 - [x] Fee estimation (bucket-based tracking, confirmation time analysis)
@@ -77,7 +77,7 @@ camlcoin/
     consensus.ml      consensus parameters, BIP9 versionbits
     validation.ml     block/tx validation
     storage.ml        block/utxo storage, flat files
-    utxo.ml           UTXO set with LRU cache
+    utxo.ml           UTXO set, layered cache with batch flushing
     p2p.ml            network protocol
     peer.ml           peer connections
     peer_manager.ml   connection pool and discovery

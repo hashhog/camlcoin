@@ -566,6 +566,273 @@ let test_utxo_stats () =
   cleanup_test_db ()
 
 (* ============================================================================
+   Layered UTXO Cache Tests
+   ============================================================================ *)
+
+(* Helper to create a coin for testing *)
+let make_test_coin value height is_coinbase =
+  Utxo.{
+    txout = {
+      Types.value;
+      script_pubkey = Cstruct.of_string "\x76\xa9\x14test_script\x88\xac";
+    };
+    height;
+    is_coinbase;
+  }
+
+(* Helper to create an outpoint for testing *)
+let make_test_outpoint txid_hex vout =
+  Types.{
+    txid = Types.hash256_of_hex txid_hex;
+    vout = Int32.of_int vout;
+  }
+
+let test_utxo_cache_add_get () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let db_view = Utxo.DbView.create db in
+  let cache = Utxo.UtxoCache.create db_view in
+  let outpoint = make_test_outpoint
+    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b" 0 in
+  let coin = make_test_coin 5000000000L 0 true in
+  (* Add coin *)
+  Utxo.UtxoCache.add_coin cache outpoint coin ~possible_overwrite:false;
+  (* Get coin - should be cache hit *)
+  let retrieved = Utxo.UtxoCache.get_coin cache outpoint in
+  Alcotest.(check bool) "coin found" true (Option.is_some retrieved);
+  let got = Option.get retrieved in
+  Alcotest.(check int64) "value matches" coin.txout.value got.txout.value;
+  Alcotest.(check int) "height matches" coin.height got.height;
+  Alcotest.(check bool) "is_coinbase matches" coin.is_coinbase got.is_coinbase;
+  (* Check stats *)
+  let stats = Utxo.UtxoCache.get_stats cache in
+  Alcotest.(check int) "cache hits" 1 stats.hits;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_utxo_cache_miss_then_hit () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let db_view = Utxo.DbView.create db in
+  let cache = Utxo.UtxoCache.create db_view in
+  let outpoint = make_test_outpoint
+    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b" 0 in
+  (* First lookup - should miss (not in cache or db) *)
+  let result1 = Utxo.UtxoCache.get_coin cache outpoint in
+  Alcotest.(check bool) "first lookup misses" true (Option.is_none result1);
+  let stats = Utxo.UtxoCache.get_stats cache in
+  Alcotest.(check int) "misses after first lookup" 1 stats.misses;
+  (* Add directly to DB via db_view *)
+  let coin = make_test_coin 100000L 50 false in
+  Utxo.DbView.add_coin db_view outpoint coin ~possible_overwrite:false;
+  (* Create fresh cache (simulates restart) *)
+  let cache2 = Utxo.UtxoCache.create db_view in
+  (* Lookup should hit DB, then cache *)
+  let result2 = Utxo.UtxoCache.get_coin cache2 outpoint in
+  Alcotest.(check bool) "db lookup succeeds" true (Option.is_some result2);
+  let stats2 = Utxo.UtxoCache.get_stats cache2 in
+  Alcotest.(check int) "misses (fetched from db)" 1 stats2.misses;
+  (* Second lookup should hit cache *)
+  let result3 = Utxo.UtxoCache.get_coin cache2 outpoint in
+  Alcotest.(check bool) "cache lookup succeeds" true (Option.is_some result3);
+  let stats3 = Utxo.UtxoCache.get_stats cache2 in
+  Alcotest.(check int) "hits after cache fetch" 1 stats3.hits;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_utxo_cache_spend () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let db_view = Utxo.DbView.create db in
+  let cache = Utxo.UtxoCache.create db_view in
+  let outpoint = make_test_outpoint
+    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b" 0 in
+  let coin = make_test_coin 5000000000L 0 true in
+  (* Add coin *)
+  Utxo.UtxoCache.add_coin cache outpoint coin ~possible_overwrite:false;
+  Alcotest.(check bool) "coin exists before spend" true
+    (Utxo.UtxoCache.have_coin cache outpoint);
+  (* Spend coin *)
+  let spent = Utxo.UtxoCache.spend_coin cache outpoint in
+  Alcotest.(check bool) "spend returns coin" true (Option.is_some spent);
+  Alcotest.(check int64) "spent coin value" coin.txout.value
+    (Option.get spent).txout.value;
+  (* Coin should no longer exist *)
+  Alcotest.(check bool) "coin gone after spend" false
+    (Utxo.UtxoCache.have_coin cache outpoint);
+  (* Spending again should return None *)
+  let spent2 = Utxo.UtxoCache.spend_coin cache outpoint in
+  Alcotest.(check bool) "second spend returns none" true (Option.is_none spent2);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_utxo_cache_flush () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let db_view = Utxo.DbView.create db in
+  let cache = Utxo.UtxoCache.create db_view in
+  let outpoint1 = make_test_outpoint
+    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b" 0 in
+  let outpoint2 = make_test_outpoint
+    "0e3e2357e806b6cdb1f70b54c3a3a17b6714ee1f0e68bebb44a74b1efd512098" 0 in
+  let coin1 = make_test_coin 5000000000L 0 true in
+  let coin2 = make_test_coin 100000L 1 false in
+  (* Add coins to cache *)
+  Utxo.UtxoCache.add_coin cache outpoint1 coin1 ~possible_overwrite:false;
+  Utxo.UtxoCache.add_coin cache outpoint2 coin2 ~possible_overwrite:false;
+  Alcotest.(check int) "entry count before flush" 2 (Utxo.UtxoCache.entry_count cache);
+  (* Flush to disk *)
+  let flushed = Lwt_main.run (Utxo.UtxoCache.flush cache) in
+  Alcotest.(check int) "flushed count" 2 flushed;
+  Alcotest.(check int) "entry count after flush" 0 (Utxo.UtxoCache.entry_count cache);
+  (* Create fresh cache and verify coins are in db *)
+  let cache2 = Utxo.UtxoCache.create db_view in
+  Alcotest.(check bool) "coin1 in db" true (Utxo.UtxoCache.have_coin cache2 outpoint1);
+  Alcotest.(check bool) "coin2 in db" true (Utxo.UtxoCache.have_coin cache2 outpoint2);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_utxo_cache_flush_erased () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let db_view = Utxo.DbView.create db in
+  let outpoint = make_test_outpoint
+    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b" 0 in
+  let coin = make_test_coin 5000000000L 0 true in
+  (* Add coin directly to DB *)
+  Utxo.DbView.add_coin db_view outpoint coin ~possible_overwrite:false;
+  (* Create cache, verify coin exists *)
+  let cache = Utxo.UtxoCache.create db_view in
+  Alcotest.(check bool) "coin exists in db" true (Utxo.UtxoCache.have_coin cache outpoint);
+  (* Spend the coin (should mark as Erased since it's from DB) *)
+  let _ = Utxo.UtxoCache.spend_coin cache outpoint in
+  Alcotest.(check bool) "coin gone after spend" false (Utxo.UtxoCache.have_coin cache outpoint);
+  let stats = Utxo.UtxoCache.get_stats cache in
+  Alcotest.(check int) "erased count" 1 stats.erased_count;
+  (* Flush should propagate deletion to DB *)
+  let _ = Lwt_main.run (Utxo.UtxoCache.flush cache) in
+  (* Create fresh cache - coin should be gone from DB too *)
+  let cache2 = Utxo.UtxoCache.create db_view in
+  Alcotest.(check bool) "coin deleted from db" false (Utxo.UtxoCache.have_coin cache2 outpoint);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_utxo_cache_add_spend_roundtrip () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let db_view = Utxo.DbView.create db in
+  let cache = Utxo.UtxoCache.create db_view in
+  (* Simulate a transaction: add outputs, spend inputs *)
+  let input_outpoint = make_test_outpoint
+    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b" 0 in
+  let output_outpoint1 = make_test_outpoint
+    "0e3e2357e806b6cdb1f70b54c3a3a17b6714ee1f0e68bebb44a74b1efd512098" 0 in
+  let output_outpoint2 = make_test_outpoint
+    "0e3e2357e806b6cdb1f70b54c3a3a17b6714ee1f0e68bebb44a74b1efd512098" 1 in
+  let input_coin = make_test_coin 5000000000L 0 true in
+  let output_coin1 = make_test_coin 2500000000L 1 false in
+  let output_coin2 = make_test_coin 2499900000L 1 false in  (* 100000 sat fee *)
+  (* Add input UTXO (simulates previous block's output) *)
+  Utxo.UtxoCache.add_coin cache input_outpoint input_coin ~possible_overwrite:false;
+  (* Process transaction: spend input, add outputs *)
+  let spent = Utxo.UtxoCache.spend_coin cache input_outpoint in
+  Alcotest.(check bool) "input spent" true (Option.is_some spent);
+  Utxo.UtxoCache.add_coin cache output_outpoint1 output_coin1 ~possible_overwrite:false;
+  Utxo.UtxoCache.add_coin cache output_outpoint2 output_coin2 ~possible_overwrite:false;
+  (* Verify final state *)
+  Alcotest.(check bool) "input gone" false (Utxo.UtxoCache.have_coin cache input_outpoint);
+  Alcotest.(check bool) "output1 exists" true (Utxo.UtxoCache.have_coin cache output_outpoint1);
+  Alcotest.(check bool) "output2 exists" true (Utxo.UtxoCache.have_coin cache output_outpoint2);
+  (* Flush and verify persistence *)
+  let _ = Lwt_main.run (Utxo.UtxoCache.flush cache) in
+  let cache2 = Utxo.UtxoCache.create db_view in
+  Alcotest.(check bool) "input still gone" false (Utxo.UtxoCache.have_coin cache2 input_outpoint);
+  Alcotest.(check bool) "output1 persisted" true (Utxo.UtxoCache.have_coin cache2 output_outpoint1);
+  Alcotest.(check bool) "output2 persisted" true (Utxo.UtxoCache.have_coin cache2 output_outpoint2);
+  (* Verify values *)
+  let got1 = Option.get (Utxo.UtxoCache.get_coin cache2 output_outpoint1) in
+  let got2 = Option.get (Utxo.UtxoCache.get_coin cache2 output_outpoint2) in
+  Alcotest.(check int64) "output1 value" output_coin1.txout.value got1.txout.value;
+  Alcotest.(check int64) "output2 value" output_coin2.txout.value got2.txout.value;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_utxo_cache_memory_tracking () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let db_view = Utxo.DbView.create db in
+  (* Use small max_size to trigger flush threshold.
+     Each coin is ~77 bytes (tag + overhead + value + script + height + bool).
+     Use 500 bytes threshold so 10 coins (770 bytes) will exceed it. *)
+  let cache = Utxo.UtxoCache.create ~max_size:500 db_view in
+  Alcotest.(check int) "initial memory" 0 (Utxo.UtxoCache.memory_usage cache);
+  (* Add some coins *)
+  for i = 0 to 9 do
+    let outpoint = make_test_outpoint
+      (Printf.sprintf "%064x" i) 0 in
+    let coin = make_test_coin (Int64.of_int (i * 100000)) i false in
+    Utxo.UtxoCache.add_coin cache outpoint coin ~possible_overwrite:false
+  done;
+  let mem = Utxo.UtxoCache.memory_usage cache in
+  Alcotest.(check bool) "memory > 0 after adds" true (mem > 0);
+  Alcotest.(check bool) "memory > threshold" true (mem > 500);
+  (* Check needs_flush with small threshold *)
+  Alcotest.(check bool) "needs_flush with small threshold" true
+    (Utxo.UtxoCache.needs_flush cache);
+  (* maybe_flush should flush when needed *)
+  let flushed = Lwt_main.run (Utxo.UtxoCache.maybe_flush cache) in
+  Alcotest.(check int) "flushed 10 entries" 10 flushed;
+  Alcotest.(check int) "memory reset after flush" 0 (Utxo.UtxoCache.memory_usage cache);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_utxo_cache_hit_rate () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let db_view = Utxo.DbView.create db in
+  let cache = Utxo.UtxoCache.create db_view in
+  (* Add some coins *)
+  for i = 0 to 4 do
+    let outpoint = make_test_outpoint
+      (Printf.sprintf "%064x" i) 0 in
+    let coin = make_test_coin (Int64.of_int (i * 100000)) i false in
+    Utxo.UtxoCache.add_coin cache outpoint coin ~possible_overwrite:false
+  done;
+  (* All lookups should be hits *)
+  for i = 0 to 4 do
+    let outpoint = make_test_outpoint
+      (Printf.sprintf "%064x" i) 0 in
+    let _ = Utxo.UtxoCache.get_coin cache outpoint in
+    ()
+  done;
+  (* One miss for non-existent entry *)
+  let missing = make_test_outpoint
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" 99 in
+  let _ = Utxo.UtxoCache.get_coin cache missing in
+  let hit_rate = Utxo.UtxoCache.hit_rate cache in
+  (* 5 hits / 6 total = 0.833... *)
+  Alcotest.(check bool) "hit rate > 0.8" true (hit_rate > 0.8);
+  Alcotest.(check bool) "hit rate < 0.9" true (hit_rate < 0.9);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_coin_conversion () =
+  let entry = Utxo.{
+    value = 5000000000L;
+    script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac";
+    height = 100;
+    is_coinbase = true;
+  } in
+  let coin = Utxo.coin_of_utxo_entry entry in
+  Alcotest.(check int64) "coin value" entry.value coin.txout.value;
+  Alcotest.(check int) "coin height" entry.height coin.height;
+  Alcotest.(check bool) "coin is_coinbase" entry.is_coinbase coin.is_coinbase;
+  let entry2 = Utxo.utxo_entry_of_coin coin in
+  Alcotest.(check int64) "roundtrip value" entry.value entry2.value;
+  Alcotest.(check int) "roundtrip height" entry.height entry2.height;
+  Alcotest.(check bool) "roundtrip is_coinbase" entry.is_coinbase entry2.is_coinbase
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -601,5 +868,16 @@ let () =
     ];
     "stats", [
       test_case "utxo statistics" `Quick test_utxo_stats;
+    ];
+    "utxo_cache", [
+      test_case "add and get" `Quick test_utxo_cache_add_get;
+      test_case "miss then hit" `Quick test_utxo_cache_miss_then_hit;
+      test_case "spend" `Quick test_utxo_cache_spend;
+      test_case "flush" `Quick test_utxo_cache_flush;
+      test_case "flush erased" `Quick test_utxo_cache_flush_erased;
+      test_case "add/spend roundtrip" `Quick test_utxo_cache_add_spend_roundtrip;
+      test_case "memory tracking" `Quick test_utxo_cache_memory_tracking;
+      test_case "hit rate" `Quick test_utxo_cache_hit_rate;
+      test_case "coin conversion" `Quick test_coin_conversion;
     ];
   ]

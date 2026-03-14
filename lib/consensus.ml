@@ -173,6 +173,7 @@ type network_config = {
   bip34_height : int;  (* Height at which BIP34 activated *)
   bip65_height : int;  (* Height at which BIP65 (CLTV) activated *)
   bip66_height : int;  (* Height at which BIP66 (strict DER) activated *)
+  csv_height : int;  (* Height at which BIP68/112/113 (CSV) activated *)
   segwit_height : int;  (* Height at which SegWit activated *)
   taproot_height : int;  (* Height at which Taproot activated *)
   pow_allow_min_difficulty : bool;  (* Allow min difficulty blocks (testnet) *)
@@ -316,6 +317,7 @@ let mainnet : network_config = {
   bip34_height = 227931;
   bip65_height = 388381;
   bip66_height = 363725;
+  csv_height = 419328;
   segwit_height = 481824;
   taproot_height = 709632;
   pow_allow_min_difficulty = false;
@@ -374,6 +376,7 @@ let testnet : network_config = {
   bip34_height = 21111;
   bip65_height = 581885;
   bip66_height = 330776;
+  csv_height = 770112;
   segwit_height = 834624;
   taproot_height = 2_032_291;
   pow_allow_min_difficulty = true;
@@ -408,6 +411,7 @@ let regtest : network_config = {
   bip34_height = 500;
   bip65_height = 1351;
   bip66_height = 1251;
+  csv_height = 432;  (* CSV active early in regtest for testing *)
   segwit_height = 0;  (* SegWit active from genesis *)
   taproot_height = 0;  (* Taproot active from genesis *)
   pow_allow_min_difficulty = true;
@@ -494,6 +498,7 @@ let script_verify_minimaldata           = 1 lsl 5   (* BIP-62 minimal push *)
 let script_verify_sigpushonly           = 1 lsl 6   (* scriptSig push-only *)
 let script_verify_cleanstack            = 1 lsl 7   (* exactly one stack element *)
 let script_verify_checklocktimeverify   = 1 lsl 9   (* BIP-65 *)
+let script_verify_checksequenceverify   = 1 lsl 10  (* BIP-68/112 *)
 let script_verify_witness               = 1 lsl 11  (* BIP-141 *)
 let script_verify_nullfail              = 1 lsl 12  (* BIP-146 *)
 let script_verify_witness_pubkeytype    = 1 lsl 14  (* BIP-141 compressed keys *)
@@ -512,6 +517,11 @@ let get_block_script_flags (height : int) (network : network_config) : int =
   (* BIP-65: OP_CHECKLOCKTIMEVERIFY *)
   let flags =
     if height >= network.bip65_height then flags lor script_verify_checklocktimeverify
+    else flags
+  in
+  (* BIP-68/112/113: OP_CHECKSEQUENCEVERIFY and sequence locks *)
+  let flags =
+    if height >= network.csv_height then flags lor script_verify_checksequenceverify
     else flags
   in
   (* SegWit (BIP-141) and associated rules *)

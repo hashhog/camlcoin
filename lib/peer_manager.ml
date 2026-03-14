@@ -395,6 +395,30 @@ let ban_addr (pm : t) (addr : string) ?(duration = 86400.0) () : unit =
         banned_until = Unix.gettimeofday () +. duration;
         source = Addr }
 
+(* Unban an address *)
+let unban_addr (pm : t) (addr : string) : unit =
+  match Hashtbl.find_opt pm.known_addrs addr with
+  | Some info ->
+    Hashtbl.replace pm.known_addrs addr { info with banned_until = 0.0 }
+  | None -> ()
+
+(* Clear all bans *)
+let clear_bans (pm : t) : unit =
+  Hashtbl.iter (fun addr info ->
+    if info.banned_until > 0.0 then
+      Hashtbl.replace pm.known_addrs addr { info with banned_until = 0.0 }
+  ) pm.known_addrs
+
+(* Get list of all banned addresses with expiry times *)
+let get_banned_list (pm : t) : (string * float) list =
+  let now = Unix.gettimeofday () in
+  Hashtbl.fold (fun addr info acc ->
+    if info.banned_until > now then
+      (addr, info.banned_until) :: acc
+    else
+      acc
+  ) pm.known_addrs []
+
 (* Record misbehavior for a peer.  Bans the peer if accumulated score >= 100. *)
 let record_peer_misbehavior (pm : t) (peer_id : int) (score : int)
     (_reason : string) : unit Lwt.t =
@@ -1001,6 +1025,74 @@ let load_bans (pm : t) (db : Storage.ChainDB.t) : int =
     end
   );
   !count
+
+(* Save bans to JSON file (banlist.json) *)
+let save_bans_json (pm : t) (filepath : string) : unit =
+  let now = Unix.gettimeofday () in
+  let bans = Hashtbl.fold (fun addr info acc ->
+    if info.banned_until > now then
+      `Assoc [
+        ("address", `String addr);
+        ("banned_until", `Float info.banned_until);
+      ] :: acc
+    else
+      acc
+  ) pm.known_addrs [] in
+  let json = `List bans in
+  let oc = open_out filepath in
+  output_string oc (Yojson.Safe.pretty_to_string json);
+  close_out oc
+
+(* Load bans from JSON file (banlist.json) *)
+let load_bans_json (pm : t) (filepath : string) : int =
+  if not (Sys.file_exists filepath) then
+    0
+  else begin
+    let now = Unix.gettimeofday () in
+    let count = ref 0 in
+    try
+      let ic = open_in filepath in
+      let content = really_input_string ic (in_channel_length ic) in
+      close_in ic;
+      let json = Yojson.Safe.from_string content in
+      (match json with
+       | `List entries ->
+         List.iter (fun entry ->
+           match entry with
+           | `Assoc fields ->
+             let addr = match List.assoc_opt "address" fields with
+               | Some (`String a) -> Some a
+               | _ -> None
+             in
+             let banned_until = match List.assoc_opt "banned_until" fields with
+               | Some (`Float f) -> Some f
+               | Some (`Int i) -> Some (float_of_int i)
+               | _ -> None
+             in
+             (match addr, banned_until with
+              | Some a, Some bu when bu > now ->
+                (match Hashtbl.find_opt pm.known_addrs a with
+                 | Some info ->
+                   Hashtbl.replace pm.known_addrs a
+                     { info with banned_until = bu }
+                 | None ->
+                   Hashtbl.replace pm.known_addrs a
+                     { address = a;
+                       port = 0;
+                       services = 0L;
+                       last_connected = 0.0;
+                       last_attempt = 0.0;
+                       failures = 0;
+                       banned_until = bu;
+                       source = Addr });
+                incr count
+              | _ -> ())
+           | _ -> ()
+         ) entries
+       | _ -> ());
+      !count
+    with _ -> 0
+  end
 
 (* Find peer by address *)
 let find_peer_by_addr (pm : t) (addr : string) : Peer.peer option =

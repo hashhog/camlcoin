@@ -1062,6 +1062,216 @@ let round5_tests = [
   Alcotest.test_case "PUSHDATA serialize roundtrip (direct)" `Quick test_pushdata_direct_serialize_roundtrip;
 ]
 
+(* ============================================================================
+   WITNESS_PUBKEYTYPE Tests (BIP-141)
+   ============================================================================ *)
+
+(* Test that WITNESS_PUBKEYTYPE flag exists and has correct value *)
+let test_witness_pubkeytype_flag_exists () =
+  Alcotest.(check bool) "flag is non-zero" true
+    (Script.script_verify_witness_pubkeytype <> 0)
+
+let test_witness_pubkeytype_flag_value () =
+  Alcotest.(check int) "flag is 1 lsl 14" (1 lsl 14)
+    Script.script_verify_witness_pubkeytype
+
+(* Test that WITNESS_PUBKEYTYPE is enabled at SegWit height for mainnet *)
+let test_witness_pubkeytype_enabled_at_segwit_height () =
+  let network = Consensus.mainnet in
+  let flags = Consensus.get_block_script_flags network.segwit_height network in
+  let has_flag = flags land Script.script_verify_witness_pubkeytype <> 0 in
+  Alcotest.(check bool) "WITNESS_PUBKEYTYPE enabled at SegWit height" true has_flag
+
+(* Test that WITNESS_PUBKEYTYPE is NOT enabled before SegWit height *)
+let test_witness_pubkeytype_disabled_before_segwit () =
+  let network = Consensus.mainnet in
+  let flags = Consensus.get_block_script_flags (network.segwit_height - 1) network in
+  let has_flag = flags land Script.script_verify_witness_pubkeytype <> 0 in
+  Alcotest.(check bool) "WITNESS_PUBKEYTYPE disabled before SegWit" false has_flag
+
+(* Test is_compressed_pubkey helper function *)
+let test_is_compressed_pubkey_02_prefix () =
+  (* 33-byte pubkey with 0x02 prefix - should be valid *)
+  let pubkey = hex_to_cstruct ("02" ^ String.make 64 'a') in
+  Alcotest.(check bool) "02 prefix compressed" true (Script.is_compressed_pubkey pubkey)
+
+let test_is_compressed_pubkey_03_prefix () =
+  (* 33-byte pubkey with 0x03 prefix - should be valid *)
+  let pubkey = hex_to_cstruct ("03" ^ String.make 64 'b') in
+  Alcotest.(check bool) "03 prefix compressed" true (Script.is_compressed_pubkey pubkey)
+
+let test_is_compressed_pubkey_04_prefix_rejected () =
+  (* 65-byte pubkey with 0x04 prefix - uncompressed, should be rejected *)
+  let pubkey = hex_to_cstruct ("04" ^ String.make 128 'c') in
+  Alcotest.(check bool) "04 prefix uncompressed" false (Script.is_compressed_pubkey pubkey)
+
+let test_is_compressed_pubkey_wrong_length () =
+  (* 32-byte key with 0x02 prefix - wrong length *)
+  let pubkey = hex_to_cstruct ("02" ^ String.make 62 'd') in
+  Alcotest.(check bool) "wrong length" false (Script.is_compressed_pubkey pubkey)
+
+let test_is_compressed_pubkey_empty () =
+  (* Empty pubkey *)
+  let pubkey = Cstruct.create 0 in
+  Alcotest.(check bool) "empty" false (Script.is_compressed_pubkey pubkey)
+
+let test_is_compressed_pubkey_wrong_prefix () =
+  (* 33-byte key with invalid prefix (0x05) *)
+  let pubkey = hex_to_cstruct ("05" ^ String.make 64 'e') in
+  Alcotest.(check bool) "wrong prefix" false (Script.is_compressed_pubkey pubkey)
+
+(* Test P2WPKH with uncompressed pubkey (65 bytes, 0x04 prefix) is rejected *)
+let test_p2wpkh_uncompressed_pubkey_rejected () =
+  let tx = make_test_tx () in
+  (* Create a 65-byte uncompressed pubkey (0x04 prefix) *)
+  let uncompressed_pubkey = hex_to_cstruct ("04" ^ String.make 128 'f') in
+  (* Compute P2WPKH program from uncompressed pubkey hash *)
+  let pubkey_hash = Crypto.hash160 uncompressed_pubkey in
+  (* P2WPKH script: OP_0 <20-byte hash> *)
+  let script_pubkey_bytes =
+    let w = Serialize.writer_create () in
+    Serialize.write_uint8 w 0x00;  (* OP_0 *)
+    Serialize.write_uint8 w 0x14;  (* push 20 bytes *)
+    Serialize.write_bytes w pubkey_hash;
+    Serialize.writer_to_cstruct w
+  in
+  (* Dummy signature (will fail sig check, but we're testing pubkey validation) *)
+  let dummy_sig = hex_to_cstruct "30060201010201010001" in
+  let witness = { Types.items = [dummy_sig; uncompressed_pubkey] } in
+  let flags = Script.script_verify_witness lor Script.script_verify_witness_pubkeytype in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey:script_pubkey_bytes
+          ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
+  | Error msg ->
+    (* Should fail with WITNESS_PUBKEYTYPE error *)
+    let contains_compressed = String.lowercase_ascii msg |> fun s ->
+      let rec check i =
+        if i + 10 > String.length s then false
+        else if String.sub s i 10 = "compressed" then true
+        else check (i + 1)
+      in check 0
+    in
+    if not contains_compressed then
+      Alcotest.fail ("Expected compressed pubkey error, got: " ^ msg)
+  | Ok _ -> Alcotest.fail "Uncompressed pubkey should be rejected with WITNESS_PUBKEYTYPE"
+
+(* Test P2WPKH with compressed pubkey (33 bytes, 0x02 prefix) is allowed *)
+let test_p2wpkh_compressed_pubkey_allowed () =
+  let tx = make_test_tx () in
+  (* Create a 33-byte compressed pubkey (0x02 prefix) *)
+  let compressed_pubkey = hex_to_cstruct ("02" ^ String.make 64 'a') in
+  (* Compute P2WPKH program from compressed pubkey hash *)
+  let pubkey_hash = Crypto.hash160 compressed_pubkey in
+  (* P2WPKH script: OP_0 <20-byte hash> *)
+  let script_pubkey_bytes =
+    let w = Serialize.writer_create () in
+    Serialize.write_uint8 w 0x00;  (* OP_0 *)
+    Serialize.write_uint8 w 0x14;  (* push 20 bytes *)
+    Serialize.write_bytes w pubkey_hash;
+    Serialize.writer_to_cstruct w
+  in
+  (* Dummy signature (will fail sig check, but key should pass pubkey type check) *)
+  let dummy_sig = hex_to_cstruct "30060201010201010001" in
+  let witness = { Types.items = [dummy_sig; compressed_pubkey] } in
+  let flags = Script.script_verify_witness lor Script.script_verify_witness_pubkeytype in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey:script_pubkey_bytes
+          ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
+  | Error msg ->
+    (* The sig check will fail, but the error should NOT be about compressed pubkey *)
+    let contains_compressed = String.lowercase_ascii msg |> fun s ->
+      let rec check i =
+        if i + 10 > String.length s then false
+        else if String.sub s i 10 = "compressed" then true
+        else check (i + 1)
+      in check 0
+    in
+    if contains_compressed then
+      Alcotest.fail ("Compressed pubkey should pass, but got error: " ^ msg)
+    (* Else: sig check failed as expected, which is fine *)
+  | Ok false ->
+    (* Script executed but returned false (sig check failed) - expected *)
+    ()
+  | Ok true ->
+    (* Unexpected success - but technically fine for pubkeytype check *)
+    ()
+
+(* Test P2WPKH with wrong prefix (33 bytes, 0x05 prefix) is rejected *)
+let test_p2wpkh_wrong_prefix_rejected () =
+  let tx = make_test_tx () in
+  (* Create a 33-byte key with invalid prefix (0x05) *)
+  let bad_pubkey = hex_to_cstruct ("05" ^ String.make 64 'b') in
+  let pubkey_hash = Crypto.hash160 bad_pubkey in
+  let script_pubkey_bytes =
+    let w = Serialize.writer_create () in
+    Serialize.write_uint8 w 0x00;
+    Serialize.write_uint8 w 0x14;
+    Serialize.write_bytes w pubkey_hash;
+    Serialize.writer_to_cstruct w
+  in
+  let dummy_sig = hex_to_cstruct "30060201010201010001" in
+  let witness = { Types.items = [dummy_sig; bad_pubkey] } in
+  let flags = Script.script_verify_witness lor Script.script_verify_witness_pubkeytype in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey:script_pubkey_bytes
+          ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
+  | Error msg ->
+    let contains_compressed = String.lowercase_ascii msg |> fun s ->
+      let rec check i =
+        if i + 10 > String.length s then false
+        else if String.sub s i 10 = "compressed" then true
+        else check (i + 1)
+      in check 0
+    in
+    if not contains_compressed then
+      Alcotest.fail ("Expected compressed pubkey error, got: " ^ msg)
+  | Ok _ -> Alcotest.fail "Wrong prefix pubkey should be rejected with WITNESS_PUBKEYTYPE"
+
+(* Test P2WPKH without WITNESS_PUBKEYTYPE flag allows uncompressed pubkeys *)
+let test_p2wpkh_uncompressed_allowed_without_flag () =
+  let tx = make_test_tx () in
+  let uncompressed_pubkey = hex_to_cstruct ("04" ^ String.make 128 'c') in
+  let pubkey_hash = Crypto.hash160 uncompressed_pubkey in
+  let script_pubkey_bytes =
+    let w = Serialize.writer_create () in
+    Serialize.write_uint8 w 0x00;
+    Serialize.write_uint8 w 0x14;
+    Serialize.write_bytes w pubkey_hash;
+    Serialize.writer_to_cstruct w
+  in
+  let dummy_sig = hex_to_cstruct "30060201010201010001" in
+  let witness = { Types.items = [dummy_sig; uncompressed_pubkey] } in
+  (* Only WITNESS flag, no WITNESS_PUBKEYTYPE *)
+  let flags = Script.script_verify_witness in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey:script_pubkey_bytes
+          ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
+  | Error msg ->
+    let contains_compressed = String.lowercase_ascii msg |> fun s ->
+      let rec check i =
+        if i + 10 > String.length s then false
+        else if String.sub s i 10 = "compressed" then true
+        else check (i + 1)
+      in check 0
+    in
+    if contains_compressed then
+      Alcotest.fail ("Without WITNESS_PUBKEYTYPE flag, should not error on compressed: " ^ msg)
+    (* Other errors (like sig failure) are expected *)
+  | Ok _ -> ()  (* Success or false without WITNESS_PUBKEYTYPE is fine *)
+
+let witness_pubkeytype_tests = [
+  Alcotest.test_case "WITNESS_PUBKEYTYPE flag exists" `Quick test_witness_pubkeytype_flag_exists;
+  Alcotest.test_case "WITNESS_PUBKEYTYPE flag value is 1 lsl 14" `Quick test_witness_pubkeytype_flag_value;
+  Alcotest.test_case "WITNESS_PUBKEYTYPE enabled at SegWit height" `Quick test_witness_pubkeytype_enabled_at_segwit_height;
+  Alcotest.test_case "WITNESS_PUBKEYTYPE disabled before SegWit" `Quick test_witness_pubkeytype_disabled_before_segwit;
+  Alcotest.test_case "is_compressed_pubkey 02 prefix" `Quick test_is_compressed_pubkey_02_prefix;
+  Alcotest.test_case "is_compressed_pubkey 03 prefix" `Quick test_is_compressed_pubkey_03_prefix;
+  Alcotest.test_case "is_compressed_pubkey 04 prefix rejected" `Quick test_is_compressed_pubkey_04_prefix_rejected;
+  Alcotest.test_case "is_compressed_pubkey wrong length" `Quick test_is_compressed_pubkey_wrong_length;
+  Alcotest.test_case "is_compressed_pubkey empty" `Quick test_is_compressed_pubkey_empty;
+  Alcotest.test_case "is_compressed_pubkey wrong prefix" `Quick test_is_compressed_pubkey_wrong_prefix;
+  Alcotest.test_case "P2WPKH uncompressed pubkey rejected" `Quick test_p2wpkh_uncompressed_pubkey_rejected;
+  Alcotest.test_case "P2WPKH compressed pubkey allowed" `Quick test_p2wpkh_compressed_pubkey_allowed;
+  Alcotest.test_case "P2WPKH wrong prefix rejected" `Quick test_p2wpkh_wrong_prefix_rejected;
+  Alcotest.test_case "P2WPKH uncompressed allowed without flag" `Quick test_p2wpkh_uncompressed_allowed_without_flag;
+]
+
 let () = Alcotest.run "test_script" [
   ("script_num", script_num_tests);
   ("parsing", parsing_tests);
@@ -1076,4 +1286,5 @@ let () = Alcotest.run "test_script" [
   ("round5_phase1", round5_tests);
   ("bug7_8_9", bug7_8_9_tests);
   ("nullfail", nullfail_tests);
+  ("witness_pubkeytype", witness_pubkeytype_tests);
 ]

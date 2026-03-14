@@ -44,6 +44,10 @@ type command =
   | Wtxidrelay
   | Sendaddrv2
   | Alert
+  (* BIP 331: Package Relay *)
+  | Sendpackages
+  | Getpkgtxns
+  | Pkgtxns
   | Unknown of string
 
 let command_to_string = function
@@ -72,6 +76,9 @@ let command_to_string = function
   | Wtxidrelay -> "wtxidrelay"
   | Sendaddrv2 -> "sendaddrv2"
   | Alert -> "alert"
+  | Sendpackages -> "sendpackages"
+  | Getpkgtxns -> "getpkgtxns"
+  | Pkgtxns -> "pkgtxns"
   | Unknown s -> s
 
 let command_of_string s =
@@ -101,6 +108,9 @@ let command_of_string s =
   | "wtxidrelay" -> Wtxidrelay
   | "sendaddrv2" -> Sendaddrv2
   | "alert" -> Alert
+  | "sendpackages" -> Sendpackages
+  | "getpkgtxns" -> Getpkgtxns
+  | "pkgtxns" -> Pkgtxns
   | other -> Unknown other
 
 (* Inventory vector types *)
@@ -199,6 +209,28 @@ type block_txns = {
   txs : Types.transaction list;
 }
 
+(* BIP 331: Package Relay Types *)
+
+(* Package relay version *)
+let package_relay_version = 1L
+
+(* sendpackages message: announce package relay support *)
+type sendpackages_msg = {
+  pkg_version : int64;       (* package relay protocol version *)
+  pkg_max_count : int32;     (* max transactions in a package *)
+  pkg_max_weight : int32;    (* max package weight *)
+}
+
+(* getpkgtxns: request transactions for a package by wtxids *)
+type getpkgtxns_msg = {
+  pkg_wtxids : Types.hash256 list;  (* wtxids of requested transactions *)
+}
+
+(* pkgtxns: response with package transactions *)
+type pkgtxns_msg = {
+  pkg_txs : Types.transaction list;  (* transactions in topological order *)
+}
+
 (* Message payload types *)
 type message_payload =
   | VersionMsg of Types.version_msg
@@ -238,6 +270,10 @@ type message_payload =
   | FeefilterMsg of int64
   | WtxidrelayMsg
   | SendaddrV2Msg
+  (* BIP 331: Package Relay *)
+  | SendpackagesMsg of sendpackages_msg
+  | GetpkgtxnsMsg of getpkgtxns_msg
+  | PkgtxnsMsg of pkgtxns_msg
   | UnknownMsg of { cmd : string; payload : Cstruct.t }
 
 type message = {
@@ -417,6 +453,51 @@ let deserialize_block_txns r : block_txns =
   let txs = List.init count (fun _ -> Serialize.deserialize_transaction r) in
   { block_hash; txs }
 
+(* ============================================================================
+   BIP 331: Package Relay Serialization
+   ============================================================================ *)
+
+let max_package_txs = 25  (* Maximum transactions in a package *)
+
+(* Serialize sendpackages message *)
+let serialize_sendpackages w (msg : sendpackages_msg) =
+  Serialize.write_int64_le w msg.pkg_version;
+  Serialize.write_int32_le w msg.pkg_max_count;
+  Serialize.write_int32_le w msg.pkg_max_weight
+
+(* Deserialize sendpackages message *)
+let deserialize_sendpackages r : sendpackages_msg =
+  let pkg_version = Serialize.read_int64_le r in
+  let pkg_max_count = Serialize.read_int32_le r in
+  let pkg_max_weight = Serialize.read_int32_le r in
+  { pkg_version; pkg_max_count; pkg_max_weight }
+
+(* Serialize getpkgtxns message *)
+let serialize_getpkgtxns w (msg : getpkgtxns_msg) =
+  Serialize.write_compact_size w (List.length msg.pkg_wtxids);
+  List.iter (Serialize.write_bytes w) msg.pkg_wtxids
+
+(* Deserialize getpkgtxns message *)
+let deserialize_getpkgtxns r : getpkgtxns_msg =
+  let count = Serialize.read_compact_size r in
+  if count > max_package_txs then
+    failwith "package wtxid count exceeds maximum";
+  let pkg_wtxids = List.init count (fun _ -> Serialize.read_bytes r 32) in
+  { pkg_wtxids }
+
+(* Serialize pkgtxns message *)
+let serialize_pkgtxns w (msg : pkgtxns_msg) =
+  Serialize.write_compact_size w (List.length msg.pkg_txs);
+  List.iter (Serialize.serialize_transaction w) msg.pkg_txs
+
+(* Deserialize pkgtxns message *)
+let deserialize_pkgtxns r : pkgtxns_msg =
+  let count = Serialize.read_compact_size r in
+  if count > max_package_txs then
+    failwith "package transaction count exceeds maximum";
+  let pkg_txs = List.init count (fun _ -> Serialize.deserialize_transaction r) in
+  { pkg_txs }
+
 (* Unified payload serialization *)
 let serialize_payload w = function
   | VersionMsg v -> Serialize.serialize_version_msg w v
@@ -454,6 +535,9 @@ let serialize_payload w = function
     Serialize.write_int64_le w feerate
   | WtxidrelayMsg -> ()
   | SendaddrV2Msg -> ()
+  | SendpackagesMsg msg -> serialize_sendpackages w msg
+  | GetpkgtxnsMsg msg -> serialize_getpkgtxns w msg
+  | PkgtxnsMsg msg -> serialize_pkgtxns w msg
   | RejectMsg { message; ccode; reason; data } ->
     Serialize.write_string w message;
     Serialize.write_uint8 w ccode;
@@ -487,6 +571,9 @@ let payload_to_command = function
   | FeefilterMsg _ -> Feefilter
   | WtxidrelayMsg -> Wtxidrelay
   | SendaddrV2Msg -> Sendaddrv2
+  | SendpackagesMsg _ -> Sendpackages
+  | GetpkgtxnsMsg _ -> Getpkgtxns
+  | PkgtxnsMsg _ -> Pkgtxns
   | UnknownMsg { cmd; _ } -> Unknown cmd
 
 let serialize_message (magic : int32) (payload : message_payload)
@@ -546,6 +633,9 @@ let deserialize_payload (cmd : command) (r : Serialize.reader)
   | Feefilter -> FeefilterMsg (Serialize.read_int64_le r)
   | Wtxidrelay -> WtxidrelayMsg
   | Sendaddrv2 -> SendaddrV2Msg
+  | Sendpackages -> SendpackagesMsg (deserialize_sendpackages r)
+  | Getpkgtxns -> GetpkgtxnsMsg (deserialize_getpkgtxns r)
+  | Pkgtxns -> PkgtxnsMsg (deserialize_pkgtxns r)
   | Reject ->
     let message = Serialize.read_string r in
     let ccode = Serialize.read_uint8 r in
@@ -814,3 +904,30 @@ let make_getblocktxn_msg (req : block_txns_request) : message_payload =
 (* Create blocktxn message *)
 let make_blocktxn_msg (resp : block_txns) : message_payload =
   BlocktxnMsg resp
+
+(* ============================================================================
+   BIP 331: Package Relay Message Helpers
+   ============================================================================ *)
+
+(* Default package relay parameters *)
+let default_pkg_max_count = 25l
+let default_pkg_max_weight = 404_000l
+
+(* Create sendpackages message to announce package relay support *)
+let make_sendpackages_msg
+    ?(max_count = default_pkg_max_count)
+    ?(max_weight = default_pkg_max_weight)
+    () : message_payload =
+  SendpackagesMsg {
+    pkg_version = package_relay_version;
+    pkg_max_count = max_count;
+    pkg_max_weight = max_weight;
+  }
+
+(* Create getpkgtxns message to request package transactions by wtxid *)
+let make_getpkgtxns_msg (wtxids : Types.hash256 list) : message_payload =
+  GetpkgtxnsMsg { pkg_wtxids = wtxids }
+
+(* Create pkgtxns message with package transactions in topological order *)
+let make_pkgtxns_msg (txs : Types.transaction list) : message_payload =
+  PkgtxnsMsg { pkg_txs = txs }

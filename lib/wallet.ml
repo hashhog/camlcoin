@@ -817,12 +817,14 @@ let sign_transaction_inputs (w : t) (tx : Types.transaction)
     let script_type = Script.classify_script wutxo.utxo.Utxo.script_pubkey in
     match script_type with
     | Script.P2TR_script _ ->
-      (* Taproot key-path spend *)
+      (* Taproot key-path spend with BIP-341 tweaked key *)
       let prevouts = List.map (fun wu ->
         (wu.utxo.Utxo.value, wu.utxo.Utxo.script_pubkey)
       ) input_utxos in
       let sighash = Script.compute_sighash_taproot tx i prevouts 0x00 () in
-      let sig_bytes = Crypto.schnorr_sign ~privkey:kp.private_key ~msg:sighash in
+      let xonly_pk = Crypto.derive_xonly_pubkey kp.private_key in
+      let tweak = Crypto.compute_taptweak_keypath xonly_pk in
+      let sig_bytes = Crypto.schnorr_sign_tweaked ~privkey:kp.private_key ~tweak ~msg:sighash in
       (* SIGHASH_DEFAULT (0x00): no suffix byte *)
       (inp, { Types.items = [sig_bytes] })
     | Script.P2WPKH_script _ ->

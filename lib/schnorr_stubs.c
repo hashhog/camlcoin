@@ -124,6 +124,47 @@ CAMLprim value caml_schnorr_sign(value v_seckey, value v_msg) {
     CAMLreturn(result);
 }
 
+/* caml_schnorr_sign_tweaked(seckey_32bytes, tweak_32bytes, msg_32bytes) -> bigarray(64 bytes)
+   Creates a keypair, applies the BIP-341 taproot tweak, then signs. */
+CAMLprim value caml_schnorr_sign_tweaked(value v_seckey, value v_tweak, value v_msg) {
+    CAMLparam3(v_seckey, v_tweak, v_msg);
+    ensure_ctx();
+
+    unsigned char *sk_data = (unsigned char *)Caml_ba_data_val(v_seckey);
+    unsigned char *tweak_data = (unsigned char *)Caml_ba_data_val(v_tweak);
+    unsigned char *msg_data = (unsigned char *)Caml_ba_data_val(v_msg);
+
+    secp256k1_keypair keypair;
+    if (!secp256k1_keypair_create(schnorr_ctx, &keypair, sk_data)) {
+        caml_failwith("caml_schnorr_sign_tweaked: invalid secret key");
+    }
+
+    /* Apply the taproot tweak to the keypair (handles parity internally) */
+    if (!secp256k1_keypair_xonly_tweak_add(schnorr_ctx, &keypair, tweak_data)) {
+        caml_failwith("caml_schnorr_sign_tweaked: tweak failed");
+    }
+
+    /* Read 32 bytes of auxiliary randomness */
+    unsigned char aux_rand[32];
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f == NULL || fread(aux_rand, 1, 32, f) != 32) {
+        if (f) fclose(f);
+        caml_failwith("caml_schnorr_sign_tweaked: failed to read /dev/urandom");
+    }
+    fclose(f);
+
+    unsigned char sig64[64];
+    if (!secp256k1_schnorrsig_sign32(schnorr_ctx, sig64, msg_data, &keypair, aux_rand)) {
+        caml_failwith("caml_schnorr_sign_tweaked: signing failed");
+    }
+
+    long dims[1] = { 64 };
+    value result = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL, dims);
+    unsigned char *result_data = (unsigned char *)Caml_ba_data_val(result);
+    memcpy(result_data, sig64, 64);
+    CAMLreturn(result);
+}
+
 /* caml_derive_xonly_pubkey(seckey_32bytes) -> bigarray(32 bytes) */
 CAMLprim value caml_derive_xonly_pubkey(value v_seckey) {
     CAMLparam1(v_seckey);

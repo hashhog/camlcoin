@@ -140,6 +140,77 @@ let test_ping_timing () =
      tested indirectly through integration tests *)
   ()
 
+(* Test misbehavior scoring categories *)
+let test_misbehavior_scores () =
+  Alcotest.(check int) "invalid_block = 100" 100
+    Peer.misbehavior_invalid_block;
+  Alcotest.(check int) "invalid_header = 20" 20
+    Peer.misbehavior_invalid_header;
+  Alcotest.(check int) "oversized_message = 20" 20
+    Peer.misbehavior_oversized_message;
+  Alcotest.(check int) "bad_tx = 10" 10
+    Peer.misbehavior_bad_tx;
+  Alcotest.(check int) "spam = 5" 5
+    Peer.misbehavior_spam
+
+(* Test record_misbehavior accumulation *)
+let test_record_misbehavior_accumulation () =
+  (* Create a dummy peer for testing *)
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  (* Initial score is 0 *)
+  let stats = Peer.get_stats peer in
+  Alcotest.(check int) "initial score" 0 stats.stat_misbehavior;
+  (* Add 10 points *)
+  let result = Peer.record_misbehavior peer 10 in
+  Alcotest.(check bool) "not banned at 10" true (result = `Ok);
+  let stats = Peer.get_stats peer in
+  Alcotest.(check int) "score = 10" 10 stats.stat_misbehavior;
+  (* Add 50 more points *)
+  let result = Peer.record_misbehavior peer 50 in
+  Alcotest.(check bool) "not banned at 60" true (result = `Ok);
+  let stats = Peer.get_stats peer in
+  Alcotest.(check int) "score = 60" 60 stats.stat_misbehavior;
+  (* Add 40 more points - should trigger ban at 100 *)
+  let result = Peer.record_misbehavior peer 40 in
+  Alcotest.(check bool) "banned at 100" true (result = `Ban);
+  let stats = Peer.get_stats peer in
+  Alcotest.(check int) "score = 100" 100 stats.stat_misbehavior
+
+(* Test record_misbehavior_for categories *)
+let test_record_misbehavior_for () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  (* Test invalid_block triggers immediate ban *)
+  let result = Peer.record_misbehavior_for peer "invalid_block" in
+  Alcotest.(check bool) "banned for invalid_block" true (result = `Ban);
+  let stats = Peer.get_stats peer in
+  Alcotest.(check int) "score = 100" 100 stats.stat_misbehavior
+
+(* Test record_misbehavior_for unknown infraction *)
+let test_record_misbehavior_for_unknown () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  (* Unknown infraction adds 1 point *)
+  let result = Peer.record_misbehavior_for peer "something_weird" in
+  Alcotest.(check bool) "not banned for unknown" true (result = `Ok);
+  let stats = Peer.get_stats peer in
+  Alcotest.(check int) "score = 1" 1 stats.stat_misbehavior
+
+(* Test peer_info includes misbehavior score *)
+let test_peer_info_misbehavior () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  let _ = Peer.record_misbehavior peer 42 in
+  let info = Peer.peer_info peer in
+  (* Check that the info string contains misb=42 somewhere *)
+  Alcotest.(check bool) "info contains misb=42" true
+    (Astring.String.is_infix ~affix:"misb=42" info)
+
 (* All tests *)
 let () =
   Alcotest.run "Peer" [
@@ -161,5 +232,12 @@ let () =
     "ping_pong", [
       Alcotest.test_case "handle_pong" `Quick test_handle_pong;
       Alcotest.test_case "ping_timing" `Quick test_ping_timing;
+    ];
+    "misbehavior", [
+      Alcotest.test_case "scores" `Quick test_misbehavior_scores;
+      Alcotest.test_case "accumulation" `Quick test_record_misbehavior_accumulation;
+      Alcotest.test_case "for_category" `Quick test_record_misbehavior_for;
+      Alcotest.test_case "for_unknown" `Quick test_record_misbehavior_for_unknown;
+      Alcotest.test_case "peer_info_misbehavior" `Quick test_peer_info_misbehavior;
     ];
   ]

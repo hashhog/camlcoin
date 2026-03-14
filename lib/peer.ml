@@ -78,6 +78,11 @@ let inbound_inv_broadcast_interval = 5.0   (* Average 5 seconds for inbound peer
 let outbound_inv_broadcast_interval = 2.0  (* Average 2 seconds for outbound peers *)
 let max_inv_per_flush = 1000               (* Maximum inventory entries per flush *)
 
+(* Feefilter constants - match Bitcoin Core net_processing.cpp *)
+let avg_feefilter_broadcast_interval = 600.0   (* Average 10 minutes between broadcasts *)
+let max_feefilter_change_delay = 300.0         (* 5 minutes max delay after significant change *)
+let feefilter_version = 70013l                 (* Minimum protocol version for feefilter *)
+
 (* Minimum protocol version required (post-segwit) *)
 let min_protocol_version = 70015l
 
@@ -116,7 +121,10 @@ type peer = {
   mutable sendaddrv2 : bool;     (* Peer requested sendaddrv2 *)
   mutable misbehavior_score : int; (* Accumulated misbehavior score; ban at >= 100 *)
   direction : peer_direction;    (* Inbound or outbound connection *)
-  mutable feefilter : int64;     (* Minimum fee rate (sat/kB) advertised by peer *)
+  mutable feefilter : int64;     (* Minimum fee rate (sat/kvB) advertised by peer *)
+  mutable fee_filter_sent : int64;  (* Last feefilter value we sent to this peer *)
+  mutable next_send_feefilter : float; (* Next time to send our feefilter to this peer *)
+  mutable block_relay_only : bool;  (* Block-relay-only connection (no tx relay) *)
   mutable msg_count_window : int;   (* Messages received in current window *)
   mutable msg_window_start : float; (* Start time of current rate-limit window *)
   mutable handshake_complete : bool; (* Version/verack handshake completed *)
@@ -193,6 +201,9 @@ let make_peer ~(network : Consensus.network_config) ~(addr : string)
     misbehavior_score = 0;
     direction;
     feefilter = 0L;
+    fee_filter_sent = 0L;
+    next_send_feefilter = Unix.gettimeofday () +. poisson_delay avg_feefilter_broadcast_interval;
+    block_relay_only = false;
     msg_count_window = 0;
     msg_window_start = Unix.gettimeofday ();
     handshake_complete = false;
@@ -908,3 +919,126 @@ let start_trickling (peer : peer) : unit Lwt.t =
     in
     loop ()
   end
+
+(* ============================================================================
+   BIP-133 FeeFilter
+   ============================================================================ *)
+
+(* Fee filter rounder: discretizes fee rates to prevent fingerprinting.
+   Uses buckets spaced 1.1x apart with randomized rounding.
+   Based on Bitcoin Core's FeeFilterRounder in policy/fees/block_policy_estimator.cpp *)
+module FeeFilterRounder = struct
+  let max_filter_feerate = 10_000_000L  (* 10 BTC/kvB in sat/kvB *)
+  let fee_filter_spacing = 1.1
+
+  (* Generate fee buckets: powers of 1.1 starting from min_relay_fee/2 *)
+  let make_fee_set (min_relay_fee : int64) : float array =
+    let min_limit = max 1L (Int64.div min_relay_fee 2L) in
+    let buckets = ref [0.0] in
+    let boundary = ref (Int64.to_float min_limit) in
+    while !boundary <= Int64.to_float max_filter_feerate do
+      buckets := !boundary :: !buckets;
+      boundary := !boundary *. fee_filter_spacing
+    done;
+    Array.of_list (List.rev !buckets)
+
+  (* Round a fee rate to a bucket with randomization.
+     66.67% chance to round down, 33.33% to round up.
+     This prevents exact mempool state leakage. *)
+  let round (fee_set : float array) (current_fee : int64) : int64 =
+    let fee_f = Int64.to_float current_fee in
+    (* Binary search for lower_bound *)
+    let n = Array.length fee_set in
+    let rec find_idx lo hi =
+      if lo >= hi then lo
+      else
+        let mid = (lo + hi) / 2 in
+        if fee_set.(mid) < fee_f then find_idx (mid + 1) hi
+        else find_idx lo mid
+    in
+    let idx = find_idx 0 n in
+    (* Possibly move to lower bucket (2/3 probability) *)
+    let final_idx =
+      if idx >= n then n - 1
+      else if idx > 0 && Random.int 3 <> 0 then idx - 1
+      else idx
+    in
+    Int64.of_float fee_set.(final_idx)
+end
+
+(* Default fee set based on 1000 sat/kvB minimum relay fee *)
+let default_fee_set = FeeFilterRounder.make_fee_set 1000L
+
+(* Check if we should send a feefilter to this peer now.
+   Returns true if it's time to send based on Poisson schedule. *)
+let should_send_feefilter (peer : peer) : bool =
+  peer.state = Ready &&
+  not peer.block_relay_only &&
+  peer.handshake_complete &&
+  (match peer.version_msg with
+   | Some v -> v.protocol_version >= feefilter_version
+   | None -> false) &&
+  Unix.gettimeofday () >= peer.next_send_feefilter
+
+(* Check if a significant fee change warrants accelerated sending.
+   Returns true if current fee is <75% or >133% of last sent value. *)
+let significant_feefilter_change (current_fee : int64) (sent_fee : int64) : bool =
+  if sent_fee = 0L then true
+  else
+    let current = Int64.to_float current_fee in
+    let sent = Int64.to_float sent_fee in
+    current < sent *. 0.75 || current > sent *. 1.33
+
+(* Schedule the next feefilter send time using Poisson delay *)
+let schedule_next_feefilter (peer : peer) : unit =
+  peer.next_send_feefilter <- Unix.gettimeofday () +. poisson_delay avg_feefilter_broadcast_interval
+
+(* Reschedule feefilter for sooner sending due to significant change *)
+let reschedule_feefilter_soon (peer : peer) : unit =
+  let now = Unix.gettimeofday () in
+  let soon = now +. Random.float max_feefilter_change_delay in
+  if soon < peer.next_send_feefilter then
+    peer.next_send_feefilter <- soon
+
+(* Send a feefilter message to the peer with the rounded fee rate.
+   Updates tracking state for next send. *)
+let send_feefilter (peer : peer) (min_fee : int64) : unit Lwt.t =
+  let open Lwt.Syntax in
+  if peer.state <> Ready || peer.block_relay_only then
+    Lwt.return_unit
+  else begin
+    let rounded_fee = FeeFilterRounder.round default_fee_set min_fee in
+    let* () = Lwt.catch
+      (fun () -> send_message peer (P2p.FeefilterMsg rounded_fee))
+      (fun _exn -> Lwt.return_unit)
+    in
+    peer.fee_filter_sent <- rounded_fee;
+    schedule_next_feefilter peer;
+    Lwt.return_unit
+  end
+
+(* Maybe send a feefilter message if conditions are met.
+   Called periodically from the peer management loop.
+   Returns true if a message was sent. *)
+let maybe_send_feefilter (peer : peer) (min_fee : int64) : bool Lwt.t =
+  let open Lwt.Syntax in
+  if not (should_send_feefilter peer) then
+    Lwt.return false
+  else begin
+    let rounded = FeeFilterRounder.round default_fee_set min_fee in
+    (* Only send if the value changed *)
+    if rounded = peer.fee_filter_sent then begin
+      schedule_next_feefilter peer;
+      Lwt.return false
+    end else begin
+      let* () = send_feefilter peer min_fee in
+      Lwt.return true
+    end
+  end
+
+(* Check and potentially accelerate feefilter sending due to significant change *)
+let check_feefilter_change (peer : peer) (current_fee : int64) : unit =
+  if peer.state = Ready && not peer.block_relay_only then
+    let rounded = FeeFilterRounder.round default_fee_set current_fee in
+    if significant_feefilter_change rounded peer.fee_filter_sent then
+      reschedule_feefilter_soon peer

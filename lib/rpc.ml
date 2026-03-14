@@ -306,6 +306,7 @@ let script_type_name (template : Script.script_template) : string =
   | Script.P2WPKH_script _ -> "witness_v0_keyhash"
   | Script.P2WSH_script _ -> "witness_v0_scripthash"
   | Script.P2TR_script _ -> "witness_v1_taproot"
+  | Script.P2A_script -> "anchor"
   | Script.OP_RETURN_data _ -> "nulldata"
   | Script.Nonstandard -> "nonstandard"
 
@@ -322,7 +323,7 @@ let script_to_address (script : Cstruct.t) (network : Address.network) : string 
     Some (Address.address_to_string { addr_type = P2WSH; hash; network })
   | Script.P2TR_script hash ->
     Some (Address.address_to_string { addr_type = P2TR; hash; network })
-  | Script.OP_RETURN_data _ | Script.Nonstandard -> None
+  | Script.P2A_script | Script.OP_RETURN_data _ | Script.Nonstandard -> None
 
 (* Build scriptPubKey JSON object with type and optional address *)
 let build_script_pubkey_json (script : Cstruct.t) (network : Address.network) : Yojson.Safe.t =

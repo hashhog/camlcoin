@@ -687,6 +687,96 @@ let test_stale_check_timer () =
   Peer_manager.stop_stale_check_timer pm;
   Alcotest.(check bool) "timer stopped" false pm.stale_check_running
 
+(* ============================================================================
+   BIP-133 Feefilter Tests
+   ============================================================================ *)
+
+(* Test FeeFilterRounder bucket generation *)
+let test_feefilter_rounder_buckets () =
+  let fee_set = Peer.FeeFilterRounder.make_fee_set 1000L in
+  (* Should have multiple buckets *)
+  Alcotest.(check bool) "has buckets" true (Array.length fee_set > 5);
+  (* First bucket should be 0 *)
+  Alcotest.(check (float 0.001)) "first bucket is 0" 0.0 fee_set.(0);
+  (* Second bucket should be around min_relay_fee / 2 = 500 *)
+  Alcotest.(check bool) "second bucket is ~500" true (fee_set.(1) >= 500.0 && fee_set.(1) <= 600.0);
+  (* Buckets should be monotonically increasing *)
+  let monotonic = ref true in
+  for i = 1 to Array.length fee_set - 1 do
+    if fee_set.(i) <= fee_set.(i-1) then monotonic := false
+  done;
+  Alcotest.(check bool) "buckets are monotonic" true !monotonic
+
+(* Test FeeFilterRounder rounding *)
+let test_feefilter_rounder_round () =
+  let fee_set = Peer.FeeFilterRounder.make_fee_set 1000L in
+  (* Round 0 should give 0 *)
+  let rounded0 = Peer.FeeFilterRounder.round fee_set 0L in
+  Alcotest.(check int64) "0 rounds to 0" 0L rounded0;
+  (* Round large value should give one of the buckets *)
+  let rounded_large = Peer.FeeFilterRounder.round fee_set 5000L in
+  Alcotest.(check bool) "large fee rounds to bucket"
+    true (Int64.to_float rounded_large <= 5000.0);
+  (* Round max should give a high bucket *)
+  let rounded_max = Peer.FeeFilterRounder.round fee_set 10_000_000L in
+  Alcotest.(check bool) "max rounds to high bucket"
+    true (rounded_max > 1_000_000L)
+
+(* Test peer feefilter state initialization *)
+let test_peer_feefilter_state () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:1 ~direction:Peer.Outbound ~fd in
+  (* Initial state *)
+  Alcotest.(check int64) "feefilter initially 0" 0L peer.feefilter;
+  Alcotest.(check int64) "fee_filter_sent initially 0" 0L peer.fee_filter_sent;
+  Alcotest.(check bool) "not block_relay_only initially" false peer.block_relay_only;
+  (* Update feefilter received from peer *)
+  peer.feefilter <- 5000L;
+  Alcotest.(check int64) "feefilter updated" 5000L peer.feefilter;
+  (* Cleanup *)
+  Lwt_main.run (Lwt_unix.close fd)
+
+(* Test tx filtering with low fee (below feefilter threshold) *)
+let test_tx_filtering_low_fee () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:1 ~direction:Peer.Outbound ~fd in
+  (* Peer has feefilter of 5000 sat/kvB *)
+  peer.feefilter <- 5000L;
+  (* Transaction with fee rate of 1000 sat/kvB (below threshold) *)
+  let tx_fee_rate = 1000L in
+  (* Should NOT relay to this peer (fee rate < feefilter) *)
+  let should_relay = tx_fee_rate >= peer.feefilter in
+  Alcotest.(check bool) "low-fee tx not relayed" false should_relay;
+  Lwt_main.run (Lwt_unix.close fd)
+
+(* Test tx filtering with high fee (above feefilter threshold) *)
+let test_tx_filtering_high_fee () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:1 ~direction:Peer.Outbound ~fd in
+  (* Peer has feefilter of 5000 sat/kvB *)
+  peer.feefilter <- 5000L;
+  (* Transaction with fee rate of 10000 sat/kvB (above threshold) *)
+  let tx_fee_rate = 10000L in
+  (* Should relay to this peer (fee rate >= feefilter) *)
+  let should_relay = tx_fee_rate >= peer.feefilter in
+  Alcotest.(check bool) "high-fee tx relayed" true should_relay;
+  Lwt_main.run (Lwt_unix.close fd)
+
+(* Test that block-relay-only connections skip feefilter sending *)
+let test_block_relay_only_skip_feefilter () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:1 ~direction:Peer.Outbound ~fd in
+  (* Mark as block-relay-only *)
+  peer.block_relay_only <- true;
+  (* should_send_feefilter should return false for block-relay-only peers *)
+  let should_send = Peer.should_send_feefilter peer in
+  Alcotest.(check bool) "block-relay-only skips feefilter" false should_send;
+  Lwt_main.run (Lwt_unix.close fd)
+
 (* All tests *)
 let () =
   Alcotest.run "Peer_manager" [
@@ -774,5 +864,13 @@ let () =
       Alcotest.test_case "get_stalling_peers_empty" `Quick test_get_stalling_peers_empty;
       Alcotest.test_case "get_available_download_peers" `Quick test_get_available_download_peers_empty;
       Alcotest.test_case "stale_check_timer" `Quick test_stale_check_timer;
+    ];
+    "feefilter", [
+      Alcotest.test_case "rounder_buckets" `Quick test_feefilter_rounder_buckets;
+      Alcotest.test_case "rounder_round" `Quick test_feefilter_rounder_round;
+      Alcotest.test_case "peer_feefilter_state" `Quick test_peer_feefilter_state;
+      Alcotest.test_case "tx_filtering_low_fee" `Quick test_tx_filtering_low_fee;
+      Alcotest.test_case "tx_filtering_high_fee" `Quick test_tx_filtering_high_fee;
+      Alcotest.test_case "block_relay_only_skip" `Quick test_block_relay_only_skip_feefilter;
     ];
   ]

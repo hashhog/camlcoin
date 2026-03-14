@@ -62,6 +62,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] REST API (block, tx, headers, chaininfo, mempool, blockhashbyheight, .json/.hex/.bin formats)
 - [x] ZMQ notifications (hashblock, hashtx, rawblock, rawtx, sequence topics, 4-byte LE sequence numbers)
 - [x] Regtest mode (generate, generatetoaddress, generateblock RPCs, instant mining)
+- [x] Block invalidation (invalidateblock, reconsiderblock RPCs, descendant tracking, chain reorg)
 - [ ] Bloom filters (BIP 37)
 
 ## Quick start

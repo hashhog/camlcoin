@@ -57,6 +57,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] PSBT (BIP-174, creator/updater/signer/combiner/finalizer/extractor roles, taproot support)
 - [x] Output descriptors (BIP 380-386, checksum, parsing, script generation, range expansion)
 - [x] Miniscript (type system, script generation, satisfaction, parsing, wsh(miniscript) support)
+- [x] BIP-133 feefilter (Poisson timing, noise rounding, block-relay-only exclusion)
 - [ ] Bloom filters (BIP 37)
 
 ## Quick start

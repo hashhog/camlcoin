@@ -17,7 +17,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Cryptographic primitives (SHA256d, RIPEMD160, secp256k1 ECDSA)
 - [x] Merkle root computation
 - [x] Address encoding (Base58Check, Bech32/Bech32m, WIF)
-- [x] Script interpreter (opcodes, stack machine, P2PKH/P2SH/P2WPKH/P2WSH/P2TR)
+- [x] Script interpreter (opcodes, stack machine, P2PKH/P2SH/P2WPKH/P2WSH/P2TR, BIP-146 NULLFAIL)
 - [x] Consensus parameters (difficulty, rewards, network configs)
 - [x] Storage layer (blocks, UTXOs, chain state, batch writes)
 - [x] Block and transaction validation (weight, sigops, Merkle, coinbase)

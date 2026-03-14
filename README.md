@@ -20,7 +20,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Script interpreter (opcodes, stack machine, P2PKH/P2SH/P2WPKH/P2WSH/P2TR, legacy sighash with FindAndDelete/OP_CODESEPARATOR, witness cleanstack, P2SH push-only, MINIMALIF)
 - [x] Consensus parameters (difficulty, rewards, network configs)
 - [x] Storage layer (blocks, UTXOs, chain state, batch writes)
-- [x] Block and transaction validation (weight, sigops, Merkle, coinbase)
+- [x] Block and transaction validation (weight, sigops, Merkle, coinbase, BIP68 sequence locks)
 - [x] P2P message serialization (version, inv, getdata, blocks, headers, tx)
 - [x] Peer connections and handshake (TCP/Lwt, version/verack, ping/pong)
 - [x] Peer manager and discovery (DNS seeds, connection pool, addr relay)

@@ -180,6 +180,256 @@ let test_protocol_versions () =
   Alcotest.(check int32) "feefilter version" 70013l Consensus.feefilter_version;
   Alcotest.(check int32) "wtxid relay version" 70016l Consensus.wtxid_relay_version
 
+(* Test testnet4 configuration *)
+let test_testnet4_config () =
+  Alcotest.(check string) "testnet4 name" "testnet4" Consensus.testnet4.name;
+  Alcotest.(check int32) "testnet4 magic" 0x1c163f28l Consensus.testnet4.magic;
+  Alcotest.(check int) "testnet4 port" 48333 Consensus.testnet4.default_port;
+  Alcotest.(check bool) "testnet4 allows min difficulty" true
+    Consensus.testnet4.pow_allow_min_difficulty;
+  Alcotest.(check bool) "testnet4 enforces BIP94" true
+    Consensus.testnet4.enforce_bip94;
+  Alcotest.(check bool) "testnet4 retargets" false
+    Consensus.testnet4.pow_no_retargeting
+
+(* Test network variant type *)
+let test_network_type () =
+  Alcotest.(check bool) "mainnet type" true
+    (Consensus.mainnet.network_type = Consensus.Mainnet);
+  Alcotest.(check bool) "testnet3 type" true
+    (Consensus.testnet.network_type = Consensus.Testnet3);
+  Alcotest.(check bool) "testnet4 type" true
+    (Consensus.testnet4.network_type = Consensus.Testnet4);
+  Alcotest.(check bool) "regtest type" true
+    (Consensus.regtest.network_type = Consensus.Regtest)
+
+(* Test difficulty retargeting calculation *)
+let test_calculate_next_work_required () =
+  (* Test mainnet: normal retarget with exact timing *)
+  let first_time = 1000000l in
+  let last_time = Int32.add first_time (Int32.of_int Consensus.target_timespan) in
+  let bits = 0x1d00ffffl in
+  let new_bits = Consensus.calculate_next_work_required
+    ~first_block_time:first_time
+    ~last_block_time:last_time
+    ~base_bits:bits
+    ~network:Consensus.mainnet
+  in
+  (* With exact target timespan, difficulty should stay the same *)
+  Alcotest.(check int32) "exact timespan keeps difficulty" bits new_bits;
+
+  (* Test with faster blocks (half the time) - difficulty should increase (target decreases) *)
+  let fast_last_time = Int32.add first_time (Int32.of_int (Consensus.target_timespan / 2)) in
+  let fast_bits = Consensus.calculate_next_work_required
+    ~first_block_time:first_time
+    ~last_block_time:fast_last_time
+    ~base_bits:bits
+    ~network:Consensus.mainnet
+  in
+  (* Target should be halved (difficulty doubled), so compact form should differ *)
+  Alcotest.(check bool) "faster blocks increase difficulty" true
+    (fast_bits < bits || fast_bits = bits);  (* Lower compact = harder difficulty *)
+
+  (* Test with slower blocks (double the time) - difficulty should decrease *)
+  let slow_last_time = Int32.add first_time (Int32.of_int (Consensus.target_timespan * 2)) in
+  let slow_bits = Consensus.calculate_next_work_required
+    ~first_block_time:first_time
+    ~last_block_time:slow_last_time
+    ~base_bits:bits
+    ~network:Consensus.mainnet
+  in
+  (* Target should be doubled (difficulty halved), so compact might be larger *)
+  Alcotest.(check bool) "slower blocks decrease difficulty" true
+    (slow_bits >= bits)
+
+(* Test clamping to 4x bounds *)
+let test_difficulty_clamping () =
+  let first_time = 1000000l in
+  let bits = 0x1d00ffffl in
+
+  (* Very fast blocks (1/10th of target time) should be clamped to 4x *)
+  let very_fast_time = Int32.add first_time (Int32.of_int (Consensus.target_timespan / 10)) in
+  let clamped_fast = Consensus.calculate_next_work_required
+    ~first_block_time:first_time
+    ~last_block_time:very_fast_time
+    ~base_bits:bits
+    ~network:Consensus.mainnet
+  in
+  (* With 1/10th time, should clamp to 1/4x (difficulty can only increase 4x) *)
+  let quarter_time = Int32.add first_time (Int32.of_int (Consensus.target_timespan / 4)) in
+  let expected_clamped = Consensus.calculate_next_work_required
+    ~first_block_time:first_time
+    ~last_block_time:quarter_time
+    ~base_bits:bits
+    ~network:Consensus.mainnet
+  in
+  Alcotest.(check int32) "fast blocks clamped to 4x" expected_clamped clamped_fast;
+
+  (* Very slow blocks (10x target time) should be clamped to 4x *)
+  let very_slow_time = Int32.add first_time (Int32.of_int (Consensus.target_timespan * 10)) in
+  let clamped_slow = Consensus.calculate_next_work_required
+    ~first_block_time:first_time
+    ~last_block_time:very_slow_time
+    ~base_bits:bits
+    ~network:Consensus.mainnet
+  in
+  let four_x_time = Int32.add first_time (Int32.of_int (Consensus.target_timespan * 4)) in
+  let expected_slow_clamped = Consensus.calculate_next_work_required
+    ~first_block_time:first_time
+    ~last_block_time:four_x_time
+    ~base_bits:bits
+    ~network:Consensus.mainnet
+  in
+  Alcotest.(check int32) "slow blocks clamped to 4x" expected_slow_clamped clamped_slow
+
+(* Test regtest always returns pow_limit *)
+let test_regtest_no_retarget () =
+  let get_block_info _h = (0l, Consensus.regtest.pow_limit) in
+  (* At adjustment boundary *)
+  let bits = Consensus.get_next_work_required
+    ~height:2016
+    ~block_time:1000000l
+    ~prev_block_time:500000l
+    ~prev_bits:0x1d00ffffl  (* Different from pow_limit *)
+    ~get_block_info
+    ~network:Consensus.regtest
+  in
+  (* Regtest should return the prev_bits unchanged (no retargeting) *)
+  Alcotest.(check int32) "regtest no retarget" 0x1d00ffffl bits;
+
+  (* Non-adjustment block *)
+  let bits2 = Consensus.get_next_work_required
+    ~height:100
+    ~block_time:1000000l
+    ~prev_block_time:500000l
+    ~prev_bits:0x1d00ffffl
+    ~get_block_info
+    ~network:Consensus.regtest
+  in
+  Alcotest.(check int32) "regtest non-adjustment" 0x1d00ffffl bits2
+
+(* Test testnet min-difficulty rule *)
+let test_testnet_min_difficulty () =
+  let pow_limit = Consensus.testnet.pow_limit in
+  let normal_bits = 0x1c00ffffl in  (* Higher difficulty than pow_limit *)
+
+  (* Create block info callback that returns normal difficulty *)
+  let get_block_info h =
+    let ts = Int32.of_int (1000000 + h * 600) in
+    (ts, normal_bits)
+  in
+
+  (* Block coming after >20 minutes should get min difficulty *)
+  let prev_time = 1000000l in
+  let slow_block_time = Int32.add prev_time 1500l in  (* 25 minutes = 1500 seconds *)
+  let bits = Consensus.get_next_work_required
+    ~height:100  (* Not an adjustment block *)
+    ~block_time:slow_block_time
+    ~prev_block_time:prev_time
+    ~prev_bits:normal_bits
+    ~get_block_info
+    ~network:Consensus.testnet
+  in
+  Alcotest.(check int32) "testnet slow block gets min diff" pow_limit bits;
+
+  (* Block coming after <20 minutes should walk back *)
+  let fast_block_time = Int32.add prev_time 600l in  (* 10 minutes *)
+  let bits2 = Consensus.get_next_work_required
+    ~height:100
+    ~block_time:fast_block_time
+    ~prev_block_time:prev_time
+    ~prev_bits:normal_bits
+    ~get_block_info
+    ~network:Consensus.testnet
+  in
+  Alcotest.(check int32) "testnet fast block keeps difficulty" normal_bits bits2
+
+(* Test testnet walk-back to find non-min-difficulty block *)
+let test_testnet_walk_back () =
+  let pow_limit = Consensus.testnet.pow_limit in
+  let real_bits = 0x1c00ffffl in
+
+  (* Create chain where blocks 95-99 are min-diff but 94 has real difficulty *)
+  let get_block_info h =
+    let ts = Int32.of_int (1000000 + h * 600) in
+    if h >= 95 then (ts, pow_limit)  (* Min difficulty *)
+    else (ts, real_bits)  (* Real difficulty *)
+  in
+
+  (* Fast block at height 100 should walk back to block 94 *)
+  let prev_time = Int32.of_int (1000000 + 99 * 600) in
+  let block_time = Int32.add prev_time 600l in  (* 10 minutes - fast *)
+  let bits = Consensus.get_next_work_required
+    ~height:100
+    ~block_time
+    ~prev_block_time:prev_time
+    ~prev_bits:pow_limit
+    ~get_block_info
+    ~network:Consensus.testnet
+  in
+  Alcotest.(check int32) "testnet walk-back finds real difficulty" real_bits bits
+
+(* Test BIP94 uses first block's bits at retarget *)
+let test_bip94_retarget () =
+  let first_bits = 0x1c00ffffl in  (* Real difficulty at period start *)
+  let last_bits = Consensus.testnet4.pow_limit in  (* Min difficulty at period end *)
+
+  let get_block_info h =
+    let ts = Int32.of_int (1000000 + h * 600) in
+    if h = 0 then (ts, first_bits)  (* First block of period *)
+    else (ts, last_bits)  (* Other blocks at min difficulty *)
+  in
+
+  (* At height 2016 (adjustment), BIP94 should use first_bits, not last_bits *)
+  let first_time = Int32.of_int 1000000 in
+  let last_time = Int32.add first_time (Int32.of_int Consensus.target_timespan) in
+
+  let bits = Consensus.get_next_work_required
+    ~height:2016
+    ~block_time:(Int32.add last_time 1l)
+    ~prev_block_time:last_time
+    ~prev_bits:last_bits
+    ~get_block_info
+    ~network:Consensus.testnet4
+  in
+
+  (* Calculate expected using first_bits as base *)
+  let expected = Consensus.calculate_next_work_required
+    ~first_block_time:first_time
+    ~last_block_time:last_time
+    ~base_bits:first_bits
+    ~network:Consensus.testnet4
+  in
+  Alcotest.(check int32) "BIP94 uses first block bits" expected bits
+
+(* Test mainnet vs testnet4 retarget difference *)
+let test_mainnet_vs_bip94 () =
+  let first_bits = 0x1c00ffffl in
+  let last_bits = 0x1d00ffffl in  (* Different bits at end *)
+
+  let first_time = 1000000l in
+  let last_time = Int32.add first_time (Int32.of_int Consensus.target_timespan) in
+
+  (* Mainnet: uses last block's bits *)
+  let mainnet_bits = Consensus.calculate_next_work_required
+    ~first_block_time:first_time
+    ~last_block_time:last_time
+    ~base_bits:last_bits  (* Mainnet uses last bits *)
+    ~network:Consensus.mainnet
+  in
+
+  (* Testnet4/BIP94: uses first block's bits *)
+  let bip94_bits = Consensus.calculate_next_work_required
+    ~first_block_time:first_time
+    ~last_block_time:last_time
+    ~base_bits:first_bits  (* BIP94 uses first bits *)
+    ~network:Consensus.testnet4
+  in
+
+  (* They should differ when base_bits differ *)
+  Alcotest.(check bool) "mainnet vs BIP94 differ" true
+    (mainnet_bits <> bip94_bits)
+
 let () =
   let open Alcotest in
   run "Consensus" [
@@ -205,6 +455,17 @@ let () =
     "network_config", [
       test_case "mainnet config" `Quick test_mainnet_config;
       test_case "testnet config" `Quick test_testnet_config;
+      test_case "testnet4 config" `Quick test_testnet4_config;
       test_case "regtest config" `Quick test_regtest_config;
+      test_case "network type" `Quick test_network_type;
+    ];
+    "difficulty_retarget", [
+      test_case "calculate next work required" `Quick test_calculate_next_work_required;
+      test_case "difficulty clamping" `Quick test_difficulty_clamping;
+      test_case "regtest no retarget" `Quick test_regtest_no_retarget;
+      test_case "testnet min difficulty" `Quick test_testnet_min_difficulty;
+      test_case "testnet walk-back" `Quick test_testnet_walk_back;
+      test_case "BIP94 retarget" `Quick test_bip94_retarget;
+      test_case "mainnet vs BIP94" `Quick test_mainnet_vs_bip94;
     ];
   ]

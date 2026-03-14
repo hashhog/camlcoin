@@ -73,11 +73,22 @@ let ping_interval = 120.0      (* 2 minutes between pings *)
 let ping_timeout = 20.0        (* 20 seconds to receive pong *)
 let handshake_timeout = 60.0   (* 60 seconds for version/verack handshake *)
 
+(* Inventory trickling constants - match Bitcoin Core net_processing.cpp *)
+let inbound_inv_broadcast_interval = 5.0   (* Average 5 seconds for inbound peers *)
+let outbound_inv_broadcast_interval = 2.0  (* Average 2 seconds for outbound peers *)
+let max_inv_per_flush = 1000               (* Maximum inventory entries per flush *)
+
 (* Minimum protocol version required (post-segwit) *)
 let min_protocol_version = 70015l
 
 (* Direction of a peer connection *)
 type peer_direction = Inbound | Outbound
+
+(* Inventory entry for trickling *)
+type inv_entry = {
+  inv_type : P2p.inv_type;
+  hash : Types.hash256;
+}
 
 (* Peer connection state *)
 type peer = {
@@ -111,6 +122,10 @@ type peer = {
   mutable handshake_complete : bool; (* Version/verack handshake completed *)
   mutable version_received : bool;   (* VERSION message has been received *)
   our_nonce : int64;                 (* Our nonce for self-connection detection *)
+  (* Inventory trickling state *)
+  inv_queue : inv_entry Queue.t;     (* Pending tx inventory to announce *)
+  mutable next_inv_send : float;     (* Next time to flush inv queue *)
+  mutable trickling_active : bool;   (* Whether the trickle timer is running *)
 }
 
 (* Generate random bytes from /dev/urandom *)
@@ -139,12 +154,25 @@ let make_local_addr () : Types.net_addr =
   Cstruct.set_uint8 addr 15 1;
   { services = services_to_int64 our_services; addr; port = 0 }
 
+(* Poisson delay: returns exponentially distributed delay with given average.
+   Uses the inverse CDF method: -ln(U) * avg where U is uniform (0,1).
+   This matches Bitcoin Core's rand_exp_duration / MakeExponentiallyDistributed. *)
+let poisson_delay (avg : float) : float =
+  let u = Random.float 1.0 in
+  (* Avoid log(0) by using max with small epsilon *)
+  let u_safe = max u 1e-10 in
+  ~-.(Float.log u_safe) *. avg
+
 (* Create a peer from an already-connected fd (used for both outbound and inbound) *)
 let make_peer ~(network : Consensus.network_config) ~(addr : string)
     ~(port : int) ~(id : int) ~(direction : peer_direction)
     ~(fd : Lwt_unix.file_descr) : peer =
   let ic = Lwt_io.of_fd ~mode:Lwt_io.Input fd in
   let oc = Lwt_io.of_fd ~mode:Lwt_io.Output fd in
+  let avg_interval = match direction with
+    | Inbound -> inbound_inv_broadcast_interval
+    | Outbound -> outbound_inv_broadcast_interval
+  in
   { id; addr; port;
     state = Connected;
     version_msg = None;
@@ -170,6 +198,10 @@ let make_peer ~(network : Consensus.network_config) ~(addr : string)
     handshake_complete = false;
     version_received = false;
     our_nonce = random_nonce ();  (* Generate nonce for self-connection detection *)
+    (* Initialize inventory trickling state *)
+    inv_queue = Queue.create ();
+    next_inv_send = Unix.gettimeofday () +. poisson_delay avg_interval;
+    trickling_active = false;
   }
 
 (* Establish TCP connection to a peer with timeout *)
@@ -789,3 +821,90 @@ let peer_info (peer : peer) : string =
     (peer_state_to_string peer.state)
     peer.best_height
     ua dir peer.misbehavior_score
+
+(* Inventory trickling: queue a transaction for delayed announcement *)
+let queue_inv (peer : peer) (entry : inv_entry) : unit =
+  if peer.state = Ready then
+    Queue.add entry peer.inv_queue
+
+(* Inventory trickling: check how many items are queued *)
+let inv_queue_length (peer : peer) : int =
+  Queue.length peer.inv_queue
+
+(* Inventory trickling: flush the queue, sending up to max_inv_per_flush items.
+   Randomizes the order of announcements for privacy.
+   Returns the number of items sent. *)
+let flush_inv_queue (peer : peer) : int Lwt.t =
+  let open Lwt.Syntax in
+  if peer.state <> Ready || Queue.is_empty peer.inv_queue then
+    Lwt.return 0
+  else begin
+    (* Collect up to max_inv_per_flush items *)
+    let items = ref [] in
+    let count = ref 0 in
+    while not (Queue.is_empty peer.inv_queue) && !count < max_inv_per_flush do
+      let entry = Queue.pop peer.inv_queue in
+      items := entry :: !items;
+      incr count
+    done;
+    if !count = 0 then
+      Lwt.return 0
+    else begin
+      (* Randomize order for privacy (shuffle using random comparator) *)
+      let shuffled = List.sort (fun _ _ -> Random.int 3 - 1) !items in
+      (* Convert to P2p.inv_vector list *)
+      let inv_vectors = List.map (fun entry ->
+        { P2p.inv_type = entry.inv_type; hash = entry.hash }
+      ) shuffled in
+      (* Send the inv message *)
+      let* () = Lwt.catch
+        (fun () -> send_message peer (P2p.InvMsg inv_vectors))
+        (fun _exn -> Lwt.return_unit)
+      in
+      Lwt.return !count
+    end
+  end
+
+(* Inventory trickling: schedule the next flush time based on Poisson delay *)
+let schedule_next_inv_send (peer : peer) : unit =
+  let avg_interval = match peer.direction with
+    | Inbound -> inbound_inv_broadcast_interval
+    | Outbound -> outbound_inv_broadcast_interval
+  in
+  peer.next_inv_send <- Unix.gettimeofday () +. poisson_delay avg_interval
+
+(* Inventory trickling: check if it's time to flush *)
+let should_flush_inv (peer : peer) : bool =
+  peer.state = Ready &&
+  not (Queue.is_empty peer.inv_queue) &&
+  Unix.gettimeofday () >= peer.next_inv_send
+
+(* Inventory trickling: start the trickle timer loop for a peer.
+   This should be called once when the peer enters Ready state.
+   The loop runs until the peer disconnects. *)
+let start_trickling (peer : peer) : unit Lwt.t =
+  let open Lwt.Syntax in
+  if peer.trickling_active then
+    Lwt.return_unit
+  else begin
+    peer.trickling_active <- true;
+    let rec loop () =
+      if peer.state = Disconnected || peer.state = Disconnecting then begin
+        peer.trickling_active <- false;
+        Lwt.return_unit
+      end else begin
+        let now = Unix.gettimeofday () in
+        let delay = max 0.1 (peer.next_inv_send -. now) in
+        let* () = Lwt_unix.sleep delay in
+        if peer.state = Ready then begin
+          let* _sent = flush_inv_queue peer in
+          schedule_next_inv_send peer;
+          loop ()
+        end else begin
+          peer.trickling_active <- false;
+          Lwt.return_unit
+        end
+      end
+    in
+    loop ()
+  end

@@ -34,7 +34,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Fee estimation (bucket-based tracking, confirmation time analysis)
 - [x] Block template construction (getblocktemplate, coinbase, witness commitment)
 - [x] CPU miner for regtest (proof-of-work search, nonce iteration)
-- [x] JSON-RPC interface
+- [x] JSON-RPC interface (batch requests, parallel processing)
 - [x] Wallet (key generation, UTXO tracking, coin selection, tx signing)
 - [x] Command-line interface
 - [x] Test suite (Alcotest unit tests, QCheck property-based tests)

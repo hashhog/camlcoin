@@ -82,11 +82,13 @@ let max_descendant_size = 101_000
 let max_rbf_evictions = 100
 let max_standard_tx_weight = 400_000
 
-(* TRUC/v3 transaction policy (BIP-431) *)
+(* TRUC/v3 transaction policy (BIP-431)
+   Reference: Bitcoin Core /src/policy/truc_policy.cpp *)
 let truc_version = 3l
-let truc_max_vsize = 10_000   (* max virtual size for v3 child transactions *)
-let truc_ancestor_limit = 2   (* max unconfirmed ancestors including self *)
-let truc_descendant_limit = 2 (* max unconfirmed descendants including self *)
+let truc_max_vsize = 10_000       (* max virtual size for any v3 transaction *)
+let truc_child_max_vsize = 1_000  (* max virtual size for v3 child (has unconfirmed v3 parent) *)
+let truc_ancestor_limit = 2       (* max unconfirmed ancestors including self *)
+let truc_descendant_limit = 2     (* max unconfirmed descendants including self *)
 
 (* ============================================================================
    Mempool Creation
@@ -567,72 +569,117 @@ let check_ancestor_descendant_limits (mp : mempool) (depends : Types.hash256 lis
 
 (* ============================================================================
    TRUC/v3 Transaction Policy (BIP-431)
+
+   Reference: Bitcoin Core /src/policy/truc_policy.cpp
+
+   TRUC (Topologically Restricted Until Confirmation) enforces a strict
+   1-parent-1-child topology for v3 transactions:
+   - A v3 tx can have at most 1 unconfirmed parent
+   - A v3 tx can have at most 1 unconfirmed child
+   - v3 tx max size: 10,000 vbytes
+   - v3 child (with unconfirmed parent) max size: 1,000 vbytes
+   - v3 transactions signal replaceability unconditionally
+   - Non-v3 cannot spend unconfirmed v3 outputs (and vice versa)
    ============================================================================ *)
+
+(* Check if a transaction is a v3/TRUC transaction *)
+let is_truc_tx (tx : Types.transaction) : bool =
+  tx.Types.version = truc_version
 
 (* Check TRUC/v3 policy constraints for a transaction *)
 let check_truc_policy (mp : mempool) (tx : Types.transaction)
     (depends : Types.hash256 list) (weight : int) : (unit, string) result =
-  let is_v3 = tx.version = truc_version in
+  let is_v3 = is_truc_tx tx in
+  let vsize = (weight + 3) / 4 in
+
   if is_v3 then begin
-    let has_unconfirmed_parents = depends <> [] in
-    (* For child transactions (those with unconfirmed parents), enforce vsize limit *)
-    if has_unconfirmed_parents then begin
-      let vsize = (weight + 3) / 4 in
-      if vsize > truc_max_vsize then
-        Error (Printf.sprintf
-          "TRUC/v3 child transaction vsize %d exceeds limit %d"
-          vsize truc_max_vsize)
-      else
-        (* Check ancestor count (including self) *)
-        let all_ancestors = Hashtbl.create 16 in
-        List.iter (fun parent_txid ->
-          let parent_key = Cstruct.to_string parent_txid in
-          if not (Hashtbl.mem all_ancestors parent_key) then begin
-            Hashtbl.replace all_ancestors parent_key ();
-            let ancestors = get_ancestors mp parent_txid in
-            List.iter (fun a ->
-              Hashtbl.replace all_ancestors (Cstruct.to_string a.txid) ()
-            ) ancestors
-          end
-        ) depends;
-        let ancestor_count = Hashtbl.length all_ancestors + 1 in
-        if ancestor_count > truc_ancestor_limit then
+    (* Rule 1: v3 transaction size limit (10,000 vbytes) *)
+    if vsize > truc_max_vsize then
+      Error (Printf.sprintf
+        "TRUC/v3 transaction too large: %d vbytes > %d limit"
+        vsize truc_max_vsize)
+    else begin
+      let has_unconfirmed_parents = depends <> [] in
+
+      (* Check if any parent is v3 *)
+      let v3_parents = List.filter (fun parent_txid ->
+        match Hashtbl.find_opt mp.entries (Cstruct.to_string parent_txid) with
+        | None -> false
+        | Some parent_entry -> is_truc_tx parent_entry.tx
+      ) depends in
+
+      (* Check if any parent is non-v3 *)
+      let non_v3_parents = List.filter (fun parent_txid ->
+        match Hashtbl.find_opt mp.entries (Cstruct.to_string parent_txid) with
+        | None -> false  (* confirmed UTXOs are fine *)
+        | Some parent_entry -> not (is_truc_tx parent_entry.tx)
+      ) depends in
+
+      (* Rule: v3 cannot spend from unconfirmed non-v3 *)
+      if non_v3_parents <> [] then
+        Error "TRUC/v3 transaction cannot spend from unconfirmed non-v3 transaction"
+
+      (* Rules for v3 child transactions (with unconfirmed v3 parents) *)
+      else if has_unconfirmed_parents && v3_parents <> [] then begin
+        (* Rule 2: v3 child size limit (1,000 vbytes) *)
+        if vsize > truc_child_max_vsize then
           Error (Printf.sprintf
-            "TRUC/v3 transaction exceeds ancestor limit (%d > %d)"
-            ancestor_count truc_ancestor_limit)
-        else
-          (* Check that no v3 parent already has an unconfirmed child (1 child limit) *)
-          let parent_has_child = List.exists (fun parent_txid ->
-            match Hashtbl.find_opt mp.entries (Cstruct.to_string parent_txid) with
-            | None -> false
-            | Some parent_entry ->
-              if parent_entry.tx.version = truc_version then begin
-                (* Check if parent already has a child in mempool *)
-                Hashtbl.fold (fun _ entry found ->
-                  found || (List.exists (fun d ->
-                    Cstruct.equal d parent_txid) entry.depends_on)
-                ) mp.entries false
-              end else
-                false
-          ) depends in
-          if parent_has_child then
-            Error "TRUC/v3 parent already has an unconfirmed child"
-          else
-            Ok ()
-    end else
-      Ok ()
+            "TRUC/v3 child transaction too large: %d vbytes > %d limit"
+            vsize truc_child_max_vsize)
+        else begin
+          (* Rule 3: v3 child can only have 1 unconfirmed parent *)
+          let ancestor_count = List.length depends + 1 in  (* parents + self *)
+          if ancestor_count > truc_ancestor_limit then
+            Error (Printf.sprintf
+              "TRUC/v3 transaction exceeds ancestor limit (%d > %d)"
+              ancestor_count truc_ancestor_limit)
+          else begin
+            (* Check for grandparents: if parent has parents, we exceed limit *)
+            let has_grandparents = List.exists (fun parent_txid ->
+              match Hashtbl.find_opt mp.entries (Cstruct.to_string parent_txid) with
+              | None -> false
+              | Some parent_entry -> parent_entry.depends_on <> []
+            ) depends in
+            if has_grandparents then
+              Error "TRUC/v3 transaction would exceed ancestor limit (grandparents exist)"
+            else begin
+              (* Rule 4: v3 parent can only have 1 child *)
+              let parent_has_child = List.exists (fun parent_txid ->
+                match Hashtbl.find_opt mp.entries (Cstruct.to_string parent_txid) with
+                | None -> false
+                | Some _parent_entry ->
+                  (* Check if parent already has a child in mempool *)
+                  Hashtbl.fold (fun _ entry found ->
+                    found || (List.exists (fun d ->
+                      Cstruct.equal d parent_txid) entry.depends_on)
+                  ) mp.entries false
+              ) depends in
+              if parent_has_child then
+                Error "TRUC/v3 parent already has an unconfirmed child (descendant limit)"
+              else
+                Ok ()
+            end
+          end
+        end
+      end else
+        Ok ()
+    end
   end else begin
     (* Non-v3 transaction: reject if it spends unconfirmed v3 outputs *)
     let spends_v3 = List.exists (fun parent_txid ->
       match Hashtbl.find_opt mp.entries (Cstruct.to_string parent_txid) with
       | None -> false
-      | Some parent_entry -> parent_entry.tx.version = truc_version
+      | Some parent_entry -> is_truc_tx parent_entry.tx
     ) depends in
     if spends_v3 then
       Error "Non-v3 transaction cannot spend unconfirmed v3 outputs"
     else
       Ok ()
   end
+
+(* Check if a v3 transaction signals replaceability (always true for v3) *)
+let truc_signals_rbf (tx : Types.transaction) : bool =
+  is_truc_tx tx
 
 (* ============================================================================
    Conflict Detection
@@ -994,10 +1041,13 @@ let get_stats (mp : mempool) : mempool_stats =
    Replace-by-Fee (RBF) Support
    ============================================================================ *)
 
-(* Check if a transaction signals RBF (BIP-125) *)
+(* Check if a transaction signals RBF (BIP-125 or TRUC/v3)
+   v3/TRUC transactions signal replaceability unconditionally. *)
 let signals_rbf (tx : Types.transaction) : bool =
+  (* v3/TRUC transactions are always replaceable *)
+  is_truc_tx tx ||
+  (* BIP-125: sequence number < 0xFFFFFFFE signals RBF *)
   List.exists (fun inp ->
-    (* Sequence number < 0xFFFFFFFE signals RBF *)
     Int32.compare inp.Types.sequence 0xFFFFFFFEl < 0
   ) tx.inputs
 

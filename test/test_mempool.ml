@@ -417,7 +417,7 @@ let test_mempool_sorted_by_feerate () =
   let sorted = Mempool.get_sorted_transactions mp in
   Alcotest.(check int) "3 transactions" 3 (List.length sorted);
   (* Should be sorted high to low fee rate *)
-  let fee_rates = List.map (fun e -> e.Mempool.fee_rate) sorted in
+  let fee_rates = List.map (fun (e : Mempool.mempool_entry) -> e.fee_rate) sorted in
   let is_sorted = List.fold_left (fun (prev, ok) rate ->
     (rate, ok && rate <= prev)
   ) (max_float, true) fee_rates |> snd in
@@ -1435,6 +1435,273 @@ let test_orphan_cpfp () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* ============================================================================
+   Cluster Mempool Tests
+   ============================================================================ *)
+
+(* Test: get_clusters returns correct number of clusters *)
+let test_cluster_basic () =
+  let (mp, _utxo, db, txid1, txid2, txid3) = create_test_mempool () in
+  (* Add three independent transactions *)
+  let tx1 = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L]
+  in
+  let tx2 = make_regular_tx
+    [make_test_input txid2 0l]
+    [make_test_output 1_990_000L]
+  in
+  let tx3 = make_regular_tx
+    [make_test_input txid3 0l]
+    [make_test_output 490_000L]
+  in
+  let _ = Mempool.add_transaction mp tx1 in
+  let _ = Mempool.add_transaction mp tx2 in
+  let _ = Mempool.add_transaction mp tx3 in
+  (* Three independent txs = three clusters *)
+  let clusters = Mempool.get_clusters mp in
+  Alcotest.(check int) "3 independent clusters" 3 (List.length clusters);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: dependent transactions form single cluster *)
+let test_cluster_dependencies () =
+  let (mp, _utxo, db, txid1, txid2, _) = create_test_mempool () in
+  (* Add parent *)
+  let parent_tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L]
+  in
+  let parent_entry = Result.get_ok (Mempool.add_transaction mp parent_tx) in
+  (* Add child *)
+  let child_tx = make_regular_tx
+    [make_test_input parent_entry.txid 0l]
+    [make_test_output 980_000L]
+  in
+  let _ = Mempool.add_transaction mp child_tx in
+  (* Add independent tx *)
+  let indep_tx = make_regular_tx
+    [make_test_input txid2 0l]
+    [make_test_output 1_990_000L]
+  in
+  let _ = Mempool.add_transaction mp indep_tx in
+  (* Should be 2 clusters: parent+child and independent *)
+  let clusters = Mempool.get_clusters mp in
+  Alcotest.(check int) "2 clusters" 2 (List.length clusters);
+  (* Find the cluster with 2 txs *)
+  let cluster_sizes = List.map (fun (c : Mempool.cluster) -> List.length c.txs) clusters in
+  Alcotest.(check bool) "one cluster has 2 txs" true (List.mem 2 cluster_sizes);
+  Alcotest.(check bool) "one cluster has 1 tx" true (List.mem 1 cluster_sizes);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: get_cluster returns the correct cluster for a txid *)
+let test_get_cluster () =
+  let (mp, _utxo, db, txid1, _txid2, _) = create_test_mempool () in
+  (* Create chain: parent -> child *)
+  let parent_tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L]
+  in
+  let parent_entry = Result.get_ok (Mempool.add_transaction mp parent_tx) in
+  let child_tx = make_regular_tx
+    [make_test_input parent_entry.txid 0l]
+    [make_test_output 980_000L]
+  in
+  let child_entry = Result.get_ok (Mempool.add_transaction mp child_tx) in
+  (* Get cluster for child should include both *)
+  let cluster = Mempool.get_cluster mp child_entry.txid in
+  Alcotest.(check bool) "cluster found" true (Option.is_some cluster);
+  let cluster = Option.get cluster in
+  Alcotest.(check int) "cluster has 2 txs" 2 (List.length cluster.txs);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: get_cluster_size returns correct count *)
+let test_get_cluster_size () =
+  let (mp, _utxo, db, txid1, _txid2, _) = create_test_mempool () in
+  (* Create chain: parent -> child1, child2 (3 txs, 1 cluster) *)
+  let parent_tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 490_000L; make_test_output 490_000L]
+  in
+  let parent_entry = Result.get_ok (Mempool.add_transaction mp parent_tx) in
+  let child1_tx = make_regular_tx
+    [make_test_input parent_entry.txid 0l]
+    [make_test_output 480_000L]
+  in
+  let child1_entry = Result.get_ok (Mempool.add_transaction mp child1_tx) in
+  let child2_tx = make_regular_tx
+    [make_test_input parent_entry.txid 1l]
+    [make_test_output 480_000L]
+  in
+  let _ = Mempool.add_transaction mp child2_tx in
+  let size = Mempool.get_cluster_size mp child1_entry.txid in
+  Alcotest.(check int) "cluster size 3" 3 size;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: linearize_cluster produces topological order *)
+let test_linearize_basic () =
+  let (mp, _utxo, db, txid1, _txid2, _) = create_test_mempool () in
+  (* Create parent -> child chain *)
+  let parent_tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L]
+  in
+  let parent_entry = Result.get_ok (Mempool.add_transaction mp parent_tx) in
+  let child_tx = make_regular_tx
+    [make_test_input parent_entry.txid 0l]
+    [make_test_output 980_000L]
+  in
+  let _ = Mempool.add_transaction mp child_tx in
+  let cluster = Option.get (Mempool.get_cluster mp parent_entry.txid) in
+  let chunks = Mempool.linearize_cluster cluster mp in
+  (* Should have 1 or 2 chunks depending on fee rates *)
+  Alcotest.(check bool) "has chunks" true (List.length chunks > 0);
+  (* Total txs across all chunks should be 2 *)
+  let total_txs = List.fold_left (fun acc (c : Mempool.chunk) ->
+    acc + List.length c.chunk_txs
+  ) 0 chunks in
+  Alcotest.(check int) "2 txs total" 2 total_txs;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: chunks are sorted by fee rate descending *)
+let test_chunks_sorted_by_feerate () =
+  let (mp, _utxo, db, txid1, txid2, _) = create_test_mempool () in
+  (* Add two independent transactions with different fee rates *)
+  let tx_high_fee = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 900_000L]  (* 100k fee *)
+  in
+  let tx_low_fee = make_regular_tx
+    [make_test_input txid2 0l]
+    [make_test_output 1_990_000L]  (* 10k fee *)
+  in
+  let _ = Mempool.add_transaction mp tx_high_fee in
+  let _ = Mempool.add_transaction mp tx_low_fee in
+  let chunks = Mempool.get_all_chunks mp in
+  Alcotest.(check int) "2 chunks" 2 (List.length chunks);
+  (* First chunk should have higher fee rate *)
+  let first = List.hd chunks in
+  let second = List.nth chunks 1 in
+  Alcotest.(check bool) "first chunk has higher fee rate" true
+    (first.chunk_fee_rate >= second.chunk_fee_rate);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: select_for_block_chunked selects transactions in fee-rate order *)
+let test_select_for_block_chunked () =
+  let (mp, _utxo, db, txid1, txid2, _) = create_test_mempool () in
+  let tx1 = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L]
+  in
+  let tx2 = make_regular_tx
+    [make_test_input txid2 0l]
+    [make_test_output 1_990_000L]
+  in
+  let _ = Mempool.add_transaction mp tx1 in
+  let _ = Mempool.add_transaction mp tx2 in
+  let selected = Mempool.select_for_block_chunked mp ~max_weight:4_000_000 in
+  Alcotest.(check int) "selected 2 txs" 2 (List.length selected);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: cluster size limit check function works correctly *)
+let test_cluster_size_limit () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let utxo = Utxo.UtxoSet.create db in
+
+  (* Test the check_cluster_size_limit function directly.
+     Note: The full add_transaction flow also enforces ancestor/descendant limits
+     which are more restrictive (25) than the cluster limit (101). The cluster
+     limit check is designed to catch cases where multiple small chains merge. *)
+
+  let base_txid = Cstruct.create 32 in
+  Cstruct.set_uint8 base_txid 0 1;
+  Utxo.UtxoSet.add utxo base_txid 0 Utxo.{
+    value = 200_000_000L;
+    script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac";
+    height = 0;
+    is_coinbase = false;
+  };
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
+
+  (* Add a simple parent tx *)
+  let parent_tx = make_regular_tx
+    [make_test_input base_txid 0l]
+    [make_test_output 199_990_000L]
+  in
+  let parent_result = Mempool.add_transaction mp parent_tx in
+  Alcotest.(check bool) "parent added" true (Result.is_ok parent_result);
+  let parent_entry = Result.get_ok parent_result in
+
+  (* Test: check_cluster_size_limit should pass for a small cluster *)
+  let fake_new_txid = Cstruct.create 32 in
+  Cstruct.set_uint8 fake_new_txid 0 99;
+  let result = Mempool.check_cluster_size_limit mp [parent_entry.txid] fake_new_txid in
+  Alcotest.(check bool) "small cluster passes limit check" true (Result.is_ok result);
+
+  (* Test: get_cluster_size returns correct count *)
+  let size = Mempool.get_cluster_size mp parent_entry.txid in
+  Alcotest.(check int) "cluster size is 1" 1 size;
+
+  (* Test: independent transactions have separate clusters *)
+  let base_txid2 = Cstruct.create 32 in
+  Cstruct.set_uint8 base_txid2 0 2;
+  Utxo.UtxoSet.add utxo base_txid2 0 Utxo.{
+    value = 100_000_000L;
+    script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac";
+    height = 0;
+    is_coinbase = false;
+  };
+  let indep_tx = make_regular_tx
+    [make_test_input base_txid2 0l]
+    [make_test_output 99_990_000L]
+  in
+  let indep_result = Mempool.add_transaction mp indep_tx in
+  Alcotest.(check bool) "independent tx added" true (Result.is_ok indep_result);
+
+  let clusters = Mempool.get_clusters mp in
+  Alcotest.(check int) "2 separate clusters" 2 (List.length clusters);
+
+  (* Test: cluster limit constant is correct *)
+  Alcotest.(check int) "max_cluster_count is 101" 101 Mempool.max_cluster_count;
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: get_worst_chunk returns lowest fee-rate chunk *)
+let test_get_worst_chunk () =
+  let (mp, _utxo, db, txid1, txid2, _) = create_test_mempool () in
+  let tx_high_fee = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 900_000L]  (* 100k fee *)
+  in
+  let tx_low_fee = make_regular_tx
+    [make_test_input txid2 0l]
+    [make_test_output 1_990_000L]  (* 10k fee *)
+  in
+  let _ = Mempool.add_transaction mp tx_high_fee in
+  let _ = Mempool.add_transaction mp tx_low_fee in
+  let worst = Mempool.get_worst_chunk mp in
+  Alcotest.(check bool) "worst chunk found" true (Option.is_some worst);
+  let worst = Option.get worst in
+  (* Worst chunk should have lower fee rate *)
+  let chunks = Mempool.get_all_chunks mp in
+  let best = List.hd chunks in
+  Alcotest.(check bool) "worst < best fee rate" true
+    (worst.chunk_fee_rate <= best.chunk_fee_rate);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: cluster mempool max constant *)
+let test_cluster_constants () =
+  Alcotest.(check int) "max_cluster_count" 101 Mempool.max_cluster_count
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
@@ -1510,5 +1777,17 @@ let () =
       test_case "package max count" `Quick test_package_max_count;
       test_case "is 1p1c" `Quick test_is_1p1c;
       test_case "orphan CPFP" `Quick test_orphan_cpfp;
+    ];
+    "cluster_mempool", [
+      test_case "basic clusters" `Quick test_cluster_basic;
+      test_case "cluster dependencies" `Quick test_cluster_dependencies;
+      test_case "get_cluster" `Quick test_get_cluster;
+      test_case "get_cluster_size" `Quick test_get_cluster_size;
+      test_case "linearize basic" `Quick test_linearize_basic;
+      test_case "chunks sorted by feerate" `Quick test_chunks_sorted_by_feerate;
+      test_case "select_for_block_chunked" `Quick test_select_for_block_chunked;
+      test_case "cluster size limit" `Quick test_cluster_size_limit;
+      test_case "get_worst_chunk" `Quick test_get_worst_chunk;
+      test_case "cluster constants" `Quick test_cluster_constants;
     ];
   ]

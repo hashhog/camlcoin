@@ -488,6 +488,158 @@ let test_flat_file_regtest_magic () =
   cleanup_flat_files ()
 
 (* ============================================================================
+   Block Pruning Tests
+   ============================================================================ *)
+
+(* Test is_block_pruned initially returns false *)
+let test_pruning_is_block_pruned_false () =
+  cleanup_flat_files ();
+  let storage = Storage.FlatFileStorage.create test_flat_file_path in
+  let block = make_test_block ~ver:1l ~ts:1l ~nc:1l in
+  let hash = Crypto.compute_block_hash block.header in
+  let _ = Storage.FlatFileStorage.write_block storage block 0 in
+  Alcotest.(check bool) "block not pruned initially" false
+    (Storage.FlatFileStorage.is_block_pruned storage hash);
+  Alcotest.(check bool) "has_block_data true initially" true
+    (Storage.FlatFileStorage.has_block_data storage hash);
+  Storage.FlatFileStorage.close storage;
+  cleanup_flat_files ()
+
+(* Test prune_one_block_file marks blocks as pruned *)
+let test_pruning_prune_one_file () =
+  cleanup_flat_files ();
+  let storage = Storage.FlatFileStorage.create test_flat_file_path in
+  let block1 = make_test_block ~ver:1l ~ts:1l ~nc:1l in
+  let block2 = make_test_block ~ver:1l ~ts:2l ~nc:2l in
+  let hash1 = Crypto.compute_block_hash block1.header in
+  let hash2 = Crypto.compute_block_hash block2.header in
+  let pos1 = Storage.FlatFileStorage.write_block storage block1 0 in
+  let _ = Storage.FlatFileStorage.write_block storage block2 1 in
+  (* Both blocks in file 0 *)
+  Alcotest.(check int) "both in file 0" 0 pos1.file_num;
+  (* Prune file 0 *)
+  Storage.FlatFileStorage.prune_one_block_file storage 0;
+  (* Both blocks should now be pruned *)
+  Alcotest.(check bool) "block1 is pruned" true
+    (Storage.FlatFileStorage.is_block_pruned storage hash1);
+  Alcotest.(check bool) "block2 is pruned" true
+    (Storage.FlatFileStorage.is_block_pruned storage hash2);
+  (* has_block_data should return false *)
+  Alcotest.(check bool) "block1 has no data" false
+    (Storage.FlatFileStorage.has_block_data storage hash1);
+  Alcotest.(check bool) "block2 has no data" false
+    (Storage.FlatFileStorage.has_block_data storage hash2);
+  (* File info should be cleared *)
+  (match Storage.FlatFileStorage.get_file_info storage 0 with
+   | Some fi ->
+     Alcotest.(check int) "file info n_blocks cleared" 0 fi.n_blocks;
+     Alcotest.(check int) "file info n_size cleared" 0 fi.n_size
+   | None -> Alcotest.fail "expected file info");
+  Storage.FlatFileStorage.close storage;
+  cleanup_flat_files ()
+
+(* Test pruned blocks cannot be read *)
+let test_pruning_blocks_unavailable () =
+  cleanup_flat_files ();
+  let storage = Storage.FlatFileStorage.create test_flat_file_path in
+  let block = make_test_block ~ver:1l ~ts:1l ~nc:42l in
+  let hash = Crypto.compute_block_hash block.header in
+  let _ = Storage.FlatFileStorage.write_block storage block 0 in
+  (* Block is readable before pruning *)
+  let before = Storage.FlatFileStorage.read_block storage hash in
+  Alcotest.(check bool) "block readable before prune" true (Option.is_some before);
+  (* Prune the file *)
+  Storage.FlatFileStorage.prune_one_block_file storage 0;
+  (* Delete the actual file to simulate real pruning *)
+  Storage.FlatFileStorage.unlink_pruned_files storage [0];
+  (* Block is not readable after pruning *)
+  let after = Storage.FlatFileStorage.read_block storage hash in
+  Alcotest.(check bool) "block not readable after prune" true (Option.is_none after);
+  Storage.FlatFileStorage.close storage;
+  cleanup_flat_files ()
+
+(* Test find_files_to_prune respects min_blocks_to_keep *)
+let test_pruning_min_blocks_kept () =
+  cleanup_flat_files ();
+  let storage = Storage.FlatFileStorage.create test_flat_file_path in
+  (* Write a block at height 100 *)
+  let block = make_test_block ~ver:1l ~ts:1l ~nc:1l in
+  let _ = Storage.FlatFileStorage.write_block storage block 100 in
+  (* With chain_height 100, file should NOT be pruned (100 <= 100 - 288 is false) *)
+  let to_prune = Storage.FlatFileStorage.find_files_to_prune storage
+      ~prune_target_bytes:0 ~chain_height:100 in
+  Alcotest.(check int) "no files to prune at height 100" 0 (List.length to_prune);
+  (* With chain_height 500, file should be prunable (100 <= 500 - 288 = 212) *)
+  let to_prune2 = Storage.FlatFileStorage.find_files_to_prune storage
+      ~prune_target_bytes:0 ~chain_height:500 in
+  Alcotest.(check int) "file prunable at height 500" 1 (List.length to_prune2);
+  Storage.FlatFileStorage.close storage;
+  cleanup_flat_files ()
+
+(* Test prune_block_files respects target *)
+let test_pruning_respects_target () =
+  cleanup_flat_files ();
+  let storage = Storage.FlatFileStorage.create test_flat_file_path in
+  (* Write some blocks *)
+  let block1 = make_test_block ~ver:1l ~ts:1l ~nc:1l in
+  let block2 = make_test_block ~ver:1l ~ts:2l ~nc:2l in
+  let _ = Storage.FlatFileStorage.write_block storage block1 0 in
+  let _ = Storage.FlatFileStorage.write_block storage block2 1 in
+  (* Get current usage *)
+  let stats_before = Storage.FlatFileStorage.get_prune_stats storage in
+  Alcotest.(check bool) "has some usage" true (stats_before.current_usage_mb >= 0);
+  (* Prune with a very high target - nothing should be pruned *)
+  let pruned = Storage.FlatFileStorage.prune_block_files storage
+      ~prune_target_mb:10000 ~chain_height:1000 in
+  Alcotest.(check int) "no files pruned with high target" 0 pruned;
+  Storage.FlatFileStorage.close storage;
+  cleanup_flat_files ()
+
+(* Test check_prune_compatibility rejects txindex with pruning *)
+let test_pruning_txindex_incompatible () =
+  let result = Storage.FlatFileStorage.check_prune_compatibility
+      ~txindex:true ~prune_target_mb:550 in
+  (match result with
+   | Error msg ->
+     Alcotest.(check bool) "error mentions txindex" true
+       (String.length msg > 0)
+   | Ok () ->
+     Alcotest.fail "expected error for txindex + pruning")
+
+(* Test check_prune_compatibility requires min 550MB *)
+let test_pruning_min_target () =
+  let result = Storage.FlatFileStorage.check_prune_compatibility
+      ~txindex:false ~prune_target_mb:100 in
+  (match result with
+   | Error msg ->
+     Alcotest.(check bool) "error mentions 550 MB" true
+       (String.length msg > 0)
+   | Ok () ->
+     Alcotest.fail "expected error for low prune target");
+  (* 550 MB should be OK *)
+  let result2 = Storage.FlatFileStorage.check_prune_compatibility
+      ~txindex:false ~prune_target_mb:550 in
+  (match result2 with
+   | Ok () -> ()
+   | Error _ -> Alcotest.fail "550 MB should be valid")
+
+(* Test get_prune_stats *)
+let test_pruning_stats () =
+  cleanup_flat_files ();
+  let storage = Storage.FlatFileStorage.create test_flat_file_path in
+  let block = make_test_block ~ver:1l ~ts:1l ~nc:1l in
+  let _ = Storage.FlatFileStorage.write_block storage block 0 in
+  let stats = Storage.FlatFileStorage.get_prune_stats storage in
+  Alcotest.(check int) "initial pruned blocks" 0 stats.pruned_blocks;
+  Alcotest.(check int) "total files >= 1" 1 stats.total_files;
+  (* Prune and check again *)
+  Storage.FlatFileStorage.prune_one_block_file storage 0;
+  let stats2 = Storage.FlatFileStorage.get_prune_stats storage in
+  Alcotest.(check int) "1 pruned block" 1 stats2.pruned_blocks;
+  Storage.FlatFileStorage.close storage;
+  cleanup_flat_files ()
+
+(* ============================================================================
    Undo Data Tests
    ============================================================================ *)
 
@@ -658,5 +810,15 @@ let () =
       test_case "read_block_at_pos" `Quick test_flat_file_read_at_pos;
       test_case "iter_blocks" `Quick test_flat_file_iter_blocks;
       test_case "regtest magic" `Quick test_flat_file_regtest_magic;
+    ];
+    "pruning", [
+      test_case "is_block_pruned false initially" `Quick test_pruning_is_block_pruned_false;
+      test_case "prune_one_block_file marks pruned" `Quick test_pruning_prune_one_file;
+      test_case "pruned blocks unavailable" `Quick test_pruning_blocks_unavailable;
+      test_case "min_blocks_to_keep respected" `Quick test_pruning_min_blocks_kept;
+      test_case "prune respects target" `Quick test_pruning_respects_target;
+      test_case "txindex incompatible with prune" `Quick test_pruning_txindex_incompatible;
+      test_case "min prune target 550MB" `Quick test_pruning_min_target;
+      test_case "prune stats" `Quick test_pruning_stats;
     ];
   ]

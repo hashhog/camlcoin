@@ -48,6 +48,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] sendrawtransaction broadcast (mempool validation, maxfeerate/maxburnamount, peer relay)
 - [x] getrawtransaction RPC (mempool lookup, txindex, blockhash param, verbose JSON)
 - [x] Flat file block storage (blk/rev files, block index, 128MB file rotation)
+- [x] Block pruning (-prune=N, 550MB minimum, txindex incompatible, 288 block safety margin)
 - [ ] Compact block relay (BIP 152)
 - [ ] Bloom filters (BIP 37)
 

@@ -889,3 +889,387 @@ let difficulty_from_bits (bits : int32) : float =
 (* Look up the expected block hash for a checkpoint height *)
 let get_checkpoint_hash (height : int) (network : network_config) : Types.hash256 option =
   List.assoc_opt height network.checkpoints
+
+(* ============================================================================
+   BIP9 Version Bits State Machine (versionbits)
+   ============================================================================ *)
+
+(* BIP9 deployment state machine states *)
+type deployment_state =
+  | Defined    (* Initial state for each deployment. Genesis block is by definition here. *)
+  | Started    (* For blocks past the start time. *)
+  | LockedIn   (* Threshold met, activation pending. *)
+  | Active     (* Final state after LockedIn period. *)
+  | Failed     (* Timeout reached before LockedIn (terminal). *)
+
+(* String representation of deployment state (for debugging/RPC) *)
+let string_of_deployment_state = function
+  | Defined  -> "defined"
+  | Started  -> "started"
+  | LockedIn -> "locked_in"
+  | Active   -> "active"
+  | Failed   -> "failed"
+
+(* BIP9 deployment parameters *)
+type deployment = {
+  name : string;                   (* Human-readable name (e.g., "segwit", "taproot") *)
+  bit : int;                       (* Bit position in nVersion (0-28) *)
+  start_time : int64;              (* Start MedianTime for signaling *)
+  timeout : int64;                 (* Timeout MedianTime for deployment *)
+  min_activation_height : int;     (* Minimum height for activation after LockedIn *)
+  period : int;                    (* Period for checking signals (usually 2016) *)
+  threshold : int;                 (* Minimum signals needed in period *)
+}
+
+(* Special start_time values *)
+let always_active = -1L     (* Deployment is always active (for testing) *)
+let never_active = -2L      (* Deployment is never active (disabled) *)
+
+(* Default threshold values *)
+let mainnet_threshold = 1815   (* ~90% of 2016 *)
+let testnet_threshold = 1512   (* 75% of 2016 for test networks *)
+
+(* Known deployments *)
+type deployment_pos =
+  | Deployment_testdummy    (* For testing versionbits logic *)
+  | Deployment_taproot      (* BIP 341/342 *)
+
+(* Check if a block version signals for a deployment bit.
+   Version must have top 3 bits = 001 (0x20000000 mask) and the specific bit set. *)
+let version_signals_bit (version : int32) (bit : int) : bool =
+  let top_mask = 0xE0000000l in
+  let top_bits = 0x20000000l in
+  let bit_mask = Int32.shift_left 1l bit in
+  Int32.logand version top_mask = top_bits &&
+  Int32.logand version bit_mask <> 0l
+
+(* Compute the bit mask for a deployment *)
+let deployment_mask (dep : deployment) : int32 =
+  Int32.shift_left 1l dep.bit
+
+(* Abstract block index for BIP9 state computation.
+   Callers must provide functions to traverse the chain. *)
+type block_index = {
+  height : int;
+  version : int32;
+  median_time_past : int64;  (* MTP of this block *)
+}
+
+(* Cache for deployment states per block height.
+   Key is the height of the first block of the retarget period.
+   In Bitcoin Core, the cache is keyed by the block *before* the period start,
+   but we key by the period start height for simplicity. *)
+module DeploymentCache = Map.Make(Int)
+
+type deployment_cache = deployment_state DeploymentCache.t
+
+(* Get the height of the first block of the retarget period containing `height`.
+   For height H, period start is: H - (H mod period)
+   But Bitcoin Core computes state based on pindexPrev, so the first block
+   of the period *being computed for* is at height that's a multiple of period.
+
+   For a block at height H, its state is determined by:
+   - Looking at the period ending at the last retarget boundary before H
+   - pindexPrev = H - 1, so pindexPrev adjusted = pindexPrev - ((pindexPrev + 1) % period)
+
+   This gives us the last block of the previous period (or the block before period start). *)
+let period_start_height (height : int) (period : int) : int =
+  height - (height mod period)
+
+(* Get the state for a deployment at a given block height.
+
+   This implements the BIP9 state machine:
+   - DEFINED: Initial state, before start_time MTP is reached
+   - STARTED: After start_time MTP, counting signals
+   - LOCKED_IN: Threshold met, waiting for activation
+   - ACTIVE: Deployment is active (terminal state)
+   - FAILED: Timeout reached before threshold (terminal state)
+
+   Parameters:
+   - dep: The deployment parameters
+   - height: Height of the block we're computing state for
+   - get_block: Function to get block info at a given height
+   - count_signals: Function to count signaling blocks in a period
+   - cache: Mutable cache reference for optimization
+
+   Returns the deployment state for the given height. *)
+let get_deployment_state
+    ~(dep : deployment)
+    ~(height : int)
+    ~(get_block : int -> block_index option)
+    ~(count_signals : start_height:int -> int)
+    ~(cache : deployment_cache ref)
+    : deployment_state =
+
+  (* Handle special start_time values *)
+  if dep.start_time = always_active then Active
+  else if dep.start_time = never_active then Failed
+  else begin
+    let period = dep.period in
+
+    (* State is computed for retarget periods. Find the period containing this height. *)
+    let period_start = period_start_height height period in
+
+    (* Check cache first *)
+    match DeploymentCache.find_opt period_start !cache with
+    | Some state -> state
+    | None ->
+      (* Need to compute state by walking back through periods *)
+
+      (* Collect periods we need to compute, working backwards *)
+      let rec collect_periods ps start =
+        if start < 0 then ps
+        else
+          match DeploymentCache.find_opt start !cache with
+          | Some _ -> ps  (* Found cached state, stop here *)
+          | None ->
+            let prev_start = start - period in
+            collect_periods (start :: ps) prev_start
+      in
+      let periods_to_compute = collect_periods [] period_start in
+
+      (* Get the state before the first period we need to compute *)
+      let initial_state =
+        if periods_to_compute = [] then
+          DeploymentCache.find period_start !cache
+        else
+          let first = List.hd periods_to_compute in
+          let prev_start = first - period in
+          if prev_start < 0 then Defined
+          else
+            match DeploymentCache.find_opt prev_start !cache with
+            | Some s -> s
+            | None ->
+              (* Genesis period is always Defined *)
+              Defined
+      in
+
+      (* Walk forward computing states for each period *)
+      let rec compute_states state = function
+        | [] -> state
+        | period_start :: rest ->
+          let new_state =
+            (* Get the block at the end of this period (pindexPrev in Bitcoin Core) *)
+            let period_end = period_start + period - 1 in
+            match get_block period_end with
+            | None ->
+              (* No block at this height yet, state is inherited *)
+              state
+            | Some block ->
+              match state with
+              | Defined ->
+                (* Transition to Started if MTP >= start_time *)
+                if block.median_time_past >= dep.start_time then
+                  Started
+                else
+                  Defined
+              | Started ->
+                (* Count signals in this period *)
+                let count = count_signals ~start_height:period_start in
+                if count >= dep.threshold then
+                  LockedIn
+                else if block.median_time_past >= dep.timeout then
+                  Failed
+                else
+                  Started
+              | LockedIn ->
+                (* Transition to Active if min_activation_height reached *)
+                (* The next period starts at period_start + period *)
+                let next_period_start = period_start + period in
+                if next_period_start >= dep.min_activation_height then
+                  Active
+                else
+                  LockedIn
+              | Active -> Active    (* Terminal state *)
+              | Failed -> Failed    (* Terminal state *)
+          in
+          (* Cache this period's state *)
+          cache := DeploymentCache.add period_start new_state !cache;
+          compute_states new_state rest
+      in
+      compute_states initial_state periods_to_compute
+  end
+
+(* Count signaling blocks in a period.
+   Helper function that counts blocks with the deployment bit set. *)
+let count_signals_in_period
+    ~(dep : deployment)
+    ~(start_height : int)
+    ~(get_block : int -> block_index option)
+    : int =
+  let period = dep.period in
+  let rec count acc h =
+    if h >= start_height + period then acc
+    else
+      match get_block h with
+      | None -> acc
+      | Some block ->
+        let signaling = version_signals_bit block.version dep.bit in
+        count (if signaling then acc + 1 else acc) (h + 1)
+  in
+  count 0 start_height
+
+(* BIP9 statistics for a deployment during Started state *)
+type bip9_stats = {
+  period_length : int;       (* Period length in blocks *)
+  threshold_count : int;     (* Threshold needed for lock-in *)
+  elapsed : int;             (* Blocks elapsed in current period *)
+  signaling_count : int;     (* Blocks signaling so far *)
+  possible : bool;           (* Can still reach threshold? *)
+}
+
+(* Get BIP9 statistics for current period *)
+let get_bip9_stats
+    ~(dep : deployment)
+    ~(height : int)
+    ~(get_block : int -> block_index option)
+    : bip9_stats =
+  let period = dep.period in
+  let period_start = period_start_height height period in
+  let elapsed = (height mod period) + 1 in
+
+  (* Count signals so far in this period *)
+  let rec count_signals acc h =
+    if h > height then acc
+    else
+      match get_block h with
+      | None -> acc
+      | Some block ->
+        let signaling = version_signals_bit block.version dep.bit in
+        count_signals (if signaling then acc + 1 else acc) (h + 1)
+  in
+  let signaling_count = count_signals 0 period_start in
+
+  (* Check if threshold is still possible *)
+  let remaining = period - elapsed in
+  let possible = signaling_count + remaining >= dep.threshold in
+
+  {
+    period_length = period;
+    threshold_count = dep.threshold;
+    elapsed;
+    signaling_count;
+    possible;
+  }
+
+(* Compute block version for mining.
+   Sets the deployment bits for any deployment in Started or LockedIn state.
+
+   Returns a version with:
+   - Top bits = 0x20000000 (versionbits signaling)
+   - Deployment bits set for active signaling *)
+let compute_block_version
+    ~(deployments : deployment list)
+    ~(height : int)
+    ~(get_block : int -> block_index option)
+    ~(caches : (deployment_pos * deployment_cache ref) list)
+    : int32 =
+  let base_version = versionbits_top_bits in
+
+  List.fold_left (fun version (pos, dep) ->
+    (* Find the cache for this deployment *)
+    let cache =
+      match List.assoc_opt pos caches with
+      | Some c -> c
+      | None -> ref DeploymentCache.empty
+    in
+    let state = get_deployment_state
+      ~dep
+      ~height
+      ~get_block
+      ~count_signals:(fun ~start_height ->
+        count_signals_in_period ~dep ~start_height ~get_block)
+      ~cache
+    in
+    match state with
+    | Started | LockedIn ->
+      (* Set the bit for this deployment *)
+      Int32.logor version (deployment_mask dep)
+    | _ -> version
+  ) base_version (List.combine (List.map fst caches) deployments)
+
+(* ============================================================================
+   Deployment configurations for each network
+   ============================================================================ *)
+
+(* Mainnet Taproot deployment (BIP 341/342) *)
+let mainnet_taproot : deployment = {
+  name = "taproot";
+  bit = 2;
+  start_time = 1619222400L;       (* April 24, 2021 00:00:00 UTC *)
+  timeout = 1628640000L;          (* August 11, 2021 00:00:00 UTC *)
+  min_activation_height = 709632; (* Actual activation height *)
+  period = 2016;
+  threshold = 1815;               (* 90% of 2016 *)
+}
+
+(* Testnet4 Taproot deployment (always active from genesis) *)
+let testnet4_taproot : deployment = {
+  name = "taproot";
+  bit = 2;
+  start_time = always_active;
+  timeout = 0L;
+  min_activation_height = 0;
+  period = 2016;
+  threshold = 1512;
+}
+
+(* Regtest Taproot deployment (always active from genesis) *)
+let regtest_taproot : deployment = {
+  name = "taproot";
+  bit = 2;
+  start_time = always_active;
+  timeout = 0L;
+  min_activation_height = 0;
+  period = 144;  (* Regtest uses 144 block periods *)
+  threshold = 108;
+}
+
+(* Test dummy deployment (for testing versionbits logic) *)
+let testdummy_deployment : deployment = {
+  name = "testdummy";
+  bit = 28;
+  start_time = never_active;
+  timeout = 0L;
+  min_activation_height = 0;
+  period = 2016;
+  threshold = 1815;
+}
+
+(* Check if a deployment is active at a given height *)
+let is_deployment_active
+    ~(dep : deployment)
+    ~(height : int)
+    ~(get_block : int -> block_index option)
+    ~(cache : deployment_cache ref)
+    : bool =
+  let state = get_deployment_state
+    ~dep
+    ~height
+    ~get_block
+    ~count_signals:(fun ~start_height ->
+      count_signals_in_period ~dep ~start_height ~get_block)
+    ~cache
+  in
+  state = Active
+
+(* ============================================================================
+   VersionBits cache management
+   ============================================================================ *)
+
+(* Full cache for all deployments *)
+type versionbits_cache = {
+  taproot : deployment_cache ref;
+  testdummy : deployment_cache ref;
+}
+
+(* Create a new empty cache *)
+let create_versionbits_cache () : versionbits_cache = {
+  taproot = ref DeploymentCache.empty;
+  testdummy = ref DeploymentCache.empty;
+}
+
+(* Clear all cached states (needed on reorg) *)
+let clear_versionbits_cache (cache : versionbits_cache) : unit =
+  cache.taproot := DeploymentCache.empty;
+  cache.testdummy := DeploymentCache.empty

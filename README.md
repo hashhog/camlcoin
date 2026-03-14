@@ -38,7 +38,8 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Wallet (BIP-39 mnemonic, BIP-32/44/84/86 derivation, coin selection with BnB+SRD, passphrase encryption with PBKDF2-SHA512, multi-wallet support)
 - [x] Command-line interface
 - [x] Test suite (Alcotest unit tests, QCheck property-based tests)
-- [x] Performance optimization (LRU cache, compact headers, benchmarks)
+- [x] Performance optimization (LRU cache, compact headers, benchmarks, parallel validation)
+- [x] Hardware-accelerated cryptography (libsecp256k1 FFI, batch Schnorr verification, ECDSA fast path)
 - [x] Misbehavior scoring and peer banning (100-point threshold, 24h bans)
 - [x] Pre-handshake message rejection (60s timeout, self-connection detection)
 - [x] Inventory trickling (Poisson-scheduled tx relay, 5s inbound, 2s outbound)

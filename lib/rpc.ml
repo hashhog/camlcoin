@@ -279,6 +279,53 @@ let handle_getdifficulty (ctx : rpc_context) : Yojson.Safe.t =
   | None -> `Float 1.0
 
 (* ============================================================================
+   Block Invalidation Handlers
+   ============================================================================ *)
+
+(* Parse block hash from hex display format (reversed) to internal format *)
+let parse_blockhash_hex (hex : string) : (Types.hash256, string) result =
+  let hex = String.lowercase_ascii hex in
+  if String.length hex <> 64 then
+    Error "Invalid block hash: must be 64 hex characters"
+  else begin
+    let hash_bytes = Types.hash256_of_hex hex in
+    (* Reverse for internal format *)
+    let hash = Cstruct.create 32 in
+    for i = 0 to 31 do
+      Cstruct.set_uint8 hash i (Cstruct.get_uint8 hash_bytes (31 - i))
+    done;
+    Ok hash
+  end
+
+(* invalidateblock - permanently marks a block as invalid *)
+let handle_invalidateblock (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String blockhash_hex] ->
+    (match parse_blockhash_hex blockhash_hex with
+     | Error msg -> Error msg
+     | Ok hash ->
+       match Sync.invalidate_block ctx.chain hash with
+       | Ok _new_height -> Ok `Null
+       | Error msg -> Error msg)
+  | _ ->
+    Error "Invalid parameters: expected [blockhash]"
+
+(* reconsiderblock - removes invalidity status of a block *)
+let handle_reconsiderblock (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String blockhash_hex] ->
+    (match parse_blockhash_hex blockhash_hex with
+     | Error msg -> Error msg
+     | Ok hash ->
+       match Sync.reconsider_block ctx.chain hash with
+       | Ok _new_height -> Ok `Null
+       | Error msg -> Error msg)
+  | _ ->
+    Error "Invalid parameters: expected [blockhash]"
+
+(* ============================================================================
    Transaction Handlers
    ============================================================================ *)
 
@@ -2117,6 +2164,8 @@ let handle_help (_ctx : rpc_context)
       "";
       "== Blockchain ==";
       "gettxout \"txid\" vout";
+      "invalidateblock \"blockhash\"";
+      "reconsiderblock \"blockhash\"";
       "";
       "== Util ==";
       "estimatesmartfee conf_target";
@@ -2184,6 +2233,14 @@ let dispatch_rpc (ctx : rpc_context)
      | Error msg -> Error (rpc_misc_error, msg))
   | "getblockstats" ->
     (match handle_getblockstats ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "invalidateblock" ->
+    (match handle_invalidateblock ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "reconsiderblock" ->
+    (match handle_reconsiderblock ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
 

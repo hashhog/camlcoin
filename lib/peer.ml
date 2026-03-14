@@ -1,5 +1,8 @@
 (* Bitcoin P2P peer connection and handshake management using Lwt *)
 
+let log_src = Logs.Src.create "PEER" ~doc:"Peer connection"
+module Log = (val Logs.src_log log_src : Logs.LOG)
+
 (* Peer connection states *)
 type peer_state =
   | Connecting
@@ -485,6 +488,23 @@ let record_misbehavior_for (peer : peer) (infraction : string) : [`Ok | `Ban] =
     | _ -> 1
   in
   record_misbehavior peer score
+
+(* Misbehaving: record misbehavior, log it, and disconnect if score reaches threshold.
+   This is the async version that handles disconnection. The ban itself should be
+   handled by peer_manager which has access to the ban table. *)
+let misbehaving (peer : peer) (score : int) (message : string) : unit Lwt.t =
+  let open Lwt.Syntax in
+  peer.misbehavior_score <- peer.misbehavior_score + score;
+  let message_prefixed = if message = "" then "" else ": " ^ message in
+  Log.info (fun m -> m "Misbehaving: peer=%d score=%d total=%d%s"
+    peer.id score peer.misbehavior_score message_prefixed);
+  if peer.misbehavior_score >= 100 then begin
+    Log.info (fun m -> m "Disconnecting misbehaving peer %d (%s) total_score=%d"
+      peer.id peer.addr peer.misbehavior_score);
+    let* () = disconnect peer in
+    Lwt.return_unit
+  end else
+    Lwt.return_unit
 
 (* Message rate limiting (Gap 15) *)
 let check_rate_limit (peer : peer) : bool =

@@ -469,6 +469,57 @@ let is_segwit addr =
 let hash_length addr =
   Cstruct.length addr.hash
 
+(* Convert an address to its corresponding scriptPubKey *)
+let address_to_script (addr : address) : Cstruct.t =
+  match addr.addr_type with
+  | P2PKH ->
+    (* OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG *)
+    let script = Cstruct.create 25 in
+    Cstruct.set_uint8 script 0 0x76;  (* OP_DUP *)
+    Cstruct.set_uint8 script 1 0xa9;  (* OP_HASH160 *)
+    Cstruct.set_uint8 script 2 0x14;  (* push 20 bytes *)
+    Cstruct.blit addr.hash 0 script 3 20;
+    Cstruct.set_uint8 script 23 0x88; (* OP_EQUALVERIFY *)
+    Cstruct.set_uint8 script 24 0xac; (* OP_CHECKSIG *)
+    script
+  | P2SH ->
+    (* OP_HASH160 <20 bytes> OP_EQUAL *)
+    let script = Cstruct.create 23 in
+    Cstruct.set_uint8 script 0 0xa9;  (* OP_HASH160 *)
+    Cstruct.set_uint8 script 1 0x14;  (* push 20 bytes *)
+    Cstruct.blit addr.hash 0 script 2 20;
+    Cstruct.set_uint8 script 22 0x87; (* OP_EQUAL *)
+    script
+  | P2WPKH ->
+    (* OP_0 <20 bytes> *)
+    let script = Cstruct.create 22 in
+    Cstruct.set_uint8 script 0 0x00;  (* OP_0 *)
+    Cstruct.set_uint8 script 1 0x14;  (* push 20 bytes *)
+    Cstruct.blit addr.hash 0 script 2 20;
+    script
+  | P2WSH ->
+    (* OP_0 <32 bytes> *)
+    let script = Cstruct.create 34 in
+    Cstruct.set_uint8 script 0 0x00;  (* OP_0 *)
+    Cstruct.set_uint8 script 1 0x20;  (* push 32 bytes *)
+    Cstruct.blit addr.hash 0 script 2 32;
+    script
+  | P2TR ->
+    (* OP_1 <32 bytes> *)
+    let script = Cstruct.create 34 in
+    Cstruct.set_uint8 script 0 0x51;  (* OP_1 *)
+    Cstruct.set_uint8 script 1 0x20;  (* push 32 bytes *)
+    Cstruct.blit addr.hash 0 script 2 32;
+    script
+  | WitnessUnknown v ->
+    (* OP_v <data> *)
+    let data_len = Cstruct.length addr.hash in
+    let script = Cstruct.create (2 + data_len) in
+    Cstruct.set_uint8 script 0 (0x50 + v);  (* OP_v *)
+    Cstruct.set_uint8 script 1 data_len;     (* push data_len bytes *)
+    Cstruct.blit addr.hash 0 script 2 data_len;
+    script
+
 (* ========== Simplified Address Encoding/Decoding ========== *)
 
 (* Encode a P2PKH address from pubkey hash and version byte *)

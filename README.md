@@ -54,6 +54,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Block indexes (hash index, height index, BIP-157/158 compact block filters with GCS)
 - [x] Compact block relay (BIP 152, SipHash, short IDs, block reconstruction)
 - [x] Package relay (BIP 331, 1p1c topology, CPFP fee-bumping, topological sort)
+- [x] PSBT (BIP-174, creator/updater/signer/combiner/finalizer/extractor roles, taproot support)
 - [ ] Bloom filters (BIP 37)
 
 ## Quick start
@@ -94,6 +95,7 @@ camlcoin/
     wallet.ml         HD wallet, BIP-39/44/84/86, coin selection, encrypted storage
     bip39.ml          mnemonic generation and seed derivation
     block_index.ml    block indexes, BIP-157/158 filters, height index
+    psbt.ml           PSBT (BIP-174) multi-party signing
     perf.ml           performance utilities and benchmarks
     cli.ml            command line interface
     camlcoin.ml       library interface

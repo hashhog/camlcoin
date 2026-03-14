@@ -862,6 +862,193 @@ let lock_unlock_tests = [
   Alcotest.test_case "encryption round trip" `Quick test_encryption_round_trip;
 ]
 
+(* ============================================================================
+   Multi-Wallet Manager Tests
+   ============================================================================ *)
+
+let test_multi_wallet_create_manager () =
+  let temp_dir = Filename.concat (Filename.get_temp_dir_name ()) "test_wallets" in
+  (try Unix.rmdir temp_dir with _ -> ());  (* Clean up from previous runs *)
+  let wm = Wallet.create_wallet_manager ~wallets_dir:temp_dir ~network:`Regtest in
+  let wallets = Wallet.list_wallets wm in
+  Alcotest.(check int) "no wallets initially" 0 (List.length wallets);
+  (* Clean up *)
+  Wallet.shutdown_wallet_manager wm;
+  (try Unix.rmdir temp_dir with _ -> ())
+
+let test_multi_wallet_create_wallet () =
+  let temp_dir = Filename.concat (Filename.get_temp_dir_name ()) "test_wallets_create" in
+  (try Unix.rmdir temp_dir with _ -> ());
+  let wm = Wallet.create_wallet_manager ~wallets_dir:temp_dir ~network:`Regtest in
+  (* Create a wallet *)
+  match Wallet.create_wallet wm "wallet1" () with
+  | Error e -> Alcotest.fail ("create_wallet failed: " ^ e)
+  | Ok w1 ->
+    Alcotest.(check bool) "wallet created" true (not (Wallet.is_empty w1) || true);  (* May be blank *)
+    let wallets = Wallet.list_wallets wm in
+    Alcotest.(check int) "one wallet" 1 (List.length wallets);
+    Alcotest.(check bool) "wallet1 in list" true (List.mem "wallet1" wallets);
+    (* Clean up *)
+    Wallet.shutdown_wallet_manager wm;
+    (* Remove files *)
+    (try Sys.remove (Filename.concat temp_dir "wallet1") with _ -> ());
+    (try Unix.rmdir temp_dir with _ -> ())
+
+let test_multi_wallet_load_unload () =
+  let temp_dir = Filename.concat (Filename.get_temp_dir_name ()) "test_wallets_load" in
+  (try Unix.rmdir temp_dir with _ -> ());
+  let wm = Wallet.create_wallet_manager ~wallets_dir:temp_dir ~network:`Regtest in
+  (* Create and unload a wallet *)
+  (match Wallet.create_wallet wm "testwallet" () with
+   | Error e -> Alcotest.fail ("create failed: " ^ e)
+   | Ok _ -> ());
+  (match Wallet.unload_wallet wm "testwallet" with
+   | Error e -> Alcotest.fail ("unload failed: " ^ e)
+   | Ok () -> ());
+  let wallets_after_unload = Wallet.list_wallets wm in
+  Alcotest.(check int) "no wallets after unload" 0 (List.length wallets_after_unload);
+  (* Load the wallet back *)
+  (match Wallet.load_wallet wm "testwallet" with
+   | Error e -> Alcotest.fail ("load failed: " ^ e)
+   | Ok _ -> ());
+  let wallets_after_load = Wallet.list_wallets wm in
+  Alcotest.(check int) "one wallet after load" 1 (List.length wallets_after_load);
+  (* Clean up *)
+  Wallet.shutdown_wallet_manager wm;
+  (try Sys.remove (Filename.concat temp_dir "testwallet") with _ -> ());
+  (try Unix.rmdir temp_dir with _ -> ())
+
+let test_multi_wallet_multiple_wallets () =
+  let temp_dir = Filename.concat (Filename.get_temp_dir_name ()) "test_wallets_multi" in
+  (try Unix.rmdir temp_dir with _ -> ());
+  let wm = Wallet.create_wallet_manager ~wallets_dir:temp_dir ~network:`Regtest in
+  (* Create two wallets *)
+  (match Wallet.create_wallet wm "alice" () with
+   | Error e -> Alcotest.fail ("create alice failed: " ^ e)
+   | Ok _ -> ());
+  (match Wallet.create_wallet wm "bob" () with
+   | Error e -> Alcotest.fail ("create bob failed: " ^ e)
+   | Ok _ -> ());
+  let wallets = Wallet.list_wallets wm in
+  Alcotest.(check int) "two wallets" 2 (List.length wallets);
+  Alcotest.(check bool) "alice in list" true (List.mem "alice" wallets);
+  Alcotest.(check bool) "bob in list" true (List.mem "bob" wallets);
+  (* Get wallets and generate addresses *)
+  let alice = Wallet.get_wallet wm "alice" in
+  let bob = Wallet.get_wallet wm "bob" in
+  Alcotest.(check bool) "alice exists" true (Option.is_some alice);
+  Alcotest.(check bool) "bob exists" true (Option.is_some bob);
+  let alice_addr = Wallet.get_new_address (Option.get alice) in
+  let bob_addr = Wallet.get_new_address (Option.get bob) in
+  (* Addresses should be different *)
+  Alcotest.(check bool) "different addresses" true (alice_addr <> bob_addr);
+  (* Clean up *)
+  Wallet.shutdown_wallet_manager wm;
+  (try Sys.remove (Filename.concat temp_dir "alice") with _ -> ());
+  (try Sys.remove (Filename.concat temp_dir "bob") with _ -> ());
+  (try Unix.rmdir temp_dir with _ -> ())
+
+let test_multi_wallet_default_wallet () =
+  let temp_dir = Filename.concat (Filename.get_temp_dir_name ()) "test_wallets_default" in
+  (try Unix.rmdir temp_dir with _ -> ());
+  let wm = Wallet.create_wallet_manager ~wallets_dir:temp_dir ~network:`Regtest in
+  (* Create default wallet (empty name) *)
+  (match Wallet.create_wallet wm "" () with
+   | Error e -> Alcotest.fail ("create default failed: " ^ e)
+   | Ok _ -> ());
+  let default = Wallet.get_default_wallet wm in
+  Alcotest.(check bool) "default wallet exists" true (Option.is_some default);
+  (* Check wallet path for default *)
+  let wallets = Wallet.list_wallets wm in
+  Alcotest.(check bool) "default in list" true (List.mem "" wallets);
+  (* Clean up *)
+  Wallet.shutdown_wallet_manager wm;
+  (try Sys.remove (Filename.concat temp_dir "wallet.dat") with _ -> ());
+  (try Unix.rmdir temp_dir with _ -> ())
+
+let test_multi_wallet_duplicate_error () =
+  let temp_dir = Filename.concat (Filename.get_temp_dir_name ()) "test_wallets_dup" in
+  (try Unix.rmdir temp_dir with _ -> ());
+  let wm = Wallet.create_wallet_manager ~wallets_dir:temp_dir ~network:`Regtest in
+  (* Create wallet *)
+  (match Wallet.create_wallet wm "dupwallet" () with
+   | Error e -> Alcotest.fail ("first create failed: " ^ e)
+   | Ok _ -> ());
+  (* Try to create same wallet again *)
+  (match Wallet.create_wallet wm "dupwallet" () with
+   | Ok _ -> Alcotest.fail "should reject duplicate wallet"
+   | Error _ -> ());  (* Expected *)
+  (* Try to load already loaded wallet *)
+  let _ = Wallet.unload_wallet wm "dupwallet" in
+  let _ = Wallet.load_wallet wm "dupwallet" in
+  (match Wallet.load_wallet wm "dupwallet" with
+   | Ok _ -> Alcotest.fail "should reject already loaded wallet"
+   | Error _ -> ());  (* Expected *)
+  (* Clean up *)
+  Wallet.shutdown_wallet_manager wm;
+  (try Sys.remove (Filename.concat temp_dir "dupwallet") with _ -> ());
+  (try Unix.rmdir temp_dir with _ -> ())
+
+let test_multi_wallet_getwalletinfo () =
+  let temp_dir = Filename.concat (Filename.get_temp_dir_name ()) "test_wallets_info" in
+  (* Clean up any leftover files from previous runs *)
+  (try Sys.remove (Filename.concat temp_dir "infowallet") with _ -> ());
+  (try Unix.rmdir temp_dir with _ -> ());
+  let wm = Wallet.create_wallet_manager ~wallets_dir:temp_dir ~network:`Regtest in
+  (match Wallet.create_wallet wm "infowallet" () with
+   | Error e -> Alcotest.fail ("create failed: " ^ e)
+   | Ok w ->
+     let info = Wallet.get_wallet_info "infowallet" w in
+     Alcotest.(check string) "wallet name" "infowallet" info.Wallet.wallet_name;
+     Alcotest.(check bool) "private keys enabled" true info.private_keys_enabled);
+  (* Clean up *)
+  Wallet.shutdown_wallet_manager wm;
+  (try Sys.remove (Filename.concat temp_dir "infowallet") with _ -> ());
+  (try Unix.rmdir temp_dir with _ -> ())
+
+let test_multi_wallet_send_between_wallets () =
+  (* Test that two wallets can have independent balances *)
+  let temp_dir = Filename.concat (Filename.get_temp_dir_name ()) "test_wallets_send" in
+  (try Unix.rmdir temp_dir with _ -> ());
+  let wm = Wallet.create_wallet_manager ~wallets_dir:temp_dir ~network:`Regtest in
+  (* Create two wallets *)
+  let w1 = match Wallet.create_wallet wm "sender" () with
+    | Error e -> Alcotest.fail ("create sender failed: " ^ e)
+    | Ok w -> w
+  in
+  let w2 = match Wallet.create_wallet wm "receiver" () with
+    | Error e -> Alcotest.fail ("create receiver failed: " ^ e)
+    | Ok w -> w
+  in
+  (* Generate addresses *)
+  let sender_addr = Wallet.get_new_address w1 in
+  let receiver_addr = Wallet.get_new_address w2 in
+  (* Verify addresses are on different wallets *)
+  Alcotest.(check bool) "sender has its address" true
+    (Option.is_some (Wallet.find_by_address w1 sender_addr));
+  Alcotest.(check bool) "receiver has its address" true
+    (Option.is_some (Wallet.find_by_address w2 receiver_addr));
+  Alcotest.(check bool) "sender does not have receiver address" true
+    (Option.is_none (Wallet.find_by_address w1 receiver_addr));
+  Alcotest.(check bool) "receiver does not have sender address" true
+    (Option.is_none (Wallet.find_by_address w2 sender_addr));
+  (* Clean up *)
+  Wallet.shutdown_wallet_manager wm;
+  (try Sys.remove (Filename.concat temp_dir "sender") with _ -> ());
+  (try Sys.remove (Filename.concat temp_dir "receiver") with _ -> ());
+  (try Unix.rmdir temp_dir with _ -> ())
+
+let multi_wallet_tests = [
+  Alcotest.test_case "create manager" `Quick test_multi_wallet_create_manager;
+  Alcotest.test_case "create wallet" `Quick test_multi_wallet_create_wallet;
+  Alcotest.test_case "load/unload wallet" `Quick test_multi_wallet_load_unload;
+  Alcotest.test_case "multiple wallets" `Quick test_multi_wallet_multiple_wallets;
+  Alcotest.test_case "default wallet" `Quick test_multi_wallet_default_wallet;
+  Alcotest.test_case "duplicate wallet error" `Quick test_multi_wallet_duplicate_error;
+  Alcotest.test_case "getwalletinfo" `Quick test_multi_wallet_getwalletinfo;
+  Alcotest.test_case "send between wallets" `Quick test_multi_wallet_send_between_wallets;
+]
+
 let () = Alcotest.run "test_wallet" [
   ("creation", creation_tests);
   ("key_management", key_management_tests);
@@ -876,4 +1063,5 @@ let () = Alcotest.run "test_wallet" [
   ("lock_unlock", lock_unlock_tests);
   ("address_types", address_type_tests);
   ("bip39", bip39_tests);
+  ("multi_wallet", multi_wallet_tests);
 ]

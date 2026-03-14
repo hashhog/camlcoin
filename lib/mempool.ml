@@ -1246,6 +1246,38 @@ let clear (mp : mempool) : unit =
   mp.total_fee <- 0L
 
 (* ============================================================================
+   Compact Block Support (BIP 152)
+   ============================================================================ *)
+
+(* Find transaction by short ID for compact block reconstruction *)
+let find_by_short_id (mp : mempool) ~(k0 : int64) ~(k1 : int64) (short_id : int64)
+    : Types.transaction option =
+  let result = ref None in
+  Hashtbl.iter (fun _ entry ->
+    if !result = None then begin
+      let computed_sid = Crypto.compute_short_txid k0 k1 entry.wtxid in
+      if computed_sid = short_id then
+        result := Some entry.tx
+    end
+  ) mp.entries;
+  !result
+
+(* Get all transactions from mempool (for compact block reconstruction) *)
+let get_all_transactions (mp : mempool) : Types.transaction list =
+  Hashtbl.fold (fun _ entry acc -> entry.tx :: acc) mp.entries []
+
+(* Create a transaction lookup table for compact block reconstruction.
+   This is more efficient than find_by_short_id for multiple lookups. *)
+let create_short_id_lookup (mp : mempool) ~(k0 : int64) ~(k1 : int64)
+    : (int64, Types.transaction) Hashtbl.t =
+  let tbl = Hashtbl.create (Hashtbl.length mp.entries) in
+  Hashtbl.iter (fun _ entry ->
+    let short_id = Crypto.compute_short_txid k0 k1 entry.wtxid in
+    Hashtbl.replace tbl short_id entry.tx
+  ) mp.entries;
+  tbl
+
+(* ============================================================================
    Mempool Persistence (Gap 5)
    ============================================================================ *)
 

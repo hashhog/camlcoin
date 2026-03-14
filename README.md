@@ -51,6 +51,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Block pruning (-prune=N, 550MB minimum, txindex incompatible, 288 block safety margin)
 - [x] Coinbase maturity (100-block delay for coinbase spends, enforced in block validation and mempool)
 - [x] Wallet encryption (encryptwallet, walletpassphrase, walletlock, passphrase change, timeout-based auto-lock)
+- [x] Block indexes (hash index, height index, BIP-157/158 compact block filters with GCS)
 - [ ] Compact block relay (BIP 152)
 - [ ] Bloom filters (BIP 37)
 
@@ -91,6 +92,7 @@ camlcoin/
     rpc.ml            JSON-RPC server
     wallet.ml         HD wallet, BIP-39/44/84/86, coin selection, encrypted storage
     bip39.ml          mnemonic generation and seed derivation
+    block_index.ml    block indexes, BIP-157/158 filters, height index
     perf.ml           performance utilities and benchmarks
     cli.ml            command line interface
     camlcoin.ml       library interface

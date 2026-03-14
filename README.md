@@ -61,6 +61,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] AssumeUTXO (BIP 199, snapshot loading, dual chainstate, background validation)
 - [x] REST API (block, tx, headers, chaininfo, mempool, blockhashbyheight, .json/.hex/.bin formats)
 - [x] ZMQ notifications (hashblock, hashtx, rawblock, rawtx, sequence topics, 4-byte LE sequence numbers)
+- [x] Regtest mode (generate, generatetoaddress, generateblock RPCs, instant mining)
 - [ ] Bloom filters (BIP 37)
 
 ## Quick start

@@ -1457,6 +1457,163 @@ let witness_cleanstack_tests = [
 ]
 
 (* ============================================================================
+   MINIMALIF Tests (Phase 6)
+
+   When MINIMALIF is active (mandatory for witness v0/v1), OP_IF/OP_NOTIF
+   arguments must be exactly empty (false) or exactly [0x01] (true).
+   Other truthy values like [0x02], [0x01 0x00], etc. are rejected.
+   ============================================================================ *)
+
+(* Helper to make a P2WSH script_pubkey from a witness script *)
+let make_p2wsh_script_pubkey witness_script =
+  let script_hash = Crypto.sha256 witness_script in
+  let w = Serialize.writer_create () in
+  Serialize.write_uint8 w 0x00;  (* OP_0 = witness v0 *)
+  Serialize.write_uint8 w 0x20;  (* push 32 bytes *)
+  Serialize.write_bytes w script_hash;
+  Serialize.writer_to_cstruct w
+
+(* Test: OP_IF with [0x02] on stack fails in witness v0 due to MINIMALIF *)
+let test_minimalif_fails_with_0x02 () =
+  let tx = make_test_tx () in
+  (* Witness script: OP_IF OP_1 OP_ENDIF
+     Encoded: 63 51 68 *)
+  let witness_script = hex_to_cstruct "635168" in
+  let script_pubkey = make_p2wsh_script_pubkey witness_script in
+  (* Witness stack: [0x02] (truthy but not minimal), then the script *)
+  let bad_value = hex_to_cstruct "02" in
+  let witness = { Types.items = [bad_value; witness_script] } in
+  let flags = Script.script_verify_witness in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+          ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
+  | Error msg ->
+    (* Should fail with MINIMALIF error *)
+    let msg_upper = String.uppercase_ascii msg in
+    let has_minimalif =
+      let rec check i =
+        if i + 9 > String.length msg_upper then false
+        else if String.sub msg_upper i 9 = "MINIMALIF" then true
+        else check (i + 1)
+      in check 0
+    in
+    if not has_minimalif then
+      Alcotest.fail ("Expected MINIMALIF error, got: " ^ msg)
+  | Ok _ -> Alcotest.fail "OP_IF with [0x02] should fail MINIMALIF in witness v0"
+
+(* Test: OP_IF with [0x01] passes in witness v0 *)
+let test_minimalif_passes_with_0x01 () =
+  let tx = make_test_tx () in
+  (* Witness script: OP_IF OP_1 OP_ENDIF
+     Encoded: 63 51 68 *)
+  let witness_script = hex_to_cstruct "635168" in
+  let script_pubkey = make_p2wsh_script_pubkey witness_script in
+  (* Witness stack: [0x01] (minimal true), then the script *)
+  let good_value = hex_to_cstruct "01" in
+  let witness = { Types.items = [good_value; witness_script] } in
+  let flags = Script.script_verify_witness in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+          ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
+  | Ok true -> ()  (* Expected: succeeds with true on stack *)
+  | Ok false -> Alcotest.fail "Expected true on stack after OP_IF branch"
+  | Error e -> Alcotest.fail ("OP_IF with [0x01] should pass: " ^ e)
+
+(* Test: OP_IF with empty stack (false) takes else branch correctly *)
+let test_minimalif_empty_takes_else_branch () =
+  let tx = make_test_tx () in
+  (* Witness script: OP_IF OP_0 OP_ELSE OP_1 OP_ENDIF
+     Encoded: 63 00 67 51 68
+     With empty (false) on stack, should take ELSE branch and push 1 *)
+  let witness_script = hex_to_cstruct "6300675168" in
+  let script_pubkey = make_p2wsh_script_pubkey witness_script in
+  (* Witness stack: empty (which is false), then the script *)
+  let empty_value = Cstruct.create 0 in
+  let witness = { Types.items = [empty_value; witness_script] } in
+  let flags = Script.script_verify_witness in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+          ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
+  | Ok true -> ()  (* Expected: takes else branch, pushes 1 *)
+  | Ok false -> Alcotest.fail "Expected true from ELSE branch"
+  | Error e -> Alcotest.fail ("Empty value should take ELSE branch: " ^ e)
+
+(* Test: OP_NOTIF with [0x02] fails MINIMALIF *)
+let test_minimalif_notif_fails_with_0x02 () =
+  let tx = make_test_tx () in
+  (* Witness script: OP_NOTIF OP_1 OP_ENDIF
+     Encoded: 64 51 68 *)
+  let witness_script = hex_to_cstruct "645168" in
+  let script_pubkey = make_p2wsh_script_pubkey witness_script in
+  let bad_value = hex_to_cstruct "02" in
+  let witness = { Types.items = [bad_value; witness_script] } in
+  let flags = Script.script_verify_witness in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+          ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
+  | Error msg ->
+    let msg_upper = String.uppercase_ascii msg in
+    let has_minimalif =
+      let rec check i =
+        if i + 9 > String.length msg_upper then false
+        else if String.sub msg_upper i 9 = "MINIMALIF" then true
+        else check (i + 1)
+      in check 0
+    in
+    if not has_minimalif then
+      Alcotest.fail ("Expected MINIMALIF error, got: " ^ msg)
+  | Ok _ -> Alcotest.fail "OP_NOTIF with [0x02] should fail MINIMALIF"
+
+(* Test: Multi-byte value [0x01 0x00] fails MINIMALIF even though truthy *)
+let test_minimalif_fails_with_multibyte () =
+  let tx = make_test_tx () in
+  let witness_script = hex_to_cstruct "635168" in  (* OP_IF OP_1 OP_ENDIF *)
+  let script_pubkey = make_p2wsh_script_pubkey witness_script in
+  (* [0x01 0x00] is truthy (non-zero) but not minimal for IF *)
+  let bad_value = hex_to_cstruct "0100" in
+  let witness = { Types.items = [bad_value; witness_script] } in
+  let flags = Script.script_verify_witness in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+          ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
+  | Error _ -> ()  (* Expected: MINIMALIF error *)
+  | Ok _ -> Alcotest.fail "[0x01 0x00] should fail MINIMALIF"
+
+(* Test: [0x00] (single byte zero) fails MINIMALIF - must be empty for false *)
+let test_minimalif_fails_with_single_zero () =
+  let tx = make_test_tx () in
+  let witness_script = hex_to_cstruct "635168" in  (* OP_IF OP_1 OP_ENDIF *)
+  let script_pubkey = make_p2wsh_script_pubkey witness_script in
+  (* [0x00] is falsy but not the empty vector *)
+  let bad_value = hex_to_cstruct "00" in
+  let witness = { Types.items = [bad_value; witness_script] } in
+  let flags = Script.script_verify_witness in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+          ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
+  | Error _ -> ()  (* Expected: MINIMALIF error *)
+  | Ok _ -> Alcotest.fail "[0x00] should fail MINIMALIF (must use empty)"
+
+(* Test: Legacy script without MINIMALIF flag allows [0x02] for OP_IF *)
+let test_legacy_allows_non_minimal_if () =
+  let tx = make_test_tx () in
+  (* Legacy script: push [0x02] OP_IF OP_1 OP_ENDIF
+     Encoded: 01 02 63 51 68 *)
+  let script_pubkey = hex_to_cstruct "0102635168" in
+  let witness = { Types.items = [] } in
+  (* No MINIMALIF flag, no witness *)
+  let flags = 0 in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+          ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
+  | Ok true -> ()  (* Legacy allows non-minimal IF values *)
+  | Ok false -> Alcotest.fail "Expected true on stack"
+  | Error e -> Alcotest.fail ("Legacy should allow [0x02] for IF: " ^ e)
+
+let minimalif_tests = [
+  Alcotest.test_case "MINIMALIF fails with [0x02]" `Quick test_minimalif_fails_with_0x02;
+  Alcotest.test_case "MINIMALIF passes with [0x01]" `Quick test_minimalif_passes_with_0x01;
+  Alcotest.test_case "MINIMALIF empty takes else branch" `Quick test_minimalif_empty_takes_else_branch;
+  Alcotest.test_case "MINIMALIF NOTIF fails with [0x02]" `Quick test_minimalif_notif_fails_with_0x02;
+  Alcotest.test_case "MINIMALIF fails with multi-byte" `Quick test_minimalif_fails_with_multibyte;
+  Alcotest.test_case "MINIMALIF fails with [0x00]" `Quick test_minimalif_fails_with_single_zero;
+  Alcotest.test_case "Legacy allows non-minimal IF" `Quick test_legacy_allows_non_minimal_if;
+]
+
+(* ============================================================================
    P2SH Push-Only Tests (Phase 4)
 
    P2SH scriptSig must contain only push operations (BIP-16 consensus rule).
@@ -1929,6 +2086,7 @@ let () = Alcotest.run "test_script" [
   ("nullfail", nullfail_tests);
   ("witness_pubkeytype", witness_pubkeytype_tests);
   ("witness_cleanstack", witness_cleanstack_tests);
+  ("minimalif", minimalif_tests);
   ("p2sh_push_only", p2sh_push_only_tests);
   ("sighash", sighash_tests);
   ("find_and_delete", find_and_delete_tests);

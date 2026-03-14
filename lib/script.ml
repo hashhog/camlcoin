@@ -2519,8 +2519,9 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                         begin match run_script st2 implicit_script with
                         | Error e -> Error e
                         | Ok () ->
-                          if flags land script_verify_cleanstack <> 0 && stack_size st2 <> 1 then
-                            Error "Stack not clean after execution"
+                          (* Witness scripts implicitly require cleanstack - unconditional *)
+                          if stack_size st2 <> 1 then
+                            Error "Cleanstack"
                           else
                             check_stack_top st2
                         end
@@ -2554,8 +2555,9 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                       begin match run_script st2 witness_script with
                       | Error e -> Error e
                       | Ok () ->
-                        if flags land script_verify_cleanstack <> 0 && stack_size st2 <> 1 then
-                          Error "Stack not clean after execution"
+                        (* Witness scripts implicitly require cleanstack - unconditional *)
+                        if stack_size st2 <> 1 then
+                          Error "Cleanstack"
                         else
                           check_stack_top st2
                       end
@@ -2632,8 +2634,9 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
               begin match run_script st implicit_script with
               | Error e -> Error e
               | Ok () ->
-                if flags land script_verify_cleanstack <> 0 && stack_size st <> 1 then
-                  Error "Stack not clean after execution"
+                (* Witness scripts implicitly require cleanstack - unconditional *)
+                if stack_size st <> 1 then
+                  Error "Cleanstack"
                 else
                   check_stack_top st
               end
@@ -2675,8 +2678,9 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
             begin match run_script st witness_script with
             | Error e -> Error e
             | Ok () ->
-              if flags land script_verify_cleanstack <> 0 && stack_size st <> 1 then
-                Error "Stack not clean after execution"
+              (* Witness scripts implicitly require cleanstack - unconditional *)
+              if stack_size st <> 1 then
+                Error "Cleanstack"
               else
                 check_stack_top st
             end
@@ -2862,8 +2866,9 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                           begin match run_script st tap_script with
                           | Error e -> Error e
                           | Ok () ->
+                            (* Witness scripts implicitly require cleanstack - unconditional *)
                             if stack_size st <> 1 then
-                              Error "Stack not clean after execution"
+                              Error "Cleanstack"
                             else
                               check_stack_top st
                           end

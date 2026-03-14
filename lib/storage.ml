@@ -976,3 +976,221 @@ module ChainDB = struct
     let key = prefix_undo_data ^ Cstruct.to_string block_hash in
     LogStorage.batch_delete batch key
 end
+
+(* ============================================================================
+   Undo Data Types for Chain Reorganizations (BIP-compatible)
+
+   Reference: Bitcoin Core's undo.h (CTxUndo, CBlockUndo)
+
+   Undo data stores the UTXOs consumed by each block's transactions so that
+   blocks can be disconnected during chain reorganizations. Without undo data,
+   reorgs would require re-downloading and re-validating the entire chain.
+
+   Structure:
+   - tx_undo: One entry per transaction input, storing the spent UTXO
+     (amount, scriptPubKey, height, is_coinbase)
+   - block_undo: One tx_undo per non-coinbase transaction in the block
+     (coinbase has no inputs, so no undo data)
+
+   Stored in rev{nnnnn}.dat files alongside blk{nnnnn}.dat in Bitcoin Core,
+   but here we use the ChainDB key-value store with the "r" prefix.
+   ============================================================================ *)
+
+(** Undo information for a single transaction input.
+    Stores the UTXO that was spent by this input. *)
+type tx_in_undo = {
+  value : int64;            (** Output value in satoshis *)
+  script_pubkey : Cstruct.t; (** Locking script of the spent output *)
+  height : int;             (** Block height where output was created *)
+  is_coinbase : bool;       (** Whether this was a coinbase output *)
+}
+
+(** Undo information for a single transaction.
+    Contains one tx_in_undo per input (prev_outputs list).
+    Matches Bitcoin Core's CTxUndo which has vprevout vector. *)
+type tx_undo = {
+  prev_outputs : tx_in_undo list;
+}
+
+(** Undo information for a block.
+    Contains one tx_undo per non-coinbase transaction.
+    The coinbase (index 0) has no inputs to undo, so it's excluded.
+    Matches Bitcoin Core's CBlockUndo which has vtxundo vector. *)
+type block_undo = {
+  tx_undos : tx_undo list;  (** One entry per non-coinbase transaction *)
+}
+
+(* Serialize a single input's undo data *)
+let serialize_tx_in_undo w (u : tx_in_undo) =
+  Serialize.write_int64_le w u.value;
+  Serialize.write_compact_size w (Cstruct.length u.script_pubkey);
+  Serialize.write_bytes w u.script_pubkey;
+  Serialize.write_int32_le w (Int32.of_int u.height);
+  Serialize.write_uint8 w (if u.is_coinbase then 1 else 0)
+
+(* Deserialize a single input's undo data *)
+let deserialize_tx_in_undo r : tx_in_undo =
+  let value = Serialize.read_int64_le r in
+  let script_len = Serialize.read_compact_size r in
+  let script_pubkey = Serialize.read_bytes r script_len in
+  let height = Int32.to_int (Serialize.read_int32_le r) in
+  let is_coinbase = Serialize.read_uint8 r <> 0 in
+  { value; script_pubkey; height; is_coinbase }
+
+(* Serialize a transaction's undo data (all inputs) *)
+let serialize_tx_undo w (u : tx_undo) =
+  Serialize.write_compact_size w (List.length u.prev_outputs);
+  List.iter (serialize_tx_in_undo w) u.prev_outputs
+
+(* Deserialize a transaction's undo data *)
+let deserialize_tx_undo r : tx_undo =
+  let count = Serialize.read_compact_size r in
+  let prev_outputs = List.init count (fun _ -> deserialize_tx_in_undo r) in
+  { prev_outputs }
+
+(* Serialize block undo data with checksum for integrity verification *)
+let serialize_block_undo w (u : block_undo) =
+  Serialize.write_compact_size w (List.length u.tx_undos);
+  List.iter (serialize_tx_undo w) u.tx_undos;
+  (* Compute SHA256 checksum over the serialized data for integrity *)
+  let data = Serialize.writer_to_cstruct w in
+  let checksum = Crypto.sha256 data in
+  Serialize.write_bytes w checksum
+
+(* Deserialize block undo data, verifying checksum *)
+let deserialize_block_undo r : block_undo =
+  let count = Serialize.read_compact_size r in
+  let tx_undos = List.init count (fun _ -> deserialize_tx_undo r) in
+  (* Verify checksum if present *)
+  let remaining = Cstruct.length r.Serialize.buf - r.Serialize.pos in
+  if remaining = 32 then begin
+    (* Position just before the checksum *)
+    let data_end = r.Serialize.pos in
+    let stored_checksum = Serialize.read_bytes r 32 in
+    let data_to_hash = Cstruct.sub r.Serialize.buf 0 data_end in
+    let computed_checksum = Crypto.sha256 data_to_hash in
+    if not (Cstruct.equal stored_checksum computed_checksum) then
+      failwith "Block undo data checksum verification failed"
+  end else if remaining > 0 then
+    failwith (Printf.sprintf "Block undo data has unexpected trailing bytes (%d)" remaining);
+  { tx_undos }
+
+(* ============================================================================
+   Chain State Management with Block Disconnect Support
+   ============================================================================ *)
+
+(** Error type for chain operations *)
+type chain_error =
+  | MissingBlock of Types.hash256
+  | MissingUndoData of Types.hash256
+  | InvalidUndoChecksum of Types.hash256
+  | UtxoError of string
+
+let chain_error_to_string = function
+  | MissingBlock h -> Printf.sprintf "Missing block: %s" (Types.hash256_to_hex_display h)
+  | MissingUndoData h -> Printf.sprintf "Missing undo data: %s" (Types.hash256_to_hex_display h)
+  | InvalidUndoChecksum h -> Printf.sprintf "Invalid undo checksum: %s" (Types.hash256_to_hex_display h)
+  | UtxoError msg -> Printf.sprintf "UTXO error: %s" msg
+
+(** Build block_undo from a block during connect_block.
+    Call this BEFORE consuming UTXOs to capture the spent outputs.
+    Returns block_undo with one tx_undo per non-coinbase transaction. *)
+let build_block_undo (block : Types.block)
+    ~(lookup_utxo : Types.outpoint -> tx_in_undo option)
+    : (block_undo, string) result =
+  let error = ref None in
+  let tx_undos = List.mapi (fun tx_idx tx ->
+    if tx_idx = 0 then
+      (* Coinbase has no inputs, return empty tx_undo *)
+      { prev_outputs = [] }
+    else begin
+      let prev_outputs = List.map (fun inp ->
+        let outpoint = inp.Types.previous_output in
+        match lookup_utxo outpoint with
+        | Some u -> u
+        | None ->
+          if !error = None then
+            error := Some (Printf.sprintf "Missing UTXO for input %s:%ld"
+              (Types.hash256_to_hex_display outpoint.txid) outpoint.vout);
+          (* Return dummy - will be ignored due to error *)
+          { value = 0L; script_pubkey = Cstruct.empty; height = 0; is_coinbase = false }
+      ) tx.Types.inputs in
+      { prev_outputs }
+    end
+  ) block.transactions in
+  match !error with
+  | Some e -> Error e
+  | None ->
+    (* Filter out the coinbase's empty tx_undo *)
+    let tx_undos = match tx_undos with
+      | _ :: rest -> rest  (* Remove first (coinbase) entry *)
+      | [] -> []
+    in
+    Ok { tx_undos }
+
+(** Disconnect a block from the chain state.
+    This reverses the effects of connect_block:
+    1. Remove outputs created by all transactions in the block
+    2. Restore spent UTXOs from the undo data
+
+    db: The chain database
+    block: The block to disconnect
+    block_hash: Hash of the block (for undo data lookup)
+    add_utxo: Callback to add a UTXO back to the set
+    remove_utxo: Callback to remove a UTXO from the set
+
+    Transactions are processed in reverse order to properly handle
+    intra-block dependencies where later transactions spend outputs
+    from earlier transactions in the same block. *)
+let disconnect_block (db : ChainDB.t) (block : Types.block)
+    (block_hash : Types.hash256)
+    ~(add_utxo : Types.hash256 -> int -> tx_in_undo -> unit)
+    ~(remove_utxo : Types.hash256 -> int -> unit)
+    : (unit, chain_error) result =
+  (* Load undo data for this block *)
+  match ChainDB.get_undo_data db block_hash with
+  | None -> Error (MissingUndoData block_hash)
+  | Some undo_raw ->
+    let undo =
+      try
+        let r = Serialize.reader_of_cstruct (Cstruct.of_string undo_raw) in
+        deserialize_block_undo r
+      with Failure msg ->
+        (* Checksum or format error *)
+        if String.length msg >= 10 && String.sub msg 0 10 = "Block undo" then
+          raise (Invalid_argument (chain_error_to_string (InvalidUndoChecksum block_hash)))
+        else
+          raise (Invalid_argument msg)
+    in
+    (* Process transactions in reverse order *)
+    let txs_reversed = List.rev block.transactions in
+    List.iter (fun tx ->
+      let txid = Crypto.compute_txid tx in
+      (* Remove outputs created by this transaction *)
+      List.iteri (fun vout _out ->
+        remove_utxo txid vout
+      ) tx.outputs
+    ) txs_reversed;
+    (* Restore spent UTXOs from undo data.
+       The tx_undos list corresponds to non-coinbase transactions in order,
+       so we iterate the original transactions (skipping coinbase) and match
+       each input with its corresponding undo entry. *)
+    let non_coinbase_txs = match block.transactions with
+      | _ :: rest -> rest
+      | [] -> []
+    in
+    List.iteri (fun tx_idx tx ->
+      if tx_idx < List.length undo.tx_undos then begin
+        let tx_undo = List.nth undo.tx_undos tx_idx in
+        List.iteri (fun inp_idx inp ->
+          if inp_idx < List.length tx_undo.prev_outputs then begin
+            let prev_out = List.nth tx_undo.prev_outputs inp_idx in
+            let outpoint = inp.Types.previous_output in
+            add_utxo outpoint.txid (Int32.to_int outpoint.vout) prev_out
+          end
+        ) tx.Types.inputs
+      end
+    ) non_coinbase_txs;
+    (* Delete the undo data for this block *)
+    ChainDB.delete_undo_data db block_hash;
+    Ok ()

@@ -263,6 +263,111 @@ let test_count_sigops_empty () =
   let script = Cstruct.create 0 in
   Alcotest.(check int) "empty script" 0 (Validation.count_sigops script)
 
+(* Test P2SH sigop counting with accurate multisig (uses preceding OP_N) *)
+let test_count_p2sh_sigops_multisig_accurate () =
+  (* OP_3 OP_CHECKMULTISIG = counts as 3 sigops *)
+  let script = Cstruct.of_string "\x53\xae" in
+  Alcotest.(check int) "3-of-N multisig" 3 (Validation.count_p2sh_sigops script)
+
+let test_count_p2sh_sigops_multisig_no_prefix () =
+  (* OP_CHECKMULTISIG without preceding OP_N = 20 worst case *)
+  let script = Cstruct.of_string "\xae" in
+  Alcotest.(check int) "multisig no prefix" 20 (Validation.count_p2sh_sigops script)
+
+let test_count_p2sh_sigops_mixed () =
+  (* OP_CHECKSIG OP_5 OP_CHECKMULTISIG OP_CHECKSIGVERIFY = 1 + 5 + 1 = 7 *)
+  let script = Cstruct.of_string "\xac\x55\xae\xad" in
+  Alcotest.(check int) "mixed sigops" 7 (Validation.count_p2sh_sigops script)
+
+(* Test sigop cost with witness discount *)
+let test_sigop_cost_legacy_tx () =
+  (* Legacy transaction with 1 CHECKSIG in scriptPubKey *)
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  (* scriptPubKey with OP_CHECKSIG *)
+  let script_pubkey = Cstruct.of_string "\xac" in
+  let tx = {
+    Types.version = 1l;
+    inputs = [make_input ~txid ()];
+    outputs = [make_output ~value:1000L ~script_pubkey ()];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let lookup _ = None in
+  let flags = Script.script_verify_p2sh in
+  let cost = Validation.count_tx_sigops_cost tx ~prev_script_pubkey_lookup:lookup ~flags in
+  (* Legacy sigops: 1 CHECKSIG in output * 4 = 4 *)
+  Alcotest.(check int) "legacy tx sigop cost" 4 cost
+
+let test_sigop_cost_p2wpkh () =
+  (* P2WPKH transaction: witness sigops = 1 (not multiplied by 4) *)
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  let tx = {
+    Types.version = 2l;
+    inputs = [make_input ~txid ()];
+    outputs = [make_output ~value:1000L ()];
+    witnesses = [{ Types.items = [Cstruct.create 72; Cstruct.create 33] }];
+    locktime = 0l;
+  } in
+  (* P2WPKH scriptPubKey: OP_0 <20 bytes> *)
+  let p2wpkh_spk = Cstruct.create 22 in
+  Cstruct.set_uint8 p2wpkh_spk 0 0x00;  (* OP_0 *)
+  Cstruct.set_uint8 p2wpkh_spk 1 0x14;  (* push 20 bytes *)
+  let lookup _ = Some p2wpkh_spk in
+  let flags = Script.script_verify_p2sh lor Script.script_verify_witness in
+  let cost = Validation.count_tx_sigops_cost tx ~prev_script_pubkey_lookup:lookup ~flags in
+  (* P2WPKH: 1 witness sigop (no multiplier) *)
+  Alcotest.(check int) "p2wpkh sigop cost" 1 cost
+
+let test_sigop_cost_p2wsh_multisig () =
+  (* P2WSH transaction with 2-of-3 multisig witness script *)
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  (* Witness script: OP_2 ... OP_3 OP_CHECKMULTISIG (simplified: just OP_3 OP_CHECKMULTISIG) *)
+  let witness_script = Cstruct.of_string "\x53\xae" in  (* OP_3 OP_CHECKMULTISIG *)
+  let tx = {
+    Types.version = 2l;
+    inputs = [make_input ~txid ()];
+    outputs = [make_output ~value:1000L ()];
+    witnesses = [{ Types.items = [
+      Cstruct.create 0;  (* dummy *)
+      Cstruct.create 72;  (* sig1 *)
+      Cstruct.create 72;  (* sig2 *)
+      witness_script;     (* witness script *)
+    ] }];
+    locktime = 0l;
+  } in
+  (* P2WSH scriptPubKey: OP_0 <32 bytes> *)
+  let p2wsh_spk = Cstruct.create 34 in
+  Cstruct.set_uint8 p2wsh_spk 0 0x00;  (* OP_0 *)
+  Cstruct.set_uint8 p2wsh_spk 1 0x20;  (* push 32 bytes *)
+  let lookup _ = Some p2wsh_spk in
+  let flags = Script.script_verify_p2sh lor Script.script_verify_witness in
+  let cost = Validation.count_tx_sigops_cost tx ~prev_script_pubkey_lookup:lookup ~flags in
+  (* P2WSH with 3-of-N multisig: 3 witness sigops (no multiplier) *)
+  Alcotest.(check int) "p2wsh multisig sigop cost" 3 cost
+
+let test_sigop_cost_witness_disabled () =
+  (* When WITNESS flag is not set, witness sigops should not be counted *)
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  let tx = {
+    Types.version = 2l;
+    inputs = [make_input ~txid ()];
+    outputs = [make_output ~value:1000L ()];
+    witnesses = [{ Types.items = [Cstruct.create 72; Cstruct.create 33] }];
+    locktime = 0l;
+  } in
+  let p2wpkh_spk = Cstruct.create 22 in
+  Cstruct.set_uint8 p2wpkh_spk 0 0x00;
+  Cstruct.set_uint8 p2wpkh_spk 1 0x14;
+  let lookup _ = Some p2wpkh_spk in
+  let flags = Script.script_verify_p2sh in  (* No WITNESS flag *)
+  let cost = Validation.count_tx_sigops_cost tx ~prev_script_pubkey_lookup:lookup ~flags in
+  (* Without WITNESS flag, witness sigops are not counted *)
+  Alcotest.(check int) "witness disabled sigop cost" 0 cost
+
 (* ============================================================================
    Transaction Finality Tests
    ============================================================================ *)
@@ -789,6 +894,13 @@ let () =
       test_case "count checkmultisig" `Quick test_count_sigops_checkmultisig;
       test_case "count multiple" `Quick test_count_sigops_multiple;
       test_case "count empty" `Quick test_count_sigops_empty;
+      test_case "p2sh multisig accurate" `Quick test_count_p2sh_sigops_multisig_accurate;
+      test_case "p2sh multisig no prefix" `Quick test_count_p2sh_sigops_multisig_no_prefix;
+      test_case "p2sh mixed sigops" `Quick test_count_p2sh_sigops_mixed;
+      test_case "legacy tx sigop cost" `Quick test_sigop_cost_legacy_tx;
+      test_case "p2wpkh sigop cost" `Quick test_sigop_cost_p2wpkh;
+      test_case "p2wsh multisig sigop cost" `Quick test_sigop_cost_p2wsh_multisig;
+      test_case "witness disabled sigop cost" `Quick test_sigop_cost_witness_disabled;
     ];
     "finality", [
       test_case "zero locktime" `Quick test_is_tx_final_zero_locktime;

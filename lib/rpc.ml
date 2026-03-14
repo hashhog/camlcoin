@@ -1827,6 +1827,56 @@ let dispatch_rpc (ctx : rpc_context)
    HTTP Server
    ============================================================================ *)
 
+(* Handle a single JSON-RPC request object, returning the response *)
+let handle_single_request (ctx : rpc_context) (json : Yojson.Safe.t)
+    : Yojson.Safe.t =
+  let method_name = match json with
+    | `Assoc fields ->
+      (match List.assoc_opt "method" fields with
+       | Some (`String m) -> m
+       | _ -> "")
+    | _ -> ""
+  in
+  let params = match json with
+    | `Assoc fields ->
+      (match List.assoc_opt "params" fields with
+       | Some (`List l) -> l
+       | Some (`Null) -> []
+       | None -> []
+       | _ -> [])
+    | _ -> []
+  in
+  let id = match json with
+    | `Assoc fields ->
+      (match List.assoc_opt "id" fields with
+       | Some v -> v
+       | None -> `Null)
+    | _ -> `Null
+  in
+  match dispatch_rpc ctx method_name params with
+  | Ok r -> json_rpc_response ~id ~result:r
+  | Error (code, message) -> json_rpc_error ~id ~code ~message
+
+(* Handle a batch of JSON-RPC requests in parallel *)
+let handle_batch_request (ctx : rpc_context) (requests : Yojson.Safe.t list)
+    : Yojson.Safe.t list Lwt.t =
+  Lwt_list.map_p (fun req ->
+    (* Each request is processed independently - errors in one don't affect others *)
+    try
+      Lwt.return (handle_single_request ctx req)
+    with exn ->
+      (* Extract id from malformed request if possible *)
+      let id = match req with
+        | `Assoc fields ->
+          (match List.assoc_opt "id" fields with
+           | Some v -> v
+           | None -> `Null)
+        | _ -> `Null
+      in
+      Lwt.return (json_rpc_error ~id ~code:rpc_parse_error
+                    ~message:(Printexc.to_string exn))
+  ) requests
+
 let start_rpc_server ~(ctx : rpc_context)
     ~(host : string) ~(port : int)
     ~(rpc_user : string) ~(rpc_password : string)
@@ -1869,44 +1919,53 @@ let start_rpc_server ~(ctx : rpc_context)
       try
         let json = Yojson.Safe.from_string body_str in
 
-        let method_name = match json with
-          | `Assoc fields ->
-            (match List.assoc_opt "method" fields with
-             | Some (`String m) -> m
-             | _ -> "")
-          | _ -> ""
-        in
+        match json with
+        (* Batch request: JSON array of request objects *)
+        | `List requests ->
+          (* Empty batch is an error per JSON-RPC 2.0 spec *)
+          if requests = [] then begin
+            let error = json_rpc_error ~id:`Null ~code:rpc_invalid_request
+                          ~message:"Invalid Request: empty batch" in
+            let response_headers = Cohttp.Header.init_with
+              "Content-Type" "application/json" in
+            Cohttp_lwt_unix.Server.respond_string
+              ~status:`OK
+              ~headers:response_headers
+              ~body:(Yojson.Safe.to_string error) ()
+          end
+          else begin
+            (* Process batch requests in parallel *)
+            let* responses = handle_batch_request ctx requests in
+            let response_body = Yojson.Safe.to_string (`List responses) in
+            let response_headers = Cohttp.Header.init_with
+              "Content-Type" "application/json" in
+            Cohttp_lwt_unix.Server.respond_string
+              ~status:`OK
+              ~headers:response_headers
+              ~body:response_body ()
+          end
 
-        let params = match json with
-          | `Assoc fields ->
-            (match List.assoc_opt "params" fields with
-             | Some (`List l) -> l
-             | Some (`Null) -> []
-             | None -> []
-             | _ -> [])
-          | _ -> []
-        in
+        (* Single request: JSON object *)
+        | `Assoc _ as single_request ->
+          let result = handle_single_request ctx single_request in
+          let response_body = Yojson.Safe.to_string result in
+          let response_headers = Cohttp.Header.init_with
+            "Content-Type" "application/json" in
+          Cohttp_lwt_unix.Server.respond_string
+            ~status:`OK
+            ~headers:response_headers
+            ~body:response_body ()
 
-        let id = match json with
-          | `Assoc fields ->
-            (match List.assoc_opt "id" fields with
-             | Some v -> v
-             | None -> `Null)
-          | _ -> `Null
-        in
-
-        let result = match dispatch_rpc ctx method_name params with
-          | Ok r -> json_rpc_response ~id ~result:r
-          | Error (code, message) -> json_rpc_error ~id ~code ~message
-        in
-
-        let response_body = Yojson.Safe.to_string result in
-        let response_headers = Cohttp.Header.init_with
-          "Content-Type" "application/json" in
-        Cohttp_lwt_unix.Server.respond_string
-          ~status:`OK
-          ~headers:response_headers
-          ~body:response_body ()
+        (* Invalid request: neither object nor array *)
+        | _ ->
+          let error = json_rpc_error ~id:`Null ~code:rpc_invalid_request
+                        ~message:"Invalid Request" in
+          let response_headers = Cohttp.Header.init_with
+            "Content-Type" "application/json" in
+          Cohttp_lwt_unix.Server.respond_string
+            ~status:`OK
+            ~headers:response_headers
+            ~body:(Yojson.Safe.to_string error) ()
 
       with exn ->
         let error = json_rpc_error

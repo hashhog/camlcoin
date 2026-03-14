@@ -167,7 +167,7 @@ let run (config : config) : unit Lwt.t =
   (* Create RPC context *)
   let rpc_ctx = Rpc.create_context
     ~chain ~mempool ~peer_manager
-    ~wallet ~fee_estimator ~network in
+    ~wallet ~fee_estimator ~network () in
 
   (* Set up signal handlers for graceful shutdown.
      We use Lwt_unix.on_signal so that the signal wakes the Lwt event loop

@@ -1,5 +1,12 @@
 (* Consensus-critical constants for Bitcoin protocol *)
 
+(* Network variant type for selecting difficulty behavior *)
+type network =
+  | Mainnet
+  | Testnet3
+  | Testnet4
+  | Regtest
+
 (* Block weight limits (post-SegWit) *)
 let max_block_weight = 4_000_000
 let max_block_sigops_cost = 80_000
@@ -179,6 +186,8 @@ type network_config = {
   pow_allow_min_difficulty : bool;  (* Allow min difficulty blocks (testnet) *)
   pow_no_retargeting : bool;  (* Skip difficulty retargeting (regtest) *)
   pow_limit : int32;  (* Compact nBits form of the maximum allowed target *)
+  enforce_bip94 : bool;  (* BIP-94 time warp fix for testnet4 difficulty *)
+  network_type : network;  (* Network variant for difficulty selection *)
   minimum_chain_work : Cstruct.t;  (* 32-byte LE; tip must reach this before block sync *)
   assume_valid_hash : Types.hash256 option;  (* Skip script verification at/below this block *)
   checkpoints : (int * Types.hash256) list;  (* Known-good block hashes at specific heights *)
@@ -231,23 +240,33 @@ let target_compare (a : Cstruct.t) (b : Cstruct.t) : int =
   in
   cmp 31
 
-(* Calculate next work required (difficulty adjustment) *)
-let next_work_required ~(last_retarget_time : int32)
-    ~(current_header : Types.block_header)
-    ~(current_bits : int32)
+(* Calculate next work required at difficulty adjustment boundary.
+   This is CalculateNextWorkRequired from Bitcoin Core pow.cpp.
+
+   Parameters:
+   - first_block_time: timestamp of the first block in the difficulty period
+   - last_block_time: timestamp of the last block before adjustment (pindexLast)
+   - base_bits: bits to use as base for calculation:
+     - For BIP94 (testnet4): bits from first block of period
+     - Otherwise: bits from last block of period
+   - network: network configuration
+
+   Returns: new compact target (nBits) *)
+let calculate_next_work_required ~(first_block_time : int32)
+    ~(last_block_time : int32)
+    ~(base_bits : int32)
     ~(network : network_config) : int32 =
-  (* Regtest: no retargeting *)
-  if network.pow_no_retargeting then current_bits
+  (* Regtest: no retargeting, return current bits *)
+  if network.pow_no_retargeting then base_bits
   else begin
-    (* Calculate actual time taken for last 2016 blocks *)
+    (* Calculate actual time taken for the difficulty period *)
     let actual_timespan =
-      Int32.to_int (Int32.sub current_header.timestamp last_retarget_time) in
-    (* Clamp to [min_target_timespan, max_target_timespan] *)
+      Int32.to_int (Int32.sub last_block_time first_block_time) in
+    (* Clamp to [target_timespan/4, target_timespan*4] *)
     let adjusted_timespan =
       min max_target_timespan (max min_target_timespan actual_timespan) in
-    (* Get current target and adjust:
-       new_target = old_target * adjusted_timespan / target_timespan *)
-    let old_target = compact_to_target current_bits in
+    (* new_target = old_target * adjusted_timespan / target_timespan *)
+    let old_target = compact_to_target base_bits in
     let product = target_multiply old_target adjusted_timespan in
     let new_target = target_divide product target_timespan 32 in
     (* Clamp to pow_limit *)
@@ -258,6 +277,96 @@ let next_work_required ~(last_retarget_time : int32)
     in
     target_to_compact clamped
   end
+
+(* Get next work required for a block at given height.
+   This is GetNextWorkRequired from Bitcoin Core pow.cpp.
+
+   Parameters:
+   - height: height of the block being mined (pindexLast->nHeight + 1)
+   - block_time: timestamp of the block being mined
+   - prev_block_time: timestamp of the previous block (pindexLast)
+   - prev_bits: bits of the previous block (pindexLast->nBits)
+   - get_block_info: callback to get (timestamp, bits) at a given height
+   - network: network configuration
+
+   Returns: required compact target (nBits) *)
+let get_next_work_required ~(height : int)
+    ~(block_time : int32)
+    ~(prev_block_time : int32)
+    ~(prev_bits : int32)
+    ~(get_block_info : int -> (int32 * int32))  (* height -> (timestamp, bits) *)
+    ~(network : network_config) : int32 =
+  let pow_limit_compact = network.pow_limit in
+
+  (* Regtest: no difficulty adjustment, always use previous bits *)
+  if network.pow_no_retargeting then
+    prev_bits
+  else begin
+    (* Check if this is a difficulty adjustment block *)
+    let is_adjustment_block = (height mod difficulty_adjustment_interval) = 0 in
+
+    if not is_adjustment_block then begin
+      (* Not an adjustment block *)
+      if network.pow_allow_min_difficulty then begin
+        (* Testnet special rule: if block timestamp > 20 minutes after previous,
+           allow minimum difficulty *)
+        let elapsed = Int32.to_int (Int32.sub block_time prev_block_time) in
+        if elapsed > 2 * target_block_time then
+          pow_limit_compact
+        else begin
+          (* Walk back to find the last non-min-difficulty block or a retarget
+             boundary. Return that block's bits. *)
+          let rec walk h =
+            if h <= 0 then pow_limit_compact
+            else begin
+              let (_ts, bits) = get_block_info h in
+              if bits <> pow_limit_compact || h mod difficulty_adjustment_interval = 0 then
+                bits
+              else
+                walk (h - 1)
+            end
+          in
+          walk (height - 1)
+        end
+      end else
+        (* Mainnet: just use previous block's bits *)
+        prev_bits
+    end else begin
+    (* Difficulty adjustment block: recalculate target *)
+    (* Go back 2015 blocks (not 2016) to find the first block of the period.
+       nHeightFirst = pindexLast->nHeight - (DifficultyAdjustmentInterval() - 1)
+       Since height = pindexLast->nHeight + 1, we have:
+       nHeightFirst = height - 1 - 2015 = height - 2016 *)
+    let first_block_height = height - difficulty_adjustment_interval in
+    let (first_block_time, first_block_bits) = get_block_info first_block_height in
+    let (last_block_time, last_block_bits) = (prev_block_time, prev_bits) in
+
+    (* BIP94 (testnet4): use first block's bits as base for calculation.
+       This preserves the real difficulty in the first block, since it cannot
+       use the min-difficulty exception. *)
+    let base_bits =
+      if network.enforce_bip94 then first_block_bits
+      else last_block_bits
+    in
+
+    calculate_next_work_required
+      ~first_block_time
+      ~last_block_time
+      ~base_bits
+      ~network
+  end
+  end  (* Close the outer "else begin" for pow_no_retargeting check *)
+
+(* Legacy wrapper for backward compatibility *)
+let next_work_required ~(last_retarget_time : int32)
+    ~(current_header : Types.block_header)
+    ~(current_bits : int32)
+    ~(network : network_config) : int32 =
+  calculate_next_work_required
+    ~first_block_time:last_retarget_time
+    ~last_block_time:current_header.timestamp
+    ~base_bits:current_bits
+    ~network
 
 (* Parse a big-endian hex string into a 32-byte little-endian Cstruct.
    The hex string is in normal reading order (MSB first), but the Cstruct
@@ -323,6 +432,8 @@ let mainnet : network_config = {
   pow_allow_min_difficulty = false;
   pow_no_retargeting = false;
   pow_limit = 0x1d00ffffl;
+  enforce_bip94 = false;
+  network_type = Mainnet;
   (* From Bitcoin Core chainparams.cpp (approximately block 804000) *)
   minimum_chain_work = work_of_hex
     "000000000000000000000000000000000000000052b2559353df4117b7348b64";
@@ -382,6 +493,48 @@ let testnet : network_config = {
   pow_allow_min_difficulty = true;
   pow_no_retargeting = false;
   pow_limit = 0x1d00ffffl;
+  enforce_bip94 = false;
+  network_type = Testnet3;
+  minimum_chain_work = zero_work;
+  assume_valid_hash = None;
+  checkpoints = [];
+}
+
+(* Testnet4 configuration (BIP-94) *)
+let testnet4 : network_config = {
+  name = "testnet4";
+  magic = 0x1c163f28l;  (* BIP-94 testnet4 magic *)
+  default_port = 48333;
+  dns_seeds = [
+    "seed.testnet4.bitcoin.sprovoost.nl";
+    "seed.testnet4.wiz.biz";
+  ];
+  genesis_hash = Types.hash256_of_hex
+    "da5e13c38306e8b0b7fd65cfc9db5fd888cf5b0a4fa1479d04c7dfc8e2f1a000";
+  genesis_header = {
+    version = 1l;
+    prev_block = Types.zero_hash;
+    merkle_root = Types.hash256_of_hex
+      "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a";
+    timestamp = 1714777860l;  (* 2024-05-03 *)
+    bits = 0x1d00ffffl;
+    nonce = 393743547l;
+  };
+  pubkey_address_prefix = 0x6F;
+  script_address_prefix = 0xC4;
+  wif_prefix = 0xEF;
+  bech32_hrp = "tb";
+  bip34_height = 1;  (* Active from genesis on testnet4 *)
+  bip65_height = 1;
+  bip66_height = 1;
+  csv_height = 1;
+  segwit_height = 1;
+  taproot_height = 1;
+  pow_allow_min_difficulty = true;
+  pow_no_retargeting = false;
+  pow_limit = 0x1d00ffffl;
+  enforce_bip94 = true;  (* BIP-94 time warp fix enabled *)
+  network_type = Testnet4;
   minimum_chain_work = zero_work;
   assume_valid_hash = None;
   checkpoints = [];
@@ -417,6 +570,8 @@ let regtest : network_config = {
   pow_allow_min_difficulty = true;
   pow_no_retargeting = true;
   pow_limit = 0x207fffffl;
+  enforce_bip94 = false;  (* No BIP-94 on regtest *)
+  network_type = Regtest;
   minimum_chain_work = zero_work;
   assume_valid_hash = None;
   checkpoints = [];

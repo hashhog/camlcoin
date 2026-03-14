@@ -165,6 +165,50 @@ let derive_bip84_change (master : extended_key) (n : int) : (Cstruct.t, string) 
   derive_normal change n >>= fun child ->
   Ok child.key
 
+(* Derive BIP-44 receive key: m/44'/0'/0'/0/n (P2PKH) *)
+let derive_bip44_receive (master : extended_key) (n : int) : (Cstruct.t, string) result =
+  let open Result in
+  let ( >>= ) = bind in
+  derive_hardened master 44 >>= fun purpose ->
+  derive_hardened purpose 0 >>= fun coin_type ->
+  derive_hardened coin_type 0 >>= fun account ->
+  derive_normal account 0 >>= fun change ->
+  derive_normal change n >>= fun child ->
+  Ok child.key
+
+(* Derive BIP-44 change key: m/44'/0'/0'/1/n (P2PKH) *)
+let derive_bip44_change (master : extended_key) (n : int) : (Cstruct.t, string) result =
+  let open Result in
+  let ( >>= ) = bind in
+  derive_hardened master 44 >>= fun purpose ->
+  derive_hardened purpose 0 >>= fun coin_type ->
+  derive_hardened coin_type 0 >>= fun account ->
+  derive_normal account 1 >>= fun change ->
+  derive_normal change n >>= fun child ->
+  Ok child.key
+
+(* Derive BIP-86 receive key: m/86'/0'/0'/0/n (P2TR) *)
+let derive_bip86_receive (master : extended_key) (n : int) : (Cstruct.t, string) result =
+  let open Result in
+  let ( >>= ) = bind in
+  derive_hardened master 86 >>= fun purpose ->
+  derive_hardened purpose 0 >>= fun coin_type ->
+  derive_hardened coin_type 0 >>= fun account ->
+  derive_normal account 0 >>= fun change ->
+  derive_normal change n >>= fun child ->
+  Ok child.key
+
+(* Derive BIP-86 change key: m/86'/0'/0'/1/n (P2TR) *)
+let derive_bip86_change (master : extended_key) (n : int) : (Cstruct.t, string) result =
+  let open Result in
+  let ( >>= ) = bind in
+  derive_hardened master 86 >>= fun purpose ->
+  derive_hardened purpose 0 >>= fun coin_type ->
+  derive_hardened coin_type 0 >>= fun account ->
+  derive_normal account 1 >>= fun change ->
+  derive_normal change n >>= fun child ->
+  Ok child.key
+
 (* ============================================================================
    Extended Key Serialization (xpub/xprv)
    ============================================================================ *)
@@ -238,11 +282,15 @@ let deserialize_extended_key (s : string) : (extended_key * bool, string) result
    Wallet Types
    ============================================================================ *)
 
+(* Address type for key derivation *)
+type address_type = P2PKH | P2WPKH | P2TR
+
 (* A keypair for signing *)
 type key_pair = {
   private_key : Crypto.private_key;
   public_key : Crypto.public_key;
   address : Address.address;
+  addr_type : address_type;
 }
 
 (* UTXO tracked by wallet *)
@@ -266,6 +314,13 @@ type tx_history_entry = {
   hist_timestamp : float;
 }
 
+(* Wallet encryption state *)
+type encryption_state = {
+  encrypted : bool;
+  salt : Cstruct.t option;
+  iv : Cstruct.t option;
+}
+
 (* Wallet state *)
 type t = {
   mutable keys : key_pair list;
@@ -278,8 +333,14 @@ type t = {
   mutable master_key : extended_key option;
   mutable receive_index : int;
   mutable change_index : int;
+  (* Separate indices for each address type *)
+  mutable bip44_receive_index : int;  (* m/44'/0'/0'/0/n - P2PKH *)
+  mutable bip44_change_index : int;   (* m/44'/0'/0'/1/n - P2PKH *)
+  mutable bip86_receive_index : int;  (* m/86'/0'/0'/0/n - P2TR *)
+  mutable bip86_change_index : int;   (* m/86'/0'/0'/1/n - P2TR *)
   sent_transactions : (string, Types.transaction) Hashtbl.t;
   mutable tx_history : tx_history_entry list;
+  mutable encryption : encryption_state;
 }
 
 (* ============================================================================
@@ -299,8 +360,13 @@ let create ~(network : [`Mainnet | `Testnet | `Regtest])
     master_key = None;
     receive_index = 0;
     change_index = 0;
+    bip44_receive_index = 0;
+    bip44_change_index = 0;
+    bip86_receive_index = 0;
+    bip86_change_index = 0;
     sent_transactions = Hashtbl.create 16;
-    tx_history = [] }
+    tx_history = [];
+    encryption = { encrypted = false; salt = None; iv = None } }
 
 (* ============================================================================
    HD Wallet Initialization
@@ -333,57 +399,104 @@ let list_find_index (pred : 'a -> bool) (lst : 'a list) : int option =
   in
   aux 0 lst
 
-(* Generate a new keypair and add to wallet.
+(* Generate a new keypair with specified address type.
+   If master_key is set, derive via appropriate BIP path; otherwise use random. *)
+let generate_key_typed (w : t) (addr_type : address_type) : key_pair =
+  let derivation_fn, get_index, set_index, addr_constructor = match addr_type with
+    | P2PKH ->
+      (derive_bip44_receive, (fun () -> w.bip44_receive_index),
+       (fun idx -> w.bip44_receive_index <- idx + 1), Address.P2PKH)
+    | P2WPKH ->
+      (derive_bip84_receive, (fun () -> w.receive_index),
+       (fun idx -> w.receive_index <- idx + 1), Address.P2WPKH)
+    | P2TR ->
+      (derive_bip86_receive, (fun () -> w.bip86_receive_index),
+       (fun idx -> w.bip86_receive_index <- idx + 1), Address.P2TR)
+  in
+  let private_key = match w.master_key with
+    | Some master ->
+      let rec try_derive idx =
+        match derivation_fn master idx with
+        | Ok pk ->
+          set_index idx;
+          pk
+        | Error _ ->
+          try_derive (idx + 1)
+      in
+      try_derive (get_index ())
+    | None ->
+      Crypto.generate_private_key ()
+  in
+  let public_key = Crypto.derive_public_key ~compressed:true private_key in
+  let address = match addr_type with
+    | P2TR ->
+      (* P2TR uses x-only pubkey for address *)
+      let xonly = Crypto.derive_xonly_pubkey private_key in
+      Address.of_pubkey ~network:w.network addr_constructor xonly
+    | _ ->
+      Address.of_pubkey ~network:w.network addr_constructor public_key
+  in
+  let kp = { private_key; public_key; address; addr_type } in
+  w.keys <- w.keys @ [kp];
+  w.next_key_index <- w.next_key_index + 1;
+  kp
+
+(* Generate a new keypair (default: P2WPKH/BIP-84).
    If master_key is set, derive via BIP-84; otherwise use random generation. *)
 let generate_key (w : t) : key_pair =
+  generate_key_typed w P2WPKH
+
+(* Generate a change key with specified address type *)
+let generate_change_key_typed (w : t) (addr_type : address_type) : key_pair =
+  let derivation_fn, get_index, set_index, addr_constructor = match addr_type with
+    | P2PKH ->
+      (derive_bip44_change, (fun () -> w.bip44_change_index),
+       (fun idx -> w.bip44_change_index <- idx + 1), Address.P2PKH)
+    | P2WPKH ->
+      (derive_bip84_change, (fun () -> w.change_index),
+       (fun idx -> w.change_index <- idx + 1), Address.P2WPKH)
+    | P2TR ->
+      (derive_bip86_change, (fun () -> w.bip86_change_index),
+       (fun idx -> w.bip86_change_index <- idx + 1), Address.P2TR)
+  in
   let private_key = match w.master_key with
     | Some master ->
       let rec try_derive idx =
-        match derive_bip84_receive master idx with
+        match derivation_fn master idx with
         | Ok pk ->
-          w.receive_index <- idx + 1;
+          set_index idx;
           pk
         | Error _ ->
-          (* Skip invalid index and try next *)
           try_derive (idx + 1)
       in
-      try_derive w.receive_index
+      try_derive (get_index ())
     | None ->
       Crypto.generate_private_key ()
   in
   let public_key = Crypto.derive_public_key ~compressed:true private_key in
-  let address = Address.of_pubkey ~network:w.network Address.P2WPKH public_key in
-  let kp = { private_key; public_key; address } in
+  let address = match addr_type with
+    | P2TR ->
+      let xonly = Crypto.derive_xonly_pubkey private_key in
+      Address.of_pubkey ~network:w.network addr_constructor xonly
+    | _ ->
+      Address.of_pubkey ~network:w.network addr_constructor public_key
+  in
+  let kp = { private_key; public_key; address; addr_type } in
   w.keys <- w.keys @ [kp];
   w.next_key_index <- w.next_key_index + 1;
   kp
 
-(* Generate a change key.
+(* Generate a change key (default: P2WPKH/BIP-84).
    If master_key is set, derive via BIP-84 change path; otherwise random. *)
 let generate_change_key (w : t) : key_pair =
-  let private_key = match w.master_key with
-    | Some master ->
-      let rec try_derive idx =
-        match derive_bip84_change master idx with
-        | Ok pk ->
-          w.change_index <- idx + 1;
-          pk
-        | Error _ ->
-          (* Skip invalid index and try next *)
-          try_derive (idx + 1)
-      in
-      try_derive w.change_index
-    | None ->
-      Crypto.generate_private_key ()
-  in
-  let public_key = Crypto.derive_public_key ~compressed:true private_key in
-  let address = Address.of_pubkey ~network:w.network Address.P2WPKH public_key in
-  let kp = { private_key; public_key; address } in
-  w.keys <- w.keys @ [kp];
-  w.next_key_index <- w.next_key_index + 1;
-  kp
+  generate_change_key_typed w P2WPKH
 
-(* Get a new receiving address *)
+(* Get a new receiving address with specified type *)
+let get_new_address_typed (w : t) (addr_type : address_type) : string =
+  let kp = generate_key_typed w addr_type in
+  Address.address_to_string kp.address
+
+(* Get a new receiving address (default: P2WPKH) *)
 let get_new_address (w : t) : string =
   let kp = generate_key w in
   Address.address_to_string kp.address
@@ -431,13 +544,24 @@ let find_by_pubkey_hash (w : t) (pkh : Types.hash160) : key_pair option =
    ============================================================================ *)
 
 (* Import a private key in WIF format *)
-let import_wif (w : t) (wif : string) : (key_pair, string) result =
+let import_wif (w : t) ?(addr_type = P2WPKH) (wif : string) : (key_pair, string) result =
   match Address.wif_decode wif with
   | Error e -> Error e
   | Ok (private_key, _compressed, _network) ->
     let public_key = Crypto.derive_public_key ~compressed:true private_key in
-    let address = Address.of_pubkey ~network:w.network Address.P2WPKH public_key in
-    let kp = { private_key; public_key; address } in
+    let address_constructor = match addr_type with
+      | P2PKH -> Address.P2PKH
+      | P2WPKH -> Address.P2WPKH
+      | P2TR -> Address.P2TR
+    in
+    let address = match addr_type with
+      | P2TR ->
+        let xonly = Crypto.derive_xonly_pubkey private_key in
+        Address.of_pubkey ~network:w.network address_constructor xonly
+      | _ ->
+        Address.of_pubkey ~network:w.network address_constructor public_key
+    in
+    let kp = { private_key; public_key; address; addr_type } in
     w.keys <- w.keys @ [kp];
     w.next_key_index <- w.next_key_index + 1;
     Ok kp
@@ -634,6 +758,42 @@ let estimate_tx_weight (n_inputs : int) (n_outputs : int) : int =
   let output_weight = n_outputs * 31 * 4 in        (* 124 per output *)
   base_weight + input_weight + output_weight
 
+(* Fisher-Yates shuffle for random permutation *)
+let shuffle_list (lst : 'a list) : 'a list =
+  let arr = Array.of_list lst in
+  let n = Array.length arr in
+  for i = n - 1 downto 1 do
+    let j = Random.int (i + 1) in
+    let tmp = arr.(i) in
+    arr.(i) <- arr.(j);
+    arr.(j) <- tmp
+  done;
+  Array.to_list arr
+
+(* Single Random Draw (SRD) coin selection.
+   Shuffles UTXOs and selects until target is reached.
+   Based on Bitcoin Core's SelectCoinsSRD. *)
+let select_coins_srd (utxos : wallet_utxo list) (target : int64)
+    : wallet_utxo list option =
+  if List.length utxos = 0 then None
+  else begin
+    (* Shuffle the UTXOs *)
+    let shuffled = shuffle_list utxos in
+    let selected = ref [] in
+    let total = ref 0L in
+    (* Select UTXOs until we reach target *)
+    List.iter (fun wutxo ->
+      if Int64.compare !total target < 0 then begin
+        selected := wutxo :: !selected;
+        total := Int64.add !total wutxo.utxo.Utxo.value
+      end
+    ) shuffled;
+    if Int64.compare !total target >= 0 then
+      Some (List.rev !selected)
+    else
+      None
+  end
+
 (* Branch and Bound coin selection (Gap 17).
    Attempts to find an exact-match selection avoiding change outputs.
    Returns None if no suitable selection is found within iteration limit. *)
@@ -727,34 +887,43 @@ let select_coins (w : t) (target : int64) (fee_rate : float)
       change;
     }
   | None ->
-    (* Fall back to greedy selection *)
-    let selected = ref [] in
-    let total = ref 0L in
-
-    List.iter (fun wutxo ->
-      if Int64.compare !total target_with_fee < 0 then begin
-        selected := wutxo :: !selected;
-        total := Int64.add !total wutxo.utxo.Utxo.value
-      end
-    ) available;
-
-    if Int64.compare !total target_with_fee < 0 then
-      Error (Printf.sprintf
-        "Insufficient funds: have %Ld satoshis, need %Ld"
-        !total target_with_fee)
-    else begin
-      (* Recalculate fee with actual number of inputs *)
-      let n_inputs = List.length !selected in
+    (* Fall back to Single Random Draw (SRD) *)
+    match select_coins_srd available target_with_fee with
+    | Some selected ->
+      let total_input = List.fold_left (fun acc u ->
+        Int64.add acc u.utxo.Utxo.value
+      ) 0L selected in
+      let n_inputs = List.length selected in
       let actual_weight = estimate_tx_weight n_inputs 2 in
       let actual_fee = Int64.of_float
         (fee_rate *. float_of_int actual_weight /. 4.0) in
-      let change = Int64.sub !total (Int64.add target actual_fee) in
+      let change = Int64.sub total_input (Int64.add target actual_fee) in
       Ok {
-        selected = List.rev !selected;
-        total_input = !total;
+        selected;
+        total_input;
         change;
       }
-    end
+    | None ->
+      let total_available = List.fold_left (fun acc u ->
+        Int64.add acc u.utxo.Utxo.value
+      ) 0L available in
+      Error (Printf.sprintf
+        "Insufficient funds: have %Ld satoshis, need %Ld"
+        total_available target_with_fee)
+
+(* Primary coin selection interface: BnB with SRD fallback.
+   As specified: try_bnb target fee_rate utxos |> Option.value ~default:(srd target fee_rate utxos) *)
+let coin_select ~target ~fee_rate (utxos : wallet_utxo list) : wallet_utxo list option =
+  let available = List.filter (fun u -> u.confirmed) utxos in
+  let estimated_tx_weight = estimate_tx_weight 1 2 in
+  let estimated_fee = Int64.of_float
+    (fee_rate *. float_of_int estimated_tx_weight /. 4.0) in
+  let target_with_fee = Int64.add target estimated_fee in
+  let cost_of_change = Int64.of_float
+    (fee_rate *. float_of_int (34 + 68) /. 1.0) in
+  match select_coins_bnb available target_with_fee cost_of_change with
+  | Some selected -> Some selected
+  | None -> select_coins_srd available target_with_fee
 
 (* ============================================================================
    Transaction Creation and Signing
@@ -1266,6 +1435,114 @@ let update_confirmations (w : t) (current_height : int) : unit =
   ) w.tx_history
 
 (* ============================================================================
+   Wallet Encryption (AES-256-CBC)
+   ============================================================================ *)
+
+(* Derive AES-256 key from passphrase using PBKDF2-HMAC-SHA256 *)
+let derive_aes_key (passphrase : string) (salt : Cstruct.t) : Cstruct.t =
+  let iterations = 100_000 in
+  let key_len = 32 in  (* AES-256 requires 32-byte key *)
+  let password = passphrase in
+  let salt_str = Cstruct.to_string salt in
+  (* PBKDF2-HMAC-SHA256 implementation *)
+  let hmac_sha256 ~key data =
+    Digestif.SHA256.hmac_string ~key data
+    |> Digestif.SHA256.to_raw_string
+  in
+  (* Salt with block number (only 1 block needed for 32-byte key) *)
+  let salt_with_block =
+    let s = Bytes.create (String.length salt_str + 4) in
+    Bytes.blit_string salt_str 0 s 0 (String.length salt_str);
+    Bytes.set s (String.length salt_str) '\000';
+    Bytes.set s (String.length salt_str + 1) '\000';
+    Bytes.set s (String.length salt_str + 2) '\000';
+    Bytes.set s (String.length salt_str + 3) '\001';
+    Bytes.to_string s
+  in
+  let u = ref (hmac_sha256 ~key:password salt_with_block) in
+  let result = Bytes.of_string !u in
+  for _ = 2 to iterations do
+    u := hmac_sha256 ~key:password !u;
+    for j = 0 to key_len - 1 do
+      let b = Char.code (Bytes.get result j) lxor Char.code (String.get !u j) in
+      Bytes.set result j (Char.chr b)
+    done
+  done;
+  Cstruct.of_string (Bytes.to_string result)
+
+(* Generate a random salt for key derivation *)
+let generate_salt () : Cstruct.t =
+  let salt = Cstruct.create 16 in
+  let fd = Unix.openfile "/dev/urandom" [Unix.O_RDONLY] 0 in
+  let bytes = Bytes.create 16 in
+  let _ = Unix.read fd bytes 0 16 in
+  Unix.close fd;
+  Cstruct.blit_from_bytes bytes 0 salt 0 16;
+  salt
+
+(* Generate a random IV for AES-CBC *)
+let generate_iv () : Cstruct.t =
+  let iv = Cstruct.create 16 in
+  let fd = Unix.openfile "/dev/urandom" [Unix.O_RDONLY] 0 in
+  let bytes = Bytes.create 16 in
+  let _ = Unix.read fd bytes 0 16 in
+  Unix.close fd;
+  Cstruct.blit_from_bytes bytes 0 iv 0 16;
+  iv
+
+(* Pad data to AES block size (16 bytes) using PKCS7 padding *)
+let pkcs7_pad (data : Cstruct.t) : Cstruct.t =
+  let block_size = 16 in
+  let len = Cstruct.length data in
+  let pad_len = block_size - (len mod block_size) in
+  let padded = Cstruct.create (len + pad_len) in
+  Cstruct.blit data 0 padded 0 len;
+  for i = 0 to pad_len - 1 do
+    Cstruct.set_uint8 padded (len + i) pad_len
+  done;
+  padded
+
+(* Remove PKCS7 padding *)
+let pkcs7_unpad (data : Cstruct.t) : Cstruct.t option =
+  let len = Cstruct.length data in
+  if len = 0 || len mod 16 <> 0 then None
+  else begin
+    let pad_len = Cstruct.get_uint8 data (len - 1) in
+    if pad_len = 0 || pad_len > 16 then None
+    else if pad_len > len then None
+    else begin
+      (* Verify padding *)
+      let valid = ref true in
+      for i = 0 to pad_len - 1 do
+        if Cstruct.get_uint8 data (len - 1 - i) <> pad_len then
+          valid := false
+      done;
+      if !valid then
+        Some (Cstruct.sub data 0 (len - pad_len))
+      else
+        None
+    end
+  end
+
+(* Encrypt data with AES-256-CBC *)
+let aes_256_cbc_encrypt ~(key : Cstruct.t) ~(iv : Cstruct.t) (plaintext : Cstruct.t) : Cstruct.t =
+  let padded = pkcs7_pad plaintext in
+  let cipher = Mirage_crypto.AES.CBC.of_secret (Cstruct.to_string key) in
+  let iv_str = Cstruct.to_string iv in
+  Cstruct.of_string (Mirage_crypto.AES.CBC.encrypt ~key:cipher ~iv:iv_str (Cstruct.to_string padded))
+
+(* Decrypt data with AES-256-CBC *)
+let aes_256_cbc_decrypt ~(key : Cstruct.t) ~(iv : Cstruct.t) (ciphertext : Cstruct.t) : Cstruct.t option =
+  if Cstruct.length ciphertext = 0 || Cstruct.length ciphertext mod 16 <> 0 then
+    None
+  else begin
+    let cipher = Mirage_crypto.AES.CBC.of_secret (Cstruct.to_string key) in
+    let iv_str = Cstruct.to_string iv in
+    let decrypted = Mirage_crypto.AES.CBC.decrypt ~key:cipher ~iv:iv_str (Cstruct.to_string ciphertext) in
+    pkcs7_unpad (Cstruct.of_string decrypted)
+  end
+
+(* ============================================================================
    Wallet Persistence
    ============================================================================ *)
 
@@ -1279,12 +1556,25 @@ let hex_to_cstruct (s : string) : Cstruct.t =
   done;
   buf
 
-(* Save wallet to file *)
+(* Convert address_type to string *)
+let addr_type_to_string = function
+  | P2PKH -> "p2pkh"
+  | P2WPKH -> "p2wpkh"
+  | P2TR -> "p2tr"
+
+(* Convert string to address_type *)
+let addr_type_of_string = function
+  | "p2pkh" -> P2PKH
+  | "p2tr" -> P2TR
+  | _ -> P2WPKH  (* default *)
+
+(* Save wallet to file (unencrypted) *)
 let save (w : t) : unit =
   let keys_json = List.map (fun kp ->
     `Assoc [
       ("private_key", `String (cstruct_to_hex kp.private_key));
       ("address", `String (Address.address_to_string kp.address));
+      ("addr_type", `String (addr_type_to_string kp.addr_type));
     ]
   ) w.keys in
 
@@ -1328,6 +1618,10 @@ let save (w : t) : unit =
     ("next_key_index", `Int w.next_key_index);
     ("balance_confirmed", `String (Int64.to_string w.balance_confirmed));
     ("balance_unconfirmed", `String (Int64.to_string w.balance_unconfirmed));
+    ("bip44_receive_index", `Int w.bip44_receive_index);
+    ("bip44_change_index", `Int w.bip44_change_index);
+    ("bip86_receive_index", `Int w.bip86_receive_index);
+    ("bip86_change_index", `Int w.bip86_change_index);
     ("tx_history", `List history_json);
   ] in
 
@@ -1335,7 +1629,225 @@ let save (w : t) : unit =
   output_string oc (Yojson.Safe.to_string json);
   close_out oc
 
-(* Load wallet from file *)
+(* Save wallet to file with AES-256-CBC encryption *)
+let save_encrypted (w : t) ~(passphrase : string) : unit =
+  let keys_json = List.map (fun kp ->
+    `Assoc [
+      ("private_key", `String (cstruct_to_hex kp.private_key));
+      ("address", `String (Address.address_to_string kp.address));
+      ("addr_type", `String (addr_type_to_string kp.addr_type));
+    ]
+  ) w.keys in
+
+  let utxos_json = List.map (fun wutxo ->
+    `Assoc [
+      ("txid", `String (cstruct_to_hex wutxo.outpoint.txid));
+      ("vout", `Int (Int32.to_int wutxo.outpoint.vout));
+      ("value", `String (Int64.to_string wutxo.utxo.Utxo.value));
+      ("script_pubkey", `String (cstruct_to_hex wutxo.utxo.Utxo.script_pubkey));
+      ("height", `Int wutxo.utxo.Utxo.height);
+      ("is_coinbase", `Bool wutxo.utxo.Utxo.is_coinbase);
+      ("key_index", `Int wutxo.key_index);
+      ("confirmed", `Bool wutxo.confirmed);
+    ]
+  ) w.utxos in
+
+  let history_json = List.map (fun h ->
+    `Assoc [
+      ("txid", `String h.hist_txid);
+      ("category", `String (match h.hist_category with `Send -> "send" | `Receive -> "receive"));
+      ("amount", `String (Int64.to_string h.hist_amount));
+      ("fee", `String (Int64.to_string h.hist_fee));
+      ("address", `String h.hist_address);
+      ("confirmations", `Int h.hist_confirmations);
+      ("blockhash", `String h.hist_block_hash);
+      ("blockheight", `Int h.hist_block_height);
+      ("time", `Float h.hist_timestamp);
+    ]
+  ) w.tx_history in
+
+  let network_str = match w.network with
+    | `Mainnet -> "mainnet"
+    | `Testnet -> "testnet"
+    | `Regtest -> "regtest"
+  in
+
+  let json = `Assoc [
+    ("network", `String network_str);
+    ("keys", `List keys_json);
+    ("utxos", `List utxos_json);
+    ("next_key_index", `Int w.next_key_index);
+    ("balance_confirmed", `String (Int64.to_string w.balance_confirmed));
+    ("balance_unconfirmed", `String (Int64.to_string w.balance_unconfirmed));
+    ("bip44_receive_index", `Int w.bip44_receive_index);
+    ("bip44_change_index", `Int w.bip44_change_index);
+    ("bip86_receive_index", `Int w.bip86_receive_index);
+    ("bip86_change_index", `Int w.bip86_change_index);
+    ("tx_history", `List history_json);
+  ] in
+
+  (* Encrypt the JSON content *)
+  let salt = generate_salt () in
+  let iv = generate_iv () in
+  let key = derive_aes_key passphrase salt in
+  let plaintext = Cstruct.of_string (Yojson.Safe.to_string json) in
+  let ciphertext = aes_256_cbc_encrypt ~key ~iv plaintext in
+
+  (* Store encrypted wallet with salt and IV prepended *)
+  let header = `Assoc [
+    ("encrypted", `Bool true);
+    ("salt", `String (cstruct_to_hex salt));
+    ("iv", `String (cstruct_to_hex iv));
+    ("data", `String (cstruct_to_hex ciphertext));
+  ] in
+
+  let oc = open_out w.db_path in
+  output_string oc (Yojson.Safe.to_string header);
+  close_out oc;
+
+  (* Update encryption state *)
+  w.encryption <- { encrypted = true; salt = Some salt; iv = Some iv }
+
+(* Load wallet data from JSON into wallet *)
+let load_wallet_json (w : t) (network : [`Mainnet | `Testnet | `Regtest]) (json : Yojson.Safe.t) : unit =
+  match json with
+  | `Assoc fields ->
+    (* Load keys *)
+    (match List.assoc_opt "keys" fields with
+     | Some (`List keys) ->
+       List.iter (fun k ->
+         match k with
+         | `Assoc kf ->
+           (match List.assoc_opt "private_key" kf with
+            | Some (`String hex) ->
+              let private_key = hex_to_cstruct hex in
+              let public_key = Crypto.derive_public_key
+                ~compressed:true private_key in
+              let addr_type = match List.assoc_opt "addr_type" kf with
+                | Some (`String s) -> addr_type_of_string s
+                | _ -> P2WPKH
+              in
+              let addr_constructor = match addr_type with
+                | P2PKH -> Address.P2PKH
+                | P2WPKH -> Address.P2WPKH
+                | P2TR -> Address.P2TR
+              in
+              let address = match addr_type with
+                | P2TR ->
+                  let xonly = Crypto.derive_xonly_pubkey private_key in
+                  Address.of_pubkey ~network addr_constructor xonly
+                | _ ->
+                  Address.of_pubkey ~network addr_constructor public_key
+              in
+              w.keys <- w.keys @ [{ private_key; public_key; address; addr_type }]
+            | _ -> ())
+         | _ -> ()
+       ) keys
+     | _ -> ());
+
+    (* Load UTXOs *)
+    (match List.assoc_opt "utxos" fields with
+     | Some (`List utxos) ->
+       List.iter (fun u ->
+         match u with
+         | `Assoc uf ->
+           let txid = match List.assoc_opt "txid" uf with
+             | Some (`String h) -> hex_to_cstruct h
+             | _ -> Types.zero_hash
+           in
+           let vout = match List.assoc_opt "vout" uf with
+             | Some (`Int v) -> Int32.of_int v
+             | _ -> 0l
+           in
+           let value = match List.assoc_opt "value" uf with
+             | Some (`String v) -> Int64.of_string v
+             | _ -> 0L
+           in
+           let script_pubkey = match List.assoc_opt "script_pubkey" uf with
+             | Some (`String h) -> hex_to_cstruct h
+             | _ -> Cstruct.create 0
+           in
+           let height = match List.assoc_opt "height" uf with
+             | Some (`Int h) -> h
+             | _ -> 0
+           in
+           let is_coinbase = match List.assoc_opt "is_coinbase" uf with
+             | Some (`Bool b) -> b
+             | _ -> false
+           in
+           let key_index = match List.assoc_opt "key_index" uf with
+             | Some (`Int i) -> i
+             | _ -> 0
+           in
+           let confirmed = match List.assoc_opt "confirmed" uf with
+             | Some (`Bool b) -> b
+             | _ -> true
+           in
+           let wutxo = {
+             outpoint = { txid; vout };
+             utxo = { Utxo.value; script_pubkey; height; is_coinbase };
+             key_index;
+             confirmed;
+           } in
+           w.utxos <- w.utxos @ [wutxo]
+         | _ -> ()
+       ) utxos
+     | _ -> ());
+
+    (* Load index fields *)
+    (match List.assoc_opt "next_key_index" fields with
+     | Some (`Int n) -> w.next_key_index <- n | _ -> ());
+    (match List.assoc_opt "balance_confirmed" fields with
+     | Some (`String v) -> w.balance_confirmed <- Int64.of_string v | _ -> ());
+    (match List.assoc_opt "balance_unconfirmed" fields with
+     | Some (`String v) -> w.balance_unconfirmed <- Int64.of_string v | _ -> ());
+    (match List.assoc_opt "bip44_receive_index" fields with
+     | Some (`Int n) -> w.bip44_receive_index <- n | _ -> ());
+    (match List.assoc_opt "bip44_change_index" fields with
+     | Some (`Int n) -> w.bip44_change_index <- n | _ -> ());
+    (match List.assoc_opt "bip86_receive_index" fields with
+     | Some (`Int n) -> w.bip86_receive_index <- n | _ -> ());
+    (match List.assoc_opt "bip86_change_index" fields with
+     | Some (`Int n) -> w.bip86_change_index <- n | _ -> ());
+
+    (* Load transaction history *)
+    (match List.assoc_opt "tx_history" fields with
+     | Some (`List entries) ->
+       List.iter (fun entry ->
+         match entry with
+         | `Assoc ef ->
+           let hist_txid = match List.assoc_opt "txid" ef with
+             | Some (`String s) -> s | _ -> "" in
+           let hist_category = match List.assoc_opt "category" ef with
+             | Some (`String "send") -> `Send | _ -> `Receive in
+           let hist_amount = match List.assoc_opt "amount" ef with
+             | Some (`String s) -> Int64.of_string s | _ -> 0L in
+           let hist_fee = match List.assoc_opt "fee" ef with
+             | Some (`String s) -> Int64.of_string s | _ -> 0L in
+           let hist_address = match List.assoc_opt "address" ef with
+             | Some (`String s) -> s | _ -> "" in
+           let hist_confirmations = match List.assoc_opt "confirmations" ef with
+             | Some (`Int n) -> n | _ -> 0 in
+           let hist_block_hash = match List.assoc_opt "blockhash" ef with
+             | Some (`String s) -> s | _ -> "" in
+           let hist_block_height = match List.assoc_opt "blockheight" ef with
+             | Some (`Int n) -> n | _ -> 0 in
+           let hist_timestamp = match List.assoc_opt "time" ef with
+             | Some (`Float f) -> f
+             | Some (`Int n) -> float_of_int n
+             | _ -> 0.0 in
+           let h = {
+             hist_txid; hist_category; hist_amount; hist_fee;
+             hist_address; hist_confirmations; hist_block_hash;
+             hist_block_height; hist_timestamp;
+           } in
+           w.tx_history <- w.tx_history @ [h]
+         | _ -> ()
+       ) entries
+     | _ -> ())
+  | _ -> ()
+
+(* Load wallet from file (unencrypted) *)
 let load ~(network : [`Mainnet | `Testnet | `Regtest])
     ~(db_path : string) : t =
   if Sys.file_exists db_path then begin
@@ -1346,128 +1858,58 @@ let load ~(network : [`Mainnet | `Testnet | `Regtest])
 
     let json = Yojson.Safe.from_string data in
     let w = create ~network ~db_path in
-
-    (match json with
-     | `Assoc fields ->
-       (* Load keys *)
-       (match List.assoc_opt "keys" fields with
-        | Some (`List keys) ->
-          List.iter (fun k ->
-            match k with
-            | `Assoc kf ->
-              (match List.assoc_opt "private_key" kf with
-               | Some (`String hex) ->
-                 let private_key = hex_to_cstruct hex in
-                 let public_key = Crypto.derive_public_key
-                   ~compressed:true private_key in
-                 let address = Address.of_pubkey
-                   ~network Address.P2WPKH public_key in
-                 w.keys <- w.keys @ [{ private_key; public_key; address }]
-               | _ -> ())
-            | _ -> ()
-          ) keys
-        | _ -> ());
-
-       (* Load UTXOs *)
-       (match List.assoc_opt "utxos" fields with
-        | Some (`List utxos) ->
-          List.iter (fun u ->
-            match u with
-            | `Assoc uf ->
-              let txid = match List.assoc_opt "txid" uf with
-                | Some (`String h) -> hex_to_cstruct h
-                | _ -> Types.zero_hash
-              in
-              let vout = match List.assoc_opt "vout" uf with
-                | Some (`Int v) -> Int32.of_int v
-                | _ -> 0l
-              in
-              let value = match List.assoc_opt "value" uf with
-                | Some (`String v) -> Int64.of_string v
-                | _ -> 0L
-              in
-              let script_pubkey = match List.assoc_opt "script_pubkey" uf with
-                | Some (`String h) -> hex_to_cstruct h
-                | _ -> Cstruct.create 0
-              in
-              let height = match List.assoc_opt "height" uf with
-                | Some (`Int h) -> h
-                | _ -> 0
-              in
-              let is_coinbase = match List.assoc_opt "is_coinbase" uf with
-                | Some (`Bool b) -> b
-                | _ -> false
-              in
-              let key_index = match List.assoc_opt "key_index" uf with
-                | Some (`Int i) -> i
-                | _ -> 0
-              in
-              let confirmed = match List.assoc_opt "confirmed" uf with
-                | Some (`Bool b) -> b
-                | _ -> true
-              in
-              let wutxo = {
-                outpoint = { txid; vout };
-                utxo = { Utxo.value; script_pubkey; height; is_coinbase };
-                key_index;
-                confirmed;
-              } in
-              w.utxos <- w.utxos @ [wutxo]
-            | _ -> ()
-          ) utxos
-        | _ -> ());
-
-       (* Load other fields *)
-       (match List.assoc_opt "next_key_index" fields with
-        | Some (`Int n) -> w.next_key_index <- n
-        | _ -> ());
-       (match List.assoc_opt "balance_confirmed" fields with
-        | Some (`String v) -> w.balance_confirmed <- Int64.of_string v
-        | _ -> ());
-       (match List.assoc_opt "balance_unconfirmed" fields with
-        | Some (`String v) -> w.balance_unconfirmed <- Int64.of_string v
-        | _ -> ());
-
-       (* Load transaction history *)
-       (match List.assoc_opt "tx_history" fields with
-        | Some (`List entries) ->
-          List.iter (fun entry ->
-            match entry with
-            | `Assoc ef ->
-              let hist_txid = match List.assoc_opt "txid" ef with
-                | Some (`String s) -> s | _ -> "" in
-              let hist_category = match List.assoc_opt "category" ef with
-                | Some (`String "send") -> `Send
-                | _ -> `Receive in
-              let hist_amount = match List.assoc_opt "amount" ef with
-                | Some (`String s) -> Int64.of_string s | _ -> 0L in
-              let hist_fee = match List.assoc_opt "fee" ef with
-                | Some (`String s) -> Int64.of_string s | _ -> 0L in
-              let hist_address = match List.assoc_opt "address" ef with
-                | Some (`String s) -> s | _ -> "" in
-              let hist_confirmations = match List.assoc_opt "confirmations" ef with
-                | Some (`Int n) -> n | _ -> 0 in
-              let hist_block_hash = match List.assoc_opt "blockhash" ef with
-                | Some (`String s) -> s | _ -> "" in
-              let hist_block_height = match List.assoc_opt "blockheight" ef with
-                | Some (`Int n) -> n | _ -> 0 in
-              let hist_timestamp = match List.assoc_opt "time" ef with
-                | Some (`Float f) -> f
-                | Some (`Int n) -> float_of_int n
-                | _ -> 0.0 in
-              let h = {
-                hist_txid; hist_category; hist_amount; hist_fee;
-                hist_address; hist_confirmations; hist_block_hash;
-                hist_block_height; hist_timestamp;
-              } in
-              w.tx_history <- w.tx_history @ [h]
-            | _ -> ()
-          ) entries
-        | _ -> ())
-     | _ -> ());
+    load_wallet_json w network json;
     w
   end else
     create ~network ~db_path
+
+(* Load wallet from encrypted file *)
+let load_encrypted ~(network : [`Mainnet | `Testnet | `Regtest])
+    ~(db_path : string) ~(passphrase : string) : (t, string) result =
+  if not (Sys.file_exists db_path) then
+    Error "Wallet file does not exist"
+  else begin
+    let ic = open_in db_path in
+    let len = in_channel_length ic in
+    let data = really_input_string ic len in
+    close_in ic;
+
+    let json = Yojson.Safe.from_string data in
+    match json with
+    | `Assoc fields ->
+      (match List.assoc_opt "encrypted" fields with
+       | Some (`Bool true) ->
+         (* Encrypted wallet: extract salt, IV, and ciphertext *)
+         let salt = match List.assoc_opt "salt" fields with
+           | Some (`String h) -> hex_to_cstruct h
+           | _ -> failwith "Missing salt"
+         in
+         let iv = match List.assoc_opt "iv" fields with
+           | Some (`String h) -> hex_to_cstruct h
+           | _ -> failwith "Missing IV"
+         in
+         let ciphertext = match List.assoc_opt "data" fields with
+           | Some (`String h) -> hex_to_cstruct h
+           | _ -> failwith "Missing encrypted data"
+         in
+         (* Derive key and decrypt *)
+         let key = derive_aes_key passphrase salt in
+         (match aes_256_cbc_decrypt ~key ~iv ciphertext with
+          | Some plaintext ->
+            let decrypted_json = Yojson.Safe.from_string (Cstruct.to_string plaintext) in
+            let w = create ~network ~db_path in
+            w.encryption <- { encrypted = true; salt = Some salt; iv = Some iv };
+            load_wallet_json w network decrypted_json;
+            Ok w
+          | None ->
+            Error "Decryption failed: incorrect passphrase or corrupted data")
+       | _ ->
+         (* Unencrypted wallet, just load it *)
+         let w = create ~network ~db_path in
+         load_wallet_json w network json;
+         Ok w)
+    | _ -> Error "Invalid wallet file format"
+  end
 
 (* ============================================================================
    Wallet Info

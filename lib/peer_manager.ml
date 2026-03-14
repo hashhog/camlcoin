@@ -54,6 +54,77 @@ let default_config : config = {
   max_block_relay_only_anchors = 2; (* BIP 155: 2 block-relay-only anchors *)
 }
 
+(* ========== Stale peer eviction constants ========== *)
+(* Reference: Bitcoin Core net_processing.cpp ConsiderEviction() *)
+
+module Stale = struct
+  (** Headers timeout: 20 minutes without header from peer behind our tip *)
+  let headers_timeout = 1200.0
+
+  (** Headers response time: 2 minutes to respond to getheaders challenge *)
+  let headers_response_time = 120.0
+
+  (** Block stalling: 2 seconds per assigned block minimum *)
+  let block_stalling_timeout = 2.0
+
+  (** Block stalling absolute max: 10 minutes before disconnect *)
+  let block_stalling_max = 600.0
+
+  (** Ping timeout: 20 minutes without pong response *)
+  let ping_timeout = 1200.0
+
+  (** Stale check interval: run periodic check every 45 seconds *)
+  let stale_check_interval = 45.0
+end
+
+(** Chain sync state for tracking headers timeout challenge *)
+type chain_sync_state =
+  | ChainSynced                     (** Peer is caught up or recently sent headers *)
+  | ChainWaitingForHeaders of {
+      timeout : float;              (** Absolute deadline for getheaders response *)
+      sent_getheaders : bool;       (** Whether we've sent the getheaders challenge *)
+    }
+
+(** Block download stalling state per peer *)
+type block_stall_state = {
+  mutable blocks_in_flight : int;   (** Number of blocks assigned to download *)
+  mutable stalling_since : float option; (** When stalling started, if any *)
+  mutable last_block_time : float;  (** Last time we received a block from this peer *)
+}
+
+(** Per-peer stale tracking state *)
+type stale_peer_state = {
+  mutable chain_sync : chain_sync_state;
+  mutable last_header_time : float;
+  block_stall : block_stall_state;
+  mutable last_ping_nonce : int64 option;
+  mutable last_ping_sent : float;
+  mutable last_pong_received : float;
+}
+
+(** Create initial stale state for a new peer *)
+let create_stale_state () : stale_peer_state =
+  let now = Unix.gettimeofday () in
+  {
+    chain_sync = ChainSynced;
+    last_header_time = now;
+    block_stall = {
+      blocks_in_flight = 0;
+      stalling_since = None;
+      last_block_time = now;
+    };
+    last_ping_nonce = None;
+    last_ping_sent = now;
+    last_pong_received = now;
+  }
+
+(** Stale peer disconnect reasons *)
+module StaleReason = struct
+  let headers_timeout = "headers sync timeout (no response to getheaders challenge)"
+  let block_stalling = "block download stalling (10 minutes without progress)"
+  let ping_timeout = "ping timeout (20 minutes without pong)"
+end
+
 (* Eclipse attack protection constants (from Bitcoin Core addrman_impl.h) *)
 let new_bucket_count = 1024        (* 2^10 = 1024 "new" buckets *)
 let tried_bucket_count = 256       (* 2^8 = 256 "tried" buckets *)
@@ -130,6 +201,9 @@ type t = {
   peer_last_block_time : (int, float) Hashtbl.t;  (* peer_id -> last block received time *)
   peer_connected_time : (int, float) Hashtbl.t;   (* peer_id -> connection timestamp *)
   outbound_netgroups : (string, bool) Hashtbl.t;  (* Netgroups of outbound connections *)
+  (* Stale peer eviction state *)
+  stale_state : (int, stale_peer_state) Hashtbl.t;  (* peer_id -> stale tracking state *)
+  mutable stale_check_running : bool;               (* Whether the 45s check timer is running *)
 }
 
 (* Generate a random bucket key for address hashing *)
@@ -165,6 +239,8 @@ let create ?(config = default_config) (network : Consensus.network_config) : t =
     peer_last_block_time = Hashtbl.create 64;
     peer_connected_time = Hashtbl.create 64;
     outbound_netgroups = Hashtbl.create 16;
+    stale_state = Hashtbl.create 64;
+    stale_check_running = false;
   }
 
 (* Update our known blockchain height *)
@@ -582,6 +658,8 @@ let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
       pm.peers <- peer :: pm.peers;
       (* Track connection time for eviction algorithm *)
       Hashtbl.replace pm.peer_connected_time peer.Peer.id now;
+      (* Initialize stale peer tracking *)
+      Hashtbl.replace pm.stale_state peer.Peer.id (create_stale_state ());
       (* Track outbound netgroup for diversity *)
       Hashtbl.replace pm.outbound_netgroups (netgroup_of addr) true;
       (* Start inventory trickling for this peer *)
@@ -636,6 +714,8 @@ let remove_peer (pm : t) (peer_id : int) : unit Lwt.t =
     Hashtbl.remove pm.peer_last_tx_time peer_id;
     Hashtbl.remove pm.peer_last_block_time peer_id;
     Hashtbl.remove pm.peer_connected_time peer_id;
+    (* Clean up stale peer tracking *)
+    Hashtbl.remove pm.stale_state peer_id;
     (* Remove from outbound netgroup tracking if outbound peer *)
     if peer.Peer.direction = Peer.Outbound then
       Hashtbl.remove pm.outbound_netgroups (netgroup_of peer.Peer.addr);
@@ -717,6 +797,187 @@ let record_peer_misbehavior (pm : t) (peer_id : int) (score : int)
 let get_misbehavior_handler (pm : t) : misbehavior_handler =
   fun peer_id score reason ->
     record_peer_misbehavior pm peer_id score reason
+
+(* ========== Stale peer eviction functions ========== *)
+(* Reference: Bitcoin Core net_processing.cpp ConsiderEviction() *)
+
+(** Get or create stale state for a peer *)
+let get_stale_state (pm : t) (peer_id : int) : stale_peer_state =
+  match Hashtbl.find_opt pm.stale_state peer_id with
+  | Some state -> state
+  | None ->
+    let state = create_stale_state () in
+    Hashtbl.replace pm.stale_state peer_id state;
+    state
+
+(** Called when we receive headers from a peer *)
+let on_headers_received (pm : t) (peer_id : int) ~(new_best_height : int32) : unit =
+  let state = get_stale_state pm peer_id in
+  let now = Unix.gettimeofday () in
+  state.last_header_time <- now;
+  (* Reset chain sync state on successful header receipt *)
+  state.chain_sync <- ChainSynced;
+  (* Update peer's best height if higher *)
+  match List.find_opt (fun p -> p.Peer.id = peer_id) pm.peers with
+  | Some peer ->
+    if new_best_height > peer.Peer.best_height then
+      peer.best_height <- new_best_height
+  | None -> ()
+
+(** Called when we receive a block from a peer *)
+let on_block_received (pm : t) (peer_id : int) : unit =
+  let state = get_stale_state pm peer_id in
+  let now = Unix.gettimeofday () in
+  state.block_stall.blocks_in_flight <- max 0 (state.block_stall.blocks_in_flight - 1);
+  state.block_stall.stalling_since <- None;
+  state.block_stall.last_block_time <- now;
+  (* Also update the eviction tracking *)
+  Hashtbl.replace pm.peer_last_block_time peer_id now
+
+(** Assign blocks to download from a peer *)
+let assign_blocks_to_peer (pm : t) (peer_id : int) ~(count : int) : unit =
+  let state = get_stale_state pm peer_id in
+  state.block_stall.blocks_in_flight <- state.block_stall.blocks_in_flight + count
+
+(** Called when we send a ping to a peer *)
+let on_ping_sent (pm : t) (peer_id : int) ~(nonce : int64) : unit =
+  let state = get_stale_state pm peer_id in
+  state.last_ping_nonce <- Some nonce;
+  state.last_ping_sent <- Unix.gettimeofday ()
+
+(** Called when we receive a pong from a peer. Returns true if nonce matched. *)
+let on_pong_received (pm : t) (peer_id : int) ~(nonce : int64) : bool =
+  let state = get_stale_state pm peer_id in
+  match state.last_ping_nonce with
+  | Some expected when expected = nonce ->
+    state.last_ping_nonce <- None;
+    state.last_pong_received <- Unix.gettimeofday ();
+    true
+  | _ -> false
+
+(** Check headers timeout for a single peer. Returns Some reason if should disconnect. *)
+let check_headers_timeout (pm : t) (peer : Peer.peer) ~(now : float) : string option =
+  let state = get_stale_state pm peer.Peer.id in
+  let our_height = Int32.to_int pm.our_height in
+  let peer_height = Int32.to_int peer.Peer.best_height in
+
+  (* Only check outbound peers that are behind our tip *)
+  if peer.Peer.direction <> Peer.Outbound then
+    None
+  else if peer_height >= our_height then begin
+    (* Peer is caught up, reset chain sync state *)
+    state.chain_sync <- ChainSynced;
+    None
+  end else begin
+    let time_since_header = now -. state.last_header_time in
+    match state.chain_sync with
+    | ChainSynced ->
+      if time_since_header > Stale.headers_timeout then begin
+        (* Start challenge: set 2-minute timeout for getheaders response *)
+        state.chain_sync <- ChainWaitingForHeaders {
+          timeout = now +. Stale.headers_response_time;
+          sent_getheaders = true;
+        };
+        None  (* Will send getheaders, don't disconnect yet *)
+      end else
+        None
+    | ChainWaitingForHeaders { timeout; _ } ->
+      if now > timeout then
+        (* Challenge timeout expired, disconnect *)
+        Some StaleReason.headers_timeout
+      else
+        None
+  end
+
+(** Check if we need to send getheaders challenge to a peer *)
+let needs_getheaders_challenge (pm : t) (peer_id : int) : bool =
+  match Hashtbl.find_opt pm.stale_state peer_id with
+  | Some state ->
+    (match state.chain_sync with
+     | ChainWaitingForHeaders { sent_getheaders = true; _ } -> true
+     | _ -> false)
+  | None -> false
+
+(** Mark that getheaders was sent (called after sending) *)
+let mark_getheaders_sent (pm : t) (peer_id : int) : unit =
+  match Hashtbl.find_opt pm.stale_state peer_id with
+  | Some state ->
+    (match state.chain_sync with
+     | ChainWaitingForHeaders s ->
+       state.chain_sync <- ChainWaitingForHeaders { s with sent_getheaders = false }
+     | _ -> ())
+  | None -> ()
+
+(** Check block stalling for a single peer. Returns Some reason if should disconnect. *)
+let check_block_stalling (pm : t) (peer : Peer.peer) ~(now : float) : string option =
+  let state = get_stale_state pm peer.Peer.id in
+  let stall = state.block_stall in
+
+  if stall.blocks_in_flight = 0 then begin
+    (* No blocks in flight, clear stalling state *)
+    stall.stalling_since <- None;
+    None
+  end else begin
+    (* Calculate expected timeout based on blocks in flight *)
+    let expected_time =
+      float_of_int stall.blocks_in_flight *. Stale.block_stalling_timeout
+    in
+    let timeout = max expected_time Stale.block_stalling_timeout in
+    let time_since_block = now -. stall.last_block_time in
+
+    match stall.stalling_since with
+    | None ->
+      (* Check if we should start stalling timer *)
+      if time_since_block > timeout then begin
+        stall.stalling_since <- Some now;
+        None  (* Just started stalling, don't disconnect yet *)
+      end else
+        None
+    | Some stall_start ->
+      let stall_duration = now -. stall_start in
+      if stall_duration > Stale.block_stalling_max then
+        (* Stalled too long, disconnect *)
+        Some StaleReason.block_stalling
+      else
+        None
+  end
+
+(** Check ping timeout for a single peer. Returns Some reason if should disconnect. *)
+let check_ping_timeout (pm : t) (peer_id : int) ~(now : float) : string option =
+  let state = get_stale_state pm peer_id in
+  match state.last_ping_nonce with
+  | None -> None  (* No ping outstanding *)
+  | Some _ ->
+    let time_since_ping = now -. state.last_ping_sent in
+    if time_since_ping > Stale.ping_timeout then
+      Some StaleReason.ping_timeout
+    else
+      None
+
+(** Get list of peers that are stalling block downloads (for reassignment) *)
+let get_stalling_peers (pm : t) : Peer.peer list =
+  let now = Unix.gettimeofday () in
+  List.filter (fun peer ->
+    match Hashtbl.find_opt pm.stale_state peer.Peer.id with
+    | Some state ->
+      (match state.block_stall.stalling_since with
+       | Some stall_start ->
+         let stall_duration = now -. stall_start in
+         (* Stalling but not yet at max timeout *)
+         stall_duration > Stale.block_stalling_timeout &&
+         stall_duration < Stale.block_stalling_max
+       | None -> false)
+    | None -> false
+  ) pm.peers
+
+(** Get peers available for block download (not stalling) *)
+let get_available_download_peers (pm : t) : Peer.peer list =
+  List.filter (fun peer ->
+    peer.Peer.state = Peer.Ready &&
+    (match Hashtbl.find_opt pm.stale_state peer.Peer.id with
+     | Some state -> state.block_stall.stalling_since = None
+     | None -> true)
+  ) pm.peers
 
 (* Get candidate addresses for connection *)
 let get_connection_candidates (pm : t) (count : int) : peer_info list =
@@ -926,6 +1187,88 @@ let build_locator (db : Storage.ChainDB.t) (tip_height : int) : Types.hash256 li
    | None -> ());
   (* Result was built in reverse (prepending), so reverse to get tip first *)
   List.rev !result
+
+(** Check all peers for staleness and disconnect stale ones.
+    Returns list of (peer_id, reason) for peers that were disconnected. *)
+let check_stale_peers (pm : t) : (int * string) list Lwt.t =
+  let open Lwt.Syntax in
+  let now = Unix.gettimeofday () in
+  let disconnected = ref [] in
+
+  (* Check each peer for staleness *)
+  let* () = Lwt_list.iter_s (fun peer ->
+    if peer.Peer.state <> Peer.Ready then
+      Lwt.return_unit
+    else begin
+      let disconnect_reason = ref None in
+
+      (* Check headers timeout (outbound only) *)
+      (match check_headers_timeout pm peer ~now with
+       | Some reason -> disconnect_reason := Some reason
+       | None -> ());
+
+      (* Check block stalling *)
+      if !disconnect_reason = None then
+        (match check_block_stalling pm peer ~now with
+         | Some reason -> disconnect_reason := Some reason
+         | None -> ());
+
+      (* Check ping timeout *)
+      if !disconnect_reason = None then
+        (match check_ping_timeout pm peer.Peer.id ~now with
+         | Some reason -> disconnect_reason := Some reason
+         | None -> ());
+
+      (* Disconnect if stale *)
+      match !disconnect_reason with
+      | Some reason ->
+        Log.info (fun m -> m "Evicting stale peer %d (%s): %s"
+          peer.Peer.id peer.Peer.addr reason);
+        disconnected := (peer.Peer.id, reason) :: !disconnected;
+        remove_peer pm peer.Peer.id
+      | None ->
+        (* Send getheaders challenge if needed *)
+        if needs_getheaders_challenge pm peer.Peer.id then begin
+          let getheaders = P2p.GetheadersMsg {
+            version = 70016l;
+            locator_hashes = (match pm.db with
+              | Some db -> build_locator db (Int32.to_int pm.our_height)
+              | None -> []);
+            hash_stop = Types.zero_hash;
+          } in
+          let* () = Lwt.catch
+            (fun () -> Peer.send_message peer getheaders)
+            (fun _exn -> Lwt.return_unit) in
+          mark_getheaders_sent pm peer.Peer.id;
+          Lwt.return_unit
+        end else
+          Lwt.return_unit
+    end
+  ) pm.peers in
+
+  Lwt.return !disconnected
+
+(** Start the periodic stale peer check timer (every 45 seconds) *)
+let start_stale_check_timer (pm : t) : unit =
+  if pm.stale_check_running then ()
+  else begin
+    pm.stale_check_running <- true;
+    let rec loop () =
+      if not pm.running || not pm.stale_check_running then
+        Lwt.return_unit
+      else begin
+        let open Lwt.Syntax in
+        let* () = Lwt_unix.sleep Stale.stale_check_interval in
+        let* _disconnected = check_stale_peers pm in
+        loop ()
+      end
+    in
+    Lwt.async loop
+  end
+
+(** Stop the periodic stale peer check timer *)
+let stop_stale_check_timer (pm : t) : unit =
+  pm.stale_check_running <- false
 
 (* Peer message handling loop for a single peer *)
 let peer_message_loop (pm : t) (peer : Peer.peer) : unit Lwt.t =
@@ -1164,6 +1507,8 @@ let accept_inbound (pm : t) (client_fd : Lwt_unix.file_descr)
       pm.peers <- peer :: pm.peers;
       (* Track connection time for eviction algorithm *)
       Hashtbl.replace pm.peer_connected_time peer.Peer.id now;
+      (* Initialize stale peer tracking *)
+      Hashtbl.replace pm.stale_state peer.Peer.id (create_stale_state ());
       (* Start inventory trickling for this peer *)
       Lwt.async (fun () -> Peer.start_trickling peer);
       (* Start the message loop for this inbound peer *)
@@ -1221,6 +1566,8 @@ let start (pm : t) : unit Lwt.t =
   List.iter (add_known_addr pm) fallback;
   (* Start connection maintenance loop *)
   let maintenance = maintain_connections pm in
+  (* Start the 45-second stale peer check timer *)
+  start_stale_check_timer pm;
   (* Return immediately, maintenance runs in background *)
   Lwt.async (fun () -> maintenance);
   Lwt.return_unit
@@ -1229,6 +1576,8 @@ let start (pm : t) : unit Lwt.t =
 let stop (pm : t) : unit Lwt.t =
   let open Lwt.Syntax in
   pm.running <- false;
+  (* Stop the stale peer check timer *)
+  stop_stale_check_timer pm;
   (* Close the listener socket if open *)
   let* () = match pm.listener_fd with
     | Some fd ->

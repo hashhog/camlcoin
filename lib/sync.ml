@@ -491,11 +491,10 @@ let validate_header (state : chain_state) (header : Types.block_header)
           let height = parent.height + 1 in
           (* Checkpoint enforcement: if this height has a checkpoint,
              the header hash must match the expected checkpoint hash *)
-          match Consensus.get_checkpoint_hash height state.network with
-          | Some expected_hash when not (Cstruct.equal hash expected_hash) ->
-            Error (Printf.sprintf
-              "Header at checkpoint height %d does not match expected hash" height)
-          | _ ->
+          match Consensus.verify_checkpoint height hash state.network with
+          | Consensus.CheckpointMismatch _ as mismatch ->
+            Error (Consensus.checkpoint_result_to_string mismatch)
+          | Consensus.CheckpointOk ->
           let work = Consensus.work_add parent.total_work
               (work_from_bits header.bits) in
           Ok { header; hash; height; total_work = work }

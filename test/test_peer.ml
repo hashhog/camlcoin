@@ -424,6 +424,161 @@ let test_self_connection_nonce () =
   (* Each peer should have a unique nonce *)
   Alcotest.(check bool) "nonces differ" true (peer1.our_nonce <> peer2.our_nonce)
 
+(* Test Poisson delay produces reasonable values *)
+let test_poisson_delay () =
+  (* Generate 100 samples and verify they're in a reasonable range *)
+  let samples = List.init 100 (fun _ -> Peer.poisson_delay 5.0) in
+  (* All samples should be positive *)
+  let all_positive = List.for_all (fun x -> x > 0.0) samples in
+  Alcotest.(check bool) "all positive" true all_positive;
+  (* Mean should be roughly 5.0 (within 50% for 100 samples) *)
+  let sum = List.fold_left ( +. ) 0.0 samples in
+  let mean = sum /. 100.0 in
+  Alcotest.(check bool) "mean in range 2.5-7.5" true (mean > 2.5 && mean < 7.5)
+
+(* Test inventory trickling constants *)
+let test_trickling_constants () =
+  Alcotest.(check (float 0.001)) "inbound interval = 5.0" 5.0
+    Peer.inbound_inv_broadcast_interval;
+  Alcotest.(check (float 0.001)) "outbound interval = 2.0" 2.0
+    Peer.outbound_inv_broadcast_interval;
+  Alcotest.(check int) "max inv per flush = 1000" 1000
+    Peer.max_inv_per_flush
+
+(* Test inv_queue initialization *)
+let test_inv_queue_init () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  (* Queue should be empty initially *)
+  Alcotest.(check int) "queue empty" 0 (Peer.inv_queue_length peer);
+  (* trickling_active should be false initially *)
+  Alcotest.(check bool) "trickling not active" false peer.trickling_active;
+  (* next_inv_send should be in the future *)
+  Alcotest.(check bool) "next_inv_send in future" true
+    (peer.next_inv_send > Unix.gettimeofday () -. 10.0)
+
+(* Test queue_inv adds to queue for Ready peer *)
+let test_queue_inv_ready () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  (* Set peer to Ready state *)
+  peer.state <- Peer.Ready;
+  let hash = Cstruct.create 32 in
+  Cstruct.set_uint8 hash 0 0xAB;
+  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+  Peer.queue_inv peer entry;
+  Alcotest.(check int) "queue has 1 item" 1 (Peer.inv_queue_length peer)
+
+(* Test queue_inv ignores non-Ready peer *)
+let test_queue_inv_not_ready () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  (* Peer is Connected, not Ready *)
+  Alcotest.(check bool) "peer not ready" false (peer.state = Peer.Ready);
+  let hash = Cstruct.create 32 in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+  Peer.queue_inv peer entry;
+  Alcotest.(check int) "queue still empty" 0 (Peer.inv_queue_length peer)
+
+(* Test multiple items can be queued *)
+let test_queue_inv_multiple () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.state <- Peer.Ready;
+  for i = 0 to 99 do
+    let hash = Cstruct.create 32 in
+    Cstruct.set_uint8 hash 0 i;
+    let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+    Peer.queue_inv peer entry
+  done;
+  Alcotest.(check int) "queue has 100 items" 100 (Peer.inv_queue_length peer)
+
+(* Test should_flush_inv returns false when queue is empty *)
+let test_should_flush_inv_empty () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.state <- Peer.Ready;
+  peer.next_inv_send <- Unix.gettimeofday () -. 10.0;  (* Past time *)
+  Alcotest.(check bool) "should not flush empty queue" false
+    (Peer.should_flush_inv peer)
+
+(* Test should_flush_inv returns false before next_inv_send time *)
+let test_should_flush_inv_not_time () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.state <- Peer.Ready;
+  (* Add an item to the queue *)
+  let hash = Cstruct.create 32 in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+  Peer.queue_inv peer entry;
+  (* Set next_inv_send to 10 seconds in the future *)
+  peer.next_inv_send <- Unix.gettimeofday () +. 10.0;
+  Alcotest.(check bool) "should not flush before time" false
+    (Peer.should_flush_inv peer)
+
+(* Test should_flush_inv returns true when ready *)
+let test_should_flush_inv_ready () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.state <- Peer.Ready;
+  (* Add an item to the queue *)
+  let hash = Cstruct.create 32 in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+  Peer.queue_inv peer entry;
+  (* Set next_inv_send to the past *)
+  peer.next_inv_send <- Unix.gettimeofday () -. 1.0;
+  Alcotest.(check bool) "should flush when ready" true
+    (Peer.should_flush_inv peer)
+
+(* Test schedule_next_inv_send updates next_inv_send *)
+let test_schedule_next_inv_send () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  let old_time = peer.next_inv_send in
+  Peer.schedule_next_inv_send peer;
+  (* New time should be in the future relative to now *)
+  Alcotest.(check bool) "next_inv_send updated" true
+    (peer.next_inv_send > Unix.gettimeofday ());
+  (* And different from the old time (almost certainly) *)
+  Alcotest.(check bool) "next_inv_send different" true
+    (peer.next_inv_send <> old_time)
+
+(* Test inbound vs outbound peer trickling intervals *)
+let test_trickling_intervals () =
+  let fd1 = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let fd2 = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let outbound = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd:fd1 in
+  let inbound = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:1 ~direction:Peer.Inbound ~fd:fd2 in
+  (* Generate many samples for each and check average is correct *)
+  let outbound_delays = List.init 50 (fun _ ->
+    Peer.schedule_next_inv_send outbound;
+    outbound.next_inv_send -. Unix.gettimeofday ()
+  ) in
+  let inbound_delays = List.init 50 (fun _ ->
+    Peer.schedule_next_inv_send inbound;
+    inbound.next_inv_send -. Unix.gettimeofday ()
+  ) in
+  let avg_outbound = (List.fold_left ( +. ) 0.0 outbound_delays) /. 50.0 in
+  let avg_inbound = (List.fold_left ( +. ) 0.0 inbound_delays) /. 50.0 in
+  (* Outbound average should be around 2.0, inbound around 5.0 *)
+  Alcotest.(check bool) "outbound avg near 2.0" true
+    (avg_outbound > 1.0 && avg_outbound < 4.0);
+  Alcotest.(check bool) "inbound avg near 5.0" true
+    (avg_inbound > 3.0 && avg_inbound < 8.0);
+  (* Inbound should be slower than outbound on average *)
+  Alcotest.(check bool) "inbound slower than outbound" true
+    (avg_inbound > avg_outbound)
+
 (* All tests *)
 let () =
   Alcotest.run "Peer" [
@@ -470,5 +625,18 @@ let () =
       Alcotest.test_case "reject_wtxidrelay_after_handshake" `Quick test_dispatch_wtxidrelay_after_handshake;
       Alcotest.test_case "reject_version_after_handshake" `Quick test_dispatch_version_after_handshake;
       Alcotest.test_case "accept_feefilter_after_handshake" `Quick test_dispatch_post_handshake_feefilter;
+    ];
+    "inv_trickling", [
+      Alcotest.test_case "poisson_delay" `Quick test_poisson_delay;
+      Alcotest.test_case "trickling_constants" `Quick test_trickling_constants;
+      Alcotest.test_case "inv_queue_init" `Quick test_inv_queue_init;
+      Alcotest.test_case "queue_inv_ready" `Quick test_queue_inv_ready;
+      Alcotest.test_case "queue_inv_not_ready" `Quick test_queue_inv_not_ready;
+      Alcotest.test_case "queue_inv_multiple" `Quick test_queue_inv_multiple;
+      Alcotest.test_case "should_flush_inv_empty" `Quick test_should_flush_inv_empty;
+      Alcotest.test_case "should_flush_inv_not_time" `Quick test_should_flush_inv_not_time;
+      Alcotest.test_case "should_flush_inv_ready" `Quick test_should_flush_inv_ready;
+      Alcotest.test_case "schedule_next_inv_send" `Quick test_schedule_next_inv_send;
+      Alcotest.test_case "trickling_intervals" `Quick test_trickling_intervals;
     ];
   ]

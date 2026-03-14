@@ -673,6 +673,176 @@ let test_sendrawtransaction_broadcasts_to_peers () =
   cleanup_test_db ()
 
 (* ============================================================================
+   Batch RPC Tests
+   ============================================================================ *)
+
+(* Test helper: simulates handle_batch_request synchronously *)
+let handle_batch_sync ctx requests =
+  Lwt_main.run (Rpc.handle_batch_request ctx requests)
+
+(* Test: batch request with multiple valid calls returns array of responses *)
+let test_batch_multiple_valid () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  (* Create a batch with 3 different RPC calls *)
+  let req1 = `Assoc [("method", `String "getblockcount"); ("params", `List []); ("id", `Int 1)] in
+  let req2 = `Assoc [("method", `String "getdifficulty"); ("params", `List []); ("id", `Int 2)] in
+  let req3 = `Assoc [("method", `String "getbestblockhash"); ("params", `List []); ("id", `Int 3)] in
+  let responses = handle_batch_sync ctx [req1; req2; req3] in
+  Alcotest.(check int) "batch returns 3 responses" 3 (List.length responses);
+  (* Check each response has the correct id *)
+  (match List.nth responses 0 with
+   | `Assoc fields ->
+     (match List.assoc_opt "id" fields with
+      | Some (`Int 1) -> ()
+      | _ -> Alcotest.fail "first response should have id=1")
+   | _ -> Alcotest.fail "response should be object");
+  (match List.nth responses 1 with
+   | `Assoc fields ->
+     (match List.assoc_opt "id" fields with
+      | Some (`Int 2) -> ()
+      | _ -> Alcotest.fail "second response should have id=2")
+   | _ -> Alcotest.fail "response should be object");
+  (match List.nth responses 2 with
+   | `Assoc fields ->
+     (match List.assoc_opt "id" fields with
+      | Some (`Int 3) -> ()
+      | _ -> Alcotest.fail "third response should have id=3")
+   | _ -> Alcotest.fail "response should be object");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: batch with mixed valid/invalid requests handles each independently *)
+let test_batch_mixed_valid_invalid () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  (* Create a batch with valid and invalid calls *)
+  let req_valid = `Assoc [("method", `String "getblockcount"); ("params", `List []); ("id", `Int 1)] in
+  let req_invalid = `Assoc [("method", `String "nonexistent_method"); ("params", `List []); ("id", `Int 2)] in
+  let req_valid2 = `Assoc [("method", `String "getdifficulty"); ("params", `List []); ("id", `Int 3)] in
+  let responses = handle_batch_sync ctx [req_valid; req_invalid; req_valid2] in
+  Alcotest.(check int) "batch returns 3 responses" 3 (List.length responses);
+  (* First should succeed (no error field) *)
+  (match List.nth responses 0 with
+   | `Assoc fields ->
+     (match List.assoc_opt "error" fields with
+      | Some `Null -> ()
+      | _ -> Alcotest.fail "first request should succeed")
+   | _ -> Alcotest.fail "response should be object");
+  (* Second should fail (has error field) *)
+  (match List.nth responses 1 with
+   | `Assoc fields ->
+     (match List.assoc_opt "error" fields with
+      | Some (`Assoc _) -> ()  (* Has error *)
+      | _ -> Alcotest.fail "second request should fail")
+   | _ -> Alcotest.fail "response should be object");
+  (* Third should succeed *)
+  (match List.nth responses 2 with
+   | `Assoc fields ->
+     (match List.assoc_opt "error" fields with
+      | Some `Null -> ()
+      | _ -> Alcotest.fail "third request should succeed")
+   | _ -> Alcotest.fail "response should be object");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: batch preserves request order in response *)
+let test_batch_preserves_order () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  (* Create batch with string ids to verify order *)
+  let req1 = `Assoc [("method", `String "getblockcount"); ("params", `List []); ("id", `String "first")] in
+  let req2 = `Assoc [("method", `String "getdifficulty"); ("params", `List []); ("id", `String "second")] in
+  let req3 = `Assoc [("method", `String "getmininginfo"); ("params", `List []); ("id", `String "third")] in
+  let responses = handle_batch_sync ctx [req1; req2; req3] in
+  Alcotest.(check int) "batch returns 3 responses" 3 (List.length responses);
+  (* Verify order by checking ids *)
+  let get_id resp = match resp with
+    | `Assoc fields ->
+      (match List.assoc_opt "id" fields with
+       | Some (`String s) -> s
+       | _ -> "unknown")
+    | _ -> "invalid"
+  in
+  Alcotest.(check string) "first id" "first" (get_id (List.nth responses 0));
+  Alcotest.(check string) "second id" "second" (get_id (List.nth responses 1));
+  Alcotest.(check string) "third id" "third" (get_id (List.nth responses 2));
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: batch with null ids *)
+let test_batch_with_null_ids () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  let req1 = `Assoc [("method", `String "getblockcount"); ("params", `List []); ("id", `Null)] in
+  let req2 = `Assoc [("method", `String "getdifficulty"); ("params", `List [])] in  (* No id at all *)
+  let responses = handle_batch_sync ctx [req1; req2] in
+  Alcotest.(check int) "batch returns 2 responses" 2 (List.length responses);
+  (* Both should have null ids in response *)
+  (match List.nth responses 0 with
+   | `Assoc fields ->
+     (match List.assoc_opt "id" fields with
+      | Some `Null -> ()
+      | _ -> Alcotest.fail "response should have null id")
+   | _ -> Alcotest.fail "response should be object");
+  (match List.nth responses 1 with
+   | `Assoc fields ->
+     (match List.assoc_opt "id" fields with
+      | Some `Null -> ()
+      | _ -> Alcotest.fail "response should have null id")
+   | _ -> Alcotest.fail "response should be object");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: batch with 4+ different RPC calls *)
+let test_batch_many_calls () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  let req1 = `Assoc [("method", `String "getblockcount"); ("params", `List []); ("id", `Int 1)] in
+  let req2 = `Assoc [("method", `String "getdifficulty"); ("params", `List []); ("id", `Int 2)] in
+  let req3 = `Assoc [("method", `String "getbestblockhash"); ("params", `List []); ("id", `Int 3)] in
+  let req4 = `Assoc [("method", `String "getmempoolinfo"); ("params", `List []); ("id", `Int 4)] in
+  let req5 = `Assoc [("method", `String "getconnectioncount"); ("params", `List []); ("id", `Int 5)] in
+  let responses = handle_batch_sync ctx [req1; req2; req3; req4; req5] in
+  Alcotest.(check int) "batch returns 5 responses" 5 (List.length responses);
+  (* Verify all responses have result (not error) *)
+  List.iteri (fun i resp ->
+    match resp with
+    | `Assoc fields ->
+      (match List.assoc_opt "error" fields with
+       | Some `Null -> ()
+       | _ -> Alcotest.failf "response %d should succeed" (i + 1))
+    | _ -> Alcotest.failf "response %d should be object" (i + 1)
+  ) responses;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: handle_single_request directly for unit testing *)
+let test_handle_single_request () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  let req = `Assoc [("method", `String "getblockcount"); ("params", `List []); ("id", `Int 42)] in
+  let response = Rpc.handle_single_request ctx req in
+  (match response with
+   | `Assoc fields ->
+     Alcotest.(check bool) "has result" true (List.mem_assoc "result" fields);
+     Alcotest.(check bool) "has id" true (List.mem_assoc "id" fields);
+     (match List.assoc_opt "id" fields with
+      | Some (`Int 42) -> ()
+      | _ -> Alcotest.fail "id should be 42")
+   | _ -> Alcotest.fail "response should be object");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: single request still works *)
+let test_single_request_still_works () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  let req = `Assoc [("method", `String "getblockcount"); ("params", `List []); ("id", `Int 1)] in
+  let response = Rpc.handle_single_request ctx req in
+  (match response with
+   | `Assoc fields ->
+     (match List.assoc_opt "error" fields with
+      | Some `Null -> ()
+      | _ -> Alcotest.fail "single request should succeed")
+   | _ -> Alcotest.fail "response should be object");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -705,5 +875,14 @@ let () =
       test_case "confirmed has block info" `Quick test_getrawtransaction_confirmed_has_block_info;
       test_case "with blockhash param" `Quick test_getrawtransaction_with_blockhash;
       test_case "wrong blockhash error" `Quick test_getrawtransaction_wrong_blockhash;
+    ];
+    "batch", [
+      test_case "multiple valid calls" `Quick test_batch_multiple_valid;
+      test_case "mixed valid/invalid" `Quick test_batch_mixed_valid_invalid;
+      test_case "preserves order" `Quick test_batch_preserves_order;
+      test_case "null ids" `Quick test_batch_with_null_ids;
+      test_case "many calls" `Quick test_batch_many_calls;
+      test_case "handle_single_request" `Quick test_handle_single_request;
+      test_case "single request works" `Quick test_single_request_still_works;
     ];
   ]

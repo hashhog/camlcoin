@@ -56,6 +56,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Package relay (BIP 331, 1p1c topology, CPFP fee-bumping, topological sort)
 - [x] PSBT (BIP-174, creator/updater/signer/combiner/finalizer/extractor roles, taproot support)
 - [x] Output descriptors (BIP 380-386, checksum, parsing, script generation, range expansion)
+- [x] Miniscript (type system, script generation, satisfaction, parsing, wsh(miniscript) support)
 - [ ] Bloom filters (BIP 37)
 
 ## Quick start
@@ -98,6 +99,7 @@ camlcoin/
     block_index.ml    block indexes, BIP-157/158 filters, height index
     psbt.ml           PSBT (BIP-174) multi-party signing
     descriptor.ml     output descriptors (BIP 380-386)
+    miniscript.ml     miniscript (type system, script generation, satisfaction)
     perf.ml           performance utilities and benchmarks
     cli.ml            command line interface
     camlcoin.ml       library interface

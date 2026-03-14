@@ -2191,3 +2191,183 @@ let create_legacy (network : Consensus.network_config) : t =
 (* Get addresses (legacy interface) *)
 let get_addresses (w : t) : string list =
   get_all_addresses w
+
+(* ============================================================================
+   Multi-Wallet Manager
+   ============================================================================ *)
+
+(* Wallet creation options *)
+type wallet_options = {
+  disable_private_keys : bool;
+  blank : bool;
+  passphrase : string option;
+  avoid_reuse : bool;
+  descriptors : bool;
+  load_on_startup : bool option;
+}
+
+let default_wallet_options = {
+  disable_private_keys = false;
+  blank = false;
+  passphrase = None;
+  avoid_reuse = false;
+  descriptors = true;
+  load_on_startup = None;
+}
+
+(* Wallet manager state *)
+type wallet_manager = {
+  wallets : (string, t) Hashtbl.t;
+  mutable wallets_dir : string;
+  network : [`Mainnet | `Testnet | `Regtest];
+}
+
+(* Create a new wallet manager *)
+let create_wallet_manager ~(wallets_dir : string) ~(network : [`Mainnet | `Testnet | `Regtest]) : wallet_manager =
+  if not (Sys.file_exists wallets_dir) then
+    Unix.mkdir wallets_dir 0o755;
+  { wallets = Hashtbl.create 16;
+    wallets_dir;
+    network }
+
+(* Get wallet file path from name *)
+let wallet_path (wm : wallet_manager) (name : string) : string =
+  if name = "" then
+    Filename.concat wm.wallets_dir "wallet.dat"
+  else
+    Filename.concat wm.wallets_dir name
+
+(* Flush wallet state to disk *)
+let flush (w : t) : unit =
+  if w.db_path <> "" then
+    if w.encryption.encrypted then begin
+      (* For encrypted wallets, we need the passphrase to save
+         If locked, we can't re-encrypt without master key *)
+      match w.encryption.lock_state with
+      | Unlocked { master_key; _ } when Cstruct.length master_key > 0 ->
+        (* Re-derive passphrase is not possible, skip save *)
+        ()
+      | _ ->
+        (* Unencrypted or we have master key accessible *)
+        save w
+    end else
+      save w
+
+(* Load a wallet by name *)
+let load_wallet (wm : wallet_manager) (name : string) : (t, string) result =
+  let path = wallet_path wm name in
+  if Hashtbl.mem wm.wallets name then
+    Error (Printf.sprintf "Wallet \"%s\" is already loaded" name)
+  else if not (Sys.file_exists path) then
+    Error (Printf.sprintf "Wallet \"%s\" not found at %s" name path)
+  else begin
+    let wallet = load ~network:wm.network ~db_path:path in
+    Hashtbl.replace wm.wallets name wallet;
+    Ok wallet
+  end
+
+(* Load an encrypted wallet by name with passphrase *)
+let load_wallet_encrypted (wm : wallet_manager) (name : string) ~(passphrase : string)
+    : (t, string) result =
+  let path = wallet_path wm name in
+  if Hashtbl.mem wm.wallets name then
+    Error (Printf.sprintf "Wallet \"%s\" is already loaded" name)
+  else if not (Sys.file_exists path) then
+    Error (Printf.sprintf "Wallet \"%s\" not found at %s" name path)
+  else
+    match load_encrypted ~network:wm.network ~db_path:path ~passphrase with
+    | Ok wallet ->
+      Hashtbl.replace wm.wallets name wallet;
+      Ok wallet
+    | Error e -> Error e
+
+(* Unload a wallet by name *)
+let unload_wallet (wm : wallet_manager) (name : string) : (unit, string) result =
+  match Hashtbl.find_opt wm.wallets name with
+  | None ->
+    Error (Printf.sprintf "Wallet \"%s\" is not loaded" name)
+  | Some wallet ->
+    flush wallet;
+    Hashtbl.remove wm.wallets name;
+    Ok ()
+
+(* Create a new wallet *)
+let create_wallet (wm : wallet_manager) (name : string) ?(options = default_wallet_options) ()
+    : (t, string) result =
+  let path = wallet_path wm name in
+  if Hashtbl.mem wm.wallets name then
+    Error (Printf.sprintf "Wallet \"%s\" is already loaded" name)
+  else if Sys.file_exists path then
+    Error (Printf.sprintf "Wallet \"%s\" already exists" name)
+  else begin
+    let wallet = create ~network:wm.network ~db_path:path in
+    (* Initialize with HD seed unless blank *)
+    if not options.blank && not options.disable_private_keys then begin
+      let mnemonic = Bip39.generate_mnemonic ~strength:128 () in
+      init_from_mnemonic wallet mnemonic ()
+    end;
+    (* Save to disk *)
+    (match options.passphrase with
+     | Some pass when pass <> "" -> save_encrypted wallet ~passphrase:pass
+     | _ -> save wallet);
+    (* Register in manager *)
+    Hashtbl.replace wm.wallets name wallet;
+    Ok wallet
+  end
+
+(* Get a wallet by name *)
+let get_wallet (wm : wallet_manager) (name : string) : t option =
+  Hashtbl.find_opt wm.wallets name
+
+(* Get the default wallet (empty name) *)
+let get_default_wallet (wm : wallet_manager) : t option =
+  Hashtbl.find_opt wm.wallets ""
+
+(* List all loaded wallet names *)
+let list_wallets (wm : wallet_manager) : string list =
+  Hashtbl.fold (fun name _ acc -> name :: acc) wm.wallets []
+
+(* Check if a wallet is loaded *)
+let is_wallet_loaded (wm : wallet_manager) (name : string) : bool =
+  Hashtbl.mem wm.wallets name
+
+(* Get wallet info as JSON-like structure *)
+type wallet_info = {
+  wallet_name : string;
+  wallet_version : int;
+  format : string;
+  tx_count : int;
+  keypoolsize : int;
+  balance : float;
+  unconfirmed_balance : float;
+  immature_balance : float;
+  private_keys_enabled : bool;
+  avoid_reuse : bool;
+  scanning : bool;
+  descriptors : bool;
+  external_signer : bool;
+}
+
+let get_wallet_info (name : string) (w : t) : wallet_info =
+  let confirmed, unconfirmed = get_balance w in
+  { wallet_name = name;
+    wallet_version = 169900;  (* Bitcoin Core 0.16.99 format *)
+    format = "sqlite";
+    tx_count = List.length w.tx_history;
+    keypoolsize = List.length w.keys;
+    balance = Int64.to_float confirmed /. 100_000_000.0;
+    unconfirmed_balance = Int64.to_float unconfirmed /. 100_000_000.0;
+    immature_balance = 0.0;  (* TODO: track immature coinbase *)
+    (* Private keys enabled if wallet has master key or any non-empty private keys *)
+    private_keys_enabled = (Option.is_some w.master_key) ||
+      (w.keys <> [] && not (List.for_all (fun kp -> Cstruct.length kp.private_key = 0) w.keys));
+    avoid_reuse = false;
+    scanning = false;
+    descriptors = true;
+    external_signer = false;
+  }
+
+(* Shutdown wallet manager, flushing all wallets *)
+let shutdown_wallet_manager (wm : wallet_manager) : unit =
+  Hashtbl.iter (fun _name wallet -> flush wallet) wm.wallets;
+  Hashtbl.clear wm.wallets

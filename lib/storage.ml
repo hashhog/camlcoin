@@ -1127,6 +1127,7 @@ type block_status =
   | Block_have_data       (** Full block data available *)
   | Block_have_undo       (** Undo data available *)
   | Block_failed          (** Validation failed *)
+  | Block_pruned          (** Block data has been pruned *)
 
 (** Block index entry stored for each block *)
 type block_index_entry = {
@@ -1228,6 +1229,7 @@ module FlatFileStorage = struct
     | Block_have_data -> 6
     | Block_have_undo -> 7
     | Block_failed -> 8
+    | Block_pruned -> 9
 
   let int_to_status = function
     | 0 -> Block_valid_unknown
@@ -1239,6 +1241,7 @@ module FlatFileStorage = struct
     | 6 -> Block_have_data
     | 7 -> Block_have_undo
     | 8 -> Block_failed
+    | 9 -> Block_pruned
     | _ -> Block_valid_unknown
 
   let serialize_entry w (e : block_index_entry) =
@@ -1263,7 +1266,7 @@ module FlatFileStorage = struct
       (mask land (1 lsl (status_to_int s))) <> 0
     ) [Block_valid_unknown; Block_valid_header; Block_valid_tree;
        Block_valid_transactions; Block_valid_chain; Block_valid_scripts;
-       Block_have_data; Block_have_undo; Block_failed] in
+       Block_have_data; Block_have_undo; Block_failed; Block_pruned] in
     let n_tx = Int32.to_int (Serialize.read_int32_le r) in
     { file_pos; undo_pos; height; header; status; n_tx }
 
@@ -1617,6 +1620,185 @@ module FlatFileStorage = struct
 
   (** Get last file number *)
   let last_file_num t = t.last_file
+
+  (* ============================================================================
+     Block Pruning (Bitcoin Core compatible)
+
+     Reference: Bitcoin Core's node/blockstorage.cpp (PruneOneBlockFile, FindFilesToPrune)
+
+     Pruning removes old block and undo data files to reduce disk usage.
+     Key constraints:
+     - Minimum prune target: 550MB
+     - Keep at least 288 blocks (MIN_BLOCKS_TO_KEEP) for reorg safety
+     - Pruned blocks cannot be served to peers (getdata returns notfound)
+     - Transaction index (-txindex) is incompatible with pruning
+     ============================================================================ *)
+
+  (** Minimum prune target in bytes (550 MB) *)
+  let min_prune_target_bytes = 550 * 1024 * 1024
+
+  (** Minimum blocks to keep for reorg safety (2 days worth) *)
+  let min_blocks_to_keep = 288
+
+  (** Calculate current disk usage (sum of block + undo sizes for all files) *)
+  let calculate_current_usage t =
+    Array.fold_left (fun acc fi ->
+      acc + fi.n_size + fi.n_undo_size
+    ) 0 t.file_info
+
+  (** Check if a block has been pruned *)
+  let is_block_pruned t (hash : Types.hash256) : bool =
+    match Hashtbl.find_opt t.block_index (Cstruct.to_string hash) with
+    | None -> false
+    | Some entry -> List.mem Block_pruned entry.status
+
+  (** Check if we have block data (not pruned) *)
+  let has_block_data t (hash : Types.hash256) : bool =
+    match Hashtbl.find_opt t.block_index (Cstruct.to_string hash) with
+    | None -> false
+    | Some entry ->
+      List.mem Block_have_data entry.status &&
+      not (List.mem Block_pruned entry.status)
+
+  (** Prune a single block file (matching Bitcoin Core's PruneOneBlockFile).
+      Clears BLOCK_HAVE_DATA and BLOCK_HAVE_UNDO flags for all blocks in the file,
+      marks them as pruned, resets file positions, and clears file info. *)
+  let prune_one_block_file t (file_number : int) : unit =
+    (* Update all block index entries that reference this file *)
+    Hashtbl.iter (fun hash_key entry ->
+      if entry.file_pos.file_num = file_number then begin
+        (* Clear data/undo flags and add pruned flag *)
+        let new_status =
+          Block_pruned ::
+          (List.filter (fun s ->
+            s <> Block_have_data && s <> Block_have_undo
+          ) entry.status)
+        in
+        let new_entry = {
+          entry with
+          file_pos = null_pos;
+          undo_pos = null_pos;
+          status = new_status;
+        } in
+        Hashtbl.replace t.block_index hash_key new_entry
+      end
+    ) t.block_index;
+    (* Clear the file info *)
+    if file_number < Array.length t.file_info then begin
+      let fi = t.file_info.(file_number) in
+      fi.n_blocks <- 0;
+      fi.n_size <- 0;
+      fi.n_undo_size <- 0;
+      fi.height_first <- max_int;
+      fi.height_last <- 0;
+      fi.time_first <- Int32.max_int;
+      fi.time_last <- 0l
+    end;
+    t.dirty <- true
+
+  (** Delete the actual blk/rev files from disk *)
+  let unlink_pruned_files t (file_numbers : int list) : unit =
+    List.iter (fun file_num ->
+      let blk_path = block_file_path t file_num in
+      let rev_path = undo_file_path t file_num in
+      (try Sys.remove blk_path with Sys_error _ -> ());
+      (try Sys.remove rev_path with Sys_error _ -> ())
+    ) file_numbers
+
+  (** Find files eligible for pruning based on target size.
+      Returns list of file numbers to prune.
+
+      A file is eligible if:
+      1. It has data (n_size > 0)
+      2. All blocks in the file are below the pruning height
+         (height_last <= chain_height - min_blocks_to_keep)
+
+      prune_target_bytes: target disk usage in bytes
+      chain_height: current validated chain height *)
+  let find_files_to_prune t ~(prune_target_bytes : int) ~(chain_height : int)
+      : int list =
+    let current_usage = calculate_current_usage t in
+    if current_usage <= prune_target_bytes then
+      []  (* Already below target *)
+    else begin
+      let last_block_can_prune = chain_height - min_blocks_to_keep in
+      let files_to_prune = ref [] in
+      let running_usage = ref current_usage in
+      (* Iterate through files in order (prune oldest first) *)
+      for file_num = 0 to Array.length t.file_info - 1 do
+        if !running_usage > prune_target_bytes then begin
+          let fi = t.file_info.(file_num) in
+          (* Check if file has data and all blocks are below prune height *)
+          if fi.n_size > 0 && fi.height_last <= last_block_can_prune then begin
+            files_to_prune := file_num :: !files_to_prune;
+            running_usage := !running_usage - fi.n_size - fi.n_undo_size
+          end
+        end
+      done;
+      List.rev !files_to_prune
+    end
+
+  (** Perform pruning to reduce disk usage below target.
+      Returns the number of files pruned.
+
+      prune_target_mb: target disk usage in MB (minimum 550)
+      chain_height: current validated chain height *)
+  let prune_block_files t ~(prune_target_mb : int) ~(chain_height : int) : int =
+    (* Enforce minimum prune target *)
+    let target_bytes = max min_prune_target_bytes (prune_target_mb * 1024 * 1024) in
+    let files_to_prune = find_files_to_prune t ~prune_target_bytes:target_bytes
+        ~chain_height in
+    (* Prune each file *)
+    List.iter (fun file_num ->
+      prune_one_block_file t file_num
+    ) files_to_prune;
+    (* Delete actual files from disk *)
+    unlink_pruned_files t files_to_prune;
+    (* Save updated index *)
+    if files_to_prune <> [] then
+      save_index t;
+    List.length files_to_prune
+
+  (** Check if pruning is enabled and compatible with current settings.
+      Returns Error if -txindex is enabled with pruning. *)
+  let check_prune_compatibility ~(txindex : bool) ~(prune_target_mb : int)
+      : (unit, string) result =
+    if prune_target_mb > 0 && txindex then
+      Error "Pruning is incompatible with -txindex. Disable txindex or pruning."
+    else if prune_target_mb > 0 && prune_target_mb < 550 then
+      Error "Prune target must be at least 550 MB"
+    else
+      Ok ()
+
+  (** Get pruning statistics *)
+  type prune_stats = {
+    current_usage_mb : int;
+    pruned_files : int;
+    total_files : int;
+    pruned_blocks : int;
+  }
+
+  let get_prune_stats t : prune_stats =
+    let current_usage = calculate_current_usage t in
+    let pruned_files = ref 0 in
+    let pruned_blocks = ref 0 in
+    let total_files = Array.length t.file_info in
+    (* Count files with zero size (pruned) *)
+    Array.iter (fun fi ->
+      if fi.n_size = 0 && fi.n_blocks = 0 then
+        incr pruned_files
+    ) t.file_info;
+    (* Count pruned blocks *)
+    Hashtbl.iter (fun _ entry ->
+      if List.mem Block_pruned entry.status then
+        incr pruned_blocks
+    ) t.block_index;
+    {
+      current_usage_mb = current_usage / 1024 / 1024;
+      pruned_files = !pruned_files;
+      total_files;
+      pruned_blocks = !pruned_blocks;
+    }
 end
 
 (* ============================================================================

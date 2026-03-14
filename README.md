@@ -19,6 +19,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Address encoding (Base58Check, Bech32/Bech32m, WIF)
 - [x] Script interpreter (opcodes, stack machine, P2PKH/P2SH/P2WPKH/P2WSH/P2TR, legacy sighash with FindAndDelete/OP_CODESEPARATOR, witness cleanstack, P2SH push-only, MINIMALIF)
 - [x] Consensus parameters (difficulty adjustment, testnet walk-back, BIP94, rewards)
+- [x] BIP9 version bits (soft fork activation state machine, signal counting)
 - [x] Storage layer (blocks, UTXOs, chain state, batch writes)
 - [x] Block and transaction validation (weight, sigops, Merkle, coinbase, BIP68 sequence locks)
 - [x] P2P message serialization (version, inv, getdata, blocks, headers, tx)
@@ -63,7 +64,7 @@ camlcoin/
     crypto.ml         hash functions, signatures
     address.ml        address encoding
     script.ml         script interpreter
-    consensus.ml      consensus parameters
+    consensus.ml      consensus parameters, BIP9 versionbits
     validation.ml     block/tx validation
     storage.ml        block/utxo storage
     utxo.ml           UTXO set with LRU cache

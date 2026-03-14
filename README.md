@@ -58,6 +58,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Output descriptors (BIP 380-386, checksum, parsing, script generation, range expansion)
 - [x] Miniscript (type system, script generation, satisfaction, parsing, wsh(miniscript) support)
 - [x] BIP-133 feefilter (Poisson timing, noise rounding, block-relay-only exclusion)
+- [x] AssumeUTXO (BIP 199, snapshot loading, dual chainstate, background validation)
 - [ ] Bloom filters (BIP 37)
 
 ## Quick start
@@ -101,6 +102,7 @@ camlcoin/
     psbt.ml           PSBT (BIP-174) multi-party signing
     descriptor.ml     output descriptors (BIP 380-386)
     miniscript.ml     miniscript (type system, script generation, satisfaction)
+    assume_utxo.ml    assumeUTXO (BIP 199, snapshot loading, background validation)
     perf.ml           performance utilities and benchmarks
     cli.ml            command line interface
     camlcoin.ml       library interface

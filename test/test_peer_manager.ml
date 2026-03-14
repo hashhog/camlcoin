@@ -24,9 +24,11 @@ let test_peer_info () =
     services = 9L;  (* NODE_NETWORK | NODE_WITNESS *)
     last_connected = 0.0;
     last_attempt = 0.0;
+    last_success = 0.0;
     failures = 0;
     banned_until = 0.0;
     source = Peer_manager.Dns;
+    table_status = Peer_manager.NotInTable;
   } in
   Alcotest.(check string) "address" "192.168.1.1" info.address;
   Alcotest.(check int) "port" 8333 info.port;
@@ -87,9 +89,11 @@ let test_add_known_addr () =
     services = 9L;
     last_connected = 0.0;
     last_attempt = 0.0;
+    last_success = 0.0;
     failures = 0;
     banned_until = 0.0;
     source = Peer_manager.Manual;
+    table_status = Peer_manager.NotInTable;
   } in
   Peer_manager.add_known_addr pm info;
   let stats = Peer_manager.get_addr_stats pm in
@@ -110,9 +114,11 @@ let test_get_candidates_filters_banned () =
     services = 9L;
     last_connected = 0.0;
     last_attempt = 0.0;
+    last_success = 0.0;
     failures = 0;
     banned_until = Unix.gettimeofday () +. 1000.0;  (* Banned *)
     source = Peer_manager.Manual;
+    table_status = Peer_manager.NotInTable;
   } in
   Peer_manager.add_known_addr pm info;
   let candidates = Peer_manager.get_connection_candidates pm 10 in
@@ -127,9 +133,11 @@ let test_get_candidates_returns_valid () =
     services = 9L;
     last_connected = 0.0;
     last_attempt = 0.0;  (* Never tried *)
+    last_success = 0.0;
     failures = 0;
     banned_until = 0.0;
     source = Peer_manager.Manual;
+    table_status = Peer_manager.NotInTable;
   } in
   Peer_manager.add_known_addr pm info;
   let candidates = Peer_manager.get_connection_candidates pm 10 in
@@ -147,9 +155,11 @@ let test_get_candidates_respects_limit () =
       services = 9L;
       last_connected = 0.0;
       last_attempt = 0.0;
+      last_success = 0.0;
       failures = 0;
       banned_until = 0.0;
       source = Peer_manager.Manual;
+      table_status = Peer_manager.NotInTable;
     } in
     Peer_manager.add_known_addr pm info
   done;
@@ -367,9 +377,11 @@ let test_get_banned_list_expired () =
     services = 9L;
     last_connected = 0.0;
     last_attempt = 0.0;
+    last_success = 0.0;
     failures = 0;
     banned_until = Unix.gettimeofday () -. 100.0;  (* Expired *)
     source = Peer_manager.Manual;
+    table_status = Peer_manager.NotInTable;
   } in
   Peer_manager.add_known_addr pm info;
   (* Add an active ban *)
@@ -405,6 +417,153 @@ let test_load_bans_json_missing () =
   let count = Peer_manager.load_bans_json pm "/nonexistent/banlist.json" in
   Alcotest.(check int) "no bans loaded" 0 count
 
+(* ========== Eclipse protection tests ========== *)
+
+(* Test address table status types *)
+let test_addr_table_status () =
+  let _ : Peer_manager.addr_table_status = Peer_manager.InNew 5 in
+  let _ : Peer_manager.addr_table_status = Peer_manager.InTried 3 in
+  let _ : Peer_manager.addr_table_status = Peer_manager.NotInTable in
+  ()
+
+(* Test bucket computation is deterministic *)
+let test_bucket_deterministic () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  let info1 : Peer_manager.peer_info = {
+    address = "192.168.1.100";
+    port = 8333;
+    services = 9L;
+    last_connected = 0.0;
+    last_attempt = 0.0;
+    last_success = 0.0;
+    failures = 0;
+    banned_until = 0.0;
+    source = Peer_manager.Manual;
+    table_status = Peer_manager.NotInTable;
+  } in
+  Peer_manager.add_known_addr pm info1;
+  let stats1 = Peer_manager.get_bucket_stats pm in
+  (* Adding same address again should not increase count *)
+  Peer_manager.add_known_addr pm info1;
+  let stats2 = Peer_manager.get_bucket_stats pm in
+  Alcotest.(check int) "new entries unchanged" stats1.new_table_entries stats2.new_table_entries
+
+(* Test addresses go to new table initially *)
+let test_addr_goes_to_new_table () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  let info : Peer_manager.peer_info = {
+    address = "10.20.30.40";
+    port = 8333;
+    services = 9L;
+    last_connected = 0.0;
+    last_attempt = 0.0;
+    last_success = 0.0;
+    failures = 0;
+    banned_until = 0.0;
+    source = Peer_manager.Addr;
+    table_status = Peer_manager.NotInTable;
+  } in
+  Peer_manager.add_known_addr pm info;
+  let stats = Peer_manager.get_bucket_stats pm in
+  Alcotest.(check bool) "new table has entry" true (stats.new_table_entries > 0);
+  Alcotest.(check bool) "tried table empty" true (stats.tried_table_entries = 0)
+
+(* Test bucket stats initialization *)
+let test_bucket_stats_initial () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  let stats = Peer_manager.get_bucket_stats pm in
+  Alcotest.(check int) "new entries" 0 stats.new_table_entries;
+  Alcotest.(check int) "tried entries" 0 stats.tried_table_entries;
+  Alcotest.(check int) "outbound netgroups" 0 stats.outbound_netgroups;
+  Alcotest.(check int) "anchors" 0 stats.anchor_count
+
+(* Test multiple addresses distribute across buckets *)
+let test_addresses_distribute () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  for i = 1 to 100 do
+    let info : Peer_manager.peer_info = {
+      address = Printf.sprintf "%d.%d.%d.%d" (i mod 256) ((i/256) mod 256) ((i/65536) mod 256) 1;
+      port = 8333;
+      services = 9L;
+      last_connected = 0.0;
+      last_attempt = 0.0;
+      last_success = 0.0;
+      failures = 0;
+      banned_until = 0.0;
+      source = Peer_manager.Addr;
+      table_status = Peer_manager.NotInTable;
+    } in
+    Peer_manager.add_known_addr pm info
+  done;
+  let stats = Peer_manager.get_bucket_stats pm in
+  Alcotest.(check int) "100 new entries" 100 stats.new_table_entries;
+  (* Should use multiple buckets *)
+  Alcotest.(check bool) "multiple buckets used" true (stats.new_table_buckets_used > 1)
+
+(* Test netgroup extraction *)
+let test_netgroup_of () =
+  Alcotest.(check string) "192.168 netgroup" "192.168"
+    (Peer_manager.netgroup_of "192.168.1.1");
+  Alcotest.(check string) "10.0 netgroup" "10.0"
+    (Peer_manager.netgroup_of "10.0.0.1");
+  Alcotest.(check string) "invalid returns self" "localhost"
+    (Peer_manager.netgroup_of "localhost")
+
+(* Test anchor connection info type *)
+let test_anchor_info () =
+  let anchor : Peer_manager.anchor_info = {
+    anchor_addr = "192.168.1.1";
+    anchor_port = 8333;
+    anchor_services = 9L;
+  } in
+  Alcotest.(check string) "anchor addr" "192.168.1.1" anchor.anchor_addr;
+  Alcotest.(check int) "anchor port" 8333 anchor.anchor_port;
+  Alcotest.(check int64) "anchor services" 9L anchor.anchor_services
+
+(* Test initial anchors empty *)
+let test_anchors_empty () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  let anchors = Peer_manager.get_anchors pm in
+  Alcotest.(check int) "no initial anchors" 0 (List.length anchors)
+
+(* Test anchor persistence roundtrip *)
+let test_anchor_persistence () =
+  let tmpdir = Filename.temp_file "anchors_test" "" in
+  Unix.unlink tmpdir;
+  Unix.mkdir tmpdir 0o755;
+  let pm = Peer_manager.create Consensus.mainnet in
+  (* No connected peers, so save should save empty list *)
+  Peer_manager.save_anchors pm tmpdir;
+  let pm2 = Peer_manager.create Consensus.mainnet in
+  let count = Peer_manager.load_anchors pm2 tmpdir in
+  Alcotest.(check int) "no anchors saved" 0 count;
+  (* Cleanup *)
+  ignore (Sys.command (Printf.sprintf "rm -rf %s" tmpdir))
+
+(* Test eviction candidate type *)
+let test_eviction_candidate () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"192.168.1.1"
+    ~port:8333 ~id:1 ~direction:Peer.Inbound ~fd in
+  let ec : Peer_manager.eviction_candidate = {
+    ec_peer = peer;
+    ec_connected = 1000.0;
+    ec_min_ping = 0.05;
+    ec_last_block_time = 900.0;
+    ec_last_tx_time = 950.0;
+    ec_keyed_netgroup = 12345;
+    ec_relay_txs = true;
+    ec_prefer_evict = false;
+  } in
+  Alcotest.(check int) "peer id" 1 ec.ec_peer.Peer.id;
+  Alcotest.(check bool) "relay txs" true ec.ec_relay_txs;
+  Alcotest.(check bool) "prefer evict" false ec.ec_prefer_evict
+
+(* Test config includes anchor setting *)
+let test_config_anchors () =
+  let cfg = Peer_manager.default_config in
+  Alcotest.(check int) "max anchors" 2 cfg.max_block_relay_only_anchors
+
 (* All tests *)
 let () =
   Alcotest.run "Peer_manager" [
@@ -412,6 +571,7 @@ let () =
       Alcotest.test_case "addr_source" `Quick test_addr_source;
       Alcotest.test_case "peer_info" `Quick test_peer_info;
       Alcotest.test_case "default_config" `Quick test_default_config;
+      Alcotest.test_case "addr_table_status" `Quick test_addr_table_status;
     ];
     "creation", [
       Alcotest.test_case "create" `Quick test_create;
@@ -461,5 +621,21 @@ let () =
       Alcotest.test_case "empty_db" `Quick test_build_locator_empty;
       Alcotest.test_case "with_blocks" `Quick test_build_locator_with_blocks;
       Alcotest.test_case "exponential" `Quick test_build_locator_exponential;
+    ];
+    "eclipse_protection", [
+      Alcotest.test_case "bucket_stats_initial" `Quick test_bucket_stats_initial;
+      Alcotest.test_case "bucket_deterministic" `Quick test_bucket_deterministic;
+      Alcotest.test_case "addr_goes_to_new" `Quick test_addr_goes_to_new_table;
+      Alcotest.test_case "addresses_distribute" `Quick test_addresses_distribute;
+      Alcotest.test_case "netgroup_of" `Quick test_netgroup_of;
+    ];
+    "eviction", [
+      Alcotest.test_case "eviction_candidate" `Quick test_eviction_candidate;
+    ];
+    "anchors", [
+      Alcotest.test_case "anchor_info" `Quick test_anchor_info;
+      Alcotest.test_case "anchors_empty" `Quick test_anchors_empty;
+      Alcotest.test_case "anchor_persistence" `Quick test_anchor_persistence;
+      Alcotest.test_case "config_anchors" `Quick test_config_anchors;
     ];
   ]

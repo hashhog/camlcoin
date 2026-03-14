@@ -134,7 +134,7 @@ let create_test_context () =
     ~peer_manager
     ~wallet:None
     ~fee_estimator
-    ~network
+    ~network ()
 
 (* ============================================================================
    Integration Tests

@@ -2409,11 +2409,15 @@ let eval_script (st : eval_state) (script : Cstruct.t) : (unit, string) result =
    Script Verification (Full Transaction Input Verification)
    ============================================================================ *)
 
-(* Check that all witness items are within the maximum element size limit *)
-let check_witness_item_sizes ~sig_version:_ (witness : Types.tx_witness) : (unit, string) result =
-  if List.exists (fun item -> Cstruct.length item > max_script_element_size) witness.items then
-    Error "Witness item exceeds maximum element size"
-  else Ok ()
+(* Check that all witness items are within the maximum element size limit.
+   BIP-342: tapscript removes the 520-byte witness item size restriction. *)
+let check_witness_item_sizes ~sig_version (witness : Types.tx_witness) : (unit, string) result =
+  match sig_version with
+  | SigVersionTapscript -> Ok ()
+  | _ ->
+    if List.exists (fun item -> Cstruct.length item > max_script_element_size) witness.items then
+      Error "Witness item exceeds maximum element size"
+    else Ok ()
 
 (* Helper: check stack top for final script result *)
 let check_stack_top (st : eval_state) : (bool, string) result =
@@ -2457,18 +2461,22 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
         Ok true  (* Unconditional success for unknown witness versions *)
     end else begin
       (* Witness flag not set, fall through to normal execution *)
-      let st = create_eval_state ~tx ~input_index ~amount ~flags
-                 ~sig_version:SigVersionBase () in
-      begin match run_script st script_sig with
+      let st_sig = create_eval_state ~tx ~input_index ~amount ~flags
+                     ~sig_version:SigVersionBase () in
+      begin match run_script st_sig script_sig with
       | Error e -> Error e
       | Ok () ->
-        begin match run_script st script_pubkey with
+        let saved_stack = st_sig.stack in
+        let st_pub = create_eval_state ~tx ~input_index ~amount ~flags
+                       ~sig_version:SigVersionBase () in
+        st_pub.stack <- saved_stack;
+        begin match run_script st_pub script_pubkey with
         | Error e -> Error e
         | Ok () ->
-          if flags land script_verify_cleanstack <> 0 && stack_size st <> 1 then
+          if flags land script_verify_cleanstack <> 0 && stack_size st_pub <> 1 then
             Error "Stack not clean after execution"
           else
-            check_stack_top st
+            check_stack_top st_pub
         end
       end
     end
@@ -2488,20 +2496,23 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
     if flags land script_verify_witness <> 0 && witness.Types.items <> [] then
       Error "Unexpected witness data for non-witness script"
     else begin
-      (* Legacy P2PKH: run scriptSig, then scriptPubKey *)
-      let st = create_eval_state ~tx ~input_index ~amount ~flags
-                 ~sig_version:SigVersionBase () in
-      begin match run_script st script_sig with
+      (* Legacy P2PKH: run scriptSig, then scriptPubKey with independent state *)
+      let st_sig = create_eval_state ~tx ~input_index ~amount ~flags
+                     ~sig_version:SigVersionBase () in
+      begin match run_script st_sig script_sig with
       | Error e -> Error e
       | Ok () ->
-        (* Copy stack and continue with scriptPubKey *)
-        begin match run_script st script_pubkey with
+        let saved_stack = st_sig.stack in
+        let st_pub = create_eval_state ~tx ~input_index ~amount ~flags
+                       ~sig_version:SigVersionBase () in
+        st_pub.stack <- saved_stack;
+        begin match run_script st_pub script_pubkey with
         | Error e -> Error e
         | Ok () ->
-          if flags land script_verify_cleanstack <> 0 && stack_size st <> 1 then
+          if flags land script_verify_cleanstack <> 0 && stack_size st_pub <> 1 then
             Error "Stack not clean after execution"
           else
-            check_stack_top st
+            check_stack_top st_pub
         end
       end
     end
@@ -2510,14 +2521,18 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
     (* BIP-16 P2SH *)
     if flags land script_verify_p2sh = 0 then
       (* P2SH not enabled, treat as regular script *)
-      let st = create_eval_state ~tx ~input_index ~amount ~flags
-                 ~sig_version:SigVersionBase () in
-      begin match run_script st script_sig with
+      let st_sig = create_eval_state ~tx ~input_index ~amount ~flags
+                     ~sig_version:SigVersionBase () in
+      begin match run_script st_sig script_sig with
       | Error e -> Error e
       | Ok () ->
-        begin match run_script st script_pubkey with
+        let saved_stack = st_sig.stack in
+        let st_pub = create_eval_state ~tx ~input_index ~amount ~flags
+                       ~sig_version:SigVersionBase () in
+        st_pub.stack <- saved_stack;
+        begin match run_script st_pub script_pubkey with
         | Error e -> Error e
-        | Ok () -> check_stack_top st
+        | Ok () -> check_stack_top st_pub
         end
       end
     else begin
@@ -2969,19 +2984,23 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
     if flags land script_verify_witness <> 0 && witness.Types.items <> [] then
       Error "Unexpected witness data for non-witness script"
     else begin
-      (* Generic script execution *)
-      let st = create_eval_state ~tx ~input_index ~amount ~flags
-                 ~sig_version:SigVersionBase () in
-      begin match run_script st script_sig with
+      (* Generic script execution with independent state per script *)
+      let st_sig = create_eval_state ~tx ~input_index ~amount ~flags
+                     ~sig_version:SigVersionBase () in
+      begin match run_script st_sig script_sig with
       | Error e -> Error e
       | Ok () ->
-        begin match run_script st script_pubkey with
+        let saved_stack = st_sig.stack in
+        let st_pub = create_eval_state ~tx ~input_index ~amount ~flags
+                       ~sig_version:SigVersionBase () in
+        st_pub.stack <- saved_stack;
+        begin match run_script st_pub script_pubkey with
         | Error e -> Error e
         | Ok () ->
-          if flags land script_verify_cleanstack <> 0 && stack_size st <> 1 then
+          if flags land script_verify_cleanstack <> 0 && stack_size st_pub <> 1 then
             Error "Stack not clean after execution"
           else
-            check_stack_top st
+            check_stack_top st_pub
         end
       end
     end

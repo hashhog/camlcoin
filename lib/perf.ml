@@ -24,63 +24,99 @@
    track access order. *)
 
 module LRU = struct
-  type ('k, 'v) t = {
-    capacity : int;
-    mutable entries : ('k * 'v) list;
-    table : ('k, 'v) Hashtbl.t;
+  type 'v dll_node = {
+    mutable key_str : string;
+    mutable value : 'v;
+    mutable prev : 'v dll_node option;
+    mutable next : 'v dll_node option;
   }
 
-  let create capacity = {
-    capacity;
-    entries = [];
-    table = Hashtbl.create capacity;
+  type ('k, 'v) t = {
+    capacity : int;
+    table : ('k, 'v dll_node) Hashtbl.t;
+    mutable head : 'v dll_node option;
+    mutable tail : 'v dll_node option;
+    mutable length : int;
+    key_to_string : 'k -> string;
   }
+
+  let create ?(key_to_string = fun _ -> "") capacity = {
+    capacity;
+    table = Hashtbl.create capacity;
+    head = None;
+    tail = None;
+    length = 0;
+    key_to_string;
+  }
+
+  let dll_remove t node =
+    (match node.prev with
+     | Some p -> p.next <- node.next
+     | None -> t.head <- node.next);
+    (match node.next with
+     | Some n -> n.prev <- node.prev
+     | None -> t.tail <- node.prev);
+    node.prev <- None;
+    node.next <- None;
+    t.length <- t.length - 1
+
+  let dll_push_front t node =
+    node.prev <- None;
+    node.next <- t.head;
+    (match t.head with
+     | Some h -> h.prev <- Some node
+     | None -> t.tail <- Some node);
+    t.head <- Some node;
+    t.length <- t.length + 1
 
   let get t key =
     match Hashtbl.find_opt t.table key with
     | None -> None
-    | Some v ->
-      (* Move to front (most recently used) *)
-      t.entries <- (key, v) ::
-        List.filter (fun (k, _) -> k <> key) t.entries;
-      Some v
+    | Some node ->
+      dll_remove t node;
+      dll_push_front t node;
+      Some node.value
 
   let put t key value =
     (match Hashtbl.find_opt t.table key with
-     | Some _ ->
-       (* Key exists - remove from entries list to re-add at front *)
-       t.entries <-
-         List.filter (fun (k, _) -> k <> key) t.entries
+     | Some node ->
+       dll_remove t node;
+       node.value <- value;
+       dll_push_front t node
      | None ->
-       (* New key - check if we need to evict *)
-       if Hashtbl.length t.table >= t.capacity then begin
-         match List.rev t.entries with
-         | [] -> ()
-         | (evict_key, _) :: rest ->
-           Hashtbl.remove t.table evict_key;
-           t.entries <- List.rev rest
-       end);
-    Hashtbl.replace t.table key value;
-    t.entries <- (key, value) :: t.entries
+       if t.length >= t.capacity then begin
+         match t.tail with
+         | None -> ()
+         | Some evict_node ->
+           dll_remove t evict_node;
+           Hashtbl.remove t.table (Obj.magic evict_node.key_str)
+       end;
+       let node = { key_str = t.key_to_string key; value; prev = None; next = None } in
+       Hashtbl.replace t.table key node;
+       dll_push_front t node)
 
   let remove t key =
-    Hashtbl.remove t.table key;
-    t.entries <-
-      List.filter (fun (k, _) -> k <> key) t.entries
+    match Hashtbl.find_opt t.table key with
+    | None -> ()
+    | Some node ->
+      dll_remove t node;
+      Hashtbl.remove t.table key
 
-  let size t = Hashtbl.length t.table
+  let size t = t.length
 
   let capacity t = t.capacity
 
   let clear t =
     Hashtbl.clear t.table;
-    t.entries <- []
+    t.head <- None;
+    t.tail <- None;
+    t.length <- 0
 
   let mem t key =
     Hashtbl.mem t.table key
 
   let iter f t =
-    Hashtbl.iter f t.table
+    Hashtbl.iter (fun k node -> f k node.value) t.table
 end
 
 (* ============================================================================
@@ -270,19 +306,17 @@ let utxo_stats_to_json stats : Yojson.Safe.t =
 
    Reduced-allocation versions of common hash operations. *)
 
-(* Reusable buffer for SHA256d to avoid repeated allocation *)
-let sha256d_buffer = Cstruct.create 32
-
 let sha256d_inplace (data : Cstruct.t) (output : Cstruct.t) : unit =
   let h1 = Digestif.SHA256.digest_string (Cstruct.to_string data) in
   let h2 = Digestif.SHA256.digest_string (Digestif.SHA256.to_raw_string h1) in
   Cstruct.blit_from_string
     (Digestif.SHA256.to_raw_string h2) 0 output 0 32
 
-(* Compute SHA256d and return result in pre-allocated buffer *)
+(* Thread-safe SHA256d that allocates a fresh buffer per call *)
 let sha256d_fast (data : Cstruct.t) : Cstruct.t =
-  sha256d_inplace data sha256d_buffer;
-  sha256d_buffer
+  let buf = Cstruct.create 32 in
+  sha256d_inplace data buf;
+  buf
 
 (* ============================================================================
    Batch Processing Utilities

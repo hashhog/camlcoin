@@ -43,6 +43,7 @@ type command =
   | Blocktxn
   | Wtxidrelay
   | Sendaddrv2
+  | Addrv2
   | Alert
   (* BIP 331: Package Relay *)
   | Sendpackages
@@ -75,6 +76,7 @@ let command_to_string = function
   | Blocktxn -> "blocktxn"
   | Wtxidrelay -> "wtxidrelay"
   | Sendaddrv2 -> "sendaddrv2"
+  | Addrv2 -> "addrv2"
   | Alert -> "alert"
   | Sendpackages -> "sendpackages"
   | Getpkgtxns -> "getpkgtxns"
@@ -107,6 +109,7 @@ let command_of_string s =
   | "blocktxn" -> Blocktxn
   | "wtxidrelay" -> Wtxidrelay
   | "sendaddrv2" -> Sendaddrv2
+  | "addrv2" -> Addrv2
   | "alert" -> Alert
   | "sendpackages" -> Sendpackages
   | "getpkgtxns" -> Getpkgtxns
@@ -231,6 +234,24 @@ type pkgtxns_msg = {
   pkg_txs : Types.transaction list;  (* transactions in topological order *)
 }
 
+(* BIP-155 addrv2 network IDs *)
+type addrv2_network_id =
+  | Addrv2_IPv4    (* 1: 4 bytes *)
+  | Addrv2_IPv6    (* 2: 16 bytes *)
+  | Addrv2_TorV2   (* 3: 10 bytes (deprecated) *)
+  | Addrv2_TorV3   (* 4: 32 bytes *)
+  | Addrv2_I2P     (* 5: 32 bytes *)
+  | Addrv2_CJDNS   (* 6: 16 bytes *)
+  | Addrv2_Unknown of int
+
+type addrv2_addr = {
+  v2_time : int32;
+  v2_services : int64;
+  v2_network_id : addrv2_network_id;
+  v2_addr : Cstruct.t;
+  v2_port : int;
+}
+
 (* Message payload types *)
 type message_payload =
   | VersionMsg of Types.version_msg
@@ -270,6 +291,7 @@ type message_payload =
   | FeefilterMsg of int64
   | WtxidrelayMsg
   | SendaddrV2Msg
+  | Addrv2Msg of addrv2_addr list
   (* BIP 331: Package Relay *)
   | SendpackagesMsg of sendpackages_msg
   | GetpkgtxnsMsg of getpkgtxns_msg
@@ -535,6 +557,20 @@ let serialize_payload w = function
     Serialize.write_int64_le w feerate
   | WtxidrelayMsg -> ()
   | SendaddrV2Msg -> ()
+  | Addrv2Msg addrs ->
+    Serialize.write_compact_size w (List.length addrs);
+    List.iter (fun a ->
+      Serialize.write_int32_le w a.v2_time;
+      Serialize.write_compact_size_int64 w a.v2_services;
+      let net_id = match a.v2_network_id with
+        | Addrv2_IPv4 -> 1 | Addrv2_IPv6 -> 2 | Addrv2_TorV2 -> 3
+        | Addrv2_TorV3 -> 4 | Addrv2_I2P -> 5 | Addrv2_CJDNS -> 6
+        | Addrv2_Unknown n -> n in
+      Serialize.write_uint8 w net_id;
+      Serialize.write_compact_size w (Cstruct.length a.v2_addr);
+      Serialize.write_bytes w a.v2_addr;
+      Serialize.write_uint16_be w a.v2_port
+    ) addrs
   | SendpackagesMsg msg -> serialize_sendpackages w msg
   | GetpkgtxnsMsg msg -> serialize_getpkgtxns w msg
   | PkgtxnsMsg msg -> serialize_pkgtxns w msg
@@ -571,6 +607,7 @@ let payload_to_command = function
   | FeefilterMsg _ -> Feefilter
   | WtxidrelayMsg -> Wtxidrelay
   | SendaddrV2Msg -> Sendaddrv2
+  | Addrv2Msg _ -> Addrv2
   | SendpackagesMsg _ -> Sendpackages
   | GetpkgtxnsMsg _ -> Getpkgtxns
   | PkgtxnsMsg _ -> Pkgtxns
@@ -633,6 +670,29 @@ let deserialize_payload (cmd : command) (r : Serialize.reader)
   | Feefilter -> FeefilterMsg (Serialize.read_int64_le r)
   | Wtxidrelay -> WtxidrelayMsg
   | Sendaddrv2 -> SendaddrV2Msg
+  | Addrv2 ->
+    let count = Serialize.read_compact_size r in
+    if count > max_addr_count then failwith "addrv2 count exceeds maximum";
+    let addrs = List.init count (fun _ ->
+      let v2_time = Serialize.read_int32_le r in
+      let v2_services = Serialize.read_compact_size_int64 r in
+      let net_byte = Serialize.read_uint8 r in
+      let v2_network_id = match net_byte with
+        | 1 -> Addrv2_IPv4 | 2 -> Addrv2_IPv6 | 3 -> Addrv2_TorV2
+        | 4 -> Addrv2_TorV3 | 5 -> Addrv2_I2P | 6 -> Addrv2_CJDNS
+        | n -> Addrv2_Unknown n in
+      let addr_len = Serialize.read_compact_size r in
+      let expected_len = match v2_network_id with
+        | Addrv2_IPv4 -> 4 | Addrv2_IPv6 -> 16 | Addrv2_TorV2 -> 10
+        | Addrv2_TorV3 -> 32 | Addrv2_I2P -> 32 | Addrv2_CJDNS -> 16
+        | Addrv2_Unknown _ -> addr_len in
+      if addr_len <> expected_len then
+        failwith (Printf.sprintf "addrv2: wrong addr length %d for network %d" addr_len net_byte);
+      let v2_addr = Serialize.read_bytes r addr_len in
+      let v2_port = Serialize.read_uint16_be r in
+      { v2_time; v2_services; v2_network_id; v2_addr; v2_port }
+    ) in
+    Addrv2Msg addrs
   | Sendpackages -> SendpackagesMsg (deserialize_sendpackages r)
   | Getpkgtxns -> GetpkgtxnsMsg (deserialize_getpkgtxns r)
   | Pkgtxns -> PkgtxnsMsg (deserialize_pkgtxns r)
@@ -810,14 +870,16 @@ let reconstruct_block (cb : compact_block) (lookup : tx_lookup)
       end
     ) cb.prefilled_txs;
 
-    (* Fill in transactions from short IDs *)
+    (* Fill in transactions from short IDs using array for O(1) access *)
+    let short_ids_arr = Array.of_list cb.short_ids in
+    let n_short_ids = Array.length short_ids_arr in
     let short_idx = ref 0 in
     for i = 0 to tx_count - 1 do
       if txs.(i) = None then begin
-        if !short_idx >= List.length cb.short_ids then
+        if !short_idx >= n_short_ids then
           missing := i :: !missing
         else begin
-          let short_id = List.nth cb.short_ids !short_idx in
+          let short_id = short_ids_arr.(!short_idx) in
           incr short_idx;
           match Hashtbl.find_opt lookup.by_short_id short_id with
           | Some tx -> txs.(i) <- Some tx

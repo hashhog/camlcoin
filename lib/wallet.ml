@@ -2237,19 +2237,17 @@ let wallet_path (wm : wallet_manager) (name : string) : string =
   else
     Filename.concat wm.wallets_dir name
 
-(* Flush wallet state to disk *)
+(* Flush wallet state to disk.
+   For encrypted wallets, only save when unlocked (keys are accessible)
+   to avoid writing zeroed-out private keys. *)
 let flush (w : t) : unit =
   if w.db_path <> "" then
     if w.encryption.encrypted then begin
-      (* For encrypted wallets, we need the passphrase to save
-         If locked, we can't re-encrypt without master key *)
       match w.encryption.lock_state with
       | Unlocked { master_key; _ } when Cstruct.length master_key > 0 ->
-        (* Re-derive passphrase is not possible, skip save *)
-        ()
-      | _ ->
-        (* Unencrypted or we have master key accessible *)
         save w
+      | _ ->
+        ()
     end else
       save w
 

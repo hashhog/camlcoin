@@ -861,8 +861,16 @@ let flush_inv_queue (peer : peer) : int Lwt.t =
     if !count = 0 then
       Lwt.return 0
     else begin
-      (* Randomize order for privacy (shuffle using random comparator) *)
-      let shuffled = List.sort (fun _ _ -> Random.int 3 - 1) !items in
+      (* Randomize order for privacy using Fisher-Yates shuffle *)
+      let arr = Array.of_list !items in
+      let n = Array.length arr in
+      for i = n - 1 downto 1 do
+        let j = Random.int (i + 1) in
+        let tmp = arr.(i) in
+        arr.(i) <- arr.(j);
+        arr.(j) <- tmp
+      done;
+      let shuffled = Array.to_list arr in
       (* Convert to P2p.inv_vector list *)
       let inv_vectors = List.map (fun entry ->
         { P2p.inv_type = entry.inv_type; hash = entry.hash }
@@ -1042,3 +1050,56 @@ let check_feefilter_change (peer : peer) (current_fee : int64) : unit =
     let rounded = FeeFilterRounder.round default_fee_set current_fee in
     if significant_feefilter_change rounded peer.fee_filter_sent then
       reschedule_feefilter_soon peer
+
+(* SOCKS5 proxy connection for Tor/I2P support.
+   Implements the SOCKS5 handshake (RFC 1928) over an existing TCP socket. *)
+let socks5_connect (fd : Lwt_unix.file_descr) ~(target_host : string) ~(target_port : int) : unit Lwt.t =
+  let open Lwt.Syntax in
+  let ic = Lwt_io.of_fd ~mode:Lwt_io.input fd in
+  let oc = Lwt_io.of_fd ~mode:Lwt_io.output fd in
+  (* Step 1: Send greeting - version 5, 1 method (no auth) *)
+  let* () = Lwt_io.write_from_exactly oc (Bytes.of_string "\x05\x01\x00") 0 3 in
+  let* () = Lwt_io.flush oc in
+  (* Step 2: Read server's method selection *)
+  let resp = Bytes.create 2 in
+  let* () = Lwt_io.read_into_exactly ic resp 0 2 in
+  if Bytes.get_uint8 resp 0 <> 5 || Bytes.get_uint8 resp 1 <> 0 then
+    Lwt.fail_with "SOCKS5: server rejected no-auth method"
+  else begin
+    (* Step 3: Send connect request - ATYP=3 (domain name) *)
+    let host_len = String.length target_host in
+    let req_len = 4 + 1 + host_len + 2 in
+    let req = Bytes.create req_len in
+    Bytes.set_uint8 req 0 5;      (* version *)
+    Bytes.set_uint8 req 1 1;      (* CMD: connect *)
+    Bytes.set_uint8 req 2 0;      (* reserved *)
+    Bytes.set_uint8 req 3 3;      (* ATYP: domain name *)
+    Bytes.set_uint8 req 4 host_len;
+    Bytes.blit_string target_host 0 req 5 host_len;
+    Bytes.set_uint8 req (5 + host_len) (target_port lsr 8);
+    Bytes.set_uint8 req (6 + host_len) (target_port land 0xFF);
+    let* () = Lwt_io.write_from_exactly oc req 0 req_len in
+    let* () = Lwt_io.flush oc in
+    (* Step 4: Read connect response *)
+    let resp_hdr = Bytes.create 4 in
+    let* () = Lwt_io.read_into_exactly ic resp_hdr 0 4 in
+    if Bytes.get_uint8 resp_hdr 1 <> 0 then
+      Lwt.fail_with (Printf.sprintf "SOCKS5: connect failed with code %d"
+        (Bytes.get_uint8 resp_hdr 1))
+    else begin
+      (* Skip the bound address based on ATYP *)
+      let atyp = Bytes.get_uint8 resp_hdr 3 in
+      let skip_len = match atyp with
+        | 1 -> 4 + 2  (* IPv4 + port *)
+        | 4 -> 16 + 2 (* IPv6 + port *)
+        | 3 ->         (* Domain - 1 byte len + domain + port *)
+          let len_buf = Bytes.create 1 in
+          ignore (Lwt_io.read_into_exactly ic len_buf 0 1);
+          Bytes.get_uint8 len_buf 0 + 2
+        | _ -> 0
+      in
+      let skip_buf = Bytes.create skip_len in
+      let* () = Lwt_io.read_into_exactly ic skip_buf 0 skip_len in
+      Lwt.return_unit
+    end
+  end

@@ -430,6 +430,395 @@ let test_mainnet_vs_bip94 () =
   Alcotest.(check bool) "mainnet vs BIP94 differ" true
     (mainnet_bits <> bip94_bits)
 
+(* ============================================================================
+   BIP9 Version Bits Tests
+   ============================================================================ *)
+
+(* Test deployment state type *)
+let test_deployment_state_strings () =
+  Alcotest.(check string) "defined" "defined"
+    (Consensus.string_of_deployment_state Consensus.Defined);
+  Alcotest.(check string) "started" "started"
+    (Consensus.string_of_deployment_state Consensus.Started);
+  Alcotest.(check string) "locked_in" "locked_in"
+    (Consensus.string_of_deployment_state Consensus.LockedIn);
+  Alcotest.(check string) "active" "active"
+    (Consensus.string_of_deployment_state Consensus.Active);
+  Alcotest.(check string) "failed" "failed"
+    (Consensus.string_of_deployment_state Consensus.Failed)
+
+(* Test version bit signaling check *)
+let test_version_signals_bit () =
+  (* Valid versionbits signaling: top bits = 0x20000000 *)
+  let base_version = 0x20000000l in
+
+  (* Bit 0 signaling *)
+  let v_bit0 = Int32.logor base_version 0x00000001l in
+  Alcotest.(check bool) "bit 0 signals" true
+    (Consensus.version_signals_bit v_bit0 0);
+  Alcotest.(check bool) "bit 0 no signal for bit 1" false
+    (Consensus.version_signals_bit v_bit0 1);
+
+  (* Bit 2 signaling (Taproot uses bit 2) *)
+  let v_bit2 = Int32.logor base_version 0x00000004l in
+  Alcotest.(check bool) "bit 2 signals" true
+    (Consensus.version_signals_bit v_bit2 2);
+  Alcotest.(check bool) "bit 2 no signal for bit 0" false
+    (Consensus.version_signals_bit v_bit2 0);
+
+  (* Bit 28 signaling (testdummy uses bit 28) *)
+  let v_bit28 = Int32.logor base_version 0x10000000l in
+  Alcotest.(check bool) "bit 28 signals" true
+    (Consensus.version_signals_bit v_bit28 28);
+
+  (* Wrong top bits: must be 001xxxxx (0x20000000) *)
+  let wrong_top = 0x10000001l in  (* 000... top bits *)
+  Alcotest.(check bool) "wrong top bits no signal" false
+    (Consensus.version_signals_bit wrong_top 0);
+
+  (* Old-style version (< 0x20000000) should not signal *)
+  Alcotest.(check bool) "old version no signal" false
+    (Consensus.version_signals_bit 4l 0)
+
+(* Test deployment mask computation *)
+let test_deployment_mask () =
+  let dep_bit0 : Consensus.deployment = {
+    name = "test0"; bit = 0;
+    start_time = 0L; timeout = 0L;
+    min_activation_height = 0; period = 2016; threshold = 1815;
+  } in
+  Alcotest.(check int32) "bit 0 mask" 0x00000001l
+    (Consensus.deployment_mask dep_bit0);
+
+  let dep_bit2 : Consensus.deployment = {
+    name = "test2"; bit = 2;
+    start_time = 0L; timeout = 0L;
+    min_activation_height = 0; period = 2016; threshold = 1815;
+  } in
+  Alcotest.(check int32) "bit 2 mask" 0x00000004l
+    (Consensus.deployment_mask dep_bit2);
+
+  let dep_bit28 : Consensus.deployment = {
+    name = "test28"; bit = 28;
+    start_time = 0L; timeout = 0L;
+    min_activation_height = 0; period = 2016; threshold = 1815;
+  } in
+  Alcotest.(check int32) "bit 28 mask" 0x10000000l
+    (Consensus.deployment_mask dep_bit28)
+
+(* Test period start height calculation *)
+let test_period_start_height () =
+  let period = 2016 in
+  Alcotest.(check int) "height 0" 0
+    (Consensus.period_start_height 0 period);
+  Alcotest.(check int) "height 100" 0
+    (Consensus.period_start_height 100 period);
+  Alcotest.(check int) "height 2015" 0
+    (Consensus.period_start_height 2015 period);
+  Alcotest.(check int) "height 2016" 2016
+    (Consensus.period_start_height 2016 period);
+  Alcotest.(check int) "height 2017" 2016
+    (Consensus.period_start_height 2017 period);
+  Alcotest.(check int) "height 4032" 4032
+    (Consensus.period_start_height 4032 period)
+
+(* Test always_active deployment *)
+let test_always_active_deployment () =
+  let dep : Consensus.deployment = {
+    name = "always_active";
+    bit = 0;
+    start_time = Consensus.always_active;
+    timeout = 0L;
+    min_activation_height = 0;
+    period = 2016;
+    threshold = 1815;
+  } in
+  let cache = ref Consensus.DeploymentCache.empty in
+  let get_block _ = None in
+  let count_signals ~start_height:_ = 0 in
+
+  let state = Consensus.get_deployment_state
+    ~dep ~height:0 ~get_block ~count_signals ~cache in
+  Alcotest.(check bool) "always active at height 0" true
+    (state = Consensus.Active);
+
+  let state2 = Consensus.get_deployment_state
+    ~dep ~height:100000 ~get_block ~count_signals ~cache in
+  Alcotest.(check bool) "always active at height 100000" true
+    (state2 = Consensus.Active)
+
+(* Test never_active deployment *)
+let test_never_active_deployment () =
+  let dep : Consensus.deployment = {
+    name = "never_active";
+    bit = 0;
+    start_time = Consensus.never_active;
+    timeout = 0L;
+    min_activation_height = 0;
+    period = 2016;
+    threshold = 1815;
+  } in
+  let cache = ref Consensus.DeploymentCache.empty in
+  let get_block _ = None in
+  let count_signals ~start_height:_ = 0 in
+
+  let state = Consensus.get_deployment_state
+    ~dep ~height:0 ~get_block ~count_signals ~cache in
+  Alcotest.(check bool) "never active at height 0" true
+    (state = Consensus.Failed);
+
+  let state2 = Consensus.get_deployment_state
+    ~dep ~height:100000 ~get_block ~count_signals ~cache in
+  Alcotest.(check bool) "never active at height 100000" true
+    (state2 = Consensus.Failed)
+
+(* Test state transitions: Defined -> Started -> LockedIn -> Active *)
+let test_full_activation_cycle () =
+  let period = 2016 in
+  let threshold = 1815 in  (* 90% of 2016 *)
+  let start_time = 1000000L in
+  let timeout = 2000000L in
+
+  let dep : Consensus.deployment = {
+    name = "test_activation";
+    bit = 0;
+    start_time;
+    timeout;
+    min_activation_height = 0;
+    period;
+    threshold;
+  } in
+
+  (* Create a simulated chain:
+     - Period 0 (0-2015): MTP < start_time -> Defined
+     - Period 1 (2016-4031): MTP >= start_time, not enough signals -> Started
+     - Period 2 (4032-6047): MTP >= start_time, 1815+ signals -> LockedIn
+     - Period 3 (6048+): After LockedIn -> Active *)
+
+  let make_block height =
+    let mtp =
+      if height < 2016 then 500000L    (* Before start_time *)
+      else 1500000L                     (* After start_time *)
+    in
+    (* In period 2, signal from all blocks *)
+    let version =
+      if height >= 4032 && height < 6048 then
+        0x20000001l  (* Signaling bit 0 *)
+      else
+        0x20000000l  (* Not signaling *)
+    in
+    Some { Consensus.height; version; median_time_past = mtp }
+  in
+
+  let count_signals ~start_height =
+    (* In period 2 (4032-6047), all blocks signal *)
+    if start_height >= 4032 && start_height < 6048 then
+      2016  (* All blocks signal *)
+    else
+      0
+  in
+
+  let cache = ref Consensus.DeploymentCache.empty in
+
+  (* Test state at various heights *)
+  let get_state height =
+    Consensus.get_deployment_state
+      ~dep ~height ~get_block:make_block ~count_signals ~cache
+  in
+
+  (* Period 0: Defined (MTP < start_time) *)
+  Alcotest.(check bool) "period 0 is defined" true
+    (get_state 1000 = Consensus.Defined);
+
+  (* Period 1: Started (MTP >= start_time but not enough signals) *)
+  Alcotest.(check bool) "period 1 is started" true
+    (get_state 3000 = Consensus.Started);
+
+  (* Period 2: LockedIn (threshold met) *)
+  Alcotest.(check bool) "period 2 is locked_in" true
+    (get_state 5000 = Consensus.LockedIn);
+
+  (* Period 3: Active (after LockedIn) *)
+  Alcotest.(check bool) "period 3 is active" true
+    (get_state 7000 = Consensus.Active)
+
+(* Test timeout -> Failed transition *)
+let test_timeout_to_failed () =
+  let period = 2016 in
+  let start_time = 1000000L in
+  let timeout = 1500000L in
+
+  let dep : Consensus.deployment = {
+    name = "test_timeout";
+    bit = 0;
+    start_time;
+    timeout;
+    min_activation_height = 0;
+    period;
+    threshold = 1815;
+  } in
+
+  (* Chain where:
+     - Period 1: MTP >= start_time but < timeout, no signals -> Started
+     - Period 2: MTP >= timeout, still no signals -> Failed *)
+  let make_block height =
+    let mtp =
+      if height < 2016 then 500000L        (* Before start *)
+      else if height < 4032 then 1200000L  (* After start, before timeout *)
+      else 1600000L                         (* After timeout *)
+    in
+    Some { Consensus.height; version = 0x20000000l; median_time_past = mtp }
+  in
+
+  let count_signals ~start_height:_ = 0 in
+  let cache = ref Consensus.DeploymentCache.empty in
+
+  let get_state height =
+    Consensus.get_deployment_state
+      ~dep ~height ~get_block:make_block ~count_signals ~cache
+  in
+
+  (* After timeout, should be Failed *)
+  Alcotest.(check bool) "after timeout is failed" true
+    (get_state 5000 = Consensus.Failed)
+
+(* Test min_activation_height delays Active state *)
+let test_min_activation_height () =
+  let period = 2016 in
+  let start_time = 1000000L in
+
+  let dep : Consensus.deployment = {
+    name = "test_min_height";
+    bit = 0;
+    start_time;
+    timeout = 9999999999L;  (* Far future *)
+    min_activation_height = 10000;  (* Must wait until height 10000 *)
+    period;
+    threshold = 1815;
+  } in
+
+  (* Chain where threshold is met in period 1 (blocks 2016-4031)
+     State machine transitions:
+     - Period 0 (0-2015): Defined (MTP < start_time)
+     - Period 1 (2016-4031): Started (MTP >= start_time)
+     - Period 2 (4032-6047): LockedIn (signals met in period 1)
+     - Period 3+: stays LockedIn until min_activation_height reached
+     - After period containing min_activation_height: Active *)
+  let make_block height =
+    let mtp = if height < 2016 then 500000L else 1500000L in
+    let version =
+      if height >= 2016 && height < 4032 then 0x20000001l
+      else 0x20000000l
+    in
+    Some { Consensus.height; version; median_time_past = mtp }
+  in
+
+  (* count_signals is called with start_height of the period BEING EVALUATED
+     When computing state for period N, we count signals in period N-1
+     Wait, no - we count signals in the current period when state is Started
+     Let me trace through:
+     - Computing period 0 state: check MTP at block 2015, Defined
+     - Computing period 2016 state: check MTP at block 4031, >= start_time, -> Started
+     - Computing period 4032 state: state is Started, count signals in period 4032
+     So to lock in during period 4032, we need signals in period 4032 *)
+  let count_signals ~start_height =
+    (* Return signals for periods where we want signaling to occur *)
+    if start_height = 2016 then 2016  (* Signal in period 1 *)
+    else if start_height = 4032 then 2016  (* Signal in period 2 too, to lock in *)
+    else 0
+  in
+
+  let cache = ref Consensus.DeploymentCache.empty in
+
+  let get_state height =
+    Consensus.get_deployment_state
+      ~dep ~height ~get_block:make_block ~count_signals ~cache
+  in
+
+  (* Period 3 (6048-8063): Should be LockedIn (min_activation_height = 10000) *)
+  Alcotest.(check bool) "before min_height is locked_in" true
+    (get_state 7000 = Consensus.LockedIn);
+
+  (* Period 5 (10080-12095): After min_activation_height, should be Active *)
+  Alcotest.(check bool) "after min_height is active" true
+    (get_state 11000 = Consensus.Active)
+
+(* Test BIP9 statistics *)
+let test_bip9_stats () =
+  let dep : Consensus.deployment = {
+    name = "test_stats";
+    bit = 0;
+    start_time = 0L;
+    timeout = 999999999L;
+    min_activation_height = 0;
+    period = 2016;
+    threshold = 1815;
+  } in
+
+  (* Create blocks where some signal and some don't *)
+  let make_block height =
+    let version =
+      if height mod 2 = 0 then 0x20000001l  (* Even blocks signal *)
+      else 0x20000000l                       (* Odd blocks don't *)
+    in
+    Some { Consensus.height; version; median_time_past = 1000000L }
+  in
+
+  (* At height 100 in period 0 *)
+  let stats = Consensus.get_bip9_stats
+    ~dep ~height:100 ~get_block:make_block in
+
+  Alcotest.(check int) "period is 2016" 2016 stats.period_length;
+  Alcotest.(check int) "threshold is 1815" 1815 stats.threshold_count;
+  Alcotest.(check int) "elapsed is 101" 101 stats.elapsed;
+  (* Even heights 0-100 = 51 signaling blocks *)
+  Alcotest.(check int) "signaling count" 51 stats.signaling_count;
+  (* With 1915 remaining blocks and 51 signals, 51 + 1915 = 1966 >= 1815 *)
+  Alcotest.(check bool) "still possible" true stats.possible
+
+(* Test cache clearing *)
+let test_versionbits_cache () =
+  let cache = Consensus.create_versionbits_cache () in
+
+  (* Add some data *)
+  cache.taproot := Consensus.DeploymentCache.add 0 Consensus.Started !(cache.taproot);
+  cache.testdummy := Consensus.DeploymentCache.add 0 Consensus.Defined !(cache.testdummy);
+
+  Alcotest.(check bool) "cache not empty" true
+    (not (Consensus.DeploymentCache.is_empty !(cache.taproot)));
+
+  (* Clear cache *)
+  Consensus.clear_versionbits_cache cache;
+
+  Alcotest.(check bool) "cache empty after clear" true
+    (Consensus.DeploymentCache.is_empty !(cache.taproot));
+  Alcotest.(check bool) "testdummy cache empty" true
+    (Consensus.DeploymentCache.is_empty !(cache.testdummy))
+
+(* Test mainnet taproot deployment parameters *)
+let test_mainnet_taproot () =
+  let dep = Consensus.mainnet_taproot in
+  Alcotest.(check string) "name" "taproot" dep.name;
+  Alcotest.(check int) "bit" 2 dep.bit;
+  Alcotest.(check int) "min_activation_height" 709632 dep.min_activation_height;
+  Alcotest.(check int) "period" 2016 dep.period;
+  Alcotest.(check int) "threshold" 1815 dep.threshold
+
+(* Test testnet4 taproot is always active *)
+let test_testnet4_taproot () =
+  let dep = Consensus.testnet4_taproot in
+  Alcotest.(check int64) "start_time is always_active" Consensus.always_active dep.start_time;
+
+  let cache = ref Consensus.DeploymentCache.empty in
+  let state = Consensus.get_deployment_state
+    ~dep ~height:0
+    ~get_block:(fun _ -> None)
+    ~count_signals:(fun ~start_height:_ -> 0)
+    ~cache
+  in
+  Alcotest.(check bool) "testnet4 taproot active at genesis" true
+    (state = Consensus.Active)
+
 let () =
   let open Alcotest in
   run "Consensus" [
@@ -467,5 +856,20 @@ let () =
       test_case "testnet walk-back" `Quick test_testnet_walk_back;
       test_case "BIP94 retarget" `Quick test_bip94_retarget;
       test_case "mainnet vs BIP94" `Quick test_mainnet_vs_bip94;
+    ];
+    "bip9_versionbits", [
+      test_case "deployment state strings" `Quick test_deployment_state_strings;
+      test_case "version signals bit" `Quick test_version_signals_bit;
+      test_case "deployment mask" `Quick test_deployment_mask;
+      test_case "period start height" `Quick test_period_start_height;
+      test_case "always active deployment" `Quick test_always_active_deployment;
+      test_case "never active deployment" `Quick test_never_active_deployment;
+      test_case "full activation cycle" `Quick test_full_activation_cycle;
+      test_case "timeout to failed" `Quick test_timeout_to_failed;
+      test_case "min activation height" `Quick test_min_activation_height;
+      test_case "bip9 stats" `Quick test_bip9_stats;
+      test_case "versionbits cache" `Quick test_versionbits_cache;
+      test_case "mainnet taproot" `Quick test_mainnet_taproot;
+      test_case "testnet4 taproot" `Quick test_testnet4_taproot;
     ];
   ]

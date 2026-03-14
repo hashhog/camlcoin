@@ -23,6 +23,7 @@ module type STORAGE = sig
   val batch_delete : batch -> string -> unit
   val batch_write : t -> batch -> unit
 
+  val iter_keys : t -> (string -> unit) -> unit
   val iter_prefix : t -> string -> (string -> string -> unit) -> unit
 
   val sync : t -> unit
@@ -341,6 +342,45 @@ module FileStorage : STORAGE = struct
         batch_put batch key value
     ) t.cache;
     batch_write t batch
+
+  (* Iterate over all keys in the database. *)
+  let iter_keys t f =
+    let seen = Hashtbl.create 256 in
+    (* Phase 1: cache keys *)
+    Hashtbl.iter (fun k _v ->
+      f k;
+      Hashtbl.replace seen k ()
+    ) t.cache;
+    (* Phase 2: scan disk for any keys not in cache *)
+    let scan_dir subdir_path =
+      if Sys.file_exists subdir_path && Sys.is_directory subdir_path then begin
+        let entries = Sys.readdir subdir_path in
+        Array.iter (fun fname ->
+          if not (String.length fname > 4 &&
+                  String.sub fname (String.length fname - 4) 4 = ".tmp") then begin
+            let fpath = Filename.concat subdir_path fname in
+            if not (Sys.is_directory fpath) then begin
+              match read_data_file fpath with
+              | Some (key, _value) ->
+                if not (Hashtbl.mem seen key) &&
+                   not (Hashtbl.mem t.deleted_keys key) then begin
+                  f key;
+                  Hashtbl.replace seen key ()
+                end
+              | None -> ()
+            end
+          end
+        ) entries
+      end
+    in
+    if Sys.file_exists t.base_dir && Sys.is_directory t.base_dir then begin
+      let subdirs = Sys.readdir t.base_dir in
+      Array.iter (fun name ->
+        let spath = Filename.concat t.base_dir name in
+        if String.length name = 2 && Sys.is_directory spath then
+          scan_dir spath
+      ) subdirs
+    end
 
   (* Iterate over all entries whose key starts with [prefix].
      Scans both the in-memory cache AND the on-disk files so that
@@ -694,6 +734,9 @@ module LogStorage : STORAGE = struct
       wal_delete t
     end
 
+  let iter_keys t f =
+    Hashtbl.iter (fun k _v -> f k) t.index
+
   let iter_prefix t prefix f =
     let prefix_len = String.length prefix in
     Hashtbl.iter (fun k (offset, vlen) ->
@@ -715,6 +758,7 @@ let prefix_block_height = "n"
 let prefix_tx_index     = "x"
 let prefix_chain_state  = "s"
 let prefix_undo_data    = "r"  (* undo data for chain reorg *)
+let prefix_invalidated  = "i"  (* manually invalidated block hashes *)
 
 (* Higher-level chain database built on top of the storage layer *)
 module ChainDB = struct
@@ -873,6 +917,31 @@ module ChainDB = struct
       let block_hash = Serialize.read_bytes r 32 in
       let tx_idx = Int32.to_int (Serialize.read_int32_le r) in
       Some (block_hash, tx_idx)
+
+  (* Invalidated block tracking for invalidateblock/reconsiderblock RPCs *)
+  let set_block_invalidated t (hash : Types.hash256) =
+    let key = prefix_invalidated ^ Cstruct.to_string hash in
+    LogStorage.put t.db key "1"
+
+  let clear_block_invalidated t (hash : Types.hash256) =
+    let key = prefix_invalidated ^ Cstruct.to_string hash in
+    LogStorage.delete t.db key
+
+  let is_block_invalidated t (hash : Types.hash256) : bool =
+    let key = prefix_invalidated ^ Cstruct.to_string hash in
+    Option.is_some (LogStorage.get t.db key)
+
+  let get_all_invalidated_blocks t : Types.hash256 list =
+    let results = ref [] in
+    let prefix_len = String.length prefix_invalidated in
+    LogStorage.iter_keys t.db (fun key ->
+      if String.length key > prefix_len &&
+         String.sub key 0 prefix_len = prefix_invalidated then begin
+        let hash_str = String.sub key prefix_len (String.length key - prefix_len) in
+        results := Cstruct.of_string hash_str :: !results
+      end
+    );
+    !results
 
   (* Batch operations for atomic updates *)
   let batch_create () = LogStorage.batch_create ()
@@ -1127,6 +1196,7 @@ type block_status =
   | Block_have_data       (** Full block data available *)
   | Block_have_undo       (** Undo data available *)
   | Block_failed          (** Validation failed *)
+  | Block_failed_child    (** Descendant of a failed block *)
   | Block_pruned          (** Block data has been pruned *)
 
 (** Block index entry stored for each block *)
@@ -1229,6 +1299,7 @@ module FlatFileStorage = struct
     | Block_have_data -> 6
     | Block_have_undo -> 7
     | Block_failed -> 8
+    | Block_failed_child -> 10
     | Block_pruned -> 9
 
   let int_to_status = function
@@ -1241,6 +1312,7 @@ module FlatFileStorage = struct
     | 6 -> Block_have_data
     | 7 -> Block_have_undo
     | 8 -> Block_failed
+    | 10 -> Block_failed_child
     | 9 -> Block_pruned
     | _ -> Block_valid_unknown
 
@@ -1266,7 +1338,8 @@ module FlatFileStorage = struct
       (mask land (1 lsl (status_to_int s))) <> 0
     ) [Block_valid_unknown; Block_valid_header; Block_valid_tree;
        Block_valid_transactions; Block_valid_chain; Block_valid_scripts;
-       Block_have_data; Block_have_undo; Block_failed; Block_pruned] in
+       Block_have_data; Block_have_undo; Block_failed; Block_failed_child;
+       Block_pruned] in
     let n_tx = Int32.to_int (Serialize.read_int32_le r) in
     { file_pos; undo_pos; height; header; status; n_tx }
 

@@ -211,6 +211,219 @@ let test_peer_info_misbehavior () =
   Alcotest.(check bool) "info contains misb=42" true
     (Astring.String.is_infix ~affix:"misb=42" info)
 
+(* Test handshake_complete and version_received initialization *)
+let test_handshake_fields_init () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  Alcotest.(check bool) "handshake not complete" false peer.handshake_complete;
+  Alcotest.(check bool) "version not received" false peer.version_received;
+  (* our_nonce should be non-zero (random) *)
+  Alcotest.(check bool) "our_nonce is set" true (peer.our_nonce <> 0L)
+
+(* Test handshake timeout constant *)
+let test_handshake_timeout () =
+  Alcotest.(check (float 0.001)) "handshake_timeout = 60.0" 60.0
+    Peer.handshake_timeout
+
+(* Test minimum protocol version constant *)
+let test_min_protocol_version () =
+  Alcotest.(check int32) "min_protocol_version = 70015" 70015l
+    Peer.min_protocol_version
+
+(* Test dispatch_message rejects pre-handshake messages *)
+let test_dispatch_pre_handshake_ping () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  (* Peer starts with handshake_complete = false and version_received = false *)
+  let msg = P2p.PingMsg 12345L in
+  let result = Lwt_main.run (Peer.dispatch_message peer msg) in
+  match result with
+  | `PreHandshake _ ->
+    (* Pre-handshake message should be rejected *)
+    Alcotest.(check bool) "misbehavior scored" true (peer.misbehavior_score > 0)
+  | `Continue -> Alcotest.fail "Expected pre-handshake rejection"
+  | `Disconnect _ -> Alcotest.fail "Expected pre-handshake rejection, not disconnect"
+
+(* Test dispatch_message accepts VERSION before handshake *)
+let test_dispatch_pre_handshake_version () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  let version_msg : Types.version_msg = {
+    protocol_version = 70016l;
+    services = 9L;  (* NODE_NETWORK | NODE_WITNESS *)
+    timestamp = Int64.of_float (Unix.gettimeofday ());
+    addr_recv = { services = 0L; addr = Cstruct.create 16; port = 8333 };
+    addr_from = Peer.make_local_addr ();
+    nonce = 999L;  (* Different from peer's own nonce *)
+    user_agent = "/TestPeer:0.1.0/";
+    start_height = 800000l;
+    relay = true;
+  } in
+  let msg = P2p.VersionMsg version_msg in
+  let result = Lwt_main.run (Peer.dispatch_message peer msg) in
+  match result with
+  | `Continue ->
+    Alcotest.(check bool) "version_received set" true peer.version_received;
+    Alcotest.(check int) "no misbehavior" 0 peer.misbehavior_score
+  | _ -> Alcotest.fail "Expected VERSION to be accepted"
+
+(* Test dispatch_message rejects duplicate VERSION *)
+let test_dispatch_duplicate_version () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  let version_msg : Types.version_msg = {
+    protocol_version = 70016l;
+    services = 9L;
+    timestamp = Int64.of_float (Unix.gettimeofday ());
+    addr_recv = { services = 0L; addr = Cstruct.create 16; port = 8333 };
+    addr_from = Peer.make_local_addr ();
+    nonce = 999L;
+    user_agent = "/TestPeer:0.1.0/";
+    start_height = 800000l;
+    relay = true;
+  } in
+  let msg = P2p.VersionMsg version_msg in
+  (* First VERSION should succeed *)
+  let _ = Lwt_main.run (Peer.dispatch_message peer msg) in
+  Alcotest.(check bool) "version_received after first" true peer.version_received;
+  (* Second VERSION should be rejected with misbehavior score 1 *)
+  let result = Lwt_main.run (Peer.dispatch_message peer msg) in
+  match result with
+  | `PreHandshake _ ->
+    Alcotest.(check int) "misbehavior = 1" 1 peer.misbehavior_score
+  | _ -> Alcotest.fail "Expected duplicate VERSION to be rejected"
+
+(* Test dispatch_message rejects VERACK before VERSION *)
+let test_dispatch_verack_before_version () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  let msg = P2p.VerackMsg in
+  let result = Lwt_main.run (Peer.dispatch_message peer msg) in
+  match result with
+  | `PreHandshake _ ->
+    Alcotest.(check int) "misbehavior = 10" 10 peer.misbehavior_score
+  | _ -> Alcotest.fail "Expected VERACK before VERSION to be rejected"
+
+(* Test dispatch_message accepts VERACK after VERSION *)
+let test_dispatch_verack_after_version () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  (* Simulate VERSION received *)
+  peer.version_received <- true;
+  let msg = P2p.VerackMsg in
+  let result = Lwt_main.run (Peer.dispatch_message peer msg) in
+  match result with
+  | `Continue ->
+    Alcotest.(check bool) "handshake_complete" true peer.handshake_complete;
+    Alcotest.(check int) "no misbehavior" 0 peer.misbehavior_score
+  | _ -> Alcotest.fail "Expected VERACK after VERSION to be accepted"
+
+(* Test dispatch_message accepts feature negotiation between VERSION and VERACK *)
+let test_dispatch_feature_negotiation () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  (* Simulate VERSION received but not VERACK *)
+  peer.version_received <- true;
+  (* wtxidrelay should be accepted *)
+  let result = Lwt_main.run (Peer.dispatch_message peer P2p.WtxidrelayMsg) in
+  (match result with
+  | `Continue ->
+    Alcotest.(check bool) "wtxid_relay set" true peer.wtxid_relay
+  | _ -> Alcotest.fail "Expected wtxidrelay to be accepted");
+  (* sendaddrv2 should be accepted *)
+  let result = Lwt_main.run (Peer.dispatch_message peer P2p.SendaddrV2Msg) in
+  (match result with
+  | `Continue ->
+    Alcotest.(check bool) "sendaddrv2 set" true peer.sendaddrv2
+  | _ -> Alcotest.fail "Expected sendaddrv2 to be accepted");
+  Alcotest.(check int) "no misbehavior" 0 peer.misbehavior_score
+
+(* Test dispatch_message rejects feature negotiation before VERSION *)
+let test_dispatch_feature_before_version () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  let result = Lwt_main.run (Peer.dispatch_message peer P2p.WtxidrelayMsg) in
+  match result with
+  | `PreHandshake _ ->
+    Alcotest.(check int) "misbehavior = 10" 10 peer.misbehavior_score
+  | _ -> Alcotest.fail "Expected wtxidrelay before VERSION to be rejected"
+
+(* Test dispatch_message rejects wtxidrelay after handshake *)
+let test_dispatch_wtxidrelay_after_handshake () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  (* Simulate completed handshake *)
+  peer.handshake_complete <- true;
+  peer.version_received <- true;
+  let result = Lwt_main.run (Peer.dispatch_message peer P2p.WtxidrelayMsg) in
+  match result with
+  | `Disconnect _ ->
+    Alcotest.(check int) "misbehavior = 1" 1 peer.misbehavior_score
+  | _ -> Alcotest.fail "Expected wtxidrelay after handshake to disconnect"
+
+(* Test dispatch_message rejects VERSION after handshake *)
+let test_dispatch_version_after_handshake () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  (* Simulate completed handshake *)
+  peer.handshake_complete <- true;
+  peer.version_received <- true;
+  let version_msg : Types.version_msg = {
+    protocol_version = 70016l;
+    services = 9L;
+    timestamp = Int64.of_float (Unix.gettimeofday ());
+    addr_recv = { services = 0L; addr = Cstruct.create 16; port = 8333 };
+    addr_from = Peer.make_local_addr ();
+    nonce = 999L;
+    user_agent = "/TestPeer:0.1.0/";
+    start_height = 800000l;
+    relay = true;
+  } in
+  let msg = P2p.VersionMsg version_msg in
+  let result = Lwt_main.run (Peer.dispatch_message peer msg) in
+  match result with
+  | `Disconnect _ ->
+    Alcotest.(check int) "misbehavior = 1" 1 peer.misbehavior_score
+  | _ -> Alcotest.fail "Expected VERSION after handshake to disconnect"
+
+(* Test dispatch_message accepts normal messages after handshake *)
+let test_dispatch_post_handshake_feefilter () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  (* Simulate completed handshake *)
+  peer.handshake_complete <- true;
+  peer.version_received <- true;
+  (* FeefilterMsg doesn't try to send a response, so it won't hang *)
+  let msg = P2p.FeefilterMsg 1000L in
+  let result = Lwt_main.run (Peer.dispatch_message peer msg) in
+  match result with
+  | `Continue ->
+    Alcotest.(check int) "no misbehavior" 0 peer.misbehavior_score;
+    Alcotest.(check int64) "feefilter set" 1000L peer.feefilter
+  | _ -> Alcotest.fail "Expected feefilter after handshake to be accepted"
+
+(* Test self-connection detection nonce *)
+let test_self_connection_nonce () =
+  let fd1 = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let fd2 = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer1 = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd:fd1 in
+  let peer2 = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:1 ~direction:Peer.Outbound ~fd:fd2 in
+  (* Each peer should have a unique nonce *)
+  Alcotest.(check bool) "nonces differ" true (peer1.our_nonce <> peer2.our_nonce)
+
 (* All tests *)
 let () =
   Alcotest.run "Peer" [
@@ -239,5 +452,23 @@ let () =
       Alcotest.test_case "for_category" `Quick test_record_misbehavior_for;
       Alcotest.test_case "for_unknown" `Quick test_record_misbehavior_for_unknown;
       Alcotest.test_case "peer_info_misbehavior" `Quick test_peer_info_misbehavior;
+    ];
+    "handshake", [
+      Alcotest.test_case "fields_init" `Quick test_handshake_fields_init;
+      Alcotest.test_case "timeout_constant" `Quick test_handshake_timeout;
+      Alcotest.test_case "min_protocol_version" `Quick test_min_protocol_version;
+      Alcotest.test_case "self_connection_nonce" `Quick test_self_connection_nonce;
+    ];
+    "pre_handshake", [
+      Alcotest.test_case "reject_ping" `Quick test_dispatch_pre_handshake_ping;
+      Alcotest.test_case "accept_version" `Quick test_dispatch_pre_handshake_version;
+      Alcotest.test_case "reject_duplicate_version" `Quick test_dispatch_duplicate_version;
+      Alcotest.test_case "reject_verack_before_version" `Quick test_dispatch_verack_before_version;
+      Alcotest.test_case "accept_verack_after_version" `Quick test_dispatch_verack_after_version;
+      Alcotest.test_case "accept_feature_negotiation" `Quick test_dispatch_feature_negotiation;
+      Alcotest.test_case "reject_feature_before_version" `Quick test_dispatch_feature_before_version;
+      Alcotest.test_case "reject_wtxidrelay_after_handshake" `Quick test_dispatch_wtxidrelay_after_handshake;
+      Alcotest.test_case "reject_version_after_handshake" `Quick test_dispatch_version_after_handshake;
+      Alcotest.test_case "accept_feefilter_after_handshake" `Quick test_dispatch_post_handshake_feefilter;
     ];
   ]

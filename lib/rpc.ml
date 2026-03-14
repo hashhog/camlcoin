@@ -1585,6 +1585,103 @@ let handle_disconnectnode (ctx : rpc_context)
     Error "Invalid parameters: expected [address] or [node_id]"
 
 (* ============================================================================
+   AssumeUTXO Handlers (loadtxoutset / dumptxoutset)
+   ============================================================================ *)
+
+let handle_loadtxoutset (_ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String path] ->
+    (* Read and validate snapshot metadata *)
+    (match Assume_utxo.read_snapshot_metadata path
+             ~expected_network_magic:_ctx.network.magic with
+    | Error e -> Error e
+    | Ok metadata ->
+      (* Check if snapshot blockhash is in our hardcoded params *)
+      (match Assume_utxo.get_assumeutxo_for_hash ~network:_ctx.network
+               metadata.base_blockhash with
+      | None ->
+        Error (Printf.sprintf
+                 "Snapshot blockhash %s not recognized. AssumeUTXO is only \
+                  supported for specific block heights."
+                 (Types.hash256_to_hex_display metadata.base_blockhash))
+      | Some params ->
+        (* Verify coins count matches *)
+        if metadata.coins_count <> params.coins_count then
+          Error (Printf.sprintf
+                   "Coins count mismatch: snapshot has %Ld, expected %Ld"
+                   metadata.coins_count params.coins_count)
+        else
+          (* Return info about the snapshot *)
+          Ok (`Assoc [
+            ("coins_loaded", `Int (Int64.to_int metadata.coins_count));
+            ("block_hash", `String
+               (Types.hash256_to_hex_display metadata.base_blockhash));
+            ("height", `Int params.height);
+            ("path", `String path);
+          ])))
+  | _ ->
+    Error "Invalid parameters: expected [path]"
+
+let handle_dumptxoutset (_ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String path] ->
+    (* Get current tip info *)
+    let tip_entry = _ctx.chain.tip in
+    let tip_height, tip_hash = match tip_entry with
+      | Some t -> (t.height, t.hash)
+      | None -> (0, Types.zero_hash)
+    in
+    (* Count total coins in UTXO set *)
+    let total_coins = ref 0L in
+    Storage.ChainDB.iter_utxos _ctx.chain.db (fun _txid _vout _data ->
+      total_coins := Int64.add !total_coins 1L
+    );
+    (* Create metadata *)
+    let metadata : Assume_utxo.snapshot_metadata = {
+      network_magic = _ctx.network.magic;
+      base_blockhash = tip_hash;
+      coins_count = !total_coins;
+    } in
+    (* Write snapshot file *)
+    (try
+      let oc = open_out_bin path in
+      (* Write metadata *)
+      let w = Serialize.writer_create () in
+      Assume_utxo.serialize_metadata w metadata;
+      output_string oc (Cstruct.to_string (Serialize.writer_to_cstruct w));
+      (* Write coins *)
+      let coins_written = ref 0L in
+      Storage.ChainDB.iter_utxos _ctx.chain.db (fun txid vout data ->
+        let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+        let utxo = Utxo.deserialize_utxo_entry r in
+        let coin : Assume_utxo.snapshot_coin = {
+          outpoint = { Types.txid; vout = Int32.of_int vout };
+          value = utxo.value;
+          script_pubkey = utxo.script_pubkey;
+          height = utxo.height;
+          is_coinbase = utxo.is_coinbase;
+        } in
+        let cw = Serialize.writer_create () in
+        Assume_utxo.serialize_coin cw coin;
+        output_string oc (Cstruct.to_string (Serialize.writer_to_cstruct cw));
+        coins_written := Int64.add !coins_written 1L
+      );
+      close_out oc;
+      Ok (`Assoc [
+        ("coins_dumped", `Int (Int64.to_int !coins_written));
+        ("base_hash", `String (Types.hash256_to_hex_display tip_hash));
+        ("base_height", `Int tip_height);
+        ("path", `String path);
+      ])
+    with
+    | Sys_error msg -> Error ("Failed to write snapshot: " ^ msg)
+    | _ -> Error "Failed to dump UTXO snapshot")
+  | _ ->
+    Error "Invalid parameters: expected [path]"
+
+(* ============================================================================
    Control Handlers
    ============================================================================ *)
 
@@ -1660,6 +1757,10 @@ let handle_help (_ctx : rpc_context)
       "";
       "== Performance ==";
       "getperfstats";
+      "";
+      "== AssumeUTXO ==";
+      "loadtxoutset \"path\"";
+      "dumptxoutset \"path\"";
     ])
   | [`String _cmd] ->
     (* Could provide help for specific command *)
@@ -1819,6 +1920,16 @@ let dispatch_rpc (ctx : rpc_context)
   (* Performance *)
   | "getperfstats" ->
     Ok (handle_getperfstats ctx)
+
+  (* AssumeUTXO *)
+  | "loadtxoutset" ->
+    (match handle_loadtxoutset ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "dumptxoutset" ->
+    (match handle_dumptxoutset ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
 
   | _ ->
     Error (rpc_method_not_found, "Method not found: " ^ method_name)

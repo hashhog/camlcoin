@@ -53,6 +53,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Wallet encryption (encryptwallet, walletpassphrase, walletlock, passphrase change, timeout-based auto-lock)
 - [x] Block indexes (hash index, height index, BIP-157/158 compact block filters with GCS)
 - [x] Compact block relay (BIP 152, SipHash, short IDs, block reconstruction)
+- [x] Package relay (BIP 331, 1p1c topology, CPFP fee-bumping, topological sort)
 - [ ] Bloom filters (BIP 37)
 
 ## Quick start

@@ -314,11 +314,22 @@ type tx_history_entry = {
   hist_timestamp : float;
 }
 
+(* Wallet lock state: tracks whether private keys are accessible *)
+type lock_state =
+  | Locked
+  | Unlocked of { master_key : Cstruct.t; expires : float }
+
 (* Wallet encryption state *)
 type encryption_state = {
-  encrypted : bool;
-  salt : Cstruct.t option;
-  iv : Cstruct.t option;
+  mutable encrypted : bool;
+  mutable salt : Cstruct.t option;
+  mutable iv : Cstruct.t option;
+  (* Encrypted master key (for encrypted wallets only) *)
+  mutable encrypted_master_key : Cstruct.t option;
+  (* Current lock state *)
+  mutable lock_state : lock_state;
+  (* Encrypted private keys: address -> encrypted key ciphertext *)
+  mutable encrypted_keys : (string, Cstruct.t) Hashtbl.t;
 }
 
 (* Wallet state *)
@@ -366,7 +377,14 @@ let create ~(network : [`Mainnet | `Testnet | `Regtest])
     bip86_change_index = 0;
     sent_transactions = Hashtbl.create 16;
     tx_history = [];
-    encryption = { encrypted = false; salt = None; iv = None } }
+    encryption = {
+      encrypted = false;
+      salt = None;
+      iv = None;
+      encrypted_master_key = None;
+      lock_state = Unlocked { master_key = Cstruct.empty; expires = infinity };
+      encrypted_keys = Hashtbl.create 16;
+    } }
 
 (* ============================================================================
    HD Wallet Initialization
@@ -1438,18 +1456,21 @@ let update_confirmations (w : t) (current_height : int) : unit =
    Wallet Encryption (AES-256-CBC)
    ============================================================================ *)
 
-(* Derive AES-256 key from passphrase using PBKDF2-HMAC-SHA256 *)
-let derive_aes_key (passphrase : string) (salt : Cstruct.t) : Cstruct.t =
-  let iterations = 100_000 in
-  let key_len = 32 in  (* AES-256 requires 32-byte key *)
-  let password = passphrase in
+(* Default number of key derivation rounds (matches Bitcoin Core) *)
+let pbkdf2_iterations = 25000
+
+(* Derive encryption key + IV from passphrase using PBKDF2-HMAC-SHA512.
+   Uses Bitcoin Core's derivation method: SHA512 iterations produce 64 bytes,
+   first 32 bytes are the AES-256 key, next 16 bytes are the IV. *)
+let derive_key_and_iv (passphrase : string) (salt : Cstruct.t) : Cstruct.t * Cstruct.t =
+  let iterations = pbkdf2_iterations in
   let salt_str = Cstruct.to_string salt in
-  (* PBKDF2-HMAC-SHA256 implementation *)
-  let hmac_sha256 ~key data =
-    Digestif.SHA256.hmac_string ~key data
-    |> Digestif.SHA256.to_raw_string
+  (* PBKDF2-HMAC-SHA512: produces 64 bytes in one block *)
+  let hmac_sha512_str ~key data =
+    Digestif.SHA512.hmac_string ~key data
+    |> Digestif.SHA512.to_raw_string
   in
-  (* Salt with block number (only 1 block needed for 32-byte key) *)
+  (* Salt with block number (only 1 block needed for 64-byte output) *)
   let salt_with_block =
     let s = Bytes.create (String.length salt_str + 4) in
     Bytes.blit_string salt_str 0 s 0 (String.length salt_str);
@@ -1459,16 +1480,24 @@ let derive_aes_key (passphrase : string) (salt : Cstruct.t) : Cstruct.t =
     Bytes.set s (String.length salt_str + 3) '\001';
     Bytes.to_string s
   in
-  let u = ref (hmac_sha256 ~key:password salt_with_block) in
+  let u = ref (hmac_sha512_str ~key:passphrase salt_with_block) in
   let result = Bytes.of_string !u in
   for _ = 2 to iterations do
-    u := hmac_sha256 ~key:password !u;
-    for j = 0 to key_len - 1 do
+    u := hmac_sha512_str ~key:passphrase !u;
+    for j = 0 to 63 do
       let b = Char.code (Bytes.get result j) lxor Char.code (String.get !u j) in
       Bytes.set result j (Char.chr b)
     done
   done;
-  Cstruct.of_string (Bytes.to_string result)
+  let full = Cstruct.of_string (Bytes.to_string result) in
+  let key = Cstruct.sub full 0 32 in  (* AES-256 key: 32 bytes *)
+  let iv = Cstruct.sub full 32 16 in   (* AES-CBC IV: 16 bytes *)
+  (key, iv)
+
+(* Legacy derive_aes_key for backward compatibility *)
+let derive_aes_key (passphrase : string) (salt : Cstruct.t) : Cstruct.t =
+  let (key, _iv) = derive_key_and_iv passphrase salt in
+  key
 
 (* Generate a random salt for key derivation *)
 let generate_salt () : Cstruct.t =
@@ -1541,6 +1570,201 @@ let aes_256_cbc_decrypt ~(key : Cstruct.t) ~(iv : Cstruct.t) (ciphertext : Cstru
     let decrypted = Mirage_crypto.AES.CBC.decrypt ~key:cipher ~iv:iv_str (Cstruct.to_string ciphertext) in
     pkcs7_unpad (Cstruct.of_string decrypted)
   end
+
+(* ============================================================================
+   Wallet Passphrase Lock/Unlock
+   ============================================================================ *)
+
+(* Check if wallet is locked *)
+let is_locked (w : t) : bool =
+  match w.encryption.lock_state with
+  | Locked -> true
+  | Unlocked { expires; _ } ->
+    let now = Unix.gettimeofday () in
+    if now >= expires then begin
+      (* Expired, transition to locked state *)
+      w.encryption.lock_state <- Locked;
+      true
+    end else
+      false
+
+(* Check if wallet is encrypted *)
+let is_encrypted (w : t) : bool =
+  w.encryption.encrypted
+
+(* Generate a random master key for encryption *)
+let generate_master_key () : Cstruct.t =
+  let key = Cstruct.create 32 in
+  let fd = Unix.openfile "/dev/urandom" [Unix.O_RDONLY] 0 in
+  let bytes = Bytes.create 32 in
+  let _ = Unix.read fd bytes 0 32 in
+  Unix.close fd;
+  Cstruct.blit_from_bytes bytes 0 key 0 32;
+  key
+
+(* Encrypt a private key with the master key.
+   Uses pubkey hash as IV per Bitcoin Core's approach. *)
+let encrypt_private_key ~(master_key : Cstruct.t) (kp : key_pair) : Cstruct.t =
+  let pubkey_hash = Crypto.sha256d kp.public_key in
+  let iv = Cstruct.sub pubkey_hash 0 16 in
+  aes_256_cbc_encrypt ~key:master_key ~iv kp.private_key
+
+(* Decrypt a private key with the master key *)
+let decrypt_private_key ~(master_key : Cstruct.t) ~(public_key : Cstruct.t)
+    (encrypted : Cstruct.t) : Cstruct.t option =
+  let pubkey_hash = Crypto.sha256d public_key in
+  let iv = Cstruct.sub pubkey_hash 0 16 in
+  aes_256_cbc_decrypt ~key:master_key ~iv encrypted
+
+(* Encrypt the wallet with a passphrase.
+   This encrypts all private keys and stores the encrypted master key. *)
+let encrypt_wallet (w : t) ~(passphrase : string) : (unit, string) result =
+  if w.encryption.encrypted then
+    Error "Wallet is already encrypted"
+  else if String.length passphrase = 0 then
+    Error "Passphrase cannot be empty"
+  else begin
+    (* Generate salt and master key *)
+    let salt = generate_salt () in
+    let master_key = generate_master_key () in
+
+    (* Derive encryption key from passphrase *)
+    let (derived_key, derived_iv) = derive_key_and_iv passphrase salt in
+
+    (* Encrypt each private key with the master key *)
+    List.iter (fun kp ->
+      let encrypted = encrypt_private_key ~master_key kp in
+      let addr_str = Address.address_to_string kp.address in
+      Hashtbl.replace w.encryption.encrypted_keys addr_str encrypted
+    ) w.keys;
+
+    (* Encrypt the master key with the derived key *)
+    let encrypted_master = aes_256_cbc_encrypt ~key:derived_key ~iv:derived_iv master_key in
+
+    (* Update encryption state *)
+    w.encryption.encrypted <- true;
+    w.encryption.salt <- Some salt;
+    w.encryption.iv <- Some derived_iv;
+    w.encryption.encrypted_master_key <- Some encrypted_master;
+    w.encryption.lock_state <- Locked;
+
+    (* Clear unencrypted private keys from memory (for security, replace with zeroes) *)
+    List.iter (fun kp ->
+      for i = 0 to Cstruct.length kp.private_key - 1 do
+        Cstruct.set_uint8 kp.private_key i 0
+      done
+    ) w.keys;
+
+    Ok ()
+  end
+
+(* Unlock the wallet with a passphrase for a specified timeout (seconds).
+   Private keys become accessible until the timeout expires. *)
+let wallet_passphrase (w : t) ~(passphrase : string) ~(timeout : float)
+    : (unit, string) result =
+  if not w.encryption.encrypted then
+    Error "Wallet is not encrypted"
+  else begin
+    match w.encryption.salt, w.encryption.encrypted_master_key with
+    | Some salt, Some encrypted_master ->
+      (* Derive key from passphrase *)
+      let (derived_key, derived_iv) = derive_key_and_iv passphrase salt in
+
+      (* Try to decrypt master key *)
+      (match aes_256_cbc_decrypt ~key:derived_key ~iv:derived_iv encrypted_master with
+       | Some master_key ->
+         (* Verify the master key by decrypting one private key *)
+         let valid = List.length w.keys = 0 ||
+           let kp = List.hd w.keys in
+           let addr_str = Address.address_to_string kp.address in
+           match Hashtbl.find_opt w.encryption.encrypted_keys addr_str with
+           | Some encrypted ->
+             (match decrypt_private_key ~master_key ~public_key:kp.public_key encrypted with
+              | Some decrypted ->
+                (* Verify by deriving pubkey and comparing *)
+                let derived_pub = Crypto.derive_public_key ~compressed:true decrypted in
+                Cstruct.equal derived_pub kp.public_key
+              | None -> false)
+           | None -> true  (* No encrypted key stored, assume valid *)
+         in
+         if valid then begin
+           (* Decrypt all private keys and restore them *)
+           List.iter (fun kp ->
+             let addr_str = Address.address_to_string kp.address in
+             match Hashtbl.find_opt w.encryption.encrypted_keys addr_str with
+             | Some encrypted ->
+               (match decrypt_private_key ~master_key ~public_key:kp.public_key encrypted with
+                | Some decrypted ->
+                  Cstruct.blit decrypted 0 kp.private_key 0 32
+                | None -> ())
+             | None -> ()
+           ) w.keys;
+
+           (* Set unlock state with expiration *)
+           let expires = Unix.gettimeofday () +. timeout in
+           w.encryption.lock_state <- Unlocked { master_key; expires };
+           Ok ()
+         end else
+           Error "Error: The wallet passphrase entered was incorrect"
+       | None ->
+         Error "Error: The wallet passphrase entered was incorrect")
+    | _ ->
+      Error "Wallet encryption data is missing"
+  end
+
+(* Lock the wallet immediately *)
+let wallet_lock (w : t) : unit =
+  (* Clear private keys from memory *)
+  if w.encryption.encrypted then begin
+    List.iter (fun kp ->
+      for i = 0 to Cstruct.length kp.private_key - 1 do
+        Cstruct.set_uint8 kp.private_key i 0
+      done
+    ) w.keys
+  end;
+  w.encryption.lock_state <- Locked
+
+(* Change the wallet passphrase *)
+let wallet_passphrase_change (w : t) ~(old_passphrase : string)
+    ~(new_passphrase : string) : (unit, string) result =
+  if not w.encryption.encrypted then
+    Error "Wallet is not encrypted"
+  else if String.length new_passphrase = 0 then
+    Error "New passphrase cannot be empty"
+  else begin
+    (* First unlock with old passphrase *)
+    match wallet_passphrase w ~passphrase:old_passphrase ~timeout:60.0 with
+    | Error e -> Error e
+    | Ok () ->
+      (* Get current master key *)
+      match w.encryption.lock_state with
+      | Locked -> Error "Failed to unlock wallet"
+      | Unlocked { master_key; _ } ->
+        (* Generate new salt and derive new key *)
+        let new_salt = generate_salt () in
+        let (new_derived_key, new_derived_iv) = derive_key_and_iv new_passphrase new_salt in
+
+        (* Re-encrypt master key with new passphrase *)
+        let new_encrypted_master = aes_256_cbc_encrypt
+          ~key:new_derived_key ~iv:new_derived_iv master_key in
+
+        (* Update encryption state *)
+        w.encryption.salt <- Some new_salt;
+        w.encryption.iv <- Some new_derived_iv;
+        w.encryption.encrypted_master_key <- Some new_encrypted_master;
+
+        (* Lock the wallet *)
+        wallet_lock w;
+        Ok ()
+  end
+
+(* Get time remaining until wallet locks (0 if locked) *)
+let wallet_unlock_remaining (w : t) : float =
+  match w.encryption.lock_state with
+  | Locked -> 0.0
+  | Unlocked { expires; _ } ->
+    let now = Unix.gettimeofday () in
+    max 0.0 (expires -. now)
 
 (* ============================================================================
    Wallet Persistence
@@ -1706,7 +1930,9 @@ let save_encrypted (w : t) ~(passphrase : string) : unit =
   close_out oc;
 
   (* Update encryption state *)
-  w.encryption <- { encrypted = true; salt = Some salt; iv = Some iv }
+  w.encryption.encrypted <- true;
+  w.encryption.salt <- Some salt;
+  w.encryption.iv <- Some iv
 
 (* Load wallet data from JSON into wallet *)
 let load_wallet_json (w : t) (network : [`Mainnet | `Testnet | `Regtest]) (json : Yojson.Safe.t) : unit =
@@ -1898,7 +2124,9 @@ let load_encrypted ~(network : [`Mainnet | `Testnet | `Regtest])
           | Some plaintext ->
             let decrypted_json = Yojson.Safe.from_string (Cstruct.to_string plaintext) in
             let w = create ~network ~db_path in
-            w.encryption <- { encrypted = true; salt = Some salt; iv = Some iv };
+            w.encryption.encrypted <- true;
+            w.encryption.salt <- Some salt;
+            w.encryption.iv <- Some iv;
             load_wallet_json w network decrypted_json;
             Ok w
           | None ->

@@ -35,7 +35,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Block template construction (getblocktemplate, coinbase, witness commitment)
 - [x] CPU miner for regtest (proof-of-work search, nonce iteration)
 - [x] JSON-RPC interface (batch requests, parallel processing)
-- [x] Wallet (BIP-39 mnemonic, BIP-32/44/84/86 derivation, coin selection with BnB+SRD, encrypted storage)
+- [x] Wallet (BIP-39 mnemonic, BIP-32/44/84/86 derivation, coin selection with BnB+SRD, passphrase encryption with PBKDF2-SHA512)
 - [x] Command-line interface
 - [x] Test suite (Alcotest unit tests, QCheck property-based tests)
 - [x] Performance optimization (LRU cache, compact headers, benchmarks)
@@ -49,6 +49,8 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] getrawtransaction RPC (mempool lookup, txindex, blockhash param, verbose JSON)
 - [x] Flat file block storage (blk/rev files, block index, 128MB file rotation)
 - [x] Block pruning (-prune=N, 550MB minimum, txindex incompatible, 288 block safety margin)
+- [x] Coinbase maturity (100-block delay for coinbase spends, enforced in block validation and mempool)
+- [x] Wallet encryption (encryptwallet, walletpassphrase, walletlock, passphrase change, timeout-based auto-lock)
 - [ ] Compact block relay (BIP 152)
 - [ ] Bloom filters (BIP 37)
 

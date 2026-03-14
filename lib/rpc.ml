@@ -464,11 +464,12 @@ let handle_getpeerinfo (ctx : rpc_context) : Yojson.Safe.t =
       ("pingtime", `Float (stats.stat_latency_ms /. 1000.0));
       ("version", `Int 70016);
       ("subver", `String stats.stat_user_agent);
-      ("inbound", `Bool false);
+      ("inbound", `Bool (stats.stat_direction = Peer.Inbound));
       ("startingheight", `Int (Int32.to_int stats.stat_best_height));
       ("synced_headers", `Int (-1));
       ("synced_blocks", `Int (-1));
       ("inflight", `List []);
+      ("misbehavior_score", `Int stats.stat_misbehavior);
     ]
   ) peers)
 
@@ -1259,6 +1260,66 @@ let handle_getperfstats (_ctx : rpc_context) : Yojson.Safe.t =
   ]
 
 (* ============================================================================
+   Ban Management Handlers
+   ============================================================================ *)
+
+(* listbanned - Return list of currently banned addresses *)
+let handle_listbanned (ctx : rpc_context) : Yojson.Safe.t =
+  let now = Unix.gettimeofday () in
+  let bans = Peer_manager.get_banned_list ctx.peer_manager in
+  `List (List.filter_map (fun (addr, ban_until) ->
+    if ban_until > now then
+      Some (`Assoc [
+        ("address", `String addr);
+        ("banned_until", `Int (int_of_float ban_until));
+        ("ban_created", `Int (int_of_float (ban_until -. 86400.0)));
+        ("ban_reason", `String "misbehavior");
+      ])
+    else
+      None
+  ) bans)
+
+(* setban - Add or remove an address from the ban list *)
+let handle_setban (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String addr; `String "add"] ->
+    Peer_manager.ban_addr ctx.peer_manager addr ~duration:86400.0 ();
+    Ok `Null
+  | [`String addr; `String "add"; `Int duration] ->
+    Peer_manager.ban_addr ctx.peer_manager addr ~duration:(float_of_int duration) ();
+    Ok `Null
+  | [`String addr; `String "remove"] ->
+    Peer_manager.unban_addr ctx.peer_manager addr;
+    Ok `Null
+  | _ ->
+    Error "Invalid parameters: expected [address, \"add\"|\"remove\", (bantime)]"
+
+(* clearbanned - Clear all banned addresses *)
+let handle_clearbanned (ctx : rpc_context) : Yojson.Safe.t =
+  Peer_manager.clear_bans ctx.peer_manager;
+  `Null
+
+(* disconnectnode - Disconnect from a peer *)
+let handle_disconnectnode (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String addr] ->
+    (match Peer_manager.find_peer_by_addr ctx.peer_manager addr with
+     | Some peer ->
+       Lwt.async (fun () -> Peer_manager.remove_peer ctx.peer_manager peer.Peer.id);
+       Ok `Null
+     | None -> Error ("Peer not found: " ^ addr))
+  | [`Int id] ->
+    (match Peer_manager.find_peer_by_id ctx.peer_manager id with
+     | Some _ ->
+       Lwt.async (fun () -> Peer_manager.remove_peer ctx.peer_manager id);
+       Ok `Null
+     | None -> Error ("Peer not found with id: " ^ string_of_int id))
+  | _ ->
+    Error "Invalid parameters: expected [address] or [node_id]"
+
+(* ============================================================================
    Control Handlers
    ============================================================================ *)
 
@@ -1298,9 +1359,13 @@ let handle_help (_ctx : rpc_context)
       "testmempoolaccept [\"rawtx\"]";
       "";
       "== Network ==";
+      "clearbanned";
+      "disconnectnode \"address\"";
       "getconnectioncount";
       "getnetworkinfo";
       "getpeerinfo";
+      "listbanned";
+      "setban \"address\" \"add\"|\"remove\" ( bantime )";
       "";
       "== Rawtransactions ==";
       "decoderawtransaction \"hexstring\"";
@@ -1401,6 +1466,18 @@ let dispatch_rpc (ctx : rpc_context)
     Ok (handle_getconnectioncount ctx)
   | "getnetworkinfo" ->
     Ok (handle_getnetworkinfo ctx)
+  | "listbanned" ->
+    Ok (handle_listbanned ctx)
+  | "setban" ->
+    (match handle_setban ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_invalid_params, msg))
+  | "clearbanned" ->
+    Ok (handle_clearbanned ctx)
+  | "disconnectnode" ->
+    (match handle_disconnectnode ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
 
   (* Mempool *)
   | "getmempoolinfo" ->

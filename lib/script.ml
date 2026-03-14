@@ -700,6 +700,11 @@ let is_defined_hash_type (hash_type : int) : bool =
   let base = hash_type land (lnot 0x80) in  (* strip ANYONECANPAY *)
   base >= 1 && base <= 3  (* SIGHASH_ALL=1, NONE=2, SINGLE=3 *)
 
+(* Check if a public key is compressed (33 bytes, prefix 0x02 or 0x03) *)
+let is_compressed_pubkey (pk : Cstruct.t) : bool =
+  Cstruct.length pk = 33 &&
+  (let prefix = Cstruct.get_uint8 pk 0 in prefix = 0x02 || prefix = 0x03)
+
 (* Check public key encoding validity *)
 let check_pubkey_encoding (pk : Cstruct.t) (flags : int) (sig_version : sig_version) : (unit, string) result =
   let pk_len = Cstruct.length pk in
@@ -708,14 +713,13 @@ let check_pubkey_encoding (pk : Cstruct.t) (flags : int) (sig_version : sig_vers
     (* STRICTENC: must be valid compressed (33 bytes, 0x02/0x03) or uncompressed (65 bytes, 0x04) *)
     if flags land script_verify_strictenc <> 0 then begin
       let valid_encoding =
-        (pk_len = 33 && (let prefix = Cstruct.get_uint8 pk 0 in prefix = 0x02 || prefix = 0x03))
-        || (pk_len = 65 && Cstruct.get_uint8 pk 0 = 0x04)
+        is_compressed_pubkey pk || (pk_len = 65 && Cstruct.get_uint8 pk 0 = 0x04)
       in
       if not valid_encoding then
         Error "Invalid public key encoding"
       else if flags land script_verify_witness_pubkeytype <> 0 &&
               (sig_version = SigVersionWitnessV0) &&
-              not (pk_len = 33 && (let prefix = Cstruct.get_uint8 pk 0 in prefix = 0x02 || prefix = 0x03)) then
+              not (is_compressed_pubkey pk) then
         Error "Witness requires compressed pubkey"
       else
         Ok ()
@@ -723,7 +727,7 @@ let check_pubkey_encoding (pk : Cstruct.t) (flags : int) (sig_version : sig_vers
       (* Even without STRICTENC, check WITNESS_PUBKEYTYPE *)
       if flags land script_verify_witness_pubkeytype <> 0 &&
          (sig_version = SigVersionWitnessV0) &&
-         not (pk_len = 33 && (let prefix = Cstruct.get_uint8 pk 0 in prefix = 0x02 || prefix = 0x03)) then
+         not (is_compressed_pubkey pk) then
         Error "Witness requires compressed pubkey"
       else
         Ok ()
@@ -2396,10 +2400,10 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
         end
       end
     end
-  | Some (0, _program) when flags land script_verify_witness <> 0 ->
+  | Some (0, program) when flags land script_verify_witness <> 0 &&
+                          Cstruct.length program <> 20 && Cstruct.length program <> 32 ->
     (* Witness v0 with wrong program length — must be exactly 20 or 32 bytes.
-       Valid lengths are caught by classify_script as P2WPKH_script/P2WSH_script,
-       so reaching here means the length is invalid. *)
+       Valid lengths (20 for P2WPKH, 32 for P2WSH) fall through to classify_script. *)
     if Cstruct.length script_sig > 0 then
       Error "scriptSig must be empty for witness program"
     else
@@ -2497,9 +2501,9 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                   else begin
                     let wit_sig = List.nth wit_items 0 in
                     let wit_pubkey = List.nth wit_items 1 in
-                    (* WITNESS_PUBKEYTYPE: require compressed pubkey *)
+                    (* WITNESS_PUBKEYTYPE: require compressed pubkey (33 bytes, 0x02/0x03 prefix) *)
                     if flags land script_verify_witness_pubkeytype <> 0 &&
-                       Cstruct.length wit_pubkey <> 33 then
+                       not (is_compressed_pubkey wit_pubkey) then
                       Error "Witness v0 requires compressed public key"
                     else begin
                       (* Verify pubkey hashes to program *)
@@ -2610,9 +2614,9 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
         else begin
           let wit_sig = List.nth wit_items 0 in
           let wit_pubkey = List.nth wit_items 1 in
-          (* WITNESS_PUBKEYTYPE: require compressed pubkey *)
+          (* WITNESS_PUBKEYTYPE: require compressed pubkey (33 bytes, 0x02/0x03 prefix) *)
           if flags land script_verify_witness_pubkeytype <> 0 &&
-             Cstruct.length wit_pubkey <> 33 then
+             not (is_compressed_pubkey wit_pubkey) then
             Error "Witness v0 requires compressed public key"
           else begin
             (* Verify pubkey hashes to program *)

@@ -322,6 +322,89 @@ let test_build_locator_exponential () =
   Storage.ChainDB.close db;
   ignore (Sys.command (Printf.sprintf "rm -rf %s" tmp_dir))
 
+(* Test unban_addr removes ban *)
+let test_unban_addr () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  Peer_manager.ban_addr pm "192.168.1.1" ~duration:1000.0 ();
+  Alcotest.(check bool) "is banned" true
+    (Peer_manager.is_banned pm "192.168.1.1");
+  Peer_manager.unban_addr pm "192.168.1.1";
+  Alcotest.(check bool) "not banned after unban" false
+    (Peer_manager.is_banned pm "192.168.1.1")
+
+(* Test clear_bans removes all bans *)
+let test_clear_bans () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  Peer_manager.ban_addr pm "192.168.1.1" ~duration:1000.0 ();
+  Peer_manager.ban_addr pm "192.168.1.2" ~duration:1000.0 ();
+  Peer_manager.ban_addr pm "192.168.1.3" ~duration:1000.0 ();
+  let stats = Peer_manager.get_addr_stats pm in
+  Alcotest.(check int) "3 banned" 3 stats.banned;
+  Peer_manager.clear_bans pm;
+  let stats2 = Peer_manager.get_addr_stats pm in
+  Alcotest.(check int) "0 banned after clear" 0 stats2.banned
+
+(* Test get_banned_list returns active bans *)
+let test_get_banned_list () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  Peer_manager.ban_addr pm "10.0.0.1" ~duration:1000.0 ();
+  Peer_manager.ban_addr pm "10.0.0.2" ~duration:1000.0 ();
+  let banned = Peer_manager.get_banned_list pm in
+  Alcotest.(check int) "2 bans" 2 (List.length banned);
+  let addrs = List.map fst banned in
+  Alcotest.(check bool) "has 10.0.0.1" true
+    (List.mem "10.0.0.1" addrs);
+  Alcotest.(check bool) "has 10.0.0.2" true
+    (List.mem "10.0.0.2" addrs)
+
+(* Test get_banned_list excludes expired bans *)
+let test_get_banned_list_expired () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  (* Create an already-expired ban by modifying the internal state *)
+  let info : Peer_manager.peer_info = {
+    address = "10.0.0.1";
+    port = 8333;
+    services = 9L;
+    last_connected = 0.0;
+    last_attempt = 0.0;
+    failures = 0;
+    banned_until = Unix.gettimeofday () -. 100.0;  (* Expired *)
+    source = Peer_manager.Manual;
+  } in
+  Peer_manager.add_known_addr pm info;
+  (* Add an active ban *)
+  Peer_manager.ban_addr pm "10.0.0.2" ~duration:1000.0 ();
+  let banned = Peer_manager.get_banned_list pm in
+  Alcotest.(check int) "1 active ban" 1 (List.length banned);
+  let addrs = List.map fst banned in
+  Alcotest.(check bool) "has 10.0.0.2" true
+    (List.mem "10.0.0.2" addrs);
+  Alcotest.(check bool) "not has 10.0.0.1" false
+    (List.mem "10.0.0.1" addrs)
+
+(* Test banlist JSON persistence roundtrip *)
+let test_banlist_json_persistence () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  Peer_manager.ban_addr pm "172.16.0.1" ~duration:1000.0 ();
+  Peer_manager.ban_addr pm "172.16.0.2" ~duration:2000.0 ();
+  let tmpfile = Filename.temp_file "banlist" ".json" in
+  Peer_manager.save_bans_json pm tmpfile;
+  (* Create a new peer manager and load *)
+  let pm2 = Peer_manager.create Consensus.mainnet in
+  let count = Peer_manager.load_bans_json pm2 tmpfile in
+  Alcotest.(check int) "loaded 2 bans" 2 count;
+  Alcotest.(check bool) "172.16.0.1 banned" true
+    (Peer_manager.is_banned pm2 "172.16.0.1");
+  Alcotest.(check bool) "172.16.0.2 banned" true
+    (Peer_manager.is_banned pm2 "172.16.0.2");
+  Unix.unlink tmpfile
+
+(* Test load_bans_json with nonexistent file *)
+let test_load_bans_json_missing () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  let count = Peer_manager.load_bans_json pm "/nonexistent/banlist.json" in
+  Alcotest.(check int) "no bans loaded" 0 count
+
 (* All tests *)
 let () =
   Alcotest.run "Peer_manager" [
@@ -338,6 +421,12 @@ let () =
     "banning", [
       Alcotest.test_case "is_banned_empty" `Quick test_is_banned_empty;
       Alcotest.test_case "ban_addr" `Quick test_ban_addr;
+      Alcotest.test_case "unban_addr" `Quick test_unban_addr;
+      Alcotest.test_case "clear_bans" `Quick test_clear_bans;
+      Alcotest.test_case "get_banned_list" `Quick test_get_banned_list;
+      Alcotest.test_case "get_banned_list_expired" `Quick test_get_banned_list_expired;
+      Alcotest.test_case "banlist_json_persistence" `Quick test_banlist_json_persistence;
+      Alcotest.test_case "load_bans_json_missing" `Quick test_load_bans_json_missing;
     ];
     "known_addrs", [
       Alcotest.test_case "add_known_addr" `Quick test_add_known_addr;

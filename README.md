@@ -20,7 +20,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Script interpreter (opcodes, stack machine, P2PKH/P2SH/P2WPKH/P2WSH/P2TR, legacy sighash with FindAndDelete/OP_CODESEPARATOR, witness cleanstack, P2SH push-only, MINIMALIF)
 - [x] Consensus parameters (difficulty adjustment, testnet walk-back, BIP94, rewards)
 - [x] BIP9 version bits (soft fork activation state machine, signal counting)
-- [x] Storage layer (blocks, UTXOs, chain state, batch writes)
+- [x] Storage layer (blocks, UTXOs, chain state, batch writes, flat files)
 - [x] Block and transaction validation (weight, sigops, Merkle, coinbase, BIP68 sequence locks)
 - [x] P2P message serialization (version, inv, getdata, blocks, headers, tx)
 - [x] Peer connections and handshake (TCP/Lwt, version/verack, ping/pong)
@@ -47,6 +47,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Checkpoint verification (hardcoded checkpoints, assume_valid, minimum_chain_work)
 - [x] sendrawtransaction broadcast (mempool validation, maxfeerate/maxburnamount, peer relay)
 - [x] getrawtransaction RPC (mempool lookup, txindex, blockhash param, verbose JSON)
+- [x] Flat file block storage (blk/rev files, block index, 128MB file rotation)
 - [ ] Compact block relay (BIP 152)
 - [ ] Bloom filters (BIP 37)
 
@@ -75,7 +76,7 @@ camlcoin/
     script.ml         script interpreter
     consensus.ml      consensus parameters, BIP9 versionbits
     validation.ml     block/tx validation
-    storage.ml        block/utxo storage
+    storage.ml        block/utxo storage, flat files
     utxo.ml           UTXO set with LRU cache
     p2p.ml            network protocol
     peer.ml           peer connections

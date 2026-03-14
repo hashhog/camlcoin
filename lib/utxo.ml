@@ -681,3 +681,374 @@ let process_blocks_batch (blocks : Types.block list)
   match !error with
   | Some e -> Error e
   | None -> Ok (!height - start_height)
+
+(* ============================================================================
+   Layered UTXO Cache with Batch Flushing
+   ============================================================================
+
+   Bitcoin Core reference: coins.cpp (CCoinsViewCache, CCoinsViewDB)
+
+   This implements a layered UTXO cache that accumulates changes in memory and
+   periodically flushes to disk, avoiding per-transaction disk writes. The
+   design mirrors Bitcoin Core's CCoinsViewCache with:
+
+   1. A coin type containing txout, height, and is_coinbase
+   2. Cache entry states: Fresh (new), Dirty (modified), Erased (spent)
+   3. Parent view abstraction for hierarchical caching
+   4. Async flush with configurable max_size threshold
+
+   Cache Entry State Semantics (matching Bitcoin Core):
+   - Fresh: Entry doesn't exist in parent (or parent has it as spent).
+            Fresh coins can be deleted entirely when spent.
+   - Dirty: Entry differs from parent cache (must flush to parent).
+   - Erased: Coin has been spent. Kept in cache to remember the spend
+            for proper flush to parent.
+
+   Valid state transitions:
+   - None -> Fresh (add_coin when not in parent)
+   - Fresh -> Erased (spend_coin on fresh entry - entry deleted)
+   - Dirty -> Erased (spend_coin on dirty entry - kept as Erased)
+   - Parent hit -> Dirty (modify coin from parent)
+
+   The flush operation writes Fresh/Dirty entries to parent and removes
+   Erased entries, then clears the cache. *)
+
+(** Coin type representing a spendable output.
+    Maps to Bitcoin Core's Coin class. *)
+type coin = {
+  txout : Types.tx_out;   (** The output (value + scriptPubKey) *)
+  height : int;           (** Block height where output was created *)
+  is_coinbase : bool;     (** Coinbase outputs need 100-block maturity *)
+}
+
+(** Cache entry states following Bitcoin Core's CCoinsCacheEntry flags.
+    Fresh: new coin not in parent, Dirty: modified from parent, Erased: spent *)
+type cache_entry =
+  | Fresh of coin       (** Coin not in parent (can delete on spend) *)
+  | Dirty of coin       (** Coin modified from parent (must flush) *)
+  | Erased              (** Coin spent (must propagate to parent on flush) *)
+
+(** Abstract UTXO view interface.
+    Allows stacking cache layers (cache on cache on database). *)
+module type UTXO_VIEW = sig
+  type t
+
+  (** Get a coin by outpoint. Returns None if not found or spent. *)
+  val get_coin : t -> Types.outpoint -> coin option
+
+  (** Check if a coin exists. *)
+  val have_coin : t -> Types.outpoint -> bool
+
+  (** Add a coin to the view.
+      @param possible_overwrite true if replacing existing coin is allowed *)
+  val add_coin : t -> Types.outpoint -> coin -> possible_overwrite:bool -> unit
+
+  (** Spend a coin, returning the spent coin if it existed. *)
+  val spend_coin : t -> Types.outpoint -> coin option
+
+  (** Flush changes to underlying storage. Returns entry count flushed. *)
+  val flush : t -> int Lwt.t
+
+  (** Get current memory usage estimate in bytes. *)
+  val memory_usage : t -> int
+end
+
+(** Database-backed UTXO view (the bottom layer).
+    Wraps ChainDB with the UTXO_VIEW interface. *)
+module DbView : sig
+  type t
+  val create : Storage.ChainDB.t -> t
+  val db : t -> Storage.ChainDB.t
+  val serialize_coin : coin -> string
+  include UTXO_VIEW with type t := t
+end = struct
+  type t = {
+    db : Storage.ChainDB.t;
+  }
+
+  let create db = { db }
+  let db t = t.db
+
+  (** Serialize a coin for database storage *)
+  let serialize_coin (c : coin) : string =
+    let w = Serialize.writer_create () in
+    Serialize.write_int64_le w c.txout.value;
+    Serialize.write_compact_size w (Cstruct.length c.txout.script_pubkey);
+    Serialize.write_bytes w c.txout.script_pubkey;
+    Serialize.write_int32_le w (Int32.of_int c.height);
+    Serialize.write_uint8 w (if c.is_coinbase then 1 else 0);
+    Cstruct.to_string (Serialize.writer_to_cstruct w)
+
+  (** Deserialize a coin from database storage *)
+  let deserialize_coin (data : string) : coin =
+    let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+    let value = Serialize.read_int64_le r in
+    let script_len = Serialize.read_compact_size r in
+    let script_pubkey = Serialize.read_bytes r script_len in
+    let height = Int32.to_int (Serialize.read_int32_le r) in
+    let is_coinbase = Serialize.read_uint8 r <> 0 in
+    { txout = { value; script_pubkey }; height; is_coinbase }
+
+  let get_coin t outpoint =
+    match Storage.ChainDB.get_utxo t.db outpoint.Types.txid
+            (Int32.to_int outpoint.vout) with
+    | None -> None
+    | Some data -> Some (deserialize_coin data)
+
+  let have_coin t outpoint =
+    Option.is_some (get_coin t outpoint)
+
+  let add_coin t outpoint coin ~possible_overwrite:_ =
+    let data = serialize_coin coin in
+    Storage.ChainDB.store_utxo t.db outpoint.Types.txid
+      (Int32.to_int outpoint.vout) data
+
+  let spend_coin t outpoint =
+    let existing = get_coin t outpoint in
+    if Option.is_some existing then
+      Storage.ChainDB.delete_utxo t.db outpoint.Types.txid
+        (Int32.to_int outpoint.vout);
+    existing
+
+  let flush _t = Lwt.return 0  (* No-op for DB view *)
+
+  let memory_usage _t = 0  (* DB doesn't contribute to memory pressure *)
+end
+
+(** Outpoint hashing for use in Hashtbl *)
+let outpoint_to_key (op : Types.outpoint) : string =
+  let w = Serialize.writer_create () in
+  Serialize.write_bytes w op.txid;
+  Serialize.write_int32_le w op.vout;
+  Cstruct.to_string (Serialize.writer_to_cstruct w)
+
+(** Default max cache size: 450MB worth of entries.
+    Assuming ~100 bytes per entry average, this is ~4.5M entries. *)
+let default_max_cache_bytes = 450 * 1024 * 1024
+
+(** Estimate memory usage of a single coin entry *)
+let coin_memory_size (c : coin) : int =
+  (* Base overhead + txout value (8) + script_pubkey + height (8) + bool (1) *)
+  32 + 8 + Cstruct.length c.txout.script_pubkey + 8 + 1
+
+(** Estimate memory usage of a cache entry *)
+let entry_memory_size = function
+  | Fresh c -> 8 + coin_memory_size c  (* tag + coin *)
+  | Dirty c -> 8 + coin_memory_size c
+  | Erased -> 8  (* just the tag *)
+
+(** Layered UTXO cache with parent view abstraction.
+    Accumulates changes in memory and flushes to parent when:
+    - Cache exceeds max_size (default 450MB)
+    - flush is explicitly called (e.g., on shutdown)
+    - A sync point is reached (e.g., every N blocks) *)
+module UtxoCache = struct
+  type t = {
+    entries : (string, cache_entry) Hashtbl.t;
+    parent : DbView.t;
+    max_size : int;
+    mutable memory_usage : int;
+    mutable stats : cache_stats;
+  }
+
+  and cache_stats = {
+    mutable hits : int;
+    mutable misses : int;
+    mutable fresh_count : int;
+    mutable dirty_count : int;
+    mutable erased_count : int;
+  }
+
+  let create ?(max_size = default_max_cache_bytes) parent =
+    {
+      entries = Hashtbl.create 100_000;
+      parent;
+      max_size;
+      memory_usage = 0;
+      stats = {
+        hits = 0; misses = 0;
+        fresh_count = 0; dirty_count = 0; erased_count = 0;
+      };
+    }
+
+  (** Get a coin from cache, falling back to parent if needed. *)
+  let get_coin t outpoint =
+    let key = outpoint_to_key outpoint in
+    match Hashtbl.find_opt t.entries key with
+    | Some Erased ->
+      (* Marked as spent in cache *)
+      t.stats.hits <- t.stats.hits + 1;
+      None
+    | Some (Fresh coin) | Some (Dirty coin) ->
+      t.stats.hits <- t.stats.hits + 1;
+      Some coin
+    | None ->
+      (* Not in cache, check parent *)
+      t.stats.misses <- t.stats.misses + 1;
+      match DbView.get_coin t.parent outpoint with
+      | None -> None
+      | Some coin ->
+        (* Cache the result from parent as Dirty (it exists in parent) *)
+        let entry = Dirty coin in
+        let mem = entry_memory_size entry in
+        Hashtbl.replace t.entries key entry;
+        t.memory_usage <- t.memory_usage + mem;
+        t.stats.dirty_count <- t.stats.dirty_count + 1;
+        Some coin
+
+  let have_coin t outpoint =
+    Option.is_some (get_coin t outpoint)
+
+  (** Add a coin to the cache.
+      Fresh if not in parent, Dirty otherwise. *)
+  let add_coin t outpoint coin ~possible_overwrite =
+    let key = outpoint_to_key outpoint in
+    let entry =
+      (* Check if it exists in parent to determine Fresh vs Dirty *)
+      match Hashtbl.find_opt t.entries key with
+      | Some (Fresh _) ->
+        (* Re-adding a fresh entry - keep as Fresh *)
+        Fresh coin
+      | Some (Dirty _) | Some Erased ->
+        (* Modifying a dirty/erased entry - mark as Dirty *)
+        Dirty coin
+      | None ->
+        (* New entry - check parent *)
+        if possible_overwrite || not (DbView.have_coin t.parent outpoint) then
+          Fresh coin
+        else
+          Dirty coin
+    in
+    (* Update memory tracking *)
+    let old_mem = match Hashtbl.find_opt t.entries key with
+      | Some e -> entry_memory_size e
+      | None -> 0
+    in
+    let new_mem = entry_memory_size entry in
+    t.memory_usage <- t.memory_usage - old_mem + new_mem;
+    (* Update stats *)
+    (match Hashtbl.find_opt t.entries key with
+     | Some (Fresh _) -> t.stats.fresh_count <- t.stats.fresh_count - 1
+     | Some (Dirty _) -> t.stats.dirty_count <- t.stats.dirty_count - 1
+     | Some Erased -> t.stats.erased_count <- t.stats.erased_count - 1
+     | None -> ());
+    (match entry with
+     | Fresh _ -> t.stats.fresh_count <- t.stats.fresh_count + 1
+     | Dirty _ -> t.stats.dirty_count <- t.stats.dirty_count + 1
+     | Erased -> t.stats.erased_count <- t.stats.erased_count + 1);
+    Hashtbl.replace t.entries key entry
+
+  (** Spend a coin, returning the spent coin if it existed. *)
+  let spend_coin t outpoint =
+    let key = outpoint_to_key outpoint in
+    match Hashtbl.find_opt t.entries key with
+    | Some (Fresh coin) ->
+      (* Fresh coin can be deleted entirely - no need to remember *)
+      t.memory_usage <- t.memory_usage - entry_memory_size (Fresh coin);
+      t.stats.fresh_count <- t.stats.fresh_count - 1;
+      Hashtbl.remove t.entries key;
+      Some coin
+    | Some (Dirty coin) ->
+      (* Must keep as Erased to propagate deletion to parent *)
+      let old_mem = entry_memory_size (Dirty coin) in
+      let new_mem = entry_memory_size Erased in
+      t.memory_usage <- t.memory_usage - old_mem + new_mem;
+      t.stats.dirty_count <- t.stats.dirty_count - 1;
+      t.stats.erased_count <- t.stats.erased_count + 1;
+      Hashtbl.replace t.entries key Erased;
+      Some coin
+    | Some Erased ->
+      (* Already spent *)
+      None
+    | None ->
+      (* Not in cache, fetch from parent then mark as erased *)
+      match DbView.get_coin t.parent outpoint with
+      | None -> None
+      | Some coin ->
+        (* Mark as Erased (exists in parent, needs deletion on flush) *)
+        let mem = entry_memory_size Erased in
+        Hashtbl.replace t.entries key Erased;
+        t.memory_usage <- t.memory_usage + mem;
+        t.stats.erased_count <- t.stats.erased_count + 1;
+        Some coin
+
+  (** Flush all changes to parent view.
+      Fresh/Dirty entries are written, Erased entries are deleted.
+      Returns the number of entries flushed. *)
+  let flush t =
+    let open Lwt.Syntax in
+    let count = Hashtbl.length t.entries in
+    if count = 0 then Lwt.return 0
+    else begin
+      let batch = Storage.ChainDB.batch_create () in
+      Hashtbl.iter (fun key entry ->
+        (* Extract outpoint from key *)
+        let key_cs = Cstruct.of_string key in
+        let txid = Cstruct.sub key_cs 0 32 in
+        let vout = Int32.to_int (Cstruct.LE.get_uint32 key_cs 32) in
+        match entry with
+        | Fresh coin | Dirty coin ->
+          let data = DbView.serialize_coin coin in
+          Storage.ChainDB.batch_store_utxo batch txid vout data
+        | Erased ->
+          Storage.ChainDB.batch_delete_utxo batch txid vout
+      ) t.entries;
+      (* Write batch to parent's database *)
+      Storage.ChainDB.batch_write (DbView.db t.parent) batch;
+      (* Clear the cache *)
+      Hashtbl.clear t.entries;
+      t.memory_usage <- 0;
+      t.stats.fresh_count <- 0;
+      t.stats.dirty_count <- 0;
+      t.stats.erased_count <- 0;
+      let* () = Lwt.pause () in  (* Yield to async scheduler *)
+      Logs.debug (fun m -> m "Flushed %d UTXO cache entries to disk" count);
+      Lwt.return count
+    end
+
+  (** Check if cache needs flushing based on memory usage *)
+  let needs_flush t =
+    t.memory_usage > t.max_size
+
+  (** Flush if cache exceeds max_size threshold *)
+  let maybe_flush t =
+    if needs_flush t then flush t
+    else Lwt.return 0
+
+  (** Get current memory usage estimate in bytes *)
+  let memory_usage t = t.memory_usage
+
+  (** Get cache statistics *)
+  let get_stats t = t.stats
+
+  (** Get entry count *)
+  let entry_count t = Hashtbl.length t.entries
+
+  (** Clear cache without flushing (use with caution - loses changes!) *)
+  let clear t =
+    Hashtbl.clear t.entries;
+    t.memory_usage <- 0;
+    t.stats <- {
+      hits = 0; misses = 0;
+      fresh_count = 0; dirty_count = 0; erased_count = 0;
+    }
+
+  (** Cache hit rate *)
+  let hit_rate t =
+    let total = t.stats.hits + t.stats.misses in
+    if total = 0 then 1.0
+    else float_of_int t.stats.hits /. float_of_int total
+end
+
+(** Convert a utxo_entry (legacy type) to coin (new type) *)
+let coin_of_utxo_entry (e : utxo_entry) : coin =
+  { txout = { Types.value = e.value; script_pubkey = e.script_pubkey };
+    height = e.height;
+    is_coinbase = e.is_coinbase }
+
+(** Convert a coin (new type) to utxo_entry (legacy type) *)
+let utxo_entry_of_coin (c : coin) : utxo_entry =
+  { value = c.txout.value;
+    script_pubkey = c.txout.script_pubkey;
+    height = c.height;
+    is_coinbase = c.is_coinbase }

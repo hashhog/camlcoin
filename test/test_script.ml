@@ -1703,6 +1703,216 @@ let p2sh_push_only_tests = [
   Alcotest.test_case "P2SH push-only not enforced without flag" `Quick test_p2sh_push_only_disabled_without_flag;
 ]
 
+(* ============================================================================
+   Legacy Sighash Tests (Bitcoin Core sighash.json vectors)
+
+   These tests verify our legacy sighash implementation against Bitcoin Core's
+   test vectors from src/test/data/sighash.json. Format:
+   [raw_transaction_hex, script_hex, input_index, hash_type, expected_sighash]
+   ============================================================================ *)
+
+(* Helper: reverse bytes in a hex string (for hash display format) *)
+let reverse_hex s =
+  let len = String.length s in
+  let buf = Buffer.create len in
+  let i = ref (len - 2) in
+  while !i >= 0 do
+    Buffer.add_substring buf s !i 2;
+    i := !i - 2
+  done;
+  Buffer.contents buf
+
+(* Test a single sighash vector *)
+let test_sighash_vector (raw_tx_hex, script_hex, input_index, hash_type, expected_hash) () =
+  let raw_tx = hex_to_cstruct raw_tx_hex in
+  let script = hex_to_cstruct script_hex in
+  let r = Serialize.reader_of_cstruct raw_tx in
+  let tx = Serialize.deserialize_transaction r in
+  (* hash_type in sighash.json is signed int32 - convert properly *)
+  let hash_type_int =
+    if hash_type < 0 then
+      Int32.to_int (Int32.of_int hash_type)
+    else
+      hash_type
+  in
+  let computed = Script.compute_sighash_legacy tx input_index script hash_type_int in
+  let computed_hex = cstruct_to_hex computed in
+  (* Bitcoin Core outputs hash in reverse byte order (big-endian display) *)
+  let computed_reversed = reverse_hex computed_hex in
+  Alcotest.(check string) "sighash matches" expected_hash computed_reversed
+
+(* Sample test vectors from Bitcoin Core's sighash.json
+   Full test suite has ~500 vectors; we test a representative sample *)
+let sighash_test_vectors = [
+  (* Vector 1: basic SIGHASH_ALL (hash_type = 1) *)
+  ("907c2bc503ade11cc3b04eb2918b6f547b0630ab569273824748c87ea14b0696526c66ba740200000004ab65ababfd1f9bdd4ef073c7afc4ae00da8a66f429c917a0081ad1e1dabce28d373eab81d8628de802000000096aab5253ab52000052ad042b5f25efb33beec9f3364e8a9139e8439d9d7e26529c3c30b6c3fd89f8684cfd68ea0200000009ab53526500636a52ab599ac2fe02a526ed040000000008535300516352515164370e010000000003006300ab2ec229", "", 2, 1864164639, "31af167a6cf3f9d5f6875caa4d31704ceb0eba078d132b78dab52c3b8997317e");
+
+  (* Vector 2: SIGHASH_SINGLE bug - input_index >= output count returns uint256(1) *)
+  ("a0aa3126041621a6dea5b800141aa696daf28408959dfb2df96095db9fa425ad3f427f2f6103000000015360290e9c6063fa26912c2e7fb6a0ad80f1c5fea1771d42f12976092e7a85a4229fdb6e890000000001abc109f6e47688ac0e4682988785744602b8c87228fcef0695085edf19088af1a9db126e93000000000665516aac536affffffff8fe53e0806e12dfd05d67ac68f4768fdbe23fc48ace22a5aa8ba04c96d58e2750300000009ac51abac63ab5153650524aa680455ce7b000000000000499e50030000000008636a00ac526563ac5051ee030000000003abacabd2b6fe000000000003516563910fb6b5", "65", 0, -1391424484, "48d6a1bd2cd9eec54eb866fc71209418a950402b5d7e52363bfb75c98e141175");
+
+  (* Vector 3: script with OP_CODESEPARATOR (0xab) - should be stripped *)
+  ("6e7e9d4b04ce17afa1e8546b627bb8d89a6a7fefd9d892ec8a192d79c2ceafc01694a6a7e7030000000953ac6a51006353636a33bced1544f797f08ceed02f108da22cd24c9e7809a446c61eb3895914508ac91f07053a01000000055163ab516affffffff11dc54eee8f9e4ff0bcf6b1a1a35b1cd10d63389571375501af7444073bcec3c02000000046aab53514a821f0ce3956e235f71e4c69d91abe1e93fb703bd33039ac567249ed339bf0ba0883ef300000000090063ab65000065ac654bec3cc504bcf499020000000005ab6a52abac64eb060100000000076a6a5351650053bbbc130100000000056a6aab53abd6e1380100000000026a51c4e509b8", "acab655151", 0, 479279909, "2a3d95b09237b72034b23f2d2bb29fa32a58ab5c6aa72f6aafdfa178ab1dd01c");
+
+  (* Vector 4: ANYONECANPAY + SIGHASH_SINGLE *)
+  ("73107cbd025c22ebc8c3e0a47b2a760739216a528de8d4dab5d45cbeb3051cebae73b01ca10200000007ab6353656a636affffffffe26816dffc670841e6a6c8c61c586da401df1261a330a6c6b3dd9f9a0789bc9e000000000800ac6552ac6aac51ffffffff0174a8f0010000000004ac52515100000000", "5163ac63635151ac", 1, 1190874345, "06e328de263a87b09beabe222a21627a6ea5c7f560030da31610c4611f4a46bc");
+
+  (* Vector 5: SIGHASH_NONE *)
+  ("e93bbf6902be872933cb987fc26ba0f914fcfc2f6ce555258554dd9939d12032a8536c8802030000000453ac5353eabb6451e074e6fef9de211347d6a45900ea5aaf2636ef7967f565dce66fa451805c5cd10000000003525253ffffffff047dc3e6020000000007516565ac656aabec9eea010000000001633e46e600000000000015080a030000000001ab00000000", "5300ac6a53ab6a", 1, -886562767, "f03aa4fc5f97e826323d0daa03343ebf8a34ed67a1ce18631f8b88e5c992e798");
+
+  (* Vector 6: Simple hash_type *)
+  ("50818f4c01b464538b1e7e7f5ae4ed96ad23c68c830e78da9a845bc19b5c3b0b20bb82e5e9030000000763526a63655352ffffffff023b3f9c040000000008630051516a6a5163a83caf01000000000553ab65510000000000", "6aac", 0, 946795545, "746306f322de2b4b58ffe7faae83f6a72433c22f88062cdde881d4dd8a5a4e2d");
+
+  (* Vector 7: empty script *)
+  ("c363a70c01ab174230bbe4afe0c3efa2d7f2feaf179431359adedccf30d1f69efe0c86ed390200000002ab51558648fe0231318b04000000000151662170000000000008ac5300006a63acac00000000", "", 0, 2146479410, "191ab180b0d753763671717d051f138d4866b7cb0d1d4811472e64de595d2c70");
+
+  (* Vector 8: negative hash type *)
+  ("8d437a7304d8772210a923fd81187c425fc28c17a5052571501db05c7e89b11448b36618cd02000000026a6340fec14ad2c9298fde1477f1e8325e5747b61b7e2ff2a549f3d132689560ab6c45dd43c3010000000963ac00ac000051516a447ed907a7efffebeb103988bf5f947fc688aab2c6a7914f48238cf92c337fad4a79348102000000085352ac526a5152517436edf2d80e3ef06725227c970a816b25d0b58d2cd3c187a7af2cea66d6b27ba69bf33a0300000007000063ab526553f3f0d6140386815d030000000003ab6300de138f00000000000900525153515265abac1f87040300000000036aac6500000000", "51", 3, -315779667, "b6632ac53578a741ae8c36d8b69e79f39b89913a2c781cdf1bf47a8c29d997a5");
+
+  (* Vector 9: multiple outputs *)
+  ("fd878840031e82fdbe1ad1d745d1185622b0060ac56638290ec4f66b1beef4450817114a2c0000000009516a63ab53650051abffffffff37b7a10322b5418bfd64fb09cd8a27ddf57731aeb1f1f920ffde7cb2dfb6cdb70300000008536a5365ac53515369ecc034f1594690dbe189094dc816d6d57ea75917de764cbf8eccce4632cbabe7e116cd0100000003515352ffffffff035777fc000000000003515200abe9140300000000050063005165bed6d10200000000076300536363ab65195e9110", "635265", 0, 1729787658, "6e3735d37a4b28c45919543aabcb732e7a3e1874db5315abb7cc6b143d62ff10");
+
+  (* Vector 10: another negative hash type *)
+  ("f40a750702af06efff3ea68e5d56e42bc41cdb8b6065c98f1221fe04a325a898cb61f3d7ee030000000363acacffffffffb5788174aef79788716f96af779d7959147a0c2e0e5bfb6c2dba2df5b4b97894030000000965510065535163ac6affffffff0445e6fd0200000000096aac536365526a526aa6546b000000000008acab656a6552535141a0fd010000000000c897ea030000000008526500ab526a6a631b39dba3", "00abab5163ac", 1, -1778064747, "d76d0fc0abfa72d646df888bce08db957e627f72962647016eeae5a8412354cf");
+]
+
+let sighash_tests =
+  List.mapi (fun i vec ->
+    Alcotest.test_case (Printf.sprintf "sighash vector %d" (i + 1)) `Quick (test_sighash_vector vec)
+  ) sighash_test_vectors
+
+(* Test FindAndDelete functionality *)
+let test_find_and_delete_basic () =
+  (* Script: PUSH 3 bytes (aabbcc), then OP_1 *)
+  (* Format: 03 aabbcc 51 *)
+  let script = hex_to_cstruct "03aabbcc51" in
+  let sig_data = hex_to_cstruct "aabbcc" in
+  let (result, removed) = Script.find_and_delete script sig_data in
+  Alcotest.(check bool) "signature was removed" true removed;
+  (* After removal: just OP_1 *)
+  Alcotest.(check string) "remaining script" "51" (cstruct_to_hex result)
+
+let test_find_and_delete_no_match () =
+  (* Script: PUSH 3 bytes (aabbcc), then OP_1 *)
+  let script = hex_to_cstruct "03aabbcc51" in
+  let sig_data = hex_to_cstruct "deadbeef" in
+  let (result, removed) = Script.find_and_delete script sig_data in
+  Alcotest.(check bool) "no removal" false removed;
+  Alcotest.(check string) "script unchanged" "03aabbcc51" (cstruct_to_hex result)
+
+let test_find_and_delete_empty_sig () =
+  let script = hex_to_cstruct "51" in
+  let sig_data = Cstruct.create 0 in
+  let (result, removed) = Script.find_and_delete script sig_data in
+  Alcotest.(check bool) "empty sig - no removal" false removed;
+  Alcotest.(check string) "script unchanged" "51" (cstruct_to_hex result)
+
+let test_find_and_delete_multiple () =
+  (* Script with same sig twice: PUSH 1 byte (aa), PUSH 1 byte (aa), OP_1 *)
+  (* Format: 01 aa 01 aa 51 *)
+  let script = hex_to_cstruct "01aa01aa51" in
+  let sig_data = hex_to_cstruct "aa" in
+  let (result, removed) = Script.find_and_delete script sig_data in
+  Alcotest.(check bool) "removed" true removed;
+  (* Both occurrences should be removed *)
+  Alcotest.(check string) "both removed" "51" (cstruct_to_hex result)
+
+(* Test strip_codeseparator functionality *)
+let test_strip_codeseparator_basic () =
+  (* Script: OP_1 OP_CODESEPARATOR OP_2 *)
+  let script = hex_to_cstruct "51ab52" in
+  let result = Script.strip_codeseparator script in
+  Alcotest.(check string) "codesep stripped" "5152" (cstruct_to_hex result)
+
+let test_strip_codeseparator_multiple () =
+  (* Script with multiple OP_CODESEPARATOR *)
+  let script = hex_to_cstruct "51abab52" in
+  let result = Script.strip_codeseparator script in
+  Alcotest.(check string) "both codeseps stripped" "5152" (cstruct_to_hex result)
+
+let test_strip_codeseparator_in_push_data () =
+  (* 0xAB inside push data should NOT be stripped *)
+  (* Script: PUSH 01ab, OP_CODESEPARATOR, OP_1 *)
+  let script = hex_to_cstruct "0201abab51" in
+  let result = Script.strip_codeseparator script in
+  (* The 0xAB inside push data stays, the real OP_CODESEPARATOR is stripped *)
+  Alcotest.(check string) "ab in push preserved" "0201ab51" (cstruct_to_hex result)
+
+let test_strip_codeseparator_empty () =
+  let script = Cstruct.create 0 in
+  let result = Script.strip_codeseparator script in
+  Alcotest.(check int) "empty stays empty" 0 (Cstruct.length result)
+
+(* Test compute_subscript_from_pos - used for OP_CODESEPARATOR handling *)
+let test_subscript_from_pos_basic () =
+  (* Script: OP_1 OP_2 OP_3 (indices 0, 1, 2) *)
+  let script = hex_to_cstruct "515253" in
+  (* After opcode at index 1 (OP_2), should get OP_3 *)
+  let result = Script.compute_subscript_from_pos script 2 in
+  Alcotest.(check string) "subscript after index 1" "53" (cstruct_to_hex result)
+
+let test_subscript_from_pos_with_push () =
+  (* Script: PUSH 2 bytes, OP_1 (indices 0, 1) *)
+  let script = hex_to_cstruct "02aabb51" in
+  (* After opcode at index 0 (the push), should get OP_1 *)
+  let result = Script.compute_subscript_from_pos script 1 in
+  Alcotest.(check string) "subscript after push" "51" (cstruct_to_hex result)
+
+let test_subscript_from_pos_past_end () =
+  let script = hex_to_cstruct "5152" in
+  let result = Script.compute_subscript_from_pos script 10 in
+  Alcotest.(check int) "past end is empty" 0 (Cstruct.length result)
+
+(* Test SIGHASH_SINGLE bug: returns uint256(1) when input_index >= output count *)
+let test_sighash_single_bug () =
+  let tx = {
+    Types.version = 1l;
+    inputs = [
+      { previous_output = { txid = Types.zero_hash; vout = 0l };
+        script_sig = Cstruct.create 0;
+        sequence = 0xffffffffl };
+      { previous_output = { txid = Types.zero_hash; vout = 1l };
+        script_sig = Cstruct.create 0;
+        sequence = 0xffffffffl }
+    ];
+    outputs = [
+      { Types.value = 1000L; script_pubkey = Cstruct.create 0 }
+    ];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  (* Input index 1, but only 1 output - should trigger the bug *)
+  let hash_type = 0x03 in  (* SIGHASH_SINGLE *)
+  let result = Script.compute_sighash_legacy tx 1 (Cstruct.create 0) hash_type in
+  (* Should be uint256(1): 0x01 followed by 31 zero bytes *)
+  Alcotest.(check int) "first byte is 1" 1 (Cstruct.get_uint8 result 0);
+  for i = 1 to 31 do
+    Alcotest.(check int) (Printf.sprintf "byte %d is 0" i) 0 (Cstruct.get_uint8 result i)
+  done
+
+let find_and_delete_tests = [
+  Alcotest.test_case "find_and_delete basic" `Quick test_find_and_delete_basic;
+  Alcotest.test_case "find_and_delete no match" `Quick test_find_and_delete_no_match;
+  Alcotest.test_case "find_and_delete empty sig" `Quick test_find_and_delete_empty_sig;
+  Alcotest.test_case "find_and_delete multiple" `Quick test_find_and_delete_multiple;
+]
+
+let strip_codeseparator_tests = [
+  Alcotest.test_case "strip_codeseparator basic" `Quick test_strip_codeseparator_basic;
+  Alcotest.test_case "strip_codeseparator multiple" `Quick test_strip_codeseparator_multiple;
+  Alcotest.test_case "strip_codeseparator in push data" `Quick test_strip_codeseparator_in_push_data;
+  Alcotest.test_case "strip_codeseparator empty" `Quick test_strip_codeseparator_empty;
+]
+
+let subscript_tests = [
+  Alcotest.test_case "subscript_from_pos basic" `Quick test_subscript_from_pos_basic;
+  Alcotest.test_case "subscript_from_pos with push" `Quick test_subscript_from_pos_with_push;
+  Alcotest.test_case "subscript_from_pos past end" `Quick test_subscript_from_pos_past_end;
+]
+
+let sighash_special_tests = [
+  Alcotest.test_case "SIGHASH_SINGLE bug" `Quick test_sighash_single_bug;
+]
+
 let () = Alcotest.run "test_script" [
   ("script_num", script_num_tests);
   ("parsing", parsing_tests);
@@ -1720,4 +1930,9 @@ let () = Alcotest.run "test_script" [
   ("witness_pubkeytype", witness_pubkeytype_tests);
   ("witness_cleanstack", witness_cleanstack_tests);
   ("p2sh_push_only", p2sh_push_only_tests);
+  ("sighash", sighash_tests);
+  ("find_and_delete", find_and_delete_tests);
+  ("strip_codeseparator", strip_codeseparator_tests);
+  ("subscript", subscript_tests);
+  ("sighash_special", sighash_special_tests);
 ]

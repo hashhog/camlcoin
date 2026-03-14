@@ -112,6 +112,12 @@ let compute_tx_weight (tx : Types.transaction) : int =
 let compute_tx_vsize (tx : Types.transaction) : int =
   (compute_tx_weight tx + 3) / 4
 
+(* Compute the full serialized size of a transaction including witness data *)
+let compute_tx_size (tx : Types.transaction) : int =
+  let w = Serialize.writer_create () in
+  Serialize.serialize_transaction w tx;
+  Cstruct.length (Serialize.writer_to_cstruct w)
+
 (* ============================================================================
    Basic Transaction Validation
    ============================================================================ *)

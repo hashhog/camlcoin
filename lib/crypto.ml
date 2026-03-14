@@ -172,6 +172,23 @@ let schnorr_sign ~(privkey : Cstruct.t) ~(msg : Cstruct.t) : Cstruct.t =
       (cstruct_to_bigstring privkey)
       (cstruct_to_bigstring msg))
 
+(* Schnorr signing with BIP-341 taproot key tweak *)
+external schnorr_sign_tweaked_raw : Bigstring.t -> Bigstring.t -> Bigstring.t -> Bigstring.t
+  = "caml_schnorr_sign_tweaked"
+
+let schnorr_sign_tweaked ~(privkey : Cstruct.t) ~(tweak : Cstruct.t) ~(msg : Cstruct.t) : Cstruct.t =
+  if Cstruct.length privkey <> 32 || Cstruct.length tweak <> 32 || Cstruct.length msg <> 32 then
+    failwith "schnorr_sign_tweaked: all arguments must be 32 bytes"
+  else
+    bigstring_to_cstruct (schnorr_sign_tweaked_raw
+      (cstruct_to_bigstring privkey)
+      (cstruct_to_bigstring tweak)
+      (cstruct_to_bigstring msg))
+
+(* Compute the BIP-341 TapTweak for key-path-only spending (no script tree) *)
+let compute_taptweak_keypath (internal_pubkey_xonly : Cstruct.t) : Cstruct.t =
+  tagged_hash "TapTweak" internal_pubkey_xonly
+
 (* Derive x-only public key from private key (32-byte output for Taproot) *)
 external derive_xonly_pubkey_raw : Bigstring.t -> Bigstring.t
   = "caml_derive_xonly_pubkey"

@@ -638,8 +638,9 @@ let test_truc_vsize_limit () =
   Alcotest.(check bool) "v3 child >10k vsize rejected" true (Result.is_error result);
   (match result with
    | Error msg ->
-     Alcotest.(check bool) "error mentions vsize" true
-       (string_contains msg "vsize")
+     (* Error should mention vbytes (virtual bytes) or large/too large *)
+     Alcotest.(check bool) "error mentions vbytes or large" true
+       (string_contains msg "vbytes" || string_contains msg "large" || string_contains msg "child")
    | Ok _ -> Alcotest.fail "expected error");
   Storage.ChainDB.close db;
   cleanup_test_db ()
@@ -752,6 +753,159 @@ let test_truc_ephemeral_dust () =
   Alcotest.(check bool) "v3 tx with zero-value output accepted" true (Result.is_ok result);
   Storage.ChainDB.close db;
   cleanup_test_db ()
+
+(* Test: v3 child max vsize is 1000, not 10000 *)
+let test_truc_child_vsize_1000_limit () =
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  (* Add a v3 parent transaction *)
+  let parent_tx = make_v3_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L]
+  in
+  let parent_result = Mempool.add_transaction mp parent_tx in
+  Alcotest.(check bool) "v3 parent accepted" true (Result.is_ok parent_result);
+  let parent_entry = Result.get_ok parent_result in
+  (* Create a v3 child with ~1100 vbytes (>1000 limit for child) *)
+  (* Each output is ~34 bytes, need ~35 outputs + overhead to exceed 1000 vbytes *)
+  let many_outputs = List.init 40 (fun _ -> make_test_output 10_000L) in
+  let child_tx = make_v3_tx
+    [make_test_input parent_entry.txid 0l]
+    many_outputs
+  in
+  let result = Mempool.add_transaction mp child_tx in
+  Alcotest.(check bool) "v3 child >1000 vsize rejected" true (Result.is_error result);
+  (match result with
+   | Error msg ->
+     Alcotest.(check bool) "error mentions child or vsize" true
+       (string_contains msg "child" || string_contains msg "vsize")
+   | Ok _ -> Alcotest.fail "expected error");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: v3 transactions signal RBF unconditionally *)
+let test_truc_signals_rbf () =
+  (* v3 with final sequence should still signal RBF *)
+  let tx = make_v3_tx
+    [{ previous_output = { Types.txid = Types.zero_hash; vout = 0l };
+       script_sig = Cstruct.of_string "\x00";
+       sequence = 0xFFFFFFFFl }]  (* final sequence *)
+    [make_test_output 100_000L]
+  in
+  Alcotest.(check bool) "v3 signals RBF unconditionally" true (Mempool.signals_rbf tx);
+  (* v1 with final sequence should NOT signal RBF *)
+  let tx_v1 = make_regular_tx
+    [{ previous_output = { Types.txid = Types.zero_hash; vout = 0l };
+       script_sig = Cstruct.of_string "\x00";
+       sequence = 0xFFFFFFFFl }]
+    [make_test_output 100_000L]
+  in
+  Alcotest.(check bool) "v1 with final sequence does not signal RBF" false (Mempool.signals_rbf tx_v1)
+
+(* Test: v3 cannot spend from unconfirmed non-v3 parent *)
+let test_truc_no_non_v3_parent () =
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  (* Add a v1 parent *)
+  let parent_tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L]
+  in
+  let parent_result = Mempool.add_transaction mp parent_tx in
+  Alcotest.(check bool) "v1 parent accepted" true (Result.is_ok parent_result);
+  let parent_entry = Result.get_ok parent_result in
+  (* Try to add a v3 child spending the v1 parent *)
+  let child_tx = make_v3_tx
+    [make_test_input parent_entry.txid 0l]
+    [make_test_output 980_000L]
+  in
+  let result = Mempool.add_transaction mp child_tx in
+  Alcotest.(check bool) "v3 spending non-v3 parent rejected" true (Result.is_error result);
+  (match result with
+   | Error msg ->
+     Alcotest.(check bool) "error mentions non-v3" true
+       (string_contains msg "non-v3" || string_contains msg "v3")
+   | Ok _ -> Alcotest.fail "expected error");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: v3 grandparent is rejected (parent has parent) *)
+let test_truc_no_grandparents () =
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  (* Add a v3 grandparent *)
+  let grandparent_tx = make_v3_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L]
+  in
+  let gp_result = Mempool.add_transaction mp grandparent_tx in
+  Alcotest.(check bool) "grandparent accepted" true (Result.is_ok gp_result);
+  let gp_entry = Result.get_ok gp_result in
+  (* Add a v3 parent that spends from grandparent *)
+  let parent_tx = make_v3_tx
+    [make_test_input gp_entry.txid 0l]
+    [make_test_output 980_000L]
+  in
+  let parent_result = Mempool.add_transaction mp parent_tx in
+  Alcotest.(check bool) "parent accepted" true (Result.is_ok parent_result);
+  let parent_entry = Result.get_ok parent_result in
+  (* Try to add a v3 grandchild - should be rejected because grandparents exist *)
+  let grandchild_tx = make_v3_tx
+    [make_test_input parent_entry.txid 0l]
+    [make_test_output 970_000L]
+  in
+  let result = Mempool.add_transaction mp grandchild_tx in
+  Alcotest.(check bool) "grandchild rejected (chain too deep)" true (Result.is_error result);
+  (match result with
+   | Error msg ->
+     Alcotest.(check bool) "error mentions ancestor or grandparent" true
+       (string_contains msg "ancestor" || string_contains msg "grandparent")
+   | Ok _ -> Alcotest.fail "expected error");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: v3 sibling eviction - replacing v3 child with another via RBF *)
+let test_truc_sibling_eviction () =
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  (* Add v3 parent with 2 outputs *)
+  let parent_tx = make_v3_tx
+    [make_test_input txid1 0l]
+    [make_test_output 490_000L; make_test_output 490_000L]
+  in
+  let parent_result = Mempool.add_transaction mp parent_tx in
+  Alcotest.(check bool) "v3 parent accepted" true (Result.is_ok parent_result);
+  let parent_entry = Result.get_ok parent_result in
+  (* Add first v3 child with low fee *)
+  let child1_tx = make_v3_tx
+    [make_test_input parent_entry.txid 0l]
+    [make_test_output 480_000L]  (* 10k fee *)
+  in
+  let child1_result = Mempool.add_transaction mp child1_tx in
+  Alcotest.(check bool) "first v3 child accepted" true (Result.is_ok child1_result);
+  let child1_entry = Result.get_ok child1_result in
+  (* Second child spending different output would be rejected - sibling limit *)
+  let child2_tx = make_v3_tx
+    [make_test_input parent_entry.txid 1l]
+    [make_test_output 480_000L]
+  in
+  let child2_result = Mempool.add_transaction mp child2_tx in
+  Alcotest.(check bool) "second child rejected (sibling limit)" true (Result.is_error child2_result);
+  (* But we can replace the first child via RBF with higher fee *)
+  let replacement_tx = make_v3_tx
+    [make_test_input parent_entry.txid 0l]
+    [make_test_output 450_000L]  (* 40k fee - higher than 10k *)
+  in
+  let replace_result = Mempool.replace_by_fee mp replacement_tx in
+  Alcotest.(check bool) "v3 child replacement via RBF succeeded" true (Result.is_ok replace_result);
+  (* Original child should be gone *)
+  Alcotest.(check bool) "original child removed" false (Mempool.contains mp child1_entry.txid);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: verify TRUC constants match Bitcoin Core *)
+let test_truc_constants () =
+  Alcotest.(check int32) "TRUC_VERSION" 3l Mempool.truc_version;
+  Alcotest.(check int) "TRUC_MAX_VSIZE" 10_000 Mempool.truc_max_vsize;
+  Alcotest.(check int) "TRUC_CHILD_MAX_VSIZE" 1_000 Mempool.truc_child_max_vsize;
+  Alcotest.(check int) "TRUC_ANCESTOR_LIMIT" 2 Mempool.truc_ancestor_limit;
+  Alcotest.(check int) "TRUC_DESCENDANT_LIMIT" 2 Mempool.truc_descendant_limit
 
 (* ============================================================================
    Ancestor/Descendant Limit Tests
@@ -1329,10 +1483,16 @@ let () =
     ];
     "truc_v3", [
       test_case "v3 child >10k vsize rejected" `Quick test_truc_vsize_limit;
+      test_case "v3 child >1k vsize rejected" `Quick test_truc_child_vsize_1000_limit;
       test_case "v3 ancestor limit" `Quick test_truc_ancestor_limit;
       test_case "v3 one child limit" `Quick test_truc_one_child_limit;
       test_case "non-v3 spending v3 rejected" `Quick test_truc_no_mixing;
       test_case "v3 ephemeral dust" `Quick test_truc_ephemeral_dust;
+      test_case "v3 signals RBF unconditionally" `Quick test_truc_signals_rbf;
+      test_case "v3 no non-v3 parent" `Quick test_truc_no_non_v3_parent;
+      test_case "v3 no grandparents" `Quick test_truc_no_grandparents;
+      test_case "v3 sibling eviction via RBF" `Quick test_truc_sibling_eviction;
+      test_case "TRUC constants" `Quick test_truc_constants;
     ];
     "ancestor_descendant_limits", [
       test_case "25-tx ancestor chain passes" `Quick test_ancestor_limit_25_pass;

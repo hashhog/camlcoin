@@ -306,8 +306,25 @@ let create_block_template ~(chain : Sync.chain_state)
   let txids = List.map Crypto.compute_txid all_txs in
   let (merkle_root, _mutated) = Crypto.merkle_root txids in
 
-  (* Current timestamp *)
-  let timestamp = Int32.of_float (Unix.gettimeofday ()) in
+  (* Calculate median-time-past to ensure our timestamp is valid.
+     Collect timestamps from tip and its ancestors (up to 11 total). *)
+  let rec collect_ts acc count entry =
+    if count >= 11 then acc
+    else
+      let acc = entry.Sync.header.timestamp :: acc in
+      if entry.height = 0 then acc
+      else
+        let parent_key = Cstruct.to_string entry.header.prev_block in
+        match Hashtbl.find_opt chain.headers parent_key with
+        | Some parent -> collect_ts acc (count + 1) parent
+        | None -> acc
+  in
+  let ancestor_ts = collect_ts [] 0 tip in
+  let mtp = Consensus.median_time_past ancestor_ts in
+
+  (* Current timestamp - ensure it's greater than MTP *)
+  let now = Int32.of_float (Unix.gettimeofday ()) in
+  let timestamp = max (Int32.add mtp 1l) now in
 
   (* Use difficulty from parent (simplified - real implementation
      would check for difficulty adjustment) *)

@@ -744,6 +744,124 @@ let encryption_tests = [
   Alcotest.test_case "wrong passphrase" `Quick test_load_encrypted_wrong_passphrase;
 ]
 
+(* ============================================================================
+   Wallet Lock/Unlock Tests
+   ============================================================================ *)
+
+let test_encrypt_wallet () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let _ = Wallet.get_new_address w in
+  (* Wallet should not be encrypted initially *)
+  Alcotest.(check bool) "not encrypted" false (Wallet.is_encrypted w);
+  Alcotest.(check bool) "not locked" false (Wallet.is_locked w);
+  (* Encrypt the wallet *)
+  match Wallet.encrypt_wallet w ~passphrase:"testpass123" with
+  | Error e -> Alcotest.fail ("encrypt_wallet failed: " ^ e)
+  | Ok () ->
+    Alcotest.(check bool) "now encrypted" true (Wallet.is_encrypted w);
+    Alcotest.(check bool) "now locked" true (Wallet.is_locked w)
+
+let test_encrypt_wallet_empty_passphrase () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let _ = Wallet.get_new_address w in
+  match Wallet.encrypt_wallet w ~passphrase:"" with
+  | Error _ -> ()  (* Expected *)
+  | Ok () -> Alcotest.fail "should reject empty passphrase"
+
+let test_encrypt_wallet_already_encrypted () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let _ = Wallet.get_new_address w in
+  let _ = Wallet.encrypt_wallet w ~passphrase:"pass1" in
+  match Wallet.encrypt_wallet w ~passphrase:"pass2" with
+  | Error _ -> ()  (* Expected *)
+  | Ok () -> Alcotest.fail "should reject double encryption"
+
+let test_wallet_passphrase_correct () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let _ = Wallet.get_new_address w in
+  let _ = Wallet.encrypt_wallet w ~passphrase:"correctpass" in
+  Alcotest.(check bool) "locked after encrypt" true (Wallet.is_locked w);
+  match Wallet.wallet_passphrase w ~passphrase:"correctpass" ~timeout:60.0 with
+  | Error e -> Alcotest.fail ("unlock failed: " ^ e)
+  | Ok () ->
+    Alcotest.(check bool) "unlocked" false (Wallet.is_locked w);
+    let remaining = Wallet.wallet_unlock_remaining w in
+    Alcotest.(check bool) "time remaining" true (remaining > 0.0)
+
+let test_wallet_passphrase_wrong () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let _ = Wallet.get_new_address w in
+  let _ = Wallet.encrypt_wallet w ~passphrase:"correctpass" in
+  match Wallet.wallet_passphrase w ~passphrase:"wrongpass" ~timeout:60.0 with
+  | Ok () -> Alcotest.fail "should fail with wrong password"
+  | Error _ -> ()  (* Expected *)
+
+let test_wallet_lock () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let _ = Wallet.get_new_address w in
+  let _ = Wallet.encrypt_wallet w ~passphrase:"testpass" in
+  let _ = Wallet.wallet_passphrase w ~passphrase:"testpass" ~timeout:60.0 in
+  Alcotest.(check bool) "unlocked" false (Wallet.is_locked w);
+  Wallet.wallet_lock w;
+  Alcotest.(check bool) "locked after walletlock" true (Wallet.is_locked w);
+  let remaining = Wallet.wallet_unlock_remaining w in
+  Alcotest.(check bool) "no time remaining" true (remaining = 0.0)
+
+let test_wallet_passphrase_not_encrypted () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let _ = Wallet.get_new_address w in
+  match Wallet.wallet_passphrase w ~passphrase:"anypass" ~timeout:60.0 with
+  | Ok () -> Alcotest.fail "should fail for non-encrypted wallet"
+  | Error _ -> ()  (* Expected *)
+
+let test_wallet_passphrase_change () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let _ = Wallet.get_new_address w in
+  let _ = Wallet.encrypt_wallet w ~passphrase:"oldpass" in
+  match Wallet.wallet_passphrase_change w ~old_passphrase:"oldpass" ~new_passphrase:"newpass" with
+  | Error e -> Alcotest.fail ("passphrase change failed: " ^ e)
+  | Ok () ->
+    Alcotest.(check bool) "locked after change" true (Wallet.is_locked w);
+    (* Old passphrase should fail *)
+    (match Wallet.wallet_passphrase w ~passphrase:"oldpass" ~timeout:60.0 with
+     | Ok () -> Alcotest.fail "old passphrase should fail"
+     | Error _ -> ());
+    (* New passphrase should work *)
+    match Wallet.wallet_passphrase w ~passphrase:"newpass" ~timeout:60.0 with
+    | Error e -> Alcotest.fail ("new passphrase failed: " ^ e)
+    | Ok () -> Alcotest.(check bool) "unlocked with new pass" false (Wallet.is_locked w)
+
+let test_encryption_round_trip () =
+  (* Comprehensive test: create, encrypt, lock, unlock, verify keys work *)
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let addr1 = Wallet.get_new_address w in
+  let addr2 = Wallet.get_new_address w in
+  (* Encrypt *)
+  let _ = Wallet.encrypt_wallet w ~passphrase:"mypassword" in
+  (* Unlock *)
+  let _ = Wallet.wallet_passphrase w ~passphrase:"mypassword" ~timeout:300.0 in
+  (* Verify addresses are still valid *)
+  let addrs = Wallet.get_all_addresses w in
+  Alcotest.(check bool) "addr1 present" true (List.mem addr1 addrs);
+  Alcotest.(check bool) "addr2 present" true (List.mem addr2 addrs);
+  (* Lock and unlock again *)
+  Wallet.wallet_lock w;
+  Alcotest.(check bool) "locked" true (Wallet.is_locked w);
+  let _ = Wallet.wallet_passphrase w ~passphrase:"mypassword" ~timeout:60.0 in
+  Alcotest.(check bool) "unlocked again" false (Wallet.is_locked w)
+
+let lock_unlock_tests = [
+  Alcotest.test_case "encrypt wallet" `Quick test_encrypt_wallet;
+  Alcotest.test_case "empty passphrase rejected" `Quick test_encrypt_wallet_empty_passphrase;
+  Alcotest.test_case "already encrypted rejected" `Quick test_encrypt_wallet_already_encrypted;
+  Alcotest.test_case "correct passphrase" `Quick test_wallet_passphrase_correct;
+  Alcotest.test_case "wrong passphrase" `Quick test_wallet_passphrase_wrong;
+  Alcotest.test_case "wallet lock" `Quick test_wallet_lock;
+  Alcotest.test_case "not encrypted error" `Quick test_wallet_passphrase_not_encrypted;
+  Alcotest.test_case "change passphrase" `Quick test_wallet_passphrase_change;
+  Alcotest.test_case "encryption round trip" `Quick test_encryption_round_trip;
+]
+
 let () = Alcotest.run "test_wallet" [
   ("creation", creation_tests);
   ("key_management", key_management_tests);
@@ -755,6 +873,7 @@ let () = Alcotest.run "test_wallet" [
   ("tx_creation", tx_creation_tests);
   ("persistence", persistence_tests);
   ("encryption", encryption_tests);
+  ("lock_unlock", lock_unlock_tests);
   ("address_types", address_type_tests);
   ("bip39", bip39_tests);
 ]

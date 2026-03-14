@@ -18,7 +18,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Merkle root computation
 - [x] Address encoding (Base58Check, Bech32/Bech32m, WIF)
 - [x] Script interpreter (opcodes, stack machine, P2PKH/P2SH/P2WPKH/P2WSH/P2TR, legacy sighash with FindAndDelete/OP_CODESEPARATOR, witness cleanstack, P2SH push-only, MINIMALIF)
-- [x] Consensus parameters (difficulty, rewards, network configs)
+- [x] Consensus parameters (difficulty adjustment, testnet walk-back, BIP94, rewards)
 - [x] Storage layer (blocks, UTXOs, chain state, batch writes)
 - [x] Block and transaction validation (weight, sigops, Merkle, coinbase, BIP68 sequence locks)
 - [x] P2P message serialization (version, inv, getdata, blocks, headers, tx)

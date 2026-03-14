@@ -20,6 +20,7 @@
   (cohttp-lwt-unix (>= 5.0.0))
   (yojson (>= 2.0.0))
   (digestif (>= 1.1.0))
+  (mirage-crypto (>= 1.0.0))
   (alcotest (and (>= 1.6.0) :with-test))
   (qcheck (and (>= 0.20) :with-test))
   (qcheck-alcotest (and (>= 0.20) :with-test))

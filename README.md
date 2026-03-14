@@ -45,6 +45,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Eclipse attack protections (bucketing, multi-criteria eviction, netgroup diversity, anchors)
 - [x] Stale peer eviction (headers timeout, block stalling, ping timeout, 45s check)
 - [x] Checkpoint verification (hardcoded checkpoints, assume_valid, minimum_chain_work)
+- [x] sendrawtransaction broadcast (mempool validation, maxfeerate/maxburnamount, peer relay)
 - [ ] Compact block relay (BIP 152)
 - [ ] Bloom filters (BIP 37)
 

@@ -1083,6 +1083,53 @@ let is_push_opcode = function
   | OP_9 | OP_10 | OP_11 | OP_12 | OP_13 | OP_14 | OP_15 | OP_16 -> true
   | _ -> false
 
+(* Check if a script contains only push operations (for P2SH scriptSig).
+   This operates on raw bytes per Bitcoin Core's IsPushOnly().
+   Push opcodes are: 0x00-0x60 (OP_0 through OP_16, including all PUSHDATA variants).
+   OP_RESERVED (0x50) counts as a "push" for this purpose, though it will
+   fail during execution anyway. *)
+let is_push_only (script : Cstruct.t) : bool =
+  let len = Cstruct.length script in
+  let rec check pos =
+    if pos >= len then true
+    else
+      let op = Cstruct.get_uint8 script pos in
+      if op > 0x60 (* OP_16 *) then
+        false
+      else begin
+        (* Advance past this opcode and any associated data *)
+        let next_pos =
+          if op = 0x00 then pos + 1                    (* OP_0 *)
+          else if op >= 0x01 && op <= 0x4b then        (* Direct push N bytes *)
+            pos + 1 + op
+          else if op = 0x4c then begin                 (* OP_PUSHDATA1 *)
+            if pos + 1 >= len then len + 1             (* truncated = invalid *)
+            else
+              let data_len = Cstruct.get_uint8 script (pos + 1) in
+              pos + 2 + data_len
+          end
+          else if op = 0x4d then begin                 (* OP_PUSHDATA2 *)
+            if pos + 2 >= len then len + 1
+            else
+              let data_len = Cstruct.LE.get_uint16 script (pos + 1) in
+              pos + 3 + data_len
+          end
+          else if op = 0x4e then begin                 (* OP_PUSHDATA4 *)
+            if pos + 4 >= len then len + 1
+            else
+              let data_len = Int32.to_int (Cstruct.LE.get_uint32 script (pos + 1)) in
+              pos + 5 + data_len
+          end
+          else pos + 1                                 (* OP_1NEGATE through OP_16 *)
+        in
+        if next_pos > len then
+          false  (* Truncated push data - script is malformed, but still "push-only" pattern *)
+        else
+          check next_pos
+      end
+  in
+  check 0
+
 (* Execute a single opcode *)
 let rec exec_opcode (st : eval_state) (op : opcode) (script_code : Cstruct.t)
     : (unit, string) result =
@@ -2449,15 +2496,10 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
         end
       end
     else begin
-      (* BIP-16: P2SH requires scriptSig to be push-only *)
-      let p2sh_pushonly_ok =
-        try
-          let sig_ops = parse_script script_sig in
-          List.for_all is_push_opcode sig_ops
-        with _ -> false
-      in
-      if not p2sh_pushonly_ok then
-        Error "P2SH scriptSig must be push-only"
+      (* BIP-16: P2SH requires scriptSig to be push-only (consensus rule).
+         Use is_push_only on raw bytes per Bitcoin Core's IsPushOnly(). *)
+      if not (is_push_only script_sig) then
+        Error "SigPushOnly"
       else begin
       (* Run scriptSig *)
       let st = create_eval_state ~tx ~input_index ~amount ~flags

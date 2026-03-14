@@ -1076,6 +1076,550 @@ let deserialize_block_undo r : block_undo =
   { tx_undos }
 
 (* ============================================================================
+   Flat File Block Storage (Bitcoin Core blk/rev format)
+
+   Reference: Bitcoin Core's node/blockstorage.cpp and flatfile.cpp
+
+   Bitcoin stores blocks in sequential flat files (blk00000.dat, blk00001.dat, ...)
+   with a simple format: [magic:4][size:4][block_data:N] repeated.
+
+   This implementation:
+   - Uses blk{nnnnn}.dat files with 128MB max size
+   - Tracks file position for each block via FlatFilePos
+   - Maintains a block index (hash -> file_pos) for fast lookups
+   - Persists the index to disk for fast startup
+   ============================================================================ *)
+
+(** Maximum block file size (128 MB = 0x8000000) *)
+let max_blockfile_size = 0x8000000
+
+(** Storage header size: 4 bytes magic + 4 bytes block size *)
+let storage_header_bytes = 8
+
+(** Network magic bytes for mainnet *)
+let mainnet_magic = 0xF9BEB4D9l
+
+(** Network magic bytes for testnet4 *)
+let testnet4_magic = 0x1C163F28l
+
+(** Network magic bytes for regtest *)
+let regtest_magic = 0xDAB5BFFAl
+
+(** Position within a flat file sequence *)
+type flat_file_pos = {
+  file_num : int;   (** File number (0, 1, 2, ...) *)
+  pos : int;        (** Byte offset within the file *)
+}
+
+(** Null position indicating invalid/unset *)
+let null_pos = { file_num = -1; pos = 0 }
+
+let is_null_pos p = p.file_num < 0
+
+(** Block status flags matching Bitcoin Core *)
+type block_status =
+  | Block_valid_unknown
+  | Block_valid_header    (** Header is valid *)
+  | Block_valid_tree      (** Header connects to known chain *)
+  | Block_valid_transactions  (** Transactions are parseable *)
+  | Block_valid_chain     (** Outputs are spendable *)
+  | Block_valid_scripts   (** Scripts verified *)
+  | Block_have_data       (** Full block data available *)
+  | Block_have_undo       (** Undo data available *)
+  | Block_failed          (** Validation failed *)
+
+(** Block index entry stored for each block *)
+type block_index_entry = {
+  file_pos : flat_file_pos;
+  undo_pos : flat_file_pos;
+  height : int;
+  header : Types.block_header;
+  status : block_status list;
+  n_tx : int;  (** Number of transactions *)
+}
+
+(** File info for each blk file *)
+type block_file_info = {
+  mutable n_blocks : int;      (** Number of blocks in this file *)
+  mutable n_size : int;        (** Current size of block data *)
+  mutable n_undo_size : int;   (** Current size of undo data *)
+  mutable height_first : int;  (** Lowest block height in file *)
+  mutable height_last : int;   (** Highest block height in file *)
+  mutable time_first : int32;  (** Earliest block timestamp *)
+  mutable time_last : int32;   (** Latest block timestamp *)
+}
+
+(** Create empty file info *)
+let empty_file_info () = {
+  n_blocks = 0;
+  n_size = 0;
+  n_undo_size = 0;
+  height_first = max_int;
+  height_last = 0;
+  time_first = Int32.max_int;
+  time_last = 0l;
+}
+
+(** Flat file storage for blocks *)
+module FlatFileStorage = struct
+  type t = {
+    blocks_dir : string;
+    mutable magic : int32;  (** Network magic bytes *)
+    mutable last_file : int;
+    mutable file_info : block_file_info array;
+    block_index : (string, block_index_entry) Hashtbl.t;  (** hash -> entry *)
+    mutable dirty : bool;  (** Index needs persisting *)
+  }
+
+  (* --- Path helpers --- *)
+
+  let block_file_path t file_num =
+    Filename.concat t.blocks_dir (Printf.sprintf "blk%05d.dat" file_num)
+
+  let undo_file_path t file_num =
+    Filename.concat t.blocks_dir (Printf.sprintf "rev%05d.dat" file_num)
+
+  let index_path t =
+    Filename.concat t.blocks_dir "index.dat"
+
+  let ensure_dir path =
+    try Unix.mkdir path 0o755
+    with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
+
+  (* --- Serialization helpers --- *)
+
+  let write_le32 oc v =
+    output_byte oc (Int32.to_int (Int32.logand v 0xFFl));
+    output_byte oc (Int32.to_int (Int32.logand (Int32.shift_right_logical v 8) 0xFFl));
+    output_byte oc (Int32.to_int (Int32.logand (Int32.shift_right_logical v 16) 0xFFl));
+    output_byte oc (Int32.to_int (Int32.logand (Int32.shift_right_logical v 24) 0xFFl))
+
+  let read_le32 ic =
+    let b0 = input_byte ic in
+    let b1 = input_byte ic in
+    let b2 = input_byte ic in
+    let b3 = input_byte ic in
+    Int32.logor
+      (Int32.of_int b0)
+      (Int32.logor
+        (Int32.shift_left (Int32.of_int b1) 8)
+        (Int32.logor
+          (Int32.shift_left (Int32.of_int b2) 16)
+          (Int32.shift_left (Int32.of_int b3) 24)))
+
+  (* --- Index persistence --- *)
+
+  let serialize_pos w (p : flat_file_pos) =
+    Serialize.write_int32_le w (Int32.of_int p.file_num);
+    Serialize.write_int32_le w (Int32.of_int p.pos)
+
+  let deserialize_pos r : flat_file_pos =
+    let file_num = Int32.to_int (Serialize.read_int32_le r) in
+    let pos = Int32.to_int (Serialize.read_int32_le r) in
+    { file_num; pos }
+
+  let status_to_int = function
+    | Block_valid_unknown -> 0
+    | Block_valid_header -> 1
+    | Block_valid_tree -> 2
+    | Block_valid_transactions -> 3
+    | Block_valid_chain -> 4
+    | Block_valid_scripts -> 5
+    | Block_have_data -> 6
+    | Block_have_undo -> 7
+    | Block_failed -> 8
+
+  let int_to_status = function
+    | 0 -> Block_valid_unknown
+    | 1 -> Block_valid_header
+    | 2 -> Block_valid_tree
+    | 3 -> Block_valid_transactions
+    | 4 -> Block_valid_chain
+    | 5 -> Block_valid_scripts
+    | 6 -> Block_have_data
+    | 7 -> Block_have_undo
+    | 8 -> Block_failed
+    | _ -> Block_valid_unknown
+
+  let serialize_entry w (e : block_index_entry) =
+    serialize_pos w e.file_pos;
+    serialize_pos w e.undo_pos;
+    Serialize.write_int32_le w (Int32.of_int e.height);
+    Serialize.serialize_block_header w e.header;
+    (* Status as bitmask *)
+    let mask = List.fold_left (fun acc s ->
+      acc lor (1 lsl (status_to_int s))
+    ) 0 e.status in
+    Serialize.write_int32_le w (Int32.of_int mask);
+    Serialize.write_int32_le w (Int32.of_int e.n_tx)
+
+  let deserialize_entry r : block_index_entry =
+    let file_pos = deserialize_pos r in
+    let undo_pos = deserialize_pos r in
+    let height = Int32.to_int (Serialize.read_int32_le r) in
+    let header = Serialize.deserialize_block_header r in
+    let mask = Int32.to_int (Serialize.read_int32_le r) in
+    let status = List.filter (fun s ->
+      (mask land (1 lsl (status_to_int s))) <> 0
+    ) [Block_valid_unknown; Block_valid_header; Block_valid_tree;
+       Block_valid_transactions; Block_valid_chain; Block_valid_scripts;
+       Block_have_data; Block_have_undo; Block_failed] in
+    let n_tx = Int32.to_int (Serialize.read_int32_le r) in
+    { file_pos; undo_pos; height; header; status; n_tx }
+
+  let save_index t =
+    if not t.dirty then ()
+    else begin
+      let path = index_path t in
+      let tmp = path ^ ".tmp" in
+      let oc = open_out_bin tmp in
+      (* Header: magic, version, entry count, last_file *)
+      output_string oc "BLKIDX01";  (* Magic + version *)
+      write_le32 oc (Int32.of_int (Hashtbl.length t.block_index));
+      write_le32 oc (Int32.of_int t.last_file);
+      (* Write file info for each file *)
+      write_le32 oc (Int32.of_int (Array.length t.file_info));
+      Array.iter (fun fi ->
+        write_le32 oc (Int32.of_int fi.n_blocks);
+        write_le32 oc (Int32.of_int fi.n_size);
+        write_le32 oc (Int32.of_int fi.n_undo_size);
+        write_le32 oc (Int32.of_int fi.height_first);
+        write_le32 oc (Int32.of_int fi.height_last);
+        write_le32 oc fi.time_first;
+        write_le32 oc fi.time_last
+      ) t.file_info;
+      (* Write each entry *)
+      Hashtbl.iter (fun hash entry ->
+        (* Hash is 32 bytes *)
+        output_string oc hash;
+        let w = Serialize.writer_create () in
+        serialize_entry w entry;
+        let data = Serialize.writer_to_cstruct w in
+        write_le32 oc (Int32.of_int (Cstruct.length data));
+        output_string oc (Cstruct.to_string data)
+      ) t.block_index;
+      close_out oc;
+      Unix.rename tmp path;
+      t.dirty <- false
+    end
+
+  let load_index t =
+    let path = index_path t in
+    if not (Sys.file_exists path) then ()
+    else begin
+      let ic = open_in_bin path in
+      (try
+        let magic = really_input_string ic 8 in
+        if magic <> "BLKIDX01" then raise Exit;
+        let count = Int32.to_int (read_le32 ic) in
+        t.last_file <- Int32.to_int (read_le32 ic);
+        (* Read file info *)
+        let fi_count = Int32.to_int (read_le32 ic) in
+        t.file_info <- Array.init fi_count (fun _ ->
+          let n_blocks = Int32.to_int (read_le32 ic) in
+          let n_size = Int32.to_int (read_le32 ic) in
+          let n_undo_size = Int32.to_int (read_le32 ic) in
+          let height_first = Int32.to_int (read_le32 ic) in
+          let height_last = Int32.to_int (read_le32 ic) in
+          let time_first = read_le32 ic in
+          let time_last = read_le32 ic in
+          { n_blocks; n_size; n_undo_size; height_first; height_last;
+            time_first; time_last }
+        );
+        for _ = 1 to count do
+          let hash = really_input_string ic 32 in
+          let entry_len = Int32.to_int (read_le32 ic) in
+          let entry_data = really_input_string ic entry_len in
+          let r = Serialize.reader_of_cstruct (Cstruct.of_string entry_data) in
+          let entry = deserialize_entry r in
+          Hashtbl.replace t.block_index hash entry
+        done
+      with _ -> ());
+      close_in ic
+    end
+
+  (* --- Public API --- *)
+
+  let create ?(magic = mainnet_magic) blocks_dir =
+    ensure_dir blocks_dir;
+    let t = {
+      blocks_dir;
+      magic;
+      last_file = 0;
+      file_info = [| empty_file_info () |];
+      block_index = Hashtbl.create 10000;
+      dirty = false;
+    } in
+    load_index t;
+    t
+
+  let close t =
+    save_index t
+
+  let sync t =
+    save_index t
+
+  (** Find position for next block, potentially creating new file *)
+  let find_next_block_pos t block_size height timestamp =
+    let add_size = block_size + storage_header_bytes in
+    (* Ensure we have file_info for current file *)
+    if t.last_file >= Array.length t.file_info then begin
+      let new_arr = Array.make (t.last_file + 1) (empty_file_info ()) in
+      Array.blit t.file_info 0 new_arr 0 (Array.length t.file_info);
+      t.file_info <- new_arr
+    end;
+    (* Check if current file has space *)
+    let fi = t.file_info.(t.last_file) in
+    if fi.n_size + add_size > max_blockfile_size then begin
+      (* Move to next file *)
+      t.last_file <- t.last_file + 1;
+      let new_arr = Array.make (t.last_file + 1) (empty_file_info ()) in
+      Array.blit t.file_info 0 new_arr 0 (Array.length t.file_info);
+      t.file_info <- new_arr
+    end;
+    let file_num = t.last_file in
+    let fi = t.file_info.(file_num) in
+    let pos = fi.n_size in
+    (* Update file info *)
+    fi.n_blocks <- fi.n_blocks + 1;
+    fi.n_size <- fi.n_size + add_size;
+    if height < fi.height_first then fi.height_first <- height;
+    if height > fi.height_last then fi.height_last <- height;
+    if Int32.compare timestamp fi.time_first < 0 then fi.time_first <- timestamp;
+    if Int32.compare timestamp fi.time_last > 0 then fi.time_last <- timestamp;
+    t.dirty <- true;
+    { file_num; pos = pos + storage_header_bytes }  (* pos points past header *)
+
+  (** Write a block to disk, returns file position *)
+  let write_block t (block : Types.block) height : flat_file_pos =
+    (* Serialize the block *)
+    let w = Serialize.writer_create () in
+    Serialize.serialize_block w block;
+    let block_data = Serialize.writer_to_cstruct w in
+    let block_size = Cstruct.length block_data in
+    (* Find position *)
+    let pos = find_next_block_pos t block_size height block.header.timestamp in
+    let file_path = block_file_path t pos.file_num in
+    (* Create or open file *)
+    let flags = [Unix.O_WRONLY; Unix.O_CREAT] in
+    let fd = Unix.openfile file_path flags 0o644 in
+    (* Seek to position before header *)
+    let _ = Unix.lseek fd (pos.pos - storage_header_bytes) Unix.SEEK_SET in
+    (* Write magic and size *)
+    let header_buf = Bytes.create 8 in
+    Bytes.set header_buf 0 (Char.chr (Int32.to_int (Int32.logand t.magic 0xFFl)));
+    Bytes.set header_buf 1 (Char.chr (Int32.to_int (Int32.logand (Int32.shift_right_logical t.magic 8) 0xFFl)));
+    Bytes.set header_buf 2 (Char.chr (Int32.to_int (Int32.logand (Int32.shift_right_logical t.magic 16) 0xFFl)));
+    Bytes.set header_buf 3 (Char.chr (Int32.to_int (Int32.logand (Int32.shift_right_logical t.magic 24) 0xFFl)));
+    let size32 = Int32.of_int block_size in
+    Bytes.set header_buf 4 (Char.chr (Int32.to_int (Int32.logand size32 0xFFl)));
+    Bytes.set header_buf 5 (Char.chr (Int32.to_int (Int32.logand (Int32.shift_right_logical size32 8) 0xFFl)));
+    Bytes.set header_buf 6 (Char.chr (Int32.to_int (Int32.logand (Int32.shift_right_logical size32 16) 0xFFl)));
+    Bytes.set header_buf 7 (Char.chr (Int32.to_int (Int32.logand (Int32.shift_right_logical size32 24) 0xFFl)));
+    let _ = Unix.write fd header_buf 0 8 in
+    (* Write block data *)
+    let _ = Unix.write fd (Cstruct.to_bytes block_data) 0 block_size in
+    Unix.close fd;
+    (* Update block index *)
+    let hash = Crypto.compute_block_hash block.header in
+    let entry = {
+      file_pos = pos;
+      undo_pos = null_pos;
+      height;
+      header = block.header;
+      status = [Block_have_data; Block_valid_header];
+      n_tx = List.length block.transactions;
+    } in
+    Hashtbl.replace t.block_index (Cstruct.to_string hash) entry;
+    t.dirty <- true;
+    pos
+
+  (** Read a block from disk given its position *)
+  let read_block_at_pos t (pos : flat_file_pos) : Types.block option =
+    if is_null_pos pos then None
+    else begin
+      let file_path = block_file_path t pos.file_num in
+      if not (Sys.file_exists file_path) then None
+      else begin
+        let fd = Unix.openfile file_path [Unix.O_RDONLY] 0 in
+        (try
+          (* Seek to header position *)
+          let _ = Unix.lseek fd (pos.pos - storage_header_bytes) Unix.SEEK_SET in
+          (* Read header *)
+          let header_buf = Bytes.create 8 in
+          let n = Unix.read fd header_buf 0 8 in
+          if n <> 8 then begin
+            Unix.close fd;
+            None
+          end
+          else begin
+            (* Verify magic *)
+            let magic =
+              Int32.logor (Int32.of_int (Char.code (Bytes.get header_buf 0)))
+                (Int32.logor
+                  (Int32.shift_left (Int32.of_int (Char.code (Bytes.get header_buf 1))) 8)
+                  (Int32.logor
+                    (Int32.shift_left (Int32.of_int (Char.code (Bytes.get header_buf 2))) 16)
+                    (Int32.shift_left (Int32.of_int (Char.code (Bytes.get header_buf 3))) 24))) in
+            if not (Int32.equal magic t.magic) then begin
+              Unix.close fd;
+              None
+            end
+            else begin
+              (* Read size *)
+              let size =
+                (Char.code (Bytes.get header_buf 4))
+                lor (Char.code (Bytes.get header_buf 5) lsl 8)
+                lor (Char.code (Bytes.get header_buf 6) lsl 16)
+                lor (Char.code (Bytes.get header_buf 7) lsl 24) in
+              (* Read block data *)
+              let block_buf = Bytes.create size in
+              let n = Unix.read fd block_buf 0 size in
+              Unix.close fd;
+              if n <> size then None
+              else begin
+                let r = Serialize.reader_of_cstruct (Cstruct.of_bytes block_buf) in
+                try Some (Serialize.deserialize_block r)
+                with _ -> None
+              end
+            end
+          end
+        with _ ->
+          Unix.close fd;
+          None)
+      end
+    end
+
+  (** Read a block from disk given its hash *)
+  let read_block t (hash : Types.hash256) : Types.block option =
+    match Hashtbl.find_opt t.block_index (Cstruct.to_string hash) with
+    | None -> None
+    | Some entry -> read_block_at_pos t entry.file_pos
+
+  (** Get block index entry *)
+  let get_block_index t (hash : Types.hash256) : block_index_entry option =
+    Hashtbl.find_opt t.block_index (Cstruct.to_string hash)
+
+  (** Check if block exists *)
+  let has_block t (hash : Types.hash256) : bool =
+    Hashtbl.mem t.block_index (Cstruct.to_string hash)
+
+  (** Update block index entry (e.g., after adding undo data) *)
+  let update_block_index t (hash : Types.hash256) (entry : block_index_entry) =
+    Hashtbl.replace t.block_index (Cstruct.to_string hash) entry;
+    t.dirty <- true
+
+  (** Write undo data for a block *)
+  let write_undo t (block_hash : Types.hash256) (undo : block_undo) : flat_file_pos option =
+    match Hashtbl.find_opt t.block_index (Cstruct.to_string block_hash) with
+    | None -> None
+    | Some entry ->
+      let w = Serialize.writer_create () in
+      serialize_block_undo w undo;
+      let undo_data = Serialize.writer_to_cstruct w in
+      let undo_size = Cstruct.length undo_data in
+      let file_num = entry.file_pos.file_num in
+      (* Ensure file_info exists *)
+      if file_num >= Array.length t.file_info then begin
+        let new_arr = Array.make (file_num + 1) (empty_file_info ()) in
+        Array.blit t.file_info 0 new_arr 0 (Array.length t.file_info);
+        t.file_info <- new_arr
+      end;
+      let fi = t.file_info.(file_num) in
+      let pos = fi.n_undo_size + storage_header_bytes in
+      fi.n_undo_size <- fi.n_undo_size + undo_size + storage_header_bytes;
+      (* Write to rev file *)
+      let file_path = undo_file_path t file_num in
+      let flags = [Unix.O_WRONLY; Unix.O_CREAT] in
+      let fd = Unix.openfile file_path flags 0o644 in
+      let _ = Unix.lseek fd (pos - storage_header_bytes) Unix.SEEK_SET in
+      (* Write magic and size *)
+      let header_buf = Bytes.create 8 in
+      Bytes.set header_buf 0 (Char.chr (Int32.to_int (Int32.logand t.magic 0xFFl)));
+      Bytes.set header_buf 1 (Char.chr (Int32.to_int (Int32.logand (Int32.shift_right_logical t.magic 8) 0xFFl)));
+      Bytes.set header_buf 2 (Char.chr (Int32.to_int (Int32.logand (Int32.shift_right_logical t.magic 16) 0xFFl)));
+      Bytes.set header_buf 3 (Char.chr (Int32.to_int (Int32.logand (Int32.shift_right_logical t.magic 24) 0xFFl)));
+      let size32 = Int32.of_int undo_size in
+      Bytes.set header_buf 4 (Char.chr (Int32.to_int (Int32.logand size32 0xFFl)));
+      Bytes.set header_buf 5 (Char.chr (Int32.to_int (Int32.logand (Int32.shift_right_logical size32 8) 0xFFl)));
+      Bytes.set header_buf 6 (Char.chr (Int32.to_int (Int32.logand (Int32.shift_right_logical size32 16) 0xFFl)));
+      Bytes.set header_buf 7 (Char.chr (Int32.to_int (Int32.logand (Int32.shift_right_logical size32 24) 0xFFl)));
+      let _ = Unix.write fd header_buf 0 8 in
+      let _ = Unix.write fd (Cstruct.to_bytes undo_data) 0 undo_size in
+      Unix.close fd;
+      (* Update entry *)
+      let undo_pos = { file_num; pos } in
+      let new_entry = { entry with
+        undo_pos;
+        status = Block_have_undo :: entry.status;
+      } in
+      Hashtbl.replace t.block_index (Cstruct.to_string block_hash) new_entry;
+      t.dirty <- true;
+      Some undo_pos
+
+  (** Read undo data for a block *)
+  let read_undo t (block_hash : Types.hash256) : block_undo option =
+    match Hashtbl.find_opt t.block_index (Cstruct.to_string block_hash) with
+    | None -> None
+    | Some entry ->
+      if is_null_pos entry.undo_pos then None
+      else begin
+        let file_path = undo_file_path t entry.undo_pos.file_num in
+        if not (Sys.file_exists file_path) then None
+        else begin
+          let fd = Unix.openfile file_path [Unix.O_RDONLY] 0 in
+          (try
+            let _ = Unix.lseek fd (entry.undo_pos.pos - storage_header_bytes) Unix.SEEK_SET in
+            let header_buf = Bytes.create 8 in
+            let n = Unix.read fd header_buf 0 8 in
+            if n <> 8 then begin
+              Unix.close fd;
+              None
+            end
+            else begin
+              let size =
+                (Char.code (Bytes.get header_buf 4))
+                lor (Char.code (Bytes.get header_buf 5) lsl 8)
+                lor (Char.code (Bytes.get header_buf 6) lsl 16)
+                lor (Char.code (Bytes.get header_buf 7) lsl 24) in
+              let undo_buf = Bytes.create size in
+              let n = Unix.read fd undo_buf 0 size in
+              Unix.close fd;
+              if n <> size then None
+              else begin
+                let r = Serialize.reader_of_cstruct (Cstruct.of_bytes undo_buf) in
+                try Some (deserialize_block_undo r)
+                with _ -> None
+              end
+            end
+          with _ ->
+            Unix.close fd;
+            None)
+        end
+      end
+
+  (** Iterate over all blocks in the index *)
+  let iter_blocks t f =
+    Hashtbl.iter (fun hash_str entry ->
+      let hash = Cstruct.of_string hash_str in
+      f hash entry
+    ) t.block_index
+
+  (** Get the number of blocks in the index *)
+  let block_count t = Hashtbl.length t.block_index
+
+  (** Get file info *)
+  let get_file_info t file_num =
+    if file_num < Array.length t.file_info then
+      Some t.file_info.(file_num)
+    else
+      None
+
+  (** Get last file number *)
+  let last_file_num t = t.last_file
+end
+
+(* ============================================================================
    Chain State Management with Block Disconnect Support
    ============================================================================ *)
 

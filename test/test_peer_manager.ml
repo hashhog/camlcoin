@@ -564,6 +564,129 @@ let test_config_anchors () =
   let cfg = Peer_manager.default_config in
   Alcotest.(check int) "max anchors" 2 cfg.max_block_relay_only_anchors
 
+(* ========== Stale peer eviction tests ========== *)
+
+(* Test stale constants *)
+let test_stale_constants () =
+  Alcotest.(check (float 0.1)) "headers_timeout" 1200.0 Peer_manager.Stale.headers_timeout;
+  Alcotest.(check (float 0.1)) "headers_response" 120.0 Peer_manager.Stale.headers_response_time;
+  Alcotest.(check (float 0.1)) "block_stalling" 2.0 Peer_manager.Stale.block_stalling_timeout;
+  Alcotest.(check (float 0.1)) "block_stalling_max" 600.0 Peer_manager.Stale.block_stalling_max;
+  Alcotest.(check (float 0.1)) "ping_timeout" 1200.0 Peer_manager.Stale.ping_timeout;
+  Alcotest.(check (float 0.1)) "check_interval" 45.0 Peer_manager.Stale.stale_check_interval
+
+(* Test chain_sync_state type *)
+let test_chain_sync_state () =
+  let _ : Peer_manager.chain_sync_state = Peer_manager.ChainSynced in
+  let _ : Peer_manager.chain_sync_state = Peer_manager.ChainWaitingForHeaders {
+    timeout = 1000.0;
+    sent_getheaders = true;
+  } in
+  ()
+
+(* Test stale state creation *)
+let test_create_stale_state () =
+  let state = Peer_manager.create_stale_state () in
+  Alcotest.(check bool) "chain synced" true
+    (state.chain_sync = Peer_manager.ChainSynced);
+  Alcotest.(check int) "no blocks in flight" 0 state.block_stall.blocks_in_flight;
+  Alcotest.(check bool) "not stalling" true (state.block_stall.stalling_since = None);
+  Alcotest.(check bool) "no ping pending" true (state.last_ping_nonce = None)
+
+(* Test stale reason messages *)
+let test_stale_reasons () =
+  Alcotest.(check bool) "headers reason not empty" true
+    (String.length Peer_manager.StaleReason.headers_timeout > 0);
+  Alcotest.(check bool) "block reason not empty" true
+    (String.length Peer_manager.StaleReason.block_stalling > 0);
+  Alcotest.(check bool) "ping reason not empty" true
+    (String.length Peer_manager.StaleReason.ping_timeout > 0)
+
+(* Test on_headers_received updates state *)
+let test_on_headers_received () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  let peer_id = 1 in
+  (* Initialize state *)
+  let state = Peer_manager.create_stale_state () in
+  state.chain_sync <- Peer_manager.ChainWaitingForHeaders {
+    timeout = 1000.0;
+    sent_getheaders = true;
+  };
+  Hashtbl.replace pm.stale_state peer_id state;
+  (* Receive headers *)
+  Peer_manager.on_headers_received pm peer_id ~new_best_height:100l;
+  let state' = Peer_manager.get_stale_state pm peer_id in
+  Alcotest.(check bool) "chain synced after headers" true
+    (state'.chain_sync = Peer_manager.ChainSynced)
+
+(* Test on_block_received updates state *)
+let test_on_block_received () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  let peer_id = 1 in
+  let state = Peer_manager.get_stale_state pm peer_id in
+  state.block_stall.blocks_in_flight <- 5;
+  state.block_stall.stalling_since <- Some (Unix.gettimeofday () -. 10.0);
+  Peer_manager.on_block_received pm peer_id;
+  let state' = Peer_manager.get_stale_state pm peer_id in
+  Alcotest.(check int) "blocks decremented" 4 state'.block_stall.blocks_in_flight;
+  Alcotest.(check bool) "stalling cleared" true (state'.block_stall.stalling_since = None)
+
+(* Test assign_blocks_to_peer *)
+let test_assign_blocks () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  let peer_id = 1 in
+  Peer_manager.assign_blocks_to_peer pm peer_id ~count:3;
+  let state = Peer_manager.get_stale_state pm peer_id in
+  Alcotest.(check int) "3 blocks assigned" 3 state.block_stall.blocks_in_flight;
+  Peer_manager.assign_blocks_to_peer pm peer_id ~count:2;
+  Alcotest.(check int) "5 blocks total" 5 state.block_stall.blocks_in_flight
+
+(* Test ping/pong tracking *)
+let test_ping_pong_tracking () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  let peer_id = 1 in
+  let nonce = 12345L in
+  (* Send ping *)
+  Peer_manager.on_ping_sent pm peer_id ~nonce;
+  let state = Peer_manager.get_stale_state pm peer_id in
+  Alcotest.(check bool) "nonce recorded" true (state.last_ping_nonce = Some nonce);
+  (* Receive correct pong *)
+  let matched = Peer_manager.on_pong_received pm peer_id ~nonce in
+  Alcotest.(check bool) "nonce matched" true matched;
+  let state' = Peer_manager.get_stale_state pm peer_id in
+  Alcotest.(check bool) "nonce cleared" true (state'.last_ping_nonce = None)
+
+(* Test pong with wrong nonce *)
+let test_pong_wrong_nonce () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  let peer_id = 1 in
+  Peer_manager.on_ping_sent pm peer_id ~nonce:11111L;
+  let matched = Peer_manager.on_pong_received pm peer_id ~nonce:22222L in
+  Alcotest.(check bool) "wrong nonce rejected" false matched;
+  let state = Peer_manager.get_stale_state pm peer_id in
+  Alcotest.(check bool) "nonce still pending" true (state.last_ping_nonce = Some 11111L)
+
+(* Test get_stalling_peers empty *)
+let test_get_stalling_peers_empty () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  let stalling = Peer_manager.get_stalling_peers pm in
+  Alcotest.(check int) "no stalling peers" 0 (List.length stalling)
+
+(* Test get_available_download_peers empty *)
+let test_get_available_download_peers_empty () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  let available = Peer_manager.get_available_download_peers pm in
+  Alcotest.(check int) "no available peers" 0 (List.length available)
+
+(* Test stale check timer control *)
+let test_stale_check_timer () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  Alcotest.(check bool) "timer not running initially" false pm.stale_check_running;
+  Peer_manager.start_stale_check_timer pm;
+  Alcotest.(check bool) "timer running after start" true pm.stale_check_running;
+  Peer_manager.stop_stale_check_timer pm;
+  Alcotest.(check bool) "timer stopped" false pm.stale_check_running
+
 (* All tests *)
 let () =
   Alcotest.run "Peer_manager" [
@@ -637,5 +760,19 @@ let () =
       Alcotest.test_case "anchors_empty" `Quick test_anchors_empty;
       Alcotest.test_case "anchor_persistence" `Quick test_anchor_persistence;
       Alcotest.test_case "config_anchors" `Quick test_config_anchors;
+    ];
+    "stale_eviction", [
+      Alcotest.test_case "stale_constants" `Quick test_stale_constants;
+      Alcotest.test_case "chain_sync_state" `Quick test_chain_sync_state;
+      Alcotest.test_case "create_stale_state" `Quick test_create_stale_state;
+      Alcotest.test_case "stale_reasons" `Quick test_stale_reasons;
+      Alcotest.test_case "on_headers_received" `Quick test_on_headers_received;
+      Alcotest.test_case "on_block_received" `Quick test_on_block_received;
+      Alcotest.test_case "assign_blocks" `Quick test_assign_blocks;
+      Alcotest.test_case "ping_pong_tracking" `Quick test_ping_pong_tracking;
+      Alcotest.test_case "pong_wrong_nonce" `Quick test_pong_wrong_nonce;
+      Alcotest.test_case "get_stalling_peers_empty" `Quick test_get_stalling_peers_empty;
+      Alcotest.test_case "get_available_download_peers" `Quick test_get_available_download_peers_empty;
+      Alcotest.test_case "stale_check_timer" `Quick test_stale_check_timer;
     ];
   ]

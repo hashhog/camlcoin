@@ -30,7 +30,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Block synchronization (IBD, parallel downloads, chain reorganization)
 - [x] UTXO set with cache (block connect/disconnect, maturity checks, layered cache with batch flushing)
 - [x] Undo data for chain reorganizations (tx_undo, block_undo, checksums)
-- [x] Mempool (fee-rate prioritization, eviction, dependency tracking, full RBF, ancestor/descendant limits, v3/TRUC policy)
+- [x] Mempool (fee-rate prioritization, eviction, dependency tracking, full RBF, ancestor/descendant limits, v3/TRUC policy, cluster mempool with linearization)
 - [x] Fee estimation (bucket-based tracking, confirmation time analysis)
 - [x] Block template construction (getblocktemplate, coinbase, witness commitment)
 - [x] CPU miner for regtest (proof-of-work search, nonce iteration)
@@ -91,7 +91,7 @@ camlcoin/
     peer.ml           peer connections
     peer_manager.ml   connection pool and discovery
     sync.ml           chain synchronization
-    mempool.ml        transaction pool
+    mempool.ml        transaction pool, cluster mempool, linearization
     fee_estimation.ml fee rate estimation
     mining.ml         block template and miner
     rpc.ml            JSON-RPC server

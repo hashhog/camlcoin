@@ -19,3 +19,4 @@ module Bip39 = Bip39
 module Wallet = Wallet
 module Cli = Cli
 module Perf = Perf
+module Block_index = Block_index

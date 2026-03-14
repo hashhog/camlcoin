@@ -281,91 +281,287 @@ let handle_getdifficulty (ctx : rpc_context) : Yojson.Safe.t =
    Transaction Handlers
    ============================================================================ *)
 
+(* Convert network config to Address.network based on bech32_hrp *)
+let network_to_address_network (config : Consensus.network_config) : Address.network =
+  match config.bech32_hrp with
+  | "bc" -> `Mainnet
+  | "tb" -> `Testnet
+  | "bcrt" -> `Regtest
+  | _ -> `Mainnet  (* Default to mainnet if unknown *)
+
+(* Convert Cstruct to hex string (for arbitrary length data) *)
+let cstruct_to_hex (cs : Cstruct.t) : string =
+  let len = Cstruct.length cs in
+  let buf = Buffer.create (len * 2) in
+  for i = 0 to len - 1 do
+    Buffer.add_string buf (Printf.sprintf "%02x" (Cstruct.get_uint8 cs i))
+  done;
+  Buffer.contents buf
+
+(* Get script type name for JSON output *)
+let script_type_name (template : Script.script_template) : string =
+  match template with
+  | Script.P2PKH_script _ -> "pubkeyhash"
+  | Script.P2SH_script _ -> "scripthash"
+  | Script.P2WPKH_script _ -> "witness_v0_keyhash"
+  | Script.P2WSH_script _ -> "witness_v0_scripthash"
+  | Script.P2TR_script _ -> "witness_v1_taproot"
+  | Script.OP_RETURN_data _ -> "nulldata"
+  | Script.Nonstandard -> "nonstandard"
+
+(* Get address from scriptPubKey if applicable *)
+let script_to_address (script : Cstruct.t) (network : Address.network) : string option =
+  match Script.classify_script script with
+  | Script.P2PKH_script hash ->
+    Some (Address.address_to_string { addr_type = P2PKH; hash; network })
+  | Script.P2SH_script hash ->
+    Some (Address.address_to_string { addr_type = P2SH; hash; network })
+  | Script.P2WPKH_script hash ->
+    Some (Address.address_to_string { addr_type = P2WPKH; hash; network })
+  | Script.P2WSH_script hash ->
+    Some (Address.address_to_string { addr_type = P2WSH; hash; network })
+  | Script.P2TR_script hash ->
+    Some (Address.address_to_string { addr_type = P2TR; hash; network })
+  | Script.OP_RETURN_data _ | Script.Nonstandard -> None
+
+(* Build scriptPubKey JSON object with type and optional address *)
+let build_script_pubkey_json (script : Cstruct.t) (network : Address.network) : Yojson.Safe.t =
+  let template = Script.classify_script script in
+  let type_name = script_type_name template in
+  let hex = cstruct_to_hex script in
+  let base_fields = [
+    ("hex", `String hex);
+    ("type", `String type_name);
+  ] in
+  let with_address = match script_to_address script network with
+    | Some addr -> base_fields @ [("address", `String addr)]
+    | None -> base_fields
+  in
+  `Assoc with_address
+
+(* Check if input is coinbase (all zeros txid, vout = 0xFFFFFFFF) *)
+let is_coinbase_input (inp : Types.tx_in) : bool =
+  let all_zeros = Cstruct.for_all (fun b -> b = '\x00') inp.previous_output.txid in
+  all_zeros && inp.previous_output.vout = 0xFFFFFFFFl
+
+(* Build vin JSON for a transaction *)
+let build_vin_json (tx : Types.transaction) : Yojson.Safe.t list =
+  List.mapi (fun i inp ->
+    let witness_items =
+      if i < List.length tx.witnesses then
+        `List (List.map (fun item ->
+          `String (cstruct_to_hex item)
+        ) (List.nth tx.witnesses i).items)
+      else
+        `List []
+    in
+    if is_coinbase_input inp then
+      (* Coinbase input *)
+      `Assoc [
+        ("coinbase", `String (cstruct_to_hex inp.script_sig));
+        ("txinwitness", witness_items);
+        ("sequence", `Int (Int32.to_int inp.sequence));
+      ]
+    else
+      (* Regular input *)
+      `Assoc [
+        ("txid", `String (Types.hash256_to_hex_display inp.previous_output.txid));
+        ("vout", `Int (Int32.to_int inp.previous_output.vout));
+        ("scriptSig", `Assoc [
+          ("hex", `String (cstruct_to_hex inp.script_sig));
+        ]);
+        ("txinwitness", witness_items);
+        ("sequence", `Int (Int32.to_int inp.sequence));
+      ]
+  ) tx.inputs
+
+(* Build vout JSON for a transaction *)
+let build_vout_json (tx : Types.transaction) (network : Address.network) : Yojson.Safe.t list =
+  List.mapi (fun i out ->
+    `Assoc [
+      ("value", `Float (Int64.to_float out.Types.value /. 100_000_000.0));
+      ("n", `Int i);
+      ("scriptPubKey", build_script_pubkey_json out.script_pubkey network);
+    ]
+  ) tx.outputs
+
+(* Serialize transaction to hex *)
+let tx_to_hex (tx : Types.transaction) : string =
+  let w = Serialize.writer_create () in
+  Serialize.serialize_transaction w tx;
+  let cs = Serialize.writer_to_cstruct w in
+  cstruct_to_hex cs
+
+(* Lookup transaction in mempool, specific block, or txindex *)
+type tx_location =
+  | InMempool
+  | InBlock of Types.hash256 * int (* block_hash, tx_index *)
+
+let lookup_transaction (ctx : rpc_context) (txid : Cstruct.t)
+    (blockhash_opt : Cstruct.t option) : (Types.transaction * tx_location option, string) result =
+  let txid_key = Cstruct.to_string txid in
+
+  (* If blockhash is specified, search only in that block *)
+  match blockhash_opt with
+  | Some block_hash ->
+    (match Storage.ChainDB.get_block ctx.chain.db block_hash with
+     | None -> Error "Block not found"
+     | Some block ->
+       (* Search for transaction in block *)
+       let rec find_tx idx = function
+         | [] -> None
+         | tx :: rest ->
+           let tx_txid = Crypto.compute_txid tx in
+           if Cstruct.equal tx_txid txid then
+             Some (tx, idx)
+           else
+             find_tx (idx + 1) rest
+       in
+       match find_tx 0 block.transactions with
+       | Some (tx, idx) -> Ok (tx, Some (InBlock (block_hash, idx)))
+       | None -> Error "No such transaction found in the provided block")
+  | None ->
+    (* Check mempool first *)
+    match Hashtbl.find_opt ctx.mempool.entries txid_key with
+    | Some entry -> Ok (entry.tx, Some InMempool)
+    | None ->
+      (* Check txindex for confirmed tx *)
+      match Storage.ChainDB.get_tx_index ctx.chain.db txid with
+      | Some (block_hash, tx_idx) ->
+        (match Storage.ChainDB.get_transaction ctx.chain.db txid with
+         | Some tx -> Ok (tx, Some (InBlock (block_hash, tx_idx)))
+         | None -> Error "Transaction indexed but not found")
+      | None ->
+        (* Try getting transaction directly (may be in storage without index) *)
+        match Storage.ChainDB.get_transaction ctx.chain.db txid with
+        | Some tx -> Ok (tx, None) (* No block info available *)
+        | None -> Error "No such mempool or blockchain transaction. Use -txindex or provide a block hash"
+
+(* Get block height from block hash *)
+let get_block_height (ctx : rpc_context) (block_hash : Cstruct.t) : int option =
+  match Sync.get_header ctx.chain block_hash with
+  | Some entry -> Some entry.height
+  | None -> None
+
+(* Get block timestamp from block hash *)
+let get_block_time (ctx : rpc_context) (block_hash : Cstruct.t) : int32 option =
+  match Storage.ChainDB.get_block_header ctx.chain.db block_hash with
+  | Some header -> Some header.timestamp
+  | None -> None
+
+(* Handle getrawtransaction RPC
+   Params: txid (hex), verbosity (int/bool, default 0), blockhash (hex, optional)
+   - verbosity=0: return raw hex
+   - verbosity=1: return decoded JSON with block info
+   - verbosity=2: return decoded JSON with fee and prevout info (TODO: prevout) *)
 let handle_getrawtransaction (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
-  match params with
-  | [`String txid_hex] | [`String txid_hex; `Bool false] ->
-    let txid_bytes = Types.hash256_of_hex txid_hex in
-    let txid = Cstruct.create 32 in
-    for i = 0 to 31 do
-      Cstruct.set_uint8 txid i (Cstruct.get_uint8 txid_bytes (31 - i))
-    done;
-    let txid_key = Cstruct.to_string txid in
-    (* Check mempool first *)
-    (match Hashtbl.find_opt ctx.mempool.entries txid_key with
-     | Some entry ->
-       let w = Serialize.writer_create () in
-       Serialize.serialize_transaction w entry.tx;
-       let cs = Serialize.writer_to_cstruct w in
-       let hex = Types.hash256_to_hex cs in
-       Ok (`String hex)
-     | None ->
-       (* Check on-chain *)
-       match Storage.ChainDB.get_transaction ctx.chain.db txid with
-       | Some tx ->
-         let w = Serialize.writer_create () in
-         Serialize.serialize_transaction w tx;
-         let cs = Serialize.writer_to_cstruct w in
-         let hex = Types.hash256_to_hex cs in
-         Ok (`String hex)
-       | None -> Error "Transaction not found")
-  | [`String txid_hex; `Bool true] ->
-    (* Verbose mode - return decoded JSON *)
-    let txid_bytes = Types.hash256_of_hex txid_hex in
-    let txid = Cstruct.create 32 in
-    for i = 0 to 31 do
-      Cstruct.set_uint8 txid i (Cstruct.get_uint8 txid_bytes (31 - i))
-    done;
-    let txid_key = Cstruct.to_string txid in
-    let tx_opt =
-      match Hashtbl.find_opt ctx.mempool.entries txid_key with
-      | Some entry -> Some (entry.tx, None)
-      | None ->
-        match Storage.ChainDB.get_transaction ctx.chain.db txid with
-        | Some tx -> Some (tx, Storage.ChainDB.get_tx_index ctx.chain.db txid)
-        | None -> None
-    in
-    (match tx_opt with
-     | None -> Error "Transaction not found"
-     | Some (tx, _block_info) ->
-       let vin = List.mapi (fun i inp ->
-         `Assoc [
-           ("txid", `String (Types.hash256_to_hex_display inp.Types.previous_output.txid));
-           ("vout", `Int (Int32.to_int inp.Types.previous_output.vout));
-           ("scriptSig", `Assoc [
-             ("hex", `String (Types.hash256_to_hex inp.Types.script_sig));
-           ]);
-           ("sequence", `Int (Int32.to_int inp.Types.sequence));
-           ("txinwitness",
-             if i < List.length tx.witnesses then
-               `List (List.map (fun item ->
-                 `String (Types.hash256_to_hex item)
-               ) (List.nth tx.witnesses i).items)
-             else
-               `List []);
-         ]
-       ) tx.inputs in
-       let vout = List.mapi (fun i out ->
-         `Assoc [
-           ("value", `Float (Int64.to_float out.Types.value /. 100_000_000.0));
-           ("n", `Int i);
-           ("scriptPubKey", `Assoc [
-             ("hex", `String (Types.hash256_to_hex out.Types.script_pubkey));
-           ]);
-         ]
-       ) tx.outputs in
-       Ok (`Assoc [
-         ("txid", `String txid_hex);
-         ("version", `Int (Int32.to_int tx.version));
-         ("size", `Int (Validation.compute_tx_size tx));
-         ("vsize", `Int (Validation.compute_tx_vsize tx));
-         ("weight", `Int (Validation.compute_tx_weight tx));
-         ("locktime", `Int (Int32.to_int tx.locktime));
-         ("vin", `List vin);
-         ("vout", `List vout);
-       ]))
-  | _ ->
-    Error "Invalid parameters: expected [txid] or [txid, verbose]"
+
+  (* Parse parameters *)
+  let parse_verbosity = function
+    | `Bool false | `Int 0 -> Some 0
+    | `Bool true | `Int 1 -> Some 1
+    | `Int 2 -> Some 2
+    | `Int n when n >= 0 && n <= 2 -> Some n
+    | _ -> None
+  in
+
+  let parse_blockhash hex =
+    try
+      let hash_bytes = Types.hash256_of_hex hex in
+      let hash = Cstruct.create 32 in
+      for i = 0 to 31 do
+        Cstruct.set_uint8 hash i (Cstruct.get_uint8 hash_bytes (31 - i))
+      done;
+      Some hash
+    with _ -> None
+  in
+
+  let parse_txid hex =
+    try
+      let txid_bytes = Types.hash256_of_hex hex in
+      let txid = Cstruct.create 32 in
+      for i = 0 to 31 do
+        Cstruct.set_uint8 txid i (Cstruct.get_uint8 txid_bytes (31 - i))
+      done;
+      Some txid
+    with _ -> None
+  in
+
+  (* Extract params *)
+  let (txid_hex, verbosity, blockhash_opt) = match params with
+    | [`String txid_hex] ->
+      (Some txid_hex, 0, None)
+    | [`String txid_hex; v] ->
+      (Some txid_hex, Option.value ~default:0 (parse_verbosity v), None)
+    | [`String txid_hex; v; `String bh] ->
+      (Some txid_hex, Option.value ~default:0 (parse_verbosity v), parse_blockhash bh)
+    | [`String txid_hex; v; `Null] ->
+      (Some txid_hex, Option.value ~default:0 (parse_verbosity v), None)
+    | _ -> (None, 0, None)
+  in
+
+  match txid_hex with
+  | None -> Error "Invalid parameters: expected [txid] or [txid, verbose] or [txid, verbose, blockhash]"
+  | Some txid_hex ->
+    match parse_txid txid_hex with
+    | None -> Error "Invalid txid"
+    | Some txid ->
+      match lookup_transaction ctx txid blockhash_opt with
+      | Error e -> Error e
+      | Ok (tx, location) ->
+        (* Verbosity 0: return raw hex *)
+        if verbosity = 0 then
+          Ok (`String (tx_to_hex tx))
+        else begin
+          (* Verbose mode: build full JSON response *)
+          let network = network_to_address_network ctx.network in
+          let wtxid = Crypto.compute_wtxid tx in
+          let vin = build_vin_json tx in
+          let vout = build_vout_json tx network in
+          let hex = tx_to_hex tx in
+
+          (* Base transaction fields *)
+          let base_fields = [
+            ("txid", `String txid_hex);
+            ("hash", `String (Types.hash256_to_hex_display wtxid));
+            ("version", `Int (Int32.to_int tx.version));
+            ("size", `Int (Validation.compute_tx_size tx));
+            ("vsize", `Int (Validation.compute_tx_vsize tx));
+            ("weight", `Int (Validation.compute_tx_weight tx));
+            ("locktime", `Int (Int32.to_int tx.locktime));
+            ("vin", `List vin);
+            ("vout", `List vout);
+            ("hex", `String hex);
+          ] in
+
+          (* Add block info if confirmed *)
+          let with_block_info = match location with
+            | Some InMempool ->
+              (* Mempool transaction has no confirmations *)
+              base_fields
+            | Some (InBlock (block_hash, _tx_idx)) ->
+              let blockhash_hex = Types.hash256_to_hex_display block_hash in
+              let tip_height = match ctx.chain.tip with Some t -> t.height | None -> 0 in
+              let block_height = Option.value ~default:0 (get_block_height ctx block_hash) in
+              let confirmations = tip_height - block_height + 1 in
+              let blocktime = match get_block_time ctx block_hash with
+                | Some t -> Int32.to_int t
+                | None -> 0
+              in
+              base_fields @ [
+                ("blockhash", `String blockhash_hex);
+                ("confirmations", `Int confirmations);
+                ("time", `Int blocktime);
+                ("blocktime", `Int blocktime);
+              ]
+            | None ->
+              (* Transaction found but no block info available *)
+              base_fields
+          in
+
+          Ok (`Assoc with_block_info)
+        end
 
 (* Default constants for sendrawtransaction *)
 let default_max_raw_tx_fee_rate = 0.10  (* 0.10 BTC/kvB *)

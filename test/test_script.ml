@@ -1456,6 +1456,253 @@ let witness_cleanstack_tests = [
   Alcotest.test_case "Legacy P2SH no flag allows extra items" `Quick test_legacy_no_cleanstack_flag_allows_extra;
 ]
 
+(* ============================================================================
+   P2SH Push-Only Tests (Phase 4)
+
+   P2SH scriptSig must contain only push operations (BIP-16 consensus rule).
+   This is unconditional when P2SH is enabled - separate from SCRIPT_VERIFY_SIGPUSHONLY.
+   ============================================================================ *)
+
+(* Test is_push_only helper function *)
+let test_is_push_only_empty () =
+  (* Empty script is push-only *)
+  Alcotest.(check bool) "empty is push-only" true
+    (Script.is_push_only (Cstruct.create 0))
+
+let test_is_push_only_op_0 () =
+  (* OP_0 (0x00) is a push *)
+  let script = hex_to_cstruct "00" in
+  Alcotest.(check bool) "OP_0 is push-only" true (Script.is_push_only script)
+
+let test_is_push_only_op_1_through_16 () =
+  (* OP_1 through OP_16 (0x51-0x60) are pushes *)
+  for i = 0x51 to 0x60 do
+    let script = hex_to_cstruct (Printf.sprintf "%02x" i) in
+    Alcotest.(check bool) (Printf.sprintf "OP_%d is push-only" (i - 0x50))
+      true (Script.is_push_only script)
+  done
+
+let test_is_push_only_op_1negate () =
+  (* OP_1NEGATE (0x4f) is a push *)
+  let script = hex_to_cstruct "4f" in
+  Alcotest.(check bool) "OP_1NEGATE is push-only" true (Script.is_push_only script)
+
+let test_is_push_only_direct_push () =
+  (* Direct push of 3 bytes: 03aabbcc *)
+  let script = hex_to_cstruct "03aabbcc" in
+  Alcotest.(check bool) "direct push is push-only" true (Script.is_push_only script)
+
+let test_is_push_only_pushdata1 () =
+  (* PUSHDATA1: 4c03aabbcc *)
+  let script = hex_to_cstruct "4c03aabbcc" in
+  Alcotest.(check bool) "PUSHDATA1 is push-only" true (Script.is_push_only script)
+
+let test_is_push_only_pushdata2 () =
+  (* PUSHDATA2: 4d0300aabbcc (little-endian length 3) *)
+  let script = hex_to_cstruct "4d0300aabbcc" in
+  Alcotest.(check bool) "PUSHDATA2 is push-only" true (Script.is_push_only script)
+
+let test_is_push_only_multiple_pushes () =
+  (* OP_1 OP_2 (push 3 bytes) -> all pushes *)
+  let script = hex_to_cstruct "515203aabbcc" in
+  Alcotest.(check bool) "multiple pushes is push-only" true (Script.is_push_only script)
+
+let test_is_push_only_op_dup_fails () =
+  (* OP_DUP (0x76) is NOT a push *)
+  let script = hex_to_cstruct "76" in
+  Alcotest.(check bool) "OP_DUP is not push-only" false (Script.is_push_only script)
+
+let test_is_push_only_op_nop_fails () =
+  (* OP_NOP (0x61) is NOT a push *)
+  let script = hex_to_cstruct "61" in
+  Alcotest.(check bool) "OP_NOP is not push-only" false (Script.is_push_only script)
+
+let test_is_push_only_op_checksig_fails () =
+  (* OP_CHECKSIG (0xac) is NOT a push *)
+  let script = hex_to_cstruct "ac" in
+  Alcotest.(check bool) "OP_CHECKSIG is not push-only" false (Script.is_push_only script)
+
+let test_is_push_only_op_reserved () =
+  (* OP_RESERVED (0x50) counts as push for this check per Bitcoin Core *)
+  let script = hex_to_cstruct "50" in
+  Alcotest.(check bool) "OP_RESERVED is push-only" true (Script.is_push_only script)
+
+let test_is_push_only_mixed_fails () =
+  (* OP_1 OP_DUP -> not push-only *)
+  let script = hex_to_cstruct "5176" in
+  Alcotest.(check bool) "push + OP_DUP is not push-only" false (Script.is_push_only script)
+
+(* Test P2SH scriptSig with OP_DUP is rejected *)
+let test_p2sh_scriptsig_op_dup_rejected () =
+  let tx = make_test_tx () in
+  (* Create a simple redeem script: OP_1 (0x51) *)
+  let redeem_script = hex_to_cstruct "51" in
+  let script_hash = Crypto.hash160 redeem_script in
+  (* P2SH script: OP_HASH160 <20 bytes> OP_EQUAL *)
+  let script_pubkey =
+    let w = Serialize.writer_create () in
+    Serialize.write_uint8 w 0xa9;  (* OP_HASH160 *)
+    Serialize.write_uint8 w 0x14;  (* push 20 bytes *)
+    Serialize.write_bytes w script_hash;
+    Serialize.write_uint8 w 0x87;  (* OP_EQUAL *)
+    Serialize.writer_to_cstruct w
+  in
+  (* scriptSig with OP_DUP before the redeem script push:
+     OP_DUP (0x76) <push redeem_script> *)
+  let script_sig =
+    let w = Serialize.writer_create () in
+    Serialize.write_uint8 w 0x76;  (* OP_DUP - NOT push-only! *)
+    let len = Cstruct.length redeem_script in
+    Serialize.write_uint8 w len;
+    Serialize.write_bytes w redeem_script;
+    Serialize.writer_to_cstruct w
+  in
+  let witness = { Types.items = [] } in
+  let flags = Script.script_verify_p2sh in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+          ~script_sig ~witness ~amount:0L ~flags () with
+  | Error msg ->
+    (* Should fail with SigPushOnly error *)
+    let msg_lower = String.lowercase_ascii msg in
+    let contains_push =
+      let rec check i =
+        if i + 4 > String.length msg_lower then false
+        else if String.sub msg_lower i 4 = "push" then true
+        else check (i + 1)
+      in check 0
+    in
+    if not contains_push then
+      Alcotest.fail ("Expected SigPushOnly error, got: " ^ msg)
+  | Ok _ -> Alcotest.fail "P2SH scriptSig with OP_DUP should be rejected"
+
+(* Test P2SH scriptSig with only pushes succeeds *)
+let test_p2sh_scriptsig_push_only_succeeds () =
+  let tx = make_test_tx () in
+  (* Create a simple redeem script: OP_1 (0x51) *)
+  let redeem_script = hex_to_cstruct "51" in
+  let script_hash = Crypto.hash160 redeem_script in
+  let script_pubkey =
+    let w = Serialize.writer_create () in
+    Serialize.write_uint8 w 0xa9;
+    Serialize.write_uint8 w 0x14;
+    Serialize.write_bytes w script_hash;
+    Serialize.write_uint8 w 0x87;
+    Serialize.writer_to_cstruct w
+  in
+  (* scriptSig with only push: <push redeem_script> *)
+  let script_sig =
+    let w = Serialize.writer_create () in
+    let len = Cstruct.length redeem_script in
+    Serialize.write_uint8 w len;
+    Serialize.write_bytes w redeem_script;
+    Serialize.writer_to_cstruct w
+  in
+  let witness = { Types.items = [] } in
+  let flags = Script.script_verify_p2sh in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+          ~script_sig ~witness ~amount:0L ~flags () with
+  | Ok true -> ()
+  | Ok false -> Alcotest.fail "Expected success"
+  | Error e -> Alcotest.fail ("Push-only scriptSig should succeed: " ^ e)
+
+(* Test P2SH scriptSig with OP_NOP is rejected *)
+let test_p2sh_scriptsig_op_nop_rejected () =
+  let tx = make_test_tx () in
+  let redeem_script = hex_to_cstruct "51" in
+  let script_hash = Crypto.hash160 redeem_script in
+  let script_pubkey =
+    let w = Serialize.writer_create () in
+    Serialize.write_uint8 w 0xa9;
+    Serialize.write_uint8 w 0x14;
+    Serialize.write_bytes w script_hash;
+    Serialize.write_uint8 w 0x87;
+    Serialize.writer_to_cstruct w
+  in
+  (* scriptSig with OP_NOP (0x61) before the redeem script push *)
+  let script_sig =
+    let w = Serialize.writer_create () in
+    Serialize.write_uint8 w 0x61;  (* OP_NOP - NOT push-only! *)
+    let len = Cstruct.length redeem_script in
+    Serialize.write_uint8 w len;
+    Serialize.write_bytes w redeem_script;
+    Serialize.writer_to_cstruct w
+  in
+  let witness = { Types.items = [] } in
+  let flags = Script.script_verify_p2sh in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+          ~script_sig ~witness ~amount:0L ~flags () with
+  | Error _ -> ()  (* Expected: SigPushOnly error *)
+  | Ok _ -> Alcotest.fail "P2SH scriptSig with OP_NOP should be rejected"
+
+(* Test that P2SH push-only is NOT enforced when P2SH flag is disabled.
+   We use a script that would fail with SigPushOnly error under P2SH,
+   but should fail with a *different* error without P2SH flag.
+
+   Without P2SH: scriptSig runs, then scriptPubKey runs on same stack.
+   OP_DUP on empty stack fails with stack underflow, not push-only error.
+   This proves push-only check wasn't applied. *)
+let test_p2sh_push_only_disabled_without_flag () =
+  let tx = make_test_tx () in
+  let redeem_script = hex_to_cstruct "51" in
+  let script_hash = Crypto.hash160 redeem_script in
+  let script_pubkey =
+    let w = Serialize.writer_create () in
+    Serialize.write_uint8 w 0xa9;
+    Serialize.write_uint8 w 0x14;
+    Serialize.write_bytes w script_hash;
+    Serialize.write_uint8 w 0x87;
+    Serialize.writer_to_cstruct w
+  in
+  (* scriptSig with OP_DUP before the redeem script push *)
+  let script_sig =
+    let w = Serialize.writer_create () in
+    Serialize.write_uint8 w 0x76;  (* OP_DUP - will fail on empty stack *)
+    let len = Cstruct.length redeem_script in
+    Serialize.write_uint8 w len;
+    Serialize.write_bytes w redeem_script;
+    Serialize.writer_to_cstruct w
+  in
+  let witness = { Types.items = [] } in
+  (* NO P2SH flag - should fail with stack error, NOT push-only error *)
+  let flags = 0 in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+          ~script_sig ~witness ~amount:0L ~flags () with
+  | Error msg ->
+    (* Should NOT be a push-only error *)
+    let msg_lower = String.lowercase_ascii msg in
+    let is_push_error =
+      let rec check i =
+        if i + 8 > String.length msg_lower then false
+        else if String.sub msg_lower i 8 = "pushonly" then true
+        else if i + 10 <= String.length msg_lower && String.sub msg_lower i 10 = "sigpushonly" then true
+        else check (i + 1)
+      in check 0
+    in
+    if is_push_error then
+      Alcotest.fail ("Without P2SH flag, should not error on push-only: " ^ msg)
+    (* Else: failed for other reason (e.g., stack underflow) - that's expected *)
+  | Ok _ -> ()  (* Unexpected success is also fine - proves push-only wasn't checked *)
+
+let p2sh_push_only_tests = [
+  Alcotest.test_case "is_push_only empty" `Quick test_is_push_only_empty;
+  Alcotest.test_case "is_push_only OP_0" `Quick test_is_push_only_op_0;
+  Alcotest.test_case "is_push_only OP_1-16" `Quick test_is_push_only_op_1_through_16;
+  Alcotest.test_case "is_push_only OP_1NEGATE" `Quick test_is_push_only_op_1negate;
+  Alcotest.test_case "is_push_only direct push" `Quick test_is_push_only_direct_push;
+  Alcotest.test_case "is_push_only PUSHDATA1" `Quick test_is_push_only_pushdata1;
+  Alcotest.test_case "is_push_only PUSHDATA2" `Quick test_is_push_only_pushdata2;
+  Alcotest.test_case "is_push_only multiple pushes" `Quick test_is_push_only_multiple_pushes;
+  Alcotest.test_case "is_push_only OP_DUP fails" `Quick test_is_push_only_op_dup_fails;
+  Alcotest.test_case "is_push_only OP_NOP fails" `Quick test_is_push_only_op_nop_fails;
+  Alcotest.test_case "is_push_only OP_CHECKSIG fails" `Quick test_is_push_only_op_checksig_fails;
+  Alcotest.test_case "is_push_only OP_RESERVED ok" `Quick test_is_push_only_op_reserved;
+  Alcotest.test_case "is_push_only mixed fails" `Quick test_is_push_only_mixed_fails;
+  Alcotest.test_case "P2SH scriptSig OP_DUP rejected" `Quick test_p2sh_scriptsig_op_dup_rejected;
+  Alcotest.test_case "P2SH scriptSig push-only succeeds" `Quick test_p2sh_scriptsig_push_only_succeeds;
+  Alcotest.test_case "P2SH scriptSig OP_NOP rejected" `Quick test_p2sh_scriptsig_op_nop_rejected;
+  Alcotest.test_case "P2SH push-only not enforced without flag" `Quick test_p2sh_push_only_disabled_without_flag;
+]
+
 let () = Alcotest.run "test_script" [
   ("script_num", script_num_tests);
   ("parsing", parsing_tests);
@@ -1472,4 +1719,5 @@ let () = Alcotest.run "test_script" [
   ("nullfail", nullfail_tests);
   ("witness_pubkeytype", witness_pubkeytype_tests);
   ("witness_cleanstack", witness_cleanstack_tests);
+  ("p2sh_push_only", p2sh_push_only_tests);
 ]

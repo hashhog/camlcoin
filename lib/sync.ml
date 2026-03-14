@@ -1,10 +1,72 @@
 (* Header-first synchronization (BIP-130) *)
 (* Downloads all block headers before downloading full blocks,
-   verifying the proof-of-work chain and building the header chain. *)
+   verifying the proof-of-work chain and building the header chain.
+
+   Anti-DoS: Implements PRESYNC/REDOWNLOAD strategy from Bitcoin Core.
+   During PRESYNC, we only track cumulative work without storing headers,
+   preventing memory exhaustion from low-work header floods. Once sufficient
+   work is demonstrated, we REDOWNLOAD and store headers permanently. *)
 
 let log_src = Logs.Src.create "VALIDATION" ~doc:"Block validation"
 module Log = (val Logs.src_log log_src : Logs.LOG)
 let _ = Log.info  (* suppress unused module warning *)
+
+(* ============================================================================
+   Header Sync Anti-DoS: PRESYNC/REDOWNLOAD State Machine
+   ============================================================================
+
+   Bitcoin Core uses a two-phase approach to prevent memory exhaustion attacks
+   during header synchronization (see headerssync.cpp):
+
+   Phase 1 - PRESYNC:
+   - Accept headers without storing them permanently
+   - Only track: cumulative_work (32 bytes), last_hash (32 bytes), count (8 bytes)
+   - Total memory per peer: ~100 bytes (constant, regardless of chain length)
+   - If cumulative_work >= minimum_chain_work, transition to REDOWNLOAD
+
+   Phase 2 - REDOWNLOAD:
+   - Re-request all headers from genesis using getheaders
+   - Validate PoW and store headers in the block index
+   - This ensures we never store headers for chains with insufficient work
+
+   Why this matters:
+   - An attacker could send millions of low-difficulty headers
+   - Without PRESYNC, we'd store all headers in memory (gigabytes)
+   - With PRESYNC, we only use ~100 bytes until work is proven
+   ============================================================================ *)
+
+(* Header sync state for anti-DoS protection (per-peer) *)
+type header_sync_state =
+  | Presync of {
+      cumulative_work : Cstruct.t;  (* 32-byte LE cumulative chain work *)
+      last_hash : Types.hash256;     (* Hash of last header seen *)
+      last_bits : int32;             (* nBits of last header for difficulty validation *)
+      count : int;                   (* Number of headers seen in PRESYNC *)
+    }
+  | Redownload of {
+      target_hash : Types.hash256;   (* Hash we're redownloading to *)
+      expected_work : Cstruct.t;     (* Expected cumulative work at target *)
+      headers_received : int;        (* Headers received during redownload *)
+    }
+  | Synced  (* Header sync complete for this peer *)
+
+(* Convert header sync state to string for logging *)
+let header_sync_state_to_string = function
+  | Presync { count; _ } -> Printf.sprintf "presync (count=%d)" count
+  | Redownload { headers_received; _ } ->
+    Printf.sprintf "redownload (received=%d)" headers_received
+  | Synced -> "synced"
+
+(* Per-peer low-work header sync tracking.
+   This state is maintained for each peer doing header sync, and is
+   destroyed when the peer disconnects or completes sync. *)
+type peer_header_sync = {
+  peer_id : int;
+  mutable state : header_sync_state;
+  mutable last_getheaders_time : float;  (* Rate limiting *)
+  chain_start_hash : Types.hash256;       (* Hash where we started syncing *)
+  chain_start_height : int;               (* Height where we started syncing *)
+}
 
 (* Sync state machine *)
 type sync_state =
@@ -52,6 +114,227 @@ let headers_response_timeout = 120.0  (* 2 min per header response *)
 
 (* Per-peer header flood threshold *)
 let max_headers_per_peer = 10_000     (* Disconnect if peer sends this many with insufficient work *)
+
+(* PRESYNC/REDOWNLOAD constants *)
+let max_headers_per_message = 2000    (* Protocol limit on headers per message *)
+let getheaders_rate_limit = 2.0       (* Minimum seconds between getheaders requests *)
+
+(* ============================================================================
+   PRESYNC/REDOWNLOAD Implementation
+   ============================================================================ *)
+
+(* Create initial PRESYNC state for a peer.
+   chain_start is the header entry where we fork from our known chain. *)
+let create_presync_state ~(peer_id : int) ~(chain_start : header_entry)
+    : peer_header_sync =
+  {
+    peer_id;
+    state = Presync {
+      cumulative_work = Cstruct.create 32;  (* Start with zero work *)
+      last_hash = chain_start.hash;
+      last_bits = chain_start.header.bits;
+      count = 0;
+    };
+    last_getheaders_time = 0.0;
+    chain_start_hash = chain_start.hash;
+    chain_start_height = chain_start.height;
+  }
+
+(* Validate a single header during PRESYNC (minimal validation without storage).
+   Only checks: prev_block continuity, proof-of-work validity.
+   Does NOT check: timestamp, MTP, or store the header.
+   Returns: Ok (hash, work, bits) or Error message *)
+let validate_presync_header ~(expected_prev : Types.hash256)
+    ~(header : Types.block_header) : (Types.hash256 * Cstruct.t * int32, string) result =
+  let hash = Crypto.compute_block_hash header in
+  (* Check prev_block links to expected *)
+  if not (Cstruct.equal header.prev_block expected_prev) then
+    Error "PRESYNC: header prev_block mismatch"
+  (* Check proof of work *)
+  else if not (Consensus.hash_meets_target hash header.bits) then
+    Error "PRESYNC: insufficient proof of work"
+  else
+    let work = Consensus.work_from_compact header.bits in
+    Ok (hash, work, header.bits)
+
+(* Process headers during PRESYNC phase.
+   Validates each header minimally and accumulates work.
+   Returns: updated state, Ok count if successful, Error if validation fails *)
+let process_presync_headers ~(ps : peer_header_sync)
+    ~(headers : Types.block_header list)
+    ~(network : Consensus.network_config)
+    : (int, string) result =
+  match ps.state with
+  | Presync presync_data ->
+    let cumulative_work = ref presync_data.cumulative_work in
+    let last_hash = ref presync_data.last_hash in
+    let last_bits = ref presync_data.last_bits in
+    let count = ref presync_data.count in
+    let error = ref None in
+    List.iter (fun header ->
+      if !error = None then
+        match validate_presync_header ~expected_prev:!last_hash ~header with
+        | Error e -> error := Some e
+        | Ok (hash, work, bits) ->
+          cumulative_work := Consensus.work_add !cumulative_work work;
+          last_hash := hash;
+          last_bits := bits;
+          incr count
+    ) headers;
+    begin match !error with
+    | Some e -> Error e
+    | None ->
+      (* Update PRESYNC state *)
+      let new_state = Presync {
+        cumulative_work = !cumulative_work;
+        last_hash = !last_hash;
+        last_bits = !last_bits;
+        count = !count;
+      } in
+      ps.state <- new_state;
+      (* Check if we should transition to REDOWNLOAD *)
+      if Consensus.work_compare !cumulative_work network.minimum_chain_work >= 0 then begin
+        Logs.info (fun m ->
+          m "PRESYNC complete for peer %d: %d headers, work >= minimum_chain_work"
+            ps.peer_id !count);
+        (* Transition to REDOWNLOAD *)
+        ps.state <- Redownload {
+          target_hash = !last_hash;
+          expected_work = !cumulative_work;
+          headers_received = 0;
+        };
+      end;
+      Ok (List.length headers)
+    end
+  | Redownload _ | Synced ->
+    Error "process_presync_headers called in wrong state"
+
+(* Check if peer should use low-work header sync (PRESYNC/REDOWNLOAD).
+   Returns true if the peer's announced work is below minimum_chain_work
+   and we should use the anti-DoS mechanism. *)
+let needs_lowwork_sync ~(chain_state : chain_state) : bool =
+  let tip_work = match chain_state.tip with
+    | Some t -> t.total_work
+    | None -> Consensus.zero_work
+  in
+  Consensus.work_compare tip_work chain_state.network.minimum_chain_work < 0
+
+(* Process headers during REDOWNLOAD phase.
+   These headers are validated AND stored since we've already verified
+   sufficient chain work during PRESYNC. *)
+let process_redownload_headers ~(ps : peer_header_sync)
+    ~(headers : Types.block_header list)
+    ~(chain_state : chain_state)
+    : (int, string) result =
+  match ps.state with
+  | Redownload rd_data ->
+    let accepted = ref 0 in
+    let error = ref None in
+    (* Find the parent entry for the first header *)
+    let prev_hash = ref (if headers = [] then rd_data.target_hash
+      else (List.hd headers).prev_block) in
+    List.iter (fun header ->
+      if !error = None then begin
+        let hash = Crypto.compute_block_hash header in
+        let hash_key = Cstruct.to_string hash in
+        (* Skip if already known *)
+        if Hashtbl.mem chain_state.headers hash_key then begin
+          prev_hash := hash;
+          incr accepted
+        end else begin
+          (* Find parent *)
+          let parent_key = Cstruct.to_string header.prev_block in
+          match Hashtbl.find_opt chain_state.headers parent_key with
+          | None ->
+            error := Some "REDOWNLOAD: unknown parent header"
+          | Some parent ->
+            (* Check proof of work *)
+            if not (Consensus.hash_meets_target hash header.bits) then
+              error := Some "REDOWNLOAD: insufficient proof of work"
+            else begin
+              let height = parent.height + 1 in
+              let work = Consensus.work_add parent.total_work
+                  (Consensus.work_from_compact header.bits) in
+              let entry = {
+                header;
+                hash;
+                height;
+                total_work = work;
+              } in
+              (* Store header *)
+              Hashtbl.replace chain_state.headers hash_key entry;
+              Storage.ChainDB.store_block_header chain_state.db hash header;
+              Storage.ChainDB.set_height_hash chain_state.db height hash;
+              (* Update tip if this has more work *)
+              let is_new_tip = match chain_state.tip with
+                | None -> true
+                | Some tip -> Consensus.work_compare work tip.total_work > 0
+              in
+              if is_new_tip then begin
+                chain_state.tip <- Some entry;
+                Storage.ChainDB.set_header_tip chain_state.db hash height;
+                chain_state.headers_synced <- height
+              end;
+              prev_hash := hash;
+              incr accepted
+            end
+        end
+      end
+    ) headers;
+    begin match !error with
+    | Some e -> Error e
+    | None ->
+      (* Update REDOWNLOAD state *)
+      let new_received = rd_data.headers_received + !accepted in
+      ps.state <- Redownload {
+        rd_data with headers_received = new_received;
+      };
+      (* Check if we've reached the target *)
+      if Cstruct.equal !prev_hash rd_data.target_hash then begin
+        Logs.info (fun m ->
+          m "REDOWNLOAD complete for peer %d: %d headers stored"
+            ps.peer_id new_received);
+        ps.state <- Synced
+      end;
+      Ok !accepted
+    end
+  | Presync _ | Synced ->
+    Error "process_redownload_headers called in wrong state"
+
+(* Determine which state a header sync message should be processed in.
+   Used by the sync loop to dispatch to the correct handler. *)
+let get_header_sync_phase (ps : peer_header_sync) : [`Presync | `Redownload | `Synced] =
+  match ps.state with
+  | Presync _ -> `Presync
+  | Redownload _ -> `Redownload
+  | Synced -> `Synced
+
+(* Build a getheaders locator for REDOWNLOAD phase.
+   Returns a locator starting from genesis to request all headers. *)
+let build_redownload_locator (chain_state : chain_state) : Types.hash256 list =
+  (* Start from genesis for full redownload *)
+  [Crypto.compute_block_hash chain_state.network.genesis_header]
+
+(* Build a getheaders locator for PRESYNC continuation.
+   Returns a locator with just the last known hash. *)
+let build_presync_locator (ps : peer_header_sync) : Types.hash256 list =
+  match ps.state with
+  | Presync { last_hash; _ } -> [last_hash]
+  | Redownload { target_hash; _ } -> [target_hash]
+  | Synced -> []
+
+(* Should we request more headers from this peer?
+   Checks rate limiting and whether sync is complete. *)
+let should_request_more_headers (ps : peer_header_sync) : bool =
+  match ps.state with
+  | Synced -> false
+  | Presync _ | Redownload _ ->
+    let now = Unix.gettimeofday () in
+    now -. ps.last_getheaders_time >= getheaders_rate_limit
+
+(* Mark that we sent a getheaders request (for rate limiting) *)
+let mark_getheaders_sent (ps : peer_header_sync) : unit =
+  ps.last_getheaders_time <- Unix.gettimeofday ()
 
 (* Compute proof-of-work from compact target (nBits) as a 256-bit integer.
    Delegates to Consensus.work_from_compact which uses

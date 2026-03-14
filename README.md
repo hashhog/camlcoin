@@ -42,6 +42,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Misbehavior scoring and peer banning (100-point threshold, 24h bans)
 - [x] Pre-handshake message rejection (60s timeout, self-connection detection)
 - [x] Inventory trickling (Poisson-scheduled tx relay, 5s inbound, 2s outbound)
+- [x] Eclipse attack protections (bucketing, multi-criteria eviction, netgroup diversity, anchors)
 - [ ] Compact block relay (BIP 152)
 - [ ] Bloom filters (BIP 37)
 

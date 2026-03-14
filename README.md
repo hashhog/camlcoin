@@ -44,6 +44,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Inventory trickling (Poisson-scheduled tx relay, 5s inbound, 2s outbound)
 - [x] Eclipse attack protections (bucketing, multi-criteria eviction, netgroup diversity, anchors)
 - [x] Stale peer eviction (headers timeout, block stalling, ping timeout, 45s check)
+- [x] Checkpoint verification (hardcoded checkpoints, assume_valid, minimum_chain_work)
 - [ ] Compact block relay (BIP 152)
 - [ ] Bloom filters (BIP 37)
 

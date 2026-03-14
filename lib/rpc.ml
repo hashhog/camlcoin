@@ -168,9 +168,12 @@ let handle_getblock (ctx : rpc_context)
        in
        (* Stripped size = (total_weight - total_size) / 3 *)
        let stripped_size = (total_weight - total_size) / 3 in
+       let tip_height = match ctx.chain.tip with Some t -> t.height | None -> 0 in
+       let confirmations = tip_height - height + 1 in
+       let median_time = Sync.compute_median_time_past ctx.chain height in
        Ok (`Assoc [
          ("hash", `String hash_hex);
-         ("confirmations", `Int 1);
+         ("confirmations", `Int confirmations);
          ("size", `Int total_size);
          ("strippedsize", `Int stripped_size);
          ("weight", `Int total_weight);
@@ -183,7 +186,7 @@ let handle_getblock (ctx : rpc_context)
            `String (Types.hash256_to_hex_display (Crypto.compute_txid tx))
          ) block.transactions));
          ("time", `Int (Int32.to_int block.header.timestamp));
-         ("mediantime", `Int (Int32.to_int block.header.timestamp));
+         ("mediantime", `Int (Int32.to_int median_time));
          ("nonce", `Int (Int32.to_int block.header.nonce));
          ("bits", `String (Printf.sprintf "%08lx" block.header.bits));
          ("difficulty", `Float (Consensus.difficulty_from_bits block.header.bits));
@@ -216,21 +219,28 @@ let handle_getblockheader (ctx : rpc_context)
          | Some e -> Types.hash256_to_hex_display e.total_work
          | None -> "0000000000000000000000000000000000000000000000000000000000000000"
        in
+       let tip_height = match ctx.chain.tip with Some t -> t.height | None -> 0 in
+       let confirmations = tip_height - height + 1 in
+       let median_time = Sync.compute_median_time_past ctx.chain height in
+       let n_tx = match Storage.ChainDB.get_block ctx.chain.db hash with
+         | Some block -> List.length block.transactions
+         | None -> 0
+       in
        Ok (`Assoc [
          ("hash", `String hash_hex);
-         ("confirmations", `Int 1);
+         ("confirmations", `Int confirmations);
          ("height", `Int height);
          ("version", `Int (Int32.to_int header.version));
          ("versionHex", `String (Printf.sprintf "%08lx" header.version));
          ("merkleroot", `String
            (Types.hash256_to_hex_display header.merkle_root));
          ("time", `Int (Int32.to_int header.timestamp));
-         ("mediantime", `Int (Int32.to_int header.timestamp));
+         ("mediantime", `Int (Int32.to_int median_time));
          ("nonce", `Int (Int32.to_int header.nonce));
          ("bits", `String (Printf.sprintf "%08lx" header.bits));
          ("difficulty", `Float (Consensus.difficulty_from_bits header.bits));
          ("chainwork", `String chainwork);
-         ("nTx", `Int 0);
+         ("nTx", `Int n_tx);
          ("previousblockhash", `String
            (Types.hash256_to_hex_display header.prev_block));
        ]))
@@ -347,7 +357,7 @@ let handle_getrawtransaction (ctx : rpc_context)
        Ok (`Assoc [
          ("txid", `String txid_hex);
          ("version", `Int (Int32.to_int tx.version));
-         ("size", `Int (Validation.compute_tx_vsize tx));
+         ("size", `Int (Validation.compute_tx_size tx));
          ("vsize", `Int (Validation.compute_tx_vsize tx));
          ("weight", `Int (Validation.compute_tx_weight tx));
          ("locktime", `Int (Int32.to_int tx.locktime));
@@ -420,7 +430,7 @@ let handle_decoderawtransaction (_ctx : rpc_context)
       Ok (`Assoc [
         ("txid", `String (Types.hash256_to_hex_display txid));
         ("version", `Int (Int32.to_int tx.version));
-        ("size", `Int (Validation.compute_tx_vsize tx));
+        ("size", `Int (Validation.compute_tx_size tx));
         ("vsize", `Int (Validation.compute_tx_vsize tx));
         ("weight", `Int (Validation.compute_tx_weight tx));
         ("locktime", `Int (Int32.to_int tx.locktime));

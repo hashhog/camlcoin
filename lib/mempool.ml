@@ -1001,7 +1001,20 @@ let signals_rbf (tx : Types.transaction) : bool =
     Int32.compare inp.Types.sequence 0xFFFFFFFEl < 0
   ) tx.inputs
 
-(* Attempt to replace an existing transaction with higher fee *)
+(* Get total fees for a transaction and all its descendants *)
+let get_fees_with_descendants (mp : mempool) (entry : mempool_entry) : int64 =
+  let desc = get_descendants mp entry.txid in
+  let desc_fees = List.fold_left (fun acc d -> Int64.add acc d.fee) 0L desc in
+  Int64.add entry.fee desc_fees
+
+(* Attempt to replace an existing transaction with higher fee.
+   Full RBF: no BIP125 signaling required (-mempoolfullrbf=1 default).
+
+   Rules enforced:
+   1. New fee > sum of all conflicting fees (including descendants)
+   2. New fee_rate > conflicting fee_rate + incremental_relay_fee
+   3. Max 100 transactions evicted
+   4. No new unconfirmed inputs (except from conflicting txs) *)
 let replace_by_fee (mp : mempool) (tx : Types.transaction)
     : (mempool_entry, string) result =
   let conflicts = find_all_conflicts mp tx in
@@ -1010,128 +1023,143 @@ let replace_by_fee (mp : mempool) (tx : Types.transaction)
     (* No conflict, just add normally *)
     add_transaction mp tx
   | _ ->
-    (* Rule 1: All conflicting transactions must signal RBF *)
-    let all_signal = List.for_all (fun e -> signals_rbf e.tx) conflicts in
-    if not all_signal then
-      Error "Existing transaction does not signal RBF"
-    else begin
-      (* Calculate new transaction fee *)
-      let input_sum = ref 0L in
-      let error = ref None in
+    (* Full RBF: no BIP125 signaling check required *)
+    (* Calculate new transaction fee *)
+    let input_sum = ref 0L in
+    let error = ref None in
 
-      List.iter (fun inp ->
-        if !error = None then begin
-          let prev = inp.Types.previous_output in
-          match lookup_utxo mp prev with
-          | None -> error := Some "Missing input"
-          | Some entry ->
-            input_sum := Int64.add !input_sum entry.value
-        end
-      ) tx.inputs;
+    List.iter (fun inp ->
+      if !error = None then begin
+        let prev = inp.Types.previous_output in
+        match lookup_utxo mp prev with
+        | None -> error := Some "Missing input"
+        | Some entry ->
+          input_sum := Int64.add !input_sum entry.value
+      end
+    ) tx.inputs;
 
-      match !error with
-      | Some e -> Error e
-      | None ->
-        let output_sum = List.fold_left
-          (fun acc out -> Int64.add acc out.Types.value)
-          0L tx.outputs in
+    match !error with
+    | Some e -> Error e
+    | None ->
+      let output_sum = List.fold_left
+        (fun acc out -> Int64.add acc out.Types.value)
+        0L tx.outputs in
 
-        if output_sum > !input_sum then
-          Error "Output exceeds input"
+      if output_sum > !input_sum then
+        Error "Output exceeds input"
+      else begin
+        let new_fee = Int64.sub !input_sum output_sum in
+        let new_weight = Validation.compute_tx_weight tx in
+        let new_vsize = max 1 ((new_weight + 3) / 4) in
+        let new_feerate = Int64.to_float new_fee /. float_of_int new_vsize in
+
+        (* Rule 3: Calculate total evictions first (conflicts + all descendants) *)
+        let all_evicted = ref [] in
+        List.iter (fun conflict_entry ->
+          all_evicted := conflict_entry :: !all_evicted;
+          let desc = get_descendants mp conflict_entry.txid in
+          all_evicted := desc @ !all_evicted
+        ) conflicts;
+        let eviction_count = List.length !all_evicted in
+
+        if eviction_count > max_rbf_evictions then
+          Error (Printf.sprintf
+            "RBF would evict %d transactions (max %d)"
+            eviction_count max_rbf_evictions)
+
         else begin
-          let new_fee = Int64.sub !input_sum output_sum in
-
-          (* Rule 3: Replacement must have higher feerate than each direct conflict *)
-          let new_weight = Validation.compute_tx_weight tx in
-          let new_vsize = max 1 (new_weight / 4) in
-          let new_feerate = Int64.to_float new_fee /. float_of_int new_vsize in
-          let low_feerate_conflict = List.find_opt (fun e ->
-            let conflict_vsize = max 1 (e.weight / 4) in
-            let conflict_feerate = Int64.to_float e.fee /. float_of_int conflict_vsize in
-            new_feerate <= conflict_feerate
-          ) conflicts in
-
-          match low_feerate_conflict with
-          | Some conflict ->
-            let conflict_vsize = max 1 (conflict.weight / 4) in
-            let conflict_feerate = Int64.to_float conflict.fee /. float_of_int conflict_vsize in
-            Error (Printf.sprintf
-              "Replacement feerate %.2f sat/vB not higher than conflicting tx feerate %.2f sat/vB (RBF Rule 3)"
-              new_feerate conflict_feerate)
-          | None ->
-
-          (* Total fee of all conflicting transactions *)
+          (* Rule 1: Total fee of all conflicting transactions INCLUDING descendants *)
           let total_conflict_fee = List.fold_left
-            (fun acc e -> Int64.add acc e.fee)
+            (fun acc e -> Int64.add acc (get_fees_with_descendants mp e))
             0L conflicts in
 
-          (* Rule 4: New fee must be higher than total conflict fee *)
           if new_fee <= total_conflict_fee then
             Error (Printf.sprintf
-              "Replacement fee %Ld not higher than total conflicting fee %Ld"
+              "Replacement fee %Ld not higher than total conflicting fee %Ld (including descendants)"
               new_fee total_conflict_fee)
 
           else begin
-            (* Rule 2: Replacement must not introduce new unconfirmed inputs *)
-            let has_new_unconfirmed = List.exists (fun inp ->
-              let prev = inp.Types.previous_output in
-              (* If input is unconfirmed (from mempool) *)
-              if not (is_confirmed_utxo mp prev) then begin
-                (* Check if this unconfirmed input was also used by a conflicting tx *)
-                let was_in_conflicts = List.exists (fun conflict_entry ->
-                  List.exists (fun conflict_inp ->
-                    Cstruct.equal conflict_inp.Types.previous_output.txid prev.txid &&
-                    conflict_inp.Types.previous_output.vout = prev.vout
-                  ) conflict_entry.tx.inputs
-                ) conflicts in
-                not was_in_conflicts
-              end else
-                false
-            ) tx.inputs in
+            (* Rule 2: Replacement must pay at least incremental_relay_fee more per kvB.
+               This ensures the additional fees cover the bandwidth for relaying. *)
+            let incremental_fee = Int64.of_float (
+              Int64.to_float mp.min_relay_fee *.
+              float_of_int new_vsize /. 1000.0) in
+            let required_fee = Int64.add total_conflict_fee incremental_fee in
 
-            if has_new_unconfirmed then
-              Error "Replacement introduces new unconfirmed inputs (RBF Rule 2)"
+            if new_fee < required_fee then
+              Error (Printf.sprintf
+                "Replacement fee %Ld too low (need >= %Ld = conflict fee %Ld + relay fee %Ld)"
+                new_fee required_fee total_conflict_fee incremental_fee)
 
             else begin
-              (* Rule 5: Replacement fee >= old fee + min_relay_fee * replacement_size / 1000 *)
-              let replacement_weight = Validation.compute_tx_weight tx in
-              let replacement_vsize = (replacement_weight + 3) / 4 in
-              let incremental_fee = Int64.of_float (
-                Int64.to_float mp.min_relay_fee *.
-                float_of_int replacement_vsize /. 1000.0) in
-              let required_fee = Int64.add total_conflict_fee incremental_fee in
+              (* Additional check: new feerate must be higher than each direct conflict's feerate *)
+              let low_feerate_conflict = List.find_opt (fun e ->
+                let conflict_vsize = max 1 ((e.weight + 3) / 4) in
+                let conflict_feerate = Int64.to_float e.fee /. float_of_int conflict_vsize in
+                new_feerate <= conflict_feerate
+              ) conflicts in
 
-              if new_fee < required_fee then
+              match low_feerate_conflict with
+              | Some conflict ->
+                let conflict_vsize = max 1 ((conflict.weight + 3) / 4) in
+                let conflict_feerate = Int64.to_float conflict.fee /. float_of_int conflict_vsize in
                 Error (Printf.sprintf
-                  "Replacement fee %Ld too low (need >= %Ld = conflict fee %Ld + relay fee %Ld)"
-                  new_fee required_fee total_conflict_fee incremental_fee)
+                  "Replacement feerate %.2f sat/vB not higher than conflicting tx feerate %.2f sat/vB"
+                  new_feerate conflict_feerate)
+              | None ->
+
+              (* Rule 4: Replacement must not introduce new unconfirmed inputs *)
+              let has_new_unconfirmed = List.exists (fun inp ->
+                let prev = inp.Types.previous_output in
+                (* If input is unconfirmed (from mempool) *)
+                if not (is_confirmed_utxo mp prev) then begin
+                  (* Check if this unconfirmed input was also used by a conflicting tx *)
+                  let was_in_conflicts = List.exists (fun conflict_entry ->
+                    List.exists (fun conflict_inp ->
+                      Cstruct.equal conflict_inp.Types.previous_output.txid prev.txid &&
+                      conflict_inp.Types.previous_output.vout = prev.vout
+                    ) conflict_entry.tx.inputs
+                  ) conflicts in
+                  not was_in_conflicts
+                end else
+                  false
+              ) tx.inputs in
+
+              if has_new_unconfirmed then
+                Error "Replacement introduces new unconfirmed inputs"
 
               else begin
-                (* Rule 6: Max 100 evicted transactions (originals + all descendants) *)
-                let eviction_count = ref 0 in
+                (* Remove all conflicting transactions and their descendants, then add new *)
                 List.iter (fun conflict_entry ->
-                  incr eviction_count;  (* The conflict itself *)
-                  let desc = get_descendants mp conflict_entry.txid in
-                  eviction_count := !eviction_count + List.length desc
+                  remove_transaction mp conflict_entry.txid
                 ) conflicts;
-
-                if !eviction_count > max_rbf_evictions then
-                  Error (Printf.sprintf
-                    "RBF would evict %d transactions (max %d)"
-                    !eviction_count max_rbf_evictions)
-
-                else begin
-                  (* Remove all conflicting transactions and add new *)
-                  List.iter (fun conflict_entry ->
-                    remove_transaction mp conflict_entry.txid
-                  ) conflicts;
-                  add_transaction mp tx
-                end
+                add_transaction mp tx
               end
             end
           end
         end
-    end
+      end
+
+(* Accept a transaction with full RBF support.
+   If the transaction conflicts with existing mempool entries, automatically
+   attempts replacement if the new transaction pays higher fees.
+   This is the main entry point for accepting transactions with full RBF. *)
+let accept_transaction ?(dry_run=false) (mp : mempool) (tx : Types.transaction)
+    : (mempool_entry, string) result =
+  (* First check if there are conflicts *)
+  let conflicts = find_all_conflicts mp tx in
+  match conflicts with
+  | [] ->
+    (* No conflicts, use normal add_transaction *)
+    add_transaction ~dry_run mp tx
+  | _ ->
+    if dry_run then
+      (* For dry_run, just check if RBF would succeed by doing validation *)
+      (* We can't actually call replace_by_fee since it modifies state *)
+      Error "txn-mempool-conflict (dry run with conflicts)"
+    else
+      (* Attempt full RBF replacement *)
+      replace_by_fee mp tx
 
 (* ============================================================================
    Orphan Transaction Pool (Task 8)

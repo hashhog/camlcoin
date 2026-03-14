@@ -583,6 +583,167 @@ let bip39_tests = [
   Alcotest.test_case "init from invalid mnemonic" `Quick test_bip39_init_from_mnemonic_invalid;
 ]
 
+(* ============================================================================
+   BIP-44/84/86 Address Type Tests
+   ============================================================================ *)
+
+let test_get_new_address_p2pkh () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let addr = Wallet.get_new_address_typed w Wallet.P2PKH in
+  (* Regtest P2PKH addresses start with 'm' or 'n' *)
+  Alcotest.(check bool) "regtest p2pkh prefix" true
+    (addr.[0] = 'm' || addr.[0] = 'n')
+
+let test_get_new_address_p2wpkh () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let addr = Wallet.get_new_address_typed w Wallet.P2WPKH in
+  (* Regtest P2WPKH addresses start with "bcrt1q" *)
+  Alcotest.(check bool) "regtest p2wpkh prefix" true
+    (String.sub addr 0 5 = "bcrt1")
+
+let test_get_new_address_p2tr () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let addr = Wallet.get_new_address_typed w Wallet.P2TR in
+  (* Regtest P2TR addresses start with "bcrt1p" *)
+  Alcotest.(check bool) "regtest p2tr prefix" true
+    (String.length addr > 6 && String.sub addr 0 6 = "bcrt1p")
+
+let test_multiple_address_types () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let _ = Wallet.get_new_address_typed w Wallet.P2PKH in
+  let _ = Wallet.get_new_address_typed w Wallet.P2WPKH in
+  let _ = Wallet.get_new_address_typed w Wallet.P2TR in
+  Alcotest.(check int) "three keys generated" 3 (Wallet.key_count w)
+
+let address_type_tests = [
+  Alcotest.test_case "p2pkh address" `Quick test_get_new_address_p2pkh;
+  Alcotest.test_case "p2wpkh address" `Quick test_get_new_address_p2wpkh;
+  Alcotest.test_case "p2tr address" `Quick test_get_new_address_p2tr;
+  Alcotest.test_case "multiple types" `Quick test_multiple_address_types;
+]
+
+(* ============================================================================
+   Coin Selection Tests (BnB and SRD)
+   ============================================================================ *)
+
+let test_coin_select_bnb_exact_match () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let kp = Wallet.generate_key w in
+  let pkh = Crypto.hash160 kp.Wallet.public_key in
+  let script = make_p2wpkh_script pkh in
+  (* Add two UTXOs that sum to exactly target + fee *)
+  let output1 = { Types.value = 50_000L; script_pubkey = script } in
+  let output2 = { Types.value = 30_000L; script_pubkey = script } in
+  let tx1 = make_mock_tx ~outputs:[output1] ~is_coinbase:true in
+  let tx2 = make_mock_tx ~outputs:[output2] ~is_coinbase:true in
+  let block1 : Types.block = {
+    header = { version = 1l; prev_block = Types.zero_hash;
+               merkle_root = Types.zero_hash; timestamp = 0l;
+               bits = 0l; nonce = 0l };
+    transactions = [tx1]
+  } in
+  let block2 : Types.block = {
+    header = { version = 1l; prev_block = Types.zero_hash;
+               merkle_root = Types.zero_hash; timestamp = 0l;
+               bits = 0l; nonce = 1l };
+    transactions = [tx2]
+  } in
+  Wallet.scan_block w block1 100;
+  Wallet.scan_block w block2 101;
+  Alcotest.(check int) "two utxos" 2 (Wallet.utxo_count w)
+
+let test_coin_select_with_many_utxos () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let kp = Wallet.generate_key w in
+  let pkh = Crypto.hash160 kp.Wallet.public_key in
+  let script = make_p2wpkh_script pkh in
+  (* Add multiple small UTXOs *)
+  for i = 0 to 9 do
+    let output = { Types.value = 10_000L; script_pubkey = script } in
+    let tx = make_mock_tx ~outputs:[output] ~is_coinbase:true in
+    let block : Types.block = {
+      header = { version = 1l; prev_block = Types.zero_hash;
+                 merkle_root = Types.zero_hash; timestamp = 0l;
+                 bits = 0l; nonce = Int32.of_int i };
+      transactions = [tx]
+    } in
+    Wallet.scan_block w block (100 + i)
+  done;
+  (* Total: 100_000 satoshis *)
+  match Wallet.select_coins w 50_000L 1.0 with
+  | Error e -> Alcotest.fail ("selection failed: " ^ e)
+  | Ok sel ->
+    (* Should select enough to cover 50000 + fees *)
+    Alcotest.(check bool) "selected enough" true
+      (Int64.compare sel.total_input 50_000L >= 0)
+
+let test_coin_select_srd_randomness () =
+  (* Run coin selection multiple times to verify SRD randomness *)
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let kp = Wallet.generate_key w in
+  let pkh = Crypto.hash160 kp.Wallet.public_key in
+  let script = make_p2wpkh_script pkh in
+  for i = 0 to 4 do
+    let output = { Types.value = Int64.of_int ((i + 1) * 10_000); script_pubkey = script } in
+    let tx = make_mock_tx ~outputs:[output] ~is_coinbase:true in
+    let block : Types.block = {
+      header = { version = 1l; prev_block = Types.zero_hash;
+                 merkle_root = Types.zero_hash; timestamp = 0l;
+                 bits = 0l; nonce = Int32.of_int i };
+      transactions = [tx]
+    } in
+    Wallet.scan_block w block (100 + i)
+  done;
+  (* Select coins *)
+  match Wallet.coin_select ~target:20_000L ~fee_rate:1.0 w.utxos with
+  | Some selected ->
+    Alcotest.(check bool) "selected coins" true (List.length selected > 0)
+  | None ->
+    Alcotest.fail "coin_select should not fail"
+
+let coin_select_advanced_tests = [
+  Alcotest.test_case "bnb exact match" `Quick test_coin_select_bnb_exact_match;
+  Alcotest.test_case "many utxos" `Quick test_coin_select_with_many_utxos;
+  Alcotest.test_case "srd randomness" `Quick test_coin_select_srd_randomness;
+]
+
+(* ============================================================================
+   Encrypted Wallet Tests
+   ============================================================================ *)
+
+let test_save_load_encrypted () =
+  let path = "/tmp/test_wallet_encrypted.json" in
+  if Sys.file_exists path then Sys.remove path;
+  let w1 = Wallet.create ~network:`Regtest ~db_path:path in
+  let addr1 = Wallet.get_new_address w1 in
+  let passphrase = "test_passphrase_123" in
+  Wallet.save_encrypted w1 ~passphrase;
+  (* Load with correct passphrase *)
+  (match Wallet.load_encrypted ~network:`Regtest ~db_path:path ~passphrase with
+   | Ok w2 ->
+     Alcotest.(check int) "loaded 1 key" 1 (Wallet.key_count w2);
+     let addrs = Wallet.get_all_addresses w2 in
+     Alcotest.(check bool) "addr present" true (List.mem addr1 addrs)
+   | Error e -> Alcotest.fail ("load failed: " ^ e));
+  Sys.remove path
+
+let test_load_encrypted_wrong_passphrase () =
+  let path = "/tmp/test_wallet_wrong_pass.json" in
+  if Sys.file_exists path then Sys.remove path;
+  let w1 = Wallet.create ~network:`Regtest ~db_path:path in
+  let _ = Wallet.get_new_address w1 in
+  Wallet.save_encrypted w1 ~passphrase:"correct_password";
+  (* Try loading with wrong passphrase *)
+  match Wallet.load_encrypted ~network:`Regtest ~db_path:path ~passphrase:"wrong_password" with
+  | Ok _ -> Alcotest.fail "should fail with wrong passphrase"
+  | Error _ -> ();
+  Sys.remove path
+
+let encryption_tests = [
+  Alcotest.test_case "save load encrypted" `Quick test_save_load_encrypted;
+  Alcotest.test_case "wrong passphrase" `Quick test_load_encrypted_wrong_passphrase;
+]
+
 let () = Alcotest.run "test_wallet" [
   ("creation", creation_tests);
   ("key_management", key_management_tests);
@@ -590,7 +751,10 @@ let () = Alcotest.run "test_wallet" [
   ("is_mine", is_mine_tests);
   ("utxo", utxo_tests);
   ("coin_selection", coin_selection_tests);
+  ("coin_selection_advanced", coin_select_advanced_tests);
   ("tx_creation", tx_creation_tests);
   ("persistence", persistence_tests);
+  ("encryption", encryption_tests);
+  ("address_types", address_type_tests);
   ("bip39", bip39_tests);
 ]

@@ -47,7 +47,8 @@ type rpc_context = {
   chain : Sync.chain_state;
   mempool : Mempool.mempool;
   peer_manager : Peer_manager.t;
-  wallet : Wallet.t option;
+  wallet : Wallet.t option;  (* Legacy: single wallet for backward compat *)
+  wallet_manager : Wallet.wallet_manager option;  (* Multi-wallet support *)
   fee_estimator : Fee_estimation.t;
   network : Consensus.network_config;
 }
@@ -1417,6 +1418,146 @@ let handle_listtransactions (ctx : rpc_context)
     ) entries)
 
 (* ============================================================================
+   Multi-Wallet Management Handlers
+   ============================================================================ *)
+
+(* Helper: get wallet by name from wallet manager, or fall back to legacy wallet *)
+let get_wallet_for_request (ctx : rpc_context) (wallet_name : string option)
+    : (Wallet.t, string) result =
+  match ctx.wallet_manager with
+  | Some wm ->
+    let name = Option.value wallet_name ~default:"" in
+    (match Wallet.get_wallet wm name with
+     | Some w -> Ok w
+     | None ->
+       if name = "" then
+         (* Fall back to legacy wallet if no default in manager *)
+         (match ctx.wallet with
+          | Some w -> Ok w
+          | None -> Error "No wallet loaded")
+       else
+         Error (Printf.sprintf "Wallet \"%s\" not found" name))
+  | None ->
+    (* Legacy single-wallet mode *)
+    (match ctx.wallet with
+     | Some w -> Ok w
+     | None -> Error "Wallet not loaded")
+
+(* createwallet "name" ( disable_private_keys blank "passphrase" avoid_reuse descriptors load_on_startup ) *)
+let handle_createwallet (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match ctx.wallet_manager with
+  | None -> Error "Wallet manager not initialized"
+  | Some wm ->
+    let name = match params with
+      | `String n :: _ -> n
+      | [] -> ""
+      | _ -> ""
+    in
+    let disable_private_keys = match List.nth_opt params 1 with
+      | Some (`Bool b) -> b
+      | _ -> false
+    in
+    let blank = match List.nth_opt params 2 with
+      | Some (`Bool b) -> b
+      | _ -> false
+    in
+    let passphrase = match List.nth_opt params 3 with
+      | Some (`String s) when s <> "" -> Some s
+      | _ -> None
+    in
+    let avoid_reuse = match List.nth_opt params 4 with
+      | Some (`Bool b) -> b
+      | _ -> false
+    in
+    let options = {
+      Wallet.disable_private_keys;
+      blank;
+      passphrase;
+      avoid_reuse;
+      descriptors = true;
+      load_on_startup = None;
+    } in
+    match Wallet.create_wallet wm name ~options () with
+    | Ok _wallet ->
+      Ok (`Assoc [
+        ("name", `String name);
+        ("warning", `String (if blank then "Empty wallet created" else ""));
+      ])
+    | Error e -> Error e
+
+(* loadwallet "name" ( load_on_startup ) *)
+let handle_loadwallet (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match ctx.wallet_manager with
+  | None -> Error "Wallet manager not initialized"
+  | Some wm ->
+    match params with
+    | `String name :: _ ->
+      (match Wallet.load_wallet wm name with
+       | Ok _wallet ->
+         Ok (`Assoc [
+           ("name", `String name);
+           ("warning", `String "");
+         ])
+       | Error e -> Error e)
+    | _ -> Error "Invalid parameters: expected [wallet_name]"
+
+(* unloadwallet ( "wallet_name" load_on_startup ) *)
+let handle_unloadwallet (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match ctx.wallet_manager with
+  | None -> Error "Wallet manager not initialized"
+  | Some wm ->
+    let name = match params with
+      | `String n :: _ -> n
+      | [] -> ""
+      | _ -> ""
+    in
+    match Wallet.unload_wallet wm name with
+    | Ok () ->
+      Ok (`Assoc [("warning", `String "")])
+    | Error e -> Error e
+
+(* listwallets *)
+let handle_listwallets (ctx : rpc_context)
+    (_params : Yojson.Safe.t list) : Yojson.Safe.t =
+  match ctx.wallet_manager with
+  | None ->
+    (* Legacy mode: return single wallet name if present *)
+    (match ctx.wallet with
+     | Some _ -> `List [`String ""]
+     | None -> `List [])
+  | Some wm ->
+    let names = Wallet.list_wallets wm in
+    `List (List.map (fun n -> `String n) names)
+
+(* getwalletinfo - returns info about the currently selected wallet *)
+let handle_getwalletinfo (ctx : rpc_context)
+    (wallet_name : string option) (_params : Yojson.Safe.t list)
+    : (Yojson.Safe.t, string) result =
+  match get_wallet_for_request ctx wallet_name with
+  | Error e -> Error e
+  | Ok wallet ->
+    let name = Option.value wallet_name ~default:"" in
+    let info = Wallet.get_wallet_info name wallet in
+    Ok (`Assoc [
+      ("walletname", `String info.Wallet.wallet_name);
+      ("walletversion", `Int info.wallet_version);
+      ("format", `String info.format);
+      ("balance", `Float info.balance);
+      ("unconfirmed_balance", `Float info.unconfirmed_balance);
+      ("immature_balance", `Float info.immature_balance);
+      ("txcount", `Int info.tx_count);
+      ("keypoolsize", `Int info.keypoolsize);
+      ("private_keys_enabled", `Bool info.private_keys_enabled);
+      ("avoid_reuse", `Bool info.avoid_reuse);
+      ("scanning", `Bool info.scanning);
+      ("descriptors", `Bool info.descriptors);
+      ("external_signer", `Bool info.external_signer);
+    ])
+
+(* ============================================================================
    Address Validation Handler
    ============================================================================ *)
 
@@ -2160,6 +2301,26 @@ let dispatch_rpc (ctx : rpc_context)
      | Ok r -> Ok r
      | Error msg -> Error (rpc_wallet_error, msg))
 
+  (* Wallet Management *)
+  | "createwallet" ->
+    (match handle_createwallet ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_wallet_error, msg))
+  | "loadwallet" ->
+    (match handle_loadwallet ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_wallet_error, msg))
+  | "unloadwallet" ->
+    (match handle_unloadwallet ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_wallet_error, msg))
+  | "listwallets" ->
+    Ok (handle_listwallets ctx params)
+  | "getwalletinfo" ->
+    (match handle_getwalletinfo ctx None params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_wallet_error, msg))
+
   (* Control *)
   | "stop" ->
     Ok (handle_stop ctx)
@@ -2239,6 +2400,27 @@ let handle_batch_request (ctx : rpc_context) (requests : Yojson.Safe.t list)
                     ~message:(Printexc.to_string exn))
   ) requests
 
+(* Extract wallet name from URI path: /wallet/<name> or / *)
+let extract_wallet_from_uri (uri : Uri.t) : string option =
+  let path = Uri.path uri in
+  if String.length path > 8 && String.sub path 0 8 = "/wallet/" then
+    Some (String.sub path 8 (String.length path - 8))
+  else if path = "/" || path = "" then
+    None  (* Use default wallet *)
+  else
+    None
+
+(* Create a context with wallet override for specific wallet routing *)
+let context_with_wallet (ctx : rpc_context) (wallet_name : string option) : rpc_context =
+  match wallet_name, ctx.wallet_manager with
+  | None, _ -> ctx  (* Use existing context *)
+  | Some name, Some wm ->
+    (* Override wallet in context with specific wallet from manager *)
+    (match Wallet.get_wallet wm name with
+     | Some w -> { ctx with wallet = Some w }
+     | None -> ctx)
+  | Some _, None -> ctx  (* No manager, use existing *)
+
 let start_rpc_server ~(ctx : rpc_context)
     ~(host : string) ~(port : int)
     ~(rpc_user : string) ~(rpc_password : string)
@@ -2257,6 +2439,11 @@ let start_rpc_server ~(ctx : rpc_context)
   let callback _conn req body =
     let headers = Cohttp.Request.headers req in
     let meth = Cohttp.Request.meth req in
+    let uri = Cohttp.Request.uri req in
+
+    (* Extract wallet name from URI for multi-wallet routing *)
+    let wallet_name = extract_wallet_from_uri uri in
+    let request_ctx = context_with_wallet ctx wallet_name in
 
     (* Only accept POST requests *)
     if meth <> `POST then begin
@@ -2297,7 +2484,7 @@ let start_rpc_server ~(ctx : rpc_context)
           end
           else begin
             (* Process batch requests in parallel *)
-            let* responses = handle_batch_request ctx requests in
+            let* responses = handle_batch_request request_ctx requests in
             let response_body = Yojson.Safe.to_string (`List responses) in
             let response_headers = Cohttp.Header.init_with
               "Content-Type" "application/json" in
@@ -2309,7 +2496,7 @@ let start_rpc_server ~(ctx : rpc_context)
 
         (* Single request: JSON object *)
         | `Assoc _ as single_request ->
-          let result = handle_single_request ctx single_request in
+          let result = handle_single_request request_ctx single_request in
           let response_body = Yojson.Safe.to_string result in
           let response_headers = Cohttp.Header.init_with
             "Content-Type" "application/json" in
@@ -2359,8 +2546,22 @@ let create_context
     ~(peer_manager : Peer_manager.t)
     ~(wallet : Wallet.t option)
     ~(fee_estimator : Fee_estimation.t)
+    ~(network : Consensus.network_config)
+    ?(wallet_manager : Wallet.wallet_manager option = None) () : rpc_context =
+  { chain; mempool; peer_manager; wallet; wallet_manager; fee_estimator; network }
+
+(* Create an RPC context with multi-wallet support *)
+let create_context_with_wallet_manager
+    ~(chain : Sync.chain_state)
+    ~(mempool : Mempool.mempool)
+    ~(peer_manager : Peer_manager.t)
+    ~(wallet_manager : Wallet.wallet_manager)
+    ~(fee_estimator : Fee_estimation.t)
     ~(network : Consensus.network_config) : rpc_context =
-  { chain; mempool; peer_manager; wallet; fee_estimator; network }
+  (* Get default wallet from manager for backward compatibility *)
+  let wallet = Wallet.get_default_wallet wallet_manager in
+  { chain; mempool; peer_manager; wallet; wallet_manager = Some wallet_manager;
+    fee_estimator; network }
 
 (* Default RPC ports by network *)
 let default_port (network : Consensus.network_config) : int =

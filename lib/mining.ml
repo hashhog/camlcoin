@@ -60,8 +60,8 @@ let compute_ancestor_fee_rate (entry : Mempool.mempool_entry)
   else Int64.to_float total_fee /. float_of_int total_weight
 
 (* Select transactions from mempool using ancestor fee rate (CPFP).
-   Uses iterative approach: pick best ancestor-fee-rate tx, select it
-   and its unselected ancestors, update rates, repeat. *)
+   Pre-sorts by ancestor fee rate and iterates in descending order,
+   re-evaluating rates only when ancestors are consumed. *)
 let select_transactions (mp : Mempool.mempool) (max_weight : int)
     : (Types.transaction * int64) list =
   let all_entries = Mempool.get_sorted_transactions mp in
@@ -71,67 +71,46 @@ let select_transactions (mp : Mempool.mempool) (max_weight : int)
   let included_txids = Hashtbl.create 100 in
   let available_weight = max_weight - coinbase_reserve_weight in
 
-  (* Build a hashtbl of remaining (unselected, not yet skipped) entries *)
-  let remaining = Hashtbl.create 100 in
-  List.iter (fun (entry : Mempool.mempool_entry) ->
-    Hashtbl.replace remaining (Cstruct.to_string entry.txid) entry
-  ) all_entries;
+  (* Pre-compute ancestor fee rates and sort descending *)
+  let rated_entries = List.map (fun (entry : Mempool.mempool_entry) ->
+    let rate = compute_ancestor_fee_rate entry mp included_txids in
+    (rate, entry)
+  ) all_entries in
+  let sorted = List.sort (fun (r1, _) (r2, _) -> compare r2 r1) rated_entries in
 
-  let continue = ref true in
-  while !continue do
-    (* Find the unselected entry with the best ancestor fee rate *)
-    let best = ref None in
-    let best_rate = ref neg_infinity in
-    Hashtbl.iter (fun _key (entry : Mempool.mempool_entry) ->
-      let rate = compute_ancestor_fee_rate entry mp included_txids in
-      if rate > !best_rate then begin
-        best_rate := rate;
-        best := Some entry
-      end
-    ) remaining;
-
-    match !best with
-    | None -> continue := false
-    | Some best_entry ->
-      (* Collect the package: unselected ancestors + the tx itself *)
+  List.iter (fun (_, (best_entry : Mempool.mempool_entry)) ->
+    let key = Cstruct.to_string best_entry.txid in
+    if Hashtbl.mem included_txids key then ()
+    else begin
       let ancestors = Mempool.get_ancestors mp best_entry.txid in
       let unselected_ancestors = List.filter (fun (a : Mempool.mempool_entry) ->
         not (Hashtbl.mem included_txids (Cstruct.to_string a.txid))
       ) ancestors in
-      (* Package = unselected ancestors (in dependency order) + best_entry *)
       let package = unselected_ancestors @ [best_entry] in
 
-      (* Calculate total package weight *)
       let pkg_weight = List.fold_left
         (fun acc (e : Mempool.mempool_entry) -> acc + e.weight)
         0 package in
 
-      (* Calculate total package sigops cost *)
       let pkg_sigops = List.fold_left (fun acc (e : Mempool.mempool_entry) ->
         acc + Mempool.count_tx_sigops_cost e.tx
       ) 0 package in
 
-      if !total_sigops_cost + pkg_sigops > Consensus.max_block_sigops_cost then begin
-        (* Package exceeds sigops cost limit; skip it *)
-        Hashtbl.remove remaining (Cstruct.to_string best_entry.txid)
-      end else if !current_weight + pkg_weight <= available_weight then begin
-        (* Select the entire package *)
+      if !total_sigops_cost + pkg_sigops > Consensus.max_block_sigops_cost then
+        ()
+      else if !current_weight + pkg_weight <= available_weight then begin
         List.iter (fun (e : Mempool.mempool_entry) ->
-          let key = Cstruct.to_string e.txid in
-          if not (Hashtbl.mem included_txids key) then begin
+          let ekey = Cstruct.to_string e.txid in
+          if not (Hashtbl.mem included_txids ekey) then begin
             selected := (e.tx, e.fee) :: !selected;
             current_weight := !current_weight + e.weight;
-            Hashtbl.replace included_txids key ();
-            Hashtbl.remove remaining key
+            Hashtbl.replace included_txids ekey ()
           end
         ) package;
         total_sigops_cost := !total_sigops_cost + pkg_sigops
-      end else begin
-        (* Package doesn't fit; remove this entry from remaining
-           and try the next best *)
-        Hashtbl.remove remaining (Cstruct.to_string best_entry.txid)
       end
-  done;
+    end
+  ) sorted;
 
   List.rev !selected
 
@@ -326,9 +305,30 @@ let create_block_template ~(chain : Sync.chain_state)
   let now = Int32.of_float (Unix.gettimeofday ()) in
   let timestamp = max (Int32.add mtp 1l) now in
 
-  (* Use difficulty from parent (simplified - real implementation
-     would check for difficulty adjustment) *)
-  let bits = tip.header.bits in
+  (* Compute correct difficulty target using consensus rules *)
+  let bits =
+    let get_block_info h =
+      let rec find_entry entry =
+        if entry.Sync.height = h then
+          (entry.Sync.header.timestamp, entry.Sync.header.bits)
+        else if entry.height = 0 then
+          (entry.Sync.header.timestamp, entry.Sync.header.bits)
+        else
+          let parent_key = Cstruct.to_string entry.header.prev_block in
+          match Hashtbl.find_opt chain.headers parent_key with
+          | Some parent -> find_entry parent
+          | None -> (entry.Sync.header.timestamp, entry.Sync.header.bits)
+      in
+      find_entry tip
+    in
+    Consensus.get_next_work_required
+      ~height
+      ~block_time:timestamp
+      ~prev_block_time:tip.header.timestamp
+      ~prev_bits:tip.header.bits
+      ~get_block_info
+      ~network:chain.network
+  in
 
   let header : Types.block_header = {
     version = 0x20000000l;

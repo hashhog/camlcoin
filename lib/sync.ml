@@ -666,8 +666,11 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
             process_and_continue state headers count loop
         end else
           process_and_continue state headers count loop
+      | Some (P2p.PingMsg nonce) ->
+        let* () = Peer.send_message peer (P2p.PongMsg nonce) in
+        loop ()
       | Some msg ->
-        Logs.warn (fun m -> m "Unexpected message during header sync: %s"
+        Logs.debug (fun m -> m "Non-header message during header sync: %s"
           (P2p.command_to_string (P2p.payload_to_command msg)));
         loop ()
     end
@@ -816,6 +819,8 @@ type orphan_block_entry = {
 type ibd_state = {
   chain : chain_state;
   mutable block_queue : block_queue_entry list;
+  queue_by_hash : (string, block_queue_entry) Hashtbl.t;
+  queue_by_height : (int, block_queue_entry) Hashtbl.t;
   mutable next_download_height : int;
   mutable next_process_height : int;
   mutable total_blocks_in_flight : int;
@@ -823,7 +828,7 @@ type ibd_state = {
   mutable blocks_since_flush : int;
   mutable pending_utxo_updates : (Types.hash256 * int * string) list;
   mutable pending_utxo_deletes : (Types.hash256 * int) list;
-  utxo_set : Utxo.OptimizedUtxoSet.t option;  (* Wire UTXO flush *)
+  utxo_set : Utxo.OptimizedUtxoSet.t option;
   mutable mempool : Mempool.mempool option;
   orphan_blocks : (string, orphan_block_entry) Hashtbl.t;
   misbehavior_handler : (int -> string -> unit) option;
@@ -836,6 +841,8 @@ let create_ibd_state ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
   let start_height = chain.blocks_synced + 1 in
   { chain;
     block_queue = [];
+    queue_by_hash = Hashtbl.create 1024;
+    queue_by_height = Hashtbl.create 1024;
     next_download_height = start_height;
     next_process_height = start_height;
     total_blocks_in_flight = 0;
@@ -850,6 +857,29 @@ let create_ibd_state ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
 
 let set_mempool (ibd : ibd_state) (mp : Mempool.mempool) =
   ibd.mempool <- Some mp
+
+(* Add an entry to the block queue with O(1) index updates *)
+let queue_add (ibd : ibd_state) (entry : block_queue_entry) =
+  ibd.block_queue <- ibd.block_queue @ [entry];
+  Hashtbl.replace ibd.queue_by_hash (Cstruct.to_string entry.hash) entry;
+  Hashtbl.replace ibd.queue_by_height entry.height entry
+
+(* Remove validated entries from the block queue *)
+let queue_remove_validated (ibd : ibd_state) =
+  let removed = List.filter (fun e -> e.download_state = Validated) ibd.block_queue in
+  List.iter (fun e ->
+    Hashtbl.remove ibd.queue_by_hash (Cstruct.to_string e.hash);
+    Hashtbl.remove ibd.queue_by_height e.height
+  ) removed;
+  ibd.block_queue <- List.filter (fun e -> e.download_state <> Validated) ibd.block_queue
+
+(* O(1) lookup by hash *)
+let queue_find_by_hash (ibd : ibd_state) (hash_key : string) : block_queue_entry option =
+  Hashtbl.find_opt ibd.queue_by_hash hash_key
+
+(* O(1) lookup by height *)
+let queue_find_by_height (ibd : ibd_state) (height : int) : block_queue_entry option =
+  Hashtbl.find_opt ibd.queue_by_height height
 
 (* Get or create peer download state *)
 let get_peer_state (ibd : ibd_state) (peer_id : int) : peer_download_state =
@@ -883,11 +913,11 @@ let fill_download_queue (ibd : ibd_state) : unit =
     | Some hash ->
       (* Only add if we don't already have the block *)
       if not (Storage.ChainDB.has_block ibd.chain.db hash) then begin
-        ibd.block_queue <- ibd.block_queue @ [{
+        queue_add ibd {
           hash;
           height;
           download_state = NotRequested;
-        }]
+        }
       end;
       ibd.next_download_height <- ibd.next_download_height + 1
     | None ->
@@ -1057,9 +1087,7 @@ let receive_block (ibd : ibd_state) (block : Types.block)
     : (unit, string) result =
   let hash = Crypto.compute_block_hash block.header in
   let hash_key = Cstruct.to_string hash in
-  match List.find_opt (fun (e : block_queue_entry) ->
-    Cstruct.to_string e.hash = hash_key
-  ) ibd.block_queue with
+  match queue_find_by_hash ibd hash_key with
   | None ->
     (* Unrequested block - store as orphan if pool isn't full *)
     let prev_hash = block.header.prev_block in
@@ -1201,7 +1229,7 @@ let process_orphan_blocks (ibd : ibd_state) (parent_hash : Types.hash256) : int 
            height = header_entry.height;
            download_state = Downloaded { block = orphan.block; peer_id = None };
          } in
-         ibd.block_queue <- ibd.block_queue @ [queue_entry];
+         queue_add ibd queue_entry;
          incr processed;
          Logs.debug (fun m ->
            m "Moved orphan block %s (height %d) to block queue"
@@ -1306,9 +1334,7 @@ let process_downloaded_blocks (ibd : ibd_state)
   let error = ref None in
   let continue = ref true in
   while !continue && !error = None do
-    match List.find_opt (fun e ->
-      e.height = ibd.next_process_height
-    ) ibd.block_queue with
+    match queue_find_by_height ibd ibd.next_process_height with
     | Some entry -> begin
       match entry.download_state with
       | Downloaded { block; peer_id } ->
@@ -1415,8 +1441,7 @@ let process_downloaded_blocks (ibd : ibd_state)
            (* Check for orphan blocks that depend on this one *)
            ignore (process_orphan_blocks ibd entry.hash);
            (* Remove validated entries from queue *)
-           ibd.block_queue <- List.filter
-             (fun e -> e.download_state <> Validated) ibd.block_queue
+           queue_remove_validated ibd
          | Error e ->
            (* Record misbehavior for the peer that sent this block *)
            (match peer_id with

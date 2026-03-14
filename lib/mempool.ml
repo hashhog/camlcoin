@@ -69,6 +69,8 @@ type mempool = {
   (* Orphan pool *)
   orphans : (string, orphan_entry) Hashtbl.t;
   max_orphans : int;
+  (* Spending index: outpoint (txid_str * vout) -> spending txid_str for O(1) conflict detection *)
+  map_next_tx : (string * int32, string) Hashtbl.t;
 }
 
 (* ============================================================================
@@ -185,7 +187,8 @@ let create ?(require_standard=true) ?(verify_scripts=true)
     require_standard;
     verify_scripts;
     orphans = Hashtbl.create 100;
-    max_orphans = 100 }
+    max_orphans = 100;
+    map_next_tx = Hashtbl.create 10_000 }
 
 (* ============================================================================
    Basic Queries
@@ -238,7 +241,8 @@ let is_confirmed_utxo (mp : mempool) (outpoint : Types.outpoint) : bool =
    Transaction Removal
    ============================================================================ *)
 
-(* Remove a transaction and its dependents recursively *)
+(* Remove a transaction and its dependents recursively.
+   Collects dependent txids before removal to avoid mutating Hashtbl during iteration. *)
 let rec remove_transaction (mp : mempool) (txid : Types.hash256) : unit =
   let txid_key = Cstruct.to_string txid in
   match Hashtbl.find_opt mp.entries txid_key with
@@ -247,11 +251,17 @@ let rec remove_transaction (mp : mempool) (txid : Types.hash256) : unit =
     Hashtbl.remove mp.entries txid_key;
     mp.total_weight <- mp.total_weight - entry.weight;
     mp.total_fee <- Int64.sub mp.total_fee entry.fee;
-    (* Remove dependents (transactions that spend our outputs) *)
-    Hashtbl.iter (fun _k dep ->
+    List.iter (fun inp ->
+      let out_key = (Cstruct.to_string inp.Types.previous_output.txid,
+                     inp.Types.previous_output.vout) in
+      Hashtbl.remove mp.map_next_tx out_key
+    ) entry.tx.inputs;
+    let dependent_txids = Hashtbl.fold (fun _k dep acc ->
       if List.exists (fun d -> Cstruct.equal d txid) dep.depends_on then
-        remove_transaction mp dep.txid
-    ) mp.entries
+        dep.txid :: acc
+      else acc
+    ) mp.entries [] in
+    List.iter (fun dep_txid -> remove_transaction mp dep_txid) dependent_txids
 
 (* ============================================================================
    Ancestor/Descendant Tracking
@@ -1105,21 +1115,19 @@ let truc_signals_rbf (tx : Types.transaction) : bool =
    Conflict Detection
    ============================================================================ *)
 
-(* Find all conflicting transactions (not just first) *)
+(* Find all conflicting transactions using the spending index for O(1) lookups *)
 let find_all_conflicts (mp : mempool) (tx : Types.transaction)
     : mempool_entry list =
   let conflicts = Hashtbl.create 4 in
   List.iter (fun inp ->
-    Hashtbl.iter (fun _k entry ->
-      List.iter (fun entry_inp ->
-        if Cstruct.equal
-             entry_inp.Types.previous_output.txid
-             inp.Types.previous_output.txid &&
-           entry_inp.previous_output.vout =
-             inp.previous_output.vout then
-          Hashtbl.replace conflicts (Cstruct.to_string entry.txid) entry
-      ) entry.tx.inputs
-    ) mp.entries
+    let key = (Cstruct.to_string inp.Types.previous_output.txid,
+               inp.Types.previous_output.vout) in
+    match Hashtbl.find_opt mp.map_next_tx key with
+    | Some spending_txid_key ->
+      (match Hashtbl.find_opt mp.entries spending_txid_key with
+       | Some entry -> Hashtbl.replace conflicts spending_txid_key entry
+       | None -> ())
+    | None -> ()
   ) tx.inputs;
   Hashtbl.fold (fun _ v acc -> v :: acc) conflicts []
 
@@ -1127,22 +1135,18 @@ let find_all_conflicts (mp : mempool) (tx : Types.transaction)
 let check_conflict (mp : mempool) (tx : Types.transaction)
     : Types.hash256 option =
   let conflict = ref None in
-
   List.iter (fun inp ->
-    if !conflict = None then
-      Hashtbl.iter (fun _k entry ->
-        if !conflict = None then
-          List.iter (fun entry_inp ->
-            if Cstruct.equal
-                 entry_inp.Types.previous_output.txid
-                 inp.Types.previous_output.txid &&
-               entry_inp.previous_output.vout =
-                 inp.previous_output.vout then
-              conflict := Some entry.txid
-          ) entry.tx.inputs
-      ) mp.entries
+    if !conflict = None then begin
+      let key = (Cstruct.to_string inp.Types.previous_output.txid,
+                 inp.Types.previous_output.vout) in
+      match Hashtbl.find_opt mp.map_next_tx key with
+      | Some spending_txid_key ->
+        (match Hashtbl.find_opt mp.entries spending_txid_key with
+         | Some entry -> conflict := Some entry.txid
+         | None -> ())
+      | None -> ()
+    end
   ) tx.inputs;
-
   !conflict
 
 (* ============================================================================
@@ -1208,7 +1212,7 @@ let verify_tx_scripts (mp : mempool) (tx : Types.transaction)
 (* Validate and add a transaction to the mempool.
    When ~dry_run:true, all validation is performed but the transaction
    is not actually inserted into the mempool. *)
-let add_transaction ?(dry_run=false) (mp : mempool) (tx : Types.transaction)
+let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (tx : Types.transaction)
     : (mempool_entry, string) result =
   let txid = Crypto.compute_txid tx in
   let txid_key = Cstruct.to_string txid in
@@ -1311,7 +1315,7 @@ let add_transaction ?(dry_run=false) (mp : mempool) (tx : Types.transaction)
               Int64.to_float mp.min_relay_fee *.
               float_of_int weight /. 4000.0) in
 
-            if fee < min_fee then
+            if fee < min_fee && not bypass_fee_check then
               Error "Fee below minimum relay fee"
 
             (* Cluster size limit check (replaces ancestor/descendant limits for cluster mempool) *)
@@ -1351,6 +1355,11 @@ let add_transaction ?(dry_run=false) (mp : mempool) (tx : Types.transaction)
               Hashtbl.replace mp.entries txid_key entry;
               mp.total_weight <- mp.total_weight + weight;
               mp.total_fee <- Int64.add mp.total_fee fee;
+              List.iter (fun inp ->
+                let out_key = (Cstruct.to_string inp.Types.previous_output.txid,
+                               inp.Types.previous_output.vout) in
+                Hashtbl.replace mp.map_next_tx out_key txid_key
+              ) tx.inputs;
 
               (* Evict if over size limit - use cluster-based eviction *)
               if mp.total_weight > mp.max_size_bytes / 4 then
@@ -2299,46 +2308,10 @@ let accept_package (mp : mempool) (txs : Types.transaction list)
           if not passes_feerate then
             rejected := (tx, "Fee below minimum relay fee (not enough CPFP)") :: !rejected
           else begin
-            (* Validate and add - use bypass_fee_check for package context *)
-            let bypass_fee = use_package_feerate in
-            (* Build entry directly to bypass fee check when package rate is good *)
+            (* Always use add_transaction to ensure full validation including
+               script verification. Pass ~bypass_fee_check for CPFP packages. *)
             let add_result =
-              if bypass_fee then begin
-                (* Direct add bypassing fee check for CPFP packages *)
-                let txid_key = Cstruct.to_string txid in
-                if Hashtbl.mem mp.entries txid_key then
-                  Error "Transaction already in mempool"
-                else begin
-                  let weight = Validation.compute_tx_weight tx in
-                  let fee_rate = Int64.to_float fee /. float_of_int weight in
-                  (* Find dependencies *)
-                  let depends = List.filter_map (fun inp ->
-                    let prev_key = Cstruct.to_string inp.Types.previous_output.txid in
-                    if Hashtbl.mem mp.entries prev_key then
-                      Some inp.Types.previous_output.txid
-                    else if Hashtbl.mem package_txids prev_key then
-                      Some inp.Types.previous_output.txid
-                    else None
-                  ) tx.Types.inputs in
-                  let wtxid = Crypto.compute_wtxid tx in
-                  let entry = {
-                    tx;
-                    txid;
-                    wtxid;
-                    fee;
-                    weight;
-                    fee_rate;
-                    time_added = Unix.gettimeofday ();
-                    height_added = mp.current_height;
-                    depends_on = depends;
-                  } in
-                  Hashtbl.replace mp.entries txid_key entry;
-                  mp.total_weight <- mp.total_weight + weight;
-                  mp.total_fee <- Int64.add mp.total_fee fee;
-                  Ok entry
-                end
-              end else
-                add_transaction mp tx
+              add_transaction ~bypass_fee_check:use_package_feerate mp tx
             in
             match add_result with
             | Ok entry -> accepted := entry :: !accepted

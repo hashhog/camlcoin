@@ -465,15 +465,11 @@ let compute_taproot_output_key (internal_pk : Cstruct.t) (merkle_root : Cstruct.
   if Cstruct.length internal_pk <> 32 then
     failwith "compute_taproot_output_key: internal_pk must be 32 bytes";
   let tweak = compute_taproot_tweak internal_pk merkle_root in
-  try
-    let result = xonly_tweak_add_raw
-      (cstruct_to_bigstring internal_pk)
-      (cstruct_to_bigstring tweak)
-    in
-    bigstring_to_cstruct result
-  with _ ->
-    (* Fallback: if FFI fails, return internal_pk unchanged (for testing) *)
-    internal_pk
+  let result = xonly_tweak_add_raw
+    (cstruct_to_bigstring internal_pk)
+    (cstruct_to_bigstring tweak)
+  in
+  bigstring_to_cstruct result
 
 (* ============================================================================
    Hardware-Accelerated ECDSA Verification

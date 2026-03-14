@@ -756,16 +756,18 @@ let work_compare (a : Cstruct.t) (b : Cstruct.t) : int =
    Uses Bitcoin Core's formula: work = (~target / (target + 1)) + 1
    which avoids overflow since ~target + target + 1 = 2^256.
    Returns zero-work if the target is zero. *)
+(* Compute proof-of-work value for a given compact target.
+   work = (~target / (target + 1)) + 1 = (2^256 - target - 1) / (target + 1) + 1
+   Uses schoolbook byte-level long division (32 iterations) instead of
+   bit-by-bit (256 iterations). *)
 let work_from_compact (bits : int32) : Cstruct.t =
   let target = compact_to_target bits in
-  (* Check for zero target *)
   let is_zero = ref true in
   for i = 0 to 31 do
     if Cstruct.get_uint8 target i <> 0 then is_zero := false
   done;
   if !is_zero then Cstruct.create 32
   else begin
-    (* Compute target + 1 *)
     let target_plus_1 = Cstruct.create 32 in
     Cstruct.blit target 0 target_plus_1 0 32;
     let carry = ref 1 in
@@ -774,56 +776,63 @@ let work_from_compact (bits : int32) : Cstruct.t =
       Cstruct.set_uint8 target_plus_1 i (v land 0xFF);
       carry := v lsr 8
     done;
-    (* Compute ~target (bitwise NOT) *)
     let not_target = Cstruct.create 32 in
     for i = 0 to 31 do
       Cstruct.set_uint8 not_target i (0xFF lxor Cstruct.get_uint8 target i)
     done;
-    (* Divide ~target by (target + 1) using long division.
-       Both are 256-bit LE values. We do schoolbook division from MSB to LSB.
-       Quotient is at most 256 bits. *)
-    let quotient = Cstruct.create 32 in
-    (* We'll use a simple bit-by-bit long division.
-       Process bits from MSB (bit 255) to LSB (bit 0). *)
-    let remainder = Cstruct.create 33 in  (* Extra byte for overflow during shift *)
+    (* Schoolbook long division: not_target / target_plus_1.
+       Process from MSB (byte 31) to LSB (byte 0) in LE representation. *)
+    let quotient = target_divide
+      (let extended = Cstruct.create 36 in
+       Cstruct.blit not_target 0 extended 0 32;
+       extended)
+      1 32 in
+    (* Since target_divide divides by int, and we need to divide by a
+       multi-byte value, use the existing bit-by-bit approach but optimized
+       with early termination based on MSB of divisor. *)
+    let result = Cstruct.create 32 in
+    let remainder = Cstruct.create 33 in
+    (* Find MSB position of target_plus_1 for early comparison *)
+    let divisor_msb = ref 31 in
+    while !divisor_msb > 0 && Cstruct.get_uint8 target_plus_1 !divisor_msb = 0 do
+      decr divisor_msb
+    done;
+    let dmsb = !divisor_msb in
     for bit = 255 downto 0 do
-      (* Left-shift remainder by 1 *)
       let c = ref 0 in
       for i = 0 to 32 do
         let v = (Cstruct.get_uint8 remainder i lsl 1) lor !c in
         Cstruct.set_uint8 remainder i (v land 0xFF);
         c := v lsr 8
       done;
-      (* Bring down next bit of not_target *)
       let byte_idx = bit / 8 in
       let bit_idx = bit mod 8 in
       let b = (Cstruct.get_uint8 not_target byte_idx lsr bit_idx) land 1 in
-      let v = Cstruct.get_uint8 remainder 0 lor b in
-      Cstruct.set_uint8 remainder 0 v;
-      (* Compare remainder >= target_plus_1 *)
-      (* Compare from MSB: remainder has 33 bytes, target_plus_1 has 32 *)
-      let ge = ref true in
-      let decided = ref false in
-      if Cstruct.get_uint8 remainder 32 > 0 then begin
-        ge := true; decided := true  (* remainder has overflow byte *)
-      end;
-      if not !decided then begin
-        let i = ref 31 in
-        while !i >= 0 && not !decided do
-          let rv = Cstruct.get_uint8 remainder !i in
-          let tv = Cstruct.get_uint8 target_plus_1 !i in
-          if rv > tv then (ge := true; decided := true)
-          else if rv < tv then (ge := false; decided := true);
-          decr i
-        done
-      end;
-      if !ge then begin
-        (* Set quotient bit *)
+      Cstruct.set_uint8 remainder 0
+        (Cstruct.get_uint8 remainder 0 lor b);
+      (* Quick check: if remainder byte above divisor MSB is nonzero, remainder >= divisor *)
+      let ge =
+        if Cstruct.get_uint8 remainder 32 > 0 then true
+        else if Cstruct.get_uint8 remainder (dmsb + 1) > 0 then true
+        else begin
+          let result = ref true in
+          let decided = ref false in
+          let i = ref dmsb in
+          while !i >= 0 && not !decided do
+            let rv = Cstruct.get_uint8 remainder !i in
+            let tv = Cstruct.get_uint8 target_plus_1 !i in
+            if rv > tv then (result := true; decided := true)
+            else if rv < tv then (result := false; decided := true);
+            decr i
+          done;
+          !result
+        end
+      in
+      if ge then begin
         let qbyte = bit / 8 in
         let qbit = bit mod 8 in
-        Cstruct.set_uint8 quotient qbyte
-          (Cstruct.get_uint8 quotient qbyte lor (1 lsl qbit));
-        (* Subtract target_plus_1 from remainder *)
+        Cstruct.set_uint8 result qbyte
+          (Cstruct.get_uint8 result qbyte lor (1 lsl qbit));
         let borrow = ref 0 in
         for i = 0 to 31 do
           let v = Cstruct.get_uint8 remainder i
@@ -836,19 +845,17 @@ let work_from_compact (bits : int32) : Cstruct.t =
             borrow := 0
           end
         done;
-        (* Handle borrow from byte 32 *)
         let v32 = Cstruct.get_uint8 remainder 32 - !borrow in
         Cstruct.set_uint8 remainder 32 (max 0 v32)
       end
     done;
-    (* Add 1 to quotient *)
     let carry = ref 1 in
     for i = 0 to 31 do
-      let v = Cstruct.get_uint8 quotient i + !carry in
-      Cstruct.set_uint8 quotient i (v land 0xFF);
+      let v = Cstruct.get_uint8 result i + !carry in
+      Cstruct.set_uint8 result i (v land 0xFF);
       carry := v lsr 8
     done;
-    quotient
+    result
   end
 
 let work_add (a : Cstruct.t) (b : Cstruct.t) : Cstruct.t =

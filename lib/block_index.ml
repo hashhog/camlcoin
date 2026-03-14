@@ -264,18 +264,30 @@ type gcs_filter = {
   encoded : string;   (** Golomb-Rice encoded data *)
 }
 
-(** FastRange64: map a hash to [0, range) without bias
-    Equivalent to (hash * range) >> 64 but using 128-bit multiplication *)
+(** FastRange64: map a hash to [0, range) without bias.
+    Computes (hash * range) >> 64 using exact 128-bit arithmetic by splitting
+    each 64-bit value into two 32-bit halves and cross-multiplying. *)
 let fast_range64 hash range =
-  (* Approximate using floating point for now since OCaml doesn't have native
-     128-bit integers. This matches Bitcoin Core's FastRange64. *)
-  let h = Int64.to_float hash in
-  let r = Int64.to_float range in
-  (* Handle negative interpretation of int64 *)
-  let h = if h < 0.0 then h +. 18446744073709551616.0 else h in
-  let r = if r < 0.0 then r +. 18446744073709551616.0 else r in
-  let result = (h *. r) /. 18446744073709551616.0 in
-  Int64.of_float result
+  let mask32 = 0xFFFFFFFFL in
+  let h_lo = Int64.logand hash mask32 in
+  let h_hi = Int64.shift_right_logical hash 32 in
+  let r_lo = Int64.logand range mask32 in
+  let r_hi = Int64.shift_right_logical range 32 in
+  (* 128-bit product = h_hi*r_hi*(2^64) + (h_hi*r_lo + h_lo*r_hi)*(2^32) + h_lo*r_lo
+     We only need the upper 64 bits, i.e. bits [127:64] of the product. *)
+  let lo_lo = Int64.mul h_lo r_lo in
+  let lo_hi = Int64.mul h_lo r_hi in
+  let hi_lo = Int64.mul h_hi r_lo in
+  let hi_hi = Int64.mul h_hi r_hi in
+  (* Carry from lower 64 bits into upper 64 bits:
+     mid_sum = (lo_lo >> 32) + lo32(lo_hi) + lo32(hi_lo) *)
+  let mid_sum = Int64.add
+    (Int64.shift_right_logical lo_lo 32)
+    (Int64.add (Int64.logand lo_hi mask32) (Int64.logand hi_lo mask32)) in
+  let carry = Int64.shift_right_logical mid_sum 32 in
+  Int64.add hi_hi
+    (Int64.add (Int64.shift_right_logical lo_hi 32)
+      (Int64.add (Int64.shift_right_logical hi_lo 32) carry))
 
 (** Hash an element to the filter's range [0, N*M) *)
 let hash_to_range params f element =

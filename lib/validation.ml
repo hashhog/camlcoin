@@ -1019,19 +1019,6 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
   match check_block ~network block height ~expected_bits ~median_time with
   | Error e -> Error e
   | Ok () ->
-    (* BIP-141 weighted sigops cost check.
-       Build a script_pubkey lookup from the base UTXO set for sigop counting. *)
-    let prev_script_pubkey_lookup outpoint =
-      match base_lookup outpoint with
-      | Some utxo -> Some utxo.script_pubkey
-      | None -> None
-    in
-    let total_sigops_cost =
-      count_block_sigops_cost block ~prev_script_pubkey_lookup ~flags in
-    if total_sigops_cost > Consensus.max_block_sigops_cost then
-      Error BlockTooManySigops
-    else
-
     (* Build local UTXO set for intra-block spending *)
     let local_utxos : (string * int32, utxo) Hashtbl.t = Hashtbl.create 64 in
     let spent_in_block : (string * int32, unit) Hashtbl.t = Hashtbl.create 64 in
@@ -1039,16 +1026,16 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
     (* Lookup that checks local UTXOs first, then base *)
     let lookup outpoint =
       let key = (Cstruct.to_string outpoint.Types.txid, outpoint.Types.vout) in
-      (* Check if already spent in this block *)
       if Hashtbl.mem spent_in_block key then
         None
       else
-        (* Check local UTXOs from this block *)
         match Hashtbl.find_opt local_utxos key with
         | Some utxo -> Some utxo
         | None -> base_lookup outpoint
     in
 
+    (* Accumulate sigops during per-tx validation so intra-block UTXOs are visible *)
+    let total_sigops_cost = ref 0 in
     let total_fees = ref 0L in
     let error = ref None in
 
@@ -1062,6 +1049,20 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
           let n_outputs = List.length tx.outputs in
           if not (check_bip30 ~lookup:base_lookup ~txid ~n_outputs) then
             error := Some (BlockTxValidationFailed (i, TxDuplicateTxid))
+        end;
+
+        (* BIP-141 per-tx sigops cost, accumulated across block.
+           Uses full lookup so intra-block outputs are visible for P2SH/witness. *)
+        if !error = None then begin
+          let prev_script_pubkey_lookup outpoint =
+            match lookup outpoint with
+            | Some utxo -> Some utxo.script_pubkey
+            | None -> None
+          in
+          let tx_sigops = count_tx_sigops_cost tx ~prev_script_pubkey_lookup ~flags in
+          total_sigops_cost := !total_sigops_cost + tx_sigops;
+          if !total_sigops_cost > Consensus.max_block_sigops_cost then
+            error := Some BlockTooManySigops
         end;
 
         (* Validate inputs (skip for coinbase) *)

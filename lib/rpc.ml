@@ -1822,7 +1822,9 @@ let handle_signrawtransactionwithkey (ctx : rpc_context)
              (match script_type with
               | Script.P2TR_script _ ->
                 let sighash = Script.compute_sighash_taproot tx i prevouts 0x00 () in
-                let sig_bytes = Crypto.schnorr_sign ~privkey ~msg:sighash in
+                let xonly_pk = Cstruct.sub pubkey 1 32 in
+                let tweak = Crypto.compute_taproot_tweak xonly_pk None in
+                let sig_bytes = Crypto.schnorr_sign_tweaked ~privkey ~tweak ~msg:sighash in
                 { Types.items = [sig_bytes] }
               | Script.P2WPKH_script _ ->
                 let script_code = Wallet.build_p2pkh_script pkh in

@@ -913,8 +913,8 @@ module UtxoCache = struct
         (* Modifying a dirty/erased entry - mark as Dirty *)
         Dirty coin
       | None ->
-        (* New entry - check parent *)
-        if possible_overwrite || not (DbView.have_coin t.parent outpoint) then
+        (* New entry - check parent to determine Fresh vs Dirty *)
+        if not (DbView.have_coin t.parent outpoint) then
           Fresh coin
         else
           Dirty coin

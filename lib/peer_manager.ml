@@ -320,6 +320,8 @@ let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
       let* peer = Peer.connect ~network:pm.network ~addr ~port ~id in
       let* () = Peer.perform_handshake peer pm.our_height in
       pm.peers <- peer :: pm.peers;
+      (* Start inventory trickling for this peer *)
+      Lwt.async (fun () -> Peer.start_trickling peer);
       (* Update known_addrs with successful connection *)
       (match Hashtbl.find_opt pm.known_addrs addr with
        | Some info ->
@@ -488,21 +490,26 @@ let announce_block (pm : t) (header : Types.block_header) (hash : Types.hash256)
     ) (fun _exn -> Lwt.return_unit)
   ) ready
 
-(* Announce a new transaction to all connected peers via inv. *)
+(* Announce a new transaction to all connected peers via inv.
+   Uses inventory trickling: transactions are queued per-peer and sent
+   on a Poisson-distributed schedule (5s average for inbound, 2s for outbound).
+   This improves privacy and reduces bandwidth. *)
 let announce_tx (pm : t) ~(txid : Types.hash256) ~(wtxid : Types.hash256)
     ~(fee_rate : int64) : unit Lwt.t =
   let ready = get_ready_peers pm in
-  Lwt_list.iter_p (fun peer ->
-    Lwt.catch (fun () ->
-      (* Skip peers whose feefilter is above this tx's fee rate *)
-      if peer.Peer.feefilter > 0L && fee_rate < peer.Peer.feefilter then
-        Lwt.return_unit
-      else if peer.Peer.wtxid_relay then
-        Peer.send_message peer (P2p.InvMsg [{ P2p.inv_type = P2p.InvWitnessTx; hash = wtxid }])
-      else
-        Peer.send_message peer (P2p.InvMsg [{ P2p.inv_type = P2p.InvTx; hash = txid }])
-    ) (fun _exn -> Lwt.return_unit)
-  ) ready
+  List.iter (fun peer ->
+    (* Skip peers whose feefilter is above this tx's fee rate *)
+    if not (peer.Peer.feefilter > 0L && fee_rate < peer.Peer.feefilter) then begin
+      let entry : Peer.inv_entry =
+        if peer.Peer.wtxid_relay then
+          { inv_type = P2p.InvWitnessTx; hash = wtxid }
+        else
+          { inv_type = P2p.InvTx; hash = txid }
+      in
+      Peer.queue_inv peer entry
+    end
+  ) ready;
+  Lwt.return_unit
 
 (* Check if a 16-byte address is an IPv4-mapped IPv6 address (::ffff:x.x.x.x) *)
 let is_ipv4_mapped (addr : Cstruct.t) : bool =
@@ -869,6 +876,8 @@ let accept_inbound (pm : t) (client_fd : Lwt_unix.file_descr)
         ~id ~direction:Peer.Inbound ~fd:client_fd in
       let* () = Peer.perform_inbound_handshake peer pm.our_height in
       pm.peers <- peer :: pm.peers;
+      (* Start inventory trickling for this peer *)
+      Lwt.async (fun () -> Peer.start_trickling peer);
       (* Start the message loop for this inbound peer *)
       Lwt.async (fun () -> peer_message_loop pm peer);
       Lwt.return_unit

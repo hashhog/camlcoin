@@ -521,8 +521,22 @@ type script_template =
   | P2WPKH_script of Types.hash160    (* OP_0 <20> *)
   | P2WSH_script of Types.hash256     (* OP_0 <32> *)
   | P2TR_script of Types.hash256      (* OP_1 <32> *)
+  | P2A_script                        (* OP_1 <0x4e73> -- Pay-to-Anchor, anyone-can-spend *)
   | OP_RETURN_data of Cstruct.t       (* OP_RETURN <data> *)
   | Nonstandard
+
+(* P2A (Pay-to-Anchor) detection and constants
+   Script: OP_1 OP_PUSHBYTES_2 0x4e73 (4 bytes total)
+   Reference: Bitcoin Core /src/script/script.cpp IsPayToAnchor() *)
+let p2a_dust_limit = 240L  (* P2A outputs must have exactly 240 satoshis *)
+
+(* Check if script is a Pay-to-Anchor output *)
+let is_p2a (script : Cstruct.t) : bool =
+  Cstruct.length script = 4 &&
+  Cstruct.get_uint8 script 0 = 0x51 &&  (* OP_1 *)
+  Cstruct.get_uint8 script 1 = 0x02 &&  (* PUSHBYTES_2 *)
+  Cstruct.get_uint8 script 2 = 0x4e &&
+  Cstruct.get_uint8 script 3 = 0x73
 
 let classify_script (script : Cstruct.t) : script_template =
   let len = Cstruct.length script in
@@ -560,6 +574,10 @@ let classify_script (script : Cstruct.t) : script_template =
      Cstruct.get_uint8 script 0 = 0x51 &&
      Cstruct.get_uint8 script 1 = 0x20
   then P2TR_script (Cstruct.sub script 2 32)
+  (* P2A (Pay-to-Anchor): OP_1 <0x4e73> *)
+  (* 51 02 4e 73 = 4 bytes *)
+  else if is_p2a script
+  then P2A_script
   (* OP_RETURN: starts with 0x6a *)
   else if len >= 1 && Cstruct.get_uint8 script 0 = 0x6a
   then OP_RETURN_data (Cstruct.sub script 1 (len - 1))
@@ -2931,6 +2949,16 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
             Error "Invalid taproot witness"
       end
     end
+
+  | P2A_script ->
+    (* Pay-to-Anchor (anyone-can-spend) -- BIP-PR-3535
+       P2A is a witness v1 program with 2-byte program 0x4e73.
+       By consensus, P2A outputs succeed unconditionally.
+       Policy requires empty witness (enforced in mempool). *)
+    if Cstruct.length script_sig <> 0 then
+      Error "scriptSig must be empty for witness program"
+    else
+      Ok true  (* Unconditional success *)
 
   | OP_RETURN_data _ ->
     (* OP_RETURN scripts are unspendable *)

@@ -23,3 +23,4 @@ module Block_index = Block_index
 module Psbt = Psbt
 module Descriptor = Descriptor
 module Miniscript = Miniscript
+module Assume_utxo = Assume_utxo

@@ -82,6 +82,82 @@ let max_descendant_size = 101_000
 let max_rbf_evictions = 100
 let max_standard_tx_weight = 400_000
 
+(* Cluster mempool constants (replaces ancestor/descendant limits) *)
+let max_cluster_count = 101    (* max transactions per cluster *)
+
+(* ============================================================================
+   Union-Find Data Structure for Clustering
+
+   Reference: Bitcoin Core /src/cluster_linearize.h
+   Clusters are connected components in the transaction dependency graph.
+   ============================================================================ *)
+
+(* Union-Find with path compression and union by rank *)
+type uf = {
+  parent : (string, string) Hashtbl.t;  (* txid_key -> parent txid_key *)
+  rank : (string, int) Hashtbl.t;       (* txid_key -> rank *)
+}
+
+let uf_create () : uf =
+  { parent = Hashtbl.create 256; rank = Hashtbl.create 256 }
+
+(* Find root with path compression *)
+let rec uf_find (uf : uf) (x : string) : string =
+  match Hashtbl.find_opt uf.parent x with
+  | None ->
+    (* Not yet in structure, add as its own root *)
+    Hashtbl.replace uf.parent x x;
+    Hashtbl.replace uf.rank x 0;
+    x
+  | Some p ->
+    if p = x then x
+    else begin
+      let root = uf_find uf p in
+      (* Path compression *)
+      Hashtbl.replace uf.parent x root;
+      root
+    end
+
+(* Union two sets by rank *)
+let uf_union (uf : uf) (x : string) (y : string) : unit =
+  let rx = uf_find uf x in
+  let ry = uf_find uf y in
+  if rx <> ry then begin
+    let rank_x = Hashtbl.find uf.rank rx in
+    let rank_y = Hashtbl.find uf.rank ry in
+    if rank_x < rank_y then
+      Hashtbl.replace uf.parent rx ry
+    else if rank_x > rank_y then
+      Hashtbl.replace uf.parent ry rx
+    else begin
+      Hashtbl.replace uf.parent ry rx;
+      Hashtbl.replace uf.rank rx (rank_x + 1)
+    end
+  end
+
+(* ============================================================================
+   Cluster Types
+
+   A cluster is a connected component in the tx dependency graph.
+   Reference: Bitcoin Core /src/txmempool.cpp, /src/cluster_linearize.h
+   ============================================================================ *)
+
+type cluster = {
+  txs : mempool_entry list;
+  total_fee : int64;
+  total_vsize : int;
+  fee_rate : float;  (* total_fee / total_vsize *)
+}
+
+(* Chunk: a subset of a cluster used for linearization.
+   Each chunk is topologically valid (all parents included before children). *)
+type chunk = {
+  chunk_txs : mempool_entry list;
+  chunk_fee : int64;
+  chunk_vsize : int;
+  chunk_fee_rate : float;
+}
+
 (* TRUC/v3 transaction policy (BIP-431)
    Reference: Bitcoin Core /src/policy/truc_policy.cpp *)
 let truc_version = 3l
@@ -225,6 +301,344 @@ let get_descendants (mp : mempool) (txid : Types.hash256)
     end
   in
   collect (Hashtbl.create 16) txid
+
+(* ============================================================================
+   Cluster Mempool
+
+   Group transactions into connected clusters based on parent/child relationships.
+   Reference: Bitcoin Core /src/cluster_linearize.cpp, /src/txmempool.cpp
+   ============================================================================ *)
+
+(* Build Union-Find structure from all mempool transactions *)
+let build_clusters_uf (mp : mempool) : uf =
+  let uf = uf_create () in
+  (* Add all transactions to UF structure *)
+  Hashtbl.iter (fun txid_key _entry ->
+    ignore (uf_find uf txid_key)
+  ) mp.entries;
+  (* Union transactions with their in-mempool parents *)
+  Hashtbl.iter (fun txid_key entry ->
+    List.iter (fun parent_txid ->
+      let parent_key = Cstruct.to_string parent_txid in
+      if Hashtbl.mem mp.entries parent_key then
+        uf_union uf txid_key parent_key
+    ) entry.depends_on
+  ) mp.entries;
+  uf
+
+(* Get all clusters in the mempool *)
+let get_clusters (mp : mempool) : cluster list =
+  let uf = build_clusters_uf mp in
+  (* Group transactions by cluster root *)
+  let cluster_map : (string, mempool_entry list) Hashtbl.t = Hashtbl.create 64 in
+  Hashtbl.iter (fun txid_key entry ->
+    let root = uf_find uf txid_key in
+    let current = try Hashtbl.find cluster_map root with Not_found -> [] in
+    Hashtbl.replace cluster_map root (entry :: current)
+  ) mp.entries;
+  (* Convert to cluster list *)
+  Hashtbl.fold (fun _root txs acc ->
+    let total_fee = List.fold_left (fun acc e -> Int64.add acc e.fee) 0L txs in
+    let total_vsize = List.fold_left (fun acc e -> acc + (e.weight + 3) / 4) 0 txs in
+    let fee_rate = if total_vsize > 0 then
+      Int64.to_float total_fee /. float_of_int total_vsize
+    else 0.0 in
+    { txs; total_fee; total_vsize; fee_rate } :: acc
+  ) cluster_map []
+
+(* Get the cluster containing a specific transaction *)
+let get_cluster (mp : mempool) (txid : Types.hash256) : cluster option =
+  let txid_key = Cstruct.to_string txid in
+  if not (Hashtbl.mem mp.entries txid_key) then None
+  else begin
+    let uf = build_clusters_uf mp in
+    let target_root = uf_find uf txid_key in
+    (* Collect all transactions in the same cluster *)
+    let txs = Hashtbl.fold (fun key entry acc ->
+      if uf_find uf key = target_root then entry :: acc
+      else acc
+    ) mp.entries [] in
+    let total_fee = List.fold_left (fun acc e -> Int64.add acc e.fee) 0L txs in
+    let total_vsize = List.fold_left (fun acc e -> acc + (e.weight + 3) / 4) 0 txs in
+    let fee_rate = if total_vsize > 0 then
+      Int64.to_float total_fee /. float_of_int total_vsize
+    else 0.0 in
+    Some { txs; total_fee; total_vsize; fee_rate }
+  end
+
+(* Get cluster size (number of transactions) for a given txid *)
+let get_cluster_size (mp : mempool) (txid : Types.hash256) : int =
+  match get_cluster mp txid with
+  | None -> 0
+  | Some cluster -> List.length cluster.txs
+
+(* ============================================================================
+   Cluster Linearization
+
+   Compute an optimal or near-optimal topological ordering that maximizes
+   fee rate at each prefix. Uses the chunking algorithm:
+   greedily pick the highest-fee-rate topologically valid subset.
+
+   Reference: Bitcoin Core /src/cluster_linearize.h ChunkLinearization
+   ============================================================================ *)
+
+(* Check if a set of txids forms a topologically valid subset
+   (all parents of included txs are also included) *)
+let is_topologically_valid (subset : (string, unit) Hashtbl.t)
+    (mp : mempool) : bool =
+  let valid = ref true in
+  Hashtbl.iter (fun txid_key () ->
+    if !valid then begin
+      match Hashtbl.find_opt mp.entries txid_key with
+      | None -> valid := false
+      | Some entry ->
+        List.iter (fun parent_txid ->
+          let parent_key = Cstruct.to_string parent_txid in
+          if Hashtbl.mem mp.entries parent_key then begin
+            if not (Hashtbl.mem subset parent_key) then
+              valid := false
+          end
+        ) entry.depends_on
+    end
+  ) subset;
+  !valid
+
+(* Find the highest-fee-rate topologically valid subset (chunk) from remaining txs.
+   This implements a greedy approximation of the optimal chunking algorithm. *)
+let find_best_chunk (remaining : mempool_entry list) (_mp : mempool) : chunk =
+  (* Build dependency info for remaining transactions *)
+  let remaining_set = Hashtbl.create (List.length remaining) in
+  List.iter (fun e ->
+    Hashtbl.replace remaining_set (Cstruct.to_string e.txid) e
+  ) remaining;
+
+  (* Find transactions with no remaining parents (can be chunk roots) *)
+  let has_remaining_parent e =
+    List.exists (fun parent_txid ->
+      Hashtbl.mem remaining_set (Cstruct.to_string parent_txid)
+    ) e.depends_on
+  in
+
+  (* Try each transaction as a potential chunk seed and find its closure *)
+  let best_chunk = ref { chunk_txs = []; chunk_fee = 0L;
+                         chunk_vsize = 0; chunk_fee_rate = 0.0 } in
+
+  (* For each transaction, compute its ancestor closure within remaining *)
+  List.iter (fun seed ->
+    (* Compute the minimal topologically valid subset containing seed *)
+    let subset = Hashtbl.create 16 in
+    let rec add_with_ancestors txid_key =
+      if not (Hashtbl.mem subset txid_key) then begin
+        Hashtbl.replace subset txid_key ();
+        match Hashtbl.find_opt remaining_set txid_key with
+        | None -> ()
+        | Some entry ->
+          List.iter (fun parent_txid ->
+            let parent_key = Cstruct.to_string parent_txid in
+            if Hashtbl.mem remaining_set parent_key then
+              add_with_ancestors parent_key
+          ) entry.depends_on
+      end
+    in
+    add_with_ancestors (Cstruct.to_string seed.txid);
+
+    (* Calculate fee rate of this subset *)
+    let chunk_txs = Hashtbl.fold (fun txid_key () acc ->
+      match Hashtbl.find_opt remaining_set txid_key with
+      | Some e -> e :: acc
+      | None -> acc
+    ) subset [] in
+    let chunk_fee = List.fold_left (fun acc e -> Int64.add acc e.fee) 0L chunk_txs in
+    let chunk_vsize = List.fold_left (fun acc e -> acc + (e.weight + 3) / 4) 0 chunk_txs in
+    let chunk_fee_rate = if chunk_vsize > 0 then
+      Int64.to_float chunk_fee /. float_of_int chunk_vsize
+    else 0.0 in
+
+    if chunk_fee_rate > !best_chunk.chunk_fee_rate ||
+       (!best_chunk.chunk_txs = [] && chunk_txs <> []) then
+      best_chunk := { chunk_txs; chunk_fee; chunk_vsize; chunk_fee_rate }
+  ) remaining;
+
+  (* If no good chunk found, try transactions with no remaining parents *)
+  if !best_chunk.chunk_txs = [] then begin
+    let roots = List.filter (fun e -> not (has_remaining_parent e)) remaining in
+    if roots <> [] then begin
+      (* Pick the highest fee-rate root as a single-tx chunk *)
+      let sorted_roots = List.sort (fun (a : mempool_entry) (b : mempool_entry) ->
+        compare b.fee_rate a.fee_rate
+      ) roots in
+      let best_root = List.hd sorted_roots in
+      best_chunk := {
+        chunk_txs = [best_root];
+        chunk_fee = best_root.fee;
+        chunk_vsize = (best_root.weight + 3) / 4;
+        chunk_fee_rate = best_root.fee_rate;
+      }
+    end else if remaining <> [] then begin
+      (* Fallback: take any remaining tx (shouldn't happen if deps are correct) *)
+      let e = List.hd remaining in
+      best_chunk := {
+        chunk_txs = [e];
+        chunk_fee = e.fee;
+        chunk_vsize = (e.weight + 3) / 4;
+        chunk_fee_rate = e.fee_rate;
+      }
+    end
+  end;
+  !best_chunk
+
+(* Remove a chunk's transactions from the remaining list *)
+let remove_chunk (remaining : mempool_entry list) (chunk : chunk)
+    : mempool_entry list =
+  let chunk_txids = Hashtbl.create (List.length chunk.chunk_txs) in
+  List.iter (fun e ->
+    Hashtbl.replace chunk_txids (Cstruct.to_string e.txid) ()
+  ) chunk.chunk_txs;
+  List.filter (fun e ->
+    not (Hashtbl.mem chunk_txids (Cstruct.to_string e.txid))
+  ) remaining
+
+(* Linearize a cluster into chunks ordered by fee rate.
+   Reference: Bitcoin Core ChunkLinearization in cluster_linearize.h *)
+let linearize_cluster (cluster : cluster) (mp : mempool) : chunk list =
+  let rec chunk_loop remaining acc =
+    if remaining = [] then List.rev acc
+    else begin
+      let best = find_best_chunk remaining mp in
+      if best.chunk_txs = [] then List.rev acc  (* shouldn't happen *)
+      else begin
+        let new_remaining = remove_chunk remaining best in
+        chunk_loop new_remaining (best :: acc)
+      end
+    end
+  in
+  chunk_loop cluster.txs []
+
+(* Get all chunks from all clusters, sorted by fee rate (highest first) *)
+let get_all_chunks (mp : mempool) : chunk list =
+  let clusters = get_clusters mp in
+  let all_chunks = List.concat_map (fun c -> linearize_cluster c mp) clusters in
+  (* Sort by fee rate descending *)
+  List.sort (fun a b -> compare b.chunk_fee_rate a.chunk_fee_rate) all_chunks
+
+(* Get the worst (lowest fee-rate) chunk for eviction *)
+let get_worst_chunk (mp : mempool) : chunk option =
+  let chunks = get_all_chunks mp in
+  if chunks = [] then None
+  else begin
+    (* Chunks are sorted highest first, so worst is last *)
+    Some (List.nth chunks (List.length chunks - 1))
+  end
+
+(* ============================================================================
+   Cluster-Based Mining Selection
+
+   Select transactions by iterating chunks in fee-rate order.
+   Reference: Bitcoin Core BlockAssembler with cluster mempool
+   ============================================================================ *)
+
+(* Select transactions for mining using chunk-based ordering *)
+let select_for_block_chunked (mp : mempool) ~(max_weight : int)
+    : mempool_entry list =
+  let chunks = get_all_chunks mp in
+  let selected = ref [] in
+  let selected_txids = Hashtbl.create 100 in
+  let current_weight = ref 0 in
+
+  (* Iterate through chunks in fee-rate order *)
+  List.iter (fun chunk ->
+    (* Check if all transactions in chunk fit *)
+    let chunk_weight = List.fold_left (fun acc e -> acc + e.weight) 0 chunk.chunk_txs in
+    if !current_weight + chunk_weight <= max_weight then begin
+      (* Verify all dependencies are satisfied *)
+      let deps_ok = List.for_all (fun e ->
+        List.for_all (fun dep_txid ->
+          let dep_key = Cstruct.to_string dep_txid in
+          (* Either dep is already selected, or not in mempool *)
+          Hashtbl.mem selected_txids dep_key ||
+          not (Hashtbl.mem mp.entries dep_key)
+        ) e.depends_on
+      ) chunk.chunk_txs in
+
+      if deps_ok then begin
+        (* Add all transactions from this chunk *)
+        List.iter (fun e ->
+          selected := e :: !selected;
+          Hashtbl.add selected_txids (Cstruct.to_string e.txid) ();
+          current_weight := !current_weight + e.weight
+        ) chunk.chunk_txs
+      end
+    end
+  ) chunks;
+
+  List.rev !selected
+
+(* ============================================================================
+   Cluster-Based Eviction
+
+   Evict the lowest-fee-rate chunk when mempool is full.
+   Reference: Bitcoin Core TrimToSize with GetWorstMainChunk
+   ============================================================================ *)
+
+(* Evict lowest fee-rate chunks until mempool is under target size *)
+let evict_by_chunks (mp : mempool) : unit =
+  let target = mp.max_size_bytes * 3 / 4 in
+  let rec evict_loop () =
+    if mp.total_weight <= target then ()
+    else begin
+      match get_worst_chunk mp with
+      | None -> ()
+      | Some worst_chunk ->
+        (* Remove all transactions in the worst chunk *)
+        List.iter (fun e ->
+          remove_transaction mp e.txid
+        ) worst_chunk.chunk_txs;
+        evict_loop ()
+    end
+  in
+  evict_loop ()
+
+(* ============================================================================
+   Cluster Size Limit Check
+
+   Replace ancestor/descendant limit checks with cluster size limit.
+   Max 101 transactions per cluster (Bitcoin Core default).
+   ============================================================================ *)
+
+(* Check if adding a transaction would exceed cluster size limit *)
+let check_cluster_size_limit (mp : mempool) (depends : Types.hash256 list)
+    (new_txid : Types.hash256) : (unit, string) result =
+  if depends = [] then
+    (* No dependencies, would form a singleton cluster *)
+    Ok ()
+  else begin
+    (* Find the cluster(s) that would be affected *)
+    let uf = build_clusters_uf mp in
+
+    (* Simulate adding the new tx to UF *)
+    let new_txid_key = Cstruct.to_string new_txid in
+    ignore (uf_find uf new_txid_key);
+
+    (* Union with all parent clusters *)
+    List.iter (fun parent_txid ->
+      let parent_key = Cstruct.to_string parent_txid in
+      if Hashtbl.mem mp.entries parent_key then
+        uf_union uf new_txid_key parent_key
+    ) depends;
+
+    (* Count the resulting cluster size *)
+    let merged_root = uf_find uf new_txid_key in
+    let cluster_size = Hashtbl.fold (fun txid_key _entry count ->
+      if uf_find uf txid_key = merged_root then count + 1
+      else count
+    ) mp.entries 1 in  (* +1 for the new tx *)
+
+    if cluster_size > max_cluster_count then
+      Error (Printf.sprintf "Cluster size limit exceeded (%d > %d)"
+        cluster_size max_cluster_count)
+    else
+      Ok ()
+  end
 
 (* ============================================================================
    Eviction Policy (Gap 8: TrimToSize by descendant score)
@@ -888,8 +1302,13 @@ let add_transaction ?(dry_run=false) (mp : mempool) (tx : Types.transaction)
             if fee < min_fee then
               Error "Fee below minimum relay fee"
 
-            (* Task 3 + Gap 6: Ancestor/descendant limits (count + size) *)
-            else match check_ancestor_descendant_limits mp !depends txid weight with
+            (* Cluster size limit check (replaces ancestor/descendant limits for cluster mempool) *)
+            else match check_cluster_size_limit mp !depends txid with
+            | Error e -> Error e
+            | Ok () ->
+
+            (* Task 3 + Gap 6: Ancestor/descendant limits (count + size) - kept for backward compat *)
+            match check_ancestor_descendant_limits mp !depends txid weight with
             | Error e -> Error e
             | Ok () ->
 
@@ -921,9 +1340,9 @@ let add_transaction ?(dry_run=false) (mp : mempool) (tx : Types.transaction)
               mp.total_weight <- mp.total_weight + weight;
               mp.total_fee <- Int64.add mp.total_fee fee;
 
-              (* Evict if over size limit *)
+              (* Evict if over size limit - use cluster-based eviction *)
               if mp.total_weight > mp.max_size_bytes / 4 then
-                evict_lowest_feerate mp
+                evict_by_chunks mp
             end;
 
             Ok entry
@@ -965,7 +1384,8 @@ let remove_for_block (mp : mempool) (block : Types.block) (height : int)
 (* Get transactions sorted by fee rate for block template *)
 let get_sorted_transactions (mp : mempool) : mempool_entry list =
   let entries = Hashtbl.fold (fun _ v acc -> v :: acc) mp.entries [] in
-  List.sort (fun a b -> compare b.fee_rate a.fee_rate) entries
+  List.sort (fun (a : mempool_entry) (b : mempool_entry) ->
+    compare b.fee_rate a.fee_rate) entries
 
 (* Select transactions for a block template respecting dependencies *)
 let select_for_block (mp : mempool) ~(max_weight : int)
@@ -1024,7 +1444,7 @@ let get_stats (mp : mempool) : mempool_stats =
       max_fee_rate = 0.0;
       avg_fee_rate = 0.0 }
   else begin
-    let fee_rates = List.map (fun e -> e.fee_rate) entries in
+    let fee_rates = List.map (fun (e : mempool_entry) -> e.fee_rate) entries in
     let min_fr = List.fold_left min max_float fee_rates in
     let max_fr = List.fold_left max 0.0 fee_rates in
     let sum_fr = List.fold_left (+.) 0.0 fee_rates in

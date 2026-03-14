@@ -614,7 +614,8 @@ let rec to_script_inner ctx node =
 
 let to_script ctx node =
   let bytes = to_script_inner ctx node in
-  Cstruct.of_string (String.init (List.length bytes) (fun i -> Char.chr (List.nth bytes i)))
+  let arr = Array.of_list bytes in
+  Cstruct.of_string (String.init (Array.length arr) (fun i -> Char.chr arr.(i)))
 
 (* ============================================================================
    Satisfaction / Witness Generation

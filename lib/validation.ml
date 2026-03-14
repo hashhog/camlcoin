@@ -21,6 +21,7 @@ type tx_validation_error =
   | TxNullPrevout
   | TxDuplicateTxid
   | TxSequenceLocksFailed
+  | TxCoinbaseMaturity of int (* spending coinbase with insufficient confirmations *)
 
 type block_validation_error =
   | BlockEmptyTransactions
@@ -61,6 +62,9 @@ let tx_error_to_string = function
   | TxNullPrevout -> "non-coinbase transaction references null outpoint"
   | TxDuplicateTxid -> "transaction has duplicate txid in UTXO set (BIP30)"
   | TxSequenceLocksFailed -> "transaction sequence locks not satisfied (BIP68)"
+  | TxCoinbaseMaturity confirmations ->
+    Printf.sprintf "spending immature coinbase (%d < %d confirmations required)"
+      confirmations Consensus.coinbase_maturity
 
 let block_error_to_string = function
   | BlockEmptyTransactions -> "block has no transactions"
@@ -888,8 +892,10 @@ let validate_tx_inputs (tx : Types.transaction) ~(lookup : utxo_lookup)
           (* Task 7: Validate input value is in MoneyRange *)
           if not (Consensus.is_valid_money utxo.value) then
             error := Some TxOutputOverflow
-          else if utxo.is_coinbase && block_height - utxo.height < Consensus.coinbase_maturity then
-            error := Some TxMissingInputs  (* Immature coinbase *)
+          else if utxo.is_coinbase && block_height - utxo.height < Consensus.coinbase_maturity then begin
+            let confirmations = block_height - utxo.height in
+            error := Some (TxCoinbaseMaturity confirmations)
+          end
           else
             utxos.(i) <- Some utxo
       end

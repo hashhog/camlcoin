@@ -18,6 +18,11 @@ let read_uint16_le r =
   r.pos <- r.pos + 2;
   v
 
+let read_uint16_be r =
+  let v = Cstruct.BE.get_uint16 r.buf r.pos in
+  r.pos <- r.pos + 2;
+  v
+
 let read_int32_le r =
   let v = Cstruct.LE.get_uint32 r.buf r.pos in
   r.pos <- r.pos + 4;
@@ -86,6 +91,11 @@ let write_uint16_le w v =
   Cstruct.LE.set_uint16 cs 0 v;
   Buffer.add_string w.buf (Cstruct.to_string cs)
 
+let write_uint16_be w v =
+  let cs = Cstruct.create 2 in
+  Cstruct.BE.set_uint16 cs 0 v;
+  Buffer.add_string w.buf (Cstruct.to_string cs)
+
 let write_int32_le w v =
   let cs = Cstruct.create 4 in
   Cstruct.LE.set_uint32 cs 0 v;
@@ -110,6 +120,31 @@ let write_compact_size w n =
   end else begin
     write_uint8 w 0xFF;
     write_int64_le w (Int64.of_int n)
+  end
+
+(* CompactSize read/write for int64 values (used by BIP-155 addrv2 services) *)
+let read_compact_size_int64 r =
+  let first = read_uint8 r in
+  if first < 0xFD then Int64.of_int first
+  else if first = 0xFD then
+    Int64.of_int (read_uint16_le r)
+  else if first = 0xFE then
+    Int64.of_int32 (read_int32_le r)
+  else
+    read_int64_le r
+
+let write_compact_size_int64 w v =
+  if Int64.compare v 0xFDL < 0 then
+    write_uint8 w (Int64.to_int v)
+  else if Int64.compare v 0xFFFFL <= 0 then begin
+    write_uint8 w 0xFD;
+    write_uint16_le w (Int64.to_int v)
+  end else if Int64.compare v 0xFFFFFFFFL <= 0 then begin
+    write_uint8 w 0xFE;
+    write_int32_le w (Int64.to_int32 v)
+  end else begin
+    write_uint8 w 0xFF;
+    write_int64_le w v
   end
 
 let write_string w s =

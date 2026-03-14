@@ -424,22 +424,20 @@ let build_eviction_candidates (pm : t) : eviction_candidate list =
       }
   ) pm.peers
 
-(* Remove last k elements from sorted list based on predicate *)
+(* Remove last k elements from sorted list that satisfy predicate.
+   Works by reversing the list, removing the first k matches, then reversing back. *)
 let erase_last_k_elements (lst : eviction_candidate list)
     (k : int) (pred : eviction_candidate -> bool) : eviction_candidate list =
-  let len = List.length lst in
-  let to_keep = max 0 (len - k) in
-  let kept = ref 0 in
   let erased = ref 0 in
-  List.filter (fun c ->
-    if !erased < k && !kept >= to_keep && pred c then begin
+  let rev = List.rev lst in
+  let filtered = List.filter (fun c ->
+    if !erased < k && pred c then begin
       incr erased;
       false
-    end else begin
-      incr kept;
+    end else
       true
-    end
-  ) lst
+  ) rev in
+  List.rev filtered
 
 (* Multi-criteria eviction algorithm matching Bitcoin Core.
    From Bitcoin Core eviction.cpp SelectNodeToEvict:
@@ -1922,3 +1920,43 @@ let get_bucket_stats (pm : t) : bucket_stats =
     outbound_netgroups = Hashtbl.length pm.outbound_netgroups;
     anchor_count = List.length pm.anchors;
   }
+
+(* Periodic address gossip: relay known addresses to connected peers.
+   Selects up to 1000 addresses from the tried table and sends them
+   to each peer that has completed the handshake. Called periodically. *)
+let gossip_addresses (pm : t) : unit Lwt.t =
+  let now = Int32.of_float (Unix.gettimeofday ()) in
+  let addrs = Hashtbl.fold (fun _k info acc ->
+    if List.length acc >= 1000 then acc
+    else begin
+      let addr_bytes = Cstruct.create 16 in
+      (* Encode IPv4 as IPv4-mapped IPv6 *)
+      let parts = String.split_on_char '.' info.address in
+      if List.length parts = 4 then begin
+        for i = 0 to 9 do Cstruct.set_uint8 addr_bytes i 0 done;
+        Cstruct.set_uint8 addr_bytes 10 0xFF;
+        Cstruct.set_uint8 addr_bytes 11 0xFF;
+        List.iteri (fun i s ->
+          try Cstruct.set_uint8 addr_bytes (12 + i) (int_of_string s)
+          with _ -> ()
+        ) parts;
+        let net_addr : Types.net_addr = {
+          services = 1L;
+          addr = addr_bytes;
+          port = info.port;
+        } in
+        (now, net_addr) :: acc
+      end else acc
+    end
+  ) pm.known_addrs [] in
+  if addrs = [] then Lwt.return_unit
+  else begin
+    let msg = P2p.AddrMsg addrs in
+    Lwt_list.iter_p (fun peer ->
+      if peer.Peer.state = Peer.Connected then
+        Lwt.catch
+          (fun () -> Peer.send_message peer msg)
+          (fun _exn -> Lwt.return_unit)
+      else Lwt.return_unit
+    ) pm.peers
+  end

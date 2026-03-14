@@ -1272,6 +1272,190 @@ let witness_pubkeytype_tests = [
   Alcotest.test_case "P2WPKH uncompressed allowed without flag" `Quick test_p2wpkh_uncompressed_allowed_without_flag;
 ]
 
+(* ============================================================================
+   Witness Cleanstack Tests (Phase 3)
+
+   Witness scripts (v0 and v1) implicitly require cleanstack behavior - this is
+   NOT gated by the SCRIPT_VERIFY_CLEANSTACK flag like for legacy P2SH.
+   After witness script execution, the stack must have exactly one element.
+   ============================================================================ *)
+
+(* Test that P2WSH with extra stack items fails even WITHOUT cleanstack flag.
+   This creates a witness script that leaves extra items on the stack. *)
+let test_witness_cleanstack_p2wsh_extra_item_fails () =
+  let tx = make_test_tx () in
+  (* Create a witness script: OP_1 OP_1 (leaves two items: 1, 1)
+     Encoded: 51 51 *)
+  let witness_script = hex_to_cstruct "5151" in
+  let script_hash = Crypto.sha256 witness_script in
+  (* P2WSH script: OP_0 <32-byte script hash> *)
+  let script_pubkey =
+    let w = Serialize.writer_create () in
+    Serialize.write_uint8 w 0x00;  (* OP_0 = witness v0 *)
+    Serialize.write_uint8 w 0x20;  (* push 32 bytes *)
+    Serialize.write_bytes w script_hash;
+    Serialize.writer_to_cstruct w
+  in
+  (* Witness stack: just the script itself (no inputs needed) *)
+  let witness = { Types.items = [witness_script] } in
+  (* Only WITNESS flag, explicitly NO cleanstack flag *)
+  let flags = Script.script_verify_witness in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+          ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
+  | Error msg ->
+    (* Should fail with cleanstack error *)
+    let msg_lower = String.lowercase_ascii msg in
+    if not (String.sub msg_lower 0 (min (String.length msg_lower) 10) = "cleanstack") then
+      Alcotest.fail ("Expected Cleanstack error, got: " ^ msg)
+  | Ok _ -> Alcotest.fail "P2WSH with extra stack items should fail (witness cleanstack)"
+
+(* Test that P2WSH with exactly one stack item succeeds *)
+let test_witness_cleanstack_p2wsh_one_item_ok () =
+  let tx = make_test_tx () in
+  (* Create a witness script: OP_1 (leaves exactly one item)
+     Encoded: 51 *)
+  let witness_script = hex_to_cstruct "51" in
+  let script_hash = Crypto.sha256 witness_script in
+  let script_pubkey =
+    let w = Serialize.writer_create () in
+    Serialize.write_uint8 w 0x00;
+    Serialize.write_uint8 w 0x20;
+    Serialize.write_bytes w script_hash;
+    Serialize.writer_to_cstruct w
+  in
+  let witness = { Types.items = [witness_script] } in
+  let flags = Script.script_verify_witness in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+          ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
+  | Ok true -> ()
+  | Ok false -> Alcotest.fail "Expected success (true)"
+  | Error e -> Alcotest.fail ("P2WSH with one stack item should succeed: " ^ e)
+
+(* Test that P2WSH with empty stack fails (EvalFalse) *)
+let test_witness_cleanstack_p2wsh_empty_stack_fails () =
+  let tx = make_test_tx () in
+  (* Create a witness script: OP_DROP (will pop the last item, leaving empty)
+     We need to push something first for DROP to work: OP_1 OP_DROP
+     Encoded: 51 75 *)
+  let witness_script = hex_to_cstruct "5175" in
+  let script_hash = Crypto.sha256 witness_script in
+  let script_pubkey =
+    let w = Serialize.writer_create () in
+    Serialize.write_uint8 w 0x00;
+    Serialize.write_uint8 w 0x20;
+    Serialize.write_bytes w script_hash;
+    Serialize.writer_to_cstruct w
+  in
+  let witness = { Types.items = [witness_script] } in
+  let flags = Script.script_verify_witness in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+          ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
+  | Error _ -> ()  (* Expected: cleanstack error (stack size != 1) *)
+  | Ok _ -> Alcotest.fail "P2WSH with empty stack should fail"
+
+(* Test that P2WSH false result fails (even with clean stack) *)
+let test_witness_cleanstack_p2wsh_false_result_fails () =
+  let tx = make_test_tx () in
+  (* Create a witness script: OP_0 (leaves exactly one item, but it's false)
+     Encoded: 00 *)
+  let witness_script = hex_to_cstruct "00" in
+  let script_hash = Crypto.sha256 witness_script in
+  let script_pubkey =
+    let w = Serialize.writer_create () in
+    Serialize.write_uint8 w 0x00;
+    Serialize.write_uint8 w 0x20;
+    Serialize.write_bytes w script_hash;
+    Serialize.writer_to_cstruct w
+  in
+  let witness = { Types.items = [witness_script] } in
+  let flags = Script.script_verify_witness in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+          ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
+  | Ok false -> ()  (* Expected: returns false *)
+  | Ok true -> Alcotest.fail "OP_0 should return false"
+  | Error e -> Alcotest.fail ("Should return Ok false, not error: " ^ e)
+
+(* Test legacy P2SH WITH cleanstack flag requires clean stack *)
+let test_legacy_cleanstack_flag_enforced () =
+  let tx = make_test_tx () in
+  (* Create a simple P2SH that leaves 2 items on stack: OP_1 OP_1
+     Encoded: 51 51 *)
+  let redeem_script = hex_to_cstruct "5151" in
+  let script_hash = Crypto.hash160 redeem_script in
+  (* P2SH script: OP_HASH160 <20 bytes> OP_EQUAL *)
+  let script_pubkey =
+    let w = Serialize.writer_create () in
+    Serialize.write_uint8 w 0xa9;  (* OP_HASH160 *)
+    Serialize.write_uint8 w 0x14;  (* push 20 bytes *)
+    Serialize.write_bytes w script_hash;
+    Serialize.write_uint8 w 0x87;  (* OP_EQUAL *)
+    Serialize.writer_to_cstruct w
+  in
+  (* scriptSig pushes the redeem script *)
+  let script_sig =
+    let w = Serialize.writer_create () in
+    let len = Cstruct.length redeem_script in
+    Serialize.write_uint8 w len;
+    Serialize.write_bytes w redeem_script;
+    Serialize.writer_to_cstruct w
+  in
+  let witness = { Types.items = [] } in
+  (* P2SH + CLEANSTACK flags *)
+  let flags = Script.script_verify_p2sh lor Script.script_verify_cleanstack in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+          ~script_sig ~witness ~amount:0L ~flags () with
+  | Error msg ->
+    (* Should fail with cleanstack-related error *)
+    let msg_lower = String.lowercase_ascii msg in
+    let has_clean =
+      let rec check i =
+        if i + 5 > String.length msg_lower then false
+        else if String.sub msg_lower i 5 = "clean" then true
+        else check (i + 1)
+      in check 0
+    in
+    if not has_clean then
+      Alcotest.fail ("Expected cleanstack error, got: " ^ msg)
+  | Ok _ -> Alcotest.fail "Legacy P2SH with cleanstack flag should fail"
+
+(* Test legacy P2SH WITHOUT cleanstack flag allows extra items *)
+let test_legacy_no_cleanstack_flag_allows_extra () =
+  let tx = make_test_tx () in
+  let redeem_script = hex_to_cstruct "5151" in  (* OP_1 OP_1 *)
+  let script_hash = Crypto.hash160 redeem_script in
+  let script_pubkey =
+    let w = Serialize.writer_create () in
+    Serialize.write_uint8 w 0xa9;
+    Serialize.write_uint8 w 0x14;
+    Serialize.write_bytes w script_hash;
+    Serialize.write_uint8 w 0x87;
+    Serialize.writer_to_cstruct w
+  in
+  let script_sig =
+    let w = Serialize.writer_create () in
+    let len = Cstruct.length redeem_script in
+    Serialize.write_uint8 w len;
+    Serialize.write_bytes w redeem_script;
+    Serialize.writer_to_cstruct w
+  in
+  let witness = { Types.items = [] } in
+  (* P2SH flag only, NO cleanstack flag *)
+  let flags = Script.script_verify_p2sh in
+  match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+          ~script_sig ~witness ~amount:0L ~flags () with
+  | Ok true -> ()  (* Expected: succeeds without cleanstack enforcement *)
+  | Ok false -> Alcotest.fail "Expected true on stack"
+  | Error e -> Alcotest.fail ("Without cleanstack flag, should succeed: " ^ e)
+
+let witness_cleanstack_tests = [
+  Alcotest.test_case "P2WSH extra stack items fails (no flag)" `Quick test_witness_cleanstack_p2wsh_extra_item_fails;
+  Alcotest.test_case "P2WSH one stack item ok" `Quick test_witness_cleanstack_p2wsh_one_item_ok;
+  Alcotest.test_case "P2WSH empty stack fails" `Quick test_witness_cleanstack_p2wsh_empty_stack_fails;
+  Alcotest.test_case "P2WSH false result returns false" `Quick test_witness_cleanstack_p2wsh_false_result_fails;
+  Alcotest.test_case "Legacy P2SH cleanstack flag enforced" `Quick test_legacy_cleanstack_flag_enforced;
+  Alcotest.test_case "Legacy P2SH no flag allows extra items" `Quick test_legacy_no_cleanstack_flag_allows_extra;
+]
+
 let () = Alcotest.run "test_script" [
   ("script_num", script_num_tests);
   ("parsing", parsing_tests);
@@ -1287,4 +1471,5 @@ let () = Alcotest.run "test_script" [
   ("bug7_8_9", bug7_8_9_tests);
   ("nullfail", nullfail_tests);
   ("witness_pubkeytype", witness_pubkeytype_tests);
+  ("witness_cleanstack", witness_cleanstack_tests);
 ]

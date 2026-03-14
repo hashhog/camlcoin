@@ -9,6 +9,12 @@ type addr_source =
   | Addr     (* From addr message from peer *)
   | Manual   (* Manually added by user *)
 
+(* Address table status (for eclipse protection bucketing) *)
+type addr_table_status =
+  | InNew of int    (* In new table, bucket index *)
+  | InTried of int  (* In tried table, bucket index *)
+  | NotInTable      (* Not yet in any table *)
+
 (* Information about a known peer address *)
 type peer_info = {
   address : string;
@@ -19,6 +25,8 @@ type peer_info = {
   failures : int;
   banned_until : float;
   source : addr_source;
+  table_status : addr_table_status;  (* Which bucket table this address is in *)
+  last_success : float;              (* Last successful outbound connection *)
 }
 
 (* Peer manager configuration *)
@@ -31,6 +39,7 @@ type config = {
   ping_interval : float; (* Seconds between pings *)
   dead_timeout : float;  (* Seconds before peer considered dead *)
   chain_sync_timeout : float; (* Seconds before evicting outbound peer behind our tip *)
+  max_block_relay_only_anchors : int; (* Max anchor connections to persist, default 2 *)
 }
 
 let default_config : config = {
@@ -42,7 +51,21 @@ let default_config : config = {
   ping_interval = 120.0;   (* 2 minutes *)
   dead_timeout = 600.0;    (* 10 minutes *)
   chain_sync_timeout = 1200.0; (* 20 minutes *)
+  max_block_relay_only_anchors = 2; (* BIP 155: 2 block-relay-only anchors *)
 }
+
+(* Eclipse attack protection constants (from Bitcoin Core addrman_impl.h) *)
+let new_bucket_count = 1024        (* 2^10 = 1024 "new" buckets *)
+let tried_bucket_count = 256       (* 2^8 = 256 "tried" buckets *)
+let bucket_size = 64               (* Max entries per bucket *)
+let new_buckets_per_address = 8    (* Max times addr can appear in new table *)
+
+(* Eviction protection constants (from Bitcoin Core eviction.cpp) *)
+let protect_by_netgroup = 4        (* Protect 4 peers by distinct netgroup *)
+let protect_by_ping = 8            (* Protect 8 peers by lowest ping *)
+let protect_by_tx_time = 4         (* Protect 4 peers by recent tx relay *)
+let protect_by_block_relay = 8     (* Protect up to 8 block-relay-only peers *)
+let protect_by_block_time = 4      (* Protect 4 peers by recent block relay *)
 
 (* Hardcoded fallback peers for testnet4 (DNS seeds are unreliable) *)
 let testnet_fallback_peers : (string * int) list = [
@@ -61,6 +84,25 @@ let mainnet_fallback_peers : (string * int) list = [
    Higher-level code (e.g. sync.ml) calls this to report misbehavior. *)
 type misbehavior_handler = int -> int -> string -> unit Lwt.t
 
+(* Eviction candidate info for multi-criteria eviction algorithm *)
+type eviction_candidate = {
+  ec_peer : Peer.peer;
+  ec_connected : float;          (* Connection timestamp *)
+  ec_min_ping : float;           (* Minimum ping latency *)
+  ec_last_block_time : float;    (* Last block received timestamp *)
+  ec_last_tx_time : float;       (* Last tx received timestamp *)
+  ec_keyed_netgroup : int;       (* Hashed /16 netgroup *)
+  ec_relay_txs : bool;           (* Whether this peer relays txs *)
+  ec_prefer_evict : bool;        (* Flagged for eviction preference *)
+}
+
+(* Anchor connection info for persistence across restarts *)
+type anchor_info = {
+  anchor_addr : string;
+  anchor_port : int;
+  anchor_services : int64;
+}
+
 (* Peer manager state *)
 type t = {
   network : Consensus.network_config;
@@ -78,7 +120,25 @@ type t = {
   mutable listen_addr : string option;           (* Our own listening address, if known *)
   chain_sync_behind_since : (int, float) Hashtbl.t; (* peer_id -> timestamp when first noticed behind *)
   mutable db : Storage.ChainDB.t option;            (* Chain database for building locators *)
+  (* Eclipse protection: address bucketing *)
+  bucket_key : string;                            (* Random key for bucket hashing *)
+  new_table : (int, string list) Hashtbl.t;       (* New address buckets: bucket_id -> addresses *)
+  tried_table : (int, string list) Hashtbl.t;     (* Tried address buckets: bucket_id -> addresses *)
+  mutable anchors : anchor_info list;             (* Block-relay-only anchor connections *)
+  (* Per-peer tracking for eviction *)
+  peer_last_tx_time : (int, float) Hashtbl.t;     (* peer_id -> last tx received time *)
+  peer_last_block_time : (int, float) Hashtbl.t;  (* peer_id -> last block received time *)
+  peer_connected_time : (int, float) Hashtbl.t;   (* peer_id -> connection timestamp *)
+  outbound_netgroups : (string, bool) Hashtbl.t;  (* Netgroups of outbound connections *)
 }
+
+(* Generate a random bucket key for address hashing *)
+let generate_bucket_key () : string =
+  let buf = Bytes.create 32 in
+  for i = 0 to 31 do
+    Bytes.set buf i (Char.chr (Random.int 256))
+  done;
+  Bytes.to_string buf
 
 (* Create a new peer manager *)
 let create ?(config = default_config) (network : Consensus.network_config) : t =
@@ -97,6 +157,14 @@ let create ?(config = default_config) (network : Consensus.network_config) : t =
     listen_addr = None;
     chain_sync_behind_since = Hashtbl.create 16;
     db = None;
+    bucket_key = generate_bucket_key ();
+    new_table = Hashtbl.create new_bucket_count;
+    tried_table = Hashtbl.create tried_bucket_count;
+    anchors = [];
+    peer_last_tx_time = Hashtbl.create 64;
+    peer_last_block_time = Hashtbl.create 64;
+    peer_connected_time = Hashtbl.create 64;
+    outbound_netgroups = Hashtbl.create 16;
   }
 
 (* Update our known blockchain height *)
@@ -146,95 +214,266 @@ let netgroup_of addr =
   | a :: b :: _ -> a ^ "." ^ b
   | _ -> addr
 
+(* Compute bucket index for an address using SHA256.
+   From Bitcoin Core: bucket = SHA256(key ^ addr)[0] *)
+let compute_bucket (key : string) (addr : string) (bucket_count : int) : int =
+  let input = key ^ addr in
+  let hash = Digestif.SHA256.(to_raw_string (digest_string input)) in
+  let first_byte = Char.code (String.get hash 0) in
+  first_byte mod bucket_count
+
+(* Compute keyed netgroup hash for eviction algorithm *)
+let compute_keyed_netgroup (key : string) (addr : string) : int =
+  let netgroup = netgroup_of addr in
+  let input = key ^ netgroup in
+  let hash = Digestif.SHA256.(to_raw_string (digest_string input)) in
+  (* Use first 4 bytes as int *)
+  (Char.code (String.get hash 0)) lor
+  (Char.code (String.get hash 1) lsl 8) lor
+  (Char.code (String.get hash 2) lsl 16) lor
+  (Char.code (String.get hash 3) lsl 24)
+
+(* Add address to new table bucket *)
+let add_to_new_table (pm : t) (addr : string) : int =
+  let bucket = compute_bucket pm.bucket_key addr new_bucket_count in
+  let current = match Hashtbl.find_opt pm.new_table bucket with
+    | Some addrs -> addrs
+    | None -> []
+  in
+  (* Check if address already in bucket *)
+  if List.mem addr current then
+    bucket
+  (* Check bucket capacity *)
+  else if List.length current >= bucket_size then begin
+    (* Bucket full - try to evict old entry *)
+    match current with
+    | [] -> bucket  (* Shouldn't happen *)
+    | _ :: rest ->
+      Hashtbl.replace pm.new_table bucket (addr :: rest);
+      bucket
+  end else begin
+    Hashtbl.replace pm.new_table bucket (addr :: current);
+    bucket
+  end
+
+(* Move address from new table to tried table (after successful connection) *)
+let move_to_tried_table (pm : t) (addr : string) : int =
+  let new_bucket = compute_bucket pm.bucket_key addr new_bucket_count in
+  let tried_bucket = compute_bucket pm.bucket_key addr tried_bucket_count in
+  (* Remove from new table *)
+  (match Hashtbl.find_opt pm.new_table new_bucket with
+   | Some addrs ->
+     let filtered = List.filter (fun a -> a <> addr) addrs in
+     if filtered = [] then
+       Hashtbl.remove pm.new_table new_bucket
+     else
+       Hashtbl.replace pm.new_table new_bucket filtered
+   | None -> ());
+  (* Add to tried table *)
+  let current = match Hashtbl.find_opt pm.tried_table tried_bucket with
+    | Some addrs -> addrs
+    | None -> []
+  in
+  if not (List.mem addr current) then begin
+    if List.length current >= bucket_size then begin
+      (* Bucket full - evict oldest entry *)
+      match List.rev current with
+      | [] -> ()
+      | _ :: rest ->
+        Hashtbl.replace pm.tried_table tried_bucket (addr :: List.rev rest)
+    end else
+      Hashtbl.replace pm.tried_table tried_bucket (addr :: current)
+  end;
+  tried_bucket
+
+(* Check if address is in tried table *)
+let is_in_tried_table (pm : t) (addr : string) : bool =
+  let bucket = compute_bucket pm.bucket_key addr tried_bucket_count in
+  match Hashtbl.find_opt pm.tried_table bucket with
+  | Some addrs -> List.mem addr addrs
+  | None -> false
+
+(* Get total entries in new table *)
+let new_table_size (pm : t) : int =
+  Hashtbl.fold (fun _ addrs acc -> acc + List.length addrs) pm.new_table 0
+
+(* Get total entries in tried table *)
+let tried_table_size (pm : t) : int =
+  Hashtbl.fold (fun _ addrs acc -> acc + List.length addrs) pm.tried_table 0
+
+(* Record peer tx relay time for eviction algorithm *)
+let record_peer_tx_time (pm : t) (peer_id : int) : unit =
+  Hashtbl.replace pm.peer_last_tx_time peer_id (Unix.gettimeofday ())
+
+(* Record peer block relay time for eviction algorithm *)
+let record_peer_block_time (pm : t) (peer_id : int) : unit =
+  Hashtbl.replace pm.peer_last_block_time peer_id (Unix.gettimeofday ())
+
+(* Build eviction candidates from inbound peers.
+   This matches Bitcoin Core's SelectNodeToEvict algorithm. *)
+let build_eviction_candidates (pm : t) : eviction_candidate list =
+  let now = Unix.gettimeofday () in
+  List.filter_map (fun p ->
+    if p.Peer.direction <> Peer.Inbound || p.Peer.state <> Peer.Ready then
+      None
+    else
+      let connected = match Hashtbl.find_opt pm.peer_connected_time p.Peer.id with
+        | Some t -> t
+        | None -> now
+      in
+      let last_tx = match Hashtbl.find_opt pm.peer_last_tx_time p.Peer.id with
+        | Some t -> t
+        | None -> 0.0
+      in
+      let last_block = match Hashtbl.find_opt pm.peer_last_block_time p.Peer.id with
+        | Some t -> t
+        | None -> 0.0
+      in
+      Some {
+        ec_peer = p;
+        ec_connected = connected;
+        ec_min_ping = p.Peer.latency;
+        ec_last_block_time = last_block;
+        ec_last_tx_time = last_tx;
+        ec_keyed_netgroup = compute_keyed_netgroup pm.bucket_key p.Peer.addr;
+        ec_relay_txs = true;  (* Assume all relay txs for now *)
+        ec_prefer_evict = false;
+      }
+  ) pm.peers
+
+(* Remove last k elements from sorted list based on predicate *)
+let erase_last_k_elements (lst : eviction_candidate list)
+    (k : int) (pred : eviction_candidate -> bool) : eviction_candidate list =
+  let len = List.length lst in
+  let to_keep = max 0 (len - k) in
+  let kept = ref 0 in
+  let erased = ref 0 in
+  List.filter (fun c ->
+    if !erased < k && !kept >= to_keep && pred c then begin
+      incr erased;
+      false
+    end else begin
+      incr kept;
+      true
+    end
+  ) lst
+
+(* Multi-criteria eviction algorithm matching Bitcoin Core.
+   From Bitcoin Core eviction.cpp SelectNodeToEvict:
+   1. Protect 4 peers by distinct netgroup
+   2. Protect 8 peers by lowest ping
+   3. Protect 4 peers by most recent tx relay
+   4. Protect up to 8 non-tx-relay peers by most recent block relay
+   5. Protect 4 peers by most recent block relay
+   6. Protect half of remaining by longest connection time
+   7. From remaining, evict peer from largest same-network group *)
+let select_node_to_evict (pm : t) : Peer.peer option =
+  let candidates = build_eviction_candidates pm in
+  if List.length candidates = 0 then None
+  else begin
+    let candidates = ref candidates in
+    (* 1. Protect 4 peers by distinct netgroup (deterministic by keyed hash) *)
+    let sorted_by_netgroup = List.sort (fun a b ->
+      compare a.ec_keyed_netgroup b.ec_keyed_netgroup
+    ) !candidates in
+    candidates := erase_last_k_elements sorted_by_netgroup protect_by_netgroup
+      (fun _ -> true);
+    (* 2. Protect 8 peers by lowest ping *)
+    let sorted_by_ping = List.sort (fun a b ->
+      compare b.ec_min_ping a.ec_min_ping  (* Reverse: lowest at end *)
+    ) !candidates in
+    candidates := erase_last_k_elements sorted_by_ping protect_by_ping
+      (fun _ -> true);
+    (* 3. Protect 4 peers by most recent tx relay *)
+    let sorted_by_tx = List.sort (fun a b ->
+      compare a.ec_last_tx_time b.ec_last_tx_time  (* Most recent at end *)
+    ) !candidates in
+    candidates := erase_last_k_elements sorted_by_tx protect_by_tx_time
+      (fun _ -> true);
+    (* 4. Protect up to 8 non-tx-relay peers by most recent block relay *)
+    let sorted_by_block_relay = List.sort (fun a b ->
+      compare a.ec_last_block_time b.ec_last_block_time
+    ) !candidates in
+    candidates := erase_last_k_elements sorted_by_block_relay protect_by_block_relay
+      (fun c -> not c.ec_relay_txs);
+    (* 5. Protect 4 peers by most recent block relay *)
+    let sorted_by_block = List.sort (fun a b ->
+      compare a.ec_last_block_time b.ec_last_block_time
+    ) !candidates in
+    candidates := erase_last_k_elements sorted_by_block protect_by_block_time
+      (fun _ -> true);
+    (* 6. Protect half of remaining by longest connection time *)
+    let half_to_protect = List.length !candidates / 2 in
+    let sorted_by_connected = List.sort (fun a b ->
+      compare b.ec_connected a.ec_connected  (* Oldest at end *)
+    ) !candidates in
+    candidates := erase_last_k_elements sorted_by_connected half_to_protect
+      (fun _ -> true);
+    (* 7. If any remain with prefer_evict, filter to only those *)
+    if List.exists (fun c -> c.ec_prefer_evict) !candidates then
+      candidates := List.filter (fun c -> c.ec_prefer_evict) !candidates;
+    (* 8. Group by netgroup and find largest group *)
+    if !candidates = [] then None
+    else begin
+      let netgroup_map = Hashtbl.create 16 in
+      List.iter (fun c ->
+        let ng = c.ec_keyed_netgroup in
+        let current = match Hashtbl.find_opt netgroup_map ng with
+          | Some lst -> lst
+          | None -> []
+        in
+        Hashtbl.replace netgroup_map ng (c :: current)
+      ) !candidates;
+      (* Find netgroup with most connections and youngest member *)
+      let largest_group = ref [] in
+      let largest_size = ref 0 in
+      let youngest_in_largest = ref max_float in
+      Hashtbl.iter (fun _ group ->
+        let size = List.length group in
+        let youngest = List.fold_left (fun acc c ->
+          min acc c.ec_connected
+        ) max_float group in
+        if size > !largest_size || (size = !largest_size && youngest > !youngest_in_largest) then begin
+          largest_size := size;
+          largest_group := group;
+          youngest_in_largest := youngest
+        end
+      ) netgroup_map;
+      (* Evict the youngest (most recently connected) in largest group *)
+      match List.sort (fun a b -> compare b.ec_connected a.ec_connected) !largest_group with
+      | c :: _ -> Some c.ec_peer
+      | [] -> None
+    end
+  end
+
 (* Evict one low-quality inbound peer to make room for a new connection.
-   Protects the best inbound peers from eviction:
-   - Top 4 by lowest latency
-   - Top 4 by highest bytes_sent (upload contribution)
-   - Top 4 by highest bytes_received (download contribution)
-   - 1 per unique /16 subnet (up to 4 netgroups)
-   - Top 4 by longest connection time (lowest peer id = earliest connection)
-   From the remaining unprotected peers, evicts the one with highest latency. *)
+   Uses multi-criteria algorithm matching Bitcoin Core:
+   - Protect peers by netgroup diversity (4)
+   - Protect by lowest ping (8)
+   - Protect by recent tx relay (4)
+   - Protect by recent block relay (8 block-relay-only + 4 general)
+   - Protect by longest connection (half of remaining)
+   - Evict from largest same-netgroup cluster *)
 let evict_inbound_peer (pm : t) : unit Lwt.t =
-  (* Get all inbound peers in Ready state *)
-  let inbound_ready = List.filter (fun p ->
+  let open Lwt.Syntax in
+  let inbound_count = List.length (List.filter (fun p ->
     p.Peer.direction = Peer.Inbound && p.Peer.state = Peer.Ready
-  ) pm.peers in
-  if List.length inbound_ready <= 8 then
+  ) pm.peers) in
+  if inbound_count <= 8 then
     (* Not enough inbound peers to justify eviction *)
     Lwt.return_unit
-  else begin
-    (* Build a set of protected peer ids *)
-    let protected = Hashtbl.create 16 in
-    (* Protect top 4 by lowest latency *)
-    let by_latency = List.sort (fun a b ->
-      compare a.Peer.latency b.Peer.latency
-    ) inbound_ready in
-    List.iteri (fun i p ->
-      if i < 4 then Hashtbl.replace protected p.Peer.id true
-    ) by_latency;
-    (* Protect top 4 by highest bytes_sent (upload contribution) *)
-    let unprotected_for_sent = List.filter (fun p ->
-      not (Hashtbl.mem protected p.Peer.id)
-    ) inbound_ready in
-    let by_bytes_sent = List.sort (fun a b ->
-      compare b.Peer.bytes_sent a.Peer.bytes_sent
-    ) unprotected_for_sent in
-    List.iteri (fun i p ->
-      if i < 4 then Hashtbl.replace protected p.Peer.id true
-    ) by_bytes_sent;
-    (* Protect top 4 by highest bytes_received (download contribution) *)
-    let unprotected_for_recv = List.filter (fun p ->
-      not (Hashtbl.mem protected p.Peer.id)
-    ) inbound_ready in
-    let by_bytes_received = List.sort (fun a b ->
-      compare b.Peer.bytes_received a.Peer.bytes_received
-    ) unprotected_for_recv in
-    List.iteri (fun i p ->
-      if i < 4 then Hashtbl.replace protected p.Peer.id true
-    ) by_bytes_received;
-    (* Netgroup diversity: protect 1 peer per unique /16 subnet (up to 4) *)
-    let unprotected_for_netgroup = List.filter (fun p ->
-      not (Hashtbl.mem protected p.Peer.id)
-    ) inbound_ready in
-    let seen_netgroups = Hashtbl.create 8 in
-    let netgroup_protected = ref 0 in
-    List.iter (fun p ->
-      if !netgroup_protected < 4 then begin
-        let ng = netgroup_of p.Peer.addr in
-        if not (Hashtbl.mem seen_netgroups ng) then begin
-          Hashtbl.replace seen_netgroups ng true;
-          Hashtbl.replace protected p.Peer.id true;
-          incr netgroup_protected
-        end
-      end
-    ) unprotected_for_netgroup;
-    (* Protect top 4 by longest connection time (lowest id = earliest) *)
-    let by_age = List.sort (fun a b ->
-      compare a.Peer.id b.Peer.id
-    ) inbound_ready in
-    List.iteri (fun i p ->
-      if i < 4 then Hashtbl.replace protected p.Peer.id true
-    ) by_age;
-    (* Filter to unprotected peers *)
-    let unprotected = List.filter (fun p ->
-      not (Hashtbl.mem protected p.Peer.id)
-    ) inbound_ready in
-    match unprotected with
-    | [] -> Lwt.return_unit
-    | _ ->
-      (* Select the unprotected peer with highest latency *)
-      let by_worst_latency = List.sort (fun a b ->
-        compare b.Peer.latency a.Peer.latency
-      ) unprotected in
-      let victim = List.hd by_worst_latency in
-      Log.info (fun m -> m "Evicting inbound peer %d (%s) latency=%.3fs"
-        victim.Peer.id victim.Peer.addr victim.Peer.latency);
-      Peer.disconnect victim |> fun lwt ->
-        let open Lwt.Syntax in
-        let* () = lwt in
-        pm.peers <- List.filter (fun p -> p.Peer.id <> victim.Peer.id) pm.peers;
-        Lwt.return_unit
-  end
+  else
+    match select_node_to_evict pm with
+    | None -> Lwt.return_unit
+    | Some victim ->
+      Log.info (fun m -> m "Evicting inbound peer %d (%s) via multi-criteria algorithm"
+        victim.Peer.id victim.Peer.addr);
+      let* () = Peer.disconnect victim in
+      pm.peers <- List.filter (fun p -> p.Peer.id <> victim.Peer.id) pm.peers;
+      Hashtbl.remove pm.peer_last_tx_time victim.Peer.id;
+      Hashtbl.remove pm.peer_last_block_time victim.Peer.id;
+      Hashtbl.remove pm.peer_connected_time victim.Peer.id;
+      Lwt.return_unit
 
 (* Check if address is banned *)
 let is_banned (pm : t) (addr : string) : bool =
@@ -259,9 +498,11 @@ let resolve_dns_seeds (network : Consensus.network_config) : peer_info list Lwt.
                  services = 0L;
                  last_connected = 0.0;
                  last_attempt = 0.0;
+                 last_success = 0.0;
                  failures = 0;
                  banned_until = 0.0;
-                 source = Dns }
+                 source = Dns;
+                 table_status = NotInTable }
         | _ -> None
       ) addrs)
     ) (fun _exn ->
@@ -284,19 +525,32 @@ let get_fallback_peers (network : Consensus.network_config) : peer_info list =
       services = 0L;
       last_connected = 0.0;
       last_attempt = 0.0;
+      last_success = 0.0;
       failures = 0;
       banned_until = 0.0;
-      source = Manual }
+      source = Manual;
+      table_status = NotInTable }
   ) peers
 
-(* Add a peer address to known addresses *)
+(* Add a peer address to known addresses with bucketing *)
 let add_known_addr (pm : t) (info : peer_info) : unit =
-  if not (Hashtbl.mem pm.known_addrs info.address) then
-    Hashtbl.replace pm.known_addrs info.address info
+  if not (Hashtbl.mem pm.known_addrs info.address) then begin
+    (* Add to new table bucket *)
+    let bucket = add_to_new_table pm info.address in
+    let info_with_bucket = { info with table_status = InNew bucket } in
+    Hashtbl.replace pm.known_addrs info.address info_with_bucket
+  end
 
-(* Connect to a peer and add to active peers *)
+(* Check if connecting to this address would violate outbound netgroup diversity *)
+let would_violate_netgroup_diversity (pm : t) (addr : string) : bool =
+  let netgroup = netgroup_of addr in
+  Hashtbl.mem pm.outbound_netgroups netgroup
+
+(* Connect to a peer and add to active peers.
+   Enforces outbound netgroup diversity for eclipse protection. *)
 let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
   let open Lwt.Syntax in
+  let now = Unix.gettimeofday () in
   (* Check connection limits *)
   let outbound_count = outbound_peer_count pm in
   if outbound_count >= pm.config.max_outbound then
@@ -307,6 +561,12 @@ let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
   (* Check if banned *)
   else if is_banned pm addr then
     Lwt.return_unit
+  (* Eclipse protection: enforce /16 netgroup diversity for outbound *)
+  else if would_violate_netgroup_diversity pm addr then begin
+    Log.debug (fun m -> m "Skipping %s: netgroup %s already connected"
+      addr (netgroup_of addr));
+    Lwt.return_unit
+  end
   else begin
     let id = pm.next_peer_id in
     pm.next_peer_id <- pm.next_peer_id + 1;
@@ -314,31 +574,41 @@ let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
     (match Hashtbl.find_opt pm.known_addrs addr with
      | Some info ->
        Hashtbl.replace pm.known_addrs addr
-         { info with last_attempt = Unix.gettimeofday () }
+         { info with last_attempt = now }
      | None -> ());
     Lwt.catch (fun () ->
       let* peer = Peer.connect ~network:pm.network ~addr ~port ~id in
       let* () = Peer.perform_handshake peer pm.our_height in
       pm.peers <- peer :: pm.peers;
+      (* Track connection time for eviction algorithm *)
+      Hashtbl.replace pm.peer_connected_time peer.Peer.id now;
+      (* Track outbound netgroup for diversity *)
+      Hashtbl.replace pm.outbound_netgroups (netgroup_of addr) true;
       (* Start inventory trickling for this peer *)
       Lwt.async (fun () -> Peer.start_trickling peer);
+      (* Move address to tried table (successful connection) *)
+      let tried_bucket = move_to_tried_table pm addr in
       (* Update known_addrs with successful connection *)
       (match Hashtbl.find_opt pm.known_addrs addr with
        | Some info ->
          Hashtbl.replace pm.known_addrs addr
            { info with
-             last_connected = Unix.gettimeofday ();
-             failures = 0 }
+             last_connected = now;
+             last_success = now;
+             failures = 0;
+             table_status = InTried tried_bucket }
        | None ->
          Hashtbl.replace pm.known_addrs addr
            { address = addr;
              port;
              services = Peer.services_to_int64 peer.services;
-             last_connected = Unix.gettimeofday ();
-             last_attempt = Unix.gettimeofday ();
+             last_connected = now;
+             last_attempt = now;
+             last_success = now;
              failures = 0;
              banned_until = 0.0;
-             source = Manual });
+             source = Manual;
+             table_status = InTried tried_bucket });
       Lwt.return_unit
     ) (fun _exn ->
       (* Connection failed, record failure *)
@@ -347,7 +617,7 @@ let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
          Hashtbl.replace pm.known_addrs addr
            { info with
              failures = info.failures + 1;
-             last_attempt = Unix.gettimeofday () }
+             last_attempt = now }
        | None -> ());
       Lwt.return_unit
     )
@@ -362,6 +632,13 @@ let remove_peer (pm : t) (peer_id : int) : unit Lwt.t =
     let* () = Peer.disconnect peer in
     pm.peers <- List.filter (fun p -> p.Peer.id <> peer_id) pm.peers;
     Hashtbl.remove pm.chain_sync_behind_since peer_id;
+    (* Clean up eviction tracking *)
+    Hashtbl.remove pm.peer_last_tx_time peer_id;
+    Hashtbl.remove pm.peer_last_block_time peer_id;
+    Hashtbl.remove pm.peer_connected_time peer_id;
+    (* Remove from outbound netgroup tracking if outbound peer *)
+    if peer.Peer.direction = Peer.Outbound then
+      Hashtbl.remove pm.outbound_netgroups (netgroup_of peer.Peer.addr);
     Lwt.return_unit
 
 (* Ban a peer *)
@@ -375,9 +652,11 @@ let ban_peer (pm : t) (peer_id : int) ?(duration = 86400.0) () : unit Lwt.t =
         services = Peer.services_to_int64 peer.services;
         last_connected = 0.0;
         last_attempt = 0.0;
+        last_success = 0.0;
         failures = 0;
         banned_until = Unix.gettimeofday () +. duration;
-        source = Addr };
+        source = Addr;
+        table_status = NotInTable };
     remove_peer pm peer_id
 
 (* Ban a peer by address *)
@@ -393,9 +672,11 @@ let ban_addr (pm : t) (addr : string) ?(duration = 86400.0) () : unit =
         services = 0L;
         last_connected = 0.0;
         last_attempt = 0.0;
+        last_success = 0.0;
         failures = 0;
         banned_until = Unix.gettimeofday () +. duration;
-        source = Addr }
+        source = Addr;
+        table_status = NotInTable }
 
 (* Unban an address *)
 let unban_addr (pm : t) (addr : string) : unit =
@@ -597,15 +878,19 @@ let handle_addr (pm : t) (peer : Peer.peer) (addrs : (int32 * Types.net_addr) li
                | None -> false) then
         ()  (* Skip our own address *)
       else if not (Hashtbl.mem pm.known_addrs ip_str) then begin
+        (* Add to new table bucket *)
+        let bucket = add_to_new_table pm ip_str in
         Hashtbl.replace pm.known_addrs ip_str
           { address = ip_str;
             port = addr.port;
             services = addr.services;
             last_connected = 0.0;
             last_attempt = 0.0;
+            last_success = 0.0;
             failures = 0;
             banned_until = 0.0;
-            source = Addr };
+            source = Addr;
+            table_status = InNew bucket };
         incr processed
       end
     ) to_process;
@@ -871,11 +1156,14 @@ let accept_inbound (pm : t) (client_fd : Lwt_unix.file_descr)
   else begin
     let id = pm.next_peer_id in
     pm.next_peer_id <- pm.next_peer_id + 1;
+    let now = Unix.gettimeofday () in
     Lwt.catch (fun () ->
       let peer = Peer.make_peer ~network:pm.network ~addr:addr_str ~port
         ~id ~direction:Peer.Inbound ~fd:client_fd in
       let* () = Peer.perform_inbound_handshake peer pm.our_height in
       pm.peers <- peer :: pm.peers;
+      (* Track connection time for eviction algorithm *)
+      Hashtbl.replace pm.peer_connected_time peer.Peer.id now;
       (* Start inventory trickling for this peer *)
       Lwt.async (fun () -> Peer.start_trickling peer);
       (* Start the message loop for this inbound peer *)
@@ -1024,9 +1312,11 @@ let load_bans (pm : t) (db : Storage.ChainDB.t) : int =
                services = 0L;
                last_connected = 0.0;
                last_attempt = 0.0;
+               last_success = 0.0;
                failures = 0;
                banned_until;
-               source = Addr });
+               source = Addr;
+               table_status = NotInTable });
         incr count
       end else
         (* Expired ban — clean up from DB *)
@@ -1091,9 +1381,11 @@ let load_bans_json (pm : t) (filepath : string) : int =
                        services = 0L;
                        last_connected = 0.0;
                        last_attempt = 0.0;
+                       last_success = 0.0;
                        failures = 0;
                        banned_until = bu;
-                       source = Addr });
+                       source = Addr;
+                       table_status = NotInTable });
                 incr count
               | _ -> ())
            | _ -> ()
@@ -1129,3 +1421,135 @@ let on_peer_disconnect (pm : t) (peer_id : int)
     requeue_blocks [];
     let* () = remove_peer pm peer_id in
     Lwt.return_unit
+
+(* ========== Anchor connections for eclipse attack protection ========== *)
+
+(* Anchor connections are block-relay-only outbound connections that persist
+   across restarts. They help prevent eclipse attacks by ensuring we maintain
+   connections to peers we've successfully connected to before.
+   See Bitcoin Core: MAX_BLOCK_RELAY_ONLY_ANCHORS = 2 *)
+
+(* Save anchor connections to anchors.dat *)
+let save_anchors (pm : t) (datadir : string) : unit =
+  let filepath = Filename.concat datadir "anchors.dat" in
+  (* Select up to max_block_relay_only_anchors outbound peers that are ready *)
+  let outbound_ready = List.filter (fun p ->
+    p.Peer.direction = Peer.Outbound && p.Peer.state = Peer.Ready
+  ) pm.peers in
+  let anchors = List.filteri (fun i _ ->
+    i < pm.config.max_block_relay_only_anchors
+  ) outbound_ready in
+  let anchor_infos = List.map (fun p ->
+    { anchor_addr = p.Peer.addr;
+      anchor_port = p.Peer.port;
+      anchor_services = Peer.services_to_int64 p.Peer.services }
+  ) anchors in
+  pm.anchors <- anchor_infos;
+  (* Serialize to JSON *)
+  let json = `List (List.map (fun a ->
+    `Assoc [
+      ("addr", `String a.anchor_addr);
+      ("port", `Int a.anchor_port);
+      ("services", `String (Int64.to_string a.anchor_services))
+    ]
+  ) anchor_infos) in
+  try
+    let oc = open_out filepath in
+    output_string oc (Yojson.Safe.pretty_to_string json);
+    close_out oc;
+    Log.info (fun m -> m "Saved %d anchor connections to %s"
+      (List.length anchor_infos) filepath)
+  with exn ->
+    Log.warn (fun m -> m "Failed to save anchors: %s" (Printexc.to_string exn))
+
+(* Load anchor connections from anchors.dat *)
+let load_anchors (pm : t) (datadir : string) : int =
+  let filepath = Filename.concat datadir "anchors.dat" in
+  if not (Sys.file_exists filepath) then
+    0
+  else begin
+    try
+      let ic = open_in filepath in
+      let content = really_input_string ic (in_channel_length ic) in
+      close_in ic;
+      let json = Yojson.Safe.from_string content in
+      let anchors = match json with
+        | `List entries ->
+          List.filter_map (fun entry ->
+            match entry with
+            | `Assoc fields ->
+              let addr = match List.assoc_opt "addr" fields with
+                | Some (`String a) -> Some a
+                | _ -> None
+              in
+              let port = match List.assoc_opt "port" fields with
+                | Some (`Int p) -> Some p
+                | _ -> None
+              in
+              let services = match List.assoc_opt "services" fields with
+                | Some (`String s) -> (try Some (Int64.of_string s) with _ -> Some 0L)
+                | Some (`Int i) -> Some (Int64.of_int i)
+                | _ -> Some 0L
+              in
+              (match addr, port, services with
+               | Some a, Some p, Some s ->
+                 Some { anchor_addr = a; anchor_port = p; anchor_services = s }
+               | _ -> None)
+            | _ -> None
+          ) entries
+        | _ -> []
+      in
+      pm.anchors <- anchors;
+      Log.info (fun m -> m "Loaded %d anchor connections from %s"
+        (List.length anchors) filepath);
+      (* Delete the file after loading (anchors are one-time use) *)
+      (try Unix.unlink filepath with _ -> ());
+      List.length anchors
+    with exn ->
+      Log.warn (fun m -> m "Failed to load anchors: %s" (Printexc.to_string exn));
+      0
+  end
+
+(* Get anchor connections to try on startup *)
+let get_anchors (pm : t) : anchor_info list =
+  pm.anchors
+
+(* Clear anchors after connecting *)
+let clear_anchors (pm : t) : unit =
+  pm.anchors <- []
+
+(* Connect to anchor peers (called on startup before DNS resolution) *)
+let connect_to_anchors (pm : t) : unit Lwt.t =
+  let open Lwt.Syntax in
+  let anchors = pm.anchors in
+  if anchors = [] then
+    Lwt.return_unit
+  else begin
+    Log.info (fun m -> m "Connecting to %d anchor peers" (List.length anchors));
+    let* () = Lwt_list.iter_s (fun anchor ->
+      add_peer pm anchor.anchor_addr anchor.anchor_port
+    ) anchors in
+    clear_anchors pm;
+    Lwt.return_unit
+  end
+
+(* ========== Eclipse protection statistics ========== *)
+
+(* Statistics about address bucket tables *)
+type bucket_stats = {
+  new_table_entries : int;
+  new_table_buckets_used : int;
+  tried_table_entries : int;
+  tried_table_buckets_used : int;
+  outbound_netgroups : int;
+  anchor_count : int;
+}
+
+let get_bucket_stats (pm : t) : bucket_stats =
+  { new_table_entries = new_table_size pm;
+    new_table_buckets_used = Hashtbl.length pm.new_table;
+    tried_table_entries = tried_table_size pm;
+    tried_table_buckets_used = Hashtbl.length pm.tried_table;
+    outbound_netgroups = Hashtbl.length pm.outbound_netgroups;
+    anchor_count = List.length pm.anchors;
+  }

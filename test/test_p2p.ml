@@ -914,6 +914,271 @@ let test_bip324_constants () =
   Alcotest.(check int) "max garbage" 4095 P2p.Bip324.max_garbage_len;
   Alcotest.(check int) "expansion" 20 P2p.Bip324.expansion
 
+(* ============================================================================
+   BIP 155 addrv2 Tests
+   ============================================================================ *)
+
+(* Helper to create addrv2 address with specific network type *)
+let make_addrv2_addr ~network_id ~addr_bytes ~port ~time ~services : P2p.addrv2_addr =
+  {
+    v2_time = time;
+    v2_services = services;
+    v2_network_id = network_id;
+    v2_addr = addr_bytes;
+    v2_port = port;
+  }
+
+(* Test addrv2 IPv4 address roundtrip *)
+let test_addrv2_ipv4_roundtrip () =
+  let ipv4_bytes = Cstruct.create 4 in
+  Cstruct.set_uint8 ipv4_bytes 0 192;
+  Cstruct.set_uint8 ipv4_bytes 1 168;
+  Cstruct.set_uint8 ipv4_bytes 2 1;
+  Cstruct.set_uint8 ipv4_bytes 3 100;
+  let addr = make_addrv2_addr
+    ~network_id:P2p.Addrv2_IPv4
+    ~addr_bytes:ipv4_bytes
+    ~port:8333
+    ~time:1700000000l
+    ~services:1L in
+  let payload = P2p.Addrv2Msg [addr] in
+  let serialized = P2p.serialize_message P2p.mainnet_magic payload in
+  let msg = P2p.deserialize_message serialized in
+  match msg.payload with
+  | P2p.Addrv2Msg [a] ->
+    Alcotest.(check int32) "time" 1700000000l a.v2_time;
+    Alcotest.(check int64) "services" 1L a.v2_services;
+    Alcotest.(check int) "port" 8333 a.v2_port;
+    Alcotest.(check int) "addr len" 4 (Cstruct.length a.v2_addr);
+    (match a.v2_network_id with
+     | P2p.Addrv2_IPv4 -> ()
+     | _ -> Alcotest.fail "Expected IPv4 network");
+    Alcotest.(check int) "byte 0" 192 (Cstruct.get_uint8 a.v2_addr 0);
+    Alcotest.(check int) "byte 3" 100 (Cstruct.get_uint8 a.v2_addr 3)
+  | _ -> Alcotest.fail "Expected single Addrv2Msg"
+
+(* Test addrv2 IPv6 address roundtrip *)
+let test_addrv2_ipv6_roundtrip () =
+  let ipv6_bytes = Cstruct.create 16 in
+  (* 2001:0db8::1 *)
+  Cstruct.set_uint8 ipv6_bytes 0 0x20;
+  Cstruct.set_uint8 ipv6_bytes 1 0x01;
+  Cstruct.set_uint8 ipv6_bytes 2 0x0d;
+  Cstruct.set_uint8 ipv6_bytes 3 0xb8;
+  Cstruct.set_uint8 ipv6_bytes 15 0x01;
+  let addr = make_addrv2_addr
+    ~network_id:P2p.Addrv2_IPv6
+    ~addr_bytes:ipv6_bytes
+    ~port:8333
+    ~time:1700000001l
+    ~services:9L in
+  let payload = P2p.Addrv2Msg [addr] in
+  let serialized = P2p.serialize_message P2p.mainnet_magic payload in
+  let msg = P2p.deserialize_message serialized in
+  match msg.payload with
+  | P2p.Addrv2Msg [a] ->
+    Alcotest.(check int) "addr len" 16 (Cstruct.length a.v2_addr);
+    (match a.v2_network_id with
+     | P2p.Addrv2_IPv6 -> ()
+     | _ -> Alcotest.fail "Expected IPv6 network");
+    Alcotest.(check int) "byte 0" 0x20 (Cstruct.get_uint8 a.v2_addr 0);
+    Alcotest.(check int) "byte 15" 0x01 (Cstruct.get_uint8 a.v2_addr 15)
+  | _ -> Alcotest.fail "Expected single Addrv2Msg"
+
+(* Test addrv2 Tor v3 address roundtrip (32 bytes ed25519 pubkey) *)
+let test_addrv2_torv3_roundtrip () =
+  let torv3_bytes = Cstruct.create 32 in
+  for i = 0 to 31 do
+    Cstruct.set_uint8 torv3_bytes i (i * 7 mod 256)
+  done;
+  let addr = make_addrv2_addr
+    ~network_id:P2p.Addrv2_TorV3
+    ~addr_bytes:torv3_bytes
+    ~port:9050
+    ~time:1700000002l
+    ~services:1L in
+  let payload = P2p.Addrv2Msg [addr] in
+  let serialized = P2p.serialize_message P2p.mainnet_magic payload in
+  let msg = P2p.deserialize_message serialized in
+  match msg.payload with
+  | P2p.Addrv2Msg [a] ->
+    Alcotest.(check int) "addr len" 32 (Cstruct.length a.v2_addr);
+    (match a.v2_network_id with
+     | P2p.Addrv2_TorV3 -> ()
+     | _ -> Alcotest.fail "Expected TorV3 network");
+    Alcotest.(check int) "port" 9050 a.v2_port;
+    (* Verify address bytes preserved *)
+    for i = 0 to 31 do
+      Alcotest.(check int) (Printf.sprintf "byte %d" i)
+        (i * 7 mod 256) (Cstruct.get_uint8 a.v2_addr i)
+    done
+  | _ -> Alcotest.fail "Expected single Addrv2Msg"
+
+(* Test addrv2 I2P address roundtrip (32 bytes SHA-256 of destination) *)
+let test_addrv2_i2p_roundtrip () =
+  let i2p_bytes = Cstruct.create 32 in
+  for i = 0 to 31 do
+    Cstruct.set_uint8 i2p_bytes i (255 - i)
+  done;
+  let addr = make_addrv2_addr
+    ~network_id:P2p.Addrv2_I2P
+    ~addr_bytes:i2p_bytes
+    ~port:0  (* I2P typically uses port 0 *)
+    ~time:1700000003l
+    ~services:1L in
+  let payload = P2p.Addrv2Msg [addr] in
+  let serialized = P2p.serialize_message P2p.mainnet_magic payload in
+  let msg = P2p.deserialize_message serialized in
+  match msg.payload with
+  | P2p.Addrv2Msg [a] ->
+    Alcotest.(check int) "addr len" 32 (Cstruct.length a.v2_addr);
+    (match a.v2_network_id with
+     | P2p.Addrv2_I2P -> ()
+     | _ -> Alcotest.fail "Expected I2P network");
+    Alcotest.(check int) "port" 0 a.v2_port;
+    (* Verify address bytes preserved *)
+    for i = 0 to 31 do
+      Alcotest.(check int) (Printf.sprintf "byte %d" i)
+        (255 - i) (Cstruct.get_uint8 a.v2_addr i)
+    done
+  | _ -> Alcotest.fail "Expected single Addrv2Msg"
+
+(* Test addrv2 CJDNS address roundtrip (16 bytes) *)
+let test_addrv2_cjdns_roundtrip () =
+  let cjdns_bytes = Cstruct.create 16 in
+  (* CJDNS addresses start with fc00::/8 *)
+  Cstruct.set_uint8 cjdns_bytes 0 0xfc;
+  for i = 1 to 15 do
+    Cstruct.set_uint8 cjdns_bytes i (i * 13 mod 256)
+  done;
+  let addr = make_addrv2_addr
+    ~network_id:P2p.Addrv2_CJDNS
+    ~addr_bytes:cjdns_bytes
+    ~port:8333
+    ~time:1700000004l
+    ~services:1L in
+  let payload = P2p.Addrv2Msg [addr] in
+  let serialized = P2p.serialize_message P2p.mainnet_magic payload in
+  let msg = P2p.deserialize_message serialized in
+  match msg.payload with
+  | P2p.Addrv2Msg [a] ->
+    Alcotest.(check int) "addr len" 16 (Cstruct.length a.v2_addr);
+    (match a.v2_network_id with
+     | P2p.Addrv2_CJDNS -> ()
+     | _ -> Alcotest.fail "Expected CJDNS network");
+    Alcotest.(check int) "first byte" 0xfc (Cstruct.get_uint8 a.v2_addr 0)
+  | _ -> Alcotest.fail "Expected single Addrv2Msg"
+
+(* Test addrv2 with multiple addresses of different types *)
+let test_addrv2_multiple_networks () =
+  let ipv4_bytes = Cstruct.create 4 in
+  Cstruct.set_uint8 ipv4_bytes 0 10;
+  Cstruct.set_uint8 ipv4_bytes 1 0;
+  Cstruct.set_uint8 ipv4_bytes 2 0;
+  Cstruct.set_uint8 ipv4_bytes 3 1;
+  let torv3_bytes = Cstruct.create 32 in
+  for i = 0 to 31 do Cstruct.set_uint8 torv3_bytes i i done;
+  let i2p_bytes = Cstruct.create 32 in
+  for i = 0 to 31 do Cstruct.set_uint8 i2p_bytes i (31 - i) done;
+  let addrs = [
+    make_addrv2_addr ~network_id:P2p.Addrv2_IPv4 ~addr_bytes:ipv4_bytes
+      ~port:8333 ~time:1700000010l ~services:1L;
+    make_addrv2_addr ~network_id:P2p.Addrv2_TorV3 ~addr_bytes:torv3_bytes
+      ~port:9050 ~time:1700000011l ~services:1L;
+    make_addrv2_addr ~network_id:P2p.Addrv2_I2P ~addr_bytes:i2p_bytes
+      ~port:0 ~time:1700000012l ~services:1L;
+  ] in
+  let payload = P2p.Addrv2Msg addrs in
+  let serialized = P2p.serialize_message P2p.mainnet_magic payload in
+  let msg = P2p.deserialize_message serialized in
+  match msg.payload with
+  | P2p.Addrv2Msg decoded_addrs ->
+    Alcotest.(check int) "addr count" 3 (List.length decoded_addrs);
+    let a0 = List.nth decoded_addrs 0 in
+    let a1 = List.nth decoded_addrs 1 in
+    let a2 = List.nth decoded_addrs 2 in
+    (match a0.v2_network_id with P2p.Addrv2_IPv4 -> () | _ -> Alcotest.fail "addr 0 not IPv4");
+    (match a1.v2_network_id with P2p.Addrv2_TorV3 -> () | _ -> Alcotest.fail "addr 1 not TorV3");
+    (match a2.v2_network_id with P2p.Addrv2_I2P -> () | _ -> Alcotest.fail "addr 2 not I2P");
+    Alcotest.(check int) "ipv4 len" 4 (Cstruct.length a0.v2_addr);
+    Alcotest.(check int) "torv3 len" 32 (Cstruct.length a1.v2_addr);
+    Alcotest.(check int) "i2p len" 32 (Cstruct.length a2.v2_addr)
+  | _ -> Alcotest.fail "Expected Addrv2Msg"
+
+(* Test addrv2 services with large CompactSize encoding *)
+let test_addrv2_large_services () =
+  let ipv4_bytes = Cstruct.create 4 in
+  Cstruct.set_uint8 ipv4_bytes 0 8;
+  Cstruct.set_uint8 ipv4_bytes 1 8;
+  Cstruct.set_uint8 ipv4_bytes 2 8;
+  Cstruct.set_uint8 ipv4_bytes 3 8;
+  (* Large services value requiring multi-byte CompactSize *)
+  let large_services = 0x0FFFFFFFL in
+  let addr = make_addrv2_addr
+    ~network_id:P2p.Addrv2_IPv4
+    ~addr_bytes:ipv4_bytes
+    ~port:8333
+    ~time:1700000020l
+    ~services:large_services in
+  let payload = P2p.Addrv2Msg [addr] in
+  let serialized = P2p.serialize_message P2p.mainnet_magic payload in
+  let msg = P2p.deserialize_message serialized in
+  match msg.payload with
+  | P2p.Addrv2Msg [a] ->
+    Alcotest.(check int64) "large services" large_services a.v2_services
+  | _ -> Alcotest.fail "Expected single Addrv2Msg"
+
+(* Test sendaddrv2 message is included in empty payloads *)
+let test_sendaddrv2_roundtrip () =
+  let payload = P2p.SendaddrV2Msg in
+  let serialized = P2p.serialize_message P2p.mainnet_magic payload in
+  let msg = P2p.deserialize_message serialized in
+  (* Header is 24 bytes, payload should be empty *)
+  Alcotest.(check int) "message size" 24 (Cstruct.length serialized);
+  match msg.payload with
+  | P2p.SendaddrV2Msg -> ()
+  | _ -> Alcotest.fail "Expected SendaddrV2Msg"
+
+(* Test addrv2 network ID conversion *)
+let test_addrv2_network_ids () =
+  (* Test that network IDs are correctly encoded/decoded *)
+  let test_cases = [
+    (P2p.Addrv2_IPv4, 4);
+    (P2p.Addrv2_IPv6, 16);
+    (P2p.Addrv2_TorV2, 10);  (* deprecated but still valid *)
+    (P2p.Addrv2_TorV3, 32);
+    (P2p.Addrv2_I2P, 32);
+    (P2p.Addrv2_CJDNS, 16);
+  ] in
+  List.iter (fun (net_id, expected_len) ->
+    let addr_bytes = Cstruct.create expected_len in
+    let addr = make_addrv2_addr
+      ~network_id:net_id
+      ~addr_bytes
+      ~port:8333
+      ~time:1700000000l
+      ~services:1L in
+    let payload = P2p.Addrv2Msg [addr] in
+    let serialized = P2p.serialize_message P2p.mainnet_magic payload in
+    let msg = P2p.deserialize_message serialized in
+    match msg.payload with
+    | P2p.Addrv2Msg [a] ->
+      Alcotest.(check int) "addr len" expected_len (Cstruct.length a.v2_addr);
+      Alcotest.(check bool) "network matches" true (a.v2_network_id = net_id)
+    | _ -> Alcotest.fail "Expected single Addrv2Msg"
+  ) test_cases
+
+(* Test addrv2 command string *)
+let test_addrv2_command () =
+  let cmd = P2p.command_of_string "addrv2" in
+  Alcotest.(check bool) "addrv2 command" true (cmd = P2p.Addrv2);
+  let s = P2p.command_to_string P2p.Addrv2 in
+  Alcotest.(check string) "addrv2 string" "addrv2" s;
+  let cmd2 = P2p.command_of_string "sendaddrv2" in
+  Alcotest.(check bool) "sendaddrv2 command" true (cmd2 = P2p.Sendaddrv2);
+  let s2 = P2p.command_to_string P2p.Sendaddrv2 in
+  Alcotest.(check string) "sendaddrv2 string" "sendaddrv2" s2
+
 let () =
   let open Alcotest in
   run "P2P" [
@@ -984,6 +1249,18 @@ let () =
       test_case "v2 message decoding" `Quick test_v2_message_decoding;
       test_case "v2 transport create" `Quick test_v2_transport_create;
       test_case "v1 transport create" `Quick test_v1_transport_create;
+    ];
+    "bip155_addrv2", [
+      test_case "addrv2 ipv4 roundtrip" `Quick test_addrv2_ipv4_roundtrip;
+      test_case "addrv2 ipv6 roundtrip" `Quick test_addrv2_ipv6_roundtrip;
+      test_case "addrv2 torv3 roundtrip" `Quick test_addrv2_torv3_roundtrip;
+      test_case "addrv2 i2p roundtrip" `Quick test_addrv2_i2p_roundtrip;
+      test_case "addrv2 cjdns roundtrip" `Quick test_addrv2_cjdns_roundtrip;
+      test_case "addrv2 multiple networks" `Quick test_addrv2_multiple_networks;
+      test_case "addrv2 large services" `Quick test_addrv2_large_services;
+      test_case "sendaddrv2 roundtrip" `Quick test_sendaddrv2_roundtrip;
+      test_case "addrv2 network ids" `Quick test_addrv2_network_ids;
+      test_case "addrv2 command" `Quick test_addrv2_command;
     ];
     "property", [
       QCheck_alcotest.to_alcotest test_ping_pong_property;

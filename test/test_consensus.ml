@@ -34,7 +34,7 @@ let test_consensus_constants () =
   Alcotest.(check int) "coinbase maturity" 100 Consensus.coinbase_maturity;
   Alcotest.(check int) "difficulty interval" 2016 Consensus.difficulty_adjustment_interval;
   Alcotest.(check int) "target timespan" 1_209_600 Consensus.target_timespan;
-  Alcotest.(check int) "halving interval" 210_000 Consensus.halving_interval
+  Alcotest.(check int) "default halving interval" 210_000 Consensus.default_halving_interval
 
 (* Test is_valid_money *)
 let test_valid_money () =

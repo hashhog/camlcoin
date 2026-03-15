@@ -2438,6 +2438,133 @@ let handle_converttopsbt (_ctx : rpc_context)
     Error "Invalid parameters: expected [hexstring, (permitsigdata)]"
 
 (* ============================================================================
+   Output Descriptor Handlers (BIP 380-386)
+   ============================================================================ *)
+
+(* getdescriptorinfo "descriptor"
+   Analyzes a descriptor string and returns information about it *)
+let handle_getdescriptorinfo (_ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String desc_str] ->
+    (match Descriptor.get_info desc_str with
+     | Ok info ->
+       Ok (`Assoc [
+         ("descriptor", `String info.Descriptor.descriptor);
+         ("checksum", `String (
+           (* Extract just the checksum from "desc#checksum" *)
+           match String.rindex_opt info.Descriptor.descriptor '#' with
+           | Some pos ->
+             String.sub info.descriptor (pos + 1)
+               (String.length info.descriptor - pos - 1)
+           | None -> ""
+         ));
+         ("isrange", `Bool info.is_range);
+         ("issolvable", `Bool info.is_solvable);
+         ("hasprivatekeys", `Bool info.has_private_keys);
+       ])
+     | Error e -> Error e)
+  | _ ->
+    Error "Invalid parameters: expected [descriptor]"
+
+(* deriveaddresses "descriptor" ( range )
+   Derives addresses from a descriptor for a given range *)
+let handle_deriveaddresses (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  let network = match ctx.network.name with
+    | "mainnet" -> `Mainnet
+    | "testnet" -> `Testnet
+    | _ -> `Regtest
+  in
+  match params with
+  | [`String desc_str] ->
+    (* No range specified - derive single address at index 0 *)
+    (match Descriptor.parse desc_str with
+     | Error e -> Error e
+     | Ok parsed ->
+       if Descriptor.is_ranged parsed.desc then
+         Error "Descriptor is ranged; please specify a range"
+       else
+         match Descriptor.derive_addresses parsed.desc (0, 0) network with
+         | Error e -> Error e
+         | Ok addrs -> Ok (`List (List.map (fun a -> `String a) addrs)))
+  | [`String desc_str; `List [`Int start_idx; `Int end_idx]] ->
+    (* Range specified as [start, end] *)
+    (match Descriptor.parse desc_str with
+     | Error e -> Error e
+     | Ok parsed ->
+       match Descriptor.derive_addresses parsed.desc (start_idx, end_idx) network with
+       | Error e -> Error e
+       | Ok addrs -> Ok (`List (List.map (fun a -> `String a) addrs)))
+  | [`String desc_str; `Int single_idx] ->
+    (* Single index *)
+    (match Descriptor.parse desc_str with
+     | Error e -> Error e
+     | Ok parsed ->
+       match Descriptor.derive_addresses parsed.desc (single_idx, single_idx) network with
+       | Error e -> Error e
+       | Ok addrs -> Ok (`List (List.map (fun a -> `String a) addrs)))
+  | _ ->
+    Error "Invalid parameters: expected [descriptor, (range)]"
+
+(* listdescriptors ( private )
+   Lists all descriptors imported into the wallet.
+   Currently, this returns implicit descriptors based on the wallet's HD keys. *)
+let handle_listdescriptors (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  let include_private = match params with
+    | [`Bool true] -> true
+    | _ -> false
+  in
+  match ctx.wallet with
+  | None -> Error "Wallet not loaded"
+  | Some wallet ->
+    (* Generate implicit descriptors from wallet's master key *)
+    let descriptors = match wallet.Wallet.master_key with
+      | None -> []
+      | Some master_key ->
+        (* Serialize the master key as xpub/xprv *)
+        let key_str = if include_private then
+          Wallet.serialize_xprv master_key
+        else
+          Wallet.serialize_xpub master_key
+        in
+        (* Generate standard BIP-84/86 descriptors *)
+        let wpkh_recv = Printf.sprintf "wpkh(%s/84'/0'/0'/0/*)" key_str in
+        let wpkh_change = Printf.sprintf "wpkh(%s/84'/0'/0'/1/*)" key_str in
+        let tr_recv = Printf.sprintf "tr(%s/86'/0'/0'/0/*)" key_str in
+        let tr_change = Printf.sprintf "tr(%s/86'/0'/0'/1/*)" key_str in
+        let make_desc d internal =
+          let desc_with_checksum = match Descriptor.add_checksum d with
+            | Some s -> s
+            | None -> d
+          in
+          `Assoc [
+            ("desc", `String desc_with_checksum);
+            ("timestamp", `Int 0);
+            ("active", `Bool true);
+            ("internal", `Bool internal);
+            ("range", `List [`Int 0; `Int 999]);
+            ("next", `Int 0);
+          ]
+        in
+        [
+          make_desc wpkh_recv false;
+          make_desc wpkh_change true;
+          make_desc tr_recv false;
+          make_desc tr_change true;
+        ]
+    in
+    Ok (`Assoc [
+      ("wallet_name", `String (match ctx.wallet_manager with
+        | Some wm -> (match Wallet.list_wallets wm with
+          | name :: _ -> name
+          | [] -> "")
+        | None -> ""));
+      ("descriptors", `List descriptors);
+    ])
+
+(* ============================================================================
    Performance Stats Handlers
    ============================================================================ *)
 
@@ -2673,6 +2800,11 @@ let handle_help (_ctx : rpc_context)
       "decodepsbt \"psbt\"";
       "finalizepsbt \"psbt\" ( extract )";
       "utxoupdatepsbt \"psbt\"";
+      "";
+      "== Descriptors ==";
+      "deriveaddresses \"descriptor\" ( range )";
+      "getdescriptorinfo \"descriptor\"";
+      "listdescriptors ( private )";
       "";
       "== Blockchain ==";
       "gettxout \"txid\" vout";
@@ -2923,6 +3055,20 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_converttopsbt ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
+
+  (* Output Descriptors *)
+  | "getdescriptorinfo" ->
+    (match handle_getdescriptorinfo ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "deriveaddresses" ->
+    (match handle_deriveaddresses ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "listdescriptors" ->
+    (match handle_listdescriptors ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_wallet_error, msg))
 
   (* Control *)
   | "stop" ->

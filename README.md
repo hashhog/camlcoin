@@ -59,7 +59,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Output descriptors (BIP 380-386, checksum, parsing, script generation, range expansion, RPC interface)
 - [x] Miniscript (type system, script generation/decompilation, optimal satisfaction with DP, wsh(miniscript) descriptors)
 - [x] BIP-133 feefilter (Poisson timing, noise rounding, block-relay-only exclusion)
-- [x] AssumeUTXO (BIP 199, snapshot loading, dual chainstate, background validation)
+- [x] AssumeUTXO (BIP 199, snapshot loading, dual chainstate, background validation, UTXO hash verification)
 - [x] REST API (block, tx, headers, chaininfo, mempool, blockhashbyheight, .json/.hex/.bin formats)
 - [x] ZMQ notifications (hashblock, hashtx, rawblock, rawtx, sequence topics, 4-byte LE sequence numbers)
 - [x] Regtest mode (generate, generatetoaddress, generateblock RPCs, instant mining)

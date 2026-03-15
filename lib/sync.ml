@@ -832,11 +832,13 @@ type ibd_state = {
   mutable mempool : Mempool.mempool option;
   orphan_blocks : (string, orphan_block_entry) Hashtbl.t;
   misbehavior_handler : (int -> string -> unit) option;
+  mutable zmq_notifier : Zmq_notify.t option;  (* ZMQ notification publisher *)
 }
 
 (* Create IBD state from existing chain state *)
 let create_ibd_state ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
     ?(misbehavior_handler : (int -> string -> unit) option)
+    ?(zmq_notifier : Zmq_notify.t option)
     (chain : chain_state) : ibd_state =
   let start_height = chain.blocks_synced + 1 in
   { chain;
@@ -853,10 +855,29 @@ let create_ibd_state ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
     utxo_set;
     mempool = None;
     orphan_blocks = Hashtbl.create 100;
-    misbehavior_handler }
+    misbehavior_handler;
+    zmq_notifier }
 
 let set_mempool (ibd : ibd_state) (mp : Mempool.mempool) =
   ibd.mempool <- Some mp
+
+let set_zmq_notifier (ibd : ibd_state) (notifier : Zmq_notify.t) =
+  ibd.zmq_notifier <- Some notifier
+
+(* Notify ZMQ subscribers about a block event *)
+let zmq_notify_block (ibd : ibd_state) (block : Types.block)
+    (block_hash : Types.hash256) (connect : bool) : unit =
+  match ibd.zmq_notifier with
+  | None -> ()
+  | Some notifier ->
+    (* Publish hashblock and rawblock *)
+    ignore (Zmq_notify.notify_hashblock notifier block_hash);
+    ignore (Zmq_notify.notify_rawblock notifier block);
+    (* Publish sequence event *)
+    if connect then
+      ignore (Zmq_notify.notify_block_connect notifier block_hash)
+    else
+      ignore (Zmq_notify.notify_block_disconnect notifier block_hash)
 
 (* Add an entry to the block queue with O(1) enqueue and index updates *)
 let queue_add (ibd : ibd_state) (entry : block_queue_entry) =
@@ -1434,6 +1455,8 @@ let process_downloaded_blocks (ibd : ibd_state)
              (* Also update chain tip in DB *)
              Storage.ChainDB.set_chain_tip ibd.chain.db entry.hash height
            end;
+           (* Notify ZMQ subscribers about block connect *)
+           zmq_notify_block ibd block entry.hash true;
            (* Check for orphan blocks that depend on this one *)
            ignore (process_orphan_blocks ibd entry.hash);
            (* Remove validated entries from queue *)
@@ -1581,6 +1604,8 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
              ) undo.tx_undos;
               (* Clean up stored undo data for disconnected block *)
               Storage.ChainDB.delete_undo_data state.db entry.hash;
+              (* Notify ZMQ subscribers about block disconnect *)
+              zmq_notify_block ibd block entry.hash false;
               Logs.debug (fun m ->
                 m "Disconnected block at height %d" entry.height);
               disconnect_blocks rest
@@ -1702,6 +1727,8 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
                (match ibd.mempool with
                 | Some mp -> Mempool.remove_for_block mp block height
                 | None -> ());
+               (* Notify ZMQ subscribers about block connect *)
+               zmq_notify_block ibd block entry.hash true;
                Logs.debug (fun m ->
                  m "Connected block at height %d during reorg" height)
              | Error e ->

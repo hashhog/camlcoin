@@ -2012,6 +2012,176 @@ let invalidate_block (state : chain_state)
       | None -> Ok 0
     end
 
+(* ============================================================================
+   BIP 152: Compact Block Relay
+
+   Compact blocks reduce block propagation bandwidth by sending just the header,
+   a random nonce, short transaction IDs (6 bytes), and prefilled transactions.
+   Recipients reconstruct blocks using transactions from their mempool.
+
+   Reference: Bitcoin Core net_processing.cpp, blockencodings.cpp
+   ============================================================================ *)
+
+(* State for tracking in-flight compact block requests *)
+type compact_block_request = {
+  cb_header_hash : Types.hash256;
+  cb_compact : P2p.compact_block;
+  cb_peer_id : int;
+  cb_request_time : float;
+  mutable cb_missing_indices : int list;  (* Indices of missing transactions *)
+}
+
+(* Pending compact block reconstruction state per block hash *)
+let pending_compact_blocks : (string, compact_block_request) Hashtbl.t =
+  Hashtbl.create 16
+
+(* Check if we have a header for this compact block *)
+let has_compact_block_header (state : chain_state) (hash : Types.hash256) : bool =
+  let hash_key = Cstruct.to_string hash in
+  Hashtbl.mem state.headers hash_key
+
+(* Handle a received cmpctblock message.
+   Attempts to reconstruct the block from mempool. If successful, processes
+   the block immediately. If missing transactions, sends getblocktxn request. *)
+let handle_cmpctblock (ibd : ibd_state) (cb : P2p.compact_block)
+    (peer : Peer.peer) ~(mempool : Mempool.mempool option)
+    : [`Reconstructed of Types.block | `NeedTx of int list | `Ignored] Lwt.t =
+  let open Lwt.Syntax in
+  let header_hash = Crypto.compute_block_hash cb.header in
+  let hash_key = Cstruct.to_string header_hash in
+  (* Check if we already have this block *)
+  if Storage.ChainDB.get_block ibd.chain.db header_hash <> None then begin
+    Logs.debug (fun m ->
+      m "Ignoring cmpctblock %s (already have block)"
+        (Types.hash256_to_hex_display header_hash));
+    Lwt.return `Ignored
+  end
+  (* Check if already processing this compact block *)
+  else if Hashtbl.mem pending_compact_blocks hash_key then begin
+    Logs.debug (fun m ->
+      m "Ignoring duplicate cmpctblock %s"
+        (Types.hash256_to_hex_display header_hash));
+    Lwt.return `Ignored
+  end
+  else begin
+    (* Derive SipHash keys for short ID computation *)
+    let (k0, k1) = Crypto.SipHash.derive_keys header_hash cb.nonce in
+    (* Build lookup table from mempool *)
+    let lookup_tbl = match mempool with
+      | None -> Hashtbl.create 0
+      | Some mp -> Mempool.create_short_id_lookup mp ~k0 ~k1
+    in
+    let lookup = { P2p.by_short_id = lookup_tbl } in
+    (* Attempt reconstruction *)
+    match P2p.reconstruct_block cb lookup with
+    | P2p.ReconstructComplete block ->
+      Logs.info (fun m ->
+        m "Reconstructed compact block %s from mempool"
+          (Types.hash256_to_hex_display header_hash));
+      Lwt.return (`Reconstructed block)
+    | P2p.ReconstructNeedTxs indices ->
+      Logs.debug (fun m ->
+        m "Compact block %s missing %d transactions, requesting"
+          (Types.hash256_to_hex_display header_hash)
+          (List.length indices));
+      (* Store pending request *)
+      let req = {
+        cb_header_hash = header_hash;
+        cb_compact = cb;
+        cb_peer_id = peer.Peer.id;
+        cb_request_time = Unix.gettimeofday ();
+        cb_missing_indices = indices;
+      } in
+      Hashtbl.replace pending_compact_blocks hash_key req;
+      (* Send getblocktxn request with differential encoding *)
+      let getblocktxn_req = P2p.make_getblocktxn_request header_hash indices in
+      let msg = P2p.make_getblocktxn_msg getblocktxn_req in
+      let* () = Lwt.catch
+        (fun () -> Peer.send_message peer msg)
+        (fun _exn -> Lwt.return_unit)
+      in
+      Lwt.return (`NeedTx indices)
+    | P2p.ReconstructFailed msg ->
+      Logs.warn (fun m ->
+        m "Failed to reconstruct compact block %s: %s"
+          (Types.hash256_to_hex_display header_hash) msg);
+      Lwt.return `Ignored
+  end
+
+(* Handle a received blocktxn message (response to getblocktxn).
+   Completes reconstruction of a pending compact block. *)
+let handle_blocktxn (ibd : ibd_state) (block_hash : Types.hash256)
+    (txns : Types.transaction list) ~(mempool : Mempool.mempool option)
+    : (Types.block, string) result =
+  let hash_key = Cstruct.to_string block_hash in
+  match Hashtbl.find_opt pending_compact_blocks hash_key with
+  | None ->
+    Logs.debug (fun m ->
+      m "Received blocktxn for unknown compact block %s"
+        (Types.hash256_to_hex_display block_hash));
+    Error "No pending compact block request"
+  | Some req ->
+    (* Remove from pending set *)
+    Hashtbl.remove pending_compact_blocks hash_key;
+    let cb = req.cb_compact in
+    (* Re-create lookup with received transactions appended.
+       We combine mempool transactions with the received missing transactions. *)
+    let header_hash = Crypto.compute_block_hash cb.header in
+    let (k0, k1) = Crypto.SipHash.derive_keys header_hash cb.nonce in
+    (* Create lookup from mempool and received transactions *)
+    let lookup_tbl = match mempool with
+      | None -> Hashtbl.create (List.length txns)
+      | Some mp -> Mempool.create_short_id_lookup mp ~k0 ~k1
+    in
+    (* Add received transactions to lookup *)
+    List.iter (fun tx ->
+      let wtxid = Crypto.compute_wtxid tx in
+      let short_id = Crypto.compute_short_txid k0 k1 wtxid in
+      Hashtbl.replace lookup_tbl short_id tx
+    ) txns;
+    let lookup = { P2p.by_short_id = lookup_tbl } in
+    (* Attempt reconstruction again with augmented lookup *)
+    match P2p.reconstruct_block cb lookup with
+    | P2p.ReconstructComplete block ->
+      Logs.info (fun m ->
+        m "Completed compact block reconstruction for %s"
+          (Types.hash256_to_hex_display block_hash));
+      (* Pass to receive_block for normal processing *)
+      let _ = receive_block ibd block in
+      Ok block
+    | P2p.ReconstructNeedTxs _ ->
+      Logs.warn (fun m ->
+        m "Compact block %s still missing transactions after blocktxn"
+          (Types.hash256_to_hex_display block_hash));
+      Error "Still missing transactions after blocktxn"
+    | P2p.ReconstructFailed msg ->
+      Logs.warn (fun m ->
+        m "Failed to reconstruct compact block %s: %s"
+          (Types.hash256_to_hex_display block_hash) msg);
+      Error msg
+
+(* Expire pending compact block requests older than timeout *)
+let expire_compact_block_requests (timeout_secs : float) : int =
+  let now = Unix.gettimeofday () in
+  let to_remove = Hashtbl.fold (fun key req acc ->
+    if now -. req.cb_request_time > timeout_secs then
+      key :: acc
+    else
+      acc
+  ) pending_compact_blocks [] in
+  List.iter (fun key -> Hashtbl.remove pending_compact_blocks key) to_remove;
+  let removed = List.length to_remove in
+  if removed > 0 then
+    Logs.debug (fun m ->
+      m "Expired %d pending compact block requests" removed);
+  removed
+
+(* Check if a peer has the header for a given block (for HB relay filtering) *)
+let peer_has_header (_peer : Peer.peer) (_hash : Types.hash256) : bool =
+  (* Simplified check: assume peer has header if handshake complete.
+     A more sophisticated implementation would track peer's best header. *)
+  true
+
 (* Reconsider a previously invalidated block.
    Clears the invalid flag from the block and all its descendants/ancestors,
    then triggers chain selection to potentially reorg to a better chain. *)

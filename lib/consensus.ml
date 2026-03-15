@@ -57,14 +57,29 @@ let feefilter_version = 70013l
 let short_ids_blocks_version = 70014l
 let wtxid_relay_version = 70016l
 
-(* Block subsidy halving *)
-let halving_interval = 210_000
+(* Block subsidy halving - default interval for mainnet/testnet *)
+let default_halving_interval = 210_000
 
-(* Calculate block subsidy (mining reward) for a given height *)
-let block_subsidy (height : int) : int64 =
+(* Regtest uses a shorter halving interval for faster testing *)
+let regtest_halving_interval = 150
+
+(* Calculate block subsidy (mining reward) for a given height.
+   halving_interval defaults to 210,000 (mainnet/testnet).
+   For regtest, pass 150 to allow testing halvings quickly. *)
+let block_subsidy ?(halving_interval = default_halving_interval) (height : int) : int64 =
   let halvings = height / halving_interval in
   if halvings >= 64 then 0L
   else Int64.shift_right 5_000_000_000L halvings  (* 50 BTC initial *)
+
+(* Block subsidy for a specific network configuration.
+   This is the recommended way to calculate subsidy when you have access
+   to the network config, as it ensures the correct halving interval. *)
+let block_subsidy_for_network (network : network) (height : int) : int64 =
+  let halving_interval = match network with
+    | Regtest -> regtest_halving_interval
+    | Mainnet | Testnet3 | Testnet4 -> default_halving_interval
+  in
+  block_subsidy ~halving_interval height
 
 (* Compact target format (nBits) conversion to 256-bit target.
 
@@ -193,6 +208,7 @@ type network_config = {
   minimum_chain_work : Cstruct.t;  (* 32-byte LE; tip must reach this before block sync *)
   assume_valid_hash : Types.hash256 option;  (* Skip script verification at/below this block *)
   checkpoints : (int * Types.hash256) list;  (* Known-good block hashes at specific heights *)
+  halving_interval : int;  (* Blocks between subsidy halvings (210000 mainnet, 150 regtest) *)
 }
 
 (* Multiply a LE byte-array target by a positive int, producing a result
@@ -458,6 +474,7 @@ let mainnet : network_config = {
     (279000, Types.hash256_of_hex "407ebde958e44190fa9e810ea1fc3a7ef601c3b0a0728cae0100000000000000");
     (295000, Types.hash256_of_hex "83a93246c67003105af33ae0b29dd66f689d0f0ff54e9b4d0000000000000000");
   ];
+  halving_interval = default_halving_interval;
 }
 
 (* Testnet3 configuration *)
@@ -500,6 +517,7 @@ let testnet : network_config = {
   minimum_chain_work = zero_work;
   assume_valid_hash = None;
   checkpoints = [];
+  halving_interval = default_halving_interval;
 }
 
 (* Testnet4 configuration (BIP-94) *)
@@ -540,6 +558,7 @@ let testnet4 : network_config = {
   minimum_chain_work = zero_work;
   assume_valid_hash = None;
   checkpoints = [];
+  halving_interval = default_halving_interval;
 }
 
 (* Regtest configuration (local testing) *)
@@ -577,6 +596,7 @@ let regtest : network_config = {
   minimum_chain_work = zero_work;
   assume_valid_hash = None;
   checkpoints = [];
+  halving_interval = regtest_halving_interval;  (* 150 blocks for quick halving tests *)
 }
 
 (* Encode block height in coinbase transaction (BIP-34)

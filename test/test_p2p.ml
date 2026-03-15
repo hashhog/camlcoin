@@ -1179,6 +1179,404 @@ let test_addrv2_command () =
   let s2 = P2p.command_to_string P2p.Sendaddrv2 in
   Alcotest.(check string) "sendaddrv2 string" "sendaddrv2" s2
 
+(* ============================================================================
+   SOCKS5 Proxy Tests
+   ============================================================================ *)
+
+(* Test onion address detection *)
+let test_onion_address_detection () =
+  Alcotest.(check bool) ".onion detected"
+    true (P2p.Socks5.is_onion_address "abcd1234.onion");
+  Alcotest.(check bool) ".onion uppercase"
+    true (P2p.Socks5.is_onion_address "ABCD1234.ONION");
+  Alcotest.(check bool) "v3 onion"
+    true (P2p.Socks5.is_onion_address "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion");
+  Alcotest.(check bool) "not onion ipv4"
+    false (P2p.Socks5.is_onion_address "192.168.1.1");
+  Alcotest.(check bool) "not onion domain"
+    false (P2p.Socks5.is_onion_address "example.com");
+  Alcotest.(check bool) "not onion .onion suffix"
+    false (P2p.Socks5.is_onion_address "foo.onion.com")
+
+(* Test I2P address detection *)
+let test_i2p_address_detection () =
+  Alcotest.(check bool) ".b32.i2p detected"
+    true (P2p.Socks5.is_i2p_address "ukeu3k5oycga3uneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq.b32.i2p");
+  Alcotest.(check bool) ".b32.i2p uppercase"
+    true (P2p.Socks5.is_i2p_address "UKEU3K5O.B32.I2P");
+  Alcotest.(check bool) "not i2p ipv4"
+    false (P2p.Socks5.is_i2p_address "192.168.1.1");
+  Alcotest.(check bool) "not i2p domain"
+    false (P2p.Socks5.is_i2p_address "example.com");
+  Alcotest.(check bool) "plain .i2p not detected"
+    false (P2p.Socks5.is_i2p_address "example.i2p")
+
+(* Test SOCKS5 reply code conversion *)
+let test_socks5_reply_codes () =
+  let check_code n expected_str =
+    let code = P2p.Socks5.reply_code_of_int n in
+    let str = P2p.Socks5.reply_code_to_string code in
+    Alcotest.(check string) (Printf.sprintf "code 0x%02x" n) expected_str str
+  in
+  check_code 0x00 "succeeded";
+  check_code 0x01 "general failure";
+  check_code 0x02 "connection not allowed";
+  check_code 0x03 "network unreachable";
+  check_code 0x04 "host unreachable";
+  check_code 0x05 "connection refused";
+  check_code 0x06 "TTL expired";
+  check_code 0x07 "command not supported";
+  check_code 0x08 "address type not supported";
+  (* Tor-specific codes *)
+  check_code 0xF0 "onion service descriptor not found";
+  check_code 0xF1 "onion service descriptor invalid";
+  check_code 0xF2 "onion service introduction failed";
+  check_code 0xF3 "onion service rendezvous failed";
+  check_code 0xF4 "onion service missing client authorization";
+  check_code 0xF5 "onion service wrong client authorization";
+  check_code 0xF6 "onion service invalid address";
+  check_code 0xF7 "onion service introduction timed out";
+  (* Unknown code *)
+  let unknown_code = P2p.Socks5.reply_code_of_int 0x99 in
+  let unknown_str = P2p.Socks5.reply_code_to_string unknown_code in
+  Alcotest.(check bool) "unknown code format"
+    true (String.sub unknown_str 0 7 = "unknown")
+
+(* Test network type detection *)
+let test_network_type_detection () =
+  let check_net host expected =
+    let net = P2p.network_type_of_host host in
+    let matches = match (net, expected) with
+      | (P2p.Net_IPv4, "ipv4") -> true
+      | (P2p.Net_IPv6, "ipv6") -> true
+      | (P2p.Net_Onion, "onion") -> true
+      | (P2p.Net_I2P, "i2p") -> true
+      | _ -> false
+    in
+    Alcotest.(check bool) host true matches
+  in
+  check_net "192.168.1.1" "ipv4";
+  check_net "example.com" "ipv4";
+  check_net "[::1]" "ipv6";
+  check_net "2001:db8::1" "ipv6";
+  check_net "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion" "onion";
+  check_net "ukeu3k5oycga3uneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq.b32.i2p" "i2p"
+
+(* Test proxy URL parsing *)
+let test_proxy_url_parsing () =
+  (* Valid SOCKS5 URL without credentials *)
+  (match P2p.parse_proxy_url "socks5://127.0.0.1:9050" with
+   | Some (P2p.Socks5Proxy { addr; port; credentials; _ }) ->
+     Alcotest.(check string) "addr" "127.0.0.1" addr;
+     Alcotest.(check int) "port" 9050 port;
+     Alcotest.(check bool) "no creds" true (credentials = None)
+   | _ -> Alcotest.fail "Expected Socks5Proxy");
+
+  (* Valid SOCKS5 URL with credentials *)
+  (match P2p.parse_proxy_url "socks5://user:pass@localhost:9050" with
+   | Some (P2p.Socks5Proxy { addr; port; credentials; _ }) ->
+     Alcotest.(check string) "addr" "localhost" addr;
+     Alcotest.(check int) "port" 9050 port;
+     (match credentials with
+      | Some cred ->
+        Alcotest.(check string) "username" "user" cred.P2p.Socks5.username;
+        Alcotest.(check string) "password" "pass" cred.P2p.Socks5.password
+      | None -> Alcotest.fail "Expected credentials")
+   | _ -> Alcotest.fail "Expected Socks5Proxy");
+
+  (* Invalid URLs *)
+  Alcotest.(check bool) "http not socks5"
+    true (P2p.parse_proxy_url "http://127.0.0.1:9050" = None);
+  Alcotest.(check bool) "no port"
+    true (P2p.parse_proxy_url "socks5://127.0.0.1" = None);
+  Alcotest.(check bool) "too short"
+    true (P2p.parse_proxy_url "socks5:" = None)
+
+(* Test I2P SAM address parsing *)
+let test_i2p_sam_parsing () =
+  (* Valid address:port *)
+  (match P2p.parse_i2p_sam "127.0.0.1:7656" with
+   | Some (P2p.I2PSam { addr; port }) ->
+     Alcotest.(check string) "addr" "127.0.0.1" addr;
+     Alcotest.(check int) "port" 7656 port
+   | _ -> Alcotest.fail "Expected I2PSam");
+
+  (* Invalid - no port *)
+  Alcotest.(check bool) "no port"
+    true (P2p.parse_i2p_sam "127.0.0.1" = None);
+
+  (* Invalid port *)
+  Alcotest.(check bool) "invalid port"
+    true (P2p.parse_i2p_sam "127.0.0.1:abc" = None)
+
+(* Test default proxy config *)
+let test_default_proxy_config () =
+  let config = P2p.default_proxy_config in
+  (match config.default_proxy with
+   | P2p.NoProxy -> ()
+   | _ -> Alcotest.fail "Expected NoProxy");
+  (match config.onion_proxy with
+   | P2p.NoProxy -> ()
+   | _ -> Alcotest.fail "Expected NoProxy");
+  (match config.i2p_sam with
+   | P2p.NoProxy -> ()
+   | _ -> Alcotest.fail "Expected NoProxy");
+  Alcotest.(check (list pass)) "onlynet empty" [] config.onlynet
+
+(* Mock SOCKS5 server for testing *)
+let run_mock_socks5_server (port : int) (handler : Lwt_unix.file_descr -> unit Lwt.t) : unit Lwt.t =
+  let open Lwt.Syntax in
+  let addr = Unix.ADDR_INET (Unix.inet_addr_loopback, port) in
+  let server_fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Lwt_unix.setsockopt server_fd Unix.SO_REUSEADDR true;
+  let* () = Lwt_unix.bind server_fd addr in
+  Lwt_unix.listen server_fd 1;
+  let* (client_fd, _) = Lwt_unix.accept server_fd in
+  let* () = handler client_fd in
+  let* () = Lwt_unix.close client_fd in
+  Lwt_unix.close server_fd
+
+(* Test mock SOCKS5 connect *)
+let test_mock_socks5_connect () =
+  let port = 19050 in  (* Use a high port for testing *)
+
+  (* Mock server that accepts connection and replies success *)
+  let handler fd =
+    let open Lwt.Syntax in
+    let ic = Lwt_io.of_fd ~mode:Lwt_io.Input fd in
+    let oc = Lwt_io.of_fd ~mode:Lwt_io.Output fd in
+
+    (* Read greeting (3 bytes: version, nmethods, method) *)
+    let greeting = Bytes.create 3 in
+    let* () = Lwt_io.read_into_exactly ic greeting 0 3 in
+    Alcotest.(check int) "greeting version" 5 (Char.code (Bytes.get greeting 0));
+    Alcotest.(check int) "greeting nmethods" 1 (Char.code (Bytes.get greeting 1));
+    Alcotest.(check int) "greeting method" 0 (Char.code (Bytes.get greeting 2));
+
+    (* Reply with method selection (no auth) *)
+    let* () = Lwt_io.write_from_exactly oc (Bytes.of_string "\x05\x00") 0 2 in
+    let* () = Lwt_io.flush oc in
+
+    (* Read connect request header (4 bytes minimum) *)
+    let header = Bytes.create 4 in
+    let* () = Lwt_io.read_into_exactly ic header 0 4 in
+    Alcotest.(check int) "connect version" 5 (Char.code (Bytes.get header 0));
+    Alcotest.(check int) "connect cmd" 1 (Char.code (Bytes.get header 1));
+    let atyp = Char.code (Bytes.get header 3) in
+    Alcotest.(check int) "connect atyp" 3 atyp;  (* domain *)
+
+    (* Read domain name length and domain *)
+    let len_buf = Bytes.create 1 in
+    let* () = Lwt_io.read_into_exactly ic len_buf 0 1 in
+    let domain_len = Char.code (Bytes.get len_buf 0) in
+    let domain = Bytes.create domain_len in
+    let* () = Lwt_io.read_into_exactly ic domain 0 domain_len in
+    (* Read port (2 bytes) *)
+    let port_buf = Bytes.create 2 in
+    let* () = Lwt_io.read_into_exactly ic port_buf 0 2 in
+
+    (* Reply with success (10 bytes: version, reply, rsv, atyp=1, 4 addr bytes, 2 port bytes) *)
+    let reply = Bytes.of_string "\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x50" in
+    let* () = Lwt_io.write_from_exactly oc reply 0 10 in
+    let* () = Lwt_io.flush oc in
+    Lwt.return_unit
+  in
+
+  (* Run test with timeout *)
+  Lwt_main.run begin
+    let open Lwt.Syntax in
+    let server = run_mock_socks5_server port handler in
+    (* Small delay to let server start *)
+    let* () = Lwt_unix.sleep 0.01 in
+    let client =
+      let* result = P2p.Socks5.connect
+        ~proxy_addr:"127.0.0.1" ~proxy_port:port
+        ~target_host:"example.onion" ~target_port:8333 ()
+      in
+      match result with
+      | P2p.Socks5.Connected fd ->
+        let* () = Lwt_unix.close fd in
+        Lwt.return_unit
+      | P2p.Socks5.ProxyError msg ->
+        Alcotest.fail ("proxy error: " ^ msg)
+      | P2p.Socks5.TargetError code ->
+        Alcotest.fail ("target error: " ^ P2p.Socks5.reply_code_to_string code)
+    in
+    let timeout =
+      let* () = Lwt_unix.sleep 5.0 in
+      Alcotest.fail "test timeout"
+    in
+    Lwt.pick [
+      (let* () = server in let* () = client in Lwt.return_unit);
+      timeout
+    ]
+  end
+
+(* Test mock SOCKS5 with username/password auth *)
+let test_mock_socks5_auth () =
+  let port = 19051 in
+
+  let handler fd =
+    let open Lwt.Syntax in
+    let ic = Lwt_io.of_fd ~mode:Lwt_io.Input fd in
+    let oc = Lwt_io.of_fd ~mode:Lwt_io.Output fd in
+
+    (* Read greeting (4 bytes: version, nmethods, method1, method2) *)
+    let greeting = Bytes.create 4 in
+    let* () = Lwt_io.read_into_exactly ic greeting 0 4 in
+    Alcotest.(check int) "greeting version" 5 (Char.code (Bytes.get greeting 0));
+
+    (* Reply with username/password auth required *)
+    let* () = Lwt_io.write_from_exactly oc (Bytes.of_string "\x05\x02") 0 2 in
+    let* () = Lwt_io.flush oc in
+
+    (* Read auth request: version + ulen + username + plen + password *)
+    let auth_header = Bytes.create 2 in
+    let* () = Lwt_io.read_into_exactly ic auth_header 0 2 in
+    Alcotest.(check int) "auth version" 1 (Char.code (Bytes.get auth_header 0));
+    let ulen = Char.code (Bytes.get auth_header 1) in
+    let username = Bytes.create ulen in
+    let* () = Lwt_io.read_into_exactly ic username 0 ulen in
+    let plen_buf = Bytes.create 1 in
+    let* () = Lwt_io.read_into_exactly ic plen_buf 0 1 in
+    let plen = Char.code (Bytes.get plen_buf 0) in
+    let password = Bytes.create plen in
+    let* () = Lwt_io.read_into_exactly ic password 0 plen in
+
+    (* Check credentials *)
+    Alcotest.(check string) "username" "testuser" (Bytes.to_string username);
+    Alcotest.(check string) "password" "testpass" (Bytes.to_string password);
+
+    (* Reply auth success *)
+    let* () = Lwt_io.write_from_exactly oc (Bytes.of_string "\x01\x00") 0 2 in
+    let* () = Lwt_io.flush oc in
+
+    (* Read connect request (skip it) *)
+    let buf = Bytes.create 256 in
+    let* _ = Lwt_io.read_into ic buf 0 256 in
+
+    (* Reply success *)
+    let reply = Bytes.of_string "\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x50" in
+    let* () = Lwt_io.write_from_exactly oc reply 0 10 in
+    Lwt_io.flush oc
+  in
+
+  Lwt_main.run begin
+    let open Lwt.Syntax in
+    let server = run_mock_socks5_server port handler in
+    let* () = Lwt_unix.sleep 0.01 in
+    let creds : P2p.Socks5.credentials = { username = "testuser"; password = "testpass" } in
+    let client =
+      let* result = P2p.Socks5.connect
+        ~proxy_addr:"127.0.0.1" ~proxy_port:port
+        ~credentials:creds
+        ~target_host:"example.onion" ~target_port:8333 ()
+      in
+      match result with
+      | P2p.Socks5.Connected fd ->
+        let* () = Lwt_unix.close fd in
+        Lwt.return_unit
+      | P2p.Socks5.ProxyError msg ->
+        Alcotest.fail ("proxy error: " ^ msg)
+      | P2p.Socks5.TargetError code ->
+        Alcotest.fail ("target error: " ^ P2p.Socks5.reply_code_to_string code)
+    in
+    let timeout =
+      let* () = Lwt_unix.sleep 5.0 in
+      Alcotest.fail "test timeout"
+    in
+    Lwt.pick [
+      (let* () = server in let* () = client in Lwt.return_unit);
+      timeout
+    ]
+  end
+
+(* Test SOCKS5 error handling *)
+let test_socks5_error_handling () =
+  let port = 19052 in
+
+  (* Server that returns connection refused *)
+  let handler fd =
+    let open Lwt.Syntax in
+    let ic = Lwt_io.of_fd ~mode:Lwt_io.Input fd in
+    let oc = Lwt_io.of_fd ~mode:Lwt_io.Output fd in
+
+    (* Read greeting *)
+    let greeting = Bytes.create 3 in
+    let* () = Lwt_io.read_into_exactly ic greeting 0 3 in
+
+    (* Reply with no auth *)
+    let* () = Lwt_io.write_from_exactly oc (Bytes.of_string "\x05\x00") 0 2 in
+    let* () = Lwt_io.flush oc in
+
+    (* Read connect request (skip it) *)
+    let buf = Bytes.create 256 in
+    let* _ = Lwt_io.read_into ic buf 0 256 in
+
+    (* Reply with connection refused (0x05) *)
+    let reply = Bytes.of_string "\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00" in
+    let* () = Lwt_io.write_from_exactly oc reply 0 10 in
+    Lwt_io.flush oc
+  in
+
+  Lwt_main.run begin
+    let open Lwt.Syntax in
+    let server = run_mock_socks5_server port handler in
+    let* () = Lwt_unix.sleep 0.01 in
+    let client =
+      let* result = P2p.Socks5.connect
+        ~proxy_addr:"127.0.0.1" ~proxy_port:port
+        ~target_host:"example.onion" ~target_port:8333 ()
+      in
+      match result with
+      | P2p.Socks5.Connected _ ->
+        Alcotest.fail "expected error, got connected"
+      | P2p.Socks5.ProxyError _ ->
+        Alcotest.fail "expected target error, got proxy error"
+      | P2p.Socks5.TargetError code ->
+        (* Should be ConnectionRefused *)
+        (match code with
+         | P2p.Socks5.ConnectionRefused -> Lwt.return_unit
+         | _ -> Alcotest.fail ("wrong error: " ^ P2p.Socks5.reply_code_to_string code))
+    in
+    let timeout =
+      let* () = Lwt_unix.sleep 5.0 in
+      Alcotest.fail "test timeout"
+    in
+    Lwt.pick [
+      (let* () = server in let* () = client in Lwt.return_unit);
+      timeout
+    ]
+  end
+
+(* ============================================================================
+   I2P SAM Protocol Tests
+   ============================================================================ *)
+
+(* Test I2P Base64 conversion *)
+let test_i2p_base64_conversion () =
+  (* Standard Base64 uses + and / *)
+  let std = "abc+def/ghi==" in
+  (* I2P Base64 uses - and ~ *)
+  let i2p = P2p.I2P.i2p_base64_of_std_base64 std in
+  Alcotest.(check string) "i2p base64" "abc-def~ghi==" i2p;
+  (* Convert back *)
+  let back = P2p.I2P.std_base64_of_i2p_base64 i2p in
+  Alcotest.(check string) "std base64" std back
+
+(* Test SAM reply parsing *)
+let test_i2p_sam_reply_parsing () =
+  let reply = "HELLO REPLY RESULT=OK VERSION=3.1 FOO=BAR" in
+  let pairs = P2p.I2P.parse_sam_reply reply in
+  Alcotest.(check int) "pair count" 3 (List.length pairs);
+  Alcotest.(check (option string)) "RESULT" (Some "OK") (List.assoc_opt "RESULT" pairs);
+  Alcotest.(check (option string)) "VERSION" (Some "3.1") (List.assoc_opt "VERSION" pairs);
+  Alcotest.(check (option string)) "FOO" (Some "BAR") (List.assoc_opt "FOO" pairs);
+  (* Test with no key=value pairs *)
+  let empty_reply = "HELLO WORLD" in
+  let empty_pairs = P2p.I2P.parse_sam_reply empty_reply in
+  Alcotest.(check int) "empty pairs" 0 (List.length empty_pairs)
+
 let () =
   let open Alcotest in
   run "P2P" [
@@ -1264,5 +1662,21 @@ let () =
     ];
     "property", [
       QCheck_alcotest.to_alcotest test_ping_pong_property;
+    ];
+    "socks5", [
+      test_case "onion address detection" `Quick test_onion_address_detection;
+      test_case "i2p address detection" `Quick test_i2p_address_detection;
+      test_case "socks5 reply codes" `Quick test_socks5_reply_codes;
+      test_case "network type detection" `Quick test_network_type_detection;
+      test_case "proxy url parsing" `Quick test_proxy_url_parsing;
+      test_case "i2p sam parsing" `Quick test_i2p_sam_parsing;
+      test_case "default proxy config" `Quick test_default_proxy_config;
+      test_case "mock socks5 connect" `Quick test_mock_socks5_connect;
+      test_case "mock socks5 auth" `Quick test_mock_socks5_auth;
+      test_case "socks5 error handling" `Quick test_socks5_error_handling;
+    ];
+    "i2p", [
+      test_case "i2p base64 conversion" `Quick test_i2p_base64_conversion;
+      test_case "i2p sam reply parsing" `Quick test_i2p_sam_reply_parsing;
     ];
   ]

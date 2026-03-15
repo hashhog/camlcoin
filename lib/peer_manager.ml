@@ -1112,16 +1112,14 @@ let announce_tx (pm : t) ~(txid : Types.hash256) ~(wtxid : Types.hash256)
     ~(fee_rate : int64) : unit Lwt.t =
   let ready = get_ready_peers pm in
   List.iter (fun peer ->
-    (* Skip peers whose feefilter is above this tx's fee rate *)
-    if not (peer.Peer.feefilter > 0L && fee_rate < peer.Peer.feefilter) then begin
-      let entry : Peer.inv_entry =
-        if peer.Peer.wtxid_relay then
-          { inv_type = P2p.InvWitnessTx; hash = wtxid }
-        else
-          { inv_type = P2p.InvTx; hash = txid }
-      in
-      Peer.queue_inv peer entry
-    end
+    (* Create inv entry with fee rate for feefilter check in queue_inv *)
+    let entry =
+      if peer.Peer.wtxid_relay then
+        Peer.make_tx_inv ~witness:true wtxid fee_rate
+      else
+        Peer.make_tx_inv ~witness:false txid fee_rate
+    in
+    Peer.queue_inv peer entry  (* queue_inv handles feefilter filtering *)
   ) ready;
   Lwt.return_unit
 

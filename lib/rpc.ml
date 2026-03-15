@@ -381,6 +381,16 @@ let cstruct_to_hex (cs : Cstruct.t) : string =
   done;
   Buffer.contents buf
 
+(* Convert hex string to Cstruct *)
+let hex_to_cstruct (s : string) : Cstruct.t =
+  let len = String.length s / 2 in
+  let buf = Cstruct.create len in
+  for i = 0 to len - 1 do
+    let byte = int_of_string ("0x" ^ String.sub s (i * 2) 2) in
+    Cstruct.set_uint8 buf i byte
+  done;
+  buf
+
 (* Get script type name for JSON output *)
 let script_type_name (template : Script.script_template) : string =
   match template with
@@ -1973,6 +1983,461 @@ let handle_getblockstats (ctx : rpc_context)
        ]))
 
 (* ============================================================================
+   PSBT (BIP-174) Handlers
+   ============================================================================ *)
+
+(* createpsbt [{"txid":"...", "vout":n},...] [{"address":amount},...] ( locktime )
+   Creates an unsigned PSBT from raw transaction components *)
+let handle_createpsbt (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  let extract_inputs inputs_json =
+    let extract_one = function
+      | `Assoc fields ->
+        let txid = match List.assoc_opt "txid" fields with
+          | Some (`String s) ->
+            let hash_bytes = Types.hash256_of_hex s in
+            (* Reverse bytes for internal representation *)
+            let hash = Cstruct.create 32 in
+            for i = 0 to 31 do
+              Cstruct.set_uint8 hash i (Cstruct.get_uint8 hash_bytes (31 - i))
+            done;
+            hash
+          | _ -> failwith "Missing txid"
+        in
+        let vout = match List.assoc_opt "vout" fields with
+          | Some (`Int n) -> Int32.of_int n
+          | _ -> failwith "Missing vout"
+        in
+        let sequence = match List.assoc_opt "sequence" fields with
+          | Some (`Int n) -> Int32.of_int n
+          | _ -> 0xFFFFFFFEl
+        in
+        { Types.previous_output = { txid; vout };
+          script_sig = Cstruct.empty;
+          sequence }
+      | _ -> failwith "Invalid input format"
+    in
+    match inputs_json with
+    | `List l -> List.map extract_one l
+    | _ -> failwith "Inputs must be an array"
+  in
+  let extract_outputs outputs_json network =
+    let extract_one = function
+      | `Assoc fields ->
+        List.filter_map (fun (addr_str, amt) ->
+          if addr_str = "data" then
+            (* OP_RETURN output *)
+            match amt with
+            | `String hex_data ->
+              let data = hex_to_cstruct hex_data in
+              let script = Cstruct.create (2 + Cstruct.length data) in
+              Cstruct.set_uint8 script 0 0x6a; (* OP_RETURN *)
+              Cstruct.set_uint8 script 1 (Cstruct.length data);
+              Cstruct.blit data 0 script 2 (Cstruct.length data);
+              Some { Types.value = 0L; script_pubkey = script }
+            | _ -> None
+          else
+            match Address.address_of_string addr_str with
+            | Error _ -> None
+            | Ok addr ->
+              if addr.network <> network then None
+              else
+                let value = match amt with
+                  | `Float f -> Int64.of_float (f *. 100_000_000.0)
+                  | `Int i -> Int64.of_int (i * 100_000_000)
+                  | `String s -> Int64.of_float (float_of_string s *. 100_000_000.0)
+                  | _ -> 0L
+                in
+                let script_pubkey = Address.address_to_script addr in
+                Some { Types.value; script_pubkey }
+        ) fields
+      | _ -> []
+    in
+    match outputs_json with
+    | `List l -> List.concat_map extract_one l
+    | _ -> failwith "Outputs must be an array"
+  in
+  match params with
+  | [inputs_json; outputs_json] | [inputs_json; outputs_json; _] ->
+    (try
+      let network = network_to_address_network ctx.network in
+      let inputs = extract_inputs inputs_json in
+      let outputs = extract_outputs outputs_json network in
+      let locktime = match params with
+        | [_; _; `Int lt] -> Int32.of_int lt
+        | _ -> 0l
+      in
+      let tx : Types.transaction = {
+        version = 2l;
+        inputs;
+        outputs;
+        witnesses = [];
+        locktime;
+      } in
+      let psbt = Psbt.create tx in
+      let b64 = Psbt.to_base64 psbt in
+      Ok (`String b64)
+    with
+    | Failure msg -> Error msg
+    | exn -> Error (Printexc.to_string exn))
+  | _ ->
+    Error "Invalid parameters: expected [[inputs], [outputs], (locktime)]"
+
+(* decodepsbt "base64string"
+   Decode a PSBT and return detailed information *)
+let handle_decodepsbt (_ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String b64] ->
+    (match Psbt.of_base64 b64 with
+     | Error e -> Error (Psbt.string_of_error e)
+     | Ok psbt ->
+       (* Build tx JSON *)
+       let tx = psbt.tx in
+       let txid = Crypto.compute_txid tx in
+       let inputs_json = List.map (fun inp ->
+         `Assoc [
+           ("txid", `String (Types.hash256_to_hex_display inp.Types.previous_output.txid));
+           ("vout", `Int (Int32.to_int inp.Types.previous_output.vout));
+           ("sequence", `Int (Int32.to_int inp.sequence));
+         ]
+       ) tx.inputs in
+       let outputs_json = List.map (fun out ->
+         `Assoc [
+           ("value", `Float (Int64.to_float out.Types.value /. 100_000_000.0));
+           ("scriptPubKey", `Assoc [
+             ("hex", `String (cstruct_to_hex out.Types.script_pubkey));
+           ]);
+         ]
+       ) tx.outputs in
+       let tx_json = `Assoc [
+         ("txid", `String (Types.hash256_to_hex_display txid));
+         ("version", `Int (Int32.to_int tx.version));
+         ("locktime", `Int (Int32.to_int tx.locktime));
+         ("vin", `List inputs_json);
+         ("vout", `List outputs_json);
+       ] in
+       (* Build inputs JSON *)
+       let psbt_inputs_json = List.mapi (fun i inp ->
+         let fields = ref [] in
+         (match inp.Psbt.witness_utxo with
+          | Some utxo ->
+            fields := !fields @ [
+              ("witness_utxo", `Assoc [
+                ("amount", `Float (Int64.to_float utxo.value /. 100_000_000.0));
+                ("scriptPubKey", `Assoc [
+                  ("hex", `String (cstruct_to_hex utxo.script_pubkey));
+                ]);
+              ])
+            ]
+          | None -> ());
+         (match inp.Psbt.non_witness_utxo with
+          | Some _ -> fields := !fields @ [("non_witness_utxo", `Bool true)]
+          | None -> ());
+         if inp.Psbt.partial_sigs <> [] then
+           fields := !fields @ [
+             ("partial_signatures", `Assoc (List.map (fun (ps : Psbt.partial_sig) ->
+               (cstruct_to_hex ps.pubkey, `String (cstruct_to_hex ps.signature))
+             ) inp.partial_sigs))
+           ];
+         (match inp.Psbt.sighash_type with
+          | Some sht -> fields := !fields @ [("sighash", `String (Int32.to_string sht))]
+          | None -> ());
+         (match inp.Psbt.redeem_script with
+          | Some rs -> fields := !fields @ [("redeem_script", `Assoc [("hex", `String (cstruct_to_hex rs))])]
+          | None -> ());
+         (match inp.Psbt.witness_script with
+          | Some ws -> fields := !fields @ [("witness_script", `Assoc [("hex", `String (cstruct_to_hex ws))])]
+          | None -> ());
+         if inp.Psbt.bip32_derivations <> [] then
+           fields := !fields @ [
+             ("bip32_derivs", `List (List.map (fun d ->
+               `Assoc [
+                 ("pubkey", `String (cstruct_to_hex d.Psbt.pubkey));
+                 ("master_fingerprint", `String (Printf.sprintf "%08lx" d.origin.fingerprint));
+                 ("path", `String (String.concat "/" (
+                   "m" :: List.map (fun idx ->
+                     if Int32.compare idx 0x80000000l >= 0 then
+                       Printf.sprintf "%ld'" (Int32.sub idx 0x80000000l)
+                     else
+                       Printf.sprintf "%ld" idx
+                   ) d.origin.path
+                 )));
+               ]
+             ) inp.bip32_derivations))
+           ];
+         (match inp.Psbt.final_scriptsig with
+          | Some ss -> fields := !fields @ [("final_scriptSig", `Assoc [("hex", `String (cstruct_to_hex ss))])]
+          | None -> ());
+         (match inp.Psbt.final_scriptwitness with
+          | Some wit -> fields := !fields @ [
+              ("final_scriptwitness", `List (List.map (fun item ->
+                `String (cstruct_to_hex item)
+              ) wit))
+            ]
+          | None -> ());
+         (match inp.Psbt.tap_key_sig with
+          | Some sig_ -> fields := !fields @ [("taproot_key_path_sig", `String (cstruct_to_hex sig_))]
+          | None -> ());
+         (match inp.Psbt.tap_internal_key with
+          | Some key -> fields := !fields @ [("taproot_internal_key", `String (cstruct_to_hex key))]
+          | None -> ());
+         `Assoc (("index", `Int i) :: !fields)
+       ) psbt.inputs in
+       (* Build outputs JSON *)
+       let psbt_outputs_json = List.mapi (fun i out ->
+         let fields = ref [] in
+         (match out.Psbt.redeem_script with
+          | Some rs -> fields := !fields @ [("redeem_script", `Assoc [("hex", `String (cstruct_to_hex rs))])]
+          | None -> ());
+         (match out.Psbt.witness_script with
+          | Some ws -> fields := !fields @ [("witness_script", `Assoc [("hex", `String (cstruct_to_hex ws))])]
+          | None -> ());
+         if out.Psbt.bip32_derivations <> [] then
+           fields := !fields @ [
+             ("bip32_derivs", `List (List.map (fun d ->
+               `Assoc [
+                 ("pubkey", `String (cstruct_to_hex d.Psbt.pubkey));
+                 ("master_fingerprint", `String (Printf.sprintf "%08lx" d.origin.fingerprint));
+               ]
+             ) out.bip32_derivations))
+           ];
+         (match out.Psbt.tap_internal_key with
+          | Some key -> fields := !fields @ [("taproot_internal_key", `String (cstruct_to_hex key))]
+          | None -> ());
+         `Assoc (("index", `Int i) :: !fields)
+       ) psbt.outputs in
+       (* Calculate fee if possible *)
+       let fee_json = match Psbt.get_fee psbt with
+         | Some fee -> [("fee", `Float (Int64.to_float fee /. 100_000_000.0))]
+         | None -> []
+       in
+       Ok (`Assoc ([
+         ("tx", tx_json);
+         ("global_xpubs", `List (List.map (fun gx ->
+           `Assoc [
+             ("xpub", `String (cstruct_to_hex gx.Psbt.xpub));
+             ("master_fingerprint", `String (Printf.sprintf "%08lx" gx.origin.fingerprint));
+           ]
+         ) psbt.global_xpubs));
+         ("psbt_version", `Int (match psbt.version with Some v -> Int32.to_int v | None -> 0));
+         ("inputs", `List psbt_inputs_json);
+         ("outputs", `List psbt_outputs_json);
+       ] @ fee_json)))
+  | _ ->
+    Error "Invalid parameters: expected [base64string]"
+
+(* analyzepsbt "base64string"
+   Analyze a PSBT and provide information about its status *)
+let handle_analyzepsbt (_ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String b64] ->
+    (match Psbt.of_base64 b64 with
+     | Error e -> Error (Psbt.string_of_error e)
+     | Ok psbt ->
+       let input_analyses = List.mapi (fun _i inp ->
+         let has_utxo = inp.Psbt.witness_utxo <> None || inp.Psbt.non_witness_utxo <> None in
+         let is_final = Psbt.is_input_finalized inp in
+         let has_sigs = inp.Psbt.partial_sigs <> [] || inp.Psbt.tap_key_sig <> None in
+         let next_role =
+           if is_final then "extractor"
+           else if has_sigs then "finalizer"
+           else if has_utxo then "signer"
+           else "updater"
+         in
+         `Assoc [
+           ("has_utxo", `Bool has_utxo);
+           ("is_final", `Bool is_final);
+           ("next", `String next_role);
+         ]
+       ) psbt.inputs in
+       let all_finalized = Psbt.is_finalized psbt in
+       let unsigned_count = Psbt.count_unsigned_inputs psbt in
+       let next_role =
+         if all_finalized then "extractor"
+         else if unsigned_count = 0 then "finalizer"
+         else "signer"
+       in
+       let fee_json = match Psbt.get_fee psbt with
+         | Some fee -> [("estimated_feerate", `Float (Int64.to_float fee /. 100_000_000.0))]
+         | None -> []
+       in
+       Ok (`Assoc ([
+         ("inputs", `List input_analyses);
+         ("estimated_vsize", `Int 0); (* Would need weight calculation *)
+         ("next", `String next_role);
+       ] @ fee_json)))
+  | _ ->
+    Error "Invalid parameters: expected [base64string]"
+
+(* combinepsbt ["base64string",...]
+   Combine multiple PSBTs into one *)
+let handle_combinepsbt (_ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`List psbts] when List.length psbts >= 1 ->
+    let decode_psbt = function
+      | `String b64 -> Psbt.of_base64 b64
+      | _ -> Error (Psbt.Parse_error "Not a string")
+    in
+    let decoded = List.map decode_psbt psbts in
+    let errors = List.filter_map (function
+      | Error e -> Some (Psbt.string_of_error e)
+      | Ok _ -> None
+    ) decoded in
+    if errors <> [] then
+      Error (String.concat "; " errors)
+    else
+      let psbts = List.filter_map (function
+        | Ok p -> Some p
+        | Error _ -> None
+      ) decoded in
+      (match psbts with
+       | [] -> Error "No valid PSBTs"
+       | first :: rest ->
+         let combined = List.fold_left (fun acc p ->
+           match acc with
+           | Error e -> Error e
+           | Ok psbt ->
+             match Psbt.combine psbt p with
+             | Ok c -> Ok c
+             | Error msg -> Error msg
+         ) (Ok first) rest in
+         match combined with
+         | Error msg -> Error msg
+         | Ok psbt -> Ok (`String (Psbt.to_base64 psbt)))
+  | _ ->
+    Error "Invalid parameters: expected [[base64strings]]"
+
+(* finalizepsbt "base64string" ( extract )
+   Finalize the inputs of a PSBT *)
+let handle_finalizepsbt (_ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String b64] | [`String b64; _] ->
+    let extract = match params with
+      | [_; `Bool b] -> b
+      | _ -> true
+    in
+    (match Psbt.of_base64 b64 with
+     | Error e -> Error (Psbt.string_of_error e)
+     | Ok psbt ->
+       (* Try to finalize each input based on its type *)
+       let finalize_one psbt i inp =
+         if Psbt.is_input_finalized inp then
+           Ok psbt
+         else if inp.Psbt.tap_key_sig <> None then
+           Psbt.finalize_input_taproot psbt i
+         else if inp.Psbt.partial_sigs <> [] then
+           (* Determine script type from witness_utxo *)
+           match inp.Psbt.witness_utxo with
+           | Some utxo ->
+             let script = utxo.script_pubkey in
+             if Cstruct.length script = 22 && Cstruct.get_uint8 script 0 = 0x00 then
+               (* P2WPKH *)
+               Psbt.finalize_input_p2wpkh psbt i
+             else if Cstruct.length script = 23 && Cstruct.get_uint8 script 0 = 0xa9 then
+               (* P2SH - check if it's P2SH-P2WPKH *)
+               Psbt.finalize_input_p2sh_p2wpkh psbt i
+             else
+               (* Try P2WPKH as fallback *)
+               Psbt.finalize_input_p2wpkh psbt i
+           | None ->
+             (* Try P2PKH for non-witness *)
+             Psbt.finalize_input_p2pkh psbt i
+         else
+           Ok psbt
+       in
+       let result = List.fold_left (fun acc (i, inp) ->
+         match acc with
+         | Error e -> Error e
+         | Ok psbt -> finalize_one psbt i inp
+       ) (Ok psbt) (List.mapi (fun i inp -> (i, inp)) psbt.inputs) in
+       match result with
+       | Error msg -> Error msg
+       | Ok finalized ->
+         let complete = Psbt.is_finalized finalized in
+         if extract && complete then
+           match Psbt.extract finalized with
+           | Error msg -> Error msg
+           | Ok tx ->
+             let w = Serialize.writer_create () in
+             Serialize.serialize_transaction w tx;
+             let hex = cstruct_to_hex (Serialize.writer_to_cstruct w) in
+             Ok (`Assoc [
+               ("hex", `String hex);
+               ("complete", `Bool true);
+             ])
+         else
+           Ok (`Assoc [
+             ("psbt", `String (Psbt.to_base64 finalized));
+             ("complete", `Bool complete);
+           ]))
+  | _ ->
+    Error "Invalid parameters: expected [base64string, (extract)]"
+
+(* utxoupdatepsbt "base64string"
+   Update PSBT inputs with UTXO information from the UTXO set *)
+let handle_utxoupdatepsbt (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String b64] ->
+    (match Psbt.of_base64 b64 with
+     | Error e -> Error (Psbt.string_of_error e)
+     | Ok psbt ->
+       (* Create UTXO set accessor *)
+       let utxo_set = Utxo.UtxoSet.create ctx.chain.db in
+       (* Update each input with UTXO from chain if available *)
+       let updated = List.fold_left (fun psbt (i, inp) ->
+         if inp.Psbt.witness_utxo <> None || inp.Psbt.non_witness_utxo <> None then
+           psbt (* Already has UTXO info *)
+         else
+           let tx_in = List.nth psbt.Psbt.tx.inputs i in
+           let txid = tx_in.previous_output.txid in
+           let vout = Int32.to_int tx_in.previous_output.vout in
+           match Utxo.UtxoSet.get utxo_set txid vout with
+           | None -> psbt
+           | Some entry ->
+             let utxo : Types.tx_out = {
+               value = entry.Utxo.value;
+               script_pubkey = entry.Utxo.script_pubkey;
+             } in
+             Psbt.add_witness_utxo psbt i utxo
+       ) psbt (List.mapi (fun i inp -> (i, inp)) psbt.inputs) in
+       Ok (`String (Psbt.to_base64 updated)))
+  | _ ->
+    Error "Invalid parameters: expected [base64string]"
+
+(* converttopsbt "hexstring" ( permitsigdata )
+   Convert a raw transaction to a PSBT *)
+let handle_converttopsbt (_ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String hex] | [`String hex; _] ->
+    let permitsigdata = match params with
+      | [_; `Bool b] -> b
+      | _ -> false
+    in
+    (try
+      let data = Cstruct.of_hex hex in
+      let r = Serialize.reader_of_cstruct data in
+      let tx = Serialize.deserialize_transaction r in
+      (* Check if there are signatures *)
+      let has_sigs = List.exists (fun inp ->
+        Cstruct.length inp.Types.script_sig > 0
+      ) tx.inputs || tx.witnesses <> [] in
+      if has_sigs && not permitsigdata then
+        Error "Transaction has signature data. Set permitsigdata=true to strip them."
+      else
+        let psbt = Psbt.create tx in
+        Ok (`String (Psbt.to_base64 psbt))
+    with exn ->
+      Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn)))
+  | _ ->
+    Error "Invalid parameters: expected [hexstring, (permitsigdata)]"
+
+(* ============================================================================
    Performance Stats Handlers
    ============================================================================ *)
 
@@ -2200,6 +2665,15 @@ let handle_help (_ctx : rpc_context)
       "sendrawtransaction \"hexstring\"";
       "signrawtransactionwithkey \"hexstring\" [\"privkey\",...]";
       "";
+      "== PSBT ==";
+      "analyzepsbt \"psbt\"";
+      "combinepsbt [\"psbt\",...]";
+      "converttopsbt \"hexstring\" ( permitsigdata )";
+      "createpsbt [{\"txid\":\"...\", \"vout\":n},...] [{\"address\":amount},...] ( locktime )";
+      "decodepsbt \"psbt\"";
+      "finalizepsbt \"psbt\" ( extract )";
+      "utxoupdatepsbt \"psbt\"";
+      "";
       "== Blockchain ==";
       "gettxout \"txid\" vout";
       "invalidateblock \"blockhash\"";
@@ -2419,6 +2893,36 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_getwalletinfo ctx None params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_wallet_error, msg))
+
+  (* PSBT *)
+  | "createpsbt" ->
+    (match handle_createpsbt ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "decodepsbt" ->
+    (match handle_decodepsbt ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_deserialization_error, msg))
+  | "analyzepsbt" ->
+    (match handle_analyzepsbt ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "combinepsbt" ->
+    (match handle_combinepsbt ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "finalizepsbt" ->
+    (match handle_finalizepsbt ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "utxoupdatepsbt" ->
+    (match handle_utxoupdatepsbt ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "converttopsbt" ->
+    (match handle_converttopsbt ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
 
   (* Control *)
   | "stop" ->

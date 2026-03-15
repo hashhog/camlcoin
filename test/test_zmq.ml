@@ -1,6 +1,7 @@
 (* Tests for ZMQ notification module *)
 
 open Camlcoin
+open Lwt.Infix
 
 (* ============================================================================
    Test Helpers
@@ -503,6 +504,158 @@ let test_default_notifier () =
   Zmq_notify.shutdown notifier
 
 (* ============================================================================
+   ZMQ Socket Tests
+   ============================================================================ *)
+
+(* Test: create publisher and bind *)
+let test_create_publisher () =
+  let pub = Zmq_socket.create_publisher () in
+  let address = "tcp://127.0.0.1:28332" in
+  Zmq_socket.bind pub address;
+  (* Clean up *)
+  Zmq_socket.close_publisher pub
+
+(* Test: create subscriber and connect *)
+let test_create_subscriber () =
+  let sub = Zmq_socket.create_subscriber () in
+  let address = "tcp://127.0.0.1:28333" in
+  Zmq_socket.connect_subscriber sub address;
+  Zmq_socket.subscribe_all sub;
+  (* Clean up *)
+  Zmq_socket.close_subscriber sub
+
+(* Test: pub/sub message delivery *)
+let test_pub_sub_delivery () =
+  let address = "tcp://127.0.0.1:28334" in
+
+  (* Create publisher and subscriber *)
+  let pub = Zmq_socket.create_publisher () in
+  Zmq_socket.bind pub address;
+
+  let sub = Zmq_socket.create_subscriber () in
+  Zmq_socket.connect_subscriber sub address;
+  Zmq_socket.subscribe_all sub;
+
+  (* Send a test message *)
+  let msg : Zmq_notify.zmq_message = {
+    topic = "hashblock";
+    data = String.make 32 'x';
+    sequence = 42l;
+  } in
+  let sent = Zmq_socket.send_message pub msg in
+  Alcotest.(check bool) "message sent" true sent;
+
+  (* Verify message was queued *)
+  let queued = Zmq_socket.get_queued_messages pub in
+  Alcotest.(check int) "queued count" 1 (List.length queued);
+
+  (* Clean up *)
+  Zmq_socket.close_subscriber sub;
+  Zmq_socket.close_publisher pub
+
+(* Test: connect notifier to publisher *)
+let test_connect_notifier () =
+  let address = "tcp://127.0.0.1:28335" in
+
+  (* Create publisher *)
+  let pub = Zmq_socket.create_publisher () in
+  Zmq_socket.bind pub address;
+
+  (* Create notifier and connect to publisher *)
+  let notifier = Zmq_notify.create_default () in
+  Zmq_socket.connect_notifier notifier pub;
+
+  (* Send a notification through the notifier *)
+  let hash = make_test_hash 123 in
+  let result = Zmq_notify.notify_hashblock notifier hash in
+  Alcotest.(check bool) "notified via publisher" true result;
+
+  (* Verify message was queued in publisher *)
+  let queued = Zmq_socket.get_queued_messages pub in
+  Alcotest.(check int) "queued via notifier" 1 (List.length queued);
+
+  (* Clean up *)
+  Zmq_notify.shutdown notifier;
+  Zmq_socket.close_publisher pub
+
+(* Test: async publisher creation *)
+let test_async_publisher () =
+  let address = "tcp://127.0.0.1:28336" in
+
+  let pub = Zmq_socket.Lwt.create_publisher () in
+  Zmq_socket.Lwt.bind pub address;
+
+  let msg : Zmq_notify.zmq_message = {
+    topic = "hashtx";
+    data = String.make 32 'y';
+    sequence = 0l;
+  } in
+
+  let test =
+    Zmq_socket.Lwt.send_message pub msg >>= fun sent ->
+    Alcotest.(check bool) "async message sent" true sent;
+    Zmq_socket.Lwt.close_publisher pub
+  in
+  Lwt_main.run test
+
+(* Test: create_from_config *)
+let test_create_from_config () =
+  let address = "tcp://127.0.0.1:28337" in
+
+  let configs : Zmq_notify.endpoint_config list = [{
+    address;
+    topics = [Zmq_notify.HashBlock; Zmq_notify.HashTx];
+    high_water_mark = 100;
+  }] in
+
+  match Zmq_socket.create_from_config configs with
+  | Some pub ->
+    (* Publisher was created and bound *)
+    Zmq_socket.close_publisher pub
+  | None ->
+    Alcotest.fail "expected publisher to be created"
+
+(* Test: create_from_config with empty list *)
+let test_create_from_empty_config () =
+  match Zmq_socket.create_from_config [] with
+  | None -> ()  (* Expected *)
+  | Some _ -> Alcotest.fail "expected None for empty config"
+
+(* Test: frame encoding and decoding *)
+let test_frame_encoding () =
+  let parts = ["hashblock"; String.make 32 'x'; "\x00\x00\x00\x2a"] in
+  let encoded = Zmq_socket.encode_frame parts in
+  (* Verify encoding is not empty *)
+  Alcotest.(check bool) "encoded not empty" true (String.length encoded > 0);
+  (* Verify roundtrip *)
+  match Zmq_socket.decode_frame encoded with
+  | Some decoded ->
+    Alcotest.(check int) "part count" 3 (List.length decoded);
+    Alcotest.(check string) "first part" "hashblock" (List.nth decoded 0)
+  | None ->
+    Alcotest.fail "decode failed"
+
+(* Test: high water mark limits queue *)
+let test_publisher_hwm () =
+  let pub = Zmq_socket.create_publisher ~high_water_mark:3 () in
+  Zmq_socket.bind pub "tcp://127.0.0.1:28338";
+
+  (* Send 5 messages, only 3 should be queued *)
+  for i = 0 to 4 do
+    let msg : Zmq_notify.zmq_message = {
+      topic = "test";
+      data = String.make 1 (Char.chr i);
+      sequence = Int32.of_int i;
+    } in
+    ignore (Zmq_socket.send_message pub msg)
+  done;
+
+  let queued = Zmq_socket.get_queued_messages pub in
+  Alcotest.(check int) "queue limited" 3 (List.length queued);
+
+  Zmq_socket.close_publisher pub
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -543,5 +696,16 @@ let () =
     ];
     "lwt_integration", [
       test_case "lwt wrappers" `Quick test_lwt_wrappers;
+    ];
+    "zmq_socket", [
+      test_case "create publisher" `Quick test_create_publisher;
+      test_case "create subscriber" `Quick test_create_subscriber;
+      test_case "pub/sub delivery" `Quick test_pub_sub_delivery;
+      test_case "connect notifier" `Quick test_connect_notifier;
+      test_case "async publisher" `Quick test_async_publisher;
+      test_case "create from config" `Quick test_create_from_config;
+      test_case "create from empty config" `Quick test_create_from_empty_config;
+      test_case "frame encoding" `Quick test_frame_encoding;
+      test_case "publisher hwm" `Quick test_publisher_hwm;
     ];
   ]

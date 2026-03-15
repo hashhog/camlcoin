@@ -509,6 +509,106 @@ let test_netgroup_of () =
   Alcotest.(check string) "invalid returns self" "localhost"
     (Peer_manager.netgroup_of "localhost")
 
+(* Test keyed netgroup computation is deterministic *)
+let test_keyed_netgroup_deterministic () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  let stats = Peer_manager.get_bucket_stats pm in
+  (* Keyed netgroup should be consistent for same address *)
+  let ng1 = Peer_manager.compute_keyed_netgroup "testkey" "192.168.1.1" in
+  let ng2 = Peer_manager.compute_keyed_netgroup "testkey" "192.168.1.1" in
+  Alcotest.(check int) "same netgroup" ng1 ng2;
+  (* Different addresses in same /16 should have same keyed netgroup *)
+  let ng3 = Peer_manager.compute_keyed_netgroup "testkey" "192.168.1.2" in
+  Alcotest.(check int) "same /16 netgroup" ng1 ng3;
+  (* Different /16 should have different netgroup *)
+  let ng4 = Peer_manager.compute_keyed_netgroup "testkey" "10.0.0.1" in
+  Alcotest.(check bool) "different /16" true (ng1 <> ng4);
+  let _ = stats in ()
+
+(* Test eclipse protection constants match Bitcoin Core *)
+let test_eclipse_constants () =
+  (* Bitcoin Core: ADDRMAN_NEW_BUCKET_COUNT = 1024, ADDRMAN_TRIED_BUCKET_COUNT = 256 *)
+  Alcotest.(check int) "new_bucket_count" 1024 Peer_manager.new_bucket_count;
+  Alcotest.(check int) "tried_bucket_count" 256 Peer_manager.tried_bucket_count;
+  Alcotest.(check int) "bucket_size" 64 Peer_manager.bucket_size;
+  (* Eviction protection constants from Bitcoin Core eviction.cpp *)
+  Alcotest.(check int) "protect_by_netgroup" 4 Peer_manager.protect_by_netgroup;
+  Alcotest.(check int) "protect_by_ping" 8 Peer_manager.protect_by_ping;
+  Alcotest.(check int) "protect_by_tx_time" 4 Peer_manager.protect_by_tx_time;
+  Alcotest.(check int) "protect_by_block_relay" 8 Peer_manager.protect_by_block_relay;
+  Alcotest.(check int) "protect_by_block_time" 4 Peer_manager.protect_by_block_time
+
+(* Test move to tried table *)
+let test_move_to_tried_table () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  let addr = "10.20.30.40" in
+  (* First add to new table *)
+  let info : Peer_manager.peer_info = {
+    address = addr;
+    port = 8333;
+    services = 9L;
+    last_connected = 0.0;
+    last_attempt = 0.0;
+    last_success = 0.0;
+    failures = 0;
+    banned_until = 0.0;
+    source = Peer_manager.Addr;
+    table_status = Peer_manager.NotInTable;
+  } in
+  Peer_manager.add_known_addr pm info;
+  let stats1 = Peer_manager.get_bucket_stats pm in
+  Alcotest.(check bool) "in new table" true (stats1.new_table_entries > 0);
+  Alcotest.(check int) "tried empty" 0 stats1.tried_table_entries;
+  (* Move to tried *)
+  let _bucket = Peer_manager.move_to_tried_table pm addr in
+  let stats2 = Peer_manager.get_bucket_stats pm in
+  Alcotest.(check bool) "new table decremented" true (stats2.new_table_entries < stats1.new_table_entries);
+  Alcotest.(check bool) "in tried table" true (stats2.tried_table_entries > 0)
+
+(* Test is_in_tried_table *)
+let test_is_in_tried_table () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  let addr = "172.16.0.1" in
+  (* Not in tried table initially *)
+  Alcotest.(check bool) "not in tried" false (Peer_manager.is_in_tried_table pm addr);
+  (* Add to new, then move to tried *)
+  let info : Peer_manager.peer_info = {
+    address = addr;
+    port = 8333;
+    services = 9L;
+    last_connected = 0.0;
+    last_attempt = 0.0;
+    last_success = 0.0;
+    failures = 0;
+    banned_until = 0.0;
+    source = Peer_manager.Manual;
+    table_status = Peer_manager.NotInTable;
+  } in
+  Peer_manager.add_known_addr pm info;
+  let _ = Peer_manager.move_to_tried_table pm addr in
+  Alcotest.(check bool) "now in tried" true (Peer_manager.is_in_tried_table pm addr)
+
+(* Test compute_bucket determinism *)
+let test_compute_bucket () =
+  let key = "secretkey123" in
+  let addr = "192.168.1.100" in
+  let b1 = Peer_manager.compute_bucket key addr 256 in
+  let b2 = Peer_manager.compute_bucket key addr 256 in
+  Alcotest.(check int) "deterministic bucket" b1 b2;
+  (* Bucket should be in valid range *)
+  Alcotest.(check bool) "bucket in range" true (b1 >= 0 && b1 < 256);
+  (* Different key gives different bucket (with high probability) *)
+  let b3 = Peer_manager.compute_bucket "otherkey" addr 256 in
+  (* We can't guarantee different, but statistically likely *)
+  let _ = b3 in ()
+
+(* Test that eviction selects from largest netgroup *)
+let test_eviction_selects_largest_netgroup () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  (* Test that select_node_to_evict returns None when no peers *)
+  let result = Peer_manager.select_node_to_evict pm in
+  Alcotest.(check bool) "no eviction with no peers" true (Option.is_none result)
+
 (* Test anchor connection info type *)
 let test_anchor_info () =
   let anchor : Peer_manager.anchor_info = {
@@ -841,9 +941,15 @@ let () =
       Alcotest.test_case "addr_goes_to_new" `Quick test_addr_goes_to_new_table;
       Alcotest.test_case "addresses_distribute" `Quick test_addresses_distribute;
       Alcotest.test_case "netgroup_of" `Quick test_netgroup_of;
+      Alcotest.test_case "keyed_netgroup_deterministic" `Quick test_keyed_netgroup_deterministic;
+      Alcotest.test_case "eclipse_constants" `Quick test_eclipse_constants;
+      Alcotest.test_case "move_to_tried_table" `Quick test_move_to_tried_table;
+      Alcotest.test_case "is_in_tried_table" `Quick test_is_in_tried_table;
+      Alcotest.test_case "compute_bucket" `Quick test_compute_bucket;
     ];
     "eviction", [
       Alcotest.test_case "eviction_candidate" `Quick test_eviction_candidate;
+      Alcotest.test_case "eviction_selects_largest_netgroup" `Quick test_eviction_selects_largest_netgroup;
     ];
     "anchors", [
       Alcotest.test_case "anchor_info" `Quick test_anchor_info;

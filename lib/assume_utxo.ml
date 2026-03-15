@@ -468,6 +468,74 @@ let dump_snapshot ~(chainstate : chainstate)
   | _ -> Error "Failed to dump snapshot"
 
 (* ============================================================================
+   UTXO Set Hash Computation
+   ============================================================================ *)
+
+(** Serialize a coin for hash computation.
+    Format matches Bitcoin Core's TxOutSer:
+    [outpoint:36][code:4][txout:var]
+    where code = (height << 1) + is_coinbase *)
+let serialize_coin_for_hash w (outpoint : Types.outpoint) (coin : snapshot_coin) =
+  (* Outpoint: txid (32) + vout (4 LE) *)
+  Serialize.write_bytes w outpoint.txid;
+  Serialize.write_int32_le w outpoint.vout;
+  (* Code: (height << 1) | is_coinbase as uint32 *)
+  let code = Int32.of_int ((coin.height lsl 1) lor (if coin.is_coinbase then 1 else 0)) in
+  Serialize.write_int32_le w code;
+  (* TxOut: value (8 LE) + scriptPubKey (compact_size + bytes) *)
+  Serialize.write_int64_le w coin.value;
+  Serialize.write_compact_size w (Cstruct.length coin.script_pubkey);
+  Serialize.write_bytes w coin.script_pubkey
+
+(** Compute the UTXO set hash by iterating over all coins.
+    This matches Bitcoin Core's HASH_SERIALIZED hash type.
+    The hash is SHA256d of the concatenation of all serialized coins. *)
+let compute_utxo_hash ~(iter_coins : (Types.outpoint -> snapshot_coin -> unit) -> unit)
+    : Types.hash256 =
+  (* We use an incremental SHA256 approach: hash each coin individually,
+     then combine all coin hashes into a single hash using a Merkle-like structure.
+     For simplicity, we concatenate all serialized coins and hash once. *)
+  let buffer = Buffer.create (1024 * 1024) in  (* 1MB initial buffer *)
+  iter_coins (fun outpoint coin ->
+    let w = Serialize.writer_create () in
+    serialize_coin_for_hash w outpoint coin;
+    let data = Serialize.writer_to_cstruct w in
+    Buffer.add_string buffer (Cstruct.to_string data)
+  );
+  let data = Cstruct.of_string (Buffer.contents buffer) in
+  Crypto.sha256d data
+
+(** Compute UTXO hash from a database by iterating all stored UTXOs *)
+let compute_utxo_hash_from_db (db : Storage.ChainDB.t) : Types.hash256 =
+  let buffer = Buffer.create (1024 * 1024) in
+  Storage.ChainDB.iter_utxos db (fun txid vout data ->
+    let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+    let utxo = Utxo.deserialize_utxo_entry r in
+    let outpoint = { Types.txid; vout = Int32.of_int vout } in
+    let coin = {
+      outpoint;
+      value = utxo.Utxo.value;
+      script_pubkey = utxo.script_pubkey;
+      height = utxo.height;
+      is_coinbase = utxo.is_coinbase;
+    } in
+    let w = Serialize.writer_create () in
+    serialize_coin_for_hash w outpoint coin;
+    let coin_data = Serialize.writer_to_cstruct w in
+    Buffer.add_string buffer (Cstruct.to_string coin_data)
+  );
+  let data = Cstruct.of_string (Buffer.contents buffer) in
+  Crypto.sha256d data
+
+(** Compute UTXO hash from a UTXO cache *)
+let compute_utxo_hash_from_cache (cache : Utxo.UtxoCache.t)
+    (db : Storage.ChainDB.t) : Types.hash256 =
+  (* For computing the hash, we need to iterate all UTXOs.
+     We flush the cache first to ensure consistency, then iterate the DB. *)
+  let _ = Lwt_main.run (Utxo.UtxoCache.flush cache) in
+  compute_utxo_hash_from_db db
+
+(* ============================================================================
    Background Validation
    ============================================================================ *)
 
@@ -495,6 +563,83 @@ let create_background_validation ~(snapshot_params : assumeutxo_params) : backgr
     snapshot_coins_hash = snapshot_params.coins_hash;
   }
 
+(** Update UTXO cache with a connected block.
+    Returns the collected fees from the block. *)
+let connect_block_to_cache ~(cache : Utxo.UtxoCache.t) ~(block : Types.block)
+    ~(height : int) : (int64, string) result =
+  let error = ref None in
+  let total_fees = ref 0L in
+
+  List.iteri (fun tx_idx tx ->
+    if !error = None then begin
+      let txid = Crypto.compute_txid tx in
+      let is_coinbase = tx_idx = 0 in
+
+      (* Process inputs (skip coinbase) *)
+      if not is_coinbase then begin
+        let input_sum = ref 0L in
+        List.iter (fun inp ->
+          if !error = None then begin
+            let prev = inp.Types.previous_output in
+            match Utxo.UtxoCache.get_coin cache prev with
+            | None ->
+              error := Some (Printf.sprintf
+                "Missing UTXO: %s:%ld"
+                (Types.hash256_to_hex_display prev.txid)
+                prev.vout)
+            | Some coin ->
+              if coin.is_coinbase &&
+                 height - coin.height < Consensus.coinbase_maturity then
+                error := Some "Immature coinbase spend"
+              else begin
+                input_sum := Int64.add !input_sum coin.txout.Types.value;
+                ignore (Utxo.UtxoCache.spend_coin cache prev)
+              end
+          end
+        ) tx.Types.inputs;
+
+        if !error = None then begin
+          let output_sum = List.fold_left
+            (fun acc out -> Int64.add acc out.Types.value)
+            0L tx.Types.outputs in
+          if output_sum > !input_sum then
+            error := Some "Output exceeds input"
+          else
+            total_fees :=
+              Int64.add !total_fees
+                (Int64.sub !input_sum output_sum)
+        end
+      end;
+
+      (* Add outputs *)
+      if !error = None then
+        List.iteri (fun vout out ->
+          let outpoint = { Types.txid; vout = Int32.of_int vout } in
+          let coin : Utxo.coin = {
+            txout = { Types.value = out.Types.value; script_pubkey = out.script_pubkey };
+            height;
+            is_coinbase;
+          } in
+          Utxo.UtxoCache.add_coin cache outpoint coin ~possible_overwrite:false
+        ) tx.Types.outputs
+    end
+  ) block.Types.transactions;
+
+  match !error with
+  | Some e -> Error e
+  | None ->
+    (* Verify coinbase value *)
+    let subsidy = Consensus.block_subsidy height in
+    let max_coinbase = Int64.add subsidy !total_fees in
+    let coinbase = List.hd block.Types.transactions in
+    let coinbase_out = List.fold_left
+      (fun acc out -> Int64.add acc out.Types.value)
+      0L coinbase.Types.outputs in
+    if coinbase_out > max_coinbase then
+      Error (Printf.sprintf "Coinbase too large: %Ld > %Ld" coinbase_out max_coinbase)
+    else
+      Ok !total_fees
+
 (** Run background validation in an Lwt thread.
     Validates blocks from genesis to snapshot height, then compares UTXO hashes. *)
 let run_background_validation
@@ -513,13 +658,34 @@ let run_background_validation
 
   let rec validate_next_block () =
     if bg_validation.validated_height >= bg_validation.target_height then begin
-      (* Validation complete - compare UTXO hashes *)
-      (* TODO: Implement UTXO hash computation *)
-      bg_validation.state <- BgCompleted;
-      snapshot_chainstate.assumeutxo_state <- Validated;
-      Logs.info (fun m -> m "[assumeutxo] Background validation completed at height %d"
+      (* Validation complete - compute UTXO hash and compare *)
+      Logs.info (fun m -> m "[assumeutxo] Computing UTXO hash at height %d..."
                    bg_validation.target_height);
-      Lwt.return_unit
+
+      (* Flush cache and compute hash *)
+      let* _ = Utxo.UtxoCache.flush ibd_chainstate.utxo_cache in
+      let db = Utxo.DbView.db (Utxo.UtxoCache.get_view ibd_chainstate.utxo_cache) in
+      let computed_hash = compute_utxo_hash_from_db db in
+
+      (* Compare with expected hash *)
+      if Cstruct.equal computed_hash bg_validation.snapshot_coins_hash then begin
+        bg_validation.state <- BgCompleted;
+        snapshot_chainstate.assumeutxo_state <- Validated;
+        Logs.info (fun m -> m "[assumeutxo] Background validation completed successfully! \
+                               UTXO hashes match at height %d"
+                     bg_validation.target_height);
+        Lwt.return_unit
+      end else begin
+        let msg = Printf.sprintf
+          "UTXO hash mismatch! Expected %s, got %s"
+          (Types.hash256_to_hex_display bg_validation.snapshot_coins_hash)
+          (Types.hash256_to_hex_display computed_hash)
+        in
+        bg_validation.state <- BgFailed msg;
+        snapshot_chainstate.assumeutxo_state <- Invalid;
+        Logs.err (fun m -> m "[assumeutxo] Background validation failed: %s" msg);
+        Lwt.return_unit
+      end
     end else begin
       let next_height = bg_validation.validated_height + 1 in
       match get_header_at_height next_height with
@@ -535,8 +701,8 @@ let run_background_validation
           validate_next_block ()
         | Some block ->
           (* Validate block against IBD chainstate *)
-          let median_time = 0l in (* TODO: compute properly *)
-          let flags = Script.script_verify_p2sh in
+          let median_time = 0l in (* TODO: compute properly from chain *)
+          let flags = Validation.get_script_flags_for_height ~network next_height in
           let base_lookup outpoint =
             match Utxo.UtxoCache.get_coin ibd_chainstate.utxo_cache outpoint with
             | Some coin ->
@@ -564,16 +730,38 @@ let run_background_validation
                         next_height (Validation.block_error_to_string e));
             Lwt.return_unit
           | Ok _fees ->
-            (* Update IBD chainstate UTXO set *)
-            (* Note: This is simplified - real impl needs proper UTXO updates *)
-            bg_validation.validated_height <- next_height;
-            bg_validation.state <- BgValidating {
-              height = next_height;
-              target_height = bg_validation.target_height;
-            };
-            (* Yield to scheduler periodically *)
-            let* () = if next_height mod 100 = 0 then Lwt.pause () else Lwt.return_unit in
-            validate_next_block ()
+            (* Update IBD chainstate UTXO set with the block's changes *)
+            (match connect_block_to_cache ~cache:ibd_chainstate.utxo_cache
+                     ~block ~height:next_height with
+            | Error e ->
+              bg_validation.state <- BgFailed e;
+              snapshot_chainstate.assumeutxo_state <- Invalid;
+              Logs.err (fun m -> m "[assumeutxo] UTXO update failed at height %d: %s"
+                          next_height e);
+              Lwt.return_unit
+            | Ok _ ->
+              bg_validation.validated_height <- next_height;
+              ibd_chainstate.tip_height <- next_height;
+              ibd_chainstate.tip_hash <- header_entry.hash;
+              bg_validation.state <- BgValidating {
+                height = next_height;
+                target_height = bg_validation.target_height;
+              };
+              (* Log progress periodically *)
+              if next_height mod 10000 = 0 then
+                Logs.info (fun m -> m "[assumeutxo] Background validation progress: %d / %d (%.1f%%)"
+                             next_height bg_validation.target_height
+                             (100.0 *. (float_of_int next_height) /. (float_of_int bg_validation.target_height)));
+              (* Flush cache periodically to avoid memory pressure *)
+              let* () =
+                if next_height mod 5000 = 0 then begin
+                  let* _ = Utxo.UtxoCache.flush ibd_chainstate.utxo_cache in
+                  Lwt.return_unit
+                end else Lwt.return_unit
+              in
+              (* Yield to scheduler periodically *)
+              let* () = if next_height mod 100 = 0 then Lwt.pause () else Lwt.return_unit in
+              validate_next_block ())
     end
   in
   validate_next_block ()

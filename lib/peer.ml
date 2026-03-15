@@ -242,6 +242,24 @@ let connect ~(network : Consensus.network_config) ~(addr : string)
     let* () = Lwt.pick [do_connect; timeout] in
     Lwt.return (make_peer ~network ~addr ~port ~id ~direction:Outbound ~fd)
 
+(* Establish TCP connection through a proxy (Tor, I2P, or SOCKS5) *)
+let connect_with_proxy ~(network : Consensus.network_config) ~(addr : string)
+    ~(port : int) ~(id : int) ~(proxy_config : P2p.proxy_config) : peer Lwt.t =
+  let open Lwt.Syntax in
+  (* Set connection timeout *)
+  let timeout =
+    let* () = Lwt_unix.sleep connection_timeout in
+    Lwt.fail_with "Connection timeout"
+  in
+  let do_connect =
+    let* result = P2p.connect_with_proxy ~config:proxy_config ~host:addr ~port in
+    match result with
+    | Ok fd -> Lwt.return fd
+    | Error msg -> Lwt.fail_with msg
+  in
+  let* fd = Lwt.pick [do_connect; timeout] in
+  Lwt.return (make_peer ~network ~addr ~port ~id ~direction:Outbound ~fd)
+
 (* Read a message from the peer with protection against stream desync.
    Uses Lwt.no_cancel to ensure TCP reads complete atomically. *)
 let read_message (peer : peer) : P2p.message_payload Lwt.t =

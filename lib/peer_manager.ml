@@ -40,6 +40,7 @@ type config = {
   dead_timeout : float;  (* Seconds before peer considered dead *)
   chain_sync_timeout : float; (* Seconds before evicting outbound peer behind our tip *)
   max_block_relay_only_anchors : int; (* Max anchor connections to persist, default 2 *)
+  max_block_relay_only : int; (* Max dedicated block-relay-only outbound connections, default 2 *)
 }
 
 let default_config : config = {
@@ -52,6 +53,7 @@ let default_config : config = {
   dead_timeout = 600.0;    (* 10 minutes *)
   chain_sync_timeout = 1200.0; (* 20 minutes *)
   max_block_relay_only_anchors = 2; (* BIP 155: 2 block-relay-only anchors *)
+  max_block_relay_only = 2; (* 2 dedicated block-relay-only outbound connections *)
 }
 
 (* ========== Stale peer eviction constants ========== *)
@@ -290,6 +292,12 @@ let outbound_peer_count (pm : t) : int =
 let inbound_peer_count (pm : t) : int =
   List.length (List.filter (fun p ->
     p.Peer.direction = Peer.Inbound) pm.peers)
+
+(* Count block-relay-only outbound peers *)
+let block_relay_only_count (pm : t) : int =
+  List.length (List.filter (fun p ->
+    p.Peer.direction = Peer.Outbound && p.Peer.block_relay_only
+  ) pm.peers)
 
 (* Extract /16 netgroup from an IPv4 address string *)
 let netgroup_of addr =
@@ -569,7 +577,7 @@ let resolve_dns_seeds (network : Consensus.network_config) : peer_info list Lwt.
     Lwt.catch (fun () ->
       let* addrs = Lwt_unix.getaddrinfo seed
         (string_of_int network.default_port)
-        [Unix.AI_SOCKTYPE Unix.SOCK_STREAM; Unix.AI_FAMILY Unix.PF_INET] in
+        [Unix.AI_SOCKTYPE Unix.SOCK_STREAM] in
       Lwt.return (List.filter_map (fun ai ->
         match ai.Unix.ai_addr with
         | Unix.ADDR_INET (ip, _) ->
@@ -701,6 +709,60 @@ let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
            { info with
              failures = info.failures + 1;
              last_attempt = now }
+       | None -> ());
+      Lwt.return_unit
+    )
+  end
+
+(* Connect a block-relay-only peer: same as add_peer but marks the peer
+   as block_relay_only=true so it never relays transactions. *)
+let add_block_relay_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
+  let open Lwt.Syntax in
+  let now = Unix.gettimeofday () in
+  if block_relay_only_count pm >= pm.config.max_block_relay_only then
+    Lwt.return_unit
+  else if List.exists (fun p -> p.Peer.addr = addr) pm.peers then
+    Lwt.return_unit
+  else if is_banned pm addr then
+    Lwt.return_unit
+  else if would_violate_netgroup_diversity pm addr then
+    Lwt.return_unit
+  else begin
+    let id = pm.next_peer_id in
+    pm.next_peer_id <- pm.next_peer_id + 1;
+    (match Hashtbl.find_opt pm.known_addrs addr with
+     | Some info ->
+       Hashtbl.replace pm.known_addrs addr { info with last_attempt = now }
+     | None -> ());
+    Lwt.catch (fun () ->
+      let* peer = Peer.connect ~network:pm.network ~addr ~port ~id in
+      peer.Peer.block_relay_only <- true;
+      let* () = Peer.perform_handshake peer pm.our_height in
+      pm.peers <- peer :: pm.peers;
+      Hashtbl.replace pm.peer_connected_time peer.Peer.id now;
+      Hashtbl.replace pm.stale_state peer.Peer.id (create_stale_state ());
+      Hashtbl.replace pm.outbound_netgroups (netgroup_of addr) true;
+      Lwt.async (fun () -> Peer.start_trickling peer);
+      let tried_bucket = move_to_tried_table pm addr in
+      (match Hashtbl.find_opt pm.known_addrs addr with
+       | Some info ->
+         Hashtbl.replace pm.known_addrs addr
+           { info with last_connected = now; last_success = now;
+             failures = 0; table_status = InTried tried_bucket }
+       | None ->
+         Hashtbl.replace pm.known_addrs addr
+           { address = addr; port;
+             services = Peer.services_to_int64 peer.services;
+             last_connected = now; last_attempt = now; last_success = now;
+             failures = 0; banned_until = 0.0; source = Manual;
+             table_status = InTried tried_bucket });
+      Log.info (fun m -> m "Connected block-relay-only peer %d (%s)" peer.Peer.id addr);
+      Lwt.return_unit
+    ) (fun _exn ->
+      (match Hashtbl.find_opt pm.known_addrs addr with
+       | Some info ->
+         Hashtbl.replace pm.known_addrs addr
+           { info with failures = info.failures + 1; last_attempt = now }
        | None -> ());
       Lwt.return_unit
     )
@@ -1422,6 +1484,17 @@ let maintain_connections (pm : t) : unit Lwt.t =
         end else
           Lwt.return_unit
       in
+      (* Maintain block-relay-only outbound connections *)
+      let* () =
+        let bro_needed = pm.config.max_block_relay_only - block_relay_only_count pm in
+        if bro_needed > 0 then begin
+          let candidates = get_connection_candidates pm bro_needed in
+          Lwt_list.iter_s (fun info ->
+            add_block_relay_peer pm info.address info.port
+          ) candidates
+        end else
+          Lwt.return_unit
+      in
       (* Ping idle peers *)
       let* () = Lwt_list.iter_p (fun peer ->
         if Peer.needs_ping peer then
@@ -1953,7 +2026,7 @@ let gossip_addresses (pm : t) : unit Lwt.t =
   else begin
     let msg = P2p.AddrMsg addrs in
     Lwt_list.iter_p (fun peer ->
-      if peer.Peer.state = Peer.Connected then
+      if peer.Peer.state = Peer.Ready then
         Lwt.catch
           (fun () -> Peer.send_message peer msg)
           (fun _exn -> Lwt.return_unit)

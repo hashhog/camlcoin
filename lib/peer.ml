@@ -124,6 +124,9 @@ type peer = {
   mutable feefilter : int64;     (* Minimum fee rate (sat/kvB) advertised by peer *)
   mutable fee_filter_sent : int64;  (* Last feefilter value we sent to this peer *)
   mutable next_send_feefilter : float; (* Next time to send our feefilter to this peer *)
+  mutable relay : bool;             (* Peer's relay flag from version message *)
+  mutable cmpct_high_bandwidth : bool; (* Peer wants high-bandwidth compact blocks *)
+  mutable cmpct_version : int64;    (* Compact block protocol version *)
   mutable block_relay_only : bool;  (* Block-relay-only connection (no tx relay) *)
   mutable msg_count_window : int;   (* Messages received in current window *)
   mutable msg_window_start : float; (* Start time of current rate-limit window *)
@@ -203,6 +206,9 @@ let make_peer ~(network : Consensus.network_config) ~(addr : string)
     feefilter = 0L;
     fee_filter_sent = 0L;
     next_send_feefilter = Unix.gettimeofday () +. poisson_delay avg_feefilter_broadcast_interval;
+    relay = true;
+    cmpct_high_bandwidth = false;
+    cmpct_version = 0L;
     block_relay_only = false;
     msg_count_window = 0;
     msg_window_start = Unix.gettimeofday ();
@@ -221,7 +227,7 @@ let connect ~(network : Consensus.network_config) ~(addr : string)
   let open Lwt.Syntax in
   let* addresses = Lwt_unix.getaddrinfo addr
     (string_of_int port)
-    [Unix.AI_SOCKTYPE Unix.SOCK_STREAM; Unix.AI_FAMILY Unix.PF_INET] in
+    [Unix.AI_SOCKTYPE Unix.SOCK_STREAM] in
   match addresses with
   | [] -> Lwt.fail_with ("Cannot resolve: " ^ addr)
   | ai :: _ ->
@@ -318,6 +324,7 @@ let process_version_msg (peer : peer) (v : Types.version_msg) : unit Lwt.t =
     peer.version_msg <- Some v;
     peer.services <- services_of_int64 v.services;
     peer.best_height <- v.start_height;
+    peer.relay <- v.relay;
     if v.protocol_version < min_protocol_version then
       Lwt.fail_with (Printf.sprintf
         "Peer protocol version too old: %ld (minimum: %ld)"
@@ -390,8 +397,9 @@ let read_until_verack (peer : peer) : unit Lwt.t =
       | Some P2p.SendaddrV2Msg ->
         peer.sendaddrv2 <- true;
         loop ()
-      | Some (P2p.SendcmpctMsg _) ->
-        (* Accept sendcmpct during feature negotiation *)
+      | Some (P2p.SendcmpctMsg { announce; version }) ->
+        peer.cmpct_high_bandwidth <- announce;
+        peer.cmpct_version <- version;
         loop ()
       | Some (P2p.FeefilterMsg feerate) ->
         (* Accept feefilter during feature negotiation *)
@@ -671,6 +679,7 @@ let dispatch_message (peer : peer) (msg : P2p.message_payload)
       let _ = peer.version_msg <- Some v in
       let _ = peer.services <- services_of_int64 v.services in
       let _ = peer.best_height <- v.start_height in
+      peer.relay <- v.relay;
       Lwt.return `Continue
     end
 
@@ -705,12 +714,15 @@ let dispatch_message (peer : peer) (msg : P2p.message_payload)
       Lwt.return `Continue
     end
 
-  | P2p.SendcmpctMsg _, false ->
+  | P2p.SendcmpctMsg { announce; version }, false ->
     if not peer.version_received then begin
       let* () = misbehaving peer 10 "pre-handshake sendcmpct" in
       Lwt.return (`PreHandshake "sendcmpct before VERSION")
-    end else
+    end else begin
+      peer.cmpct_high_bandwidth <- announce;
+      peer.cmpct_version <- version;
       Lwt.return `Continue
+    end
 
   | P2p.FeefilterMsg feerate, false ->
     if not peer.version_received then begin
@@ -751,6 +763,11 @@ let dispatch_message (peer : peer) (msg : P2p.message_payload)
 
   | P2p.VerackMsg, true ->
     (* Ignore duplicate verack *)
+    Lwt.return `Continue
+
+  | P2p.SendcmpctMsg { announce; version }, true ->
+    peer.cmpct_high_bandwidth <- announce;
+    peer.cmpct_version <- version;
     Lwt.return `Continue
 
   | P2p.FeefilterMsg feerate, true ->
@@ -833,10 +850,20 @@ let peer_info (peer : peer) : string =
     peer.best_height
     ua dir peer.misbehavior_score
 
-(* Inventory trickling: queue a transaction for delayed announcement *)
+(* Inventory trickling: queue a transaction for delayed announcement.
+   Respects the peer's relay preference: when relay=false, tx inv messages
+   are suppressed (the peer opted out of transaction relay). *)
 let queue_inv (peer : peer) (entry : inv_entry) : unit =
-  if peer.state = Ready then
-    Queue.add entry peer.inv_queue
+  if peer.state = Ready then begin
+    let is_tx = match entry.inv_type with
+      | P2p.InvTx | P2p.InvWitnessTx -> true
+      | _ -> false
+    in
+    if is_tx && (not peer.relay || peer.block_relay_only) then
+      ()
+    else
+      Queue.add entry peer.inv_queue
+  end
 
 (* Inventory trickling: check how many items are queued *)
 let inv_queue_length (peer : peer) : int =

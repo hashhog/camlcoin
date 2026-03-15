@@ -59,6 +59,7 @@ type mempool = {
   mutable total_fee : int64;
   max_size_bytes : int;       (* default 300 MB *)
   min_relay_fee : int64;      (* minimum fee rate in sat/kvB *)
+  mutable dynamic_min_fee : int64;  (* raised when mempool is full and evictions occur *)
   utxo : Utxo.UtxoSet.t;
   mutable current_height : int;
   mutable network : Consensus.network_config;
@@ -83,6 +84,7 @@ let max_ancestor_size = 101_000
 let max_descendant_size = 101_000
 let max_rbf_evictions = 100
 let max_standard_tx_weight = 400_000
+let incremental_relay_fee = 1000L  (* 1000 sat/kvB, same as default relay fee *)
 
 (* Cluster mempool constants (replaces ancestor/descendant limits) *)
 let max_cluster_count = 101    (* max transactions per cluster *)
@@ -180,6 +182,7 @@ let create ?(require_standard=true) ?(verify_scripts=true)
     total_fee = 0L;
     max_size_bytes = 300 * 1024 * 1024;
     min_relay_fee = 1000L;  (* 1 sat/vB = 1000 sat/kvB *)
+    dynamic_min_fee = 0L;
     utxo;
     current_height;
     network;
@@ -590,7 +593,8 @@ let select_for_block_chunked (mp : mempool) ~(max_weight : int)
    Reference: Bitcoin Core TrimToSize with GetWorstMainChunk
    ============================================================================ *)
 
-(* Evict lowest fee-rate chunks until mempool is under target size *)
+(* Evict lowest fee-rate chunks until mempool is under target size.
+   Updates dynamic_min_fee based on the last evicted chunk's fee rate. *)
 let evict_by_chunks (mp : mempool) : unit =
   let target = mp.max_size_bytes * 3 / 4 in
   let rec evict_loop () =
@@ -599,7 +603,10 @@ let evict_by_chunks (mp : mempool) : unit =
       match get_worst_chunk mp with
       | None -> ()
       | Some worst_chunk ->
-        (* Remove all transactions in the worst chunk *)
+        let evicted_fee_rate_kvb =
+          worst_chunk.chunk_fee_rate *. 4.0 *. 1000.0 in
+        mp.dynamic_min_fee <-
+          Int64.add (Int64.of_float evicted_fee_rate_kvb) incremental_relay_fee;
         List.iter (fun e ->
           remove_transaction mp e.txid
         ) worst_chunk.chunk_txs;
@@ -607,6 +614,16 @@ let evict_by_chunks (mp : mempool) : unit =
     end
   in
   evict_loop ()
+
+(* Effective minimum fee rate: max of static min_relay_fee and dynamic_min_fee.
+   dynamic_min_fee is raised when the mempool is full and evictions occur. *)
+let effective_min_fee (mp : mempool) : int64 =
+  if mp.total_weight > mp.max_size_bytes / 4 then
+    Int64.max mp.min_relay_fee mp.dynamic_min_fee
+  else begin
+    mp.dynamic_min_fee <- 0L;
+    mp.min_relay_fee
+  end
 
 (* ============================================================================
    Cluster Size Limit Check
@@ -1310,9 +1327,10 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (t
             let fee_rate =
               Int64.to_float fee /. float_of_int weight in
 
-            (* Check minimum relay fee *)
+            (* Check minimum relay fee (uses dynamic minimum when mempool is full) *)
+            let eff_min = effective_min_fee mp in
             let min_fee = Int64.of_float (
-              Int64.to_float mp.min_relay_fee *.
+              Int64.to_float eff_min *.
               float_of_int weight /. 4000.0) in
 
             if fee < min_fee && not bypass_fee_check then
@@ -1375,7 +1393,8 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (t
    Block Processing
    ============================================================================ *)
 
-(* Remove confirmed transactions after a block is mined *)
+(* Remove confirmed transactions after a block is mined.
+   Collects txids to remove before mutating the Hashtbl. *)
 let remove_for_block (mp : mempool) (block : Types.block) (height : int)
     : unit =
   mp.current_height <- height;
@@ -1384,17 +1403,20 @@ let remove_for_block (mp : mempool) (block : Types.block) (height : int)
     let txid = Crypto.compute_txid tx in
     remove_transaction mp txid;
 
-    (* Also remove any conflicts (double-spends) *)
+    (* Collect conflicting txids first, then remove *)
     List.iter (fun inp ->
-      Hashtbl.iter (fun _k entry ->
-        List.iter (fun entry_inp ->
-          if Cstruct.equal
-               entry_inp.Types.previous_output.txid
-               inp.Types.previous_output.txid &&
-             entry_inp.previous_output.vout = inp.previous_output.vout then
-            remove_transaction mp entry.txid
-        ) entry.tx.inputs
-      ) mp.entries
+      let to_remove = Hashtbl.fold (fun _k entry acc ->
+        let dominated = List.exists (fun entry_inp ->
+          Cstruct.equal
+            entry_inp.Types.previous_output.txid
+            inp.Types.previous_output.txid &&
+          entry_inp.previous_output.vout = inp.previous_output.vout
+        ) entry.tx.inputs in
+        if dominated then entry.txid :: acc else acc
+      ) mp.entries [] in
+      List.iter (fun conflict_txid ->
+        remove_transaction mp conflict_txid
+      ) to_remove
     ) tx.inputs
   ) block.transactions
 
@@ -2300,7 +2322,7 @@ let accept_package (mp : mempool) (txs : Types.transaction list)
         | `Error (tx, msg) ->
           rejected := (tx, msg) :: !rejected
         | `NeedValidation (tx, fee, vsize) ->
-          let txid = Crypto.compute_txid tx in
+          let _txid = Crypto.compute_txid tx in
           (* Check individual fee rate *)
           let individual_feerate = Int64.to_float fee *. 1000.0 /. float_of_int vsize in
           let passes_feerate = individual_feerate >= min_feerate || use_package_feerate in

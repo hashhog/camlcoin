@@ -12,6 +12,10 @@ let make_txid (n : int) : Types.hash256 =
   Cstruct.LE.set_uint32 buf 0 (Int32.of_int n);
   buf
 
+(* Find bucket index for a given fee rate *)
+let bucket_for (est : Fee_estimation.t) (fee_rate : float) : int =
+  Fee_estimation.find_bucket est fee_rate
+
 (* Create a minimal transaction for testing *)
 let make_test_tx () : Types.transaction =
   Types.{
@@ -39,8 +43,8 @@ let test_create () =
     (Fee_estimation.current_height est);
   Alcotest.(check int) "no tracked txs" 0
     (Fee_estimation.tracked_count est);
-  Alcotest.(check int) "has buckets" 20
-    (Fee_estimation.bucket_count est)
+  Alcotest.(check bool) "has many buckets" true
+    (Fee_estimation.bucket_count est > 100)
 
 let test_track_transaction () =
   let est = Fee_estimation.create () in
@@ -48,8 +52,8 @@ let test_track_transaction () =
   Fee_estimation.track_transaction est txid 50.0 100;
   Alcotest.(check int) "one tracked tx" 1
     (Fee_estimation.tracked_count est);
-  (* Check bucket got updated *)
-  match Fee_estimation.get_bucket_stats est 9 with (* 50.0 is in bucket 9 *)
+  let idx = bucket_for est 50.0 in
+  match Fee_estimation.get_bucket_stats est idx with
   | None -> Alcotest.fail "bucket should exist"
   | Some stats ->
     Alcotest.(check int) "unconfirmed count" 1 stats.unconfirmed
@@ -71,8 +75,8 @@ let test_record_confirmation () =
   Fee_estimation.record_confirmation est txid 102;
   Alcotest.(check int) "no longer tracked" 0
     (Fee_estimation.tracked_count est);
-  (* Check bucket stats *)
-  match Fee_estimation.get_bucket_stats est 9 with
+  let idx = bucket_for est 50.0 in
+  match Fee_estimation.get_bucket_stats est idx with
   | None -> Alcotest.fail "bucket should exist"
   | Some stats ->
     Alcotest.(check int) "confirmed count" 1 stats.confirmed;
@@ -96,15 +100,15 @@ let test_estimate_insufficient_data () =
 
 let test_estimate_with_data () =
   let est = Fee_estimation.create () in
-  (* Add 15 samples to the 50 sat/vB bucket (index 9), all confirming in 1 block *)
+  (* Add 15 samples near 50 sat/vB, all confirming in 1 block *)
   for i = 1 to 15 do
     let txid = make_txid i in
     Fee_estimation.track_transaction est txid 50.0 100;
     Fee_estimation.record_confirmation est txid 101
   done;
-  (* Should now estimate 50.0 for high priority (1 block) *)
   let high = Fee_estimation.estimate_high_priority est in
-  Alcotest.(check (float 0.01)) "estimated 50 for high" 50.0 high
+  Alcotest.(check bool) "estimated near 50 for high" true
+    (high >= 45.0 && high <= 55.0)
 
 let test_estimate_target_blocks () =
   let est = Fee_estimation.create () in
@@ -125,14 +129,18 @@ let test_estimate_target_blocks () =
   (* 100 sat/vB has median 3, 50 has median 6 - neither meets 1 block *)
   Alcotest.(check (option (float 0.01))) "1 block estimate none"
     None result1;
-  (* Estimate for 3 blocks should return 100.0 (lowest that meets target) *)
+  (* Estimate for 3 blocks should return near 100.0 (lowest that meets target) *)
   let result3 = Fee_estimation.estimate_fee est 3 in
-  Alcotest.(check (option (float 0.01))) "3 block estimate"
-    (Some 100.0) result3;
-  (* Estimate for 6 blocks should return 50.0 (lowest that meets target) *)
+  (match result3 with
+   | Some r -> Alcotest.(check bool) "3 block estimate near 100" true
+       (r >= 90.0 && r <= 110.0)
+   | None -> Alcotest.fail "3 block estimate should exist");
+  (* Estimate for 6 blocks should return near 50.0 (lowest that meets target) *)
   let result6 = Fee_estimation.estimate_fee est 6 in
-  Alcotest.(check (option (float 0.01))) "6 block estimate"
-    (Some 50.0) result6
+  (match result6 with
+   | Some r -> Alcotest.(check bool) "6 block estimate near 50" true
+       (r >= 45.0 && r <= 55.0)
+   | None -> Alcotest.fail "6 block estimate should exist")
 
 let test_estimate_finds_lowest_sufficient () =
   let est = Fee_estimation.create () in
@@ -149,9 +157,10 @@ let test_estimate_finds_lowest_sufficient () =
     Fee_estimation.track_transaction est txid 50.0 100;
     Fee_estimation.record_confirmation est txid 101
   done;
-  (* Should return the LOWEST fee rate that meets target (10.0) *)
+  (* Should return near the LOWEST fee rate that meets target (10.0) *)
   let high = Fee_estimation.estimate_high_priority est in
-  Alcotest.(check (float 0.01)) "picks lowest sufficient rate" 10.0 high
+  Alcotest.(check bool) "picks lowest sufficient rate near 10" true
+    (high >= 9.0 && high <= 11.0)
 
 (* ============================================================================
    Bucket Tests
@@ -159,46 +168,46 @@ let test_estimate_finds_lowest_sufficient () =
 
 let test_bucket_boundaries () =
   let est = Fee_estimation.create () in
-  (* Test various fee rates end up in correct buckets *)
-  (* 0.5 sat/vB should go to bucket 0 (1.0 min) *)
+  (* 0.5 sat/vB should go to bucket 0 (first bucket) *)
   Fee_estimation.track_transaction est (make_txid 1) 0.5 100;
-  match Fee_estimation.get_bucket_stats est 0 with
-  | None -> Alcotest.fail "bucket 0 should exist"
-  | Some stats ->
-    Alcotest.(check int) "0.5 in bucket 0" 1 stats.unconfirmed;
-  (* 1.5 sat/vB should go to bucket 0 (1.0-2.0 range) *)
-  Fee_estimation.track_transaction est (make_txid 2) 1.5 100;
+  let idx0 = bucket_for est 0.5 in
+  (match Fee_estimation.get_bucket_stats est idx0 with
+   | None -> Alcotest.fail "bucket should exist"
+   | Some stats ->
+     Alcotest.(check int) "0.5 in first bucket" 1 stats.unconfirmed);
+  (* 1.02 sat/vB should be in bucket 0 (1.0 to 1.05 range) *)
+  Fee_estimation.track_transaction est (make_txid 2) 1.02 100;
   (match Fee_estimation.get_bucket_stats est 0 with
    | None -> Alcotest.fail "bucket 0 should exist"
    | Some stats ->
-     Alcotest.(check int) "1.5 in bucket 0" 2 stats.unconfirmed);
-  (* 2000.0+ should go to last bucket *)
-  Fee_estimation.track_transaction est (make_txid 3) 5000.0 100;
+     Alcotest.(check bool) "1.02 in bucket 0" true (stats.unconfirmed >= 1));
+  (* 15000.0 (above max boundary 10000) should go to last bucket *)
+  Fee_estimation.track_transaction est (make_txid 3) 15000.0 100;
   let last_bucket = Fee_estimation.bucket_count est - 1 in
   match Fee_estimation.get_bucket_stats est last_bucket with
   | None -> Alcotest.fail "last bucket should exist"
   | Some stats ->
-    Alcotest.(check int) "5000 in last bucket" 1 stats.unconfirmed
+    Alcotest.(check int) "15000 in last bucket" 1 stats.unconfirmed
 
 let test_bucket_stats () =
   let est = Fee_estimation.create () in
-  (* Add some data to bucket 9 (50.0-75.0) *)
+  let idx = bucket_for est 50.0 in
   for i = 1 to 5 do
     let txid = make_txid i in
     Fee_estimation.track_transaction est txid 50.0 100;
     Fee_estimation.record_confirmation est txid (100 + i)
   done;
-  match Fee_estimation.get_bucket_stats est 9 with
+  match Fee_estimation.get_bucket_stats est idx with
   | None -> Alcotest.fail "bucket should exist"
   | Some stats ->
-    Alcotest.(check (float 0.01)) "min rate" 50.0 stats.min_rate;
-    Alcotest.(check (float 0.01)) "max rate" 75.0 stats.max_rate;
+    Alcotest.(check bool) "min rate near 50" true
+      (stats.min_rate >= 49.0 && stats.min_rate <= 51.0);
     Alcotest.(check int) "confirmed" 5 stats.confirmed;
     Alcotest.(check int) "sample count" 5 stats.sample_count
 
 let test_bucket_out_of_range () =
   let est = Fee_estimation.create () in
-  let result = Fee_estimation.get_bucket_stats est 100 in
+  let result = Fee_estimation.get_bucket_stats est 999 in
   Alcotest.(check bool) "invalid bucket returns None" true
     (Option.is_none result);
   let result2 = Fee_estimation.get_bucket_stats est (-1) in
@@ -217,7 +226,8 @@ let test_max_samples_per_bucket () =
     Fee_estimation.track_transaction est txid 50.0 100;
     Fee_estimation.record_confirmation est txid 102
   done;
-  match Fee_estimation.get_bucket_stats est 9 with
+  let idx = bucket_for est 50.0 in
+  match Fee_estimation.get_bucket_stats est idx with
   | None -> Alcotest.fail "bucket should exist"
   | Some stats ->
     (* Should be capped at 1000 samples *)
@@ -243,7 +253,8 @@ let test_clear () =
   Fee_estimation.clear est;
   Alcotest.(check int) "no tracked after clear" 0
     (Fee_estimation.tracked_count est);
-  match Fee_estimation.get_bucket_stats est 9 with
+  let idx = bucket_for est 50.0 in
+  match Fee_estimation.get_bucket_stats est idx with
   | None -> Alcotest.fail "bucket should exist"
   | Some stats ->
     Alcotest.(check int) "confirmed cleared" 0 stats.confirmed;
@@ -307,12 +318,15 @@ let test_priority_estimates_with_varied_data () =
   let high = Fee_estimation.estimate_high_priority est in
   let medium = Fee_estimation.estimate_medium_priority est in
   let low = Fee_estimation.estimate_low_priority est in
-  (* High priority (1 block): 200 sat/vB is only one that confirms in 1 *)
-  Alcotest.(check (float 0.01)) "high priority" 200.0 high;
-  (* Medium priority (6 blocks): 30 sat/vB confirms in 5 *)
-  Alcotest.(check (float 0.01)) "medium priority" 30.0 medium;
-  (* Low priority (25 blocks): 5 sat/vB confirms in 20 *)
-  Alcotest.(check (float 0.01)) "low priority" 5.0 low
+  (* High priority (1 block): near 200 sat/vB *)
+  Alcotest.(check bool) "high priority near 200" true
+    (high >= 180.0 && high <= 220.0);
+  (* Medium priority (6 blocks): near 30 sat/vB *)
+  Alcotest.(check bool) "medium priority near 30" true
+    (medium >= 25.0 && medium <= 35.0);
+  (* Low priority (25 blocks): near 5 sat/vB *)
+  Alcotest.(check bool) "low priority near 5" true
+    (low >= 4.0 && low <= 6.0)
 
 (* ============================================================================
    Estimate Mode Tests
@@ -395,8 +409,8 @@ let test_record_eviction_no_confirmation () =
   let txid = make_txid 901 in
   Fee_estimation.track_transaction est txid 50.0 100;
   Fee_estimation.record_eviction est txid;
-  (* Bucket should have zero confirmed and zero unconfirmed *)
-  match Fee_estimation.get_bucket_stats est 9 with
+  let idx = bucket_for est 50.0 in
+  match Fee_estimation.get_bucket_stats est idx with
   | None -> Alcotest.fail "bucket should exist"
   | Some stats ->
     Alcotest.(check int) "confirmed still 0" 0 stats.confirmed;

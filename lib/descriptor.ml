@@ -1087,6 +1087,18 @@ and tap_tree_has_private (tree : tap_tree) : bool =
   | TapBranch (left, right) ->
     tap_tree_has_private left || tap_tree_has_private right
 
+(* Check if a descriptor is solvable: we know the script structure and have
+   sufficient information (keys/scripts) to construct a valid scriptSig/witness
+   if private keys were available.  addr() and raw() are not solvable because
+   we don't know the underlying script structure. *)
+let rec is_solvable (desc : descriptor) : bool =
+  match desc with
+  | Pk _ | Pkh _ | Wpkh _ | Combo _ -> true
+  | Tr _ -> true
+  | Multi _ | SortedMulti _ -> true
+  | Sh inner | Wsh inner -> is_solvable inner
+  | Addr _ | Raw _ -> false
+
 (* Get descriptor info *)
 let get_info (desc_str : string) : (descriptor_info, string) result =
   match parse desc_str with
@@ -1102,6 +1114,6 @@ let get_info (desc_str : string) : (descriptor_info, string) result =
     Ok {
       descriptor = with_checksum;
       is_range;
-      is_solvable = true;  (* simplified - always solvable if parsed *)
+      is_solvable = is_solvable parsed.desc;
       has_private_keys = has_private;
     }

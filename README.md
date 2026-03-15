@@ -66,6 +66,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Block invalidation (invalidateblock, reconsiderblock RPCs, descendant tracking, chain reorg)
 - [x] BIP324 v2 encrypted transport (ElligatorSwift key exchange, ChaCha20-Poly1305 AEAD, short message IDs)
 - [x] BIP155 addrv2 message support (Tor v3, I2P, CJDNS network addresses)
+- [x] Tor and I2P proxy support (SOCKS5 client, I2P SAM protocol, stream isolation, -proxy/-onion/-i2psam)
 - [ ] Bloom filters (BIP 37)
 
 ## Quick start
@@ -95,7 +96,7 @@ camlcoin/
     validation.ml     block/tx validation
     storage.ml        block/utxo storage, flat files
     utxo.ml           UTXO set, layered cache with batch flushing
-    p2p.ml            network protocol, BIP324 v2 encrypted transport
+    p2p.ml            network protocol, BIP324 v2 transport, SOCKS5/I2P proxy
     peer.ml           peer connections
     peer_manager.ml   connection pool and discovery
     sync.ml           chain synchronization

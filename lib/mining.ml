@@ -32,6 +32,7 @@ type block_template = {
   total_weight : int;
   height : int;
   target : Cstruct.t;
+  network_type : Consensus.network;  (* For correct halving interval in JSON *)
 }
 
 (* ============================================================================
@@ -172,12 +173,14 @@ let build_witness_commitment_script (commitment : Types.hash256) : Cstruct.t =
    - total_fee: Total fees from included transactions
    - payout_script: scriptPubKey for the mining reward output
    - extra_nonce: Extra nonce bytes for mining variance (usually 8 bytes)
-   - witness_root: Optional witness merkle root for SegWit commitment *)
+   - witness_root: Optional witness merkle root for SegWit commitment
+   - network_type: Network variant (regtest uses shorter halving interval) *)
 let create_coinbase ~(height : int) ~(total_fee : int64)
     ~(payout_script : Cstruct.t) ~(extra_nonce : Cstruct.t)
-    ~(witness_root : Types.hash256 option) : Types.transaction =
+    ~(witness_root : Types.hash256 option)
+    ?(network_type : Consensus.network = Consensus.Mainnet) () : Types.transaction =
 
-  let subsidy = Consensus.block_subsidy height in
+  let subsidy = Consensus.block_subsidy_for_network network_type height in
   let reward = Int64.add subsidy total_fee in
 
   (* Build coinbase scriptSig: height encoding + extra nonce *)
@@ -269,16 +272,17 @@ let create_block_template ~(chain : Sync.chain_state)
 
   (* Compute witness merkle root for SegWit commitment.
      We need to include the coinbase (with wtxid=0) and all selected txs. *)
+  let network_type = chain.network.network_type in
   let placeholder_coinbase =
     create_coinbase ~height ~total_fee ~payout_script ~extra_nonce
-      ~witness_root:None in
+      ~witness_root:None ~network_type () in
   let all_txs_for_witness = placeholder_coinbase :: selected_txs in
   let witness_root = compute_witness_merkle_root all_txs_for_witness in
 
   (* Create final coinbase with witness commitment *)
   let coinbase_tx =
     create_coinbase ~height ~total_fee ~payout_script ~extra_nonce
-      ~witness_root:(Some witness_root) in
+      ~witness_root:(Some witness_root) ~network_type () in
 
   (* Build final transaction list for merkle root *)
   let all_txs = coinbase_tx :: selected_txs in
@@ -376,6 +380,7 @@ let create_block_template ~(chain : Sync.chain_state)
     total_weight;
     height;
     target = Consensus.compact_to_target bits;
+    network_type;
   }
 
 (* ============================================================================
@@ -500,7 +505,7 @@ let template_to_json (template : block_template) : Yojson.Safe.t =
     ("coinbasevalue",
       `String (Int64.to_string
         (Int64.add
-          (Consensus.block_subsidy template.height)
+          (Consensus.block_subsidy_for_network template.network_type template.height)
           template.total_fee)));
     ("target",
       `String (Types.hash256_to_hex template.target));
@@ -534,7 +539,7 @@ let template_to_json_simple (template : block_template) : Yojson.Safe.t =
     ("coinbasevalue",
       `String (Int64.to_string
         (Int64.add
-          (Consensus.block_subsidy template.height)
+          (Consensus.block_subsidy_for_network template.network_type template.height)
           template.total_fee)));
     ("transactions", `Int (List.length template.transactions));
     ("total_fee", `String (Int64.to_string template.total_fee));

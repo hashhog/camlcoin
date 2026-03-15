@@ -352,14 +352,14 @@ let script_num_require_minimal (data : Cstruct.t) : bool =
   let len = Cstruct.length data in
   if len = 0 then true
   else if len > 4 then false
-  else if len >= 2 then
-    (* Check for non-minimal encoding *)
+  else if len = 1 then
+    let byte = Cstruct.get_uint8 data 0 in
+    (byte land 0x7f) <> 0
+  else
     let last = Cstruct.get_uint8 data (len - 1) in
     let second_last = Cstruct.get_uint8 data (len - 2) in
-    (* If last byte is 0x00 or 0x80, second-to-last should have high bit set *)
     if (last = 0x00 || last = 0x80) && (second_last land 0x80 = 0) then false
     else true
-  else true
 
 (* Decode script number from bytes (sign-magnitude little-endian) *)
 let script_num_of_bytes ?(require_minimal=false) ?(max_bytes=4) (data : Cstruct.t) : int64 =
@@ -453,7 +453,7 @@ let create_eval_state ~tx ~input_index ~amount ~flags ~sig_version
     if_stack = [];
     op_count = 0;
     codesep_pos = 0xFFFFFFFF;  (* Initialize to 0xFFFFFFFF per Bitcoin Core *)
-    current_op_idx = 0;
+    current_op_idx = -1;
     tx;
     input_index;
     amount;
@@ -758,7 +758,6 @@ let find_and_delete (script : Cstruct.t) (sig_data : Cstruct.t) : Cstruct.t * bo
   let sig_len = Cstruct.length sig_data in
   if sig_len = 0 then (script, false)
   else
-    (* Build the push encoding of the signature *)
     let push_encoded =
       let w = Serialize.writer_create () in
       serialize_opcode w (OP_PUSHDATA (Cstruct.length sig_data, sig_data));
@@ -770,14 +769,30 @@ let find_and_delete (script : Cstruct.t) (sig_data : Cstruct.t) : Cstruct.t * bo
     let removed = ref false in
     let i = ref 0 in
     while !i < script_len do
-      if !i + push_len <= script_len &&
+      let b = Cstruct.get_uint8 script !i in
+      let opcode_len =
+        if b >= 0x01 && b <= 0x4b then 1 + b
+        else if b = 0x4c then
+          if !i + 1 < script_len then 2 + Cstruct.get_uint8 script (!i + 1)
+          else 1
+        else if b = 0x4d then
+          if !i + 2 < script_len then 3 + Cstruct.LE.get_uint16 script (!i + 1)
+          else 1
+        else if b = 0x4e then
+          if !i + 4 < script_len then 5 + Int32.to_int (Cstruct.LE.get_uint32 script (!i + 1))
+          else 1
+        else 1
+      in
+      if opcode_len = push_len && !i + push_len <= script_len &&
          Cstruct.equal (Cstruct.sub script !i push_len) push_encoded then begin
-        (* Skip the signature *)
         removed := true;
         i := !i + push_len
       end else begin
-        Buffer.add_char result (Char.chr (Cstruct.get_uint8 script !i));
-        incr i
+        let safe_len = min opcode_len (script_len - !i) in
+        for j = 0 to safe_len - 1 do
+          Buffer.add_char result (Char.chr (Cstruct.get_uint8 script (!i + j)))
+        done;
+        i := !i + safe_len
       end
     done;
     (Cstruct.of_string (Buffer.contents result), !removed)
@@ -1097,6 +1112,7 @@ let build_p2pkh_script (hash : Types.hash160) : Cstruct.t =
 (* Check if an opcode is a push operation (doesn't count toward op limit) *)
 let is_push_opcode = function
   | OP_0 | OP_PUSHDATA (_, _) | OP_1NEGATE
+  | OP_RESERVED
   | OP_1 | OP_2 | OP_3 | OP_4 | OP_5 | OP_6 | OP_7 | OP_8
   | OP_9 | OP_10 | OP_11 | OP_12 | OP_13 | OP_14 | OP_15 | OP_16 -> true
   | _ -> false
@@ -1181,7 +1197,7 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
            Also enforce when the explicit flag is set for legacy scripts. *)
         let enforce_minimalif =
           st.sig_version = SigVersionTapscript ||
-          st.sig_version = SigVersionWitnessV0 ||
+          (st.sig_version = SigVersionWitnessV0 && st.flags land script_verify_minimalif <> 0) ||
           (st.flags land script_verify_minimalif <> 0)
         in
         if enforce_minimalif then begin
@@ -1224,6 +1240,9 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
     (* Disabled opcodes fail unconditionally, even in non-executing branches *)
     Error (Printf.sprintf "Disabled opcode 0x%02x" n)
 
+  | OP_VERIF | OP_VERNOTIF ->
+    Error "Disabled opcode"
+
   | OP_CODESEPARATOR when st.sig_version = SigVersionBase &&
                           st.flags land script_verify_const_scriptcode <> 0 ->
     (* CONST_SCRIPTCODE: OP_CODESEPARATOR rejected even in non-executing branches *)
@@ -1238,7 +1257,7 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
     stack_push st (Cstruct.create 0)
 
   | OP_PUSHDATA (opbyte, data) ->
-    if st.sig_version <> SigVersionTapscript && Cstruct.length data > max_script_element_size then
+    if Cstruct.length data > max_script_element_size then
       Error "Push data exceeds maximum size"
     else if st.flags land script_verify_minimaldata <> 0 then begin
       let dlen = Cstruct.length data in
@@ -1800,14 +1819,21 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
           if Cstruct.length pubkey = 0 then
             Error "Empty pubkey in tapscript OP_CHECKSIG"
           else if Cstruct.length pubkey <> 32 then begin
-            (* Unknown pubkey type: treat as success unless discouraged *)
             if st.flags land script_verify_discourage_upgradable_pubkeytype <> 0 then
               Error "Discouraged unknown public key type in tapscript"
-            else
-              stack_push st (bool_to_stack true)
+            else begin
+              let sig_nonempty = Cstruct.length sig_bytes > 0 in
+              if sig_nonempty then begin
+                st.sigops_budget <- st.sigops_budget - 50;
+                if st.sigops_budget < 0 then
+                  Error "Tapscript validation weight budget exceeded"
+                else
+                  stack_push st (bool_to_stack true)
+              end else
+                stack_push st (bool_to_stack false)
+            end
           end
           else if Cstruct.length sig_bytes = 0 then begin
-            (* Empty signature: push false, no sigops budget cost *)
             stack_push st (bool_to_stack false)
           end else begin
             st.sigops_budget <- st.sigops_budget - 50;
@@ -1848,22 +1874,18 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
             stack_push st (bool_to_stack false)
           else begin
             let sig_der = strip_hash_type sig_bytes in
-            (* DER strict encoding check *)
-            if st.flags land script_verify_dersig <> 0 &&
-               not (Crypto.is_valid_signature_encoding sig_der) then
+            if st.flags land (script_verify_dersig lor script_verify_low_s lor script_verify_strictenc) <> 0 &&
+               not (Crypto.is_valid_signature_encoding sig_bytes) then
               Error "Non-strict DER signature"
-            (* LOW_S check *)
             else if st.flags land script_verify_low_s <> 0 &&
                     not (Crypto.is_low_der_s sig_der) then
               Error "Non-low-S signature"
             else begin
               let hash_type = get_signature_hash_type sig_bytes in
-              (* STRICTENC hash type validation *)
               if st.flags land script_verify_strictenc <> 0 &&
                  not (is_defined_hash_type hash_type) then
                 Error "Invalid hash type"
               else begin
-                (* Compute effective scriptCode accounting for OP_CODESEPARATOR *)
                 let effective_script_code =
                   if st.codesep_pos <> 0xFFFFFFFF then
                     compute_subscript_from_pos script_code (st.codesep_pos + 1)
@@ -1910,11 +1932,19 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
           if Cstruct.length pubkey = 0 then
             Error "Empty pubkey in tapscript OP_CHECKSIGVERIFY"
           else if Cstruct.length pubkey <> 32 then begin
-            (* Unknown pubkey type: treat as success unless discouraged *)
             if st.flags land script_verify_discourage_upgradable_pubkeytype <> 0 then
               Error "Discouraged unknown public key type in tapscript"
-            else
-              Ok ()
+            else begin
+              let sig_nonempty = Cstruct.length sig_bytes > 0 in
+              if sig_nonempty then begin
+                st.sigops_budget <- st.sigops_budget - 50;
+                if st.sigops_budget < 0 then
+                  Error "Tapscript validation weight budget exceeded"
+                else
+                  Ok ()
+              end else
+                Error "OP_CHECKSIGVERIFY failed (empty sig in tapscript)"
+            end
           end
           else if Cstruct.length sig_bytes = 0 then
             Error "OP_CHECKSIGVERIFY failed (empty sig in tapscript)"
@@ -1955,20 +1985,18 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
             Error "OP_CHECKSIGVERIFY failed (empty sig)"
           else begin
             let sig_der = strip_hash_type sig_bytes in
-            if st.flags land script_verify_dersig <> 0 &&
-               not (Crypto.is_valid_signature_encoding sig_der) then
+            if st.flags land (script_verify_dersig lor script_verify_low_s lor script_verify_strictenc) <> 0 &&
+               not (Crypto.is_valid_signature_encoding sig_bytes) then
               Error "Non-strict DER signature"
             else if st.flags land script_verify_low_s <> 0 &&
                     not (Crypto.is_low_der_s sig_der) then
               Error "Non-low-S signature"
             else begin
               let hash_type = get_signature_hash_type sig_bytes in
-              (* STRICTENC hash type validation *)
               if st.flags land script_verify_strictenc <> 0 &&
                  not (is_defined_hash_type hash_type) then
                 Error "Invalid hash type"
               else begin
-                (* Compute effective scriptCode accounting for OP_CODESEPARATOR *)
                 let effective_script_code =
                   if st.codesep_pos <> 0xFFFFFFFF then
                     compute_subscript_from_pos script_code (st.codesep_pos + 1)
@@ -2031,17 +2059,6 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
           match pop_n n_pubkeys [] with
           | Error e -> Error e
           | Ok pubkeys ->
-            (* Check pubkey encoding for all pubkeys *)
-            let pk_check_err = ref None in
-            List.iter (fun pk ->
-              if !pk_check_err = None then
-                match check_pubkey_encoding pk st.flags st.sig_version with
-                | Error e -> pk_check_err := Some e
-                | Ok () -> ()
-            ) pubkeys;
-            begin match !pk_check_err with
-            | Some e -> Error e
-            | None ->
             begin match stack_pop st with
             | Error e -> Error e
             | Ok m_bytes ->
@@ -2067,8 +2084,8 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                       List.iter (fun sig_bytes ->
                         if Cstruct.length sig_bytes > 0 && !sig_check_err = None then begin
                           let sig_der = strip_hash_type sig_bytes in
-                          if st.flags land script_verify_dersig <> 0 &&
-                             not (Crypto.is_valid_signature_encoding sig_der) then
+                          if st.flags land (script_verify_dersig lor script_verify_low_s lor script_verify_strictenc) <> 0 &&
+                             not (Crypto.is_valid_signature_encoding sig_bytes) then
                             sig_check_err := Some "Non-strict DER signature"
                           else if st.flags land script_verify_low_s <> 0 &&
                                   not (Crypto.is_low_der_s sig_der) then
@@ -2089,25 +2106,31 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                           compute_subscript_from_pos script_code (st.codesep_pos + 1)
                         else script_code
                       in
-                      (* Pre-clean scriptCode by removing ALL signatures (FindAndDelete) *)
-                      let any_removed = ref false in
-                      let cleaned_script = List.fold_left (fun sc sig_bytes ->
-                        if Cstruct.length sig_bytes > 0 then begin
-                          let (result, removed) = find_and_delete sc sig_bytes in
-                          if removed then any_removed := true;
-                          result
-                        end else sc
-                      ) effective_script_code sigs in
-                      if !any_removed && st.sig_version = SigVersionBase &&
-                         st.flags land script_verify_const_scriptcode <> 0 then
-                        Error "CONST_SCRIPTCODE: find_and_delete modified scriptCode"
-                      else
-                      (* Verify signatures in order *)
+                      let cleaned_script =
+                        if st.sig_version = SigVersionBase then begin
+                          let any_removed = ref false in
+                          let result = List.fold_left (fun sc sig_bytes ->
+                            if Cstruct.length sig_bytes > 0 then begin
+                              let (result, removed) = find_and_delete sc sig_bytes in
+                              if removed then any_removed := true;
+                              result
+                            end else sc
+                          ) effective_script_code sigs in
+                          if !any_removed && st.flags land script_verify_const_scriptcode <> 0 then
+                            None
+                          else
+                            Some result
+                        end else
+                          Some effective_script_code
+                      in
+                      match cleaned_script with
+                      | None -> Error "CONST_SCRIPTCODE: find_and_delete modified scriptCode"
+                      | Some cleaned_script ->
                       let rec verify_sigs sigs pubkeys success =
                         match sigs with
-                        | [] -> success
+                        | [] -> Ok success
                         | sig_bytes :: rest_sigs ->
-                          if Cstruct.length sig_bytes = 0 then false
+                          if Cstruct.length sig_bytes = 0 then Ok false
                           else begin
                             let hash_type = get_signature_hash_type sig_bytes in
                             let sig_der = strip_hash_type sig_bytes in
@@ -2119,10 +2142,12 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                               | SigVersionTaproot | SigVersionTapscript ->
                                 compute_sighash_segwit st.tx st.input_index cleaned_script st.amount hash_type
                             in
-                            (* Try each remaining pubkey *)
                             let rec try_pubkeys = function
-                              | [] -> false  (* No more pubkeys *)
+                              | [] -> Ok false
                               | pk :: rest_pks ->
+                                match check_pubkey_encoding pk st.flags st.sig_version with
+                                | Error e -> Error e
+                                | Ok () ->
                                 if Crypto.verify pk sighash sig_der then
                                   verify_sigs rest_sigs rest_pks true
                                 else
@@ -2131,8 +2156,10 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                             try_pubkeys pubkeys
                           end
                       in
-                      let success = m_sigs = 0 || verify_sigs sigs pubkeys true in
-                      (* NULLFAIL: if verification failed, all signatures must be empty *)
+                      let result = if m_sigs = 0 then Ok true else verify_sigs sigs pubkeys true in
+                      match result with
+                      | Error e -> Error e
+                      | Ok success ->
                       if (not success) &&
                          (st.flags land script_verify_nullfail <> 0) &&
                          List.exists (fun s -> Cstruct.length s > 0) sigs then
@@ -2144,7 +2171,6 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                     end
                   end
               end
-            end
             end
         end
       end
@@ -2165,7 +2191,7 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
           if locktime < 0L then
             Error "Negative locktime"
           else begin
-            let tx_locktime = Int64.of_int32 (Int32.logand st.tx.locktime 0xFFFFFFFFl) in
+            let tx_locktime = Int64.logand (Int64.of_int32 st.tx.locktime) 0xFFFFFFFFL in
             (* Check same type (blocks vs time) *)
             let both_blocks = locktime < 500000000L && tx_locktime < 500000000L in
             let both_time = locktime >= 500000000L && tx_locktime >= 500000000L in
@@ -2253,18 +2279,24 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
             if Cstruct.length pubkey = 0 then
               Error "Empty pubkey in tapscript OP_CHECKSIGADD"
             else if Cstruct.length pubkey <> 32 then begin
-              (* Unknown pubkey type: treat as success unless discouraged *)
               if st.flags land script_verify_discourage_upgradable_pubkeytype <> 0 then
                 Error "Discouraged unknown public key type in tapscript"
               else begin
                 let n = script_num_of_bytes n_bytes in
-                stack_push st (bytes_of_script_num (Int64.add n 1L))
+                let sig_nonempty = Cstruct.length sig_bytes > 0 in
+                if sig_nonempty then begin
+                  st.sigops_budget <- st.sigops_budget - 50;
+                  if st.sigops_budget < 0 then
+                    Error "Tapscript validation weight budget exceeded"
+                  else
+                    stack_push st (bytes_of_script_num (Int64.add n 1L))
+                end else
+                  stack_push st (bytes_of_script_num n)
               end
             end
             else begin
               let n = script_num_of_bytes n_bytes in
               if Cstruct.length sig_bytes = 0 then
-                (* Empty signature: push n unchanged, no sigops budget cost *)
                 stack_push st (bytes_of_script_num n)
               else begin
                 st.sigops_budget <- st.sigops_budget - 50;
@@ -2310,9 +2342,6 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
   (* Reserved/Invalid *)
   | OP_RESERVED | OP_VER | OP_RESERVED1 | OP_RESERVED2 ->
     Error "Reserved opcode"
-
-  | OP_VERIF | OP_VERNOTIF ->
-    Error "Disabled opcode"
 
   | OP_INVALID n ->
     Error (Printf.sprintf "Invalid opcode 0x%02x" n)
@@ -2410,14 +2439,13 @@ let eval_script (st : eval_state) (script : Cstruct.t) : (unit, string) result =
    ============================================================================ *)
 
 (* Check that all witness items are within the maximum element size limit.
-   BIP-342: tapscript removes the 520-byte witness item size restriction. *)
-let check_witness_item_sizes ~sig_version (witness : Types.tx_witness) : (unit, string) result =
-  match sig_version with
-  | SigVersionTapscript -> Ok ()
-  | _ ->
-    if List.exists (fun item -> Cstruct.length item > max_script_element_size) witness.items then
-      Error "Witness item exceeds maximum element size"
-    else Ok ()
+   Per Bitcoin Core: the 520-byte limit on initial witness stack items applies
+   to ALL witness versions including tapscript. BIP-342 only relaxes the limit
+   on push opcodes during script execution, not on initial witness items. *)
+let check_witness_item_sizes ~sig_version:_ (witness : Types.tx_witness) : (unit, string) result =
+  if List.exists (fun item -> Cstruct.length item > max_script_element_size) witness.items then
+    Error "Witness item exceeds maximum element size"
+  else Ok ()
 
 (* Helper: check stack top for final script result *)
 let check_stack_top (st : eval_state) : (bool, string) result =
@@ -2448,8 +2476,15 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
     Error "scriptSig contains non-push opcode"
   else
 
-  (* Check for unknown witness programs (v2-v16) -- succeed unconditionally *)
   match get_witness_program script_pubkey with
+  | Some (1, program) when Cstruct.length program <> 32 && not (is_p2a script_pubkey) &&
+                           flags land script_verify_witness <> 0 ->
+    if Cstruct.length script_sig > 0 then
+      Error "scriptSig must be empty for witness program"
+    else if flags land script_verify_discourage_upgradable_witness <> 0 then
+      Error "Upgradable witness program used"
+    else
+      Ok true
   | Some (v, _program) when v >= 2 && v <= 16 ->
     if flags land script_verify_witness <> 0 then begin
       (* Native segwit: scriptSig must be empty *)
@@ -2567,41 +2602,82 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
             if not (Cstruct.equal redeem_hash hash) then
               Ok false
             else begin
-              (* Check for P2SH-wrapped witness program *)
               match get_witness_program redeem_script with
               | Some (0, program) when Cstruct.length program = 20 ->
-                (* P2SH-P2WPKH *)
                 if flags land script_verify_witness = 0 then
                   Error "Witness program in non-witness mode"
                 else begin
-                  match check_witness_item_sizes ~sig_version:SigVersionWitnessV0 witness with
-                  | Error e -> Error e
-                  | Ok () ->
-                  let wit_items = witness.Types.items in
-                  if List.length wit_items <> 2 then
-                    Error "P2WPKH requires exactly 2 witness items"
+                  let rs_len = Cstruct.length redeem_script in
+                  let expected_sig = Cstruct.create (1 + rs_len) in
+                  Cstruct.set_uint8 expected_sig 0 rs_len;
+                  Cstruct.blit redeem_script 0 expected_sig 1 rs_len;
+                  if not (Cstruct.equal script_sig expected_sig) then
+                    Error "WITNESS_MALLEATED: scriptSig is not a single push of redeemScript"
                   else begin
-                    let wit_sig = List.nth wit_items 0 in
-                    let wit_pubkey = List.nth wit_items 1 in
-                    (* WITNESS_PUBKEYTYPE: require compressed pubkey (33 bytes, 0x02/0x03 prefix) *)
-                    if flags land script_verify_witness_pubkeytype <> 0 &&
-                       not (is_compressed_pubkey wit_pubkey) then
-                      Error "Witness v0 requires compressed public key"
+                    match check_witness_item_sizes ~sig_version:SigVersionWitnessV0 witness with
+                    | Error e -> Error e
+                    | Ok () ->
+                    let wit_items = witness.Types.items in
+                    if List.length wit_items <> 2 then
+                      Error "P2WPKH requires exactly 2 witness items"
                     else begin
-                      (* Verify pubkey hashes to program *)
-                      let pubkey_hash = Crypto.hash160 wit_pubkey in
-                      if not (Cstruct.equal pubkey_hash program) then
+                      let wit_sig = List.nth wit_items 0 in
+                      let wit_pubkey = List.nth wit_items 1 in
+                      if flags land script_verify_witness_pubkeytype <> 0 &&
+                         not (is_compressed_pubkey wit_pubkey) then
+                        Error "Witness v0 requires compressed public key"
+                      else begin
+                        let pubkey_hash = Crypto.hash160 wit_pubkey in
+                        if not (Cstruct.equal pubkey_hash program) then
+                          Ok false
+                        else begin
+                          let implicit_script = build_p2pkh_script program in
+                          let st2 = create_eval_state ~tx ~input_index ~amount ~flags
+                                      ~sig_version:SigVersionWitnessV0 () in
+                          st2.stack <- [wit_sig; wit_pubkey];
+                          begin match run_script st2 implicit_script with
+                          | Error e -> Error e
+                          | Ok () ->
+                            if stack_size st2 <> 1 then
+                              Error "Cleanstack"
+                            else
+                              check_stack_top st2
+                          end
+                        end
+                      end
+                    end
+                  end
+                end
+              | Some (0, program) when Cstruct.length program = 32 ->
+                if flags land script_verify_witness = 0 then
+                  Error "Witness program in non-witness mode"
+                else begin
+                  let rs_len = Cstruct.length redeem_script in
+                  let expected_sig = Cstruct.create (1 + rs_len) in
+                  Cstruct.set_uint8 expected_sig 0 rs_len;
+                  Cstruct.blit redeem_script 0 expected_sig 1 rs_len;
+                  if not (Cstruct.equal script_sig expected_sig) then
+                    Error "WITNESS_MALLEATED: scriptSig is not a single push of redeemScript"
+                  else begin
+                    match check_witness_item_sizes ~sig_version:SigVersionWitnessV0 witness with
+                    | Error e -> Error e
+                    | Ok () ->
+                    let wit_items = witness.Types.items in
+                    if List.length wit_items = 0 then
+                      Error "Empty witness for P2WSH"
+                    else begin
+                      let witness_script = List.nth wit_items (List.length wit_items - 1) in
+                      let script_hash = Crypto.sha256 witness_script in
+                      if not (Cstruct.equal script_hash program) then
                         Ok false
                       else begin
-                        (* Build implicit P2PKH script and run *)
-                        let implicit_script = build_p2pkh_script program in
+                        let wit_stack = List.rev (List.filteri (fun i _ -> i < List.length wit_items - 1) wit_items) in
                         let st2 = create_eval_state ~tx ~input_index ~amount ~flags
                                     ~sig_version:SigVersionWitnessV0 () in
-                        st2.stack <- [wit_sig; wit_pubkey];
-                        begin match run_script st2 implicit_script with
+                        st2.stack <- wit_stack;
+                        begin match run_script st2 witness_script with
                         | Error e -> Error e
                         | Ok () ->
-                          (* Witness scripts implicitly require cleanstack - unconditional *)
                           if stack_size st2 <> 1 then
                             Error "Cleanstack"
                           else
@@ -2611,48 +2687,23 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                     end
                   end
                 end
-              | Some (0, program) when Cstruct.length program = 32 ->
-                (* P2SH-P2WSH *)
-                if flags land script_verify_witness = 0 then
-                  Error "Witness program in non-witness mode"
-                else begin
-                  match check_witness_item_sizes ~sig_version:SigVersionWitnessV0 witness with
-                  | Error e -> Error e
-                  | Ok () ->
-                  let wit_items = witness.Types.items in
-                  if List.length wit_items = 0 then
-                    Error "Empty witness for P2WSH"
-                  else begin
-                    (* Last witness item is the witness script *)
-                    let witness_script = List.nth wit_items (List.length wit_items - 1) in
-                    let script_hash = Crypto.sha256 witness_script in
-                    if not (Cstruct.equal script_hash program) then
-                      Ok false
-                    else begin
-                      (* Initialize stack with witness items (reversed per PITFALL) *)
-                      let wit_stack = List.rev (List.filteri (fun i _ -> i < List.length wit_items - 1) wit_items) in
-                      let st2 = create_eval_state ~tx ~input_index ~amount ~flags
-                                  ~sig_version:SigVersionWitnessV0 () in
-                      st2.stack <- wit_stack;
-                      begin match run_script st2 witness_script with
-                      | Error e -> Error e
-                      | Ok () ->
-                        (* Witness scripts implicitly require cleanstack - unconditional *)
-                        if stack_size st2 <> 1 then
-                          Error "Cleanstack"
-                        else
-                          check_stack_top st2
-                      end
-                    end
-                  end
-                end
               | Some (0, _) when flags land script_verify_witness <> 0 ->
-                (* P2SH-wrapped witness v0 with wrong program length *)
-                Error "Witness v0 program must be exactly 20 or 32 bytes"
+                let rs_len = Cstruct.length redeem_script in
+                let expected_sig = Cstruct.create (1 + rs_len) in
+                Cstruct.set_uint8 expected_sig 0 rs_len;
+                Cstruct.blit redeem_script 0 expected_sig 1 rs_len;
+                if not (Cstruct.equal script_sig expected_sig) then
+                  Error "WITNESS_MALLEATED: scriptSig is not a single push of redeemScript"
+                else
+                  Error "Witness v0 program must be exactly 20 or 32 bytes"
               | Some (v, _) when v >= 1 && flags land script_verify_witness <> 0 ->
-                (* P2SH-wrapped witness v1+: not executed as taproot per BIP-341.
-                   Succeeds unconditionally unless discourage flag is set. *)
-                if flags land script_verify_discourage_upgradable_witness <> 0 then
+                let rs_len = Cstruct.length redeem_script in
+                let expected_sig = Cstruct.create (1 + rs_len) in
+                Cstruct.set_uint8 expected_sig 0 rs_len;
+                Cstruct.blit redeem_script 0 expected_sig 1 rs_len;
+                if not (Cstruct.equal script_sig expected_sig) then
+                  Error "WITNESS_MALLEATED: scriptSig is not a single push of redeemScript"
+                else if flags land script_verify_discourage_upgradable_witness <> 0 then
                   Error "Upgradable witness program in P2SH"
                 else
                   Ok true

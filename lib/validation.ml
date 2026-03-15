@@ -263,6 +263,45 @@ let check_coinbase ~network:(network : Consensus.network_config) (tx : Types.tra
   end
 
 (* ============================================================================
+   Script Verification Flags by Height
+   ============================================================================ *)
+
+(** Get the consensus script verification flags for a given block height.
+    This matches Bitcoin Core's GetBlockScriptFlags() in validation.cpp.
+    IMPORTANT: Only consensus flags are included. Policy flags (CLEANSTACK,
+    SIGPUSHONLY, LOW_S, etc.) must NOT be added here. *)
+let get_script_flags_for_height ~(network : Consensus.network_config) (height : int) : int =
+  let flags = ref 0 in
+
+  (* BIP16: P2SH (activated at different heights per network) *)
+  if height >= 1 then  (* P2SH is active from genesis in practice *)
+    flags := !flags lor Script.script_verify_p2sh;
+
+  (* BIP66: Strict DER signatures *)
+  if height >= network.bip66_height then
+    flags := !flags lor Script.script_verify_dersig;
+
+  (* BIP65: OP_CHECKLOCKTIMEVERIFY *)
+  if height >= network.bip65_height then
+    flags := !flags lor Script.script_verify_checklocktimeverify;
+
+  (* BIP68/112/113: Relative lock-time (CSV) *)
+  if height >= network.csv_height then
+    flags := !flags lor Script.script_verify_checksequenceverify;
+
+  (* BIP141/143: SegWit + NULLDUMMY *)
+  if height >= network.segwit_height then begin
+    flags := !flags lor Script.script_verify_witness;
+    flags := !flags lor Script.script_verify_nulldummy
+  end;
+
+  (* BIP341/342: Taproot *)
+  if height >= network.taproot_height then
+    flags := !flags lor Script.script_verify_taproot;
+
+  !flags
+
+(* ============================================================================
    Signature Operation Counting
    ============================================================================ *)
 

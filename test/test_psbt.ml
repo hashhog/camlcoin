@@ -592,6 +592,247 @@ let test_finalize_taproot () =
     | Some wit -> Alcotest.(check int) "one witness item" 1 (List.length wit)
 
 (* ============================================================================
+   Multi-Party Signing Tests
+   ============================================================================ *)
+
+(* Simulate a 2-of-3 multisig scenario *)
+let test_multi_party_combine () =
+  let tx : Types.transaction = {
+    version = 2l;
+    inputs = [{
+      previous_output = {
+        txid = hex_to_cstruct "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        vout = 0l;
+      };
+      script_sig = Cstruct.empty;
+      sequence = 0xFFFFFFFEl;
+    }];
+    outputs = [{
+      value = 99000L;
+      script_pubkey = hex_to_cstruct "0014aabbccdd00112233445566778899aabbccddeeff";
+    }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+
+  (* Party A creates PSBT and adds their signature *)
+  let psbt_a = Psbt.create tx in
+  let utxo : Types.tx_out = { value = 100000L; script_pubkey = hex_to_cstruct "0020ffeeddcc" } in
+  let psbt_a = Psbt.add_witness_utxo psbt_a 0 utxo in
+  let sig_a : Psbt.partial_sig = {
+    pubkey = hex_to_cstruct ("02" ^ String.make 64 'a');
+    signature = hex_to_cstruct ("3044" ^ String.make 140 'a' ^ "01");
+  } in
+  let psbt_a = Psbt.add_partial_sig psbt_a 0 sig_a in
+
+  (* Party B receives PSBT (via base64), adds their signature *)
+  let b64 = Psbt.to_base64 psbt_a in
+  let psbt_b = match Psbt.of_base64 b64 with Ok p -> p | Error _ -> Alcotest.fail "decode failed" in
+  let sig_b : Psbt.partial_sig = {
+    pubkey = hex_to_cstruct ("03" ^ String.make 64 'b');
+    signature = hex_to_cstruct ("3045" ^ String.make 142 'b' ^ "01");
+  } in
+  let psbt_b = Psbt.add_partial_sig psbt_b 0 sig_b in
+
+  (* Combine PSBTs *)
+  match Psbt.combine psbt_a psbt_b with
+  | Error e -> Alcotest.fail ("combine failed: " ^ e)
+  | Ok combined ->
+    let inp = List.hd combined.inputs in
+    Alcotest.(check int) "two signatures" 2 (List.length inp.partial_sigs);
+    Alcotest.(check bool) "has utxo" true (Option.is_some inp.witness_utxo)
+
+(* Test 3-party signing flow *)
+let test_three_party_signing () =
+  let tx : Types.transaction = {
+    version = 2l;
+    inputs = [{
+      previous_output = {
+        txid = hex_to_cstruct "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+        vout = 1l;
+      };
+      script_sig = Cstruct.empty;
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [
+      { value = 50000L; script_pubkey = hex_to_cstruct "00140000000000000000000000000000000000000001" };
+      { value = 49000L; script_pubkey = hex_to_cstruct "00140000000000000000000000000000000000000002" };
+    ];
+    witnesses = [];
+    locktime = 0l;
+  } in
+
+  (* Party 1 creates base PSBT *)
+  let psbt1 = Psbt.create tx in
+  let utxo : Types.tx_out = { value = 100000L; script_pubkey = Cstruct.concat [hex_to_cstruct "0020"; Cstruct.create 32] } in
+  let psbt1 = Psbt.add_witness_utxo psbt1 0 utxo in
+  let deriv1 : Psbt.bip32_derivation = {
+    pubkey = hex_to_cstruct ("02" ^ String.make 64 '1');
+    origin = { fingerprint = 0x11111111l; path = [0x80000054l; 0l; 0l] };
+  } in
+  let psbt1 = Psbt.add_input_derivation psbt1 0 deriv1 in
+
+  (* Serialize and send to party 2 *)
+  let b64_1 = Psbt.to_base64 psbt1 in
+
+  (* Party 2 receives, adds sig *)
+  let psbt2 = match Psbt.of_base64 b64_1 with Ok p -> p | Error _ -> Alcotest.fail "decode failed" in
+  let sig2 : Psbt.partial_sig = {
+    pubkey = hex_to_cstruct ("02" ^ String.make 64 '2');
+    signature = hex_to_cstruct ("3044" ^ String.make 140 '2' ^ "01");
+  } in
+  let psbt2 = Psbt.add_partial_sig psbt2 0 sig2 in
+
+  (* Send to party 3 *)
+  let b64_2 = Psbt.to_base64 psbt2 in
+
+  (* Party 3 receives, adds sig *)
+  let psbt3 = match Psbt.of_base64 b64_2 with Ok p -> p | Error _ -> Alcotest.fail "decode failed" in
+  let sig3 : Psbt.partial_sig = {
+    pubkey = hex_to_cstruct ("03" ^ String.make 64 '3');
+    signature = hex_to_cstruct ("3045" ^ String.make 142 '3' ^ "01");
+  } in
+  let psbt3 = Psbt.add_partial_sig psbt3 0 sig3 in
+
+  (* Verify accumulated state *)
+  let inp = List.hd psbt3.inputs in
+  Alcotest.(check int) "two signatures" 2 (List.length inp.partial_sigs);
+  Alcotest.(check int) "one derivation" 1 (List.length inp.bip32_derivations);
+  Alcotest.(check bool) "has utxo" true (Option.is_some inp.witness_utxo)
+
+(* Test parallel signing then combine *)
+let test_parallel_signing_combine () =
+  let tx : Types.transaction = {
+    version = 2l;
+    inputs = [
+      {
+        previous_output = {
+          txid = hex_to_cstruct "1111111111111111111111111111111111111111111111111111111111111111";
+          vout = 0l;
+        };
+        script_sig = Cstruct.empty;
+        sequence = 0xFFFFFFFFl;
+      };
+      {
+        previous_output = {
+          txid = hex_to_cstruct "2222222222222222222222222222222222222222222222222222222222222222";
+          vout = 0l;
+        };
+        script_sig = Cstruct.empty;
+        sequence = 0xFFFFFFFFl;
+      };
+    ];
+    outputs = [{ value = 100000L; script_pubkey = Cstruct.concat [hex_to_cstruct "0014"; Cstruct.create 20] }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+
+  (* Creator makes base PSBT *)
+  let base_psbt = Psbt.create tx in
+  let b64_base = Psbt.to_base64 base_psbt in
+
+  (* Signer A signs input 0 *)
+  let psbt_a = match Psbt.of_base64 b64_base with Ok p -> p | Error _ -> Alcotest.fail "decode failed" in
+  let utxo_a : Types.tx_out = { value = 60000L; script_pubkey = hex_to_cstruct "0014aaaa" } in
+  let psbt_a = Psbt.add_witness_utxo psbt_a 0 utxo_a in
+  let sig_a : Psbt.partial_sig = {
+    pubkey = hex_to_cstruct ("02" ^ String.make 64 'a');
+    signature = hex_to_cstruct ("3044" ^ String.make 140 'a' ^ "01");
+  } in
+  let psbt_a = Psbt.add_partial_sig psbt_a 0 sig_a in
+
+  (* Signer B signs input 1 *)
+  let psbt_b = match Psbt.of_base64 b64_base with Ok p -> p | Error _ -> Alcotest.fail "decode failed" in
+  let utxo_b : Types.tx_out = { value = 50000L; script_pubkey = hex_to_cstruct "0014bbbb" } in
+  let psbt_b = Psbt.add_witness_utxo psbt_b 1 utxo_b in
+  let sig_b : Psbt.partial_sig = {
+    pubkey = hex_to_cstruct ("03" ^ String.make 64 'b');
+    signature = hex_to_cstruct ("3045" ^ String.make 142 'b' ^ "01");
+  } in
+  let psbt_b = Psbt.add_partial_sig psbt_b 1 sig_b in
+
+  (* Combine both *)
+  match Psbt.combine psbt_a psbt_b with
+  | Error e -> Alcotest.fail ("combine failed: " ^ e)
+  | Ok combined ->
+    let inp0 = List.hd combined.inputs in
+    let inp1 = List.nth combined.inputs 1 in
+    Alcotest.(check int) "input 0 has sig" 1 (List.length inp0.partial_sigs);
+    Alcotest.(check int) "input 1 has sig" 1 (List.length inp1.partial_sigs);
+    Alcotest.(check bool) "input 0 has utxo" true (Option.is_some inp0.witness_utxo);
+    Alcotest.(check bool) "input 1 has utxo" true (Option.is_some inp1.witness_utxo)
+
+(* Test duplicate signature handling in combine *)
+let test_combine_dedup_sigs () =
+  let tx : Types.transaction = {
+    version = 2l;
+    inputs = [{
+      previous_output = {
+        txid = hex_to_cstruct "3333333333333333333333333333333333333333333333333333333333333333";
+        vout = 0l;
+      };
+      script_sig = Cstruct.empty;
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [{ value = 50000L; script_pubkey = hex_to_cstruct "0014" }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+
+  let same_pubkey = hex_to_cstruct ("02" ^ String.make 64 'a') in
+  let sig1 = hex_to_cstruct ("3044" ^ String.make 140 '1' ^ "01") in
+
+  (* Both PSBTs have signature from same pubkey *)
+  let psbt1 = Psbt.create tx in
+  let psbt1 = Psbt.add_partial_sig psbt1 0 { pubkey = same_pubkey; signature = sig1 } in
+
+  let psbt2 = Psbt.create tx in
+  let psbt2 = Psbt.add_partial_sig psbt2 0 { pubkey = same_pubkey; signature = sig1 } in
+
+  match Psbt.combine psbt1 psbt2 with
+  | Error e -> Alcotest.fail ("combine failed: " ^ e)
+  | Ok combined ->
+    let inp = List.hd combined.inputs in
+    (* Should deduplicate to one sig *)
+    Alcotest.(check int) "deduplicated to one sig" 1 (List.length inp.partial_sigs)
+
+(* Test fee calculation across multiple inputs *)
+let test_multi_input_fee () =
+  let tx : Types.transaction = {
+    version = 2l;
+    inputs = [
+      {
+        previous_output = { txid = hex_to_cstruct (String.make 64 '1'); vout = 0l };
+        script_sig = Cstruct.empty;
+        sequence = 0xFFFFFFFFl;
+      };
+      {
+        previous_output = { txid = hex_to_cstruct (String.make 64 '2'); vout = 0l };
+        script_sig = Cstruct.empty;
+        sequence = 0xFFFFFFFFl;
+      };
+    ];
+    outputs = [
+      { value = 80000L; script_pubkey = hex_to_cstruct "0014" };
+      { value = 10000L; script_pubkey = hex_to_cstruct "0014" };
+    ];
+    witnesses = [];
+    locktime = 0l;
+  } in
+
+  let psbt = Psbt.create tx in
+  let utxo1 : Types.tx_out = { value = 50000L; script_pubkey = hex_to_cstruct "0014" } in
+  let utxo2 : Types.tx_out = { value = 50000L; script_pubkey = hex_to_cstruct "0014" } in
+  let psbt = Psbt.add_witness_utxo psbt 0 utxo1 in
+  let psbt = Psbt.add_witness_utxo psbt 1 utxo2 in
+
+  match Psbt.get_fee psbt with
+  | None -> Alcotest.fail "should calculate fee"
+  | Some fee ->
+    (* Input: 50000 + 50000 = 100000, Output: 80000 + 10000 = 90000, Fee = 10000 *)
+    Alcotest.(check int64) "fee calculation" 10000L fee
+
+(* ============================================================================
    QCheck Property Tests
    ============================================================================ *)
 
@@ -703,6 +944,13 @@ let () =
     "taproot", [
       test_case "taproot key sig" `Quick test_taproot_key_sig;
       test_case "finalize taproot" `Quick test_finalize_taproot;
+    ];
+    "multi_party", [
+      test_case "two party combine" `Quick test_multi_party_combine;
+      test_case "three party signing" `Quick test_three_party_signing;
+      test_case "parallel signing combine" `Quick test_parallel_signing_combine;
+      test_case "combine dedup sigs" `Quick test_combine_dedup_sigs;
+      test_case "multi input fee" `Quick test_multi_input_fee;
     ];
     "property", [
       QCheck_alcotest.to_alcotest qcheck_serialize_roundtrip;

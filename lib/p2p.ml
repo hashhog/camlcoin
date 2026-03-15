@@ -2035,3 +2035,801 @@ let v2_get_session_id (state : v2_state) : Cstruct.t option =
   match state.cipher with
   | None -> None
   | Some cipher -> Some cipher.session_id
+
+(* ============================================================================
+   SOCKS5 Proxy Client (RFC 1928)
+
+   Implements SOCKS5 handshake for connecting through proxies like Tor.
+   Reference: Bitcoin Core netbase.cpp Socks5(), ConnectThroughProxy()
+   ============================================================================ *)
+
+module Socks5 = struct
+  (* SOCKS5 constants *)
+  let version = 0x05
+  let auth_none = 0x00
+  let auth_username_password = 0x02
+  let auth_no_acceptable = 0xFF
+  let cmd_connect = 0x01
+  let atyp_ipv4 = 0x01
+  let atyp_domain = 0x03
+  let atyp_ipv6 = 0x04
+
+  (* SOCKS5 reply codes *)
+  type reply_code =
+    | Succeeded
+    | GeneralFailure
+    | NotAllowed
+    | NetworkUnreachable
+    | HostUnreachable
+    | ConnectionRefused
+    | TtlExpired
+    | CommandNotSupported
+    | AddressTypeNotSupported
+    (* Tor-specific error codes *)
+    | TorOnionNotFound        (* 0xF0 *)
+    | TorOnionInvalid         (* 0xF1 *)
+    | TorIntroFailed          (* 0xF2 *)
+    | TorRendFailed           (* 0xF3 *)
+    | TorMissingAuth          (* 0xF4 *)
+    | TorWrongAuth            (* 0xF5 *)
+    | TorBadAddress           (* 0xF6 *)
+    | TorIntroTimeout         (* 0xF7 *)
+    | UnknownError of int
+
+  let reply_code_of_int = function
+    | 0x00 -> Succeeded
+    | 0x01 -> GeneralFailure
+    | 0x02 -> NotAllowed
+    | 0x03 -> NetworkUnreachable
+    | 0x04 -> HostUnreachable
+    | 0x05 -> ConnectionRefused
+    | 0x06 -> TtlExpired
+    | 0x07 -> CommandNotSupported
+    | 0x08 -> AddressTypeNotSupported
+    | 0xF0 -> TorOnionNotFound
+    | 0xF1 -> TorOnionInvalid
+    | 0xF2 -> TorIntroFailed
+    | 0xF3 -> TorRendFailed
+    | 0xF4 -> TorMissingAuth
+    | 0xF5 -> TorWrongAuth
+    | 0xF6 -> TorBadAddress
+    | 0xF7 -> TorIntroTimeout
+    | n -> UnknownError n
+
+  let reply_code_to_string = function
+    | Succeeded -> "succeeded"
+    | GeneralFailure -> "general failure"
+    | NotAllowed -> "connection not allowed"
+    | NetworkUnreachable -> "network unreachable"
+    | HostUnreachable -> "host unreachable"
+    | ConnectionRefused -> "connection refused"
+    | TtlExpired -> "TTL expired"
+    | CommandNotSupported -> "command not supported"
+    | AddressTypeNotSupported -> "address type not supported"
+    | TorOnionNotFound -> "onion service descriptor not found"
+    | TorOnionInvalid -> "onion service descriptor invalid"
+    | TorIntroFailed -> "onion service introduction failed"
+    | TorRendFailed -> "onion service rendezvous failed"
+    | TorMissingAuth -> "onion service missing client authorization"
+    | TorWrongAuth -> "onion service wrong client authorization"
+    | TorBadAddress -> "onion service invalid address"
+    | TorIntroTimeout -> "onion service introduction timed out"
+    | UnknownError n -> Printf.sprintf "unknown error (0x%02x)" n
+
+  (* Proxy credentials for Tor stream isolation *)
+  type credentials = {
+    username : string;
+    password : string;
+  }
+
+  (* SOCKS5 connection result *)
+  type connect_result =
+    | Connected of Lwt_unix.file_descr
+    | ProxyError of string
+    | TargetError of reply_code
+
+  (* SOCKS5 receive timeout (Tor can be slow) *)
+  let recv_timeout = 60.0  (* 60 seconds *)
+
+  (* Read exactly n bytes with timeout *)
+  let read_exact_timeout (ic : Lwt_io.input_channel) (n : int) : bytes option Lwt.t =
+    let open Lwt.Syntax in
+    let buf = Bytes.create n in
+    let read_task =
+      let* () = Lwt_io.read_into_exactly ic buf 0 n in
+      Lwt.return (Some buf)
+    in
+    let timeout_task =
+      let* () = Lwt_unix.sleep recv_timeout in
+      Lwt.return None
+    in
+    Lwt.pick [read_task; timeout_task]
+
+  (* Connect through a SOCKS5 proxy.
+     This establishes a connection to the proxy, performs the SOCKS5 handshake,
+     and returns an fd connected to the target through the proxy.
+
+     For .onion addresses, the hostname is passed through SOCKS5 and DNS
+     resolution happens on the Tor side. *)
+  let connect ~(proxy_addr : string) ~(proxy_port : int)
+      ?(credentials : credentials option) ~(target_host : string)
+      ~(target_port : int) () : connect_result Lwt.t =
+    let open Lwt.Syntax in
+
+    (* Validate hostname length (SOCKS5 limit is 255 bytes) *)
+    if String.length target_host > 255 then
+      Lwt.return (ProxyError "hostname too long (max 255 bytes)")
+    else begin
+      (* Resolve proxy address and connect *)
+      let* addresses =
+        Lwt.catch
+          (fun () -> Lwt_unix.getaddrinfo proxy_addr (string_of_int proxy_port)
+              [Unix.AI_SOCKTYPE Unix.SOCK_STREAM])
+          (fun _ -> Lwt.return [])
+      in
+      match addresses with
+      | [] -> Lwt.return (ProxyError (Printf.sprintf "cannot resolve proxy: %s" proxy_addr))
+      | ai :: _ ->
+        let fd = Lwt_unix.socket ai.ai_family ai.ai_socktype ai.ai_protocol in
+        Lwt.catch (fun () ->
+          (* Connect to proxy with timeout *)
+          let connect_task = Lwt_unix.connect fd ai.ai_addr in
+          let timeout_task =
+            let* () = Lwt_unix.sleep 10.0 in
+            Lwt.fail_with "proxy connection timeout"
+          in
+          let* () = Lwt.pick [connect_task; timeout_task] in
+
+          let ic = Lwt_io.of_fd ~mode:Lwt_io.Input fd in
+          let oc = Lwt_io.of_fd ~mode:Lwt_io.Output fd in
+
+          (* Step 1: Send greeting - version, number of methods, methods *)
+          let greeting = match credentials with
+            | None -> Bytes.of_string (Printf.sprintf "%c%c%c"
+                (Char.chr version) (Char.chr 1) (Char.chr auth_none))
+            | Some _ -> Bytes.of_string (Printf.sprintf "%c%c%c%c"
+                (Char.chr version) (Char.chr 2) (Char.chr auth_none) (Char.chr auth_username_password))
+          in
+          let* () = Lwt_io.write_from_exactly oc greeting 0 (Bytes.length greeting) in
+          let* () = Lwt_io.flush oc in
+
+          (* Step 2: Receive method selection *)
+          let* method_response = read_exact_timeout ic 2 in
+          match method_response with
+          | None ->
+            let* () = Lwt_unix.close fd in
+            Lwt.return (ProxyError "timeout waiting for proxy greeting response")
+          | Some resp ->
+            let resp_version = Char.code (Bytes.get resp 0) in
+            let selected_method = Char.code (Bytes.get resp 1) in
+
+            if resp_version <> version then begin
+              let* () = Lwt_unix.close fd in
+              Lwt.return (ProxyError (Printf.sprintf "proxy returned wrong version: %d" resp_version))
+            end else if selected_method = auth_no_acceptable then begin
+              let* () = Lwt_unix.close fd in
+              Lwt.return (ProxyError "proxy: no acceptable authentication method")
+            end else begin
+              (* Step 3: Handle authentication if required *)
+              let* auth_ok =
+                if selected_method = auth_username_password then begin
+                  match credentials with
+                  | None ->
+                    Lwt.return (Error "proxy requires authentication but no credentials provided")
+                  | Some cred ->
+                    if String.length cred.username > 255 || String.length cred.password > 255 then
+                      Lwt.return (Error "username or password too long")
+                    else begin
+                      (* Send username/password authentication (RFC 1929) *)
+                      let auth_buf = Bytes.create (3 + String.length cred.username + String.length cred.password) in
+                      Bytes.set auth_buf 0 (Char.chr 0x01);  (* subnegotiation version *)
+                      Bytes.set auth_buf 1 (Char.chr (String.length cred.username));
+                      Bytes.blit_string cred.username 0 auth_buf 2 (String.length cred.username);
+                      let pw_offset = 2 + String.length cred.username in
+                      Bytes.set auth_buf pw_offset (Char.chr (String.length cred.password));
+                      Bytes.blit_string cred.password 0 auth_buf (pw_offset + 1) (String.length cred.password);
+                      let* () = Lwt_io.write_from_exactly oc auth_buf 0 (Bytes.length auth_buf) in
+                      let* () = Lwt_io.flush oc in
+
+                      (* Receive auth response *)
+                      let* auth_response = read_exact_timeout ic 2 in
+                      match auth_response with
+                      | None -> Lwt.return (Error "timeout waiting for auth response")
+                      | Some auth_resp ->
+                        let auth_version = Char.code (Bytes.get auth_resp 0) in
+                        let auth_status = Char.code (Bytes.get auth_resp 1) in
+                        if auth_version <> 0x01 || auth_status <> 0x00 then
+                          Lwt.return (Error "proxy authentication failed")
+                        else
+                          Lwt.return (Ok ())
+                    end
+                end else
+                  Lwt.return (Ok ())
+              in
+
+              match auth_ok with
+              | Error msg ->
+                let* () = Lwt_unix.close fd in
+                Lwt.return (ProxyError msg)
+              | Ok () ->
+                (* Step 4: Send connect request *)
+                (* Format: VER=5, CMD=1 (connect), RSV=0, ATYP=3 (domain), LEN, ADDR, PORT *)
+                let connect_buf = Bytes.create (7 + String.length target_host) in
+                Bytes.set connect_buf 0 (Char.chr version);
+                Bytes.set connect_buf 1 (Char.chr cmd_connect);
+                Bytes.set connect_buf 2 (Char.chr 0x00);  (* reserved *)
+                Bytes.set connect_buf 3 (Char.chr atyp_domain);
+                Bytes.set connect_buf 4 (Char.chr (String.length target_host));
+                Bytes.blit_string target_host 0 connect_buf 5 (String.length target_host);
+                let port_offset = 5 + String.length target_host in
+                Bytes.set connect_buf port_offset (Char.chr ((target_port lsr 8) land 0xFF));
+                Bytes.set connect_buf (port_offset + 1) (Char.chr (target_port land 0xFF));
+                let* () = Lwt_io.write_from_exactly oc connect_buf 0 (Bytes.length connect_buf) in
+                let* () = Lwt_io.flush oc in
+
+                (* Step 5: Receive connect response (at least 4 bytes header) *)
+                let* connect_response = read_exact_timeout ic 4 in
+                match connect_response with
+                | None ->
+                  let* () = Lwt_unix.close fd in
+                  Lwt.return (ProxyError "timeout waiting for connect response")
+                | Some resp ->
+                  let resp_version = Char.code (Bytes.get resp 0) in
+                  let reply = Char.code (Bytes.get resp 1) in
+                  (* let _reserved = Char.code (Bytes.get resp 2) in *)
+                  let atyp = Char.code (Bytes.get resp 3) in
+
+                  if resp_version <> version then begin
+                    let* () = Lwt_unix.close fd in
+                    Lwt.return (ProxyError "proxy returned wrong version in connect response")
+                  end else begin
+                    let reply_code = reply_code_of_int reply in
+                    if reply_code <> Succeeded then begin
+                      let* () = Lwt_unix.close fd in
+                      Lwt.return (TargetError reply_code)
+                    end else begin
+                      (* Skip bound address based on address type *)
+                      let* skip_result =
+                        match atyp with
+                        | 0x01 -> (* IPv4: 4 bytes addr + 2 bytes port *)
+                          read_exact_timeout ic 6
+                        | 0x04 -> (* IPv6: 16 bytes addr + 2 bytes port *)
+                          read_exact_timeout ic 18
+                        | 0x03 -> (* Domain: 1 byte len, then len bytes + 2 bytes port *)
+                          let* len_byte = read_exact_timeout ic 1 in
+                          (match len_byte with
+                           | None -> Lwt.return None
+                           | Some lb ->
+                             let len = Char.code (Bytes.get lb 0) in
+                             read_exact_timeout ic (len + 2))
+                        | _ ->
+                          Lwt.return None
+                      in
+                      match skip_result with
+                      | None ->
+                        let* () = Lwt_unix.close fd in
+                        Lwt.return (ProxyError "error reading bound address")
+                      | Some _ ->
+                        (* Success! Return the connected fd *)
+                        Lwt.return (Connected fd)
+                    end
+                  end
+            end
+        ) (fun exn ->
+          let* () = Lwt.catch (fun () -> Lwt_unix.close fd) (fun _ -> Lwt.return_unit) in
+          Lwt.return (ProxyError (Printf.sprintf "SOCKS5 error: %s" (Printexc.to_string exn)))
+        )
+    end
+
+  (* Check if an address is a .onion address *)
+  let is_onion_address (host : string) : bool =
+    let lower = String.lowercase_ascii host in
+    String.length lower > 6 && String.sub lower (String.length lower - 6) 6 = ".onion"
+
+  (* Check if an address is a .b32.i2p address *)
+  let is_i2p_address (host : string) : bool =
+    let lower = String.lowercase_ascii host in
+    String.length lower > 8 && String.sub lower (String.length lower - 8) 8 = ".b32.i2p"
+end
+
+(* ============================================================================
+   I2P SAM Protocol Client
+
+   Implements the SAM 3.1 protocol for connecting to I2P destinations.
+   Reference: Bitcoin Core i2p.cpp, https://geti2p.net/en/docs/api/samv3
+   ============================================================================ *)
+
+module I2P = struct
+  (* I2P SAM default port *)
+  let sam_default_port = 7656
+
+  (* I2P uses port 0 for all connections (SAM 3.1 doesn't use ports) *)
+  let i2p_port = 0
+
+  (* SAM session styles *)
+  type session_style = Stream | Datagram | Raw
+
+  (* SAM reply result *)
+  type sam_result =
+    | Ok of (string * string) list  (* key=value pairs *)
+    | Error of string
+
+  (* Parse a SAM reply line into key=value pairs *)
+  let parse_sam_reply (line : string) : (string * string) list =
+    let parts = String.split_on_char ' ' line in
+    List.filter_map (fun part ->
+      match String.index_opt part '=' with
+      | Some pos ->
+        let key = String.sub part 0 pos in
+        let value = String.sub part (pos + 1) (String.length part - pos - 1) in
+        Some (key, value)
+      | None -> None
+    ) parts
+
+  (* Read a line from the SAM bridge (terminated by \n) *)
+  let read_sam_line (ic : Lwt_io.input_channel) : string option Lwt.t =
+    let open Lwt.Syntax in
+    let read_task =
+      let* line = Lwt_io.read_line ic in
+      Lwt.return (Some line)
+    in
+    let timeout_task =
+      let* () = Lwt_unix.sleep 60.0 in
+      Lwt.return None
+    in
+    Lwt.catch
+      (fun () -> Lwt.pick [read_task; timeout_task])
+      (fun _ -> Lwt.return None)
+
+  (* Send a SAM command and get the reply *)
+  let sam_command (ic : Lwt_io.input_channel) (oc : Lwt_io.output_channel)
+      (cmd : string) : sam_result Lwt.t =
+    let open Lwt.Syntax in
+    let* () = Lwt_io.write oc (cmd ^ "\n") in
+    let* () = Lwt_io.flush oc in
+    let* response = read_sam_line ic in
+    match response with
+    | None -> Lwt.return (Error "timeout waiting for SAM response")
+    | Some line ->
+      let pairs = parse_sam_reply line in
+      let result = List.assoc_opt "RESULT" pairs in
+      match result with
+      | Some "OK" -> Lwt.return (Ok pairs)
+      | Some err ->
+        let message = match List.assoc_opt "MESSAGE" pairs with
+          | Some msg -> msg
+          | None -> err
+        in
+        Lwt.return (Error message)
+      | None ->
+        (* Check if this is a valid reply without RESULT= (like destination) *)
+        if pairs <> [] then Lwt.return (Ok pairs)
+        else Lwt.return (Error "invalid SAM response")
+
+  (* I2P Base64 uses - and ~ instead of + and / *)
+  let i2p_base64_of_std_base64 (s : string) : string =
+    String.map (function
+      | '+' -> '-'
+      | '/' -> '~'
+      | c -> c
+    ) s
+
+  let std_base64_of_i2p_base64 (s : string) : string =
+    String.map (function
+      | '-' -> '+'
+      | '~' -> '/'
+      | c -> c
+    ) s
+
+  (* Simple Base32 encoder (RFC 4648) *)
+  let base32_encode (data : string) : string =
+    let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567" in
+    let len = String.length data in
+    if len = 0 then "" else
+    let out_len = ((len * 8 + 4) / 5) in
+    let result = Bytes.create out_len in
+    let bit_buffer = ref 0 in
+    let bits_in_buffer = ref 0 in
+    let out_pos = ref 0 in
+    for i = 0 to len - 1 do
+      bit_buffer := (!bit_buffer lsl 8) lor (Char.code data.[i]);
+      bits_in_buffer := !bits_in_buffer + 8;
+      while !bits_in_buffer >= 5 do
+        bits_in_buffer := !bits_in_buffer - 5;
+        let index = (!bit_buffer lsr !bits_in_buffer) land 0x1F in
+        Bytes.set result !out_pos alphabet.[index];
+        incr out_pos
+      done
+    done;
+    (* Handle remaining bits *)
+    if !bits_in_buffer > 0 then begin
+      let index = (!bit_buffer lsl (5 - !bits_in_buffer)) land 0x1F in
+      Bytes.set result !out_pos alphabet.[index]
+    end;
+    Bytes.sub_string result 0 !out_pos
+
+  (* Derive .b32.i2p address from I2P destination (SHA-256 hash of destination) *)
+  let dest_to_b32_addr (dest_b64 : string) : string =
+    (* Decode I2P Base64 to binary *)
+    let std_b64 = std_base64_of_i2p_base64 dest_b64 in
+    (* Pad if needed *)
+    let padded = std_b64 ^ String.make ((4 - (String.length std_b64 mod 4)) mod 4) '=' in
+    let dest_bin = Base64.decode_exn padded in
+    (* SHA-256 hash *)
+    let hash = Digestif.SHA256.digest_string dest_bin in
+    let hash_str = Digestif.SHA256.to_raw_string hash in
+    (* Base32 encode (lowercase, no padding) *)
+    let b32 = base32_encode hash_str in
+    String.lowercase_ascii b32 ^ ".b32.i2p"
+
+  (* Generate a unique session ID *)
+  let generate_session_id () : string =
+    let ic = open_in_bin "/dev/urandom" in
+    let bytes = really_input_string ic 8 in
+    close_in ic;
+    let hex = String.init 16 (fun i ->
+      let nibble = if i mod 2 = 0 then
+        (Char.code bytes.[i / 2]) lsr 4
+      else
+        (Char.code bytes.[i / 2]) land 0xF
+      in
+      "0123456789abcdef".[nibble]
+    ) in
+    "camlcoin_" ^ hex
+
+  (* SAM session state *)
+  type session = {
+    mutable control_fd : Lwt_unix.file_descr option;
+    mutable control_ic : Lwt_io.input_channel option;
+    mutable control_oc : Lwt_io.output_channel option;
+    mutable session_id : string;
+    mutable our_dest : string;  (* Our I2P destination in Base64 *)
+    mutable our_addr : string;  (* Our .b32.i2p address *)
+    sam_addr : string;
+    sam_port : int;
+    transient : bool;  (* Use transient destination? *)
+  }
+
+  (* Create a new SAM session *)
+  let create_session ~(sam_addr : string) ~(sam_port : int) ~(transient : bool) : session =
+    {
+      control_fd = None;
+      control_ic = None;
+      control_oc = None;
+      session_id = "";
+      our_dest = "";
+      our_addr = "";
+      sam_addr;
+      sam_port;
+      transient;
+    }
+
+  (* Connect to SAM bridge and perform handshake *)
+  let connect_sam (session : session) : (Lwt_io.input_channel * Lwt_io.output_channel * Lwt_unix.file_descr) option Lwt.t =
+    let open Lwt.Syntax in
+    let* addresses =
+      Lwt.catch
+        (fun () -> Lwt_unix.getaddrinfo session.sam_addr (string_of_int session.sam_port)
+            [Unix.AI_SOCKTYPE Unix.SOCK_STREAM])
+        (fun _ -> Lwt.return [])
+    in
+    match addresses with
+    | [] -> Lwt.return None
+    | ai :: _ ->
+      let fd = Lwt_unix.socket ai.ai_family ai.ai_socktype ai.ai_protocol in
+      Lwt.catch (fun () ->
+        let* () = Lwt_unix.connect fd ai.ai_addr in
+        let ic = Lwt_io.of_fd ~mode:Lwt_io.Input fd in
+        let oc = Lwt_io.of_fd ~mode:Lwt_io.Output fd in
+
+        (* SAM handshake: HELLO VERSION *)
+        let* result = sam_command ic oc "HELLO VERSION MIN=3.1 MAX=3.1" in
+        match result with
+        | Error _ ->
+          let* () = Lwt_unix.close fd in
+          Lwt.return None
+        | Ok _ -> Lwt.return (Some (ic, oc, fd))
+      ) (fun _ ->
+        let* () = Lwt.catch (fun () -> Lwt_unix.close fd) (fun _ -> Lwt.return_unit) in
+        Lwt.return None
+      )
+
+  (* Initialize the session (create destination) *)
+  let init_session (session : session) : bool Lwt.t =
+    let open Lwt.Syntax in
+    let* conn = connect_sam session in
+    match conn with
+    | None -> Lwt.return false
+    | Some (ic, oc, fd) ->
+      session.control_fd <- Some fd;
+      session.control_ic <- Some ic;
+      session.control_oc <- Some oc;
+      session.session_id <- generate_session_id ();
+
+      (* Create session with transient or persistent destination *)
+      let dest_spec = if session.transient then "TRANSIENT" else "TRANSIENT" in
+      let cmd = Printf.sprintf "SESSION CREATE STYLE=STREAM ID=%s DESTINATION=%s SIGNATURE_TYPE=7 i2cp.leaseSetEncType=4,0 inbound.quantity=1 outbound.quantity=1"
+        session.session_id dest_spec
+      in
+      let* result = sam_command ic oc cmd in
+      match result with
+      | Error msg ->
+        let* () = Lwt_unix.close fd in
+        session.control_fd <- None;
+        session.control_ic <- None;
+        session.control_oc <- None;
+        ignore msg;
+        Lwt.return false
+      | Ok pairs ->
+        (* Extract our destination from the reply *)
+        (match List.assoc_opt "DESTINATION" pairs with
+         | Some dest ->
+           session.our_dest <- dest;
+           session.our_addr <- dest_to_b32_addr dest;
+           Lwt.return true
+         | None ->
+           (* Session created but no destination returned - OK for connect-only *)
+           Lwt.return true)
+
+  (* Connect to an I2P destination through this session *)
+  let connect (session : session) (dest_b32 : string) : Lwt_unix.file_descr option Lwt.t =
+    let open Lwt.Syntax in
+    (* Ensure session is initialized *)
+    let* init_ok =
+      if session.control_fd = None then init_session session
+      else Lwt.return true
+    in
+    if not init_ok then Lwt.return None
+    else begin
+      (* Create a new socket for this stream connection *)
+      let* stream_conn = connect_sam session in
+      match stream_conn with
+      | None -> Lwt.return None
+      | Some (ic, oc, fd) ->
+        (* Look up the destination by name (the .b32.i2p address) *)
+        let* lookup_result = sam_command ic oc (Printf.sprintf "NAMING LOOKUP NAME=%s" dest_b32) in
+        match lookup_result with
+        | Error _ ->
+          let* () = Lwt_unix.close fd in
+          Lwt.return None
+        | Ok pairs ->
+          let dest = match List.assoc_opt "VALUE" pairs with
+            | Some d -> d
+            | None -> dest_b32  (* Use as-is if no lookup result *)
+          in
+          (* Connect to the destination *)
+          let* connect_result = sam_command ic oc
+            (Printf.sprintf "STREAM CONNECT ID=%s DESTINATION=%s SILENT=false"
+               session.session_id dest)
+          in
+          match connect_result with
+          | Error _ ->
+            let* () = Lwt_unix.close fd in
+            Lwt.return None
+          | Ok reply_pairs ->
+            let result = List.assoc_opt "RESULT" reply_pairs in
+            if result = Some "OK" then
+              Lwt.return (Some fd)
+            else begin
+              let* () = Lwt_unix.close fd in
+              Lwt.return None
+            end
+    end
+
+  (* Close the session *)
+  let close_session (session : session) : unit Lwt.t =
+    match session.control_fd with
+    | None -> Lwt.return_unit
+    | Some fd ->
+      session.control_fd <- None;
+      session.control_ic <- None;
+      session.control_oc <- None;
+      Lwt.catch (fun () -> Lwt_unix.close fd) (fun _ -> Lwt.return_unit)
+end
+
+(* ============================================================================
+   Proxy Configuration and Network Detection
+   ============================================================================ *)
+
+(* Proxy type *)
+type proxy_type =
+  | NoProxy
+  | Socks5Proxy of {
+      addr : string;
+      port : int;
+      credentials : Socks5.credentials option;
+      tor_stream_isolation : bool;  (* Use random credentials for circuit isolation *)
+    }
+  | I2PSam of {
+      addr : string;
+      port : int;
+    }
+
+(* Network type for routing decisions *)
+type network_type =
+  | Net_IPv4
+  | Net_IPv6
+  | Net_Onion
+  | Net_I2P
+  | Net_CJDNS
+  | Net_Internal
+
+(* Detect network type from hostname *)
+let network_type_of_host (host : string) : network_type =
+  let lower = String.lowercase_ascii host in
+  if Socks5.is_onion_address lower then Net_Onion
+  else if Socks5.is_i2p_address lower then Net_I2P
+  else if String.length lower > 0 && lower.[0] = '[' then Net_IPv6
+  else if String.contains lower ':' then Net_IPv6
+  else Net_IPv4
+
+(* Proxy configuration *)
+type proxy_config = {
+  default_proxy : proxy_type;    (* -proxy: default SOCKS5 proxy *)
+  onion_proxy : proxy_type;      (* -onion: proxy for .onion addresses *)
+  i2p_sam : proxy_type;          (* -i2psam: I2P SAM bridge *)
+  onlynet : network_type list;   (* -onlynet: restrict to these networks *)
+}
+
+let default_proxy_config : proxy_config = {
+  default_proxy = NoProxy;
+  onion_proxy = NoProxy;
+  i2p_sam = NoProxy;
+  onlynet = [];  (* Empty = all networks allowed *)
+}
+
+(* Get the appropriate proxy for a target *)
+let get_proxy_for_target (config : proxy_config) (host : string) : proxy_type =
+  let net_type = network_type_of_host host in
+  match net_type with
+  | Net_Onion ->
+    (* .onion addresses use onion proxy if configured, else default *)
+    (match config.onion_proxy with
+     | NoProxy -> config.default_proxy
+     | proxy -> proxy)
+  | Net_I2P ->
+    (* .b32.i2p addresses use I2P SAM *)
+    config.i2p_sam
+  | _ ->
+    (* IPv4/IPv6 use default proxy *)
+    config.default_proxy
+
+(* Check if a network is allowed by -onlynet *)
+let is_network_allowed (config : proxy_config) (net : network_type) : bool =
+  match config.onlynet with
+  | [] -> true  (* Empty = all allowed *)
+  | allowed -> List.mem net allowed
+
+(* Generate random credentials for Tor stream isolation.
+   Different credentials = different Tor circuits. *)
+let generate_isolation_credentials () : Socks5.credentials =
+  let ic = open_in_bin "/dev/urandom" in
+  let bytes = really_input_string ic 8 in
+  close_in ic;
+  let hex = String.init 16 (fun i ->
+    let nibble = if i mod 2 = 0 then
+      (Char.code bytes.[i / 2]) lsr 4
+    else
+      (Char.code bytes.[i / 2]) land 0xF
+    in
+    "0123456789abcdef".[nibble]
+  ) in
+  { Socks5.username = hex; password = hex }
+
+(* Connect to a target, using proxy if configured *)
+let connect_with_proxy ~(config : proxy_config) ~(host : string) ~(port : int)
+    : (Lwt_unix.file_descr, string) result Lwt.t =
+  let open Lwt.Syntax in
+  let net_type = network_type_of_host host in
+
+  (* Check if network is allowed *)
+  if not (is_network_allowed config net_type) then
+    Lwt.return (Error (Printf.sprintf "network not allowed: %s"
+      (match net_type with
+       | Net_IPv4 -> "ipv4"
+       | Net_IPv6 -> "ipv6"
+       | Net_Onion -> "onion"
+       | Net_I2P -> "i2p"
+       | Net_CJDNS -> "cjdns"
+       | Net_Internal -> "internal")))
+  else begin
+    let proxy = get_proxy_for_target config host in
+    match proxy with
+    | NoProxy ->
+      (* Direct connection *)
+      if net_type = Net_Onion || net_type = Net_I2P then
+        Lwt.return (Error "cannot connect to .onion/.i2p without proxy")
+      else begin
+        let* addresses =
+          Lwt.catch
+            (fun () -> Lwt_unix.getaddrinfo host (string_of_int port)
+                [Unix.AI_SOCKTYPE Unix.SOCK_STREAM])
+            (fun _ -> Lwt.return [])
+        in
+        match addresses with
+        | [] -> Lwt.return (Error ("cannot resolve: " ^ host))
+        | ai :: _ ->
+          let fd = Lwt_unix.socket ai.ai_family ai.ai_socktype ai.ai_protocol in
+          Lwt.catch (fun () ->
+            let* () = Lwt_unix.connect fd ai.ai_addr in
+            Lwt.return (Ok fd)
+          ) (fun exn ->
+            let* () = Lwt.catch (fun () -> Lwt_unix.close fd) (fun _ -> Lwt.return_unit) in
+            Lwt.return (Error (Printexc.to_string exn))
+          )
+      end
+
+    | Socks5Proxy { addr; port = proxy_port; credentials; tor_stream_isolation } ->
+      (* SOCKS5 proxy connection *)
+      let creds = if tor_stream_isolation then
+        Some (generate_isolation_credentials ())
+      else
+        credentials
+      in
+      let* result = Socks5.connect ~proxy_addr:addr ~proxy_port ?credentials:creds
+          ~target_host:host ~target_port:port ()
+      in
+      (match result with
+       | Socks5.Connected fd -> Lwt.return (Ok fd)
+       | Socks5.ProxyError msg -> Lwt.return (Error ("proxy error: " ^ msg))
+       | Socks5.TargetError code ->
+         Lwt.return (Error ("target unreachable: " ^ Socks5.reply_code_to_string code)))
+
+    | I2PSam { addr; port = sam_port } ->
+      (* I2P SAM connection *)
+      let session = I2P.create_session ~sam_addr:addr ~sam_port ~transient:true in
+      let* fd_opt = I2P.connect session host in
+      match fd_opt with
+      | Some fd -> Lwt.return (Ok fd)
+      | None -> Lwt.return (Error "I2P connection failed")
+  end
+
+(* Parse proxy URL: socks5://host:port or socks5://user:pass@host:port *)
+let parse_proxy_url (url : string) : proxy_type option =
+  let url = String.lowercase_ascii url in
+  let prefix = "socks5://" in
+  let prefix_len = 9 in
+  if String.length url < prefix_len then None
+  else if String.sub url 0 prefix_len = prefix then begin
+    let rest = String.sub url prefix_len (String.length url - prefix_len) in
+    (* Check for credentials *)
+    match String.index_opt rest '@' with
+    | Some at_pos ->
+      let cred_part = String.sub rest 0 at_pos in
+      let host_part = String.sub rest (at_pos + 1) (String.length rest - at_pos - 1) in
+      (match String.index_opt cred_part ':' with
+       | Some colon_pos ->
+         let username = String.sub cred_part 0 colon_pos in
+         let password = String.sub cred_part (colon_pos + 1) (String.length cred_part - colon_pos - 1) in
+         (match String.rindex_opt host_part ':' with
+          | Some port_pos ->
+            let addr = String.sub host_part 0 port_pos in
+            let port_str = String.sub host_part (port_pos + 1) (String.length host_part - port_pos - 1) in
+            (match int_of_string_opt port_str with
+             | Some port -> Some (Socks5Proxy { addr; port; credentials = Some { Socks5.username; password }; tor_stream_isolation = false })
+             | None -> None)
+          | None -> None)
+       | None -> None)
+    | None ->
+      (* No credentials, just host:port *)
+      (match String.rindex_opt rest ':' with
+       | Some port_pos ->
+         let addr = String.sub rest 0 port_pos in
+         let port_str = String.sub rest (port_pos + 1) (String.length rest - port_pos - 1) in
+         (match int_of_string_opt port_str with
+          | Some port -> Some (Socks5Proxy { addr; port; credentials = None; tor_stream_isolation = false })
+          | None -> None)
+       | None -> None)
+  end else
+    None
+
+(* Parse I2P SAM address: host:port *)
+let parse_i2p_sam (addr_port : string) : proxy_type option =
+  match String.rindex_opt addr_port ':' with
+  | Some pos ->
+    let addr = String.sub addr_port 0 pos in
+    let port_str = String.sub addr_port (pos + 1) (String.length addr_port - pos - 1) in
+    (match int_of_string_opt port_str with
+     | Some port -> Some (I2PSam { addr; port })
+     | None -> None)
+  | None -> None

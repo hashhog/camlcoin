@@ -875,6 +875,15 @@ let add_tap_script_sig (psbt : psbt) (input_index : int) (tss : tap_script_sig) 
   ) psbt.inputs in
   { psbt with inputs }
 
+(* Deduplicate partial signatures by pubkey (keep the first occurrence) *)
+let dedup_partial_sigs (sigs : partial_sig list) : partial_sig list =
+  let seen = Hashtbl.create 16 in
+  List.filter (fun (ps : partial_sig) ->
+    let key = Cstruct.to_string ps.pubkey in
+    if Hashtbl.mem seen key then false
+    else begin Hashtbl.replace seen key (); true end
+  ) sigs
+
 (* Combiner role: Merge two PSBTs *)
 let combine (psbt1 : psbt) (psbt2 : psbt) : (psbt, string) result =
   (* Check that underlying transactions match *)
@@ -888,7 +897,7 @@ let combine (psbt1 : psbt) (psbt2 : psbt) : (psbt, string) result =
       {
         non_witness_utxo = (match inp1.non_witness_utxo with Some _ -> inp1.non_witness_utxo | None -> inp2.non_witness_utxo);
         witness_utxo = (match inp1.witness_utxo with Some _ -> inp1.witness_utxo | None -> inp2.witness_utxo);
-        partial_sigs = inp1.partial_sigs @ inp2.partial_sigs;
+        partial_sigs = dedup_partial_sigs (inp1.partial_sigs @ inp2.partial_sigs);
         sighash_type = (match inp1.sighash_type with Some _ -> inp1.sighash_type | None -> inp2.sighash_type);
         redeem_script = (match inp1.redeem_script with Some _ -> inp1.redeem_script | None -> inp2.redeem_script);
         witness_script = (match inp1.witness_script with Some _ -> inp1.witness_script | None -> inp2.witness_script);
@@ -973,6 +982,67 @@ let finalize_input_p2pkh (psbt : psbt) (input_index : int) : (psbt, string) resu
           final_scriptsig = Some scriptsig;
           partial_sigs = [];
           bip32_derivations = [];
+        }
+        else inp'
+      ) psbt.inputs in
+      Ok { psbt with inputs }
+
+(* Finalize a P2WSH input given a witness script and assembled witness stack.
+   The final witness is: [witness_stack..., witness_script] *)
+let finalize_input_p2wsh (psbt : psbt) (input_index : int)
+    ~(witness_script : Cstruct.t) ~(witness_stack : Cstruct.t list)
+    : (psbt, string) result =
+  if input_index < 0 || input_index >= List.length psbt.inputs then
+    Error "Invalid input index"
+  else
+    let witness = witness_stack @ [witness_script] in
+    let inputs = List.mapi (fun i inp' ->
+      if i = input_index then {
+        inp' with
+        final_scriptwitness = Some witness;
+        partial_sigs = [];
+        bip32_derivations = [];
+        redeem_script = None;
+        witness_script = None;
+      }
+      else inp'
+    ) psbt.inputs in
+    Ok { psbt with inputs }
+
+(* Finalize a P2SH-P2WPKH input: wraps P2WPKH witness with the P2SH redeemScript.
+   scriptSig = <push redeemScript>  where redeemScript = OP_0 <20-byte-pubkey-hash>
+   witness   = [signature, pubkey] *)
+let finalize_input_p2sh_p2wpkh (psbt : psbt) (input_index : int)
+    : (psbt, string) result =
+  if input_index < 0 || input_index >= List.length psbt.inputs then
+    Error "Invalid input index"
+  else
+    let inp = List.nth psbt.inputs input_index in
+    match inp.partial_sigs with
+    | [] -> Error "No partial signatures for P2SH-P2WPKH input"
+    | ps :: _ ->
+      let pubkey_hash = Crypto.hash160 ps.pubkey in
+      (* redeemScript = OP_0 <20 bytes> *)
+      let redeem_script = Cstruct.create 22 in
+      Cstruct.set_uint8 redeem_script 0 0x00;
+      Cstruct.set_uint8 redeem_script 1 0x14;
+      Cstruct.blit pubkey_hash 0 redeem_script 2 20;
+      (* scriptSig = push(redeemScript) *)
+      let w = Serialize.writer_create () in
+      Serialize.write_compact_size w (Cstruct.length redeem_script);
+      Serialize.write_bytes w redeem_script;
+      let scriptsig = Serialize.writer_to_cstruct w in
+      (* witness = [signature, pubkey] *)
+      let witness = [ps.signature; ps.pubkey] in
+      let inputs = List.mapi (fun i inp' ->
+        if i = input_index then {
+          inp' with
+          final_scriptsig = Some scriptsig;
+          final_scriptwitness = Some witness;
+          partial_sigs = [];
+          bip32_derivations = [];
+          redeem_script = None;
+          witness_script = None;
         }
         else inp'
       ) psbt.inputs in

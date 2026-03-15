@@ -21,7 +21,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Consensus parameters (difficulty adjustment, testnet walk-back, BIP94, rewards)
 - [x] BIP9 version bits (soft fork activation state machine, signal counting)
 - [x] Storage layer (blocks, UTXOs, chain state, batch writes, flat files)
-- [x] Block and transaction validation (weight, sigops, Merkle, coinbase, BIP68 sequence locks)
+- [x] Block and transaction validation (weight, BIP-141 weighted sigops with witness discount, Merkle, coinbase, BIP68 sequence locks)
 - [x] P2P message serialization (version, inv, getdata, blocks, headers, tx)
 - [x] Peer connections and handshake (TCP/Lwt, version/verack, ping/pong)
 - [x] Peer manager and discovery (DNS seeds, connection pool, addr relay)

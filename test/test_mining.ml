@@ -93,7 +93,7 @@ let test_create_coinbase_basic () =
   let extra_nonce = Cstruct.of_string "\x01\x02\x03\x04\x05\x06\x07\x08" in
 
   let coinbase = Mining.create_coinbase ~height ~total_fee
-    ~payout_script ~extra_nonce ~witness_root:None in
+    ~payout_script ~extra_nonce ~witness_root:None () in
 
   (* Check it's a valid coinbase structure *)
   Alcotest.(check int) "one input" 1 (List.length coinbase.inputs);
@@ -120,7 +120,7 @@ let test_create_coinbase_with_witness () =
     "0000000000000000000000000000000000000000000000000000000000000000" in
 
   let coinbase = Mining.create_coinbase ~height ~total_fee
-    ~payout_script ~extra_nonce ~witness_root:(Some witness_root) in
+    ~payout_script ~extra_nonce ~witness_root:(Some witness_root) () in
 
   (* Should have 2 outputs (payout + witness commitment) *)
   Alcotest.(check int) "two outputs" 2 (List.length coinbase.outputs);
@@ -148,7 +148,7 @@ let test_create_coinbase_height_encoding () =
     let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
     let extra_nonce = Cstruct.create 8 in
     let coinbase = Mining.create_coinbase ~height ~total_fee:0L
-      ~payout_script ~extra_nonce ~witness_root:None in
+      ~payout_script ~extra_nonce ~witness_root:None () in
 
     let script = (List.hd coinbase.inputs).script_sig in
     let expected_prefix = Consensus.encode_height_in_coinbase height in

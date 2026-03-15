@@ -57,7 +57,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Package relay (BIP 331, 1p1c topology, CPFP fee-bumping, topological sort, ephemeral anchors)
 - [x] PSBT (BIP-174, creator/updater/signer/combiner/finalizer/extractor roles, taproot support, RPC interface)
 - [x] Output descriptors (BIP 380-386, checksum, parsing, script generation, range expansion, RPC interface)
-- [x] Miniscript (type system, script generation, satisfaction, parsing, wsh(miniscript) support)
+- [x] Miniscript (type system, script generation/decompilation, optimal satisfaction with DP, wsh(miniscript) descriptors)
 - [x] BIP-133 feefilter (Poisson timing, noise rounding, block-relay-only exclusion)
 - [x] AssumeUTXO (BIP 199, snapshot loading, dual chainstate, background validation)
 - [x] REST API (block, tx, headers, chaininfo, mempool, blockhashbyheight, .json/.hex/.bin formats)
@@ -109,7 +109,7 @@ camlcoin/
     block_index.ml    block indexes, BIP-157/158 filters, height index
     psbt.ml           PSBT (BIP-174) multi-party signing
     descriptor.ml     output descriptors (BIP 380-386)
-    miniscript.ml     miniscript (type system, script generation, satisfaction)
+    miniscript.ml     miniscript (type system, compilation/decompilation, satisfaction)
     assume_utxo.ml    assumeUTXO (BIP 199, snapshot loading, background validation)
     zmq_notify.ml     ZeroMQ pub/sub notifications for blocks and transactions
     perf.ml           performance utilities and benchmarks

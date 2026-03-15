@@ -457,9 +457,8 @@ let handle_mempool_contents (ctx : Rpc.rpc_context) (req : Cohttp.Request.t)
           match Mempool.get ctx.mempool txid with
           | None -> (txid_str, `Null)
           | Some entry ->
-            let w = Serialize.writer_create () in
-            Serialize.serialize_transaction w entry.tx;
-            let vsize = Cstruct.length (Serialize.writer_to_cstruct w) in
+            let weight = Validation.compute_tx_weight entry.tx in
+            let vsize = (weight + 3) / 4 in
             let fees = entry.fee in
             let ancestors = Mempool.get_ancestors ctx.mempool txid in
             let descendants = Mempool.get_descendants ctx.mempool txid in

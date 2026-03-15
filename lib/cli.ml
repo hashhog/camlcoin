@@ -104,7 +104,7 @@ let run (config : config) : unit Lwt.t =
   (* Get network config *)
   let network = match config.network with
     | `Mainnet -> Consensus.mainnet
-    | `Testnet -> Consensus.testnet
+    | `Testnet -> Consensus.testnet4
     | `Regtest -> Consensus.regtest
   in
 
@@ -253,7 +253,10 @@ let run (config : config) : unit Lwt.t =
         let misbehavior_handler peer_id infraction =
           match Peer_manager.find_peer_by_id peer_manager peer_id with
           | Some peer ->
-            ignore (Peer.record_misbehavior_for peer infraction)
+            (match Peer.record_misbehavior_for peer infraction with
+             | `Ok -> ()
+             | `Ban ->
+               Lwt.async (fun () -> Peer_manager.ban_peer peer_manager peer_id ()))
           | None -> ()
         in
         Sync.start_ibd ~utxo_set:optimized_utxo

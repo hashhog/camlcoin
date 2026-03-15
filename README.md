@@ -111,7 +111,8 @@ camlcoin/
     descriptor.ml     output descriptors (BIP 380-386)
     miniscript.ml     miniscript (type system, compilation/decompilation, satisfaction)
     assume_utxo.ml    assumeUTXO (BIP 199, snapshot loading, background validation)
-    zmq_notify.ml     ZeroMQ pub/sub notifications for blocks and transactions
+    zmq_notify.ml     ZeroMQ notification message formatting and queueing
+    zmq_socket.ml     ZeroMQ socket publisher/subscriber implementation
     perf.ml           performance utilities and benchmarks
     cli.ml            command line interface
     camlcoin.ml       library interface

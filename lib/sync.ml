@@ -818,7 +818,7 @@ type orphan_block_entry = {
 (* IBD state - tracks the full block download process *)
 type ibd_state = {
   chain : chain_state;
-  mutable block_queue : block_queue_entry list;
+  block_queue : block_queue_entry Queue.t;
   queue_by_hash : (string, block_queue_entry) Hashtbl.t;
   queue_by_height : (int, block_queue_entry) Hashtbl.t;
   mutable next_download_height : int;
@@ -840,7 +840,7 @@ let create_ibd_state ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
     (chain : chain_state) : ibd_state =
   let start_height = chain.blocks_synced + 1 in
   { chain;
-    block_queue = [];
+    block_queue = Queue.create ();
     queue_by_hash = Hashtbl.create 1024;
     queue_by_height = Hashtbl.create 1024;
     next_download_height = start_height;
@@ -858,20 +858,24 @@ let create_ibd_state ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
 let set_mempool (ibd : ibd_state) (mp : Mempool.mempool) =
   ibd.mempool <- Some mp
 
-(* Add an entry to the block queue with O(1) index updates *)
+(* Add an entry to the block queue with O(1) enqueue and index updates *)
 let queue_add (ibd : ibd_state) (entry : block_queue_entry) =
-  ibd.block_queue <- ibd.block_queue @ [entry];
+  Queue.push entry ibd.block_queue;
   Hashtbl.replace ibd.queue_by_hash (Cstruct.to_string entry.hash) entry;
   Hashtbl.replace ibd.queue_by_height entry.height entry
 
 (* Remove validated entries from the block queue *)
 let queue_remove_validated (ibd : ibd_state) =
-  let removed = List.filter (fun e -> e.download_state = Validated) ibd.block_queue in
-  List.iter (fun e ->
-    Hashtbl.remove ibd.queue_by_hash (Cstruct.to_string e.hash);
-    Hashtbl.remove ibd.queue_by_height e.height
-  ) removed;
-  ibd.block_queue <- List.filter (fun e -> e.download_state <> Validated) ibd.block_queue
+  let retained = Queue.create () in
+  Queue.iter (fun e ->
+    if e.download_state = Validated then begin
+      Hashtbl.remove ibd.queue_by_hash (Cstruct.to_string e.hash);
+      Hashtbl.remove ibd.queue_by_height e.height
+    end else
+      Queue.push e retained
+  ) ibd.block_queue;
+  Queue.clear ibd.block_queue;
+  Queue.transfer retained ibd.block_queue
 
 (* O(1) lookup by hash *)
 let queue_find_by_hash (ibd : ibd_state) (hash_key : string) : block_queue_entry option =
@@ -907,7 +911,7 @@ let fill_download_queue (ibd : ibd_state) : unit =
   in
   let max_queue_size = block_download_window in
   while ibd.next_download_height <= tip_height &&
-        List.length ibd.block_queue < max_queue_size do
+        Queue.length ibd.block_queue < max_queue_size do
     let height = ibd.next_download_height in
     match Storage.ChainDB.get_hash_at_height ibd.chain.db height with
     | Some hash ->
@@ -932,16 +936,14 @@ let fill_download_queue (ibd : ibd_state) : unit =
 (* Check for timed out requests and reset them *)
 let check_timeouts (ibd : ibd_state) : unit =
   let now = Unix.gettimeofday () in
-  List.iter (fun entry ->
+  Queue.iter (fun entry ->
     match entry.download_state with
     | Requested { peer_id; requested_at; timeout } ->
       if now -. requested_at > timeout then begin
-        (* Timeout occurred - reset block and penalize peer *)
         entry.download_state <- NotRequested;
         ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
         let peer_state = get_peer_state ibd peer_id in
         peer_state.blocks_in_flight <- max 0 (peer_state.blocks_in_flight - 1);
-        (* Double timeout on stall (up to max) *)
         peer_state.consecutive_timeouts <- peer_state.consecutive_timeouts + 1;
         peer_state.current_timeout <- min max_block_timeout
           (peer_state.current_timeout *. 2.0);
@@ -962,18 +964,15 @@ let check_timeouts (ibd : ibd_state) : unit =
 let check_stalled_downloads (ibd : ibd_state) : int list =
   let now = Unix.gettimeofday () in
   let peers_to_disconnect = Hashtbl.create 4 in
-  List.iter (fun entry ->
+  Queue.iter (fun entry ->
     match entry.download_state with
     | Requested { peer_id; requested_at; timeout } ->
       if now > requested_at +. timeout then begin
-        (* Hard timeout: reset block to NotRequested for re-download *)
         entry.download_state <- NotRequested;
         ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
         let peer_state = get_peer_state ibd peer_id in
         peer_state.blocks_in_flight <- max 0 (peer_state.blocks_in_flight - 1);
-        (* Increment consecutive timeout counter *)
         peer_state.consecutive_timeouts <- peer_state.consecutive_timeouts + 1;
-        (* Exponential backoff: double timeout, cap at max_stall_timeout *)
         peer_state.current_timeout <- min max_stall_timeout
           (peer_state.current_timeout *. 2.0);
         Logs.debug (fun m ->
@@ -981,13 +980,9 @@ let check_stalled_downloads (ibd : ibd_state) : int list =
              (consecutive timeouts: %d, new timeout: %.1fs)"
             entry.height peer_id
             peer_state.consecutive_timeouts peer_state.current_timeout);
-        (* Mark peer for disconnect after base_block_timeout worth of stalls *)
         if peer_state.consecutive_timeouts >= max_consecutive_timeouts then
           Hashtbl.replace peers_to_disconnect peer_id true
       end else if now > requested_at +. stall_timeout then begin
-        (* Stall detection: block pending > 2s with no progress.
-           Reset to NotRequested so it can be re-requested from another peer.
-           Do NOT penalize the peer yet — only the hard timeout does that. *)
         entry.download_state <- NotRequested;
         ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
         let peer_state = get_peer_state ibd peer_id in
@@ -1038,15 +1033,15 @@ let request_blocks (ibd : ibd_state) (peers : Peer.peer list)
         Lwt.return_unit
       else begin
         (* Mark blocks we already have as validated *)
-        List.iter (fun entry ->
+        Queue.iter (fun entry ->
           if entry.download_state = NotRequested &&
              Storage.ChainDB.has_block ibd.chain.db entry.hash then
             entry.download_state <- Validated
         ) ibd.block_queue;
         (* Find unrequested blocks *)
-        let unrequested = List.filter (fun entry ->
-          entry.download_state = NotRequested
-        ) ibd.block_queue in
+        let unrequested = Queue.fold (fun acc entry ->
+          if entry.download_state = NotRequested then entry :: acc else acc
+        ) [] ibd.block_queue |> List.rev in
         match unrequested with
         | [] -> Lwt.return_unit
         | entries ->
@@ -1136,7 +1131,7 @@ let handle_notfound (ibd : ibd_state) (peer_id : int)
     (items : P2p.inv_vector list) : unit =
   List.iter (fun (iv : P2p.inv_vector) ->
     (* Find matching block queue entry and reset to NotRequested *)
-    List.iter (fun entry ->
+    Queue.iter (fun entry ->
       match entry.download_state with
       | Requested req when req.peer_id = peer_id &&
                            Cstruct.equal entry.hash iv.hash ->
@@ -1381,21 +1376,22 @@ let process_downloaded_blocks (ibd : ibd_state)
            (* Store block *)
            Storage.ChainDB.store_block ibd.chain.db entry.hash block;
            (* Build and store undo data for chain reorganization *)
-           let undo_spent = ref [] in
-           List.iteri (fun tx_idx tx ->
-             if tx_idx > 0 then  (* Skip coinbase *)
-               List.iter (fun inp ->
+           let tx_undos = List.filter_map (fun (tx_idx, tx) ->
+             if tx_idx > 0 then begin
+               let spent = List.filter_map (fun inp ->
                  let prev = inp.Types.previous_output in
                  let vout = Int32.to_int prev.Types.vout in
                  match Storage.ChainDB.get_utxo ibd.chain.db prev.Types.txid vout with
-                 | None -> ()
+                 | None -> None
                  | Some data ->
                    let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
                    let entry_utxo = Utxo.deserialize_utxo_entry r in
-                   undo_spent := (prev, entry_utxo) :: !undo_spent
-               ) tx.Types.inputs
-           ) block.transactions;
-           let undo : Utxo.undo_data = { height; spent_outputs = !undo_spent } in
+                   Some (prev, entry_utxo)
+               ) tx.Types.inputs in
+               Some Utxo.{ spent_outputs = spent }
+             end else None
+           ) (List.mapi (fun i tx -> (i, tx)) block.transactions) in
+           let undo : Utxo.undo_data = { height; tx_undos } in
            let uw = Serialize.writer_create () in
            Utxo.serialize_undo_data uw undo;
            Storage.ChainDB.store_undo_data ibd.chain.db entry.hash
@@ -1572,15 +1568,17 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
                   ibd.pending_utxo_deletes <- (txid, vout) :: ibd.pending_utxo_deletes
                 ) tx.Types.outputs
               ) txs;
-              (* Restore spent outputs from undo data *)
-              List.iter (fun (outpoint, utxo_entry) ->
-                let data = encode_utxo utxo_entry.Utxo.value
-                    utxo_entry.Utxo.script_pubkey utxo_entry.Utxo.height
-                    utxo_entry.Utxo.is_coinbase in
-                ibd.pending_utxo_updates <-
-                  (outpoint.Types.txid, Int32.to_int outpoint.Types.vout, data)
-                  :: ibd.pending_utxo_updates
-              ) undo.spent_outputs;
+             (* Restore spent outputs from undo data *)
+             List.iter (fun (tx_undo : Utxo.tx_undo) ->
+               List.iter (fun (outpoint, utxo_entry) ->
+                 let data = encode_utxo utxo_entry.Utxo.value
+                     utxo_entry.Utxo.script_pubkey utxo_entry.Utxo.height
+                     utxo_entry.Utxo.is_coinbase in
+                 ibd.pending_utxo_updates <-
+                   (outpoint.Types.txid, Int32.to_int outpoint.Types.vout, data)
+                   :: ibd.pending_utxo_updates
+               ) tx_undo.spent_outputs
+             ) undo.tx_undos;
               (* Clean up stored undo data for disconnected block *)
               Storage.ChainDB.delete_undo_data state.db entry.hash;
               Logs.debug (fun m ->
@@ -1655,21 +1653,22 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
                if not (Storage.ChainDB.has_block state.db entry.hash) then
                  Storage.ChainDB.store_block state.db entry.hash block;
                (* Build and store undo data *)
-               let undo_spent = ref [] in
-               List.iteri (fun tx_idx tx ->
-                 if tx_idx > 0 then
-                   List.iter (fun inp ->
+               let tx_undos = List.filter_map (fun (tx_idx, tx) ->
+                 if tx_idx > 0 then begin
+                   let spent = List.filter_map (fun inp ->
                      let prev = inp.Types.previous_output in
                      let vout = Int32.to_int prev.Types.vout in
                      match Storage.ChainDB.get_utxo state.db prev.Types.txid vout with
-                     | None -> ()
+                     | None -> None
                      | Some data ->
                        let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
                        let entry_utxo = Utxo.deserialize_utxo_entry r in
-                       undo_spent := (prev, entry_utxo) :: !undo_spent
-                   ) tx.Types.inputs
-               ) block.transactions;
-               let undo : Utxo.undo_data = { height; spent_outputs = !undo_spent } in
+                       Some (prev, entry_utxo)
+                   ) tx.Types.inputs in
+                   Some Utxo.{ spent_outputs = spent }
+                 end else None
+               ) (List.mapi (fun i tx -> (i, tx)) block.transactions) in
+               let undo : Utxo.undo_data = { height; tx_undos } in
                let uw = Serialize.writer_create () in
                Utxo.serialize_undo_data uw undo;
                Storage.ChainDB.store_undo_data state.db entry.hash
@@ -1738,7 +1737,7 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
 let run_ibd (ibd : ibd_state) (peers : Peer.peer list) : unit Lwt.t =
   let rec loop () =
     fill_download_queue ibd;
-    if ibd.block_queue = [] && ibd.total_blocks_in_flight = 0 then begin
+    if Queue.is_empty ibd.block_queue && ibd.total_blocks_in_flight = 0 then begin
       (* Flush any remaining UTXO updates *)
       flush_utxos ibd;
       (* Update chain tip *)
@@ -1965,12 +1964,14 @@ let invalidate_block (state : chain_state)
                      ) tx.Types.outputs
                    ) txs;
                    (* Restore spent outputs from undo data *)
-                   List.iter (fun (outpoint, utxo_entry) ->
-                     Utxo.OptimizedUtxoSet.add utxo
-                       outpoint.Types.txid
-                       (Int32.to_int outpoint.Types.vout)
-                       utxo_entry
-                   ) undo.spent_outputs;
+                   List.iter (fun (tx_undo : Utxo.tx_undo) ->
+                     List.iter (fun (outpoint, utxo_entry) ->
+                       Utxo.OptimizedUtxoSet.add utxo
+                         outpoint.Types.txid
+                         (Int32.to_int outpoint.Types.vout)
+                         utxo_entry
+                     ) tx_undo.spent_outputs
+                   ) undo.tx_undos;
                    Storage.ChainDB.delete_undo_data state.db current.hash;
                    Logs.debug (fun m ->
                      m "Disconnected block at height %d during invalidation"

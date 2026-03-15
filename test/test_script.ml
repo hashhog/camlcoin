@@ -1502,17 +1502,14 @@ let make_p2wsh_script_pubkey witness_script =
   Serialize.write_bytes w script_hash;
   Serialize.writer_to_cstruct w
 
-(* Test: OP_IF with [0x02] on stack fails in witness v0 due to MINIMALIF *)
+(* Test: OP_IF with [0x02] on stack fails in witness v0 when MINIMALIF flag set *)
 let test_minimalif_fails_with_0x02 () =
   let tx = make_test_tx () in
-  (* Witness script: OP_IF OP_1 OP_ENDIF
-     Encoded: 63 51 68 *)
   let witness_script = hex_to_cstruct "635168" in
   let script_pubkey = make_p2wsh_script_pubkey witness_script in
-  (* Witness stack: [0x02] (truthy but not minimal), then the script *)
   let bad_value = hex_to_cstruct "02" in
   let witness = { Types.items = [bad_value; witness_script] } in
-  let flags = Script.script_verify_witness in
+  let flags = Script.script_verify_witness lor Script.script_verify_minimalif in
   match Script.verify_script ~tx ~input_index:0 ~script_pubkey
           ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
   | Error msg ->
@@ -1564,16 +1561,14 @@ let test_minimalif_empty_takes_else_branch () =
   | Ok false -> Alcotest.fail "Expected true from ELSE branch"
   | Error e -> Alcotest.fail ("Empty value should take ELSE branch: " ^ e)
 
-(* Test: OP_NOTIF with [0x02] fails MINIMALIF *)
+(* Test: OP_NOTIF with [0x02] fails MINIMALIF when flag set *)
 let test_minimalif_notif_fails_with_0x02 () =
   let tx = make_test_tx () in
-  (* Witness script: OP_NOTIF OP_1 OP_ENDIF
-     Encoded: 64 51 68 *)
   let witness_script = hex_to_cstruct "645168" in
   let script_pubkey = make_p2wsh_script_pubkey witness_script in
   let bad_value = hex_to_cstruct "02" in
   let witness = { Types.items = [bad_value; witness_script] } in
-  let flags = Script.script_verify_witness in
+  let flags = Script.script_verify_witness lor Script.script_verify_minimalif in
   match Script.verify_script ~tx ~input_index:0 ~script_pubkey
           ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
   | Error msg ->
@@ -1592,12 +1587,11 @@ let test_minimalif_notif_fails_with_0x02 () =
 (* Test: Multi-byte value [0x01 0x00] fails MINIMALIF even though truthy *)
 let test_minimalif_fails_with_multibyte () =
   let tx = make_test_tx () in
-  let witness_script = hex_to_cstruct "635168" in  (* OP_IF OP_1 OP_ENDIF *)
+  let witness_script = hex_to_cstruct "635168" in
   let script_pubkey = make_p2wsh_script_pubkey witness_script in
-  (* [0x01 0x00] is truthy (non-zero) but not minimal for IF *)
   let bad_value = hex_to_cstruct "0100" in
   let witness = { Types.items = [bad_value; witness_script] } in
-  let flags = Script.script_verify_witness in
+  let flags = Script.script_verify_witness lor Script.script_verify_minimalif in
   match Script.verify_script ~tx ~input_index:0 ~script_pubkey
           ~script_sig:(Cstruct.create 0) ~witness ~amount:0L ~flags () with
   | Error _ -> ()  (* Expected: MINIMALIF error *)

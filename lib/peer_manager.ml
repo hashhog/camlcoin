@@ -208,6 +208,8 @@ type t = {
   mutable stale_check_running : bool;               (* Whether the 45s check timer is running *)
   (* Mempool for feefilter (BIP-133) *)
   mutable mempool : Mempool.mempool option;         (* Mempool for min_relay_fee *)
+  (* BIP 152: High-bandwidth compact block relay (up to 3 peers) *)
+  mutable hb_compact_peers : int list;              (* Peer IDs designated for HB compact relay *)
 }
 
 (* Generate a random bucket key for address hashing *)
@@ -246,6 +248,7 @@ let create ?(config = default_config) (network : Consensus.network_config) : t =
     stale_state = Hashtbl.create 64;
     stale_check_running = false;
     mempool = None;
+    hb_compact_peers = [];
   }
 
 (* Set the mempool reference for feefilter (BIP-133) *)
@@ -786,6 +789,8 @@ let remove_peer (pm : t) (peer_id : int) : unit Lwt.t =
     (* Remove from outbound netgroup tracking if outbound peer *)
     if peer.Peer.direction = Peer.Outbound then
       Hashtbl.remove pm.outbound_netgroups (netgroup_of peer.Peer.addr);
+    (* Remove from high-bandwidth compact block list (BIP 152) *)
+    pm.hb_compact_peers <- List.filter ((<>) peer_id) pm.hb_compact_peers;
     Lwt.return_unit
 
 (* Ban a peer *)
@@ -2033,3 +2038,146 @@ let gossip_addresses (pm : t) : unit Lwt.t =
       else Lwt.return_unit
     ) pm.peers
   end
+
+(* ============================================================================
+   BIP 152: High-Bandwidth Compact Block Relay
+
+   Bitcoin Core maintains up to 3 peers for high-bandwidth compact block relay.
+   When a new block is found, we send cmpctblock immediately to these peers
+   without waiting for inv/getdata. This reduces block propagation latency.
+
+   Reference: Bitcoin Core net_processing.cpp MaybeSetPeerAsAnnouncingHeaderAndIDs()
+   ============================================================================ *)
+
+(* Maximum number of high-bandwidth compact block peers *)
+let max_hb_compact_peers = 3
+
+(* Check if a peer supports compact block relay version 2 (segwit-aware) *)
+let supports_compact_blocks (peer : Peer.peer) : bool =
+  peer.Peer.cmpct_version >= 2L && peer.Peer.services.Peer.witness
+
+(* Send sendcmpct message to designate a peer for high-bandwidth mode.
+   Returns true if the message was sent successfully. *)
+let send_sendcmpct (_pm : t) (peer : Peer.peer) ~(high_bandwidth : bool) : bool Lwt.t =
+  let open Lwt.Syntax in
+  if peer.Peer.state <> Peer.Ready then
+    Lwt.return false
+  else
+    Lwt.catch (fun () ->
+      let msg = P2p.make_sendcmpct_msg ~high_bandwidth in
+      let* () = Peer.send_message peer msg in
+      Lwt.return true
+    ) (fun _exn -> Lwt.return false)
+
+(* Designate a peer for high-bandwidth compact block relay.
+   Maintains at most max_hb_compact_peers peers in HB mode.
+   Prioritizes outbound peers (at least 1 outbound if possible).
+   Reference: Bitcoin Core MaybeSetPeerAsAnnouncingHeaderAndIDs() *)
+let maybe_set_hb_compact_peer (pm : t) (peer : Peer.peer) : unit Lwt.t =
+  let open Lwt.Syntax in
+  (* Don't enable for block-relay-only peers or peers without cmpctblock support *)
+  if peer.Peer.block_relay_only then Lwt.return_unit
+  else if not (supports_compact_blocks peer) then Lwt.return_unit
+  else begin
+    let peer_id = peer.Peer.id in
+    (* Already in HB list? Move to end (most recently active) *)
+    if List.mem peer_id pm.hb_compact_peers then begin
+      pm.hb_compact_peers <- List.filter ((<>) peer_id) pm.hb_compact_peers @ [peer_id];
+      Lwt.return_unit
+    end else begin
+      (* Count outbound HB peers *)
+      let count_outbound () =
+        List.fold_left (fun acc pid ->
+          match List.find_opt (fun p -> p.Peer.id = pid) pm.peers with
+          | Some p when p.Peer.direction = Peer.Outbound -> acc + 1
+          | _ -> acc
+        ) 0 pm.hb_compact_peers
+      in
+      (* Check if we need to evict a peer to maintain outbound preference *)
+      let n_hb = List.length pm.hb_compact_peers in
+      if n_hb >= max_hb_compact_peers then begin
+        let num_outbound_hb = count_outbound () in
+        (* If we're adding inbound and have exactly 1 outbound, don't evict outbound *)
+        let should_protect_outbound =
+          peer.Peer.direction = Peer.Inbound && num_outbound_hb = 1
+        in
+        (* Find peer to evict: front of list, but skip outbound if protecting *)
+        let rec find_evict_id = function
+          | [] -> None
+          | pid :: rest ->
+            match List.find_opt (fun p -> p.Peer.id = pid) pm.peers with
+            | Some p when should_protect_outbound && p.Peer.direction = Peer.Outbound ->
+              find_evict_id rest
+            | Some _ -> Some pid
+            | None -> find_evict_id rest
+        in
+        match find_evict_id pm.hb_compact_peers with
+        | None -> Lwt.return_unit  (* No peer to evict *)
+        | Some evict_id ->
+          (* Downgrade the evicted peer to low-bandwidth *)
+          let* () = match List.find_opt (fun p -> p.Peer.id = evict_id) pm.peers with
+            | Some evict_peer ->
+              let* _sent = send_sendcmpct pm evict_peer ~high_bandwidth:false in
+              Lwt.return_unit
+            | None -> Lwt.return_unit
+          in
+          pm.hb_compact_peers <- List.filter ((<>) evict_id) pm.hb_compact_peers;
+          (* Upgrade the new peer *)
+          let* sent = send_sendcmpct pm peer ~high_bandwidth:true in
+          if sent then
+            pm.hb_compact_peers <- pm.hb_compact_peers @ [peer_id];
+          Lwt.return_unit
+      end else begin
+        (* Room for more HB peers - just add *)
+        let* sent = send_sendcmpct pm peer ~high_bandwidth:true in
+        if sent then
+          pm.hb_compact_peers <- pm.hb_compact_peers @ [peer_id];
+        Lwt.return_unit
+      end
+    end
+  end
+
+(* Remove a peer from the high-bandwidth compact block list (on disconnect) *)
+let remove_hb_compact_peer (pm : t) (peer_id : int) : unit =
+  pm.hb_compact_peers <- List.filter ((<>) peer_id) pm.hb_compact_peers
+
+(* Get all peers designated for high-bandwidth compact block relay *)
+let get_hb_compact_peers (pm : t) : Peer.peer list =
+  List.filter_map (fun pid ->
+    List.find_opt (fun p -> p.Peer.id = pid && p.Peer.state = Peer.Ready) pm.peers
+  ) pm.hb_compact_peers
+
+(* Relay a compact block to all high-bandwidth peers.
+   Called when a new block is validated and connected.
+   Skips peers that don't have the previous block header yet. *)
+let relay_compact_block (pm : t) (block : Types.block)
+    ~(peer_has_header : Peer.peer -> Types.hash256 -> bool) : unit Lwt.t =
+  let prev_hash = block.header.prev_block in
+  let cb = P2p.create_compact_block block in
+  let msg = P2p.CmpctblockMsg cb in
+  let hb_peers = get_hb_compact_peers pm in
+  Lwt_list.iter_p (fun peer ->
+    if peer_has_header peer prev_hash then
+      Lwt.catch
+        (fun () -> Peer.send_message peer msg)
+        (fun _exn -> Lwt.return_unit)
+    else
+      Lwt.return_unit
+  ) hb_peers
+
+(* Create a transaction lookup table from mempool for compact block reconstruction *)
+let create_mempool_lookup (pm : t) ~(k0 : int64) ~(k1 : int64)
+    : (int64, Types.transaction) Hashtbl.t =
+  match pm.mempool with
+  | None -> Hashtbl.create 0
+  | Some mp -> Mempool.create_short_id_lookup mp ~k0 ~k1
+
+(* Attempt to reconstruct a block from a compact block using mempool transactions.
+   Returns the reconstructed block if successful, or a list of missing indices. *)
+let reconstruct_from_mempool (pm : t) (cb : P2p.compact_block)
+    : P2p.reconstruct_status =
+  let header_hash = Crypto.compute_block_hash cb.header in
+  let (k0, k1) = Crypto.SipHash.derive_keys header_hash cb.nonce in
+  let lookup_tbl = create_mempool_lookup pm ~k0 ~k1 in
+  let lookup = { P2p.by_short_id = lookup_tbl } in
+  P2p.reconstruct_block cb lookup

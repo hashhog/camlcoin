@@ -37,6 +37,11 @@ type mempool_entry = {
   time_added : float;
   height_added : int;
   depends_on : Types.hash256 list;  (* parent txids in mempool *)
+  (* Cached ancestor/descendant stats for O(1) limit checks after initial computation *)
+  mutable ancestor_count : int;     (* number of ancestors including self *)
+  mutable ancestor_size : int;      (* total vsize of ancestors including self *)
+  mutable descendant_count : int;   (* number of descendants including self *)
+  mutable descendant_size : int;    (* total vsize of descendants including self *)
 }
 
 (* ============================================================================
@@ -245,12 +250,39 @@ let is_confirmed_utxo (mp : mempool) (outpoint : Types.outpoint) : bool =
    ============================================================================ *)
 
 (* Remove a transaction and its dependents recursively.
-   Collects dependent txids before removal to avoid mutating Hashtbl during iteration. *)
+   Collects dependent txids before removal to avoid mutating Hashtbl during iteration.
+   Updates cached descendant counts of ancestors using BFS. *)
 let rec remove_transaction (mp : mempool) (txid : Types.hash256) : unit =
   let txid_key = Cstruct.to_string txid in
   match Hashtbl.find_opt mp.entries txid_key with
   | None -> ()
   | Some entry ->
+    let vsize = (entry.weight + 3) / 4 in
+    (* Update ancestor descendant counts before removal *)
+    let visited = Hashtbl.create 16 in
+    let queue = Queue.create () in
+    List.iter (fun parent_txid ->
+      let parent_key = Cstruct.to_string parent_txid in
+      if not (Hashtbl.mem visited parent_key) then begin
+        Hashtbl.replace visited parent_key ();
+        Queue.push parent_key queue
+      end
+    ) entry.depends_on;
+    while not (Queue.is_empty queue) do
+      let key = Queue.pop queue in
+      match Hashtbl.find_opt mp.entries key with
+      | None -> ()
+      | Some ancestor_entry ->
+        ancestor_entry.descendant_count <- max 1 (ancestor_entry.descendant_count - 1);
+        ancestor_entry.descendant_size <- max ancestor_entry.descendant_size (ancestor_entry.descendant_size - vsize);
+        List.iter (fun gp_txid ->
+          let gp_key = Cstruct.to_string gp_txid in
+          if not (Hashtbl.mem visited gp_key) then begin
+            Hashtbl.replace visited gp_key ();
+            Queue.push gp_key queue
+          end
+        ) ancestor_entry.depends_on
+    done;
     Hashtbl.remove mp.entries txid_key;
     mp.total_weight <- mp.total_weight - entry.weight;
     mp.total_fee <- Int64.sub mp.total_fee entry.fee;
@@ -947,62 +979,71 @@ let is_standard_tx (min_relay_fee : int64) (tx : Types.transaction) : (unit, str
 
 (* ============================================================================
    Ancestor/Descendant Limit Checks (Task 3 + Gap 6: size limits)
+
+   Uses BFS to compute ancestor set. Cached descendant counts in mempool_entry
+   allow O(1) limit checks after initial ancestor walk.
    ============================================================================ *)
 
-(* Check if adding a transaction would violate ancestor/descendant limits *)
+(* Check if adding a transaction would violate ancestor/descendant limits.
+   Uses BFS to walk parent links and compute ancestor set. *)
 let check_ancestor_descendant_limits (mp : mempool) (depends : Types.hash256 list)
-    (txid : Types.hash256) (new_tx_weight : int) : (unit, string) result =
-  (* Count ancestors: all ancestors of all parents, plus the parents themselves *)
+    (_txid : Types.hash256) (new_tx_weight : int) : (unit, string) result =
+  let new_tx_vsize = (new_tx_weight + 3) / 4 in
+
+  (* BFS to compute ancestor set *)
   let all_ancestors = Hashtbl.create 16 in
+  let queue = Queue.create () in
   List.iter (fun parent_txid ->
     let parent_key = Cstruct.to_string parent_txid in
     if not (Hashtbl.mem all_ancestors parent_key) then begin
       Hashtbl.replace all_ancestors parent_key ();
-      let ancestors = get_ancestors mp parent_txid in
-      List.iter (fun a ->
-        Hashtbl.replace all_ancestors (Cstruct.to_string a.txid) ()
-      ) ancestors
+      Queue.push parent_key queue
     end
   ) depends;
+  let ancestor_size_sum = ref 0 in
+  while not (Queue.is_empty queue) do
+    let key = Queue.pop queue in
+    match Hashtbl.find_opt mp.entries key with
+    | None -> ()
+    | Some entry ->
+      ancestor_size_sum := !ancestor_size_sum + (entry.weight + 3) / 4;
+      List.iter (fun gp_txid ->
+        let gp_key = Cstruct.to_string gp_txid in
+        if not (Hashtbl.mem all_ancestors gp_key) then begin
+          Hashtbl.replace all_ancestors gp_key ();
+          Queue.push gp_key queue
+        end
+      ) entry.depends_on
+  done;
+
   let ancestor_count = Hashtbl.length all_ancestors + 1 in  (* +1 for self *)
   if ancestor_count > max_ancestor_count then
     Error (Printf.sprintf "Too many ancestors (%d > %d)"
       ancestor_count max_ancestor_count)
   else begin
-    (* Gap 6: Check ancestor cumulative size *)
-    let ancestor_weight_sum = Hashtbl.fold (fun ancestor_key () acc ->
-      match Hashtbl.find_opt mp.entries ancestor_key with
-      | None -> acc
-      | Some e -> acc + e.weight
-    ) all_ancestors 0 in
-    let total_ancestor_size = ancestor_weight_sum + new_tx_weight in
+    (* Check ancestor cumulative size (in vbytes) *)
+    let total_ancestor_size = !ancestor_size_sum + new_tx_vsize in
     if total_ancestor_size > max_ancestor_size then
       Error (Printf.sprintf "Ancestor size limit exceeded (%d > %d)"
         total_ancestor_size max_ancestor_size)
     else begin
-      (* Check descendant limits for each parent: adding this tx increases
-         the descendant count of all ancestors *)
+      (* Check descendant limits for each ancestor using cached counts.
+         Adding this tx increases the descendant count of all ancestors by 1. *)
       let too_many_desc = ref false in
       let desc_size_exceeded = ref false in
       Hashtbl.iter (fun ancestor_key () ->
         if not !too_many_desc && not !desc_size_exceeded then begin
-          (* Find the ancestor entry to get its txid *)
           match Hashtbl.find_opt mp.entries ancestor_key with
           | None -> ()
           | Some ancestor_entry ->
-            let desc = get_descendants mp ancestor_entry.txid in
-            (* Current descendants + 1 (for new tx) *)
-            if List.length desc + 1 > max_descendant_count then
+            (* Use cached descendant_count: current + 1 for new tx *)
+            if ancestor_entry.descendant_count + 1 > max_descendant_count then
               too_many_desc := true;
-            (* Gap 6: Check cumulative descendant size *)
-            let desc_weight = List.fold_left (fun acc d -> acc + d.weight) 0 desc in
-            let total_desc_size = ancestor_entry.weight + desc_weight + new_tx_weight in
-            if total_desc_size > max_descendant_size then
+            (* Use cached descendant_size: current + new tx vsize *)
+            if ancestor_entry.descendant_size + new_tx_vsize > max_descendant_size then
               desc_size_exceeded := true
         end
       ) all_ancestors;
-      (* Also check descendants of the new tx's direct parents *)
-      ignore txid;
       if !too_many_desc then
         Error (Printf.sprintf "Adding transaction would exceed descendant limit (%d)"
           max_descendant_count)
@@ -1357,6 +1398,41 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (t
             | Ok () ->
 
             let wtxid = Crypto.compute_wtxid tx in
+            let vsize = (weight + 3) / 4 in
+
+            (* Compute initial ancestor stats using BFS *)
+            let (anc_count, anc_size) =
+              if !depends = [] then (1, vsize)
+              else begin
+                (* BFS to find all ancestors *)
+                let visited = Hashtbl.create 16 in
+                let queue = Queue.create () in
+                List.iter (fun parent_txid ->
+                  let parent_key = Cstruct.to_string parent_txid in
+                  if not (Hashtbl.mem visited parent_key) then begin
+                    Hashtbl.replace visited parent_key ();
+                    Queue.push parent_key queue
+                  end
+                ) !depends;
+                let total_size = ref vsize in
+                while not (Queue.is_empty queue) do
+                  let key = Queue.pop queue in
+                  match Hashtbl.find_opt mp.entries key with
+                  | None -> ()
+                  | Some parent_entry ->
+                    total_size := !total_size + (parent_entry.weight + 3) / 4;
+                    List.iter (fun gp_txid ->
+                      let gp_key = Cstruct.to_string gp_txid in
+                      if not (Hashtbl.mem visited gp_key) then begin
+                        Hashtbl.replace visited gp_key ();
+                        Queue.push gp_key queue
+                      end
+                    ) parent_entry.depends_on
+                done;
+                (Hashtbl.length visited + 1, !total_size)
+              end
+            in
+
             let entry = {
               tx;
               txid;
@@ -1367,6 +1443,10 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (t
               time_added = Unix.gettimeofday ();
               height_added = mp.current_height;
               depends_on = !depends;
+              ancestor_count = anc_count;
+              ancestor_size = anc_size;
+              descendant_count = 1;  (* initially just self *)
+              descendant_size = vsize;
             } in
 
             if not dry_run then begin
@@ -1378,6 +1458,32 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (t
                                inp.Types.previous_output.vout) in
                 Hashtbl.replace mp.map_next_tx out_key txid_key
               ) tx.inputs;
+
+              (* Update ancestor descendant counts - new tx is a descendant of all ancestors *)
+              let visited = Hashtbl.create 16 in
+              let queue = Queue.create () in
+              List.iter (fun parent_txid ->
+                let parent_key = Cstruct.to_string parent_txid in
+                if not (Hashtbl.mem visited parent_key) then begin
+                  Hashtbl.replace visited parent_key ();
+                  Queue.push parent_key queue
+                end
+              ) !depends;
+              while not (Queue.is_empty queue) do
+                let key = Queue.pop queue in
+                match Hashtbl.find_opt mp.entries key with
+                | None -> ()
+                | Some ancestor_entry ->
+                  ancestor_entry.descendant_count <- ancestor_entry.descendant_count + 1;
+                  ancestor_entry.descendant_size <- ancestor_entry.descendant_size + vsize;
+                  List.iter (fun gp_txid ->
+                    let gp_key = Cstruct.to_string gp_txid in
+                    if not (Hashtbl.mem visited gp_key) then begin
+                      Hashtbl.replace visited gp_key ();
+                      Queue.push gp_key queue
+                    end
+                  ) ancestor_entry.depends_on
+              done;
 
               (* Evict if over size limit - use cluster-based eviction *)
               if mp.total_weight > mp.max_size_bytes / 4 then

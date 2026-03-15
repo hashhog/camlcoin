@@ -1009,6 +1009,109 @@ let test_generate_rejects_too_many () =
   cleanup_test_db ()
 
 (* ============================================================================
+   Descriptor RPC Tests
+   ============================================================================ *)
+
+(* Test: getdescriptorinfo returns descriptor info *)
+let test_getdescriptorinfo_basic () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  let pk = "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9" in
+  let desc = "wpkh(" ^ pk ^ ")" in
+  let params = [`String desc] in
+  let result = Rpc.handle_getdescriptorinfo ctx params in
+  (match result with
+   | Ok (`Assoc fields) ->
+     Alcotest.(check bool) "has descriptor" true (List.mem_assoc "descriptor" fields);
+     Alcotest.(check bool) "has checksum" true (List.mem_assoc "checksum" fields);
+     Alcotest.(check bool) "has isrange" true (List.mem_assoc "isrange" fields);
+     Alcotest.(check bool) "has issolvable" true (List.mem_assoc "issolvable" fields);
+     (* wpkh with fixed key is not ranged *)
+     (match List.assoc_opt "isrange" fields with
+      | Some (`Bool false) -> ()
+      | _ -> Alcotest.fail "expected isrange=false")
+   | Ok _ -> Alcotest.fail "expected Assoc"
+   | Error e -> Alcotest.fail e);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: getdescriptorinfo identifies ranged descriptors *)
+let test_getdescriptorinfo_ranged () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8" in
+  let desc = "wpkh(" ^ xpub ^ "/0/*)" in
+  let params = [`String desc] in
+  let result = Rpc.handle_getdescriptorinfo ctx params in
+  (match result with
+   | Ok (`Assoc fields) ->
+     (match List.assoc_opt "isrange" fields with
+      | Some (`Bool true) -> ()
+      | _ -> Alcotest.fail "expected isrange=true for ranged descriptor")
+   | Ok _ -> Alcotest.fail "expected Assoc"
+   | Error e -> Alcotest.fail e);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: getdescriptorinfo returns error for invalid descriptor *)
+let test_getdescriptorinfo_invalid () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  let params = [`String "invalid()"] in
+  let result = Rpc.handle_getdescriptorinfo ctx params in
+  Alcotest.(check bool) "invalid descriptor error" true (Result.is_error result);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: deriveaddresses returns single address for non-ranged *)
+let test_deriveaddresses_single () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  let pk = "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9" in
+  let desc = "wpkh(" ^ pk ^ ")" in
+  let params = [`String desc] in
+  let result = Rpc.handle_deriveaddresses ctx params in
+  (match result with
+   | Ok (`List addrs) ->
+     Alcotest.(check int) "one address" 1 (List.length addrs);
+     (match List.hd addrs with
+      | `String addr ->
+        (* mainnet address starts with bc1 *)
+        Alcotest.(check bool) "starts with bc1" true
+          (String.length addr >= 3 && String.sub addr 0 3 = "bc1")
+      | _ -> Alcotest.fail "expected string address")
+   | Ok _ -> Alcotest.fail "expected List"
+   | Error e -> Alcotest.fail e);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: deriveaddresses with range *)
+let test_deriveaddresses_range () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8" in
+  let desc = "wpkh(" ^ xpub ^ "/0/*)" in
+  let params = [`String desc; `List [`Int 0; `Int 4]] in
+  let result = Rpc.handle_deriveaddresses ctx params in
+  (match result with
+   | Ok (`List addrs) ->
+     Alcotest.(check int) "five addresses" 5 (List.length addrs);
+     (* All addresses should be unique *)
+     let addr_strs = List.filter_map (function `String s -> Some s | _ -> None) addrs in
+     let unique = List.sort_uniq String.compare addr_strs in
+     Alcotest.(check int) "all unique" 5 (List.length unique)
+   | Ok _ -> Alcotest.fail "expected List"
+   | Error e -> Alcotest.fail e);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: deriveaddresses errors for ranged descriptor without range *)
+let test_deriveaddresses_ranged_no_range () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8" in
+  let desc = "wpkh(" ^ xpub ^ "/0/*)" in
+  let params = [`String desc] in
+  let result = Rpc.handle_deriveaddresses ctx params in
+  Alcotest.(check bool) "ranged without range error" true (Result.is_error result);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -1062,5 +1165,13 @@ let () =
       test_case "generateblock regtest only" `Quick test_generateblock_regtest_only;
       test_case "generate rejects negative" `Quick test_generate_rejects_negative;
       test_case "generate rejects too many" `Quick test_generate_rejects_too_many;
+    ];
+    "descriptors", [
+      test_case "getdescriptorinfo basic" `Quick test_getdescriptorinfo_basic;
+      test_case "getdescriptorinfo ranged" `Quick test_getdescriptorinfo_ranged;
+      test_case "getdescriptorinfo invalid" `Quick test_getdescriptorinfo_invalid;
+      test_case "deriveaddresses single" `Quick test_deriveaddresses_single;
+      test_case "deriveaddresses range" `Quick test_deriveaddresses_range;
+      test_case "deriveaddresses ranged no range" `Quick test_deriveaddresses_ranged_no_range;
     ];
   ]

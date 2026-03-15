@@ -65,6 +65,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Regtest mode (generate, generatetoaddress, generateblock RPCs, instant mining)
 - [x] Block invalidation (invalidateblock, reconsiderblock RPCs, descendant tracking, chain reorg)
 - [x] BIP324 v2 encrypted transport (ElligatorSwift key exchange, ChaCha20-Poly1305 AEAD, short message IDs)
+- [x] BIP155 addrv2 message support (Tor v3, I2P, CJDNS network addresses)
 - [ ] Bloom filters (BIP 37)
 
 ## Quick start

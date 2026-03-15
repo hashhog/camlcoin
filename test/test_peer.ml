@@ -579,6 +579,123 @@ let test_trickling_intervals () =
   Alcotest.(check bool) "inbound slower than outbound" true
     (avg_inbound > avg_outbound)
 
+(* Test that queue_inv delays sending - items stay in queue until flush *)
+let test_queue_inv_delayed () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.state <- Peer.Ready;
+  (* Queue several transactions *)
+  for i = 0 to 9 do
+    let hash = Cstruct.create 32 in
+    Cstruct.set_uint8 hash 0 i;
+    let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+    Peer.queue_inv peer entry
+  done;
+  (* Items should be queued, not sent - the queue should have 10 items *)
+  Alcotest.(check int) "items queued not sent" 10 (Peer.inv_queue_length peer);
+  (* should_flush_inv should be false since next_inv_send is in the future *)
+  peer.next_inv_send <- Unix.gettimeofday () +. 10.0;
+  Alcotest.(check bool) "should not flush yet" false (Peer.should_flush_inv peer)
+
+(* Test that transactions are batched - multiple items sent in one flush *)
+let test_inv_batching () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.state <- Peer.Ready;
+  (* Queue 50 transactions *)
+  for i = 0 to 49 do
+    let hash = Cstruct.create 32 in
+    Cstruct.set_uint8 hash 0 i;
+    let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+    Peer.queue_inv peer entry
+  done;
+  Alcotest.(check int) "50 items queued" 50 (Peer.inv_queue_length peer);
+  (* Flush will try to send all 50 in one batch (socket will fail, but that's ok) *)
+  let flushed = Lwt_main.run (Peer.flush_inv_queue peer) in
+  (* All 50 should have been dequeued for sending *)
+  Alcotest.(check int) "50 items flushed" 50 flushed;
+  Alcotest.(check int) "queue now empty" 0 (Peer.inv_queue_length peer)
+
+(* Test max 1000 items per flush *)
+let test_inv_batch_max_1000 () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.state <- Peer.Ready;
+  (* Queue 1500 transactions *)
+  for i = 0 to 1499 do
+    let hash = Cstruct.create 32 in
+    Cstruct.set_uint8 hash 0 (i mod 256);
+    Cstruct.set_uint8 hash 1 (i / 256);
+    let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+    Peer.queue_inv peer entry
+  done;
+  Alcotest.(check int) "1500 items queued" 1500 (Peer.inv_queue_length peer);
+  (* First flush should only send max_inv_per_flush (1000) *)
+  let flushed = Lwt_main.run (Peer.flush_inv_queue peer) in
+  Alcotest.(check int) "1000 items flushed" 1000 flushed;
+  Alcotest.(check int) "500 items remain" 500 (Peer.inv_queue_length peer);
+  (* Second flush gets the rest *)
+  let flushed2 = Lwt_main.run (Peer.flush_inv_queue peer) in
+  Alcotest.(check int) "500 items flushed" 500 flushed2;
+  Alcotest.(check int) "queue now empty" 0 (Peer.inv_queue_length peer)
+
+(* Test that relay=false peers don't receive tx inv *)
+let test_queue_inv_no_relay () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.state <- Peer.Ready;
+  peer.relay <- false;  (* Peer opted out of tx relay *)
+  let hash = Cstruct.create 32 in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+  Peer.queue_inv peer entry;
+  (* Tx should be suppressed for no-relay peer *)
+  Alcotest.(check int) "tx not queued for no-relay peer" 0 (Peer.inv_queue_length peer)
+
+(* Test that block_relay_only peers don't receive tx inv *)
+let test_queue_inv_block_relay_only () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.state <- Peer.Ready;
+  peer.block_relay_only <- true;  (* Block-relay-only connection *)
+  let hash = Cstruct.create 32 in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+  Peer.queue_inv peer entry;
+  (* Tx should be suppressed for block-relay-only peer *)
+  Alcotest.(check int) "tx not queued for block-relay-only" 0 (Peer.inv_queue_length peer)
+
+(* Test that block inv CAN be queued (not filtered like tx) *)
+let test_queue_inv_block_allowed () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.state <- Peer.Ready;
+  peer.relay <- false;  (* Peer opted out of tx relay *)
+  peer.block_relay_only <- true;  (* Block-relay-only *)
+  let hash = Cstruct.create 32 in
+  (* Block inventory should still be queued even for block-relay-only peers *)
+  let entry : Peer.inv_entry = { inv_type = P2p.InvBlock; hash } in
+  Peer.queue_inv peer entry;
+  (* Block inv should be queued *)
+  Alcotest.(check int) "block inv queued" 1 (Peer.inv_queue_length peer)
+
+(* Test that WitnessTx also respects relay flag *)
+let test_queue_inv_witness_tx_no_relay () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.state <- Peer.Ready;
+  peer.relay <- false;
+  let hash = Cstruct.create 32 in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvWitnessTx; hash } in
+  Peer.queue_inv peer entry;
+  (* WitnessTx should also be suppressed for no-relay peer *)
+  Alcotest.(check int) "witness tx not queued for no-relay" 0 (Peer.inv_queue_length peer)
+
 (* All tests *)
 let () =
   Alcotest.run "Peer" [
@@ -638,5 +755,12 @@ let () =
       Alcotest.test_case "should_flush_inv_ready" `Quick test_should_flush_inv_ready;
       Alcotest.test_case "schedule_next_inv_send" `Quick test_schedule_next_inv_send;
       Alcotest.test_case "trickling_intervals" `Quick test_trickling_intervals;
+      Alcotest.test_case "queue_inv_delayed" `Quick test_queue_inv_delayed;
+      Alcotest.test_case "inv_batching" `Quick test_inv_batching;
+      Alcotest.test_case "inv_batch_max_1000" `Quick test_inv_batch_max_1000;
+      Alcotest.test_case "no_relay_peer" `Quick test_queue_inv_no_relay;
+      Alcotest.test_case "block_relay_only" `Quick test_queue_inv_block_relay_only;
+      Alcotest.test_case "block_inv_allowed" `Quick test_queue_inv_block_allowed;
+      Alcotest.test_case "witness_tx_no_relay" `Quick test_queue_inv_witness_tx_no_relay;
     ];
   ]

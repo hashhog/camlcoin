@@ -893,6 +893,22 @@ type utxo = {
 (* UTXO lookup result *)
 type utxo_lookup = Types.outpoint -> utxo option
 
+(* UTXO view for transaction validation (alias for cleaner API) *)
+type utxo_view = utxo_lookup
+
+(* Get transaction sigop cost using UTXO view.
+   This is a convenience wrapper matching the canonical signature
+   mentioned in Bitcoin Core references.
+   Uses full flags (P2SH + WITNESS) by default. *)
+let get_transaction_sigop_cost (tx : Types.transaction) (view : utxo_view) : int =
+  let flags = Script.script_verify_p2sh lor Script.script_verify_witness in
+  let prev_script_pubkey_lookup outpoint =
+    match view outpoint with
+    | Some utxo -> Some utxo.script_pubkey
+    | None -> None
+  in
+  count_tx_sigops_cost tx ~prev_script_pubkey_lookup ~flags
+
 (* Validate transaction inputs against UTXO set
 
    IMPORTANT: This handles intra-block UTXO spending.

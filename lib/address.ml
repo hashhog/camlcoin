@@ -186,6 +186,16 @@ let bech32_encode (enc : bech32_encoding) (hrp : string) (data : int list) : str
   Buffer.contents buf
 
 let bech32_decode (s : string) : (bech32_encoding * string * int list) option =
+  (* BIP-173: reject mixed case. The data part (after the last '1' separator)
+     must be either all lowercase or all uppercase. *)
+  let has_lower = ref false in
+  let has_upper = ref false in
+  String.iter (fun c ->
+    if c >= 'a' && c <= 'z' then has_lower := true;
+    if c >= 'A' && c <= 'Z' then has_upper := true
+  ) s;
+  if !has_lower && !has_upper then None
+  else
   (* Find the separator '1' (last occurrence) *)
   let pos = match String.rindex_opt s '1' with
     | Some p -> p

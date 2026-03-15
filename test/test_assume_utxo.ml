@@ -299,6 +299,138 @@ let test_background_validation_states () =
     test_passed name
 
 (* ============================================================================
+   UTXO Hash Computation Tests
+   ============================================================================ *)
+
+let test_utxo_hash_empty () =
+  let name = "utxo hash of empty set" in
+  try
+    let hash = Assume_utxo.compute_utxo_hash
+        ~iter_coins:(fun _f -> ()) in
+    (* Empty input should hash to sha256d("") *)
+    let expected = Crypto.sha256d Cstruct.empty in
+    if Cstruct.equal hash expected then
+      test_passed name
+    else
+      test_failed name "Empty hash mismatch"
+  with e ->
+    test_failed name (Printexc.to_string e)
+
+let test_utxo_hash_single_coin () =
+  let name = "utxo hash of single coin" in
+  try
+    let coin : Assume_utxo.snapshot_coin = {
+      outpoint = {
+        Types.txid = Types.hash256_of_hex
+          "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        vout = 0l;
+      };
+      value = 5_000_000_000L;  (* 50 BTC *)
+      script_pubkey = Cstruct.of_string "\x76\xa9\x14abcdefghijklmnopqrst\x88\xac";
+      height = 100;
+      is_coinbase = true;
+    } in
+    let hash1 = Assume_utxo.compute_utxo_hash
+        ~iter_coins:(fun f -> f coin.outpoint coin) in
+    (* Running again should produce same hash *)
+    let hash2 = Assume_utxo.compute_utxo_hash
+        ~iter_coins:(fun f -> f coin.outpoint coin) in
+    if Cstruct.equal hash1 hash2 then
+      test_passed name
+    else
+      test_failed name "Hash not deterministic"
+  with e ->
+    test_failed name (Printexc.to_string e)
+
+let test_utxo_hash_multiple_coins () =
+  let name = "utxo hash of multiple coins" in
+  try
+    let coin1 : Assume_utxo.snapshot_coin = {
+      outpoint = { Types.txid = Cstruct.create 32; vout = 0l };
+      value = 100L;
+      script_pubkey = Cstruct.of_string "\x51"; (* OP_TRUE *)
+      height = 1;
+      is_coinbase = true;
+    } in
+    let coin2 : Assume_utxo.snapshot_coin = {
+      outpoint = { Types.txid = Cstruct.create 32; vout = 1l };
+      value = 200L;
+      script_pubkey = Cstruct.of_string "\x52"; (* OP_2 *)
+      height = 2;
+      is_coinbase = false;
+    } in
+    let hash_both = Assume_utxo.compute_utxo_hash
+        ~iter_coins:(fun f -> f coin1.outpoint coin1; f coin2.outpoint coin2) in
+    let hash_single = Assume_utxo.compute_utxo_hash
+        ~iter_coins:(fun f -> f coin1.outpoint coin1) in
+    (* Hash of multiple coins should differ from single coin *)
+    if Cstruct.equal hash_both hash_single then
+      test_failed name "Multiple coins should produce different hash than single"
+    else
+      test_passed name
+  with e ->
+    test_failed name (Printexc.to_string e)
+
+let test_utxo_hash_order_matters () =
+  let name = "utxo hash order matters" in
+  try
+    let coin1 : Assume_utxo.snapshot_coin = {
+      outpoint = { Types.txid = Cstruct.create 32; vout = 0l };
+      value = 100L;
+      script_pubkey = Cstruct.of_string "\x51";
+      height = 1;
+      is_coinbase = true;
+    } in
+    let coin2 : Assume_utxo.snapshot_coin = {
+      outpoint = { Types.txid = Cstruct.create 32; vout = 1l };
+      value = 200L;
+      script_pubkey = Cstruct.of_string "\x52";
+      height = 2;
+      is_coinbase = false;
+    } in
+    let hash_12 = Assume_utxo.compute_utxo_hash
+        ~iter_coins:(fun f -> f coin1.outpoint coin1; f coin2.outpoint coin2) in
+    let hash_21 = Assume_utxo.compute_utxo_hash
+        ~iter_coins:(fun f -> f coin2.outpoint coin2; f coin1.outpoint coin1) in
+    (* Order should matter for deterministic hashing *)
+    if Cstruct.equal hash_12 hash_21 then
+      test_failed name "Hash should be order-dependent"
+    else
+      test_passed name
+  with e ->
+    test_failed name (Printexc.to_string e)
+
+let test_coin_height_encoding () =
+  let name = "coin height encoding in hash" in
+  try
+    let make_coin height is_coinbase =
+      let coin : Assume_utxo.snapshot_coin = {
+        outpoint = { Types.txid = Cstruct.create 32; vout = 0l };
+        value = 100L;
+        script_pubkey = Cstruct.of_string "\x51";
+        height;
+        is_coinbase;
+      } in
+      Assume_utxo.compute_utxo_hash
+        ~iter_coins:(fun f -> f coin.outpoint coin)
+    in
+    (* Different heights should produce different hashes *)
+    let h100 = make_coin 100 false in
+    let h200 = make_coin 200 false in
+    if Cstruct.equal h100 h200 then
+      test_failed name "Different heights should produce different hashes"
+    else begin
+      (* Coinbase flag should also change hash *)
+      let h100_cb = make_coin 100 true in
+      if Cstruct.equal h100 h100_cb then
+        test_failed name "Coinbase flag should change hash"
+      else
+        test_passed name
+    end
+  with e ->
+    test_failed name (Printexc.to_string e)
+
+(* ============================================================================
    Main Test Runner
    ============================================================================ *)
 
@@ -329,5 +461,12 @@ let () =
 
   (* Background validation tests *)
   test_background_validation_states ();
+
+  (* UTXO hash computation tests *)
+  test_utxo_hash_empty ();
+  test_utxo_hash_single_coin ();
+  test_utxo_hash_multiple_coins ();
+  test_utxo_hash_order_matters ();
+  test_coin_height_encoding ();
 
   Printf.printf "All assume_utxo tests passed!\n"

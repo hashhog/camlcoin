@@ -628,6 +628,133 @@ let analysis_tests = [
   "analysis nonmalleable", `Quick, test_analysis_nonmalleable;
 ]
 
+(* ============================================================================
+   Decompilation Tests (Script -> Miniscript)
+   ============================================================================ *)
+
+let test_decompile_pk () =
+  (* pk(key) = c:pk_k(key) => <pubkey> OP_CHECKSIG *)
+  let node = Ms_wrap (WrapC, Ms_pk_k test_pubkey) in
+  let script = to_script P2WSH node in
+  match decompile P2WSH script with
+  | Some decompiled ->
+    let orig_str = to_string node in
+    let decomp_str = to_string decompiled in
+    Alcotest.(check string) "decompiled matches original" orig_str decomp_str
+  | None -> Alcotest.fail "decompilation failed for pk(key)"
+
+let test_decompile_multi () =
+  let node = Ms_multi (2, [test_pubkey; test_pubkey2]) in
+  let script = to_script P2WSH node in
+  match decompile P2WSH script with
+  | Some (Ms_multi (k, keys)) ->
+    Alcotest.(check int) "threshold is 2" 2 k;
+    Alcotest.(check int) "has 2 keys" 2 (List.length keys)
+  | Some _ -> Alcotest.fail "decompiled to wrong node type"
+  | None -> Alcotest.fail "decompilation failed for multi"
+
+let test_decompile_older () =
+  let node = Ms_older 144 in
+  let script = to_script P2WSH node in
+  match decompile P2WSH script with
+  | Some (Ms_older n) ->
+    Alcotest.(check int) "older value is 144" 144 n
+  | Some _ -> Alcotest.fail "decompiled to wrong node type"
+  | None -> Alcotest.fail "decompilation failed for older"
+
+let test_decompile_sha256 () =
+  let node = Ms_sha256 test_hash32 in
+  let script = to_script P2WSH node in
+  match decompile P2WSH script with
+  | Some (Ms_sha256 h) ->
+    Alcotest.(check bool) "hash matches" true (Cstruct.equal h test_hash32)
+  | Some _ -> Alcotest.fail "decompiled to wrong node type"
+  | None -> Alcotest.fail "decompilation failed for sha256"
+
+let test_decompile_or_i () =
+  let node = Ms_or_i (
+    Ms_wrap (WrapC, Ms_pk_k test_pubkey),
+    Ms_wrap (WrapC, Ms_pk_k test_pubkey2)
+  ) in
+  let script = to_script P2WSH node in
+  match decompile P2WSH script with
+  | Some (Ms_or_i _) -> ()
+  | Some _ -> Alcotest.fail "decompiled to wrong node type"
+  | None -> Alcotest.fail "decompilation failed for or_i"
+
+let test_decompile_checked_valid () =
+  let node = Ms_wrap (WrapC, Ms_pk_k test_pubkey) in
+  let script = to_script P2WSH node in
+  match decompile_checked P2WSH script with
+  | Ok _ -> ()
+  | Error e -> Alcotest.fail ("decompile_checked failed: " ^ e)
+
+let decompile_tests = [
+  "decompile pk", `Quick, test_decompile_pk;
+  "decompile multi", `Quick, test_decompile_multi;
+  "decompile older", `Quick, test_decompile_older;
+  "decompile sha256", `Quick, test_decompile_sha256;
+  "decompile or_i", `Quick, test_decompile_or_i;
+  "decompile_checked valid", `Quick, test_decompile_checked_valid;
+]
+
+(* ============================================================================
+   Optimal Satisfaction Tests
+   ============================================================================ *)
+
+let test_satisfy_thresh_optimal () =
+  (* thresh(2, pk(key1), s:pk(key2), s:pk(key1)) - all keys available *)
+  let sig_bytes = Cstruct.create 72 in
+  let sign_ctx = {
+    empty_sign_ctx with
+    sign = (fun _ -> Some sig_bytes);
+  } in
+  let node = Ms_thresh (2, [
+    Ms_wrap (WrapC, Ms_pk_k test_pubkey);
+    Ms_wrap (WrapS, Ms_wrap (WrapC, Ms_pk_k test_pubkey2));
+    Ms_wrap (WrapS, Ms_wrap (WrapC, Ms_pk_k test_pubkey));
+  ]) in
+  let result = satisfy P2WSH sign_ctx node in
+  Alcotest.(check bool) "can satisfy thresh" true (result.sat.available = AvailYes);
+  Alcotest.(check bool) "has signature" true result.sat.has_sig
+
+let test_satisfy_multi_order () =
+  (* multi(2, key1, key2) - only key2 available (should not satisfy) *)
+  let sig_bytes = Cstruct.create 72 in
+  let key2_bytes = match test_pubkey2 with KeyBytes c -> c | _ -> Cstruct.empty in
+  let sign_ctx = {
+    empty_sign_ctx with
+    sign = (fun k -> match k with
+      | KeyBytes cs when Cstruct.equal cs key2_bytes -> Some sig_bytes
+      | _ -> None);
+  } in
+  let node = Ms_multi (2, [test_pubkey; test_pubkey2]) in
+  let result = satisfy P2WSH sign_ctx node in
+  (* With only 1 of 2 keys, we can't satisfy *)
+  Alcotest.(check bool) "cannot satisfy multi with insufficient keys" true
+    (result.sat.available <> AvailYes)
+
+let test_satisfy_multi_both_keys () =
+  (* multi(2, key1, key2) - both keys available *)
+  let sig_bytes = Cstruct.create 72 in
+  let sign_ctx = {
+    empty_sign_ctx with
+    sign = (fun _ -> Some sig_bytes);
+  } in
+  let node = Ms_multi (2, [test_pubkey; test_pubkey2]) in
+  let result = satisfy P2WSH sign_ctx node in
+  Alcotest.(check bool) "can satisfy multi with both keys" true
+    (result.sat.available = AvailYes);
+  (* Multi witness: dummy + k signatures *)
+  Alcotest.(check int) "multi witness has 3 items (dummy + 2 sigs)" 3
+    (List.length result.sat.items)
+
+let optimal_satisfy_tests = [
+  "satisfy thresh optimal", `Quick, test_satisfy_thresh_optimal;
+  "satisfy multi order", `Quick, test_satisfy_multi_order;
+  "satisfy multi both keys", `Quick, test_satisfy_multi_both_keys;
+]
+
 let () =
   Alcotest.run "Miniscript" [
     "type system", type_tests;
@@ -636,4 +763,6 @@ let () =
     "roundtrip", roundtrip_tests;
     "satisfaction", satisfy_tests;
     "analysis", analysis_tests;
+    "decompilation", decompile_tests;
+    "optimal satisfaction", optimal_satisfy_tests;
   ]

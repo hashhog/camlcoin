@@ -51,6 +51,7 @@ type rpc_context = {
   wallet_manager : Wallet.wallet_manager option;  (* Multi-wallet support *)
   fee_estimator : Fee_estimation.t;
   network : Consensus.network_config;
+  filter_index : Block_index.filter_index option;  (* BIP-157/158 block filter index *)
 }
 
 (* ============================================================================
@@ -277,6 +278,40 @@ let handle_getdifficulty (ctx : rpc_context) : Yojson.Safe.t =
   match ctx.chain.tip with
   | Some t -> `Float (Consensus.difficulty_from_bits t.header.bits)
   | None -> `Float 1.0
+
+(* ============================================================================
+   Block Filter Handler (BIP-157/158)
+   ============================================================================ *)
+
+let handle_getblockfilter (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match ctx.filter_index with
+  | None -> Error "Block filter index is not enabled"
+  | Some idx ->
+    (match params with
+     | [`String hash_hex] | [`String hash_hex; `String "basic"] ->
+       (* Parse hash in display format (reversed) *)
+       let hash_bytes = Types.hash256_of_hex hash_hex in
+       let hash = Cstruct.create 32 in
+       for i = 0 to 31 do
+         Cstruct.set_uint8 hash i (Cstruct.get_uint8 hash_bytes (31 - i))
+       done;
+       (match Block_index.read_filter idx hash with
+        | None -> Error "Block filter not found"
+        | Some bf ->
+          (* Get filter header *)
+          let header_opt = Block_index.get_filter_header idx hash in
+          let header_hex = match header_opt with
+            | Some h -> Types.hash256_to_hex_display h
+            | None -> ""
+          in
+          Ok (`Assoc [
+            ("filter", `String (Types.hash256_to_hex
+              (Cstruct.of_string bf.filter.Block_index.encoded)));
+            ("header", `String header_hex);
+          ]))
+     | _ ->
+       Error "Invalid parameters: expected [blockhash] or [blockhash, \"basic\"]")
 
 (* ============================================================================
    Block Invalidation Handlers
@@ -2129,6 +2164,7 @@ let handle_help (_ctx : rpc_context)
       "getblockhash height";
       "getblockheader \"blockhash\" ( verbose )";
       "getblockstats hash_or_height";
+      "getblockfilter \"blockhash\" ( filtertype )";
       "getdifficulty";
       "";
       "== Mining ==";
@@ -2243,6 +2279,10 @@ let dispatch_rpc (ctx : rpc_context)
      | Error msg -> Error (rpc_misc_error, msg))
   | "reconsiderblock" ->
     (match handle_reconsiderblock ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "getblockfilter" ->
+    (match handle_getblockfilter ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
 
@@ -2606,8 +2646,10 @@ let create_context
     ~(wallet : Wallet.t option)
     ~(fee_estimator : Fee_estimation.t)
     ~(network : Consensus.network_config)
-    ?(wallet_manager : Wallet.wallet_manager option = None) () : rpc_context =
-  { chain; mempool; peer_manager; wallet; wallet_manager; fee_estimator; network }
+    ?(wallet_manager : Wallet.wallet_manager option = None)
+    ?(filter_index : Block_index.filter_index option = None) () : rpc_context =
+  { chain; mempool; peer_manager; wallet; wallet_manager; fee_estimator; network;
+    filter_index }
 
 (* Create an RPC context with multi-wallet support *)
 let create_context_with_wallet_manager
@@ -2616,11 +2658,12 @@ let create_context_with_wallet_manager
     ~(peer_manager : Peer_manager.t)
     ~(wallet_manager : Wallet.wallet_manager)
     ~(fee_estimator : Fee_estimation.t)
-    ~(network : Consensus.network_config) : rpc_context =
+    ~(network : Consensus.network_config)
+    ?(filter_index : Block_index.filter_index option = None) () : rpc_context =
   (* Get default wallet from manager for backward compatibility *)
   let wallet = Wallet.get_default_wallet wallet_manager in
   { chain; mempool; peer_manager; wallet; wallet_manager = Some wallet_manager;
-    fee_estimator; network }
+    fee_estimator; network; filter_index }
 
 (* Default RPC ports by network *)
 let default_port (network : Consensus.network_config) : int =

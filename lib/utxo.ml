@@ -1074,6 +1074,9 @@ module UtxoCache = struct
     let total = t.stats.hits + t.stats.misses in
     if total = 0 then 1.0
     else float_of_int t.stats.hits /. float_of_int total
+
+  (** Get the parent view (for accessing the underlying database) *)
+  let get_view t = t.parent
 end
 
 (** Convert a utxo_entry (legacy type) to coin (new type) *)

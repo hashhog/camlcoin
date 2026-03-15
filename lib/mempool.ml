@@ -77,6 +77,9 @@ type mempool = {
   max_orphans : int;
   (* Spending index: outpoint (txid_str * vout) -> spending txid_str for O(1) conflict detection *)
   map_next_tx : (string * int32, string) Hashtbl.t;
+  (* ZMQ notifications *)
+  mutable zmq_sequence : int64;                 (* monotonically increasing sequence for ZMQ *)
+  mutable zmq_notifier : Zmq_notify.t option;   (* optional ZMQ notifier *)
 }
 
 (* ============================================================================
@@ -180,6 +183,7 @@ let truc_descendant_limit = 2     (* max unconfirmed descendants including self 
    ============================================================================ *)
 
 let create ?(require_standard=true) ?(verify_scripts=true)
+    ?(zmq_notifier : Zmq_notify.t option)
     ~(utxo : Utxo.UtxoSet.t) ~(current_height : int) () : mempool =
   let network = Consensus.regtest in
   { entries = Hashtbl.create 10_000;
@@ -196,7 +200,9 @@ let create ?(require_standard=true) ?(verify_scripts=true)
     verify_scripts;
     orphans = Hashtbl.create 100;
     max_orphans = 100;
-    map_next_tx = Hashtbl.create 10_000 }
+    map_next_tx = Hashtbl.create 10_000;
+    zmq_sequence = 0L;
+    zmq_notifier }
 
 (* ============================================================================
    Basic Queries
@@ -249,6 +255,30 @@ let is_confirmed_utxo (mp : mempool) (outpoint : Types.outpoint) : bool =
    Transaction Removal
    ============================================================================ *)
 
+(* Set the ZMQ notifier for the mempool *)
+let set_zmq_notifier (mp : mempool) (notifier : Zmq_notify.t) : unit =
+  mp.zmq_notifier <- Some notifier
+
+(* Get the current mempool ZMQ sequence number *)
+let get_zmq_sequence (mp : mempool) : int64 = mp.zmq_sequence
+
+(* Notify ZMQ subscribers about a transaction event *)
+let zmq_notify_tx (mp : mempool) (txid : Types.hash256) (tx : Types.transaction)
+    (acceptance : bool) : unit =
+  match mp.zmq_notifier with
+  | None -> ()
+  | Some notifier ->
+    let seq = mp.zmq_sequence in
+    mp.zmq_sequence <- Int64.add seq 1L;
+    (* Publish hashtx and rawtx *)
+    ignore (Zmq_notify.notify_hashtx notifier txid);
+    ignore (Zmq_notify.notify_rawtx notifier tx);
+    (* Publish sequence event *)
+    if acceptance then
+      ignore (Zmq_notify.notify_tx_acceptance notifier txid seq)
+    else
+      ignore (Zmq_notify.notify_tx_removal notifier txid seq)
+
 (* Remove a transaction and its dependents recursively.
    Collects dependent txids before removal to avoid mutating Hashtbl during iteration.
    Updates cached descendant counts of ancestors using BFS. *)
@@ -257,6 +287,8 @@ let rec remove_transaction (mp : mempool) (txid : Types.hash256) : unit =
   match Hashtbl.find_opt mp.entries txid_key with
   | None -> ()
   | Some entry ->
+    (* Notify ZMQ subscribers about removal *)
+    zmq_notify_tx mp entry.txid entry.tx false;
     let vsize = (entry.weight + 3) / 4 in
     (* Update ancestor descendant counts before removal *)
     let visited = Hashtbl.create 16 in
@@ -1487,7 +1519,10 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (t
 
               (* Evict if over size limit - use cluster-based eviction *)
               if mp.total_weight > mp.max_size_bytes / 4 then
-                evict_by_chunks mp
+                evict_by_chunks mp;
+
+              (* Notify ZMQ subscribers about new transaction *)
+              zmq_notify_tx mp txid tx true
             end;
 
             Ok entry

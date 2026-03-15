@@ -9,6 +9,7 @@ type network =
 
 (* Block weight limits (post-SegWit) *)
 let max_block_weight = 4_000_000
+let max_block_serialized_size = 4_000_000
 let max_block_sigops_cost = 80_000
 
 (* Monetary constants *)
@@ -24,9 +25,13 @@ let max_target_timespan = target_timespan * 4  (* 4x upper bound *)
 let min_target_timespan = target_timespan / 4  (* 4x lower bound *)
 let max_timewarp = 600  (* BIP-94: max seconds a retarget-boundary block can predate its parent *)
 
+(* Witness limits *)
+let witness_scale_factor = 4
+
 (* Transaction limits *)
-let max_tx_weight = 400_000
-let max_standard_tx_weight = 400_000
+let max_tx_weight = max_block_weight  (* Consensus limit: base_size*4 <= MAX_BLOCK_WEIGHT *)
+let max_standard_tx_weight = 400_000  (* Policy limit for relay/mempool *)
+let max_tx_base_size_for_block = max_block_weight / witness_scale_factor
 let min_tx_weight = 4 * 60  (* 240 weight units *)
 let max_standard_tx_sigops_cost = 16_000
 let max_script_size = 10_000
@@ -35,9 +40,6 @@ let max_ops_per_script = 201
 let max_stack_size = 1000
 let max_pubkeys_per_multisig = 20
 let locktime_threshold = 500_000_000l  (* locktime < this = block height, >= = Unix time *)
-
-(* Witness limits *)
-let witness_scale_factor = 4
 let max_standard_p2wsh_script_size = 3600
 let max_standard_p2wsh_stack_items = 100
 let max_standard_p2wsh_stack_item_size = 80
@@ -577,9 +579,12 @@ let regtest : network_config = {
   checkpoints = [];
 }
 
-(* Encode block height in coinbase transaction (BIP-34) *)
-(* IMPORTANT: Uses CScriptNum sign-magnitude encoding, where MSB is sign bit *)
-(* Thresholds are 0x7f/0x7fff/0x7fffff (not 0xff/0xffff) because of sign bit *)
+(* Encode block height in coinbase transaction (BIP-34)
+   Bitcoin Core's CScript::push_int64 uses:
+   - OP_0 (0x00) for height 0
+   - OP_1..OP_16 (0x51..0x60) for heights 1-16
+   - CScriptNum serialization for larger values (length-prefixed, sign-magnitude)
+   IMPORTANT: Sign bit thresholds are 0x7f/0x7fff/0x7fffff, not 0xff/0xffff *)
 let encode_height_in_coinbase (height : int) : Cstruct.t =
   if height < 0 then
     failwith "encode_height_in_coinbase: height cannot be negative"
@@ -588,19 +593,20 @@ let encode_height_in_coinbase (height : int) : Cstruct.t =
     let cs = Cstruct.create 1 in
     Cstruct.set_uint8 cs 0 0x00;
     cs
-  end else if height >= 1 && height <= 16 then begin
-    (* OP_1 through OP_16 (0x51 - 0x60) *)
+  end
+  else if height >= 1 && height <= 16 then begin
+    (* OP_1 through OP_16 (0x51 + height - 1) *)
     let cs = Cstruct.create 1 in
     Cstruct.set_uint8 cs 0 (0x50 + height);
     cs
-  end else begin
-    (* Use minimal CScriptNum encoding *)
-    (* Must account for sign-magnitude: if MSB would be set, add extra byte *)
+  end
+  else begin
+    (* CScriptNum: length-prefixed sign-magnitude little-endian *)
     let bytes_needed =
-      if height <= 0x7f then 1                (* 1 byte: 0x01-0x7f *)
-      else if height <= 0x7fff then 2         (* 2 bytes: 0x80-0x7fff *)
-      else if height <= 0x7fffff then 3       (* 3 bytes: 0x8000-0x7fffff *)
-      else 4                                  (* 4 bytes: larger values *)
+      if height <= 0x7f then 1           (* 1 byte: 0x01-0x7f *)
+      else if height <= 0x7fff then 2    (* 2 bytes: 0x80-0x7fff *)
+      else if height <= 0x7fffff then 3  (* 3 bytes: 0x8000-0x7fffff *)
+      else 4                             (* 4 bytes: larger values *)
     in
     let cs = Cstruct.create (1 + bytes_needed) in
     Cstruct.set_uint8 cs 0 bytes_needed;
@@ -782,7 +788,7 @@ let work_from_compact (bits : int32) : Cstruct.t =
     done;
     (* Schoolbook long division: not_target / target_plus_1.
        Process from MSB (byte 31) to LSB (byte 0) in LE representation. *)
-    let quotient = target_divide
+    let _quotient = target_divide
       (let extended = Cstruct.create 36 in
        Cstruct.blit not_target 0 extended 0 32;
        extended)
@@ -996,7 +1002,7 @@ let always_active = -1L     (* Deployment is always active (for testing) *)
 let never_active = -2L      (* Deployment is never active (disabled) *)
 
 (* Default threshold values *)
-let mainnet_threshold = 1815   (* ~90% of 2016 *)
+let mainnet_threshold = 1916   (* 95% of 2016, Bitcoin Core default *)
 let testnet_threshold = 1512   (* 75% of 2016 for test networks *)
 
 (* Known deployments *)

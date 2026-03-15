@@ -674,6 +674,246 @@ let test_cmpctblock_command () =
   let s = P2p.command_to_string P2p.Cmpctblock in
   Alcotest.(check string) "cmpctblock string" "cmpctblock" s
 
+(* ============================================================================
+   BIP324 v2 Transport Tests
+   ============================================================================ *)
+
+(* Test HKDF-SHA256 key derivation *)
+let test_hkdf_basic () =
+  let ikm = Cstruct.of_string (String.make 32 '\x0b') in
+  let prk = P2p.Hkdf.extract ~salt:"test_salt" ~ikm in
+  Alcotest.(check int) "PRK length" 32 (Cstruct.length prk);
+  let okm = P2p.Hkdf.expand32 prk "test_info" in
+  Alcotest.(check int) "OKM length" 32 (Cstruct.length okm);
+  (* Verify determinism *)
+  let okm2 = P2p.Hkdf.expand32 prk "test_info" in
+  Alcotest.(check bool) "HKDF deterministic" true (Cstruct.equal okm okm2)
+
+(* Test ChaCha20-Poly1305 encryption roundtrip *)
+let test_chacha20poly1305_roundtrip () =
+  let key = Cstruct.create 32 in
+  for i = 0 to 31 do Cstruct.set_uint8 key i i done;
+  let nonce = Cstruct.create 12 in
+  for i = 0 to 11 do Cstruct.set_uint8 nonce i (i * 2) done;
+  let aad = Cstruct.of_string "additional data" in
+  let plaintext = Cstruct.of_string "Hello, BIP324!" in
+
+  let ciphertext = P2p.ChaCha20Poly1305.encrypt ~key ~nonce ~aad ~plaintext in
+  Alcotest.(check int) "ciphertext length"
+    (Cstruct.length plaintext + 16) (Cstruct.length ciphertext);
+
+  match P2p.ChaCha20Poly1305.decrypt ~key ~nonce ~aad ~ciphertext_and_tag:ciphertext with
+  | None -> Alcotest.fail "Decryption failed"
+  | Some decrypted ->
+    Alcotest.(check bool) "plaintext matches"
+      true (Cstruct.equal plaintext decrypted)
+
+(* Test ChaCha20-Poly1305 authentication *)
+let test_chacha20poly1305_auth_fail () =
+  let key = Cstruct.create 32 in
+  for i = 0 to 31 do Cstruct.set_uint8 key i i done;
+  let nonce = Cstruct.create 12 in
+  let aad = Cstruct.of_string "aad" in
+  let plaintext = Cstruct.of_string "secret message" in
+
+  let ciphertext = P2p.ChaCha20Poly1305.encrypt ~key ~nonce ~aad ~plaintext in
+
+  (* Tamper with ciphertext *)
+  let corrupted = Cstruct.sub_copy ciphertext 0 (Cstruct.length ciphertext) in
+  Cstruct.set_uint8 corrupted 0 (Cstruct.get_uint8 corrupted 0 lxor 0xFF);
+
+  match P2p.ChaCha20Poly1305.decrypt ~key ~nonce ~aad ~ciphertext_and_tag:corrupted with
+  | None -> ()  (* Expected: authentication failure *)
+  | Some _ -> Alcotest.fail "Decryption should have failed"
+
+(* Test FSChaCha20Poly1305 rekeying *)
+let test_fs_chacha20poly1305_rekey () =
+  let key = Cstruct.create 32 in
+  for i = 0 to 31 do Cstruct.set_uint8 key i i done;
+  let cipher = P2p.FSChaCha20Poly1305.create key 10 in
+
+  (* Encrypt 15 messages (should trigger rekeying at packet 10) *)
+  let plaintexts = List.init 15 (fun i ->
+    Cstruct.of_string (Printf.sprintf "message_%d" i)
+  ) in
+  let ciphertexts = List.map (fun pt ->
+    P2p.FSChaCha20Poly1305.encrypt cipher ~aad:Cstruct.empty ~plaintext:pt
+  ) plaintexts in
+
+  (* Ciphertexts should all be different *)
+  let unique_count = List.length (List.sort_uniq Cstruct.compare ciphertexts) in
+  Alcotest.(check int) "all ciphertexts unique" 15 unique_count
+
+(* Test BIP324 short message IDs *)
+let test_bip324_short_ids () =
+  (* Test known short IDs *)
+  Alcotest.(check (option int)) "ping ID" (Some 18) (P2p.Bip324.short_id_of_command "ping");
+  Alcotest.(check (option int)) "pong ID" (Some 19) (P2p.Bip324.short_id_of_command "pong");
+  Alcotest.(check (option int)) "addr ID" (Some 1) (P2p.Bip324.short_id_of_command "addr");
+  Alcotest.(check (option int)) "block ID" (Some 2) (P2p.Bip324.short_id_of_command "block");
+  Alcotest.(check (option int)) "tx ID" (Some 21) (P2p.Bip324.short_id_of_command "tx");
+  Alcotest.(check (option int)) "headers ID" (Some 13) (P2p.Bip324.short_id_of_command "headers");
+  Alcotest.(check (option int)) "inv ID" (Some 14) (P2p.Bip324.short_id_of_command "inv");
+  Alcotest.(check (option int)) "addrv2 ID" (Some 28) (P2p.Bip324.short_id_of_command "addrv2");
+
+  (* Test reverse lookup *)
+  Alcotest.(check (option string)) "ID 18 -> ping" (Some "ping") (P2p.Bip324.command_of_short_id 18);
+  Alcotest.(check (option string)) "ID 19 -> pong" (Some "pong") (P2p.Bip324.command_of_short_id 19);
+  Alcotest.(check (option string)) "ID 2 -> block" (Some "block") (P2p.Bip324.command_of_short_id 2);
+
+  (* Unknown commands should return None *)
+  Alcotest.(check (option int)) "version no short ID" None (P2p.Bip324.short_id_of_command "version");
+  Alcotest.(check (option int)) "verack no short ID" None (P2p.Bip324.short_id_of_command "verack")
+
+(* Test BIP324 cipher initialization *)
+let test_bip324_cipher_init () =
+  let ecdh_secret = Cstruct.create 32 in
+  for i = 0 to 31 do Cstruct.set_uint8 ecdh_secret i (i * 3 mod 256) done;
+
+  let cipher = P2p.init_bip324_cipher
+    ~ecdh_secret ~initiator:true ~network_magic:P2p.mainnet_magic in
+
+  (* Verify session ID is 32 bytes *)
+  Alcotest.(check int) "session_id length" 32 (Cstruct.length cipher.session_id);
+  (* Verify garbage terminators are 16 bytes *)
+  Alcotest.(check int) "send_gt length" 16 (Cstruct.length cipher.send_garbage_terminator);
+  Alcotest.(check int) "recv_gt length" 16 (Cstruct.length cipher.recv_garbage_terminator);
+  (* Ciphers should be initialized *)
+  Alcotest.(check bool) "send_l_cipher init" true (Option.is_some cipher.send_l_cipher);
+  Alcotest.(check bool) "recv_l_cipher init" true (Option.is_some cipher.recv_l_cipher);
+  Alcotest.(check bool) "send_p_cipher init" true (Option.is_some cipher.send_p_cipher);
+  Alcotest.(check bool) "recv_p_cipher init" true (Option.is_some cipher.recv_p_cipher)
+
+(* Test BIP324 packet encryption/decryption *)
+let test_bip324_packet_roundtrip () =
+  let ecdh_secret = Cstruct.create 32 in
+  for i = 0 to 31 do Cstruct.set_uint8 ecdh_secret i i done;
+
+  (* Create matching initiator and responder ciphers *)
+  let initiator_cipher = P2p.init_bip324_cipher
+    ~ecdh_secret ~initiator:true ~network_magic:P2p.mainnet_magic in
+  let responder_cipher = P2p.init_bip324_cipher
+    ~ecdh_secret ~initiator:false ~network_magic:P2p.mainnet_magic in
+
+  (* Initiator encrypts a message *)
+  let contents = Cstruct.of_string "test message contents" in
+  let encrypted = P2p.bip324_encrypt initiator_cipher
+    ~aad:Cstruct.empty ~contents ~ignore:false in
+
+  (* Extract length and payload *)
+  let enc_len = Cstruct.sub encrypted 0 P2p.Bip324.length_len in
+  let enc_payload = Cstruct.sub encrypted P2p.Bip324.length_len
+    (Cstruct.length encrypted - P2p.Bip324.length_len) in
+
+  (* Responder decrypts *)
+  let decrypted_len = P2p.bip324_decrypt_length responder_cipher enc_len in
+  Alcotest.(check int) "decrypted length"
+    (Cstruct.length contents) decrypted_len;
+
+  match P2p.bip324_decrypt responder_cipher ~aad:Cstruct.empty ~ciphertext:enc_payload with
+  | None -> Alcotest.fail "Decryption failed"
+  | Some (ignore_flag, decrypted_contents) ->
+    Alcotest.(check bool) "ignore flag" false ignore_flag;
+    Alcotest.(check bool) "contents match"
+      true (Cstruct.equal contents decrypted_contents)
+
+(* Test BIP324 ignore flag *)
+let test_bip324_ignore_flag () =
+  let ecdh_secret = Cstruct.create 32 in
+  for i = 0 to 31 do Cstruct.set_uint8 ecdh_secret i (i + 100) done;
+
+  let initiator = P2p.init_bip324_cipher
+    ~ecdh_secret ~initiator:true ~network_magic:P2p.mainnet_magic in
+  let responder = P2p.init_bip324_cipher
+    ~ecdh_secret ~initiator:false ~network_magic:P2p.mainnet_magic in
+
+  (* Encrypt with ignore flag set *)
+  let contents = Cstruct.of_string "decoy packet" in
+  let encrypted = P2p.bip324_encrypt initiator
+    ~aad:Cstruct.empty ~contents ~ignore:true in
+
+  let enc_payload = Cstruct.sub encrypted P2p.Bip324.length_len
+    (Cstruct.length encrypted - P2p.Bip324.length_len) in
+
+  match P2p.bip324_decrypt responder ~aad:Cstruct.empty ~ciphertext:enc_payload with
+  | None -> Alcotest.fail "Decryption failed"
+  | Some (ignore_flag, _) ->
+    Alcotest.(check bool) "ignore flag set" true ignore_flag
+
+(* Test V2 message type encoding *)
+let test_v2_message_encoding () =
+  (* Test short encoding for known commands *)
+  let ping_encoded = P2p.v2_encode_message P2p.Ping (Cstruct.create 8) in
+  Alcotest.(check int) "ping first byte" 18 (Cstruct.get_uint8 ping_encoded 0);
+  Alcotest.(check int) "ping total length" 9 (Cstruct.length ping_encoded);
+
+  let tx_encoded = P2p.v2_encode_message P2p.Tx (Cstruct.create 100) in
+  Alcotest.(check int) "tx first byte" 21 (Cstruct.get_uint8 tx_encoded 0);
+  Alcotest.(check int) "tx total length" 101 (Cstruct.length tx_encoded);
+
+  (* Test long encoding for commands without short ID *)
+  let version_encoded = P2p.v2_encode_message P2p.Version (Cstruct.create 50) in
+  Alcotest.(check int) "version first byte" 0 (Cstruct.get_uint8 version_encoded 0);
+  Alcotest.(check int) "version total length" (1 + 12 + 50) (Cstruct.length version_encoded)
+
+(* Test V2 message type decoding *)
+let test_v2_message_decoding () =
+  (* Test short ID decoding *)
+  let ping_contents = Cstruct.create 9 in
+  Cstruct.set_uint8 ping_contents 0 18;  (* ping short ID *)
+  (match P2p.v2_get_message_type ping_contents with
+   | Some (cmd, payload) ->
+     Alcotest.(check string) "decoded ping" "ping" (P2p.command_to_string cmd);
+     Alcotest.(check int) "ping payload" 8 (Cstruct.length payload)
+   | None -> Alcotest.fail "Failed to decode ping");
+
+  (* Test long encoding decoding *)
+  let version_contents = Cstruct.create 63 in
+  Cstruct.set_uint8 version_contents 0 0;  (* long encoding marker *)
+  Cstruct.blit_from_string "version" 0 version_contents 1 7;
+  (match P2p.v2_get_message_type version_contents with
+   | Some (cmd, payload) ->
+     Alcotest.(check string) "decoded version" "version" (P2p.command_to_string cmd);
+     Alcotest.(check int) "version payload" 50 (Cstruct.length payload)
+   | None -> Alcotest.fail "Failed to decode version")
+
+(* Test V2 transport creation *)
+let test_v2_transport_create () =
+  let initiator = P2p.create_v2_transport ~initiating:true ~magic:P2p.mainnet_magic in
+  (match initiator with
+   | P2p.V2 state ->
+     Alcotest.(check bool) "initiator flag" true state.initiating;
+     Alcotest.(check int) "ellswift pubkey length" 64 (Cstruct.length state.our_ellswift_pubkey);
+     Alcotest.(check bool) "send buffer non-empty" true (Cstruct.length state.send_buffer > 0)
+   | P2p.V1 _ -> Alcotest.fail "Expected V2 transport");
+
+  let responder = P2p.create_v2_transport ~initiating:false ~magic:P2p.testnet_magic in
+  (match responder with
+   | P2p.V2 state ->
+     Alcotest.(check bool) "responder flag" false state.initiating;
+     (* Responder doesn't send until it sees initiator's key *)
+     Alcotest.(check int) "responder initial send buffer" 0 (Cstruct.length state.send_buffer)
+   | P2p.V1 _ -> Alcotest.fail "Expected V2 transport")
+
+(* Test V1 transport creation *)
+let test_v1_transport_create () =
+  let v1 = P2p.create_v1_transport P2p.mainnet_magic in
+  match v1 with
+  | P2p.V1 state ->
+    Alcotest.(check int32) "v1 magic" P2p.mainnet_magic state.v1_magic
+  | P2p.V2 _ -> Alcotest.fail "Expected V1 transport"
+
+(* Test BIP324 constants *)
+let test_bip324_constants () =
+  Alcotest.(check int) "ellswift size" 64 P2p.Bip324.ellswift_pubkey_size;
+  Alcotest.(check int) "garbage term len" 16 P2p.Bip324.garbage_terminator_len;
+  Alcotest.(check int) "rekey interval" 224 P2p.Bip324.rekey_interval;
+  Alcotest.(check int) "length len" 3 P2p.Bip324.length_len;
+  Alcotest.(check int) "header len" 1 P2p.Bip324.header_len;
+  Alcotest.(check int) "tag len" 16 P2p.Bip324.poly1305_tag_len;
+  Alcotest.(check int) "max garbage" 4095 P2p.Bip324.max_garbage_len;
+  Alcotest.(check int) "expansion" 20 P2p.Bip324.expansion
+
 let () =
   let open Alcotest in
   run "P2P" [
@@ -727,6 +967,23 @@ let () =
       test_case "reconstruction missing" `Quick test_block_reconstruction_missing;
       test_case "differential indices" `Quick test_differential_indices;
       test_case "compact block tx count" `Quick test_compact_block_tx_count;
+    ];
+    "bip324", [
+      test_case "hkdf basic" `Quick test_hkdf_basic;
+      test_case "chacha20poly1305 roundtrip" `Quick test_chacha20poly1305_roundtrip;
+      test_case "chacha20poly1305 auth fail" `Quick test_chacha20poly1305_auth_fail;
+      test_case "fs chacha20poly1305 rekey" `Quick test_fs_chacha20poly1305_rekey;
+      test_case "bip324 short ids" `Quick test_bip324_short_ids;
+      test_case "bip324 cipher init" `Quick test_bip324_cipher_init;
+      test_case "bip324 packet roundtrip" `Quick test_bip324_packet_roundtrip;
+      test_case "bip324 ignore flag" `Quick test_bip324_ignore_flag;
+      test_case "bip324 constants" `Quick test_bip324_constants;
+    ];
+    "v2_transport", [
+      test_case "v2 message encoding" `Quick test_v2_message_encoding;
+      test_case "v2 message decoding" `Quick test_v2_message_decoding;
+      test_case "v2 transport create" `Quick test_v2_transport_create;
+      test_case "v1 transport create" `Quick test_v1_transport_create;
     ];
     "property", [
       QCheck_alcotest.to_alcotest test_ping_pong_property;

@@ -1,5 +1,8 @@
 (* Tests for peer connection and handshake *)
 
+(* Ignore SIGPIPE to prevent test termination when writing to unconnected sockets *)
+let () = Sys.set_signal Sys.sigpipe Sys.Signal_ignore
+
 open Camlcoin
 
 (* Test service flag encoding/decoding *)

@@ -3,3 +3,11 @@ _opam/
 *.byte
 *.native
 .env
+
+# Build artifacts
+*.cmi
+*.cmx
+*.o
+
+# Claude config
+.claude/

@@ -56,7 +56,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] Compact block relay (BIP 152, SipHash, short IDs, block reconstruction, high-bandwidth mode)
 - [x] Package relay (BIP 331, 1p1c topology, CPFP fee-bumping, topological sort, ephemeral anchors)
 - [x] PSBT (BIP-174, creator/updater/signer/combiner/finalizer/extractor roles, taproot support, RPC interface)
-- [x] Output descriptors (BIP 380-386, checksum, parsing, script generation, range expansion)
+- [x] Output descriptors (BIP 380-386, checksum, parsing, script generation, range expansion, RPC interface)
 - [x] Miniscript (type system, script generation, satisfaction, parsing, wsh(miniscript) support)
 - [x] BIP-133 feefilter (Poisson timing, noise rounding, block-relay-only exclusion)
 - [x] AssumeUTXO (BIP 199, snapshot loading, dual chainstate, background validation)

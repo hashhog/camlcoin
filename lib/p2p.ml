@@ -14,7 +14,7 @@ let max_addr_count = 1000
 
 (* Network magic bytes for different networks *)
 let mainnet_magic = 0xD9B4BEF9l
-let testnet_magic = 0x0709110Bl
+let testnet_magic = 0x1C163F28l
 let regtest_magic = 0xDAB5BFFAl
 let signet_magic = 0x40CF030Al
 

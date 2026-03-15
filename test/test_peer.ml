@@ -470,7 +470,7 @@ let test_queue_inv_ready () =
   peer.state <- Peer.Ready;
   let hash = Cstruct.create 32 in
   Cstruct.set_uint8 hash 0 0xAB;
-  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash; fee_rate = Some 2000L } in
   Peer.queue_inv peer entry;
   Alcotest.(check int) "queue has 1 item" 1 (Peer.inv_queue_length peer)
 
@@ -482,7 +482,7 @@ let test_queue_inv_not_ready () =
   (* Peer is Connected, not Ready *)
   Alcotest.(check bool) "peer not ready" false (peer.state = Peer.Ready);
   let hash = Cstruct.create 32 in
-  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash; fee_rate = Some 2000L } in
   Peer.queue_inv peer entry;
   Alcotest.(check int) "queue still empty" 0 (Peer.inv_queue_length peer)
 
@@ -495,7 +495,7 @@ let test_queue_inv_multiple () =
   for i = 0 to 99 do
     let hash = Cstruct.create 32 in
     Cstruct.set_uint8 hash 0 i;
-    let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+    let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash; fee_rate = Some 2000L } in
     Peer.queue_inv peer entry
   done;
   Alcotest.(check int) "queue has 100 items" 100 (Peer.inv_queue_length peer)
@@ -518,7 +518,7 @@ let test_should_flush_inv_not_time () =
   peer.state <- Peer.Ready;
   (* Add an item to the queue *)
   let hash = Cstruct.create 32 in
-  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash; fee_rate = Some 2000L } in
   Peer.queue_inv peer entry;
   (* Set next_inv_send to 10 seconds in the future *)
   peer.next_inv_send <- Unix.gettimeofday () +. 10.0;
@@ -533,7 +533,7 @@ let test_should_flush_inv_ready () =
   peer.state <- Peer.Ready;
   (* Add an item to the queue *)
   let hash = Cstruct.create 32 in
-  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash; fee_rate = Some 2000L } in
   Peer.queue_inv peer entry;
   (* Set next_inv_send to the past *)
   peer.next_inv_send <- Unix.gettimeofday () -. 1.0;
@@ -592,7 +592,7 @@ let test_queue_inv_delayed () =
   for i = 0 to 9 do
     let hash = Cstruct.create 32 in
     Cstruct.set_uint8 hash 0 i;
-    let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+    let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash; fee_rate = Some 2000L } in
     Peer.queue_inv peer entry
   done;
   (* Items should be queued, not sent - the queue should have 10 items *)
@@ -611,7 +611,7 @@ let test_inv_batching () =
   for i = 0 to 49 do
     let hash = Cstruct.create 32 in
     Cstruct.set_uint8 hash 0 i;
-    let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+    let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash; fee_rate = Some 2000L } in
     Peer.queue_inv peer entry
   done;
   Alcotest.(check int) "50 items queued" 50 (Peer.inv_queue_length peer);
@@ -632,7 +632,7 @@ let test_inv_batch_max_1000 () =
     let hash = Cstruct.create 32 in
     Cstruct.set_uint8 hash 0 (i mod 256);
     Cstruct.set_uint8 hash 1 (i / 256);
-    let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+    let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash; fee_rate = Some 2000L } in
     Peer.queue_inv peer entry
   done;
   Alcotest.(check int) "1500 items queued" 1500 (Peer.inv_queue_length peer);
@@ -653,7 +653,7 @@ let test_queue_inv_no_relay () =
   peer.state <- Peer.Ready;
   peer.relay <- false;  (* Peer opted out of tx relay *)
   let hash = Cstruct.create 32 in
-  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash; fee_rate = Some 2000L } in
   Peer.queue_inv peer entry;
   (* Tx should be suppressed for no-relay peer *)
   Alcotest.(check int) "tx not queued for no-relay peer" 0 (Peer.inv_queue_length peer)
@@ -666,7 +666,7 @@ let test_queue_inv_block_relay_only () =
   peer.state <- Peer.Ready;
   peer.block_relay_only <- true;  (* Block-relay-only connection *)
   let hash = Cstruct.create 32 in
-  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash } in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash; fee_rate = Some 2000L } in
   Peer.queue_inv peer entry;
   (* Tx should be suppressed for block-relay-only peer *)
   Alcotest.(check int) "tx not queued for block-relay-only" 0 (Peer.inv_queue_length peer)
@@ -681,7 +681,7 @@ let test_queue_inv_block_allowed () =
   peer.block_relay_only <- true;  (* Block-relay-only *)
   let hash = Cstruct.create 32 in
   (* Block inventory should still be queued even for block-relay-only peers *)
-  let entry : Peer.inv_entry = { inv_type = P2p.InvBlock; hash } in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvBlock; hash; fee_rate = None } in
   Peer.queue_inv peer entry;
   (* Block inv should be queued *)
   Alcotest.(check int) "block inv queued" 1 (Peer.inv_queue_length peer)
@@ -694,10 +694,198 @@ let test_queue_inv_witness_tx_no_relay () =
   peer.state <- Peer.Ready;
   peer.relay <- false;
   let hash = Cstruct.create 32 in
-  let entry : Peer.inv_entry = { inv_type = P2p.InvWitnessTx; hash } in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvWitnessTx; hash; fee_rate = Some 2000L } in
   Peer.queue_inv peer entry;
   (* WitnessTx should also be suppressed for no-relay peer *)
   Alcotest.(check int) "witness tx not queued for no-relay" 0 (Peer.inv_queue_length peer)
+
+(* ============================================================================
+   Feefilter Tests
+   ============================================================================ *)
+
+(* Test that tx above peer's feefilter passes *)
+let test_feefilter_tx_above () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.state <- Peer.Ready;
+  (* Peer sets feefilter to 1000 sat/kvB *)
+  peer.feefilter <- 1000L;
+  (* Queue a tx with 2000 sat/kvB fee rate (above feefilter) *)
+  let hash = Cstruct.create 32 in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash; fee_rate = Some 2000L } in
+  Peer.queue_inv peer entry;
+  (* Should be queued *)
+  Alcotest.(check int) "tx above feefilter queued" 1 (Peer.inv_queue_length peer)
+
+(* Test that tx below peer's feefilter is filtered out *)
+let test_feefilter_tx_below () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.state <- Peer.Ready;
+  (* Peer sets feefilter to 5000 sat/kvB *)
+  peer.feefilter <- 5000L;
+  (* Queue a tx with 1000 sat/kvB fee rate (below feefilter) *)
+  let hash = Cstruct.create 32 in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash; fee_rate = Some 1000L } in
+  Peer.queue_inv peer entry;
+  (* Should be filtered out *)
+  Alcotest.(check int) "tx below feefilter not queued" 0 (Peer.inv_queue_length peer)
+
+(* Test that tx at exactly the feefilter threshold passes *)
+let test_feefilter_tx_equal () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.state <- Peer.Ready;
+  (* Peer sets feefilter to 2000 sat/kvB *)
+  peer.feefilter <- 2000L;
+  (* Queue a tx with exactly 2000 sat/kvB fee rate *)
+  let hash = Cstruct.create 32 in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash; fee_rate = Some 2000L } in
+  Peer.queue_inv peer entry;
+  (* Should be queued (at or above threshold passes) *)
+  Alcotest.(check int) "tx at feefilter queued" 1 (Peer.inv_queue_length peer)
+
+(* Test that zero feefilter passes all transactions *)
+let test_feefilter_zero () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.state <- Peer.Ready;
+  (* Default feefilter is 0 (no filter) *)
+  Alcotest.(check int64) "default feefilter is 0" 0L peer.feefilter;
+  (* Queue a tx with low fee rate *)
+  let hash = Cstruct.create 32 in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvTx; hash; fee_rate = Some 100L } in
+  Peer.queue_inv peer entry;
+  (* Should be queued *)
+  Alcotest.(check int) "tx passes zero feefilter" 1 (Peer.inv_queue_length peer)
+
+(* Test that blocks are not affected by feefilter *)
+let test_feefilter_block_not_affected () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.state <- Peer.Ready;
+  (* Set very high feefilter *)
+  peer.feefilter <- 1_000_000L;
+  (* Queue a block (has no fee rate) *)
+  let hash = Cstruct.create 32 in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvBlock; hash; fee_rate = None } in
+  Peer.queue_inv peer entry;
+  (* Blocks should not be affected by feefilter *)
+  Alcotest.(check int) "block not filtered" 1 (Peer.inv_queue_length peer)
+
+(* Test that witness tx is also filtered by feefilter *)
+let test_feefilter_witness_tx () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.state <- Peer.Ready;
+  peer.feefilter <- 5000L;
+  (* Queue a witness tx with low fee rate *)
+  let hash = Cstruct.create 32 in
+  let entry : Peer.inv_entry = { inv_type = P2p.InvWitnessTx; hash; fee_rate = Some 1000L } in
+  Peer.queue_inv peer entry;
+  (* Should be filtered out *)
+  Alcotest.(check int) "witness tx below feefilter not queued" 0 (Peer.inv_queue_length peer)
+
+(* Test make_tx_inv helper function *)
+let test_make_tx_inv () =
+  let hash = Cstruct.create 32 in
+  Cstruct.set_uint8 hash 0 0xAB;
+  let entry = Peer.make_tx_inv ~witness:false hash 2500L in
+  Alcotest.(check bool) "inv_type is InvTx" true (entry.inv_type = P2p.InvTx);
+  Alcotest.(check bool) "hash matches" true (Cstruct.equal hash entry.hash);
+  Alcotest.(check (option int64)) "fee_rate set" (Some 2500L) entry.fee_rate
+
+(* Test make_tx_inv with witness *)
+let test_make_tx_inv_witness () =
+  let hash = Cstruct.create 32 in
+  let entry = Peer.make_tx_inv ~witness:true hash 3000L in
+  Alcotest.(check bool) "inv_type is InvWitnessTx" true (entry.inv_type = P2p.InvWitnessTx);
+  Alcotest.(check (option int64)) "fee_rate set" (Some 3000L) entry.fee_rate
+
+(* Test make_block_inv helper function *)
+let test_make_block_inv () =
+  let hash = Cstruct.create 32 in
+  Cstruct.set_uint8 hash 0 0xCD;
+  let entry = Peer.make_block_inv hash in
+  Alcotest.(check bool) "inv_type is InvBlock" true (entry.inv_type = P2p.InvBlock);
+  Alcotest.(check bool) "hash matches" true (Cstruct.equal hash entry.hash);
+  Alcotest.(check (option int64)) "fee_rate is None" None entry.fee_rate
+
+(* Test feefilter constants *)
+let test_feefilter_constants () =
+  Alcotest.(check (float 0.001)) "avg_feefilter_broadcast_interval = 600.0" 600.0
+    Peer.avg_feefilter_broadcast_interval;
+  Alcotest.(check (float 0.001)) "max_feefilter_change_delay = 300.0" 300.0
+    Peer.max_feefilter_change_delay;
+  Alcotest.(check int32) "feefilter_version = 70013" 70013l
+    Peer.feefilter_version
+
+(* Test fee filter rounder creates valid buckets *)
+let test_feefilter_rounder_buckets () =
+  let fee_set = Peer.FeeFilterRounder.make_fee_set 1000L in
+  (* Should have at least 0 and some positive values *)
+  Alcotest.(check bool) "has multiple buckets" true (Array.length fee_set > 3);
+  Alcotest.(check (float 0.001)) "first bucket is 0" 0.0 fee_set.(0);
+  (* Second bucket should be around min_relay_fee/2 = 500 *)
+  Alcotest.(check bool) "second bucket around 500" true
+    (fee_set.(1) >= 400.0 && fee_set.(1) <= 600.0)
+
+(* Test fee filter rounder round function *)
+let test_feefilter_rounder_round () =
+  let fee_set = Peer.FeeFilterRounder.make_fee_set 1000L in
+  (* Round 0 should give 0 *)
+  let r0 = Peer.FeeFilterRounder.round fee_set 0L in
+  Alcotest.(check int64) "round 0 gives 0" 0L r0;
+  (* Round a high value should give something close *)
+  let r_high = Peer.FeeFilterRounder.round fee_set 10000L in
+  Alcotest.(check bool) "round high gives reasonable value" true
+    (r_high >= 5000L && r_high <= 15000L)
+
+(* Test significant_feefilter_change detection *)
+let test_significant_feefilter_change () =
+  (* Same value - not significant *)
+  Alcotest.(check bool) "same value not significant" false
+    (Peer.significant_feefilter_change 1000L 1000L);
+  (* Small change - not significant *)
+  Alcotest.(check bool) "small change not significant" false
+    (Peer.significant_feefilter_change 900L 1000L);
+  Alcotest.(check bool) "small increase not significant" false
+    (Peer.significant_feefilter_change 1100L 1000L);
+  (* Large decrease (<75%) - significant *)
+  Alcotest.(check bool) "large decrease significant" true
+    (Peer.significant_feefilter_change 700L 1000L);
+  (* Large increase (>133%) - significant *)
+  Alcotest.(check bool) "large increase significant" true
+    (Peer.significant_feefilter_change 1400L 1000L);
+  (* Zero sent value - always significant *)
+  Alcotest.(check bool) "zero sent always significant" true
+    (Peer.significant_feefilter_change 1000L 0L)
+
+(* Test passes_feefilter function directly *)
+let test_passes_feefilter_direct () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.feefilter <- 1000L;
+  let hash = Cstruct.create 32 in
+  (* Tx above threshold passes *)
+  let entry_above : Peer.inv_entry = { inv_type = P2p.InvTx; hash; fee_rate = Some 2000L } in
+  Alcotest.(check bool) "above threshold passes" true
+    (Peer.passes_feefilter peer entry_above);
+  (* Tx below threshold fails *)
+  let entry_below : Peer.inv_entry = { inv_type = P2p.InvTx; hash; fee_rate = Some 500L } in
+  Alcotest.(check bool) "below threshold fails" false
+    (Peer.passes_feefilter peer entry_below);
+  (* Block (None fee_rate) passes *)
+  let entry_block : Peer.inv_entry = { inv_type = P2p.InvBlock; hash; fee_rate = None } in
+  Alcotest.(check bool) "block passes" true
+    (Peer.passes_feefilter peer entry_block)
 
 (* All tests *)
 let () =
@@ -765,5 +953,21 @@ let () =
       Alcotest.test_case "block_relay_only" `Quick test_queue_inv_block_relay_only;
       Alcotest.test_case "block_inv_allowed" `Quick test_queue_inv_block_allowed;
       Alcotest.test_case "witness_tx_no_relay" `Quick test_queue_inv_witness_tx_no_relay;
+    ];
+    "feefilter", [
+      Alcotest.test_case "constants" `Quick test_feefilter_constants;
+      Alcotest.test_case "tx_above" `Quick test_feefilter_tx_above;
+      Alcotest.test_case "tx_below" `Quick test_feefilter_tx_below;
+      Alcotest.test_case "tx_equal" `Quick test_feefilter_tx_equal;
+      Alcotest.test_case "zero_filter" `Quick test_feefilter_zero;
+      Alcotest.test_case "block_not_affected" `Quick test_feefilter_block_not_affected;
+      Alcotest.test_case "witness_tx" `Quick test_feefilter_witness_tx;
+      Alcotest.test_case "make_tx_inv" `Quick test_make_tx_inv;
+      Alcotest.test_case "make_tx_inv_witness" `Quick test_make_tx_inv_witness;
+      Alcotest.test_case "make_block_inv" `Quick test_make_block_inv;
+      Alcotest.test_case "rounder_buckets" `Quick test_feefilter_rounder_buckets;
+      Alcotest.test_case "rounder_round" `Quick test_feefilter_rounder_round;
+      Alcotest.test_case "significant_change" `Quick test_significant_feefilter_change;
+      Alcotest.test_case "passes_feefilter" `Quick test_passes_feefilter_direct;
     ];
   ]

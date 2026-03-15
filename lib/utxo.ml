@@ -216,7 +216,8 @@ let deserialize_undo_data r : undo_data =
    IMPORTANT: This modifies the UTXO set. If validation fails partway
    through, the UTXO set will be in an inconsistent state. Callers should
    use batch operations or be prepared to disconnect. *)
-let connect_block (utxo : UtxoSet.t) (block : Types.block)
+let connect_block ?(network_type : Consensus.network = Consensus.Mainnet)
+    (utxo : UtxoSet.t) (block : Types.block)
     (height : int)
     : (undo_data, string) result =
   let tx_undos = ref [] in
@@ -283,7 +284,7 @@ let connect_block (utxo : UtxoSet.t) (block : Types.block)
   match !error with
   | Some e -> Error e
   | None ->
-    let subsidy = Consensus.block_subsidy height in
+    let subsidy = Consensus.block_subsidy_for_network network_type height in
     let max_coinbase = Int64.add subsidy !total_fees in
     let coinbase = List.hd block.transactions in
     let coinbase_out = List.fold_left
@@ -596,7 +597,8 @@ end
    Process multiple blocks in sequence with reduced overhead.
    Returns the number of blocks successfully connected or an error. *)
 
-let connect_block_optimized (utxo : OptimizedUtxoSet.t) (block : Types.block)
+let connect_block_optimized ?(network_type : Consensus.network = Consensus.Mainnet)
+    (utxo : OptimizedUtxoSet.t) (block : Types.block)
     (height : int)
     : (undo_data, string) result =
   let tx_undos = ref [] in
@@ -663,7 +665,7 @@ let connect_block_optimized (utxo : OptimizedUtxoSet.t) (block : Types.block)
   match !error with
   | Some e -> Error e
   | None ->
-    let subsidy = Consensus.block_subsidy height in
+    let subsidy = Consensus.block_subsidy_for_network network_type height in
     let max_coinbase = Int64.add subsidy !total_fees in
     let coinbase = List.hd block.transactions in
     let coinbase_out = List.fold_left

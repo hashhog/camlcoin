@@ -1239,7 +1239,7 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
       let coinbase_value = List.fold_left (fun acc out ->
         Int64.add acc out.Types.value
       ) 0L coinbase.outputs in
-      let max_coinbase = Int64.add (Consensus.block_subsidy height) !total_fees in
+      let max_coinbase = Int64.add (Consensus.block_subsidy_for_network network.network_type height) !total_fees in
       if coinbase_value > max_coinbase then
         Error (BlockBadCoinbaseValue (coinbase_value, max_coinbase))
       else

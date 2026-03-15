@@ -752,34 +752,107 @@ and satisfy_hash_inner sctx h ht =
   | Some preimage -> { sat = sat_yes [preimage] false; dissat = sat_yes [Cstruct.create 32] false }
   | None -> { sat = sat_maybe; dissat = sat_yes [Cstruct.create 32] false }
 
+(* Helper to compute witness size *)
+and witness_size items =
+  List.fold_left (fun acc item -> acc + Cstruct.length item + 1) 0 items
+
+(* Select best option: prefer smaller witness when both available *)
+and select_best_sat a b =
+  match a.available, b.available with
+  | AvailYes, AvailYes ->
+    (* Prefer non-malleable (has signature), then smaller witness *)
+    if a.has_sig && not b.has_sig then a
+    else if b.has_sig && not a.has_sig then b
+    else if witness_size a.items <= witness_size b.items then a
+    else b
+  | AvailYes, _ -> a
+  | _, AvailYes -> b
+  | AvailMaybe, _ -> { available = AvailMaybe; has_sig = false; items = [] }
+  | _, AvailMaybe -> { available = AvailMaybe; has_sig = false; items = [] }
+  | AvailNo, AvailNo -> sat_no
+
+(* Dynamic programming for thresh satisfaction
+   Compute optimal witness by tracking best combinations at each count *)
 and satisfy_thresh_inner ctx sctx k subs =
   let results = List.map (satisfy_inner ctx sctx) subs in
   let n = List.length subs in
-  let sats_available = List.filter (fun r -> r.sat.available = AvailYes) results in
-  let dissats_available = List.filter (fun r -> r.dissat.available = AvailYes) results in
-  if List.length sats_available >= k && List.length dissats_available >= (n - k) then
-    let all_items = List.mapi (fun i r ->
-      if i < k then r.sat.items else r.dissat.items
-    ) results |> List.concat in
-    let has_sig = List.exists (fun r -> r.sat.has_sig) (List.filteri (fun i _ -> i < k) results) in
-    let dissat_items = List.concat_map (fun r -> r.dissat.items) results in
-    { sat = sat_yes all_items has_sig; dissat = sat_yes dissat_items false }
-  else if List.length dissats_available >= n then
-    let dissat_items = List.concat_map (fun r -> r.dissat.items) results in
-    { sat = sat_maybe; dissat = sat_yes dissat_items false }
-  else
-    { sat = sat_maybe; dissat = sat_maybe }
 
-and satisfy_multi_inner sctx k keys =
-  let sigs = List.filter_map sctx.sign keys in
-  let n = List.length keys in
-  if List.length sigs >= k then
-    let chosen = List.filteri (fun i _ -> i < k) sigs in
-    let dissat_items = Cstruct.create 0 :: List.init n (fun _ -> Cstruct.create 0) in
-    { sat = sat_yes (Cstruct.create 0 :: chosen) true; dissat = sat_yes dissat_items false }
+  (* dp[j] = best witness for satisfying exactly j subexpressions *)
+  (* Each entry is (available, has_sig, items, indices_used) *)
+  let dp = Array.make (n + 1) sat_no in
+  dp.(0) <- sat_yes [] false;
+
+  (* Process each subexpression *)
+  List.iteri (fun i r ->
+    (* Process in reverse to avoid using same subexpr twice *)
+    for j = min (i + 1) k downto 0 do
+      if dp.(j).available <> AvailNo then begin
+        (* Option 1: satisfy this subexpr, increment count *)
+        if j < k && r.sat.available = AvailYes then begin
+          let new_sat = {
+            available = AvailYes;
+            has_sig = dp.(j).has_sig || r.sat.has_sig;
+            items = dp.(j).items @ r.sat.items;
+          } in
+          dp.(j + 1) <- select_best_sat dp.(j + 1) new_sat
+        end;
+        (* Option 2: dissatisfy this subexpr, keep count *)
+        if r.dissat.available = AvailYes then begin
+          let new_sat = {
+            available = AvailYes;
+            has_sig = dp.(j).has_sig || r.dissat.has_sig;
+            items = dp.(j).items @ r.dissat.items;
+          } in
+          dp.(j) <- select_best_sat dp.(j) new_sat
+        end
+      end
+    done
+  ) results;
+
+  (* Build dissatisfaction: all subexpressions dissatisfied *)
+  let all_dissats_available = List.for_all (fun r -> r.dissat.available = AvailYes) results in
+  let dissat = if all_dissats_available then
+    let items = List.concat_map (fun r -> r.dissat.items) results in
+    sat_yes items false
+  else if List.exists (fun r -> r.dissat.available = AvailNo) results then
+    sat_no
   else
-    let dissat_items = Cstruct.create 0 :: List.init n (fun _ -> Cstruct.create 0) in
-    { sat = sat_maybe; dissat = sat_yes dissat_items false }
+    { available = AvailMaybe; has_sig = false; items = [] }
+  in
+
+  { sat = dp.(k); dissat }
+
+(* CHECKMULTISIG requires signatures in the same order as keys appear.
+   Use dynamic programming to find optimal k signatures. *)
+and satisfy_multi_inner sctx k keys =
+  let n = List.length keys in
+  (* Get signature availability for each key position *)
+  let key_sigs = List.mapi (fun _i key ->
+    match sctx.sign key with
+    | Some sig_bytes -> Some sig_bytes
+    | None -> None
+  ) keys in
+
+  (* dp[j] = (best sigs list, count of sigs) for first i keys with j sigs *)
+  (* We need exactly k signatures in order *)
+  let rec find_sigs acc count remaining =
+    if count >= k then Some (List.rev acc)
+    else match remaining with
+      | [] -> None
+      | None :: rest -> find_sigs acc count rest
+      | Some sig_bytes :: rest -> find_sigs (sig_bytes :: acc) (count + 1) rest
+  in
+
+  let dissat_items = Cstruct.create 0 :: List.init n (fun _ -> Cstruct.create 0) in
+
+  match find_sigs [] 0 key_sigs with
+  | Some sigs ->
+    (* CHECKMULTISIG has a dummy element bug - needs an extra item at bottom *)
+    { sat = sat_yes (Cstruct.create 0 :: sigs) true;
+      dissat = sat_yes dissat_items false }
+  | None ->
+    { sat = { available = AvailMaybe; has_sig = false; items = [] };
+      dissat = sat_yes dissat_items false }
 
 and satisfy_multi_a_inner sctx k keys =
   let n = List.length keys in
@@ -1060,3 +1133,346 @@ let rec to_string node =
   | Ms_multi (k, keys) -> "multi(" ^ string_of_int k ^ "," ^ String.concat "," (List.map key_to_string keys) ^ ")"
   | Ms_multi_a (k, keys) -> "multi_a(" ^ string_of_int k ^ "," ^ String.concat "," (List.map key_to_string keys) ^ ")"
   | Ms_wrap (w, x) -> String.make 1 (wrapper_to_char w) ^ ":" ^ to_string x
+
+(* ============================================================================
+   Script Decompilation (Script bytes -> Miniscript)
+   ============================================================================ *)
+
+(* Internal opcode representation for parsing *)
+type script_token =
+  | TokPush of Cstruct.t     (* push data *)
+  | TokOp of int             (* opcode byte *)
+
+let tokenize_script (script : Cstruct.t) : script_token list =
+  let len = Cstruct.length script in
+  let tokens = ref [] in
+  let pos = ref 0 in
+  while !pos < len do
+    let byte = Cstruct.get_uint8 script !pos in
+    incr pos;
+    if byte = 0x00 then
+      tokens := TokPush (Cstruct.create 0) :: !tokens
+    else if byte >= 0x01 && byte <= 0x4b then begin
+      let data_len = byte in
+      if !pos + data_len > len then raise Exit;
+      let data = Cstruct.sub script !pos data_len in
+      pos := !pos + data_len;
+      tokens := TokPush data :: !tokens
+    end else if byte = 0x4c then begin
+      if !pos >= len then raise Exit;
+      let data_len = Cstruct.get_uint8 script !pos in
+      incr pos;
+      if !pos + data_len > len then raise Exit;
+      let data = Cstruct.sub script !pos data_len in
+      pos := !pos + data_len;
+      tokens := TokPush data :: !tokens
+    end else if byte = 0x4d then begin
+      if !pos + 2 > len then raise Exit;
+      let data_len = Cstruct.LE.get_uint16 script !pos in
+      pos := !pos + 2;
+      if !pos + data_len > len then raise Exit;
+      let data = Cstruct.sub script !pos data_len in
+      pos := !pos + data_len;
+      tokens := TokPush data :: !tokens
+    end else if byte = 0x4e then begin
+      if !pos + 4 > len then raise Exit;
+      let data_len = Int32.to_int (Cstruct.LE.get_uint32 script !pos) in
+      pos := !pos + 4;
+      if data_len < 0 || !pos + data_len > len then raise Exit;
+      let data = Cstruct.sub script !pos data_len in
+      pos := !pos + data_len;
+      tokens := TokPush data :: !tokens
+    end else
+      tokens := TokOp byte :: !tokens
+  done;
+  List.rev !tokens
+
+(* Decode script number from CScriptNum encoding *)
+let decode_script_number (data : Cstruct.t) : int option =
+  let len = Cstruct.length data in
+  if len = 0 then Some 0
+  else if len > 4 then None
+  else begin
+    let result = ref 0 in
+    for i = 0 to len - 1 do
+      result := !result lor (Cstruct.get_uint8 data i lsl (i * 8))
+    done;
+    (* Handle sign bit *)
+    if Cstruct.get_uint8 data (len - 1) land 0x80 <> 0 then begin
+      result := !result land (lnot (0x80 lsl ((len - 1) * 8)));
+      result := - !result
+    end;
+    Some !result
+  end
+
+(* Extract a number from a token *)
+let token_to_number tok =
+  match tok with
+  | TokOp 0x00 -> Some 0
+  | TokOp n when n >= 0x51 && n <= 0x60 -> Some (n - 0x50)
+  | TokOp 0x4f -> Some (-1)
+  | TokPush data -> decode_script_number data
+  | _ -> None
+
+(* Check if token is a specific opcode *)
+let is_op byte tok =
+  match tok with
+  | TokOp b -> b = byte
+  | _ -> false
+
+(* Extract push data from token *)
+let get_push_data tok =
+  match tok with
+  | TokPush data -> Some data
+  | TokOp 0x00 -> Some (Cstruct.create 0)
+  | _ -> None
+
+(* Decompile: attempt to parse tokens as miniscript
+   Returns (miniscript option, remaining tokens) *)
+let rec decompile_inner ctx tokens : (miniscript * script_token list) option =
+  (* First, check for patterns that end with specific opcodes *)
+  (* Try c: wrapper (OP_CHECKSIG at end) first, since pk(key) = c:pk_k(key) *)
+  match try_decompile_with_checksig ctx tokens with
+  | Some result -> Some result
+  | None ->
+    match tokens with
+    | [] -> None
+
+    (* OP_0 = Ms_0 *)
+    | TokOp 0x00 :: rest -> Some (Ms_0, rest)
+
+    (* OP_1 = Ms_1 *)
+    | TokOp 0x51 :: rest -> Some (Ms_1, rest)
+
+    (* <pubkey 33 bytes> = pk_k(key) *)
+    | TokPush data :: rest when Cstruct.length data = 33 ->
+      Some (Ms_pk_k (KeyBytes data), rest)
+
+    (* <pubkey 32 bytes> = pk_k(key) for x-only keys in tapscript *)
+    | TokPush data :: rest when Cstruct.length data = 32 && ctx = Tapscript ->
+      let full = Cstruct.create 33 in
+      Cstruct.set_uint8 full 0 0x02;
+      Cstruct.blit data 0 full 1 32;
+      Some (Ms_pk_k (KeyBytes full), rest)
+
+    (* OP_DUP OP_HASH160 <20> OP_EQUALVERIFY = pk_h(key)
+       Note: we can't recover the actual key, only the hash *)
+    | TokOp 0x76 :: TokOp 0xa9 :: TokPush hash :: TokOp 0x88 :: rest
+      when Cstruct.length hash = 20 ->
+      (* We create a placeholder since we don't have the actual pubkey *)
+      Some (Ms_pk_h (KeyPlaceholder "unknown"), rest)
+
+    (* <n> OP_CSV = older(n) *)
+    | tok :: TokOp 0xb2 :: rest ->
+      (match token_to_number tok with
+       | Some n when n > 0 -> Some (Ms_older n, rest)
+       | _ -> None)
+
+    (* <n> OP_CLTV OP_DROP = after(n) *)
+    | tok :: TokOp 0xb1 :: TokOp 0x75 :: rest ->
+      (match token_to_number tok with
+       | Some n when n > 0 -> Some (Ms_after n, rest)
+       | _ -> None)
+
+  (* OP_SIZE <32> OP_EQUALVERIFY OP_SHA256 <32> OP_EQUAL = sha256(h) *)
+  | TokOp 0x82 :: tok32 :: TokOp 0x88 :: TokOp 0xa8 :: TokPush hash :: TokOp 0x87 :: rest
+    when token_to_number tok32 = Some 32 && Cstruct.length hash = 32 ->
+    Some (Ms_sha256 hash, rest)
+
+  (* OP_SIZE <32> OP_EQUALVERIFY OP_HASH256 <32> OP_EQUAL = hash256(h) *)
+  | TokOp 0x82 :: tok32 :: TokOp 0x88 :: TokOp 0xaa :: TokPush hash :: TokOp 0x87 :: rest
+    when token_to_number tok32 = Some 32 && Cstruct.length hash = 32 ->
+    Some (Ms_hash256 hash, rest)
+
+  (* OP_SIZE <32> OP_EQUALVERIFY OP_RIPEMD160 <20> OP_EQUAL = ripemd160(h) *)
+  | TokOp 0x82 :: tok32 :: TokOp 0x88 :: TokOp 0xa6 :: TokPush hash :: TokOp 0x87 :: rest
+    when token_to_number tok32 = Some 32 && Cstruct.length hash = 20 ->
+    Some (Ms_ripemd160 hash, rest)
+
+  (* OP_SIZE <32> OP_EQUALVERIFY OP_HASH160 <20> OP_EQUAL = hash160(h) *)
+  | TokOp 0x82 :: tok32 :: TokOp 0x88 :: TokOp 0xa9 :: TokPush hash :: TokOp 0x87 :: rest
+    when token_to_number tok32 = Some 32 && Cstruct.length hash = 20 ->
+    Some (Ms_hash160 hash, rest)
+
+  (* <k> <key1> ... <keyn> <n> OP_CHECKMULTISIG = multi(k, keys)
+     Only try this pattern if first token is a valid small number (1-20) *)
+  | tok_k :: TokPush _ :: _ when ctx = P2WSH ->
+    (match token_to_number tok_k with
+     | Some k when k > 0 && k <= 20 ->
+       (* Try to parse keys until we hit OP_CHECKMULTISIG *)
+       let rest = List.tl tokens in
+       let rec collect_keys acc toks =
+         match toks with
+         | TokPush data :: rest when Cstruct.length data = 33 ->
+           collect_keys (KeyBytes data :: acc) rest
+         | tok_n :: TokOp 0xae :: rest ->
+           (match token_to_number tok_n with
+            | Some n when n >= k && n = List.length acc ->
+              Some (Ms_multi (k, List.rev acc), rest)
+            | _ -> None)
+         | _ -> None
+       in
+       (match collect_keys [] rest with
+        | Some result -> Some result
+        | None -> try_decompile_compound ctx tokens)
+     | _ -> try_decompile_compound ctx tokens)
+
+  (* Fallback: try compound patterns *)
+  | _ -> try_decompile_compound ctx tokens
+
+(* Try to parse [X] OP_CHECKSIG = c:X where X is K-type
+   Only matches when OP_CHECKSIG is at the END of the tokens *)
+and try_decompile_with_checksig ctx tokens =
+  (* Check if tokens end with OP_CHECKSIG *)
+  let rec find_last_checksig acc = function
+    | [] -> None
+    | [TokOp 0xac] ->
+      (* Found OP_CHECKSIG at the end, parse what came before *)
+      let before = List.rev acc in
+      (match decompile_inner ctx before with
+       | Some (inner, []) ->
+         (* Check if inner is K-type (pk_k or pk_h) *)
+         (match inner with
+          | Ms_pk_k _ | Ms_pk_h _ -> Some (Ms_wrap (WrapC, inner), [])
+          | _ -> None)
+       | _ -> None)
+    | tok :: rest -> find_last_checksig (tok :: acc) rest
+  in
+  find_last_checksig [] tokens
+
+(* Try to parse compound expressions like and_v, or_i, etc *)
+and try_decompile_compound ctx tokens =
+  match tokens with
+  (* OP_IF [X] OP_ELSE [Y] OP_ENDIF = or_i(X, Y) *)
+  | TokOp 0x63 :: rest ->
+    (match find_else_endif ctx rest with
+     | Some (x_toks, y_toks, remaining) ->
+       (match decompile_inner ctx x_toks with
+        | Some (x, []) ->
+          (match decompile_inner ctx y_toks with
+           | Some (y, []) -> Some (Ms_or_i (x, y), remaining)
+           | _ -> None)
+        | _ -> None)
+     | None -> None)
+
+  (* OP_TOALTSTACK [X] OP_FROMALTSTACK = a:X *)
+  | TokOp 0x6b :: rest ->
+    (match find_fromaltstack ctx rest with
+     | Some (inner_toks, remaining) ->
+       (match decompile_inner ctx inner_toks with
+        | Some (inner, []) -> Some (Ms_wrap (WrapA, inner), remaining)
+        | _ -> None)
+     | None -> None)
+
+  (* OP_SWAP [X] = s:X *)
+  | TokOp 0x7c :: rest ->
+    (match decompile_inner ctx rest with
+     | Some (inner, remaining) -> Some (Ms_wrap (WrapS, inner), remaining)
+     | _ -> None)
+
+  (* OP_DUP OP_IF [X] OP_ENDIF = d:X *)
+  | TokOp 0x76 :: TokOp 0x63 :: rest ->
+    (match find_endif ctx rest with
+     | Some (inner_toks, remaining) ->
+       (match decompile_inner ctx inner_toks with
+        | Some (inner, []) -> Some (Ms_wrap (WrapD, inner), remaining)
+        | _ -> None)
+     | None -> None)
+
+  (* OP_SIZE OP_0NOTEQUAL OP_IF [X] OP_ENDIF = j:X *)
+  | TokOp 0x82 :: TokOp 0x92 :: TokOp 0x63 :: rest ->
+    (match find_endif ctx rest with
+     | Some (inner_toks, remaining) ->
+       (match decompile_inner ctx inner_toks with
+        | Some (inner, []) -> Some (Ms_wrap (WrapJ, inner), remaining)
+        | _ -> None)
+     | None -> None)
+
+  | _ -> None
+
+(* Find matching OP_ELSE and OP_ENDIF, handling nesting *)
+and find_else_endif ctx tokens =
+  let rec search depth acc_x = function
+    | [] -> None
+    | TokOp 0x63 :: rest -> (* OP_IF *)
+      search (depth + 1) (TokOp 0x63 :: acc_x) rest
+    | TokOp 0x67 :: rest when depth = 0 -> (* OP_ELSE at right level *)
+      let x_toks = List.rev acc_x in
+      find_endif_after_else ctx x_toks [] rest
+    | TokOp 0x67 :: rest -> (* OP_ELSE nested *)
+      search depth (TokOp 0x67 :: acc_x) rest
+    | TokOp 0x68 :: rest -> (* OP_ENDIF *)
+      if depth > 0 then search (depth - 1) (TokOp 0x68 :: acc_x) rest
+      else None (* mismatched *)
+    | tok :: rest -> search depth (tok :: acc_x) rest
+  in
+  search 0 [] tokens
+
+and find_endif_after_else ctx x_toks acc_y = function
+  | [] -> None
+  | TokOp 0x63 :: rest -> (* OP_IF nested *)
+    find_endif_after_else ctx x_toks (TokOp 0x63 :: acc_y) rest
+  | TokOp 0x68 :: rest -> (* OP_ENDIF *)
+    let rec count_ifs depth = function
+      | [] -> depth
+      | TokOp 0x63 :: r -> count_ifs (depth + 1) r
+      | TokOp 0x68 :: r -> count_ifs (depth - 1) r
+      | _ :: r -> count_ifs depth r
+    in
+    let nested = count_ifs 0 (List.rev acc_y) in
+    if nested = 0 then
+      Some (x_toks, List.rev acc_y, rest)
+    else
+      find_endif_after_else ctx x_toks (TokOp 0x68 :: acc_y) rest
+  | tok :: rest -> find_endif_after_else ctx x_toks (tok :: acc_y) rest
+
+(* Find matching OP_ENDIF (without OP_ELSE) *)
+and find_endif _ctx tokens =
+  let rec search depth acc = function
+    | [] -> None
+    | TokOp 0x63 :: rest -> search (depth + 1) (TokOp 0x63 :: acc) rest
+    | TokOp 0x68 :: rest ->
+      if depth = 0 then Some (List.rev acc, rest)
+      else search (depth - 1) (TokOp 0x68 :: acc) rest
+    | tok :: rest -> search depth (tok :: acc) rest
+  in
+  search 0 [] tokens
+
+(* Find OP_FROMALTSTACK *)
+and find_fromaltstack _ctx tokens =
+  let rec search acc = function
+    | [] -> None
+    | TokOp 0x6c :: rest -> Some (List.rev acc, rest)
+    | tok :: rest -> search (tok :: acc) rest
+  in
+  search [] tokens
+
+(* Main decompilation entry point *)
+let decompile ctx (script : Cstruct.t) : miniscript option =
+  try
+    let tokens = tokenize_script script in
+    match decompile_inner ctx tokens with
+    | Some (ms, []) -> Some ms
+    | Some (_ms, _remaining) ->
+      (* If there are remaining tokens, check if it's a v: wrapper pattern *)
+      None
+    | None -> None
+  with _ -> None
+
+(* Decompile with type checking *)
+let decompile_checked ctx script : (miniscript, string) result =
+  match decompile ctx script with
+  | None -> Error "failed to decompile script to miniscript"
+  | Some ms ->
+    match type_check ctx ms with
+    | Ok _ -> Ok ms
+    | Error e ->
+      let msg = match e with
+        | MissingProperty s -> "type error: missing property " ^ s
+        | IncompatibleBase s -> "type error: " ^ s
+        | ConflictingTimelocks -> "type error: conflicting timelocks"
+        | InvalidThreshold (k, n) -> Printf.sprintf "invalid threshold %d of %d" k n
+        | InvalidMultisig s -> "invalid multisig: " ^ s
+        | ContextMismatch s -> "context mismatch: " ^ s
+      in
+      Error msg

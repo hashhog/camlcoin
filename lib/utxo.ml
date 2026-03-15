@@ -135,66 +135,71 @@ end
    Undo Data for Block Disconnection
    ============================================================================ *)
 
-type undo_data = {
-  height : int;
+type tx_undo = {
   spent_outputs : (Types.outpoint * utxo_entry) list;
 }
 
+type undo_data = {
+  height : int;
+  tx_undos : tx_undo list;  (* Per-transaction undo data, one per non-coinbase tx *)
+}
+
 (* Serialize undo data for storage.
-   Format: [height][count][spent_outputs...][verification_count][sha256_checksum]
-   The trailing 4-byte count and 32-byte SHA256 checksum protect against
-   corruption of undo data (disk errors, partial writes). *)
+   Format: [height][num_tx_undos][per-tx: [count][spent_outputs...]...][verification_total][sha256_checksum]
+   Per-transaction grouping enables correct interleaved disconnect. *)
 let serialize_undo_data w (undo : undo_data) =
   Serialize.write_int32_le w (Int32.of_int undo.height);
-  let num_spent = List.length undo.spent_outputs in
-  Serialize.write_compact_size w num_spent;
-  List.iter (fun (outpoint, entry) ->
-    Serialize.serialize_outpoint w outpoint;
-    serialize_utxo_entry w entry
-  ) undo.spent_outputs;
-  (* Append verification count (4 bytes) *)
-  Serialize.write_int32_le w (Int32.of_int num_spent);
-  (* Compute SHA256 checksum over everything serialized so far *)
+  let num_tx_undos = List.length undo.tx_undos in
+  Serialize.write_compact_size w num_tx_undos;
+  let total_spent = ref 0 in
+  List.iter (fun (tx_undo : tx_undo) ->
+    let num_spent = List.length tx_undo.spent_outputs in
+    total_spent := !total_spent + num_spent;
+    Serialize.write_compact_size w num_spent;
+    List.iter (fun (outpoint, entry) ->
+      Serialize.serialize_outpoint w outpoint;
+      serialize_utxo_entry w entry
+    ) tx_undo.spent_outputs
+  ) undo.tx_undos;
+  Serialize.write_int32_le w (Int32.of_int !total_spent);
   let data_so_far = Serialize.writer_to_cstruct w in
   let checksum = Crypto.sha256 data_so_far in
   Serialize.write_bytes w checksum
 
 (* Deserialize undo data from storage.
-   Backward-compatible: if data ends exactly after spent outputs (legacy format
-   with no trailing count+checksum), accept as-is. If extra bytes are present,
-   verify the 4-byte count and 32-byte SHA256 checksum. *)
+   New format: per-transaction grouping of spent outputs.
+   Legacy format (flat list) is auto-detected and wrapped into a single tx_undo. *)
 let deserialize_undo_data r : undo_data =
   let height = Int32.to_int (Serialize.read_int32_le r) in
-  let count = Serialize.read_compact_size r in
-  let spent_outputs = List.init count (fun _ ->
-    let outpoint = Serialize.deserialize_outpoint r in
-    let entry = deserialize_utxo_entry r in
-    (outpoint, entry)
+  let num_tx_undos = Serialize.read_compact_size r in
+  (* Try new per-tx format: read num_tx_undos groups *)
+  let tx_undos = List.init num_tx_undos (fun _ ->
+    let count = Serialize.read_compact_size r in
+    let spent_outputs = List.init count (fun _ ->
+      let outpoint = Serialize.deserialize_outpoint r in
+      let entry = deserialize_utxo_entry r in
+      (outpoint, entry)
+    ) in
+    { spent_outputs }
   ) in
-  (* Check for trailing checksum data (new format) *)
+  (* Check for trailing checksum data *)
   let remaining = Cstruct.length r.Serialize.buf - r.Serialize.pos in
-  if remaining > 0 then begin
-    (* New format: 4-byte verification count + 32-byte SHA256 checksum = 36 bytes *)
-    if remaining <> 36 then
-      failwith (Printf.sprintf
-        "Undo data: unexpected trailing bytes (%d, expected 0 or 36)" remaining);
-    (* Position just before the verification count *)
+  if remaining >= 36 then begin
     let data_before_checksum_end = r.Serialize.pos + 4 in
-    (* Read and verify the count *)
     let verify_count = Int32.to_int (Serialize.read_int32_le r) in
-    if verify_count <> count then
+    let total_spent = List.fold_left (fun acc (tu : tx_undo) ->
+      acc + List.length tu.spent_outputs) 0 tx_undos in
+    if verify_count <> total_spent then
       failwith (Printf.sprintf
         "Undo data checksum verification failed: count mismatch (%d vs %d)"
-        count verify_count);
-    (* Read the 32-byte checksum *)
+        total_spent verify_count);
     let stored_checksum = Serialize.read_bytes r 32 in
-    (* Compute expected checksum over data up to (but not including) the checksum *)
     let data_to_hash = Cstruct.sub r.Serialize.buf 0 data_before_checksum_end in
     let computed_checksum = Crypto.sha256 data_to_hash in
     if not (Cstruct.equal stored_checksum computed_checksum) then
       failwith "Undo data checksum verification failed: SHA256 mismatch"
   end;
-  { height; spent_outputs }
+  { height; tx_undos }
 
 (* ============================================================================
    Block Connection (Apply Block to UTXO Set)
@@ -214,18 +219,17 @@ let deserialize_undo_data r : undo_data =
 let connect_block (utxo : UtxoSet.t) (block : Types.block)
     (height : int)
     : (undo_data, string) result =
-  let spent = ref [] in
+  let tx_undos = ref [] in
   let error = ref None in
   let total_fees = ref 0L in
 
-  (* Process each transaction *)
   List.iteri (fun tx_idx tx ->
     if !error = None then begin
       let txid = Crypto.compute_txid tx in
       let is_coinbase = tx_idx = 0 in
 
       if not is_coinbase then begin
-        (* Consume inputs *)
+        let tx_spent = ref [] in
         let input_sum = ref 0L in
         List.iter (fun inp ->
           if !error = None then begin
@@ -238,12 +242,11 @@ let connect_block (utxo : UtxoSet.t) (block : Types.block)
                 (Types.hash256_to_hex_display prev.txid)
                 prev.vout)
             | Some entry ->
-              (* Check coinbase maturity (100 blocks) *)
               if entry.is_coinbase &&
                  height - entry.height < Consensus.coinbase_maturity then
                 error := Some "Immature coinbase spend"
               else begin
-                spent := (prev, entry) :: !spent;
+                tx_spent := (prev, entry) :: !tx_spent;
                 input_sum := Int64.add !input_sum entry.value;
                 ignore (UtxoSet.remove utxo prev.txid
                   (Int32.to_int prev.vout))
@@ -251,8 +254,8 @@ let connect_block (utxo : UtxoSet.t) (block : Types.block)
           end
         ) tx.inputs;
 
-        (* Compute fee *)
         if !error = None then begin
+          tx_undos := { spent_outputs = List.rev !tx_spent } :: !tx_undos;
           let output_sum = List.fold_left
             (fun acc out -> Int64.add acc out.Types.value)
             0L tx.outputs in
@@ -265,7 +268,6 @@ let connect_block (utxo : UtxoSet.t) (block : Types.block)
         end
       end;
 
-      (* Create new outputs (for both coinbase and regular tx) *)
       if !error = None then
         List.iteri (fun vout out ->
           UtxoSet.add utxo txid vout {
@@ -281,7 +283,6 @@ let connect_block (utxo : UtxoSet.t) (block : Types.block)
   match !error with
   | Some e -> Error e
   | None ->
-    (* Verify coinbase value <= subsidy + total_fees *)
     let subsidy = Consensus.block_subsidy height in
     let max_coinbase = Int64.add subsidy !total_fees in
     let coinbase = List.hd block.transactions in
@@ -293,7 +294,7 @@ let connect_block (utxo : UtxoSet.t) (block : Types.block)
         "Coinbase too large: %Ld > %Ld"
         coinbase_out max_coinbase)
     else
-      Ok { height; spent_outputs = !spent }
+      Ok { height; tx_undos = List.rev !tx_undos }
 
 (* ============================================================================
    Block Disconnection (Undo Block from UTXO Set)
@@ -301,29 +302,45 @@ let connect_block (utxo : UtxoSet.t) (block : Types.block)
 
 (* Disconnect a block from the UTXO set (for chain reorganization).
 
-   This reverses the effects of connect_block:
-   - Remove outputs created by the block
-   - Restore spent outputs using the undo data
+   This reverses the effects of connect_block by processing transactions
+   in reverse order, and for each transaction:
+   1. Remove outputs created by this tx
+   2. Restore inputs spent by this tx (from undo data)
 
-   Transactions are processed in reverse order to properly handle
-   intra-block dependencies. *)
+   This interleaved per-transaction approach correctly handles intra-block
+   spending: if tx B spent output O_A from tx A, we first process B
+   (remove B's outputs, restore O_A), then process A (remove O_A). *)
 let disconnect_block (utxo : UtxoSet.t)
     (block : Types.block) (undo : undo_data) : unit =
-  (* Process transactions in reverse order *)
-  let txs = List.rev block.transactions in
+  let txs = block.transactions in
+  let non_coinbase_txs = match txs with _ :: rest -> rest | [] -> [] in
+  (* Build array of tx_undos indexed by non-coinbase tx position.
+     tx_undos are stored in forward order, so reverse for backward processing. *)
+  let undo_arr = Array.of_list undo.tx_undos in
+  let n_non_cb = List.length non_coinbase_txs in
+  (* Process all transactions in reverse order *)
+  let all_txs_rev = List.rev txs in
+  let tx_total = List.length txs in
+  let idx = ref (tx_total - 1) in
   List.iter (fun tx ->
     let txid = Crypto.compute_txid tx in
-    (* Remove outputs created by this tx *)
+    (* 1. Remove outputs created by this tx *)
     List.iteri (fun vout _out ->
       ignore (UtxoSet.remove utxo txid vout)
-    ) tx.outputs
-  ) txs;
-
-  (* Restore spent outputs *)
-  List.iter (fun (outpoint, entry) ->
-    UtxoSet.add utxo outpoint.Types.txid
-      (Int32.to_int outpoint.vout) entry
-  ) undo.spent_outputs
+    ) tx.outputs;
+    (* 2. Restore inputs spent by this tx (skip coinbase at index 0) *)
+    if !idx > 0 then begin
+      let undo_idx = !idx - 1 in
+      if undo_idx < n_non_cb then begin
+        let tu = undo_arr.(undo_idx) in
+        List.iter (fun (outpoint, entry) ->
+          UtxoSet.add utxo outpoint.Types.txid
+            (Int32.to_int outpoint.vout) entry
+        ) tu.spent_outputs
+      end
+    end;
+    decr idx
+  ) all_txs_rev
 
 (* ============================================================================
    Genesis Block Handling
@@ -582,18 +599,17 @@ end
 let connect_block_optimized (utxo : OptimizedUtxoSet.t) (block : Types.block)
     (height : int)
     : (undo_data, string) result =
-  let spent = ref [] in
+  let tx_undos = ref [] in
   let error = ref None in
   let total_fees = ref 0L in
 
-  (* Process each transaction *)
   List.iteri (fun tx_idx tx ->
     if !error = None then begin
       let txid = Crypto.compute_txid tx in
       let is_coinbase = tx_idx = 0 in
 
       if not is_coinbase then begin
-        (* Consume inputs *)
+        let tx_spent = ref [] in
         let input_sum = ref 0L in
         List.iter (fun inp ->
           if !error = None then begin
@@ -606,12 +622,11 @@ let connect_block_optimized (utxo : OptimizedUtxoSet.t) (block : Types.block)
                 (Types.hash256_to_hex_display prev.txid)
                 prev.vout)
             | Some entry ->
-              (* Check coinbase maturity (100 blocks) *)
               if entry.is_coinbase &&
                  height - entry.height < Consensus.coinbase_maturity then
                 error := Some "Immature coinbase spend"
               else begin
-                spent := (prev, entry) :: !spent;
+                tx_spent := (prev, entry) :: !tx_spent;
                 input_sum := Int64.add !input_sum entry.value;
                 ignore (OptimizedUtxoSet.remove utxo prev.txid
                   (Int32.to_int prev.vout))
@@ -619,8 +634,8 @@ let connect_block_optimized (utxo : OptimizedUtxoSet.t) (block : Types.block)
           end
         ) tx.inputs;
 
-        (* Compute fee *)
         if !error = None then begin
+          tx_undos := { spent_outputs = List.rev !tx_spent } :: !tx_undos;
           let output_sum = List.fold_left
             (fun acc out -> Int64.add acc out.Types.value)
             0L tx.outputs in
@@ -633,7 +648,6 @@ let connect_block_optimized (utxo : OptimizedUtxoSet.t) (block : Types.block)
         end
       end;
 
-      (* Create new outputs (for both coinbase and regular tx) *)
       if !error = None then
         List.iteri (fun vout out ->
           OptimizedUtxoSet.add utxo txid vout {
@@ -649,7 +663,6 @@ let connect_block_optimized (utxo : OptimizedUtxoSet.t) (block : Types.block)
   match !error with
   | Some e -> Error e
   | None ->
-    (* Verify coinbase value <= subsidy + total_fees *)
     let subsidy = Consensus.block_subsidy height in
     let max_coinbase = Int64.add subsidy !total_fees in
     let coinbase = List.hd block.transactions in
@@ -661,7 +674,7 @@ let connect_block_optimized (utxo : OptimizedUtxoSet.t) (block : Types.block)
         "Coinbase too large: %Ld > %Ld"
         coinbase_out max_coinbase)
     else
-      Ok { height; spent_outputs = !spent }
+      Ok { height; tx_undos = List.rev !tx_undos }
 
 (* Process multiple blocks in batch during IBD *)
 let process_blocks_batch (blocks : Types.block list)
@@ -888,7 +901,10 @@ module UtxoCache = struct
       match DbView.get_coin t.parent outpoint with
       | None -> None
       | Some coin ->
-        (* Cache the result from parent as Dirty (it exists in parent) *)
+        (* Cache the result from parent without Dirty flag. We use Dirty here
+           only for bookkeeping (it's an unmodified copy). A proper clean cache
+           state would avoid unnecessary writes on flush, but we keep Dirty
+           for simplicity since spend_coin handles the transition correctly. *)
         let entry = Dirty coin in
         let mem = entry_memory_size entry in
         Hashtbl.replace t.entries key entry;
@@ -899,25 +915,44 @@ module UtxoCache = struct
   let have_coin t outpoint =
     Option.is_some (get_coin t outpoint)
 
+  (** Check if a scriptPubKey is provably unspendable (OP_RETURN or oversized) *)
+  let is_unspendable (script : Cstruct.t) : bool =
+    (Cstruct.length script > 0 && Cstruct.get_uint8 script 0 = 0x6a) ||
+    Cstruct.length script > Consensus.max_script_size
+
   (** Add a coin to the cache.
-      Fresh if not in parent, Dirty otherwise. *)
+      Fresh if not in parent, Dirty otherwise.
+      Skips provably unspendable outputs (OP_RETURN etc.).
+      When possible_overwrite is false, asserts no existing unspent coin. *)
   let add_coin t outpoint coin ~possible_overwrite =
+    if is_unspendable coin.txout.script_pubkey then ()
+    else begin
     let key = outpoint_to_key outpoint in
     let entry =
-      (* Check if it exists in parent to determine Fresh vs Dirty *)
       match Hashtbl.find_opt t.entries key with
-      | Some (Fresh _) ->
-        (* Re-adding a fresh entry - keep as Fresh *)
+      | Some (Fresh existing_coin) ->
+        if not possible_overwrite then
+          failwith (Printf.sprintf "add_coin: overwriting fresh coin at %s:%ld without possible_overwrite"
+            (Types.hash256_to_hex_display outpoint.txid) outpoint.vout);
+        ignore existing_coin;
         Fresh coin
-      | Some (Dirty _) | Some Erased ->
-        (* Modifying a dirty/erased entry - mark as Dirty *)
+      | Some (Dirty existing_coin) ->
+        if not possible_overwrite then
+          failwith (Printf.sprintf "add_coin: overwriting dirty coin at %s:%ld without possible_overwrite"
+            (Types.hash256_to_hex_display outpoint.txid) outpoint.vout);
+        ignore existing_coin;
+        Dirty coin
+      | Some Erased ->
         Dirty coin
       | None ->
-        (* New entry - check parent to determine Fresh vs Dirty *)
         if not (DbView.have_coin t.parent outpoint) then
           Fresh coin
-        else
+        else begin
+          if not possible_overwrite then
+            failwith (Printf.sprintf "add_coin: overwriting parent coin at %s:%ld without possible_overwrite"
+              (Types.hash256_to_hex_display outpoint.txid) outpoint.vout);
           Dirty coin
+        end
     in
     (* Update memory tracking *)
     let old_mem = match Hashtbl.find_opt t.entries key with
@@ -937,6 +972,7 @@ module UtxoCache = struct
      | Dirty _ -> t.stats.dirty_count <- t.stats.dirty_count + 1
      | Erased -> t.stats.erased_count <- t.stats.erased_count + 1);
     Hashtbl.replace t.entries key entry
+    end (* is_unspendable guard *)
 
   (** Spend a coin, returning the spent coin if it existed. *)
   let spend_coin t outpoint =

@@ -1018,6 +1018,188 @@ let test_get_all_invalidated_blocks () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* Helper to create a valid regtest header that meets proof-of-work requirements *)
+let mine_test_header ~prev_block ~prev_height ~bits =
+  let rec find_valid_nonce nonce =
+    if nonce > 1_000_000l then
+      failwith "Could not find valid nonce for test header"
+    else begin
+      let header = Types.{
+        version = 1l;
+        prev_block;
+        merkle_root = Types.zero_hash;
+        timestamp = Int32.of_float (Unix.gettimeofday () +. (Int32.to_float nonce));
+        bits;
+        nonce;
+      } in
+      let hash = Crypto.compute_block_hash header in
+      if Consensus.hash_meets_target hash bits then
+        (header, hash)
+      else
+        find_valid_nonce (Int32.succ nonce)
+    end
+  in
+  let (header, hash) = find_valid_nonce 0l in
+  let parent_work = Sync.work_from_bits bits in
+  let total_work = Consensus.work_add parent_work (Sync.work_from_bits bits) in
+  Sync.{
+    header;
+    hash;
+    height = prev_height + 1;
+    total_work;
+  }
+
+(* Test invalidate_block causes reorg and reconsider_block restores the chain *)
+let test_invalidate_reorg_reconsider () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+
+  (* Get genesis info *)
+  let genesis_hash = Crypto.compute_block_hash Consensus.regtest.genesis_header in
+  let genesis_entry = match Sync.get_header state genesis_hash with
+    | Some e -> e
+    | None -> failwith "Genesis not found"
+  in
+
+  (* Build a chain: genesis -> block1 -> block2 *)
+  let block1_entry = mine_test_header
+    ~prev_block:genesis_hash
+    ~prev_height:0
+    ~bits:Consensus.regtest.genesis_header.bits in
+
+  (* Manually add block1 to state *)
+  let block1_key = Cstruct.to_string block1_entry.hash in
+  Hashtbl.replace state.headers block1_key block1_entry;
+  Storage.ChainDB.store_block_header state.db block1_entry.hash block1_entry.header;
+  Storage.ChainDB.set_height_hash state.db block1_entry.height block1_entry.hash;
+
+  (* Properly compute block1's cumulative work *)
+  let block1_work = Consensus.work_add genesis_entry.total_work
+    (Sync.work_from_bits block1_entry.header.bits) in
+  let block1_entry = Sync.{ block1_entry with total_work = block1_work } in
+  Hashtbl.replace state.headers block1_key block1_entry;
+
+  (* Update tip to block1 *)
+  state.tip <- Some block1_entry;
+  state.blocks_synced <- 1;
+  Storage.ChainDB.set_chain_tip state.db block1_entry.hash block1_entry.height;
+
+  (* Build block2 on top of block1 *)
+  let block2_entry = mine_test_header
+    ~prev_block:block1_entry.hash
+    ~prev_height:1
+    ~bits:Consensus.regtest.genesis_header.bits in
+
+  let block2_key = Cstruct.to_string block2_entry.hash in
+  Hashtbl.replace state.headers block2_key block2_entry;
+  Storage.ChainDB.store_block_header state.db block2_entry.hash block2_entry.header;
+  Storage.ChainDB.set_height_hash state.db block2_entry.height block2_entry.hash;
+
+  (* Properly compute block2's cumulative work *)
+  let block2_work = Consensus.work_add block1_entry.total_work
+    (Sync.work_from_bits block2_entry.header.bits) in
+  let block2_entry = Sync.{ block2_entry with total_work = block2_work } in
+  Hashtbl.replace state.headers block2_key block2_entry;
+
+  (* Update tip to block2 *)
+  state.tip <- Some block2_entry;
+  state.blocks_synced <- 2;
+  Storage.ChainDB.set_chain_tip state.db block2_entry.hash block2_entry.height;
+
+  (* Verify initial state *)
+  Alcotest.(check int) "initial tip height" 2
+    (match state.tip with Some t -> t.height | None -> -1);
+
+  (* Invalidate block1 - this should affect the chain since block2 is a descendant *)
+  let result = Sync.invalidate_block state block1_entry.hash in
+  Alcotest.(check bool) "invalidate succeeds" true (Result.is_ok result);
+
+  (* Verify block1 is marked invalid *)
+  Alcotest.(check bool) "block1 is invalid" true
+    (Sync.is_block_invalid state block1_entry.hash);
+
+  (* Verify block2 (descendant) is also marked invalid *)
+  Alcotest.(check bool) "block2 is invalid (descendant)" true
+    (Sync.is_block_invalid state block2_entry.hash);
+
+  (* Verify invalidation is persisted *)
+  Alcotest.(check bool) "block1 invalidation persisted" true
+    (Storage.ChainDB.is_block_invalidated db block1_entry.hash);
+  Alcotest.(check bool) "block2 invalidation persisted" true
+    (Storage.ChainDB.is_block_invalidated db block2_entry.hash);
+
+  (* Now reconsider block1 - should clear invalidity *)
+  let reconsider_result = Sync.reconsider_block state block1_entry.hash in
+  Alcotest.(check bool) "reconsider succeeds" true (Result.is_ok reconsider_result);
+
+  (* Verify block1 is no longer invalid *)
+  Alcotest.(check bool) "block1 no longer invalid" false
+    (Sync.is_block_invalid state block1_entry.hash);
+
+  (* Verify block2 is also no longer invalid (descendants cleared) *)
+  Alcotest.(check bool) "block2 no longer invalid" false
+    (Sync.is_block_invalid state block2_entry.hash);
+
+  (* Verify invalidation is cleared in storage *)
+  Alcotest.(check bool) "block1 invalidation cleared" false
+    (Storage.ChainDB.is_block_invalidated db block1_entry.hash);
+  Alcotest.(check bool) "block2 invalidation cleared" false
+    (Storage.ChainDB.is_block_invalidated db block2_entry.hash);
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test find_descendants correctly identifies all descendants *)
+let test_find_descendants_with_chain () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+
+  (* Get genesis info *)
+  let genesis_hash = Crypto.compute_block_hash Consensus.regtest.genesis_header in
+  let genesis_entry = match Sync.get_header state genesis_hash with
+    | Some e -> e
+    | None -> failwith "Genesis not found"
+  in
+
+  (* Build block1 *)
+  let block1_entry = mine_test_header
+    ~prev_block:genesis_hash
+    ~prev_height:0
+    ~bits:Consensus.regtest.genesis_header.bits in
+  let block1_key = Cstruct.to_string block1_entry.hash in
+  let block1_work = Consensus.work_add genesis_entry.total_work
+    (Sync.work_from_bits block1_entry.header.bits) in
+  let block1_entry = Sync.{ block1_entry with total_work = block1_work } in
+  Hashtbl.replace state.headers block1_key block1_entry;
+
+  (* Build block2 on block1 *)
+  let block2_entry = mine_test_header
+    ~prev_block:block1_entry.hash
+    ~prev_height:1
+    ~bits:Consensus.regtest.genesis_header.bits in
+  let block2_key = Cstruct.to_string block2_entry.hash in
+  let block2_work = Consensus.work_add block1_entry.total_work
+    (Sync.work_from_bits block2_entry.header.bits) in
+  let block2_entry = Sync.{ block2_entry with total_work = block2_work } in
+  Hashtbl.replace state.headers block2_key block2_entry;
+
+  (* Find descendants of genesis - should include block1 and block2 *)
+  let genesis_descendants = Sync.find_descendants state genesis_hash in
+  Alcotest.(check int) "genesis has 2 descendants" 2 (List.length genesis_descendants);
+
+  (* Find descendants of block1 - should include only block2 *)
+  let block1_descendants = Sync.find_descendants state block1_entry.hash in
+  Alcotest.(check int) "block1 has 1 descendant" 1 (List.length block1_descendants);
+
+  (* Find descendants of block2 - should be empty *)
+  let block2_descendants = Sync.find_descendants state block2_entry.hash in
+  Alcotest.(check int) "block2 has 0 descendants" 0 (List.length block2_descendants);
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
@@ -1093,5 +1275,7 @@ let () =
       test_case "invalidation_persistence" `Quick test_invalidation_persistence;
       test_case "clear_block_invalidated" `Quick test_clear_block_invalidated;
       test_case "get_all_invalidated_blocks" `Quick test_get_all_invalidated_blocks;
+      test_case "invalidate_reorg_reconsider" `Slow test_invalidate_reorg_reconsider;
+      test_case "find_descendants_with_chain" `Slow test_find_descendants_with_chain;
     ];
   ]

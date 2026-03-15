@@ -308,7 +308,7 @@ let create_block_template ~(chain : Sync.chain_state)
   (* Compute correct difficulty target using consensus rules *)
   let bits =
     let get_block_info h =
-      let rec find_entry entry =
+      let rec find_entry (entry : Sync.header_entry) =
         if entry.Sync.height = h then
           (entry.Sync.header.timestamp, entry.Sync.header.bits)
         else if entry.height = 0 then
@@ -330,8 +330,31 @@ let create_block_template ~(chain : Sync.chain_state)
       ~network:chain.network
   in
 
+  (* Compute block version with BIP-9 deployment signaling *)
+  let version =
+    let get_block h =
+      match Sync.get_header_at_height chain h with
+      | None -> None
+      | Some entry ->
+        let mtp = Int64.of_int32 (Sync.compute_median_time_past chain entry.height) in
+        Some Consensus.{ height = entry.height; version = entry.header.version; median_time_past = mtp }
+    in
+    let taproot_dep = match chain.network.name with
+      | "mainnet" -> Consensus.mainnet_taproot
+      | "testnet4" -> Consensus.testnet4_taproot
+      | _ -> Consensus.regtest_taproot
+    in
+    let deployments = [taproot_dep; Consensus.testdummy_deployment] in
+    let vb_cache = Consensus.create_versionbits_cache () in
+    let caches = [
+      (Consensus.Deployment_taproot, vb_cache.taproot);
+      (Consensus.Deployment_testdummy, vb_cache.testdummy);
+    ] in
+    Consensus.compute_block_version ~deployments ~height ~get_block ~caches
+  in
+
   let header : Types.block_header = {
-    version = 0x20000000l;
+    version;
     prev_block = tip.hash;
     merkle_root;
     timestamp;
@@ -456,6 +479,19 @@ let template_to_json (template : block_template) : Yojson.Safe.t =
     ]
   ) template.transactions in
 
+  (* Compute the default witness commitment script for miners *)
+  let all_txs = template.coinbase_tx :: template.transactions in
+  let witness_root = compute_witness_merkle_root all_txs in
+  let commitment = compute_witness_commitment witness_root in
+  let commitment_script = build_witness_commitment_script commitment in
+  let commitment_hex =
+    let buf = Buffer.create (Cstruct.length commitment_script * 2) in
+    for i = 0 to Cstruct.length commitment_script - 1 do
+      Buffer.add_string buf (Printf.sprintf "%02x" (Cstruct.get_uint8 commitment_script i))
+    done;
+    Buffer.contents buf
+  in
+
   `Assoc [
     ("version", `Int (Int32.to_int template.header.version));
     ("previousblockhash",
@@ -481,6 +517,7 @@ let template_to_json (template : block_template) : Yojson.Safe.t =
     ("bits",
       `String (Printf.sprintf "%08lx" template.header.bits));
     ("height", `Int template.height);
+    ("default_witness_commitment", `String commitment_hex);
   ]
 
 (* Simplified getblocktemplate response for basic mining *)

@@ -566,7 +566,8 @@ let create_background_validation ~(snapshot_params : assumeutxo_params) : backgr
 (** Update UTXO cache with a connected block.
     Returns the collected fees from the block. *)
 let connect_block_to_cache ~(cache : Utxo.UtxoCache.t) ~(block : Types.block)
-    ~(height : int) : (int64, string) result =
+    ~(height : int) ?(network_type : Consensus.network = Consensus.Mainnet) ()
+    : (int64, string) result =
   let error = ref None in
   let total_fees = ref 0L in
 
@@ -629,7 +630,7 @@ let connect_block_to_cache ~(cache : Utxo.UtxoCache.t) ~(block : Types.block)
   | Some e -> Error e
   | None ->
     (* Verify coinbase value *)
-    let subsidy = Consensus.block_subsidy height in
+    let subsidy = Consensus.block_subsidy_for_network network_type height in
     let max_coinbase = Int64.add subsidy !total_fees in
     let coinbase = List.hd block.Types.transactions in
     let coinbase_out = List.fold_left
@@ -732,7 +733,7 @@ let run_background_validation
           | Ok _fees ->
             (* Update IBD chainstate UTXO set with the block's changes *)
             (match connect_block_to_cache ~cache:ibd_chainstate.utxo_cache
-                     ~block ~height:next_height with
+                     ~block ~height:next_height () with
             | Error e ->
               bg_validation.state <- BgFailed e;
               snapshot_chainstate.assumeutxo_state <- Invalid;

@@ -1254,13 +1254,15 @@ let handle_generateblock (ctx : rpc_context)
            let ts = Int64.of_float (Unix.gettimeofday () *. 1000000.0) in
            Cstruct.LE.set_uint64 extra_nonce 0 ts;
            (* Compute witness commitment if any segwit transactions *)
+           let network_type = ctx.network.network_type in
            let placeholder_coinbase = Mining.create_coinbase
-             ~height ~total_fee ~payout_script ~extra_nonce ~witness_root:None in
+             ~height ~total_fee ~payout_script ~extra_nonce ~witness_root:None
+             ~network_type () in
            let all_txs_for_witness = placeholder_coinbase :: transactions in
            let witness_root = Mining.compute_witness_merkle_root all_txs_for_witness in
            let coinbase_tx = Mining.create_coinbase
              ~height ~total_fee ~payout_script ~extra_nonce
-             ~witness_root:(Some witness_root) in
+             ~witness_root:(Some witness_root) ~network_type () in
            (* Build block *)
            let all_txs = coinbase_tx :: transactions in
            let txids = List.map Crypto.compute_txid all_txs in
@@ -1298,6 +1300,7 @@ let handle_generateblock (ctx : rpc_context)
              total_weight = 0;
              height;
              target = Consensus.compact_to_target ctx.network.pow_limit;
+             network_type = ctx.network.network_type;
            } in
            (* Mine the block *)
            match Mining.mine_block template 100_000_000l with
@@ -1950,7 +1953,7 @@ let handle_getblockstats (ctx : rpc_context)
        let total_out = List.fold_left (fun acc tx ->
          List.fold_left (fun a out -> Int64.add a out.Types.value) acc tx.Types.outputs
        ) 0L block.transactions in
-       let subsidy = Consensus.block_subsidy height in
+       let subsidy = Consensus.block_subsidy_for_network ctx.network.network_type height in
        let total_weight =
          80 * Consensus.witness_scale_factor +
          List.fold_left (fun acc tx ->

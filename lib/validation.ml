@@ -30,6 +30,7 @@ type block_validation_error =
   | BlockBadTimestamp
   | BlockBadDifficulty
   | BlockOverweight of int
+  | BlockOversized of int
   | BlockTooManySigops
   | BlockBadCoinbaseValue of int64 * int64
   | BlockDuplicateTx
@@ -74,6 +75,8 @@ let block_error_to_string = function
   | BlockBadDifficulty -> "block does not meet difficulty target"
   | BlockOverweight w ->
     Printf.sprintf "block exceeds max weight (%d > %d)" w Consensus.max_block_weight
+  | BlockOversized s ->
+    Printf.sprintf "block exceeds max serialized size (%d > %d)" s Consensus.max_block_serialized_size
   | BlockTooManySigops -> "block exceeds sigop limit"
   | BlockBadCoinbaseValue (actual, expected) ->
     Printf.sprintf "coinbase value too high (%Ld > %Ld)" actual expected
@@ -144,10 +147,15 @@ let check_transaction ?(is_coinbase = false) (tx : Types.transaction)
   else if tx.outputs = [] then
     Error TxEmptyOutputs
   else begin
-    (* Check weight limit *)
-    let weight = compute_tx_weight tx in
-    if weight > Consensus.max_tx_weight then
-      Error (TxOversizeWeight weight)
+    (* Check consensus size limit: base_size * WITNESS_SCALE_FACTOR must not
+       exceed MAX_BLOCK_WEIGHT. This uses the non-witness serialization size,
+       matching Bitcoin Core's CheckTransaction in tx_check.cpp. *)
+    let w_base = Serialize.writer_create () in
+    Serialize.serialize_transaction_no_witness w_base tx;
+    let base_size = Cstruct.length (Serialize.writer_to_cstruct w_base) in
+    let base_weight = base_size * Consensus.witness_scale_factor in
+    if base_weight > Consensus.max_block_weight then
+      Error (TxOversizeWeight base_weight)
     else begin
       (* Check output values *)
       let total_out = ref 0L in
@@ -599,10 +607,8 @@ let check_witness_commitment (block : Types.block)
       | [] -> None
       | w :: _ ->
         match w.Types.items with
-        | [] -> None
-        | item :: _ ->
-          if Cstruct.length item = 32 then Some item
-          else None
+        | [item] when Cstruct.length item = 32 -> Some item
+        | _ -> None
     in
     (match witness_nonce with
     | None -> Error BlockBadWitnessCommitment
@@ -695,7 +701,28 @@ let check_block ~network:(network : Consensus.network_config) (block : Types.blo
                 match check_duplicate_txids txs with
                 | Error e -> Error e
                 | Ok () ->
-                  (* Check total block weight *)
+                  (* Context-free legacy sigops check (fast early rejection).
+                     This underestimates sigops because it doesn't count
+                     P2SH or witness sigops, but catches obviously invalid blocks
+                     without UTXO context. Matches Bitcoin Core's CheckBlock. *)
+                  let legacy_sigops = List.fold_left (fun acc tx ->
+                    acc + count_tx_sigops tx
+                  ) 0 txs in
+                  if legacy_sigops * Consensus.witness_scale_factor > Consensus.max_block_sigops_cost then
+                    Error BlockTooManySigops
+                  else
+                  (* Check raw serialized block size against the 4MB limit.
+                     This is separate from the weight limit and matches
+                     Bitcoin Core's MAX_BLOCK_SERIALIZED_SIZE check. *)
+                  let w_block = Serialize.writer_create () in
+                  Serialize.serialize_block w_block block;
+                  let block_size = Cstruct.length (Serialize.writer_to_cstruct w_block) in
+                  if block_size > Consensus.max_block_serialized_size then
+                    Error (BlockOversized block_size)
+                  else
+                  (* Check total block weight: sum of individual transaction
+                     weights only. Bitcoin Core's CheckBlock does NOT include
+                     the block header or txcount varint in the weight. *)
                   let total_weight = List.fold_left (fun acc tx ->
                     acc + compute_tx_weight tx
                   ) 0 txs in
@@ -771,27 +798,28 @@ let check_block_header (header : Types.block_header) : (unit, string) result =
    Transaction Finality Checks
    ============================================================================ *)
 
-(* Check if transaction is final based on locktime and sequences *)
+(* Check if transaction is final based on locktime and sequences.
+   Locktime is unsigned 32-bit: values < 500_000_000 are block heights,
+   values >= 500_000_000 are Unix timestamps. *)
 let is_tx_final (tx : Types.transaction) ~(block_height : int) ~(block_time : int32)
     : bool =
-  (* Locktime of 0 means the transaction is always final *)
   if tx.locktime = 0l then
     true
   else begin
-    let locktime = Int32.to_int tx.locktime in
-    (* If all inputs have final sequence (0xFFFFFFFF), tx is final *)
     if List.for_all (fun inp ->
          Int32.equal inp.Types.sequence 0xFFFFFFFFl
        ) tx.inputs then
       true
     else begin
-      (* Check if locktime has been reached *)
-      if locktime < 500_000_000 then
+      (* Treat locktime as unsigned 32-bit *)
+      let locktime_unsigned = Int64.logand (Int64.of_int32 tx.locktime) 0xFFFFFFFFL in
+      if locktime_unsigned < 500_000_000L then
         (* Locktime is a block height *)
-        block_height >= locktime
+        Int64.of_int block_height >= locktime_unsigned
       else
-        (* Locktime is a unix timestamp *)
-        Int32.compare block_time (Int32.of_int locktime) >= 0
+        (* Locktime is a unix timestamp - compare unsigned *)
+        let block_time_unsigned = Int64.logand (Int64.of_int32 block_time) 0xFFFFFFFFL in
+        block_time_unsigned >= locktime_unsigned
     end
   end
 
@@ -834,7 +862,7 @@ let check_sequence_locks (tx : Types.transaction) ~(block_height : int)
           end else begin
             (* Time-based lock *)
             let input_mtp = match get_mtp_at_height with
-              | Some f -> f (utxo_heights.(i) - 1)
+              | Some f -> f (max 0 (utxo_heights.(i) - 1))
               | None -> utxo_mtps.(i)
             in
             let time_offset = Int32.of_int (masked lsl 9) in
@@ -1067,8 +1095,15 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
 
         (* Validate inputs (skip for coinbase) *)
         if !error = None && not is_cb then begin
-          (* Check transaction finality (BIP-113: use median time past) *)
-          if not (is_tx_final tx ~block_height:height ~block_time:median_time) then
+          (* BIP-113: use median time past for locktime comparison
+             only after CSV activation. Before CSV, use block timestamp. *)
+          let locktime_cutoff =
+            if flags land Script.script_verify_checksequenceverify <> 0 then
+              median_time
+            else
+              block.header.timestamp
+          in
+          if not (is_tx_final tx ~block_height:height ~block_time:locktime_cutoff) then
             error := Some (BlockTxValidationFailed (i, TxNonFinalLocktime))
           else begin
             match validate_tx_inputs tx ~lookup ~block_height:height ~flags ~skip_scripts () with

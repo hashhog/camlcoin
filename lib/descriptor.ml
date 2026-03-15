@@ -77,6 +77,7 @@ and descriptor =
   | Combo of key_expr                         (* combo(KEY) *)
   | Addr of Address.address                   (* addr(ADDRESS) *)
   | Raw of Cstruct.t                          (* raw(HEX) *)
+  | Ms of Miniscript.miniscript               (* miniscript expression *)
 
 (* A fully parsed descriptor with checksum *)
 type parsed_descriptor = {
@@ -510,7 +511,10 @@ let rec parse_descriptor_inner (s : string) : (descriptor, string) result =
       else
         Ok (Raw (hex_to_cstruct hex_str))
   else
-    Error ("unknown descriptor: " ^ s)
+    (* Try parsing as miniscript expression *)
+    match Miniscript.parse_miniscript s with
+    | Ok ms -> Ok (Ms ms)
+    | Error _ -> Error ("unknown descriptor: " ^ s)
 
 (* Parse tap tree *)
 and parse_tap_tree (s : string) : (tap_tree, string) result =
@@ -920,6 +924,12 @@ let rec expand (desc : descriptor) (index : int) (network : Address.network)
     Ok [{ script_pubkey = script; script_type = ScriptRaw;
           pubkeys = []; address = None }]
 
+  | Ms ms ->
+    (* Compile miniscript to script *)
+    let script = Miniscript.to_script Miniscript.P2WSH ms in
+    Ok [{ script_pubkey = script; script_type = ScriptRaw;
+          pubkeys = []; address = None }]
+
 (* Compute taproot tree merkle root *)
 and compute_tap_tree_root (tree : tap_tree) (index : int) (network : Address.network) : Cstruct.t =
   match tree with
@@ -953,7 +963,7 @@ let rec is_ranged (desc : descriptor) : bool =
   | Multi (_, keys) | SortedMulti (_, keys) ->
     List.exists key_is_ranged keys
   | Sh inner | Wsh inner -> is_ranged inner
-  | Addr _ | Raw _ -> false
+  | Addr _ | Raw _ | Ms _ -> false
 
 and tap_tree_is_ranged (tree : tap_tree) : bool =
   match tree with
@@ -1045,6 +1055,7 @@ and to_string (desc : descriptor) : string =
   | Combo key -> "combo(" ^ key_to_string key ^ ")"
   | Addr addr -> "addr(" ^ Address.address_to_string addr ^ ")"
   | Raw script -> "raw(" ^ cstruct_to_hex script ^ ")"
+  | Ms ms -> Miniscript.to_string ms
 
 and tap_tree_to_string (tree : tap_tree) : string =
   match tree with
@@ -1079,7 +1090,7 @@ let rec has_private_keys (desc : descriptor) : bool =
   | Multi (_, keys) | SortedMulti (_, keys) ->
     List.exists key_has_private keys
   | Sh inner | Wsh inner -> has_private_keys inner
-  | Addr _ | Raw _ -> false
+  | Addr _ | Raw _ | Ms _ -> false
 
 and tap_tree_has_private (tree : tap_tree) : bool =
   match tree with
@@ -1097,6 +1108,7 @@ let rec is_solvable (desc : descriptor) : bool =
   | Tr _ -> true
   | Multi _ | SortedMulti _ -> true
   | Sh inner | Wsh inner -> is_solvable inner
+  | Ms _ -> true  (* Miniscript is solvable - we know the structure *)
   | Addr _ | Raw _ -> false
 
 (* Get descriptor info *)

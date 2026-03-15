@@ -62,7 +62,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] AssumeUTXO (BIP 199, snapshot loading, dual chainstate, background validation, UTXO hash verification)
 - [x] REST API (block, tx, headers, chaininfo, mempool, blockhashbyheight, .json/.hex/.bin formats)
 - [x] ZMQ notifications (hashblock, hashtx, rawblock, rawtx, sequence topics, 4-byte LE sequence numbers)
-- [x] Regtest mode (generate, generatetoaddress, generateblock RPCs, instant mining)
+- [x] Regtest mode (generate, generatetoaddress, generateblock RPCs, instant mining, 150-block halving)
 - [x] Block invalidation (invalidateblock, reconsiderblock RPCs, descendant tracking, chain reorg)
 - [x] BIP324 v2 encrypted transport (ElligatorSwift key exchange, ChaCha20-Poly1305 AEAD, short message IDs)
 - [x] BIP155 addrv2 message support (Tor v3, I2P, CJDNS network addresses)

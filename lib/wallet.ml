@@ -812,15 +812,26 @@ let select_coins_srd (utxos : wallet_utxo list) (target : int64)
       None
   end
 
+(* Estimated input spending cost in vbytes for P2WPKH *)
+let p2wpkh_input_vbytes = 68
+
 (* Branch and Bound coin selection (Gap 17).
    Attempts to find an exact-match selection avoiding change outputs.
+   Uses effective values (actual value minus input spending cost) for
+   selection, but returns UTXOs with their actual values.
    Returns None if no suitable selection is found within iteration limit. *)
 let select_coins_bnb (utxos : wallet_utxo list) (target : int64)
-    (cost_of_change : int64) : wallet_utxo list option =
-  (* Sort UTXOs by effective value descending *)
-  let sorted = List.sort (fun a b ->
-    Int64.compare b.utxo.Utxo.value a.utxo.Utxo.value
+    (cost_of_change : int64) ~(fee_rate : float) : wallet_utxo list option =
+  let input_cost = Int64.of_float (fee_rate *. float_of_int p2wpkh_input_vbytes) in
+  (* Filter out UTXOs with non-positive effective value *)
+  let with_eff = List.filter_map (fun u ->
+    let eff = Int64.sub u.utxo.Utxo.value input_cost in
+    if Int64.compare eff 0L > 0 then Some (u, eff) else None
   ) utxos in
+  (* Sort by effective value descending *)
+  let sorted = List.sort (fun (_, ea) (_, eb) ->
+    Int64.compare eb ea
+  ) with_eff in
   let arr = Array.of_list sorted in
   let n = Array.length arr in
   if n = 0 then None
@@ -830,33 +841,27 @@ let select_coins_bnb (utxos : wallet_utxo list) (target : int64)
     let best = ref None in
     let upper = Int64.add target cost_of_change in
 
-    (* Precompute suffix sums: suffix.(i) = sum of values from index i to n-1 *)
+    (* Precompute suffix sums of effective values *)
     let suffix = Array.make (n + 1) 0L in
     for i = n - 1 downto 0 do
-      suffix.(i) <- Int64.add suffix.(i + 1) arr.(i).utxo.Utxo.value
+      let (_, eff) = arr.(i) in
+      suffix.(i) <- Int64.add suffix.(i + 1) eff
     done;
 
-    (* DFS with backtracking *)
+    (* DFS with backtracking using effective values *)
     let rec search idx current_sum selection =
       if !iterations >= max_iterations then ()
       else begin
         incr iterations;
-        (* Check if current sum is in acceptable range *)
         if Int64.compare current_sum target >= 0 &&
            Int64.compare current_sum upper <= 0 then
           best := Some (List.rev selection)
-        else if idx >= n then
-          ()  (* No more UTXOs to consider *)
-        else if Int64.compare current_sum upper > 0 then
-          ()  (* Exceeded upper bound, prune *)
-        else if Int64.compare (Int64.add current_sum suffix.(idx)) target < 0 then
-          ()  (* Even taking all remaining can't reach target, prune *)
+        else if idx >= n then ()
+        else if Int64.compare current_sum upper > 0 then ()
+        else if Int64.compare (Int64.add current_sum suffix.(idx)) target < 0 then ()
         else begin
-          (* Include current UTXO *)
-          let value = arr.(idx).utxo.Utxo.value in
-          search (idx + 1) (Int64.add current_sum value)
-            (arr.(idx) :: selection);
-          (* Exclude current UTXO (only if we haven't found a solution) *)
+          let (utxo, eff) = arr.(idx) in
+          search (idx + 1) (Int64.add current_sum eff) (utxo :: selection);
           if !best = None then
             search (idx + 1) current_sum selection
         end
@@ -888,7 +893,7 @@ let select_coins (w : t) (target : int64) (fee_rate : float)
     (fee_rate *. float_of_int (34 + 68) /. 1.0) in
 
   (* Try BnB first for exact-match selection (no change output) *)
-  match select_coins_bnb available target_with_fee cost_of_change with
+  match select_coins_bnb available target_with_fee cost_of_change ~fee_rate with
   | Some selected ->
     let total_input = List.fold_left (fun acc u ->
       Int64.add acc u.utxo.Utxo.value
@@ -939,7 +944,7 @@ let coin_select ~target ~fee_rate (utxos : wallet_utxo list) : wallet_utxo list 
   let target_with_fee = Int64.add target estimated_fee in
   let cost_of_change = Int64.of_float
     (fee_rate *. float_of_int (34 + 68) /. 1.0) in
-  match select_coins_bnb available target_with_fee cost_of_change with
+  match select_coins_bnb available target_with_fee cost_of_change ~fee_rate with
   | Some selected -> Some selected
   | None -> select_coins_srd available target_with_fee
 
@@ -981,9 +986,11 @@ let build_p2tr_script (hash : Types.hash256) : Cstruct.t =
 let build_change_script (dest_script : Cstruct.t) (change_pubkey : Cstruct.t) : Cstruct.t =
   match Script.classify_script dest_script with
   | Script.P2TR_script _ ->
-    (* P2TR change: use x-only pubkey (drop first byte of compressed key) *)
+    (* P2TR change: extract x-only key (strip 0x02 or 0x03 prefix) then
+       compute the tweaked output key for key-path-only spending *)
     let xonly = Cstruct.sub change_pubkey 1 32 in
-    build_p2tr_script xonly
+    let output_key = Crypto.compute_taproot_output_key xonly None in
+    build_p2tr_script output_key
   | Script.P2PKH_script _ ->
     let change_hash = Crypto.hash160 change_pubkey in
     build_p2pkh_script change_hash
@@ -1266,18 +1273,28 @@ let bump_fee (w : t) ~(txid : Types.hash256) ~(new_fee_rate : float)
   match Hashtbl.find_opt w.sent_transactions txid_hex with
   | None -> Error "Transaction not found in wallet history"
   | Some orig_tx ->
-    (* Compute original total input value by looking up UTXOs *)
+    (* Compute original total input value by looking up from the parent
+       transactions' outputs rather than the wallet's UTXO set (which
+       no longer contains the spent UTXOs). *)
     let orig_input_total = List.fold_left (fun acc inp ->
       let prev = inp.Types.previous_output in
-      (* Look for the UTXO in our wallet or use 0 if spent *)
-      let value = List.fold_left (fun v wutxo ->
-        if Cstruct.equal wutxo.outpoint.txid prev.txid &&
-           wutxo.outpoint.vout = prev.vout then
-          wutxo.utxo.Utxo.value
-        else v
-      ) 0L w.utxos in
-      (* If not in current UTXOs, the original tx must track it.
-         Compute from outputs + original fee *)
+      let prev_txid_hex = cstruct_to_hex prev.txid in
+      let vout = Int32.to_int prev.vout in
+      let value =
+        match Hashtbl.find_opt w.sent_transactions prev_txid_hex with
+        | Some parent_tx ->
+          if vout < List.length parent_tx.Types.outputs then
+            (List.nth parent_tx.Types.outputs vout).Types.value
+          else 0L
+        | None ->
+          (* Fall back to wallet UTXO set for non-wallet-sent inputs *)
+          List.fold_left (fun v wutxo ->
+            if Cstruct.equal wutxo.outpoint.txid prev.txid &&
+               wutxo.outpoint.vout = prev.vout then
+              wutxo.utxo.Utxo.value
+            else v
+          ) 0L w.utxos
+      in
       Int64.add acc value
     ) 0L orig_tx.Types.inputs in
 
@@ -1285,19 +1302,7 @@ let bump_fee (w : t) ~(txid : Types.hash256) ~(new_fee_rate : float)
       Int64.add acc out.Types.value
     ) 0L orig_tx.Types.outputs in
 
-    (* If we couldn't find the inputs (already spent by original tx), compute
-       original fee from output structure. We need to reconstruct input value. *)
-    let orig_input_value =
-      if orig_input_total = 0L then
-        (* Estimate: we can't know exact input value without full UTXO set.
-           Use output total + estimated old fee *)
-        let old_weight = estimate_tx_weight
-          (List.length orig_tx.inputs) (List.length orig_tx.outputs) in
-        let old_est_fee = Int64.of_float (1.0 *. float_of_int old_weight /. 4.0) in
-        Int64.add orig_output_total old_est_fee
-      else
-        orig_input_total
-    in
+    let orig_input_value = orig_input_total in
 
     let n_inputs = List.length orig_tx.inputs in
     let n_outputs = List.length orig_tx.outputs in
@@ -1417,13 +1422,31 @@ let bump_fee (w : t) ~(txid : Types.hash256) ~(new_fee_rate : float)
         } in
 
         (* Reconstruct the full UTXO list for signing.
-           For original inputs, find UTXOs from wallet. *)
+           For original inputs, look up values from the parent tx's outputs
+           since the UTXOs are already spent from the wallet. *)
         let orig_utxos = List.filter_map (fun inp ->
           let prev = inp.Types.previous_output in
-          List.find_opt (fun wutxo ->
-            Cstruct.equal wutxo.outpoint.txid prev.txid &&
-            wutxo.outpoint.vout = prev.vout
-          ) w.utxos
+          let prev_txid_hex = cstruct_to_hex prev.txid in
+          let vout = Int32.to_int prev.vout in
+          match Hashtbl.find_opt w.sent_transactions prev_txid_hex with
+          | Some parent_tx when vout < List.length parent_tx.Types.outputs ->
+            let out = List.nth parent_tx.Types.outputs vout in
+            Some {
+              outpoint = prev;
+              utxo = {
+                Utxo.value = out.Types.value;
+                script_pubkey = out.Types.script_pubkey;
+                height = 0;
+                is_coinbase = false;
+              };
+              key_index = 0;
+              confirmed = true;
+            }
+          | _ ->
+            List.find_opt (fun wutxo ->
+              Cstruct.equal wutxo.outpoint.txid prev.txid &&
+              wutxo.outpoint.vout = prev.vout
+            ) w.utxos
         ) orig_tx.inputs in
 
         let all_utxos = orig_utxos @ List.rev !extra_utxos in

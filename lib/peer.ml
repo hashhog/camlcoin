@@ -93,6 +93,7 @@ type peer_direction = Inbound | Outbound
 type inv_entry = {
   inv_type : P2p.inv_type;
   hash : Types.hash256;
+  fee_rate : int64 option;  (* Fee rate in sat/kvB for transactions, None for blocks *)
 }
 
 (* Peer connection state *)
@@ -850,20 +851,43 @@ let peer_info (peer : peer) : string =
     peer.best_height
     ua dir peer.misbehavior_score
 
-(* Inventory trickling: queue a transaction for delayed announcement.
+(* Check if a transaction should be relayed to this peer based on its feefilter.
+   Returns true if the tx fee rate is at or above the peer's feefilter threshold.
+   Transactions without a fee rate (blocks, errors) always pass. *)
+let passes_feefilter (peer : peer) (entry : inv_entry) : bool =
+  match entry.fee_rate with
+  | None -> true  (* Non-transactions (blocks) always pass *)
+  | Some tx_fee_rate ->
+    (* Compare tx fee rate against peer's feefilter (both in sat/kvB) *)
+    tx_fee_rate >= peer.feefilter
+
+(* Inventory trickling: queue an inventory item for delayed announcement.
    Respects the peer's relay preference: when relay=false, tx inv messages
-   are suppressed (the peer opted out of transaction relay). *)
+   are suppressed (the peer opted out of transaction relay).
+   Also filters transactions below the peer's feefilter threshold. *)
 let queue_inv (peer : peer) (entry : inv_entry) : unit =
   if peer.state = Ready then begin
     let is_tx = match entry.inv_type with
       | P2p.InvTx | P2p.InvWitnessTx -> true
       | _ -> false
     in
+    (* Skip if peer opted out of tx relay or if tx is below feefilter *)
     if is_tx && (not peer.relay || peer.block_relay_only) then
       ()
+    else if is_tx && not (passes_feefilter peer entry) then
+      ()  (* Transaction fee rate below peer's feefilter threshold *)
     else
       Queue.add entry peer.inv_queue
   end
+
+(* Create an inv entry for a block (no fee rate) *)
+let make_block_inv (hash : Types.hash256) : inv_entry =
+  { inv_type = P2p.InvBlock; hash; fee_rate = None }
+
+(* Create an inv entry for a transaction with its fee rate in sat/kvB *)
+let make_tx_inv ~(witness : bool) (hash : Types.hash256) (fee_rate_satkvb : int64) : inv_entry =
+  let inv_type = if witness then P2p.InvWitnessTx else P2p.InvTx in
+  { inv_type; hash; fee_rate = Some fee_rate_satkvb }
 
 (* Inventory trickling: check how many items are queued *)
 let inv_queue_length (peer : peer) : int =

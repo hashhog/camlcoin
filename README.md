@@ -64,6 +64,7 @@ matching for opcode dispatch, and Lwt for async I/O.
 - [x] ZMQ notifications (hashblock, hashtx, rawblock, rawtx, sequence topics, 4-byte LE sequence numbers)
 - [x] Regtest mode (generate, generatetoaddress, generateblock RPCs, instant mining)
 - [x] Block invalidation (invalidateblock, reconsiderblock RPCs, descendant tracking, chain reorg)
+- [x] BIP324 v2 encrypted transport (ElligatorSwift key exchange, ChaCha20-Poly1305 AEAD, short message IDs)
 - [ ] Bloom filters (BIP 37)
 
 ## Quick start
@@ -93,7 +94,7 @@ camlcoin/
     validation.ml     block/tx validation
     storage.ml        block/utxo storage, flat files
     utxo.ml           UTXO set, layered cache with batch flushing
-    p2p.ml            network protocol
+    p2p.ml            network protocol, BIP324 v2 encrypted transport
     peer.ml           peer connections
     peer_manager.ml   connection pool and discovery
     sync.ml           chain synchronization

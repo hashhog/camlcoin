@@ -330,7 +330,7 @@ let test_create_ibd_state () =
   Alcotest.(check int) "next_download_height" 1 ibd.next_download_height;
   Alcotest.(check int) "next_process_height" 1 ibd.next_process_height;
   Alcotest.(check int) "total_blocks_in_flight" 0 ibd.total_blocks_in_flight;
-  Alcotest.(check int) "block_queue length" 0 (List.length ibd.block_queue);
+  Alcotest.(check int) "block_queue length" 0 (Queue.length ibd.block_queue);
 
   Storage.ChainDB.close db;
   cleanup_test_db ()
@@ -349,7 +349,7 @@ let test_fill_download_queue () =
   (* With only genesis block and no additional headers, queue should be empty *)
   (* (genesis is at height 0, we start downloading from height 1) *)
   Alcotest.(check int) "queue empty with no headers beyond genesis"
-    0 (List.length ibd.block_queue);
+    0 (Queue.length ibd.block_queue);
 
   Storage.ChainDB.close db;
   cleanup_test_db ()
@@ -470,7 +470,8 @@ let test_check_timeouts () =
       timeout = 5.0;
     };
   } in
-  ibd.block_queue <- [entry];
+  Queue.clear ibd.block_queue;
+  Queue.push entry ibd.block_queue;
   ibd.total_blocks_in_flight <- 1;
 
   (* Set up peer state *)
@@ -544,7 +545,9 @@ let test_receive_block () =
       timeout = 5.0;
     };
   } in
-  ibd.block_queue <- [entry];
+  Queue.clear ibd.block_queue;
+  Queue.push entry ibd.block_queue;
+  Hashtbl.replace ibd.queue_by_hash (Cstruct.to_string genesis_hash) entry;
   ibd.total_blocks_in_flight <- 1;
 
   (* Set up peer state *)

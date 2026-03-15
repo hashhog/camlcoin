@@ -227,17 +227,19 @@ let test_undo_data_serialization () =
     "0e3e2357e806b6cdb1f70b54c3a3a17b6714ee1f0e68bebb44a74b1efd512098" in
   let undo = Utxo.{
     height = 100;
-    spent_outputs = [
-      ({ Types.txid = txid1; vout = 0l },
-       { value = 5000000000L;
-         script_pubkey = Cstruct.of_string "script1";
-         height = 50;
-         is_coinbase = true });
-      ({ Types.txid = txid2; vout = 1l },
-       { value = 100000L;
-         script_pubkey = Cstruct.of_string "script2";
-         height = 75;
-         is_coinbase = false });
+    tx_undos = [
+      { spent_outputs = [
+          ({ Types.txid = txid1; vout = 0l },
+           { value = 5000000000L;
+             script_pubkey = Cstruct.of_string "script1";
+             height = 50;
+             is_coinbase = true });
+          ({ Types.txid = txid2; vout = 1l },
+           { value = 100000L;
+             script_pubkey = Cstruct.of_string "script2";
+             height = 75;
+             is_coinbase = false });
+        ] };
     ];
   } in
   let w = Serialize.writer_create () in
@@ -246,8 +248,10 @@ let test_undo_data_serialization () =
   let r = Serialize.reader_of_cstruct data in
   let decoded = Utxo.deserialize_undo_data r in
   Alcotest.(check int) "height" undo.height decoded.height;
-  Alcotest.(check int) "spent count" 2 (List.length decoded.spent_outputs);
-  let (op1, e1) = List.hd decoded.spent_outputs in
+  Alcotest.(check int) "tx_undo count" 1 (List.length decoded.tx_undos);
+  let all_spent = List.concat_map (fun (tu : Utxo.tx_undo) -> tu.spent_outputs) decoded.tx_undos in
+  Alcotest.(check int) "spent count" 2 (List.length all_spent);
+  let (op1, e1) = List.hd all_spent in
   Alcotest.(check int64) "first entry value" 5000000000L e1.value;
   Alcotest.(check bool) "first entry is_coinbase" true e1.is_coinbase;
   Alcotest.(check int32) "first outpoint vout" 0l op1.Types.vout
@@ -314,7 +318,8 @@ let test_connect_block_with_spend () =
   (* Check undo data *)
   let undo = Result.get_ok result1 in
   Alcotest.(check int) "undo height" 1 undo.height;
-  Alcotest.(check int) "undo spent count" 1 (List.length undo.spent_outputs);
+  let all_spent = List.concat_map (fun (tu : Utxo.tx_undo) -> tu.spent_outputs) undo.tx_undos in
+  Alcotest.(check int) "undo spent count" 1 (List.length all_spent);
   let _ = cb0_txid in  (* suppress unused warning *)
   Storage.ChainDB.close db;
   cleanup_test_db ()
@@ -500,12 +505,14 @@ let test_undo_data_storage () =
     "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b" in
   let undo = Utxo.{
     height = 1;
-    spent_outputs = [
-      ({ Types.txid; vout = 0l },
-       { value = 5000000000L;
-         script_pubkey = Cstruct.of_string "test";
-         height = 0;
-         is_coinbase = true });
+    tx_undos = [
+      { spent_outputs = [
+          ({ Types.txid; vout = 0l },
+           { value = 5000000000L;
+             script_pubkey = Cstruct.of_string "test";
+             height = 0;
+             is_coinbase = true });
+        ] };
     ];
   } in
   (* Serialize and store *)
@@ -519,7 +526,8 @@ let test_undo_data_storage () =
   let r = Serialize.reader_of_cstruct (Cstruct.of_string (Option.get retrieved)) in
   let decoded = Utxo.deserialize_undo_data r in
   Alcotest.(check int) "undo height" 1 decoded.height;
-  Alcotest.(check int) "spent count" 1 (List.length decoded.spent_outputs);
+  let all_spent = List.concat_map (fun (tu : Utxo.tx_undo) -> tu.spent_outputs) decoded.tx_undos in
+  Alcotest.(check int) "spent count" 1 (List.length all_spent);
   (* Delete *)
   Storage.ChainDB.delete_undo_data db block_hash;
   let deleted = Storage.ChainDB.get_undo_data db block_hash in

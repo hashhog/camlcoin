@@ -24,18 +24,19 @@
    track access order. *)
 
 module LRU = struct
-  type 'v dll_node = {
+  type ('k, 'v) dll_node = {
+    key : 'k;
     mutable key_str : string;
     mutable value : 'v;
-    mutable prev : 'v dll_node option;
-    mutable next : 'v dll_node option;
+    mutable prev : ('k, 'v) dll_node option;
+    mutable next : ('k, 'v) dll_node option;
   }
 
   type ('k, 'v) t = {
     capacity : int;
-    table : ('k, 'v dll_node) Hashtbl.t;
-    mutable head : 'v dll_node option;
-    mutable tail : 'v dll_node option;
+    table : ('k, ('k, 'v) dll_node) Hashtbl.t;
+    mutable head : ('k, 'v) dll_node option;
+    mutable tail : ('k, 'v) dll_node option;
     mutable length : int;
     key_to_string : 'k -> string;
   }
@@ -89,9 +90,9 @@ module LRU = struct
          | None -> ()
          | Some evict_node ->
            dll_remove t evict_node;
-           Hashtbl.remove t.table (Obj.magic evict_node.key_str)
+           Hashtbl.remove t.table evict_node.key
        end;
-       let node = { key_str = t.key_to_string key; value; prev = None; next = None } in
+       let node = { key; key_str = t.key_to_string key; value; prev = None; next = None } in
        Hashtbl.replace t.table key node;
        dll_push_front t node)
 

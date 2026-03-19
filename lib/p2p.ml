@@ -49,6 +49,12 @@ type command =
   | Sendpackages
   | Getpkgtxns
   | Pkgtxns
+  (* BIP 330: Erlay Transaction Reconciliation *)
+  | Sendtxrcncl
+  | Reqrecon
+  | Sketch
+  | Reqbisec
+  | Reconcildiff
   | Unknown of string
 
 let command_to_string = function
@@ -81,6 +87,11 @@ let command_to_string = function
   | Sendpackages -> "sendpackages"
   | Getpkgtxns -> "getpkgtxns"
   | Pkgtxns -> "pkgtxns"
+  | Sendtxrcncl -> "sendtxrcncl"
+  | Reqrecon -> "reqrecon"
+  | Sketch -> "sketch"
+  | Reqbisec -> "reqbisec"
+  | Reconcildiff -> "reconcildiff"
   | Unknown s -> s
 
 let command_of_string s =
@@ -114,6 +125,11 @@ let command_of_string s =
   | "sendpackages" -> Sendpackages
   | "getpkgtxns" -> Getpkgtxns
   | "pkgtxns" -> Pkgtxns
+  | "sendtxrcncl" -> Sendtxrcncl
+  | "reqrecon" -> Reqrecon
+  | "sketch" -> Sketch
+  | "reqbisec" -> Reqbisec
+  | "reconcildiff" -> Reconcildiff
   | other -> Unknown other
 
 (* Inventory vector types *)
@@ -234,6 +250,45 @@ type pkgtxns_msg = {
   pkg_txs : Types.transaction list;  (* transactions in topological order *)
 }
 
+(* ============================================================================
+   BIP 330: Erlay Transaction Reconciliation Types
+   ============================================================================ *)
+
+(* Erlay protocol version (BIP-330) *)
+let erlay_protocol_version = 1l
+
+(* sendtxrcncl: announce transaction reconciliation support *)
+type sendtxrcncl_msg = {
+  recon_version : int32;   (* reconciliation protocol version *)
+  recon_salt : int64;      (* 64-bit salt for short txid computation *)
+}
+
+(* reqrecon: request transaction reconciliation
+   Initiator requests a sketch from the responder *)
+type reqrecon_msg = {
+  recon_set_size : int32;  (* announced local set size estimate *)
+  recon_q : int32;         (* coefficient for sketch capacity calculation *)
+}
+
+(* sketch: response containing a minisketch of transactions *)
+type sketch_msg = {
+  sketch_data : Cstruct.t;  (* serialized minisketch data *)
+}
+
+(* reqbisec: request extension round with larger sketch
+   Sent when initial sketch decode fails *)
+type reqbisec_msg = {
+  bisec_set_size : int32;  (* new set size estimate *)
+  bisec_q : int32;         (* new coefficient *)
+}
+
+(* reconcildiff: communicate reconciliation result *)
+type reconcildiff_msg = {
+  success : bool;          (* whether reconciliation succeeded *)
+  ask_short_ids : Cstruct.t list;    (* short txids we're missing (initiator asks) *)
+  announce_short_ids : Cstruct.t list; (* short txids we have that peer is missing *)
+}
+
 (* BIP-155 addrv2 network IDs *)
 type addrv2_network_id =
   | Addrv2_IPv4    (* 1: 4 bytes *)
@@ -296,6 +351,12 @@ type message_payload =
   | SendpackagesMsg of sendpackages_msg
   | GetpkgtxnsMsg of getpkgtxns_msg
   | PkgtxnsMsg of pkgtxns_msg
+  (* BIP 330: Erlay Transaction Reconciliation *)
+  | SendtxrcnclMsg of sendtxrcncl_msg
+  | ReqreconMsg of reqrecon_msg
+  | SketchMsg of sketch_msg
+  | ReqbisecMsg of reqbisec_msg
+  | ReconcildiffMsg of reconcildiff_msg
   | UnknownMsg of { cmd : string; payload : Cstruct.t }
 
 type message = {
@@ -520,6 +581,81 @@ let deserialize_pkgtxns r : pkgtxns_msg =
   let pkg_txs = List.init count (fun _ -> Serialize.deserialize_transaction r) in
   { pkg_txs }
 
+(* ============================================================================
+   BIP 330: Erlay Transaction Reconciliation Serialization
+   ============================================================================ *)
+
+(* Maximum elements in reconciliation set *)
+let max_recon_set_size = 5000
+
+(* Serialize sendtxrcncl message *)
+let serialize_sendtxrcncl w (msg : sendtxrcncl_msg) =
+  Serialize.write_int32_le w msg.recon_version;
+  Serialize.write_int64_le w msg.recon_salt
+
+(* Deserialize sendtxrcncl message *)
+let deserialize_sendtxrcncl r : sendtxrcncl_msg =
+  let recon_version = Serialize.read_int32_le r in
+  let recon_salt = Serialize.read_int64_le r in
+  { recon_version; recon_salt }
+
+(* Serialize reqrecon message *)
+let serialize_reqrecon w (msg : reqrecon_msg) =
+  Serialize.write_int32_le w msg.recon_set_size;
+  Serialize.write_int32_le w msg.recon_q
+
+(* Deserialize reqrecon message *)
+let deserialize_reqrecon r : reqrecon_msg =
+  let recon_set_size = Serialize.read_int32_le r in
+  let recon_q = Serialize.read_int32_le r in
+  { recon_set_size; recon_q }
+
+(* Serialize sketch message *)
+let serialize_sketch w (msg : sketch_msg) =
+  Serialize.write_compact_size w (Cstruct.length msg.sketch_data);
+  Serialize.write_bytes w msg.sketch_data
+
+(* Deserialize sketch message *)
+let deserialize_sketch r : sketch_msg =
+  let len = Serialize.read_compact_size r in
+  (* Sanity limit: sketch shouldn't be larger than ~128KB for reasonable capacity *)
+  if len > 131072 then
+    failwith "sketch data exceeds maximum size";
+  let sketch_data = Serialize.read_bytes r len in
+  { sketch_data }
+
+(* Serialize reqbisec message *)
+let serialize_reqbisec w (msg : reqbisec_msg) =
+  Serialize.write_int32_le w msg.bisec_set_size;
+  Serialize.write_int32_le w msg.bisec_q
+
+(* Deserialize reqbisec message *)
+let deserialize_reqbisec r : reqbisec_msg =
+  let bisec_set_size = Serialize.read_int32_le r in
+  let bisec_q = Serialize.read_int32_le r in
+  { bisec_set_size; bisec_q }
+
+(* Serialize reconcildiff message *)
+let serialize_reconcildiff w (msg : reconcildiff_msg) =
+  Serialize.write_uint8 w (if msg.success then 1 else 0);
+  Serialize.write_compact_size w (List.length msg.ask_short_ids);
+  List.iter (Serialize.write_bytes w) msg.ask_short_ids;
+  Serialize.write_compact_size w (List.length msg.announce_short_ids);
+  List.iter (Serialize.write_bytes w) msg.announce_short_ids
+
+(* Deserialize reconcildiff message *)
+let deserialize_reconcildiff r : reconcildiff_msg =
+  let success = Serialize.read_uint8 r <> 0 in
+  let ask_count = Serialize.read_compact_size r in
+  if ask_count > max_recon_set_size then
+    failwith "reconcildiff ask count exceeds maximum";
+  let ask_short_ids = List.init ask_count (fun _ -> Serialize.read_bytes r 8) in
+  let announce_count = Serialize.read_compact_size r in
+  if announce_count > max_recon_set_size then
+    failwith "reconcildiff announce count exceeds maximum";
+  let announce_short_ids = List.init announce_count (fun _ -> Serialize.read_bytes r 8) in
+  { success; ask_short_ids; announce_short_ids }
+
 (* Unified payload serialization *)
 let serialize_payload w = function
   | VersionMsg v -> Serialize.serialize_version_msg w v
@@ -574,6 +710,11 @@ let serialize_payload w = function
   | SendpackagesMsg msg -> serialize_sendpackages w msg
   | GetpkgtxnsMsg msg -> serialize_getpkgtxns w msg
   | PkgtxnsMsg msg -> serialize_pkgtxns w msg
+  | SendtxrcnclMsg msg -> serialize_sendtxrcncl w msg
+  | ReqreconMsg msg -> serialize_reqrecon w msg
+  | SketchMsg msg -> serialize_sketch w msg
+  | ReqbisecMsg msg -> serialize_reqbisec w msg
+  | ReconcildiffMsg msg -> serialize_reconcildiff w msg
   | RejectMsg { message; ccode; reason; data } ->
     Serialize.write_string w message;
     Serialize.write_uint8 w ccode;
@@ -611,6 +752,11 @@ let payload_to_command = function
   | SendpackagesMsg _ -> Sendpackages
   | GetpkgtxnsMsg _ -> Getpkgtxns
   | PkgtxnsMsg _ -> Pkgtxns
+  | SendtxrcnclMsg _ -> Sendtxrcncl
+  | ReqreconMsg _ -> Reqrecon
+  | SketchMsg _ -> Sketch
+  | ReqbisecMsg _ -> Reqbisec
+  | ReconcildiffMsg _ -> Reconcildiff
   | UnknownMsg { cmd; _ } -> Unknown cmd
 
 let serialize_message (magic : int32) (payload : message_payload)
@@ -696,6 +842,11 @@ let deserialize_payload (cmd : command) (r : Serialize.reader)
   | Sendpackages -> SendpackagesMsg (deserialize_sendpackages r)
   | Getpkgtxns -> GetpkgtxnsMsg (deserialize_getpkgtxns r)
   | Pkgtxns -> PkgtxnsMsg (deserialize_pkgtxns r)
+  | Sendtxrcncl -> SendtxrcnclMsg (deserialize_sendtxrcncl r)
+  | Reqrecon -> ReqreconMsg (deserialize_reqrecon r)
+  | Sketch -> SketchMsg (deserialize_sketch r)
+  | Reqbisec -> ReqbisecMsg (deserialize_reqbisec r)
+  | Reconcildiff -> ReconcildiffMsg (deserialize_reconcildiff r)
   | Reject ->
     let message = Serialize.read_string r in
     let ccode = Serialize.read_uint8 r in
@@ -782,6 +933,204 @@ let ipv4_to_net_addr ?(services=0L) ipv4_bytes port : Types.net_addr =
   Cstruct.set_uint8 addr 11 0xFF;
   Cstruct.blit ipv4_bytes 0 addr 12 4;
   { services; addr; port }
+
+(* ============================================================================
+   BIP 330: Erlay Transaction Reconciliation Logic
+   ============================================================================ *)
+
+(* Per-peer Erlay reconciliation state *)
+type erlay_peer_state = {
+  mutable recon_enabled : bool;         (* Peer supports reconciliation *)
+  mutable recon_version : int32;        (* Negotiated reconciliation version *)
+  mutable is_initiator : bool;          (* We are the reconciliation initiator *)
+  mutable local_set : (string, unit) Hashtbl.t;  (* txids we have but haven't reconciled *)
+  mutable pending_recon : bool;         (* A reconciliation round is in progress *)
+  mutable last_recon_time : float;      (* Timestamp of last reconciliation *)
+}
+
+let create_erlay_peer_state () : erlay_peer_state = {
+  recon_enabled = false;
+  recon_version = 0l;
+  is_initiator = false;
+  local_set = Hashtbl.create 64;
+  pending_recon = false;
+  last_recon_time = 0.0;
+}
+
+(* Global Erlay state for the node *)
+type erlay_state = {
+  peer_states : (int, erlay_peer_state) Hashtbl.t;  (* peer_id -> state *)
+  recon_interval : float;   (* seconds between reconciliation rounds, ~2s per BIP330 *)
+}
+
+let create_erlay_state () : erlay_state = {
+  peer_states = Hashtbl.create 16;
+  recon_interval = 2.0;
+}
+
+(* Handle incoming sendtxrcncl: peer announces reconciliation support.
+   Called during version handshake. We register the peer and decide roles. *)
+let handle_sendtxrcncl (state : erlay_state) (peer_id : int) (msg : sendtxrcncl_msg)
+    ~(our_initiator : bool) : message_payload option =
+  let ps = create_erlay_peer_state () in
+  ps.recon_enabled <- true;
+  ps.recon_version <- Int32.min msg.recon_version erlay_protocol_version;
+  (* BIP330: the peer with higher salt is the initiator by default;
+     the our_initiator flag is pre-determined by connection direction. *)
+  ps.is_initiator <- our_initiator;
+  Hashtbl.replace state.peer_states peer_id ps;
+  (* Send our own sendtxrcncl if we haven't already *)
+  Some (SendtxrcnclMsg {
+    recon_version = erlay_protocol_version;
+    recon_salt = Int64.of_float (Unix.gettimeofday () *. 1000.0);
+  })
+
+(* Add a transaction to the reconciliation set for all Erlay peers.
+   Called when we accept a tx into the mempool via Erlay (not fanout). *)
+let add_tx_to_reconciliation_sets (state : erlay_state) (txid : Types.hash256) : unit =
+  let key = Cstruct.to_string txid in
+  Hashtbl.iter (fun _peer_id ps ->
+    if ps.recon_enabled then
+      Hashtbl.replace ps.local_set key ()
+  ) state.peer_states
+
+(* Initiate a reconciliation round with a peer.
+   Sends reqrecon with our set size and a capacity coefficient q.
+   Returns the message to send, or None if reconciliation is not due. *)
+let initiate_reconciliation (state : erlay_state) (peer_id : int)
+    : message_payload option =
+  match Hashtbl.find_opt state.peer_states peer_id with
+  | None -> None
+  | Some ps ->
+    if not ps.recon_enabled || ps.pending_recon then None
+    else
+      let now = Unix.gettimeofday () in
+      if now -. ps.last_recon_time < state.recon_interval then None
+      else begin
+        ps.pending_recon <- true;
+        let set_size = Hashtbl.length ps.local_set in
+        (* q coefficient: ratio of set sizes, encoded as fixed-point.
+           For the initial request, use set_size as an approximation. *)
+        Some (ReqreconMsg {
+          recon_set_size = Int32.of_int set_size;
+          recon_q = Int32.of_int (max 1 (set_size / 2));
+        })
+      end
+
+(* Handle incoming reqrecon: peer requests reconciliation.
+   We compute a sketch of our local set and send it back. *)
+let handle_reqrecon (state : erlay_state) (peer_id : int) (_msg : reqrecon_msg)
+    : message_payload option =
+  match Hashtbl.find_opt state.peer_states peer_id with
+  | None -> None
+  | Some ps ->
+    if not ps.recon_enabled then None
+    else begin
+      (* Build a minisketch from our local reconciliation set.
+         In a full implementation this would use an actual minisketch library.
+         Here we send a serialized set of short txid hashes. *)
+      let sketch_buf = Buffer.create 256 in
+      Hashtbl.iter (fun txid_key () ->
+        (* Use first 8 bytes of txid as short ID for the sketch *)
+        let short_id = if String.length txid_key >= 8
+          then String.sub txid_key 0 8
+          else txid_key in
+        Buffer.add_string sketch_buf short_id
+      ) ps.local_set;
+      let sketch_data = Cstruct.of_string (Buffer.contents sketch_buf) in
+      Some (SketchMsg { sketch_data })
+    end
+
+(* Handle incoming sketch: peer sends their reconciliation sketch.
+   We decode it against our local set to find the symmetric difference,
+   then send reconcildiff with the txids we need and the ones we can announce. *)
+let handle_sketch (state : erlay_state) (peer_id : int) (msg : sketch_msg)
+    : message_payload option =
+  match Hashtbl.find_opt state.peer_states peer_id with
+  | None -> None
+  | Some ps ->
+    if not ps.recon_enabled then None
+    else begin
+      (* Decode the sketch to find txids the peer has that we don't (ask_txids)
+         and txids we have that the peer doesn't (announce_txids).
+         In a full implementation, this uses minisketch decode. *)
+      let remote_ids : (string, unit) Hashtbl.t = Hashtbl.create 64 in
+      let data = Cstruct.to_string msg.sketch_data in
+      let pos = ref 0 in
+      while !pos + 8 <= String.length data do
+        let short_id = String.sub data !pos 8 in
+        Hashtbl.replace remote_ids short_id ();
+        pos := !pos + 8
+      done;
+
+      (* Compute symmetric difference *)
+      let ask_txids = ref [] in    (* txids peer has, we don't *)
+      let announce_txids = ref [] in  (* txids we have, peer doesn't *)
+
+      Hashtbl.iter (fun short_id () ->
+        let local_key = Hashtbl.fold (fun k () found ->
+          if found <> "" then found
+          else if String.length k >= 8 && String.sub k 0 8 = short_id then k
+          else ""
+        ) ps.local_set "" in
+        if local_key = "" then
+          ask_txids := Cstruct.of_string short_id :: !ask_txids
+      ) remote_ids;
+
+      Hashtbl.iter (fun full_key () ->
+        let short_id = if String.length full_key >= 8
+          then String.sub full_key 0 8
+          else full_key in
+        if not (Hashtbl.mem remote_ids short_id) then
+          announce_txids := Cstruct.of_string full_key :: !announce_txids
+      ) ps.local_set;
+
+      (* Clear the reconciliation set and mark round complete *)
+      Hashtbl.clear ps.local_set;
+      ps.pending_recon <- false;
+      ps.last_recon_time <- Unix.gettimeofday ();
+
+      let success = true in (* Sketch decoded successfully *)
+      Some (ReconcildiffMsg {
+        success;
+        ask_short_ids = !ask_txids;
+        announce_short_ids = !announce_txids;
+      })
+    end
+
+(* Handle incoming reconcildiff: peer tells us what they need and what they have.
+   - ask_txids: txids the peer wants us to send (we announce via inv)
+   - announce_txids: txids the peer is announcing to us (we request via getdata)
+   Returns (inv_items, getdata_items) to be sent. *)
+let handle_reconcildiff (state : erlay_state) (peer_id : int) (msg : reconcildiff_msg)
+    : (inv_vector list * inv_vector list) =
+  (match Hashtbl.find_opt state.peer_states peer_id with
+   | None -> ()
+   | Some ps ->
+     ps.pending_recon <- false;
+     ps.last_recon_time <- Unix.gettimeofday ();
+     Hashtbl.clear ps.local_set);
+
+  if not msg.success then
+    (* Reconciliation failed; fall back to flooding for this round *)
+    ([], [])
+  else begin
+    (* Build inv messages for txids the peer asked for *)
+    let inv_items = List.map (fun short_id ->
+      { inv_type = InvTx;
+        hash = short_id }
+    ) msg.ask_short_ids in
+    (* Build getdata for txids the peer announced *)
+    let getdata_items = List.map (fun short_id ->
+      { inv_type = InvTx;
+        hash = short_id }
+    ) msg.announce_short_ids in
+    (inv_items, getdata_items)
+  end
+
+(* Remove a peer's Erlay state (on disconnect) *)
+let remove_erlay_peer (state : erlay_state) (peer_id : int) : unit =
+  Hashtbl.remove state.peer_states peer_id
 
 (* ============================================================================
    BIP 152 Compact Block Functions

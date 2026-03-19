@@ -1015,18 +1015,36 @@ let validate_tx_inputs (tx : Types.transaction) ~(lookup : utxo_lookup)
                   { Types.items = [] }
               in
 
-              match Script.verify_script
-                      ~tx ~input_index:i
-                      ~script_pubkey:utxo.script_pubkey
-                      ~script_sig:inp.Types.script_sig
-                      ~witness
-                      ~amount:utxo.value
-                      ~flags ~prevouts () with
-              | Error msg ->
-                error := Some (TxScriptFailed (i, msg))
-              | Ok false ->
-                error := Some (TxScriptFailed (i, "Script returned false"))
-              | Ok true -> ()
+              (* Compute txid for cache key *)
+              let txid = Crypto.compute_txid tx in
+              let cache_key : Sig_cache.cache_key = {
+                txid;
+                input_index = i;
+                flags;
+              } in
+
+              (* Check sig cache first *)
+              let cache = Sig_cache.get_global () in
+              match Sig_cache.lookup cache cache_key with
+              | Some true ->
+                (* Cache hit: verification already succeeded *)
+                ()
+              | _ ->
+                (* Cache miss: run verification *)
+                match Script.verify_script
+                        ~tx ~input_index:i
+                        ~script_pubkey:utxo.script_pubkey
+                        ~script_sig:inp.Types.script_sig
+                        ~witness
+                        ~amount:utxo.value
+                        ~flags ~prevouts () with
+                | Error msg ->
+                  error := Some (TxScriptFailed (i, msg))
+                | Ok false ->
+                  error := Some (TxScriptFailed (i, "Script returned false"))
+                | Ok true ->
+                  (* Cache successful verification *)
+                  Sig_cache.insert cache cache_key true
             end
         end
       ) tx.inputs;
@@ -1035,6 +1053,69 @@ let validate_tx_inputs (tx : Types.transaction) ~(lookup : utxo_lookup)
       | Some e -> Error e
       | None -> Ok !total_in
   end
+
+(* ============================================================================
+   Parallel Script Verification (Lwt-based)
+   ============================================================================ *)
+
+(* Verify a single input's script asynchronously.
+   Returns Ok () on success, Error (index, message) on failure. *)
+let verify_input_script_async ~(tx : Types.transaction) ~(flags : int)
+    ~(prevouts : (int64 * Cstruct.t) list) (i : int)
+    (inp : Types.tx_in) (utxo : utxo) : (unit, int * string) result Lwt.t =
+  Lwt.return (
+    let witness =
+      if i < List.length tx.witnesses then
+        List.nth tx.witnesses i
+      else
+        { Types.items = [] }
+    in
+    let txid = Crypto.compute_txid tx in
+    let cache_key : Sig_cache.cache_key = {
+      txid; input_index = i; flags;
+    } in
+    let cache = Sig_cache.get_global () in
+    match Sig_cache.lookup cache cache_key with
+    | Some true -> Ok ()
+    | _ ->
+      match Script.verify_script
+              ~tx ~input_index:i
+              ~script_pubkey:utxo.script_pubkey
+              ~script_sig:inp.Types.script_sig
+              ~witness
+              ~amount:utxo.value
+              ~flags ~prevouts () with
+      | Error msg -> Error (i, msg)
+      | Ok false -> Error (i, "Script returned false")
+      | Ok true ->
+        Sig_cache.insert cache cache_key true;
+        Ok ()
+  )
+
+(* Verify all input scripts in a transaction concurrently using Lwt.
+   First collects all (input, index, utxo) triples, then dispatches
+   them in parallel and collects the first error if any. *)
+let verify_scripts_parallel ~(tx : Types.transaction) ~(flags : int)
+    ~(prevouts : (int64 * Cstruct.t) list)
+    ~(utxos : utxo option array)
+    : (unit, tx_validation_error) result Lwt.t =
+  let input_tasks = List.mapi (fun i inp ->
+    match utxos.(i) with
+    | None -> Lwt.return (Error (i, "missing input"))
+    | Some utxo -> verify_input_script_async ~tx ~flags ~prevouts i inp utxo
+  ) tx.inputs in
+  let%lwt results = Lwt_list.map_p (fun t -> t) input_tasks in
+  let first_error = List.fold_left (fun acc r ->
+    match acc with
+    | Some _ -> acc
+    | None ->
+      match r with
+      | Error (idx, msg) -> Some (TxScriptFailed (idx, msg))
+      | Ok () -> None
+  ) None results in
+  Lwt.return (match first_error with
+    | Some e -> Error e
+    | None -> Ok ())
 
 (* Calculate transaction fee *)
 let calculate_tx_fee (tx : Types.transaction) ~(lookup : utxo_lookup)

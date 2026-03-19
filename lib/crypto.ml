@@ -13,17 +13,30 @@
 
 module Secp = Libsecp256k1.External
 
+(* Hardware-accelerated SHA-256 via OpenSSL C stubs *)
+external sha256_accel : string -> string = "caml_sha256_accel"
+external sha256d_accel : string -> string = "caml_sha256d_accel"
+external sha256_hw_info : unit -> string = "caml_sha256_hw_info"
+
 (* Hash functions using digestif *)
 
 (* Double SHA-256: SHA256(SHA256(data)) — Bitcoin's primary hash *)
 let sha256d (data : Cstruct.t) : Types.hash256 =
-  let h1 = Digestif.SHA256.digest_string (Cstruct.to_string data) in
-  let h2 = Digestif.SHA256.digest_string (Digestif.SHA256.to_raw_string h1) in
-  Cstruct.of_string (Digestif.SHA256.to_raw_string h2)
+  try
+    Cstruct.of_string (sha256d_accel (Cstruct.to_string data))
+  with _ ->
+    (* Fallback to digestif if NIF not loaded *)
+    let h1 = Digestif.SHA256.digest_string (Cstruct.to_string data) in
+    let h2 = Digestif.SHA256.digest_string (Digestif.SHA256.to_raw_string h1) in
+    Cstruct.of_string (Digestif.SHA256.to_raw_string h2)
 
 let sha256 (data : Cstruct.t) : Cstruct.t =
-  let h = Digestif.SHA256.digest_string (Cstruct.to_string data) in
-  Cstruct.of_string (Digestif.SHA256.to_raw_string h)
+  try
+    Cstruct.of_string (sha256_accel (Cstruct.to_string data))
+  with _ ->
+    (* Fallback to digestif if NIF not loaded *)
+    let h = Digestif.SHA256.digest_string (Cstruct.to_string data) in
+    Cstruct.of_string (Digestif.SHA256.to_raw_string h)
 
 (* BIP-340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg) *)
 let tagged_hash (tag : string) (msg : Cstruct.t) : Cstruct.t =

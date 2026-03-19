@@ -1617,6 +1617,8 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
         ibd.pending_utxo_updates <- [];
         Error e
       | Ok () ->
+      (* Clear signature cache on reorg to prevent stale entries *)
+      Sig_cache.clear_global ();
       (* Flush pending UTXO changes from disconnect before connecting *)
       flush_utxos ibd;
       (* Re-add disconnected transactions to mempool if available *)

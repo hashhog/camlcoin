@@ -333,15 +333,16 @@ let run (config : config) : unit Lwt.t =
     graceful_shutdown ()
   in
 
-  (* Run all services concurrently. Use Lwt.choose so that when the shutdown
-     event_loop resolves, we can cancel the others explicitly via graceful_shutdown
-     rather than having Lwt.pick cancel them abruptly. Short-lived threads like
-     manual_connect_thread are joined independently so they don't terminate others. *)
-  let _bg_connect = manual_connect_thread in
-  Lwt.choose [
+  (* Run all services concurrently.  Several of the service threads
+     (peer_thread, sync_thread, manual_connect_thread) complete quickly after
+     initial setup – they must NOT cause the node to exit.  We use Lwt.async
+     for fire-and-forget background work and Lwt.join for the threads that
+     should keep running until shutdown. *)
+  Lwt.async (fun () -> manual_connect_thread);
+  Lwt.async (fun () -> peer_thread);
+  Lwt.async (fun () -> sync_thread);
+  Lwt.join [
     rpc_thread;
-    peer_thread;
-    sync_thread;
     status_thread;
     event_loop ();
   ]

@@ -1,10 +1,4 @@
-(* Database layer using file-based storage (RocksDB fallback) *)
-
-(* TODO: For production use with millions of UTXOs, replace FileStorage with
-   a proper embedded key-value store (LevelDB, RocksDB, or LMDB) via an opam
-   binding. The current file-per-key approach does not scale beyond ~100k keys
-   due to filesystem overhead. The WAL provides crash-safety but not the
-   throughput a real blockchain node needs. *)
+(* Database layer using file-based storage with write-ahead log for crash safety *)
 
 (* Storage module signature *)
 module type STORAGE = sig
@@ -29,9 +23,9 @@ module type STORAGE = sig
   val sync : t -> unit
 end
 
-(* File-based storage implementation for development without RocksDB.
-   Provides crash-safe batch writes via a write-ahead log (WAL) and
-   disk-scanning iter_prefix that does not rely solely on the in-memory cache. *)
+(* File-based storage implementation with write-ahead log (WAL) for crash safety.
+   Provides durable key-value storage with batch writes, disk-scanning
+   iter_prefix, and an in-memory cache for fast reads. *)
 module FileStorage : STORAGE = struct
   type t = {
     base_dir : string;

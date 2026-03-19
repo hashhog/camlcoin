@@ -27,3 +27,4 @@ module Miniscript = Miniscript
 module Assume_utxo = Assume_utxo
 module Zmq_notify = Zmq_notify
 module Zmq_socket = Zmq_socket
+module Sig_cache = Sig_cache

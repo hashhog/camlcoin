@@ -726,7 +726,13 @@ let is_compressed_pubkey (pk : Cstruct.t) : bool =
 (* Check public key encoding validity *)
 let check_pubkey_encoding (pk : Cstruct.t) (flags : int) (sig_version : sig_version) : (unit, string) result =
   let pk_len = Cstruct.length pk in
-  if pk_len = 0 then Ok ()
+  if pk_len = 0 then begin
+    (* Empty pubkeys are invalid with STRICTENC *)
+    if flags land script_verify_strictenc <> 0 then
+      Error "Invalid public key encoding"
+    else
+      Ok ()
+  end
   else begin
     (* STRICTENC: must be valid compressed (33 bytes, 0x02/0x03) or uncompressed (65 bytes, 0x04) *)
     if flags land script_verify_strictenc <> 0 then begin
@@ -1246,6 +1252,13 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                           st.flags land script_verify_const_scriptcode <> 0 ->
     (* CONST_SCRIPTCODE: OP_CODESEPARATOR rejected even in non-executing branches *)
     Error "CONST_SCRIPTCODE: OP_CODESEPARATOR in legacy script"
+
+  | OP_PUSHDATA (_, data) when not executing ->
+    (* Push size limit is enforced even in non-executing branches *)
+    if Cstruct.length data > max_script_element_size then
+      Error "Push data exceeds maximum size"
+    else
+      Ok ()
 
   | _ when not executing ->
     (* Skip all other opcodes when not executing *)
@@ -2040,7 +2053,7 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
     begin match stack_pop st with
     | Error e -> Error e
     | Ok n_bytes ->
-      let n_pubkeys = Int64.to_int (script_num_of_bytes n_bytes) in
+      let n_pubkeys = Int64.to_int (script_num_of_bytes ~require_minimal:(st.flags land script_verify_minimaldata <> 0) n_bytes) in
       if n_pubkeys < 0 || n_pubkeys > max_pubkeys_per_multisig then
         Error "Invalid pubkey count"
       else begin
@@ -2061,7 +2074,7 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
             begin match stack_pop st with
             | Error e -> Error e
             | Ok m_bytes ->
-              let m_sigs = Int64.to_int (script_num_of_bytes m_bytes) in
+              let m_sigs = Int64.to_int (script_num_of_bytes ~require_minimal:(st.flags land script_verify_minimaldata <> 0) m_bytes) in
               if m_sigs < 0 || m_sigs > n_pubkeys then
                 Error "Invalid signature count"
               else begin

@@ -230,15 +230,51 @@ let parse_flags (flags_str : string) : int =
     ) 0 flag_list
   end
 
-(* ---- Dummy transaction for script verification ---- *)
+(* ---- Crediting and Spending transactions (Bitcoin Core approach) ---- *)
 
-let make_dummy_tx (script_sig : Cstruct.t) : Types.transaction =
+(* Bitcoin Core's test framework creates two canonical transactions:
+   1. A "crediting transaction" that creates the UTXO with the test's scriptPubKey
+   2. A "spending transaction" that spends it with the test's scriptSig
+   This ensures real sighash computation works correctly for signature verification. *)
+
+(* Build the crediting transaction:
+   version=1, locktime=0
+   Input: null prevout (txid=0, vout=0xFFFFFFFF), scriptSig = OP_0 OP_0, sequence=0xFFFFFFFF
+   Output: value=0, scriptPubKey = test's scriptPubKey *)
+let make_crediting_tx (script_pubkey : Cstruct.t) : Types.transaction =
   let open Types in
-  let prev_hash = Cstruct.create 32 in  (* all zeros *)
+  let null_hash = Cstruct.create 32 in  (* 32 zero bytes *)
+  (* scriptSig = OP_0 OP_0 *)
+  let credit_script_sig = Cstruct.of_string "\x00\x00" in
   let input = {
-    previous_output = { txid = prev_hash; vout = 0xffffffffl };
-    script_sig = script_sig;
-    sequence = 0xffffffffl;
+    previous_output = { txid = null_hash; vout = 0xFFFFFFFFl };
+    script_sig = credit_script_sig;
+    sequence = 0xFFFFFFFFl;
+  } in
+  let output = {
+    value = 0L;
+    script_pubkey;
+  } in
+  {
+    version = 1l;
+    inputs = [input];
+    outputs = [output];
+    witnesses = [];
+    locktime = 0l;
+  }
+
+(* Build the spending transaction:
+   version=1, locktime=0
+   Input: prevout = crediting_txid:0, scriptSig = test's scriptSig, sequence=0xFFFFFFFF
+   Output: value=0, scriptPubKey = empty *)
+let make_spending_tx (crediting_tx : Types.transaction) (script_sig : Cstruct.t)
+    ~(locktime : int32) ~(sequence : int32) : Types.transaction =
+  let open Types in
+  let crediting_txid = Crypto.compute_txid crediting_tx in
+  let input = {
+    previous_output = { txid = crediting_txid; vout = 0l };
+    script_sig;
+    sequence;
   } in
   let output = {
     value = 0L;
@@ -249,8 +285,11 @@ let make_dummy_tx (script_sig : Cstruct.t) : Types.transaction =
     inputs = [input];
     outputs = [output];
     witnesses = [];
-    locktime = 0l;
+    locktime;
   }
+
+(* Bitcoin Core's BuildSpendingTransaction always uses locktime=0, sequence=0xFFFFFFFF.
+   The CLTV/CSV flags are not used in the non-witness (4/5-element) test vectors. *)
 
 (* ---- Main ---- *)
 
@@ -295,7 +334,11 @@ let () =
           let script_sig = assemble_script script_sig_asm in
           let script_pubkey = assemble_script script_pubkey_asm in
           let flags = parse_flags flags_str in
-          let tx = make_dummy_tx script_sig in
+
+          (* Build crediting and spending transactions (Bitcoin Core approach) *)
+          let crediting_tx = make_crediting_tx script_pubkey in
+          let tx = make_spending_tx crediting_tx script_sig
+                     ~locktime:0l ~sequence:0xFFFFFFFFl in
 
           let witness = Types.({ items = [] }) in
           let result = Script.verify_script

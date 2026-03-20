@@ -1907,7 +1907,7 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                 match checksig_result with
                 | Error e -> Error e
                 | Ok sighash ->
-                let valid = Crypto.verify pubkey sighash sig_der in
+                let valid = Crypto.verify_lax pubkey sighash sig_der in
                 if (not valid) && Cstruct.length sig_bytes > 0 &&
                    (st.flags land script_verify_nullfail <> 0) then
                   Error "NULLFAIL: non-empty signature on failed CHECKSIG"
@@ -2018,7 +2018,7 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                 match checksig_result with
                 | Error e -> Error e
                 | Ok sighash ->
-                let valid = Crypto.verify pubkey sighash sig_der in
+                let valid = Crypto.verify_lax pubkey sighash sig_der in
                 if valid then Ok ()
                 else if Cstruct.length sig_bytes > 0 &&
                         (st.flags land script_verify_nullfail <> 0) then
@@ -2148,7 +2148,7 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                                 match check_pubkey_encoding pk st.flags st.sig_version with
                                 | Error e -> Error e
                                 | Ok () ->
-                                if Crypto.verify pk sighash sig_der then
+                                if Crypto.verify_lax pk sighash sig_der then
                                   verify_sigs rest_sigs rest_pks true
                                 else
                                   try_pubkeys rest_pks

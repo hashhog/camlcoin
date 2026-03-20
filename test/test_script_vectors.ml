@@ -4,7 +4,7 @@
 open Camlcoin
 
 let script_tests_path =
-  "../ouroboros/bitcoin/src/test/data/script_tests.json"
+  "/home/max/hashhog/bitcoin/src/test/data/script_tests.json"
 
 (* ---- Hex utilities ---- *)
 

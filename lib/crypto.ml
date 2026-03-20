@@ -112,13 +112,13 @@ let sign (privkey : private_key) (msg_hash : Types.hash256) : signature =
 let is_valid_signature_encoding (sig_bytes : Cstruct.t) : bool =
   let len = Cstruct.length sig_bytes in
   (* Minimum DER signature is 8 bytes, maximum is 73 bytes *)
-  if len < 8 || len > 73 then false
+  if len < 9 || len > 73 then false
   else
     let b i = Cstruct.get_uint8 sig_bytes i in
     (* A signature is of type 0x30 (compound) *)
     if b 0 <> 0x30 then false
     (* Make sure the length covers the entire signature *)
-    else if b 1 <> len - 2 then false
+    else if b 1 <> len - 3 then false
     (* Make sure the length of the S element is still inside the signature *)
     else if b 2 <> 0x02 then false
     else
@@ -132,7 +132,7 @@ let is_valid_signature_encoding (sig_bytes : Cstruct.t) : bool =
       else
         let len_s = b (5 + len_r) in
         if len_s = 0 then false
-        else if len_r + len_s + 6 <> len then false
+        else if len_r + len_s + 7 <> len then false
         (* Check whether the R element is an integer *)
         (* Negative zeros are not allowed for R *)
         else if b 4 land 0x80 <> 0 then false

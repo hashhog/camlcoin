@@ -302,6 +302,187 @@ CAMLprim value caml_ecdsa_verify_normalized(value v_pubkey, value v_msg, value v
 }
 
 /* ============================================================================
+   Lax DER Signature Parsing (for Bitcoin script verification)
+   ============================================================================
+
+   Bitcoin Core uses a "lax" DER parser for signature verification when the
+   DERSIG/STRICTENC flags are not set. This allows some non-standard DER
+   encodings that were accepted by OpenSSL but not by libsecp256k1's strict
+   parser. This is a direct port of Bitcoin Core's ecdsa_signature_parse_der_lax
+   from pubkey.cpp. */
+
+static int ecdsa_signature_parse_der_lax(const secp256k1_context* ctx,
+    secp256k1_ecdsa_signature* sig, const unsigned char *input, size_t inputlen) {
+    size_t rpos, rlen, spos, slen;
+    size_t pos = 0;
+    size_t lenbyte;
+    unsigned char tmpsig[64] = {0};
+    int overflow = 0;
+
+    /* Sequence tag byte */
+    if (pos == inputlen || input[pos] != 0x30) {
+        return 0;
+    }
+    pos++;
+
+    /* Sequence length bytes */
+    if (pos == inputlen) {
+        return 0;
+    }
+    lenbyte = input[pos++];
+    if (lenbyte & 0x80) {
+        lenbyte -= 0x80;
+        if (lenbyte > inputlen - pos) {
+            return 0;
+        }
+        pos += lenbyte;
+    }
+
+    /* Integer tag byte for R */
+    if (pos == inputlen || input[pos] != 0x02) {
+        return 0;
+    }
+    pos++;
+
+    /* Integer length for R */
+    if (pos == inputlen) {
+        return 0;
+    }
+    lenbyte = input[pos++];
+    if (lenbyte & 0x80) {
+        lenbyte -= 0x80;
+        if (lenbyte > inputlen - pos) {
+            return 0;
+        }
+        while (lenbyte > 0 && input[pos] == 0) {
+            pos++;
+            lenbyte--;
+        }
+        if (lenbyte >= sizeof(size_t)) {
+            return 0;
+        }
+        rlen = 0;
+        while (lenbyte > 0) {
+            rlen = (rlen << 8) + input[pos];
+            pos++;
+            lenbyte--;
+        }
+    } else {
+        rlen = lenbyte;
+    }
+    if (rlen > inputlen - pos) {
+        return 0;
+    }
+    rpos = pos;
+    pos += rlen;
+
+    /* Integer tag byte for S */
+    if (pos == inputlen || input[pos] != 0x02) {
+        return 0;
+    }
+    pos++;
+
+    /* Integer length for S */
+    if (pos == inputlen) {
+        return 0;
+    }
+    lenbyte = input[pos++];
+    if (lenbyte & 0x80) {
+        lenbyte -= 0x80;
+        if (lenbyte > inputlen - pos) {
+            return 0;
+        }
+        while (lenbyte > 0 && input[pos] == 0) {
+            pos++;
+            lenbyte--;
+        }
+        if (lenbyte >= sizeof(size_t)) {
+            return 0;
+        }
+        slen = 0;
+        while (lenbyte > 0) {
+            slen = (slen << 8) + input[pos];
+            pos++;
+            lenbyte--;
+        }
+    } else {
+        slen = lenbyte;
+    }
+    if (slen > inputlen - pos) {
+        return 0;
+    }
+    spos = pos;
+
+    /* Ignore leading zeroes in R */
+    while (rlen > 0 && input[rpos] == 0) {
+        rlen--;
+        rpos++;
+    }
+    /* Copy R value */
+    if (rlen > 32) {
+        overflow = 1;
+    } else {
+        memcpy(tmpsig + 32 - rlen, input + rpos, rlen);
+    }
+
+    /* Ignore leading zeroes in S */
+    while (slen > 0 && input[spos] == 0) {
+        slen--;
+        spos++;
+    }
+    /* Copy S value */
+    if (slen > 32) {
+        overflow = 1;
+    } else {
+        memcpy(tmpsig + 64 - slen, input + spos, slen);
+    }
+
+    if (!overflow) {
+        overflow = !secp256k1_ecdsa_signature_parse_compact(ctx, sig, tmpsig);
+    }
+    if (overflow) {
+        /* Overwrite the result again with a correctly-parsed but invalid
+           signature if parsing failed. */
+        memset(tmpsig, 0, 64);
+        secp256k1_ecdsa_signature_parse_compact(ctx, sig, tmpsig);
+    }
+    return 1;
+}
+
+/* caml_ecdsa_verify_lax(pubkey_bytes, msg_32bytes, sig_der_bytes) -> bool
+   Same as caml_ecdsa_verify but uses lax DER parsing for legacy Bitcoin
+   signature verification (pre-DERSIG/STRICTENC enforcement). */
+CAMLprim value caml_ecdsa_verify_lax(value v_pubkey, value v_msg, value v_sig) {
+    CAMLparam3(v_pubkey, v_msg, v_sig);
+    ensure_ctx();
+
+    unsigned char *pk_data = (unsigned char *)Caml_ba_data_val(v_pubkey);
+    size_t pk_len = Caml_ba_array_val(v_pubkey)->dim[0];
+    unsigned char *msg_data = (unsigned char *)Caml_ba_data_val(v_msg);
+    unsigned char *sig_data = (unsigned char *)Caml_ba_data_val(v_sig);
+    size_t sig_len = Caml_ba_array_val(v_sig)->dim[0];
+
+    /* Parse public key */
+    secp256k1_pubkey pubkey;
+    if (!secp256k1_ec_pubkey_parse(schnorr_ctx, &pubkey, pk_data, pk_len)) {
+        CAMLreturn(Val_false);
+    }
+
+    /* Parse DER signature with lax parsing */
+    secp256k1_ecdsa_signature sig;
+    if (!ecdsa_signature_parse_der_lax(schnorr_ctx, &sig, sig_data, sig_len)) {
+        CAMLreturn(Val_false);
+    }
+
+    /* Normalize to low-S (Bitcoin Core always normalizes before verification) */
+    secp256k1_ecdsa_signature_normalize(schnorr_ctx, &sig, &sig);
+
+    /* Verify */
+    int result = secp256k1_ecdsa_verify(schnorr_ctx, &sig, msg_data, &pubkey);
+    CAMLreturn(Val_bool(result));
+}
+
+/* ============================================================================
    Batch Schnorr Verification
    ============================================================================
 

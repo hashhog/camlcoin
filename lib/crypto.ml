@@ -526,6 +526,27 @@ let verify_ecdsa_normalized ~(pubkey : Cstruct.t) ~(msg32 : Cstruct.t) ~(signatu
         (cstruct_to_bigstring signature)
     with _ -> false
 
+(* Raw FFI binding for ECDSA verification with lax DER parsing *)
+external ecdsa_verify_lax_raw : Bigstring.t -> Bigstring.t -> Bigstring.t -> bool
+  = "caml_ecdsa_verify_lax"
+
+(* ECDSA verification with lax DER parsing and low-S normalization.
+   This is needed for Bitcoin script verification: signatures that passed the
+   separate strict-DER check (when DERSIG/STRICTENC flags are set) can use
+   strict parsing, but all signatures should go through lax parsing + normalize
+   since Bitcoin Core does this for consensus verification. *)
+let verify_lax (pubkey_bytes : public_key) (msg_hash : Types.hash256) (sig_bytes : signature) : bool =
+  let pk_len = Cstruct.length pubkey_bytes in
+  if Cstruct.length msg_hash <> 32 then false
+  else if pk_len <> 33 && pk_len <> 65 then false
+  else
+    try
+      ecdsa_verify_lax_raw
+        (cstruct_to_bigstring pubkey_bytes)
+        (cstruct_to_bigstring msg_hash)
+        (cstruct_to_bigstring sig_bytes)
+    with _ -> false
+
 (* ============================================================================
    Batch Schnorr Verification
    ============================================================================

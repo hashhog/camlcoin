@@ -309,11 +309,15 @@ let () =
     match test with
     | `List elems ->
       let n = List.length elems in
-      (* Skip comments (single-element arrays) and witness tests (6+ elements) *)
+      (* Skip comments (single-element arrays) and witness tests (6+ elements,
+         or 5 elements where element 0 is a JSON array i.e. witness stack) *)
       if n = 1 || n = 2 || n = 3 then
         ()  (* comment or malformed, skip *)
       else if n >= 6 then begin
         (* Witness test - skip for now *)
+        incr skip_count
+      end else if n = 5 && (match List.nth elems 0 with `List _ -> true | _ -> false) then begin
+        (* 5-element witness test (witness stack, scriptSig, scriptPubKey, flags, expected) *)
         incr skip_count
       end else begin
         (* 4 or 5 element test: [scriptSig, scriptPubKey, flags, expected, ?comment] *)

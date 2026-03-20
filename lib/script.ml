@@ -2091,27 +2091,6 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                        Cstruct.length dummy <> 0 then
                       Error "NULLDUMMY violation"
                     else begin
-                      (* DER/LOW_S/STRICTENC checks on all non-empty signatures *)
-                      let sig_check_err = ref None in
-                      List.iter (fun sig_bytes ->
-                        if Cstruct.length sig_bytes > 0 && !sig_check_err = None then begin
-                          let sig_der = strip_hash_type sig_bytes in
-                          if st.flags land (script_verify_dersig lor script_verify_low_s lor script_verify_strictenc) <> 0 &&
-                             not (Crypto.is_valid_signature_encoding sig_bytes) then
-                            sig_check_err := Some "Non-strict DER signature"
-                          else if st.flags land script_verify_low_s <> 0 &&
-                                  not (Crypto.is_low_der_s sig_der) then
-                            sig_check_err := Some "Non-low-S signature"
-                          else if st.flags land script_verify_strictenc <> 0 then begin
-                            let ht = get_signature_hash_type sig_bytes in
-                            if not (is_defined_hash_type ht) then
-                              sig_check_err := Some "Invalid hash type"
-                          end
-                        end
-                      ) sigs;
-                      match !sig_check_err with
-                      | Some e -> Error e
-                      | None ->
                       (* Compute effective scriptCode accounting for OP_CODESEPARATOR *)
                       let effective_script_code =
                         if st.codesep_pos <> 0xFFFFFFFF then
@@ -2138,10 +2117,34 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                       match cleaned_script with
                       | None -> Error "CONST_SCRIPTCODE: find_and_delete modified scriptCode"
                       | Some cleaned_script ->
-                      let rec verify_sigs sigs pubkeys success =
+                      let check_sig_encoding sig_bytes =
+                        if Cstruct.length sig_bytes > 0 then begin
+                          if st.flags land (script_verify_dersig lor script_verify_low_s lor script_verify_strictenc) <> 0 &&
+                             not (Crypto.is_valid_signature_encoding sig_bytes) then
+                            Error "Non-strict DER signature"
+                          else if st.flags land script_verify_low_s <> 0 &&
+                                  not (Crypto.is_low_der_s (strip_hash_type sig_bytes)) then
+                            Error "Non-low-S signature"
+                          else if st.flags land script_verify_strictenc <> 0 then begin
+                            let ht = get_signature_hash_type sig_bytes in
+                            if not (is_defined_hash_type ht) then
+                              Error "Invalid hash type"
+                            else Ok ()
+                          end else Ok ()
+                        end else Ok ()
+                      in
+                      let rec verify_sigs sigs n_sigs_left pubkeys n_keys_left success =
                         match sigs with
                         | [] -> Ok success
                         | sig_bytes :: rest_sigs ->
+                          (* Early exit: not enough keys left for remaining sigs *)
+                          if n_keys_left < n_sigs_left then
+                            Ok false
+                          else
+                          (* Check sig encoding lazily, only when this sig is actually being tested *)
+                          match check_sig_encoding sig_bytes with
+                          | Error e -> Error e
+                          | Ok () ->
                           if Cstruct.length sig_bytes = 0 then Ok false
                           else begin
                             let hash_type = get_signature_hash_type sig_bytes in
@@ -2157,18 +2160,23 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                             let rec try_pubkeys = function
                               | [] -> Ok false
                               | pk :: rest_pks ->
+                                let keys_remaining = List.length rest_pks + 1 in
+                                (* Not enough keys left for remaining sigs (including current) *)
+                                if keys_remaining < n_sigs_left then
+                                  Ok false
+                                else
                                 match check_pubkey_encoding pk st.flags st.sig_version with
                                 | Error e -> Error e
                                 | Ok () ->
                                 if Crypto.verify_lax pk sighash sig_der then
-                                  verify_sigs rest_sigs rest_pks true
+                                  verify_sigs rest_sigs (n_sigs_left - 1) rest_pks (keys_remaining - 1) true
                                 else
                                   try_pubkeys rest_pks
                             in
                             try_pubkeys pubkeys
                           end
                       in
-                      let result = if m_sigs = 0 then Ok true else verify_sigs sigs pubkeys true in
+                      let result = if m_sigs = 0 then Ok true else verify_sigs sigs m_sigs pubkeys n_pubkeys true in
                       match result with
                       | Error e -> Error e
                       | Ok success ->

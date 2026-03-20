@@ -1197,8 +1197,7 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
            Also enforce when the explicit flag is set for legacy scripts. *)
         let enforce_minimalif =
           st.sig_version = SigVersionTapscript ||
-          (st.sig_version = SigVersionWitnessV0 && st.flags land script_verify_minimalif <> 0) ||
-          (st.flags land script_verify_minimalif <> 0)
+          (st.sig_version = SigVersionWitnessV0 && st.flags land script_verify_minimalif <> 0)
         in
         if enforce_minimalif then begin
           let len = Cstruct.length top in

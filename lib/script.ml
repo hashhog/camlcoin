@@ -2178,8 +2178,13 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
 
   (* Locktime operations *)
   | OP_CHECKLOCKTIMEVERIFY ->
-    if st.flags land script_verify_checklocktimeverify = 0 then
-      Ok ()  (* Treat as NOP if not enabled *)
+    if st.flags land script_verify_checklocktimeverify = 0 then begin
+      (* Treat as NOP2 if CLTV not enabled *)
+      if st.flags land script_verify_discourage_upgradable_nops <> 0 then
+        Error "Upgradable NOP used"
+      else
+        Ok ()
+    end
     else begin
       match stack_top st with
       | Error e -> Error e
@@ -2187,7 +2192,7 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
         if Cstruct.length lock_bytes > 5 then
           Error "CLTV argument too long"
         else begin
-          let locktime = script_num_of_bytes ~max_bytes:5 lock_bytes in
+          let locktime = script_num_of_bytes ~require_minimal:(st.flags land script_verify_minimaldata <> 0) ~max_bytes:5 lock_bytes in
           if locktime < 0L then
             Error "Negative locktime"
           else begin
@@ -2212,8 +2217,13 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
     end
 
   | OP_CHECKSEQUENCEVERIFY ->
-    if st.flags land script_verify_checksequenceverify = 0 then
-      Ok ()  (* Treat as NOP if not enabled *)
+    if st.flags land script_verify_checksequenceverify = 0 then begin
+      (* Treat as NOP3 if CSV not enabled *)
+      if st.flags land script_verify_discourage_upgradable_nops <> 0 then
+        Error "Upgradable NOP used"
+      else
+        Ok ()
+    end
     else begin
       match stack_top st with
       | Error e -> Error e
@@ -2221,7 +2231,7 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
         if Cstruct.length seq_bytes > 5 then
           Error "CSV argument too long"
         else begin
-          let sequence = script_num_of_bytes ~max_bytes:5 seq_bytes in
+          let sequence = script_num_of_bytes ~require_minimal:(st.flags land script_verify_minimaldata <> 0) ~max_bytes:5 seq_bytes in
           if sequence < 0L then
             Error "Negative sequence"
           else begin
@@ -2567,7 +2577,11 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
         st_pub.stack <- saved_stack;
         begin match run_script st_pub script_pubkey with
         | Error e -> Error e
-        | Ok () -> check_stack_top st_pub
+        | Ok () ->
+          if flags land script_verify_cleanstack <> 0 && stack_size st_pub <> 1 then
+            Error "Stack not clean after execution"
+          else
+            check_stack_top st_pub
         end
       end
     else begin
@@ -2584,6 +2598,8 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
       | Ok () ->
         (* Save stack before running P2SH redeem script check *)
         let stack_copy = st.stack in
+        (* Clear altstack between scriptSig and scriptPubKey *)
+        st.altstack <- [];
         (* Run scriptPubKey (OP_HASH160 <hash> OP_EQUAL) *)
         begin match run_script st script_pubkey with
         | Error e -> Error e

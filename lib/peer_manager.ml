@@ -210,6 +210,9 @@ type t = {
   mutable mempool : Mempool.mempool option;         (* Mempool for min_relay_fee *)
   (* BIP 152: High-bandwidth compact block relay (up to 3 peers) *)
   mutable hb_compact_peers : int list;              (* Peer IDs designated for HB compact relay *)
+  (* Callback to start the message loop for a newly-connected peer.
+     Filled in by [start] once [peer_message_loop] is defined. *)
+  mutable start_msg_loop : (Peer.peer -> unit);
 }
 
 (* Generate a random bucket key for address hashing *)
@@ -247,6 +250,7 @@ let create ?(config = default_config) (network : Consensus.network_config) : t =
     outbound_netgroups = Hashtbl.create 16;
     stale_state = Hashtbl.create 64;
     stale_check_running = false;
+    start_msg_loop = (fun _peer -> ());
     mempool = None;
     hb_compact_peers = [];
   }
@@ -680,6 +684,8 @@ let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
       Hashtbl.replace pm.outbound_netgroups (netgroup_of addr) true;
       (* Start inventory trickling for this peer *)
       Lwt.async (fun () -> Peer.start_trickling peer);
+      (* Start message loop if enabled (no-op before enable_message_loops) *)
+      pm.start_msg_loop peer;
       (* Move address to tried table (successful connection) *)
       let tried_bucket = move_to_tried_table pm addr in
       (* Update known_addrs with successful connection *)
@@ -748,6 +754,8 @@ let add_block_relay_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
       Hashtbl.replace pm.stale_state peer.Peer.id (create_stale_state ());
       Hashtbl.replace pm.outbound_netgroups (netgroup_of addr) true;
       Lwt.async (fun () -> Peer.start_trickling peer);
+      (* Start message loop if enabled (no-op before enable_message_loops) *)
+      pm.start_msg_loop peer;
       let tried_bucket = move_to_tried_table pm addr in
       (match Hashtbl.find_opt pm.known_addrs addr with
        | Some info ->
@@ -1669,6 +1677,19 @@ let start (pm : t) : unit Lwt.t =
   (* Return immediately, maintenance runs in background *)
   Lwt.async (fun () -> maintenance);
   Lwt.return_unit
+
+(* Enable message loops for all currently-connected outbound peers and
+   for any future peers added via add_peer / add_block_relay_peer.
+   MUST be called AFTER header sync finishes, because sync_headers reads
+   directly from the peer socket and would race with peer_message_loop. *)
+let enable_message_loops (pm : t) : unit =
+  (* Start message loops for all currently connected peers *)
+  List.iter (fun peer ->
+    Lwt.async (fun () -> peer_message_loop pm peer)
+  ) pm.peers;
+  (* Install callback so future peers also get message loops *)
+  pm.start_msg_loop <- (fun peer ->
+    Lwt.async (fun () -> peer_message_loop pm peer))
 
 (* Stop the peer manager *)
 let stop (pm : t) : unit Lwt.t =

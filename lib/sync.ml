@@ -418,6 +418,13 @@ let restore_chain_state (db : Storage.ChainDB.t)
       | None -> ()
     done;
     state.headers_synced <- tip_height;
+    (* Restore validated block height from chain_tip (separate from header_tip).
+       chain_tip is only written after successful UTXO flush, so it always
+       points to a height with consistent UTXO state. *)
+    (match Storage.ChainDB.get_chain_tip db with
+     | Some (_chain_hash, chain_height) ->
+       state.blocks_synced <- chain_height
+     | None -> ());
     (* Load invalidated blocks from database *)
     List.iter (fun hash ->
       Hashtbl.replace state.invalidated_blocks (Cstruct.to_string hash) ()
@@ -936,17 +943,22 @@ let fill_download_queue (ibd : ibd_state) : unit =
     let height = ibd.next_download_height in
     match Storage.ChainDB.get_hash_at_height ibd.chain.db height with
     | Some hash ->
-      (* Only add if we don't already have the block *)
-      if not (Storage.ChainDB.has_block ibd.chain.db hash) then begin
-        queue_add ibd {
-          hash;
-          height;
-          download_state = NotRequested;
-        }
-      end;
+      (* If the block is already stored on disk and is ABOVE blocks_synced
+         (i.e. stored from a crashed session but not yet validated with
+         consistent UTXO state), load it directly to avoid re-downloading. *)
+      if Storage.ChainDB.has_block ibd.chain.db hash then begin
+        match Storage.ChainDB.get_block ibd.chain.db hash with
+        | Some block ->
+          queue_add ibd {
+            hash; height;
+            download_state = Downloaded { block; peer_id = None };
+          }
+        | None ->
+          queue_add ibd { hash; height; download_state = NotRequested }
+      end else
+        queue_add ibd { hash; height; download_state = NotRequested };
       ibd.next_download_height <- ibd.next_download_height + 1
     | None ->
-      (* Missing hash at height - shouldn't happen if headers are synced *)
       ibd.next_download_height <- ibd.next_download_height + 1
   done
 
@@ -1086,8 +1098,21 @@ let request_blocks (ibd : ibd_state) (peers : Peer.peer list)
               m "Requesting %d blocks from peer %d (in-flight: %d/%d)"
                 (List.length inv_vectors) peer.Peer.id
                 peer_state.blocks_in_flight max_blocks_per_peer);
-            (* Send batched GetData message *)
-            Peer.send_message peer (P2p.GetdataMsg inv_vectors)
+            (* Send batched GetData message — catch broken-pipe / closed
+               channel so one dead peer doesn't kill the IBD loop. *)
+            Lwt.catch
+              (fun () -> Peer.send_message peer (P2p.GetdataMsg inv_vectors))
+              (fun _exn ->
+                 (* Peer socket is dead; un-mark the blocks so they can be
+                    re-requested from another peer. *)
+                 List.iter (fun entry ->
+                   entry.download_state <- NotRequested;
+                   ibd.total_blocks_in_flight <-
+                     max 0 (ibd.total_blocks_in_flight - 1);
+                   peer_state.blocks_in_flight <-
+                     max 0 (peer_state.blocks_in_flight - 1)
+                 ) batch;
+                 Lwt.return_unit)
           end
       end
     end
@@ -1300,22 +1325,22 @@ let compute_expected_bits (state : chain_state) (height : int)
      | None -> network.pow_limit)
   else if height mod Consensus.difficulty_adjustment_interval = 0 then begin
     (* Difficulty adjustment boundary *)
-    let last_retarget_height = height - Consensus.difficulty_adjustment_interval in
-    let last_retarget_time =
-      match get_header_at_height state last_retarget_height with
-      | Some entry -> entry.header.timestamp
-      | None -> 0l
-    in
     let parent =
       match get_header_at_height state (height - 1) with
       | Some entry -> entry.header
       | None -> network.genesis_header
     in
-    let current_bits = parent.bits in
-    Consensus.next_work_required
-      ~last_retarget_time
-      ~current_header:parent
-      ~current_bits
+    let get_block_info h =
+      match get_header_at_height state h with
+      | Some entry -> (entry.header.timestamp, entry.header.bits)
+      | None -> (0l, network.pow_limit)
+    in
+    Consensus.get_next_work_required
+      ~height
+      ~block_time:block_header.timestamp
+      ~prev_block_time:parent.timestamp
+      ~prev_bits:parent.bits
+      ~get_block_info
       ~network
   end else begin
     (* Non-adjustment block *)
@@ -1360,27 +1385,50 @@ let process_downloaded_blocks (ibd : ibd_state)
         let expected_bits = compute_expected_bits ibd.chain height block.header in
         (* Compute median time past from last 11 blocks *)
         let median_time = compute_median_time_past ibd.chain height in
-        (* Build UTXO lookup function *)
+        (* Build UTXO lookup function.  When an OptimizedUtxoSet is
+           attached we query it first — it keeps an in-memory dirty set
+           that is not yet flushed to the database, so it can resolve
+           outputs created earlier in this IBD session.  Fall back to
+           the raw DB lookup for entries written in a previous session. *)
         let lookup outpoint =
-          let _txid_key = Cstruct.to_string outpoint.Types.txid in
+          let txid = outpoint.Types.txid in
           let vout = Int32.to_int outpoint.Types.vout in
-          match Storage.ChainDB.get_utxo ibd.chain.db outpoint.Types.txid vout with
-          | None -> None
-          | Some data ->
-            let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
-            let value = Serialize.read_int64_le r in
-            let script_len = Serialize.read_compact_size r in
-            let script = Serialize.read_bytes r script_len in
-            let stored_height = Int32.to_int (Serialize.read_int32_le r) in
-            let utxo_is_coinbase = Serialize.read_uint8 r = 1 in
+          let entry_opt = match ibd.utxo_set with
+            | Some utxo ->
+              (match Utxo.OptimizedUtxoSet.get utxo txid vout with
+               | Some e -> Some e
+               | None -> None)
+            | None -> None
+          in
+          match entry_opt with
+          | Some e ->
             Some Validation.{
-              txid = outpoint.Types.txid;
+              txid;
               vout = outpoint.Types.vout;
-              value;
-              script_pubkey = script;
-              height = stored_height;
-              is_coinbase = utxo_is_coinbase;
+              value = e.Utxo.value;
+              script_pubkey = e.Utxo.script_pubkey;
+              height = e.Utxo.height;
+              is_coinbase = e.Utxo.is_coinbase;
             }
+          | None ->
+            (* Fall back to raw DB *)
+            (match Storage.ChainDB.get_utxo ibd.chain.db txid vout with
+             | None -> None
+             | Some data ->
+               let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+               let value = Serialize.read_int64_le r in
+               let script_len = Serialize.read_compact_size r in
+               let script = Serialize.read_bytes r script_len in
+               let stored_height = Int32.to_int (Serialize.read_int32_le r) in
+               let utxo_is_coinbase = Serialize.read_uint8 r = 1 in
+               Some Validation.{
+                 txid;
+                 vout = outpoint.Types.vout;
+                 value;
+                 script_pubkey = script;
+                 height = stored_height;
+                 is_coinbase = utxo_is_coinbase;
+               })
         in
         (* Validate block with UTXO tracking *)
         let skip_scripts = is_assume_valid ibd.chain height in
@@ -1402,12 +1450,23 @@ let process_downloaded_blocks (ibd : ibd_state)
                let spent = List.filter_map (fun inp ->
                  let prev = inp.Types.previous_output in
                  let vout = Int32.to_int prev.Types.vout in
-                 match Storage.ChainDB.get_utxo ibd.chain.db prev.Types.txid vout with
+                 (* Look up via OptimizedUtxoSet first, then DB *)
+                 let entry_opt = match ibd.utxo_set with
+                   | Some utxo -> Utxo.OptimizedUtxoSet.get utxo prev.Types.txid vout
+                   | None -> None
+                 in
+                 let entry_opt = match entry_opt with
+                   | Some _ as r -> r
+                   | None ->
+                     match Storage.ChainDB.get_utxo ibd.chain.db prev.Types.txid vout with
+                     | None -> None
+                     | Some data ->
+                       let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+                       Some (Utxo.deserialize_utxo_entry r)
+                 in
+                 match entry_opt with
                  | None -> None
-                 | Some data ->
-                   let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
-                   let entry_utxo = Utxo.deserialize_utxo_entry r in
-                   Some (prev, entry_utxo)
+                 | Some entry_utxo -> Some (prev, entry_utxo)
                ) tx.Types.inputs in
                Some Utxo.{ spent_outputs = spent }
              end else None
@@ -1427,7 +1486,16 @@ let process_downloaded_blocks (ibd : ibd_state)
                  let data = encode_utxo out.Types.value out.Types.script_pubkey
                      height is_cb in
                  ibd.pending_utxo_updates <-
-                   (txid, vout, data) :: ibd.pending_utxo_updates
+                   (txid, vout, data) :: ibd.pending_utxo_updates;
+                 (* Also update OptimizedUtxoSet for in-memory lookups *)
+                 (match ibd.utxo_set with
+                  | Some utxo ->
+                    Utxo.OptimizedUtxoSet.add utxo txid vout
+                      Utxo.{ value = out.Types.value;
+                             script_pubkey = out.Types.script_pubkey;
+                             height;
+                             is_coinbase = is_cb }
+                  | None -> ())
                ) tx.Types.outputs
              end;
              (* Delete spent inputs (non-coinbase only) *)
@@ -1436,7 +1504,14 @@ let process_downloaded_blocks (ibd : ibd_state)
                  ibd.pending_utxo_deletes <-
                    (inp.Types.previous_output.Types.txid,
                     Int32.to_int inp.Types.previous_output.Types.vout)
-                   :: ibd.pending_utxo_deletes
+                   :: ibd.pending_utxo_deletes;
+                 (* Also remove from OptimizedUtxoSet *)
+                 (match ibd.utxo_set with
+                  | Some utxo ->
+                    ignore (Utxo.OptimizedUtxoSet.remove utxo
+                      inp.Types.previous_output.Types.txid
+                      (Int32.to_int inp.Types.previous_output.Types.vout))
+                  | None -> ())
                ) tx.Types.inputs
              end
            ) block.transactions;
@@ -1763,10 +1838,12 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
    ============================================================================ *)
 
 (* Run initial block download *)
-let run_ibd (ibd : ibd_state) (peers : Peer.peer list) : unit Lwt.t =
+let run_ibd (ibd : ibd_state) (get_peers : unit -> Peer.peer list) : unit Lwt.t =
+  let last_progress_log = ref (Unix.gettimeofday ()) in
   let rec loop () =
     fill_download_queue ibd;
-    if Queue.is_empty ibd.block_queue && ibd.total_blocks_in_flight = 0 then begin
+    let qlen = Queue.length ibd.block_queue in
+    if qlen = 0 && ibd.total_blocks_in_flight = 0 then begin
       (* Flush any remaining UTXO updates *)
       flush_utxos ibd;
       (* Update chain tip *)
@@ -1781,6 +1858,8 @@ let run_ibd (ibd : ibd_state) (peers : Peer.peer list) : unit Lwt.t =
     end else begin
       (* Expire old orphan blocks *)
       ignore (expire_orphan_blocks ibd);
+      (* Get fresh peer list each iteration *)
+      let peers = get_peers () in
       (* Check for stalled downloads and disconnect bad peers *)
       let stalled_peers = check_stalled_downloads ibd in
       let active_peers = List.filter (fun p ->
@@ -1793,16 +1872,32 @@ let run_ibd (ibd : ibd_state) (peers : Peer.peer list) : unit Lwt.t =
         (* Remove peer state so it won't be scheduled again *)
         Hashtbl.remove ibd.peer_states peer_id
       ) stalled_peers;
-      let%lwt () = request_blocks ibd active_peers in
+      let%lwt () = Lwt.catch
+        (fun () -> request_blocks ibd active_peers)
+        (fun exn ->
+           Logs.warn (fun m ->
+             m "IBD request_blocks exception: %s" (Printexc.to_string exn));
+           Lwt.return_unit) in
       (* Short sleep to allow incoming messages *)
       let%lwt () = Lwt_unix.sleep 0.1 in
       (* Process any completed downloads *)
       (match process_downloaded_blocks ibd with
        | Ok n when n > 0 ->
+         last_progress_log := Unix.gettimeofday ();
          Logs.info (fun m ->
            m "Processed %d blocks, height now %d, in-flight: %d"
              n ibd.chain.blocks_synced ibd.total_blocks_in_flight)
-       | Ok _ -> ()
+       | Ok _ ->
+         (* Log periodic progress even when no blocks are processing *)
+         let now = Unix.gettimeofday () in
+         if now -. !last_progress_log > 30.0 then begin
+           last_progress_log := now;
+           Logs.debug (fun m ->
+             m "IBD: queue=%d in-flight=%d next_dl=%d next_proc=%d peers=%d"
+               qlen ibd.total_blocks_in_flight
+               ibd.next_download_height ibd.next_process_height
+               (List.length active_peers))
+         end
        | Error e ->
          Logs.err (fun m -> m "Block processing error: %s" e));
       loop ()
@@ -1810,10 +1905,16 @@ let run_ibd (ibd : ibd_state) (peers : Peer.peer list) : unit Lwt.t =
   in
   loop ()
 
-(* Start IBD if headers are synced but blocks aren't *)
+(* Start IBD if headers are synced but blocks aren't.
+   [on_ibd_created] is called with the ibd_state before the download loop
+   begins, so the caller can wire up a listener for incoming BlockMsg /
+   NotfoundMsg via the peer manager.  Without this callback, GetData
+   responses would be silently dropped by the peer message loop. *)
 let start_ibd ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
     ?(misbehavior_handler : (int -> string -> unit) option)
-    (state : chain_state) (peers : Peer.peer list) : unit Lwt.t =
+    ?(on_ibd_created : (ibd_state -> unit) option)
+    (state : chain_state) (get_peers : unit -> Peer.peer list)
+    : unit Lwt.t =
   if state.sync_state <> SyncingBlocks then
     Lwt.return_unit
   else begin
@@ -1830,7 +1931,11 @@ let start_ibd ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
         m "Starting IBD from height %d to %d"
           state.blocks_synced tip_height);
       let ibd = create_ibd_state ?utxo_set ?misbehavior_handler state in
-      run_ibd ibd peers
+      (* Notify caller so it can install the block-message listener *)
+      (match on_ibd_created with
+       | Some f -> f ibd
+       | None -> ());
+      run_ibd ibd get_peers
     end
   end
 

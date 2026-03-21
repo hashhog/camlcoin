@@ -523,19 +523,19 @@ let testnet : network_config = {
 (* Testnet4 configuration (BIP-94) *)
 let testnet4 : network_config = {
   name = "testnet4";
-  magic = 0x1c163f28l;  (* BIP-94 testnet4 magic *)
+  magic = 0x283f161cl;  (* BIP-94 testnet4 magic: raw bytes 1c 16 3f 28 *)
   default_port = 48333;
   dns_seeds = [
     "seed.testnet4.bitcoin.sprovoost.nl";
     "seed.testnet4.wiz.biz";
   ];
   genesis_hash = Types.hash256_of_hex
-    "da5e13c38306e8b0b7fd65cfc9db5fd888cf5b0a4fa1479d04c7dfc8e2f1a000";
+    "43f08bdab050e35b567c864b91f47f50ae725ae2de53bcfbbaf284da00000000";
   genesis_header = {
     version = 1l;
     prev_block = Types.zero_hash;
     merkle_root = Types.hash256_of_hex
-      "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a";
+      "4e7b2b9128fe0291db0693af2ae418b767e657cd407e80cb1434221eaea7a07a";
     timestamp = 1714777860l;  (* 2024-05-03 *)
     bits = 0x1d00ffffl;
     nonce = 393743547l;

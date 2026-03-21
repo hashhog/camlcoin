@@ -1254,8 +1254,8 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
     Error "CONST_SCRIPTCODE: OP_CODESEPARATOR in legacy script"
 
   | OP_PUSHDATA (_, data) when not executing ->
-    (* Push size limit is enforced even in non-executing branches *)
-    if Cstruct.length data > max_script_element_size then
+    (* Push size limit is enforced even in non-executing branches, but not in tapscript *)
+    if st.sig_version <> SigVersionTapscript && Cstruct.length data > max_script_element_size then
       Error "Push data exceeds maximum size"
     else
       Ok ()
@@ -1269,7 +1269,7 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
     stack_push st (Cstruct.create 0)
 
   | OP_PUSHDATA (opbyte, data) ->
-    if Cstruct.length data > max_script_element_size then
+    if st.sig_version <> SigVersionTapscript && Cstruct.length data > max_script_element_size then
       Error "Push data exceeds maximum size"
     else if st.flags land script_verify_minimaldata <> 0 then begin
       let dlen = Cstruct.length data in
@@ -2469,13 +2469,18 @@ let eval_script (st : eval_state) (script : Cstruct.t) : (unit, string) result =
    ============================================================================ *)
 
 (* Check that all witness items are within the maximum element size limit.
-   Per Bitcoin Core: the 520-byte limit on initial witness stack items applies
-   to ALL witness versions including tapscript. BIP-342 only relaxes the limit
-   on push opcodes during script execution, not on initial witness items. *)
-let check_witness_item_sizes ~sig_version:_ (witness : Types.tx_witness) : (unit, string) result =
-  if List.exists (fun item -> Cstruct.length item > max_script_element_size) witness.items then
-    Error "Witness item exceeds maximum element size"
-  else Ok ()
+   The 520-byte limit on initial witness stack items applies only to witness v0.
+   BIP-342 (tapscript) removes this limit entirely for both initial witness items
+   and push opcodes during script execution. *)
+let check_witness_item_sizes ~sig_version (witness : Types.tx_witness) : (unit, string) result =
+  match sig_version with
+  | SigVersionTapscript | SigVersionTaproot ->
+    (* No element size limit for taproot/tapscript witness items *)
+    Ok ()
+  | SigVersionBase | SigVersionWitnessV0 ->
+    if List.exists (fun item -> Cstruct.length item > max_script_element_size) witness.items then
+      Error "Witness item exceeds maximum element size"
+    else Ok ()
 
 (* Helper: check stack top for final script result *)
 let check_stack_top (st : eval_state) : (bool, string) result =

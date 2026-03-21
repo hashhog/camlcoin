@@ -158,6 +158,12 @@ let run (config : config) : unit Lwt.t =
     Logs.warn (fun m ->
       m "Failed to load peer bans: %s" (Printexc.to_string exn)));
 
+  (* Set peer manager's DB and initial block height so that the stale-tip
+     check can build locators and knows our validated chain height. *)
+  Peer_manager.set_db peer_manager db;
+  Peer_manager.set_height peer_manager
+    (Int32.of_int chain.blocks_synced);
+
   (* Initialize wallet *)
   let wallet = if config.wallet_enabled then begin
     let wallet_path = Filename.concat config.data_dir "wallet.json" in
@@ -234,11 +240,34 @@ let run (config : config) : unit Lwt.t =
       Lwt.return_unit
   in
 
+  (* Mutable reference to current IBD state so the block listener can
+     route incoming BlockMsg / NotfoundMsg to the download manager. *)
+  let ibd_state_ref : Sync.ibd_state option ref = ref None in
+
+  (* Register a listener BEFORE starting sync so that block and notfound
+     messages arriving via the peer_message_loop are forwarded to the IBD
+     download queue. Without this, GetData responses are silently dropped. *)
+  Peer_manager.add_listener peer_manager (fun msg peer ->
+    match !ibd_state_ref with
+    | None -> Lwt.return_unit
+    | Some ibd ->
+      (match msg with
+       | P2p.BlockMsg block ->
+         ignore (Sync.receive_block ibd block);
+         Lwt.return_unit
+       | P2p.NotfoundMsg items ->
+         Sync.handle_notfound ibd peer.Peer.id items;
+         Lwt.return_unit
+       | _ -> Lwt.return_unit));
+
+  (* Dynamic peer getter so IBD always sees the latest connected peers *)
+  let get_peers () = Peer_manager.get_ready_peers peer_manager in
+
   (* Sync thread - waits for peers then syncs *)
   let sync_thread =
     (* Wait a bit for initial peer connections *)
     let* () = Lwt_unix.sleep 5.0 in
-    let ready_peers = Peer_manager.get_ready_peers peer_manager in
+    let ready_peers = get_peers () in
     match ready_peers with
     | [] ->
       Logs.warn (fun m -> m "No peers connected yet");
@@ -247,6 +276,11 @@ let run (config : config) : unit Lwt.t =
       Logs.info (fun m ->
         m "Starting header sync with peer %d" peer.Peer.id);
       let* () = Sync.sync_headers chain peer in
+      (* Header sync is done. Now enable message loops for all peers so
+         that incoming BlockMsg / NotfoundMsg are read and passed to the
+         listener. This must happen AFTER sync_headers because it reads
+         from the peer socket directly and would race with the loop. *)
+      Peer_manager.enable_message_loops peer_manager;
       (* Start block download if needed *)
       if chain.sync_state = Sync.SyncingBlocks then begin
         Logs.info (fun m -> m "Starting block download");
@@ -261,7 +295,8 @@ let run (config : config) : unit Lwt.t =
         in
         Sync.start_ibd ~utxo_set:optimized_utxo
           ~misbehavior_handler
-          chain (Peer_manager.get_ready_peers peer_manager)
+          ~on_ibd_created:(fun ibd -> ibd_state_ref := Some ibd)
+          chain get_peers
       end else
         Lwt.return_unit
   in
@@ -280,6 +315,14 @@ let run (config : config) : unit Lwt.t =
             | None -> 0
           in
           let (mp_count, mp_weight, _) = Mempool.get_info mempool in
+          (* Keep peer_manager's our_height in sync with validated block height
+             so that the stale-tip check knows our actual progress. *)
+          let block_height = chain.blocks_synced in
+          let prev_height = Peer_manager.get_height peer_manager in
+          if Int32.of_int block_height > prev_height then begin
+            Peer_manager.set_height peer_manager (Int32.of_int block_height);
+            Peer_manager.notify_tip_updated peer_manager
+          end;
           Logs.info (fun m ->
             m "Status: peers=%d/%d height=%d mempool=%d txs (%d weight)"
               ready_count peer_count height mp_count mp_weight);
@@ -317,9 +360,18 @@ let run (config : config) : unit Lwt.t =
         m "Failed to save bans: %s" (Printexc.to_string exn)));
     (* Flush pending UTXO updates from OptimizedUtxoSet *)
     let dirty = Utxo.OptimizedUtxoSet.dirty_count optimized_utxo in
-    if dirty > 0 then
+    if dirty > 0 then begin
       Logs.info (fun m -> m "Flushing %d dirty UTXO entries to disk" dirty);
-    Utxo.OptimizedUtxoSet.flush optimized_utxo;
+      Utxo.OptimizedUtxoSet.flush optimized_utxo;
+      (* Also update chain_tip to match blocks_synced so that on restart
+         the node resumes from the correct height (matching the flushed
+         UTXO state rather than the last periodic flush point). *)
+      let bs = chain.blocks_synced in
+      (match Sync.get_header_at_height chain bs with
+       | Some entry ->
+         Storage.ChainDB.set_chain_tip db entry.hash bs
+       | None -> ())
+    end;
     (* Sync database to ensure all cached data is persisted *)
     Storage.ChainDB.sync db;
     Storage.ChainDB.close db;

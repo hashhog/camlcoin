@@ -471,6 +471,20 @@ let compute_taproot_tweak (internal_pk : Cstruct.t) (merkle_root : Cstruct.t opt
   in
   tagged_hash "TapTweak" msg
 
+(* X-only pubkey tweak add with parity (for Taproot control block construction) *)
+external xonly_tweak_add_with_parity_raw : Bigstring.t -> Bigstring.t -> (Bigstring.t * int)
+  = "caml_xonly_pubkey_tweak_add_with_parity"
+
+let compute_taproot_output_key_with_parity (internal_pk : Cstruct.t) (merkle_root : Cstruct.t option) : (Cstruct.t * int) =
+  if Cstruct.length internal_pk <> 32 then
+    failwith "compute_taproot_output_key_with_parity: internal_pk must be 32 bytes";
+  let tweak = compute_taproot_tweak internal_pk merkle_root in
+  let (result, parity) = xonly_tweak_add_with_parity_raw
+    (cstruct_to_bigstring internal_pk)
+    (cstruct_to_bigstring tweak)
+  in
+  (bigstring_to_cstruct result, parity)
+
 (* Compute the taproot output key from internal public key and optional script tree merkle root.
    This is Q = P + t*G where t = tagged_hash("TapTweak", P || m), P is internal key, m is merkle root.
    Returns the 32-byte x-only output pubkey. *)

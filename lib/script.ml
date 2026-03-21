@@ -2639,10 +2639,9 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
               Ok false
             else begin
               match get_witness_program redeem_script with
-              | Some (0, program) when Cstruct.length program = 20 ->
-                if flags land script_verify_witness = 0 then
-                  Error "Witness program in non-witness mode"
-                else begin
+              | Some (0, program) when Cstruct.length program = 20 &&
+                                       flags land script_verify_witness <> 0 ->
+                begin
                   let rs_len = Cstruct.length redeem_script in
                   let expected_sig = Cstruct.create (1 + rs_len) in
                   Cstruct.set_uint8 expected_sig 0 rs_len;
@@ -2670,7 +2669,7 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                           let implicit_script = build_p2pkh_script program in
                           let st2 = create_eval_state ~tx ~input_index ~amount ~flags
                                       ~sig_version:SigVersionWitnessV0 () in
-                          st2.stack <- [wit_sig; wit_pubkey];
+                          st2.stack <- [wit_pubkey; wit_sig];
                           begin match run_script st2 implicit_script with
                           | Error e -> Error e
                           | Ok () ->
@@ -2684,10 +2683,9 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                     end
                   end
                 end
-              | Some (0, program) when Cstruct.length program = 32 ->
-                if flags land script_verify_witness = 0 then
-                  Error "Witness program in non-witness mode"
-                else begin
+              | Some (0, program) when Cstruct.length program = 32 &&
+                                       flags land script_verify_witness <> 0 ->
+                begin
                   let rs_len = Cstruct.length redeem_script in
                   let expected_sig = Cstruct.create (1 + rs_len) in
                   Cstruct.set_uint8 expected_sig 0 rs_len;
@@ -2799,7 +2797,7 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
               let implicit_script = build_p2pkh_script program in
               let st = create_eval_state ~tx ~input_index ~amount ~flags
                          ~sig_version:SigVersionWitnessV0 () in
-              st.stack <- [wit_sig; wit_pubkey];
+              st.stack <- [wit_pubkey; wit_sig];
               begin match run_script st implicit_script with
               | Error e -> Error e
               | Ok () ->

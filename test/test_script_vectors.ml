@@ -240,8 +240,8 @@ let parse_flags (flags_str : string) : int =
 (* Build the crediting transaction:
    version=1, locktime=0
    Input: null prevout (txid=0, vout=0xFFFFFFFF), scriptSig = OP_0 OP_0, sequence=0xFFFFFFFF
-   Output: value=0, scriptPubKey = test's scriptPubKey *)
-let make_crediting_tx (script_pubkey : Cstruct.t) : Types.transaction =
+   Output: value=amount, scriptPubKey = test's scriptPubKey *)
+let make_crediting_tx ?(amount=0L) (script_pubkey : Cstruct.t) : Types.transaction =
   let open Types in
   let null_hash = Cstruct.create 32 in  (* 32 zero bytes *)
   (* scriptSig = OP_0 OP_0 *)
@@ -252,7 +252,7 @@ let make_crediting_tx (script_pubkey : Cstruct.t) : Types.transaction =
     sequence = 0xFFFFFFFFl;
   } in
   let output = {
-    value = 0L;
+    value = amount;
     script_pubkey;
   } in
   {
@@ -268,23 +268,24 @@ let make_crediting_tx (script_pubkey : Cstruct.t) : Types.transaction =
    Input: prevout = crediting_txid:0, scriptSig = test's scriptSig, sequence=0xFFFFFFFF
    Output: value=0, scriptPubKey = empty *)
 let make_spending_tx (crediting_tx : Types.transaction) (script_sig : Cstruct.t)
-    ~(locktime : int32) ~(sequence : int32) : Types.transaction =
+    ~(locktime : int32) ~(sequence : int32) ?(witnesses=[]) () : Types.transaction =
   let open Types in
   let crediting_txid = Crypto.compute_txid crediting_tx in
+  let credit_value = (List.hd crediting_tx.outputs).value in
   let input = {
     previous_output = { txid = crediting_txid; vout = 0l };
     script_sig;
     sequence;
   } in
   let output = {
-    value = 0L;
+    value = credit_value;
     script_pubkey = Cstruct.empty;
   } in
   {
     version = 1l;
     inputs = [input];
     outputs = [output];
-    witnesses = [];
+    witnesses;
     locktime;
   }
 
@@ -304,91 +305,154 @@ let () =
   let skip_count = ref 0 in
   let error_count = ref 0 in
   let total = ref 0 in
+  let witness_total = ref 0 in
+
+  (* Helper to run a single test case and update counters *)
+  let run_one_test idx ~script_sig_asm ~script_pubkey_asm ~flags_str ~expected
+      ~comment ~witness_items ~amount ~is_witness =
+    incr total;
+    if is_witness then incr witness_total;
+    try
+      let script_sig = assemble_script script_sig_asm in
+      let script_pubkey = assemble_script script_pubkey_asm in
+      let flags = parse_flags flags_str in
+
+      (* Build crediting and spending transactions *)
+      let crediting_tx = make_crediting_tx ~amount script_pubkey in
+      let witness = Types.({ items = witness_items }) in
+      let witnesses = if witness_items <> [] then [witness] else [] in
+      let tx = make_spending_tx crediting_tx script_sig
+                 ~locktime:0l ~sequence:0xFFFFFFFFl ~witnesses () in
+
+      let result = Script.verify_script
+        ~tx ~input_index:0
+        ~script_pubkey ~script_sig
+        ~witness ~amount
+        ~flags () in
+
+      let got_ok = match result with
+        | Ok true -> true
+        | _ -> false
+      in
+      let expected_ok = (expected = "OK") in
+
+      if got_ok = expected_ok then begin
+        incr pass_count
+      end else begin
+        incr fail_count;
+        Printf.printf "FAIL test %d: expected=%s got=%s sig=[%s] pub=[%s] flags=%s %s\n"
+          idx expected
+          (match result with
+           | Ok true -> "OK"
+           | Ok false -> "EVAL_FALSE"
+           | Error e -> e)
+          script_sig_asm script_pubkey_asm flags_str comment
+      end
+    with exn ->
+      let expected_ok = (expected = "OK") in
+      if not expected_ok then
+        incr pass_count  (* Expected failure, and we got an exception *)
+      else begin
+        incr error_count;
+        Printf.printf "ERROR test %d: exception=%s sig=[%s] pub=[%s] flags=%s %s\n"
+          idx (Printexc.to_string exn)
+          script_sig_asm script_pubkey_asm flags_str comment
+      end
+  in
 
   List.iteri (fun idx test ->
     match test with
     | `List elems ->
       let n = List.length elems in
-      (* Skip comments (single-element arrays) and witness tests (6+ elements,
-         or 5 elements where element 0 is a JSON array i.e. witness stack) *)
       if n = 1 || n = 2 || n = 3 then
         ()  (* comment or malformed, skip *)
-      else if n >= 6 then begin
-        (* Witness test - skip for now *)
-        incr skip_count
-      end else if n = 5 && (match List.nth elems 0 with `List _ -> true | _ -> false) then begin
-        (* 5-element witness test (witness stack, scriptSig, scriptPubKey, flags, expected) *)
-        incr skip_count
-      end else begin
-        (* 4 or 5 element test: [scriptSig, scriptPubKey, flags, expected, ?comment] *)
-        incr total;
-        let get_str i = match List.nth elems i with
-          | `String s -> s
-          | _ -> failwith "Expected string"
-        in
-        let script_sig_asm = get_str 0 in
-        let script_pubkey_asm = get_str 1 in
-        let flags_str = get_str 2 in
-        let expected = get_str 3 in
-        let comment = if n >= 5 then
-          (try get_str 4 with _ -> "")
-        else "" in
-
-        try
-          let script_sig = assemble_script script_sig_asm in
-          let script_pubkey = assemble_script script_pubkey_asm in
-          let flags = parse_flags flags_str in
-
-          (* Build crediting and spending transactions (Bitcoin Core approach) *)
-          let crediting_tx = make_crediting_tx script_pubkey in
-          let tx = make_spending_tx crediting_tx script_sig
-                     ~locktime:0l ~sequence:0xFFFFFFFFl in
-
-          let witness = Types.({ items = [] }) in
-          let result = Script.verify_script
-            ~tx ~input_index:0
-            ~script_pubkey ~script_sig
-            ~witness ~amount:0L
-            ~flags () in
-
-          let got_ok = match result with
-            | Ok true -> true
-            | _ -> false
+      else begin
+        let is_witness = match List.nth elems 0 with `List _ -> true | _ -> false in
+        if is_witness then begin
+          (* Witness test vector: [witness_stack_with_amount, scriptSig, scriptPubKey, flags, expected, ?comment]
+             The witness stack array's last element is the amount (in BTC as float).
+             All other elements are hex-encoded witness items. *)
+          let witness_arr = match List.nth elems 0 with
+            | `List l -> l
+            | _ -> failwith "Expected witness array"
           in
-          let expected_ok = (expected = "OK") in
-
-          if got_ok = expected_ok then begin
-            incr pass_count
-          end else begin
-            incr fail_count;
-            Printf.printf "FAIL test %d: expected=%s got=%s sig=[%s] pub=[%s] flags=%s %s\n"
-              idx expected
-              (match result with
-               | Ok true -> "OK"
-               | Ok false -> "EVAL_FALSE"
-               | Error e -> e)
-              script_sig_asm script_pubkey_asm flags_str comment
-          end
-        with exn ->
-          let expected_ok = (expected = "OK") in
-          if not expected_ok then
-            incr pass_count  (* Expected failure, and we got an exception *)
+          (* Skip taproot template tests (contain #SCRIPT#, #CONTROLBLOCK#, #TAPROOTOUTPUT#) *)
+          let string_contains s sub =
+            let slen = String.length s and sublen = String.length sub in
+            if sublen > slen then false
+            else
+              let rec check i =
+                if i > slen - sublen then false
+                else if String.sub s i sublen = sub then true
+                else check (i + 1)
+              in check 0
+          in
+          let has_template =
+            List.exists (fun item ->
+              match item with
+              | `String s -> string_contains s "#SCRIPT#" || string_contains s "#CONTROLBLOCK#"
+              | _ -> false
+            ) witness_arr ||
+            (match List.nth elems 2 with
+             | `String s -> string_contains s "#TAPROOTOUTPUT#"
+             | _ -> false)
+          in
+          if has_template then
+            incr skip_count
           else begin
-            incr error_count;
-            Printf.printf "ERROR test %d: exception=%s sig=[%s] pub=[%s] flags=%s %s\n"
-              idx (Printexc.to_string exn)
-              script_sig_asm script_pubkey_asm flags_str comment
+          (* Last element of witness array is the amount in BTC *)
+          let amount_btc = match List.nth witness_arr (List.length witness_arr - 1) with
+            | `Float f -> f
+            | `Int i -> float_of_int i
+            | _ -> failwith "Expected amount as last witness array element"
+          in
+          let amount = Int64.of_float (amount_btc *. 100_000_000.0 +. 0.5) in
+          (* All other elements are hex witness items *)
+          let wit_hex_items = List.filteri (fun i _ -> i < List.length witness_arr - 1) witness_arr in
+          let witness_items = List.map (fun item ->
+            match item with
+            | `String hex -> hex_to_bytes hex
+            | _ -> failwith "Expected hex string in witness array"
+          ) wit_hex_items in
+          let get_str i = match List.nth elems i with
+            | `String s -> s
+            | _ -> failwith "Expected string"
+          in
+          let script_sig_asm = get_str 1 in
+          let script_pubkey_asm = get_str 2 in
+          let flags_str = get_str 3 in
+          let expected = get_str 4 in
+          let comment = if n >= 6 then (try get_str 5 with _ -> "") else "" in
+          run_one_test idx ~script_sig_asm ~script_pubkey_asm ~flags_str ~expected
+            ~comment ~witness_items ~amount ~is_witness:true
+          end (* has_template else *)
+        end else begin
+          (* Non-witness: 4 or 5 element test [scriptSig, scriptPubKey, flags, expected, ?comment] *)
+          if n >= 4 then begin
+            let get_str i = match List.nth elems i with
+              | `String s -> s
+              | _ -> failwith "Expected string"
+            in
+            let script_sig_asm = get_str 0 in
+            let script_pubkey_asm = get_str 1 in
+            let flags_str = get_str 2 in
+            let expected = get_str 3 in
+            let comment = if n >= 5 then (try get_str 4 with _ -> "") else "" in
+            run_one_test idx ~script_sig_asm ~script_pubkey_asm ~flags_str ~expected
+              ~comment ~witness_items:[] ~amount:0L ~is_witness:false
           end
+        end
       end
     | _ -> ()
   ) tests;
 
   Printf.printf "\n=== Script Test Vector Results ===\n";
-  Printf.printf "Total non-witness tests: %d\n" !total;
+  Printf.printf "Total tests: %d (non-witness: %d, witness: %d)\n"
+    !total (!total - !witness_total) !witness_total;
   Printf.printf "  PASS:  %d\n" !pass_count;
   Printf.printf "  FAIL:  %d\n" !fail_count;
   Printf.printf "  ERROR: %d\n" !error_count;
-  Printf.printf "  Skipped (witness): %d\n" !skip_count;
+  Printf.printf "  Skipped: %d\n" !skip_count;
 
   if !fail_count > 0 || !error_count > 0 then
     exit 1

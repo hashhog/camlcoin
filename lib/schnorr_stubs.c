@@ -204,6 +204,49 @@ CAMLprim value caml_xonly_pubkey_tweak_add(value v_internal_pk, value v_tweak) {
     CAMLreturn(result);
 }
 
+/* caml_xonly_pubkey_tweak_add_with_parity(internal_pk_32bytes, tweak_32bytes)
+   -> (bigarray(32 bytes), int)
+   Like caml_xonly_pubkey_tweak_add but also returns the output key parity. */
+CAMLprim value caml_xonly_pubkey_tweak_add_with_parity(value v_internal_pk, value v_tweak) {
+    CAMLparam2(v_internal_pk, v_tweak);
+    CAMLlocal2(result_pair, result_key);
+    ensure_ctx();
+
+    unsigned char *pk_data = (unsigned char *)Caml_ba_data_val(v_internal_pk);
+    unsigned char *tweak_data = (unsigned char *)Caml_ba_data_val(v_tweak);
+
+    secp256k1_xonly_pubkey internal_pk;
+    if (!secp256k1_xonly_pubkey_parse(schnorr_ctx, &internal_pk, pk_data)) {
+        caml_failwith("caml_xonly_pubkey_tweak_add_with_parity: invalid pubkey");
+    }
+
+    secp256k1_pubkey full_pk;
+    if (!secp256k1_xonly_pubkey_tweak_add(schnorr_ctx, &full_pk, &internal_pk, tweak_data)) {
+        caml_failwith("caml_xonly_pubkey_tweak_add_with_parity: tweak failed");
+    }
+
+    secp256k1_xonly_pubkey output_xonly;
+    int parity = 0;
+    if (!secp256k1_xonly_pubkey_from_pubkey(schnorr_ctx, &output_xonly, &parity, &full_pk)) {
+        caml_failwith("caml_xonly_pubkey_tweak_add_with_parity: xonly extraction failed");
+    }
+
+    unsigned char output32[32];
+    if (!secp256k1_xonly_pubkey_serialize(schnorr_ctx, output32, &output_xonly)) {
+        caml_failwith("caml_xonly_pubkey_tweak_add_with_parity: serialization failed");
+    }
+
+    long dims[1] = { 32 };
+    result_key = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL, dims);
+    unsigned char *result_data = (unsigned char *)Caml_ba_data_val(result_key);
+    memcpy(result_data, output32, 32);
+
+    result_pair = caml_alloc(2, 0);
+    Store_field(result_pair, 0, result_key);
+    Store_field(result_pair, 1, Val_int(parity));
+    CAMLreturn(result_pair);
+}
+
 /* caml_derive_xonly_pubkey(seckey_32bytes) -> bigarray(32 bytes) */
 CAMLprim value caml_derive_xonly_pubkey(value v_seckey) {
     CAMLparam1(v_seckey);

@@ -26,6 +26,14 @@ let hex_to_bytes hex =
   done;
   Cstruct.of_string (Buffer.contents buf)
 
+let bytes_to_hex (cs : Cstruct.t) : string =
+  let len = Cstruct.length cs in
+  let buf = Buffer.create (len * 2) in
+  for i = 0 to len - 1 do
+    Buffer.add_string buf (Printf.sprintf "%02x" (Cstruct.get_uint8 cs i))
+  done;
+  Buffer.contents buf
+
 (* ---- ASM parser ---- *)
 
 (* Map opcode name (without OP_ prefix) to byte value *)
@@ -376,7 +384,7 @@ let () =
             | `List l -> l
             | _ -> failwith "Expected witness array"
           in
-          (* Skip taproot template tests (contain #SCRIPT#, #CONTROLBLOCK#, #TAPROOTOUTPUT#) *)
+          (* Check for taproot template tests *)
           let string_contains s sub =
             let slen = String.length s and sublen = String.length sub in
             if sublen > slen then false
@@ -397,9 +405,6 @@ let () =
              | `String s -> string_contains s "#TAPROOTOUTPUT#"
              | _ -> false)
           in
-          if has_template then
-            incr skip_count
-          else begin
           (* Last element of witness array is the amount in BTC *)
           let amount_btc = match List.nth witness_arr (List.length witness_arr - 1) with
             | `Float f -> f
@@ -407,6 +412,67 @@ let () =
             | _ -> failwith "Expected amount as last witness array element"
           in
           let amount = Int64.of_float (amount_btc *. 100_000_000.0 +. 0.5) in
+          if has_template then begin
+            (* Resolve taproot template placeholders *)
+            (* Internal key: the generator point x-coordinate (x-only) *)
+            let internal_key = hex_to_bytes "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798" in
+            (* Find the #SCRIPT# witness item and extract the ASM *)
+            let script_prefix = "#SCRIPT# " in
+            let leaf_script = ref Cstruct.empty in
+            let wit_hex_items = List.filteri (fun i _ -> i < List.length witness_arr - 1) witness_arr in
+            let witness_items = List.map (fun item ->
+              match item with
+              | `String s when string_contains s "#SCRIPT#" ->
+                (* Extract ASM after "#SCRIPT# " prefix *)
+                let prefix_len = String.length script_prefix in
+                let asm = String.sub s prefix_len (String.length s - prefix_len) in
+                let script_bytes = assemble_script asm in
+                leaf_script := script_bytes;
+                script_bytes
+              | `String s when s = "#CONTROLBLOCK#" ->
+                (* Compute control block from leaf script *)
+                (* Tapleaf hash: tagged_hash("TapLeaf", 0xc0 || compact_size(script_len) || script) *)
+                let tapleaf_hash = Crypto.compute_tapleaf_hash 0xc0 !leaf_script in
+                (* Merkle root = tapleaf hash (single leaf) *)
+                let merkle_root = tapleaf_hash in
+                (* Compute output key with parity *)
+                let (_output_key, parity) = Crypto.compute_taproot_output_key_with_parity internal_key (Some merkle_root) in
+                (* Control block = (0xc0 | parity) || internal_key (33 bytes for single leaf) *)
+                let cb = Cstruct.create 33 in
+                Cstruct.set_uint8 cb 0 (0xc0 lor parity);
+                Cstruct.blit internal_key 0 cb 1 32;
+                cb
+              | `String hex -> hex_to_bytes hex
+              | _ -> failwith "Expected string in witness array"
+            ) wit_hex_items in
+            let get_str i = match List.nth elems i with
+              | `String s -> s
+              | _ -> failwith "Expected string"
+            in
+            let script_sig_asm = get_str 1 in
+            let script_pubkey_str = get_str 2 in
+            (* Resolve #TAPROOTOUTPUT# in scriptPubKey *)
+            let script_pubkey_asm =
+              if string_contains script_pubkey_str "#TAPROOTOUTPUT#" then begin
+                (* Compute output key from internal key + merkle root *)
+                let tapleaf_hash = Crypto.compute_tapleaf_hash 0xc0 !leaf_script in
+                let output_key = Crypto.compute_taproot_output_key internal_key (Some tapleaf_hash) in
+                let output_hex = bytes_to_hex output_key in
+                (* Replace #TAPROOTOUTPUT# with the hex of the output key *)
+                let parts = String.split_on_char '#' script_pubkey_str in
+                (* The format is "0x51 0x20 #TAPROOTOUTPUT#" *)
+                (* After splitting on #: ["0x51 0x20 "; "TAPROOTOUTPUT"; ""] *)
+                let prefix = List.hd parts in
+                prefix ^ "0x" ^ output_hex
+              end else
+                script_pubkey_str
+            in
+            let flags_str = get_str 3 in
+            let expected = get_str 4 in
+            let comment = if n >= 6 then (try get_str 5 with _ -> "") else "" in
+            run_one_test idx ~script_sig_asm ~script_pubkey_asm ~flags_str ~expected
+              ~comment ~witness_items ~amount ~is_witness:true
+          end else begin
           (* All other elements are hex witness items *)
           let wit_hex_items = List.filteri (fun i _ -> i < List.length witness_arr - 1) witness_arr in
           let witness_items = List.map (fun item ->
@@ -425,7 +491,7 @@ let () =
           let comment = if n >= 6 then (try get_str 5 with _ -> "") else "" in
           run_one_test idx ~script_sig_asm ~script_pubkey_asm ~flags_str ~expected
             ~comment ~witness_items ~amount ~is_witness:true
-          end (* has_template else *)
+          end
         end else begin
           (* Non-witness: 4 or 5 element test [scriptSig, scriptPubKey, flags, expected, ?comment] *)
           if n >= 4 then begin

@@ -704,8 +704,10 @@ let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
              source = Manual;
              table_status = InTried tried_bucket });
       Lwt.return_unit
-    ) (fun _exn ->
+    ) (fun exn ->
       (* Connection failed, record failure *)
+      Log.debug (fun m -> m "Connection to %s:%d failed: %s"
+        addr port (Printexc.to_string exn));
       (match Hashtbl.find_opt pm.known_addrs addr with
        | Some info ->
          Hashtbl.replace pm.known_addrs addr
@@ -1652,11 +1654,13 @@ let start (pm : t) : unit Lwt.t =
   pm.running <- true;
   (* Resolve DNS seeds *)
   let* seed_addrs = resolve_dns_seeds pm.network in
+  Log.info (fun m -> m "Resolved %d addresses from DNS seeds" (List.length seed_addrs));
   List.iter (fun info ->
     Hashtbl.replace pm.known_addrs info.address info
   ) seed_addrs;
   (* Add fallback peers *)
   let fallback = get_fallback_peers pm.network in
+  Log.info (fun m -> m "Added %d fallback peers" (List.length fallback));
   List.iter (add_known_addr pm) fallback;
   (* Start connection maintenance loop *)
   let maintenance = maintain_connections pm in

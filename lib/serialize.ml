@@ -8,32 +8,43 @@ type reader = {
 
 let reader_of_cstruct cs = { buf = cs; pos = 0 }
 
+let check_remaining r n =
+  let remaining = Cstruct.length r.buf - r.pos in
+  if remaining < n then
+    failwith (Printf.sprintf "Deserialize: need %d bytes but only %d remaining" n remaining)
+
 let read_uint8 r =
+  check_remaining r 1;
   let v = Cstruct.get_uint8 r.buf r.pos in
   r.pos <- r.pos + 1;
   v
 
 let read_uint16_le r =
+  check_remaining r 2;
   let v = Cstruct.LE.get_uint16 r.buf r.pos in
   r.pos <- r.pos + 2;
   v
 
 let read_uint16_be r =
+  check_remaining r 2;
   let v = Cstruct.BE.get_uint16 r.buf r.pos in
   r.pos <- r.pos + 2;
   v
 
 let read_int32_le r =
+  check_remaining r 4;
   let v = Cstruct.LE.get_uint32 r.buf r.pos in
   r.pos <- r.pos + 4;
   v
 
 let read_int64_le r =
+  check_remaining r 8;
   let v = Cstruct.LE.get_uint64 r.buf r.pos in
   r.pos <- r.pos + 8;
   v
 
 let read_bytes r n =
+  check_remaining r n;
   let cs = Cstruct.sub r.buf r.pos n in
   r.pos <- r.pos + n;
   cs

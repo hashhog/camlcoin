@@ -1881,7 +1881,8 @@ let run_ibd (ibd : ibd_state) (get_peers : unit -> Peer.peer list) : unit Lwt.t 
       (* Short sleep to allow incoming messages *)
       let%lwt () = Lwt_unix.sleep 0.1 in
       (* Process any completed downloads *)
-      (match process_downloaded_blocks ibd with
+      (match (try process_downloaded_blocks ibd with
+              | exn -> Error (Printexc.to_string exn)) with
        | Ok n when n > 0 ->
          last_progress_log := Unix.gettimeofday ();
          Logs.info (fun m ->

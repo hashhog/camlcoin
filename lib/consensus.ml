@@ -556,7 +556,10 @@ let testnet4 : network_config = {
   enforce_bip94 = true;  (* BIP-94 time warp fix enabled *)
   network_type = Testnet4;
   minimum_chain_work = zero_work;
-  assume_valid_hash = None;
+  (* Testnet4 assumevalid — block 123613 in internal LE byte order.
+     Display hash: 0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a *)
+  assume_valid_hash = Some (Types.hash256_of_hex
+    "8acff70b172ca8e99390b27995e6f9f9e66a67852e7ee24e1e8b360200000000");
   checkpoints = [];
   halving_interval = default_halving_interval;
 }

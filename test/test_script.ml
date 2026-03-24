@@ -865,18 +865,17 @@ let test_pushdata_direct_serialize_roundtrip () =
    ============================================================================ *)
 
 let test_witness_item_size_checked_for_tapscript () =
-  (* check_witness_item_sizes should enforce 520-byte limit for tapscript too *)
+  (* check_witness_stack_item_sizes enforces 520-byte limit on stack items
+     for all sigversions including tapscript (per Bitcoin Core ExecuteWitnessScript) *)
   let oversized_item = Cstruct.create 521 in
-  let witness = { Types.items = [oversized_item] } in
-  match Script.check_witness_item_sizes ~sig_version:Script.SigVersionTapscript witness with
+  match Script.check_witness_stack_item_sizes [oversized_item] with
   | Error _ -> ()  (* Expected: oversized item rejected *)
-  | Ok () -> Alcotest.fail "Should reject oversized witness item in tapscript"
+  | Ok () -> Alcotest.fail "Should reject oversized witness stack item"
 
 let test_witness_item_size_ok_for_tapscript () =
   (* A 520-byte item should be allowed *)
   let ok_item = Cstruct.create 520 in
-  let witness = { Types.items = [ok_item] } in
-  match Script.check_witness_item_sizes ~sig_version:Script.SigVersionTapscript witness with
+  match Script.check_witness_stack_item_sizes [ok_item] with
   | Ok () -> ()
   | Error e -> Alcotest.fail ("Should allow 520-byte witness item: " ^ e)
 

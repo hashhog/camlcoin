@@ -2468,19 +2468,16 @@ let eval_script (st : eval_state) (script : Cstruct.t) : (unit, string) result =
    Script Verification (Full Transaction Input Verification)
    ============================================================================ *)
 
-(* Check that all witness items are within the maximum element size limit.
-   The 520-byte limit on initial witness stack items applies only to witness v0.
-   BIP-342 (tapscript) removes this limit entirely for both initial witness items
-   and push opcodes during script execution. *)
-let check_witness_item_sizes ~sig_version (witness : Types.tx_witness) : (unit, string) result =
-  match sig_version with
-  | SigVersionTapscript | SigVersionTaproot ->
-    (* No element size limit for taproot/tapscript witness items *)
-    Ok ()
-  | SigVersionBase | SigVersionWitnessV0 ->
-    if List.exists (fun item -> Cstruct.length item > max_script_element_size) witness.items then
-      Error "Witness item exceeds maximum element size"
-    else Ok ()
+(* Check that stack items are within the maximum element size limit (520 bytes).
+   This check applies to the items that will be placed on the initial stack
+   for script execution.  Per Bitcoin Core's ExecuteWitnessScript, the check
+   runs for ALL sigversions (including tapscript) on the *stack* items -- but
+   the witness script / control block have already been popped before the check.
+   Callers must pass only the stack items, NOT the witness script or control block. *)
+let check_witness_stack_item_sizes (items : Cstruct.t list) : (unit, string) result =
+  if List.exists (fun item -> Cstruct.length item > max_script_element_size) items then
+    Error "Witness item exceeds maximum element size"
+  else Ok ()
 
 (* Helper: check stack top for final script result *)
 let check_stack_top (st : eval_state) : (bool, string) result =
@@ -2654,13 +2651,14 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                   if not (Cstruct.equal script_sig expected_sig) then
                     Error "WITNESS_MALLEATED: scriptSig is not a single push of redeemScript"
                   else begin
-                    match check_witness_item_sizes ~sig_version:SigVersionWitnessV0 witness with
-                    | Error e -> Error e
-                    | Ok () ->
                     let wit_items = witness.Types.items in
                     if List.length wit_items <> 2 then
                       Error "P2WPKH requires exactly 2 witness items"
                     else begin
+                      (* P2WPKH: all witness items go on the stack, check all *)
+                      match check_witness_stack_item_sizes wit_items with
+                      | Error e -> Error e
+                      | Ok () ->
                       let wit_sig = List.nth wit_items 0 in
                       let wit_pubkey = List.nth wit_items 1 in
                       if flags land script_verify_witness_pubkeytype <> 0 &&
@@ -2698,9 +2696,6 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                   if not (Cstruct.equal script_sig expected_sig) then
                     Error "WITNESS_MALLEATED: scriptSig is not a single push of redeemScript"
                   else begin
-                    match check_witness_item_sizes ~sig_version:SigVersionWitnessV0 witness with
-                    | Error e -> Error e
-                    | Ok () ->
                     let wit_items = witness.Types.items in
                     if List.length wit_items = 0 then
                       Error "Empty witness for P2WSH"
@@ -2710,7 +2705,11 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                       if not (Cstruct.equal script_hash program) then
                         Ok false
                       else begin
+                        (* P2WSH: witness script (last item) is popped; only stack items are size-checked *)
                         let wit_stack = List.rev (List.filteri (fun i _ -> i < List.length wit_items - 1) wit_items) in
+                        match check_witness_stack_item_sizes wit_stack with
+                        | Error e -> Error e
+                        | Ok () ->
                         let st2 = create_eval_state ~tx ~input_index ~amount ~flags
                                     ~sig_version:SigVersionWitnessV0 () in
                         st2.stack <- wit_stack;
@@ -2779,13 +2778,14 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
       if Cstruct.length script_sig <> 0 then
         Error "scriptSig must be empty for native witness"
       else begin
-        match check_witness_item_sizes ~sig_version:SigVersionWitnessV0 witness with
-        | Error e -> Error e
-        | Ok () ->
         let wit_items = witness.Types.items in
         if List.length wit_items <> 2 then
           Error "P2WPKH requires exactly 2 witness items"
         else begin
+          (* P2WPKH: all witness items go on the stack, check all *)
+          match check_witness_stack_item_sizes wit_items with
+          | Error e -> Error e
+          | Ok () ->
           let wit_sig = List.nth wit_items 0 in
           let wit_pubkey = List.nth wit_items 1 in
           (* WITNESS_PUBKEYTYPE: require compressed pubkey (33 bytes, 0x02/0x03 prefix) *)
@@ -2829,9 +2829,6 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
       if Cstruct.length script_sig <> 0 then
         Error "scriptSig must be empty for native witness"
       else begin
-        match check_witness_item_sizes ~sig_version:SigVersionWitnessV0 witness with
-        | Error e -> Error e
-        | Ok () ->
         let wit_items = witness.Types.items in
         if List.length wit_items = 0 then
           Error "Empty witness for P2WSH"
@@ -2842,8 +2839,13 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
           if not (Cstruct.equal script_hash program) then
             Ok false
           else begin
-            (* Initialize stack with witness items (excluding script, reversed) *)
+            (* P2WSH: witness script (last item) is popped; only stack items are size-checked.
+               Per Bitcoin Core's ExecuteWitnessScript, the 520-byte limit applies to
+               the initial stack items, not the witness script itself. *)
             let wit_stack = List.rev (List.filteri (fun i _ -> i < List.length wit_items - 1) wit_items) in
+            match check_witness_stack_item_sizes wit_stack with
+            | Error e -> Error e
+            | Ok () ->
             let st = create_eval_state ~tx ~input_index ~amount ~flags
                        ~sig_version:SigVersionWitnessV0 () in
             st.stack <- wit_stack;
@@ -3026,8 +3028,11 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                       if List.length wit_stack > max_stack_size then
                         Error "Tapscript initial stack too large"
                       else begin
-                        (* Task 6: Witness item size check for tapscript *)
-                        match check_witness_item_sizes ~sig_version:SigVersionTapscript witness with
+                        (* Per Bitcoin Core's ExecuteWitnessScript, the 520-byte
+                           stack item size check applies to ALL sigversions
+                           including tapscript -- but only to the items on the
+                           stack (control block and tap script already removed). *)
+                        match check_witness_stack_item_sizes wit_stack with
                         | Error e -> Error e
                         | Ok () ->
                           let st = create_eval_state ~tx ~input_index ~amount ~flags

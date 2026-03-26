@@ -6,7 +6,10 @@
             logs logs.fmt fmt fmt.tty secp256k1-internal)
  (foreign_stubs
   (language c)
-  (names schnorr_stubs sha256_accel_stubs)
+  (names schnorr_stubs sha256_accel_stubs rocksdb_stubs)
+  (flags (:standard -I/home/max/.local/include))
   (include_dirs ../vendor/secp256k1/src ../vendor/secp256k1/include))
- (c_library_flags (-Wl,--allow-multiple-definition -lcrypto))
+ (c_library_flags (-Wl,--allow-multiple-definition -lcrypto
+                   -L/home/max/.local/lib64 -lrocksdb -lstdc++
+                   -Wl,-rpath,/home/max/.local/lib64))
  (preprocess (pps lwt_ppx)))

@@ -1177,7 +1177,7 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
     ~(expected_bits : int32) ~(median_time : int32)
     ~(base_lookup : utxo_lookup) ~(flags : int)
     ?(skip_scripts=false) ?get_mtp_at_height ()
-    : (int64, block_validation_error) result =
+    : ((int64 * Types.hash256 array * (Types.outpoint * utxo) list), block_validation_error) result =
 
   (* First do context-free checks *)
   match check_block ~network block height ~expected_bits ~median_time with
@@ -1202,10 +1202,15 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
     let total_sigops_cost = ref 0 in
     let total_fees = ref 0L in
     let error = ref None in
+    (* Collect txids and spent UTXOs for caller reuse *)
+    let n_txs = List.length block.transactions in
+    let txid_arr = Array.make n_txs (Cstruct.empty) in
+    let spent_utxos = ref [] in
 
     List.iteri (fun i tx ->
       if !error = None then begin
         let txid = Crypto.compute_txid tx in
+        txid_arr.(i) <- txid;
         let is_cb = (i = 0) in
 
         (* Task 4: BIP30 duplicate txid check *)
@@ -1282,10 +1287,15 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
                   if not (Consensus.is_valid_money !total_fees) then
                     error := Some (BlockTxValidationFailed (i, TxOutputOverflow))
                   else begin
-                    (* Mark inputs as spent *)
+                    (* Mark inputs as spent and collect spent UTXOs *)
                     List.iter (fun inp ->
-                      let key = (Cstruct.to_string inp.Types.previous_output.txid,
-                                 inp.Types.previous_output.vout) in
+                      let outpoint = inp.Types.previous_output in
+                      let key = (Cstruct.to_string outpoint.txid,
+                                 outpoint.vout) in
+                      (match lookup outpoint with
+                       | Some utxo ->
+                         spent_utxos := (outpoint, utxo) :: !spent_utxos
+                       | None -> ());
                       Hashtbl.add spent_in_block key ()
                     ) tx.inputs
                   end
@@ -1324,4 +1334,4 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
       if coinbase_value > max_coinbase then
         Error (BlockBadCoinbaseValue (coinbase_value, max_coinbase))
       else
-        Ok !total_fees
+        Ok (!total_fees, txid_arr, List.rev !spent_utxos)

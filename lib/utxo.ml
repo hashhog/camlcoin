@@ -435,8 +435,10 @@ let compute_stats (utxo : UtxoSet.t) : utxo_stats =
    dirty set and only flushed to disk when `flush` is called, using the
    storage layer's atomic batch write for crash safety.
 
-   The default cache size of 500,000 entries covers the typical UTXO working
-   set during normal operation.
+   The default cache size of 2,000,000 entries covers much of the UTXO
+   working set during IBD through the testnet4 spam block range (50k-100k).
+   Combined with GC tuning (larger minor heap, higher space_overhead), this
+   provides the best balance of cache coverage and GC throughput.
 
    During IBD, the most recently created UTXOs are the most likely to be
    spent, so an LRU eviction policy is ideal. The write-back strategy
@@ -452,7 +454,7 @@ module OptimizedUtxoSet = struct
     mutable stats : Perf.utxo_cache_stats;
   }
 
-  let create ?(cache_size=500_000) db = {
+  let create ?(cache_size=2_000_000) db = {
     db;
     cache = Perf.LRU.create cache_size;
     dirty = Hashtbl.create 10_000;

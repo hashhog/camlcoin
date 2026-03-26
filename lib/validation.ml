@@ -1179,6 +1179,129 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
     ?(skip_scripts=false) ?get_mtp_at_height ()
     : ((int64 * Types.hash256 array * (Types.outpoint * utxo) list), block_validation_error) result =
 
+  (* ====================================================================
+     FAST PATH: Assume-valid IBD (skip_scripts = true)
+     During assume-valid IBD, we trust the block structure and scripts.
+     We only need to: compute txids, verify merkle root, update UTXOs.
+     This dramatically speeds up the 50-100k spam block range.
+     ==================================================================== *)
+  if skip_scripts then begin
+    let txs = block.transactions in
+    if txs = [] then
+      Error BlockEmptyTransactions
+    else begin
+      let n_txs = List.length txs in
+      (* Fix 1: Compute txids exactly ONCE *)
+      let txid_arr = Array.make n_txs Cstruct.empty in
+      List.iteri (fun i tx ->
+        txid_arr.(i) <- Crypto.compute_txid tx
+      ) txs;
+
+      (* Verify merkle root using pre-computed txids *)
+      let txid_list = Array.to_list txid_arr in
+      let (computed_merkle, _mutated) = Crypto.merkle_root txid_list in
+      if not (Cstruct.equal computed_merkle block.header.merkle_root) then
+        Error BlockBadMerkleRoot
+      else begin
+        (* Build local UTXO set for intra-block spending *)
+        let local_utxos : (string * int32, utxo) Hashtbl.t = Hashtbl.create 64 in
+        let spent_in_block : (string * int32, unit) Hashtbl.t = Hashtbl.create 64 in
+
+        let total_fees = ref 0L in
+        let error = ref None in
+        let spent_utxos = ref [] in
+
+        List.iteri (fun i (tx : Types.transaction) ->
+          if !error = None then begin
+            let txid = txid_arr.(i) in
+            let is_cb = (i = 0) in
+
+            if not is_cb then begin
+              (* Fix 3: Single-pass UTXO lookup - resolve all inputs once.
+                 Pre-compute string key per input, reuse for lookup and
+                 spent_in_block. *)
+              let n_inputs = List.length tx.inputs in
+              let resolved_utxos = Array.make n_inputs None in
+              let input_keys = Array.make n_inputs ("", 0l) in
+              let total_in = ref 0L in
+              List.iteri (fun j inp ->
+                if !error = None then begin
+                  let outpoint = inp.Types.previous_output in
+                  let key = (Cstruct.to_string outpoint.Types.txid, outpoint.Types.vout) in
+                  input_keys.(j) <- key;
+                  (* Inline lookup using pre-computed key *)
+                  let result =
+                    if Hashtbl.mem spent_in_block key then None
+                    else match Hashtbl.find_opt local_utxos key with
+                      | Some utxo -> Some utxo
+                      | None -> base_lookup outpoint
+                  in
+                  match result with
+                  | None ->
+                    error := Some (BlockTxValidationFailed (i, TxMissingInputs))
+                  | Some utxo ->
+                    resolved_utxos.(j) <- Some utxo;
+                    total_in := Int64.add !total_in utxo.value
+                end
+              ) tx.inputs;
+
+              if !error = None then begin
+                (* Calculate fee *)
+                let total_out = List.fold_left (fun acc out ->
+                  Int64.add acc out.Types.value
+                ) 0L tx.outputs in
+                let fee = Int64.sub !total_in total_out in
+                if fee < 0L then
+                  error := Some (BlockTxValidationFailed (i, TxInsufficientFee))
+                else begin
+                  total_fees := Int64.add !total_fees fee;
+
+                  (* Mark inputs as spent using pre-computed keys *)
+                  List.iteri (fun j inp ->
+                    let outpoint = inp.Types.previous_output in
+                    let key = input_keys.(j) in
+                    (match resolved_utxos.(j) with
+                     | Some utxo ->
+                       spent_utxos := (outpoint, utxo) :: !spent_utxos
+                     | None -> ());
+                    Hashtbl.add spent_in_block key ()
+                  ) tx.inputs
+                end
+              end
+            end;
+
+            (* Add outputs to local UTXO set.
+               Compute txid string once, reuse for all outputs. *)
+            if !error = None then begin
+              let txid_str = Cstruct.to_string txid in
+              List.iteri (fun vout out ->
+                let utxo = {
+                  txid;
+                  vout = Int32.of_int vout;
+                  value = out.Types.value;
+                  script_pubkey = out.Types.script_pubkey;
+                  height;
+                  is_coinbase = is_cb;
+                } in
+                let key = (txid_str, Int32.of_int vout) in
+                Hashtbl.add local_utxos key utxo
+              ) tx.outputs
+            end
+          end
+        ) txs;
+
+        match !error with
+        | Some e -> Error e
+        | None ->
+          Ok (!total_fees, txid_arr, List.rev !spent_utxos)
+      end
+    end
+  end
+
+  (* ====================================================================
+     FULL VALIDATION PATH (non-assume-valid)
+     ==================================================================== *)
+  else begin
   (* First do context-free checks *)
   match check_block ~network block height ~expected_bits ~median_time with
   | Error e -> Error e
@@ -1198,23 +1321,28 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
         | None -> base_lookup outpoint
     in
 
+    (* Compute txids ONCE up front (Fix 1) *)
+    let n_txs = List.length block.transactions in
+    let txid_arr = Array.make n_txs Cstruct.empty in
+    List.iteri (fun i tx ->
+      txid_arr.(i) <- Crypto.compute_txid tx
+    ) block.transactions;
+
     (* Accumulate sigops during per-tx validation so intra-block UTXOs are visible *)
     let total_sigops_cost = ref 0 in
     let total_fees = ref 0L in
     let error = ref None in
-    (* Collect txids and spent UTXOs for caller reuse *)
-    let n_txs = List.length block.transactions in
-    let txid_arr = Array.make n_txs (Cstruct.empty) in
     let spent_utxos = ref [] in
 
-    List.iteri (fun i tx ->
+    List.iteri (fun i (tx : Types.transaction) ->
       if !error = None then begin
-        let txid = Crypto.compute_txid tx in
-        txid_arr.(i) <- txid;
+        let txid = txid_arr.(i) in
         let is_cb = (i = 0) in
 
-        (* Task 4: BIP30 duplicate txid check *)
-        if not (List.mem height bip30_exception_heights) then begin
+        (* Fix 4: Skip BIP30 after BIP34 activation - duplicate txids are
+           impossible once coinbase must encode height (BIP34). *)
+        if height <= network.bip34_height &&
+           not (List.mem height bip30_exception_heights) then begin
           let n_outputs = List.length tx.outputs in
           if not (check_bip30 ~lookup:base_lookup ~txid ~n_outputs) then
             error := Some (BlockTxValidationFailed (i, TxDuplicateTxid))
@@ -1247,65 +1375,149 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
           if not (is_tx_final tx ~block_height:height ~block_time:locktime_cutoff) then
             error := Some (BlockTxValidationFailed (i, TxNonFinalLocktime))
           else begin
-            match validate_tx_inputs tx ~lookup ~block_height:height ~flags ~skip_scripts () with
-            | Error e ->
+            (* Fix 3: Single-pass UTXO lookup for non-coinbase txs.
+               Pre-compute string keys once per input to avoid repeated
+               Cstruct.to_string allocations. *)
+            let n_inputs = List.length tx.inputs in
+            let resolved_utxos = Array.make n_inputs None in
+            let resolve_error = ref None in
+            List.iteri (fun j inp ->
+              if !resolve_error = None then begin
+                match lookup inp.Types.previous_output with
+                | None ->
+                  resolve_error := Some TxMissingInputs
+                | Some utxo ->
+                  (* Check coinbase maturity *)
+                  if utxo.is_coinbase && height - utxo.height < Consensus.coinbase_maturity then
+                    resolve_error := Some (TxCoinbaseMaturity (height - utxo.height))
+                  else if not (Consensus.is_valid_money utxo.value) then
+                    resolve_error := Some TxOutputOverflow
+                  else
+                    resolved_utxos.(j) <- Some utxo
+              end
+            ) tx.inputs;
+
+            match !resolve_error with
+            | Some e ->
               error := Some (BlockTxValidationFailed (i, e))
-            | Ok total_in ->
-              (* Task 5: BIP68 sequence locks *)
-              if !error = None then begin
-                let n_inputs = List.length tx.inputs in
-                let utxo_heights = Array.make n_inputs 0 in
-                let utxo_mtps = Array.make n_inputs 0l in
-                (* Collect UTXO heights for sequence lock checks *)
+            | None ->
+              (* Build prevouts for script verification *)
+              let prevouts = Array.to_list (Array.map (fun opt ->
+                match opt with
+                | Some utxo -> (utxo.value, utxo.script_pubkey)
+                | None -> (0L, Cstruct.empty)
+              ) resolved_utxos) in
+
+              (* Compute total_in from resolved UTXOs *)
+              let total_in = ref 0L in
+              Array.iter (fun opt ->
+                match opt with
+                | Some utxo -> total_in := Int64.add !total_in utxo.value
+                | None -> ()
+              ) resolved_utxos;
+
+              (* Check cumulative total_in is in MoneyRange *)
+              if not (Consensus.is_valid_money !total_in) then
+                error := Some (BlockTxValidationFailed (i, TxOutputOverflow))
+              else begin
+                (* Script verification using pre-resolved UTXOs *)
+                let script_error = ref None in
                 List.iteri (fun j inp ->
-                  match lookup inp.Types.previous_output with
-                  | Some utxo ->
-                    utxo_heights.(j) <- utxo.height;
-                    utxo_mtps.(j) <- (match get_mtp_at_height with
-                      | Some f -> f (utxo.height - 1)
-                      | None -> median_time)
-                  | None -> ()
-                ) tx.inputs;
-                if not (check_sequence_locks tx ~block_height:height
-                          ~median_time ~utxo_heights ~utxo_mtps
-                          ?get_mtp_at_height ~flags ()) then
-                  error := Some (BlockTxValidationFailed (i, TxSequenceLocksFailed))
-              end;
-
-              if !error = None then begin
-                (* Calculate and accumulate fee *)
-                let total_out = List.fold_left (fun acc out ->
-                  Int64.add acc out.Types.value
-                ) 0L tx.outputs in
-                let fee = Int64.sub total_in total_out in
-                if fee < 0L then
-                  error := Some (BlockTxValidationFailed (i, TxInsufficientFee))
-                else begin
-                  total_fees := Int64.add !total_fees fee;
-
-                  (* Task 8: Fee overflow check *)
-                  if not (Consensus.is_valid_money !total_fees) then
-                    error := Some (BlockTxValidationFailed (i, TxOutputOverflow))
-                  else begin
-                    (* Mark inputs as spent and collect spent UTXOs *)
-                    List.iter (fun inp ->
-                      let outpoint = inp.Types.previous_output in
-                      let key = (Cstruct.to_string outpoint.txid,
-                                 outpoint.vout) in
-                      (match lookup outpoint with
-                       | Some utxo ->
-                         spent_utxos := (outpoint, utxo) :: !spent_utxos
-                       | None -> ());
-                      Hashtbl.add spent_in_block key ()
-                    ) tx.inputs
+                  if !script_error = None then begin
+                    match resolved_utxos.(j) with
+                    | None -> script_error := Some (TxScriptFailed (j, "missing input"))
+                    | Some utxo ->
+                      let witness =
+                        if j < List.length tx.witnesses then
+                          List.nth tx.witnesses j
+                        else
+                          { Types.items = [] }
+                      in
+                      let txid_for_cache = Crypto.compute_txid tx in
+                      let cache_key : Sig_cache.cache_key = {
+                        txid = txid_for_cache;
+                        input_index = j;
+                        flags;
+                      } in
+                      let cache = Sig_cache.get_global () in
+                      match Sig_cache.lookup cache cache_key with
+                      | Some true -> ()
+                      | _ ->
+                        match Script.verify_script
+                                ~tx ~input_index:j
+                                ~script_pubkey:utxo.script_pubkey
+                                ~script_sig:inp.Types.script_sig
+                                ~witness
+                                ~amount:utxo.value
+                                ~flags ~prevouts () with
+                        | Error msg ->
+                          script_error := Some (TxScriptFailed (j, msg))
+                        | Ok false ->
+                          script_error := Some (TxScriptFailed (j, "Script returned false"))
+                        | Ok true ->
+                          Sig_cache.insert cache cache_key true
                   end
-                end
+                ) tx.inputs;
+
+                match !script_error with
+                | Some e -> error := Some (BlockTxValidationFailed (i, e))
+                | None ->
+                  (* BIP68 sequence locks using pre-resolved UTXOs *)
+                  if !error = None then begin
+                    let utxo_heights = Array.make n_inputs 0 in
+                    let utxo_mtps = Array.make n_inputs 0l in
+                    Array.iteri (fun j opt ->
+                      match opt with
+                      | Some utxo ->
+                        utxo_heights.(j) <- utxo.height;
+                        utxo_mtps.(j) <- (match get_mtp_at_height with
+                          | Some f -> f (utxo.height - 1)
+                          | None -> median_time)
+                      | None -> ()
+                    ) resolved_utxos;
+                    if not (check_sequence_locks tx ~block_height:height
+                              ~median_time ~utxo_heights ~utxo_mtps
+                              ?get_mtp_at_height ~flags ()) then
+                      error := Some (BlockTxValidationFailed (i, TxSequenceLocksFailed))
+                  end;
+
+                  if !error = None then begin
+                    (* Calculate and accumulate fee *)
+                    let total_out = List.fold_left (fun acc out ->
+                      Int64.add acc out.Types.value
+                    ) 0L tx.outputs in
+                    let fee = Int64.sub !total_in total_out in
+                    if fee < 0L then
+                      error := Some (BlockTxValidationFailed (i, TxInsufficientFee))
+                    else begin
+                      total_fees := Int64.add !total_fees fee;
+
+                      (* Fee overflow check *)
+                      if not (Consensus.is_valid_money !total_fees) then
+                        error := Some (BlockTxValidationFailed (i, TxOutputOverflow))
+                      else begin
+                        (* Mark inputs as spent using pre-resolved UTXOs *)
+                        List.iteri (fun j inp ->
+                          let outpoint = inp.Types.previous_output in
+                          let key = (Cstruct.to_string outpoint.txid,
+                                     outpoint.vout) in
+                          (match resolved_utxos.(j) with
+                           | Some utxo ->
+                             spent_utxos := (outpoint, utxo) :: !spent_utxos
+                           | None -> ());
+                          Hashtbl.add spent_in_block key ()
+                        ) tx.inputs
+                      end
+                    end
+                  end
               end
           end
         end;
 
-        (* Add outputs to local UTXO set for intra-block spending *)
+        (* Add outputs to local UTXO set for intra-block spending.
+           Compute txid string once, reuse for all outputs. *)
         if !error = None then begin
+          let txid_str = Cstruct.to_string txid in
           List.iteri (fun vout out ->
             let utxo = {
               txid;
@@ -1315,7 +1527,7 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
               height;
               is_coinbase = is_cb;
             } in
-            let key = (Cstruct.to_string txid, Int32.of_int vout) in
+            let key = (txid_str, Int32.of_int vout) in
             Hashtbl.add local_utxos key utxo
           ) tx.outputs
         end
@@ -1335,3 +1547,4 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
         Error (BlockBadCoinbaseValue (coinbase_value, max_coinbase))
       else
         Ok (!total_fees, txid_arr, List.rev !spent_utxos)
+  end

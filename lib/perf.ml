@@ -43,7 +43,10 @@ module LRU = struct
 
   let create ?(key_to_string = fun _ -> "") capacity = {
     capacity;
-    table = Hashtbl.create capacity;
+    (* Use a smaller initial bucket count; Hashtbl will grow as needed.
+       Pre-allocating millions of buckets wastes memory and triggers a
+       large GC sweep at startup. *)
+    table = Hashtbl.create (min capacity 262_144);
     head = None;
     tail = None;
     length = 0;

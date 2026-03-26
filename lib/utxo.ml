@@ -58,12 +58,16 @@ module UtxoSet = struct
       cache_hits = 0;
       cache_misses = 0 }
 
-  (* Create a cache key from txid and output index *)
+  (* Create a cache key from txid and output index.
+     Directly builds a 36-byte string without intermediate allocations. *)
   let utxo_key (txid : Types.hash256) (vout : int) : string =
-    let w = Serialize.writer_create () in
-    Serialize.write_bytes w txid;
-    Serialize.write_int32_le w (Int32.of_int vout);
-    Cstruct.to_string (Serialize.writer_to_cstruct w)
+    let buf = Bytes.create 36 in
+    Cstruct.blit_to_bytes txid 0 buf 0 32;
+    Bytes.set buf 32 (Char.chr (vout land 0xff));
+    Bytes.set buf 33 (Char.chr ((vout lsr 8) land 0xff));
+    Bytes.set buf 34 (Char.chr ((vout lsr 16) land 0xff));
+    Bytes.set buf 35 (Char.chr ((vout lsr 24) land 0xff));
+    Bytes.unsafe_to_string buf
 
   (* Get a UTXO entry, checking cache first then database *)
   let get (t : t) (txid : Types.hash256) (vout : int)
@@ -455,12 +459,16 @@ module OptimizedUtxoSet = struct
     stats = Perf.create_utxo_stats ();
   }
 
-  (* Create a cache key from txid and output index *)
+  (* Create a cache key from txid and output index.
+     Directly builds a 36-byte string without intermediate allocations. *)
   let utxo_key (txid : Types.hash256) (vout : int) : string =
-    let w = Serialize.writer_create () in
-    Serialize.write_bytes w txid;
-    Serialize.write_int32_le w (Int32.of_int vout);
-    Cstruct.to_string (Serialize.writer_to_cstruct w)
+    let buf = Bytes.create 36 in
+    Cstruct.blit_to_bytes txid 0 buf 0 32;
+    Bytes.set buf 32 (Char.chr (vout land 0xff));
+    Bytes.set buf 33 (Char.chr ((vout lsr 8) land 0xff));
+    Bytes.set buf 34 (Char.chr ((vout lsr 16) land 0xff));
+    Bytes.set buf 35 (Char.chr ((vout lsr 24) land 0xff));
+    Bytes.unsafe_to_string buf
 
   (* Get a UTXO entry: check LRU cache, then dirty set, then database *)
   let get (t : t) (txid : Types.hash256) (vout : int)
@@ -531,6 +539,22 @@ module OptimizedUtxoSet = struct
     Perf.LRU.remove t.cache key;
     Hashtbl.replace t.dirty key `Removed;
     existing
+
+  (* Fast remove: mark as Removed without looking up the old entry.
+     Used during IBD when the caller discards the return value.
+     Optimization: if the entry was Added in this flush window (not yet
+     on disk), we can remove it from the dirty set entirely — avoids a
+     pointless write+delete round-trip on the next flush. *)
+  let remove_fast (t : t) (txid : Types.hash256) (vout : int) : unit =
+    let key = utxo_key txid vout in
+    Perf.LRU.remove t.cache key;
+    match Hashtbl.find_opt t.dirty key with
+    | Some (`Added _) ->
+      (* Created and spent in same flush window — just remove both *)
+      Hashtbl.remove t.dirty key
+    | _ ->
+      (* Entry is on disk from a previous flush — must record deletion *)
+      Hashtbl.replace t.dirty key `Removed
 
   (* Check if a UTXO exists *)
   let exists (t : t) (txid : Types.hash256) (vout : int) : bool =

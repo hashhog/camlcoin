@@ -449,13 +449,15 @@ module OptimizedUtxoSet = struct
 
   type t = {
     db : Storage.ChainDB.t;
+    rocksdb : Rocksdb_store.t option;
     cache : (string, utxo_entry) Perf.LRU.t;
     dirty : (string, dirty_entry) Hashtbl.t;
     mutable stats : Perf.utxo_cache_stats;
   }
 
-  let create ?(cache_size=2_000_000) db = {
+  let create ?(cache_size=2_000_000) ?rocksdb db = {
     db;
+    rocksdb;
     cache = Perf.LRU.create cache_size;
     dirty = Hashtbl.create 10_000;
     stats = Perf.create_utxo_stats ();
@@ -496,8 +498,12 @@ module OptimizedUtxoSet = struct
         Perf.LRU.put t.cache key entry;
         Some entry
       | None ->
-        (* 3. Fall through to database *)
-        (match Storage.ChainDB.get_utxo t.db txid vout with
+        (* 3. Fall through to database (RocksDB if available, else LogStorage) *)
+        let db_result = match t.rocksdb with
+          | Some rdb -> Rocksdb_store.get rdb key
+          | None -> Storage.ChainDB.get_utxo t.db txid vout
+        in
+        (match db_result with
         | None ->
           t.stats.misses <- t.stats.misses + 1;
           None
@@ -531,12 +537,16 @@ module OptimizedUtxoSet = struct
         | Some (`Added entry) -> Some entry
         | Some `Removed -> None
         | None ->
-          match Storage.ChainDB.get_utxo t.db txid vout with
+          let db_result = match t.rocksdb with
+            | Some rdb -> Rocksdb_store.get rdb key
+            | None -> Storage.ChainDB.get_utxo t.db txid vout
+          in
+          (match db_result with
           | None -> None
           | Some data ->
             let r = Serialize.reader_of_cstruct
               (Cstruct.of_string data) in
-            Some (deserialize_utxo_entry r)
+            Some (deserialize_utxo_entry r))
     in
     Perf.LRU.remove t.cache key;
     Hashtbl.replace t.dirty key `Removed;
@@ -566,7 +576,10 @@ module OptimizedUtxoSet = struct
       match Hashtbl.find_opt t.dirty key with
       | Some `Removed -> false
       | Some (`Added _) -> true
-      | None -> Option.is_some (Storage.ChainDB.get_utxo t.db txid vout)
+      | None ->
+        (match t.rocksdb with
+         | Some rdb -> Option.is_some (Rocksdb_store.get rdb key)
+         | None -> Option.is_some (Storage.ChainDB.get_utxo t.db txid vout))
 
   (* Flush all dirty entries to disk in a single atomic batch transaction.
      This writes all Added entries and deletes all Removed entries, then
@@ -574,22 +587,36 @@ module OptimizedUtxoSet = struct
   let flush (t : t) : unit =
     let count = Hashtbl.length t.dirty in
     if count > 0 then begin
-      let batch = Storage.ChainDB.batch_create () in
-      Hashtbl.iter (fun key entry ->
-        (* Extract txid (32 bytes) and vout (4 bytes LE) from the key *)
-        let key_cs = Cstruct.of_string key in
-        let txid = Cstruct.sub key_cs 0 32 in
-        let vout = Int32.to_int (Cstruct.LE.get_uint32 key_cs 32) in
-        match entry with
-        | `Added utxo ->
-          let w = Serialize.writer_create () in
-          serialize_utxo_entry w utxo;
-          Storage.ChainDB.batch_store_utxo batch txid vout
-            (Cstruct.to_string (Serialize.writer_to_cstruct w))
-        | `Removed ->
-          Storage.ChainDB.batch_delete_utxo batch txid vout
-      ) t.dirty;
-      Storage.ChainDB.batch_write t.db batch;
+      (match t.rocksdb with
+       | Some rdb ->
+         (* RocksDB path: atomic batch write using raw 36-byte keys *)
+         let ops = Hashtbl.fold (fun key entry acc ->
+           match entry with
+           | `Added utxo ->
+             let w = Serialize.writer_create () in
+             serialize_utxo_entry w utxo;
+             (key, Some (Cstruct.to_string (Serialize.writer_to_cstruct w))) :: acc
+           | `Removed ->
+             (key, None) :: acc
+         ) t.dirty [] in
+         Rocksdb_store.batch_write rdb ops
+       | None ->
+         (* Legacy LogStorage path *)
+         let batch = Storage.ChainDB.batch_create () in
+         Hashtbl.iter (fun key entry ->
+           let key_cs = Cstruct.of_string key in
+           let txid = Cstruct.sub key_cs 0 32 in
+           let vout = Int32.to_int (Cstruct.LE.get_uint32 key_cs 32) in
+           match entry with
+           | `Added utxo ->
+             let w = Serialize.writer_create () in
+             serialize_utxo_entry w utxo;
+             Storage.ChainDB.batch_store_utxo batch txid vout
+               (Cstruct.to_string (Serialize.writer_to_cstruct w))
+           | `Removed ->
+             Storage.ChainDB.batch_delete_utxo batch txid vout
+         ) t.dirty;
+         Storage.ChainDB.batch_write t.db batch);
       Hashtbl.clear t.dirty;
       Logs.debug (fun m -> m "Flushed %d dirty UTXO entries to disk" count)
     end

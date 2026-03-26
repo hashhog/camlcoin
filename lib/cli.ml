@@ -118,9 +118,14 @@ let run (config : config) : unit Lwt.t =
   (* Initialize UTXO set *)
   let utxo = Utxo.UtxoSet.create db in
 
+  (* Open RocksDB for the UTXO set — replaces LogStorage's lseek+read *)
+  let rocksdb_path = Filename.concat config.data_dir "rocksdb_utxo" in
+  let rocksdb = Rocksdb_store.open_db rocksdb_path in
+  Logs.info (fun m -> m "Opened RocksDB UTXO store at %s" rocksdb_path);
+
   (* Optimized UTXO set for IBD – dirty entries are flushed periodically
      during block download and must be flushed on shutdown to avoid loss. *)
-  let optimized_utxo = Utxo.OptimizedUtxoSet.create db in
+  let optimized_utxo = Utxo.OptimizedUtxoSet.create ~rocksdb db in
 
   (* Initialize mempool *)
   let current_height = match chain.tip with
@@ -384,6 +389,9 @@ let run (config : config) : unit Lwt.t =
          Storage.ChainDB.set_chain_tip db entry.hash bs
        | None -> ())
     end;
+    (* Close RocksDB UTXO store *)
+    Rocksdb_store.close rocksdb;
+    Logs.info (fun m -> m "Closed RocksDB UTXO store");
     (* Sync database to ensure all cached data is persisted *)
     Storage.ChainDB.sync db;
     Storage.ChainDB.close db;

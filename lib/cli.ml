@@ -263,16 +263,28 @@ let run (config : config) : unit Lwt.t =
   (* Dynamic peer getter so IBD always sees the latest connected peers *)
   let get_peers () = Peer_manager.get_ready_peers peer_manager in
 
-  (* Sync thread - waits for peers then syncs *)
+  (* Sync thread - waits for first peer then syncs *)
   let sync_thread =
-    (* Wait a bit for initial peer connections *)
-    let* () = Lwt_unix.sleep 5.0 in
-    let ready_peers = get_peers () in
-    match ready_peers with
-    | [] ->
-      Logs.warn (fun m -> m "No peers connected yet");
-      Lwt.return_unit
-    | peer :: _ ->
+    (* Poll until at least one peer completes handshake (up to 60s) *)
+    let rec wait_for_peer attempts =
+      if attempts >= 60 then begin
+        Logs.warn (fun m -> m "No peers connected after 60s, will retry via stale-tip check");
+        Lwt.return_none
+      end else begin
+        let* () = Lwt_unix.sleep 1.0 in
+        let all_peers = Peer_manager.peer_count peer_manager in
+        let ready = Peer_manager.ready_peer_count peer_manager in
+        if attempts mod 5 = 0 then
+          Logs.info (fun m -> m "Waiting for peers: %d total, %d ready (attempt %d/60)" all_peers ready attempts);
+        match get_peers () with
+        | [] -> wait_for_peer (attempts + 1)
+        | peer :: _ -> Lwt.return_some peer
+      end
+    in
+    let* first_peer = wait_for_peer 0 in
+    match first_peer with
+    | None -> Lwt.return_unit
+    | Some peer ->
       Logs.info (fun m ->
         m "Starting header sync with peer %d" peer.Peer.id);
       let* () = Sync.sync_headers chain peer in

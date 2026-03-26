@@ -730,7 +730,7 @@ let run_background_validation
             Logs.err (fun m -> m "[assumeutxo] Background validation failed at height %d: %s"
                         next_height (Validation.block_error_to_string e));
             Lwt.return_unit
-          | Ok _fees ->
+          | Ok (_fees, _txid_arr, _spent_utxos) ->
             (* Update IBD chainstate UTXO set with the block's changes *)
             (match connect_block_to_cache ~cache:ibd_chainstate.utxo_cache
                      ~block ~height:next_height () with

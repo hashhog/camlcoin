@@ -800,15 +800,15 @@ let is_assume_valid (state : chain_state) (height : int) : bool =
     | Some av_entry -> height <= av_entry.height
 
 (* IBD configuration constants *)
-let max_blocks_per_peer = 16          (* Max in-flight blocks per peer *)
-let max_total_blocks_in_flight = 128  (* Global cap on blocks in flight *)
+let max_blocks_per_peer = 64           (* Max in-flight blocks per peer — aggressive for IBD *)
+let max_total_blocks_in_flight = 1024  (* Global cap on blocks in flight — 8x previous for parallel download *)
 let stall_timeout = 2.0                 (* 2s stall detection — re-request from another peer *)
 let base_block_timeout = 60.0           (* 60s base timeout — matches Bitcoin Core's conservative approach *)
 let max_block_timeout = 300.0           (* 5 min max timeout per block *)
 let max_stall_timeout = 1200.0          (* 20 min max stall — matches Bitcoin Core *)
 let max_consecutive_timeouts = 5        (* More forgiving before disconnect *)
 let utxo_flush_interval = 2000        (* Flush UTXOs every N blocks *)
-let block_download_window = 1024      (* Max blocks ahead to queue (matches Bitcoin Core BLOCK_DOWNLOAD_WINDOW) *)
+let block_download_window = 2048      (* Max blocks ahead to queue — 2x previous for deeper pipeline *)
 
 (* Orphan block pool constants *)
 let max_orphan_blocks = 750
@@ -1041,50 +1041,56 @@ let record_successful_download (ibd : ibd_state) (peer_id : int) : unit =
    Block Request Logic with Per-Peer Tracking
    ============================================================================ *)
 
-(* Request blocks from available peers using batched GetData *)
+(* Request blocks from available peers using batched GetData.
+   Distributes unrequested blocks across all ready peers in parallel,
+   giving each peer up to max_blocks_per_peer blocks per round. *)
 let request_blocks (ibd : ibd_state) (peers : Peer.peer list)
     : unit Lwt.t =
   let now = Unix.gettimeofday () in
   (* First check for timeouts *)
   check_timeouts ibd;
+  (* Mark blocks we already have on disk as validated (do this once, not per-peer) *)
+  Queue.iter (fun entry ->
+    if entry.download_state = NotRequested &&
+       Storage.ChainDB.has_block ibd.chain.db entry.hash then
+      entry.download_state <- Validated
+  ) ibd.block_queue;
   (* Filter to ready peers with capacity *)
   let ready_peers = List.filter (fun p ->
     p.Peer.state = Peer.Ready &&
     let ps = get_peer_state ibd p.Peer.id in
     ps.blocks_in_flight < max_blocks_per_peer
   ) peers in
-  (* Request from each peer up to their capacity *)
-  let%lwt () = Lwt_list.iter_s (fun peer ->
-    if ibd.total_blocks_in_flight >= max_total_blocks_in_flight then
-      Lwt.return_unit
+  (* Build a single list of unrequested blocks, then partition across peers *)
+  let unrequested = Queue.fold (fun acc entry ->
+    if entry.download_state = NotRequested then entry :: acc else acc
+  ) [] ibd.block_queue |> List.rev in
+  if unrequested = [] then Lwt.return_unit
+  else begin
+    (* Assign blocks to peers round-robin style for balanced distribution *)
+    let peer_batches : (Peer.peer * peer_download_state * block_queue_entry list ref) list =
+      List.filter_map (fun peer ->
+        let peer_state = get_peer_state ibd peer.Peer.id in
+        let available = max_blocks_per_peer - peer_state.blocks_in_flight in
+        if available > 0 then Some (peer, peer_state, ref [])
+        else None
+      ) ready_peers
+    in
+    if peer_batches = [] then Lwt.return_unit
     else begin
-      let peer_state = get_peer_state ibd peer.Peer.id in
-      let available = max_blocks_per_peer - peer_state.blocks_in_flight in
-      let global_available = max_total_blocks_in_flight - ibd.total_blocks_in_flight in
-      let to_request_count = min available global_available in
-      if to_request_count <= 0 then
-        Lwt.return_unit
-      else begin
-        (* Mark blocks we already have as validated *)
-        Queue.iter (fun entry ->
-          if entry.download_state = NotRequested &&
-             Storage.ChainDB.has_block ibd.chain.db entry.hash then
-            entry.download_state <- Validated
-        ) ibd.block_queue;
-        (* Find unrequested blocks *)
-        let unrequested = Queue.fold (fun acc entry ->
-          if entry.download_state = NotRequested then entry :: acc else acc
-        ) [] ibd.block_queue |> List.rev in
-        match unrequested with
-        | [] -> Lwt.return_unit
-        | entries ->
-          (* Take up to to_request_count blocks *)
-          let batch = List.filteri (fun i _ -> i < to_request_count) entries in
-          if batch = [] then
-            Lwt.return_unit
-          else begin
-            (* Mark as requested and build inv vectors *)
-            let inv_vectors = List.map (fun entry ->
+      (* Distribute unrequested blocks to peers *)
+      let peer_arr = Array.of_list peer_batches in
+      let n_peers = Array.length peer_arr in
+      let idx = ref 0 in
+      List.iter (fun entry ->
+        if ibd.total_blocks_in_flight < max_total_blocks_in_flight then begin
+          (* Find next peer with capacity (round-robin with skip) *)
+          let found = ref false in
+          let attempts = ref 0 in
+          while not !found && !attempts < n_peers do
+            let (peer, peer_state, batch_ref) = peer_arr.(!idx mod n_peers) in
+            let _ = peer in
+            if peer_state.blocks_in_flight < max_blocks_per_peer then begin
               entry.download_state <- Requested {
                 peer_id = peer.Peer.id;
                 requested_at = now;
@@ -1092,32 +1098,46 @@ let request_blocks (ibd : ibd_state) (peers : Peer.peer list)
               };
               ibd.total_blocks_in_flight <- ibd.total_blocks_in_flight + 1;
               peer_state.blocks_in_flight <- peer_state.blocks_in_flight + 1;
-              P2p.{ inv_type = InvWitnessBlock; hash = entry.hash }
-            ) batch in
-            Logs.debug (fun m ->
-              m "Requesting %d blocks from peer %d (in-flight: %d/%d)"
-                (List.length inv_vectors) peer.Peer.id
-                peer_state.blocks_in_flight max_blocks_per_peer);
-            (* Send batched GetData message — catch broken-pipe / closed
-               channel so one dead peer doesn't kill the IBD loop. *)
-            Lwt.catch
-              (fun () -> Peer.send_message peer (P2p.GetdataMsg inv_vectors))
-              (fun _exn ->
-                 (* Peer socket is dead; un-mark the blocks so they can be
-                    re-requested from another peer. *)
-                 List.iter (fun entry ->
-                   entry.download_state <- NotRequested;
-                   ibd.total_blocks_in_flight <-
-                     max 0 (ibd.total_blocks_in_flight - 1);
-                   peer_state.blocks_in_flight <-
-                     max 0 (peer_state.blocks_in_flight - 1)
-                 ) batch;
-                 Lwt.return_unit)
-          end
-      end
+              batch_ref := entry :: !batch_ref;
+              found := true
+            end;
+            idx := !idx + 1;
+            incr attempts
+          done
+        end
+      ) unrequested;
+      (* Send all GetData messages in parallel *)
+      let%lwt () = Lwt_list.iter_p (fun (peer, peer_state, batch_ref) ->
+        let batch : block_queue_entry list = List.rev !batch_ref in
+        if batch = [] then Lwt.return_unit
+        else begin
+          let inv_vectors = List.map (fun (entry : block_queue_entry) ->
+            P2p.{ inv_type = InvWitnessBlock; hash = entry.hash }
+          ) batch in
+          Logs.debug (fun m ->
+            m "Requesting %d blocks from peer %d (in-flight: %d/%d)"
+              (List.length inv_vectors) peer.Peer.id
+              peer_state.blocks_in_flight max_blocks_per_peer);
+          (* Send batched GetData message — catch broken-pipe / closed
+             channel so one dead peer doesn't kill the IBD loop. *)
+          Lwt.catch
+            (fun () -> Peer.send_message peer (P2p.GetdataMsg inv_vectors))
+            (fun _exn ->
+               (* Peer socket is dead; un-mark the blocks so they can be
+                  re-requested from another peer. *)
+               List.iter (fun entry ->
+                 entry.download_state <- NotRequested;
+                 ibd.total_blocks_in_flight <-
+                   max 0 (ibd.total_blocks_in_flight - 1);
+                 peer_state.blocks_in_flight <-
+                   max 0 (peer_state.blocks_in_flight - 1)
+               ) batch;
+               Lwt.return_unit)
+        end
+      ) peer_batches in
+      Lwt.return_unit
     end
-  ) ready_peers in
-  Lwt.return_unit
+  end
 
 (* ============================================================================
    Block Receipt and Processing
@@ -1441,78 +1461,118 @@ let process_downloaded_blocks (ibd : ibd_state)
                  ~flags:validation_flags ~skip_scripts
                  ~network:ibd.chain.network
                  ~get_mtp_at_height:(get_mtp_for_height ibd.chain) () with
-         | Ok _fees ->
-           (* Store block *)
-           Storage.ChainDB.store_block ibd.chain.db entry.hash block;
-           (* Build and store undo data for chain reorganization *)
-           let tx_undos = List.filter_map (fun (tx_idx, tx) ->
-             if tx_idx > 0 then begin
-               let spent = List.filter_map (fun inp ->
-                 let prev = inp.Types.previous_output in
-                 let vout = Int32.to_int prev.Types.vout in
-                 (* Look up via OptimizedUtxoSet first, then DB *)
-                 let entry_opt = match ibd.utxo_set with
-                   | Some utxo -> Utxo.OptimizedUtxoSet.get utxo prev.Types.txid vout
-                   | None -> None
-                 in
-                 let entry_opt = match entry_opt with
-                   | Some _ as r -> r
-                   | None ->
-                     match Storage.ChainDB.get_utxo ibd.chain.db prev.Types.txid vout with
-                     | None -> None
-                     | Some data ->
-                       let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
-                       Some (Utxo.deserialize_utxo_entry r)
-                 in
-                 match entry_opt with
-                 | None -> None
-                 | Some entry_utxo -> Some (prev, entry_utxo)
-               ) tx.Types.inputs in
-               Some Utxo.{ spent_outputs = spent }
-             end else None
-           ) (List.mapi (fun i tx -> (i, tx)) block.transactions) in
-           let undo : Utxo.undo_data = { height; tx_undos } in
-           let uw = Serialize.writer_create () in
-           Utxo.serialize_undo_data uw undo;
-           Storage.ChainDB.store_undo_data ibd.chain.db entry.hash
-             (Cstruct.to_string (Serialize.writer_to_cstruct uw));
+         | Ok (_fees, txid_arr, spent_utxo_list) ->
+           let ibd_mode = skip_scripts in
+           (* Fix 3: Skip block/undo storage during assume-valid IBD *)
+           if not ibd_mode then begin
+             (* Store block *)
+             Storage.ChainDB.store_block ibd.chain.db entry.hash block;
+             (* Build undo data from validation's spent_utxo_list (Fix 1) *)
+             let spent_by_tx : (int, (Types.outpoint * Utxo.utxo_entry) list) Hashtbl.t =
+               Hashtbl.create 16 in
+             (* Map spent UTXOs back to their transaction index *)
+             let tx_input_counts = Array.of_list (List.mapi (fun i tx ->
+               if i = 0 then 0  (* coinbase *)
+               else List.length tx.Types.inputs
+             ) block.transactions) in
+             (* Assign spent UTXOs to transactions *)
+             let cur_tx = ref 1 in (* start at tx 1, skip coinbase *)
+             let cur_inp = ref 0 in
+             List.iter (fun (outpoint, utxo) ->
+               (* Advance to the right tx *)
+               while !cur_tx < Array.length tx_input_counts &&
+                     !cur_inp >= tx_input_counts.(!cur_tx) do
+                 cur_tx := !cur_tx + 1;
+                 cur_inp := 0
+               done;
+               let entry = Utxo.{
+                 value = utxo.Validation.value;
+                 script_pubkey = utxo.Validation.script_pubkey;
+                 height = utxo.Validation.height;
+                 is_coinbase = utxo.Validation.is_coinbase;
+               } in
+               let existing = match Hashtbl.find_opt spent_by_tx !cur_tx with
+                 | Some l -> l | None -> [] in
+               Hashtbl.replace spent_by_tx !cur_tx ((outpoint, entry) :: existing);
+               cur_inp := !cur_inp + 1
+             ) spent_utxo_list;
+             let n_txs = List.length block.transactions in
+             let tx_undos = List.init (n_txs - 1) (fun i ->
+               let tx_idx = i + 1 in
+               let spent = match Hashtbl.find_opt spent_by_tx tx_idx with
+                 | Some l -> List.rev l | None -> [] in
+               Utxo.{ spent_outputs = spent }
+             ) in
+             let undo : Utxo.undo_data = { height; tx_undos } in
+             let uw = Serialize.writer_create () in
+             Utxo.serialize_undo_data uw undo;
+             Storage.ChainDB.store_undo_data ibd.chain.db entry.hash
+               (Cstruct.to_string (Serialize.writer_to_cstruct uw))
+           end;
            (* Update UTXOs - add new outputs, delete spent inputs *)
+           (* Fix 2: Reuse txids from validation instead of recomputing *)
+           (* Fix 5: During IBD, only use OptimizedUtxoSet, skip pending lists *)
            List.iteri (fun tx_idx tx ->
-             let txid = Crypto.compute_txid tx in
+             let txid = txid_arr.(tx_idx) in
              let is_cb = (tx_idx = 0) in
              (* Add outputs as new UTXOs (skip genesis coinbase) *)
              if not (Consensus.is_genesis_coinbase height txid) then begin
-               List.iteri (fun vout out ->
-                 let data = encode_utxo out.Types.value out.Types.script_pubkey
-                     height is_cb in
-                 ibd.pending_utxo_updates <-
-                   (txid, vout, data) :: ibd.pending_utxo_updates;
-                 (* Also update OptimizedUtxoSet for in-memory lookups *)
+               if ibd_mode then begin
+                 (* IBD: only OptimizedUtxoSet *)
                  (match ibd.utxo_set with
                   | Some utxo ->
-                    Utxo.OptimizedUtxoSet.add utxo txid vout
-                      Utxo.{ value = out.Types.value;
-                             script_pubkey = out.Types.script_pubkey;
-                             height;
-                             is_coinbase = is_cb }
+                    List.iteri (fun vout out ->
+                      Utxo.OptimizedUtxoSet.add utxo txid vout
+                        Utxo.{ value = out.Types.value;
+                               script_pubkey = out.Types.script_pubkey;
+                               height;
+                               is_coinbase = is_cb }
+                    ) tx.Types.outputs
                   | None -> ())
-               ) tx.Types.outputs
+               end else begin
+                 List.iteri (fun vout out ->
+                   let data = encode_utxo out.Types.value out.Types.script_pubkey
+                       height is_cb in
+                   ibd.pending_utxo_updates <-
+                     (txid, vout, data) :: ibd.pending_utxo_updates;
+                   (match ibd.utxo_set with
+                    | Some utxo ->
+                      Utxo.OptimizedUtxoSet.add utxo txid vout
+                        Utxo.{ value = out.Types.value;
+                               script_pubkey = out.Types.script_pubkey;
+                               height;
+                               is_coinbase = is_cb }
+                    | None -> ())
+                 ) tx.Types.outputs
+               end
              end;
              (* Delete spent inputs (non-coinbase only) *)
              if not is_cb then begin
-               List.iter (fun inp ->
-                 ibd.pending_utxo_deletes <-
-                   (inp.Types.previous_output.Types.txid,
-                    Int32.to_int inp.Types.previous_output.Types.vout)
-                   :: ibd.pending_utxo_deletes;
-                 (* Also remove from OptimizedUtxoSet *)
+               if ibd_mode then begin
+                 (* IBD: only OptimizedUtxoSet — use remove_fast since we
+                    don't need the old entry value *)
                  (match ibd.utxo_set with
                   | Some utxo ->
-                    ignore (Utxo.OptimizedUtxoSet.remove utxo
-                      inp.Types.previous_output.Types.txid
-                      (Int32.to_int inp.Types.previous_output.Types.vout))
+                    List.iter (fun inp ->
+                      Utxo.OptimizedUtxoSet.remove_fast utxo
+                        inp.Types.previous_output.Types.txid
+                        (Int32.to_int inp.Types.previous_output.Types.vout)
+                    ) tx.Types.inputs
                   | None -> ())
-               ) tx.Types.inputs
+               end else begin
+                 List.iter (fun inp ->
+                   ibd.pending_utxo_deletes <-
+                     (inp.Types.previous_output.Types.txid,
+                      Int32.to_int inp.Types.previous_output.Types.vout)
+                     :: ibd.pending_utxo_deletes;
+                   (match ibd.utxo_set with
+                    | Some utxo ->
+                      ignore (Utxo.OptimizedUtxoSet.remove utxo
+                        inp.Types.previous_output.Types.txid
+                        (Int32.to_int inp.Types.previous_output.Types.vout))
+                    | None -> ())
+                 ) tx.Types.inputs
+               end
              end
            ) block.transactions;
            (* Update chain state *)
@@ -1523,8 +1583,12 @@ let process_downloaded_blocks (ibd : ibd_state)
            incr processed;
            (* Prune old blocks if pruning is enabled *)
            prune_old_blocks ibd.chain height;
-           (* Periodic UTXO flush *)
-           if ibd.blocks_since_flush >= utxo_flush_interval then begin
+           (* Periodic UTXO flush — by block count or dirty set size *)
+           let dirty_too_large = match ibd.utxo_set with
+             | Some utxo -> Utxo.OptimizedUtxoSet.dirty_count utxo > 2_000_000
+             | None -> false
+           in
+           if ibd.blocks_since_flush >= utxo_flush_interval || dirty_too_large then begin
              flush_utxos ibd;
              ibd.blocks_since_flush <- 0;
              (* Also update chain tip in DB *)
@@ -1750,7 +1814,7 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
                      ~flags:validation_flags ~skip_scripts
                      ~network:state.network
                      ~get_mtp_at_height:(get_mtp_for_height state) () with
-             | Ok _fees ->
+             | Ok (_fees, _txid_arr, _spent_utxos) ->
                (* Store block if not already stored *)
                if not (Storage.ChainDB.has_block state.db entry.hash) then
                  Storage.ChainDB.store_block state.db entry.hash block;
@@ -1837,9 +1901,31 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
    Main IBD Loop
    ============================================================================ *)
 
-(* Run initial block download *)
+(* Run initial block download.
+   The loop aggressively pipelines download and processing:
+   1. Fill the download queue from headers
+   2. Request blocks from all peers (parallel GetData)
+   3. Yield briefly for network I/O
+   4. Process completed blocks
+   5. Immediately refill + re-request to keep pipeline saturated
+   6. Repeat with multiple yield+process cycles per request round *)
 let run_ibd (ibd : ibd_state) (get_peers : unit -> Peer.peer list) : unit Lwt.t =
   let last_progress_log = ref (Unix.gettimeofday ()) in
+  let ibd_start_time = Unix.gettimeofday () in
+  let total_processed = ref 0 in
+  (* Helper: send requests to all active peers *)
+  let send_requests () =
+    let peers = get_peers () in
+    let active_peers = List.filter (fun p ->
+      p.Peer.state = Peer.Ready
+    ) peers in
+    Lwt.catch
+      (fun () -> request_blocks ibd active_peers)
+      (fun exn ->
+         Logs.warn (fun m ->
+           m "IBD request_blocks exception: %s" (Printexc.to_string exn));
+         Lwt.return_unit)
+  in
   let rec loop () =
     fill_download_queue ibd;
     let qlen = Queue.length ibd.block_queue in
@@ -1851,56 +1937,75 @@ let run_ibd (ibd : ibd_state) (get_peers : unit -> Peer.peer list) : unit Lwt.t 
        | Some entry ->
          Storage.ChainDB.set_chain_tip ibd.chain.db entry.hash entry.height
        | None -> ());
+      let elapsed = Unix.gettimeofday () -. ibd_start_time in
       Logs.info (fun m ->
-        m "IBD complete at height %d" ibd.chain.blocks_synced);
+        m "IBD complete at height %d (%d blocks in %.1fs, %.0f blk/s)"
+          ibd.chain.blocks_synced !total_processed elapsed
+          (float_of_int !total_processed /. elapsed));
       ibd.chain.sync_state <- FullySynced;
       Lwt.return_unit
     end else begin
-      (* Expire old orphan blocks *)
+      (* Periodic orphan expiry (cheap, runs ~once/loop) *)
       ignore (expire_orphan_blocks ibd);
-      (* Get fresh peer list each iteration *)
-      let peers = get_peers () in
-      (* Check for stalled downloads and disconnect bad peers *)
+      (* Check for stalled downloads *)
       let stalled_peers = check_stalled_downloads ibd in
-      let active_peers = List.filter (fun p ->
-        not (List.mem p.Peer.id stalled_peers)
-      ) peers in
       List.iter (fun peer_id ->
         Logs.warn (fun m ->
           m "Disconnecting peer %d after %d consecutive stalled downloads"
             peer_id max_consecutive_timeouts);
-        (* Remove peer state so it won't be scheduled again *)
         Hashtbl.remove ibd.peer_states peer_id
       ) stalled_peers;
-      let%lwt () = Lwt.catch
-        (fun () -> request_blocks ibd active_peers)
-        (fun exn ->
-           Logs.warn (fun m ->
-             m "IBD request_blocks exception: %s" (Printexc.to_string exn));
-           Lwt.return_unit) in
-      (* Short sleep to allow incoming messages *)
-      let%lwt () = Lwt_unix.sleep 0.1 in
-      (* Process any completed downloads *)
-      (match (try process_downloaded_blocks ibd with
-              | exn -> Error (Printexc.to_string exn)) with
-       | Ok n when n > 0 ->
-         last_progress_log := Unix.gettimeofday ();
-         Logs.info (fun m ->
-           m "Processed %d blocks, height now %d, in-flight: %d"
-             n ibd.chain.blocks_synced ibd.total_blocks_in_flight)
-       | Ok _ ->
-         (* Log periodic progress even when no blocks are processing *)
-         let now = Unix.gettimeofday () in
-         if now -. !last_progress_log > 30.0 then begin
-           last_progress_log := now;
-           Logs.debug (fun m ->
-             m "IBD: queue=%d in-flight=%d next_dl=%d next_proc=%d peers=%d"
-               qlen ibd.total_blocks_in_flight
-               ibd.next_download_height ibd.next_process_height
-               (List.length active_peers))
-         end
-       | Error e ->
-         Logs.err (fun m -> m "Block processing error: %s" e));
+      (* Send initial requests *)
+      let%lwt () = send_requests () in
+      (* Inner loop: yield, process, re-request.  Run multiple short cycles
+         within one outer loop iteration to keep the pipeline full without
+         the overhead of orphan expiry, stall checks, etc. *)
+      let round_processed = ref 0 in
+      let rec inner_loop rounds_left =
+        if rounds_left <= 0 then Lwt.return_unit
+        else begin
+          (* Yield to let Lwt schedule network I/O and block receipt *)
+          let%lwt () = Lwt_unix.sleep 0.001 in
+          (* Process completed blocks *)
+          match (try process_downloaded_blocks ibd with
+                 | exn -> Error (Printexc.to_string exn)) with
+          | Ok n when n > 0 ->
+            round_processed := !round_processed + n;
+            total_processed := !total_processed + n;
+            (* Refill queue and request more immediately *)
+            fill_download_queue ibd;
+            let%lwt () = send_requests () in
+            inner_loop (rounds_left - 1)
+          | Ok _ ->
+            (* No blocks ready — if we have blocks in flight, yield once more;
+               otherwise break out to outer loop for stall/orphan checks *)
+            if ibd.total_blocks_in_flight = 0 then Lwt.return_unit
+            else inner_loop (rounds_left - 1)
+          | Error e ->
+            Logs.err (fun m -> m "Block processing error: %s" e);
+            Lwt.return_unit
+        end
+      in
+      let%lwt () = inner_loop 10 in
+      (* Log progress *)
+      if !round_processed > 0 then begin
+        last_progress_log := Unix.gettimeofday ();
+        let elapsed = Unix.gettimeofday () -. ibd_start_time in
+        let rate = float_of_int !total_processed /. elapsed in
+        Logs.info (fun m ->
+          m "Processed %d blocks, height now %d, in-flight: %d (avg %.0f blk/s)"
+            !round_processed ibd.chain.blocks_synced
+            ibd.total_blocks_in_flight rate)
+      end else begin
+        let now = Unix.gettimeofday () in
+        if now -. !last_progress_log > 30.0 then begin
+          last_progress_log := now;
+          Logs.info (fun m ->
+            m "IBD stall: queue=%d in-flight=%d next_dl=%d next_proc=%d"
+              qlen ibd.total_blocks_in_flight
+              ibd.next_download_height ibd.next_process_height)
+        end
+      end;
       loop ()
     end
   in

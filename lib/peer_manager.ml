@@ -725,6 +725,68 @@ let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
     )
   end
 
+(* Force-connect a peer (for addnode RPC): bypasses outbound limit and
+   netgroup diversity checks. Still checks already-connected and banned. *)
+let force_add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
+  let open Lwt.Syntax in
+  let now = Unix.gettimeofday () in
+  if List.exists (fun p -> p.Peer.addr = addr) pm.peers then
+    Lwt.return_unit
+  else if is_banned pm addr then
+    Lwt.return_unit
+  else begin
+    let id = pm.next_peer_id in
+    pm.next_peer_id <- pm.next_peer_id + 1;
+    (match Hashtbl.find_opt pm.known_addrs addr with
+     | Some info ->
+       Hashtbl.replace pm.known_addrs addr
+         { info with last_attempt = now }
+     | None -> ());
+    Lwt.catch (fun () ->
+      let* peer = Peer.connect ~network:pm.network ~addr ~port ~id in
+      let* () = Peer.perform_handshake peer pm.our_height in
+      pm.peers <- peer :: pm.peers;
+      Hashtbl.replace pm.peer_connected_time peer.Peer.id now;
+      Hashtbl.replace pm.stale_state peer.Peer.id (create_stale_state ());
+      Hashtbl.replace pm.outbound_netgroups (netgroup_of addr) true;
+      Lwt.async (fun () -> Peer.start_trickling peer);
+      pm.start_msg_loop peer;
+      let tried_bucket = move_to_tried_table pm addr in
+      (match Hashtbl.find_opt pm.known_addrs addr with
+       | Some info ->
+         Hashtbl.replace pm.known_addrs addr
+           { info with
+             last_connected = now;
+             last_success = now;
+             failures = 0;
+             table_status = InTried tried_bucket }
+       | None ->
+         Hashtbl.replace pm.known_addrs addr
+           { address = addr;
+             port;
+             services = Peer.services_to_int64 peer.services;
+             last_connected = now;
+             last_attempt = now;
+             last_success = now;
+             failures = 0;
+             banned_until = 0.0;
+             source = Manual;
+             table_status = InTried tried_bucket });
+      Lwt.return_unit
+    ) (fun exn ->
+      Log.debug (fun m -> m "Force connect to %s:%d failed: %s"
+        addr port (Printexc.to_string exn));
+      (match Hashtbl.find_opt pm.known_addrs addr with
+       | Some info ->
+         Hashtbl.replace pm.known_addrs addr
+           { info with
+             failures = info.failures + 1;
+             last_attempt = now }
+       | None -> ());
+      Lwt.return_unit
+    )
+  end
+
 (* Connect a block-relay-only peer: same as add_peer but marks the peer
    as block_relay_only=true so it never relays transactions. *)
 let add_block_relay_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =

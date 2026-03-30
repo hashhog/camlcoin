@@ -217,6 +217,12 @@ let run (config : config) : unit Lwt.t =
     Peer_manager.start peer_manager
   in
 
+  (* Start P2P listener for inbound connections *)
+  let listener_thread =
+    Logs.info (fun m -> m "Starting P2P listener on port %d" config.p2p_port);
+    Peer_manager.start_listener peer_manager config.p2p_port
+  in
+
   (* Connect to manual peers if specified *)
   let manual_connect_thread =
     if config.connect <> [] then begin
@@ -412,6 +418,7 @@ let run (config : config) : unit Lwt.t =
      should keep running until shutdown. *)
   Lwt.async (fun () -> manual_connect_thread);
   Lwt.async (fun () -> peer_thread);
+  Lwt.async (fun () -> listener_thread);
   Lwt.async (fun () -> sync_thread);
   Lwt.join [
     rpc_thread;

@@ -2638,6 +2638,37 @@ let handle_disconnectnode (ctx : rpc_context)
   | _ ->
     Error "Invalid parameters: expected [address] or [node_id]"
 
+(* addnode - Manually connect to or disconnect from a peer *)
+let handle_addnode (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String node; `String command] ->
+    (* Parse host:port *)
+    let (host, port) =
+      match String.rindex_opt node ':' with
+      | Some idx ->
+        let h = String.sub node 0 idx in
+        let p_str = String.sub node (idx + 1) (String.length node - idx - 1) in
+        (match int_of_string_opt p_str with
+         | Some p -> (h, p)
+         | None -> (node, ctx.network.Consensus.default_port))
+      | None -> (node, ctx.network.Consensus.default_port)
+    in
+    (match command with
+     | "onetry" | "add" ->
+       Lwt.async (fun () -> Peer_manager.force_add_peer ctx.peer_manager host port);
+       Ok `Null
+     | "remove" ->
+       (match Peer_manager.find_peer_by_addr ctx.peer_manager host with
+        | Some peer ->
+          Lwt.async (fun () -> Peer_manager.remove_peer ctx.peer_manager peer.Peer.id);
+          Ok `Null
+        | None -> Ok `Null)
+     | _ -> Error ("Invalid command: " ^ command ^
+                   ". Expected \"onetry\", \"add\", or \"remove\""))
+  | _ ->
+    Error "Invalid parameters: expected [\"node\", \"command\"]"
+
 (* ============================================================================
    AssumeUTXO Handlers (loadtxoutset / dumptxoutset)
    ============================================================================ *)
@@ -2781,6 +2812,7 @@ let handle_help (_ctx : rpc_context)
       "testmempoolaccept [\"rawtx\"]";
       "";
       "== Network ==";
+      "addnode \"node\" \"add\"|\"remove\"|\"onetry\"";
       "clearbanned";
       "disconnectnode \"address\"";
       "getconnectioncount";
@@ -2932,6 +2964,10 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_disconnectnode ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
+  | "addnode" ->
+    (match handle_addnode ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_invalid_params, msg))
 
   (* Mempool *)
   | "getmempoolinfo" ->

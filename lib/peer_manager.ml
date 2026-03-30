@@ -1686,8 +1686,10 @@ let accept_inbound (pm : t) (client_fd : Lwt_unix.file_descr)
       Hashtbl.replace pm.stale_state peer.Peer.id (create_stale_state ());
       (* Start inventory trickling for this peer *)
       Lwt.async (fun () -> Peer.start_trickling peer);
-      (* Start the message loop for this inbound peer *)
-      Lwt.async (fun () -> peer_message_loop pm peer);
+      (* Start the message loop via the callback.  Before
+         enable_message_loops this is a no-op, so sync_headers can
+         read from the socket without a concurrent reader. *)
+      pm.start_msg_loop peer;
       Lwt.return_unit
     ) (fun exn ->
       (* Handshake failed — log the reason and clean up *)

@@ -2,7 +2,8 @@
  (name camlcoin)
  (public_name camlcoin)
  (libraries cstruct cstruct-unix lwt lwt.unix unix bigstring bigstringaf
-            base64 cohttp-lwt-unix yojson digestif mirage-crypto cmdliner
+            base64 cohttp-lwt-unix yojson digestif mirage-crypto
+            mirage-crypto-rng mirage-crypto-rng.unix cmdliner
             logs logs.fmt fmt fmt.tty secp256k1-internal)
  (foreign_stubs
   (language c)

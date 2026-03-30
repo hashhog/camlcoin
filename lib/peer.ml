@@ -506,6 +506,11 @@ let perform_handshake_inner (peer : peer) (our_height : int32) : unit Lwt.t =
   (* Request headers announcements instead of inv (BIP-130) *)
   let* () = send_message peer P2p.SendheadersMsg in
   peer.state <- Ready;
+  (* Reset last_ping so the message loop does not immediately fire a ping.
+     Without this, last_ping=0.0 triggers needs_ping on the first iteration,
+     and the 30-second read timeout causes the 20-second ping_timed_out check
+     to disconnect the peer before the pong can be read. *)
+  peer.last_ping <- Unix.gettimeofday ();
   Lwt.return_unit
 
 (* Perform the version/verack handshake for OUTBOUND connections.
@@ -554,6 +559,7 @@ let perform_inbound_handshake_inner (peer : peer) (our_height : int32) : unit Lw
   (* Post-handshake feature negotiation *)
   let* () = send_message peer P2p.SendheadersMsg in
   peer.state <- Ready;
+  peer.last_ping <- Unix.gettimeofday ();
   Lwt.return_unit
 
 (* Perform the version/verack handshake for INBOUND connections.

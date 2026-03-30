@@ -1097,6 +1097,9 @@ let mine_single_block (ctx : rpc_context) (payout_script : Cstruct.t)
     | Error msg -> Error msg
     | Ok () ->
       let hash = Crypto.compute_block_hash block.header in
+      (* Announce the new block to all connected peers *)
+      Lwt.async (fun () ->
+        Peer_manager.announce_block ctx.peer_manager block.header hash);
       Ok hash
 
 (* generate nblocks [maxtries]

@@ -271,6 +271,30 @@ let run (config : config) : unit Lwt.t =
          Lwt.return_unit
        | _ -> Lwt.return_unit));
 
+  (* Register a listener for getdata requests so peers can fetch blocks
+     we have mined or stored (e.g. after receiving our inv announcement). *)
+  Peer_manager.add_listener peer_manager (fun msg peer ->
+    match msg with
+    | P2p.GetdataMsg items ->
+      let lookup_block hash =
+        match Storage.ChainDB.get_block db hash with
+        | None -> None
+        | Some block ->
+          let w = Serialize.writer_create () in
+          Serialize.serialize_block w block;
+          Some (Serialize.writer_to_cstruct w)
+      in
+      let lookup_tx hash =
+        match Mempool.get mempool hash with
+        | None -> None
+        | Some entry ->
+          let w = Serialize.writer_create () in
+          Serialize.serialize_transaction w entry.Mempool.tx;
+          Some (Serialize.writer_to_cstruct w)
+      in
+      Peer.handle_getdata peer items ~lookup_block ~lookup_tx
+    | _ -> Lwt.return_unit);
+
   (* Dynamic peer getter so IBD always sees the latest connected peers *)
   let get_peers () = Peer_manager.get_ready_peers peer_manager in
 

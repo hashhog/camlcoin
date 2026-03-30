@@ -513,6 +513,13 @@ let run (config : config) : unit Lwt.t =
     graceful_shutdown ()
   in
 
+  (* Prevent uncaught Lwt.async exceptions from crashing the process.
+     Protocol errors from peers are handled per-connection, but if one
+     propagates here, just log it. *)
+  Lwt.async_exception_hook := (fun exn ->
+    Printf.eprintf "[WARNING] Uncaught async exception: %s\n%!" (Printexc.to_string exn)
+  );
+
   (* Run all services concurrently.  Several of the service threads
      (peer_thread, sync_thread, manual_connect_thread) complete quickly after
      initial setup – they must NOT cause the node to exit.  We use Lwt.async

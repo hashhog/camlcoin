@@ -199,6 +199,27 @@ let run (config : config) : unit Lwt.t =
       Lwt.wakeup_later shutdown_wakener ()
     end) in
 
+  (* Generate cookie credentials and write .cookie file *)
+  let cookie_password =
+    Mirage_crypto_rng_unix.use_default ();
+    let raw = Mirage_crypto_rng_unix.getrandom 32 in
+    let hex = String.concat "" (
+      List.init (String.length raw) (fun i ->
+        Printf.sprintf "%02x" (Char.code raw.[i]))) in
+    let cookie_path = Filename.concat config.data_dir ".cookie" in
+    (try
+      let fd = Unix.openfile cookie_path
+        [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC] 0o600 in
+      let content = "__cookie__:" ^ hex in
+      let _ = Unix.write_substring fd content 0 (String.length content) in
+      Unix.close fd;
+      Logs.info (fun m -> m "Wrote RPC cookie to %s" cookie_path)
+    with exn ->
+      Logs.warn (fun m ->
+        m "Failed to write RPC cookie file: %s" (Printexc.to_string exn)));
+    hex
+  in
+
   (* Start RPC server *)
   let rpc_thread =
     Logs.info (fun m ->
@@ -209,6 +230,7 @@ let run (config : config) : unit Lwt.t =
       ~port:config.rpc_port
       ~rpc_user:config.rpc_user
       ~rpc_password:config.rpc_password
+      ~cookie_password:(Some cookie_password)
   in
 
   (* Start peer manager *)
@@ -418,10 +440,13 @@ let run (config : config) : unit Lwt.t =
                Lwt.async (fun () -> Peer_manager.ban_peer peer_manager peer_id ()))
           | None -> ()
         in
-        Sync.start_ibd ~utxo_set:optimized_utxo
+        let* () = Sync.start_ibd ~utxo_set:optimized_utxo
           ~misbehavior_handler
           ~on_ibd_created:(fun ibd -> ibd_state_ref := Some ibd)
-          chain get_peers
+          chain get_peers in
+        (* Clear IBD state so post-IBD listeners take over *)
+        ibd_state_ref := None;
+        Lwt.return_unit
       end else
         Lwt.return_unit
   in

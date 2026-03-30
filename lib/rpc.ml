@@ -3215,6 +3215,7 @@ let context_with_wallet (ctx : rpc_context) (wallet_name : string option) : rpc_
 let start_rpc_server ~(ctx : rpc_context)
     ~(host : string) ~(port : int)
     ~(rpc_user : string) ~(rpc_password : string)
+    ~(cookie_password : string option)
     : unit Lwt.t =
   let open Lwt.Syntax in
 
@@ -3222,9 +3223,15 @@ let start_rpc_server ~(ctx : rpc_context)
     match Cohttp.Header.get headers "authorization" with
     | None -> false
     | Some auth ->
-      let expected = "Basic " ^
+      let expected_user = "Basic " ^
         Base64.encode_string (rpc_user ^ ":" ^ rpc_password) in
-      String.equal auth expected
+      if String.equal auth expected_user then true
+      else match cookie_password with
+        | None -> false
+        | Some cp ->
+          let expected_cookie = "Basic " ^
+            Base64.encode_string ("__cookie__:" ^ cp) in
+          String.equal auth expected_cookie
   in
 
   let callback _conn req body =

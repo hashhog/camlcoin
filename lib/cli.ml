@@ -295,6 +295,84 @@ let run (config : config) : unit Lwt.t =
       Peer.handle_getdata peer items ~lookup_block ~lookup_tx
     | _ -> Lwt.return_unit);
 
+  (* Register a listener for inv messages: when a peer announces a new block
+     via inv, request it with getdata so we can connect it to our chain. *)
+  Peer_manager.add_listener peer_manager (fun msg peer ->
+    match msg with
+    | P2p.InvMsg items ->
+      let block_hashes = List.filter_map (fun (iv : P2p.inv_vector) ->
+        if iv.inv_type = P2p.InvBlock
+           && not (Storage.ChainDB.has_block db iv.hash) then
+          Some { P2p.inv_type = P2p.InvBlock; hash = iv.hash }
+        else
+          None
+      ) items in
+      if block_hashes <> [] then
+        Peer.send_message peer (P2p.GetdataMsg block_hashes)
+      else
+        Lwt.return_unit
+    | _ -> Lwt.return_unit);
+
+  (* Register a listener for getheaders: respond with headers from our chain
+     so peers can sync from us. *)
+  Peer_manager.add_listener peer_manager (fun msg peer ->
+    match msg with
+    | P2p.GetheadersMsg { locator_hashes; hash_stop; _ } ->
+      let headers = Sync.handle_getheaders_request chain
+          locator_hashes hash_stop in
+      if headers <> [] then
+        Peer.send_message peer (P2p.HeadersMsg headers)
+      else
+        Lwt.return_unit
+    | _ -> Lwt.return_unit);
+
+  (* Register a listener for headers received post-IBD.  When new headers
+     arrive and extend our chain, process them and request the blocks. *)
+  Peer_manager.add_listener peer_manager (fun msg peer ->
+    match msg with
+    | P2p.HeadersMsg headers when chain.sync_state = Sync.FullySynced ->
+      (match Sync.process_headers chain headers with
+       | Ok n when n > 0 ->
+         (* We accepted new headers - request the corresponding blocks *)
+         let tip_height = match chain.tip with
+           | Some t -> t.height | None -> 0 in
+         let start_h = tip_height - n + 1 in
+         let block_requests = ref [] in
+         for h = start_h to tip_height do
+           match Sync.get_header_at_height chain h with
+           | Some entry ->
+             if not (Storage.ChainDB.has_block db entry.hash) then
+               block_requests :=
+                 { P2p.inv_type = P2p.InvBlock; hash = entry.hash }
+                 :: !block_requests
+           | None -> ()
+         done;
+         if !block_requests <> [] then
+           Peer.send_message peer (P2p.GetdataMsg (List.rev !block_requests))
+         else
+           Lwt.return_unit
+       | _ -> Lwt.return_unit)
+    | _ -> Lwt.return_unit);
+
+  (* Register a listener for blocks received post-IBD (when ibd_state is None).
+     This handles unsolicited blocks and blocks requested via inv/getdata. *)
+  Peer_manager.add_listener peer_manager (fun msg _peer ->
+    match msg with
+    | P2p.BlockMsg block when !ibd_state_ref = None
+                              && chain.sync_state = Sync.FullySynced ->
+      let hash = Crypto.compute_block_hash block.Types.header in
+      (match Sync.process_new_block chain block with
+       | Ok () ->
+         (* Announce the block to other peers if it advanced the tip *)
+         Lwt.async (fun () ->
+           Peer_manager.announce_block peer_manager block.Types.header hash);
+         Lwt.return_unit
+       | Error e ->
+         Logs.debug (fun m ->
+           m "Post-IBD block rejected: %s" e);
+         Lwt.return_unit)
+    | _ -> Lwt.return_unit);
+
   (* Dynamic peer getter so IBD always sees the latest connected peers *)
   let get_peers () = Peer_manager.get_ready_peers peer_manager in
 

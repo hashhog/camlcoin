@@ -1465,8 +1465,17 @@ let peer_message_loop (pm : t) (peer : Peer.peer) : unit Lwt.t =
               | _ -> ());
              loop ())
       ) (fun exn ->
-        (* Connection error *)
-        let _ = exn in
+        (* Connection error — log and disconnect the peer gracefully *)
+        (match exn with
+         | Peer.Peer_protocol_error msg ->
+           Log.warn (fun m -> m "Protocol error from peer %d (%s): %s"
+             peer.Peer.id peer.Peer.addr msg)
+         | End_of_file ->
+           Log.info (fun m -> m "Peer %d (%s) disconnected"
+             peer.Peer.id peer.Peer.addr)
+         | exn ->
+           Log.warn (fun m -> m "Error from peer %d (%s): %s"
+             peer.Peer.id peer.Peer.addr (Printexc.to_string exn)));
         remove_peer pm peer.id
       )
     end
@@ -1680,8 +1689,16 @@ let accept_inbound (pm : t) (client_fd : Lwt_unix.file_descr)
       (* Start the message loop for this inbound peer *)
       Lwt.async (fun () -> peer_message_loop pm peer);
       Lwt.return_unit
-    ) (fun _exn ->
-      (* Handshake failed, clean up *)
+    ) (fun exn ->
+      (* Handshake failed — log the reason and clean up *)
+      (match exn with
+       | Peer.Peer_protocol_error msg ->
+         Log.warn (fun m -> m "Handshake failed for %s:%d: %s" addr_str port msg)
+       | Failure msg ->
+         Log.info (fun m -> m "Handshake failed for %s:%d: %s" addr_str port msg)
+       | exn ->
+         Log.info (fun m -> m "Handshake failed for %s:%d: %s"
+           addr_str port (Printexc.to_string exn)));
       Lwt.catch
         (fun () -> Lwt_unix.close client_fd)
         (fun _ -> Lwt.return_unit)

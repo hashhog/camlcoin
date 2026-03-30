@@ -3,6 +3,9 @@
 let log_src = Logs.Src.create "PEER" ~doc:"Peer connection"
 module Log = (val Logs.src_log log_src : Logs.LOG)
 
+(* Protocol-level error that should disconnect the peer, not crash the node *)
+exception Peer_protocol_error of string
+
 (* Peer connection states *)
 type peer_state =
   | Connecting
@@ -275,11 +278,14 @@ let read_message (peer : peer) : P2p.message_payload Lwt.t =
     let (magic, _cmd, length, expected_checksum) =
       P2p.deserialize_message_header r in
     (* Verify network magic *)
-    if magic <> peer.network.magic then
-      Lwt.fail_with (Printf.sprintf "Bad network magic: expected 0x%08lx, got 0x%08lx"
-        peer.network.magic magic)
+    if magic <> peer.network.magic then begin
+      let msg = Printf.sprintf "Bad network magic: expected 0x%08lx, got 0x%08lx"
+        peer.network.magic magic in
+      Log.warn (fun m -> m "[%s:%d] %s — disconnecting peer" peer.addr peer.port msg);
+      Lwt.fail (Peer_protocol_error msg)
+    end
     else if length > P2p.max_message_size then
-      Lwt.fail_with (Printf.sprintf "Message too large: %d bytes" length)
+      Lwt.fail (Peer_protocol_error (Printf.sprintf "Message too large: %d bytes" length))
     else begin
       (* Read payload *)
       let payload_buf = Bytes.create length in
@@ -292,7 +298,7 @@ let read_message (peer : peer) : P2p.message_payload Lwt.t =
       let actual_checksum =
         Cstruct.sub (Crypto.sha256d payload_cs) 0 4 in
       if not (Cstruct.equal expected_checksum actual_checksum) then
-        Lwt.fail_with "Bad message checksum"
+        Lwt.fail (Peer_protocol_error "Bad message checksum")
       else begin
         (* Update statistics *)
         peer.bytes_received <-

@@ -2046,6 +2046,156 @@ let start_ibd ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
   end
 
 (* ============================================================================
+   Post-IBD Block Processing
+   ============================================================================ *)
+
+(* Process a single new block received after IBD is complete (e.g. from an inv
+   announcement or unsolicited push).  Validates the block against the current
+   UTXO set and, on success, stores it and advances the chain tip.
+   Returns Ok () on success or Error msg on failure. *)
+let process_new_block (state : chain_state) (block : Types.block)
+    : (unit, string) result =
+  let hash = Crypto.compute_block_hash block.header in
+  let hash_key = Cstruct.to_string hash in
+  (* Ignore blocks we already have *)
+  if Storage.ChainDB.has_block state.db hash then
+    Ok ()
+  else begin
+    (* The block's header must already be known (via headers-first sync). If
+       not, accept the header first so we know the height. *)
+    let header_entry = match Hashtbl.find_opt state.headers hash_key with
+      | Some e -> Some e
+      | None ->
+        (* Try to accept the header on the fly *)
+        (match validate_header state block.header with
+         | Ok entry -> accept_header state entry; Some entry
+         | Error _ -> None)
+    in
+    match header_entry with
+    | None ->
+      Error "Unknown header and failed to validate"
+    | Some entry ->
+      let height = entry.height in
+      (* Only connect blocks that extend the current tip *)
+      let connects_to_tip = match state.tip with
+        | None -> height = 0
+        | Some tip -> height = tip.height + 1
+                      && Cstruct.equal block.header.prev_block tip.hash
+      in
+      if not connects_to_tip then begin
+        Logs.debug (fun m ->
+          m "Received block %s at height %d does not extend tip, storing"
+            (Types.hash256_to_hex_display hash) height);
+        (* Store block data for later use but don't connect *)
+        Storage.ChainDB.store_block state.db hash block;
+        Ok ()
+      end else begin
+        let expected_bits = compute_expected_bits state height block.header in
+        let median_time = compute_median_time_past state height in
+        let lookup outpoint =
+          let vout = Int32.to_int outpoint.Types.vout in
+          match Storage.ChainDB.get_utxo state.db outpoint.Types.txid vout with
+          | None -> None
+          | Some data ->
+            let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+            let value = Serialize.read_int64_le r in
+            let script_len = Serialize.read_compact_size r in
+            let script = Serialize.read_bytes r script_len in
+            let stored_height = Int32.to_int (Serialize.read_int32_le r) in
+            let utxo_is_coinbase = Serialize.read_uint8 r = 1 in
+            Some Validation.{
+              txid = outpoint.Types.txid;
+              vout = outpoint.Types.vout;
+              value;
+              script_pubkey = script;
+              height = stored_height;
+              is_coinbase = utxo_is_coinbase;
+            }
+        in
+        let validation_flags =
+          Consensus.get_block_script_flags height state.network
+        in
+        match Validation.validate_block_with_utxos block height
+                ~expected_bits ~median_time ~base_lookup:lookup
+                ~flags:validation_flags ~skip_scripts:false
+                ~network:state.network
+                ~get_mtp_at_height:(get_mtp_for_height state) () with
+        | Ok (_fees, txid_arr, _spent_utxos) ->
+          (* Store the block *)
+          Storage.ChainDB.store_block state.db hash block;
+          (* Update UTXOs: remove spent, add created *)
+          List.iteri (fun tx_idx tx ->
+            let is_cb = (tx_idx = 0) in
+            let txid = if tx_idx < Array.length txid_arr
+                       then txid_arr.(tx_idx)
+                       else Crypto.compute_txid tx in
+            if not is_cb then
+              List.iter (fun inp ->
+                let prev = inp.Types.previous_output in
+                Storage.ChainDB.delete_utxo state.db
+                  prev.Types.txid (Int32.to_int prev.Types.vout)
+              ) tx.Types.inputs;
+            List.iteri (fun vout out ->
+              let data = encode_utxo out.Types.value out.Types.script_pubkey
+                  height is_cb in
+              Storage.ChainDB.store_utxo state.db txid vout data
+            ) tx.Types.outputs
+          ) block.transactions;
+          (* Advance the chain tip *)
+          state.blocks_synced <- height;
+          state.tip <- Some entry;
+          Storage.ChainDB.set_chain_tip state.db hash height;
+          Storage.ChainDB.set_header_tip state.db hash height;
+          Logs.info (fun m ->
+            m "Connected new block %s at height %d"
+              (Types.hash256_to_hex_display hash) height);
+          Ok ()
+        | Error e ->
+          let msg = Validation.block_error_to_string e in
+          Logs.warn (fun m ->
+            m "Block %s at height %d failed validation: %s"
+              (Types.hash256_to_hex_display hash) height msg);
+          Error msg
+      end
+  end
+
+(* Respond to a getheaders request from a peer.  Finds the fork point using
+   the locator hashes, then returns up to 2000 headers from that point. *)
+let handle_getheaders_request (state : chain_state)
+    (locator_hashes : Types.hash256 list)
+    (hash_stop : Types.hash256) : Types.block_header list =
+  (* Find the fork point: walk the locator looking for a hash we know *)
+  let tip_height = match state.tip with
+    | Some t -> t.height | None -> 0 in
+  let fork_height =
+    let found = ref (-1) in
+    List.iter (fun loc_hash ->
+      if !found < 0 then
+        let key = Cstruct.to_string loc_hash in
+        match Hashtbl.find_opt state.headers key with
+        | Some entry -> found := entry.height
+        | None -> ()
+    ) locator_hashes;
+    if !found >= 0 then !found else 0
+  in
+  (* Collect up to 2000 headers starting after the fork point *)
+  let stop_key = Cstruct.to_string hash_stop in
+  let zero_stop = (Cstruct.length hash_stop >= 32
+                   && Cstruct.for_all (fun b -> b = '\x00') hash_stop) in
+  let result = ref [] in
+  let h = ref (fork_height + 1) in
+  while !h <= tip_height && List.length !result < 2000 do
+    (match get_header_at_height state !h with
+     | Some entry ->
+       result := entry.header :: !result;
+       if not zero_stop && Cstruct.to_string entry.hash = stop_key then
+         h := tip_height + 1  (* break *)
+     | None -> ());
+    incr h
+  done;
+  List.rev !result
+
+(* ============================================================================
    Mempool Request Handler
    ============================================================================ *)
 

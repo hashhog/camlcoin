@@ -141,6 +141,7 @@ type peer = {
   inv_queue : inv_entry Queue.t;     (* Pending tx inventory to announce *)
   mutable next_inv_send : float;     (* Next time to flush inv queue *)
   mutable trickling_active : bool;   (* Whether the trickle timer is running *)
+  mutable pending_read : P2p.message_payload Lwt.t option;  (* In-flight read to prevent concurrent reads *)
 }
 
 (* Generate random bytes from /dev/urandom *)
@@ -223,6 +224,7 @@ let make_peer ~(network : Consensus.network_config) ~(addr : string)
     inv_queue = Queue.create ();
     next_inv_send = Unix.gettimeofday () +. poisson_delay avg_interval;
     trickling_active = false;
+    pending_read = None;
   }
 
 (* Establish TCP connection to a peer with timeout *)
@@ -312,17 +314,40 @@ let read_message (peer : peer) : P2p.message_payload Lwt.t =
     end
   end
 
-(* Read a message with timeout *)
+(* Read a message with timeout.
+   Uses a pending_read slot to avoid starting concurrent reads on the same
+   Lwt_io channel.  When a timeout fires, the in-flight (Lwt.no_cancel)
+   read is kept in pending_read so the next call reuses it instead of
+   creating a second reader — which would interleave bytes and cause
+   stream misalignment ("bad magic bytes"). *)
 let read_message_with_timeout (peer : peer) (timeout_sec : float)
     : P2p.message_payload option Lwt.t =
   let open Lwt.Syntax in
+  (* Reuse an existing in-flight read, or start a fresh one *)
+  let read_promise = match peer.pending_read with
+    | Some p -> p
+    | None ->
+      let p = read_message peer in
+      peer.pending_read <- Some p;
+      p
+  in
   let timeout =
     let* () = Lwt_unix.sleep timeout_sec in
-    Lwt.return None in
+    Lwt.return `Timeout in
   let read =
-    let* msg = read_message peer in
-    Lwt.return (Some msg) in
-  Lwt.pick [read; timeout]
+    let* msg = read_promise in
+    Lwt.return (`Msg msg) in
+  (* Lwt.choose does NOT cancel the loser, so the read keeps running *)
+  let* result = Lwt.choose [read; timeout] in
+  match result with
+  | `Msg msg ->
+    (* Read completed — clear the pending slot *)
+    peer.pending_read <- None;
+    Lwt.return (Some msg)
+  | `Timeout ->
+    (* Timeout fired but the read is still in flight in pending_read;
+       it will be reused on the next call *)
+    Lwt.return None
 
 (* Send a message to the peer *)
 let send_message (peer : peer)

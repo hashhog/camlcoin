@@ -1592,7 +1592,10 @@ let process_downloaded_blocks (ibd : ibd_state)
              flush_utxos ibd;
              ibd.blocks_since_flush <- 0;
              (* Also update chain tip in DB *)
-             Storage.ChainDB.set_chain_tip ibd.chain.db entry.hash height
+             Storage.ChainDB.set_chain_tip ibd.chain.db entry.hash height;
+             (* Force GC compaction to release memory back to OS.
+                OCaml's major heap doesn't shrink without Gc.compact. *)
+             Gc.compact ()
            end;
            (* Notify ZMQ subscribers about block connect *)
            zmq_notify_block ibd block entry.hash true;

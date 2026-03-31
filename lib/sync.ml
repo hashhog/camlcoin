@@ -1585,7 +1585,7 @@ let process_downloaded_blocks (ibd : ibd_state)
            prune_old_blocks ibd.chain height;
            (* Periodic UTXO flush — by block count or dirty set size *)
            let dirty_too_large = match ibd.utxo_set with
-             | Some utxo -> Utxo.OptimizedUtxoSet.dirty_count utxo > 500_000
+             | Some utxo -> Utxo.OptimizedUtxoSet.dirty_count utxo > 50_000
              | None -> false
            in
            if ibd.blocks_since_flush >= utxo_flush_interval || dirty_too_large then begin

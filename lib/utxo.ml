@@ -72,26 +72,15 @@ module UtxoSet = struct
   (* Get a UTXO entry, checking cache first then database *)
   let get (t : t) (txid : Types.hash256) (vout : int)
       : utxo_entry option =
-    let key = utxo_key txid vout in
-    match Hashtbl.find_opt t.cache key with
-    | Some entry ->
-      t.cache_hits <- t.cache_hits + 1;
-      Some entry
-    | None ->
-      t.cache_misses <- t.cache_misses + 1;
-      match Storage.ChainDB.get_utxo t.db txid vout with
-      | None -> None
-      | Some data ->
-        let r = Serialize.reader_of_cstruct
-          (Cstruct.of_string data) in
-        let entry = deserialize_utxo_entry r in
-        (* Bound the cache: evict all entries when it exceeds 10K.
-           This is a read-through cache over the DB — entries are
-           always available from disk, so eviction is safe. *)
-        if Hashtbl.length t.cache > 10_000 then
-          Hashtbl.clear t.cache;
-        Hashtbl.replace t.cache key entry;
-        Some entry
+    (* Direct DB read — no in-process caching.  RocksDB's own block
+       cache handles hot-path reads. Eliminating the OCaml-side cache
+       prevents unbounded GC heap growth. *)
+    match Storage.ChainDB.get_utxo t.db txid vout with
+    | None -> None
+    | Some data ->
+      let r = Serialize.reader_of_cstruct
+        (Cstruct.of_string data) in
+      Some (deserialize_utxo_entry r)
 
   (* Add a UTXO entry to both cache and database (write-through) *)
   let add (t : t) (txid : Types.hash256) (vout : int)
@@ -460,7 +449,7 @@ module OptimizedUtxoSet = struct
     mutable stats : Perf.utxo_cache_stats;
   }
 
-  let create ?(cache_size=50_000) ?rocksdb db = {
+  let create ?(cache_size=0) ?rocksdb db = {
     db;
     rocksdb;
     cache = Perf.LRU.create cache_size;

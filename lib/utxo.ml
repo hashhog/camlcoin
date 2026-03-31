@@ -455,7 +455,7 @@ module OptimizedUtxoSet = struct
     mutable stats : Perf.utxo_cache_stats;
   }
 
-  let create ?(cache_size=500_000) ?rocksdb db = {
+  let create ?(cache_size=50_000) ?rocksdb db = {
     db;
     rocksdb;
     cache = Perf.LRU.create cache_size;

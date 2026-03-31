@@ -85,6 +85,11 @@ module UtxoSet = struct
         let r = Serialize.reader_of_cstruct
           (Cstruct.of_string data) in
         let entry = deserialize_utxo_entry r in
+        (* Bound the cache: evict all entries when it exceeds 10K.
+           This is a read-through cache over the DB — entries are
+           always available from disk, so eviction is safe. *)
+        if Hashtbl.length t.cache > 10_000 then
+          Hashtbl.clear t.cache;
         Hashtbl.replace t.cache key entry;
         Some entry
 

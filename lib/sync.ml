@@ -114,7 +114,7 @@ let headers_download_timeout = 900.0  (* 15 min total for header download *)
 let headers_response_timeout = 120.0  (* 2 min per header response *)
 
 (* Per-peer header flood threshold *)
-let max_headers_per_peer = 10_000     (* Disconnect if peer sends this many with insufficient work *)
+let max_headers_per_peer = 2_000_000  (* Allow full mainnet header sync from a single peer *)
 
 (* PRESYNC/REDOWNLOAD constants *)
 let max_headers_per_message = 2000    (* Protocol limit on headers per message *)
@@ -549,6 +549,8 @@ let process_headers (state : chain_state)
     Error "Header flood: too many headers with insufficient chain work"
   else begin
     let accepted = ref 0 in
+    let rejected = ref 0 in
+    let first_error = ref None in
     let error = ref None in
     List.iter (fun header ->
       if !error = None then
@@ -557,10 +559,15 @@ let process_headers (state : chain_state)
           accept_header state entry;
           incr accepted
         | Error "Header already known" ->
-          ()  (* Skip duplicates silently *)
+          incr rejected
         | Error e ->
+          if !first_error = None then first_error := Some e;
           error := Some e
     ) headers;
+    if !rejected > 0 && !accepted = 0 then
+      Logs.warn (fun m -> m "All %d headers rejected (%d known, first_err=%s)"
+        (List.length headers) !rejected
+        (match !first_error with Some e -> e | None -> "none"));
     match !error with
     | Some e when !accepted = 0 -> Error e
     | _ -> Ok !accepted
@@ -610,6 +617,17 @@ let get_header_at_height (state : chain_state) (height : int)
 (* Request headers from a peer, starting from our current tip *)
 let request_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
   let locator = build_locator state in
+  (match locator with
+   | first :: _ ->
+     Logs.info (fun m -> m "Sending getheaders with %d locators, first=%s (tip=%d)"
+       (List.length locator)
+       (let buf = Buffer.create 64 in
+        for i = 0 to min 15 (Cstruct.length first - 1) do
+          Buffer.add_string buf (Printf.sprintf "%02x" (Cstruct.get_uint8 first i))
+        done;
+        Buffer.contents buf)
+       state.headers_synced)
+   | [] -> Logs.info (fun m -> m "Sending getheaders with empty locator"));
   Peer.send_message peer
     (P2p.GetheadersMsg {
       version = Types.protocol_version;

@@ -416,13 +416,24 @@ let run (config : config) : unit Lwt.t =
         | peer :: _ -> Lwt.return_some peer
       end
     in
-    let* first_peer = wait_for_peer 0 in
-    match first_peer with
-    | None -> Lwt.return_unit
-    | Some peer ->
-      Logs.info (fun m ->
-        m "Starting header sync with peer %d" peer.Peer.id);
-      let* () = Sync.sync_headers chain peer in
+    (* Retry header sync up to 10 times if it fails *)
+    let rec try_header_sync retries =
+      let* first_peer = wait_for_peer 0 in
+      match first_peer with
+      | None -> Lwt.return_unit
+      | Some peer ->
+        Logs.info (fun m ->
+          m "Starting header sync with peer %d (attempt %d)" peer.Peer.id (11 - retries));
+        let* () = Sync.sync_headers chain peer in
+        if chain.sync_state = Sync.Idle && retries > 0 then begin
+          Logs.warn (fun m -> m "Header sync failed, retrying in 10s (%d retries left)" retries);
+          let* () = Lwt_unix.sleep 10.0 in
+          try_header_sync (retries - 1)
+        end else
+          Lwt.return_unit
+    in
+    let* () = try_header_sync 10 in
+    let _ = () in
       (* Header sync is done. Now enable message loops for all peers so
          that incoming BlockMsg / NotfoundMsg are read and passed to the
          listener. This must happen AFTER sync_headers because it reads

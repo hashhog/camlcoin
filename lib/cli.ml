@@ -435,7 +435,7 @@ let run (config : config) : unit Lwt.t =
         end else
           Lwt.return_unit
     in
-    let* () = try_header_sync 1000 in
+    let* () = try_header_sync max_int in
     let _ = () in
       (* Header sync is done. Now enable message loops for all peers so
          that incoming BlockMsg / NotfoundMsg are read and passed to the

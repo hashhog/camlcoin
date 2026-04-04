@@ -625,7 +625,7 @@ let request_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
      Logs.info (fun m -> m "Sending getheaders with %d locators, first=%s (tip=%d)"
        (List.length locator)
        (let buf = Buffer.create 64 in
-        for i = 0 to min 15 (Cstruct.length first - 1) do
+        for i = 0 to Cstruct.length first - 1 do
           Buffer.add_string buf (Printf.sprintf "%02x" (Cstruct.get_uint8 first i))
         done;
         Buffer.contents buf)

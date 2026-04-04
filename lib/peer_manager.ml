@@ -206,6 +206,7 @@ type t = {
   (* Stale peer eviction state *)
   stale_state : (int, stale_peer_state) Hashtbl.t;  (* peer_id -> stale tracking state *)
   mutable stale_check_running : bool;               (* Whether the 45s check timer is running *)
+  mutable header_sync_active : bool;                (* Suppress stale getheaders during header sync *)
   (* Mempool for feefilter (BIP-133) *)
   mutable mempool : Mempool.mempool option;         (* Mempool for min_relay_fee *)
   (* BIP 152: High-bandwidth compact block relay (up to 3 peers) *)
@@ -250,6 +251,7 @@ let create ?(config = default_config) (network : Consensus.network_config) : t =
     outbound_netgroups = Hashtbl.create 16;
     stale_state = Hashtbl.create 64;
     stale_check_running = false;
+    header_sync_active = false;
     start_msg_loop = (fun _peer -> ());
     mempool = None;
     hb_compact_peers = [];
@@ -269,6 +271,9 @@ let set_db (pm : t) (db : Storage.ChainDB.t) : unit =
 (* Get current blockchain height *)
 let get_height (pm : t) : int32 =
   pm.our_height
+
+let set_header_sync_active (pm : t) (active : bool) : unit =
+  pm.header_sync_active <- active
 
 (* Notify that the chain tip has been updated *)
 let notify_tip_updated (pm : t) : unit =
@@ -1035,6 +1040,10 @@ let check_headers_timeout (pm : t) (peer : Peer.peer) ~(now : float) : string op
 
 (** Check if we need to send getheaders challenge to a peer *)
 let needs_getheaders_challenge (pm : t) (peer_id : int) : bool =
+  (* Suppress stale-tip getheaders during active header sync to avoid
+     competing requests that confuse the sync loop *)
+  if pm.header_sync_active then false
+  else
   match Hashtbl.find_opt pm.stale_state peer_id with
   | Some state ->
     (match state.chain_sync with

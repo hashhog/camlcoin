@@ -424,7 +424,9 @@ let run (config : config) : unit Lwt.t =
       | Some peer ->
         Logs.info (fun m ->
           m "Starting header sync with peer %d (attempt %d)" peer.Peer.id (11 - retries));
+        Peer_manager.set_header_sync_active peer_manager true;
         let* () = Sync.sync_headers chain peer in
+        Peer_manager.set_header_sync_active peer_manager false;
         if chain.sync_state = Sync.Idle && retries > 0 then begin
           Logs.warn (fun m -> m "Header sync failed, retrying in 10s (%d retries left)" retries);
           let* () = Lwt_unix.sleep 10.0 in

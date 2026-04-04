@@ -1342,6 +1342,10 @@ let build_locator (db : Storage.ChainDB.t) (tip_height : int) : Types.hash256 li
 (** Check all peers for staleness and disconnect stale ones.
     Returns list of (peer_id, reason) for peers that were disconnected. *)
 let check_stale_peers (pm : t) : (int * string) list Lwt.t =
+  (* Completely skip stale checks during header sync to prevent competing
+     getheaders that confuse the sync loop *)
+  if pm.header_sync_active then Lwt.return []
+  else
   let open Lwt.Syntax in
   let now = Unix.gettimeofday () in
   let disconnected = ref [] in
@@ -1493,6 +1497,8 @@ let peer_message_loop (pm : t) (peer : Peer.peer) : unit Lwt.t =
 
 (* Check for stale chain tip and take corrective action *)
 let check_stale_tip (pm : t) : unit Lwt.t =
+  if pm.header_sync_active then Lwt.return_unit
+  else
   let open Lwt.Syntax in
   let now = Unix.gettimeofday () in
   let time_since_update = now -. pm.last_tip_update in

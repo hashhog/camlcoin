@@ -564,10 +564,13 @@ let process_headers (state : chain_state)
           if !first_error = None then first_error := Some e;
           error := Some e
     ) headers;
-    if !rejected > 0 && !accepted = 0 then
+    if !rejected > 0 && !accepted = 0 then begin
       Logs.warn (fun m -> m "All %d headers rejected (%d known, first_err=%s)"
         (List.length headers) !rejected
         (match !first_error with Some e -> e | None -> "none"));
+      Logs.warn (fun m -> m "All %d headers were duplicates, locator may be stale"
+        (List.length headers))
+    end;
     match !error with
     | Some e when !accepted = 0 -> Error e
     | _ -> Ok !accepted
@@ -704,9 +707,16 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
     | Ok accepted ->
       Logs.info (fun m -> m "Accepted %d headers, tip at height %d"
         accepted state.headers_synced);
-      if count = P2p.max_headers_count then
-        (* Peer may have more headers, continue requesting *)
-        loop_fn ()
+      if count = P2p.max_headers_count then begin
+        if accepted = 0 then begin
+          (* Peer keeps sending same headers — try a different peer *)
+          Logs.warn (fun m -> m "Peer sent %d duplicate headers, switching peers" count);
+          state.sync_state <- Idle;
+          Lwt.return_unit
+        end else
+          (* Peer may have more headers, continue requesting *)
+          loop_fn ()
+      end
       else begin
         (* Got fewer than max, we're caught up with this peer.
            Verify tip work >= minimum_chain_work before transitioning

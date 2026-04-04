@@ -359,9 +359,7 @@ let send_message (peer : peer)
    | P2p.GetheadersMsg _ ->
      let hex = Buffer.create 200 in
      String.iter (fun c -> Buffer.add_string hex (Printf.sprintf "%02x" (Char.code c))) data_str;
-     let bt = Printexc.get_callstack 5 in
-     let bt_str = Printexc.raw_backtrace_to_string bt in
-     Logs.info (fun m -> m "RAW getheaders bytes (%d) [peer %d] bt=%s: %s" (String.length data_str) peer.id bt_str (Buffer.contents hex))
+     Logs.debug (fun m -> m "RAW getheaders bytes (%d): %s" (String.length data_str) (Buffer.contents hex))
    | _ -> ());
   let* () = Lwt_io.write_from_string_exactly peer.oc
     data_str 0 (String.length data_str) in

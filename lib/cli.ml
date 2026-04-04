@@ -427,6 +427,7 @@ let run (config : config) : unit Lwt.t =
         Peer_manager.set_header_sync_active peer_manager true;
         let* () = Sync.sync_headers chain peer in
         Peer_manager.set_header_sync_active peer_manager false;
+        Peer_manager.set_height peer_manager (Int32.of_int chain.headers_synced);
         if chain.sync_state = Sync.Idle && retries > 0 then begin
           Logs.warn (fun m -> m "Header sync failed, retrying in 10s (%d retries left)" retries);
           let* () = Lwt_unix.sleep 10.0 in
@@ -434,7 +435,7 @@ let run (config : config) : unit Lwt.t =
         end else
           Lwt.return_unit
     in
-    let* () = try_header_sync 10 in
+    let* () = try_header_sync 1000 in
     let _ = () in
       (* Header sync is done. Now enable message loops for all peers so
          that incoming BlockMsg / NotfoundMsg are read and passed to the

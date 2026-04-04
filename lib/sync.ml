@@ -646,87 +646,116 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
   state.sync_state <- SyncingHeaders;
   state.sync_peer <- Some peer.id;
   let sync_start_time = Unix.gettimeofday () in
-  (* Send FIRST getheaders before entering the loop *)
-  let* () = request_headers state peer in
-  let rec loop () =
-    (* Check total header download timeout *)
+
+  (* Helper: check if a headers batch contains any NEW headers *)
+  let has_new_headers headers =
+    List.exists (fun hdr ->
+      let hash = Crypto.compute_block_hash hdr in
+      not (Hashtbl.mem state.headers (Cstruct.to_string hash))
+    ) headers
+  in
+
+  (* Helper: read one message, handling ping/pong and non-header messages.
+     Returns `Some headers` for a HeadersMsg, or `None` on timeout. *)
+  let rec read_next_headers () =
+    let* msg_opt = Peer.read_message_with_timeout peer headers_response_timeout in
+    match msg_opt with
+    | None -> Lwt.return_none
+    | Some (P2p.HeadersMsg headers) -> Lwt.return_some headers
+    | Some (P2p.PingMsg nonce) ->
+      let* () = Peer.send_message peer (P2p.PongMsg nonce) in
+      read_next_headers ()
+    | Some _msg ->
+      read_next_headers ()
+  in
+
+  (* Read the next FRESH headers response, skipping stale responses where
+     all headers are already known (leftover from previously queued
+     getheaders replies).  Does NOT send a new getheaders — only reads. *)
+  let rec drain_stale_responses stale_count =
+    if stale_count >= 10 then begin
+      Logs.warn (fun m -> m "Peer %d: %d stale responses, switching peers"
+        peer.id stale_count);
+      Lwt.return_none
+    end else begin
+      let* headers_opt = read_next_headers () in
+      match headers_opt with
+      | None -> Lwt.return_none
+      | Some headers ->
+        let count = List.length headers in
+        if count > 0 && not (has_new_headers headers) then begin
+          Logs.info (fun m ->
+            m "Skipped stale response (%d known headers, %d skipped so far)"
+              count (stale_count + 1));
+          drain_stale_responses (stale_count + 1)
+        end else
+          Lwt.return_some headers
+    end
+  in
+
+  (* Main sync iteration: send getheaders, drain stale responses,
+     process fresh headers, repeat. *)
+  let rec sync_iteration () =
     let elapsed = Unix.gettimeofday () -. sync_start_time in
     if elapsed > headers_download_timeout then begin
-      Logs.err (fun m ->
-        m "Header sync timed out after %.0fs (limit: %.0fs)"
-          elapsed headers_download_timeout);
+      Logs.err (fun m -> m "Header sync timed out after %.0fs" elapsed);
       state.sync_state <- Idle;
       Lwt.return_unit
     end else begin
-      (* Read the response to the PREVIOUS getheaders. Don't send a new one
-         yet — that causes multiple pending responses from the peer. *)
-      let* msg_opt = Peer.read_message_with_timeout peer headers_response_timeout in
-      match msg_opt with
+      let* () = request_headers state peer in
+      let* headers_opt = drain_stale_responses 0 in
+      match headers_opt with
       | None ->
-        Logs.err (fun m ->
-          m "Header sync: no response from peer %d within %.0fs"
-            peer.id headers_response_timeout);
+        Logs.warn (fun m -> m "Header sync: timeout or too many stale responses from peer %d" peer.id);
         state.sync_state <- Idle;
         Lwt.return_unit
-      | Some (P2p.HeadersMsg headers) ->
+      | Some headers ->
         let count = List.length headers in
-        Logs.info (fun m -> m "Received %d headers" count);
-        (* Track per-peer header count for flood detection *)
-        let prev_count =
-          match Hashtbl.find_opt state.headers_from_peer peer.id with
-          | Some c -> c
-          | None -> 0
-        in
-        let new_count = prev_count + count in
-        Hashtbl.replace state.headers_from_peer peer.id new_count;
-        (* Per-peer header flood check: if peer has sent > max_headers_per_peer
-           headers and total chain work is still below minimum, disconnect *)
-        if new_count > max_headers_per_peer then begin
-          let tip_work = match state.tip with
-            | Some t -> t.total_work
-            | None -> Consensus.zero_work
-          in
-          if Consensus.work_compare tip_work
-               state.network.minimum_chain_work < 0 then begin
-            Logs.warn (fun m ->
-              m "Peer %d sent %d headers with insufficient chain work, \
-                 disconnecting (header flood)" peer.id new_count);
-            state.sync_state <- Idle;
-            Lwt.return_unit
-          end else
-            process_and_continue state headers count loop
-        end else
-          process_and_continue state headers count loop
-      | Some (P2p.PingMsg nonce) ->
-        let* () = Peer.send_message peer (P2p.PongMsg nonce) in
-        loop ()
-      | Some msg ->
-        Logs.debug (fun m -> m "Non-header message during header sync: %s"
-          (P2p.command_to_string (P2p.payload_to_command msg)));
-        loop ()
+        Logs.info (fun m -> m "Received %d headers (%d new)"
+          count (List.length (List.filter (fun hdr ->
+            let hash = Crypto.compute_block_hash hdr in
+            not (Hashtbl.mem state.headers (Cstruct.to_string hash))
+          ) headers)));
+        process_and_continue state headers count
     end
-  and process_and_continue state headers count loop_fn =
-    Logs.info (fun m -> m "process_and_continue: processing %d headers" count);
+
+  and process_and_continue state headers count =
+    (* Track per-peer header count for flood detection *)
+    let prev_count =
+      match Hashtbl.find_opt state.headers_from_peer peer.id with
+      | Some c -> c | None -> 0 in
+    let new_count = prev_count + (List.length headers) in
+    Hashtbl.replace state.headers_from_peer peer.id new_count;
+    if new_count > max_headers_per_peer then begin
+      let tip_work = match state.tip with
+        | Some t -> t.total_work | None -> Consensus.zero_work in
+      if Consensus.work_compare tip_work
+           state.network.minimum_chain_work < 0 then begin
+        Logs.warn (fun m ->
+          m "Peer %d sent %d headers with insufficient chain work, \
+             disconnecting (header flood)" peer.id new_count);
+        state.sync_state <- Idle;
+        Lwt.return_unit
+      end else
+        process_headers_and_continue state headers count
+    end else
+      process_headers_and_continue state headers count
+  and process_headers_and_continue state headers count =
     match process_headers state headers with
     | Ok accepted ->
       Logs.info (fun m -> m "Accepted %d headers, tip at height %d"
         accepted state.headers_synced);
       if count = P2p.max_headers_count then begin
         if accepted = 0 then begin
-          (* Peer keeps sending same headers — try a different peer *)
-          Logs.warn (fun m -> m "Peer sent %d duplicate headers, switching peers" count);
-          state.sync_state <- Idle;
-          Lwt.return_unit
-        end else begin
-          (* Peer may have more headers — send next getheaders then loop *)
-          let* () = request_headers state peer in
-          loop_fn ()
-        end
+          Logs.warn (fun m -> m "Full batch but 0 accepted, retrying");
+          sync_iteration ()
+        end else
+          (* More headers available — continue *)
+          sync_iteration ()
       end
       else begin
-        (* Got fewer than max, we're caught up with this peer.
-           Verify tip work >= minimum_chain_work before transitioning
-           to block sync (nMinimumChainWork check). *)
+        (* Got fewer than max — peer's tip reached.
+           Check minimum_chain_work before transitioning to block sync. *)
         let tip_work = match state.tip with
           | Some t -> t.total_work
           | None -> Consensus.zero_work
@@ -748,7 +777,7 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
       state.sync_state <- Idle;
       Lwt.return_unit
   in
-  loop ()
+  sync_iteration ()
 
 (* Start header sync with peer (non-blocking) *)
 let start_header_sync (state : chain_state) (peer : Peer.peer) : unit Lwt.t =

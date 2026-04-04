@@ -646,6 +646,8 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
   state.sync_state <- SyncingHeaders;
   state.sync_peer <- Some peer.id;
   let sync_start_time = Unix.gettimeofday () in
+  (* Send FIRST getheaders before entering the loop *)
+  let* () = request_headers state peer in
   let rec loop () =
     (* Check total header download timeout *)
     let elapsed = Unix.gettimeofday () -. sync_start_time in
@@ -656,30 +658,9 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
       state.sync_state <- Idle;
       Lwt.return_unit
     end else begin
-      let* () = request_headers state peer in
-      (* Read responses, skipping any stale HeadersMsg where ALL headers
-         are already known (leftover from a previous getheaders). *)
-      let rec read_fresh_response attempts =
-        if attempts <= 0 then Lwt.return_none
-        else
-        let* msg_opt = Peer.read_message_with_timeout peer headers_response_timeout in
-        match msg_opt with
-        | Some (P2p.HeadersMsg headers) ->
-          (* Check if this is a stale response (all duplicates) *)
-          let any_new = List.exists (fun hdr ->
-            let hash = Crypto.compute_block_hash hdr in
-            not (Hashtbl.mem state.headers (Cstruct.to_string hash))
-          ) headers in
-          if any_new || List.length headers = 0 then
-            Lwt.return (Some (P2p.HeadersMsg headers))
-          else begin
-            Logs.info (fun m -> m "Skipped stale headers response (%d all-known headers)"
-              (List.length headers));
-            read_fresh_response (attempts - 1)
-          end
-        | other -> Lwt.return other
-      in
-      let* msg_opt = read_fresh_response 5 in
+      (* Read the response to the PREVIOUS getheaders. Don't send a new one
+         yet — that causes multiple pending responses from the peer. *)
+      let* msg_opt = Peer.read_message_with_timeout peer headers_response_timeout in
       match msg_opt with
       | None ->
         Logs.err (fun m ->
@@ -725,6 +706,7 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
         loop ()
     end
   and process_and_continue state headers count loop_fn =
+    Logs.info (fun m -> m "process_and_continue: processing %d headers" count);
     match process_headers state headers with
     | Ok accepted ->
       Logs.info (fun m -> m "Accepted %d headers, tip at height %d"
@@ -735,9 +717,11 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
           Logs.warn (fun m -> m "Peer sent %d duplicate headers, switching peers" count);
           state.sync_state <- Idle;
           Lwt.return_unit
-        end else
-          (* Peer may have more headers, continue requesting *)
+        end else begin
+          (* Peer may have more headers — send next getheaders then loop *)
+          let* () = request_headers state peer in
           loop_fn ()
+        end
       end
       else begin
         (* Got fewer than max, we're caught up with this peer.

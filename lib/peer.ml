@@ -355,6 +355,14 @@ let send_message (peer : peer)
   let open Lwt.Syntax in
   let data = P2p.serialize_message peer.network.magic payload in
   let data_str = Cstruct.to_string data in
+  (match payload with
+   | P2p.GetheadersMsg _ ->
+     let hex = Buffer.create 200 in
+     String.iter (fun c -> Buffer.add_string hex (Printf.sprintf "%02x" (Char.code c))) data_str;
+     let bt = Printexc.get_callstack 5 in
+     let bt_str = Printexc.raw_backtrace_to_string bt in
+     Logs.info (fun m -> m "RAW getheaders bytes (%d) [peer %d] bt=%s: %s" (String.length data_str) peer.id bt_str (Buffer.contents hex))
+   | _ -> ());
   let* () = Lwt_io.write_from_string_exactly peer.oc
     data_str 0 (String.length data_str) in
   let* () = Lwt_io.flush peer.oc in

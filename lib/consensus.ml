@@ -455,10 +455,10 @@ let mainnet : network_config = {
   (* From Bitcoin Core chainparams.cpp (approximately block 804000) *)
   minimum_chain_work = work_of_hex
     "000000000000000000000000000000000000000052b2559353df4117b7348b64";
-  (* Mainnet assumevalid — block 804000 in internal LE byte order.
-     Display hash: 00000000000000000002a7c4c1e48d76c5a37902165a270156b7a8d72f8571c4 *)
+  (* Mainnet assumevalid — block 938343 in internal LE byte order.
+     Display hash: 00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac *)
   assume_valid_hash = Some (Types.hash256_of_hex
-    "c471852fd7a8b75601275a160279a3c5768de4c1c4a702000000000000000000");
+    "aca51bd5fa4b098e477c171ddcdcd894914dd7d6ebcc00000000000000000000");
   checkpoints = [
     (11111, Types.hash256_of_hex "1d7c6eb2fd42f55925e92efad68b61edd22fba29fde8783df744e26900000000");
     (33333, Types.hash256_of_hex "a6d0b5df7d0df069ceb1e736a216ad187a50b07aaa4e78748a58d52d00000000");
@@ -688,10 +688,22 @@ let script_verify_nullfail              = 1 lsl 12  (* BIP-146 *)
 let script_verify_witness_pubkeytype    = 1 lsl 14  (* BIP-141 compressed keys *)
 let script_verify_taproot               = 1 lsl 17  (* BIP-341/342 *)
 
-(* Compute the correct script verification flags for a given block height *)
-let get_block_script_flags (height : int) (network : network_config) : int =
-  (* P2SH is always on (BIP-16 activated at height 173805 on mainnet,
-     but we treat it as always-on for simplicity) *)
+(* Compute the correct script verification flags for a given block height.
+   Bitcoin Core has script_flag_exceptions for specific blocks where script
+   rules are relaxed (e.g., the BIP16 exception at block 170060 on mainnet). *)
+let get_block_script_flags ?(block_hash="") (height : int) (network : network_config) : int =
+  (* Check script_flag_exceptions: block 170060 on mainnet was mined before
+     BIP16 P2SH enforcement but contains a tx that fails P2SH validation.
+     Bitcoin Core skips ALL script flags for this block. *)
+  let is_bip16_exception =
+    height = 170060 && (
+      block_hash = "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"
+      || block_hash = ""  (* If hash not provided, use height-only check on mainnet *)
+    ) && network.name = "mainnet"
+  in
+  if is_bip16_exception then 0
+  else
+  (* P2SH active for all other blocks *)
   let flags = script_verify_p2sh in
   (* BIP-66: strict DER signatures *)
   let flags =

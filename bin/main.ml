@@ -79,18 +79,71 @@ let benchmark_arg =
   let doc = "Run performance benchmarks and exit." in
   Arg.(value & flag & info ["benchmark"] ~doc)
 
+let import_blocks_arg =
+  let doc = "Import blocks from file (use '-' for stdin). Bypasses P2P entirely." in
+  Arg.(value & opt (some string) None &
+    info ["import-blocks"] ~docv:"PATH" ~doc)
+
 (* ============================================================================
    Main Command
    ============================================================================ *)
 
 let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
-    p2p_port max_outbound max_inbound connect debug no_wallet prune benchmark =
+    p2p_port max_outbound max_inbound connect debug no_wallet prune benchmark
+    import_blocks =
   (* If benchmark flag is set, run benchmarks and exit *)
   if benchmark then begin
     Camlcoin.Cli.setup_logging debug ();
     Camlcoin.Perf.run_benchmarks ();
     ()
-  end else begin
+  end else match import_blocks with
+  | Some import_path ->
+    (* Block import mode: bypass P2P entirely *)
+    Camlcoin.Cli.setup_logging debug ();
+    let base = Camlcoin.Cli.config_for_network network in
+    let data_dir = match datadir with
+      | Some d -> d
+      | None -> base.data_dir in
+    (try Unix.mkdir data_dir 0o755
+     with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+    let network_cfg = match network with
+      | `Mainnet -> Camlcoin.Consensus.mainnet
+      | `Testnet -> Camlcoin.Consensus.testnet4
+      | `Regtest -> Camlcoin.Consensus.regtest
+    in
+    let db_path = Filename.concat data_dir "chainstate" in
+    let db = Camlcoin.Storage.ChainDB.create db_path in
+    let chain = Camlcoin.Sync.restore_chain_state db network_cfg in
+    let rocksdb_path = Filename.concat data_dir "rocksdb_utxo" in
+    let rocksdb = Camlcoin.Rocksdb_store.open_db rocksdb_path in
+    (* Consistency check: reset blocks_synced if RocksDB was wiped *)
+    if chain.blocks_synced > 0 then begin
+      match Camlcoin.Rocksdb_store.get_tip_height rocksdb with
+      | None ->
+        Printf.eprintf "WARNING: RocksDB has no tip height but chain_tip=%d — resetting to 0\n%!"
+          chain.blocks_synced;
+        chain.blocks_synced <- 0;
+        Camlcoin.Storage.ChainDB.set_chain_tip db (Cstruct.create 32) 0
+      | Some rdb_h when rdb_h < chain.blocks_synced ->
+        Printf.eprintf "WARNING: RocksDB tip (%d) < chain_tip (%d) — resetting\n%!"
+          rdb_h chain.blocks_synced;
+        chain.blocks_synced <- rdb_h
+      | Some _ -> ()
+    end;
+    let utxo = Camlcoin.Utxo.OptimizedUtxoSet.create
+      ~cache_size:2_000_000 ~rocksdb db in
+    let ic = if import_path = "-" then stdin
+             else open_in_bin import_path in
+    Printf.eprintf "CamlCoin import: reading blocks from %s\n%!"
+      (if import_path = "-" then "stdin" else import_path);
+    let count = Camlcoin.Block_import.run ~ic ~db ~chain
+      ~network:network_cfg ~utxo () in
+    if import_path <> "-" then close_in ic;
+    Camlcoin.Rocksdb_store.close rocksdb;
+    Camlcoin.Storage.ChainDB.close db;
+    Printf.eprintf "Done: imported %d blocks\n%!" count
+  | None ->
+  begin
     let base = Camlcoin.Cli.config_for_network network in
     let config : Camlcoin.Cli.config = {
       network;
@@ -154,7 +207,8 @@ let cmd =
     $ debug_arg
     $ no_wallet_arg
     $ prune_arg
-    $ benchmark_arg)
+    $ benchmark_arg
+    $ import_blocks_arg)
 
 (* ============================================================================
    Entry Point

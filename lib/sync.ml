@@ -669,11 +669,52 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
       read_next_headers ()
   in
 
+  (* Non-blocking read: returns immediately if no message is available.
+     Used to drain leftover stale responses without blocking. *)
+  let read_next_headers_nonblocking () =
+    let* msg_opt = Peer.read_message_with_timeout peer 0.1 in
+    match msg_opt with
+    | None -> Lwt.return_none
+    | Some (P2p.HeadersMsg headers) -> Lwt.return_some headers
+    | Some (P2p.PingMsg nonce) ->
+      let* () = Peer.send_message peer (P2p.PongMsg nonce) in
+      Lwt.return_none
+    | Some _msg ->
+      Lwt.return_none
+  in
+
+  (* Drain any stale headers responses already queued on the socket from
+     previous sync attempts.  Uses a very short timeout so it returns
+     quickly once the queue is empty. *)
+  let rec drain_queued_stale count =
+    let* opt = read_next_headers_nonblocking () in
+    match opt with
+    | None -> begin
+      if count > 0 then
+        Logs.info (fun m -> m "Pre-drained %d stale header responses from socket" count);
+      Lwt.return_unit
+    end
+    | Some headers ->
+      if has_new_headers headers then begin
+        (* Oops — this is actually fresh.  Process it immediately. *)
+        if count > 0 then
+          Logs.info (fun m -> m "Pre-drained %d stale responses, found fresh batch" count);
+        let _r = process_headers state headers in
+        drain_queued_stale count
+      end else begin
+        Logs.debug (fun m -> m "Pre-drain: discarded stale response (%d headers)" (List.length headers));
+        drain_queued_stale (count + 1)
+      end
+  in
+
+  (* Drain stale responses from previous getheaders before we start. *)
+  let* () = drain_queued_stale 0 in
+
   (* Read the next FRESH headers response, skipping stale responses where
      all headers are already known (leftover from previously queued
      getheaders replies).  Does NOT send a new getheaders — only reads. *)
   let rec drain_stale_responses stale_count =
-    if stale_count >= 10 then begin
+    if stale_count >= 50 then begin
       Logs.warn (fun m -> m "Peer %d: %d stale responses, switching peers"
         peer.id stale_count);
       Lwt.return_none
@@ -693,8 +734,14 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
     end
   in
 
-  (* Main sync iteration: send getheaders, drain stale responses,
-     process fresh headers, repeat. *)
+  (* Track how many getheaders we have sent without receiving a corresponding
+     fresh response.  Each send increments the counter; each fresh response
+     resets it to 0.  We only send a NEW getheaders when the counter is 0,
+     otherwise we just drain queued responses from earlier sends. *)
+  let pending_getheaders = ref 0 in
+
+  (* Main sync iteration: send getheaders (if none pending), drain stale
+     responses, process fresh headers, repeat. *)
   let rec sync_iteration () =
     let elapsed = Unix.gettimeofday () -. sync_start_time in
     if elapsed > headers_download_timeout then begin
@@ -702,14 +749,27 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
       state.sync_state <- Idle;
       Lwt.return_unit
     end else begin
-      let* () = request_headers state peer in
+      (* Only send a new getheaders if we have no outstanding request *)
+      let* () =
+        if !pending_getheaders = 0 then begin
+          pending_getheaders := 1;
+          request_headers state peer
+        end else
+          Lwt.return_unit
+      in
       let* headers_opt = drain_stale_responses 0 in
       match headers_opt with
       | None ->
         Logs.warn (fun m -> m "Header sync: timeout or too many stale responses from peer %d" peer.id);
+        (* Reset pending counter — peer did not respond, so the outstanding
+           request is effectively dead. *)
+        pending_getheaders := 0;
         state.sync_state <- Idle;
         Lwt.return_unit
       | Some headers ->
+        (* Got a fresh response — clear the pending counter so the next
+           iteration will send a new getheaders. *)
+        pending_getheaders := 0;
         let count = List.length headers in
         Logs.info (fun m -> m "Received %d headers (%d new)"
           count (List.length (List.filter (fun hdr ->
@@ -747,7 +807,9 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
         accepted state.headers_synced);
       if count = P2p.max_headers_count then begin
         if accepted = 0 then begin
-          Logs.warn (fun m -> m "Full batch but 0 accepted, retrying");
+          Logs.warn (fun m -> m "Full batch but 0 accepted, likely stale — will send fresh getheaders");
+          (* Don't loop immediately — the next sync_iteration will send a new
+             getheaders with the current (possibly updated) locator. *)
           sync_iteration ()
         end else
           (* More headers available — continue *)
@@ -1292,9 +1354,12 @@ let flush_utxos (ibd : ibd_state) : unit =
     ibd.pending_utxo_deletes <- [];
     Logs.debug (fun m -> m "Flushed UTXO updates to disk")
   end;
-  (* Also flush the OptimizedUtxoSet dirty entries if one is attached *)
+  (* Also flush the OptimizedUtxoSet dirty entries if one is attached.
+     Pass the current blocks_synced height so RocksDB records it for
+     consistency checking on restart. *)
   match ibd.utxo_set with
-  | Some utxo -> Utxo.OptimizedUtxoSet.flush utxo
+  | Some utxo ->
+    Utxo.OptimizedUtxoSet.flush ~tip_height:ibd.chain.blocks_synced utxo
   | None -> ()
 
 (* Encode UTXO data for storage *)

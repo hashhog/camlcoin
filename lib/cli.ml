@@ -123,9 +123,32 @@ let run (config : config) : unit Lwt.t =
   let rocksdb = Rocksdb_store.open_db rocksdb_path in
   Logs.info (fun m -> m "Opened RocksDB UTXO store at %s" rocksdb_path);
 
+  (* Consistency check: detect when RocksDB was wiped but chainstate still
+     has a non-zero chain_tip.  Without this, the node would skip blocks
+     whose UTXO outputs are missing from the fresh RocksDB, causing
+     "transaction references missing inputs" errors (e.g. at block 16226). *)
+  if chain.blocks_synced > 0 then begin
+    match Rocksdb_store.get_tip_height rocksdb with
+    | None ->
+      Logs.warn (fun m ->
+        m "RocksDB UTXO store has no tip height but chainstate claims blocks_synced=%d — resetting to 0 (UTXO store was likely wiped)"
+          chain.blocks_synced);
+      chain.blocks_synced <- 0;
+      Storage.ChainDB.set_chain_tip db
+        (Cstruct.create 32) 0
+    | Some rdb_height when rdb_height < chain.blocks_synced ->
+      Logs.warn (fun m ->
+        m "RocksDB UTXO tip (%d) is behind chainstate chain_tip (%d) — resetting to RocksDB tip"
+          rdb_height chain.blocks_synced);
+      chain.blocks_synced <- rdb_height
+    | Some _ -> ()  (* Consistent — proceed normally *)
+  end;
+
   (* Optimized UTXO set for IBD – dirty entries are flushed periodically
      during block download and must be flushed on shutdown to avoid loss. *)
-  let optimized_utxo = Utxo.OptimizedUtxoSet.create ~rocksdb db in
+  (* LRU cache of 2M entries (~600MB) avoids hammering RocksDB during IBD.
+     Without this, every UTXO lookup during block validation is a disk read. *)
+  let optimized_utxo = Utxo.OptimizedUtxoSet.create ~cache_size:2_000_000 ~rocksdb db in
 
   (* Initialize mempool *)
   let current_height = match chain.tip with
@@ -416,26 +439,27 @@ let run (config : config) : unit Lwt.t =
         | peer :: _ -> Lwt.return_some peer
       end
     in
-    (* Retry header sync up to 10 times if it fails *)
-    let rec try_header_sync retries =
+    (* Retry header sync with unlimited attempts until headers are fully synced.
+       Uses a monotonically increasing attempt counter for logging. *)
+    let rec try_header_sync attempt =
       let* first_peer = wait_for_peer 0 in
       match first_peer with
       | None -> Lwt.return_unit
       | Some peer ->
         Logs.info (fun m ->
-          m "Starting header sync with peer %d (attempt %d)" peer.Peer.id (11 - retries));
+          m "Starting header sync with peer %d (attempt %d)" peer.Peer.id attempt);
         Peer_manager.set_header_sync_active peer_manager true;
         let* () = Sync.sync_headers chain peer in
         Peer_manager.set_header_sync_active peer_manager false;
         Peer_manager.set_height peer_manager (Int32.of_int chain.headers_synced);
-        if chain.sync_state = Sync.Idle && retries > 0 then begin
-          Logs.warn (fun m -> m "Header sync failed, retrying in 10s (%d retries left)" retries);
+        if chain.sync_state = Sync.Idle then begin
+          Logs.warn (fun m -> m "Header sync failed, retrying in 10s (attempt %d)" attempt);
           let* () = Lwt_unix.sleep 10.0 in
-          try_header_sync (retries - 1)
+          try_header_sync (attempt + 1)
         end else
           Lwt.return_unit
     in
-    let* () = try_header_sync max_int in
+    let* () = try_header_sync 1 in
     let _ = () in
       (* Header sync is done. Now enable message loops for all peers so
          that incoming BlockMsg / NotfoundMsg are read and passed to the
@@ -526,7 +550,7 @@ let run (config : config) : unit Lwt.t =
     let dirty = Utxo.OptimizedUtxoSet.dirty_count optimized_utxo in
     if dirty > 0 then begin
       Logs.info (fun m -> m "Flushing %d dirty UTXO entries to disk" dirty);
-      Utxo.OptimizedUtxoSet.flush optimized_utxo;
+      Utxo.OptimizedUtxoSet.flush ~tip_height:chain.blocks_synced optimized_utxo;
       (* Also update chain_tip to match blocks_synced so that on restart
          the node resumes from the correct height (matching the flushed
          UTXO state rather than the last periodic flush point). *)

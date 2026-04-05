@@ -45,7 +45,14 @@ let read_int64_le r =
 
 let read_bytes r n =
   check_remaining r n;
-  let cs = Cstruct.sub r.buf r.pos n in
+  (* IMPORTANT: Copy the slice instead of creating a Cstruct.sub view.
+     Cstruct.sub shares the backing Bigarray, so a small sub-view (e.g. a
+     22-byte script_pubkey) would keep the entire deserialization buffer
+     alive.  During IBD this caused the UTXO LRU cache to pin one full
+     block buffer per cached entry, growing RSS to 28 GB+.  Copying breaks
+     the reference and lets the GC free the block buffer promptly. *)
+  let cs = Cstruct.create n in
+  Cstruct.blit r.buf r.pos cs 0 n;
   r.pos <- r.pos + n;
   cs
 

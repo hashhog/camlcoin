@@ -28,3 +28,6 @@ module Assume_utxo = Assume_utxo
 module Zmq_notify = Zmq_notify
 module Zmq_socket = Zmq_socket
 module Sig_cache = Sig_cache
+module Rocksdb = Rocksdb
+module Rocksdb_store = Rocksdb_store
+module Block_import = Block_import

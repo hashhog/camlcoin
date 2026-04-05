@@ -577,10 +577,12 @@ module OptimizedUtxoSet = struct
 
   (* Flush all dirty entries to disk in a single atomic batch transaction.
      This writes all Added entries and deletes all Removed entries, then
-     clears the dirty set. *)
-  let flush (t : t) : unit =
+     clears the dirty set.
+     When [tip_height] is provided, also stores it in RocksDB so that
+     startup can detect a chainstate / UTXO store mismatch. *)
+  let flush ?(tip_height : int option) (t : t) : unit =
     let count = Hashtbl.length t.dirty in
-    if count > 0 then begin
+    if count > 0 || tip_height <> None then begin
       (match t.rocksdb with
        | Some rdb ->
          (* RocksDB path: atomic batch write using raw 36-byte keys *)
@@ -593,7 +595,13 @@ module OptimizedUtxoSet = struct
            | `Removed ->
              (key, None) :: acc
          ) t.dirty [] in
-         Rocksdb_store.batch_write rdb ops
+         Rocksdb_store.batch_write rdb ops;
+         (* Persist the tip height inside RocksDB so we can detect
+            inconsistencies on restart (e.g. RocksDB wiped but chainstate
+            still has a non-zero chain_tip). *)
+         (match tip_height with
+          | Some h -> Rocksdb_store.set_tip_height rdb h
+          | None -> ())
        | None ->
          (* Legacy LogStorage path *)
          let batch = Storage.ChainDB.batch_create () in
@@ -612,7 +620,8 @@ module OptimizedUtxoSet = struct
          ) t.dirty;
          Storage.ChainDB.batch_write t.db batch);
       Hashtbl.clear t.dirty;
-      Logs.debug (fun m -> m "Flushed %d dirty UTXO entries to disk" count)
+      if count > 0 then
+        Logs.debug (fun m -> m "Flushed %d dirty UTXO entries to disk" count)
     end
 
   (* Get the number of pending dirty entries *)

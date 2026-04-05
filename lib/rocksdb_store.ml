@@ -42,3 +42,29 @@ let batch_write (t : t) (ops : (string * string option) list) : unit =
   ) ops;
   Rocksdb.write_batch_write t.db wb;
   Rocksdb.write_batch_destroy wb
+
+(* Metadata key prefix — uses a prefix that cannot collide with
+   the 36-byte outpoint keys (which are raw binary). *)
+let meta_key k = "__meta__" ^ k
+
+(* Store the UTXO tip height so we can detect inconsistency with
+   the chainstate's chain_tip on startup. *)
+let set_tip_height (t : t) (height : int) : unit =
+  let buf = Bytes.create 4 in
+  Bytes.set buf 0 (Char.chr (height land 0xff));
+  Bytes.set buf 1 (Char.chr ((height lsr 8) land 0xff));
+  Bytes.set buf 2 (Char.chr ((height lsr 16) land 0xff));
+  Bytes.set buf 3 (Char.chr ((height lsr 24) land 0xff));
+  Rocksdb.put t.db (meta_key "tip_height") (Bytes.unsafe_to_string buf)
+
+let get_tip_height (t : t) : int option =
+  match Rocksdb.get t.db (meta_key "tip_height") with
+  | None -> None
+  | Some s ->
+    if String.length s < 4 then None
+    else
+      let b0 = Char.code (String.get s 0) in
+      let b1 = Char.code (String.get s 1) in
+      let b2 = Char.code (String.get s 2) in
+      let b3 = Char.code (String.get s 3) in
+      Some (b0 lor (b1 lsl 8) lor (b2 lsl 16) lor (b3 lsl 24))

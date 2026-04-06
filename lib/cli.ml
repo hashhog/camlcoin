@@ -146,9 +146,9 @@ let run (config : config) : unit Lwt.t =
 
   (* Optimized UTXO set for IBD – dirty entries are flushed periodically
      during block download and must be flushed on shutdown to avoid loss. *)
-  (* LRU cache of 2M entries (~600MB) avoids hammering RocksDB during IBD.
+  (* LRU cache of 8M entries (~2GB) avoids hammering RocksDB during IBD.
      Without this, every UTXO lookup during block validation is a disk read. *)
-  let optimized_utxo = Utxo.OptimizedUtxoSet.create ~cache_size:2_000_000 ~rocksdb db in
+  let optimized_utxo = Utxo.OptimizedUtxoSet.create ~cache_size:8_000_000 ~rocksdb db in
 
   (* Initialize mempool *)
   let current_height = match chain.tip with

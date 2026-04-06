@@ -7,8 +7,8 @@ type t = {
 }
 
 (* Open (or create) a RocksDB database at [path].
-   Tuning: 64 MB write buffer, 256 MB block cache, 10-bit bloom filter. *)
-let open_db ?(write_buffer_mb=64) ?(block_cache_mb=256) ?(bloom_bits=10)
+   Tuning: 64 MB write buffer, 512 MB block cache, 10-bit bloom filter. *)
+let open_db ?(write_buffer_mb=64) ?(block_cache_mb=512) ?(bloom_bits=10)
     (path : string) : t =
   (* Ensure parent directory exists *)
   (try Unix.mkdir path 0o755
@@ -31,21 +31,35 @@ let put (t : t) (key : string) (value : string) : unit =
 let delete (t : t) (key : string) : unit =
   Rocksdb.delete t.db key
 
+(* Metadata key prefix — uses a prefix that cannot collide with
+   the 36-byte outpoint keys (which are raw binary). *)
+let meta_key k = "__meta__" ^ k
+
 (* Atomic batch write.  Each element is (key, value_opt) where
-   None means delete and Some v means put. *)
-let batch_write (t : t) (ops : (string * string option) list) : unit =
+   None means delete and Some v means put.
+   When [tip_height] is provided it is included in the SAME WriteBatch
+   so that UTXO mutations and the recorded tip are always consistent. *)
+let batch_write ?(tip_height : int option) (t : t)
+    (ops : (string * string option) list) : unit =
   let wb = Rocksdb.write_batch_create () in
   List.iter (fun (key, v_opt) ->
     match v_opt with
     | Some v -> Rocksdb.write_batch_put wb key v
     | None   -> Rocksdb.write_batch_delete wb key
   ) ops;
+  (* Include tip_height in the same atomic batch *)
+  (match tip_height with
+   | Some h ->
+     let buf = Bytes.create 4 in
+     Bytes.set buf 0 (Char.chr (h land 0xff));
+     Bytes.set buf 1 (Char.chr ((h lsr 8) land 0xff));
+     Bytes.set buf 2 (Char.chr ((h lsr 16) land 0xff));
+     Bytes.set buf 3 (Char.chr ((h lsr 24) land 0xff));
+     Rocksdb.write_batch_put wb (meta_key "tip_height")
+       (Bytes.unsafe_to_string buf)
+   | None -> ());
   Rocksdb.write_batch_write t.db wb;
   Rocksdb.write_batch_destroy wb
-
-(* Metadata key prefix — uses a prefix that cannot collide with
-   the 36-byte outpoint keys (which are raw binary). *)
-let meta_key k = "__meta__" ^ k
 
 (* Store the UTXO tip height so we can detect inconsistency with
    the chainstate's chain_tip on startup. *)

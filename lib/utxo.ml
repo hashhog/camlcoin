@@ -429,7 +429,7 @@ let compute_stats (utxo : UtxoSet.t) : utxo_stats =
    dirty set and only flushed to disk when `flush` is called, using the
    storage layer's atomic batch write for crash safety.
 
-   The default cache size of 2,000,000 entries covers much of the UTXO
+   The default cache size of 8,000,000 entries covers much of the UTXO
    working set during IBD through the testnet4 spam block range (50k-100k).
    Combined with GC tuning (larger minor heap, higher space_overhead), this
    provides the best balance of cache coverage and GC throughput.
@@ -595,13 +595,7 @@ module OptimizedUtxoSet = struct
            | `Removed ->
              (key, None) :: acc
          ) t.dirty [] in
-         Rocksdb_store.batch_write rdb ops;
-         (* Persist the tip height inside RocksDB so we can detect
-            inconsistencies on restart (e.g. RocksDB wiped but chainstate
-            still has a non-zero chain_tip). *)
-         (match tip_height with
-          | Some h -> Rocksdb_store.set_tip_height rdb h
-          | None -> ())
+         Rocksdb_store.batch_write ?tip_height rdb ops
        | None ->
          (* Legacy LogStorage path *)
          let batch = Storage.ChainDB.batch_create () in
@@ -893,9 +887,9 @@ let outpoint_to_key (op : Types.outpoint) : string =
   Serialize.write_int32_le w op.vout;
   Cstruct.to_string (Serialize.writer_to_cstruct w)
 
-(** Default max cache size: 450MB worth of entries.
-    Assuming ~100 bytes per entry average, this is ~4.5M entries. *)
-let default_max_cache_bytes = 450 * 1024 * 1024
+(** Default max cache size: 2GB worth of entries.
+    Assuming ~100 bytes per entry average, this is ~20M entries. *)
+let default_max_cache_bytes = 2 * 1024 * 1024 * 1024
 
 (** Estimate memory usage of a single coin entry *)
 let coin_memory_size (c : coin) : int =

@@ -52,6 +52,7 @@ type rpc_context = {
   fee_estimator : Fee_estimation.t;
   network : Consensus.network_config;
   filter_index : Block_index.filter_index option;  (* BIP-157/158 block filter index *)
+  utxo : Utxo.OptimizedUtxoSet.t option;  (* UTXO set for submitblock atomic writes *)
 }
 
 (* ============================================================================
@@ -84,7 +85,7 @@ let json_rpc_error ~(id : Yojson.Safe.t)
 let handle_getblockchaininfo (ctx : rpc_context)
     : Yojson.Safe.t =
   let tip_entry = ctx.chain.tip in
-  let tip_height, tip_hash = match tip_entry with
+  let _tip_height, tip_hash = match tip_entry with
     | Some t -> (t.height,
         Types.hash256_to_hex_display t.hash)
     | None -> (0, "0000000000000000000000000000000000000000000000000000000000000000")
@@ -97,16 +98,17 @@ let handle_getblockchaininfo (ctx : rpc_context)
     | Some t -> Types.hash256_to_hex_display t.total_work
     | None -> "0000000000000000000000000000000000000000000000000000000000000000"
   in
+  let validated_height = ctx.chain.blocks_synced in
   let base_fields = [
     ("chain", `String ctx.network.name);
-    ("blocks", `Int tip_height);
+    ("blocks", `Int validated_height);
     ("headers", `Int ctx.chain.headers_synced);
     ("bestblockhash", `String tip_hash);
     ("difficulty", `Float difficulty);
     ("mediantime", `Int 0);
     ("verificationprogress", `Float
       (if ctx.chain.headers_synced = 0 then 0.0
-       else float_of_int tip_height /.
+       else float_of_int validated_height /.
             float_of_int ctx.chain.headers_synced));
     ("initialblockdownload",
       `Bool (ctx.chain.sync_state <> Sync.FullySynced));
@@ -265,9 +267,7 @@ let handle_getblockheader (ctx : rpc_context)
     Error "Invalid parameters: expected [blockhash] or [blockhash, verbose]"
 
 let handle_getblockcount (ctx : rpc_context) : Yojson.Safe.t =
-  match ctx.chain.tip with
-  | Some t -> `Int t.height
-  | None -> `Int 0
+  `Int ctx.chain.blocks_synced
 
 let handle_getbestblockhash (ctx : rpc_context) : Yojson.Safe.t =
   match ctx.chain.tip with
@@ -1070,7 +1070,9 @@ let handle_submitblock (ctx : rpc_context)
       let data = Cstruct.of_hex hex in
       let r = Serialize.reader_of_cstruct data in
       let block = Serialize.deserialize_block r in
-      match Mining.submit_block block ctx.chain ctx.mempool with
+      match Mining.submit_block ?utxo:ctx.utxo
+              ~network_type:ctx.network.network_type
+              block ctx.chain ctx.mempool with
       | Ok () -> Ok `Null
       | Error msg -> Error msg
     with exn ->
@@ -1093,7 +1095,9 @@ let mine_single_block (ctx : rpc_context) (payout_script : Cstruct.t)
   match Mining.mine_block template 100_000_000l with
   | None -> Error "Failed to find valid nonce (unexpected on regtest)"
   | Some block ->
-    match Mining.submit_block block ctx.chain ctx.mempool with
+    match Mining.submit_block ?utxo:ctx.utxo
+            ~network_type:ctx.network.network_type
+            block ctx.chain ctx.mempool with
     | Error msg -> Error msg
     | Ok () ->
       let hash = Crypto.compute_block_hash block.header in
@@ -1309,7 +1313,9 @@ let handle_generateblock (ctx : rpc_context)
            match Mining.mine_block template 100_000_000l with
            | None -> Error "Failed to find valid nonce"
            | Some block ->
-             match Mining.submit_block block ctx.chain ctx.mempool with
+             match Mining.submit_block ?utxo:ctx.utxo
+                     ~network_type:ctx.network.network_type
+                     block ctx.chain ctx.mempool with
              | Error msg -> Error msg
              | Ok () ->
                let hash = Crypto.compute_block_hash block.header in
@@ -3346,9 +3352,10 @@ let create_context
     ~(fee_estimator : Fee_estimation.t)
     ~(network : Consensus.network_config)
     ?(wallet_manager : Wallet.wallet_manager option = None)
-    ?(filter_index : Block_index.filter_index option = None) () : rpc_context =
+    ?(filter_index : Block_index.filter_index option = None)
+    ?(utxo : Utxo.OptimizedUtxoSet.t option = None) () : rpc_context =
   { chain; mempool; peer_manager; wallet; wallet_manager; fee_estimator; network;
-    filter_index }
+    filter_index; utxo }
 
 (* Create an RPC context with multi-wallet support *)
 let create_context_with_wallet_manager
@@ -3358,11 +3365,12 @@ let create_context_with_wallet_manager
     ~(wallet_manager : Wallet.wallet_manager)
     ~(fee_estimator : Fee_estimation.t)
     ~(network : Consensus.network_config)
-    ?(filter_index : Block_index.filter_index option = None) () : rpc_context =
+    ?(filter_index : Block_index.filter_index option = None)
+    ?(utxo : Utxo.OptimizedUtxoSet.t option = None) () : rpc_context =
   (* Get default wallet from manager for backward compatibility *)
   let wallet = Wallet.get_default_wallet wallet_manager in
   { chain; mempool; peer_manager; wallet; wallet_manager = Some wallet_manager;
-    fee_estimator; network; filter_index }
+    fee_estimator; network; filter_index; utxo }
 
 (* Default RPC ports by network *)
 let default_port (network : Consensus.network_config) : int =

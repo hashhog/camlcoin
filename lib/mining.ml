@@ -551,8 +551,13 @@ let template_to_json_simple (template : block_template) : Yojson.Safe.t =
    ============================================================================ *)
 
 (* Submit a mined block to the network.
-   Returns Ok() if the block is valid and was accepted. *)
-let submit_block (block : Types.block) (chain : Sync.chain_state)
+   Returns Ok() if the block is valid and was accepted.
+   When [utxo] is provided, the block is connected through the atomic
+   [connect_block_optimized] path so that UTXO mutations and the tip
+   height are written in a single RocksDB WriteBatch. *)
+let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
+    ?(network_type : Consensus.network = Consensus.Mainnet)
+    (block : Types.block) (chain : Sync.chain_state)
     (mp : Mempool.mempool) : (unit, string) result =
 
   let hash = Crypto.compute_block_hash block.header in
@@ -574,18 +579,37 @@ let submit_block (block : Types.block) (chain : Sync.chain_state)
         match Sync.validate_header chain block.header with
         | Error e -> Error e
         | Ok entry ->
-          (* Accept the header *)
-          Sync.accept_header chain entry;
+          (* Connect through the atomic UTXO path when available *)
+          let utxo_result = match utxo with
+            | Some utxo_set ->
+              (match Utxo.connect_block_optimized ~network_type utxo_set block height with
+               | Ok _undo ->
+                 (* Flush UTXO changes + tip_height in a single atomic batch *)
+                 Utxo.OptimizedUtxoSet.flush ~tip_height:height utxo_set;
+                 Ok ()
+               | Error e -> Error e)
+            | None ->
+              (* Legacy path: no UTXO validation (unsafe) *)
+              Ok ()
+          in
+          (match utxo_result with
+           | Error e -> Error e
+           | Ok () ->
+             (* Accept the header *)
+             Sync.accept_header chain entry;
 
-          (* Store the block *)
-          Storage.ChainDB.store_block chain.db hash block;
-          Storage.ChainDB.set_chain_tip chain.db hash height;
+             (* Store the block *)
+             Storage.ChainDB.store_block chain.db hash block;
+             Storage.ChainDB.set_chain_tip chain.db hash height;
 
-          (* Remove confirmed transactions from mempool *)
-          Mempool.remove_for_block mp block height;
+             (* Update blocks_synced to match *)
+             chain.blocks_synced <- height;
 
-          Logs.info (fun m -> m "Accepted mined block at height %d: %s"
-            height (Types.hash256_to_hex_display hash));
+             (* Remove confirmed transactions from mempool *)
+             Mempool.remove_for_block mp block height;
 
-          Ok ()
+             Logs.info (fun m -> m "Accepted mined block at height %d: %s"
+               height (Types.hash256_to_hex_display hash));
+
+             Ok ())
       end

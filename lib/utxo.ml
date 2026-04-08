@@ -585,17 +585,21 @@ module OptimizedUtxoSet = struct
     if count > 0 || tip_height <> None then begin
       (match t.rocksdb with
        | Some rdb ->
-         (* RocksDB path: atomic batch write using raw 36-byte keys *)
-         let ops = Hashtbl.fold (fun key entry acc ->
+         (* RocksDB path: serialize dirty entries directly into a WriteBatch.
+            Pre-serialize Added entries in-place to avoid building a
+            temporary (key * string option) list that doubles memory. *)
+         let serialized : (string, [ `Added of Cstruct.t | `Removed ]) Hashtbl.t =
+           Hashtbl.create (Hashtbl.length t.dirty) in
+         Hashtbl.iter (fun key entry ->
            match entry with
            | `Added utxo ->
              let w = Serialize.writer_create () in
              serialize_utxo_entry w utxo;
-             (key, Some (Cstruct.to_string (Serialize.writer_to_cstruct w))) :: acc
+             Hashtbl.replace serialized key (`Added (Serialize.writer_to_cstruct w))
            | `Removed ->
-             (key, None) :: acc
-         ) t.dirty [] in
-         Rocksdb_store.batch_write ?tip_height rdb ops
+             Hashtbl.replace serialized key `Removed
+         ) t.dirty;
+         Rocksdb_store.flush_dirty ?tip_height rdb serialized
        | None ->
          (* Legacy LogStorage path *)
          let batch = Storage.ChainDB.batch_create () in

@@ -84,19 +84,47 @@ let import_blocks_arg =
   Arg.(value & opt (some string) None &
     info ["import-blocks"] ~docv:"PATH" ~doc)
 
+let import_utxo_arg =
+  let doc = "Import UTXO snapshot from HDOG file. Replaces existing UTXO set and sets chain tip." in
+  Arg.(value & opt (some string) None &
+    info ["import-utxo"] ~docv:"PATH" ~doc)
+
 (* ============================================================================
    Main Command
    ============================================================================ *)
 
 let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     p2p_port max_outbound max_inbound connect debug no_wallet prune benchmark
-    import_blocks =
+    import_blocks import_utxo =
   (* If benchmark flag is set, run benchmarks and exit *)
   if benchmark then begin
     Camlcoin.Cli.setup_logging debug ();
     Camlcoin.Perf.run_benchmarks ();
     ()
-  end else match import_blocks with
+  end else match import_utxo with
+  | Some utxo_path ->
+    (* UTXO snapshot import mode *)
+    Camlcoin.Cli.setup_logging debug ();
+    let base = Camlcoin.Cli.config_for_network network in
+    let data_dir = match datadir with
+      | Some d -> d
+      | None -> base.data_dir in
+    (try Unix.mkdir data_dir 0o755
+     with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+    let network_cfg = match network with
+      | `Mainnet -> Camlcoin.Consensus.mainnet
+      | `Testnet -> Camlcoin.Consensus.testnet4
+      | `Regtest -> Camlcoin.Consensus.regtest
+    in
+    (match Camlcoin.Utxo_import.run ~snapshot_path:utxo_path
+             ~data_dir ~network:network_cfg with
+    | Ok count ->
+      Printf.eprintf "Successfully imported %d UTXOs\n%!" count
+    | Error msg ->
+      Printf.eprintf "UTXO import failed: %s\n%!" msg;
+      exit 1)
+  | None ->
+  match import_blocks with
   | Some import_path ->
     (* Block import mode: bypass P2P entirely *)
     Camlcoin.Cli.setup_logging debug ();
@@ -208,7 +236,8 @@ let cmd =
     $ no_wallet_arg
     $ prune_arg
     $ benchmark_arg
-    $ import_blocks_arg)
+    $ import_blocks_arg
+    $ import_utxo_arg)
 
 (* ============================================================================
    Entry Point

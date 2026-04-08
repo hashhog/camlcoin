@@ -932,7 +932,7 @@ let base_block_timeout = 60.0           (* 60s base timeout — matches Bitcoin 
 let max_block_timeout = 300.0           (* 5 min max timeout per block *)
 let max_stall_timeout = 1200.0          (* 20 min max stall — matches Bitcoin Core *)
 let max_consecutive_timeouts = 5        (* More forgiving before disconnect *)
-let utxo_flush_interval = 2000        (* Flush UTXOs every N blocks *)
+let utxo_flush_interval = 500          (* Flush UTXOs every N blocks *)
 let block_download_window = 2048      (* Max blocks ahead to queue — 2x previous for deeper pipeline *)
 
 (* Orphan block pool constants *)
@@ -1711,9 +1711,14 @@ let process_downloaded_blocks (ibd : ibd_state)
            incr processed;
            (* Prune old blocks if pruning is enabled *)
            prune_old_blocks ibd.chain height;
-           (* Periodic UTXO flush — by block count or dirty set size *)
+           (* Periodic UTXO flush — by block count or dirty set size.
+              The dirty threshold should be high enough that most short-lived
+              UTXOs (created and spent within the window) are eliminated by
+              remove_fast's FRESH optimisation, never touching disk at all.
+              500K accommodates the largest blocks (~4K txs * ~2 outputs)
+              without flushing mid-batch. *)
            let dirty_too_large = match ibd.utxo_set with
-             | Some utxo -> Utxo.OptimizedUtxoSet.dirty_count utxo > 5_000
+             | Some utxo -> Utxo.OptimizedUtxoSet.dirty_count utxo > 500_000
              | None -> false
            in
            if ibd.blocks_since_flush >= utxo_flush_interval || dirty_too_large then begin
@@ -1721,9 +1726,11 @@ let process_downloaded_blocks (ibd : ibd_state)
              ibd.blocks_since_flush <- 0;
              (* Also update chain tip in DB *)
              Storage.ChainDB.set_chain_tip ibd.chain.db entry.hash height;
-             (* Force GC compaction to release memory back to OS.
-                OCaml's major heap doesn't shrink without Gc.compact. *)
-             Gc.compact ()
+             (* Run a major GC slice to keep heap from growing unbounded.
+                Gc.compact is far too expensive (full heap compaction + scan);
+                Gc.major runs one full major cycle which is sufficient to
+                reclaim short-lived allocations without pausing for seconds. *)
+             Gc.major ()
            end;
            (* Notify ZMQ subscribers about block connect *)
            zmq_notify_block ibd block entry.hash true;

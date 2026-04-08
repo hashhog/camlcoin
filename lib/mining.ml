@@ -597,8 +597,18 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
             | Some utxo_set ->
               (match Utxo.connect_block_optimized ~network_type utxo_set block height with
                | Ok _undo ->
-                 (* Flush UTXO changes + tip_height in a single atomic batch *)
-                 Utxo.OptimizedUtxoSet.flush ~tip_height:height utxo_set;
+                 (* During IBD, defer the flush to accumulate dirty entries.
+                    The periodic flush in the sync loop (or shutdown) will
+                    persist them.  Flushing after every submitblock was the
+                    dominant bottleneck during feeder-driven IBD: each flush
+                    writes a RocksDB batch + fsync. By deferring, short-lived
+                    UTXOs are eliminated by remove_fast's FRESH optimisation
+                    and never touch disk at all.
+                    We still flush every 500 blocks or 500K dirty entries
+                    to bound data-loss risk. *)
+                 let dirty = Utxo.OptimizedUtxoSet.dirty_count utxo_set in
+                 if dirty > 500_000 || height mod 500 = 0 then
+                   Utxo.OptimizedUtxoSet.flush ~tip_height:height utxo_set;
                  Ok ()
                | Error e -> Error e)
             | None ->

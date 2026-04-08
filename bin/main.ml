@@ -243,4 +243,19 @@ let cmd =
    Entry Point
    ============================================================================ *)
 
-let () = exit (Cmd.eval cmd)
+let () =
+  (* Tune the OCaml GC for a large-heap server process.
+     - minor_heap_size: 4M words (32MB) reduces minor collections during
+       block validation which allocates many short-lived Cstruct/string values.
+     - space_overhead: 200 (default 120) lets the major heap grow 2x before
+       collecting, reducing major GC frequency at the cost of ~2x peak RSS.
+       With 128GB RAM this is a good trade.
+     - max_overhead: 500 means compaction only triggers when free space exceeds
+       5x live data, effectively disabling it (we use Gc.major() explicitly). *)
+  let gc = Gc.get () in
+  Gc.set { gc with
+    minor_heap_size = 4 * 1024 * 1024;
+    space_overhead = 200;
+    max_overhead = 500;
+  };
+  exit (Cmd.eval cmd)

@@ -12,6 +12,26 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* ---------- Cached read/write options ------------------------------------- */
+/* Creating and destroying rocksdb_{read,write}options on every get/put call
+   is surprisingly expensive: each call does a malloc + memset + free.
+   Caching a single instance per type eliminates this overhead entirely.
+   Thread-safety: rocksdb_readoptions/writeoptions are immutable after
+   creation so sharing across threads is safe. */
+
+static rocksdb_readoptions_t  *g_read_options  = NULL;
+static rocksdb_writeoptions_t *g_write_options = NULL;
+
+static rocksdb_readoptions_t *get_read_options(void) {
+  if (!g_read_options) g_read_options = rocksdb_readoptions_create();
+  return g_read_options;
+}
+
+static rocksdb_writeoptions_t *get_write_options(void) {
+  if (!g_write_options) g_write_options = rocksdb_writeoptions_create();
+  return g_write_options;
+}
+
 /* ---------- Custom block for rocksdb_t* --------------------------------- */
 
 #define Rocksdb_val(v) (*((rocksdb_t **)Data_custom_val(v)))
@@ -137,14 +157,12 @@ CAMLprim value caml_rocksdb_get(value v_db, value v_key) {
   rocksdb_t *db = Rocksdb_val(v_db);
   if (!db) caml_failwith("rocksdb_get: database is closed");
 
-  rocksdb_readoptions_t *ropts = rocksdb_readoptions_create();
   char *err = NULL;
   size_t vallen = 0;
 
-  char *val = rocksdb_get(db, ropts,
+  char *val = rocksdb_get(db, get_read_options(),
       String_val(v_key), caml_string_length(v_key),
       &vallen, &err);
-  rocksdb_readoptions_destroy(ropts);
 
   if (err) {
     char msg[512];
@@ -174,14 +192,12 @@ CAMLprim value caml_rocksdb_put(value v_db, value v_key, value v_val) {
   rocksdb_t *db = Rocksdb_val(v_db);
   if (!db) caml_failwith("rocksdb_put: database is closed");
 
-  rocksdb_writeoptions_t *wopts = rocksdb_writeoptions_create();
   char *err = NULL;
 
-  rocksdb_put(db, wopts,
+  rocksdb_put(db, get_write_options(),
       String_val(v_key), caml_string_length(v_key),
       String_val(v_val), caml_string_length(v_val),
       &err);
-  rocksdb_writeoptions_destroy(wopts);
 
   if (err) {
     char msg[512];
@@ -201,13 +217,11 @@ CAMLprim value caml_rocksdb_delete(value v_db, value v_key) {
   rocksdb_t *db = Rocksdb_val(v_db);
   if (!db) caml_failwith("rocksdb_delete: database is closed");
 
-  rocksdb_writeoptions_t *wopts = rocksdb_writeoptions_create();
   char *err = NULL;
 
-  rocksdb_delete(db, wopts,
+  rocksdb_delete(db, get_write_options(),
       String_val(v_key), caml_string_length(v_key),
       &err);
-  rocksdb_writeoptions_destroy(wopts);
 
   if (err) {
     char msg[512];

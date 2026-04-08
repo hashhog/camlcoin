@@ -8,7 +8,7 @@ type t = {
 
 (* Open (or create) a RocksDB database at [path].
    Tuning: 64 MB write buffer, 512 MB block cache, 10-bit bloom filter. *)
-let open_db ?(write_buffer_mb=64) ?(block_cache_mb=512) ?(bloom_bits=10)
+let open_db ?(write_buffer_mb=256) ?(block_cache_mb=2048) ?(bloom_bits=10)
     (path : string) : t =
   (* Ensure parent directory exists *)
   (try Unix.mkdir path 0o755
@@ -70,6 +70,30 @@ let set_tip_height (t : t) (height : int) : unit =
   Bytes.set buf 2 (Char.chr ((height lsr 16) land 0xff));
   Bytes.set buf 3 (Char.chr ((height lsr 24) land 0xff));
   Rocksdb.put t.db (meta_key "tip_height") (Bytes.unsafe_to_string buf)
+
+(* Flush a dirty hashtable directly into a WriteBatch, avoiding the
+   intermediate list allocation that batch_write requires.
+   Each dirty entry is serialized and added to the batch in-place. *)
+let flush_dirty ?(tip_height : int option) (t : t)
+    (dirty : (string, [ `Added of Cstruct.t | `Removed ]) Hashtbl.t) : unit =
+  let wb = Rocksdb.write_batch_create () in
+  Hashtbl.iter (fun key entry ->
+    match entry with
+    | `Added data -> Rocksdb.write_batch_put wb key (Cstruct.to_string data)
+    | `Removed -> Rocksdb.write_batch_delete wb key
+  ) dirty;
+  (match tip_height with
+   | Some h ->
+     let buf = Bytes.create 4 in
+     Bytes.set buf 0 (Char.chr (h land 0xff));
+     Bytes.set buf 1 (Char.chr ((h lsr 8) land 0xff));
+     Bytes.set buf 2 (Char.chr ((h lsr 16) land 0xff));
+     Bytes.set buf 3 (Char.chr ((h lsr 24) land 0xff));
+     Rocksdb.write_batch_put wb (meta_key "tip_height")
+       (Bytes.unsafe_to_string buf)
+   | None -> ());
+  Rocksdb.write_batch_write t.db wb;
+  Rocksdb.write_batch_destroy wb
 
 let get_tip_height (t : t) : int option =
   match Rocksdb.get t.db (meta_key "tip_height") with

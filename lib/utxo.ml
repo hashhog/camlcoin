@@ -887,9 +887,11 @@ let outpoint_to_key (op : Types.outpoint) : string =
   Serialize.write_int32_le w op.vout;
   Cstruct.to_string (Serialize.writer_to_cstruct w)
 
-(** Default max cache size: 2GB worth of entries.
-    Assuming ~100 bytes per entry average, this is ~20M entries. *)
-let default_max_cache_bytes = 2 * 1024 * 1024 * 1024
+(** Default max cache size: 1GB worth of entries.
+    Assuming ~100 bytes per entry average, this is ~10M entries.
+    Reduced from 2GB: the dirty set + LRU + OCaml GC overhead
+    caused RSS to reach 12+ GB at the previous setting. *)
+let default_max_cache_bytes = 1 * 1024 * 1024 * 1024
 
 (** Estimate memory usage of a single coin entry *)
 let coin_memory_size (c : coin) : int =

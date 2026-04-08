@@ -566,19 +566,32 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
   match Validation.check_block_header block.header with
   | Error e -> Error e
   | Ok () ->
-    (* Get expected values from chain *)
-    match chain.tip with
-    | None -> Error "No chain tip"
-    | Some tip ->
-      if not (Cstruct.equal block.header.prev_block tip.hash) then
-        Error "Block does not build on current tip"
+    (* During IBD, chain.tip is the header tip (far ahead of validated tip).
+       For submitblock, we need to compare against the validated tip (blocks_synced). *)
+    let validated_height = chain.blocks_synced in
+    let validated_tip = Sync.get_header_at_height chain validated_height in
+    match validated_tip with
+    | None -> Error "No validated tip found (blocks_synced=0 or missing header)"
+    | Some vtip ->
+      if not (Cstruct.equal block.header.prev_block vtip.hash) then
+        Error (Printf.sprintf "Block does not build on validated tip (height %d)" validated_height)
       else begin
-        let height = tip.height + 1 in
+        let height = validated_height + 1 in
 
-        (* Validate the full block *)
-        match Sync.validate_header chain block.header with
+        (* During IBD with headers-first sync, the header is already in the chain.
+           Look up existing entry or validate as new. *)
+        let entry_result = match Sync.validate_header chain block.header with
+          | Ok entry -> Ok entry
+          | Error "Header already known" ->
+            (* Header already exists — look it up. This is the normal IBD case. *)
+            (match Sync.get_header_at_height chain height with
+             | Some entry -> Ok entry
+             | None -> Error "Header already known but not found at expected height")
+          | Error e -> Error e
+        in
+        match entry_result with
         | Error e -> Error e
-        | Ok entry ->
+        | Ok _entry ->
           (* Connect through the atomic UTXO path when available *)
           let utxo_result = match utxo with
             | Some utxo_set ->
@@ -595,9 +608,6 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
           (match utxo_result with
            | Error e -> Error e
            | Ok () ->
-             (* Accept the header *)
-             Sync.accept_header chain entry;
-
              (* Store the block *)
              Storage.ChainDB.store_block chain.db hash block;
              Storage.ChainDB.set_chain_tip chain.db hash height;

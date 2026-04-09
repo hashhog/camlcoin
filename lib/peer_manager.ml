@@ -1310,6 +1310,81 @@ let handle_addr (pm : t) (peer : Peer.peer) (addrs : (int32 * Types.net_addr) li
     Hashtbl.replace pm.addr_rate peer_key (count + !processed, window_start)
   end
 
+(* Handle addrv2 messages (BIP155) — extract IPv4 addresses and add to known_addrs *)
+let handle_addrv2 (pm : t) (_peer : Peer.peer) (entries : P2p.addrv2_addr list) : unit =
+  List.iter (fun (entry : P2p.addrv2_addr) ->
+    match entry.v2_network_id with
+    | P2p.Addrv2_IPv4 when Cstruct.length entry.v2_addr = 4 ->
+      let ip_str = Printf.sprintf "%d.%d.%d.%d"
+        (Cstruct.get_uint8 entry.v2_addr 0)
+        (Cstruct.get_uint8 entry.v2_addr 1)
+        (Cstruct.get_uint8 entry.v2_addr 2)
+        (Cstruct.get_uint8 entry.v2_addr 3) in
+      if not (Hashtbl.mem pm.known_addrs ip_str) then begin
+        let bucket = add_to_new_table pm ip_str in
+        Hashtbl.replace pm.known_addrs ip_str
+          { address = ip_str;
+            port = entry.v2_port;
+            services = entry.v2_services;
+            last_seen = Unix.gettimeofday ();
+            last_attempt = 0.0;
+            last_success = 0.0;
+            failures = 0;
+            banned_until = 0.0;
+            source = Addr;
+            table_status = InNew bucket }
+      end
+    | _ -> ()  (* Skip non-IPv4 for now *)
+  ) entries
+
+(* Relay addresses to up to 2 random connected peers, excluding source *)
+let relay_addr_to_random_peers (pm : t) (source : Peer.peer) : unit =
+  let candidates = List.filter (fun p ->
+    p.Peer.id <> source.Peer.id && p.Peer.state = Peer.Ready
+  ) pm.peers in
+  if candidates = [] then ()
+  else begin
+    (* Shuffle and pick up to 2 *)
+    let shuffled = List.sort (fun _ _ -> Random.int 3 - 1) candidates in
+    let targets = match shuffled with
+      | a :: b :: _ -> [a; b]
+      | [a] -> [a]
+      | [] -> [] in
+    (* Build addr message from up to 10 known addresses *)
+    let now = Int32.of_float (Unix.gettimeofday ()) in
+    let addrs = Hashtbl.fold (fun _k info acc ->
+      if List.length acc >= 10 then acc
+      else begin
+        let addr_bytes = Cstruct.create 16 in
+        let parts = String.split_on_char '.' info.address in
+        if List.length parts = 4 then begin
+          for i = 0 to 9 do Cstruct.set_uint8 addr_bytes i 0 done;
+          Cstruct.set_uint8 addr_bytes 10 0xFF;
+          Cstruct.set_uint8 addr_bytes 11 0xFF;
+          List.iteri (fun i s ->
+            try Cstruct.set_uint8 addr_bytes (12 + i) (int_of_string s)
+            with _ -> ()
+          ) parts;
+          let net_addr : Types.net_addr = {
+            services = 1L;
+            addr = addr_bytes;
+            port = info.port;
+          } in
+          (now, net_addr) :: acc
+        end else acc
+      end
+    ) pm.known_addrs [] in
+    if addrs <> [] then begin
+      let msg = P2p.AddrMsg addrs in
+      List.iter (fun peer ->
+        Lwt.async (fun () ->
+          Lwt.catch
+            (fun () -> Peer.send_message peer msg)
+            (fun _exn -> Lwt.return_unit))
+      ) targets
+    end
+  end
+
 (* Build block locator hashes for getheaders/getblocks.
    Returns hashes from tip backwards to genesis, using exponential stepping.
    First 10 entries are sequential, then step doubles. Always ends with genesis. *)
@@ -1475,9 +1550,16 @@ let peer_message_loop (pm : t) (peer : Peer.peer) : unit Lwt.t =
                  (fun () -> listener msg peer)
                  (fun _exn -> Lwt.return_unit)
              ) pm.listeners in
-             (* Handle addr messages specially *)
+             (* Handle addr/addrv2 messages and relay to 2 random peers *)
              (match msg with
-              | P2p.AddrMsg addrs -> handle_addr pm peer addrs
+              | P2p.AddrMsg addrs ->
+                handle_addr pm peer addrs;
+                relay_addr_to_random_peers pm peer
+              | P2p.Addrv2Msg entries ->
+                handle_addrv2 pm peer entries;
+                relay_addr_to_random_peers pm peer
+              | P2p.FeefilterMsg fee_rate ->
+                peer.Peer.feefilter <- fee_rate
               | _ -> ());
              loop ())
       ) (fun exn ->

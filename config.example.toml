@@ -1,0 +1,45 @@
+# Camlcoin - Bitcoin Full Node (OCaml)
+# Example configuration file
+# Copy to your data directory and modify as needed.
+
+[network]
+# Network: mainnet, testnet, regtest
+network = "mainnet"
+
+[storage]
+# Data directory
+data_dir = "~/.camlcoin"
+# Prune mode (0 = no pruning)
+prune = 0
+
+[rpc]
+# RPC host and port
+rpc_host = "127.0.0.1"
+rpc_port = 8332
+# RPC authentication
+rpc_user = "camlcoin"
+rpc_password = "camlcoin"
+
+[p2p]
+# P2P listen port
+p2p_port = 8333
+# Maximum outbound connections
+max_outbound = 8
+# Maximum inbound connections
+max_inbound = 117
+# Manual peer addresses
+# connect = ["host:port"]
+
+[mempool]
+# (Uses Bitcoin Core defaults internally)
+
+[logging]
+# Enable debug logging
+debug = false
+# Log categories (empty = all enabled)
+# log_categories = []
+
+[metrics]
+# Prometheus metrics endpoint
+# enabled = true
+# port = 9332

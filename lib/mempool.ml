@@ -1815,6 +1815,42 @@ let accept_transaction ?(dry_run=false) (mp : mempool) (tx : Types.transaction)
       (* Attempt full RBF replacement *)
       replace_by_fee mp tx
 
+(* AcceptToMemoryPool — main entry point matching Bitcoin Core's AcceptToMemoryPool.
+   Validates and adds a transaction to the mempool, handling RBF conflicts.
+   Returns (Ok entry) on success or (Error reason) on failure. *)
+
+type accept_result = {
+  atmp_accepted : bool;
+  atmp_txid : Types.hash256;
+  atmp_fee : int64;
+  atmp_vsize : int;
+  atmp_reject_reason : string option;
+}
+
+let accept_to_memory_pool ?(test_accept=false) (mp : mempool) (tx : Types.transaction)
+    : accept_result =
+  let txid = Crypto.compute_txid tx in
+  if test_accept then begin
+    (* Dry-run: validate without modifying state *)
+    match accept_transaction ~dry_run:true mp tx with
+    | Ok entry ->
+      { atmp_accepted = true; atmp_txid = txid; atmp_fee = entry.fee;
+        atmp_vsize = entry.weight / 4;
+        atmp_reject_reason = None }
+    | Error reason ->
+      { atmp_accepted = false; atmp_txid = txid; atmp_fee = 0L; atmp_vsize = 0;
+        atmp_reject_reason = Some reason }
+  end else begin
+    match accept_transaction mp tx with
+    | Ok entry ->
+      { atmp_accepted = true; atmp_txid = txid; atmp_fee = entry.fee;
+        atmp_vsize = entry.weight / 4;
+        atmp_reject_reason = None }
+    | Error reason ->
+      { atmp_accepted = false; atmp_txid = txid; atmp_fee = 0L; atmp_vsize = 0;
+        atmp_reject_reason = Some reason }
+  end
+
 (* ============================================================================
    Orphan Transaction Pool (Task 8)
    ============================================================================ *)

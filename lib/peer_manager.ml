@@ -1326,7 +1326,7 @@ let handle_addrv2 (pm : t) (_peer : Peer.peer) (entries : P2p.addrv2_addr list) 
           { address = ip_str;
             port = entry.v2_port;
             services = entry.v2_services;
-            last_seen = Unix.gettimeofday ();
+            last_connected = Unix.gettimeofday ();
             last_attempt = 0.0;
             last_success = 0.0;
             failures = 0;

@@ -513,6 +513,8 @@ let perform_handshake_inner (peer : peer) (our_height : int32) : unit Lwt.t =
   let* () = send_message peer P2p.SendheadersMsg in
   (* BIP 152: Send sendcmpct version 2 (segwit-aware) in low-bandwidth mode *)
   let* () = send_message peer (P2p.make_sendcmpct_msg ~high_bandwidth:false) in
+  (* BIP 133: Send initial feefilter - 100 sat/vbyte = 100000 sat/kvB *)
+  let* () = send_message peer (P2p.FeefilterMsg 100_000L) in
   peer.state <- Ready;
   (* Reset last_ping so the message loop does not immediately fire a ping.
      Without this, last_ping=0.0 triggers needs_ping on the first iteration,
@@ -568,6 +570,8 @@ let perform_inbound_handshake_inner (peer : peer) (our_height : int32) : unit Lw
   let* () = send_message peer P2p.SendheadersMsg in
   (* BIP 152: Send sendcmpct version 2 (segwit-aware) in low-bandwidth mode *)
   let* () = send_message peer (P2p.make_sendcmpct_msg ~high_bandwidth:false) in
+  (* BIP 133: Send initial feefilter - 100 sat/vbyte = 100000 sat/kvB *)
+  let* () = send_message peer (P2p.FeefilterMsg 100_000L) in
   peer.state <- Ready;
   peer.last_ping <- Unix.gettimeofday ();
   Lwt.return_unit

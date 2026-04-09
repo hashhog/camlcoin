@@ -808,11 +808,19 @@ let handle_decoderawtransaction (_ctx : rpc_context)
 let handle_getpeerinfo (ctx : rpc_context) : Yojson.Safe.t =
   let peers = Peer_manager.get_peer_stats ctx.peer_manager in
   `List (List.map (fun stats ->
+    let svc = stats.Peer.stat_services in
+    let svc_names =
+      (if Int64.logand svc 1L <> 0L then ["NETWORK"] else []) @
+      (if Int64.logand svc 8L <> 0L then ["WITNESS"] else []) @
+      (if Int64.logand svc 1024L <> 0L then ["NETWORK_LIMITED"] else []) in
+    let is_inbound = stats.stat_direction = Peer.Inbound in
     `Assoc [
       ("id", `Int stats.Peer.stat_id);
       ("addr", `String (Printf.sprintf "%s:%d"
         stats.stat_addr stats.stat_port));
-      ("services", `String (Printf.sprintf "%016Lx" stats.stat_services));
+      ("network", `String "ipv4");
+      ("services", `String (Printf.sprintf "%016Lx" svc));
+      ("servicesnames", `List (List.map (fun s -> `String s) svc_names));
       ("relaytxes", `Bool true);
       ("lastsend", `Int (int_of_float stats.stat_last_seen));
       ("lastrecv", `Int (int_of_float stats.stat_last_seen));
@@ -823,12 +831,14 @@ let handle_getpeerinfo (ctx : rpc_context) : Yojson.Safe.t =
       ("pingtime", `Float (stats.stat_latency_ms /. 1000.0));
       ("version", `Int 70016);
       ("subver", `String stats.stat_user_agent);
-      ("inbound", `Bool (stats.stat_direction = Peer.Inbound));
+      ("inbound", `Bool is_inbound);
+      ("bip152_hb_to", `Bool false);
+      ("bip152_hb_from", `Bool false);
       ("startingheight", `Int (Int32.to_int stats.stat_best_height));
       ("synced_headers", `Int (-1));
       ("synced_blocks", `Int (-1));
       ("inflight", `List []);
-      ("misbehavior_score", `Int stats.stat_misbehavior);
+      ("connection_type", `String (if is_inbound then "inbound" else "outbound-full-relay"));
     ]
   ) peers)
 
@@ -841,6 +851,7 @@ let handle_getnetworkinfo (ctx : rpc_context) : Yojson.Safe.t =
     ("subversion", `String ("/CamlCoin:" ^ Types.version ^ "/"));
     ("protocolversion", `Int (Int32.to_int Types.protocol_version));
     ("localservices", `String "0000000000000009");
+    ("localservicesnames", `List [`String "NETWORK"; `String "WITNESS"]);
     ("localrelay", `Bool true);
     ("timeoffset", `Int 0);
     ("networkactive", `Bool true);
@@ -853,6 +864,14 @@ let handle_getnetworkinfo (ctx : rpc_context) : Yojson.Safe.t =
         ("limited", `Bool false);
         ("reachable", `Bool true);
         ("proxy", `String "");
+        ("proxy_randomize_credentials", `Bool false);
+      ];
+      `Assoc [
+        ("name", `String "ipv6");
+        ("limited", `Bool false);
+        ("reachable", `Bool true);
+        ("proxy", `String "");
+        ("proxy_randomize_credentials", `Bool false);
       ];
     ]);
     ("relayfee", `Float 0.00001);
@@ -879,7 +898,8 @@ let handle_getmempoolinfo (ctx : rpc_context) : Yojson.Safe.t =
       (Int64.to_float ctx.mempool.min_relay_fee /. 100_000_000.0));
     ("unbroadcastcount", `Int 0);
     ("fullrbf", `Bool true);
-    ("totalfee", `Float (Int64.to_float fees /. 100_000_000.0));
+    ("total_fee", `Float (Int64.to_float fees /. 100_000_000.0));
+    ("incrementalrelayfee", `Float 0.00001);
   ]
 
 let handle_getrawmempool (ctx : rpc_context)
@@ -905,11 +925,12 @@ let handle_getrawmempool (ctx : rpc_context)
       let ancestorfees = Int64.to_float (List.fold_left
         (fun s (e : Mempool.mempool_entry) -> Int64.add s e.fee)
         entry.fee ancestors) /. 100_000_000.0 in
+      let fee_btc = Int64.to_float entry.fee /. 100_000_000.0 in
       let info = `Assoc [
         ("vsize", `Int (entry.weight / 4));
         ("weight", `Int entry.weight);
-        ("fee", `Float (Int64.to_float entry.fee /. 100_000_000.0));
-        ("modifiedfee", `Float (Int64.to_float entry.fee /. 100_000_000.0));
+        ("fee", `Float fee_btc);
+        ("modifiedfee", `Float fee_btc);
         ("time", `Int (int_of_float entry.time_added));
         ("height", `Int entry.height_added);
         ("descendantcount", `Int descendantcount);
@@ -918,9 +939,19 @@ let handle_getrawmempool (ctx : rpc_context)
         ("ancestorcount", `Int ancestorcount);
         ("ancestorsize", `Int ancestorsize);
         ("ancestorfees", `Float ancestorfees);
+        ("wtxid", `String txid);
+        ("fees", `Assoc [
+          ("base", `Float fee_btc);
+          ("modified", `Float fee_btc);
+          ("ancestor", `Float ancestorfees);
+          ("descendant", `Float descendantfees);
+        ]);
         ("depends", `List (List.map (fun dep ->
           `String (Types.hash256_to_hex_display dep)
         ) entry.depends_on));
+        ("spentby", `List []);
+        ("bip125-replaceable", `Bool true);
+        ("unbroadcast", `Bool false);
       ] in
       (txid, info) :: acc
     ) ctx.mempool.entries [] in

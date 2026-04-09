@@ -441,16 +441,16 @@ let run (config : config) : unit Lwt.t =
     match msg with
     | P2p.TxMsg tx when chain.sync_state = Sync.FullySynced ->
       let result = Mempool.accept_to_memory_pool mempool tx in
-      if result.Mempool.accepted then begin
+      if result.Mempool.atmp_accepted then begin
         Logs.info (fun m ->
           m "Accepted tx %s into mempool (fee=%Ld vsize=%d)"
-            (Types.hash_to_hex result.Mempool.txid)
-            result.Mempool.fee result.Mempool.vsize);
+            (Types.hash256_to_hex result.Mempool.atmp_txid)
+            result.Mempool.atmp_fee result.Mempool.atmp_vsize);
         (* Convert fee rate to sat/kvB for feefilter comparison *)
         let fee_rate_kvb =
-          if result.Mempool.vsize > 0 then
-            Int64.div (Int64.mul result.Mempool.fee 1000L)
-              (Int64.of_int result.Mempool.vsize)
+          if result.Mempool.atmp_vsize > 0 then
+            Int64.div (Int64.mul result.Mempool.atmp_fee 1000L)
+              (Int64.of_int result.Mempool.atmp_vsize)
           else 0L
         in
         (* Relay inv to all ready peers except the sender *)
@@ -466,17 +466,17 @@ let run (config : config) : unit Lwt.t =
                 else P2p.InvTx
               in
               Peer.send_message relay_peer
-                (P2p.InvMsg [{ P2p.inv_type; hash = result.Mempool.txid }])
+                (P2p.InvMsg [{ P2p.inv_type; hash = result.Mempool.atmp_txid }])
             ) (fun _exn -> Lwt.return_unit)
           else
             Lwt.return_unit
         ) ready
       end else begin
-        (match result.Mempool.reject_reason with
+        (match result.Mempool.atmp_reject_reason with
          | Some reason ->
            Logs.debug (fun m ->
              m "Rejected tx %s: %s"
-               (Types.hash_to_hex result.Mempool.txid) reason)
+               (Types.hash256_to_hex result.Mempool.atmp_txid) reason)
          | None -> ());
         Lwt.return_unit
       end
@@ -509,7 +509,7 @@ let run (config : config) : unit Lwt.t =
       let header_hash = Crypto.compute_block_hash cb.header in
       Logs.info (fun m ->
         m "Received cmpctblock from peer %d: %s (%d short_ids, %d prefilled)"
-          peer.Peer.id (Types.hash_to_hex header_hash)
+          peer.Peer.id (Types.hash256_to_hex header_hash)
           (List.length cb.short_ids) (List.length cb.prefilled_txs));
       (* Attempt reconstruction using mempool *)
       let result = Peer_manager.reconstruct_from_mempool peer_manager cb in
@@ -517,7 +517,7 @@ let run (config : config) : unit Lwt.t =
        | P2p.ReconstructComplete block ->
          (* All transactions found *)
          Logs.info (fun m ->
-           m "Compact block fully reconstructed: %s" (Types.hash_to_hex header_hash));
+           m "Compact block fully reconstructed: %s" (Types.hash256_to_hex header_hash));
          (match Sync.process_new_block chain block with
           | Ok () ->
             (try Fee_estimation.process_block fee_estimator block chain.blocks_synced
@@ -532,7 +532,7 @@ let run (config : config) : unit Lwt.t =
          (* Store partial state and request missing transactions *)
          Logs.info (fun m ->
            m "Compact block %s missing %d txns, sending getblocktxn"
-             (Types.hash_to_hex header_hash) (List.length missing));
+             (Types.hash256_to_hex header_hash) (List.length missing));
          (* Build partial_txs array from reconstruction attempt *)
          let tx_count = P2p.compact_block_tx_count cb in
          let partial_txs = Array.make tx_count None in
@@ -556,7 +556,7 @@ let run (config : config) : unit Lwt.t =
            m "Compact block reconstruction failed: %s" reason);
          Lwt.return_unit)
     | P2p.BlocktxnMsg resp ->
-      let hash_hex = Types.hash_to_hex resp.block_hash in
+      let hash_hex = Types.hash256_to_hex resp.block_hash in
       Logs.info (fun m ->
         m "Received blocktxn from peer %d: %s (%d txns)"
           peer.Peer.id hash_hex (List.length resp.txs));
@@ -587,7 +587,7 @@ let run (config : config) : unit Lwt.t =
     | P2p.GetblocktxnMsg req ->
       Logs.info (fun m ->
         m "Received getblocktxn from peer %d: %s (%d indexes)"
-          peer.Peer.id (Types.hash_to_hex req.block_hash)
+          peer.Peer.id (Types.hash256_to_hex req.block_hash)
           (List.length req.indexes));
       (* Decode differential indices to absolute indices *)
       let abs_indexes = P2p.decode_differential_indices req.indexes in

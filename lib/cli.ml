@@ -173,6 +173,15 @@ let run (config : config) : unit Lwt.t =
   (* Initialize fee estimator *)
   let fee_estimator = Fee_estimation.create () in
 
+  (* Load persisted fee estimation data *)
+  let fee_est_path = Filename.concat config.data_dir "fee_estimates.dat" in
+  (try
+    if Fee_estimation.load_from_file fee_estimator fee_est_path then
+      Logs.info (fun m -> m "Loaded fee estimation data from %s" fee_est_path)
+  with exn ->
+    Logs.warn (fun m ->
+      m "Failed to load fee estimates: %s" (Printexc.to_string exn)));
+
   (* Initialize peer manager *)
   let peer_manager = Peer_manager.create
     ~config:{ Peer_manager.default_config with
@@ -412,6 +421,9 @@ let run (config : config) : unit Lwt.t =
       let hash = Crypto.compute_block_hash block.Types.header in
       (match Sync.process_new_block chain block with
        | Ok () ->
+         (* Feed the fee estimator with confirmed block data *)
+         (try Fee_estimation.process_block fee_estimator block chain.blocks_synced
+          with _ -> ());
          (* Announce the block to other peers if it advanced the tip *)
          Lwt.async (fun () ->
            Peer_manager.announce_block peer_manager block.Types.header hash);
@@ -420,6 +432,67 @@ let run (config : config) : unit Lwt.t =
          Logs.debug (fun m ->
            m "Post-IBD block rejected: %s" e);
          Lwt.return_unit)
+    | _ -> Lwt.return_unit);
+
+  (* Transaction relay: accept incoming tx messages into the mempool and relay
+     via inv to other peers. Also handle inv messages for tx announcements
+     by requesting unknown transactions via getdata. *)
+  Peer_manager.add_listener peer_manager (fun msg peer ->
+    match msg with
+    | P2p.TxMsg tx when chain.sync_state = Sync.FullySynced ->
+      let result = Mempool.accept_to_memory_pool mempool tx in
+      if result.Mempool.accepted then begin
+        Logs.info (fun m ->
+          m "Accepted tx %s into mempool (fee=%Ld vsize=%d)"
+            (Types.hash_to_hex result.Mempool.txid)
+            result.Mempool.fee result.Mempool.vsize);
+        (* Convert fee rate to sat/kvB for feefilter comparison *)
+        let fee_rate_kvb =
+          if result.Mempool.vsize > 0 then
+            Int64.div (Int64.mul result.Mempool.fee 1000L)
+              (Int64.of_int result.Mempool.vsize)
+          else 0L
+        in
+        (* Relay inv to all ready peers except the sender *)
+        let ready = Peer_manager.get_ready_peers peer_manager in
+        Lwt_list.iter_p (fun relay_peer ->
+          if relay_peer.Peer.id <> peer.Peer.id
+             && relay_peer.Peer.relay
+             && not relay_peer.Peer.block_relay_only
+             && fee_rate_kvb >= relay_peer.Peer.feefilter then
+            Lwt.catch (fun () ->
+              let inv_type =
+                if relay_peer.Peer.wtxid_relay then P2p.InvWitnessTx
+                else P2p.InvTx
+              in
+              Peer.send_message relay_peer
+                (P2p.InvMsg [{ P2p.inv_type; hash = result.Mempool.txid }])
+            ) (fun _exn -> Lwt.return_unit)
+          else
+            Lwt.return_unit
+        ) ready
+      end else begin
+        (match result.Mempool.reject_reason with
+         | Some reason ->
+           Logs.debug (fun m ->
+             m "Rejected tx %s: %s"
+               (Types.hash_to_hex result.Mempool.txid) reason)
+         | None -> ());
+        Lwt.return_unit
+      end
+    | P2p.InvMsg items when chain.sync_state = Sync.FullySynced ->
+      (* Request unknown transactions announced via inv *)
+      let tx_requests = List.filter_map (fun (iv : P2p.inv_vector) ->
+        if (iv.inv_type = P2p.InvTx || iv.inv_type = P2p.InvWitnessTx)
+           && not (Mempool.contains mempool iv.hash) then
+          Some { P2p.inv_type = P2p.InvWitnessTx; hash = iv.hash }
+        else
+          None
+      ) items in
+      if tx_requests <> [] then
+        Peer.send_message peer (P2p.GetdataMsg tx_requests)
+      else
+        Lwt.return_unit
     | _ -> Lwt.return_unit);
 
   (* BIP 152: Register a listener for compact block messages.
@@ -447,6 +520,8 @@ let run (config : config) : unit Lwt.t =
            m "Compact block fully reconstructed: %s" (Types.hash_to_hex header_hash));
          (match Sync.process_new_block chain block with
           | Ok () ->
+            (try Fee_estimation.process_block fee_estimator block chain.blocks_synced
+             with _ -> ());
             Lwt.async (fun () ->
               Peer_manager.announce_block peer_manager block.Types.header header_hash);
             Lwt.return_unit
@@ -495,6 +570,8 @@ let run (config : config) : unit Lwt.t =
               m "Compact block reconstructed from blocktxn: %s" hash_hex);
             (match Sync.process_new_block chain block with
              | Ok () ->
+               (try Fee_estimation.process_block fee_estimator block chain.blocks_synced
+                with _ -> ());
                Lwt.async (fun () ->
                  Peer_manager.announce_block peer_manager block.Types.header resp.block_hash);
                Lwt.return_unit
@@ -656,6 +733,13 @@ let run (config : config) : unit Lwt.t =
     with exn ->
       Logs.warn (fun m ->
         m "Failed to save mempool: %s" (Printexc.to_string exn)));
+    (* Save fee estimation state *)
+    (try
+      Fee_estimation.save_to_file fee_estimator fee_est_path;
+      Logs.info (fun m -> m "Saved fee estimation data to disk")
+    with exn ->
+      Logs.warn (fun m ->
+        m "Failed to save fee estimates: %s" (Printexc.to_string exn)));
     (* Save peer bans to disk *)
     (try
       Peer_manager.save_bans peer_manager db;

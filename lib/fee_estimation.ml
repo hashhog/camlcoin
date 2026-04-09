@@ -421,3 +421,89 @@ let clear (est : t) : unit =
   clear_horizon est.short;
   clear_horizon est.medium;
   clear_horizon est.long
+
+(* ============================================================================
+   Persistence — save / load estimator state to disk
+   ============================================================================ *)
+
+type serialized_bucket = {
+  s_total_confirmed : float;
+  s_total_unconfirmed : float;
+  s_blocks_to_confirm : float list;
+}
+
+type serialized_horizon = {
+  s_name : string;
+  s_decay : float;
+  s_max_target : int;
+  s_buckets : serialized_bucket array;
+}
+
+type serialized_state = {
+  s_version : int;
+  s_block_height : int;
+  s_short : serialized_horizon;
+  s_medium : serialized_horizon;
+  s_long : serialized_horizon;
+}
+
+let serialize_horizon (h : horizon) : serialized_horizon =
+  { s_name = h.name;
+    s_decay = h.decay;
+    s_max_target = h.max_target;
+    s_buckets = Array.map (fun b ->
+      { s_total_confirmed = b.total_confirmed;
+        s_total_unconfirmed = b.total_unconfirmed;
+        s_blocks_to_confirm = b.blocks_to_confirm }
+    ) h.buckets }
+
+let restore_horizon (sh : serialized_horizon) (h : horizon) : unit =
+  let n = min (Array.length sh.s_buckets) (Array.length h.buckets) in
+  for i = 0 to n - 1 do
+    let sb = sh.s_buckets.(i) in
+    h.buckets.(i).total_confirmed <- sb.s_total_confirmed;
+    h.buckets.(i).total_unconfirmed <- sb.s_total_unconfirmed;
+    h.buckets.(i).blocks_to_confirm <- sb.s_blocks_to_confirm
+  done
+
+let save_to_file (est : t) (path : string) : unit =
+  let state = {
+    s_version = 1;
+    s_block_height = est.block_height;
+    s_short = serialize_horizon est.short;
+    s_medium = serialize_horizon est.medium;
+    s_long = serialize_horizon est.long;
+  } in
+  let tmp = path ^ ".tmp" in
+  let oc = open_out_bin tmp in
+  (try
+    Marshal.to_channel oc state [];
+    close_out oc;
+    Sys.rename tmp path
+  with exn ->
+    close_out_noerr oc;
+    (try Sys.remove tmp with _ -> ());
+    raise exn)
+
+let load_from_file (est : t) (path : string) : bool =
+  if not (Sys.file_exists path) then false
+  else begin
+    try
+      let ic = open_in_bin path in
+      let state : serialized_state =
+        try
+          let s = Marshal.from_channel ic in
+          close_in ic;
+          s
+        with exn -> close_in_noerr ic; raise exn
+      in
+      if state.s_version <> 1 then false
+      else begin
+        est.block_height <- state.s_block_height;
+        restore_horizon state.s_short est.short;
+        restore_horizon state.s_medium est.medium;
+        restore_horizon state.s_long est.long;
+        true
+      end
+    with _ -> false
+  end

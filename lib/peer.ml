@@ -636,6 +636,9 @@ let misbehavior_invalid_header = 20
 let misbehavior_oversized_message = 20
 let misbehavior_bad_tx = 10
 let misbehavior_spam = 5
+let misbehavior_headers_dont_connect = 20
+let misbehavior_block_download_stall = 50
+let misbehavior_unrequested_data = 5
 
 let record_misbehavior_for (peer : peer) (infraction : string) : [`Ok | `Ban] =
   let score = match infraction with
@@ -644,6 +647,9 @@ let record_misbehavior_for (peer : peer) (infraction : string) : [`Ok | `Ban] =
     | "oversized_message" -> misbehavior_oversized_message
     | "bad_tx" -> misbehavior_bad_tx
     | "spam" -> misbehavior_spam
+    | "headers_dont_connect" -> misbehavior_headers_dont_connect
+    | "block_download_stall" -> misbehavior_block_download_stall
+    | "unrequested_data" -> misbehavior_unrequested_data
     | _ -> 1
   in
   record_misbehavior peer score

@@ -511,6 +511,8 @@ let perform_handshake_inner (peer : peer) (our_height : int32) : unit Lwt.t =
   (* Post-handshake feature negotiation *)
   (* Request headers announcements instead of inv (BIP-130) *)
   let* () = send_message peer P2p.SendheadersMsg in
+  (* BIP 152: Send sendcmpct version 2 (segwit-aware) in low-bandwidth mode *)
+  let* () = send_message peer (P2p.make_sendcmpct_msg ~high_bandwidth:false) in
   peer.state <- Ready;
   (* Reset last_ping so the message loop does not immediately fire a ping.
      Without this, last_ping=0.0 triggers needs_ping on the first iteration,
@@ -564,6 +566,8 @@ let perform_inbound_handshake_inner (peer : peer) (our_height : int32) : unit Lw
   peer.handshake_complete <- true;
   (* Post-handshake feature negotiation *)
   let* () = send_message peer P2p.SendheadersMsg in
+  (* BIP 152: Send sendcmpct version 2 (segwit-aware) in low-bandwidth mode *)
+  let* () = send_message peer (P2p.make_sendcmpct_msg ~high_bandwidth:false) in
   peer.state <- Ready;
   peer.last_ping <- Unix.gettimeofday ();
   Lwt.return_unit

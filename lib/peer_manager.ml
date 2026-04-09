@@ -1365,7 +1365,10 @@ let check_stale_peers (pm : t) : (int * string) list Lwt.t =
       (* Check block stalling *)
       if !disconnect_reason = None then
         (match check_block_stalling pm peer ~now with
-         | Some reason -> disconnect_reason := Some reason
+         | Some reason ->
+           (* Score misbehavior for stalling block downloads (+50) *)
+           ignore (Peer.record_misbehavior peer Peer.misbehavior_block_download_stall);
+           disconnect_reason := Some reason
          | None -> ());
 
       (* Check ping timeout *)

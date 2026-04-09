@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (linux-amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.x"
+      - run: opam install . --deps-only -y
+      - run: opam exec -- dune build --force @install
+      - name: Package
+        run: cp _build/default/bin/main.exe camlcoin-linux-amd64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: camlcoin-linux-amd64
+          path: camlcoin-linux-amd64
+
+  release:
+    name: Create release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true

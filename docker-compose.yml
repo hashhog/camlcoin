@@ -1,0 +1,14 @@
+services:
+  camlcoin:
+    build: .
+    container_name: camlcoin
+    restart: unless-stopped
+    ports:
+      - "48347:48347"
+      - "48337:48337"
+    volumes:
+      - camlcoin-data:/data
+    command: ["--datadir=/data", "--network=testnet4"]
+
+volumes:
+  camlcoin-data:

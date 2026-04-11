@@ -523,7 +523,7 @@ let testnet : network_config = {
 (* Testnet4 configuration (BIP-94) *)
 let testnet4 : network_config = {
   name = "testnet4";
-  magic = 0x283f161cl;  (* BIP-94 testnet4 magic: raw bytes 1c 16 3f 28 *)
+  magic = 0x1c163f28l;  (* BIP-94 testnet4 magic: bytes 1c 16 3f 28, matching Bitcoin Core chainparams *)
   default_port = 48333;
   dns_seeds = [
     "seed.testnet4.bitcoin.sprovoost.nl";

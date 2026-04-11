@@ -925,15 +925,15 @@ let is_assume_valid (state : chain_state) (height : int) : bool =
     | Some av_entry -> height <= av_entry.height
 
 (* IBD configuration constants *)
-let max_blocks_per_peer = 64           (* Max in-flight blocks per peer — aggressive for IBD *)
-let max_total_blocks_in_flight = 1024  (* Global cap on blocks in flight — 8x previous for parallel download *)
+let max_blocks_per_peer = 16           (* Max in-flight blocks per peer, matching Bitcoin Core MAX_BLOCKS_IN_TRANSIT_PER_PEER *)
+let max_total_blocks_in_flight = 128   (* Global cap on blocks in flight (8 peers × 16 per peer) *)
 let stall_timeout = 2.0                 (* 2s stall detection — re-request from another peer *)
 let base_block_timeout = 60.0           (* 60s base timeout — matches Bitcoin Core's conservative approach *)
 let max_block_timeout = 300.0           (* 5 min max timeout per block *)
 let max_stall_timeout = 1200.0          (* 20 min max stall — matches Bitcoin Core *)
 let max_consecutive_timeouts = 5        (* More forgiving before disconnect *)
-let utxo_flush_interval = 500          (* Flush UTXOs every N blocks *)
-let block_download_window = 2048      (* Max blocks ahead to queue — 2x previous for deeper pipeline *)
+let utxo_flush_interval = 500          (* Flush UTXOs every N blocks — tuned for IBD throughput *)
+let block_download_window = 1024       (* Max blocks ahead to queue, matching Bitcoin Core BLOCK_DOWNLOAD_WINDOW *)
 
 (* Orphan block pool constants *)
 let max_orphan_blocks = 750

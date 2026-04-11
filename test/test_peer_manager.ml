@@ -813,10 +813,12 @@ let test_feefilter_rounder_round () =
   (* Round 0 should give 0 *)
   let rounded0 = Peer.FeeFilterRounder.round fee_set 0L in
   Alcotest.(check int64) "0 rounds to 0" 0L rounded0;
-  (* Round large value should give one of the buckets *)
+  (* Round large value should give one of the buckets.
+     The rounder may return the bucket at or just above the input (1/3
+     probability), so we allow up to one bucket step (1.1x) above the fee. *)
   let rounded_large = Peer.FeeFilterRounder.round fee_set 5000L in
   Alcotest.(check bool) "large fee rounds to bucket"
-    true (Int64.to_float rounded_large <= 5000.0);
+    true (Int64.to_float rounded_large <= 5000.0 *. 1.1);
   (* Round max should give a high bucket *)
   let rounded_max = Peer.FeeFilterRounder.round fee_set 10_000_000L in
   Alcotest.(check bool) "max rounds to high bucket"

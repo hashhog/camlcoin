@@ -138,6 +138,7 @@ let create_test_context () =
     fee_estimator = fe;
     network = Consensus.mainnet;
     filter_index = None;
+    utxo = None;
   } in
   (ctx, db, utxo, txid1, txid2)
 
@@ -524,6 +525,7 @@ let test_getrawtransaction_confirmed_has_block_info () =
     fee_estimator = fe;
     network = Consensus.mainnet;
     filter_index = None;
+    utxo = None;
   } in
 
   let txid_hex = Types.hash256_to_hex_display txid in
@@ -593,6 +595,7 @@ let test_getrawtransaction_with_blockhash () =
     fee_estimator = fe;
     network = Consensus.mainnet;
     filter_index = None;
+    utxo = None;
   } in
 
   let txid_hex = Types.hash256_to_hex_display txid in
@@ -647,6 +650,7 @@ let test_getrawtransaction_wrong_blockhash () =
     fee_estimator = fe;
     network = Consensus.mainnet;
     filter_index = None;
+    utxo = None;
   } in
 
   (* Try to find tx that doesn't exist in this block *)
@@ -875,6 +879,7 @@ let create_regtest_context () =
     fee_estimator = fe;
     network = Consensus.regtest;
     filter_index = None;
+    utxo = None;
   } in
   (ctx, db, utxo)
 

@@ -4,7 +4,9 @@
 open Camlcoin
 
 let script_tests_path =
-  "/home/max/hashhog/bitcoin/src/test/data/script_tests.json"
+  (* resources/ is available relative to the test working directory via
+     (deps (source_tree ../resources)) in test/dune *)
+  "../resources/script_tests.json"
 
 (* ---- Hex utilities ---- *)
 

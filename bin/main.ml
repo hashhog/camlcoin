@@ -89,13 +89,18 @@ let import_utxo_arg =
   Arg.(value & opt (some string) None &
     info ["import-utxo"] ~docv:"PATH" ~doc)
 
+let metrics_port_arg =
+  let doc = "Prometheus metrics port (0 to disable)." in
+  Arg.(value & opt int 9332 &
+    info ["metricsport"] ~docv:"PORT" ~doc)
+
 (* ============================================================================
    Main Command
    ============================================================================ *)
 
 let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     p2p_port max_outbound max_inbound connect debug no_wallet prune benchmark
-    import_blocks import_utxo =
+    import_blocks import_utxo metrics_port =
   (* If benchmark flag is set, run benchmarks and exit *)
   if benchmark then begin
     Camlcoin.Cli.setup_logging debug ();
@@ -194,6 +199,7 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       wallet_enabled = not no_wallet;
       prune;
       log_categories = [];
+      metrics_port;
     } in
     Lwt_main.run (Camlcoin.Cli.run config)
   end
@@ -237,7 +243,8 @@ let cmd =
     $ prune_arg
     $ benchmark_arg
     $ import_blocks_arg
-    $ import_utxo_arg)
+    $ import_utxo_arg
+    $ metrics_port_arg)
 
 (* ============================================================================
    Entry Point

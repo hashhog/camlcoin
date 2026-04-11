@@ -1117,6 +1117,152 @@ let test_deriveaddresses_ranged_no_range () =
   cleanup_test_db ()
 
 (* ============================================================================
+   getdeploymentinfo Tests
+   ============================================================================ *)
+
+(* Create a regtest context (empty chain — tip = None).
+   On regtest, segwit_height = 0 and taproot_height = 0, so both should be
+   "active" even with an empty chain (query_height = 0). *)
+let create_regtest_context () =
+  let db_path = "/tmp/camlcoin_test_deploymentinfo_db" in
+  let rec rm_rf path =
+    if Sys.file_exists path then begin
+      if Sys.is_directory path then begin
+        Array.iter (fun f -> rm_rf (Filename.concat path f)) (Sys.readdir path);
+        Unix.rmdir path
+      end else Unix.unlink path
+    end
+  in
+  rm_rf db_path;
+  let db = Storage.ChainDB.create db_path in
+  let utxo = Utxo.UtxoSet.create db in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
+  let chain = Sync.create_chain_state db Consensus.regtest in
+  let pm = Peer_manager.create Consensus.regtest in
+  let fe = Fee_estimation.create () in
+  let ctx : Rpc.rpc_context = {
+    chain;
+    mempool = mp;
+    peer_manager = pm;
+    wallet = None;
+    wallet_manager = None;
+    fee_estimator = fe;
+    network = Consensus.regtest;
+    filter_index = None;
+    utxo = None;
+  } in
+  (ctx, db, db_path)
+
+(* Helper: extract the deployments object from a getdeploymentinfo result *)
+let get_deployments_assoc result =
+  match result with
+  | Ok (`Assoc fields) ->
+    (match List.assoc_opt "deployments" fields with
+     | Some (`Assoc deps) -> deps
+     | _ -> Alcotest.fail "deployments field missing or wrong type")
+  | Ok _ -> Alcotest.fail "result should be an object"
+  | Error msg -> Alcotest.fail ("getdeploymentinfo failed: " ^ msg)
+
+(* Test: getdeploymentinfo returns a non-empty deployments object on regtest *)
+let test_getdeploymentinfo_non_empty () =
+  let (ctx, db, db_path) = create_regtest_context () in
+  let result = Rpc.handle_getdeploymentinfo ctx [] in
+  let deps = get_deployments_assoc result in
+  Alcotest.(check bool) "deployments non-empty" true (List.length deps > 0);
+  Storage.ChainDB.close db;
+  let rec rm_rf path =
+    if Sys.file_exists path then begin
+      if Sys.is_directory path then begin
+        Array.iter (fun f -> rm_rf (Filename.concat path f)) (Sys.readdir path);
+        Unix.rmdir path
+      end else Unix.unlink path
+    end
+  in
+  rm_rf db_path
+
+(* Test: segwit deployment is present and active on regtest (segwit_height = 0) *)
+let test_getdeploymentinfo_segwit_active () =
+  let (ctx, db, db_path) = create_regtest_context () in
+  let result = Rpc.handle_getdeploymentinfo ctx [] in
+  let deps = get_deployments_assoc result in
+  (match List.assoc_opt "segwit" deps with
+   | None -> Alcotest.fail "segwit deployment missing"
+   | Some (`Assoc fields) ->
+     (match List.assoc_opt "type" fields with
+      | Some (`String t) -> Alcotest.(check string) "segwit type is buried" "buried" t
+      | _ -> Alcotest.fail "segwit type field missing");
+     (match List.assoc_opt "active" fields with
+      | Some (`Bool b) -> Alcotest.(check bool) "segwit active on regtest" true b
+      | _ -> Alcotest.fail "segwit active field missing")
+   | _ -> Alcotest.fail "segwit deployment has wrong shape");
+  Storage.ChainDB.close db;
+  let rec rm_rf path =
+    if Sys.file_exists path then begin
+      if Sys.is_directory path then begin
+        Array.iter (fun f -> rm_rf (Filename.concat path f)) (Sys.readdir path);
+        Unix.rmdir path
+      end else Unix.unlink path
+    end
+  in
+  rm_rf db_path
+
+(* Test: taproot deployment is present on regtest (bip9 type with always_active) *)
+let test_getdeploymentinfo_taproot_present () =
+  let (ctx, db, db_path) = create_regtest_context () in
+  let result = Rpc.handle_getdeploymentinfo ctx [] in
+  let deps = get_deployments_assoc result in
+  (match List.assoc_opt "taproot" deps with
+   | None -> Alcotest.fail "taproot deployment missing"
+   | Some (`Assoc fields) ->
+     (* taproot on regtest uses always_active start_time so state = Active *)
+     (match List.assoc_opt "type" fields with
+      | Some (`String t) -> Alcotest.(check string) "taproot type is bip9" "bip9" t
+      | _ -> Alcotest.fail "taproot type field missing");
+     (match List.assoc_opt "active" fields with
+      | Some (`Bool b) -> Alcotest.(check bool) "taproot active on regtest" true b
+      | _ -> Alcotest.fail "taproot active field missing");
+     (* The bip9 sub-object must also be present *)
+     (match List.assoc_opt "bip9" fields with
+      | Some (`Assoc bip9_fields) ->
+        (match List.assoc_opt "status" bip9_fields with
+         | Some (`String s) -> Alcotest.(check string) "taproot bip9 status active" "active" s
+         | _ -> Alcotest.fail "taproot bip9 status missing")
+      | _ -> Alcotest.fail "taproot bip9 sub-object missing")
+   | _ -> Alcotest.fail "taproot deployment has wrong shape");
+  Storage.ChainDB.close db;
+  let rec rm_rf path =
+    if Sys.file_exists path then begin
+      if Sys.is_directory path then begin
+        Array.iter (fun f -> rm_rf (Filename.concat path f)) (Sys.readdir path);
+        Unix.rmdir path
+      end else Unix.unlink path
+    end
+  in
+  rm_rf db_path
+
+(* Test: getdeploymentinfo returns hash and height fields *)
+let test_getdeploymentinfo_fields () =
+  let (ctx, db, db_path) = create_regtest_context () in
+  let result = Rpc.handle_getdeploymentinfo ctx [] in
+  (match result with
+   | Ok (`Assoc fields) ->
+     Alcotest.(check bool) "hash field present" true (List.mem_assoc "hash" fields);
+     Alcotest.(check bool) "height field present" true (List.mem_assoc "height" fields);
+     Alcotest.(check bool) "deployments field present" true (List.mem_assoc "deployments" fields)
+   | Ok _ -> Alcotest.fail "result should be object"
+   | Error msg -> Alcotest.fail ("getdeploymentinfo failed: " ^ msg));
+  Storage.ChainDB.close db;
+  let rec rm_rf path =
+    if Sys.file_exists path then begin
+      if Sys.is_directory path then begin
+        Array.iter (fun f -> rm_rf (Filename.concat path f)) (Sys.readdir path);
+        Unix.rmdir path
+      end else Unix.unlink path
+    end
+  in
+  rm_rf db_path
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -1178,5 +1324,11 @@ let () =
       test_case "deriveaddresses single" `Quick test_deriveaddresses_single;
       test_case "deriveaddresses range" `Quick test_deriveaddresses_range;
       test_case "deriveaddresses ranged no range" `Quick test_deriveaddresses_ranged_no_range;
+    ];
+    "getdeploymentinfo", [
+      test_case "non-empty deployments" `Quick test_getdeploymentinfo_non_empty;
+      test_case "segwit active on regtest" `Quick test_getdeploymentinfo_segwit_active;
+      test_case "taproot present on regtest" `Quick test_getdeploymentinfo_taproot_present;
+      test_case "has hash/height/deployments fields" `Quick test_getdeploymentinfo_fields;
     ];
   ]

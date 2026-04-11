@@ -16,21 +16,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgmp-dev libssl-dev libev-dev libffi-dev librocksdb-dev libsecp256k1-dev libsodium-dev pkg-config
       - uses: ocaml/setup-ocaml@v3
         with:
           ocaml-compiler: "5.x"
       - run: opam install . --deps-only -y
-      - run: opam exec -- dune build
+      - run: opam exec -- dune build @install
 
   test:
     name: Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgmp-dev libssl-dev libev-dev libffi-dev librocksdb-dev libsecp256k1-dev libsodium-dev pkg-config
       - uses: ocaml/setup-ocaml@v3
         with:
           ocaml-compiler: "5.x"
-      - run: opam install . --deps-only -y
+      - run: opam install . --deps-only --with-test -y
       - run: opam exec -- dune test
 
   docker:

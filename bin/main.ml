@@ -201,7 +201,11 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       log_categories = [];
       metrics_port;
     } in
-    Lwt_main.run (Camlcoin.Cli.run config)
+    Lwt_main.run (Camlcoin.Cli.run config);
+    (* Graceful shutdown complete: exit 0 deterministically.  The 30s
+       watchdog inside Cli.run will have already called exit 1 if the
+       graceful path stalled, so reaching this point means success. *)
+    exit 0
   end
 
 let cmd =

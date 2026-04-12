@@ -1055,67 +1055,159 @@ let validate_tx_inputs (tx : Types.transaction) ~(lookup : utxo_lookup)
   end
 
 (* ============================================================================
-   Parallel Script Verification (Lwt-based)
+   Parallel Script Verification (OCaml 5 Domain-based)
    ============================================================================ *)
 
-(* Verify a single input's script asynchronously.
-   Returns Ok () on success, Error (index, message) on failure. *)
-let verify_input_script_async ~(tx : Types.transaction) ~(flags : int)
-    ~(prevouts : (int64 * Cstruct.t) list) (i : int)
-    (inp : Types.tx_in) (utxo : utxo) : (unit, int * string) result Lwt.t =
-  Lwt.return (
-    let witness =
-      if i < List.length tx.witnesses then
-        List.nth tx.witnesses i
-      else
-        { Types.items = [] }
-    in
-    let txid = Crypto.compute_txid tx in
-    let cache_key : Sig_cache.cache_key = {
-      txid; input_index = i; flags;
-    } in
-    let cache = Sig_cache.get_global () in
-    match Sig_cache.lookup cache cache_key with
-    | Some true -> Ok ()
-    | _ ->
-      match Script.verify_script
-              ~tx ~input_index:i
-              ~script_pubkey:utxo.script_pubkey
-              ~script_sig:inp.Types.script_sig
-              ~witness
-              ~amount:utxo.value
-              ~flags ~prevouts () with
-      | Error msg -> Error (i, msg)
-      | Ok false -> Error (i, "Script returned false")
-      | Ok true ->
-        Sig_cache.insert cache cache_key true;
-        Ok ()
-  )
+(* Minimum inputs per block for parallel execution.
+   Below this threshold the Domain spawn overhead exceeds the benefit. *)
+let min_inputs_for_parallel = 16
 
-(* Verify all input scripts in a transaction concurrently using Lwt.
-   First collects all (input, index, utxo) triples, then dispatches
-   them in parallel and collects the first error if any. *)
+(* Mutex protecting all sig-cache reads and writes.
+   OCaml 5 Hashtbl is NOT Domain-safe; we serialise access around a single
+   Mutex so that cache lookups from worker domains do not race with inserts
+   from the main domain.  The critical section is short (hash lookup / insert)
+   so contention is negligible compared to secp256k1 verification. *)
+let sig_cache_mutex : Mutex.t = Mutex.create ()
+
+(* Thread-safe sig-cache lookup.  Returns Some true if cached, None otherwise. *)
+let cache_lookup (cache : Sig_cache.t) (key : Sig_cache.cache_key) : bool option =
+  Mutex.lock sig_cache_mutex;
+  let r = Sig_cache.lookup cache key in
+  Mutex.unlock sig_cache_mutex;
+  r
+
+(* Thread-safe sig-cache insert (only called for successful verifications). *)
+let cache_insert (cache : Sig_cache.t) (key : Sig_cache.cache_key) (v : bool) : unit =
+  Mutex.lock sig_cache_mutex;
+  Sig_cache.insert cache key v;
+  Mutex.unlock sig_cache_mutex
+
+(* Verify a single input.  Returns Ok () on success, Error (index, msg) on
+   failure.  Safe to call from any Domain — sig-cache access is serialised. *)
+let verify_one_input
+    ~(tx : Types.transaction) ~(flags : int)
+    ~(prevouts : (int64 * Cstruct.t) list)
+    ~(txid : Types.hash256)
+    ~(cache : Sig_cache.t)
+    (i : int) (inp : Types.tx_in) (utxo : utxo)
+    : (unit, int * string) result =
+  let witness =
+    if i < List.length tx.witnesses then List.nth tx.witnesses i
+    else { Types.items = [] }
+  in
+  let cache_key : Sig_cache.cache_key = { txid; input_index = i; flags } in
+  match cache_lookup cache cache_key with
+  | Some true -> Ok ()
+  | _ ->
+    (match Script.verify_script
+             ~tx ~input_index:i
+             ~script_pubkey:utxo.script_pubkey
+             ~script_sig:inp.Types.script_sig
+             ~witness
+             ~amount:utxo.value
+             ~flags ~prevouts () with
+    | Error msg -> Error (i, msg)
+    | Ok false -> Error (i, "Script returned false")
+    | Ok true ->
+      cache_insert cache cache_key true;
+      Ok ())
+
+(* Verify a slice of (index, input, utxo) triples in the current domain.
+   Returns the first error encountered, or Ok (). *)
+let verify_input_slice
+    ~(tx : Types.transaction) ~(flags : int)
+    ~(prevouts : (int64 * Cstruct.t) list)
+    ~(txid : Types.hash256)
+    ~(cache : Sig_cache.t)
+    (tasks : (int * Types.tx_in * utxo) list)
+    : (unit, int * string) result =
+  List.fold_left (fun acc (i, inp, utxo) ->
+    match acc with
+    | Error _ as e -> e
+    | Ok () -> verify_one_input ~tx ~flags ~prevouts ~txid ~cache i inp utxo
+  ) (Ok ()) tasks
+
+(* Verify all inputs of a transaction in parallel using OCaml 5 Domains.
+   Reference: Bitcoin Core's CCheckQueue (src/checkqueue.h) which distributes
+   CScriptCheck jobs across N-1 worker threads + the master thread.
+
+   Implementation:
+   - Collect all (index, input, utxo) tasks.
+   - Partition across min(ncpus, ntasks) domains.
+   - Spawn N-1 domains; the main domain processes the last partition.
+   - Join all domains and collect the first error.
+
+   UTXO apply (the caller's responsibility) must complete in tx order before
+   this function is called — scripts are checked after the UTXO is committed,
+   matching Bitcoin Core's ConnectBlock() ordering.
+
+   Sig-cache reads/inserts are serialised via sig_cache_mutex to prevent
+   data races on the underlying Hashtbl. *)
+let verify_scripts_parallel_domain
+    ~(tx : Types.transaction) ~(flags : int)
+    ~(prevouts : (int64 * Cstruct.t) list)
+    ~(utxos : utxo option array)
+    : (unit, tx_validation_error) result =
+  (* Build task list, propagating any missing-input errors immediately. *)
+  let tasks_or_error =
+    List.fold_right (fun (i, inp) acc ->
+      match acc with
+      | Error _ as e -> e
+      | Ok ts ->
+        (match utxos.(i) with
+         | None -> Error (TxScriptFailed (i, "missing input"))
+         | Some utxo -> Ok ((i, inp, utxo) :: ts))
+    ) (List.mapi (fun i inp -> (i, inp)) tx.inputs) (Ok [])
+  in
+  match tasks_or_error with
+  | Error e -> Error e
+  | Ok tasks ->
+    let ntasks = List.length tasks in
+    if ntasks = 0 then Ok ()
+    else begin
+      let txid = Crypto.compute_txid tx in
+      let cache = Sig_cache.get_global () in
+      (* Number of domains: min(cpu_count, ntasks), at least 1. *)
+      let ncpus = Domain.recommended_domain_count () in
+      let ndomains = max 1 (min ncpus ntasks) in
+      if ndomains = 1 then begin
+        (* Serial fallback — avoid Domain overhead for tiny transactions. *)
+        match verify_input_slice ~tx ~flags ~prevouts ~txid ~cache tasks with
+        | Ok () -> Ok ()
+        | Error (idx, msg) -> Error (TxScriptFailed (idx, msg))
+      end else begin
+        (* Partition tasks across ndomains. *)
+        let chunk = (ntasks + ndomains - 1) / ndomains in
+        let task_arr = Array.of_list tasks in
+        (* Spawn ndomains-1 worker domains; main domain handles first chunk. *)
+        let workers = Array.init (ndomains - 1) (fun d ->
+          let start = (d + 1) * chunk in
+          let stop  = min ntasks (start + chunk) in
+          let slice = Array.to_list (Array.sub task_arr start (stop - start)) in
+          Domain.spawn (fun () ->
+            verify_input_slice ~tx ~flags ~prevouts ~txid ~cache slice)
+        ) in
+        (* Main domain processes first chunk. *)
+        let main_slice = Array.to_list (Array.sub task_arr 0 (min chunk ntasks)) in
+        let main_result = verify_input_slice ~tx ~flags ~prevouts ~txid ~cache main_slice in
+        (* Join all worker domains. *)
+        let worker_results = Array.map Domain.join workers in
+        (* Collect first error across all results. *)
+        let all_results = main_result :: Array.to_list worker_results in
+        match List.find_opt (fun r -> match r with Error _ -> true | Ok () -> false) all_results with
+        | Some (Error (idx, msg)) -> Error (TxScriptFailed (idx, msg))
+        | _ -> Ok ()
+      end
+    end
+
+(* Lwt-compatible wrapper: executes Domain-parallel verification synchronously.
+   (The Lwt scheduler calls this from a single-threaded context; the Domains
+   run concurrently and are joined before we return to Lwt.) *)
 let verify_scripts_parallel ~(tx : Types.transaction) ~(flags : int)
     ~(prevouts : (int64 * Cstruct.t) list)
     ~(utxos : utxo option array)
     : (unit, tx_validation_error) result Lwt.t =
-  let input_tasks = List.mapi (fun i inp ->
-    match utxos.(i) with
-    | None -> Lwt.return (Error (i, "missing input"))
-    | Some utxo -> verify_input_script_async ~tx ~flags ~prevouts i inp utxo
-  ) tx.inputs in
-  let%lwt results = Lwt_list.map_p (fun t -> t) input_tasks in
-  let first_error = List.fold_left (fun acc r ->
-    match acc with
-    | Some _ -> acc
-    | None ->
-      match r with
-      | Error (idx, msg) -> Some (TxScriptFailed (idx, msg))
-      | Ok () -> None
-  ) None results in
-  Lwt.return (match first_error with
-    | Some e -> Error e
-    | None -> Ok ())
+  Lwt.return (verify_scripts_parallel_domain ~tx ~flags ~prevouts ~utxos)
 
 (* Calculate transaction fee *)
 let calculate_tx_fee (tx : Types.transaction) ~(lookup : utxo_lookup)
@@ -1420,48 +1512,22 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
               if not (Consensus.is_valid_money !total_in) then
                 error := Some (BlockTxValidationFailed (i, TxOutputOverflow))
               else begin
-                (* Script verification using pre-resolved UTXOs *)
-                let script_error = ref None in
-                List.iteri (fun j inp ->
-                  if !script_error = None then begin
-                    match resolved_utxos.(j) with
-                    | None -> script_error := Some (TxScriptFailed (j, "missing input"))
-                    | Some utxo ->
-                      let witness =
-                        if j < List.length tx.witnesses then
-                          List.nth tx.witnesses j
-                        else
-                          { Types.items = [] }
-                      in
-                      let txid_for_cache = Crypto.compute_txid tx in
-                      let cache_key : Sig_cache.cache_key = {
-                        txid = txid_for_cache;
-                        input_index = j;
-                        flags;
-                      } in
-                      let cache = Sig_cache.get_global () in
-                      match Sig_cache.lookup cache cache_key with
-                      | Some true -> ()
-                      | _ ->
-                        match Script.verify_script
-                                ~tx ~input_index:j
-                                ~script_pubkey:utxo.script_pubkey
-                                ~script_sig:inp.Types.script_sig
-                                ~witness
-                                ~amount:utxo.value
-                                ~flags ~prevouts () with
-                        | Error msg ->
-                          script_error := Some (TxScriptFailed (j, msg))
-                        | Ok false ->
-                          script_error := Some (TxScriptFailed (j, "Script returned false"))
-                        | Ok true ->
-                          Sig_cache.insert cache cache_key true
-                  end
-                ) tx.inputs;
+                (* Parallel script verification using OCaml 5 Domains.
+                   Reference: Bitcoin Core's CCheckQueue (src/checkqueue.h) —
+                   N-1 worker threads + master thread verify inputs concurrently.
+                   Here we spawn Domain.recommended_domain_count()-1 Domains and
+                   have the main domain process one partition.  Each Domain calls
+                   verify_one_input which serialises sig-cache access via
+                   sig_cache_mutex (OCaml Hashtbl is not Domain-safe).
+                   UTXO apply must have completed before entering this section. *)
+                let script_result =
+                  verify_scripts_parallel_domain
+                    ~tx ~flags ~prevouts ~utxos:resolved_utxos
+                in
 
-                match !script_error with
-                | Some e -> error := Some (BlockTxValidationFailed (i, e))
-                | None ->
+                match script_result with
+                | Error e -> error := Some (BlockTxValidationFailed (i, e))
+                | Ok () ->
                   (* BIP68 sequence locks using pre-resolved UTXOs *)
                   if !error = None then begin
                     let utxo_heights = Array.make n_inputs 0 in

@@ -1263,6 +1263,132 @@ let test_getdeploymentinfo_fields () =
   rm_rf db_path
 
 (* ============================================================================
+   getblockchaininfo / getdeploymentinfo Consistency Tests (regtest)
+
+   These tests assert that getblockchaininfo.softforks and
+   getdeploymentinfo.deployments read from the same underlying data: every
+   deployment present in getdeploymentinfo must appear in softforks with
+   identical "type" and "active" values.
+   ============================================================================ *)
+
+(* Extract the softforks assoc list from getblockchaininfo result. *)
+let get_softforks_assoc (result : Yojson.Safe.t) =
+  match result with
+  | `Assoc fields ->
+    (match List.assoc_opt "softforks" fields with
+     | Some (`Assoc sf) -> sf
+     | Some _ -> Alcotest.fail "softforks field has wrong type"
+     | None -> Alcotest.fail "softforks field missing from getblockchaininfo")
+  | _ -> Alcotest.fail "getblockchaininfo result is not an object"
+
+(* Test: getblockchaininfo includes a non-empty softforks field on regtest *)
+let test_getblockchaininfo_has_softforks () =
+  let (ctx, db, db_path) = create_regtest_context () in
+  let result = Rpc.handle_getblockchaininfo ctx in
+  let sf = get_softforks_assoc result in
+  Alcotest.(check bool) "softforks non-empty" true (List.length sf > 0);
+  Storage.ChainDB.close db;
+  let rec rm_rf path =
+    if Sys.file_exists path then begin
+      if Sys.is_directory path then begin
+        Array.iter (fun f -> rm_rf (Filename.concat path f)) (Sys.readdir path);
+        Unix.rmdir path
+      end else Unix.unlink path
+    end
+  in
+  rm_rf db_path
+
+(* Test: every deployment in getdeploymentinfo is present in
+   getblockchaininfo.softforks with the same "type" and "active" values.
+   This is the bridge assertion: both RPCs must read from one shared helper. *)
+let test_softforks_matches_deploymentinfo () =
+  let (ctx, db, db_path) = create_regtest_context () in
+
+  (* Collect data from both RPCs *)
+  let bc_result = Rpc.handle_getblockchaininfo ctx in
+  let di_result = Rpc.handle_getdeploymentinfo ctx [] in
+
+  let sf   = get_softforks_assoc bc_result in
+  let deps = get_deployments_assoc di_result in
+
+  (* Every entry in getdeploymentinfo.deployments must appear in softforks
+     with matching type and active fields. *)
+  List.iter (fun (name, dep_json) ->
+    match dep_json with
+    | `Assoc dep_fields ->
+      let dep_type   = (match List.assoc_opt "type"   dep_fields with
+        | Some (`String t) -> t | _ -> Alcotest.fail (name ^ ": type missing in deploymentinfo")) in
+      let dep_active = (match List.assoc_opt "active" dep_fields with
+        | Some (`Bool b) -> b | _ -> Alcotest.fail (name ^ ": active missing in deploymentinfo")) in
+      (match List.assoc_opt name sf with
+       | None ->
+         Alcotest.fail (Printf.sprintf
+           "deployment '%s' present in getdeploymentinfo but missing from softforks" name)
+       | Some (`Assoc sf_fields) ->
+         let sf_type   = (match List.assoc_opt "type"   sf_fields with
+           | Some (`String t) -> t | _ -> Alcotest.fail (name ^ ": type missing in softforks")) in
+         let sf_active = (match List.assoc_opt "active" sf_fields with
+           | Some (`Bool b) -> b | _ -> Alcotest.fail (name ^ ": active missing in softforks")) in
+         Alcotest.(check string)
+           (name ^ ": type matches")   dep_type   sf_type;
+         Alcotest.(check bool)
+           (name ^ ": active matches") dep_active sf_active
+       | Some _ ->
+         Alcotest.fail (name ^ ": softforks entry has wrong shape"))
+    | _ -> Alcotest.fail (name ^ ": deploymentinfo entry has wrong shape")
+  ) deps;
+
+  Storage.ChainDB.close db;
+  let rec rm_rf path =
+    if Sys.file_exists path then begin
+      if Sys.is_directory path then begin
+        Array.iter (fun f -> rm_rf (Filename.concat path f)) (Sys.readdir path);
+        Unix.rmdir path
+      end else Unix.unlink path
+    end
+  in
+  rm_rf db_path
+
+(* Test: all five buried deployment names are present in softforks with
+   type = "buried".  We also verify that segwit (which activates at height 0
+   on regtest) is active, while bip34/65/66/csv (which activate at heights
+   500/1351/1251/432 on regtest) are correctly inactive on an empty chain. *)
+let test_softforks_buried_present_regtest () =
+  let (ctx, db, db_path) = create_regtest_context () in
+  let result = Rpc.handle_getblockchaininfo ctx in
+  let sf = get_softforks_assoc result in
+  let buried_names = ["bip34"; "bip65"; "bip66"; "csv"; "segwit"] in
+  (* All five must be present with type = "buried" *)
+  List.iter (fun name ->
+    match List.assoc_opt name sf with
+    | None -> Alcotest.fail (name ^ " missing from softforks")
+    | Some (`Assoc fields) ->
+      (match List.assoc_opt "type" fields with
+       | Some (`String t) ->
+         Alcotest.(check string) (name ^ " type is buried") "buried" t
+       | _ -> Alcotest.fail (name ^ " type field missing or wrong"))
+    | Some _ -> Alcotest.fail (name ^ " softfork entry has wrong shape")
+  ) buried_names;
+  (* segwit activates at height 0 on regtest — must be active even on empty chain *)
+  (match List.assoc_opt "segwit" sf with
+   | Some (`Assoc fields) ->
+     (match List.assoc_opt "active" fields with
+      | Some (`Bool b) ->
+        Alcotest.(check bool) "segwit active at height 0" true b
+      | _ -> Alcotest.fail "segwit active field missing")
+   | _ -> Alcotest.fail "segwit entry missing or wrong shape");
+  Storage.ChainDB.close db;
+  let rec rm_rf path =
+    if Sys.file_exists path then begin
+      if Sys.is_directory path then begin
+        Array.iter (fun f -> rm_rf (Filename.concat path f)) (Sys.readdir path);
+        Unix.rmdir path
+      end else Unix.unlink path
+    end
+  in
+  rm_rf db_path
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -1330,5 +1456,10 @@ let () =
       test_case "segwit active on regtest" `Quick test_getdeploymentinfo_segwit_active;
       test_case "taproot present on regtest" `Quick test_getdeploymentinfo_taproot_present;
       test_case "has hash/height/deployments fields" `Quick test_getdeploymentinfo_fields;
+    ];
+    "softforks_bridge", [
+      test_case "getblockchaininfo has softforks field" `Quick test_getblockchaininfo_has_softforks;
+      test_case "softforks matches deploymentinfo (shared helper)" `Quick test_softforks_matches_deploymentinfo;
+      test_case "buried deployments present on regtest" `Quick test_softforks_buried_present_regtest;
     ];
   ]

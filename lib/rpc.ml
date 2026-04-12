@@ -79,6 +79,156 @@ let json_rpc_error ~(id : Yojson.Safe.t)
   ]
 
 (* ============================================================================
+   Shared Deployment Helpers
+   These helpers are shared by getblockchaininfo (.softforks) and
+   getdeploymentinfo (.deployments) so both RPCs always read from the same
+   source of truth: chainparams (network_config) + active chain state.
+   ============================================================================ *)
+
+(* Build a buried-deployment JSON object for a soft fork that activated at
+   a specific height.  Returns a BIP9-style object (type = "buried") with:
+     type, active, height, min_activation_height
+   active = true when the block height we are querying is >= activation height. *)
+let deployment_buried_json ~(name : string) ~(activation_height : int)
+    ~(query_height : int) : string * Yojson.Safe.t =
+  let active = query_height >= activation_height in
+  (name, `Assoc [
+    ("type",                  `String "buried");
+    ("active",                `Bool active);
+    ("height",                `Int activation_height);
+    ("min_activation_height", `Int activation_height);
+  ])
+
+(* Build a BIP9-deployment JSON object for a deployment that uses the
+   version-bits state machine.  Returns the full bip9 sub-object and outer
+   wrapper matching Bitcoin Core's getdeploymentinfo output shape. *)
+let deployment_bip9_json
+    ~(dep : Consensus.deployment)
+    ~(query_height : int)
+    ~(get_block : int -> Consensus.block_index option)
+    ~(cache : Consensus.deployment_cache ref)
+    : string * Yojson.Safe.t =
+  let state = Consensus.get_deployment_state
+    ~dep ~height:query_height ~get_block
+    ~count_signals:(fun ~start_height ->
+      Consensus.count_signals_in_period ~dep ~start_height ~get_block)
+    ~cache
+  in
+  let status_str = Consensus.string_of_deployment_state state in
+
+  (* Compute the "since" block — the start of the retarget period in which
+     the current state first became active.  We walk back through periods
+     to find the one that last changed the state. *)
+  let since =
+    let period = dep.period in
+    let rec find_since h =
+      if h <= 0 then 0
+      else
+        let prev_period = h - period in
+        let prev_state = Consensus.get_deployment_state
+          ~dep ~height:(max 0 (prev_period - 1))
+          ~get_block
+          ~count_signals:(fun ~start_height ->
+            Consensus.count_signals_in_period ~dep ~start_height ~get_block)
+          ~cache
+        in
+        if prev_state <> state then h
+        else find_since prev_period
+    in
+    let period_start = query_height - (query_height mod period) in
+    find_since period_start
+  in
+
+  let bip9_fields = ref [
+    ("start_time",           `Int (Int64.to_int dep.start_time));
+    ("timeout",              `Int (Int64.to_int dep.timeout));
+    ("min_activation_height",`Int dep.min_activation_height);
+    ("status",               `String status_str);
+    ("since",                `Int since);
+  ] in
+
+  (match state with
+   | Consensus.Started | Consensus.LockedIn ->
+     bip9_fields := ("bit", `Int dep.bit) :: !bip9_fields
+   | _ -> ());
+
+  (match state with
+   | Consensus.Started | Consensus.LockedIn ->
+     let stats = Consensus.get_bip9_stats ~dep ~height:query_height ~get_block in
+     let stats_obj = `Assoc [
+       ("period",    `Int stats.period_length);
+       ("threshold", `Int stats.threshold_count);
+       ("elapsed",   `Int stats.elapsed);
+       ("count",     `Int stats.signaling_count);
+       ("possible",  `Bool stats.possible);
+     ] in
+     bip9_fields := ("statistics", stats_obj) :: !bip9_fields
+   | _ -> ());
+
+  let active = state = Consensus.Active in
+
+  let outer_fields = ref [
+    ("type",   `String "bip9");
+    ("active", `Bool active);
+    ("bip9",   `Assoc (List.rev !bip9_fields));
+  ] in
+
+  (if active then
+     outer_fields := ("height", `Int dep.min_activation_height) :: !outer_fields);
+
+  (dep.name, `Assoc (List.rev !outer_fields))
+
+(* build_deployments_assoc: canonical deployment list for a given chain state.
+   Both getblockchaininfo (.softforks) and getdeploymentinfo (.deployments)
+   call this function so they always read from the same source of truth.
+   Returns an association list of (name, json_object) pairs. *)
+let build_deployments_assoc
+    ~(net : Consensus.network_config)
+    ~(query_height : int)
+    ~(get_block : int -> Consensus.block_index option)
+    : (string * Yojson.Safe.t) list =
+  let taproot_cache   = ref Consensus.DeploymentCache.empty in
+  let testdummy_cache = ref Consensus.DeploymentCache.empty in
+
+  let buried = [
+    deployment_buried_json ~name:"bip34" ~activation_height:net.bip34_height ~query_height;
+    deployment_buried_json ~name:"bip65" ~activation_height:net.bip65_height ~query_height;
+    deployment_buried_json ~name:"bip66" ~activation_height:net.bip66_height ~query_height;
+    deployment_buried_json ~name:"csv"   ~activation_height:net.csv_height   ~query_height;
+    deployment_buried_json ~name:"segwit"~activation_height:net.segwit_height~query_height;
+  ] in
+
+  let taproot_dep = match net.network_type with
+    | Consensus.Mainnet  -> Consensus.mainnet_taproot
+    | Consensus.Testnet4 -> Consensus.testnet4_taproot
+    | Consensus.Regtest  -> Consensus.regtest_taproot
+    | Consensus.Testnet3 -> Consensus.mainnet_taproot
+  in
+  let bip9_deps = [
+    (taproot_dep,                    taproot_cache);
+    (Consensus.testdummy_deployment, testdummy_cache);
+  ] in
+  let bip9 = List.map (fun (dep, cache) ->
+    deployment_bip9_json ~dep ~query_height ~get_block ~cache
+  ) bip9_deps in
+
+  buried @ bip9
+
+(* make_get_block: build the block-index lookup function used by the BIP9
+   state machine from a chain_state. *)
+let make_get_block (chain : Sync.chain_state) (h : int)
+    : Consensus.block_index option =
+  match Sync.get_header_at_height chain h with
+  | None -> None
+  | Some e ->
+    let mtp = Sync.compute_median_time_past chain h in
+    Some Consensus.{
+      height           = e.height;
+      version          = e.header.version;
+      median_time_past = Int64.of_int32 mtp;
+    }
+
+(* ============================================================================
    Blockchain Info Handlers
    ============================================================================ *)
 
@@ -99,6 +249,12 @@ let handle_getblockchaininfo (ctx : rpc_context)
     | None -> "0000000000000000000000000000000000000000000000000000000000000000"
   in
   let validated_height = ctx.chain.blocks_synced in
+  (* Build softforks using the shared helper so the data matches
+     getdeploymentinfo exactly — same source, same state machine. *)
+  let query_height = match tip_entry with Some t -> t.height | None -> 0 in
+  let get_block = make_get_block ctx.chain in
+  let softforks = `Assoc (build_deployments_assoc
+    ~net:ctx.network ~query_height ~get_block) in
   let base_fields = [
     ("chain", `String ctx.network.name);
     ("blocks", `Int validated_height);
@@ -121,6 +277,7 @@ let handle_getblockchaininfo (ctx : rpc_context)
      ("prune_target_size", `Int ctx.chain.prune_target)]
    else []) @
   [
+    ("softforks", softforks);
     ("warnings", `String "");
   ] in
   `Assoc base_fields
@@ -2810,105 +2967,6 @@ let handle_dumptxoutset (_ctx : rpc_context)
    getdeploymentinfo Handler
    ============================================================================ *)
 
-(* Build a buried-deployment JSON object for a soft fork that activated at
-   a specific height.  Returns a BIP9-style object (type = "buried") with:
-     type, active, height, min_activation_height
-   active = true when the block height we are querying is >= activation height. *)
-let deployment_buried_json ~(name : string) ~(activation_height : int)
-    ~(query_height : int) : string * Yojson.Safe.t =
-  let active = query_height >= activation_height in
-  (name, `Assoc [
-    ("type",                  `String "buried");
-    ("active",                `Bool active);
-    ("height",                `Int activation_height);
-    ("min_activation_height", `Int activation_height);
-  ])
-
-(* Build a BIP9-deployment JSON object for a deployment that uses the
-   version-bits state machine.  Returns the full bip9 sub-object and outer
-   wrapper matching Bitcoin Core's getdeploymentinfo output shape. *)
-let deployment_bip9_json
-    ~(dep : Consensus.deployment)
-    ~(query_height : int)
-    ~(get_block : int -> Consensus.block_index option)
-    ~(cache : Consensus.deployment_cache ref)
-    : string * Yojson.Safe.t =
-  let state = Consensus.get_deployment_state
-    ~dep ~height:query_height ~get_block
-    ~count_signals:(fun ~start_height ->
-      Consensus.count_signals_in_period ~dep ~start_height ~get_block)
-    ~cache
-  in
-  let status_str = Consensus.string_of_deployment_state state in
-
-  (* Compute the "since" block — the start of the retarget period in which
-     the current state first became active.  We walk back through periods
-     to find the one that last changed the state. *)
-  let since =
-    let period = dep.period in
-    (* Walk periods from genesis forward looking for when we entered this state *)
-    let rec find_since h =
-      if h <= 0 then 0
-      else
-        let prev_period = h - period in
-        let prev_state = Consensus.get_deployment_state
-          ~dep ~height:(max 0 (prev_period - 1))
-          ~get_block
-          ~count_signals:(fun ~start_height ->
-            Consensus.count_signals_in_period ~dep ~start_height ~get_block)
-          ~cache
-        in
-        if prev_state <> state then h
-        else find_since prev_period
-    in
-    let period_start = query_height - (query_height mod period) in
-    find_since period_start
-  in
-
-  (* Build the bip9 sub-object *)
-  let bip9_fields = ref [
-    ("start_time",           `Int (Int64.to_int dep.start_time));
-    ("timeout",              `Int (Int64.to_int dep.timeout));
-    ("min_activation_height",`Int dep.min_activation_height);
-    ("status",               `String status_str);
-    ("since",                `Int since);
-  ] in
-
-  (* Add "bit" only for Started and LockedIn (same as Bitcoin Core) *)
-  (match state with
-   | Consensus.Started | Consensus.LockedIn ->
-     bip9_fields := ("bit", `Int dep.bit) :: !bip9_fields
-   | _ -> ());
-
-  (* Add statistics when in Started or LockedIn state *)
-  (match state with
-   | Consensus.Started | Consensus.LockedIn ->
-     let stats = Consensus.get_bip9_stats ~dep ~height:query_height ~get_block in
-     let stats_obj = `Assoc [
-       ("period",    `Int stats.period_length);
-       ("threshold", `Int stats.threshold_count);
-       ("elapsed",   `Int stats.elapsed);
-       ("count",     `Int stats.signaling_count);
-       ("possible",  `Bool stats.possible);
-     ] in
-     bip9_fields := ("statistics", stats_obj) :: !bip9_fields
-   | _ -> ());
-
-  let active = state = Consensus.Active in
-
-  (* outer wrapper *)
-  let outer_fields = ref [
-    ("type",   `String "bip9");
-    ("active", `Bool active);
-    ("bip9",   `Assoc (List.rev !bip9_fields));
-  ] in
-
-  (* Include height when active *)
-  (if active then
-     outer_fields := ("height", `Int dep.min_activation_height) :: !outer_fields);
-
-  (dep.name, `Assoc (List.rev !outer_fields))
-
 (* getdeploymentinfo — returns state info for all known soft-fork deployments.
    Optional param: blockhash (default: chain tip). *)
 let handle_getdeploymentinfo (ctx : rpc_context)
@@ -2936,50 +2994,8 @@ let handle_getdeploymentinfo (ctx : rpc_context)
     let query_height = entry.height in
     let hash_str = Types.hash256_to_hex_display entry.hash in
     let net = ctx.network in
-
-    (* Build get_block helper for BIP9 state machine *)
-    let get_block (h : int) : Consensus.block_index option =
-      match Sync.get_header_at_height ctx.chain h with
-      | None -> None
-      | Some e ->
-        let mtp = Sync.compute_median_time_past ctx.chain h in
-        Some Consensus.{
-          height           = e.height;
-          version          = e.header.version;
-          median_time_past = Int64.of_int32 mtp;
-        }
-    in
-
-    (* Caches for BIP9 deployments (fresh per call — acceptable since
-       getdeploymentinfo is not a hot path) *)
-    let taproot_cache   = ref Consensus.DeploymentCache.empty in
-    let testdummy_cache = ref Consensus.DeploymentCache.empty in
-
-    (* Buried deployments — activation heights come from the network config *)
-    let buried = [
-      deployment_buried_json ~name:"bip34" ~activation_height:net.bip34_height ~query_height;
-      deployment_buried_json ~name:"bip65" ~activation_height:net.bip65_height ~query_height;
-      deployment_buried_json ~name:"bip66" ~activation_height:net.bip66_height ~query_height;
-      deployment_buried_json ~name:"csv"   ~activation_height:net.csv_height   ~query_height;
-      deployment_buried_json ~name:"segwit"~activation_height:net.segwit_height~query_height;
-    ] in
-
-    (* BIP9 deployments — select per network *)
-    let taproot_dep = match net.network_type with
-      | Consensus.Mainnet  -> Consensus.mainnet_taproot
-      | Consensus.Testnet4 -> Consensus.testnet4_taproot
-      | Consensus.Regtest  -> Consensus.regtest_taproot
-      | Consensus.Testnet3 -> Consensus.mainnet_taproot  (* fallback *)
-    in
-    let bip9_deps = [
-      (taproot_dep,             taproot_cache);
-      (Consensus.testdummy_deployment, testdummy_cache);
-    ] in
-    let bip9 = List.map (fun (dep, cache) ->
-      deployment_bip9_json ~dep ~query_height ~get_block ~cache
-    ) bip9_deps in
-
-    let deployments = `Assoc (buried @ bip9) in
+    let get_block = make_get_block ctx.chain in
+    let deployments = `Assoc (build_deployments_assoc ~net ~query_height ~get_block) in
 
     Ok (`Assoc [
       ("hash",        `String hash_str);

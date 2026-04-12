@@ -220,22 +220,32 @@ let run (config : config) : unit Lwt.t =
 
   (* Set up signal handlers for graceful shutdown.
      We use Lwt_unix.on_signal so that the signal wakes the Lwt event loop
-     rather than racing with it from an OCaml signal handler. *)
+     rather than racing with it from an OCaml signal handler.  A second
+     signal during shutdown escalates immediately to a forced exit, matching
+     Bitcoin Core init.cpp semantics. *)
   let shutdown_wakener, shutdown_waiter =
     let (w, u) = Lwt.wait () in (u, w) in
   let shutdown = ref false in
+  let handle_signal name =
+    if not !shutdown then begin
+      Logs.info (fun m -> m "received %s" name);
+      shutdown := true;
+      Lwt.wakeup_later shutdown_wakener ()
+    end else begin
+      (* Second signal: escalate to immediate forced exit. *)
+      Logs.warn (fun m ->
+        m "received second %s during shutdown — forcing exit" name);
+      Printf.eprintf "[camlcoin] second %s — forcing exit\n%!" name;
+      exit 1
+    end
+  in
   let _sig_int = Lwt_unix.on_signal Sys.sigint (fun _signum ->
-    if not !shutdown then begin
-      Logs.info (fun m -> m "Received SIGINT, initiating graceful shutdown");
-      shutdown := true;
-      Lwt.wakeup_later shutdown_wakener ()
-    end) in
+    handle_signal "SIGINT") in
   let _sig_term = Lwt_unix.on_signal Sys.sigterm (fun _signum ->
-    if not !shutdown then begin
-      Logs.info (fun m -> m "Received SIGTERM, initiating graceful shutdown");
-      shutdown := true;
-      Lwt.wakeup_later shutdown_wakener ()
-    end) in
+    handle_signal "SIGTERM") in
+  (* Ignore SIGPIPE: writes to closed peer sockets must return EPIPE rather
+     than killing the process. *)
+  (try Sys.set_signal Sys.sigpipe Sys.Signal_ignore with _ -> ());
 
   (* Generate cookie credentials and write .cookie file *)
   let cookie_password =
@@ -718,15 +728,31 @@ let run (config : config) : unit Lwt.t =
     log_status ()
   in
 
-  (* Graceful shutdown procedure: flush all pending state to disk *)
+  (* Graceful shutdown procedure: flush all pending state to disk in the
+     reverse order of startup.  Each phase is wrapped in a try so that one
+     failure does not skip subsequent flushes.  Phased log lines match the
+     blockbrew / Bitcoin Core init.cpp shutdown trace. *)
   let graceful_shutdown () =
-    Logs.info (fun m -> m "Shutting down...");
-    let* () = Peer_manager.stop peer_manager in
-    (* Save wallet state *)
-    (match wallet with
-     | Some w -> Wallet.save w
-     | None -> ());
-    (* Save mempool to disk *)
+    (* Phase 1: stop P2P networking (listener + peer manager + outbound). *)
+    Logs.info (fun m -> m "stopping P2P");
+    let* () =
+      Lwt.catch
+        (fun () -> Peer_manager.stop peer_manager)
+        (fun exn ->
+          Logs.warn (fun m ->
+            m "Peer_manager.stop raised: %s" (Printexc.to_string exn));
+          Lwt.return_unit)
+    in
+    (* Phase 2: save wallet state. *)
+    (try
+      (match wallet with
+       | Some w -> Wallet.save w
+       | None -> ())
+    with exn ->
+      Logs.warn (fun m ->
+        m "Failed to save wallet: %s" (Printexc.to_string exn)));
+    (* Phase 3: flush chainstate (mempool, fee estimates, peer bans, UTXO). *)
+    Logs.info (fun m -> m "flushing chainstate");
     (try
       let mempool_path = Filename.concat config.data_dir "mempool.dat" in
       Mempool.save_mempool mempool mempool_path;
@@ -735,48 +761,74 @@ let run (config : config) : unit Lwt.t =
     with exn ->
       Logs.warn (fun m ->
         m "Failed to save mempool: %s" (Printexc.to_string exn)));
-    (* Save fee estimation state *)
     (try
       Fee_estimation.save_to_file fee_estimator fee_est_path;
       Logs.info (fun m -> m "Saved fee estimation data to disk")
     with exn ->
       Logs.warn (fun m ->
         m "Failed to save fee estimates: %s" (Printexc.to_string exn)));
-    (* Save peer bans to disk *)
     (try
       Peer_manager.save_bans peer_manager db;
       Logs.info (fun m -> m "Saved peer bans to disk")
     with exn ->
       Logs.warn (fun m ->
         m "Failed to save bans: %s" (Printexc.to_string exn)));
-    (* Flush pending UTXO updates from OptimizedUtxoSet *)
-    let dirty = Utxo.OptimizedUtxoSet.dirty_count optimized_utxo in
-    if dirty > 0 then begin
-      Logs.info (fun m -> m "Flushing %d dirty UTXO entries to disk" dirty);
-      Utxo.OptimizedUtxoSet.flush ~tip_height:chain.blocks_synced optimized_utxo;
-      (* Also update chain_tip to match blocks_synced so that on restart
-         the node resumes from the correct height (matching the flushed
-         UTXO state rather than the last periodic flush point). *)
-      let bs = chain.blocks_synced in
-      (match Sync.get_header_at_height chain bs with
-       | Some entry ->
-         Storage.ChainDB.set_chain_tip db entry.hash bs
-       | None -> ())
-    end;
-    (* Close RocksDB UTXO store *)
-    Rocksdb_store.close rocksdb;
-    Logs.info (fun m -> m "Closed RocksDB UTXO store");
-    (* Sync database to ensure all cached data is persisted *)
-    Storage.ChainDB.sync db;
-    Storage.ChainDB.close db;
-    Logs.info (fun m -> m "Shutdown complete");
+    (try
+      let dirty = Utxo.OptimizedUtxoSet.dirty_count optimized_utxo in
+      if dirty > 0 then begin
+        Logs.info (fun m -> m "Flushing %d dirty UTXO entries to disk" dirty);
+        Utxo.OptimizedUtxoSet.flush
+          ~tip_height:chain.blocks_synced optimized_utxo;
+        let bs = chain.blocks_synced in
+        (match Sync.get_header_at_height chain bs with
+         | Some entry ->
+           Storage.ChainDB.set_chain_tip db entry.hash bs
+         | None -> ())
+      end
+    with exn ->
+      Logs.warn (fun m ->
+        m "Failed to flush UTXO: %s" (Printexc.to_string exn)));
+    (* Phase 4: close databases. *)
+    Logs.info (fun m -> m "closing DB");
+    (try Rocksdb_store.close rocksdb
+     with exn ->
+       Logs.warn (fun m ->
+         m "Failed to close RocksDB: %s" (Printexc.to_string exn)));
+    (try
+      Storage.ChainDB.sync db;
+      Storage.ChainDB.close db
+    with exn ->
+      Logs.warn (fun m ->
+        m "Failed to close chainstate DB: %s" (Printexc.to_string exn)));
+    Logs.info (fun m -> m "exit");
     Lwt.return_unit
   in
 
-  (* Main event loop - waits for shutdown signal *)
+  (* 30-second hard-deadline watchdog.  Armed when the shutdown signal fires.
+     If graceful_shutdown has not completed within 30s, we best-effort close
+     the databases and call exit(1).  This prevents any single blocking step
+     (RocksDB compaction, UTXO flush, peer shutdown) from stranding the
+     process and forcing the supervisor to escalate to SIGKILL. *)
+  let watchdog () =
+    let* () = shutdown_waiter in
+    let* () = Lwt_unix.sleep 30.0 in
+    Logs.err (fun m ->
+      m "shutdown watchdog: graceful shutdown exceeded 30s — forcing exit");
+    Printf.eprintf
+      "[camlcoin] shutdown watchdog: graceful shutdown exceeded 30s — forcing exit\n%!";
+    (* Best-effort close of DBs so the next start isn't stuck on a lock. *)
+    (try Rocksdb_store.close rocksdb with _ -> ());
+    (try Storage.ChainDB.close db with _ -> ());
+    exit 1
+  in
+
+  (* Main event loop - waits for shutdown signal, then runs graceful_shutdown
+     and returns.  Using Lwt.pick against the watchdog guarantees that
+     whichever completes first wins: either graceful returns normally, or
+     the watchdog process-exits. *)
   let event_loop () =
     let* () = shutdown_waiter in
-    graceful_shutdown ()
+    Lwt.pick [ graceful_shutdown (); watchdog () ]
   in
 
   (* Prevent uncaught Lwt.async exceptions from crashing the process.
@@ -829,9 +881,32 @@ let run (config : config) : unit Lwt.t =
       Lwt.return_unit
   in
 
-  Lwt.join [
-    rpc_thread;
-    status_thread;
-    metrics_thread;
-    event_loop ();
-  ]
+  (* Run service threads in the background.  They never terminate on their
+     own (the Cohttp-based RPC and metrics servers have no stop hook that
+     resolves their promise), so we must not wait on them via Lwt.join — we
+     would hang forever on shutdown.  Instead the event_loop promise is the
+     single source of truth for when the process should return from
+     Lwt_main.run: event_loop resolves when graceful_shutdown finishes, and
+     the 30s watchdog inside it guarantees bounded exit time. *)
+  Lwt.async (fun () ->
+    Lwt.catch
+      (fun () -> rpc_thread)
+      (fun exn ->
+        Logs.warn (fun m ->
+          m "rpc_thread exited: %s" (Printexc.to_string exn));
+        Lwt.return_unit));
+  Lwt.async (fun () ->
+    Lwt.catch
+      (fun () -> status_thread)
+      (fun exn ->
+        Logs.warn (fun m ->
+          m "status_thread exited: %s" (Printexc.to_string exn));
+        Lwt.return_unit));
+  Lwt.async (fun () ->
+    Lwt.catch
+      (fun () -> metrics_thread)
+      (fun exn ->
+        Logs.warn (fun m ->
+          m "metrics_thread exited: %s" (Printexc.to_string exn));
+        Lwt.return_unit));
+  event_loop ()

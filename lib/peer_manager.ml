@@ -677,8 +677,10 @@ let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
        Hashtbl.replace pm.known_addrs addr
          { info with last_attempt = now }
      | None -> ());
+    let peer_ref = ref None in
     Lwt.catch (fun () ->
       let* peer = Peer.connect ~network:pm.network ~addr ~port ~id in
+      peer_ref := Some peer;
       let* () = Peer.perform_handshake peer pm.our_height in
       pm.peers <- peer :: pm.peers;
       (* Track connection time for eviction algorithm *)
@@ -716,6 +718,18 @@ let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
              table_status = InTried tried_bucket });
       Lwt.return_unit
     ) (fun exn ->
+      (* Connection or handshake failed: if Peer.connect succeeded but a
+         later step (e.g. perform_handshake) raised, the peer's fd and
+         Lwt_io channels need to be torn down here. If Peer.connect
+         itself raised, the fd was already closed by its internal
+         Lwt.catch wrapper (see Peer.connect). *)
+      let* () = match !peer_ref with
+        | None -> Lwt.return_unit
+        | Some peer ->
+          Lwt.catch
+            (fun () -> Peer.disconnect peer)
+            (fun _ -> Lwt.return_unit)
+      in
       (* Connection failed, record failure *)
       Log.debug (fun m -> m "Connection to %s:%d failed: %s"
         addr port (Printexc.to_string exn));
@@ -747,8 +761,10 @@ let force_add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
        Hashtbl.replace pm.known_addrs addr
          { info with last_attempt = now }
      | None -> ());
+    let peer_ref = ref None in
     Lwt.catch (fun () ->
       let* peer = Peer.connect ~network:pm.network ~addr ~port ~id in
+      peer_ref := Some peer;
       let* () = Peer.perform_handshake peer pm.our_height in
       pm.peers <- peer :: pm.peers;
       Hashtbl.replace pm.peer_connected_time peer.Peer.id now;
@@ -779,6 +795,15 @@ let force_add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
              table_status = InTried tried_bucket });
       Lwt.return_unit
     ) (fun exn ->
+      (* Tear down peer fd/channels on handshake failure; Peer.connect
+         already closed its own fd if it was the one to raise. *)
+      let* () = match !peer_ref with
+        | None -> Lwt.return_unit
+        | Some peer ->
+          Lwt.catch
+            (fun () -> Peer.disconnect peer)
+            (fun _ -> Lwt.return_unit)
+      in
       Log.debug (fun m -> m "Force connect to %s:%d failed: %s"
         addr port (Printexc.to_string exn));
       (match Hashtbl.find_opt pm.known_addrs addr with
@@ -812,8 +837,10 @@ let add_block_relay_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
      | Some info ->
        Hashtbl.replace pm.known_addrs addr { info with last_attempt = now }
      | None -> ());
+    let peer_ref = ref None in
     Lwt.catch (fun () ->
       let* peer = Peer.connect ~network:pm.network ~addr ~port ~id in
+      peer_ref := Some peer;
       peer.Peer.block_relay_only <- true;
       let* () = Peer.perform_handshake peer pm.our_height in
       pm.peers <- peer :: pm.peers;
@@ -839,6 +866,14 @@ let add_block_relay_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
       Log.info (fun m -> m "Connected block-relay-only peer %d (%s)" peer.Peer.id addr);
       Lwt.return_unit
     ) (fun _exn ->
+      (* Tear down peer fd/channels if handshake failed after connect. *)
+      let* () = match !peer_ref with
+        | None -> Lwt.return_unit
+        | Some peer ->
+          Lwt.catch
+            (fun () -> Peer.disconnect peer)
+            (fun _ -> Lwt.return_unit)
+      in
       (match Hashtbl.find_opt pm.known_addrs addr with
        | Some info ->
          Hashtbl.replace pm.known_addrs addr
@@ -1647,92 +1682,105 @@ let check_stale_tip (pm : t) : unit Lwt.t =
   end else
     Lwt.return_unit
 
-(* Connection maintenance loop *)
+(* Connection maintenance loop.
+   Supervised with a top-level Lwt.catch so a transient exception
+   (e.g. Unix_error EBADF from an fd-table pathology) cannot
+   permanently kill the outbound dialer. Mirrors the pattern of
+   accept_loop in start_listener. See
+   wave2-2026-04-14/CAMLCOIN-SMALL-PATCH-FIX.md. *)
 let maintain_connections (pm : t) : unit Lwt.t =
   let open Lwt.Syntax in
   let rec loop () =
     if not pm.running then Lwt.return_unit
     else begin
-      (* Count active outbound connections *)
-      let active_outbound = List.filter (fun p ->
-        p.Peer.state = Peer.Ready && p.Peer.direction = Peer.Outbound
-      ) pm.peers in
-      let needed = pm.config.max_outbound - List.length active_outbound in
-      (* Try to connect to more peers if needed *)
-      let* () =
-        if needed > 0 then begin
-          let candidates = get_connection_candidates pm needed in
-          Lwt_list.iter_s (fun info ->
-            add_peer pm info.address info.port
-          ) candidates
-        end else
-          Lwt.return_unit
-      in
-      (* Maintain block-relay-only outbound connections *)
-      let* () =
-        let bro_needed = pm.config.max_block_relay_only - block_relay_only_count pm in
-        if bro_needed > 0 then begin
-          let candidates = get_connection_candidates pm bro_needed in
-          Lwt_list.iter_s (fun info ->
-            add_block_relay_peer pm info.address info.port
-          ) candidates
-        end else
-          Lwt.return_unit
-      in
-      (* Ping idle peers *)
-      let* () = Lwt_list.iter_p (fun peer ->
-        if Peer.needs_ping peer then
-          Peer.send_ping peer
-        else
-          Lwt.return_unit
-      ) pm.peers in
-      (* Remove dead peers *)
-      let now = Unix.gettimeofday () in
-      let dead = List.filter (fun p ->
-        p.Peer.state = Peer.Ready &&
-        now -. p.last_seen > pm.config.dead_timeout
-      ) pm.peers in
-      let* () = Lwt_list.iter_s (fun p ->
-        remove_peer pm p.Peer.id
-      ) dead in
-      (* Evict outbound peers behind our chain tip for too long *)
-      let* () =
-        let our_h = Int32.to_int pm.our_height in
-        let behind = List.filter (fun p ->
-          p.Peer.state = Peer.Ready &&
-          p.Peer.direction = Peer.Outbound &&
-          Int32.to_int p.Peer.best_height < our_h - 1
+      Lwt.catch (fun () ->
+        (* Count active outbound connections *)
+        let active_outbound = List.filter (fun p ->
+          p.Peer.state = Peer.Ready && p.Peer.direction = Peer.Outbound
         ) pm.peers in
-        (* Track when each outbound peer first fell behind *)
-        List.iter (fun p ->
-          if not (Hashtbl.mem pm.chain_sync_behind_since p.Peer.id) then
-            Hashtbl.replace pm.chain_sync_behind_since p.Peer.id now
-        ) behind;
-        (* Clear tracking for peers that caught up *)
-        let caught_up_ids = Hashtbl.fold (fun pid _ts acc ->
-          match List.find_opt (fun p -> p.Peer.id = pid) behind with
-          | Some _ -> acc
-          | None -> pid :: acc
-        ) pm.chain_sync_behind_since [] in
-        List.iter (fun pid ->
-          Hashtbl.remove pm.chain_sync_behind_since pid
-        ) caught_up_ids;
-        (* Disconnect peers behind for longer than chain_sync_timeout *)
-        let to_evict = Hashtbl.fold (fun pid ts acc ->
-          if now -. ts > pm.config.chain_sync_timeout then pid :: acc
-          else acc
-        ) pm.chain_sync_behind_since [] in
-        Lwt_list.iter_s (fun pid ->
-          Log.info (fun m -> m "Evicting outbound peer %d: behind our tip for >%.0fs"
-            pid pm.config.chain_sync_timeout);
-          remove_peer pm pid
-        ) to_evict
-      in
-      (* Check for stale chain tip *)
-      let* () = check_stale_tip pm in
-      (* Sleep before next iteration *)
-      let* () = Lwt_unix.sleep 10.0 in
-      loop ()
+        let needed = pm.config.max_outbound - List.length active_outbound in
+        (* Try to connect to more peers if needed *)
+        let* () =
+          if needed > 0 then begin
+            let candidates = get_connection_candidates pm needed in
+            Lwt_list.iter_s (fun info ->
+              add_peer pm info.address info.port
+            ) candidates
+          end else
+            Lwt.return_unit
+        in
+        (* Maintain block-relay-only outbound connections *)
+        let* () =
+          let bro_needed = pm.config.max_block_relay_only - block_relay_only_count pm in
+          if bro_needed > 0 then begin
+            let candidates = get_connection_candidates pm bro_needed in
+            Lwt_list.iter_s (fun info ->
+              add_block_relay_peer pm info.address info.port
+            ) candidates
+          end else
+            Lwt.return_unit
+        in
+        (* Ping idle peers *)
+        let* () = Lwt_list.iter_p (fun peer ->
+          if Peer.needs_ping peer then
+            Peer.send_ping peer
+          else
+            Lwt.return_unit
+        ) pm.peers in
+        (* Remove dead peers *)
+        let now = Unix.gettimeofday () in
+        let dead = List.filter (fun p ->
+          p.Peer.state = Peer.Ready &&
+          now -. p.last_seen > pm.config.dead_timeout
+        ) pm.peers in
+        let* () = Lwt_list.iter_s (fun p ->
+          remove_peer pm p.Peer.id
+        ) dead in
+        (* Evict outbound peers behind our chain tip for too long *)
+        let* () =
+          let our_h = Int32.to_int pm.our_height in
+          let behind = List.filter (fun p ->
+            p.Peer.state = Peer.Ready &&
+            p.Peer.direction = Peer.Outbound &&
+            Int32.to_int p.Peer.best_height < our_h - 1
+          ) pm.peers in
+          (* Track when each outbound peer first fell behind *)
+          List.iter (fun p ->
+            if not (Hashtbl.mem pm.chain_sync_behind_since p.Peer.id) then
+              Hashtbl.replace pm.chain_sync_behind_since p.Peer.id now
+          ) behind;
+          (* Clear tracking for peers that caught up *)
+          let caught_up_ids = Hashtbl.fold (fun pid _ts acc ->
+            match List.find_opt (fun p -> p.Peer.id = pid) behind with
+            | Some _ -> acc
+            | None -> pid :: acc
+          ) pm.chain_sync_behind_since [] in
+          List.iter (fun pid ->
+            Hashtbl.remove pm.chain_sync_behind_since pid
+          ) caught_up_ids;
+          (* Disconnect peers behind for longer than chain_sync_timeout *)
+          let to_evict = Hashtbl.fold (fun pid ts acc ->
+            if now -. ts > pm.config.chain_sync_timeout then pid :: acc
+            else acc
+          ) pm.chain_sync_behind_since [] in
+          Lwt_list.iter_s (fun pid ->
+            Log.info (fun m -> m "Evicting outbound peer %d: behind our tip for >%.0fs"
+              pid pm.config.chain_sync_timeout);
+            remove_peer pm pid
+          ) to_evict
+        in
+        (* Check for stale chain tip *)
+        let* () = check_stale_tip pm in
+        (* Sleep before next iteration *)
+        let* () = Lwt_unix.sleep 10.0 in
+        loop ()
+      ) (fun exn ->
+        Log.warn (fun m ->
+          m "maintain_connections: transient exception: %s — retrying in 10s"
+            (Printexc.to_string exn));
+        let* () = Lwt_unix.sleep 10.0 in
+        loop ()
+      )
     end
   in
   loop ()

@@ -227,7 +227,11 @@ let make_peer ~(network : Consensus.network_config) ~(addr : string)
     pending_read = None;
   }
 
-(* Establish TCP connection to a peer with timeout *)
+(* Establish TCP connection to a peer with timeout.
+   The socket fd is always closed on any failure path (timeout,
+   ECONNREFUSED, EHOSTUNREACH, or make_peer raising) to prevent
+   outbound socket fd leaks. See CAMLCOIN-REVIVE-FEASIBILITY.md and
+   wave2-2026-04-14/CAMLCOIN-SMALL-PATCH-FIX.md. *)
 let connect ~(network : Consensus.network_config) ~(addr : string)
     ~(port : int) ~(id : int) : peer Lwt.t =
   let open Lwt.Syntax in
@@ -239,15 +243,22 @@ let connect ~(network : Consensus.network_config) ~(addr : string)
   | ai :: _ ->
     let fd = Lwt_unix.socket ai.ai_family
       ai.ai_socktype ai.ai_protocol in
-    (* Set connection timeout *)
-    let timeout =
-      let* () = Lwt_unix.sleep connection_timeout in
-      Lwt.fail_with "Connection timeout" in
-    let do_connect = Lwt_unix.connect fd ai.ai_addr in
-    let* () = Lwt.pick [do_connect; timeout] in
-    Lwt.return (make_peer ~network ~addr ~port ~id ~direction:Outbound ~fd)
+    Lwt.catch (fun () ->
+      (* Set connection timeout *)
+      let timeout =
+        let* () = Lwt_unix.sleep connection_timeout in
+        Lwt.fail_with "Connection timeout" in
+      let do_connect = Lwt_unix.connect fd ai.ai_addr in
+      let* () = Lwt.pick [do_connect; timeout] in
+      Lwt.return (make_peer ~network ~addr ~port ~id ~direction:Outbound ~fd))
+    (fun exn ->
+      let* () = Lwt.catch
+        (fun () -> Lwt_unix.close fd)
+        (fun _ -> Lwt.return_unit) in
+      Lwt.fail exn)
 
-(* Establish TCP connection through a proxy (Tor, I2P, or SOCKS5) *)
+(* Establish TCP connection through a proxy (Tor, I2P, or SOCKS5).
+   The proxy-produced fd is defensively closed if make_peer ever raises. *)
 let connect_with_proxy ~(network : Consensus.network_config) ~(addr : string)
     ~(port : int) ~(id : int) ~(proxy_config : P2p.proxy_config) : peer Lwt.t =
   let open Lwt.Syntax in
@@ -263,7 +274,14 @@ let connect_with_proxy ~(network : Consensus.network_config) ~(addr : string)
     | Error msg -> Lwt.fail_with msg
   in
   let* fd = Lwt.pick [do_connect; timeout] in
-  Lwt.return (make_peer ~network ~addr ~port ~id ~direction:Outbound ~fd)
+  Lwt.catch
+    (fun () ->
+      Lwt.return (make_peer ~network ~addr ~port ~id ~direction:Outbound ~fd))
+    (fun exn ->
+      let* () = Lwt.catch
+        (fun () -> Lwt_unix.close fd)
+        (fun _ -> Lwt.return_unit) in
+      Lwt.fail exn)
 
 (* Read a message from the peer with protection against stream desync.
    Uses Lwt.no_cancel to ensure TCP reads complete atomically. *)

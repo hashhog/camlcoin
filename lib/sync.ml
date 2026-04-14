@@ -1516,13 +1516,18 @@ let compute_expected_bits (state : chain_state) (height : int)
 let get_mtp_for_height (state : chain_state) (h : int) : int32 =
   compute_median_time_past state h
 
-(* Process downloaded blocks in height order *)
-let process_downloaded_blocks (ibd : ibd_state)
+(* Process downloaded blocks in height order.
+   [max_blocks] caps how many blocks are processed in one synchronous call.
+   Cap exists to prevent Lwt scheduler starvation: each block validation is
+   CPU-heavy (script verification, UTXO updates, RocksDB writes) and holds
+   the Lwt thread. Returning periodically lets the caller's inner_loop
+   Lwt_unix.sleep 0.001 yield to the RPC/metrics handlers. *)
+let process_downloaded_blocks ?(max_blocks = 4) (ibd : ibd_state)
     : (int, string) result =
   let processed = ref 0 in
   let error = ref None in
   let continue = ref true in
-  while !continue && !error = None do
+  while !continue && !error = None && !processed < max_blocks do
     match queue_find_by_height ibd ibd.next_process_height with
     | Some entry -> begin
       match entry.download_state with

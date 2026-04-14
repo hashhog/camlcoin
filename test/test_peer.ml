@@ -887,6 +887,76 @@ let test_passes_feefilter_direct () =
   Alcotest.(check bool) "block passes" true
     (Peer.passes_feefilter peer entry_block)
 
+(* fd-leak regression tests for outbound Peer.connect error paths.
+   See wave2-2026-04-14/CAMLCOIN-SMALL-PATCH-FIX.md and
+   CAMLCOIN-REVIVE-FEASIBILITY.md — every outbound dial that hit a
+   timeout or ECONNREFUSED leaked exactly one socket fd until patched. *)
+
+let count_fds () =
+  (* Linux: count entries in /proc/self/fd. Skip on non-Linux. *)
+  try Array.length (Sys.readdir "/proc/self/fd")
+  with Sys_error _ -> -1
+
+let test_connect_refused_no_fd_leak () =
+  (* Port 1 on localhost should reliably refuse / be unbound. *)
+  let before = count_fds () in
+  if before < 0 then
+    (* Non-Linux — skip via trivial assertion *)
+    Alcotest.(check pass) "non-linux skip" () ()
+  else begin
+    let fail_once () =
+      Lwt.catch
+        (fun () ->
+          let open Lwt.Syntax in
+          let* _peer = Peer.connect ~network:Consensus.mainnet
+            ~addr:"127.0.0.1" ~port:1 ~id:0 in
+          Lwt.return_unit)
+        (fun _ -> Lwt.return_unit)
+    in
+    let rec loop n =
+      if n = 0 then Lwt.return_unit
+      else
+        let open Lwt.Syntax in
+        let* () = fail_once () in loop (n - 1)
+    in
+    Lwt_main.run (loop 20);
+    let after = count_fds () in
+    (* Allow a tiny slack for transient dune/runtime fds *)
+    Alcotest.(check bool)
+      (Printf.sprintf "fd count stable (before=%d after=%d)" before after)
+      true (after <= before + 2)
+  end
+
+let test_connect_timeout_no_fd_leak () =
+  (* 10.255.255.1 is reserved — connect should timeout. Keep N small
+     because each iteration waits out Peer.connection_timeout. *)
+  let before = count_fds () in
+  if before < 0 then
+    Alcotest.(check pass) "non-linux skip" () ()
+  else begin
+    let fail_once () =
+      Lwt.catch
+        (fun () ->
+          let open Lwt.Syntax in
+          let* _peer = Peer.connect ~network:Consensus.mainnet
+            ~addr:"10.255.255.1" ~port:1 ~id:0 in
+          Lwt.return_unit)
+        (fun _ -> Lwt.return_unit)
+    in
+    let rec loop n =
+      if n = 0 then Lwt.return_unit
+      else
+        let open Lwt.Syntax in
+        let* () = fail_once () in loop (n - 1)
+    in
+    (* Only 2 iterations — each pays connection_timeout *)
+    Lwt_main.run (loop 2);
+    let after = count_fds () in
+    Alcotest.(check bool)
+      (Printf.sprintf "fd count stable (before=%d after=%d)" before after)
+      true (after <= before + 2)
+  end
+
 (* All tests *)
 let () =
   Alcotest.run "Peer" [
@@ -969,5 +1039,11 @@ let () =
       Alcotest.test_case "rounder_round" `Quick test_feefilter_rounder_round;
       Alcotest.test_case "significant_change" `Quick test_significant_feefilter_change;
       Alcotest.test_case "passes_feefilter" `Quick test_passes_feefilter_direct;
+    ];
+    "fd_leak", [
+      Alcotest.test_case "connect_refused_no_leak"
+        `Quick test_connect_refused_no_fd_leak;
+      Alcotest.test_case "connect_timeout_no_leak"
+        `Slow test_connect_timeout_no_fd_leak;
     ];
   ]

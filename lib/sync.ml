@@ -1522,7 +1522,7 @@ let get_mtp_for_height (state : chain_state) (h : int) : int32 =
    CPU-heavy (script verification, UTXO updates, RocksDB writes) and holds
    the Lwt thread. Returning periodically lets the caller's inner_loop
    Lwt_unix.sleep 0.001 yield to the RPC/metrics handlers. *)
-let process_downloaded_blocks ?(max_blocks = 4) (ibd : ibd_state)
+let process_downloaded_blocks ?(max_blocks = 1) (ibd : ibd_state)
     : (int, string) result =
   let processed = ref 0 in
   let error = ref None in

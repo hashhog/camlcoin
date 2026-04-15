@@ -1516,18 +1516,165 @@ let compute_expected_bits (state : chain_state) (height : int)
 let get_mtp_for_height (state : chain_state) (h : int) : int32 =
   compute_median_time_past state h
 
+(* ============================================================================
+   Block Validation Worker (wave 11 — Domain.join option B)
+   ============================================================================
+   A single persistent worker Domain runs block validation
+   (Validation.validate_block_with_utxos) off the Lwt main thread.
+
+   Design invariant: the worker never mutates ibd.* Hashtbls.  It only calls
+   validate_block_with_utxos with a captured lookup closure; the closure
+   reads from ibd.utxo_set / chain DB but the Lwt main thread is parked on
+   the response mvar while the worker runs, and no other Lwt callback
+   mutates the UTXO set during IBD (peer handlers touch queue/peer_states
+   only).  Mutation of ibd.* stays pinned to the Lwt thread, applied AFTER
+   the worker returns the validation result.
+
+   IPC: plain Mutex+Condition channels (not Lwt_mvar — those only work on
+   the Lwt side).  Lwt side wraps put/take in Lwt_preemptive.detach so the
+   scheduler parks rather than blocks. *)
+module Validation_worker = struct
+  type job = {
+    block : Types.block;
+    height : int;
+    expected_bits : int32;
+    median_time : int32;
+    lookup : Validation.utxo_lookup;
+    flags : int;
+    skip_scripts : bool;
+    network : Consensus.network_config;
+    get_mtp_at_height : (int -> int32) option;
+  }
+
+  type validation_result =
+    ((int64 * Types.hash256 array
+      * (Types.outpoint * Validation.utxo) list),
+     Validation.block_validation_error) result
+
+  type message = Validate of job | Shutdown
+
+  (* Two typed single-slot channels (request + response).  Plain
+     Mutex+Condition — works on both the worker Domain and (wrapped in
+     Lwt_preemptive.detach) the Lwt side. *)
+  type req_chan = {
+    rmutex : Mutex.t;
+    rcond : Condition.t;
+    mutable rmsg : message option;
+  }
+  type resp_chan = {
+    pmutex : Mutex.t;
+    pcond : Condition.t;
+    mutable presult : (validation_result, exn) result option;
+  }
+
+  type t = {
+    req : req_chan;
+    resp : resp_chan;
+    domain : unit Domain.t;
+  }
+
+  let put_req (c : req_chan) (m : message) : unit =
+    Mutex.lock c.rmutex;
+    (* Single-slot: wait until empty *)
+    while c.rmsg <> None do Condition.wait c.rcond c.rmutex done;
+    c.rmsg <- Some m;
+    Condition.broadcast c.rcond;
+    Mutex.unlock c.rmutex
+
+  let take_req (c : req_chan) : message =
+    Mutex.lock c.rmutex;
+    while c.rmsg = None do Condition.wait c.rcond c.rmutex done;
+    let m = match c.rmsg with Some v -> v | None -> assert false in
+    c.rmsg <- None;
+    Condition.broadcast c.rcond;
+    Mutex.unlock c.rmutex;
+    m
+
+  let put_resp (c : resp_chan) (r : (validation_result, exn) result) : unit =
+    Mutex.lock c.pmutex;
+    while c.presult <> None do Condition.wait c.pcond c.pmutex done;
+    c.presult <- Some r;
+    Condition.broadcast c.pcond;
+    Mutex.unlock c.pmutex
+
+  let take_resp (c : resp_chan) : (validation_result, exn) result =
+    Mutex.lock c.pmutex;
+    while c.presult = None do Condition.wait c.pcond c.pmutex done;
+    let r = match c.presult with Some v -> v | None -> assert false in
+    c.presult <- None;
+    Condition.broadcast c.pcond;
+    Mutex.unlock c.pmutex;
+    r
+
+  let worker_loop (req : req_chan) (resp : resp_chan) : unit =
+    let rec loop () =
+      match take_req req with
+      | Shutdown -> ()
+      | Validate j ->
+        let r =
+          try
+            Ok (Validation.validate_block_with_utxos j.block j.height
+                  ~expected_bits:j.expected_bits
+                  ~median_time:j.median_time
+                  ~base_lookup:j.lookup
+                  ~flags:j.flags
+                  ~skip_scripts:j.skip_scripts
+                  ~network:j.network
+                  ?get_mtp_at_height:j.get_mtp_at_height
+                  ())
+          with exn -> Error exn
+        in
+        put_resp resp r;
+        loop ()
+    in
+    loop ()
+
+  let create () : t =
+    let req = { rmutex = Mutex.create (); rcond = Condition.create ();
+                rmsg = None } in
+    let resp = { pmutex = Mutex.create (); pcond = Condition.create ();
+                 presult = None } in
+    let domain = Domain.spawn (fun () -> worker_loop req resp) in
+    { req; resp; domain }
+
+  (* Lwt-side submit: enqueue job, park Lwt scheduler (via
+     Lwt_preemptive.detach) while the worker Domain runs.
+     Crucially, the Lwt main thread is parked on Lwt_preemptive — it does
+     not hold the OCaml runtime lock while the worker is running — so
+     other Lwt callbacks CAN run, but the IBD invariant is preserved
+     because process_downloaded_blocks defers all ibd.* mutation until
+     AFTER this call returns and we're back on the Lwt thread. *)
+  let submit_lwt (t : t) (j : job) : validation_result Lwt.t =
+    let%lwt () = Lwt_preemptive.detach (fun () -> put_req t.req (Validate j)) () in
+    let%lwt r = Lwt_preemptive.detach (fun () -> take_resp t.resp) () in
+    match r with
+    | Ok v -> Lwt.return v
+    | Error exn -> Lwt.fail exn
+
+  let shutdown (t : t) : unit =
+    put_req t.req Shutdown;
+    Domain.join t.domain
+end
+
 (* Process downloaded blocks in height order.
-   [max_blocks] caps how many blocks are processed in one synchronous call.
-   Cap exists to prevent Lwt scheduler starvation: each block validation is
-   CPU-heavy (script verification, UTXO updates, RocksDB writes) and holds
-   the Lwt thread. Returning periodically lets the caller's inner_loop
-   Lwt_unix.sleep 0.001 yield to the RPC/metrics handlers. *)
-let process_downloaded_blocks ?(max_blocks = 1) (ibd : ibd_state)
-    : (int, string) result =
+   [max_blocks] caps how many blocks are processed in one call.
+   When [worker] is provided, block validation (the CPU-heavy
+   script/merkle/UTXO check) runs on a persistent worker Domain with the
+   Lwt scheduler parked on a Lwt_preemptive.detach await; all ibd.*
+   mutation still happens here on the Lwt main thread once the worker
+   returns.  When [worker] is None, validation runs inline (legacy path,
+   used for tests and post-IBD paths). *)
+let process_downloaded_blocks ?(max_blocks = 1)
+    ?(worker : Validation_worker.t option)
+    (ibd : ibd_state)
+    : (int, string) result Lwt.t =
   let processed = ref 0 in
   let error = ref None in
   let continue = ref true in
-  while !continue && !error = None && !processed < max_blocks do
+  let rec step () : unit Lwt.t =
+    if not !continue || !error <> None || !processed >= max_blocks then
+      Lwt.return_unit
+    else
     match queue_find_by_height ibd ibd.next_process_height with
     | Some entry -> begin
       match entry.download_state with
@@ -1589,11 +1736,28 @@ let process_downloaded_blocks ?(max_blocks = 1) (ibd : ibd_state)
           if skip_scripts then 0
           else Consensus.get_block_script_flags height ibd.chain.network
         in
-        (match Validation.validate_block_with_utxos block height
-                 ~expected_bits ~median_time ~base_lookup:lookup
-                 ~flags:validation_flags ~skip_scripts
-                 ~network:ibd.chain.network
-                 ~get_mtp_at_height:(get_mtp_for_height ibd.chain) () with
+        let%lwt vresult =
+          match worker with
+          | Some w ->
+            let job : Validation_worker.job = {
+              block; height;
+              expected_bits; median_time;
+              lookup;
+              flags = validation_flags;
+              skip_scripts;
+              network = ibd.chain.network;
+              get_mtp_at_height = Some (get_mtp_for_height ibd.chain);
+            } in
+            Validation_worker.submit_lwt w job
+          | None ->
+            Lwt.return (
+              Validation.validate_block_with_utxos block height
+                ~expected_bits ~median_time ~base_lookup:lookup
+                ~flags:validation_flags ~skip_scripts
+                ~network:ibd.chain.network
+                ~get_mtp_at_height:(get_mtp_for_height ibd.chain) ())
+        in
+        (match vresult with
          | Ok (_fees, txid_arr, spent_utxo_list) ->
            let ibd_mode = skip_scripts in
            (* Fix 3: Skip block/undo storage during assume-valid IBD *)
@@ -1742,7 +1906,8 @@ let process_downloaded_blocks ?(max_blocks = 1) (ibd : ibd_state)
            (* Check for orphan blocks that depend on this one *)
            ignore (process_orphan_blocks ibd entry.hash);
            (* Remove validated entries from queue *)
-           queue_remove_validated ibd
+           queue_remove_validated ibd;
+           step ()
          | Error e ->
            (* Record misbehavior for the peer that sent this block *)
            (match peer_id with
@@ -1753,18 +1918,24 @@ let process_downloaded_blocks ?(max_blocks = 1) (ibd : ibd_state)
             | None -> ());
            error := Some (Printf.sprintf
              "Block validation failed at height %d: %s"
-             height (Validation.block_error_to_string e)))
+             height (Validation.block_error_to_string e));
+           Lwt.return_unit)
       | NotRequested | Requested _ ->
-        continue := false  (* Waiting for download *)
+        continue := false;  (* Waiting for download *)
+        Lwt.return_unit
       | Validated ->
         (* Already validated, skip *)
-        ibd.next_process_height <- ibd.next_process_height + 1
+        ibd.next_process_height <- ibd.next_process_height + 1;
+        step ()
       end
-    | None -> continue := false
-  done;
+    | None ->
+      continue := false;
+      Lwt.return_unit
+  in
+  let%lwt () = step () in
   match !error with
-  | Some e -> Error e
-  | None -> Ok !processed
+  | Some e -> Lwt.return (Error e)
+  | None -> Lwt.return (Ok !processed)
 
 (* ============================================================================
    Chain Reorganization
@@ -2056,6 +2227,11 @@ let run_ibd (ibd : ibd_state) (get_peers : unit -> Peer.peer list) : unit Lwt.t 
   let last_progress_log = ref (Unix.gettimeofday ()) in
   let ibd_start_time = Unix.gettimeofday () in
   let total_processed = ref 0 in
+  (* Spawn the persistent validation worker Domain (wave 11 option B).
+     The worker runs block validation off the Lwt main thread; all ibd.*
+     mutation remains on the Lwt thread. *)
+  let worker = Validation_worker.create () in
+  Logs.info (fun m -> m "IBD: spawned persistent validation worker Domain");
   (* Helper: send requests to all active peers *)
   let send_requests () =
     let peers = get_peers () in
@@ -2086,6 +2262,8 @@ let run_ibd (ibd : ibd_state) (get_peers : unit -> Peer.peer list) : unit Lwt.t 
           ibd.chain.blocks_synced !total_processed elapsed
           (float_of_int !total_processed /. elapsed));
       ibd.chain.sync_state <- FullySynced;
+      (* Shut down the persistent validation worker cleanly. *)
+      (try Validation_worker.shutdown worker with _ -> ());
       Lwt.return_unit
     end else begin
       (* Periodic orphan expiry (cheap, runs ~once/loop) *)
@@ -2109,9 +2287,13 @@ let run_ibd (ibd : ibd_state) (get_peers : unit -> Peer.peer list) : unit Lwt.t 
         else begin
           (* Yield to let Lwt schedule network I/O and block receipt *)
           let%lwt () = Lwt_unix.sleep 0.001 in
-          (* Process completed blocks *)
-          match (try process_downloaded_blocks ibd with
-                 | exn -> Error (Printexc.to_string exn)) with
+          (* Process completed blocks — validation runs in the worker Domain *)
+          let%lwt result =
+            Lwt.catch
+              (fun () -> process_downloaded_blocks ~worker ibd)
+              (fun exn -> Lwt.return (Error (Printexc.to_string exn)))
+          in
+          match result with
           | Ok n when n > 0 ->
             round_processed := !round_processed + n;
             total_processed := !total_processed + n;

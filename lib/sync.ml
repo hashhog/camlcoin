@@ -1174,9 +1174,15 @@ let request_blocks (ibd : ibd_state) (peers : Peer.peer list)
   let now = Unix.gettimeofday () in
   (* First check for timeouts *)
   check_timeouts ibd;
-  (* Mark blocks we already have on disk as validated (do this once, not per-peer) *)
+  (* Mark blocks we already have on disk as validated — but ONLY if their
+     height is at or below blocks_synced.  A block above blocks_synced may be
+     on disk from a prior session (stored by the "doesn't connect to tip" path
+     without UTXO processing), or may have been written with stripped witness
+     data.  Marking such a block Validated skips the UTXO update, corrupting
+     the UTXO set for all subsequent blocks. *)
   Queue.iter (fun entry ->
     if entry.download_state = NotRequested &&
+       entry.height <= ibd.chain.blocks_synced &&
        Storage.ChainDB.has_block ibd.chain.db entry.hash then
       entry.download_state <- Validated
   ) ibd.block_queue;

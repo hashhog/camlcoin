@@ -439,12 +439,20 @@ end
    on open by scanning the log.  This avoids the filesystem-overhead-per-key
    problem of FileStorage while requiring no external C libraries. *)
 module LogStorage : STORAGE = struct
+  (* [mutex] serializes access to data_fd + data_offset + index + deleted.
+     The Validation_worker Domain calls [get] / [iter_prefix] concurrently
+     with the main Lwt Domain's [put] / [delete] / [batch_write], and
+     Unix.lseek on a shared fd without locking corrupts the file offset
+     and — under sustained OCaml 5 multi-Domain load — triggers
+     EBADF/ESPIPE on subsequent lseek calls. See W38
+     camlcoin-ebadf-investigation.md. *)
   type t = {
     base_dir : string;
     mutable data_fd : Unix.file_descr;
     mutable data_offset : int;
     index : (string, int * int) Hashtbl.t;  (* key -> (value_offset, value_len) *)
     deleted : (string, unit) Hashtbl.t;
+    mutex : Mutex.t;
   }
 
   type batch = (string * [`Put of string | `Delete]) list ref
@@ -683,6 +691,7 @@ module LogStorage : STORAGE = struct
       data_offset = 0;
       index = Hashtbl.create 10000;
       deleted = Hashtbl.create 128;
+      mutex = Mutex.create ();
     } in
     rebuild_index t;
     (* Replay WAL if present *)
@@ -696,25 +705,30 @@ module LogStorage : STORAGE = struct
     t
 
   let close t =
-    (try Unix.fsync t.data_fd with Unix.Unix_error _ -> ());
-    (try Unix.close t.data_fd with Unix.Unix_error _ -> ())
+    Mutex.protect t.mutex (fun () ->
+      (try Unix.fsync t.data_fd with Unix.Unix_error _ -> ());
+      (try Unix.close t.data_fd with Unix.Unix_error _ -> ()))
 
   let sync t =
-    (try Unix.fsync t.data_fd with Unix.Unix_error _ -> ())
+    Mutex.protect t.mutex (fun () ->
+      (try Unix.fsync t.data_fd with Unix.Unix_error _ -> ()))
 
   let get t key =
-    if Hashtbl.mem t.deleted key then None
-    else
-      match Hashtbl.find_opt t.index key with
-      | None -> None
-      | Some (offset, vlen) ->
-        let _ = Unix.lseek t.data_fd offset Unix.SEEK_SET in
-        let buf = really_read_fd t.data_fd vlen in
-        Some (Bytes.to_string buf)
+    Mutex.protect t.mutex (fun () ->
+      if Hashtbl.mem t.deleted key then None
+      else
+        match Hashtbl.find_opt t.index key with
+        | None -> None
+        | Some (offset, vlen) ->
+          let _ = Unix.lseek t.data_fd offset Unix.SEEK_SET in
+          let buf = really_read_fd t.data_fd vlen in
+          Some (Bytes.to_string buf))
 
-  let put t key value = append_put t key value
+  let put t key value =
+    Mutex.protect t.mutex (fun () -> append_put t key value)
 
-  let delete t key = append_delete t key
+  let delete t key =
+    Mutex.protect t.mutex (fun () -> append_delete t key)
 
   let batch_create () = ref []
   let batch_put b key value = b := (key, `Put value) :: !b
@@ -722,25 +736,39 @@ module LogStorage : STORAGE = struct
 
   let batch_write t b =
     let ops = List.rev !b in
-    if ops <> [] then begin
-      wal_write t ops;
-      apply_ops t ops;
-      wal_delete t
-    end
+    if ops <> [] then
+      Mutex.protect t.mutex (fun () ->
+        wal_write t ops;
+        apply_ops t ops;
+        wal_delete t)
 
   let iter_keys t f =
-    Hashtbl.iter (fun k _v -> f k) t.index
+    (* Snapshot keys under the lock, then invoke [f] outside the critical
+       section so that [f] is free to call back into LogStorage.get without
+       deadlocking (Mutex.t is non-recursive). *)
+    let keys =
+      Mutex.protect t.mutex (fun () ->
+        Hashtbl.fold (fun k _v acc -> k :: acc) t.index [])
+    in
+    List.iter f keys
 
   let iter_prefix t prefix f =
+    (* Snapshot (key, value) pairs matching prefix under the lock, then
+       invoke [f] outside the critical section (same reasoning as
+       [iter_keys]). *)
     let prefix_len = String.length prefix in
-    Hashtbl.iter (fun k (offset, vlen) ->
-      if String.length k >= prefix_len &&
-         String.sub k 0 prefix_len = prefix then begin
-        let _ = Unix.lseek t.data_fd offset Unix.SEEK_SET in
-        let buf = really_read_fd t.data_fd vlen in
-        f k (Bytes.to_string buf)
-      end
-    ) t.index
+    let entries =
+      Mutex.protect t.mutex (fun () ->
+        Hashtbl.fold (fun k (offset, vlen) acc ->
+          if String.length k >= prefix_len &&
+             String.sub k 0 prefix_len = prefix then begin
+            let _ = Unix.lseek t.data_fd offset Unix.SEEK_SET in
+            let buf = really_read_fd t.data_fd vlen in
+            (k, Bytes.to_string buf) :: acc
+          end else acc
+        ) t.index [])
+    in
+    List.iter (fun (k, v) -> f k v) entries
 end
 
 (* Key prefix constants for namespace separation *)

@@ -411,34 +411,41 @@ let run (config : config) : unit Lwt.t =
          the header chain tip persists indefinitely because no retry mechanism
          existed.  Now the stale-tip check's periodic getheaders doubles as a
          gap-fill trigger: any missing block with a known header gets
-         re-requested. *)
-      (match Sync.process_headers chain headers with
-       | Ok _ ->
-         let tip_height = match chain.tip with
-           | Some t -> t.height | None -> 0 in
-         let start_h = chain.blocks_synced + 1 in
-         if start_h <= tip_height then begin
-           let block_requests = ref [] in
-           for h = start_h to tip_height do
-             match Sync.get_header_at_height chain h with
-             | Some entry ->
-               if not (Storage.ChainDB.has_block db entry.hash) then
-                 block_requests :=
-                   { P2p.inv_type = P2p.InvWitnessBlock; hash = entry.hash }
-                   :: !block_requests
-             | None -> ()
-           done;
-           if !block_requests <> [] then begin
-             let n_requests = List.length !block_requests in
-             Logs.info (fun m ->
-               m "Post-IBD gap-fill: requesting %d missing blocks [%d..%d] from peer %d"
-                 n_requests start_h tip_height peer.Peer.id);
-             Peer.send_message peer (P2p.GetdataMsg (List.rev !block_requests))
-           end else
-             Lwt.return_unit
-         end else
-           Lwt.return_unit
-       | _ -> Lwt.return_unit)
+         re-requested.
+
+         W39 fix: the scan must also run when [process_headers] returns
+         non-Ok.  Post-restart, peers frequently reply to our getheaders with
+         headers we already have; [process_headers] then returns an error
+         ("All N headers rejected / duplicates") and the gap-fill was being
+         skipped — so the node stayed stuck at blocks_synced < tip_height
+         indefinitely.  The gap-fill target range depends only on
+         [chain.tip] and [chain.blocks_synced], both already populated from
+         prior IBD, so we run it unconditionally. *)
+      let _ = Sync.process_headers chain headers in
+      let tip_height = match chain.tip with
+        | Some t -> t.height | None -> 0 in
+      let start_h = chain.blocks_synced + 1 in
+      if start_h <= tip_height then begin
+        let block_requests = ref [] in
+        for h = start_h to tip_height do
+          match Sync.get_header_at_height chain h with
+          | Some entry ->
+            if not (Storage.ChainDB.has_block db entry.hash) then
+              block_requests :=
+                { P2p.inv_type = P2p.InvWitnessBlock; hash = entry.hash }
+                :: !block_requests
+          | None -> ()
+        done;
+        if !block_requests <> [] then begin
+          let n_requests = List.length !block_requests in
+          Logs.info (fun m ->
+            m "Post-IBD gap-fill: requesting %d missing blocks [%d..%d] from peer %d"
+              n_requests start_h tip_height peer.Peer.id);
+          Peer.send_message peer (P2p.GetdataMsg (List.rev !block_requests))
+        end else
+          Lwt.return_unit
+      end else
+        Lwt.return_unit
     | _ -> Lwt.return_unit);
 
   (* Register a listener for blocks received post-IBD (when ibd_state is None).

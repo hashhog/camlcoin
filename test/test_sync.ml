@@ -469,6 +469,7 @@ let test_check_timeouts () =
       requested_at = Unix.gettimeofday () -. 100.0; (* 100 seconds ago *)
       timeout = 5.0;
     };
+    tried_peers = [];
   } in
   Queue.clear ibd.block_queue;
   Queue.push entry ibd.block_queue;
@@ -544,6 +545,7 @@ let test_receive_block () =
       requested_at = Unix.gettimeofday ();
       timeout = 5.0;
     };
+    tried_peers = [];
   } in
   Queue.clear ibd.block_queue;
   Queue.push entry ibd.block_queue;

@@ -2409,14 +2409,103 @@ let start_ibd ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
    announcement or unsolicited push).  Validates the block against the current
    UTXO set and, on success, stores it and advances the chain tip.
    Returns Ok () on success or Error msg on failure. *)
+(* Try to connect stored blocks starting at state.tip + 1.
+   Returns the number of blocks connected.
+   W34 fix: after the gap-fill receives blocks out-of-order, later blocks are
+   stored on disk but never processed because process_new_block returns Ok ()
+   when the block is already on disk.  This helper walks the stored chain
+   forward from the current tip, processing each stored block that extends
+   the tip.  Called at the end of process_new_block so that out-of-order
+   arrivals converge to a consistent tip. *)
+let rec connect_stored_blocks (state : chain_state) : int =
+  let next_height = state.blocks_synced + 1 in
+  match get_header_at_height state next_height with
+  | None -> 0
+  | Some entry ->
+    (* Verify this stored block extends the current tip *)
+    let extends_tip = match state.tip with
+      | None -> next_height = 0
+      | Some tip ->
+        Cstruct.equal entry.header.prev_block tip.hash
+        && next_height = tip.height + 1
+    in
+    if not extends_tip then 0
+    else if not (Storage.ChainDB.has_block state.db entry.hash) then 0
+    else match Storage.ChainDB.get_block state.db entry.hash with
+      | None -> 0
+      | Some stored_block ->
+        let expected_bits = compute_expected_bits state next_height stored_block.header in
+        let median_time = compute_median_time_past state next_height in
+        let lookup outpoint =
+          let vout = Int32.to_int outpoint.Types.vout in
+          match Storage.ChainDB.get_utxo state.db outpoint.Types.txid vout with
+          | None -> None
+          | Some data ->
+            let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+            let value = Serialize.read_int64_le r in
+            let script_len = Serialize.read_compact_size r in
+            let script = Serialize.read_bytes r script_len in
+            let stored_height = Int32.to_int (Serialize.read_int32_le r) in
+            let utxo_is_coinbase = Serialize.read_uint8 r = 1 in
+            Some Validation.{
+              txid = outpoint.Types.txid;
+              vout = outpoint.Types.vout;
+              value;
+              script_pubkey = script;
+              height = stored_height;
+              is_coinbase = utxo_is_coinbase;
+            }
+        in
+        let validation_flags =
+          Consensus.get_block_script_flags next_height state.network
+        in
+        match Validation.validate_block_with_utxos stored_block next_height
+                ~expected_bits ~median_time ~base_lookup:lookup
+                ~flags:validation_flags ~skip_scripts:false
+                ~network:state.network
+                ~get_mtp_at_height:(get_mtp_for_height state) () with
+        | Ok (_fees, txid_arr, _spent_utxos) ->
+          List.iteri (fun tx_idx tx ->
+            let is_cb = (tx_idx = 0) in
+            let txid = if tx_idx < Array.length txid_arr
+                       then txid_arr.(tx_idx)
+                       else Crypto.compute_txid tx in
+            if not is_cb then
+              List.iter (fun inp ->
+                let prev = inp.Types.previous_output in
+                Storage.ChainDB.delete_utxo state.db
+                  prev.Types.txid (Int32.to_int prev.Types.vout)
+              ) tx.Types.inputs;
+            List.iteri (fun vout out ->
+              let data = encode_utxo out.Types.value out.Types.script_pubkey
+                  next_height is_cb in
+              Storage.ChainDB.store_utxo state.db txid vout data
+            ) tx.Types.outputs
+          ) stored_block.transactions;
+          state.blocks_synced <- next_height;
+          state.tip <- Some entry;
+          Storage.ChainDB.set_chain_tip state.db entry.hash next_height;
+          Storage.ChainDB.set_header_tip state.db entry.hash next_height;
+          Logs.info (fun m ->
+            m "Connected stored block %s at height %d (catch-up from gap-fill)"
+              (Types.hash256_to_hex_display entry.hash) next_height);
+          1 + connect_stored_blocks state
+        | Error e ->
+          let msg = Validation.block_error_to_string e in
+          Logs.warn (fun m ->
+            m "Stored block at height %d failed validation: %s" next_height msg);
+          0
+
 let process_new_block (state : chain_state) (block : Types.block)
     : (unit, string) result =
   let hash = Crypto.compute_block_hash block.header in
   let hash_key = Cstruct.to_string hash in
-  (* Ignore blocks we already have *)
-  if Storage.ChainDB.has_block state.db hash then
+  (* Ignore blocks we already have — but still try to advance from stored
+     out-of-order blocks in case a recent fill brought us what we needed. *)
+  if Storage.ChainDB.has_block state.db hash then begin
+    let _ = connect_stored_blocks state in
     Ok ()
-  else begin
+  end else begin
     (* The block's header must already be known (via headers-first sync). If
        not, accept the header first so we know the height. *)
     let header_entry = match Hashtbl.find_opt state.headers hash_key with
@@ -2505,6 +2594,14 @@ let process_new_block (state : chain_state) (block : Types.block)
           Logs.info (fun m ->
             m "Connected new block %s at height %d"
               (Types.hash256_to_hex_display hash) height);
+          (* W34 fix: try to connect any subsequent stored blocks that were
+             received out-of-order by the gap-fill but couldn't be processed
+             because their parent wasn't yet connected. *)
+          let connected = connect_stored_blocks state in
+          if connected > 0 then
+            Logs.info (fun m ->
+              m "Connected %d additional stored blocks, tip now at %d"
+                connected state.blocks_synced);
           Ok ()
         | Error e ->
           let msg = Validation.block_error_to_string e in

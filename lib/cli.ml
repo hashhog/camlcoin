@@ -371,9 +371,12 @@ let run (config : config) : unit Lwt.t =
     match msg with
     | P2p.InvMsg items ->
       let block_hashes = List.filter_map (fun (iv : P2p.inv_vector) ->
-        if iv.inv_type = P2p.InvBlock
+        if (iv.inv_type = P2p.InvBlock || iv.inv_type = P2p.InvWitnessBlock)
            && not (Storage.ChainDB.has_block db iv.hash) then
-          Some { P2p.inv_type = P2p.InvBlock; hash = iv.hash }
+          (* Always request with witness data so we can validate the witness
+             commitment.  Using InvBlock strips all witness data from the
+             response, breaking check_witness_commitment on segwit blocks. *)
+          Some { P2p.inv_type = P2p.InvWitnessBlock; hash = iv.hash }
         else
           None
       ) items in
@@ -413,7 +416,7 @@ let run (config : config) : unit Lwt.t =
            | Some entry ->
              if not (Storage.ChainDB.has_block db entry.hash) then
                block_requests :=
-                 { P2p.inv_type = P2p.InvBlock; hash = entry.hash }
+                 { P2p.inv_type = P2p.InvWitnessBlock; hash = entry.hash }
                  :: !block_requests
            | None -> ()
          done;

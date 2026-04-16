@@ -1909,16 +1909,29 @@ let process_downloaded_blocks ?(max_blocks = 1)
            queue_remove_validated ibd;
            step ()
          | Error e ->
-           (* Record misbehavior for the peer that sent this block *)
-           (match peer_id with
-            | Some pid ->
-              (match ibd.misbehavior_handler with
-               | Some handler -> handler pid "invalid_block"
-               | None -> ())
-            | None -> ());
-           error := Some (Printf.sprintf
-             "Block validation failed at height %d: %s"
-             height (Validation.block_error_to_string e));
+           let err_str = Validation.block_error_to_string e in
+           (* Witness commitment mismatch may mean the peer sent the block
+              without witness serialization (stripped by a non-witness peer,
+              or data mutated in transit).  This is analogous to Bitcoin
+              Core's BLOCK_MUTATED — do NOT ban the peer, just re-request
+              the block.  For all other validation errors, score the peer. *)
+           let is_mutated_witness = (e = Validation.BlockBadWitnessCommitment) in
+           if not is_mutated_witness then
+             (match peer_id with
+              | Some pid ->
+                (match ibd.misbehavior_handler with
+                 | Some handler -> handler pid "invalid_block"
+                 | None -> ())
+              | None -> ());
+           Logs.warn (fun m ->
+             m "Block validation failed at height %d: %s%s — resetting to re-download"
+               height err_str
+               (if is_mutated_witness then " (BLOCK_MUTATED — will retry)" else ""));
+           (* Reset to NotRequested so the block is re-downloaded from a
+              different peer.  Leaving it in Downloaded causes an infinite
+              retry loop against the same (possibly corrupt/stripped) data. *)
+           entry.download_state <- NotRequested;
+           continue := false;
            Lwt.return_unit)
       | NotRequested | Requested _ ->
         continue := false;  (* Waiting for download *)

@@ -404,25 +404,39 @@ let run (config : config) : unit Lwt.t =
   Peer_manager.add_listener peer_manager (fun msg peer ->
     match msg with
     | P2p.HeadersMsg headers when chain.sync_state = Sync.FullySynced ->
+      (* W33 post-IBD gap-fill fix:
+         Always scan the full [blocks_synced+1 .. tip_height] range, not just
+         the newly-accepted headers.  If prior block requests failed silently
+         (peer disconnect, notfound, etc.), the gap between blocks_synced and
+         the header chain tip persists indefinitely because no retry mechanism
+         existed.  Now the stale-tip check's periodic getheaders doubles as a
+         gap-fill trigger: any missing block with a known header gets
+         re-requested. *)
       (match Sync.process_headers chain headers with
-       | Ok n when n > 0 ->
-         (* We accepted new headers - request the corresponding blocks *)
+       | Ok _ ->
          let tip_height = match chain.tip with
            | Some t -> t.height | None -> 0 in
-         let start_h = tip_height - n + 1 in
-         let block_requests = ref [] in
-         for h = start_h to tip_height do
-           match Sync.get_header_at_height chain h with
-           | Some entry ->
-             if not (Storage.ChainDB.has_block db entry.hash) then
-               block_requests :=
-                 { P2p.inv_type = P2p.InvWitnessBlock; hash = entry.hash }
-                 :: !block_requests
-           | None -> ()
-         done;
-         if !block_requests <> [] then
-           Peer.send_message peer (P2p.GetdataMsg (List.rev !block_requests))
-         else
+         let start_h = chain.blocks_synced + 1 in
+         if start_h <= tip_height then begin
+           let block_requests = ref [] in
+           for h = start_h to tip_height do
+             match Sync.get_header_at_height chain h with
+             | Some entry ->
+               if not (Storage.ChainDB.has_block db entry.hash) then
+                 block_requests :=
+                   { P2p.inv_type = P2p.InvWitnessBlock; hash = entry.hash }
+                   :: !block_requests
+             | None -> ()
+           done;
+           if !block_requests <> [] then begin
+             let n_requests = List.length !block_requests in
+             Logs.info (fun m ->
+               m "Post-IBD gap-fill: requesting %d missing blocks [%d..%d] from peer %d"
+                 n_requests start_h tip_height peer.Peer.id);
+             Peer.send_message peer (P2p.GetdataMsg (List.rev !block_requests))
+           end else
+             Lwt.return_unit
+         end else
            Lwt.return_unit
        | _ -> Lwt.return_unit)
     | _ -> Lwt.return_unit);

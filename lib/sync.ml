@@ -2223,7 +2223,12 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
    4. Process completed blocks
    5. Immediately refill + re-request to keep pipeline saturated
    6. Repeat with multiple yield+process cycles per request round *)
-let run_ibd (ibd : ibd_state) (get_peers : unit -> Peer.peer list) : unit Lwt.t =
+let run_ibd ?(shutdown_flag : bool ref option)
+    (ibd : ibd_state) (get_peers : unit -> Peer.peer list) : unit Lwt.t =
+  let is_shutdown () = match shutdown_flag with
+    | Some r -> !r
+    | None   -> false
+  in
   let last_progress_log = ref (Unix.gettimeofday ()) in
   let ibd_start_time = Unix.gettimeofday () in
   let total_processed = ref 0 in
@@ -2246,6 +2251,11 @@ let run_ibd (ibd : ibd_state) (get_peers : unit -> Peer.peer list) : unit Lwt.t 
          Lwt.return_unit)
   in
   let rec loop () =
+    if is_shutdown () then begin
+      Logs.info (fun m -> m "IBD: shutdown requested, stopping loop");
+      (try Validation_worker.shutdown worker with _ -> ());
+      Lwt.return_unit
+    end else begin
     fill_download_queue ibd;
     let qlen = Queue.length ibd.block_queue in
     if qlen = 0 && ibd.total_blocks_in_flight = 0 then begin
@@ -2283,7 +2293,7 @@ let run_ibd (ibd : ibd_state) (get_peers : unit -> Peer.peer list) : unit Lwt.t 
          the overhead of orphan expiry, stall checks, etc. *)
       let round_processed = ref 0 in
       let rec inner_loop rounds_left =
-        if rounds_left <= 0 then Lwt.return_unit
+        if rounds_left <= 0 || is_shutdown () then Lwt.return_unit
         else begin
           (* Yield to let Lwt schedule network I/O and block receipt *)
           let%lwt () = Lwt_unix.sleep 0.001 in
@@ -2333,6 +2343,7 @@ let run_ibd (ibd : ibd_state) (get_peers : unit -> Peer.peer list) : unit Lwt.t 
       end;
       loop ()
     end
+  end  (* closes is_shutdown else begin *)
   in
   loop ()
 
@@ -2344,6 +2355,7 @@ let run_ibd (ibd : ibd_state) (get_peers : unit -> Peer.peer list) : unit Lwt.t 
 let start_ibd ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
     ?(misbehavior_handler : (int -> string -> unit) option)
     ?(on_ibd_created : (ibd_state -> unit) option)
+    ?(shutdown_flag : bool ref option)
     (state : chain_state) (get_peers : unit -> Peer.peer list)
     : unit Lwt.t =
   if state.sync_state <> SyncingBlocks then
@@ -2366,7 +2378,7 @@ let start_ibd ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
       (match on_ibd_created with
        | Some f -> f ibd
        | None -> ());
-      run_ibd ibd get_peers
+      run_ibd ?shutdown_flag ibd get_peers
     end
   end
 

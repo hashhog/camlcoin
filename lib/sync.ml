@@ -897,11 +897,17 @@ type block_download_state =
   | Downloaded of { block : Types.block; peer_id : int option }
   | Validated
 
-(* Block queue entry - tracks download progress for each block *)
+(* Block queue entry - tracks download progress for each block.
+   W34: tried_peers accumulates peers that were assigned this block and
+   failed (timeout, stall).  request_blocks prefers peers not in this list
+   to avoid repeatedly re-assigning an unresponsive peer (W31 bug: a block
+   could sit in-flight for up to max_stall_timeout=1200s because the same
+   peer kept getting picked). *)
 type block_queue_entry = {
   hash : Types.hash256;
   height : int;
   mutable download_state : block_download_state;
+  mutable tried_peers : int list;
 }
 
 (* Per-peer download tracking to avoid blocking on slow peers *)
@@ -1077,11 +1083,14 @@ let fill_download_queue (ibd : ibd_state) : unit =
           queue_add ibd {
             hash; height;
             download_state = Downloaded { block; peer_id = None };
+            tried_peers = [];
           }
         | None ->
-          queue_add ibd { hash; height; download_state = NotRequested }
+          queue_add ibd { hash; height;
+                          download_state = NotRequested; tried_peers = [] }
       end else
-        queue_add ibd { hash; height; download_state = NotRequested };
+        queue_add ibd { hash; height;
+                        download_state = NotRequested; tried_peers = [] };
       ibd.next_download_height <- ibd.next_download_height + 1
     | None ->
       ibd.next_download_height <- ibd.next_download_height + 1
@@ -1099,6 +1108,9 @@ let check_timeouts (ibd : ibd_state) : unit =
     | Requested { peer_id; requested_at; timeout } ->
       if now -. requested_at > timeout then begin
         entry.download_state <- NotRequested;
+        (* W34: record that this peer failed to serve this block *)
+        if not (List.mem peer_id entry.tried_peers) then
+          entry.tried_peers <- peer_id :: entry.tried_peers;
         ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
         let peer_state = get_peer_state ibd peer_id in
         peer_state.blocks_in_flight <- max 0 (peer_state.blocks_in_flight - 1);
@@ -1127,6 +1139,9 @@ let check_stalled_downloads (ibd : ibd_state) : int list =
     | Requested { peer_id; requested_at; timeout } ->
       if now > requested_at +. timeout then begin
         entry.download_state <- NotRequested;
+        (* W34: record that this peer failed — prefer-untried avoids re-pick *)
+        if not (List.mem peer_id entry.tried_peers) then
+          entry.tried_peers <- peer_id :: entry.tried_peers;
         ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
         let peer_state = get_peer_state ibd peer_id in
         peer_state.blocks_in_flight <- max 0 (peer_state.blocks_in_flight - 1);
@@ -1142,6 +1157,9 @@ let check_stalled_downloads (ibd : ibd_state) : int list =
           Hashtbl.replace peers_to_disconnect peer_id true
       end else if now > requested_at +. stall_timeout then begin
         entry.download_state <- NotRequested;
+        (* W34: record that this peer failed (stall) *)
+        if not (List.mem peer_id entry.tried_peers) then
+          entry.tried_peers <- peer_id :: entry.tried_peers;
         ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
         let peer_state = get_peer_state ibd peer_id in
         peer_state.blocks_in_flight <- max 0 (peer_state.blocks_in_flight - 1);
@@ -1215,26 +1233,41 @@ let request_blocks (ibd : ibd_state) (peers : Peer.peer list)
       let idx = ref 0 in
       List.iter (fun entry ->
         if ibd.total_blocks_in_flight < max_total_blocks_in_flight then begin
-          (* Find next peer with capacity (round-robin with skip) *)
-          let found = ref false in
-          let attempts = ref 0 in
-          while not !found && !attempts < n_peers do
-            let (peer, peer_state, batch_ref) = peer_arr.(!idx mod n_peers) in
-            let _ = peer in
-            if peer_state.blocks_in_flight < max_blocks_per_peer then begin
-              entry.download_state <- Requested {
-                peer_id = peer.Peer.id;
-                requested_at = now;
-                timeout = peer_state.current_timeout;
-              };
-              ibd.total_blocks_in_flight <- ibd.total_blocks_in_flight + 1;
-              peer_state.blocks_in_flight <- peer_state.blocks_in_flight + 1;
-              batch_ref := entry :: !batch_ref;
-              found := true
-            end;
-            idx := !idx + 1;
-            incr attempts
-          done
+          (* W34: prefer peers that haven't failed this block yet.
+             First pass only considers peers NOT in entry.tried_peers.
+             If no untried peer has capacity, fall back to any peer with
+             capacity (second pass) — this avoids a deadlock when every
+             connected peer has already failed on a block.  When the tried
+             list gets as long as the peer set, it's effectively reset for
+             the purpose of capacity checks. *)
+          let try_assign filter_tried =
+            let found = ref false in
+            let attempts = ref 0 in
+            while not !found && !attempts < n_peers do
+              let (peer, peer_state, batch_ref) = peer_arr.(!idx mod n_peers) in
+              let peer_ok =
+                peer_state.blocks_in_flight < max_blocks_per_peer
+                && (not filter_tried
+                    || not (List.mem peer.Peer.id entry.tried_peers))
+              in
+              if peer_ok then begin
+                entry.download_state <- Requested {
+                  peer_id = peer.Peer.id;
+                  requested_at = now;
+                  timeout = peer_state.current_timeout;
+                };
+                ibd.total_blocks_in_flight <- ibd.total_blocks_in_flight + 1;
+                peer_state.blocks_in_flight <- peer_state.blocks_in_flight + 1;
+                batch_ref := entry :: !batch_ref;
+                found := true
+              end;
+              idx := !idx + 1;
+              incr attempts
+            done;
+            !found
+          in
+          if not (try_assign true) then
+            ignore (try_assign false)
         end
       ) unrequested;
       (* Send all GetData messages in parallel *)
@@ -1423,6 +1456,7 @@ let process_orphan_blocks (ibd : ibd_state) (parent_hash : Types.hash256) : int 
            hash = orphan.hash;
            height = header_entry.height;
            download_state = Downloaded { block = orphan.block; peer_id = None };
+           tried_peers = [];
          } in
          queue_add ibd queue_entry;
          incr processed;

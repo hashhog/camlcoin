@@ -687,6 +687,7 @@ let run (config : config) : unit Lwt.t =
         let* () = Sync.start_ibd ~utxo_set:optimized_utxo
           ~misbehavior_handler
           ~on_ibd_created:(fun ibd -> ibd_state_ref := Some ibd)
+          ~shutdown_flag:shutdown
           chain get_peers in
         (* Clear IBD state so post-IBD listeners take over *)
         ibd_state_ref := None;

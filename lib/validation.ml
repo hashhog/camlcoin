@@ -1176,14 +1176,22 @@ let verify_scripts_parallel_domain
         | Ok () -> Ok ()
         | Error (idx, msg) -> Error (TxScriptFailed (idx, msg))
       end else begin
-        (* Partition tasks across ndomains. *)
+        (* Partition tasks across ndomains.
+           chunk = ceiling(ntasks/ndomains) so that every domain gets at most
+           chunk tasks.  However, when ntasks is not evenly divisible by
+           ndomains the ceiling over-allocates: the last few workers compute
+           start = (d+1)*chunk > ntasks.  The W22 fix added max 0 for len, but
+           Array.sub raises Invalid_argument when pos > Array.length even with
+           len=0.  Fix: clamp start to ntasks before computing stop/len so
+           both pos and pos+len are always within [0, ntasks]. *)
         let chunk = (ntasks + ndomains - 1) / ndomains in
         let task_arr = Array.of_list tasks in
         (* Spawn ndomains-1 worker domains; main domain handles first chunk. *)
         let workers = Array.init (ndomains - 1) (fun d ->
-          let start = (d + 1) * chunk in
+          let start = min ntasks ((d + 1) * chunk) in
           let stop  = min ntasks (start + chunk) in
-          let slice = Array.to_list (Array.sub task_arr start (stop - start)) in
+          let len   = stop - start in  (* always >= 0: start <= stop *)
+          let slice = Array.to_list (Array.sub task_arr start len) in
           Domain.spawn (fun () ->
             verify_input_slice ~tx ~flags ~prevouts ~txid ~cache slice)
         ) in

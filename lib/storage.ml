@@ -784,10 +784,37 @@ let prefix_invalidated  = "i"  (* manually invalidated block hashes *)
 
 (* Higher-level chain database built on top of the storage layer *)
 module ChainDB = struct
-  type t = { db : LogStorage.t }
+  (* [rocksdb_utxo] is the optional dual-read/dual-delete backend used to
+     recover pre-assume-valid UTXOs that live only in the RocksDB store.
+     Assume-valid IBD writes UTXOs exclusively through [OptimizedUtxoSet]
+     → Rocksdb_store.  The post-IBD gap-fill and single-block-connect
+     paths below historically read only from LogStorage, which created a
+     split-brain where any post-IBD block that spent a pre-AV output
+     failed with [TxMissingInputs].  When [rocksdb_utxo] is attached,
+     [get_utxo] falls back to RocksDB on a LogStorage miss and
+     [delete_utxo] removes from both stores so a spent output does not
+     reappear from the fallback path. *)
+  type t = {
+    db : LogStorage.t;
+    mutable rocksdb_utxo : Rocksdb_store.t option;
+  }
 
-  let create path = { db = LogStorage.open_db path }
+  let create path = { db = LogStorage.open_db path; rocksdb_utxo = None }
   let close t = LogStorage.close t.db
+
+  let attach_rocksdb_utxo t r = t.rocksdb_utxo <- Some r
+
+  (* 36-byte key format used by Rocksdb_store / OptimizedUtxoSet.utxo_key.
+     Unlike LogStorage UTXO keys, there is no 1-byte prefix — the whole
+     key is txid_internal[32] ++ vout_le[4]. *)
+  let rocksdb_utxo_key (txid : Types.hash256) (vout : int) : string =
+    let buf = Bytes.create 36 in
+    Cstruct.blit_to_bytes txid 0 buf 0 32;
+    Bytes.set buf 32 (Char.chr (vout land 0xff));
+    Bytes.set buf 33 (Char.chr ((vout lsr 8) land 0xff));
+    Bytes.set buf 34 (Char.chr ((vout lsr 16) land 0xff));
+    Bytes.set buf 35 (Char.chr ((vout lsr 24) land 0xff));
+    Bytes.unsafe_to_string buf
 
   (* Flush any cached-but-not-yet-persisted data to disk.  Call before
      close to ensure no writes are lost on shutdown. *)
@@ -878,7 +905,15 @@ module ChainDB = struct
     Serialize.write_int32_le w (Int32.of_int vout);
     let key = prefix_utxo ^
       Cstruct.to_string (Serialize.writer_to_cstruct w) in
-    LogStorage.get t.db key
+    match LogStorage.get t.db key with
+    | Some _ as v -> v
+    | None ->
+      (* LogStorage miss: fall back to RocksDB if attached.  The stored
+         value format (Utxo.serialize_utxo_entry) is identical in both
+         backends, so the fallback is a transparent string option. *)
+      (match t.rocksdb_utxo with
+       | None -> None
+       | Some r -> Rocksdb_store.get r (rocksdb_utxo_key txid vout))
 
   let delete_utxo t (txid : Types.hash256) (vout : int) =
     let w = Serialize.writer_create () in
@@ -886,7 +921,12 @@ module ChainDB = struct
     Serialize.write_int32_le w (Int32.of_int vout);
     let key = prefix_utxo ^
       Cstruct.to_string (Serialize.writer_to_cstruct w) in
-    LogStorage.delete t.db key
+    LogStorage.delete t.db key;
+    (* Mirror the delete into RocksDB so a spent pre-AV output cannot
+       resurface via the [get_utxo] fallback above. *)
+    (match t.rocksdb_utxo with
+     | None -> ()
+     | Some r -> Rocksdb_store.delete r (rocksdb_utxo_key txid vout))
 
   (* Chain state - tip hash and height (validated blocks) *)
   let set_chain_tip t (hash : Types.hash256) (height : int) =

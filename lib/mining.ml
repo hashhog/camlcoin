@@ -566,19 +566,11 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
   match Validation.check_block_header block.header with
   | Error e -> Error e
   | Ok () ->
-    (* During IBD, chain.tip is the header tip (far ahead of validated tip).
-       For submitblock, we compare against the validated tip (blocks_synced).
-       Fall back to chain.tip when the DB lookup returns None — this covers
-       regtest/fresh chain where genesis is only in the in-memory Hashtbl. *)
+    (* For submitblock we must compare against the validated-block tip, not
+       the header tip (which may lead `blocks_synced` post-IBD).  Use the
+       `Sync.block_tip` helper instead of reading `chain.tip` directly. *)
     let validated_height = chain.blocks_synced in
-    let validated_tip =
-      match Sync.get_header_at_height chain validated_height with
-      | Some _ as x -> x
-      | None ->
-        (* Fresh chain: genesis may not yet be persisted at height 0 in DB;
-           chain.tip points directly to the validated tip. *)
-        chain.tip
-    in
+    let validated_tip = Sync.block_tip chain in
     match validated_tip with
     | None -> Error "No validated tip found (blocks_synced=0 or missing header)"
     | Some vtip ->

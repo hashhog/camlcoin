@@ -125,6 +125,13 @@ let run (config : config) : unit Lwt.t =
   let rocksdb = Rocksdb_store.open_db rocksdb_path in
   Logs.info (fun m -> m "Opened RocksDB UTXO store at %s" rocksdb_path);
 
+  (* Wire the RocksDB handle into ChainDB so [get_utxo] can fall back to
+     RocksDB on a LogStorage miss.  Pre-assume-valid UTXOs live only in
+     RocksDB because assume-valid IBD writes through OptimizedUtxoSet;
+     without this fallback, any post-IBD block that spends a pre-AV
+     output fails validation with TxMissingInputs. *)
+  Storage.ChainDB.attach_rocksdb_utxo db rocksdb;
+
   (* Consistency check: detect when RocksDB was wiped but chainstate still
      has a non-zero chain_tip.  Without this, the node would skip blocks
      whose UTXO outputs are missing from the fresh RocksDB, causing

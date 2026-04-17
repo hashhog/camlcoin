@@ -2456,12 +2456,18 @@ let rec connect_stored_blocks (state : chain_state) : int =
   match get_header_at_height state next_height with
   | None -> 0
   | Some entry ->
-    (* Verify this stored block extends the current tip *)
-    let extends_tip = match state.tip with
-      | None -> next_height = 0
-      | Some tip ->
-        Cstruct.equal entry.header.prev_block tip.hash
-        && next_height = tip.height + 1
+    (* Verify this stored block extends the current BLOCK tip (not the header
+       tip).  Post-IBD `state.tip` tracks the best-work header — which may be
+       ahead of `blocks_synced` while gap-fill is in flight — so comparing
+       against it causes every stored block to look "detached" and the drain
+       silently returns 0.  Source the block tip's hash from the height→hash
+       index at `blocks_synced`. *)
+    let extends_tip =
+      if state.blocks_synced = 0 && next_height = 0 then true
+      else match get_header_at_height state state.blocks_synced with
+        | None -> false
+        | Some block_tip ->
+          Cstruct.equal entry.header.prev_block block_tip.hash
     in
     if not extends_tip then 0
     else if not (Storage.ChainDB.has_block state.db entry.hash) then 0
@@ -2555,11 +2561,16 @@ let process_new_block (state : chain_state) (block : Types.block)
       Error "Unknown header and failed to validate"
     | Some entry ->
       let height = entry.height in
-      (* Only connect blocks that extend the current tip *)
-      let connects_to_tip = match state.tip with
-        | None -> height = 0
-        | Some tip -> height = tip.height + 1
-                      && Cstruct.equal block.header.prev_block tip.hash
+      (* Only connect blocks that extend the current BLOCK tip.  Compare
+         against `blocks_synced` (not `state.tip`, which may be the header
+         tip post-IBD).  See `connect_stored_blocks` for the same rationale. *)
+      let connects_to_tip =
+        if height <> state.blocks_synced + 1 then false
+        else if state.blocks_synced = 0 && height = 0 then true
+        else match get_header_at_height state state.blocks_synced with
+          | None -> false
+          | Some block_tip ->
+            Cstruct.equal block.header.prev_block block_tip.hash
       in
       if not connects_to_tip then begin
         Logs.debug (fun m ->
@@ -2567,6 +2578,14 @@ let process_new_block (state : chain_state) (block : Types.block)
             (Types.hash256_to_hex_display hash) height);
         (* Store block data for later use but don't connect *)
         Storage.ChainDB.store_block state.db hash block;
+        (* The incoming block may be the first of a gap-fill batch; even if
+           it doesn't extend the tip itself, its arrival means peers are
+           responding and earlier stored blocks may now be drainable. *)
+        let connected = connect_stored_blocks state in
+        if connected > 0 then
+          Logs.info (fun m ->
+            m "Connected %d stored blocks after gap-fill store, tip now at %d"
+              connected state.blocks_synced);
         Ok ()
       end else begin
         let expected_bits = compute_expected_bits state height block.header in

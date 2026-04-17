@@ -89,7 +89,23 @@ type header_entry = {
   total_work : Cstruct.t;  (* cumulative proof-of-work, 32-byte LE *)
 }
 
-(* Chain state - tracks sync progress and header chain *)
+(* Chain state - tracks sync progress and header chain.
+
+   NOTE on `tip` semantics: [tip] is the best-work *header* entry, updated
+   by [accept_header] whenever a new header with more cumulative work is
+   accepted. It is NOT necessarily the validated-block tip — post-IBD,
+   [tip.height] can lead [blocks_synced] while gap-fill is in flight.
+
+   For the validated-block tip (getblockcount-style queries, block-linkage
+   checks in validation), use [block_tip] below, which resolves through
+   [blocks_synced] and the height->hash index.
+
+   Historical note (W43): [process_new_block] and [connect_stored_blocks]
+   used to overwrite [tip] with the just-connected block entry, making
+   the field's meaning flip between "header tip" and "block tip" at
+   runtime. That conflation caused the W42 mainnet gap-fill regression
+   (blocks shelved but never drained because [tip.hash] was the header
+   tip's hash). See W43/W44 reports. *)
 type chain_state = {
   db : Storage.ChainDB.t;
   network : Consensus.network_config;
@@ -616,6 +632,21 @@ let get_header_at_height (state : chain_state) (height : int)
   match Storage.ChainDB.get_hash_at_height state.db height with
   | Some hash -> Hashtbl.find_opt state.headers (Cstruct.to_string hash)
   | None -> None
+
+(* The validated-block tip — the header_entry for the highest block that has
+   been fully validated and connected (UTXO set updated).  This is distinct
+   from [state.tip], which tracks the best-work *header* and may lead
+   [blocks_synced] post-IBD while gap-fill is in flight.  Prefer this helper
+   over `get_header_at_height state state.blocks_synced` at call sites —
+   it falls back to [state.tip] for the fresh-chain case where genesis may
+   only be in the in-memory Hashtbl (pre-persistence). *)
+let block_tip (state : chain_state) : header_entry option =
+  match get_header_at_height state state.blocks_synced with
+  | Some _ as x -> x
+  | None ->
+    (* Fresh chain: genesis may not yet be persisted at height 0 in DB;
+       state.tip points directly to the validated tip in that case. *)
+    if state.blocks_synced = 0 then state.tip else None
 
 (* Request headers from a peer, starting from our current tip *)
 let request_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
@@ -2457,17 +2488,12 @@ let rec connect_stored_blocks (state : chain_state) : int =
   | None -> 0
   | Some entry ->
     (* Verify this stored block extends the current BLOCK tip (not the header
-       tip).  Post-IBD `state.tip` tracks the best-work header — which may be
-       ahead of `blocks_synced` while gap-fill is in flight — so comparing
-       against it causes every stored block to look "detached" and the drain
-       silently returns 0.  Source the block tip's hash from the height→hash
-       index at `blocks_synced`. *)
+       tip — see `chain_state` comment). *)
     let extends_tip =
       if state.blocks_synced = 0 && next_height = 0 then true
-      else match get_header_at_height state state.blocks_synced with
+      else match block_tip state with
         | None -> false
-        | Some block_tip ->
-          Cstruct.equal entry.header.prev_block block_tip.hash
+        | Some bt -> Cstruct.equal entry.header.prev_block bt.hash
     in
     if not extends_tip then 0
     else if not (Storage.ChainDB.has_block state.db entry.hash) then 0
@@ -2561,16 +2587,14 @@ let process_new_block (state : chain_state) (block : Types.block)
       Error "Unknown header and failed to validate"
     | Some entry ->
       let height = entry.height in
-      (* Only connect blocks that extend the current BLOCK tip.  Compare
-         against `blocks_synced` (not `state.tip`, which may be the header
-         tip post-IBD).  See `connect_stored_blocks` for the same rationale. *)
+      (* Only connect blocks that extend the current BLOCK tip (see
+         `chain_state` comment on why `state.tip` is not used here). *)
       let connects_to_tip =
         if height <> state.blocks_synced + 1 then false
         else if state.blocks_synced = 0 && height = 0 then true
-        else match get_header_at_height state state.blocks_synced with
+        else match block_tip state with
           | None -> false
-          | Some block_tip ->
-            Cstruct.equal block.header.prev_block block_tip.hash
+          | Some bt -> Cstruct.equal block.header.prev_block bt.hash
       in
       if not connects_to_tip then begin
         Logs.debug (fun m ->

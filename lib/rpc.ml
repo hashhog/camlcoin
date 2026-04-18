@@ -431,6 +431,53 @@ let handle_getbestblockhash (ctx : rpc_context) : Yojson.Safe.t =
   | Some t -> `String (Types.hash256_to_hex_display t.hash)
   | None -> `String "0000000000000000000000000000000000000000000000000000000000000000"
 
+(* hashhog W70: uniform fleet-wide sync-state report.
+   Spec: meta-repo `spec/getsyncstate.md`.
+
+   SHOULD fields return JSON `Null (not omitted) so consumer parsers
+   can index by key without presence checks. blocks_in_flight,
+   blocks_pending_connect, and last_block_received_time are null in
+   v1 because rpc_context does not currently carry the ibd_state. *)
+let handle_getsyncstate (ctx : rpc_context) : Yojson.Safe.t =
+  let zero_hash =
+    "0000000000000000000000000000000000000000000000000000000000000000" in
+  let tip_hash = match ctx.chain.tip with
+    | Some t -> Types.hash256_to_hex_display t.hash
+    | None -> zero_hash
+  in
+  let tip_height = ctx.chain.blocks_synced in
+  let header_height = max ctx.chain.headers_synced tip_height in
+  (* No distinct header-tip hash tracked in chain_state; tip_hash is
+     the best we can offer in v1 without a larger refactor. *)
+  let best_header_hash = tip_hash in
+  let is_ibd = ctx.chain.sync_state <> Sync.FullySynced in
+  let num_peers = Peer_manager.peer_count ctx.peer_manager in
+  let chain_name = match ctx.network.name with
+    | "mainnet" -> "main"
+    | "testnet3" -> "test"
+    | other -> other
+  in
+  let progress =
+    if header_height = 0 then 0.0
+    else
+      let p = float_of_int tip_height /. float_of_int header_height in
+      if p > 1.0 then 1.0 else p
+  in
+  `Assoc [
+    ("tip_height", `Int tip_height);
+    ("tip_hash", `String tip_hash);
+    ("best_header_height", `Int header_height);
+    ("best_header_hash", `String best_header_hash);
+    ("initial_block_download", `Bool is_ibd);
+    ("num_peers", `Int num_peers);
+    ("verification_progress", `Float progress);
+    ("blocks_in_flight", `Null);
+    ("blocks_pending_connect", `Null);
+    ("last_block_received_time", `Null);
+    ("chain", `String chain_name);
+    ("protocol_version", `Int (Int32.to_int Types.protocol_version));
+  ]
+
 let handle_getdifficulty (ctx : rpc_context) : Yojson.Safe.t =
   match ctx.chain.tip with
   | Some t -> `Float (Consensus.difficulty_from_bits t.header.bits)
@@ -3024,6 +3071,7 @@ let handle_help (_ctx : rpc_context)
       "getblock \"blockhash\" ( verbosity )";
       "getblockchaininfo";
       "getblockcount";
+      "getsyncstate";
       "getblockhash height";
       "getblockheader \"blockhash\" ( verbose )";
       "getblockstats hash_or_height";
@@ -3142,6 +3190,8 @@ let dispatch_rpc (ctx : rpc_context)
     Ok (handle_getblockcount ctx)
   | "getbestblockhash" ->
     Ok (handle_getbestblockhash ctx)
+  | "getsyncstate" ->
+    Ok (handle_getsyncstate ctx)
   | "getdifficulty" ->
     Ok (handle_getdifficulty ctx)
   | "gettxout" ->

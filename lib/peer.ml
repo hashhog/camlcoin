@@ -935,6 +935,8 @@ type peer_stats = {
   stat_user_agent : string;
   stat_direction : peer_direction;
   stat_misbehavior : int;
+  stat_relay : bool;
+  stat_protocol_version : int32;
 }
 
 let get_stats (peer : peer) : peer_stats =
@@ -955,6 +957,10 @@ let get_stats (peer : peer) : peer_stats =
       | None -> "");
     stat_direction = peer.direction;
     stat_misbehavior = peer.misbehavior_score;
+    stat_relay = peer.relay;
+    stat_protocol_version = (match peer.version_msg with
+      | Some v -> v.protocol_version
+      | None -> 0l);
   }
 
 (* Pretty print peer info *)

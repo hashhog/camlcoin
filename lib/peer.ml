@@ -343,6 +343,17 @@ let read_message (peer : peer) : P2p.message_payload Lwt.t =
 let read_message_with_timeout (peer : peer) (timeout_sec : float)
     : P2p.message_payload option Lwt.t =
   let open Lwt.Syntax in
+  (* W78 fast-path: if the peer is already disconnected, a fresh read_message
+     would synchronously reject with Channel_closed, the catch handler would
+     run on the current stack, and the caller's recursive loop would grow the
+     stack unbounded (Lwt.bind is not tail-recursive on already-resolved
+     promises).  Short-circuit with Lwt.pause () to force the scheduler to
+     yield between iterations.  Prevents the 1708-warning Stack-overflow seen
+     in wave47-2026-04-16/camlcoin-crash-2026-04-19-1455.log.tail. *)
+  if peer.state = Disconnected || peer.state = Disconnecting then
+    let* () = Lwt.pause () in
+    Lwt.return_none
+  else
   (* Reuse an existing in-flight read, or start a fresh one *)
   let read_promise = match peer.pending_read with
     | Some p -> p
@@ -393,7 +404,12 @@ let read_message_with_timeout (peer : peer) (timeout_sec : float)
   | `Timeout ->
     (* Timeout fired but the read is still in flight in pending_read;
        it will be reused on the next call.  (The read-failure path above
-       clears pending_read itself before returning `Timeout.) *)
+       clears pending_read itself before returning `Timeout.)
+       W78: Lwt.pause () before returning so the scheduler yields even when
+       the whole Lwt.catch + Lwt.choose chain resolved synchronously (e.g.
+       Channel_closed was already raised before this fn was entered).  Breaks
+       stack-growing sync recursion in callers that loop on None. *)
+    let* () = Lwt.pause () in
     Lwt.return None
 
 (* Send a message to the peer *)

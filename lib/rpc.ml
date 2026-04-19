@@ -1025,7 +1025,7 @@ let handle_getpeerinfo (ctx : rpc_context) : Yojson.Safe.t =
       ("network", `String "ipv4");
       ("services", `String (Printf.sprintf "%016Lx" svc));
       ("servicesnames", `List (List.map (fun s -> `String s) svc_names));
-      ("relaytxes", `Bool true);
+      ("relaytxes", `Bool stats.stat_relay);
       ("lastsend", `Int (int_of_float stats.stat_last_seen));
       ("lastrecv", `Int (int_of_float stats.stat_last_seen));
       ("bytessent", `Int stats.stat_bytes_sent);
@@ -1033,7 +1033,7 @@ let handle_getpeerinfo (ctx : rpc_context) : Yojson.Safe.t =
       ("conntime", `Int (int_of_float stats.stat_last_seen));
       ("timeoffset", `Int 0);
       ("pingtime", `Float (stats.stat_latency_ms /. 1000.0));
-      ("version", `Int 70016);
+      ("version", `Int (Int32.to_int stats.stat_protocol_version));
       ("subver", `String stats.stat_user_agent);
       ("inbound", `Bool is_inbound);
       ("bip152_hb_to", `Bool false);

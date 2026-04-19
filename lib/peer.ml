@@ -352,9 +352,35 @@ let read_message_with_timeout (peer : peer) (timeout_sec : float)
   let timeout =
     let* () = Lwt_unix.sleep timeout_sec in
     Lwt.return `Timeout in
+  (* W74: catch read-side exceptions (End_of_file when the peer closes
+     mid-message, ECONNRESET, etc.) and report them as a timeout.  Prior
+     to this fix, a peer closing its socket during header sync would
+     propagate End_of_file past the sync fiber's exception boundary and
+     kill the header-sync thread entirely — wedging IBD at the batch
+     boundary where the peer dropped (observed at height 162,000, i.e.
+     exactly 81 × max_headers_per_message).  Now the dead promise is
+     dropped, the peer is marked Disconnected so it won't be re-selected,
+     and the caller sees a clean `None` (= timeout) and retries with a
+     different peer. *)
   let read =
-    let* msg = read_promise in
-    Lwt.return (`Msg msg) in
+    Lwt.catch
+      (fun () ->
+        let* msg = read_promise in
+        Lwt.return (`Msg msg))
+      (fun exn ->
+        Log.warn (fun m ->
+          m "[%s:%d] read_message failed: %s — treating as timeout"
+            peer.addr peer.port (Printexc.to_string exn));
+        peer.pending_read <- None;
+        if peer.state <> Disconnected && peer.state <> Disconnecting then begin
+          peer.state <- Disconnected;
+          Lwt.async (fun () ->
+            Lwt.catch
+              (fun () -> Lwt_unix.close peer.fd)
+              (fun _ -> Lwt.return_unit))
+        end;
+        Lwt.return `Timeout)
+  in
   (* Lwt.choose does NOT cancel the loser, so the read keeps running *)
   let* result = Lwt.choose [read; timeout] in
   match result with
@@ -364,7 +390,8 @@ let read_message_with_timeout (peer : peer) (timeout_sec : float)
     Lwt.return (Some msg)
   | `Timeout ->
     (* Timeout fired but the read is still in flight in pending_read;
-       it will be reused on the next call *)
+       it will be reused on the next call.  (The read-failure path above
+       clears pending_read itself before returning `Timeout.) *)
     Lwt.return None
 
 (* Send a message to the peer *)

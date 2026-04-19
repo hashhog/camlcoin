@@ -129,6 +129,7 @@ type peer = {
   mutable fee_filter_sent : int64;  (* Last feefilter value we sent to this peer *)
   mutable next_send_feefilter : float; (* Next time to send our feefilter to this peer *)
   mutable relay : bool;             (* Peer's relay flag from version message *)
+  mutable time_offset : int64;      (* peer_version_timestamp - our_time_at_receipt (seconds) *)
   mutable cmpct_high_bandwidth : bool; (* Peer wants high-bandwidth compact blocks *)
   mutable cmpct_version : int64;    (* Compact block protocol version *)
   mutable block_relay_only : bool;  (* Block-relay-only connection (no tx relay) *)
@@ -212,6 +213,7 @@ let make_peer ~(network : Consensus.network_config) ~(addr : string)
     fee_filter_sent = 0L;
     next_send_feefilter = Unix.gettimeofday () +. poisson_delay avg_feefilter_broadcast_interval;
     relay = true;
+    time_offset = 0L;
     cmpct_high_bandwidth = false;
     cmpct_version = 0L;
     block_relay_only = false;
@@ -426,6 +428,7 @@ let process_version_msg (peer : peer) (v : Types.version_msg) : unit Lwt.t =
     peer.services <- services_of_int64 v.services;
     peer.best_height <- v.start_height;
     peer.relay <- v.relay;
+    peer.time_offset <- Int64.sub v.timestamp (Int64.of_float (Unix.gettimeofday ()));
     if v.protocol_version < min_protocol_version then
       Lwt.fail_with (Printf.sprintf
         "Peer protocol version too old: %ld (minimum: %ld)"
@@ -801,6 +804,7 @@ let dispatch_message (peer : peer) (msg : P2p.message_payload)
       let _ = peer.services <- services_of_int64 v.services in
       let _ = peer.best_height <- v.start_height in
       peer.relay <- v.relay;
+      peer.time_offset <- Int64.sub v.timestamp (Int64.of_float (Unix.gettimeofday ()));
       Lwt.return `Continue
     end
 
@@ -937,6 +941,7 @@ type peer_stats = {
   stat_misbehavior : int;
   stat_relay : bool;
   stat_protocol_version : int32;
+  stat_time_offset : int64;
 }
 
 let get_stats (peer : peer) : peer_stats =
@@ -961,6 +966,7 @@ let get_stats (peer : peer) : peer_stats =
     stat_protocol_version = (match peer.version_msg with
       | Some v -> v.protocol_version
       | None -> 0l);
+    stat_time_offset = peer.time_offset;
   }
 
 (* Pretty print peer info *)

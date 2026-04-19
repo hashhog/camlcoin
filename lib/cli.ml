@@ -686,7 +686,22 @@ let run (config : config) : unit Lwt.t =
         Logs.info (fun m ->
           m "Starting header sync with peer %d (attempt %d)" peer.Peer.id attempt);
         Peer_manager.set_header_sync_active peer_manager true;
-        let* () = Sync.sync_headers chain peer in
+        (* W74: defense-in-depth.  sync_headers should now return cleanly on
+           any read failure (the underlying peer.ml read_message_with_timeout
+           converts I/O exceptions to timeouts), but wrap with Lwt.catch
+           anyway so any unexpected exception path lands in the retry loop
+           below instead of killing the sync fiber.  See
+           wave47-2026-04-16/W74-CAMLCOIN-HEADER-WEDGE.md. *)
+        let* () =
+          Lwt.catch
+            (fun () -> Sync.sync_headers chain peer)
+            (fun exn ->
+              Logs.err (fun m ->
+                m "sync_headers raised unexpected exception: %s — forcing retry"
+                  (Printexc.to_string exn));
+              chain.sync_state <- Sync.Idle;
+              Lwt.return_unit)
+        in
         Peer_manager.set_header_sync_active peer_manager false;
         Peer_manager.set_height peer_manager (Int32.of_int chain.headers_synced);
         if chain.sync_state = Sync.Idle then begin

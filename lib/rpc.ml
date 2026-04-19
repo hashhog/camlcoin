@@ -1031,7 +1031,7 @@ let handle_getpeerinfo (ctx : rpc_context) : Yojson.Safe.t =
       ("bytessent", `Int stats.stat_bytes_sent);
       ("bytesrecv", `Int stats.stat_bytes_received);
       ("conntime", `Int (int_of_float stats.stat_last_seen));
-      ("timeoffset", `Int 0);
+      ("timeoffset", `Int (Int64.to_int stats.stat_time_offset));
       ("pingtime", `Float (stats.stat_latency_ms /. 1000.0));
       ("version", `Int (Int32.to_int stats.stat_protocol_version));
       ("subver", `String stats.stat_user_agent);

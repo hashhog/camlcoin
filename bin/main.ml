@@ -201,6 +201,19 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       log_categories = [];
       metrics_port;
     } in
+    (* W78: install an async-exception hook that logs instead of terminating.
+       The default hook calls exit 2 on any exception from an Lwt.async
+       continuation — a Stack_overflow in one peer-rotation callback would
+       kill the whole node (observed 2026-04-19 17:31 at height 382545).
+       We log the exception + backtrace and keep the node running; the
+       next scheduled operation will recover.  Add a distinctive prefix so
+       these lines are easy to find in post-mortem grep. *)
+    Printexc.record_backtrace true;
+    Lwt.async_exception_hook := (fun exn ->
+      Printf.eprintf "[W78-ASYNC-EXN] uncaught exception in Lwt.async: %s\n%s\n%!"
+        (Printexc.to_string exn)
+        (Printexc.get_backtrace ())
+    );
     Lwt_main.run (Camlcoin.Cli.run config);
     (* Graceful shutdown complete: exit 0 deterministically.  The 30s
        watchdog inside Cli.run will have already called exit 1 if the

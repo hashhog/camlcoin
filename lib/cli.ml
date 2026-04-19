@@ -816,6 +816,14 @@ let run (config : config) : unit Lwt.t =
          | Some entry ->
            Storage.ChainDB.set_chain_tip db entry.hash bs
          | None -> ())
+      end else begin
+        (* W47 fix: in FullySynced mode, dirty is always 0 because
+           [process_new_block] bypasses OptimizedUtxoSet.  Without this
+           branch the shutdown path leaves rdb_tip frozen at the last IBD
+           flush height while chain_tip (in LogStorage) has advanced with
+           every post-IBD block — producing the 945509 wedge on next boot.
+           Always align rdb_tip with blocks_synced at shutdown. *)
+        Rocksdb_store.set_tip_height rocksdb chain.blocks_synced
       end
     with exn ->
       Logs.warn (fun m ->

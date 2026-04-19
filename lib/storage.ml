@@ -1077,6 +1077,59 @@ module ChainDB = struct
      | None -> ()
      | Some r -> Rocksdb_store.delete r (rocksdb_utxo_key txid vout))
 
+  (* Atomically apply a block's UTXO delta and advance both backends' tips.
+     LogStorage batch:  UTXO puts + deletes + chain_tip + header_tip
+     RocksDB batch:     UTXO puts + deletes + tip_height (via batch_write)
+
+     Commit order is LogStorage-first so a crash between the two commits
+     leaves rdb_tip < chain_tip, which [cli.ml]'s boot consistency check
+     already handles (rewinds blocks_synced to rdb_tip; the next IBD
+     re-processes the gap using RocksDB as the authoritative pre-gap UTXO
+     snapshot via [get_utxo]'s fallback path).
+
+     This helper replaces the previous pattern in [process_new_block] and
+     [connect_stored_blocks] which split UTXO deletes (mirrored to RocksDB)
+     from UTXO puts (LogStorage-only) and advanced chain_tip without
+     touching rdb_tip at all — causing RocksDB to accumulate destructive
+     deletes with a frozen tip marker (W47 945509 wedge). *)
+  let apply_block_atomic t
+      ~(tip_hash : Types.hash256) ~(tip_height : int)
+      ~(header_tip_hash : Types.hash256) ~(header_tip_height : int)
+      (ops : (Types.hash256 * int * [ `Add of string | `Del ]) list)
+      : unit =
+    let ls_batch = LogStorage.batch_create () in
+    let rdb_ops =
+      List.rev_map (fun (txid, vout, op) ->
+        let w = Serialize.writer_create () in
+        Serialize.write_bytes w txid;
+        Serialize.write_int32_le w (Int32.of_int vout);
+        let ls_key = prefix_utxo ^
+          Cstruct.to_string (Serialize.writer_to_cstruct w) in
+        let rdb_key = rocksdb_utxo_key txid vout in
+        (match op with
+         | `Add data ->
+           LogStorage.batch_put ls_batch ls_key data;
+           (rdb_key, Some data)
+         | `Del ->
+           LogStorage.batch_delete ls_batch ls_key;
+           (rdb_key, None))
+      ) ops
+    in
+    LogStorage.batch_put ls_batch
+      (prefix_chain_state ^ "tip_hash") (Cstruct.to_string tip_hash);
+    LogStorage.batch_put ls_batch
+      (prefix_chain_state ^ "tip_height") (encode_height tip_height);
+    LogStorage.batch_put ls_batch
+      (prefix_chain_state ^ "header_tip_hash")
+      (Cstruct.to_string header_tip_hash);
+    LogStorage.batch_put ls_batch
+      (prefix_chain_state ^ "header_tip_height")
+      (encode_height header_tip_height);
+    LogStorage.batch_write t.db ls_batch;
+    (match t.rocksdb_utxo with
+     | None -> ()
+     | Some r -> Rocksdb_store.batch_write ~tip_height r rdb_ops)
+
   (* Chain state - tip hash and height (validated blocks) *)
   let set_chain_tip t (hash : Types.hash256) (height : int) =
     let batch = LogStorage.batch_create () in

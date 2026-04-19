@@ -2531,6 +2531,7 @@ let rec connect_stored_blocks (state : chain_state) : int =
                 ~network:state.network
                 ~get_mtp_at_height:(get_mtp_for_height state) () with
         | Ok (_fees, txid_arr, _spent_utxos) ->
+          let ops = ref [] in
           List.iteri (fun tx_idx tx ->
             let is_cb = (tx_idx = 0) in
             let txid = if tx_idx < Array.length txid_arr
@@ -2539,19 +2540,21 @@ let rec connect_stored_blocks (state : chain_state) : int =
             if not is_cb then
               List.iter (fun inp ->
                 let prev = inp.Types.previous_output in
-                Storage.ChainDB.delete_utxo state.db
-                  prev.Types.txid (Int32.to_int prev.Types.vout)
+                ops := (prev.Types.txid, Int32.to_int prev.Types.vout, `Del)
+                       :: !ops
               ) tx.Types.inputs;
             List.iteri (fun vout out ->
               let data = encode_utxo out.Types.value out.Types.script_pubkey
                   next_height is_cb in
-              Storage.ChainDB.store_utxo state.db txid vout data
+              ops := (txid, vout, `Add data) :: !ops
             ) tx.Types.outputs
           ) stored_block.transactions;
           state.blocks_synced <- next_height;
           state.tip <- Some entry;
-          Storage.ChainDB.set_chain_tip state.db entry.hash next_height;
-          Storage.ChainDB.set_header_tip state.db entry.hash next_height;
+          Storage.ChainDB.apply_block_atomic state.db
+            ~tip_hash:entry.hash ~tip_height:next_height
+            ~header_tip_hash:entry.hash ~header_tip_height:next_height
+            (List.rev !ops);
           Logs.info (fun m ->
             m "Connected stored block %s at height %d (catch-up from gap-fill)"
               (Types.hash256_to_hex_display entry.hash) next_height);
@@ -2645,7 +2648,8 @@ let process_new_block (state : chain_state) (block : Types.block)
         | Ok (_fees, txid_arr, _spent_utxos) ->
           (* Store the block *)
           Storage.ChainDB.store_block state.db hash block;
-          (* Update UTXOs: remove spent, add created *)
+          (* Collect UTXO mutations for a single atomic block commit *)
+          let ops = ref [] in
           List.iteri (fun tx_idx tx ->
             let is_cb = (tx_idx = 0) in
             let txid = if tx_idx < Array.length txid_arr
@@ -2654,20 +2658,23 @@ let process_new_block (state : chain_state) (block : Types.block)
             if not is_cb then
               List.iter (fun inp ->
                 let prev = inp.Types.previous_output in
-                Storage.ChainDB.delete_utxo state.db
-                  prev.Types.txid (Int32.to_int prev.Types.vout)
+                ops := (prev.Types.txid, Int32.to_int prev.Types.vout, `Del)
+                       :: !ops
               ) tx.Types.inputs;
             List.iteri (fun vout out ->
               let data = encode_utxo out.Types.value out.Types.script_pubkey
                   height is_cb in
-              Storage.ChainDB.store_utxo state.db txid vout data
+              ops := (txid, vout, `Add data) :: !ops
             ) tx.Types.outputs
           ) block.transactions;
-          (* Advance the chain tip *)
+          (* Advance the chain tip atomically with UTXO deltas so that
+             rdb_tip never lags chain_tip (the W47 945509 wedge). *)
           state.blocks_synced <- height;
           state.tip <- Some entry;
-          Storage.ChainDB.set_chain_tip state.db hash height;
-          Storage.ChainDB.set_header_tip state.db hash height;
+          Storage.ChainDB.apply_block_atomic state.db
+            ~tip_hash:hash ~tip_height:height
+            ~header_tip_hash:hash ~header_tip_height:height
+            (List.rev !ops);
           Logs.info (fun m ->
             m "Connected new block %s at height %d"
               (Types.hash256_to_hex_display hash) height);

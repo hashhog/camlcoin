@@ -601,6 +601,128 @@ module LogStorage : STORAGE = struct
     let jpath = wal_path t in
     (try Unix.unlink jpath with Unix.Unix_error _ -> ())
 
+  (* --- Index snapshot (phase 1 — close-time write + delta scan on open)
+
+     data.log.idx contains a serialized copy of [index]+[deleted] plus the
+     byte offset in data.log at which the snapshot was taken. On open_db,
+     if a valid snapshot exists we load it in lieu of a full file scan and
+     then only re-scan records appended to data.log after the watermark.
+     This cuts cold-boot on a 100+GB data.log from tens of minutes to
+     seconds. Written only on close; a crash between snapshots simply
+     falls back to the full rebuild_index path — no correctness impact. *)
+
+  let snapshot_path t = Filename.concat t.base_dir "data.log.idx"
+  let snapshot_tmp_path t = Filename.concat t.base_dir "data.log.idx.tmp"
+
+  let snapshot_magic = "CAMLIDX1"
+  let snapshot_version = 1
+
+  let write_be64_bytes n =
+    let b = Bytes.create 8 in
+    for i = 0 to 7 do
+      Bytes.set b (7 - i) (Char.chr ((n lsr (i * 8)) land 0xff))
+    done;
+    b
+
+  let read_be64 ic =
+    let r = ref 0 in
+    for _ = 0 to 7 do
+      r := (!r lsl 8) lor (input_byte ic)
+    done;
+    !r
+
+  (* Streaming snapshot writer. Iterates t.index and t.deleted directly
+     under the lock rather than materializing the entries into a list,
+     to avoid a multi-GB peak allocation on large UTXO sets. Runs
+     inside close, which is the only call site, so holding the lock
+     across the write is acceptable. *)
+  let write_snapshot t =
+    let tmp = snapshot_tmp_path t in
+    Mutex.protect t.mutex (fun () ->
+      let oc = open_out_bin tmp in
+      output_string oc snapshot_magic;
+      write_be32 oc snapshot_version;
+      output_bytes oc (write_be64_bytes t.data_offset);
+      output_bytes oc (write_be64_bytes (Hashtbl.length t.index));
+      output_bytes oc (write_be64_bytes (Hashtbl.length t.deleted));
+      Hashtbl.iter (fun k (off, vlen) ->
+        write_be32 oc (String.length k);
+        output_string oc k;
+        output_bytes oc (write_be64_bytes off);
+        write_be32 oc vlen
+      ) t.index;
+      Hashtbl.iter (fun k () ->
+        write_be32 oc (String.length k);
+        output_string oc k
+      ) t.deleted;
+      output_string oc snapshot_magic;
+      flush oc;
+      (try Unix.fsync (Unix.descr_of_out_channel oc)
+       with Unix.Unix_error _ -> ());
+      close_out oc);
+    Unix.rename tmp (snapshot_path t)
+
+  (* Load t.index and t.deleted from data.log.idx if present + valid.
+     Returns Some watermark on success, None on any failure (missing,
+     truncated, version mismatch, bad magic). On failure, the partially-
+     loaded tables are reset before return so the caller can fall back
+     to a full rebuild_index from an empty state. *)
+  let try_load_snapshot t =
+    let path = snapshot_path t in
+    if not (Sys.file_exists path) then None
+    else begin
+      let ic = open_in_bin path in
+      let flen = in_channel_length ic in
+      let ok = ref true in
+      let watermark = ref 0 in
+      let magic_len = String.length snapshot_magic in
+      (try
+        if flen < magic_len * 2 + 4 + 8 + 8 + 8 then raise Exit;
+        (* Trailer check FIRST so we fail fast on torn writes. *)
+        seek_in ic (flen - magic_len);
+        let tail = really_input_string ic magic_len in
+        if tail <> snapshot_magic then raise Exit;
+        seek_in ic 0;
+        let head = really_input_string ic magic_len in
+        if head <> snapshot_magic then raise Exit;
+        let version = read_be32 ic in
+        if version <> snapshot_version then raise Exit;
+        watermark := read_be64 ic;
+        let n_idx = read_be64 ic in
+        let n_del = read_be64 ic in
+        (* Reject a watermark that points past data.log — can only
+           happen on a torn write or a mismatched pair of files. *)
+        let data_path = data_log_path t in
+        let data_len =
+          if Sys.file_exists data_path then
+            let dic = open_in_bin data_path in
+            let l = in_channel_length dic in
+            close_in dic; l
+          else 0
+        in
+        if !watermark > data_len then raise Exit;
+        for _ = 1 to n_idx do
+          let klen = read_be32 ic in
+          let key = really_input_string ic klen in
+          let off = read_be64 ic in
+          let vlen = read_be32 ic in
+          Hashtbl.replace t.index key (off, vlen)
+        done;
+        for _ = 1 to n_del do
+          let klen = read_be32 ic in
+          let key = really_input_string ic klen in
+          Hashtbl.replace t.deleted key ()
+        done
+      with _ -> ok := false);
+      close_in ic;
+      if !ok then Some !watermark
+      else begin
+        Hashtbl.reset t.index;
+        Hashtbl.reset t.deleted;
+        None
+      end
+    end
+
   (* --- Append operations to data.log ----------------------------------- *)
 
   (* Append a put record and update the index. Returns unit. *)
@@ -638,14 +760,19 @@ module LogStorage : STORAGE = struct
 
   (* --- Scan data.log to rebuild the in-memory index -------------------- *)
 
-  let rebuild_index t =
+  (* Scan data.log from [start] to EOF, applying each record to the index
+     and deleted tables. [start]=0 reproduces the historical full-scan
+     behavior; a non-zero start is used by open_db to delta-scan the
+     records written after a snapshot's watermark. *)
+  let rebuild_index_from_offset t ~start =
     let path = data_log_path t in
     if not (Sys.file_exists path) then begin
       t.data_offset <- 0
     end else begin
       let ic = open_in_bin path in
       let flen = in_channel_length ic in
-      let last_valid_pos = ref 0 in
+      seek_in ic start;
+      let last_valid_pos = ref start in
       (try
         while pos_in ic < flen do
           let op = input_char ic in
@@ -674,6 +801,8 @@ module LogStorage : STORAGE = struct
       t.data_offset <- !last_valid_pos
     end
 
+  let rebuild_index t = rebuild_index_from_offset t ~start:0
+
   (* --- Public API ------------------------------------------------------ *)
 
   let open_db path =
@@ -693,7 +822,19 @@ module LogStorage : STORAGE = struct
       deleted = Hashtbl.create 128;
       mutex = Mutex.create ();
     } in
-    rebuild_index t;
+    (* Snapshot-then-delta path: if a valid data.log.idx is present,
+       load it and only scan records appended after its watermark.
+       On any failure we fall back to the full rebuild_index that
+       this code path used unconditionally prior to this change. *)
+    (match try_load_snapshot t with
+     | Some watermark ->
+       Printf.eprintf
+         "[LogStorage] snapshot loaded: %d index + %d deleted, watermark=%d bytes\n%!"
+         (Hashtbl.length t.index) (Hashtbl.length t.deleted) watermark;
+       rebuild_index_from_offset t ~start:watermark
+     | None ->
+       Printf.eprintf "[LogStorage] no valid snapshot, full rebuild_index\n%!";
+       rebuild_index t);
     (* Replay WAL if present *)
     let jpath = Filename.concat path "_wal_journal" in
     (match wal_read jpath with
@@ -705,8 +846,16 @@ module LogStorage : STORAGE = struct
     t
 
   let close t =
+    (* Fsync data.log first so the snapshot's watermark refers only to
+       bytes already durable on disk. Then write the snapshot, then close
+       the fd. A crash between fsync and rename leaves the old snapshot
+       (or none) in place — try_load_snapshot falls back to rebuild. *)
     Mutex.protect t.mutex (fun () ->
-      (try Unix.fsync t.data_fd with Unix.Unix_error _ -> ());
+      (try Unix.fsync t.data_fd with Unix.Unix_error _ -> ()));
+    (try write_snapshot t
+     with _ ->
+       Printf.eprintf "[LogStorage] snapshot write failed, skipping\n%!");
+    Mutex.protect t.mutex (fun () ->
       (try Unix.close t.data_fd with Unix.Unix_error _ -> ()))
 
   let sync t =

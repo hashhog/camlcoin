@@ -704,6 +704,13 @@ let run (config : config) : unit Lwt.t =
         in
         Peer_manager.set_header_sync_active peer_manager false;
         Peer_manager.set_height peer_manager (Int32.of_int chain.headers_synced);
+        (* Reset the stale-tip clock after the (potentially multi-hour)
+           header sync.  Without this, the very first stale-tip check
+           after `set_header_sync_active false` would fire immediately
+           against `last_tip_update = peer_manager init time` and rotate
+           peers in the 30s window before the status thread's next tick
+           calls notify_tip_updated. *)
+        Peer_manager.notify_tip_updated peer_manager;
         if chain.sync_state = Sync.Idle then begin
           Logs.warn (fun m -> m "Header sync failed, retrying in 10s (attempt %d)" attempt);
           let* () = Lwt_unix.sleep 10.0 in
@@ -742,7 +749,16 @@ let run (config : config) : unit Lwt.t =
         Lwt.return_unit
   in
 
-  (* Periodic status logging *)
+  (* Periodic status logging.  The block-progress observation must be
+     tracked against its own ref (not pm.our_height): after header sync
+     completes, cli.ml above sets pm.our_height to chain.headers_synced
+     so the locator builder uses the header tip.  During block IBD,
+     blocks_synced is far below that header tip, so the old condition
+     `block_height > pm.our_height` was permanently false — meaning
+     notify_tip_updated NEVER fired during block IBD, and the stale-tip
+     rotation in peer_manager.ml fired against an apparent multi-hour
+     stall, killing every connected peer and wedging IBD entirely. *)
+  let last_block_height_observed = ref chain.blocks_synced in
   let status_thread =
     let rec log_status () =
       if !shutdown then Lwt.return_unit
@@ -756,14 +772,14 @@ let run (config : config) : unit Lwt.t =
             | None -> 0
           in
           let (mp_count, mp_weight, _) = Mempool.get_info mempool in
-          (* Keep peer_manager's our_height in sync with validated block height
-             so that the stale-tip check knows our actual progress. *)
           let block_height = chain.blocks_synced in
-          let prev_height = Peer_manager.get_height peer_manager in
-          if Int32.of_int block_height > prev_height then begin
-            Peer_manager.set_height peer_manager (Int32.of_int block_height);
+          if block_height > !last_block_height_observed then begin
+            last_block_height_observed := block_height;
             Peer_manager.notify_tip_updated peer_manager
           end;
+          let prev_height = Peer_manager.get_height peer_manager in
+          if Int32.of_int block_height > prev_height then
+            Peer_manager.set_height peer_manager (Int32.of_int block_height);
           Logs.info (fun m ->
             m "Status: peers=%d/%d height=%d mempool=%d txs (%d weight)"
               ready_count peer_count height mp_count mp_weight);

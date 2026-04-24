@@ -656,8 +656,9 @@ let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
   let outbound_count = outbound_peer_count pm in
   if outbound_count >= pm.config.max_outbound then
     Lwt.return_unit
-  (* Check if already connected *)
-  else if List.exists (fun p -> p.Peer.addr = addr) pm.peers then
+  (* Already connected? Compare (addr, port) — IP-only would forbid a
+     second peer on the same host (e.g. multiple nodes on 127.0.0.1). *)
+  else if List.exists (fun p -> p.Peer.addr = addr && p.Peer.port = port) pm.peers then
     Lwt.return_unit
   (* Check if banned *)
   else if is_banned pm addr then
@@ -749,7 +750,7 @@ let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
 let force_add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
   let open Lwt.Syntax in
   let now = Unix.gettimeofday () in
-  if List.exists (fun p -> p.Peer.addr = addr) pm.peers then
+  if List.exists (fun p -> p.Peer.addr = addr && p.Peer.port = port) pm.peers then
     Lwt.return_unit
   else if is_banned pm addr then
     Lwt.return_unit
@@ -824,7 +825,7 @@ let add_block_relay_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
   let now = Unix.gettimeofday () in
   if block_relay_only_count pm >= pm.config.max_block_relay_only then
     Lwt.return_unit
-  else if List.exists (fun p -> p.Peer.addr = addr) pm.peers then
+  else if List.exists (fun p -> p.Peer.addr = addr && p.Peer.port = port) pm.peers then
     Lwt.return_unit
   else if is_banned pm addr then
     Lwt.return_unit
@@ -1812,8 +1813,12 @@ let accept_inbound (pm : t) (client_fd : Lwt_unix.file_descr)
       (fun _ -> Lwt.return_unit) in
     Lwt.return_unit
   end
-  (* Check if already connected *)
-  else if List.exists (fun p -> p.Peer.addr = addr_str) pm.peers then begin
+  (* Already connected? Compare (addr, port) — IP-only would block every
+     inbound from a host where we already have one peer (e.g. localhost
+     fleet runs multiple nodes on 127.0.0.1). For inbound the `port` is
+     the client's source ephemeral port, so collisions only occur on
+     literal duplicate TCP sockets, which is what we want to drop. *)
+  else if List.exists (fun p -> p.Peer.addr = addr_str && p.Peer.port = port) pm.peers then begin
     let* () = Lwt.catch
       (fun () -> Lwt_unix.close client_fd)
       (fun _ -> Lwt.return_unit) in

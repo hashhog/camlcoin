@@ -2286,9 +2286,16 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
       match !connect_error with
       | Some e -> Error e
       | None ->
-        (* Update tip and chain state *)
+        (* Update tip and chain state. Also advance headers_synced
+           monotonically — if the new chain tip is beyond our current
+           header watermark, peers' getheaders locator must reflect it.
+           See Bug 8 (2026-04-26): omitting this update caused chain.tip
+           and headers_synced to diverge, wedging IBD via repeated
+           re-fetch of already-known headers. *)
         state.tip <- Some new_tip;
         state.blocks_synced <- new_tip.height;
+        if new_tip.height > state.headers_synced then
+          state.headers_synced <- new_tip.height;
         Storage.ChainDB.set_chain_tip state.db new_tip.hash new_tip.height;
         Logs.info (fun m ->
           m "Reorganization complete, new tip at height %d" new_tip.height);
@@ -2551,6 +2558,13 @@ let rec connect_stored_blocks (state : chain_state) : int =
           ) stored_block.transactions;
           state.blocks_synced <- next_height;
           state.tip <- Some entry;
+          (* Bug 8 fix (2026-04-26): keep in-memory headers_synced in sync
+             with state.tip. apply_block_atomic persists header_tip to DB,
+             but the locator builder reads the in-memory field; without
+             this update, getheaders re-uses a stale locator and peers
+             respond with already-known headers in an infinite loop. *)
+          if next_height > state.headers_synced then
+            state.headers_synced <- next_height;
           Storage.ChainDB.apply_block_atomic state.db
             ~tip_hash:entry.hash ~tip_height:next_height
             ~header_tip_hash:entry.hash ~header_tip_height:next_height
@@ -2671,6 +2685,15 @@ let process_new_block (state : chain_state) (block : Types.block)
              rdb_tip never lags chain_tip (the W47 945509 wedge). *)
           state.blocks_synced <- height;
           state.tip <- Some entry;
+          (* Bug 8 fix (2026-04-26): mirror apply_block_atomic's
+             header_tip_height update into the in-memory field; the
+             locator builder reads in-memory state. Without this,
+             post-IBD block-connect advances state.tip past
+             state.headers_synced, locator becomes stale, getheaders
+             re-fetches headers that fail accept_header's work-compare
+             check, infinite loop. *)
+          if height > state.headers_synced then
+            state.headers_synced <- height;
           Storage.ChainDB.apply_block_atomic state.db
             ~tip_hash:hash ~tip_height:height
             ~header_tip_hash:hash ~header_tip_height:height

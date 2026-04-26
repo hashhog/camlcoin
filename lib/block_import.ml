@@ -99,6 +99,17 @@ let run ~(ic : in_channel) ~(db : Storage.ChainDB.t)
          (match Hashtbl.find_opt chain.headers hash_key with
           | Some entry -> chain.tip <- Some entry
           | None -> ());
+         (* Bug 8 fix (2026-04-26): mirror chain.tip advance into
+            chain.headers_synced. The earlier branch at line 83-86 only
+            updates headers_synced when the header was FRESHLY added
+            (`if height > chain.headers_synced`); when the header was
+            already in chain.headers (the typical IBD/catch-up path:
+            header accepted earlier, block now connecting), that branch
+            is skipped and chain.tip advances here without
+            headers_synced moving. The getheaders locator builder reads
+            chain.headers_synced, so the divergence wedges peer sync. *)
+         if height > chain.headers_synced then
+           chain.headers_synced <- height;
          Storage.ChainDB.set_chain_tip db hash height;
 
          incr count;

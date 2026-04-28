@@ -2070,34 +2070,50 @@ let generate_privkey () : Cstruct.t =
   close_in ic;
   Cstruct.of_string bytes
 
-(* Compute ElligatorSwift encoding of public key (64 bytes)
-   Note: This is a simplified placeholder. Real implementation requires
-   libsecp256k1's ellswift module. For now, we use pubkey || random padding. *)
-let compute_ellswift_pubkey (privkey : Cstruct.t) : Cstruct.t =
-  (* Derive compressed public key *)
-  let pubkey = Crypto.derive_public_key ~compressed:true privkey in
-  (* ElligatorSwift encoding would produce 64 uniform-looking bytes
-     For now, concatenate pubkey with random padding *)
-  let padding = Cstruct.create (64 - Cstruct.length pubkey) in
-  let ic = open_in_bin "/dev/urandom" in
-  let bytes = really_input_string ic (64 - Cstruct.length pubkey) in
-  close_in ic;
-  Cstruct.blit_from_string bytes 0 padding 0 (Cstruct.length padding);
-  Cstruct.concat [pubkey; padding]
+(* libsecp256k1 ElligatorSwift FFI (see lib/schnorr_stubs.c).
+   Backed by secp256k1_ellswift_create / secp256k1_ellswift_xdh with
+   secp256k1_ellswift_xdh_hash_function_bip324 — i.e. real BIP-324 v2,
+   not a placeholder. *)
+external ellswift_create_raw : Bigstring.t -> Bigstring.t -> Bigstring.t
+  = "caml_ellswift_create"
+external ellswift_xdh_raw : Bigstring.t -> Bigstring.t -> Bigstring.t -> bool -> Bigstring.t
+  = "caml_ellswift_xdh"
 
-(* Compute ECDH shared secret from our private key and peer's ellswift pubkey
-   Note: Real implementation requires libsecp256k1's ellswift_xdh. *)
+(* Compute ElligatorSwift encoding of the public key for [privkey] (64 bytes).
+   Uses libsecp256k1's secp256k1_ellswift_create. The 32 bytes of auxrand
+   are read from /dev/urandom; per BIP-324 / libsecp256k1, this just
+   strengthens uniformity of the encoding and is not load-bearing for
+   correctness. *)
+let compute_ellswift_pubkey (privkey : Cstruct.t) : Cstruct.t =
+  if Cstruct.length privkey <> 32 then
+    invalid_arg "compute_ellswift_pubkey: privkey must be 32 bytes";
+  let sk_bs = Crypto.cstruct_to_bigstring privkey in
+  let aux_cs = Cstruct.create 32 in
+  let ic = open_in_bin "/dev/urandom" in
+  let aux = really_input_string ic 32 in
+  close_in ic;
+  Cstruct.blit_from_string aux 0 aux_cs 0 32;
+  let aux_bs = Crypto.cstruct_to_bigstring aux_cs in
+  let ell_bs = ellswift_create_raw sk_bs aux_bs in
+  Crypto.bigstring_to_cstruct ell_bs
+
+(* Compute the BIP-324 32-byte ECDH shared secret from our private key,
+   our 64-byte ElligatorSwift encoding, and the peer's 64-byte ElligatorSwift
+   encoding. Calls secp256k1_ellswift_xdh with the BIP-324 hash function.
+   The party byte is derived from [initiator] inside the C stub. *)
 let compute_ecdh_secret (our_privkey : Cstruct.t) (their_ellswift : Cstruct.t)
     (our_ellswift : Cstruct.t) (initiator : bool) : Cstruct.t =
-  (* For real implementation, we'd use secp256k1_ellswift_xdh
-     which computes BIP324-specific ECDH with both ellswift pubkeys.
-     Here we simulate with a tagged hash of the inputs. *)
-  let data = Cstruct.concat [
-    (if initiator then our_ellswift else their_ellswift);
-    (if initiator then their_ellswift else our_ellswift);
-    our_privkey
-  ] in
-  Crypto.tagged_hash "bip324_ecdh" data
+  if Cstruct.length our_privkey <> 32 then
+    invalid_arg "compute_ecdh_secret: privkey must be 32 bytes";
+  if Cstruct.length their_ellswift <> 64 then
+    invalid_arg "compute_ecdh_secret: their_ellswift must be 64 bytes";
+  if Cstruct.length our_ellswift <> 64 then
+    invalid_arg "compute_ecdh_secret: our_ellswift must be 64 bytes";
+  let sk_bs = Crypto.cstruct_to_bigstring our_privkey in
+  let their_bs = Crypto.cstruct_to_bigstring their_ellswift in
+  let our_bs = Crypto.cstruct_to_bigstring our_ellswift in
+  let shared_bs = ellswift_xdh_raw sk_bs their_bs our_bs initiator in
+  Crypto.bigstring_to_cstruct shared_bs
 
 (* Create V2 transport (initiator or responder) *)
 let create_v2_transport ~(initiating : bool) ~(magic : int32) : transport =

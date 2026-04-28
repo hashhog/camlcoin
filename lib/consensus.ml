@@ -1003,7 +1003,38 @@ let should_skip_scripts ~(block_height : int)
 
 (* ============================================================================
    BIP9 Version Bits State Machine (versionbits)
-   ============================================================================ *)
+   ============================================================================
+
+   IMPORTANT — buried vs. versionbits design (matches Bitcoin Core):
+
+   This module implements the BIP9 version-bits state machine, but it is
+   intentionally NOT consulted on the consensus-validation hot path.  Script
+   verification flags are gated by simple height comparisons against the
+   activation heights stored on [network_config] (see [get_block_script_flags]
+   above and [Validation.get_script_flags_for_height]).  This mirrors Bitcoin
+   Core's "buried deployment" design (see bitcoin-core/src/deploymentstatus.h
+   and src/validation.cpp's GetBlockScriptFlags): once a soft-fork has been
+   active for years on mainnet, its activation logic is reduced to a hard-coded
+   height in chainparams and the BIP9 signaling machinery is no longer needed
+   for consensus.  In Core, [DeploymentActiveAt(BuriedDeployment)] is a one-line
+   `nHeight >= params.DeploymentHeight(dep)` check.
+
+   The state machine in this module is used for:
+     1. RPC reporting (getblockchaininfo .softforks / getdeploymentinfo) so
+        clients see the historical signaling status of each deployment.
+     2. Mining version-bit signaling in [compute_block_version], so newly
+        mined blocks signal for any non-buried deployment in Started or
+        LockedIn state.
+     3. Future non-buried deployments (e.g. the next Taproot-style soft fork)
+        whose activation height is not yet known at compile time.
+
+   For currently-buried deployments (BIP65, BIP66, CSV, SegWit, Taproot on
+   mainnet), the BIP9 [min_activation_height] in the deployment record MUST
+   equal the corresponding `*_height` field on [network_config].  This is
+   enforced at startup by [check_buried_deployment_consistency] below — a
+   defense-in-depth assertion that catches a developer who updates one
+   constant but not the other.  Mainnet ships with matching values today, so
+   this check is purely informational on the mainnet path. *)
 
 (* BIP9 deployment state machine states *)
 type deployment_state =
@@ -1384,3 +1415,53 @@ let create_versionbits_cache () : versionbits_cache = {
 let clear_versionbits_cache (cache : versionbits_cache) : unit =
   cache.taproot := DeploymentCache.empty;
   cache.testdummy := DeploymentCache.empty
+
+(* ============================================================================
+   Buried-deployment / BIP9 consistency check (defense-in-depth)
+   ============================================================================
+
+   Verify that for every deployment that is now buried in [network_config]
+   (BIP65, BIP66, CSV, SegWit, Taproot), the BIP9 deployment record agrees
+   with the buried activation height.  This does NOT change consensus on any
+   network — on mainnet the values already match Bitcoin Core's chainparams,
+   so the assertion is always true.  Its role is to catch a future drift
+   where a developer updates one source of truth but not the other.
+
+   For Taproot specifically we have both a buried activation height
+   ([network.taproot_height]) AND a BIP9 deployment record
+   ([mainnet_taproot] / [testnet4_taproot] / [regtest_taproot]).  These two
+   numbers MUST agree, otherwise the RPC/mining code (which uses BIP9) and
+   the validation code (which uses height-gating) would disagree about when
+   Taproot is active — exactly the failure mode the user wants ruled out.
+
+   BIP65/BIP66/CSV/SegWit are buried-only in this implementation (no BIP9
+   record exists), so no parity check is needed for them — they cannot
+   disagree with themselves.  This matches Bitcoin Core's current design.
+
+   Returns Ok () on agreement, Error msg with the specific mismatch otherwise.
+   Callers (sync.ml chain_state setup) should treat any error as fatal: a
+   misconfigured chainparams file is not a recoverable condition. *)
+let check_buried_deployment_consistency (network : network_config)
+    : (unit, string) result =
+  let taproot_dep = match network.network_type with
+    | Mainnet  -> Some mainnet_taproot
+    | Testnet4 -> Some testnet4_taproot
+    | Regtest  -> Some regtest_taproot
+    | Testnet3 -> None  (* No dedicated testnet3 deployment; height-gated only *)
+  in
+  match taproot_dep with
+  | None -> Ok ()
+  | Some dep ->
+    (* Skip the check for always_active / never_active sentinels: those
+       deployments don't have a meaningful min_activation_height to compare. *)
+    if dep.start_time = always_active || dep.start_time = never_active then
+      Ok ()
+    else if dep.min_activation_height <> network.taproot_height then
+      Error (Printf.sprintf
+        "BIP9/buried-deployment mismatch on %s: taproot BIP9 \
+         min_activation_height=%d but network.taproot_height=%d. \
+         These MUST agree — see consensus.ml comment block above \
+         get_deployment_state."
+        network.name dep.min_activation_height network.taproot_height)
+    else
+      Ok ()

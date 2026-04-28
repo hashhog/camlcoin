@@ -362,6 +362,15 @@ let work_from_bits (bits : int32) : Cstruct.t =
 (* Create initial chain state with genesis block *)
 let create_chain_state (db : Storage.ChainDB.t)
     (network : Consensus.network_config) : chain_state =
+  (* Defense-in-depth: verify the BIP9 deployment records and the buried
+     activation heights on [network_config] agree.  See the comment block
+     in consensus.ml above [get_deployment_state] for the full rationale.
+     A mismatch is a chainparams misconfiguration and is fatal. *)
+  (match Consensus.check_buried_deployment_consistency network with
+   | Ok () -> ()
+   | Error msg ->
+     Logs.err (fun m -> m "Fatal: %s" msg);
+     failwith msg);
   let state = {
     db; network;
     headers = Hashtbl.create 100_000;
@@ -396,6 +405,14 @@ let create_chain_state (db : Storage.ChainDB.t)
 (* Restore chain state from database *)
 let restore_chain_state (db : Storage.ChainDB.t)
     (network : Consensus.network_config) : chain_state =
+  (* Defense-in-depth: same BIP9/buried-deployment parity check as
+     [create_chain_state].  Even on the restore path, a mismatch must
+     be caught before we resume validating blocks. *)
+  (match Consensus.check_buried_deployment_consistency network with
+   | Ok () -> ()
+   | Error msg ->
+     Logs.err (fun m -> m "Fatal: %s" msg);
+     failwith msg);
   let state = {
     db; network;
     headers = Hashtbl.create 100_000;

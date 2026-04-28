@@ -16,6 +16,7 @@
 /* Enable the modules we need */
 #define ENABLE_MODULE_EXTRAKEYS 1
 #define ENABLE_MODULE_SCHNORRSIG 1
+#define ENABLE_MODULE_ELLSWIFT 1
 
 /* Prevent OCaml compatibility macros from interfering with secp256k1 code.
  * OCaml's caml/compatibility.h defines 'alloc' as a macro which clashes
@@ -44,6 +45,7 @@
 /* Schnorr public headers (for the API types) */
 #include "secp256k1_extrakeys.h"
 #include "secp256k1_schnorrsig.h"
+#include "secp256k1_ellswift.h"
 
 static secp256k1_context *schnorr_ctx = NULL;
 
@@ -616,5 +618,114 @@ CAMLprim value caml_pubkey_serialize_compressed(value v_pubkey) {
     value result = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL, dims);
     unsigned char *result_data = (unsigned char *)Caml_ba_data_val(result);
     memcpy(result_data, output, 33);
+    CAMLreturn(result);
+}
+
+/* ============================================================================
+   BIP-324 ElligatorSwift (libsecp256k1 ellswift module)
+   ============================================================================
+
+   These stubs back the BIP-324 v2 transport handshake. They wrap two
+   libsecp256k1 calls:
+
+   - secp256k1_ellswift_create:  derive a 64-byte ElligatorSwift encoding of
+                                 the public key for a given 32-byte secret
+                                 key, optionally salted with 32 bytes of
+                                 auxiliary randomness.
+
+   - secp256k1_ellswift_xdh:     compute the BIP-324 32-byte ECDH shared
+                                 secret given our seckey and both parties'
+                                 ElligatorSwift encodings, using the
+                                 secp256k1_ellswift_xdh_hash_function_bip324
+                                 hasher (tagged-hash variant).
+
+   Result is a Bigstring/Bigarray (UINT8/C_LAYOUT) for zero-copy interop with
+   the OCaml side, matching the convention used by the rest of this file. */
+
+/* caml_ellswift_create(seckey_32bytes, auxrand_32bytes_or_empty) -> bigarray(64 bytes)
+
+   If auxrand has length 0, NULL is passed for auxrand32 (libsecp256k1 then
+   uses just the seckey as entropy); otherwise auxrand must be exactly 32
+   bytes. Raises Failure on invalid inputs. */
+CAMLprim value caml_ellswift_create(value v_seckey, value v_auxrand) {
+    CAMLparam2(v_seckey, v_auxrand);
+    ensure_ctx();
+
+    unsigned char *sk_data = (unsigned char *)Caml_ba_data_val(v_seckey);
+    size_t sk_len = Caml_ba_array_val(v_seckey)->dim[0];
+    unsigned char *aux_data = (unsigned char *)Caml_ba_data_val(v_auxrand);
+    size_t aux_len = Caml_ba_array_val(v_auxrand)->dim[0];
+
+    if (sk_len != 32) {
+        caml_failwith("caml_ellswift_create: seckey must be 32 bytes");
+    }
+    if (aux_len != 0 && aux_len != 32) {
+        caml_failwith("caml_ellswift_create: auxrand must be 0 or 32 bytes");
+    }
+
+    unsigned char ell64[64];
+    int ret = secp256k1_ellswift_create(schnorr_ctx, ell64, sk_data,
+                                        aux_len == 32 ? aux_data : NULL);
+    if (!ret) {
+        caml_failwith("caml_ellswift_create: ellswift_create failed (invalid seckey?)");
+    }
+
+    long dims[1] = { 64 };
+    value result = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL, dims);
+    unsigned char *result_data = (unsigned char *)Caml_ba_data_val(result);
+    memcpy(result_data, ell64, 64);
+    CAMLreturn(result);
+}
+
+/* caml_ellswift_xdh(our_seckey_32, their_ellswift_64, our_ellswift_64, initiator_bool)
+       -> bigarray(32 bytes)
+
+   Computes the BIP-324 ECDH shared secret using
+   secp256k1_ellswift_xdh_hash_function_bip324. The party byte is derived
+   from the initiator flag per BIP-324: initiator -> party=0 (party A),
+   responder -> party=1 (party B), with ell_a64/ell_b64 ordered so that
+   ell_?64 corresponding to our seckey is on the matching side. */
+CAMLprim value caml_ellswift_xdh(value v_our_sk,
+                                 value v_their_ell,
+                                 value v_our_ell,
+                                 value v_initiator) {
+    CAMLparam4(v_our_sk, v_their_ell, v_our_ell, v_initiator);
+    ensure_ctx();
+
+    unsigned char *sk_data = (unsigned char *)Caml_ba_data_val(v_our_sk);
+    size_t sk_len = Caml_ba_array_val(v_our_sk)->dim[0];
+    unsigned char *their_data = (unsigned char *)Caml_ba_data_val(v_their_ell);
+    size_t their_len = Caml_ba_array_val(v_their_ell)->dim[0];
+    unsigned char *our_data = (unsigned char *)Caml_ba_data_val(v_our_ell);
+    size_t our_len = Caml_ba_array_val(v_our_ell)->dim[0];
+    int initiator = Bool_val(v_initiator);
+
+    if (sk_len != 32) {
+        caml_failwith("caml_ellswift_xdh: seckey must be 32 bytes");
+    }
+    if (their_len != 64 || our_len != 64) {
+        caml_failwith("caml_ellswift_xdh: ellswift encodings must be 64 bytes");
+    }
+
+    /* BIP-324: party=0 means we are party A (initiator), party=1 means party B
+       (responder). ell_a64 must be the initiator's encoding, ell_b64 the
+       responder's. seckey32 must correspond to our party's encoding. */
+    int party = initiator ? 0 : 1;
+    const unsigned char *ell_a = initiator ? our_data : their_data;
+    const unsigned char *ell_b = initiator ? their_data : our_data;
+
+    unsigned char shared[32];
+    int ret = secp256k1_ellswift_xdh(schnorr_ctx, shared, ell_a, ell_b,
+                                     sk_data, party,
+                                     secp256k1_ellswift_xdh_hash_function_bip324,
+                                     NULL);
+    if (!ret) {
+        caml_failwith("caml_ellswift_xdh: ellswift_xdh failed");
+    }
+
+    long dims[1] = { 32 };
+    value result = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL, dims);
+    unsigned char *result_data = (unsigned char *)Caml_ba_data_val(result);
+    memcpy(result_data, shared, 32);
     CAMLreturn(result);
 }

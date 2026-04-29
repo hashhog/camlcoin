@@ -1890,6 +1890,15 @@ type v2_state = {
   mutable cipher : bip324_cipher option;
   mutable recv_buffer : Cstruct.t;
   mutable recv_len : int;                    (* Decrypted length, valid in RecvVersion/App *)
+  (* True iff [recv_len] has been decrypted for the in-flight packet but
+     the payload has not yet been fully received.  Disambiguates the
+     "no length read yet" case from the "length is zero" case (BIP-324's
+     version packet has empty contents per spec, so [recv_len] = 0 is
+     a valid post-decrypt state).  Without this flag the FSChaCha20 length
+     cipher's keystream advances twice for the same packet on every empty
+     payload — corrupting all subsequent length decrypts and stalling the
+     handshake on the responder side. *)
+  mutable recv_len_known : bool;
   mutable recv_aad : Cstruct.t;              (* AAD for next packet (garbage during handshake) *)
   mutable recv_decode_buffer : Cstruct.t;    (* Decoded message contents *)
   mutable send_buffer : Cstruct.t;
@@ -2012,6 +2021,7 @@ let create_v2_transport ~(initiating : bool) ~(magic : int32) : transport =
     cipher = None;
     recv_buffer = Cstruct.empty;
     recv_len = 0;
+    recv_len_known = false;
     recv_aad = Cstruct.empty;
     recv_decode_buffer = Cstruct.empty;
     send_buffer;
@@ -2118,11 +2128,19 @@ let v2_receive_bytes (state : v2_state) (data : Cstruct.t) : bool =
 
     | V2RecvVersion | V2RecvApp ->
       let cipher = Option.get state.cipher in
-      (* Read 3-byte encrypted length if we don't have it *)
-      if state.recv_len = 0 then begin
+      (* Read 3-byte encrypted length if we don't have it.  The FSChaCha20
+         length cipher advances by exactly one chunk per packet, so we MUST
+         decrypt the length only once even if we re-enter this branch while
+         waiting for the rest of the ciphertext.  Use [recv_len_known] (not
+         [recv_len = 0]) as the sentinel — version/decoy packets legitimately
+         carry [recv_len = 0] (empty contents), and re-decrypting the next 3
+         bytes as a fresh length corrupts the keystream and produces garbage
+         length values that wedge the responder. *)
+      if not state.recv_len_known then begin
         if Cstruct.length state.recv_buffer >= Bip324.length_len then begin
           let enc_len = Cstruct.sub state.recv_buffer 0 Bip324.length_len in
           state.recv_len <- bip324_decrypt_length cipher enc_len;
+          state.recv_len_known <- true;
           state.recv_buffer <- Cstruct.sub state.recv_buffer Bip324.length_len
             (Cstruct.length state.recv_buffer - Bip324.length_len);
           process ()
@@ -2143,7 +2161,9 @@ let v2_receive_bytes (state : v2_state) (data : Cstruct.t) : bool =
           | None ->
             false  (* Decryption failed *)
           | Some (ignore_flag, contents) ->
+            (* Reset per-packet length tracking for the next packet. *)
             state.recv_len <- 0;
+            state.recv_len_known <- false;
             if ignore_flag then begin
               (* Decoy packet, continue reading *)
               if state.recv_state = V2RecvVersion then begin

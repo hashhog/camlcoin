@@ -1206,24 +1206,42 @@ let test_find_descendants_with_chain () =
    BIP-35 mempool dispatch (NODE_BLOOM gate)
    ============================================================================ *)
 
-(* Verify that we advertise NODE_BLOOM by default (BIP-35 / BIP-111).
-   This is the prerequisite for [handle_mempool_msg] to actually serve
-   peer-issued MEMPOOL requests; if the bit is off, the gate disconnects
-   the peer.  Mirrors Bitcoin Core's default -peerbloomfilters=1. *)
-let test_bip35_advertise_node_bloom () =
-  Alcotest.(check bool) "our_services advertises NODE_BLOOM"
-    true Peer.our_services.bloom;
-  let bits = Peer.services_to_int64 Peer.our_services in
-  Alcotest.(check bool) "service bits include NODE_BLOOM (4)"
-    true (Int64.logand bits 4L <> 0L)
+(* Verify that NODE_BLOOM (BIP-35 / BIP-111) is OFF by default — mirrors
+   Bitcoin Core's DEFAULT_PEERBLOOMFILTERS = false (net_processing.h:44).
+   With the bit unset, [handle_mempool_msg] disconnects the requesting
+   peer rather than serving an InvMsg. *)
+let test_bip35_default_off () =
+  Peer.set_peer_bloom_filters false;
+  Alcotest.(check bool) "our_services bloom default off"
+    false (Peer.our_services ()).bloom;
+  let bits = Peer.services_to_int64 (Peer.our_services ()) in
+  Alcotest.(check bool) "service bits exclude NODE_BLOOM (4) by default"
+    true (Int64.logand bits 4L = 0L);
+  Alcotest.(check int64) "default service bits = 9 (NETWORK|WITNESS)" 9L bits
+
+(* When the operator passes --peerbloomfilters, NODE_BLOOM is set and the
+   MEMPOOL handler will serve InvMsg responses to peers. *)
+let test_bip35_advertise_when_enabled () =
+  Peer.set_peer_bloom_filters true;
+  Alcotest.(check bool) "our_services advertises NODE_BLOOM when enabled"
+    true (Peer.our_services ()).bloom;
+  let bits = Peer.services_to_int64 (Peer.our_services ()) in
+  Alcotest.(check bool) "service bits include NODE_BLOOM (4) when enabled"
+    true (Int64.logand bits 4L <> 0L);
+  Alcotest.(check int64) "enabled service bits = 13 (NETWORK|BLOOM|WITNESS)"
+    13L bits;
+  (* Restore Core default for subsequent tests *)
+  Peer.set_peer_bloom_filters false
 
 (* With NODE_BLOOM advertised AND no mempool attached, [handle_mempool_msg]
    must return cleanly without writing to the peer.  The fact that the
    handler exists, is reachable from [handle_mempool_msg_for], and runs
    to completion (no Lwt exception) is what proves the dispatch wiring
-   from [Cli.run]'s listener works end-to-end. *)
+   from [Cli.run]'s listener works end-to-end.  We flip the flag on for
+   this test (default is off, per Core parity). *)
 let test_bip35_handler_no_mempool () =
   cleanup_test_db ();
+  Peer.set_peer_bloom_filters true;
   let db = Storage.ChainDB.create test_db_path in
   let chain = Sync.create_chain_state db Consensus.regtest in
   let ibd = Sync.create_ibd_state chain in
@@ -1239,6 +1257,8 @@ let test_bip35_handler_no_mempool () =
   (* Same path via the bare-mempool entry point used post-IBD. *)
   Lwt_main.run (Sync.handle_mempool_msg_for None peer);
   Storage.ChainDB.close db;
+  (* Restore Core default for subsequent tests *)
+  Peer.set_peer_bloom_filters false;
   cleanup_test_db ()
 
 let () =
@@ -1307,7 +1327,9 @@ let () =
       test_case "presync_constants" `Quick test_presync_constants;
     ];
     "bip35_mempool_dispatch", [
-      test_case "advertise NODE_BLOOM" `Quick test_bip35_advertise_node_bloom;
+      test_case "default off (Core parity)" `Quick test_bip35_default_off;
+      test_case "advertise when enabled" `Quick
+        test_bip35_advertise_when_enabled;
       test_case "handler no mempool" `Quick test_bip35_handler_no_mempool;
     ];
     "block_invalidation", [

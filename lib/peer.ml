@@ -59,16 +59,33 @@ let empty_services : peer_services =
     compact_filters = false;
     network_limited = false }
 
-(* Our node's advertised services: full node with witness support and
-   NODE_BLOOM (BIP-111 / BIP-35).  Advertising NODE_BLOOM means we honour
-   peer-issued `mempool` requests (BIP-35) and bloom-filter setup messages.
-   Bitcoin Core advertises this whenever -peerbloomfilters=1 (the default
-   when bloom filters are enabled), and gates the MEMPOOL handler in
-   src/net_processing.cpp on `peer.m_our_services & NODE_BLOOM`. *)
-let our_services : peer_services = {
+(* Bloom-filter / BIP-35 (NODE_BLOOM) advertisement gate.
+
+   Bitcoin Core sets DEFAULT_PEERBLOOMFILTERS = false in
+   src/net_processing.h:44 — i.e. the BIP-35 / BIP-111 NODE_BLOOM bit is
+   OFF by default and is only flipped on by passing -peerbloomfilters=1.
+   We mirror that exactly: this ref defaults to [false] and is flipped at
+   startup by [Cli.run] when the operator passes --peerbloomfilters.  The
+   MEMPOOL handler in [Sync.handle_mempool_msg_for] gates on the same bit
+   (matches Core's net_processing.cpp guard on
+   `peer.m_our_services & NODE_BLOOM`). *)
+let peer_bloom_filters : bool ref = ref false
+
+(* Configure the NODE_BLOOM advertisement.  Must be called BEFORE any peer
+   is initialised so that [our_services ()] is consistent across the run. *)
+let set_peer_bloom_filters (b : bool) : unit =
+  peer_bloom_filters := b
+
+(* Our node's advertised services: full node with witness support, plus
+   NODE_BLOOM iff [peer_bloom_filters] is set.  Returns a fresh record on
+   every call so callers see the current value of the flag.  When the flag
+   is OFF (Core default) we advertise NODE_NETWORK | NODE_WITNESS = 9; when
+   ON (operator opt-in) we advertise NODE_NETWORK | NODE_BLOOM | NODE_WITNESS
+   = 13. *)
+let our_services () : peer_services = {
   network = true;
   getutxo = false;
-  bloom = true;
+  bloom = !peer_bloom_filters;
   witness = true;
   compact_filters = false;
   network_limited = false;
@@ -271,7 +288,7 @@ let make_local_addr () : Types.net_addr =
   Cstruct.set_uint8 addr 13 0;
   Cstruct.set_uint8 addr 14 0;
   Cstruct.set_uint8 addr 15 1;
-  { services = services_to_int64 our_services; addr; port = 0 }
+  { services = services_to_int64 (our_services ()); addr; port = 0 }
 
 (* Poisson delay: returns exponentially distributed delay with given average.
    Uses the inverse CDF method: -ln(U) * avg where U is uniform (0,1).
@@ -672,7 +689,7 @@ let process_version_msg (peer : peer) (v : Types.version_msg) : unit Lwt.t =
 (* Build a version message for outgoing handshake *)
 let make_version_msg (peer : peer) (our_height : int32) : Types.version_msg =
   { protocol_version = Types.protocol_version;
-    services = services_to_int64 our_services;
+    services = services_to_int64 (our_services ());
     timestamp = Int64.of_float (Unix.gettimeofday ());
     addr_recv = {
       services = 0L;

@@ -1837,7 +1837,11 @@ let accept_inbound (pm : t) (client_fd : Lwt_unix.file_descr)
     Lwt.catch (fun () ->
       let peer = Peer.make_peer ~network:pm.network ~addr:addr_str ~port
         ~id ~direction:Peer.Inbound ~fd:client_fd in
-      let* () = Peer.perform_inbound_handshake peer pm.our_height in
+      (* Negotiated handshake: peeks 16 bytes to classify v1 vs v2 (BIP-324
+         responder).  Falls through to perform_inbound_handshake when the
+         peer sends a v1 VERSION header or when CAMLCOIN_BIP324_V2_INBOUND
+         is OFF (the default). *)
+      let* () = Peer.perform_inbound_handshake_negotiated peer pm.our_height in
       pm.peers <- peer :: pm.peers;
       (* Track connection time for eviction algorithm *)
       Hashtbl.replace pm.peer_connected_time peer.Peer.id now;

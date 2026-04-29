@@ -444,8 +444,30 @@ let read_message_v2 (peer : peer) (state : P2p.v2_state)
   Lwt.no_cancel begin
     let chunk_size = 8192 in
     let chunk = Bytes.create chunk_size in
-    (* If state already has a complete app message buffered (e.g. from the
-       handshake's final processReceivedBytes), drain it first. *)
+    (* On entry, attempt to drive the state machine on whatever is already
+       in [state.recv_buffer] before reading from the socket.  Bitcoin Core
+       and clearbit both send VERSION + VERACK back-to-back during the v2
+       app handshake; both packets typically arrive in a single TCP segment
+       and are concatenated into [recv_buffer] by the previous call's read.
+       After [v2_get_message] has consumed the first packet, [recv_state]
+       is reset to [V2RecvApp] but the leftover ciphertext for the next
+       packet is still in [recv_buffer].  Without an explicit drain the
+       responder blocks on a socket that has nothing new to deliver,
+       wedging the post-cipher application handshake. *)
+    let try_drain_buffer () : bool =
+      (* Returns true iff [process()] made progress (either decoded a
+         complete message or consumed bytes that advanced [recv_state]).
+         Passes an empty chunk so the buffer pointer is unchanged on entry
+         and the function call is purely a state-machine pump. *)
+      let pre_state = state.recv_state in
+      let pre_len = Cstruct.length state.recv_buffer in
+      let ok = P2p.v2_receive_bytes state Cstruct.empty in
+      if not ok then false
+      else
+        P2p.v2_message_complete state
+        || state.recv_state <> pre_state
+        || Cstruct.length state.recv_buffer <> pre_len
+    in
     let rec loop () =
       if P2p.v2_message_complete state then begin
         match P2p.v2_get_message state with
@@ -455,7 +477,10 @@ let read_message_v2 (peer : peer) (state : P2p.v2_state)
           peer.msgs_received <- peer.msgs_received + 1;
           peer.last_seen <- Unix.gettimeofday ();
           Lwt.return msg.P2p.payload
-      end else begin
+      end else if Cstruct.length state.recv_buffer > 0
+                  && try_drain_buffer () then
+        loop ()
+      else begin
         let* n = Lwt_io.read_into peer.ic chunk 0 chunk_size in
         if n = 0 then Lwt.fail End_of_file
         else begin

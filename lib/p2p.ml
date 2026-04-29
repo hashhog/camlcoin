@@ -1541,267 +1541,57 @@ module ChaCha20Poly1305 = struct
     done;
     output
 
-  (* Poly1305 MAC computation using 64-bit arithmetic
-     Based on the reference implementation in RFC 8439.
-     Uses a limb representation with 5x26-bit limbs for accumulator and r. *)
-  let poly1305_mac (key : Cstruct.t) (data : Cstruct.t) : Cstruct.t =
-    (* Read r and s from key *)
-    let r0 = Cstruct.LE.get_uint32 key 0 in
-    let r1 = Cstruct.LE.get_uint32 key 4 in
-    let r2 = Cstruct.LE.get_uint32 key 8 in
-    let r3 = Cstruct.LE.get_uint32 key 12 in
+  (* AEAD_CHACHA20_POLY1305 encrypt / decrypt — RFC 8439 + IETF mode.
 
-    (* Clamp r per Poly1305 spec *)
-    let r0 = Int32.logand r0 0x0fffffffl in
-    let r1 = Int32.logand r1 0x0ffffffcl in
-    let r2 = Int32.logand r2 0x0ffffffcl in
-    let r3 = Int32.logand r3 0x0ffffffcl in
-
-    (* Convert r to 5x26-bit limbs *)
-    let r0_26 = Int64.of_int32 (Int32.logand r0 0x03ffffffl) in
-    let r1_26 = Int64.of_int32 (Int32.logand
-      (Int32.logor (Int32.shift_right_logical r0 26) (Int32.shift_left r1 6)) 0x03ffffffl) in
-    let r2_26 = Int64.of_int32 (Int32.logand
-      (Int32.logor (Int32.shift_right_logical r1 20) (Int32.shift_left r2 12)) 0x03ffffffl) in
-    let r3_26 = Int64.of_int32 (Int32.logand
-      (Int32.logor (Int32.shift_right_logical r2 14) (Int32.shift_left r3 18)) 0x03ffffffl) in
-    let r4_26 = Int64.of_int32 (Int32.shift_right_logical r3 8) in
-
-    (* Precompute 5*r for reduction *)
-    let s1 = Int64.mul r1_26 5L in
-    let s2 = Int64.mul r2_26 5L in
-    let s3 = Int64.mul r3_26 5L in
-    let s4 = Int64.mul r4_26 5L in
-
-    (* Accumulator in 5x26-bit limbs *)
-    let h0 = ref 0L in
-    let h1 = ref 0L in
-    let h2 = ref 0L in
-    let h3 = ref 0L in
-    let h4 = ref 0L in
-
-    (* Process data in 16-byte blocks *)
-    let len = Cstruct.length data in
-    let num_full_blocks = len / 16 in
-
-    for block = 0 to num_full_blocks - 1 do
-      let offset = block * 16 in
-      (* Read 16-byte block as 4x32-bit little-endian *)
-      let t0 = Int64.of_int32 (Cstruct.LE.get_uint32 data offset) in
-      let t1 = Int64.of_int32 (Cstruct.LE.get_uint32 data (offset + 4)) in
-      let t2 = Int64.of_int32 (Cstruct.LE.get_uint32 data (offset + 8)) in
-      let t3 = Int64.of_int32 (Cstruct.LE.get_uint32 data (offset + 12)) in
-
-      (* Add block to accumulator + high bit *)
-      h0 := Int64.add !h0 (Int64.logand t0 0x03ffffffL);
-      h1 := Int64.add !h1 (Int64.logand (Int64.logor (Int64.shift_right_logical t0 26) (Int64.shift_left t1 6)) 0x03ffffffL);
-      h2 := Int64.add !h2 (Int64.logand (Int64.logor (Int64.shift_right_logical t1 20) (Int64.shift_left t2 12)) 0x03ffffffL);
-      h3 := Int64.add !h3 (Int64.logand (Int64.logor (Int64.shift_right_logical t2 14) (Int64.shift_left t3 18)) 0x03ffffffL);
-      h4 := Int64.add !h4 (Int64.logor (Int64.shift_right_logical t3 8) 0x01000000L);  (* high bit = 2^128 = 1 << 128, in limb 4 at bit 24 *)
-
-      (* Multiply h by r *)
-      let d0 = Int64.add (Int64.add (Int64.add (Int64.add
-        (Int64.mul !h0 r0_26) (Int64.mul !h1 s4)) (Int64.mul !h2 s3)) (Int64.mul !h3 s2)) (Int64.mul !h4 s1) in
-      let d1 = Int64.add (Int64.add (Int64.add (Int64.add
-        (Int64.mul !h0 r1_26) (Int64.mul !h1 r0_26)) (Int64.mul !h2 s4)) (Int64.mul !h3 s3)) (Int64.mul !h4 s2) in
-      let d2 = Int64.add (Int64.add (Int64.add (Int64.add
-        (Int64.mul !h0 r2_26) (Int64.mul !h1 r1_26)) (Int64.mul !h2 r0_26)) (Int64.mul !h3 s4)) (Int64.mul !h4 s3) in
-      let d3 = Int64.add (Int64.add (Int64.add (Int64.add
-        (Int64.mul !h0 r3_26) (Int64.mul !h1 r2_26)) (Int64.mul !h2 r1_26)) (Int64.mul !h3 r0_26)) (Int64.mul !h4 s4) in
-      let d4 = Int64.add (Int64.add (Int64.add (Int64.add
-        (Int64.mul !h0 r4_26) (Int64.mul !h1 r3_26)) (Int64.mul !h2 r2_26)) (Int64.mul !h3 r1_26)) (Int64.mul !h4 r0_26) in
-
-      (* Partial reduction mod 2^130-5 *)
-      let c = Int64.shift_right_logical d0 26 in
-      h0 := Int64.logand d0 0x03ffffffL;
-      let d1 = Int64.add d1 c in
-      let c = Int64.shift_right_logical d1 26 in
-      h1 := Int64.logand d1 0x03ffffffL;
-      let d2 = Int64.add d2 c in
-      let c = Int64.shift_right_logical d2 26 in
-      h2 := Int64.logand d2 0x03ffffffL;
-      let d3 = Int64.add d3 c in
-      let c = Int64.shift_right_logical d3 26 in
-      h3 := Int64.logand d3 0x03ffffffL;
-      let d4 = Int64.add d4 c in
-      let c = Int64.shift_right_logical d4 26 in
-      h4 := Int64.logand d4 0x03ffffffL;
-      h0 := Int64.add !h0 (Int64.mul c 5L);
-      let c = Int64.shift_right_logical !h0 26 in
-      h0 := Int64.logand !h0 0x03ffffffL;
-      h1 := Int64.add !h1 c;
-    done;
-
-    (* Process final partial block if any *)
-    let remaining = len - (num_full_blocks * 16) in
-    if remaining > 0 then begin
-      let block_buf = Cstruct.create 16 in
-      Cstruct.blit data (num_full_blocks * 16) block_buf 0 remaining;
-      Cstruct.set_uint8 block_buf remaining 0x01;  (* hibit *)
-
-      let t0 = Int64.of_int32 (Cstruct.LE.get_uint32 block_buf 0) in
-      let t1 = Int64.of_int32 (Cstruct.LE.get_uint32 block_buf 4) in
-      let t2 = Int64.of_int32 (Cstruct.LE.get_uint32 block_buf 8) in
-      let t3 = Int64.of_int32 (Cstruct.LE.get_uint32 block_buf 12) in
-
-      h0 := Int64.add !h0 (Int64.logand t0 0x03ffffffL);
-      h1 := Int64.add !h1 (Int64.logand (Int64.logor (Int64.shift_right_logical t0 26) (Int64.shift_left t1 6)) 0x03ffffffL);
-      h2 := Int64.add !h2 (Int64.logand (Int64.logor (Int64.shift_right_logical t1 20) (Int64.shift_left t2 12)) 0x03ffffffL);
-      h3 := Int64.add !h3 (Int64.logand (Int64.logor (Int64.shift_right_logical t2 14) (Int64.shift_left t3 18)) 0x03ffffffL);
-      h4 := Int64.add !h4 (Int64.shift_right_logical t3 8);  (* no hibit in limb for partial block, added via buffer *)
-
-      let d0 = Int64.add (Int64.add (Int64.add (Int64.add
-        (Int64.mul !h0 r0_26) (Int64.mul !h1 s4)) (Int64.mul !h2 s3)) (Int64.mul !h3 s2)) (Int64.mul !h4 s1) in
-      let d1 = Int64.add (Int64.add (Int64.add (Int64.add
-        (Int64.mul !h0 r1_26) (Int64.mul !h1 r0_26)) (Int64.mul !h2 s4)) (Int64.mul !h3 s3)) (Int64.mul !h4 s2) in
-      let d2 = Int64.add (Int64.add (Int64.add (Int64.add
-        (Int64.mul !h0 r2_26) (Int64.mul !h1 r1_26)) (Int64.mul !h2 r0_26)) (Int64.mul !h3 s4)) (Int64.mul !h4 s3) in
-      let d3 = Int64.add (Int64.add (Int64.add (Int64.add
-        (Int64.mul !h0 r3_26) (Int64.mul !h1 r2_26)) (Int64.mul !h2 r1_26)) (Int64.mul !h3 r0_26)) (Int64.mul !h4 s4) in
-      let d4 = Int64.add (Int64.add (Int64.add (Int64.add
-        (Int64.mul !h0 r4_26) (Int64.mul !h1 r3_26)) (Int64.mul !h2 r2_26)) (Int64.mul !h3 r1_26)) (Int64.mul !h4 r0_26) in
-
-      let c = Int64.shift_right_logical d0 26 in
-      h0 := Int64.logand d0 0x03ffffffL;
-      let d1 = Int64.add d1 c in
-      let c = Int64.shift_right_logical d1 26 in
-      h1 := Int64.logand d1 0x03ffffffL;
-      let d2 = Int64.add d2 c in
-      let c = Int64.shift_right_logical d2 26 in
-      h2 := Int64.logand d2 0x03ffffffL;
-      let d3 = Int64.add d3 c in
-      let c = Int64.shift_right_logical d3 26 in
-      h3 := Int64.logand d3 0x03ffffffL;
-      let d4 = Int64.add d4 c in
-      let c = Int64.shift_right_logical d4 26 in
-      h4 := Int64.logand d4 0x03ffffffL;
-      h0 := Int64.add !h0 (Int64.mul c 5L);
-      let c = Int64.shift_right_logical !h0 26 in
-      h0 := Int64.logand !h0 0x03ffffffL;
-      h1 := Int64.add !h1 c;
-    end;
-
-    (* Full reduction mod 2^130-5 *)
-    let c = Int64.shift_right_logical !h1 26 in
-    h1 := Int64.logand !h1 0x03ffffffL;
-    h2 := Int64.add !h2 c;
-    let c = Int64.shift_right_logical !h2 26 in
-    h2 := Int64.logand !h2 0x03ffffffL;
-    h3 := Int64.add !h3 c;
-    let c = Int64.shift_right_logical !h3 26 in
-    h3 := Int64.logand !h3 0x03ffffffL;
-    h4 := Int64.add !h4 c;
-    let c = Int64.shift_right_logical !h4 26 in
-    h4 := Int64.logand !h4 0x03ffffffL;
-    h0 := Int64.add !h0 (Int64.mul c 5L);
-    let c = Int64.shift_right_logical !h0 26 in
-    h0 := Int64.logand !h0 0x03ffffffL;
-    h1 := Int64.add !h1 c;
-
-    (* Compute h + -p *)
-    let g0 = Int64.add !h0 5L in
-    let c = Int64.shift_right_logical g0 26 in
-    let g0 = Int64.logand g0 0x03ffffffL in
-    let g1 = Int64.add !h1 c in
-    let c = Int64.shift_right_logical g1 26 in
-    let g1 = Int64.logand g1 0x03ffffffL in
-    let g2 = Int64.add !h2 c in
-    let c = Int64.shift_right_logical g2 26 in
-    let g2 = Int64.logand g2 0x03ffffffL in
-    let g3 = Int64.add !h3 c in
-    let c = Int64.shift_right_logical g3 26 in
-    let g3 = Int64.logand g3 0x03ffffffL in
-    let g4 = Int64.add (Int64.sub !h4 0x04000000L) c in
-
-    (* Select h if h < p, or h - p if h >= p *)
-    let mask = Int64.shift_right (Int64.sub g4 0L) 63 in  (* -1 if g4 < 0, else 0 *)
-    let mask = Int64.sub mask 1L in  (* 0 if g4 < 0, else -1 *)
-    h0 := Int64.logxor !h0 (Int64.logand (Int64.logxor g0 !h0) mask);
-    h1 := Int64.logxor !h1 (Int64.logand (Int64.logxor g1 !h1) mask);
-    h2 := Int64.logxor !h2 (Int64.logand (Int64.logxor g2 !h2) mask);
-    h3 := Int64.logxor !h3 (Int64.logand (Int64.logxor g3 !h3) mask);
-    h4 := Int64.logxor !h4 (Int64.logand (Int64.logxor g4 !h4) mask);
-
-    (* Convert from 5x26-bit to 4x32-bit *)
-    let h0_32 = Int64.logor !h0 (Int64.shift_left !h1 26) in
-    let h1_32 = Int64.logor (Int64.shift_right_logical !h1 6) (Int64.shift_left !h2 20) in
-    let h2_32 = Int64.logor (Int64.shift_right_logical !h2 12) (Int64.shift_left !h3 14) in
-    let h3_32 = Int64.logor (Int64.shift_right_logical !h3 18) (Int64.shift_left !h4 8) in
-
-    (* Add s *)
-    let s0 = Int64.of_int32 (Cstruct.LE.get_uint32 key 16) in
-    let s1 = Int64.of_int32 (Cstruct.LE.get_uint32 key 20) in
-    let s2 = Int64.of_int32 (Cstruct.LE.get_uint32 key 24) in
-    let s3 = Int64.of_int32 (Cstruct.LE.get_uint32 key 28) in
-
-    let f0 = Int64.add (Int64.logand h0_32 0xffffffffL) s0 in
-    let f1 = Int64.add (Int64.add (Int64.logand h1_32 0xffffffffL) s1) (Int64.shift_right_logical f0 32) in
-    let f2 = Int64.add (Int64.add (Int64.logand h2_32 0xffffffffL) s2) (Int64.shift_right_logical f1 32) in
-    let f3 = Int64.add (Int64.add (Int64.logand h3_32 0xffffffffL) s3) (Int64.shift_right_logical f2 32) in
-
-    let tag = Cstruct.create 16 in
-    Cstruct.LE.set_uint32 tag 0 (Int64.to_int32 f0);
-    Cstruct.LE.set_uint32 tag 4 (Int64.to_int32 f1);
-    Cstruct.LE.set_uint32 tag 8 (Int64.to_int32 f2);
-    Cstruct.LE.set_uint32 tag 12 (Int64.to_int32 f3);
-    tag
-
-  (* Pad to 16-byte boundary *)
-  let pad16 (data : Cstruct.t) : Cstruct.t =
-    let len = Cstruct.length data in
-    let rem = len mod 16 in
-    if rem = 0 then data
-    else
-      let padding = Cstruct.create (16 - rem) in
-      Cstruct.concat [data; padding]
-
-  (* AEAD_CHACHA20_POLY1305 encrypt
-     cipher = plaintext || tag
-     tag = Poly1305(poly_key, AAD || pad(AAD) || ciphertext || pad(ciphertext) || len(AAD) || len(ciphertext)) *)
+     We delegate to mirage-crypto's verified Chacha20.authenticate_encrypt /
+     authenticate_decrypt rather than wiring our hand-rolled chacha20_crypt
+     to our hand-rolled poly1305_mac. The previous in-tree wiring carried
+     two latent Int64 sign-extension bugs in poly1305_mac that produced
+     wrong tags for any AAD/key/message in which a 32-bit dword had bit 31
+     set — i.e., on roughly half of all real BIP-324 sessions. mirage-crypto
+     Chacha20 is RFC-8439-validated and treats nonce = 12 bytes, counter =
+     32-bit, exactly matching BIP-324 semantics. *)
   let encrypt ~(key : Cstruct.t) ~(nonce : Cstruct.t) ~(aad : Cstruct.t) ~(plaintext : Cstruct.t) : Cstruct.t =
-    (* Generate Poly1305 key using ChaCha20 block 0 *)
-    let poly_key = Cstruct.sub (chacha20_block key nonce 0l) 0 32 in
-    (* Encrypt plaintext with ChaCha20 starting at block 1 *)
-    let ciphertext = chacha20_crypt key nonce 1l plaintext in
-    (* Compute tag *)
-    let aad_len = Cstruct.length aad in
-    let ct_len = Cstruct.length ciphertext in
-    let len_block = Cstruct.create 16 in
-    Cstruct.LE.set_uint64 len_block 0 (Int64.of_int aad_len);
-    Cstruct.LE.set_uint64 len_block 8 (Int64.of_int ct_len);
-    let mac_data = Cstruct.concat [pad16 aad; pad16 ciphertext; len_block] in
-    let tag = poly1305_mac poly_key mac_data in
-    Cstruct.concat [ciphertext; tag]
+    let mc_key = Mirage_crypto.Chacha20.of_secret (Cstruct.to_string key) in
+    let nonce_s = Cstruct.to_string nonce in
+    let adata = Cstruct.to_string aad in
+    let pt = Cstruct.to_string plaintext in
+    let ct_with_tag = Mirage_crypto.Chacha20.authenticate_encrypt
+        ~key:mc_key ~nonce:nonce_s ~adata pt
+    in
+    Cstruct.of_string ct_with_tag
 
-  (* AEAD_CHACHA20_POLY1305 decrypt
-     Returns None if authentication fails *)
   let decrypt ~(key : Cstruct.t) ~(nonce : Cstruct.t) ~(aad : Cstruct.t) ~(ciphertext_and_tag : Cstruct.t) : Cstruct.t option =
-    let len = Cstruct.length ciphertext_and_tag in
-    if len < 16 then None
-    else begin
-      let ciphertext = Cstruct.sub ciphertext_and_tag 0 (len - 16) in
-      let tag = Cstruct.sub ciphertext_and_tag (len - 16) 16 in
-      (* Generate Poly1305 key *)
-      let poly_key = Cstruct.sub (chacha20_block key nonce 0l) 0 32 in
-      (* Verify tag *)
-      let aad_len = Cstruct.length aad in
-      let ct_len = Cstruct.length ciphertext in
-      let len_block = Cstruct.create 16 in
-      Cstruct.LE.set_uint64 len_block 0 (Int64.of_int aad_len);
-      Cstruct.LE.set_uint64 len_block 8 (Int64.of_int ct_len);
-      let mac_data = Cstruct.concat [pad16 aad; pad16 ciphertext; len_block] in
-      let expected_tag = poly1305_mac poly_key mac_data in
-      if not (Cstruct.equal tag expected_tag) then None
-      else begin
-        (* Decrypt *)
-        let plaintext = chacha20_crypt key nonce 1l ciphertext in
-        Some plaintext
-      end
-    end
+    let mc_key = Mirage_crypto.Chacha20.of_secret (Cstruct.to_string key) in
+    let nonce_s = Cstruct.to_string nonce in
+    let adata = Cstruct.to_string aad in
+    let ct = Cstruct.to_string ciphertext_and_tag in
+    match Mirage_crypto.Chacha20.authenticate_decrypt
+            ~key:mc_key ~nonce:nonce_s ~adata ct
+    with
+    | Some pt -> Some (Cstruct.of_string pt)
+    | None -> None
 end
 
 (* Forward-Secure ChaCha20Poly1305 with rekeying (FSChaCha20Poly1305)
-   Per BIP324: rekeys every REKEY_INTERVAL messages *)
+   Per BIP324: rekeys every REKEY_INTERVAL messages.
+
+   Per-packet nonce:    LE32(packet_counter) || LE64(rekey_counter)
+   Per-packet AEAD:     standard ChaCha20-Poly1305 (block 0 = poly key,
+                        block 1+ = ciphertext keystream).
+   Rekey trigger:       after the (REKEY_INTERVAL - 1)-th packet of an epoch,
+                        i.e. just before packet_counter would wrap to 0.
+   Rekey nonce:         LE32(0xFFFFFFFF) || LE64(rekey_counter)
+                        (NOT packet_counter — Bitcoin Core puts a sentinel
+                         in the packet-counter slot to avoid colliding with
+                         a real packet-nonce).
+   Rekey body:          AEAD-encrypt 32 zero bytes under (old_key, rekey_nonce,
+                        empty aad); the new key is the first 32 bytes of the
+                        ciphertext (which is just the keystream of block 1
+                        XOR'd with zeros — equivalent to ChaCha20 block 1
+                        first 32 bytes; block 0 is reserved for the Poly1305
+                        one-time key and must NOT be reused as keying
+                        material). *)
 module FSChaCha20Poly1305 = struct
   type t = {
     mutable key : Cstruct.t;
@@ -1816,77 +1606,158 @@ module FSChaCha20Poly1305 = struct
       packet_counter = 0;
       rekey_counter = 0L }
 
-  (* Construct nonce from rekey_counter (little-endian) and packet_counter *)
-  let make_nonce (t : t) : Cstruct.t =
+  (* Per-packet nonce:
+       bytes 0..3 = packet_counter (LE32)
+       bytes 4..11 = rekey_counter  (LE64) *)
+  let make_packet_nonce (t : t) : Cstruct.t =
     let nonce = Cstruct.create 12 in
-    (* Lower 4 bytes: packet_counter *)
     Cstruct.LE.set_uint32 nonce 0 (Int32.of_int t.packet_counter);
-    (* Upper 8 bytes: rekey_counter *)
     Cstruct.LE.set_uint64 nonce 4 t.rekey_counter;
     nonce
 
-  (* Advance to next packet, rekey if needed *)
+  (* Rekey nonce:
+       bytes 0..3 = 0xFFFFFFFF sentinel (NOT packet_counter)
+       bytes 4..11 = rekey_counter (LE64)
+     This matches Bitcoin Core (chacha20poly1305.cpp NextPacket):
+       m_aead.Keystream({0xFFFFFFFF, m_rekey_counter}, ...) *)
+  let make_rekey_nonce (t : t) : Cstruct.t =
+    let nonce = Cstruct.create 12 in
+    Cstruct.LE.set_uint32 nonce 0 0xFFFFFFFFl;
+    Cstruct.LE.set_uint64 nonce 4 t.rekey_counter;
+    nonce
+
+  (* Advance to next packet, rekey if needed.
+     Bitcoin Core increments packet_counter then tests == rekey_interval, so a
+     rekey occurs after exactly rekey_interval packets in the current epoch. *)
   let next_packet (t : t) : unit =
     t.packet_counter <- t.packet_counter + 1;
     if t.packet_counter = t.rekey_interval then begin
-      (* Rekey: new_key = ChaCha20(old_key, nonce, 0)[0:32] *)
-      let nonce = make_nonce t in
-      let keystream = ChaCha20Poly1305.chacha20_block t.key nonce 0l in
-      t.key <- Cstruct.sub_copy keystream 0 32;
+      (* New key = AEAD_ChaCha20Poly1305(old_key, rekey_nonce, "", 32-zeros)[0:32]
+         which is exactly the first 32 bytes of ChaCha20 keystream block 1
+         under (old_key, rekey_nonce). We compute it directly via the
+         ChaCha20 block function (block index = 1) to avoid building a
+         full AEAD frame just to discard the tag. *)
+      let rekey_nonce = make_rekey_nonce t in
+      let keystream_block1 = ChaCha20Poly1305.chacha20_block t.key rekey_nonce 1l in
+      t.key <- Cstruct.sub_copy keystream_block1 0 32;
       t.packet_counter <- 0;
       t.rekey_counter <- Int64.add t.rekey_counter 1L
     end
 
   let encrypt (t : t) ~(aad : Cstruct.t) ~(plaintext : Cstruct.t) : Cstruct.t =
-    let nonce = make_nonce t in
+    let nonce = make_packet_nonce t in
     let result = ChaCha20Poly1305.encrypt ~key:t.key ~nonce ~aad ~plaintext in
     next_packet t;
     result
 
   let decrypt (t : t) ~(aad : Cstruct.t) ~(ciphertext : Cstruct.t) : Cstruct.t option =
-    let nonce = make_nonce t in
+    let nonce = make_packet_nonce t in
     let result = ChaCha20Poly1305.decrypt ~key:t.key ~nonce ~aad ~ciphertext_and_tag:ciphertext in
     next_packet t;
     result
 end
 
-(* FSChaCha20 for length encryption (no authentication) *)
+(* FSChaCha20 for length encryption (no authentication).
+
+   Per BIP-324 + Bitcoin Core (crypto/chacha20.cpp FSChaCha20::Crypt), the
+   length cipher must produce a CONTINUOUS keystream within a rekey epoch:
+   one ChaCha20 stream cipher seeded with (key, nonce=(0||LE64(rekey_counter)),
+   block_counter=0) and advanced naturally by every Crypt() call. The
+   "packet counter" only triggers the rekey after rekey_interval crypts; it
+   does NOT enter the nonce.
+
+   The previous implementation rebuilt a fresh ChaCha20 from block 0 every
+   Crypt() and stuffed packet_counter into the nonce. That decrypts the very
+   first packet's length field correctly (both sides happen to seed from
+   block 0), but every subsequent packet uses a different keystream than the
+   peer expects, so the length prefix becomes garbage and the AEAD payload
+   that follows fails authentication. This is the same family of bug that
+   was fixed in clearbit (cb04a1f), haskoin (5343d02), blockbrew (7351ce8)
+   and others.
+
+   Rekey, per Core: at rekey_interval packets, draw the next 32 bytes of
+   keystream (which is buffered, advancing block_counter past the data
+   consumed so far) as the new key, then Seek to (block 0, nonce =
+   (0 || LE64(++rekey_counter))) and reset the keystream buffer. *)
 module FSChaCha20 = struct
   type t = {
     mutable key : Cstruct.t;
     rekey_interval : int;
     mutable packet_counter : int;
     mutable rekey_counter : int64;
+    (* Stateful keystream buffer: holds the unconsumed tail of the most
+       recently-generated 64-byte keystream block, plus a block_counter
+       that records the index of the NEXT block to generate. *)
+    mutable block_counter : int32;
+    mutable buffer : Cstruct.t;        (* 0..64 bytes of keystream *)
   }
 
   let create (key : Cstruct.t) (rekey_interval : int) : t =
     { key = Cstruct.sub_copy key 0 32;
       rekey_interval;
       packet_counter = 0;
-      rekey_counter = 0L }
+      rekey_counter = 0L;
+      block_counter = 0l;
+      buffer = Cstruct.create 0 }
 
-  let make_nonce (t : t) : Cstruct.t =
+  (* Epoch nonce: bytes 0..3 = 0, bytes 4..11 = rekey_counter (LE64).
+     Constant within a rekey epoch — what changes per call is the
+     internal block_counter, not the nonce. *)
+  let epoch_nonce (t : t) : Cstruct.t =
     let nonce = Cstruct.create 12 in
-    Cstruct.LE.set_uint32 nonce 0 (Int32.of_int t.packet_counter);
+    Cstruct.LE.set_uint32 nonce 0 0l;
     Cstruct.LE.set_uint64 nonce 4 t.rekey_counter;
     nonce
 
-  let next_packet (t : t) : unit =
+  (* Pull `nbytes` of keystream from the continuing ChaCha20 stream,
+     refilling the 64-byte buffer as needed. *)
+  let get_keystream (t : t) (nbytes : int) : Cstruct.t =
+    let out = Cstruct.create nbytes in
+    let written = ref 0 in
+    while !written < nbytes do
+      if Cstruct.length t.buffer = 0 then begin
+        (* Need a fresh block. *)
+        let nonce = epoch_nonce t in
+        t.buffer <- ChaCha20Poly1305.chacha20_block t.key nonce t.block_counter;
+        t.block_counter <- Int32.add t.block_counter 1l
+      end;
+      let avail = Cstruct.length t.buffer in
+      let want = nbytes - !written in
+      let n = if avail < want then avail else want in
+      Cstruct.blit t.buffer 0 out !written n;
+      (* Drop n bytes from the front of the buffer. *)
+      t.buffer <- Cstruct.sub t.buffer n (avail - n);
+      written := !written + n
+    done;
+    out
+
+  (* Reset keystream state to start of a new epoch. *)
+  let begin_new_epoch (t : t) (new_key : Cstruct.t) : unit =
+    t.key <- Cstruct.sub_copy new_key 0 32;
+    t.packet_counter <- 0;
+    t.rekey_counter <- Int64.add t.rekey_counter 1L;
+    t.block_counter <- 0l;
+    t.buffer <- Cstruct.create 0
+
+  (* Encrypt/decrypt the 3-byte length field with the continuing keystream,
+     then optionally rekey. *)
+  let crypt (t : t) (data : Cstruct.t) : Cstruct.t =
+    let len = Cstruct.length data in
+    let ks = get_keystream t len in
+    let out = Cstruct.create len in
+    for i = 0 to len - 1 do
+      Cstruct.set_uint8 out i
+        (Cstruct.get_uint8 data i lxor Cstruct.get_uint8 ks i)
+    done;
     t.packet_counter <- t.packet_counter + 1;
     if t.packet_counter = t.rekey_interval then begin
-      let nonce = make_nonce t in
-      let keystream = ChaCha20Poly1305.chacha20_block t.key nonce 0l in
-      t.key <- Cstruct.sub_copy keystream 0 32;
-      t.packet_counter <- 0;
-      t.rekey_counter <- Int64.add t.rekey_counter 1L
-    end
-
-  (* Encrypt/decrypt 3-byte length field *)
-  let crypt (t : t) (data : Cstruct.t) : Cstruct.t =
-    let nonce = make_nonce t in
-    let result = ChaCha20Poly1305.chacha20_crypt t.key nonce 0l data in
-    next_packet t;
-    result
+      (* New key = next 32 bytes of the current epoch's keystream.
+         This consumes from the buffer + advances block_counter as needed,
+         exactly like Bitcoin Core's m_chacha20.Keystream(new_key). *)
+      let new_key = get_keystream t 32 in
+      begin_new_epoch t new_key
+    end;
+    out
 end
 
 (* BIP324 Cipher state *)

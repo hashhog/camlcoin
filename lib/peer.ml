@@ -80,16 +80,61 @@ let handshake_timeout = 60.0   (* 60 seconds for version/verack handshake *)
    mirror it so a stalled remote doesn't wedge the dialer for long. *)
 let v2_handshake_deadline = 30.0  (* seconds for cipher handshake *)
 
-(* Returns true iff BIP-324 v2 outbound is enabled. Default OFF (conservative)
-   since this code path is brand new — enable per-process via
-   CAMLCOIN_BIP324_V2_OUTBOUND=1. Mirrors clearbit's CLEARBIT_BIP324_V2 gate
-   pattern (clearbit/src/peer.zig:653). *)
-let bip324_v2_outbound_enabled () : bool =
-  match Sys.getenv_opt "CAMLCOIN_BIP324_V2_OUTBOUND" with
+(* Helper: parse a CAMLCOIN_BIP324_V2* env var as a boolean.  Returns true
+   iff the variable is set to a value other than {0, false, off, ""}. *)
+let env_flag_on (key : string) : bool =
+  match Sys.getenv_opt key with
   | None -> false
   | Some v ->
     let v = String.lowercase_ascii v in
     not (v = "0" || v = "false" || v = "off" || v = "")
+
+(* Returns true iff BIP-324 v2 outbound is enabled. Default OFF (conservative)
+   since this code path is brand new — enable per-process via
+   CAMLCOIN_BIP324_V2_OUTBOUND=1 (or the umbrella CAMLCOIN_BIP324_V2=1 which
+   gates both directions).  Mirrors clearbit's CLEARBIT_BIP324_V2 gate pattern
+   (clearbit/src/peer.zig:653). *)
+let bip324_v2_outbound_enabled () : bool =
+  env_flag_on "CAMLCOIN_BIP324_V2_OUTBOUND" || env_flag_on "CAMLCOIN_BIP324_V2"
+
+(* Returns true iff BIP-324 v2 inbound (responder mode) is enabled.  Default
+   OFF — enable per-process via CAMLCOIN_BIP324_V2_INBOUND=1 (or the umbrella
+   CAMLCOIN_BIP324_V2=1 which gates both directions).  When OFF the inbound
+   listener hands every byte straight to read_message_v1 (legacy behaviour).
+   When ON the listener peeks the first 16 bytes of the stream, classifies
+   the connection (v1 magic + "version\0\0\0\0\0" → v1; anything else → v2),
+   and on v2 detection drives the BIP-324 cipher handshake in responder mode
+   before falling through to the application version/verack. *)
+let bip324_v2_inbound_enabled () : bool =
+  env_flag_on "CAMLCOIN_BIP324_V2_INBOUND" || env_flag_on "CAMLCOIN_BIP324_V2"
+
+(* 12-byte v1 command for VERSION ("version" plus 5 NUL bytes).  Used by the
+   inbound peek-classifier to distinguish a v1 VERSION header from a v2
+   ElligatorSwift pubkey.  Matches clearbit/src/v2_transport.zig:114. *)
+let v1_version_command : bytes =
+  let b = Bytes.make 12 '\000' in
+  Bytes.blit_string "version" 0 b 0 7;
+  b
+
+(* Length of the v1 detection prefix: 4-byte network magic + 12-byte command.
+   Mirrors clearbit's V1_PREFIX_LEN (clearbit/src/v2_transport.zig:111). *)
+let v1_prefix_len = 16
+
+(* Classify the leading 16 bytes of an inbound TCP stream.  Returns true iff
+   they look like the start of a v1 VERSION message (4-byte network magic
+   followed by the 12-byte "version" command).  Caller must pass at least
+   [v1_prefix_len] bytes; otherwise the function returns false (i.e. "not v1",
+   which forces the caller to treat the connection as v2 — same conservative
+   choice as Bitcoin Core's V2Transport::ProcessReceivedMaybeV1Bytes). *)
+let looks_like_v1_version (peek : bytes) (magic : int32) : bool =
+  if Bytes.length peek < v1_prefix_len then false
+  else begin
+    let m = Cstruct.LE.get_uint32 (Cstruct.of_bytes peek) 0 in
+    if m <> magic then false
+    else
+      let cmd = Bytes.sub peek 4 12 in
+      Bytes.equal cmd v1_version_command
+  end
 
 (* Per-address LRU cache of addresses that turned out to be v1-only.
    Bounded at 4096 entries (matches clearbit's V2_FALLBACK_CACHE_MAX).
@@ -427,8 +472,9 @@ let read_message_v2 (peer : peer) (state : P2p.v2_state)
   end
 
 (* Top-level read_message: dispatch on transport.  V1 is the default; V2
-   is only set after [perform_v2_outbound_handshake] (or future inbound
-   v2 path) has installed the V2Transport on the peer. *)
+   is only set after [perform_v2_handshake] has installed the V2Transport
+   on the peer (driven by either the outbound dialer or the inbound
+   responder peek-classifier). *)
 let read_message (peer : peer) : P2p.message_payload Lwt.t =
   match peer.transport with
   | None | Some (P2p.V1 _) -> read_message_v1 peer
@@ -690,15 +736,21 @@ let disconnect (peer : peer) : unit Lwt.t =
    socket cannot be reused).
    ============================================================================ *)
 
-(* Drive the BIP-324 cipher handshake on an outbound peer that already has
-   an initiator V2Transport attached.  Loops until the V2 state machine has:
-     1. flushed our (ellswift pubkey + garbage) bytes on the wire,
+(* Drive the BIP-324 cipher handshake on a peer that already has a V2Transport
+   attached.  Direction-agnostic — the v2 state machine handles both initiator
+   and responder transitions internally; this function just shuttles bytes.
+   Loops until the V2 state machine has:
+     1. flushed our staged bytes on the wire (initiator: pubkey+garbage on
+        iteration 1, then garbage terminator + version packet after peer's
+        pubkey arrives; responder: pubkey + garbage + terminator + version
+        all in one shot once peer's pubkey arrives),
      2. received the peer's ellswift pubkey,
      3. derived the shared secret + ciphers,
      4. emitted our garbage terminator + (decoy + ) version packet,
      5. consumed the peer's garbage + garbage terminator + version packet.
-   On success [peer.transport] is set to [Some (V2 state)] and any subsequent
-   send/read flows through encrypted dispatch.  Bounded by [v2_handshake_deadline].
+   On success [peer.transport] is left set to [Some (V2 state)] and any
+   subsequent send/read flows through encrypted dispatch.  Bounded by
+   [v2_handshake_deadline].
 
    Failure modes:
      - V2RecvV1Fallback         → peer is speaking v1 (caller must close socket)
@@ -706,7 +758,7 @@ let disconnect (peer : peer) : unit Lwt.t =
      - deadline reached         → stalled remote
      - End_of_file / read err   → peer closed
    In every failure case we raise — caller decides whether to fall back. *)
-let perform_v2_outbound_handshake (peer : peer)
+let perform_v2_handshake (peer : peer)
     (state : P2p.v2_state) : unit Lwt.t =
   let open Lwt.Syntax in
   let chunk_size = 8192 in
@@ -925,7 +977,7 @@ let connect_outbound_negotiated
           | P2p.V1 _ -> assert false
         in
         peer.transport <- Some transport;
-        let* () = perform_v2_outbound_handshake peer v2_state in
+        let* () = perform_v2_handshake peer v2_state in
         (* Cipher handshake complete — run the application version/verack
            over the encrypted v2 transport.  send_message / read_message
            dispatch on peer.transport so this Just Works. *)
@@ -950,6 +1002,152 @@ let connect_outbound_negotiated
               (fun () -> disconnect fresh)
               (fun _ -> Lwt.return_unit) in
             Lwt.fail exn2))
+  end
+
+(* ============================================================================
+   BIP-324 v2 inbound (responder mode)
+   ----------------------------------------------------------------------------
+   Mirrors clearbit's responder path (clearbit/src/peer.zig:899-924).  The
+   inbound listener has just accepted a TCP connection; before driving the
+   v1 application handshake we peek 16 bytes from the kernel buffer with
+   MSG_PEEK and classify:
+
+     - If the bytes match the v1 VERSION header prefix (network magic +
+       "version\0\0\0\0\0"), proceed straight to [perform_inbound_handshake]
+       (the legacy v1 path).  The peeked bytes remain in the kernel buffer,
+       so [Lwt_io.read_into_exactly] in [read_message_v1] picks them up.
+
+     - Otherwise (peer sent a 64-byte ElligatorSwift pubkey), attach a
+       responder V2Transport, drive the BIP-324 cipher handshake via
+       [perform_v2_handshake], then run the application version/verack on
+       top of the encrypted channel.  [send_message] / [read_message]
+       dispatch on [peer.transport] so once the cipher handshake completes
+       the application messages flow through encrypted dispatch automatically.
+
+   Gated by [bip324_v2_inbound_enabled] (default OFF).  When OFF behaviour
+   is identical to calling [perform_inbound_handshake] directly.
+   ============================================================================ *)
+
+(* Peek up to [v1_prefix_len] bytes from the underlying TCP socket without
+   consuming them from the kernel buffer.  Bounded by [deadline_sec].  Returns
+   the number of bytes actually peeked (0 to v1_prefix_len).  May return less
+   than v1_prefix_len if the deadline expires with partial data; the caller
+   must treat that as inconclusive (we err on the side of "not v1" → v2).
+
+   Lwt_unix.recv with [MSG_PEEK] leaves the bytes in the kernel buffer so a
+   subsequent Lwt_io.read_into on peer.ic still sees the full stream.  This
+   relies on Lwt_io.of_fd not having pre-pulled any bytes from the kernel,
+   which is true at the start of [accept_inbound] (peer.ic has not been read
+   from yet). *)
+let peek_inbound_prefix (peer : peer) (deadline_sec : float)
+    : int Lwt.t =
+  let open Lwt.Syntax in
+  let buf = Bytes.create v1_prefix_len in
+  let start = Unix.gettimeofday () in
+  let rec loop total =
+    if total >= v1_prefix_len then Lwt.return total
+    else
+      let elapsed = Unix.gettimeofday () -. start in
+      if elapsed >= deadline_sec then Lwt.return total
+      else begin
+        let remaining = deadline_sec -. elapsed in
+        let recv_task =
+          let* n = Lwt_unix.recv peer.fd buf total
+            (v1_prefix_len - total) [Unix.MSG_PEEK] in
+          Lwt.return (`Got n)
+        in
+        let timeout_task =
+          let* () = Lwt_unix.sleep remaining in
+          Lwt.return `Timeout
+        in
+        let* res = Lwt.pick [recv_task; timeout_task] in
+        match res with
+        | `Timeout -> Lwt.return total
+        | `Got 0 -> Lwt.return total  (* EOF — caller will see it on next read *)
+        | `Got n ->
+          (* recv with MSG_PEEK returns the cumulative bytes available;
+             advance our notion of total but stop if it didn't grow
+             (kernel has no more data right now). *)
+          if n <= total then Lwt.return total
+          else loop n
+      end
+  in
+  loop 0
+
+(* Drive the inbound handshake with optional BIP-324 v2 negotiation.  When
+   [bip324_v2_inbound_enabled] is OFF this just delegates to
+   [perform_inbound_handshake] (legacy v1 path).  When ON it peeks 16 bytes
+   from the socket, classifies, and on v2 detection installs a responder
+   V2Transport + drives the cipher handshake before the app version/verack. *)
+let perform_inbound_handshake_negotiated (peer : peer)
+    (our_height : int32) : unit Lwt.t =
+  let open Lwt.Syntax in
+  if not (bip324_v2_inbound_enabled ()) then
+    perform_inbound_handshake peer our_height
+  else begin
+    (* Phase 1: peek + classify.  Use a short deadline (5s) — a healthy peer
+       sends 16+ bytes in the first TCP segment; silence past that means a
+       slow/malformed peer and we'd rather fall back to v1 (which has its
+       own timeouts) than wedge here. *)
+    let* got = peek_inbound_prefix peer 5.0 in
+    let peek_buf = Bytes.create v1_prefix_len in
+    (* Re-peek into peek_buf so we have the bytes in hand for classification.
+       This double-peek is intentional — peek_inbound_prefix returns only
+       the count; we need the bytes themselves to inspect the command field.
+       MSG_PEEK leaves them in the kernel either way. *)
+    let* () =
+      if got < v1_prefix_len then Lwt.return_unit
+      else
+        let* _ = Lwt_unix.recv peer.fd peek_buf 0 v1_prefix_len
+          [Unix.MSG_PEEK] in
+        Lwt.return_unit
+    in
+    let is_v1 =
+      got >= v1_prefix_len &&
+      looks_like_v1_version peek_buf peer.network.magic
+    in
+    if is_v1 || got < v1_prefix_len then begin
+      (* v1 path: bytes remain in kernel (MSG_PEEK is non-destructive),
+         Lwt_io.read_into_exactly in read_message_v1 will pick them up.
+         We also take this branch on partial peek (got < 16) — the v1
+         handshake's read_timeout will fire if the peer is truly silent;
+         this preserves graceful degradation when the peek deadline fires
+         before classification completes. *)
+      perform_inbound_handshake peer our_height
+    end
+    else begin
+      (* Phase 2: v2 responder.  Attach a responder V2Transport; its
+         send_buffer starts empty (responders wait for the peer's pubkey
+         before sending anything per BIP-324 § "Wire format").  The state
+         machine starts in V2RecvKeyMaybeV1 and will advance to V2RecvKey
+         on the first chunk because the peeked bytes don't match v1 magic. *)
+      let transport = P2p.create_v2_transport ~initiating:false
+        ~magic:peer.network.magic in
+      let v2_state = match transport with
+        | P2p.V2 s -> s
+        | P2p.V1 _ -> assert false
+      in
+      peer.transport <- Some transport;
+      Lwt.catch
+        (fun () ->
+          let* () = perform_v2_handshake peer v2_state in
+          (* Cipher handshake complete — run the application version/verack
+             over the encrypted v2 transport.  send_message / read_message
+             dispatch on peer.transport so this Just Works. *)
+          let* () = perform_inbound_handshake peer our_height in
+          Log.info (fun m ->
+            m "[%s:%d] BIP-324 v2 inbound connected (encrypted)"
+              peer.addr peer.port);
+          Lwt.return_unit)
+        (fun exn ->
+          (* Reset transport so the caller's clean-up path doesn't try to
+             send a v2 disconnect packet over a half-built cipher. *)
+          peer.transport <- None;
+          Log.info (fun m ->
+            m "[%s:%d] BIP-324 v2 inbound failed: %s"
+              peer.addr peer.port (Printexc.to_string exn));
+          Lwt.fail exn)
+    end
   end
 
 (* Send a ping message and record the nonce (BIP-31) *)

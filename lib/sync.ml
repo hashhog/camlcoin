@@ -2792,7 +2792,7 @@ let max_mempool_inv_items = 50_000
 let handle_mempool_msg_for
     (mempool : Mempool.mempool option) (peer : Peer.peer) : unit Lwt.t =
   let open Lwt.Syntax in
-  if not Peer.our_services.bloom then begin
+  if not (Peer.our_services ()).bloom then begin
     Logs.debug (fun m ->
       m "MEMPOOL request from peer %d but NODE_BLOOM not advertised \
          — disconnecting" peer.Peer.id);

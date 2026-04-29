@@ -1050,13 +1050,29 @@ let handle_getconnectioncount (ctx : rpc_context) : Yojson.Safe.t =
   `Int (Peer_manager.peer_count ctx.peer_manager)
 
 let handle_getnetworkinfo (ctx : rpc_context) : Yojson.Safe.t =
+  (* Render localservices straight from [Peer.our_services] so the RPC
+     output matches the bits we actually advertise on the wire.  When
+     -peerbloomfilters=0 (Core default) the NODE_BLOOM bit is off and the
+     hex string drops to "...0009" with BLOOM removed from the names list. *)
+  let svc = Peer.our_services () in
+  let svc_bits = Peer.services_to_int64 svc in
+  let localservices_hex = Printf.sprintf "%016Lx" svc_bits in
+  let localservicesnames =
+    let names = ref [] in
+    if svc.network_limited then names := `String "NETWORK_LIMITED" :: !names;
+    if svc.compact_filters then names := `String "COMPACT_FILTERS" :: !names;
+    if svc.witness then names := `String "WITNESS" :: !names;
+    if svc.bloom then names := `String "BLOOM" :: !names;
+    if svc.getutxo then names := `String "GETUTXO" :: !names;
+    if svc.network then names := `String "NETWORK" :: !names;
+    `List !names
+  in
   `Assoc [
     ("version", `Int 210000);
     ("subversion", `String ("/CamlCoin:" ^ Types.version ^ "/"));
     ("protocolversion", `Int (Int32.to_int Types.protocol_version));
-    ("localservices", `String "000000000000000d");
-    ("localservicesnames",
-      `List [`String "NETWORK"; `String "BLOOM"; `String "WITNESS"]);
+    ("localservices", `String localservices_hex);
+    ("localservicesnames", localservicesnames);
     ("localrelay", `Bool true);
     ("timeoffset", `Int 0);
     ("networkactive", `Bool true);

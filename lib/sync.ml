@@ -2780,9 +2780,25 @@ let handle_getheaders_request (state : chain_state)
 let max_mempool_inv_items = 50_000
 
 (* Handle a MempoolMsg from a peer: respond with an InvMsg listing
-   transaction IDs currently in the mempool. *)
-let handle_mempool_msg (ibd : ibd_state) (peer : Peer.peer) : unit Lwt.t =
-  match ibd.mempool with
+   transaction IDs currently in the mempool.
+
+   BIP-35 / NODE_BLOOM gate (matches Bitcoin Core's
+   src/net_processing.cpp `if msg_type == NetMsgType::MEMPOOL` block):
+   we serve the request only if *we* advertise NODE_BLOOM.  If we don't,
+   we drop the message and disconnect the peer (Core also fDisconnects
+   unless the peer has NoBan permission; camlcoin has no permission
+   layer, so we just disconnect unconditionally).  Note the gate looks
+   at our own advertised services, NOT the peer's. *)
+let handle_mempool_msg_for
+    (mempool : Mempool.mempool option) (peer : Peer.peer) : unit Lwt.t =
+  let open Lwt.Syntax in
+  if not Peer.our_services.bloom then begin
+    Logs.debug (fun m ->
+      m "MEMPOOL request from peer %d but NODE_BLOOM not advertised \
+         — disconnecting" peer.Peer.id);
+    Lwt.catch (fun () -> Peer.disconnect peer) (fun _ -> Lwt.return_unit)
+  end else
+  match mempool with
   | None ->
     (* No mempool attached — nothing to advertise *)
     Lwt.return_unit
@@ -2806,12 +2822,35 @@ let handle_mempool_msg (ibd : ibd_state) (peer : Peer.peer) : unit Lwt.t =
         end
       end
     ) mp.entries;
+    (* Send in chunks of MAX_INV_SZ (50 000) to mirror Core's wire limit
+       (net_processing.cpp:126 `MAX_INV_SZ`).  Today [max_mempool_inv_items]
+       equals MAX_INV_SZ so we never accumulate more than one chunk's
+       worth, but the rev+chunk loop here keeps us correct if either
+       constant changes in future. *)
+    let rec send_chunks items =
+      match items with
+      | [] -> Lwt.return_unit
+      | _ ->
+        let rec take n acc = function
+          | [] -> (List.rev acc, [])
+          | _ as l when n = 0 -> (List.rev acc, l)
+          | x :: rest -> take (n - 1) (x :: acc) rest
+        in
+        let chunk, rest = take max_mempool_inv_items [] items in
+        let* () = Lwt.catch
+          (fun () -> Peer.send_message peer (P2p.InvMsg chunk))
+          (fun _exn -> Lwt.return_unit) in
+        send_chunks rest
+    in
     if !inv_items <> [] then
-      Lwt.catch
-        (fun () -> Peer.send_message peer (P2p.InvMsg !inv_items))
-        (fun _exn -> Lwt.return_unit)
+      send_chunks (List.rev !inv_items)
     else
       Lwt.return_unit
+
+(* IBD-state convenience wrapper; identical semantics to
+   [handle_mempool_msg_for] but reads the mempool out of an ibd_state. *)
+let handle_mempool_msg (ibd : ibd_state) (peer : Peer.peer) : unit Lwt.t =
+  handle_mempool_msg_for ibd.mempool peer
 
 (* ============================================================================
    Block Invalidation (invalidateblock / reconsiderblock RPCs)

@@ -680,9 +680,15 @@ let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
      | None -> ());
     let peer_ref = ref None in
     Lwt.catch (fun () ->
-      let* peer = Peer.connect ~network:pm.network ~addr ~port ~id in
+      (* connect_outbound_negotiated tries BIP-324 v2 first (when
+         CAMLCOIN_BIP324_V2_OUTBOUND=1 and the address is not in the
+         v1-only LRU cache), falling back to v1 on a fresh socket. The
+         function performs the application version/verack itself (over v2
+         cipher when negotiated, plaintext otherwise), so the previous
+         [Peer.perform_handshake] call is not needed. *)
+      let* peer = Peer.connect_outbound_negotiated
+        ~network:pm.network ~addr ~port ~id ~our_height:pm.our_height in
       peer_ref := Some peer;
-      let* () = Peer.perform_handshake peer pm.our_height in
       pm.peers <- peer :: pm.peers;
       (* Track connection time for eviction algorithm *)
       Hashtbl.replace pm.peer_connected_time peer.Peer.id now;
@@ -764,9 +770,9 @@ let force_add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
      | None -> ());
     let peer_ref = ref None in
     Lwt.catch (fun () ->
-      let* peer = Peer.connect ~network:pm.network ~addr ~port ~id in
+      let* peer = Peer.connect_outbound_negotiated
+        ~network:pm.network ~addr ~port ~id ~our_height:pm.our_height in
       peer_ref := Some peer;
-      let* () = Peer.perform_handshake peer pm.our_height in
       pm.peers <- peer :: pm.peers;
       Hashtbl.replace pm.peer_connected_time peer.Peer.id now;
       Hashtbl.replace pm.stale_state peer.Peer.id (create_stale_state ());
@@ -840,10 +846,10 @@ let add_block_relay_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
      | None -> ());
     let peer_ref = ref None in
     Lwt.catch (fun () ->
-      let* peer = Peer.connect ~network:pm.network ~addr ~port ~id in
+      let* peer = Peer.connect_outbound_negotiated
+        ~network:pm.network ~addr ~port ~id ~our_height:pm.our_height in
       peer_ref := Some peer;
       peer.Peer.block_relay_only <- true;
-      let* () = Peer.perform_handshake peer pm.our_height in
       pm.peers <- peer :: pm.peers;
       Hashtbl.replace pm.peer_connected_time peer.Peer.id now;
       Hashtbl.replace pm.stale_state peer.Peer.id (create_stale_state ());

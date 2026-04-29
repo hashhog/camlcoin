@@ -957,6 +957,119 @@ let test_connect_timeout_no_fd_leak () =
       true (after <= before + 2)
   end
 
+(* ===== BIP-324 v2 outbound dispatch tests ============================== *)
+
+(* Helper to set / unset CAMLCOIN_BIP324_V2_OUTBOUND for one assertion.
+   Unix.putenv overrides; we restore afterwards. *)
+let with_v2_env (v : string option) (f : unit -> unit) : unit =
+  let key = "CAMLCOIN_BIP324_V2_OUTBOUND" in
+  let prev = Sys.getenv_opt key in
+  (match v with
+   | Some s -> Unix.putenv key s
+   | None ->
+     (* Approximate "unset" — putenv has no remove on the OCaml stdlib;
+        clobber to "" which the gate treats as off. *)
+     Unix.putenv key "");
+  let restore () =
+    match prev with
+    | Some s -> Unix.putenv key s
+    | None -> Unix.putenv key ""
+  in
+  (try f (); restore () with e -> restore (); raise e)
+
+let test_bip324_v2_default_off () =
+  with_v2_env None (fun () ->
+    Alcotest.(check bool) "default OFF (no env)" false
+      (Peer.bip324_v2_outbound_enabled ()))
+
+let test_bip324_v2_env_one () =
+  with_v2_env (Some "1") (fun () ->
+    Alcotest.(check bool) "env=1 → ON" true
+      (Peer.bip324_v2_outbound_enabled ()))
+
+let test_bip324_v2_env_zero () =
+  with_v2_env (Some "0") (fun () ->
+    Alcotest.(check bool) "env=0 → OFF" false
+      (Peer.bip324_v2_outbound_enabled ()))
+
+let test_bip324_v2_env_false () =
+  with_v2_env (Some "false") (fun () ->
+    Alcotest.(check bool) "env=false → OFF" false
+      (Peer.bip324_v2_outbound_enabled ()));
+  with_v2_env (Some "FALSE") (fun () ->
+    Alcotest.(check bool) "env=FALSE → OFF" false
+      (Peer.bip324_v2_outbound_enabled ()));
+  with_v2_env (Some "off") (fun () ->
+    Alcotest.(check bool) "env=off → OFF" false
+      (Peer.bip324_v2_outbound_enabled ()))
+
+let test_v1only_cache_basic () =
+  Peer.V1OnlyCache.clear ();
+  Alcotest.(check bool) "fresh: not v1-only" false
+    (Peer.V1OnlyCache.is_v1_only ~addr:"203.0.113.7" ~port:8333);
+  Peer.V1OnlyCache.mark ~addr:"203.0.113.7" ~port:8333;
+  Alcotest.(check bool) "marked: now v1-only" true
+    (Peer.V1OnlyCache.is_v1_only ~addr:"203.0.113.7" ~port:8333);
+  Alcotest.(check bool) "different addr unaffected" false
+    (Peer.V1OnlyCache.is_v1_only ~addr:"203.0.113.8" ~port:8333)
+
+let test_v1only_cache_pair () =
+  (* (addr, port) is the cache key — same addr on different port is
+     independent.  Mirrors the recent W camlcoin (addr, port) dedup
+     fix (424d84e). *)
+  Peer.V1OnlyCache.clear ();
+  Peer.V1OnlyCache.mark ~addr:"127.0.0.1" ~port:18444;
+  Alcotest.(check bool) "127.0.0.1:18444 is v1-only" true
+    (Peer.V1OnlyCache.is_v1_only ~addr:"127.0.0.1" ~port:18444);
+  Alcotest.(check bool) "127.0.0.1:18445 is NOT v1-only" false
+    (Peer.V1OnlyCache.is_v1_only ~addr:"127.0.0.1" ~port:18445)
+
+let test_v1only_cache_dedup () =
+  Peer.V1OnlyCache.clear ();
+  Peer.V1OnlyCache.mark ~addr:"10.0.0.1" ~port:8333;
+  let s1 = Peer.V1OnlyCache.size () in
+  Peer.V1OnlyCache.mark ~addr:"10.0.0.1" ~port:8333;
+  Peer.V1OnlyCache.mark ~addr:"10.0.0.1" ~port:8333;
+  let s2 = Peer.V1OnlyCache.size () in
+  Alcotest.(check int) "duplicate marks don't grow cache" s1 s2
+
+let test_v1only_cache_cap () =
+  Peer.V1OnlyCache.clear ();
+  let cap = Peer.V1OnlyCache.capacity in
+  Alcotest.(check bool) "capacity is positive" true (cap > 0);
+  for i = 0 to cap + 16 do
+    Peer.V1OnlyCache.mark ~addr:(Printf.sprintf "10.%d.%d.%d"
+      ((i lsr 16) land 0xFF) ((i lsr 8) land 0xFF) (i land 0xFF))
+      ~port:8333
+  done;
+  Alcotest.(check bool) "cache stays at-or-below cap" true
+    (Peer.V1OnlyCache.size () <= cap);
+  Peer.V1OnlyCache.clear ();
+  Alcotest.(check int) "clear empties cache" 0
+    (Peer.V1OnlyCache.size ())
+
+(* When connect_outbound_negotiated returns a peer that hasn't gone through
+   the v2 path, peer.transport must be None (= legacy v1 dispatch).  We
+   can't drive a real network handshake here, so this test exercises just
+   the transport field on a peer constructed by [make_peer]. *)
+let test_transport_default_v1 () =
+  (* Borrow the same socketpair trick used by other handshake tests. *)
+  let (s1, s2) = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let fd = Lwt_unix.of_unix_file_descr s1 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:18444 ~id:42 ~direction:Peer.Outbound ~fd in
+  Alcotest.(check bool) "default transport is None (= v1)" true
+    (peer.Peer.transport = None);
+  (* Manually flip to v2 (simulating what connect_outbound_negotiated
+     does after a successful cipher handshake) and verify match works. *)
+  let t = P2p.create_v2_transport ~initiating:true ~magic:P2p.mainnet_magic in
+  peer.Peer.transport <- Some t;
+  (match peer.Peer.transport with
+   | Some (P2p.V2 _) -> Alcotest.(check pass) "v2 dispatch reachable" () ()
+   | _ -> Alcotest.fail "expected V2 transport");
+  Lwt_main.run (Peer.disconnect peer);
+  Unix.close s2
+
 (* All tests *)
 let () =
   Alcotest.run "Peer" [
@@ -1045,5 +1158,16 @@ let () =
         `Quick test_connect_refused_no_fd_leak;
       Alcotest.test_case "connect_timeout_no_leak"
         `Slow test_connect_timeout_no_fd_leak;
+    ];
+    "bip324_v2_outbound", [
+      Alcotest.test_case "env_var_default_off" `Quick test_bip324_v2_default_off;
+      Alcotest.test_case "env_var_honors_one" `Quick test_bip324_v2_env_one;
+      Alcotest.test_case "env_var_honors_zero" `Quick test_bip324_v2_env_zero;
+      Alcotest.test_case "env_var_honors_false" `Quick test_bip324_v2_env_false;
+      Alcotest.test_case "v1only_cache_mark_lookup" `Quick test_v1only_cache_basic;
+      Alcotest.test_case "v1only_cache_addr_port_pair" `Quick test_v1only_cache_pair;
+      Alcotest.test_case "v1only_cache_dedup" `Quick test_v1only_cache_dedup;
+      Alcotest.test_case "v1only_cache_capacity" `Quick test_v1only_cache_cap;
+      Alcotest.test_case "transport_dispatch_default_v1" `Quick test_transport_default_v1;
     ];
   ]

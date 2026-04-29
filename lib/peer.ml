@@ -699,8 +699,22 @@ let send_feature_negotiation (peer : peer) : unit Lwt.t =
   send_message peer P2p.SendaddrV2Msg
 
 (* Read messages until verack arrives, accepting feature negotiation messages
-   (wtxidrelay, sendaddrv2, sendcmpct, feefilter) that arrive before verack.
-   Returns unit on success or fails on timeout / unexpected messages. *)
+   (wtxidrelay, sendaddrv2, sendcmpct, feefilter, sendtxrcncl, sendpackages)
+   that arrive before verack.  Returns unit on success or fails on timeout /
+   unexpected messages.
+
+   sendtxrcncl (BIP-330) and sendpackages (BIP-431) MUST be sent between
+   VERSION and VERACK per their respective BIPs (see Bitcoin Core
+   net_processing.cpp ProcessMessage(SENDTXRCNCL) which disconnects peers
+   that send it after fSuccessfullyConnected).  Camlcoin does not implement
+   Erlay reconciliation or package relay, so we silently ignore both —
+   matching Core's "ignored, as our node does not have txreconciliation
+   enabled" behaviour.  Without this, lunarblock-as-initiator (which sends
+   sendtxrcncl right after the peer's VERSION arrives, before its own
+   VERACK) trips a spurious "Unexpected message before verack" failure on
+   the responder side and the connection is torn down — observed as the
+   single remaining v2 divergence in the BIP-324 interop matrix
+   (lunarblock → camlcoin = v1, every other initiator → camlcoin = v2). *)
 let read_until_verack (peer : peer) : unit Lwt.t =
   let open Lwt.Syntax in
   let deadline = Unix.gettimeofday () +. read_timeout in
@@ -726,6 +740,15 @@ let read_until_verack (peer : peer) : unit Lwt.t =
       | Some (P2p.FeefilterMsg feerate) ->
         (* Accept feefilter during feature negotiation *)
         peer.feefilter <- feerate;
+        loop ()
+      | Some (P2p.SendtxrcnclMsg _) ->
+        (* BIP-330 Erlay tx reconciliation negotiation.  We don't implement
+           the Erlay responder, so silently ignore (matches Core when
+           m_txreconciliation is null). *)
+        loop ()
+      | Some (P2p.SendpackagesMsg _) ->
+        (* BIP-431 package relay negotiation.  We don't implement package
+           relay; silently ignore the announcement. *)
         loop ()
       | Some _ -> Lwt.fail_with "Unexpected message before verack"
     end

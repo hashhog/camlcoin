@@ -348,6 +348,17 @@ let run (config : config) : unit Lwt.t =
          Lwt.return_unit
        | _ -> Lwt.return_unit));
 
+  (* BIP-35 mempool dispatch.  Registered as a separate listener so that it
+     fires both during IBD (when [ibd_state_ref] is set) and post-IBD (when
+     it is [None]); we always consult the live [mempool] handle which is
+     valid throughout the node lifetime.  The handler enforces the
+     NODE_BLOOM gate (mirrors Bitcoin Core's net_processing.cpp guard) and
+     disconnects the requesting peer if we don't advertise NODE_BLOOM. *)
+  Peer_manager.add_listener peer_manager (fun msg peer ->
+    match msg with
+    | P2p.MempoolMsg -> Sync.handle_mempool_msg_for (Some mempool) peer
+    | _ -> Lwt.return_unit);
+
   (* Register a listener for getdata requests so peers can fetch blocks
      we have mined or stored (e.g. after receiving our inv announcement). *)
   Peer_manager.add_listener peer_manager (fun msg peer ->

@@ -59,11 +59,16 @@ let empty_services : peer_services =
     compact_filters = false;
     network_limited = false }
 
-(* Our node's advertised services: full node with witness support *)
+(* Our node's advertised services: full node with witness support and
+   NODE_BLOOM (BIP-111 / BIP-35).  Advertising NODE_BLOOM means we honour
+   peer-issued `mempool` requests (BIP-35) and bloom-filter setup messages.
+   Bitcoin Core advertises this whenever -peerbloomfilters=1 (the default
+   when bloom filters are enabled), and gates the MEMPOOL handler in
+   src/net_processing.cpp on `peer.m_our_services & NODE_BLOOM`. *)
 let our_services : peer_services = {
   network = true;
   getutxo = false;
-  bloom = false;
+  bloom = true;
   witness = true;
   compact_filters = false;
   network_limited = false;

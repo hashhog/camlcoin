@@ -1048,6 +1048,118 @@ let test_v1only_cache_cap () =
   Alcotest.(check int) "clear empties cache" 0
     (Peer.V1OnlyCache.size ())
 
+(* ===== BIP-324 v2 inbound (responder) tests ============================ *)
+
+(* Helper to set / unset CAMLCOIN_BIP324_V2_INBOUND for one assertion. *)
+let with_v2_inbound_env (v : string option) (f : unit -> unit) : unit =
+  let key = "CAMLCOIN_BIP324_V2_INBOUND" in
+  let prev = Sys.getenv_opt key in
+  (match v with
+   | Some s -> Unix.putenv key s
+   | None -> Unix.putenv key "");
+  let restore () =
+    match prev with
+    | Some s -> Unix.putenv key s
+    | None -> Unix.putenv key ""
+  in
+  (try f (); restore () with e -> restore (); raise e)
+
+(* Helper for the umbrella CAMLCOIN_BIP324_V2 var that gates both directions. *)
+let with_v2_umbrella_env (v : string option) (f : unit -> unit) : unit =
+  let key = "CAMLCOIN_BIP324_V2" in
+  let prev = Sys.getenv_opt key in
+  (match v with
+   | Some s -> Unix.putenv key s
+   | None -> Unix.putenv key "");
+  let restore () =
+    match prev with
+    | Some s -> Unix.putenv key s
+    | None -> Unix.putenv key ""
+  in
+  (try f (); restore () with e -> restore (); raise e)
+
+let test_bip324_v2_inbound_default_off () =
+  with_v2_inbound_env None (fun () ->
+    with_v2_umbrella_env None (fun () ->
+      Alcotest.(check bool) "default OFF (no env)" false
+        (Peer.bip324_v2_inbound_enabled ())))
+
+let test_bip324_v2_inbound_env_one () =
+  with_v2_inbound_env (Some "1") (fun () ->
+    Alcotest.(check bool) "INBOUND=1 → ON" true
+      (Peer.bip324_v2_inbound_enabled ()))
+
+let test_bip324_v2_inbound_env_zero () =
+  with_v2_inbound_env (Some "0") (fun () ->
+    with_v2_umbrella_env None (fun () ->
+      Alcotest.(check bool) "INBOUND=0 → OFF" false
+        (Peer.bip324_v2_inbound_enabled ())))
+
+let test_bip324_v2_umbrella_gates_inbound () =
+  (* CAMLCOIN_BIP324_V2=1 alone enables inbound — outbound and inbound
+     converge on the same gate when no per-direction var is set. *)
+  with_v2_inbound_env None (fun () ->
+    with_v2_umbrella_env (Some "1") (fun () ->
+      Alcotest.(check bool) "umbrella=1 → inbound ON" true
+        (Peer.bip324_v2_inbound_enabled ());
+      Alcotest.(check bool) "umbrella=1 → outbound ON" true
+        (Peer.bip324_v2_outbound_enabled ())))
+
+(* The peek-classifier distinguishes a v1 VERSION header from a v2
+   ElligatorSwift pubkey by the 16-byte prefix (4 magic + 12 command). *)
+let test_looks_like_v1_version_real_v1 () =
+  (* Mainnet magic LE = F9 BE B4 D9, then "version" + 5 NULs.
+     [Bytes.make] zero-fills (vs [Bytes.create] which leaves uninitialised
+     bytes); we rely on the trailing 5 NULs to match [v1_version_command]. *)
+  let bytes = Bytes.make 16 '\000' in
+  Bytes.set bytes 0 '\xF9'; Bytes.set bytes 1 '\xBE';
+  Bytes.set bytes 2 '\xB4'; Bytes.set bytes 3 '\xD9';
+  Bytes.blit_string "version" 0 bytes 4 7;
+  Alcotest.(check bool) "real v1 VERSION prefix is classified v1" true
+    (Peer.looks_like_v1_version bytes P2p.mainnet_magic)
+
+let test_looks_like_v1_version_v2_pubkey () =
+  (* A 64-byte ellswift pubkey is uniformly random; the chance that its
+     leading 4 bytes happen to match the mainnet magic is 2^-32, so for any
+     specific test vector they won't.  Use a deliberately non-matching
+     prefix. *)
+  let bytes = Bytes.create 16 in
+  for i = 0 to 15 do Bytes.set bytes i (Char.chr (0xAA lxor i)) done;
+  Alcotest.(check bool) "v2-shaped bytes are NOT classified v1" false
+    (Peer.looks_like_v1_version bytes P2p.mainnet_magic)
+
+let test_looks_like_v1_version_magic_match_wrong_cmd () =
+  (* Mainnet magic + "inv\0\0\0\0\0\0\0\0\0" must NOT classify as v1
+     VERSION — only the VERSION command is the v1 entry point. *)
+  let bytes = Bytes.make 16 '\000' in
+  Bytes.set bytes 0 '\xF9'; Bytes.set bytes 1 '\xBE';
+  Bytes.set bytes 2 '\xB4'; Bytes.set bytes 3 '\xD9';
+  Bytes.blit_string "inv" 0 bytes 4 3;
+  Alcotest.(check bool) "magic+inv is NOT v1 VERSION" false
+    (Peer.looks_like_v1_version bytes P2p.mainnet_magic)
+
+let test_looks_like_v1_version_short_buffer () =
+  (* < 16 bytes returns false (= "treat as v2", per Bitcoin Core's
+     ProcessReceivedMaybeV1Bytes).  Defensive — caller should always pass
+     v1_prefix_len bytes. *)
+  let bytes = Bytes.make 8 '\000' in
+  Alcotest.(check bool) "short buffer is NOT v1" false
+    (Peer.looks_like_v1_version bytes P2p.mainnet_magic)
+
+let test_looks_like_v1_version_wrong_magic () =
+  (* Mainnet magic constant on a testnet4-magic host is not v1. *)
+  let bytes = Bytes.make 16 '\000' in
+  Bytes.set bytes 0 '\xF9'; Bytes.set bytes 1 '\xBE';
+  Bytes.set bytes 2 '\xB4'; Bytes.set bytes 3 '\xD9';
+  Bytes.blit_string "version" 0 bytes 4 7;
+  Alcotest.(check bool) "mainnet magic on testnet4 host is NOT v1" false
+    (Peer.looks_like_v1_version bytes P2p.testnet_magic)
+
+let test_v1_prefix_len_constant () =
+  (* Sanity: 4 (magic) + 12 (command) = 16 bytes.  Matches Bitcoin Core
+     V2Transport::V1_PREFIX_LEN and clearbit's V1_PREFIX_LEN. *)
+  Alcotest.(check int) "v1_prefix_len = 16" 16 Peer.v1_prefix_len
+
 (* When connect_outbound_negotiated returns a peer that hasn't gone through
    the v2 path, peer.transport must be None (= legacy v1 dispatch).  We
    can't drive a real network handshake here, so this test exercises just
@@ -1169,5 +1281,27 @@ let () =
       Alcotest.test_case "v1only_cache_dedup" `Quick test_v1only_cache_dedup;
       Alcotest.test_case "v1only_cache_capacity" `Quick test_v1only_cache_cap;
       Alcotest.test_case "transport_dispatch_default_v1" `Quick test_transport_default_v1;
+    ];
+    "bip324_v2_inbound", [
+      Alcotest.test_case "env_var_default_off"
+        `Quick test_bip324_v2_inbound_default_off;
+      Alcotest.test_case "env_var_honors_one"
+        `Quick test_bip324_v2_inbound_env_one;
+      Alcotest.test_case "env_var_honors_zero"
+        `Quick test_bip324_v2_inbound_env_zero;
+      Alcotest.test_case "umbrella_gates_both_directions"
+        `Quick test_bip324_v2_umbrella_gates_inbound;
+      Alcotest.test_case "classify_real_v1_version"
+        `Quick test_looks_like_v1_version_real_v1;
+      Alcotest.test_case "classify_v2_pubkey"
+        `Quick test_looks_like_v1_version_v2_pubkey;
+      Alcotest.test_case "classify_magic_match_wrong_cmd"
+        `Quick test_looks_like_v1_version_magic_match_wrong_cmd;
+      Alcotest.test_case "classify_short_buffer"
+        `Quick test_looks_like_v1_version_short_buffer;
+      Alcotest.test_case "classify_wrong_magic"
+        `Quick test_looks_like_v1_version_wrong_magic;
+      Alcotest.test_case "v1_prefix_len_constant"
+        `Quick test_v1_prefix_len_constant;
     ];
   ]

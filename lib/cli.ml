@@ -24,6 +24,11 @@ type config = {
   prune : int;  (* 0 = no pruning *)
   log_categories : string list;  (* empty = all enabled *)
   metrics_port : int;  (* Prometheus metrics port, 0 = disabled *)
+  peer_bloom_filters : bool;
+    (* Advertise NODE_BLOOM (BIP-35 / BIP-111).  Defaults to [false] to
+       match Bitcoin Core's DEFAULT_PEERBLOOMFILTERS (net_processing.h:44);
+       enable with --peerbloomfilters to honour MEMPOOL requests and
+       bloom-filter setup messages. *)
 }
 
 (* ============================================================================
@@ -46,6 +51,7 @@ let default_config : config = {
   prune = 0;
   log_categories = [];
   metrics_port = 9332;
+  peer_bloom_filters = false;  (* Mirrors Core DEFAULT_PEERBLOOMFILTERS *)
 }
 
 (* Network-specific configuration *)
@@ -94,6 +100,16 @@ let run (config : config) : unit Lwt.t =
        | `Mainnet -> "mainnet"
        | `Testnet -> "testnet"
        | `Regtest -> "regtest"));
+
+  (* Configure NODE_BLOOM advertisement BEFORE any peer/handshake work.
+     [Peer.our_services ()] reads this ref, so it must be set before the
+     peer manager, P2P listener, or RPC server start consulting it.
+     Defaults to [false] (Core parity); flip with --peerbloomfilters. *)
+  Peer.set_peer_bloom_filters config.peer_bloom_filters;
+  Logs.info (fun m ->
+    m "NODE_BLOOM (BIP-35) advertisement: %s"
+      (if config.peer_bloom_filters then "enabled (-peerbloomfilters=1)"
+       else "disabled (Core default)"));
 
   (* Ensure data directory exists *)
   (try Unix.mkdir config.data_dir 0o755

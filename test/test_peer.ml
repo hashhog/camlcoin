@@ -67,14 +67,17 @@ let test_our_services () =
   let ours = Peer.our_services in
   Alcotest.(check bool) "our network" true ours.network;
   Alcotest.(check bool) "our witness" true ours.witness;
-  Alcotest.(check bool) "our bloom" false ours.bloom;
+  (* BIP-35 / NODE_BLOOM: we advertise it so peers may issue MEMPOOL
+     requests and bloom-filter setup messages.  Mirrors Bitcoin Core's
+     -peerbloomfilters=1 default. *)
+  Alcotest.(check bool) "our bloom" true ours.bloom;
   Alcotest.(check bool) "our getutxo" false ours.getutxo;
   Alcotest.(check bool) "our compact_filters" false ours.compact_filters;
   Alcotest.(check bool) "our network_limited" false ours.network_limited;
 
-  (* NODE_NETWORK | NODE_WITNESS = 1 | 8 = 9 *)
+  (* NODE_NETWORK | NODE_BLOOM | NODE_WITNESS = 1 | 4 | 8 = 13 *)
   let as_int = Peer.services_to_int64 ours in
-  Alcotest.(check int64) "our services value" 9L as_int
+  Alcotest.(check int64) "our services value" 13L as_int
 
 (* Test peer state to string *)
 let test_peer_state_to_string () =
@@ -108,8 +111,8 @@ let test_make_local_addr () =
     (Cstruct.get_uint8 addr.addr 14);
   Alcotest.(check int) "byte 15 = 1" 1
     (Cstruct.get_uint8 addr.addr 15);
-  (* Check services *)
-  Alcotest.(check int64) "local addr services" 9L addr.services;
+  (* Check services: NODE_NETWORK | NODE_BLOOM | NODE_WITNESS = 1|4|8 = 13 *)
+  Alcotest.(check int64) "local addr services" 13L addr.services;
   (* Check port is 0 *)
   Alcotest.(check int) "local addr port" 0 addr.port
 

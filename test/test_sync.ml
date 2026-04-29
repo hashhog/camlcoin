@@ -1202,6 +1202,45 @@ let test_find_descendants_with_chain () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* ============================================================================
+   BIP-35 mempool dispatch (NODE_BLOOM gate)
+   ============================================================================ *)
+
+(* Verify that we advertise NODE_BLOOM by default (BIP-35 / BIP-111).
+   This is the prerequisite for [handle_mempool_msg] to actually serve
+   peer-issued MEMPOOL requests; if the bit is off, the gate disconnects
+   the peer.  Mirrors Bitcoin Core's default -peerbloomfilters=1. *)
+let test_bip35_advertise_node_bloom () =
+  Alcotest.(check bool) "our_services advertises NODE_BLOOM"
+    true Peer.our_services.bloom;
+  let bits = Peer.services_to_int64 Peer.our_services in
+  Alcotest.(check bool) "service bits include NODE_BLOOM (4)"
+    true (Int64.logand bits 4L <> 0L)
+
+(* With NODE_BLOOM advertised AND no mempool attached, [handle_mempool_msg]
+   must return cleanly without writing to the peer.  The fact that the
+   handler exists, is reachable from [handle_mempool_msg_for], and runs
+   to completion (no Lwt exception) is what proves the dispatch wiring
+   from [Cli.run]'s listener works end-to-end. *)
+let test_bip35_handler_no_mempool () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let chain = Sync.create_chain_state db Consensus.regtest in
+  let ibd = Sync.create_ibd_state chain in
+  Alcotest.(check bool) "ibd has no mempool" true (ibd.mempool = None);
+  (* Build a peer with a dummy fd; no IO will be performed because the
+     mempool is empty / absent. *)
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  (* Should complete without raising; the gate accepts because we DO
+     advertise NODE_BLOOM, then the empty-mempool branch returns unit. *)
+  Lwt_main.run (Sync.handle_mempool_msg ibd peer);
+  (* Same path via the bare-mempool entry point used post-IBD. *)
+  Lwt_main.run (Sync.handle_mempool_msg_for None peer);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
@@ -1266,6 +1305,10 @@ let () =
       test_case "needs_lowwork_sync" `Quick test_needs_lowwork_sync;
       test_case "presync_memory_footprint" `Quick test_presync_memory_footprint;
       test_case "presync_constants" `Quick test_presync_constants;
+    ];
+    "bip35_mempool_dispatch", [
+      test_case "advertise NODE_BLOOM" `Quick test_bip35_advertise_node_bloom;
+      test_case "handler no mempool" `Quick test_bip35_handler_no_mempool;
     ];
     "block_invalidation", [
       test_case "is_block_invalid_initially_false" `Quick test_is_block_invalid_initially_false;

@@ -1602,6 +1602,15 @@ let peer_message_loop (pm : t) (peer : Peer.peer) : unit Lwt.t =
                 relay_addr_to_random_peers pm peer
               | P2p.FeefilterMsg fee_rate ->
                 peer.Peer.feefilter <- fee_rate
+              | P2p.MempoolMsg ->
+                (* BIP-35: peer is asking us to inv our mempool contents.
+                   The actual send is wired via [Peer_manager.add_listener]
+                   in [Cli.run] (it needs the [Sync.ibd_state] / mempool
+                   handle, neither of which lives on [pm]).  This explicit
+                   case keeps the dispatch self-documenting and ensures
+                   that if the listener is ever removed, nothing in
+                   [pm] silently drops the message. *)
+                ()
               | _ -> ());
              loop ())
       ) (fun exn ->

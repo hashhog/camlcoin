@@ -1054,8 +1054,9 @@ let handle_getnetworkinfo (ctx : rpc_context) : Yojson.Safe.t =
     ("version", `Int 210000);
     ("subversion", `String ("/CamlCoin:" ^ Types.version ^ "/"));
     ("protocolversion", `Int (Int32.to_int Types.protocol_version));
-    ("localservices", `String "0000000000000009");
-    ("localservicesnames", `List [`String "NETWORK"; `String "WITNESS"]);
+    ("localservices", `String "000000000000000d");
+    ("localservicesnames",
+      `List [`String "NETWORK"; `String "BLOOM"; `String "WITNESS"]);
     ("localrelay", `Bool true);
     ("timeoffset", `Int 0);
     ("networkactive", `Bool true);

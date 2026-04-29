@@ -94,13 +94,20 @@ let metrics_port_arg =
   Arg.(value & opt int 9332 &
     info ["metricsport"] ~docv:"PORT" ~doc)
 
+let peer_bloom_filters_arg =
+  let doc = "Advertise NODE_BLOOM (BIP-35 / BIP-111) and serve MEMPOOL \
+             requests + bloom-filter setup messages. Defaults to false to \
+             match Bitcoin Core's DEFAULT_PEERBLOOMFILTERS." in
+  Arg.(value & opt bool false &
+    info ["peerbloomfilters"] ~docv:"BOOL" ~doc)
+
 (* ============================================================================
    Main Command
    ============================================================================ *)
 
 let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     p2p_port max_outbound max_inbound connect debug no_wallet prune benchmark
-    import_blocks import_utxo metrics_port =
+    import_blocks import_utxo metrics_port peer_bloom_filters =
   (* If benchmark flag is set, run benchmarks and exit *)
   if benchmark then begin
     Camlcoin.Cli.setup_logging debug ();
@@ -200,6 +207,7 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       prune;
       log_categories = [];
       metrics_port;
+      peer_bloom_filters;
     } in
     (* W78: install an async-exception hook that logs instead of terminating.
        The default hook calls exit 2 on any exception from an Lwt.async
@@ -261,7 +269,8 @@ let cmd =
     $ benchmark_arg
     $ import_blocks_arg
     $ import_utxo_arg
-    $ metrics_port_arg)
+    $ metrics_port_arg
+    $ peer_bloom_filters_arg)
 
 (* ============================================================================
    Entry Point

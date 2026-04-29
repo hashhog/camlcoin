@@ -62,22 +62,36 @@ let test_services_individual_bits () =
   let s = Peer.services_of_int64 1024L in
   Alcotest.(check bool) "network_limited=1024" true s.network_limited
 
-(* Test our_services values *)
+(* Test our_services values: by default we mirror Bitcoin Core's
+   DEFAULT_PEERBLOOMFILTERS = false (net_processing.h:44), so NODE_BLOOM
+   is OFF and the advertised services are NODE_NETWORK | NODE_WITNESS = 9. *)
 let test_our_services () =
-  let ours = Peer.our_services in
+  Peer.set_peer_bloom_filters false;
+  let ours = Peer.our_services () in
   Alcotest.(check bool) "our network" true ours.network;
   Alcotest.(check bool) "our witness" true ours.witness;
-  (* BIP-35 / NODE_BLOOM: we advertise it so peers may issue MEMPOOL
-     requests and bloom-filter setup messages.  Mirrors Bitcoin Core's
-     -peerbloomfilters=1 default. *)
-  Alcotest.(check bool) "our bloom" true ours.bloom;
+  (* BIP-35 / NODE_BLOOM is OFF by default (Core parity).  Operators flip
+     it on with --peerbloomfilters; covered separately by
+     [test_our_services_bloom_enabled]. *)
+  Alcotest.(check bool) "our bloom default off" false ours.bloom;
   Alcotest.(check bool) "our getutxo" false ours.getutxo;
   Alcotest.(check bool) "our compact_filters" false ours.compact_filters;
   Alcotest.(check bool) "our network_limited" false ours.network_limited;
 
-  (* NODE_NETWORK | NODE_BLOOM | NODE_WITNESS = 1 | 4 | 8 = 13 *)
+  (* NODE_NETWORK | NODE_WITNESS = 1 | 8 = 9 *)
   let as_int = Peer.services_to_int64 ours in
-  Alcotest.(check int64) "our services value" 13L as_int
+  Alcotest.(check int64) "our services value (default)" 9L as_int
+
+(* Test our_services with --peerbloomfilters=1: NODE_BLOOM advertised,
+   bits = NODE_NETWORK | NODE_BLOOM | NODE_WITNESS = 1 | 4 | 8 = 13. *)
+let test_our_services_bloom_enabled () =
+  Peer.set_peer_bloom_filters true;
+  let ours = Peer.our_services () in
+  Alcotest.(check bool) "our bloom enabled" true ours.bloom;
+  let as_int = Peer.services_to_int64 ours in
+  Alcotest.(check int64) "our services value (bloom on)" 13L as_int;
+  (* Restore Core default for subsequent tests *)
+  Peer.set_peer_bloom_filters false
 
 (* Test peer state to string *)
 let test_peer_state_to_string () =
@@ -96,6 +110,7 @@ let test_peer_state_to_string () =
 
 (* Test make_local_addr creates valid IPv4-mapped IPv6 address *)
 let test_make_local_addr () =
+  Peer.set_peer_bloom_filters false;
   let addr = Peer.make_local_addr () in
   (* Check IPv4-mapped prefix bytes *)
   Alcotest.(check int) "byte 10 = 0xFF" 0xFF
@@ -111,8 +126,9 @@ let test_make_local_addr () =
     (Cstruct.get_uint8 addr.addr 14);
   Alcotest.(check int) "byte 15 = 1" 1
     (Cstruct.get_uint8 addr.addr 15);
-  (* Check services: NODE_NETWORK | NODE_BLOOM | NODE_WITNESS = 1|4|8 = 13 *)
-  Alcotest.(check int64) "local addr services" 13L addr.services;
+  (* Check services: with NODE_BLOOM off (Core default), bits are
+     NODE_NETWORK | NODE_WITNESS = 1|8 = 9. *)
+  Alcotest.(check int64) "local addr services (default)" 9L addr.services;
   (* Check port is 0 *)
   Alcotest.(check int) "local addr port" 0 addr.port
 
@@ -1191,7 +1207,9 @@ let () =
     "services", [
       Alcotest.test_case "encoding roundtrip" `Quick test_services_encoding;
       Alcotest.test_case "individual bits" `Quick test_services_individual_bits;
-      Alcotest.test_case "our services" `Quick test_our_services;
+      Alcotest.test_case "our services (default off)" `Quick test_our_services;
+      Alcotest.test_case "our services (bloom on)" `Quick
+        test_our_services_bloom_enabled;
     ];
     "peer_state", [
       Alcotest.test_case "to_string" `Quick test_peer_state_to_string;

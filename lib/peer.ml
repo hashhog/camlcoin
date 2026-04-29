@@ -76,6 +76,55 @@ let ping_interval = 120.0      (* 2 minutes between pings *)
 let ping_timeout = 20.0        (* 20 seconds to receive pong *)
 let handshake_timeout = 60.0   (* 60 seconds for version/verack handshake *)
 
+(* BIP-324 v2 outbound probe deadline.  Bitcoin Core net.cpp uses ~30s; we
+   mirror it so a stalled remote doesn't wedge the dialer for long. *)
+let v2_handshake_deadline = 30.0  (* seconds for cipher handshake *)
+
+(* Returns true iff BIP-324 v2 outbound is enabled. Default OFF (conservative)
+   since this code path is brand new — enable per-process via
+   CAMLCOIN_BIP324_V2_OUTBOUND=1. Mirrors clearbit's CLEARBIT_BIP324_V2 gate
+   pattern (clearbit/src/peer.zig:653). *)
+let bip324_v2_outbound_enabled () : bool =
+  match Sys.getenv_opt "CAMLCOIN_BIP324_V2_OUTBOUND" with
+  | None -> false
+  | Some v ->
+    let v = String.lowercase_ascii v in
+    not (v = "0" || v = "false" || v = "off" || v = "")
+
+(* Per-address LRU cache of addresses that turned out to be v1-only.
+   Bounded at 4096 entries (matches clearbit's V2_FALLBACK_CACHE_MAX).
+   When full, eviction is "drop the first entry the iterator yields"
+   — implementation-defined order, same compromise as clearbit. The cache
+   is process-wide / in-memory only (lost on restart, which is fine). *)
+module V1OnlyCache : sig
+  val mark : addr:string -> port:int -> unit
+  val is_v1_only : addr:string -> port:int -> bool
+  val size : unit -> int
+  val clear : unit -> unit
+  val capacity : int
+end = struct
+  let capacity = 4096
+  let table : (string, unit) Hashtbl.t = Hashtbl.create 64
+  let key ~addr ~port = Printf.sprintf "%s:%d" addr port
+  let mark ~addr ~port =
+    let k = key ~addr ~port in
+    if not (Hashtbl.mem table k) then begin
+      if Hashtbl.length table >= capacity then begin
+        (* Drop one arbitrary entry to make room.  Hashtbl.iter visits
+           in implementation-defined order; we eject the first key it
+           hands us and stop. *)
+        let to_drop = ref None in
+        (try Hashtbl.iter (fun k' () -> to_drop := Some k'; raise Exit) table
+         with Exit -> ());
+        Option.iter (Hashtbl.remove table) !to_drop
+      end;
+      Hashtbl.add table k ()
+    end
+  let is_v1_only ~addr ~port = Hashtbl.mem table (key ~addr ~port)
+  let size () = Hashtbl.length table
+  let clear () = Hashtbl.clear table
+end
+
 (* Inventory trickling constants - match Bitcoin Core net_processing.cpp *)
 let inbound_inv_broadcast_interval = 5.0   (* Average 5 seconds for inbound peers *)
 let outbound_inv_broadcast_interval = 2.0  (* Average 2 seconds for outbound peers *)
@@ -143,6 +192,9 @@ type peer = {
   mutable next_inv_send : float;     (* Next time to flush inv queue *)
   mutable trickling_active : bool;   (* Whether the trickle timer is running *)
   mutable pending_read : P2p.message_payload Lwt.t option;  (* In-flight read to prevent concurrent reads *)
+  (* BIP-324 v2 transport.  None = legacy v1 path (the default).  Some
+     (P2p.V2 state) = encrypted v2 transport; send/read dispatch on this. *)
+  mutable transport : P2p.transport option;
 }
 
 (* Generate random bytes from /dev/urandom *)
@@ -227,6 +279,9 @@ let make_peer ~(network : Consensus.network_config) ~(addr : string)
     next_inv_send = Unix.gettimeofday () +. poisson_delay avg_interval;
     trickling_active = false;
     pending_read = None;
+    (* Default to v1 (= None).  The BIP-324 v2 dialer flips this to
+       Some (P2p.V2 state) once the cipher handshake completes. *)
+    transport = None;
   }
 
 (* Establish TCP connection to a peer with timeout.
@@ -285,9 +340,8 @@ let connect_with_proxy ~(network : Consensus.network_config) ~(addr : string)
         (fun _ -> Lwt.return_unit) in
       Lwt.fail exn)
 
-(* Read a message from the peer with protection against stream desync.
-   Uses Lwt.no_cancel to ensure TCP reads complete atomically. *)
-let read_message (peer : peer) : P2p.message_payload Lwt.t =
+(* Read a v1 message from the peer (legacy plaintext path). *)
+let read_message_v1 (peer : peer) : P2p.message_payload Lwt.t =
   let open Lwt.Syntax in
   (* Protect the entire read sequence from cancellation to prevent TCP desync *)
   Lwt.no_cancel begin
@@ -333,6 +387,52 @@ let read_message (peer : peer) : P2p.message_payload Lwt.t =
       end
     end
   end
+
+(* Read a v2 (BIP-324) application packet from a peer whose cipher
+   handshake has already completed.  Pumps raw bytes through
+   [P2p.v2_receive_bytes] until the v2 state machine yields a complete
+   message, then returns it.  Leaves any extra bytes in the V2 state's
+   recv_buffer for the next call. *)
+let read_message_v2 (peer : peer) (state : P2p.v2_state)
+    : P2p.message_payload Lwt.t =
+  let open Lwt.Syntax in
+  Lwt.no_cancel begin
+    let chunk_size = 8192 in
+    let chunk = Bytes.create chunk_size in
+    (* If state already has a complete app message buffered (e.g. from the
+       handshake's final processReceivedBytes), drain it first. *)
+    let rec loop () =
+      if P2p.v2_message_complete state then begin
+        match P2p.v2_get_message state with
+        | None ->
+          Lwt.fail (Peer_protocol_error "v2: undecodable application packet")
+        | Some msg ->
+          peer.msgs_received <- peer.msgs_received + 1;
+          peer.last_seen <- Unix.gettimeofday ();
+          Lwt.return msg.P2p.payload
+      end else begin
+        let* n = Lwt_io.read_into peer.ic chunk 0 chunk_size in
+        if n = 0 then Lwt.fail End_of_file
+        else begin
+          peer.bytes_received <- peer.bytes_received + n;
+          let received = Cstruct.of_bytes ~len:n chunk in
+          let ok = P2p.v2_receive_bytes state received in
+          if not ok then
+            Lwt.fail (Peer_protocol_error "v2: state machine rejected bytes")
+          else loop ()
+        end
+      end
+    in
+    loop ()
+  end
+
+(* Top-level read_message: dispatch on transport.  V1 is the default; V2
+   is only set after [perform_v2_outbound_handshake] (or future inbound
+   v2 path) has installed the V2Transport on the peer. *)
+let read_message (peer : peer) : P2p.message_payload Lwt.t =
+  match peer.transport with
+  | None | Some (P2p.V1 _) -> read_message_v1 peer
+  | Some (P2p.V2 state) -> read_message_v2 peer state
 
 (* Read a message with timeout.
    Uses a pending_read slot to avoid starting concurrent reads on the same
@@ -412,8 +512,8 @@ let read_message_with_timeout (peer : peer) (timeout_sec : float)
     let* () = Lwt.pause () in
     Lwt.return None
 
-(* Send a message to the peer *)
-let send_message (peer : peer)
+(* Send a v1 (legacy plaintext) message to the peer. *)
+let send_message_v1 (peer : peer)
     (payload : P2p.message_payload) : unit Lwt.t =
   let open Lwt.Syntax in
   let data = P2p.serialize_message peer.network.magic payload in
@@ -430,6 +530,37 @@ let send_message (peer : peer)
   peer.bytes_sent <- peer.bytes_sent + Cstruct.length data;
   peer.msgs_sent <- peer.msgs_sent + 1;
   Lwt.return_unit
+
+(* Send an application message over a v2 (BIP-324) transport whose cipher
+   handshake has completed.  Encrypts via [v2_set_message] and flushes the
+   resulting ciphertext via [v2_get_bytes_to_send]. *)
+let send_message_v2 (peer : peer) (state : P2p.v2_state)
+    (payload : P2p.message_payload) : unit Lwt.t =
+  let open Lwt.Syntax in
+  let queued = P2p.v2_set_message state payload in
+  if not queued then
+    Lwt.fail (Peer_protocol_error "v2: cannot encrypt before handshake complete")
+  else begin
+    let bytes = P2p.v2_get_bytes_to_send state in
+    let n = Cstruct.length bytes in
+    if n = 0 then Lwt.return_unit
+    else begin
+      let s = Cstruct.to_string bytes in
+      let* () = Lwt_io.write_from_string_exactly peer.oc s 0 n in
+      let* () = Lwt_io.flush peer.oc in
+      peer.bytes_sent <- peer.bytes_sent + n;
+      peer.msgs_sent <- peer.msgs_sent + 1;
+      Lwt.return_unit
+    end
+  end
+
+(* Top-level send_message: dispatch on transport.  V1 is the default;
+   the v2 path is only active after the cipher handshake completes. *)
+let send_message (peer : peer)
+    (payload : P2p.message_payload) : unit Lwt.t =
+  match peer.transport with
+  | None | Some (P2p.V1 _) -> send_message_v1 peer payload
+  | Some (P2p.V2 state) -> send_message_v2 peer state payload
 
 (* Helper: process a version message received from the remote peer *)
 let process_version_msg (peer : peer) (v : Types.version_msg) : unit Lwt.t =
@@ -549,6 +680,98 @@ let disconnect (peer : peer) : unit Lwt.t =
   peer.state <- Disconnected;
   Lwt.return_unit
 
+(* ============================================================================
+   BIP-324 v2 outbound dialer
+   ----------------------------------------------------------------------------
+   Mirrors clearbit's [connectOutboundNegotiated] (clearbit/src/peer.zig:1845).
+   Try v2 first (gated by [bip324_v2_outbound_enabled] + per-address v1-only
+   cache); on failure, mark address v1-only and reconnect on a fresh socket
+   in v1 mode (sending v2 garbage is destructive on a v1 peer so the original
+   socket cannot be reused).
+   ============================================================================ *)
+
+(* Drive the BIP-324 cipher handshake on an outbound peer that already has
+   an initiator V2Transport attached.  Loops until the V2 state machine has:
+     1. flushed our (ellswift pubkey + garbage) bytes on the wire,
+     2. received the peer's ellswift pubkey,
+     3. derived the shared secret + ciphers,
+     4. emitted our garbage terminator + (decoy + ) version packet,
+     5. consumed the peer's garbage + garbage terminator + version packet.
+   On success [peer.transport] is set to [Some (V2 state)] and any subsequent
+   send/read flows through encrypted dispatch.  Bounded by [v2_handshake_deadline].
+
+   Failure modes:
+     - V2RecvV1Fallback         → peer is speaking v1 (caller must close socket)
+     - v2_receive_bytes = false → cipher decryption failed
+     - deadline reached         → stalled remote
+     - End_of_file / read err   → peer closed
+   In every failure case we raise — caller decides whether to fall back. *)
+let perform_v2_outbound_handshake (peer : peer)
+    (state : P2p.v2_state) : unit Lwt.t =
+  let open Lwt.Syntax in
+  let chunk_size = 8192 in
+  let chunk = Bytes.create chunk_size in
+  let start = Unix.gettimeofday () in
+  (* Flush whatever the V2 transport has staged for sending (initial pubkey
+     + garbage on the first iteration; later, garbage terminator + version
+     packet ciphertext after we've received the peer's ellswift pubkey). *)
+  let flush_send () =
+    let bytes = P2p.v2_get_bytes_to_send state in
+    let n = Cstruct.length bytes in
+    if n = 0 then Lwt.return_unit
+    else begin
+      let s = Cstruct.to_string bytes in
+      let* () = Lwt_io.write_from_string_exactly peer.oc s 0 n in
+      let* () = Lwt_io.flush peer.oc in
+      peer.bytes_sent <- peer.bytes_sent + n;
+      Lwt.return_unit
+    end
+  in
+  let rec loop () =
+    let elapsed = Unix.gettimeofday () -. start in
+    if elapsed >= v2_handshake_deadline then
+      Lwt.fail_with "BIP-324 v2 handshake timeout"
+    else begin
+      (* Flush staged bytes (idempotent if buffer is empty). *)
+      let* () = flush_send () in
+      (* Done?  V2RecvAppReady or recv_state advanced past V2RecvVersion
+         (i.e., we've consumed the peer's version packet) AND send_state is
+         V2SendReady (we've already emitted our version packet). *)
+      let recv_done =
+        match state.recv_state with
+        | P2p.V2RecvApp | P2p.V2RecvAppReady -> true
+        | _ -> false
+      in
+      let send_done = state.send_state = P2p.V2SendReady in
+      if recv_done && send_done && Cstruct.length state.send_buffer = 0 then
+        Lwt.return_unit
+      else begin
+        (* Read more bytes with a deadline-bounded timeout. *)
+        let remaining = v2_handshake_deadline -. elapsed in
+        let read_task =
+          let* n = Lwt_io.read_into peer.ic chunk 0 chunk_size in
+          if n = 0 then Lwt.fail End_of_file
+          else Lwt.return n
+        in
+        let timeout_task =
+          let* () = Lwt_unix.sleep remaining in
+          Lwt.fail_with "BIP-324 v2 handshake timeout"
+        in
+        let* n = Lwt.pick [read_task; timeout_task] in
+        peer.bytes_received <- peer.bytes_received + n;
+        let received = Cstruct.of_bytes ~len:n chunk in
+        let ok = P2p.v2_receive_bytes state received in
+        if not ok then
+          Lwt.fail_with "BIP-324 v2 cipher handshake rejected bytes"
+        else if state.recv_state = P2p.V2RecvV1Fallback then
+          Lwt.fail_with "BIP-324 v2 peer fell back to v1 mid-handshake"
+        else loop ()
+      end
+    end
+  in
+  loop ()
+
+
 (* Core handshake logic for OUTBOUND connections (called with timeout wrapper) *)
 let perform_handshake_inner (peer : peer) (our_height : int32) : unit Lwt.t =
   let open Lwt.Syntax in
@@ -660,6 +883,74 @@ let perform_inbound_handshake (peer : peer) (our_height : int32) : unit Lwt.t =
     Lwt.fail_with "Handshake timeout"
   in
   Lwt.pick [handshake; timeout]
+
+(* ============================================================================
+   BIP-324 v2 outbound dialer (entry point)
+   ----------------------------------------------------------------------------
+   Try v2 first (gated by env var [CAMLCOIN_BIP324_V2_OUTBOUND] + per-address
+   v1-only LRU cache); on cipher failure, mark address v1-only and reconnect
+   on a fresh socket in v1.  Sending v2 ellswift garbage is destructive on a
+   v1 peer so the original socket cannot be reused.
+   ============================================================================ *)
+let connect_outbound_negotiated
+    ~(network : Consensus.network_config) ~(addr : string) ~(port : int)
+    ~(id : int) ~(our_height : int32) : peer Lwt.t =
+  let open Lwt.Syntax in
+  let try_v2 =
+    bip324_v2_outbound_enabled () && not (V1OnlyCache.is_v1_only ~addr ~port)
+  in
+  if not try_v2 then begin
+    (* v1 path: behave exactly as the legacy [connect; perform_handshake]
+       sequence used to. *)
+    let* peer = connect ~network ~addr ~port ~id in
+    Lwt.catch
+      (fun () ->
+        let* () = perform_handshake peer our_height in
+        Lwt.return peer)
+      (fun exn ->
+        let* () = Lwt.catch (fun () -> disconnect peer) (fun _ -> Lwt.return_unit) in
+        Lwt.fail exn)
+  end
+  else begin
+    (* Phase 1: try v2 on a fresh socket. *)
+    let* peer = connect ~network ~addr ~port ~id in
+    Lwt.catch
+      (fun () ->
+        (* Attach an initiator V2Transport.  Its send_buffer already
+           contains the ellswift pubkey + initial garbage. *)
+        let transport = P2p.create_v2_transport ~initiating:true
+          ~magic:peer.network.magic in
+        let v2_state = match transport with
+          | P2p.V2 s -> s
+          | P2p.V1 _ -> assert false
+        in
+        peer.transport <- Some transport;
+        let* () = perform_v2_outbound_handshake peer v2_state in
+        (* Cipher handshake complete — run the application version/verack
+           over the encrypted v2 transport.  send_message / read_message
+           dispatch on peer.transport so this Just Works. *)
+        let* () = perform_handshake peer our_height in
+        Log.info (fun m ->
+          m "[%s:%d] BIP-324 v2 outbound connected (encrypted)" addr port);
+        Lwt.return peer)
+      (fun exn ->
+        Log.info (fun m ->
+          m "[%s:%d] BIP-324 v2 outbound failed: %s — falling back to v1"
+            addr port (Printexc.to_string exn));
+        V1OnlyCache.mark ~addr ~port;
+        let* () = Lwt.catch (fun () -> disconnect peer) (fun _ -> Lwt.return_unit) in
+        (* Phase 2: v1 fallback on a brand-new socket. *)
+        let* fresh = connect ~network ~addr ~port ~id in
+        Lwt.catch
+          (fun () ->
+            let* () = perform_handshake fresh our_height in
+            Lwt.return fresh)
+          (fun exn2 ->
+            let* () = Lwt.catch
+              (fun () -> disconnect fresh)
+              (fun _ -> Lwt.return_unit) in
+            Lwt.fail exn2))
+  end
 
 (* Send a ping message and record the nonce (BIP-31) *)
 let send_ping (peer : peer) : unit Lwt.t =

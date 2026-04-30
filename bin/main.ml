@@ -163,6 +163,16 @@ let ready_fd_arg =
   Arg.(value & opt (some int) None &
     info ["ready-fd"] ~docv:"N" ~doc)
 
+let zmq_pub_arg =
+  let doc = "ZMQ publish endpoint in Bitcoin Core syntax: \
+             '-zmqpub<topic>=<addr>'. Topics: hashblock, hashtx, rawblock, \
+             rawtx, sequence (and 'pub<topic>' aliases). Address is a ZMQ \
+             URL such as 'tcp://127.0.0.1:28332'. Repeatable; each call \
+             may target a different topic and/or endpoint. Multiple topics \
+             on the same endpoint are bound to one PUB socket." in
+  Arg.(value & opt_all string [] &
+    info ["zmqpub"] ~docv:"OPT" ~doc)
+
 (* ============================================================================
    Main Command
    ============================================================================ *)
@@ -171,7 +181,7 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     p2p_port max_outbound max_inbound connect debug no_wallet prune benchmark
     import_blocks import_utxo metrics_port peer_bloom_filters
     migrate_logstorage daemon_mode pid_path conf_path debug_cats
-    logfile printtoconsole ready_fd =
+    logfile printtoconsole ready_fd zmq_pub =
   (* Resolve datadir early so config-file lookup can default to it. *)
   let base = Camlcoin.Cli.config_for_network network in
   let resolved_datadir = match datadir with
@@ -369,6 +379,18 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       log_categories = eff_debug_cats;
       metrics_port = eff_metrics_port;
       peer_bloom_filters = eff_peer_bloom;
+      zmq_pub_options = (
+        (* The cmdliner option strips the leading flag; users typed
+           '--zmqpub=rawblock=tcp://...' so what we see is
+           'rawblock=tcp://...'. Re-attach the '-zmqpub' prefix so
+           parse_zmq_option (which understands the Bitcoin-Core
+           '-zmqpubrawblock=tcp://...' grammar) accepts it. *)
+        let cli_norm = List.map (fun s -> "-zmqpub" ^ s) zmq_pub in
+        let from_conf =
+          Camlcoin.Runtime_config.get_all conf_opts "zmqpub"
+          |> List.map (fun s -> "-zmqpub" ^ s)
+        in
+        cli_norm @ from_conf);
     } in
     (* Ensure datadir exists so we can land the PID file there. *)
     (try Unix.mkdir resolved_datadir 0o755
@@ -463,7 +485,8 @@ let cmd =
     $ debug_cat_arg
     $ logfile_arg
     $ printtoconsole_arg
-    $ ready_fd_arg)
+    $ ready_fd_arg
+    $ zmq_pub_arg)
 
 (* ============================================================================
    Entry Point

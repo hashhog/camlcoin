@@ -4,11 +4,11 @@
  (libraries cstruct cstruct-unix lwt lwt.unix unix bigstring bigstringaf
             base64 cohttp-lwt-unix yojson digestif mirage-crypto
             mirage-crypto-rng mirage-crypto-rng.unix cmdliner
-            logs logs.fmt fmt fmt.tty)
+            logs logs.fmt fmt fmt.tty threads.posix)
  (foreign_stubs
   (language c)
-  (names schnorr_stubs sha256_accel_stubs rocksdb_stubs)
+  (names schnorr_stubs sha256_accel_stubs rocksdb_stubs zmq_stubs)
   (flags (:standard))
   (include_dirs ../vendor/secp256k1/src ../vendor/secp256k1/include))
- (c_library_flags (-lcrypto -lrocksdb -lstdc++))
+ (c_library_flags (-lcrypto -lrocksdb -l:libzmq.so.5 -lstdc++))
  (preprocess (pps lwt_ppx)))

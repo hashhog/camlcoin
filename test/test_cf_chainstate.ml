@@ -370,6 +370,148 @@ let () =
     exit 0
   | None -> ()
 
+(* Tests for the reindex helpers (cf_clear functions). *)
+let test_cf_clear_utxo () =
+  with_db (fun db ->
+    (* Populate 100 UTXO entries across 10 txids. *)
+    for i = 0 to 9 do
+      let txid = mk_hash i in
+      for vout = 0 to 9 do
+        Cf_chainstate.put_utxo db txid vout
+          (Printf.sprintf "utxo-%d-%d" i vout)
+      done
+    done;
+    let n = Cf_chainstate.cf_clear_utxo db in
+    Alcotest.(check int) "cleared 100 entries" 100 n;
+    (* Spot check: every entry is gone. *)
+    Alcotest.(check (option string)) "utxo wiped"
+      None (Cf_chainstate.get_utxo db (mk_hash 5) 5);
+    (* Re-clearing an empty CF returns 0. *)
+    let n2 = Cf_chainstate.cf_clear_utxo db in
+    Alcotest.(check int) "second clear is no-op" 0 n2)
+
+let test_cf_clear_chain_tip_only () =
+  with_db (fun db ->
+    Cf_chainstate.put_chain_state db "tip_hash" "TIP_HASH";
+    Cf_chainstate.put_chain_state db "tip_height" "\x10\x00\x00\x00";
+    Cf_chainstate.put_chain_state db "header_tip_hash" "HDR_HASH";
+    Cf_chainstate.put_chain_state db "header_tip_height" "\x20\x00\x00\x00";
+    let n = Cf_chainstate.cf_clear_chain_tip_only db in
+    Alcotest.(check int) "cleared 2 keys" 2 n;
+    Alcotest.(check (option string)) "tip_hash gone"
+      None (Cf_chainstate.get_chain_state db "tip_hash");
+    Alcotest.(check (option string)) "tip_height gone"
+      None (Cf_chainstate.get_chain_state db "tip_height");
+    Alcotest.(check (option string)) "header_tip_hash retained"
+      (Some "HDR_HASH")
+      (Cf_chainstate.get_chain_state db "header_tip_hash");
+    Alcotest.(check (option string)) "header_tip_height retained"
+      (Some "\x20\x00\x00\x00")
+      (Cf_chainstate.get_chain_state db "header_tip_height"))
+
+let test_cf_clear_undo_data () =
+  with_db (fun db ->
+    for i = 0 to 4 do
+      Cf_chainstate.put_undo_data db (mk_hash i)
+        (Printf.sprintf "undo-%d" i)
+    done;
+    let n = Cf_chainstate.cf_clear_undo_data db in
+    Alcotest.(check int) "cleared 5 undo entries" 5 n;
+    Alcotest.(check (option string)) "undo wiped"
+      None (Cf_chainstate.get_undo_data db (mk_hash 2)))
+
+let test_cf_clear_preserves_other_cfs () =
+  with_db (fun db ->
+    (* Put data in cf_block_header + cf_block_data + cf_block_height +
+       cf_utxo. Wipe utxo only; verify the others are intact. *)
+    let hash = mk_hash 0x77 in
+    Cf_chainstate.put_block_header db hash "HDR";
+    Cf_chainstate.put_block_data db hash "BLOCK";
+    Cf_chainstate.put_block_height db 12345 hash;
+    Cf_chainstate.put_utxo db hash 0 "DELME";
+    let _ = Cf_chainstate.cf_clear_utxo db in
+    Alcotest.(check (option string)) "header survived"
+      (Some "HDR") (Cf_chainstate.get_block_header db hash);
+    Alcotest.(check (option string)) "block_data survived"
+      (Some "BLOCK") (Cf_chainstate.get_block_data db hash);
+    Alcotest.(check bool) "block_height survived"
+      true (Cf_chainstate.get_block_height db 12345 <> None);
+    Alcotest.(check (option string)) "utxo wiped"
+      None (Cf_chainstate.get_utxo db hash 0))
+
+(* End-to-end test for Reindex.pre_open_wipe: lay out a fake datadir
+   containing a populated CF chainstate + a rocksdb_utxo subdir +
+   stray mempool.dat / fee_estimates.dat, run the wipe, then verify
+   the post-wipe state matches what restore_chain_state expects:
+     - block_header / block_data / block_height retained
+     - cf_utxo cleared
+     - cf_undo_data cleared
+     - tip_hash + tip_height cleared, but header_tip_* retained
+     - rocksdb_utxo/ directory removed
+     - mempool.dat + fee_estimates.dat removed
+*)
+let test_reindex_pre_open_wipe () =
+  cleanup_tmp ();
+  Unix.mkdir tmp_root 0o755;
+  let data_dir = Filename.concat tmp_root "datadir" in
+  Unix.mkdir data_dir 0o755;
+  let chainstate_dir = Filename.concat data_dir "chainstate" in
+  Unix.mkdir chainstate_dir 0o755;
+  let cf_path = Filename.concat chainstate_dir "chainstate-rocks" in
+  (* Populate the CF chainstate with some test data. *)
+  let db = Cf_chainstate.open_db cf_path in
+  let hash = mk_hash 0xaa in
+  Cf_chainstate.put_block_header db hash "HEADER";
+  Cf_chainstate.put_block_data db hash "BODY";
+  Cf_chainstate.put_block_height db 1 hash;
+  Cf_chainstate.put_utxo db hash 0 "UTXO";
+  Cf_chainstate.put_undo_data db hash "UNDO";
+  Cf_chainstate.put_chain_state db "tip_hash" "T-HASH";
+  Cf_chainstate.put_chain_state db "tip_height" "\x01\x00\x00\x00";
+  Cf_chainstate.put_chain_state db "header_tip_hash" "HT-HASH";
+  Cf_chainstate.put_chain_state db "header_tip_height" "\x01\x00\x00\x00";
+  Cf_chainstate.close db;
+  (* Create a rocksdb_utxo subdirectory and stray files. *)
+  let rdb_path = Filename.concat data_dir "rocksdb_utxo" in
+  Unix.mkdir rdb_path 0o755;
+  let oc = open_out (Filename.concat rdb_path "MANIFEST") in
+  output_string oc "stale-rdb"; close_out oc;
+  let mempool_path = Filename.concat data_dir "mempool.dat" in
+  let oc = open_out mempool_path in
+  output_string oc "stale-mp"; close_out oc;
+  let fee_path = Filename.concat data_dir "fee_estimates.dat" in
+  let oc = open_out fee_path in
+  output_string oc "stale-fees"; close_out oc;
+  (* Run the wipe. *)
+  (match Reindex.pre_open_wipe ~data_dir with
+   | Ok () -> ()
+   | Error msg -> Alcotest.fail msg);
+  (* Re-open and inspect. *)
+  let db = Cf_chainstate.open_db cf_path in
+  Alcotest.(check (option string)) "header retained"
+    (Some "HEADER") (Cf_chainstate.get_block_header db hash);
+  Alcotest.(check (option string)) "block_data retained"
+    (Some "BODY") (Cf_chainstate.get_block_data db hash);
+  Alcotest.(check bool) "block_height retained"
+    true (Cf_chainstate.get_block_height db 1 <> None);
+  Alcotest.(check (option string)) "utxo cleared"
+    None (Cf_chainstate.get_utxo db hash 0);
+  Alcotest.(check (option string)) "undo_data cleared"
+    None (Cf_chainstate.get_undo_data db hash);
+  Alcotest.(check (option string)) "tip_hash cleared"
+    None (Cf_chainstate.get_chain_state db "tip_hash");
+  Alcotest.(check (option string)) "tip_height cleared"
+    None (Cf_chainstate.get_chain_state db "tip_height");
+  Alcotest.(check (option string)) "header_tip_hash retained"
+    (Some "HT-HASH") (Cf_chainstate.get_chain_state db "header_tip_hash");
+  Cf_chainstate.close db;
+  Alcotest.(check bool) "rocksdb_utxo dir removed"
+    false (Sys.file_exists rdb_path);
+  Alcotest.(check bool) "mempool.dat removed"
+    false (Sys.file_exists mempool_path);
+  Alcotest.(check bool) "fee_estimates.dat removed"
+    false (Sys.file_exists fee_path)
+
 let () =
   cleanup_tmp ();
   let open Alcotest in
@@ -395,5 +537,17 @@ let () =
         test_chaindb_end_to_end_100_blocks;
       test_case "boot guard refuses unmigrated datadir" `Quick
         test_boot_guard_refuses_unmigrated_datadir;
+    ];
+    "reindex_helpers", [
+      test_case "cf_clear_utxo wipes all entries" `Quick
+        test_cf_clear_utxo;
+      test_case "cf_clear_chain_tip_only retains header_tip" `Quick
+        test_cf_clear_chain_tip_only;
+      test_case "cf_clear_undo_data wipes all entries" `Quick
+        test_cf_clear_undo_data;
+      test_case "cf_clear is namespace-isolated" `Quick
+        test_cf_clear_preserves_other_cfs;
+      test_case "Reindex.pre_open_wipe end-to-end" `Quick
+        test_reindex_pre_open_wipe;
     ];
   ]

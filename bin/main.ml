@@ -173,6 +173,19 @@ let zmq_pub_arg =
   Arg.(value & opt_all string [] &
     info ["zmqpub"] ~docv:"OPT" ~doc)
 
+let reindex_arg =
+  let doc = "Wipe and rebuild the chainstate (UTXO + chain_state + \
+             undo_data column families plus the rocksdb_utxo store). \
+             Headers, block bodies, and the height->hash mapping are \
+             retained on disk; every stored block is then re-validated \
+             from height 0 forward to rebuild the UTXO set. Use after \
+             on-disk corruption of the UTXO set, after a consensus \
+             upgrade that requires re-validation, or to recover from a \
+             half-written chainstate. The daemon then continues into \
+             normal IBD / FullySynced operation. Mirrors Bitcoin Core's \
+             '-reindex' (init.cpp + validation.cpp)." in
+  Arg.(value & flag & info ["reindex"] ~doc)
+
 (* ============================================================================
    Main Command
    ============================================================================ *)
@@ -181,7 +194,7 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     p2p_port max_outbound max_inbound connect debug no_wallet prune benchmark
     import_blocks import_utxo metrics_port peer_bloom_filters
     migrate_logstorage daemon_mode pid_path conf_path debug_cats
-    logfile printtoconsole ready_fd zmq_pub =
+    logfile printtoconsole ready_fd zmq_pub reindex =
   (* Resolve datadir early so config-file lookup can default to it. *)
   let base = Camlcoin.Cli.config_for_network network in
   let resolved_datadir = match datadir with
@@ -391,6 +404,10 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
           |> List.map (fun s -> "-zmqpub" ^ s)
         in
         cli_norm @ from_conf);
+      reindex =
+        reindex
+        || (match Camlcoin.Runtime_config.get_bool conf_opts "reindex" with
+            | Some b -> b | None -> false);
     } in
     (* Ensure datadir exists so we can land the PID file there. *)
     (try Unix.mkdir resolved_datadir 0o755
@@ -486,7 +503,8 @@ let cmd =
     $ logfile_arg
     $ printtoconsole_arg
     $ ready_fd_arg
-    $ zmq_pub_arg)
+    $ zmq_pub_arg
+    $ reindex_arg)
 
 (* ============================================================================
    Entry Point

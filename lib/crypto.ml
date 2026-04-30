@@ -11,7 +11,10 @@
  * - digestif uses C implementations with potential hardware SHA intrinsics
  *)
 
-module Secp = Libsecp256k1.External
+(* All secp256k1 operations route through the vendored libsecp256k1 via thin
+   C stubs in lib/schnorr_stubs.c. The opam secp256k1-internal binding has
+   been removed so there is exactly one secp256k1 implementation linked into
+   the binary. See "drop duplicate secp256k1 source" commit. *)
 
 (* Hardware-accelerated SHA-256 via OpenSSL C stubs *)
 external sha256_accel : string -> string = "caml_sha256_accel"
@@ -50,9 +53,6 @@ let hash160 (data : Cstruct.t) : Types.hash160 =
   let h2 = Digestif.RMD160.digest_string (Digestif.SHA256.to_raw_string h1) in
   Cstruct.of_string (Digestif.RMD160.to_raw_string h2)
 
-(* Global secp256k1 context — created once for signing and verification *)
-let secp_ctx = Secp.Context.create ~sign:true ~verify:true ()
-
 (* High-level types *)
 type private_key = Cstruct.t   (* 32 bytes *)
 type public_key = Cstruct.t    (* 33 bytes compressed or 65 uncompressed *)
@@ -85,25 +85,27 @@ let generate_private_key () : private_key =
   Cstruct.blit_from_string bytes 0 buf 0 32;
   buf
 
+(* Derive public key from private key.
+   C stub calls vendored libsecp256k1's secp256k1_ec_pubkey_create +
+   secp256k1_ec_pubkey_serialize. *)
+external ec_pubkey_create_raw : Bigstring.t -> int -> Bigstring.t
+  = "caml_ec_pubkey_create"
+
 let derive_public_key ?(compressed=true) (privkey : private_key) : public_key =
   let sk_bs = cstruct_to_bigstring privkey in
-  let sk = Secp.Key.read_sk_exn secp_ctx sk_bs in
-  let pk = Secp.Key.neuterize_exn secp_ctx sk in
-  let pk_bs = Secp.Key.to_bytes ~compress:compressed secp_ctx pk in
+  let pk_bs = ec_pubkey_create_raw sk_bs (if compressed then 1 else 0) in
   bigstring_to_cstruct pk_bs
+
+(* ECDSA sign + low-S normalize + DER serialize.
+   C stub calls vendored libsecp256k1's secp256k1_ecdsa_sign +
+   secp256k1_ecdsa_signature_normalize + secp256k1_ecdsa_signature_serialize_der. *)
+external ecdsa_sign_der_raw : Bigstring.t -> Bigstring.t -> Bigstring.t
+  = "caml_ecdsa_sign_der"
 
 let sign (privkey : private_key) (msg_hash : Types.hash256) : signature =
   let sk_bs = cstruct_to_bigstring privkey in
-  let sk = Secp.Key.read_sk_exn secp_ctx sk_bs in
   let msg_bs = cstruct_to_bigstring msg_hash in
-  let sig_ = Secp.Sign.sign_exn secp_ctx ~sk msg_bs in
-  (* Normalize to low-S per BIP-62 rule 5 *)
-  let sig_ = match Secp.Sign.normalize secp_ctx sig_ with
-    | None -> sig_
-    | Some normalized -> normalized
-  in
-  (* Serialize as DER *)
-  let der_bs = Secp.Sign.to_bytes ~der:true secp_ctx sig_ in
+  let der_bs = ecdsa_sign_der_raw sk_bs msg_bs in
   bigstring_to_cstruct der_bs
 
 (* Check strict DER encoding of a signature (without hash type byte).
@@ -148,25 +150,30 @@ let is_valid_signature_encoding (sig_bytes : Cstruct.t) : bool =
         else true
 
 (* Check if a DER-encoded signature (without hash type byte) has a low S value.
-   BIP-62 rule 5. Uses libsecp256k1's normalize to detect high-S. *)
+   BIP-62 rule 5. C stub parses DER and uses libsecp256k1's normalize to detect
+   high-S. Returns false on parse failure. *)
+external ecdsa_signature_is_low_s_raw : Bigstring.t -> bool
+  = "caml_ecdsa_signature_is_low_s"
+
 let is_low_der_s (sig_bytes : Cstruct.t) : bool =
   try
     let sig_bs = cstruct_to_bigstring sig_bytes in
-    let sig_ = Secp.Sign.read_der_exn secp_ctx sig_bs in
-    (* normalize returns None if already low-S, Some _ if it was high-S *)
-    match Secp.Sign.normalize secp_ctx sig_ with
-    | None -> true     (* Already normalized / low-S *)
-    | Some _ -> false  (* Was high-S, needed normalization *)
+    ecdsa_signature_is_low_s_raw sig_bs
   with _ -> false
+
+(* ECDSA verify (strict DER parsing, no low-S normalize, mirrors the
+   historical Sign.verify_exn semantics).  Routed through the same
+   caml_ecdsa_verify C stub as verify_ecdsa_fast (declared below) to keep
+   exactly one secp256k1 implementation in the binary. *)
+external verify_ecdsa_strict_raw : Bigstring.t -> Bigstring.t -> Bigstring.t -> bool
+  = "caml_ecdsa_verify"
 
 let verify (pubkey_bytes : public_key) (msg_hash : Types.hash256) (sig_bytes : signature) : bool =
   try
     let pk_bs = cstruct_to_bigstring pubkey_bytes in
-    let pk = Secp.Key.read_pk_exn secp_ctx pk_bs in
     let msg_bs = cstruct_to_bigstring msg_hash in
     let sig_bs = cstruct_to_bigstring sig_bytes in
-    let sig_ = Secp.Sign.read_der_exn secp_ctx sig_bs in
-    Secp.Sign.verify_exn secp_ctx ~pk ~msg:msg_bs ~signature:sig_
+    verify_ecdsa_strict_raw pk_bs msg_bs sig_bs
   with _ -> false
 
 (* ============================================================================
@@ -185,10 +192,8 @@ let verify (pubkey_bytes : public_key) (msg_hash : Types.hash256) (sig_bytes : s
    ============================================================================ *)
 
 (* C stubs (lib/schnorr_stubs.c) — vendored libsecp256k1 with the recovery
-   module enabled.  We deliberately bypass the secp256k1-internal OCaml
-   binding here because camlcoin links the vendored libsecp256k1 alongside
-   the binding's bundled copy, and `--allow-multiple-definition` can route
-   the binding's sign and recover paths to inconsistent function bodies. *)
+   module enabled. Same vendored copy as every other secp256k1 call in the
+   binary; the duplicate-link via secp256k1-internal has been retired. *)
 external ecdsa_sign_compact_raw : Bigstring.t -> Bigstring.t -> int -> Bigstring.t
   = "caml_ecdsa_sign_compact"
 
@@ -593,8 +598,7 @@ let compute_taproot_output_key (internal_pk : Cstruct.t) (merkle_root : Cstruct.
    Hardware-Accelerated ECDSA Verification
    ============================================================================
 
-   These functions use libsecp256k1's optimized implementation directly via FFI,
-   bypassing the OCaml secp256k1-internal bindings for better performance.
+   These functions use the vendored libsecp256k1 directly via FFI.
    libsecp256k1 uses hand-optimized assembly for x86_64 when available. *)
 
 (* Raw FFI binding for fast ECDSA verification *)

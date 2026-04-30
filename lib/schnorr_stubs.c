@@ -835,3 +835,183 @@ CAMLprim value caml_ecdsa_recover_compact(value v_sig, value v_msg) {
     memcpy(out, pub, publen);
     CAMLreturn(result);
 }
+
+/* ============================================================================
+   Generic ECDSA: derive pubkey, sign (DER+low-S), DER-low-S check, seckey tweak
+
+   These stubs replace the OCaml secp256k1-internal binding's Key/Sign API.
+   Camlcoin previously linked both the vendored libsecp256k1 and the binding's
+   bundled copy under -Wl,--allow-multiple-definition, which routed otherwise-
+   identical symbols to inconsistent function bodies. Routing every secp256k1
+   call through C stubs against the vendored copy gives a single source of
+   truth for sign / verify / derive.
+   ============================================================================ */
+
+/* caml_ec_pubkey_create(seckey_32, compressed_int) -> bigarray (33 or 65 bytes)
+   Raises Failure on invalid seckey. */
+CAMLprim value caml_ec_pubkey_create(value v_seckey, value v_compressed) {
+    CAMLparam2(v_seckey, v_compressed);
+    ensure_ctx();
+
+    unsigned char *sk_data = (unsigned char *)Caml_ba_data_val(v_seckey);
+    size_t sk_len = Caml_ba_array_val(v_seckey)->dim[0];
+    int compressed = Int_val(v_compressed);
+
+    if (sk_len != 32) {
+        caml_failwith("caml_ec_pubkey_create: seckey must be 32 bytes");
+    }
+
+    secp256k1_pubkey pk;
+    if (!secp256k1_ec_pubkey_create(schnorr_ctx, &pk, sk_data)) {
+        caml_failwith("caml_ec_pubkey_create: invalid seckey");
+    }
+
+    unsigned char pub[65];
+    size_t publen = compressed ? 33 : 65;
+    if (!secp256k1_ec_pubkey_serialize(schnorr_ctx, pub, &publen, &pk,
+            compressed ? SECP256K1_EC_COMPRESSED : SECP256K1_EC_UNCOMPRESSED)) {
+        caml_failwith("caml_ec_pubkey_create: pubkey_serialize failed");
+    }
+
+    long dims[1] = { (long)publen };
+    value result = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL, dims);
+    unsigned char *out = (unsigned char *)Caml_ba_data_val(result);
+    memcpy(out, pub, publen);
+    CAMLreturn(result);
+}
+
+/* caml_ecdsa_sign_der(seckey_32, msg_32) -> bigarray (DER, low-S normalized)
+   Returns the DER serialization of the signature with low-S enforced
+   (BIP-62 rule 5).  Raises Failure on signing error. */
+CAMLprim value caml_ecdsa_sign_der(value v_seckey, value v_msg) {
+    CAMLparam2(v_seckey, v_msg);
+    ensure_ctx();
+
+    unsigned char *sk_data = (unsigned char *)Caml_ba_data_val(v_seckey);
+    size_t sk_len = Caml_ba_array_val(v_seckey)->dim[0];
+    unsigned char *msg_data = (unsigned char *)Caml_ba_data_val(v_msg);
+    size_t msg_len = Caml_ba_array_val(v_msg)->dim[0];
+
+    if (sk_len != 32) {
+        caml_failwith("caml_ecdsa_sign_der: seckey must be 32 bytes");
+    }
+    if (msg_len != 32) {
+        caml_failwith("caml_ecdsa_sign_der: msg must be 32 bytes");
+    }
+
+    secp256k1_ecdsa_signature sig;
+    if (!secp256k1_ecdsa_sign(schnorr_ctx, &sig, msg_data, sk_data, NULL, NULL)) {
+        caml_failwith("caml_ecdsa_sign_der: signing failed");
+    }
+
+    /* Normalize to low-S per BIP-62 rule 5. */
+    secp256k1_ecdsa_signature_normalize(schnorr_ctx, &sig, &sig);
+
+    unsigned char der[72];
+    size_t der_len = sizeof(der);
+    if (!secp256k1_ecdsa_signature_serialize_der(schnorr_ctx, der, &der_len, &sig)) {
+        caml_failwith("caml_ecdsa_sign_der: serialize_der failed");
+    }
+
+    long dims[1] = { (long)der_len };
+    value result = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL, dims);
+    unsigned char *out = (unsigned char *)Caml_ba_data_val(result);
+    memcpy(out, der, der_len);
+    CAMLreturn(result);
+}
+
+/* caml_ecdsa_signature_is_low_s(sig_der_bytes) -> bool
+   Parses a DER-encoded ECDSA signature (no hash type byte) and returns true
+   iff its S value is already in low-S form.  Returns false if the signature
+   cannot be parsed. Mirrors libsecp256k1_internal's Sign.normalize semantics:
+   normalize returns Some _ when the input was high-S, None when already low-S;
+   we use signature_normalize's return value in the same way. */
+CAMLprim value caml_ecdsa_signature_is_low_s(value v_sig) {
+    CAMLparam1(v_sig);
+    ensure_ctx();
+
+    unsigned char *sig_data = (unsigned char *)Caml_ba_data_val(v_sig);
+    size_t sig_len = Caml_ba_array_val(v_sig)->dim[0];
+
+    secp256k1_ecdsa_signature sig;
+    if (!secp256k1_ecdsa_signature_parse_der(schnorr_ctx, &sig, sig_data, sig_len)) {
+        CAMLreturn(Val_false);
+    }
+
+    /* signature_normalize returns 1 if sig was modified (was high-S), 0 if
+       already low-S. We want is_low_s = (was already low-S) = !was_modified. */
+    int was_modified = secp256k1_ecdsa_signature_normalize(schnorr_ctx, NULL, &sig);
+    CAMLreturn(Val_bool(!was_modified));
+}
+
+/* caml_ec_seckey_tweak_add(seckey_32, tweak_32) -> bigarray (32 bytes)
+   Raises Failure on invalid seckey or tweak overflow. */
+CAMLprim value caml_ec_seckey_tweak_add(value v_seckey, value v_tweak) {
+    CAMLparam2(v_seckey, v_tweak);
+    ensure_ctx();
+
+    unsigned char *sk_data = (unsigned char *)Caml_ba_data_val(v_seckey);
+    size_t sk_len = Caml_ba_array_val(v_seckey)->dim[0];
+    unsigned char *tweak_data = (unsigned char *)Caml_ba_data_val(v_tweak);
+    size_t tweak_len = Caml_ba_array_val(v_tweak)->dim[0];
+
+    if (sk_len != 32) {
+        caml_failwith("caml_ec_seckey_tweak_add: seckey must be 32 bytes");
+    }
+    if (tweak_len != 32) {
+        caml_failwith("caml_ec_seckey_tweak_add: tweak must be 32 bytes");
+    }
+
+    unsigned char out[32];
+    memcpy(out, sk_data, 32);
+    if (!secp256k1_ec_seckey_tweak_add(schnorr_ctx, out, tweak_data)) {
+        caml_failwith("caml_ec_seckey_tweak_add: tweak overflow / invalid result");
+    }
+
+    long dims[1] = { 32 };
+    value result = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL, dims);
+    unsigned char *result_data = (unsigned char *)Caml_ba_data_val(result);
+    memcpy(result_data, out, 32);
+    CAMLreturn(result);
+}
+
+/* caml_ec_pubkey_tweak_add(pubkey_bytes, tweak_32) -> bigarray (33 bytes,
+   compressed)
+   Pubkey input may be 33 or 65 bytes. Output is always 33-byte compressed.
+   Raises Failure on invalid pubkey or tweak overflow. Used by BIP-32 public
+   derivation: child_pubkey = parent_pubkey + tweak * G. */
+CAMLprim value caml_ec_pubkey_tweak_add(value v_pubkey, value v_tweak) {
+    CAMLparam2(v_pubkey, v_tweak);
+    ensure_ctx();
+
+    unsigned char *pk_data = (unsigned char *)Caml_ba_data_val(v_pubkey);
+    size_t pk_len = Caml_ba_array_val(v_pubkey)->dim[0];
+    unsigned char *tweak_data = (unsigned char *)Caml_ba_data_val(v_tweak);
+    size_t tweak_len = Caml_ba_array_val(v_tweak)->dim[0];
+
+    if (tweak_len != 32) {
+        caml_failwith("caml_ec_pubkey_tweak_add: tweak must be 32 bytes");
+    }
+
+    secp256k1_pubkey pk;
+    if (!secp256k1_ec_pubkey_parse(schnorr_ctx, &pk, pk_data, pk_len)) {
+        caml_failwith("caml_ec_pubkey_tweak_add: invalid pubkey");
+    }
+
+    if (!secp256k1_ec_pubkey_tweak_add(schnorr_ctx, &pk, tweak_data)) {
+        caml_failwith("caml_ec_pubkey_tweak_add: tweak overflow");
+    }
+
+    unsigned char out[33];
+    size_t out_len = 33;
+    if (!secp256k1_ec_pubkey_serialize(schnorr_ctx, out, &out_len, &pk,
+            SECP256K1_EC_COMPRESSED)) {
+        caml_failwith("caml_ec_pubkey_tweak_add: serialize failed");
+    }
+
+    long dims[1] = { 33 };
+    value result = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL, dims);
+    unsigned char *result_data = (unsigned char *)Caml_ba_data_val(result);
+    memcpy(result_data, out, 33);
+    CAMLreturn(result);
+}

@@ -169,6 +169,97 @@ let verify (pubkey_bytes : public_key) (msg_hash : Types.hash256) (sig_bytes : s
     Secp.Sign.verify_exn secp_ctx ~pk ~msg:msg_bs ~signature:sig_
   with _ -> false
 
+(* ============================================================================
+   Compact Recoverable ECDSA signatures (Bitcoin Core "signmessage" format)
+
+   Format (matches Bitcoin Core's CKey::SignCompact / CPubKey::RecoverCompact
+   in src/key.cpp + src/pubkey.cpp):
+     [0]      header byte = 27 + recid + (compressed ? 4 : 0)
+     [1..33)  32-byte R
+     [33..65) 32-byte S
+
+   The header byte's low 2 bits hold the recovery id (0..3); bit 2 is the
+   compressed-pubkey flag. The libsecp256k1 OCaml binding stores the
+   recoverable signature serialization as 65 raw bytes: 64-byte compact body
+   followed by a 1-byte recid at index 64. We translate between the two.
+   ============================================================================ *)
+
+(* C stubs (lib/schnorr_stubs.c) — vendored libsecp256k1 with the recovery
+   module enabled.  We deliberately bypass the secp256k1-internal OCaml
+   binding here because camlcoin links the vendored libsecp256k1 alongside
+   the binding's bundled copy, and `--allow-multiple-definition` can route
+   the binding's sign and recover paths to inconsistent function bodies. *)
+external ecdsa_sign_compact_raw : Bigstring.t -> Bigstring.t -> int -> Bigstring.t
+  = "caml_ecdsa_sign_compact"
+
+external ecdsa_recover_compact_raw : Bigstring.t -> Bigstring.t -> Bigstring.t
+  = "caml_ecdsa_recover_compact"
+
+(* Sign [msg_hash] with [privkey] and return a 65-byte Bitcoin compact
+   signature.  [compressed] sets the +4 flag in the header byte and reflects
+   whether the corresponding pubkey is the 33-byte compressed SEC encoding. *)
+let sign_compact ?(compressed=true) (privkey : private_key)
+    (msg_hash : Types.hash256) : Cstruct.t =
+  let sk_bs = cstruct_to_bigstring privkey in
+  let msg_bs = cstruct_to_bigstring msg_hash in
+  let out_bs = ecdsa_sign_compact_raw sk_bs msg_bs (if compressed then 1 else 0) in
+  bigstring_to_cstruct out_bs
+
+(* Recover the public key that produced [sig_bytes] over [msg_hash].
+   Returns the SEC-encoded public key (compressed if header byte's bit-2 is
+   set, else uncompressed) on success.  Returns None on a malformed signature
+   or when recovery fails (the C stub returns a 0-length bigstring on
+   failure). *)
+let recover_compact (sig_bytes : Cstruct.t) (msg_hash : Types.hash256)
+    : public_key option =
+  if Cstruct.length sig_bytes <> 65 then None
+  else
+    try
+      let sig_bs = cstruct_to_bigstring sig_bytes in
+      let msg_bs = cstruct_to_bigstring msg_hash in
+      let pub_bs = ecdsa_recover_compact_raw sig_bs msg_bs in
+      if Bigstring.length pub_bs = 0 then None
+      else Some (bigstring_to_cstruct pub_bs)
+    with _ -> None
+
+(* Bitcoin Core's MESSAGE_MAGIC prefix used by signmessage / verifymessage
+   (src/common/signmessage.cpp). *)
+let message_magic = "Bitcoin Signed Message:\n"
+
+(* Encode a CompactSize-prefixed string the same way Bitcoin Core's
+   HashWriter::operator<<(string) does: compact-size length, then raw bytes. *)
+let put_compact_size (buf : Buffer.t) (n : int) : unit =
+  if n < 0xFD then
+    Buffer.add_char buf (Char.chr n)
+  else if n <= 0xFFFF then begin
+    Buffer.add_char buf '\xFD';
+    Buffer.add_char buf (Char.chr (n land 0xFF));
+    Buffer.add_char buf (Char.chr ((n lsr 8) land 0xFF))
+  end else if n <= 0xFFFFFFFF then begin
+    Buffer.add_char buf '\xFE';
+    Buffer.add_char buf (Char.chr (n land 0xFF));
+    Buffer.add_char buf (Char.chr ((n lsr 8) land 0xFF));
+    Buffer.add_char buf (Char.chr ((n lsr 16) land 0xFF));
+    Buffer.add_char buf (Char.chr ((n lsr 24) land 0xFF))
+  end else begin
+    Buffer.add_char buf '\xFF';
+    for i = 0 to 7 do
+      Buffer.add_char buf (Char.chr ((n lsr (i * 8)) land 0xFF))
+    done
+  end
+
+(* Compute the double-SHA256 hash that signmessage / verifymessage operate on:
+     dsha256(compact_size(magic) || magic || compact_size(msg) || msg)
+   Mirrors src/common/signmessage.cpp::MessageHash. *)
+let message_hash (message : string) : Types.hash256 =
+  let buf = Buffer.create
+    (10 + String.length message_magic + String.length message) in
+  put_compact_size buf (String.length message_magic);
+  Buffer.add_string buf message_magic;
+  put_compact_size buf (String.length message);
+  Buffer.add_string buf message;
+  sha256d (Cstruct.of_string (Buffer.contents buf))
+
 (* Schnorr signature verification (BIP-340) *)
 external schnorr_verify_raw : Bigstring.t -> Bigstring.t -> Bigstring.t -> bool
   = "caml_schnorr_verify"

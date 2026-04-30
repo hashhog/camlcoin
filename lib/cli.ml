@@ -272,7 +272,8 @@ let run (config : config) : unit Lwt.t =
   let rpc_ctx = Rpc.create_context
     ~chain ~mempool ~peer_manager
     ~wallet ~fee_estimator ~network
-    ~utxo:(Some optimized_utxo) () in
+    ~utxo:(Some optimized_utxo)
+    ~data_dir:(Some config.data_dir) () in
 
   (* Set up signal handlers for graceful shutdown.
      We use Lwt_unix.on_signal so that the signal wakes the Lwt event loop

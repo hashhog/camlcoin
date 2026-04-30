@@ -17,6 +17,7 @@
 #define ENABLE_MODULE_EXTRAKEYS 1
 #define ENABLE_MODULE_SCHNORRSIG 1
 #define ENABLE_MODULE_ELLSWIFT 1
+#define ENABLE_MODULE_RECOVERY 1
 
 /* Prevent OCaml compatibility macros from interfering with secp256k1 code.
  * OCaml's caml/compatibility.h defines 'alloc' as a macro which clashes
@@ -46,6 +47,7 @@
 #include "secp256k1_extrakeys.h"
 #include "secp256k1_schnorrsig.h"
 #include "secp256k1_ellswift.h"
+#include "secp256k1_recovery.h"
 
 static secp256k1_context *schnorr_ctx = NULL;
 
@@ -727,5 +729,109 @@ CAMLprim value caml_ellswift_xdh(value v_our_sk,
     value result = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL, dims);
     unsigned char *result_data = (unsigned char *)Caml_ba_data_val(result);
     memcpy(result_data, shared, 32);
+    CAMLreturn(result);
+}
+
+/* ============================================================================
+   Recoverable ECDSA (Bitcoin Core "signmessage" / "verifymessage" format)
+
+   Both stubs use the vendored libsecp256k1 directly so that the sign and
+   recover paths are guaranteed to use the same implementation.  Mixing the
+   secp256k1-internal opam package's bundled lib with the vendored copy
+   under --allow-multiple-definition can route sign and recover to mutually
+   inconsistent function bodies — these stubs side-step that.
+   ============================================================================ */
+
+/* caml_ecdsa_sign_compact(seckey_32, msg_32, compressed_int)
+     -> bigarray(65 bytes)  (Bitcoin compact: header || R || S)
+   header = 27 + recid + (compressed ? 4 : 0) */
+CAMLprim value caml_ecdsa_sign_compact(value v_seckey, value v_msg,
+                                       value v_compressed) {
+    CAMLparam3(v_seckey, v_msg, v_compressed);
+    ensure_ctx();
+
+    unsigned char *sk_data = (unsigned char *)Caml_ba_data_val(v_seckey);
+    unsigned char *msg_data = (unsigned char *)Caml_ba_data_val(v_msg);
+    int compressed = Int_val(v_compressed);
+
+    secp256k1_ecdsa_recoverable_signature rsig;
+    if (!secp256k1_ecdsa_sign_recoverable(schnorr_ctx, &rsig, msg_data,
+                                          sk_data, NULL, NULL)) {
+        caml_failwith("caml_ecdsa_sign_compact: signing failed");
+    }
+    unsigned char rs[64];
+    int recid = -1;
+    if (!secp256k1_ecdsa_recoverable_signature_serialize_compact(schnorr_ctx,
+            rs, &recid, &rsig)) {
+        caml_failwith("caml_ecdsa_sign_compact: serialize_compact failed");
+    }
+
+    long dims[1] = { 65 };
+    value result = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL, dims);
+    unsigned char *out = (unsigned char *)Caml_ba_data_val(result);
+    out[0] = (unsigned char)(27 + recid + (compressed ? 4 : 0));
+    memcpy(out + 1, rs, 64);
+    CAMLreturn(result);
+}
+
+/* caml_ecdsa_recover_compact(sig_65, msg_32) -> bigarray | none
+   Returns:
+     dim=33 → compressed pubkey on success (header bit 4 set)
+     dim=65 → uncompressed pubkey on success (header bit 4 clear)
+     dim=0  → recovery failed (caller treats as None) */
+CAMLprim value caml_ecdsa_recover_compact(value v_sig, value v_msg) {
+    CAMLparam2(v_sig, v_msg);
+    ensure_ctx();
+
+    unsigned char *sig_data = (unsigned char *)Caml_ba_data_val(v_sig);
+    size_t sig_len = Caml_ba_array_val(v_sig)->dim[0];
+    unsigned char *msg_data = (unsigned char *)Caml_ba_data_val(v_msg);
+
+    long fail_dims[1] = { 0 };
+
+    if (sig_len != 65) {
+        value fail = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL,
+                                   fail_dims);
+        CAMLreturn(fail);
+    }
+
+    int header = sig_data[0];
+    if (header < 27 || header > 34) {
+        value fail = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL,
+                                   fail_dims);
+        CAMLreturn(fail);
+    }
+    int recid = (header - 27) & 3;
+    int compressed = ((header - 27) & 4) != 0;
+
+    secp256k1_ecdsa_recoverable_signature rsig;
+    if (!secp256k1_ecdsa_recoverable_signature_parse_compact(schnorr_ctx,
+            &rsig, sig_data + 1, recid)) {
+        value fail = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL,
+                                   fail_dims);
+        CAMLreturn(fail);
+    }
+
+    secp256k1_pubkey pk;
+    if (!secp256k1_ecdsa_recover(schnorr_ctx, &pk, &rsig, msg_data)) {
+        value fail = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL,
+                                   fail_dims);
+        CAMLreturn(fail);
+    }
+
+    unsigned char pub[65];
+    size_t publen = compressed ? 33 : 65;
+    if (!secp256k1_ec_pubkey_serialize(schnorr_ctx, pub, &publen, &pk,
+            compressed ? SECP256K1_EC_COMPRESSED : SECP256K1_EC_UNCOMPRESSED)) {
+        value fail = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL,
+                                   fail_dims);
+        CAMLreturn(fail);
+    }
+
+    long ok_dims[1] = { (long)publen };
+    value result = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL,
+                                 ok_dims);
+    unsigned char *out = (unsigned char *)Caml_ba_data_val(result);
+    memcpy(out, pub, publen);
     CAMLreturn(result);
 }

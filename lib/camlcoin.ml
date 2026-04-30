@@ -34,3 +34,4 @@ module Cf_chainstate = Cf_chainstate
 module Migration = Migration
 module Block_import = Block_import
 module Utxo_import = Utxo_import
+module Runtime_config = Runtime_config

@@ -71,16 +71,23 @@ let config_for_network = function
    Logging Setup
    ============================================================================ *)
 
-let setup_logging (debug : bool) ?(categories : string list = []) () : unit =
+(* When [reporter_already_installed] is true the caller has already wired up
+   a custom reporter (e.g. Runtime_config.install_log_file_reporter for
+   --logfile output) and we must NOT clobber it with Logs_fmt.reporter. *)
+let setup_logging ?(reporter_already_installed : bool = false)
+    (debug : bool) ?(categories : string list = []) () : unit =
   Fmt_tty.setup_std_outputs ();
   let default_level = if debug then Logs.Debug else Logs.Info in
   Logs.set_level (Some default_level);
-  Logs.set_reporter (Logs_fmt.reporter ());
+  if not reporter_already_installed then
+    Logs.set_reporter (Logs_fmt.reporter ());
   if categories <> [] then
     List.iter (fun src ->
       let name = Logs.Src.name src in
-      if not (List.mem (String.uppercase_ascii name)
-                (List.map String.uppercase_ascii categories)) then
+      (* Sentinel "__none__" from Runtime_config.resolve_debug_categories
+         means no source matches -> all clamped to Warning. *)
+      let cats_uc = List.map String.uppercase_ascii categories in
+      if not (List.mem (String.uppercase_ascii name) cats_uc) then
         Logs.Src.set_level src (Some Logs.Warning)
     ) (Logs.Src.list ())
 
@@ -88,10 +95,15 @@ let setup_logging (debug : bool) ?(categories : string list = []) () : unit =
    Main Application Run Loop
    ============================================================================ *)
 
-let run (config : config) : unit Lwt.t =
+let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   let open Lwt.Syntax in
 
-  setup_logging config.debug ~categories:config.log_categories ();
+  (* Detect whether bin/main.ml already installed a file-based reporter
+     (Runtime_config.install_log_file_reporter); if so, don't clobber it. *)
+  let reporter_installed = Runtime_config.log_target_ref <> ref None
+                           && !Runtime_config.log_target_ref <> None in
+  setup_logging ~reporter_already_installed:reporter_installed
+    config.debug ~categories:config.log_categories ();
 
   Logs.info (fun m ->
     m "CamlCoin v%s starting on %s"
@@ -832,6 +844,9 @@ let run (config : config) : unit Lwt.t =
       if !shutdown then Lwt.return_unit
       else begin
         let* () = Lwt_unix.sleep 30.0 in
+        (* Action any pending SIGHUP — reopens the log file, no-op if no
+           --logfile was configured. Cheap flag check. *)
+        Runtime_config.drain_pending_sighup ();
         if not !shutdown then begin
           let peer_count = Peer_manager.peer_count peer_manager in
           let ready_count = Peer_manager.ready_peer_count peer_manager in
@@ -939,6 +954,9 @@ let run (config : config) : unit Lwt.t =
     with exn ->
       Logs.warn (fun m ->
         m "Failed to close chainstate DB: %s" (Printexc.to_string exn)));
+    (* Phase 5: remove PID file. Done last so a supervisor watching for the
+       file's disappearance only sees it after databases are flushed. *)
+    Runtime_config.remove_pid_file ();
     Logs.info (fun m -> m "exit");
     Lwt.return_unit
   in
@@ -986,6 +1004,11 @@ let run (config : config) : unit Lwt.t =
   Lwt.async (fun () -> peer_thread);
   Lwt.async (fun () -> listener_thread);
   Lwt.async (fun () -> sync_thread);
+
+  (* Supervisor handshake: now that the RPC, peer manager, and P2P listener
+     have been kicked off, signal readiness on the file descriptor passed by
+     the launcher (e.g. systemd Type=notify alternative). *)
+  Runtime_config.signal_ready ?fd:ready_fd ();
 
   (* Start Prometheus metrics server *)
   let metrics_thread =

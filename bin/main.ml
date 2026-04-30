@@ -109,6 +109,60 @@ let migrate_logstorage_arg =
              re-run after a crash. Operator-driven; never auto-runs." in
   Arg.(value & flag & info ["migrate-logstorage-to-rocksdb"] ~doc)
 
+(* Operational flags: daemon, pid file, conf, debug categories, log file,
+   printtoconsole, ready-fd. Mirrors Bitcoin Core's init.cpp surface. *)
+
+let daemon_arg =
+  let doc = "Fork to background after initialisation (double-fork + setsid). \
+             stdio is redirected to /dev/null; use --logfile to capture log \
+             output. PID is written via --pid (default <datadir>/camlcoin.pid)." in
+  Arg.(value & flag & info ["daemon"] ~doc)
+
+let pid_arg =
+  let doc = "Path to write the camlcoin PID file. Defaults to \
+             <datadir>/camlcoin.pid. The file is removed on graceful \
+             shutdown. Refuses to start if the file already names a live \
+             process." in
+  Arg.(value & opt (some string) None &
+    info ["pid"] ~docv:"PATH" ~doc)
+
+let conf_arg =
+  let doc = "Read additional options from a config file (Bitcoin Core \
+             grammar: key=value, # comments, [section] headers). CLI values \
+             win over config file values. Default: <datadir>/camlcoin.conf." in
+  Arg.(value & opt (some string) None &
+    info ["conf"] ~docv:"FILE" ~doc)
+
+let debug_cat_arg =
+  let doc = "Enable selective debug logging for one or more categories \
+             (comma-separated, repeatable). Categories match the Logs.Src \
+             registry (e.g. NET, RPC, MEMPOOL, VALIDATION, PEER, MINING, \
+             WALLET, REST, PKG-RELAY). Special values: 'all' / '1' enable \
+             everything; 'none' / '0' disable everything." in
+  Arg.(value & opt_all string [] &
+    info ["debug-cat"] ~docv:"CAT" ~doc)
+
+let logfile_arg =
+  let doc = "Write logs to a file in addition to (or instead of) stderr. \
+             SIGHUP closes and reopens the file for log rotation." in
+  Arg.(value & opt (some string) None &
+    info ["logfile"] ~docv:"PATH" ~doc)
+
+let printtoconsole_arg =
+  let doc = "Force log output to stderr even when --logfile is set. \
+             Without --logfile this is the default and the flag is a no-op. \
+             Mirrors Bitcoin Core's -printtoconsole." in
+  Arg.(value & opt (some bool) None &
+    info ["printtoconsole"] ~docv:"BOOL" ~doc)
+
+let ready_fd_arg =
+  let doc = "Write a single byte to file descriptor N once initialisation \
+             is complete (RPC bound, peer manager started). The fd is then \
+             closed. Useful for systemd-style READY signalling without \
+             dbus." in
+  Arg.(value & opt (some int) None &
+    info ["ready-fd"] ~docv:"N" ~doc)
+
 (* ============================================================================
    Main Command
    ============================================================================ *)
@@ -116,15 +170,100 @@ let migrate_logstorage_arg =
 let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     p2p_port max_outbound max_inbound connect debug no_wallet prune benchmark
     import_blocks import_utxo metrics_port peer_bloom_filters
-    migrate_logstorage =
+    migrate_logstorage daemon_mode pid_path conf_path debug_cats
+    logfile printtoconsole ready_fd =
+  (* Resolve datadir early so config-file lookup can default to it. *)
+  let base = Camlcoin.Cli.config_for_network network in
+  let resolved_datadir = match datadir with
+    | Some d -> d
+    | None -> base.data_dir in
+  (* Load config file. CLI wins over conf, conf wins over hard-coded defaults. *)
+  let conf_path_resolved = match conf_path with
+    | Some p -> p
+    | None -> Filename.concat resolved_datadir "camlcoin.conf" in
+  let conf_opts =
+    try Camlcoin.Runtime_config.parse_conf_file ~network conf_path_resolved
+    with _ -> [] in
+  (* Resolve effective values: CLI > conf > hard-coded base defaults. *)
+  let eff_rpc_host =
+    Camlcoin.Runtime_config.overlay_string
+      ~cli:(if rpc_host = "127.0.0.1" then None else Some rpc_host)
+      ~conf:(Camlcoin.Runtime_config.get_string conf_opts "rpchost")
+      ~default:rpc_host in
+  let eff_rpc_user =
+    Camlcoin.Runtime_config.overlay_string
+      ~cli:(if rpc_user = "camlcoin" then None else Some rpc_user)
+      ~conf:(Camlcoin.Runtime_config.get_string conf_opts "rpcuser")
+      ~default:rpc_user in
+  let eff_rpc_password =
+    Camlcoin.Runtime_config.overlay_string
+      ~cli:(if rpc_password = "camlcoin" then None else Some rpc_password)
+      ~conf:(Camlcoin.Runtime_config.get_string conf_opts "rpcpassword")
+      ~default:rpc_password in
+  let eff_max_outbound =
+    Camlcoin.Runtime_config.overlay_int
+      ~cli:(if max_outbound = 8 then None else Some max_outbound)
+      ~conf:(Camlcoin.Runtime_config.get_int conf_opts "maxoutbound")
+      ~default:max_outbound in
+  let eff_max_inbound =
+    Camlcoin.Runtime_config.overlay_int
+      ~cli:(if max_inbound = 117 then None else Some max_inbound)
+      ~conf:(Camlcoin.Runtime_config.get_int conf_opts "maxinbound")
+      ~default:max_inbound in
+  let eff_prune =
+    Camlcoin.Runtime_config.overlay_int
+      ~cli:(if prune = 0 then None else Some prune)
+      ~conf:(Camlcoin.Runtime_config.get_int conf_opts "prune")
+      ~default:prune in
+  let eff_metrics_port =
+    Camlcoin.Runtime_config.overlay_int
+      ~cli:(if metrics_port = 9332 then None else Some metrics_port)
+      ~conf:(Camlcoin.Runtime_config.get_int conf_opts "metricsport")
+      ~default:metrics_port in
+  let eff_peer_bloom =
+    Camlcoin.Runtime_config.overlay_bool
+      ~cli_set:false ~cli_value:peer_bloom_filters
+      ~conf:(Camlcoin.Runtime_config.get_bool conf_opts "peerbloomfilters")
+      ~default:peer_bloom_filters in
+  let eff_debug_cats =
+    let cli = debug_cats in
+    let from_conf =
+      match Camlcoin.Runtime_config.get_string conf_opts "debug" with
+      | Some v -> [v]
+      | None -> [] in
+    Camlcoin.Runtime_config.resolve_debug_categories (cli @ from_conf) in
+  let eff_logfile = match logfile with
+    | Some p -> Some p
+    | None -> Camlcoin.Runtime_config.get_string conf_opts "logfile" in
+  let eff_printtoconsole = match printtoconsole with
+    | Some b -> b
+    | None ->
+      (match Camlcoin.Runtime_config.get_bool conf_opts "printtoconsole" with
+       | Some b -> b
+       | None -> eff_logfile = None) in
+  let eff_pid_path = match pid_path with
+    | Some p -> p
+    | None ->
+      (match Camlcoin.Runtime_config.get_string conf_opts "pid" with
+       | Some p -> p
+       | None -> Filename.concat resolved_datadir "camlcoin.pid") in
+  let eff_daemon =
+    daemon_mode
+    || (match Camlcoin.Runtime_config.get_bool conf_opts "daemon" with
+        | Some b -> b | None -> false) in
+  let eff_ready_fd = ready_fd in
+  let install_log_reporter () =
+    match eff_logfile with
+    | None -> () (* default cli.ml setup_logging installs Logs_fmt *)
+    | Some path ->
+      Camlcoin.Runtime_config.install_log_file_reporter
+        ~also_console:eff_printtoconsole path
+  in
   (* If migrate-logstorage flag is set, run the migration and exit. *)
   if migrate_logstorage then begin
     Camlcoin.Cli.setup_logging debug ();
-    let base = Camlcoin.Cli.config_for_network network in
-    let data_dir = match datadir with
-      | Some d -> d
-      | None -> base.data_dir in
-    let chainstate_dir = Filename.concat data_dir "chainstate" in
+    install_log_reporter ();
+    let chainstate_dir = Filename.concat resolved_datadir "chainstate" in
     let rc = Camlcoin.Migration.run ~chainstate_dir in
     exit rc
   end else
@@ -204,31 +343,56 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     Printf.eprintf "Done: imported %d blocks\n%!" count
   | None ->
   begin
-    let base = Camlcoin.Cli.config_for_network network in
+    let conf_rpc_port = Camlcoin.Runtime_config.get_int conf_opts "rpcport" in
+    let conf_p2p_port = Camlcoin.Runtime_config.get_int conf_opts "port" in
+    let conf_connect = Camlcoin.Runtime_config.get_all conf_opts "connect" in
     let config : Camlcoin.Cli.config = {
       network;
-      data_dir = (match datadir with
-        | Some d -> d
-        | None -> base.data_dir);
-      rpc_host;
+      data_dir = resolved_datadir;
+      rpc_host = eff_rpc_host;
       rpc_port = (match rpc_port with
         | Some p -> p
-        | None -> base.rpc_port);
-      rpc_user;
-      rpc_password;
+        | None -> (match conf_rpc_port with
+          | Some p -> p | None -> base.rpc_port));
+      rpc_user = eff_rpc_user;
+      rpc_password = eff_rpc_password;
       p2p_port = (match p2p_port with
         | Some p -> p
-        | None -> base.p2p_port);
-      max_outbound;
-      max_inbound;
-      connect;
+        | None -> (match conf_p2p_port with
+          | Some p -> p | None -> base.p2p_port));
+      max_outbound = eff_max_outbound;
+      max_inbound = eff_max_inbound;
+      connect = (if connect <> [] then connect else conf_connect);
       debug;
       wallet_enabled = not no_wallet;
-      prune;
-      log_categories = [];
-      metrics_port;
-      peer_bloom_filters;
+      prune = eff_prune;
+      log_categories = eff_debug_cats;
+      metrics_port = eff_metrics_port;
+      peer_bloom_filters = eff_peer_bloom;
     } in
+    (* Ensure datadir exists so we can land the PID file there. *)
+    (try Unix.mkdir resolved_datadir 0o755
+     with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+    (* Daemonize BEFORE Lwt_main.run; Lwt_engine state does not survive a
+       fork. After this returns we are the grandchild, detached from any
+       controlling terminal. *)
+    if eff_daemon then Camlcoin.Runtime_config.daemonize ();
+    (* PID file: write our (post-daemonize) PID. Refuses to start if the
+       file already names a live process. *)
+    (match Camlcoin.Runtime_config.write_pid_file eff_pid_path with
+     | Ok () -> ()
+     | Error msg ->
+       Printf.eprintf "[camlcoin] %s\n%!" msg;
+       exit 1);
+    (* Install file-based log reporter if --logfile was set. Must run AFTER
+       daemonize so the file descriptor isn't lost across the fork. *)
+    (match eff_logfile with
+     | None -> ()
+     | Some path ->
+       Camlcoin.Runtime_config.install_log_file_reporter
+         ~also_console:eff_printtoconsole path);
+    (* SIGHUP triggers a log reopen on the next status-thread tick. *)
+    Camlcoin.Runtime_config.install_sighup_handler ();
     (* W78: install an async-exception hook that logs instead of terminating.
        The default hook calls exit 2 on any exception from an Lwt.async
        continuation — a Stack_overflow in one peer-rotation callback would
@@ -242,10 +406,11 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
         (Printexc.to_string exn)
         (Printexc.get_backtrace ())
     );
-    Lwt_main.run (Camlcoin.Cli.run config);
+    Lwt_main.run (Camlcoin.Cli.run ?ready_fd:eff_ready_fd config);
     (* Graceful shutdown complete: exit 0 deterministically.  The 30s
        watchdog inside Cli.run will have already called exit 1 if the
        graceful path stalled, so reaching this point means success. *)
+    Camlcoin.Runtime_config.remove_pid_file ();
     exit 0
   end
 
@@ -291,7 +456,14 @@ let cmd =
     $ import_utxo_arg
     $ metrics_port_arg
     $ peer_bloom_filters_arg
-    $ migrate_logstorage_arg)
+    $ migrate_logstorage_arg
+    $ daemon_arg
+    $ pid_arg
+    $ conf_arg
+    $ debug_cat_arg
+    $ logfile_arg
+    $ printtoconsole_arg
+    $ ready_fd_arg)
 
 (* ============================================================================
    Entry Point

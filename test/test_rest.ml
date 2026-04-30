@@ -110,10 +110,25 @@ let test_split_string_trailing () =
    Context Setup
    ============================================================================ *)
 
+(* Track the most recently created ChainDB so the test teardown can
+   close it before [cleanup_test_db] does the rm -rf. With the
+   Cf_chainstate-backed ChainDB (Option D), RocksDB acquires an OS
+   lock + maintains memtable/CF handles in-process; tearing down the
+   on-disk dir without closing those handles first leaves a corrupted
+   datadir for the next test. *)
+let last_db : Storage.ChainDB.t option ref = ref None
+
+let close_test_db () =
+  (match !last_db with
+   | Some db -> Storage.ChainDB.close db; last_db := None
+   | None -> ());
+  cleanup_test_db ()
+
 (* Create a test context for REST endpoints *)
 let create_test_context () =
-  cleanup_test_db ();
+  close_test_db ();
   let db = Storage.ChainDB.create test_db_path in
+  last_db := Some db;
   let utxo = Utxo.UtxoSet.create db in
   let mempool = Mempool.create ~require_standard:false ~verify_scripts:false
                   ~utxo ~current_height:0 () in
@@ -148,7 +163,7 @@ let test_dispatch_block_not_found () =
   let response = Lwt_main.run (Rest.dispatch_rest ctx req path) in
   let status = Cohttp.Response.status (fst response) in
   Alcotest.(check bool) "404 for missing block" true (status = `Not_found);
-  cleanup_test_db ()
+  close_test_db ()
 
 let test_dispatch_tx_not_found () =
   let ctx = create_test_context () in
@@ -158,7 +173,7 @@ let test_dispatch_tx_not_found () =
   let response = Lwt_main.run (Rest.dispatch_rest ctx req path) in
   let status = Cohttp.Response.status (fst response) in
   Alcotest.(check bool) "404 for missing tx" true (status = `Not_found);
-  cleanup_test_db ()
+  close_test_db ()
 
 let test_dispatch_chaininfo () =
   let ctx = create_test_context () in
@@ -180,7 +195,7 @@ let test_dispatch_chaininfo () =
      Alcotest.(check bool) "has bestblockhash field" true
        (List.mem_assoc "bestblockhash" fields)
    | _ -> Alcotest.fail "Expected JSON object");
-  cleanup_test_db ()
+  close_test_db ()
 
 let test_dispatch_mempool_info () =
   let ctx = create_test_context () in
@@ -199,7 +214,7 @@ let test_dispatch_mempool_info () =
      Alcotest.(check bool) "has loaded field" true
        (List.mem_assoc "loaded" fields)
    | _ -> Alcotest.fail "Expected JSON object");
-  cleanup_test_db ()
+  close_test_db ()
 
 let test_dispatch_mempool_contents () =
   let ctx = create_test_context () in
@@ -215,7 +230,7 @@ let test_dispatch_mempool_contents () =
    | `Assoc _ -> ()  (* verbose format: object with txid keys *)
    | `List _ -> ()   (* non-verbose: list of txids *)
    | _ -> Alcotest.fail "Expected JSON object or list");
-  cleanup_test_db ()
+  close_test_db ()
 
 let test_dispatch_blockhashbyheight_not_found () =
   let ctx = create_test_context () in
@@ -224,7 +239,7 @@ let test_dispatch_blockhashbyheight_not_found () =
   let response = Lwt_main.run (Rest.dispatch_rest ctx req path) in
   let status = Cohttp.Response.status (fst response) in
   Alcotest.(check bool) "404 for invalid height" true (status = `Not_found);
-  cleanup_test_db ()
+  close_test_db ()
 
 let test_dispatch_blockhashbyheight_invalid () =
   let ctx = create_test_context () in
@@ -233,7 +248,7 @@ let test_dispatch_blockhashbyheight_invalid () =
   let response = Lwt_main.run (Rest.dispatch_rest ctx req path) in
   let status = Cohttp.Response.status (fst response) in
   Alcotest.(check bool) "400 for invalid height" true (status = `Bad_request);
-  cleanup_test_db ()
+  close_test_db ()
 
 let test_dispatch_unknown_path () =
   let ctx = create_test_context () in
@@ -242,7 +257,7 @@ let test_dispatch_unknown_path () =
   let response = Lwt_main.run (Rest.dispatch_rest ctx req path) in
   let status = Cohttp.Response.status (fst response) in
   Alcotest.(check bool) "404 for unknown path" true (status = `Not_found);
-  cleanup_test_db ()
+  close_test_db ()
 
 let test_dispatch_headers_invalid_hash () =
   let ctx = create_test_context () in
@@ -251,7 +266,7 @@ let test_dispatch_headers_invalid_hash () =
   let response = Lwt_main.run (Rest.dispatch_rest ctx req path) in
   let status = Cohttp.Response.status (fst response) in
   Alcotest.(check bool) "400 for invalid hash" true (status = `Bad_request);
-  cleanup_test_db ()
+  close_test_db ()
 
 let test_chaininfo_json_only () =
   let ctx = create_test_context () in
@@ -260,7 +275,7 @@ let test_chaininfo_json_only () =
   let response = Lwt_main.run (Rest.dispatch_rest ctx req path) in
   let status = Cohttp.Response.status (fst response) in
   Alcotest.(check bool) "404 for non-json chaininfo" true (status = `Not_found);
-  cleanup_test_db ()
+  close_test_db ()
 
 let test_mempool_info_json_only () =
   let ctx = create_test_context () in
@@ -269,7 +284,7 @@ let test_mempool_info_json_only () =
   let response = Lwt_main.run (Rest.dispatch_rest ctx req path) in
   let status = Cohttp.Response.status (fst response) in
   Alcotest.(check bool) "404 for non-json mempool info" true (status = `Not_found);
-  cleanup_test_db ()
+  close_test_db ()
 
 (* ============================================================================
    Test Suite

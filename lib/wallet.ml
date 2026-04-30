@@ -27,11 +27,20 @@ let insert_at_random lst item =
 
 (* ============================================================================
    Secp256k1 Helpers (shared with Crypto module)
+
+   All secp256k1 operations route through the vendored libsecp256k1 via thin
+   C stubs in lib/schnorr_stubs.c. The opam secp256k1-internal binding has
+   been removed so there is exactly one secp256k1 implementation in-binary.
    ============================================================================ *)
 
-module Secp = Libsecp256k1.External
+(* BIP-32 add_tweak for child key derivation: vendored libsecp256k1's
+   secp256k1_ec_seckey_tweak_add (private side) and secp256k1_ec_pubkey_tweak_add
+   (public side / xpub-rooted derivation). *)
+external ec_seckey_tweak_add_raw : Bigstring.t -> Bigstring.t -> Bigstring.t
+  = "caml_ec_seckey_tweak_add"
 
-let secp_ctx = Secp.Context.create ~sign:true ~verify:true ()
+external ec_pubkey_tweak_add_raw : Bigstring.t -> Bigstring.t -> Bigstring.t
+  = "caml_ec_pubkey_tweak_add"
 
 let cstruct_to_bigstring cs =
   let len = Cstruct.length cs in
@@ -79,9 +88,16 @@ let derive_master_key (seed : Cstruct.t) : extended_key =
     parent_fingerprint = 0l;
     child_index = 0l }
 
-(* Compute fingerprint of an extended key (first 4 bytes of hash160 of pubkey) *)
+(* Compute fingerprint of an extended key (first 4 bytes of hash160 of pubkey).
+   Accepts either a 32-byte private extkey (derive pubkey) or a 33-byte
+   compressed-pubkey extkey (use as-is). *)
 let fingerprint_of_key (ek : extended_key) : int32 =
-  let pubkey = Crypto.derive_public_key ~compressed:true ek.key in
+  let pubkey =
+    if Cstruct.length ek.key = 32 then
+      Crypto.derive_public_key ~compressed:true ek.key
+    else
+      ek.key
+  in
   let h = Crypto.hash160 pubkey in
   (* Read first 4 bytes as big-endian int32 *)
   Cstruct.BE.get_uint32 h 0
@@ -95,45 +111,68 @@ let int32_to_bytes (v : int32) : Cstruct.t =
 (* Hardened index threshold *)
 let hardened_offset = 0x80000000l
 
-(* Derive a child key (BIP-32) *)
+(* Derive a child key (BIP-32).
+
+   Handles both private (xprv-rooted, 32-byte key) and public (xpub-rooted,
+   33-byte compressed key) parents:
+     private: child_sk = parent_sk + IL  (mod n) via ec_seckey_tweak_add
+     public:  child_pk = parent_pk + IL*G via ec_pubkey_tweak_add
+   Hardened derivation requires the private key, so it errors out for xpub
+   parents. *)
 let derive_child_key (parent : extended_key) (index : int32) : (extended_key, string) result =
-  let data =
-    if Int32.compare index hardened_offset >= 0 then begin
-      (* Hardened derivation: HMAC-SHA512(chain_code, 0x00 || key || index_be) *)
-      Cstruct.concat [
-        Cstruct.of_string "\x00";
-        parent.key;
-        int32_to_bytes index
-      ]
-    end else begin
-      (* Normal derivation: HMAC-SHA512(chain_code, pubkey || index_be) *)
-      let pubkey = Crypto.derive_public_key ~compressed:true parent.key in
-      Cstruct.concat [
-        pubkey;
-        int32_to_bytes index
-      ]
-    end
+  let parent_is_private = Cstruct.length parent.key = 32 in
+  let parent_pubkey () =
+    if parent_is_private then
+      Crypto.derive_public_key ~compressed:true parent.key
+    else
+      parent.key
   in
-  let i = hmac_sha512 ~key:parent.chain_code data in
-  let il = Cstruct.sub i 0 32 in
-  let ir = Cstruct.sub i 32 32 in
-  (* Child key = (parent_key + il) mod curve order.
-     Use libsecp256k1's add_tweak which handles the mod order arithmetic. *)
-  try
-    let parent_sk_bs = cstruct_to_bigstring parent.key in
-    let parent_sk = Secp.Key.read_sk_exn secp_ctx parent_sk_bs in
-    let tweak_bs = cstruct_to_bigstring il in
-    let child_sk = Secp.Key.add_tweak secp_ctx parent_sk tweak_bs in
-    let child_key_bs = Secp.Key.to_bytes secp_ctx child_sk in
-    let child_key = bigstring_to_cstruct child_key_bs in
-    let fp = fingerprint_of_key parent in
-    Ok { key = child_key;
-      chain_code = ir;
-      depth = parent.depth + 1;
-      parent_fingerprint = fp;
-      child_index = index }
-  with _ ->
-    Error "BIP-32: invalid child key derived"
+  (* BIP-32 hardened indices are 0x80000000..0xFFFFFFFF.  The signed
+     Int32.compare misclassifies any unsigned value with bit 31 set as
+     "less than 0x80000000" (which itself is -2^31 signed), so use
+     Int32.unsigned_compare to get the BIP-32-correct ordering. *)
+  let is_hardened = Int32.unsigned_compare index hardened_offset >= 0 in
+  if is_hardened && not parent_is_private then
+    Error "BIP-32: hardened derivation requires private key (xprv)"
+  else
+    let data =
+      if is_hardened then
+        (* Hardened: HMAC-SHA512(chain_code, 0x00 || sk || index_be) *)
+        Cstruct.concat [
+          Cstruct.of_string "\x00";
+          parent.key;
+          int32_to_bytes index
+        ]
+      else
+        (* Normal: HMAC-SHA512(chain_code, parent_pubkey || index_be) *)
+        Cstruct.concat [
+          parent_pubkey ();
+          int32_to_bytes index
+        ]
+    in
+    let i = hmac_sha512 ~key:parent.chain_code data in
+    let il = Cstruct.sub i 0 32 in
+    let ir = Cstruct.sub i 32 32 in
+    (* Child key = parent_key (+) il via libsecp256k1's tweak_add.
+       For private keys: secp256k1_ec_seckey_tweak_add (mod-n scalar add).
+       For public keys:  secp256k1_ec_pubkey_tweak_add (point add tweak*G). *)
+    try
+      let parent_bs = cstruct_to_bigstring parent.key in
+      let tweak_bs = cstruct_to_bigstring il in
+      let child_key_bs =
+        if parent_is_private
+        then ec_seckey_tweak_add_raw parent_bs tweak_bs
+        else ec_pubkey_tweak_add_raw parent_bs tweak_bs
+      in
+      let child_key = bigstring_to_cstruct child_key_bs in
+      let fp = fingerprint_of_key parent in
+      Ok { key = child_key;
+        chain_code = ir;
+        depth = parent.depth + 1;
+        parent_fingerprint = fp;
+        child_index = index }
+    with _ ->
+      Error "BIP-32: invalid child key derived"
 
 (* Derive a hardened child *)
 let derive_hardened (parent : extended_key) (index : int) : (extended_key, string) result =
@@ -244,8 +283,14 @@ let serialize_xpub (ek : extended_key) : string =
   Cstruct.BE.set_uint32 buf 9 ek.child_index;
   (* Chain code *)
   Cstruct.blit ek.chain_code 0 buf 13 32;
-  (* Compressed public key *)
-  let pubkey = Crypto.derive_public_key ~compressed:true ek.key in
+  (* Compressed public key — accept either a 32-byte private extkey
+     (derive pubkey) or a 33-byte compressed-pubkey extkey (use as-is). *)
+  let pubkey =
+    if Cstruct.length ek.key = 32 then
+      Crypto.derive_public_key ~compressed:true ek.key
+    else
+      ek.key
+  in
   Cstruct.blit pubkey 0 buf 45 33;
   Address.base58check_encode buf
 

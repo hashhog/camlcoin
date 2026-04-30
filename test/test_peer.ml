@@ -435,6 +435,62 @@ let test_dispatch_post_handshake_feefilter () =
     Alcotest.(check int64) "feefilter set" 1000L peer.feefilter
   | _ -> Alcotest.fail "Expected feefilter after handshake to be accepted"
 
+(* Test BIP-331 sendpackages is accepted between VERSION and VERACK and
+   captures the announced limits on the peer record. *)
+let test_dispatch_sendpackages_pre_verack () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.version_received <- true;
+  let msg = P2p.SendpackagesMsg {
+    pkg_version = 1L;
+    pkg_max_count = 25l;
+    pkg_max_weight = 404_000l;
+  } in
+  let result = Lwt_main.run (Peer.dispatch_message peer msg) in
+  (match result with
+   | `Continue ->
+     Alcotest.(check bool) "sendpackages_received" true peer.sendpackages_received;
+     Alcotest.(check int64) "pkg_relay_version" 1L peer.pkg_relay_version;
+     Alcotest.(check int32) "pkg_max_count" 25l peer.pkg_max_count;
+     Alcotest.(check int32) "pkg_max_weight" 404_000l peer.pkg_max_weight
+   | _ -> Alcotest.fail "Expected sendpackages to be accepted pre-VERACK");
+  Alcotest.(check int) "no misbehavior" 0 peer.misbehavior_score
+
+(* sendpackages BEFORE VERSION must be rejected with a misbehavior bump. *)
+let test_dispatch_sendpackages_before_version () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  let msg = P2p.SendpackagesMsg {
+    pkg_version = 1L;
+    pkg_max_count = 25l;
+    pkg_max_weight = 404_000l;
+  } in
+  let result = Lwt_main.run (Peer.dispatch_message peer msg) in
+  match result with
+  | `PreHandshake _ ->
+    Alcotest.(check int) "misbehavior = 10" 10 peer.misbehavior_score
+  | _ -> Alcotest.fail "Expected sendpackages-before-VERSION rejection"
+
+(* sendpackages AFTER VERACK is a protocol violation per BIP-331. *)
+let test_dispatch_sendpackages_after_verack () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  peer.handshake_complete <- true;
+  peer.version_received <- true;
+  let msg = P2p.SendpackagesMsg {
+    pkg_version = 1L;
+    pkg_max_count = 25l;
+    pkg_max_weight = 404_000l;
+  } in
+  let result = Lwt_main.run (Peer.dispatch_message peer msg) in
+  match result with
+  | `Disconnect _ ->
+    Alcotest.(check int) "misbehavior = 1" 1 peer.misbehavior_score
+  | _ -> Alcotest.fail "Expected sendpackages-after-VERACK to disconnect"
+
 (* Test self-connection detection nonce *)
 let test_self_connection_nonce () =
   let fd1 = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
@@ -1249,6 +1305,9 @@ let () =
       Alcotest.test_case "reject_wtxidrelay_after_handshake" `Quick test_dispatch_wtxidrelay_after_handshake;
       Alcotest.test_case "reject_version_after_handshake" `Quick test_dispatch_version_after_handshake;
       Alcotest.test_case "accept_feefilter_after_handshake" `Quick test_dispatch_post_handshake_feefilter;
+      Alcotest.test_case "accept_sendpackages_pre_verack" `Quick test_dispatch_sendpackages_pre_verack;
+      Alcotest.test_case "reject_sendpackages_before_version" `Quick test_dispatch_sendpackages_before_version;
+      Alcotest.test_case "reject_sendpackages_after_verack" `Quick test_dispatch_sendpackages_after_verack;
     ];
     "inv_trickling", [
       Alcotest.test_case "poisson_delay" `Quick test_poisson_delay;

@@ -598,6 +598,13 @@ let run (config : config) : unit Lwt.t =
         Lwt.return_unit
     | _ -> Lwt.return_unit);
 
+  (* BIP 331: Register a listener for package relay messages.  This handles
+     getpkgtxns (peer asks for txs by wtxid) and pkgtxns (peer delivers a
+     package for validation).  Sendpackages negotiation is captured in
+     Peer.dispatch_message before this listener fires. *)
+  Peer_manager.add_listener peer_manager (fun msg peer ->
+    Package_relay.dispatch mempool msg peer);
+
   (* BIP 152: Register a listener for compact block messages.
      When we receive a cmpctblock, attempt reconstruction from our mempool.
      If reconstruction fails (missing transactions), send getblocktxn to the peer.

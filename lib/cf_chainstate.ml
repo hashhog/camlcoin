@@ -390,3 +390,67 @@ let batch_delete_invalidated (b : batch) (hash : Types.hash256) =
 let batch_write (b : batch) : unit =
   Rocksdb.write_batch_write b.parent.db b.raw;
   Rocksdb.write_batch_destroy b.raw
+
+(* --- Reindex helpers -------------------------------------------------- *)
+
+(* Wipe every key in a single CF using batched [delete] operations.
+   Iterates the CF, accumulates keys into a batch, and flushes every
+   [batch_size] keys. Returns the number of keys deleted.
+
+   This is intentionally simple — RocksDB's [DeleteRange] would be
+   faster but is not exposed by our C stub layer; we'd add it as a
+   follow-up if reindex turns out to be a hot path. For -reindex (a
+   one-shot operator action) the row-by-row delete is acceptable. *)
+let cf_clear (t : t) (cfh : Rocksdb.cf_handle) ?(batch_size = 10_000) () : int =
+  let count = ref 0 in
+  let pending = ref [] in
+  let flush () =
+    if !pending <> [] then begin
+      let wb = Rocksdb.write_batch_create () in
+      List.iter (fun k -> Rocksdb.write_batch_delete_cf wb cfh k) !pending;
+      Rocksdb.write_batch_write t.db wb;
+      Rocksdb.write_batch_destroy wb;
+      pending := []
+    end
+  in
+  Rocksdb.cf_iter t.db cfh (fun key _value ->
+    pending := key :: !pending;
+    incr count;
+    if List.length !pending >= batch_size then flush ());
+  flush ();
+  !count
+
+(* Wipe the UTXO column family. Used by -reindex. *)
+let cf_clear_utxo (t : t) : int =
+  cf_clear t t.cfh_utxo ()
+
+(* Wipe the chain_state CF (tip_hash, tip_height, header_tip_hash,
+   header_tip_height — only 4 keys). Used by -reindex. *)
+let cf_clear_chain_state (t : t) : int =
+  cf_clear t t.cfh_chain_state ()
+
+(* Clear ONLY the two chain-tip pointer keys (tip_hash, tip_height),
+   leaving header_tip_* intact. Used by -reindex so that the next
+   restore_chain_state still sees the header tip and can reload the
+   in-memory header chain from cf_block_header — which is what drives
+   the post-wipe block replay. Returns the number of keys deleted
+   (0, 1, or 2). *)
+let cf_clear_chain_tip_only (t : t) : int =
+  let count = ref 0 in
+  (match Rocksdb.cf_get t.db t.cfh_chain_state "tip_hash" with
+   | None -> ()
+   | Some _ ->
+     Rocksdb.cf_delete t.db t.cfh_chain_state "tip_hash";
+     incr count);
+  (match Rocksdb.cf_get t.db t.cfh_chain_state "tip_height" with
+   | None -> ()
+   | Some _ ->
+     Rocksdb.cf_delete t.db t.cfh_chain_state "tip_height";
+     incr count);
+  !count
+
+(* Wipe the undo_data CF. Used by -reindex (undo data must be regenerated
+   alongside the new UTXO state; stale undo from a previous run could
+   silently mis-rewind a future reorg). *)
+let cf_clear_undo_data (t : t) : int =
+  cf_clear t t.cfh_undo_data ()

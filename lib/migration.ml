@@ -35,7 +35,14 @@ let data_log_path (chainstate_dir : string) : string =
 (* Progress checkpoint format: one line per CF, "namespace=count" (count
    of records routed to that CF so far, used as a sanity counter and
    user-facing display). The byte offset in data.log lives on its own
-   line as "offset=N" — that is the actual resume point. *)
+   line as "offset=N" — that is the actual resume point.
+
+   [n_torn] counts index entries that LogStorage refused to read because
+   their [(offset, vlen)] would have overrun the on-disk file (e.g.
+   data.log was truncated by a crash mid-write). It is surfaced from
+   [Storage.LogStorage.n_torn_records] after the walk completes and
+   blocks [.migration-complete] when non-zero, so an operator with a
+   torn datadir cannot silently lose records. *)
 type progress = {
   mutable offset : int;     (* next byte to read from data.log *)
   mutable n_block_header : int;
@@ -49,6 +56,7 @@ type progress = {
   mutable n_invalidated : int;
   mutable n_skipped : int;
   mutable n_unknown : int;
+  mutable n_torn : int;
 }
 
 let empty_progress () = {
@@ -64,6 +72,7 @@ let empty_progress () = {
   n_invalidated = 0;
   n_skipped = 0;
   n_unknown = 0;
+  n_torn = 0;
 }
 
 let write_progress (chainstate_dir : string) (p : progress) =
@@ -82,6 +91,7 @@ let write_progress (chainstate_dir : string) (p : progress) =
   Printf.fprintf oc "invalidated=%d\n" p.n_invalidated;
   Printf.fprintf oc "skipped=%d\n" p.n_skipped;
   Printf.fprintf oc "unknown=%d\n" p.n_unknown;
+  Printf.fprintf oc "torn=%d\n" p.n_torn;
   flush oc;
   (try Unix.fsync (Unix.descr_of_out_channel oc)
    with Unix.Unix_error _ -> ());
@@ -116,6 +126,7 @@ let read_progress (chainstate_dir : string) : progress =
           | "invalidated" -> p.n_invalidated <- n
           | "skipped" -> p.n_skipped <- n
           | "unknown" -> p.n_unknown <- n
+          | "torn" -> p.n_torn <- n
           | _ -> ()
       done
     with End_of_file -> ());
@@ -284,15 +295,22 @@ let migrate ?(checkpoint_every = 50_000) (chainstate_dir : string) : result =
     route_record cfdb p key (Some value);
     incr count;
     if !count mod checkpoint_every = 0 then begin
+      (* Surface torn-record count into the progress checkpoint so a
+         crash mid-walk leaves a paper trail even if the migration is
+         later resumed. *)
+      p.n_torn <- Storage.LogStorage.n_torn_records log;
       write_progress chainstate_dir p;
       Printf.eprintf
         "[migration] checkpoint: %d records routed (h=%d b=%d t=%d u=%d \
-         n=%d x=%d s=%d r=%d i=%d skipped=%d unknown=%d)\n%!"
+         n=%d x=%d s=%d r=%d i=%d skipped=%d unknown=%d torn=%d)\n%!"
         !count p.n_block_header p.n_block_data p.n_tx p.n_utxo
         p.n_block_height p.n_tx_index p.n_chain_state p.n_undo_data
-        p.n_invalidated p.n_skipped p.n_unknown
+        p.n_invalidated p.n_skipped p.n_unknown p.n_torn
     end
   );
+  (* Final torn-record snapshot — the iter_prefix walk just finished, so
+     LogStorage's [n_torn] counter is now stable at the true total. *)
+  p.n_torn <- Storage.LogStorage.n_torn_records log;
   write_progress chainstate_dir p;
   Cf_chainstate.close cfdb;
   Storage.LogStorage.close log;
@@ -331,17 +349,33 @@ let run ~(chainstate_dir : string) : int =
       let r = migrate chainstate_dir in
       Printf.eprintf
         "[migration] DONE: %d records routed (h=%d b=%d t=%d u=%d \
-         n=%d x=%d s=%d r=%d i=%d skipped=%d unknown=%d)\n%!"
+         n=%d x=%d s=%d r=%d i=%d skipped=%d unknown=%d torn=%d)\n%!"
         r.total_records r.progress.n_block_header r.progress.n_block_data
         r.progress.n_tx r.progress.n_utxo r.progress.n_block_height
         r.progress.n_tx_index r.progress.n_chain_state
         r.progress.n_undo_data r.progress.n_invalidated
-        r.progress.n_skipped r.progress.n_unknown;
+        r.progress.n_skipped r.progress.n_unknown r.progress.n_torn;
       if r.progress.n_unknown > 0 then begin
         Printf.eprintf
           "[migration] REFUSING to mark complete — %d unknown records seen\n%!"
           r.progress.n_unknown;
         2
+      end else if r.progress.n_torn > 0 then begin
+        (* Torn records are entries the LogStorage index claimed exist
+           but whose value bytes were not on disk (typical cause: the
+           writer process was killed mid-write). Migration cannot
+           silently complete — the operator must repair the source
+           (e.g. truncate data.log past the torn region, or restore
+           from a clean backup) and re-run. We do NOT rename data.log
+           in this case so the source is still in place for the next
+           attempt. *)
+        Printf.eprintf
+          "[migration] REFUSING to mark complete — %d torn record(s) skipped \
+           in data.log. Repair the source datadir (e.g. restore from backup, \
+           or truncate data.log past the last good record) and re-run. \
+           data.log left in place; .migration-complete NOT written.\n%!"
+          r.progress.n_torn;
+        4
       end else begin
         (* Rename data.log -> data.log.pre-migration-bak. Don't delete;
            the operator should manually unlink after sanity checks. *)

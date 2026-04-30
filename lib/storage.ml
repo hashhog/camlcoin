@@ -469,8 +469,26 @@ end
 (* Append-only log storage implementation.  All key-value pairs live in a
    single file (data.log) with an in-memory hash-table index that is rebuilt
    on open by scanning the log.  This avoids the filesystem-overhead-per-key
-   problem of FileStorage while requiring no external C libraries. *)
-module LogStorage : STORAGE = struct
+   problem of FileStorage while requiring no external C libraries.
+
+   This module is post-Option-D legacy: ChainDB now uses [Cf_chainstate]
+   directly, and LogStorage is retained read-only so [Migration] can
+   convert old [data.log] datadirs to the RocksDB CF layout. The signature
+   below extends [STORAGE] with [n_torn_records], which the migration
+   layer uses to detect index entries whose value bytes do not exist on
+   disk (typically the result of a process crash mid-write that left the
+   on-disk file shorter than the in-memory index claims). *)
+module LogStorage : sig
+  include STORAGE
+
+  (* Number of index entries skipped during [get] / [iter_prefix]
+     because the entry's [(offset, vlen)] would read past the live
+     end-of-file. Monotonically increasing for the lifetime of [t].
+     Zero on a clean datadir. The migration tool surfaces this so an
+     operator running with a torn [data.log] can see how many records
+     were unreachable. *)
+  val n_torn_records : t -> int
+end = struct
   (* [mutex] serializes access to data_fd + data_offset + index + deleted.
      The Validation_worker Domain calls [get] / [iter_prefix] concurrently
      with the main Lwt Domain's [put] / [delete] / [batch_write], and
@@ -485,6 +503,12 @@ module LogStorage : STORAGE = struct
     index : (string, int * int) Hashtbl.t;  (* key -> (value_offset, value_len) *)
     deleted : (string, unit) Hashtbl.t;
     mutex : Mutex.t;
+    (* [n_torn] counts index entries whose (offset, vlen) reads would
+       overrun the live end-of-file. Bumped from [get] / [iter_prefix]
+       when the bounds check fires. The migration sequencer reads this
+       at end-of-walk and refuses to write [.migration-complete] when
+       it is non-zero, so the operator sees the torn-record loss. *)
+    mutable n_torn : int;
   }
 
   type batch = (string * [`Put of string | `Delete]) list ref
@@ -811,15 +835,29 @@ module LogStorage : STORAGE = struct
           match op with
           | 'P' ->
             let klen = read_be32 ic in
+            (* Bound-check klen against remaining file bytes BEFORE reading
+               the key, so a torn header (e.g. klen-prefix written but
+               not the key bytes) raises Exit instead of really_input_string
+               raising End_of_file far past where we want to truncate. *)
+            if klen < 0 || pos_in ic + klen > flen then raise Exit;
             let key = really_input_string ic klen in
             let vlen = read_be32 ic in
             let value_offset = pos_in ic in
+            (* Same defence for vlen. Without this, a bogus or torn vlen
+               could seek past EOF — [seek_in] tolerates that, leaving
+               [pos_in] beyond [flen] — and the entry would be silently
+               recorded in the index pointing at bytes that do not exist
+               on disk. That is the precise stale-index condition that
+               broke the Apr 30 migration repro at iter_prefix time
+               (see CAMLCOIN-UTXO-DESIGN-MEMO-2026-04-29.md). *)
+            if vlen < 0 || value_offset + vlen > flen then raise Exit;
             seek_in ic (value_offset + vlen);
             Hashtbl.replace t.index key (value_offset, vlen);
             Hashtbl.remove t.deleted key;
             last_valid_pos := pos_in ic
           | 'D' ->
             let klen = read_be32 ic in
+            if klen < 0 || pos_in ic + klen > flen then raise Exit;
             let key = really_input_string ic klen in
             Hashtbl.remove t.index key;
             Hashtbl.replace t.deleted key ();
@@ -908,6 +946,7 @@ module LogStorage : STORAGE = struct
       index = Hashtbl.create 10000;
       deleted = Hashtbl.create 128;
       mutex = Mutex.create ();
+      n_torn = 0;
     } in
     (* Snapshot-then-delta path: if a valid data.log.idx is present,
        load it and only scan records appended after its watermark.
@@ -949,6 +988,37 @@ module LogStorage : STORAGE = struct
     Mutex.protect t.mutex (fun () ->
       (try Unix.fsync t.data_fd with Unix.Unix_error _ -> ()))
 
+  (* Live size of [data.log] via fstat on the open fd. The mutable
+     [t.data_offset] tracks our logical end, but [fstat.st_size] is the
+     ground truth observed by the kernel — and is the right thing to
+     bounds-check against when deciding whether an index entry's
+     [(offset, vlen)] would overrun EOF. On a clean datadir these two
+     agree. They diverge when the file was truncated externally, when a
+     prior process crashed mid-write before [data_offset] was updated,
+     or when a torn snapshot loaded index entries pointing past the
+     real on-disk bytes. *)
+  let data_log_size_unsafe t =
+    try (Unix.fstat t.data_fd).Unix.st_size
+    with Unix.Unix_error _ -> t.data_offset
+
+  (* True iff the index entry [(offset, vlen)] is fully readable from
+     the current data.log (offset >= 0, vlen >= 0, offset+vlen within
+     the file). On a [false] result, [t.n_torn] is incremented and a
+     warning is logged on the first occurrence. The caller is expected
+     to skip the entry. *)
+  let entry_fits_or_warn t key offset vlen flen =
+    if offset < 0 || vlen < 0 || offset + vlen > flen then begin
+      let prev = t.n_torn in
+      t.n_torn <- prev + 1;
+      if prev = 0 then
+        Printf.eprintf
+          "[LogStorage] torn record detected: key_len=%d offset=%d vlen=%d \
+           flen=%d (further torn records will be counted silently; total \
+           reported via n_torn_records)\n%!"
+          (String.length key) offset vlen flen;
+      false
+    end else true
+
   let get t key =
     Mutex.protect t.mutex (fun () ->
       if Hashtbl.mem t.deleted key then None
@@ -956,9 +1026,13 @@ module LogStorage : STORAGE = struct
         match Hashtbl.find_opt t.index key with
         | None -> None
         | Some (offset, vlen) ->
-          let _ = Unix.lseek t.data_fd offset Unix.SEEK_SET in
-          let buf = really_read_fd t.data_fd vlen in
-          Some (Bytes.to_string buf))
+          let flen = data_log_size_unsafe t in
+          if not (entry_fits_or_warn t key offset vlen flen) then None
+          else begin
+            let _ = Unix.lseek t.data_fd offset Unix.SEEK_SET in
+            let buf = really_read_fd t.data_fd vlen in
+            Some (Bytes.to_string buf)
+          end)
 
   let put t key value =
     Mutex.protect t.mutex (fun () -> append_put t key value)
@@ -991,20 +1065,36 @@ module LogStorage : STORAGE = struct
   let iter_prefix t prefix f =
     (* Snapshot (key, value) pairs matching prefix under the lock, then
        invoke [f] outside the critical section (same reasoning as
-       [iter_keys]). *)
+       [iter_keys]).
+
+       Tolerant of torn records: any index entry whose [(offset, vlen)]
+       reads would overrun the live end-of-file is skipped and counted
+       in [t.n_torn]. Without this guard a single bad entry — produced
+       by a process crash mid-write, a truncated snapshot, or any other
+       index/file mismatch — raises [End_of_file] inside [Hashtbl.fold]
+       and aborts the entire walk before [f] is invoked even once,
+       which is exactly the failure observed in the Apr 28 mainnet
+       crash + Apr 30 migration repro (see CAMLCOIN-UTXO-DESIGN-MEMO-
+       2026-04-29.md and the Apr 30 prompt). *)
     let prefix_len = String.length prefix in
     let entries =
       Mutex.protect t.mutex (fun () ->
+        let flen = data_log_size_unsafe t in
         Hashtbl.fold (fun k (offset, vlen) acc ->
           if String.length k >= prefix_len &&
              String.sub k 0 prefix_len = prefix then begin
-            let _ = Unix.lseek t.data_fd offset Unix.SEEK_SET in
-            let buf = really_read_fd t.data_fd vlen in
-            (k, Bytes.to_string buf) :: acc
+            if not (entry_fits_or_warn t k offset vlen flen) then acc
+            else begin
+              let _ = Unix.lseek t.data_fd offset Unix.SEEK_SET in
+              let buf = really_read_fd t.data_fd vlen in
+              (k, Bytes.to_string buf) :: acc
+            end
           end else acc
         ) t.index [])
     in
     List.iter (fun (k, v) -> f k v) entries
+
+  let n_torn_records t = t.n_torn
 end
 
 (* Key prefix constants for namespace separation *)

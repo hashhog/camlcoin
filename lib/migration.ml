@@ -1,9 +1,9 @@
-(* Migration: LogStorage -> Cf_chainstate (Option D, step 2).
+(* Migration: legacy [data.log] -> Cf_chainstate (Option D, step 2).
 
-   Reads every record from an existing [data.log] (LogStorage), routes it
-   to the matching RocksDB column family in [Cf_chainstate], and records
-   progress in a checkpoint file so a crashed migration resumes without
-   redoing work or losing records.
+   Reads every record from an existing [data.log] (the retired LogStorage
+   on-disk format), routes it to the matching RocksDB column family in
+   [Cf_chainstate], and records progress in a checkpoint file so a
+   crashed migration resumes without redoing work or losing records.
 
    Idempotent: re-running on a partially or fully migrated datadir is a
    no-op (it skips records whose CF entry already exists).
@@ -14,11 +14,549 @@
    operator is expected to run the migration command and inspect the
    exit status before re-launching the daemon.
 
-   The output CFs match the 9 LogStorage namespaces:
+   The output CFs match the 9 legacy namespaces:
      [h] -> CF_BLOCK_HEADER, [b] -> CF_BLOCK_DATA, [t] -> CF_TX,
      [u] -> CF_UTXO, [n] -> CF_BLOCK_HEIGHT, [x] -> CF_TX_INDEX,
      [s] -> CF_CHAIN_STATE, [r] -> CF_UNDO_DATA, [i] -> CF_INVALIDATED.
-*)
+
+   The legacy LogStorage source code (writer, WAL, multi-Domain mutex)
+   has been retired now that mainnet is on RocksDB CFs. The [Log_reader]
+   submodule below contains the minimum read-only logic needed to walk
+   a pre-Option-D [data.log]: open in append mode (so rebuild_index can
+   truncate any torn tail), load + delta-scan an existing snapshot if
+   present, replay the WAL, expose [iter] and [get], and surface the
+   torn-record count so the migration sequencer can refuse to mark
+   complete on a damaged source.
+
+   [Log_writer] is a tiny on-disk-format-compatible writer used only by
+   the test suite to build synthetic [data.log] fixtures. It has no
+   production callers; keeping reader+writer in the same module is the
+   cleanest place to keep the format definition co-located. *)
+
+(* ============================================================================
+   Log_reader: read-only handle on a legacy LogStorage [data.log] datadir.
+
+   Surface used by the migration sequencer:
+     - [open_for_migration path] open the on-disk store, replay any WAL,
+       load a valid snapshot if present, truncate a torn tail.
+     - [iter t f] walk every (key, value) live pair, tolerant of torn
+       index entries (skipped + counted in [n_torn]).
+     - [get t key] random-access lookup, also torn-tolerant.
+     - [n_torn t] count of skipped entries (zero on a clean datadir).
+     - [close t] close the underlying fd (no writes).
+
+   Log_writer: tiny on-disk-format-compatible writer for tests. NOT part
+   of the production API; used by [test/test_migration.ml] to build
+   synthetic [data.log] fixtures.
+
+   The format is unchanged from the retired Storage.LogStorage:
+     - data.log is an append-only stream of records:
+         'P' BE32(klen) key BE32(vlen) value
+         'D' BE32(klen) key
+     - data.log.idx is an optional close-time snapshot:
+         "CAMLIDX1" BE32(version) BE64(watermark) BE64(n_idx) BE64(n_del)
+         { BE32(klen) key BE64(off) BE32(vlen) }*  (* index *)
+         { BE32(klen) key }*                       (* deleted set *)
+         "CAMLIDX1"                                (* trailer *)
+     - _wal_journal is a write-ahead log:
+         { 'P' BE32(klen) key BE32(vlen) value
+         | 'D' BE32(klen) key }*
+         "WALVALID"                                (* trailer *)
+
+   Tolerance for torn records is preserved exactly as in storage.ml@e4068de:
+   the rebuild_index path truncates a torn tail; the index lookup path
+   bounds-checks (offset, vlen) against the live file size and skips
+   entries that would overrun, bumping [n_torn].
+   ========================================================================== *)
+module Log_reader = struct
+  type t = {
+    base_dir : string;
+    mutable data_fd : Unix.file_descr;
+    mutable data_offset : int;
+    index : (string, int * int) Hashtbl.t;  (* key -> (value_offset, value_len) *)
+    deleted : (string, unit) Hashtbl.t;
+    mutable n_torn : int;
+  }
+
+  let ensure_dir path =
+    try Unix.mkdir path 0o755
+    with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
+
+  let data_log_path t = Filename.concat t.base_dir "data.log"
+  let wal_path t = Filename.concat t.base_dir "_wal_journal"
+  let snapshot_path t = Filename.concat t.base_dir "data.log.idx"
+
+  let snapshot_magic = "CAMLIDX1"
+  let snapshot_version = 1
+  let wal_magic = "WALVALID"
+
+  let write_be32 oc n =
+    output_byte oc ((n lsr 24) land 0xff);
+    output_byte oc ((n lsr 16) land 0xff);
+    output_byte oc ((n lsr 8)  land 0xff);
+    output_byte oc ( n         land 0xff)
+
+  let read_be32 ic =
+    let b0 = input_byte ic in
+    let b1 = input_byte ic in
+    let b2 = input_byte ic in
+    let b3 = input_byte ic in
+    (b0 lsl 24) lor (b1 lsl 16) lor (b2 lsl 8) lor b3
+
+  let read_be64 ic =
+    let r = ref 0 in
+    for _ = 0 to 7 do
+      r := (!r lsl 8) lor (input_byte ic)
+    done;
+    !r
+
+  let really_read_fd fd len =
+    let buf = Bytes.create len in
+    let rec loop off rem =
+      if rem <= 0 then ()
+      else
+        let n = Unix.read fd buf off rem in
+        if n = 0 then raise End_of_file;
+        loop (off + n) (rem - n)
+    in
+    loop 0 len;
+    buf
+
+  (* Defense against torn write_snapshot renames: scan for orphan
+     *.tmp files in the chainstate dir and remove any older than
+     [stale_age_seconds]. Safe to call before any reads. *)
+  let cleanup_orphan_tmp_files ?(stale_age_seconds = 60.0) chainstate_dir =
+    if Sys.file_exists chainstate_dir && Sys.is_directory chainstate_dir then begin
+      let now = Unix.time () in
+      let entries =
+        try Sys.readdir chainstate_dir
+        with Sys_error _ -> [||]
+      in
+      Array.iter (fun name ->
+        if Filename.check_suffix name ".tmp" then begin
+          let full = Filename.concat chainstate_dir name in
+          match (try Some (Unix.lstat full) with Unix.Unix_error _ -> None) with
+          | Some st when st.Unix.st_kind = Unix.S_REG ->
+            let age = now -. st.Unix.st_mtime in
+            if age >= stale_age_seconds then
+              (try Unix.unlink full with Unix.Unix_error _ -> ())
+          | _ -> ()
+        end
+      ) entries
+    end
+
+  let try_load_snapshot t =
+    let path = snapshot_path t in
+    if not (Sys.file_exists path) then None
+    else begin
+      let ic = open_in_bin path in
+      let flen = in_channel_length ic in
+      let ok = ref true in
+      let watermark = ref 0 in
+      let magic_len = String.length snapshot_magic in
+      (try
+        if flen < magic_len * 2 + 4 + 8 + 8 + 8 then raise Exit;
+        seek_in ic (flen - magic_len);
+        let tail = really_input_string ic magic_len in
+        if tail <> snapshot_magic then raise Exit;
+        seek_in ic 0;
+        let head = really_input_string ic magic_len in
+        if head <> snapshot_magic then raise Exit;
+        let version = read_be32 ic in
+        if version <> snapshot_version then raise Exit;
+        watermark := read_be64 ic;
+        let n_idx = read_be64 ic in
+        let n_del = read_be64 ic in
+        let data_path = data_log_path t in
+        let data_len =
+          if Sys.file_exists data_path then
+            let dic = open_in_bin data_path in
+            let l = in_channel_length dic in
+            close_in dic; l
+          else 0
+        in
+        if !watermark > data_len then raise Exit;
+        for _ = 1 to n_idx do
+          let klen = read_be32 ic in
+          let key = really_input_string ic klen in
+          let off = read_be64 ic in
+          let vlen = read_be32 ic in
+          Hashtbl.replace t.index key (off, vlen)
+        done;
+        for _ = 1 to n_del do
+          let klen = read_be32 ic in
+          let key = really_input_string ic klen in
+          Hashtbl.replace t.deleted key ()
+        done
+      with _ -> ok := false);
+      close_in ic;
+      if !ok then Some !watermark
+      else begin
+        Hashtbl.reset t.index;
+        Hashtbl.reset t.deleted;
+        None
+      end
+    end
+
+  (* Scan data.log from [start] to EOF, applying each record to the index
+     and deleted tables. Tolerates a torn tail: any record whose declared
+     length would overrun the file is detected (Exit), and the file is
+     truncated at the last fully-valid record offset so the next open is
+     clean. *)
+  let rebuild_index_from_offset t ~start =
+    let path = data_log_path t in
+    if not (Sys.file_exists path) then begin
+      t.data_offset <- 0
+    end else begin
+      let ic = open_in_bin path in
+      let flen = in_channel_length ic in
+      seek_in ic start;
+      let last_valid_pos = ref start in
+      (try
+        while pos_in ic < flen do
+          let op = input_char ic in
+          match op with
+          | 'P' ->
+            let klen = read_be32 ic in
+            if klen < 0 || pos_in ic + klen > flen then raise Exit;
+            let key = really_input_string ic klen in
+            let vlen = read_be32 ic in
+            let value_offset = pos_in ic in
+            if vlen < 0 || value_offset + vlen > flen then raise Exit;
+            seek_in ic (value_offset + vlen);
+            Hashtbl.replace t.index key (value_offset, vlen);
+            Hashtbl.remove t.deleted key;
+            last_valid_pos := pos_in ic
+          | 'D' ->
+            let klen = read_be32 ic in
+            if klen < 0 || pos_in ic + klen > flen then raise Exit;
+            let key = really_input_string ic klen in
+            Hashtbl.remove t.index key;
+            Hashtbl.replace t.deleted key ();
+            last_valid_pos := pos_in ic
+          | _ -> raise Exit
+        done
+      with Exit | End_of_file -> ());
+      close_in ic;
+      if !last_valid_pos < flen then
+        Unix.truncate path !last_valid_pos;
+      t.data_offset <- !last_valid_pos
+    end
+
+  let rebuild_index t = rebuild_index_from_offset t ~start:0
+
+  (* WAL replay. The on-disk format and tolerance match the retired
+     LogStorage: a torn WAL (no trailing magic, or any opcode fault) is
+     discarded and the file unlinked. A valid WAL is replayed by
+     appending records to data.log just like the original writer did,
+     so the migration sees a self-consistent live set. *)
+  let wal_read jpath =
+    if not (Sys.file_exists jpath) then None
+    else begin
+      let ic = open_in_bin jpath in
+      let flen = in_channel_length ic in
+      if flen < String.length wal_magic then begin
+        close_in ic;
+        None
+      end else begin
+        seek_in ic (flen - String.length wal_magic);
+        let tail = really_input_string ic (String.length wal_magic) in
+        if tail <> wal_magic then begin
+          close_in ic;
+          None
+        end else begin
+          seek_in ic 0;
+          let data_len = flen - String.length wal_magic in
+          let ops = ref [] in
+          let valid = ref true in
+          (try
+            while pos_in ic < data_len do
+              let op_byte = input_char ic in
+              match op_byte with
+              | 'P' ->
+                let klen = read_be32 ic in
+                let key = really_input_string ic klen in
+                let vlen = read_be32 ic in
+                let value = really_input_string ic vlen in
+                ops := (key, `Put value) :: !ops
+              | 'D' ->
+                let klen = read_be32 ic in
+                let key = really_input_string ic klen in
+                ops := (key, `Delete) :: !ops
+              | _ ->
+                valid := false;
+                raise Exit
+            done
+          with
+          | End_of_file -> valid := false
+          | Exit -> ());
+          close_in ic;
+          if !valid then Some (List.rev !ops) else None
+        end
+      end
+    end
+
+  let write_be32_bytes n =
+    let b = Bytes.create 4 in
+    Bytes.set b 0 (Char.chr ((n lsr 24) land 0xff));
+    Bytes.set b 1 (Char.chr ((n lsr 16) land 0xff));
+    Bytes.set b 2 (Char.chr ((n lsr 8)  land 0xff));
+    Bytes.set b 3 (Char.chr ( n         land 0xff));
+    b
+
+  let append_raw t s =
+    let b = Bytes.of_string s in
+    let len = Bytes.length b in
+    let rec loop off rem =
+      if rem <= 0 then ()
+      else
+        let n = Unix.write t.data_fd b off rem in
+        loop (off + n) (rem - n)
+    in
+    loop 0 len;
+    t.data_offset <- t.data_offset + len
+
+  let append_raw_bytes t b =
+    let len = Bytes.length b in
+    let rec loop off rem =
+      if rem <= 0 then ()
+      else
+        let n = Unix.write t.data_fd b off rem in
+        loop (off + n) (rem - n)
+    in
+    loop 0 len;
+    t.data_offset <- t.data_offset + len
+
+  let append_put t key value =
+    append_raw t "P";
+    let klen = String.length key in
+    append_raw_bytes t (write_be32_bytes klen);
+    append_raw t key;
+    let vlen = String.length value in
+    append_raw_bytes t (write_be32_bytes vlen);
+    let value_offset = t.data_offset in
+    append_raw t value;
+    Hashtbl.replace t.index key (value_offset, vlen);
+    Hashtbl.remove t.deleted key
+
+  let append_delete t key =
+    append_raw t "D";
+    let klen = String.length key in
+    append_raw_bytes t (write_be32_bytes klen);
+    append_raw t key;
+    Hashtbl.remove t.index key;
+    Hashtbl.replace t.deleted key ()
+
+  let apply_ops t (ops : (string * [`Put of string | `Delete]) list) =
+    List.iter (fun (key, op) ->
+      match op with
+      | `Put value -> append_put t key value
+      | `Delete -> append_delete t key
+    ) ops
+
+  let wal_delete t =
+    let jpath = wal_path t in
+    (try Unix.unlink jpath with Unix.Unix_error _ -> ())
+
+  let open_for_migration path =
+    ensure_dir path;
+    cleanup_orphan_tmp_files path;
+    let log_path = Filename.concat path "data.log" in
+    if not (Sys.file_exists log_path) then begin
+      let fd = Unix.openfile log_path [Unix.O_CREAT; Unix.O_WRONLY] 0o644 in
+      Unix.close fd
+    end;
+    let fd = Unix.openfile log_path [Unix.O_RDWR; Unix.O_APPEND] 0o644 in
+    let t = {
+      base_dir = path;
+      data_fd = fd;
+      data_offset = 0;
+      index = Hashtbl.create 10000;
+      deleted = Hashtbl.create 128;
+      n_torn = 0;
+    } in
+    (match try_load_snapshot t with
+     | Some watermark ->
+       rebuild_index_from_offset t ~start:watermark
+     | None ->
+       rebuild_index t);
+    let jpath = wal_path t in
+    (match wal_read jpath with
+     | None ->
+       (try Unix.unlink jpath with Unix.Unix_error _ -> ())
+     | Some ops ->
+       apply_ops t ops;
+       wal_delete t);
+    t
+
+  let close t =
+    (try Unix.close t.data_fd with Unix.Unix_error _ -> ())
+
+  let data_log_size_unsafe t =
+    try (Unix.fstat t.data_fd).Unix.st_size
+    with Unix.Unix_error _ -> t.data_offset
+
+  let entry_fits_or_warn t _key offset vlen flen =
+    if offset < 0 || vlen < 0 || offset + vlen > flen then begin
+      t.n_torn <- t.n_torn + 1;
+      false
+    end else true
+
+  let get t key =
+    if Hashtbl.mem t.deleted key then None
+    else
+      match Hashtbl.find_opt t.index key with
+      | None -> None
+      | Some (offset, vlen) ->
+        let flen = data_log_size_unsafe t in
+        if not (entry_fits_or_warn t key offset vlen flen) then None
+        else begin
+          let _ = Unix.lseek t.data_fd offset Unix.SEEK_SET in
+          let buf = really_read_fd t.data_fd vlen in
+          Some (Bytes.to_string buf)
+        end
+
+  let iter t f =
+    let prefix_len = 0 in
+    let prefix = "" in
+    let flen = data_log_size_unsafe t in
+    let entries =
+      Hashtbl.fold (fun k (offset, vlen) acc ->
+        if String.length k >= prefix_len &&
+           String.sub k 0 prefix_len = prefix then begin
+          if not (entry_fits_or_warn t k offset vlen flen) then acc
+          else begin
+            let _ = Unix.lseek t.data_fd offset Unix.SEEK_SET in
+            let buf = really_read_fd t.data_fd vlen in
+            (k, Bytes.to_string buf) :: acc
+          end
+        end else acc
+      ) t.index []
+    in
+    List.iter (fun (k, v) -> f k v) entries
+
+  let n_torn t = t.n_torn
+end
+
+(* ============================================================================
+   Log_writer: synthetic-fixture writer for tests only.
+
+   Implements the same on-disk format as Log_reader but with a minimal,
+   single-Domain API (no mutex, no WAL — tests don't need crash safety).
+   Closing writes a snapshot file so that the synthetic datadir round-trips
+   through Log_reader's open_for_migration path the same way a closed
+   pre-Option-D datadir would have.
+   ========================================================================== *)
+module Log_writer = struct
+  type t = {
+    base_dir : string;
+    data_fd : Unix.file_descr;
+    mutable data_offset : int;
+    index : (string, int * int) Hashtbl.t;
+    deleted : (string, unit) Hashtbl.t;
+  }
+
+  let ensure_dir path =
+    try Unix.mkdir path 0o755
+    with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
+
+  let write_be32 oc n =
+    output_byte oc ((n lsr 24) land 0xff);
+    output_byte oc ((n lsr 16) land 0xff);
+    output_byte oc ((n lsr 8)  land 0xff);
+    output_byte oc ( n         land 0xff)
+
+  let write_be32_bytes n =
+    let b = Bytes.create 4 in
+    Bytes.set b 0 (Char.chr ((n lsr 24) land 0xff));
+    Bytes.set b 1 (Char.chr ((n lsr 16) land 0xff));
+    Bytes.set b 2 (Char.chr ((n lsr 8)  land 0xff));
+    Bytes.set b 3 (Char.chr ( n         land 0xff));
+    b
+
+  let write_be64_bytes n =
+    let b = Bytes.create 8 in
+    for i = 0 to 7 do
+      Bytes.set b (7 - i) (Char.chr ((n lsr (i * 8)) land 0xff))
+    done;
+    b
+
+  let snapshot_path t = Filename.concat t.base_dir "data.log.idx"
+  let snapshot_tmp_path t = Filename.concat t.base_dir "data.log.idx.tmp"
+  let snapshot_magic = "CAMLIDX1"
+  let snapshot_version = 1
+
+  let append_bytes t b =
+    let len = Bytes.length b in
+    let rec loop off rem =
+      if rem <= 0 then ()
+      else
+        let n = Unix.write t.data_fd b off rem in
+        loop (off + n) (rem - n)
+    in
+    loop 0 len;
+    t.data_offset <- t.data_offset + len
+
+  let append_string t s = append_bytes t (Bytes.of_string s)
+
+  let open_db path =
+    ensure_dir path;
+    let log_path = Filename.concat path "data.log" in
+    if not (Sys.file_exists log_path) then begin
+      let fd = Unix.openfile log_path [Unix.O_CREAT; Unix.O_WRONLY] 0o644 in
+      Unix.close fd
+    end;
+    let fd = Unix.openfile log_path [Unix.O_RDWR; Unix.O_APPEND] 0o644 in
+    (* Compute initial offset = current file size so puts append. *)
+    let off = (Unix.fstat fd).Unix.st_size in
+    { base_dir = path;
+      data_fd = fd;
+      data_offset = off;
+      index = Hashtbl.create 64;
+      deleted = Hashtbl.create 16 }
+
+  let put t key value =
+    append_string t "P";
+    append_bytes t (write_be32_bytes (String.length key));
+    append_string t key;
+    append_bytes t (write_be32_bytes (String.length value));
+    let value_offset = t.data_offset in
+    append_string t value;
+    Hashtbl.replace t.index key (value_offset, String.length value);
+    Hashtbl.remove t.deleted key
+
+  (* Write a close-time snapshot mirroring the retired LogStorage format,
+     so torn-snapshot tests can patch the watermark after close. *)
+  let write_snapshot t =
+    let tmp = snapshot_tmp_path t in
+    let oc = open_out_bin tmp in
+    output_string oc snapshot_magic;
+    write_be32 oc snapshot_version;
+    output_bytes oc (write_be64_bytes t.data_offset);
+    output_bytes oc (write_be64_bytes (Hashtbl.length t.index));
+    output_bytes oc (write_be64_bytes (Hashtbl.length t.deleted));
+    Hashtbl.iter (fun k (off, vlen) ->
+      write_be32 oc (String.length k);
+      output_string oc k;
+      output_bytes oc (write_be64_bytes off);
+      write_be32 oc vlen
+    ) t.index;
+    Hashtbl.iter (fun k () ->
+      write_be32 oc (String.length k);
+      output_string oc k
+    ) t.deleted;
+    output_string oc snapshot_magic;
+    flush oc;
+    (try Unix.fsync (Unix.descr_of_out_channel oc)
+     with Unix.Unix_error _ -> ());
+    close_out oc;
+    Unix.rename tmp (snapshot_path t)
+
+  let close t =
+    (try Unix.fsync t.data_fd with Unix.Unix_error _ -> ());
+    (try write_snapshot t with _ -> ());
+    (try Unix.close t.data_fd with Unix.Unix_error _ -> ())
+end
 
 let progress_file (chainstate_dir : string) : string =
   Filename.concat chainstate_dir ".migration-progress"
@@ -262,12 +800,12 @@ let route_record (cfdb : Cf_chainstate.t) (p : progress)
 (* Migration sequencer.
 
    Strategy: instead of byte-replaying the on-disk data.log (which
-   contains tombstoned + overwritten records), we open the LogStorage
-   normally — letting it rebuild its in-memory index, replay the WAL,
-   and present the *live* set of (key, value) pairs — and stream that
-   into RocksDB CFs. This is simpler, correct in the presence of
-   tombstones, and matches how LogStorage's own [iter_keys] already
-   walks the live set.
+   contains tombstoned + overwritten records), we open the legacy
+   data.log via [Log_reader.open_for_migration] — letting it rebuild
+   its in-memory index, replay the WAL, and present the *live* set of
+   (key, value) pairs — and stream that into RocksDB CFs. This is
+   simpler, correct in the presence of tombstones, and matches how the
+   retired LogStorage's own [iter_keys] walked the live set.
 
    For idempotency we use [route_record] which checks-then-writes per
    key; running migration twice on the same datadir is a no-op for
@@ -275,7 +813,7 @@ let route_record (cfdb : Cf_chainstate.t) (p : progress)
 
    For crash resumption we checkpoint progress periodically (every N
    records) and after every CF batch flush. On restart we re-open both
-   stores and re-walk the LogStorage index — duplicates short-circuit.
+   stores and re-walk the legacy index — duplicates short-circuit.
 *)
 
 type result = {
@@ -283,22 +821,22 @@ type result = {
   total_records : int;
 }
 
-(* Walk LogStorage's index, route each (key, value) into the right CF.
-   Checkpoints progress every [checkpoint_every] records. *)
+(* Walk the legacy data.log's index, route each (key, value) into the
+   right CF. Checkpoints progress every [checkpoint_every] records. *)
 let migrate ?(checkpoint_every = 50_000) (chainstate_dir : string) : result =
-  let log = Storage.LogStorage.open_db chainstate_dir in
+  let log = Log_reader.open_for_migration chainstate_dir in
   let cfdb_path = Filename.concat chainstate_dir "chainstate-rocks" in
   let cfdb = Cf_chainstate.open_db cfdb_path in
   let p = read_progress chainstate_dir in
   let count = ref 0 in
-  Storage.LogStorage.iter_prefix log "" (fun key value ->
+  Log_reader.iter log (fun key value ->
     route_record cfdb p key (Some value);
     incr count;
     if !count mod checkpoint_every = 0 then begin
       (* Surface torn-record count into the progress checkpoint so a
          crash mid-walk leaves a paper trail even if the migration is
          later resumed. *)
-      p.n_torn <- Storage.LogStorage.n_torn_records log;
+      p.n_torn <- Log_reader.n_torn log;
       write_progress chainstate_dir p;
       Printf.eprintf
         "[migration] checkpoint: %d records routed (h=%d b=%d t=%d u=%d \
@@ -308,12 +846,12 @@ let migrate ?(checkpoint_every = 50_000) (chainstate_dir : string) : result =
         p.n_invalidated p.n_skipped p.n_unknown p.n_torn
     end
   );
-  (* Final torn-record snapshot — the iter_prefix walk just finished, so
-     LogStorage's [n_torn] counter is now stable at the true total. *)
-  p.n_torn <- Storage.LogStorage.n_torn_records log;
+  (* Final torn-record snapshot — the iter walk just finished, so
+     Log_reader's [n_torn] counter is now stable at the true total. *)
+  p.n_torn <- Log_reader.n_torn log;
   write_progress chainstate_dir p;
   Cf_chainstate.close cfdb;
-  Storage.LogStorage.close log;
+  Log_reader.close log;
   { progress = p; total_records = !count }
 
 (* Public entry point. Returns 0 on success, non-zero on failure.
@@ -343,7 +881,7 @@ let run ~(chainstate_dir : string) : int =
       0
     end
   end else begin
-    Printf.eprintf "[migration] starting LogStorage -> RocksDB CF migration\n%!";
+    Printf.eprintf "[migration] starting legacy data.log -> RocksDB CF migration\n%!";
     Printf.eprintf "[migration] chainstate_dir=%s\n%!" chainstate_dir;
     (try
       let r = migrate chainstate_dir in

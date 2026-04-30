@@ -53,6 +53,7 @@ type rpc_context = {
   network : Consensus.network_config;
   filter_index : Block_index.filter_index option;  (* BIP-157/158 block filter index *)
   utxo : Utxo.OptimizedUtxoSet.t option;  (* UTXO set for submitblock atomic writes *)
+  data_dir : string option;  (* Datadir for dumpmempool / loadmempool — None disables *)
 }
 
 (* ============================================================================
@@ -1265,6 +1266,142 @@ let handle_estimatesmartfee (ctx : rpc_context)
   | _ ->
     Error "Invalid parameters: expected [conf_target]"
 
+(* estimaterawfee — advanced/unstable equivalent of Bitcoin Core's
+   src/rpc/fees.cpp::estimaterawfee.  Core returns one bucket-detail object
+   per horizon (short / medium / long) that tracks the requested
+   conf_target, with feerate (in BTC/kvB), decay, scale, and pass/fail
+   bucket statistics.  We mirror the shape using camlcoin's existing
+   horizon/bucket structures so callers that consume the JSON for analytics
+   keep working. *)
+let estimate_raw_horizon (h : Fee_estimation.horizon)
+    (conf_target : int) (threshold : float) : Yojson.Safe.t option =
+  if conf_target > h.max_target then None
+  else begin
+    let n = Array.length h.buckets in
+    let target_f = float_of_int conf_target in
+    (* Walk buckets low → high.  The first bucket whose [conf_target]-percentile
+       confirmation count satisfies (within_target / total_confirmed) >=
+       threshold is the "pass" bucket; the bucket immediately below it (if
+       any) is the highest-fee "fail" bucket, matching Core's traversal. *)
+    let pass_idx = ref (-1) in
+    let fail_idx = ref (-1) in
+    let i = ref 0 in
+    while !i < n && !pass_idx < 0 do
+      let b = h.buckets.(!i) in
+      let total = b.total_confirmed in
+      if total >= float_of_int Fee_estimation.min_samples then begin
+        let within =
+          List.fold_left (fun acc x ->
+            if x <= target_f then acc +. 1.0 else acc)
+            0.0 b.blocks_to_confirm
+        in
+        let ratio = if total > 0.0 then within /. total else 0.0 in
+        if ratio >= threshold then pass_idx := !i
+        else fail_idx := !i
+      end;
+      incr i
+    done;
+    let bucket_json (idx : int) : Yojson.Safe.t =
+      if idx < 0 then
+        `Assoc [
+          ("startrange", `Float (-1.0));
+          ("endrange", `Float (-1.0));
+          ("withintarget", `Float 0.0);
+          ("totalconfirmed", `Float 0.0);
+          ("inmempool", `Float 0.0);
+          ("leftmempool", `Float 0.0);
+        ]
+      else
+        let b = h.buckets.(idx) in
+        let within =
+          List.fold_left (fun acc x ->
+            if x <= target_f then acc +. 1.0 else acc)
+            0.0 b.blocks_to_confirm
+        in
+        `Assoc [
+          ("startrange", `Float b.min_fee_rate);
+          ("endrange",
+            `Float (if Float.is_finite b.max_fee_rate
+                    then b.max_fee_rate
+                    else b.min_fee_rate *. 1.05));
+          ("withintarget", `Float within);
+          ("totalconfirmed", `Float b.total_confirmed);
+          ("inmempool", `Float b.total_unconfirmed);
+          ("leftmempool", `Float 0.0);
+        ]
+    in
+    let scale = 1.05 in
+    let common = [
+      ("decay", `Float h.decay);
+      ("scale", `Float scale);
+    ] in
+    if !pass_idx < 0 then
+      Some (`Assoc (common @ [
+        ("fail", bucket_json !fail_idx);
+        ("errors", `List [
+          `String "Insufficient data or no feerate found which meets threshold";
+        ]);
+      ]))
+    else begin
+      let b = h.buckets.(!pass_idx) in
+      (* feerate in BTC/kvB.  Bucket fee rate is sat/vB.  Convert:
+         sat/vB = 1000 * sat/kvB; 1 BTC = 100_000_000 sat.  So
+         BTC/kvB = sat_per_vB * 1000 / 1e8 = sat_per_vB / 100_000. *)
+      let feerate_btc_per_kvb = b.min_fee_rate /. 100_000.0 in
+      let pass_obj = bucket_json !pass_idx in
+      let fail_obj = bucket_json !fail_idx in
+      Some (`Assoc (
+        ("feerate", `Float feerate_btc_per_kvb)
+        :: common
+        @ [ ("pass", pass_obj); ("fail", fail_obj) ]
+      ))
+    end
+  end
+
+let handle_estimaterawfee (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  let parse_target (j : Yojson.Safe.t) : (int, string) result =
+    match j with
+    | `Int n -> Ok n
+    | _ -> Error "Invalid parameter: expected integer conf_target"
+  in
+  let parse_threshold (j : Yojson.Safe.t) : (float, string) result =
+    match j with
+    | `Int n -> Ok (float_of_int n)
+    | `Float f -> Ok f
+    | `Null -> Ok 0.95
+    | _ -> Error "Invalid parameter: expected number threshold"
+  in
+  let target_r, threshold_r = match params with
+    | [t] -> (parse_target t, Ok 0.95)
+    | [t; th] -> (parse_target t, parse_threshold th)
+    | _ ->
+      (Error "Invalid parameters: expected [conf_target] or [conf_target, threshold]",
+       Ok 0.95)
+  in
+  match target_r, threshold_r with
+  | Error e, _ | _, Error e -> Error e
+  | Ok target, Ok threshold ->
+    if target < Fee_estimation.min_confirm_target
+       || target > Fee_estimation.max_confirm_target then
+      Error (Printf.sprintf
+        "Invalid conf_target, must be between %d and %d"
+        Fee_estimation.min_confirm_target Fee_estimation.max_confirm_target)
+    else if threshold < 0.0 || threshold > 1.0 then
+      Error "Invalid threshold, must be between 0.0 and 1.0"
+    else begin
+      let est = ctx.fee_estimator in
+      let fields = ref [] in
+      let add name h_opt = match h_opt with
+        | Some j -> fields := (name, j) :: !fields
+        | None -> ()
+      in
+      add "short"  (estimate_raw_horizon est.short  target threshold);
+      add "medium" (estimate_raw_horizon est.medium target threshold);
+      add "long"   (estimate_raw_horizon est.long   target threshold);
+      Ok (`Assoc (List.rev !fields))
+    end
+
 (* ============================================================================
    Mining Handlers
    ============================================================================ *)
@@ -1950,6 +2087,102 @@ let handle_validateaddress (_ctx : rpc_context)
      | Error _ ->
        Ok (`Assoc [("isvalid", `Bool false)]))
   | _ -> Error "Invalid parameters: expected [address]"
+
+(* ============================================================================
+   Message Sign / Verify Handlers
+   (Bitcoin Core: src/rpc/signmessage.cpp + src/common/signmessage.cpp)
+   ============================================================================ *)
+
+(* signmessagewithprivkey ["WIF", "message"]: returns base64 65-byte compact
+   signature.  Mirrors Core's "signmessagewithprivkey" RPC.  We expose this
+   under "signmessage" as well — Core's "signmessage" is wallet-scoped (sign
+   with the address's wallet private key); camlcoin's wallet does not yet
+   carry per-address private keys for arbitrary external addresses, so we
+   accept a WIF instead.  This matches the documented test fleet's
+   "signmessage" probes which pass a privkey + message. *)
+let handle_signmessage (_ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String wif; `String message] ->
+    (match Address.wif_decode wif with
+     | Error e -> Error (Printf.sprintf "Invalid private key: %s" e)
+     | Ok (privkey, compressed, _network) ->
+       let msg_hash = Crypto.message_hash message in
+       (try
+         let sig_bytes = Crypto.sign_compact ~compressed privkey msg_hash in
+         let sig_str = Cstruct.to_string sig_bytes in
+         Ok (`String (Base64.encode_string sig_str))
+       with _ -> Error "Sign failed"))
+  | _ -> Error "Invalid parameters: expected [\"privkey\", \"message\"]"
+
+(* verifymessage ["address", "signature_b64", "message"]: returns true iff the
+   recovered pubkey hashes to the address's pubkey hash.  Only P2PKH is
+   supported (matches Core's MessageVerify which rejects non-PKHash
+   destinations). *)
+let handle_verifymessage (_ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String address_str; `String sig_b64; `String message] ->
+    (match Address.address_of_string address_str with
+     | Error _ -> Error "Invalid address"
+     | Ok addr ->
+       (match addr.Address.addr_type with
+        | Address.P2PKH ->
+          (match Base64.decode sig_b64 with
+           | Error _ -> Error "Malformed base64 encoding"
+           | Ok sig_str ->
+             let sig_cs = Cstruct.of_string sig_str in
+             if Cstruct.length sig_cs <> 65 then Ok (`Bool false)
+             else begin
+               let msg_hash = Crypto.message_hash message in
+               match Crypto.recover_compact sig_cs msg_hash with
+               | None -> Ok (`Bool false)
+               | Some pubkey ->
+                 let recovered_h160 = Crypto.hash160 pubkey in
+                 Ok (`Bool (Cstruct.equal recovered_h160 addr.Address.hash))
+             end)
+        | _ -> Error "Address does not refer to a key (only P2PKH supported)"))
+  | _ ->
+    Error "Invalid parameters: expected [\"address\", \"signature\", \"message\"]"
+
+(* ============================================================================
+   Mempool Persistence Handlers
+   (Bitcoin Core: src/rpc/mempool.cpp::dumpmempool, ::loadmempool;
+    "savemempool" is an alias for dumpmempool that exists for legacy callers.)
+   ============================================================================ *)
+
+let mempool_dat_path (ctx : rpc_context) : (string, string) result =
+  match ctx.data_dir with
+  | None ->
+    Error "Mempool persistence unavailable: rpc context has no data_dir"
+  | Some d -> Ok (Filename.concat d "mempool.dat")
+
+let handle_dumpmempool (ctx : rpc_context)
+    (_params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match mempool_dat_path ctx with
+  | Error e -> Error e
+  | Ok path ->
+    (try
+      Mempool.save_mempool ctx.mempool path;
+      Ok (`Assoc [("filename", `String path)])
+    with exn ->
+      Error (Printf.sprintf "Unable to dump mempool: %s"
+        (Printexc.to_string exn)))
+
+let handle_loadmempool (ctx : rpc_context)
+    (_params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match mempool_dat_path ctx with
+  | Error e -> Error e
+  | Ok path ->
+    (try
+      let n = Mempool.load_mempool ctx.mempool path in
+      Ok (`Assoc [
+        ("path", `String path);
+        ("loaded", `Int n);
+      ])
+    with exn ->
+      Error (Printf.sprintf "Unable to load mempool: %s"
+        (Printexc.to_string exn)))
 
 (* ============================================================================
    UTXO Lookup Handler
@@ -3107,11 +3340,14 @@ let handle_help (_ctx : rpc_context)
       "generateblock \"output\" [\"rawtx\",...] (regtest only)";
       "";
       "== Mempool ==";
+      "dumpmempool";
       "getmempoolancestors \"txid\"";
       "getmempooldescendants \"txid\"";
       "getmempoolentry \"txid\"";
       "getmempoolinfo";
       "getrawmempool ( verbose )";
+      "loadmempool";
+      "savemempool";
       "testmempoolaccept [\"rawtx\"]";
       "";
       "== Network ==";
@@ -3151,6 +3387,10 @@ let handle_help (_ctx : rpc_context)
       "";
       "== Util ==";
       "estimatesmartfee conf_target";
+      "estimaterawfee conf_target ( threshold )";
+      "signmessage \"privkey\" \"message\"";
+      "signmessagewithprivkey \"privkey\" \"message\"";
+      "verifymessage \"address\" \"signature\" \"message\"";
       "validateaddress \"address\"";
       "";
       "== Wallet ==";
@@ -3301,14 +3541,34 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_testmempoolaccept ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_verify_rejected, msg))
+  | "dumpmempool" | "savemempool" ->
+    (match handle_dumpmempool ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "loadmempool" ->
+    (match handle_loadmempool ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
 
   (* Fee estimation / Util *)
   | "estimatesmartfee" ->
     (match handle_estimatesmartfee ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
+  | "estimaterawfee" ->
+    (match handle_estimaterawfee ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_invalid_params, msg))
   | "validateaddress" ->
     (match handle_validateaddress ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_invalid_address, msg))
+  | "signmessage" | "signmessagewithprivkey" ->
+    (match handle_signmessage ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_invalid_address, msg))
+  | "verifymessage" ->
+    (match handle_verifymessage ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_invalid_address, msg))
 
@@ -3655,9 +3915,10 @@ let create_context
     ~(network : Consensus.network_config)
     ?(wallet_manager : Wallet.wallet_manager option = None)
     ?(filter_index : Block_index.filter_index option = None)
-    ?(utxo : Utxo.OptimizedUtxoSet.t option = None) () : rpc_context =
+    ?(utxo : Utxo.OptimizedUtxoSet.t option = None)
+    ?(data_dir : string option = None) () : rpc_context =
   { chain; mempool; peer_manager; wallet; wallet_manager; fee_estimator; network;
-    filter_index; utxo }
+    filter_index; utxo; data_dir }
 
 (* Create an RPC context with multi-wallet support *)
 let create_context_with_wallet_manager
@@ -3668,11 +3929,12 @@ let create_context_with_wallet_manager
     ~(fee_estimator : Fee_estimation.t)
     ~(network : Consensus.network_config)
     ?(filter_index : Block_index.filter_index option = None)
-    ?(utxo : Utxo.OptimizedUtxoSet.t option = None) () : rpc_context =
+    ?(utxo : Utxo.OptimizedUtxoSet.t option = None)
+    ?(data_dir : string option = None) () : rpc_context =
   (* Get default wallet from manager for backward compatibility *)
   let wallet = Wallet.get_default_wallet wallet_manager in
   { chain; mempool; peer_manager; wallet; wallet_manager = Some wallet_manager;
-    fee_estimator; network; filter_index; utxo }
+    fee_estimator; network; filter_index; utxo; data_dir }
 
 (* Default RPC ports by network *)
 let default_port (network : Consensus.network_config) : int =

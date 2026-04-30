@@ -770,6 +770,131 @@ let test_disconnect_block_missing_undo () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* --- cleanup_orphan_tmp_files tests ----------------------------------- *)
+
+(* Set the mtime of [path] to [age_seconds] in the past. *)
+let backdate_file path age_seconds =
+  let now = Unix.time () in
+  let target = now -. age_seconds in
+  Unix.utimes path target target
+
+(* Stale .tmp files older than the threshold should be removed. *)
+let test_cleanup_orphan_tmp_stale () =
+  let dir = "/tmp/camlcoin_cleanup_tmp_test_stale" in
+  let rec rm_rf p =
+    if Sys.file_exists p then begin
+      if Sys.is_directory p then begin
+        Array.iter (fun f -> rm_rf (Filename.concat p f)) (Sys.readdir p);
+        Unix.rmdir p
+      end else Unix.unlink p
+    end
+  in
+  rm_rf dir;
+  Unix.mkdir dir 0o755;
+  let stale = Filename.concat dir "data.log.idx.tmp" in
+  let other_stale = Filename.concat dir "foo.tmp" in
+  let oc = open_out stale in
+  output_string oc "stale-snapshot-bytes";
+  close_out oc;
+  let oc2 = open_out other_stale in
+  output_string oc2 "other";
+  close_out oc2;
+  (* Backdate both so they look like crashed-out writes from > 1min ago *)
+  backdate_file stale 3600.0;
+  backdate_file other_stale 3600.0;
+  Storage.LogStorage.cleanup_orphan_tmp_files dir;
+  Alcotest.(check bool) "stale .tmp removed"
+    false (Sys.file_exists stale);
+  Alcotest.(check bool) "other stale .tmp removed"
+    false (Sys.file_exists other_stale);
+  rm_rf dir
+
+(* Young .tmp files (< 60s by default) must be preserved — there might be
+   an in-flight snapshot writer. *)
+let test_cleanup_orphan_tmp_young () =
+  let dir = "/tmp/camlcoin_cleanup_tmp_test_young" in
+  let rec rm_rf p =
+    if Sys.file_exists p then begin
+      if Sys.is_directory p then begin
+        Array.iter (fun f -> rm_rf (Filename.concat p f)) (Sys.readdir p);
+        Unix.rmdir p
+      end else Unix.unlink p
+    end
+  in
+  rm_rf dir;
+  Unix.mkdir dir 0o755;
+  let young = Filename.concat dir "data.log.idx.tmp" in
+  let oc = open_out young in
+  output_string oc "in-flight";
+  close_out oc;
+  (* Default threshold is 60s; this file is 0s old. *)
+  Storage.LogStorage.cleanup_orphan_tmp_files dir;
+  Alcotest.(check bool) "young .tmp preserved"
+    true (Sys.file_exists young);
+  rm_rf dir
+
+(* Non-.tmp files must NOT be touched by the cleanup. *)
+let test_cleanup_orphan_tmp_keeps_non_tmp () =
+  let dir = "/tmp/camlcoin_cleanup_tmp_test_keep" in
+  let rec rm_rf p =
+    if Sys.file_exists p then begin
+      if Sys.is_directory p then begin
+        Array.iter (fun f -> rm_rf (Filename.concat p f)) (Sys.readdir p);
+        Unix.rmdir p
+      end else Unix.unlink p
+    end
+  in
+  rm_rf dir;
+  Unix.mkdir dir 0o755;
+  let keep = Filename.concat dir "data.log" in
+  let keep_idx = Filename.concat dir "data.log.idx" in
+  let oc = open_out keep in
+  output_string oc "live data";
+  close_out oc;
+  let oc2 = open_out keep_idx in
+  output_string oc2 "live snapshot";
+  close_out oc2;
+  backdate_file keep 3600.0;
+  backdate_file keep_idx 3600.0;
+  Storage.LogStorage.cleanup_orphan_tmp_files dir;
+  Alcotest.(check bool) "data.log preserved" true (Sys.file_exists keep);
+  Alcotest.(check bool) "data.log.idx preserved"
+    true (Sys.file_exists keep_idx);
+  rm_rf dir
+
+(* open_db must invoke cleanup_orphan_tmp_files automatically. *)
+let test_cleanup_orphan_tmp_via_open_db () =
+  let dir = "/tmp/camlcoin_cleanup_tmp_test_opendb" in
+  let rec rm_rf p =
+    if Sys.file_exists p then begin
+      if Sys.is_directory p then begin
+        Array.iter (fun f -> rm_rf (Filename.concat p f)) (Sys.readdir p);
+        Unix.rmdir p
+      end else Unix.unlink p
+    end
+  in
+  rm_rf dir;
+  Unix.mkdir dir 0o755;
+  let stale = Filename.concat dir "data.log.idx.tmp" in
+  let oc = open_out stale in
+  output_string oc "stale-snapshot";
+  close_out oc;
+  backdate_file stale 3600.0;
+  let db = Storage.LogStorage.open_db dir in
+  Alcotest.(check bool) "open_db removed stale tmp"
+    false (Sys.file_exists stale);
+  Storage.LogStorage.close db;
+  rm_rf dir
+
+(* Cleanup on a non-existent dir is a no-op (no exception). *)
+let test_cleanup_orphan_tmp_missing_dir () =
+  let dir = "/tmp/camlcoin_cleanup_tmp_test_does_not_exist_42" in
+  (try
+    if Sys.file_exists dir then Unix.rmdir dir
+  with _ -> ());
+  Storage.LogStorage.cleanup_orphan_tmp_files dir;
+  Alcotest.(check bool) "no exception on missing dir" true true
+
 let () =
   cleanup_test_db ();
   cleanup_flat_files ();
@@ -779,6 +904,13 @@ let () =
       test_case "basic operations" `Quick test_file_storage_basic;
       test_case "batch operations" `Quick test_file_storage_batch;
       test_case "iter_prefix" `Quick test_file_storage_iter_prefix;
+    ];
+    "cleanup_orphan_tmp", [
+      test_case "removes stale .tmp" `Quick test_cleanup_orphan_tmp_stale;
+      test_case "keeps young .tmp" `Quick test_cleanup_orphan_tmp_young;
+      test_case "keeps non-.tmp files" `Quick test_cleanup_orphan_tmp_keeps_non_tmp;
+      test_case "open_db invokes cleanup" `Quick test_cleanup_orphan_tmp_via_open_db;
+      test_case "missing dir is no-op" `Quick test_cleanup_orphan_tmp_missing_dir;
     ];
     "chain_db", [
       test_case "block header" `Quick test_chaindb_block_header;

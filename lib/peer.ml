@@ -249,6 +249,11 @@ type peer = {
   mutable cmpct_high_bandwidth : bool; (* Peer wants high-bandwidth compact blocks *)
   mutable cmpct_version : int64;    (* Compact block protocol version *)
   mutable block_relay_only : bool;  (* Block-relay-only connection (no tx relay) *)
+  (* BIP-331 package relay: peer announced sendpackages support. *)
+  mutable sendpackages_received : bool;
+  mutable pkg_relay_version : int64;
+  mutable pkg_max_count : int32;
+  mutable pkg_max_weight : int32;
   mutable msg_count_window : int;   (* Messages received in current window *)
   mutable msg_window_start : float; (* Start time of current rate-limit window *)
   mutable handshake_complete : bool; (* Version/verack handshake completed *)
@@ -336,6 +341,10 @@ let make_peer ~(network : Consensus.network_config) ~(addr : string)
     cmpct_high_bandwidth = false;
     cmpct_version = 0L;
     block_relay_only = false;
+    sendpackages_received = false;
+    pkg_relay_version = 0L;
+    pkg_max_count = 0l;
+    pkg_max_weight = 0l;
     msg_count_window = 0;
     msg_window_start = Unix.gettimeofday ();
     handshake_complete = false;
@@ -768,9 +777,15 @@ let read_until_verack (peer : peer) : unit Lwt.t =
            the Erlay responder, so silently ignore (matches Core when
            m_txreconciliation is null). *)
         loop ()
-      | Some (P2p.SendpackagesMsg _) ->
-        (* BIP-431 package relay negotiation.  We don't implement package
-           relay; silently ignore the announcement. *)
+      | Some (P2p.SendpackagesMsg msg) ->
+        (* BIP-331 package relay negotiation.  Capture the peer's announced
+           limits so we can clamp our [getpkgtxns] requests later.  Per the
+           BIP, sendpackages MUST be sent between VERSION and VERACK; reaching
+           here means the peer is offering 1p1c (or richer) package relay. *)
+        peer.sendpackages_received <- true;
+        peer.pkg_relay_version <- msg.pkg_version;
+        peer.pkg_max_count <- msg.pkg_max_count;
+        peer.pkg_max_weight <- msg.pkg_max_weight;
         loop ()
       | Some _ -> Lwt.fail_with "Unexpected message before verack"
     end
@@ -1433,6 +1448,21 @@ let dispatch_message (peer : peer) (msg : P2p.message_payload)
       Lwt.return `Continue
     end
 
+  (* BIP-331 sendpackages: announced between VERSION and VERACK.  Capture the
+     peer's package-relay limits so the listener-level handler can clamp our
+     own [getpkgtxns] requests. *)
+  | P2p.SendpackagesMsg msg, false ->
+    if not peer.version_received then begin
+      let* () = misbehaving peer 10 "pre-handshake sendpackages" in
+      Lwt.return (`PreHandshake "sendpackages before VERSION")
+    end else begin
+      peer.sendpackages_received <- true;
+      peer.pkg_relay_version <- msg.pkg_version;
+      peer.pkg_max_count <- msg.pkg_max_count;
+      peer.pkg_max_weight <- msg.pkg_max_weight;
+      Lwt.return `Continue
+    end
+
   (* Pre-handshake: Any other message - reject *)
   | _, false ->
     let* () = misbehaving peer 10 "pre-handshake message" in
@@ -1478,6 +1508,12 @@ let dispatch_message (peer : peer) (msg : P2p.message_payload)
     (* Version message after handshake is a protocol violation *)
     let* () = misbehaving peer 1 "VERSION after handshake" in
     Lwt.return (`Disconnect "Unexpected VERSION message after handshake")
+
+  | P2p.SendpackagesMsg _, true ->
+    (* BIP-331: sendpackages MUST be sent between VERSION and VERACK; later
+       arrival is a protocol violation. *)
+    let* () = misbehaving peer 1 "sendpackages after handshake" in
+    Lwt.return (`Disconnect "sendpackages received after VERACK")
 
   | _, true ->
     (* Other messages handled by higher-level code *)

@@ -2144,89 +2144,289 @@ let create_short_id_lookup (mp : mempool) ~(k0 : int64) ~(k1 : int64)
   tbl
 
 (* ============================================================================
-   Mempool Persistence (Gap 5)
+   Mempool Persistence — Bitcoin Core byte-compatible format
+
+   File layout (mirrors bitcoin-core/src/node/mempool_persist.cpp):
+     [0,  8)  : uint64 LE version  (= 2 for the obfuscated format)
+     [8, 17)  : compact-size 0x08 + 8 raw key bytes  (the XOR obfuscation key)
+     [17, …)  : XOR-obfuscated payload, where byte at file offset p is XOR'd
+                with key[p mod 8]  (matches Core's [Obfuscation::operator()])
+
+   Payload (post-XOR, in declaration order):
+     uint64 LE                          total_txns_to_load
+     <total_txns_to_load times>         CTransaction-with-witness
+                                        int64 LE  nTime
+                                        int64 LE  nFeeDelta
+     compact-size + entries             mapDeltas       (Txid + int64 LE)
+     compact-size + entries             unbroadcast set (Txid only)
+
+   Camlcoin currently stores neither [nFeeDelta] nor an unbroadcast set; we
+   therefore emit empty maps in those positions and ignore them on read.  When
+   either is wired in, the writer/reader can extend without changing the on-
+   wire format.
+
+   The previous custom format (4-byte BE count, BE 64-bit fee, BE float time,
+   4-byte BE tx-data length, raw tx) is NOT detected — it carried no stable
+   magic and lived only inside our datadir.  On read of a non-Core file the
+   loader returns 0 (best-effort) and the node continues with an empty
+   mempool, exactly as Core does on a malformed file.
    ============================================================================ *)
 
-(* Save mempool to a binary file (atomic via temp file + rename) *)
+let mempool_dump_version = 2L
+
+(* Generate 8 random bytes for the XOR key.  We avoid pulling in the full
+   mirage_crypto dependency stack (already used elsewhere) and just read from
+   /dev/urandom; the key is non-secret and only obscures the on-disk bytes
+   from incidental file scans.  Falls back to gettimeofday-seeded hash if
+   /dev/urandom is unavailable. *)
+let random_xor_key () : bytes =
+  try
+    let ic = open_in_bin "/dev/urandom" in
+    let buf = Bytes.create 8 in
+    Fun.protect ~finally:(fun () -> close_in_noerr ic)
+      (fun () -> really_input ic buf 0 8);
+    buf
+  with _ ->
+    let k = Bytes.create 8 in
+    let t = Unix.gettimeofday () in
+    let bits = Int64.bits_of_float t in
+    for i = 0 to 7 do
+      Bytes.set_uint8 k i
+        (Int64.to_int (Int64.logand
+          (Int64.shift_right_logical bits (i * 8)) 0xFFL))
+    done;
+    k
+
+(* In-place XOR a buffer at the given starting [file_offset].  [key] is the
+   8-byte obfuscation key. *)
+let xor_in_place ~(key : bytes) ~(file_offset : int) (b : bytes) : unit =
+  let k0 = Bytes.unsafe_get key 0 |> Char.code in
+  let k1 = Bytes.unsafe_get key 1 |> Char.code in
+  let k2 = Bytes.unsafe_get key 2 |> Char.code in
+  let k3 = Bytes.unsafe_get key 3 |> Char.code in
+  let k4 = Bytes.unsafe_get key 4 |> Char.code in
+  let k5 = Bytes.unsafe_get key 5 |> Char.code in
+  let k6 = Bytes.unsafe_get key 6 |> Char.code in
+  let k7 = Bytes.unsafe_get key 7 |> Char.code in
+  let n = Bytes.length b in
+  for i = 0 to n - 1 do
+    let p = file_offset + i in
+    let kb = match p land 7 with
+      | 0 -> k0 | 1 -> k1 | 2 -> k2 | 3 -> k3
+      | 4 -> k4 | 5 -> k5 | 6 -> k6 | _ -> k7
+    in
+    let c = Char.code (Bytes.unsafe_get b i) in
+    Bytes.unsafe_set b i (Char.chr (c lxor kb))
+  done
+
+(* Helpers: encode/decode primitives at known buffer offsets, working in raw
+   bytes so we can XOR-obfuscate a contiguous payload before writing it to
+   disk in one shot. *)
+let put_uint64_le (buf : Buffer.t) (v : int64) : unit =
+  let cs = Cstruct.create 8 in
+  Cstruct.LE.set_uint64 cs 0 v;
+  Buffer.add_string buf (Cstruct.to_string cs)
+
+let put_int64_le (buf : Buffer.t) (v : int64) : unit = put_uint64_le buf v
+
+let put_compact_size (buf : Buffer.t) (n : int) : unit =
+  if n < 0xFD then Buffer.add_char buf (Char.chr n)
+  else if n <= 0xFFFF then begin
+    Buffer.add_char buf '\xFD';
+    let cs = Cstruct.create 2 in
+    Cstruct.LE.set_uint16 cs 0 n;
+    Buffer.add_string buf (Cstruct.to_string cs)
+  end else if n <= 0xFFFFFFFF then begin
+    Buffer.add_char buf '\xFE';
+    let cs = Cstruct.create 4 in
+    Cstruct.LE.set_uint32 cs 0 (Int32.of_int n);
+    Buffer.add_string buf (Cstruct.to_string cs)
+  end else begin
+    Buffer.add_char buf '\xFF';
+    put_uint64_le buf (Int64.of_int n)
+  end
+
+(* Save mempool in Bitcoin Core byte-compatible format (atomic via temp file
+   + rename, mirroring Core's "<path>.new" → rename pattern). *)
 let save_mempool (mp : mempool) (path : string) : unit =
-  let tmp = path ^ ".tmp" in
+  let tmp = path ^ ".new" in
   let oc = open_out_bin tmp in
   Fun.protect ~finally:(fun () -> close_out_noerr oc) (fun () ->
-    (* Write 4-byte BE count *)
-    let count = Hashtbl.length mp.entries in
-    let buf4 = Cstruct.create 4 in
-    Cstruct.BE.set_uint32 buf4 0 (Int32.of_int count);
-    output_string oc (Cstruct.to_string buf4);
-    (* Write each entry *)
-    Hashtbl.iter (fun _k entry ->
-      (* txid: 32 bytes *)
-      output_string oc (Cstruct.to_string entry.txid);
-      (* fee: 8 bytes BE *)
-      let buf8 = Cstruct.create 8 in
-      Cstruct.BE.set_uint64 buf8 0 entry.fee;
-      output_string oc (Cstruct.to_string buf8);
-      (* time_added: 8 bytes BE (Int64.bits_of_float) *)
-      let buf8t = Cstruct.create 8 in
-      Cstruct.BE.set_uint64 buf8t 0 (Int64.bits_of_float entry.time_added);
-      output_string oc (Cstruct.to_string buf8t);
-      (* tx_data: serialize transaction *)
+    (* 1. Header: version (no XOR yet) *)
+    let hdr = Buffer.create 17 in
+    put_uint64_le hdr mempool_dump_version;
+    (* 2. Header: serialized 8-byte XOR key as compact-size + raw bytes (no
+       XOR yet — Core writes this before SetObfuscation). *)
+    let xor_key = random_xor_key () in
+    Buffer.add_char hdr (Char.chr 0x08);
+    Buffer.add_bytes hdr xor_key;
+    output_string oc (Buffer.contents hdr);
+    (* 3. Build the obfuscated payload in memory, then XOR + write. *)
+    let payload = Buffer.create 4096 in
+    (* Snapshot entries first to make iteration deterministic relative to
+       any concurrent mutation (the caller is expected to hold or know the
+       single-writer invariant; Core takes [pool.cs] for the same reason). *)
+    let entries =
+      Hashtbl.fold (fun _k e acc -> e :: acc) mp.entries [] in
+    let n = List.length entries in
+    put_uint64_le payload (Int64.of_int n);
+    List.iter (fun (entry : mempool_entry) ->
+      (* CTransaction with witness *)
       let w = Serialize.writer_create () in
       Serialize.serialize_transaction w entry.tx;
       let tx_cs = Serialize.writer_to_cstruct w in
-      let tx_data = Cstruct.to_string tx_cs in
-      (* tx_data_len: 4 bytes BE *)
-      let buf4l = Cstruct.create 4 in
-      Cstruct.BE.set_uint32 buf4l 0 (Int32.of_int (String.length tx_data));
-      output_string oc (Cstruct.to_string buf4l);
-      (* tx_data: raw bytes *)
-      output_string oc tx_data
-    ) mp.entries
+      Buffer.add_string payload (Cstruct.to_string tx_cs);
+      (* int64 LE nTime (seconds since epoch) *)
+      put_int64_le payload (Int64.of_float entry.time_added);
+      (* int64 LE nFeeDelta — camlcoin does not (yet) track prioritisetransaction
+         deltas, so we emit 0.  Core treats absent deltas the same way. *)
+      put_int64_le payload 0L
+    ) entries;
+    (* mapDeltas: empty (camlcoin lacks prioritisetransaction tracking) *)
+    put_compact_size payload 0;
+    (* unbroadcast_txids: empty (camlcoin lacks an unbroadcast set) *)
+    put_compact_size payload 0;
+    (* XOR the entire payload, then write. Payload starts at file offset 17. *)
+    let payload_bytes = Buffer.to_bytes payload in
+    xor_in_place ~key:xor_key ~file_offset:17 payload_bytes;
+    output_bytes oc payload_bytes
   );
   Sys.rename tmp path
 
-(* Load mempool from a binary file, returns count of loaded transactions *)
+(* Streaming reader over a Buffer.contents-style raw payload string with an
+   internal cursor.  The caller pre-XOR-decodes the payload before passing it
+   in, so this just needs to walk a string. *)
+type reader_state = {
+  mutable r_pos : int;
+  r_data : string;
+}
+
+let r_remaining (r : reader_state) : int =
+  String.length r.r_data - r.r_pos
+
+let r_read_u8 (r : reader_state) : int =
+  if r_remaining r < 1 then failwith "mempool.dat truncated";
+  let c = Char.code r.r_data.[r.r_pos] in
+  r.r_pos <- r.r_pos + 1;
+  c
+
+let r_read_bytes (r : reader_state) (n : int) : string =
+  if r_remaining r < n then failwith "mempool.dat truncated";
+  let s = String.sub r.r_data r.r_pos n in
+  r.r_pos <- r.r_pos + n;
+  s
+
+let r_read_uint16_le (r : reader_state) : int =
+  let s = r_read_bytes r 2 in
+  Cstruct.LE.get_uint16 (Cstruct.of_string s) 0
+
+let r_read_uint32_le (r : reader_state) : int32 =
+  let s = r_read_bytes r 4 in
+  Cstruct.LE.get_uint32 (Cstruct.of_string s) 0
+
+let r_read_int64_le (r : reader_state) : int64 =
+  let s = r_read_bytes r 8 in
+  Cstruct.LE.get_uint64 (Cstruct.of_string s) 0
+
+let r_read_compact_size (r : reader_state) : int =
+  let first = r_read_u8 r in
+  if first < 0xFD then first
+  else if first = 0xFD then r_read_uint16_le r
+  else if first = 0xFE then Int32.to_int (r_read_uint32_le r)
+  else Int64.to_int (r_read_int64_le r)
+
+(* Load mempool from a Bitcoin Core byte-compatible mempool.dat.  Returns the
+   number of transactions successfully accepted into the mempool.  Silently
+   returns 0 on malformed / unsupported / missing files (matches Core's
+   "Continuing anyway" loss-tolerant policy). *)
 let load_mempool (mp : mempool) (path : string) : int =
   if not (Sys.file_exists path) then 0
-  else
+  else begin
     let loaded = ref 0 in
     (try
       let ic = open_in_bin path in
       Fun.protect ~finally:(fun () -> close_in_noerr ic) (fun () ->
-        (* Read 4-byte BE count *)
-        let hdr = Bytes.create 4 in
-        really_input ic hdr 0 4;
-        let hdr_cs = Cstruct.of_bytes hdr in
-        let count = Int32.to_int (Cstruct.BE.get_uint32 hdr_cs 0) in
-        for _i = 1 to count do
-          (* txid: 32 bytes *)
-          let txid_buf = Bytes.create 32 in
-          really_input ic txid_buf 0 32;
-          ignore (Cstruct.of_bytes txid_buf);  (* txid — used only for verification *)
-          (* fee: 8 bytes BE *)
-          let fee_buf = Bytes.create 8 in
-          really_input ic fee_buf 0 8;
-          ignore (Cstruct.BE.get_uint64 (Cstruct.of_bytes fee_buf) 0);  (* fee — recomputed by add_transaction *)
-          (* time_added: 8 bytes BE *)
-          let time_buf = Bytes.create 8 in
-          really_input ic time_buf 0 8;
-          ignore (Int64.float_of_bits (Cstruct.BE.get_uint64 (Cstruct.of_bytes time_buf) 0));  (* time_added — recomputed *)
-          (* tx_data_len: 4 bytes BE *)
-          let len_buf = Bytes.create 4 in
-          really_input ic len_buf 0 4;
-          let tx_data_len = Int32.to_int (Cstruct.BE.get_uint32 (Cstruct.of_bytes len_buf) 0) in
-          (* tx_data: raw bytes *)
-          let tx_buf = Bytes.create tx_data_len in
-          really_input ic tx_buf 0 tx_data_len;
-          let tx_cs = Cstruct.of_bytes tx_buf in
-          let r = Serialize.reader_of_cstruct tx_cs in
-          let tx = Serialize.deserialize_transaction r in
-          match add_transaction mp tx with
-          | Ok _ -> incr loaded
-          | Error _ -> ()  (* skip silently *)
+        let file_len = in_channel_length ic in
+        if file_len < 8 then raise Exit;
+        let hdr_v = Bytes.create 8 in
+        really_input ic hdr_v 0 8;
+        let version = Cstruct.LE.get_uint64
+          (Cstruct.of_bytes hdr_v) 0 in
+        let key, payload_offset =
+          if Int64.equal version 1L then
+            (* Legacy unobfuscated v1: zero key (no XOR) *)
+            (Bytes.make 8 '\x00', 8)
+          else if Int64.equal version mempool_dump_version then begin
+            if file_len < 17 then raise Exit;
+            let csize_buf = Bytes.create 1 in
+            really_input ic csize_buf 0 1;
+            (* Core serializes the key as vector<byte>: compact-size length
+               followed by raw bytes.  For an 8-byte key this MUST be 0x08;
+               we also tolerate 0xFD-prefixed encodings just in case. *)
+            let csize = Char.code (Bytes.get csize_buf 0) in
+            let n =
+              if csize < 0xFD then csize
+              else if csize = 0xFD then begin
+                let b2 = Bytes.create 2 in
+                really_input ic b2 0 2;
+                Cstruct.LE.get_uint16 (Cstruct.of_bytes b2) 0
+              end else raise Exit
+            in
+            if n <> 8 then raise Exit;
+            let k = Bytes.create 8 in
+            really_input ic k 0 8;
+            (* file offset now: 8 (version) + (1 csize byte) + 8 (key) = 17 *)
+            (k, 17)
+          end else
+            (* Unknown version (incl. legacy big-endian custom format) *)
+            raise Exit
+        in
+        (* Read the rest of the file as one chunk and XOR-decode. *)
+        let payload_len = file_len - payload_offset in
+        if payload_len <= 0 then raise Exit;
+        let payload = Bytes.create payload_len in
+        really_input ic payload 0 payload_len;
+        xor_in_place ~key ~file_offset:payload_offset payload;
+        let r = { r_pos = 0; r_data = Bytes.unsafe_to_string payload } in
+        let total = r_read_int64_le r in
+        if Int64.compare total 0L < 0 then raise Exit;
+        let total_int = Int64.to_int total in
+        for _i = 1 to total_int do
+          (* Build a sub-reader on the remaining payload so [Serialize] can
+             walk the variable-length transaction.  We use [Serialize]'s own
+             reader by handing it the remaining slice via Cstruct. *)
+          let remaining = r_remaining r in
+          if remaining <= 0 then raise Exit;
+          let cs = Cstruct.of_string ~off:r.r_pos ~len:remaining
+            r.r_data in
+          let sr = Serialize.reader_of_cstruct cs in
+          let tx = Serialize.deserialize_transaction sr in
+          (* Advance our cursor by however many bytes Serialize consumed. *)
+          r.r_pos <- r.r_pos + sr.pos;
+          let _n_time = r_read_int64_le r in   (* discarded — mempool re-times *)
+          let _n_fee_delta = r_read_int64_le r in (* no prioritisetx tracking *)
+          (match add_transaction mp tx with
+           | Ok _ -> incr loaded
+           | Error _ -> ())
+        done;
+        (* mapDeltas: read + discard *)
+        let n_deltas = r_read_compact_size r in
+        for _i = 1 to n_deltas do
+          let _txid = r_read_bytes r 32 in
+          let _amount = r_read_int64_le r in
+          ()
+        done;
+        (* unbroadcast_txids: read + discard *)
+        let n_unbcast =
+          try r_read_compact_size r
+          with _ -> 0 in
+        for _i = 1 to n_unbcast do
+          let _txid = r_read_bytes r 32 in ()
         done
       )
-    with _ -> ());  (* handle corrupt files gracefully *)
+    with _ -> ());
     !loaded
+  end
 
 (* ============================================================================
    Package Relay (BIP 331)

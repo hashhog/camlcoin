@@ -1577,6 +1577,88 @@ let test_i2p_sam_reply_parsing () =
   let empty_pairs = P2p.I2P.parse_sam_reply empty_reply in
   Alcotest.(check int) "empty pairs" 0 (List.length empty_pairs)
 
+(* ============================================================================
+   BIP-331 Package Relay message roundtrips
+   ============================================================================ *)
+
+let test_sendpackages_roundtrip () =
+  let payload = P2p.SendpackagesMsg {
+    pkg_version = P2p.package_relay_version;
+    pkg_max_count = 25l;
+    pkg_max_weight = 404_000l;
+  } in
+  let serialized = P2p.serialize_message P2p.mainnet_magic payload in
+  let msg = P2p.deserialize_message serialized in
+  match msg.payload with
+  | P2p.SendpackagesMsg m ->
+    Alcotest.(check int64) "version" P2p.package_relay_version m.pkg_version;
+    Alcotest.(check int32) "max_count" 25l m.pkg_max_count;
+    Alcotest.(check int32) "max_weight" 404_000l m.pkg_max_weight
+  | _ -> Alcotest.fail "Expected SendpackagesMsg"
+
+let test_getpkgtxns_roundtrip () =
+  let h = test_hash () in
+  let payload = P2p.GetpkgtxnsMsg { pkg_wtxids = [h; h] } in
+  let serialized = P2p.serialize_message P2p.mainnet_magic payload in
+  let msg = P2p.deserialize_message serialized in
+  match msg.payload with
+  | P2p.GetpkgtxnsMsg m ->
+    Alcotest.(check int) "wtxid count" 2 (List.length m.pkg_wtxids);
+    List.iter (fun h' ->
+      Alcotest.(check bool) "hash equal" true (Cstruct.equal h h')
+    ) m.pkg_wtxids
+  | _ -> Alcotest.fail "Expected GetpkgtxnsMsg"
+
+let test_pkgtxns_roundtrip () =
+  let tx = Types.{
+    version = 2l;
+    inputs = [{
+      previous_output = { txid = test_hash (); vout = 0l };
+      script_sig = Cstruct.of_string "\x51";
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [{
+      value = 50_000L;
+      script_pubkey = Cstruct.of_string "\x6a";
+    }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let payload = P2p.PkgtxnsMsg { pkg_txs = [tx] } in
+  let serialized = P2p.serialize_message P2p.mainnet_magic payload in
+  let msg = P2p.deserialize_message serialized in
+  match msg.payload with
+  | P2p.PkgtxnsMsg m ->
+    Alcotest.(check int) "tx count" 1 (List.length m.pkg_txs);
+    let tx' = List.hd m.pkg_txs in
+    Alcotest.(check int32) "version" 2l tx'.version;
+    Alcotest.(check int) "inputs" 1 (List.length tx'.inputs)
+  | _ -> Alcotest.fail "Expected PkgtxnsMsg"
+
+let test_getpkgtxns_max_count_enforced () =
+  (* 26 wtxids — one over BIP-331 max — must fail to deserialize. *)
+  let h = test_hash () in
+  let payload = P2p.GetpkgtxnsMsg {
+    pkg_wtxids = List.init 26 (fun _ -> h)
+  } in
+  let serialized = P2p.serialize_message P2p.mainnet_magic payload in
+  let raised = ref false in
+  (try ignore (P2p.deserialize_message serialized)
+   with _ -> raised := true);
+  Alcotest.(check bool) "26 wtxids rejected" true !raised
+
+let test_sendpackages_command_byte () =
+  let payload = P2p.SendpackagesMsg {
+    pkg_version = 1L;
+    pkg_max_count = 25l;
+    pkg_max_weight = 404_000l;
+  } in
+  let serialized = P2p.serialize_message P2p.mainnet_magic payload in
+  let cmd_bytes = Cstruct.sub serialized 4 12 in
+  let cmd_str = Cstruct.to_string cmd_bytes in
+  Alcotest.(check bool) "command starts with sendpackages"
+    true (String.sub cmd_str 0 12 = "sendpackages")
+
 let () =
   let open Alcotest in
   run "P2P" [
@@ -1584,6 +1666,13 @@ let () =
       test_case "command roundtrip" `Quick test_command_roundtrip;
       test_case "unknown command" `Quick test_command_unknown;
       test_case "cmpctblock command" `Quick test_cmpctblock_command;
+    ];
+    "package_relay_bip331", [
+      test_case "sendpackages roundtrip" `Quick test_sendpackages_roundtrip;
+      test_case "getpkgtxns roundtrip" `Quick test_getpkgtxns_roundtrip;
+      test_case "pkgtxns roundtrip" `Quick test_pkgtxns_roundtrip;
+      test_case "getpkgtxns max_count enforced" `Quick test_getpkgtxns_max_count_enforced;
+      test_case "sendpackages command byte" `Quick test_sendpackages_command_byte;
     ];
     "inv_types", [
       test_case "inv_type roundtrip" `Quick test_inv_type_roundtrip;

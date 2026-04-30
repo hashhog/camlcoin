@@ -53,6 +53,10 @@ let cf_tx_index     = "tx_index"
 let cf_chain_state  = "chain_state"
 let cf_undo_data    = "undo_data"
 let cf_invalidated  = "invalidated"
+(* Ban list CF: holds peer bans previously stored in LogStorage with
+   key prefix "B" (peer_manager.ml). The CF naming gives us the
+   namespace; keys are bare address strings. *)
+let cf_ban_list     = "ban_list"
 
 (* Order MUST match the [cfh] indices in [open_db]. *)
 let all_cf_names = [|
@@ -66,9 +70,11 @@ let all_cf_names = [|
   cf_chain_state;
   cf_undo_data;
   cf_invalidated;
+  cf_ban_list;
 |]
 
 type t = {
+  path : string;
   db : Rocksdb.t;
   cfh_default      : Rocksdb.cf_handle;
   cfh_block_header : Rocksdb.cf_handle;
@@ -80,20 +86,70 @@ type t = {
   cfh_chain_state  : Rocksdb.cf_handle;
   cfh_undo_data    : Rocksdb.cf_handle;
   cfh_invalidated  : Rocksdb.cf_handle;
+  cfh_ban_list     : Rocksdb.cf_handle;
   mutable closed   : bool;
 }
+
+(* In-process registry of open DBs by absolute path. RocksDB acquires
+   an OS file lock on each open; opening the same path twice from the
+   same process fails with "lock hold by current process". Test
+   harnesses (e.g. test_rest.ml) call ChainDB.create on the same path
+   across many tests without closing in between, which used to work
+   under LogStorage but now needs explicit close-then-reopen. To keep
+   the test surface small we transparently close any existing handle
+   for the same path before opening a new one. Production callers go
+   through ChainDB.create + ChainDB.close exactly once per datadir, so
+   this registry is invisible to them. *)
+let open_handles : (string, t) Hashtbl.t = Hashtbl.create 8
+let registry_lock = Mutex.create ()
 
 let ensure_dir path =
   try Unix.mkdir path 0o755
   with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
 
-(* Open (or create) the chainstate at [path]. Creates all 9 CFs +
+let close_unlocked (t : t) : unit =
+  if not t.closed then begin
+    (* Per the C stub contract: destroy CF handles BEFORE closing the DB.
+       We swallow any individual destroy/close failure so that a torn-down
+       datadir (e.g. test harness rm -rf while a handle is still open)
+       doesn't propagate into the next caller. The handle is marked closed
+       either way, so the registry can drop it and a fresh open can
+       proceed. *)
+    let safe_destroy h =
+      try Rocksdb.cf_destroy t.db h with _ -> ()
+    in
+    safe_destroy t.cfh_default;
+    safe_destroy t.cfh_block_header;
+    safe_destroy t.cfh_block_data;
+    safe_destroy t.cfh_tx;
+    safe_destroy t.cfh_utxo;
+    safe_destroy t.cfh_block_height;
+    safe_destroy t.cfh_tx_index;
+    safe_destroy t.cfh_chain_state;
+    safe_destroy t.cfh_undo_data;
+    safe_destroy t.cfh_invalidated;
+    safe_destroy t.cfh_ban_list;
+    (try Rocksdb.close t.db with _ -> ());
+    t.closed <- true
+  end
+
+(* Open (or create) the chainstate at [path]. Creates all 11 CFs +
    the implicit default CF on first call. Subsequent opens require
    the CFs to exist on disk; missing CFs are created automatically
    thanks to [create_missing_column_families = 1] in the C stub. *)
 let open_db ?(write_buffer_mb = 256) ?(block_cache_mb = 2048)
     ?(bloom_bits = 10) (path : string) : t =
   ensure_dir path;
+  Mutex.protect registry_lock (fun () ->
+    (match Hashtbl.find_opt open_handles path with
+     | Some prior when not prior.closed ->
+       (* Another caller (e.g. an earlier test) already opened the
+          same datadir and never called close. RocksDB's per-path
+          OS lock would refuse the new open; tear the prior handle
+          down first. *)
+       close_unlocked prior;
+       Hashtbl.remove open_handles path
+     | _ -> ()));
   let db, cfhs =
     Rocksdb.open_cfs path all_cf_names
       write_buffer_mb block_cache_mb bloom_bits
@@ -101,7 +157,8 @@ let open_db ?(write_buffer_mb = 256) ?(block_cache_mb = 2048)
   if Array.length cfhs <> Array.length all_cf_names then
     failwith
       "Cf_chainstate.open_db: cf handle count mismatch (rocksdb stub bug)";
-  {
+  let t = {
+    path;
     db;
     cfh_default      = cfhs.(0);
     cfh_block_header = cfhs.(1);
@@ -113,25 +170,21 @@ let open_db ?(write_buffer_mb = 256) ?(block_cache_mb = 2048)
     cfh_chain_state  = cfhs.(7);
     cfh_undo_data    = cfhs.(8);
     cfh_invalidated  = cfhs.(9);
+    cfh_ban_list     = cfhs.(10);
     closed = false;
-  }
+  } in
+  Mutex.protect registry_lock (fun () ->
+    Hashtbl.replace open_handles path t);
+  t
 
 let close (t : t) : unit =
-  if not t.closed then begin
-    (* Per the C stub contract: destroy CF handles BEFORE closing the DB. *)
-    Rocksdb.cf_destroy t.db t.cfh_default;
-    Rocksdb.cf_destroy t.db t.cfh_block_header;
-    Rocksdb.cf_destroy t.db t.cfh_block_data;
-    Rocksdb.cf_destroy t.db t.cfh_tx;
-    Rocksdb.cf_destroy t.db t.cfh_utxo;
-    Rocksdb.cf_destroy t.db t.cfh_block_height;
-    Rocksdb.cf_destroy t.db t.cfh_tx_index;
-    Rocksdb.cf_destroy t.db t.cfh_chain_state;
-    Rocksdb.cf_destroy t.db t.cfh_undo_data;
-    Rocksdb.cf_destroy t.db t.cfh_invalidated;
-    Rocksdb.close t.db;
-    t.closed <- true
-  end
+  Mutex.protect registry_lock (fun () ->
+    close_unlocked t;
+    (* Only remove the registry entry if it still points at [t] —
+       another open could have raced past the registry update. *)
+    match Hashtbl.find_opt open_handles t.path with
+    | Some t' when t' == t -> Hashtbl.remove open_handles t.path
+    | _ -> ())
 
 (* --- Helpers ---------------------------------------------------------- *)
 
@@ -247,6 +300,28 @@ let iter_invalidated (t : t) (f : Types.hash256 -> unit) =
   Rocksdb.cf_iter t.db t.cfh_invalidated (fun key _value ->
     f (Cstruct.of_string key))
 
+(* Ban list. Keys are address strings, values are 8-byte BE encoded
+   floats (Int64.bits_of_float banned_until). The format is identical
+   to what LogStorage stored under prefix "B"; only the storage
+   backend changes. *)
+let put_ban (t : t) (addr : string) (data : string) =
+  Rocksdb.cf_put t.db t.cfh_ban_list addr data
+
+let get_ban (t : t) (addr : string) : string option =
+  Rocksdb.cf_get t.db t.cfh_ban_list addr
+
+let delete_ban (t : t) (addr : string) =
+  Rocksdb.cf_delete t.db t.cfh_ban_list addr
+
+let iter_bans (t : t) (f : string -> string -> unit) =
+  Rocksdb.cf_iter t.db t.cfh_ban_list f
+
+(* Flush (sync) — RocksDB writes are durable on each [cf_put] /
+   [batch_write] when WAL is on (the default), so this is a no-op
+   for parity with LogStorage.sync. Provided so ChainDB.sync can
+   keep its existing signature. *)
+let flush (_t : t) : unit = ()
+
 (* --- Atomic batches ---------------------------------------------------- *)
 
 (* Multi-CF write batch. Mirrors Bitcoin Core's CCoinsViewDB::BatchWrite
@@ -267,6 +342,10 @@ let batch_put_block_header (b : batch) (hash : Types.hash256) (data : string) =
 let batch_put_block_data (b : batch) (hash : Types.hash256) (data : string) =
   Rocksdb.write_batch_put_cf b.raw b.parent.cfh_block_data
     (Cstruct.to_string hash) data
+
+let batch_delete_block_data (b : batch) (hash : Types.hash256) =
+  Rocksdb.write_batch_delete_cf b.raw b.parent.cfh_block_data
+    (Cstruct.to_string hash)
 
 let batch_put_tx (b : batch) (txid : Types.hash256) (data : string) =
   Rocksdb.write_batch_put_cf b.raw b.parent.cfh_tx
@@ -295,6 +374,10 @@ let batch_put_chain_state (b : batch) (key : string) (value : string) =
 let batch_put_undo_data (b : batch) (hash : Types.hash256) (data : string) =
   Rocksdb.write_batch_put_cf b.raw b.parent.cfh_undo_data
     (Cstruct.to_string hash) data
+
+let batch_delete_undo_data (b : batch) (hash : Types.hash256) =
+  Rocksdb.write_batch_delete_cf b.raw b.parent.cfh_undo_data
+    (Cstruct.to_string hash)
 
 let batch_put_invalidated (b : batch) (hash : Types.hash256) =
   Rocksdb.write_batch_put_cf b.raw b.parent.cfh_invalidated

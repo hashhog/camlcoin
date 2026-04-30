@@ -34,6 +34,12 @@ type config = {
        syntax (e.g. "-zmqpubrawblock=tcp://127.0.0.1:28332"). Supported
        topics: hashblock, hashtx, rawblock, rawtx, sequence (and the
        "pub*" aliases). Empty list disables the ZMQ notifier. *)
+  reindex : bool;
+    (* If true, before opening the chainstate, wipe the UTXO + chain_state
+       + undo_data CFs and the rocksdb_utxo subdirectory; then after
+       opening, replay every stored block from height 0 forward to
+       rebuild the UTXO set. Headers + block bodies + height->hash
+       are retained. Mirrors Bitcoin Core's -reindex (init.cpp). *)
 }
 
 (* ============================================================================
@@ -58,6 +64,7 @@ let default_config : config = {
   metrics_port = 9332;
   peer_bloom_filters = false;  (* Mirrors Core DEFAULT_PEERBLOOMFILTERS *)
   zmq_pub_options = [];
+  reindex = false;
 }
 
 (* Network-specific configuration *)
@@ -168,6 +175,22 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     end
   end else
     Migration.check_or_refuse_to_boot db_path;
+
+  (* -reindex pre-open phase. MUST run before Storage.ChainDB.create
+     (the wipe needs exclusive access to the on-disk RocksDB), and
+     before Migration.check_or_refuse_to_boot (the wipe leaves a fresh
+     chainstate that the migration guard would otherwise mistake for
+     an unmigrated legacy datadir). The post-open replay runs after
+     restore_chain_state populates the in-memory header chain. *)
+  if config.reindex then begin
+    match Reindex.pre_open_wipe ~data_dir:config.data_dir with
+    | Ok () ->
+      Logs.info (fun m -> m "reindex: pre-open wipe complete")
+    | Error msg ->
+      Logs.err (fun m -> m "reindex: pre-open wipe FAILED: %s" msg);
+      Printf.eprintf "[camlcoin] reindex failed: %s\n%!" msg;
+      exit 1
+  end;
   let db = Storage.ChainDB.create db_path in
 
   (* Get network config *)
@@ -228,6 +251,20 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
      RSS to 12+ GB.  4M keeps RSS under control while still caching the
      hot working set. *)
   let optimized_utxo = Utxo.OptimizedUtxoSet.create ~cache_size:4_000_000 ~rocksdb db in
+
+  (* -reindex post-open replay. With cf_chain_state cleared, restore
+     above set blocks_synced = 0 (no tip on disk). Headers were
+     reloaded from cf_block_header. Walking forward via
+     connect_stored_blocks rebuilds UTXOs + the chain_tip pointer
+     from the retained block bodies. After this returns, the daemon
+     is in the same observable state as a normal restart from a
+     valid chainstate, and IBD / FullySynced operation continues. *)
+  if config.reindex then begin
+    let n = Reindex.replay_stored_blocks chain in
+    Logs.info (fun m ->
+      m "reindex: replay finished, %d blocks rebuilt, current tip=%d"
+        n chain.blocks_synced)
+  end;
 
   (* Initialize mempool *)
   let current_height = match chain.tip with

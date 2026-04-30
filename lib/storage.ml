@@ -21,6 +21,13 @@ module type STORAGE = sig
   val iter_prefix : t -> string -> (string -> string -> unit) -> unit
 
   val sync : t -> unit
+
+  (* Remove stale `*.tmp` files from a chainstate directory left behind
+     by torn writes (e.g. a failed [Unix.rename] in [write_snapshot]).
+     Conservative: only files older than [stale_age_seconds] (default 60s)
+     are removed; only the immediate directory is scanned. Idempotent. *)
+  val cleanup_orphan_tmp_files :
+    ?stale_age_seconds:float -> string -> unit
 end
 
 (* File-based storage implementation with write-ahead log (WAL) for crash safety.
@@ -432,6 +439,31 @@ module FileStorage : STORAGE = struct
           scan_dir spath
       ) subdirs
     end
+
+  (* FileStorage doesn't write [*.tmp] files itself, but the public STORAGE
+     signature requires this entry point so callers can opt in to a
+     consistent startup-time cleanup regardless of backend. Behaviour
+     mirrors LogStorage.cleanup_orphan_tmp_files; safe to call when the
+     directory does not exist. *)
+  let cleanup_orphan_tmp_files ?(stale_age_seconds = 60.0) chainstate_dir =
+    if Sys.file_exists chainstate_dir && Sys.is_directory chainstate_dir then begin
+      let now = Unix.time () in
+      let entries =
+        try Sys.readdir chainstate_dir
+        with Sys_error _ -> [||]
+      in
+      Array.iter (fun name ->
+        if Filename.check_suffix name ".tmp" then begin
+          let full = Filename.concat chainstate_dir name in
+          match (try Some (Unix.lstat full) with Unix.Unix_error _ -> None) with
+          | Some st when st.Unix.st_kind = Unix.S_REG ->
+            let age = now -. st.Unix.st_mtime in
+            if age >= stale_age_seconds then
+              (try Unix.unlink full with Unix.Unix_error _ -> ())
+          | _ -> ()
+        end
+      ) entries
+    end
 end
 
 (* Append-only log storage implementation.  All key-value pairs live in a
@@ -805,8 +837,63 @@ module LogStorage : STORAGE = struct
 
   (* --- Public API ------------------------------------------------------ *)
 
+  (* Scan [chainstate_dir] for stale `*.tmp` files left behind by a torn
+     [write_snapshot] (the rename in [write_snapshot] failed mid-flight, or
+     the process exited between fsync and rename, leaving an orphan tmp).
+     For each tmp file older than [stale_age_seconds], remove it. We are
+     conservative: only operate inside [chainstate_dir] (no recursion), and
+     skip files younger than the threshold so an in-flight snapshot writer
+     in another process is not interfered with.
+
+     Idempotent + best-effort: any individual unlink failure is logged and
+     ignored. Called from [open_db] before any reads. *)
+  let cleanup_orphan_tmp_files ?(stale_age_seconds = 60.0) chainstate_dir =
+    if Sys.file_exists chainstate_dir && Sys.is_directory chainstate_dir then begin
+      let now = Unix.time () in
+      let entries =
+        try Sys.readdir chainstate_dir
+        with Sys_error msg ->
+          Printf.eprintf "[LogStorage] cleanup_orphan_tmp_files: readdir %s: %s\n%!"
+            chainstate_dir msg;
+          [||]
+      in
+      Array.iter (fun name ->
+        if Filename.check_suffix name ".tmp" then begin
+          let full = Filename.concat chainstate_dir name in
+          (* Only act on regular files we can stat. Skip dirs, symlinks
+             we can't follow, etc. *)
+          match (try Some (Unix.lstat full) with Unix.Unix_error _ -> None) with
+          | Some st when st.Unix.st_kind = Unix.S_REG ->
+            let age = now -. st.Unix.st_mtime in
+            if age >= stale_age_seconds then begin
+              let size = st.Unix.st_size in
+              (try
+                 Unix.unlink full;
+                 Printf.eprintf
+                   "[LogStorage] cleanup_orphan_tmp_files: removed %s \
+                    (age=%.0fs size=%d)\n%!"
+                   full age size
+               with Unix.Unix_error (e, _, _) ->
+                 Printf.eprintf
+                   "[LogStorage] cleanup_orphan_tmp_files: unlink %s failed: %s\n%!"
+                   full (Unix.error_message e))
+            end else begin
+              Printf.eprintf
+                "[LogStorage] cleanup_orphan_tmp_files: skipping %s \
+                 (too young, age=%.0fs < %.0fs)\n%!"
+                full age stale_age_seconds
+            end
+          | _ -> ()
+        end
+      ) entries
+    end
+
   let open_db path =
     ensure_dir path;
+    (* Defense against torn write_snapshot renames: scan for orphan
+       *.tmp files in the chainstate dir and remove any that are old
+       enough to be safe. Runs before any reads. *)
+    cleanup_orphan_tmp_files path;
     let log_path = Filename.concat path "data.log" in
     (* Create data.log if it doesn't exist *)
     if not (Sys.file_exists log_path) then begin

@@ -1018,7 +1018,18 @@ let prefix_chain_state  = "s"
 let prefix_undo_data    = "r"  (* undo data for chain reorg *)
 let prefix_invalidated  = "i"  (* manually invalidated block hashes *)
 
-(* Higher-level chain database built on top of the storage layer *)
+(* Higher-level chain database built on top of the storage layer.
+
+   TODO(option-d): per CAMLCOIN-UTXO-DESIGN-MEMO-2026-04-29.md, this
+   module should be replaced with a [Cf_chainstate]-backed implementation
+   that lives entirely in RocksDB column families. Today the LogStorage
+   path here is still authoritative; [Cf_chainstate] / [Migration] /
+   the new [--migrate-logstorage-to-rocksdb] CLI flag provide the target
+   schema + migration tooling but the call sites below have not yet been
+   rewritten to dispatch through the CF backend. The follow-up commit
+   should: (a) add a flag-gated [ChainDB] variant that delegates every
+   put/get/iter to [Cf_chainstate]; (b) flip the [Migration.boot_guard]
+   default to on; (c) delete the LogStorage module body. *)
 module ChainDB = struct
   (* [rocksdb_utxo] is the optional dual-read/dual-delete backend used to
      recover pre-assume-valid UTXOs that live only in the RocksDB store.

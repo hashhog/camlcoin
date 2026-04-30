@@ -117,20 +117,39 @@ let run (config : config) : unit Lwt.t =
 
   (* Initialize database *)
   let db_path = Filename.concat config.data_dir "chainstate" in
-  (* Option D boot guard: when CAMLCOIN_REQUIRE_OPTION_D_MIGRATION=1 is
-     set in the environment, refuse to start if [data.log] is present
-     but [.migration-complete] is absent. This is the auto-detect
-     described in CAMLCOIN-UTXO-DESIGN-MEMO-2026-04-29.md, gated behind
-     an opt-in env var until the ChainDB call sites are rewritten to
-     route through Cf_chainstate.
+  (* Option D boot guard (default ON as of the ChainDB → Cf_chainstate
+     cutover, see CAMLCOIN-UTXO-DESIGN-MEMO-2026-04-29.md).
 
-     TODO(option-d): once ChainDB.create is replaced with the
-     Cf_chainstate-backed equivalent, flip this gate to default-on so
-     a stale data.log can't silently shadow the new RocksDB chainstate. *)
-  (match Sys.getenv_opt "CAMLCOIN_REQUIRE_OPTION_D_MIGRATION" with
-   | Some ("1" | "true" | "yes") ->
-     Migration.check_or_refuse_to_boot db_path
-   | _ -> ());
+     If [data.log] is present but [.migration-complete] is missing the
+     legacy LogStorage data has not been migrated; ChainDB is now
+     RocksDB-CF-backed and would happily start an empty chain on top of
+     the unmigrated dir, silently abandoning the operator's history.
+     Refuse the boot instead and direct them to run the migration.
+
+     [CAMLCOIN_ALLOW_LEGACY_LOGSTORAGE=1] downgrades the refuse to a
+     loud warning. Intended for emergency rollback only — the daemon
+     will still write to RocksDB and ignore the data.log. *)
+  let legacy_escape =
+    match Sys.getenv_opt "CAMLCOIN_ALLOW_LEGACY_LOGSTORAGE" with
+    | Some ("1" | "true" | "yes") -> true
+    | _ -> false
+  in
+  if legacy_escape then begin
+    let dl = Filename.concat db_path "data.log" in
+    let mc = Filename.concat db_path ".migration-complete" in
+    if Sys.file_exists dl && not (Sys.file_exists mc) then begin
+      Logs.warn (fun m ->
+        m "CAMLCOIN_ALLOW_LEGACY_LOGSTORAGE=1: data.log present at %s \
+           but no .migration-complete marker. The daemon will boot \
+           against the new RocksDB chainstate and IGNORE data.log; \
+           run --migrate-logstorage-to-rocksdb to recover."
+          dl);
+      Printf.eprintf
+        "[boot] WARNING: legacy data.log present, ignored \
+         (CAMLCOIN_ALLOW_LEGACY_LOGSTORAGE=1)\n%!"
+    end
+  end else
+    Migration.check_or_refuse_to_boot db_path;
   let db = Storage.ChainDB.create db_path in
 
   (* Get network config *)

@@ -117,6 +117,20 @@ let run (config : config) : unit Lwt.t =
 
   (* Initialize database *)
   let db_path = Filename.concat config.data_dir "chainstate" in
+  (* Option D boot guard: when CAMLCOIN_REQUIRE_OPTION_D_MIGRATION=1 is
+     set in the environment, refuse to start if [data.log] is present
+     but [.migration-complete] is absent. This is the auto-detect
+     described in CAMLCOIN-UTXO-DESIGN-MEMO-2026-04-29.md, gated behind
+     an opt-in env var until the ChainDB call sites are rewritten to
+     route through Cf_chainstate.
+
+     TODO(option-d): once ChainDB.create is replaced with the
+     Cf_chainstate-backed equivalent, flip this gate to default-on so
+     a stale data.log can't silently shadow the new RocksDB chainstate. *)
+  (match Sys.getenv_opt "CAMLCOIN_REQUIRE_OPTION_D_MIGRATION" with
+   | Some ("1" | "true" | "yes") ->
+     Migration.check_or_refuse_to_boot db_path
+   | _ -> ());
   let db = Storage.ChainDB.create db_path in
 
   (* Get network config *)

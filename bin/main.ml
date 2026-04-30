@@ -101,13 +101,33 @@ let peer_bloom_filters_arg =
   Arg.(value & opt bool false &
     info ["peerbloomfilters"] ~docv:"BOOL" ~doc)
 
+let migrate_logstorage_arg =
+  let doc = "Run the LogStorage -> RocksDB CF migration (Option D) and \
+             exit. Streams every record from data.log into the RocksDB \
+             chainstate-rocks/ column families and renames data.log to \
+             data.log.pre-migration-bak on success. Idempotent: safe to \
+             re-run after a crash. Operator-driven; never auto-runs." in
+  Arg.(value & flag & info ["migrate-logstorage-to-rocksdb"] ~doc)
+
 (* ============================================================================
    Main Command
    ============================================================================ *)
 
 let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     p2p_port max_outbound max_inbound connect debug no_wallet prune benchmark
-    import_blocks import_utxo metrics_port peer_bloom_filters =
+    import_blocks import_utxo metrics_port peer_bloom_filters
+    migrate_logstorage =
+  (* If migrate-logstorage flag is set, run the migration and exit. *)
+  if migrate_logstorage then begin
+    Camlcoin.Cli.setup_logging debug ();
+    let base = Camlcoin.Cli.config_for_network network in
+    let data_dir = match datadir with
+      | Some d -> d
+      | None -> base.data_dir in
+    let chainstate_dir = Filename.concat data_dir "chainstate" in
+    let rc = Camlcoin.Migration.run ~chainstate_dir in
+    exit rc
+  end else
   (* If benchmark flag is set, run benchmarks and exit *)
   if benchmark then begin
     Camlcoin.Cli.setup_logging debug ();
@@ -270,7 +290,8 @@ let cmd =
     $ import_blocks_arg
     $ import_utxo_arg
     $ metrics_port_arg
-    $ peer_bloom_filters_arg)
+    $ peer_bloom_filters_arg
+    $ migrate_logstorage_arg)
 
 (* ============================================================================
    Entry Point

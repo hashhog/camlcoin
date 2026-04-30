@@ -1018,77 +1018,76 @@ let prefix_chain_state  = "s"
 let prefix_undo_data    = "r"  (* undo data for chain reorg *)
 let prefix_invalidated  = "i"  (* manually invalidated block hashes *)
 
-(* Higher-level chain database built on top of the storage layer.
+(* Higher-level chain database, Option D (Cf_chainstate-backed).
 
-   TODO(option-d): per CAMLCOIN-UTXO-DESIGN-MEMO-2026-04-29.md, this
-   module should be replaced with a [Cf_chainstate]-backed implementation
-   that lives entirely in RocksDB column families. Today the LogStorage
-   path here is still authoritative; [Cf_chainstate] / [Migration] /
-   the new [--migrate-logstorage-to-rocksdb] CLI flag provide the target
-   schema + migration tooling but the call sites below have not yet been
-   rewritten to dispatch through the CF backend. The follow-up commit
-   should: (a) add a flag-gated [ChainDB] variant that delegates every
-   put/get/iter to [Cf_chainstate]; (b) flip the [Migration.boot_guard]
-   default to on; (c) delete the LogStorage module body. *)
+   This module is the public chainstate API consumed by sync, validation,
+   block_import, peer_manager, RPC, and the test suite. Storage is now
+   in RocksDB column families via [Cf_chainstate]; the legacy
+   [LogStorage] module above is retained read-only so [Migration] can
+   convert old [data.log] datadirs to the new layout (see
+   CAMLCOIN-UTXO-DESIGN-MEMO-2026-04-29.md, Option D).
+
+   The external API (function names, signatures, and semantics) is
+   identical to the previous LogStorage-backed implementation; only the
+   underlying storage changes. The [batch] type is now backed by a
+   [Cf_chainstate.batch] (multi-CF RocksDB write batch) so all puts +
+   deletes in one [batch_write] commit atomically across all
+   namespaces, mirroring [CCoinsViewDB::BatchWrite] in
+   bitcoin-core/src/txdb.cpp:23-83. *)
 module ChainDB = struct
   (* [rocksdb_utxo] is the optional dual-read/dual-delete backend used to
      recover pre-assume-valid UTXOs that live only in the RocksDB store.
      Assume-valid IBD writes UTXOs exclusively through [OptimizedUtxoSet]
-     → Rocksdb_store.  The post-IBD gap-fill and single-block-connect
-     paths below historically read only from LogStorage, which created a
-     split-brain where any post-IBD block that spent a pre-AV output
-     failed with [TxMissingInputs].  When [rocksdb_utxo] is attached,
-     [get_utxo] falls back to RocksDB on a LogStorage miss and
-     [delete_utxo] removes from both stores so a spent output does not
-     reappear from the fallback path. *)
+     → Rocksdb_store.  When [rocksdb_utxo] is attached, [get_utxo] falls
+     back to the assume-utxo store on a CF miss and [delete_utxo]
+     removes from both stores so a spent output does not reappear from
+     the fallback path. *)
   type t = {
-    db : LogStorage.t;
+    cf : Cf_chainstate.t;
     mutable rocksdb_utxo : Rocksdb_store.t option;
   }
 
-  let create path = { db = LogStorage.open_db path; rocksdb_utxo = None }
-  let close t = LogStorage.close t.db
+  (* Open the Option-D chainstate. Lives at <datadir>/chainstate-rocks/ —
+     the same path Migration writes into. The parent dir is created
+     here so callers don't have to mkdir before passing in a fresh
+     chainstate path (matches the historical LogStorage.open_db
+     behaviour). *)
+  let create path =
+    (try Unix.mkdir path 0o755
+     with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+    let cf_path = Filename.concat path "chainstate-rocks" in
+    { cf = Cf_chainstate.open_db cf_path; rocksdb_utxo = None }
+
+  let close t = Cf_chainstate.close t.cf
 
   let attach_rocksdb_utxo t r = t.rocksdb_utxo <- Some r
 
   (* 36-byte key format used by Rocksdb_store / OptimizedUtxoSet.utxo_key.
-     Unlike LogStorage UTXO keys, there is no 1-byte prefix — the whole
-     key is txid_internal[32] ++ vout_le[4]. *)
+     [Cf_chainstate.utxo_key] uses the same layout for the CF backend. *)
   let rocksdb_utxo_key (txid : Types.hash256) (vout : int) : string =
-    let buf = Bytes.create 36 in
-    Cstruct.blit_to_bytes txid 0 buf 0 32;
-    Bytes.set buf 32 (Char.chr (vout land 0xff));
-    Bytes.set buf 33 (Char.chr ((vout lsr 8) land 0xff));
-    Bytes.set buf 34 (Char.chr ((vout lsr 16) land 0xff));
-    Bytes.set buf 35 (Char.chr ((vout lsr 24) land 0xff));
-    Bytes.unsafe_to_string buf
+    Cf_chainstate.utxo_key txid vout
 
-  (* Flush any cached-but-not-yet-persisted data to disk.  Call before
-     close to ensure no writes are lost on shutdown. *)
-  let sync t = LogStorage.sync t.db
+  (* Flush any cached-but-not-yet-persisted data to disk.  RocksDB writes
+     are durable as soon as [cf_put] / [batch_write] returns when the WAL
+     is on (the default), so this is a no-op for parity with the old
+     LogStorage.sync. Kept for ABI compatibility with callers that still
+     invoke it before close. *)
+  let sync t = Cf_chainstate.flush t.cf
 
   (* Encode height as 4-byte big-endian for lexicographic sorting *)
-  let encode_height (h : int) : string =
-    let cs = Cstruct.create 4 in
-    Cstruct.BE.set_uint32 cs 0 (Int32.of_int h);
-    Cstruct.to_string cs
-
-  let decode_height (s : string) : int =
-    let cs = Cstruct.of_string s in
-    Int32.to_int (Cstruct.BE.get_uint32 cs 0)
+  let encode_height = Cf_chainstate.encode_height
+  let decode_height = Cf_chainstate.decode_height
 
   (* Block header storage *)
   let store_block_header t (hash : Types.hash256) (header : Types.block_header) =
     let w = Serialize.writer_create () in
     Serialize.serialize_block_header w header;
-    let key = prefix_block_header ^ Cstruct.to_string hash in
-    LogStorage.put t.db key
+    Cf_chainstate.put_block_header t.cf hash
       (Cstruct.to_string (Serialize.writer_to_cstruct w))
 
   let get_block_header t (hash : Types.hash256)
       : Types.block_header option =
-    let key = prefix_block_header ^ Cstruct.to_string hash in
-    match LogStorage.get t.db key with
+    match Cf_chainstate.get_block_header t.cf hash with
     | None -> None
     | Some data ->
       let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
@@ -1098,13 +1097,11 @@ module ChainDB = struct
   let store_block t (hash : Types.hash256) (block : Types.block) =
     let w = Serialize.writer_create () in
     Serialize.serialize_block w block;
-    let key = prefix_block_data ^ Cstruct.to_string hash in
-    LogStorage.put t.db key
+    Cf_chainstate.put_block_data t.cf hash
       (Cstruct.to_string (Serialize.writer_to_cstruct w))
 
   let get_block t (hash : Types.hash256) : Types.block option =
-    let key = prefix_block_data ^ Cstruct.to_string hash in
-    match LogStorage.get t.db key with
+    match Cf_chainstate.get_block_data t.cf hash with
     | None -> None
     | Some data ->
       let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
@@ -1112,26 +1109,20 @@ module ChainDB = struct
 
   (* Height to hash mapping *)
   let set_height_hash t (height : int) (hash : Types.hash256) =
-    let key = prefix_block_height ^ encode_height height in
-    LogStorage.put t.db key (Cstruct.to_string hash)
+    Cf_chainstate.put_block_height t.cf height hash
 
   let get_hash_at_height t (height : int) : Types.hash256 option =
-    let key = prefix_block_height ^ encode_height height in
-    match LogStorage.get t.db key with
-    | None -> None
-    | Some data -> Some (Cstruct.of_string data)
+    Cf_chainstate.get_block_height t.cf height
 
   (* Transaction storage *)
   let store_transaction t (txid : Types.hash256) (tx : Types.transaction) =
     let w = Serialize.writer_create () in
     Serialize.serialize_transaction w tx;
-    let key = prefix_tx ^ Cstruct.to_string txid in
-    LogStorage.put t.db key
+    Cf_chainstate.put_tx t.cf txid
       (Cstruct.to_string (Serialize.writer_to_cstruct w))
 
   let get_transaction t (txid : Types.hash256) : Types.transaction option =
-    let key = prefix_tx ^ Cstruct.to_string txid in
-    match LogStorage.get t.db key with
+    match Cf_chainstate.get_tx t.cf txid with
     | None -> None
     | Some data ->
       let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
@@ -1139,36 +1130,21 @@ module ChainDB = struct
 
   (* UTXO storage - keyed by txid + vout for O(1) lookup *)
   let store_utxo t (txid : Types.hash256) (vout : int) (utxo_data : string) =
-    let w = Serialize.writer_create () in
-    Serialize.write_bytes w txid;
-    Serialize.write_int32_le w (Int32.of_int vout);
-    let key = prefix_utxo ^
-      Cstruct.to_string (Serialize.writer_to_cstruct w) in
-    LogStorage.put t.db key utxo_data
+    Cf_chainstate.put_utxo t.cf txid vout utxo_data
 
   let get_utxo t (txid : Types.hash256) (vout : int) : string option =
-    let w = Serialize.writer_create () in
-    Serialize.write_bytes w txid;
-    Serialize.write_int32_le w (Int32.of_int vout);
-    let key = prefix_utxo ^
-      Cstruct.to_string (Serialize.writer_to_cstruct w) in
-    match LogStorage.get t.db key with
+    match Cf_chainstate.get_utxo t.cf txid vout with
     | Some _ as v -> v
     | None ->
-      (* LogStorage miss: fall back to RocksDB if attached.  The stored
-         value format (Utxo.serialize_utxo_entry) is identical in both
+      (* CF miss: fall back to RocksDB if attached.  The stored value
+         format (Utxo.serialize_utxo_entry) is identical in both
          backends, so the fallback is a transparent string option. *)
       (match t.rocksdb_utxo with
        | None -> None
        | Some r -> Rocksdb_store.get r (rocksdb_utxo_key txid vout))
 
   let delete_utxo t (txid : Types.hash256) (vout : int) =
-    let w = Serialize.writer_create () in
-    Serialize.write_bytes w txid;
-    Serialize.write_int32_le w (Int32.of_int vout);
-    let key = prefix_utxo ^
-      Cstruct.to_string (Serialize.writer_to_cstruct w) in
-    LogStorage.delete t.db key;
+    Cf_chainstate.delete_utxo t.cf txid vout;
     (* Mirror the delete into RocksDB so a spent pre-AV output cannot
        resurface via the [get_utxo] fallback above. *)
     (match t.rocksdb_utxo with
@@ -1176,68 +1152,57 @@ module ChainDB = struct
      | Some r -> Rocksdb_store.delete r (rocksdb_utxo_key txid vout))
 
   (* Atomically apply a block's UTXO delta and advance both backends' tips.
-     LogStorage batch:  UTXO puts + deletes + chain_tip + header_tip
-     RocksDB batch:     UTXO puts + deletes + tip_height (via batch_write)
+     CF batch:        UTXO puts + deletes + chain_tip + header_tip
+     RocksDB batch:   UTXO puts + deletes + tip_height (via batch_write)
 
-     Commit order is LogStorage-first so a crash between the two commits
-     leaves rdb_tip < chain_tip, which [cli.ml]'s boot consistency check
+     Commit order is CF-first so a crash between the two commits leaves
+     rdb_tip < chain_tip, which [cli.ml]'s boot consistency check
      already handles (rewinds blocks_synced to rdb_tip; the next IBD
-     re-processes the gap using RocksDB as the authoritative pre-gap UTXO
-     snapshot via [get_utxo]'s fallback path).
-
-     This helper replaces the previous pattern in [process_new_block] and
-     [connect_stored_blocks] which split UTXO deletes (mirrored to RocksDB)
-     from UTXO puts (LogStorage-only) and advanced chain_tip without
-     touching rdb_tip at all — causing RocksDB to accumulate destructive
-     deletes with a frozen tip marker (W47 945509 wedge). *)
+     re-processes the gap using RocksDB as the authoritative pre-gap
+     UTXO snapshot via [get_utxo]'s fallback path). *)
   let apply_block_atomic t
       ~(tip_hash : Types.hash256) ~(tip_height : int)
       ~(header_tip_hash : Types.hash256) ~(header_tip_height : int)
       (ops : (Types.hash256 * int * [ `Add of string | `Del ]) list)
       : unit =
-    let ls_batch = LogStorage.batch_create () in
+    let cf_batch = Cf_chainstate.batch_create t.cf in
     let rdb_ops =
       List.rev_map (fun (txid, vout, op) ->
-        let w = Serialize.writer_create () in
-        Serialize.write_bytes w txid;
-        Serialize.write_int32_le w (Int32.of_int vout);
-        let ls_key = prefix_utxo ^
-          Cstruct.to_string (Serialize.writer_to_cstruct w) in
         let rdb_key = rocksdb_utxo_key txid vout in
         (match op with
          | `Add data ->
-           LogStorage.batch_put ls_batch ls_key data;
+           Cf_chainstate.batch_put_utxo cf_batch txid vout data;
            (rdb_key, Some data)
          | `Del ->
-           LogStorage.batch_delete ls_batch ls_key;
+           Cf_chainstate.batch_delete_utxo cf_batch txid vout;
            (rdb_key, None))
       ) ops
     in
-    LogStorage.batch_put ls_batch
-      (prefix_chain_state ^ "tip_hash") (Cstruct.to_string tip_hash);
-    LogStorage.batch_put ls_batch
-      (prefix_chain_state ^ "tip_height") (encode_height tip_height);
-    LogStorage.batch_put ls_batch
-      (prefix_chain_state ^ "header_tip_hash")
-      (Cstruct.to_string header_tip_hash);
-    LogStorage.batch_put ls_batch
-      (prefix_chain_state ^ "header_tip_height")
-      (encode_height header_tip_height);
-    LogStorage.batch_write t.db ls_batch;
+    Cf_chainstate.batch_put_chain_state cf_batch
+      "tip_hash" (Cstruct.to_string tip_hash);
+    Cf_chainstate.batch_put_chain_state cf_batch
+      "tip_height" (encode_height tip_height);
+    Cf_chainstate.batch_put_chain_state cf_batch
+      "header_tip_hash" (Cstruct.to_string header_tip_hash);
+    Cf_chainstate.batch_put_chain_state cf_batch
+      "header_tip_height" (encode_height header_tip_height);
+    Cf_chainstate.batch_write cf_batch;
     (match t.rocksdb_utxo with
      | None -> ()
      | Some r -> Rocksdb_store.batch_write ~tip_height r rdb_ops)
 
   (* Chain state - tip hash and height (validated blocks) *)
   let set_chain_tip t (hash : Types.hash256) (height : int) =
-    let batch = LogStorage.batch_create () in
-    LogStorage.batch_put batch (prefix_chain_state ^ "tip_hash") (Cstruct.to_string hash);
-    LogStorage.batch_put batch (prefix_chain_state ^ "tip_height") (encode_height height);
-    LogStorage.batch_write t.db batch
+    let batch = Cf_chainstate.batch_create t.cf in
+    Cf_chainstate.batch_put_chain_state batch "tip_hash"
+      (Cstruct.to_string hash);
+    Cf_chainstate.batch_put_chain_state batch "tip_height"
+      (encode_height height);
+    Cf_chainstate.batch_write batch
 
   let get_chain_tip t : (Types.hash256 * int) option =
-    match LogStorage.get t.db (prefix_chain_state ^ "tip_hash"),
-          LogStorage.get t.db (prefix_chain_state ^ "tip_height") with
+    match Cf_chainstate.get_chain_state t.cf "tip_hash",
+          Cf_chainstate.get_chain_state t.cf "tip_height" with
     | Some hash_str, Some height_str ->
       let hash = Cstruct.of_string hash_str in
       let height = decode_height height_str in
@@ -1245,16 +1210,17 @@ module ChainDB = struct
     | _ -> None
 
   (* Header tip - separate from chain tip (headers can be ahead of validated blocks) *)
-  (* IMPORTANT: header_tip tracks downloaded headers, chain_tip tracks validated blocks *)
   let set_header_tip t (hash : Types.hash256) (height : int) =
-    let batch = LogStorage.batch_create () in
-    LogStorage.batch_put batch (prefix_chain_state ^ "header_tip_hash") (Cstruct.to_string hash);
-    LogStorage.batch_put batch (prefix_chain_state ^ "header_tip_height") (encode_height height);
-    LogStorage.batch_write t.db batch
+    let batch = Cf_chainstate.batch_create t.cf in
+    Cf_chainstate.batch_put_chain_state batch "header_tip_hash"
+      (Cstruct.to_string hash);
+    Cf_chainstate.batch_put_chain_state batch "header_tip_height"
+      (encode_height height);
+    Cf_chainstate.batch_write batch
 
   let get_header_tip t : (Types.hash256 * int) option =
-    match LogStorage.get t.db (prefix_chain_state ^ "header_tip_hash"),
-          LogStorage.get t.db (prefix_chain_state ^ "header_tip_height") with
+    match Cf_chainstate.get_chain_state t.cf "header_tip_hash",
+          Cf_chainstate.get_chain_state t.cf "header_tip_height" with
     | Some hash_str, Some height_str ->
       let hash = Cstruct.of_string hash_str in
       let height = decode_height height_str in
@@ -1266,13 +1232,11 @@ module ChainDB = struct
     let w = Serialize.writer_create () in
     Serialize.write_bytes w block_hash;
     Serialize.write_int32_le w (Int32.of_int tx_idx);
-    let key = prefix_tx_index ^ Cstruct.to_string txid in
-    LogStorage.put t.db key
+    Cf_chainstate.put_tx_index t.cf txid
       (Cstruct.to_string (Serialize.writer_to_cstruct w))
 
   let get_tx_index t (txid : Types.hash256) : (Types.hash256 * int) option =
-    let key = prefix_tx_index ^ Cstruct.to_string txid in
-    match LogStorage.get t.db key with
+    match Cf_chainstate.get_tx_index t.cf txid with
     | None -> None
     | Some data ->
       let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
@@ -1282,106 +1246,137 @@ module ChainDB = struct
 
   (* Invalidated block tracking for invalidateblock/reconsiderblock RPCs *)
   let set_block_invalidated t (hash : Types.hash256) =
-    let key = prefix_invalidated ^ Cstruct.to_string hash in
-    LogStorage.put t.db key "1"
+    Cf_chainstate.put_invalidated t.cf hash
 
   let clear_block_invalidated t (hash : Types.hash256) =
-    let key = prefix_invalidated ^ Cstruct.to_string hash in
-    LogStorage.delete t.db key
+    Cf_chainstate.delete_invalidated t.cf hash
 
   let is_block_invalidated t (hash : Types.hash256) : bool =
-    let key = prefix_invalidated ^ Cstruct.to_string hash in
-    Option.is_some (LogStorage.get t.db key)
+    Cf_chainstate.is_invalidated t.cf hash
 
   let get_all_invalidated_blocks t : Types.hash256 list =
     let results = ref [] in
-    let prefix_len = String.length prefix_invalidated in
-    LogStorage.iter_keys t.db (fun key ->
-      if String.length key > prefix_len &&
-         String.sub key 0 prefix_len = prefix_invalidated then begin
-        let hash_str = String.sub key prefix_len (String.length key - prefix_len) in
-        results := Cstruct.of_string hash_str :: !results
-      end
-    );
+    Cf_chainstate.iter_invalidated t.cf (fun hash ->
+      results := hash :: !results);
     !results
 
-  (* Batch operations for atomic updates *)
-  let batch_create () = LogStorage.batch_create ()
+  (* Batch operations for atomic updates.
 
-  let batch_store_block_header batch (hash : Types.hash256) (header : Types.block_header) =
+     The batch type is a [Cf_chainstate.batch], but we hide it behind
+     an indirection so [batch_create] can keep its old [unit]
+     signature. The batch is materialized lazily on first put/delete
+     by stashing the parent ChainDB.t in a ref. The [batch_write]
+     entry point promotes the ref to a real batch and commits it. *)
+  type batch = {
+    mutable inner : Cf_chainstate.batch option;
+    pending : (Cf_chainstate.batch -> unit) Queue.t;
+  }
+
+  let batch_create () : batch = {
+    inner = None;
+    pending = Queue.create ();
+  }
+
+  let with_batch_for (batch : batch) (t : t) (f : Cf_chainstate.batch -> unit) =
+    let b =
+      match batch.inner with
+      | Some b -> b
+      | None ->
+        let b = Cf_chainstate.batch_create t.cf in
+        batch.inner <- Some b;
+        (* Drain previously queued operations into the now-realized batch. *)
+        Queue.iter (fun op -> op b) batch.pending;
+        Queue.clear batch.pending;
+        b
+    in
+    f b
+
+  (* When the parent ChainDB is not yet known (e.g. callers create a batch
+     and then call [batch_*_*] before [batch_write]), queue the operation
+     and replay against the real batch when [batch_write t b] runs. *)
+  let queue_op (batch : batch) (op : Cf_chainstate.batch -> unit) =
+    match batch.inner with
+    | Some b -> op b
+    | None -> Queue.add op batch.pending
+
+  let batch_store_block_header batch (hash : Types.hash256)
+      (header : Types.block_header) =
     let w = Serialize.writer_create () in
     Serialize.serialize_block_header w header;
-    let key = prefix_block_header ^ Cstruct.to_string hash in
-    LogStorage.batch_put batch key
-      (Cstruct.to_string (Serialize.writer_to_cstruct w))
+    let data = Cstruct.to_string (Serialize.writer_to_cstruct w) in
+    queue_op batch (fun b ->
+      Cf_chainstate.batch_put_block_header b hash data)
 
-  let batch_store_utxo batch (txid : Types.hash256) (vout : int) (utxo_data : string) =
-    let w = Serialize.writer_create () in
-    Serialize.write_bytes w txid;
-    Serialize.write_int32_le w (Int32.of_int vout);
-    let key = prefix_utxo ^
-      Cstruct.to_string (Serialize.writer_to_cstruct w) in
-    LogStorage.batch_put batch key utxo_data
+  let batch_store_utxo batch (txid : Types.hash256) (vout : int)
+      (utxo_data : string) =
+    queue_op batch (fun b ->
+      Cf_chainstate.batch_put_utxo b txid vout utxo_data)
 
   let batch_delete_utxo batch (txid : Types.hash256) (vout : int) =
-    let w = Serialize.writer_create () in
-    Serialize.write_bytes w txid;
-    Serialize.write_int32_le w (Int32.of_int vout);
-    let key = prefix_utxo ^
-      Cstruct.to_string (Serialize.writer_to_cstruct w) in
-    LogStorage.batch_delete batch key
+    queue_op batch (fun b ->
+      Cf_chainstate.batch_delete_utxo b txid vout)
 
   let batch_set_chain_tip batch (hash : Types.hash256) (height : int) =
-    LogStorage.batch_put batch
-      (prefix_chain_state ^ "tip_hash") (Cstruct.to_string hash);
-    LogStorage.batch_put batch
-      (prefix_chain_state ^ "tip_height") (encode_height height)
+    let h = encode_height height in
+    let hs = Cstruct.to_string hash in
+    queue_op batch (fun b ->
+      Cf_chainstate.batch_put_chain_state b "tip_hash" hs;
+      Cf_chainstate.batch_put_chain_state b "tip_height" h)
 
   let batch_set_header_tip batch (hash : Types.hash256) (height : int) =
-    LogStorage.batch_put batch
-      (prefix_chain_state ^ "header_tip_hash") (Cstruct.to_string hash);
-    LogStorage.batch_put batch
-      (prefix_chain_state ^ "header_tip_height") (encode_height height)
+    let h = encode_height height in
+    let hs = Cstruct.to_string hash in
+    queue_op batch (fun b ->
+      Cf_chainstate.batch_put_chain_state b "header_tip_hash" hs;
+      Cf_chainstate.batch_put_chain_state b "header_tip_height" h)
 
-  let batch_write t batch = LogStorage.batch_write t.db batch
+  let batch_write t (batch : batch) : unit =
+    with_batch_for batch t (fun _b -> ());
+    (match batch.inner with
+     | None -> ()  (* empty batch, nothing to commit *)
+     | Some b ->
+       Cf_chainstate.batch_write b;
+       batch.inner <- None)
 
   (* Iterate over all UTXOs *)
   let iter_utxos t f =
-    LogStorage.iter_prefix t.db prefix_utxo (fun key value ->
-      (* Extract txid and vout from key *)
-      let key_data = String.sub key 1 (String.length key - 1) in
-      let r = Serialize.reader_of_cstruct (Cstruct.of_string key_data) in
-      let txid = Serialize.read_bytes r 32 in
-      let vout = Int32.to_int (Serialize.read_int32_le r) in
-      f txid vout value
-    )
+    Rocksdb.cf_iter t.cf.db t.cf.cfh_utxo (fun key value ->
+      (* Key layout: txid(32) ++ vout_le(4), no prefix. *)
+      if String.length key = 36 then begin
+        let txid = Cstruct.of_string (String.sub key 0 32) in
+        let b0 = Char.code key.[32] in
+        let b1 = Char.code key.[33] in
+        let b2 = Char.code key.[34] in
+        let b3 = Char.code key.[35] in
+        let vout = b0 lor (b1 lsl 8) lor (b2 lsl 16) lor (b3 lsl 24) in
+        f txid vout value
+      end)
 
   (* Check if block exists *)
   let has_block t (hash : Types.hash256) : bool =
-    let key = prefix_block_data ^ Cstruct.to_string hash in
-    Option.is_some (LogStorage.get t.db key)
+    Option.is_some (Cf_chainstate.get_block_data t.cf hash)
 
   let has_block_header t (hash : Types.hash256) : bool =
-    let key = prefix_block_header ^ Cstruct.to_string hash in
-    Option.is_some (LogStorage.get t.db key)
+    Option.is_some (Cf_chainstate.get_block_header t.cf hash)
 
   let delete_block t (hash : Types.hash256) =
-    let key = prefix_block_data ^ Cstruct.to_string hash in
-    LogStorage.delete t.db key
+    Cf_chainstate.delete_block_data t.cf hash
 
   let batch_delete_block batch (hash : Types.hash256) =
-    let key = prefix_block_data ^ Cstruct.to_string hash in
-    LogStorage.batch_delete batch key
+    queue_op batch (fun b ->
+      Cf_chainstate.batch_delete_block_data b hash)
 
-  (* Undo data storage - keyed by block hash for chain reorganizations *)
+  (* Undo data storage - keyed by block hash for chain reorganizations.
+     We append a sha256 checksum to the value (matching the legacy
+     LogStorage layout) so corruption from a torn write surfaces as a
+     [None] read instead of a silently-bad block disconnect. *)
   let store_undo_data t (block_hash : Types.hash256) (undo_data : string) =
-    let key = prefix_undo_data ^ Cstruct.to_string block_hash in
     let checksum = Crypto.sha256 (Cstruct.of_string undo_data) in
-    LogStorage.put t.db key (undo_data ^ Cstruct.to_string checksum)
+    Cf_chainstate.put_undo_data t.cf block_hash
+      (undo_data ^ Cstruct.to_string checksum)
 
   let get_undo_data t (block_hash : Types.hash256) : string option =
-    let key = prefix_undo_data ^ Cstruct.to_string block_hash in
-    match LogStorage.get t.db key with
+    match Cf_chainstate.get_undo_data t.cf block_hash with
     | None -> None
     | Some raw ->
       let len = String.length raw in
@@ -1394,18 +1389,33 @@ module ChainDB = struct
         else None  (* checksum mismatch = corrupt *)
 
   let delete_undo_data t (block_hash : Types.hash256) =
-    let key = prefix_undo_data ^ Cstruct.to_string block_hash in
-    LogStorage.delete t.db key
+    Cf_chainstate.delete_undo_data t.cf block_hash
 
   (* Batch undo data operations *)
-  let batch_store_undo_data batch (block_hash : Types.hash256) (undo_data : string) =
-    let key = prefix_undo_data ^ Cstruct.to_string block_hash in
+  let batch_store_undo_data batch (block_hash : Types.hash256)
+      (undo_data : string) =
     let checksum = Crypto.sha256 (Cstruct.of_string undo_data) in
-    LogStorage.batch_put batch key (undo_data ^ Cstruct.to_string checksum)
+    let payload = undo_data ^ Cstruct.to_string checksum in
+    queue_op batch (fun b ->
+      Cf_chainstate.batch_put_undo_data b block_hash payload)
 
   let batch_delete_undo_data batch (block_hash : Types.hash256) =
-    let key = prefix_undo_data ^ Cstruct.to_string block_hash in
-    LogStorage.batch_delete batch key
+    queue_op batch (fun b ->
+      Cf_chainstate.batch_delete_undo_data b block_hash)
+
+  (* --- Ban list (peer_manager.ml) -----------------------------------------
+     Bans were stored under LogStorage prefix "B"; in the CF backend they
+     live in their own namespace ([Cf_chainstate.cf_ban_list]) so the
+     per-peer-banlist iteration no longer needs a prefix scan over a
+     mixed keyspace. *)
+  let put_ban t (addr : string) (data : string) =
+    Cf_chainstate.put_ban t.cf addr data
+
+  let delete_ban t (addr : string) =
+    Cf_chainstate.delete_ban t.cf addr
+
+  let iter_bans t (f : string -> string -> unit) =
+    Cf_chainstate.iter_bans t.cf f
 end
 
 (* ============================================================================

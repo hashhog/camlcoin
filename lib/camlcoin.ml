@@ -30,5 +30,7 @@ module Zmq_socket = Zmq_socket
 module Sig_cache = Sig_cache
 module Rocksdb = Rocksdb
 module Rocksdb_store = Rocksdb_store
+module Cf_chainstate = Cf_chainstate
+module Migration = Migration
 module Block_import = Block_import
 module Utxo_import = Utxo_import

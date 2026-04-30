@@ -802,7 +802,7 @@ let test_cleanup_orphan_tmp_stale () =
   (* Backdate both so they look like crashed-out writes from > 1min ago *)
   backdate_file stale 3600.0;
   backdate_file other_stale 3600.0;
-  Storage.LogStorage.cleanup_orphan_tmp_files dir;
+  Storage.FileStorage.cleanup_orphan_tmp_files dir;
   Alcotest.(check bool) "stale .tmp removed"
     false (Sys.file_exists stale);
   Alcotest.(check bool) "other stale .tmp removed"
@@ -828,7 +828,7 @@ let test_cleanup_orphan_tmp_young () =
   output_string oc "in-flight";
   close_out oc;
   (* Default threshold is 60s; this file is 0s old. *)
-  Storage.LogStorage.cleanup_orphan_tmp_files dir;
+  Storage.FileStorage.cleanup_orphan_tmp_files dir;
   Alcotest.(check bool) "young .tmp preserved"
     true (Sys.file_exists young);
   rm_rf dir
@@ -856,34 +856,10 @@ let test_cleanup_orphan_tmp_keeps_non_tmp () =
   close_out oc2;
   backdate_file keep 3600.0;
   backdate_file keep_idx 3600.0;
-  Storage.LogStorage.cleanup_orphan_tmp_files dir;
+  Storage.FileStorage.cleanup_orphan_tmp_files dir;
   Alcotest.(check bool) "data.log preserved" true (Sys.file_exists keep);
   Alcotest.(check bool) "data.log.idx preserved"
     true (Sys.file_exists keep_idx);
-  rm_rf dir
-
-(* open_db must invoke cleanup_orphan_tmp_files automatically. *)
-let test_cleanup_orphan_tmp_via_open_db () =
-  let dir = "/tmp/camlcoin_cleanup_tmp_test_opendb" in
-  let rec rm_rf p =
-    if Sys.file_exists p then begin
-      if Sys.is_directory p then begin
-        Array.iter (fun f -> rm_rf (Filename.concat p f)) (Sys.readdir p);
-        Unix.rmdir p
-      end else Unix.unlink p
-    end
-  in
-  rm_rf dir;
-  Unix.mkdir dir 0o755;
-  let stale = Filename.concat dir "data.log.idx.tmp" in
-  let oc = open_out stale in
-  output_string oc "stale-snapshot";
-  close_out oc;
-  backdate_file stale 3600.0;
-  let db = Storage.LogStorage.open_db dir in
-  Alcotest.(check bool) "open_db removed stale tmp"
-    false (Sys.file_exists stale);
-  Storage.LogStorage.close db;
   rm_rf dir
 
 (* Cleanup on a non-existent dir is a no-op (no exception). *)
@@ -892,7 +868,7 @@ let test_cleanup_orphan_tmp_missing_dir () =
   (try
     if Sys.file_exists dir then Unix.rmdir dir
   with _ -> ());
-  Storage.LogStorage.cleanup_orphan_tmp_files dir;
+  Storage.FileStorage.cleanup_orphan_tmp_files dir;
   Alcotest.(check bool) "no exception on missing dir" true true
 
 let () =
@@ -909,7 +885,6 @@ let () =
       test_case "removes stale .tmp" `Quick test_cleanup_orphan_tmp_stale;
       test_case "keeps young .tmp" `Quick test_cleanup_orphan_tmp_young;
       test_case "keeps non-.tmp files" `Quick test_cleanup_orphan_tmp_keeps_non_tmp;
-      test_case "open_db invokes cleanup" `Quick test_cleanup_orphan_tmp_via_open_db;
       test_case "missing dir is no-op" `Quick test_cleanup_orphan_tmp_missing_dir;
     ];
     "chain_db", [

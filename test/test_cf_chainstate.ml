@@ -165,6 +165,211 @@ let test_list_column_families () =
   Alcotest.(check bool) "has chain_state CF" true (has "chain_state");
   cleanup_tmp ()
 
+(* Ban list (Option D step 3): peer_manager's persistent ban table is
+   now a CF, not a "B"-prefixed LogStorage keyspace. Verify that
+   put/iter/delete behave correctly. *)
+let test_ban_list_roundtrip () =
+  with_db (fun db ->
+    let mk_value t =
+      let cs = Cstruct.create 8 in
+      Cstruct.BE.set_uint64 cs 0 (Int64.bits_of_float t);
+      Cstruct.to_string cs
+    in
+    Cf_chainstate.put_ban db "1.2.3.4" (mk_value 1.0);
+    Cf_chainstate.put_ban db "5.6.7.8" (mk_value 2.0);
+    Cf_chainstate.put_ban db "9.0.1.2" (mk_value 3.0);
+    Alcotest.(check (option string)) "ban 1 stored"
+      (Some (mk_value 1.0)) (Cf_chainstate.get_ban db "1.2.3.4");
+    let collected = ref [] in
+    Cf_chainstate.iter_bans db (fun addr v ->
+      collected := (addr, v) :: !collected);
+    Alcotest.(check int) "iter sees 3 bans" 3 (List.length !collected);
+    Cf_chainstate.delete_ban db "5.6.7.8";
+    Alcotest.(check (option string)) "deleted ban gone"
+      None (Cf_chainstate.get_ban db "5.6.7.8");
+    let collected2 = ref [] in
+    Cf_chainstate.iter_bans db (fun addr v ->
+      collected2 := (addr, v) :: !collected2);
+    Alcotest.(check int) "iter sees 2 bans after delete"
+      2 (List.length !collected2))
+
+(* End-to-end integration test (Option D step 3): boot a fresh ChainDB,
+   apply ~100 blocks worth of state spread across all 9 namespaces,
+   close + reopen, and verify every namespace persisted. This exercises
+   ChainDB's swap from LogStorage -> Cf_chainstate end-to-end without
+   needing a full p2p / sync / validation harness. *)
+let test_chaindb_end_to_end_100_blocks () =
+  cleanup_tmp ();
+  Unix.mkdir tmp_root 0o755;
+  let datadir = Filename.concat tmp_root "datadir" in
+  Unix.mkdir datadir 0o755;
+  let db_path = Filename.concat datadir "chainstate" in
+  let db = Storage.ChainDB.create db_path in
+  let n_blocks = 100 in
+  (* Build 100 fake block hashes and apply to every namespace. *)
+  let mk_block_hash i =
+    let b = Bytes.make 32 (Char.chr (i land 0xff)) in
+    Bytes.set b 0 (Char.chr ((i lsr 8) land 0xff));
+    Cstruct.of_bytes b
+  in
+  let mk_txid i = mk_block_hash (1_000 + i) in
+  for i = 0 to n_blocks - 1 do
+    let bh = mk_block_hash i in
+    let txid = mk_txid i in
+    (* block_header CF *)
+    let header = {
+      Types.version = Int32.of_int (i + 1);
+      prev_block = mk_block_hash (max 0 (i - 1));
+      merkle_root = mk_block_hash (i + 100);
+      timestamp = Int32.of_int (1700000000 + i);
+      bits = 0x1d00ffffl;
+      nonce = Int32.of_int i;
+    } in
+    Storage.ChainDB.store_block_header db bh header;
+    (* block_data CF — we use a tiny synthetic block *)
+    let block = { Types.header; transactions = [] } in
+    Storage.ChainDB.store_block db bh block;
+    (* block_height CF *)
+    Storage.ChainDB.set_height_hash db i bh;
+    (* tx CF — pretend a coinbase lives here *)
+    let tx_hash = txid in
+    (* Coinbase tx — single null input + a tiny output. Needs at least
+       one tx_in/tx_out so the round-trip (de)serialization doesn't
+       trip the segwit flag check. *)
+    let tx = {
+      Types.version = 1l;
+      inputs = [{
+        Types.previous_output = {
+          Types.txid = Cstruct.create 32;
+          vout = 0xffffffffl;
+        };
+        script_sig = Cstruct.empty;
+        sequence = 0xffffffffl;
+      }];
+      outputs = [{
+        Types.value = 5000000000L;
+        script_pubkey = Cstruct.empty;
+      }];
+      witnesses = [];
+      locktime = 0l;
+    } in
+    Storage.ChainDB.store_transaction db tx_hash tx;
+    (* tx_index CF *)
+    Storage.ChainDB.store_tx_index db txid bh i;
+    (* utxo CF *)
+    Storage.ChainDB.store_utxo db txid 0 (Printf.sprintf "utxo-%d" i);
+    (* undo_data CF *)
+    Storage.ChainDB.store_undo_data db bh (Printf.sprintf "undo-%d" i);
+    (* invalidated CF — mark every 10th block invalid for variety *)
+    if i mod 10 = 0 then
+      Storage.ChainDB.set_block_invalidated db bh
+  done;
+  (* chain_state CF *)
+  let tip = mk_block_hash (n_blocks - 1) in
+  Storage.ChainDB.set_chain_tip db tip (n_blocks - 1);
+  Storage.ChainDB.set_header_tip db tip (n_blocks - 1);
+  Storage.ChainDB.close db;
+  (* Reopen and verify *)
+  let db = Storage.ChainDB.create db_path in
+  for i = 0 to n_blocks - 1 do
+    let bh = mk_block_hash i in
+    let txid = mk_txid i in
+    Alcotest.(check bool)
+      (Printf.sprintf "block %d header present" i) true
+      (Option.is_some (Storage.ChainDB.get_block_header db bh));
+    Alcotest.(check bool)
+      (Printf.sprintf "block %d body present" i) true
+      (Storage.ChainDB.has_block db bh);
+    let h_at = Storage.ChainDB.get_hash_at_height db i in
+    Alcotest.(check bool)
+      (Printf.sprintf "height %d -> hash present" i) true
+      (Option.is_some h_at);
+    Alcotest.(check string)
+      (Printf.sprintf "height %d -> correct hash" i)
+      (Cstruct.to_string bh)
+      (Cstruct.to_string (Option.get h_at));
+    Alcotest.(check bool)
+      (Printf.sprintf "tx %d present" i) true
+      (Option.is_some (Storage.ChainDB.get_transaction db txid));
+    Alcotest.(check bool)
+      (Printf.sprintf "tx_index %d present" i) true
+      (Option.is_some (Storage.ChainDB.get_tx_index db txid));
+    Alcotest.(check (option string))
+      (Printf.sprintf "utxo %d preserved" i)
+      (Some (Printf.sprintf "utxo-%d" i))
+      (Storage.ChainDB.get_utxo db txid 0);
+    Alcotest.(check (option string))
+      (Printf.sprintf "undo %d preserved" i)
+      (Some (Printf.sprintf "undo-%d" i))
+      (Storage.ChainDB.get_undo_data db bh);
+    if i mod 10 = 0 then
+      Alcotest.(check bool)
+        (Printf.sprintf "block %d invalidated" i) true
+        (Storage.ChainDB.is_block_invalidated db bh)
+  done;
+  (match Storage.ChainDB.get_chain_tip db with
+   | None -> Alcotest.fail "chain tip missing after reopen"
+   | Some (h, height) ->
+     Alcotest.(check int) "tip height" (n_blocks - 1) height;
+     Alcotest.(check string) "tip hash"
+       (Cstruct.to_string tip) (Cstruct.to_string h));
+  (match Storage.ChainDB.get_header_tip db with
+   | None -> Alcotest.fail "header tip missing after reopen"
+   | Some (_, height) ->
+     Alcotest.(check int) "header tip height" (n_blocks - 1) height);
+  let invalid = Storage.ChainDB.get_all_invalidated_blocks db in
+  Alcotest.(check int) "10 invalidated blocks across 100"
+    10 (List.length invalid);
+  Storage.ChainDB.close db;
+  cleanup_tmp ()
+
+(* Boot-guard test (Option D step 3): when data.log is present but
+   .migration-complete is missing, the daemon must refuse to boot.
+   We test the underlying Migration.check_or_refuse_to_boot helper
+   in a subprocess so we can observe the exit code.
+
+   The subprocess is the test executable itself, re-invoked with a
+   marker env var set so it knows to call check_or_refuse_to_boot
+   and exit (rather than running the test harness). *)
+let test_boot_guard_refuses_unmigrated_datadir () =
+  cleanup_tmp ();
+  Unix.mkdir tmp_root 0o755;
+  let chainstate = Filename.concat tmp_root "chainstate" in
+  Unix.mkdir chainstate 0o755;
+  (* Plant a fake data.log file *)
+  let dl = Filename.concat chainstate "data.log" in
+  let oc = open_out dl in
+  output_string oc "fake-legacy-logstorage-data";
+  close_out oc;
+  (* No marker. Boot guard MUST refuse with exit 12. *)
+  let argv0 = Sys.executable_name in
+  let cmd =
+    Printf.sprintf "CAMLCOIN_TEST_BOOT_GUARD_TARGET=%s %s 2>/dev/null"
+      (Filename.quote chainstate) (Filename.quote argv0)
+  in
+  let rc = Sys.command cmd in
+  Alcotest.(check int) "boot guard refuses with exit 12" 12 rc;
+  (* Now write the marker -> guard accepts. *)
+  let mc = Filename.concat chainstate ".migration-complete" in
+  let oc = open_out mc in
+  output_string oc "complete\n";
+  close_out oc;
+  let rc = Sys.command cmd in
+  Alcotest.(check int) "boot guard accepts after marker"
+    0 rc;
+  cleanup_tmp ()
+
+(* When the test executable is invoked with CAMLCOIN_TEST_BOOT_GUARD_TARGET
+   set, it skips the alcotest run and instead exercises the boot guard
+   directly. Lets the test above observe exit 12 / 0 from the same
+   binary. *)
+let () =
+  match Sys.getenv_opt "CAMLCOIN_TEST_BOOT_GUARD_TARGET" with
+  | Some target ->
+    Migration.check_or_refuse_to_boot target;
+    exit 0
+  | None -> ()
+
 let () =
   cleanup_tmp ();
   let open Alcotest in
@@ -176,6 +381,7 @@ let () =
       test_case "height->hash" `Quick test_height_hash_mapping;
       test_case "chain_state metadata" `Quick test_chain_state_metadata;
       test_case "invalidated" `Quick test_invalidated;
+      test_case "ban list" `Quick test_ban_list_roundtrip;
     ];
     "atomic_batch", [
       test_case "multi-CF batch" `Quick test_atomic_batch;
@@ -183,5 +389,11 @@ let () =
     "persistence", [
       test_case "close+reopen" `Quick test_close_reopen;
       test_case "list CFs on disk" `Quick test_list_column_families;
+    ];
+    "option_d_integration", [
+      test_case "ChainDB end-to-end 100 blocks" `Quick
+        test_chaindb_end_to_end_100_blocks;
+      test_case "boot guard refuses unmigrated datadir" `Quick
+        test_boot_guard_refuses_unmigrated_datadir;
     ];
   ]

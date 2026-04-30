@@ -29,6 +29,11 @@ type config = {
        match Bitcoin Core's DEFAULT_PEERBLOOMFILTERS (net_processing.h:44);
        enable with --peerbloomfilters to honour MEMPOOL requests and
        bloom-filter setup messages. *)
+  zmq_pub_options : string list;
+    (* ZMQ publisher options in Bitcoin Core's "-zmqpub<topic>=<address>"
+       syntax (e.g. "-zmqpubrawblock=tcp://127.0.0.1:28332"). Supported
+       topics: hashblock, hashtx, rawblock, rawtx, sequence (and the
+       "pub*" aliases). Empty list disables the ZMQ notifier. *)
 }
 
 (* ============================================================================
@@ -52,6 +57,7 @@ let default_config : config = {
   log_categories = [];
   metrics_port = 9332;
   peer_bloom_filters = false;  (* Mirrors Core DEFAULT_PEERBLOOMFILTERS *)
+  zmq_pub_options = [];
 }
 
 (* Network-specific configuration *)
@@ -229,6 +235,33 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     | None -> 0
   in
   let mempool = Mempool.create ~utxo ~current_height () in
+
+  (* ZMQ notifier setup. Parses Bitcoin-Core-style "-zmqpub<topic>=<addr>"
+     options into endpoint configs, opens a real PUB socket per address
+     via lib/zmq_socket.ml, and wires the notifier into both the IBD
+     pipeline (block-connect / block-disconnect) and the mempool
+     (tx-acceptance / tx-removal). The notifier handle stays alive for
+     the life of the daemon and is torn down in [graceful_shutdown]. *)
+  let zmq_options =
+    List.filter_map Zmq_notify.Config.parse_zmq_option config.zmq_pub_options
+  in
+  let zmq_state =
+    if zmq_options = [] then None
+    else begin
+      let configs = Zmq_notify.Config.build_configs zmq_options in
+      let notifier = Zmq_notify.create configs in
+      match Zmq_socket.create_from_config configs with
+      | None -> None
+      | Some publisher ->
+        Zmq_socket.connect_notifier notifier publisher;
+        Logs.info (fun m ->
+          m "ZMQ: notifier active (%d topic(s) on %d endpoint(s))"
+            (List.length zmq_options)
+            (List.length configs));
+        Mempool.set_zmq_notifier mempool notifier;
+        Some (notifier, publisher)
+    end
+  in
 
   (* Load persisted mempool from previous session *)
   let mempool_path = Filename.concat config.data_dir "mempool.dat" in
@@ -819,7 +852,15 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         in
         let* () = Sync.start_ibd ~utxo_set:optimized_utxo
           ~misbehavior_handler
-          ~on_ibd_created:(fun ibd -> ibd_state_ref := Some ibd)
+          ~on_ibd_created:(fun ibd ->
+            ibd_state_ref := Some ibd;
+            (* Wire ZMQ notifier into the IBD pipeline so block-connect
+               / block-disconnect events publish on rawblock / hashblock
+               / sequence topics. Mempool was wired earlier, before the
+               IBD started. *)
+            (match zmq_state with
+             | Some (notifier, _) -> Sync.set_zmq_notifier ibd notifier
+             | None -> ()))
           ~shutdown_flag:shutdown
           chain get_peers in
         (* Clear IBD state so post-IBD listeners take over *)
@@ -942,6 +983,18 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     with exn ->
       Logs.warn (fun m ->
         m "Failed to flush UTXO: %s" (Printexc.to_string exn)));
+    (* Phase 4a: tear down the ZMQ publisher + context so the wire is
+       quiet before we close the databases. zmq_ctx_term blocks on
+       in-flight sends; LINGER=0 was set on the socket so close returns
+       immediately. Best-effort: a hung ZMQ teardown cannot block the
+       graceful path beyond this point because the whole shutdown path
+       is wrapped by the 30s watchdog. *)
+    (match zmq_state with
+     | None -> ()
+     | Some (notifier, publisher) ->
+       (try Zmq_notify.shutdown notifier with _ -> ());
+       (try Zmq_socket.close_publisher publisher with _ -> ());
+       Logs.info (fun m -> m "ZMQ: notifier shut down"));
     (* Phase 4: close databases. *)
     Logs.info (fun m -> m "closing DB");
     (try Rocksdb_store.close rocksdb

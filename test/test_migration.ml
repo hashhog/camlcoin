@@ -1,6 +1,12 @@
-(* Tests for Migration — LogStorage -> Cf_chainstate (Option D). *)
+(* Tests for Migration — legacy data.log -> Cf_chainstate (Option D). *)
 
 open Camlcoin
+
+(* Module aliases so test bodies read like the retired Storage.LogStorage
+   API. Both reader and writer live inside the Migration module since
+   the production source has been retired. *)
+module Log_reader = Migration.Log_reader
+module Log_writer = Migration.Log_writer
 
 let tmp_root = "/tmp/camlcoin_migration_test"
 
@@ -28,20 +34,20 @@ let build_fake_chainstate () =
   Unix.mkdir tmp_root 0o755;
   let chainstate = Filename.concat tmp_root "chainstate" in
   Unix.mkdir chainstate 0o755;
-  let log = Storage.LogStorage.open_db chainstate in
+  let log = Log_writer.open_db chainstate in
   (* Block header under "h" prefix *)
   let bh_hash = mk_hash 0xa0 in
-  Storage.LogStorage.put log
+  Log_writer.put log
     (Storage.prefix_block_header ^ Cstruct.to_string bh_hash)
     "block-header-bytes";
   (* Block data under "b" prefix *)
   let bd_hash = mk_hash 0xb0 in
-  Storage.LogStorage.put log
+  Log_writer.put log
     (Storage.prefix_block_data ^ Cstruct.to_string bd_hash)
     "block-data-bytes";
   (* Tx under "t" prefix *)
   let tx_hash = mk_hash 0x10 in
-  Storage.LogStorage.put log
+  Log_writer.put log
     (Storage.prefix_tx ^ Cstruct.to_string tx_hash)
     "tx-payload-bytes";
   (* UTXO under "u" prefix - key is u + txid32 + vout_le32 *)
@@ -53,7 +59,7 @@ let build_fake_chainstate () =
     Bytes.set b 34 (Char.chr 0); Bytes.set b 35 (Char.chr 0);
     Bytes.unsafe_to_string b
   in
-  Storage.LogStorage.put log
+  Log_writer.put log
     (Storage.prefix_utxo ^ u_key) "utxo-entry-bytes";
   (* Height -> hash under "n" prefix *)
   let n_hash = mk_hash 0xa0 in
@@ -62,29 +68,29 @@ let build_fake_chainstate () =
     Cstruct.BE.set_uint32 cs 0 (Int32.of_int 7);
     Cstruct.to_string cs
   in
-  Storage.LogStorage.put log
+  Log_writer.put log
     (Storage.prefix_block_height ^ height_key)
     (Cstruct.to_string n_hash);
   (* Tx index under "x" prefix *)
-  Storage.LogStorage.put log
+  Log_writer.put log
     (Storage.prefix_tx_index ^ Cstruct.to_string tx_hash)
     "tx-index-bytes";
   (* Chain state under "s" prefix *)
-  Storage.LogStorage.put log
+  Log_writer.put log
     (Storage.prefix_chain_state ^ "tip_hash")
     (Cstruct.to_string bh_hash);
-  Storage.LogStorage.put log
+  Log_writer.put log
     (Storage.prefix_chain_state ^ "tip_height")
     height_key;
   (* Undo data under "r" prefix *)
-  Storage.LogStorage.put log
+  Log_writer.put log
     (Storage.prefix_undo_data ^ Cstruct.to_string bd_hash)
     "undo-data-bytes";
   (* Invalidated under "i" prefix *)
   let inv_hash = mk_hash 0x99 in
-  Storage.LogStorage.put log
+  Log_writer.put log
     (Storage.prefix_invalidated ^ Cstruct.to_string inv_hash) "1";
-  Storage.LogStorage.close log;
+  Log_writer.close log;
   chainstate
 
 (* Verify that all records made it into the right CFs after migration. *)
@@ -209,71 +215,107 @@ let test_run_on_empty_chainstate () =
 
 (* --- Torn-record tolerance regression (Apr 28 → Apr 30 mainnet repro) --- *)
 
-(* Direct repro of the iter_prefix-walks-past-EOF bug. Open LogStorage,
-   write three records, then truncate data.log under the live handle so
-   the third record's value is no longer fully on disk. With the fix,
-   iter_prefix must skip the torn entry, surface it via
-   [n_torn_records], and yield the two intact records to the callback.
-   Without the fix, the [Hashtbl.fold] in iter_prefix raises
-   [End_of_file] inside the mutex and the entire walk aborts before
-   the callback is invoked even once. *)
+(* Helpers for patching a Log_writer-emitted snapshot. The on-disk format
+   matches the retired LogStorage exactly; we patch the watermark + each
+   entry's vlen so that try_load_snapshot accepts the stale offsets and
+   the resulting in-memory index points past EOF — the exact failure
+   condition the W30 / W31 fix guards against. *)
+let read_be64_at_path path off =
+  let ic = open_in_bin path in
+  seek_in ic off;
+  let r = ref 0 in
+  for _ = 0 to 7 do
+    r := (!r lsl 8) lor (input_byte ic)
+  done;
+  close_in ic;
+  !r
+
+let write_be64_at_path path off n =
+  let oc = open_out_gen [Open_wronly; Open_binary] 0o644 path in
+  seek_out oc off;
+  for i = 0 to 7 do
+    output_char oc (Char.chr ((n lsr ((7 - i) * 8)) land 0xff))
+  done;
+  close_out oc
+
+(* Patch the snapshot watermark to [new_watermark] so [try_load_snapshot]
+   accepts it after data.log has been truncated. *)
+let patch_snapshot_watermark chainstate new_watermark =
+  let snap = Filename.concat chainstate "data.log.idx" in
+  Alcotest.(check bool) "data.log.idx exists post-close"
+    true (Sys.file_exists snap);
+  let _orig = read_be64_at_path snap 12 in
+  write_be64_at_path snap 12 new_watermark
+
+(* Direct repro of the iter-walks-past-EOF bug, post-LogStorage retirement.
+   Build a fresh datadir with three records via Log_writer + close (close
+   writes a snapshot), then truncate data.log mid-record-3 and patch the
+   snapshot's watermark to equal the new (shorter) data.log size so that
+   the snapshot is accepted on reopen. The reopened Log_reader sees an
+   in-memory index whose entry for the third key claims more bytes than
+   the file holds — the regression condition. With the fix, iter must
+   skip the torn entry, surface it via [n_torn], and yield the two intact
+   records to the callback. *)
 let test_iter_prefix_tolerates_torn_entry () =
   cleanup_tmp ();
   Unix.mkdir tmp_root 0o755;
   let chainstate = Filename.concat tmp_root "chainstate" in
   Unix.mkdir chainstate 0o755;
-  let log = Storage.LogStorage.open_db chainstate in
-  Storage.LogStorage.put log "k1" (String.make 64 'A');
-  Storage.LogStorage.put log "k2" (String.make 64 'B');
-  Storage.LogStorage.put log "k3" (String.make 64 'C');
-  (* Truncate the live data.log so k3's value is no longer fully on
-     disk. We chop 32 bytes — well within the 64-byte value, so k3's
-     index entry now claims (offset, 64) but the file only has bytes
-     up to offset+32. *)
+  let log = Log_writer.open_db chainstate in
+  Log_writer.put log "k1" (String.make 64 'A');
+  Log_writer.put log "k2" (String.make 64 'B');
+  Log_writer.put log "k3" (String.make 64 'C');
+  Log_writer.close log;
+  (* Chop 32 bytes off the tail so k3's recorded (offset, 64) overruns
+     EOF, then patch the snapshot watermark to the new file size so
+     try_load_snapshot accepts the stale offsets. *)
   let dlog = Filename.concat chainstate "data.log" in
   let cur_size = (Unix.stat dlog).Unix.st_size in
-  Unix.truncate dlog (cur_size - 32);
-  (* Pre-fix: this raised [End_of_file] from inside iter_prefix; the
-     callback never fired. Post-fix: callback fires for the two intact
-     records, k3 is silently skipped, n_torn_records reports 1. *)
+  let new_size = cur_size - 32 in
+  Unix.truncate dlog new_size;
+  patch_snapshot_watermark chainstate new_size;
+  let log = Log_reader.open_for_migration chainstate in
   let collected = ref [] in
-  Storage.LogStorage.iter_prefix log "" (fun k v ->
+  Log_reader.iter log (fun k v ->
     collected := (k, v) :: !collected);
   Alcotest.(check int) "iter yielded the 2 intact records"
     2 (List.length !collected);
-  Alcotest.(check int) "n_torn_records counted the torn k3"
-    1 (Storage.LogStorage.n_torn_records log);
-  (* Sanity: the values returned for k1+k2 are still correct. *)
+  Alcotest.(check int) "n_torn counted the torn k3"
+    1 (Log_reader.n_torn log);
   let by_key = List.sort compare !collected in
   Alcotest.(check (list (pair string string))) "k1+k2 round-trip"
     [("k1", String.make 64 'A'); ("k2", String.make 64 'B')]
     by_key;
-  Storage.LogStorage.close log;
+  Log_reader.close log;
   cleanup_tmp ()
 
-(* iter_prefix and get share the bounds-check helper, so a torn entry
-   that iter_prefix skips must also be reported as missing (not as a
-   raised exception) via [get]. This locks the read paths together. *)
+(* iter and get share the bounds-check helper, so a torn entry that iter
+   skips must also be reported as missing (not as a raised exception)
+   via [get]. This locks the read paths together. *)
 let test_get_tolerates_torn_entry () =
   cleanup_tmp ();
   Unix.mkdir tmp_root 0o755;
   let chainstate = Filename.concat tmp_root "chainstate" in
   Unix.mkdir chainstate 0o755;
-  let log = Storage.LogStorage.open_db chainstate in
-  Storage.LogStorage.put log "live" "value-of-live-record";
-  Storage.LogStorage.put log "torn" (String.make 200 'Z');
+  let log = Log_writer.open_db chainstate in
+  Log_writer.put log "live" "value-of-live-record";
+  Log_writer.put log "torn" (String.make 200 'Z');
+  Log_writer.close log;
   let dlog = Filename.concat chainstate "data.log" in
   let cur_size = (Unix.stat dlog).Unix.st_size in
-  Unix.truncate dlog (cur_size - 100);
+  let new_size = cur_size - 100 in
+  Unix.truncate dlog new_size;
+  patch_snapshot_watermark chainstate new_size;
+  let log = Log_reader.open_for_migration chainstate in
   Alcotest.(check (option string)) "live record still readable"
     (Some "value-of-live-record")
-    (Storage.LogStorage.get log "live");
+    (Log_reader.get log "live");
   Alcotest.(check (option string)) "torn record returns None (no exception)"
     None
-    (Storage.LogStorage.get log "torn");
-  Alcotest.(check int) "n_torn_records bumped"
-    1 (Storage.LogStorage.n_torn_records log);
-  Storage.LogStorage.close log;
+    (Log_reader.get log "torn");
+  Alcotest.(check int) "n_torn bumped"
+    1 (Log_reader.n_torn log);
+  Log_reader.close log;
   cleanup_tmp ()
 
 (* Helper for the run-level synthetic-snapshot-corruption test. We need
@@ -370,17 +412,17 @@ let test_torn_tail_record_truncated_on_open () =
   Unix.mkdir tmp_root 0o755;
   let chainstate = Filename.concat tmp_root "chainstate" in
   Unix.mkdir chainstate 0o755;
-  (* Step 1: write 10 good records using the normal API + close. *)
-  let log = Storage.LogStorage.open_db chainstate in
+  (* Step 1: write 10 good records using the test fixture writer + close. *)
+  let log = Log_writer.open_db chainstate in
   for i = 0 to 9 do
     let key =
       Printf.sprintf "%c%s"
         (String.get Storage.prefix_block_data 0)
         (String.make 32 (Char.chr (i + 1)))
     in
-    Storage.LogStorage.put log key (Printf.sprintf "block-%d" i)
+    Log_writer.put log key (Printf.sprintf "block-%d" i)
   done;
-  Storage.LogStorage.close log;
+  Log_writer.close log;
   (* Step 2: drop the snapshot so the next open does a full rebuild
      (so the torn tail we are about to append exercises the
      rebuild_index truncation path, not the snapshot path). *)

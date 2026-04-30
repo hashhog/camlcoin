@@ -207,6 +207,215 @@ let test_run_on_empty_chainstate () =
     true (Sys.file_exists (Migration.complete_marker chainstate));
   cleanup_tmp ()
 
+(* --- Torn-record tolerance regression (Apr 28 → Apr 30 mainnet repro) --- *)
+
+(* Direct repro of the iter_prefix-walks-past-EOF bug. Open LogStorage,
+   write three records, then truncate data.log under the live handle so
+   the third record's value is no longer fully on disk. With the fix,
+   iter_prefix must skip the torn entry, surface it via
+   [n_torn_records], and yield the two intact records to the callback.
+   Without the fix, the [Hashtbl.fold] in iter_prefix raises
+   [End_of_file] inside the mutex and the entire walk aborts before
+   the callback is invoked even once. *)
+let test_iter_prefix_tolerates_torn_entry () =
+  cleanup_tmp ();
+  Unix.mkdir tmp_root 0o755;
+  let chainstate = Filename.concat tmp_root "chainstate" in
+  Unix.mkdir chainstate 0o755;
+  let log = Storage.LogStorage.open_db chainstate in
+  Storage.LogStorage.put log "k1" (String.make 64 'A');
+  Storage.LogStorage.put log "k2" (String.make 64 'B');
+  Storage.LogStorage.put log "k3" (String.make 64 'C');
+  (* Truncate the live data.log so k3's value is no longer fully on
+     disk. We chop 32 bytes — well within the 64-byte value, so k3's
+     index entry now claims (offset, 64) but the file only has bytes
+     up to offset+32. *)
+  let dlog = Filename.concat chainstate "data.log" in
+  let cur_size = (Unix.stat dlog).Unix.st_size in
+  Unix.truncate dlog (cur_size - 32);
+  (* Pre-fix: this raised [End_of_file] from inside iter_prefix; the
+     callback never fired. Post-fix: callback fires for the two intact
+     records, k3 is silently skipped, n_torn_records reports 1. *)
+  let collected = ref [] in
+  Storage.LogStorage.iter_prefix log "" (fun k v ->
+    collected := (k, v) :: !collected);
+  Alcotest.(check int) "iter yielded the 2 intact records"
+    2 (List.length !collected);
+  Alcotest.(check int) "n_torn_records counted the torn k3"
+    1 (Storage.LogStorage.n_torn_records log);
+  (* Sanity: the values returned for k1+k2 are still correct. *)
+  let by_key = List.sort compare !collected in
+  Alcotest.(check (list (pair string string))) "k1+k2 round-trip"
+    [("k1", String.make 64 'A'); ("k2", String.make 64 'B')]
+    by_key;
+  Storage.LogStorage.close log;
+  cleanup_tmp ()
+
+(* iter_prefix and get share the bounds-check helper, so a torn entry
+   that iter_prefix skips must also be reported as missing (not as a
+   raised exception) via [get]. This locks the read paths together. *)
+let test_get_tolerates_torn_entry () =
+  cleanup_tmp ();
+  Unix.mkdir tmp_root 0o755;
+  let chainstate = Filename.concat tmp_root "chainstate" in
+  Unix.mkdir chainstate 0o755;
+  let log = Storage.LogStorage.open_db chainstate in
+  Storage.LogStorage.put log "live" "value-of-live-record";
+  Storage.LogStorage.put log "torn" (String.make 200 'Z');
+  let dlog = Filename.concat chainstate "data.log" in
+  let cur_size = (Unix.stat dlog).Unix.st_size in
+  Unix.truncate dlog (cur_size - 100);
+  Alcotest.(check (option string)) "live record still readable"
+    (Some "value-of-live-record")
+    (Storage.LogStorage.get log "live");
+  Alcotest.(check (option string)) "torn record returns None (no exception)"
+    None
+    (Storage.LogStorage.get log "torn");
+  Alcotest.(check int) "n_torn_records bumped"
+    1 (Storage.LogStorage.n_torn_records log);
+  Storage.LogStorage.close log;
+  cleanup_tmp ()
+
+(* Helper for the run-level synthetic-snapshot-corruption test. We need
+   the index loaded by [open_db] to contain entries pointing past the
+   real on-disk EOF — which is what happens when the writer process
+   was killed mid-write and the snapshot's watermark covers records
+   the file never fully held. We build that state by:
+     1. Writing a clean datadir + closing (snapshot now exists, valid).
+     2. Truncating data.log to chop off the tail.
+     3. Patching the snapshot file's watermark field to equal the new
+        (shorter) on-disk size, so [try_load_snapshot]'s watermark
+        check passes and the stale per-entry offsets are kept. *)
+let read_be64_at ic off =
+  seek_in ic off;
+  let r = ref 0 in
+  for _ = 0 to 7 do
+    r := (!r lsl 8) lor (input_byte ic)
+  done;
+  !r
+
+let write_be64_at oc off n =
+  seek_out oc off;
+  for i = 0 to 7 do
+    output_char oc (Char.chr ((n lsr ((7 - i) * 8)) land 0xff))
+  done
+
+let corrupt_snapshot_to_make_index_torn chainstate =
+  let dlog = Filename.concat chainstate "data.log" in
+  let snap = Filename.concat chainstate "data.log.idx" in
+  Alcotest.(check bool) "data.log.idx exists post-close"
+    true (Sys.file_exists snap);
+  let cur = (Unix.stat dlog).Unix.st_size in
+  let chop = 64 in
+  Alcotest.(check bool) "data.log big enough to chop" true (cur > chop + 32);
+  let new_size = cur - chop in
+  Unix.truncate dlog new_size;
+  (* Patch watermark (bytes 12..19 of the snapshot, big-endian) to
+     equal new_size so try_load_snapshot accepts it. *)
+  let ic = open_in_bin snap in
+  let _orig_watermark = read_be64_at ic 12 in
+  close_in ic;
+  let oc = open_out_gen [Open_wronly; Open_binary] 0o644 snap in
+  write_be64_at oc 12 new_size;
+  close_out oc
+
+(* Run the full Migration.run end-to-end against a torn datadir.
+   Asserts the migration completes without raising, returns a non-
+   success code, refuses to write [.migration-complete], and leaves
+   data.log in place for repair. *)
+let test_run_refuses_to_complete_on_torn_records () =
+  let chainstate = build_fake_chainstate () in
+  corrupt_snapshot_to_make_index_torn chainstate;
+  let rc = Migration.run ~chainstate_dir:chainstate in
+  Alcotest.(check bool) "non-zero rc on torn data.log" true (rc <> 0);
+  Alcotest.(check int) "exits with the documented torn-record code"
+    4 rc;
+  Alcotest.(check bool) ".migration-complete NOT written"
+    false (Sys.file_exists (Migration.complete_marker chainstate));
+  Alcotest.(check bool) "data.log preserved (not renamed to bak)"
+    true (Sys.file_exists (Migration.data_log_path chainstate));
+  Alcotest.(check bool) "no pre-migration backup yet"
+    false (Sys.file_exists (Migration.backup_path chainstate));
+  (* Progress file should have torn>0 so the operator can see it. *)
+  let p = Migration.read_progress chainstate in
+  Alcotest.(check bool) "progress.n_torn > 0" true (p.n_torn > 0);
+  cleanup_tmp ()
+
+(* Idempotency under torn records: running the migration twice on the
+   same torn datadir must produce consistent counts and consistent
+   exit codes (both 4). The second run must not silently mark
+   complete just because RocksDB CFs already hold the records the
+   first run was able to route. *)
+let test_run_idempotent_on_torn_records () =
+  let chainstate = build_fake_chainstate () in
+  corrupt_snapshot_to_make_index_torn chainstate;
+  let rc1 = Migration.run ~chainstate_dir:chainstate in
+  Alcotest.(check int) "first run: torn rc" 4 rc1;
+  let p1 = Migration.read_progress chainstate in
+  let rc2 = Migration.run ~chainstate_dir:chainstate in
+  Alcotest.(check int) "second run: same torn rc" 4 rc2;
+  let p2 = Migration.read_progress chainstate in
+  Alcotest.(check int) "n_torn stable across runs" p1.n_torn p2.n_torn;
+  Alcotest.(check bool) "still no .migration-complete"
+    false (Sys.file_exists (Migration.complete_marker chainstate));
+  cleanup_tmp ()
+
+(* Synthetic torn-record-at-tail test, per the Apr 30 fix prompt: a
+   data.log with N good records and a single torn header at the end.
+   The pre-existing rebuild_index path already handles this by
+   truncating the partial tail; the migration must therefore complete
+   successfully, processing the N intact records without crashing. *)
+let test_torn_tail_record_truncated_on_open () =
+  cleanup_tmp ();
+  Unix.mkdir tmp_root 0o755;
+  let chainstate = Filename.concat tmp_root "chainstate" in
+  Unix.mkdir chainstate 0o755;
+  (* Step 1: write 10 good records using the normal API + close. *)
+  let log = Storage.LogStorage.open_db chainstate in
+  for i = 0 to 9 do
+    let key =
+      Printf.sprintf "%c%s"
+        (String.get Storage.prefix_block_data 0)
+        (String.make 32 (Char.chr (i + 1)))
+    in
+    Storage.LogStorage.put log key (Printf.sprintf "block-%d" i)
+  done;
+  Storage.LogStorage.close log;
+  (* Step 2: drop the snapshot so the next open does a full rebuild
+     (so the torn tail we are about to append exercises the
+     rebuild_index truncation path, not the snapshot path). *)
+  let snap = Filename.concat chainstate "data.log.idx" in
+  if Sys.file_exists snap then Unix.unlink snap;
+  (* Step 3: append a torn header to data.log: 'P' opcode + klen=4 +
+     "torn" + vlen=1000 + only 50 bytes of value. The next open's
+     rebuild_index will read past EOF on the value, hit End_of_file,
+     and truncate the file at the last valid record. *)
+  let dlog = Filename.concat chainstate "data.log" in
+  let oc = open_out_gen [Open_wronly; Open_append; Open_binary] 0o644 dlog in
+  output_char oc 'P';
+  (* klen = 4 *)
+  output_char oc '\x00'; output_char oc '\x00';
+  output_char oc '\x00'; output_char oc '\x04';
+  output_string oc "torn";
+  (* vlen header claims 1000 bytes... *)
+  output_char oc '\x00'; output_char oc '\x00';
+  output_char oc '\x03'; output_char oc '\xe8';
+  (* ...but we only write 50 bytes of value before "crashing". *)
+  output_string oc (String.make 50 'X');
+  close_out oc;
+  (* Step 4: run the migration. Expected: rebuild_index trims the
+     torn tail, the 10 good records migrate, marker is written. *)
+  let rc = Migration.run ~chainstate_dir:chainstate in
+  Alcotest.(check int) "torn-tail data.log: migration succeeds" 0 rc;
+  Alcotest.(check bool) "marker written"
+    true (Sys.file_exists (Migration.complete_marker chainstate));
+  let p = Migration.read_progress chainstate in
+  Alcotest.(check int) "no torn-index records (tail was truncated)"
+    0 p.n_torn;
+  Alcotest.(check int) "10 block_data records migrated"
+    10 p.n_block_data;
+  cleanup_tmp ()
+
 let () =
   cleanup_tmp ();
   let open Alcotest in
@@ -219,5 +428,17 @@ let () =
     ];
     "boot_guard", [
       test_case "helpers" `Quick test_boot_guard_helpers;
+    ];
+    "torn_records", [
+      test_case "iter_prefix tolerates torn entry"
+        `Quick test_iter_prefix_tolerates_torn_entry;
+      test_case "get tolerates torn entry"
+        `Quick test_get_tolerates_torn_entry;
+      test_case "run refuses to complete on torn records"
+        `Quick test_run_refuses_to_complete_on_torn_records;
+      test_case "run is idempotent on torn records"
+        `Quick test_run_idempotent_on_torn_records;
+      test_case "torn tail record truncated on open"
+        `Quick test_torn_tail_record_truncated_on_open;
     ];
   ]

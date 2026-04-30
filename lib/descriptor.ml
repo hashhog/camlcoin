@@ -622,24 +622,31 @@ let derive_key_at (key : key_expr) (index : int) : (Cstruct.t, string) result =
           | Ok ek' -> derive_path ek' rest
           end
       in
+      (* Extract the compressed pubkey from an extended_key whose key field
+         may be a 32-byte secret (xprv) or 33-byte compressed pubkey (xpub). *)
+      let pubkey_of_ek (ek : Wallet.extended_key) =
+        if Cstruct.length ek.key = 32
+        then Crypto.derive_public_key ~compressed:true ek.key
+        else ek.key
+      in
       match derive_path extkey path with
       | Error e -> Error e
       | Ok derived ->
         (* Handle wildcard derivation *)
         begin match dt with
         | NonRanged ->
-          Ok (Crypto.derive_public_key ~compressed:true derived.key)
+          Ok (pubkey_of_ek derived)
         | UnhardenedRanged ->
           begin match Wallet.derive_normal derived index with
           | Error e -> Error e
           | Ok final ->
-            Ok (Crypto.derive_public_key ~compressed:true final.key)
+            Ok (pubkey_of_ek final)
           end
         | HardenedRanged ->
           begin match Wallet.derive_hardened derived index with
           | Error e -> Error e
           | Ok final ->
-            Ok (Crypto.derive_public_key ~compressed:true final.key)
+            Ok (pubkey_of_ek final)
           end
         end
   in

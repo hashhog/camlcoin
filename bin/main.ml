@@ -85,9 +85,21 @@ let import_blocks_arg =
     info ["import-blocks"] ~docv:"PATH" ~doc)
 
 let import_utxo_arg =
-  let doc = "Import UTXO snapshot from HDOG file. Replaces existing UTXO set and sets chain tip." in
+  (* cmdliner treats unescaped '$' and '\\' specially in doc strings, so
+     the wire-format magic 'utxo<0xff>' and the path '<datadir>/...'
+     are written without those characters. *)
+  let doc = "Load a Bitcoin Core dumptxoutset (UTXO snapshot) into a fresh \
+             snapshot chainstate. The file MUST be in Core wire format \
+             (magic bytes 'utxo' followed by 0xff, version 2, \
+             ScriptCompression-encoded coins). The base blockhash and \
+             coin count are checked against camlcoin's hardcoded \
+             AssumeUTXO parameters before any coin is loaded; mismatches \
+             fail fast. Snapshot data populates a SECONDARY chainstate \
+             at <datadir>/chainstate_snapshot/; the existing IBD \
+             chainstate is left intact. The historical alias \
+             '--load-snapshot' is also accepted." in
   Arg.(value & opt (some string) None &
-    info ["import-utxo"] ~docv:"PATH" ~doc)
+    info ["import-utxo"; "load-snapshot"] ~docv:"PATH" ~doc)
 
 let metrics_port_arg =
   let doc = "Prometheus metrics port (0 to disable)." in
@@ -297,7 +309,14 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     ()
   end else match import_utxo with
   | Some utxo_path ->
-    (* UTXO snapshot import mode *)
+    (* UTXO snapshot import: Bitcoin Core dumptxoutset format.
+
+       The HDOG path retired 2026-04-29: the prior bespoke 52-byte header
+       + per-coin (txid, vout LE, amount, height, scriptlen, script)
+       layout was incompatible with the rest of the fleet and prevented
+       camlcoin from consuming snapshots produced by Bitcoin Core or any
+       other implementation. We now read Core's wire format byte-for-byte
+       (magic 'utxo\xff', VARINT/CompressAmount/ScriptCompression). *)
     Camlcoin.Cli.setup_logging debug ();
     let base = Camlcoin.Cli.config_for_network network in
     let data_dir = match datadir with
@@ -310,12 +329,31 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       | `Testnet -> Camlcoin.Consensus.testnet4
       | `Regtest -> Camlcoin.Consensus.regtest
     in
-    (match Camlcoin.Utxo_import.run ~snapshot_path:utxo_path
-             ~data_dir ~network:network_cfg with
-    | Ok count ->
-      Printf.eprintf "Successfully imported %d UTXOs\n%!" count
+    let snapshot_db_path =
+      Filename.concat data_dir "chainstate_snapshot" in
+    let on_progress (p : Camlcoin.Assume_utxo.load_progress) =
+      if Int64.rem p.coins_loaded 1_000_000L = 0L
+         && Int64.compare p.coins_loaded 0L > 0 then
+        Printf.eprintf "[utxo-import] %Ld / %Ld coins (%.1f%%)\n%!"
+          p.coins_loaded p.total_coins p.pct
+    in
+    Printf.eprintf "[utxo-import] Loading Core-format snapshot: %s\n%!"
+      utxo_path;
+    Printf.eprintf "[utxo-import] Network: %s | snapshot chainstate: %s\n%!"
+      network_cfg.Camlcoin.Consensus.name snapshot_db_path;
+    (match Camlcoin.Assume_utxo.load_snapshot
+             ~network:network_cfg
+             ~snapshot_path:utxo_path
+             ~snapshot_db_path
+             ~on_progress
+             () with
+    | Ok cs ->
+      Printf.eprintf
+        "[utxo-import] Loaded snapshot at height %d (%s)\n%!"
+        cs.tip_height
+        (Camlcoin.Types.hash256_to_hex_display cs.tip_hash)
     | Error msg ->
-      Printf.eprintf "UTXO import failed: %s\n%!" msg;
+      Printf.eprintf "[utxo-import] failed: %s\n%!" msg;
       exit 1)
   | None ->
   match import_blocks with

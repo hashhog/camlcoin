@@ -3167,16 +3167,19 @@ let handle_addnode (ctx : rpc_context)
    AssumeUTXO Handlers (loadtxoutset / dumptxoutset)
    ============================================================================ *)
 
+(* loadtxoutset and dumptxoutset both speak Bitcoin Core's [dumptxoutset]
+   wire format (magic 'utxo\xff', version 2, per-txid grouped coins with
+   ScriptCompression-encoded scriptPubKeys). The bespoke "HDOG" format is
+   retired (2026-04-29) — see lib/compressor.ml + lib/assume_utxo.ml. *)
+
 let handle_loadtxoutset (_ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
   | [`String path] ->
-    (* Read and validate snapshot metadata *)
     (match Assume_utxo.read_snapshot_metadata path
              ~expected_network_magic:_ctx.network.magic with
     | Error e -> Error e
     | Ok metadata ->
-      (* Check if snapshot blockhash is in our hardcoded params *)
       (match Assume_utxo.get_assumeutxo_for_hash ~network:_ctx.network
                metadata.base_blockhash with
       | None ->
@@ -3185,20 +3188,43 @@ let handle_loadtxoutset (_ctx : rpc_context)
                   supported for specific block heights."
                  (Types.hash256_to_hex_display metadata.base_blockhash))
       | Some params ->
-        (* Verify coins count matches *)
-        if metadata.coins_count <> params.coins_count then
+        if Int64.compare params.coins_count 0L <> 0
+           && metadata.coins_count <> params.coins_count then
           Error (Printf.sprintf
                    "Coins count mismatch: snapshot has %Ld, expected %Ld"
                    metadata.coins_count params.coins_count)
-        else
-          (* Return info about the snapshot *)
-          Ok (`Assoc [
-            ("coins_loaded", `Int (Int64.to_int metadata.coins_count));
-            ("block_hash", `String
-               (Types.hash256_to_hex_display metadata.base_blockhash));
-            ("height", `Int params.height);
-            ("path", `String path);
-          ])))
+        else begin
+          (* Stream the coins into a fresh snapshot chainstate sibling
+             directory of the active datadir. The active chainstate is
+             unaffected — this matches Core's "second chainstate" model. *)
+          let snapshot_db_path =
+            match _ctx.data_dir with
+            | Some d -> Filename.concat d "chainstate_snapshot"
+            | None ->
+              (* No datadir provided in test contexts: pick a sibling of
+                 the snapshot file so we still have a unique location. *)
+              (Filename.dirname path) ^ "/chainstate_snapshot"
+          in
+          (match Assume_utxo.load_snapshot
+                   ~network:_ctx.network
+                   ~snapshot_path:path
+                   ~snapshot_db_path
+                   () with
+          | Error msg -> Error msg
+          | Ok cs ->
+            Ok (`Assoc [
+              ("coins_loaded", `Int (Int64.to_int metadata.coins_count));
+              ("base_hash",
+                 `String (Types.hash256_to_hex_display
+                            metadata.base_blockhash));
+              ("base_height", `Int params.height);
+              ("path", `String path);
+              ("tip_hash",
+                 `String (Types.hash256_to_hex_display cs.tip_hash));
+              ("tip_height", `Int cs.tip_height);
+            ])
+          )
+        end))
   | _ ->
     Error "Invalid parameters: expected [path]"
 
@@ -3206,57 +3232,46 @@ let handle_dumptxoutset (_ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
   | [`String path] ->
-    (* Get current tip info *)
     let tip_entry = _ctx.chain.tip in
     let tip_height, tip_hash = match tip_entry with
       | Some t -> (t.height, t.hash)
       | None -> (0, Types.zero_hash)
     in
-    (* Count total coins in UTXO set *)
+    (* Count total coins in UTXO set. Single pass across the iterator. *)
     let total_coins = ref 0L in
     Storage.ChainDB.iter_utxos _ctx.chain.db (fun _txid _vout _data ->
       total_coins := Int64.add !total_coins 1L
     );
-    (* Create metadata *)
     let metadata : Assume_utxo.snapshot_metadata = {
       network_magic = _ctx.network.magic;
       base_blockhash = tip_hash;
       coins_count = !total_coins;
     } in
-    (* Write snapshot file *)
-    (try
-      let oc = open_out_bin path in
-      (* Write metadata *)
-      let w = Serialize.writer_create () in
-      Assume_utxo.serialize_metadata w metadata;
-      output_string oc (Cstruct.to_string (Serialize.writer_to_cstruct w));
-      (* Write coins *)
-      let coins_written = ref 0L in
-      Storage.ChainDB.iter_utxos _ctx.chain.db (fun txid vout data ->
-        let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
-        let utxo = Utxo.deserialize_utxo_entry r in
-        let coin : Assume_utxo.snapshot_coin = {
-          outpoint = { Types.txid; vout = Int32.of_int vout };
-          value = utxo.value;
-          script_pubkey = utxo.script_pubkey;
-          height = utxo.height;
-          is_coinbase = utxo.is_coinbase;
-        } in
-        let cw = Serialize.writer_create () in
-        Assume_utxo.serialize_coin cw coin;
-        output_string oc (Cstruct.to_string (Serialize.writer_to_cstruct cw));
-        coins_written := Int64.add !coins_written 1L
-      );
-      close_out oc;
+    let coins_written = ref 0L in
+    let res = Assume_utxo.write_snapshot path metadata
+      ~iter_coins:(fun emit ->
+        Storage.ChainDB.iter_utxos _ctx.chain.db (fun txid vout data ->
+          let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+          let utxo = Utxo.deserialize_utxo_entry r in
+          let coin : Assume_utxo.snapshot_coin = {
+            outpoint = { Types.txid; vout = Int32.of_int vout };
+            value = utxo.value;
+            script_pubkey = utxo.script_pubkey;
+            height = utxo.height;
+            is_coinbase = utxo.is_coinbase;
+          } in
+          emit coin;
+          coins_written := Int64.add !coins_written 1L))
+    in
+    (match res with
+    | Error msg -> Error msg
+    | Ok () ->
       Ok (`Assoc [
-        ("coins_dumped", `Int (Int64.to_int !coins_written));
+        ("coins_written", `Int (Int64.to_int !coins_written));
         ("base_hash", `String (Types.hash256_to_hex_display tip_hash));
         ("base_height", `Int tip_height);
         ("path", `String path);
-      ])
-    with
-    | Sys_error msg -> Error ("Failed to write snapshot: " ^ msg)
-    | _ -> Error "Failed to dump UTXO snapshot")
+      ]))
   | _ ->
     Error "Invalid parameters: expected [path]"
 

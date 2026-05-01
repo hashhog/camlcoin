@@ -2091,6 +2091,116 @@ let collect_path (state : chain_state) (from_entry : header_entry)
   in
   collect [] to_entry
 
+(* Disconnect blocks from current tip back to [target] (an ancestor of
+   the current tip). Restores UTXOs spent on the disconnected blocks
+   from each block's stored undo data and removes the outputs that the
+   disconnected blocks created. Block bodies and headers are preserved
+   on disk so the chain can be re-applied later via [reorganize].
+   Undo data for the disconnected blocks is deleted (matching what
+   [reorganize] does on its disconnect path); on re-apply, [reorganize]
+   rebuilds undo data fresh from the recovered UTXO set.
+
+   Mirrors Bitcoin Core's [TemporaryRollback] used by [dumptxoutset]
+   ([src/rpc/blockchain.cpp:3157]). The caller is responsible for
+   re-applying the chain afterwards (e.g. via [reorganize new_tip])
+   if it does not want to leave the chainstate at [target]. *)
+let disconnect_to_target (state : chain_state) (target : header_entry)
+    : (unit, string) result =
+  match state.tip with
+  | None -> Error "No current tip"
+  | Some current_tip when current_tip.height < target.height ->
+    Error (Printf.sprintf
+             "Target height %d is above current tip %d"
+             target.height current_tip.height)
+  | Some current_tip when Cstruct.equal current_tip.hash target.hash ->
+    Ok ()  (* Already at target — no-op. *)
+  | Some current_tip ->
+    (* The target must be an ancestor on the active chain. Verify by
+       walking back from current_tip until we hit target's height. *)
+    let rec walk_back (h : header_entry) : (header_entry, string) result =
+      if h.height = target.height then
+        if Cstruct.equal h.hash target.hash then Ok h
+        else Error "Target is not an ancestor of the current tip"
+      else
+        let pkey = Cstruct.to_string h.header.prev_block in
+        match Hashtbl.find_opt state.headers pkey with
+        | Some p -> walk_back p
+        | None -> Error "Cannot walk to target (missing parent)"
+    in
+    (match walk_back current_tip with
+     | Error _ as e -> e
+     | Ok _ ->
+       (* Build the list of blocks to disconnect (between target and
+          current tip), tip-first (i.e. disconnect order). *)
+       let to_disconnect = collect_path state target current_tip in
+       (* Walk tip-first applying undo per block. We collect all UTXO
+          mutations into a single batch so the disconnect is atomic
+          relative to a crash partway through. *)
+       let batch = Storage.ChainDB.batch_create () in
+       let rec disconnect = function
+         | [] -> Ok ()
+         | (entry : header_entry) :: rest ->
+           match Storage.ChainDB.get_block state.db entry.hash with
+           | None ->
+             Error (Printf.sprintf
+                      "Missing block at height %d during rollback disconnect"
+                      entry.height)
+           | Some block ->
+             match Storage.ChainDB.get_undo_data state.db entry.hash with
+             | None ->
+               Error (Printf.sprintf
+                        "Missing undo data at height %d during rollback \
+                         disconnect"
+                        entry.height)
+             | Some undo_raw ->
+               let r = Serialize.reader_of_cstruct
+                         (Cstruct.of_string undo_raw) in
+               let undo = Utxo.deserialize_undo_data r in
+               (* Remove outputs created by this block. Reverse tx order
+                  matches what [reorganize] does. *)
+               let txs = List.rev block.transactions in
+               List.iter (fun (tx : Types.transaction) ->
+                 let txid = Crypto.compute_txid tx in
+                 List.iteri (fun vout _out ->
+                   Storage.ChainDB.batch_delete_utxo batch txid vout
+                 ) tx.Types.outputs
+               ) txs;
+               (* Restore spent outputs from undo data. *)
+               List.iter (fun (tx_undo : Utxo.tx_undo) ->
+                 List.iter
+                   (fun (outpoint, (utxo_entry : Utxo.utxo_entry)) ->
+                     let data = encode_utxo utxo_entry.value
+                                  utxo_entry.script_pubkey
+                                  utxo_entry.height
+                                  utxo_entry.is_coinbase in
+                     Storage.ChainDB.batch_store_utxo batch
+                       outpoint.Types.txid
+                       (Int32.to_int outpoint.Types.vout)
+                       data
+                   ) tx_undo.spent_outputs
+               ) undo.tx_undos;
+               (* The undo data for this block is no longer valid:
+                  [reorganize] will rebuild it on the connect path
+                  when the chain is re-applied. *)
+               Storage.ChainDB.delete_undo_data state.db entry.hash;
+               disconnect rest
+       in
+       (match disconnect (List.rev to_disconnect) with
+        | Error _ as e -> e
+        | Ok () ->
+          Storage.ChainDB.batch_write state.db batch;
+          (* Clear sig cache: stale validation results from the
+             disconnected segment must not leak forward. *)
+          Sig_cache.clear_global ();
+          (* Update in-memory + on-disk chain tip pointer. *)
+          state.tip <- Some target;
+          state.blocks_synced <- target.height;
+          Storage.ChainDB.set_chain_tip state.db target.hash target.height;
+          Logs.info (fun m ->
+            m "Rollback complete: tip rewound from height %d to %d"
+              current_tip.height target.height);
+          Ok ()))
+
 (* Perform chain reorganization to new tip
    IMPORTANT: This restores UTXOs spent on the old chain and spends
    UTXOs on the new chain. This is critical for UTXO set consistency. *)

@@ -951,6 +951,302 @@ let test_verify_loaded_utxo_muhash_mismatch_uses_core_wording () =
         (Printf.sprintf "Wrong error wording: %s" msg)
 
 (* ============================================================================
+   handle_dumptxoutset rollback-mode tests
+
+   Mirrors Bitcoin Core's [src/rpc/blockchain.cpp:dumptxoutset] three-mode
+   parameter parsing: ["latest"], ["rollback"], and the named [{"rollback":
+   <h|hash>}] option. The rewind path itself is exercised over a no-op
+   tip (target == current tip) so this suite stays self-contained — full
+   multi-block reorg tests live in test_sync.ml's reorganize coverage and
+   in the regtest harness ([test/test_regtest.ml]).
+   ============================================================================ *)
+
+(* Build a minimal [Rpc.rpc_context] suitable for [handle_dumptxoutset]
+   parameter-parsing tests. The chain starts on mainnet genesis with no
+   additional blocks; that's enough to exercise the rollback selector
+   logic but obviously cannot test multi-block disconnect. *)
+let make_dump_test_ctx () =
+  let dir = temp_dir () in
+  let db_path = Filename.concat dir "chain" in
+  let db = Storage.ChainDB.create db_path in
+  let utxo = Utxo.UtxoSet.create db in
+  let chain = Sync.create_chain_state db Consensus.mainnet in
+  let mp = Mempool.create
+    ~require_standard:false
+    ~verify_scripts:false
+    ~utxo
+    ~current_height:0
+    () in
+  let pm = Peer_manager.create Consensus.mainnet in
+  let fe = Fee_estimation.create () in
+  let ctx : Rpc.rpc_context = {
+    chain;
+    mempool = mp;
+    peer_manager = pm;
+    wallet = None;
+    wallet_manager = None;
+    fee_estimator = fe;
+    network = Consensus.mainnet;
+    filter_index = None;
+    utxo = None;
+    data_dir = Some dir;
+  } in
+  (ctx, db, dir)
+
+let cleanup_dump_test_ctx db dir =
+  Storage.ChainDB.close db;
+  cleanup_dir dir
+
+let unique_dump_path label =
+  Printf.sprintf "/tmp/camlcoin_dump_%s_%d_%d.dat"
+    label (Unix.getpid ()) (Random.int 100000)
+
+let test_dump_rollback_latest_mode () =
+  let name = "dumptxoutset: \"latest\" mode emits genesis tip metadata" in
+  let (ctx, db, dir) = make_dump_test_ctx () in
+  let path = unique_dump_path "latest" in
+  (try Sys.remove path with _ -> ());
+  let result =
+    Rpc.handle_dumptxoutset ctx [`String path; `String "latest"] in
+  (try Sys.remove path with _ -> ());
+  cleanup_dump_test_ctx db dir;
+  match result with
+  | Ok (`Assoc fields) ->
+    (match List.assoc_opt "base_height" fields with
+     | Some (`Int 0) -> test_passed name
+     | Some other ->
+       test_failed name
+         (Printf.sprintf "base_height: wanted 0 (genesis), got %s"
+            (Yojson.Safe.to_string other))
+     | None -> test_failed name "missing base_height field")
+  | Ok _ -> test_failed name "expected `Assoc"
+  | Error msg -> test_failed name msg
+
+let test_dump_rollback_default_is_latest () =
+  let name = "dumptxoutset: legacy [path] form behaves as \"latest\"" in
+  let (ctx, db, dir) = make_dump_test_ctx () in
+  let path = unique_dump_path "legacy" in
+  (try Sys.remove path with _ -> ());
+  let result = Rpc.handle_dumptxoutset ctx [`String path] in
+  (try Sys.remove path with _ -> ());
+  cleanup_dump_test_ctx db dir;
+  match result with
+  | Ok (`Assoc fields) ->
+    (match List.assoc_opt "base_height" fields with
+     | Some (`Int 0) -> test_passed name
+     | _ -> test_failed name "expected base_height = 0 (genesis)")
+  | _ -> test_failed name "expected Ok `Assoc"
+
+let test_dump_rollback_no_target_genesis_chain_errors () =
+  let name =
+    "dumptxoutset: \"rollback\" w/o target on genesis-only chain errors"
+  in
+  (* No assumeutxo entry is ≤ genesis (height 0), so the selector
+     should reject this with the "no available snapshot heights" message
+     rather than silently dump genesis. Mirrors Core's behaviour when
+     [GetAvailableSnapshotHeights] returns an empty filtered list. *)
+  let (ctx, db, dir) = make_dump_test_ctx () in
+  let path = unique_dump_path "rollback_noh" in
+  (try Sys.remove path with _ -> ());
+  let result =
+    Rpc.handle_dumptxoutset ctx [`String path; `String "rollback"] in
+  (try Sys.remove path with _ -> ());
+  cleanup_dump_test_ctx db dir;
+  match result with
+  | Error msg ->
+    if try
+         let prefix = "No assumeutxo snapshot heights" in
+         String.length msg >= String.length prefix
+         && String.sub msg 0 (String.length prefix) = prefix
+       with _ -> false
+    then test_passed name
+    else
+      test_failed name
+        (Printf.sprintf "wrong error wording: %s" msg)
+  | Ok _ -> test_failed name "expected Error, got Ok"
+
+let test_dump_rollback_named_option_height_above_tip_errors () =
+  let name =
+    "dumptxoutset: rollback={height} above current tip errors"
+  in
+  let (ctx, db, dir) = make_dump_test_ctx () in
+  let path = unique_dump_path "rollback_above" in
+  (try Sys.remove path with _ -> ());
+  let result = Rpc.handle_dumptxoutset ctx [
+    `String path;
+    `String "";
+    `Assoc [("rollback", `Int 1_000)]
+  ] in
+  (try Sys.remove path with _ -> ());
+  cleanup_dump_test_ctx db dir;
+  match result with
+  | Error msg ->
+    if try
+         let needle = "after current tip" in
+         let nlen = String.length needle in
+         let mlen = String.length msg in
+         let rec search i =
+           if i + nlen > mlen then false
+           else if String.sub msg i nlen = needle then true
+           else search (i + 1)
+         in
+         search 0
+       with _ -> false
+    then test_passed name
+    else
+      test_failed name
+        (Printf.sprintf "wrong error wording: %s" msg)
+  | Ok _ -> test_failed name "expected Error, got Ok"
+
+let test_dump_rollback_named_option_height_zero_works () =
+  let name =
+    "dumptxoutset: rollback={0} on genesis chain dumps genesis (no-op rewind)"
+  in
+  (* Target == current tip (genesis at height 0) should be a no-op:
+     the rollback selector resolves the target, but [disconnect_to_target]
+     short-circuits because [Cstruct.equal target.hash tip.hash]. *)
+  let (ctx, db, dir) = make_dump_test_ctx () in
+  let path = unique_dump_path "rollback_zero" in
+  (try Sys.remove path with _ -> ());
+  let result = Rpc.handle_dumptxoutset ctx [
+    `String path;
+    `String "rollback";
+    `Assoc [("rollback", `Int 0)]
+  ] in
+  (try Sys.remove path with _ -> ());
+  cleanup_dump_test_ctx db dir;
+  match result with
+  | Ok (`Assoc fields) ->
+    (match List.assoc_opt "base_height" fields with
+     | Some (`Int 0) -> test_passed name
+     | _ -> test_failed name "expected base_height = 0")
+  | _ -> test_failed name "expected Ok `Assoc"
+
+let test_dump_rollback_negative_height_errors () =
+  let name = "dumptxoutset: rollback={-1} errors with \"is negative\"" in
+  let (ctx, db, dir) = make_dump_test_ctx () in
+  let path = unique_dump_path "rollback_neg" in
+  (try Sys.remove path with _ -> ());
+  let result = Rpc.handle_dumptxoutset ctx [
+    `String path;
+    `String "";
+    `Assoc [("rollback", `Int (-1))]
+  ] in
+  (try Sys.remove path with _ -> ());
+  cleanup_dump_test_ctx db dir;
+  match result with
+  | Error msg ->
+    if try
+         let needle = "is negative" in
+         let nlen = String.length needle in
+         let mlen = String.length msg in
+         let rec search i =
+           if i + nlen > mlen then false
+           else if String.sub msg i nlen = needle then true
+           else search (i + 1)
+         in
+         search 0
+       with _ -> false
+    then test_passed name
+    else
+      test_failed name
+        (Printf.sprintf "wrong error wording: %s" msg)
+  | Ok _ -> test_failed name "expected Error, got Ok"
+
+let test_dump_rollback_type_conflicts_with_named_option () =
+  let name =
+    "dumptxoutset: type=\"latest\" + rollback={...} option errors"
+  in
+  let (ctx, db, dir) = make_dump_test_ctx () in
+  let path = unique_dump_path "conflict" in
+  (try Sys.remove path with _ -> ());
+  let result = Rpc.handle_dumptxoutset ctx [
+    `String path;
+    `String "latest";
+    `Assoc [("rollback", `Int 0)]
+  ] in
+  (try Sys.remove path with _ -> ());
+  cleanup_dump_test_ctx db dir;
+  match result with
+  | Error msg ->
+    if try
+         let needle = "specified with rollback option" in
+         let nlen = String.length needle in
+         let mlen = String.length msg in
+         let rec search i =
+           if i + nlen > mlen then false
+           else if String.sub msg i nlen = needle then true
+           else search (i + 1)
+         in
+         search 0
+       with _ -> false
+    then test_passed name
+    else
+      test_failed name
+        (Printf.sprintf "wrong error wording: %s" msg)
+  | Ok _ -> test_failed name "expected Error, got Ok"
+
+let test_dump_rollback_invalid_type_string_errors () =
+  let name = "dumptxoutset: type=\"bogus\" errors with Core wording" in
+  let (ctx, db, dir) = make_dump_test_ctx () in
+  let path = unique_dump_path "bogus" in
+  (try Sys.remove path with _ -> ());
+  let result =
+    Rpc.handle_dumptxoutset ctx [`String path; `String "bogus"] in
+  (try Sys.remove path with _ -> ());
+  cleanup_dump_test_ctx db dir;
+  match result with
+  | Error msg ->
+    if try
+         let needle = "Please specify \"rollback\" or \"latest\"" in
+         let nlen = String.length needle in
+         let mlen = String.length msg in
+         let rec search i =
+           if i + nlen > mlen then false
+           else if String.sub msg i nlen = needle then true
+           else search (i + 1)
+         in
+         search 0
+       with _ -> false
+    then test_passed name
+    else
+      test_failed name
+        (Printf.sprintf "wrong error wording: %s" msg)
+  | Ok _ -> test_failed name "expected Error, got Ok"
+
+let test_disconnect_to_target_noop_on_current_tip () =
+  let name =
+    "Sync.disconnect_to_target: target == tip is a no-op (Ok ())"
+  in
+  let (ctx, db, dir) = make_dump_test_ctx () in
+  let result =
+    match ctx.chain.tip with
+    | Some t -> Sync.disconnect_to_target ctx.chain t
+    | None -> Error "no tip"
+  in
+  cleanup_dump_test_ctx db dir;
+  match result with
+  | Ok () -> test_passed name
+  | Error msg -> test_failed name msg
+
+let test_disconnect_to_target_unknown_target_errors () =
+  let name =
+    "Sync.disconnect_to_target: target above tip errors"
+  in
+  let (ctx, db, dir) = make_dump_test_ctx () in
+  let bogus_target : Sync.header_entry = {
+    header = Consensus.mainnet.genesis_header;
+    hash = Types.zero_hash;
+    height = 1_000_000;
+    total_work = Types.zero_hash;
+  } in
+  let result = Sync.disconnect_to_target ctx.chain bogus_target in
+  cleanup_dump_test_ctx db dir;
+  match result with
+  | Error _ -> test_passed name
+  | Ok () -> test_failed name "expected Error, got Ok"
+
+(* ============================================================================
    Main Test Runner
    ============================================================================ *)
 
@@ -1006,5 +1302,17 @@ let () =
   test_verify_loaded_utxo_hash_match ();
   test_verify_loaded_utxo_hash_mismatch_uses_core_wording ();
   test_verify_loaded_utxo_hash_rejects_muhash_value ();
+
+  (* dumptxoutset rollback-mode tests (Bitcoin Core blockchain.cpp:dumptxoutset) *)
+  test_dump_rollback_latest_mode ();
+  test_dump_rollback_default_is_latest ();
+  test_dump_rollback_no_target_genesis_chain_errors ();
+  test_dump_rollback_named_option_height_above_tip_errors ();
+  test_dump_rollback_named_option_height_zero_works ();
+  test_dump_rollback_negative_height_errors ();
+  test_dump_rollback_type_conflicts_with_named_option ();
+  test_dump_rollback_invalid_type_string_errors ();
+  test_disconnect_to_target_noop_on_current_tip ();
+  test_disconnect_to_target_unknown_target_errors ();
 
   Printf.printf "All assume_utxo tests passed!\n"

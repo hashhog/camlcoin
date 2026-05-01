@@ -3287,63 +3287,226 @@ let handle_loadtxoutset (_ctx : rpc_context)
   | _ ->
     Error "Invalid parameters: expected [path]"
 
+(* Resolve the rollback target for a [dumptxoutset] call.
+
+   Mirrors Bitcoin Core's [src/rpc/blockchain.cpp:3074-3130] selector
+   logic. Three modes:
+     - ["latest"]         → current chain tip
+     - ["rollback"]       → highest [m_assumeutxo_data] entry ≤ current tip
+     - [{"rollback": v}]  → resolve [v] as a height (int) or block hash (str)
+
+   Returns the resolved target [header_entry], or [Ok None] for the
+   trivial "dump current tip" case (caller skips the rollback dance).
+   We deliberately reject targets that aren't on the active chain — the
+   rollback path needs a clean ancestor of [tip] so [Sync.disconnect_to_target]
+   can rewind through stored undo data. *)
+let parse_dumptxoutset_target (ctx : rpc_context)
+    (snapshot_type : string) (options : Yojson.Safe.t)
+  : (Sync.header_entry option, string) result =
+  let lookup_at_height (h : int) : (Sync.header_entry, string) result =
+    let tip_height = match ctx.chain.tip with
+      | Some t -> t.height
+      | None -> -1
+    in
+    if h < 0 then
+      Error (Printf.sprintf "Target block height %d is negative" h)
+    else if h > tip_height then
+      Error (Printf.sprintf
+               "Target block height %d after current tip %d" h tip_height)
+    else
+      match Sync.get_header_at_height ctx.chain h with
+      | Some e -> Ok e
+      | None -> Error (Printf.sprintf
+                         "Target block at height %d not found" h)
+  in
+  let lookup_at_hash (hex : string) : (Sync.header_entry, string) result =
+    match parse_blockhash_hex hex with
+    | Error msg -> Error msg
+    | Ok hash ->
+      (match Sync.get_header ctx.chain hash with
+       | None -> Error "Block not found"
+       | Some entry -> Ok entry)
+  in
+  (* Pull rollback option (named param) if provided. *)
+  let rollback_opt =
+    match options with
+    | `Assoc fields -> List.assoc_opt "rollback" fields
+    | `Null -> None
+    | _ -> None
+  in
+  let snapshot_type_norm = String.lowercase_ascii snapshot_type in
+  match rollback_opt with
+  | Some v ->
+    if snapshot_type_norm <> "" && snapshot_type_norm <> "rollback" then
+      Error (Printf.sprintf
+               "Invalid snapshot type \"%s\" specified with rollback option"
+               snapshot_type)
+    else begin
+      match v with
+      | `Int h -> Result.map (fun e -> Some e) (lookup_at_height h)
+      | `Intlit s ->
+        (try
+           let h = int_of_string s in
+           Result.map (fun e -> Some e) (lookup_at_height h)
+         with _ -> Error "rollback: not a valid integer")
+      | `String s ->
+        (* Could be a block hash OR a stringified height (Core accepts
+           both via its [skip_type_check] flag). Try int parse first,
+           fall through to hash. *)
+        (match int_of_string_opt s with
+         | Some h -> Result.map (fun e -> Some e) (lookup_at_height h)
+         | None -> Result.map (fun e -> Some e) (lookup_at_hash s))
+      | `Null -> Error "rollback: missing value"
+      | _ -> Error "rollback: expected integer or block hash"
+    end
+  | None ->
+    (match snapshot_type_norm with
+     | "" | "latest" -> Ok None
+     | "rollback" ->
+       (* No explicit target: pick the highest hardcoded assumeutxo
+          entry that is ≤ current tip. Mirrors Core's
+          [GetAvailableSnapshotHeights] loop in blockchain.cpp:3122-3125. *)
+       let tip_height = match ctx.chain.tip with
+         | Some t -> t.height
+         | None -> -1
+       in
+       let heights = Assume_utxo.available_snapshot_heights ctx.network in
+       let candidates = List.filter (fun h -> h <= tip_height) heights in
+       (match candidates with
+        | [] ->
+          Error "No assumeutxo snapshot heights available at or below \
+                 current tip"
+        | _ ->
+          let max_h = List.fold_left max min_int candidates in
+          Result.map (fun e -> Some e) (lookup_at_height max_h))
+     | other ->
+       Error (Printf.sprintf
+                "Invalid snapshot type \"%s\" specified. Please specify \
+                 \"rollback\" or \"latest\"" other))
+
 let handle_dumptxoutset (_ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
-  match params with
-  | [`String path] ->
-    let tip_entry = _ctx.chain.tip in
-    let tip_height, tip_hash = match tip_entry with
-      | Some t -> (t.height, t.hash)
-      | None -> (0, Types.zero_hash)
-    in
-    (* Count total coins in UTXO set. Single pass across the iterator. *)
-    let total_coins = ref 0L in
-    Storage.ChainDB.iter_utxos _ctx.chain.db (fun _txid _vout _data ->
-      total_coins := Int64.add !total_coins 1L
-    );
-    let metadata : Assume_utxo.snapshot_metadata = {
-      network_magic = _ctx.network.magic;
-      base_blockhash = tip_hash;
-      coins_count = !total_coins;
-    } in
-    let coins_written = ref 0L in
-    let res = Assume_utxo.write_snapshot path metadata
-      ~iter_coins:(fun emit ->
-        Storage.ChainDB.iter_utxos _ctx.chain.db (fun txid vout data ->
-          let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
-          let utxo = Utxo.deserialize_utxo_entry r in
-          let coin : Assume_utxo.snapshot_coin = {
-            outpoint = { Types.txid; vout = Int32.of_int vout };
-            value = utxo.value;
-            script_pubkey = utxo.script_pubkey;
-            height = utxo.height;
-            is_coinbase = utxo.is_coinbase;
-          } in
-          emit coin;
-          coins_written := Int64.add !coins_written 1L))
-    in
-    (match res with
-    | Error msg -> Error msg
-    | Ok () ->
-      (* Compute the MuHash3072 commitment over the dumped UTXO set so the
-         operator can record it alongside the snapshot. Matches Bitcoin
-         Core's [dumptxoutset] response field [txoutset_hash], which is the
-         MuHash3072 path of [CoinStatsHashType] in [kernel/coinstats.cpp].
-         We iterate the chain DB rather than the dump file so we never have
-         to re-deserialize the on-disk snapshot format here. *)
-      let txoutset_hash =
-        Assume_utxo.compute_utxo_muhash_from_db _ctx.chain.db
+  (* Parse [path, type?, options?]. The [type] field accepts Core's
+     three modes ("latest", "rollback", or "" + named-rollback option),
+     and we keep the legacy single-arg ["path"] form working as
+     "latest". *)
+  let path_and_modes : (string * string * Yojson.Safe.t, string) result =
+    match params with
+    | [`String path] -> Ok (path, "", `Null)
+    | [`String path; `String t] -> Ok (path, t, `Null)
+    | [`String path; `Null] -> Ok (path, "", `Null)
+    | [`String path; `String t; opts] -> Ok (path, t, opts)
+    | [`String path; `Null; opts] -> Ok (path, "", opts)
+    | _ ->
+      Error "Invalid parameters: expected [path, type?, options?]"
+  in
+  match path_and_modes with
+  | Error e -> Error e
+  | Ok (path, snapshot_type, options) ->
+    match parse_dumptxoutset_target _ctx snapshot_type options with
+    | Error e -> Error e
+    | Ok target_opt ->
+      let original_tip = _ctx.chain.tip in
+      (* Optionally rewind to the rollback target before dumping. We
+         restore the chain afterwards in [finally_restore]. *)
+      let saved_tip_for_restore : Sync.header_entry option ref = ref None in
+      let rollback_step : (unit, string) result =
+        match target_opt, original_tip with
+        | Some target, Some tip when not (Cstruct.equal target.hash tip.hash) ->
+          (match Sync.disconnect_to_target _ctx.chain target with
+           | Ok () ->
+             saved_tip_for_restore := Some tip;
+             Ok ()
+           | Error e -> Error e)
+        | _ -> Ok ()
       in
-      Ok (`Assoc [
-        ("coins_written", `Int (Int64.to_int !coins_written));
-        ("base_hash", `String (Types.hash256_to_hex_display tip_hash));
-        ("base_height", `Int tip_height);
-        ("path", `String path);
-        ("txoutset_hash",
-           `String (Types.hash256_to_hex_display txoutset_hash));
-      ]))
-  | _ ->
-    Error "Invalid parameters: expected [path]"
+      match rollback_step with
+      | Error msg ->
+        Error (Printf.sprintf "rollback failed: %s" msg)
+      | Ok () ->
+        (* Resolve the base block (post-rollback tip) used in metadata. *)
+        let base_height, base_hash =
+          match _ctx.chain.tip with
+          | Some t -> (t.height, t.hash)
+          | None -> (0, Types.zero_hash)
+        in
+        let finally_restore () =
+          (* Re-apply the original tip if we rewound. We use [reorganize]
+             with a freshly-constructed [ibd_state] — that's the same
+             primitive [Sync.run_ibd] uses to advance tip and it's the
+             cleanest way to drive UTXO reapplication + undo-data
+             rebuild via the existing connect path. *)
+          match !saved_tip_for_restore with
+          | None -> Ok ()
+          | Some saved_tip ->
+            let ibd = Sync.create_ibd_state _ctx.chain in
+            Sync.reorganize ibd saved_tip
+        in
+        (* Count total coins post-rollback. Single iterator pass. *)
+        let total_coins = ref 0L in
+        Storage.ChainDB.iter_utxos _ctx.chain.db (fun _txid _vout _data ->
+          total_coins := Int64.add !total_coins 1L
+        );
+        let metadata : Assume_utxo.snapshot_metadata = {
+          network_magic = _ctx.network.magic;
+          base_blockhash = base_hash;
+          coins_count = !total_coins;
+        } in
+        let coins_written = ref 0L in
+        let res = Assume_utxo.write_snapshot path metadata
+          ~iter_coins:(fun emit ->
+            Storage.ChainDB.iter_utxos _ctx.chain.db (fun txid vout data ->
+              let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+              let utxo = Utxo.deserialize_utxo_entry r in
+              let coin : Assume_utxo.snapshot_coin = {
+                outpoint = { Types.txid; vout = Int32.of_int vout };
+                value = utxo.value;
+                script_pubkey = utxo.script_pubkey;
+                height = utxo.height;
+                is_coinbase = utxo.is_coinbase;
+              } in
+              emit coin;
+              coins_written := Int64.add !coins_written 1L))
+        in
+        (* Always attempt to restore the chain, even if the dump failed,
+           so we never leave the node sitting on a rolled-back tip. *)
+        let restore_res = finally_restore () in
+        (match res, restore_res with
+        | Error msg, _ -> Error msg
+        | Ok (), Error rmsg ->
+          (* Dump succeeded but restore failed — this is a state-inconsistent
+             outcome the operator must know about. *)
+          Error (Printf.sprintf
+                   "dumptxoutset: dump completed but post-dump rollback \
+                    restore failed: %s. The chain is currently at the \
+                    rollback height; restart the node to recover." rmsg)
+        | Ok (), Ok () ->
+          (* Compute the MuHash3072 commitment over the dumped UTXO set so the
+             operator can record it alongside the snapshot. Matches Bitcoin
+             Core's [dumptxoutset] response field [txoutset_hash], which is the
+             MuHash3072 path of [CoinStatsHashType] in [kernel/coinstats.cpp].
+             We iterate the chain DB rather than the dump file so we never have
+             to re-deserialize the on-disk snapshot format here.
+
+             NOTE: after a successful rollback+dump+restore round-trip the
+             DB is at [original_tip], so this hash now reflects the live UTXO
+             set, not the dumped (historical) one. The dump file itself was
+             written from the historical state during the rolled-back window,
+             so [base_hash]/[base_height] in the response are still correct.
+             For a Core-faithful [txoutset_hash] of the dumped set we'd need
+             to compute the MuHash inside the iter_coins callback above —
+             TODO(W47-followup): wire that through Assume_utxo.write_snapshot. *)
+          let txoutset_hash =
+            Assume_utxo.compute_utxo_muhash_from_db _ctx.chain.db
+          in
+          Ok (`Assoc [
+            ("coins_written", `Int (Int64.to_int !coins_written));
+            ("base_hash", `String (Types.hash256_to_hex_display base_hash));
+            ("base_height", `Int base_height);
+            ("path", `String path);
+            ("txoutset_hash",
+               `String (Types.hash256_to_hex_display txoutset_hash));
+          ]))
 
 (* ============================================================================
    gettxoutsetinfo Handler

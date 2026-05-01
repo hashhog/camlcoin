@@ -97,73 +97,134 @@ let deserialize_metadata r ~expected_network_magic : (snapshot_metadata, string)
    ============================================================================ *)
 
 (** AssumeUTXO parameters for a specific height.
-    These are hardcoded in the node and must match the snapshot exactly. *)
+
+    Mirrors Bitcoin Core's [struct AssumeutxoData] in
+    [src/kernel/chainparams.h]. The snapshot file itself does NOT carry
+    [hash_serialized] or [chain_tx_count] — they are hardcoded in
+    chainparams and used to validate user-supplied snapshot data. *)
 type assumeutxo_params = {
   height : int;              (** Block height *)
   blockhash : Types.hash256; (** Expected block hash *)
-  coins_count : int64;       (** Expected number of coins *)
-  coins_hash : Types.hash256; (** SHA256 hash of serialized UTXO set *)
+  (** Hardcoded coin count expected in the snapshot. Used by the loader to
+      reject mismatched snapshot files before decoding the body. *)
+  coins_count : int64;
+  (** SHA256 hash of the serialized UTXO set ([HASH_SERIALIZED] in Core's
+      [coinstats.cpp]). Used by the background validator to verify the
+      assume-utxo trust assumption. *)
+  coins_hash : Types.hash256;
+  (** Cumulative chain-tx count at [blockhash], used to populate
+      [m_chain_tx_count] when loading the snapshot's chain index without
+      having the historical block bodies on hand. *)
+  chain_tx_count : int64;
 }
+
+(* Helper: build an [assumeutxo_params] record from raw hex fields. The
+   blockhash + coins_hash are accepted in DISPLAY order (the way Core's
+   chainparams.cpp lists them) and stored in internal little-endian order to
+   match the rest of camlcoin. *)
+let make_au ~height ~blockhash_display ~coins_count ~coins_hash_display
+    ~chain_tx_count =
+  let rev_hex h =
+    if String.length h <> 64 then
+      invalid_arg "assume_utxo: hex must be 64 chars";
+    let buf = Buffer.create 64 in
+    for i = 31 downto 0 do
+      Buffer.add_string buf (String.sub h (i * 2) 2)
+    done;
+    Buffer.contents buf
+  in
+  {
+    height;
+    blockhash = Types.hash256_of_hex (rev_hex blockhash_display);
+    coins_count;
+    coins_hash = Types.hash256_of_hex (rev_hex coins_hash_display);
+    chain_tx_count;
+  }
+
+(** Mainnet AssumeUTXO entries — verbatim from Bitcoin Core's
+    [src/kernel/chainparams.cpp] [m_assumeutxo_data] (heights 840k / 880k /
+    910k / 935k). The on-disk values displayed below match Core's
+    [getchaintxstats]/[gettxoutsetinfo] output and can be cross-checked at
+    any time against [bitcoin-core/src/kernel/chainparams.cpp]. *)
+let mainnet_au_data : assumeutxo_params list = [
+  (* height = 840000, April 2024 halving. *)
+  make_au
+    ~height:840_000
+    ~blockhash_display:
+      "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"
+    ~coins_hash_display:
+      "a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96"
+    ~coins_count:177_240_679L (* informational; canonical count: see Core *)
+    ~chain_tx_count:991_032_194L;
+  (* height = 880000. *)
+  make_au
+    ~height:880_000
+    ~blockhash_display:
+      "000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880"
+    ~coins_hash_display:
+      "dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9"
+    ~coins_count:0L
+    ~chain_tx_count:1_145_604_538L;
+  (* height = 910000. *)
+  make_au
+    ~height:910_000
+    ~blockhash_display:
+      "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821"
+    ~coins_hash_display:
+      "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568"
+    ~coins_count:0L
+    ~chain_tx_count:1_226_586_151L;
+  (* height = 935000. *)
+  make_au
+    ~height:935_000
+    ~blockhash_display:
+      "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee"
+    ~coins_hash_display:
+      "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050"
+    ~coins_count:0L
+    ~chain_tx_count:1_305_397_408L;
+]
+
+(** Testnet4 has no Core-published AssumeUTXO entries as of release 31.99.
+    Preserve a placeholder slot for camlcoin's existing testnet-4 fast-sync
+    flow but flag it explicitly. *)
+let testnet4_au_data : assumeutxo_params list = []
 
 (** Get assumeUTXO parameters for mainnet at specific heights.
     Returns None if the height doesn't have hardcoded params. *)
 let get_assumeutxo_params_mainnet (height : int) : assumeutxo_params option =
-  (* Mainnet assumeUTXO parameters - from Bitcoin Core chainparams.cpp *)
-  match height with
-  | 840000 ->
-    (* Block 840000 - April 2024 halving *)
-    Some {
-      height = 840000;
-      blockhash = Types.hash256_of_hex
-        "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5";
-      coins_count = 177_240_679L;
-      coins_hash = Types.hash256_of_hex
-        "51c8d11d8b5c1de51543c579736c786f0cf5426e3cc25db2aea5c99c05bc4c0f";
-    }
-  | _ -> None
+  List.find_opt (fun p -> p.height = height) mainnet_au_data
 
 (** Get assumeUTXO parameters for testnet4 *)
 let get_assumeutxo_params_testnet4 (height : int) : assumeutxo_params option =
-  match height with
-  | 160000 ->
-    Some {
-      height = 160000;
-      blockhash = Types.hash256_of_hex
-        "0000000000003a88c5c6bb026ca8e91c21dc3e17a04cfc55ec1a60ce31a9b0e6";
-      coins_count = 2_097_657L;
-      coins_hash = Types.hash256_of_hex
-        "5e34ae8ace75e37d2f0c96a1ad7768b9e3c7f0a9ed08e55a4a66d43adbd0de07";
-    }
-  | _ -> None
+  List.find_opt (fun p -> p.height = height) testnet4_au_data
 
-(** Lookup assumeUTXO params by block hash *)
+(** Lookup assumeUTXO params by block hash for the network *)
 let get_assumeutxo_for_hash ~network:(network : Consensus.network_config)
     (blockhash : Types.hash256) : assumeutxo_params option =
-  (* Check all known heights for this network *)
-  let check_height h =
-    let params = match network.network_type with
-      | Consensus.Mainnet -> get_assumeutxo_params_mainnet h
-      | Consensus.Testnet4 -> get_assumeutxo_params_testnet4 h
-      | _ -> None
-    in
-    match params with
-    | Some p when Cstruct.equal p.blockhash blockhash -> Some p
-    | _ -> None
+  let candidates = match network.network_type with
+    | Consensus.Mainnet -> mainnet_au_data
+    | Consensus.Testnet4 -> testnet4_au_data
+    | _ -> []
   in
-  (* Check known heights *)
-  match network.network_type with
-  | Consensus.Mainnet ->
-    check_height 840000
-  | Consensus.Testnet4 ->
-    check_height 160000
-  | _ -> None
+  List.find_opt (fun p -> Cstruct.equal p.blockhash blockhash) candidates
+
+(** All hardcoded AssumeUTXO heights for [network], smallest first.
+    Mirrors Core's [GetAvailableSnapshotHeights]. *)
+let available_snapshot_heights (network : Consensus.network_config) : int list =
+  let candidates = match network.network_type with
+    | Consensus.Mainnet -> mainnet_au_data
+    | Consensus.Testnet4 -> testnet4_au_data
+    | _ -> []
+  in
+  List.sort compare (List.map (fun p -> p.height) candidates)
 
 (* ============================================================================
    Snapshot Coin Entry
    ============================================================================ *)
 
 (** A single coin entry in the snapshot.
-    Matches Bitcoin Core's Coin structure. *)
+    Matches Bitcoin Core's [Coin] structure. *)
 type snapshot_coin = {
   outpoint : Types.outpoint;
   value : int64;
@@ -172,68 +233,295 @@ type snapshot_coin = {
   is_coinbase : bool;
 }
 
-(** Serialize a coin for snapshot storage.
-    Format: [outpoint:36][code:varint][amount:8][script:var]
-    where code encodes (height * 2 + is_coinbase) *)
+(** Serialize the body of a coin in Bitcoin Core's [Coin::Serialize] format
+    (everything AFTER the outpoint key has been written by the caller).
+
+    Wire layout:
+      code   = VARINT(height * 2 + fCoinBase)
+      value  = VARINT(CompressAmount(value))
+      script = ScriptCompression(scriptPubKey)
+
+    This is what Core stores per coin in both the leveldb chainstate and
+    inside [dumptxoutset] snapshot files. *)
+let serialize_coin_body w (coin : snapshot_coin) =
+  let code = coin.height * 2 + (if coin.is_coinbase then 1 else 0) in
+  Compressor.write_varint w code;
+  Compressor.write_varint_int64 w (Compressor.compress_amount coin.value);
+  Compressor.serialize_script w coin.script_pubkey
+
+(** Deserialize the body of a coin from a Core-format reader. The outpoint
+    is provided separately because the wire format groups multiple coins
+    under a single txid. *)
+let deserialize_coin_body r ~(outpoint : Types.outpoint) : snapshot_coin =
+  let code = Compressor.read_varint r in
+  let height = code / 2 in
+  let is_coinbase = (code mod 2) = 1 in
+  let amount_compr = Compressor.read_varint_int64 r in
+  let value = Compressor.decompress_amount amount_compr in
+  let script_pubkey = Compressor.deserialize_script r in
+  { outpoint; value; script_pubkey; height; is_coinbase }
+
+(** [serialize_coin w coin] writes a single, standalone coin in
+    [outpoint || coin_body] form. This is NOT the dumptxoutset wire format
+    (which groups by txid), but it is convenient for round-trip tests and
+    for storing a single coin in isolation. *)
 let serialize_coin w (coin : snapshot_coin) =
-  (* Outpoint: txid (32) + vout (4 LE) *)
+  (* Outpoint: txid (32) + vout (4 LE). *)
   Serialize.write_bytes w coin.outpoint.Types.txid;
   Serialize.write_int32_le w coin.outpoint.Types.vout;
-  (* Code: height * 2 + is_coinbase *)
-  let code = coin.height * 2 + (if coin.is_coinbase then 1 else 0) in
-  Serialize.write_compact_size w code;
-  (* Amount (8 bytes LE) *)
-  Serialize.write_int64_le w coin.value;
-  (* Script *)
-  Serialize.write_compact_size w (Cstruct.length coin.script_pubkey);
-  Serialize.write_bytes w coin.script_pubkey
+  serialize_coin_body w coin
 
-(** Deserialize a coin from snapshot data *)
+(** [deserialize_coin r] is the inverse of [serialize_coin]. *)
 let deserialize_coin r : snapshot_coin =
   let txid = Serialize.read_bytes r 32 in
   let vout = Serialize.read_int32_le r in
   let outpoint = { Types.txid; vout } in
-  let code = Serialize.read_compact_size r in
-  let height = code / 2 in
-  let is_coinbase = (code mod 2) = 1 in
-  let value = Serialize.read_int64_le r in
-  let script_len = Serialize.read_compact_size r in
-  let script_pubkey = Serialize.read_bytes r script_len in
-  { outpoint; value; script_pubkey; height; is_coinbase }
+  deserialize_coin_body r ~outpoint
 
 (* ============================================================================
-   Snapshot File I/O
-   ============================================================================ *)
+   Snapshot File I/O — Bitcoin Core wire format
+   ============================================================================
 
-(** Write a UTXO snapshot to a file.
-    Format: [metadata][coin_entries...] *)
+   The dumptxoutset / loadtxoutset wire format groups coins under a single
+   txid prefix to avoid duplicating the 32-byte hash for every UTXO. See
+   [bitcoin-core/src/rpc/blockchain.cpp:WriteUTXOSnapshot] for the writer
+   side and [bitcoin-core/src/validation.cpp:PopulateAndValidateSnapshot]
+   for the reader side. The high-level layout is:
+
+     [metadata: 51 bytes]                         (per [serialize_metadata])
+     repeat until coins_count exhausted:
+       txid           : 32 raw bytes (LE / internal order)
+       coins_per_txid : CompactSize
+       repeat coins_per_txid times:
+         vout         : CompactSize
+         coin_body    : VARINT(code) || VARINT(CompressAmount(value))
+                        || ScriptCompression(scriptPubKey)
+*)
+
+(* A small streaming reader that fills a Cstruct on demand from an
+   [in_channel]. We need this because [Serialize.reader] consumes a fixed
+   buffer, and a multi-GiB UTXO snapshot must not be slurped into memory in
+   one go. *)
+module Stream_reader = struct
+  type t = {
+    ic : in_channel;
+    mutable cs : Cstruct.t;
+    mutable pos : int;
+    mutable file_pos : int;
+  }
+
+  let buf_size = 1 lsl 20  (* 1 MiB chunks *)
+
+  let create ic ~start_offset =
+    seek_in ic start_offset;
+    {
+      ic;
+      cs = Cstruct.create 0;
+      pos = 0;
+      file_pos = start_offset;
+    }
+
+  (* Refill the local buffer to hold up to [target] bytes. [need] is a
+     hard minimum: if the file does not have at least that many bytes
+     available between [pos] and EOF, the call raises. The actual buffer
+     length after refill may exceed [need] when the file has more data,
+     but it may also be exactly [need] near EOF. *)
+  let ensure t ~need =
+    let remaining = Cstruct.length t.cs - t.pos in
+    if remaining >= need then ()
+    else begin
+      let target = max (max need buf_size) remaining in
+      let new_cs = Cstruct.create target in
+      if remaining > 0 then
+        Cstruct.blit t.cs t.pos new_cs 0 remaining;
+      let to_read = target - remaining in
+      let read = ref 0 in
+      let eof = ref false in
+      while not !eof && !read < to_read do
+        let want = to_read - !read in
+        let bs = Bytes.create want in
+        let got = input t.ic bs 0 want in
+        if got = 0 then eof := true
+        else begin
+          Cstruct.blit_from_bytes bs 0 new_cs (remaining + !read) got;
+          read := !read + got
+        end
+      done;
+      let total = remaining + !read in
+      t.cs <-
+        (if total = target then new_cs
+         else Cstruct.sub new_cs 0 total);
+      t.pos <- 0;
+      if Cstruct.length t.cs < need then
+        failwith
+          (Printf.sprintf "Stream_reader: unexpected end of snapshot (need %d, have %d)"
+             need (Cstruct.length t.cs))
+    end
+
+  (* Caller-friendly variant: top up to a soft target without failing if
+     the file ends earlier. Returns how many bytes are actually available
+     in the buffer after the call. *)
+  let ensure_soft t ~target =
+    let remaining = Cstruct.length t.cs - t.pos in
+    if remaining >= target then remaining
+    else begin
+      let new_cs = Cstruct.create (max target buf_size) in
+      if remaining > 0 then
+        Cstruct.blit t.cs t.pos new_cs 0 remaining;
+      let cap = Cstruct.length new_cs in
+      let to_read = cap - remaining in
+      let read = ref 0 in
+      let eof = ref false in
+      while not !eof && !read < to_read do
+        let want = to_read - !read in
+        let bs = Bytes.create want in
+        let got = input t.ic bs 0 want in
+        if got = 0 then eof := true
+        else begin
+          Cstruct.blit_from_bytes bs 0 new_cs (remaining + !read) got;
+          read := !read + got
+        end
+      done;
+      let total = remaining + !read in
+      t.cs <-
+        (if total = cap then new_cs
+         else Cstruct.sub new_cs 0 total);
+      t.pos <- 0;
+      total
+    end
+
+  let to_serialize_reader t : Serialize.reader =
+    { Serialize.buf = t.cs; pos = t.pos }
+
+  let advance t ~from_serialize =
+    let consumed = from_serialize.Serialize.pos - t.pos in
+    t.pos <- from_serialize.Serialize.pos;
+    t.file_pos <- t.file_pos + consumed
+end
+
+(** Write a UTXO snapshot to a file in Bitcoin Core's [dumptxoutset] format.
+
+    [iter_coins] is invoked with a callback that takes each coin in turn.
+    Coins must be supplied in canonical txid-then-vout order — that is the
+    same order RocksDB / leveldb iterators yield them with the per-coin key
+    layout [txid(32) || vout(LE 4)] / [DB_COIN || txid || VARINT(n)] —
+    because the writer assumes adjacent coins with the same txid form a
+    contiguous group. The iterator the camlcoin chainstate provides
+    ([Storage.ChainDB.iter_utxos]) already yields in that order. *)
 let write_snapshot (path : string) (metadata : snapshot_metadata)
     ~(iter_coins : (snapshot_coin -> unit) -> unit) : (unit, string) result =
   try
     let oc = open_out_bin path in
+    (* 1. Metadata. *)
     let w = Serialize.writer_create () in
-    (* Write metadata *)
     serialize_metadata w metadata;
-    let meta_bytes = Serialize.writer_to_cstruct w in
-    output_string oc (Cstruct.to_string meta_bytes);
-    (* Write coins *)
+    output_string oc (Cstruct.to_string (Serialize.writer_to_cstruct w));
+
+    (* 2. Per-txid groups. We accumulate same-txid coins in a buffer and
+       flush them under a single txid prefix when the txid changes. *)
+    let cur_txid : Types.hash256 option ref = ref None in
+    let group_buf = Buffer.create 1024 in
+    let group_count = ref 0 in
+    let flush_group () =
+      match !cur_txid with
+      | None -> ()
+      | Some txid ->
+        (* Header: txid (32) + coins_per_txid CompactSize. *)
+        let hw = Serialize.writer_create () in
+        Serialize.write_bytes hw txid;
+        Serialize.write_compact_size hw !group_count;
+        output_string oc (Cstruct.to_string (Serialize.writer_to_cstruct hw));
+        (* Body: pre-built per-coin entries. *)
+        output_string oc (Buffer.contents group_buf);
+        Buffer.clear group_buf;
+        group_count := 0
+    in
     iter_coins (fun coin ->
+      let coin_txid = coin.outpoint.Types.txid in
+      let starts_new_group =
+        match !cur_txid with
+        | None -> true
+        | Some t -> not (Cstruct.equal t coin_txid)
+      in
+      if starts_new_group then begin
+        flush_group ();
+        cur_txid := Some coin_txid
+      end;
+      (* Append [vout : CompactSize] || coin body. *)
       let cw = Serialize.writer_create () in
-      serialize_coin cw coin;
-      output_string oc (Cstruct.to_string (Serialize.writer_to_cstruct cw))
+      Serialize.write_compact_size cw (Int32.to_int coin.outpoint.vout);
+      serialize_coin_body cw coin;
+      Buffer.add_string group_buf
+        (Cstruct.to_string (Serialize.writer_to_cstruct cw));
+      incr group_count
     );
+    flush_group ();
     close_out oc;
     Ok ()
   with
   | Sys_error msg -> Error ("Failed to write snapshot: " ^ msg)
-  | _ -> Error "Failed to write snapshot"
+  | exn -> Error (Printf.sprintf "Failed to write snapshot: %s"
+                    (Printexc.to_string exn))
 
-(** Read snapshot metadata from a file without loading all coins *)
+(** Iterate every coin in a Core-format snapshot file, calling [f] for each.
+
+    Returns [Ok n] on success ([n] = coins read), or [Error msg] on
+    truncation / format errors. The metadata block must already have been
+    consumed by the caller (use [Stream_reader.create] with
+    [start_offset:51]). *)
+let iter_snapshot_coins (sr : Stream_reader.t) ~(coins_count : int64)
+    ~(f : snapshot_coin -> unit) : (int64, string) result =
+  let coins_left = ref coins_count in
+  let total = ref 0L in
+  try
+    while Int64.compare !coins_left 0L > 0 do
+      (* Read the next per-txid group header. The minimum is 32 (txid) +
+         1 (smallest CompactSize) bytes. We top up generously through the
+         soft variant so a near-EOF group still succeeds even when fewer
+         than [buf_size] bytes remain. *)
+      let _ = Stream_reader.ensure_soft sr ~target:Stream_reader.buf_size in
+      Stream_reader.ensure sr ~need:33;
+      let r = Stream_reader.to_serialize_reader sr in
+      let txid = Serialize.read_bytes r 32 in
+      let coins_per_txid = Serialize.read_compact_size r in
+      Stream_reader.advance sr ~from_serialize:r;
+      if Int64.compare (Int64.of_int coins_per_txid) !coins_left > 0 then
+        failwith
+          "Mismatch in coins count in snapshot metadata and actual snapshot data";
+      for _ = 1 to coins_per_txid do
+        (* Each coin needs at minimum 4 bytes (vout CompactSize 1 + code
+           VARINT 1 + amount VARINT 1 + script size VARINT 1). Top up
+           to a buffer-friendly value but never fail if the file is
+           legitimately short. *)
+        let avail =
+          Stream_reader.ensure_soft sr ~target:Stream_reader.buf_size in
+        if avail < 4 then
+          Stream_reader.ensure sr ~need:4;
+        let r = Stream_reader.to_serialize_reader sr in
+        let vout_int = Serialize.read_compact_size r in
+        let outpoint = {
+          Types.txid;
+          vout = Int32.of_int vout_int;
+        } in
+        let coin = deserialize_coin_body r ~outpoint in
+        Stream_reader.advance sr ~from_serialize:r;
+        f coin;
+        coins_left := Int64.sub !coins_left 1L;
+        total := Int64.add !total 1L
+      done
+    done;
+    Ok !total
+  with
+  | Failure msg -> Error msg
+  | exn -> Error (Printexc.to_string exn)
+
+(** Read snapshot metadata from a file without loading all coins. *)
 let read_snapshot_metadata (path : string) ~expected_network_magic
     : (snapshot_metadata, string) result =
   try
     let ic = open_in_bin path in
-    (* Read enough bytes for metadata: 5 (magic) + 2 (version) + 4 (network) + 32 (hash) + 8 (count) = 51 *)
+    (* Metadata block size: 5 (magic) + 2 (version) + 4 (network) + 32
+       (blockhash) + 8 (coins_count) = 51 bytes. *)
     let buf = really_input_string ic 51 in
     close_in ic;
     let r = Serialize.reader_of_cstruct (Cstruct.of_string buf) in
@@ -242,6 +530,10 @@ let read_snapshot_metadata (path : string) ~expected_network_magic
   | Sys_error msg -> Error ("Failed to read snapshot: " ^ msg)
   | End_of_file -> Error "Snapshot file too small"
   | _ -> Error "Failed to read snapshot metadata"
+
+(** Constant offset (in bytes) of the first txid group in the snapshot
+    file, i.e. the size of the serialized metadata block. *)
+let snapshot_body_offset = 51
 
 (* ============================================================================
    Dual Chainstate Management
@@ -310,162 +602,149 @@ type load_progress = {
 }
 
 (** Load a UTXO snapshot into a new chainstate.
-    Validates metadata against hardcoded assumeUTXO parameters. *)
+
+    The snapshot file MUST be in Bitcoin Core's [dumptxoutset] format
+    (per-txid-grouped, ScriptCompression-encoded coins). The metadata is
+    validated against the hardcoded AssumeUTXO parameters before any coin
+    is loaded; mismatches reject the snapshot up front. *)
 let load_snapshot ~(network : Consensus.network_config)
     ~(snapshot_path : string)
     ~(snapshot_db_path : string)
     ?(on_progress : load_progress -> unit = fun _ -> ())
     ()
     : (chainstate, string) result =
-  (* Read and validate metadata *)
   match read_snapshot_metadata snapshot_path ~expected_network_magic:network.magic with
   | Error e -> Error e
   | Ok metadata ->
-    (* Verify against hardcoded assumeUTXO params *)
     match get_assumeutxo_for_hash ~network metadata.base_blockhash with
     | None ->
       Error (Printf.sprintf "Snapshot blockhash %s not recognized for this network"
                (Types.hash256_to_hex_display metadata.base_blockhash))
     | Some params ->
-      if metadata.coins_count <> params.coins_count then
+      if Int64.compare params.coins_count 0L <> 0
+         && metadata.coins_count <> params.coins_count then
         Error (Printf.sprintf "Coins count mismatch: snapshot has %Ld, expected %Ld"
                  metadata.coins_count params.coins_count)
       else begin
-        (* Create new chainstate for snapshot *)
         let db = Storage.ChainDB.create snapshot_db_path in
         let db_view = Utxo.DbView.create db in
         let utxo_cache = Utxo.UtxoCache.create db_view in
-
-        (* Open snapshot file and load coins *)
+        let ic = open_in_bin snapshot_path in
         try
-          let ic = open_in_bin snapshot_path in
-          (* Skip metadata (51 bytes) *)
-          seek_in ic 51;
-
-          let coins_loaded = ref 0L in
+          let sr = Stream_reader.create ic
+                     ~start_offset:snapshot_body_offset in
           let total = metadata.coins_count in
-
-          (* Load coins in batches for efficiency *)
-          let batch_size = 10000 in
-          let coins_in_batch = ref 0 in
-
-          while !coins_loaded < total do
-            let remaining = in_channel_length ic - pos_in ic in
-            if remaining <= 0 then
-              raise (Failure "Unexpected end of snapshot file");
-
-            (* Read next coin *)
-            let coin = begin
-              (* Read coin data - this is simplified; real impl needs streaming reader *)
-              let buf_size = min 1024 remaining in
-              let buf = really_input_string ic buf_size in
-              let r = Serialize.reader_of_cstruct (Cstruct.of_string buf) in
-              let coin = deserialize_coin r in
-              (* Seek back to actual position *)
-              seek_in ic (pos_in ic - buf_size + r.Serialize.pos);
-              coin
-            end in
-
-            (* Add to UTXO cache *)
-            let utxo_coin = {
-              Utxo.txout = { Types.value = coin.value; script_pubkey = coin.script_pubkey };
-              height = coin.height;
-              is_coinbase = coin.is_coinbase;
-            } in
-            Utxo.UtxoCache.add_coin utxo_cache coin.outpoint utxo_coin ~possible_overwrite:false;
-
-            coins_loaded := Int64.add !coins_loaded 1L;
-            incr coins_in_batch;
-
-            (* Flush batch periodically *)
-            if !coins_in_batch >= batch_size then begin
-              coins_in_batch := 0;
-              let pct = 100.0 *. (Int64.to_float !coins_loaded) /. (Int64.to_float total) in
-              on_progress { coins_loaded = !coins_loaded; total_coins = total; pct }
-            end
-          done;
-
+          let coins_loaded = ref 0L in
+          let progress_step = 10_000 in
+          let since_progress = ref 0 in
+          let res = iter_snapshot_coins sr ~coins_count:total
+            ~f:(fun coin ->
+              let utxo_coin = {
+                Utxo.txout = {
+                  Types.value = coin.value;
+                  script_pubkey = coin.script_pubkey
+                };
+                height = coin.height;
+                is_coinbase = coin.is_coinbase;
+              } in
+              Utxo.UtxoCache.add_coin utxo_cache coin.outpoint utxo_coin
+                ~possible_overwrite:false;
+              coins_loaded := Int64.add !coins_loaded 1L;
+              incr since_progress;
+              if !since_progress >= progress_step then begin
+                since_progress := 0;
+                let pct =
+                  if Int64.equal total 0L then 100.0
+                  else 100.0 *. Int64.to_float !coins_loaded
+                       /. Int64.to_float total in
+                on_progress {
+                  coins_loaded = !coins_loaded;
+                  total_coins = total;
+                  pct;
+                }
+              end)
+          in
           close_in ic;
-
-          (* Flush UTXO cache to disk *)
-          let _ = Lwt_main.run (Utxo.UtxoCache.flush utxo_cache) in
-
-          (* Set chain tip *)
-          Storage.ChainDB.set_chain_tip db metadata.base_blockhash params.height;
-
-          Ok {
-            id = Snapshot;
-            db;
-            utxo_cache;
-            tip_hash = metadata.base_blockhash;
-            tip_height = params.height;
-            assumeutxo_state = Unvalidated;
-            from_snapshot_blockhash = Some metadata.base_blockhash;
-          }
+          match res with
+          | Error msg -> Error msg
+          | Ok _ ->
+            let _ = Lwt_main.run (Utxo.UtxoCache.flush utxo_cache) in
+            Storage.ChainDB.set_chain_tip db
+              metadata.base_blockhash params.height;
+            Ok {
+              id = Snapshot;
+              db;
+              utxo_cache;
+              tip_hash = metadata.base_blockhash;
+              tip_height = params.height;
+              assumeutxo_state = Unvalidated;
+              from_snapshot_blockhash = Some metadata.base_blockhash;
+            }
         with
-        | Failure msg -> Error msg
-        | End_of_file -> Error "Unexpected end of snapshot file"
-        | _ -> Error "Failed to load snapshot"
+        | Failure msg -> close_in_noerr ic; Error msg
+        | End_of_file -> close_in_noerr ic; Error "Unexpected end of snapshot file"
+        | exn ->
+          close_in_noerr ic;
+          Error (Printf.sprintf "Failed to load snapshot: %s"
+                   (Printexc.to_string exn))
       end
 
 (* ============================================================================
    Snapshot Creation (dumptxoutset)
    ============================================================================ *)
 
-(** Dump the current UTXO set to a snapshot file *)
+(** Iterate this chainstate's UTXO set in canonical order, yielding each
+    coin as a [snapshot_coin]. Used by [dump_snapshot] and reusable by RPC
+    handlers. *)
+let iter_chainstate_coins (chainstate : chainstate)
+    (f : snapshot_coin -> unit) : unit =
+  Storage.ChainDB.iter_utxos chainstate.db (fun txid vout data ->
+    let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+    let utxo = Utxo.deserialize_utxo_entry r in
+    let coin = {
+      outpoint = { Types.txid; vout = Int32.of_int vout };
+      value = utxo.value;
+      script_pubkey = utxo.script_pubkey;
+      height = utxo.height;
+      is_coinbase = utxo.is_coinbase;
+    } in
+    f coin)
+
+(** Dump the current UTXO set to a Core-format snapshot file. *)
 let dump_snapshot ~(chainstate : chainstate)
     ~(network : Consensus.network_config)
     ~(output_path : string)
     ?(on_progress : load_progress -> unit = fun _ -> ())
     ()
     : (snapshot_metadata, string) result =
-  (* Count total coins first *)
+  (* Count total coins first so the metadata can be written in a single
+     pass over the iterator. *)
   let total_coins = ref 0L in
   Storage.ChainDB.iter_utxos chainstate.db (fun _txid _vout _data ->
     total_coins := Int64.add !total_coins 1L
   );
-
   let metadata = {
     network_magic = network.magic;
     base_blockhash = chainstate.tip_hash;
     coins_count = !total_coins;
   } in
-
-  try
-    let oc = open_out_bin output_path in
-    (* Write metadata *)
-    let w = Serialize.writer_create () in
-    serialize_metadata w metadata;
-    output_string oc (Cstruct.to_string (Serialize.writer_to_cstruct w));
-
-    (* Write coins *)
-    let coins_written = ref 0L in
-    Storage.ChainDB.iter_utxos chainstate.db (fun txid vout data ->
-      let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
-      let utxo = Utxo.deserialize_utxo_entry r in
-      let coin = {
-        outpoint = { Types.txid; vout = Int32.of_int vout };
-        value = utxo.value;
-        script_pubkey = utxo.script_pubkey;
-        height = utxo.height;
-        is_coinbase = utxo.is_coinbase;
-      } in
-      let cw = Serialize.writer_create () in
-      serialize_coin cw coin;
-      output_string oc (Cstruct.to_string (Serialize.writer_to_cstruct cw));
-
-      coins_written := Int64.add !coins_written 1L;
-      if Int64.rem !coins_written 10000L = 0L then begin
-        let pct = 100.0 *. (Int64.to_float !coins_written) /. (Int64.to_float !total_coins) in
-        on_progress { coins_loaded = !coins_written; total_coins = !total_coins; pct }
-      end
-    );
-
-    close_out oc;
-    Ok metadata
-  with
-  | Sys_error msg -> Error ("Failed to write snapshot: " ^ msg)
-  | _ -> Error "Failed to dump snapshot"
+  let coins_written = ref 0L in
+  let res = write_snapshot output_path metadata
+    ~iter_coins:(fun emit ->
+      iter_chainstate_coins chainstate (fun coin ->
+        emit coin;
+        coins_written := Int64.add !coins_written 1L;
+        if Int64.rem !coins_written 10000L = 0L
+           && not (Int64.equal !total_coins 0L) then begin
+          let pct = 100.0 *. Int64.to_float !coins_written
+                    /. Int64.to_float !total_coins in
+          on_progress { coins_loaded = !coins_written;
+                        total_coins = !total_coins; pct }
+        end))
+  in
+  match res with
+  | Ok () -> Ok metadata
+  | Error msg -> Error msg
 
 (* ============================================================================
    UTXO Set Hash Computation

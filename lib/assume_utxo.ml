@@ -850,20 +850,51 @@ let compute_utxo_muhash_from_cache (cache : Utxo.UtxoCache.t)
   let _ = Lwt_main.run (Utxo.UtxoCache.flush cache) in
   compute_utxo_muhash_from_db db
 
-(** [verify_loaded_utxo_muhash ~db ~expected] is the strict snapshot
+(** [verify_loaded_utxo_hash ~db ~expected] is the strict snapshot
     content-hash check performed by [loadtxoutset] after a snapshot's
-    coins have been streamed into the chainstate DB. It computes
-    [compute_utxo_muhash_from_db db] and compares against [expected]
-    (the [params.coins_hash] from chainparams' AssumeUTXO whitelist —
-    this value IS a MuHash3072 commitment in current Bitcoin Core).
+    coins have been streamed into the chainstate DB.
+
+    This mirrors Bitcoin Core's [ActivateSnapshot] gate at
+    [src/validation.cpp:5902-5915]: Core invokes
+    [ComputeUTXOStats(CoinStatsHashType::HASH_SERIALIZED, ...)]
+    ([src/kernel/coinstats.cpp:161-163]) which streams every
+    [(outpoint, coin)] preimage through a [HashWriter] (i.e. SHA256d
+    of the concatenation, see [src/hash.h:HashWriter::GetHash]) and
+    compares the result against
+    [m_assumeutxo_data.hash_serialized] from chainparams. The
+    chainparams field is named [hash_serialized] precisely because it
+    holds the [HASH_SERIALIZED] (SHA256d) commitment — NOT the
+    MuHash3072 commitment, which Core uses only for the
+    [gettxoutsetinfo "muhash"] RPC.
+
+    We compute the same SHA256d via [compute_utxo_hash_from_db db]
+    and compare against [expected] (the [params.coins_hash] from the
+    chainparams AssumeUTXO whitelist).
 
     On mismatch returns Core's verbatim wording from
-    [src/validation.cpp]:
+    [src/validation.cpp:5913]:
         "Bad snapshot content hash: expected <expected>, got <actual>"
     so external tooling that scrapes the message keeps working.
 
     Returns [Ok actual] when the hashes agree, where [actual] is the
     same [hash256] callers can surface as [txoutset_hash]. *)
+let verify_loaded_utxo_hash ~(db : Storage.ChainDB.t)
+    ~(expected : Types.hash256) : (Types.hash256, string) result =
+  let actual = compute_utxo_hash_from_db db in
+  if Cstruct.equal actual expected then
+    Ok actual
+  else
+    Error (Printf.sprintf
+             "Bad snapshot content hash: expected %s, got %s"
+             (Types.hash256_to_hex_display expected)
+             (Types.hash256_to_hex_display actual))
+
+(** [verify_loaded_utxo_muhash ~db ~expected] is the MuHash3072 variant
+    of the snapshot content-hash check. NOT used by [loadtxoutset] —
+    Core's strict gate uses [HASH_SERIALIZED] (see
+    [verify_loaded_utxo_hash] above). Retained as a building block for
+    the [gettxoutsetinfo hash_type=muhash] RPC and for tests that
+    exercise the MuHash3072 plumbing. *)
 let verify_loaded_utxo_muhash ~(db : Storage.ChainDB.t)
     ~(expected : Types.hash256) : (Types.hash256, string) result =
   let actual = compute_utxo_muhash_from_db db in

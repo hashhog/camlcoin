@@ -850,6 +850,31 @@ let compute_utxo_muhash_from_cache (cache : Utxo.UtxoCache.t)
   let _ = Lwt_main.run (Utxo.UtxoCache.flush cache) in
   compute_utxo_muhash_from_db db
 
+(** [verify_loaded_utxo_muhash ~db ~expected] is the strict snapshot
+    content-hash check performed by [loadtxoutset] after a snapshot's
+    coins have been streamed into the chainstate DB. It computes
+    [compute_utxo_muhash_from_db db] and compares against [expected]
+    (the [params.coins_hash] from chainparams' AssumeUTXO whitelist —
+    this value IS a MuHash3072 commitment in current Bitcoin Core).
+
+    On mismatch returns Core's verbatim wording from
+    [src/validation.cpp]:
+        "Bad snapshot content hash: expected <expected>, got <actual>"
+    so external tooling that scrapes the message keeps working.
+
+    Returns [Ok actual] when the hashes agree, where [actual] is the
+    same [hash256] callers can surface as [txoutset_hash]. *)
+let verify_loaded_utxo_muhash ~(db : Storage.ChainDB.t)
+    ~(expected : Types.hash256) : (Types.hash256, string) result =
+  let actual = compute_utxo_muhash_from_db db in
+  if Cstruct.equal actual expected then
+    Ok actual
+  else
+    Error (Printf.sprintf
+             "Bad snapshot content hash: expected %s, got %s"
+             (Types.hash256_to_hex_display expected)
+             (Types.hash256_to_hex_display actual))
+
 (* ============================================================================
    Background Validation
    ============================================================================ *)

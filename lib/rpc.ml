@@ -3232,17 +3232,47 @@ let handle_loadtxoutset (_ctx : rpc_context)
                    () with
           | Error msg -> Error msg
           | Ok cs ->
-            Ok (`Assoc [
-              ("coins_loaded", `Int (Int64.to_int metadata.coins_count));
-              ("base_hash",
-                 `String (Types.hash256_to_hex_display
-                            metadata.base_blockhash));
-              ("base_height", `Int params.height);
-              ("path", `String path);
-              ("tip_hash",
-                 `String (Types.hash256_to_hex_display cs.tip_hash));
-              ("tip_height", `Int cs.tip_height);
-            ])
+            (* Strict snapshot content-hash check.
+
+               Mirrors Bitcoin Core's [ActivateSnapshot] step in
+               [src/validation.cpp:5912-5915]: after the coins have been
+               loaded into the new chainstate, recompute the canonical
+               UTXO commitment over the loaded set and reject the
+               snapshot if it disagrees with the chainparams-pinned
+               value.
+
+               In current Core [m_assumeutxo_data.hash_serialized] holds
+               a MuHash3072 commitment, so we compute the same thing
+               here using [compute_utxo_muhash_from_db] and the strict
+               whitelist's [params.coins_hash]. The error string is
+               Core's verbatim wording so external tooling that scrapes
+               the message keeps working.
+
+               Both [params.coins_hash] (stored LE per [make_au]) and
+               the [Muhash.finalize] output (raw 32-byte SHA256) are in
+               the same byte order — Core's [uint256] hex constructor
+               reverses on parse and [Muhash.finalize] returns the raw
+               digest, so a direct [Cstruct.equal] is the right check.
+               For the error message we render both via
+               [hash256_to_hex_display] so the operator sees the same
+               hex Core would print. *)
+            (match Assume_utxo.verify_loaded_utxo_muhash
+                     ~db:cs.db ~expected:params.coins_hash with
+            | Error msg -> Error msg
+            | Ok actual_hash ->
+              Ok (`Assoc [
+                ("coins_loaded", `Int (Int64.to_int metadata.coins_count));
+                ("base_hash",
+                   `String (Types.hash256_to_hex_display
+                              metadata.base_blockhash));
+                ("base_height", `Int params.height);
+                ("path", `String path);
+                ("tip_hash",
+                   `String (Types.hash256_to_hex_display cs.tip_hash));
+                ("tip_height", `Int cs.tip_height);
+                ("txoutset_hash",
+                   `String (Types.hash256_to_hex_display actual_hash));
+              ]))
           )
         end))
   | _ ->
@@ -3286,14 +3316,150 @@ let handle_dumptxoutset (_ctx : rpc_context)
     (match res with
     | Error msg -> Error msg
     | Ok () ->
+      (* Compute the MuHash3072 commitment over the dumped UTXO set so the
+         operator can record it alongside the snapshot. Matches Bitcoin
+         Core's [dumptxoutset] response field [txoutset_hash], which is the
+         MuHash3072 path of [CoinStatsHashType] in [kernel/coinstats.cpp].
+         We iterate the chain DB rather than the dump file so we never have
+         to re-deserialize the on-disk snapshot format here. *)
+      let txoutset_hash =
+        Assume_utxo.compute_utxo_muhash_from_db _ctx.chain.db
+      in
       Ok (`Assoc [
         ("coins_written", `Int (Int64.to_int !coins_written));
         ("base_hash", `String (Types.hash256_to_hex_display tip_hash));
         ("base_height", `Int tip_height);
         ("path", `String path);
+        ("txoutset_hash",
+           `String (Types.hash256_to_hex_display txoutset_hash));
       ]))
   | _ ->
     Error "Invalid parameters: expected [path]"
+
+(* ============================================================================
+   gettxoutsetinfo Handler
+   ============================================================================
+
+   Mirrors Bitcoin Core's RPC of the same name (see
+   [src/rpc/blockchain.cpp:gettxoutsetinfo]). We expose the same shape:
+   [height], [bestblock], [transactions], [txouts], [bogosize], [total_amount],
+   [hash_serialized_3] and/or [muhash] (depending on the [hash_type]
+   argument), and [disk_size]. Only the [hash_type] parameter is consulted —
+   we accept "none", "hash_serialized_3", and "muhash". An optional second
+   argument ([blockhash]) is rejected with the same error Core returns
+   ("Querying specific block heights is not supported") because we do not
+   maintain a coinstats index. *)
+
+let handle_gettxoutsetinfo (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  let hash_type, extra_args =
+    match params with
+    | [] -> ("hash_serialized_3", [])
+    | [`Null] -> ("hash_serialized_3", [])
+    | (`String s) :: rest -> (s, rest)
+    | (`Null) :: rest -> ("hash_serialized_3", rest)
+    | _ -> ("hash_serialized_3", List.tl params)
+  in
+  if extra_args <> [] && extra_args <> [`Null] then
+    Error "Querying specific block heights is not supported"
+  else
+    let normalized = String.lowercase_ascii hash_type in
+    if normalized <> "none"
+       && normalized <> "hash_serialized_3"
+       && normalized <> "muhash" then
+      Error (Printf.sprintf
+               "%s is not a valid hash_type" hash_type)
+    else begin
+      (* Walk the UTXO set once, computing aggregate stats and (optionally)
+         the requested commitment in a single pass. The MuHash accumulator
+         is allocated lazily so callers asking for hash_type=none don't pay
+         for it. The hash_serialized_3 path uses the same buffer-then-SHA256d
+         encoding [compute_utxo_hash_from_db] does — we replicate the loop
+         locally to avoid a second pass over the iterator. *)
+      let muhash_acc =
+        if normalized = "muhash" then Some (Muhash.create ()) else None
+      in
+      let hash_buffer =
+        if normalized = "hash_serialized_3" then
+          Some (Buffer.create (1024 * 1024))
+        else None
+      in
+      let txouts = ref 0 in
+      let bogosize = ref 0L in
+      let total_amount = ref 0L in
+      let txid_set = Hashtbl.create 1024 in
+      Storage.ChainDB.iter_utxos ctx.chain.db (fun txid vout data ->
+        let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+        let utxo = Utxo.deserialize_utxo_entry r in
+        let outpoint = { Types.txid; vout = Int32.of_int vout } in
+        (* Track unique txids for the [transactions] field. *)
+        let key = Types.hash256_to_hex txid in
+        if not (Hashtbl.mem txid_set key) then
+          Hashtbl.add txid_set key ();
+        incr txouts;
+        total_amount := Int64.add !total_amount utxo.Utxo.value;
+        (* Core's GetBogoSize: 32 + 4 + 4 + 8 + 2 + scriptPubKey.size *)
+        let spk_len = Cstruct.length utxo.script_pubkey in
+        bogosize := Int64.add !bogosize (Int64.of_int (50 + spk_len));
+        (match muhash_acc with
+         | None -> ()
+         | Some acc ->
+           let buf =
+             Muhash.serialize_txout outpoint
+               ~value:utxo.Utxo.value
+               ~script_pubkey:utxo.script_pubkey
+               ~height:utxo.height
+               ~is_coinbase:utxo.is_coinbase
+           in
+           Muhash.add acc (Bytes.unsafe_to_string buf));
+        (match hash_buffer with
+         | None -> ()
+         | Some buf ->
+           let coin : Assume_utxo.snapshot_coin = {
+             outpoint;
+             value = utxo.Utxo.value;
+             script_pubkey = utxo.script_pubkey;
+             height = utxo.height;
+             is_coinbase = utxo.is_coinbase;
+           } in
+           let w = Serialize.writer_create () in
+           Assume_utxo.serialize_coin_for_hash w outpoint coin;
+           let cs = Serialize.writer_to_cstruct w in
+           Buffer.add_string buf (Cstruct.to_string cs)));
+      let tip_height, tip_hash = match ctx.chain.tip with
+        | Some t -> (t.height, t.hash)
+        | None -> (0, Types.zero_hash)
+      in
+      let base_fields = [
+        ("height", `Int tip_height);
+        ("bestblock",
+           `String (Types.hash256_to_hex_display tip_hash));
+        ("transactions", `Int (Hashtbl.length txid_set));
+        ("txouts", `Int !txouts);
+        ("bogosize", `Int (Int64.to_int !bogosize));
+        ("total_amount",
+           (* Core formats total_amount as a fixed-precision BTC float;
+              we emit satoshis as int to keep the value loss-free for
+              downstream tooling, matching what camlcoin does in
+              getblockstats. *)
+           `Int (Int64.to_int !total_amount));
+      ] in
+      let hash_field =
+        match muhash_acc, hash_buffer with
+        | Some acc, _ ->
+          let raw = Muhash.finalize acc in
+          [("muhash",
+              `String (Types.hash256_to_hex_display
+                         (Cstruct.of_bytes raw)))]
+        | None, Some buf ->
+          let cs = Cstruct.of_string (Buffer.contents buf) in
+          let h = Crypto.sha256d cs in
+          [("hash_serialized_3",
+              `String (Types.hash256_to_hex_display h))]
+        | None, None -> []
+      in
+      Ok (`Assoc (base_fields @ hash_field))
+    end
 
 (* ============================================================================
    getdeploymentinfo Handler
@@ -3447,6 +3613,7 @@ let handle_help (_ctx : rpc_context)
       "== AssumeUTXO ==";
       "loadtxoutset \"path\"";
       "dumptxoutset \"path\"";
+      "gettxoutsetinfo ( \"hash_type\" )";
     ])
   | [`String _cmd] ->
     (* Could provide help for specific command *)
@@ -3736,6 +3903,10 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_dumptxoutset ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
+  | "gettxoutsetinfo" ->
+    (match handle_gettxoutsetinfo ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_invalid_params, msg))
 
   | _ ->
     Error (rpc_method_not_found, "Method not found: " ^ method_name)

@@ -1652,6 +1652,88 @@ let test_loadmempool_missing_file_zero () =
   cleanup_test_db ()
 
 (* ============================================================================
+   dumptxoutset / gettxoutsetinfo MuHash3072 wiring
+
+   The RPC-level wiring needs to (a) emit the MuHash3072 commitment as
+   [txoutset_hash] in the [dumptxoutset] response and (b) surface the
+   same value via the [gettxoutsetinfo "muhash"] handler. Both
+   handlers iterate the chainstate DB, so we populate the test
+   context's UTXO set, call the RPC, and compare against
+   [Assume_utxo.compute_utxo_muhash_from_db] computed directly. The
+   strict-mismatch path is exercised by [test_assume_utxo.ml] —
+   reproducing it here would require synthesising a snapshot file that
+   passes the chainparams whitelist, which has nothing to do with the
+   hash wiring itself.
+   ============================================================================ *)
+
+let test_dumptxoutset_emits_muhash_txoutset_hash () =
+  let (ctx, db, _utxo, _txid1, _txid2) = create_test_context () in
+  let path = Printf.sprintf "/tmp/camlcoin_dump_muhash_%d.dat"
+               (Unix.getpid ()) in
+  (try Sys.remove path with _ -> ());
+  let result = Rpc.handle_dumptxoutset ctx [`String path] in
+  (match result with
+   | Ok (`Assoc fields) ->
+     (* Direct expected value: MuHash3072 over the same DB the handler
+        iterates. The test context is populated by create_test_context
+        with two UTXOs; this is enough to make MuHash deterministic
+        and non-trivial. *)
+     let expected =
+       Assume_utxo.compute_utxo_muhash_from_db ctx.chain.db
+     in
+     let expected_hex = Types.hash256_to_hex_display expected in
+     (match List.assoc_opt "txoutset_hash" fields with
+      | Some (`String s) ->
+        Alcotest.(check string)
+          "dumptxoutset txoutset_hash matches MuHash3072"
+          expected_hex s
+      | _ -> Alcotest.fail "dumptxoutset response missing txoutset_hash field")
+   | Ok _ -> Alcotest.fail "expected `Assoc result"
+   | Error msg -> Alcotest.fail ("dumptxoutset returned error: " ^ msg));
+  (try Sys.remove path with _ -> ());
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_gettxoutsetinfo_muhash_matches_dump () =
+  let (ctx, db, _utxo, _txid1, _txid2) = create_test_context () in
+  let result = Rpc.handle_gettxoutsetinfo ctx [`String "muhash"] in
+  (match result with
+   | Ok (`Assoc fields) ->
+     let expected =
+       Assume_utxo.compute_utxo_muhash_from_db ctx.chain.db
+     in
+     let expected_hex = Types.hash256_to_hex_display expected in
+     (match List.assoc_opt "muhash" fields with
+      | Some (`String s) ->
+        Alcotest.(check string)
+          "gettxoutsetinfo muhash matches direct compute"
+          expected_hex s
+      | _ -> Alcotest.fail "gettxoutsetinfo response missing muhash field");
+     (* Sanity: txouts must be 2 because create_test_context adds two
+        UTXOs; transactions == 2 since both have unique txids. *)
+     (match List.assoc_opt "txouts" fields with
+      | Some (`Int n) -> Alcotest.(check int) "txouts" 2 n
+      | _ -> Alcotest.fail "missing txouts field");
+     (match List.assoc_opt "transactions" fields with
+      | Some (`Int n) -> Alcotest.(check int) "transactions" 2 n
+      | _ -> Alcotest.fail "missing transactions field")
+   | Ok _ -> Alcotest.fail "expected `Assoc result"
+   | Error msg -> Alcotest.fail ("gettxoutsetinfo returned error: " ^ msg));
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_gettxoutsetinfo_rejects_bad_hash_type () =
+  let (ctx, db, _utxo, _, _) = create_test_context () in
+  let result =
+    Rpc.handle_gettxoutsetinfo ctx [`String "not_a_real_hash_type"]
+  in
+  (match result with
+   | Error _ -> ()
+   | Ok _ -> Alcotest.fail "expected error for unknown hash_type");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -1744,5 +1826,13 @@ let () =
       test_case "dumpmempool → loadmempool round-trip" `Quick test_dumpmempool_load_roundtrip;
       test_case "savemempool aliases dumpmempool" `Quick test_savemempool_alias;
       test_case "loadmempool missing file → 0" `Quick test_loadmempool_missing_file_zero;
+    ];
+    "snapshot_muhash_rpc", [
+      test_case "dumptxoutset emits MuHash3072 txoutset_hash" `Quick
+        test_dumptxoutset_emits_muhash_txoutset_hash;
+      test_case "gettxoutsetinfo muhash matches direct compute" `Quick
+        test_gettxoutsetinfo_muhash_matches_dump;
+      test_case "gettxoutsetinfo rejects unknown hash_type" `Quick
+        test_gettxoutsetinfo_rejects_bad_hash_type;
     ];
   ]

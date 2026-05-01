@@ -679,6 +679,171 @@ let test_coin_height_encoding () =
     test_failed name (Printexc.to_string e)
 
 (* ============================================================================
+   MuHash3072 UTXO commitment tests
+
+   These exercise [Assume_utxo.compute_utxo_muhash_from_db] and
+   [verify_loaded_utxo_muhash] against a fresh per-test DB so we can
+   pin down the exact preimage shape without dragging in a chainstate
+   bootstrap. The MuHash3072 module itself is exhaustively covered by
+   [test/test_muhash.ml] (Core's canonical vectors); these tests focus
+   on the wiring into the snapshot-validation paths.
+   ============================================================================ *)
+
+(* Insert a UTXO into a chain DB using the same encoding the snapshot
+   loader / IBD path uses (Utxo.serialize_utxo_entry). Returns nothing;
+   reading back via Storage.ChainDB.iter_utxos is what the production
+   compute_utxo_muhash_from_db does. *)
+let put_test_utxo (db : Storage.ChainDB.t) ~txid_hex ~vout
+    ~value ~script ~height ~is_coinbase =
+  let entry : Utxo.utxo_entry = {
+    Utxo.value;
+    script_pubkey = Cstruct.of_string script;
+    height;
+    is_coinbase;
+  } in
+  let w = Serialize.writer_create () in
+  Utxo.serialize_utxo_entry w entry;
+  let cs = Serialize.writer_to_cstruct w in
+  let txid = Types.hash256_of_hex txid_hex in
+  Storage.ChainDB.store_utxo db txid vout (Cstruct.to_string cs)
+
+let test_muhash_empty_db () =
+  let name = "muhash: empty UTXO set is canonical empty MuHash" in
+  let dir = temp_dir () in
+  let db = Storage.ChainDB.create (Filename.concat dir "chain") in
+  let actual = Assume_utxo.compute_utxo_muhash_from_db db in
+  let expected =
+    Cstruct.of_bytes (Muhash.finalize (Muhash.create ()))
+  in
+  Storage.ChainDB.close db;
+  cleanup_dir dir;
+  if Cstruct.equal actual expected then test_passed name
+  else test_failed name "Empty MuHash mismatch with finalize(create())"
+
+let test_muhash_deterministic () =
+  let name = "muhash: identical UTXO sets produce identical MuHash" in
+  let dir1 = temp_dir () in
+  let dir2 = temp_dir () in
+  let db1 = Storage.ChainDB.create (Filename.concat dir1 "chain") in
+  let db2 = Storage.ChainDB.create (Filename.concat dir2 "chain") in
+  let load db =
+    put_test_utxo db
+      ~txid_hex:
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      ~vout:0 ~value:5_000_000_000L
+      ~script:"\x76\xa9\x14abcdefghijklmnopqrst\x88\xac"
+      ~height:100 ~is_coinbase:true;
+    put_test_utxo db
+      ~txid_hex:
+        "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+      ~vout:7 ~value:21_000L
+      ~script:"\x51" ~height:200 ~is_coinbase:false
+  in
+  load db1; load db2;
+  let h1 = Assume_utxo.compute_utxo_muhash_from_db db1 in
+  let h2 = Assume_utxo.compute_utxo_muhash_from_db db2 in
+  Storage.ChainDB.close db1;
+  Storage.ChainDB.close db2;
+  cleanup_dir dir1;
+  cleanup_dir dir2;
+  if Cstruct.equal h1 h2 then test_passed name
+  else test_failed name "Same UTXO set produced different MuHash values"
+
+let test_muhash_differs_from_sha256d () =
+  let name = "muhash: MuHash != sha256d hash for same UTXO set" in
+  let dir = temp_dir () in
+  let db = Storage.ChainDB.create (Filename.concat dir "chain") in
+  put_test_utxo db
+    ~txid_hex:
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    ~vout:0 ~value:5_000_000_000L
+    ~script:"\x51" ~height:1 ~is_coinbase:true;
+  let muhash = Assume_utxo.compute_utxo_muhash_from_db db in
+  let sha256d = Assume_utxo.compute_utxo_hash_from_db db in
+  Storage.ChainDB.close db;
+  cleanup_dir dir;
+  if Cstruct.equal muhash sha256d then
+    test_failed name "MuHash and sha256d should not collide on a non-empty set"
+  else test_passed name
+
+let test_muhash_set_change_changes_hash () =
+  let name = "muhash: changing one UTXO changes the commitment" in
+  let dir = temp_dir () in
+  let db = Storage.ChainDB.create (Filename.concat dir "chain") in
+  put_test_utxo db
+    ~txid_hex:
+      "1111111111111111111111111111111111111111111111111111111111111111"
+    ~vout:0 ~value:1_000L ~script:"\x51"
+    ~height:10 ~is_coinbase:false;
+  let h1 = Assume_utxo.compute_utxo_muhash_from_db db in
+  put_test_utxo db
+    ~txid_hex:
+      "2222222222222222222222222222222222222222222222222222222222222222"
+    ~vout:0 ~value:2_000L ~script:"\x52"
+    ~height:11 ~is_coinbase:false;
+  let h2 = Assume_utxo.compute_utxo_muhash_from_db db in
+  Storage.ChainDB.close db;
+  cleanup_dir dir;
+  if Cstruct.equal h1 h2 then
+    test_failed name "Adding a UTXO must change the MuHash commitment"
+  else test_passed name
+
+let test_verify_loaded_utxo_muhash_match () =
+  let name =
+    "verify_loaded_utxo_muhash: agreeing hash returns Ok actual"
+  in
+  let dir = temp_dir () in
+  let db = Storage.ChainDB.create (Filename.concat dir "chain") in
+  put_test_utxo db
+    ~txid_hex:
+      "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+    ~vout:0 ~value:9_999L ~script:"\x51"
+    ~height:42 ~is_coinbase:false;
+  let expected = Assume_utxo.compute_utxo_muhash_from_db db in
+  match Assume_utxo.verify_loaded_utxo_muhash ~db ~expected with
+  | Ok actual ->
+    Storage.ChainDB.close db; cleanup_dir dir;
+    if Cstruct.equal actual expected then test_passed name
+    else test_failed name "Returned hash differs from expected on match"
+  | Error msg ->
+    Storage.ChainDB.close db; cleanup_dir dir;
+    test_failed name ("Verification rejected matching hash: " ^ msg)
+
+let test_verify_loaded_utxo_muhash_mismatch_uses_core_wording () =
+  (* This is the test the operator asked for: when the loaded UTXO's
+     MuHash disagrees with the chainparams-pinned commitment, the
+     loadtxoutset path must surface Core's verbatim wording so external
+     tooling that scrapes RPC errors keeps working. *)
+  let name =
+    "verify_loaded_utxo_muhash: mismatch returns Core's verbatim error"
+  in
+  let dir = temp_dir () in
+  let db = Storage.ChainDB.create (Filename.concat dir "chain") in
+  put_test_utxo db
+    ~txid_hex:
+      "abababababababababababababababababababababababababababababababab"
+    ~vout:0 ~value:50_000L ~script:"\x51"
+    ~height:5 ~is_coinbase:false;
+  (* Wrong expected: the 840k mainnet AssumeUTXO MuHash, which our
+     synthetic single-coin DB cannot possibly match. *)
+  let bogus_expected =
+    (List.hd Assume_utxo.mainnet_au_data).coins_hash
+  in
+  match Assume_utxo.verify_loaded_utxo_muhash ~db ~expected:bogus_expected with
+  | Ok _ ->
+    Storage.ChainDB.close db; cleanup_dir dir;
+    test_failed name "Mismatch must NOT return Ok"
+  | Error msg ->
+    Storage.ChainDB.close db; cleanup_dir dir;
+    let prefix = "Bad snapshot content hash: expected " in
+    let plen = String.length prefix in
+    if String.length msg >= plen
+       && String.sub msg 0 plen = prefix then test_passed name
+    else
+      test_failed name
+        (Printf.sprintf "Wrong error wording: %s" msg)
+
+(* ============================================================================
    Main Test Runner
    ============================================================================ *)
 
@@ -721,5 +886,13 @@ let () =
   test_utxo_hash_multiple_coins ();
   test_utxo_hash_order_matters ();
   test_coin_height_encoding ();
+
+  (* MuHash3072 wiring tests *)
+  test_muhash_empty_db ();
+  test_muhash_deterministic ();
+  test_muhash_differs_from_sha256d ();
+  test_muhash_set_change_changes_hash ();
+  test_verify_loaded_utxo_muhash_match ();
+  test_verify_loaded_utxo_muhash_mismatch_uses_core_wording ();
 
   Printf.printf "All assume_utxo tests passed!\n"

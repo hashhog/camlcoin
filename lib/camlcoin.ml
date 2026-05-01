@@ -36,3 +36,4 @@ module Block_import = Block_import
 module Runtime_config = Runtime_config
 module Compressor = Compressor
 module Reindex = Reindex
+module Muhash = Muhash

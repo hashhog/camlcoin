@@ -4,7 +4,7 @@
  (libraries cstruct cstruct-unix lwt lwt.unix unix bigstring bigstringaf
             base64 cohttp-lwt-unix yojson digestif mirage-crypto
             mirage-crypto-rng mirage-crypto-rng.unix cmdliner
-            logs logs.fmt fmt fmt.tty threads.posix)
+            logs logs.fmt fmt fmt.tty threads.posix zarith)
  (foreign_stubs
   (language c)
   (names schnorr_stubs sha256_accel_stubs rocksdb_stubs zmq_stubs)

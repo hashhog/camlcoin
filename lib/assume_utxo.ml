@@ -814,6 +814,42 @@ let compute_utxo_hash_from_cache (cache : Utxo.UtxoCache.t)
   let _ = Lwt_main.run (Utxo.UtxoCache.flush cache) in
   compute_utxo_hash_from_db db
 
+(** Compute the MuHash3072-based [txoutset_hash] over the UTXO set.
+    Mirrors Bitcoin Core's [CoinStatsHashType::MUHASH] path in
+    [src/kernel/coinstats.cpp]: feed each [(outpoint, coin)] preimage —
+    [outpoint || code(LE32) || value(LE64) || script(varint+bytes)] — into
+    a [MuHash3072] accumulator, then SHA256(LE-3072(num/den mod p)).
+
+    This is the value the [gettxoutsetinfo "muhash"] RPC returns and the
+    quantity Core's strict snapshot validator computes after a successful
+    [loadtxoutset]. We expose it as a [hash256] (32 raw bytes) so callers
+    can feed it straight into [Types.hash256_to_hex_display] for RPC
+    output, matching Core's wire form. *)
+let compute_utxo_muhash_from_db (db : Storage.ChainDB.t) : Types.hash256 =
+  let acc = Muhash.create () in
+  Storage.ChainDB.iter_utxos db (fun txid vout data ->
+    let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+    let utxo = Utxo.deserialize_utxo_entry r in
+    let outpoint = { Types.txid; vout = Int32.of_int vout } in
+    let coin_buf =
+      Muhash.serialize_txout outpoint
+        ~value:utxo.Utxo.value
+        ~script_pubkey:utxo.script_pubkey
+        ~height:utxo.height
+        ~is_coinbase:utxo.is_coinbase
+    in
+    Muhash.add acc (Bytes.unsafe_to_string coin_buf)
+  );
+  Cstruct.of_bytes (Muhash.finalize acc)
+
+(** Compute the MuHash3072 [txoutset_hash] from a UTXO cache view. As with
+    [compute_utxo_hash_from_cache], we flush the cache first so the on-disk
+    set is the one we accumulate. *)
+let compute_utxo_muhash_from_cache (cache : Utxo.UtxoCache.t)
+    (db : Storage.ChainDB.t) : Types.hash256 =
+  let _ = Lwt_main.run (Utxo.UtxoCache.flush cache) in
+  compute_utxo_muhash_from_db db
+
 (* ============================================================================
    Background Validation
    ============================================================================ *)

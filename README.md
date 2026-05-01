@@ -78,7 +78,7 @@ dune exec camlcoin -- --network=testnet --debug
 | `--prune=N` | `0` | Prune target in MB (0=disabled) |
 | `--benchmark` | off | Run performance benchmarks and exit |
 | `--import-blocks=PATH` | none | Import blocks from file (`-` for stdin) |
-| `--import-utxo=PATH` | none | Import UTXO snapshot from HDOG file |
+| `--import-utxo=PATH` (alias `--load-snapshot=PATH`) | none | Load a Bitcoin Core `dumptxoutset` snapshot file. Wire format is byte-identical to Core 31.99 (`utxo\xff` magic, version 2, ScriptCompression-encoded coins). The file is verified against camlcoin's hardcoded AssumeUTXO heights (840k / 880k / 910k / 935k mainnet) before any coin is loaded. |
 
 Cookie-based authentication is generated automatically in `$datadir/.cookie`.
 

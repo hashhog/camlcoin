@@ -3235,28 +3235,37 @@ let handle_loadtxoutset (_ctx : rpc_context)
             (* Strict snapshot content-hash check.
 
                Mirrors Bitcoin Core's [ActivateSnapshot] step in
-               [src/validation.cpp:5912-5915]: after the coins have been
-               loaded into the new chainstate, recompute the canonical
-               UTXO commitment over the loaded set and reject the
-               snapshot if it disagrees with the chainparams-pinned
-               value.
+               [src/validation.cpp:5902-5915]: after the coins have
+               been loaded into the new chainstate, recompute the
+               canonical UTXO commitment over the loaded set and
+               reject the snapshot if it disagrees with the
+               chainparams-pinned value.
 
-               In current Core [m_assumeutxo_data.hash_serialized] holds
-               a MuHash3072 commitment, so we compute the same thing
-               here using [compute_utxo_muhash_from_db] and the strict
-               whitelist's [params.coins_hash]. The error string is
-               Core's verbatim wording so external tooling that scrapes
-               the message keeps working.
+               Core uses [CoinStatsHashType::HASH_SERIALIZED] here
+               (see [src/kernel/coinstats.cpp:161-163]) — i.e. SHA256d
+               of the streamed [(outpoint, coin)] preimages via
+               [HashWriter] ([src/hash.h:HashWriter::GetHash] is the
+               canonical SHA256d). The chainparams field is named
+               [hash_serialized] for exactly this reason: it pins a
+               SHA256d commitment, NOT the MuHash3072 value. (MuHash
+               is used only on the [gettxoutsetinfo "muhash"] surface,
+               see [handle_gettxoutsetinfo] below.)
+
+               We compute the same SHA256d via
+               [verify_loaded_utxo_hash], which calls
+               [compute_utxo_hash_from_db] (HASH_SERIALIZED-equivalent
+               streaming SHA256d). The error string is Core's verbatim
+               wording from [validation.cpp:5913] so external tooling
+               that scrapes the message keeps working.
 
                Both [params.coins_hash] (stored LE per [make_au]) and
-               the [Muhash.finalize] output (raw 32-byte SHA256) are in
-               the same byte order — Core's [uint256] hex constructor
-               reverses on parse and [Muhash.finalize] returns the raw
-               digest, so a direct [Cstruct.equal] is the right check.
-               For the error message we render both via
-               [hash256_to_hex_display] so the operator sees the same
-               hex Core would print. *)
-            (match Assume_utxo.verify_loaded_utxo_muhash
+               our [Crypto.sha256d] output are 32 raw bytes in the
+               same byte order — Core's [uint256] hex constructor
+               reverses on parse and the digest is raw — so a direct
+               [Cstruct.equal] is the right check. For the error
+               message we render both via [hash256_to_hex_display] so
+               the operator sees the same hex Core would print. *)
+            (match Assume_utxo.verify_loaded_utxo_hash
                      ~db:cs.db ~expected:params.coins_hash with
             | Error msg -> Error msg
             | Ok actual_hash ->

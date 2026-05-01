@@ -809,6 +809,113 @@ let test_verify_loaded_utxo_muhash_match () =
     Storage.ChainDB.close db; cleanup_dir dir;
     test_failed name ("Verification rejected matching hash: " ^ msg)
 
+(* ============================================================================
+   Strict-gate tests: HASH_SERIALIZED (SHA256d), NOT MuHash3072.
+
+   Pins the [loadtxoutset] strict snapshot content-hash check to
+   Bitcoin Core's [HASH_SERIALIZED] semantics
+   ([src/validation.cpp:5902-5915] +
+   [src/kernel/coinstats.cpp:161-163]). The chainparams
+   [m_assumeutxo_data.hash_serialized] field holds the SHA256d
+   commitment (e.g. mainnet 840k = a2a5521b...), not the MuHash3072
+   commitment. Reverts the regression in 649d85d which mis-wired the
+   gate to MuHash3072.
+   ============================================================================ *)
+
+let test_verify_loaded_utxo_hash_match () =
+  let name =
+    "verify_loaded_utxo_hash: SHA256d agreeing hash returns Ok actual"
+  in
+  let dir = temp_dir () in
+  let db = Storage.ChainDB.create (Filename.concat dir "chain") in
+  put_test_utxo db
+    ~txid_hex:
+      "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+    ~vout:0 ~value:9_999L ~script:"\x51"
+    ~height:42 ~is_coinbase:false;
+  let expected = Assume_utxo.compute_utxo_hash_from_db db in
+  match Assume_utxo.verify_loaded_utxo_hash ~db ~expected with
+  | Ok actual ->
+    Storage.ChainDB.close db; cleanup_dir dir;
+    if Cstruct.equal actual expected then test_passed name
+    else test_failed name "Returned hash differs from expected on match"
+  | Error msg ->
+    Storage.ChainDB.close db; cleanup_dir dir;
+    test_failed name ("Verification rejected matching hash: " ^ msg)
+
+let test_verify_loaded_utxo_hash_mismatch_uses_core_wording () =
+  let name =
+    "verify_loaded_utxo_hash: SHA256d mismatch returns Core's verbatim error"
+  in
+  let dir = temp_dir () in
+  let db = Storage.ChainDB.create (Filename.concat dir "chain") in
+  put_test_utxo db
+    ~txid_hex:
+      "abababababababababababababababababababababababababababababababab"
+    ~vout:0 ~value:50_000L ~script:"\x51"
+    ~height:5 ~is_coinbase:false;
+  (* Wrong expected: the 840k mainnet AssumeUTXO commitment, which our
+     synthetic single-coin DB cannot possibly match. *)
+  let bogus_expected =
+    (List.hd Assume_utxo.mainnet_au_data).coins_hash
+  in
+  match Assume_utxo.verify_loaded_utxo_hash ~db ~expected:bogus_expected with
+  | Ok _ ->
+    Storage.ChainDB.close db; cleanup_dir dir;
+    test_failed name "Mismatch must NOT return Ok"
+  | Error msg ->
+    Storage.ChainDB.close db; cleanup_dir dir;
+    let prefix = "Bad snapshot content hash: expected " in
+    let plen = String.length prefix in
+    if String.length msg >= plen
+       && String.sub msg 0 plen = prefix then test_passed name
+    else
+      test_failed name
+        (Printf.sprintf "Wrong error wording: %s" msg)
+
+(* The strict gate MUST use SHA256d (HASH_SERIALIZED), not MuHash3072.
+   Pins the regression: feeding the MuHash3072 commitment to the
+   strict-gate verifier MUST fail, because the chainparams pin is a
+   SHA256d. *)
+let test_verify_loaded_utxo_hash_rejects_muhash_value () =
+  let name =
+    "verify_loaded_utxo_hash: rejects MuHash3072 commitment as expected value"
+  in
+  let dir = temp_dir () in
+  let db = Storage.ChainDB.create (Filename.concat dir "chain") in
+  put_test_utxo db
+    ~txid_hex:
+      "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+    ~vout:0 ~value:1L ~script:"\x51"
+    ~height:7 ~is_coinbase:false;
+  let muhash = Assume_utxo.compute_utxo_muhash_from_db db in
+  let sha256d = Assume_utxo.compute_utxo_hash_from_db db in
+  if Cstruct.equal muhash sha256d then begin
+    Storage.ChainDB.close db; cleanup_dir dir;
+    test_failed name "MuHash and SHA256d collided on a non-empty set; \
+                      cannot pin strict gate"
+  end else
+    match Assume_utxo.verify_loaded_utxo_hash ~db ~expected:muhash with
+    | Ok _ ->
+      Storage.ChainDB.close db; cleanup_dir dir;
+      test_failed name
+        "Strict gate accepted MuHash3072 value; gate is wired to MuHash, \
+         not HASH_SERIALIZED (regression)"
+    | Error _ ->
+      (* Sanity-check the converse: feeding the SHA256d value DOES pass. *)
+      match Assume_utxo.verify_loaded_utxo_hash ~db ~expected:sha256d with
+      | Ok actual when Cstruct.equal actual sha256d ->
+        Storage.ChainDB.close db; cleanup_dir dir;
+        test_passed name
+      | Ok _ ->
+        Storage.ChainDB.close db; cleanup_dir dir;
+        test_failed name
+          "Strict gate accepted SHA256d but returned wrong actual"
+      | Error msg ->
+        Storage.ChainDB.close db; cleanup_dir dir;
+        test_failed name
+          ("Strict gate rejected matching SHA256d: " ^ msg)
+
 let test_verify_loaded_utxo_muhash_mismatch_uses_core_wording () =
   (* This is the test the operator asked for: when the loaded UTXO's
      MuHash disagrees with the chainparams-pinned commitment, the
@@ -894,5 +1001,10 @@ let () =
   test_muhash_set_change_changes_hash ();
   test_verify_loaded_utxo_muhash_match ();
   test_verify_loaded_utxo_muhash_mismatch_uses_core_wording ();
+
+  (* Strict-gate (SHA256d / HASH_SERIALIZED) regression tests *)
+  test_verify_loaded_utxo_hash_match ();
+  test_verify_loaded_utxo_hash_mismatch_uses_core_wording ();
+  test_verify_loaded_utxo_hash_rejects_muhash_value ();
 
   Printf.printf "All assume_utxo tests passed!\n"

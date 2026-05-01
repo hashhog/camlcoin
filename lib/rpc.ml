@@ -3180,13 +3180,33 @@ let handle_loadtxoutset (_ctx : rpc_context)
              ~expected_network_magic:_ctx.network.magic with
     | Error e -> Error e
     | Ok metadata ->
+      (* Core-strict whitelist check: refuse any snapshot whose
+         base_blockhash height isn't in [m_assumeutxo_data].
+         Mirrors [bitcoin-core/src/validation.cpp:5775-5780]:
+
+           if (!maybe_au_data) {
+               return util::Error{Untranslated(strprintf(
+                   "Assumeutxo height in snapshot metadata not recognized "
+                   "(%d) - refusing to load snapshot", base_height))};
+           }
+
+         Camlcoin already short-circuits via [get_assumeutxo_for_hash]
+         (hash-keyed lookup against [mainnet_au_data]); reuse that, and
+         when the lookup fails attempt to resolve the height from the
+         header index for the error message. Falls back to -1 (matching
+         Core's behaviour for an unknown blockhash). *)
       (match Assume_utxo.get_assumeutxo_for_hash ~network:_ctx.network
                metadata.base_blockhash with
       | None ->
+        let base_height =
+          match Sync.get_header _ctx.chain metadata.base_blockhash with
+          | Some hdr -> hdr.height
+          | None -> -1
+        in
         Error (Printf.sprintf
-                 "Snapshot blockhash %s not recognized. AssumeUTXO is only \
-                  supported for specific block heights."
-                 (Types.hash256_to_hex_display metadata.base_blockhash))
+                 "Assumeutxo height in snapshot metadata not recognized \
+                  (%d) - refusing to load snapshot"
+                 base_height)
       | Some params ->
         if Int64.compare params.coins_count 0L <> 0
            && metadata.coins_count <> params.coins_count then

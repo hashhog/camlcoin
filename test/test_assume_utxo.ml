@@ -249,6 +249,61 @@ let test_unknown_height () =
   | None -> test_passed name
   | Some _ -> test_failed name "Should return None for unknown height"
 
+(* Core-strict whitelist rejection (matches
+   bitcoin-core/src/validation.cpp:5775-5780). The regtest genesis hash is
+   intentionally absent from [mainnet_au_data], so any snapshot whose
+   metadata advertises that hash as the [base_blockhash] must be refused
+   by [get_assumeutxo_for_hash] regardless of how it was framed. *)
+let test_regtest_genesis_rejected () =
+  let name = "regtest-genesis blockhash rejected by mainnet whitelist" in
+  let regtest_genesis = Camlcoin.Consensus.regtest.genesis_hash in
+  match Assume_utxo.get_assumeutxo_for_hash
+          ~network:Camlcoin.Consensus.mainnet regtest_genesis with
+  | None -> test_passed name
+  | Some _ ->
+    test_failed name
+      "Regtest genesis hash must NOT match any mainnet AssumeUTXO entry"
+
+(* End-to-end snapshot rejection: write a snapshot whose metadata carries
+   the regtest genesis as [base_blockhash], read it back through the same
+   helpers the [loadtxoutset] RPC uses, and assert the whitelist lookup
+   refuses it. This is the exact decision point in [handle_loadtxoutset]:
+   the RPC reports
+     "Assumeutxo height in snapshot metadata not recognized (...) -
+      refusing to load snapshot"
+   when this lookup returns None. *)
+let test_loadtxoutset_regtest_genesis_refused () =
+  let name = "loadtxoutset path: regtest-genesis snapshot is refused" in
+  let dir = temp_dir () in
+  let path = Filename.concat dir "regtest_genesis_snapshot.dat" in
+  let regtest_genesis = Camlcoin.Consensus.regtest.genesis_hash in
+  let metadata : Assume_utxo.snapshot_metadata = {
+    network_magic = Camlcoin.Consensus.mainnet.magic;
+    base_blockhash = regtest_genesis;
+    coins_count = 0L;
+  } in
+  (match Assume_utxo.write_snapshot path metadata
+           ~iter_coins:(fun _emit -> ()) with
+  | Error msg ->
+    cleanup_dir dir;
+    test_failed name ("Snapshot write failed: " ^ msg)
+  | Ok () ->
+    (match Assume_utxo.read_snapshot_metadata path
+             ~expected_network_magic:Camlcoin.Consensus.mainnet.magic with
+    | Error msg ->
+      cleanup_dir dir;
+      test_failed name ("Snapshot read failed: " ^ msg)
+    | Ok decoded ->
+      (match Assume_utxo.get_assumeutxo_for_hash
+               ~network:Camlcoin.Consensus.mainnet decoded.base_blockhash with
+      | None ->
+        cleanup_dir dir;
+        test_passed name
+      | Some _ ->
+        cleanup_dir dir;
+        test_failed name
+          "Regtest-genesis snapshot must be refused by the whitelist")))
+
 (* Testnet4 has no Core-published AssumeUTXO heights as of Core 31.99.
    Verify [get_assumeutxo_params_testnet4] returns None for any height. *)
 let test_testnet4_params () =
@@ -648,6 +703,8 @@ let () =
   test_mainnet_params ();
   test_mainnet_all_heights ();
   test_unknown_height ();
+  test_regtest_genesis_rejected ();
+  test_loadtxoutset_regtest_genesis_refused ();
   test_testnet4_params ();
 
   (* File I/O tests *)

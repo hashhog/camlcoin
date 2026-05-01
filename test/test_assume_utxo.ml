@@ -41,7 +41,7 @@ let cleanup_dir path =
 let test_metadata_serialization () =
   let name = "metadata serialization roundtrip" in
   let metadata : Assume_utxo.snapshot_metadata = {
-    network_magic = 0xF9BEB4D9l;  (* mainnet *)
+    network_magic = 0xD9B4BEF9l;  (* mainnet, OCaml int32 form *)
     base_blockhash = Types.hash256_of_hex
       "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5";
     coins_count = 177_240_679L;
@@ -52,9 +52,25 @@ let test_metadata_serialization () =
   Assume_utxo.serialize_metadata w metadata;
   let data = Serialize.writer_to_cstruct w in
 
+  (* The serialized metadata block is exactly 51 bytes: magic 5 + version 2
+     + network 4 + blockhash 32 + coins_count 8. *)
+  if Cstruct.length data <> 51 then
+    test_failed name (Printf.sprintf "expected 51-byte metadata, got %d"
+                        (Cstruct.length data))
+  else
+  (* Bytes 0..4 are 'utxo\xff'; bytes 5..6 are version 2 LE; bytes 7..10 are
+     mainnet pchMessageStart {f9, be, b4, d9}. *)
+  let prefix = Cstruct.to_string (Cstruct.sub data 0 11) in
+  let expected_prefix = "utxo\xff\x02\x00\xf9\xbe\xb4\xd9" in
+  if prefix <> expected_prefix then
+    test_failed name (Printf.sprintf
+                        "Wire prefix mismatch (got %s, want %s)"
+                        (String.escaped prefix)
+                        (String.escaped expected_prefix))
+  else
   (* Deserialize *)
   let r = Serialize.reader_of_cstruct data in
-  match Assume_utxo.deserialize_metadata r ~expected_network_magic:0xF9BEB4D9l with
+  match Assume_utxo.deserialize_metadata r ~expected_network_magic:0xD9B4BEF9l with
   | Error msg -> test_failed name msg
   | Ok decoded ->
     if decoded.network_magic <> metadata.network_magic then
@@ -69,7 +85,7 @@ let test_metadata_serialization () =
 let test_metadata_network_mismatch () =
   let name = "metadata network mismatch" in
   let metadata : Assume_utxo.snapshot_metadata = {
-    network_magic = 0xF9BEB4D9l;  (* mainnet *)
+    network_magic = 0xD9B4BEF9l;  (* mainnet *)
     base_blockhash = Types.hash256_of_hex
       "0000000000000000000000000000000000000000000000000000000000000001";
     coins_count = 100L;
@@ -80,7 +96,7 @@ let test_metadata_network_mismatch () =
   Assume_utxo.serialize_metadata w metadata;
   let data = Serialize.writer_to_cstruct w in
 
-  (* Deserialize with wrong expected network *)
+  (* Deserialize with wrong expected network (testnet4) *)
   let r = Serialize.reader_of_cstruct data in
   match Assume_utxo.deserialize_metadata r ~expected_network_magic:0x1C163F28l with
   | Error _ -> test_passed name  (* Expected to fail *)
@@ -91,7 +107,7 @@ let test_invalid_magic () =
   (* Create data with wrong magic bytes *)
   let data = Cstruct.of_string "wrong" in
   let r = Serialize.reader_of_cstruct data in
-  match Assume_utxo.deserialize_metadata r ~expected_network_magic:0xF9BEB4D9l with
+  match Assume_utxo.deserialize_metadata r ~expected_network_magic:0xD9B4BEF9l with
   | Error _ -> test_passed name  (* Expected to fail *)
   | Ok _ -> test_failed name "Should have failed with invalid magic"
 
@@ -193,8 +209,39 @@ let test_mainnet_params () =
       test_failed name "height mismatch"
     else if params.coins_count <> 177_240_679L then
       test_failed name "coins_count mismatch"
+    else if params.chain_tx_count <> 991_032_194L then
+      test_failed name "chain_tx_count mismatch (must match Core 31.99 chainparams.cpp)"
     else
       test_passed name
+
+(* Verify all four mainnet AssumeUTXO heights from Bitcoin Core 31.99
+   chainparams.cpp (heights 840k / 880k / 910k / 935k) are present and
+   carry the canonical chain_tx_count + blockhash. *)
+let test_mainnet_all_heights () =
+  let name = "mainnet assumeutxo all four heights" in
+  let expected = [
+    (840_000,
+       "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
+       991_032_194L);
+    (880_000,
+       "000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880",
+       1_145_604_538L);
+    (910_000,
+       "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821",
+       1_226_586_151L);
+    (935_000,
+       "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee",
+       1_305_397_408L);
+  ] in
+  let ok = List.for_all (fun (h, want_hash, want_chain_tx) ->
+    match Assume_utxo.get_assumeutxo_params_mainnet h with
+    | None -> false
+    | Some p ->
+      Types.hash256_to_hex_display p.blockhash = want_hash
+      && Int64.equal p.chain_tx_count want_chain_tx
+  ) expected in
+  if ok then test_passed name
+  else test_failed name "one or more entries missing or mismatched"
 
 let test_unknown_height () =
   let name = "unknown height returns None" in
@@ -202,15 +249,15 @@ let test_unknown_height () =
   | None -> test_passed name
   | Some _ -> test_failed name "Should return None for unknown height"
 
+(* Testnet4 has no Core-published AssumeUTXO heights as of Core 31.99.
+   Verify [get_assumeutxo_params_testnet4] returns None for any height. *)
 let test_testnet4_params () =
-  let name = "testnet4 assumeutxo params lookup" in
+  let name = "testnet4 assumeutxo: no published heights" in
   match Assume_utxo.get_assumeutxo_params_testnet4 160000 with
-  | None -> test_failed name "Should have params for height 160000"
-  | Some params ->
-    if params.height <> 160000 then
-      test_failed name "height mismatch"
-    else
-      test_passed name
+  | None -> test_passed name
+  | Some _ ->
+    test_failed name
+      "Testnet4 AssumeUTXO is not yet defined upstream; should return None"
 
 (* ============================================================================
    Chainstate ID Tests
@@ -235,7 +282,7 @@ let test_snapshot_file_io () =
   let path = Filename.concat dir "test_snapshot.dat" in
 
   let metadata : Assume_utxo.snapshot_metadata = {
-    network_magic = 0xF9BEB4D9l;
+    network_magic = 0xD9B4BEF9l;
     base_blockhash = Types.hash256_of_hex
       "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5";
     coins_count = 3L;
@@ -261,7 +308,7 @@ let test_snapshot_file_io () =
   | Ok () ->
     (* Read back metadata *)
     (match Assume_utxo.read_snapshot_metadata path
-             ~expected_network_magic:0xF9BEB4D9l with
+             ~expected_network_magic:0xD9B4BEF9l with
     | Error msg ->
       cleanup_dir dir;
       test_failed name ("Read failed: " ^ msg)
@@ -276,6 +323,151 @@ let test_snapshot_file_io () =
       end)
 
 (* ============================================================================
+   Core Wire-Format Snapshot Tests
+   ============================================================================ *)
+
+(* Build a deterministic 32-byte hash from a one-byte tag, used to fabricate
+   distinct txids for the wire-format roundtrip tests. *)
+let mk_txid (tag : int) : Types.hash256 =
+  let buf = Cstruct.create 32 in
+  Cstruct.set_uint8 buf 0 tag;
+  buf
+
+let test_snapshot_wire_roundtrip () =
+  let name = "snapshot wire-format roundtrip (Core layout)" in
+  let dir = temp_dir () in
+  let path = Filename.concat dir "snap_wire.dat" in
+  (* Three coins under two distinct txids: txid A has vouts 0 and 1, txid B
+     has vout 0. Exercises the per-txid grouping codepath. *)
+  let txid_a = mk_txid 0xAA in
+  let txid_b = mk_txid 0xBB in
+  let p2pkh_script =
+    let s = Cstruct.create 25 in
+    Cstruct.set_uint8 s 0 0x76;  (* OP_DUP *)
+    Cstruct.set_uint8 s 1 0xa9;  (* OP_HASH160 *)
+    Cstruct.set_uint8 s 2 20;
+    for i = 0 to 19 do
+      Cstruct.set_uint8 s (3 + i) (i + 0x10)
+    done;
+    Cstruct.set_uint8 s 23 0x88;  (* OP_EQUALVERIFY *)
+    Cstruct.set_uint8 s 24 0xac;  (* OP_CHECKSIG *)
+    s
+  in
+  let custom_script = Cstruct.of_string "\x6a\x04\xde\xad\xbe\xef" in
+  let coin1 : Assume_utxo.snapshot_coin = {
+    outpoint = { Types.txid = txid_a; vout = 0l };
+    value = 5_000_000_000L;
+    script_pubkey = p2pkh_script;
+    height = 100;
+    is_coinbase = true;
+  } in
+  let coin2 : Assume_utxo.snapshot_coin = {
+    outpoint = { Types.txid = txid_a; vout = 1l };
+    value = 21_000L;
+    script_pubkey = custom_script;
+    height = 100;
+    is_coinbase = false;
+  } in
+  let coin3 : Assume_utxo.snapshot_coin = {
+    outpoint = { Types.txid = txid_b; vout = 0l };
+    value = 1L;
+    script_pubkey = Cstruct.empty;
+    height = 0;
+    is_coinbase = false;
+  } in
+  let coins = [coin1; coin2; coin3] in
+  let metadata : Assume_utxo.snapshot_metadata = {
+    network_magic = 0xD9B4BEF9l;
+    base_blockhash = Cstruct.create 32;
+    coins_count = 3L;
+  } in
+  match Assume_utxo.write_snapshot path metadata
+          ~iter_coins:(fun f -> List.iter f coins) with
+  | Error msg -> cleanup_dir dir; test_failed name ("write: " ^ msg)
+  | Ok () ->
+    (* Reopen and stream all coins back via the public iterator. *)
+    let ic = open_in_bin path in
+    let sr = Assume_utxo.Stream_reader.create ic
+               ~start_offset:Assume_utxo.snapshot_body_offset in
+    let acc = ref [] in
+    let res =
+      Assume_utxo.iter_snapshot_coins sr ~coins_count:3L
+        ~f:(fun coin -> acc := coin :: !acc)
+    in
+    close_in ic;
+    cleanup_dir dir;
+    match res with
+    | Error msg -> test_failed name ("iter: " ^ msg)
+    | Ok n ->
+      let decoded = List.rev !acc in
+      let same_coin (a : Assume_utxo.snapshot_coin)
+                    (b : Assume_utxo.snapshot_coin) =
+        Cstruct.equal a.outpoint.txid b.outpoint.txid
+        && Int32.equal a.outpoint.vout b.outpoint.vout
+        && Int64.equal a.value b.value
+        && Cstruct.equal a.script_pubkey b.script_pubkey
+        && a.height = b.height
+        && a.is_coinbase = b.is_coinbase
+      in
+      if Int64.compare n 3L <> 0 then
+        test_failed name (Printf.sprintf "expected 3 coins, got %Ld" n)
+      else if not (List.length decoded = 3
+                   && List.for_all2 same_coin decoded coins) then
+        test_failed name "decoded coins do not match input"
+      else
+        test_passed name
+
+(* Verify the on-wire byte layout for a single 2-coin / 1-txid group
+   matches Core exactly. Construct a coin with a known compressed P2PKH
+   script and known small amount and compare bytes. *)
+let test_snapshot_wire_bytes () =
+  let name = "snapshot wire bytes match Core layout" in
+  let dir = temp_dir () in
+  let path = Filename.concat dir "snap_bytes.dat" in
+  let txid = mk_txid 0xCC in
+  let coin : Assume_utxo.snapshot_coin = {
+    outpoint = { Types.txid; vout = 0l };
+    value = 1L;
+    script_pubkey = Cstruct.empty;  (* fallback path: VARINT(6) + 0 bytes *)
+    height = 0;
+    is_coinbase = false;
+  } in
+  let metadata : Assume_utxo.snapshot_metadata = {
+    network_magic = 0xD9B4BEF9l;
+    base_blockhash = Cstruct.create 32;
+    coins_count = 1L;
+  } in
+  (match Assume_utxo.write_snapshot path metadata
+           ~iter_coins:(fun f -> f coin) with
+   | Error msg -> cleanup_dir dir; test_failed name ("write: " ^ msg)
+   | Ok () ->
+     let ic = open_in_bin path in
+     let len = in_channel_length ic in
+     let body_len = len - Assume_utxo.snapshot_body_offset in
+     seek_in ic Assume_utxo.snapshot_body_offset;
+     let body = really_input_string ic body_len in
+     close_in ic;
+     cleanup_dir dir;
+     (* Expected body bytes:
+          txid (32 raw) || coins_per_txid CompactSize 0x01
+          || vout CompactSize 0x00 || code VARINT(0) = 0x00
+          || amount VARINT(CompressAmount(1)) — CompressAmount(1) = 1,
+             VARINT(1) = 0x01
+          || script size VARINT(0+6) = 0x06 then 0 raw bytes. *)
+     let expected = Bytes.create (32 + 1 + 1 + 1 + 1 + 1) in
+     Cstruct.blit_to_bytes txid 0 expected 0 32;
+     Bytes.set expected 32 (Char.chr 0x01);  (* coins_per_txid *)
+     Bytes.set expected 33 (Char.chr 0x00);  (* vout = 0 *)
+     Bytes.set expected 34 (Char.chr 0x00);  (* code VARINT *)
+     Bytes.set expected 35 (Char.chr 0x01);  (* VARINT(CompressAmount(1)) *)
+     Bytes.set expected 36 (Char.chr 0x06);  (* script size VARINT(0+6) *)
+     let want = Bytes.unsafe_to_string expected in
+     if String.equal body want then test_passed name
+     else test_failed name (Printf.sprintf
+       "wire bytes mismatch: got=%s want=%s"
+       (String.escaped body) (String.escaped want)))
+
+(* ============================================================================
    Background Validation State Tests
    ============================================================================ *)
 
@@ -286,6 +478,7 @@ let test_background_validation_states () =
     blockhash = Cstruct.create 32;
     coins_count = 50L;
     coins_hash = Cstruct.create 32;
+    chain_tx_count = 0L;
   } in
   let bg = Assume_utxo.create_background_validation ~snapshot_params:params in
 
@@ -453,11 +646,14 @@ let () =
 
   (* Hardcoded params tests *)
   test_mainnet_params ();
+  test_mainnet_all_heights ();
   test_unknown_height ();
   test_testnet4_params ();
 
   (* File I/O tests *)
   test_snapshot_file_io ();
+  test_snapshot_wire_roundtrip ();
+  test_snapshot_wire_bytes ();
 
   (* Background validation tests *)
   test_background_validation_states ();

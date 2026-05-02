@@ -1734,6 +1734,87 @@ let test_gettxoutsetinfo_rejects_bad_hash_type () =
   cleanup_test_db ()
 
 (* ============================================================================
+   Wallet Encryption RPC Tests
+     - encryptwallet "passphrase"
+     - walletpassphrase "passphrase" timeout
+     - walletlock
+   ============================================================================ *)
+
+(* Build a context with an attached wallet. The wallet is created with one
+   address so encrypt/decrypt actually exercises the master-key roundtrip
+   verification path in [Wallet.wallet_passphrase]. *)
+let create_wallet_test_context () =
+  let (ctx, db, utxo, _, _) = create_test_context () in
+  let wallet = Wallet.create ~network:`Regtest ~db_path:"" in
+  let _ = Wallet.get_new_address wallet in
+  let ctx = { ctx with wallet = Some wallet } in
+  (ctx, db, utxo, wallet)
+
+(* Test: encrypt → walletpassphrase with wrong passphrase fails;
+   walletpassphrase with right passphrase succeeds. Goes through dispatch_rpc
+   to exercise both the handler and the dispatch table wiring. *)
+let test_walletpassphrase_wrong_then_right () =
+  let (ctx, db, _utxo, wallet) = create_wallet_test_context () in
+
+  (* encryptwallet "secret" *)
+  (match Rpc.dispatch_rpc ctx "encryptwallet" [`String "secret"] with
+   | Ok _ -> ()
+   | Error (_, msg) -> Alcotest.fail ("encryptwallet failed: " ^ msg));
+  Alcotest.(check bool) "wallet now encrypted" true (Wallet.is_encrypted wallet);
+  Alcotest.(check bool) "wallet now locked" true (Wallet.is_locked wallet);
+
+  (* walletpassphrase "wrong" 60 — must fail with rpc_wallet_error *)
+  (match Rpc.dispatch_rpc ctx "walletpassphrase" [`String "wrong"; `Int 60] with
+   | Ok _ -> Alcotest.fail "walletpassphrase with wrong pass should fail"
+   | Error (code, _) ->
+     Alcotest.(check int) "wrong pass returns wallet error" Rpc.rpc_wallet_error code);
+  Alcotest.(check bool) "still locked after wrong pass" true (Wallet.is_locked wallet);
+
+  (* walletpassphrase "secret" 60 — must succeed *)
+  (match Rpc.dispatch_rpc ctx "walletpassphrase" [`String "secret"; `Int 60] with
+   | Ok _ -> ()
+   | Error (_, msg) ->
+     Alcotest.fail ("walletpassphrase with right pass failed: " ^ msg));
+  Alcotest.(check bool) "unlocked after right pass" false (Wallet.is_locked wallet);
+
+  (* walletlock — must re-lock immediately *)
+  (match Rpc.dispatch_rpc ctx "walletlock" [] with
+   | Ok _ -> ()
+   | Error (_, msg) -> Alcotest.fail ("walletlock failed: " ^ msg));
+  Alcotest.(check bool) "locked after walletlock" true (Wallet.is_locked wallet);
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: walletpassphrase auto-relocks after timeout via the Lwt.async
+   sleeper. Uses a 1-second timeout and runs an Lwt main loop for ~2s
+   to give the timer a chance to fire. *)
+let test_walletpassphrase_auto_relock () =
+  let (ctx, db, _utxo, wallet) = create_wallet_test_context () in
+
+  (match Rpc.dispatch_rpc ctx "encryptwallet" [`String "topsecret"] with
+   | Ok _ -> ()
+   | Error (_, msg) -> Alcotest.fail ("encryptwallet failed: " ^ msg));
+
+  (* Unlock for 1 second. *)
+  (match Rpc.dispatch_rpc ctx "walletpassphrase"
+           [`String "topsecret"; `Int 1] with
+   | Ok _ -> ()
+   | Error (_, msg) -> Alcotest.fail ("walletpassphrase failed: " ^ msg));
+  Alcotest.(check bool) "unlocked immediately after walletpassphrase"
+    false (Wallet.is_locked wallet);
+
+  (* Drive the Lwt scheduler so the relock-timer can fire. We sleep
+     slightly longer than the unlock timeout. *)
+  Lwt_main.run (Lwt_unix.sleep 1.6);
+
+  Alcotest.(check bool) "auto-relocked after timeout"
+    true (Wallet.is_locked wallet);
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -1834,5 +1915,11 @@ let () =
         test_gettxoutsetinfo_muhash_matches_dump;
       test_case "gettxoutsetinfo rejects unknown hash_type" `Quick
         test_gettxoutsetinfo_rejects_bad_hash_type;
+    ];
+    "wallet_encryption_rpc", [
+      test_case "encrypt → wrong then right passphrase" `Quick
+        test_walletpassphrase_wrong_then_right;
+      test_case "auto-relock after timeout" `Quick
+        test_walletpassphrase_auto_relock;
     ];
   ]

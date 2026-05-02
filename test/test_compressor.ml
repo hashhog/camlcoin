@@ -170,6 +170,143 @@ let test_script_compress_p2wpkh_fallback () =
   | None -> pass name  (* Expected: not compressible *)
   | Some _ -> fail name "P2WPKH must NOT match a special case"
 
+(* Bitcoin Core's [DecompressScript] for nSize=4/5: rebuild an uncompressed
+   P2PK from the parity bit + 32-byte x via secp256k1 point decompression.
+   Vector: the secp256k1 generator G.
+     compressed (parity even, prefix 0x02):
+       02 79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
+     uncompressed (0x04 || X || Y):
+       04 79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
+          483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8
+   The expected P2PK script is [0x41 || pubkey[65] || OP_CHECKSIG]. *)
+let test_decompress_uncompressed_p2pk_g () =
+  let name = "DecompressScript: uncompressed P2PK (generator G)" in
+  let hex_to_cstruct h =
+    let b = Bytes.create (String.length h / 2) in
+    for i = 0 to Bytes.length b - 1 do
+      Bytes.set b i (Char.chr (int_of_string ("0x" ^ String.sub h (2*i) 2)))
+    done;
+    Cstruct.of_bytes b
+  in
+  let x =
+    hex_to_cstruct
+      "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+  in
+  let y =
+    hex_to_cstruct
+      "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8"
+  in
+  (* parity of G's Y is even (Y[31] = 0xb8 → low bit 0), so the compressed
+     prefix is 0x02 and the snapshot tag is 0x04. *)
+  match Compressor.decompress_script 0x04 x with
+  | None -> fail name "decompress returned None for valid generator G"
+  | Some script ->
+    if Cstruct.length script <> 67 then
+      fail name (Printf.sprintf "expected 67-byte script, got %d"
+                   (Cstruct.length script));
+    if Cstruct.get_uint8 script 0 <> 65 then
+      fail name "leading push byte must be 65 (0x41)";
+    if Cstruct.get_uint8 script 1 <> 0x04 then
+      fail name "uncompressed pubkey must start with 0x04";
+    let got_x = Cstruct.sub script 2 32 in
+    let got_y = Cstruct.sub script 34 32 in
+    if not (Cstruct.equal got_x x) then
+      fail name "X coordinate mismatch";
+    if not (Cstruct.equal got_y y) then
+      fail name "Y coordinate mismatch";
+    if Cstruct.get_uint8 script 66 <> 0xac then
+      fail name "trailing opcode must be OP_CHECKSIG (0xac)";
+    pass name
+
+(* Tag 0x05 (parity odd) using -G = (G_x, p - G_y).  The point -G has
+   X = G's X but Y with low bit 1, so parity-odd.  We expect tag 0x05 to
+   yield X || (p - G_y). *)
+let test_decompress_uncompressed_p2pk_neg_g () =
+  let name = "DecompressScript: uncompressed P2PK (-G, parity odd)" in
+  let hex_to_cstruct h =
+    let b = Bytes.create (String.length h / 2) in
+    for i = 0 to Bytes.length b - 1 do
+      Bytes.set b i (Char.chr (int_of_string ("0x" ^ String.sub h (2*i) 2)))
+    done;
+    Cstruct.of_bytes b
+  in
+  let x =
+    hex_to_cstruct
+      "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+  in
+  (* Y(-G) = p - Y(G) mod p, where p = secp256k1 field prime
+       FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+     Computed in Python and confirmed by libsecp256k1:
+       p - 0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8
+       = 0xb7c52588d95c3b9aa25b0403f1eef75702e84bb7597aabe663b82f6f04ef2777 *)
+  let y_neg =
+    hex_to_cstruct
+      "b7c52588d95c3b9aa25b0403f1eef75702e84bb7597aabe663b82f6f04ef2777"
+  in
+  match Compressor.decompress_script 0x05 x with
+  | None -> fail name "decompress returned None for valid -G"
+  | Some script ->
+    if Cstruct.length script <> 67 then
+      fail name (Printf.sprintf "expected 67 bytes, got %d"
+                   (Cstruct.length script));
+    let got_x = Cstruct.sub script 2 32 in
+    let got_y = Cstruct.sub script 34 32 in
+    if not (Cstruct.equal got_x x) then fail name "X mismatch";
+    if not (Cstruct.equal got_y y_neg) then
+      fail name (Printf.sprintf "Y mismatch: got %s"
+                   (String.escaped (Cstruct.to_string got_y)));
+    pass name
+
+(* Negative case: an invalid x-coord (not on the curve) must fail-closed. *)
+let test_decompress_uncompressed_p2pk_invalid () =
+  let name = "DecompressScript: invalid x-coord fail-closed" in
+  (* All-zero x is not a valid secp256k1 x-coordinate: y^2 = x^3 + 7 = 7,
+     and 7 is a quadratic non-residue mod p (well-known). *)
+  let bad_x = Cstruct.create 32 in  (* all zeros *)
+  match Compressor.decompress_script 0x04 bad_x with
+  | None -> pass name
+  | Some _ ->
+    fail name "decompress should have returned None for off-curve x"
+
+(* Round-trip through the public ScriptCompression entry points: an
+   uncompressed P2PK encoded by [serialize_script] must decode identically.
+   This proves that compress→decompress is a fixpoint for the 0x04/0x05
+   path, matching Core's invariant. *)
+let test_script_serialize_roundtrip_uncompressed_p2pk () =
+  let name = "Script roundtrip: uncompressed P2PK" in
+  let hex_to_cstruct h =
+    let b = Bytes.create (String.length h / 2) in
+    for i = 0 to Bytes.length b - 1 do
+      Bytes.set b i (Char.chr (int_of_string ("0x" ^ String.sub h (2*i) 2)))
+    done;
+    Cstruct.of_bytes b
+  in
+  (* Build the canonical 67-byte P2PK script for G. *)
+  let g_uncomp =
+    hex_to_cstruct
+      ("0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+       ^ "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8")
+  in
+  let script = Cstruct.create 67 in
+  Cstruct.set_uint8 script 0 65;
+  Cstruct.blit g_uncomp 0 script 1 65;
+  Cstruct.set_uint8 script 66 0xac;
+  let w = Serialize.writer_create () in
+  Compressor.serialize_script w script;
+  let bytes = Serialize.writer_to_cstruct w in
+  (* Must compress: first byte 0x04 (parity even), then 32-byte X. *)
+  if Cstruct.length bytes <> 33 then
+    fail name (Printf.sprintf "expected 33-byte compressed form, got %d"
+                 (Cstruct.length bytes));
+  if Cstruct.get_uint8 bytes 0 <> 0x04 then
+    fail name (Printf.sprintf "expected tag 0x04, got 0x%02x"
+                 (Cstruct.get_uint8 bytes 0));
+  let r = Serialize.reader_of_cstruct bytes in
+  let back = Compressor.deserialize_script r in
+  if not (Cstruct.equal back script) then
+    fail name "round-trip differs from original";
+  pass name
+
 (* Round-trip via the public ScriptCompression entry points: any script that
    is encoded by [serialize_script] must decode identically. *)
 let test_script_serialize_roundtrip () =
@@ -215,5 +352,9 @@ let () =
   test_script_compress_p2pkh ();
   test_script_compress_p2sh ();
   test_script_compress_p2wpkh_fallback ();
+  test_decompress_uncompressed_p2pk_g ();
+  test_decompress_uncompressed_p2pk_neg_g ();
+  test_decompress_uncompressed_p2pk_invalid ();
+  test_script_serialize_roundtrip_uncompressed_p2pk ();
   test_script_serialize_roundtrip ();
   Printf.printf "All compressor tests passed!\n"

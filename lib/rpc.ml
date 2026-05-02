@@ -2051,6 +2051,117 @@ let handle_getwalletinfo (ctx : rpc_context)
     ])
 
 (* ============================================================================
+   Wallet Encryption Handlers (encryptwallet / walletpassphrase / walletlock)
+   ============================================================================
+
+   These wire the existing PBKDF2 + AES-256-CBC primitives in
+   [Wallet.encrypt_wallet], [Wallet.wallet_passphrase], [Wallet.wallet_lock]
+   to JSON-RPC. Behaviour mirrors Bitcoin Core's
+   [src/wallet/rpc/encrypt.cpp]:
+     - encryptwallet "passphrase"
+         Encrypts a previously-unencrypted wallet. The wallet is left in the
+         locked state; Core also recommends the operator restart, but our
+         implementation can keep running locked.
+     - walletpassphrase "passphrase" timeout
+         Decrypts the wallet's master key for [timeout] seconds. After the
+         timeout elapses, an [Lwt.async] timer triggers [wallet_lock], which
+         zeroes the in-memory private keys.
+     - walletlock
+         Immediately re-locks an unlocked wallet. *)
+
+(* encryptwallet "passphrase" *)
+let handle_encryptwallet (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | `String passphrase :: _ ->
+    if String.length passphrase = 0 then
+      Error "passphrase can not be empty"
+    else begin
+      match get_wallet_for_request ctx None with
+      | Error e -> Error e
+      | Ok wallet ->
+        if Wallet.is_encrypted wallet then
+          Error "Error: running with an encrypted wallet, but encryptwallet was called."
+        else begin
+          match Wallet.encrypt_wallet wallet ~passphrase with
+          | Error e -> Error e
+          | Ok () ->
+            Ok (`String
+              "wallet encrypted; The keypool has been flushed and a new HD seed was generated (if you are using HD). You need to make a new backup.")
+        end
+    end
+  | _ ->
+    Error "Invalid parameters: expected [passphrase]"
+
+(* walletpassphrase "passphrase" timeout
+
+   Unlocks the wallet for [timeout] seconds. Schedules an Lwt.async sleeper
+   that re-locks once the deadline passes. The sleeper uses a snapshot of
+   the unlock-state expiry so a later [walletpassphrase] that *extends* the
+   timeout is honoured: if the wallet is still unlocked but the snapshotted
+   deadline has been superseded, we leave it alone. *)
+let handle_walletpassphrase (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | `String passphrase :: timeout_param :: _ ->
+    let timeout = match timeout_param with
+      | `Int n -> float_of_int n
+      | `Float f -> f
+      | _ -> -1.0
+    in
+    if timeout <= 0.0 then
+      Error "Timeout cannot be negative."
+    else if String.length passphrase = 0 then
+      Error "passphrase can not be empty"
+    else begin
+      (* Core caps the unlock timeout at 100,000,000 seconds. *)
+      let timeout = min timeout 100_000_000.0 in
+      match get_wallet_for_request ctx None with
+      | Error e -> Error e
+      | Ok wallet ->
+        if not (Wallet.is_encrypted wallet) then
+          Error "Error: running with an unencrypted wallet, but walletpassphrase was called."
+        else begin
+          match Wallet.wallet_passphrase wallet ~passphrase ~timeout with
+          | Error e -> Error e
+          | Ok () ->
+            (* Snapshot the deadline this unlock established. If the user
+               re-issues walletpassphrase with a larger timeout before this
+               sleeper fires, the new deadline will exceed our snapshot and
+               we must NOT lock — Core's behaviour is to extend, not reset. *)
+            let our_deadline = Unix.gettimeofday () +. timeout in
+            Lwt.async (fun () ->
+              let open Lwt.Syntax in
+              let* () = Lwt_unix.sleep timeout in
+              (* Only lock if the wallet is still unlocked AND the current
+                 unlock state matches our timer (i.e. nobody extended it). *)
+              (match wallet.Wallet.encryption.lock_state with
+               | Wallet.Locked -> ()
+               | Wallet.Unlocked { expires; _ } ->
+                 if expires <= our_deadline +. 0.5 then
+                   Wallet.wallet_lock wallet);
+              Lwt.return_unit
+            );
+            Ok `Null
+        end
+    end
+  | _ ->
+    Error "Invalid parameters: expected [passphrase, timeout]"
+
+(* walletlock *)
+let handle_walletlock (ctx : rpc_context)
+    (_params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match get_wallet_for_request ctx None with
+  | Error e -> Error e
+  | Ok wallet ->
+    if not (Wallet.is_encrypted wallet) then
+      Error "Error: running with an unencrypted wallet, but walletlock was called."
+    else begin
+      Wallet.wallet_lock wallet;
+      Ok `Null
+    end
+
+(* ============================================================================
    Address Validation Handler
    ============================================================================ *)
 
@@ -3841,6 +3952,9 @@ let handle_help (_ctx : rpc_context)
       "listunspent";
       "sendtoaddress \"address\" amount";
       "signrawtransactionwithwallet \"hexstring\"";
+      "encryptwallet \"passphrase\"";
+      "walletpassphrase \"passphrase\" timeout";
+      "walletlock";
       "";
       "== Control ==";
       "help ( \"command\" )";
@@ -4076,6 +4190,20 @@ let dispatch_rpc (ctx : rpc_context)
     Ok (handle_listwallets ctx params)
   | "getwalletinfo" ->
     (match handle_getwalletinfo ctx None params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_wallet_error, msg))
+
+  (* Wallet Encryption *)
+  | "encryptwallet" ->
+    (match handle_encryptwallet ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_wallet_error, msg))
+  | "walletpassphrase" ->
+    (match handle_walletpassphrase ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_wallet_error, msg))
+  | "walletlock" ->
+    (match handle_walletlock ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_wallet_error, msg))
 

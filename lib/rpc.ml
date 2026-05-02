@@ -3634,6 +3634,74 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
     end
 
 (* ============================================================================
+   scrubunspendable Handler
+   ============================================================================
+
+   Operator-invoked one-shot scrub. Walks the [Cf_chainstate.cfh_utxo]
+   column family via [Storage.ChainDB.iter_utxos] and removes any entry
+   whose [script_pubkey] is provably unspendable per
+   [Utxo.is_unspendable_script] (mirrors Bitcoin Core's
+   [CScript::IsUnspendable]: leading [OP_RETURN] or oversize script).
+
+   Background: prior to commit 0c02b15, [connect_block_optimized] /
+   [Sync.process_new_block] / [Sync.connect_stored_blocks] inserted
+   every coinbase output into the UTXO set, including the SegWit
+   witness-commitment [OP_RETURN] and any other [OP_RETURN] data
+   carriers.  Bitcoin Core's [validation.cpp:AddCoins] skips
+   [IsUnspendable()] outputs, so legacy datadirs carry an over-count of
+   coins versus Core. The write-time filter in 0c02b15 stops new
+   orphans, but pre-existing on-disk entries linger.  This RPC closes
+   that gap.
+
+   Idempotent: a second invocation finds no unspendable entries and
+   returns [{"removed": 0, "bytes_freed": 0}].
+
+   Implementation note: we collect the (txid, vout, value-bytes) tuples
+   in a first iterator pass and delete in a second pass, so we never
+   mutate the CF while a RocksDB iterator is still walking it.
+   [Storage.ChainDB.delete_utxo] mirrors the delete into the optional
+   [rocksdb_utxo] backend so a scrubbed coin cannot reappear via the
+   AssumeUTXO fallback path. *)
+
+let handle_scrubunspendable (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [] | [`Null] ->
+    let to_delete : (Types.hash256 * int * int) list ref = ref [] in
+    let scanned = ref 0 in
+    (* Phase 1: collect orphan keys.  Iteration runs over a RocksDB
+       snapshot, so deletes are deferred to phase 2 to keep iterator
+       semantics well-defined. *)
+    Storage.ChainDB.iter_utxos ctx.chain.db (fun txid vout data ->
+      incr scanned;
+      try
+        let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+        let utxo = Utxo.deserialize_utxo_entry r in
+        if Utxo.is_unspendable_script utxo.script_pubkey then
+          to_delete :=
+            (txid, vout, String.length data) :: !to_delete
+      with _ ->
+        (* A torn or otherwise undeserializable record is not what this
+           RPC is meant to scrub — leave it alone for the operator to
+           triage. *)
+        ());
+    (* Phase 2: delete + tally bytes freed (key 36 + value bytes). *)
+    let removed = ref 0 in
+    let bytes_freed = ref 0 in
+    List.iter (fun (txid, vout, vlen) ->
+      Storage.ChainDB.delete_utxo ctx.chain.db txid vout;
+      incr removed;
+      bytes_freed := !bytes_freed + 36 + vlen
+    ) !to_delete;
+    Ok (`Assoc [
+      ("removed",     `Int !removed);
+      ("bytes_freed", `Int !bytes_freed);
+      ("scanned",     `Int !scanned);
+    ])
+  | _ ->
+    Error "Invalid parameters: scrubunspendable takes no arguments"
+
+(* ============================================================================
    getdeploymentinfo Handler
    ============================================================================ *)
 
@@ -3786,6 +3854,7 @@ let handle_help (_ctx : rpc_context)
       "loadtxoutset \"path\"";
       "dumptxoutset \"path\"";
       "gettxoutsetinfo ( \"hash_type\" )";
+      "scrubunspendable";
     ])
   | [`String _cmd] ->
     (* Could provide help for specific command *)
@@ -4077,6 +4146,10 @@ let dispatch_rpc (ctx : rpc_context)
      | Error msg -> Error (rpc_misc_error, msg))
   | "gettxoutsetinfo" ->
     (match handle_gettxoutsetinfo ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_invalid_params, msg))
+  | "scrubunspendable" ->
+    (match handle_scrubunspendable ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_invalid_params, msg))
 

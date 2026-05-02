@@ -205,6 +205,109 @@ let test_mine_multiple_blocks_regtest () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* Verify that [Mining.submit_block] with an [OptimizedUtxoSet] writes
+   the per-block UTXO deltas into the cf_chainstate UTXO column family
+   (i.e. the column family that [Storage.ChainDB.iter_utxos] walks).
+   Regression test for the dumptxoutset / submitblock empty-snapshot
+   bug: prior to the fix, the deferred [OptimizedUtxoSet.flush] only
+   wrote to rocksdb_utxo, leaving the cf_chainstate UTXO CF empty —
+   and a [dumptxoutset] call then emitted a 51-byte header-only
+   snapshot with 0 coins. *)
+let test_submit_block_populates_chainstate_iter () =
+  let (chain, db) = create_test_chain_state () in
+  let rocksdb_path = test_db_path ^ "_rocksdb_utxo" in
+  (* clean up any prior run *)
+  (try
+    let rec rm_rf path =
+      if Sys.file_exists path then begin
+        if Sys.is_directory path then begin
+          Array.iter (fun f -> rm_rf (Filename.concat path f))
+            (Sys.readdir path);
+          Unix.rmdir path
+        end else
+          Unix.unlink path
+      end
+    in
+    rm_rf rocksdb_path
+   with _ -> ());
+  let rocksdb = Rocksdb_store.open_db rocksdb_path in
+  Storage.ChainDB.attach_rocksdb_utxo db rocksdb;
+  let optimized = Utxo.OptimizedUtxoSet.create
+    ~cache_size:1024 ~rocksdb db in
+  let utxo = Utxo.UtxoSet.create db in
+  let mp = Mempool.create
+    ~require_standard:false ~verify_scripts:false
+    ~utxo ~current_height:0 () in
+  let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
+
+  (* Mine 3 blocks via [Mining.submit_block ~utxo:Some optimized].  Each
+     coinbase has ONE spendable output (no SegWit witness commitment in
+     this synthesised template — it's a plain P2PKH-like script), so we
+     expect exactly 3 entries to land in the cf_chainstate UTXO CF. *)
+  for _ = 1 to 3 do
+    let template = Mining.create_block_template ~chain ~mp ~payout_script in
+    match Mining.mine_block template 10000l with
+    | None -> Alcotest.fail "Failed to mine block on regtest"
+    | Some block ->
+      match Mining.submit_block ~utxo:optimized
+              ~network_type:Consensus.Regtest block chain mp with
+      | Error msg -> Alcotest.fail ("Block submission failed: " ^ msg)
+      | Ok () -> ()
+  done;
+
+  (* iter_utxos walks the cf_chainstate UTXO CF.  Without the fix this
+     reports 0 entries.  With the fix it reports the live UTXO count. *)
+  let count = ref 0 in
+  Storage.ChainDB.iter_utxos db (fun _txid _vout _data ->
+    incr count);
+  Alcotest.(check bool) "cf_chainstate UTXO CF non-empty after submit_block"
+    true (!count > 0);
+  (* Three blocks each contributing one spendable coinbase output → 3 UTXOs. *)
+  Alcotest.(check int) "cf_chainstate UTXO count == 3 (1/block)"
+    3 !count;
+
+  Rocksdb_store.close rocksdb;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Direct unit test for [Utxo.is_unspendable_script]: OP_RETURN scripts
+   must be flagged unspendable so they are excluded from the UTXO set
+   at block-connect time, matching Bitcoin Core's [AddCoins] semantics
+   ([validation.cpp]).  Without this filter every SegWit coinbase
+   inserts its OP_RETURN witness commitment into the UTXO set and the
+   dumptxoutset coin count diverges from Core. *)
+let test_is_unspendable_script () =
+  (* OP_RETURN (0x6a) at offset 0 → unspendable. *)
+  let op_return = Cstruct.of_string "\x6a" in
+  Alcotest.(check bool) "OP_RETURN is unspendable" true
+    (Utxo.is_unspendable_script op_return);
+  (* OP_RETURN with payload (e.g. SegWit witness commitment). *)
+  let witness_commit = Cstruct.of_string
+    "\x6a\x24\xaa\x21\xa9\xed\
+     \x00\x00\x00\x00\x00\x00\x00\x00\
+     \x00\x00\x00\x00\x00\x00\x00\x00\
+     \x00\x00\x00\x00\x00\x00\x00\x00\
+     \x00\x00\x00\x00\x00\x00\x00\x00" in
+  Alcotest.(check bool) "OP_RETURN witness commitment is unspendable" true
+    (Utxo.is_unspendable_script witness_commit);
+  (* Standard P2PKH spendable script. *)
+  let p2pkh = Cstruct.of_string
+    "\x76\xa9\x14\
+     \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\
+     \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\
+     \x88\xac" in
+  Alcotest.(check bool) "P2PKH is spendable" false
+    (Utxo.is_unspendable_script p2pkh);
+  (* Empty script: NOT unspendable per Core (Cstruct.length=0 fails the
+     OP_RETURN-byte check; size check is also false). *)
+  let empty = Cstruct.create 0 in
+  Alcotest.(check bool) "empty script is spendable (per Core)" false
+    (Utxo.is_unspendable_script empty);
+  (* Oversized script (> max_script_size) is unspendable. *)
+  let oversized = Cstruct.create (Consensus.max_script_size + 1) in
+  Alcotest.(check bool) "oversized script is unspendable" true
+    (Utxo.is_unspendable_script oversized)
+
 (* ============================================================================
    Regtest Coinbase Tests
    ============================================================================ *)
@@ -305,6 +408,11 @@ let () =
       test_case "instant mining on regtest" `Slow test_regtest_instant_mining;
       test_case "no difficulty adjustment" `Quick test_regtest_no_difficulty_adjustment;
       test_case "mine multiple blocks" `Slow test_mine_multiple_blocks_regtest;
+      test_case "submit_block populates cf_chainstate iter_utxos"
+        `Slow test_submit_block_populates_chainstate_iter;
+    ];
+    "utxo_filter", [
+      test_case "is_unspendable_script" `Quick test_is_unspendable_script;
     ];
     "coinbase", [
       test_case "coinbase uses regtest subsidy" `Quick test_coinbase_uses_regtest_subsidy;

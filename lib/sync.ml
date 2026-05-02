@@ -2678,9 +2678,12 @@ let rec connect_stored_blocks (state : chain_state) : int =
                        :: !ops
               ) tx.Types.inputs;
             List.iteri (fun vout out ->
-              let data = encode_utxo out.Types.value out.Types.script_pubkey
-                  next_height is_cb in
-              ops := (txid, vout, `Add data) :: !ops
+              (* Skip provably-unspendable outputs to match Core's
+                 [AddCoins] semantics; see process_new_block for rationale. *)
+              if not (Utxo.is_unspendable_script out.Types.script_pubkey) then
+                let data = encode_utxo out.Types.value out.Types.script_pubkey
+                    next_height is_cb in
+                ops := (txid, vout, `Add data) :: !ops
             ) tx.Types.outputs
           ) stored_block.transactions;
           state.blocks_synced <- next_height;
@@ -2803,9 +2806,15 @@ let process_new_block (state : chain_state) (block : Types.block)
                        :: !ops
               ) tx.Types.inputs;
             List.iteri (fun vout out ->
-              let data = encode_utxo out.Types.value out.Types.script_pubkey
-                  height is_cb in
-              ops := (txid, vout, `Add data) :: !ops
+              (* Skip provably-unspendable outputs (OP_RETURN, oversized
+                 scripts) so the UTXO set matches Core's [AddCoins]
+                 semantics.  Without this filter every SegWit coinbase
+                 inserts its OP_RETURN witness commitment, doubling the
+                 coin count vs Core's chainstate. *)
+              if not (Utxo.is_unspendable_script out.Types.script_pubkey) then
+                let data = encode_utxo out.Types.value out.Types.script_pubkey
+                    height is_cb in
+                ops := (txid, vout, `Add data) :: !ops
             ) tx.Types.outputs
           ) block.transactions;
           (* Advance the chain tip atomically with UTXO deltas so that

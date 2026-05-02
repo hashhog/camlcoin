@@ -1015,3 +1015,54 @@ CAMLprim value caml_ec_pubkey_tweak_add(value v_pubkey, value v_tweak) {
     memcpy(result_data, out, 33);
     CAMLreturn(result);
 }
+
+/* caml_ec_pubkey_decompress(compressed_pubkey_33) -> bigarray
+   Parses a 33-byte compressed secp256k1 public key (0x02 / 0x03 prefix +
+   32-byte x-coord) and returns the 65-byte uncompressed encoding (0x04 +
+   X || Y).  Used by Bitcoin Core's ScriptCompression::DecompressScript for
+   nSize == 0x04 / 0x05 (uncompressed P2PK rebuilt from the compressed wire
+   form).  Returns a length-0 bigarray on failure (invalid x / not on curve)
+   so the OCaml caller can map that to an Option/None without raising. */
+CAMLprim value caml_ec_pubkey_decompress(value v_compressed) {
+    CAMLparam1(v_compressed);
+    ensure_ctx();
+
+    unsigned char *pk_data = (unsigned char *)Caml_ba_data_val(v_compressed);
+    size_t pk_len = Caml_ba_array_val(v_compressed)->dim[0];
+
+    long fail_dims[1] = { 0 };
+
+    if (pk_len != 33) {
+        value fail = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL,
+                                   fail_dims);
+        CAMLreturn(fail);
+    }
+
+    secp256k1_pubkey pk;
+    if (!secp256k1_ec_pubkey_parse(schnorr_ctx, &pk, pk_data, 33)) {
+        value fail = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL,
+                                   fail_dims);
+        CAMLreturn(fail);
+    }
+
+    unsigned char out[65];
+    size_t out_len = 65;
+    if (!secp256k1_ec_pubkey_serialize(schnorr_ctx, out, &out_len, &pk,
+            SECP256K1_EC_UNCOMPRESSED)) {
+        value fail = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL,
+                                   fail_dims);
+        CAMLreturn(fail);
+    }
+    if (out_len != 65) {
+        value fail = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL,
+                                   fail_dims);
+        CAMLreturn(fail);
+    }
+
+    long ok_dims[1] = { 65 };
+    value result = caml_ba_alloc(CAML_BA_UINT8 | CAML_BA_C_LAYOUT, 1, NULL,
+                                 ok_dims);
+    unsigned char *result_data = (unsigned char *)Caml_ba_data_val(result);
+    memcpy(result_data, out, 65);
+    CAMLreturn(result);
+}

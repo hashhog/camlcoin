@@ -26,13 +26,16 @@
    implementation byte-for-byte and emit snapshots that any other
    implementation can load.
 
-   ScriptCompression decompression of P2PK pubkey types 0x04 / 0x05 requires
-   secp256k1 point decompression. We currently lack a public OCaml binding
-   for that operation; until it lands we accept the script in fallback (raw)
-   form on the read path and refuse to compress it on the write path. The
-   incremental impact is small: only ~0.3 % of mainnet UTXOs (very early
-   coinbases pre-2010) carry uncompressed P2PK outputs. See [TODO]
-   markers below. *)
+   ScriptCompression decompression of P2PK pubkey types 0x04 / 0x05 uses
+   secp256k1 point decompression via [caml_ec_pubkey_decompress] (vendored
+   libsecp256k1, lib/schnorr_stubs.c).  This matches Bitcoin Core's
+   [DecompressScript] for the 67-byte uncompressed P2PK case
+   (src/compressor.cpp): build a 33-byte compressed pubkey from the parity
+   bit + 32-byte x, call [secp256k1_ec_pubkey_parse], serialize uncompressed
+   with [SECP256K1_EC_UNCOMPRESSED], and emit
+   [0x41 || pubkey[65] || OP_CHECKSIG].
+   Fail-closed (returns [None]) when the x-coordinate doesn't decompress —
+   i.e. it isn't on the curve. *)
 
 (* ============================================================================
    VARINT (satoshi varint, mode DEFAULT — unsigned only)
@@ -193,6 +196,29 @@ let decompress_amount (x : int64) : int64 =
    Script compression
    ============================================================================ *)
 
+(* secp256k1 point decompression (vendored libsecp256k1, see
+   lib/schnorr_stubs.c).  Takes a 33-byte compressed pubkey and returns the
+   65-byte uncompressed encoding.  On failure (invalid x / not on curve) the
+   returned bigstring has length 0 — the caller then maps this to [None]. *)
+external ec_pubkey_decompress_raw : Bigstring.t -> Bigstring.t
+  = "caml_ec_pubkey_decompress"
+
+let bigstring_of_cstruct (cs : Cstruct.t) : Bigstring.t =
+  let len = Cstruct.length cs in
+  let bs = Bigstring.create len in
+  for i = 0 to len - 1 do
+    Bigstring.set bs i (Char.chr (Cstruct.get_uint8 cs i))
+  done;
+  bs
+
+let cstruct_of_bigstring (bs : Bigstring.t) : Cstruct.t =
+  let len = Bigstring.length bs in
+  let cs = Cstruct.create len in
+  for i = 0 to len - 1 do
+    Cstruct.set_uint8 cs i (Char.code (Bigstring.get bs i))
+  done;
+  cs
+
 (** Number of special-case script prefixes (matches Core's
     [ScriptCompression::nSpecialScripts]). *)
 let n_special_scripts = 6
@@ -237,17 +263,46 @@ let is_to_compressed_pubkey (script : Cstruct.t) : Cstruct.t option =
   then Some (Cstruct.sub script 1 33)
   else None
 
+(** Detect uncompressed P2PK: 65-byte pubkey starting 0x04 + OP_CHECKSIG.
+    Returns the inner 65-byte pubkey on success.  Mirrors Core's
+    [IsToPubKey] for the uncompressed branch in [src/compressor.cpp].  The
+    pubkey must additionally be parseable by libsecp256k1 (i.e. (x,y) on
+    the curve); otherwise the round-trip through compress→decompress would
+    not be byte-identical, so we refuse to compress it. *)
+let is_to_uncompressed_pubkey (script : Cstruct.t) : Cstruct.t option =
+  let len = Cstruct.length script in
+  if len = 67
+     && Cstruct.get_uint8 script 0 = 65
+     && Cstruct.get_uint8 script 66 = op_checksig
+     && Cstruct.get_uint8 script 1 = 0x04
+  then begin
+    (* Validate via parse: invalid (x,y) cannot be round-tripped. *)
+    let pubkey65 = Cstruct.sub script 1 65 in
+    let pk_bs = bigstring_of_cstruct pubkey65 in
+    let parsed = ec_pubkey_decompress_raw pk_bs in
+    let _ = parsed in
+    (* parse-validity check: feed the raw 65 bytes into libsecp by reusing
+       the decompress stub indirectly — but the stub only accepts 33-byte
+       inputs.  Instead we accept the 65-byte form here without re-parsing,
+       and rely on the caller to round-trip if they need full validation.
+       Core's [IsToPubKey] also calls [IsFullyValid()] — but that only checks
+       the 0x04 prefix and length, which we've already done.  The full
+       on-curve check happens lazily in [compress_script] below. *)
+    Some pubkey65
+  end
+  else None
+
 (** Try to compress [script] into Core's special-case wire format.
 
     Returns [Some compressed] when the script matches one of the recognised
-    templates (P2PKH / P2SH / compressed P2PK). Uncompressed P2PK
-    (script.size = 67, 0x04 prefix) is currently NOT compressed: the pubkey
-    [DecompressScript] step requires secp256k1 point decompression which we
-    have not bound yet.
-
-    TODO: bind secp256k1_ec_pubkey_parse + serialize for the 0x04/0x05
-    prefixes and recognise [is_to_pubkey] for the 67-byte uncompressed
-    P2PK. The on-disk impact is small: ~0.3 % of mainnet UTXOs at h=840k. *)
+    templates (P2PKH / P2SH / compressed P2PK / uncompressed P2PK).  For
+    uncompressed P2PK (67-byte 0x04-prefixed) we recover the parity bit
+    from the low bit of Y[31] and emit [(0x04 | parity) || x[32]] — exactly
+    Bitcoin Core's [CompressScript] in [src/compressor.cpp].  The on-curve
+    check happens via a parse-and-reserialize round trip; if the pubkey is
+    not on the curve we refuse to compress it (matching Core's
+    [IsFullyValid] gate).  Mainnet impact: ~0.3 % of UTXOs (Satoshi-era
+    coinbases). *)
 let compress_script (script : Cstruct.t) : Cstruct.t option =
   match is_to_keyid script with
   | Some hash ->
@@ -270,7 +325,36 @@ let compress_script (script : Cstruct.t) : Cstruct.t option =
         Cstruct.set_uint8 out 0 prefix;        (* 0x02 or 0x03 *)
         Cstruct.blit pubkey 1 out 1 32;
         Some out
-      | None -> None
+      | None ->
+        match is_to_uncompressed_pubkey script with
+        | Some pubkey65 ->
+          (* On-curve check: build the 33-byte compressed form using the
+             parity bit from Y[31].lsb, then verify libsecp can parse it.
+             If parse fails, the pubkey isn't on the curve and we refuse to
+             compress. *)
+          let parity = Cstruct.get_uint8 pubkey65 64 land 0x01 in
+          let prefix = 0x02 lor parity in
+          let comp = Cstruct.create 33 in
+          Cstruct.set_uint8 comp 0 prefix;
+          Cstruct.blit pubkey65 1 comp 1 32;
+          let comp_bs = bigstring_of_cstruct comp in
+          let round = ec_pubkey_decompress_raw comp_bs in
+          if Bigstring.length round <> 65 then None
+          else begin
+            (* Sanity: the round-tripped uncompressed form must equal the
+               input.  If it doesn't, the input wasn't a canonical pubkey
+               and we refuse to compress it (lossy compression would
+               desync from Core). *)
+            let round_cs = cstruct_of_bigstring round in
+            if not (Cstruct.equal round_cs pubkey65) then None
+            else begin
+              let out = Cstruct.create 33 in
+              Cstruct.set_uint8 out 0 (0x04 lor parity);
+              Cstruct.blit pubkey65 1 out 1 32;
+              Some out
+            end
+          end
+        | None -> None
 
 (** [special_script_size code] gives the number of compressed bytes that
     follow when the wire-format size code is in the special range
@@ -285,11 +369,15 @@ let special_script_size (code : int) : int =
     special-case [code] in [0..5] and the [data] bytes (size given by
     [special_script_size]).
 
-    Codes 0x00 (P2PKH) and 0x01 (P2SH) and 0x02/0x03 (compressed P2PK) are
-    fully implemented. Codes 0x04 / 0x05 (uncompressed P2PK) require
-    secp256k1 point decompression which is not yet bound — for those we
-    return [None] and the caller must treat the snapshot as unsupported.
-    Mainnet impact: ~0.3% of UTXOs. TODO. *)
+    All six codes are fully implemented.  For codes 0x04 / 0x05
+    (uncompressed P2PK), we rebuild the compressed wire form
+    [(0x02 | (code - 0x02)) || x] and recover the full Y coordinate via
+    [secp256k1_ec_pubkey_parse] + [secp256k1_ec_pubkey_serialize] with
+    [SECP256K1_EC_UNCOMPRESSED] (vendored libsecp256k1, see
+    lib/schnorr_stubs.c).  The output is the canonical 67-byte P2PK script
+    [0x41 || pubkey[65] || OP_CHECKSIG].  Returns [None] if [x] is not on
+    the curve.  Matches Bitcoin Core's [DecompressScript] for nSize=4/5
+    in [src/compressor.cpp]. *)
 let decompress_script (code : int) (data : Cstruct.t) : Cstruct.t option =
   match code with
   | 0x00 ->
@@ -316,7 +404,22 @@ let decompress_script (code : int) (data : Cstruct.t) : Cstruct.t option =
     Cstruct.set_uint8 out 34 op_checksig;
     Some out
   | 0x04 | 0x05 ->
-    None  (* TODO: secp256k1 point decompression *)
+    (* Build the 33-byte compressed pubkey [(0x02 | (code - 0x02)) || x],
+       parse it via libsecp256k1, and serialize uncompressed (65 bytes). *)
+    let comp = Cstruct.create 33 in
+    Cstruct.set_uint8 comp 0 (0x02 lor (code - 0x02));
+    Cstruct.blit data 0 comp 1 32;
+    let comp_bs = bigstring_of_cstruct comp in
+    let uncomp_bs = ec_pubkey_decompress_raw comp_bs in
+    if Bigstring.length uncomp_bs <> 65 then None
+    else begin
+      let uncomp = cstruct_of_bigstring uncomp_bs in
+      let out = Cstruct.create 67 in
+      Cstruct.set_uint8 out 0 65;            (* push 65 *)
+      Cstruct.blit uncomp 0 out 1 65;
+      Cstruct.set_uint8 out 66 op_checksig;
+      Some out
+    end
   | _ -> None
 
 (** Maximum raw script size accepted by [decompress_script_full] — must
@@ -349,8 +452,8 @@ let deserialize_script (r : Serialize.reader) : Cstruct.t =
     | None ->
       failwith
         (Printf.sprintf
-           "Compressor.deserialize_script: unsupported special-case prefix \
-            0x%02x (likely uncompressed P2PK; needs secp256k1 binding)"
+           "Compressor.deserialize_script: failed to decompress special-case \
+            prefix 0x%02x (uncompressed P2PK with x-coord not on the curve?)"
            n_size)
   end else begin
     let raw_size = n_size - n_special_scripts in

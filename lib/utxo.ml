@@ -39,6 +39,20 @@ let deserialize_utxo_entry r : utxo_entry =
   let is_coinbase = Serialize.read_uint8 r <> 0 in
   { value; script_pubkey; height; is_coinbase }
 
+(* Provably-unspendable scriptPubKey detector.  Mirrors Bitcoin Core's
+   [CScript::IsUnspendable] — an output is unspendable iff the script
+   begins with [OP_RETURN] (0x6a) or exceeds [MAX_SCRIPT_SIZE].  Such
+   outputs are never inserted into the UTXO set by Core
+   ([validation.cpp]'s [AddCoins]), so adding them locally would
+   produce a UTXO set that diverges from Core on every block carrying
+   a witness commitment (post-SegWit coinbase) or a data-carrying
+   [OP_RETURN].  Used at block-connect time and at dumptxoutset
+   iteration time to keep the dump byte-compatible with Core's
+   reference output. *)
+let is_unspendable_script (script : Cstruct.t) : bool =
+  (Cstruct.length script > 0 && Cstruct.get_uint8 script 0 = 0x6a) ||
+  Cstruct.length script > Consensus.max_script_size
+
 (* ============================================================================
    UTXO Set with Write-Through Cache (Legacy)
    ============================================================================ *)
@@ -622,6 +636,46 @@ module OptimizedUtxoSet = struct
         Logs.debug (fun m -> m "Flushed %d dirty UTXO entries to disk" count)
     end
 
+  (* Drain all dirty entries through [Storage.ChainDB.apply_block_atomic]
+     so that BOTH the cf_chainstate UTXO column family AND rocksdb_utxo
+     receive the deltas, then update both tip pointers in the same
+     RocksDB batch.
+
+     This is the persistence path used by [Mining.submit_block] (which
+     drives [connect_block_optimized] to mutate the in-memory dirty set
+     but otherwise relies on [flush] — and [flush] only writes to
+     rocksdb_utxo, leaving cf_chainstate empty).  The dump path
+     ([Storage.ChainDB.iter_utxos] + [dumptxoutset]) iterates
+     cf_chainstate, which is why a regtest node fed only via
+     [submitblock] dumped a 51-byte header-only snapshot with 0 coins
+     before this fix.  Mirrors [Sync.process_new_block]'s post-validate
+     [apply_block_atomic] call so that submitblock and IBD-driven block
+     connection produce the same observable on-disk UTXO state. *)
+  let persist_dirty_atomic (t : t)
+      ~(tip_hash : Types.hash256) ~(tip_height : int)
+      ~(header_tip_hash : Types.hash256) ~(header_tip_height : int)
+      : unit =
+    let ops : (Types.hash256 * int * [ `Add of string | `Del ]) list ref =
+      ref [] in
+    Hashtbl.iter (fun key entry ->
+      let key_cs = Cstruct.of_string key in
+      let txid = Cstruct.sub key_cs 0 32 in
+      let vout = Int32.to_int (Cstruct.LE.get_uint32 key_cs 32) in
+      let op = match entry with
+        | `Added utxo ->
+          let w = Serialize.writer_create () in
+          serialize_utxo_entry w utxo;
+          `Add (Cstruct.to_string (Serialize.writer_to_cstruct w))
+        | `Removed -> `Del
+      in
+      ops := (txid, vout, op) :: !ops
+    ) t.dirty;
+    Storage.ChainDB.apply_block_atomic t.db
+      ~tip_hash ~tip_height
+      ~header_tip_hash ~header_tip_height
+      !ops;
+    Hashtbl.clear t.dirty
+
   (* Get the number of pending dirty entries *)
   let dirty_count (t : t) : int =
     Hashtbl.length t.dirty
@@ -706,12 +760,19 @@ let connect_block_optimized ?(network_type : Consensus.network = Consensus.Mainn
 
       if !error = None then
         List.iteri (fun vout out ->
-          OptimizedUtxoSet.add utxo txid vout {
-            value = out.Types.value;
-            script_pubkey = out.script_pubkey;
-            height;
-            is_coinbase;
-          }
+          (* Skip provably-unspendable outputs (OP_RETURN, oversized
+             scripts).  Core never adds these to the UTXO set in
+             [AddCoins]; including them would over-count by ~1 per
+             SegWit coinbase (the witness commitment) and cause
+             dumptxoutset to emit a UTXO set that diverges from Core
+             on every post-SegWit block. *)
+          if not (is_unspendable_script out.Types.script_pubkey) then
+            OptimizedUtxoSet.add utxo txid vout {
+              value = out.Types.value;
+              script_pubkey = out.script_pubkey;
+              height;
+              is_coinbase;
+            }
         ) tx.outputs
     end
   ) block.transactions;

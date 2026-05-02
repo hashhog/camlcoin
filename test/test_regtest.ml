@@ -309,6 +309,191 @@ let test_is_unspendable_script () =
     (Utxo.is_unspendable_script oversized)
 
 (* ============================================================================
+   scrubunspendable RPC Tests
+   ============================================================================
+   Operator-invoked one-shot scrub. Seeds the cf_chainstate UTXO CF with a
+   mix of spendable + OP_RETURN + oversize entries, then calls
+   [Rpc.handle_scrubunspendable] and verifies:
+     1. only the unspendable entries are removed
+     2. spendable entries are preserved
+     3. the byte-count tally is consistent (key 36 + value bytes)
+     4. a second call is a no-op (idempotent) *)
+
+let make_scrub_test_ctx (db : Storage.ChainDB.t) : Rpc.rpc_context =
+  let chain = Sync.create_chain_state db Consensus.regtest in
+  let utxo = Utxo.UtxoSet.create db in
+  let mp = Mempool.create
+    ~require_standard:false ~verify_scripts:false
+    ~utxo ~current_height:0 () in
+  let pm = Peer_manager.create Consensus.regtest in
+  let fe = Fee_estimation.create () in
+  { chain; mempool = mp; peer_manager = pm;
+    wallet = None; wallet_manager = None;
+    fee_estimator = fe; network = Consensus.regtest;
+    filter_index = None; utxo = None; data_dir = None }
+
+(* Persist a synthetic [utxo_entry] directly into the cf_chainstate UTXO
+   CF, bypassing the write-time filter so we can simulate a pre-fix
+   on-disk state. *)
+let persist_synthetic_utxo (db : Storage.ChainDB.t)
+    (txid : Types.hash256) (vout : int)
+    (script : Cstruct.t) : int =
+  let entry : Utxo.utxo_entry = {
+    value = 5_000_000_000L;
+    script_pubkey = script;
+    height = 1;
+    is_coinbase = false;
+  } in
+  let w = Serialize.writer_create () in
+  Utxo.serialize_utxo_entry w entry;
+  let data = Cstruct.to_string (Serialize.writer_to_cstruct w) in
+  Storage.ChainDB.store_utxo db txid vout data;
+  String.length data
+
+let mk_txid (seed : int) : Types.hash256 =
+  let buf = Bytes.create 32 in
+  for i = 0 to 31 do
+    Bytes.set buf i (Char.chr ((seed + i) land 0xff))
+  done;
+  Cstruct.of_bytes buf
+
+let count_cf_utxos (db : Storage.ChainDB.t) : int =
+  let n = ref 0 in
+  Storage.ChainDB.iter_utxos db (fun _t _v _d -> incr n);
+  !n
+
+let test_scrubunspendable_removes_op_return_entries () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let ctx = make_scrub_test_ctx db in
+
+  (* 2 spendable P2PKH outputs *)
+  let p2pkh = Cstruct.of_string
+    "\x76\xa9\x14\
+     \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\
+     \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\
+     \x88\xac" in
+  let _ = persist_synthetic_utxo db (mk_txid 1) 0 p2pkh in
+  let _ = persist_synthetic_utxo db (mk_txid 2) 0 p2pkh in
+
+  (* 3 OP_RETURN entries (the orphan class we're scrubbing) — one bare
+     OP_RETURN, one SegWit witness commitment, one data carrier. *)
+  let v_op_return_bare = persist_synthetic_utxo db (mk_txid 3) 0
+    (Cstruct.of_string "\x6a") in
+  let v_witness_commit = persist_synthetic_utxo db (mk_txid 4) 0
+    (Cstruct.of_string
+       "\x6a\x24\xaa\x21\xa9\xed\
+        \x11\x22\x33\x44\x55\x66\x77\x88\
+        \x11\x22\x33\x44\x55\x66\x77\x88\
+        \x11\x22\x33\x44\x55\x66\x77\x88\
+        \x11\x22\x33\x44\x55\x66\x77\x88") in
+  let v_data_carrier = persist_synthetic_utxo db (mk_txid 5) 0
+    (Cstruct.of_string "\x6a\x05hello") in
+
+  (* 1 oversize script (also unspendable per Core) *)
+  let oversize = Cstruct.create (Consensus.max_script_size + 1) in
+  let v_oversize = persist_synthetic_utxo db (mk_txid 6) 0 oversize in
+
+  Alcotest.(check int) "seeded UTXO count" 6 (count_cf_utxos db);
+
+  let result = Rpc.handle_scrubunspendable ctx [] in
+  (match result with
+   | Ok (`Assoc fields) ->
+     let removed =
+       match List.assoc_opt "removed" fields with
+       | Some (`Int n) -> n
+       | _ -> Alcotest.fail "missing removed field"
+     in
+     let bytes_freed =
+       match List.assoc_opt "bytes_freed" fields with
+       | Some (`Int n) -> n
+       | _ -> Alcotest.fail "missing bytes_freed field"
+     in
+     let scanned =
+       match List.assoc_opt "scanned" fields with
+       | Some (`Int n) -> n
+       | _ -> Alcotest.fail "missing scanned field"
+     in
+     Alcotest.(check int) "removed = 4 (3 OP_RETURN + 1 oversize)"
+       4 removed;
+     Alcotest.(check int) "scanned = 6 (all UTXOs)" 6 scanned;
+     let expected_bytes =
+       4 * 36
+       + v_op_return_bare + v_witness_commit
+       + v_data_carrier + v_oversize
+     in
+     Alcotest.(check int) "bytes_freed matches key+value sum"
+       expected_bytes bytes_freed
+   | Ok _ -> Alcotest.fail "expected `Assoc result"
+   | Error msg -> Alcotest.fail ("scrubunspendable failed: " ^ msg));
+
+  (* Post-scrub: only the 2 spendable P2PKH entries remain. *)
+  Alcotest.(check int) "post-scrub UTXO count = 2 spendable entries"
+    2 (count_cf_utxos db);
+
+  (* Spot-check: the surviving entries are the spendable ones. *)
+  Alcotest.(check bool) "spendable txid 1 still present" true
+    (Option.is_some (Storage.ChainDB.get_utxo db (mk_txid 1) 0));
+  Alcotest.(check bool) "spendable txid 2 still present" true
+    (Option.is_some (Storage.ChainDB.get_utxo db (mk_txid 2) 0));
+  Alcotest.(check bool) "OP_RETURN txid 3 was scrubbed" true
+    (Option.is_none (Storage.ChainDB.get_utxo db (mk_txid 3) 0));
+  Alcotest.(check bool) "witness-commit txid 4 was scrubbed" true
+    (Option.is_none (Storage.ChainDB.get_utxo db (mk_txid 4) 0));
+  Alcotest.(check bool) "data-carrier txid 5 was scrubbed" true
+    (Option.is_none (Storage.ChainDB.get_utxo db (mk_txid 5) 0));
+  Alcotest.(check bool) "oversize txid 6 was scrubbed" true
+    (Option.is_none (Storage.ChainDB.get_utxo db (mk_txid 6) 0));
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_scrubunspendable_idempotent () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let ctx = make_scrub_test_ctx db in
+
+  (* Seed: 1 spendable + 1 OP_RETURN. *)
+  let p2pkh = Cstruct.of_string
+    "\x76\xa9\x14\
+     \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\
+     \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\
+     \x88\xac" in
+  let _ = persist_synthetic_utxo db (mk_txid 1) 0 p2pkh in
+  let _ = persist_synthetic_utxo db (mk_txid 2) 0
+    (Cstruct.of_string "\x6a\x04test") in
+
+  (* First call scrubs the OP_RETURN entry. *)
+  (match Rpc.handle_scrubunspendable ctx [] with
+   | Ok (`Assoc fields) ->
+     (match List.assoc_opt "removed" fields with
+      | Some (`Int n) ->
+        Alcotest.(check int) "first call removes 1" 1 n
+      | _ -> Alcotest.fail "missing removed field")
+   | _ -> Alcotest.fail "first call failed");
+
+  (* Second call: idempotent — finds nothing to scrub. *)
+  (match Rpc.handle_scrubunspendable ctx [] with
+   | Ok (`Assoc fields) ->
+     (match List.assoc_opt "removed" fields,
+            List.assoc_opt "bytes_freed" fields with
+      | Some (`Int 0), Some (`Int 0) -> ()
+      | Some (`Int n), _ ->
+        Alcotest.fail
+          (Printf.sprintf "second call removed %d, expected 0" n)
+      | _ -> Alcotest.fail "missing fields on second call")
+   | _ -> Alcotest.fail "second call failed");
+
+  (* Spendable entry still present after both calls. *)
+  Alcotest.(check bool) "spendable preserved across both scrubs" true
+    (Option.is_some (Storage.ChainDB.get_utxo db (mk_txid 1) 0));
+  Alcotest.(check int) "final UTXO count = 1 spendable"
+    1 (count_cf_utxos db);
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* ============================================================================
    Regtest Coinbase Tests
    ============================================================================ *)
 
@@ -413,6 +598,10 @@ let () =
     ];
     "utxo_filter", [
       test_case "is_unspendable_script" `Quick test_is_unspendable_script;
+      test_case "scrubunspendable removes OP_RETURN + oversize entries"
+        `Quick test_scrubunspendable_removes_op_return_entries;
+      test_case "scrubunspendable is idempotent"
+        `Quick test_scrubunspendable_idempotent;
     ];
     "coinbase", [
       test_case "coinbase uses regtest subsidy" `Quick test_coinbase_uses_regtest_subsidy;

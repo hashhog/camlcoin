@@ -601,30 +601,35 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
             | Some utxo_set ->
               (match Utxo.connect_block_optimized ~network_type utxo_set block height with
                | Ok _undo ->
-                 (* During IBD, defer the flush to accumulate dirty entries.
-                    The periodic flush in the sync loop (or shutdown) will
-                    persist them.  Flushing after every submitblock was the
-                    dominant bottleneck during feeder-driven IBD: each flush
-                    writes a RocksDB batch + fsync. By deferring, short-lived
-                    UTXOs are eliminated by remove_fast's FRESH optimisation
-                    and never touch disk at all.
-                    We still flush every 500 blocks or 500K dirty entries
-                    to bound data-loss risk. *)
-                 let dirty = Utxo.OptimizedUtxoSet.dirty_count utxo_set in
-                 if dirty > 500_000 || height mod 500 = 0 then
-                   Utxo.OptimizedUtxoSet.flush ~tip_height:height utxo_set;
+                 (* Drain the per-block dirty set into BOTH stores
+                    (cf_chainstate UTXO column family + rocksdb_utxo) via
+                    the same [apply_block_atomic] path used by
+                    [Sync.process_new_block].  Without this, the deferred
+                    [OptimizedUtxoSet.flush] writes only to rocksdb_utxo,
+                    leaving cf_chainstate empty — and dumptxoutset (which
+                    iterates cf_chainstate via [Storage.ChainDB.iter_utxos])
+                    emits a 51-byte header-only snapshot.
+
+                    The atomic write also advances tip_hash / tip_height /
+                    header_tip in the same RocksDB batch, replacing the
+                    separate [set_chain_tip] call below. *)
+                 Utxo.OptimizedUtxoSet.persist_dirty_atomic utxo_set
+                   ~tip_hash:hash ~tip_height:height
+                   ~header_tip_hash:hash ~header_tip_height:height;
                  Ok ()
                | Error e -> Error e)
             | None ->
-              (* Legacy path: no UTXO validation (unsafe) *)
+              (* Legacy path: no UTXO validation (unsafe).  Without an
+                 OptimizedUtxoSet we still need to persist the tip pointer
+                 so subsequent reads/dumps see the new height. *)
+              Storage.ChainDB.set_chain_tip chain.db hash height;
               Ok ()
           in
           (match utxo_result with
            | Error e -> Error e
            | Ok () ->
-             (* Store the block *)
+             (* Store the block body *)
              Storage.ChainDB.store_block chain.db hash block;
-             Storage.ChainDB.set_chain_tip chain.db hash height;
 
              (* Update blocks_synced to match *)
              chain.blocks_synced <- height;

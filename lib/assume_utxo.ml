@@ -410,58 +410,98 @@ end
     ([Storage.ChainDB.iter_utxos]) already yields in that order. *)
 let write_snapshot (path : string) (metadata : snapshot_metadata)
     ~(iter_coins : (snapshot_coin -> unit) -> unit) : (unit, string) result =
+  (* Atomic-write protocol mirrors Bitcoin Core's
+     [rpc/blockchain.cpp::dumptxoutset]:
+       1. write to [<path>.incomplete]
+       2. fsync the fd
+       3. atomic rename to [<path>]
+     so an operator copying mid-dump never sees a torn file, and a
+     SIGKILL during dump leaves at most a [.incomplete] artifact (never
+     a half-written [<path>]). On any error we best-effort-remove the
+     temp file before returning the error to the caller. *)
+  let tmp_path = path ^ ".incomplete" in
+  let cleanup_temp () =
+    try Sys.remove tmp_path with _ -> ()
+  in
   try
-    let oc = open_out_bin path in
-    (* 1. Metadata. *)
-    let w = Serialize.writer_create () in
-    serialize_metadata w metadata;
-    output_string oc (Cstruct.to_string (Serialize.writer_to_cstruct w));
-
-    (* 2. Per-txid groups. We accumulate same-txid coins in a buffer and
-       flush them under a single txid prefix when the txid changes. *)
-    let cur_txid : Types.hash256 option ref = ref None in
-    let group_buf = Buffer.create 1024 in
-    let group_count = ref 0 in
-    let flush_group () =
-      match !cur_txid with
-      | None -> ()
-      | Some txid ->
-        (* Header: txid (32) + coins_per_txid CompactSize. *)
-        let hw = Serialize.writer_create () in
-        Serialize.write_bytes hw txid;
-        Serialize.write_compact_size hw !group_count;
-        output_string oc (Cstruct.to_string (Serialize.writer_to_cstruct hw));
-        (* Body: pre-built per-coin entries. *)
-        output_string oc (Buffer.contents group_buf);
-        Buffer.clear group_buf;
-        group_count := 0
+    let oc = open_out_bin tmp_path in
+    let oc_open = ref true in
+    let cleanup_on_error exn =
+      if !oc_open then (try close_out_noerr oc with _ -> ());
+      oc_open := false;
+      cleanup_temp ();
+      raise exn
     in
-    iter_coins (fun coin ->
-      let coin_txid = coin.outpoint.Types.txid in
-      let starts_new_group =
-        match !cur_txid with
-        | None -> true
-        | Some t -> not (Cstruct.equal t coin_txid)
-      in
-      if starts_new_group then begin
-        flush_group ();
-        cur_txid := Some coin_txid
-      end;
-      (* Append [vout : CompactSize] || coin body. *)
-      let cw = Serialize.writer_create () in
-      Serialize.write_compact_size cw (Int32.to_int coin.outpoint.vout);
-      serialize_coin_body cw coin;
-      Buffer.add_string group_buf
-        (Cstruct.to_string (Serialize.writer_to_cstruct cw));
-      incr group_count
-    );
-    flush_group ();
-    close_out oc;
+    (try
+       (* 1. Metadata. *)
+       let w = Serialize.writer_create () in
+       serialize_metadata w metadata;
+       output_string oc (Cstruct.to_string (Serialize.writer_to_cstruct w));
+
+       (* 2. Per-txid groups. We accumulate same-txid coins in a buffer and
+          flush them under a single txid prefix when the txid changes. *)
+       let cur_txid : Types.hash256 option ref = ref None in
+       let group_buf = Buffer.create 1024 in
+       let group_count = ref 0 in
+       let flush_group () =
+         match !cur_txid with
+         | None -> ()
+         | Some txid ->
+           (* Header: txid (32) + coins_per_txid CompactSize. *)
+           let hw = Serialize.writer_create () in
+           Serialize.write_bytes hw txid;
+           Serialize.write_compact_size hw !group_count;
+           output_string oc (Cstruct.to_string (Serialize.writer_to_cstruct hw));
+           (* Body: pre-built per-coin entries. *)
+           output_string oc (Buffer.contents group_buf);
+           Buffer.clear group_buf;
+           group_count := 0
+       in
+       iter_coins (fun coin ->
+         let coin_txid = coin.outpoint.Types.txid in
+         let starts_new_group =
+           match !cur_txid with
+           | None -> true
+           | Some t -> not (Cstruct.equal t coin_txid)
+         in
+         if starts_new_group then begin
+           flush_group ();
+           cur_txid := Some coin_txid
+         end;
+         (* Append [vout : CompactSize] || coin body. *)
+         let cw = Serialize.writer_create () in
+         Serialize.write_compact_size cw (Int32.to_int coin.outpoint.vout);
+         serialize_coin_body cw coin;
+         Buffer.add_string group_buf
+           (Cstruct.to_string (Serialize.writer_to_cstruct cw));
+         incr group_count
+       );
+       flush_group ();
+       (* Durability: flush the user-space buffer and fsync the fd
+          BEFORE the rename. Without the fsync, a power loss between
+          rename and the OS flushing dirty pages could leave [<path>]
+          visible with zero-length / torn contents. *)
+       flush oc;
+       let fd = Unix.descr_of_out_channel oc in
+       (try Unix.fsync fd with Unix.Unix_error _ -> ());
+       close_out oc;
+       oc_open := false
+     with exn -> cleanup_on_error exn);
+
+    (* 3. Atomic rename: temp -> final. *)
+    (try Sys.rename tmp_path path
+     with exn ->
+       cleanup_temp ();
+       raise exn);
     Ok ()
   with
-  | Sys_error msg -> Error ("Failed to write snapshot: " ^ msg)
-  | exn -> Error (Printf.sprintf "Failed to write snapshot: %s"
-                    (Printexc.to_string exn))
+  | Sys_error msg ->
+    cleanup_temp ();
+    Error ("Failed to write snapshot: " ^ msg)
+  | exn ->
+    cleanup_temp ();
+    Error (Printf.sprintf "Failed to write snapshot: %s"
+             (Printexc.to_string exn))
 
 (** Iterate every coin in a Core-format snapshot file, calling [f] for each.
 

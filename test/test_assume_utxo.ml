@@ -377,6 +377,42 @@ let test_snapshot_file_io () =
         test_passed name
       end)
 
+(* Atomic-write protocol regression: mirrors Bitcoin Core's
+   [rpc/blockchain.cpp::dumptxoutset] which writes to
+   [<path>.incomplete], fsyncs, and renames. After a successful write
+   only [<path>] should exist; the [.incomplete] temp must be gone so
+   that mid-dump observers never see a torn file. *)
+let test_snapshot_atomic_write () =
+  let name = "snapshot atomic write leaves no .incomplete on success" in
+  let dir = temp_dir () in
+  let path = Filename.concat dir "atomic.dat" in
+  let tmp = path ^ ".incomplete" in
+
+  let metadata : Assume_utxo.snapshot_metadata = {
+    network_magic = 0xD9B4BEF9l;
+    base_blockhash = Types.hash256_of_hex
+      "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5";
+    coins_count = 0L;
+  } in
+
+  let result = Assume_utxo.write_snapshot path metadata
+      ~iter_coins:(fun _ -> ()) in
+
+  match result with
+  | Error msg ->
+    cleanup_dir dir;
+    test_failed name ("Write failed: " ^ msg)
+  | Ok () ->
+    let final_exists = Sys.file_exists path in
+    let tmp_exists = Sys.file_exists tmp in
+    cleanup_dir dir;
+    if not final_exists then
+      test_failed name "final path missing after successful write"
+    else if tmp_exists then
+      test_failed name ".incomplete temp left on disk after success"
+    else
+      test_passed name
+
 (* ============================================================================
    Core Wire-Format Snapshot Tests
    ============================================================================ *)
@@ -1277,6 +1313,7 @@ let () =
 
   (* File I/O tests *)
   test_snapshot_file_io ();
+  test_snapshot_atomic_write ();
   test_snapshot_wire_roundtrip ();
   test_snapshot_wire_bytes ();
 

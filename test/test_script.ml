@@ -925,12 +925,18 @@ let test_nullfail_flag_value () =
   Alcotest.(check int) "NULLFAIL flag is 1 lsl 12" (1 lsl 12)
     Script.script_verify_nullfail
 
-(* Test that NULLFAIL is enabled at SegWit height for mainnet *)
+(* Test that NULLFAIL is NOT in consensus flags (policy-only per Core policy/policy.h:125).
+   NULLFAIL IS in the standard (mempool) flags via get_standard_policy_flags. *)
 let test_nullfail_enabled_at_segwit_height () =
   let network = Consensus.mainnet in
-  let flags = Consensus.get_block_script_flags network.segwit_height network in
-  let has_nullfail = flags land Script.script_verify_nullfail <> 0 in
-  Alcotest.(check bool) "NULLFAIL enabled at SegWit height" true has_nullfail
+  (* Consensus path: NULLFAIL must NOT be set *)
+  let consensus_flags = Consensus.get_block_script_flags network.segwit_height network in
+  let has_nullfail_consensus = consensus_flags land Script.script_verify_nullfail <> 0 in
+  Alcotest.(check bool) "NULLFAIL absent from consensus flags at SegWit height" false has_nullfail_consensus;
+  (* Mempool/standard path: NULLFAIL must BE set *)
+  let standard_flags = Consensus.get_standard_policy_flags network.segwit_height network in
+  let has_nullfail_standard = standard_flags land Script.script_verify_nullfail <> 0 in
+  Alcotest.(check bool) "NULLFAIL present in standard policy flags at SegWit height" true has_nullfail_standard
 
 (* Test that NULLFAIL is NOT enabled before SegWit height *)
 let test_nullfail_disabled_before_segwit () =
@@ -1103,12 +1109,18 @@ let test_witness_pubkeytype_flag_value () =
   Alcotest.(check int) "flag is 1 lsl 14" (1 lsl 14)
     Script.script_verify_witness_pubkeytype
 
-(* Test that WITNESS_PUBKEYTYPE is enabled at SegWit height for mainnet *)
+(* Test that WITNESS_PUBKEYTYPE is NOT in consensus flags (policy-only per Core policy/policy.h:128).
+   WITNESS_PUBKEYTYPE IS in the standard (mempool) flags via get_standard_policy_flags. *)
 let test_witness_pubkeytype_enabled_at_segwit_height () =
   let network = Consensus.mainnet in
-  let flags = Consensus.get_block_script_flags network.segwit_height network in
-  let has_flag = flags land Script.script_verify_witness_pubkeytype <> 0 in
-  Alcotest.(check bool) "WITNESS_PUBKEYTYPE enabled at SegWit height" true has_flag
+  (* Consensus path: WITNESS_PUBKEYTYPE must NOT be set *)
+  let consensus_flags = Consensus.get_block_script_flags network.segwit_height network in
+  let has_flag_consensus = consensus_flags land Script.script_verify_witness_pubkeytype <> 0 in
+  Alcotest.(check bool) "WITNESS_PUBKEYTYPE absent from consensus flags at SegWit height" false has_flag_consensus;
+  (* Mempool/standard path: WITNESS_PUBKEYTYPE must BE set *)
+  let standard_flags = Consensus.get_standard_policy_flags network.segwit_height network in
+  let has_flag_standard = standard_flags land Script.script_verify_witness_pubkeytype <> 0 in
+  Alcotest.(check bool) "WITNESS_PUBKEYTYPE present in standard policy flags at SegWit height" true has_flag_standard
 
 (* Test that WITNESS_PUBKEYTYPE is NOT enabled before SegWit height *)
 let test_witness_pubkeytype_disabled_before_segwit () =

@@ -1643,14 +1643,35 @@ let check_stale_tip (pm : t) : unit Lwt.t =
   let higher_peers = List.filter (fun p ->
     p.Peer.best_height > pm.our_height
   ) ready_peers in
-  if time_since_update > pm.stale_tip_check_interval && higher_peers <> [] then begin
-    (* Sort by best_height descending to find the peer with highest reported height *)
-    let sorted = List.sort (fun a b ->
-      Int32.compare b.Peer.best_height a.Peer.best_height
-    ) higher_peers in
-    let best_peer = List.hd sorted in
-    Log.info (fun m -> m "Stale tip detected (no update for %.0fs), \
-      peer %d reports height %ld vs our %ld"
+  (* Post-IBD bug fix: peer.best_height is only updated at VERSION handshake
+     and on headers-received. INV block announcements do NOT update it, so
+     post-IBD a fully-caught-up node sees all peers reporting their stale
+     handshake-time height (≤ ours) and `higher_peers` stays empty
+     indefinitely. Effect: no periodic getheaders ever fires; lag grows
+     unbounded as the chain advances. Fix: when the higher_peers gate
+     would otherwise suppress, fall back to polling any ready peer — the
+     reply is cheap (empty if peer has no new headers, the canonical
+     getheaders/headers handshake otherwise). *)
+  let poll_peer =
+    if higher_peers <> [] then
+      (* Sort by best_height descending; ask the peer claiming the most. *)
+      Some (List.hd (List.sort (fun a b ->
+        Int32.compare b.Peer.best_height a.Peer.best_height
+      ) higher_peers))
+    else
+      match ready_peers with
+      | [] -> None
+      | peers ->
+        (* Pick any ready peer (prefer the most-recently-active = highest
+           last_seen, biasing toward live, responsive connections). *)
+        Some (List.hd (List.sort (fun a b ->
+          compare b.Peer.last_seen a.Peer.last_seen
+        ) peers))
+  in
+  if time_since_update > pm.stale_tip_check_interval && poll_peer <> None then begin
+    let best_peer = match poll_peer with Some p -> p | None -> assert false in
+    Log.info (fun m -> m "Stale tip check (no update for %.0fs), \
+      polling peer %d (peer reports height %ld vs our %ld)"
       time_since_update best_peer.Peer.id best_peer.Peer.best_height pm.our_height);
     (* Send getheaders to the peer with the highest reported height *)
     let getheaders = P2p.GetheadersMsg {
@@ -1663,8 +1684,12 @@ let check_stale_tip (pm : t) : unit Lwt.t =
     let* () = Lwt.catch
       (fun () -> Peer.send_message best_peer getheaders)
       (fun _exn -> Lwt.return_unit) in
-    (* If tip is very stale (2x interval), disconnect longest-behind peer and try a new one *)
-    if time_since_update > 2.0 *. pm.stale_tip_check_interval then begin
+    (* If tip is very stale (2x interval), AND we have a peer truly reporting
+       higher (not the polling-fallback case), disconnect longest-behind peer.
+       Skip the rotation if we only have the fallback peer — peers may all
+       legitimately be at our tip. *)
+    if higher_peers <> []
+       && time_since_update > 2.0 *. pm.stale_tip_check_interval then begin
       Log.info (fun m -> m "Tip severely stale (%.0fs), rotating longest-behind peer" time_since_update);
       (* Find peer that has been behind the longest *)
       let behind_peers = Hashtbl.fold (fun pid ts acc ->

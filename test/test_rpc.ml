@@ -1666,6 +1666,59 @@ let test_loadmempool_missing_file_zero () =
    hash wiring itself.
    ============================================================================ *)
 
+(* ============================================================================
+   NetworkDisable RAII gate (dumptxoutset rollback)
+
+   Mirrors Bitcoin Core's NetworkDisable wrapper around TemporaryRollback in
+   rpc/blockchain.cpp::dumptxoutset. Sets [chain.block_submission_paused]
+   directly and confirms [handle_submitblock] short-circuits with a
+   "paused" reject string before any deserialization.
+   ============================================================================ *)
+
+let test_submitblock_refuses_while_paused () =
+  let (ctx, db, _utxo, _txid1, _txid2) = create_test_context () in
+  ctx.chain.block_submission_paused <- true;
+  (* Garbage hex is fine: gate runs before deserialization. *)
+  let result = Rpc.handle_submitblock ctx [`String "00"] in
+  (match result with
+   | Ok (`String reason) ->
+     Alcotest.(check bool)
+       "reject reason mentions pause"
+       true
+       (try
+          let _ = Str.search_forward (Str.regexp_string "paused") reason 0 in
+          true
+        with Not_found -> false)
+   | Ok _ ->
+     Alcotest.fail "expected `String reject reason while paused"
+   | Error msg ->
+     Alcotest.fail ("submitblock returned error while paused: " ^ msg));
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_submitblock_unblocks_after_pause_cleared () =
+  let (ctx, db, _utxo, _txid1, _txid2) = create_test_context () in
+  ctx.chain.block_submission_paused <- true;
+  ctx.chain.block_submission_paused <- false;
+  (* With the pause cleared, the handler must move past the gate and
+     reach the decode/validate path. We pass garbage hex so it ultimately
+     fails decode — the important assertion is that we DON'T see the
+     "paused" reject string. *)
+  let result = Rpc.handle_submitblock ctx [`String "00"] in
+  (match result with
+   | Ok (`String reason) ->
+     Alcotest.(check bool)
+       "must not report pause once flag is cleared"
+       false
+       (try
+          let _ = Str.search_forward (Str.regexp_string "paused") reason 0 in
+          true
+        with Not_found -> false)
+   | Ok _ -> ()
+   | Error _ -> ()  (* Decode error is fine; means we're past the gate. *));
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 let test_dumptxoutset_emits_muhash_txoutset_hash () =
   let (ctx, db, _utxo, _txid1, _txid2) = create_test_context () in
   let path = Printf.sprintf "/tmp/camlcoin_dump_muhash_%d.dat"
@@ -1915,6 +1968,12 @@ let () =
         test_gettxoutsetinfo_muhash_matches_dump;
       test_case "gettxoutsetinfo rejects unknown hash_type" `Quick
         test_gettxoutsetinfo_rejects_bad_hash_type;
+    ];
+    "networkdisable_rollback_gate", [
+      test_case "submitblock refuses while paused" `Quick
+        test_submitblock_refuses_while_paused;
+      test_case "submitblock unblocks after pause cleared" `Quick
+        test_submitblock_unblocks_after_pause_cleared;
     ];
     "wallet_encryption_rpc", [
       test_case "encrypt → wrong then right passphrase" `Quick

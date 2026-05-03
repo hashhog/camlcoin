@@ -119,6 +119,14 @@ type chain_state = {
   mutable prune_height : int;    (* last pruned height *)
   headers_from_peer : (int, int) Hashtbl.t;  (* peer_id -> header count from that peer *)
   mutable invalidated_blocks : (string, unit) Hashtbl.t;  (* manually invalidated block hashes *)
+  mutable block_submission_paused : bool;
+  (* NetworkDisable flag (Bitcoin Core
+     [src/rpc/blockchain.cpp::NetworkDisable] around [TemporaryRollback]).
+     When true, [submitblock] and any P2P block-handler callsite that
+     consults this flag must refuse new blocks. Set during
+     [dumptxoutset rollback]'s rewind→dump→replay dance so peers cannot
+     race a new block into the chain mid-rewind; cleared on every exit
+     path. Peers stay connected; only block acceptance is gated. *)
 }
 
 (* Header flood prevention: reject new headers when this limit is reached
@@ -383,6 +391,7 @@ let create_chain_state (db : Storage.ChainDB.t)
     prune_height = 0;
     headers_from_peer = Hashtbl.create 16;
     invalidated_blocks = Hashtbl.create 16;
+    block_submission_paused = false;
   } in
   (* Insert genesis block header *)
   let genesis_hash = Crypto.compute_block_hash network.genesis_header in
@@ -425,6 +434,7 @@ let restore_chain_state (db : Storage.ChainDB.t)
     prune_height = 0;
     headers_from_peer = Hashtbl.create 16;
     invalidated_blocks = Hashtbl.create 16;
+    block_submission_paused = false;
   } in
   (* Check for stored header tip *)
   match Storage.ChainDB.get_header_tip db with

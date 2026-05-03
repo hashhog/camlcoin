@@ -1453,6 +1453,13 @@ let handle_getblocktemplate (ctx : rpc_context)
 
 let handle_submitblock (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  (* NetworkDisable gate. Refuse submissions while a [dumptxoutset
+     rollback] dance is in progress. Mirrors Bitcoin Core's NetworkDisable
+     RAII around TemporaryRollback in [rpc/blockchain.cpp::dumptxoutset]. *)
+  if ctx.chain.block_submission_paused then
+    Ok (`String
+      "rejected: block submission paused (dumptxoutset rollback in progress)")
+  else
   match params with
   | [`String hex] ->
     (try
@@ -3514,10 +3521,66 @@ let handle_dumptxoutset (_ctx : rpc_context)
   match path_and_modes with
   | Error e -> Error e
   | Ok (path, snapshot_type, options) ->
+    (* Refuse to overwrite an existing destination — matches Core's
+       "<path> already exists. If you are sure this is what you want,
+       move it out of the way first." guard in
+       [rpc/blockchain.cpp::dumptxoutset]. We probe with [Sys.file_exists]
+       BEFORE any chain-state mutation so a name collision does not
+       leave the chain in a half-rolled-back state. *)
+    if Sys.file_exists path then
+      Error (Printf.sprintf
+               "%s already exists. If you are sure this is what you want, \
+                move it out of the way first." path)
+    else
     match parse_dumptxoutset_target _ctx snapshot_type options with
     | Error e -> Error e
     | Ok target_opt ->
       let original_tip = _ctx.chain.tip in
+      (* Pruned-mode pre-check (Bitcoin Core
+         [rpc/blockchain.cpp:dumptxoutset]):
+             if (IsPruneMode() &&
+                 target_index->nHeight <
+                 m_blockman.GetFirstBlock()->nHeight)
+                 throw "Block height N not available (pruned data).
+                        Use a height after M.";
+         Camlcoin tracks the prune horizon via [chain.prune_height]
+         (see [handle_getblockchaininfo]), populated by the storage prune
+         sweep. We fail fast so a pruned datadir does not begin a
+         disconnect that is guaranteed to fail when undo data is missing. *)
+      let prune_check : (unit, string) result =
+        match target_opt with
+        | Some target
+          when _ctx.chain.prune_target > 0
+            && target.height < _ctx.chain.prune_height ->
+          Error (Printf.sprintf
+                   "Block height %d not available (pruned data). \
+                    Use a height after %d."
+                   target.height (_ctx.chain.prune_height - 1))
+        | _ -> Ok ()
+      in
+      match prune_check with
+      | Error msg -> Error msg
+      | Ok () ->
+      (* NetworkDisable RAII (Bitcoin Core
+         [src/rpc/blockchain.cpp::NetworkDisable] around
+         [TemporaryRollback]). Pause inbound block acceptance for the
+         duration of the rewind→dump→replay dance and restore on every
+         exit path. We only activate when there's actual rewind work
+         (a "latest" dump doesn't need the gate). Restoration is wrapped
+         in [finally_restore_pause] so a partway-through error does not
+         strand the flag set. *)
+      let pause_active =
+        match target_opt, original_tip with
+        | Some target, Some tip when not (Cstruct.equal target.hash tip.hash) ->
+          true
+        | _ -> false
+      in
+      if pause_active then
+        _ctx.chain.block_submission_paused <- true;
+      let finally_restore_pause () =
+        if pause_active then
+          _ctx.chain.block_submission_paused <- false
+      in
       (* Optionally rewind to the rollback target before dumping. We
          restore the chain afterwards in [finally_restore]. *)
       let saved_tip_for_restore : Sync.header_entry option ref = ref None in
@@ -3528,11 +3591,14 @@ let handle_dumptxoutset (_ctx : rpc_context)
            | Ok () ->
              saved_tip_for_restore := Some tip;
              Ok ()
-           | Error e -> Error e)
+           | Error e ->
+             finally_restore_pause ();
+             Error e)
         | _ -> Ok ()
       in
       match rollback_step with
       | Error msg ->
+        finally_restore_pause ();
         Error (Printf.sprintf "rollback failed: %s" msg)
       | Ok () ->
         (* Resolve the base block (post-rollback tip) used in metadata. *)
@@ -3582,6 +3648,11 @@ let handle_dumptxoutset (_ctx : rpc_context)
         (* Always attempt to restore the chain, even if the dump failed,
            so we never leave the node sitting on a rolled-back tip. *)
         let restore_res = finally_restore () in
+        (* Restore the NetworkDisable flag now that the rewind+dump+replay
+           dance is complete (success or failure). Done BEFORE returning so
+           subsequent submitblock requests in the same process don't see a
+           stale pause. *)
+        finally_restore_pause ();
         (match res, restore_res with
         | Error msg, _ -> Error msg
         | Ok (), Error rmsg ->

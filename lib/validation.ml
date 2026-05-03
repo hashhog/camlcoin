@@ -1332,6 +1332,23 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
                not (is_tx_final tx ~block_height:height ~block_time:locktime_cutoff_fast) then
               error := Some (BlockTxValidationFailed (i, TxNonFinalLocktime));
 
+            (* BIP-30: always run even on the fast (assumevalid) path.
+               Bitcoin Core ConnectBlock enforces BIP-30 unconditionally —
+               assumevalid only skips script verification.
+               Reference: Bitcoin Core validation.cpp ConnectBlock (~line 2467). *)
+            if !error = None then begin
+              let bip34_implies_bip30_limit_fast = 1983702 in
+              let enforce_bip30_fast =
+                not (List.mem height bip30_exception_heights) &&
+                (height < network.bip34_height || height >= bip34_implies_bip30_limit_fast)
+              in
+              if enforce_bip30_fast then begin
+                let n_outputs = List.length tx.outputs in
+                if not (check_bip30 ~lookup:base_lookup ~txid ~n_outputs) then
+                  error := Some (BlockTxValidationFailed (i, TxDuplicateTxid))
+              end
+            end;
+
             if !error = None && not is_cb then begin
               (* Fix 3: Single-pass UTXO lookup - resolve all inputs once.
                  Pre-compute string key per input, reuse for lookup and
@@ -1455,10 +1472,22 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
         let txid = txid_arr.(i) in
         let is_cb = (i = 0) in
 
-        (* Fix 4: Skip BIP30 after BIP34 activation - duplicate txids are
-           impossible once coinbase must encode height (BIP34). *)
-        if height <= network.bip34_height &&
-           not (List.mem height bip30_exception_heights) then begin
+        (* BIP-30: reject any block whose transactions would overwrite an
+           existing unspent output in the UTXO set (CVE-2012-1909).
+           Two mainnet blocks (h=91842 and h=91880) predate BIP-30 and are
+           permanently exempt.  After BIP-34 activation (h >= bip34_height),
+           coinbase-height uniqueness makes duplicate txids practically
+           impossible, so skip the check for performance.  However, at
+           h >= 1,983,702 BIP-34 modular arithmetic begins to repeat
+           pre-BIP34 coinbase heights, so re-enable the check there.
+           Reference: Bitcoin Core validation.cpp ConnectBlock (~line 2467)
+           and IsBIP30Repeat(). *)
+        let bip34_implies_bip30_limit = 1983702 in
+        let enforce_bip30 =
+          not (List.mem height bip30_exception_heights) &&
+          (height < network.bip34_height || height >= bip34_implies_bip30_limit)
+        in
+        if enforce_bip30 then begin
           let n_outputs = List.length tx.outputs in
           if not (check_bip30 ~lookup:base_lookup ~txid ~n_outputs) then
             error := Some (BlockTxValidationFailed (i, TxDuplicateTxid))

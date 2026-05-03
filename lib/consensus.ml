@@ -720,18 +720,17 @@ let get_block_script_flags ?(block_hash="") (height : int) (network : network_co
     if height >= network.csv_height then flags lor script_verify_checksequenceverify
     else flags
   in
-  (* SegWit (BIP-141) and associated rules *)
+  (* SegWit (BIP-141/143/147): WITNESS + NULLDUMMY only.
+     CLEANSTACK, SIGPUSHONLY, NULLFAIL, LOW_S, MINIMALDATA, WITNESS_PUBKEYTYPE
+     are STANDARD_SCRIPT_VERIFY_FLAGS (policy only) per Bitcoin Core
+     policy/policy.h:119-132.  They must NOT appear in the consensus block-
+     script-flag computer.  Use [get_standard_policy_flags] to add them for
+     mempool/relay purposes. *)
   let flags =
     if height >= network.segwit_height then
       flags
       lor script_verify_witness
       lor script_verify_nulldummy
-      lor script_verify_cleanstack
-      lor script_verify_sigpushonly
-      lor script_verify_nullfail
-      lor script_verify_low_s
-      lor script_verify_minimaldata
-      lor script_verify_witness_pubkeytype
     else flags
   in
   (* Taproot (BIP-341/342) *)
@@ -740,6 +739,22 @@ let get_block_script_flags ?(block_hash="") (height : int) (network : network_co
     else flags
   in
   flags
+
+(* Add the mempool/relay policy flags on top of the consensus flags.
+   These are STANDARD_SCRIPT_VERIFY_FLAGS additions per Bitcoin Core
+   policy/policy.h:119-132.  Do NOT call this from the block-connect path. *)
+let get_standard_policy_flags (height : int) (network : network_config) : int =
+  let base = get_block_script_flags height network in
+  let extra = ref 0 in
+  if height >= network.segwit_height then begin
+    extra := !extra lor script_verify_cleanstack;
+    extra := !extra lor script_verify_sigpushonly;
+    extra := !extra lor script_verify_nullfail;
+    extra := !extra lor script_verify_low_s;
+    extra := !extra lor script_verify_minimaldata;
+    extra := !extra lor script_verify_witness_pubkeytype
+  end;
+  base lor !extra
 
 (* ============================================================================
    Testnet min-difficulty rule

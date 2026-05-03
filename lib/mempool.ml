@@ -1246,7 +1246,10 @@ let check_conflict (mp : mempool) (tx : Types.transaction)
 (* Verify all input scripts for a transaction *)
 let verify_tx_scripts (mp : mempool) (tx : Types.transaction)
     : (unit, string) result =
-  let flags = Consensus.get_block_script_flags (mp.current_height + 1) mp.network in
+  (* Mempool uses standard (policy) flags — stricter than consensus block flags.
+     This rejects non-standard txs at acceptance time while still accepting all
+     consensus-valid txs during block validation. *)
+  let flags = Consensus.get_standard_policy_flags (mp.current_height + 1) mp.network in
   let error = ref None in
 
   (* Build prevouts list for Taproot sighash *)

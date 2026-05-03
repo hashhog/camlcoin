@@ -1198,4 +1198,48 @@ let () =
       test_case "99 confirmations fails" `Quick test_coinbase_maturity_99_blocks;
       test_case "non-coinbase no maturity" `Quick test_non_coinbase_no_maturity;
     ];
+    "is_tx_final_locktime", [
+      test_case "zero locktime always final" `Quick
+        (fun () ->
+          let tx = make_tx ~locktime:0l
+            ~inputs:[make_input ~sequence:0l ()]
+            ~outputs:[] ()
+          in
+          Alcotest.(check bool) "final" true
+            (Validation.is_tx_final tx ~block_height:100 ~block_time:1_699_999_000l));
+      test_case "height-based satisfied" `Quick
+        (fun () ->
+          let tx = make_tx ~locktime:100l
+            ~inputs:[make_input ~sequence:0l ()]
+            ~outputs:[] ()
+          in
+          Alcotest.(check bool) "final" true
+            (Validation.is_tx_final tx ~block_height:101 ~block_time:1_699_999_000l));
+      test_case "height-based not satisfied, non-final seq" `Quick
+        (fun () ->
+          let tx = make_tx ~locktime:200l
+            ~inputs:[make_input ~sequence:1l ()]
+            ~outputs:[] ()
+          in
+          Alcotest.(check bool) "not final" false
+            (Validation.is_tx_final tx ~block_height:100 ~block_time:1_699_999_000l));
+      test_case "SEQUENCE_FINAL overrides locktime" `Quick
+        (fun () ->
+          let tx = make_tx ~locktime:999999999l
+            ~inputs:[make_input ~sequence:0xFFFFFFFFl ()]
+            ~outputs:[] ()
+          in
+          Alcotest.(check bool) "final" true
+            (Validation.is_tx_final tx ~block_height:100 ~block_time:1_699_999_000l));
+      test_case "time-based locktime satisfied" `Quick
+        (fun () ->
+          (* locktime=500_000_001 >= LOCKTIME_THRESHOLD (time-based);
+             block_time=500_000_002 > locktime → satisfied *)
+          let tx = make_tx ~locktime:500_000_001l
+            ~inputs:[make_input ~sequence:0l ()]
+            ~outputs:[] ()
+          in
+          Alcotest.(check bool) "final" true
+            (Validation.is_tx_final tx ~block_height:100 ~block_time:500_000_002l));
+    ];
   ]

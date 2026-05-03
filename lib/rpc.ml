@@ -1451,6 +1451,35 @@ let handle_getblocktemplate (ctx : rpc_context)
       ~chain:ctx.chain ~mp:ctx.mempool ~payout_script in
     Ok (Mining.template_to_json template)
 
+(* Map a submitblock error string to the canonical BIP-22 result token.
+   Per BIP-22 and Bitcoin Core BIP22ValidationResult() in
+   src/rpc/mining.cpp, rejection reasons must be short ASCII strings in
+   the result field, not verbose error messages.
+   Strings are matched against known substrings from validation.ml. *)
+let bip22_of_submitblock_error (msg : string) : string =
+  let c s = let open String in
+    let n = length s and m = length msg in
+    if n > m then false
+    else
+      let rec go i = if i > m - n then false
+                     else if sub msg i n = s then true
+                     else go (i + 1)
+      in go 0
+  in
+  if c "difficulty target" || c "does not meet" then "high-hash"
+  else if c "merkle root" || c "mutated" then "bad-txnmrklroot"
+  else if c "witness commitment" then "bad-witness-merkle-match"
+  else if c "coinbase value" || c "coinbase value too high" then "bad-cb-amount"
+  else if c "sigop" then "bad-blk-sigops"
+  else if c "duplicate transaction" then "bad-txns-duplicate"
+  else if c "non-final" || c "not final" then "bad-txns-nonfinal"
+  else if c "invalid coinbase" || c "bad coinbase" then "bad-cb-height"
+  else if c "timestamp too far" then "time-too-new"
+  else if c "timestamp" then "time-too-old"
+  else if c "script verification failed" then "mandatory-script-verify-flag-failed"
+  else if c "missing inputs" || c "missing or spent" then "bad-txns-inputs-missingorspent"
+  else "rejected"
+
 let handle_submitblock (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   (* NetworkDisable gate. Refuse submissions while a [dumptxoutset
@@ -1470,9 +1499,14 @@ let handle_submitblock (ctx : rpc_context)
               ~network_type:ctx.network.network_type
               block ctx.chain ctx.mempool with
       | Ok () -> Ok `Null
-      | Error msg -> Error msg
+      (* Return canonical BIP-22 string in result field (not as an error).
+         Bitcoin Core BIP22ValidationResult() returns the string as a
+         successful JSON-RPC result, not a JSON-RPC error object. *)
+      | Error msg -> Ok (`String (bip22_of_submitblock_error msg))
     with exn ->
-      Error (Printf.sprintf "Block decode failed: %s" (Printexc.to_string exn)))
+      (* Deserialization / structural failure: still a BIP-22 "rejected". *)
+      let _ = Printf.sprintf "Block decode failed: %s" (Printexc.to_string exn) in
+      Ok (`String "rejected"))
   | _ ->
     Error "Invalid parameters: expected [hexdata]"
 

@@ -1311,12 +1311,28 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
         let error = ref None in
         let spent_utxos = ref [] in
 
+        (* ContextualCheckBlock: IsFinalTx for all txs — runs even on fast path.
+           Bitcoin Core validation.cpp:4146: assumevalid only skips script
+           verification; structural rules including IsFinalTx still apply.
+           lock_time_cutoff uses MTP when CSV (BIP-113) is active. *)
+        let locktime_cutoff_fast =
+          if flags land Script.script_verify_checksequenceverify <> 0
+          then median_time
+          else block.header.timestamp
+        in
+
         List.iteri (fun i (tx : Types.transaction) ->
           if !error = None then begin
             let txid = txid_arr.(i) in
             let is_cb = (i = 0) in
 
-            if not is_cb then begin
+            (* IsFinalTx check — coinbase is always final (locktime=0), but we
+               check all txs for correctness, same as Core's vtx loop. *)
+            if not is_cb &&
+               not (is_tx_final tx ~block_height:height ~block_time:locktime_cutoff_fast) then
+              error := Some (BlockTxValidationFailed (i, TxNonFinalLocktime));
+
+            if !error = None && not is_cb then begin
               (* Fix 3: Single-pass UTXO lookup - resolve all inputs once.
                  Pre-compute string key per input, reuse for lookup and
                  spent_in_block. *)

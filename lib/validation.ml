@@ -1597,6 +1597,34 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
               if not (Consensus.is_valid_money !total_in) then
                 error := Some (BlockTxValidationFailed (i, TxOutputOverflow))
               else begin
+                (* BIP-68 SequenceLocks: check relative lock-times BEFORE
+                   script verification.
+                   Reference: Bitcoin Core validation.cpp ConnectBlock() ~line 2549:
+                     prevheights[j] = view.AccessCoin(tx.vin[j].prevout).nHeight;
+                     if (!SequenceLocks(tx, nLockTimeFlags, prevheights, *pindex))
+                       state.Invalid(..., "bad-txns-nonfinal", ...)
+                   Core fires this BEFORE CheckInputScripts (script-eval), so
+                   blocks with unsatisfied relative lock-times must be rejected
+                   with bad-txns-nonfinal, not block-script-verify-flag-failed.
+                   Moving this before verify_scripts_parallel_domain restores
+                   Core ordering parity (ordering bug surfaced in wave-35 corpus). *)
+                let utxo_heights = Array.make n_inputs 0 in
+                let utxo_mtps = Array.make n_inputs 0l in
+                Array.iteri (fun j opt ->
+                  match opt with
+                  | Some utxo ->
+                    utxo_heights.(j) <- utxo.height;
+                    utxo_mtps.(j) <- (match get_mtp_at_height with
+                      | Some f -> f (utxo.height - 1)
+                      | None -> median_time)
+                  | None -> ()
+                ) resolved_utxos;
+                if not (check_sequence_locks tx ~block_height:height
+                          ~median_time ~utxo_heights ~utxo_mtps
+                          ?get_mtp_at_height ~flags ()) then
+                  error := Some (BlockTxValidationFailed (i, TxSequenceLocksFailed));
+
+                if !error = None then begin
                 (* Parallel script verification using OCaml 5 Domains.
                    Reference: Bitcoin Core's CCheckQueue (src/checkqueue.h) —
                    N-1 worker threads + master thread verify inputs concurrently.
@@ -1613,24 +1641,6 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
                 match script_result with
                 | Error e -> error := Some (BlockTxValidationFailed (i, e))
                 | Ok () ->
-                  (* BIP68 sequence locks using pre-resolved UTXOs *)
-                  if !error = None then begin
-                    let utxo_heights = Array.make n_inputs 0 in
-                    let utxo_mtps = Array.make n_inputs 0l in
-                    Array.iteri (fun j opt ->
-                      match opt with
-                      | Some utxo ->
-                        utxo_heights.(j) <- utxo.height;
-                        utxo_mtps.(j) <- (match get_mtp_at_height with
-                          | Some f -> f (utxo.height - 1)
-                          | None -> median_time)
-                      | None -> ()
-                    ) resolved_utxos;
-                    if not (check_sequence_locks tx ~block_height:height
-                              ~median_time ~utxo_heights ~utxo_mtps
-                              ?get_mtp_at_height ~flags ()) then
-                      error := Some (BlockTxValidationFailed (i, TxSequenceLocksFailed))
-                  end;
 
                   if !error = None then begin
                     (* Calculate and accumulate fee *)
@@ -1661,7 +1671,8 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
                       end
                     end
                   end
-              end
+              end (* if !error = None then begin — script-eval guard *)
+              end (* else begin — MoneyRange check *)
           end
         end;
 

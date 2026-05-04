@@ -1479,7 +1479,7 @@ let bip22_of_submitblock_error (msg : string) : string =
      — Core reaches ConnectBlock prevout-already-spent and returns
      "bad-txns-inputs-missingorspent" for the same block (dup-txid-merkle-malleation corpus). *)
   else if c "duplicate transaction" then "bad-txns-inputs-missingorspent"
-  else if c "non-final" || c "not final" then "bad-txns-nonfinal"
+  else if c "non-final" || c "not final" || c "sequence locks" then "bad-txns-nonfinal"
   (* bad-cb-length: coinbase scriptSig 2..100 byte cap (consensus/tx_check.cpp:49) *)
   else if c "bad-cb-length" then "bad-cb-length"
   (* bad-cb-height: BIP-34 height prefix wrong *)

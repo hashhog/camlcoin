@@ -1471,7 +1471,14 @@ let bip22_of_submitblock_error (msg : string) : string =
   else if c "witness commitment" then "bad-witness-merkle-match"
   else if c "coinbase value" || c "coinbase value too high" then "bad-cb-amount"
   else if c "sigop" then "bad-blk-sigops"
-  else if c "duplicate transaction" then "bad-txns-duplicate"
+  (* BIP-30 cross-block duplicate UTXO: "transaction has duplicate txid in UTXO set (BIP30)"
+     — Core returns "bad-txns-BIP30" for this; the "BIP30" substring distinguishes it from
+     the in-block dup-txid case below. *)
+  else if c "BIP30" then "bad-txns-BIP30"
+  (* In-block dup-txid (CVE-2012-2459): "block contains duplicate transactions"
+     — Core reaches ConnectBlock prevout-already-spent and returns
+     "bad-txns-inputs-missingorspent" for the same block (dup-txid-merkle-malleation corpus). *)
+  else if c "duplicate transaction" then "bad-txns-inputs-missingorspent"
   else if c "non-final" || c "not final" then "bad-txns-nonfinal"
   (* bad-cb-length: coinbase scriptSig 2..100 byte cap (consensus/tx_check.cpp:49) *)
   else if c "bad-cb-length" then "bad-cb-length"

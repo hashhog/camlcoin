@@ -592,6 +592,69 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
         | Error e -> Error (Validation.block_error_to_string e)
         | Ok () ->
 
+        (* Full contextual validation with UTXO access: BIP-30 duplicate-UTXO,
+           per-input script verification, BIP-141 weighted sigops cost budget,
+           and coinbase value ≤ subsidy + fees.  These four checks are present
+           in the IBD path (Sync.process_new_block → validate_block_with_utxos)
+           but were missing on the submitblock path because connect_block_optimized
+           only does UTXO mutation, not validation.
+           Reference: Bitcoin Core ProcessNewBlock → AcceptBlock → CheckBlock →
+                      ContextualCheckBlock → ConnectBlock (validation.cpp).
+           Code comments in check_block already acknowledge the gap:
+             "Sigop cost check is deferred to validate_block_with_utxos"
+             "Coinbase value check is deferred to validate_block_with_utxos"
+           This call is read-only: validate_block_with_utxos does not mutate
+           the UTXO set.  connect_block_optimized below still handles mutations. *)
+        let base_lookup (outpoint : Types.outpoint) : Validation.utxo option =
+          let txid = outpoint.Types.txid in
+          let vout = Int32.to_int outpoint.Types.vout in
+          (* Check the OptimizedUtxoSet in-memory cache first (mirrors
+             sync.ml:1794-1809: IBD uses the same layered lookup). *)
+          let entry_opt = match utxo with
+            | Some utxo_set ->
+              (match Utxo.OptimizedUtxoSet.get utxo_set txid vout with
+               | Some e ->
+                 Some Validation.{
+                   txid; vout = outpoint.Types.vout;
+                   value = e.Utxo.value;
+                   script_pubkey = e.Utxo.script_pubkey;
+                   height = e.Utxo.height;
+                   is_coinbase = e.Utxo.is_coinbase;
+                 }
+               | None -> None)
+            | None -> None
+          in
+          match entry_opt with
+          | Some _ as found -> found
+          | None ->
+            (* Fall back to raw DB (cf_chainstate / rocksdb_utxo) *)
+            (match Storage.ChainDB.get_utxo chain.db txid vout with
+             | None -> None
+             | Some data ->
+               let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+               let value = Serialize.read_int64_le r in
+               let script_len = Serialize.read_compact_size r in
+               let script = Serialize.read_bytes r script_len in
+               let stored_height = Int32.to_int (Serialize.read_int32_le r) in
+               let utxo_is_coinbase = Serialize.read_uint8 r = 1 in
+               Some Validation.{
+                 txid; vout = outpoint.Types.vout;
+                 value; script_pubkey = script;
+                 height = stored_height; is_coinbase = utxo_is_coinbase;
+               })
+        in
+        let validation_flags =
+          Consensus.get_block_script_flags height chain.network
+        in
+        (match Validation.validate_block_with_utxos block height
+                 ~expected_bits:block.header.bits ~median_time
+                 ~base_lookup ~flags:validation_flags
+                 ~skip_scripts:false
+                 ~network:chain.network
+                 ~get_mtp_at_height:(Sync.get_mtp_for_height chain) () with
+        | Error e -> Error (Validation.block_error_to_string e)
+        | Ok _ ->
+
         (* During IBD with headers-first sync, the header is already in the chain.
            Look up existing entry or validate as new. *)
         let entry_result = match Sync.validate_header chain block.header with
@@ -653,5 +716,5 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
              Logs.info (fun m -> m "Accepted mined block at height %d: %s"
                height (Types.hash256_to_hex_display hash));
 
-             Ok ()))
+             Ok ())))
       end

@@ -1473,6 +1473,9 @@ let bip22_of_submitblock_error (msg : string) : string =
   else if c "sigop" then "bad-blk-sigops"
   else if c "duplicate transaction" then "bad-txns-duplicate"
   else if c "non-final" || c "not final" then "bad-txns-nonfinal"
+  (* bad-cb-length: coinbase scriptSig 2..100 byte cap (consensus/tx_check.cpp:49) *)
+  else if c "bad-cb-length" then "bad-cb-length"
+  (* bad-cb-height: BIP-34 height prefix wrong *)
   else if c "invalid coinbase" || c "bad coinbase" then "bad-cb-height"
   else if c "timestamp too far" then "time-too-new"
   else if c "timestamp" then "time-too-old"

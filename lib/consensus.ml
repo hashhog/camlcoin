@@ -585,7 +585,7 @@ let regtest : network_config = {
   script_address_prefix = 0xC4;
   wif_prefix = 0xEF;
   bech32_hrp = "bcrt";
-  bip34_height = 500;
+  bip34_height = 1;  (* Bitcoin Core kernel/chainparams.cpp:536: consensus.BIP34Height = 1 *)
   bip65_height = 1351;
   bip66_height = 1251;
   csv_height = 432;  (* CSV active early in regtest for testing *)

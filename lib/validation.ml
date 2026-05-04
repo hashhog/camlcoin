@@ -16,6 +16,7 @@ type tx_validation_error =
   | TxScriptFailed of int * string
   | TxNonFinalLocktime
   | TxBadCoinbase
+  | TxCoinbaseScriptSigTooLong  (* scriptSig length outside 2..100 bytes; bad-cb-length *)
   | TxInvalidWitness
   | TxUnexpectedCoinbase
   | TxNullPrevout
@@ -58,6 +59,7 @@ let tx_error_to_string = function
     Printf.sprintf "script verification failed for input %d: %s" i msg
   | TxNonFinalLocktime -> "transaction is not final (locktime)"
   | TxBadCoinbase -> "invalid coinbase transaction"
+  | TxCoinbaseScriptSigTooLong -> "coinbase scriptSig length out of range (bad-cb-length)"
   | TxInvalidWitness -> "invalid witness data"
   | TxUnexpectedCoinbase -> "unexpected coinbase transaction (not first in block)"
   | TxNullPrevout -> "non-coinbase transaction references null outpoint"
@@ -237,10 +239,11 @@ let check_coinbase ~network:(network : Consensus.network_config) (tx : Types.tra
     if not is_null then
       Error TxBadCoinbase
     else begin
-      (* Script sig length must be between 2 and 100 bytes *)
+      (* Script sig length must be between 2 and 100 bytes.
+         Bitcoin Core consensus/tx_check.cpp:49. *)
       let script_len = Cstruct.length inp.Types.script_sig in
       if script_len < 2 || script_len > 100 then
-        Error TxBadCoinbase
+        Error TxCoinbaseScriptSigTooLong
       else begin
         (* BIP-34: Check block height encoding in coinbase script
            Only enforced at heights where BIP-34 is active *)

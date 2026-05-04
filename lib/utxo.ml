@@ -228,6 +228,11 @@ let deserialize_undo_data r : undo_data =
    IMPORTANT: This modifies the UTXO set. If validation fails partway
    through, the UTXO set will be in an inconsistent state. Callers should
    use batch operations or be prepared to disconnect. *)
+(* DEAD CODE (wave-33b ledger): zero non-test callers. The live UTXO mutation
+   path is connect_block_optimized (called from block_import.ml and mining.ml).
+   This unoptimized variant uses UtxoSet.t (not OptimizedUtxoSet.t) and is
+   kept only for test coverage. BIP-30 / sigop / IsFinalTx fixes belong in
+   connect_block_optimized, NOT here. *)
 let connect_block ?(network_type : Consensus.network = Consensus.Mainnet)
     (utxo : UtxoSet.t) (block : Types.block)
     (height : int)
@@ -315,6 +320,11 @@ let connect_block ?(network_type : Consensus.network = Consensus.Mainnet)
 
 (* Disconnect a block from the UTXO set (for chain reorganization).
 
+   DEAD CODE (wave-33b ledger): zero non-test callers. Transitively dead via
+   connect_blocks (which was deleted in this wave). Test-only callers remain
+   in test_utxo.ml; disconnect logic for live reorgs lives in the layered
+   UTXO cache (LayeredUtxoCache, below).
+
    This reverses the effects of connect_block by processing transactions
    in reverse order, and for each transaction:
    1. Remove outputs created by this tx
@@ -374,28 +384,8 @@ let initialize_genesis (utxo : UtxoSet.t)
   ()
 
 (* ============================================================================
-   Batch Connect/Disconnect for Multiple Blocks
+   Batch Connect/Disconnect for Multiple Blocks (DELETED wave-33b ledger)
    ============================================================================ *)
-
-(* Connect multiple blocks in sequence, returning all undo data *)
-let connect_blocks (utxo : UtxoSet.t) (blocks : (Types.block * int) list)
-    : (undo_data list, string) result =
-  let rec loop acc = function
-    | [] -> Ok (List.rev acc)
-    | (block, height) :: rest ->
-      match connect_block utxo block height with
-      | Error e -> Error e
-      | Ok undo -> loop (undo :: acc) rest
-  in
-  loop [] blocks
-
-(* Disconnect multiple blocks in reverse sequence *)
-let disconnect_blocks (utxo : UtxoSet.t)
-    (blocks_with_undo : (Types.block * undo_data) list) : unit =
-  (* Must process in reverse order (newest to oldest) *)
-  List.iter (fun (block, undo) ->
-    disconnect_block utxo block undo
-  ) (List.rev blocks_with_undo)
 
 (* ============================================================================
    UTXO Statistics
@@ -793,24 +783,8 @@ let connect_block_optimized ?(network_type : Consensus.network = Consensus.Mainn
     else
       Ok { height; tx_undos = List.rev !tx_undos }
 
-(* Process multiple blocks in batch during IBD *)
-let process_blocks_batch (blocks : Types.block list)
-    (utxo : OptimizedUtxoSet.t) (start_height : int)
-    : (int, string) result =
-  let height = ref start_height in
-  let error = ref None in
-  List.iter (fun block ->
-    if !error = None then begin
-      match connect_block_optimized utxo block !height with
-      | Ok _undo ->
-        incr height
-      | Error e ->
-        error := Some e
-    end
-  ) blocks;
-  match !error with
-  | Some e -> Error e
-  | None -> Ok (!height - start_height)
+(* process_blocks_batch deleted in wave-33b: zero callers outside dead
+   connect_block_optimized wrappers. Use connect_block_optimized directly. *)
 
 (* ============================================================================
    Layered UTXO Cache with Batch Flushing

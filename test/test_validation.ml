@@ -199,7 +199,7 @@ let test_check_coinbase_wrong_height () =
     ~outputs:[make_output ~value:(Consensus.block_subsidy 500) ()]
     ()
   in
-  (* Check against different height (both >= bip34_height=500 for regtest) *)
+  (* Check against different height (both >= bip34_height=1 for regtest) *)
   match Validation.check_coinbase ~network:Consensus.regtest cb 600 with
   | Error Validation.TxBadCoinbase -> ()
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.tx_error_to_string e)
@@ -229,10 +229,12 @@ let test_check_coinbase_script_too_short () =
     ~outputs:[make_output ~value:1000L ()]
     ()
   in
+  (* Script length check runs before BIP-34, so expect TxCoinbaseScriptSigTooLong
+     (maps to "bad-cb-length").  Bitcoin Core consensus/tx_check.cpp:49. *)
   match Validation.check_coinbase ~network:Consensus.regtest cb 100 with
-  | Error Validation.TxBadCoinbase -> ()
+  | Error Validation.TxCoinbaseScriptSigTooLong -> ()
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.tx_error_to_string e)
-  | Ok () -> Alcotest.fail "Should have failed with TxBadCoinbase"
+  | Ok () -> Alcotest.fail "Should have failed with TxCoinbaseScriptSigTooLong"
 
 (* ============================================================================
    Sigops Counting Tests
@@ -656,8 +658,10 @@ let test_check_block_bad_timestamp () =
   in
   let txid = Crypto.compute_txid coinbase in
   let (merkle, _) = Crypto.merkle_root [txid] in
-  (* Timestamp <= median_time should fail *)
-  let header = make_header ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:50l () in
+  (* Timestamp <= median_time should fail.
+     BIP-34 is active from height 1 on regtest, so use version=2 to satisfy
+     the post-BIP34 block version check. *)
+  let header = make_header ~version:2l ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:50l () in
   let block = { Types.header; transactions = [coinbase] } in
   match Validation.check_block ~network:Consensus.regtest block 100 ~expected_bits:0x207fffffl ~median_time:100l with
   | Error Validation.BlockBadTimestamp -> ()
@@ -679,7 +683,8 @@ let test_check_block_duplicate_tx () =
     ()
   in
   let block = {
-    Types.header = make_header ~timestamp:200l ();
+    (* BIP-34 active from height 1 on regtest — use version=2 to pass version check *)
+    Types.header = make_header ~version:2l ~timestamp:200l ();
     transactions = [coinbase; regular_tx; regular_tx];  (* Duplicate *)
   } in
   match Validation.check_block ~network:Consensus.regtest block 100 ~expected_bits:0x207fffffl ~median_time:0l with
@@ -738,15 +743,16 @@ let test_block_error_strings () =
    ============================================================================ *)
 
 let test_bip34_not_enforced_before_activation () =
-  (* Before bip34_height (regtest=500), height encoding is not checked *)
+  (* Before bip34_height, height encoding is not checked.
+     On regtest bip34_height=1 (Core parity), so use mainnet where
+     bip34_height=227931.  Height=200 with a coinbase for height=100 should
+     pass on mainnet because 200 < 227931. *)
   let cb = make_tx
     ~inputs:[make_coinbase_input ~height:100]
     ~outputs:[make_output ~value:(Consensus.block_subsidy 100) ()]
     ()
   in
-  (* Pass height=200 with coinbase encoded for height=100 -- should pass
-     because 200 < regtest bip34_height=500 *)
-  match Validation.check_coinbase ~network:Consensus.regtest cb 200 with
+  match Validation.check_coinbase ~network:Consensus.mainnet cb 200 with
   | Ok () -> ()
   | Error e -> Alcotest.fail ("Should not enforce BIP34 before activation: " ^
                               Validation.tx_error_to_string e)
@@ -787,7 +793,9 @@ let test_block_version_too_low_bip34 () =
   | Ok () -> Alcotest.fail "Should have rejected version 1 block after BIP34"
 
 let test_block_version_ok_before_bip34 () =
-  (* Before bip34_height, version 1 is fine *)
+  (* Before bip34_height, version 1 is fine.
+     On regtest bip34_height=1 (Core parity), so use mainnet where
+     bip34_height=227931.  Height=100 with version=1 should be OK on mainnet. *)
   let coinbase = make_tx
     ~inputs:[make_coinbase_input ~height:100]
     ~outputs:[make_output ~value:(Consensus.block_subsidy 100) ()]
@@ -797,11 +805,11 @@ let test_block_version_ok_before_bip34 () =
   let (merkle, _) = Crypto.merkle_root [txid] in
   let header = make_header ~version:1l ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:100l () in
   let block = { Types.header; transactions = [coinbase] } in
-  match Validation.check_block ~network:Consensus.regtest block 100
+  match Validation.check_block ~network:Consensus.mainnet block 100
           ~expected_bits:0x207fffffl ~median_time:0l with
   | Error Validation.BlockBadVersion ->
     Alcotest.fail "Should NOT reject version 1 block before BIP34 activation"
-  | Error Validation.BlockBadDifficulty -> ()  (* Expected: PoW check may fail *)
+  | Error Validation.BlockBadDifficulty -> ()  (* Expected: PoW check may fail on mainnet params *)
   | Error _ -> ()  (* Other errors are acceptable *)
   | Ok () -> ()
 
@@ -1164,9 +1172,10 @@ let test_bip30_check_passes_no_existing_coin () =
   Alcotest.(check bool) "BIP-30 passes when no duplicate" true result
 
 (* BIP-30: validate_block_with_utxos rejects a duplicate UTXO at pre-BIP34 height
-   (uses skip_scripts=true path which now also runs BIP-30) *)
+   (uses skip_scripts=true path which now also runs BIP-30).
+   Use mainnet where bip34_height=227931, so height=100 is pre-BIP34. *)
 let test_bip30_validate_block_rejects_duplicate () =
-  let height = 100 in  (* pre-BIP34 on regtest (bip34_height=500) *)
+  let height = 100 in  (* pre-BIP34 on mainnet (bip34_height=227931) *)
   let (block, txid) = make_bip30_block ~height ~coinbase_suffix:0xCC in
   (* base_lookup returns a coin at the same txid — simulates duplicate *)
   let base_lookup (op : Types.outpoint) =
@@ -1182,7 +1191,7 @@ let test_bip30_validate_block_rejects_duplicate () =
     else None
   in
   let flags = Script.script_verify_none in
-  match Validation.validate_block_with_utxos ~network:Consensus.regtest block height
+  match Validation.validate_block_with_utxos ~network:Consensus.mainnet block height
     ~expected_bits:0x207fffffl ~median_time:0l
     ~base_lookup ~flags ~skip_scripts:true () with
   | Error (Validation.BlockTxValidationFailed (_, Validation.TxDuplicateTxid)) -> ()

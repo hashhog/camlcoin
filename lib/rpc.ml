@@ -1486,7 +1486,11 @@ let bip22_of_submitblock_error (msg : string) : string =
   else if c "invalid coinbase" || c "bad coinbase" then "bad-cb-height"
   else if c "timestamp too far" then "time-too-new"
   else if c "timestamp" then "time-too-old"
-  else if c "script verification failed" then "mandatory-script-verify-flag-failed"
+  (* Connect-block stage: Core validation.cpp:2122 "block-script-verify-flag-failed (%s)".
+     Covers disabled opcodes (OP_CAT and 14 peers), signature failures, etc. *)
+  else if c "script verification failed" || c "disabled opcode" || c "Disabled opcode"
+       || c "script failed" || c "checksig" || c "witness program" then
+       "block-script-verify-flag-failed"
   else if c "missing inputs" || c "missing or spent" then "bad-txns-inputs-missingorspent"
   (* Negative output value: consensus/tx_check.cpp::CheckTransaction — Core parity *)
   else if c "has negative value" then "bad-txns-vout-negative"

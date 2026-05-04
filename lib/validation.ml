@@ -8,7 +8,8 @@ type tx_validation_error =
   | TxEmptyInputs
   | TxEmptyOutputs
   | TxOversizeWeight of int
-  | TxNegativeOutput of int
+  | TxNegativeOutput of int     (* output value < 0 (signed int64): bad-txns-vout-negative *)
+  | TxOutputTooLarge of int     (* output value > MAX_MONEY: bad-txns-vout-toolarge *)
   | TxOutputOverflow
   | TxDuplicateInputs
   | TxMissingInputs
@@ -50,7 +51,9 @@ let tx_error_to_string = function
   | TxOversizeWeight w ->
     Printf.sprintf "transaction exceeds max weight (%d > %d)" w Consensus.max_tx_weight
   | TxNegativeOutput i ->
-    Printf.sprintf "output %d has negative or excessive value" i
+    Printf.sprintf "output %d has negative value" i
+  | TxOutputTooLarge i ->
+    Printf.sprintf "output %d value exceeds MAX_MONEY" i
   | TxOutputOverflow -> "total output value overflow"
   | TxDuplicateInputs -> "transaction has duplicate inputs"
   | TxMissingInputs -> "transaction references missing inputs"
@@ -164,12 +167,12 @@ let check_transaction ?(is_coinbase = false) (tx : Types.transaction)
       let bad_output = ref None in
       List.iteri (fun i out ->
         if !bad_output = None then begin
-          (* Check for negative value *)
+          (* Check for negative value — mirrors Core consensus/tx_check.cpp::CheckTransaction *)
           if out.Types.value < 0L then
             bad_output := Some (TxNegativeOutput i)
           (* Check for value exceeding max money *)
           else if out.Types.value > Consensus.max_money then
-            bad_output := Some (TxNegativeOutput i)
+            bad_output := Some (TxOutputTooLarge i)
           else begin
             (* Check for overflow in total *)
             total_out := Int64.add !total_out out.Types.value;

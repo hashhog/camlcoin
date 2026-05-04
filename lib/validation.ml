@@ -691,6 +691,37 @@ let check_duplicate_txids (transactions : Types.transaction list)
   in
   check transactions
 
+(* ============================================================================
+   Transaction Finality Checks (IsFinalTx)
+   Placed here (before check_block) because check_block calls is_tx_final.
+   ============================================================================ *)
+
+(* Check if transaction is final based on locktime and sequences.
+   Locktime is unsigned 32-bit: values < 500_000_000 are block heights,
+   values >= 500_000_000 are Unix timestamps.
+   Reference: Bitcoin Core consensus/tx_verify.cpp IsFinalTx() *)
+let is_tx_final (tx : Types.transaction) ~(block_height : int) ~(block_time : int32)
+    : bool =
+  if tx.locktime = 0l then
+    true
+  else begin
+    if List.for_all (fun inp ->
+         Int32.equal inp.Types.sequence 0xFFFFFFFFl
+       ) tx.inputs then
+      true
+    else begin
+      (* Treat locktime as unsigned 32-bit *)
+      let locktime_unsigned = Int64.logand (Int64.of_int32 tx.locktime) 0xFFFFFFFFL in
+      if locktime_unsigned < 500_000_000L then
+        (* Locktime is a block height *)
+        Int64.of_int block_height >= locktime_unsigned
+      else
+        (* Locktime is a unix timestamp - compare unsigned *)
+        let block_time_unsigned = Int64.logand (Int64.of_int32 block_time) 0xFFFFFFFFL in
+        block_time_unsigned >= locktime_unsigned
+    end
+  end
+
 (* Validate a full block *)
 let check_block ~network:(network : Consensus.network_config) (block : Types.block) (height : int)
     ~(expected_bits : int32) ~(median_time : int32)
@@ -802,12 +833,36 @@ let check_block ~network:(network : Consensus.network_config) (block : Types.blo
                         match check_witness_commitment block with
                         | Error e -> Error e
                         | Ok () ->
+                          (* Task 7: ContextualCheckBlock — IsFinalTx for every tx.
+                             Bitcoin Core validation.cpp:4146 enforces this even when
+                             scripts are skipped (assumevalid only skips script verify).
+                             lock_time_cutoff = median_time when BIP-113/CSV is active
+                             (height >= csv_height), else block header timestamp.
+                             Reference: bitcoin-core/src/consensus/tx_verify.cpp IsFinalTx
+                                        BIP-113 (median-time-past locktime) *)
+                          let csv_active = height >= network.csv_height in
+                          let lock_time_cutoff =
+                            if csv_active then median_time
+                            else block.header.timestamp
+                          in
+                          let error2 = ref None in
+                          List.iteri (fun i tx ->
+                            if !error2 = None then begin
+                              let is_cb = (i = 0) in
+                              if not is_cb &&
+                                 not (is_tx_final tx ~block_height:height ~block_time:lock_time_cutoff) then
+                                error2 := Some (BlockTxValidationFailed (i, TxNonFinalLocktime))
+                            end
+                          ) txs;
+                          (match !error2 with
+                           | Some e -> Error e
+                           | None ->
                           (* Coinbase value check is deferred to
                              validate_block_with_utxos which has UTXO context
                              to compute actual fees. Without knowing fees, any
                              check here would either be too strict (rejecting
                              valid blocks) or too loose to be useful. *)
-                          Ok ()
+                          Ok ())
                     end
                   end
               end
@@ -834,35 +889,6 @@ let check_block_header (header : Types.block_header) : (unit, string) result =
       Error "Block does not meet difficulty target"
     else
       Ok ()
-  end
-
-(* ============================================================================
-   Transaction Finality Checks
-   ============================================================================ *)
-
-(* Check if transaction is final based on locktime and sequences.
-   Locktime is unsigned 32-bit: values < 500_000_000 are block heights,
-   values >= 500_000_000 are Unix timestamps. *)
-let is_tx_final (tx : Types.transaction) ~(block_height : int) ~(block_time : int32)
-    : bool =
-  if tx.locktime = 0l then
-    true
-  else begin
-    if List.for_all (fun inp ->
-         Int32.equal inp.Types.sequence 0xFFFFFFFFl
-       ) tx.inputs then
-      true
-    else begin
-      (* Treat locktime as unsigned 32-bit *)
-      let locktime_unsigned = Int64.logand (Int64.of_int32 tx.locktime) 0xFFFFFFFFL in
-      if locktime_unsigned < 500_000_000L then
-        (* Locktime is a block height *)
-        Int64.of_int block_height >= locktime_unsigned
-      else
-        (* Locktime is a unix timestamp - compare unsigned *)
-        let block_time_unsigned = Int64.logand (Int64.of_int32 block_time) 0xFFFFFFFFL in
-        block_time_unsigned >= locktime_unsigned
-    end
   end
 
 (* ============================================================================

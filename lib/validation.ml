@@ -1699,3 +1699,70 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
       else
         Ok (!total_fees, txid_arr, List.rev !spent_utxos)
   end
+
+(* ============================================================================
+   Unified Block Acceptance Helper — mirrors Bitcoin Core ProcessNewBlock
+   ============================================================================
+
+   All block-acceptance entry points (submitblock RPC, P2P block handler,
+   connect_stored_blocks gap-fill, IBD pipeline) route through this single
+   function.  This ensures every path receives the same validation sequence:
+
+     1. validate_block_with_utxos — full contextual validation (internally
+        calls check_block for context-free checks, then performs UTXO-aware
+        checks: BIP-30 dup-UTXO, per-input scripts, BIP-141 sigops cost,
+        coinbase value ≤ subsidy+fees, BIP-68 sequence locks).
+
+   On the assumevalid fast path (skip_scripts=true), validate_block_with_utxos
+   skips script verification but still enforces IsFinalTx, BIP-30, and
+   fee/value accounting — matching Bitcoin Core's ConnectBlock behaviour where
+   assumevalid only skips CScriptCheck jobs.
+
+   Reference: Bitcoin Core validation.cpp
+     - AcceptBlockHeader (PoW/timestamp/version/difficulty)
+     - AcceptBlock → CheckBlock (context-free structural checks)
+     - ActivateBestChain → ConnectBlock (contextual + UTXO checks)
+   Both submitblock RPC and P2P block handling call ProcessNewBlock,
+   which internally calls AcceptBlock → ActivateBestChain (ConnectBlock).
+
+   Return value mirrors validate_block_with_utxos:
+     AB_ok (fees, txid_arr, spent_utxos)
+     AB_err error
+
+   DO NOT call connect_block / apply_block_atomic inside this function.
+   Callers are responsible for UTXO mutations after accept_block succeeds.
+
+   Porting note (wave-31 refactor): this replaces the per-entry-point
+   hand-rolled check sequences that caused camlcoin to appear on the
+   consensus-bug list in waves 3, 7, 15, 22, and 23.  The submitblock
+   path previously called check_block (line ~566 mining.ml) and THEN
+   validate_block_with_utxos (which calls check_block again internally),
+   running check_block twice.  The IBD path called validate_block_with_utxos
+   once.  Both now call accept_block which defers entirely to
+   validate_block_with_utxos (single entry for all structural + contextual
+   checks). *)
+
+type accept_block_result =
+  | AB_ok of int64 * Types.hash256 array * (Types.outpoint * utxo) list
+  | AB_err of block_validation_error
+
+let accept_block
+    ~(network : Consensus.network_config)
+    ~(block : Types.block)
+    ~(height : int)
+    ~(expected_bits : int32)
+    ~(median_time : int32)
+    ~(base_lookup : utxo_lookup)
+    ~(flags : int)
+    ?(skip_scripts = false)
+    ?get_mtp_at_height
+    ()
+    : accept_block_result =
+  match validate_block_with_utxos ~network block height
+          ~expected_bits ~median_time
+          ~base_lookup ~flags ~skip_scripts
+          ?get_mtp_at_height () with
+  | Ok (fees, txid_arr, spent_utxos) ->
+    AB_ok (fees, txid_arr, spent_utxos)
+  | Error e ->
+    AB_err e

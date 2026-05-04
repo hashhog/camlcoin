@@ -1128,20 +1128,26 @@ let run_background_validation
               }
             | None -> None
           in
-          match Validation.validate_block_with_utxos ~network block next_height
+          (* accept_block: unified ProcessNewBlock check pipeline.
+             The assumeutxo background validator applies the same check
+             sequence as all other block-acceptance paths, ensuring that
+             the background IBD chain reaches the same consensus state as
+             a from-genesis sync would.
+             Reference: bitcoin-core/src/validation.cpp ProcessNewBlock. *)
+          match Validation.accept_block ~network ~block ~height:next_height
                   ~expected_bits:header_entry.header.bits
                   ~median_time
                   ~base_lookup
                   ~flags
                   ~skip_scripts:false
                   () with
-          | Error e ->
+          | Validation.AB_err e ->
             bg_validation.state <- BgFailed (Validation.block_error_to_string e);
             snapshot_chainstate.assumeutxo_state <- Invalid;
             Logs.err (fun m -> m "[assumeutxo] Background validation failed at height %d: %s"
                         next_height (Validation.block_error_to_string e));
             Lwt.return_unit
-          | Ok (_fees, _txid_arr, _spent_utxos) ->
+          | Validation.AB_ok (_fees, _txid_arr, _spent_utxos) ->
             (* Update IBD chainstate UTXO set with the block's changes *)
             (match connect_block_to_cache ~cache:ibd_chainstate.utxo_cache
                      ~block ~height:next_height () with

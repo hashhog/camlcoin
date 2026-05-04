@@ -1709,17 +1709,26 @@ module Validation_worker = struct
       match take_req req with
       | Shutdown -> ()
       | Validate j ->
+        (* accept_block: unified ProcessNewBlock check pipeline.
+           Same sequence as process_new_block, connect_stored_blocks, and
+           submit_block. Using accept_block here ensures the IBD worker
+           Domain applies identical validation logic to the main-thread paths.
+           Reference: bitcoin-core/src/validation.cpp ProcessNewBlock. *)
         let r =
           try
-            Ok (Validation.validate_block_with_utxos j.block j.height
-                  ~expected_bits:j.expected_bits
-                  ~median_time:j.median_time
-                  ~base_lookup:j.lookup
-                  ~flags:j.flags
-                  ~skip_scripts:j.skip_scripts
-                  ~network:j.network
-                  ?get_mtp_at_height:j.get_mtp_at_height
-                  ())
+            (match Validation.accept_block
+                     ~network:j.network ~block:j.block ~height:j.height
+                     ~expected_bits:j.expected_bits
+                     ~median_time:j.median_time
+                     ~base_lookup:j.lookup
+                     ~flags:j.flags
+                     ~skip_scripts:j.skip_scripts
+                     ?get_mtp_at_height:j.get_mtp_at_height
+                     () with
+             | Validation.AB_ok (fees, txid_arr, spent) ->
+               Ok (Ok (fees, txid_arr, spent))
+             | Validation.AB_err e ->
+               Ok (Error e))
           with exn -> Error exn
         in
         put_resp resp r;
@@ -1848,12 +1857,17 @@ let process_downloaded_blocks ?(max_blocks = 1)
             } in
             Validation_worker.submit_lwt w job
           | None ->
+            (* accept_block: same unified pipeline as the worker path.
+               This inline branch is used in tests and post-IBD single-block
+               connects that don't use the Domain worker. *)
             Lwt.return (
-              Validation.validate_block_with_utxos block height
-                ~expected_bits ~median_time ~base_lookup:lookup
-                ~flags:validation_flags ~skip_scripts
-                ~network:ibd.chain.network
-                ~get_mtp_at_height:(get_mtp_for_height ibd.chain) ())
+              match Validation.accept_block
+                      ~network:ibd.chain.network ~block ~height
+                      ~expected_bits ~median_time ~base_lookup:lookup
+                      ~flags:validation_flags ~skip_scripts
+                      ~get_mtp_at_height:(get_mtp_for_height ibd.chain) () with
+              | Validation.AB_ok (fees, txid_arr, spent) -> Ok (fees, txid_arr, spent)
+              | Validation.AB_err e -> Error e)
         in
         (match vresult with
          | Ok (_fees, txid_arr, spent_utxo_list) ->
@@ -2344,12 +2358,15 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
               if skip_scripts then 0
               else Consensus.get_block_script_flags height state.network
             in
-            (match Validation.validate_block_with_utxos block height
+            (* accept_block: unified ProcessNewBlock check pipeline,
+               same as all other block-acceptance paths.
+               Reference: bitcoin-core/src/validation.cpp ProcessNewBlock. *)
+            (match Validation.accept_block
+                     ~network:state.network ~block ~height
                      ~expected_bits ~median_time ~base_lookup:lookup
                      ~flags:validation_flags ~skip_scripts
-                     ~network:state.network
                      ~get_mtp_at_height:(get_mtp_for_height state) () with
-             | Ok (_fees, _txid_arr, _spent_utxos) ->
+             | Validation.AB_ok (_fees, _txid_arr, _spent_utxos) ->
                (* Store block if not already stored *)
                if not (Storage.ChainDB.has_block state.db entry.hash) then
                  Storage.ChainDB.store_block state.db entry.hash block;
@@ -2407,7 +2424,7 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
                zmq_notify_block ibd block entry.hash true;
                Logs.debug (fun m ->
                  m "Connected block at height %d during reorg" height)
-             | Error e ->
+             | Validation.AB_err e ->
                (* During reorg, blocks come from storage so no peer_id
                   is available; log misbehavior if we ever gain context *)
                (match ibd.misbehavior_handler with
@@ -2669,12 +2686,15 @@ let rec connect_stored_blocks (state : chain_state) : int =
         let validation_flags =
           Consensus.get_block_script_flags next_height state.network
         in
-        match Validation.validate_block_with_utxos stored_block next_height
+        (* accept_block: unified ProcessNewBlock check pipeline.
+           Same sequence as process_new_block and submit_block.
+           Reference: bitcoin-core/src/validation.cpp ProcessNewBlock. *)
+        match Validation.accept_block
+                ~network:state.network ~block:stored_block ~height:next_height
                 ~expected_bits ~median_time ~base_lookup:lookup
                 ~flags:validation_flags ~skip_scripts:false
-                ~network:state.network
                 ~get_mtp_at_height:(get_mtp_for_height state) () with
-        | Ok (_fees, txid_arr, _spent_utxos) ->
+        | Validation.AB_ok (_fees, txid_arr, _spent_utxos) ->
           let ops = ref [] in
           List.iteri (fun tx_idx tx ->
             let is_cb = (tx_idx = 0) in
@@ -2713,7 +2733,7 @@ let rec connect_stored_blocks (state : chain_state) : int =
             m "Connected stored block %s at height %d (catch-up from gap-fill)"
               (Types.hash256_to_hex_display entry.hash) next_height);
           1 + connect_stored_blocks state
-        | Error e ->
+        | Validation.AB_err e ->
           let msg = Validation.block_error_to_string e in
           Logs.warn (fun m ->
             m "Stored block at height %d failed validation: %s" next_height msg);
@@ -2794,12 +2814,18 @@ let process_new_block (state : chain_state) (block : Types.block)
         let validation_flags =
           Consensus.get_block_script_flags height state.network
         in
-        match Validation.validate_block_with_utxos block height
+        (* accept_block: unified ProcessNewBlock check pipeline.
+           Mirrors Bitcoin Core's AcceptBlock → CheckBlock →
+           ContextualCheckBlock → ConnectBlock validation sequence.
+           Both submitblock RPC and this P2P path go through accept_block,
+           guaranteeing identical check semantics.
+           Reference: bitcoin-core/src/validation.cpp ProcessNewBlock. *)
+        match Validation.accept_block
+                ~network:state.network ~block ~height
                 ~expected_bits ~median_time ~base_lookup:lookup
                 ~flags:validation_flags ~skip_scripts:false
-                ~network:state.network
                 ~get_mtp_at_height:(get_mtp_for_height state) () with
-        | Ok (_fees, txid_arr, _spent_utxos) ->
+        | Validation.AB_ok (_fees, txid_arr, _spent_utxos) ->
           (* Store the block *)
           Storage.ChainDB.store_block state.db hash block;
           (* Collect UTXO mutations for a single atomic block commit *)
@@ -2856,7 +2882,7 @@ let process_new_block (state : chain_state) (block : Types.block)
               m "Connected %d additional stored blocks, tip now at %d"
                 connected state.blocks_synced);
           Ok ()
-        | Error e ->
+        | Validation.AB_err e ->
           let msg = Validation.block_error_to_string e in
           Logs.warn (fun m ->
             m "Block %s at height %d failed validation: %s"

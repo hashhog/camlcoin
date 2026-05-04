@@ -579,6 +579,19 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
       else begin
         let height = validated_height + 1 in
 
+        (* Context-free block validation: coinbase scriptSig length cap (bad-cb-length),
+           witness commitment recomputation (bad-witness-merkle-match), merkle root,
+           sigops, weight, etc.  Mirrors Bitcoin Core CheckBlock() which runs before
+           ConnectBlock().
+           Reference: bitcoin-core/src/validation.cpp CheckBlock
+                      bitcoin-core/src/consensus/tx_check.cpp:49 (bad-cb-length)
+                      bitcoin-core/src/validation.cpp:3870-3901 (bad-witness-merkle-match) *)
+        let median_time = Sync.compute_median_time_past chain height in
+        (match Validation.check_block ~network:chain.network block height
+               ~expected_bits:block.header.bits ~median_time with
+        | Error e -> Error (Validation.block_error_to_string e)
+        | Ok () ->
+
         (* During IBD with headers-first sync, the header is already in the chain.
            Look up existing entry or validate as new. *)
         let entry_result = match Sync.validate_header chain block.header with
@@ -640,5 +653,5 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
              Logs.info (fun m -> m "Accepted mined block at height %d: %s"
                height (Types.hash256_to_hex_display hash));
 
-             Ok ())
+             Ok ()))
       end

@@ -1488,6 +1488,8 @@ let bip22_of_submitblock_error (msg : string) : string =
   else if c "timestamp" then "time-too-old"
   else if c "script verification failed" then "mandatory-script-verify-flag-failed"
   else if c "missing inputs" || c "missing or spent" then "bad-txns-inputs-missingorspent"
+  (* Negative output value: consensus/tx_check.cpp::CheckTransaction — Core parity *)
+  else if c "has negative value" then "bad-txns-vout-negative"
   else "rejected"
 
 let handle_submitblock (ctx : rpc_context)

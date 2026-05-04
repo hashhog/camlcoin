@@ -586,9 +586,9 @@ let regtest : network_config = {
   wif_prefix = 0xEF;
   bech32_hrp = "bcrt";
   bip34_height = 1;  (* Bitcoin Core kernel/chainparams.cpp:536: consensus.BIP34Height = 1 *)
-  bip65_height = 1351;
-  bip66_height = 1251;
-  csv_height = 432;  (* CSV active early in regtest for testing *)
+  bip65_height = 1;  (* Bitcoin Core kernel/chainparams.cpp:538: consensus.BIP65Height = 1 *)
+  bip66_height = 1;  (* Bitcoin Core kernel/chainparams.cpp:539: consensus.BIP66Height = 1 *)
+  csv_height = 1;    (* Bitcoin Core kernel/chainparams.cpp:540: consensus.CSVHeight = 1 *)
   segwit_height = 0;  (* SegWit active from genesis *)
   taproot_height = 0;  (* Taproot active from genesis *)
   pow_allow_min_difficulty = true;

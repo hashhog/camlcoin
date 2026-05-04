@@ -579,32 +579,19 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
       else begin
         let height = validated_height + 1 in
 
-        (* Context-free block validation: coinbase scriptSig length cap (bad-cb-length),
-           witness commitment recomputation (bad-witness-merkle-match), merkle root,
-           sigops, weight, etc.  Mirrors Bitcoin Core CheckBlock() which runs before
-           ConnectBlock().
-           Reference: bitcoin-core/src/validation.cpp CheckBlock
-                      bitcoin-core/src/consensus/tx_check.cpp:49 (bad-cb-length)
-                      bitcoin-core/src/validation.cpp:3870-3901 (bad-witness-merkle-match) *)
+        (* Unified block validation via accept_block — mirrors Bitcoin Core's
+           ProcessNewBlock pipeline (AcceptBlock → CheckBlock →
+           ContextualCheckBlock → ConnectBlock checks).
+           Both the context-free checks (merkle, sigops, weight, coinbase
+           script length, witness commitment) and the UTXO-aware checks
+           (BIP-30 dup-UTXO, per-input scripts, BIP-141 weighted sigops,
+           coinbase value ≤ subsidy+fees, BIP-68 sequence locks) are
+           performed inside accept_block via validate_block_with_utxos.
+           This eliminates the former double-call pattern (check_block then
+           validate_block_with_utxos) and keeps the check sequence in sync
+           with the IBD path (Sync.process_new_block uses accept_block too).
+           Reference: bitcoin-core/src/validation.cpp ProcessNewBlock. *)
         let median_time = Sync.compute_median_time_past chain height in
-        (match Validation.check_block ~network:chain.network block height
-               ~expected_bits:block.header.bits ~median_time with
-        | Error e -> Error (Validation.block_error_to_string e)
-        | Ok () ->
-
-        (* Full contextual validation with UTXO access: BIP-30 duplicate-UTXO,
-           per-input script verification, BIP-141 weighted sigops cost budget,
-           and coinbase value ≤ subsidy + fees.  These four checks are present
-           in the IBD path (Sync.process_new_block → validate_block_with_utxos)
-           but were missing on the submitblock path because connect_block_optimized
-           only does UTXO mutation, not validation.
-           Reference: Bitcoin Core ProcessNewBlock → AcceptBlock → CheckBlock →
-                      ContextualCheckBlock → ConnectBlock (validation.cpp).
-           Code comments in check_block already acknowledge the gap:
-             "Sigop cost check is deferred to validate_block_with_utxos"
-             "Coinbase value check is deferred to validate_block_with_utxos"
-           This call is read-only: validate_block_with_utxos does not mutate
-           the UTXO set.  connect_block_optimized below still handles mutations. *)
         let base_lookup (outpoint : Types.outpoint) : Validation.utxo option =
           let txid = outpoint.Types.txid in
           let vout = Int32.to_int outpoint.Types.vout in
@@ -646,14 +633,14 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
         let validation_flags =
           Consensus.get_block_script_flags height chain.network
         in
-        (match Validation.validate_block_with_utxos block height
+        (match Validation.accept_block
+                 ~network:chain.network ~block ~height
                  ~expected_bits:block.header.bits ~median_time
                  ~base_lookup ~flags:validation_flags
                  ~skip_scripts:false
-                 ~network:chain.network
                  ~get_mtp_at_height:(Sync.get_mtp_for_height chain) () with
-        | Error e -> Error (Validation.block_error_to_string e)
-        | Ok _ ->
+        | Validation.AB_err e -> Error (Validation.block_error_to_string e)
+        | Validation.AB_ok _ ->
 
         (* During IBD with headers-first sync, the header is already in the chain.
            Look up existing entry or validate as new. *)
@@ -716,5 +703,5 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
              Logs.info (fun m -> m "Accepted mined block at height %d: %s"
                height (Types.hash256_to_hex_display hash));
 
-             Ok ())))
+             Ok ()))
       end

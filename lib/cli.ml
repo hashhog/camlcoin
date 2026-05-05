@@ -21,7 +21,14 @@ type config = {
   connect : string list;  (* manual peer addresses *)
   debug : bool;
   wallet_enabled : bool;
-  prune : int;  (* 0 = no pruning *)
+  prune : int;
+    (* Pruning target in BYTES (after MiB→bytes conversion at the CLI
+       layer in [bin/main.ml]). Bitcoin Core --prune semantics
+       (init.cpp:524):
+         0           = pruning disabled
+         1           = manual mode (auto-prune off; manual RPC only — TODO)
+         N * 1MiB    = automatic prune target where N >= 550 MiB
+       Values 2..549 are rejected at CLI parse. *)
   log_categories : string list;  (* empty = all enabled *)
   metrics_port : int;  (* Prometheus metrics port, 0 = disabled *)
   peer_bloom_filters : bool;

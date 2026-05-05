@@ -1500,6 +1500,11 @@ let bip22_of_submitblock_error (msg : string) : string =
   else if c "has negative value" then "bad-txns-vout-negative"
   (* Output value > MAX_MONEY: consensus/tx_check.cpp::CheckTransaction — Core parity *)
   else if c "exceeds MAX_MONEY" then "bad-txns-vout-toolarge"
+  (* Non-coinbase tx where sum(inputs) < sum(outputs).
+     Core consensus/tx_verify.cpp::CheckTxInputs:
+       state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout", ...)
+     validation.ml emits "transaction fee is insufficient" for TxInsufficientFee. *)
+  else if c "fee is insufficient" then "bad-txns-in-belowout"
   else "rejected"
 
 let handle_submitblock (ctx : rpc_context)

@@ -492,20 +492,26 @@ let restore_chain_state (db : Storage.ChainDB.t)
 let avg_block_size_bytes = 1_500_000
 
 (* Prune old block data to save disk space.
-   [prune_target] is in BYTES (Bitcoin Core convention). The keep window is
-   derived as [target_bytes / avg_block_size_bytes], floored at 288
+   [prune_target] is in BYTES (Bitcoin Core convention), or the literal
+   sentinel value [1] for `--prune=1` manual mode (init.cpp:524 /
+   blockmanager_args.cpp:27): node is in prune mode but automatic prunes
+   do NOT fire — only the pruneblockchain RPC may delete data. Maps to
+   Core's unreachable PRUNE_TARGET_MANUAL = uint64::MAX sentinel.
+
+   The keep window for automatic mode is derived as
+   [target_bytes / avg_block_size_bytes], floored at 288
    (MIN_BLOCKS_TO_KEEP). Also deletes undo data for very old blocks beyond
    the keep window + 288.
    Reference: bitcoin-core/src/node/blockstorage.cpp FindFilesToPrune. *)
 let prune_old_blocks (state : chain_state) (current_height : int) : unit =
   if state.prune_target <= 0 then ()
+  else if state.prune_target = 1 then
+    (* `--prune=1` manual-mode sentinel: in prune mode, but auto-prune
+       trigger never fires. The pruneblockchain RPC (when shipped) is
+       the only path that may advance prune_height. *)
+    ()
   else
     let min_keep = 288 in  (* Bitcoin Core MIN_BLOCKS_TO_KEEP *)
-    (* Convert byte target to a rough block-count keep window. With
-       prune_target=1 (manual sentinel), the divisor pins keep_blocks at
-       min_keep and auto-prune effectively keeps everything within 288 of
-       the tip; future manual-mode work will short-circuit this branch
-       entirely. *)
     let target_blocks = state.prune_target / avg_block_size_bytes in
     let keep_blocks = max target_blocks min_keep in
     let prune_below = current_height - keep_blocks in

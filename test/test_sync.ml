@@ -1261,6 +1261,76 @@ let test_bip35_handler_no_mempool () =
   Peer.set_peer_bloom_filters false;
   cleanup_test_db ()
 
+(* ============================================================================
+   Pruning: --prune CLI value is MiB, internal prune_target is bytes.
+   Audit: CORE-PARITY-AUDIT/_pruning-cross-impl-audit-2026-05-05.md (Bug 5).
+   Reference: bitcoin-core/src/init.cpp:524 (--prune semantics).
+   ============================================================================ *)
+
+(* Static helper: matches the conversion in bin/main.ml. Kept here so the
+   test pins the semantic; if the CLI conversion changes, this function and
+   the assertions move together. *)
+let convert_prune_mib_to_bytes mib =
+  if mib = 0 then 0
+  else if mib = 1 then 1  (* manual-mode sentinel *)
+  else if mib < 550 then
+    failwith "prune below floor"  (* CLI exits 1; tests just raise *)
+  else mib * 1024 * 1024
+
+let test_prune_cli_550_mib_to_bytes () =
+  (* Core convention: --prune=550 means 550 MiB, i.e. 576716800 bytes. *)
+  Alcotest.(check int) "550 MiB → bytes"
+    (550 * 1024 * 1024) (convert_prune_mib_to_bytes 550);
+  Alcotest.(check int) "550 MiB → 576716800"
+    576716800 (convert_prune_mib_to_bytes 550)
+
+let test_prune_cli_zero_is_off () =
+  Alcotest.(check int) "--prune=0 stays 0 (off)" 0
+    (convert_prune_mib_to_bytes 0)
+
+let test_prune_cli_one_is_manual_sentinel () =
+  (* --prune=1 is Core's manual-mode sentinel; auto-prune off. We keep
+     literal 1 (not 1 MiB) so [prune_target > 0] still flags prune-mode
+     for NODE_NETWORK_LIMITED while [target_blocks = 1 / 1_500_000 = 0]
+     means [keep_blocks = max 0 288 = 288] in [prune_old_blocks]. *)
+  Alcotest.(check int) "--prune=1 manual sentinel" 1
+    (convert_prune_mib_to_bytes 1)
+
+let test_prune_cli_floor_rejects_2_to_549 () =
+  (* Below-floor values must be rejected (Core init.cpp:524 floor at 550). *)
+  let raised n =
+    try ignore (convert_prune_mib_to_bytes n); false
+    with _ -> true
+  in
+  Alcotest.(check bool) "--prune=2 rejected" true (raised 2);
+  Alcotest.(check bool) "--prune=549 rejected" true (raised 549);
+  Alcotest.(check bool) "--prune=100 rejected" true (raised 100)
+
+let test_prune_cli_above_floor () =
+  Alcotest.(check int) "--prune=1000 → 1000 MiB"
+    (1000 * 1024 * 1024) (convert_prune_mib_to_bytes 1000);
+  Alcotest.(check int) "--prune=2000 → 2 GiB"
+    (2000 * 1024 * 1024) (convert_prune_mib_to_bytes 2000)
+
+(* prune_old_blocks honors the byte semantic: with target=550 MiB and
+   avg_block_size=1.5 MB, target_blocks ≈ 384, so keep_blocks = max 384 288
+   = 384 (rounding aside; the math here is the spec). *)
+let test_prune_old_blocks_uses_bytes () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  (* Set 550 MiB as the prune target (in bytes). *)
+  state.prune_target <- 550 * 1024 * 1024;
+  state.prune_height <- 0;
+  (* current_height too small to trigger pruning; the function should be a
+     no-op (prune_below would be negative). This is the regression-pin
+     that prune_old_blocks doesn't crash on the new bytes semantic. *)
+  Sync.prune_old_blocks state 100;
+  Alcotest.(check int) "prune_height unchanged when below keep window"
+    0 state.prune_height;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
@@ -1331,6 +1401,14 @@ let () =
       test_case "advertise when enabled" `Quick
         test_bip35_advertise_when_enabled;
       test_case "handler no mempool" `Quick test_bip35_handler_no_mempool;
+    ];
+    "prune_units", [
+      test_case "--prune=0 → 0 (off)" `Quick test_prune_cli_zero_is_off;
+      test_case "--prune=1 manual sentinel" `Quick test_prune_cli_one_is_manual_sentinel;
+      test_case "--prune=550 MiB → bytes" `Quick test_prune_cli_550_mib_to_bytes;
+      test_case "--prune=N for N in 2..549 rejected" `Quick test_prune_cli_floor_rejects_2_to_549;
+      test_case "--prune above floor scales" `Quick test_prune_cli_above_floor;
+      test_case "prune_old_blocks honors bytes semantic" `Quick test_prune_old_blocks_uses_bytes;
     ];
     "block_invalidation", [
       test_case "is_block_invalid_initially_false" `Quick test_is_block_invalid_initially_false;

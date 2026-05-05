@@ -76,19 +76,30 @@ let peer_bloom_filters : bool ref = ref false
 let set_peer_bloom_filters (b : bool) : unit =
   peer_bloom_filters := b
 
+(* BIP-159 NODE_NETWORK_LIMITED advertisement gate.  Set at startup by
+   [Cli.run] from [config.prune > 0].  When ON, [our_services ()] OR's
+   in the [network_limited] flag so the version handshake signals that
+   we serve only the recent ~288-block window.  Mirrors Core's
+   `init.cpp` (`nLocalServices |= NODE_NETWORK_LIMITED` when
+   `IsPruneMode()` is true). *)
+let prune_mode_advertise : bool ref = ref false
+
+let set_prune_mode_advertise (b : bool) : unit =
+  prune_mode_advertise := b
+
 (* Our node's advertised services: full node with witness support, plus
-   NODE_BLOOM iff [peer_bloom_filters] is set.  Returns a fresh record on
-   every call so callers see the current value of the flag.  When the flag
-   is OFF (Core default) we advertise NODE_NETWORK | NODE_WITNESS = 9; when
-   ON (operator opt-in) we advertise NODE_NETWORK | NODE_BLOOM | NODE_WITNESS
-   = 13. *)
+   NODE_BLOOM iff [peer_bloom_filters] is set, plus NODE_NETWORK_LIMITED
+   iff [prune_mode_advertise] is set.  Returns a fresh record on every
+   call so callers see the current values of the flags.  Core advertises
+   NODE_NETWORK alongside NODE_NETWORK_LIMITED in the auto-prune case
+   (the node still has the recent-288 window). *)
 let our_services () : peer_services = {
   network = true;
   getutxo = false;
   bloom = !peer_bloom_filters;
   witness = true;
   compact_filters = false;
-  network_limited = false;
+  network_limited = !prune_mode_advertise;
 }
 
 (* Connection and read timeouts *)

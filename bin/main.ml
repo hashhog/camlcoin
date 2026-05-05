@@ -71,9 +71,20 @@ let no_wallet_arg =
   Arg.(value & flag & info ["disablewallet"] ~doc)
 
 let prune_arg =
-  let doc = "Prune old blocks to reduce disk usage. 0 = no pruning." in
+  (* Bitcoin Core --prune semantics (init.cpp:524):
+       0      = pruning disabled
+       1      = manual mode (only RPC pruneblockchain triggers; no auto-prune)
+       >= 550 = automatic prune target in MiB (550 MiB minimum)
+       2..549 = rejected as below floor *)
+  let doc = "Reduce storage requirements by enabling pruning (deleting) of \
+             old blocks. This allows the pruneblockchain RPC to be called to \
+             delete specific blocks and enables automatic pruning of old \
+             blocks if a target size in MiB is provided. \
+             0 = disable pruning blocks, 1 = allow manual pruning via RPC, \
+             >=550 = automatically prune block files to stay under the \
+             specified target size in MiB." in
   Arg.(value & opt int 0 &
-    info ["prune"] ~docv:"SIZE" ~doc)
+    info ["prune"] ~docv:"MIB" ~doc)
 
 let benchmark_arg =
   let doc = "Run performance benchmarks and exit." in
@@ -245,11 +256,33 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       ~cli:(if max_inbound = 117 then None else Some max_inbound)
       ~conf:(Camlcoin.Runtime_config.get_int conf_opts "maxinbound")
       ~default:max_inbound in
-  let eff_prune =
+  let eff_prune_mib =
     Camlcoin.Runtime_config.overlay_int
       ~cli:(if prune = 0 then None else Some prune)
       ~conf:(Camlcoin.Runtime_config.get_int conf_opts "prune")
       ~default:prune in
+  (* Bitcoin Core --prune floor validation (init.cpp:524-540):
+       0      → off
+       1      → manual mode (kept; auto-prune gated separately by sync.ml)
+       2..549 → rejected (below MIN_DISK_SPACE_FOR_BLOCK_FILES = 550 MiB)
+       ≥550   → automatic prune target.
+     Convert MiB → bytes per Core convention. The internal
+     [chain.prune_target] field carries bytes after this conversion;
+     `--prune=1` (manual mode) is kept as a literal 1-byte sentinel,
+     since 0 means off. *)
+  let eff_prune =
+    if eff_prune_mib = 0 then 0
+    else if eff_prune_mib = 1 then 1  (* manual-mode sentinel *)
+    else if eff_prune_mib < 550 then begin
+      Logs.err (fun m ->
+        m "Invalid --prune=%d: must be 0 (off), 1 (manual), or \
+           >= 550 (target in MiB). Bitcoin Core rejects values below \
+           MIN_DISK_SPACE_FOR_BLOCK_FILES (550 MiB) at init.cpp:524."
+          eff_prune_mib);
+      exit 1
+    end else
+      eff_prune_mib * 1024 * 1024
+  in
   let eff_metrics_port =
     Camlcoin.Runtime_config.overlay_int
       ~cli:(if metrics_port = 9332 then None else Some metrics_port)

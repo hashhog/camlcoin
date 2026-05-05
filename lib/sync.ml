@@ -115,7 +115,15 @@ type chain_state = {
   mutable sync_peer : int option;
   mutable headers_synced : int;
   mutable blocks_synced : int;
-  mutable prune_target : int;    (* 0 = no pruning, else keep this many blocks *)
+  mutable prune_target : int;
+    (* Pruning target in BYTES (Bitcoin Core convention; init.cpp:524).
+         0           = disabled
+         1           = manual mode (CLI sentinel; auto-prune does not fire,
+                       only the pruneblockchain RPC triggers a sweep — TODO)
+         N >= 550 MiB (in bytes) = automatic target.
+       The CLI converts --prune=N (MiB) to bytes before assigning here.
+       [prune_old_blocks] derives a block-count keep window from this
+       byte target via an average-block-size constant. *)
   mutable prune_height : int;    (* last pruned height *)
   headers_from_peer : (int, int) Hashtbl.t;  (* peer_id -> header count from that peer *)
   mutable invalidated_blocks : (string, unit) Hashtbl.t;  (* manually invalidated block hashes *)
@@ -477,14 +485,29 @@ let restore_chain_state (db : Storage.ChainDB.t)
     (* No stored state, create fresh with genesis *)
     create_chain_state db network
 
+(* Average block size used to convert a byte-denominated [prune_target] into
+   a block-count keep window. 1.5 MB matches lunarblock's AVG_BLOCK_SIZE
+   (src/prune.lua:41) and is a conservative-on-the-keep-side estimate for
+   post-segwit mainnet (avg ~1.3 MB; matters only as a soft target). *)
+let avg_block_size_bytes = 1_500_000
+
 (* Prune old block data to save disk space.
-   Keeps at least min_keep (288) blocks, matching Bitcoin Core MIN_BLOCKS_TO_KEEP.
-   Also deletes undo data for very old blocks beyond the keep window + 288. *)
+   [prune_target] is in BYTES (Bitcoin Core convention). The keep window is
+   derived as [target_bytes / avg_block_size_bytes], floored at 288
+   (MIN_BLOCKS_TO_KEEP). Also deletes undo data for very old blocks beyond
+   the keep window + 288.
+   Reference: bitcoin-core/src/node/blockstorage.cpp FindFilesToPrune. *)
 let prune_old_blocks (state : chain_state) (current_height : int) : unit =
   if state.prune_target <= 0 then ()
   else
     let min_keep = 288 in  (* Bitcoin Core MIN_BLOCKS_TO_KEEP *)
-    let keep_blocks = max state.prune_target min_keep in
+    (* Convert byte target to a rough block-count keep window. With
+       prune_target=1 (manual sentinel), the divisor pins keep_blocks at
+       min_keep and auto-prune effectively keeps everything within 288 of
+       the tip; future manual-mode work will short-circuit this branch
+       entirely. *)
+    let target_blocks = state.prune_target / avg_block_size_bytes in
+    let keep_blocks = max target_blocks min_keep in
     let prune_below = current_height - keep_blocks in
     if prune_below <= state.prune_height then ()
     else begin
@@ -658,6 +681,19 @@ let get_header_at_height (state : chain_state) (height : int)
     : header_entry option =
   match Storage.ChainDB.get_hash_at_height state.db height with
   | Some hash -> Hashtbl.find_opt state.headers (Cstruct.to_string hash)
+  | None -> None
+
+(* Look up a block's height via the in-memory header table.  Returns [None]
+   if the header is not in memory (the block predates the running process
+   and is not in the loaded header set).  Used by the BIP-159 peer-served-
+   blocks gate in [Cli.run]: when prune mode is on, we refuse to serve
+   blocks below tip - 288 even if [Storage.ChainDB.get_block] could return
+   them.  Best-effort only — if we don't know the height, the gate falls
+   through to the existing serve-or-notfound path. *)
+let lookup_block_height (state : chain_state) (hash : Types.hash256)
+    : int option =
+  match Hashtbl.find_opt state.headers (Cstruct.to_string hash) with
+  | Some entry -> Some entry.height
   | None -> None
 
 (* The validated-block tip — the header_entry for the highest block that has

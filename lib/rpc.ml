@@ -230,6 +230,30 @@ let make_get_block (chain : Sync.chain_state) (h : int)
     }
 
 (* ============================================================================
+   Formatting Helpers (used by multiple handlers below)
+   ============================================================================ *)
+
+(* Render a Cstruct as a lowercase hex string. *)
+let cstruct_to_hex_early (cs : Cstruct.t) : string =
+  let len = Cstruct.length cs in
+  let buf = Buffer.create (len * 2) in
+  for i = 0 to len - 1 do
+    Buffer.add_string buf (Printf.sprintf "%02x" (Cstruct.get_uint8 cs i))
+  done;
+  Buffer.contents buf
+
+(* Convert compact bits to 64-char big-endian hex target string (Core format).
+   compact_to_target returns little-endian (byte 0 = LSB); iterate 31..0 for
+   MSB-first display order matching Bitcoin Core. *)
+let bits_to_target_hex (bits : int32) : string =
+  let target = Consensus.compact_to_target bits in
+  let buf = Buffer.create 64 in
+  for i = 31 downto 0 do
+    Buffer.add_string buf (Printf.sprintf "%02x" (Cstruct.get_uint8 target i))
+  done;
+  Buffer.contents buf
+
+(* ============================================================================
    Blockchain Info Handlers
    ============================================================================ *)
 
@@ -249,6 +273,18 @@ let handle_getblockchaininfo (ctx : rpc_context)
     | Some t -> Types.hash256_to_hex_display t.total_work
     | None -> "0000000000000000000000000000000000000000000000000000000000000000"
   in
+  let tip_bits_hex = match tip_entry with
+    | Some t -> Printf.sprintf "%08lx" t.header.bits
+    | None -> "1d00ffff"
+  in
+  let tip_target_hex = match tip_entry with
+    | Some t -> bits_to_target_hex t.header.bits
+    | None -> String.make 64 '0'
+  in
+  let tip_time = match tip_entry with
+    | Some t -> Int32.to_int t.header.timestamp
+    | None -> 0
+  in
   let validated_height = ctx.chain.blocks_synced in
   (* Build softforks using the shared helper so the data matches
      getdeploymentinfo exactly — same source, same state machine. *)
@@ -262,6 +298,7 @@ let handle_getblockchaininfo (ctx : rpc_context)
     ("headers", `Int ctx.chain.headers_synced);
     ("bestblockhash", `String tip_hash);
     ("difficulty", `Float difficulty);
+    ("time", `Int tip_time);
     ("mediantime", `Int 0);
     ("verificationprogress", `Float
       (if ctx.chain.headers_synced = 0 then 0.0
@@ -270,6 +307,8 @@ let handle_getblockchaininfo (ctx : rpc_context)
     ("initialblockdownload",
       `Bool (ctx.chain.sync_state <> Sync.FullySynced));
     ("chainwork", `String chainwork);
+    ("bits", `String tip_bits_hex);
+    ("target", `String tip_target_hex);
     ("size_on_disk", `Int 0);
     ("pruned", `Bool (ctx.chain.prune_target > 0));
   ] @
@@ -351,11 +390,38 @@ let handle_getblock (ctx : rpc_context)
          ("mediantime", `Int (Int32.to_int median_time));
          ("nonce", `Int (Int32.to_int block.header.nonce));
          ("bits", `String (Printf.sprintf "%08lx" block.header.bits));
+         ("target", `String (bits_to_target_hex block.header.bits));
          ("difficulty", `Float (Consensus.difficulty_from_bits block.header.bits));
          ("chainwork", `String chainwork);
          ("nTx", `Int (List.length block.transactions));
          ("previousblockhash", `String
            (Types.hash256_to_hex_display block.header.prev_block));
+         ("coinbase_tx",
+           (match block.transactions with
+            | [] -> `Null
+            | cb :: _ ->
+              let seq_val = match cb.Types.inputs with
+                | inp :: _ -> Int32.to_int inp.Types.sequence
+                | [] -> 0
+              in
+              let script_hex = match cb.Types.inputs with
+                | inp :: _ -> cstruct_to_hex_early inp.Types.script_sig
+                | [] -> ""
+              in
+              let witness_hex = match cb.Types.witnesses with
+                | w :: _ when w.Types.items <> [] ->
+                  Some (cstruct_to_hex_early (List.hd w.Types.items))
+                | _ -> None
+              in
+              let base = [
+                ("version", `Int (Int32.to_int cb.Types.version));
+                ("locktime", `Int (Int32.to_int cb.Types.locktime));
+                ("sequence", `Int seq_val);
+                ("coinbase", `String script_hex);
+              ] in
+              `Assoc (match witness_hex with
+                | Some h -> base @ [("witness", `String h)]
+                | None -> base)));
        ]))
   | _ ->
     Error "Invalid parameters: expected [blockhash] or [blockhash, verbosity]"
@@ -1045,21 +1111,34 @@ let handle_getpeerinfo (ctx : rpc_context) : Yojson.Safe.t =
       ("relaytxes", `Bool stats.stat_relay);
       ("lastsend", `Int (int_of_float stats.stat_last_seen));
       ("lastrecv", `Int (int_of_float stats.stat_last_seen));
+      ("last_transaction", `Int 0);
+      ("last_block", `Int 0);
       ("bytessent", `Int stats.stat_bytes_sent);
       ("bytesrecv", `Int stats.stat_bytes_received);
       ("conntime", `Int (int_of_float stats.stat_last_seen));
       ("timeoffset", `Int (Int64.to_int stats.stat_time_offset));
       ("pingtime", `Float (stats.stat_latency_ms /. 1000.0));
+      ("minping", `Float (stats.stat_latency_ms /. 1000.0));
       ("version", `Int (Int32.to_int stats.stat_protocol_version));
       ("subver", `String stats.stat_user_agent);
       ("inbound", `Bool is_inbound);
       ("bip152_hb_to", `Bool false);
       ("bip152_hb_from", `Bool false);
       ("startingheight", `Int (Int32.to_int stats.stat_best_height));
+      ("presynced_headers", `Int (-1));
       ("synced_headers", `Int (-1));
       ("synced_blocks", `Int (-1));
       ("inflight", `List []);
+      ("addr_relay_enabled", `Bool true);
+      ("addr_processed", `Int 0);
+      ("addr_rate_limited", `Int 0);
+      ("permissions", `List []);
+      ("minfeefilter", `Float 0.0);
+      ("bytessent_per_msg", `Assoc []);
+      ("bytesrecv_per_msg", `Assoc []);
       ("connection_type", `String (if is_inbound then "inbound" else "outbound-full-relay"));
+      ("transport_protocol_type", `String "v1");
+      ("session_id", `String "");
     ]
   ) peers)
 
@@ -1423,16 +1502,32 @@ let handle_estimaterawfee (ctx : rpc_context)
    ============================================================================ *)
 
 let handle_getmininginfo (ctx : rpc_context) : Yojson.Safe.t =
-  let height, difficulty = match ctx.chain.tip with
-    | Some t -> (t.height, Consensus.difficulty_from_bits t.header.bits)
-    | None -> (0, 1.0)
+  let height, difficulty, bits = match ctx.chain.tip with
+    | Some t ->
+      (t.height, Consensus.difficulty_from_bits t.header.bits, t.header.bits)
+    | None -> (0, 1.0, 0x1d00ffffl)
   in
+  let bits_hex = Printf.sprintf "%08lx" bits in
+  let target_hex = bits_to_target_hex bits in
+  let next_height = height + 1 in
   `Assoc [
     ("blocks", `Int height);
+    ("currentblocksize", `Int 0);
+    ("currentblockweight", `Int 0);
+    ("currentblocktx", `Int 0);
+    ("bits", `String bits_hex);
     ("difficulty", `Float difficulty);
+    ("target", `String target_hex);
+    ("blockmintxfee", `Float 0.00001000);
     ("networkhashps", `Float 0.0);
     ("pooledtx", `Int (Hashtbl.length ctx.mempool.entries));
     ("chain", `String ctx.network.name);
+    ("next", `Assoc [
+      ("height", `Int next_height);
+      ("bits", `String bits_hex);
+      ("difficulty", `Float difficulty);
+      ("target", `String target_hex);
+    ]);
     ("warnings", `String "");
   ]
 

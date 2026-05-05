@@ -1492,6 +1492,10 @@ let bip22_of_submitblock_error (msg : string) : string =
        || c "script failed" || c "checksig" || c "witness program" then
        "block-script-verify-flag-failed"
   else if c "missing inputs" || c "missing or spent" then "bad-txns-inputs-missingorspent"
+  (* Coinbase maturity violation: consensus/tx_verify.cpp::CheckTxInputs.
+     Core: state.Invalid(TX_PREMATURE_SPEND, "bad-txns-premature-spend-of-coinbase").
+     validation.ml emits "spending immature coinbase (N < 100 confirmations required)". *)
+  else if c "immature coinbase" then "bad-txns-premature-spend-of-coinbase"
   (* Negative output value: consensus/tx_check.cpp::CheckTransaction — Core parity *)
   else if c "has negative value" then "bad-txns-vout-negative"
   (* Output value > MAX_MONEY: consensus/tx_check.cpp::CheckTransaction — Core parity *)

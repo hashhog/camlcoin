@@ -484,6 +484,22 @@ let handle_getdifficulty (ctx : rpc_context) : Yojson.Safe.t =
   | Some t -> `Float (Consensus.difficulty_from_bits t.header.bits)
   | None -> `Float 1.0
 
+(* getchaintips — return the set of chain tips known to this node.
+   Camlcoin only tracks the active chain, so we always return exactly
+   one entry with status "active" and branchlen 0 (same as beamchain).
+   Bitcoin Core: src/rpc/blockchain.cpp::getchaintips *)
+let handle_getchaintips (ctx : rpc_context) : Yojson.Safe.t =
+  match ctx.chain.tip with
+  | Some t ->
+    `List [`Assoc [
+      ("height",    `Int t.height);
+      ("hash",      `String (Types.hash256_to_hex_display t.hash));
+      ("branchlen", `Int 0);
+      ("status",    `String "active");
+    ]]
+  | None ->
+    `List []
+
 (* ============================================================================
    Block Filter Handler (BIP-157/158)
    ============================================================================ *)
@@ -4012,6 +4028,7 @@ let handle_help (_ctx : rpc_context)
       "getblockfilter \"blockhash\" ( filtertype )";
       "getdeploymentinfo ( \"blockhash\" )";
       "getdifficulty";
+      "getchaintips";
       "";
       "== Mining ==";
       "getblocktemplate";
@@ -4140,6 +4157,8 @@ let dispatch_rpc (ctx : rpc_context)
     Ok (handle_getsyncstate ctx)
   | "getdifficulty" ->
     Ok (handle_getdifficulty ctx)
+  | "getchaintips" ->
+    Ok (handle_getchaintips ctx)
   | "gettxout" ->
     (match handle_gettxout ctx params with
      | Ok r -> Ok r

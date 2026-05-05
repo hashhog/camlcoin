@@ -143,6 +143,16 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       (if config.peer_bloom_filters then "enabled (-peerbloomfilters=1)"
        else "disabled (Core default)"));
 
+  (* BIP-159: advertise NODE_NETWORK_LIMITED when prune mode is on.
+     Mirrors Core init.cpp `nLocalServices |= NODE_NETWORK_LIMITED`
+     gated on `IsPruneMode()`.  Set BEFORE any peer/handshake work for
+     the same reason as the bloom flag. *)
+  Peer.set_prune_mode_advertise (config.prune > 0);
+  Logs.info (fun m ->
+    m "NODE_NETWORK_LIMITED (BIP-159) advertisement: %s"
+      (if config.prune > 0 then "enabled (--prune > 0)"
+       else "disabled"));
+
   (* Ensure data directory exists *)
   (try Unix.mkdir config.data_dir 0o755
    with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
@@ -499,17 +509,40 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     | _ -> Lwt.return_unit);
 
   (* Register a listener for getdata requests so peers can fetch blocks
-     we have mined or stored (e.g. after receiving our inv announcement). *)
+     we have mined or stored (e.g. after receiving our inv announcement).
+
+     BIP-159 peer-served-blocks gate: when prune mode is on, refuse to
+     serve blocks below tip - 288 (best-effort via in-memory header
+     table).  Honest peers respecting our NODE_NETWORK_LIMITED bit
+     should not request these. *)
+  let min_blocks_to_keep = 288 in
   Peer_manager.add_listener peer_manager (fun msg peer ->
     match msg with
     | P2p.GetdataMsg items ->
+      let prune_horizon =
+        if config.prune > 0 then
+          match chain.tip with
+          | Some t when t.height > min_blocks_to_keep ->
+            Some (t.height - min_blocks_to_keep)
+          | _ -> None
+        else None
+      in
       let lookup_block hash =
         match Storage.ChainDB.get_block db hash with
         | None -> None
         | Some block ->
-          let w = Serialize.writer_create () in
-          Serialize.serialize_block w block;
-          Some (Serialize.writer_to_cstruct w)
+          (match prune_horizon with
+           | Some horizon ->
+             (match Sync.lookup_block_height chain hash with
+              | Some h when h < horizon -> None
+              | _ ->
+                let w = Serialize.writer_create () in
+                Serialize.serialize_block w block;
+                Some (Serialize.writer_to_cstruct w))
+           | None ->
+             let w = Serialize.writer_create () in
+             Serialize.serialize_block w block;
+             Some (Serialize.writer_to_cstruct w))
       in
       let lookup_tx hash =
         match Mempool.get mempool hash with

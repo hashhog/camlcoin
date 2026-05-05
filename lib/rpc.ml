@@ -4221,6 +4221,334 @@ let handle_help (_ctx : rpc_context)
     `String "Invalid parameters"
 
 (* ============================================================================
+   Wave-47b Handlers: getnetworkhashps, gettxoutproof, verifytxoutproof,
+   getrpcinfo
+   ============================================================================ *)
+
+(* w47b_dsha256_pair: double-SHA256(a || b), both are 32-byte Cstructs.
+   Matches Bitcoin Core Hash(a, b) = DSHA256(a || b). *)
+let w47b_dsha256_pair (a : Cstruct.t) (b : Cstruct.t) : Cstruct.t =
+  let combined = Cstruct.create 64 in
+  Cstruct.blit a 0 combined 0 32;
+  Cstruct.blit b 0 combined 32 32;
+  Crypto.sha256d combined
+
+(* w47b_tree_width: CalcTreeWidth from Bitcoin Core merkleblock.cpp.
+   height 0 = leaf level (width = n_tx); height nHeight = root (width = 1).
+   Formula: (n_tx + (1<<height) - 1) >> height *)
+let w47b_tree_width (n_tx : int) (height : int) : int =
+  (n_tx + (1 lsl height) - 1) lsr height
+
+(* w47b_encode_varint: encode a Bitcoin varint into a Buffer *)
+let w47b_encode_varint (buf : Buffer.t) (v : int) : unit =
+  if v < 0xFD then
+    Buffer.add_char buf (Char.chr v)
+  else if v <= 0xFFFF then begin
+    Buffer.add_char buf '\xFD';
+    Buffer.add_char buf (Char.chr (v land 0xFF));
+    Buffer.add_char buf (Char.chr ((v lsr 8) land 0xFF))
+  end else begin
+    Buffer.add_char buf '\xFE';
+    Buffer.add_char buf (Char.chr (v land 0xFF));
+    Buffer.add_char buf (Char.chr ((v lsr 8) land 0xFF));
+    Buffer.add_char buf (Char.chr ((v lsr 16) land 0xFF));
+    Buffer.add_char buf (Char.chr ((v lsr 24) land 0xFF))
+  end
+
+(* w47b_write_le32: write 4-byte LE int32 into a Buffer *)
+let w47b_write_le32 (buf : Buffer.t) (v : int32) : unit =
+  Buffer.add_char buf (Char.chr (Int32.to_int (Int32.logand v 0xFFl)));
+  Buffer.add_char buf (Char.chr (Int32.to_int (Int32.logand (Int32.shift_right_logical v 8) 0xFFl)));
+  Buffer.add_char buf (Char.chr (Int32.to_int (Int32.logand (Int32.shift_right_logical v 16) 0xFFl)));
+  Buffer.add_char buf (Char.chr (Int32.to_int (Int32.logand (Int32.shift_right_logical v 24) 0xFFl)))
+
+(* w47b_calc_hash: CalcHash from Bitcoin Core.
+   height 0 = leaves (txids); height > 0 = internal node.
+   At height 0, returns txid_arr[pos].
+   At height > 0, combines left and right children, duplicating right if out of range. *)
+let rec w47b_calc_hash (txid_arr : Cstruct.t array) (n_tx : int)
+    (height : int) (pos : int) : Cstruct.t =
+  if height = 0 then
+    (* leaf: return the txid *)
+    txid_arr.(pos)
+  else begin
+    let left = w47b_calc_hash txid_arr n_tx (height - 1) (pos * 2) in
+    let right =
+      if pos * 2 + 1 < w47b_tree_width n_tx (height - 1)
+      then w47b_calc_hash txid_arr n_tx (height - 1) (pos * 2 + 1)
+      else left
+    in
+    w47b_dsha256_pair left right
+  end
+
+(* w47b_build_partial_merkle_tree: TraverseAndBuild from Bitcoin Core.
+   Starts at the root (height = nHeight, pos = 0) and recurses toward leaves.
+   Returns (hashes_list, bits_list) in the order emitted (pre-order DFS). *)
+let w47b_build_partial_merkle_tree (txid_arr : Cstruct.t array)
+    (match_arr : bool array) : Cstruct.t list * bool list =
+  let n_tx = Array.length txid_arr in
+  if n_tx = 0 then ([], [])
+  else begin
+    (* nHeight: smallest h such that CalcTreeWidth(h) == 1 *)
+    let n_height = ref 0 in
+    while w47b_tree_width n_tx !n_height > 1 do incr n_height done;
+    let hashes = ref [] in
+    let bits   = ref [] in
+    (* TraverseAndBuild(height, pos): height=0 is leaves, height=nHeight is root *)
+    let rec traverse height pos =
+      (* fParentOfMatch: any match in range [pos<<height, (pos+1)<<height) *)
+      let lo = pos lsl height in
+      let hi = min ((pos + 1) lsl height) n_tx in
+      let parent_match = ref false in
+      for p = lo to hi - 1 do
+        if match_arr.(p) then parent_match := true
+      done;
+      bits := !parent_match :: !bits;
+      if height = 0 || not !parent_match then begin
+        (* emit hash for this node *)
+        hashes := (w47b_calc_hash txid_arr n_tx height pos) :: !hashes
+      end else begin
+        (* recurse into children *)
+        traverse (height - 1) (pos * 2);
+        if pos * 2 + 1 < w47b_tree_width n_tx (height - 1) then
+          traverse (height - 1) (pos * 2 + 1)
+      end
+    in
+    traverse !n_height 0;
+    (List.rev !hashes, List.rev !bits)
+  end
+
+(* w47b_read_varint: read a Bitcoin varint from a Cstruct, returns (value, new_pos) *)
+let w47b_read_varint (data : Cstruct.t) (pos : int) : int * int =
+  let b0 = Cstruct.get_uint8 data pos in
+  if b0 < 0xFD then (b0, pos + 1)
+  else if b0 = 0xFD then
+    let v = Cstruct.LE.get_uint16 data (pos + 1) in (v, pos + 3)
+  else if b0 = 0xFE then
+    let v = Int32.to_int (Cstruct.LE.get_uint32 data (pos + 1)) in (v, pos + 5)
+  else
+    let v = Int32.to_int (Cstruct.LE.get_uint32 data (pos + 1)) in (v, pos + 9)
+
+(* w47b_parse_partial_merkle_tree: TraverseAndExtract from Bitcoin Core.
+   Returns list of matched txids in display-hex order, or Error. *)
+let w47b_parse_partial_merkle_tree (n_tx : int) (hash_list : Cstruct.t list)
+    (flag_cs : Cstruct.t) : (string list, string) result =
+  if n_tx = 0 then Ok []
+  else begin
+    let n_height = ref 0 in
+    while w47b_tree_width n_tx !n_height > 1 do incr n_height done;
+    let total_bits = Cstruct.length flag_cs * 8 in
+    let bits = Array.init total_bits (fun i ->
+      let byte_i = i / 8 in
+      let bit_i  = i mod 8 in
+      (Cstruct.get_uint8 flag_cs byte_i) land (1 lsl bit_i) <> 0
+    ) in
+    let hash_arr = Array.of_list hash_list in
+    let bit_pos  = ref 0 in
+    let hash_pos = ref 0 in
+    let matched  = ref [] in
+    let bad      = ref false in
+    (* TraverseAndExtract(height, pos): mirrors Bitcoin Core *)
+    let rec extract height pos =
+      if !bad then Cstruct.create 32
+      else if !bit_pos >= total_bits then begin bad := true; Cstruct.create 32 end
+      else begin
+        let flag = bits.(!bit_pos) in
+        incr bit_pos;
+        if height = 0 || not flag then begin
+          (* use stored hash *)
+          if !hash_pos >= Array.length hash_arr
+          then begin bad := true; Cstruct.create 32 end
+          else begin
+            let h = hash_arr.(!hash_pos) in
+            incr hash_pos;
+            if height = 0 && flag then
+              matched := (Types.hash256_to_hex_display h) :: !matched;
+            h
+          end
+        end else begin
+          let left  = extract (height - 1) (pos * 2) in
+          let right =
+            if pos * 2 + 1 < w47b_tree_width n_tx (height - 1)
+            then extract (height - 1) (pos * 2 + 1)
+            else left
+          in
+          w47b_dsha256_pair left right
+        end
+      end
+    in
+    let _root = extract !n_height 0 in
+    if !bad then Error "Invalid proof (bad bit/hash count)"
+    else Ok (List.rev !matched)
+  end
+
+let handle_getnetworkhashps (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  let nblocks = match params with
+    | `Int n :: _ -> n
+    | _ -> 120
+  in
+  let tip_height = ctx.chain.blocks_synced in
+  if tip_height < 2 then Ok (`Int 0)
+  else begin
+    let window = if nblocks <= 0 then 120 else min nblocks tip_height in
+    let hi = tip_height in
+    let lo = hi - window in
+    match Sync.get_header_at_height ctx.chain hi,
+          Sync.get_header_at_height ctx.chain lo with
+    | Some hi_e, Some lo_e ->
+      (* total_work is a 32-byte LE Cstruct.  Read bytes LE → float. *)
+      let cstruct_to_float (cs : Cstruct.t) : float =
+        let acc  = ref 0.0 in
+        let base = ref 1.0 in
+        for i = 0 to 31 do
+          acc  := !acc +. float_of_int (Cstruct.get_uint8 cs i) *. !base;
+          base := !base *. 256.0
+        done;
+        !acc
+      in
+      let work_diff = cstruct_to_float hi_e.Sync.total_work
+                   -. cstruct_to_float lo_e.Sync.total_work in
+      let time_diff = Int32.to_int hi_e.Sync.header.timestamp
+                    - Int32.to_int lo_e.Sync.header.timestamp in
+      if time_diff <= 0 then Ok (`Int 0)
+      else begin
+        let hashps = work_diff /. float_of_int time_diff in
+        if hashps < 9.007199254740992e15
+        then Ok (`Int (int_of_float hashps))
+        else Ok (`Float hashps)
+      end
+    | _ -> Ok (`Int 0)
+  end
+
+let handle_gettxoutproof (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | (`List txids_json) :: rest ->
+    let blockhash_opt = match rest with
+      | [`String bh] -> Some bh
+      | _ -> None
+    in
+    (* Parse requested txids: display hex → internal LE Cstruct *)
+    let req_txids =
+      List.filter_map (function
+        | `String hex ->
+          let hash_bytes = Types.hash256_of_hex hex in
+          let txid = Cstruct.create 32 in
+          for i = 0 to 31 do
+            Cstruct.set_uint8 txid i (Cstruct.get_uint8 hash_bytes (31 - i))
+          done;
+          Some txid
+        | _ -> None
+      ) txids_json
+    in
+    if req_txids = [] then Error "No txids provided"
+    else begin
+      let block_hash_result = match blockhash_opt with
+        | Some hex ->
+          let bh = Types.hash256_of_hex hex in
+          let h = Cstruct.create 32 in
+          for i = 0 to 31 do
+            Cstruct.set_uint8 h i (Cstruct.get_uint8 bh (31 - i))
+          done;
+          Ok h
+        | None ->
+          let first_txid = List.hd req_txids in
+          (match Storage.ChainDB.get_tx_index ctx.chain.db first_txid with
+           | Some (bh, _idx) -> Ok bh
+           | None -> Error "Transaction not found in block index")
+      in
+      match block_hash_result with
+      | Error e -> Error e
+      | Ok bh ->
+        match Storage.ChainDB.get_block ctx.chain.db bh with
+        | None -> Error "Block not found"
+        | Some block ->
+          let all_txids = List.map Crypto.compute_txid block.transactions in
+          let n_tx = List.length all_txids in
+          let txid_arr = Array.of_list all_txids in
+          let match_arr = Array.map (fun tx_cs ->
+            List.exists (fun req -> Cstruct.equal tx_cs req) req_txids
+          ) txid_arr in
+          let (hashes, bits) = w47b_build_partial_merkle_tree txid_arr match_arr in
+          (* Encode CMerkleBlock wire format *)
+          let buf = Buffer.create 512 in
+          (* 80-byte block header *)
+          let w = Serialize.writer_create () in
+          Serialize.serialize_block_header w block.header;
+          Buffer.add_string buf (Cstruct.to_string (Serialize.writer_to_cstruct w));
+          (* nTx uint32 LE *)
+          w47b_write_le32 buf (Int32.of_int n_tx);
+          (* hashes *)
+          w47b_encode_varint buf (List.length hashes);
+          List.iter (fun h -> Buffer.add_string buf (Cstruct.to_string h)) hashes;
+          (* flag bytes *)
+          let n_bits  = List.length bits in
+          let n_bytes = (n_bits + 7) / 8 in
+          let flag_arr = Bytes.make n_bytes '\x00' in
+          List.iteri (fun i b ->
+            if b then
+              Bytes.set_uint8 flag_arr (i / 8)
+                (Bytes.get_uint8 flag_arr (i / 8) lor (1 lsl (i mod 8)))
+          ) bits;
+          w47b_encode_varint buf n_bytes;
+          Buffer.add_string buf (Bytes.to_string flag_arr);
+          Ok (`String (cstruct_to_hex (Cstruct.of_string (Buffer.contents buf))))
+    end
+  | _ -> Error "Invalid parameters: expected [txids] or [txids, blockhash]"
+
+let handle_verifytxoutproof (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String proof_hex] ->
+    (try
+      let proof_cs = hex_to_cstruct proof_hex in
+      let proof_len = Cstruct.length proof_cs in
+      if proof_len < 84 then Error "Proof too short"
+      else begin
+        (* Verify block exists in our chain by hashing the 80-byte header *)
+        let block_hash = Crypto.sha256d (Cstruct.sub proof_cs 0 80) in
+        match Sync.get_header ctx.chain block_hash with
+        | None -> Error "Block not found in chain"
+        | Some _entry ->
+          let pos = ref 80 in
+          let n_tx = Int32.to_int (Cstruct.LE.get_uint32 proof_cs !pos) in
+          pos := !pos + 4;
+          if n_tx = 0 then Ok (`List [])
+          else begin
+            let (hash_count, new_pos) = w47b_read_varint proof_cs !pos in
+            pos := new_pos;
+            if proof_len < !pos + hash_count * 32
+            then Error "Proof truncated (hashes)"
+            else begin
+              let hashes = List.init hash_count (fun i ->
+                Cstruct.sub proof_cs (!pos + i * 32) 32
+              ) in
+              pos := !pos + hash_count * 32;
+              let (flag_count, new_pos2) = w47b_read_varint proof_cs !pos in
+              pos := new_pos2;
+              if proof_len < !pos + flag_count
+              then Error "Proof truncated (flags)"
+              else begin
+                let flag_cs = Cstruct.sub proof_cs !pos flag_count in
+                match w47b_parse_partial_merkle_tree n_tx hashes flag_cs with
+                | Error e -> Error e
+                | Ok matched ->
+                  Ok (`List (List.map (fun txid_hex -> `String txid_hex) matched))
+              end
+            end
+          end
+      end
+    with _ -> Error "Failed to decode proof")
+  | _ -> Error "Invalid parameters: expected [proof_hex]"
+
+let handle_getrpcinfo (_ctx : rpc_context) : Yojson.Safe.t =
+  `Assoc [
+    ("active_commands", `List []);
+    ("logpath", `String "");
+  ]
+
+(* ============================================================================
    RPC Method Dispatcher
    ============================================================================ *)
 
@@ -4526,6 +4854,22 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_scrubunspendable ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_invalid_params, msg))
+
+  (* Wave-47b *)
+  | "getnetworkhashps" ->
+    (match handle_getnetworkhashps ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "gettxoutproof" ->
+    (match handle_gettxoutproof ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "verifytxoutproof" ->
+    (match handle_verifytxoutproof ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "getrpcinfo" ->
+    Ok (handle_getrpcinfo ctx)
 
   | _ ->
     Error (rpc_method_not_found, "Method not found: " ^ method_name)

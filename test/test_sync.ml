@@ -1291,8 +1291,8 @@ let test_prune_cli_zero_is_off () =
 let test_prune_cli_one_is_manual_sentinel () =
   (* --prune=1 is Core's manual-mode sentinel; auto-prune off. We keep
      literal 1 (not 1 MiB) so [prune_target > 0] still flags prune-mode
-     for NODE_NETWORK_LIMITED while [target_blocks = 1 / 1_500_000 = 0]
-     means [keep_blocks = max 0 288 = 288] in [prune_old_blocks]. *)
+     for NODE_NETWORK_LIMITED. [prune_old_blocks] short-circuits on the
+     literal sentinel — see [test_prune_old_blocks_manual_mode_short_circuits]. *)
   Alcotest.(check int) "--prune=1 manual sentinel" 1
     (convert_prune_mib_to_bytes 1)
 
@@ -1327,6 +1327,44 @@ let test_prune_old_blocks_uses_bytes () =
      that prune_old_blocks doesn't crash on the new bytes semantic. *)
   Sync.prune_old_blocks state 100;
   Alcotest.(check int) "prune_height unchanged when below keep window"
+    0 state.prune_height;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_prune_old_blocks_manual_mode_short_circuits () =
+  (* `--prune=1` manual-only mode (Bitcoin Core init.cpp:524 /
+     blockmanager_args.cpp:27): node is in prune mode but the auto-prune
+     trigger MUST NOT fire. Only the pruneblockchain RPC may delete
+     data. Maps to Core's PRUNE_TARGET_MANUAL = uint64::MAX sentinel
+     (an unreachable target so FindFilesToPrune's usage check is dead).
+
+     Pre-fix behavior: prune_target=1 fell through to the keep-window
+     math (target_blocks = 1 / 1_500_000 = 0; keep_blocks = max 0 288 =
+     288), so prune_below = current_height - 288 still fired auto-prune
+     deletes. Post-fix: function short-circuits without advancing
+     prune_height. *)
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  state.prune_target <- 1; (* manual-mode sentinel *)
+  state.prune_height <- 0;
+  (* High current_height — auto-prune would normally fire here. Manual
+     mode must keep prune_height pinned at 0. *)
+  Sync.prune_old_blocks state 1_000_000;
+  Alcotest.(check int) "manual mode: prune_height does not advance"
+    0 state.prune_height;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_prune_old_blocks_off_short_circuits () =
+  (* prune_target=0 (off / archive default) is also a no-op. *)
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  state.prune_target <- 0;
+  state.prune_height <- 0;
+  Sync.prune_old_blocks state 1_000_000;
+  Alcotest.(check int) "archive: prune_height does not advance"
     0 state.prune_height;
   Storage.ChainDB.close db;
   cleanup_test_db ()
@@ -1409,6 +1447,8 @@ let () =
       test_case "--prune=N for N in 2..549 rejected" `Quick test_prune_cli_floor_rejects_2_to_549;
       test_case "--prune above floor scales" `Quick test_prune_cli_above_floor;
       test_case "prune_old_blocks honors bytes semantic" `Quick test_prune_old_blocks_uses_bytes;
+      test_case "prune_old_blocks: manual mode short-circuits" `Quick test_prune_old_blocks_manual_mode_short_circuits;
+      test_case "prune_old_blocks: archive (off) short-circuits" `Quick test_prune_old_blocks_off_short_circuits;
     ];
     "block_invalidation", [
       test_case "is_block_invalid_initially_false" `Quick test_is_block_invalid_initially_false;

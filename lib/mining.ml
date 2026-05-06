@@ -673,7 +673,18 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
                  ~skip_scripts:false
                  ~get_mtp_at_height:(Sync.get_mtp_for_height chain) () with
         | Validation.AB_err e -> Error (Validation.block_error_to_string e)
-        | Validation.AB_ok _ ->
+        | Validation.AB_ok (_fees, txid_arr, _spent_utxos) ->
+        (* Write tx_index entries for every tx in this submitblock-
+           accepted block (Pattern C0 closure 2026-05-05). Mirrors
+           [Sync.process_new_block]'s tx_index_write_for_block call.
+           Without this, [getrawtransaction] returns "No such mempool
+           or blockchain transaction" for every tx in a submitblock-
+           accepted block (findings:
+           [_txindex-revert-on-reorg-fleet-result-2026-05-05.md]
+           Pattern C0; the pre-fix harness flagged camlcoin's A1.coinbase
+           probe as `tx-err` even pre-reorg). Companion to the undo-data
+           persistence on the same path that 22667c2 added. *)
+        Sync.tx_index_write_for_block chain.db block hash txid_arr;
 
         (* During IBD with headers-first sync, the header is already in the chain.
            Look up existing entry or validate as new. *)

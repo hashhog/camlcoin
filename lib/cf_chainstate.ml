@@ -264,6 +264,9 @@ let put_tx_index (t : t) (txid : Types.hash256) (data : string) =
 let get_tx_index (t : t) (txid : Types.hash256) : string option =
   Rocksdb.cf_get t.db t.cfh_tx_index (Cstruct.to_string txid)
 
+let delete_tx_index (t : t) (txid : Types.hash256) =
+  Rocksdb.cf_delete t.db t.cfh_tx_index (Cstruct.to_string txid)
+
 (* Chain state metadata. Keys are short ASCII strings:
    "tip_hash", "tip_height", "header_tip_hash", "header_tip_height".
    No prefix byte needed; the CF gives us the namespace. *)
@@ -367,6 +370,10 @@ let batch_put_block_height (b : batch) (height : int) (hash : Types.hash256) =
 let batch_put_tx_index (b : batch) (txid : Types.hash256) (data : string) =
   Rocksdb.write_batch_put_cf b.raw b.parent.cfh_tx_index
     (Cstruct.to_string txid) data
+
+let batch_delete_tx_index (b : batch) (txid : Types.hash256) =
+  Rocksdb.write_batch_delete_cf b.raw b.parent.cfh_tx_index
+    (Cstruct.to_string txid)
 
 let batch_put_chain_state (b : batch) (key : string) (value : string) =
   Rocksdb.write_batch_put_cf b.raw b.parent.cfh_chain_state key value

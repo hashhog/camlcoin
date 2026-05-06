@@ -704,6 +704,13 @@ module ChainDB = struct
       let tx_idx = Int32.to_int (Serialize.read_int32_le r) in
       Some (block_hash, tx_idx)
 
+  (* Delete a tx_index entry. Used by [Sync.reorganize] to revert the
+     txid -> (block_hash, tx_index) mapping when a block is disconnected.
+     Mirrors Bitcoin Core's [BaseIndex::BlockDisconnected] -> [CustomRemove]
+     in [src/index/txindex.cpp] (TxIndex::CustomRemove). *)
+  let delete_tx_index t (txid : Types.hash256) =
+    Cf_chainstate.delete_tx_index t.cf txid
+
   (* Invalidated block tracking for invalidateblock/reconsiderblock RPCs *)
   let set_block_invalidated t (hash : Types.hash256) =
     Cf_chainstate.put_invalidated t.cf hash

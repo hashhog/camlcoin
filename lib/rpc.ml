@@ -2040,6 +2040,134 @@ let handle_signrawtransactionwithwallet (ctx : rpc_context)
     Error "Invalid parameters: expected [hexstring]"
 
 (* ============================================================================
+   lockunspent / listlockunspent Handlers
+   (Bitcoin Core: src/wallet/rpc/coins.cpp::lockunspent + ::listlockunspent)
+   ============================================================================ *)
+
+(* Parse a {"txid": "...", "vout": N} object into a Types.outpoint.  We reverse
+   the txid hex before storing so the on-disk byte layout matches Core's
+   internal big-endian representation (createpsbt does the same — see line
+   ~2980).  Returns Error if the object is malformed. *)
+let parse_lock_outpoint (obj : Yojson.Safe.t) : (Types.outpoint, string) result =
+  match obj with
+  | `Assoc fields ->
+    let txid_r = match List.assoc_opt "txid" fields with
+      | Some (`String s) when String.length s = 64 ->
+        (try
+          let display = Types.hash256_of_hex s in
+          (* Reverse bytes to match the canonical internal layout *)
+          let txid = Cstruct.create 32 in
+          for i = 0 to 31 do
+            Cstruct.set_uint8 txid i (Cstruct.get_uint8 display (31 - i))
+          done;
+          Ok txid
+        with _ -> Error "Invalid txid")
+      | _ -> Error "Missing or invalid txid"
+    in
+    let vout_r = match List.assoc_opt "vout" fields with
+      | Some (`Int n) ->
+        if n < 0 then Error "Invalid parameter, vout cannot be negative"
+        else Ok (Int32.of_int n)
+      | _ -> Error "Missing or invalid vout"
+    in
+    (match txid_r, vout_r with
+     | Ok txid, Ok vout -> Ok { Types.txid; vout }
+     | Error e, _ | _, Error e -> Error e)
+  | _ -> Error "Expected outpoint object {txid, vout}"
+
+(* lockunspent unlock ([{txid,vout},...]) (persistent)
+   - When unlock=true and transactions array is omitted, ALL locks are cleared.
+   - When transactions are provided, validate each (must reference a wallet
+     UTXO; lock-direction must match current state) and then apply the lock
+     change atomically (Core: see two-pass loop in coins.cpp:283-340). *)
+let handle_lockunspent (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match ctx.wallet with
+  | None -> Error "Wallet not loaded"
+  | Some wallet ->
+    let unlock_r = match params with
+      | (`Bool b) :: _ -> Ok b
+      | _ -> Error "Invalid parameter, expected bool unlock"
+    in
+    (match unlock_r with
+     | Error e -> Error e
+     | Ok unlock ->
+       (* persistent flag is the optional 3rd parameter *)
+       let persistent = match params with
+         | _ :: _ :: (`Bool b) :: _ -> b
+         | _ -> false
+       in
+       (* Determine if the transactions array was omitted or null. *)
+       let txs_param = match params with
+         | _ :: t :: _ -> Some t
+         | _ -> None
+       in
+       (match txs_param with
+        | None | Some `Null ->
+          if unlock then
+            let _ = Wallet.unlock_all_coins wallet in
+            Ok (`Bool true)
+          else
+            Ok (`Bool true)
+        | Some (`List arr) ->
+          (* Pass 1: validate every outpoint (Core does the same: parse +
+             validate first, mutate second, so a partial failure leaves the
+             lockset untouched). *)
+          let parsed = List.map parse_lock_outpoint arr in
+          let first_err = List.find_opt Result.is_error parsed in
+          (match first_err with
+           | Some (Error e) -> Error e
+           | _ ->
+             let outpoints = List.map (function
+               | Ok op -> op
+               | Error _ -> assert false  (* unreachable: filtered above *)
+             ) parsed in
+             let wallet_utxos = Wallet.get_utxos wallet in
+             let validation_err = List.find_map (fun op ->
+               (* Core checks: wallet knows the parent tx, vout is in range,
+                  output unspent, and (un)lock direction matches current
+                  state. *)
+               let known = List.exists (fun (wu : Wallet.wallet_utxo) ->
+                 Cstruct.equal wu.outpoint.txid op.Types.txid &&
+                 wu.outpoint.vout = op.Types.vout
+               ) wallet_utxos in
+               if not known then
+                 Some "Invalid parameter, unknown transaction"
+               else
+                 let is_locked = Wallet.is_locked_coin wallet op in
+                 if unlock && not is_locked then
+                   Some "Invalid parameter, expected locked output"
+                 else if (not unlock) && is_locked && not persistent then
+                   Some "Invalid parameter, output already locked"
+                 else
+                   None
+             ) outpoints in
+             (match validation_err with
+              | Some msg -> Error msg
+              | None ->
+                List.iter (fun op ->
+                  if unlock then
+                    let _ = Wallet.unlock_coin wallet op in ()
+                  else
+                    let _ = Wallet.lock_coin wallet op ~persistent in ()
+                ) outpoints;
+                Ok (`Bool true)))
+        | Some _ -> Error "transactions parameter must be an array"))
+
+let handle_listlockunspent (ctx : rpc_context)
+    (_params : Yojson.Safe.t list) : Yojson.Safe.t =
+  match ctx.wallet with
+  | None -> `List []
+  | Some wallet ->
+    let outpoints = Wallet.list_locked_coins wallet in
+    `List (List.map (fun op ->
+      `Assoc [
+        ("txid", `String (Types.hash256_to_hex_display op.Types.txid));
+        ("vout", `Int (Int32.to_int op.Types.vout));
+      ]
+    ) outpoints)
+
+(* ============================================================================
    Transaction History Handler
    ============================================================================ *)
 
@@ -2384,13 +2512,10 @@ let handle_validateaddress (_ctx : rpc_context)
    ============================================================================ *)
 
 (* signmessagewithprivkey ["WIF", "message"]: returns base64 65-byte compact
-   signature.  Mirrors Core's "signmessagewithprivkey" RPC.  We expose this
-   under "signmessage" as well — Core's "signmessage" is wallet-scoped (sign
-   with the address's wallet private key); camlcoin's wallet does not yet
-   carry per-address private keys for arbitrary external addresses, so we
-   accept a WIF instead.  This matches the documented test fleet's
-   "signmessage" probes which pass a privkey + message. *)
-let handle_signmessage (_ctx : rpc_context)
+   signature.  Mirrors Core's "signmessagewithprivkey" RPC
+   (src/rpc/signmessage.cpp::signmessagewithprivkey): caller supplies a WIF
+   directly, no wallet involvement. *)
+let handle_signmessagewithprivkey (_ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
   | [`String wif; `String message] ->
@@ -2404,6 +2529,59 @@ let handle_signmessage (_ctx : rpc_context)
          Ok (`String (Base64.encode_string sig_str))
        with _ -> Error "Sign failed"))
   | _ -> Error "Invalid parameters: expected [\"privkey\", \"message\"]"
+
+(* signmessage ["address", "message"]: wallet-scoped signing.  Mirrors Core's
+   wallet/rpc/signmessage.cpp::signmessage — looks up the private key for
+   [address] in the loaded wallet, then produces a base64 65-byte compact
+   signature over the Bitcoin-Signed-Message MessageHash framing.  Core
+   restricts the destination to PKHash (P2PKH); we follow that.
+
+   For backward compatibility with the legacy "signmessage WIF message"
+   shape that earlier camlcoin builds (and the cross-impl test fleet) used,
+   we sniff the first parameter: if it parses as a WIF, dispatch to the
+   privkey path; otherwise treat it as an address and require the wallet. *)
+let handle_signmessage (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String addr_or_wif; `String message] ->
+    (* Backward-compat: if the first arg parses as WIF, route to the legacy
+       privkey-based path.  This keeps existing callers working without
+       forcing them to switch to "signmessagewithprivkey". *)
+    (match Address.wif_decode addr_or_wif with
+     | Ok _ ->
+       handle_signmessagewithprivkey ctx params
+     | Error _ ->
+       (* Wallet-scoped path: look up the address in the loaded wallet. *)
+       match ctx.wallet with
+       | None -> Error "Method not found: no wallet is loaded."
+       | Some wallet ->
+         match Address.address_of_string addr_or_wif with
+         | Error _ -> Error "Invalid address"
+         | Ok addr ->
+           (* Core requires PKHash (P2PKH) for signmessage. *)
+           (match addr.Address.addr_type with
+            | Address.P2PKH -> ()
+            | _ ->
+              (* Fall through into the lookup; if no key matches, the user
+                 will get a clear error.  But first, return the Core message
+                 directly for non-P2PKH so callers see the same shape. *)
+              ()) ;
+           if addr.Address.addr_type <> Address.P2PKH then
+             Error "Address does not refer to key"
+           else
+             match Wallet.find_by_address wallet addr_or_wif with
+             | None ->
+               Error "Private key not available"
+             | Some kp ->
+               let msg_hash = Crypto.message_hash message in
+               (try
+                 let sig_bytes = Crypto.sign_compact ~compressed:true
+                   kp.Wallet.private_key msg_hash in
+                 let sig_str = Cstruct.to_string sig_bytes in
+                 Ok (`String (Base64.encode_string sig_str))
+               with _ -> Error "Sign failed"))
+  | _ ->
+    Error "Invalid parameters: expected [\"address\", \"message\"]"
 
 (* verifymessage ["address", "signature_b64", "message"]: returns true iff the
    recovered pubkey hashes to the address's pubkey hash.  Only P2PKH is
@@ -3417,6 +3595,276 @@ let handle_converttopsbt (_ctx : rpc_context)
     Error "Invalid parameters: expected [hexstring, (permitsigdata)]"
 
 (* ============================================================================
+   walletcreatefundedpsbt Handler
+   (Bitcoin Core: src/wallet/rpc/spend.cpp::walletcreatefundedpsbt)
+   Creates and funds a PSBT.  Implements the Creator + Updater roles:
+   - parse user inputs/outputs into a base transaction skeleton
+   - if no manual inputs, run wallet coin selection to fund the target
+   - emit a PSBT with witness_utxo populated for each wallet input
+   - return {psbt, fee, changepos}
+   ============================================================================ *)
+
+let handle_walletcreatefundedpsbt (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match ctx.wallet with
+  | None -> Error "Wallet not loaded"
+  | Some wallet ->
+    let inputs_param, outputs_param, locktime_param, options_param =
+      match params with
+      | [a; b] -> (a, b, `Int 0, `Assoc [])
+      | [a; b; c] -> (a, b, c, `Assoc [])
+      | [a; b; c; d] -> (a, b, c, d)
+      | a :: b :: c :: d :: _ -> (a, b, c, d)
+      | _ ->
+        (`List [], `List [], `Int 0, `Assoc [])
+    in
+    if List.length params < 2 then
+      Error "Invalid parameters: expected [inputs, outputs, (locktime, options, bip32derivs, version)]"
+    else
+    (try
+      let network = network_to_address_network ctx.network in
+      (* --- Manual inputs (may be empty) --- *)
+      let manual_inputs = match inputs_param with
+        | `List arr ->
+          List.map (fun obj ->
+            match obj with
+            | `Assoc fields ->
+              let txid = match List.assoc_opt "txid" fields with
+                | Some (`String s) ->
+                  let display = Types.hash256_of_hex s in
+                  let h = Cstruct.create 32 in
+                  for i = 0 to 31 do
+                    Cstruct.set_uint8 h i (Cstruct.get_uint8 display (31 - i))
+                  done;
+                  h
+                | _ -> failwith "Missing input txid"
+              in
+              let vout = match List.assoc_opt "vout" fields with
+                | Some (`Int n) -> Int32.of_int n
+                | _ -> failwith "Missing input vout"
+              in
+              let sequence = match List.assoc_opt "sequence" fields with
+                | Some (`Int n) -> Int32.of_int n
+                | _ -> 0xFFFFFFFEl
+              in
+              { Types.previous_output = { txid; vout };
+                script_sig = Cstruct.empty;
+                sequence }
+            | _ -> failwith "Each input must be an object"
+          ) arr
+        | `Null -> []
+        | _ -> failwith "inputs must be an array"
+      in
+      (* --- Outputs (Core accepts both [{addr:amt},...] and {addr:amt}) --- *)
+      let parse_amount = function
+        | `Float f -> Int64.of_float (f *. 100_000_000.0)
+        | `Int i -> Int64.of_int (i * 100_000_000)
+        | `String s -> Int64.of_float (float_of_string s *. 100_000_000.0)
+        | _ -> 0L
+      in
+      let parse_one_output_field (addr_str, amt) =
+        if addr_str = "data" then
+          match amt with
+          | `String hex_data ->
+            let data = hex_to_cstruct hex_data in
+            let script = Cstruct.create (2 + Cstruct.length data) in
+            Cstruct.set_uint8 script 0 0x6a;
+            Cstruct.set_uint8 script 1 (Cstruct.length data);
+            Cstruct.blit data 0 script 2 (Cstruct.length data);
+            Some { Types.value = 0L; script_pubkey = script }
+          | _ -> None
+        else
+          match Address.address_of_string addr_str with
+          | Error _ -> failwith (Printf.sprintf "Invalid address: %s" addr_str)
+          | Ok addr ->
+            if addr.network <> network then
+              failwith (Printf.sprintf "Address not on this network: %s" addr_str)
+            else
+              let script_pubkey = Address.address_to_script addr in
+              Some { Types.value = parse_amount amt; script_pubkey }
+      in
+      let outputs = match outputs_param with
+        | `List arr ->
+          List.concat_map (function
+            | `Assoc fields -> List.filter_map parse_one_output_field fields
+            | _ -> failwith "Each output entry must be an object"
+          ) arr
+        | `Assoc fields ->
+          List.filter_map parse_one_output_field fields
+        | _ -> failwith "outputs must be an array or object"
+      in
+      if outputs = [] then
+        Error "Cannot create PSBT with no outputs"
+      else
+      let locktime = match locktime_param with
+        | `Int n -> Int32.of_int n
+        | `Null -> 0l
+        | _ -> 0l
+      in
+      (* --- Options --- *)
+      let opt_field name = match options_param with
+        | `Assoc fields -> List.assoc_opt name fields
+        | _ -> None
+      in
+      let add_inputs_default = (manual_inputs = []) in
+      let add_inputs = match opt_field "add_inputs" with
+        | Some (`Bool b) -> b
+        | _ -> add_inputs_default
+      in
+      (* Fee-rate selection mirrors Core's options parser
+         (src/wallet/rpc/spend.cpp::SetFeeEstimateMode):
+           - fee_rate: sat/vB (most callers)
+           - feeRate:  BTC/kvB legacy alias.  BTC/kvB → sat/vB == f * 1e5
+         If both are set, fee_rate wins (Core errors out, we follow the
+         simpler "explicit > legacy" rule). *)
+      let fee_rate = match opt_field "fee_rate" with
+        | Some (`Float f) -> f
+        | Some (`Int n) -> float_of_int n
+        | _ ->
+          (match opt_field "feeRate" with
+           | Some (`Float f) -> f *. 100_000.0
+           | Some (`Int n) -> float_of_int n *. 100_000.0
+           | _ -> 1.0)
+      in
+      let lock_unspents = match opt_field "lockUnspents" with
+        | Some (`Bool b) -> b
+        | _ -> false
+      in
+      let change_address_opt = match opt_field "changeAddress" with
+        | Some (`String s) -> Some s
+        | _ -> None
+      in
+      let change_position = match opt_field "changePosition" with
+        | Some (`Int n) -> Some n
+        | _ -> None
+      in
+      (* --- Build inputs + change --- *)
+      let target_amount = List.fold_left (fun acc o ->
+        Int64.add acc o.Types.value
+      ) 0L outputs in
+      let (final_inputs, selected_wutxos, change_amount) =
+        if manual_inputs <> [] && not add_inputs then
+          (* All inputs supplied manually; no auto-funding.  We still need to
+             know the wallet UTXO behind each input (if any) to populate
+             witness_utxo and to determine change.  Compute totals. *)
+          let wallet_utxos = Wallet.get_utxos wallet in
+          let resolved = List.filter_map (fun (inp : Types.tx_in) ->
+            List.find_opt (fun (wu : Wallet.wallet_utxo) ->
+              Cstruct.equal wu.outpoint.txid inp.previous_output.txid &&
+              wu.outpoint.vout = inp.previous_output.vout
+            ) wallet_utxos
+          ) manual_inputs in
+          let total_input = List.fold_left (fun acc (wu : Wallet.wallet_utxo) ->
+            Int64.add acc wu.utxo.Utxo.value
+          ) 0L resolved in
+          let n_inputs = List.length manual_inputs in
+          let n_outputs = List.length outputs + 1 in
+          let wt = Wallet.estimate_tx_weight n_inputs n_outputs in
+          let est_fee = Int64.of_float
+            (fee_rate *. float_of_int wt /. 4.0) in
+          let change = Int64.sub total_input
+            (Int64.add target_amount est_fee) in
+          (manual_inputs, resolved, change)
+        else
+          match Wallet.select_coins wallet target_amount fee_rate with
+          | Error e -> failwith e
+          | Ok sel ->
+            let auto_inputs = List.map (fun (wu : Wallet.wallet_utxo) ->
+              { Types.previous_output = wu.outpoint;
+                script_sig = Cstruct.empty;
+                sequence = 0xFFFFFFFEl }
+            ) sel.selected in
+            (manual_inputs @ auto_inputs,
+             sel.selected,
+             sel.change)
+      in
+      (* Assemble outputs with optional change.  Change position is
+         determined by the user's request, else random (Core: random by
+         default).  changepos = -1 means no change output. *)
+      let dust = 546L in
+      let (final_outputs, changepos) =
+        if Int64.compare change_amount dust > 0 then
+          let change_script = match change_address_opt with
+            | Some addr_str ->
+              (match Address.address_of_string addr_str with
+               | Ok a when a.Address.network = network ->
+                 Address.address_to_script a
+               | _ -> failwith (Printf.sprintf "Invalid changeAddress: %s" addr_str))
+            | None ->
+              let kp = Wallet.generate_change_key wallet in
+              let dest_script = match outputs with
+                | first :: _ -> first.Types.script_pubkey
+                | [] -> Cstruct.empty
+              in
+              Wallet.build_change_script dest_script kp.Wallet.public_key
+          in
+          let change_out = { Types.value = change_amount;
+                             script_pubkey = change_script } in
+          let pos = match change_position with
+            | Some p when p >= 0 && p <= List.length outputs -> p
+            | Some _ -> List.length outputs  (* clamp to end *)
+            | None ->
+              (* Random insert position so observers cannot trivially tell
+                 the change output apart.  Matches Core's randomization. *)
+              Random.int (List.length outputs + 1)
+          in
+          let rec insert_at i acc = function
+            | rest when i = 0 -> List.rev_append acc (change_out :: rest)
+            | x :: rest -> insert_at (i - 1) (x :: acc) rest
+            | [] -> List.rev (change_out :: acc)
+          in
+          (insert_at pos [] outputs, pos)
+        else
+          (outputs, -1)
+      in
+      let tx : Types.transaction = {
+        version = 2l;
+        inputs = final_inputs;
+        outputs = final_outputs;
+        witnesses = [];
+        locktime;
+      } in
+      (* Build PSBT, attach witness_utxo for every wallet-known input. *)
+      let psbt = Psbt.create tx in
+      let psbt =
+        List.fold_left (fun (acc : Psbt.psbt) (i, inp) ->
+          let prev = inp.Types.previous_output in
+          match List.find_opt (fun (wu : Wallet.wallet_utxo) ->
+            Cstruct.equal wu.outpoint.txid prev.txid &&
+            wu.outpoint.vout = prev.vout
+          ) selected_wutxos with
+          | Some wu ->
+            let utxo_out = { Types.value = wu.utxo.Utxo.value;
+                             script_pubkey = wu.utxo.Utxo.script_pubkey } in
+            Psbt.add_witness_utxo acc i utxo_out
+          | None -> acc
+        ) psbt
+        (List.mapi (fun i inp -> (i, inp)) final_inputs)
+      in
+      (* lockUnspents=true: lock every selected wallet utxo (Core does this
+         atomically after the PSBT is built — see spend.cpp ::FundTransaction). *)
+      if lock_unspents then
+        List.iter (fun (wu : Wallet.wallet_utxo) ->
+          let _ = Wallet.lock_coin wallet wu.outpoint ~persistent:false in ()
+        ) selected_wutxos;
+      let total_input = List.fold_left (fun acc (wu : Wallet.wallet_utxo) ->
+        Int64.add acc wu.utxo.Utxo.value
+      ) 0L selected_wutxos in
+      let total_output = List.fold_left (fun acc o ->
+        Int64.add acc o.Types.value
+      ) 0L final_outputs in
+      let fee = Int64.sub total_input total_output in
+      let fee = if Int64.compare fee 0L < 0 then 0L else fee in
+      Ok (`Assoc [
+        ("psbt", `String (Psbt.to_base64 psbt));
+        ("fee", `Float (Int64.to_float fee /. 100_000_000.0));
+        ("changepos", `Int changepos);
+      ])
+    with
+    | Failure msg -> Error msg
+    | exn -> Error (Printexc.to_string exn))
+
+(* ============================================================================
    Output Descriptor Handlers (BIP 380-386)
    ============================================================================ *)
 
@@ -4363,6 +4811,7 @@ let handle_help (_ctx : rpc_context)
       "decodepsbt \"psbt\"";
       "finalizepsbt \"psbt\" ( extract )";
       "utxoupdatepsbt \"psbt\"";
+      "walletcreatefundedpsbt [{\"txid\":\"...\", \"vout\":n},...] [{\"address\":amount},...] ( locktime options bip32derivs )";
       "";
       "== Descriptors ==";
       "deriveaddresses \"descriptor\" ( range )";
@@ -4377,7 +4826,7 @@ let handle_help (_ctx : rpc_context)
       "== Util ==";
       "estimatesmartfee conf_target";
       "estimaterawfee conf_target ( threshold )";
-      "signmessage \"privkey\" \"message\"";
+      "signmessage \"address\" \"message\"";
       "signmessagewithprivkey \"privkey\" \"message\"";
       "verifymessage \"address\" \"signature\" \"message\"";
       "validateaddress \"address\"";
@@ -4387,6 +4836,8 @@ let handle_help (_ctx : rpc_context)
       "getnewaddress";
       "listtransactions ( count skip )";
       "listunspent";
+      "lockunspent unlock ( [{\"txid\":\"...\", \"vout\":n},...] persistent )";
+      "listlockunspent";
       "sendtoaddress \"address\" amount";
       "signrawtransactionwithwallet \"hexstring\"";
       "encryptwallet \"passphrase\"";
@@ -4891,8 +5342,12 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_validateaddress ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_invalid_address, msg))
-  | "signmessage" | "signmessagewithprivkey" ->
+  | "signmessage" ->
     (match handle_signmessage ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_invalid_address, msg))
+  | "signmessagewithprivkey" ->
+    (match handle_signmessagewithprivkey ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_invalid_address, msg))
   | "verifymessage" ->
@@ -4943,6 +5398,12 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_signrawtransactionwithwallet ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_wallet_error, msg))
+  | "lockunspent" ->
+    (match handle_lockunspent ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_invalid_params, msg))
+  | "listlockunspent" ->
+    Ok (handle_listlockunspent ctx params)
 
   (* Wallet Management *)
   | "createwallet" ->
@@ -5007,6 +5468,10 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_converttopsbt ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
+  | "walletcreatefundedpsbt" ->
+    (match handle_walletcreatefundedpsbt ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_wallet_error, msg))
 
   (* Output Descriptors *)
   | "getdescriptorinfo" ->

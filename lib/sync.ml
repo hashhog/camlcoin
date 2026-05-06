@@ -126,6 +126,18 @@ type chain_state = {
        byte target via an average-block-size constant. *)
   mutable prune_height : int;    (* last pruned height *)
   headers_from_peer : (int, int) Hashtbl.t;  (* peer_id -> header count from that peer *)
+  unconnecting_headers : (int, int) Hashtbl.t;
+    (* peer_id -> count of consecutive unconnecting-headers messages.
+       Mirrors Bitcoin Core's [nUnconnectingHeaders] in
+       net_processing.cpp::ProcessHeadersMessage.  When the count
+       exceeds [max_num_unconnecting_headers_msgs] we hand the peer to
+       [misbehavior_handler]; on a connecting batch we reset the entry.
+       Pre-fix, camlcoin returned [Error "Unknown parent header"] from
+       [process_headers] and dropped the sync_peer to Idle without ever
+       penalizing the peer — a malicious peer could keep us in a
+       getheaders loop indefinitely.  See
+       CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+       (Pattern B). *)
   mutable invalidated_blocks : (string, unit) Hashtbl.t;  (* manually invalidated block hashes *)
   mutable block_submission_paused : bool;
   (* NetworkDisable flag (Bitcoin Core
@@ -147,6 +159,14 @@ let headers_response_timeout = 120.0  (* 2 min per header response *)
 
 (* Per-peer header flood threshold *)
 let max_headers_per_peer = 2_000_000  (* Allow full mainnet header sync from a single peer *)
+
+(* Bitcoin Core's MAX_NUM_UNCONNECTING_HEADERS_MSGS (net_processing.cpp).
+   A peer that delivers more than this many successive unconnecting-
+   headers messages is misbehavior-scored and disconnected.  Tolerates
+   up to 10 transient unlinked batches before taking action — matches
+   Core, looser than the legacy "drop sync_peer on first orphan"
+   behavior and stricter than "never penalize". *)
+let max_num_unconnecting_headers_msgs = 10
 
 (* PRESYNC/REDOWNLOAD constants *)
 let max_headers_per_message = 2000    (* Protocol limit on headers per message *)
@@ -398,6 +418,7 @@ let create_chain_state (db : Storage.ChainDB.t)
     prune_target = 0;
     prune_height = 0;
     headers_from_peer = Hashtbl.create 16;
+    unconnecting_headers = Hashtbl.create 16;
     invalidated_blocks = Hashtbl.create 16;
     block_submission_paused = false;
   } in
@@ -441,6 +462,7 @@ let restore_chain_state (db : Storage.ChainDB.t)
     prune_target = 0;
     prune_height = 0;
     headers_from_peer = Hashtbl.create 16;
+    unconnecting_headers = Hashtbl.create 16;
     invalidated_blocks = Hashtbl.create 16;
     block_submission_paused = false;
   } in
@@ -608,6 +630,37 @@ let accept_header (state : chain_state) (entry : header_entry) : unit =
 
 (* Process a list of headers from the network.
    Returns Ok(accepted_count) or Error(reason) if validation fails *)
+(* Record that [peer_id] just sent us a headers message whose first header
+   doesn't connect to our chain.  Returns [true] if the per-peer counter
+   has exceeded [max_num_unconnecting_headers_msgs] (caller must
+   misbehavior-score and disconnect the peer); returns [false] otherwise
+   (caller should re-issue getheaders to drive Core's
+   FindForkInGlobalIndex behavior).  Mirrors Bitcoin Core's
+   [nUnconnectingHeaders] accounting in
+   net_processing.cpp::ProcessHeadersMessage. *)
+let note_unconnecting_headers (state : chain_state) (peer_id : int) : bool =
+  let prev =
+    match Hashtbl.find_opt state.unconnecting_headers peer_id with
+    | Some n -> n
+    | None -> 0
+  in
+  let next = prev + 1 in
+  Hashtbl.replace state.unconnecting_headers peer_id next;
+  next > max_num_unconnecting_headers_msgs
+
+(* Reset the unconnecting-headers counter for [peer_id].  Called after
+   any successful connecting batch from this peer, mirroring Core's
+   [nUnconnectingHeaders = 0] in the success path of
+   ProcessHeadersMessage.  Idempotent — no-op if no entry exists. *)
+let reset_unconnecting_headers (state : chain_state) (peer_id : int) : unit =
+  Hashtbl.remove state.unconnecting_headers peer_id
+
+(* Read the current unconnecting-headers count for [peer_id]; used by tests. *)
+let unconnecting_headers_count (state : chain_state) (peer_id : int) : int =
+  match Hashtbl.find_opt state.unconnecting_headers peer_id with
+  | Some n -> n
+  | None -> 0
+
 let process_headers (state : chain_state)
     (headers : Types.block_header list) : (int, string) result =
   (* Header flood prevention: reject if we already have too many headers
@@ -905,6 +958,11 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
     | Ok accepted ->
       Logs.info (fun m -> m "Accepted %d headers, tip at height %d"
         accepted state.headers_synced);
+      (* Successful connecting batch — reset the unconnecting-headers
+         counter for this peer (Core's nUnconnectingHeaders = 0 in the
+         success path). *)
+      if accepted > 0 then
+        reset_unconnecting_headers state peer.Peer.id;
       if count = P2p.max_headers_count then begin
         if accepted = 0 then begin
           Logs.warn (fun m -> m "Full batch but 0 accepted, likely stale — will send fresh getheaders");
@@ -933,6 +991,36 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
           state.sync_state <- SyncingBlocks;
           Lwt.return_unit
         end
+      end
+    | Error e when e = "Unknown parent header" ->
+      (* Bitcoin Core (net_processing.cpp::ProcessHeadersMessage)
+         tolerates up to MAX_NUM_UNCONNECTING_HEADERS_MSGS=10
+         successive unconnecting messages from a peer before
+         disconnecting.  Pre-fix, camlcoin silently dropped the
+         sync_peer (state.sync_state <- Idle) without ever ban-scoring
+         the peer, leaving us in a getheaders loop with a malicious
+         peer indefinitely.  See
+         CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+         (Pattern B). *)
+      let exceeded = note_unconnecting_headers state peer.Peer.id in
+      if exceeded then begin
+        Logs.warn (fun m ->
+          m "Peer %d exceeded MAX_NUM_UNCONNECTING_HEADERS_MSGS=%d, dropping sync_peer"
+            peer.Peer.id max_num_unconnecting_headers_msgs);
+        reset_unconnecting_headers state peer.Peer.id;
+        state.sync_state <- Idle;
+        Lwt.return_unit
+      end else begin
+        let count = unconnecting_headers_count state peer.Peer.id in
+        Logs.info (fun m ->
+          m "Unconnecting headers from peer %d (#%d/%d), retrying with fresh locator"
+            peer.Peer.id count max_num_unconnecting_headers_msgs);
+        (* Drive Core's FindForkInGlobalIndex behavior: re-iterate the
+           sync loop, which builds a new locator and re-issues
+           getheaders.  Counter persists until either a connecting
+           batch arrives (resets) or the threshold is exceeded
+           (drops). *)
+        sync_iteration ()
       end
     | Error e ->
       Logs.err (fun m -> m "Header validation failed: %s" e);

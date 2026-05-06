@@ -2097,6 +2097,244 @@ let test_submitpackage_dispatcher () =
   cleanup_test_db ()
 
 (* ============================================================================
+   Wallet Wave Tests:
+     - lockunspent / listlockunspent (Bitcoin Core: src/wallet/rpc/coins.cpp)
+     - signmessage WIF→address Core-shape
+     - walletcreatefundedpsbt (Bitcoin Core: src/wallet/rpc/spend.cpp)
+   ============================================================================ *)
+
+(* Build a wallet UTXO entry for testing.  We bypass scan_block here because
+   we want to drop a single, deterministic outpoint into the wallet without
+   plumbing a fake block. *)
+let make_wallet_utxo (w : Wallet.t) ~txid ~vout ~value : Wallet.wallet_utxo =
+  (* Generate a key the wallet owns so coin selection paths can sign. *)
+  let kp = Wallet.generate_key w in
+  let script_pubkey = match kp.Wallet.addr_type with
+    | Wallet.P2WPKH -> Wallet.build_p2wpkh_script (Crypto.hash160 kp.public_key)
+    | Wallet.P2PKH -> Wallet.build_p2pkh_script (Crypto.hash160 kp.public_key)
+    | Wallet.P2TR ->
+      let xonly = Crypto.derive_xonly_pubkey kp.private_key in
+      Wallet.build_p2tr_script xonly
+  in
+  { Wallet.outpoint = { Types.txid; vout };
+    utxo = { Utxo.value; script_pubkey; height = 1; is_coinbase = false };
+    key_index = 0;
+    confirmed = true; }
+
+(* Stand up a wallet-backed RPC context with two known wallet UTXOs that
+   coin selection can pick from.  Returns the context, the chain DB handle
+   (for cleanup), the wallet, and the two outpoints. *)
+let create_lockunspent_context () =
+  let (ctx, db, _utxo, _, _) = create_test_context () in
+  let wallet = Wallet.create ~network:`Mainnet ~db_path:"" in
+  let txid_a = Types.hash256_of_hex
+    "1111111111111111111111111111111111111111111111111111111111111111" in
+  let txid_b = Types.hash256_of_hex
+    "2222222222222222222222222222222222222222222222222222222222222222" in
+  let wu_a = make_wallet_utxo wallet ~txid:txid_a ~vout:0l ~value:50_000_000L in
+  let wu_b = make_wallet_utxo wallet ~txid:txid_b ~vout:1l ~value:30_000_000L in
+  wallet.utxos <- [wu_a; wu_b];
+  let ctx = { ctx with wallet = Some wallet } in
+  (ctx, db, wallet, wu_a.outpoint, wu_b.outpoint)
+
+(* lockunspent + listlockunspent + unlock round-trip.  Locks one outpoint,
+   verifies it shows up in listlockunspent with the display-reversed txid,
+   then unlocks it and verifies the list is empty again. *)
+let test_lockunspent_roundtrip () =
+  let (ctx, db, wallet, op_a, _op_b) = create_lockunspent_context () in
+  (* Empty initially. *)
+  let r = Rpc.handle_listlockunspent ctx [] in
+  Alcotest.(check bool) "empty list initially" true
+    (match r with `List [] -> true | _ -> false);
+  (* lockunspent false [{txid_a, vout=0}] — display-reversed txid hex. *)
+  let txid_a_disp = Types.hash256_to_hex_display op_a.Types.txid in
+  let lock_result = Rpc.handle_lockunspent ctx [
+    `Bool false;
+    `List [`Assoc [("txid", `String txid_a_disp); ("vout", `Int 0)]];
+  ] in
+  Alcotest.(check bool) "lockunspent ok" true
+    (match lock_result with Ok (`Bool true) -> true | _ -> false);
+  Alcotest.(check bool) "wallet records lock" true
+    (Wallet.is_locked_coin wallet op_a);
+  (* listlockunspent — must report the locked outpoint. *)
+  let r2 = Rpc.handle_listlockunspent ctx [] in
+  let count = match r2 with `List l -> List.length l | _ -> 0 in
+  Alcotest.(check int) "list has one entry" 1 count;
+  (* Re-locking with persistent=false must error per Core (already locked). *)
+  let dup = Rpc.handle_lockunspent ctx [
+    `Bool false;
+    `List [`Assoc [("txid", `String txid_a_disp); ("vout", `Int 0)]];
+  ] in
+  Alcotest.(check bool) "duplicate lock rejected" true (Result.is_error dup);
+  (* Unlock the same outpoint. *)
+  let unlock_result = Rpc.handle_lockunspent ctx [
+    `Bool true;
+    `List [`Assoc [("txid", `String txid_a_disp); ("vout", `Int 0)]];
+  ] in
+  Alcotest.(check bool) "unlockunspent ok" true
+    (match unlock_result with Ok (`Bool true) -> true | _ -> false);
+  Alcotest.(check bool) "wallet no longer locked" false
+    (Wallet.is_locked_coin wallet op_a);
+  let r3 = Rpc.handle_listlockunspent ctx [] in
+  Alcotest.(check bool) "list empty after unlock" true
+    (match r3 with `List [] -> true | _ -> false);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* lockunspent rejects unknown outpoints (Core's "Invalid parameter, unknown
+   transaction" path: parent tx is not in the wallet). *)
+let test_lockunspent_unknown_tx_rejected () =
+  let (ctx, db, _wallet, _op_a, _op_b) = create_lockunspent_context () in
+  let bogus = Types.hash256_to_hex_display
+    (Types.hash256_of_hex
+       "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef") in
+  let r = Rpc.handle_lockunspent ctx [
+    `Bool false;
+    `List [`Assoc [("txid", `String bogus); ("vout", `Int 0)]];
+  ] in
+  Alcotest.(check bool) "unknown tx rejected" true (Result.is_error r);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* lockunspent unlock=true with no transaction array clears all locks
+   (Core: lockunspent true is the documented "clear everything" form). *)
+let test_lockunspent_unlock_all () =
+  let (ctx, db, wallet, op_a, op_b) = create_lockunspent_context () in
+  (* Lock both outpoints. *)
+  let _ = Wallet.lock_coin wallet op_a ~persistent:false in
+  let _ = Wallet.lock_coin wallet op_b ~persistent:false in
+  Alcotest.(check int) "two locks before clear" 2
+    (List.length (Wallet.list_locked_coins wallet));
+  (* Call lockunspent true with no tx array. *)
+  let r = Rpc.handle_lockunspent ctx [`Bool true] in
+  Alcotest.(check bool) "unlock-all ok" true
+    (match r with Ok (`Bool true) -> true | _ -> false);
+  Alcotest.(check int) "no locks after clear" 0
+    (List.length (Wallet.list_locked_coins wallet));
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* signmessage Core-shape: handler accepts (address, message) and signs with
+   the private key the wallet holds for that address.  This is the new
+   behaviour mandated by Core's wallet/rpc/signmessage.cpp::signmessage. *)
+let test_signmessage_address_shape () =
+  let (ctx, db, _utxo, _, _) = create_test_context () in
+  let wallet = Wallet.create ~network:`Mainnet ~db_path:"" in
+  (* Import a known privkey under P2PKH so the wallet has a key associated
+     with a P2PKH address (signmessage accepts only PKHash, per Core). *)
+  let priv_hex =
+    "0a0b0c0d0e0f1011121314151617181920212223242526272829303132333435" in
+  let priv = Cstruct.of_hex priv_hex in
+  let wif = Address.wif_encode ~compressed:true ~network:`Mainnet priv in
+  let kp = match Wallet.import_wif wallet ~addr_type:Wallet.P2PKH wif with
+    | Ok kp -> kp
+    | Error e -> Alcotest.fail ("import_wif failed: " ^ e)
+  in
+  let address = Address.address_to_string kp.Wallet.address in
+  let ctx = { ctx with wallet = Some wallet } in
+  (* signmessage with address (NOT WIF) and a message. *)
+  let r = Rpc.handle_signmessage ctx [`String address; `String "hello"] in
+  Alcotest.(check bool) "signmessage ok" true (Result.is_ok r);
+  let sig_b64 = match r with
+    | Ok (`String s) -> s
+    | _ -> Alcotest.fail "expected base64 sig"
+  in
+  Alcotest.(check int) "b64 sig length" 88 (String.length sig_b64);
+  (* Now verify with verifymessage — round-trip must succeed. *)
+  let v = Rpc.handle_verifymessage ctx
+    [`String address; `String sig_b64; `String "hello"] in
+  Alcotest.(check bool) "verifymessage true" true
+    (match v with Ok (`Bool true) -> true | _ -> false);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* signmessage retains backward compatibility: if the first arg is a WIF
+   (legacy callers / cross-impl probes), it routes to the privkey-signing
+   path and still produces a valid signature without needing a wallet. *)
+let test_signmessage_wif_compat () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  let priv_hex =
+    "1010101010101010101010101010101010101010101010101010101010101010" in
+  let (wif, address) = make_test_wif_and_address priv_hex in
+  let r = Rpc.handle_signmessage ctx [`String wif; `String "compat"] in
+  Alcotest.(check bool) "wif compat ok" true (Result.is_ok r);
+  let sig_b64 = match r with
+    | Ok (`String s) -> s
+    | _ -> Alcotest.fail "expected sig"
+  in
+  let v = Rpc.handle_verifymessage ctx
+    [`String address; `String sig_b64; `String "compat"] in
+  Alcotest.(check bool) "verify ok via wif compat" true
+    (match v with Ok (`Bool true) -> true | _ -> false);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* signmessage with non-P2PKH address must error: Core enforces PKHash-only
+   in wallet/rpc/signmessage.cpp:55-57.  We mirror that. *)
+let test_signmessage_non_p2pkh_address_rejected () =
+  let (ctx, db, _utxo, _, _) = create_test_context () in
+  let wallet = Wallet.create ~network:`Mainnet ~db_path:"" in
+  let priv_hex =
+    "2020202020202020202020202020202020202020202020202020202020202020" in
+  let priv = Cstruct.of_hex priv_hex in
+  let wif = Address.wif_encode ~compressed:true ~network:`Mainnet priv in
+  let kp = match Wallet.import_wif wallet ~addr_type:Wallet.P2WPKH wif with
+    | Ok kp -> kp
+    | Error e -> Alcotest.fail ("import_wif failed: " ^ e)
+  in
+  let p2wpkh_addr = Address.address_to_string kp.Wallet.address in
+  let ctx = { ctx with wallet = Some wallet } in
+  let r = Rpc.handle_signmessage ctx [`String p2wpkh_addr; `String "hi"] in
+  Alcotest.(check bool) "P2WPKH address rejected" true (Result.is_error r);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* walletcreatefundedpsbt: empty inputs + outputs to a destination triggers
+   coin selection, returns a PSBT that decodes back to a tx with at least
+   one input and the destination output, plus a non-negative fee. *)
+let test_walletcreatefundedpsbt_basic () =
+  let (ctx, db, _wallet, _op_a, _op_b) = create_lockunspent_context () in
+  (* Destination address (mainnet P2WPKH). *)
+  let dest_priv = Cstruct.of_hex
+    "3030303030303030303030303030303030303030303030303030303030303030" in
+  let dest_pub = Crypto.derive_public_key ~compressed:true dest_priv in
+  let dest_addr = Address.of_pubkey ~network:`Mainnet
+    Address.P2WPKH dest_pub in
+  let dest_str = Address.address_to_string dest_addr in
+  (* Send 0.1 BTC, default fee_rate. *)
+  let result = Rpc.handle_walletcreatefundedpsbt ctx [
+    `List [];
+    `List [`Assoc [(dest_str, `Float 0.1)]];
+  ] in
+  Alcotest.(check bool) "wcfp ok" true (Result.is_ok result);
+  let fields = match result with
+    | Ok (`Assoc f) -> f
+    | _ -> Alcotest.fail "expected assoc result"
+  in
+  let psbt_b64 = match List.assoc "psbt" fields with
+    | `String s -> s | _ -> Alcotest.fail "psbt field shape"
+  in
+  Alcotest.(check bool) "psbt nonempty" true (String.length psbt_b64 > 0);
+  (* Decode + check structural properties. *)
+  let psbt = match Psbt.of_base64 psbt_b64 with
+    | Ok p -> p
+    | Error e -> Alcotest.fail ("psbt decode: " ^ Psbt.string_of_error e)
+  in
+  Alcotest.(check bool) "≥1 input" true (List.length psbt.tx.inputs >= 1);
+  Alcotest.(check bool) "≥1 output" true (List.length psbt.tx.outputs >= 1);
+  (* Witness UTXO populated for the wallet's selected input. *)
+  let any_witness_utxo = List.exists (fun (i : Psbt.psbt_input) ->
+    i.witness_utxo <> None
+  ) psbt.inputs in
+  Alcotest.(check bool) "witness_utxo set" true any_witness_utxo;
+  let fee = match List.assoc "fee" fields with
+    | `Float f -> f | _ -> Alcotest.fail "fee field shape"
+  in
+  Alcotest.(check bool) "fee non-negative" true (fee >= 0.0);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -2231,5 +2469,21 @@ let () =
         test_submitpackage_too_many;
       test_case "dispatcher routes submitpackage" `Quick
         test_submitpackage_dispatcher;
+    ];
+    "wallet_wave", [
+      test_case "lockunspent + listlockunspent round-trip" `Quick
+        test_lockunspent_roundtrip;
+      test_case "lockunspent rejects unknown tx" `Quick
+        test_lockunspent_unknown_tx_rejected;
+      test_case "lockunspent unlock-all clears every lock" `Quick
+        test_lockunspent_unlock_all;
+      test_case "signmessage Core-shape (address, message)" `Quick
+        test_signmessage_address_shape;
+      test_case "signmessage WIF backward-compat path" `Quick
+        test_signmessage_wif_compat;
+      test_case "signmessage rejects non-P2PKH address" `Quick
+        test_signmessage_non_p2pkh_address_rejected;
+      test_case "walletcreatefundedpsbt basic funding" `Quick
+        test_walletcreatefundedpsbt_basic;
     ];
   ]

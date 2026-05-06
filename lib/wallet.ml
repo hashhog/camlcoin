@@ -397,6 +397,8 @@ type t = {
   sent_transactions : (string, Types.transaction) Hashtbl.t;
   mutable tx_history : tx_history_entry list;
   mutable encryption : encryption_state;
+  (* lockunspent: outpoint -> persistent flag (true = written to disk) *)
+  locked_coins : (string * int32, bool) Hashtbl.t;
 }
 
 (* ============================================================================
@@ -429,7 +431,9 @@ let create ~(network : [`Mainnet | `Testnet | `Regtest])
       encrypted_master_key = None;
       lock_state = Unlocked { master_key = Cstruct.empty; expires = infinity };
       encrypted_keys = Hashtbl.create 16;
-    } }
+    };
+    locked_coins = Hashtbl.create 16;
+  }
 
 (* ============================================================================
    HD Wallet Initialization
@@ -2240,6 +2244,53 @@ let clear_utxos (w : t) : unit =
   w.utxos <- [];
   w.balance_confirmed <- 0L;
   w.balance_unconfirmed <- 0L
+
+(* ============================================================================
+   Locked coins (lockunspent / listlockunspent)
+   Mirrors Bitcoin Core CWallet::{LockCoin,UnlockCoin,IsLockedCoin,
+   ListLockedCoins,UnlockAllCoins} (src/wallet/wallet.cpp).  In-memory locks
+   are dropped on process exit (Core wipes m_setLockedCoins for unwritten
+   entries on restart); we have no on-disk lockset yet, so persistent=true
+   currently behaves like persistent=false but is accepted for API parity.
+   ============================================================================ *)
+
+(* Internal key: txid hex (32 bytes raw -> 64 hex chars) + vout.  We use the
+   raw byte string (not display-reversed) so the encoding is canonical. *)
+let outpoint_key (op : Types.outpoint) : string * int32 =
+  (Cstruct.to_string op.Types.txid, op.Types.vout)
+
+(* Lock a coin.  Returns false if already locked AND we're not upgrading from
+   in-memory to persistent.  Matches Core's behaviour where re-locking with
+   persistent=true upgrades the entry. *)
+let lock_coin (w : t) (op : Types.outpoint) ~(persistent : bool) : bool =
+  let k = outpoint_key op in
+  (match Hashtbl.find_opt w.locked_coins k with
+   | Some existing_persistent when existing_persistent || not persistent ->
+     (* Already locked with at-least the requested persistence: nothing to do
+        except return success (Core's LockCoin always returns true in this
+        path; the caller already filtered duplicates). *)
+     ()
+   | _ ->
+     Hashtbl.replace w.locked_coins k persistent);
+  true
+
+let unlock_coin (w : t) (op : Types.outpoint) : bool =
+  let k = outpoint_key op in
+  Hashtbl.remove w.locked_coins k;
+  true
+
+let is_locked_coin (w : t) (op : Types.outpoint) : bool =
+  Hashtbl.mem w.locked_coins (outpoint_key op)
+
+let unlock_all_coins (w : t) : bool =
+  Hashtbl.clear w.locked_coins;
+  true
+
+let list_locked_coins (w : t) : Types.outpoint list =
+  Hashtbl.fold (fun (txid_str, vout) _persistent acc ->
+    let op = { Types.txid = Cstruct.of_string txid_str; vout } in
+    op :: acc
+  ) w.locked_coins []
 
 (* ============================================================================
    Legacy Interface (for backward compatibility)

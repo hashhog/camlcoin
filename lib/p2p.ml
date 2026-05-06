@@ -10,6 +10,7 @@ let message_header_size = 24
 let max_message_size = 4 * 1000 * 1000  (* 4 MB max message, matches Bitcoin Core MAX_PROTOCOL_MESSAGE_LENGTH *)
 let max_inv_count = 50_000
 let max_headers_count = 2000
+let max_locator_size = 101  (* Core MAX_LOCATOR_SZ; chain.h *)
 let max_addr_count = 1000
 
 (* Network magic bytes for different networks *)
@@ -425,6 +426,11 @@ let serialize_getblocks w ~version ~locator_hashes ~hash_stop =
 let deserialize_getblocks r =
   let version = Serialize.read_int32_le r in
   let count = Serialize.read_compact_size r in
+  (* Anti-DoS: Bitcoin Core MAX_LOCATOR_SZ = 101 (chain.h). Reject before
+     allocating the list to prevent an attacker from forcing arbitrary
+     memory allocation via a crafted getblocks/getheaders message. *)
+  if count > max_locator_size then
+    failwith (Printf.sprintf "locator size %d exceeds MAX_LOCATOR_SZ" count);
   let locator_hashes = List.init count
     (fun _ -> Serialize.read_bytes r 32) in
   let hash_stop = Serialize.read_bytes r 32 in

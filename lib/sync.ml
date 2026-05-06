@@ -2426,9 +2426,365 @@ let tx_index_erase_for_block (db : Storage.ChainDB.t)
     Storage.ChainDB.delete_tx_index db txid
   ) block.transactions
 
-(* Perform chain reorganization to new tip
-   IMPORTANT: This restores UTXOs spent on the old chain and spends
-   UTXOs on the new chain. This is critical for UTXO set consistency. *)
+(* ============================================================================
+   Multi-block reorg atomicity (Pattern D-FULL closure 2026-05-05)
+   ============================================================================
+
+   [reorganize] orchestrates the disconnect-then-reconnect of a chain split.
+   Pre-D-FULL (i.e. the [22667c2 / 838de15] state) the disconnect side
+   already used an accumulator pattern: outputs to remove and UTXOs to
+   restore from undo data piled into [ibd.pending_utxo_updates] /
+   [ibd.pending_utxo_deletes], and a single [flush_utxos] commit landed
+   them all together (Pattern D-PARTIAL — best of any impl per the
+   2026-05-05 fleet audit
+   [CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md]).
+   The reconnect side, however, was per-block: every reconnected block
+   stored its own block body, undo data, tx_index pointers, and
+   per-block UTXO flush in independent batches. A crash partway through
+   reconnect left N reconnect-batches plus the disconnect-batch on disk
+   and M-N blocks pending — a structurally observable split.
+
+   This refactor extends the accumulator to the reconnect side: ALL
+   disk mutations from BOTH halves of the reorg (UTXO puts/deletes +
+   undo data + block bodies + tx_index pointers + height-hash mappings
+   + tip flip) accumulate into ONE shared [Storage.ChainDB.batch], and
+   commit with a single [batch_write]. RocksDB's [WriteBatch] is
+   atomic (all-or-nothing on WAL replay), so a crash mid-reorg either
+   leaves the chain at the OLD tip with NOTHING applied, or at the
+   NEW tip with EVERYTHING applied — never a split.
+
+   Mirrors Bitcoin Core's reorg coordination through
+   [CCoinsViewDB::BatchWrite] ([txdb.cpp:100+]) wrapping the active-
+   chain pivot in [CChainState::ActivateBestChainStep]
+   ([validation.cpp]).
+
+   Side effects deferred until AFTER successful commit (so a rollback
+   doesn't leave hanging notifications):
+     - ZMQ block-disconnect / block-connect notifications
+     - Mempool refill (re-add disconnected txs) + per-connect-block
+       [Mempool.remove_for_block]
+     - [prune_old_blocks]
+     - In-memory [state.tip / blocks_synced / headers_synced] updates
+     - [Sig_cache.clear_global]
+
+   The [pending_view] hashtable maintains an O(1) lookup overlay for
+   the connect-side validator: a UTXO restored on the disconnect side
+   that the new chain spends, or a UTXO created by an earlier connect
+   block that a later connect block spends, must both be visible to
+   the [base_lookup] passed into [Validation.accept_block]. Without
+   the overlay, [accept_block] would read disk-only state (pre-reorg
+   UTXOs) and reject the new chain's first spend. *)
+
+(* Cap multi-block reorg depth.  Rolling back more than this many blocks
+   is almost certainly a misconfigured peer or a malicious attempt to
+   replace deep history; abort rather than burn unbounded I/O.  Bitcoin
+   Core has the same conceptual cap via the [-maxreorgdepth] knob (default
+   100 in [validation.h]'s [DEFAULT_MAX_REORG_DEPTH]).  *)
+let max_reorg_depth = 100
+
+(* O(1) overlay used by the reorg connect-side [base_lookup] and by the
+   undo-data construction loop. Mirrors the in-progress UTXO state held
+   in [ibd.pending_utxo_updates] / [ibd.pending_utxo_deletes] (which
+   carry the disk-batch payload) but in a hashtable form so a single
+   block validation doesn't re-scan an unbounded list per input. *)
+type reorg_view = {
+  view_writes : (string, string) Hashtbl.t;  (* utxo_key -> encoded UTXO *)
+  view_deletes : (string, unit) Hashtbl.t;   (* utxo_key marked spent *)
+}
+
+let reorg_view_create () : reorg_view = {
+  view_writes = Hashtbl.create 1024;
+  view_deletes = Hashtbl.create 1024;
+}
+
+(* Stable string key for the overlay: 32-byte txid (raw bytes) ++ 4-byte
+   little-endian vout. Distinct keys never collide because the txid is
+   already a 32-byte hash. *)
+let utxo_view_key (txid : Types.hash256) (vout : int) : string =
+  let key = Bytes.create 36 in
+  Bytes.blit_string (Cstruct.to_string txid) 0 key 0 32;
+  Bytes.set_uint8 key 32 (vout land 0xff);
+  Bytes.set_uint8 key 33 ((vout lsr 8) land 0xff);
+  Bytes.set_uint8 key 34 ((vout lsr 16) land 0xff);
+  Bytes.set_uint8 key 35 ((vout lsr 24) land 0xff);
+  Bytes.unsafe_to_string key
+
+let reorg_view_put (v : reorg_view) (txid : Types.hash256) (vout : int)
+    (data : string) : unit =
+  let k = utxo_view_key txid vout in
+  Hashtbl.remove v.view_deletes k;
+  Hashtbl.replace v.view_writes k data
+
+let reorg_view_delete (v : reorg_view) (txid : Types.hash256) (vout : int)
+    : unit =
+  let k = utxo_view_key txid vout in
+  Hashtbl.remove v.view_writes k;
+  Hashtbl.replace v.view_deletes k ()
+
+type view_status =
+  | View_present of string  (* encoded UTXO bytes *)
+  | View_absent              (* explicitly spent in this reorg *)
+  | View_unknown             (* fall back to disk *)
+
+let reorg_view_get (v : reorg_view) (txid : Types.hash256) (vout : int)
+    : view_status =
+  let k = utxo_view_key txid vout in
+  if Hashtbl.mem v.view_deletes k then View_absent
+  else
+    match Hashtbl.find_opt v.view_writes k with
+    | Some data -> View_present data
+    | None -> View_unknown
+
+(* Decode the on-disk UTXO blob into a [Validation.utxo].  Layout matches
+   [encode_utxo] above and [Storage.ChainDB.get_utxo]'s return value. *)
+let decode_utxo_for_lookup (txid : Types.hash256) (vout_le : int32)
+    (data : string) : Validation.utxo =
+  let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+  let value = Serialize.read_int64_le r in
+  let script_len = Serialize.read_compact_size r in
+  let script = Serialize.read_bytes r script_len in
+  let stored_height = Int32.to_int (Serialize.read_int32_le r) in
+  let utxo_is_coinbase = Serialize.read_uint8 r = 1 in
+  Validation.{
+    txid;
+    vout = vout_le;
+    value;
+    script_pubkey = script;
+    height = stored_height;
+    is_coinbase = utxo_is_coinbase;
+  }
+
+(* [batch] in this module is [Storage.ChainDB.batch]; the alias keeps the
+   reorg helpers below readable without importing the whole module. *)
+
+(* Disconnect-side accumulator: stage every disk mutation needed to undo
+   one block into the shared [batch] and the [pending_view] overlay.
+   Mirrors the existing per-block disconnect pattern but writes through
+   a caller-supplied batch instead of via [delete_undo_data] /
+   [tx_index_erase_for_block] direct calls. The block body itself is
+   retained on disk (Core parity — disconnected blocks remain
+   available on side-branches for [getblock <hash>]). *)
+let disconnect_block_into_batch
+    (ibd : ibd_state) (batch : Storage.ChainDB.batch)
+    (view : reorg_view)
+    (entry : header_entry)
+    : (Types.transaction list, string) result =
+  let state = ibd.chain in
+  match Storage.ChainDB.get_block state.db entry.hash with
+  | None ->
+    Error (Printf.sprintf
+      "Missing block at height %d during reorg disconnect" entry.height)
+  | Some block ->
+    match Storage.ChainDB.get_undo_data state.db entry.hash with
+    | None ->
+      Error (Printf.sprintf
+        "Missing undo data at height %d during reorg disconnect" entry.height)
+    | Some undo_raw ->
+      let r = Serialize.reader_of_cstruct (Cstruct.of_string undo_raw) in
+      let undo = Utxo.deserialize_undo_data r in
+      (* Collect non-coinbase txs for mempool re-addition (deferred). *)
+      let txs_for_mempool =
+        List.filter_map (fun (i, tx) ->
+          if i > 0 then Some tx else None)
+        (List.mapi (fun i tx -> (i, tx)) block.transactions)
+      in
+      (* Remove outputs created by this block (reverse tx order). *)
+      let txs_rev = List.rev block.transactions in
+      List.iter (fun tx ->
+        let txid = Crypto.compute_txid tx in
+        List.iteri (fun vout _out ->
+          ibd.pending_utxo_deletes <-
+            (txid, vout) :: ibd.pending_utxo_deletes;
+          reorg_view_delete view txid vout
+        ) tx.Types.outputs
+      ) txs_rev;
+      (* Restore spent outputs from undo data. *)
+      List.iter (fun (tx_undo : Utxo.tx_undo) ->
+        List.iter (fun (outpoint, utxo_entry) ->
+          let data = encode_utxo utxo_entry.Utxo.value
+              utxo_entry.Utxo.script_pubkey utxo_entry.Utxo.height
+              utxo_entry.Utxo.is_coinbase in
+          let vout = Int32.to_int outpoint.Types.vout in
+          ibd.pending_utxo_updates <-
+            (outpoint.Types.txid, vout, data)
+            :: ibd.pending_utxo_updates;
+          reorg_view_put view outpoint.Types.txid vout data
+        ) tx_undo.spent_outputs
+      ) undo.tx_undos;
+      (* Stage [delete_undo_data] for the disconnected block (now stale). *)
+      Storage.ChainDB.batch_delete_undo_data batch entry.hash;
+      (* Stage [tx_index_erase] for every tx in the block (Pattern C0
+         counterpart of [TxIndex::CustomRemove]). The raw tx blob in the
+         [tx] CF is retained for explicit-blockhash [getrawtransaction]
+         lookups, matching [tx_index_erase_for_block]'s on-disk policy. *)
+      List.iter (fun tx ->
+        let txid = Crypto.compute_txid tx in
+        Storage.ChainDB.batch_delete_tx_index batch txid
+      ) block.transactions;
+      Logs.debug (fun m ->
+        m "Staged disconnect for block at height %d" entry.height);
+      Ok txs_for_mempool
+
+(* Connect-side accumulator: the symmetric counterpart of
+   [disconnect_block_into_batch]. Validates the new chain's block,
+   then stages its block body, undo data, tx_index, and UTXO delta
+   into the shared [batch] and overlay [view]. The validator's
+   [base_lookup] reads through the overlay so an input spent on the
+   new chain that resolves to a UTXO restored by an earlier
+   disconnect step (or created by an earlier connect step) is found
+   without an intermediate disk flush. *)
+let connect_block_into_batch
+    (ibd : ibd_state) (batch : Storage.ChainDB.batch)
+    (view : reorg_view)
+    (entry : header_entry)
+    : (Types.block, string) result =
+  let state = ibd.chain in
+  match Storage.ChainDB.get_block state.db entry.hash with
+  | None ->
+    Error (Printf.sprintf
+      "Missing block at height %d during reorg connect" entry.height)
+  | Some block ->
+    let height = entry.height in
+    let expected_bits = compute_expected_bits state height block.header in
+    let median_time = compute_median_time_past state height in
+    (* Lookup that reads through the overlay first, then disk. Used by
+       [accept_block] for input resolution and below for undo-data
+       construction. *)
+    let lookup outpoint =
+      let vout = Int32.to_int outpoint.Types.vout in
+      match reorg_view_get view outpoint.Types.txid vout with
+      | View_absent -> None
+      | View_present data ->
+        Some (decode_utxo_for_lookup outpoint.Types.txid
+                outpoint.Types.vout data)
+      | View_unknown ->
+        (match Storage.ChainDB.get_utxo state.db outpoint.Types.txid vout with
+         | None -> None
+         | Some data ->
+           Some (decode_utxo_for_lookup outpoint.Types.txid
+                   outpoint.Types.vout data))
+    in
+    (* Same overlay-aware reader, but returns a [Utxo.utxo_entry] for the
+       undo-data builder.  Both call sites must share the overlay so the
+       undo data we write reflects what the connect step actually spent
+       (rather than the stale pre-reorg disk image). *)
+    let lookup_utxo_entry (prev : Types.outpoint)
+        : (Types.outpoint * Utxo.utxo_entry) option =
+      let vout = Int32.to_int prev.Types.vout in
+      let decode_entry data : Utxo.utxo_entry =
+        let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+        Utxo.deserialize_utxo_entry r
+      in
+      match reorg_view_get view prev.Types.txid vout with
+      | View_absent -> None
+      | View_present data -> Some (prev, decode_entry data)
+      | View_unknown ->
+        (match Storage.ChainDB.get_utxo state.db prev.Types.txid vout with
+         | None -> None
+         | Some data -> Some (prev, decode_entry data))
+    in
+    let skip_scripts = is_assume_valid state height in
+    let validation_flags =
+      if skip_scripts then 0
+      else Consensus.get_block_script_flags height state.network
+    in
+    (match Validation.accept_block
+             ~network:state.network ~block ~height
+             ~expected_bits ~median_time ~base_lookup:lookup
+             ~flags:validation_flags ~skip_scripts
+             ~get_mtp_at_height:(get_mtp_for_height state) () with
+     | Validation.AB_err e ->
+       (match ibd.misbehavior_handler with
+        | Some _handler ->
+          Logs.warn (fun m ->
+            m "Invalid block at height %d during reorg (no peer to penalize)" height)
+        | None -> ());
+       Error (Printf.sprintf
+         "Block validation failed at height %d during reorg: %s"
+         height (Validation.block_error_to_string e))
+     | Validation.AB_ok (_fees, _txid_arr, _spent_utxos) ->
+       (* Stage block body if not already on disk. The disk write is
+          idempotent — the active path that brought us here always
+          stored the body when it was first received, but a side-branch
+          accepted via [register_side_branch_header] may not have. *)
+       if not (Storage.ChainDB.has_block state.db entry.hash) then
+         Storage.ChainDB.batch_store_block batch entry.hash block;
+       (* Build undo data from overlay-aware lookups. *)
+       let tx_undos = List.filter_map (fun (tx_idx, tx) ->
+         if tx_idx > 0 then begin
+           let spent = List.filter_map (fun inp ->
+             lookup_utxo_entry inp.Types.previous_output
+           ) tx.Types.inputs in
+           Some Utxo.{ spent_outputs = spent }
+         end else None
+       ) (List.mapi (fun i tx -> (i, tx)) block.transactions) in
+       let undo : Utxo.undo_data = { height; tx_undos } in
+       let uw = Serialize.writer_create () in
+       Utxo.serialize_undo_data uw undo;
+       Storage.ChainDB.batch_store_undo_data batch entry.hash
+         (Cstruct.to_string (Serialize.writer_to_cstruct uw));
+       (* Stage tx_index pointers (Pattern C0 counterpart of
+          [TxIndex::CustomAppend]). The raw tx blob goes into the
+          [tx] CF, the txid->(block_hash, tx_idx) pointer into the
+          [tx_index] CF — both via the shared batch. *)
+       List.iteri (fun tx_idx tx ->
+         let txid = Crypto.compute_txid tx in
+         Storage.ChainDB.batch_store_transaction batch txid tx;
+         Storage.ChainDB.batch_store_tx_index batch txid entry.hash tx_idx
+       ) block.transactions;
+       (* Stage UTXO delta. Skip provably-unspendable outputs for
+          Core-[AddCoins] parity (see the 22667c2 commit for the
+          SegWit OP_RETURN coinbase commitment that motivated this
+          filter on the reorg-connect path). *)
+       List.iteri (fun tx_idx tx ->
+         let txid = Crypto.compute_txid tx in
+         let is_cb = (tx_idx = 0) in
+         if not (Consensus.is_genesis_coinbase height txid) then begin
+           List.iteri (fun vout out ->
+             if not (Utxo.is_unspendable_script
+                       out.Types.script_pubkey) then begin
+               let data = encode_utxo out.Types.value
+                   out.Types.script_pubkey height is_cb in
+               ibd.pending_utxo_updates <-
+                 (txid, vout, data) :: ibd.pending_utxo_updates;
+               reorg_view_put view txid vout data
+             end
+           ) tx.Types.outputs
+         end;
+         if not is_cb then begin
+           List.iter (fun inp ->
+             let prev = inp.Types.previous_output in
+             let vout = Int32.to_int prev.Types.vout in
+             ibd.pending_utxo_deletes <-
+               (prev.Types.txid, vout) :: ibd.pending_utxo_deletes;
+             reorg_view_delete view prev.Types.txid vout
+           ) tx.Types.inputs
+         end
+       ) block.transactions;
+       Logs.debug (fun m ->
+         m "Staged connect for block at height %d during reorg" height);
+       Ok block)
+
+(* Stage the accumulated [pending_utxo_updates] / [pending_utxo_deletes]
+   into the shared batch and clear the in-memory lists.  Order matches
+   [flush_utxos]: puts first, then deletes — RocksDB applies in batch
+   order, so a (put, delete) collision on the same key is resolved
+   delete-wins, which is what we want for any input spent in the same
+   reorg as it was created/restored.  *)
+let stage_pending_utxos_into_batch
+    (ibd : ibd_state) (batch : Storage.ChainDB.batch) : unit =
+  List.iter (fun (txid, vout, data) ->
+    Storage.ChainDB.batch_store_utxo batch txid vout data
+  ) ibd.pending_utxo_updates;
+  List.iter (fun (txid, vout) ->
+    Storage.ChainDB.batch_delete_utxo batch txid vout
+  ) ibd.pending_utxo_deletes;
+  ibd.pending_utxo_updates <- [];
+  ibd.pending_utxo_deletes <- []
+
+(* Perform chain reorganization to new tip.  D-FULL atomicity: all
+   disk writes from BOTH halves of the reorg land in ONE [batch_write].
+   See the comment block above [max_reorg_depth] for the rationale. *)
 let reorganize (ibd : ibd_state) (new_tip : header_entry)
     : (unit, string) result =
   let state = ibd.chain in
@@ -2436,255 +2792,127 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
     | Some t -> t
     | None -> failwith "No current tip"
   in
-  (* Avoid reorg if new tip isn't better *)
   if Consensus.work_compare new_tip.total_work current_tip.total_work <= 0 then
     Error "New tip does not have more work"
   else begin
     match find_fork_point state current_tip new_tip with
     | Error e -> Error e
     | Ok fork_point ->
-      Logs.info (fun m ->
-        m "Reorganizing from height %d to %d (fork at %d)"
-          current_tip.height new_tip.height fork_point.height);
-      (* Collect blocks to disconnect (current chain from tip to fork) *)
-      let to_disconnect = collect_path state fork_point current_tip in
-      (* Collect blocks to connect (new chain from fork to new tip) *)
-      let to_connect = collect_path state fork_point new_tip in
-      (* Disconnect blocks in reverse order (tip back to fork): restore spent UTXOs *)
-      let disconnected_txs = ref [] in
-      let rec disconnect_blocks = function
-        | [] -> Ok ()
-        | (entry : header_entry) :: rest ->
-          match Storage.ChainDB.get_block state.db entry.hash with
-          | None ->
-            Error (Printf.sprintf
-              "Missing block at height %d during reorg disconnect" entry.height)
-          | Some block ->
-            (* Collect non-coinbase transactions for mempool re-addition *)
-            List.iteri (fun tx_idx tx ->
-              if tx_idx > 0 then
-                disconnected_txs := tx :: !disconnected_txs
-            ) block.transactions;
-            match Storage.ChainDB.get_undo_data state.db entry.hash with
-            | None ->
-              Error (Printf.sprintf
-                "Missing undo data at height %d during reorg disconnect" entry.height)
-            | Some undo_raw ->
-              let r = Serialize.reader_of_cstruct (Cstruct.of_string undo_raw) in
-              let undo = Utxo.deserialize_undo_data r in
-              (* Remove outputs created by this block (reverse tx order) *)
-              let txs = List.rev block.transactions in
-              List.iter (fun tx ->
-                let txid = Crypto.compute_txid tx in
-                List.iteri (fun vout _out ->
-                  ibd.pending_utxo_deletes <- (txid, vout) :: ibd.pending_utxo_deletes
-                ) tx.Types.outputs
-              ) txs;
-             (* Restore spent outputs from undo data *)
-             List.iter (fun (tx_undo : Utxo.tx_undo) ->
-               List.iter (fun (outpoint, utxo_entry) ->
-                 let data = encode_utxo utxo_entry.Utxo.value
-                     utxo_entry.Utxo.script_pubkey utxo_entry.Utxo.height
-                     utxo_entry.Utxo.is_coinbase in
-                 ibd.pending_utxo_updates <-
-                   (outpoint.Types.txid, Int32.to_int outpoint.Types.vout, data)
-                   :: ibd.pending_utxo_updates
-               ) tx_undo.spent_outputs
-             ) undo.tx_undos;
-              (* Clean up stored undo data for disconnected block *)
-              Storage.ChainDB.delete_undo_data state.db entry.hash;
-              (* Erase tx_index entries for every tx in the disconnected
-                 block (Pattern C0 closure 2026-05-05). Mirrors Bitcoin
-                 Core's [TxIndex::CustomRemove] (txindex.cpp:69-83) fired
-                 from [BaseIndex::BlockDisconnected]. Without this,
-                 [getrawtransaction] returns stale block_hash + positive
-                 confirmations for transactions whose only confirming
-                 block was just disconnected (Pattern C1). *)
-              tx_index_erase_for_block state.db block;
-              (* Notify ZMQ subscribers about block disconnect *)
-              zmq_notify_block ibd block entry.hash false;
-              Logs.debug (fun m ->
-                m "Disconnected block at height %d" entry.height);
-              disconnect_blocks rest
-      in
-      match disconnect_blocks (List.rev to_disconnect) with
-      | Error e ->
-        Logs.err (fun m -> m "Reorg aborted during disconnect: %s" e);
-        ibd.pending_utxo_deletes <- [];
-        ibd.pending_utxo_updates <- [];
-        Error e
-      | Ok () ->
-      (* Clear signature cache on reorg to prevent stale entries *)
-      Sig_cache.clear_global ();
-      (* Flush pending UTXO changes from disconnect before connecting *)
-      flush_utxos ibd;
-      (* Re-add disconnected transactions to mempool if available *)
-      (match ibd.mempool with
-       | Some mp ->
-         List.iter (fun tx ->
-           ignore (Mempool.add_transaction mp tx)
-         ) !disconnected_txs;
-         Logs.debug (fun m ->
-           m "Re-added %d disconnected transactions to mempool"
-             (List.length !disconnected_txs))
-       | None -> ());
-      (* Connect blocks on the new chain from fork forward *)
-      let connect_error = ref None in
-      List.iter (fun (entry : header_entry) ->
-        if !connect_error = None then
-          match Storage.ChainDB.get_block state.db entry.hash with
-          | None ->
-            connect_error := Some (Printf.sprintf
-              "Missing block at height %d during reorg connect" entry.height)
-          | Some block ->
-            let height = entry.height in
-            (* Compute expected difficulty from chain state *)
-            let expected_bits = compute_expected_bits state height block.header in
-            (* Compute median time past from last 11 blocks *)
-            let median_time = compute_median_time_past state height in
-            let lookup outpoint =
-              let vout = Int32.to_int outpoint.Types.vout in
-              match Storage.ChainDB.get_utxo state.db outpoint.Types.txid vout with
-              | None -> None
-              | Some data ->
-                let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
-                let value = Serialize.read_int64_le r in
-                let script_len = Serialize.read_compact_size r in
-                let script = Serialize.read_bytes r script_len in
-                let stored_height = Int32.to_int (Serialize.read_int32_le r) in
-                let utxo_is_coinbase = Serialize.read_uint8 r = 1 in
-                Some Validation.{
-                  txid = outpoint.Types.txid;
-                  vout = outpoint.Types.vout;
-                  value;
-                  script_pubkey = script;
-                  height = stored_height;
-                  is_coinbase = utxo_is_coinbase;
-                }
-            in
-            let skip_scripts = is_assume_valid state height in
-            let validation_flags =
-              if skip_scripts then 0
-              else Consensus.get_block_script_flags height state.network
-            in
-            (* accept_block: unified ProcessNewBlock check pipeline,
-               same as all other block-acceptance paths.
-               Reference: bitcoin-core/src/validation.cpp ProcessNewBlock. *)
-            (match Validation.accept_block
-                     ~network:state.network ~block ~height
-                     ~expected_bits ~median_time ~base_lookup:lookup
-                     ~flags:validation_flags ~skip_scripts
-                     ~get_mtp_at_height:(get_mtp_for_height state) () with
-             | Validation.AB_ok (_fees, _txid_arr, _spent_utxos) ->
-               (* Store block if not already stored *)
-               if not (Storage.ChainDB.has_block state.db entry.hash) then
-                 Storage.ChainDB.store_block state.db entry.hash block;
-               (* Build and store undo data *)
-               let tx_undos = List.filter_map (fun (tx_idx, tx) ->
-                 if tx_idx > 0 then begin
-                   let spent = List.filter_map (fun inp ->
-                     let prev = inp.Types.previous_output in
-                     let vout = Int32.to_int prev.Types.vout in
-                     match Storage.ChainDB.get_utxo state.db prev.Types.txid vout with
-                     | None -> None
-                     | Some data ->
-                       let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
-                       let entry_utxo = Utxo.deserialize_utxo_entry r in
-                       Some (prev, entry_utxo)
-                   ) tx.Types.inputs in
-                   Some Utxo.{ spent_outputs = spent }
-                 end else None
-               ) (List.mapi (fun i tx -> (i, tx)) block.transactions) in
-               let undo : Utxo.undo_data = { height; tx_undos } in
-               let uw = Serialize.writer_create () in
-               Utxo.serialize_undo_data uw undo;
-               Storage.ChainDB.store_undo_data state.db entry.hash
-                 (Cstruct.to_string (Serialize.writer_to_cstruct uw));
-               (* Write tx_index entries for every tx connected by this
-                  reorg-connect (Pattern C0 closure 2026-05-05). Mirrors
-                  Bitcoin Core's [TxIndex::CustomAppend] fired by
-                  [BaseIndex::BlockConnected]. *)
-               tx_index_write_for_block_recompute state.db block entry.hash;
-               (* Update UTXOs.
-                  Skip provably-unspendable outputs (OP_RETURN, oversized
-                  scripts) so the post-reorg chainstate matches Core's
-                  [AddCoins] semantics. Without this filter the SegWit
-                  coinbase OP_RETURN witness commitment lands in the
-                  UTXO set on the connect side of every reorg, doubling
-                  coinbase-tx UTXO count vs Core's chainstate and
-                  diverging [hash_serialized_3]. Mirrors
-                  [process_new_block] (sync.ml:2886-2897) which already
-                  has this filter on the IBD path; the omission here
-                  was caught when the Pattern Y fix made [submit_block]
-                  reach this connect path for the first time
-                  (corpus entry [reorg-via-submitblock] showed UTXO
-                  hash divergence post-reorg even though the tip
-                  matched). *)
-               List.iteri (fun tx_idx tx ->
-                 let txid = Crypto.compute_txid tx in
-                 let is_cb = (tx_idx = 0) in
-                 if not (Consensus.is_genesis_coinbase height txid) then begin
-                   List.iteri (fun vout out ->
-                     if not (Utxo.is_unspendable_script
-                               out.Types.script_pubkey) then begin
-                       let data = encode_utxo out.Types.value
-                           out.Types.script_pubkey height is_cb in
-                       ibd.pending_utxo_updates <-
-                         (txid, vout, data) :: ibd.pending_utxo_updates
-                     end
-                   ) tx.Types.outputs
-                 end;
-                 if not is_cb then begin
-                   List.iter (fun inp ->
-                     ibd.pending_utxo_deletes <-
-                       (inp.Types.previous_output.Types.txid,
-                        Int32.to_int inp.Types.previous_output.Types.vout)
-                       :: ibd.pending_utxo_deletes
-                   ) tx.Types.inputs
-                 end
-               ) block.transactions;
-               (* Flush after each connect to keep DB consistent for lookups *)
-               flush_utxos ibd;
-               (* Prune old blocks if pruning is enabled *)
-               prune_old_blocks state height;
-               (* Remove connected block's transactions from mempool *)
-               (match ibd.mempool with
-                | Some mp -> Mempool.remove_for_block mp block height
-                | None -> ());
-               (* Notify ZMQ subscribers about block connect *)
-               zmq_notify_block ibd block entry.hash true;
-               Logs.debug (fun m ->
-                 m "Connected block at height %d during reorg" height)
-             | Validation.AB_err e ->
-               (* During reorg, blocks come from storage so no peer_id
-                  is available; log misbehavior if we ever gain context *)
-               (match ibd.misbehavior_handler with
-                | Some _handler ->
-                  Logs.warn (fun m ->
-                    m "Invalid block at height %d during reorg (no peer to penalize)" height)
-                | None -> ());
-               connect_error := Some (Printf.sprintf
-                 "Block validation failed at height %d during reorg: %s"
-                 height (Validation.block_error_to_string e)))
-      ) to_connect;
-      (* Check for connect errors *)
-      match !connect_error with
-      | Some e -> Error e
-      | None ->
-        (* Update tip and chain state. Also advance headers_synced
-           monotonically — if the new chain tip is beyond our current
-           header watermark, peers' getheaders locator must reflect it.
-           See Bug 8 (2026-04-26): omitting this update caused chain.tip
-           and headers_synced to diverge, wedging IBD via repeated
-           re-fetch of already-known headers. *)
-        state.tip <- Some new_tip;
-        state.blocks_synced <- new_tip.height;
-        if new_tip.height > state.headers_synced then
-          state.headers_synced <- new_tip.height;
-        Storage.ChainDB.set_chain_tip state.db new_tip.hash new_tip.height;
+      (* Cap reorg depth.  Counted from the OLD tip back to the fork
+         point — that's how many blocks we'd need to disconnect. *)
+      let disconnect_depth = current_tip.height - fork_point.height in
+      let connect_depth = new_tip.height - fork_point.height in
+      if disconnect_depth > max_reorg_depth
+         || connect_depth > max_reorg_depth then
+        Error (Printf.sprintf
+          "Reorg depth %d exceeds MAX_REORG_DEPTH=%d (disconnect=%d, connect=%d)"
+          (max disconnect_depth connect_depth) max_reorg_depth
+          disconnect_depth connect_depth)
+      else begin
         Logs.info (fun m ->
-          m "Reorganization complete, new tip at height %d" new_tip.height);
-        Ok ()
+          m "Reorganizing from height %d to %d (fork at %d)"
+            current_tip.height new_tip.height fork_point.height);
+        let to_disconnect = collect_path state fork_point current_tip in
+        let to_connect = collect_path state fork_point new_tip in
+        let batch = Storage.ChainDB.batch_create () in
+        let view = reorg_view_create () in
+        (* Reset pending lists so we own them for the duration of the
+           reorg.  In normal operation the lists are empty here (callers
+           hold the chain lock around reorganize); this is a defensive
+           clear in case a prior partial run left state behind. *)
+        ibd.pending_utxo_updates <- [];
+        ibd.pending_utxo_deletes <- [];
+        let disconnected_txs = ref [] in
+        (* Disconnect side: iterate tip-back-to-fork. *)
+        let rec disconnect_blocks = function
+          | [] -> Ok ()
+          | (entry : header_entry) :: rest ->
+            (match disconnect_block_into_batch ibd batch view entry with
+             | Error e -> Error e
+             | Ok txs ->
+               disconnected_txs := txs @ !disconnected_txs;
+               disconnect_blocks rest)
+        in
+        match disconnect_blocks (List.rev to_disconnect) with
+        | Error e ->
+          Logs.err (fun m -> m "Reorg aborted during disconnect: %s" e);
+          ibd.pending_utxo_updates <- [];
+          ibd.pending_utxo_deletes <- [];
+          Error e
+        | Ok () ->
+          (* Connect side: iterate fork-forward-to-new-tip. *)
+          let connect_error = ref None in
+          let connected_blocks = ref [] in
+          List.iter (fun (entry : header_entry) ->
+            if !connect_error = None then
+              match connect_block_into_batch ibd batch view entry with
+              | Error e -> connect_error := Some e
+              | Ok block ->
+                connected_blocks := (entry, block) :: !connected_blocks
+          ) to_connect;
+          match !connect_error with
+          | Some e ->
+            Logs.err (fun m -> m "Reorg aborted during connect: %s" e);
+            ibd.pending_utxo_updates <- [];
+            ibd.pending_utxo_deletes <- [];
+            (* No batch_write happened; the on-disk image is unchanged
+               from the pre-reorg state. *)
+            Error e
+          | None ->
+            (* Stage UTXO delta + tip flip into the same batch and commit. *)
+            stage_pending_utxos_into_batch ibd batch;
+            Storage.ChainDB.batch_set_chain_tip batch new_tip.hash
+              new_tip.height;
+            Storage.ChainDB.batch_write state.db batch;
+            (* Disk is now durably at the new chain.  Apply in-memory
+               state and side effects after the commit so a crash
+               between batch_write and these updates leaves only the
+               state recoverable from disk on restart. *)
+            state.tip <- Some new_tip;
+            state.blocks_synced <- new_tip.height;
+            if new_tip.height > state.headers_synced then
+              state.headers_synced <- new_tip.height;
+            (* Clear sig cache so stale results from the abandoned chain
+               don't leak into post-reorg validation. *)
+            Sig_cache.clear_global ();
+            (* Mempool refill: re-add disconnected non-coinbase txs. *)
+            (match ibd.mempool with
+             | Some mp ->
+               List.iter (fun tx ->
+                 ignore (Mempool.add_transaction mp tx)
+               ) !disconnected_txs;
+               Logs.debug (fun m ->
+                 m "Re-added %d disconnected transactions to mempool"
+                   (List.length !disconnected_txs))
+             | None -> ());
+            (* Per-connect-block side effects: mempool eviction, prune,
+               ZMQ notify. [connected_blocks] is in reverse iteration
+               order; List.rev_iter style preserves connect order so
+               ZMQ subscribers see the disconnect-then-reconnect
+               sequence in the right direction. *)
+            (* ZMQ disconnect notifies (oldest-disconnected first =
+               most-recent-tip first, matching Core's [ChainstateManager]
+               which fires [BlockDisconnected] from the tip down). *)
+            List.iter (fun (entry : header_entry) ->
+              match Storage.ChainDB.get_block state.db entry.hash with
+              | None -> ()
+              | Some block ->
+                zmq_notify_block ibd block entry.hash false
+            ) (List.rev to_disconnect);
+            (* Connect-side effects (mempool eviction, prune, ZMQ
+               connect) iterated in fork-forward order. *)
+            List.iter (fun ((entry : header_entry), (block : Types.block)) ->
+              (match ibd.mempool with
+               | Some mp -> Mempool.remove_for_block mp block entry.height
+               | None -> ());
+              prune_old_blocks state entry.height;
+              zmq_notify_block ibd block entry.hash true
+            ) (List.rev !connected_blocks);
+            Logs.info (fun m ->
+              m "Reorganization complete, new tip at height %d"
+                new_tip.height);
+            Ok ()
+      end
   end
 
 (* ============================================================================

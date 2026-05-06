@@ -505,6 +505,12 @@ module ChainDB = struct
   type t = {
     cf : Cf_chainstate.t;
     mutable rocksdb_utxo : Rocksdb_store.t option;
+    (* [batch_write_count] counts non-empty [batch_write] commits.  Used
+       only by the test suite to assert "exactly one disk batch per
+       reorg" (Pattern D-FULL atomicity invariant); production code
+       does not branch on the value.  An empty batch (no put/delete
+       queued) is a no-op and does not increment. *)
+    mutable batch_write_count : int;
   }
 
   (* Open the Option-D chainstate. Lives at <datadir>/chainstate-rocks/ —
@@ -516,7 +522,8 @@ module ChainDB = struct
     (try Unix.mkdir path 0o755
      with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
     let cf_path = Filename.concat path "chainstate-rocks" in
-    { cf = Cf_chainstate.open_db cf_path; rocksdb_utxo = None }
+    { cf = Cf_chainstate.open_db cf_path; rocksdb_utxo = None;
+      batch_write_count = 0 }
 
   let close t = Cf_chainstate.close t.cf
 
@@ -803,7 +810,13 @@ module ChainDB = struct
      | None -> ()  (* empty batch, nothing to commit *)
      | Some b ->
        Cf_chainstate.batch_write b;
-       batch.inner <- None)
+       batch.inner <- None;
+       t.batch_write_count <- t.batch_write_count + 1)
+
+  (* Test-facing accessors for the batch-commit counter.  See [batch_write_count]
+     above for rationale. *)
+  let get_batch_write_count t : int = t.batch_write_count
+  let reset_batch_write_count t : unit = t.batch_write_count <- 0
 
   (* Iterate over all UTXOs *)
   let iter_utxos t f =
@@ -869,6 +882,45 @@ module ChainDB = struct
   let batch_delete_undo_data batch (block_hash : Types.hash256) =
     queue_op batch (fun b ->
       Cf_chainstate.batch_delete_undo_data b block_hash)
+
+  (* --- Batched block / tx / tx_index / height-hash operations ---------------
+     Added for the Pattern D-FULL reorg-atomicity refactor (sync.ml::reorganize):
+     a multi-block reorg accumulates UTXO + undo + block + tx_index + tip
+     mutations into ONE shared batch, and commits with a single batch_write.
+     Mirrors Bitcoin Core's CCoinsViewDB::BatchWrite + BlockManager
+     [WriteBlockToDisk] coordination on the active-chain flip. *)
+
+  let batch_store_block batch (hash : Types.hash256) (block : Types.block) =
+    let w = Serialize.writer_create () in
+    Serialize.serialize_block w block;
+    let data = Cstruct.to_string (Serialize.writer_to_cstruct w) in
+    queue_op batch (fun b ->
+      Cf_chainstate.batch_put_block_data b hash data)
+
+  let batch_set_height_hash batch (height : int) (hash : Types.hash256) =
+    queue_op batch (fun b ->
+      Cf_chainstate.batch_put_block_height b height hash)
+
+  let batch_store_transaction batch (txid : Types.hash256)
+      (tx : Types.transaction) =
+    let w = Serialize.writer_create () in
+    Serialize.serialize_transaction w tx;
+    let data = Cstruct.to_string (Serialize.writer_to_cstruct w) in
+    queue_op batch (fun b ->
+      Cf_chainstate.batch_put_tx b txid data)
+
+  let batch_store_tx_index batch (txid : Types.hash256)
+      (block_hash : Types.hash256) (tx_idx : int) =
+    let w = Serialize.writer_create () in
+    Serialize.write_bytes w block_hash;
+    Serialize.write_int32_le w (Int32.of_int tx_idx);
+    let data = Cstruct.to_string (Serialize.writer_to_cstruct w) in
+    queue_op batch (fun b ->
+      Cf_chainstate.batch_put_tx_index b txid data)
+
+  let batch_delete_tx_index batch (txid : Types.hash256) =
+    queue_op batch (fun b ->
+      Cf_chainstate.batch_delete_tx_index b txid)
 
   (* --- Ban list (peer_manager.ml) -----------------------------------------
      Bans were stored under LogStorage prefix "B"; in the CF backend they

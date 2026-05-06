@@ -1185,24 +1185,36 @@ let run_background_validation
   validate_next_block ()
 
 (* ============================================================================
-   Activation
-   ============================================================================ *)
+   Activation — DELETED 2026-05-05
+   ============================================================================
 
-(** Activate a snapshot chainstate, making it the active chainstate.
-    The current IBD chainstate becomes the background chainstate. *)
-let activate_snapshot ~(node_state : node_state)
-    ~(snapshot_chainstate : chainstate)
-    : (unit, string) result =
-  (* Verify snapshot has more work than current tip *)
-  if snapshot_chainstate.tip_height <= node_state.active_chainstate.tip_height then
-    Error "Snapshot does not have more work than current chain"
-  else begin
-    (* Store old chainstate as background *)
-    node_state.background_chainstate <- Some node_state.active_chainstate;
-    (* Make snapshot the active chainstate *)
-    node_state.active_chainstate <- snapshot_chainstate;
-    node_state.snapshot_height <- Some snapshot_chainstate.tip_height;
-    Logs.info (fun m -> m "[assumeutxo] Activated snapshot at height %d"
-                 snapshot_chainstate.tip_height);
-    Ok ()
-  end
+   [activate_snapshot] used to live here. It operated on [node_state] (the
+   2-chainstate IBD/snapshot pair below) and was meant to mirror Bitcoin
+   Core's [ChainstateManager::ActivateSnapshot] in [src/validation.cpp:5588]:
+   promote a freshly-loaded snapshot chainstate to "active" and demote the
+   prior tip to "background" for behind-the-scenes IBD validation.
+
+   It was removed because it had zero callers across [lib/], [bin/], and
+   [test/] — and the wider 2-chainstate machinery it depended on is dormant:
+   [node_state] / [active_chainstate] / [background_chainstate] /
+   [has_snapshot_chainstate] / [create_chainstate] are never instantiated
+   anywhere in the codebase. They were a 2026-04-29 design draft for
+   in-process Core-style dual-chainstate switching that camlcoin never
+   integrated.
+
+   What ships instead: both the CLI ([bin/main.ml::import_utxo]) and the
+   RPC ([lib/rpc.ml::handle_loadtxoutset]) symmetrically write the snapshot
+   into a sibling [chainstate_snapshot/] RocksDB directory. That data is
+   currently inert with respect to the running daemon — the live chainstate
+   used by [Sync] / [Block_import] / [Peer_manager] is the genesis-rooted
+   IBD chainstate at [<datadir>/chainstate/] and is never swapped or
+   merged with the snapshot directory. Wiring real snapshot activation is
+   an architectural change (camlcoin's chain data model would need to
+   become dual-chainstate) and is out of scope here. See the
+   2026-05-05 snapshot CLI/RPC parity audit for the GREEN scoring rationale.
+
+   The orphan supporting surface ([node_state] + [create_chainstate] +
+   [has_snapshot_chainstate]) is intentionally retained for now to keep
+   the diff narrow; a follow-up cleanup may remove that whole cluster
+   together with [run_background_validation] once the assumeutxo
+   integration plan is decided. *)

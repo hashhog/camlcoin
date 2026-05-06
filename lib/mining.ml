@@ -574,8 +574,41 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
     match validated_tip with
     | None -> Error "No validated tip found (blocks_synced=0 or missing header)"
     | Some vtip ->
-      if not (Cstruct.equal block.header.prev_block vtip.hash) then
-        Error (Printf.sprintf "Block does not build on validated tip (height %d)" validated_height)
+      if not (Cstruct.equal block.header.prev_block vtip.hash) then begin
+        (* Side-branch / heavier-fork submission (Pattern Y closure
+           2026-05-05). The block does not extend the validated tip but
+           its parent is already known. This is exactly the code path
+           Bitcoin Core's [BlockManager::AcceptBlock] handles for non-
+           best-chain blocks: store header + body, defer ConnectBlock
+           to a later [ActivateBestChain]. If the new chain has more
+           work than the active tip, [reorganize] flips the tip;
+           otherwise the side-branch is stored-but-inactive and the
+           BIP-22 result is "inconclusive" (rendered as Ok () here;
+           [bip22_of_submitblock_error] is not consulted on the
+           accept path).
+           Counterpart to rustoshi 68a422b — see
+           lib/sync.ml::try_attach_side_branch_and_reorg.
+           Pre-fix this returned "Block does not build on validated tip",
+           which the diff-test corpus surfaced as ctx-rej-h113. *)
+        let parent_key = Cstruct.to_string block.header.prev_block in
+        match Hashtbl.find_opt chain.headers parent_key with
+        | None ->
+          (* Truly orphan — neither the validated tip nor any known
+             header. Mirror Core's BIP-22 "rejected" result; the
+             previous error string ("Block does not build on validated
+             tip") is no longer accurate when the parent is also
+             unknown. *)
+          Error (Printf.sprintf
+                   "Block %s parent %s not in block index"
+                   (Types.hash256_to_hex_display hash)
+                   (Types.hash256_to_hex_display block.header.prev_block))
+        | Some parent ->
+          (* Delegate to the side-branch / reorg path. *)
+          Sync.try_attach_side_branch_and_reorg
+            ?utxo_set:utxo
+            ~mempool:mp
+            chain block parent
+      end
       else begin
         let height = validated_height + 1 in
 
@@ -663,7 +696,24 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
           let utxo_result = match utxo with
             | Some utxo_set ->
               (match Utxo.connect_block_optimized ~network_type utxo_set block height with
-               | Ok _undo ->
+               | Ok undo ->
+                 (* Persist undo data so [Sync.reorganize] (and any
+                    submitblock-driven side-branch promotion below)
+                    can roll back this block on the disconnect path.
+                    Pre-fix the happy path discarded [undo], which left
+                    the IBD-path-only [reorganize] unable to disconnect
+                    submitblock-mined blocks: every reorg crossing a
+                    submitblock-mined block tripped "Missing undo data
+                    at height N during reorg disconnect".
+
+                    Counterpart to [Sync.process_new_block:1957-1961]
+                    which calls the same [store_undo_data] for IBD
+                    blocks. Pattern Y closure 2026-05-05 (rustoshi
+                    68a422b counterpart). *)
+                 let uw = Serialize.writer_create () in
+                 Utxo.serialize_undo_data uw undo;
+                 Storage.ChainDB.store_undo_data chain.db hash
+                   (Cstruct.to_string (Serialize.writer_to_cstruct uw));
                  (* Drain the per-block dirty set into BOTH stores
                     (cf_chainstate UTXO column family + rocksdb_utxo) via
                     the same [apply_block_atomic] path used by

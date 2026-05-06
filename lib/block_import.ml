@@ -94,6 +94,13 @@ let run ~(ic : in_channel) ~(db : Storage.ChainDB.t)
       let network_type = network.Consensus.network_type in
       (match Utxo.connect_block_optimized ~network_type utxo block height with
        | Ok _undo ->
+         (* Write tx_index entries for every tx in the imported block
+            (Pattern C0 closure 2026-05-05). Mirrors
+            [Sync.process_new_block]; the import path has its own
+            [Utxo.connect_block_optimized] driver that bypasses
+            [Sync.process_new_block], so the txindex wire must be
+            duplicated here. *)
+         Sync.tx_index_write_for_block_recompute db block hash;
          (* Update chain tip in DB *)
          chain.blocks_synced <- height;
          (match Hashtbl.find_opt chain.headers hash_key with

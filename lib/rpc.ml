@@ -2545,6 +2545,198 @@ let handle_testmempoolaccept (ctx : rpc_context)
     Error "Invalid parameters: expected [[rawtx]]"
 
 (* ============================================================================
+   submitpackage Handler
+
+   Mirrors Bitcoin Core's `submitpackage` RPC. Accepts an array of raw tx
+   hex strings (parents + child(ren), max 25 txs), validates atomically via
+   Mempool.accept_package, and returns a Core-compatible JSON object:
+
+     {
+       "package_msg":  "success" | "<error string>",
+       "tx-results":   { <wtxid_hex>: { txid, [vsize, fees{base,...}], [error] } },
+       "replaced-transactions": [ ... ]   (* always present, may be empty *)
+     }
+
+   Wired to the existing Mempool.accept_package engine; does not refactor
+   it. See CORE-PARITY-AUDIT/_mempool-package-rbf-cross-impl-audit-2026-05-06-part1.md
+   YELLOW-5.
+   ============================================================================ *)
+
+let handle_submitpackage (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  (* Parse parameters: [package_array [, maxfeerate [, maxburnamount]]] *)
+  let parse_params params =
+    let parse_amount json default =
+      match json with
+      | `Float f -> Ok f
+      | `Int i -> Ok (float_of_int i)
+      | `Null -> Ok default
+      | _ -> Error "maxfeerate / maxburnamount must be numeric"
+    in
+    match params with
+    | [`List arr] ->
+      Ok (arr, default_max_raw_tx_fee_rate, default_max_burn_amount)
+    | [`List arr; mf] ->
+      (match parse_amount mf default_max_raw_tx_fee_rate with
+       | Ok f -> Ok (arr, f, default_max_burn_amount)
+       | Error e -> Error e)
+    | [`List arr; mf; mb] ->
+      (match parse_amount mf default_max_raw_tx_fee_rate, parse_amount mb 0.0 with
+       | Ok f, Ok b ->
+         let burn_sats = Int64.of_float (b *. 100_000_000.0) in
+         Ok (arr, f, burn_sats)
+       | Error e, _ | _, Error e -> Error e)
+    | _ ->
+      Error "Invalid parameters: expected [[\"rawtx\",...] (, maxfeerate (, maxburnamount))]"
+  in
+  match parse_params params with
+  | Error e -> Error e
+  | Ok (raw_arr, max_fee_rate, max_burn_amount) ->
+    (* Enforce 1..MAX_PACKAGE_COUNT before doing any decoding work *)
+    let n = List.length raw_arr in
+    if n = 0 || n > Mempool.max_package_count then
+      Error (Printf.sprintf
+        "Array must contain between 1 and %d transactions."
+        Mempool.max_package_count)
+    else begin
+      (* Decode all transactions, halt on first decode error (Core behavior) *)
+      let decode_one json =
+        match json with
+        | `String hex ->
+          (try
+            let data = Cstruct.of_hex hex in
+            let r = Serialize.reader_of_cstruct data in
+            Ok (Serialize.deserialize_transaction r)
+          with exn ->
+            Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn)))
+        | _ -> Error "package element must be a hex string"
+      in
+      let rec decode_all acc = function
+        | [] -> Ok (List.rev acc)
+        | j :: rest ->
+          (match decode_one j with
+           | Ok tx -> decode_all (tx :: acc) rest
+           | Error e -> Error e)
+      in
+      match decode_all [] raw_arr with
+      | Error e -> Error e
+      | Ok txs ->
+        (* Burn-amount check on every output before mempool validation.
+           Core throws MAX_BURN_EXCEEDED here; we surface it as an Error. *)
+        let burn_violation = List.find_opt (fun tx ->
+          sum_burn_amount tx > max_burn_amount
+        ) txs in
+        (match burn_violation with
+         | Some tx ->
+           let burn = sum_burn_amount tx in
+           Error (Printf.sprintf
+             "Unspendable output exceeds maximum: %Ld > %Ld satoshis"
+             burn max_burn_amount)
+         | None ->
+           (* Validate as a package via existing engine *)
+           let pkg_result = Mempool.accept_package ctx.mempool txs in
+           (* Build a wtxid -> entry-or-error lookup *)
+           let entry_by_wtxid_key : (string, Mempool.mempool_entry) Hashtbl.t =
+             Hashtbl.create n in
+           let error_by_wtxid_key : (string, string) Hashtbl.t =
+             Hashtbl.create n in
+           let package_msg = ref "success" in
+           (match pkg_result with
+            | Mempool.PackageAccepted entries ->
+              List.iter (fun e ->
+                Hashtbl.replace entry_by_wtxid_key
+                  (Cstruct.to_string e.Mempool.wtxid) e
+              ) entries
+            | Mempool.PackagePartial { accepted; rejected } ->
+              package_msg := "package-partial-accept";
+              List.iter (fun e ->
+                Hashtbl.replace entry_by_wtxid_key
+                  (Cstruct.to_string e.Mempool.wtxid) e
+              ) accepted;
+              List.iter (fun (tx, msg) ->
+                let wtxid = Crypto.compute_wtxid tx in
+                Hashtbl.replace error_by_wtxid_key
+                  (Cstruct.to_string wtxid) msg
+              ) rejected
+            | Mempool.PackageRejected msg ->
+              package_msg := msg);
+
+           (* maxfeerate post-check on accepted entries; evict + flag if exceeded *)
+           if max_fee_rate > 0.0 then begin
+             let exceed_keys = ref [] in
+             Hashtbl.iter (fun key e ->
+               let vsize = (e.Mempool.weight + 3) / 4 in
+               let max_fee_sats =
+                 Int64.of_float
+                   (max_fee_rate *. 100_000_000.0 /. 1000.0
+                    *. float_of_int vsize)
+               in
+               if e.Mempool.fee > max_fee_sats then
+                 exceed_keys := (key, e) :: !exceed_keys
+             ) entry_by_wtxid_key;
+             List.iter (fun (key, e) ->
+               Mempool.remove_transaction ctx.mempool e.Mempool.txid;
+               Hashtbl.remove entry_by_wtxid_key key;
+               Hashtbl.replace error_by_wtxid_key key "max-fee-exceeded"
+             ) !exceed_keys;
+             if !exceed_keys <> [] && !package_msg = "success" then
+               package_msg := "max-fee-exceeded"
+           end;
+
+           (* Build tx-results map and announce accepted txs to peers *)
+           let tx_results = List.map (fun tx ->
+             let txid = Crypto.compute_txid tx in
+             let wtxid = Crypto.compute_wtxid tx in
+             let wtxid_key = Cstruct.to_string wtxid in
+             let txid_hex = Types.hash256_to_hex_display txid in
+             let wtxid_hex = Types.hash256_to_hex_display wtxid in
+             match Hashtbl.find_opt entry_by_wtxid_key wtxid_key with
+             | Some e ->
+               let vsize = (e.Mempool.weight + 3) / 4 in
+               let fee_btc = Int64.to_float e.Mempool.fee /. 100_000_000.0 in
+               let effective_feerate_btc_per_kvb =
+                 if vsize > 0 then
+                   Int64.to_float e.Mempool.fee
+                   /. float_of_int vsize
+                   /. 100_000.0
+                 else 0.0
+               in
+               (* Announce to peers (best-effort) *)
+               let fee_rate =
+                 Int64.div e.Mempool.fee
+                   (Int64.of_int (max 1 (e.Mempool.weight / 4)))
+               in
+               Lwt.async (fun () ->
+                 Peer_manager.announce_tx ctx.peer_manager
+                   ~txid:e.Mempool.txid ~wtxid ~fee_rate);
+               (wtxid_hex, `Assoc [
+                 ("txid", `String txid_hex);
+                 ("vsize", `Int vsize);
+                 ("fees", `Assoc [
+                   ("base", `Float fee_btc);
+                   ("effective-feerate", `Float effective_feerate_btc_per_kvb);
+                   ("effective-includes", `List [`String wtxid_hex]);
+                 ]);
+               ])
+             | None ->
+               let err_msg =
+                 match Hashtbl.find_opt error_by_wtxid_key wtxid_key with
+                 | Some msg -> msg
+                 | None -> "package-not-validated"
+               in
+               (wtxid_hex, `Assoc [
+                 ("txid", `String txid_hex);
+                 ("error", `String err_msg);
+               ])
+           ) txs in
+           Ok (`Assoc [
+             ("package_msg", `String !package_msg);
+             ("tx-results", `Assoc tx_results);
+             ("replaced-transactions", `List []);
+           ]))
+    end
+
+(* ============================================================================
    signrawtransactionwithkey Handler
    ============================================================================ *)
 
@@ -4161,6 +4353,7 @@ let handle_help (_ctx : rpc_context)
       "getrawtransaction \"txid\" ( verbose )";
       "sendrawtransaction \"hexstring\"";
       "signrawtransactionwithkey \"hexstring\" [\"privkey\",...]";
+      "submitpackage [\"rawtx\",...] ( maxfeerate maxburnamount )";
       "";
       "== PSBT ==";
       "analyzepsbt \"psbt\"";
@@ -4670,6 +4863,10 @@ let dispatch_rpc (ctx : rpc_context)
      | Error msg -> Error (rpc_misc_error, msg))
   | "testmempoolaccept" ->
     (match handle_testmempoolaccept ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_verify_rejected, msg))
+  | "submitpackage" ->
+    (match handle_submitpackage ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_verify_rejected, msg))
   | "dumpmempool" | "savemempool" ->

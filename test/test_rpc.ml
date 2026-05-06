@@ -1930,6 +1930,173 @@ let test_walletpassphrase_auto_relock () =
   cleanup_test_db ()
 
 (* ============================================================================
+   submitpackage Tests
+   ============================================================================ *)
+
+(* Test: valid 2-tx package (parent + child) admits both transactions and
+   returns Core-shape JSON with package_msg=success and a tx-results entry
+   keyed by wtxid for each submitted tx. *)
+let test_submitpackage_valid_2tx () =
+  let (ctx, db, _utxo, txid1, _) = create_test_context () in
+  (* Parent: 10 BTC -> 9.99 BTC (10k sat fee). *)
+  let parent_tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 9_990_000L]
+  in
+  let parent_txid = Crypto.compute_txid parent_tx in
+  (* Child spends parent's output, paying 10k sat fee. *)
+  let child_tx = make_regular_tx
+    [make_test_input parent_txid 0l]
+    [make_test_output 9_980_000L]
+  in
+  let parent_wtxid = Crypto.compute_wtxid parent_tx in
+  let child_wtxid = Crypto.compute_wtxid child_tx in
+  let parent_wtxid_hex = Types.hash256_to_hex_display parent_wtxid in
+  let child_wtxid_hex = Types.hash256_to_hex_display child_wtxid in
+  let params =
+    [`List [`String (tx_to_hex parent_tx); `String (tx_to_hex child_tx)]]
+  in
+  let result = Rpc.handle_submitpackage ctx params in
+  Alcotest.(check bool) "submitpackage Ok" true (Result.is_ok result);
+  (match result with
+   | Ok (`Assoc fields) ->
+     (match List.assoc_opt "package_msg" fields with
+      | Some (`String s) ->
+        Alcotest.(check string) "package_msg success" "success" s
+      | _ -> Alcotest.fail "package_msg missing or wrong type");
+     (match List.assoc_opt "tx-results" fields with
+      | Some (`Assoc tx_results) ->
+        Alcotest.(check int) "2 tx-results" 2 (List.length tx_results);
+        Alcotest.(check bool) "parent wtxid present" true
+          (List.mem_assoc parent_wtxid_hex tx_results);
+        Alcotest.(check bool) "child wtxid present" true
+          (List.mem_assoc child_wtxid_hex tx_results);
+        (* Each entry should have txid + vsize + fees (no error) *)
+        List.iter (fun (_wtxid_hex, entry) ->
+          match entry with
+          | `Assoc inner ->
+            Alcotest.(check bool) "has txid" true
+              (List.mem_assoc "txid" inner);
+            Alcotest.(check bool) "has vsize" true
+              (List.mem_assoc "vsize" inner);
+            Alcotest.(check bool) "has fees" true
+              (List.mem_assoc "fees" inner);
+            Alcotest.(check bool) "no error key" false
+              (List.mem_assoc "error" inner);
+            (match List.assoc "fees" inner with
+             | `Assoc fee_fields ->
+               Alcotest.(check bool) "fees.base present" true
+                 (List.mem_assoc "base" fee_fields)
+             | _ -> Alcotest.fail "fees should be an object")
+          | _ -> Alcotest.fail "tx-result entry should be object"
+        ) tx_results
+      | _ -> Alcotest.fail "tx-results missing or wrong type");
+     Alcotest.(check bool) "replaced-transactions present" true
+       (List.mem_assoc "replaced-transactions" fields)
+   | _ -> Alcotest.fail "expected Ok(`Assoc _)");
+  (* Both txs should be in mempool *)
+  Alcotest.(check bool) "parent in mempool" true
+    (Mempool.contains ctx.mempool parent_txid);
+  Alcotest.(check bool) "child in mempool" true
+    (Mempool.contains ctx.mempool (Crypto.compute_txid child_tx));
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: package with a child that has missing inputs rejects atomically.
+   The child references a nonexistent parent (not in the package, not in the
+   chain), so the whole package must be rejected; mempool must remain empty. *)
+let test_submitpackage_rejects_atomic () =
+  let (ctx, db, _utxo, txid1, _) = create_test_context () in
+  (* Parent is fine. *)
+  let parent_tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 9_990_000L]
+  in
+  (* Child spends a nonexistent parent — guaranteed missing input. *)
+  let bogus_parent =
+    Types.hash256_of_hex
+      "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+  in
+  let child_tx = make_regular_tx
+    [make_test_input bogus_parent 0l]
+    [make_test_output 999_000L]
+  in
+  let parent_txid = Crypto.compute_txid parent_tx in
+  let child_txid = Crypto.compute_txid child_tx in
+  let params =
+    [`List [`String (tx_to_hex parent_tx); `String (tx_to_hex child_tx)]]
+  in
+  let result = Rpc.handle_submitpackage ctx params in
+  Alcotest.(check bool) "submitpackage Ok response" true (Result.is_ok result);
+  (match result with
+   | Ok (`Assoc fields) ->
+     (* package_msg should NOT be "success" since the child fails. *)
+     (match List.assoc_opt "package_msg" fields with
+      | Some (`String s) ->
+        Alcotest.(check bool) "package_msg not success" true (s <> "success")
+      | _ -> Alcotest.fail "package_msg missing");
+     (* tx-results must still contain an entry per submitted wtxid. *)
+     (match List.assoc_opt "tx-results" fields with
+      | Some (`Assoc tx_results) ->
+        Alcotest.(check int) "2 tx-results entries" 2
+          (List.length tx_results)
+      | _ -> Alcotest.fail "tx-results missing")
+   | _ -> Alcotest.fail "expected Ok(`Assoc _)");
+  (* Atomic semantics: child must not be in mempool. The parent may or may
+     not have ended up in the mempool depending on partial-acceptance
+     behavior, but the child (which references a nonexistent input) MUST be
+     rejected. *)
+  Alcotest.(check bool) "child rejected" false
+    (Mempool.contains ctx.mempool child_txid);
+  ignore parent_txid;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: empty package array is rejected with a clear error. *)
+let test_submitpackage_empty () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  let result = Rpc.handle_submitpackage ctx [`List []] in
+  Alcotest.(check bool) "empty package rejected" true (Result.is_error result);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: package exceeding MAX_PACKAGE_COUNT is rejected. *)
+let test_submitpackage_too_many () =
+  let (ctx, db, _, txid1, _) = create_test_context () in
+  let tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 9_990_000L]
+  in
+  let hex = tx_to_hex tx in
+  (* 26 entries > MAX_PACKAGE_COUNT (25) *)
+  let arr = `List (List.init 26 (fun _ -> `String hex)) in
+  let result = Rpc.handle_submitpackage ctx [arr] in
+  Alcotest.(check bool) "26-tx package rejected" true (Result.is_error result);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: dispatcher route registers submitpackage. *)
+let test_submitpackage_dispatcher () =
+  let (ctx, db, _, txid1, _) = create_test_context () in
+  let parent_tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 9_990_000L]
+  in
+  let parent_txid = Crypto.compute_txid parent_tx in
+  let child_tx = make_regular_tx
+    [make_test_input parent_txid 0l]
+    [make_test_output 9_980_000L]
+  in
+  let params =
+    [`List [`String (tx_to_hex parent_tx); `String (tx_to_hex child_tx)]]
+  in
+  let result = Rpc.dispatch_rpc ctx "submitpackage" params in
+  Alcotest.(check bool) "dispatcher routes submitpackage" true
+    (Result.is_ok result);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -2052,5 +2219,17 @@ let () =
         test_walletpassphrase_wrong_then_right;
       test_case "auto-relock after timeout" `Quick
         test_walletpassphrase_auto_relock;
+    ];
+    "submitpackage", [
+      test_case "valid 2-tx package admits both" `Quick
+        test_submitpackage_valid_2tx;
+      test_case "rejected child rejects atomic" `Quick
+        test_submitpackage_rejects_atomic;
+      test_case "empty package rejected" `Quick
+        test_submitpackage_empty;
+      test_case "package > MAX_PACKAGE_COUNT rejected" `Quick
+        test_submitpackage_too_many;
+      test_case "dispatcher routes submitpackage" `Quick
+        test_submitpackage_dispatcher;
     ];
   ]

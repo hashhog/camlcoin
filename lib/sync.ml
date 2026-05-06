@@ -2267,6 +2267,77 @@ let disconnect_to_target (state : chain_state) (target : header_entry)
               current_tip.height target.height);
           Ok ()))
 
+(* ============================================================================
+   Tx-index connect/disconnect (Pattern C0 closure 2026-05-05)
+   ============================================================================
+
+   Counterpart to Bitcoin Core's [TxIndex] class
+   ([bitcoin-core/src/index/txindex.cpp]). Core's [BaseIndex::BlockConnected]
+   fires [CustomAppend] which writes (txid -> DiskTxPos) for every tx in
+   the connected block; [BaseIndex::BlockDisconnected] fires [CustomRemove]
+   which deletes those entries when a block leaves the active chain.
+
+   Pre-fix camlcoin had the storage helpers
+   ([Storage.ChainDB.store_transaction] / [store_tx_index]) but no
+   production caller — they were exercised only by tests. This left
+   [getrawtransaction(txid, true)] returning "No such mempool or
+   blockchain transaction" for every IBD-fetched and submitblock-accepted
+   tx. The findings doc
+   [CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md]
+   recorded the symptom as Pattern C0 — txindex non-functional pre-reorg.
+
+   The [tx_index_*] helpers below are called from every block-connect
+   path (process_new_block, connect_stored_blocks, reorganize-connect,
+   submit_block, block_import) and from the reorganize-disconnect path.
+
+   Following 22667c2 (Pattern Y closure) which made
+   [reorganize] reachable from submitblock, this is the minimum wiring
+   to make [getrawtransaction] return a stable result across reorgs. *)
+let tx_index_write_for_block (db : Storage.ChainDB.t)
+    (block : Types.block) (block_hash : Types.hash256)
+    (txid_arr : Types.hash256 array) : unit =
+  List.iteri (fun tx_idx tx ->
+    let txid =
+      if tx_idx < Array.length txid_arr then txid_arr.(tx_idx)
+      else Crypto.compute_txid tx
+    in
+    (* Store the full tx blob and the txid -> (block_hash, tx_idx)
+       pointer. Both are needed: [Rpc.lookup_transaction] hits the
+       tx_index CF first, then dereferences the pointer to fetch the
+       tx blob via [Storage.ChainDB.get_transaction]. *)
+    Storage.ChainDB.store_transaction db txid tx;
+    Storage.ChainDB.store_tx_index db txid block_hash tx_idx
+  ) block.transactions
+
+(* Same as [tx_index_write_for_block] but recomputes txids when the
+   caller doesn't have a precomputed array (e.g. reorg-connect path
+   when txid_arr from accept_block is not threaded through). *)
+let tx_index_write_for_block_recompute (db : Storage.ChainDB.t)
+    (block : Types.block) (block_hash : Types.hash256) : unit =
+  List.iteri (fun tx_idx tx ->
+    let txid = Crypto.compute_txid tx in
+    Storage.ChainDB.store_transaction db txid tx;
+    Storage.ChainDB.store_tx_index db txid block_hash tx_idx
+  ) block.transactions
+
+(* Erase tx_index entries for every tx in a disconnected block.
+   Mirrors Bitcoin Core's [TxIndex::CustomRemove] (txindex.cpp:69-83).
+   We delete only the txid -> (block_hash, tx_idx) pointer; the raw
+   tx blob in the [tx] CF is retained. Core does the same — its
+   tx blob lookup goes through [DiskTxPos] read from txindex, so once
+   the pointer is gone the raw blob is unreachable. Keeping the blob
+   is also Core-consistent because side-branch tx blobs may still be
+   reachable via [getrawtransaction(<txid>, <blockhash>)] if the
+   blockhash is supplied explicitly (camlcoin's [Rpc.lookup_transaction]
+   already supports the explicit-blockhash path independently of the
+   tx_index CF). *)
+let tx_index_erase_for_block (db : Storage.ChainDB.t)
+    (block : Types.block) : unit =
+  List.iter (fun tx ->
+    let txid = Crypto.compute_txid tx in
+    Storage.ChainDB.delete_tx_index db txid
+  ) block.transactions
+
 (* Perform chain reorganization to new tip
    IMPORTANT: This restores UTXOs spent on the old chain and spends
    UTXOs on the new chain. This is critical for UTXO set consistency. *)
@@ -2334,6 +2405,14 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
              ) undo.tx_undos;
               (* Clean up stored undo data for disconnected block *)
               Storage.ChainDB.delete_undo_data state.db entry.hash;
+              (* Erase tx_index entries for every tx in the disconnected
+                 block (Pattern C0 closure 2026-05-05). Mirrors Bitcoin
+                 Core's [TxIndex::CustomRemove] (txindex.cpp:69-83) fired
+                 from [BaseIndex::BlockDisconnected]. Without this,
+                 [getrawtransaction] returns stale block_hash + positive
+                 confirmations for transactions whose only confirming
+                 block was just disconnected (Pattern C1). *)
+              tx_index_erase_for_block state.db block;
               (* Notify ZMQ subscribers about block disconnect *)
               zmq_notify_block ibd block entry.hash false;
               Logs.debug (fun m ->
@@ -2433,6 +2512,11 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
                Utxo.serialize_undo_data uw undo;
                Storage.ChainDB.store_undo_data state.db entry.hash
                  (Cstruct.to_string (Serialize.writer_to_cstruct uw));
+               (* Write tx_index entries for every tx connected by this
+                  reorg-connect (Pattern C0 closure 2026-05-05). Mirrors
+                  Bitcoin Core's [TxIndex::CustomAppend] fired by
+                  [BaseIndex::BlockConnected]. *)
+               tx_index_write_for_block_recompute state.db block entry.hash;
                (* Update UTXOs.
                   Skip provably-unspendable outputs (OP_RETURN, oversized
                   scripts) so the post-reorg chainstate matches Core's
@@ -2954,6 +3038,12 @@ let rec connect_stored_blocks (state : chain_state) : int =
                 ~flags:validation_flags ~skip_scripts:false
                 ~get_mtp_at_height:(get_mtp_for_height state) () with
         | Validation.AB_ok (_fees, txid_arr, _spent_utxos) ->
+          (* Write tx_index entries for the connected stored block
+             (Pattern C0 closure 2026-05-05). Mirrors process_new_block
+             below; the gap-fill catch-up path needs the same wiring or
+             [getrawtransaction] returns nothing for any tx whose only
+             confirmation arrived via the out-of-order drain. *)
+          tx_index_write_for_block state.db stored_block entry.hash txid_arr;
           let ops = ref [] in
           List.iteri (fun tx_idx tx ->
             let is_cb = (tx_idx = 0) in
@@ -3087,6 +3177,16 @@ let process_new_block (state : chain_state) (block : Types.block)
         | Validation.AB_ok (_fees, txid_arr, _spent_utxos) ->
           (* Store the block *)
           Storage.ChainDB.store_block state.db hash block;
+          (* Write tx_index entries for every tx in the new block
+             (Pattern C0 closure 2026-05-05). Mirrors Bitcoin Core's
+             [TxIndex::CustomAppend] fired from [BaseIndex::BlockConnected]
+             ([bitcoin-core/src/index/txindex.cpp]). Without this, every
+             post-IBD block-connect leaves [getrawtransaction] returning
+             "No such mempool or blockchain transaction" for the just-
+             connected txs (findings doc:
+             [_txindex-revert-on-reorg-fleet-result-2026-05-05.md]
+             Pattern C0). *)
+          tx_index_write_for_block state.db block hash txid_arr;
           (* Collect UTXO mutations for a single atomic block commit *)
           let ops = ref [] in
           List.iteri (fun tx_idx tx ->

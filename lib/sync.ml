@@ -2433,16 +2433,33 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
                Utxo.serialize_undo_data uw undo;
                Storage.ChainDB.store_undo_data state.db entry.hash
                  (Cstruct.to_string (Serialize.writer_to_cstruct uw));
-               (* Update UTXOs *)
+               (* Update UTXOs.
+                  Skip provably-unspendable outputs (OP_RETURN, oversized
+                  scripts) so the post-reorg chainstate matches Core's
+                  [AddCoins] semantics. Without this filter the SegWit
+                  coinbase OP_RETURN witness commitment lands in the
+                  UTXO set on the connect side of every reorg, doubling
+                  coinbase-tx UTXO count vs Core's chainstate and
+                  diverging [hash_serialized_3]. Mirrors
+                  [process_new_block] (sync.ml:2886-2897) which already
+                  has this filter on the IBD path; the omission here
+                  was caught when the Pattern Y fix made [submit_block]
+                  reach this connect path for the first time
+                  (corpus entry [reorg-via-submitblock] showed UTXO
+                  hash divergence post-reorg even though the tip
+                  matched). *)
                List.iteri (fun tx_idx tx ->
                  let txid = Crypto.compute_txid tx in
                  let is_cb = (tx_idx = 0) in
                  if not (Consensus.is_genesis_coinbase height txid) then begin
                    List.iteri (fun vout out ->
-                     let data = encode_utxo out.Types.value out.Types.script_pubkey
-                         height is_cb in
-                     ibd.pending_utxo_updates <-
-                       (txid, vout, data) :: ibd.pending_utxo_updates
+                     if not (Utxo.is_unspendable_script
+                               out.Types.script_pubkey) then begin
+                       let data = encode_utxo out.Types.value
+                           out.Types.script_pubkey height is_cb in
+                       ibd.pending_utxo_updates <-
+                         (txid, vout, data) :: ibd.pending_utxo_updates
+                     end
                    ) tx.Types.outputs
                  end;
                  if not is_cb then begin
@@ -2496,6 +2513,206 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
         Logs.info (fun m ->
           m "Reorganization complete, new tip at height %d" new_tip.height);
         Ok ()
+  end
+
+(* ============================================================================
+   Side-branch acceptance (Pattern Y closure 2026-05-05)
+   ============================================================================
+
+   Counterpart to Bitcoin Core's [BlockManager::AcceptBlock]
+   ([validation.cpp]), which writes [pindexNew->nChainWork] and sets
+   [BLOCK_HAVE_DATA] on every accepted block regardless of whether it lives
+   on the active chain or a side-branch. Storage and best-chain selection
+   are decoupled in Core.
+
+   In camlcoin (pre-fix), [Mining.submit_block] only accepted blocks that
+   extend the validated tip — a competing fork's first block was rejected
+   with "Block does not build on validated tip" even though every prior
+   block was on disk. This made [reorganize] unreachable from the
+   submitblock RPC: the side-branch could never be stored, so the heavier
+   tip could never be selected.
+
+   Counterpart to rustoshi 68a422b (server.rs:2730-2790) which closed the
+   same Pattern Y bug: that fix made [submit_block]'s happy path persist
+   a [BlockIndexEntry] so the parent-lookup in [try_attach_and_reorg]
+   would not return None for a side-branch block whose parent was a
+   previously-accepted best-chain block. The shape here is broader because
+   camlcoin lacked any side-branch acceptance at all — the corpus entry
+   [reorg-via-submitblock] showed [ctx-rej-h113], i.e. B1's submission
+   was rejected at the gate.
+
+   Verified pre/post with [tools/diff-test.sh --entry=reorg-via-submitblock]
+   (see CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md). *)
+
+(* Register a side-branch header in the in-memory map and on-disk header
+   store WITHOUT overwriting the active chain's height->hash mapping or
+   rewinding the validated tip. This is the side-branch counterpart of
+   [accept_header] (which assumes the new entry extends the active
+   header chain — calling it for a side-branch would break [block_tip]
+   and break getblock-by-height for the active chain). *)
+let register_side_branch_header (state : chain_state) (entry : header_entry)
+    : unit =
+  let hash_key = Cstruct.to_string entry.hash in
+  Hashtbl.replace state.headers hash_key entry;
+  (* store_block_header is keyed by hash, so it does not interfere with
+     the active chain — distinct from set_height_hash which IS active-
+     chain-only. *)
+  Storage.ChainDB.store_block_header state.db entry.hash entry.header
+
+(* Pattern Y closure: accept a block whose parent is in the index but is
+   not the validated tip (side-branch / heavier-fork acceptance via
+   [submitblock]). Returns Ok () on stored — with optional reorg if the
+   side-branch is now strictly heavier than the active header tip — and
+   Error on rejection.
+
+   Mirrors Bitcoin Core's [ProcessNewBlock] -> [AcceptBlock] code path
+   for non-best-chain blocks: header chain validation + CheckBlock +
+   ContextualCheckBlock, body+header persisted to disk, ConnectBlock
+   deferred to a later [ActivateBestChain] call (here:
+   [reorganize]). UTXO checks are deferred to [reorganize]'s connect
+   path, which is where Core would run them too (ConnectBlock fires
+   only on the connect side of a reorg, not at side-branch storage
+   time). *)
+let try_attach_side_branch_and_reorg
+    ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
+    ?(mempool : Mempool.mempool option)
+    ?(misbehavior_handler : (int -> string -> unit) option)
+    (state : chain_state) (block : Types.block) (parent : header_entry)
+    : (unit, string) result =
+  let hash = Crypto.compute_block_hash block.header in
+  (* Idempotency: if we already have this block on disk, don't reprocess. *)
+  if Storage.ChainDB.has_block state.db hash then begin
+    Logs.debug (fun m ->
+      m "submitblock side-branch: block %s already stored — no-op"
+        (Types.hash256_to_hex_display hash));
+    Ok ()
+  end else begin
+    let height = parent.height + 1 in
+    let header = block.header in
+    (* Header validation (PoW, MTP, checkpoint, future-time clamp).
+       We cannot reuse [validate_header] directly because it short-circuits
+       with "Header already known" for headers already in the in-memory
+       map (e.g. when the header arrived ahead of the body via P2P) and
+       calls [accept_header] would overwrite the active height->hash
+       mapping. So we inline the relevant pieces, indexed against the
+       in-memory parent (not the active height->hash mapping which may
+       point at the competing chain). *)
+    if not (Consensus.hash_meets_target hash header.bits) then
+      Error "Insufficient proof of work"
+    else if Int32.to_float header.timestamp >
+            Unix.gettimeofday () +. 7200.0 then
+      Error "Header timestamp too far in future"
+    else begin
+      let ancestor_ts = collect_ancestor_timestamps state parent 11 in
+      let mtp = Consensus.median_time_past ancestor_ts in
+      if Int32.compare header.timestamp mtp <= 0 then
+        Error "Header timestamp not greater than median-time-past"
+      else begin
+        match Consensus.verify_checkpoint height hash state.network with
+        | Consensus.CheckpointMismatch _ as mismatch ->
+          Error (Consensus.checkpoint_result_to_string mismatch)
+        | Consensus.CheckpointOk ->
+        (* Compute expected difficulty from the parent's bits. For
+           regtest/[pow_no_retargeting], parent.bits is authoritative.
+           For mainnet retargeting, the difficulty-adjustment boundary
+           on a side-branch is intentionally deferred — a future patch
+           can wire a side-branch-aware [compute_expected_bits] (the
+           current implementation walks the active height->hash
+           mapping). For non-boundary heights with retargeting,
+           parent.bits is also the right answer. The corpus entry
+           [reorg-via-submitblock] runs on regtest, so this path is
+           exercised under [pow_no_retargeting]. *)
+        let expected_bits =
+          if state.network.pow_no_retargeting then parent.header.bits
+          else if height mod Consensus.difficulty_adjustment_interval = 0
+          then compute_expected_bits state height block.header
+          else parent.header.bits
+        in
+        if header.bits <> expected_bits then
+          Error (Printf.sprintf
+                   "Header difficulty mismatch (got 0x%lx expected 0x%lx)"
+                   header.bits expected_bits)
+        else begin
+          let total_work =
+            Consensus.work_add parent.total_work
+              (work_from_bits header.bits)
+          in
+          let entry =
+            { header; hash; height; total_work }
+          in
+          (* CheckBlock + ContextualCheckBlock — context-free + header-
+             chain-context checks, but NOT ConnectBlock (UTXO checks are
+             deferred to [reorganize]'s connect path). *)
+          let median_time = mtp in
+          (match Validation.check_block ~network:state.network block height
+                   ~expected_bits ~median_time with
+           | Error e ->
+             Error (Validation.block_error_to_string e)
+           | Ok () ->
+             (* Persist header and body. UTXO is untouched here; if the
+                side-branch becomes the active tip below, [reorganize]
+                will re-validate and connect via the IBD pipeline. *)
+             register_side_branch_header state entry;
+             Storage.ChainDB.store_block state.db hash block;
+             Logs.info (fun m ->
+               m "submitblock side-branch: stored block %s at height %d \
+                  (parent=%s)"
+                 (Types.hash256_to_hex_display hash) height
+                 (Types.hash256_to_hex_display parent.hash));
+             (* If the new chain has strictly more work than the current
+                best-work header tip, run [reorganize] to flip the
+                validated tip. Use a freshly-built [ibd_state] — the
+                same primitive [Sync.run_ibd] uses — so the connect
+                path can write undo data and update the UTXO set
+                atomically. *)
+             let current_tip_work = match state.tip with
+               | Some t -> t.total_work
+               | None -> Consensus.zero_work
+             in
+             if Consensus.work_compare total_work current_tip_work > 0
+             then begin
+               Logs.info (fun m ->
+                 m "submitblock side-branch: heavier than active tip \
+                    (height %d vs %d), triggering reorganize"
+                   height
+                   (match state.tip with Some t -> t.height | None -> -1));
+               (* Drive [reorganize] with the side-branch entry as the
+                  new tip. [reorganize] reads the *current* state.tip as
+                  the reorg source — DO NOT overwrite state.tip before
+                  the call (an earlier draft did, which made
+                  current_tip == new_tip and tripped the
+                  "New tip does not have more work" guard at
+                  reorganize:2281). [reorganize] updates state.tip /
+                  blocks_synced / headers_synced / set_chain_tip on its
+                  Ok exit path; it does NOT update set_header_tip on
+                  RocksDB, so we do that here on success too so
+                  recovery (restore_chain_state) reloads B3 as the
+                  header tip. *)
+               let ibd =
+                 create_ibd_state ?utxo_set ?misbehavior_handler state
+               in
+               (match mempool with
+                | Some mp -> set_mempool ibd mp
+                | None -> ());
+               match reorganize ibd entry with
+               | Ok () ->
+                 Storage.ChainDB.set_header_tip state.db entry.hash entry.height;
+                 Ok ()
+               | Error e ->
+                 Logs.err (fun m ->
+                   m "submitblock side-branch: reorganize failed: %s" e);
+                 Error e
+             end else begin
+               (* Side-branch stored but not activated — the equivalent
+                  of Core's "inconclusive" return from submitblock. *)
+               Logs.info (fun m ->
+                 m "submitblock side-branch: stored at h=%d but not \
+                    heavier than active tip (no reorg)" height);
+               Ok ()
+             end)
+        end
+      end
+    end
   end
 
 (* ============================================================================

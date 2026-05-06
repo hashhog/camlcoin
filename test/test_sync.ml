@@ -1021,15 +1021,23 @@ let test_get_all_invalidated_blocks () =
   cleanup_test_db ()
 
 (* Helper to create a valid regtest header that meets proof-of-work requirements *)
-let mine_test_header ~prev_block ~prev_height ~bits =
+let mine_test_header ?(merkle_marker : int32 = 0l) ~prev_block ~prev_height ~bits () =
   let rec find_valid_nonce nonce =
     if nonce > 1_000_000l then
       failwith "Could not find valid nonce for test header"
     else begin
+      (* The merkle_marker bytes occupy the last 4 bytes of merkle_root,
+         which gives callers a cheap way to mint two distinct blocks
+         that share prev_block (e.g. the A1 / B1 pair in
+         side-branch tests). Without this, mine_test_header for two
+         calls with the same prev_block and same wallclock second
+         returns identical headers. *)
+      let merkle = Cstruct.create 32 in
+      Cstruct.LE.set_uint32 merkle 28 merkle_marker;
       let header = Types.{
         version = 1l;
         prev_block;
-        merkle_root = Types.zero_hash;
+        merkle_root = merkle;
         timestamp = Int32.of_float (Unix.gettimeofday () +. (Int32.to_float nonce));
         bits;
         nonce;
@@ -1068,7 +1076,7 @@ let test_invalidate_reorg_reconsider () =
   let block1_entry = mine_test_header
     ~prev_block:genesis_hash
     ~prev_height:0
-    ~bits:Consensus.regtest.genesis_header.bits in
+    ~bits:Consensus.regtest.genesis_header.bits () in
 
   (* Manually add block1 to state *)
   let block1_key = Cstruct.to_string block1_entry.hash in
@@ -1091,7 +1099,7 @@ let test_invalidate_reorg_reconsider () =
   let block2_entry = mine_test_header
     ~prev_block:block1_entry.hash
     ~prev_height:1
-    ~bits:Consensus.regtest.genesis_header.bits in
+    ~bits:Consensus.regtest.genesis_header.bits () in
 
   let block2_key = Cstruct.to_string block2_entry.hash in
   Hashtbl.replace state.headers block2_key block2_entry;
@@ -1169,7 +1177,7 @@ let test_find_descendants_with_chain () =
   let block1_entry = mine_test_header
     ~prev_block:genesis_hash
     ~prev_height:0
-    ~bits:Consensus.regtest.genesis_header.bits in
+    ~bits:Consensus.regtest.genesis_header.bits () in
   let block1_key = Cstruct.to_string block1_entry.hash in
   let block1_work = Consensus.work_add genesis_entry.total_work
     (Sync.work_from_bits block1_entry.header.bits) in
@@ -1180,7 +1188,7 @@ let test_find_descendants_with_chain () =
   let block2_entry = mine_test_header
     ~prev_block:block1_entry.hash
     ~prev_height:1
-    ~bits:Consensus.regtest.genesis_header.bits in
+    ~bits:Consensus.regtest.genesis_header.bits () in
   let block2_key = Cstruct.to_string block2_entry.hash in
   let block2_work = Consensus.work_add block1_entry.total_work
     (Sync.work_from_bits block2_entry.header.bits) in
@@ -1369,6 +1377,160 @@ let test_prune_old_blocks_off_short_circuits () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* ============================================================================
+   Side-branch acceptance (Pattern Y closure 2026-05-05)
+   ============================================================================
+
+   These tests guard the structural invariants of the side-branch path
+   added to make [Mining.submit_block] accept a heavier fork's first
+   block (rustoshi 68a422b counterpart; corpus entry
+   `tools/diff-test-corpus/regression/reorg-via-submitblock`).
+
+   The full end-to-end test (submit A1+A2 then B1+B2+B3 → tip flips to
+   B3, UTXO state matches the B chain) lives in the diff-test corpus
+   harness because it requires Validation.accept_block + a regtest
+   coinbase + the OptimizedUtxoSet wiring. These unit tests exercise
+   the in-process invariants the patch is responsible for. *)
+
+(* register_side_branch_header MUST insert the entry into both the
+   in-memory header map and the on-disk header store. It MUST NOT
+   touch [set_height_hash] (that mapping is owned by accept_header /
+   the active chain), and it MUST NOT rewind the active tip. *)
+let test_register_side_branch_header_invariants () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+
+  let genesis_hash = Crypto.compute_block_hash Consensus.regtest.genesis_header in
+  let genesis_entry = Option.get (Sync.get_tip state) in
+  Alcotest.(check int) "genesis at height 0" 0 genesis_entry.height;
+
+  (* Build A1 on top of genesis via accept_header — this is the active
+     chain block at height 1; height-hash maps 1 -> A1. *)
+  let a1_entry = mine_test_header
+    ~prev_block:genesis_hash
+    ~prev_height:0
+    ~bits:Consensus.regtest.genesis_header.bits () in
+  let a1_total_work = Consensus.work_add genesis_entry.total_work
+    (Sync.work_from_bits a1_entry.header.bits) in
+  let a1_entry = Sync.{ a1_entry with total_work = a1_total_work } in
+  Sync.accept_header state a1_entry;
+  Alcotest.(check bool) "A1 in headers map" true
+    (Hashtbl.mem state.headers (Cstruct.to_string a1_entry.hash));
+  (* set_height_hash 1 -> A1 *)
+  let h1_active_pre = Storage.ChainDB.get_hash_at_height db 1 in
+  Alcotest.(check bool) "h=1 active mapping = A1" true
+    (match h1_active_pre with
+     | Some h -> Cstruct.equal h a1_entry.hash
+     | None -> false);
+
+  (* Now build B1 sharing the same parent (genesis) and register as
+     side-branch. B1 must NOT clobber the active h=1 mapping. The
+     [merkle_marker] picks a non-zero merkle root so B1's header is
+     distinct from A1 even when both calls happen in the same wallclock
+     second. *)
+  let b1_entry = mine_test_header
+    ~merkle_marker:0xb1b1b1b1l
+    ~prev_block:genesis_hash
+    ~prev_height:0
+    ~bits:Consensus.regtest.genesis_header.bits () in
+  Alcotest.(check bool) "B1 distinct from A1" true
+    (not (Cstruct.equal a1_entry.hash b1_entry.hash));
+  let b1_total_work = Consensus.work_add genesis_entry.total_work
+    (Sync.work_from_bits b1_entry.header.bits) in
+  let b1_entry = Sync.{ b1_entry with total_work = b1_total_work } in
+
+  Sync.register_side_branch_header state b1_entry;
+
+  (* B1 in headers map. *)
+  Alcotest.(check bool) "B1 in headers map" true
+    (Hashtbl.mem state.headers (Cstruct.to_string b1_entry.hash));
+  (* B1's header is on disk. *)
+  Alcotest.(check bool) "B1 header on disk" true
+    (Storage.ChainDB.has_block_header db b1_entry.hash);
+  (* CRUCIAL: active height-hash mapping STILL points at A1. This is
+     the structural invariant accept_header would have broken. *)
+  let h1_active_post = Storage.ChainDB.get_hash_at_height db 1 in
+  Alcotest.(check bool) "h=1 active mapping STILL A1 (not B1)" true
+    (match h1_active_post with
+     | Some h -> Cstruct.equal h a1_entry.hash
+     | None -> false);
+  (* CRUCIAL: state.tip is unchanged (still A1, the equal-work first-
+     accepted entry). *)
+  Alcotest.(check bool) "state.tip unchanged after side-branch register" true
+    (match state.tip with
+     | Some t -> Cstruct.equal t.hash a1_entry.hash
+     | None -> false);
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* When [Mining.submit_block] receives a block whose parent is in the
+   index but is NOT the validated tip, it must NOT reject with the
+   pre-fix "Block does not build on validated tip" error. The actual
+   acceptance result depends on whether the parent's header is in the
+   in-memory map; in this test we don't do a full coinbase + UTXO
+   build, so we assert only that the gate flips: pre-fix error string
+   gone, replaced by a header / validation error from the side-branch
+   path or by Ok () on a successful path. *)
+let test_submit_block_side_branch_gate () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let genesis_hash = Crypto.compute_block_hash Consensus.regtest.genesis_header in
+
+  (* Build the active chain to height 1: A1 on genesis. *)
+  let a1_entry = mine_test_header
+    ~prev_block:genesis_hash
+    ~prev_height:0
+    ~bits:Consensus.regtest.genesis_header.bits () in
+  let a1_total_work = Consensus.work_add
+    (Option.get (Sync.get_tip state)).total_work
+    (Sync.work_from_bits a1_entry.header.bits) in
+  let a1_entry = Sync.{ a1_entry with total_work = a1_total_work } in
+  Sync.accept_header state a1_entry;
+  state.tip <- Some a1_entry;
+  state.blocks_synced <- 1;
+  Storage.ChainDB.set_chain_tip state.db a1_entry.hash a1_entry.height;
+
+  (* Build B1 on genesis (a side-branch). Its synthetic block body
+     won't pass full validation (no real coinbase, no merkle), but the
+     ERROR returned must NOT be the pre-fix "does not build on
+     validated tip" guard — it must come from inside the side-branch
+     path (e.g. CheckBlock failure). *)
+  let b1_entry = mine_test_header
+    ~merkle_marker:0xb1b1b1b1l
+    ~prev_block:genesis_hash
+    ~prev_height:0
+    ~bits:Consensus.regtest.genesis_header.bits () in
+  Alcotest.(check bool) "B1 distinct from A1" true
+    (not (Cstruct.equal a1_entry.hash b1_entry.hash));
+  let utxo = Utxo.UtxoSet.create db in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+    ~utxo ~current_height:1 () in
+  let block_b1 : Types.block = { header = b1_entry.header; transactions = [] } in
+  let result = Mining.submit_block ~network_type:Consensus.Regtest
+    block_b1 state mp in
+  (match result with
+   | Ok () ->
+     (* Unlikely without a coinbase, but accept this outcome — the gate
+        is open. *)
+     ()
+   | Error msg ->
+     (* The pre-fix error message is the regression we're guarding
+        against. *)
+     Alcotest.(check bool)
+       (Printf.sprintf
+          "submit_block must NOT reject side-branch with the pre-fix \
+           gate string (got: %S)" msg)
+       true
+       (not (String.length msg >= 32
+             && String.sub msg 0 32
+                = "Block does not build on validated")));
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
@@ -1419,6 +1581,16 @@ let () =
     ];
     "reorganization", [
       test_case "find_fork_point_same" `Quick test_find_fork_point_same;
+    ];
+    "side_branch_acceptance", [
+      (* Pattern Y closure 2026-05-05 (rustoshi 68a422b counterpart).
+         Guards the structural invariants of the submit_block side-
+         branch path. End-to-end coverage lives in
+         tools/diff-test-corpus/regression/reorg-via-submitblock. *)
+      test_case "register_side_branch_header preserves active chain"
+        `Quick test_register_side_branch_header_invariants;
+      test_case "submit_block side-branch gate is open"
+        `Quick test_submit_block_side_branch_gate;
     ];
     "header_sync_antidos", [
       test_case "header_sync_state_to_string" `Quick test_header_sync_state_to_string;

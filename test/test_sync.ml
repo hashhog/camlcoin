@@ -1531,6 +1531,173 @@ let test_submit_block_side_branch_gate () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* ============================================================================
+   Tx-index connect/disconnect (Pattern C0 closure 2026-05-05)
+   ============================================================================
+
+   Guards the Pattern C0 wiring added in lib/sync.ml that mirrors Bitcoin
+   Core's [TxIndex::CustomAppend] / [CustomRemove] semantics
+   ([bitcoin-core/src/index/txindex.cpp]). Pre-fix, [Storage.ChainDB.store_tx_index]
+   existed but had no production caller; getrawtransaction returned
+   "no such transaction" for every IBD-fetched / submitblock-accepted
+   tx (see CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md).
+
+   These tests exercise the helpers directly because the full block-
+   connect pipeline requires a coinbase + UTXO + accept_block harness
+   that the diff-test corpus already covers (entry
+   tools/diff-test-corpus/regression/txindex-revert-on-reorg). *)
+
+(* Build a synthetic block with one fake non-coinbase tx so we can
+   exercise [tx_index_write_for_block] and [tx_index_erase_for_block]
+   without a full coinbase + UTXO setup. The tx itself is structurally
+   minimal — the helpers index by [Crypto.compute_txid tx], which works
+   for any well-formed Types.transaction value. *)
+let make_synthetic_tx ~marker : Types.transaction =
+  {
+    version = 1l;
+    inputs = [{
+      previous_output = { txid = Types.zero_hash; vout = 0xffffffffl };
+      script_sig = Cstruct.create 0;
+      sequence = 0xffffffffl;
+    }];
+    outputs = [{
+      value = 0L;
+      script_pubkey = Cstruct.of_string (Printf.sprintf "tx-%d" marker);
+    }];
+    witnesses = [];
+    locktime = 0l;
+  }
+
+(* Build a synthetic block with two transactions sharing a known parent.
+   The block hash is whatever Crypto.compute_block_hash returns for the
+   header — fine for a tx_index round-trip test where we just need a
+   stable 32-byte block_hash key. *)
+let make_synthetic_block ~tx_count : Types.block * Types.hash256 =
+  let header = Types.{
+    version = 1l;
+    prev_block = Types.zero_hash;
+    merkle_root = Types.zero_hash;
+    timestamp = 0l;
+    bits = 0x207fffffl;
+    nonce = 0l;
+  } in
+  let hash = Crypto.compute_block_hash header in
+  let txs = List.init tx_count (fun i -> make_synthetic_tx ~marker:i) in
+  ({ header; transactions = txs }, hash)
+
+(* tx_index_write_for_block_recompute MUST populate the txid -> (block_hash,
+   tx_idx) mapping for every tx in the block. After the helper runs,
+   [Storage.ChainDB.get_tx_index] returns the right (block_hash, tx_idx)
+   pair for each tx. This is the Pattern C0 invariant: pre-fix the
+   helpers existed but had no caller, so [getrawtransaction] returned
+   "no such tx" for every IBD-fetched tx. *)
+let test_tx_index_write_populates_index () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let (block, block_hash) = make_synthetic_block ~tx_count:3 in
+
+  (* Pre-fix invariant: lookup MISSes for every tx before the helper
+     fires. Confirms the test setup correctly mirrors a fresh datadir
+     on the IBD path. *)
+  List.iter (fun tx ->
+    let txid = Crypto.compute_txid tx in
+    Alcotest.(check bool) "pre-write: tx_index miss" true
+      (Storage.ChainDB.get_tx_index db txid = None)
+  ) block.transactions;
+
+  Sync.tx_index_write_for_block_recompute db block block_hash;
+
+  (* Post-write: every tx is indexed at the right (block_hash, tx_idx). *)
+  List.iteri (fun expected_idx tx ->
+    let txid = Crypto.compute_txid tx in
+    match Storage.ChainDB.get_tx_index db txid with
+    | None ->
+      Alcotest.fail (Printf.sprintf
+        "tx_index miss for tx_idx=%d post-write" expected_idx)
+    | Some (got_blockhash, got_idx) ->
+      Alcotest.(check int)
+        (Printf.sprintf "tx_idx for txid #%d" expected_idx)
+        expected_idx got_idx;
+      Alcotest.(check bool)
+        (Printf.sprintf "block_hash for txid #%d" expected_idx)
+        true (Cstruct.equal block_hash got_blockhash);
+      (* Tx blob is also stored — required by [Rpc.lookup_transaction]
+         which dereferences the index pointer through
+         [Storage.ChainDB.get_transaction]. *)
+      Alcotest.(check bool)
+        (Printf.sprintf "tx blob retrievable for tx_idx=%d" expected_idx)
+        true (Storage.ChainDB.get_transaction db txid <> None)
+  ) block.transactions;
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* tx_index_erase_for_block MUST delete the txid -> (block_hash, tx_idx)
+   mapping for every tx in a disconnected block. This is the Pattern C
+   invariant: post-reorg, [getrawtransaction] for a tx that lived only
+   in a now-disconnected block must NOT return positive confirmations.
+   Mirrors Bitcoin Core's [TxIndex::CustomRemove] (txindex.cpp:69-83)
+   fired from [BaseIndex::BlockDisconnected]. *)
+let test_tx_index_erase_drops_disconnected_txs () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let (block, block_hash) = make_synthetic_block ~tx_count:2 in
+
+  Sync.tx_index_write_for_block_recompute db block block_hash;
+  (* Sanity: post-write all hits. *)
+  List.iter (fun tx ->
+    let txid = Crypto.compute_txid tx in
+    Alcotest.(check bool) "post-write: tx_index hit" true
+      (Storage.ChainDB.get_tx_index db txid <> None)
+  ) block.transactions;
+
+  Sync.tx_index_erase_for_block db block;
+
+  (* Post-erase: every tx_index entry is gone. *)
+  List.iter (fun tx ->
+    let txid = Crypto.compute_txid tx in
+    Alcotest.(check bool) "post-erase: tx_index miss" true
+      (Storage.ChainDB.get_tx_index db txid = None)
+  ) block.transactions;
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* tx_index_write_for_block (the precomputed-txid variant) MUST agree
+   with tx_index_write_for_block_recompute on the same block. The two
+   helpers exist because some callers have a precomputed txid array
+   from accept_block (faster) and some don't. They must be byte-
+   identical in their resulting tx_index CF state. *)
+let test_tx_index_write_precomputed_matches_recompute () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let (block, block_hash) = make_synthetic_block ~tx_count:2 in
+  let txid_arr =
+    Array.of_list (List.map Crypto.compute_txid block.transactions) in
+
+  Sync.tx_index_write_for_block db block block_hash txid_arr;
+
+  (* Post-write: every tx is indexed at the right (block_hash, tx_idx),
+     matching what the recompute variant would produce. *)
+  List.iteri (fun expected_idx tx ->
+    let txid = Crypto.compute_txid tx in
+    (match Storage.ChainDB.get_tx_index db txid with
+     | None ->
+       Alcotest.fail (Printf.sprintf
+         "tx_index miss for tx_idx=%d (precomputed-txid variant)"
+         expected_idx)
+     | Some (got_blockhash, got_idx) ->
+       Alcotest.(check int)
+         (Printf.sprintf "tx_idx for txid #%d (precomputed)" expected_idx)
+         expected_idx got_idx;
+       Alcotest.(check bool)
+         (Printf.sprintf "block_hash for txid #%d (precomputed)" expected_idx)
+         true (Cstruct.equal block_hash got_blockhash))
+  ) block.transactions;
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
@@ -1591,6 +1758,21 @@ let () =
         `Quick test_register_side_branch_header_invariants;
       test_case "submit_block side-branch gate is open"
         `Quick test_submit_block_side_branch_gate;
+    ];
+    "txindex_connect_disconnect", [
+      (* Pattern C0 closure 2026-05-05. Guards the tx_index wiring
+         that mirrors Bitcoin Core's TxIndex::CustomAppend /
+         CustomRemove (bitcoin-core/src/index/txindex.cpp). End-to-end
+         coverage lives in
+         tools/diff-test-corpus/regression/txindex-revert-on-reorg.
+         Findings doc:
+         CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md *)
+      test_case "tx_index_write populates index"
+        `Quick test_tx_index_write_populates_index;
+      test_case "tx_index_erase drops disconnected txs"
+        `Quick test_tx_index_erase_drops_disconnected_txs;
+      test_case "precomputed-txid variant matches recompute"
+        `Quick test_tx_index_write_precomputed_matches_recompute;
     ];
     "header_sync_antidos", [
       test_case "header_sync_state_to_string" `Quick test_header_sync_state_to_string;

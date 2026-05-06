@@ -1698,6 +1698,91 @@ let test_tx_index_write_precomputed_matches_recompute () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* Core parity: per-peer unconnecting-headers counter must tolerate up
+   to MAX_NUM_UNCONNECTING_HEADERS_MSGS=10 successive unlinked batches
+   before the caller drops the peer.  Mirrors Bitcoin Core's
+   `nUnconnectingHeaders` accounting in
+   net_processing.cpp::ProcessHeadersMessage.  Pre-fix, camlcoin
+   silently dropped sync_peer (-> Idle) on the first orphan with no
+   penalty — see
+   CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+   (Pattern B). *)
+let test_unconnecting_headers_counter_under_threshold () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let peer_id = 42 in
+  Alcotest.(check int) "initial counter is 0"
+    0 (Sync.unconnecting_headers_count state peer_id);
+  (* 10 successive unconnecting messages should NOT exceed threshold. *)
+  for _ = 1 to Sync.max_num_unconnecting_headers_msgs do
+    let exceeded = Sync.note_unconnecting_headers state peer_id in
+    Alcotest.(check bool)
+      "under threshold should not signal exceeded"
+      false exceeded
+  done;
+  Alcotest.(check int) "counter at threshold"
+    Sync.max_num_unconnecting_headers_msgs
+    (Sync.unconnecting_headers_count state peer_id);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_unconnecting_headers_counter_exceeds_threshold () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let peer_id = 7 in
+  for _ = 1 to Sync.max_num_unconnecting_headers_msgs do
+    let _ = Sync.note_unconnecting_headers state peer_id in ()
+  done;
+  (* 11th call MUST signal exceeded. *)
+  let exceeded = Sync.note_unconnecting_headers state peer_id in
+  Alcotest.(check bool) "11th unconnecting message exceeds threshold"
+    true exceeded;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_unconnecting_headers_reset_on_connecting () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let peer_id = 99 in
+  (* Bump the counter a few times. *)
+  for _ = 1 to 5 do
+    let _ = Sync.note_unconnecting_headers state peer_id in ()
+  done;
+  Alcotest.(check int) "counter reflects bumps"
+    5 (Sync.unconnecting_headers_count state peer_id);
+  (* Reset on a successful connecting batch. *)
+  Sync.reset_unconnecting_headers state peer_id;
+  Alcotest.(check int) "counter resets to 0"
+    0 (Sync.unconnecting_headers_count state peer_id);
+  (* Subsequent unconnecting starts fresh. *)
+  let _ = Sync.note_unconnecting_headers state peer_id in
+  Alcotest.(check int) "counter starts fresh after reset"
+    1 (Sync.unconnecting_headers_count state peer_id);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_unconnecting_headers_per_peer () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let pa = 1 and pb = 2 in
+  for _ = 1 to Sync.max_num_unconnecting_headers_msgs do
+    let _ = Sync.note_unconnecting_headers state pa in ()
+  done;
+  Alcotest.(check int) "peer A at threshold"
+    Sync.max_num_unconnecting_headers_msgs
+    (Sync.unconnecting_headers_count state pa);
+  Alcotest.(check int) "peer B unaffected"
+    0 (Sync.unconnecting_headers_count state pb);
+  let exceeded_b = Sync.note_unconnecting_headers state pb in
+  Alcotest.(check bool) "peer B's first message does not exceed threshold"
+    false exceeded_b;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
@@ -1803,6 +1888,16 @@ let () =
       test_case "prune_old_blocks honors bytes semantic" `Quick test_prune_old_blocks_uses_bytes;
       test_case "prune_old_blocks: manual mode short-circuits" `Quick test_prune_old_blocks_manual_mode_short_circuits;
       test_case "prune_old_blocks: archive (off) short-circuits" `Quick test_prune_old_blocks_off_short_circuits;
+    ];
+    "unconnecting_headers", [
+      test_case "under threshold tolerated" `Quick
+        test_unconnecting_headers_counter_under_threshold;
+      test_case "11th message exceeds threshold" `Quick
+        test_unconnecting_headers_counter_exceeds_threshold;
+      test_case "reset on connecting batch" `Quick
+        test_unconnecting_headers_reset_on_connecting;
+      test_case "per-peer independent" `Quick
+        test_unconnecting_headers_per_peer;
     ];
     "block_invalidation", [
       test_case "is_block_invalid_initially_false" `Quick test_is_block_invalid_initially_false;

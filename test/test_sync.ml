@@ -1345,6 +1345,99 @@ let test_reorganize_single_batch_commit () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* Regression for the 2026-05-07 UTXO-after-reorg bug
+   (CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md
+   wave 9 — camlcoin diverged on `utxo_after` while every other impl,
+   including Core, agreed).
+
+   Pre-fix, [stage_pending_utxos_into_batch] iterated two flat lists
+   ([pending_utxo_updates] then [pending_utxo_deletes]) accumulated in
+   append order across BOTH halves of the reorg, then flushed "all
+   puts, then all deletes".  When a coinbase txid collides between the
+   disconnected chain and the reconnected chain (regtest determinism:
+   same height + same address + same scriptSig → same coinbase
+   serialization → same txid), the same UTXO key showed up as both a
+   delete (disconnect side) and a put (connect side); the trailing
+   delete won and the UTXO ended up MISSING on disk.
+
+   Post-fix, the function commits the [reorg_view] overlay which
+   already reconciles put/delete collisions at insertion time
+   ([reorg_view_put] removes any matching delete; [reorg_view_delete]
+   removes any matching write).  This test guards that property by
+   simulating the exact sequence the real reorg path produces: one key
+   gets an early put, then a delete, then a final put — the post-flush
+   on-disk image MUST contain the put. *)
+let test_stage_pending_utxos_resolves_collisions () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let ibd = Sync.create_ibd_state state in
+  let view = Sync.reorg_view_create () in
+
+  (* Three keys to exercise:
+     - K_collide: present-on-pre-reorg-disk; deleted by disconnect, then
+       re-put by connect (same txid, same value).  Must EXIST post-flush.
+     - K_pure_delete: present-on-pre-reorg-disk; deleted by disconnect,
+       not re-put.  Must be ABSENT post-flush.
+     - K_pure_put: not on disk; put by connect, never deleted.
+       Must EXIST post-flush. *)
+  let k_collide = Cstruct.create 32 in
+  Cstruct.set_uint8 k_collide 0 0xC0;
+  Cstruct.set_uint8 k_collide 31 0x11;
+  let k_pure_delete = Cstruct.create 32 in
+  Cstruct.set_uint8 k_pure_delete 0 0xDE;
+  let k_pure_put = Cstruct.create 32 in
+  Cstruct.set_uint8 k_pure_put 0 0xAD;
+  let vout = 0 in
+
+  (* Pre-populate disk with the two keys disconnect would unwind. *)
+  let pre_batch = Storage.ChainDB.batch_create () in
+  Storage.ChainDB.batch_store_utxo pre_batch k_collide vout "collide-data";
+  Storage.ChainDB.batch_store_utxo pre_batch k_pure_delete vout
+    "pure-delete-data";
+  Storage.ChainDB.batch_write db pre_batch;
+
+  (* Disconnect-half (tip-back-to-fork): both K_collide and K_pure_delete
+     get queued for delete. *)
+  Sync.reorg_view_delete view k_collide vout;
+  Sync.reorg_view_delete view k_pure_delete vout;
+
+  (* Connect-half (fork-forward-to-new-tip): K_collide gets re-put with
+     the same value (regtest reorg: same coinbase txid → same UTXO),
+     K_pure_put gets put fresh. *)
+  Sync.reorg_view_put view k_collide vout "collide-data";
+  Sync.reorg_view_put view k_pure_put vout "pure-put-data";
+
+  (* Commit. *)
+  let batch = Storage.ChainDB.batch_create () in
+  Sync.stage_pending_utxos_into_batch ibd batch view;
+  Storage.ChainDB.batch_write db batch;
+
+  (* Assertions: K_collide present (delete reconciled by later put);
+     K_pure_delete absent; K_pure_put present. *)
+  (match Storage.ChainDB.get_utxo db k_collide vout with
+   | Some data ->
+     Alcotest.(check string)
+       "K_collide preserved across disconnect+reconnect"
+       "collide-data" data
+   | None ->
+     Alcotest.fail
+       "K_collide MISSING — the disconnect-delete won over the \
+        connect-put (this is the pre-2026-05-07 bug)");
+
+  Alcotest.(check (option string))
+    "K_pure_delete absent (disconnect with no re-put)"
+    None
+    (Storage.ChainDB.get_utxo db k_pure_delete vout);
+
+  Alcotest.(check (option string))
+    "K_pure_put present (connect-only)"
+    (Some "pure-put-data")
+    (Storage.ChainDB.get_utxo db k_pure_put vout);
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 (* Test invalidate_block causes reorg and reconsider_block restores the chain *)
 let test_invalidate_reorg_reconsider () =
   cleanup_test_db ();
@@ -2129,6 +2222,12 @@ let () =
         test_reorganize_crash_pre_commit_no_disk_change;
       test_case "single-batch commit (3-disconnect + 4-reconnect)" `Quick
         test_reorganize_single_batch_commit;
+      (* 2026-05-07 wave 9 regression: same-key put/delete collision
+         (regtest coinbase txid identical across chain A and chain B)
+         must resolve in favor of the connect-side put, not the
+         disconnect-side delete. *)
+      test_case "stage_pending_utxos resolves put/delete collisions"
+        `Quick test_stage_pending_utxos_resolves_collisions;
     ];
     "side_branch_acceptance", [
       (* Pattern Y closure 2026-05-05 (rustoshi 68a422b counterpart).

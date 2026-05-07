@@ -2872,20 +2872,56 @@ let connect_block_into_batch
          m "Staged connect for block at height %d during reorg" height);
        Ok block)
 
-(* Stage the accumulated [pending_utxo_updates] / [pending_utxo_deletes]
-   into the shared batch and clear the in-memory lists.  Order matches
-   [flush_utxos]: puts first, then deletes — RocksDB applies in batch
-   order, so a (put, delete) collision on the same key is resolved
-   delete-wins, which is what we want for any input spent in the same
-   reorg as it was created/restored.  *)
+(* Stage the reorg's net UTXO delta into the shared batch by walking
+   the [reorg_view] overlay.  The overlay already represents the
+   correctly-resolved final state of every (txid, vout) the reorg
+   touched: [reorg_view_put] removes any matching [view_deletes]
+   entry, [reorg_view_delete] removes any matching [view_writes]
+   entry, so each key lives in at most one of the two tables.  This
+   is the source of truth for what we must commit.
+
+   Pre-2026-05-07 this function instead iterated two flat lists
+   ([ibd.pending_utxo_updates] / [pending_utxo_deletes]) accumulated
+   in append order across all disconnect+connect blocks, then wrote
+   "all puts, then all deletes" — meaning a key that was deleted
+   on the disconnect side and re-put on the connect side ended up
+   DELETED (the trailing delete won).  That is wrong whenever a
+   coinbase txid collides between the disconnected chain and the
+   reconnected chain — which is exactly what happens in regtest
+   reorgs (deterministic mining produces identical coinbase
+   serialization at the same height + same address, so A1's
+   coinbase txid == B1's coinbase txid; corpus entry
+   `reorg-via-submitblock` triggers it).  Bitcoin Core's
+   [CCoinsViewCache] handles this naturally because it mutates the
+   in-memory cache per-block; we replicate that resolution by
+   committing the view's net state, not the raw event log.
+
+   The pending-list mutations in the disconnect/connect helpers are
+   left in place but are now ignored by this function and cleared
+   here; the overlay is the authoritative source.  IBD's connect
+   path has its own [flush_utxos] commit that still uses those
+   lists (forward-only path, no put/delete collisions, no view). *)
 let stage_pending_utxos_into_batch
-    (ibd : ibd_state) (batch : Storage.ChainDB.batch) : unit =
-  List.iter (fun (txid, vout, data) ->
+    (ibd : ibd_state) (batch : Storage.ChainDB.batch)
+    (view : reorg_view) : unit =
+  let decode_key (k : string) : Types.hash256 * int =
+    let txid = Cstruct.of_string (String.sub k 0 32) in
+    let vout =
+      (Char.code k.[32])
+      lor ((Char.code k.[33]) lsl 8)
+      lor ((Char.code k.[34]) lsl 16)
+      lor ((Char.code k.[35]) lsl 24)
+    in
+    (txid, vout)
+  in
+  Hashtbl.iter (fun k data ->
+    let (txid, vout) = decode_key k in
     Storage.ChainDB.batch_store_utxo batch txid vout data
-  ) ibd.pending_utxo_updates;
-  List.iter (fun (txid, vout) ->
+  ) view.view_writes;
+  Hashtbl.iter (fun k () ->
+    let (txid, vout) = decode_key k in
     Storage.ChainDB.batch_delete_utxo batch txid vout
-  ) ibd.pending_utxo_deletes;
+  ) view.view_deletes;
   ibd.pending_utxo_updates <- [];
   ibd.pending_utxo_deletes <- []
 
@@ -2977,8 +3013,11 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
                from the pre-reorg state. *)
             Error e
           | None ->
-            (* Stage UTXO delta + tip flip into the same batch and commit. *)
-            stage_pending_utxos_into_batch ibd batch;
+            (* Stage UTXO delta + tip flip into the same batch and commit.
+               The [view] is the source of truth (it correctly
+               resolves put/delete collisions across the reorg's
+               disconnect+connect halves). *)
+            stage_pending_utxos_into_batch ibd batch view;
             Storage.ChainDB.batch_set_chain_tip batch new_tip.hash
               new_tip.height;
             Storage.ChainDB.batch_write state.db batch;

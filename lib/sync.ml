@@ -147,6 +147,28 @@ type chain_state = {
      [dumptxoutset rollback]'s rewind→dump→replay dance so peers cannot
      race a new block into the chain mid-rewind; cleared on every exit
      path. Peers stay connected; only block acceptance is gated. *)
+  mutable bip157_index : Block_index.bip157_index option;
+  (* BIP-157/158 basic block filter index handle.
+
+     [Some _] when the daemon was started with --blockfilterindex=basic
+     (or its boolean-equivalent forms; see [bin/main.ml]); [None]
+     otherwise. Every connect-block path in this module calls
+     [Block_index.append_block_filter] when this is [Some], in lockstep
+     with the validated-tip advance, so the filter index never lags or
+     leads the active chain by more than one block. Reorgs call
+     [Block_index.rewind_bip157_index] from [reorganize]'s disconnect
+     half. The handle is created in [cli.ml] (Cli.run) after
+     [restore_chain_state] returns and before any IBD or post-IBD block
+     listener is wired; [cli.ml]'s graceful-shutdown phase calls
+     [Block_index.close_bip157_index] on the way down. The REST handler
+     in [rest.ml] reads through the legacy [Rpc.rpc_context.filter_index]
+     pointer which we point at this same [filter_idx] sub-handle; the
+     bundle here is just the orchestration sidecar (height->hash + atomic
+     append/rewind helpers).
+
+     Mirrors Bitcoin Core's [BlockFilterIndex] singleton attached to
+     [ChainstateManager] via [g_indexes_ready_to_sync]
+     ([src/index/blockfilterindex.cpp]). *)
 }
 
 (* Header flood prevention: reject new headers when this limit is reached
@@ -421,6 +443,7 @@ let create_chain_state (db : Storage.ChainDB.t)
     unconnecting_headers = Hashtbl.create 16;
     invalidated_blocks = Hashtbl.create 16;
     block_submission_paused = false;
+    bip157_index = None;
   } in
   (* Insert genesis block header *)
   let genesis_hash = Crypto.compute_block_hash network.genesis_header in
@@ -465,6 +488,7 @@ let restore_chain_state (db : Storage.ChainDB.t)
     unconnecting_headers = Hashtbl.create 16;
     invalidated_blocks = Hashtbl.create 16;
     block_submission_paused = false;
+    bip157_index = None;
   } in
   (* Check for stored header tip *)
   match Storage.ChainDB.get_header_tip db with
@@ -1117,6 +1141,63 @@ let is_assume_valid (state : chain_state) (height : int) : bool =
     match Hashtbl.find_opt state.headers (Cstruct.to_string av_hash) with
     | None -> false  (* assumevalid block not in our chain yet *)
     | Some av_entry -> height <= av_entry.height
+
+(* ============================================================================
+   BIP-157 filter index helpers
+
+   Every connect-block path in this module calls [append_filter_if_enabled]
+   when [chain.bip157_index] is [Some]. The helper is a no-op when the index
+   is disabled, keeping the call sites uniform regardless of whether the
+   operator passed --blockfilterindex.
+
+   The [spent_utxos] argument is the [Validation.utxo] list returned from
+   [Validation.accept_block] (AB_ok's third element). This is exactly the
+   set of outputs that were spent by the block, in iteration order, and is
+   already in hand at every connect-block call site — converting it into
+   the [Cstruct.t list] expected by [Block_index.append_block_filter] is a
+   single [List.map].
+
+   Errors are logged but never escalated. If the parent's filter is
+   unexpectedly missing (e.g. a manually-deleted index file), the next
+   restart's startup-time backfill will catch up.
+   ============================================================================ *)
+let append_filter_if_enabled
+    (chain : chain_state) ~(block : Types.block) ~(height : int)
+    ~(spent_utxos : (Types.outpoint * Validation.utxo) list)
+    : unit =
+  match chain.bip157_index with
+  | None -> ()
+  | Some idx ->
+    let spent_scripts =
+      List.map (fun (_op, (u : Validation.utxo)) -> u.script_pubkey)
+        spent_utxos
+    in
+    (match Block_index.append_block_filter idx
+             ~block ~height ~spent_scripts with
+     | Ok () -> ()
+     | Error msg ->
+       Logs.warn (fun m ->
+         m "BIP-157: failed to append filter at height %d: %s" height msg))
+
+(* Same shape but for callers (e.g. the reorg connect path) that have the
+   spent UTXOs as [Utxo.utxo_entry] rather than [Validation.utxo]. *)
+let append_filter_if_enabled_from_entries
+    (chain : chain_state) ~(block : Types.block) ~(height : int)
+    ~(spent_entries : (Types.outpoint * Utxo.utxo_entry) list)
+    : unit =
+  match chain.bip157_index with
+  | None -> ()
+  | Some idx ->
+    let spent_scripts =
+      List.map (fun (_op, (e : Utxo.utxo_entry)) -> e.script_pubkey)
+        spent_entries
+    in
+    (match Block_index.append_block_filter idx
+             ~block ~height ~spent_scripts with
+     | Ok () -> ()
+     | Error msg ->
+       Logs.warn (fun m ->
+         m "BIP-157: failed to append filter at height %d: %s" height msg))
 
 (* IBD configuration constants *)
 let max_blocks_per_peer = 16           (* Max in-flight blocks per peer, matching Bitcoin Core MAX_BLOCKS_IN_TRANSIT_PER_PEER *)
@@ -2002,6 +2083,16 @@ let process_downloaded_blocks ?(max_blocks = 1)
         (match vresult with
          | Ok (_fees, txid_arr, spent_utxo_list) ->
            let ibd_mode = skip_scripts in
+           (* BIP-157 filter index append. Done in BOTH the assume-valid
+              fast-path AND the full-validation slow-path because the
+              REST blockfilter handler must serve filters for every
+              connected block regardless of whether script verification
+              was skipped. The spent UTXOs come from validation's
+              [spent_utxo_list] (full-validate) or from the upstream
+              UTXO lookup (assume-valid path produces them too as long
+              as inputs were resolved). *)
+           append_filter_if_enabled ibd.chain ~block ~height
+             ~spent_utxos:spent_utxo_list;
            (* Fix 3: Skip block/undo storage during assume-valid IBD *)
            if not ibd_mode then begin
              (* Store block *)
@@ -2723,6 +2814,22 @@ let connect_block_into_batch
        Utxo.serialize_undo_data uw undo;
        Storage.ChainDB.batch_store_undo_data batch entry.hash
          (Cstruct.to_string (Serialize.writer_to_cstruct uw));
+       (* BIP-157 filter index append for the reorg-connect path. We
+          flatten [tx_undos] into a single list of (outpoint, entry)
+          pairs so [append_filter_if_enabled_from_entries] can extract
+          scriptPubKeys without re-computing them.
+
+          Reorg ordering: the disconnect half of the reorg has already
+          called [Block_index.rewind_bip157_index] (see [reorganize])
+          to roll the index back to the fork point, so this append at
+          [height] sees a fresh parent filter header just like a normal
+          IBD connect. *)
+       let spent_entries =
+         List.concat_map (fun (tu : Utxo.tx_undo) -> tu.spent_outputs)
+           tx_undos
+       in
+       append_filter_if_enabled_from_entries state ~block ~height
+         ~spent_entries;
        (* Stage tx_index pointers (Pattern C0 counterpart of
           [TxIndex::CustomAppend]). The raw tx blob goes into the
           [tx] CF, the txid->(block_hash, tx_idx) pointer into the
@@ -2840,6 +2947,17 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
           ibd.pending_utxo_deletes <- [];
           Error e
         | Ok () ->
+          (* BIP-157 disconnect-half: rewind the filter index to the
+             fork point so the connect-half's appender sees a fresh
+             parent for [fork_point.height + 1]. We do this once for
+             the whole reorg (rather than per-block) because the index
+             is in-memory between [batch_write] calls and a single
+             [rewind_bip157_index] call is O(disconnect_depth). *)
+          (match state.bip157_index with
+           | None -> ()
+           | Some idx ->
+             Block_index.rewind_bip157_index idx
+               ~target_height:fork_point.height);
           (* Connect side: iterate fork-forward-to-new-tip. *)
           let connect_error = ref None in
           let connected_blocks = ref [] in
@@ -2864,6 +2982,21 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
             Storage.ChainDB.batch_set_chain_tip batch new_tip.hash
               new_tip.height;
             Storage.ChainDB.batch_write state.db batch;
+            (* BIP-157 reorg-fsync. The rewind + per-block appends above
+               only mutated the in-memory bundle. Persist them now,
+               matching the LSM commit we just performed for the
+               chainstate. The flush is best-effort: a crash before this
+               point leaves the index recoverable from the next restart's
+               backfill (which walks last-indexed-height+1 .. blocks_synced
+               and replays). *)
+            (match state.bip157_index with
+             | None -> ()
+             | Some idx ->
+               (try Block_index.sync_bip157_index idx
+                with exn ->
+                  Logs.warn (fun m ->
+                    m "BIP-157: reorg sync failed: %s"
+                      (Printexc.to_string exn))));
             (* Disk is now durably at the new chain.  Apply in-memory
                state and side effects after the commit so a crash
                between batch_write and these updates leaves only the
@@ -3287,6 +3420,102 @@ let start_ibd ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
   end
 
 (* ============================================================================
+   BIP-157 Startup Backfill
+
+   Reference: Bitcoin Core's [BlockFilterIndex::CustomInit] +
+   [BaseIndex::Sync] ([src/index/blockfilterindex.cpp]).
+
+   On every daemon start, if --blockfilterindex is enabled, we walk the
+   stored chain from [last_indexed_height + 1] up to [blocks_synced],
+   re-reading each block body + undo data and feeding them into
+   [Block_index.append_block_filter]. This catches up the index after:
+   - fresh-install (last_indexed_height = -1, walks the full chain)
+   - cold-restart with --blockfilterindex toggled on for the first time
+   - crash mid-block-connect (the chain is durable but the index missed
+     the last few entries because the index is flushed less frequently
+     than the chainstate)
+
+   The backfill uses the stored undo data when available (post-assume-valid
+   blocks) and falls back to an empty spent_scripts list (assume-valid IBD
+   path skipped undo storage to save disk; the basic filter degrades to
+   "outputs only" for those blocks, matching Core's behaviour when
+   running a pruned node with a partially-pruned undo file).
+
+   Logged with progress every 10000 blocks so a fresh-install backfill
+   doesn't go silent for hours. Returns the count of blocks that were
+   newly indexed. *)
+let backfill_bip157_index (state : chain_state) : int =
+  match state.bip157_index with
+  | None -> 0
+  | Some idx ->
+    let target = state.blocks_synced in
+    let start = Block_index.bip157_best_height idx + 1 in
+    if start > target then 0
+    else begin
+      Logs.info (fun m ->
+        m "BIP-157: starting backfill from height %d to %d (%d blocks)"
+          start target (target - start + 1));
+      let count = ref 0 in
+      let progress_step = 10000 in
+      (try
+        for h = start to target do
+          match get_header_at_height state h with
+          | None ->
+            (* Header gap: stop the backfill so we don't index past a
+               hole in the chain. The next restart will retry. *)
+            raise Exit
+          | Some entry ->
+            (match Storage.ChainDB.get_block state.db entry.hash with
+             | None ->
+               (* Block body missing (likely pruned). Stop here; the
+                  filter index can't be populated for pruned heights. *)
+               Logs.warn (fun m ->
+                 m "BIP-157: stopping backfill at height %d (block body \
+                    not on disk — pruned or missing)" h);
+               raise Exit
+             | Some block ->
+               (* Build spent_scripts from the stored undo data when
+                  it's available; fall back to empty (outputs-only
+                  filter) when the assume-valid IBD path skipped undo
+                  storage. *)
+               let spent_scripts =
+                 match Storage.ChainDB.get_undo_data state.db entry.hash with
+                 | None -> []
+                 | Some undo_raw ->
+                   (try
+                     let r =
+                       Serialize.reader_of_cstruct (Cstruct.of_string undo_raw)
+                     in
+                     let undo = Utxo.deserialize_undo_data r in
+                     List.concat_map (fun (tu : Utxo.tx_undo) ->
+                       List.map (fun (_op, (e : Utxo.utxo_entry)) ->
+                         e.script_pubkey
+                       ) tu.spent_outputs
+                     ) undo.tx_undos
+                   with _ -> [])
+               in
+               (match Block_index.append_block_filter idx
+                        ~block ~height:h ~spent_scripts with
+                | Ok () ->
+                  incr count;
+                  if !count mod progress_step = 0 then
+                    Logs.info (fun m ->
+                      m "BIP-157: backfill progress: %d/%d (height %d)"
+                        !count (target - start + 1) h)
+                | Error msg ->
+                  Logs.warn (fun m ->
+                    m "BIP-157: backfill stopped at height %d: %s" h msg);
+                  raise Exit))
+        done
+      with Exit -> ());
+      Block_index.sync_bip157_index idx;
+      Logs.info (fun m ->
+        m "BIP-157: backfill complete, %d new entries (best_height=%d)"
+          !count (Block_index.bip157_best_height idx));
+      !count
+    end
+
+(* ============================================================================
    Post-IBD Block Processing
    ============================================================================ *)
 
@@ -3353,13 +3582,17 @@ let rec connect_stored_blocks (state : chain_state) : int =
                 ~expected_bits ~median_time ~base_lookup:lookup
                 ~flags:validation_flags ~skip_scripts:false
                 ~get_mtp_at_height:(get_mtp_for_height state) () with
-        | Validation.AB_ok (_fees, txid_arr, _spent_utxos) ->
+        | Validation.AB_ok (_fees, txid_arr, spent_utxos) ->
           (* Write tx_index entries for the connected stored block
              (Pattern C0 closure 2026-05-05). Mirrors process_new_block
              below; the gap-fill catch-up path needs the same wiring or
              [getrawtransaction] returns nothing for any tx whose only
              confirmation arrived via the out-of-order drain. *)
           tx_index_write_for_block state.db stored_block entry.hash txid_arr;
+          (* BIP-157 filter index append (no-op when --blockfilterindex
+             is off). Mirrors Core's [BlockFilterIndex::CustomAppend]. *)
+          append_filter_if_enabled state ~block:stored_block
+            ~height:next_height ~spent_utxos;
           let ops = ref [] in
           List.iteri (fun tx_idx tx ->
             let is_cb = (tx_idx = 0) in
@@ -3490,7 +3723,7 @@ let process_new_block (state : chain_state) (block : Types.block)
                 ~expected_bits ~median_time ~base_lookup:lookup
                 ~flags:validation_flags ~skip_scripts:false
                 ~get_mtp_at_height:(get_mtp_for_height state) () with
-        | Validation.AB_ok (_fees, txid_arr, _spent_utxos) ->
+        | Validation.AB_ok (_fees, txid_arr, spent_utxos) ->
           (* Store the block *)
           Storage.ChainDB.store_block state.db hash block;
           (* Write tx_index entries for every tx in the new block
@@ -3503,6 +3736,10 @@ let process_new_block (state : chain_state) (block : Types.block)
              [_txindex-revert-on-reorg-fleet-result-2026-05-05.md]
              Pattern C0). *)
           tx_index_write_for_block state.db block hash txid_arr;
+          (* BIP-157 filter index append (no-op when --blockfilterindex
+             is off). Mirrors Core's [BlockFilterIndex::CustomAppend]
+             fired from [BaseIndex::BlockConnected]. *)
+          append_filter_if_enabled state ~block ~height ~spent_utxos;
           (* Collect UTXO mutations for a single atomic block commit *)
           let ops = ref [] in
           List.iteri (fun tx_idx tx ->

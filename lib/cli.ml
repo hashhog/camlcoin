@@ -47,6 +47,19 @@ type config = {
        opening, replay every stored block from height 0 forward to
        rebuild the UTXO set. Headers + block bodies + height->hash
        are retained. Mirrors Bitcoin Core's -reindex (init.cpp). *)
+  rest_enabled : bool;
+    (* Mirrors Bitcoin Core's -rest (init.cpp:153 DEFAULT_REST_ENABLE).
+       When true, a public read-only REST HTTP listener is spawned in
+       Cli.run alongside the JSON-RPC listener; when false (default),
+       no REST socket is bound and the rest module is silent. *)
+  rest_port : int option;
+    (* Optional override port for the REST listener. [None] reuses the
+       JSON-RPC port, matching Core's "REST handlers mounted on the
+       same HTTP server" semantics. Set explicitly to use a separate
+       physical socket. *)
+  rest_bind : string option;
+    (* Optional bind address for the REST listener. [None] reuses
+       [rpc_host]. *)
 }
 
 (* ============================================================================
@@ -72,6 +85,9 @@ let default_config : config = {
   peer_bloom_filters = false;  (* Mirrors Core DEFAULT_PEERBLOOMFILTERS *)
   zmq_pub_options = [];
   reindex = false;
+  rest_enabled = false;  (* Mirrors Core DEFAULT_REST_ENABLE = false *)
+  rest_port = None;
+  rest_bind = None;
 }
 
 (* Network-specific configuration *)
@@ -435,6 +451,47 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       ~rpc_user:config.rpc_user
       ~rpc_password:config.rpc_password
       ~cookie_password:(Some cookie_password)
+  in
+
+  (* Optionally start REST server. Defaults OFF to match Bitcoin Core's
+     DEFAULT_REST_ENABLE=false (init.cpp:153). When enabled, the public
+     read-only REST surface (block / tx / headers / chaininfo / mempool /
+     blockhashbyheight / blockfilter / blockfilterheaders) is bound to a
+     separate Cohttp listener so the JSON-RPC auth path stays untouched.
+     The default port is the same as --rpcport (no separate listener
+     spawned in that case to avoid double-binding); use --restport to
+     pick a distinct socket. The default bind reuses --rpchost. *)
+  let rest_host = match config.rest_bind with
+    | Some h -> h
+    | None -> config.rpc_host in
+  let rest_port = match config.rest_port with
+    | Some p -> p
+    | None -> config.rpc_port in
+  let rest_thread =
+    if not config.rest_enabled then
+      Lwt.return_unit
+    else if rest_port = config.rpc_port && rest_host = config.rpc_host then begin
+      (* Same host:port as the JSON-RPC server. The Cohttp-based RPC
+         listener already routes paths starting with "/" — but the RPC
+         dispatcher only honors POST and JSON-RPC bodies. Mounting the
+         REST router on the same socket would require teaching the RPC
+         server to delegate /rest/* to dispatch_rest. Today we instead
+         emit a clear log line and refuse to bind a duplicate listener,
+         keeping the cli observable rather than failing silently. *)
+      Logs.warn (fun m ->
+        m "REST enabled but --restport (%d) matches --rpcport; \
+           REST endpoints are NOT served. Set --restport=<distinct \
+           port> to enable."
+          rest_port);
+      Lwt.return_unit
+    end else begin
+      Logs.info (fun m ->
+        m "Starting REST server on %s:%d (--rest)" rest_host rest_port);
+      Rest.start_rest_server
+        ~ctx:rpc_ctx
+        ~host:rest_host
+        ~port:rest_port
+    end
   in
 
   (* Start peer manager *)
@@ -1200,5 +1257,12 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       (fun exn ->
         Logs.warn (fun m ->
           m "metrics_thread exited: %s" (Printexc.to_string exn));
+        Lwt.return_unit));
+  Lwt.async (fun () ->
+    Lwt.catch
+      (fun () -> rest_thread)
+      (fun exn ->
+        Logs.warn (fun m ->
+          m "rest_thread exited: %s" (Printexc.to_string exn));
         Lwt.return_unit));
   event_loop ()

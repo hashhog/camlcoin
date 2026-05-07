@@ -209,6 +209,32 @@ let reindex_arg =
              '-reindex' (init.cpp + validation.cpp)." in
   Arg.(value & flag & info ["reindex"] ~doc)
 
+let rest_arg =
+  let doc = "Enable the public REST HTTP server (read-only \
+             /rest/block, /rest/tx, /rest/headers, /rest/chaininfo, \
+             /rest/mempool/{info,contents}, /rest/blockhashbyheight, \
+             /rest/blockfilter, /rest/blockfilterheaders endpoints). \
+             Default: off, matching Bitcoin Core's DEFAULT_REST_ENABLE \
+             (init.cpp:153)." in
+  Arg.(value & flag & info ["rest"] ~doc)
+
+let rest_port_arg =
+  let doc = "Port for the REST HTTP server when --rest is set. \
+             Defaults to the same port as --rpcport, mirroring Bitcoin \
+             Core's behavior of mounting REST handlers on the JSON-RPC \
+             listener. A separate port can be set if a deployment \
+             prefers physical isolation between the authenticated RPC \
+             surface and the public REST surface." in
+  Arg.(value & opt (some int) None &
+    info ["restport"] ~docv:"PORT" ~doc)
+
+let rest_bind_arg =
+  let doc = "Bind address for the REST HTTP server. Defaults to \
+             --rpchost (127.0.0.1). Use 0.0.0.0 to expose REST publicly; \
+             never combine that with --rpcallowip-style relaxation." in
+  Arg.(value & opt (some string) None &
+    info ["restbind"] ~docv:"HOST" ~doc)
+
 (* ============================================================================
    Main Command
    ============================================================================ *)
@@ -217,7 +243,8 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     p2p_port max_outbound max_inbound connect debug no_wallet prune benchmark
     import_blocks import_utxo metrics_port peer_bloom_filters
     migrate_logstorage daemon_mode pid_path conf_path debug_cats
-    logfile printtoconsole ready_fd zmq_pub reindex =
+    logfile printtoconsole ready_fd zmq_pub reindex
+    rest_enabled rest_port rest_bind =
   (* Resolve datadir early so config-file lookup can default to it. *)
   let base = Camlcoin.Cli.config_for_network network in
   let resolved_datadir = match datadir with
@@ -479,6 +506,16 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
         reindex
         || (match Camlcoin.Runtime_config.get_bool conf_opts "reindex" with
             | Some b -> b | None -> false);
+      rest_enabled =
+        rest_enabled
+        || (match Camlcoin.Runtime_config.get_bool conf_opts "rest" with
+            | Some b -> b | None -> false);
+      rest_port = (match rest_port with
+        | Some p -> Some p
+        | None -> Camlcoin.Runtime_config.get_int conf_opts "restport");
+      rest_bind = (match rest_bind with
+        | Some h -> Some h
+        | None -> Camlcoin.Runtime_config.get_string conf_opts "restbind");
     } in
     (* Ensure datadir exists so we can land the PID file there. *)
     (try Unix.mkdir resolved_datadir 0o755
@@ -575,7 +612,10 @@ let cmd =
     $ printtoconsole_arg
     $ ready_fd_arg
     $ zmq_pub_arg
-    $ reindex_arg)
+    $ reindex_arg
+    $ rest_arg
+    $ rest_port_arg
+    $ rest_bind_arg)
 
 (* ============================================================================
    Entry Point

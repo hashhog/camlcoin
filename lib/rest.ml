@@ -109,9 +109,19 @@ let get_query_param (req : Cohttp.Request.t) (name : string) : string option =
 
 (* ============================================================================
    Block Endpoint: GET /rest/block/<hash>.<format>
+                   GET /rest/block/notxdetails/<hash>.<format>
+
+   [notx_details] toggles the JSON-mode tx verbosity:
+     false (default) — Core's "DETAILS_AND_PREVOUT": each tx is a JSON
+                       object with vin/vout/locktime; matches /rest/block/.
+     true            — Core's "SHOW_TXID": tx field is a flat list of
+                       txid hex strings; matches /rest/block/notxdetails/.
+   .bin and .hex are byte-for-byte identical between the two paths
+   (Core rest.cpp:471-479).
    ============================================================================ *)
 
-let handle_block (ctx : Rpc.rpc_context) (_req : Cohttp.Request.t)
+let handle_block ?(notx_details : bool = false)
+    (ctx : Rpc.rpc_context) (_req : Cohttp.Request.t)
     (uri_part : string) =
   let open Lwt.Syntax in
   let rf, hash_str = parse_data_format uri_part in
@@ -155,6 +165,51 @@ let handle_block (ctx : Rpc.rpc_context) (_req : Cohttp.Request.t)
         let tip_height = match ctx.chain.tip with Some t -> t.height | None -> 0 in
         let confirmations = tip_height - height + 1 in
         let median_time = Sync.compute_median_time_past ctx.chain height in
+        let tx_field =
+          if notx_details then
+            (* /rest/block/notxdetails — Core's SHOW_TXID verbosity: flat
+               txid strings only. *)
+            `List (List.map (fun tx ->
+              `String (Types.hash256_to_hex_display (Crypto.compute_txid tx))
+            ) block.transactions)
+          else
+            (* /rest/block — Core's DETAILS_AND_PREVOUT verbosity: tx
+               objects with vin/vout/locktime/etc. We do not yet plumb
+               undo data here so prevout decoration is omitted; the
+               shape still matches DETAILS for SPV/lightweight clients. *)
+            `List (List.map (fun (tx : Types.transaction) ->
+              let w = Serialize.writer_create () in
+              Serialize.serialize_transaction w tx;
+              let raw_size = Cstruct.length (Serialize.writer_to_cstruct w) in
+              `Assoc [
+                ("txid", `String (Types.hash256_to_hex_display (Crypto.compute_txid tx)));
+                ("hash", `String (Types.hash256_to_hex_display (Crypto.compute_wtxid tx)));
+                ("version", `Int (Int32.to_int tx.version));
+                ("size", `Int raw_size);
+                ("weight", `Int (Validation.compute_tx_weight tx));
+                ("locktime", `Int (Int32.to_int tx.locktime));
+                ("vin", `List (List.map (fun (inp : Types.tx_in) ->
+                  `Assoc [
+                    ("txid", `String (Types.hash256_to_hex_display inp.previous_output.txid));
+                    ("vout", `Int (Int32.to_int inp.previous_output.vout));
+                    ("scriptSig", `Assoc [
+                      ("hex", `String (cstruct_to_hex inp.script_sig))
+                    ]);
+                    ("sequence", `Int (Int32.to_int inp.sequence));
+                  ]
+                ) tx.inputs));
+                ("vout", `List (List.mapi (fun n (out : Types.tx_out) ->
+                  `Assoc [
+                    ("value", `Float (Int64.to_float out.value /. 100_000_000.0));
+                    ("n", `Int n);
+                    ("scriptPubKey", `Assoc [
+                      ("hex", `String (cstruct_to_hex out.script_pubkey))
+                    ]);
+                  ]
+                ) tx.outputs));
+              ]
+            ) block.transactions)
+        in
         let json = `Assoc [
           ("hash", `String hash_str);
           ("confirmations", `Int confirmations);
@@ -165,9 +220,7 @@ let handle_block (ctx : Rpc.rpc_context) (_req : Cohttp.Request.t)
           ("version", `Int (Int32.to_int block.header.version));
           ("versionHex", `String (Printf.sprintf "%08lx" block.header.version));
           ("merkleroot", `String (Types.hash256_to_hex_display block.header.merkle_root));
-          ("tx", `List (List.map (fun tx ->
-            `String (Types.hash256_to_hex_display (Crypto.compute_txid tx))
-          ) block.transactions));
+          ("tx", tx_field);
           ("time", `Int (Int32.to_int block.header.timestamp));
           ("mediantime", `Int (Int32.to_int median_time));
           ("nonce", `Int (Int32.to_int block.header.nonce));
@@ -180,6 +233,14 @@ let handle_block (ctx : Rpc.rpc_context) (_req : Cohttp.Request.t)
         respond_json (Yojson.Safe.to_string json)
       | Undefined ->
         respond_error `Not_found ("output format not found (available: " ^ available_formats () ^ ")")
+
+(* /rest/block/notxdetails/<hash>.<format>: Core rest.cpp:476-479. Wraps
+   handle_block with [notx_details=true] so the JSON tx field is a flat
+   list of txid hex strings. .bin and .hex paths are byte-identical to
+   /rest/block/. *)
+let handle_block_notxdetails (ctx : Rpc.rpc_context) (req : Cohttp.Request.t)
+    (uri_part : string) =
+  handle_block ~notx_details:true ctx req uri_part
 
 (* ============================================================================
    Transaction Endpoint: GET /rest/tx/<txid>.<format>
@@ -364,6 +425,162 @@ let handle_headers (ctx : Rpc.rpc_context) (req : Cohttp.Request.t)
             respond_error `Not_found ("output format not found (available: " ^ available_formats () ^ ")")
 
 (* ============================================================================
+   Block Filter Endpoint (BIP-157/158)
+     GET /rest/blockfilter/<filtertype>/<hash>.<format>
+     GET /rest/blockfilterheaders/<filtertype>/<hash>.<format>?count=<count>
+     GET /rest/blockfilterheaders/<filtertype>/<count>/<hash>.<format>
+                                                  (deprecated path form)
+
+   Reference: bitcoin-core/src/rest.cpp:500-711.
+
+   When the filter index is not enabled (the default), Core returns
+   HTTP 400 with "Index is not enabled for filtertype <name>"; we mirror
+   that exactly so SPV clients can probe and back off cleanly.
+   ============================================================================ *)
+
+(* Currently only "basic" (BIP-158 basic filter) is supported, matching
+   Core's BlockFilterTypeByName. Returns the parsed type when the name
+   matches (case-insensitive), [None] otherwise. *)
+let parse_filter_type (name : string) : Block_index.block_filter_type option =
+  match String.lowercase_ascii name with
+  | "basic" -> Some Block_index.Basic
+  | _ -> None
+
+let handle_blockfilter (ctx : Rpc.rpc_context) (_req : Cohttp.Request.t)
+    (uri_part : string) =
+  let rf, param = parse_data_format uri_part in
+  let parts = split_string param '/' in
+  match parts with
+  | [filtertype_str; hash_str] ->
+    (match parse_filter_type filtertype_str with
+     | None ->
+       respond_error `Bad_request ("Unknown filtertype " ^ filtertype_str)
+     | Some _ftype ->
+       (match ctx.filter_index with
+        | None ->
+          respond_error `Bad_request
+            ("Index is not enabled for filtertype " ^ filtertype_str)
+        | Some idx ->
+          (match parse_display_hash hash_str with
+           | None ->
+             respond_error `Bad_request ("Invalid hash: " ^ hash_str)
+           | Some hash ->
+             (match Block_index.read_filter idx hash with
+              | None ->
+                respond_error `Not_found
+                  "Filter not found. Block was not connected to active chain."
+              | Some bf ->
+                (* Encoded filter is the raw GCS bytes per BIP-158. Core's
+                   wire format on the REST endpoint is the same compact
+                   bytes that get serialized into a `cfilter` P2P message
+                   payload. *)
+                let encoded = bf.filter.Block_index.encoded in
+                (match rf with
+                 | Binary ->
+                   respond_binary encoded
+                 | Hex ->
+                   respond_hex (cstruct_to_hex (Cstruct.of_string encoded))
+                 | JSON ->
+                   let json = `Assoc [
+                     ("filter",
+                      `String (cstruct_to_hex (Cstruct.of_string encoded)))
+                   ] in
+                   respond_json (Yojson.Safe.to_string json)
+                 | Undefined ->
+                   respond_error `Not_found
+                     ("output format not found (available: "
+                      ^ available_formats () ^ ")"))))))
+  | _ ->
+    respond_error `Bad_request
+      "Invalid URI format. Expected /rest/blockfilter/<filtertype>/<blockhash>"
+
+let handle_blockfilterheaders (ctx : Rpc.rpc_context) (req : Cohttp.Request.t)
+    (uri_part : string) =
+  let rf, param = parse_data_format uri_part in
+  let parts = split_string param '/' in
+  let filtertype_str, count_str, hash_str =
+    match parts with
+    | [ft; hash] ->
+      (* New path: /rest/blockfilterheaders/<ft>/<hash>?count=<n> *)
+      let count = match get_query_param req "count" with
+        | Some c -> c | None -> "5" in
+      (ft, count, hash)
+    | [ft; count; hash] ->
+      (* Deprecated path: /rest/blockfilterheaders/<ft>/<count>/<hash> *)
+      (ft, count, hash)
+    | _ ->
+      ("", "", "")
+  in
+  if filtertype_str = "" then
+    respond_error `Bad_request
+      "Invalid URI format. Expected \
+       /rest/blockfilterheaders/<filtertype>/<blockhash>.<ext>?count=<count>"
+  else match parse_filter_type filtertype_str with
+  | None ->
+    respond_error `Bad_request ("Unknown filtertype " ^ filtertype_str)
+  | Some _ ->
+    let count = try int_of_string count_str with _ -> 0 in
+    if count < 1 || count > max_headers_results then
+      respond_error `Bad_request
+        (Printf.sprintf
+           "Header count is invalid or out of acceptable range (1-%d): %s"
+           max_headers_results count_str)
+    else match ctx.filter_index with
+    | None ->
+      respond_error `Bad_request
+        ("Index is not enabled for filtertype " ^ filtertype_str)
+    | Some idx ->
+      match parse_display_hash hash_str with
+      | None ->
+        respond_error `Bad_request ("Invalid hash: " ^ hash_str)
+      | Some hash ->
+        (* Walk forward from [hash] along the active chain, collecting
+           filter headers. Mirrors Core's loop over active_chain.Next. *)
+        let rec collect h remaining acc =
+          if remaining = 0 then List.rev acc
+          else
+            match Sync.get_header ctx.chain h with
+            | None -> List.rev acc
+            | Some entry ->
+              let in_chain = match ctx.chain.tip with
+                | None -> false
+                | Some tip -> entry.height <= tip.height
+              in
+              if not in_chain then List.rev acc
+              else
+                match Block_index.get_filter_header idx h with
+                | None -> List.rev acc  (* index gap → return what we have *)
+                | Some fh ->
+                  match Storage.ChainDB.get_hash_at_height
+                          ctx.chain.db (entry.height + 1) with
+                  | None -> List.rev (fh :: acc)
+                  | Some next -> collect next (remaining - 1) (fh :: acc)
+        in
+        let filter_headers = collect hash count [] in
+        if filter_headers = [] then
+          respond_error `Not_found
+            "Filter not found. Block filters are still in the process of being indexed."
+        else match rf with
+        | Binary ->
+          let buf = Buffer.create (32 * List.length filter_headers) in
+          List.iter (fun fh -> Buffer.add_string buf (Cstruct.to_string fh))
+            filter_headers;
+          respond_binary (Buffer.contents buf)
+        | Hex ->
+          let buf = Buffer.create (64 * List.length filter_headers) in
+          List.iter (fun fh ->
+            Buffer.add_string buf (cstruct_to_hex fh)) filter_headers;
+          respond_hex (Buffer.contents buf)
+        | JSON ->
+          let json = `List (List.map (fun fh ->
+            `String (Types.hash256_to_hex_display fh)) filter_headers) in
+          respond_json (Yojson.Safe.to_string json)
+        | Undefined ->
+          respond_error `Not_found
+            ("output format not found (available: "
+             ^ available_formats () ^ ")")
+
+(* ============================================================================
    Chain Info Endpoint: GET /rest/chaininfo.json
    ============================================================================ *)
 
@@ -518,15 +735,39 @@ let handle_blockhashbyheight (ctx : Rpc.rpc_context) (_req : Cohttp.Request.t)
    REST Dispatcher
    ============================================================================ *)
 
+(* Helper: prefix test that's safe regardless of path length. *)
+let starts_with (s : string) (prefix : string) : bool =
+  let n = String.length prefix in
+  String.length s >= n && String.sub s 0 n = prefix
+
 let dispatch_rest (ctx : Rpc.rpc_context) (req : Cohttp.Request.t)
     (path : string) =
-  (* Route based on path prefix - most specific matches first *)
-  (* /rest/blockhashbyheight/ must come before /rest/block/ *)
-  if String.length path > 23 && String.sub path 0 24 = "/rest/blockhashbyheight/" then
-    let uri_part = String.sub path 24 (String.length path - 24) in
+  (* Route based on path prefix - most specific matches first.
+     Ordering rules (longer/more-specific first to avoid ambiguity):
+       /rest/blockhashbyheight/    before /rest/block/
+       /rest/blockfilterheaders/   before /rest/blockfilter/
+       /rest/blockfilter/          before /rest/block/  (block is shortest)
+       /rest/block/notxdetails/    before /rest/block/  (notxdetails-then-block)
+  *)
+  if starts_with path "/rest/blockhashbyheight/" then
+    let pfx = String.length "/rest/blockhashbyheight/" in
+    let uri_part = String.sub path pfx (String.length path - pfx) in
     handle_blockhashbyheight ctx req uri_part
-  else if String.length path > 12 && String.sub path 0 12 = "/rest/block/" then
-    let uri_part = String.sub path 12 (String.length path - 12) in
+  else if starts_with path "/rest/blockfilterheaders/" then
+    let pfx = String.length "/rest/blockfilterheaders/" in
+    let uri_part = String.sub path pfx (String.length path - pfx) in
+    handle_blockfilterheaders ctx req uri_part
+  else if starts_with path "/rest/blockfilter/" then
+    let pfx = String.length "/rest/blockfilter/" in
+    let uri_part = String.sub path pfx (String.length path - pfx) in
+    handle_blockfilter ctx req uri_part
+  else if starts_with path "/rest/block/notxdetails/" then
+    let pfx = String.length "/rest/block/notxdetails/" in
+    let uri_part = String.sub path pfx (String.length path - pfx) in
+    handle_block_notxdetails ctx req uri_part
+  else if starts_with path "/rest/block/" then
+    let pfx = String.length "/rest/block/" in
+    let uri_part = String.sub path pfx (String.length path - pfx) in
     handle_block ctx req uri_part
   else if String.length path > 9 && String.sub path 0 9 = "/rest/tx/" then
     let uri_part = String.sub path 9 (String.length path - 9) in

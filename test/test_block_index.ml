@@ -473,6 +473,180 @@ let test_height_index_sparse () =
   cleanup ()
 
 (* ============================================================================
+   BIP-157 Index Bundle Tests (high-level append + backfill + rewind)
+   ============================================================================ *)
+
+let test_bip157_dir = "/tmp/camlcoin_test_bip157"
+
+let cleanup_bip157 () =
+  cleanup_dir test_bip157_dir
+
+(* Helper: build a block with [n] outputs whose scriptPubKeys differ so
+   the test can verify the filter actually includes them. We also vary
+   the prev_block field to make each block hash unique — without that,
+   [bip157_has_height] dedup would mask append-side bugs. *)
+let make_unique_block ~(prev_block : Types.hash256) tag =
+  let header = Types.{
+    version = 1l;
+    prev_block;
+    merkle_root = Types.zero_hash;
+    timestamp = Int32.of_int (1231006505 + tag);
+    bits = 0x1d00ffffl;
+    nonce = Int32.of_int (2083236893 + tag);
+  } in
+  let scripts = [
+    Printf.sprintf "\x76\xa9\x14unique_%020dXX\x88\xac" tag;
+  ] in
+  let tx = make_test_tx_with_outputs scripts in
+  Types.{ header; transactions = [tx] }
+
+(* Sanity: opening + closing an empty bundle leaves best_height = -1 and
+   creates the [<data_dir>/indexes/blockfilter/basic] directory. *)
+let test_bip157_create_empty () =
+  cleanup_bip157 ();
+  let idx = Block_index.create_bip157_index ~data_dir:test_bip157_dir in
+  Alcotest.(check int) "empty bundle best_height = -1"
+    (-1) (Block_index.bip157_best_height idx);
+  Alcotest.(check bool) "filter sub-dir exists" true
+    (Sys.file_exists (Filename.concat test_bip157_dir "indexes/blockfilter/basic"));
+  Block_index.close_bip157_index idx;
+  cleanup_bip157 ()
+
+(* End-to-end: append a chain of 3 blocks, verify each is indexed and
+   each filter header chains against the previous filter header
+   (filter_header[0] = SHA256d(filter_hash[0] || zero_hash);
+    filter_header[h] = SHA256d(filter_hash[h] || filter_header[h-1])). *)
+let test_bip157_append_chain () =
+  cleanup_bip157 ();
+  let idx = Block_index.create_bip157_index ~data_dir:test_bip157_dir in
+  let prev_block = ref Types.zero_hash in
+  let block_hashes = ref [] in
+  for h = 0 to 2 do
+    let block = make_unique_block ~prev_block:!prev_block h in
+    let block_hash = Crypto.compute_block_hash block.header in
+    block_hashes := block_hash :: !block_hashes;
+    prev_block := block_hash;
+    let r = Block_index.append_block_filter idx
+              ~block ~height:h ~spent_scripts:[] in
+    Alcotest.(check bool) (Printf.sprintf "append height=%d ok" h)
+      true (match r with Ok () -> true | Error _ -> false)
+  done;
+  Alcotest.(check int) "best_height advanced to 2"
+    2 (Block_index.bip157_best_height idx);
+  (* Idempotent re-append at height 0: a no-op, must not raise. *)
+  let block0 = make_unique_block ~prev_block:Types.zero_hash 0 in
+  let r = Block_index.append_block_filter idx
+            ~block:block0 ~height:0 ~spent_scripts:[] in
+  Alcotest.(check bool) "idempotent re-append" true
+    (match r with Ok () -> true | Error _ -> false);
+  Alcotest.(check int) "best_height unchanged after idempotent append"
+    2 (Block_index.bip157_best_height idx);
+  (* Filter header chaining: pull filter_header at heights 0..2 and
+     verify they match the chained recomputation. *)
+  let block_hashes = List.rev !block_hashes in  (* now in height order 0..2 *)
+  let prev_fh = ref Types.zero_hash in
+  List.iteri (fun h hash ->
+    let bf = match Block_index.read_filter idx.filter_idx hash with
+      | Some f -> f | None -> Alcotest.fail "filter missing" in
+    let expected_fh = Block_index.compute_filter_header bf !prev_fh in
+    let stored_fh = match Block_index.get_filter_header idx.filter_idx hash with
+      | Some f -> f | None -> Alcotest.fail "filter_header missing" in
+    Alcotest.(check string)
+      (Printf.sprintf "filter header chain at height %d" h)
+      (Cstruct.to_string expected_fh)
+      (Cstruct.to_string stored_fh);
+    prev_fh := stored_fh
+  ) block_hashes;
+  Block_index.close_bip157_index idx;
+  cleanup_bip157 ()
+
+(* The "parent not indexed" guard: appending at height 5 with no chain
+   below it must fail with a backfill-needed error, not silently chain
+   against zero_hash (which would corrupt the filter-header chain). *)
+let test_bip157_append_skip_height_rejected () =
+  cleanup_bip157 ();
+  let idx = Block_index.create_bip157_index ~data_dir:test_bip157_dir in
+  let block = make_unique_block ~prev_block:Types.zero_hash 5 in
+  let r = Block_index.append_block_filter idx
+            ~block ~height:5 ~spent_scripts:[] in
+  (match r with
+   | Ok () -> Alcotest.fail "append at height 5 should be rejected"
+   | Error msg ->
+     Alcotest.(check bool) "error mentions backfill"
+       true (try
+               let _ = Str.search_forward
+                 (Str.regexp_string "backfill") msg 0 in true
+             with Not_found -> false));
+  Alcotest.(check int) "no entries indexed"
+    (-1) (Block_index.bip157_best_height idx);
+  Block_index.close_bip157_index idx;
+  cleanup_bip157 ()
+
+(* Reorg-style rewind: append heights 0..4, then rewind to height 2.
+   Heights 3 and 4 must drop from both the filter index and the
+   height->hash sidecar; heights 0..2 must stay. *)
+let test_bip157_rewind_drops_above_target () =
+  cleanup_bip157 ();
+  let idx = Block_index.create_bip157_index ~data_dir:test_bip157_dir in
+  let prev_block = ref Types.zero_hash in
+  let block_hashes = Array.make 5 Types.zero_hash in
+  for h = 0 to 4 do
+    let block = make_unique_block ~prev_block:!prev_block h in
+    let block_hash = Crypto.compute_block_hash block.header in
+    block_hashes.(h) <- block_hash;
+    prev_block := block_hash;
+    let _ = Block_index.append_block_filter idx
+              ~block ~height:h ~spent_scripts:[] in ()
+  done;
+  Alcotest.(check int) "pre-rewind best_height = 4"
+    4 (Block_index.bip157_best_height idx);
+  Block_index.rewind_bip157_index idx ~target_height:2;
+  Alcotest.(check int) "post-rewind best_height = 2"
+    2 (Block_index.bip157_best_height idx);
+  Alcotest.(check bool) "height 4 filter dropped" false
+    (Block_index.has_filter idx.filter_idx block_hashes.(4));
+  Alcotest.(check bool) "height 3 filter dropped" false
+    (Block_index.has_filter idx.filter_idx block_hashes.(3));
+  Alcotest.(check bool) "height 2 filter retained" true
+    (Block_index.has_filter idx.filter_idx block_hashes.(2));
+  Alcotest.(check bool) "height 0 filter retained" true
+    (Block_index.has_filter idx.filter_idx block_hashes.(0));
+  (* After rewind, re-appending the dropped heights must succeed
+     (parent at height 2 is still indexed, so the chain reconnects). *)
+  let block3 = make_unique_block ~prev_block:block_hashes.(2) 3 in
+  let r = Block_index.append_block_filter idx
+            ~block:block3 ~height:3 ~spent_scripts:[] in
+  Alcotest.(check bool) "post-rewind re-append succeeds" true
+    (match r with Ok () -> true | Error _ -> false);
+  Block_index.close_bip157_index idx;
+  cleanup_bip157 ()
+
+(* Persistence across close+reopen: the bundle must reload its
+   best_height and filter contents from disk so a daemon restart
+   doesn't trigger a wasteful full backfill. *)
+let test_bip157_persistence () =
+  cleanup_bip157 ();
+  let prev_block = ref Types.zero_hash in
+  let last_hash = ref Types.zero_hash in
+  let idx1 = Block_index.create_bip157_index ~data_dir:test_bip157_dir in
+  for h = 0 to 2 do
+    let block = make_unique_block ~prev_block:!prev_block h in
+    let block_hash = Crypto.compute_block_hash block.header in
+    last_hash := block_hash;
+    prev_block := block_hash;
+    let _ = Block_index.append_block_filter idx1
+              ~block ~height:h ~spent_scripts:[] in ()
+  done;
+  Block_index.close_bip157_index idx1;
+  let idx2 = Block_index.create_bip157_index ~data_dir:test_bip157_dir in
+  Alcotest.(check int) "best_height persisted"
+    2 (Block_index.bip157_best_height idx2);
+  Alcotest.(check bool) "filter for last height retained across reopen"
+    true (Block_index.has_filter idx2.filter_idx !last_hash);
+  Block_index.close_bip157_index idx2;
+  cleanup_bip157 ()
+
+(* ============================================================================
    Test Suite
    ============================================================================ *)
 
@@ -520,5 +694,16 @@ let () =
       test_case "large height" `Quick test_height_index_large_height;
       test_case "remove" `Quick test_height_index_remove;
       test_case "sparse" `Quick test_height_index_sparse;
+    ];
+    "bip157_bundle", [
+      test_case "create empty bundle" `Quick test_bip157_create_empty;
+      test_case "append chain + idempotent re-append" `Quick
+        test_bip157_append_chain;
+      test_case "skip-height append rejected" `Quick
+        test_bip157_append_skip_height_rejected;
+      test_case "rewind drops above target" `Quick
+        test_bip157_rewind_drops_above_target;
+      test_case "persistence across close+reopen" `Quick
+        test_bip157_persistence;
     ];
   ]

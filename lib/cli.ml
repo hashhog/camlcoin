@@ -60,6 +60,15 @@ type config = {
   rest_bind : string option;
     (* Optional bind address for the REST listener. [None] reuses
        [rpc_host]. *)
+  blockfilterindex_basic : bool;
+    (* Mirrors Bitcoin Core's -blockfilterindex=basic
+       (init.cpp / index/blockfilterindex.cpp). When [true], the daemon
+       maintains a BIP-157/158 basic filter index at
+       [<data_dir>/indexes/blockfilter/basic] and serves
+       /rest/blockfilter[/headers] from it; when [false] (default), the
+       REST endpoints return Core's exact 400 "Index is not enabled for
+       filtertype basic". The index is back-filled at startup if it lags
+       the validated tip and is updated on every connect/reorg. *)
 }
 
 (* ============================================================================
@@ -88,6 +97,7 @@ let default_config : config = {
   rest_enabled = false;  (* Mirrors Core DEFAULT_REST_ENABLE = false *)
   rest_port = None;
   rest_bind = None;
+  blockfilterindex_basic = false;  (* Mirrors Core DEFAULT_BLOCKFILTERINDEX *)
 }
 
 (* Network-specific configuration *)
@@ -240,6 +250,40 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     m "Chain state initialized, headers at height %d"
       chain.headers_synced);
 
+  (* BIP-157 basic block filter index.  Mirrors Bitcoin Core's
+     [-blockfilterindex=basic] (init.cpp + index/blockfilterindex.cpp).
+     Created here so it's attached to [chain] before any IBD or post-IBD
+     block listener fires; closed in graceful_shutdown.  When the flag
+     is off we leave [chain.bip157_index = None] and every connect-block
+     path no-ops via [append_filter_if_enabled]. *)
+  let bip157_index =
+    if not config.blockfilterindex_basic then None
+    else begin
+      try
+        let idx = Block_index.create_bip157_index ~data_dir:config.data_dir in
+        chain.bip157_index <- Some idx;
+        Logs.info (fun m ->
+          m "BIP-157 index opened at %s (best_height=%d, target=%d)"
+            idx.root_dir
+            (Block_index.bip157_best_height idx)
+            chain.blocks_synced);
+        (* Run the startup backfill synchronously so the REST endpoints
+           served by the upcoming RPC listener can immediately answer
+           filter requests for any indexed height. The walk is bounded
+           by [chain.blocks_synced] (validated tip), so it never runs
+           past the active chain; stops gracefully on missing block
+           bodies (pruned datadirs). *)
+        let _ = Sync.backfill_bip157_index chain in
+        Some idx
+      with exn ->
+        Logs.err (fun m ->
+          m "BIP-157: failed to open filter index at %s: %s"
+            (Filename.concat config.data_dir "indexes/blockfilter/basic")
+            (Printexc.to_string exn));
+        None
+    end
+  in
+
   (* Initialize UTXO set *)
   let utxo = Utxo.UtxoSet.create db in
 
@@ -383,10 +427,20 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     Some (Wallet.load ~network:config.network ~db_path:wallet_path)
   end else None in
 
-  (* Create RPC context *)
+  (* Create RPC context. The [filter_index] field of [rpc_context]
+     is the inner [Block_index.filter_index] sub-handle (used by
+     [rest.ml]'s blockfilter handlers); we extract it from the bundle
+     when the operator enabled --blockfilterindex, and otherwise leave
+     it [None] so the REST endpoints return Core's exact 400
+     "Index is not enabled for filtertype basic". *)
+  let filter_index_for_rpc =
+    Option.map (fun (idx : Block_index.bip157_index) -> idx.filter_idx)
+      bip157_index
+  in
   let rpc_ctx = Rpc.create_context
     ~chain ~mempool ~peer_manager
     ~wallet ~fee_estimator ~network
+    ~filter_index:filter_index_for_rpc
     ~utxo:(Some optimized_utxo)
     ~data_dir:(Some config.data_dir) () in
 
@@ -1129,6 +1183,20 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
        (try Zmq_notify.shutdown notifier with _ -> ());
        (try Zmq_socket.close_publisher publisher with _ -> ());
        Logs.info (fun m -> m "ZMQ: notifier shut down"));
+    (* Phase 4b: flush + close the BIP-157 index. Must run before the
+       databases are closed so any in-flight chain mutation has been
+       observed; must run after IBD/post-IBD block listeners are
+       quiesced (Peer_manager.stop above ensures no further connect
+       blocks come in). Best-effort. *)
+    (match bip157_index with
+     | None -> ()
+     | Some idx ->
+       (try
+         Block_index.close_bip157_index idx;
+         Logs.info (fun m -> m "BIP-157: filter index flushed and closed")
+       with exn ->
+         Logs.warn (fun m ->
+           m "BIP-157: close failed: %s" (Printexc.to_string exn))));
     (* Phase 4: close databases. *)
     Logs.info (fun m -> m "closing DB");
     (try Rocksdb_store.close rocksdb

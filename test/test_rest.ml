@@ -287,6 +287,165 @@ let test_mempool_info_json_only () =
   close_test_db ()
 
 (* ============================================================================
+   Block notxdetails Tests (Bitcoin Core rest.cpp:476-479)
+   ============================================================================ *)
+
+(* Path-prefix routing: /rest/block/notxdetails/<hash> must hit the
+   notxdetails handler, not the regular /rest/block/<hash> handler.
+   Since the test datadir has no blocks the response is 404, but we
+   verify the URI parses and reaches the dedicated handler. *)
+let test_dispatch_notxdetails_route () =
+  let ctx = create_test_context () in
+  let hash = "0000000000000000000000000000000000000000000000000000000000000001" in
+  let path = "/rest/block/notxdetails/" ^ hash ^ ".json" in
+  let req = Cohttp.Request.make (Uri.of_string path) in
+  let response = Lwt_main.run (Rest.dispatch_rest ctx req path) in
+  let status = Cohttp.Response.status (fst response) in
+  (* Block doesn't exist -> 404. We only care that dispatch routed to the
+     notxdetails handler and didn't 400 because the URI was misparsed. *)
+  Alcotest.(check bool) "notxdetails routes to block handler (404 for unknown block)"
+    true (status = `Not_found);
+  close_test_db ()
+
+(* /rest/block/notxdetails/<garbage> reaches the handler and returns 400
+   because the hash is not 64 hex chars. Confirms parse_display_hash
+   gates the notxdetails path the same way as the regular block path. *)
+let test_dispatch_notxdetails_invalid_hash () =
+  let ctx = create_test_context () in
+  let path = "/rest/block/notxdetails/notahash.json" in
+  let req = Cohttp.Request.make (Uri.of_string path) in
+  let response = Lwt_main.run (Rest.dispatch_rest ctx req path) in
+  let status = Cohttp.Response.status (fst response) in
+  Alcotest.(check bool) "400 for invalid notxdetails hash"
+    true (status = `Bad_request);
+  close_test_db ()
+
+(* ============================================================================
+   Block Filter Tests (BIP-157/158, Core rest.cpp:622-711)
+   ============================================================================ *)
+
+(* When the filter index is not enabled (default in tests), Core returns
+   HTTP 400 "Index is not enabled for filtertype <name>". We mirror
+   that. *)
+let test_blockfilter_index_disabled () =
+  let ctx = create_test_context () in
+  let hash = "0000000000000000000000000000000000000000000000000000000000000001" in
+  let path = "/rest/blockfilter/basic/" ^ hash ^ ".json" in
+  let req = Cohttp.Request.make (Uri.of_string path) in
+  let response = Lwt_main.run (Rest.dispatch_rest ctx req path) in
+  let status = Cohttp.Response.status (fst response) in
+  Alcotest.(check bool) "400 when filter index disabled"
+    true (status = `Bad_request);
+  let body = Lwt_main.run (Cohttp_lwt.Body.to_string (snd response)) in
+  Alcotest.(check bool) "error mentions filtertype is not enabled"
+    true (try
+            let _ = Str.search_forward
+              (Str.regexp "Index is not enabled") body 0 in true
+          with Not_found -> false);
+  close_test_db ()
+
+(* Unknown filtertype -> 400 (Core rest.cpp:642-643). Even if the index
+   were enabled, only "basic" is a recognized name. *)
+let test_blockfilter_unknown_filtertype () =
+  let ctx = create_test_context () in
+  let hash = "0000000000000000000000000000000000000000000000000000000000000001" in
+  let path = "/rest/blockfilter/spooky/" ^ hash ^ ".json" in
+  let req = Cohttp.Request.make (Uri.of_string path) in
+  let response = Lwt_main.run (Rest.dispatch_rest ctx req path) in
+  let status = Cohttp.Response.status (fst response) in
+  Alcotest.(check bool) "400 for unknown filtertype"
+    true (status = `Bad_request);
+  let body = Lwt_main.run (Cohttp_lwt.Body.to_string (snd response)) in
+  Alcotest.(check bool) "error mentions Unknown filtertype"
+    true (try
+            let _ = Str.search_forward
+              (Str.regexp "Unknown filtertype") body 0 in true
+          with Not_found -> false);
+  close_test_db ()
+
+(* /rest/blockfilter/<filtertype>/<hash> must be exactly two slash
+   segments (after the format suffix is stripped). Core rest.cpp:631
+   returns 400 "Invalid URI format. Expected ..." otherwise. *)
+let test_blockfilter_bad_uri_format () =
+  let ctx = create_test_context () in
+  let path = "/rest/blockfilter/basic.json" in
+  let req = Cohttp.Request.make (Uri.of_string path) in
+  let response = Lwt_main.run (Rest.dispatch_rest ctx req path) in
+  let status = Cohttp.Response.status (fst response) in
+  Alcotest.(check bool) "400 for malformed blockfilter URI"
+    true (status = `Bad_request);
+  close_test_db ()
+
+(* Same disabled-index check for /rest/blockfilterheaders. The handler
+   accepts both the new (/<ft>/<hash>?count) and deprecated (/<ft>/
+   <count>/<hash>) path forms; we cover both. *)
+let test_blockfilterheaders_index_disabled () =
+  let ctx = create_test_context () in
+  let hash = "0000000000000000000000000000000000000000000000000000000000000001" in
+  let path = "/rest/blockfilterheaders/basic/" ^ hash ^ ".json?count=5" in
+  let req = Cohttp.Request.make (Uri.of_string path) in
+  let response = Lwt_main.run (Rest.dispatch_rest ctx req path) in
+  let status = Cohttp.Response.status (fst response) in
+  Alcotest.(check bool) "400 when filter index disabled (headers)"
+    true (status = `Bad_request);
+  close_test_db ()
+
+(* Deprecated-path form: /rest/blockfilterheaders/<ft>/<count>/<hash>.<ext> *)
+let test_blockfilterheaders_deprecated_path () =
+  let ctx = create_test_context () in
+  let hash = "0000000000000000000000000000000000000000000000000000000000000001" in
+  let path = "/rest/blockfilterheaders/basic/3/" ^ hash ^ ".json" in
+  let req = Cohttp.Request.make (Uri.of_string path) in
+  let response = Lwt_main.run (Rest.dispatch_rest ctx req path) in
+  let status = Cohttp.Response.status (fst response) in
+  Alcotest.(check bool) "deprecated-path form parses (400 = index off, not 404)"
+    true (status = `Bad_request);
+  close_test_db ()
+
+(* count<1 or count>2000 must be rejected with 400 BEFORE the index
+   check, so the error string matches Core regardless of index state. *)
+let test_blockfilterheaders_count_out_of_range () =
+  let ctx = create_test_context () in
+  let hash = "0000000000000000000000000000000000000000000000000000000000000001" in
+  let path = "/rest/blockfilterheaders/basic/" ^ hash ^ ".json?count=999999" in
+  let req = Cohttp.Request.make (Uri.of_string path) in
+  let response = Lwt_main.run (Rest.dispatch_rest ctx req path) in
+  let status = Cohttp.Response.status (fst response) in
+  Alcotest.(check bool) "400 for out-of-range count"
+    true (status = `Bad_request);
+  let body = Lwt_main.run (Cohttp_lwt.Body.to_string (snd response)) in
+  Alcotest.(check bool) "error mentions out of acceptable range"
+    true (try
+            let _ = Str.search_forward
+              (Str.regexp "out of acceptable range") body 0 in true
+          with Not_found -> false);
+  close_test_db ()
+
+(* Filtertype routing precedence: the dispatcher must match the longer
+   prefix /rest/blockfilterheaders/ before /rest/blockfilter/ (otherwise
+   "headers/..." would be parsed as a malformed two-segment blockfilter
+   URI). This regression test pins the ordering. *)
+let test_blockfilter_vs_headers_routing () =
+  let ctx = create_test_context () in
+  let hash = "0000000000000000000000000000000000000000000000000000000000000001" in
+  (* If the dispatcher matched /rest/blockfilter/ first, the uri_part
+     would be "headers/basic/<hash>.json" — a 3-part split that the
+     blockfilter handler treats as malformed (expects 2 parts), giving
+     400 with the bad-URI message. With correct ordering, the headers
+     handler matches and returns 400 with the index-disabled message.
+     Both happen to be 400, so we sniff the body to confirm. *)
+  let path = "/rest/blockfilterheaders/basic/" ^ hash ^ ".json?count=1" in
+  let req = Cohttp.Request.make (Uri.of_string path) in
+  let response = Lwt_main.run (Rest.dispatch_rest ctx req path) in
+  let body = Lwt_main.run (Cohttp_lwt.Body.to_string (snd response)) in
+  Alcotest.(check bool) "headers handler (not blockfilter) handled the URI"
+    true (try
+            let _ = Str.search_forward
+              (Str.regexp "Index is not enabled") body 0 in true
+          with Not_found -> false);
+  close_test_db ()
+
+(* ============================================================================
    Test Suite
    ============================================================================ *)
 
@@ -325,9 +484,26 @@ let dispatch_tests = [
   "mempool info json only", `Quick, test_mempool_info_json_only;
 ]
 
+let notxdetails_tests = [
+  "notxdetails routes correctly", `Quick, test_dispatch_notxdetails_route;
+  "notxdetails 400 on bad hash", `Quick, test_dispatch_notxdetails_invalid_hash;
+]
+
+let blockfilter_tests = [
+  "blockfilter index disabled -> 400", `Quick, test_blockfilter_index_disabled;
+  "blockfilter unknown filtertype -> 400", `Quick, test_blockfilter_unknown_filtertype;
+  "blockfilter bad URI format -> 400", `Quick, test_blockfilter_bad_uri_format;
+  "blockfilterheaders index disabled -> 400", `Quick, test_blockfilterheaders_index_disabled;
+  "blockfilterheaders deprecated path parses", `Quick, test_blockfilterheaders_deprecated_path;
+  "blockfilterheaders count out-of-range", `Quick, test_blockfilterheaders_count_out_of_range;
+  "blockfilter vs blockfilterheaders routing", `Quick, test_blockfilter_vs_headers_routing;
+]
+
 let () =
   Alcotest.run "REST" [
     "format_parsing", format_parsing_tests;
     "helpers", helper_tests;
     "dispatch", dispatch_tests;
+    "notxdetails", notxdetails_tests;
+    "blockfilter", blockfilter_tests;
   ]

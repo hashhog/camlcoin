@@ -457,12 +457,23 @@ let basic_filter_params (block_hash : Types.hash256) : gcs_params =
   let k0, k1 = filter_key_of_block_hash block_hash in
   { siphash_k0 = k0; siphash_k1 = k1; p = basic_filter_p; m = basic_filter_m }
 
-(** Build a basic block filter from a block and its undo data.
+(** Build a basic block filter from a block plus an arbitrary list of spent
+    scriptPubKeys (one Cstruct per spent output, in any order — duplicates and
+    empty scripts are filtered out below).
 
-    Matches Bitcoin Core's BasicFilterElements in blockfilter.cpp:
-    - Includes all non-empty, non-OP_RETURN output scriptPubKeys
-    - Includes all spent output scriptPubKeys from undo data *)
-let build_basic_filter (block : Types.block) (undo : Storage.block_undo option)
+    Matches Bitcoin Core's BasicFilterElements (blockfilter.cpp). The
+    [build_basic_filter] variant just below is a convenience wrapper around
+    this one for callers that already have a [Storage.block_undo] in hand;
+    the connect-block paths in [sync.ml] hold the spent UTXOs as a
+    [Validation.utxo] list and feed them in directly via the [spent_scripts]
+    parameter.
+
+    BIP-158 element rules:
+    - Include every non-empty, non-OP_RETURN output scriptPubKey
+    - Include every non-empty spent output scriptPubKey
+    - Deduplicate (Core's [GCSFilter::ConstructHashedSet]) *)
+let build_basic_filter_from_scripts
+    (block : Types.block) (spent_scripts : Cstruct.t list)
     : block_filter =
   let block_hash = Crypto.compute_block_hash block.header in
   let params = basic_filter_params block_hash in
@@ -480,23 +491,31 @@ let build_basic_filter (block : Types.block) (undo : Storage.block_undo option)
     ) tx.Types.outputs
   ) block.transactions;
 
-  (* Add spent scriptPubKeys from undo data *)
-  (match undo with
-   | None -> ()
-   | Some u ->
-     List.iter (fun (tx_undo : Storage.tx_undo) ->
-       List.iter (fun (prev_out : Storage.tx_in_undo) ->
-         let script = prev_out.script_pubkey in
-         if Cstruct.length script > 0 then
-           elements := Cstruct.to_string script :: !elements
-       ) tx_undo.prev_outputs
-     ) u.tx_undos);
+  (* Add spent scriptPubKeys *)
+  List.iter (fun script ->
+    if Cstruct.length script > 0 then
+      elements := Cstruct.to_string script :: !elements
+  ) spent_scripts;
 
   (* Deduplicate elements *)
   let unique = List.sort_uniq String.compare !elements in
 
   let filter = build_filter params unique in
   { filter_type = Basic; block_hash; filter }
+
+(** Build a basic block filter from a block and its [Storage.block_undo]. *)
+let build_basic_filter (block : Types.block) (undo : Storage.block_undo option)
+    : block_filter =
+  let spent_scripts = match undo with
+    | None -> []
+    | Some u ->
+      List.concat_map (fun (tx_undo : Storage.tx_undo) ->
+        List.map (fun (prev_out : Storage.tx_in_undo) ->
+          prev_out.script_pubkey
+        ) tx_undo.prev_outputs
+      ) u.tx_undos
+  in
+  build_basic_filter_from_scripts block spent_scripts
 
 (** Compute filter hash (SHA256d of encoded filter) *)
 let compute_filter_hash (bf : block_filter) : Types.hash256 =
@@ -896,3 +915,130 @@ let remove_hash_at_height idx height =
       done
     end
   end
+
+(* ============================================================================
+   BIP-157 Index Bundle (high-level orchestration)
+
+   Reference: Bitcoin Core's [src/index/blockfilterindex.cpp].
+
+   The two pieces above ([filter_index] and [height_index]) are intentionally
+   independent for unit-testability, but every sync-time call site needs them
+   in lockstep: a freshly-stored filter at height H means the block-filter
+   index AND the height->hash mapping for H both have to land or neither
+   does. Bitcoin Core handles this in [BlockFilterIndex::CustomAppend] which
+   writes to a single LevelDB batch.  We get equivalent atomicity by always
+   updating both indexes in [append_block_filter] and only flushing them
+   together via [sync_bip157_index] / [close_bip157_index].
+
+   The bundle also tracks the on-disk root directory so callers don't have
+   to hand-thread two paths through the codebase.
+   ============================================================================ *)
+
+(** Bundled BIP-157 index: filter store + height->hash sidecar. *)
+type bip157_index = {
+  root_dir : string;
+  filter_idx : filter_index;
+  height_idx : height_index;
+}
+
+(** Create or open a BIP-157 index rooted at [<data_dir>/indexes/blockfilter/basic].
+
+    Mirrors Bitcoin Core's path scheme: a Core node configured with
+    `-blockfilterindex=basic` on mainnet writes to
+    `<datadir>/indexes/blockfilter/basic/`. We use the same layout so an
+    operator who is already pointing tooling at a Core datadir can swap in
+    camlcoin without re-pathing. *)
+let create_bip157_index ~(data_dir : string) : bip157_index =
+  ensure_dir data_dir;
+  let indexes_root = Filename.concat data_dir "indexes" in
+  ensure_dir indexes_root;
+  let filter_root = Filename.concat indexes_root "blockfilter" in
+  ensure_dir filter_root;
+  let basic_root = Filename.concat filter_root "basic" in
+  ensure_dir basic_root;
+  let filter_idx = create_filter_index basic_root in
+  let height_idx = create_height_index basic_root in
+  { root_dir = basic_root; filter_idx; height_idx }
+
+(** Flush both sub-indexes to disk (idempotent). *)
+let sync_bip157_index (idx : bip157_index) =
+  sync_filter_index idx.filter_idx;
+  sync_height_index idx.height_idx
+
+(** Close the bundle (flushes on the way out). *)
+let close_bip157_index (idx : bip157_index) =
+  close_filter_index idx.filter_idx;
+  close_height_index idx.height_idx
+
+(** Highest height for which a filter has been computed. Returns -1 if the
+    index is empty (matches Bitcoin Core's [m_best_block_height = nullopt]
+    sentinel for a never-populated index). *)
+let bip157_best_height (idx : bip157_index) : int =
+  get_max_height idx.height_idx
+
+(** True iff [height] has been indexed. *)
+let bip157_has_height (idx : bip157_index) (height : int) : bool =
+  match get_hash_at_height idx.height_idx height with
+  | Some _ -> true
+  | None -> false
+
+(** Look up the previous block's filter header for chaining.
+
+    For height = 0 (genesis), Core returns the all-zero hash. For any other
+    height, we look up the parent's filter by going one step back in the
+    height index and reading its filter_header. Returns [None] only if the
+    parent has not been indexed yet — which means the caller must run a
+    backfill before appending this height (sync.ml's IBD pipeline always
+    calls in height order, so this is the expected steady-state path). *)
+let bip157_prev_filter_header (idx : bip157_index) (height : int)
+    : Types.hash256 option =
+  if height = 0 then Some Types.zero_hash
+  else begin
+    match get_hash_at_height idx.height_idx (height - 1) with
+    | None -> None
+    | Some prev_hash ->
+      get_filter_header idx.filter_idx prev_hash
+  end
+
+(** Append a basic filter for [block] at [height]. Builds the filter from
+    [block] outputs + [spent_scripts] (one Cstruct per spent output's
+    scriptPubKey, no [Storage.block_undo] required), chains the filter
+    header against the previous block's filter header, and updates the
+    height->hash sidecar. Idempotent: a second call with the same height
+    is a no-op. Returns [Ok ()] on success and [Error msg] when the parent
+    is not yet indexed (caller should run a backfill). *)
+let append_block_filter (idx : bip157_index)
+    ~(block : Types.block) ~(height : int)
+    ~(spent_scripts : Cstruct.t list)
+    : (unit, string) result =
+  if bip157_has_height idx height then Ok ()  (* idempotent *)
+  else begin
+    let block_hash = Crypto.compute_block_hash block.header in
+    match bip157_prev_filter_header idx height with
+    | None ->
+      Error (Printf.sprintf
+        "BIP-157 backfill needed: parent filter for height %d not indexed"
+        height)
+    | Some prev_filter_header ->
+      let bf = build_basic_filter_from_scripts block spent_scripts in
+      store_filter idx.filter_idx bf prev_filter_header;
+      set_hash_at_height idx.height_idx height block_hash;
+      Ok ()
+  end
+
+(** Reorg-aware rewind. Drops every indexed entry strictly above
+    [target_height]. Used by [sync.ml]'s reorganize path so the disconnect
+    half of a reorg leaves the index in lock-step with the active chain. *)
+let rewind_bip157_index (idx : bip157_index) ~(target_height : int) =
+  let cur = get_max_height idx.height_idx in
+  let h = ref cur in
+  while !h > target_height do
+    (match get_hash_at_height idx.height_idx !h with
+     | Some hash ->
+       let key = Cstruct.to_string hash in
+       Hashtbl.remove idx.filter_idx.index key;
+       idx.filter_idx.dirty <- true
+     | None -> ());
+    remove_hash_at_height idx.height_idx !h;
+    decr h
+  done

@@ -235,6 +235,25 @@ let rest_bind_arg =
   Arg.(value & opt (some string) None &
     info ["restbind"] ~docv:"HOST" ~doc)
 
+let blockfilterindex_arg =
+  (* Bitcoin Core's -blockfilterindex flag (init.cpp / index/blockfilterindex.cpp).
+     Accepts either a boolean ('1'/'0' / 'true'/'false') or the literal
+     filter type 'basic' — both enable the basic (BIP-158) filter index.
+     Anything else is rejected at runtime with a clear error. Default is
+     off, matching DEFAULT_BLOCKFILTERINDEX in Core. *)
+  let doc = "Maintain a BIP-157/158 basic block filter index at \
+             <datadir>/indexes/blockfilter/basic. Required for \
+             /rest/blockfilter and /rest/blockfilterheaders to serve \
+             actual filters; without this flag the REST endpoints \
+             return Core's exact 400 'Index is not enabled for \
+             filtertype basic'. On startup, any gap between the \
+             index's last-known-height and the validated chain tip \
+             is back-filled by re-reading stored blocks + undo data. \
+             Accepted values: '0' / 'false' (off, default), \
+             '1' / 'true' / 'basic' (on)." in
+  Arg.(value & opt (some string) None &
+    info ["blockfilterindex"] ~docv:"VAL" ~doc)
+
 (* ============================================================================
    Main Command
    ============================================================================ *)
@@ -244,7 +263,7 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     import_blocks import_utxo metrics_port peer_bloom_filters
     migrate_logstorage daemon_mode pid_path conf_path debug_cats
     logfile printtoconsole ready_fd zmq_pub reindex
-    rest_enabled rest_port rest_bind =
+    rest_enabled rest_port rest_bind blockfilterindex =
   (* Resolve datadir early so config-file lookup can default to it. *)
   let base = Camlcoin.Cli.config_for_network network in
   let resolved_datadir = match datadir with
@@ -516,6 +535,33 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       rest_bind = (match rest_bind with
         | Some h -> Some h
         | None -> Camlcoin.Runtime_config.get_string conf_opts "restbind");
+      blockfilterindex_basic =
+        (* Resolve CLI value (string / None) and conf-file value into a
+           boolean. Accepted enables: '1', 'true', 'basic'. Accepted
+           disables: '0', 'false', missing. Anything else is fatal. *)
+        let parse_one v =
+          match String.lowercase_ascii v with
+          | "" | "0" | "false" -> Ok false
+          | "1" | "true" | "basic" -> Ok true
+          | other ->
+            Error (Printf.sprintf
+              "Invalid --blockfilterindex value: %S (accepted: 0/1/true/false/basic)"
+              other)
+        in
+        let cli_val = blockfilterindex in
+        let conf_val = Camlcoin.Runtime_config.get_string conf_opts "blockfilterindex" in
+        let chosen = match cli_val with
+          | Some v -> Some v
+          | None -> conf_val
+        in
+        (match chosen with
+         | None -> false
+         | Some v ->
+           (match parse_one v with
+            | Ok b -> b
+            | Error msg ->
+              Printf.eprintf "[camlcoin] %s\n%!" msg;
+              exit 1));
     } in
     (* Ensure datadir exists so we can land the PID file there. *)
     (try Unix.mkdir resolved_datadir 0o755
@@ -615,7 +661,8 @@ let cmd =
     $ reindex_arg
     $ rest_arg
     $ rest_port_arg
-    $ rest_bind_arg)
+    $ rest_bind_arg
+    $ blockfilterindex_arg)
 
 (* ============================================================================
    Entry Point

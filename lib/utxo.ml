@@ -215,155 +215,23 @@ let deserialize_undo_data r : undo_data =
 
 (* ============================================================================
    Block Connection (Apply Block to UTXO Set)
+   ============================================================================
+
+   The legacy [connect_block] / [disconnect_block] helpers (UtxoSet.t-based,
+   tagged "DEAD CODE wave-33b ledger") were removed in W25 (2026-05-07).
+
+   They had zero non-test callers and their genesis-coinbase semantics
+   diverged from Bitcoin Core: they happily added the genesis coinbase to
+   the UTXO set at height 0, while Core treats genesis as a no-op
+   (validation.cpp:2337-2343). The live UTXO mutation path is
+   [connect_block_optimized] (called from block_import.ml and mining.ml),
+   which W24 (camlcoin 26a9b40) hardened with the matching genesis guard.
+
+   The tests that exercised these dead helpers (the entire "connect_block"
+   and "disconnect_block" Alcotest groups in test/test_utxo.ml) were
+   deleted in the same wave. The W24 [test_connect_block_optimized_genesis_noop]
+   covers the genesis-no-op contract on the live optimized path.
    ============================================================================ *)
-
-(* Connect a block to the UTXO set.
-
-   For each transaction:
-   - Non-coinbase: consume inputs (remove from UTXO set), record for undo
-   - All: create new outputs (add to UTXO set)
-
-   Returns undo data on success, error message on failure.
-
-   IMPORTANT: This modifies the UTXO set. If validation fails partway
-   through, the UTXO set will be in an inconsistent state. Callers should
-   use batch operations or be prepared to disconnect. *)
-(* DEAD CODE (wave-33b ledger): zero non-test callers. The live UTXO mutation
-   path is connect_block_optimized (called from block_import.ml and mining.ml).
-   This unoptimized variant uses UtxoSet.t (not OptimizedUtxoSet.t) and is
-   kept only for test coverage. BIP-30 / sigop / IsFinalTx fixes belong in
-   connect_block_optimized, NOT here. *)
-let connect_block ?(network_type : Consensus.network = Consensus.Mainnet)
-    (utxo : UtxoSet.t) (block : Types.block)
-    (height : int)
-    : (undo_data, string) result =
-  let tx_undos = ref [] in
-  let error = ref None in
-  let total_fees = ref 0L in
-
-  List.iteri (fun tx_idx tx ->
-    if !error = None then begin
-      let txid = Crypto.compute_txid tx in
-      let is_coinbase = tx_idx = 0 in
-
-      if not is_coinbase then begin
-        let tx_spent = ref [] in
-        let input_sum = ref 0L in
-        List.iter (fun inp ->
-          if !error = None then begin
-            let prev = inp.Types.previous_output in
-            match UtxoSet.get utxo prev.txid
-                    (Int32.to_int prev.vout) with
-            | None ->
-              error := Some (Printf.sprintf
-                "Missing UTXO: %s:%ld"
-                (Types.hash256_to_hex_display prev.txid)
-                prev.vout)
-            | Some entry ->
-              if entry.is_coinbase &&
-                 height - entry.height < Consensus.coinbase_maturity then
-                error := Some "Immature coinbase spend"
-              else begin
-                tx_spent := (prev, entry) :: !tx_spent;
-                input_sum := Int64.add !input_sum entry.value;
-                ignore (UtxoSet.remove utxo prev.txid
-                  (Int32.to_int prev.vout))
-              end
-          end
-        ) tx.inputs;
-
-        if !error = None then begin
-          tx_undos := { spent_outputs = List.rev !tx_spent } :: !tx_undos;
-          let output_sum = List.fold_left
-            (fun acc out -> Int64.add acc out.Types.value)
-            0L tx.outputs in
-          if output_sum > !input_sum then
-            error := Some "Output exceeds input"
-          else
-            total_fees :=
-              Int64.add !total_fees
-                (Int64.sub !input_sum output_sum)
-        end
-      end;
-
-      if !error = None then
-        List.iteri (fun vout out ->
-          UtxoSet.add utxo txid vout {
-            value = out.Types.value;
-            script_pubkey = out.script_pubkey;
-            height;
-            is_coinbase;
-          }
-        ) tx.outputs
-    end
-  ) block.transactions;
-
-  match !error with
-  | Some e -> Error e
-  | None ->
-    let subsidy = Consensus.block_subsidy_for_network network_type height in
-    let max_coinbase = Int64.add subsidy !total_fees in
-    let coinbase = List.hd block.transactions in
-    let coinbase_out = List.fold_left
-      (fun acc out -> Int64.add acc out.Types.value)
-      0L coinbase.outputs in
-    if coinbase_out > max_coinbase then
-      Error (Printf.sprintf
-        "Coinbase too large: %Ld > %Ld"
-        coinbase_out max_coinbase)
-    else
-      Ok { height; tx_undos = List.rev !tx_undos }
-
-(* ============================================================================
-   Block Disconnection (Undo Block from UTXO Set)
-   ============================================================================ *)
-
-(* Disconnect a block from the UTXO set (for chain reorganization).
-
-   DEAD CODE (wave-33b ledger): zero non-test callers. Transitively dead via
-   connect_blocks (which was deleted in this wave). Test-only callers remain
-   in test_utxo.ml; disconnect logic for live reorgs lives in the layered
-   UTXO cache (LayeredUtxoCache, below).
-
-   This reverses the effects of connect_block by processing transactions
-   in reverse order, and for each transaction:
-   1. Remove outputs created by this tx
-   2. Restore inputs spent by this tx (from undo data)
-
-   This interleaved per-transaction approach correctly handles intra-block
-   spending: if tx B spent output O_A from tx A, we first process B
-   (remove B's outputs, restore O_A), then process A (remove O_A). *)
-let disconnect_block (utxo : UtxoSet.t)
-    (block : Types.block) (undo : undo_data) : unit =
-  let txs = block.transactions in
-  let non_coinbase_txs = match txs with _ :: rest -> rest | [] -> [] in
-  (* Build array of tx_undos indexed by non-coinbase tx position.
-     tx_undos are stored in forward order, so reverse for backward processing. *)
-  let undo_arr = Array.of_list undo.tx_undos in
-  let n_non_cb = List.length non_coinbase_txs in
-  (* Process all transactions in reverse order *)
-  let all_txs_rev = List.rev txs in
-  let tx_total = List.length txs in
-  let idx = ref (tx_total - 1) in
-  List.iter (fun tx ->
-    let txid = Crypto.compute_txid tx in
-    (* 1. Remove outputs created by this tx *)
-    List.iteri (fun vout _out ->
-      ignore (UtxoSet.remove utxo txid vout)
-    ) tx.outputs;
-    (* 2. Restore inputs spent by this tx (skip coinbase at index 0) *)
-    if !idx > 0 then begin
-      let undo_idx = !idx - 1 in
-      if undo_idx < n_non_cb then begin
-        let tu = undo_arr.(undo_idx) in
-        List.iter (fun (outpoint, entry) ->
-          UtxoSet.add utxo outpoint.Types.txid
-            (Int32.to_int outpoint.vout) entry
-        ) tu.spent_outputs
-      end
-    end;
-    decr idx
-  ) all_txs_rev
 
 (* ============================================================================
    Genesis Block Handling

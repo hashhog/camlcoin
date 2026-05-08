@@ -485,7 +485,9 @@ let handle_getblockheader (ctx : rpc_context)
        let w = Serialize.writer_create () in
        Serialize.serialize_block_header w header;
        let cs = Serialize.writer_to_cstruct w in
-       let hex = Types.hash256_to_hex cs in
+       (* W27-A: serialized header is 80 bytes; hash256_to_hex is 32-only
+          and would silently truncate. *)
+       let hex = cstruct_to_hex_early cs in
        Ok (`String hex))
   | _ ->
     Error "Invalid parameters: expected [blockhash] or [blockhash, verbose]"
@@ -593,7 +595,9 @@ let handle_getblockfilter (ctx : rpc_context)
             | None -> ""
           in
           Ok (`Assoc [
-            ("filter", `String (Types.hash256_to_hex
+            (* W27-A: BIP-158 filter is variable-length (potentially KB);
+               hash256_to_hex would silently truncate to 32 bytes. *)
+            ("filter", `String (cstruct_to_hex_early
               (Cstruct.of_string bf.filter.Block_index.encoded)));
             ("header", `String header_hex);
           ]))
@@ -1052,13 +1056,15 @@ let handle_decoderawtransaction (_ctx : rpc_context)
           ("txid", `String (Types.hash256_to_hex_display inp.Types.previous_output.txid));
           ("vout", `Int (Int32.to_int inp.Types.previous_output.vout));
           ("scriptSig", `Assoc [
-            ("hex", `String (Types.hash256_to_hex inp.Types.script_sig));
+            (* W27-A: scriptSig is variable-length; hash256_to_hex truncates. *)
+            ("hex", `String (cstruct_to_hex_early inp.Types.script_sig));
           ]);
           ("sequence", `Int (Int32.to_int inp.Types.sequence));
           ("txinwitness",
             if i < List.length tx.witnesses then
               `List (List.map (fun item ->
-                `String (Types.hash256_to_hex item)
+                (* W27-A: witness items are variable-length. *)
+                `String (cstruct_to_hex_early item)
               ) (List.nth tx.witnesses i).items)
             else
               `List []);
@@ -1069,7 +1075,8 @@ let handle_decoderawtransaction (_ctx : rpc_context)
           ("value", `Float (Int64.to_float out.Types.value /. 100_000_000.0));
           ("n", `Int i);
           ("scriptPubKey", `Assoc [
-            ("hex", `String (Types.hash256_to_hex out.Types.script_pubkey));
+            (* W27-A: scriptPubKey is variable-length; hash256_to_hex truncates. *)
+            ("hex", `String (cstruct_to_hex_early out.Types.script_pubkey));
           ]);
         ]
       ) tx.outputs in
@@ -2029,7 +2036,9 @@ let handle_signrawtransactionwithwallet (ctx : rpc_context)
          let w = Serialize.writer_create () in
          Serialize.serialize_transaction w signed_tx;
          let cs = Serialize.writer_to_cstruct w in
-         let signed_hex = Types.hash256_to_hex cs in
+         (* W27-A: signed tx is variable-length (100-1000+ bytes);
+            hash256_to_hex would truncate to 64 hex chars. *)
+         let signed_hex = cstruct_to_hex_early cs in
          Ok (`Assoc [
            ("hex", `String signed_hex);
            ("complete", `Bool all_found);
@@ -2489,7 +2498,9 @@ let handle_validateaddress (_ctx : rpc_context)
          | Address.WitnessUnknown v -> Some v
          | _ -> None
        in
-       let hex = Types.hash256_to_hex script_pubkey in
+       (* W27-A: scriptPubKey from build_output_script is 22-34 bytes
+          depending on address type; hash256_to_hex would truncate. *)
+       let hex = cstruct_to_hex_early script_pubkey in
        let base_fields = [
          ("isvalid", `Bool true);
          ("address", `String address);
@@ -2679,7 +2690,8 @@ let handle_gettxout (ctx : rpc_context)
          ("confirmations", `Int confirmations);
          ("value", `Float (Int64.to_float utxo.Utxo.value /. 100_000_000.0));
          ("scriptPubKey", `Assoc [
-           ("hex", `String (Types.hash256_to_hex utxo.Utxo.script_pubkey));
+           (* W27-A: scriptPubKey is variable-length; hash256_to_hex truncates. *)
+           ("hex", `String (cstruct_to_hex_early utxo.Utxo.script_pubkey));
          ]);
          ("coinbase", `Bool utxo.Utxo.is_coinbase);
        ]))

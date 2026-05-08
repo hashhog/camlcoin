@@ -2417,6 +2417,104 @@ let test_signrawtransactionwithkey_p2pkh_wif () =
   cleanup_test_db ()
 
 (* ============================================================================
+   W27-A: hash256_to_hex truncation regression tests
+   ----------------------------------------------------------------------------
+   Types.hash256_to_hex is hard-coded to 32 bytes; using it on variable-length
+   data silently truncates output to 64 hex chars. The W27-A wave fixed 7 RPC
+   callsites that misused it. These tests pin the post-fix behavior.
+   ============================================================================ *)
+
+(* getblockheader verbose=false must return the full 80-byte serialized header
+   as 160 hex chars (not 64, which would be the W27-A truncation bug). *)
+let test_getblockheader_raw_returns_160_hex () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  (* Fabricate a deterministic header and store it directly. *)
+  let header : Types.block_header = {
+    version = 0x20000000l;
+    prev_block = Types.hash256_of_hex
+      "0000000000000000000000000000000000000000000000000000000000000000";
+    merkle_root = Types.hash256_of_hex
+      "1111111111111111111111111111111111111111111111111111111111111111";
+    timestamp = 0x12345678l;
+    bits = 0x207fffffl;
+    nonce = 0xdeadbeefl;
+  } in
+  let hash = Crypto.compute_block_hash header in
+  Storage.ChainDB.store_block_header db hash header;
+  (* getblockheader expects display-format hex (reversed). *)
+  let hash_hex = Types.hash256_to_hex_display hash in
+  let result = Rpc.handle_getblockheader ctx
+    [`String hash_hex; `Bool false] in
+  let raw_hex = match result with
+    | Ok (`String s) -> s
+    | Ok _ -> Alcotest.fail "expected `String"
+    | Error e -> Alcotest.fail (Printf.sprintf "handler error: %s" e)
+  in
+  (* Bitcoin block headers are exactly 80 bytes → 160 hex chars. The pre-fix
+     hash256_to_hex returned 64 (32 bytes) and silently dropped the last 48. *)
+  Alcotest.(check int) "raw header hex length = 80*2"
+    160 (String.length raw_hex);
+  (* Sanity: round-trip the hex back to a header and compare. *)
+  let cs = Cstruct.of_hex raw_hex in
+  let r = Serialize.reader_of_cstruct cs in
+  let decoded = Serialize.deserialize_block_header r in
+  Alcotest.(check int32) "version preserved"
+    header.version decoded.version;
+  Alcotest.(check int32) "nonce preserved"
+    header.nonce decoded.nonce;
+  Alcotest.(check int32) "bits preserved"
+    header.bits decoded.bits;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* decoderawtransaction must emit the *full* scriptPubKey hex for each output,
+   not the W27-A truncated 64-char prefix. We construct an OP_RETURN output
+   whose scriptPubKey is much longer than 32 bytes (so truncation would be
+   immediately observable as length mismatch). *)
+let test_decoderawtransaction_scriptpubkey_full_hex () =
+  let (ctx, db, _, txid1, _) = create_test_context () in
+  (* OP_RETURN with 75 bytes of payload → scriptPubKey is 1+1+75 = 77 bytes,
+     so 154 hex chars. The pre-fix path returned 64. *)
+  let payload = String.make 75 '\xab' in
+  let burn_out = make_burn_output 0L payload in
+  let expected_spk_len = Cstruct.length burn_out.script_pubkey in
+  Alcotest.(check int) "test fixture: scriptPubKey 77 bytes"
+    77 expected_spk_len;
+  let tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [burn_out]
+  in
+  let tx_hex = tx_to_hex tx in
+  let result = Rpc.handle_decoderawtransaction ctx [`String tx_hex] in
+  let decoded = match result with
+    | Ok j -> j
+    | Error e -> Alcotest.fail (Printf.sprintf "handler error: %s" e)
+  in
+  let vout = match decoded with
+    | `Assoc fields -> (match List.assoc "vout" fields with
+        | `List l -> l | _ -> Alcotest.fail "vout shape")
+    | _ -> Alcotest.fail "decoded shape"
+  in
+  let out0 = List.hd vout in
+  let spk_hex = match out0 with
+    | `Assoc fs ->
+      (match List.assoc "scriptPubKey" fs with
+       | `Assoc spk_fs ->
+         (match List.assoc "hex" spk_fs with
+          | `String s -> s | _ -> Alcotest.fail "spk hex shape")
+       | _ -> Alcotest.fail "scriptPubKey shape")
+    | _ -> Alcotest.fail "vout[0] shape"
+  in
+  (* Must be 2× the byte length, NOT the 64-char W27-A truncation. *)
+  Alcotest.(check int) "scriptPubKey hex length = 2 * byte length"
+    (expected_spk_len * 2) (String.length spk_hex);
+  (* Defense check: assert it isn't the truncated 64-char form. *)
+  Alcotest.(check bool) "not truncated to 64 hex chars"
+    true (String.length spk_hex <> 64);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -2569,5 +2667,11 @@ let () =
         test_walletcreatefundedpsbt_basic;
       test_case "signrawtransactionwithkey P2PKH (WIF) signs" `Quick
         test_signrawtransactionwithkey_p2pkh_wif;
+    ];
+    "hash256_to_hex_truncation_W27A", [
+      test_case "getblockheader raw returns 160 hex chars (80 bytes)" `Quick
+        test_getblockheader_raw_returns_160_hex;
+      test_case "decoderawtransaction emits full scriptPubKey hex" `Quick
+        test_decoderawtransaction_scriptpubkey_full_hex;
     ];
   ]

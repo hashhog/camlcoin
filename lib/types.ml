@@ -20,6 +20,13 @@ let hash256_of_hex (s : string) : hash256 =
   buf
 
 let hash256_to_hex (h : hash256) : string =
+  (* Defense-in-depth (W27-A): this helper is hard-coded to a 32-byte loop and
+     silently truncates anything longer. Several RPC handlers historically
+     misused it on variable-length cstructs (scriptSig, signed-tx hex, BIP-158
+     filters, raw block headers, scriptPubKey). Fail loud instead. Use
+     [cstruct_to_hex_early] in [rpc.ml] (or any equivalent length-aware helper)
+     for non-32-byte data. *)
+  assert (Cstruct.length h = 32);
   let buf = Buffer.create 64 in
   for i = 0 to 31 do
     Buffer.add_string buf (Printf.sprintf "%02x" (Cstruct.get_uint8 h i))

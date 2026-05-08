@@ -499,6 +499,25 @@ let test_bip39_vector1_seed () =
   Alcotest.(check string) "seed matches test vector" expected_hex seed_hex;
   Alcotest.(check int) "seed is 64 bytes" 64 (Cstruct.length seed)
 
+let test_bip39_vector1_seed_with_trezor_passphrase () =
+  (* Canonical TREZOR test vector: same mnemonic, passphrase="TREZOR".
+     Pins the salt = "mnemonic" ^ passphrase code path at bip39.ml:409.
+     A regression that drops the passphrase concat would not be caught
+     by the empty-passphrase test above. *)
+  let mnemonic =
+    "abandon abandon abandon abandon abandon abandon \
+     abandon abandon abandon abandon abandon about"
+  in
+  let seed = Bip39.mnemonic_to_seed ~mnemonic ~passphrase:"TREZOR" () in
+  let expected_hex =
+    "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e5349553\
+     1f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04"
+  in
+  let seed_hex = cstruct_to_hex seed in
+  Alcotest.(check string) "seed matches TREZOR-passphrase test vector"
+    expected_hex seed_hex;
+  Alcotest.(check int) "seed is 64 bytes" 64 (Cstruct.length seed)
+
 let test_bip39_validate_valid () =
   let mnemonic =
     "abandon abandon abandon abandon abandon abandon \
@@ -573,6 +592,8 @@ let test_bip39_init_from_mnemonic_invalid () =
 let bip39_tests = [
   Alcotest.test_case "vector1 mnemonic valid" `Quick test_bip39_vector1_mnemonic;
   Alcotest.test_case "vector1 seed" `Quick test_bip39_vector1_seed;
+  Alcotest.test_case "vector1 seed with TREZOR passphrase" `Quick
+    test_bip39_vector1_seed_with_trezor_passphrase;
   Alcotest.test_case "validate valid" `Quick test_bip39_validate_valid;
   Alcotest.test_case "validate wrong word" `Quick test_bip39_validate_wrong_word;
   Alcotest.test_case "validate wrong count" `Quick test_bip39_validate_wrong_count;

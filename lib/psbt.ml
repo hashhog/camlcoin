@@ -1085,6 +1085,113 @@ let is_finalized (psbt : psbt) : bool =
 let count_unsigned_inputs (psbt : psbt) : int =
   List.length (List.filter (fun inp -> not (is_input_finalized inp)) psbt.inputs)
 
+(* Parse the M-of-N threshold from a bare CHECKMULTISIG redeem/witness script.
+   Layout (BIP-11 / Core's IsStandardMultisig):
+       <OP_M> <pubkey_1> ... <pubkey_N> <OP_N> OP_CHECKMULTISIG
+   where OP_M / OP_N are OP_1..OP_16 (0x51..0x60).
+   Returns Some (m, n) on a well-formed multisig; None otherwise. *)
+let parse_multisig_threshold (script : Cstruct.t) : (int * int) option =
+  let len = Cstruct.length script in
+  if len < 4 then None
+  else
+    let last = Cstruct.get_uint8 script (len - 1) in
+    if last <> 0xae then None  (* OP_CHECKMULTISIG *)
+    else
+      let m_byte = Cstruct.get_uint8 script 0 in
+      let n_byte = Cstruct.get_uint8 script (len - 2) in
+      if m_byte < 0x51 || m_byte > 0x60 then None
+      else if n_byte < 0x51 || n_byte > 0x60 then None
+      else
+        let m = m_byte - 0x50 in
+        let n = n_byte - 0x50 in
+        if m < 1 || m > n || n > 20 then None
+        else Some (m, n)
+
+(* Determine the minimum number of partial signatures required to finalize an
+   input. Mirrors Core's SignPSBTInput dummy-sign attempt in
+   src/node/psbt.cpp:AnalyzePSBT — for the purposes of next-role analysis,
+   the "missing sigs" count is what matters.
+   Returns:
+     - Some k where k is the number of partial sigs needed to finalize
+     - None when the script type cannot be classified (treat as "cannot
+       determine readiness"; defer to the legacy any-sig heuristic).
+
+   We classify via the available redeem_script / witness_script; this is
+   sufficient for the standard P2SH-multisig and P2SH-P2WSH-multisig cases
+   that previously miscounted (W41). *)
+let required_sig_count (inp : psbt_input) : int option =
+  (* Prefer witness_script (P2WSH and nested P2SH-P2WSH multisig). *)
+  match inp.witness_script with
+  | Some ws ->
+    (match parse_multisig_threshold ws with
+     | Some (m, _n) -> Some m
+     | None -> Some 1)  (* Non-multisig P2WSH: assume single-sig finalize. *)
+  | None ->
+    match inp.redeem_script with
+    | Some rs ->
+      (match parse_multisig_threshold rs with
+       | Some (m, _n) -> Some m
+       | None ->
+         (* Bare P2SH that is not multisig: P2SH-P2WPKH (single-sig) or
+            similar single-sig wrappers. *)
+         Some 1)
+    | None ->
+      (* No redeem/witness script: classify via witness_utxo scriptPubKey
+         when available. P2WPKH / P2PKH single-sig => 1 partial sig. *)
+      (match inp.witness_utxo with
+       | Some _ -> Some 1
+       | None ->
+         match inp.non_witness_utxo with
+         | Some _ -> Some 1
+         | None -> None)
+
+(* Is this input ready for the finalizer step?  Mirrors Core's
+   "dummy-sign succeeds" branch in AnalyzePSBT: when a non-finalized input
+   has every signature it needs (M-of-N for multisig; 1 for single-sig),
+   the next role is FINALIZER, not SIGNER. *)
+let is_input_ready_to_finalize (inp : psbt_input) : bool =
+  if is_input_finalized inp then false
+  else if inp.tap_key_sig <> None then true
+  else
+    let n_sigs = List.length inp.partial_sigs in
+    if n_sigs = 0 then false
+    else
+      match required_sig_count inp with
+      | Some k -> n_sigs >= k
+      | None ->
+        (* Cannot classify; legacy behavior — treat any sig as "enough"
+           rather than reporting signer when finalizer might apply. *)
+        n_sigs >= 1
+
+(* Compute the per-input next-role string for analyzepsbt, mirroring
+   Bitcoin Core's AnalyzePSBT (src/node/psbt.cpp). *)
+let input_next_role (inp : psbt_input) : string =
+  let has_utxo = inp.witness_utxo <> None || inp.non_witness_utxo <> None in
+  if is_input_finalized inp then "extractor"
+  else if not has_utxo then "updater"
+  else if is_input_ready_to_finalize inp then "finalizer"
+  else "signer"
+
+(* PSBT-level next role = min over per-input roles (Core ordering:
+   creator < updater < signer < finalizer < extractor). *)
+let psbt_next_role (psbt : psbt) : string =
+  let rank = function
+    | "creator" -> 0
+    | "updater" -> 1
+    | "signer" -> 2
+    | "finalizer" -> 3
+    | "extractor" -> 4
+    | _ -> 4
+  in
+  match psbt.inputs with
+  | [] -> "creator"
+  | first :: rest ->
+    let r0 = input_next_role first in
+    List.fold_left (fun acc inp ->
+      let r = input_next_role inp in
+      if rank r < rank acc then r else acc
+    ) r0 rest
+
 (* Extractor role: Extract the final signed transaction *)
 let extract (psbt : psbt) : (Types.transaction, string) result =
   if not (is_finalized psbt) then

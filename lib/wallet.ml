@@ -1048,11 +1048,233 @@ let build_change_script (dest_script : Cstruct.t) (change_pubkey : Cstruct.t) : 
     let change_hash = Crypto.hash160 change_pubkey in
     build_p2wpkh_script change_hash
 
+(* ============================================================================
+   Phase-2 segwit-v0 wrap signers (W28 — single-key + multisig P2WSH /
+   P2SH-P2WPKH / P2SH-P2WSH).  Pure functions; no wallet state.
+
+   References (Bitcoin Core):
+   - script/sign.cpp::ProduceSignature  — top-level dispatcher
+   - script/interpreter.cpp::SignatureHashV0  — BIP-143 sighash
+   - The witnessScript serves as scriptCode for BIP-143 unconditionally
+     for P2WSH (and P2SH-wrapped P2WSH) per BIP-143 spec.
+   ============================================================================ *)
+
+(* Encode an OP_PUSH for arbitrary-length payload.  Wraps with the
+   correct opcode (direct push <0x4c, OP_PUSHDATA1/2/4) so the resulting
+   bytes are a single push operation in script-execution semantics. *)
+let push_data (payload : Cstruct.t) : Cstruct.t =
+  let len = Cstruct.length payload in
+  let prefix =
+    if len < 0x4c then
+      let b = Cstruct.create 1 in
+      Cstruct.set_uint8 b 0 len; b
+    else if len <= 0xff then
+      let b = Cstruct.create 2 in
+      Cstruct.set_uint8 b 0 0x4c;
+      Cstruct.set_uint8 b 1 len; b
+    else if len <= 0xffff then
+      let b = Cstruct.create 3 in
+      Cstruct.set_uint8 b 0 0x4d;
+      Cstruct.set_uint8 b 1 (len land 0xff);
+      Cstruct.set_uint8 b 2 ((len lsr 8) land 0xff); b
+    else
+      let b = Cstruct.create 5 in
+      Cstruct.set_uint8 b 0 0x4e;
+      Cstruct.set_uint8 b 1 (len land 0xff);
+      Cstruct.set_uint8 b 2 ((len lsr 8) land 0xff);
+      Cstruct.set_uint8 b 3 ((len lsr 16) land 0xff);
+      Cstruct.set_uint8 b 4 ((len lsr 24) land 0xff); b
+  in
+  Cstruct.concat [prefix; payload]
+
+(* Extract the (sorted-as-they-appear) list of compressed pubkeys from a
+   bare OP_CHECKMULTISIG witnessScript:
+     OP_M <pk1> <pk2> ... <pkN> OP_N OP_CHECKMULTISIG
+   Returns None for any other script template.  Used to determine M (the
+   required-signature count) and the canonical pubkey ordering — the
+   witness must place sigs in pubkey-listed order, with an OP_0 dummy
+   preceding the sigs to absorb the historical CHECKMULTISIG off-by-one. *)
+let parse_multisig_witness_script (ws : Cstruct.t)
+    : (int * int * Cstruct.t list) option =
+  let len = Cstruct.length ws in
+  if len < 4 then None
+  else
+    let last = Cstruct.get_uint8 ws (len - 1) in
+    if last <> 0xae then None  (* OP_CHECKMULTISIG *)
+    else
+      let m_op = Cstruct.get_uint8 ws 0 in
+      let n_op = Cstruct.get_uint8 ws (len - 2) in
+      (* OP_1..OP_16 = 0x51..0x60 *)
+      if m_op < 0x51 || m_op > 0x60 || n_op < 0x51 || n_op > 0x60 then None
+      else
+        let m = m_op - 0x50 in
+        let n = n_op - 0x50 in
+        if m > n || m = 0 then None
+        else
+          let pks = ref [] in
+          let pos = ref 1 in
+          let ok = ref true in
+          for _ = 1 to n do
+            if !ok && !pos < len - 2 then begin
+              let push_len = Cstruct.get_uint8 ws !pos in
+              if (push_len = 33 || push_len = 65)
+                 && !pos + 1 + push_len <= len - 2 then begin
+                pks := Cstruct.sub ws (!pos + 1) push_len :: !pks;
+                pos := !pos + 1 + push_len
+              end else ok := false
+            end else ok := false
+          done;
+          if !ok && !pos = len - 2 && List.length !pks = n
+          then Some (m, n, List.rev !pks)
+          else None
+
+(* BIP-143 P2WSH signer.  Caller supplies the witnessScript (which doubles
+   as scriptCode for the sighash), the input value, the sighash type,
+   and a list of signing keys.  For a 1-key OP_CHECKSIG witnessScript
+   sign_keys must contain exactly that key.  For an M-of-N OP_CHECKMULTISIG
+   witnessScript sign_keys must contain at least M keys whose pubkeys
+   appear in the witnessScript; the witness is assembled with an OP_0
+   dummy plus M sigs placed in pubkey-listed order (CHECKMULTISIG semantics).
+
+   Returns the (input, witness) pair; the input is unchanged because
+   segwit inputs leave script_sig empty. *)
+let sign_input_p2wsh
+    ~(tx : Types.transaction)
+    ~(input_idx : int)
+    ~(witness_script : Cstruct.t)
+    ~(value : int64)
+    ~(sign_keys : (Crypto.private_key * Crypto.public_key) list)
+    ~(hash_type : int)
+    : Types.tx_in * Types.tx_witness =
+  let sighash =
+    Script.compute_sighash_segwit tx input_idx witness_script value hash_type
+  in
+  let ht_byte = Cstruct.create 1 in
+  Cstruct.set_uint8 ht_byte 0 hash_type;
+  let inp = List.nth tx.inputs input_idx in
+  let stack =
+    match parse_multisig_witness_script witness_script with
+    | Some (m, _n, pks) ->
+      (* Order the M sigs by the witnessScript's pubkey order. *)
+      let sigs_in_order = List.filter_map (fun pk ->
+        match List.find_opt (fun (_sk, our_pk) ->
+          Cstruct.equal our_pk pk
+        ) sign_keys with
+        | None -> None
+        | Some (sk, _) ->
+          let der = Crypto.sign sk sighash in
+          Some (Cstruct.concat [der; ht_byte])
+      ) pks in
+      if List.length sigs_in_order < m then
+        failwith (Printf.sprintf
+          "sign_input_p2wsh: have %d matching keys, need %d"
+          (List.length sigs_in_order) m);
+      (* Truncate to M (Core verifies exactly M sigs; extras are stack
+         garbage). *)
+      let take_m =
+        let rec aux n l = match n, l with
+          | 0, _ | _, [] -> []
+          | n, x :: rest -> x :: aux (n - 1) rest
+        in aux m sigs_in_order
+      in
+      (Cstruct.create 0) :: take_m  (* OP_0 dummy + M sigs *)
+    | None ->
+      (* Single-key path: assume the witnessScript ends OP_CHECKSIG and
+         our one signing key is the consumer.  Caller is responsible for
+         passing the correct key. *)
+      (match sign_keys with
+       | [(sk, _pk)] ->
+         let der = Crypto.sign sk sighash in
+         [Cstruct.concat [der; ht_byte]]
+       | [] -> failwith "sign_input_p2wsh: no signing keys"
+       | _ ->
+         failwith
+           "sign_input_p2wsh: single-key path requires exactly one key")
+  in
+  let witness_items = stack @ [witness_script] in
+  (inp, { Types.items = witness_items })
+
+(* P2SH-P2WPKH wrap.  scriptSig = push(redeemScript), where
+   redeemScript = OP_0 <hash160(pubkey)>.  BIP-143 sighash uses the
+   implied P2PKH scriptCode ( OP_DUP OP_HASH160 <pkh> OP_EQUALVERIFY
+   OP_CHECKSIG ).  Witness = [sig||hashtype, pubkey]. *)
+let sign_input_p2sh_p2wpkh
+    ~(tx : Types.transaction)
+    ~(input_idx : int)
+    ~(privkey : Crypto.private_key)
+    ~(pubkey : Crypto.public_key)
+    ~(value : int64)
+    ~(hash_type : int)
+    : Types.tx_in * Types.tx_witness =
+  let pkh = Crypto.hash160 pubkey in
+  (* redeemScript = OP_0 <20-byte pkh> (= 22 bytes total) *)
+  let redeem_script = build_p2wpkh_script pkh in
+  (* BIP-143 scriptCode for P2WPKH: OP_DUP OP_HASH160 <pkh> OP_EQUALVERIFY
+     OP_CHECKSIG (= the legacy P2PKH script).  See BIP-143 spec. *)
+  let script_code = build_p2pkh_script pkh in
+  let sighash =
+    Script.compute_sighash_segwit tx input_idx script_code value hash_type
+  in
+  let der = Crypto.sign privkey sighash in
+  let ht_byte = Cstruct.create 1 in
+  Cstruct.set_uint8 ht_byte 0 hash_type;
+  let sig_with_hashtype = Cstruct.concat [der; ht_byte] in
+  let script_sig = push_data redeem_script in
+  let inp = List.nth tx.inputs input_idx in
+  ({ inp with Types.script_sig },
+   { Types.items = [sig_with_hashtype; pubkey] })
+
+(* P2SH-P2WSH wrap.  scriptSig = push(redeemScript) where
+   redeemScript = OP_0 <SHA256(witnessScript)>.  Witness identical to
+   bare P2WSH.  BIP-143 sighash uses witnessScript as scriptCode. *)
+let sign_input_p2sh_p2wsh
+    ~(tx : Types.transaction)
+    ~(input_idx : int)
+    ~(witness_script : Cstruct.t)
+    ~(value : int64)
+    ~(sign_keys : (Crypto.private_key * Crypto.public_key) list)
+    ~(hash_type : int)
+    : Types.tx_in * Types.tx_witness =
+  let ws_hash = Crypto.sha256 witness_script in
+  (* redeemScript = OP_0 <32-byte sha256> (= 34 bytes total) *)
+  let redeem_script = Cstruct.create 34 in
+  Cstruct.set_uint8 redeem_script 0 0x00;
+  Cstruct.set_uint8 redeem_script 1 0x20;
+  Cstruct.blit ws_hash 0 redeem_script 2 32;
+  let (_inp_unused, witness) =
+    sign_input_p2wsh ~tx ~input_idx ~witness_script ~value ~sign_keys ~hash_type
+  in
+  let script_sig = push_data redeem_script in
+  let inp = List.nth tx.inputs input_idx in
+  ({ inp with Types.script_sig }, witness)
+
+(* Helper: detect a P2SH scriptPubKey that wraps a P2WPKH whose pubkey
+   the wallet owns.  Returns the matching keypair on success.  Used by
+   the dispatcher below to route otherwise-unowned P2SH inputs through
+   the new P2SH-P2WPKH signer. *)
+let is_mine_p2sh_p2wpkh (w : t) (script_pubkey : Cstruct.t)
+    : key_pair option =
+  match Script.classify_script script_pubkey with
+  | Script.P2SH_script script_hash ->
+    List.find_opt (fun kp ->
+      let pkh = Crypto.hash160 kp.public_key in
+      let redeem = build_p2wpkh_script pkh in
+      Cstruct.equal (Crypto.hash160 redeem) script_hash
+    ) w.keys
+  | _ -> None
+
 (* Sign a transaction's inputs given the selected UTXOs *)
 let sign_transaction_inputs (w : t) (tx : Types.transaction)
     (input_utxos : wallet_utxo list) : Types.transaction =
   let signed_inputs_and_witnesses = List.mapi (fun i wutxo ->
-    let kp = match is_mine w wutxo.utxo.Utxo.script_pubkey with
+    let kp_opt = is_mine w wutxo.utxo.Utxo.script_pubkey in
+    let kp = match kp_opt with
+      | Some kp -> Some kp
+      | None ->
+        (* Phase-2 W28: also accept P2SH-P2WPKH wraps of an owned key. *)
+        is_mine_p2sh_p2wpkh w wutxo.utxo.Utxo.script_pubkey
+    in
+    let kp = match kp with
       | Some kp -> kp
       | None -> failwith "Cannot find key for input"
     in
@@ -1100,6 +1322,17 @@ let sign_transaction_inputs (w : t) (tx : Types.transaction)
       Cstruct.set_uint8 script_sig (1 + sig_len) pub_len;
       Cstruct.blit kp.public_key 0 script_sig (1 + sig_len + 1) pub_len;
       ({ inp with Types.script_sig }, { Types.items = [] })
+    | Script.P2SH_script _ ->
+      (* W28: only the P2SH-P2WPKH-of-owned-key shape is dispatchable
+         here; the wallet does not store witnessScripts so bare P2SH
+         multisig and P2SH-P2WSH require external context (RPC prevtxs
+         array — not yet wired into this code path). *)
+      sign_input_p2sh_p2wpkh
+        ~tx ~input_idx:i
+        ~privkey:kp.private_key
+        ~pubkey:kp.public_key
+        ~value:wutxo.utxo.Utxo.value
+        ~hash_type:Script.sighash_all
     | _ ->
       failwith "sign_transaction_inputs: unsupported script type"
   ) input_utxos in

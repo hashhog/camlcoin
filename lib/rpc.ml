@@ -3440,29 +3440,32 @@ let handle_analyzepsbt (_ctx : rpc_context)
     (match Psbt.of_base64 b64 with
      | Error e -> Error (Psbt.string_of_error e)
      | Ok psbt ->
-       let input_analyses = List.mapi (fun _i inp ->
+       (* Per-input next-role classification mirrors Bitcoin Core's
+          AnalyzePSBT (src/node/psbt.cpp):
+            - Finalized                                  -> extractor
+            - Has all required sigs (M for M-of-N multisig; 1 for
+              single-sig; taproot key-sig present)       -> finalizer
+            - Has UTXO but missing sigs                  -> signer
+            - No UTXO                                    -> updater
+          PSBT-level next = min over per-input roles (Core ordering:
+          creator < updater < signer < finalizer < extractor; see
+          AnalyzePSBT src/node/psbt.cpp:91-95).
+          The fleet harness W40-C surfaced the "all sigs present, not
+          yet inscribed" case for a 2-of-2 P2SH-multisig + 2-of-2
+          P2SH-P2WSH-multisig fixture; the legacy logic counted only
+          finalized inputs and reported next=signer instead of
+          finalizer (W41). *)
+       let input_analyses = List.map (fun inp ->
          let has_utxo = inp.Psbt.witness_utxo <> None || inp.Psbt.non_witness_utxo <> None in
          let is_final = Psbt.is_input_finalized inp in
-         let has_sigs = inp.Psbt.partial_sigs <> [] || inp.Psbt.tap_key_sig <> None in
-         let next_role =
-           if is_final then "extractor"
-           else if has_sigs then "finalizer"
-           else if has_utxo then "signer"
-           else "updater"
-         in
+         let role = Psbt.input_next_role inp in
          `Assoc [
            ("has_utxo", `Bool has_utxo);
            ("is_final", `Bool is_final);
-           ("next", `String next_role);
+           ("next", `String role);
          ]
        ) psbt.inputs in
-       let all_finalized = Psbt.is_finalized psbt in
-       let unsigned_count = Psbt.count_unsigned_inputs psbt in
-       let next_role =
-         if all_finalized then "extractor"
-         else if unsigned_count = 0 then "finalizer"
-         else "signer"
-       in
+       let next_role = Psbt.psbt_next_role psbt in
        let fee_json = match Psbt.get_fee psbt with
          | Some fee -> [("estimated_feerate", `Float (Int64.to_float fee /. 100_000_000.0))]
          | None -> []

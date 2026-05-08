@@ -2989,13 +2989,16 @@ let handle_signrawtransactionwithkey (ctx : rpc_context)
       (* Sign each input *)
       let signed_count = ref 0 in
       let total_inputs = List.length tx.inputs in
-      let new_witnesses = List.mapi (fun i _inp ->
+      let existing_witness_at i =
+        if i < List.length tx.witnesses then
+          List.nth tx.witnesses i
+        else
+          { Types.items = [] }
+      in
+      let new_inputs_and_witnesses = List.mapi (fun i inp ->
         match List.nth_opt input_utxos i with
         | None | Some None ->
-          if i < List.length tx.witnesses then
-            List.nth tx.witnesses i
-          else
-            { Types.items = [] }
+          (inp, existing_witness_at i)
         | Some (Some utxo) ->
           let script_type = Script.classify_script utxo.Utxo.script_pubkey in
           let matching_key = match script_type with
@@ -3015,10 +3018,7 @@ let handle_signrawtransactionwithkey (ctx : rpc_context)
           in
           (match matching_key with
            | None ->
-             if i < List.length tx.witnesses then
-               List.nth tx.witnesses i
-             else
-               { Types.items = [] }
+             (inp, existing_witness_at i)
            | Some (privkey, pubkey, pkh, _xonly) ->
              incr signed_count;
              (match script_type with
@@ -3027,7 +3027,7 @@ let handle_signrawtransactionwithkey (ctx : rpc_context)
                 let xonly_pk = Cstruct.sub pubkey 1 32 in
                 let tweak = Crypto.compute_taproot_tweak xonly_pk None in
                 let sig_bytes = Crypto.schnorr_sign_tweaked ~privkey ~tweak ~msg:sighash in
-                { Types.items = [sig_bytes] }
+                (inp, { Types.items = [sig_bytes] })
               | Script.P2WPKH_script _ ->
                 let script_code = Wallet.build_p2pkh_script pkh in
                 let sighash = Script.compute_sighash_segwit
@@ -3036,25 +3036,44 @@ let handle_signrawtransactionwithkey (ctx : rpc_context)
                 let sig_with_hashtype = Cstruct.concat [
                   signature; Cstruct.of_string "\x01"
                 ] in
-                { Types.items = [sig_with_hashtype; pubkey] }
+                (inp, { Types.items = [sig_with_hashtype; pubkey] })
               | Script.P2PKH_script _ ->
-                (* Legacy P2PKH needs scriptSig, not witness *)
-                if i < List.length tx.witnesses then
-                  List.nth tx.witnesses i
-                else
-                  { Types.items = [] }
+                (* Legacy P2PKH: build scriptSig <sig+hashtype> <pubkey>; no witness *)
+                let script_code = utxo.Utxo.script_pubkey in
+                let sighash = Script.compute_sighash_legacy tx i script_code
+                  Script.sighash_all in
+                let signature = Crypto.sign privkey sighash in
+                let sig_with_hashtype = Cstruct.concat [
+                  signature; Cstruct.of_string "\x01"
+                ] in
+                let sig_len = Cstruct.length sig_with_hashtype in
+                let pub_len = Cstruct.length pubkey in
+                let script_sig = Cstruct.create (1 + sig_len + 1 + pub_len) in
+                Cstruct.set_uint8 script_sig 0 sig_len;
+                Cstruct.blit sig_with_hashtype 0 script_sig 1 sig_len;
+                Cstruct.set_uint8 script_sig (1 + sig_len) pub_len;
+                Cstruct.blit pubkey 0 script_sig (1 + sig_len + 1) pub_len;
+                ({ inp with Types.script_sig }, { Types.items = [] })
               | _ ->
-                if i < List.length tx.witnesses then
-                  List.nth tx.witnesses i
-                else
-                  { Types.items = [] }))
+                (inp, existing_witness_at i)))
       ) tx.inputs in
-      let signed_tx = { tx with witnesses = new_witnesses } in
+      let new_inputs = List.map fst new_inputs_and_witnesses in
+      let new_witnesses = List.map snd new_inputs_and_witnesses in
+      (* Only carry the segwit marker/flag if at least one witness is non-empty;
+         otherwise downstream deserialization rejects with "Superfluous witness
+         record". This matches Bitcoin Core's CTransaction::HasWitness gating. *)
+      let any_witness = List.exists (fun (w : Types.tx_witness) ->
+        w.items <> []
+      ) new_witnesses in
+      let final_witnesses = if any_witness then new_witnesses else [] in
+      let signed_tx = { tx with inputs = new_inputs; witnesses = final_witnesses } in
       let complete = !signed_count = total_inputs in
       let w = Serialize.writer_create () in
       Serialize.serialize_transaction w signed_tx;
       let cs = Serialize.writer_to_cstruct w in
-      let signed_hex = Types.hash256_to_hex cs in
+      (* hash256_to_hex is hard-coded to 32 bytes; signed tx is variable length.
+         Use the variable-length helper. *)
+      let signed_hex = cstruct_to_hex_early cs in
       Ok (`Assoc [
         ("hex", `String signed_hex);
         ("complete", `Bool complete);

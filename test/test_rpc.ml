@@ -2335,6 +2335,88 @@ let test_walletcreatefundedpsbt_basic () =
   cleanup_test_db ()
 
 (* ============================================================================
+   signrawtransactionwithkey: P2PKH (legacy) WIF path
+   ============================================================================
+   W19-camlcoin found that the P2PKH classify branch in
+   handle_signrawtransactionwithkey returned the existing/empty witness
+   instead of producing a real scriptSig.  This pins the WIF path: a
+   P2PKH UTXO is funded for a known key, the handler signs, and we
+   assert (a) the result hex round-trips, (b) the input's scriptSig is
+   non-empty, (c) the embedded ECDSA signature verifies against the
+   sighash, and (d) `complete` is true. *)
+let test_signrawtransactionwithkey_p2pkh_wif () =
+  let (ctx, db, utxo, _t1, _t2) = create_test_context () in
+  (* Deterministic key. *)
+  let priv_hex =
+    "4040404040404040404040404040404040404040404040404040404040404040" in
+  let privkey = Cstruct.of_hex priv_hex in
+  let pubkey = Crypto.derive_public_key ~compressed:true privkey in
+  let pkh = Crypto.hash160 pubkey in
+  let script_pubkey = Wallet.build_p2pkh_script pkh in
+  let wif = Address.wif_encode ~compressed:true ~network:`Mainnet privkey in
+  (* Fund a fresh P2PKH UTXO matched to this key. *)
+  let funding_txid = Types.hash256_of_hex
+    "1111111111111111111111111111111111111111111111111111111111111111" in
+  Utxo.UtxoSet.add utxo funding_txid 0 Utxo.{
+    value = 50_000_000L;  (* 0.5 BTC *)
+    script_pubkey;
+    height = 0;
+    is_coinbase = false;
+  };
+  (* Build an unsigned tx spending that input. *)
+  let unsigned = make_regular_tx
+    [make_test_input funding_txid 0l]
+    [make_test_output 49_990_000L]
+  in
+  let unsigned_hex = tx_to_hex unsigned in
+  let result = Rpc.handle_signrawtransactionwithkey ctx
+    [`String unsigned_hex; `List [`String wif]] in
+  Alcotest.(check bool) "sign ok" true (Result.is_ok result);
+  let (signed_hex, complete) = match result with
+    | Ok (`Assoc fields) ->
+      let h = match List.assoc "hex" fields with
+        | `String s -> s | _ -> Alcotest.fail "hex shape" in
+      let c = match List.assoc "complete" fields with
+        | `Bool b -> b | _ -> Alcotest.fail "complete shape" in
+      (h, c)
+    | _ -> Alcotest.fail "expected Ok(`Assoc _)"
+  in
+  Alcotest.(check bool) "complete = true" true complete;
+  (* Decode the signed hex. *)
+  let signed_tx =
+    let r = Serialize.reader_of_cstruct (Cstruct.of_hex signed_hex) in
+    Serialize.deserialize_transaction r
+  in
+  let inp0 = List.nth signed_tx.Types.inputs 0 in
+  let script_sig = inp0.Types.script_sig in
+  Alcotest.(check bool) "scriptSig non-empty" true
+    (Cstruct.length script_sig > 0);
+  (* scriptSig layout: <push sig_len> <sig+hashtype> <push pub_len> <pubkey>.
+     Extract the signature (without the trailing hashtype byte) and the
+     pubkey, then verify the ECDSA signature against the legacy sighash
+     of the original (unsigned) tx with script_pubkey as scriptCode. *)
+  let sig_len = Cstruct.get_uint8 script_sig 0 in
+  Alcotest.(check bool) "sig_len plausible" true
+    (sig_len >= 8 && sig_len <= 73);
+  let sig_with_hashtype = Cstruct.sub script_sig 1 sig_len in
+  let hashtype_byte =
+    Cstruct.get_uint8 sig_with_hashtype (sig_len - 1) in
+  Alcotest.(check int) "hashtype = SIGHASH_ALL" 0x01 hashtype_byte;
+  let der_sig = Cstruct.sub sig_with_hashtype 0 (sig_len - 1) in
+  let pub_off = 1 + sig_len in
+  let pub_len = Cstruct.get_uint8 script_sig pub_off in
+  let extracted_pub = Cstruct.sub script_sig (pub_off + 1) pub_len in
+  Alcotest.(check bool) "scriptSig pubkey matches WIF pubkey" true
+    (Cstruct.equal extracted_pub pubkey);
+  (* Recompute the legacy sighash on the unsigned tx + verify. *)
+  let sighash = Script.compute_sighash_legacy unsigned 0
+    script_pubkey Script.sighash_all in
+  Alcotest.(check bool) "ECDSA signature verifies" true
+    (Crypto.verify pubkey sighash der_sig);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -2485,5 +2567,7 @@ let () =
         test_signmessage_non_p2pkh_address_rejected;
       test_case "walletcreatefundedpsbt basic funding" `Quick
         test_walletcreatefundedpsbt_basic;
+      test_case "signrawtransactionwithkey P2PKH (WIF) signs" `Quick
+        test_signrawtransactionwithkey_p2pkh_wif;
     ];
   ]

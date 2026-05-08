@@ -419,6 +419,55 @@ let test_connect_block_coinbase_too_large () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* W24 defense-in-depth: connect_block_optimized must short-circuit on the
+   genesis block (height = 0) without mutating UTXO state. Mirrors Bitcoin
+   Core's validation.cpp:2337-2343 special-case. Three caller-side guards
+   already prevent height=0 from reaching the function in normal IBD/mining
+   flow, but a future caller skipping them must not silently insert the
+   genesis coinbase into the UTXO set. *)
+let test_connect_block_optimized_genesis_noop () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let utxo = Utxo.OptimizedUtxoSet.create db in
+  (* Plant a sentinel UTXO so we can prove no mutation occurs. *)
+  let sentinel_txid = Types.hash256_of_hex
+    "deadbeefcafebabe0123456789abcdef0123456789abcdefdeadbeefcafebabe" in
+  let sentinel_entry = Utxo.{
+    value = 42_000L;
+    script_pubkey = Cstruct.of_string "\x76\xa9\x14sentinel\x88\xac";
+    height = 7;
+    is_coinbase = false;
+  } in
+  Utxo.OptimizedUtxoSet.add utxo sentinel_txid 0 sentinel_entry;
+  Alcotest.(check bool) "sentinel present pre-call" true
+    (Option.is_some (Utxo.OptimizedUtxoSet.get utxo sentinel_txid 0));
+  (* Construct a fake genesis block with a coinbase paying the subsidy. *)
+  let subsidy = Consensus.block_subsidy 0 in
+  let genesis_block = make_test_block 0 subsidy [] in
+  let coinbase_txid =
+    Crypto.compute_txid (List.hd genesis_block.transactions) in
+  (* Call connect_block_optimized directly with height=0. *)
+  let result = Utxo.connect_block_optimized utxo genesis_block 0 in
+  Alcotest.(check bool) "genesis returns Ok" true (Result.is_ok result);
+  let undo = Result.get_ok result in
+  Alcotest.(check int) "undo height = 0" 0 undo.height;
+  Alcotest.(check int) "undo tx_undos empty" 0 (List.length undo.tx_undos);
+  (* Genesis coinbase MUST NOT be in the UTXO set. *)
+  Alcotest.(check bool) "genesis coinbase NOT in UTXO" false
+    (Option.is_some (Utxo.OptimizedUtxoSet.get utxo coinbase_txid 0));
+  (* Sentinel must be unchanged (proves no add and no remove happened). *)
+  let after = Utxo.OptimizedUtxoSet.get utxo sentinel_txid 0 in
+  Alcotest.(check bool) "sentinel still present" true (Option.is_some after);
+  let after_entry = Option.get after in
+  Alcotest.(check int64) "sentinel value unchanged"
+    sentinel_entry.value after_entry.value;
+  Alcotest.(check int) "sentinel height unchanged"
+    sentinel_entry.height after_entry.height;
+  Alcotest.(check bool) "sentinel is_coinbase unchanged"
+    sentinel_entry.is_coinbase after_entry.is_coinbase;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 (* ============================================================================
    Block Disconnection Tests
    ============================================================================ *)
@@ -869,6 +918,7 @@ let () =
       test_case "output exceeds input" `Quick test_connect_block_output_exceeds_input;
       test_case "missing UTXO" `Quick test_connect_block_missing_utxo;
       test_case "coinbase too large" `Quick test_connect_block_coinbase_too_large;
+      test_case "optimized genesis no-op (W24)" `Quick test_connect_block_optimized_genesis_noop;
     ];
     "disconnect_block", [
       test_case "basic disconnect" `Quick test_disconnect_block;

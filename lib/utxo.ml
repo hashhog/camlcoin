@@ -699,6 +699,17 @@ let connect_block_optimized ?(network_type : Consensus.network = Consensus.Mainn
     (utxo : OptimizedUtxoSet.t) (block : Types.block)
     (height : int)
     : (undo_data, string) result =
+  (* Defense-in-depth genesis guard (W24, cross-impl audit).
+     The genesis coinbase is unspendable and MUST NOT enter the UTXO set;
+     three caller-side guards already prevent height=0 from reaching this
+     function (sync.ml `chain init` 439-462, block_import.ml:52, IBD
+     start_height = blocks_synced+1 at sync.ml:1250), but a future caller
+     that skips them would silently pollute the UTXO set. Mirror Bitcoin
+     Core's pattern (validation.cpp:2337-2343): on the genesis block,
+     return success immediately without touching state. *)
+  if height = 0 then
+    Ok { height = 0; tx_undos = [] }
+  else
   let tx_undos = ref [] in
   let error = ref None in
   let total_fees = ref 0L in

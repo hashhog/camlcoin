@@ -3026,6 +3026,14 @@ let handle_signrawtransactionwithkey (ctx : rpc_context)
               List.find_opt (fun (_priv, _pub, _pkh, xonly) ->
                 Cstruct.equal xonly xonly_hash
               ) decoded_keys
+            | Script.P2SH_script script_hash ->
+              (* W28 Phase-2: detect P2SH-P2WPKH wrap of a supplied key.
+                 redeemScript = OP_0 <hash160(pubkey)>; the P2SH hash is
+                 hash160 of that 22-byte redeemScript. *)
+              List.find_opt (fun (_priv, _pub, pkh, _xonly) ->
+                let redeem = Wallet.build_p2wpkh_script pkh in
+                Cstruct.equal (Crypto.hash160 redeem) script_hash
+              ) decoded_keys
             | _ -> None
           in
           (match matching_key with
@@ -3066,6 +3074,14 @@ let handle_signrawtransactionwithkey (ctx : rpc_context)
                 Cstruct.set_uint8 script_sig (1 + sig_len) pub_len;
                 Cstruct.blit pubkey 0 script_sig (1 + sig_len + 1) pub_len;
                 ({ inp with Types.script_sig }, { Types.items = [] })
+              | Script.P2SH_script _ ->
+                (* W28: only P2SH-P2WPKH wrap reaches here (matching_key
+                   filter above narrowed to that shape).  Delegate to the
+                   wallet wrap signer. *)
+                Wallet.sign_input_p2sh_p2wpkh
+                  ~tx ~input_idx:i ~privkey ~pubkey
+                  ~value:utxo.Utxo.value
+                  ~hash_type:Script.sighash_all
               | _ ->
                 (inp, existing_witness_at i)))
       ) tx.inputs in

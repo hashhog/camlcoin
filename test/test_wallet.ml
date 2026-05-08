@@ -1059,6 +1059,197 @@ let test_multi_wallet_send_between_wallets () =
   (try Sys.remove (Filename.concat temp_dir "receiver") with _ -> ());
   (try Unix.rmdir temp_dir with _ -> ())
 
+(* ============================================================================
+   W28 Phase-2 segwit-v0 wrap signer tests
+   (sign_input_p2wsh + sign_input_p2sh_p2wpkh + sign_input_p2sh_p2wsh)
+   ============================================================================ *)
+
+(* Build an unsigned tx with one input + one output for vector tests.  Uses a
+   placeholder prev-outpoint and a P2WPKH dummy output script — the witness
+   format is independent of the spend destination, only the input matters. *)
+let w28_make_unsigned_tx ~prev_txid ~prev_vout : Types.transaction =
+  let dummy_pkh = Cstruct.create 20 in
+  let p2wpkh_out = Cstruct.create 22 in
+  Cstruct.set_uint8 p2wpkh_out 0 0x00;
+  Cstruct.set_uint8 p2wpkh_out 1 0x14;
+  Cstruct.blit dummy_pkh 0 p2wpkh_out 2 20;
+  { Types.version = 2l;
+    inputs = [{
+      previous_output = { txid = prev_txid; vout = prev_vout };
+      script_sig = Cstruct.create 0;
+      sequence = 0xFFFFFFFEl;
+    }];
+    outputs = [{ value = 90_000L; script_pubkey = p2wpkh_out }];
+    witnesses = [];
+    locktime = 0l }
+
+(* Deterministic 32-byte privkey from a small label.  Avoids RNG so the
+   vectors are reproducible. *)
+let w28_test_privkey (i : int) : Cstruct.t =
+  let buf = Cstruct.create 32 in
+  for j = 0 to 31 do Cstruct.set_uint8 buf j 0 done;
+  Cstruct.set_uint8 buf 31 i;
+  buf
+
+(* Build the 2-of-N multisig witnessScript bytes:
+   OP_M <push33> <pk1> ... <push33> <pkN> OP_N OP_CHECKMULTISIG. *)
+let w28_build_multisig_ws (m : int) (pks : Cstruct.t list) : Cstruct.t =
+  let n = List.length pks in
+  let parts = ref [] in
+  let push_byte b = parts := (let c = Cstruct.create 1 in Cstruct.set_uint8 c 0 b; c) :: !parts in
+  push_byte (0x50 + m);
+  List.iter (fun pk ->
+    push_byte 33;
+    parts := pk :: !parts
+  ) pks;
+  push_byte (0x50 + n);
+  push_byte 0xae;  (* OP_CHECKMULTISIG *)
+  Cstruct.concat (List.rev !parts)
+
+let w28_prev_txid =
+  hex_to_cstruct
+    "1111111111111111111111111111111111111111111111111111111111111111"
+
+let test_w28_p2wsh_2of3_multisig () =
+  (* 3 keys; pick keys 0 and 2 to sign (skipping middle to exercise that
+     the signer respects pubkey order, not key-list order). *)
+  let sk0 = w28_test_privkey 1 in
+  let sk1 = w28_test_privkey 2 in
+  let sk2 = w28_test_privkey 3 in
+  let pk0 = Crypto.derive_public_key sk0 in
+  let pk1 = Crypto.derive_public_key sk1 in
+  let pk2 = Crypto.derive_public_key sk2 in
+  let ws = w28_build_multisig_ws 2 [pk0; pk1; pk2] in
+  let value = 100_000L in
+  let tx = w28_make_unsigned_tx ~prev_txid:w28_prev_txid ~prev_vout:0l in
+  let (_inp, witness) =
+    Wallet.sign_input_p2wsh
+      ~tx ~input_idx:0
+      ~witness_script:ws ~value
+      ~sign_keys:[(sk0, pk0); (sk2, pk2)]
+      ~hash_type:Script.sighash_all
+  in
+  (* Witness shape: [OP_0 dummy, sig_pk0, sig_pk2, witnessScript] *)
+  Alcotest.(check int) "witness items" 4 (List.length witness.items);
+  let dummy = List.nth witness.items 0 in
+  Alcotest.(check int) "OP_0 dummy length" 0 (Cstruct.length dummy);
+  let last = List.nth witness.items 3 in
+  Alcotest.(check bool) "witnessScript is last" true
+    (Cstruct.equal last ws);
+  (* Verify each sig against the BIP-143 sighash of witnessScript. *)
+  let sighash =
+    Script.compute_sighash_segwit tx 0 ws value Script.sighash_all
+  in
+  let sig0 = List.nth witness.items 1 in
+  let sig2 = List.nth witness.items 2 in
+  let strip_ht s =
+    Cstruct.sub s 0 (Cstruct.length s - 1)
+  in
+  let ht_byte_ok s =
+    Cstruct.get_uint8 s (Cstruct.length s - 1) = Script.sighash_all
+  in
+  Alcotest.(check bool) "sig0 hashtype byte" true (ht_byte_ok sig0);
+  Alcotest.(check bool) "sig2 hashtype byte" true (ht_byte_ok sig2);
+  Alcotest.(check bool) "verify sig0 vs pk0" true
+    (Crypto.verify pk0 sighash (strip_ht sig0));
+  Alcotest.(check bool) "verify sig2 vs pk2" true
+    (Crypto.verify pk2 sighash (strip_ht sig2));
+  (* Cross-check: pk1 (the unsigned key) must NOT verify sig0. *)
+  Alcotest.(check bool) "wrong-key rejection" false
+    (Crypto.verify pk1 sighash (strip_ht sig0))
+
+let test_w28_p2sh_p2wpkh_wrap () =
+  let sk = w28_test_privkey 7 in
+  let pk = Crypto.derive_public_key sk in
+  let value = 250_000L in
+  let tx = w28_make_unsigned_tx ~prev_txid:w28_prev_txid ~prev_vout:1l in
+  let (inp, witness) =
+    Wallet.sign_input_p2sh_p2wpkh
+      ~tx ~input_idx:0 ~privkey:sk ~pubkey:pk
+      ~value ~hash_type:Script.sighash_all
+  in
+  (* scriptSig must be a single push of the 22-byte redeemScript. *)
+  Alcotest.(check int) "scriptSig length" 23 (Cstruct.length inp.script_sig);
+  Alcotest.(check int) "scriptSig push opcode" 22
+    (Cstruct.get_uint8 inp.script_sig 0);
+  let pkh = Crypto.hash160 pk in
+  let expected_redeem = Cstruct.create 22 in
+  Cstruct.set_uint8 expected_redeem 0 0x00;
+  Cstruct.set_uint8 expected_redeem 1 0x14;
+  Cstruct.blit pkh 0 expected_redeem 2 20;
+  Alcotest.(check bool) "redeemScript bytes match" true
+    (Cstruct.equal (Cstruct.sub inp.script_sig 1 22) expected_redeem);
+  (* Witness: [sig+ht, pubkey] *)
+  Alcotest.(check int) "witness items" 2 (List.length witness.items);
+  let pubkey_in_witness = List.nth witness.items 1 in
+  Alcotest.(check bool) "pubkey in witness" true
+    (Cstruct.equal pubkey_in_witness pk);
+  (* Sighash uses the implied P2PKH scriptCode. *)
+  let p2pkh_script = Cstruct.create 25 in
+  Cstruct.set_uint8 p2pkh_script 0 0x76;
+  Cstruct.set_uint8 p2pkh_script 1 0xa9;
+  Cstruct.set_uint8 p2pkh_script 2 0x14;
+  Cstruct.blit pkh 0 p2pkh_script 3 20;
+  Cstruct.set_uint8 p2pkh_script 23 0x88;
+  Cstruct.set_uint8 p2pkh_script 24 0xac;
+  let sighash =
+    Script.compute_sighash_segwit tx 0 p2pkh_script value Script.sighash_all
+  in
+  let sig_item = List.nth witness.items 0 in
+  let der = Cstruct.sub sig_item 0 (Cstruct.length sig_item - 1) in
+  Alcotest.(check int) "hashtype byte = 0x01" 0x01
+    (Cstruct.get_uint8 sig_item (Cstruct.length sig_item - 1));
+  Alcotest.(check bool) "verify P2SH-P2WPKH sig" true
+    (Crypto.verify pk sighash der)
+
+let test_w28_p2sh_p2wsh_2of2 () =
+  let sk_a = w28_test_privkey 11 in
+  let sk_b = w28_test_privkey 13 in
+  let pk_a = Crypto.derive_public_key sk_a in
+  let pk_b = Crypto.derive_public_key sk_b in
+  let ws = w28_build_multisig_ws 2 [pk_a; pk_b] in
+  let value = 500_000L in
+  let tx = w28_make_unsigned_tx ~prev_txid:w28_prev_txid ~prev_vout:2l in
+  let (inp, witness) =
+    Wallet.sign_input_p2sh_p2wsh
+      ~tx ~input_idx:0 ~witness_script:ws ~value
+      ~sign_keys:[(sk_a, pk_a); (sk_b, pk_b)]
+      ~hash_type:Script.sighash_all
+  in
+  (* scriptSig must be a single push of the 34-byte redeemScript = OP_0 <sha256(ws)>. *)
+  Alcotest.(check int) "scriptSig length" 35 (Cstruct.length inp.script_sig);
+  Alcotest.(check int) "scriptSig push opcode" 34
+    (Cstruct.get_uint8 inp.script_sig 0);
+  let redeem = Cstruct.sub inp.script_sig 1 34 in
+  Alcotest.(check int) "redeem opcode 0" 0x00 (Cstruct.get_uint8 redeem 0);
+  Alcotest.(check int) "redeem push 32" 0x20 (Cstruct.get_uint8 redeem 1);
+  Alcotest.(check bool) "redeem hash = sha256(ws)" true
+    (Cstruct.equal (Cstruct.sub redeem 2 32) (Crypto.sha256 ws));
+  (* Witness: [OP_0, sig_a, sig_b, witnessScript] — sigs in pubkey order. *)
+  Alcotest.(check int) "witness items" 4 (List.length witness.items);
+  Alcotest.(check int) "OP_0 dummy" 0 (Cstruct.length (List.nth witness.items 0));
+  Alcotest.(check bool) "witnessScript is last" true
+    (Cstruct.equal (List.nth witness.items 3) ws);
+  let sighash =
+    Script.compute_sighash_segwit tx 0 ws value Script.sighash_all
+  in
+  let strip_ht s = Cstruct.sub s 0 (Cstruct.length s - 1) in
+  let sig_a = List.nth witness.items 1 in
+  let sig_b = List.nth witness.items 2 in
+  Alcotest.(check bool) "verify sig_a" true
+    (Crypto.verify pk_a sighash (strip_ht sig_a));
+  Alcotest.(check bool) "verify sig_b" true
+    (Crypto.verify pk_b sighash (strip_ht sig_b))
+
+let w28_segwit_wrap_tests = [
+  Alcotest.test_case "P2WSH 2-of-3 multisig sign+verify"
+    `Quick test_w28_p2wsh_2of3_multisig;
+  Alcotest.test_case "P2SH-P2WPKH wrap sign+verify"
+    `Quick test_w28_p2sh_p2wpkh_wrap;
+  Alcotest.test_case "P2SH-P2WSH 2-of-2 multisig sign+verify"
+    `Quick test_w28_p2sh_p2wsh_2of2;
+]
+
 let multi_wallet_tests = [
   Alcotest.test_case "create manager" `Quick test_multi_wallet_create_manager;
   Alcotest.test_case "create wallet" `Quick test_multi_wallet_create_wallet;
@@ -1085,4 +1276,5 @@ let () = Alcotest.run "test_wallet" [
   ("address_types", address_type_tests);
   ("bip39", bip39_tests);
   ("multi_wallet", multi_wallet_tests);
+  ("w28_segwit_v0_wraps", w28_segwit_wrap_tests);
 ]

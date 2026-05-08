@@ -24,14 +24,6 @@ let make_test_output value =
     script_pubkey = Cstruct.of_string "\x76\xa9\x14test_script_pubkey\x88\xac";
   }
 
-(* Helper to create a test transaction input *)
-let make_test_input txid vout =
-  Types.{
-    previous_output = { txid; vout };
-    script_sig = Cstruct.of_string "\x00";
-    sequence = 0xFFFFFFFFl;
-  }
-
 (* Helper to create a coinbase transaction *)
 let make_coinbase_tx height outputs =
   let height_script = Consensus.encode_height_in_coinbase height in
@@ -43,16 +35,6 @@ let make_coinbase_tx height outputs =
       script_sig;
       sequence = 0xFFFFFFFFl;
     }];
-    outputs;
-    witnesses = [];
-    locktime = 0l;
-  }
-
-(* Helper to create a regular transaction *)
-let make_regular_tx inputs outputs =
-  Types.{
-    version = 1l;
-    inputs;
     outputs;
     witnesses = [];
     locktime = 0l;
@@ -261,163 +243,16 @@ let test_undo_data_serialization () =
 
 (* ============================================================================
    Block Connection Tests
-   ============================================================================ *)
+   ============================================================================
 
-let test_connect_coinbase_only_block () =
-  cleanup_test_db ();
-  let db = Storage.ChainDB.create test_db_path in
-  let utxo = Utxo.UtxoSet.create db in
-  (* Create a block with just coinbase *)
-  let subsidy = Consensus.block_subsidy 0 in
-  let block = make_test_block 0 subsidy [] in
-  let result = Utxo.connect_block utxo block 0 in
-  Alcotest.(check bool) "connect succeeded" true (Result.is_ok result);
-  (* Verify coinbase output is in UTXO set *)
-  let coinbase_txid = Crypto.compute_txid (List.hd block.transactions) in
-  let got = Utxo.UtxoSet.get utxo coinbase_txid 0 in
-  Alcotest.(check bool) "coinbase output exists" true (Option.is_some got);
-  let entry = Option.get got in
-  Alcotest.(check int64) "coinbase value" subsidy entry.value;
-  Alcotest.(check bool) "is_coinbase flag" true entry.is_coinbase;
-  Alcotest.(check int) "height" 0 entry.height;
-  Storage.ChainDB.close db;
-  cleanup_test_db ()
+   The legacy [Utxo.connect_block] / [Utxo.disconnect_block] (UtxoSet.t-based)
+   helpers were dead code (wave-33b ledger) and had a genesis-coinbase bug
+   that diverged from Bitcoin Core. They were deleted in W25 (2026-05-07)
+   along with all six [connect_block_*] Alcotest cases that exercised them
+   (including the bug-pinning [test_connect_coinbase_only_block]).
 
-let test_connect_block_with_spend () =
-  cleanup_test_db ();
-  let db = Storage.ChainDB.create test_db_path in
-  let utxo = Utxo.UtxoSet.create db in
-  (* Connect block 0 (genesis with coinbase) *)
-  let subsidy0 = Consensus.block_subsidy 0 in
-  let block0 = make_test_block 0 subsidy0 [] in
-  let _result0 = Utxo.connect_block utxo block0 0 in
-  let cb0_txid = Crypto.compute_txid (List.hd block0.transactions) in
-  (* We need to wait 100 blocks for coinbase maturity, but for this test
-     let's just add a non-coinbase UTXO that we can spend immediately *)
-  let fake_txid = Types.hash256_of_hex
-    "0e3e2357e806b6cdb1f70b54c3a3a17b6714ee1f0e68bebb44a74b1efd512098" in
-  Utxo.UtxoSet.add utxo fake_txid 0 Utxo.{
-    value = 1000000L;
-    script_pubkey = Cstruct.of_string "test";
-    height = 0;
-    is_coinbase = false;  (* not coinbase, so no maturity wait *)
-  };
-  (* Create block 1 that spends the fake UTXO *)
-  let spend_tx = make_regular_tx
-    [make_test_input fake_txid 0l]
-    [make_test_output 900000L]  (* 100000 satoshi fee *)
-  in
-  let subsidy1 = Consensus.block_subsidy 1 in
-  let block1 = make_test_block 1 (Int64.add subsidy1 100000L) [spend_tx] in
-  let result1 = Utxo.connect_block utxo block1 1 in
-  Alcotest.(check bool) "block 1 connect succeeded" true (Result.is_ok result1);
-  (* Verify spent UTXO is removed *)
-  Alcotest.(check bool) "spent UTXO removed" false
-    (Utxo.UtxoSet.exists utxo fake_txid 0);
-  (* Verify new output is created *)
-  let spend_txid = Crypto.compute_txid spend_tx in
-  Alcotest.(check bool) "new output exists" true
-    (Utxo.UtxoSet.exists utxo spend_txid 0);
-  (* Check undo data *)
-  let undo = Result.get_ok result1 in
-  Alcotest.(check int) "undo height" 1 undo.height;
-  let all_spent = List.concat_map (fun (tu : Utxo.tx_undo) -> tu.spent_outputs) undo.tx_undos in
-  Alcotest.(check int) "undo spent count" 1 (List.length all_spent);
-  let _ = cb0_txid in  (* suppress unused warning *)
-  Storage.ChainDB.close db;
-  cleanup_test_db ()
-
-let test_connect_block_coinbase_maturity () =
-  cleanup_test_db ();
-  let db = Storage.ChainDB.create test_db_path in
-  let utxo = Utxo.UtxoSet.create db in
-  (* Add a coinbase UTXO at height 0 *)
-  let cb_txid = Types.hash256_of_hex
-    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b" in
-  Utxo.UtxoSet.add utxo cb_txid 0 Utxo.{
-    value = 5000000000L;
-    script_pubkey = Cstruct.of_string "test";
-    height = 0;
-    is_coinbase = true;
-  };
-  (* Try to spend at height 99 (should fail - only 99 confirmations) *)
-  let spend_tx = make_regular_tx
-    [make_test_input cb_txid 0l]
-    [make_test_output 4999900000L]
-  in
-  let subsidy = Consensus.block_subsidy 99 in
-  let block99 = make_test_block 99 (Int64.add subsidy 100000L) [spend_tx] in
-  let result99 = Utxo.connect_block utxo block99 99 in
-  Alcotest.(check bool) "block 99 connect fails (immature)" true (Result.is_error result99);
-  (match result99 with
-   | Error msg ->
-     Alcotest.(check bool) "error mentions maturity" true
-       (String.sub msg 0 8 = "Immature")
-   | Ok _ -> ());
-  (* At height 100, spending should succeed (100 confirmations) *)
-  let block100 = make_test_block 100 (Int64.add subsidy 100000L) [spend_tx] in
-  let result100 = Utxo.connect_block utxo block100 100 in
-  Alcotest.(check bool) "block 100 connect succeeds" true (Result.is_ok result100);
-  Storage.ChainDB.close db;
-  cleanup_test_db ()
-
-let test_connect_block_output_exceeds_input () =
-  cleanup_test_db ();
-  let db = Storage.ChainDB.create test_db_path in
-  let utxo = Utxo.UtxoSet.create db in
-  (* Add a small UTXO *)
-  let txid = Types.hash256_of_hex
-    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b" in
-  Utxo.UtxoSet.add utxo txid 0 Utxo.{
-    value = 100000L;
-    script_pubkey = Cstruct.of_string "test";
-    height = 0;
-    is_coinbase = false;
-  };
-  (* Try to create output larger than input *)
-  let spend_tx = make_regular_tx
-    [make_test_input txid 0l]
-    [make_test_output 200000L]  (* More than input! *)
-  in
-  let block = make_test_block 1 (Consensus.block_subsidy 1) [spend_tx] in
-  let result = Utxo.connect_block utxo block 1 in
-  Alcotest.(check bool) "connect fails (output > input)" true (Result.is_error result);
-  Storage.ChainDB.close db;
-  cleanup_test_db ()
-
-let test_connect_block_missing_utxo () =
-  cleanup_test_db ();
-  let db = Storage.ChainDB.create test_db_path in
-  let utxo = Utxo.UtxoSet.create db in
-  (* Try to spend non-existent UTXO *)
-  let fake_txid = Types.hash256_of_hex
-    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b" in
-  let spend_tx = make_regular_tx
-    [make_test_input fake_txid 0l]
-    [make_test_output 100000L]
-  in
-  let block = make_test_block 1 (Consensus.block_subsidy 1) [spend_tx] in
-  let result = Utxo.connect_block utxo block 1 in
-  Alcotest.(check bool) "connect fails (missing UTXO)" true (Result.is_error result);
-  Storage.ChainDB.close db;
-  cleanup_test_db ()
-
-let test_connect_block_coinbase_too_large () =
-  cleanup_test_db ();
-  let db = Storage.ChainDB.create test_db_path in
-  let utxo = Utxo.UtxoSet.create db in
-  (* Create block with coinbase claiming more than subsidy + fees *)
-  let subsidy = Consensus.block_subsidy 0 in
-  let block = make_test_block 0 (Int64.add subsidy 1L) [] in  (* 1 satoshi too much *)
-  let result = Utxo.connect_block utxo block 0 in
-  Alcotest.(check bool) "connect fails (coinbase too large)" true (Result.is_error result);
-  (match result with
-   | Error msg ->
-     Alcotest.(check bool) "error mentions coinbase" true
-       (String.sub msg 0 8 = "Coinbase")
-   | Ok _ -> ());
-  Storage.ChainDB.close db;
-  cleanup_test_db ()
+   The W24 [test_connect_block_optimized_genesis_noop] below covers the
+   genesis-no-op contract on the live optimized path. *)
 
 (* W24 defense-in-depth: connect_block_optimized must short-circuit on the
    genesis block (height = 0) without mutating UTXO state. Mirrors Bitcoin
@@ -469,80 +304,12 @@ let test_connect_block_optimized_genesis_noop () =
   cleanup_test_db ()
 
 (* ============================================================================
-   Block Disconnection Tests
+   Block Disconnection Tests — DELETED in W25 (2026-05-07).
+
+   The legacy [Utxo.disconnect_block] (UtxoSet.t-based) was dead code with
+   no production callers; live reorg disconnect lives in the layered UTXO
+   cache. Tests that exercised it were removed alongside the function.
    ============================================================================ *)
-
-let test_disconnect_block () =
-  cleanup_test_db ();
-  let db = Storage.ChainDB.create test_db_path in
-  let utxo = Utxo.UtxoSet.create db in
-  (* Add a spendable UTXO *)
-  let input_txid = Types.hash256_of_hex
-    "0e3e2357e806b6cdb1f70b54c3a3a17b6714ee1f0e68bebb44a74b1efd512098" in
-  let original_entry = Utxo.{
-    value = 1000000L;
-    script_pubkey = Cstruct.of_string "original_script";
-    height = 0;
-    is_coinbase = false;
-  } in
-  Utxo.UtxoSet.add utxo input_txid 0 original_entry;
-  (* Connect a block that spends it *)
-  let spend_tx = make_regular_tx
-    [make_test_input input_txid 0l]
-    [make_test_output 900000L]
-  in
-  let subsidy = Consensus.block_subsidy 1 in
-  let block = make_test_block 1 (Int64.add subsidy 100000L) [spend_tx] in
-  let undo = Result.get_ok (Utxo.connect_block utxo block 1) in
-  let spend_txid = Crypto.compute_txid spend_tx in
-  let cb_txid = Crypto.compute_txid (List.hd block.transactions) in
-  (* Verify state after connection *)
-  Alcotest.(check bool) "original spent" false (Utxo.UtxoSet.exists utxo input_txid 0);
-  Alcotest.(check bool) "new output exists" true (Utxo.UtxoSet.exists utxo spend_txid 0);
-  Alcotest.(check bool) "coinbase exists" true (Utxo.UtxoSet.exists utxo cb_txid 0);
-  (* Disconnect the block *)
-  Utxo.disconnect_block utxo block undo;
-  (* Verify state after disconnection *)
-  Alcotest.(check bool) "original restored" true (Utxo.UtxoSet.exists utxo input_txid 0);
-  Alcotest.(check bool) "new output removed" false (Utxo.UtxoSet.exists utxo spend_txid 0);
-  Alcotest.(check bool) "coinbase removed" false (Utxo.UtxoSet.exists utxo cb_txid 0);
-  (* Verify restored entry has correct values *)
-  let restored = Option.get (Utxo.UtxoSet.get utxo input_txid 0) in
-  Alcotest.(check int64) "restored value" original_entry.value restored.value;
-  Alcotest.(check bool) "restored script" true
-    (Cstruct.equal original_entry.script_pubkey restored.script_pubkey);
-  Storage.ChainDB.close db;
-  cleanup_test_db ()
-
-let test_connect_disconnect_multiple () =
-  cleanup_test_db ();
-  let db = Storage.ChainDB.create test_db_path in
-  let utxo = Utxo.UtxoSet.create db in
-  (* Connect 3 blocks in sequence *)
-  let block0 = make_test_block 0 (Consensus.block_subsidy 0) [] in
-  let undo0 = Result.get_ok (Utxo.connect_block utxo block0 0) in
-  let block1 = make_test_block 1 (Consensus.block_subsidy 1) [] in
-  let undo1 = Result.get_ok (Utxo.connect_block utxo block1 1) in
-  let block2 = make_test_block 2 (Consensus.block_subsidy 2) [] in
-  let undo2 = Result.get_ok (Utxo.connect_block utxo block2 2) in
-  let cb0 = Crypto.compute_txid (List.hd block0.transactions) in
-  let cb1 = Crypto.compute_txid (List.hd block1.transactions) in
-  let cb2 = Crypto.compute_txid (List.hd block2.transactions) in
-  (* All 3 coinbase outputs should exist *)
-  Alcotest.(check bool) "cb0 exists" true (Utxo.UtxoSet.exists utxo cb0 0);
-  Alcotest.(check bool) "cb1 exists" true (Utxo.UtxoSet.exists utxo cb1 0);
-  Alcotest.(check bool) "cb2 exists" true (Utxo.UtxoSet.exists utxo cb2 0);
-  (* Disconnect in reverse order *)
-  Utxo.disconnect_block utxo block2 undo2;
-  Alcotest.(check bool) "cb2 removed" false (Utxo.UtxoSet.exists utxo cb2 0);
-  Alcotest.(check bool) "cb1 still exists" true (Utxo.UtxoSet.exists utxo cb1 0);
-  Utxo.disconnect_block utxo block1 undo1;
-  Alcotest.(check bool) "cb1 removed" false (Utxo.UtxoSet.exists utxo cb1 0);
-  Alcotest.(check bool) "cb0 still exists" true (Utxo.UtxoSet.exists utxo cb0 0);
-  Utxo.disconnect_block utxo block0 undo0;
-  Alcotest.(check bool) "cb0 removed" false (Utxo.UtxoSet.exists utxo cb0 0);
-  Storage.ChainDB.close db;
-  cleanup_test_db ()
 
 (* ============================================================================
    Undo Data Storage Tests
@@ -912,17 +679,7 @@ let () =
       test_case "cache stats" `Quick test_utxoset_cache_stats;
     ];
     "connect_block", [
-      test_case "coinbase only block" `Quick test_connect_coinbase_only_block;
-      test_case "block with spend" `Quick test_connect_block_with_spend;
-      test_case "coinbase maturity" `Quick test_connect_block_coinbase_maturity;
-      test_case "output exceeds input" `Quick test_connect_block_output_exceeds_input;
-      test_case "missing UTXO" `Quick test_connect_block_missing_utxo;
-      test_case "coinbase too large" `Quick test_connect_block_coinbase_too_large;
       test_case "optimized genesis no-op (W24)" `Quick test_connect_block_optimized_genesis_noop;
-    ];
-    "disconnect_block", [
-      test_case "basic disconnect" `Quick test_disconnect_block;
-      test_case "connect/disconnect multiple" `Quick test_connect_disconnect_multiple;
     ];
     "storage", [
       test_case "undo data storage" `Quick test_undo_data_storage;

@@ -276,6 +276,33 @@ let put_chain_state (t : t) (key : string) (value : string) =
 let get_chain_state (t : t) (key : string) : string option =
   Rocksdb.cf_get t.db t.cfh_chain_state key
 
+(* Block nTx index: stores transaction count per block, keyed by
+   "n:" prefix + 32-byte raw block hash.  Written for every connected
+   block (including assume-valid IBD) so getblockheader can return
+   a correct nTx without needing the full block body. *)
+let ntx_key (hash : Types.hash256) : string =
+  "n:" ^ Cstruct.to_string hash
+
+let put_block_ntx (t : t) (hash : Types.hash256) (n : int) =
+  (* Encode n_tx as 4-byte little-endian int32 *)
+  let buf = Bytes.create 4 in
+  Bytes.set buf 0 (Char.chr (n land 0xFF));
+  Bytes.set buf 1 (Char.chr ((n lsr 8) land 0xFF));
+  Bytes.set buf 2 (Char.chr ((n lsr 16) land 0xFF));
+  Bytes.set buf 3 (Char.chr ((n lsr 24) land 0xFF));
+  Rocksdb.cf_put t.db t.cfh_chain_state (ntx_key hash) (Bytes.to_string buf)
+
+let get_block_ntx (t : t) (hash : Types.hash256) : int option =
+  match Rocksdb.cf_get t.db t.cfh_chain_state (ntx_key hash) with
+  | None -> None
+  | Some s when String.length s >= 4 ->
+    let b0 = Char.code s.[0] in
+    let b1 = Char.code s.[1] in
+    let b2 = Char.code s.[2] in
+    let b3 = Char.code s.[3] in
+    Some (b0 lor (b1 lsl 8) lor (b2 lsl 16) lor (b3 lsl 24))
+  | Some _ -> None
+
 (* Undo data, keyed by 32-byte block hash *)
 let put_undo_data (t : t) (hash : Types.hash256) (data : string) =
   Rocksdb.cf_put t.db t.cfh_undo_data (Cstruct.to_string hash) data

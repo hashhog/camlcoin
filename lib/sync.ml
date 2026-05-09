@@ -1760,8 +1760,25 @@ let compute_median_time_past (state : chain_state) (height : int) : int32 =
       | Some entry -> collect (entry.header.timestamp :: acc) (h - 1) (count - 1)
       | None -> acc
   in
-  (* Collect up to 11 timestamps from height-1 down to height-11 *)
+  (* Collect up to 11 timestamps from height-1 down to height-11.
+     Used for block validation (MTP check), which excludes the current block. *)
   let timestamps = collect [] (height - 1) 11 in
+  Consensus.median_time_past timestamps
+
+(* Compute the median time past FOR DISPLAY in getblockheader/getblock RPC,
+   which mirrors Bitcoin Core's CBlockIndex::GetMedianTimePast() that starts
+   at the CURRENT block (inclusive):
+     pindex = this; for i = 0..10: collect pindex->time; pindex = pprev
+   This differs from [compute_median_time_past] used for validation which
+   starts at height-1 (exclusive of the current block). *)
+let compute_median_time_for_display (state : chain_state) (height : int) : int32 =
+  let rec collect acc h count =
+    if count <= 0 || h < 0 then acc
+    else match get_header_at_height state h with
+      | Some entry -> collect (entry.header.timestamp :: acc) (h - 1) (count - 1)
+      | None -> acc
+  in
+  let timestamps = collect [] height 11 in
   Consensus.median_time_past timestamps
 
 (* Compute the expected difficulty bits for a block at the given height.
@@ -2211,6 +2228,11 @@ let process_downloaded_blocks ?(max_blocks = 1)
            ibd.chain.blocks_synced <- height;
            ibd.blocks_since_flush <- ibd.blocks_since_flush + 1;
            incr processed;
+           (* Store nTx for every connected block so getblockheader can
+              return the correct count without needing the full block body.
+              This fires on both assume-valid and full-validation paths. *)
+           Storage.ChainDB.store_block_ntx ibd.chain.db entry.hash
+             (List.length block.transactions);
            (* Prune old blocks if pruning is enabled *)
            prune_old_blocks ibd.chain height;
            (* Periodic UTXO flush — by block count or dirty set size.
@@ -3040,6 +3062,12 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
                state and side effects after the commit so a crash
                between batch_write and these updates leaves only the
                state recoverable from disk on restart. *)
+            (* Store nTx for every reorg-connected block so getblockheader
+               returns a correct count even if the block body is absent. *)
+            List.iter (fun ((entry : header_entry), (block : Types.block)) ->
+              Storage.ChainDB.store_block_ntx state.db entry.hash
+                (List.length block.transactions)
+            ) (List.rev !connected_blocks);
             state.tip <- Some new_tip;
             state.blocks_synced <- new_tip.height;
             if new_tip.height > state.headers_synced then
@@ -3666,6 +3694,10 @@ let rec connect_stored_blocks (state : chain_state) : int =
             ~tip_hash:entry.hash ~tip_height:next_height
             ~header_tip_hash:entry.hash ~header_tip_height:next_height
             (List.rev !ops);
+          (* Store nTx for this block so getblockheader returns the correct
+             count without needing the full block body. *)
+          Storage.ChainDB.store_block_ntx state.db entry.hash
+            (List.length stored_block.transactions);
           Logs.info (fun m ->
             m "Connected stored block %s at height %d (catch-up from gap-fill)"
               (Types.hash256_to_hex_display entry.hash) next_height);
@@ -3821,6 +3853,10 @@ let process_new_block (state : chain_state) (block : Types.block)
             ~tip_hash:hash ~tip_height:height
             ~header_tip_hash:hash ~header_tip_height:height
             (List.rev !ops);
+          (* Store nTx for this newly-connected block so getblockheader
+             returns the correct count without needing the full block body. *)
+          Storage.ChainDB.store_block_ntx state.db hash
+            (List.length block.transactions);
           Logs.info (fun m ->
             m "Connected new block %s at height %d"
               (Types.hash256_to_hex_display hash) height);

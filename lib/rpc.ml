@@ -3287,8 +3287,209 @@ let handle_createpsbt (ctx : rpc_context)
   | _ ->
     Error "Invalid parameters: expected [[inputs], [outputs], (locktime)]"
 
+(* ── W51/W52 decodepsbt helpers — Core-byte-compat JSON shape ────────────
+   Reference: bitcoin-core/src/core_io.cpp ScriptToAsmStr / ScriptToUniv /
+   ValueFromAmount; script/descriptor.cpp InferDescriptor (no-provider path).
+   ───────────────────────────────────────────────────────────────────────── *)
+
+(* Format a satoshi amount as Core's ValueFromAmount: "%s%d.%08d".
+   Always 8 fractional digits, no scientific notation. *)
+let format_btc_amount (sats : int64) : string =
+  let neg = Int64.compare sats 0L < 0 in
+  let abs = if neg then Int64.neg sats else sats in
+  let whole = Int64.div abs 100_000_000L in
+  let frac  = Int64.rem abs 100_000_000L in
+  let sign  = if neg then "-" else "" in
+  Printf.sprintf "%s%Ld.%08Ld" sign whole frac
+
+(* Emit a satoshi amount as a Yojson Intlit node so the decimal text is
+   preserved verbatim (e.g. "1.00000000", never "1.0" or "1.").
+   Yojson.Safe.t does not have Floatlit, but Intlit emits the string
+   unquoted — valid for decimal JSON numbers like "1.00000000". *)
+let btc_amount_json (sats : int64) : Yojson.Safe.t =
+  `Intlit (format_btc_amount sats)
+
+(* Core-style script ASM — matches ScriptToAsmStr(script, false).
+   Rules (core_io.cpp:357):
+     OP_0          → "0"
+     OP_1NEGATE    → "-1"
+     OP_1..OP_16   → "1".."16"
+     Push ≤4 bytes → decoded CScriptNum integer (signed little-endian)
+     Push >4 bytes → raw hex lowercase
+     All other ops → GetOpName string (e.g. "OP_DUP") *)
+let script_to_asm (script : Cstruct.t) : string =
+  (* CScriptNum decode: signed little-endian, sign bit in MSB of last byte *)
+  let decode_scriptnum vch len =
+    if len = 0 then "0"
+    else begin
+      let result = ref 0L in
+      for i = 0 to len - 1 do
+        result := Int64.logor !result
+          (Int64.shift_left (Int64.of_int (Char.code (Cstruct.get_char vch i))) (8 * i))
+      done;
+      let last = Char.code (Cstruct.get_char vch (len - 1)) in
+      if last land 0x80 <> 0 then begin
+        (* clear sign bit, negate *)
+        let sign_pos = 8 * (len - 1) + 7 in
+        result := Int64.logand !result
+          (Int64.lognot (Int64.shift_left 1L sign_pos));
+        result := Int64.neg !result
+      end;
+      Int64.to_string !result
+    end
+  in
+  let ops =
+    (try Script.parse_script script
+     with _ -> [])
+  in
+  let tokens = List.map (fun op ->
+    match op with
+    | Script.OP_0          -> "0"
+    | Script.OP_1NEGATE    -> "-1"
+    | Script.OP_1          -> "1"
+    | Script.OP_2          -> "2"
+    | Script.OP_3          -> "3"
+    | Script.OP_4          -> "4"
+    | Script.OP_5          -> "5"
+    | Script.OP_6          -> "6"
+    | Script.OP_7          -> "7"
+    | Script.OP_8          -> "8"
+    | Script.OP_9          -> "9"
+    | Script.OP_10         -> "10"
+    | Script.OP_11         -> "11"
+    | Script.OP_12         -> "12"
+    | Script.OP_13         -> "13"
+    | Script.OP_14         -> "14"
+    | Script.OP_15         -> "15"
+    | Script.OP_16         -> "16"
+    | Script.OP_PUSHDATA (_opbyte, data) ->
+      let len = Cstruct.length data in
+      if len <= 4 then decode_scriptnum data len
+      else cstruct_to_hex data
+    | Script.OP_NOP                  -> "OP_NOP"
+    | Script.OP_IF                   -> "OP_IF"
+    | Script.OP_NOTIF                -> "OP_NOTIF"
+    | Script.OP_ELSE                 -> "OP_ELSE"
+    | Script.OP_ENDIF                -> "OP_ENDIF"
+    | Script.OP_VERIFY               -> "OP_VERIFY"
+    | Script.OP_RETURN               -> "OP_RETURN"
+    | Script.OP_TOALTSTACK           -> "OP_TOALTSTACK"
+    | Script.OP_FROMALTSTACK         -> "OP_FROMALTSTACK"
+    | Script.OP_IFDUP                -> "OP_IFDUP"
+    | Script.OP_DEPTH                -> "OP_DEPTH"
+    | Script.OP_DROP                 -> "OP_DROP"
+    | Script.OP_DUP                  -> "OP_DUP"
+    | Script.OP_NIP                  -> "OP_NIP"
+    | Script.OP_OVER                 -> "OP_OVER"
+    | Script.OP_PICK                 -> "OP_PICK"
+    | Script.OP_ROLL                 -> "OP_ROLL"
+    | Script.OP_ROT                  -> "OP_ROT"
+    | Script.OP_SWAP                 -> "OP_SWAP"
+    | Script.OP_TUCK                 -> "OP_TUCK"
+    | Script.OP_2DROP                -> "OP_2DROP"
+    | Script.OP_2DUP                 -> "OP_2DUP"
+    | Script.OP_3DUP                 -> "OP_3DUP"
+    | Script.OP_2OVER                -> "OP_2OVER"
+    | Script.OP_2ROT                 -> "OP_2ROT"
+    | Script.OP_2SWAP                -> "OP_2SWAP"
+    | Script.OP_SIZE                 -> "OP_SIZE"
+    | Script.OP_EQUAL                -> "OP_EQUAL"
+    | Script.OP_EQUALVERIFY          -> "OP_EQUALVERIFY"
+    | Script.OP_1ADD                 -> "OP_1ADD"
+    | Script.OP_1SUB                 -> "OP_1SUB"
+    | Script.OP_NEGATE               -> "OP_NEGATE"
+    | Script.OP_ABS                  -> "OP_ABS"
+    | Script.OP_NOT                  -> "OP_NOT"
+    | Script.OP_0NOTEQUAL            -> "OP_0NOTEQUAL"
+    | Script.OP_ADD                  -> "OP_ADD"
+    | Script.OP_SUB                  -> "OP_SUB"
+    | Script.OP_BOOLAND              -> "OP_BOOLAND"
+    | Script.OP_BOOLOR               -> "OP_BOOLOR"
+    | Script.OP_NUMEQUAL             -> "OP_NUMEQUAL"
+    | Script.OP_NUMEQUALVERIFY       -> "OP_NUMEQUALVERIFY"
+    | Script.OP_NUMNOTEQUAL          -> "OP_NUMNOTEQUAL"
+    | Script.OP_LESSTHAN             -> "OP_LESSTHAN"
+    | Script.OP_GREATERTHAN          -> "OP_GREATERTHAN"
+    | Script.OP_LESSTHANOREQUAL      -> "OP_LESSTHANOREQUAL"
+    | Script.OP_GREATERTHANOREQUAL   -> "OP_GREATERTHANOREQUAL"
+    | Script.OP_MIN                  -> "OP_MIN"
+    | Script.OP_MAX                  -> "OP_MAX"
+    | Script.OP_WITHIN               -> "OP_WITHIN"
+    | Script.OP_RIPEMD160            -> "OP_RIPEMD160"
+    | Script.OP_SHA1                 -> "OP_SHA1"
+    | Script.OP_SHA256               -> "OP_SHA256"
+    | Script.OP_HASH160              -> "OP_HASH160"
+    | Script.OP_HASH256              -> "OP_HASH256"
+    | Script.OP_CODESEPARATOR        -> "OP_CODESEPARATOR"
+    | Script.OP_CHECKSIG             -> "OP_CHECKSIG"
+    | Script.OP_CHECKSIGVERIFY       -> "OP_CHECKSIGVERIFY"
+    | Script.OP_CHECKMULTISIG        -> "OP_CHECKMULTISIG"
+    | Script.OP_CHECKMULTISIGVERIFY  -> "OP_CHECKMULTISIGVERIFY"
+    | Script.OP_CHECKLOCKTIMEVERIFY  -> "OP_CHECKLOCKTIMEVERIFY"
+    | Script.OP_CHECKSEQUENCEVERIFY  -> "OP_CHECKSEQUENCEVERIFY"
+    | Script.OP_CHECKSIGADD          -> "OP_CHECKSIGADD"
+    | Script.OP_NOP1                 -> "OP_NOP1"
+    | Script.OP_NOP4                 -> "OP_NOP4"
+    | Script.OP_NOP5                 -> "OP_NOP5"
+    | Script.OP_NOP6                 -> "OP_NOP6"
+    | Script.OP_NOP7                 -> "OP_NOP7"
+    | Script.OP_NOP8                 -> "OP_NOP8"
+    | Script.OP_NOP9                 -> "OP_NOP9"
+    | Script.OP_NOP10                -> "OP_NOP10"
+    | Script.OP_RESERVED             -> "OP_RESERVED"
+    | Script.OP_VER                  -> "OP_VER"
+    | Script.OP_VERIF                -> "OP_VERIF"
+    | Script.OP_VERNOTIF             -> "OP_VERNOTIF"
+    | Script.OP_RESERVED1            -> "OP_RESERVED1"
+    | Script.OP_RESERVED2            -> "OP_RESERVED2"
+    | Script.OP_INVALID _            -> "OP_INVALIDOPCODE"
+  ) ops in
+  String.concat " " tokens
+
+(* Build descriptor string for a scriptPubKey, mirroring Core's
+   InferDescriptor (script/descriptor.cpp:2897) in the no-keys path:
+     addr(<address>)#<csum>  for standard address-encodable scripts
+     raw(<hex>)#<csum>       otherwise
+   Reference: bitcoin-core/src/script/descriptor.cpp InferDescriptor. *)
+let infer_descriptor (script : Cstruct.t) (network : Address.network) : string =
+  let payload = match script_to_address script network with
+    | Some addr -> "addr(" ^ addr ^ ")"
+    | None      -> "raw(" ^ cstruct_to_hex script ^ ")"
+  in
+  match Descriptor.add_checksum payload with
+  | Some s -> s
+  | None   -> payload  (* unreachable for well-formed addr/hex inputs *)
+
+(* Build full Core-shape scriptPubKey JSON for decodepsbt / ScriptToUniv.
+   Emits {asm, desc, hex, address?, type} — address suppressed when
+   script_to_address returns None (P2PK/multisig/OP_RETURN/nonstandard). *)
+let psbt_script_pubkey_json (script : Cstruct.t) (network : Address.network) : Yojson.Safe.t =
+  let template  = Script.classify_script script in
+  let type_name = script_type_name template in
+  let base = [
+    ("asm",  `String (script_to_asm script));
+    ("desc", `String (infer_descriptor script network));
+    ("hex",  `String (cstruct_to_hex script));
+  ] in
+  let with_addr = match script_to_address script network with
+    | Some addr -> base @ [("address", `String addr)]
+    | None      -> base
+  in
+  `Assoc (with_addr @ [("type", `String type_name)])
+
 (* decodepsbt "base64string"
-   Decode a PSBT and return detailed information *)
+   Decode a PSBT and return detailed information.
+   W51/W52: JSON shape now byte-identical to Bitcoin Core 31.99 for the
+   empty-aux corpus entries.  Key changes vs the pre-W51 shape:
+     1. amount formatting: Floatlit "1.00000000" (ValueFromAmount %d.%08d)
+     2. scriptPubKey: full {asm, desc, hex, address?, type} shape
+     3. global_xpubs: already present; proprietary+unknown added
+     4. address suppressed for non-address-encodable scripts
+     5. scriptSig: {asm, hex} even when empty (PSBT unsigned tx)
+     6. sequence: treated as uint32 (avoid signed -1 for 0xFFFFFFFF)
+     7. tx: hash + size/vsize/weight added
+     8. psbt inputs/outputs: index field removed (Core emits {} when empty)
+   Reference: bitcoin-core/src/rpc/rawtransaction.cpp decodepsbt. *)
 let handle_decodepsbt (_ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
@@ -3296,42 +3497,52 @@ let handle_decodepsbt (_ctx : rpc_context)
     (match Psbt.of_base64 b64 with
      | Error e -> Error (Psbt.string_of_error e)
      | Ok psbt ->
-       (* Build tx JSON *)
-       let tx = psbt.tx in
-       let txid = Crypto.compute_txid tx in
+       let tx      = psbt.tx in
+       let network : Address.network = `Mainnet in  (* decodepsbt is network-agnostic; use mainnet for addr encoding *)
+       let txid    = Crypto.compute_txid tx in
+       let wtxid   = Crypto.compute_wtxid tx in
+       (* tx.vin: scriptSig {asm, hex} + sequence as uint32 *)
        let inputs_json = List.map (fun inp ->
          `Assoc [
-           ("txid", `String (Types.hash256_to_hex_display inp.Types.previous_output.txid));
-           ("vout", `Int (Int32.to_int inp.Types.previous_output.vout));
-           ("sequence", `Int (Int32.to_int inp.sequence));
+           ("txid",      `String (Types.hash256_to_hex_display inp.Types.previous_output.txid));
+           ("vout",      `Int (Int32.to_int inp.Types.previous_output.vout));
+           ("scriptSig", `Assoc [
+             ("asm", `String (script_to_asm inp.Types.script_sig));
+             ("hex", `String (cstruct_to_hex inp.Types.script_sig));
+           ]);
+           (* sequence: treat int32 bits as uint32 — Core emits 4294967295 for 0xFFFFFFFF *)
+           ("sequence",  `Int (Int64.to_int
+             (Int64.logand (Int64.of_int32 inp.sequence) 0xFFFFFFFFL)));
          ]
        ) tx.inputs in
-       let outputs_json = List.map (fun out ->
+       (* tx.vout: value as btc_amount_json + n index + full scriptPubKey *)
+       let outputs_json = List.mapi (fun i out ->
          `Assoc [
-           ("value", `Float (Int64.to_float out.Types.value /. 100_000_000.0));
-           ("scriptPubKey", `Assoc [
-             ("hex", `String (cstruct_to_hex out.Types.script_pubkey));
-           ]);
+           ("value",       btc_amount_json out.Types.value);
+           ("n",           `Int i);
+           ("scriptPubKey", psbt_script_pubkey_json out.Types.script_pubkey network);
          ]
        ) tx.outputs in
        let tx_json = `Assoc [
-         ("txid", `String (Types.hash256_to_hex_display txid));
-         ("version", `Int (Int32.to_int tx.version));
+         ("txid",     `String (Types.hash256_to_hex_display txid));
+         ("hash",     `String (Types.hash256_to_hex_display wtxid));
+         ("version",  `Int (Int32.to_int tx.version));
+         ("size",     `Int (Validation.compute_tx_size tx));
+         ("vsize",    `Int (Validation.compute_tx_vsize tx));
+         ("weight",   `Int (Validation.compute_tx_weight tx));
          ("locktime", `Int (Int32.to_int tx.locktime));
-         ("vin", `List inputs_json);
-         ("vout", `List outputs_json);
+         ("vin",      `List inputs_json);
+         ("vout",     `List outputs_json);
        ] in
-       (* Build inputs JSON *)
-       let psbt_inputs_json = List.mapi (fun i inp ->
+       (* PSBT per-input records — index field removed (Core emits {} when empty) *)
+       let psbt_inputs_json = List.map (fun inp ->
          let fields = ref [] in
          (match inp.Psbt.witness_utxo with
           | Some utxo ->
             fields := !fields @ [
               ("witness_utxo", `Assoc [
-                ("amount", `Float (Int64.to_float utxo.value /. 100_000_000.0));
-                ("scriptPubKey", `Assoc [
-                  ("hex", `String (cstruct_to_hex utxo.script_pubkey));
-                ]);
+                ("amount",      btc_amount_json utxo.value);
+                ("scriptPubKey", psbt_script_pubkey_json utxo.script_pubkey network);
               ])
             ]
           | None -> ());
@@ -3357,9 +3568,9 @@ let handle_decodepsbt (_ctx : rpc_context)
            fields := !fields @ [
              ("bip32_derivs", `List (List.map (fun d ->
                `Assoc [
-                 ("pubkey", `String (cstruct_to_hex d.Psbt.pubkey));
+                 ("pubkey",             `String (cstruct_to_hex d.Psbt.pubkey));
                  ("master_fingerprint", `String (Printf.sprintf "%08lx" d.origin.fingerprint));
-                 ("path", `String (String.concat "/" (
+                 ("path",               `String (String.concat "/" (
                    "m" :: List.map (fun idx ->
                      if Int32.compare idx 0x80000000l >= 0 then
                        Printf.sprintf "%ld'" (Int32.sub idx 0x80000000l)
@@ -3386,10 +3597,10 @@ let handle_decodepsbt (_ctx : rpc_context)
          (match inp.Psbt.tap_internal_key with
           | Some key -> fields := !fields @ [("taproot_internal_key", `String (cstruct_to_hex key))]
           | None -> ());
-         `Assoc (("index", `Int i) :: !fields)
+         `Assoc !fields
        ) psbt.inputs in
-       (* Build outputs JSON *)
-       let psbt_outputs_json = List.mapi (fun i out ->
+       (* PSBT per-output records — index field removed *)
+       let psbt_outputs_json = List.map (fun out ->
          let fields = ref [] in
          (match out.Psbt.redeem_script with
           | Some rs -> fields := !fields @ [("redeem_script", `Assoc [("hex", `String (cstruct_to_hex rs))])]
@@ -3401,7 +3612,7 @@ let handle_decodepsbt (_ctx : rpc_context)
            fields := !fields @ [
              ("bip32_derivs", `List (List.map (fun d ->
                `Assoc [
-                 ("pubkey", `String (cstruct_to_hex d.Psbt.pubkey));
+                 ("pubkey",             `String (cstruct_to_hex d.Psbt.pubkey));
                  ("master_fingerprint", `String (Printf.sprintf "%08lx" d.origin.fingerprint));
                ]
              ) out.bip32_derivations))
@@ -3409,25 +3620,27 @@ let handle_decodepsbt (_ctx : rpc_context)
          (match out.Psbt.tap_internal_key with
           | Some key -> fields := !fields @ [("taproot_internal_key", `String (cstruct_to_hex key))]
           | None -> ());
-         `Assoc (("index", `Int i) :: !fields)
+         `Assoc !fields
        ) psbt.outputs in
-       (* Calculate fee if possible *)
-       let fee_json = match Psbt.get_fee psbt with
-         | Some fee -> [("fee", `Float (Int64.to_float fee /. 100_000_000.0))]
+       (* fee: use btc_amount_json so amount is Core-shaped *)
+       let fee_fields = match Psbt.get_fee psbt with
+         | Some fee -> [("fee", btc_amount_json fee)]
          | None -> []
        in
        Ok (`Assoc ([
-         ("tx", tx_json);
+         ("tx",          tx_json);
          ("global_xpubs", `List (List.map (fun gx ->
            `Assoc [
-             ("xpub", `String (cstruct_to_hex gx.Psbt.xpub));
+             ("xpub",               `String (cstruct_to_hex gx.Psbt.xpub));
              ("master_fingerprint", `String (Printf.sprintf "%08lx" gx.origin.fingerprint));
            ]
          ) psbt.global_xpubs));
          ("psbt_version", `Int (match psbt.version with Some v -> Int32.to_int v | None -> 0));
-         ("inputs", `List psbt_inputs_json);
-         ("outputs", `List psbt_outputs_json);
-       ] @ fee_json)))
+         ("proprietary",  `List []);
+         ("unknown",      `Assoc []);
+         ("inputs",       `List psbt_inputs_json);
+         ("outputs",      `List psbt_outputs_json);
+       ] @ fee_fields)))
   | _ ->
     Error "Invalid parameters: expected [base64string]"
 

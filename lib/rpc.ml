@@ -1042,59 +1042,6 @@ let handle_sendrawtransaction (ctx : rpc_context)
     with exn ->
       Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn)))
 
-let handle_decoderawtransaction (_ctx : rpc_context)
-    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
-  match params with
-  | [`String hex] ->
-    (try
-      let data = Cstruct.of_hex hex in
-      let r = Serialize.reader_of_cstruct data in
-      let tx = Serialize.deserialize_transaction r in
-      let txid = Crypto.compute_txid tx in
-      let vin = List.mapi (fun i inp ->
-        `Assoc [
-          ("txid", `String (Types.hash256_to_hex_display inp.Types.previous_output.txid));
-          ("vout", `Int (Int32.to_int inp.Types.previous_output.vout));
-          ("scriptSig", `Assoc [
-            (* W27-A: scriptSig is variable-length; hash256_to_hex truncates. *)
-            ("hex", `String (cstruct_to_hex_early inp.Types.script_sig));
-          ]);
-          ("sequence", `Int (Int32.to_int inp.Types.sequence));
-          ("txinwitness",
-            if i < List.length tx.witnesses then
-              `List (List.map (fun item ->
-                (* W27-A: witness items are variable-length. *)
-                `String (cstruct_to_hex_early item)
-              ) (List.nth tx.witnesses i).items)
-            else
-              `List []);
-        ]
-      ) tx.inputs in
-      let vout = List.mapi (fun i out ->
-        `Assoc [
-          ("value", `Float (Int64.to_float out.Types.value /. 100_000_000.0));
-          ("n", `Int i);
-          ("scriptPubKey", `Assoc [
-            (* W27-A: scriptPubKey is variable-length; hash256_to_hex truncates. *)
-            ("hex", `String (cstruct_to_hex_early out.Types.script_pubkey));
-          ]);
-        ]
-      ) tx.outputs in
-      Ok (`Assoc [
-        ("txid", `String (Types.hash256_to_hex_display txid));
-        ("version", `Int (Int32.to_int tx.version));
-        ("size", `Int (Validation.compute_tx_size tx));
-        ("vsize", `Int (Validation.compute_tx_vsize tx));
-        ("weight", `Int (Validation.compute_tx_weight tx));
-        ("locktime", `Int (Int32.to_int tx.locktime));
-        ("vin", `List vin);
-        ("vout", `List vout);
-      ])
-    with exn ->
-      Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn)))
-  | _ ->
-    Error "Invalid parameters: expected [hexstring]"
-
 (* ============================================================================
    Peer Info Handlers
    ============================================================================ *)
@@ -3716,10 +3663,20 @@ let build_script_type_json (script : Cstruct.t) : Yojson.Safe.t =
 
 (* Full TxToUniv shape without "hex" field, for non_witness_utxo.
    Matches Core's TxToUniv(tx, uint256(), entry, include_hex=false).
-   vin scriptSig uses sighash-decode ASM. vout scriptPubKey includes address. *)
+   vin scriptSig uses sighash-decode ASM. vout scriptPubKey includes address.
+   Note: hash (wtxid) is always the full serialized hash — even for coinbase.
+   Core's TxToUniv always calls GetHash() which hashes the full serialized tx.
+   Crypto.compute_wtxid returns zero_hash for coinbase (witness merkle tree
+   rule), but decoderawtransaction/non_witness_utxo must emit the real hash.
+   Reference: bitcoin-core/src/core_io.cpp TxToUniv line ~230 (hash field). *)
+let compute_rpc_hash (tx : Types.transaction) : Types.hash256 =
+  let w = Serialize.writer_create () in
+  Serialize.serialize_transaction w tx;
+  Crypto.sha256d (Serialize.writer_to_cstruct w)
+
 let build_non_witness_utxo_json (tx : Types.transaction) (network : Address.network) : Yojson.Safe.t =
   let txid  = Crypto.compute_txid tx in
-  let wtxid = Crypto.compute_wtxid tx in
+  let wtxid = compute_rpc_hash tx in
   let vin_json = List.mapi (fun i inp ->
     let witness_items_opt =
       if i < List.length tx.witnesses then
@@ -3769,6 +3726,31 @@ let build_non_witness_utxo_json (tx : Types.transaction) (network : Address.netw
   ]
 
 (* ─────────────────────────────────────────────────────────────────────────── *)
+
+(* decoderawtransaction "hexstring" [iswitness]
+   Decode a raw transaction hex and return a TxToUniv-shaped JSON object.
+   Reference: bitcoin-core/src/rpc/rawtransaction.cpp decoderawtransaction()
+   → TxToUniv(tx, block_hash=uint256(), entry, include_hex=false).
+   Shape: {txid, hash, version, size, vsize, weight, locktime, vin[], vout[]}.
+   No top-level "hex" field (Core's include_hex=false at rawtransaction.cpp:443).
+   Uses build_non_witness_utxo_json — the canonical TxToUniv emitter shared
+   with decodepsbt — so vin (coinbase detection, txinwitness, sighash ASM)
+   and vout (btc_amount_json, psbt_script_pubkey_json with desc/type/address)
+   are byte-identical with Bitcoin Core 31.99 (W55). *)
+let handle_decoderawtransaction (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  let network = network_to_address_network ctx.network in
+  match params with
+  | [`String hex] | [`String hex; `Bool _] ->
+    (try
+      let data = Cstruct.of_hex hex in
+      let r = Serialize.reader_of_cstruct data in
+      let tx = Serialize.deserialize_transaction r in
+      Ok (build_non_witness_utxo_json tx network)
+    with exn ->
+      Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn)))
+  | _ ->
+    Error "Invalid parameters: expected [hexstring]"
 
 (* decodepsbt "base64string"
    Decode a PSBT and return detailed information.

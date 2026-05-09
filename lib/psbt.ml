@@ -47,6 +47,7 @@ let psbt_out_bip32_derivation = 0x02
 let psbt_out_tap_internal_key = 0x05
 let psbt_out_tap_tree = 0x06
 let psbt_out_tap_bip32_derivation = 0x07
+let psbt_out_musig2_participants = 0x08
 
 (* Separator byte (0x00 length key) *)
 let psbt_separator = 0x00
@@ -120,6 +121,12 @@ type psbt_input = {
   unknown : (Cstruct.t * Cstruct.t) list;        (* Unknown key-values *)
 }
 
+(* MuSig2 participant pubkeys (BIP-327) *)
+type musig2_participant = {
+  aggregate_key : Cstruct.t;          (* 33-byte compressed aggregate pubkey *)
+  participant_keys : Cstruct.t list;  (* 33-byte compressed participant pubkeys *)
+}
+
 (* PSBT Output *)
 type psbt_output = {
   redeem_script : Cstruct.t option;
@@ -128,6 +135,7 @@ type psbt_output = {
   tap_internal_key : Cstruct.t option;
   tap_tree : Cstruct.t option;                   (* Serialized tap tree *)
   tap_bip32_derivations : tap_bip32_derivation list;
+  musig2_participants : musig2_participant list;  (* MuSig2 aggregate→participants *)
   unknown : (Cstruct.t * Cstruct.t) list;
 }
 
@@ -199,6 +207,7 @@ let empty_output = {
   tap_internal_key = None;
   tap_tree = None;
   tap_bip32_derivations = [];
+  musig2_participants = [];
   unknown = [];
 }
 
@@ -394,6 +403,14 @@ let serialize_output w (out : psbt_output) =
     Serialize.write_bytes w2 origin_bytes;
     write_kv w psbt_out_tap_bip32_derivation td.xonly_pubkey (Serialize.writer_to_cstruct w2)
   ) out.tap_bip32_derivations;
+
+  (* MuSig2 participant pubkeys *)
+  List.iter (fun (m : musig2_participant) ->
+    (* Key: type(1) + agg_pubkey(33); Value: participant_pubkeys (33B each, concatenated) *)
+    let w2 = Serialize.writer_create () in
+    List.iter (fun pk -> Serialize.write_bytes w2 pk) m.participant_keys;
+    write_kv w psbt_out_musig2_participants m.aggregate_key (Serialize.writer_to_cstruct w2)
+  ) out.musig2_participants;
 
   (* Unknown entries *)
   List.iter (fun (k, v) ->
@@ -615,6 +632,7 @@ let deserialize_output r : (psbt_output, psbt_error) result =
     Ok { o with
          bip32_derivations = List.rev o.bip32_derivations;
          tap_bip32_derivations = List.rev o.tap_bip32_derivations;
+         musig2_participants = List.rev o.musig2_participants;
          unknown = List.rev o.unknown;
        }
   in
@@ -663,6 +681,18 @@ let deserialize_output r : (psbt_output, psbt_error) result =
              let origin = parse_key_origin remaining in
              let td = { xonly_pubkey = key_data; leaf_hashes; origin } in
              out := { !out with tap_bip32_derivations = td :: !out.tap_bip32_derivations }
+           end
+
+         | t when t = psbt_out_musig2_participants ->
+           (* Key: type(1) + aggregate_pubkey(33)
+              Value: participant_pubkeys concatenated, 33 bytes each *)
+           if Cstruct.length key_data = 33 then begin
+             let n_parts = Cstruct.length value / 33 in
+             let participant_keys = List.init n_parts (fun i ->
+               Cstruct.sub value (i * 33) 33
+             ) in
+             let m = { aggregate_key = key_data; participant_keys } in
+             out := { !out with musig2_participants = m :: !out.musig2_participants }
            end
 
          | _ ->
@@ -1017,6 +1047,7 @@ let combine (psbt1 : psbt) (psbt2 : psbt) : (psbt, string) result =
         tap_internal_key = (match out1.tap_internal_key with Some _ -> out1.tap_internal_key | None -> out2.tap_internal_key);
         tap_tree = (match out1.tap_tree with Some _ -> out1.tap_tree | None -> out2.tap_tree);
         tap_bip32_derivations = dedup_tap_bip32_derivations (out1.tap_bip32_derivations @ out2.tap_bip32_derivations);
+        musig2_participants = out1.musig2_participants @ out2.musig2_participants;
         unknown = dedup_unknown_kvs (out1.unknown @ out2.unknown);
       }
     ) psbt1.outputs psbt2.outputs in

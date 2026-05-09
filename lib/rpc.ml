@@ -3530,29 +3530,86 @@ let handle_finalizepsbt (_ctx : rpc_context)
     (match Psbt.of_base64 b64 with
      | Error e -> Error (Psbt.string_of_error e)
      | Ok psbt ->
-       (* Try to finalize each input based on its type *)
+       (* Try to finalize each input based on its type.
+          W47 — Pre-W47 routing called finalize_input_p2sh_p2wpkh for
+          ANY P2SH UTXO, which silently mis-finalized P2SH-multisig and
+          P2SH-P2WSH-multisig inputs by synthesizing an OP_0+hash160
+          redeem_script from the first partial-sig pubkey (lib/psbt.ml's
+          old finalize_input_p2sh_p2wpkh body, lines 1026-1029) instead
+          of consuming the actual inp.redeem_script.  Now we classify
+          via the input's own redeem_script / witness_script:
+
+            redeem_script = OP_0 <push N>...      → segwit wrap
+              witness_script = OP_M ... CHECKMULTISIG → P2SH-P2WSH-multisig
+              witness_script = nothing            → P2SH-P2WPKH (single)
+            redeem_script = OP_M ... CHECKMULTISIG → P2SH-multisig (legacy)
+            witness_script = OP_M ... CHECKMULTISIG, no redeem_script
+                                                  → bare P2WSH-multisig
+            else fall through to the legacy single-key heuristics.
+
+          Mirrors the dispatch in bitcoin-core/src/script/sign.cpp
+          ProduceSignature → SignStep, which similarly walks
+          redeemScript / witnessScript before classifying the input. *)
+       let is_segwit_wrap (rs : Cstruct.t) : bool =
+         (* P2SH redeemScript that wraps a segwit program:
+            OP_0 <push N> <N bytes>  where N = 20 (P2WPKH) or 32 (P2WSH) *)
+         let len = Cstruct.length rs in
+         (len = 22 || len = 34)
+         && Cstruct.get_uint8 rs 0 = 0x00
+         && Cstruct.get_uint8 rs 1 = (len - 2)
+       in
+       let is_p2wsh_wrap (rs : Cstruct.t) : bool =
+         Cstruct.length rs = 34
+         && Cstruct.get_uint8 rs 0 = 0x00
+         && Cstruct.get_uint8 rs 1 = 0x20
+       in
+       let is_multisig (script : Cstruct.t) : bool =
+         match Psbt.parse_multisig_threshold script with
+         | Some _ -> true
+         | None -> false
+       in
        let finalize_one psbt i inp =
          if Psbt.is_input_finalized inp then
            Ok psbt
          else if inp.Psbt.tap_key_sig <> None then
            Psbt.finalize_input_taproot psbt i
-         else if inp.Psbt.partial_sigs <> [] then
-           (* Determine script type from witness_utxo *)
-           match inp.Psbt.witness_utxo with
-           | Some utxo ->
-             let script = utxo.script_pubkey in
-             if Cstruct.length script = 22 && Cstruct.get_uint8 script 0 = 0x00 then
-               (* P2WPKH *)
-               Psbt.finalize_input_p2wpkh psbt i
-             else if Cstruct.length script = 23 && Cstruct.get_uint8 script 0 = 0xa9 then
-               (* P2SH - check if it's P2SH-P2WPKH *)
-               Psbt.finalize_input_p2sh_p2wpkh psbt i
-             else
-               (* Try P2WPKH as fallback *)
-               Psbt.finalize_input_p2wpkh psbt i
-           | None ->
-             (* Try P2PKH for non-witness *)
-             Psbt.finalize_input_p2pkh psbt i
+         else if inp.Psbt.partial_sigs <> [] then begin
+           match inp.Psbt.redeem_script, inp.Psbt.witness_script with
+           (* P2SH-P2WSH-multisig: redeem_script wraps witness program,
+              witness_script is the actual multisig. *)
+           | Some rs, Some ws when is_p2wsh_wrap rs && is_multisig ws ->
+             Psbt.finalize_input_p2sh_p2wsh_multisig psbt i
+               ~redeem_script:rs ~witness_script:ws
+           (* Legacy P2SH-multisig: redeem_script is multisig, no witness_script. *)
+           | Some rs, None when is_multisig rs ->
+             Psbt.finalize_input_p2sh_multisig psbt i ~redeem_script:rs
+           (* Defensive: redeem_script = multisig + a stray witness_script;
+              still legacy P2SH-multisig (Core tolerates extra producer
+              fields and the redeem_script alone determines the spend
+              path). *)
+           | Some rs, Some _ when is_multisig rs ->
+             Psbt.finalize_input_p2sh_multisig psbt i ~redeem_script:rs
+           (* P2SH-P2WPKH: redeem_script wraps a P2WPKH program. *)
+           | Some rs, _ when is_segwit_wrap rs && Cstruct.length rs = 22 ->
+             Psbt.finalize_input_p2sh_p2wpkh psbt i
+           (* Bare P2WSH-multisig: no redeem_script, witness_script is
+              the multisig. *)
+           | None, Some ws when is_multisig ws ->
+             Psbt.finalize_input_p2wsh_multisig psbt i ~witness_script:ws
+           | _ ->
+             (* Fall back to UTXO-driven dispatch (single-key paths). *)
+             match inp.Psbt.witness_utxo with
+             | Some utxo ->
+               let script = utxo.script_pubkey in
+               if Cstruct.length script = 22 && Cstruct.get_uint8 script 0 = 0x00 then
+                 Psbt.finalize_input_p2wpkh psbt i
+               else if Cstruct.length script = 23 && Cstruct.get_uint8 script 0 = 0xa9 then
+                 Psbt.finalize_input_p2sh_p2wpkh psbt i
+               else
+                 Psbt.finalize_input_p2wpkh psbt i
+             | None ->
+               Psbt.finalize_input_p2pkh psbt i
+         end
          else
            Ok psbt
        in

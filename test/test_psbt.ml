@@ -921,6 +921,160 @@ let test_multi_input_fee () =
     Alcotest.(check int64) "fee calculation" 10000L fee
 
 (* ============================================================================
+   W47 — multisig finalize regression tests + combine idempotency
+   ============================================================================ *)
+
+(* Build a 2-of-2 CHECKMULTISIG redeem/witness script with two compressed
+   pubkeys, in the listed order:  OP_2 <push pk1> <push pk2> OP_2 OP_CHECKMULTISIG. *)
+let build_multisig_2of2 (pk1 : Cstruct.t) (pk2 : Cstruct.t) : Cstruct.t =
+  assert (Cstruct.length pk1 = 33);
+  assert (Cstruct.length pk2 = 33);
+  let buf = Cstruct.create (1 + 1 + 33 + 1 + 33 + 1 + 1) in
+  Cstruct.set_uint8 buf 0 0x52;            (* OP_2 *)
+  Cstruct.set_uint8 buf 1 33;
+  Cstruct.blit pk1 0 buf 2 33;
+  Cstruct.set_uint8 buf 35 33;
+  Cstruct.blit pk2 0 buf 36 33;
+  Cstruct.set_uint8 buf 69 0x52;           (* OP_2 *)
+  Cstruct.set_uint8 buf 70 0xae;           (* OP_CHECKMULTISIG *)
+  buf
+
+let make_unit_tx () : Types.transaction = {
+  version = 2l;
+  inputs = [{
+    previous_output = { txid = hex_to_cstruct (String.make 64 '0'); vout = 0l };
+    script_sig = Cstruct.empty;
+    sequence = 0xFFFFFFFFl;
+  }];
+  outputs = [{ value = 50000L; script_pubkey = hex_to_cstruct "0014" }];
+  witnesses = [];
+  locktime = 0l;
+}
+
+(* W47-T1: P2SH-multisig finalize must emit sigs in script-pubkey order
+   even when partial_sigs are added in REVERSE order. *)
+let test_w47_p2sh_multisig_finalize_order () =
+  let pk1 = hex_to_cstruct ("02" ^ String.make 64 'a') in
+  let pk2 = hex_to_cstruct ("03" ^ String.make 64 'b') in
+  let sig1 = hex_to_cstruct ("3044" ^ String.make 140 '1' ^ "01") in
+  let sig2 = hex_to_cstruct ("3045" ^ String.make 142 '2' ^ "01") in
+  let redeem_script = build_multisig_2of2 pk1 pk2 in
+  let psbt = Psbt.create (make_unit_tx ()) in
+  let psbt = Psbt.add_redeem_script psbt 0 redeem_script in
+  (* Add partial_sigs in REVERSE order (pk2 first, then pk1).  Naive
+     finalize would emit them in arrival order; correct behavior emits
+     them in script-pubkey order (pk1 sig, then pk2 sig). *)
+  let psbt = Psbt.add_partial_sig psbt 0 { pubkey = pk2; signature = sig2 } in
+  let psbt = Psbt.add_partial_sig psbt 0 { pubkey = pk1; signature = sig1 } in
+  match Psbt.finalize_input_p2sh_multisig psbt 0 ~redeem_script with
+  | Error e -> Alcotest.fail ("finalize failed: " ^ e)
+  | Ok finalized ->
+    let inp = List.hd finalized.inputs in
+    (match inp.final_scriptsig with
+     | None -> Alcotest.fail "no final_scriptsig"
+     | Some ss ->
+       (* scriptSig layout: OP_0 <push sig1> <push sig2> <push redeem_script>.
+          We expect sig1 to appear at offset 2 (after OP_0 + push-len).
+          sig1 is the longer string of '1's; sig2 the longer string of
+          '2's.  Find the first sig push and check its first byte
+          actually corresponds to sig1, not sig2. *)
+       Alcotest.(check int) "scriptSig starts with OP_0" 0x00 (Cstruct.get_uint8 ss 0);
+       let sig1_push_len = Cstruct.get_uint8 ss 1 in
+       Alcotest.(check int) "first sig push length" (Cstruct.length sig1) sig1_push_len;
+       let sig1_first_byte = Cstruct.get_uint8 ss 2 in
+       (* sig1 starts with 0x30 0x44; sig2 with 0x30 0x45. Check 2nd byte
+          (offset 3) which differs — sig1: 0x44, sig2: 0x45. *)
+       Alcotest.(check int) "sig1 emitted first (DER len byte)" 0x44 (Cstruct.get_uint8 ss 3);
+       (* Negative check: sig2 must come AFTER sig1 in the scriptSig. *)
+       let sig2_offset = 2 + sig1_push_len + 1 in
+       Alcotest.(check int) "sig2 emitted second (DER len byte)" 0x45 (Cstruct.get_uint8 ss (sig2_offset + 1));
+       Alcotest.(check int) "first byte sig1" 0x30 sig1_first_byte);
+    (* Producer fields must be cleared post-finalize (W43-1). *)
+    Alcotest.(check int) "partial_sigs cleared" 0 (List.length inp.partial_sigs);
+    Alcotest.(check bool) "redeem_script cleared" true (inp.redeem_script = None)
+
+(* W47-T2: P2SH-P2WSH-multisig finalize must build outer scriptSig =
+   push(redeem_script) and witness = [empty, sig1, sig2, witness_script]
+   in script-pubkey order even with reversed partial_sigs. *)
+let test_w47_p2sh_p2wsh_multisig_finalize_order () =
+  let pk1 = hex_to_cstruct ("02" ^ String.make 64 'a') in
+  let pk2 = hex_to_cstruct ("03" ^ String.make 64 'b') in
+  let sig1 = hex_to_cstruct ("3044" ^ String.make 140 '1' ^ "01") in
+  let sig2 = hex_to_cstruct ("3045" ^ String.make 142 '2' ^ "01") in
+  let witness_script = build_multisig_2of2 pk1 pk2 in
+  let ws_hash = Crypto.sha256 witness_script in
+  (* P2SH outer redeem_script = OP_0 <0x20> <sha256(ws)>. *)
+  let redeem_script = Cstruct.create 34 in
+  Cstruct.set_uint8 redeem_script 0 0x00;
+  Cstruct.set_uint8 redeem_script 1 0x20;
+  Cstruct.blit ws_hash 0 redeem_script 2 32;
+  let psbt = Psbt.create (make_unit_tx ()) in
+  let psbt = Psbt.add_redeem_script psbt 0 redeem_script in
+  let psbt = Psbt.add_witness_script psbt 0 witness_script in
+  let psbt = Psbt.add_partial_sig psbt 0 { pubkey = pk2; signature = sig2 } in
+  let psbt = Psbt.add_partial_sig psbt 0 { pubkey = pk1; signature = sig1 } in
+  match Psbt.finalize_input_p2sh_p2wsh_multisig psbt 0
+          ~redeem_script ~witness_script with
+  | Error e -> Alcotest.fail ("finalize failed: " ^ e)
+  | Ok finalized ->
+    let inp = List.hd finalized.inputs in
+    (* Outer scriptSig = push(redeem_script).  Length-byte = 34 (P2WSH wrap). *)
+    (match inp.final_scriptsig with
+     | None -> Alcotest.fail "no final_scriptsig"
+     | Some ss ->
+       Alcotest.(check int) "scriptSig length" 35 (Cstruct.length ss);
+       Alcotest.(check int) "scriptSig push prefix" 34 (Cstruct.get_uint8 ss 0));
+    (* Witness stack = [empty, sig1, sig2, witness_script]. *)
+    (match inp.final_scriptwitness with
+     | None -> Alcotest.fail "no witness"
+     | Some wit ->
+       Alcotest.(check int) "witness items" 4 (List.length wit);
+       let item0 = List.nth wit 0 in
+       let item1 = List.nth wit 1 in
+       let item2 = List.nth wit 2 in
+       let item3 = List.nth wit 3 in
+       Alcotest.(check int) "OP_0 dummy" 0 (Cstruct.length item0);
+       Alcotest.(check bool) "sig1 first" true (Cstruct.equal item1 sig1);
+       Alcotest.(check bool) "sig2 second" true (Cstruct.equal item2 sig2);
+       Alcotest.(check bool) "witness_script last" true (Cstruct.equal item3 witness_script));
+    Alcotest.(check int) "partial_sigs cleared" 0 (List.length inp.partial_sigs);
+    Alcotest.(check bool) "redeem_script cleared" true (inp.redeem_script = None);
+    Alcotest.(check bool) "witness_script cleared" true (inp.witness_script = None)
+
+(* W47-T3: combine() must be byte-identity-idempotent — combining a PSBT
+   with itself must produce the same bytes.  Pre-W47, bip32_derivations,
+   tap_*, unknown, and global_xpubs all doubled in length on every
+   self-combine, so the serialized bytes diverged.  This caught T2 of
+   tools/psbt-multi-input-test.sh. *)
+let test_w47_combine_idempotent_with_bip32 () =
+  let pk = hex_to_cstruct ("02" ^ String.make 64 'a') in
+  let psbt = Psbt.create (make_unit_tx ()) in
+  let psbt = Psbt.add_input_derivation psbt 0
+               { pubkey = pk;
+                 origin = { fingerprint = 0xdeadbeefl; path = [0l; 0l] } } in
+  match Psbt.combine psbt psbt with
+  | Error e -> Alcotest.fail ("combine failed: " ^ e)
+  | Ok combined ->
+    let inp_orig = List.hd psbt.inputs in
+    let inp_comb = List.hd combined.inputs in
+    Alcotest.(check int) "bip32 derivations not doubled"
+      (List.length inp_orig.bip32_derivations)
+      (List.length inp_comb.bip32_derivations);
+    (* Byte-identity: serialize both and compare.  This is the strict
+       form of the idempotency property. *)
+    let b1 = Psbt.serialize psbt in
+    let b2 = Psbt.serialize combined in
+    Alcotest.(check bool) "byte-identical after self-combine" true
+      (Cstruct.equal b1 b2);
+    (* Triple-combine for sanity: still byte-identical. *)
+    (match Psbt.combine combined psbt with
+     | Error e -> Alcotest.fail ("triple combine failed: " ^ e)
+     | Ok triple ->
+       let b3 = Psbt.serialize triple in
+       Alcotest.(check bool) "byte-identical after triple-combine" true
+         (Cstruct.equal b1 b3))
+
+(* ============================================================================
    QCheck Property Tests
    ============================================================================ *)
 
@@ -1048,6 +1202,14 @@ let () =
       test_case "parallel signing combine" `Quick test_parallel_signing_combine;
       test_case "combine dedup sigs" `Quick test_combine_dedup_sigs;
       test_case "multi input fee" `Quick test_multi_input_fee;
+    ];
+    "w47_multisig_finalize", [
+      test_case "P2SH-multisig finalize emits sigs in script order"
+        `Quick test_w47_p2sh_multisig_finalize_order;
+      test_case "P2SH-P2WSH-multisig finalize emits sigs in script order"
+        `Quick test_w47_p2sh_p2wsh_multisig_finalize_order;
+      test_case "combine idempotent (bip32 dedup)"
+        `Quick test_w47_combine_idempotent_with_bip32;
     ];
     "property", [
       QCheck_alcotest.to_alcotest qcheck_serialize_roundtrip;

@@ -846,6 +846,18 @@ module ChainDB = struct
     queue_op batch (fun b ->
       Cf_chainstate.batch_delete_block_data b hash)
 
+  (* Block nTx index: stores transaction count per block hash.
+     Written for every connected block (including assume-valid IBD) so
+     getblockheader can return a correct nTx without needing the full block
+     body in the block data CF.  The key lives in cfh_chain_state with a
+     "n:" prefix to avoid collisions with the short ASCII chain-state keys
+     ("tip_hash", etc.). *)
+  let store_block_ntx t (hash : Types.hash256) (n : int) =
+    Cf_chainstate.put_block_ntx t.cf hash n
+
+  let get_block_ntx t (hash : Types.hash256) : int option =
+    Cf_chainstate.get_block_ntx t.cf hash
+
   (* Undo data storage - keyed by block hash for chain reorganizations.
      We append a sha256 checksum to the value (matching the legacy
      LogStorage layout) so corruption from a torn write surfaces as a

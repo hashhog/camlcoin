@@ -507,6 +507,7 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       ~cookie_password:(Some cookie_password)
   in
 
+
   (* Optionally start REST server. Defaults OFF to match Bitcoin Core's
      DEFAULT_REST_ENABLE=false (init.cpp:153). When enabled, the public
      read-only REST surface (block / tx / headers / chaininfo / mempool /

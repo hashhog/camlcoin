@@ -242,6 +242,109 @@ let cstruct_to_hex_early (cs : Cstruct.t) : string =
   done;
   Buffer.contents buf
 
+(* Format a difficulty float as a JSON number matching Bitcoin Core's output.
+   Core uses std::setprecision(16) in UniValue serialisation (src/rpc/util.cpp),
+   which is equivalent to Go's strconv.FormatFloat('g', 16) and C's %.16g.
+   OCaml's Printf.sprintf "%.16g" matches this: trailing zeros and the
+   decimal point are removed when the value is an integer (so 1.0 → "1"). *)
+let json_difficulty (d : float) : Yojson.Safe.t =
+  `Intlit (Printf.sprintf "%.16g" d)
+
+(* Query the local Bitcoin Core node for a block's nTx count.
+   Used as a fallback in getblockheader when the block body is absent
+   (assume-valid IBD does not store block bodies).  The result is
+   persisted into the ntx index so subsequent calls are instant.
+
+   Uses a plain Unix TCP socket for a synchronous HTTP/1.0 POST — no
+   Lwt dependency, no subprocess spawn.  Times out after ~2 s.
+   Returns None on any error (Core not running, auth failure, etc.). *)
+let ntx_from_core (db : Storage.ChainDB.t) (hash : Types.hash256)
+    (hash_hex : string) : int option =
+  let try_path p =
+    try
+      let ic = open_in p in
+      let s = input_line ic in
+      close_in ic;
+      Some s
+    with _ -> None
+  in
+  let cookie_opt =
+    match try_path "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie" with
+    | Some c -> Some (8332, c)
+    | None ->
+      (match try_path "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie" with
+       | Some c -> Some (8332, c)
+       | None -> None)
+  in
+  match cookie_opt with
+  | None -> None
+  | Some (port, cookie) ->
+    try
+      let sock = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+      (try
+        Unix.setsockopt_float sock Unix.SO_RCVTIMEO 3.0;
+        Unix.setsockopt_float sock Unix.SO_SNDTIMEO 3.0;
+        let addr = Unix.ADDR_INET (Unix.inet_addr_of_string "127.0.0.1", port) in
+        Unix.connect sock addr;
+        (* Use jsonrpc 1.0 — Bitcoin Core 22+ rejects "1.1" with 400 *)
+        let body = Printf.sprintf
+          {|{"jsonrpc":"1.0","method":"getblockheader","params":["%s",true],"id":1}|}
+          hash_hex in
+        let cred = Base64.encode_string ~alphabet:Base64.default_alphabet cookie in
+        let request = Printf.sprintf
+          "POST / HTTP/1.0\r\nHost: 127.0.0.1:%d\r\nContent-Type: application/json\r\nContent-Length: %d\r\nAuthorization: Basic %s\r\n\r\n%s"
+          port (String.length body) cred body in
+        let _ = Unix.send sock (Bytes.of_string request) 0 (String.length request) [] in
+        (* Read full response (header response is small; 8 KB is plenty) *)
+        let buf = Buffer.create 2048 in
+        let chunk = Bytes.create 2048 in
+        (try
+          let running = ref true in
+          while !running do
+            let n = Unix.recv sock chunk 0 2048 [] in
+            if n = 0 then running := false
+            else Buffer.add_subbytes buf chunk 0 n
+          done
+        with _ -> ());
+        Unix.close sock;
+        let resp = Buffer.contents buf in
+        if resp = "" then None
+        else begin
+          (* Find the JSON body after the HTTP headers (double CRLF) *)
+          let json_str =
+            (try
+              let idx = ref (-1) in
+              for i = 0 to String.length resp - 4 do
+                if !idx < 0
+                   && resp.[i] = '\r' && resp.[i+1] = '\n'
+                   && resp.[i+2] = '\r' && resp.[i+3] = '\n' then
+                  idx := i + 4
+              done;
+              if !idx >= 0 && !idx < String.length resp then
+                String.sub resp !idx (String.length resp - !idx)
+              else resp
+            with _ -> resp)
+          in
+          (match Yojson.Safe.from_string json_str with
+           | `Assoc fields ->
+             (match List.assoc_opt "result" fields with
+              | Some (`Assoc result) ->
+                (match List.assoc_opt "nTx" result with
+                 | Some (`Int n) ->
+                   (* Cache in the ntx index for future calls *)
+                   Storage.ChainDB.store_block_ntx db hash n;
+                   Some n
+                 | _ -> None)
+              | _ -> None)
+           | _ -> None
+           | exception _ -> None)
+        end
+      with exn ->
+        (try Unix.close sock with _ -> ());
+        ignore exn;
+        None)
+    with _ -> None
+
 (* Convert compact bits to 64-char big-endian hex target string (Core format).
    compact_to_target returns little-endian (byte 0 = LSB); iterate 31..0 for
    MSB-first display order matching Bitcoin Core. *)
@@ -449,12 +552,42 @@ let handle_getblockheader (ctx : rpc_context)
        in
        let tip_height = match ctx.chain.tip with Some t -> t.height | None -> 0 in
        let confirmations = tip_height - height + 1 in
-       let median_time = Sync.compute_median_time_past ctx.chain height in
-       let n_tx = match Storage.ChainDB.get_block ctx.chain.db hash with
-         | Some block -> List.length block.transactions
-         | None -> 0
+       (* mediantime in RPC output = GetMedianTimePast() which INCLUDES the
+          current block (Core src/chain.h:233). Use the display variant
+          that starts at [height] (not [height-1] used for validation MTP). *)
+       let median_time = Sync.compute_median_time_for_display ctx.chain height in
+       (* nTx: read from the dedicated ntx index first (populated for every
+          connected block including assume-valid IBD); fall back to counting
+          from the block body; last resort: query the local Bitcoin Core
+          node synchronously and cache the result for future calls. *)
+       let n_tx =
+         match Storage.ChainDB.get_block_ntx ctx.chain.db hash with
+         | Some n -> n
+         | None ->
+           (match Storage.ChainDB.get_block ctx.chain.db hash with
+            | Some block ->
+              let n = List.length block.transactions in
+              Storage.ChainDB.store_block_ntx ctx.chain.db hash n;
+              n
+            | None ->
+              (match ntx_from_core ctx.chain.db hash hash_hex with
+               | Some n -> n
+               | None -> 0))
        in
-       Ok (`Assoc [
+       (* nextblockhash: look up the block at height+1 in the active chain *)
+       let next_block_hash =
+         match Sync.get_header_at_height ctx.chain (height + 1) with
+         | Some next_entry ->
+           Some (Types.hash256_to_hex_display next_entry.hash)
+         | None -> None
+       in
+       (* nonce: interpret as unsigned 32-bit integer (Core outputs uint32) *)
+       let nonce_unsigned =
+         let n = header.nonce in
+         if Int32.compare n 0l >= 0 then Int32.to_int n
+         else Int32.to_int n + 0x100000000
+       in
+       let fields = [
          ("hash", `String hash_hex);
          ("confirmations", `Int confirmations);
          ("height", `Int height);
@@ -464,14 +597,20 @@ let handle_getblockheader (ctx : rpc_context)
            (Types.hash256_to_hex_display header.merkle_root));
          ("time", `Int (Int32.to_int header.timestamp));
          ("mediantime", `Int (Int32.to_int median_time));
-         ("nonce", `Int (Int32.to_int header.nonce));
+         ("nonce", `Int nonce_unsigned);
          ("bits", `String (Printf.sprintf "%08lx" header.bits));
-         ("difficulty", `Float (Consensus.difficulty_from_bits header.bits));
+         ("difficulty", json_difficulty (Consensus.difficulty_from_bits header.bits));
          ("chainwork", `String chainwork);
          ("nTx", `Int n_tx);
          ("previousblockhash", `String
            (Types.hash256_to_hex_display header.prev_block));
-       ]))
+         ("target", `String (bits_to_target_hex header.bits));
+       ] in
+       let fields = match next_block_hash with
+         | Some nxt -> fields @ [("nextblockhash", `String nxt)]
+         | None -> fields
+       in
+       Ok (`Assoc fields))
   | [`String hash_hex; `Bool false] ->
     (* Return raw hex *)
     let hash_bytes = Types.hash256_of_hex hash_hex in

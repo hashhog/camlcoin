@@ -538,6 +538,43 @@ let is_p2a (script : Cstruct.t) : bool =
   Cstruct.get_uint8 script 2 = 0x4e &&
   Cstruct.get_uint8 script 3 = 0x73
 
+(* Check if a script contains only push operations (raw-byte scan).
+   Mirrors Bitcoin Core CScript::IsPushOnly(const_iterator pc) (script.cpp:265).
+   Any opcode > OP_16 (0x60), or a push whose data runs past end-of-script,
+   causes the function to return false.  An empty script returns true.
+   Placed here because classify_script needs it for the OP_RETURN branch. *)
+let is_push_only_raw (script : Cstruct.t) : bool =
+  let len = Cstruct.length script in
+  let rec check pos =
+    if pos >= len then true
+    else
+      let op = Cstruct.get_uint8 script pos in
+      if op > 0x60 (* OP_16 *) then
+        false
+      else begin
+        let next_pos =
+          if op = 0x00 then pos + 1
+          else if op >= 0x01 && op <= 0x4b then pos + 1 + op
+          else if op = 0x4c then begin
+            if pos + 1 >= len then len + 1
+            else pos + 2 + Cstruct.get_uint8 script (pos + 1)
+          end
+          else if op = 0x4d then begin
+            if pos + 2 >= len then len + 1
+            else pos + 3 + Cstruct.LE.get_uint16 script (pos + 1)
+          end
+          else if op = 0x4e then begin
+            if pos + 4 >= len then len + 1
+            else pos + 5 + Int32.to_int (Cstruct.LE.get_uint32 script (pos + 1))
+          end
+          else pos + 1
+        in
+        if next_pos > len then false
+        else check next_pos
+      end
+  in
+  check 0
+
 let classify_script (script : Cstruct.t) : script_template =
   let len = Cstruct.length script in
   (* P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG *)
@@ -578,8 +615,11 @@ let classify_script (script : Cstruct.t) : script_template =
   (* 51 02 4e 73 = 4 bytes *)
   else if is_p2a script
   then P2A_script
-  (* OP_RETURN: starts with 0x6a *)
+  (* OP_RETURN: starts with 0x6a, followed by valid push opcodes only.
+     Bitcoin Core (solver.cpp:185): scriptPubKey.IsPushOnly(begin()+1) must hold.
+     A truncated push (e.g. 6a09deadbeef — push-9 with only 3 bytes) is Nonstandard. *)
   else if len >= 1 && Cstruct.get_uint8 script 0 = 0x6a
+       && is_push_only_raw (Cstruct.sub script 1 (len - 1))
   then OP_RETURN_data (Cstruct.sub script 1 (len - 1))
   else Nonstandard
 
@@ -1123,52 +1163,11 @@ let is_push_opcode = function
   | OP_9 | OP_10 | OP_11 | OP_12 | OP_13 | OP_14 | OP_15 | OP_16 -> true
   | _ -> false
 
-(* Check if a script contains only push operations (for P2SH scriptSig).
-   This operates on raw bytes per Bitcoin Core's IsPushOnly().
-   Push opcodes are: 0x00-0x60 (OP_0 through OP_16, including all PUSHDATA variants).
-   OP_RESERVED (0x50) counts as a "push" for this purpose, though it will
-   fail during execution anyway. *)
+(* Check if a script contains only push operations (for P2SH scriptSig / mempool policy).
+   Delegates to is_push_only_raw which is defined near classify_script so that
+   the OP_RETURN classification branch can also call it. *)
 let is_push_only (script : Cstruct.t) : bool =
-  let len = Cstruct.length script in
-  let rec check pos =
-    if pos >= len then true
-    else
-      let op = Cstruct.get_uint8 script pos in
-      if op > 0x60 (* OP_16 *) then
-        false
-      else begin
-        (* Advance past this opcode and any associated data *)
-        let next_pos =
-          if op = 0x00 then pos + 1                    (* OP_0 *)
-          else if op >= 0x01 && op <= 0x4b then        (* Direct push N bytes *)
-            pos + 1 + op
-          else if op = 0x4c then begin                 (* OP_PUSHDATA1 *)
-            if pos + 1 >= len then len + 1             (* truncated = invalid *)
-            else
-              let data_len = Cstruct.get_uint8 script (pos + 1) in
-              pos + 2 + data_len
-          end
-          else if op = 0x4d then begin                 (* OP_PUSHDATA2 *)
-            if pos + 2 >= len then len + 1
-            else
-              let data_len = Cstruct.LE.get_uint16 script (pos + 1) in
-              pos + 3 + data_len
-          end
-          else if op = 0x4e then begin                 (* OP_PUSHDATA4 *)
-            if pos + 4 >= len then len + 1
-            else
-              let data_len = Int32.to_int (Cstruct.LE.get_uint32 script (pos + 1)) in
-              pos + 5 + data_len
-          end
-          else pos + 1                                 (* OP_1NEGATE through OP_16 *)
-        in
-        if next_pos > len then
-          false  (* Truncated push data - script is malformed, but still "push-only" pattern *)
-        else
-          check next_pos
-      end
-  in
-  check 0
+  is_push_only_raw script
 
 (* Execute a single opcode *)
 let rec exec_opcode (st : eval_state) (op : opcode) (script_code : Cstruct.t)

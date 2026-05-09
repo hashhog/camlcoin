@@ -1748,6 +1748,75 @@ let test_p2a_spending_size () =
   Alcotest.(check bool) "P2A spending size < 100" true (size < 100)
 
 (* ============================================================================
+   W58-6 OP_RETURN IsStandard regression tests
+   ============================================================================ *)
+
+(* Helper: build a Cstruct.t from a hex string *)
+let hex_to_cstruct hex =
+  let n = String.length hex / 2 in
+  let cs = Cstruct.create n in
+  for i = 0 to n - 1 do
+    let byte = int_of_string ("0x" ^ String.sub hex (i * 2) 2) in
+    Cstruct.set_uint8 cs i byte
+  done;
+  cs
+
+(* Helper: build a tx_out with a given raw script_pubkey *)
+let make_output_with_script script_pubkey value =
+  Types.{ value; script_pubkey }
+
+(* Test: truncated OP_RETURN push is rejected by is_standard_output.
+   6a09deadbeef: OP_RETURN + push-9-bytes opcode but only 3 data bytes follow.
+   Bitcoin Core IsPushOnly() returns false for truncated pushes => Nonstandard. *)
+let test_is_standard_output_op_return_truncated () =
+  let bad_script = hex_to_cstruct "6a09deadbeef" in
+  Alcotest.(check bool)
+    "truncated OP_RETURN push is NOT standard"
+    false
+    (Mempool.is_standard_output bad_script)
+
+(* Test: well-formed OP_RETURN (6a04deadbeef) is standard and not dust *)
+let test_is_standard_output_op_return_valid () =
+  let good_script = hex_to_cstruct "6a04deadbeef" in
+  Alcotest.(check bool)
+    "valid OP_RETURN (6a04deadbeef) is standard"
+    true
+    (Mempool.is_standard_output good_script);
+  (* OP_RETURN outputs are exempt from dust *)
+  let out = make_output_with_script good_script 0L in
+  Alcotest.(check bool)
+    "valid OP_RETURN output is not dust"
+    false
+    (Mempool.is_dust 1000L out)
+
+(* Test: mempool rejects a tx whose vout contains a truncated OP_RETURN script.
+   This confirms PATH B: is_standard_tx iterates outputs and calls is_standard_output
+   which in turn calls classify_script — the W56-fixed path. *)
+let test_is_standard_tx_rejects_truncated_op_return () =
+  let tx = make_regular_tx
+    [make_test_input Types.zero_hash 0l]
+    [make_output_with_script (hex_to_cstruct "6a09deadbeef") 0L]
+  in
+  let result = Mempool.is_standard_tx 1000L tx in
+  Alcotest.(check bool)
+    "tx with truncated OP_RETURN vout is non-standard"
+    true
+    (Result.is_error result)
+
+(* Test: mempool accepts a tx whose vout contains a valid OP_RETURN.
+   6a04deadbeef is OP_RETURN PUSH_4 <deadbeef> — well-formed null_data. *)
+let test_is_standard_tx_accepts_valid_op_return () =
+  let tx = make_regular_tx
+    [make_test_input Types.zero_hash 0l]
+    [make_output_with_script (hex_to_cstruct "6a04deadbeef") 0L]
+  in
+  let result = Mempool.is_standard_tx 1000L tx in
+  Alcotest.(check bool)
+    "tx with valid OP_RETURN vout is standard"
+    true
+    (Result.is_ok result)
+
+(* ============================================================================
    Ephemeral Anchor Tests
    ============================================================================ *)
 
@@ -2161,6 +2230,12 @@ let () =
       test_case "P2A correct dust value" `Quick test_p2a_dust_correct_value;
       test_case "P2A wrong dust value" `Quick test_p2a_dust_wrong_value;
       test_case "P2A spending size" `Quick test_p2a_spending_size;
+    ];
+    "op_return_policy", [
+      test_case "truncated OP_RETURN push is nonstandard" `Quick test_is_standard_output_op_return_truncated;
+      test_case "valid OP_RETURN is standard and not dust" `Quick test_is_standard_output_op_return_valid;
+      test_case "tx with truncated OP_RETURN vout rejected" `Quick test_is_standard_tx_rejects_truncated_op_return;
+      test_case "tx with valid OP_RETURN vout accepted" `Quick test_is_standard_tx_accepts_valid_op_return;
     ];
     "persistence_core_format", [
       test_case "save/load roundtrip" `Quick test_save_load_roundtrip;

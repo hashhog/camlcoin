@@ -174,6 +174,32 @@ let test_classify_op_return () =
   | Script.OP_RETURN_data _ -> ()
   | _ -> Alcotest.fail "Expected OP_RETURN_data"
 
+(* W58-6 regression: truncated OP_RETURN push must be Nonstandard.
+   6a09deadbeef = OP_RETURN PUSH_9 <3 bytes> — push claims 9 bytes but only 3 follow.
+   Bitcoin Core solver.cpp:185 requires IsPushOnly() on the remainder; a truncated
+   push fails IsPushOnly() => TxoutType::NONSTANDARD.
+   6a04deadbeef = OP_RETURN PUSH_4 <4 bytes> — well-formed, must be OP_RETURN_data. *)
+let test_classify_op_return_truncated_push () =
+  (* Truncated: push opcode 0x09 but only 3 data bytes follow => Nonstandard *)
+  let bad = hex_to_cstruct "6a09deadbeef" in
+  (match Script.classify_script bad with
+  | Script.Nonstandard -> ()
+  | Script.OP_RETURN_data _ ->
+    Alcotest.fail "truncated OP_RETURN push must be Nonstandard, got OP_RETURN_data"
+  | _ -> Alcotest.fail "truncated OP_RETURN push must be Nonstandard");
+  (* Well-formed: push opcode 0x04 with exactly 4 data bytes => OP_RETURN_data *)
+  let good = hex_to_cstruct "6a04deadbeef" in
+  (match Script.classify_script good with
+  | Script.OP_RETURN_data _ -> ()
+  | Script.Nonstandard ->
+    Alcotest.fail "valid OP_RETURN (6a04deadbeef) must be OP_RETURN_data, got Nonstandard"
+  | _ -> Alcotest.fail "valid OP_RETURN (6a04deadbeef) expected OP_RETURN_data");
+  (* Bare OP_RETURN (no data) => OP_RETURN_data (empty payload, Core-compatible) *)
+  let bare = hex_to_cstruct "6a" in
+  (match Script.classify_script bare with
+  | Script.OP_RETURN_data _ -> ()
+  | _ -> Alcotest.fail "bare OP_RETURN must be OP_RETURN_data")
+
 (* P2A (Pay-to-Anchor) script: OP_1 OP_PUSHBYTES_2 0x4e73 *)
 let test_classify_p2a () =
   let p2a_script = hex_to_cstruct "51024e73" in
@@ -614,6 +640,7 @@ let classification_tests = [
   Alcotest.test_case "classify P2TR" `Quick test_classify_p2tr;
   Alcotest.test_case "classify P2A" `Quick test_classify_p2a;
   Alcotest.test_case "classify OP_RETURN" `Quick test_classify_op_return;
+  Alcotest.test_case "classify OP_RETURN truncated push is nonstandard" `Quick test_classify_op_return_truncated_push;
 ]
 
 let p2a_tests = [

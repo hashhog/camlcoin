@@ -3393,6 +3393,162 @@ let script_to_asm (script : Cstruct.t) : string =
   ) ops in
   String.concat " " tokens
 
+(* A variant of script_to_asm that matches Core's ScriptToAsmStr behavior on
+   malformed scripts: processes opcodes byte-by-byte at the raw level and emits
+   "[error]" for any truncated push, then stops.  The regular script_to_asm
+   uses parse_script which throws an exception on truncated pushes, producing
+   an empty string — wrong for decodescript where Core emits partial ASM.
+
+   Reference: bitcoin-core/src/core_io.cpp ScriptToAsmStr line ~360. *)
+let script_to_asm_tolerant (script : Cstruct.t) : string =
+  (* CScriptNum decode: signed little-endian, sign bit in MSB of last byte *)
+  let decode_scriptnum (data : Cstruct.t) (len : int) : string =
+    if len = 0 then "0"
+    else begin
+      let result = ref 0L in
+      for i = 0 to len - 1 do
+        result := Int64.logor !result
+          (Int64.shift_left (Int64.of_int (Cstruct.get_uint8 data i)) (8 * i))
+      done;
+      let last = Cstruct.get_uint8 data (len - 1) in
+      if last land 0x80 <> 0 then begin
+        let sign_pos = 8 * (len - 1) + 7 in
+        result := Int64.logand !result
+          (Int64.lognot (Int64.shift_left 1L sign_pos));
+        result := Int64.neg !result
+      end;
+      Int64.to_string !result
+    end
+  in
+  let len = Cstruct.length script in
+  let buf = Buffer.create 64 in
+  let first = ref true in
+  let add_token tok =
+    if !first then first := false else Buffer.add_char buf ' ';
+    Buffer.add_string buf tok
+  in
+  let add_data_token (data : Cstruct.t) =
+    let dlen = Cstruct.length data in
+    if dlen <= 4 then add_token (decode_scriptnum data dlen)
+    else add_token (cstruct_to_hex data)
+  in
+  let pos = ref 0 in
+  let stop = ref false in
+  while !pos < len && not !stop do
+    let byte = Cstruct.get_uint8 script !pos in
+    pos := !pos + 1;
+    (* Direct push N bytes (0x01..0x4b) *)
+    if byte >= 0x01 && byte <= 0x4b then begin
+      let n = byte in
+      if !pos + n > len then begin
+        add_token "[error]";
+        stop := true
+      end else begin
+        add_data_token (Cstruct.sub script !pos n);
+        pos := !pos + n
+      end
+    end
+    (* OP_PUSHDATA1 *)
+    else if byte = 0x4c then begin
+      if !pos >= len then begin add_token "[error]"; stop := true end
+      else begin
+        let n = Cstruct.get_uint8 script !pos in
+        pos := !pos + 1;
+        if !pos + n > len then begin add_token "[error]"; stop := true end
+        else begin
+          add_data_token (Cstruct.sub script !pos n);
+          pos := !pos + n
+        end
+      end
+    end
+    (* OP_PUSHDATA2 *)
+    else if byte = 0x4d then begin
+      if !pos + 1 >= len then begin add_token "[error]"; stop := true end
+      else begin
+        let n = Cstruct.get_uint8 script !pos lor
+                (Cstruct.get_uint8 script (!pos + 1) lsl 8) in
+        pos := !pos + 2;
+        if !pos + n > len then begin add_token "[error]"; stop := true end
+        else begin
+          add_data_token (Cstruct.sub script !pos n);
+          pos := !pos + n
+        end
+      end
+    end
+    (* OP_PUSHDATA4 *)
+    else if byte = 0x4e then begin
+      if !pos + 3 >= len then begin add_token "[error]"; stop := true end
+      else begin
+        let n = Cstruct.get_uint8 script !pos lor
+                (Cstruct.get_uint8 script (!pos + 1) lsl 8) lor
+                (Cstruct.get_uint8 script (!pos + 2) lsl 16) lor
+                (Cstruct.get_uint8 script (!pos + 3) lsl 24) in
+        pos := !pos + 4;
+        if !pos + n > len then begin add_token "[error]"; stop := true end
+        else begin
+          add_data_token (Cstruct.sub script !pos n);
+          pos := !pos + n
+        end
+      end
+    end
+    else begin
+      (* Non-push opcodes: emit via the regular opcode name table *)
+      let op_name = match byte with
+        | 0x00 -> "0"
+        | 0x4f -> "-1"         (* OP_1NEGATE *)
+        | 0x51 -> "1"          (* OP_1 *)
+        | 0x52 -> "2"  | 0x53 -> "3"  | 0x54 -> "4"
+        | 0x55 -> "5"  | 0x56 -> "6"  | 0x57 -> "7"
+        | 0x58 -> "8"  | 0x59 -> "9"  | 0x5a -> "10"
+        | 0x5b -> "11" | 0x5c -> "12" | 0x5d -> "13"
+        | 0x5e -> "14" | 0x5f -> "15" | 0x60 -> "16"
+        | 0x61 -> "OP_NOP"
+        | 0x62 -> "OP_VER"
+        | 0x63 -> "OP_IF"      | 0x64 -> "OP_NOTIF"
+        | 0x65 -> "OP_VERIF"   | 0x66 -> "OP_VERNOTIF"
+        | 0x67 -> "OP_ELSE"    | 0x68 -> "OP_ENDIF"
+        | 0x69 -> "OP_VERIFY"  | 0x6a -> "OP_RETURN"
+        | 0x6b -> "OP_TOALTSTACK" | 0x6c -> "OP_FROMALTSTACK"
+        | 0x6d -> "OP_2DROP"   | 0x6e -> "OP_2DUP"   | 0x6f -> "OP_3DUP"
+        | 0x70 -> "OP_2OVER"   | 0x71 -> "OP_2ROT"   | 0x72 -> "OP_2SWAP"
+        | 0x73 -> "OP_IFDUP"   | 0x74 -> "OP_DEPTH"
+        | 0x75 -> "OP_DROP"    | 0x76 -> "OP_DUP"
+        | 0x77 -> "OP_NIP"     | 0x78 -> "OP_OVER"
+        | 0x79 -> "OP_PICK"    | 0x7a -> "OP_ROLL"
+        | 0x7b -> "OP_ROT"     | 0x7c -> "OP_SWAP"   | 0x7d -> "OP_TUCK"
+        | 0x82 -> "OP_SIZE"
+        | 0x87 -> "OP_EQUAL"   | 0x88 -> "OP_EQUALVERIFY"
+        | 0x89 -> "OP_RESERVED1" | 0x8a -> "OP_RESERVED2"
+        | 0x8b -> "OP_1ADD"    | 0x8c -> "OP_1SUB"
+        | 0x8f -> "OP_NEGATE"  | 0x90 -> "OP_ABS"
+        | 0x91 -> "OP_NOT"     | 0x92 -> "OP_0NOTEQUAL"
+        | 0x93 -> "OP_ADD"     | 0x94 -> "OP_SUB"
+        | 0x9a -> "OP_BOOLAND" | 0x9b -> "OP_BOOLOR"
+        | 0x9c -> "OP_NUMEQUAL" | 0x9d -> "OP_NUMEQUALVERIFY"
+        | 0x9e -> "OP_NUMNOTEQUAL"
+        | 0x9f -> "OP_LESSTHAN" | 0xa0 -> "OP_GREATERTHAN"
+        | 0xa1 -> "OP_LESSTHANOREQUAL" | 0xa2 -> "OP_GREATERTHANOREQUAL"
+        | 0xa3 -> "OP_MIN"     | 0xa4 -> "OP_MAX"    | 0xa5 -> "OP_WITHIN"
+        | 0xa6 -> "OP_RIPEMD160" | 0xa7 -> "OP_SHA1"
+        | 0xa8 -> "OP_SHA256"  | 0xa9 -> "OP_HASH160" | 0xaa -> "OP_HASH256"
+        | 0xab -> "OP_CODESEPARATOR"
+        | 0xac -> "OP_CHECKSIG" | 0xad -> "OP_CHECKSIGVERIFY"
+        | 0xae -> "OP_CHECKMULTISIG" | 0xaf -> "OP_CHECKMULTISIGVERIFY"
+        | 0xb0 -> "OP_NOP1"
+        | 0xb1 -> "OP_CHECKLOCKTIMEVERIFY"
+        | 0xb2 -> "OP_CHECKSEQUENCEVERIFY"
+        | 0xb3 -> "OP_NOP4" | 0xb4 -> "OP_NOP5"
+        | 0xb5 -> "OP_NOP6" | 0xb6 -> "OP_NOP7"
+        | 0xb7 -> "OP_NOP8" | 0xb8 -> "OP_NOP9" | 0xb9 -> "OP_NOP10"
+        | 0xba -> "OP_CHECKSIGADD"
+        | 0x50 -> "OP_RESERVED"
+        | _    -> "OP_INVALIDOPCODE"
+      in
+      add_token op_name
+    end
+  done;
+  Buffer.contents buf
+
 (* Format a 4-byte BIP-32 key fingerprint for JSON output.
    PSBT stores the fingerprint as 4 raw bytes.  parse_key_origin reads them
    with read_int32_le so the stored int32 has the bytes in LE order: byte 0
@@ -3751,6 +3907,216 @@ let handle_decoderawtransaction (ctx : rpc_context)
       Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn)))
   | _ ->
     Error "Invalid parameters: expected [hexstring]"
+
+(* decodescript "hexstring"
+   Decode a hex-encoded script and return its components.
+   Reference: bitcoin-core/src/rpc/rawtransaction.cpp `decodescript` handler.
+
+   Shape: {asm, desc, type, address?, p2sh?, segwit?}
+   CRITICAL: top-level has NO hex field (ScriptToUniv called with include_hex=false).
+   Inner segwit object HAS hex (include_hex=true).
+
+   can_wrap types: pubkey, pubkeyhash, multisig, nonstandard,
+     witness_v0_keyhash, witness_v0_scripthash.
+   Extra gates: script must not be unspendable (OP_RETURN prefix) and must not
+     contain OP_CHECKSIGADD (0xba).
+   can_wrap_P2WSH types (subset): pubkey (compressed only), pubkeyhash,
+     nonstandard, multisig (compressed only). NOT already-segwit types.
+   Segwit wrap:
+     PUBKEY/PUBKEYHASH → P2WPKH(Hash160(pubkey or embedded hash))
+     others → P2WSH(SHA256(script))
+
+   Nulldata fix: classify_script maps any 0x6a-prefixed script to OP_RETURN_data.
+   Core's Solver() additionally requires IsPushOnly on the remainder. A script
+   starting with OP_RETURN but with a truncated push at the end is "nonstandard",
+   not "nulldata". We apply this check in the decodescript handler. *)
+
+(* Check if a script contains OP_CHECKSIGADD (0xba). *)
+let script_has_checksigadd (script : Cstruct.t) : bool =
+  let len = Cstruct.length script in
+  let rec loop i =
+    if i >= len then false
+    else if Cstruct.get_uint8 script i = 0xba then true
+    else loop (i + 1)
+  in
+  loop 0
+
+(* Classify a script for decodescript purposes, applying Core's nulldata check.
+   This mirrors Script.classify_script but fixes OP_RETURN_data: a script
+   starting with OP_RETURN whose tail bytes are NOT push-only is "nonstandard". *)
+let decodescript_classify (script : Cstruct.t) : Script.script_template =
+  match Script.classify_script script with
+  | Script.OP_RETURN_data tail ->
+    (* Core's Solver requires IsPushOnly on the bytes after OP_RETURN.
+       is_push_only returns false if any push is truncated. *)
+    if Script.is_push_only tail then
+      Script.OP_RETURN_data tail
+    else
+      Script.Nonstandard
+  | other -> other
+
+(* Build a P2SH wrap address from a redeem script. *)
+let p2sh_wrap_address (script : Cstruct.t) (network : Address.network) : string =
+  let h = Crypto.hash160 script in
+  Address.address_to_string { addr_type = P2SH; hash = h; network }
+
+(* Build a P2WPKH script (OP_0 <20-byte-hash>) as Cstruct. *)
+let build_p2wpkh_script (hash20 : Cstruct.t) : Cstruct.t =
+  let buf = Cstruct.create 22 in
+  Cstruct.set_uint8 buf 0 0x00;  (* OP_0 *)
+  Cstruct.set_uint8 buf 1 0x14;  (* push 20 bytes *)
+  Cstruct.blit hash20 0 buf 2 20;
+  buf
+
+(* Build a P2WSH script (OP_0 <32-byte-SHA256(script)>) as Cstruct. *)
+let build_p2wsh_script (script : Cstruct.t) : Cstruct.t =
+  let h = Crypto.sha256 script in
+  let buf = Cstruct.create 34 in
+  Cstruct.set_uint8 buf 0 0x00;  (* OP_0 *)
+  Cstruct.set_uint8 buf 1 0x20;  (* push 32 bytes *)
+  Cstruct.blit h 0 buf 2 32;
+  buf
+
+(* Extract the raw pubkey from a P2PK script: <pushLen> <pubkey> OP_CHECKSIG.
+   Returns the pubkey bytes or empty Cstruct if not a valid P2PK. *)
+let extract_p2pk_pubkey (script : Cstruct.t) : Cstruct.t option =
+  let len = Cstruct.length script in
+  if len < 35 then None
+  else
+    let push_len = Cstruct.get_uint8 script 0 in
+    if (push_len = 33 || push_len = 65)
+       && len = push_len + 2
+       && Cstruct.get_uint8 script (push_len + 1) = 0xac  (* OP_CHECKSIG *)
+    then Some (Cstruct.sub script 1 push_len)
+    else None
+
+(* Check if a pubkey is compressed (33 bytes, prefix 0x02 or 0x03). *)
+let is_compressed_pubkey_bytes (pk : Cstruct.t) : bool =
+  Cstruct.length pk = 33 &&
+  (Cstruct.get_uint8 pk 0 = 0x02 || Cstruct.get_uint8 pk 0 = 0x03)
+
+(* Extract all pubkeys from a multisig script and check if all are compressed.
+   Multisig: OP_M <pubkeys...> OP_N OP_CHECKMULTISIG (0xae at end).
+   Returns Some true if all compressed, Some false if any uncompressed, None if parse fails. *)
+let multisig_all_compressed (script : Cstruct.t) : bool option =
+  let len = Cstruct.length script in
+  if len < 4 || Cstruct.get_uint8 script (len - 1) <> 0xae then None
+  else begin
+    (* skip OP_M at index 0, parse pubkeys until we hit OP_N *)
+    let rec loop i all_compressed =
+      if i >= len - 2 then Some all_compressed  (* end of pubkeys *)
+      else
+        let op = Cstruct.get_uint8 script i in
+        if op = 0 then None  (* unexpected OP_0 *)
+        else if op >= 0x01 && op <= 0x4b then begin
+          (* direct push: op bytes of data *)
+          if i + 1 + op > len then None
+          else
+            let pk = Cstruct.sub script (i + 1) op in
+            loop (i + 1 + op) (all_compressed && is_compressed_pubkey_bytes pk)
+        end
+        else
+          (* hit OP_N or something else — stop *)
+          Some all_compressed
+    in
+    loop 1 true
+  end
+
+let handle_decodescript (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  let network = network_to_address_network ctx.network in
+  let hex_str = match params with
+    | [`String s] -> s
+    | (`String s) :: _ -> s
+    | _ -> ""
+  in
+  let script_result =
+    if hex_str = "" then Ok (Cstruct.create 0)
+    else
+      (try Ok (Cstruct.of_hex hex_str)
+       with _ -> Error "script decode failed: invalid hex")
+  in
+  match script_result with
+  | Error e -> Error e
+  | Ok script ->
+  (* Classify with nulldata-IsPushOnly fix *)
+  let template = decodescript_classify script in
+  let type_name = script_type_name template in
+  (* Build top-level: {asm, desc, type, address?} — NO hex field.
+     Use script_to_asm_tolerant (not script_to_asm) so truncated pushes emit
+     "[error]" matching Core's ScriptToAsmStr output. *)
+  let addr_opt = script_to_address script network in
+  let top_fields = ref [
+    ("asm",  `String (script_to_asm_tolerant script));
+    ("desc", `String (infer_descriptor script network));
+    ("type", `String type_name);
+  ] in
+  (match addr_opt with
+   | Some addr -> top_fields := !top_fields @ [("address", `String addr)]
+   | None -> ());
+  (* Determine can_wrap per Core's rawtransaction.cpp decodescript:
+       types: pubkey/pubkeyhash/multisig/nonstandard/witness_v0_keyhash/witness_v0_scripthash
+       gates: not unspendable (OP_RETURN prefix), no OP_CHECKSIGADD, HasValidOps. *)
+  let can_wrap =
+    let is_unspendable = Cstruct.length script > 0 && Cstruct.get_uint8 script 0 = 0x6a in
+    let has_csadd = script_has_checksigadd script in
+    (not is_unspendable) && (not has_csadd) &&
+    (match type_name with
+     | "pubkey" | "pubkeyhash" | "multisig" | "nonstandard"
+     | "witness_v0_keyhash" | "witness_v0_scripthash" -> true
+     | _ -> false)
+  in
+  if can_wrap then begin
+    top_fields := !top_fields @ [("p2sh", `String (p2sh_wrap_address script network))];
+    (* Determine can_wrap_P2WSH:
+         pubkey (compressed only), pubkeyhash, nonstandard → true
+         multisig (all compressed only) → true
+         witness_v0_keyhash, witness_v0_scripthash → false (already segwit) *)
+    let can_wrap_p2wsh =
+      match type_name with
+      | "pubkeyhash" | "nonstandard" -> true
+      | "pubkey" ->
+        (match extract_p2pk_pubkey script with
+         | Some pk -> is_compressed_pubkey_bytes pk
+         | None -> false)
+      | "multisig" ->
+        (match multisig_all_compressed script with
+         | Some b -> b
+         | None -> false)
+      | _ -> false  (* witness_v0_keyhash, witness_v0_scripthash → no *)
+    in
+    if can_wrap_p2wsh then begin
+      (* Build segwit script:
+           PUBKEY/PUBKEYHASH → P2WPKH from Hash160(pubkey or embedded hash)
+           Others → P2WSH from SHA256(script) *)
+      let segwit_script =
+        match type_name with
+        | "pubkey" ->
+          let pk = (match extract_p2pk_pubkey script with Some pk -> pk | None -> Cstruct.create 0) in
+          build_p2wpkh_script (Crypto.hash160 pk)
+        | "pubkeyhash" ->
+          (* P2PKH script: 76 a9 14 <20-byte-hash> 88 ac — hash is at bytes [3..22] *)
+          build_p2wpkh_script (Cstruct.sub script 3 20)
+        | _ ->
+          build_p2wsh_script script
+      in
+      let segwit_type = script_type_name (Script.classify_script segwit_script) in
+      let segwit_addr_opt = script_to_address segwit_script network in
+      let segwit_p2sh = p2sh_wrap_address segwit_script network in
+      let sw_fields = ref [
+        ("asm",  `String (script_to_asm segwit_script));
+        ("desc", `String (infer_descriptor segwit_script network));
+        ("hex",  `String (cstruct_to_hex segwit_script));
+        ("type", `String segwit_type);
+      ] in
+      (match segwit_addr_opt with
+       | Some addr -> sw_fields := !sw_fields @ [("address", `String addr)]
+       | None -> ());
+      sw_fields := !sw_fields @ [("p2sh-segwit", `String segwit_p2sh)];
+      top_fields := !top_fields @ [("segwit", `Assoc !sw_fields)]
+    end
+  end;
+  Ok (`Assoc !top_fields)
 
 (* decodepsbt "base64string"
    Decode a PSBT and return detailed information.
@@ -5995,6 +6361,10 @@ let dispatch_rpc (ctx : rpc_context)
      | Error msg -> Error (rpc_verify_rejected, msg))
   | "decoderawtransaction" ->
     (match handle_decoderawtransaction ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_deserialization_error, msg))
+  | "decodescript" ->
+    (match handle_decodescript ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_deserialization_error, msg))
   | "signrawtransactionwithkey" ->

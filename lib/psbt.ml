@@ -472,14 +472,31 @@ let parse_key_origin (data : Cstruct.t) : key_origin =
   let path = List.init path_len (fun _ -> Serialize.read_int32_le r) in
   { fingerprint; path }
 
-(* Deserialize a PSBT input *)
+(* Deserialize a PSBT input.
+   W47 — list-typed fields (partial_sigs, bip32_derivations, tap_*,
+   unknown) are accumulated by prepending (`::`), which leaves them in
+   REVERSE on-wire order.  Re-serializing without reversal flipped the
+   order vs. the source bytes, so combinepsbt(p,p) was not byte-
+   identical to p (T2 of tools/psbt-multi-input-test.sh).  Reverse all
+   list-typed fields back to source order before returning. *)
 let deserialize_input r : (psbt_input, psbt_error) result =
   let inp = ref empty_input in
   let seen_keys = Hashtbl.create 16 in
+  let finalize () =
+    let i = !inp in
+    Ok { i with
+         partial_sigs = List.rev i.partial_sigs;
+         bip32_derivations = List.rev i.bip32_derivations;
+         tap_script_sigs = List.rev i.tap_script_sigs;
+         tap_leaf_scripts = List.rev i.tap_leaf_scripts;
+         tap_bip32_derivations = List.rev i.tap_bip32_derivations;
+         unknown = List.rev i.unknown;
+       }
+  in
 
   let rec read_entries () =
     match read_key r with
-    | None -> Ok !inp  (* Separator found *)
+    | None -> finalize ()  (* Separator found *)
     | Some key ->
       let value = read_value r in
 
@@ -588,14 +605,23 @@ let deserialize_input r : (psbt_input, psbt_error) result =
   in
   read_entries ()
 
-(* Deserialize a PSBT output *)
+(* Deserialize a PSBT output.  W47 — same list-reversal fix as
+   deserialize_input above. *)
 let deserialize_output r : (psbt_output, psbt_error) result =
   let out = ref empty_output in
   let seen_keys = Hashtbl.create 16 in
+  let finalize () =
+    let o = !out in
+    Ok { o with
+         bip32_derivations = List.rev o.bip32_derivations;
+         tap_bip32_derivations = List.rev o.tap_bip32_derivations;
+         unknown = List.rev o.unknown;
+       }
+  in
 
   let rec read_entries () =
     match read_key r with
-    | None -> Ok !out
+    | None -> finalize ()
     | Some key ->
       let value = read_value r in
 
@@ -884,6 +910,69 @@ let dedup_partial_sigs (sigs : partial_sig list) : partial_sig list =
     else begin Hashtbl.replace seen key (); true end
   ) sigs
 
+(* W47 — Combine dedup helpers.  combine() previously concatenated the
+   list-typed input/output fields below without any de-duplication, so a
+   PSBT combined with itself doubled in size on every round.  This
+   broke T2 (combinepsbt idempotency) of tools/psbt-multi-input-test.sh
+   on every fixture that carried bip32_derivations, tap_*, unknown, or
+   global_xpubs entries.  Mirrors dedup_partial_sigs in shape — keep the
+   first occurrence, drop later duplicates keyed by the BIP-371 / BIP-174
+   canonical key bytes for each record type. *)
+
+let dedup_bip32_derivations (ds : bip32_derivation list) : bip32_derivation list =
+  let seen = Hashtbl.create 16 in
+  List.filter (fun (d : bip32_derivation) ->
+    let key = Cstruct.to_string d.pubkey in
+    if Hashtbl.mem seen key then false
+    else begin Hashtbl.replace seen key (); true end
+  ) ds
+
+let dedup_tap_script_sigs (ts : tap_script_sig list) : tap_script_sig list =
+  let seen = Hashtbl.create 16 in
+  List.filter (fun (s : tap_script_sig) ->
+    (* BIP-371: key = xonly_pubkey || leaf_hash *)
+    let key = Cstruct.to_string s.xonly_pubkey ^ Cstruct.to_string s.leaf_hash in
+    if Hashtbl.mem seen key then false
+    else begin Hashtbl.replace seen key (); true end
+  ) ts
+
+let dedup_tap_leaf_scripts (ls : tap_leaf_script list) : tap_leaf_script list =
+  let seen = Hashtbl.create 16 in
+  List.filter (fun (l : tap_leaf_script) ->
+    (* BIP-371: key = control_block (uniquely identifies the spend path) *)
+    let key = Cstruct.to_string l.control_block in
+    if Hashtbl.mem seen key then false
+    else begin Hashtbl.replace seen key (); true end
+  ) ls
+
+let dedup_tap_bip32_derivations (ds : tap_bip32_derivation list)
+    : tap_bip32_derivation list =
+  let seen = Hashtbl.create 16 in
+  List.filter (fun (d : tap_bip32_derivation) ->
+    (* BIP-371: key = xonly_pubkey *)
+    let key = Cstruct.to_string d.xonly_pubkey in
+    if Hashtbl.mem seen key then false
+    else begin Hashtbl.replace seen key (); true end
+  ) ds
+
+let dedup_unknown_kvs (kvs : (Cstruct.t * Cstruct.t) list)
+    : (Cstruct.t * Cstruct.t) list =
+  let seen = Hashtbl.create 16 in
+  List.filter (fun (k, _v) ->
+    let key = Cstruct.to_string k in
+    if Hashtbl.mem seen key then false
+    else begin Hashtbl.replace seen key (); true end
+  ) kvs
+
+let dedup_global_xpubs (gs : global_xpub list) : global_xpub list =
+  let seen = Hashtbl.create 16 in
+  List.filter (fun (g : global_xpub) ->
+    (* BIP-174: key = serialized 78-byte xpub *)
+    let key = Cstruct.to_string g.xpub in
+    if Hashtbl.mem seen key then false
+    else begin Hashtbl.replace seen key (); true end
+  ) gs
+
 (* Combiner role: Merge two PSBTs *)
 let combine (psbt1 : psbt) (psbt2 : psbt) : (psbt, string) result =
   (* Check that underlying transactions match *)
@@ -892,7 +981,12 @@ let combine (psbt1 : psbt) (psbt2 : psbt) : (psbt, string) result =
   if not (Cstruct.equal tx1_bytes tx2_bytes) then
     Error "Cannot combine PSBTs: transactions don't match"
   else
-    (* Merge inputs *)
+    (* Merge inputs.  W47: every list-typed field is deduped to make
+       combine idempotent (combine(p,p) must return byte-identical p).
+       Pre-W47, only partial_sigs was deduped; bip32_derivations, tap_*,
+       and unknown doubled in length on every self-combine, breaking T2
+       of tools/psbt-multi-input-test.sh on the asymmetric multisig
+       fixture (which carries 4-7 bip32 entries per input). *)
     let merged_inputs = List.map2 (fun inp1 inp2 ->
       {
         non_witness_utxo = (match inp1.non_witness_utxo with Some _ -> inp1.non_witness_utxo | None -> inp2.non_witness_utxo);
@@ -901,39 +995,39 @@ let combine (psbt1 : psbt) (psbt2 : psbt) : (psbt, string) result =
         sighash_type = (match inp1.sighash_type with Some _ -> inp1.sighash_type | None -> inp2.sighash_type);
         redeem_script = (match inp1.redeem_script with Some _ -> inp1.redeem_script | None -> inp2.redeem_script);
         witness_script = (match inp1.witness_script with Some _ -> inp1.witness_script | None -> inp2.witness_script);
-        bip32_derivations = inp1.bip32_derivations @ inp2.bip32_derivations;
+        bip32_derivations = dedup_bip32_derivations (inp1.bip32_derivations @ inp2.bip32_derivations);
         final_scriptsig = (match inp1.final_scriptsig with Some _ -> inp1.final_scriptsig | None -> inp2.final_scriptsig);
         final_scriptwitness = (match inp1.final_scriptwitness with Some _ -> inp1.final_scriptwitness | None -> inp2.final_scriptwitness);
         tap_key_sig = (match inp1.tap_key_sig with Some _ -> inp1.tap_key_sig | None -> inp2.tap_key_sig);
-        tap_script_sigs = inp1.tap_script_sigs @ inp2.tap_script_sigs;
-        tap_leaf_scripts = inp1.tap_leaf_scripts @ inp2.tap_leaf_scripts;
-        tap_bip32_derivations = inp1.tap_bip32_derivations @ inp2.tap_bip32_derivations;
+        tap_script_sigs = dedup_tap_script_sigs (inp1.tap_script_sigs @ inp2.tap_script_sigs);
+        tap_leaf_scripts = dedup_tap_leaf_scripts (inp1.tap_leaf_scripts @ inp2.tap_leaf_scripts);
+        tap_bip32_derivations = dedup_tap_bip32_derivations (inp1.tap_bip32_derivations @ inp2.tap_bip32_derivations);
         tap_internal_key = (match inp1.tap_internal_key with Some _ -> inp1.tap_internal_key | None -> inp2.tap_internal_key);
         tap_merkle_root = (match inp1.tap_merkle_root with Some _ -> inp1.tap_merkle_root | None -> inp2.tap_merkle_root);
-        unknown = inp1.unknown @ inp2.unknown;
+        unknown = dedup_unknown_kvs (inp1.unknown @ inp2.unknown);
       }
     ) psbt1.inputs psbt2.inputs in
 
-    (* Merge outputs *)
+    (* Merge outputs (W47: same dedup story for output bip32/tap/unknown). *)
     let merged_outputs = List.map2 (fun out1 out2 ->
       {
         redeem_script = (match out1.redeem_script with Some _ -> out1.redeem_script | None -> out2.redeem_script);
         witness_script = (match out1.witness_script with Some _ -> out1.witness_script | None -> out2.witness_script);
-        bip32_derivations = out1.bip32_derivations @ out2.bip32_derivations;
+        bip32_derivations = dedup_bip32_derivations (out1.bip32_derivations @ out2.bip32_derivations);
         tap_internal_key = (match out1.tap_internal_key with Some _ -> out1.tap_internal_key | None -> out2.tap_internal_key);
         tap_tree = (match out1.tap_tree with Some _ -> out1.tap_tree | None -> out2.tap_tree);
-        tap_bip32_derivations = out1.tap_bip32_derivations @ out2.tap_bip32_derivations;
-        unknown = out1.unknown @ out2.unknown;
+        tap_bip32_derivations = dedup_tap_bip32_derivations (out1.tap_bip32_derivations @ out2.tap_bip32_derivations);
+        unknown = dedup_unknown_kvs (out1.unknown @ out2.unknown);
       }
     ) psbt1.outputs psbt2.outputs in
 
     Ok {
       tx = psbt1.tx;
-      global_xpubs = psbt1.global_xpubs @ psbt2.global_xpubs;
+      global_xpubs = dedup_global_xpubs (psbt1.global_xpubs @ psbt2.global_xpubs);
       version = psbt1.version;
       inputs = merged_inputs;
       outputs = merged_outputs;
-      unknown = psbt1.unknown @ psbt2.unknown;
+      unknown = dedup_unknown_kvs (psbt1.unknown @ psbt2.unknown);
     }
 
 (* Finalizer role: Finalize an input with scriptSig/witness *)
@@ -1047,6 +1141,252 @@ let finalize_input_p2sh_p2wpkh (psbt : psbt) (input_index : int)
         else inp'
       ) psbt.inputs in
       Ok { psbt with inputs }
+
+(* W47 — Parse a bare-multisig redeem/witness script and return its
+   M-of-N threshold AND the canonical pubkey ordering.  Layout:
+     <OP_M> <push pk1> <push pk2> ... <push pkN> <OP_N> OP_CHECKMULTISIG
+   where OP_M / OP_N are OP_1..OP_16 (0x51..0x60) and each pushed pubkey
+   is 33 bytes (compressed) or 65 bytes (uncompressed).  The pubkey
+   ordering matters for finalization: CHECKMULTISIG verifies the M sigs
+   in pubkey-listed order, so finalize must place sigs in script-pubkey
+   order (NOT in arbitrary partial_sigs-arrival order). Mirrors the
+   wallet.parse_multisig_witness_script signer-side helper. *)
+let parse_multisig_pubkeys (script : Cstruct.t)
+    : (int * int * Cstruct.t list) option =
+  let len = Cstruct.length script in
+  if len < 4 then None
+  else
+    let last = Cstruct.get_uint8 script (len - 1) in
+    if last <> 0xae then None  (* OP_CHECKMULTISIG *)
+    else
+      let m_byte = Cstruct.get_uint8 script 0 in
+      let n_byte = Cstruct.get_uint8 script (len - 2) in
+      if m_byte < 0x51 || m_byte > 0x60 then None
+      else if n_byte < 0x51 || n_byte > 0x60 then None
+      else
+        let m = m_byte - 0x50 in
+        let n = n_byte - 0x50 in
+        if m < 1 || m > n || n > 20 then None
+        else
+          let pks = ref [] in
+          let pos = ref 1 in
+          let ok = ref true in
+          for _ = 1 to n do
+            if !ok && !pos < len - 2 then begin
+              let push_len = Cstruct.get_uint8 script !pos in
+              if (push_len = 33 || push_len = 65)
+                 && !pos + 1 + push_len <= len - 2 then begin
+                pks := Cstruct.sub script (!pos + 1) push_len :: !pks;
+                pos := !pos + 1 + push_len
+              end else ok := false
+            end else ok := false
+          done;
+          if !ok && !pos = len - 2 && List.length !pks = n
+          then Some (m, n, List.rev !pks)
+          else None
+
+(* W47 — Helper: write a Bitcoin scriptSig push of `data` using the
+   minimal-push encoding rules (OP_PUSHBYTES_N for 1..75, OP_PUSHDATA1
+   for 76..255, OP_PUSHDATA2 for 256..65535).  Multisig redeemScripts
+   never exceed 65535 bytes (max 20 pubkeys), so PUSHDATA4 is unreachable
+   here.  Mirrors Core's CScript::operator<< push semantics. *)
+let push_script_data (data : Cstruct.t) : Cstruct.t =
+  let len = Cstruct.length data in
+  if len <= 75 then begin
+    let prefix = Cstruct.create 1 in
+    Cstruct.set_uint8 prefix 0 len;
+    Cstruct.concat [prefix; data]
+  end else if len <= 0xff then begin
+    let prefix = Cstruct.create 2 in
+    Cstruct.set_uint8 prefix 0 0x4c;  (* OP_PUSHDATA1 *)
+    Cstruct.set_uint8 prefix 1 len;
+    Cstruct.concat [prefix; data]
+  end else begin
+    let prefix = Cstruct.create 3 in
+    Cstruct.set_uint8 prefix 0 0x4d;  (* OP_PUSHDATA2 *)
+    Cstruct.set_uint8 prefix 1 (len land 0xff);
+    Cstruct.set_uint8 prefix 2 ((len lsr 8) land 0xff);
+    Cstruct.concat [prefix; data]
+  end
+
+(* W47 — Finalize a legacy P2SH-multisig input.
+   scriptSig = OP_0 <push sig1> ... <push sigM> <push redeemScript>
+   No witness (legacy).  Sigs are placed in the order of the pubkeys
+   listed in the redeemScript — partial_sigs may arrive in any order
+   from the signer (e.g. pubkey-2 signs first), and CHECKMULTISIG
+   verifies sigs strictly in script-pubkey order, so reordering is
+   mandatory.  See bitcoin-core/src/script/sign.cpp:SignStep
+   (TxoutType::MULTISIG branch).  W43-1 lesson: clear producer fields
+   AFTER setting final_scriptsig to avoid the partial_sigs stripping
+   regression. *)
+let finalize_input_p2sh_multisig (psbt : psbt) (input_index : int)
+    ~(redeem_script : Cstruct.t) : (psbt, string) result =
+  if input_index < 0 || input_index >= List.length psbt.inputs then
+    Error "Invalid input index"
+  else
+    let inp = List.nth psbt.inputs input_index in
+    match parse_multisig_pubkeys redeem_script with
+    | None -> Error "redeem_script is not a bare CHECKMULTISIG"
+    | Some (m, _n, pks) ->
+      (* For each pubkey in script order, find a matching partial_sig.
+         Stop after collecting M.  Ordering matters: CHECKMULTISIG
+         verifies sigs strictly in pubkey-listed order. *)
+      let sigs_in_order =
+        List.filter_map (fun pk ->
+          List.find_opt (fun (ps : partial_sig) ->
+            Cstruct.equal ps.pubkey pk
+          ) inp.partial_sigs
+        ) pks
+      in
+      if List.length sigs_in_order < m then
+        Error (Printf.sprintf
+                 "Not enough partial sigs for P2SH-multisig: have %d, need %d"
+                 (List.length sigs_in_order) m)
+      else begin
+        (* Take the first M sigs in script-pubkey order. *)
+        let take_m =
+          let rec aux n l = match n, l with
+            | 0, _ | _, [] -> []
+            | n, x :: rest -> x :: aux (n - 1) rest
+          in aux m sigs_in_order
+        in
+        (* scriptSig: OP_0 <push sig1> ... <push sigM> <push redeemScript> *)
+        let op0 = Cstruct.create 1 in
+        Cstruct.set_uint8 op0 0 0x00;
+        let sig_pushes = List.map (fun (ps : partial_sig) ->
+          push_script_data ps.signature
+        ) take_m in
+        let scriptsig =
+          Cstruct.concat (op0 :: sig_pushes @ [push_script_data redeem_script])
+        in
+        let inputs = List.mapi (fun i inp' ->
+          if i = input_index then {
+            inp' with
+            final_scriptsig = Some scriptsig;
+            (* Clear producer fields AFTER setting final_scriptsig
+               (W43-1 regression-avoidance). *)
+            partial_sigs = [];
+            bip32_derivations = [];
+            redeem_script = None;
+            witness_script = None;
+            sighash_type = None;
+          }
+          else inp'
+        ) psbt.inputs in
+        Ok { psbt with inputs }
+      end
+
+(* W47 — Finalize a P2SH-P2WSH-multisig input.
+   Outer scriptSig = <push redeemScript>  where
+     redeemScript = OP_0 <0x20> <SHA256(witnessScript)>  (P2WSH outer)
+   Witness stack = OP_0_byte sig1 ... sigM witnessScript.  As with bare
+   P2SH-multisig, sigs are placed in pubkey-listed order from the
+   witnessScript.  See bitcoin-core/src/script/sign.cpp ProduceSignature
+   path (TxoutType::WITNESS_V0_SCRIPTHASH wrapping MULTISIG). *)
+let finalize_input_p2sh_p2wsh_multisig (psbt : psbt) (input_index : int)
+    ~(redeem_script : Cstruct.t) ~(witness_script : Cstruct.t)
+    : (psbt, string) result =
+  if input_index < 0 || input_index >= List.length psbt.inputs then
+    Error "Invalid input index"
+  else
+    let inp = List.nth psbt.inputs input_index in
+    match parse_multisig_pubkeys witness_script with
+    | None -> Error "witness_script is not a bare CHECKMULTISIG"
+    | Some (m, _n, pks) ->
+      let sigs_in_order =
+        List.filter_map (fun pk ->
+          List.find_opt (fun (ps : partial_sig) ->
+            Cstruct.equal ps.pubkey pk
+          ) inp.partial_sigs
+        ) pks
+      in
+      if List.length sigs_in_order < m then
+        Error (Printf.sprintf
+                 "Not enough partial sigs for P2SH-P2WSH-multisig: have %d, need %d"
+                 (List.length sigs_in_order) m)
+      else begin
+        let take_m =
+          let rec aux n l = match n, l with
+            | 0, _ | _, [] -> []
+            | n, x :: rest -> x :: aux (n - 1) rest
+          in aux m sigs_in_order
+        in
+        (* Outer scriptSig = <push redeemScript> *)
+        let scriptsig = push_script_data redeem_script in
+        (* Witness = [empty, sig1, ..., sigM, witnessScript].  The
+           leading empty cstruct is the OP_0 dummy that absorbs
+           CHECKMULTISIG's historical off-by-one. *)
+        let op0_empty = Cstruct.empty in
+        let witness =
+          op0_empty
+          :: (List.map (fun (ps : partial_sig) -> ps.signature) take_m)
+          @ [witness_script]
+        in
+        let inputs = List.mapi (fun i inp' ->
+          if i = input_index then {
+            inp' with
+            final_scriptsig = Some scriptsig;
+            final_scriptwitness = Some witness;
+            (* Clear producer fields AFTER setting final_* (W43-1). *)
+            partial_sigs = [];
+            bip32_derivations = [];
+            redeem_script = None;
+            witness_script = None;
+            sighash_type = None;
+          }
+          else inp'
+        ) psbt.inputs in
+        Ok { psbt with inputs }
+      end
+
+(* W47 — Finalize a bare P2WSH-multisig input.
+   Witness stack = OP_0_byte sig1 ... sigM witnessScript. *)
+let finalize_input_p2wsh_multisig (psbt : psbt) (input_index : int)
+    ~(witness_script : Cstruct.t) : (psbt, string) result =
+  if input_index < 0 || input_index >= List.length psbt.inputs then
+    Error "Invalid input index"
+  else
+    let inp = List.nth psbt.inputs input_index in
+    match parse_multisig_pubkeys witness_script with
+    | None -> Error "witness_script is not a bare CHECKMULTISIG"
+    | Some (m, _n, pks) ->
+      let sigs_in_order =
+        List.filter_map (fun pk ->
+          List.find_opt (fun (ps : partial_sig) ->
+            Cstruct.equal ps.pubkey pk
+          ) inp.partial_sigs
+        ) pks
+      in
+      if List.length sigs_in_order < m then
+        Error (Printf.sprintf
+                 "Not enough partial sigs for P2WSH-multisig: have %d, need %d"
+                 (List.length sigs_in_order) m)
+      else begin
+        let take_m =
+          let rec aux n l = match n, l with
+            | 0, _ | _, [] -> []
+            | n, x :: rest -> x :: aux (n - 1) rest
+          in aux m sigs_in_order
+        in
+        let witness =
+          Cstruct.empty
+          :: (List.map (fun (ps : partial_sig) -> ps.signature) take_m)
+          @ [witness_script]
+        in
+        let inputs = List.mapi (fun i inp' ->
+          if i = input_index then {
+            inp' with
+            final_scriptwitness = Some witness;
+            partial_sigs = [];
+            bip32_derivations = [];
+            redeem_script = None;
+            witness_script = None;
+            sighash_type = None;
+          }
+          else inp'
+        ) psbt.inputs in
+        Ok { psbt with inputs }
+      end
 
 let finalize_input_taproot (psbt : psbt) (input_index : int) : (psbt, string) result =
   if input_index < 0 || input_index >= List.length psbt.inputs then

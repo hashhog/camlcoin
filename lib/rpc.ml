@@ -3477,6 +3477,259 @@ let psbt_script_pubkey_json (script : Cstruct.t) (network : Address.network) : Y
   in
   `Assoc (with_addr @ [("type", `String type_name)])
 
+(* W53 helpers for decodepsbt input-side records ─────────────────────────── *)
+
+(* Map a PSBT sighash-type integer to its Bitcoin Core string label.
+   Reference: bitcoin-core/src/core_io.cpp SighashToStr (line ~343).
+   PSBT_IN_SIGHASH_TYPE stores a 4-byte LE uint32; we use the low byte. *)
+let psbt_sighash_to_str (sht : int32) : string =
+  match Int32.logand sht 0xffl |> Int32.to_int with
+  | 0x01 -> "ALL"
+  | 0x02 -> "NONE"
+  | 0x03 -> "SINGLE"
+  | 0x81 -> "ALL|ANYONECANPAY"
+  | 0x82 -> "NONE|ANYONECANPAY"
+  | 0x83 -> "SINGLE|ANYONECANPAY"
+  | _    -> ""
+
+(* IsValidSignatureEncoding: DER format check (9..73 bytes).
+   Mirrors bitcoin-core/src/script/interpreter.cpp IsValidSignatureEncoding. *)
+let is_valid_der_sig (vch : string) (len : int) : bool =
+  if len < 9 || len > 73 then false
+  else begin
+    let b i = Char.code vch.[i] in
+    if b 0 <> 0x30 then false
+    else if b 1 <> len - 3 then false
+    else begin
+      let len_r = b 3 in
+      if 5 + len_r >= len then false
+      else begin
+        let len_s = b (5 + len_r) in
+        if len_r + len_s + 7 <> len then false
+        else if b 2 <> 0x02 then false
+        else if len_r = 0 then false
+        else if b 4 land 0x80 <> 0 then false
+        else if len_r > 1 && b 4 = 0x00 && b 5 land 0x80 = 0 then false
+        else if b (len_r + 4) <> 0x02 then false
+        else if len_s = 0 then false
+        else if b (len_r + 6) land 0x80 <> 0 then false
+        else if len_s > 1 && b (len_r + 6) = 0x00 && b (len_r + 7) land 0x80 = 0 then false
+        else true
+      end
+    end
+  end
+
+(* IsDefinedHashtypeSignature: last byte (masked ~ANYONECANPAY) in [1,3]. *)
+let is_defined_hashtype (vch : string) (len : int) : bool =
+  if len = 0 then false
+  else
+    let ht = Char.code vch.[len - 1] land (lnot 0x80) in
+    ht >= 1 && ht <= 3
+
+(* script_to_asm_sighash: ScriptToAsmStr(script, fAttemptSighashDecode=true).
+   For push-data > 4 bytes that passes DER+hashtype checks, strips the last
+   byte (sighash flag) from the displayed hex and appends "[TYPE]". *)
+let script_to_asm_sighash (script : Cstruct.t) : string =
+  let ops = (try Script.parse_script script with _ -> []) in
+  let decode_scriptnum vch len =
+    if len = 0 then "0"
+    else begin
+      let result = ref 0L in
+      for i = 0 to len - 1 do
+        result := Int64.logor !result
+          (Int64.shift_left (Int64.of_int (Char.code (Cstruct.get_char vch i))) (8 * i))
+      done;
+      let last = Char.code (Cstruct.get_char vch (len - 1)) in
+      if last land 0x80 <> 0 then begin
+        let sign_pos = 8 * (len - 1) + 7 in
+        result := Int64.logand !result
+          (Int64.lognot (Int64.shift_left 1L sign_pos));
+        result := Int64.neg !result
+      end;
+      Int64.to_string !result
+    end
+  in
+  (* Hex-encode bytes 0..n-1 of a Cstruct *)
+  let hex_prefix (data : Cstruct.t) (n : int) : string =
+    let buf = Buffer.create (n * 2) in
+    for i = 0 to n - 1 do
+      Buffer.add_string buf (Printf.sprintf "%02x" (Char.code (Cstruct.get_char data i)))
+    done;
+    Buffer.contents buf
+  in
+  let tokens = List.map (fun op ->
+    match op with
+    | Script.OP_0       -> "0"
+    | Script.OP_1NEGATE -> "-1"
+    | Script.OP_1  -> "1"  | Script.OP_2  -> "2"  | Script.OP_3  -> "3"
+    | Script.OP_4  -> "4"  | Script.OP_5  -> "5"  | Script.OP_6  -> "6"
+    | Script.OP_7  -> "7"  | Script.OP_8  -> "8"  | Script.OP_9  -> "9"
+    | Script.OP_10 -> "10" | Script.OP_11 -> "11" | Script.OP_12 -> "12"
+    | Script.OP_13 -> "13" | Script.OP_14 -> "14" | Script.OP_15 -> "15"
+    | Script.OP_16 -> "16"
+    | Script.OP_PUSHDATA (_opbyte, data) ->
+      let len = Cstruct.length data in
+      if len <= 4 then decode_scriptnum data len
+      else begin
+        (* sighash-decode path: only when fAttemptSighashDecode=true *)
+        let raw = Cstruct.to_string data in
+        if is_valid_der_sig raw len && is_defined_hashtype raw len then begin
+          let sighash_byte = Char.code raw.[len - 1] in
+          let label = psbt_sighash_to_str (Int32.of_int sighash_byte) in
+          let hex_part = hex_prefix data (len - 1) in
+          if label = "" then hex_part
+          else hex_part ^ "[" ^ label ^ "]"
+        end else
+          cstruct_to_hex data
+      end
+    | Script.OP_NOP                  -> "OP_NOP"
+    | Script.OP_IF                   -> "OP_IF"
+    | Script.OP_NOTIF                -> "OP_NOTIF"
+    | Script.OP_ELSE                 -> "OP_ELSE"
+    | Script.OP_ENDIF                -> "OP_ENDIF"
+    | Script.OP_VERIFY               -> "OP_VERIFY"
+    | Script.OP_RETURN               -> "OP_RETURN"
+    | Script.OP_TOALTSTACK           -> "OP_TOALTSTACK"
+    | Script.OP_FROMALTSTACK         -> "OP_FROMALTSTACK"
+    | Script.OP_IFDUP                -> "OP_IFDUP"
+    | Script.OP_DEPTH                -> "OP_DEPTH"
+    | Script.OP_DROP                 -> "OP_DROP"
+    | Script.OP_DUP                  -> "OP_DUP"
+    | Script.OP_NIP                  -> "OP_NIP"
+    | Script.OP_OVER                 -> "OP_OVER"
+    | Script.OP_PICK                 -> "OP_PICK"
+    | Script.OP_ROLL                 -> "OP_ROLL"
+    | Script.OP_ROT                  -> "OP_ROT"
+    | Script.OP_SWAP                 -> "OP_SWAP"
+    | Script.OP_TUCK                 -> "OP_TUCK"
+    | Script.OP_2DROP                -> "OP_2DROP"
+    | Script.OP_2DUP                 -> "OP_2DUP"
+    | Script.OP_3DUP                 -> "OP_3DUP"
+    | Script.OP_2OVER                -> "OP_2OVER"
+    | Script.OP_2ROT                 -> "OP_2ROT"
+    | Script.OP_2SWAP                -> "OP_2SWAP"
+    | Script.OP_SIZE                 -> "OP_SIZE"
+    | Script.OP_EQUAL                -> "OP_EQUAL"
+    | Script.OP_EQUALVERIFY          -> "OP_EQUALVERIFY"
+    | Script.OP_1ADD                 -> "OP_1ADD"
+    | Script.OP_1SUB                 -> "OP_1SUB"
+    | Script.OP_NEGATE               -> "OP_NEGATE"
+    | Script.OP_ABS                  -> "OP_ABS"
+    | Script.OP_NOT                  -> "OP_NOT"
+    | Script.OP_0NOTEQUAL            -> "OP_0NOTEQUAL"
+    | Script.OP_ADD                  -> "OP_ADD"
+    | Script.OP_SUB                  -> "OP_SUB"
+    | Script.OP_BOOLAND              -> "OP_BOOLAND"
+    | Script.OP_BOOLOR               -> "OP_BOOLOR"
+    | Script.OP_NUMEQUAL             -> "OP_NUMEQUAL"
+    | Script.OP_NUMEQUALVERIFY       -> "OP_NUMEQUALVERIFY"
+    | Script.OP_NUMNOTEQUAL          -> "OP_NUMNOTEQUAL"
+    | Script.OP_LESSTHAN             -> "OP_LESSTHAN"
+    | Script.OP_GREATERTHAN          -> "OP_GREATERTHAN"
+    | Script.OP_LESSTHANOREQUAL      -> "OP_LESSTHANOREQUAL"
+    | Script.OP_GREATERTHANOREQUAL   -> "OP_GREATERTHANOREQUAL"
+    | Script.OP_MIN                  -> "OP_MIN"
+    | Script.OP_MAX                  -> "OP_MAX"
+    | Script.OP_WITHIN               -> "OP_WITHIN"
+    | Script.OP_RIPEMD160            -> "OP_RIPEMD160"
+    | Script.OP_SHA1                 -> "OP_SHA1"
+    | Script.OP_SHA256               -> "OP_SHA256"
+    | Script.OP_HASH160              -> "OP_HASH160"
+    | Script.OP_HASH256              -> "OP_HASH256"
+    | Script.OP_CODESEPARATOR        -> "OP_CODESEPARATOR"
+    | Script.OP_CHECKSIG             -> "OP_CHECKSIG"
+    | Script.OP_CHECKSIGVERIFY       -> "OP_CHECKSIGVERIFY"
+    | Script.OP_CHECKMULTISIG        -> "OP_CHECKMULTISIG"
+    | Script.OP_CHECKMULTISIGVERIFY  -> "OP_CHECKMULTISIGVERIFY"
+    | Script.OP_CHECKLOCKTIMEVERIFY  -> "OP_CHECKLOCKTIMEVERIFY"
+    | Script.OP_CHECKSEQUENCEVERIFY  -> "OP_CHECKSEQUENCEVERIFY"
+    | Script.OP_CHECKSIGADD          -> "OP_CHECKSIGADD"
+    | Script.OP_NOP1                 -> "OP_NOP1"
+    | Script.OP_NOP4                 -> "OP_NOP4"
+    | Script.OP_NOP5                 -> "OP_NOP5"
+    | Script.OP_NOP6                 -> "OP_NOP6"
+    | Script.OP_NOP7                 -> "OP_NOP7"
+    | Script.OP_NOP8                 -> "OP_NOP8"
+    | Script.OP_NOP9                 -> "OP_NOP9"
+    | Script.OP_NOP10                -> "OP_NOP10"
+    | Script.OP_RESERVED             -> "OP_RESERVED"
+    | Script.OP_VER                  -> "OP_VER"
+    | Script.OP_VERIF                -> "OP_VERIF"
+    | Script.OP_VERNOTIF             -> "OP_VERNOTIF"
+    | Script.OP_RESERVED1            -> "OP_RESERVED1"
+    | Script.OP_RESERVED2            -> "OP_RESERVED2"
+    | Script.OP_INVALID _            -> "OP_INVALIDOPCODE"
+  ) ops in
+  String.concat " " tokens
+
+(* {asm, hex, type} for redeem_script / witness_script.
+   Matches ScriptToUniv(script, out) with default include_address=false.
+   Core emits {asm, hex, type} only — no desc, no address. *)
+let build_script_type_json (script : Cstruct.t) : Yojson.Safe.t =
+  let template  = Script.classify_script script in
+  let type_name = script_type_name template in
+  `Assoc [
+    ("asm",  `String (script_to_asm script));
+    ("hex",  `String (cstruct_to_hex script));
+    ("type", `String type_name);
+  ]
+
+(* Full TxToUniv shape without "hex" field, for non_witness_utxo.
+   Matches Core's TxToUniv(tx, uint256(), entry, include_hex=false).
+   vin scriptSig uses sighash-decode ASM. vout scriptPubKey includes address. *)
+let build_non_witness_utxo_json (tx : Types.transaction) (network : Address.network) : Yojson.Safe.t =
+  let txid  = Crypto.compute_txid tx in
+  let wtxid = Crypto.compute_wtxid tx in
+  let vin_json = List.mapi (fun i inp ->
+    let witness_items_opt =
+      if i < List.length tx.witnesses then
+        let w = List.nth tx.witnesses i in
+        if w.Types.items = [] then None
+        else Some (`List (List.map (fun item -> `String (cstruct_to_hex item)) w.items))
+      else None
+    in
+    let base =
+      if is_coinbase_input inp then
+        [("coinbase",  `String (cstruct_to_hex inp.Types.script_sig));
+         ("sequence",  `Int (Int64.to_int
+           (Int64.logand (Int64.of_int32 inp.sequence) 0xFFFFFFFFL)))]
+      else
+        [("txid",      `String (Types.hash256_to_hex_display inp.Types.previous_output.txid));
+         ("vout",      `Int (Int32.to_int inp.Types.previous_output.vout));
+         ("scriptSig", `Assoc [
+           ("asm", `String (script_to_asm_sighash inp.Types.script_sig));
+           ("hex", `String (cstruct_to_hex inp.Types.script_sig));
+         ]);
+         ("sequence",  `Int (Int64.to_int
+           (Int64.logand (Int64.of_int32 inp.sequence) 0xFFFFFFFFL)))]
+    in
+    let with_witness = match witness_items_opt with
+      | Some w -> base @ [("txinwitness", w)]
+      | None   -> base
+    in
+    `Assoc with_witness
+  ) tx.inputs in
+  let vout_json = List.mapi (fun i out ->
+    `Assoc [
+      ("value",       btc_amount_json out.Types.value);
+      ("n",           `Int i);
+      ("scriptPubKey", psbt_script_pubkey_json out.Types.script_pubkey network);
+    ]
+  ) tx.outputs in
+  `Assoc [
+    ("txid",     `String (Types.hash256_to_hex_display txid));
+    ("hash",     `String (Types.hash256_to_hex_display wtxid));
+    ("version",  `Int (Int32.to_int tx.version));
+    ("size",     `Int (Validation.compute_tx_size tx));
+    ("vsize",    `Int (Validation.compute_tx_vsize tx));
+    ("weight",   `Int (Validation.compute_tx_weight tx));
+    ("locktime", `Int (Int32.to_int tx.locktime));
+    ("vin",      `List vin_json);
+    ("vout",     `List vout_json);
+  ]
+
+(* ─────────────────────────────────────────────────────────────────────────── *)
+
 (* decodepsbt "base64string"
    Decode a PSBT and return detailed information.
    W51/W52: JSON shape now byte-identical to Bitcoin Core 31.99 for the
@@ -3547,7 +3800,7 @@ let handle_decodepsbt (_ctx : rpc_context)
             ]
           | None -> ());
          (match inp.Psbt.non_witness_utxo with
-          | Some _ -> fields := !fields @ [("non_witness_utxo", `Bool true)]
+          | Some nwu -> fields := !fields @ [("non_witness_utxo", build_non_witness_utxo_json nwu network)]
           | None -> ());
          if inp.Psbt.partial_sigs <> [] then
            fields := !fields @ [
@@ -3556,13 +3809,13 @@ let handle_decodepsbt (_ctx : rpc_context)
              ) inp.partial_sigs))
            ];
          (match inp.Psbt.sighash_type with
-          | Some sht -> fields := !fields @ [("sighash", `String (Int32.to_string sht))]
+          | Some sht -> fields := !fields @ [("sighash", `String (psbt_sighash_to_str sht))]
           | None -> ());
          (match inp.Psbt.redeem_script with
-          | Some rs -> fields := !fields @ [("redeem_script", `Assoc [("hex", `String (cstruct_to_hex rs))])]
+          | Some rs -> fields := !fields @ [("redeem_script", build_script_type_json rs)]
           | None -> ());
          (match inp.Psbt.witness_script with
-          | Some ws -> fields := !fields @ [("witness_script", `Assoc [("hex", `String (cstruct_to_hex ws))])]
+          | Some ws -> fields := !fields @ [("witness_script", build_script_type_json ws)]
           | None -> ());
          if inp.Psbt.bip32_derivations <> [] then
            fields := !fields @ [
@@ -3582,7 +3835,10 @@ let handle_decodepsbt (_ctx : rpc_context)
              ) inp.bip32_derivations))
            ];
          (match inp.Psbt.final_scriptsig with
-          | Some ss -> fields := !fields @ [("final_scriptSig", `Assoc [("hex", `String (cstruct_to_hex ss))])]
+          | Some ss -> fields := !fields @ [("final_scriptSig", `Assoc [
+              ("asm", `String (script_to_asm_sighash ss));
+              ("hex", `String (cstruct_to_hex ss));
+            ])]
           | None -> ());
          (match inp.Psbt.final_scriptwitness with
           | Some wit -> fields := !fields @ [

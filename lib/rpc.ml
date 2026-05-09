@@ -3446,19 +3446,59 @@ let script_to_asm (script : Cstruct.t) : string =
   ) ops in
   String.concat " " tokens
 
+(* Format a 4-byte BIP-32 key fingerprint for JSON output.
+   PSBT stores the fingerprint as 4 raw bytes.  parse_key_origin reads them
+   with read_int32_le so the stored int32 has the bytes in LE order: byte 0
+   is the LSB.  Core uses ReadBE32 + strprintf("%08x") which outputs the
+   original wire bytes left-to-right (big-endian display).  To reproduce
+   that, we extract the 4 LE bytes from the int32 and print them in order. *)
+let format_fingerprint (fp : int32) : string =
+  Printf.sprintf "%02lx%02lx%02lx%02lx"
+    (Int32.logand fp 0xffl)
+    (Int32.logand (Int32.shift_right_logical fp 8) 0xffl)
+    (Int32.logand (Int32.shift_right_logical fp 16) 0xffl)
+    (Int32.logand (Int32.shift_right_logical fp 24) 0xffl)
+
+(* Format a BIP-32 derivation path as Core's WriteHDKeypath (bip32.cpp:56).
+   Core uses apostrophe=false by default, so hardened components use 'h'
+   not "'".  Hardened check: high bit set (unsigned), i.e.
+   Int32.logand idx 0x80000000l <> 0l.  Non-hardened indices are 0..2^31-1
+   and always non-negative as int32 in that range. *)
+let format_hd_path (path : int32 list) : string =
+  String.concat "/" ("m" :: List.map (fun idx ->
+    if Int32.logand idx 0x80000000l <> 0l then
+      Printf.sprintf "%ldh" (Int32.logand idx 0x7fffffffl)
+    else
+      Printf.sprintf "%ld" idx
+  ) path)
+
 (* Build descriptor string for a scriptPubKey, mirroring Core's
-   InferDescriptor (script/descriptor.cpp:2897) in the no-keys path:
-     addr(<address>)#<csum>  for standard address-encodable scripts
-     raw(<hex>)#<csum>       otherwise
+   InferDescriptor (script/descriptor.cpp:2897) in the no-keys path.
+   For witness_v1_taproot (OP_1 <32-byte x-only key>) Core emits
+     rawtr(<32-byte-hex>)#<checksum>
+   because InferDescriptor recognizes the x-only key and wraps it in
+   RawTrDescriptor, not AddressDescriptor.
+   For all other standard scripts:
+     addr(<address>)#<csum>
+   For non-standard scripts:
+     raw(<hex>)#<csum>
    Reference: bitcoin-core/src/script/descriptor.cpp InferDescriptor. *)
 let infer_descriptor (script : Cstruct.t) (network : Address.network) : string =
-  let payload = match script_to_address script network with
-    | Some addr -> "addr(" ^ addr ^ ")"
-    | None      -> "raw(" ^ cstruct_to_hex script ^ ")"
+  let payload =
+    (* Check for OP_1 <32 bytes> = witness_v1_taproot *)
+    if Cstruct.length script = 34
+       && Cstruct.get_uint8 script 0 = 0x51
+       && Cstruct.get_uint8 script 1 = 0x20 then
+      let xonly_hex = cstruct_to_hex (Cstruct.sub script 2 32) in
+      "rawtr(" ^ xonly_hex ^ ")"
+    else
+      match script_to_address script network with
+      | Some addr -> "addr(" ^ addr ^ ")"
+      | None      -> "raw(" ^ cstruct_to_hex script ^ ")"
   in
   match Descriptor.add_checksum payload with
   | Some s -> s
-  | None   -> payload  (* unreachable for well-formed addr/hex inputs *)
+  | None   -> payload  (* unreachable for well-formed inputs *)
 
 (* Build full Core-shape scriptPubKey JSON for decodepsbt / ScriptToUniv.
    Emits {asm, desc, hex, address?, type} — address suppressed when
@@ -3822,15 +3862,8 @@ let handle_decodepsbt (_ctx : rpc_context)
              ("bip32_derivs", `List (List.map (fun d ->
                `Assoc [
                  ("pubkey",             `String (cstruct_to_hex d.Psbt.pubkey));
-                 ("master_fingerprint", `String (Printf.sprintf "%08lx" d.origin.fingerprint));
-                 ("path",               `String (String.concat "/" (
-                   "m" :: List.map (fun idx ->
-                     if Int32.compare idx 0x80000000l >= 0 then
-                       Printf.sprintf "%ld'" (Int32.sub idx 0x80000000l)
-                     else
-                       Printf.sprintf "%ld" idx
-                   ) d.origin.path
-                 )));
+                 ("master_fingerprint", `String (format_fingerprint d.origin.fingerprint));
+                 ("path",               `String (format_hd_path d.origin.path));
                ]
              ) inp.bip32_derivations))
            ];
@@ -3847,11 +3880,89 @@ let handle_decodepsbt (_ctx : rpc_context)
               ) wit))
             ]
           | None -> ());
+         (* BIP-371 input-side taproot fields.
+            Emission order matches Bitcoin Core rawtransaction.cpp:1249-1313. *)
          (match inp.Psbt.tap_key_sig with
           | Some sig_ -> fields := !fields @ [("taproot_key_path_sig", `String (cstruct_to_hex sig_))]
           | None -> ());
+         (* taproot_script_path_sigs (0x14): array sorted by (xonly, leaf_hash) —
+            Core iterates m_tap_script_sigs: std::map<std::pair<XOnlyPubKey,uint256>,...> *)
+         if inp.Psbt.tap_script_sigs <> [] then begin
+           let sorted_sigs =
+             List.sort (fun a b ->
+               let c = Cstruct.compare a.Psbt.xonly_pubkey b.Psbt.xonly_pubkey in
+               if c <> 0 then c else Cstruct.compare a.Psbt.leaf_hash b.Psbt.leaf_hash
+             ) inp.tap_script_sigs
+           in
+           fields := !fields @ [
+             ("taproot_script_path_sigs", `List (List.map (fun (tss : Psbt.tap_script_sig) ->
+               `Assoc [
+                 ("pubkey",    `String (cstruct_to_hex tss.xonly_pubkey));
+                 ("leaf_hash", `String (cstruct_to_hex tss.leaf_hash));
+                 ("sig",       `String (cstruct_to_hex tss.signature));
+               ]
+             ) sorted_sigs))
+           ]
+         end;
+         (* taproot_scripts (0x15): array sorted by (script, leaf_ver) —
+            Core iterates m_tap_scripts: std::map<std::pair<CScript,int>,...>.
+            Control blocks within each entry are sorted lexicographically. *)
+         if inp.Psbt.tap_leaf_scripts <> [] then begin
+           (* Group by (script, leaf_ver): collect all control_blocks per leaf *)
+           let tbl : (string * int, Cstruct.t list ref) Hashtbl.t = Hashtbl.create 8 in
+           List.iter (fun (tls : Psbt.tap_leaf_script) ->
+             let key = (Cstruct.to_string tls.script, tls.leaf_version) in
+             (match Hashtbl.find_opt tbl key with
+              | Some r -> r := tls.control_block :: !r
+              | None   -> Hashtbl.add tbl key (ref [tls.control_block]))
+           ) inp.tap_leaf_scripts;
+           (* Sort the groups by (script_bytes, leaf_ver) *)
+           let groups = Hashtbl.fold (fun (script_str, lv) cbs_ref acc ->
+             (script_str, lv, !cbs_ref) :: acc
+           ) tbl [] in
+           let sorted_groups = List.sort (fun (s1, lv1, _) (s2, lv2, _) ->
+             let c = String.compare s1 s2 in
+             if c <> 0 then c else compare lv1 lv2
+           ) groups in
+           fields := !fields @ [
+             ("taproot_scripts", `List (List.map (fun (script_str, lv, cbs) ->
+               let sorted_cbs = List.sort Cstruct.compare cbs in
+               `Assoc [
+                 ("script",         `String (cstruct_to_hex (Cstruct.of_string script_str)));
+                 ("leaf_ver",       `Int lv);
+                 ("control_blocks", `List (List.map (fun cb ->
+                   `String (cstruct_to_hex cb)
+                 ) sorted_cbs));
+               ]
+             ) sorted_groups))
+           ]
+         end;
+         (* taproot_bip32_derivs (0x16): sorted by xonly pubkey —
+            Core iterates m_tap_bip32_paths: std::map<XOnlyPubKey,...> *)
+         if inp.Psbt.tap_bip32_derivations <> [] then begin
+           let sorted_tds =
+             List.sort (fun (a : Psbt.tap_bip32_derivation) b ->
+               Cstruct.compare a.xonly_pubkey b.xonly_pubkey
+             ) inp.tap_bip32_derivations
+           in
+           fields := !fields @ [
+             ("taproot_bip32_derivs", `List (List.map (fun (td : Psbt.tap_bip32_derivation) ->
+               `Assoc [
+                 ("pubkey",             `String (cstruct_to_hex td.xonly_pubkey));
+                 ("master_fingerprint", `String (format_fingerprint td.origin.fingerprint));
+                 ("path",               `String (format_hd_path td.origin.path));
+                 ("leaf_hashes",        `List (List.map (fun lh ->
+                   `String (cstruct_to_hex lh)
+                 ) td.leaf_hashes));
+               ]
+             ) sorted_tds))
+           ]
+         end;
          (match inp.Psbt.tap_internal_key with
           | Some key -> fields := !fields @ [("taproot_internal_key", `String (cstruct_to_hex key))]
+          | None -> ());
+         (match inp.Psbt.tap_merkle_root with
+          | Some root -> fields := !fields @ [("taproot_merkle_root", `String (cstruct_to_hex root))]
           | None -> ());
          `Assoc !fields
        ) psbt.inputs in
@@ -3869,13 +3980,75 @@ let handle_decodepsbt (_ctx : rpc_context)
              ("bip32_derivs", `List (List.map (fun d ->
                `Assoc [
                  ("pubkey",             `String (cstruct_to_hex d.Psbt.pubkey));
-                 ("master_fingerprint", `String (Printf.sprintf "%08lx" d.origin.fingerprint));
+                 ("master_fingerprint", `String (format_fingerprint d.origin.fingerprint));
+                 ("path",               `String (format_hd_path d.origin.path));
                ]
              ) out.bip32_derivations))
            ];
          (match out.Psbt.tap_internal_key with
           | Some key -> fields := !fields @ [("taproot_internal_key", `String (cstruct_to_hex key))]
           | None -> ());
+         (* taproot_tree (0x06): array of {depth, leaf_ver, script}.
+            The raw tap_tree bytes store (depth:1, leaf_ver:1, script:varint-prefixed). *)
+         (match out.Psbt.tap_tree with
+          | Some tree_bytes ->
+            let entries = ref [] in
+            let r = Serialize.reader_of_cstruct tree_bytes in
+            (try
+              while r.pos < Cstruct.length tree_bytes do
+                let depth = Serialize.read_uint8 r in
+                let lv    = Serialize.read_uint8 r in
+                let slen  = Serialize.read_compact_size r in
+                let script_cs = Serialize.read_bytes r slen in
+                entries := !entries @ [`Assoc [
+                  ("depth",    `Int depth);
+                  ("leaf_ver", `Int lv);
+                  ("script",   `String (cstruct_to_hex script_cs));
+                ]]
+              done
+            with _ -> ());
+            if !entries <> [] then
+              fields := !fields @ [("taproot_tree", `List !entries)]
+          | None -> ());
+         (* taproot_bip32_derivs (0x07): sorted by xonly pubkey *)
+         if out.Psbt.tap_bip32_derivations <> [] then begin
+           let sorted_tds =
+             List.sort (fun (a : Psbt.tap_bip32_derivation) b ->
+               Cstruct.compare a.xonly_pubkey b.xonly_pubkey
+             ) out.tap_bip32_derivations
+           in
+           fields := !fields @ [
+             ("taproot_bip32_derivs", `List (List.map (fun (td : Psbt.tap_bip32_derivation) ->
+               `Assoc [
+                 ("pubkey",             `String (cstruct_to_hex td.xonly_pubkey));
+                 ("master_fingerprint", `String (format_fingerprint td.origin.fingerprint));
+                 ("path",               `String (format_hd_path td.origin.path));
+                 ("leaf_hashes",        `List (List.map (fun lh ->
+                   `String (cstruct_to_hex lh)
+                 ) td.leaf_hashes));
+               ]
+             ) sorted_tds))
+           ]
+         end;
+         (* musig2_participant_pubkeys (0x08): sorted by aggregate_pubkey —
+            Core iterates m_musig2_participants: std::map<CPubKey,vector<CPubKey>> *)
+         if out.Psbt.musig2_participants <> [] then begin
+           let sorted_m2 =
+             List.sort (fun a b ->
+               Cstruct.compare a.Psbt.aggregate_key b.Psbt.aggregate_key
+             ) out.musig2_participants
+           in
+           fields := !fields @ [
+             ("musig2_participant_pubkeys", `List (List.map (fun (m : Psbt.musig2_participant) ->
+               `Assoc [
+                 ("aggregate_pubkey",  `String (cstruct_to_hex m.aggregate_key));
+                 ("participant_pubkeys", `List (List.map (fun pk ->
+                   `String (cstruct_to_hex pk)
+                 ) m.participant_keys));
+               ]
+             ) sorted_m2))
+           ]
+         end;
          `Assoc !fields
        ) psbt.outputs in
        (* fee: use btc_amount_json so amount is Core-shaped *)
@@ -3888,7 +4061,7 @@ let handle_decodepsbt (_ctx : rpc_context)
          ("global_xpubs", `List (List.map (fun gx ->
            `Assoc [
              ("xpub",               `String (cstruct_to_hex gx.Psbt.xpub));
-             ("master_fingerprint", `String (Printf.sprintf "%08lx" gx.origin.fingerprint));
+             ("master_fingerprint", `String (format_fingerprint gx.origin.fingerprint));
            ]
          ) psbt.global_xpubs));
          ("psbt_version", `Int (match psbt.version with Some v -> Int32.to_int v | None -> 0));

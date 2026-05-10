@@ -43,6 +43,12 @@ let locktime_threshold = 500_000_000l  (* locktime < this = block height, >= = U
 let max_standard_p2wsh_script_size = 3600
 let max_standard_p2wsh_stack_items = 100
 let max_standard_p2wsh_stack_item_size = 80
+let max_standard_tapscript_stack_item_size = 80  (* BIP-342 / Core policy/policy.h *)
+
+(* Taproot / annex constants (BIP-341, BIP-342) *)
+let annex_tag = 0x50               (* ANNEX_TAG: first byte of annex *)
+let taproot_leaf_mask = 0xfe       (* TAPROOT_LEAF_MASK: mask leaf version from control block[0] *)
+let taproot_leaf_tapscript = 0xc0  (* TAPROOT_LEAF_TAPSCRIPT: leaf version for BIP-342 tapscript *)
 
 (* Version bits for soft fork deployment (BIP-9) *)
 let versionbits_top_mask = 0xE0000000l

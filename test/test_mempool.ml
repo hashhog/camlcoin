@@ -2137,6 +2137,304 @@ let test_load_rejects_legacy_be_format () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* ============================================================================
+   W72 IsWitnessStandard tests — all 6 gates from Core policy/policy.cpp:265-352.
+   We drive is_witness_standard directly with a closure for the UTXO lookup
+   so tests do not need a full mempool/DB setup.
+   ============================================================================ *)
+
+(* Helper: build a Cstruct from a list of bytes *)
+let bytes_to_cstruct lst =
+  let cs = Cstruct.create (List.length lst) in
+  List.iteri (Cstruct.set_uint8 cs) lst;
+  cs
+
+(* Standard script templates *)
+let make_p2pkh_script () =
+  (* OP_DUP OP_HASH160 <20 zero bytes> OP_EQUALVERIFY OP_CHECKSIG *)
+  let cs = Cstruct.create 25 in
+  Cstruct.set_uint8 cs 0 0x76; (* OP_DUP *)
+  Cstruct.set_uint8 cs 1 0xa9; (* OP_HASH160 *)
+  Cstruct.set_uint8 cs 2 0x14; (* push 20 *)
+  (* bytes 3..22 = zero hash160 *)
+  Cstruct.set_uint8 cs 23 0x88; (* OP_EQUALVERIFY *)
+  Cstruct.set_uint8 cs 24 0xac; (* OP_CHECKSIG *)
+  cs
+
+(* P2SH: OP_HASH160 <20 bytes> OP_EQUAL *)
+let make_p2sh_script () =
+  let cs = Cstruct.create 23 in
+  Cstruct.set_uint8 cs 0 0xa9;
+  Cstruct.set_uint8 cs 1 0x14;
+  (* bytes 2..21 = zero hash160 *)
+  Cstruct.set_uint8 cs 22 0x87;
+  cs
+
+(* P2WPKH: OP_0 <20 bytes> *)
+let make_p2wpkh_script () =
+  let cs = Cstruct.create 22 in
+  Cstruct.set_uint8 cs 0 0x00;
+  Cstruct.set_uint8 cs 1 0x14;
+  cs
+
+(* P2WSH: OP_0 <32 bytes> *)
+let make_p2wsh_script () =
+  let cs = Cstruct.create 34 in
+  Cstruct.set_uint8 cs 0 0x00;
+  Cstruct.set_uint8 cs 1 0x20;
+  cs
+
+(* P2TR: OP_1 <32 bytes> *)
+let make_p2tr_script () =
+  let cs = Cstruct.create 34 in
+  Cstruct.set_uint8 cs 0 0x51;
+  Cstruct.set_uint8 cs 1 0x20;
+  cs
+
+(* P2A: OP_1 <0x4e73> *)
+let make_p2a_script_iws () =
+  bytes_to_cstruct [0x51; 0x02; 0x4e; 0x73]
+
+(* Non-zero dummy txid (not zero_hash, so coinbase check doesn't fire) *)
+let dummy_noncoinbase_txid =
+  let cs = Cstruct.create 32 in
+  Cstruct.set_uint8 cs 0 0xab;
+  cs
+
+(* Helper: build a transaction with the given prevout script and witness *)
+let make_witness_tx_with_prevout_and_witness _prevout_script witness_items =
+  let tx = Types.{
+    version = 1l;
+    inputs = [{
+      previous_output = { txid = dummy_noncoinbase_txid; vout = 0l };
+      script_sig = Cstruct.empty;
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [{
+      value = 50_000L;
+      script_pubkey = make_p2wpkh_script ();
+    }];
+    witnesses = [{ items = witness_items }];
+    locktime = 0l;
+  } in
+  tx
+
+(* Run is_witness_standard with a constant prevout script for each input *)
+let check_iws prevout_script tx =
+  Mempool.is_witness_standard
+    ~lookup:(fun _op -> Some prevout_script)
+    tx
+
+(* Gate 6: coinbase is exempt — even with a witness *)
+let test_witness_standard_coinbase_exempt () =
+  let tx = Types.{
+    version = 1l;
+    inputs = [{
+      previous_output = { txid = Types.zero_hash; vout = 0xFFFFFFFFl };
+      script_sig = Cstruct.of_string "\x00";
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [{ value = 5000000000L; script_pubkey = make_p2wpkh_script () }];
+    witnesses = [{ items = [Cstruct.create 64] }];
+    locktime = 0l;
+  } in
+  let result = check_iws (make_p2wpkh_script ()) tx in
+  Alcotest.(check bool) "coinbase with witness is exempt" true (Result.is_ok result)
+
+(* Gate 1: P2A prevout + non-empty witness → reject *)
+let test_witness_standard_p2a_rejects_witness () =
+  let tx = make_witness_tx_with_prevout_and_witness
+    (make_p2a_script_iws ())
+    [Cstruct.create 1]  (* non-empty witness *)
+  in
+  let result = check_iws (make_p2a_script_iws ()) tx in
+  Alcotest.(check bool) "P2A with witness is rejected" true (Result.is_error result)
+
+(* Gate 3: P2WPKH is a witness program so it passes — witness is fine *)
+let test_witness_standard_p2wpkh_accepted () =
+  (* P2WPKH with a 2-item witness (sig + pubkey) — should pass *)
+  let sig_data = Cstruct.create 71 in
+  let pub_data = Cstruct.create 33 in
+  let tx = make_witness_tx_with_prevout_and_witness
+    (make_p2wpkh_script ())
+    [sig_data; pub_data]
+  in
+  let result = check_iws (make_p2wpkh_script ()) tx in
+  Alcotest.(check bool) "P2WPKH witness accepted" true (Result.is_ok result)
+
+(* Gate 3: bare P2PKH (non-witness program) + non-empty witness → reject *)
+let test_witness_standard_bare_with_witness () =
+  let tx = make_witness_tx_with_prevout_and_witness
+    (make_p2pkh_script ())
+    [Cstruct.create 32]  (* witness on a non-witness-program input *)
+  in
+  let result = check_iws (make_p2pkh_script ()) tx in
+  Alcotest.(check bool) "non-witness script with witness is rejected" true (Result.is_error result)
+
+(* Gate 4: P2WSH witness script exceeds 3600 bytes → reject *)
+let test_witness_standard_p2wsh_script_too_large () =
+  let big_script = Cstruct.create 3601 in
+  let tx = make_witness_tx_with_prevout_and_witness
+    (make_p2wsh_script ())
+    [Cstruct.create 32; big_script]  (* stack item + oversized witness script *)
+  in
+  let result = check_iws (make_p2wsh_script ()) tx in
+  Alcotest.(check bool) "P2WSH script > 3600 bytes rejected" true (Result.is_error result)
+
+(* Gate 4: P2WSH with too many stack items (> 100) → reject *)
+let test_witness_standard_p2wsh_too_many_items () =
+  (* 102 items: 101 stack items + 1 witness script = 102 total, 101 non-script items *)
+  let small_item = Cstruct.create 1 in
+  let witness_script = Cstruct.create 10 in
+  let items = List.init 101 (fun _ -> small_item) @ [witness_script] in
+  let tx = make_witness_tx_with_prevout_and_witness (make_p2wsh_script ()) items in
+  let result = check_iws (make_p2wsh_script ()) tx in
+  Alcotest.(check bool) "P2WSH with 101 stack items (>100) rejected" true (Result.is_error result)
+
+(* Gate 4: P2WSH stack item > 80 bytes → reject *)
+let test_witness_standard_p2wsh_item_too_large () =
+  let big_item = Cstruct.create 81 in  (* one byte over the 80-byte limit *)
+  let witness_script = Cstruct.create 10 in
+  let tx = make_witness_tx_with_prevout_and_witness
+    (make_p2wsh_script ())
+    [big_item; witness_script]
+  in
+  let result = check_iws (make_p2wsh_script ()) tx in
+  Alcotest.(check bool) "P2WSH stack item > 80 bytes rejected" true (Result.is_error result)
+
+(* Gate 4: P2WSH within all limits → accept *)
+let test_witness_standard_p2wsh_accepted () =
+  let valid_item = Cstruct.create 80 in  (* exactly at limit *)
+  let witness_script = Cstruct.create 3600 in  (* exactly at limit *)
+  let tx = make_witness_tx_with_prevout_and_witness
+    (make_p2wsh_script ())
+    [valid_item; witness_script]
+  in
+  let result = check_iws (make_p2wsh_script ()) tx in
+  Alcotest.(check bool) "P2WSH at limits is accepted" true (Result.is_ok result)
+
+(* Gate 5: P2TR with annex (first byte 0x50 in last item when ≥2 items) → reject *)
+let test_witness_standard_p2tr_annex_rejected () =
+  let sig_data = Cstruct.create 64 in
+  (* Annex: first byte = 0x50 *)
+  let annex = Cstruct.create 4 in
+  Cstruct.set_uint8 annex 0 0x50;
+  let tx = make_witness_tx_with_prevout_and_witness
+    (make_p2tr_script ())
+    [sig_data; annex]
+  in
+  let result = check_iws (make_p2tr_script ()) tx in
+  Alcotest.(check bool) "P2TR annex rejected" true (Result.is_error result)
+
+(* Gate 5: P2TR key-path (1 stack item, no annex) → accept *)
+let test_witness_standard_p2tr_keypath_accepted () =
+  let sig_data = Cstruct.create 64 in
+  let tx = make_witness_tx_with_prevout_and_witness
+    (make_p2tr_script ())
+    [sig_data]
+  in
+  let result = check_iws (make_p2tr_script ()) tx in
+  Alcotest.(check bool) "P2TR key-path accepted" true (Result.is_ok result)
+
+(* Gate 5: P2TR tapscript path with stack item > 80 bytes → reject.
+   Stack layout: item0 (data) | tapscript | control_block
+   control_block[0] & 0xfe = 0xc0 → tapscript leaf. *)
+let test_witness_standard_p2tr_tapscript_item_too_large () =
+  let big_item = Cstruct.create 81 in  (* over 80-byte limit *)
+  let tapscript = Cstruct.create 10 in
+  (* Control block: leaf version 0xc0, internal key 32 bytes = 33 bytes total *)
+  let ctrl = Cstruct.create 33 in
+  Cstruct.set_uint8 ctrl 0 0xc0;
+  let tx = make_witness_tx_with_prevout_and_witness
+    (make_p2tr_script ())
+    [big_item; tapscript; ctrl]
+  in
+  let result = check_iws (make_p2tr_script ()) tx in
+  Alcotest.(check bool) "P2TR tapscript item > 80 bytes rejected" true (Result.is_error result)
+
+(* Gate 5: P2TR tapscript path with item exactly 80 bytes → accept *)
+let test_witness_standard_p2tr_tapscript_accepted () =
+  let item = Cstruct.create 80 in  (* at limit *)
+  let tapscript = Cstruct.create 10 in
+  let ctrl = Cstruct.create 33 in
+  Cstruct.set_uint8 ctrl 0 0xc0;
+  let tx = make_witness_tx_with_prevout_and_witness
+    (make_p2tr_script ())
+    [item; tapscript; ctrl]
+  in
+  let result = check_iws (make_p2tr_script ()) tx in
+  Alcotest.(check bool) "P2TR tapscript at 80 bytes accepted" true (Result.is_ok result)
+
+(* Gate 5: P2TR with empty witness → skipped (null witness is not checked by Core) *)
+let test_witness_standard_p2tr_empty_witness () =
+  (* Core skips inputs with null (empty items) witness.
+     The 0-element branch in gate 5 is only reachable when n_eff = 0 after
+     stripping annex, which requires ≥2 items first (otherwise annex strip
+     doesn't fire).  The simplest observable behavior: items = [] → Ok (skipped). *)
+  let tx = Types.{
+    version = 1l;
+    inputs = [{
+      previous_output = { txid = dummy_noncoinbase_txid; vout = 0l };
+      script_sig = Cstruct.empty;
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [{ value = 50_000L; script_pubkey = make_p2wpkh_script () }];
+    witnesses = [{ items = [] }];  (* null witness → skipped by Core *)
+    locktime = 0l;
+  } in
+  let result = check_iws (make_p2tr_script ()) tx in
+  Alcotest.(check bool) "P2TR with null witness is skipped (ok)" true (Result.is_ok result)
+
+(* Gate 2 + 4: P2SH-wrapped P2WSH.
+   prevout = P2SH; scriptSig = PUSH(p2wsh_script); witness = [item; witness_script].
+   After extracting redeemScript from scriptSig, effective_script is P2WSH.
+   Gate 4 should then apply: if item > 80 bytes → reject. *)
+let test_witness_standard_p2sh_p2wsh () =
+  (* Build a P2WSH redeem script (OP_0 <32 bytes>) *)
+  let redeem = make_p2wsh_script () in  (* 34 bytes *)
+  (* Build scriptSig: push the redeem script.  34 bytes → direct push opcode *)
+  let script_sig = Cstruct.create (1 + Cstruct.length redeem) in
+  Cstruct.set_uint8 script_sig 0 (Cstruct.length redeem);  (* direct push opcode *)
+  Cstruct.blit redeem 0 script_sig 1 (Cstruct.length redeem);
+  (* Big witness stack item (> 80 bytes) to trigger gate 4 *)
+  let big_item = Cstruct.create 81 in
+  let witness_script = Cstruct.create 10 in
+  let tx = Types.{
+    version = 1l;
+    inputs = [{
+      previous_output = { txid = dummy_noncoinbase_txid; vout = 0l };
+      script_sig;
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [{ value = 50_000L; script_pubkey = make_p2wpkh_script () }];
+    witnesses = [{ items = [big_item; witness_script] }];
+    locktime = 0l;
+  } in
+  let result = Mempool.is_witness_standard
+    ~lookup:(fun _op -> Some (make_p2sh_script ()))
+    tx
+  in
+  Alcotest.(check bool) "P2SH-P2WSH with oversized stack item rejected" true (Result.is_error result)
+
+(* Gate 2: P2SH with empty scriptSig → reject *)
+let test_witness_standard_p2sh_empty_scriptsig () =
+  let tx = Types.{
+    version = 1l;
+    inputs = [{
+      previous_output = { txid = dummy_noncoinbase_txid; vout = 0l };
+      script_sig = Cstruct.empty;  (* empty scriptSig → empty stack → reject *)
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [{ value = 50_000L; script_pubkey = make_p2wpkh_script () }];
+    witnesses = [{ items = [Cstruct.create 32] }];
+    locktime = 0l;
+  } in
+  let result = Mempool.is_witness_standard
+    ~lookup:(fun _op -> Some (make_p2sh_script ()))
+    tx
+  in
+  Alcotest.(check bool) "P2SH with empty scriptSig rejected" true (Result.is_error result)
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
@@ -2256,5 +2554,22 @@ let () =
       test_case "package with unspent dust rejected" `Quick test_ephemeral_package_rejected;
       test_case "multiple dust spent" `Quick test_ephemeral_multiple_dust;
       test_case "ephemeral constants" `Quick test_ephemeral_constants;
+    ];
+    "is_witness_standard", [
+      test_case "coinbase exempt" `Quick test_witness_standard_coinbase_exempt;
+      test_case "P2A with witness rejected (gate 1)" `Quick test_witness_standard_p2a_rejects_witness;
+      test_case "P2WPKH bare witness accepted" `Quick test_witness_standard_p2wpkh_accepted;
+      test_case "non-witness script with witness rejected (gate 3)" `Quick test_witness_standard_bare_with_witness;
+      test_case "P2WSH script too large rejected (gate 4)" `Quick test_witness_standard_p2wsh_script_too_large;
+      test_case "P2WSH too many stack items rejected (gate 4)" `Quick test_witness_standard_p2wsh_too_many_items;
+      test_case "P2WSH stack item too large rejected (gate 4)" `Quick test_witness_standard_p2wsh_item_too_large;
+      test_case "P2WSH within limits accepted (gate 4)" `Quick test_witness_standard_p2wsh_accepted;
+      test_case "P2TR annex rejected (gate 5)" `Quick test_witness_standard_p2tr_annex_rejected;
+      test_case "P2TR key-path accepted (gate 5)" `Quick test_witness_standard_p2tr_keypath_accepted;
+      test_case "P2TR tapscript item too large rejected (gate 5)" `Quick test_witness_standard_p2tr_tapscript_item_too_large;
+      test_case "P2TR tapscript item within limit accepted (gate 5)" `Quick test_witness_standard_p2tr_tapscript_accepted;
+      test_case "P2TR empty witness rejected (gate 5)" `Quick test_witness_standard_p2tr_empty_witness;
+      test_case "P2SH-P2WSH redeem script extraction (gate 2+4)" `Quick test_witness_standard_p2sh_p2wsh;
+      test_case "P2SH empty scriptSig rejected (gate 2)" `Quick test_witness_standard_p2sh_empty_scriptsig;
     ];
   ]

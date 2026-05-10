@@ -94,7 +94,7 @@ let select_transactions (mp : Mempool.mempool) (max_weight : int)
         0 package in
 
       let pkg_sigops = List.fold_left (fun acc (e : Mempool.mempool_entry) ->
-        acc + Mempool.count_tx_sigops_cost e.tx
+        acc + Mempool.count_tx_sigops_cost e.tx mp
       ) 0 package in
 
       if !total_sigops_cost + pkg_sigops > Consensus.max_block_sigops_cost then
@@ -479,7 +479,8 @@ let template_to_json (template : block_template) : Yojson.Safe.t =
       ("txid", `String (Types.hash256_to_hex_display txid));
       ("fee", `Int (Int64.to_int fee));
       ("depends", `List (List.map (fun i -> `Int i) depends));
-      ("sigops", `Int (Mempool.count_tx_sigops_cost tx));
+      ("sigops", `Int (Validation.count_tx_sigops_cost_simple tx
+                         ~prev_script_pubkey_lookup:(fun _ -> None)));
       ("weight", `Int (Validation.compute_tx_weight tx));
     ]
   ) template.transactions in

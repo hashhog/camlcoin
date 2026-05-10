@@ -72,6 +72,7 @@ and descriptor =
   | Sh of descriptor                          (* sh(SCRIPT) *)
   | Wsh of descriptor                         (* wsh(SCRIPT) *)
   | Tr of key_expr * tap_tree option          (* tr(KEY) or tr(KEY, TREE) *)
+  | Rawtr of key_expr                         (* rawtr(KEY) — BIP-386: x-only key, no tweak *)
   | Multi of int * key_expr list              (* multi(k, KEY, ...) *)
   | SortedMulti of int * key_expr list        (* sortedmulti(k, KEY, ...) *)
   | Combo of key_expr                         (* combo(KEY) *)
@@ -442,6 +443,17 @@ let rec parse_descriptor_inner (s : string) : (descriptor, string) result =
       match parse_descriptor_inner inner_str with
       | Error e -> Error ("wsh: " ^ e)
       | Ok inner -> Ok (Wsh inner)
+  (* rawtr(KEY) — BIP-386: x-only pubkey used directly as output key, no tweak
+     Must be checked before tr() to avoid "rawtr" matching the "tr(" prefix check *)
+  else if String.length s > 6 && String.sub s 0 6 = "rawtr(" then
+    match find_matching_paren s 5 with
+    | None -> Error "unmatched parenthesis in rawtr()"
+    | Some close ->
+      let key_str = String.sub s 6 (close - 6) in
+      begin match parse_key key_str `P2TR with
+      | Error e -> Error ("rawtr: " ^ e)
+      | Ok key -> Ok (Rawtr key)
+      end
   (* tr(KEY) or tr(KEY, TREE) *)
   else if String.length s > 3 && String.sub s 0 3 = "tr(" then
     match find_matching_paren s 2 with
@@ -848,6 +860,23 @@ let rec expand (desc : descriptor) (index : int) (network : Address.network)
             pubkeys = [pubkey]; address = Some addr }]
     end
 
+  | Rawtr key ->
+    (* BIP-386: the x-only pubkey IS the output key — no taproot tweak applied.
+       Core: issolvable=true (key-path spend is known), isrange=false for const keys. *)
+    begin match derive_key_at key index with
+    | Error e -> Error e
+    | Ok pubkey ->
+      let xonly = get_xonly_pubkey pubkey in
+      let script = build_p2tr_script xonly in
+      let addr = Address.address_to_string {
+        addr_type = Address.P2TR;
+        hash = xonly;
+        network;
+      } in
+      Ok [{ script_pubkey = script; script_type = ScriptP2TR;
+            pubkeys = [pubkey]; address = Some addr }]
+    end
+
   | Multi (k, keys) ->
     let pubkeys_result = List.map (fun key -> derive_key_at key index) keys in
     let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) pubkeys_result in
@@ -964,7 +993,7 @@ let rec is_ranged (desc : descriptor) : bool =
     | Xpub { derive; _ } -> derive <> NonRanged
   in
   match desc with
-  | Pk k | Pkh k | Wpkh k | Combo k -> key_is_ranged k
+  | Pk k | Pkh k | Wpkh k | Combo k | Rawtr k -> key_is_ranged k
   | Tr (k, tree) ->
     key_is_ranged k || (match tree with Some t -> tap_tree_is_ranged t | None -> false)
   | Multi (_, keys) | SortedMulti (_, keys) ->
@@ -1053,6 +1082,7 @@ and to_string (desc : descriptor) : string =
   | Wsh inner -> "wsh(" ^ to_string inner ^ ")"
   | Tr (key, None) -> "tr(" ^ key_to_string key ^ ")"
   | Tr (key, Some tree) -> "tr(" ^ key_to_string key ^ "," ^ tap_tree_to_string tree ^ ")"
+  | Rawtr key -> "rawtr(" ^ key_to_string key ^ ")"
   | Multi (k, keys) ->
     "multi(" ^ string_of_int k ^ "," ^
     String.concat "," (List.map key_to_string keys) ^ ")"
@@ -1090,7 +1120,7 @@ let rec has_private_keys (desc : descriptor) : bool =
     | ConstPubkey _ -> false
   in
   match desc with
-  | Pk k | Pkh k | Wpkh k | Combo k -> key_has_private k
+  | Pk k | Pkh k | Wpkh k | Combo k | Rawtr k -> key_has_private k
   | Tr (k, tree) ->
     key_has_private k ||
     (match tree with Some t -> tap_tree_has_private t | None -> false)
@@ -1112,7 +1142,7 @@ and tap_tree_has_private (tree : tap_tree) : bool =
 let rec is_solvable (desc : descriptor) : bool =
   match desc with
   | Pk _ | Pkh _ | Wpkh _ | Combo _ -> true
-  | Tr _ -> true
+  | Tr _ | Rawtr _ -> true
   | Multi _ | SortedMulti _ -> true
   | Sh inner | Wsh inner -> is_solvable inner
   | Ms _ -> true  (* Miniscript is solvable - we know the structure *)

@@ -1042,6 +1042,236 @@ let check_p2wsh_witness_limits (tx : Types.transaction) : (unit, string) result 
   | Some e -> Error e
   | None -> Ok ()
 
+(* IsWitnessStandard — per-input witness policy check.
+   Reference: Bitcoin Core policy/policy.cpp:265-352.
+
+   Called after IsStandardTx when the transaction has any witness data.
+   Iterates over every input.  Skips inputs whose witness is null (empty items).
+
+   The six gates (in Core order):
+     Gate 1 — P2A prevout + non-empty witness → "bad-witness-nonstandard"
+     Gate 2 — P2SH prevout: extract redeemScript from scriptSig (casually, no
+               hash check).  Fail/empty scriptSig → reject.
+     Gate 3 — non-witness prevScript + non-empty witness → reject
+     Gate 4 — P2WSH v0 32B:  script ≤ 3600;  stack items (excl. script) ≤ 100;
+               each item ≤ 80 bytes
+     Gate 5 — P2TR v1 32B (not P2SH-wrapped):
+               annex (stack.back[0] == 0x50 when ≥2 items) → reject;
+               tapscript path (control_block[0] & 0xfe == 0xc0): each item ≤ 80;
+               0-item stack → reject (already invalid by consensus)
+     Gate 6 — coinbase: exempt (return Ok immediately)
+
+   The function takes a UTXO lookup callback so it can be called from
+   add_transaction (which has the full mempool UTXO set) and from tests
+   (which pass a simple closure). *)
+let is_witness_standard
+    ~(lookup : Types.outpoint -> Cstruct.t option)
+    (tx : Types.transaction)
+    : (unit, string) result =
+  (* Gate 6: coinbases are exempt — same as Core's first check. *)
+  let first_input = List.hd tx.inputs in
+  if Cstruct.equal first_input.Types.previous_output.txid Types.zero_hash then
+    Ok ()
+  else begin
+    let error = ref None in
+    List.iteri (fun i inp ->
+      if !error = None then begin
+        let witness =
+          if i < List.length tx.witnesses then List.nth tx.witnesses i
+          else { Types.items = [] }
+        in
+        (* Skip inputs with null (empty) witness — Core does the same. *)
+        if witness.Types.items <> [] then begin
+          match lookup inp.Types.previous_output with
+          | None ->
+            (* No prevout info — cannot check; skip this input conservatively.
+               The script-verification pass will catch missing UTXOs. *)
+            ()
+          | Some prev_script ->
+            (* Gate 1: P2A + non-empty witness → reject. *)
+            if Script.is_p2a prev_script then
+              error := Some "bad-witness-nonstandard: P2A input with non-empty witness"
+            else begin
+              (* Gate 2: if prevout is P2SH, extract redeemScript from scriptSig.
+                 Core: EvalScript(stack, scriptSig, SCRIPT_VERIFY_NONE, ...) then
+                 prevScript = stack.back().  We simulate by walking push opcodes. *)
+              let p2sh = match Script.classify_script prev_script with
+                | Script.P2SH_script _ -> true
+                | _ -> false
+              in
+              let effective_script =
+                if p2sh then begin
+                  (* Walk scriptSig push ops to get last pushed item.
+                     Any failure (parse error, empty result) → reject. *)
+                  match (try
+                    let ops = Script.parse_script inp.Types.script_sig in
+                    (* Core's EvalScript in SCRIPT_VERIFY_NONE mode:
+                       push each item onto the stack without checking anything. *)
+                    let stack = List.filter_map (fun op ->
+                      match op with
+                      | Script.OP_0 -> Some Cstruct.empty
+                      | Script.OP_PUSHDATA (_, data) -> Some data
+                      | Script.OP_1NEGATE ->
+                        let cs = Cstruct.create 1 in
+                        Cstruct.set_uint8 cs 0 0x81; Some cs
+                      | Script.OP_1  -> let cs = Cstruct.create 1 in Cstruct.set_uint8 cs 0 1; Some cs
+                      | Script.OP_2  -> let cs = Cstruct.create 1 in Cstruct.set_uint8 cs 0 2; Some cs
+                      | Script.OP_3  -> let cs = Cstruct.create 1 in Cstruct.set_uint8 cs 0 3; Some cs
+                      | Script.OP_4  -> let cs = Cstruct.create 1 in Cstruct.set_uint8 cs 0 4; Some cs
+                      | Script.OP_5  -> let cs = Cstruct.create 1 in Cstruct.set_uint8 cs 0 5; Some cs
+                      | Script.OP_6  -> let cs = Cstruct.create 1 in Cstruct.set_uint8 cs 0 6; Some cs
+                      | Script.OP_7  -> let cs = Cstruct.create 1 in Cstruct.set_uint8 cs 0 7; Some cs
+                      | Script.OP_8  -> let cs = Cstruct.create 1 in Cstruct.set_uint8 cs 0 8; Some cs
+                      | Script.OP_9  -> let cs = Cstruct.create 1 in Cstruct.set_uint8 cs 0 9; Some cs
+                      | Script.OP_10 -> let cs = Cstruct.create 1 in Cstruct.set_uint8 cs 0 10; Some cs
+                      | Script.OP_11 -> let cs = Cstruct.create 1 in Cstruct.set_uint8 cs 0 11; Some cs
+                      | Script.OP_12 -> let cs = Cstruct.create 1 in Cstruct.set_uint8 cs 0 12; Some cs
+                      | Script.OP_13 -> let cs = Cstruct.create 1 in Cstruct.set_uint8 cs 0 13; Some cs
+                      | Script.OP_14 -> let cs = Cstruct.create 1 in Cstruct.set_uint8 cs 0 14; Some cs
+                      | Script.OP_15 -> let cs = Cstruct.create 1 in Cstruct.set_uint8 cs 0 15; Some cs
+                      | Script.OP_16 -> let cs = Cstruct.create 1 in Cstruct.set_uint8 cs 0 16; Some cs
+                      | _ -> None  (* non-push opcode: EvalScript returns false → reject *)
+                    ) ops in
+                    (* If any non-push opcode was encountered, filter_map skips it
+                       but doesn't signal failure.  Core would return false from
+                       EvalScript.  We detect this by checking parse succeeded and
+                       all ops produced Some. *)
+                    let all_push = List.for_all (fun op ->
+                      match op with
+                      | Script.OP_0 | Script.OP_PUSHDATA _ | Script.OP_1NEGATE
+                      | Script.OP_1  | Script.OP_2  | Script.OP_3  | Script.OP_4
+                      | Script.OP_5  | Script.OP_6  | Script.OP_7  | Script.OP_8
+                      | Script.OP_9  | Script.OP_10 | Script.OP_11 | Script.OP_12
+                      | Script.OP_13 | Script.OP_14 | Script.OP_15 | Script.OP_16 -> true
+                      | _ -> false
+                    ) ops in
+                    if not all_push then Error "non-push in scriptSig"
+                    else if stack = [] then Error "empty P2SH scriptSig stack"
+                    else Ok (List.nth stack (List.length stack - 1))
+                  with exn -> Error (Printexc.to_string exn)) with
+                  | Error msg ->
+                    error := Some (Printf.sprintf
+                      "bad-witness-nonstandard: P2SH scriptSig eval failed at input %d: %s" i msg);
+                    None
+                  | Ok redeem_script -> Some redeem_script
+                end else
+                  Some prev_script
+              in
+              match effective_script with
+              | None -> ()  (* error already set *)
+              | Some script ->
+                (* Gate 3: non-witness program + non-empty witness → reject. *)
+                (match Script.get_witness_program script with
+                | None ->
+                  error := Some (Printf.sprintf
+                    "bad-witness-nonstandard: non-witness script with witness at input %d" i)
+                | Some (version, program) ->
+                  (* Gate 4: P2WSH v0 (32-byte program) *)
+                  if version = 0 && Cstruct.length program = 32 then begin
+                    let items = witness.Types.items in
+                    let n = List.length items in
+                    if n = 0 then
+                      (* Empty witness for P2WSH is an error but caught by script
+                         execution.  Not a policy reject per Core — skip. *)
+                      ()
+                    else begin
+                      let witness_script = List.nth items (n - 1) in
+                      let script_size = Cstruct.length witness_script in
+                      if script_size > Consensus.max_standard_p2wsh_script_size then
+                        error := Some (Printf.sprintf
+                          "bad-witness-nonstandard: P2WSH witness script too large at input %d \
+                           (%d > %d)" i script_size Consensus.max_standard_p2wsh_script_size)
+                      else begin
+                        let stack_items = n - 1 in  (* exclude the witness script *)
+                        if stack_items > Consensus.max_standard_p2wsh_stack_items then
+                          error := Some (Printf.sprintf
+                            "bad-witness-nonstandard: too many P2WSH stack items at input %d \
+                             (%d > %d)" i stack_items Consensus.max_standard_p2wsh_stack_items)
+                        else begin
+                          let bad = ref None in
+                          List.iteri (fun j item ->
+                            if !bad = None && j < n - 1 then begin
+                              let item_len = Cstruct.length item in
+                              if item_len > Consensus.max_standard_p2wsh_stack_item_size then
+                                bad := Some (Printf.sprintf
+                                  "bad-witness-nonstandard: P2WSH stack item too large at \
+                                   input %d item %d (%d > %d)"
+                                  i j item_len Consensus.max_standard_p2wsh_stack_item_size)
+                            end
+                          ) items;
+                          match !bad with
+                          | Some e -> error := Some e
+                          | None -> ()
+                        end
+                      end
+                    end
+                  end
+                  (* Gate 5: P2TR v1 (32-byte program, not P2SH-wrapped) *)
+                  else if version = 1 && Cstruct.length program = 32 && not p2sh then begin
+                    let items = witness.Types.items in
+                    let n = List.length items in
+                    (* Strip optional annex from the back. *)
+                    let (has_annex, n_eff) =
+                      if n >= 2 then begin
+                        let last = List.nth items (n - 1) in
+                        if Cstruct.length last > 0 &&
+                           Cstruct.get_uint8 last 0 = Consensus.annex_tag then
+                          (* Annex is non-standard as long as no semantics defined. *)
+                          (true, n - 1)
+                        else
+                          (false, n)
+                      end else
+                        (false, n)
+                    in
+                    if has_annex then
+                      error := Some (Printf.sprintf
+                        "bad-witness-nonstandard: taproot annex present at input %d" i)
+                    else if n_eff >= 2 then begin
+                      (* Script-path spend: stack | script | control_block *)
+                      let control_block = List.nth items (n_eff - 1) in
+                      if Cstruct.length control_block = 0 then
+                        error := Some (Printf.sprintf
+                          "bad-witness-nonstandard: empty control block at input %d" i)
+                      else begin
+                        let leaf_version =
+                          Cstruct.get_uint8 control_block 0 land Consensus.taproot_leaf_mask in
+                        if leaf_version = Consensus.taproot_leaf_tapscript then begin
+                          (* BIP-342 tapscript: check stack items (excl. script + ctrl block) *)
+                          let stack_top = n_eff - 2 in  (* items[0..stack_top-1] *)
+                          let bad = ref None in
+                          List.iteri (fun j item ->
+                            if !bad = None && j < stack_top then begin
+                              let item_len = Cstruct.length item in
+                              if item_len > Consensus.max_standard_tapscript_stack_item_size then
+                                bad := Some (Printf.sprintf
+                                  "bad-witness-nonstandard: tapscript stack item too large at \
+                                   input %d item %d (%d > %d)"
+                                  i j item_len Consensus.max_standard_tapscript_stack_item_size)
+                            end
+                          ) items;
+                          match !bad with
+                          | Some e -> error := Some e
+                          | None -> ()
+                        end
+                        (* Other leaf versions: no additional policy rules. *)
+                      end
+                    end else if n_eff = 1 then
+                      (* Key-path spend: one stack element.  No extra policy. *)
+                      ()
+                    else
+                      (* Zero elements: invalid by consensus but reject as non-standard. *)
+                      error := Some (Printf.sprintf
+                        "bad-witness-nonstandard: empty taproot witness stack at input %d" i)
+                  end)
+            end
+        end
+      end
+    ) tx.inputs;
+    match !error with
+    | Some e -> Error e
+    | None -> Ok ()
+  end
+
 (* Policy constants matching Bitcoin Core policy/policy.h *)
 let max_standard_scriptsig_size = 1650  (* MAX_STANDARD_SCRIPTSIG_SIZE *)
 let min_standard_tx_nonwitness_size = 65 (* MIN_STANDARD_TX_NONWITNESS_SIZE — CVE-2017-12842 *)
@@ -1147,7 +1377,10 @@ let is_standard_tx (min_relay_fee : int64) (tx : Types.transaction) : (unit, str
                 "dust: transaction has %d dust outputs (max %d)"
                 dust_count max_dust_outputs_per_tx)
             else begin
-              (* Gate 7: P2WSH witness policy limits (stack item count/size) *)
+              (* Gate 7: P2WSH witness policy limits (stack item count/size).
+                 This is a heuristic pre-check that does not require prevout lookup.
+                 The full per-prevout check (including P2TR, annex, P2SH unwrapping)
+                 is performed by is_witness_standard, called from add_transaction. *)
               check_p2wsh_witness_limits tx
             end
       end
@@ -1481,6 +1714,22 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (t
     | Error e -> Error e
     | Ok () ->
 
+    (* IsWitnessStandard checks (skipped when require_standard=false).
+       Core: validation.cpp:904 — guarded by tx.HasWitness() + require_standard.
+       We check witnesses <> [] as camlcoin's HasWitness equivalent.
+       The UTXO lookup is threaded in via a closure over mp. *)
+    let has_witness = List.exists (fun w -> w.Types.items <> []) tx.witnesses in
+    (match (if has_witness && mp.require_standard then
+      is_witness_standard
+        ~lookup:(fun op ->
+          match lookup_utxo mp op with
+          | Some e -> Some e.Utxo.script_pubkey
+          | None -> None)
+        tx
+    else Ok ()) with
+    | Error e -> Error e
+    | Ok () ->
+
     (* Phase 1C: Per-tx sigops cost check *)
     let sigops_cost = count_tx_sigops_cost tx in
     if sigops_cost > 80_000 then
@@ -1676,7 +1925,7 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (t
             Ok entry
           end
         end
-    end
+    end)
 
 (* ============================================================================
    Block Processing

@@ -2774,39 +2774,10 @@ let handle_loadmempool (ctx : rpc_context)
       Error (Printf.sprintf "Unable to load mempool: %s"
         (Printexc.to_string exn)))
 
-(* ============================================================================
-   UTXO Lookup Handler
-   ============================================================================ *)
-
-let handle_gettxout (ctx : rpc_context)
-    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
-  match params with
-  | [`String txid_hex; `Int vout] ->
-    let txid = parse_txid_param txid_hex in
-    let utxo_set = Utxo.UtxoSet.create ctx.chain.db in
-    (match Utxo.UtxoSet.get utxo_set txid vout with
-     | None -> Ok `Null
-     | Some utxo ->
-       let tip_hash_hex = match ctx.chain.tip with
-         | Some t -> Types.hash256_to_hex_display t.hash
-         | None -> "0000000000000000000000000000000000000000000000000000000000000000"
-       in
-       let tip_height = match ctx.chain.tip with
-         | Some t -> t.height
-         | None -> 0
-       in
-       let confirmations = max 1 (tip_height - utxo.Utxo.height + 1) in
-       Ok (`Assoc [
-         ("bestblock", `String tip_hash_hex);
-         ("confirmations", `Int confirmations);
-         ("value", `Float (Int64.to_float utxo.Utxo.value /. 100_000_000.0));
-         ("scriptPubKey", `Assoc [
-           (* W27-A: scriptPubKey is variable-length; hash256_to_hex truncates. *)
-           ("hex", `String (cstruct_to_hex_early utxo.Utxo.script_pubkey));
-         ]);
-         ("coinbase", `Bool utxo.Utxo.is_coinbase);
-       ]))
-  | _ -> Error "Invalid parameters: expected [txid, vout]"
+(* handle_gettxout is defined after psbt_script_pubkey_json / btc_amount_json
+   (W61) because it calls those helpers which are introduced in the W51/W52
+   block below.  The dispatch table that calls handle_gettxout is even later
+   in the file, so forward-ordering is not an issue. *)
 
 (* ============================================================================
    testmempoolaccept Handler
@@ -3806,6 +3777,44 @@ let psbt_script_pubkey_json (script : Cstruct.t) (network : Address.network) : Y
     | None      -> base
   in
   `Assoc (with_addr @ [("type", `String type_name)])
+
+(* ============================================================================
+   UTXO Lookup Handler  (W61 — moved here to use psbt_script_pubkey_json +
+   btc_amount_json; refactored from the stale W27-A stub that only emitted
+   {hex} and used float for value.)
+
+   Reference: bitcoin-core/src/rpc/blockchain.cpp gettxout (ScriptToUniv +
+   ValueFromAmount path).  Core shape (stripped by harness):
+     coinbase, scriptPubKey:{asm,desc,hex,address?,type}, value
+   ============================================================================ *)
+
+let handle_gettxout (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String txid_hex; `Int vout] ->
+    let txid = parse_txid_param txid_hex in
+    let utxo_set = Utxo.UtxoSet.create ctx.chain.db in
+    (match Utxo.UtxoSet.get utxo_set txid vout with
+     | None -> Ok `Null
+     | Some utxo ->
+       let tip_hash_hex = match ctx.chain.tip with
+         | Some t -> Types.hash256_to_hex_display t.hash
+         | None -> "0000000000000000000000000000000000000000000000000000000000000000"
+       in
+       let tip_height = match ctx.chain.tip with
+         | Some t -> t.height
+         | None -> 0
+       in
+       let confirmations = max 1 (tip_height - utxo.Utxo.height + 1) in
+       let net = network_to_address_network ctx.network in
+       Ok (`Assoc [
+         ("bestblock",    `String tip_hash_hex);
+         ("confirmations", `Int confirmations);
+         ("value",        btc_amount_json utxo.Utxo.value);
+         ("scriptPubKey", psbt_script_pubkey_json utxo.Utxo.script_pubkey net);
+         ("coinbase",     `Bool utxo.Utxo.is_coinbase);
+       ]))
+  | _ -> Error "Invalid parameters: expected [txid, vout]"
 
 (* W53 helpers for decodepsbt input-side records ─────────────────────────── *)
 

@@ -1213,12 +1213,281 @@ let test_accept_transaction_full_rbf () =
   cleanup_test_db ()
 
 (* ============================================================================
-   Test Runner
+   W73 BIP-125 RBF gate tests (comprehensive — 8 gates vs Core rbf.cpp)
    ============================================================================ *)
 
-(* ============================================================================
-   Package Relay Tests (BIP 331)
-   ============================================================================ *)
+(* Gate 1: signals_rbf — nSequence <= 0xFFFFFFFD (MAX_BIP125_RBF_SEQUENCE) signals.
+   W70 fixed the signed-int comparison gotcha; these tests verify the boundary. *)
+let test_rbf_gate1_boundary () =
+  (* sequence = 0xFFFFFFFD: at boundary → signals RBF *)
+  let tx_fd = make_regular_tx
+    [{ (make_test_input Types.zero_hash 0l) with
+       Types.sequence = 0xFFFFFFFDl }]
+    [make_test_output 100_000L] in
+  Alcotest.(check bool) "0xFFFFFFFD signals RBF" true (Mempool.signals_rbf tx_fd);
+  (* sequence = 0xFFFFFFFE: one above boundary → does NOT signal *)
+  let tx_fe = make_regular_tx
+    [{ (make_test_input Types.zero_hash 0l) with
+       Types.sequence = 0xFFFFFFFEl }]
+    [make_test_output 100_000L] in
+  Alcotest.(check bool) "0xFFFFFFFE does not signal" false (Mempool.signals_rbf tx_fe);
+  (* sequence = 0xFFFFFFFF: SEQUENCE_FINAL → does NOT signal *)
+  let tx_ff = make_regular_tx
+    [{ (make_test_input Types.zero_hash 0l) with
+       Types.sequence = 0xFFFFFFFFl }]
+    [make_test_output 100_000L] in
+  Alcotest.(check bool) "0xFFFFFFFF does not signal" false (Mempool.signals_rbf tx_ff);
+  (* sequence = 0 → signals RBF (W70 bug was: 0 > -2 = non-RBF) *)
+  let tx_zero = make_regular_tx
+    [{ (make_test_input Types.zero_hash 0l) with
+       Types.sequence = 0l }]
+    [make_test_output 100_000L] in
+  Alcotest.(check bool) "sequence=0 signals RBF (W70 fix)" true (Mempool.signals_rbf tx_zero)
+
+(* Gate 2: inheritable opt-in via mempool ancestors.
+   A tx whose own sequences don't signal but whose mempool parent signals → replaceable. *)
+let test_rbf_gate2_ancestor_inheritable () =
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  (* Add parent with RBF-signaling sequence *)
+  let parent_tx = make_regular_tx
+    [make_test_input_rbf txid1 0l]   (* signals RBF *)
+    [make_test_output 990_000L] in
+  let parent_entry = Result.get_ok (Mempool.add_transaction mp parent_tx) in
+  (* Child with FINAL sequence — does NOT signal RBF itself *)
+  let child_tx = make_regular_tx
+    [{ (make_test_input parent_entry.txid 0l) with
+       Types.sequence = 0xFFFFFFFFl }]  (* no own signal *)
+    [make_test_output 980_000L] in
+  (* signals_rbf alone: false (no own signal) *)
+  Alcotest.(check bool) "child own signal: false" false (Mempool.signals_rbf child_tx);
+  (* signals_rbf_with_ancestors: true (parent signals) *)
+  Alcotest.(check bool) "child inherits from parent" true
+    (Mempool.signals_rbf_with_ancestors mp child_tx);
+  (* A tx with no mempool parents should not inherit *)
+  let orphan_tx = make_regular_tx
+    [{ (make_test_input Types.zero_hash 0l) with
+       Types.sequence = 0xFFFFFFFFl }]
+    [make_test_output 100_000L] in
+  Alcotest.(check bool) "no parents → no inheritable RBF" false
+    (Mempool.signals_rbf_with_ancestors mp orphan_tx);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Gate 3: MAX_REPLACEMENT_CANDIDATES = 100 deduplicated.
+   If a tx is both a direct conflict and a descendant of another conflict, it
+   must only be counted once (Core uses a set<txiter>). *)
+let test_rbf_gate3_eviction_dedup () =
+  let (mp, utxo, db, txid1, txid2, _) = create_test_mempool () in
+  (* tx_a and tx_b both spend txid1:0 and txid2:0 respectively;
+     tx_c is a child of tx_a.  When we try to replace both tx_a and tx_b,
+     tx_c appears in the descendant set of tx_a and NOT as a direct conflict.
+     It should only be counted once. *)
+  let tx_a = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L] in
+  let entry_a = Result.get_ok (Mempool.add_transaction mp tx_a) in
+  let tx_b = make_regular_tx
+    [make_test_input txid2 0l]
+    [make_test_output 1_990_000L] in
+  let _entry_b = Result.get_ok (Mempool.add_transaction mp tx_b) in
+  (* Add a child of tx_a *)
+  Utxo.UtxoSet.add utxo entry_a.txid 0 Utxo.{
+    value = 990_000L;
+    script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac";
+    height = 100; is_coinbase = false;
+  };
+  let _child_a = Mempool.add_transaction mp (make_regular_tx
+    [make_test_input entry_a.txid 0l]
+    [make_test_output 980_000L]) in
+  (* Replacement spending both txid1:0 and txid2:0 with high enough fee *)
+  let replacement = make_regular_tx
+    [make_test_input txid1 0l; make_test_input txid2 0l]
+    [make_test_output 2_950_000L] in  (* fee = 40k, beats 10k+10k+10k *)
+  let result = Mempool.replace_by_fee mp replacement in
+  (* Should succeed — dedup means eviction_count = 3 (tx_a, tx_b, child_a), not 4 *)
+  Alcotest.(check bool) "deduped eviction count allows replacement" true (Result.is_ok result);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Gate 3: the 100-eviction hard limit is enforced after dedup *)
+let test_rbf_gate3_eviction_limit_enforced () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let utxo = Utxo.UtxoSet.create db in
+  (* Create 101 independent confirmed UTXOs *)
+  let txids = Array.init 101 (fun i ->
+    let txid = Cstruct.create 32 in
+    Cstruct.set_uint8 txid 0 (i + 2);
+    Utxo.UtxoSet.add utxo txid 0 Utxo.{
+      value = 100_000L;
+      script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac";
+      height = 0; is_coinbase = false;
+    };
+    txid) in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
+  (* Add a shared parent UTXO *)
+  let shared_txid = Types.hash256_of_hex
+    "2222222222222222222222222222222222222222222222222222222222222222" in
+  Utxo.UtxoSet.add utxo shared_txid 0 Utxo.{
+    value = 50_000_000L;
+    script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac";
+    height = 0; is_coinbase = false;
+  };
+  (* Add 101 txs each spending a different UTXO + shared_txid → all conflict on shared_txid *)
+  (* Actually, simpler: add 101 independent txs each spending one of txids, then
+     one mega-replacement that spends the UTXO of each → would evict all 101 *)
+  Array.iter (fun txid ->
+    let tx = make_regular_tx [make_test_input txid 0l] [make_test_output 99_000L] in
+    ignore (Mempool.add_transaction mp tx)
+  ) txids;
+  (* Replacement spending all 101 source UTXOs → needs to evict all 101 conflicting txs *)
+  let inputs = Array.to_list (Array.map (fun txid -> make_test_input txid 0l) txids) in
+  let replacement = make_regular_tx inputs [make_test_output 9_000_000L] in
+  let result = Mempool.replace_by_fee mp replacement in
+  Alcotest.(check bool) "101 evictions rejected (> 100)" true (Result.is_error result);
+  (match result with
+   | Error msg -> Alcotest.(check bool) "error mentions too many" true
+       (let re = Str.regexp "too many" in
+        (try ignore (Str.search_forward re msg 0); true with Not_found -> false))
+   | Ok _ -> ());
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Gate 5: EntriesAndTxidsDisjoint — replacement must not spend a conflicting tx.
+   If ancestor(replacement) ∩ direct_conflicts ≠ ∅ → reject. *)
+let test_rbf_gate5_entries_txids_disjoint () =
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  (* Add tx_parent spending txid1:0 → it's in the mempool *)
+  let tx_parent = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L] in
+  let parent_entry = Result.get_ok (Mempool.add_transaction mp tx_parent) in
+  (* tx_replacement conflicts with tx_parent (spends txid1:0) but ALSO
+     spends an output of tx_parent (parent_entry.txid:0).
+     tx_parent is a direct conflict AND an ancestor → disjoint check fires. *)
+  let replacement = make_regular_tx
+    [make_test_input txid1 0l;
+     make_test_input parent_entry.txid 0l]  (* ancestor = conflict *)
+    [make_test_output 1_950_000L] in
+  let result = Mempool.replace_by_fee mp replacement in
+  Alcotest.(check bool) "spends conflicting ancestor → rejected" true (Result.is_error result);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Gate 6: Rule #3 — replacement_fees >= original_fees.
+   Core: PaysForRBF rejects when replacement_fees < original_fees.
+   Equal fee is ALLOWED.  Old code used <= (too strict). *)
+let test_rbf_gate6_equal_fee_allowed () =
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  let tx_orig = make_regular_tx
+    [make_test_input_rbf txid1 0l]
+    [make_test_output 990_000L]  (* 10k fee *)
+  in
+  let _ = Mempool.add_transaction mp tx_orig in
+  (* Replacement with exactly equal fee — Core allows this (Rule #3: >= not >) *)
+  let tx_equal_fee = make_regular_tx
+    [make_test_input_rbf txid1 0l]
+    [make_test_output 990_000L]  (* same 10k fee — but different outputs so different txid *)
+  in
+  (* Distinct txid is needed — add a dummy extra output to differentiate *)
+  let tx_equal_fee = { tx_equal_fee with Types.outputs =
+    [make_test_output 985_000L; make_test_output 5_000L] } in
+  (* 990k = 985k + 5k → still 10k fee *)
+  let result = Mempool.replace_by_fee mp tx_equal_fee in
+  (* Rule #4 (additional fees) will decide, but Rule #3 must not reject equal fees *)
+  (* With equal fees (additional_fees=0), Rule #4 will reject due to relay fee.
+     The important thing is the error is NOT "less fees than conflicting txs". *)
+  (match result with
+   | Error msg ->
+     let is_rule3 = let re = Str.regexp "less fees" in
+       (try ignore (Str.search_forward re msg 0); true with Not_found -> false) in
+     Alcotest.(check bool) "Rule #3 does not reject equal fees" false is_rule3
+   | Ok _ -> ());  (* if it passes (e.g. feerate check passes), that's also fine *)
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Gate 6: lower fee is correctly rejected *)
+let test_rbf_gate6_lower_fee_rejected () =
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  let tx_orig = make_regular_tx
+    [make_test_input_rbf txid1 0l]
+    [make_test_output 900_000L]  (* 100k fee *)
+  in
+  let _ = Mempool.add_transaction mp tx_orig in
+  let tx_lower = make_regular_tx
+    [make_test_input_rbf txid1 0l]
+    [make_test_output 950_000L]  (* 50k fee — lower *)
+  in
+  let result = Mempool.replace_by_fee mp tx_lower in
+  Alcotest.(check bool) "lower fee rejected (Rule #3)" true (Result.is_error result);
+  (match result with
+   | Error msg ->
+     let has_msg = let re = Str.regexp "less fees" in
+       (try ignore (Str.search_forward re msg 0); true with Not_found -> false) in
+     Alcotest.(check bool) "Rule #3 error message" true has_msg
+   | Ok _ -> ());
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Gate 7: Rule #4 — additional_fees >= relay_fee.GetFee(replacement_vsize).
+   Tests that bumping fee by exactly the min increment succeeds. *)
+let test_rbf_gate7_pays_for_rbf_bandwidth () =
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  (* mp.min_relay_fee = 1000 sat/kvB; tx ~452 WU = 113 vbytes.
+     relay_fee_for_replacement = floor(1000 * 113 / 1000) = 113 sat.
+     original_fee = 10_000; need additional >= 113. *)
+  let tx_orig = make_regular_tx
+    [make_test_input_rbf txid1 0l]
+    [make_test_output 990_000L]  (* 10k fee *)
+  in
+  let _ = Mempool.add_transaction mp tx_orig in
+  (* Bump by only 1 satoshi — should fail Rule #4 *)
+  let tx_tiny_bump = make_regular_tx
+    [make_test_input_rbf txid1 0l]
+    [make_test_output 989_999L]  (* 10_001 fee — only 1 sat extra *)
+  in
+  let result_tiny = Mempool.replace_by_fee mp tx_tiny_bump in
+  Alcotest.(check bool) "1-sat bump fails Rule #4" true (Result.is_error result_tiny);
+  (* Bump by 2000 satoshi — should pass Rule #4 *)
+  let tx_good_bump = make_regular_tx
+    [make_test_input_rbf txid1 0l]
+    [make_test_output 988_000L]  (* 12k fee — 2k extra *)
+  in
+  let result_good = Mempool.replace_by_fee mp tx_good_bump in
+  Alcotest.(check bool) "2k-sat bump passes Rule #4" true (Result.is_ok result_good);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Gate 4: HasNoNewUnconfirmed — replacement must not introduce new unconfirmed inputs
+   that are not outputs of the conflicting txs.
+   Core: rbf.cpp — inputs of replacement whose parent is in mempool AND not in conflict set. *)
+let test_rbf_gate4_no_new_unconfirmed () =
+  let (mp, _utxo, db, txid1, txid2, _) = create_test_mempool () in
+  (* Add an unrelated confirmed-only tx to the mempool as a parent *)
+  let unrelated_parent = make_regular_tx
+    [make_test_input txid2 0l]
+    [make_test_output 1_990_000L] in
+  let up_entry = Result.get_ok (Mempool.add_transaction mp unrelated_parent) in
+  (* Add conflicting tx spending txid1:0 *)
+  let tx_conflict = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L] in
+  let _ = Mempool.add_transaction mp tx_conflict in
+  (* Replacement spends txid1:0 (direct conflict) AND up_entry:0 (new unconfirmed input) *)
+  let replacement = make_regular_tx
+    [make_test_input txid1 0l;
+     make_test_input up_entry.txid 0l]  (* NEW unconfirmed input *)
+    [make_test_output 2_950_000L] in
+  let result = Mempool.replace_by_fee mp replacement in
+  Alcotest.(check bool) "new unconfirmed input → rejected" true (Result.is_error result);
+  (* A replacement that only spends confirmed inputs is fine *)
+  let replacement_clean = make_regular_tx
+    [make_test_input txid1 0l]  (* confirmed UTXO *)
+    [make_test_output 985_000L] in  (* 15k fee > 10k + relay *)
+  let result_clean = Mempool.replace_by_fee mp replacement_clean in
+  Alcotest.(check bool) "only confirmed inputs → accepted" true (Result.is_ok result_clean);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
 
 (* Test: topo_sort correctly orders parent before child *)
 let test_topo_sort_basic () =
@@ -2476,6 +2745,17 @@ let () =
       test_case "RBF with descendant fees" `Quick test_full_rbf_descendant_fees;
       test_case "RBF eviction limit" `Quick test_full_rbf_eviction_limit;
       test_case "accept_transaction with full RBF" `Quick test_accept_transaction_full_rbf;
+    ];
+    "rbf_w73_gates", [
+      test_case "gate1: sequence boundary (W70 fix verified)" `Quick test_rbf_gate1_boundary;
+      test_case "gate2: ancestor inheritable opt-in" `Quick test_rbf_gate2_ancestor_inheritable;
+      test_case "gate3: eviction dedup (conflict+descendant overlap)" `Quick test_rbf_gate3_eviction_dedup;
+      test_case "gate3: 101 evictions rejected (> MAX_REPLACEMENT_CANDIDATES)" `Quick test_rbf_gate3_eviction_limit_enforced;
+      test_case "gate5: EntriesAndTxidsDisjoint — spends conflicting ancestor" `Quick test_rbf_gate5_entries_txids_disjoint;
+      test_case "gate6: Rule#3 equal fee allowed (not <=)" `Quick test_rbf_gate6_equal_fee_allowed;
+      test_case "gate6: Rule#3 lower fee rejected" `Quick test_rbf_gate6_lower_fee_rejected;
+      test_case "gate7: Rule#4 additional fees cover bandwidth" `Quick test_rbf_gate7_pays_for_rbf_bandwidth;
+      test_case "gate4: HasNoNewUnconfirmed rejects new mempool inputs" `Quick test_rbf_gate4_no_new_unconfirmed;
     ];
     "stats", [
       test_case "get stats" `Quick test_mempool_stats;

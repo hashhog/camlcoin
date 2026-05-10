@@ -1337,6 +1337,80 @@ let handle_getmempoolinfo (ctx : rpc_context) : Yojson.Safe.t =
     ("incrementalrelayfee", `Float 0.00001);
   ]
 
+(* Shared mempool entry → JSON helper.
+   Produces the canonical Core entryToJSON shape (src/rpc/mempool.cpp:508).
+   Used by getrawmempool (verbose), getmempoolentry, getmempoolancestors
+   (verbose), and getmempooldescendants (verbose).
+
+   Core field order and types:
+     vsize, weight, time (int), height, descendantcount, descendantsize,
+     ancestorcount, ancestorsize, wtxid, chunkweight,
+     fees{base, modified, ancestor, descendant, chunk},
+     depends, spentby, bip125-replaceable, unbroadcast
+
+   Notes:
+   - chunkweight: Core uses cluster-linearisation chunk weight; we approximate
+     as entry.weight (exact when the tx is its own chunk, which is the common
+     case for single-tx chains).
+   - spentby: we don't maintain a child index in O(1); iterate mempool to find
+     entries whose depends_on includes this txid. This is O(mempool_size) but
+     rare (only called on explicit entry queries).
+   - bip125-replaceable: use Mempool.signals_rbf on the tx. *)
+let mempool_entry_to_json (mp : Mempool.mempool) (entry : Mempool.mempool_entry)
+    : Yojson.Safe.t =
+  let fee_btc = Int64.to_float entry.fee /. 100_000_000.0 in
+  (* Ancestor fees: sum of ancestor fees including self *)
+  let anc_fees_int64 =
+    let ancs = Mempool.get_ancestors mp entry.txid in
+    List.fold_left (fun acc (e : Mempool.mempool_entry) -> Int64.add acc e.fee)
+      entry.fee ancs
+  in
+  let ancestorfees_btc = Int64.to_float anc_fees_int64 /. 100_000_000.0 in
+  (* Descendant fees: sum of descendant fees including self *)
+  let desc_fees_int64 =
+    let descs = Mempool.get_descendants mp entry.txid in
+    List.fold_left (fun acc (e : Mempool.mempool_entry) -> Int64.add acc e.fee)
+      entry.fee descs
+  in
+  let descendantfees_btc = Int64.to_float desc_fees_int64 /. 100_000_000.0 in
+  let wtxid_hex = Types.hash256_to_hex_display entry.wtxid in
+  (* spentby: txids of in-mempool txs that spend any output of this tx *)
+  let txid_key = Cstruct.to_string entry.txid in
+  let spentby =
+    Hashtbl.fold (fun _ (e : Mempool.mempool_entry) acc ->
+      if List.exists (fun dep ->
+           Cstruct.to_string dep = txid_key
+         ) e.depends_on
+      then `String (Types.hash256_to_hex_display e.txid) :: acc
+      else acc
+    ) mp.entries []
+  in
+  `Assoc [
+    ("vsize",           `Int ((entry.weight + 3) / 4));
+    ("weight",          `Int entry.weight);
+    ("time",            `Int (int_of_float entry.time_added));
+    ("height",          `Int entry.height_added);
+    ("descendantcount", `Int entry.descendant_count);
+    ("descendantsize",  `Int entry.descendant_size);
+    ("ancestorcount",   `Int entry.ancestor_count);
+    ("ancestorsize",    `Int entry.ancestor_size);
+    ("wtxid",           `String wtxid_hex);
+    ("chunkweight",     `Int entry.weight);
+    ("fees", `Assoc [
+      ("base",       `Float fee_btc);
+      ("modified",   `Float fee_btc);
+      ("ancestor",   `Float ancestorfees_btc);
+      ("descendant", `Float descendantfees_btc);
+      ("chunk",      `Float fee_btc);
+    ]);
+    ("depends",   `List (List.map (fun dep ->
+      `String (Types.hash256_to_hex_display dep)
+    ) entry.depends_on));
+    ("spentby",   `List spentby);
+    ("bip125-replaceable", `Bool (Mempool.signals_rbf entry.tx));
+    ("unbroadcast",        `Bool false);
+  ]
+
 let handle_getrawmempool (ctx : rpc_context)
     (params : Yojson.Safe.t list) : Yojson.Safe.t =
   let verbose = match params with
@@ -1346,48 +1420,7 @@ let handle_getrawmempool (ctx : rpc_context)
   if verbose then begin
     let entries = Hashtbl.fold (fun _ entry acc ->
       let txid = Types.hash256_to_hex_display entry.Mempool.txid in
-      let descendants = Mempool.get_descendants ctx.mempool entry.txid in
-      let descendantcount = 1 + List.length descendants in
-      let descendantsize = (entry.weight +
-        List.fold_left (fun s (e : Mempool.mempool_entry) -> s + e.weight) 0 descendants) / 4 in
-      let descendantfees = Int64.to_float (List.fold_left
-        (fun s (e : Mempool.mempool_entry) -> Int64.add s e.fee)
-        entry.fee descendants) /. 100_000_000.0 in
-      let ancestors = Mempool.get_ancestors ctx.mempool entry.txid in
-      let ancestorcount = 1 + List.length ancestors in
-      let ancestorsize = (entry.weight +
-        List.fold_left (fun s (e : Mempool.mempool_entry) -> s + e.weight) 0 ancestors) / 4 in
-      let ancestorfees = Int64.to_float (List.fold_left
-        (fun s (e : Mempool.mempool_entry) -> Int64.add s e.fee)
-        entry.fee ancestors) /. 100_000_000.0 in
-      let fee_btc = Int64.to_float entry.fee /. 100_000_000.0 in
-      let info = `Assoc [
-        ("vsize", `Int (entry.weight / 4));
-        ("weight", `Int entry.weight);
-        ("fee", `Float fee_btc);
-        ("modifiedfee", `Float fee_btc);
-        ("time", `Int (int_of_float entry.time_added));
-        ("height", `Int entry.height_added);
-        ("descendantcount", `Int descendantcount);
-        ("descendantsize", `Int descendantsize);
-        ("descendantfees", `Float descendantfees);
-        ("ancestorcount", `Int ancestorcount);
-        ("ancestorsize", `Int ancestorsize);
-        ("ancestorfees", `Float ancestorfees);
-        ("wtxid", `String txid);
-        ("fees", `Assoc [
-          ("base", `Float fee_btc);
-          ("modified", `Float fee_btc);
-          ("ancestor", `Float ancestorfees);
-          ("descendant", `Float descendantfees);
-        ]);
-        ("depends", `List (List.map (fun dep ->
-          `String (Types.hash256_to_hex_display dep)
-        ) entry.depends_on));
-        ("spentby", `List []);
-        ("bip125-replaceable", `Bool true);
-        ("unbroadcast", `Bool false);
-      ] in
+      let info = mempool_entry_to_json ctx.mempool entry in
       (txid, info) :: acc
     ) ctx.mempool.entries [] in
     `Assoc entries
@@ -1413,27 +1446,61 @@ let parse_txid_param (txid_hex : string) : Cstruct.t =
 
 let handle_getmempoolancestors (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
-  match params with
-  | [`String txid_hex] ->
+  let (txid_hex, verbose) = match params with
+    | [`String h]              -> (Some h, false)
+    | [`String h; `Bool v]     -> (Some h, v)
+    | [`String h; `Int 0]      -> (Some h, false)
+    | [`String h; `Int _]      -> (Some h, true)
+    | _                        -> (None, false)
+  in
+  match txid_hex with
+  | None -> Error "Invalid parameters: expected [txid] or [txid, verbose]"
+  | Some txid_hex ->
     let txid = parse_txid_param txid_hex in
-    let ancestors = Mempool.get_ancestors ctx.mempool txid in
-    Ok (`List (List.map (fun entry ->
-      `String (Types.hash256_to_hex_display entry.Mempool.txid)
-    ) ancestors))
-  | _ ->
-    Error "Invalid parameters: expected [txid]"
+    let txid_key = Cstruct.to_string txid in
+    if not (Hashtbl.mem ctx.mempool.entries txid_key) then
+      Error "Transaction not in mempool"
+    else begin
+      let ancestors = Mempool.get_ancestors ctx.mempool txid in
+      if verbose then
+        Ok (`Assoc (List.map (fun (entry : Mempool.mempool_entry) ->
+          let k = Types.hash256_to_hex_display entry.txid in
+          (k, mempool_entry_to_json ctx.mempool entry)
+        ) ancestors))
+      else
+        Ok (`List (List.map (fun (entry : Mempool.mempool_entry) ->
+          `String (Types.hash256_to_hex_display entry.txid)
+        ) ancestors))
+    end
 
 let handle_getmempooldescendants (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
-  match params with
-  | [`String txid_hex] ->
+  let (txid_hex, verbose) = match params with
+    | [`String h]              -> (Some h, false)
+    | [`String h; `Bool v]     -> (Some h, v)
+    | [`String h; `Int 0]      -> (Some h, false)
+    | [`String h; `Int _]      -> (Some h, true)
+    | _                        -> (None, false)
+  in
+  match txid_hex with
+  | None -> Error "Invalid parameters: expected [txid] or [txid, verbose]"
+  | Some txid_hex ->
     let txid = parse_txid_param txid_hex in
-    let descendants = Mempool.get_descendants ctx.mempool txid in
-    Ok (`List (List.map (fun entry ->
-      `String (Types.hash256_to_hex_display entry.Mempool.txid)
-    ) descendants))
-  | _ ->
-    Error "Invalid parameters: expected [txid]"
+    let txid_key = Cstruct.to_string txid in
+    if not (Hashtbl.mem ctx.mempool.entries txid_key) then
+      Error "Transaction not in mempool"
+    else begin
+      let descendants = Mempool.get_descendants ctx.mempool txid in
+      if verbose then
+        Ok (`Assoc (List.map (fun (entry : Mempool.mempool_entry) ->
+          let k = Types.hash256_to_hex_display entry.txid in
+          (k, mempool_entry_to_json ctx.mempool entry)
+        ) descendants))
+      else
+        Ok (`List (List.map (fun (entry : Mempool.mempool_entry) ->
+          `String (Types.hash256_to_hex_display entry.txid)
+        ) descendants))
+    end
 
 let handle_getmempoolentry (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
@@ -1443,14 +1510,7 @@ let handle_getmempoolentry (ctx : rpc_context)
     let txid_key = Cstruct.to_string txid in
     (match Hashtbl.find_opt ctx.mempool.entries txid_key with
      | Some entry ->
-       Ok (`Assoc [
-         ("fee", `Float (Int64.to_float entry.Mempool.fee /. 100_000_000.0));
-         ("weight", `Int entry.weight);
-         ("time", `Float entry.time_added);
-         ("depends", `List (List.map (fun dep ->
-           `String (Types.hash256_to_hex_display dep)
-         ) entry.depends_on));
-       ])
+       Ok (mempool_entry_to_json ctx.mempool entry)
      | None ->
        Error "Transaction not in mempool")
   | _ ->

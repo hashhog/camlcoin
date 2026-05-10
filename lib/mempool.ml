@@ -1653,9 +1653,13 @@ let get_stats (mp : mempool) : mempool_stats =
 let signals_rbf (tx : Types.transaction) : bool =
   (* v3/TRUC transactions are always replaceable *)
   is_truc_tx tx ||
-  (* BIP-125: sequence number < 0xFFFFFFFE signals RBF *)
+  (* BIP-125: sequence number < 0xFFFFFFFE signals RBF.
+     Sequences are unsigned uint32; use Int64 mask to avoid signed-comparison
+     gotcha: 0xFFFFFFFEl as OCaml int32 is -2l, so Int32.compare 0l (-2l) > 0
+     which would incorrectly report sequence=0 as non-RBF. *)
   List.exists (fun inp ->
-    Int32.compare inp.Types.sequence 0xFFFFFFFEl < 0
+    let seq_u = Int64.logand (Int64.of_int32 inp.Types.sequence) 0xFFFFFFFFL in
+    Int64.compare seq_u 0xFFFFFFFEL < 0
   ) tx.inputs
 
 (* Get total fees for a transaction and all its descendants *)

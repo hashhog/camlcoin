@@ -919,78 +919,32 @@ let is_standard_output (script_pubkey : Cstruct.t) : bool =
     | Some (m, n) -> n >= 1 && n <= 3 && m >= 1 && m <= n
     | None -> false
 
-(* Count legacy sigops in a script with accurate multisig counting.
-   OP_CHECKSIG/VERIFY = 1 sigop.
-   OP_CHECKMULTISIG/VERIFY = N sigops where N is the preceding OP_N (1-16),
-   or 20 if the preceding opcode is not an OP_N push. *)
-let count_script_sigops (script : Cstruct.t) : int =
-  let op_n_value = function
-    | Script.OP_1  -> Some 1  | Script.OP_2  -> Some 2
-    | Script.OP_3  -> Some 3  | Script.OP_4  -> Some 4
-    | Script.OP_5  -> Some 5  | Script.OP_6  -> Some 6
-    | Script.OP_7  -> Some 7  | Script.OP_8  -> Some 8
-    | Script.OP_9  -> Some 9  | Script.OP_10 -> Some 10
-    | Script.OP_11 -> Some 11 | Script.OP_12 -> Some 12
-    | Script.OP_13 -> Some 13 | Script.OP_14 -> Some 14
-    | Script.OP_15 -> Some 15 | Script.OP_16 -> Some 16
-    | _ -> None
+(* Count UTXO-aware sigops cost for a mempool transaction.
+   Delegates to Validation.count_tx_sigops_cost which correctly implements
+   Bitcoin Core's GetTransactionSigOpCost (tx_verify.cpp:143-162):
+     legacy sigops × WITNESS_SCALE_FACTOR
+   + P2SH sigops × WITNESS_SCALE_FACTOR  (guarded by P2SH flag, checks prevout)
+   + witness sigops × 1                  (guarded by WITNESS flag, checks prevout)
+
+   Requires a UTXO lookup closure so that P2SH and witness sigops can be
+   attributed to the correct input type.  Inputs whose prevout is not found
+   (e.g. unconfirmed parents not yet in the UTXO set) contribute 0 P2SH /
+   witness sigops; their legacy sigops are still counted. *)
+let count_tx_sigops_cost_for_mempool (tx : Types.transaction)
+    (mp : mempool) : int =
+  let prev_script_pubkey_lookup op =
+    match lookup_utxo mp op with
+    | Some e -> Some e.Utxo.script_pubkey
+    | None -> None
   in
-  try
-    let ops = Script.parse_script script in
-    let (count, _) = List.fold_left (fun (acc, prev_op) op ->
-      match op with
-      | Script.OP_CHECKSIG | Script.OP_CHECKSIGVERIFY -> (acc + 1, Some op)
-      | Script.OP_CHECKMULTISIG | Script.OP_CHECKMULTISIGVERIFY ->
-        let n = match prev_op with
-          | Some prev -> (match op_n_value prev with Some n -> n | None -> 20)
-          | None -> 20
-        in
-        (acc + n, Some op)
-      | _ -> (acc, Some op)
-    ) (0, None) ops in
-    count
-  with _ -> 0
+  let flags = Script.script_verify_p2sh lor Script.script_verify_witness in
+  Validation.count_tx_sigops_cost tx ~prev_script_pubkey_lookup ~flags
 
-let last_push_data (ops : Script.opcode list) : Cstruct.t option =
-  List.fold_left (fun acc op -> match op with Script.OP_PUSHDATA (_, data) -> Some data | _ -> acc) None ops
-
-let count_p2sh_sigops (script_sig : Cstruct.t) : int =
-  try
-    let ops = Script.parse_script script_sig in
-    match last_push_data ops with
-    | Some redeem_script -> count_script_sigops redeem_script
-    | None -> 0
-  with _ -> 0
-
-(* Count total legacy sigops cost for a transaction (legacy sigops * 4 for witness scale) *)
-let count_tx_sigops_cost (tx : Types.transaction) : int =
-  let input_sigops = List.fold_left (fun acc inp ->
-    acc + count_script_sigops inp.Types.script_sig
-  ) 0 tx.inputs in
-  let output_sigops = List.fold_left (fun acc out ->
-    acc + count_script_sigops out.Types.script_pubkey
-  ) 0 tx.outputs in
-  let legacy_cost = (input_sigops + output_sigops) * 4 in
-  (* P2SH redeem script sigops, also at witness scale *)
-  let p2sh_cost = List.fold_left (fun acc (inp : Types.tx_in) ->
-    acc + count_p2sh_sigops inp.script_sig * 4
-  ) 0 tx.inputs in
-  (* P2SH-wrapped witness sigops at 1x weight *)
-  let witness_cost =
-    if tx.witnesses = [] then 0
-    else
-      List.fold_left (fun acc wit ->
-        let n = List.length wit.Types.items in
-        if n >= 2 then begin
-          let last_item = List.nth wit.items (n - 1) in
-          let last_len = Cstruct.length last_item in
-          if last_len = 20 then acc + 1  (* P2SH-P2WPKH: 1 sigop *)
-          else if last_len > 1 then acc + count_script_sigops last_item  (* P2SH-P2WSH witness script *)
-          else acc
-        end else acc
-      ) 0 tx.witnesses
-  in
-  legacy_cost + p2sh_cost + witness_cost
+(* Public alias used by mining.ml.
+   Counts sigops for a transaction that is already in the mempool pool
+   (its prevouts are accessible via the UTXO set). *)
+let count_tx_sigops_cost (tx : Types.transaction) (mp : mempool) : int =
+  count_tx_sigops_cost_for_mempool tx mp
 
 (* Gap 2: Check P2WSH witness policy limits *)
 let check_p2wsh_witness_limits (tx : Types.transaction) : (unit, string) result =
@@ -1730,9 +1684,13 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (t
     | Error e -> Error e
     | Ok () ->
 
-    (* Phase 1C: Per-tx sigops cost check *)
-    let sigops_cost = count_tx_sigops_cost tx in
-    if sigops_cost > 80_000 then
+    (* Phase 1C: Per-tx sigops cost check.
+       Core: validation.cpp:905 + policy/policy.h:44
+       MAX_STANDARD_TX_SIGOPS_COST = MAX_BLOCK_SIGOPS_COST / 5 = 16,000.
+       We use the UTXO-aware counter so P2SH/witness inputs are attributed
+       correctly (matching GetTransactionSigOpCost in tx_verify.cpp:143). *)
+    let sigops_cost = count_tx_sigops_cost_for_mempool tx mp in
+    if sigops_cost > Consensus.max_standard_tx_sigops_cost then
       Error "Transaction exceeds max standard sigops cost"
 
     (* Task 5: Locktime enforcement *)

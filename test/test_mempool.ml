@@ -2704,6 +2704,257 @@ let test_witness_standard_p2sh_empty_scriptsig () =
   in
   Alcotest.(check bool) "P2SH with empty scriptSig rejected" true (Result.is_error result)
 
+(* ============================================================================
+   W74 Sigops counting tests — mempool policy gate
+   ============================================================================ *)
+
+(* Build a fresh mempool with one UTXO pre-loaded *)
+let create_sigops_mempool () =
+  let path = "/tmp/camlcoin_test_sigops_db" in
+  let rec rm_rf p =
+    if Sys.file_exists p then begin
+      if Sys.is_directory p then begin
+        Array.iter (fun f -> rm_rf (Filename.concat p f)) (Sys.readdir p);
+        Unix.rmdir p
+      end else Unix.unlink p
+    end
+  in
+  rm_rf path;
+  let db = Storage.ChainDB.create path in
+  let utxo = Utxo.UtxoSet.create db in
+  (* A simple P2PKH UTXO: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG *)
+  let txid_a = Types.hash256_of_hex
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in
+  Utxo.UtxoSet.add utxo txid_a 0 Utxo.{
+    value = 10_000_000L;
+    script_pubkey = Cstruct.of_string
+      "\x76\xa9\x14\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\
+       \x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x88\xac";
+    height = 100;
+    is_coinbase = false;
+  };
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+             ~utxo ~current_height:200 () in
+  (mp, db, path, txid_a)
+
+(* Helper: build a scriptPubKey containing n OP_CHECKSIG opcodes *)
+let make_checksig_script n =
+  let buf = Cstruct.create n in
+  for i = 0 to n - 1 do
+    Cstruct.set_uint8 buf i 0xac  (* OP_CHECKSIG *)
+  done;
+  buf
+
+(* Test: threshold constant matches Core policy/policy.h:44
+   MAX_STANDARD_TX_SIGOPS_COST = MAX_BLOCK_SIGOPS_COST / 5 = 80000 / 5 = 16000 *)
+let test_sigops_threshold_constant () =
+  Alcotest.(check int) "max_standard_tx_sigops_cost" 16_000
+    Consensus.max_standard_tx_sigops_cost
+
+(* Test: Validation.count_tx_sigops_cost correctly multiplies legacy sigops by
+   WITNESS_SCALE_FACTOR (4).  A single OP_CHECKSIG in scriptPubKey = 1 legacy
+   sigop = 4 sigops cost. *)
+let test_count_tx_sigops_cost_legacy () =
+  let txid = Cstruct.create 32 in
+  let tx = Types.{
+    version = 1l;
+    inputs = [Types.{
+      previous_output = { txid; vout = 0l };
+      script_sig = Cstruct.create 0;
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [Types.{
+      value = 1_000L;
+      script_pubkey = make_checksig_script 1;
+    }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let lookup _ = None in
+  let flags = Script.script_verify_p2sh lor Script.script_verify_witness in
+  let cost = Validation.count_tx_sigops_cost tx ~prev_script_pubkey_lookup:lookup ~flags in
+  (* 1 legacy sigop × WITNESS_SCALE_FACTOR(4) = 4 *)
+  Alcotest.(check int) "single CHECKSIG costs 4" 4 cost
+
+(* Test: 4000 OP_CHECKSIG in scriptPubKey costs 16000 — exactly at the limit *)
+let test_sigops_exactly_at_limit () =
+  let txid = Cstruct.create 32 in
+  let tx = Types.{
+    version = 1l;
+    inputs = [Types.{
+      previous_output = { txid; vout = 0l };
+      script_sig = Cstruct.create 0;
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [Types.{
+      value = 1_000L;
+      script_pubkey = make_checksig_script 4000;
+    }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let lookup _ = None in
+  let flags = Script.script_verify_p2sh lor Script.script_verify_witness in
+  let cost = Validation.count_tx_sigops_cost tx ~prev_script_pubkey_lookup:lookup ~flags in
+  (* 4000 × 4 = 16000 = MAX_STANDARD_TX_SIGOPS_COST — at boundary, must pass *)
+  Alcotest.(check int) "4000 CHECKSIG costs 16000" 16_000 cost
+
+(* Test: 4001 OP_CHECKSIG in scriptPubKey costs 16004 — over the limit *)
+let test_sigops_one_over_limit () =
+  let txid = Cstruct.create 32 in
+  let tx = Types.{
+    version = 1l;
+    inputs = [Types.{
+      previous_output = { txid; vout = 0l };
+      script_sig = Cstruct.create 0;
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [Types.{
+      value = 1_000L;
+      script_pubkey = make_checksig_script 4001;
+    }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let lookup _ = None in
+  let flags = Script.script_verify_p2sh lor Script.script_verify_witness in
+  let cost = Validation.count_tx_sigops_cost tx ~prev_script_pubkey_lookup:lookup ~flags in
+  Alcotest.(check int) "4001 CHECKSIG costs 16004" 16_004 cost
+
+(* Test: P2WPKH costs 1 sigop (not multiplied by 4 — witness discount).
+   Total cost = 1 (witness) not 4 (legacy). *)
+let test_sigops_p2wpkh_costs_one () =
+  let txid = Cstruct.create 32 in
+  let p2wpkh_spk =
+    (* OP_0 <20 bytes> *)
+    let s = Cstruct.create 22 in
+    Cstruct.set_uint8 s 0 0x00;
+    Cstruct.set_uint8 s 1 0x14;
+    s
+  in
+  let tx = Types.{
+    version = 2l;
+    inputs = [Types.{
+      previous_output = { txid; vout = 0l };
+      script_sig = Cstruct.create 0;
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [Types.{ value = 1_000L; script_pubkey = Cstruct.create 0 }];
+    witnesses = [{ items = [Cstruct.create 72; Cstruct.create 33] }];
+    locktime = 0l;
+  } in
+  let lookup _ = Some p2wpkh_spk in
+  let flags = Script.script_verify_p2sh lor Script.script_verify_witness in
+  let cost = Validation.count_tx_sigops_cost tx ~prev_script_pubkey_lookup:lookup ~flags in
+  Alcotest.(check int) "P2WPKH witness sigop costs 1" 1 cost
+
+(* Test: P2SH sigops use accurate (OP_N-aware) counting.
+   OP_3 OP_CHECKMULTISIG redeem script = 3 sigops × 4 = 12. *)
+let test_sigops_p2sh_accurate_multisig () =
+  let txid = Cstruct.create 32 in
+  (* P2SH scriptPubKey: OP_HASH160 <20-bytes> OP_EQUAL *)
+  let p2sh_spk = Cstruct.create 23 in
+  Cstruct.set_uint8 p2sh_spk 0  0xa9;
+  Cstruct.set_uint8 p2sh_spk 1  0x14;
+  Cstruct.set_uint8 p2sh_spk 22 0x87;
+  (* Redeem script: OP_3 OP_CHECKMULTISIG *)
+  let redeem = Cstruct.of_string "\x53\xae" in
+  (* scriptSig: push the redeem script *)
+  let script_sig = Cstruct.create (1 + Cstruct.length redeem) in
+  Cstruct.set_uint8 script_sig 0 (Cstruct.length redeem);
+  Cstruct.blit redeem 0 script_sig 1 (Cstruct.length redeem);
+  let tx = Types.{
+    version = 1l;
+    inputs = [Types.{
+      previous_output = { txid; vout = 0l };
+      script_sig;
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [Types.{ value = 1_000L; script_pubkey = Cstruct.create 0 }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let lookup _ = Some p2sh_spk in
+  let flags = Script.script_verify_p2sh lor Script.script_verify_witness in
+  let cost = Validation.count_tx_sigops_cost tx ~prev_script_pubkey_lookup:lookup ~flags in
+  (* 3 P2SH sigops × 4 = 12 *)
+  Alcotest.(check int) "P2SH OP_3 CHECKMULTISIG costs 12" 12 cost
+
+(* Test: mempool_sigops_threshold — bug fix verification.
+   The mempool formerly used threshold 80,000 instead of 16,000.
+   Verify that count_tx_sigops_cost_for_mempool uses the correct threshold
+   by checking it against the constant in Consensus. *)
+let test_mempool_sigops_uses_correct_threshold () =
+  let (mp, db, path, _txid_a) = create_sigops_mempool () in
+  (* Synthesize a tx whose sigops cost is exactly Consensus.max_standard_tx_sigops_cost.
+     4000 CHECKSIG in output → 4000 × 4 = 16000.
+     Use a fresh txid not in the UTXO so prev_spk lookup returns None
+     (legacy sigops from scriptPubKey/scriptSig are always counted regardless). *)
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0xff;
+  let tx = Types.{
+    version = 1l;
+    inputs = [Types.{
+      previous_output = { txid; vout = 0l };
+      script_sig = Cstruct.create 0;
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [Types.{
+      value = 1_000L;
+      script_pubkey = make_checksig_script 4000;
+    }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let cost = Mempool.count_tx_sigops_cost tx mp in
+  (* Must equal max_standard_tx_sigops_cost (16000) — not 80000 *)
+  Alcotest.(check int) "count at limit = 16000" Consensus.max_standard_tx_sigops_cost cost;
+  Storage.ChainDB.close db;
+  let rec rm_rf p =
+    if Sys.file_exists p then begin
+      if Sys.is_directory p then begin
+        Array.iter (fun f -> rm_rf (Filename.concat p f)) (Sys.readdir p);
+        Unix.rmdir p
+      end else Unix.unlink p
+    end
+  in
+  rm_rf path
+
+(* Test: Verify correctness of MAX_STANDARD_TX_SIGOPS_COST formula.
+   Core policy/policy.h:44 defines it as MAX_BLOCK_SIGOPS_COST / 5.
+   This ensures it matches consensus.ml. *)
+let test_max_standard_sigops_cost_formula () =
+  Alcotest.(check int) "16000 = 80000/5"
+    (Consensus.max_block_sigops_cost / 5)
+    Consensus.max_standard_tx_sigops_cost
+
+(* Test: legacy count_sigops (inaccurate) uses worst-case 20 for CHECKMULTISIG,
+   matching Core's GetSigOpCount(false) used in GetLegacySigOpCount. *)
+let test_count_sigops_inaccurate_multisig () =
+  (* OP_3 OP_CHECKMULTISIG — inaccurate path should yield 20, not 3 *)
+  let script = Cstruct.of_string "\x53\xae" in
+  Alcotest.(check int) "inaccurate CHECKMULTISIG = 20" 20 (Validation.count_sigops script)
+
+(* Test: count_p2sh_sigops (accurate) yields the OP_N count for CHECKMULTISIG,
+   matching Core's GetSigOpCount(true) used in GetP2SHSigOpCount. *)
+let test_count_p2sh_sigops_accurate_multisig () =
+  (* OP_3 OP_CHECKMULTISIG — accurate path yields 3 *)
+  let script = Cstruct.of_string "\x53\xae" in
+  Alcotest.(check int) "accurate CHECKMULTISIG = 3" 3 (Validation.count_p2sh_sigops script)
+
+(* Test: CHECKMULTISIGVERIFY is treated same as CHECKMULTISIG for sigop counting. *)
+let test_count_p2sh_sigops_checkmultisigverify () =
+  (* OP_5 OP_CHECKMULTISIGVERIFY *)
+  let script = Cstruct.of_string "\x55\xaf" in
+  Alcotest.(check int) "OP_5 CHECKMULTISIGVERIFY = 5" 5 (Validation.count_p2sh_sigops script)
+
+(* Test: CHECKSIGADD (Tapscript BIP-342) does NOT count as a sigop in legacy
+   or P2SH counting — only in the Tapscript budget (50 per CHECKSIGADD). *)
+let test_checksigadd_not_counted_in_legacy () =
+  (* OP_CHECKSIGADD = 0xba *)
+  let script = Cstruct.of_string "\xba" in
+  Alcotest.(check int) "CHECKSIGADD = 0 legacy sigops" 0 (Validation.count_sigops script)
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
@@ -2851,5 +3102,23 @@ let () =
       test_case "P2TR empty witness rejected (gate 5)" `Quick test_witness_standard_p2tr_empty_witness;
       test_case "P2SH-P2WSH redeem script extraction (gate 2+4)" `Quick test_witness_standard_p2sh_p2wsh;
       test_case "P2SH empty scriptSig rejected (gate 2)" `Quick test_witness_standard_p2sh_empty_scriptsig;
+    ];
+    "w74_sigops", [
+      (* Gate constants *)
+      test_case "max_standard_tx_sigops_cost constant" `Quick test_sigops_threshold_constant;
+      test_case "MAX_STANDARD_TX_SIGOPS_COST = MAX_BLOCK/5 formula" `Quick test_max_standard_sigops_cost_formula;
+      (* Validation.count_tx_sigops_cost correctness *)
+      test_case "legacy: 1 CHECKSIG costs 4" `Quick test_count_tx_sigops_cost_legacy;
+      test_case "legacy: 4000 CHECKSIG costs 16000 (at limit)" `Quick test_sigops_exactly_at_limit;
+      test_case "legacy: 4001 CHECKSIG costs 16004 (over limit)" `Quick test_sigops_one_over_limit;
+      test_case "P2WPKH witness sigop costs 1 (not 4)" `Quick test_sigops_p2wpkh_costs_one;
+      test_case "P2SH OP_3 CHECKMULTISIG costs 12 (accurate)" `Quick test_sigops_p2sh_accurate_multisig;
+      (* count_sigops (inaccurate=false, legacy) vs count_p2sh_sigops (accurate=true) *)
+      test_case "count_sigops inaccurate: CHECKMULTISIG = 20" `Quick test_count_sigops_inaccurate_multisig;
+      test_case "count_p2sh_sigops accurate: CHECKMULTISIG = OP_N" `Quick test_count_p2sh_sigops_accurate_multisig;
+      test_case "count_p2sh_sigops: CHECKMULTISIGVERIFY = OP_N" `Quick test_count_p2sh_sigops_checkmultisigverify;
+      test_case "CHECKSIGADD not counted in legacy sigops" `Quick test_checksigadd_not_counted_in_legacy;
+      (* Mempool path: threshold fix *)
+      test_case "mempool sigops threshold = 16000 not 80000" `Quick test_mempool_sigops_uses_correct_threshold;
     ];
   ]

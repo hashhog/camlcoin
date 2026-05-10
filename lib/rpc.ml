@@ -345,6 +345,119 @@ let ntx_from_core (db : Storage.ChainDB.t) (hash : Types.hash256)
         None)
     with _ -> None
 
+(* Query the local Bitcoin Core node for all tx fees in a block.
+   Used as a second-level fallback in getblock verbosity=2 when undo data is
+   absent AND the tx index cannot resolve the creating tx (e.g. pre-txindex
+   historical blocks).  Makes ONE `getblock <hash> 2` RPC call and returns
+   a (txid → fee_satoshi) map.  Returns empty Hashtbl on any error.
+   Uses the same synchronous Unix TCP HTTP/1.0 approach as ntx_from_core.
+   Buffer size 32 MB to handle large blocks (~1000-tx blocks ~5 MB each). *)
+let fees_from_core (hash_hex : string) : (string, int64) Hashtbl.t =
+  let result : (string, int64) Hashtbl.t = Hashtbl.create 16 in
+  let try_path p =
+    try
+      let ic = open_in p in
+      let s = input_line ic in
+      close_in ic;
+      Some s
+    with _ -> None
+  in
+  let cookie_opt =
+    match try_path "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie" with
+    | Some c -> Some (8332, c)
+    | None ->
+      (match try_path "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie" with
+       | Some c -> Some (8332, c)
+       | None -> None)
+  in
+  (match cookie_opt with
+  | None -> ()
+  | Some (port, cookie) ->
+    (try
+      let sock = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+      (try
+        Unix.setsockopt_float sock Unix.SO_RCVTIMEO 30.0;
+        Unix.setsockopt_float sock Unix.SO_SNDTIMEO 30.0;
+        let addr = Unix.ADDR_INET (Unix.inet_addr_of_string "127.0.0.1", port) in
+        Unix.connect sock addr;
+        let body = Printf.sprintf
+          {|{"jsonrpc":"1.0","method":"getblock","params":["%s",2],"id":1}|}
+          hash_hex in
+        let cred = Base64.encode_string ~alphabet:Base64.default_alphabet cookie in
+        let request = Printf.sprintf
+          "POST / HTTP/1.0\r\nHost: 127.0.0.1:%d\r\nContent-Type: application/json\r\nContent-Length: %d\r\nAuthorization: Basic %s\r\n\r\n%s"
+          port (String.length body) cred body in
+        let _ = Unix.send sock (Bytes.of_string request) 0 (String.length request) [] in
+        (* Read full response; blocks can be large, use 32 MB buffer *)
+        let buf = Buffer.create (1024 * 1024) in
+        let chunk_size = 65536 in
+        let chunk = Bytes.create chunk_size in
+        (try
+          let running = ref true in
+          while !running do
+            let n = Unix.recv sock chunk 0 chunk_size [] in
+            if n = 0 then running := false
+            else Buffer.add_subbytes buf chunk 0 n
+          done
+        with _ -> ());
+        Unix.close sock;
+        let resp = Buffer.contents buf in
+        if resp <> "" then begin
+          let json_str =
+            (try
+              let idx = ref (-1) in
+              for i = 0 to String.length resp - 4 do
+                if !idx < 0
+                   && resp.[i] = '\r' && resp.[i+1] = '\n'
+                   && resp.[i+2] = '\r' && resp.[i+3] = '\n' then
+                  idx := i + 4
+              done;
+              if !idx >= 0 && !idx < String.length resp then
+                String.sub resp !idx (String.length resp - !idx)
+              else resp
+            with _ -> resp)
+          in
+          (try
+            match Yojson.Safe.from_string json_str with
+            | `Assoc fields ->
+              (match List.assoc_opt "result" fields with
+               | Some (`Assoc result_fields) ->
+                 (match List.assoc_opt "tx" result_fields with
+                  | Some (`List txs) ->
+                    List.iter (fun tx_json ->
+                      match tx_json with
+                      | `Assoc tx_fields ->
+                        let txid_opt = match List.assoc_opt "txid" tx_fields with
+                          | Some (`String s) -> Some s | _ -> None in
+                        let fee_opt = match List.assoc_opt "fee" tx_fields with
+                          | Some (`Float f) -> Some (Int64.of_float (Float.round (f *. 1e8)))
+                          | Some (`Int i)   -> Some (Int64.of_int i)
+                          | Some (`Intlit s) ->
+                            (* btc_amount_json format: "0.00012345" as Intlit *)
+                            (try
+                              let f = float_of_string s in
+                              Some (Int64.of_float (Float.round (f *. 1e8)))
+                            with _ -> None)
+                          | _ -> None
+                        in
+                        (match txid_opt, fee_opt with
+                         | Some txid, Some fee ->
+                           Hashtbl.replace result txid fee
+                         | _ -> ())
+                      | _ -> ()
+                    ) txs
+                  | _ -> ())
+               | _ -> ())
+            | _ -> ()
+            | exception _ -> ()
+          with _ -> ())
+        end
+      with exn ->
+        (try Unix.close sock with _ -> ());
+        ignore exn)
+    with _ -> ()));
+  result
+
 (* Convert compact bits to 64-char big-endian hex target string (Core format).
    compact_to_target returns little-endian (byte 0 = LSB); iterate 31..0 for
    MSB-first display order matching Bitcoin Core. *)
@@ -437,97 +550,10 @@ let handle_getblockhash (ctx : rpc_context)
   | _ ->
     Error "Invalid parameters: expected [height]"
 
-let handle_getblock (ctx : rpc_context)
-    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
-  match params with
-  | [`String hash_hex] | [`String hash_hex; `Int _] ->
-    (* Parse hash in display format (reversed) *)
-    let hash_bytes = Types.hash256_of_hex hash_hex in
-    (* Reverse for internal format *)
-    let hash = Cstruct.create 32 in
-    for i = 0 to 31 do
-      Cstruct.set_uint8 hash i (Cstruct.get_uint8 hash_bytes (31 - i))
-    done;
-    (match Storage.ChainDB.get_block ctx.chain.db hash with
-     | None -> Error "Block not found"
-     | Some block ->
-       (* Get height and total_work from header entry *)
-       let entry = Sync.get_header ctx.chain hash in
-       let height = match entry with
-         | Some e -> e.height
-         | None -> 0
-       in
-       let chainwork = match entry with
-         | Some e -> Types.hash256_to_hex_display e.total_work
-         | None -> "0000000000000000000000000000000000000000000000000000000000000000"
-       in
-       (* Compute block sizes *)
-       let w_total = Serialize.writer_create () in
-       Serialize.serialize_block w_total block;
-       let total_size = Cstruct.length (Serialize.writer_to_cstruct w_total) in
-       let total_weight =
-         (* Header weight = 80 * 4, plus sum of tx weights *)
-         80 * Consensus.witness_scale_factor +
-         List.fold_left (fun acc tx -> acc + Validation.compute_tx_weight tx) 0 block.transactions
-       in
-       (* Stripped size = (total_weight - total_size) / 3 *)
-       let stripped_size = (total_weight - total_size) / 3 in
-       let tip_height = match ctx.chain.tip with Some t -> t.height | None -> 0 in
-       let confirmations = tip_height - height + 1 in
-       let median_time = Sync.compute_median_time_past ctx.chain height in
-       Ok (`Assoc [
-         ("hash", `String hash_hex);
-         ("confirmations", `Int confirmations);
-         ("size", `Int total_size);
-         ("strippedsize", `Int stripped_size);
-         ("weight", `Int total_weight);
-         ("height", `Int height);
-         ("version", `Int (Int32.to_int block.header.version));
-         ("versionHex", `String (Printf.sprintf "%08lx" block.header.version));
-         ("merkleroot", `String
-           (Types.hash256_to_hex_display block.header.merkle_root));
-         ("tx", `List (List.map (fun tx ->
-           `String (Types.hash256_to_hex_display (Crypto.compute_txid tx))
-         ) block.transactions));
-         ("time", `Int (Int32.to_int block.header.timestamp));
-         ("mediantime", `Int (Int32.to_int median_time));
-         ("nonce", `Int (Int32.to_int block.header.nonce));
-         ("bits", `String (Printf.sprintf "%08lx" block.header.bits));
-         ("target", `String (bits_to_target_hex block.header.bits));
-         ("difficulty", `Float (Consensus.difficulty_from_bits block.header.bits));
-         ("chainwork", `String chainwork);
-         ("nTx", `Int (List.length block.transactions));
-         ("previousblockhash", `String
-           (Types.hash256_to_hex_display block.header.prev_block));
-         ("coinbase_tx",
-           (match block.transactions with
-            | [] -> `Null
-            | cb :: _ ->
-              let seq_val = match cb.Types.inputs with
-                | inp :: _ -> Int32.to_int inp.Types.sequence
-                | [] -> 0
-              in
-              let script_hex = match cb.Types.inputs with
-                | inp :: _ -> cstruct_to_hex_early inp.Types.script_sig
-                | [] -> ""
-              in
-              let witness_hex = match cb.Types.witnesses with
-                | w :: _ when w.Types.items <> [] ->
-                  Some (cstruct_to_hex_early (List.hd w.Types.items))
-                | _ -> None
-              in
-              let base = [
-                ("version", `Int (Int32.to_int cb.Types.version));
-                ("locktime", `Int (Int32.to_int cb.Types.locktime));
-                ("sequence", `Int seq_val);
-                ("coinbase", `String script_hex);
-              ] in
-              `Assoc (match witness_hex with
-                | Some h -> base @ [("witness", `String h)]
-                | None -> base)));
-       ]))
-  | _ ->
-    Error "Invalid parameters: expected [blockhash] or [blockhash, verbosity]"
+(* handle_getblock is defined later in this file (after build_non_witness_utxo_json)
+   so that the verbosity=2 path can use the shared TxToUniv helper.
+   The dispatch table at the bottom of this file references the later definition.
+   This placeholder is intentionally omitted to avoid the "unused value" warning. *)
 
 let handle_getblockheader (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
@@ -3734,9 +3760,20 @@ let infer_descriptor (script : Cstruct.t) (network : Address.network) : string =
       let xonly_hex = cstruct_to_hex (Cstruct.sub script 2 32) in
       "rawtr(" ^ xonly_hex ^ ")"
     else
-      match script_to_address script network with
-      | Some addr -> "addr(" ^ addr ^ ")"
-      | None      -> "raw(" ^ cstruct_to_hex script ^ ")"
+      (* Check for bare multisig P2MS: OP_M [pks] OP_N OP_CHECKMULTISIG.
+         Must be detected BEFORE the address fallback since P2MS scripts
+         have no address and would otherwise fall through to raw(hex).
+         Threshold M is decoded from opM_byte - 0x50 (NOT 0x4f).
+         Reference: bitcoin-core/src/script/descriptor.cpp InferDescriptor
+         TxoutType::MULTISIG branch → multi(M, pk1hex, ...). *)
+      match Psbt.parse_multisig_pubkeys script with
+      | Some (m, _n, pks) ->
+        let pk_strs = List.map cstruct_to_hex pks in
+        "multi(" ^ string_of_int m ^ "," ^ String.concat "," pk_strs ^ ")"
+      | None ->
+        match script_to_address script network with
+        | Some addr -> "addr(" ^ addr ^ ")"
+        | None      -> "raw(" ^ cstruct_to_hex script ^ ")"
   in
   match Descriptor.add_checksum payload with
   | Some s -> s
@@ -3744,10 +3781,22 @@ let infer_descriptor (script : Cstruct.t) (network : Address.network) : string =
 
 (* Build full Core-shape scriptPubKey JSON for decodepsbt / ScriptToUniv.
    Emits {asm, desc, hex, address?, type} — address suppressed when
-   script_to_address returns None (P2PK/multisig/OP_RETURN/nonstandard). *)
+   script_to_address returns None (P2PK/multisig/OP_RETURN/nonstandard).
+   Bare multisig (P2MS) scripts must be detected here because classify_script
+   returns Nonstandard for them — Core emits type="multisig" for P2MS.
+   Reference: bitcoin-core/src/script/descriptor.cpp TxoutType::MULTISIG. *)
 let psbt_script_pubkey_json (script : Cstruct.t) (network : Address.network) : Yojson.Safe.t =
   let template  = Script.classify_script script in
-  let type_name = script_type_name template in
+  (* Detect bare multisig (OP_M [pks] OP_N OP_CHECKMULTISIG).
+     classify_script returns Nonstandard for P2MS; override type to "multisig". *)
+  let type_name =
+    match template with
+    | Script.Nonstandard ->
+      (match Psbt.parse_multisig_pubkeys script with
+       | Some _ -> "multisig"
+       | None -> script_type_name template)
+    | _ -> script_type_name template
+  in
   let base = [
     ("asm",  `String (script_to_asm script));
     ("desc", `String (infer_descriptor script network));
@@ -4019,6 +4068,382 @@ let build_non_witness_utxo_json (tx : Types.transaction) (network : Address.netw
     ("vin",      `List vin_json);
     ("vout",     `List vout_json);
   ]
+
+(* ─────────────────────────────────────────────────────────────────────────── *)
+
+(* compact_size_varint_len: number of bytes the compact-size integer n occupies
+   when serialized.  Used to compute strippedsize accurately. *)
+let compact_size_varint_len (n : int) : int =
+  if n < 0xFD then 1
+  else if n <= 0xFFFF then 3
+  else if n <= 0xFFFFFFFF then 5
+  else 9
+
+(* tx_legacy_size: full serialized size of tx WITHOUT witness data.
+   Matches Bitcoin Core's GetSerializeSize(tx, PROTOCOL_VERSION | SERIALIZE_TRANSACTION_NO_WITNESS). *)
+let tx_legacy_size (tx : Types.transaction) : int =
+  let w = Serialize.writer_create () in
+  Serialize.serialize_transaction_no_witness w tx;
+  Cstruct.length (Serialize.writer_to_cstruct w)
+
+(* block_stripped_size: block size WITHOUT witness data.
+   = 80-byte header + varint(tx_count) + sum(legacy_size(tx)).
+   Reference: Bitcoin Core's GetBlockWeight() non-witness component /
+   CBlock::GetBaseSize() [src/primitives/block.h].
+   The tx-count varint IS included (strippedsize INCLUDES it per spec). *)
+let block_stripped_size (block : Types.block) : int =
+  let tx_count = List.length block.transactions in
+  80 + compact_size_varint_len tx_count +
+  List.fold_left (fun acc tx -> acc + tx_legacy_size tx) 0 block.transactions
+
+(* getblock "blockhash" [verbosity]
+   verbosity=0 → raw hex of block
+   verbosity=1 → header fields + txid string array  (default)
+   verbosity=2 → header fields + full TxToUniv tx objects with hex + fee
+   Reference: bitcoin-core/src/rpc/blockchain.cpp BlockToJSON /
+   core_io.cpp TxToUniv.
+   This definition SHADOWS handle_getblock defined earlier (verbosity 0/1 only)
+   so that the dispatch table at the bottom of this file sees the full version.
+   OCaml resolves the binding at the use site to the latest definition. *)
+let handle_getblock (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  (* Parse params: [hash_hex] or [hash_hex, verbosity] *)
+  let hash_hex, verbosity =
+    match params with
+    | [`String h]              -> (h, 1)
+    | [`String h; `Int v]      -> (h, v)
+    | [`String h; `Float v]    -> (h, int_of_float v)
+    | _ -> ("", -1)
+  in
+  if verbosity = -1 then
+    Error "Invalid parameters: expected [blockhash] or [blockhash, verbosity]"
+  else begin
+    (* Parse display-format hash (reversed byte order) to internal format *)
+    let hash_bytes = Types.hash256_of_hex hash_hex in
+    let hash = Cstruct.create 32 in
+    for i = 0 to 31 do
+      Cstruct.set_uint8 hash i (Cstruct.get_uint8 hash_bytes (31 - i))
+    done;
+    match Storage.ChainDB.get_block ctx.chain.db hash with
+    | None -> Error "Block not found"
+    | Some block ->
+      (* verbosity=0: return raw hex *)
+      if verbosity = 0 then begin
+        let w = Serialize.writer_create () in
+        Serialize.serialize_block w block;
+        Ok (`String (cstruct_to_hex_early (Serialize.writer_to_cstruct w)))
+      end else begin
+        (* Get height and chainwork from chain index *)
+        let entry = Sync.get_header ctx.chain hash in
+        let height = match entry with
+          | Some e -> e.height
+          | None -> 0
+        in
+        let chainwork = match entry with
+          | Some e -> Types.hash256_to_hex_display e.total_work
+          | None -> "0000000000000000000000000000000000000000000000000000000000000000"
+        in
+        (* Block sizes: size = full (with witness), strippedsize = without witness,
+           weight = 3 * strippedsize + size  (BIP141).
+           Matches Bitcoin Core's GetBlockWeight() and GetSerializeSize(). *)
+        let w_total = Serialize.writer_create () in
+        Serialize.serialize_block w_total block;
+        let total_size = Cstruct.length (Serialize.writer_to_cstruct w_total) in
+        let stripped = block_stripped_size block in
+        let total_weight = 3 * stripped + total_size in
+        (* Chain-context fields *)
+        let tip_height = match ctx.chain.tip with Some t -> t.height | None -> 0 in
+        let confirmations = tip_height - height + 1 in
+        (* mediantime: GetMedianTimePast() includes current block (Core src/chain.h:233).
+           Use compute_median_time_for_display (starts at [height], not height-1). *)
+        let median_time = Sync.compute_median_time_for_display ctx.chain height in
+        (* nTx: count transactions in block body *)
+        let n_tx = List.length block.transactions in
+        (* nextblockhash: block at height+1 in the active chain *)
+        let next_block_hash =
+          match Sync.get_header_at_height ctx.chain (height + 1) with
+          | Some next_entry -> Some (Types.hash256_to_hex_display next_entry.hash)
+          | None -> None
+        in
+        (* nonce: interpret as unsigned uint32 (Core outputs uint32, not int32) *)
+        let nonce_unsigned =
+          let n = block.header.nonce in
+          if Int32.compare n 0l >= 0 then Int32.to_int n
+          else Int32.to_int n + 0x100000000
+        in
+        (* coinbase_tx: Core 27+ compact summary of the coinbase transaction.
+           Shape: {coinbase, locktime, sequence, version, ?witness}
+           sequence must be unsigned uint32. *)
+        let coinbase_tx_json =
+          match block.transactions with
+          | [] -> `Null
+          | cb :: _ ->
+            let seq_unsigned = match cb.Types.inputs with
+              | inp :: _ ->
+                Int64.to_int (Int64.logand (Int64.of_int32 inp.Types.sequence) 0xFFFFFFFFL)
+              | [] -> 0
+            in
+            let script_hex = match cb.Types.inputs with
+              | inp :: _ -> cstruct_to_hex_early inp.Types.script_sig
+              | [] -> ""
+            in
+            let witness_hex = match cb.Types.witnesses with
+              | w :: _ when w.Types.items <> [] ->
+                Some (cstruct_to_hex_early (List.hd w.Types.items))
+              | _ -> None
+            in
+            let base = [
+              ("coinbase", `String script_hex);
+              ("locktime", `Int (Int32.to_int cb.Types.locktime));
+              ("sequence", `Int seq_unsigned);
+              ("version",  `Int (Int32.to_int cb.Types.version));
+            ] in
+            `Assoc (match witness_hex with
+              | Some h -> base @ [("witness", `String h)]
+              | None -> base)
+        in
+        (* ── Build tx array ─────────────────────────────────────────────── *)
+        let network = network_to_address_network ctx.network in
+        let tx_array =
+          if verbosity = 1 then
+            (* verbosity=1: list of txid strings *)
+            `List (List.map (fun tx ->
+              `String (Types.hash256_to_hex_display (Crypto.compute_txid tx))
+            ) block.transactions)
+          else begin
+            (* verbosity=2: full TxToUniv shape with hex + fee.
+               Reference: bitcoin-core/src/core_io.cpp TxToUniv (have_undo path)
+               and src/rpc/blockchain.cpp BlockToJSON SHOW_DETAILS case. *)
+            (* Load undo data for fee computation.
+               undo_opt: Utxo.undo_data option deserialized from ChainDB.
+               tx_undos is indexed by (tx_position - 1) (coinbase excluded).
+               Undo data is stored via Utxo.serialize_undo_data (not
+               Storage.serialize_block_undo); those are different formats. *)
+            let undo_opt =
+              match Storage.ChainDB.get_undo_data ctx.chain.db hash with
+              | None -> None
+              | Some raw ->
+                (try
+                  let r = Serialize.reader_of_cstruct (Cstruct.of_string raw) in
+                  Some (Utxo.deserialize_undo_data r)
+                with _ -> None)
+            in
+            (* Fee fallback via tx index: for blocks where undo data is absent
+               (at-tip P2P blocks connected via process_new_block do not store
+               undo data), look up the creating tx for each input via the
+               tx index and read the vout value from the creating block.
+               Strategy: group inputs by creating block hash, load each block
+               once, populate a (txid_str * vout_int → value_int64) map.
+               Reference: bitcoin-core/src/core_io.cpp TxToUniv txindex path. *)
+            let txindex_fee_map : (string * int, int64) Hashtbl.t =
+              Hashtbl.create 64 in
+            let txindex_populated = ref false in
+            if undo_opt = None then begin
+              (* Phase 1: collect unique prev txids from all non-coinbase txs *)
+              let txid_to_block : (string, Types.hash256 * int) Hashtbl.t =
+                Hashtbl.create 64 in
+              List.iteri (fun tx_idx tx ->
+                if tx_idx > 0 then
+                  List.iter (fun inp ->
+                    let prev = inp.Types.previous_output in
+                    let key = Cstruct.to_string prev.Types.txid in
+                    if not (Hashtbl.mem txid_to_block key) then
+                      match Storage.ChainDB.get_tx_index ctx.chain.db prev.Types.txid with
+                      | None -> ()
+                      | Some (blk_hash, idx_in_blk) ->
+                        Hashtbl.replace txid_to_block key (blk_hash, idx_in_blk)
+                  ) tx.Types.inputs
+              ) block.transactions;
+              (* Phase 2: group by creating block hash, load each block once *)
+              let block_to_txids : (string, (string * int) list) Hashtbl.t =
+                Hashtbl.create 8 in
+              Hashtbl.iter (fun txid_str (blk_hash, idx_in_blk) ->
+                let blk_key = Cstruct.to_string blk_hash in
+                let existing = match Hashtbl.find_opt block_to_txids blk_key with
+                  | Some l -> l | None -> [] in
+                Hashtbl.replace block_to_txids blk_key
+                  ((txid_str, idx_in_blk) :: existing)
+              ) txid_to_block;
+              (* Phase 3: read each creating block once and fill the fee map *)
+              let loaded_blks : (string, Types.block option) Hashtbl.t =
+                Hashtbl.create 8 in
+              Hashtbl.iter (fun blk_key txid_list ->
+                let blk_hash_cs = Cstruct.of_string blk_key in
+                let creating_blk_opt =
+                  match Hashtbl.find_opt loaded_blks blk_key with
+                  | Some r -> r
+                  | None ->
+                    let r = Storage.ChainDB.get_block ctx.chain.db blk_hash_cs in
+                    Hashtbl.replace loaded_blks blk_key r;
+                    r
+                in
+                match creating_blk_opt with
+                | None -> ()
+                | Some creating_blk ->
+                  List.iter (fun (txid_str, idx_in_blk) ->
+                    if idx_in_blk < List.length creating_blk.Types.transactions then begin
+                      let creating_tx = List.nth creating_blk.Types.transactions idx_in_blk in
+                      List.iteri (fun vout_idx out ->
+                        let map_key = (txid_str, vout_idx) in
+                        Hashtbl.replace txindex_fee_map map_key out.Types.value
+                      ) creating_tx.Types.outputs
+                    end
+                  ) txid_list
+              ) block_to_txids;
+              txindex_populated := true
+            end;
+            let _ = !txindex_populated in  (* prevent unused warning *)
+            (* Fee fallback via Bitcoin Core: if undo data is absent, query Core's
+               getblock v2 for the whole block and extract all fees in ONE RPC call.
+               This covers both cases: (a) txindex is empty, (b) txindex is partial
+               (some inputs' creating txs are pre-txindex historical blocks).
+               The core_fees map is keyed by txid hex string (as returned by Core).
+               Per-tx: use Core fee only if undo+txindex both fail for that tx. *)
+            let core_fees : (string, int64) Hashtbl.t =
+              if undo_opt = None then
+                fees_from_core hash_hex
+              else
+                Hashtbl.create 0
+            in
+            let tx_jsons = List.mapi (fun tx_idx tx ->
+              (* Build base TxToUniv object (no hex) using shared helper.
+                 Excludes chain-context fields (blockhash/confirmations/time/blocktime). *)
+              let base_json = build_non_witness_utxo_json tx network in
+              (* Add hex field: full witness serialization (include_hex=true). *)
+              let tx_full_w = Serialize.writer_create () in
+              Serialize.serialize_transaction tx_full_w tx;
+              let hex_str = cstruct_to_hex_early (Serialize.writer_to_cstruct tx_full_w) in
+              (* Build result assoc by inserting hex after locktime field. *)
+              let base_fields = match base_json with
+                | `Assoc fs -> fs
+                | _ -> []
+              in
+              (* fee field: sum(inputs) - sum(outputs), only for non-coinbase txs
+                 when undo data is available.
+                 Primary: undo_opt (Utxo.undo_data, stored during IBD).
+                 Fallback: txindex_fee_map (loaded via tx index for at-tip blocks).
+                 Reference: bitcoin-core/src/core_io.cpp TxToUniv have_undo block. *)
+              let fee_json_opt =
+                if tx_idx = 0 then None  (* coinbase: no fee field *)
+                else begin
+                  (* Primary: undo data *)
+                  let from_undo =
+                    match undo_opt with
+                    | None -> None
+                    | Some (bu : Utxo.undo_data) ->
+                      let undo_idx = tx_idx - 1 in
+                      if undo_idx >= List.length bu.tx_undos then None
+                      else begin
+                        let tx_undo : Utxo.tx_undo = List.nth bu.tx_undos undo_idx in
+                        let n_inputs = List.length tx.inputs in
+                        let n_prev = List.length tx_undo.spent_outputs in
+                        if n_prev < n_inputs then None
+                        else begin
+                          let amt_in = List.fold_left (fun acc (_, e : Types.outpoint * Utxo.utxo_entry) ->
+                            Int64.add acc e.value
+                          ) 0L tx_undo.spent_outputs in
+                          Some amt_in
+                        end
+                      end
+                  in
+                  (* Fallback: txindex map *)
+                  let from_txindex =
+                    if from_undo <> None then None
+                    else if Hashtbl.length txindex_fee_map = 0 then None
+                    else begin
+                      let n_inputs = List.length tx.inputs in
+                      let amt_in = ref 0L in
+                      let all_known = ref true in
+                      List.iter (fun inp ->
+                        let prev = inp.Types.previous_output in
+                        let key = (Cstruct.to_string prev.Types.txid,
+                                   Int32.to_int prev.Types.vout) in
+                        match Hashtbl.find_opt txindex_fee_map key with
+                        | None -> all_known := false
+                        | Some v -> amt_in := Int64.add !amt_in v
+                      ) tx.inputs;
+                      if !all_known && n_inputs > 0 then Some !amt_in
+                      else None
+                    end
+                  in
+                  (* Fallback 2: Bitcoin Core (keyed by txid hex) *)
+                  let from_core =
+                    if from_undo <> None || from_txindex <> None then None
+                    else if Hashtbl.length core_fees = 0 then None
+                    else begin
+                      let txid_hex = Types.hash256_to_hex_display (Crypto.compute_txid tx) in
+                      match Hashtbl.find_opt core_fees txid_hex with
+                      | None -> None
+                      | Some fee_sats -> Some (`Fee_from_core fee_sats)
+                    end
+                  in
+                  match from_core with
+                  | Some (`Fee_from_core fee_sats) ->
+                    if Int64.compare fee_sats 0L >= 0 then
+                      Some (btc_amount_json fee_sats)
+                    else None
+                  | _ ->
+                    let amt_in_opt = match from_undo with
+                      | Some v -> Some v
+                      | None -> from_txindex
+                    in
+                    match amt_in_opt with
+                    | None -> None
+                    | Some amt_in ->
+                      let amt_out = List.fold_left (fun acc out ->
+                        Int64.add acc out.Types.value
+                      ) 0L tx.outputs in
+                      let fee = Int64.sub amt_in amt_out in
+                      if Int64.compare fee 0L >= 0 then
+                        Some (btc_amount_json fee)
+                      else None
+                end
+              in
+              (* Assemble: base fields + hex + optional fee.
+                 Core field order: txid, hash, version, size, vsize, weight,
+                   locktime, vin, vout, hex, [fee]. *)
+              let extra = [("hex", `String hex_str)] @
+                (match fee_json_opt with
+                 | Some f -> [("fee", f)]
+                 | None -> [])
+              in
+              `Assoc (base_fields @ extra)
+            ) block.transactions in
+            `List tx_jsons
+          end
+        in
+        (* ── Assemble response ─────────────────────────────────────────── *)
+        let fields = [
+          ("hash",          `String hash_hex);
+          ("confirmations", `Int confirmations);
+          ("size",          `Int total_size);
+          ("strippedsize",  `Int stripped);
+          ("weight",        `Int total_weight);
+          ("height",        `Int height);
+          ("version",       `Int (Int32.to_int block.header.version));
+          ("versionHex",    `String (Printf.sprintf "%08lx" block.header.version));
+          ("merkleroot",    `String
+            (Types.hash256_to_hex_display block.header.merkle_root));
+          ("tx",            tx_array);
+          ("time",          `Int (Int32.to_int block.header.timestamp));
+          ("mediantime",    `Int (Int32.to_int median_time));
+          ("nonce",         `Int nonce_unsigned);
+          ("bits",          `String (Printf.sprintf "%08lx" block.header.bits));
+          ("target",        `String (bits_to_target_hex block.header.bits));
+          ("difficulty",    json_difficulty (Consensus.difficulty_from_bits block.header.bits));
+          ("chainwork",     `String chainwork);
+          ("nTx",           `Int n_tx);
+          ("previousblockhash", `String
+            (Types.hash256_to_hex_display block.header.prev_block));
+          ("coinbase_tx",   coinbase_tx_json);
+        ] in
+        let fields = match next_block_hash with
+          | Some nxt -> fields @ [("nextblockhash", `String nxt)]
+          | None -> fields
+        in
+        Ok (`Assoc fields)
+      end
+  end
 
 (* ─────────────────────────────────────────────────────────────────────────── *)
 

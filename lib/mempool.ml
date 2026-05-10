@@ -827,7 +827,81 @@ let is_push_only_script_sig (script_sig : Cstruct.t) : bool =
     with _ -> false
   end
 
-(* Check if a script is a recognized standard output type *)
+(* Check if a script is a P2PK (bare pubkey) output.
+   Format: <33 or 65 byte pubkey> OP_CHECKSIG (0xac).
+   Core: MatchPayToPubkey in solver.cpp — pubkey must be 33 (compressed)
+   or 65 (uncompressed) bytes. *)
+let is_p2pk_script (script : Cstruct.t) : bool =
+  let len = Cstruct.length script in
+  (* Compressed: 35 bytes total — 0x21 <33 bytes> 0xac *)
+  ((len = 35 &&
+    Cstruct.get_uint8 script 0 = 0x21 &&
+    Cstruct.get_uint8 script 34 = 0xac) ||
+   (* Uncompressed: 67 bytes total — 0x41 <65 bytes> 0xac *)
+   (len = 67 &&
+    Cstruct.get_uint8 script 0 = 0x41 &&
+    Cstruct.get_uint8 script 66 = 0xac))
+
+(* Decode bare multisig (m-of-n OP_CHECKMULTISIG) output.
+   Returns Some (m, n) where m is the minimum required signatures and n is the
+   total number of pubkeys, or None if the script is not bare multisig.
+   Core: MatchMultisig in solver.cpp — OP_m <pubkeys> OP_n OP_CHECKMULTISIG.
+   n and m must be OP_1..OP_16 small integers. *)
+let decode_bare_multisig (script : Cstruct.t) : (int * int) option =
+  let len = Cstruct.length script in
+  (* Minimum: OP_1 <33-byte-pub> OP_1 OP_CHECKMULTISIG = 37 bytes *)
+  if len < 37 then None
+  else
+    let last_byte = Cstruct.get_uint8 script (len - 1) in
+    if last_byte <> 0xae (* OP_CHECKMULTISIG *) then None
+    else begin
+      (* First byte must be OP_1..OP_16 (0x51..0x60): the m value *)
+      let m_byte = Cstruct.get_uint8 script 0 in
+      if m_byte < 0x51 || m_byte > 0x60 then None
+      else begin
+        let m = m_byte - 0x50 in
+        (* Walk pubkeys — each must be a 0x21 (33) or 0x41 (65) byte push *)
+        let i = ref 1 in
+        let n = ref 0 in
+        let bad = ref false in
+        while not !bad && !i < len - 2 do
+          let push_byte = Cstruct.get_uint8 script !i in
+          let pk_len =
+            if push_byte = 0x21 then 33
+            else if push_byte = 0x41 then 65
+            else 0
+          in
+          if pk_len = 0 then bad := true
+          else if !i + 1 + pk_len > len - 2 then bad := true
+          else begin
+            incr n;
+            i := !i + 1 + pk_len
+          end
+        done;
+        if !bad then None
+        else begin
+          (* Next byte (at position i) must be OP_n (0x51..0x60) *)
+          if !i <> len - 2 then None
+          else begin
+            let n_byte = Cstruct.get_uint8 script !i in
+            if n_byte < 0x51 || n_byte > 0x60 then None
+            else begin
+              let n_val = n_byte - 0x50 in
+              (* Pubkey count must match n and constraints must hold *)
+              if !n <> n_val then None
+              else Some (m, n_val)
+            end
+          end
+        end
+      end
+    end
+
+(* Check if a script is a recognized standard output type.
+   Reference: Bitcoin Core IsStandard() in policy/policy.cpp + Solver() in
+   script/solver.cpp.  Standard types: P2PKH, P2SH, P2WPKH, P2WSH, P2TR, P2A,
+   P2PK (bare pubkey), bare multisig m-of-n with n <= 3, and OP_RETURN.
+   OP_RETURN size is NOT checked here — it is checked cumulatively in
+   is_standard_tx (see datacarrier_bytes_left logic below). *)
 let is_standard_output (script_pubkey : Cstruct.t) : bool =
   match Script.classify_script script_pubkey with
   | Script.P2PKH_script _ -> true
@@ -836,8 +910,14 @@ let is_standard_output (script_pubkey : Cstruct.t) : bool =
   | Script.P2WSH_script _ -> true
   | Script.P2TR_script _ -> true
   | Script.P2A_script -> true  (* P2A is standard -- BIP-PR-3535 *)
-  | Script.OP_RETURN_data _ -> Cstruct.length script_pubkey <= 83
-  | Script.Nonstandard -> false
+  | Script.OP_RETURN_data _ -> true  (* size checked cumulatively in is_standard_tx *)
+  | Script.Nonstandard ->
+    (* Check P2PK (bare pubkey) — not in classify_script but standard in Core *)
+    if is_p2pk_script script_pubkey then true
+    (* Check bare multisig m-of-n with n <= 3 (Core policy limit) *)
+    else match decode_bare_multisig script_pubkey with
+    | Some (m, n) -> n >= 1 && n <= 3 && m >= 1 && m <= n
+    | None -> false
 
 (* Count legacy sigops in a script with accurate multisig counting.
    OP_CHECKSIG/VERIFY = 1 sigop.
@@ -962,50 +1042,115 @@ let check_p2wsh_witness_limits (tx : Types.transaction) : (unit, string) result 
   | Some e -> Error e
   | None -> Ok ()
 
-(* Check if a transaction passes IsStandard policy *)
+(* Policy constants matching Bitcoin Core policy/policy.h *)
+let max_standard_scriptsig_size = 1650  (* MAX_STANDARD_SCRIPTSIG_SIZE *)
+let min_standard_tx_nonwitness_size = 65 (* MIN_STANDARD_TX_NONWITNESS_SIZE — CVE-2017-12842 *)
+(* MAX_OP_RETURN_RELAY = MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR = 400000/4 = 100000 *)
+let max_datacarrier_bytes = 100_000
+(* MAX_DUST_OUTPUTS_PER_TX = 1 (ephemeral dust: exactly 1 dust output allowed) *)
+let max_dust_outputs_per_tx = 1
+
+(* Compute the non-witness serialized size of a transaction (base size).
+   Used for MIN_STANDARD_TX_NONWITNESS_SIZE check (CVE-2017-12842). *)
+let compute_tx_nonwitness_size (tx : Types.transaction) : int =
+  let w = Serialize.writer_create () in
+  Serialize.serialize_transaction_no_witness w tx;
+  Cstruct.length (Serialize.writer_to_cstruct w)
+
+(* Check if a transaction passes IsStandard policy.
+   Reference: Bitcoin Core IsStandardTx() in policy/policy.cpp.
+
+   Gate order follows Core exactly:
+   1. version ∈ [1, TX_MAX_STANDARD_VERSION=3]
+   2. weight ≤ MAX_STANDARD_TX_WEIGHT (400,000 WU)
+   3. non-witness size ≥ MIN_STANDARD_TX_NONWITNESS_SIZE (65 bytes) — CVE-2017-12842
+   4. per-input: scriptSig ≤ MAX_STANDARD_SCRIPTSIG_SIZE (1650) + IsPushOnly
+   5. per-output: standard scriptPubKey; cumulative OP_RETURN ≤ 100,000 bytes
+   6. dust: at most MAX_DUST_OUTPUTS_PER_TX (1) dust outputs
+   7. P2WSH witness policy limits (check_p2wsh_witness_limits) *)
 let is_standard_tx (min_relay_fee : int64) (tx : Types.transaction) : (unit, string) result =
-  (* Version must be 1 or 2 *)
+  (* Gate 1: Version must be in [1, TX_MAX_STANDARD_VERSION=3].
+     v3/TRUC transactions (BIP-431) are standard. *)
   let version = Int32.to_int tx.version in
-  if version < 1 || version > 2 then
+  if version < 1 || version > 3 then
     Error "Non-standard transaction version"
   else begin
-    (* Weight must not exceed 400,000 *)
+    (* Gate 2: Weight must not exceed MAX_STANDARD_TX_WEIGHT (400,000 WU) *)
     let weight = Validation.compute_tx_weight tx in
     if weight > max_standard_tx_weight then
       Error "Transaction weight exceeds standard limit"
     else begin
-      (* All outputs must be recognized script types *)
-      let bad_output = ref None in
-      List.iteri (fun i out ->
-        if !bad_output = None then begin
-          if not (is_standard_output out.Types.script_pubkey) then
-            bad_output := Some (Printf.sprintf
-              "Non-standard output script at index %d" i)
-          else if is_dust min_relay_fee out &&
-                  not (tx.version = 3l && out.Types.value = 0L) then
-            bad_output := Some (Printf.sprintf
-              "Dust output at index %d (value: %Ld)" i out.Types.value)
-        end
-      ) tx.outputs;
-
-      match !bad_output with
-      | Some e -> Error e
-      | None ->
-        (* All scriptSigs must be push-only *)
+      (* Gate 3: Non-witness size must be >= MIN_STANDARD_TX_NONWITNESS_SIZE (65 bytes).
+         Prevents the CVE-2017-12842 merkle-tree attack via 64-byte transactions. *)
+      let nonwitness_size = compute_tx_nonwitness_size tx in
+      if nonwitness_size < min_standard_tx_nonwitness_size then
+        Error "Transaction non-witness size too small (CVE-2017-12842)"
+      else begin
+        (* Gate 4: Per-input scriptSig checks.
+           - scriptSig must not exceed 1650 bytes (MAX_STANDARD_SCRIPTSIG_SIZE)
+           - scriptSig must be push-only *)
         let bad_input = ref None in
         List.iteri (fun i inp ->
           if !bad_input = None then begin
-            if not (is_push_only_script_sig inp.Types.script_sig) then
+            let sig_len = Cstruct.length inp.Types.script_sig in
+            if sig_len > max_standard_scriptsig_size then
               bad_input := Some (Printf.sprintf
-                "Non-push-only scriptSig at input %d" i)
+                "scriptsig-size: scriptSig at input %d too large (%d > %d)"
+                i sig_len max_standard_scriptsig_size)
+            else if not (is_push_only_script_sig inp.Types.script_sig) then
+              bad_input := Some (Printf.sprintf
+                "scriptsig-not-pushonly: non-push-only scriptSig at input %d" i)
           end
         ) tx.inputs;
 
         match !bad_input with
         | Some e -> Error e
         | None ->
-          (* Gap 2: P2WSH witness policy limits *)
-          check_p2wsh_witness_limits tx
+          (* Gate 5: Per-output scriptPubKey standardness + cumulative datacarrier budget.
+             OP_RETURN outputs consume from a shared 100,000-byte budget (datacarrier_bytes_left).
+             Each OP_RETURN scriptPubKey's total byte length (including the 0x6a prefix) is
+             charged, matching Core's `size = txout.scriptPubKey.size()` in IsStandardTx. *)
+          let datacarrier_bytes_left = ref max_datacarrier_bytes in
+          let bad_output = ref None in
+          List.iteri (fun i out ->
+            if !bad_output = None then begin
+              if not (is_standard_output out.Types.script_pubkey) then
+                bad_output := Some (Printf.sprintf
+                  "scriptpubkey: non-standard output script at index %d" i)
+              else begin
+                match Script.classify_script out.Types.script_pubkey with
+                | Script.OP_RETURN_data _ ->
+                  let op_return_size = Cstruct.length out.Types.script_pubkey in
+                  if op_return_size > !datacarrier_bytes_left then
+                    bad_output := Some (Printf.sprintf
+                      "datacarrier: OP_RETURN output at index %d exceeds datacarrier budget \
+                       (%d bytes, %d remaining)"
+                      i op_return_size !datacarrier_bytes_left)
+                  else
+                    datacarrier_bytes_left := !datacarrier_bytes_left - op_return_size
+                | _ -> ()
+              end
+            end
+          ) tx.outputs;
+
+          match !bad_output with
+          | Some e -> Error e
+          | None ->
+            (* Gate 6: Dust check.
+               Core allows at most MAX_DUST_OUTPUTS_PER_TX (1) dust outputs (ephemeral dust).
+               Count dust outputs and reject if more than 1. *)
+            let dust_count = List.fold_left (fun acc out ->
+              if is_dust min_relay_fee out then acc + 1 else acc
+            ) 0 tx.outputs in
+            if dust_count > max_dust_outputs_per_tx then
+              Error (Printf.sprintf
+                "dust: transaction has %d dust outputs (max %d)"
+                dust_count max_dust_outputs_per_tx)
+            else begin
+              (* Gate 7: P2WSH witness policy limits (stack item count/size) *)
+              check_p2wsh_witness_limits tx
+            end
+      end
     end
   end
 

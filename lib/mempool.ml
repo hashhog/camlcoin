@@ -2043,18 +2043,64 @@ let get_stats (mp : mempool) : mempool_stats =
    ============================================================================ *)
 
 (* Check if a transaction signals RBF (BIP-125 or TRUC/v3)
-   v3/TRUC transactions signal replaceability unconditionally. *)
+   v3/TRUC transactions signal replaceability unconditionally.
+   This function checks only the transaction itself, not mempool ancestors.
+   Use [signals_rbf_with_ancestors] when mempool context is available. *)
 let signals_rbf (tx : Types.transaction) : bool =
   (* v3/TRUC transactions are always replaceable *)
   is_truc_tx tx ||
-  (* BIP-125: sequence number < 0xFFFFFFFE signals RBF.
+  (* BIP-125: any input with nSequence <= MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD) signals RBF.
      Sequences are unsigned uint32; use Int64 mask to avoid signed-comparison
      gotcha: 0xFFFFFFFEl as OCaml int32 is -2l, so Int32.compare 0l (-2l) > 0
-     which would incorrectly report sequence=0 as non-RBF. *)
+     which would incorrectly report sequence=0 as non-RBF.  Fixed by W70. *)
   List.exists (fun inp ->
     let seq_u = Int64.logand (Int64.of_int32 inp.Types.sequence) 0xFFFFFFFFL in
     Int64.compare seq_u 0xFFFFFFFEL < 0
   ) tx.inputs
+
+(* Gate 2: BIP-125 inheritable opt-in — also REPLACEABLE_BIP125 if any in-mempool
+   ancestor signals RBF, even if this tx's own sequence numbers don't.
+   Core: rbf.cpp IsRBFOptIn, walks pool.CalculateMemPoolAncestors. *)
+let signals_rbf_with_ancestors (mp : mempool) (tx : Types.transaction) : bool =
+  if signals_rbf tx then true
+  else begin
+    (* Walk all mempool ancestors via BFS — same logic as ancestor-limit walk *)
+    let txid_key = Cstruct.to_string (Crypto.compute_txid tx) in
+    (* Seed with direct parents of this tx *)
+    let direct_parents = List.filter_map (fun inp ->
+      let parent_key = Cstruct.to_string inp.Types.previous_output.txid in
+      if Hashtbl.mem mp.entries parent_key then Some parent_key else None
+    ) tx.inputs in
+    if direct_parents = [] then false
+    else begin
+      let visited = Hashtbl.create 8 in
+      let queue = Queue.create () in
+      List.iter (fun pk ->
+        if pk <> txid_key && not (Hashtbl.mem visited pk) then begin
+          Hashtbl.replace visited pk ();
+          Queue.push pk queue
+        end
+      ) direct_parents;
+      let found = ref false in
+      while not (Queue.is_empty queue) && not !found do
+        let key = Queue.pop queue in
+        match Hashtbl.find_opt mp.entries key with
+        | None -> ()
+        | Some ancestor_entry ->
+          if signals_rbf ancestor_entry.tx then
+            found := true
+          else
+            List.iter (fun gp_txid ->
+              let gp_key = Cstruct.to_string gp_txid in
+              if not (Hashtbl.mem visited gp_key) then begin
+                Hashtbl.replace visited gp_key ();
+                Queue.push gp_key queue
+              end
+            ) ancestor_entry.depends_on
+      done;
+      !found
+    end
+  end
 
 (* Get total fees for a transaction and all its descendants *)
 let get_fees_with_descendants (mp : mempool) (entry : mempool_entry) : int64 =
@@ -2108,87 +2154,144 @@ let replace_by_fee (mp : mempool) (tx : Types.transaction)
         let new_vsize = max 1 ((new_weight + 3) / 4) in
         let new_feerate = Int64.to_float new_fee /. float_of_int new_vsize in
 
-        (* Rule 3: Calculate total evictions first (conflicts + all descendants) *)
-        let all_evicted = ref [] in
+        (* Rule #5 (Gate 3): Collect the full set of transactions that would be
+           evicted (conflicts + all their descendants). Deduplicate by txid so
+           that a tx that appears as both a direct conflict and a descendant of
+           another conflict is only counted once (same as Core's unique-cluster
+           bound — rbf.cpp GetEntriesForConflicts uses a set<txiter>).
+           Core constant: MAX_REPLACEMENT_CANDIDATES = 100. *)
+        let evicted_set : (string, mempool_entry) Hashtbl.t = Hashtbl.create 16 in
         List.iter (fun conflict_entry ->
-          all_evicted := conflict_entry :: !all_evicted;
+          let key = Cstruct.to_string conflict_entry.txid in
+          if not (Hashtbl.mem evicted_set key) then
+            Hashtbl.replace evicted_set key conflict_entry;
           let desc = get_descendants mp conflict_entry.txid in
-          all_evicted := desc @ !all_evicted
+          List.iter (fun d ->
+            let dk = Cstruct.to_string d.txid in
+            if not (Hashtbl.mem evicted_set dk) then
+              Hashtbl.replace evicted_set dk d
+          ) desc
         ) conflicts;
-        let eviction_count = List.length !all_evicted in
+        let eviction_count = Hashtbl.length evicted_set in
 
         if eviction_count > max_rbf_evictions then
           Error (Printf.sprintf
-            "RBF would evict %d transactions (max %d)"
+            "rejecting replacement; too many conflicting transactions (%d > %d)"
             eviction_count max_rbf_evictions)
 
         else begin
-          (* Rule 1: Total fee of all conflicting transactions INCLUDING descendants *)
-          let total_conflict_fee = List.fold_left
-            (fun acc e -> Int64.add acc (get_fees_with_descendants mp e))
-            0L conflicts in
+          (* Build set of conflict txids for the disjoint check below *)
+          let conflict_txid_set : (string, unit) Hashtbl.t = Hashtbl.create 8 in
+          List.iter (fun ce ->
+            Hashtbl.replace conflict_txid_set (Cstruct.to_string ce.txid) ()
+          ) conflicts;
 
-          if new_fee <= total_conflict_fee then
-            Error (Printf.sprintf
-              "Replacement fee %Ld not higher than total conflicting fee %Ld (including descendants)"
-              new_fee total_conflict_fee)
+          (* Gate 5 (EntriesAndTxidsDisjoint — Core rbf.cpp line 85):
+             The replacement tx's mempool ancestors must not overlap with the
+             direct conflict set.  If they did, the replacement would depend on
+             a tx being evicted, making the whole operation incoherent.
+             Core: ancestors-of-replacement ∩ direct_conflicts = ∅. *)
+          let ancestor_in_conflict =
+            let found = ref false in
+            let visited = Hashtbl.create 8 in
+            let queue = Queue.create () in
+            List.iter (fun inp ->
+              let pk = Cstruct.to_string inp.Types.previous_output.txid in
+              if Hashtbl.mem mp.entries pk && not (Hashtbl.mem visited pk) then begin
+                Hashtbl.replace visited pk ();
+                Queue.push pk queue
+              end
+            ) tx.inputs;
+            while not (Queue.is_empty queue) && not !found do
+              let key = Queue.pop queue in
+              if Hashtbl.mem conflict_txid_set key then
+                found := true
+              else
+                (match Hashtbl.find_opt mp.entries key with
+                 | None -> ()
+                 | Some ae ->
+                   List.iter (fun gp ->
+                     let gk = Cstruct.to_string gp in
+                     if not (Hashtbl.mem visited gk) then begin
+                       Hashtbl.replace visited gk ();
+                       Queue.push gk queue
+                     end
+                   ) ae.depends_on)
+            done;
+            !found
+          in
+
+          if ancestor_in_conflict then
+            Error "replacement tx spends a conflicting transaction"
 
           else begin
-            (* Rule 2: Replacement must pay at least incremental_relay_fee more per kvB.
-               This ensures the additional fees cover the bandwidth for relaying. *)
-            let incremental_fee = Int64.of_float (
-              Int64.to_float mp.min_relay_fee *.
-              float_of_int new_vsize /. 1000.0) in
-            let required_fee = Int64.add total_conflict_fee incremental_fee in
+            (* Rule #3 (Gate 6): replacement_fees >= original_fees.
+               Core: PaysForRBF rejects when replacement_fees < original_fees.
+               Note: equal is ALLOWED (>= not >).  Previous code used <= which
+               was wrong — it rejected replacements with exactly the same fee. *)
+            let total_conflict_fee = Hashtbl.fold
+              (fun _ e acc -> Int64.add acc e.fee) evicted_set 0L in
 
-            if new_fee < required_fee then
+            if new_fee < total_conflict_fee then
               Error (Printf.sprintf
-                "Replacement fee %Ld too low (need >= %Ld = conflict fee %Ld + relay fee %Ld)"
-                new_fee required_fee total_conflict_fee incremental_fee)
+                "rejecting replacement, less fees than conflicting txs; %Ld < %Ld"
+                new_fee total_conflict_fee)
 
             else begin
-              (* Additional check: new feerate must be higher than each direct conflict's feerate *)
-              let low_feerate_conflict = List.find_opt (fun e ->
-                let conflict_vsize = max 1 ((e.weight + 3) / 4) in
-                let conflict_feerate = Int64.to_float e.fee /. float_of_int conflict_vsize in
-                new_feerate <= conflict_feerate
-              ) conflicts in
-
-              match low_feerate_conflict with
-              | Some conflict ->
-                let conflict_vsize = max 1 ((conflict.weight + 3) / 4) in
-                let conflict_feerate = Int64.to_float conflict.fee /. float_of_int conflict_vsize in
+              (* Rule #4 (Gate 7): additional_fees >= relay_fee.GetFee(replacement_vsize).
+                 Core: PaysForRBF, additional_fees = replacement_fees − original_fees.
+                 relay_fee is in sat/kvB; GetFee(vsize) = ceil(rate * vsize / 1000).
+                 We use integer arithmetic to match Core's truncating GetFee. *)
+              let additional_fees = Int64.sub new_fee total_conflict_fee in
+              let relay_fee_for_replacement =
+                Int64.div (Int64.mul mp.min_relay_fee (Int64.of_int new_vsize)) 1000L in
+              if additional_fees < relay_fee_for_replacement then
                 Error (Printf.sprintf
-                  "Replacement feerate %.2f sat/vB not higher than conflicting tx feerate %.2f sat/vB"
-                  new_feerate conflict_feerate)
-              | None ->
-
-              (* Rule 4: Replacement must not introduce new unconfirmed inputs *)
-              let has_new_unconfirmed = List.exists (fun inp ->
-                let prev = inp.Types.previous_output in
-                (* If input is unconfirmed (from mempool) *)
-                if not (is_confirmed_utxo mp prev) then begin
-                  (* Check if this unconfirmed input was also used by a conflicting tx *)
-                  let was_in_conflicts = List.exists (fun conflict_entry ->
-                    List.exists (fun conflict_inp ->
-                      Cstruct.equal conflict_inp.Types.previous_output.txid prev.txid &&
-                      conflict_inp.Types.previous_output.vout = prev.vout
-                    ) conflict_entry.tx.inputs
-                  ) conflicts in
-                  not was_in_conflicts
-                end else
-                  false
-              ) tx.inputs in
-
-              if has_new_unconfirmed then
-                Error "Replacement introduces new unconfirmed inputs"
+                  "rejecting replacement, not enough additional fees to relay; %Ld < %Ld"
+                  additional_fees relay_fee_for_replacement)
 
               else begin
-                (* Remove all conflicting transactions and their descendants, then add new *)
-                List.iter (fun conflict_entry ->
-                  remove_transaction mp conflict_entry.txid
+                (* Rule #2 (Gate 4, HasNoNewUnconfirmed / BIP125 Rule 2):
+                   The replacement may only include an unconfirmed input if that
+                   exact outpoint (txid:vout) was already spent by one of the
+                   directly conflicting transactions.
+                   Rationale: prevents the replacement from pulling in new
+                   unconfirmed parents that were never part of the original
+                   conflict cluster.
+                   BIP125: "The replacement transaction may only include an
+                   unconfirmed input if that input was included in one of the
+                   original transactions." *)
+                let conflict_outpoints : (string * int32, unit) Hashtbl.t =
+                  Hashtbl.create 16 in
+                List.iter (fun ce ->
+                  List.iter (fun inp ->
+                    let key = (Cstruct.to_string inp.Types.previous_output.txid,
+                               inp.Types.previous_output.vout) in
+                    Hashtbl.replace conflict_outpoints key ()
+                  ) ce.tx.inputs
                 ) conflicts;
-                add_transaction mp tx
+
+                let new_unconfirmed = List.exists (fun inp ->
+                  let parent_key = Cstruct.to_string inp.Types.previous_output.txid in
+                  let outpoint_key = (parent_key, inp.Types.previous_output.vout) in
+                  (* Only flag as "new unconfirmed" if:
+                     1. The parent is in the mempool (so it's an unconfirmed input), AND
+                     2. This exact outpoint was NOT already spent by a conflicting tx *)
+                  Hashtbl.mem mp.entries parent_key &&
+                  not (Hashtbl.mem conflict_outpoints outpoint_key)
+                ) tx.inputs in
+
+                if new_unconfirmed then
+                  Error "replacement tx introduces new unconfirmed inputs not in original transactions"
+
+                else begin
+                  ignore new_feerate; (* suppress unused warning after removing non-Core feerate check *)
+                  (* Remove all conflicting transactions and their descendants, then add new *)
+                  List.iter (fun conflict_entry ->
+                    remove_transaction mp conflict_entry.txid
+                  ) conflicts;
+                  add_transaction mp tx
+                end
               end
             end
           end

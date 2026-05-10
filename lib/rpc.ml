@@ -2603,6 +2603,13 @@ let handle_validateaddress (_ctx : rpc_context)
          | Address.P2WPKH | Address.P2WSH | Address.P2TR | Address.WitnessUnknown _ -> true
          | Address.P2PKH | Address.P2SH -> false
        in
+       (* isscript: true for P2SH AND for witness programs > 20 bytes
+          (P2WSH = 32 bytes, P2TR = 32 bytes).  Bitcoin Core: src/rpc/util.cpp
+          DescribeAddress: isscript=true for P2SH and for SegwitV0ScriptHash/P2TR. *)
+       let is_script = match addr.Address.addr_type with
+         | Address.P2SH | Address.P2WSH | Address.P2TR -> true
+         | Address.P2WPKH | Address.P2PKH | Address.WitnessUnknown _ -> false
+       in
        let witness_version = match addr.Address.addr_type with
          | Address.P2WPKH | Address.P2WSH -> Some 0
          | Address.P2TR -> Some 1
@@ -2616,16 +2623,30 @@ let handle_validateaddress (_ctx : rpc_context)
          ("isvalid", `Bool true);
          ("address", `String address);
          ("scriptPubKey", `String hex);
-         ("isscript", `Bool (addr.Address.addr_type = Address.P2SH));
+         ("isscript", `Bool is_script);
          ("iswitness", `Bool is_witness);
        ] in
+       (* witness_program + witness_version appended for all witness address types.
+          witness_program is the raw hash bytes (not the scriptPubKey prefix).
+          witness_version is the decoded integer (0 or 1), not the opcode byte. *)
        let fields = match witness_version with
-         | Some v -> ("witness_version", `Int v) :: base_fields
+         | Some v ->
+           let prog_hex = cstruct_to_hex_early addr.Address.hash in
+           base_fields @ [
+             ("witness_program", `String prog_hex);
+             ("witness_version", `Int v);
+           ]
          | None -> base_fields
        in
        Ok (`Assoc fields)
      | Error _ ->
-       Ok (`Assoc [("isvalid", `Bool false)]))
+       (* Core 27+: invalid address returns error + error_locations, no address echo.
+          src/rpc/util.cpp ValidateAddress: {isvalid:false, error:..., error_locations:[]} *)
+       Ok (`Assoc [
+         ("error", `String "Invalid or unsupported Segwit (Bech32) or Base58 encoding.");
+         ("error_locations", `List []);
+         ("isvalid", `Bool false);
+       ]))
   | _ -> Error "Invalid parameters: expected [address]"
 
 (* ============================================================================

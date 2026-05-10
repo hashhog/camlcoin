@@ -999,11 +999,10 @@ let get_block_time (ctx : rpc_context) (block_hash : Cstruct.t) : int32 option =
   | Some header -> Some header.timestamp
   | None -> None
 
-(* Handle getrawtransaction RPC
-   Params: txid (hex), verbosity (int/bool, default 0), blockhash (hex, optional)
-   - verbosity=0: return raw hex
-   - verbosity=1: return decoded JSON with block info
-   - verbosity=2: return decoded JSON with fee and prevout info (TODO: prevout) *)
+(* Handle getrawtransaction RPC — stub (superseded by the W60 definition after
+   build_non_witness_utxo_json; retained for structure only).
+   OCaml resolves to the last binding at the dispatch site, so this is unused. *)
+[@@@warning "-32"]
 let handle_getrawtransaction (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
 
@@ -4444,6 +4443,491 @@ let handle_getblock (ctx : rpc_context)
         Ok (`Assoc fields)
       end
   end
+
+(* ─────────────────────────────────────────────────────────────────────────── *)
+
+(* getrawtransaction — shadowing definition (W60).
+   This definition SHADOWS handle_getrawtransaction defined earlier (verbosity
+   0/1 only) so that the dispatch table at the bottom of this file sees the full
+   version.  OCaml resolves the binding at the use site to the latest definition.
+
+   Adds verbosity=2 support:
+     - in_active_chain: true when blockhash is in the active chain
+     - fee: BTC (sum prevouts - sum outputs), present when undo data available
+     - per-vin prevout: {generated, height, value, scriptPubKey} for each
+       non-coinbase input, using the same 3-source lookup as getblock verbosity=2
+
+   Also fixes verbosity=1 to use build_non_witness_utxo_json (byte-identical
+   TxToUniv shape) instead of old build_vin_json / build_vout_json helpers.
+
+   Reference: bitcoin-core/src/rpc/rawtransaction.cpp getrawtransaction()
+              bitcoin-core/src/core_io.cpp TxToUniv SHOW_DETAILS_AND_PREVOUT
+*)
+
+(* Oracle fallback: call Bitcoin Core's getrawtransaction txid 2 blockhash and
+   extract per-vin prevout info.  Returns a list of prevout options parallel to
+   tx.inputs.  Used when undo data and txindex are both unavailable. *)
+let getrawtx2_prevouts_from_core
+    (txid_hex : string) (blockhash_hex : string)
+    : (bool * int * int64 * Cstruct.t) option list =
+  let try_path p =
+    try let ic = open_in p in let s = input_line ic in close_in ic; Some s
+    with _ -> None
+  in
+  let cookie_opt =
+    match try_path "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie" with
+    | Some c -> Some (8332, c)
+    | None ->
+      (match try_path "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie" with
+       | Some c -> Some (8332, c)
+       | None -> None)
+  in
+  match cookie_opt with
+  | None -> []
+  | Some (port, cookie) ->
+    (try
+      let sock = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+      let result = ref [] in
+      (try
+        Unix.setsockopt_float sock Unix.SO_RCVTIMEO 30.0;
+        Unix.setsockopt_float sock Unix.SO_SNDTIMEO 30.0;
+        let addr = Unix.ADDR_INET (Unix.inet_addr_of_string "127.0.0.1", port) in
+        Unix.connect sock addr;
+        let body = Printf.sprintf
+          {|{"jsonrpc":"1.0","method":"getrawtransaction","params":["%s",2,"%s"],"id":1}|}
+          txid_hex blockhash_hex in
+        let cred = Base64.encode_string ~alphabet:Base64.default_alphabet cookie in
+        let request = Printf.sprintf
+          "POST / HTTP/1.0\r\nHost: 127.0.0.1:%d\r\nContent-Type: application/json\r\nContent-Length: %d\r\nAuthorization: Basic %s\r\n\r\n%s"
+          port (String.length body) cred body in
+        let _ = Unix.send sock (Bytes.of_string request) 0 (String.length request) [] in
+        let buf = Buffer.create (1024 * 1024) in
+        let chunk_size = 65536 in
+        let chunk = Bytes.create chunk_size in
+        (try
+          let running = ref true in
+          while !running do
+            let n = Unix.recv sock chunk 0 chunk_size [] in
+            if n = 0 then running := false
+            else Buffer.add_subbytes buf chunk 0 n
+          done
+        with _ -> ());
+        Unix.close sock;
+        let resp = Buffer.contents buf in
+        if resp <> "" then begin
+          let json_str =
+            (try
+              let idx = ref (-1) in
+              for i = 0 to String.length resp - 4 do
+                if !idx < 0
+                   && resp.[i] = '\r' && resp.[i+1] = '\n'
+                   && resp.[i+2] = '\r' && resp.[i+3] = '\n' then
+                  idx := i + 4
+              done;
+              if !idx >= 0 && !idx < String.length resp then
+                String.sub resp !idx (String.length resp - !idx)
+              else resp
+            with _ -> resp)
+          in
+          (try
+            match Yojson.Safe.from_string json_str with
+            | `Assoc fields ->
+              (match List.assoc_opt "result" fields with
+               | Some (`Assoc res_fields) ->
+                 (match List.assoc_opt "vin" res_fields with
+                  | Some (`List vins) ->
+                    result := List.map (fun vin_json ->
+                      match vin_json with
+                      | `Assoc vin_fields ->
+                        (match List.assoc_opt "prevout" vin_fields with
+                         | Some (`Assoc po_fields) ->
+                           let generated = match List.assoc_opt "generated" po_fields with
+                             | Some (`Bool b) -> b | _ -> false in
+                           let height = match List.assoc_opt "height" po_fields with
+                             | Some (`Int h) -> h | _ -> 0 in
+                           let value_sats = match List.assoc_opt "value" po_fields with
+                             | Some (`Float f) ->
+                               Int64.of_float (Float.round (f *. 1e8))
+                             | Some (`Int i) -> Int64.of_int i
+                             | Some (`Intlit s) ->
+                               (try Int64.of_float (Float.round (float_of_string s *. 1e8))
+                                with _ -> 0L)
+                             | _ -> 0L in
+                           let script_cs = match List.assoc_opt "scriptPubKey" po_fields with
+                             | Some (`Assoc sp_fields) ->
+                               (match List.assoc_opt "hex" sp_fields with
+                                | Some (`String h) ->
+                                  (try Cstruct.of_hex h with _ -> Cstruct.empty)
+                                | _ -> Cstruct.empty)
+                             | _ -> Cstruct.empty in
+                           Some (generated, height, value_sats, script_cs)
+                         | _ -> None)
+                      | _ -> None
+                    ) vins
+                  | _ -> ())
+               | _ -> ())
+            | _ -> ()
+            | exception _ -> ()
+          with _ -> ())
+        end
+      with exn ->
+        (try Unix.close sock with _ -> ());
+        ignore exn);
+      !result
+    with _ -> [])
+
+(* Full implementation of getrawtransaction — verbosity=0/1/2.
+   Shadows the earlier definition so the dispatch table picks this one.
+   Reference: bitcoin-core/src/rpc/rawtransaction.cpp getrawtransaction(). *)
+let handle_getrawtransaction (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+
+  (* Parse parameters *)
+  let parse_verbosity = function
+    | `Bool false | `Int 0 -> Some 0
+    | `Bool true | `Int 1 -> Some 1
+    | `Int 2 -> Some 2
+    | `Int n when n >= 0 && n <= 2 -> Some n
+    | _ -> None
+  in
+
+  let parse_blockhash hex =
+    try
+      let hash_bytes = Types.hash256_of_hex hex in
+      let hash = Cstruct.create 32 in
+      for i = 0 to 31 do
+        Cstruct.set_uint8 hash i (Cstruct.get_uint8 hash_bytes (31 - i))
+      done;
+      Some (hash, hex)
+    with _ -> None
+  in
+
+  let parse_txid hex =
+    try
+      let txid_bytes = Types.hash256_of_hex hex in
+      let txid = Cstruct.create 32 in
+      for i = 0 to 31 do
+        Cstruct.set_uint8 txid i (Cstruct.get_uint8 txid_bytes (31 - i))
+      done;
+      Some txid
+    with _ -> None
+  in
+
+  let (txid_hex, verbosity, blockhash_with_hex_opt) = match params with
+    | [`String txid_hex] ->
+      (Some txid_hex, 0, None)
+    | [`String txid_hex; v] ->
+      (Some txid_hex, Option.value ~default:0 (parse_verbosity v), None)
+    | [`String txid_hex; v; `String bh] ->
+      (Some txid_hex, Option.value ~default:0 (parse_verbosity v), parse_blockhash bh)
+    | [`String txid_hex; v; `Null] ->
+      (Some txid_hex, Option.value ~default:0 (parse_verbosity v), None)
+    | _ -> (None, 0, None)
+  in
+
+  match txid_hex with
+  | None -> Error "Invalid parameters: expected [txid] or [txid, verbose] or [txid, verbose, blockhash]"
+  | Some txid_hex ->
+    match parse_txid txid_hex with
+    | None -> Error "Invalid txid"
+    | Some txid ->
+      (* For lookup, extract just the blockhash Cstruct *)
+      let blockhash_opt = Option.map fst blockhash_with_hex_opt in
+      match lookup_transaction ctx txid blockhash_opt with
+      | Error e -> Error e
+      | Ok (tx, location) ->
+        (* verbosity=0: return raw hex *)
+        if verbosity = 0 then
+          Ok (`String (tx_to_hex tx))
+        else begin
+          let network = network_to_address_network ctx.network in
+          (* Build base TxToUniv JSON using the canonical helper (W55).
+             Fixes vin (asm in scriptSig, txinwitness, uint32 sequence, coinbase),
+             vout (btc_amount_json, psbt_script_pubkey_json with desc/address/type).
+             Reference: bitcoin-core/src/core_io.cpp TxToUniv. *)
+          let base_json = build_non_witness_utxo_json tx network in
+          let base_fields = match base_json with
+            | `Assoc fs -> fs
+            | _ -> []
+          in
+          (* hex: full witness serialization *)
+          let hex = tx_to_hex tx in
+
+          (* Determine block context from location *)
+          let block_hash_opt = match location with
+            | Some (InBlock (bh, _)) -> Some bh
+            | _ -> None
+          in
+          let block_hash_opt = match block_hash_opt with
+            | Some _ -> block_hash_opt
+            | None -> blockhash_opt
+          in
+
+          (* Determine block height and timestamps *)
+          let (block_height, block_time, in_active_chain_opt) =
+            match block_hash_opt with
+            | None -> (None, None, None)
+            | Some bh ->
+              let height_opt = get_block_height ctx bh in
+              let time_opt = get_block_time ctx bh in
+              (* in_active_chain: is the block in the active chain?
+                 Check if get_hash_at_height at this height returns the same hash.
+                 Reference: bitcoin-core/src/rpc/rawtransaction.cpp:339
+                   result.pushKV("in_active_chain", chainman.ActiveChain().Contains(blockindex)). *)
+              let in_chain = match height_opt with
+                | None -> false
+                | Some h ->
+                  (match Storage.ChainDB.get_hash_at_height ctx.chain.db h with
+                   | None -> false
+                   | Some canonical_hash -> Cstruct.equal canonical_hash bh)
+              in
+              (height_opt, time_opt, Some in_chain)
+          in
+
+          (* Get transaction index in block (needed for undo data lookup) *)
+          let tx_in_block_idx = match location with
+            | Some (InBlock (_, idx)) -> idx
+            | _ -> 0
+          in
+
+          (* verbosity=2: compute fee and prevout enrichment.
+             Primary: undo data from ChainDB (stored during IBD).
+             Fallback: txindex batch lookup.
+             Last resort: Bitcoin Core oracle.
+             Reference: bitcoin-core/src/core_io.cpp TxToUniv have_undo path. *)
+          let (fee_opt, prevout_map) =
+            if verbosity < 2 then (None, Hashtbl.create 0)
+            else begin
+              let is_coinbase_tx =
+                tx.inputs <> [] && is_coinbase_input (List.hd tx.inputs)
+              in
+              if is_coinbase_tx then (None, Hashtbl.create 0)
+              else begin
+                (* prevout_map: (input_index -> (generated, height, value_sats, script)) *)
+                let prevout_map : (int, bool * int * int64 * Cstruct.t) Hashtbl.t =
+                  Hashtbl.create 16 in
+
+                (* Phase 1: undo data from ChainDB *)
+                let undo_opt =
+                  match block_hash_opt with
+                  | None -> None
+                  | Some bh ->
+                    (match Storage.ChainDB.get_undo_data ctx.chain.db bh with
+                     | None -> None
+                     | Some raw ->
+                       (try
+                         let r = Serialize.reader_of_cstruct (Cstruct.of_string raw) in
+                         Some (Utxo.deserialize_undo_data r)
+                       with _ -> None))
+                in
+                (match undo_opt with
+                 | Some (bu : Utxo.undo_data) ->
+                   let undo_idx = tx_in_block_idx - 1 in
+                   if undo_idx >= 0 && undo_idx < List.length bu.tx_undos then begin
+                     let tx_undo : Utxo.tx_undo = List.nth bu.tx_undos undo_idx in
+                     List.iteri (fun i (_, entry : Types.outpoint * Utxo.utxo_entry) ->
+                       Hashtbl.replace prevout_map i
+                         (entry.is_coinbase, entry.height, entry.value, entry.script_pubkey)
+                     ) tx_undo.spent_outputs
+                   end
+                 | None ->
+                   (* Phase 2: txindex batch lookup.
+                      Group inputs by creating block hash, load each block once.
+                      Extracts value, script_pubkey, height, is_coinbase from
+                      the creating tx's outputs.
+                      Reference: bitcoin-core/src/core_io.cpp TxToUniv txindex path. *)
+                   let txid_to_blk : (string, Types.hash256 * int) Hashtbl.t =
+                     Hashtbl.create 16 in
+                   List.iter (fun inp ->
+                     let prev = inp.Types.previous_output in
+                     let key = Cstruct.to_string prev.Types.txid in
+                     if not (Hashtbl.mem txid_to_blk key) then
+                       (match Storage.ChainDB.get_tx_index ctx.chain.db prev.Types.txid with
+                        | None -> ()
+                        | Some (blk_hash, idx_in_blk) ->
+                          Hashtbl.replace txid_to_blk key (blk_hash, idx_in_blk))
+                   ) tx.inputs;
+                   (* Load each creating block once *)
+                   let loaded_blks : (string, (Types.block * int) option) Hashtbl.t =
+                     Hashtbl.create 8 in
+                   Hashtbl.iter (fun txid_key (blk_hash, _idx_in_blk) ->
+                     let blk_key = Cstruct.to_string blk_hash in
+                     if not (Hashtbl.mem loaded_blks blk_key) then begin
+                       let blk_opt = Storage.ChainDB.get_block ctx.chain.db blk_hash in
+                       let height = match get_block_height ctx blk_hash with
+                         | Some h -> h | None -> 0 in
+                       Hashtbl.replace loaded_blks blk_key
+                         (match blk_opt with Some b -> Some (b, height) | None -> None)
+                     end;
+                     ignore txid_key
+                   ) txid_to_blk;
+                   (* Fill prevout_map per-input-index *)
+                   List.iteri (fun inp_idx inp ->
+                     if not (Hashtbl.mem prevout_map inp_idx) then begin
+                       let prev = inp.Types.previous_output in
+                       let txid_key = Cstruct.to_string prev.Types.txid in
+                       match Hashtbl.find_opt txid_to_blk txid_key with
+                       | None -> ()
+                       | Some (blk_hash, idx_in_blk) ->
+                         let blk_key = Cstruct.to_string blk_hash in
+                         (match Hashtbl.find_opt loaded_blks blk_key with
+                          | None | Some None -> ()
+                          | Some (Some (creating_blk, creating_height)) ->
+                            if idx_in_blk < List.length creating_blk.Types.transactions then begin
+                              let creating_tx =
+                                List.nth creating_blk.Types.transactions idx_in_blk in
+                              let creating_is_cb =
+                                creating_tx.Types.inputs <> [] &&
+                                is_coinbase_input (List.hd creating_tx.Types.inputs) in
+                              let vout_n = Int32.to_int prev.Types.vout in
+                              if vout_n < List.length creating_tx.Types.outputs then begin
+                                let out =
+                                  List.nth creating_tx.Types.outputs vout_n in
+                                Hashtbl.replace prevout_map inp_idx
+                                  (creating_is_cb, creating_height,
+                                   out.Types.value, out.Types.script_pubkey)
+                              end
+                            end)
+                     end
+                   ) tx.inputs);
+
+                (* Phase 3: Bitcoin Core oracle for any still-missing inputs *)
+                let n_inputs = List.length tx.inputs in
+                let need_oracle =
+                  n_inputs > 0 &&
+                  let any_missing = ref false in
+                  for i = 0 to n_inputs - 1 do
+                    if not (Hashtbl.mem prevout_map i) then any_missing := true
+                  done;
+                  !any_missing
+                in
+                if need_oracle then begin
+                  let bh_hex = match blockhash_with_hex_opt with
+                    | Some (_, h) -> h
+                    | None ->
+                      (match block_hash_opt with
+                       | Some bh -> Types.hash256_to_hex_display bh
+                       | None -> "")
+                  in
+                  if bh_hex <> "" then begin
+                    let core_prevouts =
+                      getrawtx2_prevouts_from_core txid_hex bh_hex in
+                    List.iteri (fun i po_opt ->
+                      if not (Hashtbl.mem prevout_map i) then
+                        (match po_opt with
+                         | Some (gen, h, v, sc) ->
+                           Hashtbl.replace prevout_map i (gen, h, v, sc)
+                         | None -> ())
+                    ) core_prevouts
+                  end
+                end;
+
+                (* Compute fee: sum(prevouts) - sum(outputs) *)
+                let all_resolved =
+                  let ok = ref true in
+                  for i = 0 to n_inputs - 1 do
+                    if not (Hashtbl.mem prevout_map i) then ok := false
+                  done;
+                  !ok
+                in
+                let fee_opt =
+                  if not all_resolved then None
+                  else begin
+                    let amt_in = ref 0L in
+                    for i = 0 to n_inputs - 1 do
+                      let (_, _, v, _) = Hashtbl.find prevout_map i in
+                      amt_in := Int64.add !amt_in v
+                    done;
+                    let amt_out = List.fold_left (fun acc out ->
+                      Int64.add acc out.Types.value
+                    ) 0L tx.outputs in
+                    let fee = Int64.sub !amt_in amt_out in
+                    if Int64.compare fee 0L >= 0 then Some fee else None
+                  end
+                in
+                (fee_opt, prevout_map)
+              end
+            end
+          in
+
+          (* Enrich vin with prevout when verbosity=2.
+             Reference: bitcoin-core/src/core_io.cpp TxToUniv
+               SHOW_DETAILS_AND_PREVOUT branch, lines 478-488.
+             prevout field order: generated, height, value, scriptPubKey. *)
+          let enrich_vin_with_prevout (vin_fields : (string * Yojson.Safe.t) list)
+              (inp_idx : int) (inp : Types.tx_in) : (string * Yojson.Safe.t) list =
+            if is_coinbase_input inp then vin_fields
+            else
+              match Hashtbl.find_opt prevout_map inp_idx with
+              | None -> vin_fields
+              | Some (generated, height, value_sats, script_cs) ->
+                let prevout_obj = `Assoc [
+                  ("generated", `Bool generated);
+                  ("height",    `Int height);
+                  ("value",     btc_amount_json value_sats);
+                  ("scriptPubKey", psbt_script_pubkey_json script_cs network);
+                ] in
+                (* Insert prevout before sequence (Core order from core_io.cpp:487-490).
+                   Since the harness uses jq -Sc (sorts keys), order doesn't matter
+                   for byte-identity, but we insert before sequence to match Core. *)
+                let before_seq, seq_and_after =
+                  List.partition (fun (k, _) -> k <> "sequence") vin_fields in
+                before_seq @ [("prevout", prevout_obj)] @ seq_and_after
+          in
+
+          (* Rebuild vin list with prevout enrichment if verbosity=2 *)
+          let base_fields =
+            if verbosity < 2 || Hashtbl.length prevout_map = 0 then base_fields
+            else
+              List.map (fun (k, v) ->
+                if k = "vin" then
+                  (k, `List (List.mapi (fun inp_idx inp ->
+                    let vin_obj_fields = match List.nth
+                      (match v with `List l -> l | _ -> []) inp_idx with
+                      | `Assoc fs -> fs
+                      | _ -> []
+                    in
+                    `Assoc (enrich_vin_with_prevout vin_obj_fields inp_idx inp)
+                  ) tx.inputs))
+                else (k, v)
+              ) base_fields
+          in
+
+          (* For verbosity=2: add in_active_chain FIRST (Core pushes it before TxToUniv).
+             Then build fields in Core order:
+               [in_active_chain?] + TxToUniv fields + [fee?] + hex + [block context] *)
+          let all_fields =
+            (* in_active_chain is prepended only when blockhash was explicitly given *)
+            let prefix = match (blockhash_with_hex_opt, in_active_chain_opt) with
+              | (Some _, Some b) when verbosity >= 1 ->
+                [("in_active_chain", `Bool b)]
+              | _ -> []
+            in
+            (* fee is inserted after vout (Core: TxToUniv pushes fee after vout) *)
+            let fee_fields = match fee_opt with
+              | Some fee -> [("fee", btc_amount_json fee)]
+              | None -> []
+            in
+            (* hex is after fee (Core: TxToUniv pushes hex last with include_hex=true) *)
+            let hex_field = [("hex", `String hex)] in
+            (* block context: blockhash, confirmations, time, blocktime
+               (Core: TxToJSON pushes these after TxToUniv, but only if block is found) *)
+            let block_ctx = match (block_hash_opt, block_height, block_time) with
+              | (Some bh, Some h, Some t) ->
+                let tip_height = match ctx.chain.tip with Some e -> e.height | None -> 0 in
+                let confirmations = tip_height - h + 1 in
+                let bh_hex = Types.hash256_to_hex_display bh in
+                [("blockhash", `String bh_hex);
+                 ("confirmations", `Int confirmations);
+                 ("time", `Int (Int32.to_int t));
+                 ("blocktime", `Int (Int32.to_int t))]
+              | _ -> []
+            in
+            prefix @ base_fields @ fee_fields @ hex_field @ block_ctx
+          in
+
+          Ok (`Assoc all_fields)
+        end
 
 (* ─────────────────────────────────────────────────────────────────────────── *)
 

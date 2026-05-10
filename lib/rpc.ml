@@ -6109,6 +6109,117 @@ let handle_deriveaddresses (ctx : rpc_context)
   | _ ->
     Error "Invalid parameters: expected [descriptor, (range)]"
 
+(* createmultisig nrequired ["pk1","pk2",...] ( address_type )
+   Creates a P2SH / P2WSH / P2SH-of-P2WSH multisig address + descriptor.
+
+   address_type: "legacy" (default) → sh(multi(M,...)) → P2SH base58check
+                 "bech32"           → wsh(multi(M,...)) → P2WSH bech32
+                 "p2sh-segwit"      → sh(wsh(multi(M,...))) → P2SH-of-P2WSH
+
+   redeemScript is the same raw M-of-N multisig script in all three cases.
+   descriptor carries a BIP-380 8-char checksum.
+
+   Reference: bitcoin-core/src/rpc/util.cpp CreatemultisigRequest +
+              src/rpc/misc.cpp::createmultisig. *)
+let handle_createmultisig (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  let network = match ctx.network.name with
+    | "mainnet" -> `Mainnet
+    | "testnet" -> `Testnet
+    | _ -> `Regtest
+  in
+  (* Parse nrequired and pubkeys list, with optional address_type *)
+  let (nrequired_raw, pubkeys_raw, address_type) = match params with
+    | [`Int n; `List pks] -> (n, pks, "legacy")
+    | [`Int n; `List pks; `String at] -> (n, pks, at)
+    | _ -> (-1, [], "")
+  in
+  if nrequired_raw = -1 then
+    Error "Invalid parameters: expected [nrequired, [\"pubkey\",...], (address_type)]"
+  else begin
+    (* Validate address_type *)
+    if address_type <> "legacy" && address_type <> "bech32" && address_type <> "p2sh-segwit" then
+      Error (Printf.sprintf "Unknown address type '%s', must be one of: legacy, p2sh-segwit, bech32" address_type)
+    else begin
+      let n = List.length pubkeys_raw in
+      (* Validate M, N bounds *)
+      if n = 0 then Error "No keys provided"
+      else if n > 20 then Error "Number of keys exceeds 20"
+      else if nrequired_raw < 1 then Error "nrequired must be at least 1"
+      else if nrequired_raw > n then
+        Error (Printf.sprintf "not enough keys supplied (%d keys, but %d required)" n nrequired_raw)
+      else begin
+        (* Parse and validate each pubkey — must be 33-byte compressed hex *)
+        let parse_pubkey i raw =
+          match raw with
+          | `String hex ->
+            (try
+              let bs = Cstruct.of_hex hex in
+              let len = Cstruct.length bs in
+              if len <> 33 then
+                Error (Printf.sprintf "Pubkey %d is not 33 bytes (compressed)" i)
+              else begin
+                let prefix = Cstruct.get_uint8 bs 0 in
+                if prefix <> 0x02 && prefix <> 0x03 then
+                  Error (Printf.sprintf "Pubkey %d is not a compressed public key" i)
+                else Ok bs
+              end
+            with _ ->
+              Error (Printf.sprintf "Pubkey %d is not valid hex" i))
+          | _ -> Error (Printf.sprintf "Pubkey %d must be a hex string" i)
+        in
+        let results = List.mapi parse_pubkey pubkeys_raw in
+        let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) results in
+        if errors <> [] then Error (List.hd errors)
+        else begin
+          let pubkeys = List.filter_map (function Ok pk -> Some pk | Error _ -> None) results in
+          let m = nrequired_raw in
+          (* Build the raw multisig redeemScript: OP_M pk1 pk2 ... pkN OP_N OP_CHECKMULTISIG *)
+          let redeem_script = Descriptor.build_multisig_script m pubkeys in
+          let redeem_hex = cstruct_to_hex redeem_script in
+          (* Build the inner multi(...) descriptor string *)
+          let pk_strs = List.map cstruct_to_hex pubkeys in
+          let multi_inner = Printf.sprintf "multi(%d,%s)" m (String.concat "," pk_strs) in
+          (* Derive address and descriptor string according to address_type *)
+          let (address, desc_payload) = match address_type with
+            | "legacy" ->
+              (* sh(multi(M,...)) — P2SH: hash160(redeemScript) *)
+              let sh_hash = Crypto.hash160 redeem_script in
+              let addr = Address.address_to_string {
+                addr_type = Address.P2SH; hash = sh_hash; network
+              } in
+              (addr, "sh(" ^ multi_inner ^ ")")
+            | "bech32" ->
+              (* wsh(multi(M,...)) — P2WSH: sha256(redeemScript) *)
+              let wsh_hash = Crypto.sha256 redeem_script in
+              let addr = Address.address_to_string {
+                addr_type = Address.P2WSH; hash = wsh_hash; network
+              } in
+              (addr, "wsh(" ^ multi_inner ^ ")")
+            | _ (* "p2sh-segwit" *) ->
+              (* sh(wsh(multi(M,...))) — P2SH-of-P2WSH: hash160(OP_0 sha256(redeemScript)) *)
+              let wsh_hash = Crypto.sha256 redeem_script in
+              let wsh_script = Descriptor.build_p2wsh_script wsh_hash in
+              let sh_hash = Crypto.hash160 wsh_script in
+              let addr = Address.address_to_string {
+                addr_type = Address.P2SH; hash = sh_hash; network
+              } in
+              (addr, "sh(wsh(" ^ multi_inner ^ "))")
+          in
+          let descriptor = match Descriptor.add_checksum desc_payload with
+            | Some s -> s
+            | None -> desc_payload
+          in
+          Ok (`Assoc [
+            ("address", `String address);
+            ("redeemScript", `String redeem_hex);
+            ("descriptor", `String descriptor);
+          ])
+        end
+      end
+    end
+  end
+
 (* listdescriptors ( private )
    Lists all descriptors imported into the wallet.
    Currently, this returns implicit descriptors based on the wallet's HD keys. *)
@@ -7659,6 +7770,10 @@ let dispatch_rpc (ctx : rpc_context)
      | Error msg -> Error (rpc_misc_error, msg))
   | "deriveaddresses" ->
     (match handle_deriveaddresses ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "createmultisig" ->
+    (match handle_createmultisig ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
   | "listdescriptors" ->

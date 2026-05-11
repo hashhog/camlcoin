@@ -94,8 +94,13 @@ let max_rbf_evictions = 100
 let max_standard_tx_weight = 400_000
 let incremental_relay_fee = 1000L  (* 1000 sat/kvB, same as default relay fee *)
 
-(* Cluster mempool constants (replaces ancestor/descendant limits) *)
-let max_cluster_count = 101    (* max transactions per cluster *)
+(* Cluster mempool constants.
+   Reference: Bitcoin Core policy/policy.h DEFAULT_CLUSTER_LIMIT / DEFAULT_CLUSTER_SIZE_LIMIT_KVB.
+   DEFAULT_CLUSTER_LIMIT = 64 (max tx count per cluster).
+   DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 (max cluster vsize in kvB = 101_000 vbytes).
+   Note: 101 is the *size* limit in kvB, NOT the count limit. Count limit is 64. *)
+let max_cluster_count = 64     (* DEFAULT_CLUSTER_LIMIT — max transactions per cluster *)
+let max_cluster_size_vbytes = 101_000  (* DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 — max cluster vsize *)
 
 (* ============================================================================
    Union-Find Data Structure for Clustering
@@ -207,6 +212,10 @@ let create ?(require_standard=true) ?(verify_scripts=true)
 (* ============================================================================
    Basic Queries
    ============================================================================ *)
+
+(* Expose internal entries table for testing (allows direct injection of fake entries
+   to stress-test cluster limits without needing to bypass ancestor/descendant checks). *)
+let get_entries (mp : mempool) : (string, mempool_entry) Hashtbl.t = mp.entries
 
 (* Check if a transaction is already in the mempool *)
 let contains (mp : mempool) (txid : Types.hash256) : bool =
@@ -692,15 +701,25 @@ let effective_min_fee (mp : mempool) : int64 =
 (* ============================================================================
    Cluster Size Limit Check
 
-   Replace ancestor/descendant limit checks with cluster size limit.
-   Max 101 transactions per cluster (Bitcoin Core default).
+   Enforces both cluster count and cluster vsize limits.
+   Reference: Bitcoin Core txmempool.cpp CTxMemPool::CTxMemPool() lines 179-181;
+   kernel/mempool_limits.h MemPoolLimits::cluster_count + cluster_size_vbytes;
+   policy/policy.h DEFAULT_CLUSTER_LIMIT=64, DEFAULT_CLUSTER_SIZE_LIMIT_KVB=101.
+
+   Core enforces:
+     max_cluster_count=64   — no more than 64 txs in one connected cluster
+     max_cluster_size=101_000 vbytes — cluster total vsize ≤ 101 kvB
    ============================================================================ *)
 
-(* Check if adding a transaction would exceed cluster size limit *)
-let check_cluster_size_limit (mp : mempool) (depends : Types.hash256 list)
-    (new_txid : Types.hash256) : (unit, string) result =
+(* Check if adding a transaction would exceed either cluster limit.
+   [new_tx_weight] is the weight of the new transaction being added; used to
+   compute its vsize contribution to the merged cluster total. *)
+let check_cluster_size_limit ?(new_tx_weight=0) (mp : mempool)
+    (depends : Types.hash256 list) (new_txid : Types.hash256)
+    : (unit, string) result =
   if depends = [] then
-    (* No dependencies, would form a singleton cluster *)
+    (* No dependencies — would form a singleton cluster of size 1.
+       Singleton always passes both count (1 ≤ 64) and size limits. *)
     Ok ()
   else begin
     (* Find the cluster(s) that would be affected *)
@@ -717,16 +736,28 @@ let check_cluster_size_limit (mp : mempool) (depends : Types.hash256 list)
         uf_union uf new_txid_key parent_key
     ) depends;
 
-    (* Count the resulting cluster size *)
+    (* Count the resulting cluster tx count AND total vsize *)
     let merged_root = uf_find uf new_txid_key in
-    let cluster_size = Hashtbl.fold (fun txid_key _entry count ->
-      if uf_find uf txid_key = merged_root then count + 1
-      else count
-    ) mp.entries 1 in  (* +1 for the new tx *)
+    let new_tx_vsize = (new_tx_weight + 3) / 4 in
+    let (cluster_count, cluster_vsize) =
+      Hashtbl.fold (fun txid_key entry (cnt, vsz) ->
+        if uf_find uf txid_key = merged_root then
+          (cnt + 1, vsz + (entry.weight + 3) / 4)
+        else
+          (cnt, vsz)
+      ) mp.entries (1, new_tx_vsize)  (* +1/+vsize for the new tx itself *)
+    in
 
-    if cluster_size > max_cluster_count then
-      Error (Printf.sprintf "Cluster size limit exceeded (%d > %d)"
-        cluster_size max_cluster_count)
+    (* Gate 1: cluster transaction count limit (DEFAULT_CLUSTER_LIMIT = 64) *)
+    if cluster_count > max_cluster_count then
+      Error (Printf.sprintf
+        "cluster tx count limit exceeded (%d > %d); too-large-cluster"
+        cluster_count max_cluster_count)
+    (* Gate 2: cluster vsize limit (DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 = 101_000 vbytes) *)
+    else if cluster_vsize > max_cluster_size_vbytes then
+      Error (Printf.sprintf
+        "cluster vsize limit exceeded (%d > %d vbytes); too-large-cluster"
+        cluster_vsize max_cluster_size_vbytes)
     else
       Ok ()
   end
@@ -1764,8 +1795,10 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (t
             if fee < min_fee && not bypass_fee_check then
               Error "Fee below minimum relay fee"
 
-            (* Cluster size limit check (replaces ancestor/descendant limits for cluster mempool) *)
-            else match check_cluster_size_limit mp !depends txid with
+            (* Cluster size limit check: enforce both count (≤64) and vsize (≤101 kvB) limits.
+               Reference: Bitcoin Core txmempool.cpp:1341-1344 (CheckMemPoolPolicyLimits).
+               Pass the new tx weight so the vsize gate can account for this tx's contribution. *)
+            else match check_cluster_size_limit ~new_tx_weight:weight mp !depends txid with
             | Error e -> Error e
             | Ok () ->
 

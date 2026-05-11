@@ -1886,8 +1886,9 @@ let test_cluster_size_limit () =
 
   (* Test the check_cluster_size_limit function directly.
      Note: The full add_transaction flow also enforces ancestor/descendant limits
-     which are more restrictive (25) than the cluster limit (101). The cluster
-     limit check is designed to catch cases where multiple small chains merge. *)
+     which are more restrictive (25 tx) than the cluster count limit (64). The cluster
+     limit check is designed to catch cases where multiple small chains merge into
+     a cluster exceeding 64 txs or 101 kvB total vsize. *)
 
   let base_txid = Cstruct.create 32 in
   Cstruct.set_uint8 base_txid 0 1;
@@ -1937,8 +1938,10 @@ let test_cluster_size_limit () =
   let clusters = Mempool.get_clusters mp in
   Alcotest.(check int) "2 separate clusters" 2 (List.length clusters);
 
-  (* Test: cluster limit constant is correct *)
-  Alcotest.(check int) "max_cluster_count is 101" 101 Mempool.max_cluster_count;
+  (* Test: cluster limit constant is correct.
+     DEFAULT_CLUSTER_LIMIT = 64 (policy/policy.h:72).
+     Note: 101 is the cluster SIZE limit in kvB, NOT the count limit. *)
+  Alcotest.(check int) "max_cluster_count is 64" 64 Mempool.max_cluster_count;
 
   Storage.ChainDB.close db;
   cleanup_test_db ()
@@ -1967,9 +1970,124 @@ let test_get_worst_chunk () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
-(* Test: cluster mempool max constant *)
+(* Test: cluster count gate — exactly 64 txs in a cluster is accepted, 65 is rejected.
+   Uses check_cluster_size_limit directly (bypassing add_transaction ancestor-limit gate
+   of 25) by injecting fake entries that form a linear chain.
+   Reference: Bitcoin Core policy/policy.h DEFAULT_CLUSTER_LIMIT=64. *)
+let test_cluster_count_gate_at_limit () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let utxo = Utxo.UtxoSet.create db in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
+  (* Build a linear chain of 63 fake entries injected directly into mp.entries.
+     Each entry i depends on entry i-1 so the UF groups them all into one cluster. *)
+  let txids = Array.init 64 (fun i ->
+    let t = Cstruct.create 32 in
+    Cstruct.set_uint8 t 0 (i + 1);
+    t
+  ) in
+  (* entries[0..62] — 63 txs in the chain; txids[63] will be the new tx under test *)
+  let entries_tbl = Mempool.get_entries mp in
+  for i = 0 to 62 do
+    let parent_txid =
+      if i = 0 then Cstruct.create 32  (* genesis — not in entries → singleton parent *)
+      else txids.(i - 1)
+    in
+    let fake_tx =
+      make_regular_tx [make_test_input parent_txid 0l] [make_test_output 1000L] in
+    let e : Mempool.mempool_entry = {
+      Mempool.tx = fake_tx; txid = txids.(i); wtxid = txids.(i);
+      fee = 1000L; weight = 400 (* 100 vbytes *); fee_rate = 2.5;
+      time_added = 0.0; height_added = 100;
+      depends_on = (if i = 0 then [] else [txids.(i - 1)]);
+      ancestor_count = i + 1; ancestor_size = (i + 1) * 100;
+      descendant_count = 1; descendant_size = 100;
+    } in
+    Hashtbl.replace entries_tbl (Cstruct.to_string txids.(i)) e
+  done;
+  (* Now we have 63 entries forming one linear cluster.
+     A new tx depending on txids[62] would merge into the same cluster → 64 total.
+     64 ≤ max_cluster_count (64) → should be accepted. *)
+  let new_txid_64 = txids.(63) in
+  let result_64 =
+    Mempool.check_cluster_size_limit mp [txids.(62)] new_txid_64 in
+  Alcotest.(check bool) "64-tx cluster at limit passes" true (Result.is_ok result_64);
+  (* Now inject txids[63] into the table (64 entries) and check that a 65th is rejected. *)
+  let fake_tx_64 =
+    make_regular_tx [make_test_input txids.(62) 0l] [make_test_output 1000L] in
+  let e64 : Mempool.mempool_entry = {
+    Mempool.tx = fake_tx_64; txid = txids.(63); wtxid = txids.(63);
+    fee = 1000L; weight = 400; fee_rate = 2.5;
+    time_added = 0.0; height_added = 100;
+    depends_on = [txids.(62)];
+    ancestor_count = 64; ancestor_size = 6400;
+    descendant_count = 1; descendant_size = 100;
+  } in
+  Hashtbl.replace entries_tbl (Cstruct.to_string txids.(63)) e64;
+  let new_txid_65 = Cstruct.create 32 in
+  Cstruct.set_uint8 new_txid_65 0 0xFF;
+  let result_65 =
+    Mempool.check_cluster_size_limit mp [txids.(63)] new_txid_65 in
+  Alcotest.(check bool) "65-tx cluster over limit rejected" true (Result.is_error result_65);
+  (match result_65 with
+   | Error msg ->
+     Alcotest.(check bool) "error mentions cluster" true
+       (string_contains msg "cluster")
+   | Ok _ -> Alcotest.fail "expected cluster count limit error");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: cluster vsize gate — cluster total vsize exceeding 101 kvB is rejected.
+   Reference: Bitcoin Core kernel/mempool_limits.h cluster_size_vbytes = 101_000;
+   txmempool.cpp:181 max_cluster_size = cluster_size_vbytes * WITNESS_SCALE_FACTOR. *)
+let test_cluster_vsize_gate () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let utxo = Utxo.UtxoSet.create db in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
+  (* Inject a single fake entry with a large vsize (100_000 vbytes = weight 400_000) *)
+  let large_txid = Cstruct.create 32 in
+  Cstruct.set_uint8 large_txid 0 0xA1;
+  let base_txid = Cstruct.create 32 in
+  Cstruct.set_uint8 base_txid 0 0xA0;
+  let large_entry : Mempool.mempool_entry = {
+    Mempool.tx = make_regular_tx [make_test_input base_txid 0l] [make_test_output 1000L];
+    txid = large_txid; wtxid = large_txid;
+    fee = 1000L; weight = 400_000 (* 100_000 vbytes *); fee_rate = 0.0025;
+    time_added = 0.0; height_added = 100;
+    depends_on = [];
+    ancestor_count = 1; ancestor_size = 100_000;
+    descendant_count = 1; descendant_size = 100_000;
+  } in
+  Hashtbl.replace (Mempool.get_entries mp) (Cstruct.to_string large_txid) large_entry;
+  (* A new tx of 2_000 vbytes (weight 8_000) joining this cluster would total 102_000 vbytes,
+     exceeding the 101_000 vbytes cluster size limit → should be rejected. *)
+  let new_txid = Cstruct.create 32 in
+  Cstruct.set_uint8 new_txid 0 0xA2;
+  let result =
+    Mempool.check_cluster_size_limit ~new_tx_weight:8_000 mp [large_txid] new_txid in
+  Alcotest.(check bool) "102 kvB cluster over vsize limit rejected" true (Result.is_error result);
+  (match result with
+   | Error msg ->
+     Alcotest.(check bool) "error mentions cluster" true
+       (string_contains msg "cluster")
+   | Ok _ -> Alcotest.fail "expected cluster vsize limit error");
+  (* A new tx of exactly 1_000 vbytes (weight 4_000) would total 101_000 vbytes,
+     exactly at the limit → should be accepted. *)
+  let new_txid2 = Cstruct.create 32 in
+  Cstruct.set_uint8 new_txid2 0 0xA3;
+  let result2 =
+    Mempool.check_cluster_size_limit ~new_tx_weight:4_000 mp [large_txid] new_txid2 in
+  Alcotest.(check bool) "101 kvB cluster at vsize limit accepted" true (Result.is_ok result2);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: cluster mempool constants match Bitcoin Core policy/policy.h *)
 let test_cluster_constants () =
-  Alcotest.(check int) "max_cluster_count" 101 Mempool.max_cluster_count
+  (* DEFAULT_CLUSTER_LIMIT = 64 — max transactions per cluster *)
+  Alcotest.(check int) "max_cluster_count" 64 Mempool.max_cluster_count;
+  (* DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 → 101_000 vbytes *)
+  Alcotest.(check int) "max_cluster_size_vbytes" 101_000 Mempool.max_cluster_size_vbytes
 
 (* ============================================================================
    P2A (Pay-to-Anchor) Tests
@@ -3052,6 +3170,8 @@ let () =
       test_case "select_for_block_chunked" `Quick test_select_for_block_chunked;
       test_case "cluster size limit" `Quick test_cluster_size_limit;
       test_case "get_worst_chunk" `Quick test_get_worst_chunk;
+      test_case "cluster count gate at 64 (W75)" `Quick test_cluster_count_gate_at_limit;
+      test_case "cluster vsize gate at 101 kvB (W75)" `Quick test_cluster_vsize_gate;
       test_case "cluster constants" `Quick test_cluster_constants;
     ];
     "p2a", [

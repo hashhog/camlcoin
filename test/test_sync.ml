@@ -1835,6 +1835,588 @@ let test_stage_pending_utxos_resolves_collisions () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* ============================================================================
+   W92: DisconnectBlock + ApplyTxInUndo comprehensive gate tests
+   ============================================================================
+
+   Reference: Bitcoin Core validation.cpp:2149-2248 (ApplyTxInUndo +
+   Chainstate::DisconnectBlock), validation.h:451-455 (DisconnectResult).
+
+   Each test pins down ONE gate from the Core algorithm.  Tests work
+   directly against [disconnect_block_into_batch] and [apply_tx_in_undo]
+   so they observe the per-gate behavior the full reorg pipeline
+   abstracts away.  End-to-end reorg coverage already lives in the
+   diff-test corpus reorg entries; these unit tests guard the
+   gate-by-gate invariants that the corpus can only see indirectly. *)
+
+(* Helper: build a one-tx block (coinbase only) with a single output of
+   the given value + scriptPubKey.  Used by disconnect tests that need a
+   minimal real block in the DB. *)
+let make_coinbase_only_block ~prev_block ~ts ~nc ~output_value
+    ~output_script : Types.block =
+  let header = make_test_header ~prev_block ~ts ~nc in
+  let coinbase : Types.transaction = Types.{
+    version = 1l;
+    inputs = [{
+      previous_output = { txid = Types.zero_hash; vout = 0xffffffffl };
+      script_sig = Cstruct.of_string "\x51";  (* OP_TRUE *)
+      sequence = 0xffffffffl;
+    }];
+    outputs = [{
+      value = output_value;
+      script_pubkey = output_script;
+    }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  { header; transactions = [coinbase] }
+
+(* W92 Gate 2 — block/undo size consistency.  If the undo data records
+   N tx_undos for a block with M transactions, Core requires M = N+1
+   (one tx_undo per non-coinbase tx).  A mismatch must produce an
+   Error from [disconnect_block_into_batch]. *)
+let test_w92_disconnect_size_mismatch_rejected () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let ibd = Sync.create_ibd_state state in
+
+  (* Build a 1-tx block (coinbase only) — Core requires undo.size() == 0. *)
+  let block = make_coinbase_only_block
+    ~prev_block:Types.zero_hash ~ts:1500000000l ~nc:1l
+    ~output_value:50_00000000L
+    ~output_script:(Cstruct.of_string "\x51") in
+  let bhash = Crypto.compute_block_hash block.header in
+  Storage.ChainDB.store_block db bhash block;
+
+  (* Write WRONG-sized undo data: 1 tx_undo for a 1-tx block (should be 0). *)
+  let bogus_undo : Utxo.undo_data = {
+    height = 1;
+    tx_undos = [{ Utxo.spent_outputs = [] }];  (* 1 entry, off-by-one *)
+  } in
+  let uw = Serialize.writer_create () in
+  Utxo.serialize_undo_data uw bogus_undo;
+  Storage.ChainDB.store_undo_data db bhash
+    (Cstruct.to_string (Serialize.writer_to_cstruct uw));
+
+  let batch = Storage.ChainDB.batch_create () in
+  let view = Sync.reorg_view_create () in
+  let entry : Sync.header_entry = Sync.{
+    header = block.header;
+    hash = bhash;
+    height = 1;
+    total_work = Consensus.zero_work;
+  } in
+  let result = Sync.disconnect_block_into_batch ibd batch view entry in
+  (match result with
+   | Error msg ->
+     let needle = "inconsistent" in
+     let mlen = String.length msg in
+     let nlen = String.length needle in
+     let rec contains i =
+       if i + nlen > mlen then false
+       else if String.sub msg i nlen = needle then true
+       else contains (i + 1)
+     in
+     Alcotest.(check bool)
+       (Printf.sprintf "size mismatch error mentions 'inconsistent' (got %S)" msg)
+       true (contains 0)
+   | Ok _ ->
+     Alcotest.fail
+       "expected Error from size mismatch, got Ok");
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* W92 Gate 6 — IsUnspendable() outputs are skipped in the per-output
+   verify+spend pass.  An OP_RETURN output in the disconnected block
+   must NOT cause a fclean trip even though the UTXO set never contained
+   it. *)
+let test_w92_disconnect_unspendable_outputs_skipped () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let ibd = Sync.create_ibd_state state in
+
+  (* OP_RETURN output → unspendable.  Core never adds it to the UTXO set
+     ([validation.cpp]'s [AddCoins] gate), so the disconnect-side
+     SpendCoin must skip it (no UTXO present is the EXPECTED state). *)
+  let op_return_script = Cstruct.of_string "\x6a\x04dead" in
+  let block = make_coinbase_only_block
+    ~prev_block:Types.zero_hash ~ts:1500000001l ~nc:2l
+    ~output_value:0L
+    ~output_script:op_return_script in
+  let bhash = Crypto.compute_block_hash block.header in
+  Storage.ChainDB.store_block db bhash block;
+
+  (* Empty undo data for 1-tx (coinbase only) block — passes G2. *)
+  let undo : Utxo.undo_data = { height = 1; tx_undos = [] } in
+  let uw = Serialize.writer_create () in
+  Utxo.serialize_undo_data uw undo;
+  Storage.ChainDB.store_undo_data db bhash
+    (Cstruct.to_string (Serialize.writer_to_cstruct uw));
+
+  let batch = Storage.ChainDB.batch_create () in
+  let view = Sync.reorg_view_create () in
+  let entry : Sync.header_entry = Sync.{
+    header = block.header;
+    hash = bhash;
+    height = 1;
+    total_work = Consensus.zero_work;
+  } in
+  let result = Sync.disconnect_block_into_batch ibd batch view entry in
+  (match result with
+   | Ok (_txs, Sync.Disconnect_ok) -> ()  (* expected: skipping unspendable is clean *)
+   | Ok (_, dres) ->
+     Alcotest.fail
+       (Printf.sprintf "expected Disconnect_ok for OP_RETURN-only block, got %s"
+          (match dres with
+           | Sync.Disconnect_ok -> "OK"
+           | Sync.Disconnect_unclean -> "UNCLEAN"
+           | Sync.Disconnect_failed -> "FAILED"))
+   | Error e ->
+     Alcotest.fail (Printf.sprintf "expected Ok, got Error: %s" e));
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* W92 Gate 8 — fClean trips and DISCONNECT_UNCLEAN is returned when the
+   block's outputs don't match the UTXO set we're rolling back from.
+   Setup: store a block whose coinbase output is NOT in the UTXO set —
+   SpendCoin returns false, fclean := false, but the rollback proceeds. *)
+let test_w92_disconnect_missing_output_returns_unclean () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let ibd = Sync.create_ibd_state state in
+
+  (* Spendable output (P2WSH-ish placeholder), NOT pre-seeded into UTXO set. *)
+  let script = Cstruct.of_string
+    "\x00\x20\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\
+     \x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\
+     \x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f" in
+  let block = make_coinbase_only_block
+    ~prev_block:Types.zero_hash ~ts:1500000002l ~nc:3l
+    ~output_value:50_00000000L
+    ~output_script:script in
+  let bhash = Crypto.compute_block_hash block.header in
+  Storage.ChainDB.store_block db bhash block;
+
+  let undo : Utxo.undo_data = { height = 1; tx_undos = [] } in
+  let uw = Serialize.writer_create () in
+  Utxo.serialize_undo_data uw undo;
+  Storage.ChainDB.store_undo_data db bhash
+    (Cstruct.to_string (Serialize.writer_to_cstruct uw));
+
+  let batch = Storage.ChainDB.batch_create () in
+  let view = Sync.reorg_view_create () in
+  let entry : Sync.header_entry = Sync.{
+    header = block.header;
+    hash = bhash;
+    height = 1;
+    total_work = Consensus.zero_work;
+  } in
+  let result = Sync.disconnect_block_into_batch ibd batch view entry in
+  (match result with
+   | Ok (_, Sync.Disconnect_unclean) -> ()  (* expected: missing → unclean *)
+   | Ok (_, dres) ->
+     Alcotest.fail
+       (Printf.sprintf
+          "expected Disconnect_unclean for missing UTXO, got %s"
+          (match dres with
+           | Sync.Disconnect_ok -> "OK"
+           | Sync.Disconnect_unclean -> "UNCLEAN"
+           | Sync.Disconnect_failed -> "FAILED"))
+   | Error e ->
+     Alcotest.fail (Printf.sprintf "expected Ok unclean, got Error: %s" e));
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* W92 Gate 7 — output match check: the coin in the UTXO set must match
+   value, scriptPubKey, height, and coinbase flag of the block's output.
+   Mismatch on any of the four → fclean trip → DISCONNECT_UNCLEAN. *)
+let test_w92_disconnect_mismatched_output_returns_unclean () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let ibd = Sync.create_ibd_state state in
+
+  let script = Cstruct.of_string "\x76\xa9\x14" in  (* P2PKH-ish prefix *)
+  let block = make_coinbase_only_block
+    ~prev_block:Types.zero_hash ~ts:1500000003l ~nc:4l
+    ~output_value:50_00000000L
+    ~output_script:script in
+  let bhash = Crypto.compute_block_hash block.header in
+  Storage.ChainDB.store_block db bhash block;
+
+  (* Pre-seed UTXO with MISMATCHED value (49 BTC, not 50). *)
+  let coinbase_tx = List.nth block.transactions 0 in
+  let cb_txid = Crypto.compute_txid coinbase_tx in
+  let wrong_value_blob = Sync.encode_utxo 49_00000000L script 1 true in
+  Storage.ChainDB.store_utxo db cb_txid 0 wrong_value_blob;
+
+  let undo : Utxo.undo_data = { height = 1; tx_undos = [] } in
+  let uw = Serialize.writer_create () in
+  Utxo.serialize_undo_data uw undo;
+  Storage.ChainDB.store_undo_data db bhash
+    (Cstruct.to_string (Serialize.writer_to_cstruct uw));
+
+  let batch = Storage.ChainDB.batch_create () in
+  let view = Sync.reorg_view_create () in
+  let entry : Sync.header_entry = Sync.{
+    header = block.header;
+    hash = bhash;
+    height = 1;
+    total_work = Consensus.zero_work;
+  } in
+  let result = Sync.disconnect_block_into_batch ibd batch view entry in
+  (match result with
+   | Ok (_, Sync.Disconnect_unclean) -> ()  (* mismatch → unclean *)
+   | Ok (_, dres) ->
+     Alcotest.fail
+       (Printf.sprintf
+          "expected Disconnect_unclean on value mismatch, got %s"
+          (match dres with
+           | Sync.Disconnect_ok -> "OK"
+           | Sync.Disconnect_unclean -> "UNCLEAN"
+           | Sync.Disconnect_failed -> "FAILED"))
+   | Error e ->
+     Alcotest.fail (Printf.sprintf "expected Ok unclean, got Error: %s" e));
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* W92 Gates 1+3 — disconnect-side BIP-30 exemption.  When disconnecting
+   one of the two IsBIP30Unspendable blocks (h=91722 / h=91812 with their
+   canonical mainnet hashes), the SpendCoin output mismatch must NOT
+   trip fclean — that mismatch is the expected state because the
+   block's coinbase outputs were OVERWRITTEN by the later repeat blocks
+   at h=91842 / h=91880.  Reference: Core validation.cpp:2201-2202. *)
+let test_w92_disconnect_bip30_unspendable_exempt () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let ibd = Sync.create_ibd_state state in
+
+  (* Build a block whose hash matches the canonical h=91722 IsBIP30Unspendable
+     internal-LE hash.  We don't need real PoW since we feed the entry
+     directly to [disconnect_block_into_batch] — we just need the
+     entry.hash to match the table.  Use a fake block stored under that
+     specific hash. *)
+  let canonical_91722_hash = Types.hash256_of_hex
+    "8ed04d57f2f3cdc6a6e55569dc1654e1f219847f66e726dca271020000000000" in
+
+  (* Coinbase-only block with a spendable output that is NOT in the
+     UTXO set — normally this would trip fclean (gate 8) but the BIP-30
+     exemption suppresses it. *)
+  let script = Cstruct.of_string "\x76\xa9\x14" in
+  let block = make_coinbase_only_block
+    ~prev_block:Types.zero_hash ~ts:1500000004l ~nc:5l
+    ~output_value:50_00000000L
+    ~output_script:script in
+  Storage.ChainDB.store_block db canonical_91722_hash block;
+
+  let undo : Utxo.undo_data = { height = 91722; tx_undos = [] } in
+  let uw = Serialize.writer_create () in
+  Utxo.serialize_undo_data uw undo;
+  Storage.ChainDB.store_undo_data db canonical_91722_hash
+    (Cstruct.to_string (Serialize.writer_to_cstruct uw));
+
+  let batch = Storage.ChainDB.batch_create () in
+  let view = Sync.reorg_view_create () in
+  let entry : Sync.header_entry = Sync.{
+    header = block.header;
+    hash = canonical_91722_hash;
+    height = 91722;
+    total_work = Consensus.zero_work;
+  } in
+  let result = Sync.disconnect_block_into_batch ibd batch view entry in
+  (match result with
+   | Ok (_, Sync.Disconnect_ok) -> ()  (* BIP-30 exemption: clean *)
+   | Ok (_, dres) ->
+     Alcotest.fail
+       (Printf.sprintf
+          "expected Disconnect_ok for IsBIP30Unspendable block (h=91722), got %s"
+          (match dres with
+           | Sync.Disconnect_ok -> "OK"
+           | Sync.Disconnect_unclean -> "UNCLEAN"
+           | Sync.Disconnect_failed -> "FAILED"))
+   | Error e ->
+     Alcotest.fail (Printf.sprintf "expected Ok clean, got Error: %s" e));
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* W92 Gate 1 — BIP-30 exemption requires height + hash.  A block at
+   h=91722 with a NON-canonical hash must NOT be exempt — the fclean
+   trip from the missing UTXO must fire. *)
+let test_w92_disconnect_bip30_requires_canonical_hash () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let ibd = Sync.create_ibd_state state in
+
+  (* Wrong hash at h=91722 — NOT in the IsBIP30Unspendable table. *)
+  let wrong_hash = Cstruct.create 32 in
+  Cstruct.set_uint8 wrong_hash 0 0xDE;
+  Cstruct.set_uint8 wrong_hash 31 0xAD;
+
+  let script = Cstruct.of_string "\x76\xa9\x14" in
+  let block = make_coinbase_only_block
+    ~prev_block:Types.zero_hash ~ts:1500000005l ~nc:6l
+    ~output_value:50_00000000L
+    ~output_script:script in
+  Storage.ChainDB.store_block db wrong_hash block;
+
+  let undo : Utxo.undo_data = { height = 91722; tx_undos = [] } in
+  let uw = Serialize.writer_create () in
+  Utxo.serialize_undo_data uw undo;
+  Storage.ChainDB.store_undo_data db wrong_hash
+    (Cstruct.to_string (Serialize.writer_to_cstruct uw));
+
+  let batch = Storage.ChainDB.batch_create () in
+  let view = Sync.reorg_view_create () in
+  let entry : Sync.header_entry = Sync.{
+    header = block.header;
+    hash = wrong_hash;
+    height = 91722;
+    total_work = Consensus.zero_work;
+  } in
+  let result = Sync.disconnect_block_into_batch ibd batch view entry in
+  (match result with
+   | Ok (_, Sync.Disconnect_unclean) -> ()
+   | Ok (_, dres) ->
+     Alcotest.fail
+       (Printf.sprintf
+          "expected Disconnect_unclean (no exemption for non-canonical hash), got %s"
+          (match dres with
+           | Sync.Disconnect_ok -> "OK"
+           | Sync.Disconnect_unclean -> "UNCLEAN"
+           | Sync.Disconnect_failed -> "FAILED"))
+   | Error e ->
+     Alcotest.fail (Printf.sprintf "expected Ok unclean, got Error: %s" e));
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* W92 Gate 12 (ApplyTxInUndo: HaveCoin → fClean=false) — the unit-level
+   test directly against [apply_tx_in_undo].  Pre-seed an unspent coin
+   at the target outpoint, then call apply_tx_in_undo on the same key:
+   result must be Disconnect_unclean (overwriting an unspent coin). *)
+let test_w92_apply_tx_in_undo_overwrite_returns_unclean () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let ibd = Sync.create_ibd_state state in
+  let view = Sync.reorg_view_create () in
+
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0xAB;
+  let vout = 0 in
+  let script = Cstruct.of_string "\x76\xa9\x14" in
+  let pre_existing_data = Sync.encode_utxo 10_00000000L script 5 false in
+  Storage.ChainDB.store_utxo db txid vout pre_existing_data;
+
+  let outpoint : Types.outpoint = {
+    txid;
+    vout = Int32.of_int vout;
+  } in
+  let undo_entry : Utxo.utxo_entry = {
+    value = 10_00000000L;
+    script_pubkey = script;
+    height = 5;
+    is_coinbase = false;
+  } in
+  let r = Sync.apply_tx_in_undo ibd view outpoint undo_entry in
+  Alcotest.(check bool)
+    "apply_tx_in_undo on already-present coin returns Disconnect_unclean"
+    true
+    (match r with Sync.Disconnect_unclean -> true | _ -> false);
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* W92 Gate 12 / ApplyTxInUndo happy path — clean restore returns OK
+   and the coin lands in the overlay. *)
+let test_w92_apply_tx_in_undo_clean_path () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let ibd = Sync.create_ibd_state state in
+  let view = Sync.reorg_view_create () in
+
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x42;
+  let vout = 3 in
+  let script = Cstruct.of_string "\x00\x14abcdefghij1234567890" in
+
+  let outpoint : Types.outpoint = {
+    txid;
+    vout = Int32.of_int vout;
+  } in
+  let undo_entry : Utxo.utxo_entry = {
+    value = 7_00000000L;
+    script_pubkey = script;
+    height = 100;
+    is_coinbase = false;
+  } in
+  let r = Sync.apply_tx_in_undo ibd view outpoint undo_entry in
+  Alcotest.(check bool)
+    "apply_tx_in_undo on absent coin returns Disconnect_ok"
+    true
+    (match r with Sync.Disconnect_ok -> true | _ -> false);
+
+  (* The overlay must now contain the restored coin. *)
+  (match Sync.reorg_view_get view txid vout with
+   | Sync.View_present _ -> ()
+   | _ -> Alcotest.fail "restored coin must be present in overlay");
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* W92 Gate 12 / ApplyTxInUndo missing-metadata fast path — undo's
+   height=0 with no sibling coin must return DISCONNECT_FAILED. *)
+let test_w92_apply_tx_in_undo_missing_metadata_unrecoverable () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let ibd = Sync.create_ibd_state state in
+  let view = Sync.reorg_view_create () in
+
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0xFF;
+  let vout = 0 in
+  let script = Cstruct.of_string "\x76\xa9\x14" in
+  let outpoint : Types.outpoint = {
+    txid;
+    vout = Int32.of_int vout;
+  } in
+  (* height = 0: pre-0.10 undo record with no metadata, no sibling exists *)
+  let undo_entry : Utxo.utxo_entry = {
+    value = 1_00000000L;
+    script_pubkey = script;
+    height = 0;
+    is_coinbase = false;
+  } in
+  let r = Sync.apply_tx_in_undo ibd view outpoint undo_entry in
+  Alcotest.(check bool)
+    "apply_tx_in_undo on unrecoverable metadata returns Disconnect_failed"
+    true
+    (match r with Sync.Disconnect_failed -> true | _ -> false);
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* W92 Gate 12 / ApplyTxInUndo missing-metadata recovery — undo's
+   height=0 with a sibling coin in the overlay must succeed and copy
+   height + coinbase flag from the alternate. *)
+let test_w92_apply_tx_in_undo_missing_metadata_recovered_via_sibling () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let ibd = Sync.create_ibd_state state in
+  let view = Sync.reorg_view_create () in
+
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x77;
+  let script = Cstruct.of_string "\x76\xa9\x14" in
+  (* Pre-seed a sibling at vout=1 in disk with height=42 + coinbase=true. *)
+  let sibling_data = Sync.encode_utxo 5_00000000L script 42 true in
+  Storage.ChainDB.store_utxo db txid 1 sibling_data;
+
+  (* Now apply undo for vout=0 with height=0 — should recover from sibling. *)
+  let outpoint : Types.outpoint = {
+    txid;
+    vout = 0l;
+  } in
+  let undo_entry : Utxo.utxo_entry = {
+    value = 3_00000000L;
+    script_pubkey = script;
+    height = 0;
+    is_coinbase = false;  (* will be overridden by sibling *)
+  } in
+  let r = Sync.apply_tx_in_undo ibd view outpoint undo_entry in
+  Alcotest.(check bool)
+    "missing-metadata recovery via sibling returns Disconnect_ok"
+    true
+    (match r with Sync.Disconnect_ok -> true | _ -> false);
+
+  (* Recovered coin in overlay must have sibling's height + coinbase flag. *)
+  (match Sync.reorg_view_get view txid 0 with
+   | Sync.View_present data ->
+     let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+     let _value = Serialize.read_int64_le r in
+     let slen = Serialize.read_compact_size r in
+     let _script = Serialize.read_bytes r slen in
+     let recovered_height = Int32.to_int (Serialize.read_int32_le r) in
+     let recovered_cb = Serialize.read_uint8 r = 1 in
+     Alcotest.(check int) "recovered height = sibling height (42)"
+       42 recovered_height;
+     Alcotest.(check bool) "recovered coinbase flag = sibling coinbase"
+       true recovered_cb
+   | _ -> Alcotest.fail "recovered coin must be in overlay");
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* W92 Gate 1 (read undo data) — missing undo data must surface as Error. *)
+let test_w92_disconnect_missing_undo_data_errors () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let ibd = Sync.create_ibd_state state in
+
+  let block = make_coinbase_only_block
+    ~prev_block:Types.zero_hash ~ts:1500000006l ~nc:7l
+    ~output_value:50_00000000L
+    ~output_script:(Cstruct.of_string "\x51") in
+  let bhash = Crypto.compute_block_hash block.header in
+  Storage.ChainDB.store_block db bhash block;
+  (* Intentionally DO NOT store undo data. *)
+
+  let batch = Storage.ChainDB.batch_create () in
+  let view = Sync.reorg_view_create () in
+  let entry : Sync.header_entry = Sync.{
+    header = block.header;
+    hash = bhash;
+    height = 1;
+    total_work = Consensus.zero_work;
+  } in
+  let result = Sync.disconnect_block_into_batch ibd batch view entry in
+  (match result with
+   | Error msg ->
+     let needle = "Missing undo data" in
+     let mlen = String.length msg in
+     let nlen = String.length needle in
+     let rec contains i =
+       if i + nlen > mlen then false
+       else if String.sub msg i nlen = needle then true
+       else contains (i + 1)
+     in
+     Alcotest.(check bool)
+       (Printf.sprintf "error mentions 'Missing undo data' (got %S)" msg)
+       true (contains 0)
+   | Ok _ ->
+     Alcotest.fail "expected Error for missing undo data");
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* W92 — DISCONNECT_OK + DISCONNECT_UNCLEAN + DISCONNECT_FAILED variants
+   are constructible and distinguishable.  Sanity test for the tri-valued
+   result type. *)
+let test_w92_disconnect_result_tri_valued () =
+  let v_ok = Sync.Disconnect_ok in
+  let v_unclean = Sync.Disconnect_unclean in
+  let v_failed = Sync.Disconnect_failed in
+  Alcotest.(check bool) "OK != UNCLEAN" true
+    (v_ok <> v_unclean);
+  Alcotest.(check bool) "OK != FAILED" true
+    (v_ok <> v_failed);
+  Alcotest.(check bool) "UNCLEAN != FAILED" true
+    (v_unclean <> v_failed)
+
 (* Test invalidate_block causes reorg and reconsider_block restores the chain *)
 let test_invalidate_reorg_reconsider () =
   cleanup_test_db ();
@@ -2625,6 +3207,50 @@ let () =
          disconnect-side delete. *)
       test_case "stage_pending_utxos resolves put/delete collisions"
         `Quick test_stage_pending_utxos_resolves_collisions;
+    ];
+    "w92_disconnect_block", [
+      (* W92 — DisconnectBlock + ApplyTxInUndo + chain reorg comprehensive
+         gate audit (2026-05-11).  Reference: Bitcoin Core
+         validation.cpp:2149-2248, validation.h:451-455.
+
+         Each test pins down one (or two) gate(s) from Core's algorithm
+         that prior to W92 were missing or incorrect in camlcoin's
+         disconnect path:
+
+         - Block/undo size consistency (Core validation.cpp:2190)
+         - IsUnspendable skip on per-output verify (Core line 2214)
+         - Output match check value/script/height/coinbase (Core line 2218)
+         - fClean → DISCONNECT_UNCLEAN (Core line 2247)
+         - BIP-30 unspendable exemption (Core lines 2201-2202)
+         - ApplyTxInUndo HaveCoin overwrite (Core line 2153)
+         - ApplyTxInUndo missing-metadata recovery (Core lines 2155-2166)
+         - ApplyTxInUndo DISCONNECT_FAILED for unrecoverable metadata
+         - Missing undo data → Error
+         - Disconnect_ok / Disconnect_unclean / Disconnect_failed tri-value *)
+      test_case "G2: block/undo size mismatch rejected" `Quick
+        test_w92_disconnect_size_mismatch_rejected;
+      test_case "G6: IsUnspendable outputs skipped (no fclean trip)" `Quick
+        test_w92_disconnect_unspendable_outputs_skipped;
+      test_case "G7/G8: missing UTXO output returns UNCLEAN" `Quick
+        test_w92_disconnect_missing_output_returns_unclean;
+      test_case "G7/G8: mismatched UTXO value returns UNCLEAN" `Quick
+        test_w92_disconnect_mismatched_output_returns_unclean;
+      test_case "G3: BIP-30 unspendable canonical hash → exempt" `Quick
+        test_w92_disconnect_bip30_unspendable_exempt;
+      test_case "G3: BIP-30 unspendable requires canonical hash" `Quick
+        test_w92_disconnect_bip30_requires_canonical_hash;
+      test_case "G12: apply_tx_in_undo HaveCoin overwrite → UNCLEAN" `Quick
+        test_w92_apply_tx_in_undo_overwrite_returns_unclean;
+      test_case "G12: apply_tx_in_undo clean path → OK + overlay put" `Quick
+        test_w92_apply_tx_in_undo_clean_path;
+      test_case "G12: apply_tx_in_undo unrecoverable metadata → FAILED" `Quick
+        test_w92_apply_tx_in_undo_missing_metadata_unrecoverable;
+      test_case "G12: apply_tx_in_undo recovers metadata via sibling" `Quick
+        test_w92_apply_tx_in_undo_missing_metadata_recovered_via_sibling;
+      test_case "G1: missing undo data surfaces as Error" `Quick
+        test_w92_disconnect_missing_undo_data_errors;
+      test_case "tri-valued DisconnectResult constructible" `Quick
+        test_w92_disconnect_result_tri_valued;
     ];
     "side_branch_acceptance", [
       (* Pattern Y closure 2026-05-05 (rustoshi 68a422b counterpart).

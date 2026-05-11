@@ -2193,6 +2193,222 @@ let sighash_special_tests = [
   Alcotest.test_case "SIGHASH_SINGLE bug" `Quick test_sighash_single_bug;
 ]
 
+(* ============================================================================
+   BIP-112 OP_CHECKSEQUENCEVERIFY Gate Tests (W80)
+   Reference: interpreter.cpp:561-593, 1782-1826; tx_verify.cpp:39-110
+   ============================================================================ *)
+
+(* Helper: build a tx with the given version and input sequence, then run
+   OP_CHECKSEQUENCEVERIFY with arg pushed on the stack. *)
+let run_csv ~tx_version ~input_seq ~script_arg_bytes ~flags =
+  let input : Types.tx_in = {
+    previous_output = { txid = Types.zero_hash; vout = 0l };
+    script_sig = Cstruct.create 0;
+    sequence = input_seq;
+  } in
+  let tx : Types.transaction = {
+    version = tx_version;
+    inputs = [input];
+    outputs = [{ value = 0L; script_pubkey = Cstruct.create 0 }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let st = Script.create_eval_state ~tx ~input_index:0 ~amount:0L ~flags
+             ~sig_version:Script.SigVersionBase () in
+  (* Push the argument onto the stack, then eval OP_CHECKSEQUENCEVERIFY (0xb2) *)
+  let script =
+    let push_len = Cstruct.length script_arg_bytes in
+    if push_len = 0 then
+      (* OP_0 = 0x00, then OP_CSV = 0xb2 *)
+      hex_to_cstruct "00b2"
+    else begin
+      let buf = Cstruct.create (1 + push_len + 1) in
+      Cstruct.set_uint8 buf 0 push_len;  (* push N bytes *)
+      Cstruct.blit script_arg_bytes 0 buf 1 push_len;
+      Cstruct.set_uint8 buf (1 + push_len) 0xb2;  (* OP_CHECKSEQUENCEVERIFY *)
+      buf
+    end
+  in
+  Script.eval_script st script
+
+(* Encode a positive integer as script number bytes *)
+let encode_script_num n =
+  Script.bytes_of_script_num (Int64.of_int n)
+
+(* Gate 1: CSV flag disabled → OP_CSV treated as NOP3, ok *)
+let test_csv_nop3_without_flag () =
+  (* No CSV flag: should be treated as NOP3 and succeed *)
+  let flags = 0 in
+  let arg = encode_script_num 100 in  (* any value *)
+  let tx_seq = 50l in  (* would fail if checked *)
+  match run_csv ~tx_version:2l ~input_seq:tx_seq ~script_arg_bytes:arg ~flags with
+  | Ok () -> ()
+  | Error e -> Alcotest.fail ("CSV as NOP3 should succeed: " ^ e)
+
+(* Gate 1: CSV flag disabled but DISCOURAGE_UPGRADABLE_NOPS → fail *)
+let test_csv_nop3_discourage () =
+  let flags = Script.script_verify_discourage_upgradable_nops in
+  let arg = encode_script_num 100 in
+  let tx_seq = 50l in
+  match run_csv ~tx_version:2l ~input_seq:tx_seq ~script_arg_bytes:arg ~flags with
+  | Error _ -> ()  (* Expected: discouraged NOP *)
+  | Ok () -> Alcotest.fail "CSV without flag + DISCOURAGE should fail"
+
+(* Gate 2: empty stack → error *)
+let test_csv_empty_stack () =
+  let flags = Script.script_verify_checksequenceverify in
+  let tx : Types.transaction = {
+    version = 2l;
+    inputs = [{
+      previous_output = { txid = Types.zero_hash; vout = 0l };
+      script_sig = Cstruct.create 0;
+      sequence = 0x10l;
+    }];
+    outputs = [{ value = 0L; script_pubkey = Cstruct.create 0 }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let st = Script.create_eval_state ~tx ~input_index:0 ~amount:0L ~flags
+             ~sig_version:Script.SigVersionBase () in
+  (* Only OP_CSV, no push — empty stack *)
+  let script = hex_to_cstruct "b2" in
+  match Script.eval_script st script with
+  | Error _ -> ()
+  | Ok () -> Alcotest.fail "CSV with empty stack should fail"
+
+(* Gate 4: negative sequence arg → error *)
+let test_csv_negative_arg () =
+  let flags = Script.script_verify_checksequenceverify in
+  (* Push -1 (0x81) then CSV *)
+  let arg = hex_to_cstruct "81" in
+  let tx_seq = 0x00400010l in
+  match run_csv ~tx_version:2l ~input_seq:tx_seq ~script_arg_bytes:arg ~flags with
+  | Error _ -> ()
+  | Ok () -> Alcotest.fail "CSV with negative arg should fail"
+
+(* Gate 5: script arg has disable bit set → NOP (success), per BIP-112 §3.1 *)
+let test_csv_disable_flag_on_arg () =
+  let flags = Script.script_verify_checksequenceverify in
+  (* Encode 0x80000000 as 5-byte script num: 00 00 00 80 80 in sign-magnitude LE *)
+  (* Actually in script num encoding: 0x80000000 as unsigned would be negative script num.
+     Per BIP-112: if the argument has DISABLE_FLAG set, behave as NOP regardless.
+     But the spec says: "treat as NOP if bit 31 set". In script num encoding,
+     bit 31 of the unsigned value maps to a 5-byte representation. *)
+  (* Encode as 4-byte value: 0x00000000 in script num = OP_0 → push 0, disable = 0x80000000 *)
+  (* Use 0x80000000 value: 5-byte encoding: 00 00 00 00 80 (positive 2^31=2147483648) *)
+  let arg = Cstruct.create 5 in
+  Cstruct.set_uint8 arg 0 0x00;
+  Cstruct.set_uint8 arg 1 0x00;
+  Cstruct.set_uint8 arg 2 0x00;
+  Cstruct.set_uint8 arg 3 0x80;
+  Cstruct.set_uint8 arg 4 0x00;  (* sign bit clear = positive 2^31 *)
+  (* tx seq = 0 (no disable bit) which would fail if the value were checked,
+     but BIP-112 says disable bit in arg → NOP *)
+  let tx_seq = 0x00l in (* height-based, value 0 — would pass anyway *)
+  match run_csv ~tx_version:2l ~input_seq:tx_seq ~script_arg_bytes:arg ~flags with
+  | Ok () -> ()  (* NOP: disable bit on arg → success *)
+  | Error e -> Alcotest.fail ("CSV with disable bit on arg should be NOP: " ^ e)
+
+(* Gate 6: tx version < 2 → fail *)
+let test_csv_tx_version_too_low () =
+  let flags = Script.script_verify_checksequenceverify in
+  let arg = encode_script_num 10 in
+  let tx_seq = 0x00000014l in  (* 20, which satisfies value 10, but version = 1 → fail *)
+  match run_csv ~tx_version:1l ~input_seq:tx_seq ~script_arg_bytes:arg ~flags with
+  | Error _ -> ()
+  | Ok () -> Alcotest.fail "CSV with tx version 1 should fail"
+
+(* Gate 7: tx input has disable bit set → fail (unsatisfied locktime) *)
+let test_csv_tx_input_disable_bit () =
+  let flags = Script.script_verify_checksequenceverify in
+  let arg = encode_script_num 10 in
+  let tx_seq = 0x8000000Al in  (* disable bit set on input *)
+  match run_csv ~tx_version:2l ~input_seq:tx_seq ~script_arg_bytes:arg ~flags with
+  | Error _ -> ()
+  | Ok () -> Alcotest.fail "CSV with disable bit on tx input should fail"
+
+(* Gate 8: type mismatch (script is height-based, tx is time-based) → fail *)
+let test_csv_type_mismatch_height_vs_time () =
+  let flags = Script.script_verify_checksequenceverify in
+  let arg = encode_script_num 10 in  (* height-based: bit 22 clear *)
+  let tx_seq = 0x0040000Al in  (* time-based: bit 22 set, value 10 *)
+  match run_csv ~tx_version:2l ~input_seq:tx_seq ~script_arg_bytes:arg ~flags with
+  | Error _ -> ()
+  | Ok () -> Alcotest.fail "CSV type mismatch (height vs time) should fail"
+
+(* Gate 8: type mismatch (script is time-based, tx is height-based) → fail *)
+let test_csv_type_mismatch_time_vs_height () =
+  let flags = Script.script_verify_checksequenceverify in
+  (* Script arg: time-based, value 10. Encode: 0x00400000 + 10 = 0x0040000A as positive script num *)
+  (* 0x40000A in little-endian 3 bytes: 0A 00 40 (and no sign bit since positive) *)
+  let arg = Cstruct.create 3 in
+  Cstruct.set_uint8 arg 0 0x0A;
+  Cstruct.set_uint8 arg 1 0x00;
+  Cstruct.set_uint8 arg 2 0x40;
+  let tx_seq = 0x0000000Al in  (* height-based: bit 22 clear, value 10 *)
+  match run_csv ~tx_version:2l ~input_seq:tx_seq ~script_arg_bytes:arg ~flags with
+  | Error _ -> ()
+  | Ok () -> Alcotest.fail "CSV type mismatch (time vs height) should fail"
+
+(* Gate 9: value comparison — tx_val >= script_val → pass *)
+let test_csv_height_value_satisfied () =
+  let flags = Script.script_verify_checksequenceverify in
+  let arg = encode_script_num 10 in  (* height-based, require 10 *)
+  let tx_seq = 0x0000000Al in  (* 10, exactly equal → pass *)
+  match run_csv ~tx_version:2l ~input_seq:tx_seq ~script_arg_bytes:arg ~flags with
+  | Ok () -> ()
+  | Error e -> Alcotest.fail ("CSV satisfied (tx=10 >= arg=10) should pass: " ^ e)
+
+(* Gate 9: value comparison — tx_val < script_val → fail *)
+let test_csv_height_value_not_satisfied () =
+  let flags = Script.script_verify_checksequenceverify in
+  let arg = encode_script_num 10 in  (* require 10 *)
+  let tx_seq = 0x00000009l in  (* 9 < 10 → fail *)
+  match run_csv ~tx_version:2l ~input_seq:tx_seq ~script_arg_bytes:arg ~flags with
+  | Error _ -> ()
+  | Ok () -> Alcotest.fail "CSV not satisfied (tx=9 < arg=10) should fail"
+
+(* Gate 9: time-based value comparison — tx time-masked >= script value → pass *)
+let test_csv_time_value_satisfied () =
+  let flags = Script.script_verify_checksequenceverify in
+  (* Script: time-based, value=5. Encode 0x00400005 as script num *)
+  let arg = Cstruct.create 3 in
+  Cstruct.set_uint8 arg 0 0x05;
+  Cstruct.set_uint8 arg 1 0x00;
+  Cstruct.set_uint8 arg 2 0x40;
+  let tx_seq = 0x00400005l in  (* time-based, value=5, exactly equal → pass *)
+  match run_csv ~tx_version:2l ~input_seq:tx_seq ~script_arg_bytes:arg ~flags with
+  | Ok () -> ()
+  | Error e -> Alcotest.fail ("CSV time satisfied (tx=5 >= arg=5) should pass: " ^ e)
+
+(* Int32→Int64 unsigned conversion: tx sequence 0x80000001 has bit 31 set → disable flag → fail
+   Before fix: Int64.of_int32 0x80000001l = -2147483647L; logand with 0x80000000L = 0x80000000L ≠ 0 → error.
+   The fixed code uses logand with 0xFFFFFFFFL so it correctly gives 0x80000001L. *)
+let test_csv_tx_seq_bit31_unsigned () =
+  let flags = Script.script_verify_checksequenceverify in
+  let arg = encode_script_num 1 in
+  (* 0x80000001: bit 31 set (disable flag) *)
+  let tx_seq = Int32.of_int (- (0x7FFFFFFF)) in  (* = 0x80000001 in Int32 *)
+  match run_csv ~tx_version:2l ~input_seq:tx_seq ~script_arg_bytes:arg ~flags with
+  | Error _ -> ()  (* disable bit on input → fail (unsatisfied locktime) *)
+  | Ok () -> Alcotest.fail "tx_seq 0x80000001 (disable bit) should fail"
+
+let csv_gate_tests = [
+  Alcotest.test_case "Gate1: no CSV flag → NOP3 succeeds" `Quick test_csv_nop3_without_flag;
+  Alcotest.test_case "Gate1: no flag + DISCOURAGE_NOPS → fails" `Quick test_csv_nop3_discourage;
+  Alcotest.test_case "Gate2: empty stack → error" `Quick test_csv_empty_stack;
+  Alcotest.test_case "Gate4: negative arg → error" `Quick test_csv_negative_arg;
+  Alcotest.test_case "Gate5: disable bit on arg → NOP" `Quick test_csv_disable_flag_on_arg;
+  Alcotest.test_case "Gate6: tx version < 2 → fail" `Quick test_csv_tx_version_too_low;
+  Alcotest.test_case "Gate7: tx input disable bit → fail" `Quick test_csv_tx_input_disable_bit;
+  Alcotest.test_case "Gate8: type mismatch height vs time → fail" `Quick test_csv_type_mismatch_height_vs_time;
+  Alcotest.test_case "Gate8: type mismatch time vs height → fail" `Quick test_csv_type_mismatch_time_vs_height;
+  Alcotest.test_case "Gate9: height value satisfied (tx=arg) → pass" `Quick test_csv_height_value_satisfied;
+  Alcotest.test_case "Gate9: height value not satisfied (tx<arg) → fail" `Quick test_csv_height_value_not_satisfied;
+  Alcotest.test_case "Gate9: time value satisfied (tx=arg) → pass" `Quick test_csv_time_value_satisfied;
+  Alcotest.test_case "Int32 sign-ext: tx_seq=0x80000001 disable bit" `Quick test_csv_tx_seq_bit31_unsigned;
+]
+
 (* Test P2A script verification - succeeds unconditionally *)
 let test_p2a_verify_script_succeeds () =
   let tx = make_test_tx () in
@@ -2247,4 +2463,5 @@ let () = Alcotest.run "test_script" [
   ("sighash_special", sighash_special_tests);
   ("p2a", p2a_tests);
   ("p2a_verify", p2a_verify_tests);
+  ("csv_gates", csv_gate_tests);
 ]

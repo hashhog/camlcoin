@@ -56,6 +56,13 @@ type command =
   | Sketch
   | Reqbisec
   | Reconcildiff
+  (* BIP 157: Client Side Block Filtering *)
+  | Getcfilters
+  | Cfilter
+  | Getcfheaders
+  | Cfheaders
+  | Getcfcheckpt
+  | Cfcheckpt
   | Unknown of string
 
 let command_to_string = function
@@ -93,6 +100,12 @@ let command_to_string = function
   | Sketch -> "sketch"
   | Reqbisec -> "reqbisec"
   | Reconcildiff -> "reconcildiff"
+  | Getcfilters -> "getcfilters"
+  | Cfilter -> "cfilter"
+  | Getcfheaders -> "getcfheaders"
+  | Cfheaders -> "cfheaders"
+  | Getcfcheckpt -> "getcfcheckpt"
+  | Cfcheckpt -> "cfcheckpt"
   | Unknown s -> s
 
 let command_of_string s =
@@ -131,6 +144,12 @@ let command_of_string s =
   | "sketch" -> Sketch
   | "reqbisec" -> Reqbisec
   | "reconcildiff" -> Reconcildiff
+  | "getcfilters" -> Getcfilters
+  | "cfilter" -> Cfilter
+  | "getcfheaders" -> Getcfheaders
+  | "cfheaders" -> Cfheaders
+  | "getcfcheckpt" -> Getcfcheckpt
+  | "cfcheckpt" -> Cfcheckpt
   | other -> Unknown other
 
 (* Inventory vector types *)
@@ -358,6 +377,37 @@ type message_payload =
   | SketchMsg of sketch_msg
   | ReqbisecMsg of reqbisec_msg
   | ReconcildiffMsg of reconcildiff_msg
+  (* BIP 157: Client Side Block Filtering — request/response messages *)
+  | GetcfiltersMsg of {
+      filter_type : int;           (** 0 = basic *)
+      start_height : int32;
+      stop_hash : Types.hash256;
+    }
+  | CfilterMsg of {
+      filter_type : int;
+      block_hash : Types.hash256;
+      filter_data : Cstruct.t;     (** raw GCS-encoded filter bytes *)
+    }
+  | GetcfheadersMsg of {
+      filter_type : int;
+      start_height : int32;
+      stop_hash : Types.hash256;
+    }
+  | CfheadersMsg of {
+      filter_type : int;
+      stop_hash : Types.hash256;
+      prev_filter_header : Types.hash256;
+      filter_hashes : Types.hash256 list;
+    }
+  | GetcfcheckptMsg of {
+      filter_type : int;
+      stop_hash : Types.hash256;
+    }
+  | CfcheckptMsg of {
+      filter_type : int;
+      stop_hash : Types.hash256;
+      filter_headers : Types.hash256 list;  (** one per CFCHECKPT_INTERVAL=1000 blocks *)
+    }
   | UnknownMsg of { cmd : string; payload : Cstruct.t }
 
 type message = {
@@ -725,6 +775,33 @@ let serialize_payload w = function
   | SketchMsg msg -> serialize_sketch w msg
   | ReqbisecMsg msg -> serialize_reqbisec w msg
   | ReconcildiffMsg msg -> serialize_reconcildiff w msg
+  | GetcfiltersMsg { filter_type; start_height; stop_hash } ->
+    Serialize.write_uint8 w filter_type;
+    Serialize.write_int32_le w start_height;
+    Serialize.write_bytes w stop_hash
+  | CfilterMsg { filter_type; block_hash; filter_data } ->
+    Serialize.write_uint8 w filter_type;
+    Serialize.write_bytes w block_hash;
+    Serialize.write_compact_size w (Cstruct.length filter_data);
+    Serialize.write_bytes w filter_data
+  | GetcfheadersMsg { filter_type; start_height; stop_hash } ->
+    Serialize.write_uint8 w filter_type;
+    Serialize.write_int32_le w start_height;
+    Serialize.write_bytes w stop_hash
+  | CfheadersMsg { filter_type; stop_hash; prev_filter_header; filter_hashes } ->
+    Serialize.write_uint8 w filter_type;
+    Serialize.write_bytes w stop_hash;
+    Serialize.write_bytes w prev_filter_header;
+    Serialize.write_compact_size w (List.length filter_hashes);
+    List.iter (Serialize.write_bytes w) filter_hashes
+  | GetcfcheckptMsg { filter_type; stop_hash } ->
+    Serialize.write_uint8 w filter_type;
+    Serialize.write_bytes w stop_hash
+  | CfcheckptMsg { filter_type; stop_hash; filter_headers } ->
+    Serialize.write_uint8 w filter_type;
+    Serialize.write_bytes w stop_hash;
+    Serialize.write_compact_size w (List.length filter_headers);
+    List.iter (Serialize.write_bytes w) filter_headers
   | RejectMsg { message; ccode; reason; data } ->
     Serialize.write_string w message;
     Serialize.write_uint8 w ccode;
@@ -767,6 +844,12 @@ let payload_to_command = function
   | SketchMsg _ -> Sketch
   | ReqbisecMsg _ -> Reqbisec
   | ReconcildiffMsg _ -> Reconcildiff
+  | GetcfiltersMsg _ -> Getcfilters
+  | CfilterMsg _ -> Cfilter
+  | GetcfheadersMsg _ -> Getcfheaders
+  | CfheadersMsg _ -> Cfheaders
+  | GetcfcheckptMsg _ -> Getcfcheckpt
+  | CfcheckptMsg _ -> Cfcheckpt
   | UnknownMsg { cmd; _ } -> Unknown cmd
 
 let serialize_message (magic : int32) (payload : message_payload)
@@ -857,6 +940,39 @@ let deserialize_payload (cmd : command) (r : Serialize.reader)
   | Sketch -> SketchMsg (deserialize_sketch r)
   | Reqbisec -> ReqbisecMsg (deserialize_reqbisec r)
   | Reconcildiff -> ReconcildiffMsg (deserialize_reconcildiff r)
+  | Getcfilters ->
+    let filter_type = Serialize.read_uint8 r in
+    let start_height = Serialize.read_int32_le r in
+    let stop_hash = Serialize.read_bytes r 32 in
+    GetcfiltersMsg { filter_type; start_height; stop_hash }
+  | Cfilter ->
+    let filter_type = Serialize.read_uint8 r in
+    let block_hash = Serialize.read_bytes r 32 in
+    let filter_len = Serialize.read_compact_size r in
+    let filter_data = Serialize.read_bytes r filter_len in
+    CfilterMsg { filter_type; block_hash; filter_data }
+  | Getcfheaders ->
+    let filter_type = Serialize.read_uint8 r in
+    let start_height = Serialize.read_int32_le r in
+    let stop_hash = Serialize.read_bytes r 32 in
+    GetcfheadersMsg { filter_type; start_height; stop_hash }
+  | Cfheaders ->
+    let filter_type = Serialize.read_uint8 r in
+    let stop_hash = Serialize.read_bytes r 32 in
+    let prev_filter_header = Serialize.read_bytes r 32 in
+    let count = Serialize.read_compact_size r in
+    let filter_hashes = List.init count (fun _ -> Serialize.read_bytes r 32) in
+    CfheadersMsg { filter_type; stop_hash; prev_filter_header; filter_hashes }
+  | Getcfcheckpt ->
+    let filter_type = Serialize.read_uint8 r in
+    let stop_hash = Serialize.read_bytes r 32 in
+    GetcfcheckptMsg { filter_type; stop_hash }
+  | Cfcheckpt ->
+    let filter_type = Serialize.read_uint8 r in
+    let stop_hash = Serialize.read_bytes r 32 in
+    let count = Serialize.read_compact_size r in
+    let filter_headers = List.init count (fun _ -> Serialize.read_bytes r 32) in
+    CfcheckptMsg { filter_type; stop_hash; filter_headers }
   | Reject ->
     let message = Serialize.read_string r in
     let ccode = Serialize.read_uint8 r in

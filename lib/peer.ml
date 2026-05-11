@@ -93,12 +93,19 @@ let set_prune_mode_advertise (b : bool) : unit =
    call so callers see the current values of the flags.  Core advertises
    NODE_NETWORK alongside NODE_NETWORK_LIMITED in the auto-prune case
    (the node still has the recent-288 window). *)
+(* Whether to advertise NODE_COMPACT_FILTERS (bit 6 = 64).
+   Set to true by [enable_compact_filters ()] when the operator passes
+   --blockfilterindex, mirroring Bitcoin Core's init.cpp wiring. *)
+let compact_filters_enabled = ref false
+
+let enable_compact_filters () = compact_filters_enabled := true
+
 let our_services () : peer_services = {
   network = true;
   getutxo = false;
   bloom = !peer_bloom_filters;
   witness = true;
-  compact_filters = false;
+  compact_filters = !compact_filters_enabled;
   network_limited = !prune_mode_advertise;
 }
 

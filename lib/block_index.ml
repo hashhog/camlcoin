@@ -109,17 +109,21 @@ end
    ============================================================================ *)
 
 module GolombRice = struct
-  (* Bit stream writer for Golomb-Rice encoding *)
+  (* Bit stream writer for Golomb-Rice encoding.
+     Matches Bitcoin Core's BitStreamWriter<OStream> in streams.h, which uses
+     MSB-first bit ordering within each byte.  Core's Write(data, nbits) writes
+     the nbits least-significant bits of data starting from the most significant
+     of those bits.  Reference: bitcoin-core/src/streams.h BitStreamWriter::Write *)
   type bit_writer = {
-    mutable buffer : int;      (* Bits waiting to be written *)
-    mutable bits : int;        (* Number of bits in buffer (0-7) *)
+    mutable buffer : int;      (* Current byte being assembled, placed MSB-first *)
+    mutable offset : int;      (* Number of high-order bits already written (0-8) *)
     mutable data : bytes;      (* Output buffer *)
     mutable pos : int;         (* Current position in output *)
   }
 
   let create_writer () = {
     buffer = 0;
-    bits = 0;
+    offset = 0;
     data = Bytes.create 256;
     pos = 0;
   }
@@ -132,45 +136,56 @@ module GolombRice = struct
       w.data <- new_data
     end
 
+  (* Write nbits from value (MSB of the nbits-bit value first).
+     Core: m_buffer |= (data << (64 - nbits)) >> (64 - 8 + m_offset)
+     i.e. the top nbits bits of (data shifted left to the MSB) are placed
+     starting at m_offset from the MSB of m_buffer. *)
   let write_bits w value nbits =
-    (* Write nbits from value (LSB first within each byte) *)
     let value = ref value in
     let nbits = ref nbits in
     while !nbits > 0 do
-      let space = 8 - w.bits in
+      let space = 8 - w.offset in
       let take = min space !nbits in
-      let mask = (1 lsl take) - 1 in
-      w.buffer <- w.buffer lor ((Int64.to_int !value land mask) lsl w.bits);
-      value := Int64.shift_right_logical !value take;
+      (* Extract the top `take` bits of the remaining `nbits`-bit value.
+         Core: (data << (64 - nbits)) >> (64 - 8 + m_offset)
+         = top-take bits of value at offset from MSB of byte.
+         In OCaml with int64: shift value right by (nbits - take) to get those bits,
+         then mask to `take` bits, then place at position (space - take) from the LSB. *)
+      let bits = Int64.(to_int (logand
+        (shift_right_logical !value (!nbits - take))
+        (of_int ((1 lsl take) - 1)))) in
+      w.buffer <- w.buffer lor (bits lsl (space - take));
       nbits := !nbits - take;
-      w.bits <- w.bits + take;
-      if w.bits = 8 then begin
+      w.offset <- w.offset + take;
+      if w.offset = 8 then begin
         ensure_capacity w 1;
         Bytes.set w.data w.pos (Char.chr w.buffer);
         w.pos <- w.pos + 1;
         w.buffer <- 0;
-        w.bits <- 0
+        w.offset <- 0
       end
     done
 
   let flush w =
-    if w.bits > 0 then begin
+    if w.offset > 0 then begin
       ensure_capacity w 1;
       Bytes.set w.data w.pos (Char.chr w.buffer);
       w.pos <- w.pos + 1;
       w.buffer <- 0;
-      w.bits <- 0
+      w.offset <- 0
     end
 
   let to_string w =
     flush w;
     Bytes.sub_string w.data 0 w.pos
 
-  (* Encode a single value using Golomb-Rice coding *)
+  (* Encode a single value using Golomb-Rice coding.
+     Matches bitcoin-core/src/util/golombrice.h GolombRiceEncode:
+       Write ~0ULL as q 1-bits, then Write(0, 1), then Write(x, P). *)
   let encode w ~p x =
     (* Write quotient as unary (q 1-bits followed by a 0) *)
     let q = Int64.shift_right_logical x p in
-    let q = Int64.to_int q in  (* Quotient should be small *)
+    let q_int = Int64.to_int q in  (* Quotient is small for practical inputs *)
     let rec write_ones remaining =
       if remaining > 0 then begin
         let nbits = min remaining 64 in
@@ -178,44 +193,51 @@ module GolombRice = struct
         write_ones (remaining - nbits)
       end
     in
-    write_ones q;
+    write_ones q_int;
     write_bits w 0L 1;
-    (* Write remainder in p bits *)
+    (* Write remainder in p bits (MSB of remainder first, per Core) *)
     write_bits w x p
 
-  (* Bit stream reader for Golomb-Rice decoding *)
+  (* Bit stream reader for Golomb-Rice decoding.
+     Matches Bitcoin Core's BitStreamReader<IStream> in streams.h:
+     data |= (uint8_t)(m_buffer << m_offset) >> (8 - bits)
+     i.e. MSB-first within each byte.  m_offset tracks how many high-order bits
+     of the current byte have already been read. *)
   type bit_reader = {
     data : string;
     mutable byte_pos : int;
-    mutable bit_pos : int;  (* Bits consumed in current byte (0-7) *)
+    mutable offset : int;  (* High-order bits already consumed from current byte (0-8) *)
   }
 
   let create_reader data = {
     data;
     byte_pos = 0;
-    bit_pos = 0;
+    offset = 8;  (* Start at 8 so we read a new byte on first access *)
   }
 
+  (* Read nbits, MSB first.  Returns bits in the nbits least-significant positions
+     of the result (same convention as Core's BitStreamReader::Read). *)
   let read_bits r nbits =
     let result = ref 0L in
-    let shift = ref 0 in
     let nbits = ref nbits in
     while !nbits > 0 do
-      if r.byte_pos >= String.length r.data then
-        failwith "GolombRice: unexpected end of data";
-      let byte = Char.code (String.get r.data r.byte_pos) in
-      let available = 8 - r.bit_pos in
-      let take = min available !nbits in
-      let mask = (1 lsl take) - 1 in
-      let bits = (byte lsr r.bit_pos) land mask in
-      result := Int64.logor !result (Int64.shift_left (Int64.of_int bits) !shift);
-      shift := !shift + take;
-      nbits := !nbits - take;
-      r.bit_pos <- r.bit_pos + take;
-      if r.bit_pos = 8 then begin
+      if r.offset = 8 then begin
+        if r.byte_pos >= String.length r.data then
+          failwith "GolombRice: unexpected end of data";
         r.byte_pos <- r.byte_pos + 1;
-        r.bit_pos <- 0
-      end
+        r.offset <- 0
+      end;
+      let byte = Char.code (String.get r.data (r.byte_pos - 1)) in
+      let available = 8 - r.offset in
+      let take = min available !nbits in
+      (* Core: data |= (uint8_t)(m_buffer << m_offset) >> (8 - bits)
+         = byte with `offset` high bits zeroed, then >> (8 - take)
+         = bits at positions [offset .. offset+take-1] from MSB, placed in LSBs *)
+      let chunk = (byte lsl r.offset) land 0xff in  (* zero the already-read high bits *)
+      let chunk = chunk lsr (8 - take) in            (* bring the desired bits to LSBs *)
+      result := Int64.(logor (shift_left !result take) (of_int chunk));
+      r.offset <- r.offset + take;
+      nbits := !nbits - take
     done;
     !result
 

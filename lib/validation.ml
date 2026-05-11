@@ -761,26 +761,38 @@ let check_duplicate_txids (transactions : Types.transaction list)
 (* Check if transaction is final based on locktime and sequences.
    Locktime is unsigned 32-bit: values < 500_000_000 are block heights,
    values >= 500_000_000 are Unix timestamps.
-   Reference: Bitcoin Core consensus/tx_verify.cpp IsFinalTx() *)
+   Reference: Bitcoin Core consensus/tx_verify.cpp:17-37 IsFinalTx()
+   Core semantics: nLockTime is the *last invalid* height/time, so a tx
+   becomes final when block_height/time STRICTLY EXCEEDS nLockTime.
+   i.e. return true when (int64_t)tx.nLockTime < nBlockHeight/nBlockTime.
+   Bug fixed: was using >= (off-by-one), must use > (strict greater-than). *)
 let is_tx_final (tx : Types.transaction) ~(block_height : int) ~(block_time : int32)
     : bool =
   if tx.locktime = 0l then
     true
   else begin
-    if List.for_all (fun inp ->
-         Int32.equal inp.Types.sequence 0xFFFFFFFFl
-       ) tx.inputs then
+    (* Treat locktime as unsigned 32-bit *)
+    let locktime_unsigned = Int64.logand (Int64.of_int32 tx.locktime) 0xFFFFFFFFL in
+    let locktime_satisfied =
+      if locktime_unsigned < 500_000_000L then
+        (* Locktime is a block height: final when block_height > locktime
+           (Core: nLockTime < nBlockHeight, strict less-than) *)
+        Int64.of_int block_height > locktime_unsigned
+      else
+        (* Locktime is a unix timestamp: final when block_time > locktime
+           (Core: nLockTime < nBlockTime, strict less-than) *)
+        let block_time_unsigned = Int64.logand (Int64.of_int32 block_time) 0xFFFFFFFFL in
+        block_time_unsigned > locktime_unsigned
+    in
+    if locktime_satisfied then
       true
     else begin
-      (* Treat locktime as unsigned 32-bit *)
-      let locktime_unsigned = Int64.logand (Int64.of_int32 tx.locktime) 0xFFFFFFFFL in
-      if locktime_unsigned < 500_000_000L then
-        (* Locktime is a block height *)
-        Int64.of_int block_height >= locktime_unsigned
-      else
-        (* Locktime is a unix timestamp - compare unsigned *)
-        let block_time_unsigned = Int64.logand (Int64.of_int32 block_time) 0xFFFFFFFFL in
-        block_time_unsigned >= locktime_unsigned
+      (* Even if locktime not satisfied, tx is final if ALL inputs have
+         nSequence == SEQUENCE_FINAL (0xffffffff), which disables locktime.
+         Reference: Core tx_verify.cpp:32-36 *)
+      List.for_all (fun inp ->
+        Int32.equal inp.Types.sequence 0xFFFFFFFFl
+      ) tx.inputs
     end
   end
 

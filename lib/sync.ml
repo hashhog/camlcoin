@@ -4478,7 +4478,7 @@ let handle_cmpctblock (ibd : ibd_state) (cb : P2p.compact_block)
   end
   else begin
     (* Derive SipHash keys for short ID computation *)
-    let (k0, k1) = Crypto.SipHash.derive_keys header_hash cb.nonce in
+    let (k0, k1) = Crypto.SipHash.derive_keys cb.header cb.nonce in
     (* Build lookup table from mempool *)
     let lookup_tbl = match mempool with
       | None -> Hashtbl.create 0
@@ -4539,8 +4539,7 @@ let handle_blocktxn (ibd : ibd_state) (block_hash : Types.hash256)
     let cb = req.cb_compact in
     (* Re-create lookup with received transactions appended.
        We combine mempool transactions with the received missing transactions. *)
-    let header_hash = Crypto.compute_block_hash cb.header in
-    let (k0, k1) = Crypto.SipHash.derive_keys header_hash cb.nonce in
+    let (k0, k1) = Crypto.SipHash.derive_keys cb.header cb.nonce in
     (* Create lookup from mempool and received transactions *)
     let lookup_tbl = match mempool with
       | None -> Hashtbl.create (List.length txns)

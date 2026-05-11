@@ -534,12 +534,20 @@ module SipHash = struct
     let (v0, v1, v2, v3) = sipround (v0, v1, v2, v3) in
     Int64.logxor (Int64.logxor (Int64.logxor v0 v1) v2) v3
 
-  (* Derive SipHash keys from block header hash and nonce.
-     Per BIP 152: SHA256(block_header || nonce) -> first 16 bytes as (k0, k1). *)
-  let derive_keys (header_hash : Cstruct.t) (nonce : int64) : (int64 * int64) =
+  (* Derive SipHash keys from block header and nonce.
+     Per BIP 152 / Bitcoin Core FillShortTxIDSelector:
+       SHA256(serialize(header) || nonce_le_8bytes) -> first 16 bytes as (k0, k1).
+     The preimage is the 80-byte serialized block header followed by the 8-byte
+     little-endian nonce.  Bitcoin Core writes: stream << header << nonce, then
+     calls CSHA256 (single SHA-256) on the stream — NOT SHA256d(header_hash).
+     Taking SHA256(header_hash || nonce) was Bug #1: wrong 40-byte preimage
+     (32-byte double-SHA256 hash instead of 80-byte raw header bytes). *)
+  let derive_keys (header : Types.block_header) (nonce : int64) : (int64 * int64) =
+    let w = Serialize.writer_create () in
+    Serialize.serialize_block_header w header;
     let nonce_cs = Cstruct.create 8 in
     Cstruct.LE.set_uint64 nonce_cs 0 nonce;
-    let preimage = Cstruct.concat [header_hash; nonce_cs] in
+    let preimage = Cstruct.concat [Serialize.writer_to_cstruct w; nonce_cs] in
     let hash = sha256 preimage in
     let k0 = get_uint64_le hash 0 in
     let k1 = get_uint64_le hash 8 in

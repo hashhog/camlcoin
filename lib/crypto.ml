@@ -108,12 +108,15 @@ let sign (privkey : private_key) (msg_hash : Types.hash256) : signature =
   let der_bs = ecdsa_sign_der_raw sk_bs msg_bs in
   bigstring_to_cstruct der_bs
 
-(* Check strict DER encoding of a signature (without hash type byte).
-   DER format: 0x30 <total_len> 0x02 <R_len> <R> 0x02 <S_len> <S>
-   See Bitcoin Core's IsValidSignatureEncoding in script/interpreter.cpp *)
+(* Check strict DER encoding of a signature.
+   Input sig_bytes INCLUDES the trailing hash-type byte (as in script evaluation).
+   Format: 0x30 <total_len> 0x02 <R_len> <R> 0x02 <S_len> <S> <hashtype>
+   Minimum 9 bytes (R=1, S=1, plus hashtype), maximum 73 bytes.
+   See Bitcoin Core's IsValidSignatureEncoding in script/interpreter.cpp:108-171. *)
 let is_valid_signature_encoding (sig_bytes : Cstruct.t) : bool =
   let len = Cstruct.length sig_bytes in
-  (* Minimum DER signature is 8 bytes, maximum is 73 bytes *)
+  (* Minimum 9 bytes (tag+len+R_tag+R_len+R[1]+S_tag+S_len+S[1]+hashtype),
+     maximum 73 bytes (R=33, S=33, plus 7 overhead bytes including hashtype). *)
   if len < 9 || len > 73 then false
   else
     let b i = Cstruct.get_uint8 sig_bytes i in

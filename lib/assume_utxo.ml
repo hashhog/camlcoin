@@ -1134,12 +1134,23 @@ let run_background_validation
              the background IBD chain reaches the same consensus state as
              a from-genesis sync would.
              Reference: bitcoin-core/src/validation.cpp ProcessNewBlock. *)
+          (* W93 Bug 1 fix: pass BIP34Height hash so the BIP-30 skip
+             optimization activates on mainnet. *)
+          let bip34_height_hash =
+            match network.Consensus.bip34_hash with
+            | None -> None
+            | Some _ ->
+              (match get_header_at_height network.Consensus.bip34_height with
+               | None -> None
+               | Some e -> Some e.hash)
+          in
           match Validation.accept_block ~network ~block ~height:next_height
                   ~expected_bits:header_entry.header.bits
                   ~median_time
                   ~base_lookup
                   ~flags
                   ~skip_scripts:false
+                  ?bip34_height_hash
                   () with
           | Validation.AB_err e ->
             bg_validation.state <- BgFailed (Validation.block_error_to_string e);

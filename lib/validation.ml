@@ -1481,6 +1481,22 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
     ?(skip_scripts=false) ?(prev_block_time = 0l) ?get_mtp_at_height ?bip34_height_hash ()
     : ((int64 * Types.hash256 array * (Types.outpoint * utxo) list), block_validation_error) result =
 
+  (* W93 Bug 5/6 fix: BIP-68 SequenceLocks and BIP-113 IsFinalTx are
+     enforced on assumevalid (fast path) too — Bitcoin Core
+     validation.cpp:2480-2482 computes nLockTimeFlags from
+     DEPLOYMENT_CSV state independently of fScriptChecks.  Callers may
+     pass flags=0 when [skip_scripts=true]; compute the locktime flag
+     locally from network activation height so CSV-aware locktime gates
+     fire on the fast path just like Core.  Reference:
+     bitcoin-core/src/validation.cpp:2480-2482 (nLockTimeFlags) and
+     :2549-2561 (SequenceLocks). *)
+  let csv_active_at_height = height >= network.csv_height in
+  let lock_time_flags =
+    if csv_active_at_height
+    then flags lor Script.script_verify_checksequenceverify
+    else flags
+  in
+
   (* ====================================================================
      FAST PATH: Assume-valid IBD (skip_scripts = true)
      During assume-valid IBD, we trust the block structure and scripts.
@@ -1488,6 +1504,23 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
      This dramatically speeds up the 50-100k spam block range.
      ==================================================================== *)
   if skip_scripts then begin
+    (* W93 Bug 10 fix: assumevalid only skips CScriptCheck per Bitcoin
+       Core (validation.cpp:2320 calls CheckBlock unconditionally before
+       the script_check_reason branch).  Pre-W93 the fast path skipped
+       check_block entirely, silently bypassing every structural and
+       contextual gate (version-bits, BIP-94 timewarp, witness
+       commitment, max_block_weight/size, sigops upper bound, dup-txid,
+       per-tx CheckTransaction, IsFinalTx) on the assumevalid IBD path.
+       A malicious peer could feed structurally-invalid blocks below
+       assumevalid and they would all be silently accepted, then the
+       chain would diverge at the assumevalid block.
+
+       Calling check_block here restores parity: CheckBlock runs on
+       BOTH paths; only the inner script verification is skipped. *)
+    match check_block ~network block height ~expected_bits ~median_time
+            ~prev_block_time () with
+    | Error e -> Error e
+    | Ok () ->
     let txs = block.transactions in
     if txs = [] then
       Error BlockEmptyTransactions
@@ -1499,10 +1532,17 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
         txid_arr.(i) <- Crypto.compute_txid tx
       ) txs;
 
-      (* Verify merkle root using pre-computed txids *)
+      (* Verify merkle root using pre-computed txids.
+         W93 Bug 11 fix: mutated merkle (duplicate tx in tree) is a Core
+         BLOCK_MUTATED outcome (validation.cpp:2321-2326) — fatal
+         corruption, not just bad merkle. CheckBlock above already
+         catches the mutated flag, but we keep this redundant test on
+         the pre-computed txids to fail closed if the path changes. *)
       let txid_list = Array.to_list txid_arr in
-      let (computed_merkle, _mutated) = Crypto.merkle_root txid_list in
-      if not (Cstruct.equal computed_merkle block.header.merkle_root) then
+      let (computed_merkle, mutated) = Crypto.merkle_root txid_list in
+      if mutated then
+        Error BlockMutatedMerkle
+      else if not (Cstruct.equal computed_merkle block.header.merkle_root) then
         Error BlockBadMerkleRoot
       else begin
         (* Compute block hash once for BIP-30 repeat-block check.
@@ -1516,13 +1556,22 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
         let total_fees = ref 0L in
         let error = ref None in
         let spent_utxos = ref [] in
+        (* W93 Bug 2 fix: BIP-141 weighted sigops cost is checked on
+           BOTH paths in Core (validation.cpp:2568-2572); accumulate
+           on the fast path too so a malicious peer can't sneak a
+           sigop-bomb block in below assumevalid. Uses the same
+           overlay-aware prev_script_pubkey_lookup as the full path. *)
+        let total_sigops_cost = ref 0 in
 
         (* ContextualCheckBlock: IsFinalTx for all txs — runs even on fast path.
            Bitcoin Core validation.cpp:4146: assumevalid only skips script
            verification; structural rules including IsFinalTx still apply.
-           lock_time_cutoff uses MTP when CSV (BIP-113) is active. *)
+           lock_time_cutoff uses MTP when CSV (BIP-113) is active.
+           W93 Bug 6 fix: use lock_time_flags (CSV-aware regardless of
+           caller's script flags) instead of [flags], which is forced to
+           0 by the IBD/reorg dispatcher on assumevalid. *)
         let locktime_cutoff_fast =
-          if flags land Script.script_verify_checksequenceverify <> 0
+          if lock_time_flags land Script.script_verify_checksequenceverify <> 0
           then median_time
           else block.header.timestamp
         in
@@ -1554,6 +1603,43 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
               end
             end;
 
+            (* W93 Bug 2 fix: BIP-141 weighted sigops cost is checked on
+               both paths in Core [validation.cpp:2568-2572].  We must
+               also accumulate it here so a malicious peer can't sneak a
+               sigop-bomb block in below assumevalid.  Uses the overlay-
+               aware lookup (local_utxos + spent_in_block + base_lookup)
+               so intra-block P2SH/witness redeems resolve correctly.
+               Use STANDARD block flags for sigops counting (P2SH +
+               WITNESS) so post-segwit blocks count witness sigops even
+               though the caller passes flags=0 on the assumevalid
+               dispatch — matches Core, which computes flags via
+               GetBlockScriptFlags pindex [validation.cpp:2485] and
+               passes them to GetTransactionSigOpCost [:2568]
+               unconditionally. *)
+            if !error = None then begin
+              let prev_script_pubkey_lookup_fast outpoint =
+                let key =
+                  (Cstruct.to_string outpoint.Types.txid,
+                   outpoint.Types.vout)
+                in
+                if Hashtbl.mem spent_in_block key then None
+                else match Hashtbl.find_opt local_utxos key with
+                  | Some utxo -> Some utxo.script_pubkey
+                  | None -> (match base_lookup outpoint with
+                             | Some utxo -> Some utxo.script_pubkey
+                             | None -> None)
+              in
+              let sigops_flags =
+                Consensus.get_block_script_flags height network
+              in
+              let tx_sigops = count_tx_sigops_cost tx
+                                ~prev_script_pubkey_lookup:prev_script_pubkey_lookup_fast
+                                ~flags:sigops_flags in
+              total_sigops_cost := !total_sigops_cost + tx_sigops;
+              if !total_sigops_cost > Consensus.max_block_sigops_cost then
+                error := Some BlockTooManySigops
+            end;
+
             if !error = None && not is_cb then begin
               (* Fix 3: Single-pass UTXO lookup - resolve all inputs once.
                  Pre-compute string key per input, reuse for lookup and
@@ -1578,8 +1664,28 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
                   | None ->
                     error := Some (BlockTxValidationFailed (i, TxMissingInputs))
                   | Some utxo ->
-                    resolved_utxos.(j) <- Some utxo;
-                    total_in := Int64.add !total_in utxo.value
+                    (* W93 Bug 3 fix: coinbase maturity. Core's
+                       Consensus::CheckTxInputs (tx_verify.cpp:179-182)
+                       is called from ConnectBlock unconditionally —
+                       assumevalid does NOT skip it. *)
+                    if utxo.is_coinbase
+                       && height - utxo.height < Consensus.coinbase_maturity then
+                      error := Some (BlockTxValidationFailed
+                                       (i, TxCoinbaseMaturity (height - utxo.height)))
+                    (* W93 Bug 7 fix: per-input MoneyRange check
+                       (bad-txns-inputvalues-outofrange).
+                       tx_verify.cpp:186-188. *)
+                    else if not (Consensus.is_valid_money utxo.value) then
+                      error := Some (BlockTxValidationFailed (i, TxOutputOverflow))
+                    else begin
+                      resolved_utxos.(j) <- Some utxo;
+                      total_in := Int64.add !total_in utxo.value;
+                      (* W93 Bug 7 fix: cumulative input MoneyRange check
+                         (also bad-txns-inputvalues-outofrange).
+                         tx_verify.cpp:186. *)
+                      if not (Consensus.is_valid_money !total_in) then
+                        error := Some (BlockTxValidationFailed (i, TxOutputOverflow))
+                    end
                 end
               ) tx.inputs;
 
@@ -1588,7 +1694,11 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
                    Bitcoin Core validation.cpp ConnectBlock (~line 2557) runs
                    SequenceLocks BEFORE the fScriptChecks guard, so it fires
                    regardless of assumevalid.  We must do the same here.
-                   Reference: bitcoin-core/src/consensus/tx_verify.cpp:107-110. *)
+                   Reference: bitcoin-core/src/consensus/tx_verify.cpp:107-110.
+                   W93 Bug 5 fix: use lock_time_flags (CSV-aware) instead of
+                   [flags], which is forced to 0 by the IBD/reorg dispatcher
+                   on the assumevalid fast path — that path was silently
+                   skipping SequenceLocks before this fix. *)
                 let utxo_heights_arr = Array.make n_inputs 0 in
                 let utxo_mtps_arr = Array.make n_inputs 0l in
                 Array.iteri (fun j opt ->
@@ -1603,7 +1713,7 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
                 if not (check_sequence_locks tx ~block_height:height
                           ~median_time ~utxo_heights:utxo_heights_arr
                           ~utxo_mtps:utxo_mtps_arr
-                          ?get_mtp_at_height ~flags ()) then
+                          ?get_mtp_at_height ~flags:lock_time_flags ()) then
                   error := Some (BlockTxValidationFailed (i, TxSequenceLocksFailed))
               end;
 
@@ -1760,9 +1870,12 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
         (* Validate inputs (skip for coinbase) *)
         if !error = None && not is_cb then begin
           (* BIP-113: use median time past for locktime comparison
-             only after CSV activation. Before CSV, use block timestamp. *)
+             only after CSV activation. Before CSV, use block timestamp.
+             W93: use lock_time_flags (CSV-aware regardless of caller's
+             script flags) for parity with the fast path; on the full
+             path lock_time_flags == flags so this is a no-op. *)
           let locktime_cutoff =
-            if flags land Script.script_verify_checksequenceverify <> 0 then
+            if lock_time_flags land Script.script_verify_checksequenceverify <> 0 then
               median_time
             else
               block.header.timestamp
@@ -1839,7 +1952,7 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
                 ) resolved_utxos;
                 if not (check_sequence_locks tx ~block_height:height
                           ~median_time ~utxo_heights ~utxo_mtps
-                          ?get_mtp_at_height ~flags ()) then
+                          ?get_mtp_at_height ~flags:lock_time_flags ()) then
                   error := Some (BlockTxValidationFailed (i, TxSequenceLocksFailed));
 
                 if !error = None then begin

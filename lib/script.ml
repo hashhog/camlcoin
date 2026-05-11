@@ -2263,7 +2263,13 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                 Error "CSV requires tx version >= 2"
               else begin
                 let inp = List.nth st.tx.inputs st.input_index in
-                let tx_seq = Int64.of_int32 (Int32.logand inp.sequence 0xFFFFFFFFl) in
+                (* Read nSequence as unsigned 32-bit: Int64.of_int32 sign-extends,
+                   so mask to 32 bits to get the unsigned interpretation.
+                   Reference: interpreter.cpp:1786
+                     const int64_t txToSequence = (int64_t)txTo->vin[nIn].nSequence;
+                   In C++ nSequence is uint32_t; the cast zero-extends.
+                   In OCaml Int32 is signed, so we must mask explicitly. *)
+                let tx_seq = Int64.logand (Int64.of_int32 inp.sequence) 0xFFFFFFFFL in
                 (* Check disable flag in tx sequence *)
                 if Int64.logand tx_seq 0x80000000L <> 0L then
                   Error "CSV on disabled input"

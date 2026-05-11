@@ -907,6 +907,138 @@ let test_truc_constants () =
   Alcotest.(check int) "TRUC_ANCESTOR_LIMIT" 2 Mempool.truc_ancestor_limit;
   Alcotest.(check int) "TRUC_DESCENDANT_LIMIT" 2 Mempool.truc_descendant_limit
 
+(* Test: gate order — ancestor limit check fires before child-size check.
+   A v3 tx with 2 unconfirmed v3 parents should be rejected with an "ancestor"
+   error even if its vsize would also violate TRUC_CHILD_MAX_VSIZE.
+   Core gate order: ancestor count (gate 3) before child size (gate 5).
+   Ref: truc_policy.cpp:207-227. *)
+let test_truc_gate_order_ancestor_before_child_size () =
+  let (mp, _utxo, db, txid1, txid2, _) = create_test_mempool () in
+  let parent1_tx = make_v3_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L]
+  in
+  let parent2_tx = make_v3_tx
+    [make_test_input txid2 0l]
+    [make_test_output 1_990_000L]
+  in
+  let p1_result = Mempool.add_transaction mp parent1_tx in
+  let p2_result = Mempool.add_transaction mp parent2_tx in
+  Alcotest.(check bool) "parent1 accepted" true (Result.is_ok p1_result);
+  Alcotest.(check bool) "parent2 accepted" true (Result.is_ok p2_result);
+  let p1_entry = Result.get_ok p1_result in
+  let p2_entry = Result.get_ok p2_result in
+  (* v3 child spending BOTH parents — also >1000 vbytes (has many outputs).
+     The ancestor limit (3 > 2) should fire before the child-size check. *)
+  let many_outputs = List.init 40 (fun _ -> make_test_output 10_000L) in
+  let child_tx = make_v3_tx
+    [make_test_input p1_entry.txid 0l;
+     make_test_input p2_entry.txid 0l]
+    many_outputs
+  in
+  let result = Mempool.add_transaction mp child_tx in
+  Alcotest.(check bool) "oversized multi-parent v3 rejected" true (Result.is_error result);
+  (match result with
+   | Error msg ->
+     Alcotest.(check bool) "error mentions ancestor (not child size)" true
+       (string_contains msg "ancestor")
+   | Ok _ -> Alcotest.fail "expected error");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: TRUC_DESCENDANT_LIMIT constant is actually used.
+   A v3 parent with one child already in the mempool must reject a second
+   child.  This verifies the gate uses truc_descendant_limit (=2) rather
+   than a hard-coded boolean.
+   Ref: truc_policy.cpp:243 — GetDescendantCount + 1 > TRUC_DESCENDANT_LIMIT. *)
+let test_truc_descendant_limit_constant_used () =
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  let parent_tx = make_v3_tx
+    [make_test_input txid1 0l]
+    [make_test_output 490_000L; make_test_output 490_000L]
+  in
+  let parent_result = Mempool.add_transaction mp parent_tx in
+  Alcotest.(check bool) "v3 parent accepted" true (Result.is_ok parent_result);
+  let parent_entry = Result.get_ok parent_result in
+  (* First child: descendant_count becomes 2 (parent + child1), still ≤ TRUC_DESCENDANT_LIMIT. *)
+  let child1_tx = make_v3_tx
+    [make_test_input parent_entry.txid 0l]
+    [make_test_output 480_000L]
+  in
+  let c1_result = Mempool.add_transaction mp child1_tx in
+  Alcotest.(check bool) "first v3 child accepted" true (Result.is_ok c1_result);
+  (* Second child: descendant_count would become 3 > TRUC_DESCENDANT_LIMIT(2). *)
+  let child2_tx = make_v3_tx
+    [make_test_input parent_entry.txid 1l]
+    [make_test_output 480_000L]
+  in
+  let c2_result = Mempool.add_transaction mp child2_tx in
+  Alcotest.(check bool) "second v3 child rejected (descendant limit)" true
+    (Result.is_error c2_result);
+  (match c2_result with
+   | Error msg ->
+     Alcotest.(check bool) "error mentions descendant" true
+       (string_contains msg "descendant")
+   | Ok _ -> Alcotest.fail "expected error");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: v3 root (no unconfirmed parents) is not subject to child size limit.
+   A v3 tx with vsize > TRUC_CHILD_MAX_VSIZE (1000) but ≤ TRUC_MAX_VSIZE (10000)
+   should be ACCEPTED when it has no unconfirmed parents.
+   Verifies gate 5 only applies when there IS an unconfirmed parent.
+   Ref: truc_policy.cpp:213-228. *)
+let test_truc_root_not_subject_to_child_size () =
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  (* v3 tx with ~1500 vbytes (> child limit 1000, < parent limit 10000).
+     Spending a confirmed UTXO (no unconfirmed parents). *)
+  let many_outputs = List.init 45 (fun _ -> make_test_output 20_000L) in
+  let tx = make_v3_tx
+    [make_test_input txid1 0l]
+    many_outputs
+  in
+  let result = Mempool.add_transaction mp tx in
+  Alcotest.(check bool) "v3 root >1000 vbytes accepted (no unconfirmed parent)" true
+    (Result.is_ok result);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Test: v3 grandparent chain — grandchild must be rejected.
+   Chain: grandparent (v3, confirmed-spent-by) → parent (v3, in-mempool) →
+   grandchild (v3, being added).  The grandchild has a parent whose
+   ancestor set already has 1 member, so grandchild would be at depth 3.
+   Ref: truc_policy.cpp:215-220 — GetAncestorCount(parent) + 1 > TRUC_ANCESTOR_LIMIT. *)
+let test_truc_grandparent_depth () =
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  let grandparent_tx = make_v3_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L]
+  in
+  let gp_result = Mempool.add_transaction mp grandparent_tx in
+  Alcotest.(check bool) "grandparent accepted" true (Result.is_ok gp_result);
+  let gp_entry = Result.get_ok gp_result in
+  let parent_tx = make_v3_tx
+    [make_test_input gp_entry.txid 0l]
+    [make_test_output 980_000L]
+  in
+  let p_result = Mempool.add_transaction mp parent_tx in
+  Alcotest.(check bool) "parent accepted" true (Result.is_ok p_result);
+  let p_entry = Result.get_ok p_result in
+  let grandchild_tx = make_v3_tx
+    [make_test_input p_entry.txid 0l]
+    [make_test_output 970_000L]
+  in
+  let gc_result = Mempool.add_transaction mp grandchild_tx in
+  Alcotest.(check bool) "grandchild rejected (ancestor depth 3)" true
+    (Result.is_error gc_result);
+  (match gc_result with
+   | Error msg ->
+     Alcotest.(check bool) "error mentions ancestor" true
+       (string_contains msg "ancestor")
+   | Ok _ -> Alcotest.fail "expected error");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 (* ============================================================================
    Ancestor/Descendant Limit Tests
    ============================================================================ *)
@@ -3142,6 +3274,15 @@ let () =
       test_case "v3 no grandparents" `Quick test_truc_no_grandparents;
       test_case "v3 sibling eviction via RBF" `Quick test_truc_sibling_eviction;
       test_case "TRUC constants" `Quick test_truc_constants;
+      (* W78 new tests *)
+      test_case "W78: gate order — ancestor before child-size" `Quick
+        test_truc_gate_order_ancestor_before_child_size;
+      test_case "W78: TRUC_DESCENDANT_LIMIT constant exercised" `Quick
+        test_truc_descendant_limit_constant_used;
+      test_case "W78: v3 root not subject to child-size limit" `Quick
+        test_truc_root_not_subject_to_child_size;
+      test_case "W78: grandparent depth rejected via ancestor count" `Quick
+        test_truc_grandparent_depth;
     ];
     "ancestor_descendant_limits", [
       test_case "25-tx ancestor chain passes" `Quick test_ancestor_limit_25_pass;

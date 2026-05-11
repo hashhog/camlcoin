@@ -211,6 +211,7 @@ type network_config = {
   wif_prefix : int;  (* Wallet Import Format prefix *)
   bech32_hrp : string;  (* Bech32 human-readable part *)
   bip34_height : int;  (* Height at which BIP34 activated *)
+  bip34_hash : Types.hash256 option;  (* Block hash at BIP34 activation height (None = no pre-BIP34 window) *)
   bip65_height : int;  (* Height at which BIP65 (CLTV) activated *)
   bip66_height : int;  (* Height at which BIP66 (strict DER) activated *)
   csv_height : int;  (* Height at which BIP68/112/113 (CSV) activated *)
@@ -458,6 +459,11 @@ let mainnet : network_config = {
   wif_prefix = 0x80;
   bech32_hrp = "bc";
   bip34_height = 227931;
+  (* Bitcoin Core kernel/chainparams.cpp:90: consensus.BIP34Hash =
+     "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"
+     Stored in internal LE byte order (display hash bytes reversed). *)
+  bip34_hash = Some (Types.hash256_of_hex
+    "b808089c756add1591b1d17bab44bba3fed9e02f942ab4894b02000000000000");
   bip65_height = 388381;
   bip66_height = 363725;
   csv_height = 419328;
@@ -520,6 +526,11 @@ let testnet : network_config = {
   wif_prefix = 0xEF;
   bech32_hrp = "tb";
   bip34_height = 21111;
+  (* Bitcoin Core kernel/chainparams.cpp:213: consensus.BIP34Hash =
+     "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8"
+     Stored in internal LE byte order (display hash bytes reversed). *)
+  bip34_hash = Some (Types.hash256_of_hex
+    "f88ecd9912d00d3f5c2a8e0f50417d3e415c75b3abe584346da9b32300000000");
   bip65_height = 581885;
   bip66_height = 330776;
   csv_height = 770112;
@@ -561,6 +572,7 @@ let testnet4 : network_config = {
   wif_prefix = 0xEF;
   bech32_hrp = "tb";
   bip34_height = 1;  (* Active from genesis on testnet4 *)
+  bip34_hash = None;  (* No pre-BIP34 window: BIP34 active from genesis *)
   bip65_height = 1;
   bip66_height = 1;
   csv_height = 1;
@@ -602,6 +614,7 @@ let regtest : network_config = {
   wif_prefix = 0xEF;
   bech32_hrp = "bcrt";
   bip34_height = 1;  (* Bitcoin Core kernel/chainparams.cpp:536: consensus.BIP34Height = 1 *)
+  bip34_hash = None;  (* No pre-BIP34 window: BIP34 active from genesis *)
   bip65_height = 1;  (* Bitcoin Core kernel/chainparams.cpp:538: consensus.BIP65Height = 1 *)
   bip66_height = 1;  (* Bitcoin Core kernel/chainparams.cpp:539: consensus.BIP66Height = 1 *)
   csv_height = 1;    (* Bitcoin Core kernel/chainparams.cpp:540: consensus.CSVHeight = 1 *)
@@ -941,14 +954,51 @@ let work_add (a : Cstruct.t) (b : Cstruct.t) : Cstruct.t =
   result
 
 (* ============================================================================
-   BIP-30 exception heights
+   BIP-30 canonical block hash tables
    ============================================================================ *)
 
-(* The two blocks where duplicate coinbase TXIDs were allowed (before BIP-34
-   enforced unique coinbase scripts via block height encoding). These blocks
-   contained coinbase transactions whose TXIDs matched earlier coinbases,
-   effectively destroying the earlier outputs. *)
-let bip30_exception_heights = [91842; 91880]
+(* IsBIP30Repeat — the two mainnet blocks that OVERWROTE earlier coinbases.
+   Bitcoin Core validation.cpp:6189-6192 (IsBIP30Repeat).
+   BIP-30 checking is SKIPPED (exempted) for exactly these two blocks.
+   Both height AND hash must match — height-only exemption is a consensus bug. *)
+let bip30_repeat_blocks : (int * string) list = [
+  (* display hash: 00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec
+     internal LE (bytes reversed): eccae000e3c8e4e093936360431f3b7603c563c1ff6181390a4d0a0000000000 *)
+  (91842, "eccae000e3c8e4e093936360431f3b7603c563c1ff6181390a4d0a0000000000");
+  (* display hash: 00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721
+     internal LE (bytes reversed): 21d77ccb4c08386a04ac0196ae10f6a1d2c2a377558ca190f143070000000000 *)
+  (91880, "21d77ccb4c08386a04ac0196ae10f6a1d2c2a377558ca190f143070000000000");
+]
+
+(* IsBIP30Unspendable — the two mainnet blocks whose coinbase outputs were
+   OVERWRITTEN by the repeat blocks above.  Their outputs were made unspendable.
+   Bitcoin Core validation.cpp:6195-6198 (IsBIP30Unspendable).
+   Used in DisconnectBlock to skip the clean-flag check for these blocks. *)
+let bip30_unspendable_blocks : (int * string) list = [
+  (* display hash: 00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e
+     internal LE (bytes reversed): 8ed04d57f2f3cdc6a6e55569dc1654e1f219847f66e726dca271020000000000 *)
+  (91722, "8ed04d57f2f3cdc6a6e55569dc1654e1f219847f66e726dca271020000000000");
+  (* display hash: 00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f
+     internal LE (bytes reversed): 2f6f30f9d683deb85d9314ef5dcf36af66d9e3ce1a2b79d4aef00a0000000000 *)
+  (91812, "2f6f30f9d683deb85d9314ef5dcf36af66d9e3ce1a2b79d4aef00a0000000000");
+]
+
+(* Check if a (height, block_hash) pair matches the IsBIP30Repeat table.
+   Returns true if BIP-30 checking should be SKIPPED for this block.
+   Bitcoin Core validation.cpp:6189-6192. *)
+let is_bip30_repeat (height : int) (block_hash : Types.hash256) : bool =
+  List.exists (fun (h, hex) ->
+    h = height && Cstruct.equal block_hash (Types.hash256_of_hex hex)
+  ) bip30_repeat_blocks
+
+(* Check if a (height, block_hash) pair matches the IsBIP30Unspendable table.
+   Returns true if DisconnectBlock should ignore UTXO mismatch for this block
+   (because its coinbase outputs were destroyed by a repeat block).
+   Bitcoin Core validation.cpp:6195-6198. *)
+let is_bip30_unspendable (height : int) (block_hash : Types.hash256) : bool =
+  List.exists (fun (h, hex) ->
+    h = height && Cstruct.equal block_hash (Types.hash256_of_hex hex)
+  ) bip30_unspendable_blocks
 
 (* Compute difficulty from compact bits format.
    Mirrors Bitcoin Core's GetDifficulty in src/rpc/blockchain.cpp:94-114.

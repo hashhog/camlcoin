@@ -127,10 +127,13 @@ let test_check_transaction_output_over_max () =
     ~outputs:[make_output ~value:(Int64.add Consensus.max_money 1L) ()]
     ()
   in
+  (* Bug fix: Core returns bad-txns-vout-toolarge (TxOutputTooLarge), not
+     bad-txns-vout-negative.  The previous test was silently accepting the
+     wrong error variant. Reference: consensus/tx_check.cpp:29-30. *)
   match Validation.check_transaction tx with
-  | Error (Validation.TxNegativeOutput _) -> ()
+  | Error (Validation.TxOutputTooLarge _) -> ()
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.tx_error_to_string e)
-  | Ok () -> Alcotest.fail "Should have failed"
+  | Ok () -> Alcotest.fail "Should have failed with TxOutputTooLarge"
 
 let test_check_transaction_duplicate_inputs () =
   let txid = Cstruct.create 32 in
@@ -666,9 +669,11 @@ let test_check_block_bad_timestamp () =
   let txid = Crypto.compute_txid coinbase in
   let (merkle, _) = Crypto.merkle_root [txid] in
   (* Timestamp <= median_time should fail.
-     BIP-34 is active from height 1 on regtest, so use version=2 to satisfy
-     the post-BIP34 block version check. *)
-  let header = make_header ~version:2l ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:50l () in
+     Regtest has bip65_height=1 and bip66_height=1, so at height=100 the block
+     version must be >= 4 (bip65 threshold).  Use version=4l to pass the version
+     gate so the timestamp check can fire.
+     Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader. *)
+  let header = make_header ~version:4l ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:50l () in
   let block = { Types.header; transactions = [coinbase] } in
   match Validation.check_block ~network:Consensus.regtest block 100 ~expected_bits:0x207fffffl ~median_time:100l with
   | Error Validation.BlockBadTimestamp -> ()
@@ -690,8 +695,10 @@ let test_check_block_duplicate_tx () =
     ()
   in
   let block = {
-    (* BIP-34 active from height 1 on regtest — use version=2 to pass version check *)
-    Types.header = make_header ~version:2l ~timestamp:200l ();
+    (* Regtest has bip65_height=1, bip66_height=1: at height 100 the block version
+       must be >= 4.  Previous test used version=2 which fired BlockBadVersion
+       before the duplicate-tx check could run. *)
+    Types.header = make_header ~version:4l ~timestamp:200l ();
     transactions = [coinbase; regular_tx; regular_tx];  (* Duplicate *)
   } in
   match Validation.check_block ~network:Consensus.regtest block 100 ~expected_bits:0x207fffffl ~median_time:0l with
@@ -2587,6 +2594,577 @@ let test_sigop_adjusted_never_below_plain () =
   Alcotest.(check bool) "adj vsize >= plain vsize" true (adj1 >= plain_vsize)
 
 (* ============================================================================
+   W84 — CheckTransaction / CheckTxInputs / CVE-2018-17144 / GetBlockSubsidy
+   Comprehensive gate tests.
+   References:
+     consensus/tx_check.cpp  (CheckTransaction)
+     consensus/tx_verify.cpp:164-214 (CheckTxInputs)
+     validation.cpp:1839-1850 (GetBlockSubsidy)
+     validation.cpp:2515-2620 (ConnectBlock fee+coinbase gates)
+   ============================================================================ *)
+
+(* ── GetBlockSubsidy: all halving boundaries 0..64 ──────────────────────── *)
+
+(* Core validation.cpp:1841-1848: halvings = height / 210000, result >> halvings.
+   At halvings >= 64 the shift is undefined behaviour in C++ — Core returns 0L
+   explicitly.  OCaml Int64.shift_right is defined for all shifts, but the
+   function must still return 0L for halvings >= 64. *)
+let test_subsidy_all_halvings () =
+  (* Subsidy at the START of each epoch 0..63 should equal 50 >> epoch BTC. *)
+  let coin = Consensus.coin in  (* 100_000_000L *)
+  let interval = Consensus.default_halving_interval in
+  (* Epoch 0: 50 BTC *)
+  Alcotest.(check int64) "epoch 0 start" (Int64.mul 50L coin)
+    (Consensus.block_subsidy 0);
+  (* Epoch 1: 25 BTC *)
+  Alcotest.(check int64) "epoch 1 start" (Int64.mul 25L coin)
+    (Consensus.block_subsidy interval);
+  (* Epoch 2: 12.5 BTC = 1_250_000_000 sat *)
+  Alcotest.(check int64) "epoch 2 start" 1_250_000_000L
+    (Consensus.block_subsidy (2 * interval));
+  (* Epoch 3: 6.25 BTC = 625_000_000 sat *)
+  Alcotest.(check int64) "epoch 3 start" 625_000_000L
+    (Consensus.block_subsidy (3 * interval));
+  (* Epoch 32: 50*COIN >> 32 = 11 sat (rounds down) *)
+  let epoch32 = Int64.shift_right (Int64.mul 50L coin) 32 in
+  Alcotest.(check int64) "epoch 32 start" epoch32
+    (Consensus.block_subsidy (32 * interval));
+  (* Epoch 63: last non-zero epoch (50 >> 63 = 0 because 50 < 2^63 but
+     50 * COIN >> 63 = 0 since 50*1e8 = 5e9 < 2^63, shift-right 63 bits → 0) *)
+  let epoch63 = Int64.shift_right (Int64.mul 50L coin) 63 in
+  Alcotest.(check int64) "epoch 63 start" epoch63
+    (Consensus.block_subsidy (63 * interval));
+  (* Epoch 64: halvings >= 64 → 0 (Core returns 0 to avoid undefined UB) *)
+  Alcotest.(check int64) "epoch 64 returns 0" 0L
+    (Consensus.block_subsidy (64 * interval));
+  (* Deep future: still 0 *)
+  Alcotest.(check int64) "epoch 100 returns 0" 0L
+    (Consensus.block_subsidy (100 * interval));
+  (* Last block of epoch 0: block 209_999 *)
+  Alcotest.(check int64) "last block epoch 0" (Int64.mul 50L coin)
+    (Consensus.block_subsidy (interval - 1));
+  (* First block of epoch 1: block 210_000 *)
+  Alcotest.(check int64) "first block epoch 1" (Int64.mul 25L coin)
+    (Consensus.block_subsidy interval)
+
+(* GetBlockSubsidy: regtest uses interval=150. *)
+let test_subsidy_regtest_interval () =
+  let coin = Consensus.coin in
+  let interval = Consensus.regtest_halving_interval in  (* 150 *)
+  Alcotest.(check int64) "regtest epoch 0" (Int64.mul 50L coin)
+    (Consensus.block_subsidy ~halving_interval:interval 0);
+  Alcotest.(check int64) "regtest epoch 1 at 150" (Int64.mul 25L coin)
+    (Consensus.block_subsidy ~halving_interval:interval interval);
+  Alcotest.(check int64) "regtest block 149 epoch 0" (Int64.mul 50L coin)
+    (Consensus.block_subsidy ~halving_interval:interval (interval - 1));
+  Alcotest.(check int64) "regtest epoch 64 = 0" 0L
+    (Consensus.block_subsidy ~halving_interval:interval (64 * interval))
+
+(* ── CVE-2010-5139: per-output value bounds ─────────────────────────────── *)
+
+(* Core consensus/tx_check.cpp:27-33.
+   The three output-value gates must fire in order: negative, toolarge, overflow. *)
+
+(* Gate: bad-txns-vout-negative (value < 0) *)
+let test_cve_2010_negative_value () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  let tx = make_tx
+    ~inputs:[make_input ~txid ()]
+    ~outputs:[make_output ~value:(-1L) ()]
+    ()
+  in
+  (match Validation.check_transaction tx with
+  | Error (Validation.TxNegativeOutput 0) -> ()
+  | Error e -> Alcotest.fail ("Expected TxNegativeOutput 0, got: " ^ Validation.tx_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have rejected negative output");
+  (* Exactly Int64.min_int *)
+  let tx2 = make_tx
+    ~inputs:[make_input ~txid ()]
+    ~outputs:[make_output ~value:Int64.min_int ()]
+    ()
+  in
+  (match Validation.check_transaction tx2 with
+  | Error (Validation.TxNegativeOutput 0) -> ()
+  | Error e -> Alcotest.fail ("min_int: " ^ Validation.tx_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have rejected Int64.min_int output")
+
+(* Gate: bad-txns-vout-toolarge (value > MAX_MONEY) *)
+let test_cve_2010_toolarge_value () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  (* MAX_MONEY + 1 *)
+  let tx = make_tx
+    ~inputs:[make_input ~txid ()]
+    ~outputs:[make_output ~value:(Int64.add Consensus.max_money 1L) ()]
+    ()
+  in
+  (match Validation.check_transaction tx with
+  | Error (Validation.TxOutputTooLarge 0) -> ()
+  | Error e -> Alcotest.fail ("Expected TxOutputTooLarge, got: " ^ Validation.tx_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have rejected value > MAX_MONEY");
+  (* MAX_MONEY itself should be accepted *)
+  let tx_ok = make_tx
+    ~inputs:[make_input ~txid ()]
+    ~outputs:[make_output ~value:Consensus.max_money ()]
+    ()
+  in
+  (match Validation.check_transaction tx_ok with
+  | Ok () -> ()
+  | Error (Validation.TxDuplicateInputs) -> ()  (* zero txid dup is irrelevant here *)
+  | Error e -> Alcotest.fail ("MAX_MONEY should be accepted: " ^ Validation.tx_error_to_string e))
+
+(* Gate: bad-txns-txouttotal-toolarge (sum of outputs > MAX_MONEY) *)
+let test_cve_2010_txouttotal_toolarge () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  let txid2 = Cstruct.create 32 in
+  Cstruct.set_uint8 txid2 0 0x02;
+  (* Two MAX_MONEY outputs: sum > MAX_MONEY *)
+  let tx = make_tx
+    ~inputs:[make_input ~txid (); make_input ~txid:txid2 ()]
+    ~outputs:[
+      make_output ~value:Consensus.max_money ();
+      make_output ~value:1L ();
+    ]
+    ()
+  in
+  (match Validation.check_transaction tx with
+  | Error Validation.TxOutputOverflow -> ()
+  | Error e -> Alcotest.fail ("Expected TxOutputOverflow: " ^ Validation.tx_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have rejected overflow sum")
+
+(* ── CVE-2018-17144: duplicate inputs ───────────────────────────────────── *)
+
+(* Core consensus/tx_check.cpp:41-44.
+   Two inputs referencing the same outpoint must be rejected with
+   bad-txns-inputs-duplicate. *)
+let test_cve_2018_17144_duplicate_inputs () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0xAB;
+  let inp = make_input ~txid ~vout:0l () in
+  let tx = make_tx
+    ~inputs:[inp; inp]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  (match Validation.check_transaction tx with
+  | Error Validation.TxDuplicateInputs -> ()
+  | Error e -> Alcotest.fail ("Expected TxDuplicateInputs: " ^ Validation.tx_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have rejected duplicate inputs");
+  (* Same txid, different vout → NOT a duplicate *)
+  let inp_v0 = make_input ~txid ~vout:0l () in
+  let inp_v1 = make_input ~txid ~vout:1l () in
+  let tx_ok = make_tx
+    ~inputs:[inp_v0; inp_v1]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  (match Validation.check_transaction tx_ok with
+  | Ok () -> ()
+  | Error Validation.TxDuplicateInputs ->
+    Alcotest.fail "Different vout must not be a duplicate"
+  | Error _ -> ())  (* Other errors (oversize, etc.) are fine *)
+
+(* ── bad-cb-length: coinbase scriptSig must be 2..100 bytes ─────────────── *)
+
+(* Core consensus/tx_check.cpp:49-50. *)
+let test_bad_cb_length_too_short () =
+  (* scriptSig = 1 byte: below minimum of 2 *)
+  let script_sig = Cstruct.create 1 in
+  let coinbase = make_tx
+    ~inputs:[{
+      Types.previous_output = { txid = Types.zero_hash; vout = -1l };
+      script_sig;
+      sequence = 0xFFFFFFFFl;
+    }]
+    ~outputs:[make_output ~value:5_000_000_000L ()]
+    ()
+  in
+  match Validation.check_coinbase ~network:Consensus.regtest coinbase 0 with
+  | Error Validation.TxCoinbaseScriptSigTooLong -> ()
+  | Error e -> Alcotest.fail ("Expected TxCoinbaseScriptSigTooLong: " ^ Validation.tx_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have rejected scriptSig too short"
+
+let test_bad_cb_length_too_long () =
+  (* scriptSig = 101 bytes: above maximum of 100 *)
+  let script_sig = Cstruct.create 101 in
+  Cstruct.set_uint8 script_sig 0 0x03;  (* height push — keeps BIP-34 happy *)
+  let coinbase = make_tx
+    ~inputs:[{
+      Types.previous_output = { txid = Types.zero_hash; vout = -1l };
+      script_sig;
+      sequence = 0xFFFFFFFFl;
+    }]
+    ~outputs:[make_output ~value:5_000_000_000L ()]
+    ()
+  in
+  match Validation.check_coinbase ~network:Consensus.mainnet coinbase 0 with
+  | Error Validation.TxCoinbaseScriptSigTooLong -> ()
+  | Error e -> Alcotest.fail ("Expected TxCoinbaseScriptSigTooLong: " ^ Validation.tx_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have rejected scriptSig too long"
+
+let test_bad_cb_length_exact_boundaries () =
+  (* Exactly 2 bytes: minimum, should pass (pre-BIP34 at height 0) *)
+  let script_sig_2 = Cstruct.create 2 in
+  let cb_min = make_tx
+    ~inputs:[{
+      Types.previous_output = { txid = Types.zero_hash; vout = -1l };
+      script_sig = script_sig_2;
+      sequence = 0xFFFFFFFFl;
+    }]
+    ~outputs:[make_output ~value:5_000_000_000L ()]
+    ()
+  in
+  (match Validation.check_coinbase ~network:Consensus.mainnet cb_min 0 with
+  | Ok () -> ()
+  | Error e -> Alcotest.fail ("2-byte scriptSig should pass: " ^ Validation.tx_error_to_string e));
+  (* Exactly 100 bytes: maximum, should pass *)
+  let script_sig_100 = Cstruct.create 100 in
+  let cb_max = make_tx
+    ~inputs:[{
+      Types.previous_output = { txid = Types.zero_hash; vout = -1l };
+      script_sig = script_sig_100;
+      sequence = 0xFFFFFFFFl;
+    }]
+    ~outputs:[make_output ~value:5_000_000_000L ()]
+    ()
+  in
+  (match Validation.check_coinbase ~network:Consensus.mainnet cb_max 0 with
+  | Ok () -> ()
+  | Error e -> Alcotest.fail ("100-byte scriptSig should pass: " ^ Validation.tx_error_to_string e))
+
+(* ── CheckTxInputs: per-input UTXO value MoneyRange ────────────────────── *)
+
+(* Core consensus/tx_verify.cpp:186: !MoneyRange(coin.out.nValue) → reject.
+   A UTXO with a value > MAX_MONEY (e.g. injected via a corrupt database) must
+   be rejected at spend time. *)
+let test_input_value_out_of_range () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  (* UTXO with value > MAX_MONEY *)
+  let lookup _outpoint =
+    Some {
+      Validation.txid;
+      vout = 0l;
+      value = Int64.add Consensus.max_money 1L;
+      script_pubkey = Cstruct.create 0;
+      height = 0;
+      is_coinbase = false;
+    }
+  in
+  let tx = make_tx
+    ~inputs:[make_input ~txid ()]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  match Validation.validate_tx_inputs tx ~lookup ~block_height:100
+          ~flags:0 ~skip_scripts:true () with
+  | Error Validation.TxOutputOverflow -> ()
+  | Error e -> Alcotest.fail ("Expected TxOutputOverflow: " ^ Validation.tx_error_to_string e)
+  | Ok _ -> Alcotest.fail "Should have rejected UTXO value > MAX_MONEY"
+
+(* ── CheckTxInputs: cumulative nValueIn MoneyRange ──────────────────────── *)
+
+(* Core consensus/tx_verify.cpp:186: !MoneyRange(nValueIn) → reject.
+   If multiple inputs each below MAX_MONEY but their sum overflows, reject. *)
+let test_input_cumulative_overflow () =
+  (* Two UTXOs each worth MAX_MONEY; their sum overflows MoneyRange. *)
+  let txid1 = Cstruct.create 32 in
+  Cstruct.set_uint8 txid1 0 0x01;
+  let txid2 = Cstruct.create 32 in
+  Cstruct.set_uint8 txid2 0 0x02;
+  let lookup outpoint =
+    Some {
+      Validation.txid = outpoint.Types.txid;
+      vout = outpoint.Types.vout;
+      value = Consensus.max_money;
+      script_pubkey = Cstruct.create 0;
+      height = 0;
+      is_coinbase = false;
+    }
+  in
+  let tx = make_tx
+    ~inputs:[make_input ~txid:txid1 ~vout:0l ();
+             make_input ~txid:txid2 ~vout:0l ()]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  match Validation.validate_tx_inputs tx ~lookup ~block_height:100
+          ~flags:0 ~skip_scripts:true () with
+  | Error Validation.TxOutputOverflow -> ()
+  | Error e -> Alcotest.fail ("Expected TxOutputOverflow: " ^ Validation.tx_error_to_string e)
+  | Ok _ -> Alcotest.fail "Should have rejected overflow nValueIn"
+
+(* ── CheckTxInputs: bad-txns-in-belowout ────────────────────────────────── *)
+
+(* Core consensus/tx_verify.cpp:196-199: nValueIn < value_out → reject.
+   In camlcoin this is checked as fee < 0L in both validate_tx_inputs and the
+   block-connect loop. *)
+let test_input_below_output () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  let lookup _outpoint =
+    Some {
+      Validation.txid;
+      vout = 0l;
+      value = 1000L;   (* input worth 1000 sat *)
+      script_pubkey = Cstruct.create 0;
+      height = 0;
+      is_coinbase = false;
+    }
+  in
+  (* Output worth more than input *)
+  let tx = make_tx
+    ~inputs:[make_input ~txid ()]
+    ~outputs:[make_output ~value:2000L ()]  (* outputs > inputs *)
+    ()
+  in
+  match Validation.validate_tx_inputs tx ~lookup ~block_height:100
+          ~flags:0 ~skip_scripts:true () with
+  | Ok total_in when total_in = 1000L ->
+    (* validate_tx_inputs just returns total_in; bad-txns-in-belowout is a
+       block-level check (done in the connect loop).  Confirm 1000L returned. *)
+    ()
+  | Ok other ->
+    Alcotest.fail (Printf.sprintf "Expected total_in=1000L, got %Ld" other)
+  | Error e -> Alcotest.fail ("Unexpected error: " ^ Validation.tx_error_to_string e)
+
+(* ── Coinbase maturity: boundary COINBASE_MATURITY − 1 and COINBASE_MATURITY *)
+
+(* Core consensus/tx_verify.cpp:179-182: nSpendHeight - coin.nHeight < 100 → reject.
+   Equality (depth = 100) is already accepted; depth = 99 is rejected. *)
+let test_coinbase_maturity_boundary () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  (* Coinbase mined at height 0 *)
+  let lookup _outpoint =
+    Some {
+      Validation.txid;
+      vout = 0l;
+      value = 5_000_000_000L;
+      script_pubkey = Cstruct.create 0;
+      height = 0;
+      is_coinbase = true;
+    }
+  in
+  let tx = make_tx
+    ~inputs:[make_input ~txid ()]
+    ~outputs:[make_output ~value:4_999_990_000L ()]
+    ()
+  in
+  (* Depth = 99: must reject *)
+  (match Validation.validate_tx_inputs tx ~lookup ~block_height:99
+          ~flags:0 ~skip_scripts:true () with
+  | Error (Validation.TxCoinbaseMaturity 99) -> ()
+  | Error e -> Alcotest.fail ("depth=99: " ^ Validation.tx_error_to_string e)
+  | Ok _ -> Alcotest.fail "depth=99 must be rejected");
+  (* Depth = 100: must accept (>= COINBASE_MATURITY) *)
+  (match Validation.validate_tx_inputs tx ~lookup ~block_height:100
+          ~flags:0 ~skip_scripts:true () with
+  | Ok _ -> ()
+  | Error e -> Alcotest.fail ("depth=100 must be accepted: " ^ Validation.tx_error_to_string e));
+  (* Depth = 101: also fine *)
+  (match Validation.validate_tx_inputs tx ~lookup ~block_height:101
+          ~flags:0 ~skip_scripts:true () with
+  | Ok _ -> ()
+  | Error e -> Alcotest.fail ("depth=101 must be accepted: " ^ Validation.tx_error_to_string e))
+
+(* ── bad-cb-amount: coinbase pays too much ────────────────────────────────── *)
+
+(* Core validation.cpp:2610-2613:
+     blockReward = nFees + GetBlockSubsidy(pindex->nHeight, params);
+     if (block.vtx[0]->GetValueOut() > blockReward) → reject.
+   Tested through validate_block_with_utxos with skip_scripts=true. *)
+let test_bad_cb_amount_in_block () =
+  (* Build a regtest block at height 1 with a coinbase paying subsidy+1. *)
+  let height = 1 in
+  let subsidy = Consensus.block_subsidy_for_network Consensus.Regtest height in
+  let overpaid = Int64.add subsidy 1L in
+  let coinbase_oversized = make_tx
+    ~inputs:[make_coinbase_input ~height]
+    ~outputs:[make_output ~value:overpaid ()]
+    ()
+  in
+  let txid = Crypto.compute_txid coinbase_oversized in
+  let (merkle, _) = Crypto.merkle_root [txid] in
+  (* version=4 to satisfy bip65/bip66 checks at height=1 on regtest *)
+  let header = make_header ~version:4l ~merkle_root:merkle
+    ~bits:0x207fffffl ~timestamp:200l () in
+  let block = { Types.header; transactions = [coinbase_oversized] } in
+  let lookup _outpoint = None in
+  let flags = Script.script_verify_none in
+  match Validation.validate_block_with_utxos ~network:Consensus.regtest block height
+    ~expected_bits:0x207fffffl ~median_time:0l ~base_lookup:lookup
+    ~flags ~skip_scripts:true () with
+  | Error (Validation.BlockBadCoinbaseValue _) -> ()
+  | Error e -> Alcotest.fail ("Expected BlockBadCoinbaseValue: "
+                               ^ Validation.block_error_to_string e)
+  | Ok _ -> Alcotest.fail "Should have rejected oversized coinbase"
+
+(* Coinbase paying exactly subsidy (no fees) must be accepted. *)
+let test_cb_amount_exact_subsidy () =
+  let height = 1 in
+  let subsidy = Consensus.block_subsidy_for_network Consensus.Regtest height in
+  let coinbase_ok = make_tx
+    ~inputs:[make_coinbase_input ~height]
+    ~outputs:[make_output ~value:subsidy ()]
+    ()
+  in
+  let txid = Crypto.compute_txid coinbase_ok in
+  let (merkle, _) = Crypto.merkle_root [txid] in
+  let header = make_header ~version:4l ~merkle_root:merkle
+    ~bits:0x207fffffl ~timestamp:200l () in
+  let block = { Types.header; transactions = [coinbase_ok] } in
+  let lookup _outpoint = None in
+  let flags = Script.script_verify_none in
+  match Validation.validate_block_with_utxos ~network:Consensus.regtest block height
+    ~expected_bits:0x207fffffl ~median_time:0l ~base_lookup:lookup
+    ~flags ~skip_scripts:true () with
+  | Ok _ -> ()
+  | Error e -> Alcotest.fail ("Exact subsidy must be accepted: "
+                               ^ Validation.block_error_to_string e)
+
+(* ── bad-cb-amount at epoch boundary: subsidy halves ──────────────────────── *)
+
+(* At block 210000 (regtest: 150) the subsidy halves.  A coinbase paying the old
+   full subsidy must be rejected. *)
+let test_bad_cb_amount_after_halving () =
+  (* Use regtest's shorter interval for fast testing *)
+  let height = Consensus.regtest_halving_interval in  (* 150 *)
+  (* Post-halving subsidy via block_subsidy_for_network *)
+  let new_subsidy = Consensus.block_subsidy_for_network Consensus.Regtest height in
+  let old_subsidy = Consensus.block_subsidy_for_network Consensus.Regtest (height - 1) in
+  (* Sanity: old should be 2× new *)
+  Alcotest.(check int64) "old subsidy is 2x new" (Int64.mul 2L new_subsidy) old_subsidy;
+  (* Coinbase paying old_subsidy (one sat too many) *)
+  let coinbase_bad = make_tx
+    ~inputs:[make_coinbase_input ~height]
+    ~outputs:[make_output ~value:old_subsidy ()]
+    ()
+  in
+  let txid = Crypto.compute_txid coinbase_bad in
+  let (merkle, _) = Crypto.merkle_root [txid] in
+  let header = make_header ~version:4l ~merkle_root:merkle
+    ~bits:0x207fffffl ~timestamp:200l () in
+  let block = { Types.header; transactions = [coinbase_bad] } in
+  let lookup _outpoint = None in
+  let flags = Script.script_verify_none in
+  match Validation.validate_block_with_utxos ~network:Consensus.regtest block height
+    ~expected_bits:0x207fffffl ~median_time:0l ~base_lookup:lookup
+    ~flags ~skip_scripts:true () with
+  | Error (Validation.BlockBadCoinbaseValue _) -> ()
+  | Error e -> Alcotest.fail ("Expected BlockBadCoinbaseValue after halving: "
+                               ^ Validation.block_error_to_string e)
+  | Ok _ -> Alcotest.fail "Should have rejected pre-halving coinbase amount post-halving"
+
+(* ── bad-txns-prevout-null: non-coinbase must not have null outpoints ─────── *)
+
+(* Core consensus/tx_check.cpp:54-56. *)
+let test_null_prevout_rejected_for_non_coinbase () =
+  (* Null outpoint: txid = all zeros, vout = -1 (0xFFFFFFFF) *)
+  let null_inp = {
+    Types.previous_output = { txid = Types.zero_hash; vout = -1l };
+    script_sig = Cstruct.create 0;
+    sequence = 0xFFFFFFFFl;
+  } in
+  let tx = make_tx
+    ~inputs:[null_inp]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  match Validation.check_transaction tx with
+  | Error Validation.TxNullPrevout -> ()
+  | Error e -> Alcotest.fail ("Expected TxNullPrevout: " ^ Validation.tx_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have rejected null prevout in non-coinbase"
+
+(* ── Accumulated fee MoneyRange (bad-txns-accumulated-fee-outofrange) ─────── *)
+
+(* Core validation.cpp:2543-2547: nFees += txfee; if (!MoneyRange(nFees)) reject.
+   Test via validate_block_with_utxos: two txs each contributing MAX_MONEY in fees
+   would cause the accumulator to overflow MoneyRange. *)
+let test_accumulated_fee_overflow () =
+  (* Block: coinbase + tx1 + tx2.
+     tx1 spends 1 UTXO worth MAX_MONEY, outputs 0 → fee = MAX_MONEY.
+     tx2 spends 1 UTXO worth MAX_MONEY, outputs 0 → fee = MAX_MONEY.
+     Accumulated = 2 × MAX_MONEY > MAX_MONEY → reject.
+     The coinbase output must also be capped to 0 (no subsidy + no fees yet)
+     but it doesn't matter because the fee check fires first. *)
+  let height = 1 in
+
+  (* Coinbase tx for block *)
+  let coinbase = make_tx
+    ~inputs:[make_coinbase_input ~height]
+    ~outputs:[make_output ~value:0L ()]  (* 0 to avoid bad-cb-amount *)
+    ()
+  in
+
+  (* Two UTXOs worth MAX_MONEY each, to be spent with zero outputs *)
+  let txid1 = Cstruct.create 32 in
+  Cstruct.set_uint8 txid1 0 0x11;
+  let txid2 = Cstruct.create 32 in
+  Cstruct.set_uint8 txid2 0 0x22;
+
+  let spend1 = make_tx
+    ~inputs:[make_input ~txid:txid1 ~vout:0l ()]
+    ~outputs:[]  (* All to fees *)
+    ()
+  in
+  let spend2 = make_tx
+    ~inputs:[make_input ~txid:txid2 ~vout:0l ()]
+    ~outputs:[]
+    ()
+  in
+  (* Fix transaction outputs to empty so fee = MAX_MONEY each; but empty vout
+     would fail TxEmptyOutputs in check_transaction.  Use a 0-value output. *)
+  let _ = spend1 in let _ = spend2 in
+  let spend1 = make_tx
+    ~inputs:[make_input ~txid:txid1 ~vout:0l ()]
+    ~outputs:[make_output ~value:0L ()]
+    ()
+  in
+  let spend2 = make_tx
+    ~inputs:[make_input ~txid:txid2 ~vout:0l ()]
+    ~outputs:[make_output ~value:0L ()]
+    ()
+  in
+
+  let all_txids = List.map Crypto.compute_txid [coinbase; spend1; spend2] in
+  let (merkle, _) = Crypto.merkle_root all_txids in
+  let header = make_header ~version:4l ~merkle_root:merkle
+    ~bits:0x207fffffl ~timestamp:200l () in
+  let block = { Types.header; transactions = [coinbase; spend1; spend2] } in
+
+  let lookup outpoint =
+    let eq_txid cs1 cs2 = Cstruct.equal cs1 cs2 in
+    if eq_txid outpoint.Types.txid txid1 && outpoint.Types.vout = 0l then
+      Some {
+        Validation.txid = txid1; vout = 0l;
+        value = Consensus.max_money;
+        script_pubkey = Cstruct.create 0;
+        height = 0; is_coinbase = false;
+      }
+    else if eq_txid outpoint.Types.txid txid2 && outpoint.Types.vout = 0l then
+      Some {
+        Validation.txid = txid2; vout = 0l;
+        value = Consensus.max_money;
+        script_pubkey = Cstruct.create 0;
+        height = 0; is_coinbase = false;
+      }
+    else None
+  in
+  let flags = Script.script_verify_none in
+  match Validation.validate_block_with_utxos ~network:Consensus.regtest block height
+    ~expected_bits:0x207fffffl ~median_time:0l ~base_lookup:lookup
+    ~flags ~skip_scripts:true () with
+  | Error (Validation.BlockTxValidationFailed (_, Validation.TxOutputOverflow)) -> ()
+  | Error e -> Alcotest.fail ("Expected fee-overflow error: "
+                               ^ Validation.block_error_to_string e)
+  | Ok _ -> Alcotest.fail "Should have rejected accumulated fee overflow"
+
+(* ── Test Registration ───────────────────────────────────────────────────── *)
+
+(* ============================================================================
    Test Registration
    ============================================================================ *)
 
@@ -2828,5 +3406,35 @@ let () =
       (* Gate 5: validate_block enforces at limit *)
       test_case "G5: validate_block enforces at height=1983702" `Quick
         test_bip30_reenabled_at_limit_in_validate;
+    ];
+    "w84_checktx_checktxinputs", [
+      (* GetBlockSubsidy *)
+      test_case "subsidy all halvings 0..64" `Quick test_subsidy_all_halvings;
+      test_case "subsidy regtest interval" `Quick test_subsidy_regtest_interval;
+      (* CVE-2010-5139 *)
+      test_case "CVE-2010: negative output" `Quick test_cve_2010_negative_value;
+      test_case "CVE-2010: toolarge output (bad-txns-vout-toolarge)" `Quick test_cve_2010_toolarge_value;
+      test_case "CVE-2010: total output overflow" `Quick test_cve_2010_txouttotal_toolarge;
+      (* CVE-2018-17144 *)
+      test_case "CVE-2018-17144: duplicate inputs" `Quick test_cve_2018_17144_duplicate_inputs;
+      (* bad-cb-length *)
+      test_case "bad-cb-length: scriptSig too short" `Quick test_bad_cb_length_too_short;
+      test_case "bad-cb-length: scriptSig too long" `Quick test_bad_cb_length_too_long;
+      test_case "bad-cb-length: exact boundaries 2 and 100" `Quick test_bad_cb_length_exact_boundaries;
+      (* CheckTxInputs: per-input and cumulative MoneyRange *)
+      test_case "input UTXO value > MAX_MONEY rejected" `Quick test_input_value_out_of_range;
+      test_case "cumulative input sum overflow rejected" `Quick test_input_cumulative_overflow;
+      (* bad-txns-in-belowout *)
+      test_case "validate_tx_inputs returns total_in (belowout check is block-level)" `Quick test_input_below_output;
+      (* bad-txns-premature-spend-of-coinbase *)
+      test_case "coinbase maturity: depth=99 reject, depth=100 accept" `Quick test_coinbase_maturity_boundary;
+      (* bad-cb-amount *)
+      test_case "bad-cb-amount: coinbase overpays subsidy" `Quick test_bad_cb_amount_in_block;
+      test_case "bad-cb-amount: exact subsidy accepted" `Quick test_cb_amount_exact_subsidy;
+      test_case "bad-cb-amount: pre-halving amount rejected post-halving" `Quick test_bad_cb_amount_after_halving;
+      (* bad-txns-prevout-null *)
+      test_case "bad-txns-prevout-null: non-coinbase null outpoint rejected" `Quick test_null_prevout_rejected_for_non_coinbase;
+      (* accumulated fee overflow *)
+      test_case "bad-txns-accumulated-fee-outofrange: 2x MAX_MONEY fees overflow" `Quick test_accumulated_fee_overflow;
     ];
   ]

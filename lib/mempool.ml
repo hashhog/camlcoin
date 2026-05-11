@@ -62,9 +62,16 @@ type mempool = {
   mutable entries : (string, mempool_entry) Hashtbl.t;
   mutable total_weight : int;
   mutable total_fee : int64;
-  max_size_bytes : int;       (* default 300 MB *)
+  max_size_bytes : int;       (* default 300 MB = 300_000_000 bytes (SI, matching Core) *)
   min_relay_fee : int64;      (* minimum fee rate in sat/kvB *)
   mutable dynamic_min_fee : int64;  (* raised when mempool is full and evictions occur *)
+  (* Rolling minimum fee — tracks eviction floor with exponential decay.
+     Reference: Bitcoin Core txmempool.h:195-197, txmempool.cpp:829-859
+     rollingMinimumFeeRate decays to zero over ROLLING_FEE_HALFLIFE (12h) after a block.
+     blockSinceLastRollingFeeBump gates whether decay is active. *)
+  mutable rolling_min_fee_rate : float;         (* sat/kvB, updated by track_package_removed *)
+  mutable last_rolling_fee_update : float;      (* Unix timestamp of last decay computation *)
+  mutable block_since_last_rolling_fee_bump : bool;  (* true after block connected; enables decay *)
   utxo : Utxo.UtxoSet.t;
   mutable current_height : int;
   mutable network : Consensus.network_config;
@@ -92,7 +99,15 @@ let max_ancestor_size = 101_000
 let max_descendant_size = 101_000
 let max_rbf_evictions = 100
 let max_standard_tx_weight = 400_000
-let incremental_relay_fee = 1000L  (* 1000 sat/kvB, same as default relay fee *)
+(* DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB.
+   Reference: bitcoin-core/src/policy/policy.h:48
+   Previous value was 1000 sat/kvB (10× too high). *)
+let incremental_relay_fee = 100L  (* sat/kvB — policy/policy.h DEFAULT_INCREMENTAL_RELAY_FEE *)
+let incremental_relay_fee_float = 100.0  (* float copy for rolling-fee math *)
+
+(* ROLLING_FEE_HALFLIFE = 12 hours in seconds.
+   Reference: bitcoin-core/src/txmempool.h:212 *)
+let rolling_fee_halflife = float_of_int (60 * 60 * 12)  (* 43200.0 s *)
 
 (* Cluster mempool constants.
    Reference: Bitcoin Core policy/policy.h DEFAULT_CLUSTER_LIMIT / DEFAULT_CLUSTER_SIZE_LIMIT_KVB.
@@ -194,9 +209,15 @@ let create ?(require_standard=true) ?(verify_scripts=true)
   { entries = Hashtbl.create 10_000;
     total_weight = 0;
     total_fee = 0L;
-    max_size_bytes = 300 * 1024 * 1024;
+    (* DEFAULT_MAX_MEMPOOL_SIZE_MB * 1_000_000 — SI megabytes, not MiB.
+       Reference: bitcoin-core/src/kernel/mempool_options.h:40
+       Previous value was 300 * 1024 * 1024 = 314,572,800 (too large by ~4.9%). *)
+    max_size_bytes = 300 * 1_000_000;
     min_relay_fee = 1000L;  (* 1 sat/vB = 1000 sat/kvB *)
     dynamic_min_fee = 0L;
+    rolling_min_fee_rate = 0.0;
+    last_rolling_fee_update = Unix.gettimeofday ();
+    block_since_last_rolling_fee_bump = false;
     utxo;
     current_height;
     network;
@@ -660,26 +681,87 @@ let select_for_block_chunked (mp : mempool) ~(max_weight : int)
   List.rev !selected
 
 (* ============================================================================
-   Cluster-Based Eviction
-
-   Evict the lowest-fee-rate chunk when mempool is full.
-   Reference: Bitcoin Core TrimToSize with GetWorstMainChunk
+   Rolling Minimum Fee — exponential decay after blocks
+   Reference: Bitcoin Core txmempool.cpp:829-859
    ============================================================================ *)
 
-(* Evict lowest fee-rate chunks until mempool is under target size.
-   Updates dynamic_min_fee based on the last evicted chunk's fee rate. *)
+(* track_package_removed — update rolling_min_fee_rate when a chunk is evicted.
+   Only raises the floor (never lowers it here).  Clears blockSinceLastRollingFeeBump
+   so the decay timer is reset.
+   Reference: Bitcoin Core txmempool.cpp:853-859
+     if (rate.GetFeePerK() > rollingMinimumFeeRate) {
+         rollingMinimumFeeRate = rate.GetFeePerK();
+         blockSinceLastRollingFeeBump = false; } *)
+let track_package_removed (mp : mempool) (evicted_fee_rate_kvb : float) : unit =
+  if evicted_fee_rate_kvb > mp.rolling_min_fee_rate then begin
+    mp.rolling_min_fee_rate <- evicted_fee_rate_kvb;
+    mp.block_since_last_rolling_fee_bump <- false
+  end
+
+(* get_min_fee — return the current minimum fee rate, applying exponential decay.
+   Reference: Bitcoin Core txmempool.cpp:829-851
+   Half-life is 12h (43200s); halved to 6h when pool < 1/2 full, halved again to
+   3h when pool < 1/4 full.  Decay is only applied when blockSinceLastRollingFeeBump
+   is true (a block was connected since the last eviction bump).
+   Returns max(decayed_rolling_rate, incremental_relay_fee) in sat/kvB. *)
+let get_min_fee (mp : mempool) : int64 =
+  if (not mp.block_since_last_rolling_fee_bump) || mp.rolling_min_fee_rate = 0.0 then
+    (* No decay active: return the current rolling rate directly (rounded). *)
+    Int64.of_float (Float.round mp.rolling_min_fee_rate)
+  else begin
+    let now = Unix.gettimeofday () in
+    if now > mp.last_rolling_fee_update +. 10.0 then begin
+      (* Apply exponential decay with conditional halflife adjustment.
+         Reference: txmempool.cpp:836-843 *)
+      let halflife =
+        let usage = mp.total_weight in
+        let limit = mp.max_size_bytes in
+        if usage < limit / 4 then rolling_fee_halflife /. 4.0
+        else if usage < limit / 2 then rolling_fee_halflife /. 2.0
+        else rolling_fee_halflife
+      in
+      let elapsed = now -. mp.last_rolling_fee_update in
+      mp.rolling_min_fee_rate <-
+        mp.rolling_min_fee_rate /. (2.0 ** (elapsed /. halflife));
+      mp.last_rolling_fee_update <- now;
+      (* Clear to zero once it falls below incremental_relay_fee / 2.
+         Reference: txmempool.cpp:845-848 *)
+      if mp.rolling_min_fee_rate < incremental_relay_fee_float /. 2.0 then begin
+        mp.rolling_min_fee_rate <- 0.0;
+        0L
+      end else
+        Int64.of_float (max mp.rolling_min_fee_rate incremental_relay_fee_float)
+    end else
+      Int64.of_float (max mp.rolling_min_fee_rate incremental_relay_fee_float)
+  end
+
+(* ============================================================================
+   Cluster-Based Eviction
+
+   Evict the lowest-fee-rate chunk when mempool exceeds the size limit.
+   Reference: Bitcoin Core txmempool.cpp:861-911 (TrimToSize)
+   ============================================================================ *)
+
+(* evict_by_chunks — evict lowest-fee-rate chunks until total_weight <= max_size_bytes.
+   Uses track_package_removed to maintain the rolling floor.
+   Reference: Core TrimToSize evicts until DynamicMemoryUsage() <= sizelimit (full limit,
+   not 75%).  The per-chunk feerate floor is raised by incremental_relay_fee each round.
+   Reference: txmempool.cpp:877-878 — removed += incremental_relay_feerate before track. *)
 let evict_by_chunks (mp : mempool) : unit =
-  let target = mp.max_size_bytes * 3 / 4 in
   let rec evict_loop () =
-    if mp.total_weight <= target then ()
+    if mp.total_weight <= mp.max_size_bytes then ()
     else begin
       match get_worst_chunk mp with
       | None -> ()
       | Some worst_chunk ->
+        (* chunk_fee_rate is in sat/weight-unit; convert to sat/kvB for rolling fee.
+           1 sat/wu * 4 wu/vB * 1000 vB/kvB = 4000 sat/kvB per (sat/wu). *)
         let evicted_fee_rate_kvb =
           worst_chunk.chunk_fee_rate *. 4.0 *. 1000.0 in
-        mp.dynamic_min_fee <-
-          Int64.add (Int64.of_float evicted_fee_rate_kvb) incremental_relay_fee;
+        (* Add incremental_relay_fee before updating the floor, so the floor is
+           strictly above the just-evicted rate (Core txmempool.cpp:877-878). *)
+        let floor_rate = evicted_fee_rate_kvb +. incremental_relay_fee_float in
+        track_package_removed mp floor_rate;
         List.iter (fun e ->
           remove_transaction mp e.txid
         ) worst_chunk.chunk_txs;
@@ -688,15 +770,14 @@ let evict_by_chunks (mp : mempool) : unit =
   in
   evict_loop ()
 
-(* Effective minimum fee rate: max of static min_relay_fee and dynamic_min_fee.
-   dynamic_min_fee is raised when the mempool is full and evictions occur. *)
+(* effective_min_fee — the minimum fee rate (sat/kvB) a new transaction must meet.
+   Uses the rolling exponential-decay model from get_min_fee, then takes the max
+   with the static min_relay_fee.
+   Reference: Core callers of GetMinFee pass the full sizelimit; min is raised by
+   rolling eviction history and decays back down after blocks. *)
 let effective_min_fee (mp : mempool) : int64 =
-  if mp.total_weight > mp.max_size_bytes / 4 then
-    Int64.max mp.min_relay_fee mp.dynamic_min_fee
-  else begin
-    mp.dynamic_min_fee <- 0L;
-    mp.min_relay_fee
-  end
+  let rolling = get_min_fee mp in
+  Int64.max mp.min_relay_fee rolling
 
 (* ============================================================================
    Cluster Size Limit Check
@@ -1946,8 +2027,11 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (t
                   ) ancestor_entry.depends_on
               done;
 
-              (* Evict if over size limit - use cluster-based eviction *)
-              if mp.total_weight > mp.max_size_bytes / 4 then
+              (* Evict if over size limit - use cluster-based eviction.
+                 Reference: Core validation.cpp:275 calls TrimToSize(max_size_bytes)
+                 after every accept — triggers when total weight exceeds the full
+                 limit (not 25% of it as the old code did). *)
+              if mp.total_weight > mp.max_size_bytes then
                 evict_by_chunks mp;
 
               (* Notify ZMQ subscribers about new transaction *)
@@ -1964,7 +2048,11 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (t
    ============================================================================ *)
 
 (* Remove confirmed transactions after a block is mined.
-   Collects txids to remove before mutating the Hashtbl. *)
+   Collects txids to remove before mutating the Hashtbl.
+   Also resets the rolling fee decay timer so the floor can begin decaying.
+   Reference: Bitcoin Core txmempool.cpp:405-431 (removeForBlock)
+     lastRollingFeeUpdate = GetTime();
+     blockSinceLastRollingFeeBump = true; *)
 let remove_for_block (mp : mempool) (block : Types.block) (height : int)
     : unit =
   mp.current_height <- height;
@@ -1988,7 +2076,12 @@ let remove_for_block (mp : mempool) (block : Types.block) (height : int)
         remove_transaction mp conflict_txid
       ) to_remove
     ) tx.inputs
-  ) block.transactions
+  ) block.transactions;
+  (* Reset rolling fee update timestamp and mark block-since-last-bump so the
+     exponential decay starts running from this point forward.
+     Reference: Core txmempool.cpp:426-427 *)
+  mp.last_rolling_fee_update <- Unix.gettimeofday ();
+  mp.block_since_last_rolling_fee_bump <- true
 
 (* ============================================================================
    Block Template Construction
@@ -3357,3 +3450,49 @@ let process_orphans_with_cpfp (mp : mempool) (new_txid : Types.hash256)
     ) to_try
   done;
   List.rev !accepted
+
+(* ============================================================================
+   W86 Test Accessors — expose rolling-fee internals for unit tests
+   Only used by test/test_mempool.ml; not part of the public API.
+   ============================================================================ *)
+
+let get_rolling_min_fee_rate (mp : mempool) : float =
+  mp.rolling_min_fee_rate
+
+let set_rolling_min_fee_rate (mp : mempool) (r : float) : unit =
+  mp.rolling_min_fee_rate <- r
+
+let get_block_since_last_rolling_fee_bump (mp : mempool) : bool =
+  mp.block_since_last_rolling_fee_bump
+
+let set_block_since_last_rolling_fee_bump (mp : mempool) (v : bool) : unit =
+  mp.block_since_last_rolling_fee_bump <- v
+
+let get_last_rolling_fee_update (mp : mempool) : float =
+  mp.last_rolling_fee_update
+
+let set_last_rolling_fee_update (mp : mempool) (t : float) : unit =
+  mp.last_rolling_fee_update <- t
+
+(* count — number of entries in the pool (alias for get_info fst) *)
+let count (mp : mempool) : int =
+  Hashtbl.length mp.entries
+
+(* set_total_weight_for_testing — inject an arbitrary total_weight for eviction
+   threshold tests without needing to add real transactions. *)
+let set_total_weight_for_testing (mp : mempool) (w : int) : unit =
+  mp.total_weight <- w
+
+(* evict_by_chunks_for_testing — public wrapper so tests can call the eviction
+   loop directly. *)
+let evict_by_chunks_for_testing (mp : mempool) : unit =
+  evict_by_chunks mp
+
+(* set_entry_time_for_testing — backdate a transaction's time_added so expiry
+   tests can trigger the 336h gate without sleeping. *)
+let set_entry_time_for_testing (mp : mempool) (txid : Types.hash256) (t : float) : unit =
+  let key = Cstruct.to_string txid in
+  match Hashtbl.find_opt mp.entries key with
+  | None -> ()
+  | Some entry ->
+    Hashtbl.replace mp.entries key { entry with time_added = t }

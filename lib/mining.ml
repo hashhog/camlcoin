@@ -626,6 +626,7 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
            with the IBD path (Sync.process_new_block uses accept_block too).
            Reference: bitcoin-core/src/validation.cpp ProcessNewBlock. *)
         let median_time = Sync.compute_median_time_past chain height in
+        let prev_block_time = Sync.get_prev_block_time chain height in
         let base_lookup (outpoint : Types.outpoint) : Validation.utxo option =
           let txid = outpoint.Types.txid in
           let vout = Int32.to_int outpoint.Types.vout in
@@ -669,7 +670,7 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
         in
         (match Validation.accept_block
                  ~network:chain.network ~block ~height
-                 ~expected_bits:block.header.bits ~median_time
+                 ~expected_bits:block.header.bits ~median_time ~prev_block_time
                  ~base_lookup ~flags:validation_flags
                  ~skip_scripts:false
                  ~get_mtp_at_height:(Sync.get_mtp_for_height chain) () with

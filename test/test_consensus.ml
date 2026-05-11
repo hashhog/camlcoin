@@ -431,6 +431,103 @@ let test_mainnet_vs_bip94 () =
     (mainnet_bits <> bip94_bits)
 
 (* ============================================================================
+   BIP-94 Timewarp Rule Tests
+   Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4097-4104
+              consensus/consensus.h:35 (MAX_TIMEWARP=600)
+   ============================================================================ *)
+
+(* The timewarp rule fires ONLY on testnet4 (enforce_bip94=true) and ONLY at
+   difficulty-adjustment boundaries (height % 2016 = 0). *)
+
+let test_timewarp_not_enforced_mainnet () =
+  (* Mainnet: enforce_bip94=false — rule never fires even at boundary *)
+  let prev_time = 1_000_000l in
+  let header_time = Int32.sub prev_time 1000l in  (* 1000s before parent — would fail on testnet4 *)
+  Alcotest.(check bool) "mainnet no timewarp enforcement" true
+    (Consensus.check_timewarp_rule
+       ~height:2016
+       ~header_time
+       ~prev_block_time:prev_time
+       ~network:Consensus.mainnet)
+
+let test_timewarp_not_enforced_regtest () =
+  (* Regtest: enforce_bip94=false — rule never fires *)
+  let prev_time = 1_000_000l in
+  let header_time = Int32.sub prev_time 1000l in
+  Alcotest.(check bool) "regtest no timewarp enforcement" true
+    (Consensus.check_timewarp_rule
+       ~height:2016
+       ~header_time
+       ~prev_block_time:prev_time
+       ~network:Consensus.regtest)
+
+let test_timewarp_non_boundary_testnet4 () =
+  (* Testnet4 but NOT a retarget boundary — rule does not apply *)
+  let prev_time = 1_000_000l in
+  let header_time = Int32.sub prev_time 1000l in
+  Alcotest.(check bool) "testnet4 non-boundary skipped" true
+    (Consensus.check_timewarp_rule
+       ~height:2017  (* not a multiple of 2016 *)
+       ~header_time
+       ~prev_block_time:prev_time
+       ~network:Consensus.testnet4)
+
+let test_timewarp_passes_at_boundary () =
+  (* Testnet4 at boundary: header_time >= prev_block_time - 600 should pass *)
+  let prev_time = 1_000_000l in
+  (* Exactly at the limit: header_time = prev_time - 600 *)
+  let header_time = Int32.sub prev_time 600l in
+  Alcotest.(check bool) "testnet4 boundary exactly at limit passes" true
+    (Consensus.check_timewarp_rule
+       ~height:2016
+       ~header_time
+       ~prev_block_time:prev_time
+       ~network:Consensus.testnet4)
+
+let test_timewarp_passes_normal () =
+  (* Testnet4 at boundary: normal forward-progressing timestamp passes *)
+  let prev_time = 1_000_000l in
+  let header_time = Int32.add prev_time 600l in  (* 10 min after parent *)
+  Alcotest.(check bool) "testnet4 normal timestamp passes" true
+    (Consensus.check_timewarp_rule
+       ~height:2016
+       ~header_time
+       ~prev_block_time:prev_time
+       ~network:Consensus.testnet4)
+
+let test_timewarp_fails_over_limit () =
+  (* Testnet4 at boundary: header_time < prev_block_time - 600 should fail *)
+  let prev_time = 1_000_000l in
+  let header_time = Int32.sub prev_time 601l in  (* 601s before parent — over MAX_TIMEWARP *)
+  Alcotest.(check bool) "testnet4 boundary over limit fails" false
+    (Consensus.check_timewarp_rule
+       ~height:2016
+       ~header_time
+       ~prev_block_time:prev_time
+       ~network:Consensus.testnet4)
+
+let test_timewarp_boundary_detection () =
+  (* Only height % 2016 = 0 is a boundary; verify adjacent heights *)
+  let prev_time = 1_000_000l in
+  let header_time = Int32.sub prev_time 700l in  (* Would fail if boundary checked *)
+  (* height=2015: not a boundary → should pass *)
+  Alcotest.(check bool) "h=2015 not boundary" true
+    (Consensus.check_timewarp_rule ~height:2015
+       ~header_time ~prev_block_time:prev_time ~network:Consensus.testnet4);
+  (* height=2016: boundary → should fail *)
+  Alcotest.(check bool) "h=2016 is boundary" false
+    (Consensus.check_timewarp_rule ~height:2016
+       ~header_time ~prev_block_time:prev_time ~network:Consensus.testnet4);
+  (* height=2017: not a boundary → should pass *)
+  Alcotest.(check bool) "h=2017 not boundary" true
+    (Consensus.check_timewarp_rule ~height:2017
+       ~header_time ~prev_block_time:prev_time ~network:Consensus.testnet4);
+  (* height=4032: next boundary → should fail *)
+  Alcotest.(check bool) "h=4032 is boundary" false
+    (Consensus.check_timewarp_rule ~height:4032
+       ~header_time ~prev_block_time:prev_time ~network:Consensus.testnet4)
+
+(* ============================================================================
    BIP9 Version Bits Tests
    ============================================================================ *)
 
@@ -1204,6 +1301,15 @@ let () =
     ];
     "time", [
       test_case "median time past" `Quick test_median_time_past;
+    ];
+    "timewarp_rule", [
+      test_case "mainnet no enforcement" `Quick test_timewarp_not_enforced_mainnet;
+      test_case "regtest no enforcement" `Quick test_timewarp_not_enforced_regtest;
+      test_case "testnet4 non-boundary skipped" `Quick test_timewarp_non_boundary_testnet4;
+      test_case "testnet4 passes at limit" `Quick test_timewarp_passes_at_boundary;
+      test_case "testnet4 normal timestamp" `Quick test_timewarp_passes_normal;
+      test_case "testnet4 over limit fails" `Quick test_timewarp_fails_over_limit;
+      test_case "testnet4 boundary detection" `Quick test_timewarp_boundary_detection;
     ];
     "encoding", [
       test_case "encode height in coinbase" `Quick test_encode_height_in_coinbase;

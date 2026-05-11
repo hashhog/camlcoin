@@ -828,10 +828,14 @@ let is_difficulty_adjustment_height (height : int) : bool =
 
 (* BIP-94 timewarp protection: at difficulty adjustment boundaries, the new
    block's timestamp must not be more than max_timewarp seconds before the
-   previous block's timestamp. Returns true if the block passes the check. *)
+   previous block's timestamp. Returns true if the block passes the check.
+
+   Gate: only enforced when network.enforce_bip94 is true (testnet4).
+   Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4097-4104
+              consensusParams.enforce_BIP94 *)
 let check_timewarp_rule ~(height : int) ~(header_time : int32)
     ~(prev_block_time : int32) ~(network : network_config) : bool =
-  if network.pow_no_retargeting then true  (* Regtest skips this *)
+  if not network.enforce_bip94 then true  (* Only enforced on testnet4 *)
   else if height mod difficulty_adjustment_interval <> 0 then true  (* Not a boundary *)
   else
     (* header_time >= prev_block_time - max_timewarp *)

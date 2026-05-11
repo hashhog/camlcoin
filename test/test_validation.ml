@@ -1435,6 +1435,185 @@ let test_sequence_lock_multiple_inputs () =
     ~utxo_heights ~utxo_mtps ~flags () in
   Alcotest.(check bool) "second input not satisfied" false result_fail
 
+(* BIP-68 Gate: SEQUENCE_FINAL (0xFFFFFFFF) has disable bit set → skip *)
+let test_sequence_final_skipped () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x01;
+  let tx = make_tx
+    ~version:2l
+    ~inputs:[make_input ~txid ~sequence:0xFFFFFFFFl ()]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  let utxo_heights = [| 100 |] in
+  let utxo_mtps = [| 0l |] in
+  let flags = Script.script_verify_checksequenceverify in
+  (* 0xFFFFFFFF has bit 31 set → disable flag → always pass regardless of height *)
+  let result = Validation.check_sequence_locks tx
+    ~block_height:1 ~median_time:0l
+    ~utxo_heights ~utxo_mtps ~flags () in
+  Alcotest.(check bool) "SEQUENCE_FINAL skipped" true result
+
+(* BIP-68 Gate: height-based boundary: block_height = required_height passes,
+   block_height = required_height - 1 fails.
+   Core: nMinHeight = nCoinHeight + mask - 1; fail if nMinHeight >= block.nHeight
+   → fail iff block_height <= nCoinHeight + mask - 1 → fail iff block_height < nCoinHeight + mask *)
+let test_sequence_lock_height_boundary () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x02;
+  let tx = make_tx
+    ~version:2l
+    ~inputs:[make_input ~txid ~sequence:5l ()]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  let utxo_heights = [| 200 |] in
+  let utxo_mtps = [| 0l |] in
+  let flags = Script.script_verify_checksequenceverify in
+  (* required = 200 + 5 = 205; exact boundary *)
+  let pass = Validation.check_sequence_locks tx
+    ~block_height:205 ~median_time:0l
+    ~utxo_heights ~utxo_mtps ~flags () in
+  Alcotest.(check bool) "height 205 (= 200+5) passes" true pass;
+  let fail = Validation.check_sequence_locks tx
+    ~block_height:204 ~median_time:0l
+    ~utxo_heights ~utxo_mtps ~flags () in
+  Alcotest.(check bool) "height 204 (= 200+5-1) fails" false fail
+
+(* BIP-68 Gate: time-based boundary with granularity = 9 (×512s) *)
+let test_sequence_lock_time_boundary () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x03;
+  (* sequence value = 3 → 3 × 512 = 1536 seconds relative lock *)
+  let tx = make_tx
+    ~version:2l
+    ~inputs:[make_input ~txid ~sequence:0x00400003l ()]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  let utxo_heights = [| 100 |] in
+  let base_mtp = 1_700_000_000l in
+  let utxo_mtps = [| base_mtp |] in
+  let flags = Script.script_verify_checksequenceverify in
+  (* required = 1_700_000_000 + (3 lsl 9) = 1_700_000_000 + 1536 = 1_700_001_536 *)
+  let required = Int32.add base_mtp (Int32.of_int (3 lsl 9)) in
+  let pass = Validation.check_sequence_locks tx
+    ~block_height:200 ~median_time:required
+    ~utxo_heights ~utxo_mtps ~flags () in
+  Alcotest.(check bool) "exact MTP passes" true pass;
+  let fail = Validation.check_sequence_locks tx
+    ~block_height:200
+    ~median_time:(Int32.sub required 1l)
+    ~utxo_heights ~utxo_mtps ~flags () in
+  Alcotest.(check bool) "MTP - 1 fails" false fail
+
+(* BIP-68 Gate: time-based lock uses Int64 arithmetic — no Int32 overflow
+   for large timestamps. Use values that would overflow Int32. *)
+let test_sequence_lock_time_int64_no_overflow () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x04;
+  (* sequence value = 0xFFFF (max) → 0xFFFF × 512 = 33_553_920s *)
+  let tx = make_tx
+    ~version:2l
+    ~inputs:[make_input ~txid ~sequence:0x0040FFFFl ()]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  let utxo_heights = [| 100 |] in
+  (* Use a large base MTP that, when 33_553_920 is added, would overflow Int32.
+     Int32 max ≈ 2_147_483_647. Use base = 2_100_000_000. *)
+  let base_mtp = Int32.of_int 2_100_000_000 in
+  let utxo_mtps = [| base_mtp |] in
+  let flags = Script.script_verify_checksequenceverify in
+  (* required (Int64) = 2_100_000_000 + 33_553_920 = 2_133_553_920, fits in Int64
+     but would overflow Int32 (max 2_147_483_647 is larger, so just barely ok here;
+     use a larger base to force overflow: base = 2_130_000_000 + offset = 2_163_553_920 > 2^31-1) *)
+  let base_mtp2 = Int32.of_int 2_130_000_000 in
+  let utxo_mtps2 = [| base_mtp2 |] in
+  (* required = 2_130_000_000 + 33_553_920 = 2_163_553_920 which overflows Int32 *)
+  (* As unsigned int64: 2_163_553_920 = 0x0000_0000_80E6_5B40 *)
+  let req64 = Int64.add (Int64.logand (Int64.of_int32 base_mtp2) 0xFFFFFFFFL)
+                        (Int64.of_int (0xFFFF lsl 9)) in
+  (* Block MTP >= req64 should pass; block MTP < req64 should fail.
+     Convert req64 back to int32 for test: take low 32 bits (may wrap). *)
+  let req_lo32 = Int32.of_int (Int64.to_int (Int64.logand req64 0xFFFFFFFFL)) in
+  (* Pass: block MTP = req_lo32 interpreted as unsigned (which is > req64 when wrapped if we trust Int64 impl) *)
+  (* Simpler: just verify the function returns true when block MTP passes as int64-derived value *)
+  let _ = base_mtp in
+  let _ = utxo_mtps in
+  let _ = req_lo32 in
+  (* Verify: with max lock (0xFFFF * 512), a modern block should still satisfy an old UTXO *)
+  let modern_mtp = 1_700_000_000l in  (* year ~2023 *)
+  let old_utxo_mtp = 1_000_000_000l in  (* year ~2001 *)
+  let utxo_mtps3 = [| old_utxo_mtp |] in
+  (* required = 1_000_000_000 + 33_553_920 = 1_033_553_920, modern_mtp 1.7B > 1.033B → pass *)
+  let pass = Validation.check_sequence_locks tx
+    ~block_height:200 ~median_time:modern_mtp
+    ~utxo_heights ~utxo_mtps:utxo_mtps3 ~flags () in
+  Alcotest.(check bool) "modern MTP satisfies old time lock" true pass;
+  (* required with utxo_mtps2 = 2_163_553_920 > Int32 signed max *)
+  (* block_mtp 1_700_000_000 < 2_163_553_920 (unsigned) → fail *)
+  let fail = Validation.check_sequence_locks tx
+    ~block_height:200 ~median_time:1_700_000_000l
+    ~utxo_heights ~utxo_mtps:utxo_mtps2 ~flags () in
+  Alcotest.(check bool) "Int64 overflow case: fails correctly" false fail
+
+(* BIP-68 Gate: max mask value 0xFFFF for height lock *)
+let test_sequence_lock_max_height_mask () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x05;
+  let tx = make_tx
+    ~version:2l
+    ~inputs:[make_input ~txid ~sequence:0x0000FFFFl ()]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  let utxo_heights = [| 0 |] in  (* UTXO at genesis *)
+  let utxo_mtps = [| 0l |] in
+  let flags = Script.script_verify_checksequenceverify in
+  (* required = 0 + 65535 = 65535 *)
+  let pass = Validation.check_sequence_locks tx
+    ~block_height:65535 ~median_time:0l
+    ~utxo_heights ~utxo_mtps ~flags () in
+  Alcotest.(check bool) "max height mask (65535) passes at exact height" true pass;
+  let fail = Validation.check_sequence_locks tx
+    ~block_height:65534 ~median_time:0l
+    ~utxo_heights ~utxo_mtps ~flags () in
+  Alcotest.(check bool) "max height mask (65535) fails one below" false fail
+
+(* BIP-68 Gate: get_mtp_at_height callback used for time-based lock (BIP-68 §3) *)
+let test_sequence_lock_get_mtp_callback () =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x06;
+  (* time-based lock: 2 × 512s = 1024s *)
+  let tx = make_tx
+    ~version:2l
+    ~inputs:[make_input ~txid ~sequence:0x00400002l ()]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  let utxo_heights = [| 50 |] in
+  (* Without callback: utxo_mtp is whatever caller supplies *)
+  let utxo_mtp_approx = [| 1_000_000_000l |] in
+  let flags = Script.script_verify_checksequenceverify in
+  (* With callback: mtp at height 49 = 900_000_000, required = 900_000_000 + 1024 = 900_001_024 *)
+  let get_mtp h =
+    if h = 49 then 900_000_000l
+    else 1_000_000_000l
+  in
+  (* block MTP 900_001_100 > 900_001_024 → pass with callback *)
+  let pass_with_cb = Validation.check_sequence_locks tx
+    ~block_height:100 ~median_time:900_001_100l
+    ~utxo_heights ~utxo_mtps:utxo_mtp_approx
+    ~get_mtp_at_height:get_mtp ~flags () in
+  Alcotest.(check bool) "callback MTP used: passes" true pass_with_cb;
+  (* block MTP 900_000_500 < 900_001_024 → fail *)
+  let fail_with_cb = Validation.check_sequence_locks tx
+    ~block_height:100 ~median_time:900_000_500l
+    ~utxo_heights ~utxo_mtps:utxo_mtp_approx
+    ~get_mtp_at_height:get_mtp ~flags () in
+  Alcotest.(check bool) "callback MTP used: fails" false fail_with_cb
+
 (* ============================================================================
    Coinbase Maturity Tests
    ============================================================================ *)
@@ -2515,6 +2694,13 @@ let () =
       test_case "version 1 ignores locks" `Quick test_sequence_lock_version_1_ignored;
       test_case "no CSV flag skips check" `Quick test_sequence_lock_flag_not_set;
       test_case "multiple inputs" `Quick test_sequence_lock_multiple_inputs;
+      (* New W80 gates *)
+      test_case "SEQUENCE_FINAL (0xFFFFFFFF) has disable bit → skip" `Quick test_sequence_final_skipped;
+      test_case "height boundary: exact required_height passes" `Quick test_sequence_lock_height_boundary;
+      test_case "time boundary: granularity=9 exact passes" `Quick test_sequence_lock_time_boundary;
+      test_case "time lock: Int64 arithmetic no overflow" `Quick test_sequence_lock_time_int64_no_overflow;
+      test_case "max MASK=0xFFFF height lock" `Quick test_sequence_lock_max_height_mask;
+      test_case "get_mtp_at_height callback for BIP-68 utxo-1 MTP" `Quick test_sequence_lock_get_mtp_callback;
     ];
     "coinbase_maturity", [
       test_case "error string" `Quick test_coinbase_maturity_error_string;

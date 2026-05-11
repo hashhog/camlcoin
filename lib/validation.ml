@@ -995,14 +995,24 @@ let check_sequence_locks (tx : Types.transaction) ~(block_height : int)
             if block_height < required_height then
               ok := false
           end else begin
-            (* Time-based lock *)
+            (* Time-based lock.
+               Use Int64 arithmetic throughout to match Bitcoin Core's int64_t
+               in CalculateSequenceLocks (tx_verify.cpp:88):
+                 nMinTime = max(nMinTime,
+                   nCoinTime + (int64_t)((seq & MASK) << GRANULARITY) - 1)
+               then EvaluateSequenceLocks checks nMinTime >= nBlockTime.
+               Int32 would overflow for large timestamps + offsets. *)
             let input_mtp = match get_mtp_at_height with
               | Some f -> f (max 0 (utxo_heights.(i) - 1))
               | None -> utxo_mtps.(i)
             in
-            let time_offset = Int32.of_int (masked lsl 9) in
-            let required_time = Int32.add input_mtp time_offset in
-            if Int32.compare median_time required_time < 0 then
+            let input_mtp64 = Int64.logand (Int64.of_int32 input_mtp) 0xFFFFFFFFL in
+            let median_time64 = Int64.logand (Int64.of_int32 median_time) 0xFFFFFFFFL in
+            let time_offset64 = Int64.of_int (masked lsl 9) in
+            (* Core semantics: required = nCoinTime + offset - 1; fail if block_mtp <= required,
+               i.e. fail if median_time64 < input_mtp64 + time_offset64 *)
+            let required_time64 = Int64.add input_mtp64 time_offset64 in
+            if Int64.compare median_time64 required_time64 < 0 then
               ok := false
           end
         end
@@ -1537,6 +1547,30 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
                     total_in := Int64.add !total_in utxo.value
                 end
               ) tx.inputs;
+
+              if !error = None then begin
+                (* BIP-68 SequenceLocks: enforced even on the fast/assumevalid path.
+                   Bitcoin Core validation.cpp ConnectBlock (~line 2557) runs
+                   SequenceLocks BEFORE the fScriptChecks guard, so it fires
+                   regardless of assumevalid.  We must do the same here.
+                   Reference: bitcoin-core/src/consensus/tx_verify.cpp:107-110. *)
+                let utxo_heights_arr = Array.make n_inputs 0 in
+                let utxo_mtps_arr = Array.make n_inputs 0l in
+                Array.iteri (fun j opt ->
+                  match opt with
+                  | Some utxo ->
+                    utxo_heights_arr.(j) <- utxo.height;
+                    utxo_mtps_arr.(j) <- (match get_mtp_at_height with
+                      | Some f -> f (max 0 (utxo.height - 1))
+                      | None -> median_time)
+                  | None -> ()
+                ) resolved_utxos;
+                if not (check_sequence_locks tx ~block_height:height
+                          ~median_time ~utxo_heights:utxo_heights_arr
+                          ~utxo_mtps:utxo_mtps_arr
+                          ?get_mtp_at_height ~flags ()) then
+                  error := Some (BlockTxValidationFailed (i, TxSequenceLocksFailed))
+              end;
 
               if !error = None then begin
                 (* Calculate fee *)

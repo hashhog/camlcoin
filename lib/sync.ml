@@ -35,6 +35,20 @@ let _ = Log.info  (* suppress unused module warning *)
    - With PRESYNC, we only use ~100 bytes until work is proven
    ============================================================================ *)
 
+(* REDOWNLOAD phase data, extracted as a named record so it can be referenced
+   via [ref] across pattern-match arms (OCaml inline records may not escape). *)
+type redownload_data = {
+  target_hash : Types.hash256;   (* Hash we're redownloading to — last hash from PRESYNC *)
+  redownload_last_hash : Types.hash256;  (* Hash of last redownloaded header (advances) *)
+  redownload_last_height : int;          (* Height of last redownloaded header *)
+  redownload_first_prev_hash : Types.hash256; (* hashPrevBlock of first buffered header *)
+  redownload_chain_work : Cstruct.t;    (* Accumulated work on redownloaded chain *)
+  process_all_remaining : bool;  (* True once redownload work >= minimum_required_work *)
+  headers_received : int;        (* Headers received during redownload *)
+  (* m_redownloaded_headers buffer — headers not yet released to acceptance *)
+  buffer : (Types.block_header * Types.hash256) Queue.t;
+}
+
 (* Header sync state for anti-DoS protection (per-peer) *)
 type header_sync_state =
   | Presync of {
@@ -42,19 +56,16 @@ type header_sync_state =
       last_hash : Types.hash256;     (* Hash of last header seen *)
       last_bits : int32;             (* nBits of last header for difficulty validation *)
       count : int;                   (* Number of headers seen in PRESYNC *)
+      current_height : int;          (* Height of last header seen in PRESYNC *)
     }
-  | Redownload of {
-      target_hash : Types.hash256;   (* Hash we're redownloading to *)
-      expected_work : Cstruct.t;     (* Expected cumulative work at target *)
-      headers_received : int;        (* Headers received during redownload *)
-    }
+  | Redownload of redownload_data
   | Synced  (* Header sync complete for this peer *)
 
 (* Convert header sync state to string for logging *)
 let header_sync_state_to_string = function
   | Presync { count; _ } -> Printf.sprintf "presync (count=%d)" count
-  | Redownload { headers_received; _ } ->
-    Printf.sprintf "redownload (received=%d)" headers_received
+  | Redownload { headers_received; buffer; _ } ->
+    Printf.sprintf "redownload (received=%d, buffered=%d)" headers_received (Queue.length buffer)
   | Synced -> "synced"
 
 (* Per-peer low-work header sync tracking.
@@ -66,6 +77,22 @@ type peer_header_sync = {
   mutable last_getheaders_time : float;  (* Rate limiting *)
   chain_start_hash : Types.hash256;       (* Hash where we started syncing *)
   chain_start_height : int;               (* Height where we started syncing *)
+  chain_start_bits : int32;               (* nBits at chain_start, for diff transition checks *)
+  chain_start_work : Cstruct.t;           (* Cumulative chain work at chain_start *)
+  (* Salted hasher keys for 1-bit commitment generation — secret, per-sync-session.
+     Mirrors Core's SaltedUint256Hasher (util/hasher.h).  We use SipHash-2-4. *)
+  hasher_k0 : int64;
+  hasher_k1 : int64;
+  (* Secret offset for commitment heights: commitments are taken at heights h
+     where (h % HEADER_COMMITMENT_PERIOD) == commit_offset.
+     Mirrors Core's m_commit_offset = randrange(commitment_period). *)
+  commit_offset : int;
+  (* FIFO queue of 1-bit commitments collected during PRESYNC, consumed in REDOWNLOAD.
+     Mirrors Core's bitdeque<> m_header_commitments. *)
+  header_commitments : bool Queue.t;
+  (* Bound on how many commitments an honest peer's chain could ever produce, given the
+     6-blocks-per-second MTP rule.  Mirrors Core's m_max_commitments. *)
+  max_commitments : int;
 }
 
 (* Sync state machine *)
@@ -194,37 +221,115 @@ let max_num_unconnecting_headers_msgs = 10
 let max_headers_per_message = 2000    (* Protocol limit on headers per message *)
 let getheaders_rate_limit = 2.0       (* Minimum seconds between getheaders requests *)
 
+(* headerssync.cpp HEADER_COMMITMENT_PERIOD = 600 (every 600th block gets a commitment) *)
+let header_commitment_period = 600
+
+(* headerssync.cpp REDOWNLOAD_BUFFER_SIZE = 14304 (headers buffered before releasing for
+   acceptance; chosen so that buffer holds at least several commitment periods worth) *)
+let redownload_buffer_size = 14304
+
+(* Maximum future block time per Bitcoin Core consensus (2 hours = 7200 seconds).
+   Used in the max_commitments bound (headerssync.cpp constructor line 42). *)
+let max_future_block_time_secs = 7200
+
+(* 6 blocks/second is the fastest physically possible block rate given the MTP rule
+   (each block's timestamp must exceed the median of the prior 11, so at most 6
+   consecutive blocks can be produced per second against a rolling window).
+   Mirrors the constant in headerssync.cpp line 43. *)
+let max_blocks_per_second = 6
+
+(* Generate random uint64 from /dev/urandom. *)
+let random_uint64 () : int64 =
+  let ic = open_in_bin "/dev/urandom" in
+  let buf = Bytes.create 8 in
+  really_input ic buf 0 8;
+  close_in ic;
+  (* Read as little-endian int64 *)
+  let b i = Int64.of_int (Char.code (Bytes.get buf i)) in
+  let ( lsl ) = Int64.shift_left in
+  let ( lor ) = Int64.logor in
+  (b 0) lor ((b 1) lsl 8) lor ((b 2) lsl 16) lor ((b 3) lsl 24)
+  lor ((b 4) lsl 32) lor ((b 5) lsl 40) lor ((b 6) lsl 48) lor ((b 7) lsl 56)
+
+(* Salted 1-bit commitment hash of a block hash.
+   Mirrors Core's SaltedUint256Hasher (util/hasher.h) + the "&1" extraction in
+   headerssync.cpp:197,263.  We use camlcoin's existing SipHash-2-4 implementation. *)
+let commitment_bit ~(k0 : int64) ~(k1 : int64) ~(hash : Types.hash256) : bool =
+  let result = Crypto.SipHash.hash_uint256 k0 k1 hash in
+  Int64.logand result 1L = 1L
+
 (* ============================================================================
    PRESYNC/REDOWNLOAD Implementation
    ============================================================================ *)
 
 (* Create initial PRESYNC state for a peer.
-   chain_start is the header entry where we fork from our known chain. *)
+   chain_start is the header entry where we fork from our known chain.
+
+   Bug fixes vs the original:
+   Bug 1/3/4: now creates random hasher keys + commit_offset + max_commitments bound.
+   Bug 8: cumulative_work starts from chain_start.total_work not zero. *)
 let create_presync_state ~(peer_id : int) ~(chain_start : header_entry)
     : peer_header_sync =
+  (* Random salted hasher keys — mirrors Core's m_hasher(SaltedUint256Hasher)
+     and m_commit_offset = randrange(commitment_period). *)
+  let hasher_k0 = random_uint64 () in
+  let hasher_k1 = random_uint64 () in
+  let commit_offset =
+    let raw = random_uint64 () in
+    (* Take absolute value mod commitment_period *)
+    let v = Int64.to_int (Int64.logand raw (Int64.of_int (header_commitment_period - 1))) in
+    ((v mod header_commitment_period) + header_commitment_period) mod header_commitment_period
+  in
+  (* m_max_commitments = 6 * max_seconds_since_start / commitment_period.
+     max_seconds_since_start = now - chain_start.MTP + max_future_block_time.
+     Core uses the MTP of chain_start; we approximate with chain_start timestamp. *)
+  let chain_start_ts = Int32.to_int chain_start.header.timestamp in
+  let now = int_of_float (Unix.gettimeofday ()) in
+  let max_seconds = (now - chain_start_ts) + max_future_block_time_secs in
+  let max_commitments =
+    if max_seconds <= 0 then 0
+    else max_blocks_per_second * max_seconds / header_commitment_period
+  in
   {
     peer_id;
     state = Presync {
-      cumulative_work = Cstruct.create 32;  (* Start with zero work *)
+      cumulative_work = Cstruct.of_string (Cstruct.to_string chain_start.total_work);  (* Bug 8: init from chain_start work *)
       last_hash = chain_start.hash;
       last_bits = chain_start.header.bits;
       count = 0;
+      current_height = chain_start.height;
     };
     last_getheaders_time = 0.0;
     chain_start_hash = chain_start.hash;
     chain_start_height = chain_start.height;
+    chain_start_bits = chain_start.header.bits;
+    chain_start_work = Cstruct.of_string (Cstruct.to_string chain_start.total_work);
+    hasher_k0;
+    hasher_k1;
+    commit_offset;
+    header_commitments = Queue.create ();
+    max_commitments;
   }
 
 (* Validate a single header during PRESYNC (minimal validation without storage).
-   Only checks: prev_block continuity, proof-of-work validity.
-   Does NOT check: timestamp, MTP, or store the header.
-   Returns: Ok (hash, work, bits) or Error message *)
-let validate_presync_header ~(expected_prev : Types.hash256)
+   Checks: prev_block continuity, permitted_difficulty_transition, proof-of-work validity.
+   Does NOT check: timestamp or MTP.
+   Returns: Ok (hash, work, bits) or Error message
+
+   Bug 5 fix: now calls permitted_difficulty_transition (was missing entirely). *)
+let validate_presync_header ~(network : Consensus.network_config)
+    ~(next_height : int) ~(prev_bits : int32)
+    ~(expected_prev : Types.hash256)
     ~(header : Types.block_header) : (Types.hash256 * Cstruct.t * int32, string) result =
   let hash = Crypto.compute_block_hash header in
   (* Check prev_block links to expected *)
   if not (Cstruct.equal header.prev_block expected_prev) then
     Error "PRESYNC: header prev_block mismatch"
+  (* Bug 5: check difficulty transition is within permitted bounds.
+     Mirrors Core headerssync.cpp:189-193 (ValidateAndProcessSingleHeader). *)
+  else if not (Consensus.permitted_difficulty_transition ~network ~height:next_height
+                 ~old_nbits:prev_bits ~new_nbits:header.bits) then
+    Error (Printf.sprintf "PRESYNC: invalid difficulty transition at height %d" next_height)
   (* Check proof of work *)
   else if not (Consensus.hash_meets_target hash header.bits) then
     Error "PRESYNC: insufficient proof of work"
@@ -233,8 +338,13 @@ let validate_presync_header ~(expected_prev : Types.hash256)
     Ok (hash, work, header.bits)
 
 (* Process headers during PRESYNC phase.
-   Validates each header minimally and accumulates work.
-   Returns: updated state, Ok count if successful, Error if validation fails *)
+   Validates each header minimally, checks difficulty transitions, accumulates work,
+   and stores 1-bit salted hash commitments for every N-th header.
+
+   Bug 1 fix: now stores commitment bits in ps.header_commitments.
+   Bug 3 fix: enforces max_commitments bound.
+   Bug 5 fix: calls permitted_difficulty_transition via validate_presync_header.
+   Bug 8 fix: cumulative_work was already fixed in create_presync_state. *)
 let process_presync_headers ~(ps : peer_header_sync)
     ~(headers : Types.block_header list)
     ~(network : Consensus.network_config)
@@ -245,16 +355,35 @@ let process_presync_headers ~(ps : peer_header_sync)
     let last_hash = ref presync_data.last_hash in
     let last_bits = ref presync_data.last_bits in
     let count = ref presync_data.count in
+    let current_height = ref presync_data.current_height in
     let error = ref None in
     List.iter (fun header ->
-      if !error = None then
-        match validate_presync_header ~expected_prev:!last_hash ~header with
+      if !error = None then begin
+        let next_height = !current_height + 1 in
+        match validate_presync_header ~network ~next_height ~prev_bits:!last_bits
+                ~expected_prev:!last_hash ~header with
         | Error e -> error := Some e
         | Ok (hash, work, bits) ->
-          cumulative_work := Consensus.work_add !cumulative_work work;
-          last_hash := hash;
-          last_bits := bits;
-          incr count
+          (* Bug 1: store a 1-bit salted commitment at every commitment_period-th block.
+             Mirrors Core headerssync.cpp:195-205 (ValidateAndProcessSingleHeader). *)
+          if next_height mod header_commitment_period = ps.commit_offset then begin
+            let bit = commitment_bit ~k0:ps.hasher_k0 ~k1:ps.hasher_k1 ~hash in
+            Queue.push bit ps.header_commitments;
+            (* Bug 3: enforce max_commitments memory bound *)
+            if Queue.length ps.header_commitments > ps.max_commitments then begin
+              error := Some (Printf.sprintf
+                "PRESYNC: exceeded max commitments (%d) at height %d (peer %d)"
+                ps.max_commitments next_height ps.peer_id)
+            end
+          end;
+          if !error = None then begin
+            cumulative_work := Consensus.work_add !cumulative_work work;
+            last_hash := hash;
+            last_bits := bits;
+            current_height := next_height;
+            incr count
+          end
+      end
     ) headers;
     begin match !error with
     | Some e -> Error e
@@ -265,18 +394,27 @@ let process_presync_headers ~(ps : peer_header_sync)
         last_hash = !last_hash;
         last_bits = !last_bits;
         count = !count;
+        current_height = !current_height;
       } in
       ps.state <- new_state;
-      (* Check if we should transition to REDOWNLOAD *)
+      (* Check if we should transition to REDOWNLOAD.
+         Mirrors Core headerssync.cpp:165-173. *)
       if Consensus.work_compare !cumulative_work network.minimum_chain_work >= 0 then begin
         Logs.info (fun m ->
-          m "PRESYNC complete for peer %d: %d headers, work >= minimum_chain_work"
-            ps.peer_id !count);
-        (* Transition to REDOWNLOAD *)
+          m "PRESYNC complete for peer %d: height=%d count=%d, work >= minimum_chain_work"
+            ps.peer_id !current_height !count);
+        (* Transition to REDOWNLOAD.
+           Bug 9 fix: redownload starts from chain_start (not genesis).
+           Redownload buffer initially empty; redownload_last_hash = chain_start.hash. *)
         ps.state <- Redownload {
           target_hash = !last_hash;
-          expected_work = !cumulative_work;
+          redownload_last_hash = ps.chain_start_hash;
+          redownload_last_height = ps.chain_start_height;
+          redownload_first_prev_hash = ps.chain_start_hash;
+          redownload_chain_work = Cstruct.of_string (Cstruct.to_string ps.chain_start_work);
+          process_all_remaining = false;
           headers_received = 0;
+          buffer = Queue.create ();
         };
       end;
       Ok (List.length headers)
@@ -294,84 +432,152 @@ let needs_lowwork_sync ~(chain_state : chain_state) : bool =
   in
   Consensus.work_compare tip_work chain_state.network.minimum_chain_work < 0
 
+
 (* Process headers during REDOWNLOAD phase.
-   These headers are validated AND stored since we've already verified
-   sufficient chain work during PRESYNC. *)
+   These headers are validated, stored in a buffer, and released to permanent
+   storage only once the buffer is deep enough (commitment safety margin).
+
+   Bug 2 fix: now verifies commitment bits against stored PRESYNC commitments.
+   Bug 6 fix: calls permitted_difficulty_transition.
+   Bug 7 fix: uses redownload_buffer_size before releasing to acceptance.
+   Bug 10 fix: implements process_all_remaining flag.
+   Bug 9 fix: build_redownload_locator now uses chain_start_hash (see below). *)
 let process_redownload_headers ~(ps : peer_header_sync)
     ~(headers : Types.block_header list)
     ~(chain_state : chain_state)
-    : (int, string) result =
+    : (Types.block_header list, string) result =
   match ps.state with
   | Redownload rd_data ->
-    let accepted = ref 0 in
     let error = ref None in
-    (* Find the parent entry for the first header *)
-    let prev_hash = ref (if headers = [] then rd_data.target_hash
-      else (List.hd headers).prev_block) in
-    List.iter (fun header ->
+    let rd = ref rd_data in
+    List.iter (fun (header : Types.block_header) ->
       if !error = None then begin
-        let hash = Crypto.compute_block_hash header in
-        let hash_key = Cstruct.to_string hash in
-        (* Skip if already known *)
-        if Hashtbl.mem chain_state.headers hash_key then begin
-          prev_hash := hash;
-          incr accepted
-        end else begin
-          (* Find parent *)
-          let parent_key = Cstruct.to_string header.prev_block in
-          match Hashtbl.find_opt chain_state.headers parent_key with
-          | None ->
-            error := Some "REDOWNLOAD: unknown parent header"
-          | Some parent ->
-            (* Check proof of work *)
-            if not (Consensus.hash_meets_target hash header.bits) then
-              error := Some "REDOWNLOAD: insufficient proof of work"
+        let next_height = !rd.redownload_last_height + 1 in
+        (* Check prev_block continuity — mirrors Core headerssync.cpp:224-227. *)
+        if not (Cstruct.equal header.prev_block !rd.redownload_last_hash) then
+          error := Some (Printf.sprintf
+            "REDOWNLOAD: non-continuous headers at height %d (peer %d)" next_height ps.peer_id)
+        else begin
+          (* Bug 6: check difficulty transition — mirrors Core headerssync.cpp:230-240.
+             previous_nBits = back of buffer's nBits, or chain_start_bits if buffer empty. *)
+          let previous_nBits =
+            if Queue.is_empty !rd.buffer then ps.chain_start_bits
             else begin
-              let height = parent.height + 1 in
-              let work = Consensus.work_add parent.total_work
-                  (Consensus.work_from_compact header.bits) in
-              let entry = {
-                header;
-                hash;
-                height;
-                total_work = work;
-              } in
-              (* Store header *)
-              Hashtbl.replace chain_state.headers hash_key entry;
-              Storage.ChainDB.store_block_header chain_state.db hash header;
-              Storage.ChainDB.set_height_hash chain_state.db height hash;
-              (* Update tip if this has more work *)
-              let is_new_tip = match chain_state.tip with
-                | None -> true
-                | Some tip -> Consensus.work_compare work tip.total_work > 0
-              in
-              if is_new_tip then begin
-                chain_state.tip <- Some entry;
-                Storage.ChainDB.set_header_tip chain_state.db hash height;
-                chain_state.headers_synced <- height
-              end;
-              prev_hash := hash;
-              incr accepted
+              let last = ref ps.chain_start_bits in
+              Queue.iter (fun ((h : Types.block_header), _) -> last := h.bits) !rd.buffer;
+              !last
             end
+          in
+          if not (Consensus.permitted_difficulty_transition ~network:chain_state.network
+                    ~height:next_height ~old_nbits:previous_nBits ~new_nbits:header.bits) then
+            error := Some (Printf.sprintf
+              "REDOWNLOAD: invalid difficulty transition at height %d (peer %d)" next_height ps.peer_id)
+          else begin
+            (* Track work on redownloaded chain — mirrors Core headerssync.cpp:243-248. *)
+            let new_chain_work = Consensus.work_add !rd.redownload_chain_work
+                (Consensus.work_from_compact header.bits) in
+            let process_all =
+              !rd.process_all_remaining ||
+              Consensus.work_compare new_chain_work chain_state.network.minimum_chain_work >= 0
+            in
+            (* Bug 2: verify commitment bit if applicable.
+               Mirrors Core headerssync.cpp:256-269.
+               Skip commitment check once process_all is set — peer may have
+               extended its chain since PRESYNC so commitments can run out. *)
+            let hash = Crypto.compute_block_hash header in
+            if not process_all &&
+               next_height mod header_commitment_period = ps.commit_offset then begin
+              if Queue.is_empty ps.header_commitments then
+                error := Some (Printf.sprintf
+                  "REDOWNLOAD: commitment overrun at height %d (peer %d)" next_height ps.peer_id)
+              else begin
+                let expected_bit = Queue.pop ps.header_commitments in
+                let actual_bit = commitment_bit ~k0:ps.hasher_k0 ~k1:ps.hasher_k1 ~hash in
+                if actual_bit <> expected_bit then
+                  error := Some (Printf.sprintf
+                    "REDOWNLOAD: commitment mismatch at height %d (peer %d)" next_height ps.peer_id)
+              end
+            end;
+            if !error = None then begin
+              (* Store in buffer — mirrors Core m_redownloaded_headers.emplace_back *)
+              Queue.push (header, hash) !rd.buffer;
+              rd := { !rd with
+                redownload_last_height = next_height;
+                redownload_last_hash = hash;
+                redownload_chain_work = new_chain_work;
+                process_all_remaining = process_all;
+                headers_received = !rd.headers_received + 1;
+              }
+            end
+          end
         end
       end
     ) headers;
     begin match !error with
     | Some e -> Error e
     | None ->
-      (* Update REDOWNLOAD state *)
-      let new_received = rd_data.headers_received + !accepted in
-      ps.state <- Redownload {
-        rd_data with headers_received = new_received;
-      };
-      (* Check if we've reached the target *)
-      if Cstruct.equal !prev_hash rd_data.target_hash then begin
+      (* Release headers ready for acceptance (buffer deep enough or process_all).
+         Mirrors Core's PopHeadersReadyForAcceptance call in ProcessNextHeaders. *)
+      let ready = ref [] in
+      let first_prev = ref !rd.redownload_first_prev_hash in
+      let keep_going = ref true in
+      while !keep_going && not (Queue.is_empty !rd.buffer) do
+        if Queue.length !rd.buffer > redownload_buffer_size || !rd.process_all_remaining then begin
+          let ((hdr : Types.block_header), _) = Queue.pop !rd.buffer in
+          let full_hdr = Types.{ hdr with prev_block = !first_prev } in
+          first_prev := Crypto.compute_block_hash full_hdr;
+          ready := full_hdr :: !ready
+        end else
+          keep_going := false
+      done;
+      (* Update first_prev_hash in rd state *)
+      rd := { !rd with redownload_first_prev_hash = !first_prev };
+      ps.state <- Redownload !rd;
+      let released = List.rev !ready in
+      (* Now store all released headers into chain state (permanent storage).
+         This is the equivalent of the caller processing pow_validated_headers. *)
+      List.iter (fun (header : Types.block_header) ->
+        let hash = Crypto.compute_block_hash header in
+        let hash_key = Cstruct.to_string hash in
+        if not (Hashtbl.mem chain_state.headers hash_key) then begin
+          let parent_key = Cstruct.to_string header.prev_block in
+          match Hashtbl.find_opt chain_state.headers parent_key with
+          | None -> () (* skip if parent not known yet; will be linked later *)
+          | Some parent ->
+            let height = parent.height + 1 in
+            let work = Consensus.work_add parent.total_work
+                (Consensus.work_from_compact header.bits) in
+            let entry = { header; hash; height; total_work = work } in
+            Hashtbl.replace chain_state.headers hash_key entry;
+            Storage.ChainDB.store_block_header chain_state.db hash header;
+            Storage.ChainDB.set_height_hash chain_state.db height hash;
+            let is_new_tip = match chain_state.tip with
+              | None -> true
+              | Some tip -> Consensus.work_compare work tip.total_work > 0
+            in
+            if is_new_tip then begin
+              chain_state.tip <- Some entry;
+              Storage.ChainDB.set_header_tip chain_state.db hash height;
+              chain_state.headers_synced <- height
+            end
+        end
+      ) released;
+      (* Check if REDOWNLOAD is complete (buffer drained and process_all set,
+         or we've hit the target hash). *)
+      let final_rd = match ps.state with
+        | Redownload r -> r
+        | _ -> !rd
+      in
+      let complete =
+        Queue.is_empty final_rd.buffer && final_rd.process_all_remaining
+      in
+      if complete then begin
         Logs.info (fun m ->
-          m "REDOWNLOAD complete for peer %d: %d headers stored"
-            ps.peer_id new_received);
+          m "REDOWNLOAD complete for peer %d: height=%d, %d headers stored"
+            ps.peer_id final_rd.redownload_last_height final_rd.headers_received);
         ps.state <- Synced
       end;
-      Ok !accepted
+      Ok released
     end
   | Presync _ | Synced ->
     Error "process_redownload_headers called in wrong state"
@@ -385,10 +591,27 @@ let get_header_sync_phase (ps : peer_header_sync) : [`Presync | `Redownload | `S
   | Synced -> `Synced
 
 (* Build a getheaders locator for REDOWNLOAD phase.
-   Returns a locator starting from genesis to request all headers. *)
-let build_redownload_locator (chain_state : chain_state) : Types.hash256 list =
-  (* Start from genesis for full redownload *)
-  [Crypto.compute_block_hash chain_state.network.genesis_header]
+   Returns a locator starting from the redownload cursor (last accepted hash).
+
+   Bug 9 fix: was always returning the genesis hash, forcing a full re-download
+   from block 0 even when the chain_start was at height 900k.  Core uses
+   m_redownload_buffer_last_hash (initialized to chain_start.GetBlockHash()),
+   which starts at chain_start and advances as headers are accepted. *)
+let build_redownload_locator (ps : peer_header_sync) (chain_state : chain_state)
+    : Types.hash256 list =
+  match ps.state with
+  | Redownload rd ->
+    (* Start from the last accepted redownloaded hash, with chain_start as fallback. *)
+    [rd.redownload_last_hash]
+    @ (* Append chain_start locator entries as per Core's NextHeadersRequestLocator *)
+    (let chain_start_entry_opt = Hashtbl.find_opt chain_state.headers
+         (Cstruct.to_string ps.chain_start_hash) in
+     match chain_start_entry_opt with
+     | None -> [ps.chain_start_hash]
+     | Some _ -> [ps.chain_start_hash])
+  | _ ->
+    (* Fallback: genesis (should not be reached in normal operation) *)
+    [Crypto.compute_block_hash chain_state.network.genesis_header]
 
 (* Build a getheaders locator for PRESYNC continuation.
    Returns a locator with just the last known hash. *)

@@ -42,6 +42,7 @@ type block_validation_error =
   | BlockUnexpectedWitness       (* unexpected-witness: witness data in non-segwit block *)
   | BlockBadVersion
   | BlockMutatedMerkle
+  | BlockTimeWarpAttack  (* time-timewarp-attack: BIP-94 retarget-boundary timestamp too early *)
 
 (* ============================================================================
    Error formatting
@@ -95,6 +96,7 @@ let block_error_to_string = function
   | BlockUnexpectedWitness -> "unexpected-witness"
   | BlockBadVersion -> "block version too low for active soft forks"
   | BlockMutatedMerkle -> "merkle tree has mutated duplicate transactions"
+  | BlockTimeWarpAttack -> "time-timewarp-attack"
 
 (* ============================================================================
    Transaction Weight Computation (BIP-141)
@@ -796,9 +798,17 @@ let is_tx_final (tx : Types.transaction) ~(block_height : int) ~(block_time : in
     end
   end
 
-(* Validate a full block *)
+(* Validate a full block (contextual + context-free checks).
+
+   [prev_block_time]: timestamp of the previous block; used for BIP-94
+   timewarp check.  Callers that don't have this (e.g. unit tests) may
+   pass 0l — the check fires only when network.enforce_bip94 is true
+   (testnet4) and height is a difficulty-adjustment boundary.
+   Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader. *)
 let check_block ~network:(network : Consensus.network_config) (block : Types.block) (height : int)
     ~(expected_bits : int32) ~(median_time : int32)
+    ?(prev_block_time = 0l)
+    ()
     : (unit, block_validation_error) result =
   let txs = block.transactions in
 
@@ -815,7 +825,8 @@ let check_block ~network:(network : Consensus.network_config) (block : Types.blo
       match check_coinbase ~network coinbase height with
       | Error e -> Error (BlockTxValidationFailed (0, e))
       | Ok () ->
-        (* Bug 5: Block version enforcement after BIP activation heights *)
+        (* Block version enforcement after BIP activation heights.
+           Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4113-4118. *)
         if height >= network.bip34_height && Int32.compare block.header.version 2l < 0 then
           Error BlockBadVersion
         else if height >= network.bip66_height && Int32.compare block.header.version 3l < 0 then
@@ -823,7 +834,8 @@ let check_block ~network:(network : Consensus.network_config) (block : Types.blo
         else if height >= network.bip65_height && Int32.compare block.header.version 4l < 0 then
           Error BlockBadVersion
         else
-        (* Check difficulty target *)
+        (* Check difficulty target.
+           Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4088-4089. *)
         if block.header.bits <> expected_bits then
           Error BlockBadDifficulty
         else begin
@@ -832,9 +844,20 @@ let check_block ~network:(network : Consensus.network_config) (block : Types.blo
           if not (Consensus.hash_meets_target block_hash block.header.bits) then
             Error BlockBadDifficulty
           else begin
-            (* Check timestamp is after median time past *)
+            (* Check timestamp is after median time past (time-too-old).
+               Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4092-4093. *)
             if block.header.timestamp <= median_time then
               Error BlockBadTimestamp
+            (* BIP-94 timewarp protection: at difficulty-adjustment boundaries the new
+               block's timestamp must not predate the previous block's by more than
+               MAX_TIMEWARP=600 seconds.
+               Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4097-4104. *)
+            else if not (Consensus.check_timewarp_rule
+                           ~height
+                           ~header_time:block.header.timestamp
+                           ~prev_block_time
+                           ~network) then
+              Error BlockTimeWarpAttack
             else begin
               (* Verify merkle root *)
               let txids = List.map Crypto.compute_txid txs in
@@ -945,7 +968,7 @@ let check_block ~network:(network : Consensus.network_config) (block : Types.blo
                     end
                   end
               end
-            end
+            end  (* closes else begin after timewarp check *)
           end
         end
     end
@@ -1455,7 +1478,7 @@ let bip30_should_enforce
 let validate_block_with_utxos ~network:(network : Consensus.network_config) (block : Types.block) (height : int)
     ~(expected_bits : int32) ~(median_time : int32)
     ~(base_lookup : utxo_lookup) ~(flags : int)
-    ?(skip_scripts=false) ?get_mtp_at_height ?bip34_height_hash ()
+    ?(skip_scripts=false) ?(prev_block_time = 0l) ?get_mtp_at_height ?bip34_height_hash ()
     : ((int64 * Types.hash256 array * (Types.outpoint * utxo) list), block_validation_error) result =
 
   (* ====================================================================
@@ -1666,8 +1689,8 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
      FULL VALIDATION PATH (non-assume-valid)
      ==================================================================== *)
   else begin
-  (* First do context-free checks *)
-  match check_block ~network block height ~expected_bits ~median_time with
+  (* First do context-free + contextual header checks *)
+  match check_block ~network block height ~expected_bits ~median_time ~prev_block_time () with
   | Error e -> Error e
   | Ok () ->
     (* Build local UTXO set for intra-block spending *)
@@ -1961,12 +1984,13 @@ let accept_block
     ~(base_lookup : utxo_lookup)
     ~(flags : int)
     ?(skip_scripts = false)
+    ?(prev_block_time = 0l)
     ?get_mtp_at_height
     ?bip34_height_hash
     ()
     : accept_block_result =
   match validate_block_with_utxos ~network block height
-          ~expected_bits ~median_time
+          ~expected_bits ~median_time ~prev_block_time
           ~base_lookup ~flags ~skip_scripts
           ?get_mtp_at_height ?bip34_height_hash () with
   | Ok (fees, txid_arr, spent_utxos) ->

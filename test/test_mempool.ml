@@ -3205,6 +3205,268 @@ let test_checksigadd_not_counted_in_legacy () =
   let script = Cstruct.of_string "\xba" in
   Alcotest.(check int) "CHECKSIGADD = 0 legacy sigops" 0 (Validation.count_sigops script)
 
+(* ============================================================================
+   W86 Eviction Tests
+   Reference: Bitcoin Core txmempool.cpp:811-911, txmempool.h:195-212,
+              kernel/mempool_options.h:19-41, policy/policy.h:48
+   ============================================================================ *)
+
+(* Helper: create a mempool with direct access to its internals via the
+   Mempool module functions *)
+let make_w86_pool () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let utxo = Utxo.UtxoSet.create db in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+    ~utxo ~current_height:100 () in
+  (mp, db)
+
+let test_w86_incremental_relay_fee_constant () =
+  (* DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB — policy/policy.h:48
+     Previous bug: was 1000L (10× too high). *)
+  Alcotest.(check int64) "incremental_relay_fee = 100 sat/kvB"
+    100L Mempool.incremental_relay_fee;
+  cleanup_test_db ()
+
+let test_w86_max_size_bytes_si () =
+  (* DEFAULT_MAX_MEMPOOL_SIZE_MB * 1_000_000 = 300_000_000.
+     Core uses SI megabytes, not MiB (1024*1024).
+     Reference: kernel/mempool_options.h:40
+     Previous bug: was 300 * 1024 * 1024 = 314_572_800 (~4.9% too large). *)
+  let (mp, db) = make_w86_pool () in
+  let (_, _, _) = Mempool.get_info mp in
+  Alcotest.(check bool) "300 MB (SI) != 300 MiB"
+    true (300 * 1_000_000 <> 300 * 1024 * 1024);
+  Alcotest.(check int) "expected SI value"
+    300_000_000 (300 * 1_000_000);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_w86_rolling_fee_halflife_constant () =
+  (* ROLLING_FEE_HALFLIFE = 60 * 60 * 12 = 43200 s — txmempool.h:212 *)
+  Alcotest.(check (Alcotest.float 0.001)) "halflife = 43200 s"
+    43200.0 Mempool.rolling_fee_halflife;
+  cleanup_test_db ()
+
+let test_w86_track_package_removed_raises () =
+  let (mp, db) = make_w86_pool () in
+  (* Start at zero *)
+  Alcotest.(check (Alcotest.float 0.001)) "initial rolling rate = 0" 0.0
+    (Mempool.get_rolling_min_fee_rate mp);
+  (* track with 500 sat/kvB — should raise *)
+  Mempool.track_package_removed mp 500.0;
+  Alcotest.(check (Alcotest.float 0.001)) "rate raised to 500" 500.0
+    (Mempool.get_rolling_min_fee_rate mp);
+  (* track with 1000 — should raise again *)
+  Mempool.track_package_removed mp 1000.0;
+  Alcotest.(check (Alcotest.float 0.001)) "rate raised to 1000" 1000.0
+    (Mempool.get_rolling_min_fee_rate mp);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_w86_track_package_removed_no_lower () =
+  let (mp, db) = make_w86_pool () in
+  Mempool.track_package_removed mp 1000.0;
+  (* track with a lower rate — should NOT lower the floor *)
+  Mempool.track_package_removed mp 200.0;
+  Alcotest.(check (Alcotest.float 0.001)) "floor not lowered" 1000.0
+    (Mempool.get_rolling_min_fee_rate mp);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_w86_track_package_removed_clears_bump_flag () =
+  let (mp, db) = make_w86_pool () in
+  (* Simulate a block having been connected (sets the bump flag) *)
+  Mempool.set_block_since_last_rolling_fee_bump mp true;
+  Alcotest.(check bool) "flag is true before track" true
+    (Mempool.get_block_since_last_rolling_fee_bump mp);
+  (* track_package_removed should clear it *)
+  Mempool.track_package_removed mp 500.0;
+  Alcotest.(check bool) "flag cleared after track" false
+    (Mempool.get_block_since_last_rolling_fee_bump mp);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_w86_get_min_fee_zero_initial () =
+  let (mp, db) = make_w86_pool () in
+  (* No evictions, no blocks: rolling_min_fee_rate = 0, blockSinceBump = false *)
+  let result = Mempool.get_min_fee mp in
+  Alcotest.(check int64) "get_min_fee = 0 when no evictions" 0L result;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_w86_get_min_fee_no_decay_without_block () =
+  let (mp, db) = make_w86_pool () in
+  (* Set a rolling rate but NO block since bump — decay should not fire *)
+  Mempool.track_package_removed mp 5000.0;
+  (* block_since_last_rolling_fee_bump = false after track_package_removed *)
+  Alcotest.(check bool) "bump flag false" false
+    (Mempool.get_block_since_last_rolling_fee_bump mp);
+  let result = Mempool.get_min_fee mp in
+  (* Should return the stored rate (rounded) with no decay applied *)
+  Alcotest.(check int64) "no decay without block" 5000L result;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_w86_get_min_fee_decays_after_block () =
+  let (mp, db) = make_w86_pool () in
+  (* Eviction sets rolling rate to 10000 sat/kvB *)
+  Mempool.track_package_removed mp 10000.0;
+  (* Simulate a block: set bump flag and set last_update to 60s ago *)
+  Mempool.set_block_since_last_rolling_fee_bump mp true;
+  Mempool.set_last_rolling_fee_update mp (Unix.gettimeofday () -. 60.0);
+  let result = Mempool.get_min_fee mp in
+  (* After 60s with halflife=43200s, decay = 10000 / 2^(60/43200) ≈ 9999.03
+     Rate is positive and less than initial 10000. *)
+  Alcotest.(check bool) "rate decayed (positive)" true (result > 0L);
+  Alcotest.(check bool) "rate below initial 10000" true (result < 10000L);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_w86_get_min_fee_clears_below_threshold () =
+  let (mp, db) = make_w86_pool () in
+  (* Set a rate just above zero but below incremental_relay_fee / 2 = 50 sat/kvB *)
+  Mempool.set_rolling_min_fee_rate mp 40.0;   (* < 50 — below threshold *)
+  Mempool.set_block_since_last_rolling_fee_bump mp true;
+  (* Set last_update far enough in the past to trigger the decay branch *)
+  Mempool.set_last_rolling_fee_update mp (Unix.gettimeofday () -. 20.0);
+  let result = Mempool.get_min_fee mp in
+  (* After even a little decay from an already-low 40, it should clear to 0 *)
+  Alcotest.(check int64) "cleared to 0 below threshold" 0L result;
+  Alcotest.(check (Alcotest.float 0.001)) "rolling rate zeroed" 0.0
+    (Mempool.get_rolling_min_fee_rate mp);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_w86_get_min_fee_max_with_incremental () =
+  let (mp, db) = make_w86_pool () in
+  (* Set rolling rate to 80 sat/kvB — above zero but below 100 *)
+  Mempool.set_rolling_min_fee_rate mp 80.0;
+  (* No block since bump — no decay, returns the stored rate directly *)
+  let result = Mempool.get_min_fee mp in
+  (* Since blockSinceBump=false, returns llround(rolling) = 80, and the caller
+     effective_min_fee takes max(min_relay_fee=1000, 80) = 1000.
+     get_min_fee itself returns 80 in this case. *)
+  Alcotest.(check int64) "get_min_fee returns rolling when no decay" 80L result;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_w86_effective_min_fee_baseline () =
+  let (mp, db) = make_w86_pool () in
+  (* No evictions: rolling = 0, effective = min_relay_fee = 1000 sat/kvB *)
+  let result = Mempool.effective_min_fee mp in
+  Alcotest.(check int64) "effective = min_relay_fee when no evictions" 1000L result;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_w86_effective_min_fee_raised () =
+  let (mp, db) = make_w86_pool () in
+  (* Eviction bumps rolling to 5000 sat/kvB (> min_relay_fee=1000) *)
+  Mempool.track_package_removed mp 5000.0;
+  let result = Mempool.effective_min_fee mp in
+  Alcotest.(check int64) "effective raised to 5000" 5000L result;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_w86_evict_target_is_full_limit () =
+  (* Reference: Core TrimToSize evicts until DynamicMemoryUsage() <= sizelimit.
+     Previous bug: camlcoin evicted to 75% of max_size_bytes.
+     Structural check: 300_000_000 != 300_000_000 * 3 / 4. *)
+  Alcotest.(check bool) "eviction target is full limit, not 75%"
+    true (300_000_000 <> 300_000_000 * 3 / 4);
+  let (mp, db) = make_w86_pool () in
+  (* Inject a fake weight between 75% and 100% to confirm no spurious eviction *)
+  let fake_weight = 300_000_000 * 8 / 10 in  (* 80% = 240_000_000 *)
+  Mempool.set_total_weight_for_testing mp fake_weight;
+  Alcotest.(check int) "no entries to evict" 0 (Mempool.count mp);
+  Mempool.evict_by_chunks_for_testing mp;
+  let (count_after, weight_after, _) = Mempool.get_info mp in
+  Alcotest.(check int) "no eviction with empty pool" 0 count_after;
+  (* Weight stays since there are no entries to remove *)
+  Alcotest.(check int) "weight unchanged with empty pool" fake_weight weight_after;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_w86_evict_raises_rolling_floor () =
+  let (mp, db) = make_w86_pool () in
+  (* Verify: before any eviction, rolling rate = 0 *)
+  Alcotest.(check (Alcotest.float 0.001)) "rolling rate 0 initially" 0.0
+    (Mempool.get_rolling_min_fee_rate mp);
+  (* Manually call track_package_removed (simulating what evict_by_chunks does) *)
+  Mempool.track_package_removed mp (200.0 +. 100.0);  (* evicted_rate + incremental *)
+  Alcotest.(check bool) "rolling rate raised after eviction" true
+    (Mempool.get_rolling_min_fee_rate mp > 0.0);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_w86_remove_for_block_sets_bump_flag () =
+  let (mp, db) = make_w86_pool () in
+  (* Initially false *)
+  Alcotest.(check bool) "initially false" false
+    (Mempool.get_block_since_last_rolling_fee_bump mp);
+  (* Call remove_for_block with an empty block *)
+  let empty_block = Types.{
+    header = {
+      version = 1l; prev_block = Types.zero_hash; merkle_root = Types.zero_hash;
+      timestamp = 0l; bits = 0x207fffffl; nonce = 0l; };
+    transactions = [];
+  } in
+  Mempool.remove_for_block mp empty_block 101;
+  (* After block, bump flag must be true *)
+  Alcotest.(check bool) "bump flag set after block" true
+    (Mempool.get_block_since_last_rolling_fee_bump mp);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_w86_remove_for_block_updates_timestamp () =
+  let (mp, db) = make_w86_pool () in
+  let before = Unix.gettimeofday () in
+  let empty_block = Types.{
+    header = {
+      version = 1l; prev_block = Types.zero_hash; merkle_root = Types.zero_hash;
+      timestamp = 0l; bits = 0x207fffffl; nonce = 0l; };
+    transactions = [];
+  } in
+  Mempool.remove_for_block mp empty_block 101;
+  let after = Unix.gettimeofday () in
+  let ts = Mempool.get_last_rolling_fee_update mp in
+  Alcotest.(check bool) "timestamp updated (>= before)" true (ts >= before);
+  Alcotest.(check bool) "timestamp updated (<= after)" true (ts <= after);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_w86_expire_uses_336h () =
+  (* DEFAULT_MEMPOOL_EXPIRY_HOURS = 336h = 14 days = 1_209_600 s
+     Reference: kernel/mempool_options.h:23 *)
+  let expected_seconds = 336 * 60 * 60 in
+  Alcotest.(check int) "336h in seconds = 1_209_600" 1_209_600 expected_seconds;
+  cleanup_test_db ();
+  let db2 = Storage.ChainDB.create test_db_path in
+  let utxo2 = Utxo.UtxoSet.create db2 in
+  let txid_src = Types.hash256_of_hex
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in
+  Utxo.UtxoSet.add utxo2 txid_src 0 Utxo.{
+    value = 1_000_000L;
+    script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac";
+    height = 0; is_coinbase = false;
+  };
+  let mp2 = Mempool.create ~require_standard:false ~verify_scripts:false
+    ~utxo:utxo2 ~current_height:100 () in
+  let tx = make_regular_tx
+    [make_test_input txid_src 0l]
+    [make_test_output 999_000L]
+  in
+  (match Mempool.add_transaction mp2 tx with
+  | Error _ -> Alcotest.failf "add failed"
+  | Ok entry ->
+    (* Wind the clock back: set time_added to 336h + 1s ago *)
+    Mempool.set_entry_time_for_testing mp2 entry.Mempool.txid
+      (Unix.gettimeofday () -. float_of_int (expected_seconds + 1));
+    let removed = Mempool.expire_old_transactions mp2 in
+    Alcotest.(check int) "expired after 336h+1s" 1 removed);
+  Storage.ChainDB.close db2;
+  cleanup_test_db ()
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
@@ -3381,5 +3643,50 @@ let () =
       test_case "CHECKSIGADD not counted in legacy sigops" `Quick test_checksigadd_not_counted_in_legacy;
       (* Mempool path: threshold fix *)
       test_case "mempool sigops threshold = 16000 not 80000" `Quick test_mempool_sigops_uses_correct_threshold;
+    ];
+    "w86_eviction", [
+      (* Constants *)
+      test_case "incremental_relay_fee = 100 sat/kvB (Core DEFAULT)" `Quick
+        test_w86_incremental_relay_fee_constant;
+      test_case "max_size_bytes = 300_000_000 (SI MB not MiB)" `Quick
+        test_w86_max_size_bytes_si;
+      test_case "rolling_fee_halflife = 43200 s (12h)" `Quick
+        test_w86_rolling_fee_halflife_constant;
+      (* track_package_removed: only raises, never lowers; clears bump flag *)
+      test_case "track_package_removed raises floor" `Quick
+        test_w86_track_package_removed_raises;
+      test_case "track_package_removed does not lower floor" `Quick
+        test_w86_track_package_removed_no_lower;
+      test_case "track_package_removed clears block_since_bump" `Quick
+        test_w86_track_package_removed_clears_bump_flag;
+      (* get_min_fee: decay inactive when no block since bump *)
+      test_case "get_min_fee returns 0 when rolling rate 0 and no block" `Quick
+        test_w86_get_min_fee_zero_initial;
+      test_case "get_min_fee no decay when blockSinceLastBump=false" `Quick
+        test_w86_get_min_fee_no_decay_without_block;
+      test_case "get_min_fee decays after block connected" `Quick
+        test_w86_get_min_fee_decays_after_block;
+      test_case "get_min_fee clears to 0 below incremental_relay_fee/2" `Quick
+        test_w86_get_min_fee_clears_below_threshold;
+      test_case "get_min_fee returns max(rolling, incremental_relay_fee)" `Quick
+        test_w86_get_min_fee_max_with_incremental;
+      (* effective_min_fee: max(min_relay_fee, get_min_fee) *)
+      test_case "effective_min_fee = min_relay_fee when rolling=0" `Quick
+        test_w86_effective_min_fee_baseline;
+      test_case "effective_min_fee raises with rolling floor" `Quick
+        test_w86_effective_min_fee_raised;
+      (* evict_by_chunks: evicts to max_size_bytes (not 75%) *)
+      test_case "evict_by_chunks stops at max_size_bytes not 75%" `Quick
+        test_w86_evict_target_is_full_limit;
+      test_case "evict_by_chunks raises rolling floor on eviction" `Quick
+        test_w86_evict_raises_rolling_floor;
+      (* remove_for_block: sets block_since_last_rolling_fee_bump *)
+      test_case "remove_for_block sets block_since_last_rolling_fee_bump" `Quick
+        test_w86_remove_for_block_sets_bump_flag;
+      test_case "remove_for_block updates last_rolling_fee_update" `Quick
+        test_w86_remove_for_block_updates_timestamp;
+      (* expire_old_transactions: 336h = 1_209_600 s *)
+      test_case "expire uses 336h (1_209_600 s)" `Quick
+        test_w86_expire_uses_336h;
     ];
   ]

@@ -1595,16 +1595,25 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
                 else begin
                   total_fees := Int64.add !total_fees fee;
 
-                  (* Mark inputs as spent using pre-computed keys *)
-                  List.iteri (fun j inp ->
-                    let outpoint = inp.Types.previous_output in
-                    let key = input_keys.(j) in
-                    (match resolved_utxos.(j) with
-                     | Some utxo ->
-                       spent_utxos := (outpoint, utxo) :: !spent_utxos
-                     | None -> ());
-                    Hashtbl.add spent_in_block key ()
-                  ) tx.inputs
+                  (* Accumulated fee MoneyRange check — mirrors Core
+                     validation.cpp:2543-2547 (bad-txns-accumulated-fee-outofrange).
+                     This fires even on the assumevalid fast path because ConnectBlock
+                     runs this check unconditionally (it is not guarded by
+                     fScriptChecks). *)
+                  if not (Consensus.is_valid_money !total_fees) then
+                    error := Some (BlockTxValidationFailed (i, TxOutputOverflow))
+                  else begin
+                    (* Mark inputs as spent using pre-computed keys *)
+                    List.iteri (fun j inp ->
+                      let outpoint = inp.Types.previous_output in
+                      let key = input_keys.(j) in
+                      (match resolved_utxos.(j) with
+                       | Some utxo ->
+                         spent_utxos := (outpoint, utxo) :: !spent_utxos
+                       | None -> ());
+                      Hashtbl.add spent_in_block key ()
+                    ) tx.inputs
+                  end
                 end
               end
             end;
@@ -1632,7 +1641,23 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
         match !error with
         | Some e -> Error e
         | None ->
-          Ok (!total_fees, txid_arr, List.rev !spent_utxos)
+          (* Coinbase value check — mirrors Core validation.cpp:2610-2613
+             (bad-cb-amount).  ConnectBlock runs this after the tx loop and is
+             NOT guarded by fScriptChecks, so it must fire on the fast
+             (assumevalid) path too. *)
+          let coinbase = List.hd block.transactions in
+          let coinbase_value = List.fold_left (fun acc out ->
+            Int64.add acc out.Types.value
+          ) 0L coinbase.outputs in
+          let max_coinbase =
+            Int64.add
+              (Consensus.block_subsidy_for_network network.network_type height)
+              !total_fees
+          in
+          if coinbase_value > max_coinbase then
+            Error (BlockBadCoinbaseValue (coinbase_value, max_coinbase))
+          else
+            Ok (!total_fees, txid_arr, List.rev !spent_utxos)
       end
     end
   end

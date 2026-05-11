@@ -358,6 +358,286 @@ let qcheck_tests = [
   QCheck_alcotest.to_alcotest qcheck_sign_verify_roundtrip;
 ]
 
+(* ============================================================================
+   BIP-66 / IsValidSignatureEncoding tests
+   Covers all ~22 gates from Bitcoin Core interpreter.cpp:108-171.
+   Input format: 0x30 total_len 0x02 R_len R 0x02 S_len S hashtype
+   Minimum 9 bytes, maximum 73 bytes.
+   ============================================================================ *)
+
+(* Canonical valid minimal signature: R=1 byte, S=1 byte, HT=SIGHASH_ALL *)
+(* 0x30 0x06 0x02 0x01 0x01 0x02 0x01 0x01 0x01 *)
+let valid_minimal_der = "3006020101020101" ^ "01"
+
+(* Canonical valid maximal-ish signature: R=33 bytes, S=1 byte *)
+let make_der_sig ?(ht=0x01) r_hex s_hex =
+  let r_len = String.length r_hex / 2 in
+  let s_len = String.length s_hex / 2 in
+  let total = r_len + s_len + 4 in  (* 02 R_len R 02 S_len S *)
+  Printf.sprintf "30%02x02%02x%s02%02x%s%02x"
+    total r_len r_hex s_len s_hex ht
+
+(* Gate 1: minimum length < 9 → false *)
+let test_der_too_short () =
+  (* 8-byte sig: 30 05 02 01 01 02 01 01 — missing hashtype *)
+  let sig_bytes = hex_to_cstruct "3005020101020101" in
+  Alcotest.(check bool) "8-byte sig too short" false
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* Gate 2: maximum length > 73 → false.
+   Build a 74-byte sig: R=34 bytes (leading 0x00 + 33 zero bytes),
+   S=1 byte.  Outer: 30 <total> 02 22 <R[34]> 02 01 <S[1]> <HT>
+   total = 34+1+4 = 39; sig = 2+39+1 = 42 bytes — NOT 74.
+   To reach 74: R=33, S=33.  total=70; sig=2+70+1=73 — exactly valid!
+   For 74: R=34, S=33.  total=71; sig=2+71+1=74. *)
+let test_der_too_long () =
+  let r34 = String.make (34 * 2) '1' in  (* 34 bytes, no high bit *)
+  let s33 = String.make (33 * 2) '1' in  (* 33 bytes, no high bit *)
+  let total = 34 + 33 + 4 in             (* 71 *)
+  let sig_hex = Printf.sprintf "30%02x02%02x%s02%02x%s01"
+    total 34 r34 33 s33 in
+  let sig_bytes = hex_to_cstruct sig_hex in
+  Alcotest.(check bool) "74-byte sig too long" false
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* Gate 3: first byte != 0x30 → false.
+   31 06 02 01 01 02 01 01 01 — compound tag 0x31 instead of 0x30, 9 bytes *)
+let test_der_wrong_compound_tag () =
+  let sig_bytes = hex_to_cstruct "310602010102010101" in
+  Alcotest.(check bool) "wrong compound tag 0x31" false
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* Gate 4: total-length byte wrong → false.
+   30 05 02 01 01 02 01 01 01: total_len=5, sig.size()=9, 9-3=6 ≠ 5 → false *)
+let test_der_wrong_total_length () =
+  let sig_bytes = hex_to_cstruct "300502010102010101" in
+  Alcotest.(check bool) "wrong total-length field" false
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* Gate 5: R integer tag sig[2] != 0x02 → false.
+   30 06 03 01 01 02 01 01 01 — R tag is 0x03 instead of 0x02 *)
+let test_der_wrong_r_tag () =
+  let sig_bytes = hex_to_cstruct "300603010102010101" in
+  Alcotest.(check bool) "wrong R tag 0x03" false
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* Gate 6: lenR = 0 → false.
+   30 05 02 00 02 01 01 01 — R length is 0 (needs hashtype for 9 bytes total) *)
+let test_der_zero_r_length () =
+  (* 30 05 02 00 02 01 01 01 = 8 bytes, too short.  Need total_len consistent:
+     30 04 02 00 02 01 01 01 = 8 bytes, len<9 → fails length gate first.
+     Use a slightly bigger sig: 30 06 02 00 XX 02 01 01 01 where XX is padding. *)
+  (* Simplest: build 30 05 02 00 02 01 01 HT.  len=8 <9 → fails length. *)
+  (* For gate 6 specifically: need sig.size()>=9 and total-len field OK but lenR=0.
+     sig: 30 06 02 00 02 01 01 XX 01 — wait: total_len=6, sig.size()=9, 9-3=6 ok.
+     But lenR=0 → gate 6 fires.  sig[4]=0x02 (S tag) and lenS byte at sig[5]=0x01.
+     lenR+lenS+7 = 0+1+7=8 ≠ 9 → gate 10 fires first.
+     Build with consistent lengths: R=0, S=3: 30 07 02 00 02 03 aa bb cc 01
+     total=7, sig.size()=10, 10-3=7 ok; lenR=0 → gate 6.  *)
+  let sig_bytes = hex_to_cstruct "300702000203aabbcc01" in
+  Alcotest.(check bool) "zero R length" false
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* Gate 7: 5+lenR >= sig.size() — R overflows sig → false.
+   30 06 02 05 01 02 01 01 01 — lenR=5 but only 1 byte of R follows; 5+5=10 >= 9 *)
+let test_der_r_overflow () =
+  (* sig = 30 06 02 05 01 02 01 01 01: 9 bytes, total_len=6 ok; lenR=5; 5+5=10>=9 → false *)
+  let sig_bytes = hex_to_cstruct "300602050102010101" in
+  Alcotest.(check bool) "R overflows sig" false
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* Gate 8: S integer tag != 0x02 → false.
+   Build a structurally consistent sig but with S tag = 0x03.
+   R=1 byte, S=1 byte, S_tag=0x03: 30 06 02 01 01 03 01 01 01 *)
+let test_der_wrong_s_tag () =
+  let sig_bytes = hex_to_cstruct "300602010103010101" in
+  Alcotest.(check bool) "wrong S tag 0x03" false
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* Gate 9: lenS = 0 → false.
+   30 06 02 01 01 02 00 XX 01 — lenS=0, consistent total.
+   lenR=1, lenS=0: lenR+lenS+7=8 ≠ 9 → gate 10 fires.
+   Need lenR+lenS+7 = sig.size(): lenR=1, lenS=0, 7+1+0=8 → sig.size()=8 < 9.
+   Use lenR=2, lenS=0: 7+2+0=9 → sig.size()=9.
+   30 07 02 02 01 02 02 00 01: total_len=7, sig.size()=9?
+   Wait: 30 total_len 02 02 R[2] 02 00 hashtype = 1+1+1+1+2+1+1+1 = 9 bytes ✓
+   total_len = sig.size()-3 = 6, not 7 → mismatch. Fix: total_len=6.
+   30 06 02 02 01 01 02 00 01: 1+1+1+1+2+1+1+1=9 bytes, total_len=6=9-3 ✓
+   lenR=2, lenS=0; 5+lenR=7; 7<9 ✓; S_tag at sig[4+2]=sig[6]=0x02 ✓; lenS=0 → gate 9 *)
+let test_der_zero_s_length () =
+  let sig_bytes = hex_to_cstruct "300602020101020001" in
+  Alcotest.(check bool) "zero S length" false
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* Gate 10: total length mismatch lenR+lenS+7 != sig.size() → false.
+   Build a sig where the lengths are individually OK but don't sum correctly.
+   R=1, S=1 → should be 9 bytes.  Append an extra byte to make it 10. *)
+let test_der_total_mismatch () =
+  (* 30 07 02 01 01 02 01 01 XX 01: 10 bytes, total_len=7=10-3 ✓;
+     lenR=1, lenS=1; lenR+lenS+7=9 ≠ 10 → gate 10 *)
+  let sig_bytes = hex_to_cstruct "3007020101020101ff01" in
+  Alcotest.(check bool) "total length mismatch" false
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* Gate 11: R negative (high bit set on first R byte) → false.
+   30 06 02 01 80 02 01 01 01 — R[0] = 0x80 *)
+let test_der_r_negative () =
+  let sig_bytes = hex_to_cstruct "300602018002010101" in
+  Alcotest.(check bool) "R is negative (high bit)" false
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* Gate 12: R excessively padded (leading 0x00 when next byte < 0x80) → false.
+   30 07 02 02 00 01 02 01 01 01 — R = [00 01], unnecessary leading zero.
+   10 bytes: total_len=7=10-3 ✓, lenR=2, lenS=1, lenR+lenS+7=10 ✓ *)
+let test_der_r_excess_zero () =
+  let sig_bytes = hex_to_cstruct "30070202000102010101" in
+  Alcotest.(check bool) "R excess leading zero" false
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* Gate 13: R with valid leading zero (next byte >= 0x80) → true.
+   30 07 02 02 00 80 02 01 01 01 — R = [00 80], required leading zero *)
+let test_der_r_valid_leading_zero () =
+  let sig_bytes = hex_to_cstruct "30070202008002010101" in
+  Alcotest.(check bool) "R valid leading zero (next byte high)" true
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* Gate 14: S negative → false.
+   30 06 02 01 01 02 01 80 01 — S[0] = 0x80 *)
+let test_der_s_negative () =
+  let sig_bytes = hex_to_cstruct "300602010102018001" in
+  Alcotest.(check bool) "S is negative (high bit)" false
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* Gate 15: S excessively padded → false.
+   30 07 02 01 01 02 02 00 01 01 — S = [00 01], unnecessary leading zero.
+   10 bytes: total_len=7=10-3 ✓, lenR=1, lenS=2, lenR+lenS+7=10 ✓ *)
+let test_der_s_excess_zero () =
+  let sig_bytes = hex_to_cstruct "30070201010202000101" in
+  Alcotest.(check bool) "S excess leading zero" false
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* Gate 16: S with valid leading zero → true.
+   30 07 02 01 01 02 02 00 80 01 — S = [00 80], required leading zero *)
+let test_der_s_valid_leading_zero () =
+  let sig_bytes = hex_to_cstruct "30070201010202008001" in
+  Alcotest.(check bool) "S valid leading zero" true
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* Valid minimal DER signature *)
+let test_der_valid_minimal () =
+  let sig_bytes = hex_to_cstruct valid_minimal_der in
+  Alcotest.(check bool) "valid minimal DER sig" true
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* Valid signature with SIGHASH_ANYONECANPAY | SIGHASH_ALL = 0x81 *)
+let test_der_valid_anyonecanpay () =
+  let sig_bytes = hex_to_cstruct (make_der_sig ~ht:0x81 "01" "01") in
+  Alcotest.(check bool) "valid DER sig ANYONECANPAY" true
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* SIGHASH_NONE = 0x02 *)
+let test_der_valid_sighash_none () =
+  let sig_bytes = hex_to_cstruct (make_der_sig ~ht:0x02 "01" "01") in
+  Alcotest.(check bool) "valid DER sig SIGHASH_NONE" true
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* SIGHASH_SINGLE = 0x03 *)
+let test_der_valid_sighash_single () =
+  let sig_bytes = hex_to_cstruct (make_der_sig ~ht:0x03 "01" "01") in
+  Alcotest.(check bool) "valid DER sig SIGHASH_SINGLE" true
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* Hashtype 0x00 is not valid per STRICTENC (tested separately in script tests)
+   but is_valid_signature_encoding does NOT check hashtype — only structure.
+   So 0x00 hashtype is structurally valid. *)
+let test_der_hashtype_zero_structurally_valid () =
+  let sig_bytes = hex_to_cstruct (make_der_sig ~ht:0x00 "01" "01") in
+  Alcotest.(check bool) "hashtype 0x00 structurally valid (encoding check only)" true
+    (Crypto.is_valid_signature_encoding sig_bytes)
+
+(* ============================================================================
+   is_defined_hash_type tests
+   Tests the is_defined_hash_type predicate in script.ml.
+   Valid types (after stripping ANYONECANPAY bit): 0x01 ALL, 0x02 NONE, 0x03 SINGLE.
+   ============================================================================ *)
+
+let test_defined_hashtype_all () =
+  Alcotest.(check bool) "SIGHASH_ALL (0x01) is defined" true
+    (Script.is_defined_hash_type 0x01)
+
+let test_defined_hashtype_none () =
+  Alcotest.(check bool) "SIGHASH_NONE (0x02) is defined" true
+    (Script.is_defined_hash_type 0x02)
+
+let test_defined_hashtype_single () =
+  Alcotest.(check bool) "SIGHASH_SINGLE (0x03) is defined" true
+    (Script.is_defined_hash_type 0x03)
+
+let test_defined_hashtype_anyonecanpay_all () =
+  Alcotest.(check bool) "ANYONECANPAY|ALL (0x81) is defined" true
+    (Script.is_defined_hash_type 0x81)
+
+let test_defined_hashtype_anyonecanpay_none () =
+  Alcotest.(check bool) "ANYONECANPAY|NONE (0x82) is defined" true
+    (Script.is_defined_hash_type 0x82)
+
+let test_defined_hashtype_anyonecanpay_single () =
+  Alcotest.(check bool) "ANYONECANPAY|SINGLE (0x83) is defined" true
+    (Script.is_defined_hash_type 0x83)
+
+let test_defined_hashtype_zero_invalid () =
+  Alcotest.(check bool) "0x00 is not a defined hashtype" false
+    (Script.is_defined_hash_type 0x00)
+
+let test_defined_hashtype_four_invalid () =
+  Alcotest.(check bool) "0x04 is not a defined hashtype" false
+    (Script.is_defined_hash_type 0x04)
+
+let test_defined_hashtype_anyonecanpay_zero_invalid () =
+  Alcotest.(check bool) "ANYONECANPAY|0x00 (0x80) is not defined" false
+    (Script.is_defined_hash_type 0x80)
+
+let test_defined_hashtype_anyonecanpay_four_invalid () =
+  Alcotest.(check bool) "ANYONECANPAY|0x04 (0x84) is not defined" false
+    (Script.is_defined_hash_type 0x84)
+
+let bip66_der_tests = [
+  Alcotest.test_case "too short (8 bytes)" `Quick test_der_too_short;
+  Alcotest.test_case "too long (74 bytes)" `Quick test_der_too_long;
+  Alcotest.test_case "wrong compound tag 0x31" `Quick test_der_wrong_compound_tag;
+  Alcotest.test_case "wrong total-length field" `Quick test_der_wrong_total_length;
+  Alcotest.test_case "wrong R integer tag 0x03" `Quick test_der_wrong_r_tag;
+  Alcotest.test_case "zero R length" `Quick test_der_zero_r_length;
+  Alcotest.test_case "R overflows sig" `Quick test_der_r_overflow;
+  Alcotest.test_case "wrong S integer tag 0x03" `Quick test_der_wrong_s_tag;
+  Alcotest.test_case "zero S length" `Quick test_der_zero_s_length;
+  Alcotest.test_case "total length mismatch" `Quick test_der_total_mismatch;
+  Alcotest.test_case "R negative (high bit)" `Quick test_der_r_negative;
+  Alcotest.test_case "R excess leading zero" `Quick test_der_r_excess_zero;
+  Alcotest.test_case "R valid leading zero" `Quick test_der_r_valid_leading_zero;
+  Alcotest.test_case "S negative (high bit)" `Quick test_der_s_negative;
+  Alcotest.test_case "S excess leading zero" `Quick test_der_s_excess_zero;
+  Alcotest.test_case "S valid leading zero" `Quick test_der_s_valid_leading_zero;
+  Alcotest.test_case "valid minimal (R=1, S=1)" `Quick test_der_valid_minimal;
+  Alcotest.test_case "valid ANYONECANPAY|ALL" `Quick test_der_valid_anyonecanpay;
+  Alcotest.test_case "valid SIGHASH_NONE" `Quick test_der_valid_sighash_none;
+  Alcotest.test_case "valid SIGHASH_SINGLE" `Quick test_der_valid_sighash_single;
+  Alcotest.test_case "hashtype 0x00 structurally valid" `Quick test_der_hashtype_zero_structurally_valid;
+]
+
+let defined_hashtype_tests = [
+  Alcotest.test_case "SIGHASH_ALL defined" `Quick test_defined_hashtype_all;
+  Alcotest.test_case "SIGHASH_NONE defined" `Quick test_defined_hashtype_none;
+  Alcotest.test_case "SIGHASH_SINGLE defined" `Quick test_defined_hashtype_single;
+  Alcotest.test_case "ANYONECANPAY|ALL defined" `Quick test_defined_hashtype_anyonecanpay_all;
+  Alcotest.test_case "ANYONECANPAY|NONE defined" `Quick test_defined_hashtype_anyonecanpay_none;
+  Alcotest.test_case "ANYONECANPAY|SINGLE defined" `Quick test_defined_hashtype_anyonecanpay_single;
+  Alcotest.test_case "0x00 not defined" `Quick test_defined_hashtype_zero_invalid;
+  Alcotest.test_case "0x04 not defined" `Quick test_defined_hashtype_four_invalid;
+  Alcotest.test_case "0x80 not defined" `Quick test_defined_hashtype_anyonecanpay_zero_invalid;
+  Alcotest.test_case "0x84 not defined" `Quick test_defined_hashtype_anyonecanpay_four_invalid;
+]
+
 let () = Alcotest.run "test_crypto" [
   ("sha256", sha256_tests);
   ("hash160", hash160_tests);
@@ -367,4 +647,6 @@ let () = Alcotest.run "test_crypto" [
   ("genesis", genesis_tests);
   ("property", qcheck_tests);
   ("hardware_accel", hardware_accel_tests);
+  ("bip66_der_encoding", bip66_der_tests);
+  ("defined_hashtype", defined_hashtype_tests);
 ]

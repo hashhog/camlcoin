@@ -647,6 +647,293 @@ let test_bip157_persistence () =
   cleanup_bip157 ()
 
 (* ============================================================================
+   BIP-158 Official Test Vectors
+
+   These vectors are from Bitcoin Core's test/data/blockfilters.json and
+   the BIP-158 reference implementation.  Each entry specifies a raw block
+   (hex), a list of previous-output scriptPubKeys spent in the block (hex),
+   the expected basic filter (hex), and the expected filter header (hex).
+
+   The filters and headers are compared byte-for-byte so any deviation in:
+     - SipHash key derivation (filter_key_of_block_hash)
+     - FastRange64 mapping
+     - Golomb-Rice encode/decode
+     - OP_RETURN / empty-script exclusion rules
+     - SHA256d chain for filter_hash + filter_header
+   will cause a test failure.
+   ============================================================================ *)
+
+(** Decode a hex string to a raw byte string *)
+let hex_decode (s : string) : string =
+  let n = String.length s in
+  assert (n mod 2 = 0);
+  Bytes.init (n / 2) (fun i ->
+    Char.chr (int_of_string ("0x" ^ String.sub s (i * 2) 2))
+  ) |> Bytes.to_string
+
+(** Encode bytes to lowercase hex *)
+let hex_encode (s : string) : string =
+  let buf = Buffer.create (String.length s * 2) in
+  String.iter (fun c ->
+    Buffer.add_string buf (Printf.sprintf "%02x" (Char.code c))
+  ) s;
+  Buffer.contents buf
+
+(** Build a block_filter from a raw block hex + list of spent scriptPubKey hexes.
+    The block is deserialized from its wire format; each prev_script_hex is a
+    hex-encoded scriptPubKey of a spent output.  This mirrors Bitcoin Core's
+    BlockFilter(BlockFilterType::BASIC, block, block_undo) constructor. *)
+let build_filter_from_hex (block_hex : string) (prev_script_hexes : string list)
+    : Block_index.block_filter =
+  let raw_block = hex_decode block_hex in
+  let r = Serialize.reader_of_cstruct (Cstruct.of_string raw_block) in
+  let block = Serialize.deserialize_block r in
+  let spent_scripts = List.map (fun h ->
+    Cstruct.of_string (hex_decode h)
+  ) prev_script_hexes in
+  Block_index.build_basic_filter_from_scripts block spent_scripts
+
+(** Compute the filter header given a filter and a previous header hex string. *)
+let compute_header_from_hex (bf : Block_index.block_filter) (prev_hex : string)
+    : string =
+  let prev_bytes = hex_decode prev_hex in
+  (* prev_hex is in "display" order (reversed) — convert to internal byte order *)
+  let prev_len = String.length prev_bytes in
+  assert (prev_len = 32);
+  let prev_internal = Cstruct.create 32 in
+  for i = 0 to 31 do
+    Cstruct.set_uint8 prev_internal i
+      (Char.code (String.get prev_bytes (31 - i)))
+  done;
+  let header = Block_index.compute_filter_header bf prev_internal in
+  (* Return in display order (reversed) *)
+  let buf = Buffer.create 64 in
+  for i = 31 downto 0 do
+    Buffer.add_string buf (Printf.sprintf "%02x" (Cstruct.get_uint8 header i))
+  done;
+  Buffer.contents buf
+
+(* BIP-158 test vector: block height 0 (testnet genesis block).
+   Reference: bitcoin-core/src/test/data/blockfilters.json row 1.
+   Expected basic filter bytes: 019dfca8
+   Expected basic header: 21584579b7eb08997773e5aeff3a7f932700042d0ed2a6129012b7d7ae81b750 *)
+let test_bip158_vector_genesis () =
+  let block_hex = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4adae5494dffff001d1aa4ae180101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000" in
+  let prev_scripts = [] in
+  let prev_header_hex =
+    "0000000000000000000000000000000000000000000000000000000000000000" in
+  let expected_filter_hex = "019dfca8" in
+  let expected_header_hex =
+    "21584579b7eb08997773e5aeff3a7f932700042d0ed2a6129012b7d7ae81b750" in
+
+  let bf = build_filter_from_hex block_hex prev_scripts in
+  let actual_filter_hex = hex_encode bf.Block_index.filter.Block_index.encoded in
+  Alcotest.(check string) "genesis filter bytes" expected_filter_hex actual_filter_hex;
+
+  let actual_header_hex = compute_header_from_hex bf prev_header_hex in
+  Alcotest.(check string) "genesis filter header" expected_header_hex actual_header_hex
+
+(* BIP-158 test vector: block height 2 (testnet).
+   Reference: bitcoin-core/src/test/data/blockfilters.json row 2.
+   Expected basic filter: 0174a170
+   Expected basic header: 186afd11ef2b5e7e3504f2e8cbf8df28a1fd251fe53d60dff8b1467d1b386cf0 *)
+let test_bip158_vector_height2 () =
+  let block_hex = "0100000006128e87be8b1b4dea47a7247d5528d2702c96826c7a648497e773b800000000e241352e3bec0a95a6217e10c3abb54adfa05abb12c126695595580fb92e222032e7494dffff001d00d235340101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0e0432e7494d010e062f503253482fffffffff0100f2052a010000002321038a7f6ef1c8ca0c588aa53fa860128077c9e6c11e6830f4d7ee4e763a56b7718fac00000000" in
+  let prev_scripts = [] in
+  let prev_header_hex =
+    "d7bdac13a59d745b1add0d2ce852f1a0442e8945fc1bf3848d3cbffd88c24fe1" in
+  let expected_filter_hex = "0174a170" in
+  let expected_header_hex =
+    "186afd11ef2b5e7e3504f2e8cbf8df28a1fd251fe53d60dff8b1467d1b386cf0" in
+
+  let bf = build_filter_from_hex block_hex prev_scripts in
+  let actual_filter_hex = hex_encode bf.Block_index.filter.Block_index.encoded in
+  Alcotest.(check string) "height-2 filter bytes" expected_filter_hex actual_filter_hex;
+
+  let actual_header_hex = compute_header_from_hex bf prev_header_hex in
+  Alcotest.(check string) "height-2 filter header" expected_header_hex actual_header_hex
+
+(* BIP-158 test vector: block height 3 (testnet).
+   Reference: bitcoin-core/src/test/data/blockfilters.json row 3.
+   Expected basic filter: 016cf7a0
+   Expected basic header: 8d63aadf5ab7257cb6d2316a57b16f517bff1c6388f124ec4c04af1212729d2a *)
+let test_bip158_vector_height3 () =
+  let block_hex = "0100000020782a005255b657696ea057d5b98f34defcf75196f64f6eeac8026c0000000041ba5afc532aae03151b8aa87b65e1594f97504a768e010c98c0add79216247186e7494dffff001d058dc2b60101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0e0486e7494d0151062f503253482fffffffff0100f2052a01000000232103f6d9ff4c12959445ca5549c811683bf9c88e637b222dd2e0311154c4c85cf423ac00000000" in
+  let prev_scripts = [] in
+  let prev_header_hex =
+    "186afd11ef2b5e7e3504f2e8cbf8df28a1fd251fe53d60dff8b1467d1b386cf0" in
+  let expected_filter_hex = "016cf7a0" in
+  let expected_header_hex =
+    "8d63aadf5ab7257cb6d2316a57b16f517bff1c6388f124ec4c04af1212729d2a" in
+
+  let bf = build_filter_from_hex block_hex prev_scripts in
+  let actual_filter_hex = hex_encode bf.Block_index.filter.Block_index.encoded in
+  Alcotest.(check string) "height-3 filter bytes" expected_filter_hex actual_filter_hex;
+
+  let actual_header_hex = compute_header_from_hex bf prev_header_hex in
+  Alcotest.(check string) "height-3 filter header" expected_header_hex actual_header_hex
+
+(* BIP-158 test vector: block with empty data (height 1414221).
+   Reference: last entry in blockfilters.json.
+   Coinbase-only block, no outputs, expected filter: 00  (N=0)
+   Expected basic header: 021e8882ef5a0ed932edeebbecfeda1d7ce528ec7b3daa27641acf1189d7b5dc *)
+let test_bip158_vector_empty_filter () =
+  (* This block has only a coinbase with an un-parseable output (empty value=0 script=empty).
+     The coinbase output scriptPubKey is empty (len=0), so it is excluded.
+     Expected filter: 00  (N=0, compact size 0) *)
+  let block_hex = "000000204ea88307a7959d8207968f152bedca5a93aefab253f1fb2cfb032a400000000070cebb14ec6dbc27a9dfd066d9849a4d3bac5f674665f73a5fe1de01a022a0c851fda85bf05f4c19a779d1450102000000010000000000000000000000000000000000000000000000000000000000000000ffffffff18034d94154d696e6572476174653030310d000000f238f401ffffffff01c817a804000000000000000000" in
+  let prev_scripts = [] in
+  let prev_header_hex =
+    "5e5e12d90693c8e936f01847859404c67482439681928353ca1296982042864e" in
+  let expected_filter_hex = "00" in
+  let expected_header_hex =
+    "021e8882ef5a0ed932edeebbecfeda1d7ce528ec7b3daa27641acf1189d7b5dc" in
+
+  let bf = build_filter_from_hex block_hex prev_scripts in
+  let actual_filter_hex = hex_encode bf.Block_index.filter.Block_index.encoded in
+  Alcotest.(check string) "empty-filter block filter bytes" expected_filter_hex actual_filter_hex;
+
+  let actual_header_hex = compute_header_from_hex bf prev_header_hex in
+  Alcotest.(check string) "empty-filter block filter header" expected_header_hex actual_header_hex
+
+(* ============================================================================
+   SipHash-2-4 official test vector (RFC / siphash.net reference).
+   Key: 00 01 02 03 04 05 06 07 | 08 09 0a 0b 0c 0d 0e 0f
+   Input: 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e
+   Expected output: 0xa129ca6149be45e5 (little-endian: e5 45 be 49 61 ca 29 a1)
+   ============================================================================ *)
+let test_siphash_reference_vector () =
+  let k0 = 0x0706050403020100L in
+  let k1 = 0x0f0e0d0c0b0a0908L in
+  (* 15 bytes: 0x00..0x0e *)
+  let data =
+    "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e"
+  in
+  let result = Block_index.SipHash.siphash24 ~k0 ~k1 data in
+  (* SipHash-2-4 reference output for this input: 0xa129ca6149be45e5 *)
+  let expected = 0xa129ca6149be45e5L in
+  Alcotest.(check bool) "siphash reference vector"
+    true (Int64.equal result expected)
+
+(* ============================================================================
+   P2P message serialization round-trip tests for BIP-157 message types.
+   Verifies that getcfilters/cfilter/getcfheaders/cfheaders/
+   getcfcheckpt/cfcheckpt parse correctly through the p2p layer.
+   ============================================================================ *)
+
+let test_p2p_getcfilters_roundtrip () =
+  let stop_hash = Types.hash256_of_hex
+    "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943" in
+  let msg = P2p.GetcfiltersMsg {
+    filter_type = 0;
+    start_height = 0l;
+    stop_hash;
+  } in
+  let serialized = P2p.serialize_message 0xd9b4bef9l msg in
+  let deserialized = P2p.deserialize_message serialized in
+  match deserialized.P2p.payload with
+  | P2p.GetcfiltersMsg { filter_type; start_height; stop_hash = sh } ->
+    Alcotest.(check int) "filter_type" 0 filter_type;
+    Alcotest.(check int32) "start_height" 0l start_height;
+    Alcotest.(check string) "stop_hash"
+      (Cstruct.to_string stop_hash) (Cstruct.to_string sh)
+  | _ -> Alcotest.fail "expected GetcfiltersMsg"
+
+let test_p2p_cfilter_roundtrip () =
+  let block_hash = Types.hash256_of_hex
+    "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943" in
+  let filter_data = Cstruct.of_string (hex_decode "019dfca8") in
+  let msg = P2p.CfilterMsg {
+    filter_type = 0;
+    block_hash;
+    filter_data;
+  } in
+  let serialized = P2p.serialize_message 0xd9b4bef9l msg in
+  let deserialized = P2p.deserialize_message serialized in
+  match deserialized.P2p.payload with
+  | P2p.CfilterMsg { filter_type; filter_data = fd; _ } ->
+    Alcotest.(check int) "filter_type" 0 filter_type;
+    Alcotest.(check string) "filter_data"
+      (Cstruct.to_string filter_data) (Cstruct.to_string fd)
+  | _ -> Alcotest.fail "expected CfilterMsg"
+
+let test_p2p_getcfheaders_roundtrip () =
+  let stop_hash = Types.hash256_of_hex
+    "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943" in
+  let msg = P2p.GetcfheadersMsg {
+    filter_type = 0;
+    start_height = 100l;
+    stop_hash;
+  } in
+  let serialized = P2p.serialize_message 0xd9b4bef9l msg in
+  let deserialized = P2p.deserialize_message serialized in
+  match deserialized.P2p.payload with
+  | P2p.GetcfheadersMsg { filter_type; start_height; stop_hash = sh } ->
+    Alcotest.(check int) "filter_type" 0 filter_type;
+    Alcotest.(check int32) "start_height" 100l start_height;
+    Alcotest.(check string) "stop_hash"
+      (Cstruct.to_string stop_hash) (Cstruct.to_string sh)
+  | _ -> Alcotest.fail "expected GetcfheadersMsg"
+
+let test_p2p_cfheaders_roundtrip () =
+  let stop_hash = Types.hash256_of_hex
+    "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943" in
+  let prev_fh = Types.zero_hash in
+  let fh1 = Types.hash256_of_hex
+    "21584579b7eb08997773e5aeff3a7f932700042d0ed2a6129012b7d7ae81b750" in
+  let msg = P2p.CfheadersMsg {
+    filter_type = 0;
+    stop_hash;
+    prev_filter_header = prev_fh;
+    filter_hashes = [fh1];
+  } in
+  let serialized = P2p.serialize_message 0xd9b4bef9l msg in
+  let deserialized = P2p.deserialize_message serialized in
+  match deserialized.P2p.payload with
+  | P2p.CfheadersMsg { filter_type; filter_hashes; _ } ->
+    Alcotest.(check int) "filter_type" 0 filter_type;
+    Alcotest.(check int) "filter_hashes count" 1 (List.length filter_hashes);
+    Alcotest.(check string) "filter_hash[0]"
+      (Cstruct.to_string fh1) (Cstruct.to_string (List.nth filter_hashes 0))
+  | _ -> Alcotest.fail "expected CfheadersMsg"
+
+let test_p2p_getcfcheckpt_roundtrip () =
+  let stop_hash = Types.hash256_of_hex
+    "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943" in
+  let msg = P2p.GetcfcheckptMsg {
+    filter_type = 0;
+    stop_hash;
+  } in
+  let serialized = P2p.serialize_message 0xd9b4bef9l msg in
+  let deserialized = P2p.deserialize_message serialized in
+  match deserialized.P2p.payload with
+  | P2p.GetcfcheckptMsg { filter_type; stop_hash = sh } ->
+    Alcotest.(check int) "filter_type" 0 filter_type;
+    Alcotest.(check string) "stop_hash"
+      (Cstruct.to_string stop_hash) (Cstruct.to_string sh)
+  | _ -> Alcotest.fail "expected GetcfcheckptMsg"
+
+let test_p2p_cfcheckpt_roundtrip () =
+  let stop_hash = Types.hash256_of_hex
+    "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943" in
+  let fh1 = Types.hash256_of_hex
+    "21584579b7eb08997773e5aeff3a7f932700042d0ed2a6129012b7d7ae81b750" in
+  let msg = P2p.CfcheckptMsg {
+    filter_type = 0;
+    stop_hash;
+    filter_headers = [fh1];
+  } in
+  let serialized = P2p.serialize_message 0xd9b4bef9l msg in
+  let deserialized = P2p.deserialize_message serialized in
+  match deserialized.P2p.payload with
+  | P2p.CfcheckptMsg { filter_type; filter_headers; _ } ->
+    Alcotest.(check int) "filter_type" 0 filter_type;
+    Alcotest.(check int) "filter_headers count" 1 (List.length filter_headers);
+    Alcotest.(check string) "filter_headers[0]"
+      (Cstruct.to_string fh1) (Cstruct.to_string (List.nth filter_headers 0))
+  | _ -> Alcotest.fail "expected CfcheckptMsg"
+
+(* ============================================================================
    Test Suite
    ============================================================================ *)
 
@@ -659,6 +946,7 @@ let () =
       test_case "empty input" `Quick test_siphash_empty;
       test_case "deterministic" `Quick test_siphash_deterministic;
       test_case "different keys" `Quick test_siphash_different_keys;
+      test_case "reference vector" `Quick test_siphash_reference_vector;
     ];
     "golomb_rice", [
       test_case "roundtrip" `Quick test_golomb_rice_roundtrip;
@@ -678,6 +966,20 @@ let () =
       test_case "excludes OP_RETURN" `Quick test_block_filter_excludes_op_return;
       test_case "with undo data" `Quick test_block_filter_with_undo_data;
       test_case "hash and header" `Quick test_filter_hash_and_header;
+    ];
+    "bip158_vectors", [
+      test_case "genesis block (height 0)" `Quick test_bip158_vector_genesis;
+      test_case "height 2" `Quick test_bip158_vector_height2;
+      test_case "height 3" `Quick test_bip158_vector_height3;
+      test_case "empty filter (height 1414221)" `Quick test_bip158_vector_empty_filter;
+    ];
+    "p2p_bip157_messages", [
+      test_case "getcfilters roundtrip" `Quick test_p2p_getcfilters_roundtrip;
+      test_case "cfilter roundtrip" `Quick test_p2p_cfilter_roundtrip;
+      test_case "getcfheaders roundtrip" `Quick test_p2p_getcfheaders_roundtrip;
+      test_case "cfheaders roundtrip" `Quick test_p2p_cfheaders_roundtrip;
+      test_case "getcfcheckpt roundtrip" `Quick test_p2p_getcfcheckpt_roundtrip;
+      test_case "cfcheckpt roundtrip" `Quick test_p2p_cfcheckpt_roundtrip;
     ];
     "filter_index", [
       test_case "create" `Quick test_filter_index_create;

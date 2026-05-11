@@ -274,6 +274,13 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
            past the active chain; stops gracefully on missing block
            bodies (pruned datadirs). *)
         let _ = Sync.backfill_bip157_index chain in
+        (* Advertise NODE_COMPACT_FILTERS (bit 6) so peers know we can
+           serve getcfilters/getcfheaders/getcfcheckpt.  Mirrors Bitcoin
+           Core's init.cpp: NODE_COMPACT_FILTERS is ORed into
+           GetLocalServices() iff blockfilterindex is enabled. *)
+        Peer.enable_compact_filters ();
+        Logs.info (fun m ->
+          m "BIP-157: NODE_COMPACT_FILTERS enabled (blockfilterindex=basic)");
         Some idx
       with exn ->
         Logs.err (fun m ->
@@ -748,6 +755,149 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
           Lwt.return_unit
       end else
         Lwt.return_unit
+    | _ -> Lwt.return_unit);
+
+  (* BIP-157 compact filter request handler.
+     Serves getcfilters / getcfheaders / getcfcheckpt when
+     --blockfilterindex=basic is active.  When the index is absent,
+     these messages are silently dropped (same as Bitcoin Core when the
+     index is disabled: PrepareBlockFilterRequest returns false and the
+     function returns early).
+
+     Core constants (net_processing.cpp):
+       MAX_GETCFILTERS_SIZE  = 1000
+       MAX_GETCFHEADERS_SIZE = 2000
+       CFCHECKPT_INTERVAL    = 1000                                        *)
+  let max_getcfilters_size = 1000 in
+  let max_getcfheaders_size = 2000 in
+  let cfcheckpt_interval = 1000 in
+  Peer_manager.add_listener peer_manager (fun msg peer ->
+    match msg, bip157_index with
+    | P2p.GetcfiltersMsg { filter_type = 0; start_height; stop_hash }, Some idx ->
+      (* BIP-157 §getcfilters: send one cfilter per height in [start, stop] *)
+      let start_h = Int32.to_int start_height in
+      (* Resolve stop_hash to a height using the chain header table *)
+      (match Sync.lookup_block_height chain stop_hash with
+       | None ->
+         Logs.debug (fun m ->
+           m "BIP-157 getcfilters: unknown stop_hash %s"
+             (Types.hash256_to_hex_display stop_hash))
+       | Some stop_h ->
+         if start_h > stop_h then ()
+         else if stop_h - start_h >= max_getcfilters_size then begin
+           Logs.debug (fun m ->
+             m "BIP-157 getcfilters: range %d too large (%d max)"
+               (stop_h - start_h + 1) max_getcfilters_size);
+         end else begin
+           (* Walk height range, send one cfilter per block *)
+           let all_ok = ref true in
+           let h = ref start_h in
+           while !h <= stop_h && !all_ok do
+             (match Block_index.read_filter idx.Block_index.filter_idx
+                       (Option.get (Sync.get_header_at_height chain !h)).Sync.hash with
+              | None ->
+                Logs.debug (fun m ->
+                  m "BIP-157 getcfilters: filter missing at height %d" !h);
+                all_ok := false
+              | Some bf ->
+                let filter_cstruct = Cstruct.of_string bf.Block_index.filter.Block_index.encoded in
+                Lwt.async (fun () ->
+                  Peer.send_message peer
+                    (P2p.CfilterMsg {
+                       filter_type = 0;
+                       block_hash = bf.Block_index.block_hash;
+                       filter_data = filter_cstruct;
+                     })));
+             incr h
+           done
+         end);
+      Lwt.return_unit
+    | P2p.GetcfheadersMsg { filter_type = 0; start_height; stop_hash }, Some idx ->
+      (* BIP-157 §getcfheaders: send cfheaders for the range *)
+      let start_h = Int32.to_int start_height in
+      (match Sync.lookup_block_height chain stop_hash with
+       | None ->
+         Logs.debug (fun m ->
+           m "BIP-157 getcfheaders: unknown stop_hash %s"
+             (Types.hash256_to_hex_display stop_hash))
+       | Some stop_h ->
+         if start_h > stop_h then ()
+         else if stop_h - start_h >= max_getcfheaders_size then
+           Logs.debug (fun m ->
+             m "BIP-157 getcfheaders: range %d too large (%d max)"
+               (stop_h - start_h + 1) max_getcfheaders_size)
+         else begin
+           (* Compute prev_filter_header (header at start_h - 1, or zero for genesis) *)
+           let prev_fh =
+             if start_h = 0 then Types.zero_hash
+             else
+               match Sync.get_header_at_height chain (start_h - 1) with
+               | None -> Types.zero_hash
+               | Some e ->
+                 (match Block_index.get_filter_header idx.Block_index.filter_idx e.Sync.hash with
+                  | Some h -> h
+                  | None -> Types.zero_hash)
+           in
+           (* Collect filter hashes over [start_h..stop_h] *)
+           let hashes = ref [] in
+           let all_ok = ref true in
+           for h = start_h to stop_h do
+             if !all_ok then
+               match Sync.get_header_at_height chain h with
+               | None -> all_ok := false
+               | Some e ->
+                 (match Block_index.get_filter_entry idx.Block_index.filter_idx e.Sync.hash with
+                  | None -> all_ok := false
+                  | Some entry -> hashes := entry.Block_index.filter_hash :: !hashes)
+           done;
+           if !all_ok then begin
+             Lwt.async (fun () ->
+               Peer.send_message peer
+                 (P2p.CfheadersMsg {
+                    filter_type = 0;
+                    stop_hash;
+                    prev_filter_header = prev_fh;
+                    filter_hashes = List.rev !hashes;
+                  }))
+           end
+         end);
+      Lwt.return_unit
+    | P2p.GetcfcheckptMsg { filter_type = 0; stop_hash }, Some idx ->
+      (* BIP-157 §getcfcheckpt: send filter headers at every CFCHECKPT_INTERVAL *)
+      (match Sync.lookup_block_height chain stop_hash with
+       | None ->
+         Logs.debug (fun m ->
+           m "BIP-157 getcfcheckpt: unknown stop_hash %s"
+             (Types.hash256_to_hex_display stop_hash))
+       | Some stop_h ->
+         let n_checkpts = stop_h / cfcheckpt_interval in
+         let headers = ref [] in
+         let all_ok = ref true in
+         for i = 1 to n_checkpts do
+           if !all_ok then begin
+             let height = i * cfcheckpt_interval in
+             match Sync.get_header_at_height chain height with
+             | None -> all_ok := false
+             | Some e ->
+               (match Block_index.get_filter_header idx.Block_index.filter_idx e.Sync.hash with
+                | None -> all_ok := false
+                | Some h -> headers := h :: !headers)
+           end
+         done;
+         if !all_ok then
+           Lwt.async (fun () ->
+             Peer.send_message peer
+               (P2p.CfcheckptMsg {
+                  filter_type = 0;
+                  stop_hash;
+                  filter_headers = List.rev !headers;
+                })));
+      Lwt.return_unit
+    | P2p.GetcfiltersMsg _, None
+    | P2p.GetcfheadersMsg _, None
+    | P2p.GetcfcheckptMsg _, None ->
+      (* Index not enabled; silently ignore, per Core behaviour *)
+      Lwt.return_unit
     | _ -> Lwt.return_unit);
 
   (* Register a listener for blocks received post-IBD (when ibd_state is None).

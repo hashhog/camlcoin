@@ -565,8 +565,10 @@ let test_is_tx_final_height_locktime () =
   (* Not final at height 499 *)
   Alcotest.(check bool) "not final before height" false
     (Validation.is_tx_final tx ~block_height:499 ~block_time:0l);
-  (* Final at height 500 *)
-  Alcotest.(check bool) "final at height" true
+  (* Not final at height 500 — nLockTime=500 is the *last invalid* height;
+     Core IsFinalTx: (int64_t)nLockTime < nBlockHeight → 500 < 500 = false.
+     Bug fixed: was >= (off-by-one), now correctly uses > (strict). *)
+  Alcotest.(check bool) "not final at exact locktime height" false
     (Validation.is_tx_final tx ~block_height:500 ~block_time:0l);
   (* Final after height *)
   Alcotest.(check bool) "final after height" true
@@ -584,9 +586,14 @@ let test_is_tx_final_time_locktime () =
   (* Not final before time *)
   Alcotest.(check bool) "not final before time" false
     (Validation.is_tx_final tx ~block_height:1000000 ~block_time:500_000_099l);
-  (* Final at time *)
-  Alcotest.(check bool) "final at time" true
-    (Validation.is_tx_final tx ~block_height:1000000 ~block_time:500_000_100l)
+  (* Not final at exact time — nLockTime is last invalid timestamp;
+     Core: (int64_t)nLockTime < nBlockTime → 500_000_100 < 500_000_100 = false.
+     Bug fixed: was >= (off-by-one), now correctly uses > (strict). *)
+  Alcotest.(check bool) "not final at exact locktime timestamp" false
+    (Validation.is_tx_final tx ~block_height:1000000 ~block_time:500_000_100l);
+  (* Final one second after locktime *)
+  Alcotest.(check bool) "final one second after locktime" true
+    (Validation.is_tx_final tx ~block_height:1000000 ~block_time:500_000_101l)
 
 (* ============================================================================
    Block Validation Tests

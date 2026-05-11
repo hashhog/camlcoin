@@ -2194,6 +2194,287 @@ let sighash_special_tests = [
 ]
 
 (* ============================================================================
+   BIP-65 OP_CHECKLOCKTIMEVERIFY Gate Tests (W81)
+   Reference: interpreter.cpp:522-558, 1745-1779; script.h:47
+   15 gates: flag, stack, 5-byte, negative, type, comparison, sequence-final
+   ============================================================================ *)
+
+(* Helper: build a tx with a given locktime and input sequence, then run
+   OP_CHECKLOCKTIMEVERIFY (0xb1) with arg pushed on the stack. *)
+let run_cltv ~tx_locktime ~input_seq ~script_arg_bytes ~flags =
+  let input : Types.tx_in = {
+    previous_output = { txid = Types.zero_hash; vout = 0l };
+    script_sig = Cstruct.create 0;
+    sequence = input_seq;
+  } in
+  let tx : Types.transaction = {
+    version = 1l;
+    inputs = [input];
+    outputs = [{ value = 0L; script_pubkey = Cstruct.create 0 }];
+    witnesses = [];
+    locktime = tx_locktime;
+  } in
+  let st = Script.create_eval_state ~tx ~input_index:0 ~amount:0L ~flags
+             ~sig_version:Script.SigVersionBase () in
+  (* Build script: push arg then OP_CHECKLOCKTIMEVERIFY (0xb1) *)
+  let script =
+    let push_len = Cstruct.length script_arg_bytes in
+    if push_len = 0 then
+      (* OP_0 = 0x00, then OP_CLTV = 0xb1 *)
+      hex_to_cstruct "00b1"
+    else begin
+      let buf = Cstruct.create (1 + push_len + 1) in
+      Cstruct.set_uint8 buf 0 push_len;  (* push N bytes *)
+      Cstruct.blit script_arg_bytes 0 buf 1 push_len;
+      Cstruct.set_uint8 buf (1 + push_len) 0xb1;  (* OP_CHECKLOCKTIMEVERIFY *)
+      buf
+    end
+  in
+  Script.eval_script st script
+
+(* Gate 1: CLTV flag disabled → OP_CLTV treated as NOP2, succeeds *)
+(* Reference: interpreter.cpp:524-527 *)
+let test_cltv_nop2_without_flag () =
+  let flags = 0 in
+  let arg = Script.bytes_of_script_num 1000L in  (* any value that would fail if checked *)
+  (* tx_locktime=0 would fail type mismatch if CLTV enforced, but flag not set *)
+  match run_cltv ~tx_locktime:0l ~input_seq:0l ~script_arg_bytes:arg ~flags with
+  | Ok () -> ()
+  | Error e -> Alcotest.fail ("CLTV as NOP2 should succeed: " ^ e)
+
+(* Gate 1: CLTV flag disabled but DISCOURAGE_UPGRADABLE_NOPS set → fail *)
+(* Reference: interpreter.cpp:524-527 (NOP path still subject to discouragement) *)
+let test_cltv_nop2_discourage () =
+  let flags = Script.script_verify_discourage_upgradable_nops in
+  let arg = Script.bytes_of_script_num 100L in
+  match run_cltv ~tx_locktime:0l ~input_seq:0xFFFFFFFFl ~script_arg_bytes:arg ~flags with
+  | Error _ -> ()  (* Expected: discouraged NOP *)
+  | Ok () -> Alcotest.fail "CLTV without flag + DISCOURAGE should fail"
+
+(* Gate 2: empty stack → SCRIPT_ERR_INVALID_STACK_OPERATION *)
+(* Reference: interpreter.cpp:529-530 *)
+let test_cltv_empty_stack () =
+  let flags = Script.script_verify_checklocktimeverify in
+  let tx : Types.transaction = {
+    version = 1l;
+    inputs = [{
+      previous_output = { txid = Types.zero_hash; vout = 0l };
+      script_sig = Cstruct.create 0;
+      sequence = 0l;
+    }];
+    outputs = [{ value = 0L; script_pubkey = Cstruct.create 0 }];
+    witnesses = [];
+    locktime = 1000l;
+  } in
+  let st = Script.create_eval_state ~tx ~input_index:0 ~amount:0L ~flags
+             ~sig_version:Script.SigVersionBase () in
+  (* Only OP_CLTV, no push — empty stack *)
+  let script = hex_to_cstruct "b1" in
+  match Script.eval_script st script with
+  | Error _ -> ()
+  | Ok () -> Alcotest.fail "CLTV with empty stack should fail"
+
+(* Gate 3: argument > 5 bytes → fail (5-byte ScriptNum limit) *)
+(* Reference: interpreter.cpp:546 (CScriptNum with max 5 bytes) *)
+let test_cltv_arg_too_long () =
+  let flags = Script.script_verify_checklocktimeverify in
+  (* 6-byte push would exceed the 5-byte ScriptNum limit *)
+  let tx : Types.transaction = {
+    version = 1l;
+    inputs = [{
+      previous_output = { txid = Types.zero_hash; vout = 0l };
+      script_sig = Cstruct.create 0;
+      sequence = 0l;
+    }];
+    outputs = [{ value = 0L; script_pubkey = Cstruct.create 0 }];
+    witnesses = [];
+    locktime = 0xFFFFFFFFl;
+  } in
+  let st = Script.create_eval_state ~tx ~input_index:0 ~amount:0L ~flags
+             ~sig_version:Script.SigVersionBase () in
+  (* Build script that pushes 6 bytes then CLTV *)
+  let arg6 = Cstruct.create 6 in
+  Cstruct.memset arg6 0x01;
+  let buf = Cstruct.create (1 + 6 + 1) in
+  Cstruct.set_uint8 buf 0 6;
+  Cstruct.blit arg6 0 buf 1 6;
+  Cstruct.set_uint8 buf 7 0xb1;
+  (match Script.eval_script st buf with
+  | Error _ -> ()
+  | Ok () -> Alcotest.fail "CLTV with 6-byte arg should fail")
+
+(* Gate 4: negative locktime arg → SCRIPT_ERR_NEGATIVE_LOCKTIME *)
+(* Reference: interpreter.cpp:551-552 *)
+let test_cltv_negative_arg () =
+  let flags = Script.script_verify_checklocktimeverify in
+  (* Push -1 (0x81 in script num encoding) then CLTV *)
+  let arg = hex_to_cstruct "81" in  (* -1 *)
+  match run_cltv ~tx_locktime:1000l ~input_seq:0l ~script_arg_bytes:arg ~flags with
+  | Error _ -> ()
+  | Ok () -> Alcotest.fail "CLTV with negative arg should fail"
+
+(* Gate 5: type mismatch — script arg is block-height, tx.nLockTime is timestamp *)
+(* Reference: interpreter.cpp:1754-1758, CheckLockTime() *)
+let test_cltv_type_mismatch_height_vs_time () =
+  let flags = Script.script_verify_checklocktimeverify in
+  (* script arg < 500_000_000 (height), tx.locktime >= 500_000_000 (time) *)
+  let arg = Script.bytes_of_script_num 100L in  (* height-based *)
+  match run_cltv ~tx_locktime:500_000_001l ~input_seq:0l ~script_arg_bytes:arg ~flags with
+  | Error _ -> ()
+  | Ok () -> Alcotest.fail "CLTV type mismatch (height arg vs time tx) should fail"
+
+(* Gate 5: type mismatch — script arg is timestamp, tx.nLockTime is block height *)
+(* Reference: interpreter.cpp:1754-1758, CheckLockTime() *)
+let test_cltv_type_mismatch_time_vs_height () =
+  let flags = Script.script_verify_checklocktimeverify in
+  (* script arg >= 500_000_000 (time), tx.locktime < 500_000_000 (height) *)
+  let arg = Script.bytes_of_script_num 500_000_001L in  (* time-based *)
+  match run_cltv ~tx_locktime:1000l ~input_seq:0l ~script_arg_bytes:arg ~flags with
+  | Error _ -> ()
+  | Ok () -> Alcotest.fail "CLTV type mismatch (time arg vs height tx) should fail"
+
+(* Gate 6: script locktime > tx.nLockTime → SCRIPT_ERR_UNSATISFIED_LOCKTIME *)
+(* Reference: interpreter.cpp:1762-1763, CheckLockTime():
+   if (nLockTime > (int64_t)txTo->nLockTime) return false; *)
+let test_cltv_locktime_not_satisfied () =
+  let flags = Script.script_verify_checklocktimeverify in
+  (* script wants locktime 200, tx only has 100 *)
+  let arg = Script.bytes_of_script_num 200L in
+  match run_cltv ~tx_locktime:100l ~input_seq:0l ~script_arg_bytes:arg ~flags with
+  | Error _ -> ()
+  | Ok () -> Alcotest.fail "CLTV not satisfied (script=200 > tx=100) should fail"
+
+(* Gate 6 boundary: script locktime == tx.nLockTime → satisfied (same height/time) *)
+(* Reference: interpreter.cpp:1762 — only rejects when nLockTime > tx.nLockTime *)
+let test_cltv_locktime_equal_passes () =
+  let flags = Script.script_verify_checklocktimeverify in
+  (* script wants 300, tx has 300, input is non-final *)
+  let arg = Script.bytes_of_script_num 300L in
+  match run_cltv ~tx_locktime:300l ~input_seq:0l ~script_arg_bytes:arg ~flags with
+  | Ok () -> ()
+  | Error e -> Alcotest.fail ("CLTV equal locktime should pass: " ^ e)
+
+(* Gate 6: script locktime < tx.nLockTime → satisfied (tx has higher locktime) *)
+let test_cltv_locktime_satisfied () =
+  let flags = Script.script_verify_checklocktimeverify in
+  (* script wants 100, tx has 200 *)
+  let arg = Script.bytes_of_script_num 100L in
+  match run_cltv ~tx_locktime:200l ~input_seq:0l ~script_arg_bytes:arg ~flags with
+  | Ok () -> ()
+  | Error e -> Alcotest.fail ("CLTV satisfied (script=100 <= tx=200) should pass: " ^ e)
+
+(* Gate 7: input nSequence == SEQUENCE_FINAL (0xffffffff) → fail *)
+(* Reference: interpreter.cpp:1775-1776, CheckLockTime():
+   if (CTxIn::SEQUENCE_FINAL == txTo->vin[nIn].nSequence) return false; *)
+let test_cltv_sequence_final_fails () =
+  let flags = Script.script_verify_checklocktimeverify in
+  (* Locktime satisfied, but input sequence is SEQUENCE_FINAL → fail *)
+  let arg = Script.bytes_of_script_num 100L in
+  match run_cltv ~tx_locktime:200l ~input_seq:0xFFFFFFFFl ~script_arg_bytes:arg ~flags with
+  | Error _ -> ()
+  | Ok () -> Alcotest.fail "CLTV with SEQUENCE_FINAL input should fail"
+
+(* Gate 7 boundary: non-SEQUENCE_FINAL input (even 0xfffffffe) passes *)
+let test_cltv_near_sequence_final_passes () =
+  let flags = Script.script_verify_checklocktimeverify in
+  let arg = Script.bytes_of_script_num 100L in
+  (* 0xfffffffe is NOT SEQUENCE_FINAL (0xffffffff) → should pass when locktime satisfied *)
+  match run_cltv ~tx_locktime:200l ~input_seq:0xFFFFFFFEl ~script_arg_bytes:arg ~flags with
+  | Ok () -> ()
+  | Error e -> Alcotest.fail ("CLTV with seq=0xfffffffe should pass: " ^ e)
+
+(* Time-based CLTV: both script arg and tx.nLockTime >= 500_000_000 *)
+(* Reference: interpreter.cpp:1755-1756 *)
+let test_cltv_time_based_satisfied () =
+  let flags = Script.script_verify_checklocktimeverify in
+  (* script wants unix time 500_000_100, tx has 500_000_200 *)
+  let arg = Script.bytes_of_script_num 500_000_100L in
+  match run_cltv ~tx_locktime:500_000_200l ~input_seq:0l ~script_arg_bytes:arg ~flags with
+  | Ok () -> ()
+  | Error e -> Alcotest.fail ("CLTV time-based satisfied should pass: " ^ e)
+
+(* Time-based CLTV: script arg > tx.nLockTime → fail *)
+let test_cltv_time_based_not_satisfied () =
+  let flags = Script.script_verify_checklocktimeverify in
+  (* script wants 600_000_000, tx only has 500_000_100 *)
+  let arg = Script.bytes_of_script_num 600_000_000L in
+  match run_cltv ~tx_locktime:500_000_100l ~input_seq:0l ~script_arg_bytes:arg ~flags with
+  | Error _ -> ()
+  | Ok () -> Alcotest.fail "CLTV time-based not satisfied should fail"
+
+(* Zero arg (OP_0): always passes for any non-negative tx.nLockTime (since 0 <= any) *)
+let test_cltv_zero_arg_always_passes () =
+  let flags = Script.script_verify_checklocktimeverify in
+  (* OP_0 pushes empty bytes = script num 0; tx locktime = 0, input non-final *)
+  let tx : Types.transaction = {
+    version = 1l;
+    inputs = [{
+      previous_output = { txid = Types.zero_hash; vout = 0l };
+      script_sig = Cstruct.create 0;
+      sequence = 0l;
+    }];
+    outputs = [{ value = 0L; script_pubkey = Cstruct.create 0 }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let st = Script.create_eval_state ~tx ~input_index:0 ~amount:0L ~flags
+             ~sig_version:Script.SigVersionBase () in
+  (* OP_0 (0x00) pushes empty bytes = script num 0 then CLTV *)
+  let script = hex_to_cstruct "00b1" in
+  match Script.eval_script st script with
+  | Ok () -> ()
+  | Error e -> Alcotest.fail ("CLTV with zero arg should pass: " ^ e)
+
+(* CLTV does NOT pop the stack (it is a NOP-like verify opcode) *)
+(* Reference: interpreter.cpp:522-558 — no stack.pop(), uses stacktop(-1) *)
+let test_cltv_does_not_pop_stack () =
+  let flags = Script.script_verify_checklocktimeverify in
+  let tx : Types.transaction = {
+    version = 1l;
+    inputs = [{
+      previous_output = { txid = Types.zero_hash; vout = 0l };
+      script_sig = Cstruct.create 0;
+      sequence = 0l;
+    }];
+    outputs = [{ value = 0L; script_pubkey = Cstruct.create 0 }];
+    witnesses = [];
+    locktime = 200l;
+  } in
+  let st = Script.create_eval_state ~tx ~input_index:0 ~amount:0L ~flags
+             ~sig_version:Script.SigVersionBase () in
+  (* Script: push 1-byte value 100 (opcode 0x01 then data 0x64),
+     then CLTV (0xb1), then OP_DROP (0x75).
+     If CLTV popped the stack, DROP would fail with stack-underflow.
+     tx.locktime=200 > arg=100 → CLTV passes and MUST leave the 100 on stack. *)
+  let buf = Cstruct.create 4 in
+  Cstruct.set_uint8 buf 0 0x01;  (* push 1 byte *)
+  Cstruct.set_uint8 buf 1 0x64;  (* data = 100 *)
+  Cstruct.set_uint8 buf 2 0xb1;  (* OP_CHECKLOCKTIMEVERIFY *)
+  Cstruct.set_uint8 buf 3 0x75;  (* OP_DROP *)
+  match Script.eval_script st buf with
+  | Ok () -> ()
+  | Error e -> Alcotest.fail ("CLTV should leave stack intact; got: " ^ e)
+
+let cltv_gate_tests = [
+  Alcotest.test_case "Gate1: no CLTV flag → NOP2 succeeds" `Quick test_cltv_nop2_without_flag;
+  Alcotest.test_case "Gate1: no flag + DISCOURAGE_NOPS → fails" `Quick test_cltv_nop2_discourage;
+  Alcotest.test_case "Gate2: empty stack → error" `Quick test_cltv_empty_stack;
+  Alcotest.test_case "Gate3: arg > 5 bytes → error" `Quick test_cltv_arg_too_long;
+  Alcotest.test_case "Gate4: negative arg → error" `Quick test_cltv_negative_arg;
+  Alcotest.test_case "Gate5: type mismatch height vs time → fail" `Quick test_cltv_type_mismatch_height_vs_time;
+  Alcotest.test_case "Gate5: type mismatch time vs height → fail" `Quick test_cltv_type_mismatch_time_vs_height;
+  Alcotest.test_case "Gate6: script locktime > tx locktime → fail" `Quick test_cltv_locktime_not_satisfied;
+  Alcotest.test_case "Gate6: script locktime == tx locktime → pass" `Quick test_cltv_locktime_equal_passes;
+  Alcotest.test_case "Gate6: script locktime < tx locktime → pass" `Quick test_cltv_locktime_satisfied;
+  Alcotest.test_case "Gate7: SEQUENCE_FINAL input → fail" `Quick test_cltv_sequence_final_fails;
+  Alcotest.test_case "Gate7: near-SEQUENCE_FINAL (0xfffffffe) → pass" `Quick test_cltv_near_sequence_final_passes;
+  Alcotest.test_case "time-based CLTV satisfied" `Quick test_cltv_time_based_satisfied;
+  Alcotest.test_case "time-based CLTV not satisfied" `Quick test_cltv_time_based_not_satisfied;
+  Alcotest.test_case "zero arg always passes" `Quick test_cltv_zero_arg_always_passes;
+  Alcotest.test_case "CLTV does not pop stack" `Quick test_cltv_does_not_pop_stack;
+]
+
+(* ============================================================================
    BIP-112 OP_CHECKSEQUENCEVERIFY Gate Tests (W80)
    Reference: interpreter.cpp:561-593, 1782-1826; tx_verify.cpp:39-110
    ============================================================================ *)
@@ -2463,5 +2744,6 @@ let () = Alcotest.run "test_script" [
   ("sighash_special", sighash_special_tests);
   ("p2a", p2a_tests);
   ("p2a_verify", p2a_verify_tests);
+  ("cltv_gates", cltv_gate_tests);
   ("csv_gates", csv_gate_tests);
 ]

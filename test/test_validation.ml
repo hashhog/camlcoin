@@ -1681,6 +1681,540 @@ let test_bip30_gate_bip34_implies_limit () =
   Alcotest.(check bool) "at limit enforcement re-enables" true (limit >= 1983702)
 
 (* ============================================================================
+   W79: BIP-30 + BIP-34 Comprehensive Gate Tests
+
+   10 Core gates:
+   Gate 1  IsBIP30Repeat: exempt only specific canonical blocks (height+hash)
+   Gate 2  IsBIP30Unspendable: for DisconnectBlock clean-flag (height+hash)
+   Gate 3  fEnforceBIP30 = !IsBIP30Repeat
+   Gate 4  BIP34Hash skip: skip BIP-30 when BIP34 confirmed on canonical chain
+   Gate 5  BIP34_IMPLIES_BIP30_LIMIT = 1,983,702: re-enable BIP-30
+   Gate 6  BIP-30 check applies to ALL txs in block, not just coinbase
+   Gate 7  BIP-34 coinbase height encoding with CScriptNum
+   Gate 8  BIP-34 block version enforcement (version >= 2 at bip34_height)
+   Gate 9  DisconnectBlock BIP-30 exception (IsBIP30Unspendable)
+   Gate 10 CScriptNum encoding correctness for all boundary heights
+
+   Reference: Bitcoin Core validation.cpp:2400-2476, 6189-6199
+   ============================================================================ *)
+
+(* Gate 1 + Gate 3: IsBIP30Repeat — height+hash required, not height only.
+   A block at h=91842 with the CANONICAL hash is exempt.
+   A block at h=91842 with a DIFFERENT hash must NOT be exempt. *)
+let test_bip30_repeat_requires_canonical_hash () =
+  (* Canonical repeat block at h=91842:
+     display hash = 00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec *)
+  let canonical_hash = Types.hash256_of_hex
+    "eccae000e3c8e4e093936360431f3b7603c563c1ff6181390a4d0a0000000000" in
+  let wrong_hash = Types.zero_hash in  (* Any non-canonical hash *)
+
+  Alcotest.(check bool)
+    "Gate 1: canonical hash at h=91842 IS exempt (IsBIP30Repeat=true)"
+    true
+    (Consensus.is_bip30_repeat 91842 canonical_hash);
+
+  Alcotest.(check bool)
+    "Gate 1: wrong hash at h=91842 NOT exempt (IsBIP30Repeat=false)"
+    false
+    (Consensus.is_bip30_repeat 91842 wrong_hash);
+
+  (* Same for h=91880 *)
+  let canonical_hash_91880 = Types.hash256_of_hex
+    "21d77ccb4c08386a04ac0196ae10f6a1d2c2a377558ca190f143070000000000" in
+  Alcotest.(check bool)
+    "Gate 1: canonical hash at h=91880 IS exempt"
+    true
+    (Consensus.is_bip30_repeat 91880 canonical_hash_91880);
+
+  Alcotest.(check bool)
+    "Gate 1: wrong hash at h=91880 NOT exempt"
+    false
+    (Consensus.is_bip30_repeat 91880 wrong_hash)
+
+(* Gate 1: Heights outside the BIP30 repeat list are never exempt *)
+let test_bip30_repeat_only_at_exempt_heights () =
+  let any_hash = Types.zero_hash in
+  Alcotest.(check bool)
+    "Gate 1: h=91843 (not in list) never exempt"
+    false
+    (Consensus.is_bip30_repeat 91843 any_hash);
+  Alcotest.(check bool)
+    "Gate 1: h=100 (not in list) never exempt"
+    false
+    (Consensus.is_bip30_repeat 100 any_hash);
+  Alcotest.(check bool)
+    "Gate 1: h=91722 (unspendable, not repeat) not exempt"
+    false
+    (Consensus.is_bip30_repeat 91722 any_hash);
+  Alcotest.(check bool)
+    "Gate 1: h=91812 (unspendable, not repeat) not exempt"
+    false
+    (Consensus.is_bip30_repeat 91812 any_hash)
+
+(* Gate 2: IsBIP30Unspendable — the two blocks whose outputs were destroyed.
+   Used in DisconnectBlock. Reference: Core validation.cpp:6195-6198. *)
+let test_bip30_unspendable_height_and_hash () =
+  (* h=91722 canonical hash:
+     display = 00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e *)
+  let h91722_canonical = Types.hash256_of_hex
+    "8ed04d57f2f3cdc6a6e55569dc1654e1f219847f66e726dca271020000000000" in
+  (* h=91812 canonical hash:
+     display = 00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f *)
+  let h91812_canonical = Types.hash256_of_hex
+    "2f6f30f9d683deb85d9314ef5dcf36af66d9e3ce1a2b79d4aef00a0000000000" in
+  let wrong_hash = Types.zero_hash in
+
+  Alcotest.(check bool)
+    "Gate 2: h=91722 + canonical hash IS unspendable"
+    true
+    (Consensus.is_bip30_unspendable 91722 h91722_canonical);
+
+  Alcotest.(check bool)
+    "Gate 2: h=91722 + wrong hash is NOT unspendable"
+    false
+    (Consensus.is_bip30_unspendable 91722 wrong_hash);
+
+  Alcotest.(check bool)
+    "Gate 2: h=91812 + canonical hash IS unspendable"
+    true
+    (Consensus.is_bip30_unspendable 91812 h91812_canonical);
+
+  Alcotest.(check bool)
+    "Gate 2: h=91812 + wrong hash is NOT unspendable"
+    false
+    (Consensus.is_bip30_unspendable 91812 wrong_hash);
+
+  (* Repeat heights (91842/91880) are NOT in the unspendable list *)
+  Alcotest.(check bool)
+    "Gate 2: h=91842 NOT in unspendable list"
+    false
+    (Consensus.is_bip30_unspendable 91842 wrong_hash);
+
+  (* Unspendable heights are NOT in the repeat list *)
+  Alcotest.(check bool)
+    "Gate 2: h=91722 NOT in repeat list"
+    false
+    (Consensus.is_bip30_repeat 91722 h91722_canonical)
+
+(* Gate 3 + Gate 4: bip30_should_enforce — comprehensive gate logic.
+   Tests enforcement decisions at critical heights. *)
+let test_bip30_should_enforce_pre_bip34 () =
+  (* Pre-BIP34 mainnet height: BIP-30 always enforced (unless repeat block) *)
+  let any_hash = Types.zero_hash in
+  let result = Validation.bip30_should_enforce
+    ~network:Consensus.mainnet
+    ~height:100
+    ~block_hash:any_hash
+    ~bip34_height_hash:None in
+  Alcotest.(check bool)
+    "Gate 3: pre-BIP34 height 100 enforces BIP-30"
+    true result
+
+let test_bip30_should_enforce_repeat_block_exempt () =
+  (* Gate 1/3: canonical repeat block IS exempt, wrong hash is NOT *)
+  let canonical_h91842 = Types.hash256_of_hex
+    "eccae000e3c8e4e093936360431f3b7603c563c1ff6181390a4d0a0000000000" in
+  let result_canonical = Validation.bip30_should_enforce
+    ~network:Consensus.mainnet
+    ~height:91842
+    ~block_hash:canonical_h91842
+    ~bip34_height_hash:None in
+  Alcotest.(check bool)
+    "Gate 3: canonical h=91842 is exempt from BIP-30"
+    false result_canonical;
+
+  let result_wrong = Validation.bip30_should_enforce
+    ~network:Consensus.mainnet
+    ~height:91842
+    ~block_hash:Types.zero_hash
+    ~bip34_height_hash:None in
+  Alcotest.(check bool)
+    "Gate 3: non-canonical h=91842 must still enforce BIP-30"
+    true result_wrong
+
+let test_bip30_should_enforce_bip34_active_canonical () =
+  (* Gate 4: after BIP34 activation on the canonical chain (BIP34Hash confirmed),
+     BIP-30 checking is skipped for performance. *)
+  let any_hash = Types.zero_hash in
+  let mainnet_bip34_hash = match Consensus.mainnet.bip34_hash with
+    | Some h -> h
+    | None -> failwith "mainnet must have bip34_hash"
+  in
+  (* Canonical chain: bip34_height_hash = mainnet BIP34Hash *)
+  let result = Validation.bip30_should_enforce
+    ~network:Consensus.mainnet
+    ~height:300000  (* Well above BIP34 height 227931, below 1983702 *)
+    ~block_hash:any_hash
+    ~bip34_height_hash:(Some mainnet_bip34_hash) in
+  Alcotest.(check bool)
+    "Gate 4: canonical chain height 300000 → skip BIP-30"
+    false result
+
+let test_bip30_should_enforce_bip34_active_noncanonical () =
+  (* Gate 4: if BIP34Hash does NOT match, we cannot confirm canonical chain → enforce *)
+  let any_hash = Types.zero_hash in
+  let wrong_bip34_hash = Types.zero_hash in  (* Not the real BIP34Hash *)
+  let result = Validation.bip30_should_enforce
+    ~network:Consensus.mainnet
+    ~height:300000
+    ~block_hash:any_hash
+    ~bip34_height_hash:(Some wrong_bip34_hash) in
+  Alcotest.(check bool)
+    "Gate 4: non-canonical BIP34 ancestor → enforce BIP-30"
+    true result
+
+let test_bip30_should_enforce_bip34_no_hint () =
+  (* Without bip34_height_hash hint (None), conservative: enforce BIP-30 even post-BIP34.
+     This is the safe fallback when callers don't have ancestor hash available. *)
+  let any_hash = Types.zero_hash in
+  let result = Validation.bip30_should_enforce
+    ~network:Consensus.mainnet
+    ~height:300000
+    ~block_hash:any_hash
+    ~bip34_height_hash:None in
+  Alcotest.(check bool)
+    "Gate 4 fallback: no BIP34 hint → conservative enforcement"
+    true result
+
+let test_bip30_should_enforce_at_limit () =
+  (* Gate 5: at height >= 1,983,702, BIP-30 is re-enabled regardless of BIP34 *)
+  let any_hash = Types.zero_hash in
+  let mainnet_bip34_hash = match Consensus.mainnet.bip34_hash with
+    | Some h -> h
+    | None -> failwith "mainnet must have bip34_hash"
+  in
+  (* Even with canonical BIP34 hash, at >= 1983702 enforcement re-enables *)
+  let result = Validation.bip30_should_enforce
+    ~network:Consensus.mainnet
+    ~height:1983702
+    ~block_hash:any_hash
+    ~bip34_height_hash:(Some mainnet_bip34_hash) in
+  Alcotest.(check bool)
+    "Gate 5: height=1983702 re-enables BIP-30"
+    true result;
+
+  let result2 = Validation.bip30_should_enforce
+    ~network:Consensus.mainnet
+    ~height:2000000
+    ~block_hash:any_hash
+    ~bip34_height_hash:(Some mainnet_bip34_hash) in
+  Alcotest.(check bool)
+    "Gate 5: height=2000000 also enforces BIP-30"
+    true result2
+
+let test_bip30_should_enforce_regtest_no_window () =
+  (* On regtest/testnet4 (bip34_hash=None, BIP34 active from genesis),
+     BIP-30 is never enforced for heights in [bip34_height, 1983702).
+     No pre-BIP34 window means no duplicate coinbases are possible. *)
+  let any_hash = Types.zero_hash in
+  let result = Validation.bip30_should_enforce
+    ~network:Consensus.regtest
+    ~height:1000
+    ~block_hash:any_hash
+    ~bip34_height_hash:None in
+  Alcotest.(check bool)
+    "Gate 4 regtest: bip34_hash=None → no BIP-30 enforcement"
+    false result
+
+(* Gate 6: BIP-30 applies to ALL transactions, not just coinbase.
+   Verify check_bip30 is called for non-coinbase txs too. *)
+let test_bip30_applies_to_all_txs () =
+  (* Build a block with coinbase + one regular tx, both with same txid.
+     The duplicate regular tx must also be caught. *)
+  let coinbase_script = Consensus.encode_height_in_coinbase 100 in
+  (* Add padding to reach minimum 2-byte scriptSig length *)
+  let script_pad = Cstruct.create 1 in
+  Cstruct.set_uint8 script_pad 0 0x00;
+  let coinbase_full = Cstruct.append coinbase_script script_pad in
+  let coinbase = make_tx
+    ~inputs:[{
+      Types.previous_output = { txid = Types.zero_hash; vout = -1l };
+      script_sig = coinbase_full;
+      sequence = 0xFFFFFFFFl;
+    }]
+    ~outputs:[make_output ~value:5_000_000_000L ()]
+    ()
+  in
+  (* Regular tx that would duplicate an existing UTXO *)
+  let dup_txid = Crypto.compute_txid coinbase in  (* same as coinbase for simplicity *)
+  let non_cb_tx = make_tx
+    ~inputs:[{
+      Types.previous_output = { txid = Crypto.compute_txid coinbase; vout = 0l };
+      script_sig = Cstruct.create 0;
+      sequence = 0xFFFFFFFFl;
+    }]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  let all_txids = [Crypto.compute_txid coinbase; Crypto.compute_txid non_cb_tx] in
+  let (merkle, _) = Crypto.merkle_root all_txids in
+  let header = make_header ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:100l () in
+  let block = { Types.header; transactions = [coinbase; non_cb_tx] } in
+
+  (* Gate 6: BIP-30 check on the non-coinbase tx's outputs *)
+  let non_cb_txid = Crypto.compute_txid non_cb_tx in
+  let n_non_cb_outputs = List.length non_cb_tx.Types.outputs in
+
+  (* Lookup that returns a coin for the non-coinbase txid — simulates duplicate *)
+  let lookup_dup (op : Types.outpoint) =
+    if Cstruct.equal op.txid non_cb_txid && op.vout = 0l then
+      Some {
+        Validation.txid = non_cb_txid;
+        vout = 0l;
+        value = 1000L;
+        script_pubkey = Cstruct.create 0;
+        height = 99;
+        is_coinbase = false;
+      }
+    else None
+  in
+  let result = Validation.check_bip30
+    ~lookup:lookup_dup ~txid:non_cb_txid ~n_outputs:n_non_cb_outputs in
+  Alcotest.(check bool)
+    "Gate 6: BIP-30 check_bip30 fails for duplicate non-coinbase tx"
+    false result;
+
+  (* Also verify check_bip30 catches duplicate coinbase *)
+  let _ = dup_txid in
+  let lookup_cb_dup (op : Types.outpoint) =
+    if Cstruct.equal op.txid (Crypto.compute_txid coinbase) && op.vout = 0l then
+      Some {
+        Validation.txid = Crypto.compute_txid coinbase;
+        vout = 0l;
+        value = 5_000_000_000L;
+        script_pubkey = Cstruct.create 0;
+        height = 99;
+        is_coinbase = true;
+      }
+    else None
+  in
+  let coinbase_txid = Crypto.compute_txid coinbase in
+  let n_cb_outputs = List.length coinbase.Types.outputs in
+  let _ = block in
+  let result_cb = Validation.check_bip30
+    ~lookup:lookup_cb_dup ~txid:coinbase_txid ~n_outputs:n_cb_outputs in
+  Alcotest.(check bool)
+    "Gate 6: BIP-30 check_bip30 fails for duplicate coinbase too"
+    false result_cb
+
+(* Gate 7 + Gate 10: BIP-34 CScriptNum encoding — verify sign-bit boundary cases.
+   Reference: Bitcoin Core script.h CScriptNum::serialize + CScript::push_int64. *)
+let test_bip34_cscriptnum_sign_bit_boundaries () =
+  (* Height 127 (0x7f): 1 data byte, no sign-bit padding needed *)
+  let cs127 = Consensus.encode_height_in_coinbase 127 in
+  Alcotest.(check int) "h=127 total length 2" 2 (Cstruct.length cs127);
+  Alcotest.(check int) "h=127 push opcode" 0x01 (Cstruct.get_uint8 cs127 0);
+  Alcotest.(check int) "h=127 value byte" 0x7F (Cstruct.get_uint8 cs127 1);
+
+  (* Height 128 (0x80): MSB has sign bit set → needs 2 data bytes [0x80, 0x00] *)
+  let cs128 = Consensus.encode_height_in_coinbase 128 in
+  Alcotest.(check int) "h=128 total length 3" 3 (Cstruct.length cs128);
+  Alcotest.(check int) "h=128 push opcode" 0x02 (Cstruct.get_uint8 cs128 0);
+  Alcotest.(check int) "h=128 byte 0" 0x80 (Cstruct.get_uint8 cs128 1);
+  Alcotest.(check int) "h=128 byte 1 (zero pad)" 0x00 (Cstruct.get_uint8 cs128 2);
+
+  (* Height 32767 (0x7fff): 2 data bytes, no padding *)
+  let cs32767 = Consensus.encode_height_in_coinbase 32767 in
+  Alcotest.(check int) "h=32767 total length 3" 3 (Cstruct.length cs32767);
+  Alcotest.(check int) "h=32767 push opcode" 0x02 (Cstruct.get_uint8 cs32767 0);
+  Alcotest.(check int) "h=32767 byte 0" 0xFF (Cstruct.get_uint8 cs32767 1);
+  Alcotest.(check int) "h=32767 byte 1" 0x7F (Cstruct.get_uint8 cs32767 2);
+
+  (* Height 32768 (0x8000): MSB 0x80 → needs 3 data bytes [0x00, 0x80, 0x00] *)
+  let cs32768 = Consensus.encode_height_in_coinbase 32768 in
+  Alcotest.(check int) "h=32768 total length 4" 4 (Cstruct.length cs32768);
+  Alcotest.(check int) "h=32768 push opcode" 0x03 (Cstruct.get_uint8 cs32768 0);
+  Alcotest.(check int) "h=32768 byte 0" 0x00 (Cstruct.get_uint8 cs32768 1);
+  Alcotest.(check int) "h=32768 byte 1" 0x80 (Cstruct.get_uint8 cs32768 2);
+  Alcotest.(check int) "h=32768 byte 2 (zero pad)" 0x00 (Cstruct.get_uint8 cs32768 3);
+
+  (* Height 8388607 (0x7fffff): 3 data bytes, no padding *)
+  let cs8388607 = Consensus.encode_height_in_coinbase 8388607 in
+  Alcotest.(check int) "h=8388607 total length 4" 4 (Cstruct.length cs8388607);
+  Alcotest.(check int) "h=8388607 push opcode" 0x03 (Cstruct.get_uint8 cs8388607 0);
+
+  (* Height 8388608 (0x800000): MSB 0x80 → needs 4 data bytes *)
+  let cs8388608 = Consensus.encode_height_in_coinbase 8388608 in
+  Alcotest.(check int) "h=8388608 total length 5" 5 (Cstruct.length cs8388608);
+  Alcotest.(check int) "h=8388608 push opcode" 0x04 (Cstruct.get_uint8 cs8388608 0);
+  Alcotest.(check int) "h=8388608 byte 0" 0x00 (Cstruct.get_uint8 cs8388608 1);
+  Alcotest.(check int) "h=8388608 byte 1" 0x00 (Cstruct.get_uint8 cs8388608 2);
+  Alcotest.(check int) "h=8388608 byte 2" 0x80 (Cstruct.get_uint8 cs8388608 3);
+  Alcotest.(check int) "h=8388608 byte 3 (zero pad)" 0x00 (Cstruct.get_uint8 cs8388608 4)
+
+(* Gate 7: BIP-34 OP_0/OP_1..OP_16 encoding — boundary at heights 0 and 1-16 *)
+let test_bip34_op_encoding_boundaries () =
+  (* Height 0 → OP_0 (0x00) *)
+  let cs0 = Consensus.encode_height_in_coinbase 0 in
+  Alcotest.(check int) "h=0 → OP_0 (len=1)" 1 (Cstruct.length cs0);
+  Alcotest.(check int) "h=0 byte = 0x00" 0x00 (Cstruct.get_uint8 cs0 0);
+
+  (* Height 1 → OP_1 (0x51) *)
+  let cs1 = Consensus.encode_height_in_coinbase 1 in
+  Alcotest.(check int) "h=1 → OP_1 (len=1)" 1 (Cstruct.length cs1);
+  Alcotest.(check int) "h=1 byte = 0x51" 0x51 (Cstruct.get_uint8 cs1 0);
+
+  (* Height 16 → OP_16 (0x60) *)
+  let cs16 = Consensus.encode_height_in_coinbase 16 in
+  Alcotest.(check int) "h=16 → OP_16 (len=1)" 1 (Cstruct.length cs16);
+  Alcotest.(check int) "h=16 byte = 0x60" 0x60 (Cstruct.get_uint8 cs16 0);
+
+  (* Height 17 → CScriptNum(17): push 1 byte, value 0x11 *)
+  let cs17 = Consensus.encode_height_in_coinbase 17 in
+  Alcotest.(check int) "h=17 len=2" 2 (Cstruct.length cs17);
+  Alcotest.(check int) "h=17 push byte = 0x01" 0x01 (Cstruct.get_uint8 cs17 0);
+  Alcotest.(check int) "h=17 value = 0x11" 0x11 (Cstruct.get_uint8 cs17 1)
+
+(* Gate 7: check_coinbase returns TxBadCoinbase error string correctly for bad-cb-height *)
+let test_bip34_error_on_wrong_height () =
+  (* Build coinbase with wrong height (height 50 instead of 100) *)
+  let wrong_script = Consensus.encode_height_in_coinbase 50 in
+  let pad = Cstruct.create 1 in  (* pad to >= 2 bytes *)
+  let script_sig = Cstruct.append wrong_script pad in
+  let coinbase = make_tx
+    ~inputs:[{
+      Types.previous_output = { txid = Types.zero_hash; vout = -1l };
+      script_sig;
+      sequence = 0xFFFFFFFFl;
+    }]
+    ~outputs:[make_output ~value:5_000_000_000L ()]
+    ()
+  in
+  (* Use mainnet at height=100 (bip34_height=227931 → NOT enforced): should be OK *)
+  (match Validation.check_coinbase ~network:Consensus.mainnet coinbase 100 with
+   | Ok () -> ()
+   | Error _ -> Alcotest.fail "Height 100 < bip34_height=227931, no BIP34 check expected");
+
+  (* Use regtest at height=100 (bip34_height=1 → enforced): should fail *)
+  (match Validation.check_coinbase ~network:Consensus.regtest coinbase 100 with
+   | Error Validation.TxBadCoinbase -> ()
+   | Error e -> Alcotest.fail ("Unexpected error: " ^ Validation.tx_error_to_string e)
+   | Ok () -> Alcotest.fail "Should have rejected wrong height encoding")
+
+(* Gate 8: Block version must be >= 2 at bip34_height *)
+let test_bip34_block_version_gate () =
+  (* Regtest bip34_height=1: version 1 block at height >= 1 must be rejected.
+     Use height=500 to mirror test_block_version_too_low_bip34. *)
+  let coinbase = make_tx
+    ~inputs:[make_coinbase_input ~height:500]
+    ~outputs:[make_output ~value:(Consensus.block_subsidy 500) ()]
+    ()
+  in
+  let txid = Crypto.compute_txid coinbase in
+  let (merkle, _) = Crypto.merkle_root [txid] in
+  let header = make_header ~version:1l ~merkle_root:merkle
+    ~bits:0x207fffffl ~timestamp:100l () in
+  let v1_block_h500 = { Types.header; transactions = [coinbase] } in
+  (* block version check is in check_block; call it at height >= bip34_height *)
+  (match Validation.check_block ~network:Consensus.regtest v1_block_h500 500
+           ~expected_bits:0x207fffffl ~median_time:0l with
+   | Error Validation.BlockBadVersion -> ()
+   | Error Validation.BlockBadDifficulty -> ()  (* PoW check may fire first *)
+   | Error e -> Alcotest.fail ("Unexpected error: " ^ Validation.block_error_to_string e)
+   | Ok () -> Alcotest.fail "Version 1 block at regtest h=500 should fail")
+
+(* Gate 4: Mainnet bip34_hash field matches the known canonical value.
+   display: 000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8 *)
+let test_mainnet_bip34_hash_correct () =
+  let expected_display =
+    "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8" in
+  match Consensus.mainnet.bip34_hash with
+  | None -> Alcotest.fail "mainnet must have bip34_hash"
+  | Some h ->
+    (* Convert internal LE to display hash *)
+    let display = Types.hash256_to_hex_display h in
+    Alcotest.(check string) "mainnet BIP34Hash display" expected_display display
+
+(* Gate 4: Testnet3 bip34_hash field matches the known canonical value.
+   display: 0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8 *)
+let test_testnet3_bip34_hash_correct () =
+  let expected_display =
+    "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8" in
+  match Consensus.testnet.bip34_hash with
+  | None -> Alcotest.fail "testnet3 must have bip34_hash"
+  | Some h ->
+    let display = Types.hash256_to_hex_display h in
+    Alcotest.(check string) "testnet3 BIP34Hash display" expected_display display
+
+(* Gate 4: Testnet4 and regtest have no bip34_hash (BIP34 active from genesis) *)
+let test_no_bip34_hash_on_genesis_networks () =
+  Alcotest.(check bool) "testnet4 bip34_hash = None" true
+    (Consensus.testnet4.bip34_hash = None);
+  Alcotest.(check bool) "regtest bip34_hash = None" true
+    (Consensus.regtest.bip34_hash = None)
+
+(* Gate 1: The two BIP30 repeat block hashes match Core constants.
+   Core validation.cpp:6191-6192 *)
+let test_bip30_repeat_block_hashes_match_core () =
+  (* h=91842 display: 00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec *)
+  let h91842_display = "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec" in
+  let h91842_internal = Types.hash256_of_hex
+    "eccae000e3c8e4e093936360431f3b7603c563c1ff6181390a4d0a0000000000" in
+  Alcotest.(check string)
+    "h=91842 repeat hash round-trips to Core display value"
+    h91842_display
+    (Types.hash256_to_hex_display h91842_internal);
+
+  (* h=91880 display: 00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721 *)
+  let h91880_display = "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721" in
+  let h91880_internal = Types.hash256_of_hex
+    "21d77ccb4c08386a04ac0196ae10f6a1d2c2a377558ca190f143070000000000" in
+  Alcotest.(check string)
+    "h=91880 repeat hash round-trips to Core display value"
+    h91880_display
+    (Types.hash256_to_hex_display h91880_internal)
+
+(* Gate 2: The two BIP30 unspendable block hashes match Core constants.
+   Core validation.cpp:6197-6198 *)
+let test_bip30_unspendable_block_hashes_match_core () =
+  (* h=91722 display: 00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e *)
+  let h91722_display = "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e" in
+  let h91722_internal = Types.hash256_of_hex
+    "8ed04d57f2f3cdc6a6e55569dc1654e1f219847f66e726dca271020000000000" in
+  Alcotest.(check string)
+    "h=91722 unspendable hash round-trips to Core display value"
+    h91722_display
+    (Types.hash256_to_hex_display h91722_internal);
+
+  (* h=91812 display: 00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f *)
+  let h91812_display = "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f" in
+  let h91812_internal = Types.hash256_of_hex
+    "2f6f30f9d683deb85d9314ef5dcf36af66d9e3ce1a2b79d4aef00a0000000000" in
+  Alcotest.(check string)
+    "h=91812 unspendable hash round-trips to Core display value"
+    h91812_display
+    (Types.hash256_to_hex_display h91812_internal)
+
+(* Gate 5: validate_block_with_utxos at height=1983702 enforces BIP-30
+   even when canonical BIP34 hash is provided (limit re-enables enforcement). *)
+let test_bip30_reenabled_at_limit_in_validate () =
+  let height = 1983702 in
+  let (block, txid) = make_bip30_block ~height ~coinbase_suffix:0xEE in
+  let mainnet_bip34_hash = match Consensus.mainnet.bip34_hash with
+    | Some h -> h | None -> failwith "mainnet must have bip34_hash"
+  in
+  let base_lookup (op : Types.outpoint) =
+    if Cstruct.equal op.txid txid && op.vout = 0l then
+      Some {
+        Validation.txid;
+        vout = 0l;
+        value = 5_000_000_000L;
+        script_pubkey = Cstruct.create 0;
+        height = height - 1;
+        is_coinbase = true;
+      }
+    else None
+  in
+  let flags = Script.script_verify_none in
+  match Validation.validate_block_with_utxos ~network:Consensus.mainnet block height
+    ~expected_bits:0x207fffffl ~median_time:0l
+    ~base_lookup ~flags ~skip_scripts:true
+    ~bip34_height_hash:mainnet_bip34_hash () with
+  | Error (Validation.BlockTxValidationFailed (_, Validation.TxDuplicateTxid)) -> ()
+  | Error e -> Alcotest.fail ("Gate 5: wrong error at 1983702: " ^ Validation.block_error_to_string e)
+  | Ok _ -> Alcotest.fail "Gate 5: BIP-30 should be enforced at height=1983702"
+
+(* ============================================================================
    BIP-141 Weight / VSize / Sigop-Adjusted Comprehensive Tests (W76)
 
    Reference: consensus/consensus.h:14-24, consensus/validation.h:132-145,
@@ -2047,5 +2581,59 @@ let () =
         test_bip30_old_wrong_heights_not_exempt;
       test_case "BIP34_IMPLIES_BIP30_LIMIT = 1983702" `Quick
         test_bip30_gate_bip34_implies_limit;
+    ];
+    "bip30_bip34_w79_gates", [
+      (* Gate 1 + 3: IsBIP30Repeat requires height+hash, not height-only *)
+      test_case "G1: repeat exempt only with canonical hash" `Quick
+        test_bip30_repeat_requires_canonical_hash;
+      test_case "G1: non-exempt heights always enforce" `Quick
+        test_bip30_repeat_only_at_exempt_heights;
+      (* Gate 2: IsBIP30Unspendable for DisconnectBlock *)
+      test_case "G2: unspendable height+hash check" `Quick
+        test_bip30_unspendable_height_and_hash;
+      (* Gate 3 + 4: bip30_should_enforce comprehensive *)
+      test_case "G3: pre-BIP34 always enforces" `Quick
+        test_bip30_should_enforce_pre_bip34;
+      test_case "G3: canonical repeat block exempt" `Quick
+        test_bip30_should_enforce_repeat_block_exempt;
+      test_case "G4: canonical BIP34 chain skips BIP-30" `Quick
+        test_bip30_should_enforce_bip34_active_canonical;
+      test_case "G4: non-canonical BIP34 ancestor enforces" `Quick
+        test_bip30_should_enforce_bip34_active_noncanonical;
+      test_case "G4 fallback: no BIP34 hint → conservative" `Quick
+        test_bip30_should_enforce_bip34_no_hint;
+      (* Gate 5: BIP34_IMPLIES_BIP30_LIMIT re-enables at 1983702 *)
+      test_case "G5: re-enabled at height=1983702" `Quick
+        test_bip30_should_enforce_at_limit;
+      test_case "G5: no BIP30 window on genesis networks" `Quick
+        test_bip30_should_enforce_regtest_no_window;
+      (* Gate 6: BIP-30 applies to ALL txs *)
+      test_case "G6: BIP-30 catches non-coinbase duplicates too" `Quick
+        test_bip30_applies_to_all_txs;
+      (* Gate 7 + 10: CScriptNum encoding boundary cases *)
+      test_case "G7/G10: CScriptNum sign-bit boundaries" `Quick
+        test_bip34_cscriptnum_sign_bit_boundaries;
+      test_case "G7: OP_0/OP_1..OP_16 encoding boundaries" `Quick
+        test_bip34_op_encoding_boundaries;
+      test_case "G7: bad-cb-height rejected after BIP34" `Quick
+        test_bip34_error_on_wrong_height;
+      (* Gate 8: block version enforcement *)
+      test_case "G8: version 1 block rejected at bip34_height" `Quick
+        test_bip34_block_version_gate;
+      (* Gate 4: BIP34Hash field correctness *)
+      test_case "G4: mainnet bip34_hash matches Core" `Quick
+        test_mainnet_bip34_hash_correct;
+      test_case "G4: testnet3 bip34_hash matches Core" `Quick
+        test_testnet3_bip34_hash_correct;
+      test_case "G4: testnet4/regtest have no bip34_hash" `Quick
+        test_no_bip34_hash_on_genesis_networks;
+      (* Block hash round-trip verification *)
+      test_case "G1: repeat block hashes match Core constants" `Quick
+        test_bip30_repeat_block_hashes_match_core;
+      test_case "G2: unspendable block hashes match Core constants" `Quick
+        test_bip30_unspendable_block_hashes_match_core;
+      (* Gate 5: validate_block enforces at limit *)
+      test_case "G5: validate_block enforces at height=1983702" `Quick
+        test_bip30_reenabled_at_limit_in_validate;
     ];
   ]

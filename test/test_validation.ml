@@ -1270,6 +1270,192 @@ let test_bip30_gate_bip34_implies_limit () =
   Alcotest.(check bool) "at limit enforcement re-enables" true (limit >= 1983702)
 
 (* ============================================================================
+   BIP-141 Weight / VSize / Sigop-Adjusted Comprehensive Tests (W76)
+
+   Reference: consensus/consensus.h:14-24, consensus/validation.h:132-145,
+              policy/policy.h:37-50, policy/policy.cpp:390-408.
+
+   Gates verified:
+   G1  MAX_BLOCK_WEIGHT = 4_000_000 WU (block gate — tested in check_block group)
+   G2  MAX_BLOCK_SIGOPS_COST = 80_000 (block gate)
+   G3  MIN_TRANSACTION_WEIGHT = 240 WU (consensus.h:23 — constant sanity)
+   G4  MIN_SERIALIZABLE_TRANSACTION_WEIGHT = 40 WU (consensus.h:24 — constant sanity)
+   G5  MAX_STANDARD_TX_WEIGHT = 400_000 WU (policy gate — tested in mempool group)
+   G6  WITNESS_SCALE_FACTOR = 4 (formula identity)
+   G7  weight(legacy) = base_size * 4
+   G8  weight(segwit) = base_size * 3 + total_size
+   G9  vsize = ceil(weight / 4)
+   G10 GetSigOpsAdjustedWeight = max(weight, sigop_cost * DEFAULT_BYTES_PER_SIGOP)
+   G11 GetVirtualTransactionSize with sigop inflation
+   G12 DEFAULT_BYTES_PER_SIGOP = 20 (policy.h:50)
+   ============================================================================ *)
+
+(* G7: For a legacy (non-witness) transaction, weight = base_size * 4.
+   Strip both sides should be equal since there is no witness discount. *)
+let test_weight_legacy_formula () =
+  let tx = make_tx
+    ~inputs:[make_input ()]
+    ~outputs:[make_output ~value:1000L ()]
+    ()
+  in
+  let weight = Validation.compute_tx_weight tx in
+  let w_base = Serialize.writer_create () in
+  Serialize.serialize_transaction_no_witness w_base tx;
+  let base_size = Cstruct.length (Serialize.writer_to_cstruct w_base) in
+  (* G7: weight = base_size * 4 for non-witness tx *)
+  Alcotest.(check int) "legacy: weight = base_size * 4" (base_size * 4) weight
+
+(* G7+G8: For a segwit tx, weight = base_size * 3 + total_size
+   (equivalently: base_size * 4 + witness_size).
+   Verify both forms are equal. *)
+let test_weight_segwit_formula () =
+  (* Witness: 2-item stack with sizes 72 and 33 bytes *)
+  let tx = {
+    Types.version = 1l;
+    inputs = [make_input ()];
+    outputs = [make_output ~value:1000L ()];
+    witnesses = [{ Types.items = [Cstruct.create 72; Cstruct.create 33] }];
+    locktime = 0l;
+  } in
+  let weight = Validation.compute_tx_weight tx in
+  let w_base = Serialize.writer_create () in
+  Serialize.serialize_transaction_no_witness w_base tx;
+  let base_size = Cstruct.length (Serialize.writer_to_cstruct w_base) in
+  let w_total = Serialize.writer_create () in
+  Serialize.serialize_transaction w_total tx;
+  let total_size = Cstruct.length (Serialize.writer_to_cstruct w_total) in
+  (* G8: weight = base_size * 3 + total_size *)
+  let expected = base_size * 3 + total_size in
+  Alcotest.(check int) "segwit: weight = base_size*3 + total_size" expected weight;
+  (* Witness data has a 75% discount, so weight < 4 * base_size + total_size-base_size? *)
+  (* Actually: weight = base_size*4 + (total_size - base_size)*1 — witness at 1x *)
+  let witness_size = total_size - base_size in
+  let expected2 = base_size * 4 + witness_size in
+  Alcotest.(check int) "segwit: weight = base_size*4 + witness_size" expected2 weight
+
+(* G8: stripped_size (no-witness) vs total_size relationship *)
+let test_weight_stripped_and_total () =
+  let tx = {
+    Types.version = 2l;
+    inputs = [make_input ()];
+    outputs = [make_output ~value:5000L ()];
+    witnesses = [{ Types.items = [Cstruct.create 64] }];  (* 64-byte witness item *)
+    locktime = 0l;
+  } in
+  let w_base = Serialize.writer_create () in
+  Serialize.serialize_transaction_no_witness w_base tx;
+  let stripped = Cstruct.length (Serialize.writer_to_cstruct w_base) in
+  let w_total = Serialize.writer_create () in
+  Serialize.serialize_transaction w_total tx;
+  let total = Cstruct.length (Serialize.writer_to_cstruct w_total) in
+  (* total >= stripped always *)
+  Alcotest.(check bool) "total >= stripped" true (total >= stripped);
+  (* weight = stripped * (4-1) + total = stripped*3 + total *)
+  let weight = Validation.compute_tx_weight tx in
+  Alcotest.(check int) "formula: stripped*3+total" (stripped * 3 + total) weight
+
+(* G9: vsize = ceil(weight / 4), verified with concrete weight values *)
+let test_vsize_ceiling_divide () =
+  (* weight divisible by 4: vsize = weight/4 *)
+  Alcotest.(check int) "weight=400 → vsize=100"  100
+    (Validation.get_virtual_transaction_size ~weight:400  ~sigop_cost:0 ~bytes_per_sigop:0);
+  (* weight = 4k+1: vsize = k+1 *)
+  Alcotest.(check int) "weight=401 → vsize=101" 101
+    (Validation.get_virtual_transaction_size ~weight:401  ~sigop_cost:0 ~bytes_per_sigop:0);
+  (* weight = 4k+3: vsize = k+1 *)
+  Alcotest.(check int) "weight=403 → vsize=101" 101
+    (Validation.get_virtual_transaction_size ~weight:403  ~sigop_cost:0 ~bytes_per_sigop:0);
+  (* weight = 4k+2: vsize = k+1 *)
+  Alcotest.(check int) "weight=402 → vsize=101" 101
+    (Validation.get_virtual_transaction_size ~weight:402  ~sigop_cost:0 ~bytes_per_sigop:0)
+
+(* G10: GetSigOpsAdjustedWeight = max(weight, sigop_cost * bytes_per_sigop)
+   policy/policy.cpp:390-393 *)
+let test_get_sigops_adjusted_weight () =
+  let bps = Consensus.default_bytes_per_sigop in (* 20 *)
+  (* sigop_cost * bps < weight → weight wins *)
+  Alcotest.(check int) "weight dominates"
+    1000
+    (Validation.get_sigops_adjusted_weight ~weight:1000 ~sigop_cost:10 ~bytes_per_sigop:bps);
+  (* sigop_cost * bps > weight → sigops win *)
+  Alcotest.(check int) "sigops dominate"
+    (100 * 20)   (* = 2000 *)
+    (Validation.get_sigops_adjusted_weight ~weight:500 ~sigop_cost:100 ~bytes_per_sigop:bps);
+  (* Equal: pick max (same) *)
+  Alcotest.(check int) "equal → either"
+    2000
+    (Validation.get_sigops_adjusted_weight ~weight:2000 ~sigop_cost:100 ~bytes_per_sigop:bps);
+  (* bytes_per_sigop=0 → always returns weight regardless of sigop_cost *)
+  Alcotest.(check int) "bps=0 → identity"
+    500
+    (Validation.get_sigops_adjusted_weight ~weight:500 ~sigop_cost:9999 ~bytes_per_sigop:0)
+
+(* G11: GetVirtualTransactionSize with sigop inflation
+   policy/policy.cpp:395-398: vsize = ceil(max(weight, sigop_cost*bps) / 4) *)
+let test_get_virtual_transaction_size_sigop_inflation () =
+  let bps = Consensus.default_bytes_per_sigop in (* 20 *)
+  (* Low sigops: vsize dominated by weight *)
+  Alcotest.(check int) "low sigops: weight path"
+    250   (* ceil(1000/4) *)
+    (Validation.get_virtual_transaction_size ~weight:1000 ~sigop_cost:5 ~bytes_per_sigop:bps);
+  (* High sigops inflate: sigop_cost=100, bps=20 → adj=2000, vsize=500 *)
+  Alcotest.(check int) "high sigops: 100*20=2000→500 vsize"
+    500
+    (Validation.get_virtual_transaction_size ~weight:300 ~sigop_cost:100 ~bytes_per_sigop:bps);
+  (* Ceiling: sigop_cost=5, bps=20 → adj=max(101,100)=101, vsize=ceil(101/4)=26 *)
+  Alcotest.(check int) "ceiling after sigop adj"
+    26   (* ceil(101/4) *)
+    (Validation.get_virtual_transaction_size ~weight:101 ~sigop_cost:5 ~bytes_per_sigop:bps);
+  (* Exactly at boundary: adj=100 → vsize=25 *)
+  Alcotest.(check int) "exact boundary 100→25"
+    25
+    (Validation.get_virtual_transaction_size ~weight:100 ~sigop_cost:5 ~bytes_per_sigop:bps)
+
+(* G12: DEFAULT_BYTES_PER_SIGOP = 20 (policy.h:50) *)
+let test_default_bytes_per_sigop_constant () =
+  Alcotest.(check int) "DEFAULT_BYTES_PER_SIGOP = 20" 20 Consensus.default_bytes_per_sigop
+
+(* G3+G4: Constant sanity: MIN_TRANSACTION_WEIGHT = 240, MIN_SERIALIZABLE = 40 *)
+let test_min_weight_constants () =
+  Alcotest.(check int) "MIN_TRANSACTION_WEIGHT = 4*60 = 240" 240 Consensus.min_tx_weight;
+  Alcotest.(check int) "MIN_SERIALIZABLE_TX_WEIGHT = 4*10 = 40" 40 Consensus.min_serializable_tx_weight
+
+(* G6: WITNESS_SCALE_FACTOR = 4 *)
+let test_witness_scale_factor () =
+  Alcotest.(check int) "WITNESS_SCALE_FACTOR = 4" 4 Consensus.witness_scale_factor
+
+(* MAX_STANDARD_TX_WEIGHT boundary: weight exactly at limit passes; weight+1 would fail *)
+let test_max_standard_tx_weight_boundary () =
+  (* The limit is 400,000 WU (MAX_STANDARD_TX_WEIGHT). Verify the constant. *)
+  Alcotest.(check int) "MAX_STANDARD_TX_WEIGHT = 400_000" 400_000 Consensus.max_standard_tx_weight;
+  (* vsize at max standard weight: ceil(400000/4) = 100000 *)
+  Alcotest.(check int) "vsize at max standard = 100_000"
+    100_000
+    (Validation.get_virtual_transaction_size
+       ~weight:Consensus.max_standard_tx_weight ~sigop_cost:0 ~bytes_per_sigop:0)
+
+(* MAX_BLOCK_WEIGHT boundary: gate is weight > 4_000_000 *)
+let test_max_block_weight_boundary () =
+  Alcotest.(check int) "MAX_BLOCK_WEIGHT = 4_000_000" 4_000_000 Consensus.max_block_weight;
+  (* vsize at max block weight: 1_000_000 vbytes *)
+  Alcotest.(check int) "vsize at max block weight = 1_000_000"
+    1_000_000
+    (Validation.get_virtual_transaction_size
+       ~weight:Consensus.max_block_weight ~sigop_cost:0 ~bytes_per_sigop:0)
+
+(* Sigop-adjusted vsize does NOT go below plain vsize — the max() is a floor *)
+let test_sigop_adjusted_never_below_plain () =
+  let bps = Consensus.default_bytes_per_sigop in
+  let weight = 1600 in
+  let plain_vsize = (weight + 3) / 4 in
+  (* sigop_cost = 0: adjusted vsize = plain vsize *)
+  let adj0 = Validation.get_virtual_transaction_size ~weight ~sigop_cost:0 ~bytes_per_sigop:bps in
+  Alcotest.(check int) "zero sigops: equal to plain vsize" plain_vsize adj0;
+  (* sigop_cost = 1: adj = max(1600, 20) = 1600, vsize = 400 — same *)
+  let adj1 = Validation.get_virtual_transaction_size ~weight ~sigop_cost:1 ~bytes_per_sigop:bps in
+  Alcotest.(check bool) "adj vsize >= plain vsize" true (adj1 >= plain_vsize)
+
+(* ============================================================================
    Test Registration
    ============================================================================ *)
 
@@ -1279,6 +1465,20 @@ let () =
     "tx_weight", [
       test_case "weight without witness" `Quick test_tx_weight_no_witness;
       test_case "weight with witness" `Quick test_tx_weight_with_witness;
+    ];
+    "bip141_weight_vsize", [
+      test_case "G7: legacy weight = base_size*4" `Quick test_weight_legacy_formula;
+      test_case "G8: segwit weight = base_size*3+total" `Quick test_weight_segwit_formula;
+      test_case "G8: stripped vs total relationship" `Quick test_weight_stripped_and_total;
+      test_case "G9: vsize = ceil(weight/4)" `Quick test_vsize_ceiling_divide;
+      test_case "G10: get_sigops_adjusted_weight" `Quick test_get_sigops_adjusted_weight;
+      test_case "G11: get_virtual_transaction_size sigop inflation" `Quick test_get_virtual_transaction_size_sigop_inflation;
+      test_case "G12: DEFAULT_BYTES_PER_SIGOP=20" `Quick test_default_bytes_per_sigop_constant;
+      test_case "G3+G4: MIN_TRANSACTION_WEIGHT constants" `Quick test_min_weight_constants;
+      test_case "G6: WITNESS_SCALE_FACTOR=4" `Quick test_witness_scale_factor;
+      test_case "MAX_STANDARD_TX_WEIGHT boundary" `Quick test_max_standard_tx_weight_boundary;
+      test_case "MAX_BLOCK_WEIGHT boundary" `Quick test_max_block_weight_boundary;
+      test_case "sigop-adjusted never below plain" `Quick test_sigop_adjusted_never_below_plain;
     ];
     "check_transaction", [
       test_case "valid transaction" `Quick test_check_transaction_valid;

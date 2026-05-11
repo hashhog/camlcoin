@@ -120,9 +120,29 @@ let compute_tx_weight (tx : Types.transaction) : int =
   (* weight = base_size * 3 + total_size *)
   base_size * (Consensus.witness_scale_factor - 1) + total_size
 
-(* Virtual size is weight / 4, rounded up *)
+(* Virtual size is weight / 4, rounded up.
+   For the plain (no-sigop-adjustment) case only. Use get_virtual_transaction_size
+   when you have a sigop cost to apply. *)
 let compute_tx_vsize (tx : Types.transaction) : int =
   (compute_tx_weight tx + 3) / 4
+
+(* GetSigOpsAdjustedWeight — policy/policy.cpp:390-393
+   Returns max(weight, sigop_cost * bytes_per_sigop).
+   When bytes_per_sigop = 0 (no sigop adjustment requested) this reduces to weight.
+   This prevents sigop-exhaustion attacks by making high-sigop transactions
+   appear heavier for feerate and vsize purposes. *)
+let get_sigops_adjusted_weight ~(weight : int) ~(sigop_cost : int)
+    ~(bytes_per_sigop : int) : int =
+  if bytes_per_sigop = 0 then weight
+  else max weight (sigop_cost * bytes_per_sigop)
+
+(* GetVirtualTransactionSize — policy/policy.cpp:395-398
+   vsize = ceil(get_sigops_adjusted_weight(weight, sigop_cost, bytes_per_sigop) / WITNESS_SCALE_FACTOR)
+   When sigop_cost = 0 or bytes_per_sigop = 0 this is just ceil(weight / 4). *)
+let get_virtual_transaction_size ~(weight : int) ~(sigop_cost : int)
+    ~(bytes_per_sigop : int) : int =
+  let adj = get_sigops_adjusted_weight ~weight ~sigop_cost ~bytes_per_sigop in
+  (adj + Consensus.witness_scale_factor - 1) / Consensus.witness_scale_factor
 
 (* Compute the full serialized size of a transaction including witness data *)
 let compute_tx_size (tx : Types.transaction) : int =

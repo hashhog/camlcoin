@@ -763,39 +763,45 @@ let is_compressed_pubkey (pk : Cstruct.t) : bool =
   Cstruct.length pk = 33 &&
   (let prefix = Cstruct.get_uint8 pk 0 in prefix = 0x02 || prefix = 0x03)
 
-(* Check public key encoding validity *)
+(* Check public key encoding validity.
+   Mirrors Bitcoin Core's CheckPubKeyEncoding (script/interpreter.cpp:218-227).
+   Two independent gates:
+     1. STRICTENC: reject anything that is not compressed-or-uncompressed SEC encoding.
+     2. WITNESS_PUBKEYTYPE (BIP-141): in segwit v0, require *compressed* key (no 0x04).
+   Both gates apply to empty pubkeys: an empty key is neither compressed nor
+   uncompressed, so it fails both checks regardless of STRICTENC.  The previous
+   code short-circuited on pk_len=0 without testing WITNESS_PUBKEYTYPE — that was
+   a bug: an empty pubkey in witness v0 with WITNESS_PUBKEYTYPE must be rejected.
+   Core ref: IsCompressedPubKey(empty) = false, so the WITNESS_PUBKEYTYPE gate fires.
+*)
 let check_pubkey_encoding (pk : Cstruct.t) (flags : int) (sig_version : sig_version) : (unit, string) result =
   let pk_len = Cstruct.length pk in
-  if pk_len = 0 then begin
-    (* Empty pubkeys are invalid with STRICTENC *)
-    if flags land script_verify_strictenc <> 0 then
+  (* STRICTENC gate: must be valid compressed (33 B, 0x02/0x03) or uncompressed
+     (65 B, 0x04).  Empty and all other lengths/prefixes are invalid. *)
+  if flags land script_verify_strictenc <> 0 then begin
+    let valid_encoding =
+      is_compressed_pubkey pk || (pk_len = 65 && Cstruct.get_uint8 pk 0 = 0x04)
+    in
+    if not valid_encoding then
       Error "Invalid public key encoding"
+    (* If STRICTENC accepted the key it is either compressed or uncompressed.
+       WITNESS_PUBKEYTYPE further restricts witness v0 to compressed only. *)
+    else if flags land script_verify_witness_pubkeytype <> 0 &&
+            sig_version = SigVersionWitnessV0 &&
+            not (is_compressed_pubkey pk) then
+      Error "Witness requires compressed pubkey"
     else
       Ok ()
-  end
-  else begin
-    (* STRICTENC: must be valid compressed (33 bytes, 0x02/0x03) or uncompressed (65 bytes, 0x04) *)
-    if flags land script_verify_strictenc <> 0 then begin
-      let valid_encoding =
-        is_compressed_pubkey pk || (pk_len = 65 && Cstruct.get_uint8 pk 0 = 0x04)
-      in
-      if not valid_encoding then
-        Error "Invalid public key encoding"
-      else if flags land script_verify_witness_pubkeytype <> 0 &&
-              (sig_version = SigVersionWitnessV0) &&
-              not (is_compressed_pubkey pk) then
-        Error "Witness requires compressed pubkey"
-      else
-        Ok ()
-    end else begin
-      (* Even without STRICTENC, check WITNESS_PUBKEYTYPE *)
-      if flags land script_verify_witness_pubkeytype <> 0 &&
-         (sig_version = SigVersionWitnessV0) &&
-         not (is_compressed_pubkey pk) then
-        Error "Witness requires compressed pubkey"
-      else
-        Ok ()
-    end
+  end else begin
+    (* Without STRICTENC, only WITNESS_PUBKEYTYPE applies.  It must reject any
+       pubkey that is not a valid compressed key — including empty ones.
+       Note: is_compressed_pubkey returns false for empty, so the guard fires. *)
+    if flags land script_verify_witness_pubkeytype <> 0 &&
+       sig_version = SigVersionWitnessV0 &&
+       not (is_compressed_pubkey pk) then
+      Error "Witness requires compressed pubkey"
+    else
+      Ok ()
   end
 
 (* FindAndDelete: Remove all occurrences of a signature from script

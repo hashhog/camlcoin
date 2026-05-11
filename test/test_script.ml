@@ -2719,6 +2719,222 @@ let p2a_verify_tests = [
   Alcotest.test_case "P2A with nonempty scriptSig fails" `Quick test_p2a_with_nonempty_scriptsig_fails;
 ]
 
+(* ============================================================================
+   BIP-66 / CheckSignatureEncoding gate tests (W82)
+
+   Tests for DERSIG, LOW_S, STRICTENC (hashtype + pubkey type), and
+   WITNESS_PUBKEYTYPE (empty pubkey bug fix) gates in the script interpreter.
+   Reference: Bitcoin Core interpreter.cpp:201-227 and interpreter.cpp:335-345.
+   ============================================================================ *)
+
+(* Helper: build a script "<sig> <pubkey> OP_CHECKSIG" hex *)
+let make_checksig_hex sig_hex pk_hex =
+  let sig_push = Printf.sprintf "%02x%s" (String.length sig_hex / 2) sig_hex in
+  let pk_push  = Printf.sprintf "%02x%s" (String.length pk_hex  / 2) pk_hex in
+  sig_push ^ pk_push ^ "ac"
+
+(* Valid minimal DER sig, SIGHASH_ALL=0x01, compressed pubkey *)
+let min_der_sig_hex = "3006020101020101" ^ "01"   (* 9 bytes *)
+let compressed_pk_hex = "02" ^ String.make 64 '0'  (* 33 bytes, 0x02 prefix *)
+
+(* ------------------------------------------------------------------ DERSIG *)
+
+(* DERSIG flag: structurally invalid DER sig must be rejected *)
+let test_dersig_rejects_non_der () =
+  (* Use a garbage 9-byte "sig" that is not DER-encoded *)
+  let bad_sig = "310101010101010101" in  (* first byte 0x31, not 0x30 *)
+  let script_hex = make_checksig_hex bad_sig compressed_pk_hex in
+  let flags = Script.script_verify_dersig in
+  match eval_script_with_flags script_hex flags with
+  | Error _ -> ()  (* Expected: DER error *)
+  | Ok _ -> Alcotest.fail "DERSIG must reject non-DER signature"
+
+(* DERSIG flag absent: structurally invalid DER sig is treated as "fails ECDSA" *)
+let test_no_dersig_allows_non_der () =
+  (* A non-DER sig without DERSIG flag should just push false (fail ECDSA) *)
+  let bad_sig = "310101010101010101" in
+  let script_hex = make_checksig_hex bad_sig compressed_pk_hex in
+  let flags = 0 in
+  match eval_script_with_flags script_hex flags with
+  | Ok false -> ()   (* sig fails ECDSA, pushes false — no encoding error *)
+  | Ok true  -> Alcotest.fail "non-DER sig should not succeed"
+  | Error _  -> ()   (* an error here is also acceptable — no DERSIG gate but ECDSA fails *)
+
+(* DERSIG flag: valid DER sig passes the encoding gate (ECDSA may still fail) *)
+let test_dersig_passes_valid_der () =
+  let script_hex = make_checksig_hex min_der_sig_hex compressed_pk_hex in
+  let flags = Script.script_verify_dersig in
+  match eval_script_with_flags script_hex flags with
+  | Ok false -> ()   (* encoding OK, ECDSA fails → false *)
+  | Ok true  -> ()   (* unexpected success is fine here *)
+  | Error e  ->
+    (* The only allowed error is "non-strict DER" — report anything else as a test failure *)
+    let lower = String.lowercase_ascii e in
+    let is_der = let rec f i = if i + 3 > String.length lower then false
+                               else if String.sub lower i 3 = "der" then true
+                               else f (i+1) in f 0 in
+    if is_der then Alcotest.fail ("Valid DER sig rejected with DERSIG: " ^ e)
+
+(* ----------------------------------------------------------------- STRICTENC hashtype gate *)
+
+(* STRICTENC rejects hashtype 0x00 *)
+let test_strictenc_rejects_zero_hashtype () =
+  (* Build a valid DER sig with hashtype 0x00 *)
+  let sig_ht00 = "3006020101020101" ^ "00" in
+  let script_hex = make_checksig_hex sig_ht00 compressed_pk_hex in
+  let flags = Script.script_verify_strictenc in
+  match eval_script_with_flags script_hex flags with
+  | Error _ -> ()  (* Expected: invalid hashtype error *)
+  | Ok _ -> Alcotest.fail "STRICTENC must reject hashtype 0x00"
+
+(* STRICTENC rejects hashtype 0x04 (out of range) *)
+let test_strictenc_rejects_hashtype_04 () =
+  let sig_ht04 = "3006020101020101" ^ "04" in
+  let script_hex = make_checksig_hex sig_ht04 compressed_pk_hex in
+  let flags = Script.script_verify_strictenc in
+  match eval_script_with_flags script_hex flags with
+  | Error _ -> ()
+  | Ok _ -> Alcotest.fail "STRICTENC must reject hashtype 0x04"
+
+(* STRICTENC allows SIGHASH_ALL = 0x01 *)
+let test_strictenc_allows_sighash_all () =
+  let script_hex = make_checksig_hex min_der_sig_hex compressed_pk_hex in
+  let flags = Script.script_verify_strictenc in
+  match eval_script_with_flags script_hex flags with
+  | Ok _ -> ()  (* encoding OK, ECDSA fails → false or error is fine *)
+  | Error e ->
+    let lower = String.lowercase_ascii e in
+    let is_hashtype = let rec f i = if i + 8 > String.length lower then false
+                                    else if String.sub lower i 8 = "hashtype" then true
+                                    else f (i+1) in f 0 in
+    if is_hashtype then Alcotest.fail ("STRICTENC rejected valid hashtype ALL: " ^ e)
+
+(* STRICTENC allows ANYONECANPAY | SIGHASH_ALL = 0x81 *)
+let test_strictenc_allows_anyonecanpay_all () =
+  let sig_acp = "3006020101020101" ^ "81" in
+  let script_hex = make_checksig_hex sig_acp compressed_pk_hex in
+  let flags = Script.script_verify_strictenc in
+  match eval_script_with_flags script_hex flags with
+  | Ok _ -> ()
+  | Error e ->
+    let lower = String.lowercase_ascii e in
+    let is_hashtype = let rec f i = if i + 8 > String.length lower then false
+                                    else if String.sub lower i 8 = "hashtype" then true
+                                    else f (i+1) in f 0 in
+    if is_hashtype then Alcotest.fail ("STRICTENC rejected ANYONECANPAY|ALL: " ^ e)
+
+(* ----------------------------------------------------------------- STRICTENC pubkey gate *)
+
+(* STRICTENC: uncompressed (0x04, 65B) key is valid for legacy (non-witness) *)
+let test_strictenc_allows_uncompressed_pubkey_legacy () =
+  let uncompressed_pk = "04" ^ String.make 128 '0' in
+  let script_hex = make_checksig_hex min_der_sig_hex uncompressed_pk in
+  let flags = Script.script_verify_strictenc in
+  match eval_script_with_flags script_hex flags with
+  | Ok _ -> ()   (* encoding OK for legacy *)
+  | Error e ->
+    let lower = String.lowercase_ascii e in
+    let is_pubkey = let rec f i = if i + 6 > String.length lower then false
+                                  else if String.sub lower i 6 = "pubkey" then true
+                                  else f (i+1) in f 0 in
+    if is_pubkey then Alcotest.fail ("STRICTENC rejected uncompressed key in legacy: " ^ e)
+
+(* STRICTENC: unknown prefix pubkey (0x05) is rejected *)
+let test_strictenc_rejects_unknown_prefix_pubkey () =
+  let bad_pk = "05" ^ String.make 64 '0' in
+  let script_hex = make_checksig_hex min_der_sig_hex bad_pk in
+  let flags = Script.script_verify_strictenc in
+  match eval_script_with_flags script_hex flags with
+  | Error _ -> ()  (* Expected: pubkey type error *)
+  | Ok _ -> Alcotest.fail "STRICTENC must reject pubkey with prefix 0x05"
+
+(* STRICTENC: 31-byte key (wrong length) is rejected *)
+let test_strictenc_rejects_wrong_length_pubkey () =
+  let bad_pk = "02" ^ String.make 60 '0' in  (* 31 bytes total *)
+  let script_hex = make_checksig_hex min_der_sig_hex bad_pk in
+  let flags = Script.script_verify_strictenc in
+  match eval_script_with_flags script_hex flags with
+  | Error _ -> ()
+  | Ok _ -> Alcotest.fail "STRICTENC must reject 31-byte pubkey"
+
+(* ----------------------------------------------------------------- Empty pubkey + WITNESS_PUBKEYTYPE bug fix *)
+
+(* Bug fix: empty pubkey must be rejected when WITNESS_PUBKEYTYPE + WITNESS_V0 is active.
+   Previously, check_pubkey_encoding short-circuited on pk_len=0 and skipped the
+   WITNESS_PUBKEYTYPE gate.  Core's IsCompressedPubKey(empty)=false fires the gate.
+   We test this via check_pubkey_encoding directly since triggering it through
+   verify_script requires a P2WPKH path where the witness stack already has the
+   hash preimage checked. *)
+let test_check_pubkey_encoding_empty_rejects_witness_pubkeytype () =
+  let empty_pk = Cstruct.create 0 in
+  let flags = Script.script_verify_witness_pubkeytype in
+  match Script.check_pubkey_encoding empty_pk flags Script.SigVersionWitnessV0 with
+  | Error _ -> ()  (* Expected: WITNESS_PUBKEYTYPE rejects empty pubkey *)
+  | Ok () -> Alcotest.fail "Empty pubkey must be rejected with WITNESS_PUBKEYTYPE in witness v0"
+
+(* Without WITNESS_PUBKEYTYPE, empty pubkey is OK in witness v0 (no gate fires) *)
+let test_check_pubkey_encoding_empty_ok_without_flag () =
+  let empty_pk = Cstruct.create 0 in
+  let flags = 0 in
+  match Script.check_pubkey_encoding empty_pk flags Script.SigVersionWitnessV0 with
+  | Ok () -> ()
+  | Error e -> Alcotest.fail ("Empty pubkey without WITNESS_PUBKEYTYPE should be Ok: " ^ e)
+
+(* WITNESS_PUBKEYTYPE in legacy (non-witness v0) context: empty pubkey is OK *)
+let test_check_pubkey_encoding_empty_ok_in_legacy () =
+  let empty_pk = Cstruct.create 0 in
+  let flags = Script.script_verify_witness_pubkeytype in
+  match Script.check_pubkey_encoding empty_pk flags Script.SigVersionBase with
+  | Ok () -> ()
+  | Error e -> Alcotest.fail ("Empty pubkey in legacy with WITNESS_PUBKEYTYPE should be Ok: " ^ e)
+
+(* STRICTENC: empty pubkey is always rejected (length < 33 → not compressed/uncompressed) *)
+let test_check_pubkey_encoding_empty_rejected_by_strictenc () =
+  let empty_pk = Cstruct.create 0 in
+  let flags = Script.script_verify_strictenc in
+  match Script.check_pubkey_encoding empty_pk flags Script.SigVersionBase with
+  | Error _ -> ()  (* Expected *)
+  | Ok () -> Alcotest.fail "Empty pubkey must be rejected by STRICTENC"
+
+(* Uncompressed pubkey (0x04 prefix) rejected by WITNESS_PUBKEYTYPE in witness v0 *)
+let test_check_pubkey_encoding_uncompressed_rejected_in_witness_v0 () =
+  let uncompressed_pk = hex_to_cstruct ("04" ^ String.make 128 '0') in
+  let flags = Script.script_verify_witness_pubkeytype in
+  match Script.check_pubkey_encoding uncompressed_pk flags Script.SigVersionWitnessV0 with
+  | Error _ -> ()  (* Expected *)
+  | Ok () -> Alcotest.fail "Uncompressed pubkey must be rejected by WITNESS_PUBKEYTYPE in witness v0"
+
+(* Compressed pubkey (0x02 prefix) accepted by WITNESS_PUBKEYTYPE in witness v0 *)
+let test_check_pubkey_encoding_compressed_ok_in_witness_v0 () =
+  let compressed_pk = hex_to_cstruct ("02" ^ String.make 64 '0') in
+  let flags = Script.script_verify_witness_pubkeytype in
+  match Script.check_pubkey_encoding compressed_pk flags Script.SigVersionWitnessV0 with
+  | Ok () -> ()
+  | Error e -> Alcotest.fail ("Compressed pubkey should be accepted in witness v0: " ^ e)
+
+let bip66_script_tests = [
+  (* DERSIG gate *)
+  Alcotest.test_case "DERSIG rejects non-DER sig" `Quick test_dersig_rejects_non_der;
+  Alcotest.test_case "no DERSIG: non-DER sig pushes false" `Quick test_no_dersig_allows_non_der;
+  Alcotest.test_case "DERSIG passes valid DER" `Quick test_dersig_passes_valid_der;
+  (* STRICTENC hashtype gate *)
+  Alcotest.test_case "STRICTENC rejects hashtype 0x00" `Quick test_strictenc_rejects_zero_hashtype;
+  Alcotest.test_case "STRICTENC rejects hashtype 0x04" `Quick test_strictenc_rejects_hashtype_04;
+  Alcotest.test_case "STRICTENC allows SIGHASH_ALL" `Quick test_strictenc_allows_sighash_all;
+  Alcotest.test_case "STRICTENC allows ANYONECANPAY|ALL" `Quick test_strictenc_allows_anyonecanpay_all;
+  (* STRICTENC pubkey gate *)
+  Alcotest.test_case "STRICTENC allows uncompressed key in legacy" `Quick test_strictenc_allows_uncompressed_pubkey_legacy;
+  Alcotest.test_case "STRICTENC rejects unknown prefix pubkey" `Quick test_strictenc_rejects_unknown_prefix_pubkey;
+  Alcotest.test_case "STRICTENC rejects wrong-length pubkey" `Quick test_strictenc_rejects_wrong_length_pubkey;
+  (* check_pubkey_encoding: empty pubkey + WITNESS_PUBKEYTYPE bug fix *)
+  Alcotest.test_case "empty pubkey rejected by WITNESS_PUBKEYTYPE in v0" `Quick test_check_pubkey_encoding_empty_rejects_witness_pubkeytype;
+  Alcotest.test_case "empty pubkey ok without WITNESS_PUBKEYTYPE" `Quick test_check_pubkey_encoding_empty_ok_without_flag;
+  Alcotest.test_case "empty pubkey ok in legacy with WITNESS_PUBKEYTYPE" `Quick test_check_pubkey_encoding_empty_ok_in_legacy;
+  Alcotest.test_case "empty pubkey rejected by STRICTENC" `Quick test_check_pubkey_encoding_empty_rejected_by_strictenc;
+  Alcotest.test_case "uncompressed pubkey rejected in witness v0" `Quick test_check_pubkey_encoding_uncompressed_rejected_in_witness_v0;
+  Alcotest.test_case "compressed pubkey ok in witness v0" `Quick test_check_pubkey_encoding_compressed_ok_in_witness_v0;
+]
+
 let () = Alcotest.run "test_script" [
   ("script_num", script_num_tests);
   ("parsing", parsing_tests);
@@ -2746,4 +2962,5 @@ let () = Alcotest.run "test_script" [
   ("p2a_verify", p2a_verify_tests);
   ("cltv_gates", cltv_gate_tests);
   ("csv_gates", csv_gate_tests);
+  ("bip66_gates", bip66_script_tests);
 ]

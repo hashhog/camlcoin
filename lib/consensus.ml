@@ -32,8 +32,18 @@ let witness_scale_factor = 4
 let max_tx_weight = max_block_weight  (* Consensus limit: base_size*4 <= MAX_BLOCK_WEIGHT *)
 let max_standard_tx_weight = 400_000  (* Policy limit for relay/mempool *)
 let max_tx_base_size_for_block = max_block_weight / witness_scale_factor
+(* MIN_TRANSACTION_WEIGHT = WITNESS_SCALE_FACTOR * 60 = 240 (consensus.h:23) *)
 let min_tx_weight = 4 * 60  (* 240 weight units *)
+(* MIN_SERIALIZABLE_TRANSACTION_WEIGHT = WITNESS_SCALE_FACTOR * 10 = 40 (consensus.h:24).
+   Used as a lower bound for compact-block / merkle-block parsing, not a hard tx gate. *)
+let min_serializable_tx_weight = 4 * 10  (* 40 weight units *)
 let max_standard_tx_sigops_cost = 16_000
+(* DEFAULT_BYTES_PER_SIGOP = 20 (policy.h:50).
+   Used in GetSigOpsAdjustedWeight / GetVirtualTransactionSize to inflate the effective
+   weight of high-sigop transactions: adjusted = max(weight, sigop_cost * bytes_per_sigop).
+   This prevents sigop exhaustion attacks by making high-sigop txs appear heavier for
+   fee-rate and vsize purposes. *)
+let default_bytes_per_sigop = 20
 let max_script_size = 10_000
 let max_script_element_size = 520
 let max_ops_per_script = 201

@@ -781,7 +781,8 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
                  ~expected_bits:block.header.bits ~median_time ~prev_block_time
                  ~base_lookup ~flags:validation_flags
                  ~skip_scripts:false
-                 ~get_mtp_at_height:(Sync.get_mtp_for_height chain) () with
+                 ~get_mtp_at_height:(Sync.get_mtp_for_height chain)
+                 ?bip34_height_hash:(Sync.bip34_height_hash_for chain) () with
         | Validation.AB_err e -> Error (Validation.block_error_to_string e)
         | Validation.AB_ok (_fees, txid_arr, _spent_utxos) ->
         (* Write tx_index entries for every tx in this submitblock-

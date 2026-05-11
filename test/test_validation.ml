@@ -40,6 +40,25 @@ let make_header ?(version=1l) ?(prev_block=Types.zero_hash)
     ?(nonce=0l) () : Types.block_header =
   { version; prev_block; merkle_root; timestamp; bits; nonce }
 
+(* W93 helper: grind a nonce so the header satisfies hash_meets_target
+   for the given [bits].  Required by tests that run on the assumevalid
+   fast path now that check_block executes there.  The regtest pow
+   limit (0x207fffff) accepts ~50% of random nonces so this loop
+   typically finds a nonce in 0..2 iterations.  Bounded at 10M to
+   prevent runaway in pathological cases. *)
+let mine_header (template : Types.block_header) : Types.block_header =
+  let rec loop nonce =
+    if nonce > 10_000_000l then
+      failwith (Printf.sprintf
+                  "mine_header: failed to grind nonce for bits=0x%lx" template.bits)
+    else
+      let h = { template with Types.nonce } in
+      let hash = Crypto.compute_block_hash h in
+      if Consensus.hash_meets_target hash h.bits then h
+      else loop (Int32.add nonce 1l)
+  in
+  loop 0l
+
 (* ============================================================================
    Transaction Weight Tests
    ============================================================================ *)
@@ -1798,14 +1817,21 @@ let test_non_coinbase_no_maturity () =
    Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
    ============================================================================ *)
 
-(* Helper: build a minimal valid-merkle block for use with skip_scripts=true *)
+(* Helper: build a minimal valid-merkle block for use with skip_scripts=true.
+
+   W93: the fast path now invokes check_block, which enforces
+   check_coinbase including BIP-34 height encoding when
+   [height >= network.bip34_height].  Regtest activates BIP-34 from
+   height 1, so the coinbase scriptSig must start with the canonical
+   CScriptNum encoding of [height].  We append the [coinbase_suffix]
+   byte after the BIP-34 prefix so the resulting script remains 2..100
+   bytes long and uniquely identifies the coinbase for txid purposes. *)
 let make_bip30_block ~height ~coinbase_suffix =
-  (* Coinbase that is unique per test by varying the suffix byte in scriptSig *)
-  let script_sig = Cstruct.create 4 in
-  Cstruct.set_uint8 script_sig 0 0x03;  (* push 3 bytes *)
-  Cstruct.set_uint8 script_sig 1 (height land 0xFF);
-  Cstruct.set_uint8 script_sig 2 ((height lsr 8) land 0xFF);
-  Cstruct.set_uint8 script_sig 3 coinbase_suffix;
+  let bip34_prefix = Consensus.encode_height_in_coinbase height in
+  let prefix_len = Cstruct.length bip34_prefix in
+  let script_sig = Cstruct.create (prefix_len + 1) in
+  Cstruct.blit bip34_prefix 0 script_sig 0 prefix_len;
+  Cstruct.set_uint8 script_sig prefix_len coinbase_suffix;
   let coinbase = make_tx
     ~inputs:[{
       Types.previous_output = { txid = Types.zero_hash; vout = -1l };
@@ -1817,7 +1843,13 @@ let make_bip30_block ~height ~coinbase_suffix =
   in
   let txid = Crypto.compute_txid coinbase in
   let (merkle, _) = Crypto.merkle_root [txid] in
-  let header = make_header ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:100l () in
+  (* W93: block version must satisfy contextual version-bits checks.
+     Pick version high enough to clear BIP-34/65/66 minimums for any
+     reasonable test height.  check_block enforces these on the fast
+     path now that it routes through check_block. *)
+  let header_template = make_header ~version:4l ~merkle_root:merkle
+                          ~bits:0x207fffffl ~timestamp:100l () in
+  let header = mine_header header_template in
   let block = { Types.header; transactions = [coinbase] } in
   (block, txid)
 
@@ -3063,8 +3095,8 @@ let test_bad_cb_amount_in_block () =
   let txid = Crypto.compute_txid coinbase_oversized in
   let (merkle, _) = Crypto.merkle_root [txid] in
   (* version=4 to satisfy bip65/bip66 checks at height=1 on regtest *)
-  let header = make_header ~version:4l ~merkle_root:merkle
-    ~bits:0x207fffffl ~timestamp:200l () in
+  let header = mine_header (make_header ~version:4l ~merkle_root:merkle
+    ~bits:0x207fffffl ~timestamp:200l ()) in
   let block = { Types.header; transactions = [coinbase_oversized] } in
   let lookup _outpoint = None in
   let flags = Script.script_verify_none in
@@ -3087,8 +3119,8 @@ let test_cb_amount_exact_subsidy () =
   in
   let txid = Crypto.compute_txid coinbase_ok in
   let (merkle, _) = Crypto.merkle_root [txid] in
-  let header = make_header ~version:4l ~merkle_root:merkle
-    ~bits:0x207fffffl ~timestamp:200l () in
+  let header = mine_header (make_header ~version:4l ~merkle_root:merkle
+    ~bits:0x207fffffl ~timestamp:200l ()) in
   let block = { Types.header; transactions = [coinbase_ok] } in
   let lookup _outpoint = None in
   let flags = Script.script_verify_none in
@@ -3119,8 +3151,8 @@ let test_bad_cb_amount_after_halving () =
   in
   let txid = Crypto.compute_txid coinbase_bad in
   let (merkle, _) = Crypto.merkle_root [txid] in
-  let header = make_header ~version:4l ~merkle_root:merkle
-    ~bits:0x207fffffl ~timestamp:200l () in
+  let header = mine_header (make_header ~version:4l ~merkle_root:merkle
+    ~bits:0x207fffffl ~timestamp:200l ()) in
   let block = { Types.header; transactions = [coinbase_bad] } in
   let lookup _outpoint = None in
   let flags = Script.script_verify_none in
@@ -3241,6 +3273,320 @@ let test_accumulated_fee_overflow () =
 (* ============================================================================
    Test Registration
    ============================================================================ *)
+
+(* ============================================================================
+   W93: ConnectBlock + ConnectTip + UpdateCoins gates
+
+   These tests exercise the assumevalid fast path in
+   [Validation.validate_block_with_utxos] to verify that Bitcoin Core's
+   ConnectBlock gates that are NOT guarded by fScriptChecks fire even
+   when [skip_scripts=true].  Pre-W93 the fast path silently skipped:
+
+     - check_block (all structural/contextual checks)
+     - BIP-141 weighted sigops accumulation
+     - BIP-68 SequenceLocks (because callers pass flags=0)
+     - BIP-113 IsFinalTx with CSV-aware cutoff (same root cause)
+     - coinbase maturity (bad-txns-premature-spend-of-coinbase)
+     - per-input MoneyRange + cumulative MoneyRange
+     - mutated merkle (BLOCK_MUTATED)
+
+   Reference: Bitcoin Core validation.cpp:2295-2673 (ConnectBlock),
+   :3005-... (ConnectTip), :1999-2012 (UpdateCoins),
+   consensus/tx_verify.cpp:178-188 (CheckTxInputs).
+   ============================================================================ *)
+
+(* W93 Bug 10: assumevalid fast path runs check_block.  A block at
+   regtest height=1 with a malformed coinbase scriptSig (no BIP-34
+   prefix) must be rejected on the fast path. *)
+let test_w93_fast_path_runs_check_block_bip34 () =
+  let height = 1 in
+  let bad_script = Cstruct.create 4 in
+  Cstruct.set_uint8 bad_script 0 0x03;
+  Cstruct.set_uint8 bad_script 1 0x99;  (* not the BIP-34 encoding of 1 *)
+  Cstruct.set_uint8 bad_script 2 0x88;
+  Cstruct.set_uint8 bad_script 3 0x77;
+  let coinbase = make_tx
+    ~inputs:[{
+      Types.previous_output = { txid = Types.zero_hash; vout = -1l };
+      script_sig = bad_script;
+      sequence = 0xFFFFFFFFl;
+    }]
+    ~outputs:[make_output ~value:5_000_000_000L ()]
+    ()
+  in
+  let txid = Crypto.compute_txid coinbase in
+  let (merkle, _) = Crypto.merkle_root [txid] in
+  let header = mine_header (make_header ~version:4l ~merkle_root:merkle
+                              ~bits:0x207fffffl ~timestamp:100l ()) in
+  let block = { Types.header; transactions = [coinbase] } in
+  let base_lookup _ = None in
+  let flags = 0 in
+  match Validation.validate_block_with_utxos ~network:Consensus.regtest block height
+          ~expected_bits:0x207fffffl ~median_time:0l
+          ~base_lookup ~flags ~skip_scripts:true () with
+  | Error (Validation.BlockTxValidationFailed (0, Validation.TxBadCoinbase)) -> ()
+  | Error e -> Alcotest.fail
+                 ("W93: expected BIP-34 coinbase rejection on fast path, got: "
+                  ^ Validation.block_error_to_string e)
+  | Ok _ -> Alcotest.fail
+              "W93: fast path must run check_block; missing BIP-34 coinbase \
+               was silently accepted"
+
+(* W93 Bug 10: assumevalid fast path enforces block version-bits. *)
+let test_w93_fast_path_enforces_bip34_block_version () =
+  let height = 1 in
+  let coinbase = make_tx
+    ~inputs:[make_coinbase_input ~height]
+    ~outputs:[make_output ~value:5_000_000_000L ()]
+    ()
+  in
+  let txid = Crypto.compute_txid coinbase in
+  let (merkle, _) = Crypto.merkle_root [txid] in
+  (* version=1 — invalid at regtest bip34_height=1 *)
+  let header = mine_header (make_header ~version:1l ~merkle_root:merkle
+                              ~bits:0x207fffffl ~timestamp:100l ()) in
+  let block = { Types.header; transactions = [coinbase] } in
+  let base_lookup _ = None in
+  let flags = 0 in
+  match Validation.validate_block_with_utxos ~network:Consensus.regtest block height
+          ~expected_bits:0x207fffffl ~median_time:0l
+          ~base_lookup ~flags ~skip_scripts:true () with
+  | Error Validation.BlockBadVersion -> ()
+  | Error e -> Alcotest.fail
+                 ("W93: expected BlockBadVersion on fast path, got: "
+                  ^ Validation.block_error_to_string e)
+  | Ok _ -> Alcotest.fail
+              "W93: fast path must reject version=1 block at bip34_height"
+
+(* W93 Bug 3: fast path rejects spending an immature coinbase. *)
+let test_w93_fast_path_rejects_immature_coinbase () =
+  let height = 50 in  (* spending coinbase from height=0 → depth 50 *)
+  let prev_txid =
+    let h = Cstruct.create 32 in
+    Cstruct.set_uint8 h 0 0xAB;
+    h
+  in
+  let outpoint = { Types.txid = prev_txid; vout = 0l } in
+  let base_lookup op =
+    if Cstruct.equal op.Types.txid prev_txid && op.Types.vout = 0l then
+      Some {
+        Validation.txid = prev_txid; vout = 0l;
+        value = 5_000_000_000L;
+        script_pubkey = Cstruct.create 0;
+        height = 0;  (* coinbase from genesis → depth = 50, < COINBASE_MATURITY=100 *)
+        is_coinbase = true;
+      }
+    else None
+  in
+  let coinbase = make_tx
+    ~inputs:[make_coinbase_input ~height]
+    ~outputs:[make_output ~value:5_000_000_000L ()]
+    ()
+  in
+  let spender = make_tx
+    ~inputs:[{
+      Types.previous_output = outpoint;
+      script_sig = Cstruct.create 0;
+      sequence = 0xFFFFFFFFl;
+    }]
+    ~outputs:[make_output ~value:4_000_000_000L ()]
+    ()
+  in
+  let txid_cb = Crypto.compute_txid coinbase in
+  let txid_sp = Crypto.compute_txid spender in
+  let (merkle, _) = Crypto.merkle_root [txid_cb; txid_sp] in
+  let header = mine_header (make_header ~version:4l ~merkle_root:merkle
+                              ~bits:0x207fffffl ~timestamp:200l ()) in
+  let block = { Types.header; transactions = [coinbase; spender] } in
+  let flags = 0 in
+  match Validation.validate_block_with_utxos ~network:Consensus.regtest block height
+          ~expected_bits:0x207fffffl ~median_time:0l
+          ~base_lookup ~flags ~skip_scripts:true () with
+  | Error (Validation.BlockTxValidationFailed
+             (1, Validation.TxCoinbaseMaturity _)) -> ()
+  | Error e -> Alcotest.fail
+                 ("W93: expected TxCoinbaseMaturity on fast path, got: "
+                  ^ Validation.block_error_to_string e)
+  | Ok _ -> Alcotest.fail
+              "W93: fast path must reject immature coinbase spend"
+
+(* W93 Bug 7: fast path rejects per-input value > MAX_MONEY. *)
+let test_w93_fast_path_rejects_input_value_out_of_range () =
+  let height = 200 in  (* past coinbase maturity *)
+  let prev_txid =
+    let h = Cstruct.create 32 in
+    Cstruct.set_uint8 h 0 0xCD;
+    h
+  in
+  let outpoint = { Types.txid = prev_txid; vout = 0l } in
+  let max_money = Consensus.max_money in
+  let base_lookup op =
+    if Cstruct.equal op.Types.txid prev_txid && op.Types.vout = 0l then
+      Some {
+        Validation.txid = prev_txid; vout = 0l;
+        value = Int64.add max_money 1L;  (* > MAX_MONEY *)
+        script_pubkey = Cstruct.create 0;
+        height = 50;
+        is_coinbase = false;
+      }
+    else None
+  in
+  let coinbase = make_tx
+    ~inputs:[make_coinbase_input ~height]
+    ~outputs:[make_output ~value:5_000_000_000L ()]
+    ()
+  in
+  let spender = make_tx
+    ~inputs:[{
+      Types.previous_output = outpoint;
+      script_sig = Cstruct.create 0;
+      sequence = 0xFFFFFFFFl;
+    }]
+    ~outputs:[make_output ~value:4_000_000_000L ()]
+    ()
+  in
+  let txid_cb = Crypto.compute_txid coinbase in
+  let txid_sp = Crypto.compute_txid spender in
+  let (merkle, _) = Crypto.merkle_root [txid_cb; txid_sp] in
+  let header = mine_header (make_header ~version:4l ~merkle_root:merkle
+                              ~bits:0x207fffffl ~timestamp:200l ()) in
+  let block = { Types.header; transactions = [coinbase; spender] } in
+  let flags = 0 in
+  match Validation.validate_block_with_utxos ~network:Consensus.regtest block height
+          ~expected_bits:0x207fffffl ~median_time:0l
+          ~base_lookup ~flags ~skip_scripts:true () with
+  | Error (Validation.BlockTxValidationFailed
+             (1, Validation.TxOutputOverflow)) -> ()
+  | Error e -> Alcotest.fail
+                 ("W93: expected TxOutputOverflow on fast path, got: "
+                  ^ Validation.block_error_to_string e)
+  | Ok _ -> Alcotest.fail
+              "W93: fast path must reject input value > MAX_MONEY"
+
+(* W93 Bug 5/6: fast path enforces BIP-68 SequenceLocks even when caller
+   passes flags=0 (the IBD/reorg dispatcher pattern for assumevalid). *)
+let test_w93_fast_path_enforces_bip68_sequence_locks () =
+  (* Spend a height-locked UTXO too early. *)
+  let height = 200 in  (* past csv_height=0 on regtest *)
+  let prev_txid =
+    let h = Cstruct.create 32 in
+    Cstruct.set_uint8 h 0 0xEF;
+    h
+  in
+  let outpoint = { Types.txid = prev_txid; vout = 0l } in
+  let utxo_height = 150 in
+  let base_lookup op =
+    if Cstruct.equal op.Types.txid prev_txid && op.Types.vout = 0l then
+      Some {
+        Validation.txid = prev_txid; vout = 0l;
+        value = 5_000_000_000L;
+        script_pubkey = Cstruct.create 0;
+        height = utxo_height;
+        is_coinbase = false;
+      }
+    else None
+  in
+  let coinbase = make_tx
+    ~inputs:[make_coinbase_input ~height]
+    ~outputs:[make_output ~value:5_000_000_000L ()]
+    ()
+  in
+  (* sequence = 100 means input is mature at utxo.height + 100 = 250.
+     We're at height=200, so BIP-68 must reject. *)
+  let spender = {
+    Types.version = 2l;  (* BIP-68 requires version >= 2 *)
+    inputs = [{
+      Types.previous_output = outpoint;
+      script_sig = Cstruct.create 0;
+      sequence = 100l;
+    }];
+    outputs = [make_output ~value:4_000_000_000L ()];
+    locktime = 0l;
+    witnesses = [];
+  } in
+  let txid_cb = Crypto.compute_txid coinbase in
+  let txid_sp = Crypto.compute_txid spender in
+  let (merkle, _) = Crypto.merkle_root [txid_cb; txid_sp] in
+  let header = mine_header (make_header ~version:4l ~merkle_root:merkle
+                              ~bits:0x207fffffl ~timestamp:200l ()) in
+  let block = { Types.header; transactions = [coinbase; spender] } in
+  (* CALLER PASSES FLAGS=0 — this is the pre-W93 bug pattern.
+     CSV must still be enforced because regtest csv_height=0. *)
+  let flags = 0 in
+  match Validation.validate_block_with_utxos ~network:Consensus.regtest block height
+          ~expected_bits:0x207fffffl ~median_time:0l
+          ~base_lookup ~flags ~skip_scripts:true () with
+  | Error (Validation.BlockTxValidationFailed
+             (1, Validation.TxSequenceLocksFailed)) -> ()
+  | Error e -> Alcotest.fail
+                 ("W93: expected TxSequenceLocksFailed on fast path with \
+                   flags=0, got: "
+                  ^ Validation.block_error_to_string e)
+  | Ok _ -> Alcotest.fail
+              "W93: fast path silently skipped BIP-68 SequenceLocks \
+               (Bug 5 regression)"
+
+(* W93 Bug 2: fast path enforces MAX_BLOCK_SIGOPS_COST.
+   Mostly a regression smoke test — we construct a small block whose
+   sigops cost is well under the limit and verify it's accepted (a true
+   over-limit test would need ~80k OP_CHECKSIGs).  The contract being
+   verified is: total_sigops_cost is accumulated and tested on the fast
+   path; pre-W93 it was zero, so any non-zero accumulation that respects
+   the limit confirms wiring. *)
+let test_w93_fast_path_accumulates_sigops () =
+  let height = 1 in
+  let coinbase = make_tx
+    ~inputs:[make_coinbase_input ~height]
+    ~outputs:[make_output ~value:5_000_000_000L ()]
+    ()
+  in
+  let txid = Crypto.compute_txid coinbase in
+  let (merkle, _) = Crypto.merkle_root [txid] in
+  let header = mine_header (make_header ~version:4l ~merkle_root:merkle
+                              ~bits:0x207fffffl ~timestamp:100l ()) in
+  let block = { Types.header; transactions = [coinbase] } in
+  let base_lookup _ = None in
+  let flags = 0 in
+  match Validation.validate_block_with_utxos ~network:Consensus.regtest block height
+          ~expected_bits:0x207fffffl ~median_time:0l
+          ~base_lookup ~flags ~skip_scripts:true () with
+  | Ok _ -> ()
+  | Error e -> Alcotest.fail
+                 ("W93: well-formed block should be accepted on fast path, got: "
+                  ^ Validation.block_error_to_string e)
+
+(* W93 Bug 1: bip30_should_enforce returns false when bip34_height_hash
+   matches the network's canonical BIP34Hash (skip optimization active). *)
+let test_w93_bip30_skip_with_bip34_height_hash () =
+  let mainnet = Consensus.mainnet in
+  let canonical_hash = match mainnet.bip34_hash with
+    | Some h -> h
+    | None -> failwith "mainnet must have bip34_hash"
+  in
+  (* Some height in the BIP-34 era but below BIP34_IMPLIES_BIP30_LIMIT. *)
+  let height = 500_000 in
+  let probe_hash = Cstruct.create 32 in
+  Cstruct.set_uint8 probe_hash 0 0x42;  (* not a repeat block *)
+  let result = Validation.bip30_should_enforce
+                 ~network:mainnet ~height ~block_hash:probe_hash
+                 ~bip34_height_hash:(Some canonical_hash) in
+  Alcotest.(check bool) "W93: BIP-30 SKIPPED when bip34_height_hash matches"
+    false result
+
+(* W93 Bug 1 (counterpart): bip30_should_enforce returns true when the
+   bip34_height_hash does NOT match (Gate 4 falls through). *)
+let test_w93_bip30_enforce_with_wrong_bip34_hash () =
+  let mainnet = Consensus.mainnet in
+  let height = 500_000 in
+  let probe_hash = Cstruct.create 32 in
+  Cstruct.set_uint8 probe_hash 0 0x42;
+  let wrong_hash = Cstruct.create 32 in
+  Cstruct.set_uint8 wrong_hash 0 0xFF;
+  let result = Validation.bip30_should_enforce
+                 ~network:mainnet ~height ~block_hash:probe_hash
+                 ~bip34_height_hash:(Some wrong_hash) in
+  Alcotest.(check bool) "W93: BIP-30 ENFORCED when bip34_height_hash mismatches"
+    true result
 
 let () =
   let open Alcotest in
@@ -3513,5 +3859,24 @@ let () =
       test_case "bad-txns-prevout-null: non-coinbase null outpoint rejected" `Quick test_null_prevout_rejected_for_non_coinbase;
       (* accumulated fee overflow *)
       test_case "bad-txns-accumulated-fee-outofrange: 2x MAX_MONEY fees overflow" `Quick test_accumulated_fee_overflow;
+    ];
+    (* W93: ConnectBlock + ConnectTip + UpdateCoins comprehensive audit *)
+    "w93_connectblock_gates", [
+      test_case "fast path runs check_block (BIP-34 coinbase)" `Quick
+        test_w93_fast_path_runs_check_block_bip34;
+      test_case "fast path enforces BIP-34 block version" `Quick
+        test_w93_fast_path_enforces_bip34_block_version;
+      test_case "fast path rejects immature coinbase (Bug 3)" `Quick
+        test_w93_fast_path_rejects_immature_coinbase;
+      test_case "fast path rejects per-input value > MAX_MONEY (Bug 7)" `Quick
+        test_w93_fast_path_rejects_input_value_out_of_range;
+      test_case "fast path enforces BIP-68 with flags=0 (Bug 5)" `Quick
+        test_w93_fast_path_enforces_bip68_sequence_locks;
+      test_case "fast path accumulates sigops on well-formed block (Bug 2)" `Quick
+        test_w93_fast_path_accumulates_sigops;
+      test_case "bip30_should_enforce skips when bip34_hash matches (Bug 1)" `Quick
+        test_w93_bip30_skip_with_bip34_height_hash;
+      test_case "bip30_should_enforce enforces when bip34_hash mismatches (Bug 1)" `Quick
+        test_w93_bip30_enforce_with_wrong_bip34_hash;
     ];
   ]

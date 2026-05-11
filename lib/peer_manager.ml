@@ -2473,8 +2473,7 @@ let create_mempool_lookup (pm : t) ~(k0 : int64) ~(k1 : int64)
    Returns the reconstructed block if successful, or a list of missing indices. *)
 let reconstruct_from_mempool (pm : t) (cb : P2p.compact_block)
     : P2p.reconstruct_status =
-  let header_hash = Crypto.compute_block_hash cb.header in
-  let (k0, k1) = Crypto.SipHash.derive_keys header_hash cb.nonce in
+  let (k0, k1) = Crypto.SipHash.derive_keys cb.header cb.nonce in
   let lookup_tbl = create_mempool_lookup pm ~k0 ~k1 in
   let lookup = { P2p.by_short_id = lookup_tbl } in
   P2p.reconstruct_block cb lookup

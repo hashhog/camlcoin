@@ -669,7 +669,21 @@ let test_never_active_deployment () =
   Alcotest.(check bool) "never active at height 100000" true
     (state2 = Consensus.Failed)
 
-(* Test state transitions: Defined -> Started -> LockedIn -> Active *)
+(* Test state transitions: Defined -> Started -> LockedIn -> Active
+
+   Bitcoin Core versionbits.cpp:GetStateFor uses the MTP of the last block of
+   the *previous* period (= the anchor, period_start - 1) to drive state
+   transitions.  Chain layout for this test:
+
+   Period 0 (blocks 0-2015): anchor = block -1 (before genesis) → Defined
+     Blocks 0-2015 have MTP < start_time (irrelevant — anchor is genesis parent)
+   Period 1 (blocks 2016-4031): anchor = block 2015, MTP >= start_time → Started
+     No signals in period 1.
+   Period 2 (blocks 4032-6047): anchor = block 4031, MTP >= start_time, signals → LockedIn
+     Signals in period 2 (start_height=4032): 2016 >= threshold.
+   Period 3 (blocks 6048-8063): anchor = block 6047.  LockedIn.
+     period_start=6048 >= min_activation_height=0 → Active.
+*)
 let test_full_activation_cycle () =
   let period = 2016 in
   let threshold = 1815 in  (* 90% of 2016 *)
@@ -686,33 +700,27 @@ let test_full_activation_cycle () =
     threshold;
   } in
 
-  (* Create a simulated chain:
-     - Period 0 (0-2015): MTP < start_time -> Defined
-     - Period 1 (2016-4031): MTP >= start_time, not enough signals -> Started
-     - Period 2 (4032-6047): MTP >= start_time, 1815+ signals -> LockedIn
-     - Period 3 (6048+): After LockedIn -> Active *)
-
+  (* Key: the anchor for a period is period_start - 1.
+     - Anchor for period 0 = -1 (genesis parent, get_block returns None → Defined)
+     - Anchor for period 1 = 2015 → must have MTP >= start_time
+     - Anchor for period 2 = 4031 → must have MTP >= start_time
+     - Anchor for period 3 = 6047 → must have MTP >= start_time
+     Block 2015 is the boundary: heights < 2015 have MTP < start_time,
+     heights >= 2015 have MTP >= start_time. *)
   let make_block height =
     let mtp =
-      if height < 2016 then 500000L    (* Before start_time *)
-      else 1500000L                     (* After start_time *)
+      if height < 2015 then 500000L    (* Before start_time *)
+      else 1500000L                     (* After start_time — covers all anchors *)
     in
-    (* In period 2, signal from all blocks *)
-    let version =
-      if height >= 4032 && height < 6048 then
-        0x20000001l  (* Signaling bit 0 *)
-      else
-        0x20000000l  (* Not signaling *)
-    in
-    Some { Consensus.height; version; median_time_past = mtp }
+    Some { Consensus.height; version = 0x20000000l; median_time_past = mtp }
   in
 
+  (* count_signals is called with the start_height of the period being evaluated
+     when the state machine is in Started.  We signal in period 2 (start_height=4032)
+     to trigger LockedIn. *)
   let count_signals ~start_height =
-    (* In period 2 (4032-6047), all blocks signal *)
-    if start_height >= 4032 && start_height < 6048 then
-      2016  (* All blocks signal *)
-    else
-      0
+    if start_height = 4032 then 2016  (* All blocks in period 2 signal *)
+    else 0
   in
 
   let cache = ref Consensus.DeploymentCache.empty in
@@ -723,23 +731,29 @@ let test_full_activation_cycle () =
       ~dep ~height ~get_block:make_block ~count_signals ~cache
   in
 
-  (* Period 0: Defined (MTP < start_time) *)
+  (* Period 0: Defined — anchor is genesis parent (height -1), no block → Defined *)
   Alcotest.(check bool) "period 0 is defined" true
     (get_state 1000 = Consensus.Defined);
 
-  (* Period 1: Started (MTP >= start_time but not enough signals) *)
+  (* Period 1 (2016-4031): anchor = block 2015, MTP=1500000L >= start_time → Started *)
   Alcotest.(check bool) "period 1 is started" true
     (get_state 3000 = Consensus.Started);
 
-  (* Period 2: LockedIn (threshold met) *)
+  (* Period 2 (4032-6047): Started + signals(4032)=2016 >= 1815 → LockedIn *)
   Alcotest.(check bool) "period 2 is locked_in" true
     (get_state 5000 = Consensus.LockedIn);
 
-  (* Period 3: Active (after LockedIn) *)
+  (* Period 3 (6048-8063): LockedIn + period_start=6048 >= min_activation_height=0 → Active *)
   Alcotest.(check bool) "period 3 is active" true
     (get_state 7000 = Consensus.Active)
 
-(* Test timeout -> Failed transition *)
+(* Test timeout -> Failed transition
+
+   Anchor layout (period_start - 1):
+   - Anchor for period 1 = block 2015 → MTP >= start_time, MTP < timeout → Started
+   - Anchor for period 2 = block 4031 → MTP >= start_time, MTP < timeout → Started (no threshold)
+   - Anchor for period 3 = block 6047 → MTP >= timeout, no signals → Failed
+*)
 let test_timeout_to_failed () =
   let period = 2016 in
   let start_time = 1000000L in
@@ -755,14 +769,15 @@ let test_timeout_to_failed () =
     threshold = 1815;
   } in
 
-  (* Chain where:
-     - Period 1: MTP >= start_time but < timeout, no signals -> Started
-     - Period 2: MTP >= timeout, still no signals -> Failed *)
+  (* Anchor for period 1 (= block 2015): MTP=1200000L >= start_time, < timeout → Started.
+     Anchor for period 2 (= block 4031): MTP=1200000L >= start_time, < timeout → still Started
+       (count=0 < threshold, MTP < timeout).
+     Anchor for period 3 (= block 6047): MTP=1600000L >= timeout, count=0 → Failed. *)
   let make_block height =
     let mtp =
-      if height < 2016 then 500000L        (* Before start *)
-      else if height < 4032 then 1200000L  (* After start, before timeout *)
-      else 1600000L                         (* After timeout *)
+      if height < 2015 then 500000L       (* Before start *)
+      else if height < 6047 then 1200000L (* After start, before timeout *)
+      else 1600000L                        (* At/after timeout *)
     in
     Some { Consensus.height; version = 0x20000000l; median_time_past = mtp }
   in
@@ -775,11 +790,27 @@ let test_timeout_to_failed () =
       ~dep ~height ~get_block:make_block ~count_signals ~cache
   in
 
-  (* After timeout, should be Failed *)
-  Alcotest.(check bool) "after timeout is failed" true
-    (get_state 5000 = Consensus.Failed)
+  (* Period 1 (2016-4031): anchor=2015, MTP=1200000L >= start_time → Started *)
+  Alcotest.(check bool) "period 1 is started" true
+    (get_state 3000 = Consensus.Started);
 
-(* Test min_activation_height delays Active state *)
+  (* Period 3 (6048-8063): anchor=6047, MTP=1600000L >= timeout, count=0 → Failed *)
+  Alcotest.(check bool) "after timeout is failed" true
+    (get_state 7000 = Consensus.Failed)
+
+(* Test min_activation_height delays Active state
+
+   Core versionbits.cpp:102: LOCKED_IN → ACTIVE when
+   `pindexPrev->nHeight + 1 >= min_activation_height`, i.e. period_start >= mah.
+
+   Anchor layout (period_start - 1):
+   - Anchor for period 0 = -1 (genesis parent) → Defined
+   - Anchor for period 1 = 2015 → MTP >= start_time → Started
+   - Anchor for period 2 = 4031 → state=Started, signals(4032)=2016 → LockedIn
+   - Period 3 (6048): period_start=6048 < 10000 → LockedIn
+   - Period 4 (8064): period_start=8064 < 10000 → LockedIn
+   - Period 5 (10080): period_start=10080 >= 10000 → Active   ← Core correct behaviour
+*)
 let test_min_activation_height () =
   let period = 2016 in
   let start_time = 1000000L in
@@ -789,39 +820,27 @@ let test_min_activation_height () =
     bit = 0;
     start_time;
     timeout = 9999999999L;  (* Far future *)
-    min_activation_height = 10000;  (* Must wait until height 10000 *)
+    min_activation_height = 10000;  (* Must wait until period_start >= 10000 *)
     period;
     threshold = 1815;
   } in
 
-  (* Chain where threshold is met in period 1 (blocks 2016-4031)
-     State machine transitions:
-     - Period 0 (0-2015): Defined (MTP < start_time)
-     - Period 1 (2016-4031): Started (MTP >= start_time)
-     - Period 2 (4032-6047): LockedIn (signals met in period 1)
-     - Period 3+: stays LockedIn until min_activation_height reached
-     - After period containing min_activation_height: Active *)
+  (* Anchor for period 1 = block 2015; must have MTP >= start_time.
+     Block 2015 needs MTP=1500000L; heights < 2015 are MTP < start_time
+     (the anchor for period 0 is genesis parent = None → Defined). *)
   let make_block height =
-    let mtp = if height < 2016 then 500000L else 1500000L in
-    let version =
-      if height >= 2016 && height < 4032 then 0x20000001l
-      else 0x20000000l
-    in
-    Some { Consensus.height; version; median_time_past = mtp }
+    let mtp = if height < 2015 then 500000L else 1500000L in
+    Some { Consensus.height; version = 0x20000000l; median_time_past = mtp }
   in
 
-  (* count_signals is called with start_height of the period BEING EVALUATED
-     When computing state for period N, we count signals in period N-1
-     Wait, no - we count signals in the current period when state is Started
-     Let me trace through:
-     - Computing period 0 state: check MTP at block 2015, Defined
-     - Computing period 2016 state: check MTP at block 4031, >= start_time, -> Started
-     - Computing period 4032 state: state is Started, count signals in period 4032
-     So to lock in during period 4032, we need signals in period 4032 *)
+  (* With the corrected anchor-based MTP check:
+     - period_start=2016 is Started (anchor 2015 MTP >= start_time)
+     - period_start=4032 is in Started state; count_signals(4032)=2016 → LockedIn
+     - period_start=6048..8064: LockedIn (period_start < 10000)
+     - period_start=10080: Active (10080 >= 10000)
+     Signals only need to fire in period 4032 (the Started period) to lock in. *)
   let count_signals ~start_height =
-    (* Return signals for periods where we want signaling to occur *)
-    if start_height = 2016 then 2016  (* Signal in period 1 *)
-    else if start_height = 4032 then 2016  (* Signal in period 2 too, to lock in *)
+    if start_height = 4032 then 2016  (* All blocks in period 2 signal → LockedIn *)
     else 0
   in
 
@@ -832,11 +851,16 @@ let test_min_activation_height () =
       ~dep ~height ~get_block:make_block ~count_signals ~cache
   in
 
-  (* Period 3 (6048-8063): Should be LockedIn (min_activation_height = 10000) *)
+  (* Period 3 (6048-8063): LockedIn — period_start=6048 < min_activation_height=10000 *)
   Alcotest.(check bool) "before min_height is locked_in" true
     (get_state 7000 = Consensus.LockedIn);
 
-  (* Period 5 (10080-12095): After min_activation_height, should be Active *)
+  (* Period 4 (8064-10079): still LockedIn — period_start=8064 < 10000 *)
+  Alcotest.(check bool) "period 4 still locked_in" true
+    (get_state 9000 = Consensus.LockedIn);
+
+  (* Period 5 (10080-12095): Active — period_start=10080 >= 10000.
+     Core: `pindexPrev->nHeight + 1 = period_start >= min_activation_height`. *)
   Alcotest.(check bool) "after min_height is active" true
     (get_state 11000 = Consensus.Active)
 
@@ -891,6 +915,88 @@ let test_versionbits_cache () =
     (Consensus.DeploymentCache.is_empty !(cache.taproot));
   Alcotest.(check bool) "testdummy cache empty" true
     (Consensus.DeploymentCache.is_empty !(cache.testdummy))
+
+(* Test that LockedIn→Active fires at the correct period when
+   min_activation_height is an exact period multiple.
+
+   Taproot on mainnet: min_activation_height=709632, period=2016.
+   709632 / 2016 = 352 exactly → period starting at 709632.
+
+   Core: activates when period_start >= 709632.
+   - period_start=707616 (period 351): 707616 >= 709632? No → LockedIn.
+   - period_start=709632 (period 352): 709632 >= 709632? Yes → Active.
+
+   Old buggy code checked (period_start + period) >= mah:
+   - period_start=707616: (707616+2016)=709632 >= 709632? Yes → Active (WRONG — one period early).
+*)
+let test_locked_in_exact_period_boundary () =
+  let period = 2016 in
+  let min_activation_height = 709632 in  (* Taproot activation height: exact period boundary *)
+
+  let dep : Consensus.deployment = {
+    name = "taproot_boundary";
+    bit = 2;
+    start_time = 1000000L;
+    timeout = 9999999999L;
+    min_activation_height;
+    period;
+    threshold = 1815;
+  } in
+
+  (* Chain: blocks >= 2015 have MTP >= start_time.
+     We pre-seed the cache with LockedIn at a period well before the boundary
+     to skip the full DEFINED→STARTED→LOCKED_IN walk. *)
+  let make_block height =
+    let mtp = if height < 2015 then 500000L else 1500000L in
+    Some { Consensus.height; version = 0x20000000l; median_time_past = mtp }
+  in
+  let count_signals ~start_height:_ = 0 in
+
+  (* Pre-seed: inject LockedIn at period 705600 (= 350 * 2016) to avoid
+     walking the full mainnet chain.  The state machine just reads forward
+     from there. *)
+  let cache = ref (Consensus.DeploymentCache.add 705600 Consensus.LockedIn
+                     Consensus.DeploymentCache.empty) in
+
+  let get_state height =
+    Consensus.get_deployment_state
+      ~dep ~height ~get_block:make_block ~count_signals ~cache
+  in
+
+  (* Period 351 (707616..709631): period_start=707616 < 709632 → LockedIn *)
+  Alcotest.(check bool) "period before boundary is still locked_in" true
+    (get_state 708000 = Consensus.LockedIn);
+
+  (* Period 352 (709632..711647): period_start=709632 >= 709632 → Active.
+     Core ref: versionbits.cpp:102 `pindexPrev->nHeight + 1 >= min_activation_height`. *)
+  Alcotest.(check bool) "period at exact boundary activates" true
+    (get_state 710000 = Consensus.Active)
+
+(* Test that period 0 (anchor = genesis parent) is always Defined.
+   Verifies the genesis-boundary edge case: get_block(-1) must return None
+   and the None branch must inherit Defined, not crash. *)
+let test_genesis_period_is_defined () =
+  let dep : Consensus.deployment = {
+    name = "genesis_test";
+    bit = 0;
+    start_time = 0L;  (* start_time=0 so MTP=0 would satisfy it *)
+    timeout = 9999999999L;
+    min_activation_height = 0;
+    period = 2016;
+    threshold = 1815;
+  } in
+  (* Even though start_time=0, the anchor for period 0 is height -1 (before
+     genesis), which get_block returns None for.  State must be Defined. *)
+  let make_block h =
+    if h < 0 then None
+    else Some { Consensus.height = h; version = 0x20000000l; median_time_past = 0L }
+  in
+  let count_signals ~start_height:_ = 0 in
+  let cache = ref Consensus.DeploymentCache.empty in
+  let state = Consensus.get_deployment_state
+    ~dep ~height:0 ~get_block:make_block ~count_signals ~cache in
+  Alcotest.(check bool) "genesis period is Defined despite start_time=0" true
+    (state = Consensus.Defined)
 
 (* Test mainnet taproot deployment parameters *)
 let test_mainnet_taproot () =
@@ -1356,6 +1462,8 @@ let () =
       test_case "full activation cycle" `Quick test_full_activation_cycle;
       test_case "timeout to failed" `Quick test_timeout_to_failed;
       test_case "min activation height" `Quick test_min_activation_height;
+      test_case "locked_in exact period boundary" `Quick test_locked_in_exact_period_boundary;
+      test_case "genesis period is defined" `Quick test_genesis_period_is_defined;
       test_case "bip9 stats" `Quick test_bip9_stats;
       test_case "versionbits cache" `Quick test_versionbits_cache;
       test_case "mainnet taproot" `Quick test_mainnet_taproot;

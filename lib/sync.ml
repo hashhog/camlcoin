@@ -1029,6 +1029,28 @@ let block_tip (state : chain_state) : header_entry option =
        state.tip points directly to the validated tip in that case. *)
     if state.blocks_synced = 0 then state.tip else None
 
+(* W93 Bug 1 fix: provide the hash of the block at the network's
+   BIP34Height so Bitcoin Core's BIP-30 skip optimization (Gate 4) can
+   be activated.  Without this, [Validation.bip30_should_enforce] falls
+   through to "enforce BIP-30 at every height >= bip34_height" on
+   mainnet, costing extra UTXO probes per tx for the entire post-BIP34
+   range.  Returns [None] when:
+     - network has no BIP34 activation hint (bip34_hash = None),
+     - the block at BIP34Height is not yet known to the chain state
+       (which forces the conservative enforce path until headers reach
+       that height — correct safety behaviour).
+   Called by [process_new_block], [connect_stored_blocks], the IBD
+   per-block validator, [submit_block], the reorg-connect path, and the
+   assumeutxo init.  Reference: Bitcoin Core validation.cpp:2460-2462
+   (BIP34Hash ancestor check). *)
+let bip34_height_hash_for (state : chain_state) : Types.hash256 option =
+  match state.network.Consensus.bip34_hash with
+  | None -> None
+  | Some _ ->
+    (match get_header_at_height state state.network.Consensus.bip34_height with
+     | None -> None
+     | Some entry -> Some entry.hash)
+
 (* Request headers from a peer, starting from our current tip *)
 let request_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
   let locator = build_locator state in
@@ -2115,6 +2137,11 @@ module Validation_worker = struct
     skip_scripts : bool;
     network : Consensus.network_config;
     get_mtp_at_height : (int -> int32) option;
+    (* W93 Bug 1 fix: hash of the block at network.bip34_height on the
+       canonical chain, if known.  Pass [Some h] to enable Bitcoin Core's
+       BIP-30 skip optimization (Gate 4 of [bip30_should_enforce]).
+       [None] falls through to the conservative enforce path. *)
+    bip34_height_hash : Types.hash256 option;
   }
 
   type validation_result =
@@ -2198,6 +2225,7 @@ module Validation_worker = struct
                      ~flags:j.flags
                      ~skip_scripts:j.skip_scripts
                      ?get_mtp_at_height:j.get_mtp_at_height
+                     ?bip34_height_hash:j.bip34_height_hash
                      () with
              | Validation.AB_ok (fees, txid_arr, spent) ->
                Ok (Ok (fees, txid_arr, spent))
@@ -2330,6 +2358,7 @@ let process_downloaded_blocks ?(max_blocks = 1)
               skip_scripts;
               network = ibd.chain.network;
               get_mtp_at_height = Some (get_mtp_for_height ibd.chain);
+              bip34_height_hash = bip34_height_hash_for ibd.chain;
             } in
             Validation_worker.submit_lwt w job
           | None ->
@@ -2341,7 +2370,8 @@ let process_downloaded_blocks ?(max_blocks = 1)
                       ~network:ibd.chain.network ~block ~height
                       ~expected_bits ~median_time ~prev_block_time ~base_lookup:lookup
                       ~flags:validation_flags ~skip_scripts
-                      ~get_mtp_at_height:(get_mtp_for_height ibd.chain) () with
+                      ~get_mtp_at_height:(get_mtp_for_height ibd.chain)
+                      ?bip34_height_hash:(bip34_height_hash_for ibd.chain) () with
               | Validation.AB_ok (fees, txid_arr, spent) -> Ok (fees, txid_arr, spent)
               | Validation.AB_err e -> Error e)
         in
@@ -3324,7 +3354,8 @@ let connect_block_into_batch
              ~network:state.network ~block ~height
              ~expected_bits ~median_time ~prev_block_time ~base_lookup:lookup
              ~flags:validation_flags ~skip_scripts
-             ~get_mtp_at_height:(get_mtp_for_height state) () with
+             ~get_mtp_at_height:(get_mtp_for_height state)
+             ?bip34_height_hash:(bip34_height_hash_for state) () with
      | Validation.AB_err e ->
        (match ibd.misbehavior_handler with
         | Some _handler ->
@@ -4191,7 +4222,8 @@ let rec connect_stored_blocks (state : chain_state) : int =
                 ~network:state.network ~block:stored_block ~height:next_height
                 ~expected_bits ~median_time ~prev_block_time ~base_lookup:lookup
                 ~flags:validation_flags ~skip_scripts:false
-                ~get_mtp_at_height:(get_mtp_for_height state) () with
+                ~get_mtp_at_height:(get_mtp_for_height state)
+                ?bip34_height_hash:(bip34_height_hash_for state) () with
         | Validation.AB_ok (_fees, txid_arr, spent_utxos) ->
           (* Write tx_index entries for the connected stored block
              (Pattern C0 closure 2026-05-05). Mirrors process_new_block
@@ -4337,7 +4369,8 @@ let process_new_block (state : chain_state) (block : Types.block)
                 ~network:state.network ~block ~height
                 ~expected_bits ~median_time ~prev_block_time ~base_lookup:lookup
                 ~flags:validation_flags ~skip_scripts:false
-                ~get_mtp_at_height:(get_mtp_for_height state) () with
+                ~get_mtp_at_height:(get_mtp_for_height state)
+                ?bip34_height_hash:(bip34_height_hash_for state) () with
         | Validation.AB_ok (_fees, txid_arr, spent_utxos) ->
           (* Store the block *)
           Storage.ChainDB.store_block state.db hash block;

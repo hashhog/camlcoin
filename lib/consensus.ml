@@ -1428,39 +1428,74 @@ let get_deployment_state
               Defined
       in
 
-      (* Walk forward computing states for each period *)
+      (* Walk forward computing states for each period.
+
+         Bitcoin Core versionbits.cpp:GetStateFor uses pindexPrev (the last
+         block of the *previous* period) as the MTP anchor for the state
+         transition of the *current* period.  In our period-start keying:
+           anchor = period_start - 1  (last block of the previous period)
+
+         For period_start = 0 the anchor is height -1 (before genesis), which
+         has no block; that arm is handled by the `None` branch → inherit
+         state = Defined.  This matches Core's nullptr → DEFINED handling.
+
+         Bug fixes (Core refs):
+           1. MTP anchor: use `period_start - 1` instead of
+              `period_start + period - 1`.
+              Core: pindexPrev = last block of previous period (line 46).
+              Old code used the last block of the *current* period, causing
+              DEFINED→STARTED and STARTED→FAILED transitions one period late.
+
+           2. LockedIn→Active: use `period_start >= min_activation_height`
+              instead of `period_start + period >= min_activation_height`.
+              Core: `pindexPrev->nHeight + 1 >= min_activation_height`
+              (line 102), where pindexPrev+1 = period_start.
+              Old code checked the *next* period start, causing early/wrong
+              Taproot activation (709632 boundary is an exact period multiple;
+              old code activated at block 707616 instead of 709632). *)
       let rec compute_states state = function
         | [] -> state
         | period_start :: rest ->
           let new_state =
-            (* Get the block at the end of this period (pindexPrev in Bitcoin Core) *)
-            let period_end = period_start + period - 1 in
-            match get_block period_end with
+            (* Core: pindexPrev = last block of the *previous* period.
+               In our keying: anchor = period_start - 1.
+               When period_start = 0, anchor = -1 → get_block returns None
+               (before genesis), so state is inherited as Defined. *)
+            let anchor = period_start - 1 in
+            match get_block anchor with
             | None ->
-              (* No block at this height yet, state is inherited *)
+              (* No block at this height yet (or before genesis), state
+                 is inherited — matches Core's nullptr → DEFINED. *)
               state
             | Some block ->
               match state with
               | Defined ->
-                (* Transition to Started if MTP >= start_time *)
+                (* DEFINED → STARTED if MTP of previous-period's last block
+                   >= start_time.  Core: versionbits.cpp:78. *)
                 if block.median_time_past >= dep.start_time then
                   Started
                 else
                   Defined
               | Started ->
-                (* Count signals in this period *)
+                (* Count signals in this period.
+                   Core: walks nPeriod blocks back from pindexPrev,
+                   which covers exactly the current period. *)
                 let count = count_signals ~start_height:period_start in
                 if count >= dep.threshold then
                   LockedIn
                 else if block.median_time_past >= dep.timeout then
+                  (* STARTED → FAILED if MTP >= timeout and no lock-in.
+                     Core: versionbits.cpp:95. *)
                   Failed
                 else
                   Started
               | LockedIn ->
-                (* Transition to Active if min_activation_height reached *)
-                (* The next period starts at period_start + period *)
-                let next_period_start = period_start + period in
-                if next_period_start >= dep.min_activation_height then
+                (* LOCKED_IN → ACTIVE when the first block of the current
+                   period (= period_start) satisfies the min_activation_height
+                   constraint.  Core: `pindexPrev->nHeight + 1 >= mah` where
+                   pindexPrev is the anchor and pindexPrev+1 = period_start.
+                   Core ref: versionbits.cpp:102. *)
+                if period_start >= dep.min_activation_height then
                   Active
                 else
                   LockedIn

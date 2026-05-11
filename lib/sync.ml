@@ -621,6 +621,18 @@ let validate_header (state : chain_state) (header : Types.block_header)
           Error "Header timestamp not greater than median-time-past"
         else begin
           let height = parent.height + 1 in
+          (* BIP-94 timewarp protection: at retarget boundaries on testnet4,
+             the new block's timestamp must not predate the parent's by more
+             than MAX_TIMEWARP=600 seconds.
+             Reference: bitcoin-core/src/validation.cpp
+                        ContextualCheckBlockHeader:4097-4104. *)
+          if not (Consensus.check_timewarp_rule
+                    ~height
+                    ~header_time:header.timestamp
+                    ~prev_block_time:parent.header.timestamp
+                    ~network:state.network) then
+            Error "time-timewarp-attack"
+          else
           (* Checkpoint enforcement: if this height has a checkpoint,
              the header hash must match the expected checkpoint hash *)
           match Consensus.verify_checkpoint height hash state.network with
@@ -1842,6 +1854,15 @@ let compute_expected_bits (state : chain_state) (height : int)
 let get_mtp_for_height (state : chain_state) (h : int) : int32 =
   compute_median_time_past state h
 
+(* Return the timestamp of the block at height-1 (the parent), used for
+   BIP-94 timewarp check.  Returns 0l when height=0 (genesis has no parent).
+   Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4101. *)
+let get_prev_block_time (state : chain_state) (height : int) : int32 =
+  if height <= 0 then 0l
+  else match get_header_at_height state (height - 1) with
+    | Some e -> e.header.timestamp
+    | None -> 0l
+
 (* ============================================================================
    Block Validation Worker (wave 11 — Domain.join option B)
    ============================================================================
@@ -1865,6 +1886,7 @@ module Validation_worker = struct
     height : int;
     expected_bits : int32;
     median_time : int32;
+    prev_block_time : int32;  (* timestamp of block at height-1; BIP-94 timewarp check *)
     lookup : Validation.utxo_lookup;
     flags : int;
     skip_scripts : bool;
@@ -1948,6 +1970,7 @@ module Validation_worker = struct
                      ~network:j.network ~block:j.block ~height:j.height
                      ~expected_bits:j.expected_bits
                      ~median_time:j.median_time
+                     ~prev_block_time:j.prev_block_time
                      ~base_lookup:j.lookup
                      ~flags:j.flags
                      ~skip_scripts:j.skip_scripts
@@ -2020,6 +2043,8 @@ let process_downloaded_blocks ?(max_blocks = 1)
         let expected_bits = compute_expected_bits ibd.chain height block.header in
         (* Compute median time past from last 11 blocks *)
         let median_time = compute_median_time_past ibd.chain height in
+        (* BIP-94: parent block timestamp for timewarp check *)
+        let prev_block_time = get_prev_block_time ibd.chain height in
         (* Build UTXO lookup function.  When an OptimizedUtxoSet is
            attached we query it first — it keeps an in-memory dirty set
            that is not yet flushed to the database, so it can resolve
@@ -2076,7 +2101,7 @@ let process_downloaded_blocks ?(max_blocks = 1)
           | Some w ->
             let job : Validation_worker.job = {
               block; height;
-              expected_bits; median_time;
+              expected_bits; median_time; prev_block_time;
               lookup;
               flags = validation_flags;
               skip_scripts;
@@ -2091,7 +2116,7 @@ let process_downloaded_blocks ?(max_blocks = 1)
             Lwt.return (
               match Validation.accept_block
                       ~network:ibd.chain.network ~block ~height
-                      ~expected_bits ~median_time ~base_lookup:lookup
+                      ~expected_bits ~median_time ~prev_block_time ~base_lookup:lookup
                       ~flags:validation_flags ~skip_scripts
                       ~get_mtp_at_height:(get_mtp_for_height ibd.chain) () with
               | Validation.AB_ok (fees, txid_arr, spent) -> Ok (fees, txid_arr, spent)
@@ -2765,6 +2790,7 @@ let connect_block_into_batch
     let height = entry.height in
     let expected_bits = compute_expected_bits state height block.header in
     let median_time = compute_median_time_past state height in
+    let prev_block_time = get_prev_block_time state height in
     (* Lookup that reads through the overlay first, then disk. Used by
        [accept_block] for input resolution and below for undo-data
        construction. *)
@@ -2808,7 +2834,7 @@ let connect_block_into_batch
     in
     (match Validation.accept_block
              ~network:state.network ~block ~height
-             ~expected_bits ~median_time ~base_lookup:lookup
+             ~expected_bits ~median_time ~prev_block_time ~base_lookup:lookup
              ~flags:validation_flags ~skip_scripts
              ~get_mtp_at_height:(get_mtp_for_height state) () with
      | Validation.AB_err e ->
@@ -3212,6 +3238,14 @@ let try_attach_side_branch_and_reorg
       let mtp = Consensus.median_time_past ancestor_ts in
       if Int32.compare header.timestamp mtp <= 0 then
         Error "Header timestamp not greater than median-time-past"
+      (* BIP-94 timewarp protection for retarget boundary blocks on testnet4.
+         Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4097-4104. *)
+      else if not (Consensus.check_timewarp_rule
+                     ~height
+                     ~header_time:header.timestamp
+                     ~prev_block_time:parent.header.timestamp
+                     ~network:state.network) then
+        Error "time-timewarp-attack"
       else begin
         match Consensus.verify_checkpoint height hash state.network with
         | Consensus.CheckpointMismatch _ as mismatch ->
@@ -3249,8 +3283,9 @@ let try_attach_side_branch_and_reorg
              chain-context checks, but NOT ConnectBlock (UTXO checks are
              deferred to [reorganize]'s connect path). *)
           let median_time = mtp in
+          let prev_block_time = parent.header.timestamp in
           (match Validation.check_block ~network:state.network block height
-                   ~expected_bits ~median_time with
+                   ~expected_bits ~median_time ~prev_block_time () with
            | Error e ->
              Error (Validation.block_error_to_string e)
            | Ok () ->
@@ -3623,6 +3658,7 @@ let rec connect_stored_blocks (state : chain_state) : int =
       | Some stored_block ->
         let expected_bits = compute_expected_bits state next_height stored_block.header in
         let median_time = compute_median_time_past state next_height in
+        let prev_block_time = get_prev_block_time state next_height in
         let lookup outpoint =
           let vout = Int32.to_int outpoint.Types.vout in
           match Storage.ChainDB.get_utxo state.db outpoint.Types.txid vout with
@@ -3651,7 +3687,7 @@ let rec connect_stored_blocks (state : chain_state) : int =
            Reference: bitcoin-core/src/validation.cpp ProcessNewBlock. *)
         match Validation.accept_block
                 ~network:state.network ~block:stored_block ~height:next_height
-                ~expected_bits ~median_time ~base_lookup:lookup
+                ~expected_bits ~median_time ~prev_block_time ~base_lookup:lookup
                 ~flags:validation_flags ~skip_scripts:false
                 ~get_mtp_at_height:(get_mtp_for_height state) () with
         | Validation.AB_ok (_fees, txid_arr, spent_utxos) ->
@@ -3765,6 +3801,7 @@ let process_new_block (state : chain_state) (block : Types.block)
       end else begin
         let expected_bits = compute_expected_bits state height block.header in
         let median_time = compute_median_time_past state height in
+        let prev_block_time = get_prev_block_time state height in
         let lookup outpoint =
           let vout = Int32.to_int outpoint.Types.vout in
           match Storage.ChainDB.get_utxo state.db outpoint.Types.txid vout with
@@ -3796,7 +3833,7 @@ let process_new_block (state : chain_state) (block : Types.block)
            Reference: bitcoin-core/src/validation.cpp ProcessNewBlock. *)
         match Validation.accept_block
                 ~network:state.network ~block ~height
-                ~expected_bits ~median_time ~base_lookup:lookup
+                ~expected_bits ~median_time ~prev_block_time ~base_lookup:lookup
                 ~flags:validation_flags ~skip_scripts:false
                 ~get_mtp_at_height:(get_mtp_for_height state) () with
         | Validation.AB_ok (_fees, txid_arr, spent_utxos) ->

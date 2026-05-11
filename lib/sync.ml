@@ -2270,7 +2270,12 @@ let process_downloaded_blocks ?(max_blocks = 1)
               or data mutated in transit).  This is analogous to Bitcoin
               Core's BLOCK_MUTATED — do NOT ban the peer, just re-request
               the block.  For all other validation errors, score the peer. *)
-           let is_mutated_witness = (e = Validation.BlockBadWitnessCommitment) in
+           let is_mutated_witness = match e with
+             | Validation.BlockBadWitnessCommitment
+             | Validation.BlockBadWitnessNonceSize
+             | Validation.BlockUnexpectedWitness -> true
+             | _ -> false
+           in
            if not is_mutated_witness then
              (match peer_id with
               | Some pid ->

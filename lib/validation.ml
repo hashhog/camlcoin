@@ -1348,12 +1348,9 @@ let calculate_tx_fee (tx : Types.transaction) ~(lookup : utxo_lookup)
    Full Block Validation with UTXO Set
    ============================================================================ *)
 
-(* BIP30 exception heights: these historical Bitcoin blocks had duplicate
-   coinbase txids that were later spent. *)
-let bip30_exception_heights = [91842; 91880]
-
 (* Check BIP30: no unspent outputs exist with the same txid.
-   We probe output indices 0 through n_outputs-1 in the UTXO set. *)
+   We probe output indices 0 through n_outputs-1 in the UTXO set.
+   Bitcoin Core validation.cpp:2468-2475 (ConnectBlock BIP30 loop). *)
 let check_bip30 ~(lookup : utxo_lookup) ~(txid : Types.hash256)
     ~(n_outputs : int) : bool =
   let found = ref false in
@@ -1365,14 +1362,78 @@ let check_bip30 ~(lookup : utxo_lookup) ~(txid : Types.hash256)
   done;
   not !found
 
+(* Determine whether BIP-30 must be enforced for this block.
+   Mirrors Bitcoin Core's logic in ConnectBlock (validation.cpp:2402-2467).
+
+   Gate 1: IsBIP30Repeat — if this block IS one of the two historical repeat
+   blocks (h=91842 or h=91880 with their specific canonical hashes), skip
+   BIP-30 checking entirely.  Height-only is WRONG: any fork block at those
+   heights would be incorrectly exempted.
+
+   Gate 4: BIP34Hash skip — once we know BIP34 activated at the canonical
+   BIP34Height block (verified by matching BIP34Hash), duplicate coinbases
+   can no longer be created, so BIP-30 checking is redundant.  We verify
+   this only when the caller passes the hash of the block at BIP34Height
+   (bip34_height_hash).  Without it we conservatively enforce BIP-30.
+
+   Gate 5: BIP34_IMPLIES_BIP30_LIMIT — at h >= 1,983,702 BIP-34 height
+   encoding wraps around and could theoretically repeat pre-BIP34 heights,
+   so BIP-30 checking is re-enabled regardless.
+
+   Bitcoin Core references:
+   - IsBIP30Repeat: validation.cpp:6189-6192
+   - fEnforceBIP30 = !IsBIP30Repeat: validation.cpp:2402
+   - BIP34Hash ancestor check: validation.cpp:2460-2462
+   - BIP34_IMPLIES_BIP30_LIMIT = 1,983,702: validation.cpp:2430
+   - Final gate: validation.cpp:2467 *)
+let bip30_should_enforce
+    ~(network : Consensus.network_config)
+    ~(height : int)
+    ~(block_hash : Types.hash256)
+    ~(bip34_height_hash : Types.hash256 option)
+    : bool =
+  let bip34_implies_bip30_limit = 1983702 in
+
+  (* Gate 1 / Gate 3: IsBIP30Repeat — exempt only the specific canonical blocks *)
+  if Consensus.is_bip30_repeat height block_hash then
+    false
+  else
+    (* Gate 4: BIP34Hash skip optimization.
+       If we know the block at BIP34Height has the expected canonical hash,
+       then BIP34 is truly activated on this chain and BIP-30 can be skipped
+       (for heights below BIP34_IMPLIES_BIP30_LIMIT). *)
+    let bip34_confirmed_on_canonical_chain =
+      match (network.Consensus.bip34_hash, bip34_height_hash) with
+      | (Some expected_hash, Some actual_hash) ->
+        Cstruct.equal expected_hash actual_hash
+      | _ -> false  (* No BIP34 hash info → cannot confirm canonical chain *)
+    in
+    if bip34_confirmed_on_canonical_chain
+       && height >= network.Consensus.bip34_height
+       && height < bip34_implies_bip30_limit then
+      false  (* BIP34 active on canonical chain: skip BIP-30 for performance *)
+    else if height >= network.Consensus.bip34_height
+            && height < bip34_implies_bip30_limit
+            && network.Consensus.bip34_hash = None then
+      false  (* bip34_hash=None means BIP34 active from genesis (testnet4/regtest);
+                no pre-BIP34 window exists, so BIP30 violations are impossible *)
+    else
+      true  (* Enforce BIP-30: either pre-BIP34, or >= BIP34_IMPLIES_BIP30_LIMIT *)
+
 (* Validate block with full UTXO tracking
 
    IMPORTANT: This properly handles intra-block spending by updating
-   a local UTXO view during validation. *)
+   a local UTXO view during validation.
+
+   [bip34_height_hash]: hash of the block at [network.bip34_height] on the
+   current chain, used to confirm BIP-34 is activated on the canonical chain
+   (Gate 4 of BIP-30 enforcement).  Pass [Some hash] when the caller has the
+   block index and can provide it; [None] causes the conservative fallback
+   (BIP-30 is enforced at heights >= bip34_height on any chain). *)
 let validate_block_with_utxos ~network:(network : Consensus.network_config) (block : Types.block) (height : int)
     ~(expected_bits : int32) ~(median_time : int32)
     ~(base_lookup : utxo_lookup) ~(flags : int)
-    ?(skip_scripts=false) ?get_mtp_at_height ()
+    ?(skip_scripts=false) ?get_mtp_at_height ?bip34_height_hash ()
     : ((int64 * Types.hash256 array * (Types.outpoint * utxo) list), block_validation_error) result =
 
   (* ====================================================================
@@ -1399,6 +1460,10 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
       if not (Cstruct.equal computed_merkle block.header.merkle_root) then
         Error BlockBadMerkleRoot
       else begin
+        (* Compute block hash once for BIP-30 repeat-block check.
+           Uses the same header, so this is deterministic and idempotent. *)
+        let block_hash_for_bip30 = Crypto.compute_block_hash block.header in
+
         (* Build local UTXO set for intra-block spending *)
         let local_utxos : (string * int32, utxo) Hashtbl.t = Hashtbl.create 64 in
         let spent_in_block : (string * int32, unit) Hashtbl.t = Hashtbl.create 64 in
@@ -1431,14 +1496,13 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
             (* BIP-30: always run even on the fast (assumevalid) path.
                Bitcoin Core ConnectBlock enforces BIP-30 unconditionally —
                assumevalid only skips script verification.
-               Reference: Bitcoin Core validation.cpp ConnectBlock (~line 2467). *)
+               Uses height+hash for the repeat-block exemption (Gates 1/3)
+               and the BIP34Hash canonical-chain optimization (Gate 4).
+               Reference: Bitcoin Core validation.cpp ConnectBlock (line 2402-2467). *)
             if !error = None then begin
-              let bip34_implies_bip30_limit_fast = 1983702 in
-              let enforce_bip30_fast =
-                not (List.mem height bip30_exception_heights) &&
-                (height < network.bip34_height || height >= bip34_implies_bip30_limit_fast)
-              in
-              if enforce_bip30_fast then begin
+              if bip30_should_enforce ~network ~height
+                   ~block_hash:block_hash_for_bip30
+                   ~bip34_height_hash then begin
                 let n_outputs = List.length tx.outputs in
                 if not (check_bip30 ~lookup:base_lookup ~txid ~n_outputs) then
                   error := Some (BlockTxValidationFailed (i, TxDuplicateTxid))
@@ -1557,6 +1621,9 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
       txid_arr.(i) <- Crypto.compute_txid tx
     ) block.transactions;
 
+    (* Compute block hash once for BIP-30 repeat-block check. *)
+    let block_hash_for_bip30 = Crypto.compute_block_hash block.header in
+
     (* Accumulate sigops during per-tx validation so intra-block UTXOs are visible *)
     let total_sigops_cost = ref 0 in
     let total_fees = ref 0L in
@@ -1570,20 +1637,13 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
 
         (* BIP-30: reject any block whose transactions would overwrite an
            existing unspent output in the UTXO set (CVE-2012-1909).
-           Two mainnet blocks (h=91842 and h=91880) predate BIP-30 and are
-           permanently exempt.  After BIP-34 activation (h >= bip34_height),
-           coinbase-height uniqueness makes duplicate txids practically
-           impossible, so skip the check for performance.  However, at
-           h >= 1,983,702 BIP-34 modular arithmetic begins to repeat
-           pre-BIP34 coinbase heights, so re-enable the check there.
-           Reference: Bitcoin Core validation.cpp ConnectBlock (~line 2467)
-           and IsBIP30Repeat(). *)
-        let bip34_implies_bip30_limit = 1983702 in
-        let enforce_bip30 =
-          not (List.mem height bip30_exception_heights) &&
-          (height < network.bip34_height || height >= bip34_implies_bip30_limit)
-        in
-        if enforce_bip30 then begin
+           Uses height+hash for the repeat-block exemption (Gates 1/3)
+           and the BIP34Hash canonical-chain optimization (Gate 4).
+           Reference: Bitcoin Core validation.cpp ConnectBlock (line 2402-2467)
+           and IsBIP30Repeat() (line 6189-6192). *)
+        if bip30_should_enforce ~network ~height
+             ~block_hash:block_hash_for_bip30
+             ~bip34_height_hash then begin
           let n_outputs = List.length tx.outputs in
           if not (check_bip30 ~lookup:base_lookup ~txid ~n_outputs) then
             error := Some (BlockTxValidationFailed (i, TxDuplicateTxid))
@@ -1831,12 +1891,13 @@ let accept_block
     ~(flags : int)
     ?(skip_scripts = false)
     ?get_mtp_at_height
+    ?bip34_height_hash
     ()
     : accept_block_result =
   match validate_block_with_utxos ~network block height
           ~expected_bits ~median_time
           ~base_lookup ~flags ~skip_scripts
-          ?get_mtp_at_height () with
+          ?get_mtp_at_height ?bip34_height_hash () with
   | Ok (fees, txid_arr, spent_utxos) ->
     AB_ok (fees, txid_arr, spent_utxos)
   | Error e ->

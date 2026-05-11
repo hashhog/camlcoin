@@ -947,6 +947,246 @@ let test_mainnet_checkpoints () =
   Alcotest.(check bool) "regtest has no checkpoints" true
     (List.length Consensus.regtest.checkpoints = 0)
 
+(* ============================================================================
+   W83 — GetNextWorkRequired + PoW audit tests
+   ============================================================================ *)
+
+(* Test Core's CalculateNextWorkRequired with the exact vectors from
+   bitcoin-core/src/test/pow_tests.cpp. *)
+
+(* pow_tests.cpp: get_next_work — no constraint, normal retarget
+   nLastRetargetTime=1261130161 (block #30240)
+   pindexLast: nHeight=32255, nTime=1262152739, nBits=0x1d00ffff
+   expected: 0x1d00d86a *)
+let test_core_vector_get_next_work () =
+  let first_time = 1261130161l in
+  let last_time  = 1262152739l in
+  let bits       = 0x1d00ffffl in
+  let expected   = 0x1d00d86al in
+  let got = Consensus.calculate_next_work_required
+    ~first_block_time:first_time
+    ~last_block_time:last_time
+    ~base_bits:bits
+    ~network:Consensus.mainnet
+  in
+  Alcotest.(check int32) "Core vector: get_next_work" expected got
+
+(* pow_tests.cpp: get_next_work_pow_limit — early chain, result clamped to pow_limit
+   nLastRetargetTime=1231006505 (genesis)
+   pindexLast: nHeight=2015, nTime=1233061996, nBits=0x1d00ffff
+   expected: 0x1d00ffff (clamped to pow_limit) *)
+let test_core_vector_pow_limit () =
+  let first_time = 1231006505l in
+  let last_time  = 1233061996l in
+  let bits       = 0x1d00ffffl in
+  let expected   = 0x1d00ffffl in
+  let got = Consensus.calculate_next_work_required
+    ~first_block_time:first_time
+    ~last_block_time:last_time
+    ~base_bits:bits
+    ~network:Consensus.mainnet
+  in
+  Alcotest.(check int32) "Core vector: pow_limit" expected got
+
+(* pow_tests.cpp: get_next_work_lower_limit_actual — fast blocks, clamped at min timespan
+   nLastRetargetTime=1279008237 (block #66528)
+   pindexLast: nHeight=68543, nTime=1279297671, nBits=0x1c05a3f4
+   expected: 0x1c0168fd *)
+let test_core_vector_lower_limit () =
+  let first_time = 1279008237l in
+  let last_time  = 1279297671l in
+  let bits       = 0x1c05a3f4l in
+  let expected   = 0x1c0168fdl in
+  let got = Consensus.calculate_next_work_required
+    ~first_block_time:first_time
+    ~last_block_time:last_time
+    ~base_bits:bits
+    ~network:Consensus.mainnet
+  in
+  Alcotest.(check int32) "Core vector: lower_limit_actual" expected got
+
+(* pow_tests.cpp: get_next_work_upper_limit_actual — slow blocks, clamped at max timespan
+   nLastRetargetTime=1263163443
+   pindexLast: nHeight=46367, nTime=1269211443, nBits=0x1c387f6f
+   expected: 0x1d00e1fd *)
+let test_core_vector_upper_limit () =
+  let first_time = 1263163443l in
+  let last_time  = 1269211443l in
+  let bits       = 0x1c387f6fl in
+  let expected   = 0x1d00e1fdl in
+  let got = Consensus.calculate_next_work_required
+    ~first_block_time:first_time
+    ~last_block_time:last_time
+    ~base_bits:bits
+    ~network:Consensus.mainnet
+  in
+  Alcotest.(check int32) "Core vector: upper_limit_actual" expected got
+
+(* Test compact_is_negative and compact_is_overflow *)
+let test_compact_flags () =
+  (* Normal bits: not negative, not overflow *)
+  Alcotest.(check bool) "0x1d00ffff not negative" false
+    (Consensus.compact_is_negative 0x1d00ffffl);
+  Alcotest.(check bool) "0x1d00ffff not overflow" false
+    (Consensus.compact_is_overflow 0x1d00ffffl);
+
+  (* Negative bit set with non-zero mantissa *)
+  (* 0x1d800001: sign bit set, mantissa=0x000001 -> fNegative=true *)
+  Alcotest.(check bool) "0x1d800001 is negative" true
+    (Consensus.compact_is_negative 0x1d800001l);
+  Alcotest.(check bool) "0x1d800001 not overflow" false
+    (Consensus.compact_is_overflow 0x1d800001l);
+
+  (* Zero mantissa with sign bit: Core fNegative = false (nWord=0) *)
+  (* 0x1d800000: sign bit set but mantissa=0 -> fNegative=false *)
+  Alcotest.(check bool) "0x1d800000 not negative (zero mantissa)" false
+    (Consensus.compact_is_negative 0x1d800000l);
+
+  (* Overflow: nSize=35 (0x23), nWord=0x000001 -> fOverflow (nSize>34) *)
+  Alcotest.(check bool) "nSize=35 is overflow" true
+    (Consensus.compact_is_overflow (Int32.logor 0x23000000l 0x000001l));
+
+  (* Core overflow rules (arith_uint256.cpp SetCompact):
+       nSize > 34: always overflow
+       nWord > 0xff && nSize > 33: overflow
+       nWord > 0xffff && nSize > 32: overflow  *)
+
+  (* Not overflow: nSize=33 (0x21), nWord=0x0000ff (<=0xff, 0x21 not >33) *)
+  Alcotest.(check bool) "nSize=33 nWord=0xff not overflow" false
+    (Consensus.compact_is_overflow (Int32.logor 0x21000000l 0x0000ffl));
+
+  (* Not overflow: nSize=33 (0x21), nWord=0x000100 (>0xff BUT nSize=33 not >33) *)
+  Alcotest.(check bool) "nSize=33 nWord=0x100 not overflow (nSize not >33)" false
+    (Consensus.compact_is_overflow (Int32.logor 0x21000000l 0x000100l));
+
+  (* Not overflow: nSize=33 (0x21), nWord=0x010000 (>0xffff BUT nSize=33 not >33, check >32 applies: 0x010000>0xffff && 33>32 = true) *)
+  (* Wait: nWord=0x010000 > 0xffff = true, nSize=33 > 32 = true -> overflow *)
+  Alcotest.(check bool) "nSize=33 nWord=0x10000 is overflow (>0xffff && nSize>32)" true
+    (Consensus.compact_is_overflow (Int32.logor 0x21000000l 0x010000l));
+
+  (* Overflow: nSize=34 (0x22), nWord=0x00ffff (nWord>0xff && nSize=34>33 -> overflow) *)
+  Alcotest.(check bool) "nSize=34 nWord=0xffff is overflow (>0xff && nSize>33)" true
+    (Consensus.compact_is_overflow (Int32.logor 0x22000000l 0x00ffffl));
+
+  (* Not overflow: nSize=34 (0x22), nWord=0x0000ff (nWord not >0xff; nWord>0xffff is false) *)
+  Alcotest.(check bool) "nSize=34 nWord=0xff not overflow (not >0xff)" false
+    (Consensus.compact_is_overflow (Int32.logor 0x22000000l 0x0000ffl));
+
+  (* Overflow: nSize=34 (0x22), nWord=0x010000 (>0xffff && nSize>32) *)
+  Alcotest.(check bool) "nSize=34 nWord=0x10000 is overflow" true
+    (Consensus.compact_is_overflow (Int32.logor 0x22000000l 0x010000l));
+
+  (* Overflow: nSize=35 (0x23) -> always overflow (nSize>34) *)
+  Alcotest.(check bool) "nSize=35 always overflow" true
+    (Consensus.compact_is_overflow (Int32.logor 0x23000000l 0x000001l))
+
+(* Test check_proof_of_work — mirrors Core's pow_tests.cpp *)
+let test_check_proof_of_work () =
+  let consensus = Consensus.mainnet in
+
+  (* Negative target: pow_limit.GetCompact(true) → should fail.
+     nBits = mainnet pow_limit bits with sign bit set.
+     pow_limit = 0x1d00ffff → mantissa 0x00ffff, sign bit → 0x1d80ffff
+     ... actually Core test uses: nBits = UintToArith256(consensus.powLimit).GetCompact(true)
+     which forces fNegative=true. Simplest: use bits with sign bit set + non-zero mantissa. *)
+  let negative_bits = 0x1d800001l in
+  let hash_one = Cstruct.create 32 in
+  Cstruct.set_uint8 hash_one 0 1;
+  Alcotest.(check bool) "negative target rejected" false
+    (Consensus.check_proof_of_work hash_one negative_bits consensus);
+
+  (* Overflow target: nBits = ~0x00800000 (exponent=0xff, huge overflow).
+     Core test: unsigned int nBits{~0x00800000U} which is 0xff7fffff.
+     nSize=0xff=255 > 34 → overflow *)
+  let overflow_bits = 0xff7fffffl in
+  Alcotest.(check bool) "overflow target rejected" false
+    (Consensus.check_proof_of_work hash_one overflow_bits consensus);
+
+  (* Too-easy target: pow_limit * 2, should be rejected as above pow_limit *)
+  let pow_limit_target = Consensus.compact_to_target consensus.pow_limit in
+  let doubled = Consensus.target_multiply pow_limit_target 2 in
+  let too_easy_bits = Consensus.target_to_compact (Cstruct.sub doubled 0 32) in
+  Alcotest.(check bool) "too-easy target rejected" false
+    (Consensus.check_proof_of_work hash_one too_easy_bits consensus);
+
+  (* Zero target: nBits from zero value → rejected *)
+  let zero_bits = 0x00000000l in
+  Alcotest.(check bool) "zero target rejected" false
+    (Consensus.check_proof_of_work hash_one zero_bits consensus);
+
+  (* Valid: hash=0x01 with easy pow_limit bits — hash < target *)
+  Alcotest.(check bool) "valid hash meets pow_limit" true
+    (Consensus.check_proof_of_work hash_one consensus.pow_limit consensus);
+
+  (* Invalid: hash > target (hash=pow_limit*2, target=pow_limit) *)
+  let big_hash = Cstruct.create 32 in
+  for i = 0 to 31 do
+    Cstruct.set_uint8 big_hash i (Cstruct.get_uint8 pow_limit_target i)
+  done;
+  (* Set big_hash to pow_limit * 2 by shifting left *)
+  let carry = ref 0 in
+  for i = 0 to 31 do
+    let v = Cstruct.get_uint8 big_hash i * 2 + !carry in
+    Cstruct.set_uint8 big_hash i (v land 0xFF);
+    carry := v lsr 8
+  done;
+  Alcotest.(check bool) "hash bigger than target rejected" false
+    (Consensus.check_proof_of_work big_hash consensus.pow_limit consensus)
+
+(* Test permitted_difficulty_transition — mirrors Core's pow_tests.cpp vectors *)
+let test_permitted_difficulty_transition () =
+  let consensus = Consensus.mainnet in
+
+  (* Vector: get_next_work — height 32256, old=0x1d00ffff, expected=0x1d00d86a *)
+  Alcotest.(check bool) "32256: 0x1d00ffff->0x1d00d86a permitted" true
+    (Consensus.permitted_difficulty_transition ~network:consensus
+       ~height:32256 ~old_nbits:0x1d00ffffl ~new_nbits:0x1d00d86al);
+
+  (* Vector: get_next_work_pow_limit — height 2016, old=0x1d00ffff, expected=0x1d00ffff *)
+  Alcotest.(check bool) "2016: 0x1d00ffff->0x1d00ffff permitted" true
+    (Consensus.permitted_difficulty_transition ~network:consensus
+       ~height:2016 ~old_nbits:0x1d00ffffl ~new_nbits:0x1d00ffffl);
+
+  (* Vector: lower_limit_actual — height 68544, old=0x1c05a3f4, expected=0x1c0168fd *)
+  Alcotest.(check bool) "68544: 0x1c05a3f4->0x1c0168fd permitted" true
+    (Consensus.permitted_difficulty_transition ~network:consensus
+       ~height:68544 ~old_nbits:0x1c05a3f4l ~new_nbits:0x1c0168fdl);
+
+  (* Core test: reducing further from 0x1c0168fd should NOT be permitted *)
+  Alcotest.(check bool) "68544: too-hard transition rejected" false
+    (Consensus.permitted_difficulty_transition ~network:consensus
+       ~height:68544 ~old_nbits:0x1c05a3f4l
+       ~new_nbits:(Int32.sub 0x1c0168fdl 1l));
+
+  (* Vector: upper_limit_actual — height 46368, old=0x1c387f6f, expected=0x1d00e1fd *)
+  Alcotest.(check bool) "46368: 0x1c387f6f->0x1d00e1fd permitted" true
+    (Consensus.permitted_difficulty_transition ~network:consensus
+       ~height:46368 ~old_nbits:0x1c387f6fl ~new_nbits:0x1d00e1fdl);
+
+  (* Core test: increasing further from 0x1d00e1fd should NOT be permitted *)
+  Alcotest.(check bool) "46368: too-easy transition rejected" false
+    (Consensus.permitted_difficulty_transition ~network:consensus
+       ~height:46368 ~old_nbits:0x1c387f6fl
+       ~new_nbits:(Int32.add 0x1d00e1fdl 1l));
+
+  (* Non-adjustment block: bits must match exactly *)
+  Alcotest.(check bool) "non-boundary: same bits permitted" true
+    (Consensus.permitted_difficulty_transition ~network:consensus
+       ~height:100 ~old_nbits:0x1c05a3f4l ~new_nbits:0x1c05a3f4l);
+  Alcotest.(check bool) "non-boundary: different bits rejected" false
+    (Consensus.permitted_difficulty_transition ~network:consensus
+       ~height:100 ~old_nbits:0x1c05a3f4l ~new_nbits:0x1c05a3f5l);
+
+  (* Testnet: always returns true regardless of transition *)
+  Alcotest.(check bool) "testnet: any transition permitted" true
+    (Consensus.permitted_difficulty_transition ~network:Consensus.testnet
+       ~height:2016 ~old_nbits:0x1d00ffffl ~new_nbits:0x1c0000ffl);
+
+  (* Regtest: always returns true *)
+  Alcotest.(check bool) "regtest: any transition permitted" true
+    (Consensus.permitted_difficulty_transition ~network:Consensus.regtest
+       ~height:2016 ~old_nbits:0x207fffffl ~new_nbits:0x1d00ffffl)
+
 let () =
   let open Alcotest in
   run "Consensus" [
@@ -984,6 +1224,21 @@ let () =
       test_case "testnet walk-back" `Quick test_testnet_walk_back;
       test_case "BIP94 retarget" `Quick test_bip94_retarget;
       test_case "mainnet vs BIP94" `Quick test_mainnet_vs_bip94;
+    ];
+    "core_pow_vectors", [
+      test_case "Core vector: get_next_work" `Quick test_core_vector_get_next_work;
+      test_case "Core vector: pow_limit" `Quick test_core_vector_pow_limit;
+      test_case "Core vector: lower_limit_actual" `Quick test_core_vector_lower_limit;
+      test_case "Core vector: upper_limit_actual" `Quick test_core_vector_upper_limit;
+    ];
+    "compact_flags", [
+      test_case "compact_is_negative / compact_is_overflow" `Quick test_compact_flags;
+    ];
+    "check_proof_of_work", [
+      test_case "check_proof_of_work all cases" `Quick test_check_proof_of_work;
+    ];
+    "permitted_difficulty_transition", [
+      test_case "permitted_difficulty_transition vectors" `Quick test_permitted_difficulty_transition;
     ];
     "bip9_versionbits", [
       test_case "deployment state strings" `Quick test_deployment_state_strings;

@@ -99,23 +99,65 @@ let block_subsidy_for_network (network : network) (height : int) : int64 =
 
 (* Compact target format (nBits) conversion to 256-bit target.
 
-   The compact format is: bits[31:24] = exponent, bits[22:0] = mantissa
+   The compact format is: bits[31:24] = exponent (nSize), bits[22:0] = mantissa (nWord).
+   Bit 23 is the sign bit.
    Target = mantissa * 256^(exponent - 3)
 
    The result is stored in little-endian format (byte 0 = LSB, byte 31 = MSB).
    For regtest 0x207fffff: mantissa=0x7fffff, exp=32, target=0x7fffff * 256^29
-   This puts bytes at indices 29, 30, 31 in little-endian storage. *)
+   This puts bytes at indices 29, 30, 31 in little-endian storage.
+
+   Mirrors Bitcoin Core arith_uint256.cpp:SetCompact.
+   Returns the target value.  The separate [compact_is_negative] and
+   [compact_is_overflow] predicates track the flag fields used by DeriveTarget
+   to reject invalid nBits values.
+
+   Overflow condition matches Bitcoin Core exactly:
+     nWord != 0 && (nSize > 34 || (nWord > 0xff && nSize > 33) || (nWord > 0xffff && nSize > 32))
+   so exponent=33 with nWord<=0xff and exponent=34 with nWord<=0xffff are NOT overflow. *)
+
+(* Return true if this nBits value has the negative flag set.
+   Bitcoin Core: fNegative = nWord != 0 && (nCompact & 0x00800000) != 0. *)
+let compact_is_negative (bits : int32) : bool =
+  let bits_i = Int32.to_int bits in
+  let nword = bits_i land 0x7FFFFF in
+  nword <> 0 && (bits_i land 0x00800000 <> 0)
+
+(* Return true if this nBits value represents an overflow (target > 2^256).
+   Bitcoin Core: fOverflow = nWord != 0 && (nSize > 34 ||
+                              (nWord > 0xff && nSize > 33) ||
+                              (nWord > 0xffff && nSize > 32)). *)
+let compact_is_overflow (bits : int32) : bool =
+  let bits_i = Int32.to_int bits in
+  let nword = bits_i land 0x7FFFFF in
+  let nsize = (bits_i lsr 24) land 0xFF in
+  nword <> 0 && (
+    nsize > 34
+    || (nword > 0xff && nsize > 33)
+    || (nword > 0xffff && nsize > 32)
+  )
+
 let compact_to_target (bits : int32) : Cstruct.t =
   let bits_i = Int32.to_int bits in
   let exponent = (bits_i lsr 24) land 0xFF in
   let mantissa = bits_i land 0x7FFFFF in
   let target = Cstruct.create 32 in
 
-  (* Negative bit set: return zero target *)
-  if bits_i land 0x00800000 <> 0 then
+  (* Negative bit set (and mantissa non-zero): return zero target.
+     Core: if pfNegative, DeriveTarget returns nothing.  Mapping to zero here
+     ensures hash_meets_target rejects such blocks (any real hash > 0). *)
+  if bits_i land 0x00800000 <> 0 && mantissa <> 0 then
     target
-  (* Exponent overflow: return zero target *)
-  else if exponent > 32 then
+  (* Exponent overflow (Core semantics): return zero target.
+     nSize > 34 is always overflow.
+     nSize > 33 with nWord > 0xff is overflow.
+     nSize > 32 with nWord > 0xffff is overflow.
+     (exponent 33 with nWord<=0xff and exponent 34 with nWord<=0xffff are valid.) *)
+  else if mantissa <> 0 && (
+    exponent > 34
+    || (mantissa > 0xff && exponent > 33)
+    || (mantissa > 0xffff && exponent > 32)
+  ) then
     target
   else if exponent = 0 || mantissa = 0 then
     target  (* Zero target *)
@@ -181,22 +223,28 @@ let target_to_compact (target : Cstruct.t) : int32 =
                 (Int32.of_int (mantissa land 0x7FFFFF))
   end
 
-(* Check if a hash meets the target difficulty *)
+(* Compare two 256-bit LE values.  Returns true iff a <= b. *)
+let target_le (a : Cstruct.t) (b : Cstruct.t) : bool =
+  let rec cmp i =
+    if i < 0 then true  (* equal *)
+    else
+      let av = Cstruct.get_uint8 a i in
+      let bv = Cstruct.get_uint8 b i in
+      if av < bv then true
+      else if av > bv then false
+      else cmp (i - 1)
+  in
+  cmp 31
+
+(* Check if a hash meets the target difficulty.
+   This is a lightweight check — it does NOT validate the nBits field itself
+   (negative/overflow/pow_limit bounds).  Use check_proof_of_work for full
+   validation matching Bitcoin Core's CheckProofOfWork / DeriveTarget. *)
 let hash_meets_target (hash : Types.hash256) (bits : int32) : bool =
   let target = compact_to_target bits in
-  (* Compare hash to target (both in internal little-endian format) *)
-  (* Hash must be <= target. Compare from MSB (byte 31) to LSB (byte 0) *)
-  let rec compare_bytes i =
-    if i < 0 then true  (* Equal, meets target *)
-    else begin
-      let h = Cstruct.get_uint8 hash i in
-      let t = Cstruct.get_uint8 target i in
-      if h < t then true
-      else if h > t then false
-      else compare_bytes (i - 1)
-    end
-  in
-  compare_bytes 31
+  target_le hash target
+
+
 
 (* Network configuration type *)
 type network_config = {
@@ -402,6 +450,101 @@ let next_work_required ~(last_retarget_time : int32)
     ~last_block_time:current_header.timestamp
     ~base_bits:current_bits
     ~network
+
+(* Full proof-of-work check matching Bitcoin Core's CheckProofOfWork /
+   DeriveTarget (pow.cpp:146-170).
+
+   Rejects nBits that are:
+   - negative   (sign bit set with non-zero mantissa)
+   - overflow   (target would exceed 2^256)
+   - zero       (target == 0)
+   - above pow_limit
+   Then checks hash <= target.
+
+   Bitcoin Core pow.cpp:161-170:
+     auto bnTarget{DeriveTarget(nBits, params.powLimit)};
+     if (!bnTarget) return false;
+     if (UintToArith256(hash) > bnTarget) return false;
+     return true; *)
+let check_proof_of_work (hash : Types.hash256) (bits : int32)
+    (network : network_config) : bool =
+  (* Reject negative nBits *)
+  if compact_is_negative bits then false
+  (* Reject overflow nBits *)
+  else if compact_is_overflow bits then false
+  else begin
+    let target = compact_to_target bits in
+    (* Reject zero target *)
+    let is_zero = ref true in
+    for i = 0 to 31 do
+      if Cstruct.get_uint8 target i <> 0 then is_zero := false
+    done;
+    if !is_zero then false
+    else begin
+      (* Reject target > pow_limit *)
+      let pow_limit_target = compact_to_target network.pow_limit in
+      if not (target_le target pow_limit_target) then false
+      (* Check hash <= target *)
+      else target_le hash target
+    end
+  end
+
+(* PermittedDifficultyTransition — Bitcoin Core pow.cpp:89-136.
+   Returns false if the difficulty transition from old_nbits to new_nbits at
+   the given height is outside allowed bounds.
+
+   At difficulty-adjustment boundaries (height % 2016 == 0):
+   - new target must be within [old_target/4, old_target*4] (clamped to pow_limit)
+   - comparison uses SetCompact/GetCompact round-trip to match Core's truncation
+
+   At non-boundary heights: old_nbits must equal new_nbits exactly.
+
+   Always returns true on networks that allow min-difficulty blocks
+   (testnet3, testnet4, regtest), matching Bitcoin Core's early return:
+     if (params.fPowAllowMinDifficultyBlocks) return true;
+
+   Bitcoin Core pow.cpp:89-136. *)
+let permitted_difficulty_transition ~(network : network_config)
+    ~(height : int) ~(old_nbits : int32) ~(new_nbits : int32) : bool =
+  (* Testnet/regtest: all transitions permitted *)
+  if network.pow_allow_min_difficulty then true
+  else if height mod difficulty_adjustment_interval = 0 then begin
+    (* At adjustment boundary: check factor-of-4 bounds *)
+    let smallest_timespan = min_target_timespan in  (* target_timespan / 4 *)
+    let largest_timespan  = max_target_timespan in  (* target_timespan * 4 *)
+    let pow_limit_target  = compact_to_target network.pow_limit in
+    let observed          = compact_to_target new_nbits in
+
+    (* Calculate the largest (easiest) allowed target:
+       largest = old_target * largest_timespan / target_timespan, clamped to pow_limit *)
+    let old_target = compact_to_target old_nbits in
+    let largest_raw = target_divide
+      (target_multiply old_target largest_timespan)
+      target_timespan 32 in
+    let largest_target =
+      if target_compare largest_raw pow_limit_target > 0 then pow_limit_target
+      else largest_raw in
+    (* Round-trip through compact to match Core's truncation *)
+    let maximum_new_target = compact_to_target (target_to_compact largest_target) in
+    if target_compare maximum_new_target observed < 0 then false
+    else begin
+      (* Calculate the smallest (hardest) allowed target:
+         smallest = old_target * smallest_timespan / target_timespan, clamped to pow_limit *)
+      let smallest_raw = target_divide
+        (target_multiply old_target smallest_timespan)
+        target_timespan 32 in
+      let smallest_target =
+        if target_compare smallest_raw pow_limit_target > 0 then pow_limit_target
+        else smallest_raw in
+      (* Round-trip through compact to match Core's truncation *)
+      let minimum_new_target = compact_to_target (target_to_compact smallest_target) in
+      if target_compare minimum_new_target observed > 0 then false
+      else true
+    end
+  end else begin
+    (* Not a boundary: bits must be identical *)
+    old_nbits = new_nbits
+  end
 
 (* Parse a big-endian hex string into a 32-byte little-endian Cstruct.
    The hex string is in normal reading order (MSB first), but the Cstruct

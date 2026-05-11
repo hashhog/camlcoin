@@ -1818,7 +1818,14 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (t
             | Ok () ->
 
             let wtxid = Crypto.compute_wtxid tx in
-            let vsize = (weight + 3) / 4 in
+            (* Sigop-adjusted vsize — policy/policy.cpp:395-398, kernel/mempool_entry.h:110-112.
+               Core's GetTxSize() = GetVirtualTransactionSize(nTxWeight, sigOpCost, nBytesPerSigOp).
+               When the sigop cost inflates vsize beyond the raw weight/4 value, the larger
+               vsize is used for feerate comparisons and ancestor/descendant size accounting.
+               sigops_cost is already computed above for the MAX_STANDARD_TX_SIGOPS_COST gate. *)
+            let vsize = Validation.get_virtual_transaction_size
+              ~weight ~sigop_cost:sigops_cost
+              ~bytes_per_sigop:Consensus.default_bytes_per_sigop in
 
             (* Compute initial ancestor stats using BFS *)
             let (anc_count, anc_size) =
@@ -2330,7 +2337,8 @@ let accept_to_memory_pool ?(test_accept=false) (mp : mempool) (tx : Types.transa
     match accept_transaction ~dry_run:true mp tx with
     | Ok entry ->
       { atmp_accepted = true; atmp_txid = txid; atmp_fee = entry.fee;
-        atmp_vsize = entry.weight / 4;
+        (* ceil(weight / 4) — must round up, not truncate; policy/policy.cpp:395-398 *)
+        atmp_vsize = (entry.weight + 3) / 4;
         atmp_reject_reason = None }
     | Error reason ->
       { atmp_accepted = false; atmp_txid = txid; atmp_fee = 0L; atmp_vsize = 0;
@@ -2339,7 +2347,8 @@ let accept_to_memory_pool ?(test_accept=false) (mp : mempool) (tx : Types.transa
     match accept_transaction mp tx with
     | Ok entry ->
       { atmp_accepted = true; atmp_txid = txid; atmp_fee = entry.fee;
-        atmp_vsize = entry.weight / 4;
+        (* ceil(weight / 4) — must round up, not truncate; policy/policy.cpp:395-398 *)
+        atmp_vsize = (entry.weight + 3) / 4;
         atmp_reject_reason = None }
     | Error reason ->
       { atmp_accepted = false; atmp_txid = txid; atmp_fee = 0L; atmp_vsize = 0;

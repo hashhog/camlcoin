@@ -1469,95 +1469,124 @@ let check_ancestor_descendant_limits (mp : mempool) (depends : Types.hash256 lis
 let is_truc_tx (tx : Types.transaction) : bool =
   tx.Types.version = truc_version
 
-(* Check TRUC/v3 policy constraints for a transaction *)
-let check_truc_policy (mp : mempool) (tx : Types.transaction)
-    (depends : Types.hash256 list) (weight : int) : (unit, string) result =
-  let is_v3 = is_truc_tx tx in
-  let vsize = (weight + 3) / 4 in
+(* Check TRUC/v3 policy constraints for a transaction.
+   [vsize] must be the sigop-adjusted virtual size (use
+   Validation.get_virtual_transaction_size), matching Core's SingleTRUCChecks
+   which also receives the sigop-adjusted vsize.
 
-  if is_v3 then begin
-    (* Rule 1: v3 transaction size limit (10,000 vbytes) *)
+   Gate order mirrors Bitcoin Core truc_policy.cpp:SingleTRUCChecks:
+     1. Inheritance: non-v3 cannot spend v3, v3 cannot spend non-v3.
+     2. (v3 only) TRUC_MAX_VSIZE: vsize ≤ 10,000 vbytes.
+     3. (v3 only) TRUC_ANCESTOR_LIMIT: direct unconfirmed parents ≤ 1.
+     4. (v3 with unconfirmed parents) grandparent check via parent's ancestor count.
+     5. (v3 with unconfirmed parents) TRUC_CHILD_MAX_VSIZE: vsize ≤ 1,000 vbytes.
+     6. (v3 with unconfirmed parents) TRUC_DESCENDANT_LIMIT: parent's descendant
+        count + 1 ≤ 2.
+
+   Reference: bitcoin-core/src/policy/truc_policy.cpp:171-261. *)
+let check_truc_policy (mp : mempool) (tx : Types.transaction)
+    (depends : Types.hash256 list) (vsize : int) : (unit, string) result =
+  let is_v3 = is_truc_tx tx in
+
+  (* Gate 1 (ALL transactions): version-inheritance check.
+     Core truc_policy.cpp:178-191. *)
+  let inheritance_error = ref None in
+  List.iter (fun parent_txid ->
+    if !inheritance_error = None then begin
+      match Hashtbl.find_opt mp.entries (Cstruct.to_string parent_txid) with
+      | None -> ()  (* confirmed parent — no version constraint *)
+      | Some parent_entry ->
+        let parent_is_v3 = is_truc_tx parent_entry.tx in
+        if (not is_v3) && parent_is_v3 then
+          inheritance_error := Some
+            "Non-v3 transaction cannot spend unconfirmed v3 outputs"
+        else if is_v3 && (not parent_is_v3) then
+          inheritance_error := Some
+            "TRUC/v3 transaction cannot spend from unconfirmed non-v3 transaction"
+    end
+  ) depends;
+
+  match !inheritance_error with
+  | Some e -> Error e
+  | None ->
+
+  (* Remaining gates only apply to v3 transactions. *)
+  if not is_v3 then Ok ()
+  else begin
+    (* Gate 2 (v3): TRUC_MAX_VSIZE — 10,000 sigop-adjusted vbytes.
+       Core truc_policy.cpp:200-204. *)
     if vsize > truc_max_vsize then
       Error (Printf.sprintf
         "TRUC/v3 transaction too large: %d vbytes > %d limit"
         vsize truc_max_vsize)
+
     else begin
-      let has_unconfirmed_parents = depends <> [] in
+      (* Gate 3 (v3): TRUC_ANCESTOR_LIMIT — at most 1 direct unconfirmed parent.
+         Core truc_policy.cpp:207-211:
+           if mempool_parents.size() + 1 > TRUC_ANCESTOR_LIMIT  *)
+      let direct_parent_count = List.length depends in
+      if direct_parent_count + 1 > truc_ancestor_limit then
+        Error (Printf.sprintf
+          "TRUC/v3 transaction has too many unconfirmed ancestors (%d > %d)"
+          (direct_parent_count + 1) truc_ancestor_limit)
 
-      (* Check if any parent is v3 *)
-      let v3_parents = List.filter (fun parent_txid ->
+      else if depends = [] then
+        (* v3 root (no unconfirmed parents): all gates passed. *)
+        Ok ()
+
+      else begin
+        (* has_unconfirmed_parents = true from here on.
+           Exactly 1 direct unconfirmed parent (gate 3 enforces this). *)
+        let parent_txid = List.hd depends in
         match Hashtbl.find_opt mp.entries (Cstruct.to_string parent_txid) with
-        | None -> false
-        | Some parent_entry -> is_truc_tx parent_entry.tx
-      ) depends in
-
-      (* Check if any parent is non-v3 *)
-      let non_v3_parents = List.filter (fun parent_txid ->
-        match Hashtbl.find_opt mp.entries (Cstruct.to_string parent_txid) with
-        | None -> false  (* confirmed UTXOs are fine *)
-        | Some parent_entry -> not (is_truc_tx parent_entry.tx)
-      ) depends in
-
-      (* Rule: v3 cannot spend from unconfirmed non-v3 *)
-      if non_v3_parents <> [] then
-        Error "TRUC/v3 transaction cannot spend from unconfirmed non-v3 transaction"
-
-      (* Rules for v3 child transactions (with unconfirmed v3 parents) *)
-      else if has_unconfirmed_parents && v3_parents <> [] then begin
-        (* Rule 2: v3 child size limit (1,000 vbytes) *)
-        if vsize > truc_child_max_vsize then
-          Error (Printf.sprintf
-            "TRUC/v3 child transaction too large: %d vbytes > %d limit"
-            vsize truc_child_max_vsize)
-        else begin
-          (* Rule 3: v3 child can only have 1 unconfirmed parent *)
-          let ancestor_count = List.length depends + 1 in  (* parents + self *)
-          if ancestor_count > truc_ancestor_limit then
+        | None ->
+          (* Parent not in mempool anymore — should not happen since depends
+             is built from mempool lookups; treat as no constraint. *)
+          Ok ()
+        | Some parent_entry ->
+          (* Gate 4 (v3 child): parent's ancestor count + 1 must not exceed limit.
+             This rejects grandparent chains.
+             Core truc_policy.cpp:215-220:
+               if pool.GetAncestorCount(mempool_parents[0]) + 1 > TRUC_ANCESTOR_LIMIT
+             GetAncestorCount includes the parent itself, so parent has 0
+             unconfirmed ancestors ⟹ count=1, 1+1=2≤2 ✓.
+             Parent has 1 unconfirmed grandparent ⟹ count=2, 2+1=3>2 ✗. *)
+          let parent_ancestor_count = List.length parent_entry.depends_on + 1 in
+          if parent_ancestor_count + 1 > truc_ancestor_limit then
             Error (Printf.sprintf
-              "TRUC/v3 transaction exceeds ancestor limit (%d > %d)"
-              ancestor_count truc_ancestor_limit)
+              "TRUC/v3 transaction would have too many ancestors \
+               (parent already has %d ancestors)" parent_ancestor_count)
+
           else begin
-            (* Check for grandparents: if parent has parents, we exceed limit *)
-            let has_grandparents = List.exists (fun parent_txid ->
-              match Hashtbl.find_opt mp.entries (Cstruct.to_string parent_txid) with
-              | None -> false
-              | Some parent_entry -> parent_entry.depends_on <> []
-            ) depends in
-            if has_grandparents then
-              Error "TRUC/v3 transaction would exceed ancestor limit (grandparents exist)"
+            (* Gate 5 (v3 child): TRUC_CHILD_MAX_VSIZE — 1,000 sigop-adjusted vbytes.
+               Core truc_policy.cpp:222-227. *)
+            if vsize > truc_child_max_vsize then
+              Error (Printf.sprintf
+                "TRUC/v3 child transaction too large: %d vbytes > %d limit"
+                vsize truc_child_max_vsize)
+
             else begin
-              (* Rule 4: v3 parent can only have 1 child *)
-              let parent_has_child = List.exists (fun parent_txid ->
-                match Hashtbl.find_opt mp.entries (Cstruct.to_string parent_txid) with
-                | None -> false
-                | Some _parent_entry ->
-                  (* Check if parent already has a child in mempool *)
-                  Hashtbl.fold (fun _ entry found ->
-                    found || (List.exists (fun d ->
-                      Cstruct.equal d parent_txid) entry.depends_on)
-                  ) mp.entries false
-              ) depends in
-              if parent_has_child then
-                Error "TRUC/v3 parent already has an unconfirmed child (descendant limit)"
+              (* Gate 6 (v3 child): TRUC_DESCENDANT_LIMIT — parent can have at most
+                 1 child (descendant_count including itself must stay ≤ 2).
+                 Core truc_policy.cpp:229-258.
+                 We use the cached descendant_count on the parent entry:
+                   parent.descendant_count + 1 > TRUC_DESCENDANT_LIMIT
+                 descendant_count includes the parent itself, so:
+                   0 children ⟹ count=1, 1+1=2≤2 ✓
+                   1 child    ⟹ count=2, 2+1=3>2 ✗ *)
+              if parent_entry.descendant_count + 1 > truc_descendant_limit then
+                Error (Printf.sprintf
+                  "TRUC/v3 parent %s already has an unconfirmed child \
+                   (descendant count %d would exceed limit %d)"
+                  (Types.hash256_to_hex_display parent_txid)
+                  (parent_entry.descendant_count + 1)
+                  truc_descendant_limit)
               else
                 Ok ()
             end
           end
-        end
-      end else
-        Ok ()
+      end
     end
-  end else begin
-    (* Non-v3 transaction: reject if it spends unconfirmed v3 outputs *)
-    let spends_v3 = List.exists (fun parent_txid ->
-      match Hashtbl.find_opt mp.entries (Cstruct.to_string parent_txid) with
-      | None -> false
-      | Some parent_entry -> is_truc_tx parent_entry.tx
-    ) depends in
-    if spends_v3 then
-      Error "Non-v3 transaction cannot spend unconfirmed v3 outputs"
-    else
-      Ok ()
   end
 
 (* Check if a v3 transaction signals replaceability (always true for v3) *)
@@ -1807,8 +1836,21 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (t
             | Error e -> Error e
             | Ok () ->
 
-            (* TRUC/v3 policy (BIP-431) *)
-            match check_truc_policy mp tx !depends weight with
+            (* Sigop-adjusted vsize — policy/policy.cpp:395-398, kernel/mempool_entry.h:110-112.
+               Core's GetTxSize() = GetVirtualTransactionSize(nTxWeight, sigOpCost, nBytesPerSigOp).
+               When the sigop cost inflates vsize beyond the raw weight/4 value, the larger
+               vsize is used for feerate comparisons and ancestor/descendant size accounting.
+               sigops_cost is already computed above for the MAX_STANDARD_TX_SIGOPS_COST gate.
+               Computed here (before the TRUC check) so check_truc_policy receives the
+               correct sigop-adjusted vsize matching Core's SingleTRUCChecks. *)
+            let vsize = Validation.get_virtual_transaction_size
+              ~weight ~sigop_cost:sigops_cost
+              ~bytes_per_sigop:Consensus.default_bytes_per_sigop in
+
+            (* TRUC/v3 policy (BIP-431).
+               Pass sigop-adjusted vsize — Core truc_policy.cpp:SingleTRUCChecks
+               receives the same adjusted vsize. *)
+            match check_truc_policy mp tx !depends vsize with
             | Error e -> Error e
             | Ok () ->
 
@@ -1818,14 +1860,6 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (t
             | Ok () ->
 
             let wtxid = Crypto.compute_wtxid tx in
-            (* Sigop-adjusted vsize — policy/policy.cpp:395-398, kernel/mempool_entry.h:110-112.
-               Core's GetTxSize() = GetVirtualTransactionSize(nTxWeight, sigOpCost, nBytesPerSigOp).
-               When the sigop cost inflates vsize beyond the raw weight/4 value, the larger
-               vsize is used for feerate comparisons and ancestor/descendant size accounting.
-               sigops_cost is already computed above for the MAX_STANDARD_TX_SIGOPS_COST gate. *)
-            let vsize = Validation.get_virtual_transaction_size
-              ~weight ~sigop_cost:sigops_cost
-              ~bytes_per_sigop:Consensus.default_bytes_per_sigop in
 
             (* Compute initial ancestor stats using BFS *)
             let (anc_count, anc_size) =

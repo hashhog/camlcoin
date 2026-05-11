@@ -607,7 +607,7 @@ let test_check_block_empty () =
     Types.header = make_header ();
     transactions = [];
   } in
-  match Validation.check_block ~network:Consensus.regtest block 0 ~expected_bits:0x207fffffl ~median_time:0l with
+  match Validation.check_block ~network:Consensus.regtest block 0 ~expected_bits:0x207fffffl ~median_time:0l () with
   | Error Validation.BlockEmptyTransactions -> ()
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
   | Ok () -> Alcotest.fail "Should have failed with BlockEmptyTransactions"
@@ -624,7 +624,7 @@ let test_check_block_no_coinbase () =
     Types.header = make_header ();
     transactions = [regular_tx];
   } in
-  match Validation.check_block ~network:Consensus.regtest block 0 ~expected_bits:0x207fffffl ~median_time:0l with
+  match Validation.check_block ~network:Consensus.regtest block 0 ~expected_bits:0x207fffffl ~median_time:0l () with
   | Error Validation.BlockNoCoinbase -> ()
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
   | Ok () -> Alcotest.fail "Should have failed with BlockNoCoinbase"
@@ -640,7 +640,7 @@ let test_check_block_bad_difficulty () =
   let header = make_header ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:100l () in
   let block = { Types.header; transactions = [coinbase] } in
   (* Expected bits don't match *)
-  match Validation.check_block ~network:Consensus.regtest block 0 ~expected_bits:0x1d00ffffl ~median_time:0l with
+  match Validation.check_block ~network:Consensus.regtest block 0 ~expected_bits:0x1d00ffffl ~median_time:0l () with
   | Error Validation.BlockBadDifficulty -> ()
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
   | Ok () -> Alcotest.fail "Should have failed with BlockBadDifficulty"
@@ -654,7 +654,7 @@ let test_check_block_bad_merkle () =
   let wrong_merkle = Types.zero_hash in
   let header = make_header ~merkle_root:wrong_merkle ~bits:0x207fffffl ~timestamp:100l () in
   let block = { Types.header; transactions = [coinbase] } in
-  match Validation.check_block ~network:Consensus.regtest block 0 ~expected_bits:0x207fffffl ~median_time:0l with
+  match Validation.check_block ~network:Consensus.regtest block 0 ~expected_bits:0x207fffffl ~median_time:0l () with
   | Error Validation.BlockBadMerkleRoot -> ()
   | Error Validation.BlockBadDifficulty -> ()  (* May fail difficulty first *)
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
@@ -675,11 +675,80 @@ let test_check_block_bad_timestamp () =
      Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader. *)
   let header = make_header ~version:4l ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:50l () in
   let block = { Types.header; transactions = [coinbase] } in
-  match Validation.check_block ~network:Consensus.regtest block 100 ~expected_bits:0x207fffffl ~median_time:100l with
+  match Validation.check_block ~network:Consensus.regtest block 100 ~expected_bits:0x207fffffl ~median_time:100l () with
   | Error Validation.BlockBadTimestamp -> ()
   | Error Validation.BlockBadDifficulty -> ()  (* May fail PoW check *)
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
   | Ok () -> Alcotest.fail "Should have failed with BlockBadTimestamp"
+
+(* BIP-94 timewarp attack: check_block fires BlockTimeWarpAttack on testnet4 at a
+   difficulty-adjustment boundary when header_time < prev_block_time - MAX_TIMEWARP.
+   Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4097-4104. *)
+let test_check_block_timewarp_attack () =
+  (* Use testnet4 (enforce_bip94=true); height=2016 is a retarget boundary *)
+  let coinbase = make_tx
+    ~inputs:[make_coinbase_input ~height:2016]
+    ~outputs:[make_output ~value:(Consensus.block_subsidy 2016) ()]
+    ()
+  in
+  let txid = Crypto.compute_txid coinbase in
+  let (merkle, _) = Crypto.merkle_root [txid] in
+  (* Timestamp > median_time (passes time-too-old), but 700s before prev block
+     (fails BIP-94: needs prev_block_time - 600 <= header_time). *)
+  let prev_block_time = 2_000_000l in
+  let header_time = Int32.sub prev_block_time 700l in  (* 700s before parent: > MAX_TIMEWARP=600 *)
+  let median_time = Int32.sub header_time 1l in        (* header_time > median_time: passes MTP gate *)
+  let header = make_header ~version:4l ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:header_time () in
+  let block = { Types.header; transactions = [coinbase] } in
+  match Validation.check_block ~network:Consensus.testnet4 block 2016
+          ~expected_bits:0x207fffffl ~median_time ~prev_block_time () with
+  | Error Validation.BlockTimeWarpAttack -> ()
+  | Error Validation.BlockBadDifficulty -> ()  (* PoW hash check may fire first *)
+  | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have failed with BlockTimeWarpAttack on testnet4"
+
+(* Mainnet: timewarp rule does NOT apply even at a retarget boundary. *)
+let test_check_block_no_timewarp_mainnet () =
+  let coinbase = make_tx
+    ~inputs:[make_coinbase_input ~height:2016]
+    ~outputs:[make_output ~value:(Consensus.block_subsidy 2016) ()]
+    ()
+  in
+  let txid = Crypto.compute_txid coinbase in
+  let (merkle, _) = Crypto.merkle_root [txid] in
+  let prev_block_time = 2_000_000l in
+  let header_time = Int32.sub prev_block_time 700l in
+  let median_time = Int32.sub header_time 1l in
+  let header = make_header ~version:4l ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:header_time () in
+  let block = { Types.header; transactions = [coinbase] } in
+  (* On mainnet, the same block must NOT be rejected as BlockTimeWarpAttack *)
+  (match Validation.check_block ~network:Consensus.mainnet block 2016
+           ~expected_bits:0x207fffffl ~median_time ~prev_block_time () with
+   | Error Validation.BlockTimeWarpAttack ->
+     Alcotest.fail "Mainnet must NOT enforce BIP-94 timewarp rule"
+   | _ -> ())
+
+(* Testnet4 at a non-retarget boundary: timewarp does not apply. *)
+let test_check_block_no_timewarp_non_boundary () =
+  let height = 2017 in  (* NOT a retarget boundary *)
+  let coinbase = make_tx
+    ~inputs:[make_coinbase_input ~height]
+    ~outputs:[make_output ~value:(Consensus.block_subsidy height) ()]
+    ()
+  in
+  let txid = Crypto.compute_txid coinbase in
+  let (merkle, _) = Crypto.merkle_root [txid] in
+  let prev_block_time = 2_000_000l in
+  let header_time = Int32.sub prev_block_time 700l in
+  let median_time = Int32.sub header_time 1l in
+  let header = make_header ~version:4l ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:header_time () in
+  let block = { Types.header; transactions = [coinbase] } in
+  (* At non-boundary height, timewarp must NOT fire *)
+  (match Validation.check_block ~network:Consensus.testnet4 block height
+           ~expected_bits:0x207fffffl ~median_time ~prev_block_time () with
+   | Error Validation.BlockTimeWarpAttack ->
+     Alcotest.fail "Timewarp must not fire at non-boundary height"
+   | _ -> ())
 
 let test_check_block_duplicate_tx () =
   let coinbase = make_tx
@@ -701,7 +770,7 @@ let test_check_block_duplicate_tx () =
     Types.header = make_header ~version:4l ~timestamp:200l ();
     transactions = [coinbase; regular_tx; regular_tx];  (* Duplicate *)
   } in
-  match Validation.check_block ~network:Consensus.regtest block 100 ~expected_bits:0x207fffffl ~median_time:0l with
+  match Validation.check_block ~network:Consensus.regtest block 100 ~expected_bits:0x207fffffl ~median_time:0l () with
   | Error Validation.BlockDuplicateTx -> ()
   | Error Validation.BlockBadMerkleRoot -> ()  (* May fail merkle first *)
   | Error Validation.BlockBadDifficulty -> ()  (* May fail PoW first *)
@@ -1098,7 +1167,7 @@ let test_check_block_unexpected_witness_regtest () =
   let header = make_header ~version:4l ~merkle_root ~bits:0x207fffffl ~timestamp:200l () in
   let block = { Types.header; transactions = txs } in
   match Validation.check_block ~network:Consensus.regtest block 1
-          ~expected_bits:0x207fffffl ~median_time:0l with
+          ~expected_bits:0x207fffffl ~median_time:0l () with
   | Error Validation.BlockUnexpectedWitness -> ()
   | Error Validation.BlockBadWitnessNonceSize -> ()  (* also acceptable: commitment check *)
   | Error Validation.BlockBadWitnessCommitment -> ()
@@ -1147,6 +1216,7 @@ let test_block_error_strings () =
     Validation.BlockUnexpectedWitness;
     Validation.BlockBadVersion;
     Validation.BlockMutatedMerkle;
+    Validation.BlockTimeWarpAttack;
   ] in
   List.iter (fun e ->
     let s = Validation.block_error_to_string e in
@@ -1161,7 +1231,11 @@ let test_block_error_strings () =
     (Validation.block_error_to_string Validation.BlockBadWitnessNonceSize);
   Alcotest.(check string) "unexpected-witness string"
     "unexpected-witness"
-    (Validation.block_error_to_string Validation.BlockUnexpectedWitness)
+    (Validation.block_error_to_string Validation.BlockUnexpectedWitness);
+  (* BIP-94 error string matches Core's reject reason *)
+  Alcotest.(check string) "time-timewarp-attack string"
+    "time-timewarp-attack"
+    (Validation.block_error_to_string Validation.BlockTimeWarpAttack)
 
 (* ============================================================================
    BIP-34 Conditional Enforcement Tests (Bug 1)
@@ -1211,7 +1285,7 @@ let test_block_version_too_low_bip34 () =
   let header = make_header ~version:1l ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:100l () in
   let block = { Types.header; transactions = [coinbase] } in
   match Validation.check_block ~network:Consensus.regtest block 500
-          ~expected_bits:0x207fffffl ~median_time:0l with
+          ~expected_bits:0x207fffffl ~median_time:0l () with
   | Error Validation.BlockBadVersion -> ()
   | Error Validation.BlockBadDifficulty -> ()  (* May fail PoW first *)
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
@@ -1231,7 +1305,7 @@ let test_block_version_ok_before_bip34 () =
   let header = make_header ~version:1l ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:100l () in
   let block = { Types.header; transactions = [coinbase] } in
   match Validation.check_block ~network:Consensus.mainnet block 100
-          ~expected_bits:0x207fffffl ~median_time:0l with
+          ~expected_bits:0x207fffffl ~median_time:0l () with
   | Error Validation.BlockBadVersion ->
     Alcotest.fail "Should NOT reject version 1 block before BIP34 activation"
   | Error Validation.BlockBadDifficulty -> ()  (* Expected: PoW check may fail on mainnet params *)
@@ -1250,7 +1324,7 @@ let test_block_version_too_low_bip66 () =
   let header = make_header ~version:2l ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:100l () in
   let block = { Types.header; transactions = [coinbase] } in
   match Validation.check_block ~network:Consensus.regtest block 1251
-          ~expected_bits:0x207fffffl ~median_time:0l with
+          ~expected_bits:0x207fffffl ~median_time:0l () with
   | Error Validation.BlockBadVersion -> ()
   | Error Validation.BlockBadDifficulty -> ()
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
@@ -1268,7 +1342,7 @@ let test_block_version_too_low_bip65 () =
   let header = make_header ~version:3l ~merkle_root:merkle ~bits:0x207fffffl ~timestamp:100l () in
   let block = { Types.header; transactions = [coinbase] } in
   match Validation.check_block ~network:Consensus.regtest block 1351
-          ~expected_bits:0x207fffffl ~median_time:0l with
+          ~expected_bits:0x207fffffl ~median_time:0l () with
   | Error Validation.BlockBadVersion -> ()
   | Error Validation.BlockBadDifficulty -> ()
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
@@ -2300,7 +2374,7 @@ let test_bip34_block_version_gate () =
   let v1_block_h500 = { Types.header; transactions = [coinbase] } in
   (* block version check is in check_block; call it at height >= bip34_height *)
   (match Validation.check_block ~network:Consensus.regtest v1_block_h500 500
-           ~expected_bits:0x207fffffl ~median_time:0l with
+           ~expected_bits:0x207fffffl ~median_time:0l () with
    | Error Validation.BlockBadVersion -> ()
    | Error Validation.BlockBadDifficulty -> ()  (* PoW check may fire first *)
    | Error e -> Alcotest.fail ("Unexpected error: " ^ Validation.block_error_to_string e)
@@ -3238,6 +3312,9 @@ let () =
       test_case "bad merkle" `Quick test_check_block_bad_merkle;
       test_case "bad timestamp" `Quick test_check_block_bad_timestamp;
       test_case "duplicate tx" `Quick test_check_block_duplicate_tx;
+      test_case "BIP94 timewarp attack testnet4" `Quick test_check_block_timewarp_attack;
+      test_case "BIP94 no timewarp on mainnet" `Quick test_check_block_no_timewarp_mainnet;
+      test_case "BIP94 no timewarp at non-boundary" `Quick test_check_block_no_timewarp_non_boundary;
     ];
     "witness_commitment", [
       test_case "valid commitment" `Quick test_witness_commitment_valid;

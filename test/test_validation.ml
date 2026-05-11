@@ -695,6 +695,404 @@ let test_check_block_duplicate_tx () =
   | Ok () -> Alcotest.fail "Should have failed with BlockDuplicateTx"
 
 (* ============================================================================
+   Witness Commitment Tests (W77 — BIP-141 comprehensive audit)
+   Reference: bitcoin-core/src/validation.cpp:3870-3916,
+              bitcoin-core/src/consensus/validation.h:147-165
+   ============================================================================ *)
+
+(* Build the 6-byte witness commitment prefix: OP_RETURN 0x24 0xaa 0x21 0xa9 0xed *)
+let witness_commitment_prefix () =
+  let p = Cstruct.create 6 in
+  Cstruct.set_uint8 p 0 0x6a;
+  Cstruct.set_uint8 p 1 0x24;
+  Cstruct.set_uint8 p 2 0xaa;
+  Cstruct.set_uint8 p 3 0x21;
+  Cstruct.set_uint8 p 4 0xa9;
+  Cstruct.set_uint8 p 5 0xed;
+  p
+
+(* Build a valid 38-byte witness commitment scriptPubKey with the given 32-byte hash *)
+let make_commitment_spk (hash32 : Cstruct.t) : Cstruct.t =
+  Cstruct.concat [witness_commitment_prefix (); hash32]
+
+(* Compute the expected commitment hash from a block's witness merkle root and nonce.
+   commitment = SHA256d(witness_merkle_root || nonce) *)
+let compute_commitment_hash (witness_root : Cstruct.t) (nonce : Cstruct.t) : Cstruct.t =
+  Crypto.sha256d (Cstruct.concat [witness_root; nonce])
+
+(* Build a minimal valid segwit block:
+   - coinbase with a witness commitment output (last output) and the coinbase
+     witness nonce (32 zero bytes in vin[0].scriptWitness)
+   - one regular transaction (no witness) *)
+let make_segwit_block ~(height : int) ~(extra_txs : Types.transaction list)
+    ~(witness_nonce : Cstruct.t)
+    ~(commitment_hash : Cstruct.t option)   (* None → use correct hash *)
+    ~(commitment_outputs : Types.tx_out list option)  (* None → use correct output *)
+    () : Types.block =
+  (* Witness merkle root: coinbase wtxid=0, others use full serialization *)
+  let placeholder_coinbase : Types.transaction = {
+    version = 2l;
+    inputs = [make_coinbase_input ~height];
+    outputs = [make_output ~value:(Consensus.block_subsidy height) ()];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let all_for_witness = placeholder_coinbase :: extra_txs in
+  let wtxids = List.mapi (fun i tx ->
+    if i = 0 then Types.zero_hash
+    else
+      let w = Serialize.writer_create () in
+      Serialize.serialize_transaction w tx;
+      Crypto.sha256d (Serialize.writer_to_cstruct w)
+  ) all_for_witness in
+  let (witness_root, _) = Crypto.merkle_root wtxids in
+  let commitment32 = match commitment_hash with
+    | Some h -> h
+    | None -> compute_commitment_hash witness_root witness_nonce
+  in
+  let commit_spk = make_commitment_spk commitment32 in
+  let commit_output = make_output ~script_pubkey:commit_spk () in
+  let coinbase_outputs = match commitment_outputs with
+    | Some outs -> outs
+    | None -> [make_output ~value:(Consensus.block_subsidy height) (); commit_output]
+  in
+  let coinbase_witness : Types.tx_witness = {
+    items = [witness_nonce];
+  } in
+  let coinbase : Types.transaction = {
+    version = 2l;
+    inputs = [make_coinbase_input ~height];
+    outputs = coinbase_outputs;
+    witnesses = [coinbase_witness];
+    locktime = 0l;
+  } in
+  let all_txs = coinbase :: extra_txs in
+  let txids = List.map Crypto.compute_txid all_txs in
+  let (merkle_root, _) = Crypto.merkle_root txids in
+  let header = make_header ~version:4l ~merkle_root ~bits:0x207fffffl ~timestamp:200l () in
+  { Types.header; transactions = all_txs }
+
+(* Gate 10: coinbase witness nonce must be exactly 1 item of 32 bytes.
+   Core: validation.cpp:3880-3885, bad-witness-nonce-size *)
+let test_witness_nonce_wrong_size () =
+  (* Nonce with 31 bytes (too short) → BlockBadWitnessNonceSize *)
+  let bad_nonce = Cstruct.create 31 in
+  let block = make_segwit_block ~height:1 ~extra_txs:[] ~witness_nonce:bad_nonce
+    ~commitment_hash:None ~commitment_outputs:None () in
+  match Validation.check_witness_commitment ~segwit_active:true block with
+  | Error Validation.BlockBadWitnessNonceSize -> ()
+  | Error e -> Alcotest.failf "Wrong error for 31-byte nonce: %s"
+      (Validation.block_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have failed with BlockBadWitnessNonceSize"
+
+let test_witness_nonce_33_bytes () =
+  (* Nonce with 33 bytes (too long) → BlockBadWitnessNonceSize *)
+  let bad_nonce = Cstruct.create 33 in
+  let block = make_segwit_block ~height:1 ~extra_txs:[] ~witness_nonce:bad_nonce
+    ~commitment_hash:None ~commitment_outputs:None () in
+  match Validation.check_witness_commitment ~segwit_active:true block with
+  | Error Validation.BlockBadWitnessNonceSize -> ()
+  | Error e -> Alcotest.failf "Wrong error for 33-byte nonce: %s"
+      (Validation.block_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have failed with BlockBadWitnessNonceSize"
+
+let test_witness_nonce_empty_stack () =
+  (* Empty witness stack for coinbase input → BlockBadWitnessNonceSize *)
+  let zero_nonce = Cstruct.create 32 in
+  let block = make_segwit_block ~height:1 ~extra_txs:[] ~witness_nonce:zero_nonce
+    ~commitment_hash:None ~commitment_outputs:None () in
+  (* Override witnesses to empty stack *)
+  let cb = List.hd block.transactions in
+  let cb2 = { cb with witnesses = [{ Types.items = [] }] } in
+  let txs2 = cb2 :: List.tl block.transactions in
+  let block2 = { block with transactions = txs2 } in
+  (match Validation.check_witness_commitment ~segwit_active:true block2 with
+  | Error Validation.BlockBadWitnessNonceSize -> ()
+  | Error e -> Alcotest.failf "Wrong error for empty nonce stack: %s"
+      (Validation.block_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have failed with BlockBadWitnessNonceSize")
+
+let test_witness_nonce_two_items () =
+  (* Two-item stack → BlockBadWitnessNonceSize *)
+  let zero_nonce = Cstruct.create 32 in
+  let block = make_segwit_block ~height:1 ~extra_txs:[] ~witness_nonce:zero_nonce
+    ~commitment_hash:None ~commitment_outputs:None () in
+  let cb = List.hd block.transactions in
+  let cb2 = { cb with witnesses =
+    [{ Types.items = [Cstruct.create 32; Cstruct.create 32] }] } in
+  let txs2 = cb2 :: List.tl block.transactions in
+  let block2 = { block with transactions = txs2 } in
+  (match Validation.check_witness_commitment ~segwit_active:true block2 with
+  | Error Validation.BlockBadWitnessNonceSize -> ()
+  | Error e -> Alcotest.failf "Wrong error for 2-item stack: %s"
+      (Validation.block_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have failed with BlockBadWitnessNonceSize")
+
+(* Gate 11: SHA256d(witness_merkle_root || nonce) must equal commitment.
+   Core: validation.cpp:3890-3898, bad-witness-merkle-match *)
+let test_witness_merkle_mismatch () =
+  let zero_nonce = Cstruct.create 32 in
+  let wrong_hash = Cstruct.create 32 in  (* all-zeros ≠ correct commitment *)
+  Cstruct.set_uint8 wrong_hash 0 0xFF;
+  let block = make_segwit_block ~height:1 ~extra_txs:[] ~witness_nonce:zero_nonce
+    ~commitment_hash:(Some wrong_hash) ~commitment_outputs:None () in
+  match Validation.check_witness_commitment ~segwit_active:true block with
+  | Error Validation.BlockBadWitnessCommitment -> ()
+  | Error e -> Alcotest.failf "Wrong error for merkle mismatch: %s"
+      (Validation.block_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have failed with BlockBadWitnessCommitment"
+
+(* Valid segwit block: coinbase wtxid=0, correct commitment, correct nonce *)
+let test_witness_commitment_valid () =
+  let zero_nonce = Cstruct.create 32 in
+  let block = make_segwit_block ~height:1 ~extra_txs:[] ~witness_nonce:zero_nonce
+    ~commitment_hash:None ~commitment_outputs:None () in
+  match Validation.check_witness_commitment ~segwit_active:true block with
+  | Ok () -> ()
+  | Error e -> Alcotest.failf "Valid witness block rejected: %s"
+      (Validation.block_error_to_string e)
+
+(* LAST-scan: Core scans coinbase outputs forward and keeps the last matching one.
+   If two commitment outputs exist, the last one must be valid.
+   The first (bad) one should be ignored. *)
+let test_witness_last_output_wins () =
+  let zero_nonce = Cstruct.create 32 in
+  (* Build a block and then replace coinbase outputs with two commitment outputs,
+     where the first is wrong and the second is correct. *)
+  let block = make_segwit_block ~height:1 ~extra_txs:[] ~witness_nonce:zero_nonce
+    ~commitment_hash:None ~commitment_outputs:None () in
+  (* Extract correct commitment from the block's second coinbase output *)
+  let cb = List.hd block.transactions in
+  let correct_commit_output = List.nth cb.outputs 1 in
+  (* Make a wrong commitment output *)
+  let bad_hash = Cstruct.create 32 in
+  Cstruct.set_uint8 bad_hash 0 0xDE;
+  let bad_commit_spk = make_commitment_spk bad_hash in
+  let bad_commit_output = make_output ~script_pubkey:bad_commit_spk () in
+  (* Coinbase now has: payout, wrong-commit, correct-commit *)
+  let cb2 = { cb with outputs =
+    [make_output ~value:(Consensus.block_subsidy 1) ();
+     bad_commit_output;
+     correct_commit_output] } in
+  let txids2 = List.map Crypto.compute_txid (cb2 :: List.tl block.transactions) in
+  let (merkle2, _) = Crypto.merkle_root txids2 in
+  let header2 = { block.header with merkle_root = merkle2 } in
+  let block2 : Types.block = { header = header2;
+    transactions = cb2 :: List.tl block.transactions } in
+  (* Last output (correct-commit) wins → should pass *)
+  match Validation.check_witness_commitment ~segwit_active:true block2 with
+  | Ok () -> ()
+  | Error e -> Alcotest.failf "Last-output-wins test failed: %s"
+      (Validation.block_error_to_string e)
+
+(* Gate 12: segwit active, no commitment found → any witness data = unexpected-witness.
+   Core: validation.cpp:3905-3913 *)
+let test_unexpected_witness_segwit_active () =
+  (* Block with a non-segwit coinbase (no commitment output) but a tx with witness *)
+  let coinbase : Types.transaction = {
+    version = 2l;
+    inputs = [make_coinbase_input ~height:1];
+    outputs = [make_output ~value:(Consensus.block_subsidy 1) ()];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let witness_tx : Types.transaction = {
+    version = 1l;
+    inputs = [make_input ~txid:(Cstruct.create 32) ()];
+    outputs = [make_output ~value:1000L ()];
+    witnesses = [{ Types.items = [Cstruct.create 72; Cstruct.create 33] }];
+    locktime = 0l;
+  } in
+  let block : Types.block = {
+    header = make_header ();
+    transactions = [coinbase; witness_tx];
+  } in
+  match Validation.check_witness_commitment ~segwit_active:true block with
+  | Error Validation.BlockUnexpectedWitness -> ()
+  | Error e -> Alcotest.failf "Wrong error for unexpected witness: %s"
+      (Validation.block_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have failed with BlockUnexpectedWitness"
+
+(* Pre-segwit block with no witness data should pass (unexpected-witness check passes) *)
+let test_no_witness_pre_segwit () =
+  let coinbase : Types.transaction = {
+    version = 1l;
+    inputs = [make_coinbase_input ~height:0];
+    outputs = [make_output ~value:(Consensus.block_subsidy 0) ()];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let block : Types.block = {
+    header = make_header ();
+    transactions = [coinbase];
+  } in
+  match Validation.check_witness_commitment ~segwit_active:false block with
+  | Ok () -> ()
+  | Error e -> Alcotest.failf "Pre-segwit clean block rejected: %s"
+      (Validation.block_error_to_string e)
+
+(* Pre-segwit block with witness data → unexpected-witness (same as post-segwit no-commitment) *)
+let test_unexpected_witness_pre_segwit () =
+  let coinbase : Types.transaction = {
+    version = 1l;
+    inputs = [make_coinbase_input ~height:0];
+    outputs = [make_output ~value:(Consensus.block_subsidy 0) ()];
+    witnesses = [{ Types.items = [Cstruct.create 32] }];
+    locktime = 0l;
+  } in
+  let block : Types.block = {
+    header = make_header ();
+    transactions = [coinbase];
+  } in
+  match Validation.check_witness_commitment ~segwit_active:false block with
+  | Error Validation.BlockUnexpectedWitness -> ()
+  | Error e -> Alcotest.failf "Wrong error for pre-segwit with witness: %s"
+      (Validation.block_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have failed with BlockUnexpectedWitness"
+
+(* Bug 1 regression: pre-segwit block with a coincidental commitment-looking output
+   must NOT be validated as having a segwit commitment — the commitment check is
+   skipped entirely when segwit_active=false.
+   Core: CheckWitnessMalleation(expect_witness_commitment=false) skips the
+   commitment block, validation.cpp:3872-3903 *)
+let test_pre_segwit_ignores_commitment_output () =
+  (* Coinbase with a commitment-looking output but no coinbase witness.
+     Pre-segwit: commitment check is skipped, only unexpected-witness is checked.
+     Since there's no witness data, this should pass. *)
+  let commit_spk = make_commitment_spk (Cstruct.create 32) in
+  let commit_output = make_output ~script_pubkey:commit_spk () in
+  let coinbase : Types.transaction = {
+    version = 1l;
+    inputs = [make_coinbase_input ~height:0];
+    outputs = [make_output ~value:(Consensus.block_subsidy 0) (); commit_output];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let block : Types.block = {
+    header = make_header ();
+    transactions = [coinbase];
+  } in
+  (* segwit_active=false: commitment output is ignored, no witness → Ok *)
+  (match Validation.check_witness_commitment ~segwit_active:false block with
+  | Ok () -> ()
+  | Error e -> Alcotest.failf
+      "Pre-segwit commitment-looking output should be ignored, got: %s"
+      (Validation.block_error_to_string e));
+  (* segwit_active=true with no coinbase witness → BlockBadWitnessNonceSize *)
+  (match Validation.check_witness_commitment ~segwit_active:true block with
+  | Error Validation.BlockBadWitnessNonceSize -> ()
+  | Error e -> Alcotest.failf
+      "Expected BlockBadWitnessNonceSize for segwit active without nonce, got: %s"
+      (Validation.block_error_to_string e)
+  | Ok () -> Alcotest.fail "Should fail with BlockBadWitnessNonceSize when segwit active")
+
+(* Minimum size: commitment output must be >= 38 bytes.
+   A 37-byte output matching the prefix bytes is NOT a commitment.
+   Core: MINIMUM_WITNESS_COMMITMENT=38, consensus/validation.h:18 *)
+let test_minimum_38_byte_commitment () =
+  (* 37-byte scriptPubKey: prefix + 31-byte hash → not a valid commitment *)
+  let short_spk = Cstruct.create 37 in
+  Cstruct.blit (witness_commitment_prefix ()) 0 short_spk 0 6;
+  (* Fill remaining 31 bytes with the "hash" (irrelevant since not picked up) *)
+  let coinbase : Types.transaction = {
+    version = 2l;
+    inputs = [make_coinbase_input ~height:1];
+    outputs = [
+      make_output ~value:(Consensus.block_subsidy 1) ();
+      make_output ~script_pubkey:short_spk ();
+    ];
+    witnesses = [{ Types.items = [Cstruct.create 32] }];
+    locktime = 0l;
+  } in
+  let block : Types.block = {
+    header = make_header ();
+    transactions = [coinbase];
+  } in
+  (* 37-byte output is not picked up as a commitment → falls to unexpected-witness check.
+     The coinbase has a witness, so BlockUnexpectedWitness is triggered. *)
+  match Validation.check_witness_commitment ~segwit_active:true block with
+  | Error Validation.BlockUnexpectedWitness -> ()
+  | Error e -> Alcotest.failf "Wrong error for 37-byte commitment: %s"
+      (Validation.block_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have failed"
+
+(* No commitment in coinbase, no witness data → Ok (pre-activation-style block) *)
+let test_no_commitment_no_witness () =
+  let coinbase : Types.transaction = {
+    version = 2l;
+    inputs = [make_coinbase_input ~height:1];
+    outputs = [make_output ~value:(Consensus.block_subsidy 1) ()];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let block : Types.block = {
+    header = make_header ();
+    transactions = [coinbase];
+  } in
+  match Validation.check_witness_commitment ~segwit_active:true block with
+  | Ok () -> ()
+  | Error e -> Alcotest.failf "No-commitment no-witness should pass: %s"
+      (Validation.block_error_to_string e)
+
+(* Coinbase wtxid must be all-zeros in the witness merkle tree.
+   Build a block where the coinbase wtxid is treated as 0x00…00, then verify
+   that the computed commitment matches what a reference would produce. *)
+let test_coinbase_wtxid_is_zero () =
+  let zero_nonce = Cstruct.create 32 in
+  (* The coinbase wtxid for the witness merkle is always 0 (BIP-141) *)
+  let coinbase_wtxid = Types.zero_hash in
+  (* With only one tx, witness merkle root = coinbase_wtxid = 0 *)
+  let expected_witness_root = coinbase_wtxid in
+  let expected_commitment = compute_commitment_hash expected_witness_root zero_nonce in
+  let block = make_segwit_block ~height:1 ~extra_txs:[] ~witness_nonce:zero_nonce
+    ~commitment_hash:None ~commitment_outputs:None () in
+  (* Extract the actual commitment from the block *)
+  let cb = List.hd block.transactions in
+  let commit_out = List.nth cb.outputs 1 in
+  let actual_commitment = Cstruct.sub commit_out.Types.script_pubkey 6 32 in
+  Alcotest.(check bool) "coinbase wtxid=0 produces correct commitment"
+    true (Cstruct.equal expected_commitment actual_commitment);
+  (* Also verify the validation passes *)
+  match Validation.check_witness_commitment ~segwit_active:true block with
+  | Ok () -> ()
+  | Error e -> Alcotest.failf "Coinbase-wtxid-zero block rejected: %s"
+      (Validation.block_error_to_string e)
+
+(* check_block integration: witness commitment is checked at the correct segwit gate.
+   On regtest, segwit_height=0, so every block requires a witness commitment check.
+   A regtest block (height=1) without a commitment but with witness data should fail. *)
+let test_check_block_unexpected_witness_regtest () =
+  (* For regtest at height=1, segwit is active (segwit_height=0).
+     A block with witness data but no commitment → unexpected-witness *)
+  let witness_tx : Types.transaction = {
+    version = 1l;
+    inputs = [make_input ~txid:(let t = Cstruct.create 32 in Cstruct.set_uint8 t 0 1; t) ()];
+    outputs = [make_output ~value:1000L ()];
+    witnesses = [{ Types.items = [Cstruct.create 72] }];
+    locktime = 0l;
+  } in
+  let coinbase : Types.transaction = {
+    version = 2l;
+    inputs = [make_coinbase_input ~height:1];
+    outputs = [make_output ~value:(Consensus.block_subsidy 1) ()];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let txs = [coinbase; witness_tx] in
+  let txids = List.map Crypto.compute_txid txs in
+  let (merkle_root, _) = Crypto.merkle_root txids in
+  let header = make_header ~version:4l ~merkle_root ~bits:0x207fffffl ~timestamp:200l () in
+  let block = { Types.header; transactions = txs } in
+  match Validation.check_block ~network:Consensus.regtest block 1
+          ~expected_bits:0x207fffffl ~median_time:0l with
+  | Error Validation.BlockUnexpectedWitness -> ()
+  | Error Validation.BlockBadWitnessNonceSize -> ()  (* also acceptable: commitment check *)
+  | Error Validation.BlockBadWitnessCommitment -> ()
+  | Error e -> Alcotest.failf "Expected witness error, got: %s"
+      (Validation.block_error_to_string e)
+  | Ok () -> Alcotest.fail "Should have failed due to witness without commitment"
+
+(* ============================================================================
    Error String Tests
    ============================================================================ *)
 
@@ -730,13 +1128,26 @@ let test_block_error_strings () =
     Validation.BlockBadCoinbaseValue (100L, 50L);
     Validation.BlockDuplicateTx;
     Validation.BlockTxValidationFailed (0, Validation.TxEmptyInputs);
+    Validation.BlockBadWitnessCommitment;
+    Validation.BlockBadWitnessNonceSize;
+    Validation.BlockUnexpectedWitness;
     Validation.BlockBadVersion;
     Validation.BlockMutatedMerkle;
   ] in
   List.iter (fun e ->
     let s = Validation.block_error_to_string e in
     Alcotest.(check bool) "error string not empty" true (String.length s > 0)
-  ) errors
+  ) errors;
+  (* Verify the error strings match Core reject reasons exactly *)
+  Alcotest.(check string) "merkle-match string"
+    "bad-witness-merkle-match"
+    (Validation.block_error_to_string Validation.BlockBadWitnessCommitment);
+  Alcotest.(check string) "nonce-size string"
+    "bad-witness-nonce-size"
+    (Validation.block_error_to_string Validation.BlockBadWitnessNonceSize);
+  Alcotest.(check string) "unexpected-witness string"
+    "unexpected-witness"
+    (Validation.block_error_to_string Validation.BlockUnexpectedWitness)
 
 (* ============================================================================
    BIP-34 Conditional Enforcement Tests (Bug 1)
@@ -1529,6 +1940,23 @@ let () =
       test_case "bad merkle" `Quick test_check_block_bad_merkle;
       test_case "bad timestamp" `Quick test_check_block_bad_timestamp;
       test_case "duplicate tx" `Quick test_check_block_duplicate_tx;
+    ];
+    "witness_commitment", [
+      test_case "valid commitment" `Quick test_witness_commitment_valid;
+      test_case "nonce 31 bytes → bad-witness-nonce-size" `Quick test_witness_nonce_wrong_size;
+      test_case "nonce 33 bytes → bad-witness-nonce-size" `Quick test_witness_nonce_33_bytes;
+      test_case "empty nonce stack → bad-witness-nonce-size" `Quick test_witness_nonce_empty_stack;
+      test_case "two-item nonce stack → bad-witness-nonce-size" `Quick test_witness_nonce_two_items;
+      test_case "wrong hash → bad-witness-merkle-match" `Quick test_witness_merkle_mismatch;
+      test_case "last output wins (LAST-scan)" `Quick test_witness_last_output_wins;
+      test_case "no commitment, has witness → unexpected-witness" `Quick test_unexpected_witness_segwit_active;
+      test_case "pre-segwit no witness → Ok" `Quick test_no_witness_pre_segwit;
+      test_case "pre-segwit with witness → unexpected-witness" `Quick test_unexpected_witness_pre_segwit;
+      test_case "pre-segwit ignores commitment output (Bug 1)" `Quick test_pre_segwit_ignores_commitment_output;
+      test_case "38-byte minimum (37-byte is not a commitment)" `Quick test_minimum_38_byte_commitment;
+      test_case "no commitment, no witness → Ok" `Quick test_no_commitment_no_witness;
+      test_case "coinbase wtxid is zero in witness merkle" `Quick test_coinbase_wtxid_is_zero;
+      test_case "check_block: unexpected-witness on regtest" `Quick test_check_block_unexpected_witness_regtest;
     ];
     "error_strings", [
       test_case "tx error strings" `Quick test_tx_error_strings;

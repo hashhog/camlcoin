@@ -37,7 +37,9 @@ type block_validation_error =
   | BlockBadCoinbaseValue of int64 * int64
   | BlockDuplicateTx
   | BlockTxValidationFailed of int * tx_validation_error
-  | BlockBadWitnessCommitment
+  | BlockBadWitnessCommitment    (* bad-witness-merkle-match *)
+  | BlockBadWitnessNonceSize     (* bad-witness-nonce-size: coinbase scriptWitness must be 1 item of 32 bytes *)
+  | BlockUnexpectedWitness       (* unexpected-witness: witness data in non-segwit block *)
   | BlockBadVersion
   | BlockMutatedMerkle
 
@@ -88,7 +90,9 @@ let block_error_to_string = function
   | BlockDuplicateTx -> "block contains duplicate transactions"
   | BlockTxValidationFailed (i, e) ->
     Printf.sprintf "transaction %d validation failed: %s" i (tx_error_to_string e)
-  | BlockBadWitnessCommitment -> "witness commitment mismatch"
+  | BlockBadWitnessCommitment -> "bad-witness-merkle-match"
+  | BlockBadWitnessNonceSize -> "bad-witness-nonce-size"
+  | BlockUnexpectedWitness -> "unexpected-witness"
   | BlockBadVersion -> "block version too low for active soft forks"
   | BlockMutatedMerkle -> "merkle tree has mutated duplicate transactions"
 
@@ -659,38 +663,73 @@ let compute_witness_merkle_root (transactions : Types.transaction list)
   let (root, _mutated) = Crypto.merkle_root wtxids in
   root
 
-(* Verify the witness commitment in a block. *)
-let check_witness_commitment (block : Types.block)
+(* Verify the witness commitment in a block.
+   Mirrors Bitcoin Core's CheckWitnessMalleation (validation.cpp:3870-3916).
+
+   When segwit_active=true (expect_witness_commitment in Core):
+     - Find the LAST coinbase output whose scriptPubKey starts with
+       OP_RETURN 0x24 0xaa 0x21 0xa9 0xed and is >= 38 bytes.
+     - If found:
+         - coinbase scriptWitness must be exactly 1 stack item of 32 bytes
+           (the witness reserved value / nonce).  Fail with
+           BlockBadWitnessNonceSize otherwise.  [Core: bad-witness-nonce-size]
+         - SHA256d(witness_merkle_root || nonce) must equal the 32 bytes at
+           scriptPubKey[6..38].  Fail with BlockBadWitnessCommitment otherwise.
+           [Core: bad-witness-merkle-match]
+     - If not found: fall through to unexpected-witness check.
+
+   When segwit_active=false (pre-segwit block):
+     - Skip the commitment check entirely (no commitment is required).
+     - Still reject any block that contains witness data.
+       [Core: unexpected-witness]
+
+   Reference: bitcoin-core/src/consensus/validation.h:147-165
+              bitcoin-core/src/validation.cpp:3870-3916 *)
+let check_witness_commitment ~(segwit_active : bool) (block : Types.block)
     : (unit, block_validation_error) result =
   let coinbase = List.hd block.transactions in
-  match find_witness_commitment coinbase with
-  | Some commitment ->
-    (* Witness commitment found in coinbase — always validate it,
-       regardless of whether transactions have witness data *)
-    let witness_nonce =
-      match coinbase.witnesses with
-      | [] -> None
-      | w :: _ ->
-        match w.Types.items with
-        | [item] when Cstruct.length item = 32 -> Some item
-        | _ -> None
-    in
-    (match witness_nonce with
-    | None -> Error BlockBadWitnessCommitment
-    | Some nonce ->
-      let witness_root = compute_witness_merkle_root block.transactions in
-      let combined = Cstruct.concat [witness_root; nonce] in
-      let expected = Crypto.sha256d combined in
-      if Cstruct.equal expected commitment then
-        Ok ()
+  if segwit_active then begin
+    match find_witness_commitment coinbase with
+    | Some commitment ->
+      (* Gate 10: coinbase scriptWitness[0] must be exactly 1 item of 32 bytes.
+         Core: validation.cpp:3880-3885 (bad-witness-nonce-size) *)
+      let witness_nonce =
+        match coinbase.witnesses with
+        | [] -> None
+        | w :: _ ->
+          match w.Types.items with
+          | [item] when Cstruct.length item = 32 -> Some item
+          | _ -> None
+      in
+      (match witness_nonce with
+      | None -> Error BlockBadWitnessNonceSize
+      | Some nonce ->
+        (* Gate 11: SHA256d(witness_merkle_root || nonce) must match commitment.
+           Core: validation.cpp:3890-3898 (bad-witness-merkle-match) *)
+        let witness_root = compute_witness_merkle_root block.transactions in
+        let combined = Cstruct.concat [witness_root; nonce] in
+        let expected = Crypto.sha256d combined in
+        if Cstruct.equal expected commitment then
+          Ok ()
+        else
+          Error BlockBadWitnessCommitment)
+    | None ->
+      (* Gate 12: segwit active, no commitment → reject if any tx has witness.
+         Core: validation.cpp:3905-3913 (unexpected-witness) *)
+      if block_has_witness block then
+        Error BlockUnexpectedWitness
       else
-        Error BlockBadWitnessCommitment)
-  | None ->
-    (* No commitment — reject if any transaction has witness data *)
+        Ok ()
+  end else begin
+    (* Pre-segwit: commitment check skipped entirely.
+       Only check for unexpected witness data.
+       Core: CheckWitnessMalleation with expect_witness_commitment=false,
+             validation.cpp:3905-3913 *)
     if block_has_witness block then
-      Error BlockBadWitnessCommitment
+      Error BlockUnexpectedWitness
     else
       Ok ()
+  end
 
 (* ============================================================================
    Block Validation
@@ -852,8 +891,13 @@ let check_block ~network:(network : Consensus.network_config) (block : Types.blo
                       match !error with
                       | Some e -> Error e
                       | None ->
-                        (* Task 6: Verify witness commitment *)
-                        match check_witness_commitment block with
+                        (* Task 6: Verify witness commitment.
+                           Gate on segwit activation height, matching Core's
+                           CheckWitnessMalleation(expect_witness_commitment=
+                             DeploymentActiveAfter(..., DEPLOYMENT_SEGWIT))
+                           in ContextualCheckBlock, validation.cpp:4169. *)
+                        let segwit_active = height >= network.segwit_height in
+                        match check_witness_commitment ~segwit_active block with
                         | Error e -> Error e
                         | Ok () ->
                           (* Task 7: ContextualCheckBlock — IsFinalTx for every tx.

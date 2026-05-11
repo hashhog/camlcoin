@@ -510,6 +510,10 @@ let deserialize_compact_block r : compact_block =
   if prefilled_count > max_compact_block_txs then
     failwith "compact block prefilled count exceeds maximum";
   let prefilled_txs = List.init prefilled_count (fun _ -> deserialize_prefilled_tx r) in
+  (* Bug #3 fix: total tx count must fit in 16 bits (Core blockencodings.cpp:124-127).
+     Short IDs use uint16_t indices; a combined count > 65535 overflows them. *)
+  if short_id_count + prefilled_count > 65535 then
+    failwith "compact block total tx count overflows 16 bits";
   { header; nonce; short_ids; prefilled_txs }
 
 (* Serialize block transactions request (getblocktxn) *)
@@ -1152,8 +1156,7 @@ let generate_compact_nonce () : int64 =
 let create_compact_block (block : Types.block) : compact_block =
   let header = block.header in
   let nonce = generate_compact_nonce () in
-  let header_hash = Crypto.compute_block_hash header in
-  let (k0, k1) = Crypto.SipHash.derive_keys header_hash nonce in
+  let (k0, k1) = Crypto.SipHash.derive_keys header nonce in
 
   (* Coinbase is always prefilled at index 0 *)
   let coinbase = List.hd block.transactions in
@@ -1213,42 +1216,67 @@ let reconstruct_block (cb : compact_block) (lookup : tx_lookup)
     let txs = Array.make tx_count None in
     let missing = ref [] in
 
-    (* Fill in prefilled transactions *)
+    (* Fill in prefilled transactions.
+       Bug #4 fix: an abs_idx >= tx_count means the sender gave us a prefilled
+       transaction at an index that does not exist in this block — that is an
+       invalid compact block (Core returns READ_STATUS_INVALID for this case in
+       InitData; see blockencodings.cpp:80-85). We propagate it as a failure
+       rather than silently ignoring it. *)
+    let prefill_ok = ref true in
     let last_idx = ref (-1) in
     List.iter (fun ptx ->
       let abs_idx = !last_idx + ptx.index + 1 in
       if abs_idx >= tx_count then
-        () (* invalid index, will fail later *)
+        prefill_ok := false
       else begin
         txs.(abs_idx) <- Some ptx.tx;
         last_idx := abs_idx
       end
     ) cb.prefilled_txs;
-
-    (* Fill in transactions from short IDs using array for O(1) access *)
-    let short_ids_arr = Array.of_list cb.short_ids in
-    let n_short_ids = Array.length short_ids_arr in
-    let short_idx = ref 0 in
-    for i = 0 to tx_count - 1 do
-      if txs.(i) = None then begin
-        if !short_idx >= n_short_ids then
-          missing := i :: !missing
-        else begin
-          let short_id = short_ids_arr.(!short_idx) in
-          incr short_idx;
-          match Hashtbl.find_opt lookup.by_short_id short_id with
-          | Some tx -> txs.(i) <- Some tx
-          | None -> missing := i :: !missing
-        end
-      end
-    done;
-
-    if !missing <> [] then
-      ReconstructNeedTxs (List.rev !missing)
+    if not !prefill_ok then
+      ReconstructFailed "compact block prefilled index out of range"
     else begin
-      (* All transactions found - build the block *)
-      let transactions = Array.to_list (Array.map Option.get txs) in
-      ReconstructComplete { header = cb.header; transactions }
+      (* Fill in transactions from short IDs using array for O(1) access.
+         Bug #2 fix: track which slots were matched from the lookup so that a
+         short-ID collision (two mempool txns producing the same 48-bit short ID)
+         causes us to request the transaction instead of silently picking the
+         wrong one.  This mirrors Core's have_txn[] logic in InitData
+         (blockencodings.cpp:118-144): on first match we record the tx; on a
+         second match we clear the slot so the index ends up in missing[]. *)
+      let short_ids_arr = Array.of_list cb.short_ids in
+      let n_short_ids = Array.length short_ids_arr in
+      let short_idx = ref 0 in
+      (* have_txn tracks which slots were already filled from the lookup *)
+      let have_txn = Array.make tx_count false in
+      for i = 0 to tx_count - 1 do
+        if txs.(i) = None then begin
+          if !short_idx >= n_short_ids then
+            missing := i :: !missing
+          else begin
+            let short_id = short_ids_arr.(!short_idx) in
+            incr short_idx;
+            match Hashtbl.find_opt lookup.by_short_id short_id with
+            | Some tx ->
+              if not have_txn.(i) then begin
+                txs.(i) <- Some tx;
+                have_txn.(i) <- true
+              end else begin
+                (* Collision: two lookup entries share this short ID — request it *)
+                txs.(i) <- None;
+                missing := i :: !missing
+              end
+            | None -> missing := i :: !missing
+          end
+        end
+      done;
+
+      if !missing <> [] then
+        ReconstructNeedTxs (List.rev !missing)
+      else begin
+        (* All transactions found - build the block *)
+        let transactions = Array.to_list (Array.map Option.get txs) in
+        ReconstructComplete { header = cb.header; transactions }
+      end
     end
   end
 

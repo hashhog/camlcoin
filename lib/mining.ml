@@ -39,8 +39,22 @@ type block_template = {
    Transaction Selection
    ============================================================================ *)
 
-(* Reserve weight units for coinbase transaction *)
-let coinbase_reserve_weight = 4000
+(* Reserve weight units for coinbase + block header overhead.
+   Mirrors Bitcoin Core policy.h:
+     DEFAULT_BLOCK_RESERVED_WEIGHT = 8000   (resetBlock starts nBlockWeight here)
+     MINIMUM_BLOCK_RESERVED_WEIGHT = 2000   (lower clamp in ClampOptions)
+   The available weight for transactions is:
+     nBlockMaxWeight (4_000_000) - block_reserved_weight (8_000) = 3_992_000
+   Reference: bitcoin-core/src/node/miner.cpp resetBlock(), policy.h:27-34 *)
+let default_block_reserved_weight = 8000
+let minimum_block_reserved_weight = 2000
+let max_consecutive_failures = 1000
+let block_full_enough_weight_delta = 4000
+
+(* Clamp a user-supplied reserved weight into [minimum, max_block_weight].
+   Mirrors ClampOptions() in bitcoin-core/src/node/miner.cpp:79-88. *)
+let clamp_reserved_weight w =
+  max minimum_block_reserved_weight (min w Consensus.max_block_weight)
 
 (* Compute ancestor fee rate for a transaction, skipping already-selected ancestors.
    ancestor_fee_rate = (tx_fee + sum of unselected ancestor fees) /
@@ -62,15 +76,38 @@ let compute_ancestor_fee_rate (entry : Mempool.mempool_entry)
 
 (* Select transactions from mempool using ancestor fee rate (CPFP).
    Pre-sorts by ancestor fee rate and iterates in descending order,
-   re-evaluating rates only when ancestors are consumed. *)
-let select_transactions (mp : Mempool.mempool) (max_weight : int)
+   re-evaluating rates only when ancestors are consumed.
+
+   Parameters:
+   - max_weight: nBlockMaxWeight (usually Consensus.max_block_weight = 4_000_000)
+   - reserved_weight: block_reserved_weight (default DEFAULT_BLOCK_RESERVED_WEIGHT = 8_000)
+   - min_fee_rate_sat_per_kvb: minimum acceptable fee rate in sat/kvB (0 = no minimum)
+   - block_height: height of the block being assembled (for IsFinalTx)
+   - lock_time_cutoff: MTP of prev block (for IsFinalTx, BIP-113)
+
+   Mirrors the addChunks() / TestChunkBlockLimits() / TestChunkTransactions() logic
+   in bitcoin-core/src/node/miner.cpp:239-333. *)
+let select_transactions ?(reserved_weight = default_block_reserved_weight)
+    ?(min_fee_rate_sat_per_kvb = 0)
+    ?(block_height = 1)
+    ?(lock_time_cutoff = 0l)
+    (mp : Mempool.mempool) (max_weight : int)
     : (Types.transaction * int64) list =
+  (* Clamp reserved weight: [MINIMUM_BLOCK_RESERVED_WEIGHT, MAX_BLOCK_WEIGHT].
+     Mirrors ClampOptions in miner.cpp:79-88. *)
+  let reserved = clamp_reserved_weight reserved_weight in
+  (* nBlockWeight starts at reserved_weight; available for txs = max - reserved.
+     Core: nBlockWeight += entry.GetTxWeight() and gate is
+       nBlockWeight + chunk >= nBlockMaxWeight  ⟹  refuse if true.
+     Equivalently: allow only if current_weight + pkg_weight < (max - reserved). *)
+  let available_weight = max_weight - reserved in
+
   let all_entries = Mempool.get_sorted_transactions mp in
   let selected = ref [] in
   let current_weight = ref 0 in
   let total_sigops_cost = ref 0 in
+  let n_consecutive_failed = ref 0 in
   let included_txids = Hashtbl.create 100 in
-  let available_weight = max_weight - coinbase_reserve_weight in
 
   (* Pre-compute ancestor fee rates and sort descending *)
   let rated_entries = List.map (fun (entry : Mempool.mempool_entry) ->
@@ -79,36 +116,84 @@ let select_transactions (mp : Mempool.mempool) (max_weight : int)
   ) all_entries in
   let sorted = List.sort (fun (r1, _) (r2, _) -> compare r2 r1) rated_entries in
 
-  List.iter (fun (_, (best_entry : Mempool.mempool_entry)) ->
-    let key = Cstruct.to_string best_entry.txid in
-    if Hashtbl.mem included_txids key then ()
+  let done_ = ref false in
+  List.iter (fun (rate, (best_entry : Mempool.mempool_entry)) ->
+    if !done_ then ()
     else begin
-      let ancestors = Mempool.get_ancestors mp best_entry.txid in
-      let unselected_ancestors = List.filter (fun (a : Mempool.mempool_entry) ->
-        not (Hashtbl.mem included_txids (Cstruct.to_string a.txid))
-      ) ancestors in
-      let package = unselected_ancestors @ [best_entry] in
+      (* BUG 3 fixed: blockMinFeeRate gate — mirrors miner.cpp:297-301.
+         min_fee_rate_sat_per_kvb is sat per 1000 virtual bytes = sat per 1000 wu/4.
+         rate is sat per weight unit (sat/wu).  Convert: min_rate_sat_per_wu =
+         min_fee_rate_sat_per_kvb / 4000.0 (1 kvB = 4000 wu).
+         Skip this chunk (and all cheaper ones — feerate-sorted) if rate is too low. *)
+      if min_fee_rate_sat_per_kvb > 0 then begin
+        let min_rate_sat_per_wu = float_of_int min_fee_rate_sat_per_kvb /. 4000.0 in
+        if rate < min_rate_sat_per_wu then begin
+          done_ := true  (* everything remaining is cheaper — stop *)
+        end
+      end;
+      if not !done_ then begin
+        let key = Cstruct.to_string best_entry.txid in
+        if Hashtbl.mem included_txids key then ()
+        else begin
+          let ancestors = Mempool.get_ancestors mp best_entry.txid in
+          let unselected_ancestors = List.filter (fun (a : Mempool.mempool_entry) ->
+            not (Hashtbl.mem included_txids (Cstruct.to_string a.txid))
+          ) ancestors in
+          let package = unselected_ancestors @ [best_entry] in
 
-      let pkg_weight = List.fold_left
-        (fun acc (e : Mempool.mempool_entry) -> acc + e.weight)
-        0 package in
+          let pkg_weight = List.fold_left
+            (fun acc (e : Mempool.mempool_entry) -> acc + e.weight)
+            0 package in
 
-      let pkg_sigops = List.fold_left (fun acc (e : Mempool.mempool_entry) ->
-        acc + Mempool.count_tx_sigops_cost e.tx mp
-      ) 0 package in
+          let pkg_sigops = List.fold_left (fun acc (e : Mempool.mempool_entry) ->
+            acc + Mempool.count_tx_sigops_cost e.tx mp
+          ) 0 package in
 
-      if !total_sigops_cost + pkg_sigops > Consensus.max_block_sigops_cost then
-        ()
-      else if !current_weight + pkg_weight <= available_weight then begin
-        List.iter (fun (e : Mempool.mempool_entry) ->
-          let ekey = Cstruct.to_string e.txid in
-          if not (Hashtbl.mem included_txids ekey) then begin
-            selected := (e.tx, e.fee) :: !selected;
-            current_weight := !current_weight + e.weight;
-            Hashtbl.replace included_txids ekey ()
+          (* BUG 1 fixed: TestChunkTransactions — IsFinalTx check.
+             Core miner.cpp:252-259: for each tx in chunk, check IsFinalTx with
+             (nHeight, m_lock_time_cutoff=pindexPrev->GetMedianTimePast()).
+             Without this, non-final transactions (future locktime) can be
+             included in block templates, which validators will reject.
+             Reference: bitcoin-core/src/node/miner.cpp TestChunkTransactions. *)
+          let chunk_is_final = List.for_all (fun (e : Mempool.mempool_entry) ->
+            Validation.is_tx_final e.tx ~block_height ~block_time:lock_time_cutoff
+          ) package in
+
+          (* BUG 2 fixed: sigops gate uses >= (not >) matching Core miner.cpp:244.
+             Core: if (nBlockSigOpsCost + chunk_sigops_cost >= MAX_BLOCK_SIGOPS_COST) return false
+             Previous code used >, allowing one extra sigop up to = 80000. *)
+          let sigops_ok = !total_sigops_cost + pkg_sigops < Consensus.max_block_sigops_cost in
+
+          (* Weight gate: allow if current + pkg < available (strict less-than).
+             Core: nBlockWeight + chunk_size >= nBlockMaxWeight → refuse.
+             Equivalent: allow when current_weight + pkg_weight < available_weight.
+             This correctly reserves space for the coinbase / block overhead. *)
+          let weight_ok = !current_weight + pkg_weight < available_weight in
+
+          if not (sigops_ok && weight_ok && chunk_is_final) then begin
+            (* Chunk doesn't fit or is non-final — skip it.
+               BUG 4 fixed: MAX_CONSECUTIVE_FAILURES early exit.
+               Core miner.cpp:313-317: after 1000 consecutive failures, quit if block
+               is "full enough" (within BLOCK_FULL_ENOUGH_WEIGHT_DELTA=4000 of limit).
+               This prevents O(N) iteration over a full mempool when the block is close
+               to weight-limit. *)
+            incr n_consecutive_failed;
+            if !n_consecutive_failed > max_consecutive_failures &&
+               !current_weight + block_full_enough_weight_delta > available_weight then
+              done_ := true
+          end else begin
+            n_consecutive_failed := 0;
+            List.iter (fun (e : Mempool.mempool_entry) ->
+              let ekey = Cstruct.to_string e.txid in
+              if not (Hashtbl.mem included_txids ekey) then begin
+                selected := (e.tx, e.fee) :: !selected;
+                current_weight := !current_weight + e.weight;
+                Hashtbl.replace included_txids ekey ()
+              end
+            ) package;
+            total_sigops_cost := !total_sigops_cost + pkg_sigops
           end
-        ) package;
-        total_sigops_cost := !total_sigops_cost + pkg_sigops
+        end
       end
     end
   ) sorted;
@@ -187,14 +272,21 @@ let create_coinbase ~(height : int) ~(total_fee : int64)
   let height_bytes = Consensus.encode_height_in_coinbase height in
   let coinbase_script = Cstruct.concat [height_bytes; extra_nonce] in
 
-  (* Coinbase input: null outpoint *)
+  (* Coinbase input: null outpoint.
+     BUG 5 fixed: sequence must be MAX_SEQUENCE_NONFINAL (0xFFFFFFFE), not 0xFFFFFFFF.
+     Core miner.cpp:171: coinbaseTx.vin[0].nSequence = CTxIn::MAX_SEQUENCE_NONFINAL
+     Comment: "Make sure timelock is enforced."
+     0xFFFFFFFF (SEQUENCE_FINAL) disables nLockTime enforcement; 0xFFFFFFFE keeps it
+     active so the nLockTime = height-1 rule is honoured by validators.
+     Reference: bitcoin-core/src/node/miner.cpp:171,
+                bitcoin-core/src/primitives/transaction.h:76,82 *)
   let coinbase_input : Types.tx_in = {
     previous_output = {
       txid = Types.zero_hash;
       vout = 0xFFFFFFFFl;
     };
     script_sig = coinbase_script;
-    sequence = 0xFFFFFFFFl;
+    sequence = 0xFFFFFFFEl;  (* CTxIn::MAX_SEQUENCE_NONFINAL — NOT 0xFFFFFFFF *)
   } in
 
   (* Primary payout output *)
@@ -223,12 +315,20 @@ let create_coinbase ~(height : int) ~(total_fee : int64)
       ([payout_output], [])
   in
 
+  (* BUG 6 fixed: coinbase locktime must be nHeight - 1, not 0.
+     Core miner.cpp:196: coinbaseTx.nLockTime = static_cast<uint32_t>(nHeight - 1)
+     This works together with sequence = 0xFFFFFFFE: the locktime is the *last invalid*
+     height, so nLockTime = height-1 means the coinbase is valid at height (strictly
+     greater). Without this, the locktime is 0 (always valid), which is technically fine
+     for consensus, but deviates from Core's canonical coinbase format and would cause
+     getblocktemplate clients (and test vectors) expecting height-1 to diverge.
+     Reference: bitcoin-core/src/node/miner.cpp:196 *)
   {
     version = 2l;
     inputs = [coinbase_input];
     outputs;
     witnesses;
-    locktime = 0l;
+    locktime = Int32.of_int (max 0 (height - 1));
   }
 
 (* ============================================================================
@@ -253,8 +353,29 @@ let create_block_template ~(chain : Sync.chain_state)
 
   let height = tip.height + 1 in
 
-  (* Select transactions from mempool *)
-  let selected = select_transactions mp Consensus.max_block_weight in
+  (* Select transactions from mempool.
+     Pass block_height and lock_time_cutoff (MTP of prev block) for IsFinalTx checks.
+     Core miner.cpp:148: m_lock_time_cutoff = pindexPrev->GetMedianTimePast().
+     Default reserved_weight = DEFAULT_BLOCK_RESERVED_WEIGHT (8000). *)
+  let tip_ts_list =
+    let rec collect acc count entry =
+      if count >= 11 then acc
+      else
+        let acc = entry.Sync.header.timestamp :: acc in
+        if entry.height = 0 then acc
+        else
+          let parent_key = Cstruct.to_string entry.header.prev_block in
+          match Hashtbl.find_opt chain.headers parent_key with
+          | Some parent -> collect acc (count + 1) parent
+          | None -> acc
+    in
+    collect [] 0 tip
+  in
+  let lock_time_cutoff = Consensus.median_time_past tip_ts_list in
+  let selected = select_transactions mp Consensus.max_block_weight
+    ~reserved_weight:default_block_reserved_weight
+    ~block_height:height
+    ~lock_time_cutoff in
 
   (* Calculate total fees *)
   let total_fee = List.fold_left
@@ -289,23 +410,10 @@ let create_block_template ~(chain : Sync.chain_state)
   let txids = List.map Crypto.compute_txid all_txs in
   let (merkle_root, _mutated) = Crypto.merkle_root txids in
 
-  (* Calculate median-time-past to ensure our timestamp is valid.
-     Collect timestamps from tip and its ancestors (up to 11 total). *)
-  let rec collect_ts acc count entry =
-    if count >= 11 then acc
-    else
-      let acc = entry.Sync.header.timestamp :: acc in
-      if entry.height = 0 then acc
-      else
-        let parent_key = Cstruct.to_string entry.header.prev_block in
-        match Hashtbl.find_opt chain.headers parent_key with
-        | Some parent -> collect_ts acc (count + 1) parent
-        | None -> acc
-  in
-  let ancestor_ts = collect_ts [] 0 tip in
-  let mtp = Consensus.median_time_past ancestor_ts in
-
-  (* Current timestamp - ensure it's greater than MTP *)
+  (* tip_ts_list was computed above for lock_time_cutoff; reuse for MTP.
+     Current timestamp — must exceed MTP of previous block (GetMinimumTime).
+     Core miner.cpp:52: nNewTime = max(GetMinimumTime(pindexPrev, ...), now) *)
+  let mtp = lock_time_cutoff in  (* MTP = median_time_past tip_ts_list, already computed *)
   let now = Int32.of_float (Unix.gettimeofday ()) in
   let timestamp = max (Int32.add mtp 1l) now in
 

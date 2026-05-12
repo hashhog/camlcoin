@@ -974,6 +974,34 @@ let compute_sighash_segwit (tx : Types.transaction) (input_index : int)
   Serialize.write_int32_le w (Int32.of_int hash_type);
   Crypto.sha256d (Serialize.writer_to_cstruct w)
 
+(* BIP-341 valid Schnorr sighash type whitelist.
+   Mirrors Bitcoin Core's check in script/interpreter.cpp SignatureHashSchnorr:
+     `hash_type <= 0x03 || (hash_type >= 0x81 && hash_type <= 0x83)`
+   The valid values are: 0x00 (SIGHASH_DEFAULT == ALL for Taproot),
+     0x01 (ALL), 0x02 (NONE), 0x03 (SINGLE),
+     0x81 (ALL|ANYONECANPAY), 0x82 (NONE|ANYONECANPAY), 0x83 (SINGLE|ANYONECANPAY).
+   Callers SHOULD validate hash_type with this helper before invoking
+   compute_sighash_taproot; otherwise that function will raise Failure on a
+   bad hash_type, which under tapscript is caught by eval_script's try-with
+   but under P2TR key-path verification (verify_script's P2TR_script branch)
+   would propagate up to validation.ml as an unhandled exception — a DoS
+   vector for a maliciously-crafted 65-byte Schnorr signature with hash_type
+   in {0x04..0x80, 0x84..0xFF}. W95 fix. *)
+let is_valid_taproot_hash_type (hash_type : int) : bool =
+  hash_type <= 0x03 || (hash_type >= 0x81 && hash_type <= 0x83)
+
+(* BIP-341 Schnorr-sighash precondition check: does the hash_type require an
+   output at input_index? Core (interpreter.cpp:1549-1550) returns false from
+   SignatureHashSchnorr when `output_type == SIGHASH_SINGLE && in_pos >=
+   tx_to.vout.size()`, which surfaces as SCRIPT_ERR_SCHNORR_SIG_HASHTYPE in
+   CheckSchnorrSignature. We pre-check it from every Schnorr verify call site
+   to keep the failwith inside compute_sighash_taproot from propagating up
+   into validation.ml as an unhandled exception (W95 fix; same shape as the
+   hash_type-whitelist DoS). *)
+let taproot_sighash_single_safe (hash_type : int) (input_index : int) (n_outputs : int) : bool =
+  let base_type = hash_type land 0x03 in
+  base_type <> 3 || input_index < n_outputs
+
 (* BIP-341 Taproot sighash computation (SignatureHashSchnorr).
 
    Parameters:
@@ -995,11 +1023,13 @@ let compute_sighash_taproot
     ?(tapleaf_hash : Cstruct.t option)
     ?(codesep_pos : int = 0xFFFFFFFF)
     () : Cstruct.t =
-  (* Validate hash_type per BIP-341: only 0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83.
-     Equivalent to Core's `hash_type <= 0x03 || (hash_type >= 0x81 && hash_type <= 0x83)`. *)
+  (* Validate hash_type per BIP-341. See is_valid_taproot_hash_type above.
+     Callers MUST pre-check; we still re-check defensively so a future caller
+     can't accidentally feed a bad hash_type and produce a silently-wrong
+     sighash. *)
   let base_type = hash_type land 0x03 in
   let anyone_can_pay = hash_type land 0x80 <> 0 in
-  if not (List.mem hash_type [0x00; 0x01; 0x02; 0x03; 0x81; 0x82; 0x83]) then
+  if not (is_valid_taproot_hash_type hash_type) then
     failwith (Printf.sprintf "Invalid Taproot hash_type: 0x%02x" hash_type);
 
   (* W94/BIP-341: prevouts MUST be exactly one entry per tx input. Core asserts
@@ -1884,6 +1914,14 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                 in
                 if sig_len = 65 && hash_type = 0 then
                   Error "Invalid hash_type 0x00 in 65-byte tapscript sig"
+                else if not (is_valid_taproot_hash_type hash_type) then
+                  (* W95/BIP-341: hash_type whitelist (0x00..0x03, 0x81..0x83).
+                     Pre-check so compute_sighash_taproot doesn't raise. *)
+                  Error "Invalid hash_type in 65-byte tapscript sig"
+                else if not (taproot_sighash_single_safe hash_type st.input_index
+                               (List.length st.tx.outputs)) then
+                  (* W95/BIP-341: SIGHASH_SINGLE without matching output. *)
+                  Error "Tapscript SIGHASH_SINGLE without matching output"
                 else begin
                   let sig_64 = Cstruct.sub sig_bytes 0 64 in
                   let sighash = compute_sighash_taproot st.tx st.input_index st.prevouts hash_type
@@ -1997,6 +2035,13 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                 in
                 if sig_len = 65 && hash_type = 0 then
                   Error "Invalid hash_type 0x00 in 65-byte tapscript sig"
+                else if not (is_valid_taproot_hash_type hash_type) then
+                  (* W95/BIP-341: hash_type whitelist. *)
+                  Error "Invalid hash_type in 65-byte tapscript sig"
+                else if not (taproot_sighash_single_safe hash_type st.input_index
+                               (List.length st.tx.outputs)) then
+                  (* W95/BIP-341: SIGHASH_SINGLE without matching output. *)
+                  Error "Tapscript SIGHASH_SINGLE without matching output"
                 else begin
                   let sig_64 = Cstruct.sub sig_bytes 0 64 in
                   let sighash = compute_sighash_taproot st.tx st.input_index st.prevouts hash_type
@@ -2371,6 +2416,13 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                     in
                     if sig_len = 65 && hash_type = 0 then
                       Error "Invalid hash_type 0x00 in 65-byte tapscript sig"
+                    else if not (is_valid_taproot_hash_type hash_type) then
+                      (* W95/BIP-341: hash_type whitelist. *)
+                      Error "Invalid hash_type in 65-byte tapscript sig"
+                    else if not (taproot_sighash_single_safe hash_type st.input_index
+                                   (List.length st.tx.outputs)) then
+                      (* W95/BIP-341: SIGHASH_SINGLE without matching output. *)
+                      Error "OP_CHECKSIGADD SIGHASH_SINGLE without matching output"
                     else begin
                       let sig_64 = Cstruct.sub sig_bytes 0 64 in
                       let sighash = compute_sighash_taproot st.tx st.input_index st.prevouts hash_type
@@ -2941,6 +2993,19 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
               in
               if sig_len = 65 && hash_type = 0 then
                 Error "Invalid taproot hash type 0x00 in 65-byte signature"
+              else if not (is_valid_taproot_hash_type hash_type) then
+                (* W95/BIP-341: Reject undefined hash_type cleanly. Without this
+                   gate the failwith inside compute_sighash_taproot would
+                   propagate up through verify_script into validation.ml
+                   unhandled — a DoS for a malicious 65-byte keypath sig
+                   with hash_type in {0x04..0x80, 0x84..0xFF}. *)
+                Error "Invalid taproot hash type in 65-byte signature"
+              else if not (taproot_sighash_single_safe hash_type input_index
+                             (List.length tx.outputs)) then
+                (* W95/BIP-341 Core 1549-1550: SIGHASH_SINGLE with missing
+                   matching output → SCRIPT_ERR_SCHNORR_SIG_HASHTYPE.
+                   Pre-check so compute_sighash_taproot doesn't failwith. *)
+                Error "Taproot SIGHASH_SINGLE without matching output"
               else begin
                 let sig_64 = Cstruct.sub sig_bytes 0 64 in
                 let sighash = compute_sighash_taproot tx input_index prevouts hash_type

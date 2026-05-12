@@ -1921,7 +1921,9 @@ type bip324_cipher = {
   recv_garbage_terminator : Cstruct.t;
 }
 
-(* Initialize BIP324 cipher from ECDH shared secret *)
+(* Initialize BIP324 cipher from ECDH shared secret.
+   Zeroizes all HKDF intermediates (prk, per-role OKMs, ecdh_secret) after use,
+   mirroring Core's memory_cleanse() calls in bip324.cpp:67-70. *)
 let init_bip324_cipher ~(ecdh_secret : Cstruct.t) ~(initiator : bool) ~(network_magic : int32) : bip324_cipher =
   (* Construct salt: "bitcoin_v2_shared_secret" + network magic bytes *)
   let magic_bytes = Cstruct.create 4 in
@@ -1931,6 +1933,10 @@ let init_bip324_cipher ~(ecdh_secret : Cstruct.t) ~(initiator : bool) ~(network_
   (* HKDF extract *)
   let prk = Hkdf.extract ~salt ~ikm:ecdh_secret in
 
+  (* Zero the ECDH secret immediately after PRK extraction — it is no longer
+     needed and must not linger in the heap.  Core: memory_cleanse(ecdh_secret). *)
+  Cstruct.memset ecdh_secret 0;
+
   (* Derive keys *)
   let initiator_l_key = Hkdf.expand32 prk "initiator_L" in
   let initiator_p_key = Hkdf.expand32 prk "initiator_P" in
@@ -1938,6 +1944,10 @@ let init_bip324_cipher ~(ecdh_secret : Cstruct.t) ~(initiator : bool) ~(network_
   let responder_p_key = Hkdf.expand32 prk "responder_P" in
   let garbage_terminators = Hkdf.expand32 prk "garbage_terminators" in
   let session_id = Hkdf.expand32 prk "session_id" in
+
+  (* Zero PRK — all OKMs derived, PRK is now dead key material.
+     Core: memory_cleanse(hkdf). *)
+  Cstruct.memset prk 0;
 
   (* Assign keys based on role *)
   let (send_l_key, recv_l_key, send_p_key, recv_p_key) =
@@ -1947,7 +1957,9 @@ let init_bip324_cipher ~(ecdh_secret : Cstruct.t) ~(initiator : bool) ~(network_
       (responder_l_key, initiator_l_key, responder_p_key, initiator_p_key)
   in
 
-  (* Extract garbage terminators (first 16 bytes for initiator send, last 16 for responder) *)
+  (* Extract garbage terminators (first 16 bytes for initiator send, last 16 for responder).
+     Uses sub (view), not sub_copy, so send_gt/recv_gt alias garbage_terminators backing
+     buffer — do NOT zero garbage_terminators here. *)
   let (send_gt, recv_gt) =
     if initiator then
       (Cstruct.sub garbage_terminators 0 Bip324.garbage_terminator_len,
@@ -1957,7 +1969,9 @@ let init_bip324_cipher ~(ecdh_secret : Cstruct.t) ~(initiator : bool) ~(network_
        Cstruct.sub garbage_terminators 0 Bip324.garbage_terminator_len)
   in
 
-  {
+  (* FSChaCha20{,Poly1305}.create copies the key via Cstruct.sub_copy, so the
+     originals below are safe to zero once the ciphers are constructed. *)
+  let result = {
     send_l_cipher = Some (FSChaCha20.create send_l_key Bip324.rekey_interval);
     recv_l_cipher = Some (FSChaCha20.create recv_l_key Bip324.rekey_interval);
     send_p_cipher = Some (FSChaCha20Poly1305.create send_p_key Bip324.rekey_interval);
@@ -1965,7 +1979,16 @@ let init_bip324_cipher ~(ecdh_secret : Cstruct.t) ~(initiator : bool) ~(network_
     session_id;
     send_garbage_terminator = send_gt;
     recv_garbage_terminator = recv_gt;
-  }
+  } in
+
+  (* Zero OKM buffers — keys have been copied into the cipher objects above.
+     Core: memory_cleanse(hkdf_okm). *)
+  Cstruct.memset initiator_l_key 0;
+  Cstruct.memset initiator_p_key 0;
+  Cstruct.memset responder_l_key 0;
+  Cstruct.memset responder_p_key 0;
+
+  result
 
 (* Encrypt a BIP324 packet *)
 let bip324_encrypt (cipher : bip324_cipher) ~(aad : Cstruct.t) ~(contents : Cstruct.t) ~(ignore : bool) : Cstruct.t =
@@ -2213,12 +2236,17 @@ let v2_receive_bytes (state : v2_state) (data : Cstruct.t) : bool =
         state.recv_buffer <- Cstruct.sub state.recv_buffer Bip324.ellswift_pubkey_size
           (Cstruct.length state.recv_buffer - Bip324.ellswift_pubkey_size);
 
-        (* Compute ECDH shared secret and initialize ciphers *)
+        (* Compute ECDH shared secret and initialize ciphers.
+           init_bip324_cipher zeros ecdh_secret in-place after PRK extraction. *)
         let ecdh_secret = compute_ecdh_secret state.our_privkey their_ellswift
           state.our_ellswift_pubkey state.initiating in
         let cipher = init_bip324_cipher ~ecdh_secret ~initiator:state.initiating
           ~network_magic:state.network_magic in
         state.cipher <- Some cipher;
+
+        (* Zero our_privkey — ephemeral key consumed by ECDH, must not persist.
+           Core: memory_cleanse(m_our_ephemeral_key) after BIP324::Initialize. *)
+        Cstruct.memset state.our_privkey 0;
 
         (* Update states *)
         state.recv_state <- V2RecvGarbageTerminator;

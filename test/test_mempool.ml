@@ -3875,6 +3875,188 @@ let test_w96_atmp_no_exception_on_empty_inputs () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* ============================================================================
+   W96 — ValidateInputsStandardness tests (FIX-12)
+   ============================================================================ *)
+
+(* Gate 1: spending a genuinely nonstandard prevout is rejected at relay.
+   We use OP_NOP OP_NOP (0x61 0x61) as the script_pubkey — not a witness
+   program (get_witness_program returns None) and not any standard type. *)
+let test_validate_inputs_nonstandard_prevout () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let utxo = Utxo.UtxoSet.create db in
+  let prev_txid = Types.hash256_of_hex
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in
+  (* Nonstandard script_pubkey: OP_NOP OP_NOP — no standard classifier matches. *)
+  let nonstandard_spk = Cstruct.of_string "\x61\x61" in
+  Utxo.UtxoSet.add utxo prev_txid 0 Utxo.{
+    value = 1_000_000L;
+    script_pubkey = nonstandard_spk;
+    height = 0;
+    is_coinbase = false;
+  };
+  let tx = Types.{
+    version = 1l;
+    inputs = [{
+      previous_output = { txid = prev_txid; vout = 0l };
+      script_sig = Cstruct.empty;
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [make_test_output 990_000L];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  (* Direct call to the gate function. *)
+  let lookup op =
+    match Utxo.UtxoSet.get utxo op.Types.txid (Int32.to_int op.Types.vout) with
+    | Some e -> Some e.Utxo.script_pubkey
+    | None -> None
+  in
+  let result = Mempool.validate_inputs_standardness ~lookup tx in
+  Alcotest.(check bool) "nonstandard prevout rejected (gate 1)" true
+    (Result.is_error result);
+  (* Also check the error string contains the canonical reject reason. *)
+  (match result with
+   | Ok () -> Alcotest.fail "expected Error"
+   | Error msg ->
+     Alcotest.(check bool) "error mentions bad-txns-nonstandard-inputs" true
+       (let n = String.length msg in
+        let key = "bad-txns-nonstandard-inputs" in
+        let klen = String.length key in
+        let found = ref false in
+        for i = 0 to n - klen do
+          if String.sub msg i klen = key then found := true
+        done;
+        !found));
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Gate 2: spending a WITNESS_UNKNOWN prevout is rejected at relay.
+   OP_2 <20-byte payload> is a valid witness program (version 2, 20-byte data)
+   but not any recognised standard type (P2WPKH needs version 0, P2TR needs
+   version 1/32 bytes).  classify_script returns Nonstandard and
+   get_witness_program returns Some (2, <20 bytes>). *)
+let test_validate_inputs_witness_unknown_prevout () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let utxo = Utxo.UtxoSet.create db in
+  let prev_txid = Types.hash256_of_hex
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" in
+  (* WITNESS_UNKNOWN: OP_2 (0x52) + PUSH_20 (0x14) + 20 zero bytes.
+     Version 2 witness program, 20-byte data — not P2TR (needs v1/32B), not P2WPKH (needs v0/20B). *)
+  let witness_unknown_spk =
+    Cstruct.concat [
+      Cstruct.of_string "\x52\x14";   (* OP_2, PUSHBYTES_20 *)
+      Cstruct.create 20;              (* 20 zero bytes *)
+    ]
+  in
+  Utxo.UtxoSet.add utxo prev_txid 0 Utxo.{
+    value = 1_000_000L;
+    script_pubkey = witness_unknown_spk;
+    height = 0;
+    is_coinbase = false;
+  };
+  let tx = Types.{
+    version = 1l;
+    inputs = [{
+      previous_output = { txid = prev_txid; vout = 0l };
+      script_sig = Cstruct.empty;
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [make_test_output 990_000L];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let lookup op =
+    match Utxo.UtxoSet.get utxo op.Types.txid (Int32.to_int op.Types.vout) with
+    | Some e -> Some e.Utxo.script_pubkey
+    | None -> None
+  in
+  let result = Mempool.validate_inputs_standardness ~lookup tx in
+  Alcotest.(check bool) "witness_unknown prevout rejected (gate 2)" true
+    (Result.is_error result);
+  (match result with
+   | Ok () -> Alcotest.fail "expected Error"
+   | Error msg ->
+     Alcotest.(check bool) "error mentions bad-txns-nonstandard-inputs" true
+       (let n = String.length msg in
+        let key = "bad-txns-nonstandard-inputs" in
+        let klen = String.length key in
+        let found = ref false in
+        for i = 0 to n - klen do
+          if String.sub msg i klen = key then found := true
+        done;
+        !found));
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Gate 3: P2SH input whose redeemScript has > MAX_P2SH_SIGOPS (15) sigops
+   is rejected.  We encode 16 OP_CHECKSIG (0xac) bytes as the redeemScript
+   and push it as the last item of the scriptSig.
+   Sigop count = 16 > 15 → "bad-txns-nonstandard-inputs". *)
+let test_validate_inputs_p2sh_too_many_sigops () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let utxo = Utxo.UtxoSet.create db in
+  let prev_txid = Types.hash256_of_hex
+    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" in
+  (* P2SH prevout: OP_HASH160 PUSH_20 <20 zeroes> OP_EQUAL *)
+  let p2sh_spk =
+    Cstruct.concat [
+      Cstruct.of_string "\xa9\x14";   (* OP_HASH160, PUSHBYTES_20 *)
+      Cstruct.create 20;              (* 20 zero bytes — hash doesn't matter for policy test *)
+      Cstruct.of_string "\x87";       (* OP_EQUAL *)
+    ]
+  in
+  Utxo.UtxoSet.add utxo prev_txid 0 Utxo.{
+    value = 1_000_000L;
+    script_pubkey = p2sh_spk;
+    height = 0;
+    is_coinbase = false;
+  };
+  (* redeemScript = 16 × OP_CHECKSIG = 16 sigops > MAX_P2SH_SIGOPS (15). *)
+  let redeem_script = Cstruct.of_string
+    "\xac\xac\xac\xac\xac\xac\xac\xac\xac\xac\xac\xac\xac\xac\xac\xac" in
+  (* scriptSig = PUSH_16 <redeemScript>.  0x10 = direct push of 16 bytes. *)
+  let script_sig = Cstruct.concat [
+    Cstruct.of_string "\x10";   (* PUSHBYTES_16 *)
+    redeem_script;
+  ] in
+  let tx = Types.{
+    version = 1l;
+    inputs = [{
+      previous_output = { txid = prev_txid; vout = 0l };
+      script_sig;
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [make_test_output 990_000L];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let lookup op =
+    match Utxo.UtxoSet.get utxo op.Types.txid (Int32.to_int op.Types.vout) with
+    | Some e -> Some e.Utxo.script_pubkey
+    | None -> None
+  in
+  let result = Mempool.validate_inputs_standardness ~lookup tx in
+  Alcotest.(check bool) "P2SH with 16 sigops rejected (gate 3)" true
+    (Result.is_error result);
+  (match result with
+   | Ok () -> Alcotest.fail "expected Error"
+   | Error msg ->
+     Alcotest.(check bool) "error mentions p2sh redeemscript sigops exceed limit" true
+       (let n = String.length msg in
+        let key = "p2sh redeemscript sigops exceed limit" in
+        let klen = String.length key in
+        let found = ref false in
+        for i = 0 to n - klen do
+          if String.sub msg i klen = key then found := true
+        done;
+        !found));
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 (* W96 Bug 13 sanity: ATMP works for a normal valid tx via the public
    wrapper. *)
 let test_w96_accept_to_memory_pool_basic_ok () =
@@ -4113,6 +4295,14 @@ let () =
       (* expire_old_transactions: 336h = 1_209_600 s *)
       test_case "expire uses 336h (1_209_600 s)" `Quick
         test_w86_expire_uses_336h;
+    ];
+    "w96_validate_inputs_standardness", [
+      test_case "gate1: nonstandard prevout rejected" `Quick
+        test_validate_inputs_nonstandard_prevout;
+      test_case "gate2: witness_unknown prevout rejected" `Quick
+        test_validate_inputs_witness_unknown_prevout;
+      test_case "gate3: P2SH redeemScript >15 sigops rejected" `Quick
+        test_validate_inputs_p2sh_too_many_sigops;
     ];
     "w96_atmp_audit", [
       test_case "coinbase rejected via full IsCoinBase (vin=1 + IsNull)" `Quick

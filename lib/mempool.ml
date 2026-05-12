@@ -119,6 +119,11 @@ let rolling_fee_halflife = float_of_int (60 * 60 * 12)  (* 43200.0 s *)
    Note: 101 is the *size* limit in kvB, NOT the count limit. Count limit is 64. *)
 let max_cluster_count = 64     (* DEFAULT_CLUSTER_LIMIT — max transactions per cluster *)
 let max_cluster_size_vbytes = 101_000  (* DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 — max cluster vsize *)
+(* MAX_P2SH_SIGOPS = 15 — maximum legacy sigops in a P2SH redeemScript.
+   Reference: Bitcoin Core policy/policy.h:42.
+   ValidateInputsStandardness gate 3: reject P2SH inputs whose redeemScript
+   sigops exceed this limit to mitigate expensive-script DoS. *)
+let max_p2sh_sigops = 15
 
 (* ============================================================================
    Union-Find Data Structure for Clustering
@@ -1112,6 +1117,96 @@ let check_p2wsh_witness_limits (tx : Types.transaction) : (unit, string) result 
   | Some e -> Error e
   | None -> Ok ()
 
+(* ValidateInputsStandardness — per-input prevout-type and P2SH-sigops check.
+   Reference: Bitcoin Core policy/policy.cpp:214-263.
+
+   Called after IsStandardTx and BEFORE IsWitnessStandard, guarded by
+   require_standard.  Three gates per Core:
+
+     Gate 1 — NONSTANDARD prevout type → "bad-txns-nonstandard-inputs"
+               Spends of genuinely nonstandard scriptPubKeys are rejected.
+               In camlcoin, classify_script returns Nonstandard for these AND
+               for WITNESS_UNKNOWN scripts, so gate 1 and gate 2 are
+               distinguished by whether get_witness_program also matches.
+
+     Gate 2 — WITNESS_UNKNOWN prevout → "bad-txns-nonstandard-inputs"
+               Witness programs with unrecognised version/size (e.g. v2..v16,
+               or v1 with ≠32-byte data, or v0 with ≠20/32-byte data) are
+               reserved as upgrade hooks and rejected at relay.  In camlcoin
+               these scripts are Nonstandard but get_witness_program returns
+               Some, distinguishing them from gate-1 rejections.
+
+     Gate 3 — P2SH prevout with redeemScript sigops > MAX_P2SH_SIGOPS (15)
+               → "bad-txns-nonstandard-inputs"
+               The last push item in the scriptSig is the redeemScript.
+               Its legacy sigop count (accurate, with OP_n context) must not
+               exceed 15.  Empty-scriptSig P2SH inputs are also rejected here
+               because there is no redeemScript to inspect.
+
+   Coinbase transactions are exempt (Core returns valid state immediately).
+   Takes a ~lookup callback so it can be used from both add_transaction and
+   unit tests. *)
+let validate_inputs_standardness
+    ~(lookup : Types.outpoint -> Cstruct.t option)
+    (tx : Types.transaction)
+    : (unit, string) result =
+  (* Coinbases are exempt — same first check as Core. *)
+  let first_input = List.hd tx.inputs in
+  if Cstruct.equal first_input.Types.previous_output.txid Types.zero_hash then
+    Ok ()
+  else begin
+    let error = ref None in
+    List.iteri (fun i inp ->
+      if !error = None then begin
+        match lookup inp.Types.previous_output with
+        | None ->
+          (* Prevout not found — skip; script verification will catch it. *)
+          ()
+        | Some prev_script ->
+          begin match Script.classify_script prev_script with
+          | Script.Nonstandard ->
+            (* Distinguish WITNESS_UNKNOWN (a recognisable witness program in an
+               unspecified version/size slot) from a truly nonstandard script. *)
+            begin match Script.get_witness_program prev_script with
+            | Some _ ->
+              (* Gate 2: WITNESS_UNKNOWN — a witness program of unknown version
+                 or unsupported size.  Reserved for future upgrades; reject now
+                 so we don't relay unvalidatable scripts. *)
+              error := Some (Printf.sprintf
+                "bad-txns-nonstandard-inputs: input %d witness program is undefined" i)
+            | None ->
+              (* Gate 1: genuinely nonstandard scriptPubKey. *)
+              error := Some (Printf.sprintf
+                "bad-txns-nonstandard-inputs: input %d script unknown" i)
+            end
+          | Script.P2SH_script _ ->
+            (* Gate 3: P2SH — extract redeemScript (last push of scriptSig)
+               and check its legacy sigop count against MAX_P2SH_SIGOPS.
+               Reference: policy.cpp:241-258, CScript::GetSigOpCount(true). *)
+            begin match Validation.extract_last_push_data inp.Types.script_sig with
+            | None ->
+              (* Missing or empty redeemScript — reject. *)
+              error := Some (Printf.sprintf
+                "bad-txns-nonstandard-inputs: input %d P2SH redeemscript missing" i)
+            | Some redeem_script ->
+              let sigops = Validation.count_p2sh_sigops redeem_script in
+              if sigops > max_p2sh_sigops then
+                error := Some (Printf.sprintf
+                  "bad-txns-nonstandard-inputs: p2sh redeemscript sigops exceed limit \
+                   (input %d: %d > %d)" i sigops max_p2sh_sigops)
+            end
+          | _ ->
+            (* All other standard types (P2PKH, P2WPKH, P2WSH, P2TR, P2A,
+               OP_RETURN) pass without further checks here. *)
+            ()
+          end
+      end
+    ) tx.inputs;
+    match !error with
+    | Some e -> Error e
+    | None -> Ok ()
+  end
+
 (* IsWitnessStandard — per-input witness policy check.
    Reference: Bitcoin Core policy/policy.cpp:265-352.
 
@@ -1889,6 +1984,22 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
     | Error e -> Error e
     | Ok () ->
 
+    (* ValidateInputsStandardness — per-input prevout-type and P2SH-sigops check.
+       Core: validation.cpp:896-901 — guarded by require_standard, runs AFTER
+       IsStandardTx and BEFORE IsWitnessStandard.
+       Three gates: nonstandard prevout, WITNESS_UNKNOWN prevout, P2SH sigops > 15.
+       Reference: policy/policy.cpp:214-263. *)
+    (match (if mp.require_standard then
+      validate_inputs_standardness
+        ~lookup:(fun op ->
+          match lookup_utxo mp op with
+          | Some e -> Some e.Utxo.script_pubkey
+          | None -> None)
+        tx
+    else Ok ()) with
+    | Error e -> Error e
+    | Ok () ->
+
     (* IsWitnessStandard checks (skipped when require_standard=false).
        Core: validation.cpp:904 — guarded by tx.HasWitness() + require_standard.
        We check witnesses <> [] as camlcoin's HasWitness equivalent.
@@ -2187,7 +2298,7 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
             Ok entry)
           end
         end
-    end))
+    end)))
   end))
 
 (* ============================================================================

@@ -1806,10 +1806,10 @@ let test_sendpackages_command_byte () =
             does a separate 16-byte MSG_PEEK before calling create_v2_transport,
             so the risk is confined to code that calls v2_receive_bytes directly
             with a responder transport.
-   G24/BUG: recv_len decoded in V2RecvVersion/V2RecvApp is never checked against
-            max_message_size (4 MB).  A peer can encode 3 bytes that decrypt to
-            e.g. 0xFFFFFF (16 MB) and camlcoin will wait to buffer that many
-            bytes without bound — memory exhaustion DoS.
+   G24: recv_len decoded in V2RecvVersion/V2RecvApp is now capped at
+        max_message_size (4 MB = 4_000_000, Core MAX_PROTOCOL_MESSAGE_LENGTH).
+        A peer encoding 3 bytes that decrypt to > 4 MB causes an immediate
+        disconnect (v2_receive_bytes returns false).  Fixed in W98.
    G10/BUG: No zeroization of ecdh_secret, HKDF intermediate material, or
             privkey after use.  Core calls memory_cleanse() on all three.
             OCaml GC makes this hard to guarantee, but no explicit zeroing
@@ -1974,42 +1974,47 @@ let test_w98_g15_max_garbage_abort () =
     let ok = P2p.v2_receive_bytes rstate too_much in
     Alcotest.(check bool) "G15: garbage overflow correctly rejected" false ok
 
-(* G24 BUG: recv_len not bounds-checked in V2RecvVersion/V2RecvApp.
-   Document the absence: after cipher setup, a crafted 3-byte length field can
-   decrypt to a value far above max_message_size (4 MB). The state machine will
-   accept the decoded length and wait to buffer that many bytes — no early reject.
-   We test this by constructing the scenario and asserting the CURRENT behavior
-   (no rejection on length alone), flagging it as a DoS bug. *)
+(* G24: recv_len in V2RecvVersion/V2RecvApp must be capped at max_message_size
+   (4 MB = 4_000_000 bytes, Core MAX_PROTOCOL_MESSAGE_LENGTH).  After the fix a
+   crafted 3-byte length field that decrypts to > 4 MB must cause
+   v2_receive_bytes to return false (disconnect), not buffer indefinitely. *)
 let test_w98_g24_recv_len_no_bounds_check () =
-  (* Use the packet-vector ECDH so we have a known cipher. *)
-  let hex s =
-    let len = String.length s / 2 in
-    let cs = Cstruct.create len in
-    for i = 0 to len - 1 do
-      Cstruct.set_uint8 cs i (int_of_string ("0x" ^ String.sub s (2*i) 2))
-    done; cs
-  in
-  let priv = hex "61062ea5071d800bbfd59e2e8b53d47d194b095ae5a4df04936b49772ef0d4d7" in
-  let ell_theirs = hex "a4a94dfce69b4a2a0a099313d10f9f7e7d649d60501c9e1d274c300e0d89aafaffffffffffffffffffffffffffffffffffffffffffffffffffffffff8faf88d5" in
-  let ell_ours   = hex "ec0adff257bbfe500c188c80b4fdd640f6b45a482bbc15fc7cef5931deff0aa186f6eb9bba7b85dc4dcc28b28722de1e3d9108b985e2967045668f66098e475b" in
-  let ecdh = P2p.compute_ecdh_secret priv ell_theirs ell_ours true in
-  let recv_cipher = P2p.init_bip324_cipher ~ecdh_secret:ecdh ~initiator:false
-                      ~network_magic:P2p.mainnet_magic in
-  let send_cipher = P2p.init_bip324_cipher ~ecdh_secret:ecdh ~initiator:true
-                      ~network_magic:P2p.mainnet_magic in
-  (* Encrypt a very short message to get a legitimate ciphertext. *)
-  let small_ct = P2p.bip324_encrypt send_cipher ~aad:Cstruct.empty
-                   ~contents:(Cstruct.create 1) ~ignore:false in
-  (* Decode the length field normally to confirm the cipher is wired correctly. *)
-  let enc_len = Cstruct.sub small_ct 0 3 in
-  let len_val = P2p.bip324_decrypt_length recv_cipher enc_len in
-  Alcotest.(check int) "normal 1-byte payload decodes to len=1" 1 len_val;
-  (* BUG G24: there is no check after bip324_decrypt_length that would reject
-     a decoded length of e.g. 0xFFFFFF (16 MB).  The state machine stores it
-     in recv_len and waits for that many bytes.  We document this by confirming
-     that the decoded length is accepted without error. *)
-  (* (No crash / rejection on the length value alone = bug present) *)
-  Alcotest.(check bool) "G24 BUG documented: max_message_size not enforced on v2 recv_len" true true
+  (* Constant sanity-check: Core value must be present in p2p.ml. *)
+  Alcotest.(check int) "max_message_size = 4_000_000" 4_000_000 P2p.max_message_size;
+  (* Build a full V2 handshake so we obtain a live cipher pair on each side. *)
+  let init_t = P2p.create_v2_transport ~initiating:true  ~magic:P2p.mainnet_magic in
+  let resp_t = P2p.create_v2_transport ~initiating:false ~magic:P2p.mainnet_magic in
+  match init_t, resp_t with
+  | P2p.V1 _, _ | _, P2p.V1 _ -> Alcotest.fail "Expected V2 transport"
+  | P2p.V2 is, P2p.V2 rs ->
+    let flush_and_pump src dst =
+      let bytes = P2p.v2_get_bytes_to_send src in
+      if Cstruct.length bytes > 0 then
+        ignore (P2p.v2_receive_bytes dst bytes)
+    in
+    flush_and_pump is rs;  (* initiator pubkey+garbage → responder *)
+    flush_and_pump rs is;  (* responder pubkey+garbage+term+version → initiator *)
+    flush_and_pump is rs;  (* initiator term+version → responder *)
+    (* Both sides must now be in V2RecvApp (application phase). *)
+    let init_done = is.recv_state = P2p.V2RecvApp
+                 || is.recv_state = P2p.V2RecvAppReady in
+    let resp_done = rs.recv_state = P2p.V2RecvApp
+                 || rs.recv_state = P2p.V2RecvAppReady in
+    if not init_done || not resp_done then
+      Alcotest.fail "handshake did not complete";
+    (* Encrypt an oversized payload (4_000_001 bytes) from the initiator side.
+       We only need the first 3 bytes (the encrypted length field) to trigger
+       the cap check in the responder's recv state machine — the rest of the
+       ciphertext is never fed in. *)
+    let oversize_contents = Cstruct.create (P2p.max_message_size + 1) in
+    let oversize_cipher = Option.get is.cipher in
+    let oversize_ct = P2p.bip324_encrypt oversize_cipher ~aad:Cstruct.empty
+                        ~contents:oversize_contents ~ignore:false in
+    let enc_len_only = Cstruct.sub oversize_ct 0 3 in
+    (* Feed just the 3-byte encrypted length to the responder.  The fix must
+       cause v2_receive_bytes to return false immediately (oversized → disconnect). *)
+    let ok = P2p.v2_receive_bytes rs enc_len_only in
+    Alcotest.(check bool) "G24 FIXED: oversize recv_len (>4 MB) rejected" false ok
 
 (* G17: VERSION packet AAD = garbage bytes (not empty). *)
 let test_w98_g17_version_aad_is_garbage () =
@@ -2267,7 +2272,7 @@ let () =
       test_case "G19 APP decoy IGNORE_BIT silently discarded" `Quick test_w98_g19_app_decoy_discard;
       test_case "G21 short IDs 1..12" `Quick test_w98_g21_short_ids_1_to_12;
       test_case "G23 invalid short ID rejected" `Quick test_w98_g23_invalid_short_id_rejected;
-      test_case "G24 BUG recv_len no bounds check" `Quick test_w98_g24_recv_len_no_bounds_check;
+      test_case "G24 recv_len capped at 4 MB (W98 fix)" `Quick test_w98_g24_recv_len_no_bounds_check;
       test_case "G28 AEAD tag failure disconnects" `Quick test_w98_g28_aead_tag_fail_disconnects;
       test_case "G10 BUG no key zeroization" `Quick test_w98_g10_no_zeroize_documented;
     ];

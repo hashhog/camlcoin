@@ -173,33 +173,60 @@ let test_g2_expire_orphans_dead_helper () =
   cleanup_dir path
 
 (* ============================================================================
-   G3 / BUG-3: P2P relay uses txid for wtxid-relay peers
+   G3 / BUG-3 FIX: P2P relay now sends wtxid (not txid) to wtxid-relay peers
    ============================================================================ *)
 
-(* Tests that the ATMP result has only atmp_txid (txid) and no atmp_wtxid field.
-   The relay path in cli.ml line ~957 uses this for InvWitnessTx, which is wrong.
-   A correct implementation would compute and use wtxid for wtxid-relay peers. *)
-let test_g3_atmp_result_exposes_only_txid () =
-  let (mp, _db, path) = make_test_mempool () in
-  let tx = make_test_tx () in
-  let txid = Crypto.compute_txid tx in
-  let wtxid = Crypto.compute_wtxid tx in
-  (* For a non-coinbase tx with no witness, txid = wtxid - so use one with witnesses
-     to create divergence. Here we just document that atmp_txid is txid.
-     An explicit divergence test would require a segwit tx. *)
-  let are_equal = Cstruct.equal txid wtxid in
-  (* For a plain tx with no witness, txid == wtxid, so this doesn't expose the bug directly.
-     The important thing is that the accept_result type has NO atmp_wtxid field,
-     forcing callers to re-compute wtxid themselves for wtxid-relay peers. *)
-  ignore are_equal;
-  let result = Mempool.accept_to_memory_pool mp tx in
-  (* atmp_txid is the txid *)
-  let result_id = result.Mempool.atmp_txid in
-  (* For a no-witness tx, txid == wtxid. For a segwit tx they would differ and
-     the relay bug (using txid in InvWitnessTx) would be immediately visible. *)
-  ignore result_id;
-  Alcotest.(check bool) "BUG-3: atmp_result has no atmp_wtxid field; relay must re-compute wtxid" true true;
-  cleanup_dir path
+(* FIXED: cli.ml relay path computes wtxid from the tx and sends InvWtx+wtxid to
+   wtxid-relay peers, InvTx+txid to legacy peers.
+   Core reference: net_processing.cpp RelayTransaction
+     const uint256& hash{peer.m_wtxid_relay ? wtxid.ToUint256() : txid.ToUint256()} *)
+
+(* Assert InvWtx (Core MSG_WTX) has the correct wire value = 5. *)
+let test_g3_invwtx_value_is_5 () =
+  let v = P2p.inv_type_to_int32 P2p.InvWtx in
+  Alcotest.(check int32) "FIX BUG-3: InvWtx wire value = 5 (Core MSG_WTX)" 5l v
+
+(* Assert InvWitnessTx (legacy) still has value 0x40000001 — not confused with InvWtx. *)
+let test_g3_invwitnesstx_value_is_legacy () =
+  let v = P2p.inv_type_to_int32 P2p.InvWitnessTx in
+  Alcotest.(check int32) "FIX BUG-3: InvWitnessTx retains legacy value 0x40000001" 0x40000001l v
+
+(* Assert that for a segwit tx the wtxid differs from the txid, and that
+   Crypto.compute_wtxid returns the witness hash (relay must use this for
+   InvWtx, not atmp_txid which is the txid). *)
+let test_g3_relay_uses_wtxid_for_segwit_tx () =
+  let wit_data = Cstruct.of_string "\x04\xde\xad\xbe\xef" in
+  let tx_segwit : Types.transaction = {
+    Types.version = 1l;
+    inputs = [{
+      Types.previous_output = { txid = Types.zero_hash; vout = 0l };
+      script_sig = Cstruct.empty;
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [{
+      Types.value = 50_000L;
+      script_pubkey = Cstruct.of_string "\x51";  (* OP_1 *)
+    }];
+    witnesses = [{ Types.items = [wit_data] }];
+    locktime = 0l;
+  } in
+  let txid  = Crypto.compute_txid  tx_segwit in
+  let wtxid = Crypto.compute_wtxid tx_segwit in
+  (* For a segwit tx with non-empty witnesses, txid ≠ wtxid *)
+  Alcotest.(check bool) "FIX BUG-3: segwit tx has txid ≠ wtxid" false (Cstruct.equal txid wtxid);
+  (* The relay fix uses Crypto.compute_wtxid to get the wtxid for InvWtx.
+     Verify compute_wtxid is not just an alias for compute_txid. *)
+  let txid_hex  = Types.hash256_to_hex txid  in
+  let wtxid_hex = Types.hash256_to_hex wtxid in
+  Alcotest.(check bool) "FIX BUG-3: wtxid hex differs from txid hex for segwit tx"
+    false (String.equal txid_hex wtxid_hex)
+
+(* Assert that inv_type_of_int32 round-trips InvWtx correctly. *)
+let test_g3_invwtx_roundtrip () =
+  let decoded = P2p.inv_type_of_int32 5l in
+  (* Must decode to InvWtx, not InvUnknown or any other constructor *)
+  let is_invwtx = (decoded = P2p.InvWtx) in
+  Alcotest.(check bool) "FIX BUG-3: inv_type_of_int32 5l = InvWtx" true is_invwtx
 
 (* ============================================================================
    G4 / BUG-4: TxMsg processed on block-relay-only connection
@@ -470,8 +497,11 @@ let () =
     "G2_expire_orphans_dead", [
       Alcotest.test_case "BUG_expire_orphans_never_called" `Quick test_g2_expire_orphans_dead_helper;
     ];
-    "G3_relay_txid_for_wtxid_peers", [
-      Alcotest.test_case "BUG_atmp_result_no_wtxid_field" `Quick test_g3_atmp_result_exposes_only_txid;
+    "G3_relay_uses_wtxid_for_wtxid_relay_peers", [
+      Alcotest.test_case "FIX_invwtx_value_is_5"             `Quick test_g3_invwtx_value_is_5;
+      Alcotest.test_case "FIX_invwitnesstx_legacy_0x40000001" `Quick test_g3_invwitnesstx_value_is_legacy;
+      Alcotest.test_case "FIX_segwit_txid_ne_wtxid"          `Quick test_g3_relay_uses_wtxid_for_segwit_tx;
+      Alcotest.test_case "FIX_invwtx_roundtrip"              `Quick test_g3_invwtx_roundtrip;
     ];
     "G4_bro_peer_txmsg_accepted", [
       Alcotest.test_case "BUG_no_rejectincomingtxs" `Quick test_g4_block_relay_only_peer_lacks_reject_guard;

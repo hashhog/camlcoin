@@ -1939,29 +1939,50 @@ let test_w98_g8_header () =
    | Some (ignore_bit, _) ->
      Alcotest.(check bool) "ignore flag round-trips" true ignore_bit)
 
-(* G13 / G14: V1 prefix detection.
-   G14 BUG: p2p.ml V2RecvKeyMaybeV1 transitions to V2RecvV1Fallback after
-   seeing only 4 matching magic bytes, not the full 16-byte prefix.
-   Document the behavior: feed exactly the 4-byte magic as a v2 pubkey prefix
-   and confirm the state machine falls back to V1 (demonstrating the premature
-   classification bug). *)
+(* G13 / G14: V1 prefix detection — fixed in W98.
+   BIP-324 and Core net.cpp:1091-1094 require matching the full 16-byte prefix
+   (4-byte magic + "version\x00\x00\x00\x00\x00") before deciding V1 fallback.
+   The old code triggered V1 fallback after only 4 matching bytes (the magic),
+   which would misclassify a v2 peer whose ellswift pubkey starts with the
+   network magic bytes.  After the fix, 4 magic-only bytes must NOT trigger
+   V1 fallback; only a full 16-byte match should. *)
 let test_w98_g14_v1_prefix_check_only_4bytes () =
-  (* Build a buffer that starts with mainnet magic but is NOT a v1 VERSION msg.
-     This simulates an attacker or a legitimate v2 peer whose random 64-byte
-     pubkey happens to start with the 4-byte mainnet magic bytes. *)
-  let responder = P2p.create_v2_transport ~initiating:false ~magic:P2p.mainnet_magic in
-  match responder with
+  (* Case 1: 4 magic bytes only — must NOT trigger V1 fallback (need 16B). *)
+  let responder1 = P2p.create_v2_transport ~initiating:false ~magic:P2p.mainnet_magic in
+  (match responder1 with
   | P2p.V1 _ -> Alcotest.fail "Expected V2"
   | P2p.V2 state ->
-    (* First 4 bytes = mainnet magic = 0xF9BEB4D9 (LE) *)
     let magic_prefix = Cstruct.create 4 in
     Cstruct.LE.set_uint32 magic_prefix 0 P2p.mainnet_magic;
     let _ok = P2p.v2_receive_bytes state magic_prefix in
-    (* BUG: after only 4 magic bytes, camlcoin transitions to V2RecvV1Fallback.
-       A correct implementation would wait for 16 bytes before classifying.
-       We assert the ACTUAL (buggy) behavior so the test catches any regression. *)
-    Alcotest.(check bool) "BUG G14: 4-byte magic triggers v1 fallback (should need 16B)"
-      true (state.recv_state = P2p.V2RecvV1Fallback)
+    (* FIX G14: 4 magic bytes alone must NOT classify as V1 fallback. *)
+    Alcotest.(check bool) "FIX G14: 4-byte magic alone does NOT trigger v1 fallback"
+      false (state.recv_state = P2p.V2RecvV1Fallback));
+  (* Case 2: full 16-byte V1 prefix — must trigger V1 fallback. *)
+  let responder2 = P2p.create_v2_transport ~initiating:false ~magic:P2p.mainnet_magic in
+  (match responder2 with
+  | P2p.V1 _ -> Alcotest.fail "Expected V2"
+  | P2p.V2 state ->
+    let v1_prefix = Cstruct.create 16 in
+    Cstruct.LE.set_uint32 v1_prefix 0 P2p.mainnet_magic;
+    (* "version\x00\x00\x00\x00\x00" at bytes 4-15 *)
+    let suffix = "version\x00\x00\x00\x00\x00" in
+    String.iteri (fun i c -> Cstruct.set_uint8 v1_prefix (4 + i) (Char.code c)) suffix;
+    let _ok = P2p.v2_receive_bytes state v1_prefix in
+    Alcotest.(check bool) "FIX G14: full 16-byte V1 prefix triggers v1 fallback"
+      true (state.recv_state = P2p.V2RecvV1Fallback));
+  (* Case 3: magic bytes followed by non-version bytes — must switch to V2 (KEY). *)
+  let responder3 = P2p.create_v2_transport ~initiating:false ~magic:P2p.mainnet_magic in
+  match responder3 with
+  | P2p.V1 _ -> Alcotest.fail "Expected V2"
+  | P2p.V2 state ->
+    let not_v1 = Cstruct.create 16 in
+    Cstruct.LE.set_uint32 not_v1 0 P2p.mainnet_magic;
+    (* byte 4 = 0xFF, not 'v' *)
+    Cstruct.set_uint8 not_v1 4 0xFF;
+    let _ok = P2p.v2_receive_bytes state not_v1 in
+    Alcotest.(check bool) "FIX G14: magic+non-version 16B → V2 KEY (not fallback)"
+      false (state.recv_state = P2p.V2RecvV1Fallback)
 
 (* G15: MAX_GARBAGE_LEN = 4095; abort when offset > 4095 (i.e., after 4111B). *)
 let test_w98_g15_max_garbage_abort () =
@@ -2312,7 +2333,7 @@ let () =
       test_case "G7 LENGTH_LEN=3 LE" `Quick test_w98_g7_length_field;
       test_case "G8 HEADER_LEN=1 IGNORE_BIT=0x80" `Quick test_w98_g8_header;
       test_case "G11 RecvState transitions" `Quick test_w98_g11_recv_state_graph;
-      test_case "G14 BUG 4-byte V1 prefix check (should be 16B)" `Quick test_w98_g14_v1_prefix_check_only_4bytes;
+      test_case "G14 FIX V1 prefix 4-byte → 16-byte (W98)" `Quick test_w98_g14_v1_prefix_check_only_4bytes;
       test_case "G15 MAX_GARBAGE_LEN abort at 4111B" `Quick test_w98_g15_max_garbage_abort;
       test_case "G17 VERSION AAD=garbage" `Quick test_w98_g17_version_aad_is_garbage;
       test_case "G19 APP decoy IGNORE_BIT silently discarded" `Quick test_w98_g19_app_decoy_discard;

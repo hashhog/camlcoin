@@ -3595,15 +3595,73 @@ let test_w97_g19b_no_hasmoresamework_gate () =
     true true
 
 (* G19c — fTooFarAhead: block height > active + MIN_BLOCKS_TO_KEEP=288.
-   Core: drops blocks too far ahead of the tip as anti-DoS.
-   Camlcoin: NO fTooFarAhead gate.  Constant 288 lives only in pruning code.
-   BUG-19c. *)
+   Core: drops unrequested blocks more than 288 blocks ahead of active tip.
+   Fixed: W97 G19c gate added to process_new_block.
+   Three cases:
+     (1) unrequested block at height > tip+288  → Error "too-far-ahead"
+     (2) unrequested block at height = tip+288  → NOT rejected (boundary is >)
+     (3) requested  block at height > tip+288  → NOT rejected (f_requested bypasses)
+   Reference: bitcoin-core/src/validation.cpp:4325. *)
 let test_w97_g19c_no_too_far_ahead_gate () =
-  let (_state, db, _) = w97_build_chain 0 in
-  Storage.ChainDB.close db; w97_cleanup_db ();
-  Alcotest.(check bool)
-    "G19c: BUG — no fTooFarAhead (height > tip+288) gate in process_new_block"
-    true true
+  (* blocks_synced starts at 0 (genesis), so tip+288 = 288. *)
+  (* --- case 1: unrequested, height = 289 (> 0+288) — must be rejected --- *)
+  let (state1, db1, _) = w97_build_chain 289 in
+  (* w97_build_chain 289 builds 289 header entries (heights 1..289) without
+     advancing blocks_synced; the block-tip remains at height 0. *)
+  let header_289 =
+    match Sync.get_header_at_height state1 289 with
+    | Some e -> e.header
+    | None ->
+      Storage.ChainDB.close db1; w97_cleanup_db ();
+      Alcotest.fail "G19c case1: could not retrieve header at height 289"
+  in
+  let block_289 = Types.{ header = header_289; transactions = [] } in
+  let result1 = Sync.process_new_block state1 block_289 in
+  Storage.ChainDB.close db1; w97_cleanup_db ();
+  (match result1 with
+   | Error "too-far-ahead" -> ()
+   | Ok () ->
+     Alcotest.fail "G19c case1 FAIL: unrequested block at height 289 (tip+289) \
+                    was accepted instead of rejected with too-far-ahead"
+   | Error e ->
+     Alcotest.fail (Printf.sprintf
+       "G19c case1 FAIL: expected too-far-ahead, got Error %S" e));
+
+  (* --- case 2: unrequested, height = 288 (= 0+288) — boundary must pass --- *)
+  let (state2, db2, _) = w97_build_chain 288 in
+  let header_288 =
+    match Sync.get_header_at_height state2 288 with
+    | Some e -> e.header
+    | None ->
+      Storage.ChainDB.close db2; w97_cleanup_db ();
+      Alcotest.fail "G19c case2: could not retrieve header at height 288"
+  in
+  let block_288 = Types.{ header = header_288; transactions = [] } in
+  let result2 = Sync.process_new_block state2 block_288 in
+  Storage.ChainDB.close db2; w97_cleanup_db ();
+  (match result2 with
+   | Error "too-far-ahead" ->
+     Alcotest.fail "G19c case2 FAIL: block at height 288 (= tip+288) should \
+                    NOT be rejected by fTooFarAhead (gate is >, not >=)"
+   | Ok () | Error _ -> ());   (* any other result is fine for this boundary check *)
+
+  (* --- case 3: explicitly requested, height = 289 — must NOT be rejected --- *)
+  let (state3, db3, _) = w97_build_chain 289 in
+  let header_289b =
+    match Sync.get_header_at_height state3 289 with
+    | Some e -> e.header
+    | None ->
+      Storage.ChainDB.close db3; w97_cleanup_db ();
+      Alcotest.fail "G19c case3: could not retrieve header at height 289"
+  in
+  let block_289b = Types.{ header = header_289b; transactions = [] } in
+  let result3 = Sync.process_new_block ~f_requested:true state3 block_289b in
+  Storage.ChainDB.close db3; w97_cleanup_db ();
+  match result3 with
+  | Error "too-far-ahead" ->
+    Alcotest.fail "G19c case3 FAIL: requested block at height 289 was rejected \
+                   with too-far-ahead; f_requested:true must bypass the gate"
+  | Ok () | Error _ -> ()     (* any other outcome is acceptable *)
 
 (* G19d — nChainWork < MinimumChainWork (anti-DoS for unrequested).
    Core: drops blocks whose nChainWork < MinimumChainWork() when !fRequested.
@@ -4026,7 +4084,7 @@ let () =
         test_w97_g18_already_have_short_circuits;
       test_case "G19b: BUG — no fHasMoreOrSameWork gate" `Quick
         test_w97_g19b_no_hasmoresamework_gate;
-      test_case "G19c: BUG — no fTooFarAhead gate" `Quick
+      test_case "G19c: fTooFarAhead gate (unrequested>tip+288 rejected, at-boundary+requested pass)" `Quick
         test_w97_g19c_no_too_far_ahead_gate;
       test_case "G19d: BUG — min_chain_work not enforced at block accept" `Quick
         test_w97_g19d_no_minchainwork_gate_on_block;

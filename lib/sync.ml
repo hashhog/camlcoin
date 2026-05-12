@@ -4294,8 +4294,8 @@ let rec connect_stored_blocks (state : chain_state) : int =
             m "Stored block at height %d failed validation: %s" next_height msg);
           0
 
-let process_new_block (state : chain_state) (block : Types.block)
-    : (unit, string) result =
+let process_new_block ?(f_requested = false) (state : chain_state)
+    (block : Types.block) : (unit, string) result =
   let hash = Crypto.compute_block_hash block.header in
   let hash_key = Cstruct.to_string hash in
   (* Ignore blocks we already have — but still try to advance from stored
@@ -4319,6 +4319,20 @@ let process_new_block (state : chain_state) (block : Types.block)
       Error "Unknown header and failed to validate"
     | Some entry ->
       let height = entry.height in
+      (* G19c — fTooFarAhead anti-DoS gate.
+         Core: bitcoin-core/src/validation.cpp:4325 — when !fRequested and
+         pindex->nHeight > ActiveHeight() + MIN_BLOCKS_TO_KEEP (288), drop
+         the block silently.  Without this, a peer can send hundreds of
+         future blocks to consume disk I/O and CPU before they are ever
+         connectable, since every out-of-order block is stored and later
+         re-validated when the chain catches up.
+         Reference: bitcoin-core/src/validation.cpp ProcessNewBlock /
+         AcceptBlock (W97 G19c). *)
+      let min_blocks_to_keep = 288 in
+      let f_too_far_ahead = height > state.blocks_synced + min_blocks_to_keep in
+      if (not f_requested) && f_too_far_ahead then
+        Error "too-far-ahead"
+      else
       (* Only connect blocks that extend the current BLOCK tip (see
          `chain_state` comment on why `state.tip` is not used here). *)
       let connects_to_tip =

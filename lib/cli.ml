@@ -1013,7 +1013,7 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
          (* All transactions found *)
          Logs.info (fun m ->
            m "Compact block fully reconstructed: %s" (Types.hash256_to_hex header_hash));
-         (match Sync.process_new_block chain block with
+         (match Sync.process_new_block ~f_requested:true chain block with
           | Ok () ->
             (try Fee_estimation.process_block fee_estimator block chain.blocks_synced
              with _ -> ());
@@ -1063,7 +1063,7 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
           | Ok block ->
             Logs.info (fun m ->
               m "Compact block reconstructed from blocktxn: %s" hash_hex);
-            (match Sync.process_new_block chain block with
+            (match Sync.process_new_block ~f_requested:true chain block with
              | Ok () ->
                (try Fee_estimation.process_block fee_estimator block chain.blocks_synced
                 with _ -> ());

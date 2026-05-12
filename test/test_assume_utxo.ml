@@ -1286,7 +1286,7 @@ let test_disconnect_to_target_unknown_target_errors () =
    W102 AssumeUTXO gate audit tests
    ===========================================================================
 
-   Each test below pins a specific bug found during the W102 audit.
+   Each test below asserts a specific guard fixed during the W102 wave.
    Bug IDs (B1-B15) match the commit message.
 
    Reference: bitcoin-core/src/validation.cpp ActivateSnapshot 5588;
@@ -1295,33 +1295,25 @@ let test_disconnect_to_target_unknown_target_errors () =
    =========================================================================== *)
 
 (* -----------------------------------------------------------------------
-   B1 — G8: coin.height > base_height NOT checked during PopulateAndValidate
+   B1 — coin.height > base_height guard (FIXED)
 
    Bitcoin Core (validation.cpp:5814-5819):
      if (coin.nHeight > base_height || outpoint.n >= UINT32_MAX)
        return error("Bad snapshot data after deserializing %d coins")
-   camlcoin's [iter_snapshot_coins] / [load_snapshot] loads every coin
-   unconditionally — a malicious snapshot can inject future-height coins.
 
-   We can't directly call load_snapshot against a fake whitelist entry,
-   so we pin the missing check by confirming iter_snapshot_coins does NOT
-   raise on a coin with height > 0 even when the caller provides no guard.
-   A correct implementation would either (a) propagate a base_height limit
-   into iter_snapshot_coins, or (b) validate heights in the load_snapshot
-   loop before calling add_coin.
+   iter_snapshot_coins now accepts optional ~base_height; load_snapshot
+   passes params.height.  A coin at height > base_height must produce Error.
    ----------------------------------------------------------------------- *)
-let test_b1_coin_height_exceeds_base_not_rejected () =
-  let name = "B1: iter_snapshot_coins does not validate coin.height > base_height" in
+let test_b1_coin_height_exceeds_base_rejected () =
+  let name = "B1 (fixed): coin.height > base_height rejected by iter_snapshot_coins" in
   let dir = temp_dir () in
   let path = Filename.concat dir "h_exceed.dat" in
-  (* Build a snapshot with a single coin at height 999_999 — well above any
-     real snapshot base_height (~840k for mainnet h1).  If camlcoin had the
-     Core guard this coin would be rejected during load. *)
+  (* Coin at height 500 with base_height=100 — must be rejected. *)
   let future_coin : Assume_utxo.snapshot_coin = {
     outpoint = { Types.txid = mk_txid 0x01; vout = 0l };
     value = 5_000_000_000L;
     script_pubkey = Cstruct.of_string "\x51";
-    height = 999_999;
+    height = 500;
     is_coinbase = false;
   } in
   let metadata : Assume_utxo.snapshot_metadata = {
@@ -1336,42 +1328,29 @@ let test_b1_coin_height_exceeds_base_not_rejected () =
     let ic = open_in_bin path in
     let sr = Assume_utxo.Stream_reader.create ic
                ~start_offset:Assume_utxo.snapshot_body_offset in
-    let loaded = ref [] in
     let res =
-      Assume_utxo.iter_snapshot_coins sr ~coins_count:1L
-        ~f:(fun coin -> loaded := coin :: !loaded)
+      Assume_utxo.iter_snapshot_coins ~base_height:100 sr ~coins_count:1L
+        ~f:(fun _ -> ())
     in
     close_in ic;
     cleanup_dir dir;
     match res with
-    | Error _ ->
-      (* If iter already rejects, B1 is partially fixed — still document. *)
-      test_passed name  (* keep test green; the bug document captures it *)
+    | Error _ -> test_passed name  (* guard fired — correct *)
     | Ok _ ->
-      (* Bug confirmed: coin with height > typical base_height was loaded
-         without error. A correct implementation must reject it. *)
-      if !loaded <> [] then
-        (* Document the missing guard rather than fail the build.
-           Comment says SHOULD have been Error — mark with note. *)
-        test_passed name  (* B1 documented — guard is absent *)
-      else
-        test_failed name "unexpected: no coin loaded despite Ok return")
+      test_failed name
+        "B1: coin with height > base_height was NOT rejected (guard missing)")
 
 (* -----------------------------------------------------------------------
-   B2 — G8: MoneyRange not checked for each coin during snapshot load
+   B2 — MoneyRange guard (FIXED)
 
    Bitcoin Core (validation.cpp:5820-5823):
      if (!MoneyRange(coin.out.nValue))
        return error("Bad snapshot data ... bad tx out value")
-   camlcoin does not call any MoneyRange check in iter_snapshot_coins or
-   load_snapshot.  A snapshot with coin.value > 21_000_000 * COIN (or < 0)
-   is loaded silently.
 
-   We verify by writing and reading back a coin with value > MAX_MONEY and
-   confirming iter_snapshot_coins accepts it without error.
+   iter_snapshot_coins now validates coin.value in [0, MAX_MONEY].
    ----------------------------------------------------------------------- *)
-let test_b2_coin_value_exceeds_max_money_not_rejected () =
-  let name = "B2: coin.value > MAX_MONEY not rejected during snapshot load" in
+let test_b2_coin_value_exceeds_max_money_rejected () =
+  let name = "B2 (fixed): coin.value > MAX_MONEY rejected by iter_snapshot_coins" in
   let dir = temp_dir () in
   let path = Filename.concat dir "bad_money.dat" in
   let max_money = Int64.mul 21_000_000L 100_000_000L in
@@ -1394,35 +1373,31 @@ let test_b2_coin_value_exceeds_max_money_not_rejected () =
     let ic = open_in_bin path in
     let sr = Assume_utxo.Stream_reader.create ic
                ~start_offset:Assume_utxo.snapshot_body_offset in
-    let loaded = ref [] in
     let res =
       Assume_utxo.iter_snapshot_coins sr ~coins_count:1L
-        ~f:(fun coin -> loaded := coin :: !loaded)
+        ~f:(fun _ -> ())
     in
     close_in ic;
     cleanup_dir dir;
-    (* Document the missing guard; keep green so CI doesn't churn. *)
-    (match res with
-    | Error _ -> test_passed name  (* if already guarded, pass *)
+    match res with
+    | Error _ -> test_passed name  (* MoneyRange guard fired — correct *)
     | Ok _ ->
-      if List.length !loaded = 1 then
-        test_passed name  (* B2 documented — guard is absent *)
-      else
-        test_failed name "unexpected result"))
+      test_failed name
+        "B2: coin.value > MAX_MONEY was NOT rejected (MoneyRange guard missing)")
 
 (* -----------------------------------------------------------------------
-   B3 — G9: trailing bytes after declared coins_count not detected
+   B3 — trailing-bytes guard (FIXED)
 
    Bitcoin Core (validation.cpp:5872-5883):
      try { coins_file >> left_over_byte; }
      catch (failure&) { out_of_coins = true; }
      if (!out_of_coins) return error("coins left over after deserializing N")
-   camlcoin stops the while loop when coins_left == 0 but never tries to
-   read a trailing byte.  A bloated snapshot (extra appended data) is
-   accepted silently.
+
+   iter_snapshot_coins now probes for a trailing byte after all declared
+   coins are consumed and returns Error when one is found.
    ----------------------------------------------------------------------- *)
-let test_b3_trailing_bytes_after_coins_not_detected () =
-  let name = "B3: trailing bytes after coins_count not detected" in
+let test_b3_trailing_bytes_after_coins_rejected () =
+  let name = "B3 (fixed): trailing bytes after coins_count rejected" in
   let dir = temp_dir () in
   let path = Filename.concat dir "trailing.dat" in
   let coin : Assume_utxo.snapshot_coin = {
@@ -1445,7 +1420,6 @@ let test_b3_trailing_bytes_after_coins_not_detected () =
     let oc = open_out_gen [Open_binary; Open_append] 0o644 path in
     output_char oc '\xff';
     close_out oc;
-    (* Now read it back — Core would reject, camlcoin should too. *)
     let ic = open_in_bin path in
     let sr = Assume_utxo.Stream_reader.create ic
                ~start_offset:Assume_utxo.snapshot_body_offset in
@@ -1456,35 +1430,27 @@ let test_b3_trailing_bytes_after_coins_not_detected () =
     close_in ic;
     cleanup_dir dir;
     match res with
-    | Error _ -> test_passed name  (* if already guarded, pass *)
+    | Error _ -> test_passed name  (* trailing-byte guard fired — correct *)
     | Ok _ ->
-      (* B3 documented — trailing byte was silently ignored *)
-      test_passed name)
+      test_failed name
+        "B3: trailing bytes after coins were NOT rejected (guard missing)")
 
 (* -----------------------------------------------------------------------
-   B4 — G4: loadtxoutset does not check header-chain membership of base block
+   B4 — header-chain membership guard (FIXED)
 
    Bitcoin Core ActivateSnapshot (validation.cpp:5611-5615):
      snapshot_start_block = m_blockman.LookupBlockIndex(base_blockhash);
      if (!snapshot_start_block)
        return error("The base block header (%s) must appear in the headers
                      chain. Make sure all headers are syncing …")
-   camlcoin's handle_loadtxoutset skips this check entirely — it proceeds
-   to call load_snapshot even if the base blockhash is not in the synced
-   header index.
 
-   We test by checking that the whitelist lookup succeeds for mainnet 840k
-   but the corresponding header is NOT in a fresh chain_state (genesis only),
-   and verify handle_loadtxoutset does NOT produce the expected error.  The
-   test documents the absent gate — if the guard is later added the test
-   can be inverted.
+   handle_loadtxoutset now calls Sync.has_header and rejects when the
+   base_blockhash is absent.  A genesis-only chain will not have mainnet
+   840k, so the error must fire.
    ----------------------------------------------------------------------- *)
-let test_b4_base_block_header_chain_membership_not_checked () =
-  let name = "B4: loadtxoutset missing header-chain membership check" in
-  (* Create a snapshot whose base_blockhash is the mainnet 840k entry.
-     The RPC chain has only genesis, so the 840k header is absent. *)
+let test_b4_base_block_header_chain_membership_checked () =
+  let name = "B4 (fixed): loadtxoutset rejects snapshot whose base block is not in header chain" in
   let (ctx, db, dir) = make_dump_test_ctx () in
-  (* Write a snapshot that claims to be at mainnet 840k. *)
   let au840 = match Assume_utxo.get_assumeutxo_params_mainnet 840_000 with
     | Some p -> p
     | None -> failwith "840k params missing"
@@ -1493,7 +1459,9 @@ let test_b4_base_block_header_chain_membership_not_checked () =
   let metadata : Assume_utxo.snapshot_metadata = {
     network_magic = Camlcoin.Consensus.mainnet.magic;
     base_blockhash = au840.blockhash;
-    coins_count = 0L;
+    (* Use the canonical coins_count so the early coins_count guard passes
+       and execution reaches the B4 header-chain membership check. *)
+    coins_count = au840.coins_count;
   } in
   (try Sys.remove snap_path with _ -> ());
   (match Assume_utxo.write_snapshot snap_path metadata
@@ -1504,98 +1472,183 @@ let test_b4_base_block_header_chain_membership_not_checked () =
   | Ok () ->
     let result = Rpc.handle_loadtxoutset ctx [`String snap_path] in
     (try Sys.remove snap_path with _ -> ());
-    (* Clean up snapshot db if created *)
     let snap_db_dir = Filename.concat dir "chainstate_snapshot" in
     (try ignore (Sys.command (Printf.sprintf "rm -rf %s" snap_db_dir))
      with _ -> ());
     cleanup_dump_test_ctx db dir;
-    (* Core would return Error "base block header ... must appear in headers
-       chain".  Camlcoin either returns Error for another reason (coins_count
-       mismatch check after hash verification) or Ok.  The key point is that
-       it does NOT return the header-chain error. *)
+    (* Must produce "headers chain" error — not a hash/coins error. *)
     match result with
-    | Error _msg ->
-      (* Some error occurred — might be the hash check failing, not the
-         header check.  B4 is still present because the wrong gate fires. *)
-      test_passed name  (* B4 documented *)
+    | Error msg ->
+      let has_header_err =
+        try
+          let needle = "headers chain" in
+          let nlen = String.length needle in
+          let mlen = String.length msg in
+          let rec search i =
+            if i + nlen > mlen then false
+            else if String.sub msg i nlen = needle then true
+            else search (i + 1)
+          in
+          search 0
+        with _ -> false
+      in
+      if has_header_err then test_passed name
+      else
+        test_failed name
+          (Printf.sprintf "wrong error — expected 'headers chain', got: %s" msg)
     | Ok _ ->
-      (* No error at all despite 840k header not being in chain — B4 confirmed *)
-      test_passed name)  (* B4 documented *)
+      test_failed name "expected Error, got Ok (B4 guard not firing)")
 
 (* -----------------------------------------------------------------------
-   B5 — G4: loadtxoutset does not check for pre-existing snapshot activation
+   B5 — double-activation guard (FIXED)
 
    Bitcoin Core ActivateSnapshot (validation.cpp:5600-5602):
      if (this->CurrentChainstate().m_from_snapshot_blockhash)
        return error("Can't activate a snapshot-based chainstate more than once")
-   camlcoin's handle_loadtxoutset has no such guard — calling loadtxoutset
-   twice will clobber the chainstate_snapshot/ directory without warning.
+
+   handle_loadtxoutset now checks whether chainstate_snapshot/ already
+   exists on disk and rejects with "more than once".
+
+   To reach B5 we must pass B4 (header in chain).  We inject a fake header
+   entry for the 840k blockhash directly into the in-memory header table,
+   then pre-create the snapshot_db directory to trigger B5.
    ----------------------------------------------------------------------- *)
-let test_b5_double_snapshot_activation_not_guarded () =
-  let name = "B5: loadtxoutset allows double activation (no guard)" in
+let test_b5_double_snapshot_activation_guarded () =
+  let name = "B5 (fixed): loadtxoutset rejects when snapshot already activated" in
   let (ctx, db, dir) = make_dump_test_ctx () in
-  (* Use a snapshot with zero coins and a whitelisted hash — but we only
-     care that the second call is not rejected with a "can't activate more
-     than once" error. *)
+  let au840 = match Assume_utxo.get_assumeutxo_params_mainnet 840_000 with
+    | Some p -> p
+    | None -> failwith "840k params missing"
+  in
+  (* Inject the 840k blockhash into the in-memory header table so B4 passes. *)
+  let fake_entry : Sync.header_entry = {
+    header = Camlcoin.Consensus.mainnet.genesis_header;
+    hash = au840.blockhash;
+    height = au840.height;
+    total_work = Cstruct.create 32;
+  } in
+  Hashtbl.replace ctx.chain.Sync.headers
+    (Cstruct.to_string au840.blockhash) fake_entry;
+  (* Pre-create the snapshot_db directory to trigger the B5 guard. *)
+  let snapshot_db_path = Filename.concat dir "chainstate_snapshot" in
+  (try Unix.mkdir snapshot_db_path 0o755 with _ -> ());
   let snap_path = unique_dump_path "b5_double" in
   let metadata : Assume_utxo.snapshot_metadata = {
     network_magic = Camlcoin.Consensus.mainnet.magic;
-    base_blockhash = Cstruct.create 32;  (* not whitelisted — will fail whitelist *)
-    coins_count = 0L;
+    base_blockhash = au840.blockhash;
+    (* Use canonical coins_count so coins_count guard passes, reaching B5. *)
+    coins_count = au840.coins_count;
   } in
   (try Sys.remove snap_path with _ -> ());
   (match Assume_utxo.write_snapshot snap_path metadata
            ~iter_coins:(fun _ -> ()) with
   | Error msg ->
-    cleanup_dump_test_ctx db dir;
-    test_failed name ("write: " ^ msg)
-  | Ok () ->
-    (* First call — will fail whitelist check (correct). *)
-    let r1 = Rpc.handle_loadtxoutset ctx [`String snap_path] in
-    (* Second call — if B5 were fixed, would say "already activated". *)
-    let r2 = Rpc.handle_loadtxoutset ctx [`String snap_path] in
-    (try Sys.remove snap_path with _ -> ());
-    cleanup_dump_test_ctx db dir;
-    (* Both calls should produce whitelist rejection (not "already activated").
-       B5 is present because neither call produces the double-activation guard. *)
-    match r1, r2 with
-    | Error _, Error _ ->
-      test_passed name  (* B5 documented — both fail whitelist, not guard *)
-    | _ ->
-      test_passed name)  (* B5 documented regardless *)
-
-(* -----------------------------------------------------------------------
-   B6 — G4: loadtxoutset does not reject if mempool is non-empty
-
-   Bitcoin Core ActivateSnapshot (validation.cpp:5626-5629):
-     if (mempool && mempool->size() > 0)
-       return error("Can't activate a snapshot when mempool not empty")
-   camlcoin's handle_loadtxoutset does not check Mempool.size().
-   ----------------------------------------------------------------------- *)
-let test_b6_mempool_not_checked_before_snapshot_load () =
-  let name = "B6: loadtxoutset does not check mempool is empty" in
-  let (ctx, db, dir) = make_dump_test_ctx () in
-  (* We can't easily inject a mempool entry in this context, but we can
-     document the absent guard by inspecting the RPC handler path. *)
-  let snap_path = unique_dump_path "b6_mempool" in
-  let metadata : Assume_utxo.snapshot_metadata = {
-    network_magic = Camlcoin.Consensus.mainnet.magic;
-    base_blockhash = Cstruct.create 32;
-    coins_count = 0L;
-  } in
-  (try Sys.remove snap_path with _ -> ());
-  (match Assume_utxo.write_snapshot snap_path metadata
-           ~iter_coins:(fun _ -> ()) with
-  | Error msg ->
+    (try ignore (Sys.command (Printf.sprintf "rm -rf %s" snapshot_db_path)) with _ -> ());
     cleanup_dump_test_ctx db dir;
     test_failed name ("write: " ^ msg)
   | Ok () ->
     let result = Rpc.handle_loadtxoutset ctx [`String snap_path] in
     (try Sys.remove snap_path with _ -> ());
+    (try ignore (Sys.command (Printf.sprintf "rm -rf %s" snapshot_db_path)) with _ -> ());
     cleanup_dump_test_ctx db dir;
-    (* The call will fail the whitelist check — not a mempool check.
-       B6 is documented: even with a non-empty mempool the whitelist error
-       fires first rather than the mempool guard. *)
+    match result with
+    | Error msg ->
+      let has_double_err =
+        try
+          let needle = "more than once" in
+          let nlen = String.length needle in
+          let mlen = String.length msg in
+          let rec search i =
+            if i + nlen > mlen then false
+            else if String.sub msg i nlen = needle then true
+            else search (i + 1)
+          in
+          search 0
+        with _ -> false
+      in
+      if has_double_err then test_passed name
+      else
+        test_failed name
+          (Printf.sprintf "wrong error — expected 'more than once', got: %s" msg)
+    | Ok _ ->
+      test_failed name "expected Error, got Ok (B5 guard not firing)")
+
+(* -----------------------------------------------------------------------
+   B6 — mempool-empty precondition guard (FIXED)
+
+   Bitcoin Core ActivateSnapshot (validation.cpp:5626-5629):
+     if (mempool && mempool->size() > 0)
+       return error("Can't activate a snapshot when mempool not empty")
+
+   handle_loadtxoutset now calls Mempool.count and rejects when > 0.
+
+   To reach B6 we must pass B4 (header in chain) and B5 (no existing
+   snapshot_db).  We inject a fake header and a fake mempool entry.
+   ----------------------------------------------------------------------- *)
+let test_b6_mempool_checked_before_snapshot_load () =
+  let name = "B6 (fixed): loadtxoutset rejects when mempool is non-empty" in
+  let (ctx, db, dir) = make_dump_test_ctx () in
+  let au840 = match Assume_utxo.get_assumeutxo_params_mainnet 840_000 with
+    | Some p -> p
+    | None -> failwith "840k params missing"
+  in
+  (* Inject 840k header so B4 passes. *)
+  let fake_entry : Sync.header_entry = {
+    header = Camlcoin.Consensus.mainnet.genesis_header;
+    hash = au840.blockhash;
+    height = au840.height;
+    total_work = Cstruct.create 32;
+  } in
+  Hashtbl.replace ctx.chain.Sync.headers
+    (Cstruct.to_string au840.blockhash) fake_entry;
+  (* No snapshot_db → B5 passes. *)
+  (* Inject a fake mempool entry so B6 fires. *)
+  let fake_tx : Types.transaction = {
+    version = 1l;
+    inputs = [];
+    outputs = [];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let fake_txid = Crypto.compute_txid fake_tx in
+  let fake_mp_entry : Mempool.mempool_entry = {
+    txid = fake_txid;
+    wtxid = fake_txid;
+    tx = fake_tx;
+    fee = 1000L;
+    weight = 400;
+    fee_rate = 2.5;
+    time_added = 0.0;
+    height_added = 0;
+    depends_on = [];
+    ancestor_count = 1;
+    ancestor_size = 100;
+    descendant_count = 1;
+    descendant_size = 100;
+  } in
+  Hashtbl.replace (Mempool.get_entries ctx.mempool)
+    (Cstruct.to_string fake_txid) fake_mp_entry;
+  let snap_path = unique_dump_path "b6_mempool" in
+  let metadata : Assume_utxo.snapshot_metadata = {
+    network_magic = Camlcoin.Consensus.mainnet.magic;
+    base_blockhash = au840.blockhash;
+    (* Use canonical coins_count so coins_count guard passes, reaching B6. *)
+    coins_count = au840.coins_count;
+  } in
+  (try Sys.remove snap_path with _ -> ());
+  (match Assume_utxo.write_snapshot snap_path metadata
+           ~iter_coins:(fun _ -> ()) with
+  | Error msg ->
+    Hashtbl.remove (Mempool.get_entries ctx.mempool) (Cstruct.to_string fake_txid);
+    cleanup_dump_test_ctx db dir;
+    test_failed name ("write: " ^ msg)
+  | Ok () ->
+    let result = Rpc.handle_loadtxoutset ctx [`String snap_path] in
+    (try Sys.remove snap_path with _ -> ());
+    let snap_db_dir = Filename.concat dir "chainstate_snapshot" in
+    (try ignore (Sys.command (Printf.sprintf "rm -rf %s" snap_db_dir)) with _ -> ());
+    Hashtbl.remove (Mempool.get_entries ctx.mempool) (Cstruct.to_string fake_txid);
+    cleanup_dump_test_ctx db dir;
     match result with
     | Error msg ->
       let has_mempool_err =
@@ -1611,32 +1664,61 @@ let test_b6_mempool_not_checked_before_snapshot_load () =
           search 0
         with _ -> false
       in
-      if has_mempool_err then
-        test_failed name "Unexpected mempool error — B6 may be fixed; re-check"
+      if has_mempool_err then test_passed name
       else
-        test_passed name  (* B6 documented — whitelist fires, not mempool guard *)
-    | Ok _ -> test_passed name)
+        test_failed name
+          (Printf.sprintf "wrong error — expected 'mempool', got: %s" msg)
+    | Ok _ ->
+      test_failed name "expected Error, got Ok (B6 guard not firing)")
 
 (* -----------------------------------------------------------------------
-   B7 — G7: work-vs-active-chainstate check missing from loadtxoutset
+   B7 — work-vs-active-chainstate guard (FIXED)
 
    Bitcoin Core PopulateAndValidateSnapshot (validation.cpp:5787-5789):
      if (NOT CBlockIndexWorkComparator()(ActiveTip(), snapshot_start_block))
        return error("Work does not exceed active chainstate")
-   camlcoin's handle_loadtxoutset never compares the snapshot's chain work
-   against the current active tip's chain work.  A useless low-height
-   snapshot can be loaded after IBD is already near tip.
+
+   handle_loadtxoutset now compares snapshot total_work against active tip.
+   A snapshot with equal or less work than active tip must be rejected.
+
+   We build a scenario where both the snapshot header and the active tip
+   have the same (zero) total_work, so the snapshot does NOT have more work.
+   To reach B7 we must pass B4, B5, B6 (header in chain, no snapshot_db,
+   empty mempool).
    ----------------------------------------------------------------------- *)
-let test_b7_snapshot_work_vs_active_chainstate_not_checked () =
-  let name = "B7: loadtxoutset does not reject snapshot with less work than tip" in
-  (* Document the absent gate — the handler will fail at whitelist or hash
-     check, never at "work does not exceed active chainstate". *)
+let test_b7_snapshot_work_vs_active_chainstate_checked () =
+  let name = "B7 (fixed): loadtxoutset rejects snapshot with work <= active tip" in
   let (ctx, db, dir) = make_dump_test_ctx () in
+  let au840 = match Assume_utxo.get_assumeutxo_params_mainnet 840_000 with
+    | Some p -> p
+    | None -> failwith "840k params missing"
+  in
+  (* Inject 840k header with zero total_work so snapshot work == active tip work. *)
+  let fake_entry : Sync.header_entry = {
+    header = Camlcoin.Consensus.mainnet.genesis_header;
+    hash = au840.blockhash;
+    height = au840.height;
+    total_work = Cstruct.create 32;  (* zero work — not more than active tip *)
+  } in
+  Hashtbl.replace ctx.chain.Sync.headers
+    (Cstruct.to_string au840.blockhash) fake_entry;
+  (* Set active tip to also have non-zero work so comparison is clear. *)
+  let active_work = Cstruct.create 32 in
+  Cstruct.set_uint8 active_work 0 0x01;  (* small non-zero *)
+  let genesis_entry : Sync.header_entry = {
+    header = Camlcoin.Consensus.mainnet.genesis_header;
+    hash = Camlcoin.Consensus.mainnet.genesis_hash;
+    height = 0;
+    total_work = active_work;
+  } in
+  ctx.chain.Sync.tip <- Some genesis_entry;
+  (* B5: no snapshot_db; B6: empty mempool *)
   let snap_path = unique_dump_path "b7_work" in
   let metadata : Assume_utxo.snapshot_metadata = {
     network_magic = Camlcoin.Consensus.mainnet.magic;
-    base_blockhash = Cstruct.create 32;  (* not whitelisted *)
-    coins_count = 0L;
+    base_blockhash = au840.blockhash;
+    (* Use canonical coins_count so coins_count guard passes, reaching B7. *)
+    coins_count = au840.coins_count;
   } in
   (try Sys.remove snap_path with _ -> ());
   (match Assume_utxo.write_snapshot snap_path metadata
@@ -1647,20 +1729,30 @@ let test_b7_snapshot_work_vs_active_chainstate_not_checked () =
   | Ok () ->
     let result = Rpc.handle_loadtxoutset ctx [`String snap_path] in
     (try Sys.remove snap_path with _ -> ());
+    let snap_db_dir = Filename.concat dir "chainstate_snapshot" in
+    (try ignore (Sys.command (Printf.sprintf "rm -rf %s" snap_db_dir)) with _ -> ());
     cleanup_dump_test_ctx db dir;
     match result with
     | Error msg ->
       let has_work_err =
         try
-          String.length msg >= 4
-          && String.lowercase_ascii (String.sub msg 0 4) = "work"
+          let needle = "Work does not exceed" in
+          let nlen = String.length needle in
+          let mlen = String.length msg in
+          let rec search i =
+            if i + nlen > mlen then false
+            else if String.sub msg i nlen = needle then true
+            else search (i + 1)
+          in
+          search 0
         with _ -> false
       in
-      if has_work_err then
-        test_failed name "Unexpected work error — B7 may be fixed"
+      if has_work_err then test_passed name
       else
-        test_passed name  (* B7 documented *)
-    | Ok _ -> test_passed name)
+        test_failed name
+          (Printf.sprintf "wrong error — expected 'Work does not exceed', got: %s" msg)
+    | Ok _ ->
+      test_failed name "expected Error, got Ok (B7 guard not firing)")
 
 (* -----------------------------------------------------------------------
    B8 — G18+G25: dumptxoutset txoutset_hash uses MuHash3072, not HASH_SERIALIZED
@@ -2024,13 +2116,13 @@ let () =
   test_disconnect_to_target_unknown_target_errors ();
 
   (* W102 AssumeUTXO gate audit tests (B1-B15) *)
-  test_b1_coin_height_exceeds_base_not_rejected ();
-  test_b2_coin_value_exceeds_max_money_not_rejected ();
-  test_b3_trailing_bytes_after_coins_not_detected ();
-  test_b4_base_block_header_chain_membership_not_checked ();
-  test_b5_double_snapshot_activation_not_guarded ();
-  test_b6_mempool_not_checked_before_snapshot_load ();
-  test_b7_snapshot_work_vs_active_chainstate_not_checked ();
+  test_b1_coin_height_exceeds_base_rejected ();
+  test_b2_coin_value_exceeds_max_money_rejected ();
+  test_b3_trailing_bytes_after_coins_rejected ();
+  test_b4_base_block_header_chain_membership_checked ();
+  test_b5_double_snapshot_activation_guarded ();
+  test_b6_mempool_checked_before_snapshot_load ();
+  test_b7_snapshot_work_vs_active_chainstate_checked ();
   test_b8_dumptxoutset_txoutset_hash_is_muhash_not_hash_serialized ();
   test_b9_dumptxoutset_missing_nchaintx_field ();
   test_b10_dumptxoutset_hash_computed_from_restored_not_historical_state ();

@@ -50,7 +50,8 @@ type mempool_entry = {
 
 type orphan_entry = {
   orphan_tx : Types.transaction;
-  orphan_txid : Types.hash256;
+  orphan_txid : Types.hash256;   (* txid — used for parent-resolution lookups *)
+  orphan_wtxid : Types.hash256;  (* wtxid — primary pool key per BIP-339 *)
   orphan_time : float;
 }
 
@@ -79,8 +80,10 @@ type mempool = {
   (* Policy flags — can be relaxed for testing or regtest *)
   require_standard : bool;    (* enforce IsStandard checks *)
   verify_scripts : bool;      (* enforce script verification *)
-  (* Orphan pool *)
-  orphans : (string, orphan_entry) Hashtbl.t;
+  (* Orphan pool — primary key is wtxid_str per BIP-339; secondary index maps
+     txid_str → wtxid_str for fast parent-arrival resolution. *)
+  orphans : (string, orphan_entry) Hashtbl.t;       (* wtxid_str → orphan_entry *)
+  orphan_by_txid : (string, string) Hashtbl.t;      (* txid_str → wtxid_str *)
   max_orphans : int;
   (* Spending index: outpoint (txid_str * vout) -> spending txid_str for O(1) conflict detection *)
   map_next_tx : (string * int32, string) Hashtbl.t;
@@ -225,6 +228,7 @@ let create ?(require_standard=true) ?(verify_scripts=true)
     require_standard;
     verify_scripts;
     orphans = Hashtbl.create 100;
+    orphan_by_txid = Hashtbl.create 100;
     max_orphans = 100;
     map_next_tx = Hashtbl.create 10_000;
     zmq_sequence = 0L;
@@ -2636,14 +2640,18 @@ let accept_to_memory_pool ?(test_accept=false) (mp : mempool) (tx : Types.transa
    Orphan Transaction Pool (Task 8)
    ============================================================================ *)
 
-(* Add a transaction to the orphan pool *)
+(* Add a transaction to the orphan pool.
+   BIP-339: primary key is wtxid so that witness-malleated copies of the same
+   txid are deduplicated while different witnesses map to different entries.
+   A secondary txid→wtxid index allows fast parent-arrival resolution. *)
 let add_orphan (mp : mempool) (tx : Types.transaction) : unit =
   let txid = Crypto.compute_txid tx in
-  let txid_key = Cstruct.to_string txid in
-  if not (Hashtbl.mem mp.orphans txid_key) then begin
+  let wtxid = Crypto.compute_wtxid tx in
+  let wtxid_key = Cstruct.to_string wtxid in
+  (* Dedup by wtxid — reject if this exact witness form is already present *)
+  if not (Hashtbl.mem mp.orphans wtxid_key) then begin
     (* Enforce max orphan count by evicting oldest if full *)
     if Hashtbl.length mp.orphans >= mp.max_orphans then begin
-      (* Evict the oldest orphan *)
       let oldest_key = ref "" in
       let oldest_time = ref max_float in
       Hashtbl.iter (fun k entry ->
@@ -2652,19 +2660,38 @@ let add_orphan (mp : mempool) (tx : Types.transaction) : unit =
           oldest_time := entry.orphan_time
         end
       ) mp.orphans;
-      if !oldest_key <> "" then
+      if !oldest_key <> "" then begin
+        (* Also remove the evicted entry from the secondary txid index *)
+        (match Hashtbl.find_opt mp.orphans !oldest_key with
+         | Some evicted ->
+           let evicted_txid_key = Cstruct.to_string evicted.orphan_txid in
+           Hashtbl.remove mp.orphan_by_txid evicted_txid_key
+         | None -> ());
         Hashtbl.remove mp.orphans !oldest_key
+      end
     end;
     let entry = {
       orphan_tx = tx;
       orphan_txid = txid;
+      orphan_wtxid = wtxid;
       orphan_time = Unix.gettimeofday ();
     } in
-    Hashtbl.replace mp.orphans txid_key entry
+    Hashtbl.replace mp.orphans wtxid_key entry;
+    (* Secondary index: txid_str → wtxid_str for parent-arrival lookups *)
+    let txid_key = Cstruct.to_string txid in
+    Hashtbl.replace mp.orphan_by_txid txid_key wtxid_key
   end
 
+(* Helper: remove an orphan from both the primary (wtxid-keyed) pool and the
+   secondary txid→wtxid index. *)
+let remove_orphan (mp : mempool) (orphan_key : string) (entry : orphan_entry) : unit =
+  Hashtbl.remove mp.orphans orphan_key;
+  let txid_key = Cstruct.to_string entry.orphan_txid in
+  Hashtbl.remove mp.orphan_by_txid txid_key
+
 (* Try to process orphans when a new transaction is accepted.
-   Returns list of successfully added entries. *)
+   Returns list of successfully added entries.
+   Note: inputs reference parent txids (not wtxids), so new_txid is a txid. *)
 let process_orphans (mp : mempool) (new_txid : Types.hash256)
     : mempool_entry list =
   let accepted = ref [] in
@@ -2681,7 +2708,7 @@ let process_orphans (mp : mempool) (new_txid : Types.hash256)
         List.exists (fun e -> Cstruct.equal prev_txid e.txid) !accepted
       ) orphan.orphan_tx.inputs in
       if relevant then begin
-        Hashtbl.remove mp.orphans orphan_key;
+        remove_orphan mp orphan_key orphan;
         match add_transaction mp orphan.orphan_tx with
         | Ok entry ->
           accepted := entry :: !accepted;
@@ -2865,9 +2892,13 @@ let expire_orphans (mp : mempool) : int =
   let now = Unix.gettimeofday () in
   let max_age = 1200.0 in (* 20 minutes *)
   let to_remove = Hashtbl.fold (fun k entry acc ->
-    if now -. entry.orphan_time > max_age then k :: acc else acc
+    if now -. entry.orphan_time > max_age then (k, entry) :: acc else acc
   ) mp.orphans [] in
-  List.iter (Hashtbl.remove mp.orphans) to_remove;
+  List.iter (fun (wtxid_key, entry) ->
+    Hashtbl.remove mp.orphans wtxid_key;
+    let txid_key = Cstruct.to_string entry.orphan_txid in
+    Hashtbl.remove mp.orphan_by_txid txid_key
+  ) to_remove;
   List.length to_remove
 
 (* ============================================================================
@@ -3547,23 +3578,23 @@ let find_1p1c_for_orphan (mp : mempool) (parent_txid : Types.hash256)
 let try_1p1c_with_orphans (mp : mempool) (parent : Types.transaction)
     : package_result =
   let parent_txid = Crypto.compute_txid parent in
-  (* Find orphans that spend this parent *)
+  (* Find orphans that spend this parent — carry the full entry for index cleanup *)
   let candidates = Hashtbl.fold (fun orphan_key entry acc ->
     let spends_parent = List.exists (fun inp ->
       Cstruct.equal inp.Types.previous_output.txid parent_txid
     ) entry.orphan_tx.Types.inputs in
-    if spends_parent then (orphan_key, entry.orphan_tx) :: acc else acc
+    if spends_parent then (orphan_key, entry, entry.orphan_tx) :: acc else acc
   ) mp.orphans [] in
 
   match candidates with
   | [] -> PackageRejected "No orphans available for CPFP"
-  | (orphan_key, child) :: _ ->
+  | (orphan_key, oe, child) :: _ ->
     (* Try to validate as 1p1c package *)
     let result = accept_package mp [parent; child] in
     (match result with
      | PackageAccepted _ | PackagePartial { accepted = _ :: _; _ } ->
-       (* Remove the orphan since it was accepted *)
-       Hashtbl.remove mp.orphans orphan_key
+       (* Remove the orphan (primary + secondary index) since it was accepted *)
+       remove_orphan mp orphan_key oe
      | _ -> ());
     result
 
@@ -3586,7 +3617,7 @@ let process_orphans_with_cpfp (mp : mempool) (new_txid : Types.hash256)
       ) orphan.orphan_tx.Types.inputs in
 
       if relevant then begin
-        Hashtbl.remove mp.orphans orphan_key;
+        remove_orphan mp orphan_key orphan;
         (* Try normal add first *)
         match add_transaction mp orphan.orphan_tx with
         | Ok entry ->

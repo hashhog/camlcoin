@@ -508,11 +508,33 @@ let write_snapshot (path : string) (metadata : snapshot_metadata)
     Returns [Ok n] on success ([n] = coins read), or [Error msg] on
     truncation / format errors. The metadata block must already have been
     consumed by the caller (use [Stream_reader.create] with
-    [start_offset:51]). *)
-let iter_snapshot_coins (sr : Stream_reader.t) ~(coins_count : int64)
+    [start_offset:51]).
+
+    [~base_height] (optional, default [max_int]) — when provided, any coin
+    whose [height > base_height] causes an immediate [Error], mirroring
+    Bitcoin Core [validation.cpp:5814-5819]:
+      if (coin.nHeight > base_height || outpoint.n >= UINT32_MAX)
+        return error("Bad snapshot data after deserializing %d coins")
+
+    B2: every coin's [value] is checked against [MoneyRange]; a coin with
+    [value < 0 || value > MAX_MONEY] causes an immediate [Error], mirroring
+    [validation.cpp:5820-5823]:
+      if (!MoneyRange(coin.out.nValue))
+        return error("Bad snapshot data ... bad tx out value")
+
+    B3: after all declared coins are consumed a trailing-byte probe is
+    attempted.  If the file has further data the load is rejected, mirroring
+    [validation.cpp:5872-5883]:
+      try { coins_file >> left_over_byte; }
+      catch (failure&) { out_of_coins = true; }
+      if (!out_of_coins) return error("coins left over after deserializing N") *)
+let iter_snapshot_coins ?(base_height : int = max_int)
+    (sr : Stream_reader.t) ~(coins_count : int64)
     ~(f : snapshot_coin -> unit) : (int64, string) result =
   let coins_left = ref coins_count in
   let total = ref 0L in
+  (* B2: MAX_MONEY = 21_000_000 BTC in satoshis *)
+  let max_money = 2_100_000_000_000_000L in
   try
     while Int64.compare !coins_left 0L > 0 do
       (* Read the next per-txid group header. The minimum is 32 (txid) +
@@ -545,11 +567,31 @@ let iter_snapshot_coins (sr : Stream_reader.t) ~(coins_count : int64)
         } in
         let coin = deserialize_coin_body r ~outpoint in
         Stream_reader.advance sr ~from_serialize:r;
+        (* B1: coin.height must not exceed the snapshot base_height.
+           Reference: validation.cpp:5814-5819. *)
+        if coin.height > base_height then
+          failwith (Printf.sprintf
+            "Bad snapshot data after deserializing %Ld coins"
+            !total);
+        (* B2: MoneyRange check — coin value must be in [0, MAX_MONEY].
+           Reference: validation.cpp:5820-5823. *)
+        if coin.value < 0L || coin.value > max_money then
+          failwith (Printf.sprintf
+            "Bad snapshot data after deserializing %Ld coins [bad tx out value]"
+            !total);
         f coin;
         coins_left := Int64.sub !coins_left 1L;
         total := Int64.add !total 1L
       done
     done;
+    (* B3: trailing-bytes probe.  After consuming exactly [coins_count] coins,
+       try to read one more byte.  If the file has further data the snapshot
+       is malformed.  Reference: validation.cpp:5872-5883. *)
+    let trailing = Stream_reader.ensure_soft sr ~target:1 in
+    if trailing > 0 then
+      failwith (Printf.sprintf
+        "coins left over after deserializing %Ld coins from snapshot"
+        !total);
     Ok !total
   with
   | Failure msg -> Error msg
@@ -677,7 +719,7 @@ let load_snapshot ~(network : Consensus.network_config)
           let coins_loaded = ref 0L in
           let progress_step = 10_000 in
           let since_progress = ref 0 in
-          let res = iter_snapshot_coins sr ~coins_count:total
+          let res = iter_snapshot_coins ~base_height:params.height sr ~coins_count:total
             ~f:(fun coin ->
               let utxo_coin = {
                 Utxo.txout = {

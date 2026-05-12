@@ -327,26 +327,117 @@ let test_g15_full_validation_flags () =
   Alcotest.(check bool) "G15: full validation used on P2P blocks" true true
 
 (* ============================================================================
-   G16  BLOCK_MUTATED → no Misbehaving — PASS (matches Core)
+   G16  FIXED: BLOCK_MUTATED → no Misbehaving (matches Core)
+   Witness-mutated blocks (bad-witness-merkle-match, bad-witness-nonce-size,
+   unexpected-witness) must NOT score the sender — the block may have been
+   legitimately stripped in transit.  process_new_block skips the handler for
+   these error variants.
    ============================================================================ *)
 
 let test_g16_block_mutated_not_punished () =
-  Alcotest.(check bool) "G16: BLOCK_MUTATED correctly not punished" true true
+  (* Verify that a BLOCK_MUTATED (witness-commitment) failure from
+     process_new_block does NOT invoke the misbehavior_handler. *)
+  let path = unique_test_db_path "g16" in
+  cleanup_dir path;
+  let db = Storage.ChainDB.create path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let scored = ref false in
+  let handler _pid _infraction = scored := true in
+  (* Build a minimal block with a bad witness commitment so accept_block
+     returns BlockBadWitnessCommitment — the canonical BLOCK_MUTATED class.
+     We use the genesis coinbase structure and append a bogus scriptWitness
+     on the coinbase so the nonce-size check fires before the merkle check. *)
+  let genesis = Consensus.regtest.genesis_header in
+  let bad_witness_item = Cstruct.create 31 in  (* 31 bytes, not 32 → bad-nonce-size *)
+  let cb_tx = Types.{
+    version = 1l;
+    inputs = [{
+      previous_output = { txid = Cstruct.create 32; vout = 0xFFFFFFFFl };
+      script_sig = Cstruct.of_string "\x03\x00\x00\x00";
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [{ value = 5_000_000_000L;
+                 script_pubkey = Cstruct.of_string "\x51" }];
+    witnesses = [Types.{ items = [bad_witness_item] }];
+    locktime = 0l;
+  } in
+  let txid = Crypto.compute_txid cb_tx in
+  let (merkle_root, _) = Crypto.merkle_root [txid] in
+  let header = Types.{
+    genesis with
+    prev_block = Crypto.compute_block_hash genesis;
+    merkle_root;
+    timestamp = Int32.add genesis.timestamp 1l;
+  } in
+  let block = Types.{ header; transactions = [cb_tx] } in
+  let _result = Sync.process_new_block ~peer_id:42
+    ~misbehavior_handler:handler state block in
+  Storage.ChainDB.close db;
+  cleanup_dir path;
+  Alcotest.(check bool)
+    "G16 FIXED: BLOCK_MUTATED (bad-nonce-size) does NOT score peer" false !scored
 
 (* ============================================================================
-   G17  BUG: misbehavior_handler in ibd_state drops score parameter
-   Type is (int -> string -> unit) not (int -> int -> string -> unit).
-   All IBD-path misbehaving calls are routed through record_misbehavior_for
-   which maps string→int via a fixed lookup table.  Custom per-callsite scores
-   are impossible through this interface.
+   G17  FIXED: process_new_block now accepts misbehavior_handler + peer_id;
+   non-BLOCK_MUTATED failures call handler with "invalid_block" (score 100).
    ============================================================================ *)
 
 let test_g17_misbehavior_score_constants () =
   (* The predefined scores are correct: *)
   Alcotest.(check int) "G17: invalid_block = 100" 100 Peer.misbehavior_invalid_block;
   Alcotest.(check int) "G17: invalid_header = 20"  20 Peer.misbehavior_invalid_header;
-  (* But the handler type in ibd_state drops the score — documented as BUG. *)
-  Alcotest.(check bool) "G17 BUG: ibd handler drops score (architectural gap)" true true
+  (* FIXED: process_new_block now accepts misbehavior_handler; a block with a
+     provably invalid header (bad difficulty) DOES score the peer. *)
+  let path = unique_test_db_path "g17" in
+  cleanup_dir path;
+  let db = Storage.ChainDB.create path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let scored_peer = ref (-1) in
+  let scored_infraction = ref "" in
+  let handler pid infraction =
+    scored_peer := pid;
+    scored_infraction := infraction
+  in
+  (* Build a height-1 block that:
+     - has the genesis as prev_block (so validate_header succeeds on the fly)
+     - has a zeroed merkle root (wrong) so accept_block returns BlockBadMerkleRoot
+     - carries a coinbase with the correct BIP34 height=1 encoding (OP_1 = 0x51)
+     BlockBadMerkleRoot is a non-BLOCK_MUTATED error, so the misbehavior handler
+     must be called with infraction "invalid_block". *)
+  let genesis_header = Consensus.regtest.genesis_header in
+  let genesis_hash = Crypto.compute_block_hash genesis_header in
+  let h1 = Types.{
+    version = 4l;
+    prev_block = genesis_hash;
+    merkle_root = Cstruct.create 32;   (* deliberately wrong → BlockBadMerkleRoot *)
+    timestamp = Int32.add genesis_header.timestamp 1200l;
+    bits = 0x207fffffl;
+    nonce = 0l;
+  } in
+  let cb1 = Types.{
+    version = 1l;
+    inputs = [{
+      previous_output = { txid = Cstruct.create 32; vout = 0xFFFFFFFFl };
+      script_sig = Cstruct.of_string "\x51\x00";  (* OP_1 = BIP34 height=1 encoding *)
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [{ value = 5_000_000_000L;
+                 script_pubkey = Cstruct.of_string "\x51" }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let block = Types.{ header = h1; transactions = [cb1] } in
+  let result = Sync.process_new_block ~peer_id:99
+    ~misbehavior_handler:handler state block in
+  let result_str = match result with Ok () -> "Ok()" | Error e -> "Error(" ^ e ^ ")" in
+  Storage.ChainDB.close db;
+  cleanup_dir path;
+  if !scored_peer = -1 then
+    Alcotest.failf "G17: handler never called. process_new_block returned: %s" result_str;
+  Alcotest.(check int)
+    "G17 FIXED: non-BLOCK_MUTATED failure scores peer 99" 99 !scored_peer;
+  Alcotest.(check string)
+    "G17 FIXED: infraction = invalid_block" "invalid_block" !scored_infraction
 
 (* ============================================================================
    G18  Fork → not InvalidateBlock — PASS (by design)

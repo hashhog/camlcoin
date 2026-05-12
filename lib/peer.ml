@@ -267,6 +267,8 @@ type peer = {
   mutable cmpct_high_bandwidth : bool; (* Peer wants high-bandwidth compact blocks *)
   mutable cmpct_version : int64;    (* Compact block protocol version *)
   mutable block_relay_only : bool;  (* Block-relay-only connection (no tx relay) *)
+  no_ban : bool;                     (* NoBan permission — never ban, only disconnect *)
+  is_manual : bool;                  (* Manually-added peer — never ban, only disconnect *)
   (* BIP-331 package relay: peer announced sendpackages support. *)
   mutable sendpackages_received : bool;
   mutable pkg_relay_version : int64;
@@ -322,10 +324,21 @@ let poisson_delay (avg : float) : float =
   let u_safe = max u 1e-10 in
   ~-.(Float.log u_safe) *. avg
 
+(* Detect local (loopback) address strings for the noban/manual exemption *)
+let is_addr_local (addr : string) : bool =
+  addr = "127.0.0.1" || addr = "::1" ||
+  (* IPv4-mapped loopback ::ffff:127.x.x.x *)
+  (let n = String.length addr in
+   n >= 7 && String.sub addr 0 7 = "::ffff:" &&
+   (let rest = String.sub addr 7 (n - 7) in
+    String.length rest >= 3 && String.sub rest 0 3 = "127"))
+
 (* Create a peer from an already-connected fd (used for both outbound and inbound) *)
 let make_peer ~(network : Consensus.network_config) ~(addr : string)
     ~(port : int) ~(id : int) ~(direction : peer_direction)
-    ~(fd : Lwt_unix.file_descr) : peer =
+    ~(fd : Lwt_unix.file_descr)
+    ?(no_ban : bool = false) ?(is_manual : bool = false)
+    () : peer =
   let ic = Lwt_io.of_fd ~mode:Lwt_io.Input fd in
   let oc = Lwt_io.of_fd ~mode:Lwt_io.Output fd in
   let avg_interval = match direction with
@@ -351,6 +364,8 @@ let make_peer ~(network : Consensus.network_config) ~(addr : string)
     sendaddrv2 = false;
     misbehavior_score = 0;
     direction;
+    no_ban;
+    is_manual;
     feefilter = 0L;
     fee_filter_sent = 0L;
     next_send_feefilter = Unix.gettimeofday () +. poisson_delay avg_feefilter_broadcast_interval;
@@ -401,7 +416,7 @@ let connect ~(network : Consensus.network_config) ~(addr : string)
         Lwt.fail_with "Connection timeout" in
       let do_connect = Lwt_unix.connect fd ai.ai_addr in
       let* () = Lwt.pick [do_connect; timeout] in
-      Lwt.return (make_peer ~network ~addr ~port ~id ~direction:Outbound ~fd))
+      Lwt.return (make_peer ~network ~addr ~port ~id ~direction:Outbound ~fd ()))
     (fun exn ->
       let* () = Lwt.catch
         (fun () -> Lwt_unix.close fd)
@@ -427,7 +442,7 @@ let connect_with_proxy ~(network : Consensus.network_config) ~(addr : string)
   let* fd = Lwt.pick [do_connect; timeout] in
   Lwt.catch
     (fun () ->
-      Lwt.return (make_peer ~network ~addr ~port ~id ~direction:Outbound ~fd))
+      Lwt.return (make_peer ~network ~addr ~port ~id ~direction:Outbound ~fd ()))
     (fun exn ->
       let* () = Lwt.catch
         (fun () -> Lwt_unix.close fd)
@@ -1283,12 +1298,23 @@ let ping_timed_out (peer : peer) : bool =
     Unix.gettimeofday () -. peer.last_ping > ping_timeout
   | None -> false
 
-(* Record misbehavior for a peer.  Returns `Ban if the accumulated score
-   reaches the threshold (>= 100), otherwise `Ok. *)
+(* Record misbehavior for a peer.
+   Returns:
+     `Ok            — below threshold; keep connection
+     `Ban           — threshold reached on a regular inbound peer; ban + disconnect
+     `DisconnectOnly — threshold reached but peer is NoBan, manually-added, or
+                       local (loopback); disconnect without adding to ban table
+                       (mirrors Bitcoin Core MaybeDiscourageAndDisconnect) *)
 let record_misbehavior (peer : peer) (score : int)
-    : [`Ok | `Ban] =
+    : [`Ok | `Ban | `DisconnectOnly] =
   peer.misbehavior_score <- peer.misbehavior_score + score;
-  if peer.misbehavior_score >= 100 then `Ban else `Ok
+  if peer.misbehavior_score >= 100 then begin
+    if peer.no_ban || peer.is_manual || is_addr_local peer.addr then
+      `DisconnectOnly
+    else
+      `Ban
+  end else
+    `Ok
 
 (* Misbehavior scoring categories (Gap 14) *)
 let misbehavior_invalid_block = 100
@@ -1300,7 +1326,7 @@ let misbehavior_headers_dont_connect = 20
 let misbehavior_block_download_stall = 50
 let misbehavior_unrequested_data = 5
 
-let record_misbehavior_for (peer : peer) (infraction : string) : [`Ok | `Ban] =
+let record_misbehavior_for (peer : peer) (infraction : string) : [`Ok | `Ban | `DisconnectOnly] =
   let score = match infraction with
     | "invalid_block" -> misbehavior_invalid_block
     | "invalid_header" -> misbehavior_invalid_header
@@ -1316,7 +1342,9 @@ let record_misbehavior_for (peer : peer) (infraction : string) : [`Ok | `Ban] =
 
 (* Misbehaving: record misbehavior, log it, and disconnect if score reaches threshold.
    This is the async version that handles disconnection. The ban itself should be
-   handled by peer_manager which has access to the ban table. *)
+   handled by peer_manager which has access to the ban table.
+   NoBan / manual / local peers are only disconnected, never banned — mirrors
+   Bitcoin Core net_processing.cpp:5083 MaybeDiscourageAndDisconnect. *)
 let misbehaving (peer : peer) (score : int) (message : string) : unit Lwt.t =
   let open Lwt.Syntax in
   peer.misbehavior_score <- peer.misbehavior_score + score;
@@ -1324,10 +1352,21 @@ let misbehaving (peer : peer) (score : int) (message : string) : unit Lwt.t =
   Log.info (fun m -> m "Misbehaving: peer=%d score=%d total=%d%s"
     peer.id score peer.misbehavior_score message_prefixed);
   if peer.misbehavior_score >= 100 then begin
-    Log.info (fun m -> m "Disconnecting misbehaving peer %d (%s) total_score=%d"
-      peer.id peer.addr peer.misbehavior_score);
-    let* () = disconnect peer in
-    Lwt.return_unit
+    (* NoBan / manual / local → disconnect only, no ban entry *)
+    if peer.no_ban || peer.is_manual then begin
+      Log.info (fun m -> m "Disconnecting (no-ban) peer %d (%s) total_score=%d"
+        peer.id peer.addr peer.misbehavior_score);
+      disconnect peer
+    end else if is_addr_local peer.addr then begin
+      Log.info (fun m -> m "Disconnecting (local) peer %d (%s) total_score=%d — no ban"
+        peer.id peer.addr peer.misbehavior_score);
+      disconnect peer
+    end else begin
+      Log.info (fun m -> m "Disconnecting misbehaving peer %d (%s) total_score=%d"
+        peer.id peer.addr peer.misbehavior_score);
+      let* () = disconnect peer in
+      Lwt.return_unit
+    end
   end else
     Lwt.return_unit
 

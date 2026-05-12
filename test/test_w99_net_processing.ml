@@ -9,8 +9,8 @@
        stopping requests to this peer.
    G12 DOS         — orphan TX expiry = 1200s (20 min); Core uses 5 min.
        Malicious peers can hold 100 orphan slots for 4× longer.
-   G14 CORRECTNESS — orphan TX pool keyed by txid not wtxid; witness-malleated
-       duplicates not deduplicated (BIP-339 regression).
+   G14 CORRECTNESS — FIXED: orphan TX pool now keyed by wtxid per BIP-339;
+       both malleated variants stored; secondary txid→wtxid index maintained.
    G17 CORRECTNESS — ibd_state.misbehavior_handler type is (int -> string -> unit)
        dropping the score; callers cannot pass custom scores.
    G24 OBSERVABILITY — unknown post-handshake messages produce no log entry.
@@ -262,15 +262,60 @@ let test_g13_recursive_orphan_exported () =
   Alcotest.(check bool) "G13: process_orphans callable" true true
 
 (* ============================================================================
-   G14  BUG: Orphan TX pool keyed by txid, not wtxid
-   orphan_entry has no wtxid field; add_orphan keys by Cstruct.to_string txid.
-   Witness-malleated duplicates are not deduplicated.
+   G14  FIXED: Orphan TX pool keyed by wtxid per BIP-339
+   Primary key = wtxid so witness-malleated duplicates get distinct slots.
+   Secondary txid→wtxid index keeps parent-arrival resolution intact.
    ============================================================================ *)
 
 let test_g14_orphan_pool_keyed_by_txid () =
-  (* Confirmed by reading mempool.ml: orphan_entry = { orphan_tx; orphan_txid; orphan_time }
-     — no orphan_wtxid field.  add_orphan uses Cstruct.to_string txid as key. *)
-  Alcotest.(check bool) "G14 BUG: orphan keyed by txid not wtxid (design gap)" true true
+  let path = unique_test_db_path "g14" in
+  cleanup_dir path;
+  let db = Storage.ChainDB.create path in
+  let utxo = Utxo.UtxoSet.create db in
+  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+             ~utxo ~current_height:0 () in
+  (* Build a minimal transaction with a missing parent — it will be orphaned.
+     Two copies: tx_a has no witness data, tx_b has a dummy witness stack.
+     They share the same inputs/outputs so txid is identical, but wtxid differs
+     because tx_b carries witness data. *)
+  let fake_parent_txid = Cstruct.create 32 in  (* zero hash — parent not in UTXO *)
+  let mk_tx witnesses =
+    Types.{
+      version = 1l;
+      inputs = [{
+        previous_output = { txid = fake_parent_txid; vout = 0l };
+        script_sig = Cstruct.empty;
+        sequence = 0xFFFFFFFFl;
+      }];
+      outputs = [{ value = 50_000L; script_pubkey = Cstruct.of_string "\x51" }];
+      witnesses;
+      locktime = 0l;
+    }
+  in
+  let tx_a = mk_tx [] in   (* no witness — legacy serialisation *)
+  let tx_b = mk_tx [Types.{ items = [Cstruct.of_string "\x01"] }] in (* witness-malleated variant *)
+  (* txid is the same for tx_a and tx_b (non-witness serialisation identical) *)
+  let txid_a = Crypto.compute_txid tx_a in
+  let txid_b = Crypto.compute_txid tx_b in
+  Alcotest.(check bool) "G14: txid_a = txid_b (same non-witness content)"
+    true (Cstruct.equal txid_a txid_b);
+  (* wtxid differs because the witness stack differs *)
+  let wtxid_a = Crypto.compute_wtxid tx_a in
+  let wtxid_b = Crypto.compute_wtxid tx_b in
+  Alcotest.(check bool) "G14: wtxid_a ≠ wtxid_b (different witnesses)"
+    false (Cstruct.equal wtxid_a wtxid_b);
+  (* Add both to the orphan pool *)
+  Mempool.add_orphan mp tx_a;
+  Mempool.add_orphan mp tx_b;
+  (* Both must be present: primary key is wtxid, so neither clobbers the other *)
+  Alcotest.(check int) "G14 FIXED: both malleated variants stored (pool size = 2)"
+    2 (Mempool.orphan_count mp);
+  (* Re-adding tx_a (same wtxid) must NOT grow the pool *)
+  Mempool.add_orphan mp tx_a;
+  Alcotest.(check int) "G14 FIXED: identical re-add deduplicated by wtxid (pool size = 2)"
+    2 (Mempool.orphan_count mp);
+  Storage.ChainDB.close db;
+  cleanup_dir path
 
 (* ============================================================================
    G15  ProcessNewBlock flags: skip_scripts=false — PASS
@@ -519,7 +564,7 @@ let () =
       Alcotest.test_case "process_orphans_callable" `Quick test_g13_recursive_orphan_exported;
     ];
     "G14_wtxid_orphan", [
-      Alcotest.test_case "BUG_txid_key_not_wtxid" `Quick test_g14_orphan_pool_keyed_by_txid;
+      Alcotest.test_case "FIXED_wtxid_primary_key_bip339" `Quick test_g14_orphan_pool_keyed_by_txid;
     ];
     "G15_block_flags", [
       Alcotest.test_case "full_validation" `Quick test_g15_full_validation_flags;

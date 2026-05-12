@@ -4315,7 +4315,10 @@ let rec connect_stored_blocks (state : chain_state) : int =
             m "Stored block at height %d failed validation: %s" next_height msg);
           0
 
-let process_new_block ?(f_requested = false) (state : chain_state)
+let process_new_block ?(f_requested = false)
+    ?(peer_id : int option)
+    ?(misbehavior_handler : (int -> string -> unit) option)
+    (state : chain_state)
     (block : Types.block) : (unit, string) result =
   let hash = Crypto.compute_block_hash block.header in
   let hash_key = Cstruct.to_string hash in
@@ -4497,6 +4500,23 @@ let process_new_block ?(f_requested = false) (state : chain_state)
           Logs.warn (fun m ->
             m "Block %s at height %d failed validation: %s"
               (Types.hash256_to_hex_display hash) height msg);
+          (* G16/G17 fix: Misbehaving on BLOCK_INVALID_HEADER and BLOCK_FAILED_VALID
+             (matching Bitcoin Core's InvalidBlockFound / MaybePunishNodeForBlock).
+             BLOCK_MUTATED errors (witness commitment, nonce-size, unexpected-witness)
+             are NOT scored — the peer may have received a legitimately stripped block
+             and is not at fault.  All other validation failures indicate the peer
+             sent a provably invalid block and should be penalised at score 100.
+             Reference: bitcoin-core/src/net_processing.cpp MaybePunishNodeForBlock. *)
+          let is_mutated = match e with
+            | Validation.BlockBadWitnessCommitment
+            | Validation.BlockBadWitnessNonceSize
+            | Validation.BlockUnexpectedWitness -> true
+            | _ -> false
+          in
+          if not is_mutated then
+            (match peer_id, misbehavior_handler with
+             | Some pid, Some handler -> handler pid "invalid_block"
+             | _ -> ());
           Error msg
       end
   end

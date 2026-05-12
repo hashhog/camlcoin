@@ -877,11 +877,13 @@ let test_make_tx_inv () =
   Alcotest.(check bool) "hash matches" true (Cstruct.equal hash entry.hash);
   Alcotest.(check (option int64)) "fee_rate set" (Some 2500L) entry.fee_rate
 
-(* Test make_tx_inv with witness *)
+(* Test make_tx_inv with witness — must use InvWtx (MSG_WTX=5), not legacy InvWitnessTx *)
 let test_make_tx_inv_witness () =
   let hash = Cstruct.create 32 in
   let entry = Peer.make_tx_inv ~witness:true hash 3000L in
-  Alcotest.(check bool) "inv_type is InvWitnessTx" true (entry.inv_type = P2p.InvWitnessTx);
+  (* BIP-339 / Core protocol.h: wtxid-relay inv uses MSG_WTX = 5 (InvWtx),
+     NOT the legacy MSG_WITNESS_TX = 0x40000001 (InvWitnessTx). *)
+  Alcotest.(check bool) "inv_type is InvWtx (MSG_WTX=5)" true (entry.inv_type = P2p.InvWtx);
   Alcotest.(check (option int64)) "fee_rate set" (Some 3000L) entry.fee_rate
 
 (* Test make_block_inv helper function *)

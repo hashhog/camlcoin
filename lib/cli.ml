@@ -941,6 +941,15 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
               (Int64.of_int result.Mempool.atmp_vsize)
           else 0L
         in
+        (* Compute wtxid once for the relay loop.
+           BIP-339 / Core net_processing.cpp RelayTransaction:
+             const uint256& hash{peer.m_wtxid_relay ? wtxid.ToUint256() : txid.ToUint256()}
+           wtxid-relay peers must receive InvWtx (MSG_WTX=5) with the wtxid;
+           legacy peers receive InvTx (MSG_TX=1) with the txid. *)
+        let atmp_wtxid =
+          (try Crypto.compute_wtxid tx with _ -> result.Mempool.atmp_txid)
+        in
+        let txid = result.Mempool.atmp_txid in
         (* Relay inv to all ready peers except the sender *)
         let ready = Peer_manager.get_ready_peers peer_manager in
         Lwt_list.iter_p (fun relay_peer ->
@@ -949,12 +958,12 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
              && not relay_peer.Peer.block_relay_only
              && fee_rate_kvb >= relay_peer.Peer.feefilter then
             Lwt.catch (fun () ->
-              let inv_type =
-                if relay_peer.Peer.wtxid_relay then P2p.InvWitnessTx
-                else P2p.InvTx
+              let (inv_type, hash) =
+                if relay_peer.Peer.wtxid_relay then (P2p.InvWtx, atmp_wtxid)
+                else (P2p.InvTx, txid)
               in
               Peer.send_message relay_peer
-                (P2p.InvMsg [{ P2p.inv_type; hash = result.Mempool.atmp_txid }])
+                (P2p.InvMsg [{ P2p.inv_type; hash }])
             ) (fun _exn -> Lwt.return_unit)
           else
             Lwt.return_unit
@@ -971,9 +980,10 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     | P2p.InvMsg items when chain.sync_state = Sync.FullySynced ->
       (* Request unknown transactions announced via inv *)
       let tx_requests = List.filter_map (fun (iv : P2p.inv_vector) ->
-        if (iv.inv_type = P2p.InvTx || iv.inv_type = P2p.InvWitnessTx)
+        if (iv.inv_type = P2p.InvTx || iv.inv_type = P2p.InvWtx
+            || iv.inv_type = P2p.InvWitnessTx)
            && not (Mempool.contains mempool iv.hash) then
-          Some { P2p.inv_type = P2p.InvWitnessTx; hash = iv.hash }
+          Some { P2p.inv_type = P2p.InvWtx; hash = iv.hash }
         else
           None
       ) items in

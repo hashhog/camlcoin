@@ -1186,7 +1186,9 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
             (match Peer.record_misbehavior_for peer infraction with
              | `Ok -> ()
              | `Ban ->
-               Lwt.async (fun () -> Peer_manager.ban_peer peer_manager peer_id ()))
+               Lwt.async (fun () -> Peer_manager.ban_peer peer_manager peer_id ())
+             | `DisconnectOnly ->
+               Lwt.async (fun () -> Peer_manager.remove_peer peer_manager peer_id))
           | None -> ()
         in
         let* () = Sync.start_ibd ~utxo_set:optimized_utxo

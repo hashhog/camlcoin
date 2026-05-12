@@ -24,10 +24,10 @@ open Camlcoin
    Helpers
    ============================================================================ *)
 
-let make_test_peer ?(direction = Peer.Outbound) () =
+let make_test_peer ?(direction = Peer.Inbound) () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-  Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction ~fd
+  Peer.make_peer ~network:Consensus.mainnet ~addr:"1.2.3.4"
+    ~port:8333 ~id:0 ~direction ~fd ()
 
 (* Unique temp-dir per test invocation to avoid RocksDB lock contention *)
 let unique_test_db_path label =
@@ -69,29 +69,60 @@ let test_g1_below_threshold_ok () =
   Alcotest.(check bool) "G1: 99 = Ok (not yet banned)" true (result = `Ok)
 
 (* ============================================================================
-   G2  BUG: No noban/manual/outbound protection in misbehaving path
+   G2  FIXED: noban/manual/local protection in misbehaving path
    Bitcoin Core's MaybeDiscourageAndDisconnect (net_processing.cpp:5083)
-   exempts NoBan and manually-connected peers from ban.  camlcoin bans all
-   peers unconditionally.
+   exempts NoBan and manually-connected peers from ban.  camlcoin now
+   mirrors this: no_ban=true and is_manual=true peers return `DisconnectOnly;
+   local-address peers return `DisconnectOnly; regular inbound returns `Ban.
    ============================================================================ *)
 
-let test_g2_bug_outbound_banned_same_as_inbound () =
-  let out_peer = make_test_peer ~direction:Peer.Outbound () in
-  let in_peer  = make_test_peer ~direction:Peer.Inbound  () in
-  let r_out = Peer.record_misbehavior out_peer 100 in
-  let r_in  = Peer.record_misbehavior in_peer  100 in
-  (* BUG: both return `Ban — no direction-based exemption *)
-  Alcotest.(check bool) "G2 BUG: outbound returns Ban (should only disconnect)" true
-    (r_out = `Ban);
-  Alcotest.(check bool) "G2 reference: inbound returns Ban" true
-    (r_in = `Ban)
+let make_test_peer_noban () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Peer.make_peer ~network:Consensus.mainnet ~addr:"1.2.3.4"
+    ~port:8333 ~id:1 ~direction:Peer.Inbound ~fd ~no_ban:true ()
 
-let test_g2_peer_has_no_noban_flag () =
-  (* The peer record has no noban/permission field — gap confirmed *)
-  let peer = make_test_peer () in
-  let stats = Peer.get_stats peer in
-  (* misbehavior score is accessible; there is no permission field *)
-  Alcotest.(check int) "G2: initial misbehavior_score = 0" 0 stats.stat_misbehavior
+let make_test_peer_manual () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Peer.make_peer ~network:Consensus.mainnet ~addr:"1.2.3.4"
+    ~port:8333 ~id:2 ~direction:Peer.Outbound ~fd ~is_manual:true ()
+
+let make_test_peer_local () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:3 ~direction:Peer.Inbound ~fd ()
+
+let make_test_peer_regular_inbound () =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Peer.make_peer ~network:Consensus.mainnet ~addr:"1.2.3.4"
+    ~port:8333 ~id:4 ~direction:Peer.Inbound ~fd ()
+
+(* Case 1: NoBan peer — returns DisconnectOnly, never Ban *)
+let test_g2_noban_no_ban () =
+  let peer = make_test_peer_noban () in
+  let result = Peer.record_misbehavior peer 100 in
+  Alcotest.(check bool) "G2: noban peer returns DisconnectOnly (not Ban)" true
+    (result = `DisconnectOnly)
+
+(* Case 2: Manual peer — returns DisconnectOnly, never Ban *)
+let test_g2_manual_no_ban () =
+  let peer = make_test_peer_manual () in
+  let result = Peer.record_misbehavior peer 100 in
+  Alcotest.(check bool) "G2: manual peer returns DisconnectOnly (not Ban)" true
+    (result = `DisconnectOnly)
+
+(* Case 3: Local address — returns DisconnectOnly, never Ban *)
+let test_g2_local_disconnect_only () =
+  let peer = make_test_peer_local () in
+  let result = Peer.record_misbehavior peer 100 in
+  Alcotest.(check bool) "G2: local peer returns DisconnectOnly (not Ban)" true
+    (result = `DisconnectOnly)
+
+(* Case 4: Regular inbound — returns Ban as before *)
+let test_g2_regular_inbound_banned () =
+  let peer = make_test_peer_regular_inbound () in
+  let result = Peer.record_misbehavior peer 100 in
+  Alcotest.(check bool) "G2: regular inbound peer returns Ban" true
+    (result = `Ban)
 
 (* ============================================================================
    G3  Persistent ban DB — PASS
@@ -449,8 +480,10 @@ let () =
       Alcotest.test_case "99_still_ok"          `Quick test_g1_below_threshold_ok;
     ];
     "G2_noban_protections", [
-      Alcotest.test_case "BUG_outbound_banned_same" `Quick test_g2_bug_outbound_banned_same_as_inbound;
-      Alcotest.test_case "no_permission_field"      `Quick test_g2_peer_has_no_noban_flag;
+      Alcotest.test_case "noban_no_op"           `Quick test_g2_noban_no_ban;
+      Alcotest.test_case "manual_no_op"          `Quick test_g2_manual_no_ban;
+      Alcotest.test_case "local_disconnect_only" `Quick test_g2_local_disconnect_only;
+      Alcotest.test_case "regular_inbound_ban"   `Quick test_g2_regular_inbound_banned;
     ];
     "G3_ban_scores", [
       Alcotest.test_case "scores_defined" `Quick test_g3_ban_scores_defined;

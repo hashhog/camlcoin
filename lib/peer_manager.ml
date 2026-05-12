@@ -973,7 +973,9 @@ let get_banned_list (pm : t) : (string * float) list =
       acc
   ) pm.known_addrs []
 
-(* Record misbehavior for a peer.  Bans the peer if accumulated score >= 100. *)
+(* Record misbehavior for a peer.  Bans the peer if accumulated score >= 100.
+   NoBan / manually-connected / local peers are only disconnected (no ban entry)
+   — mirrors Bitcoin Core MaybeDiscourageAndDisconnect (net_processing.cpp:5083). *)
 let record_peer_misbehavior (pm : t) (peer_id : int) (score : int)
     (_reason : string) : unit Lwt.t =
   match List.find_opt (fun p -> p.Peer.id = peer_id) pm.peers with
@@ -981,7 +983,8 @@ let record_peer_misbehavior (pm : t) (peer_id : int) (score : int)
   | Some peer ->
     (match Peer.record_misbehavior peer score with
      | `Ok -> Lwt.return_unit
-     | `Ban -> ban_peer pm peer_id ())
+     | `Ban -> ban_peer pm peer_id ()
+     | `DisconnectOnly -> remove_peer pm peer_id)
 
 (* Get a misbehavior handler callback suitable for use from sync.ml etc.
    Usage: let handler = get_misbehavior_handler pm in handler peer_id score reason *)
@@ -1870,7 +1873,7 @@ let accept_inbound (pm : t) (client_fd : Lwt_unix.file_descr)
     let now = Unix.gettimeofday () in
     Lwt.catch (fun () ->
       let peer = Peer.make_peer ~network:pm.network ~addr:addr_str ~port
-        ~id ~direction:Peer.Inbound ~fd:client_fd in
+        ~id ~direction:Peer.Inbound ~fd:client_fd () in
       (* Negotiated handshake: peeks 16 bytes to classify v1 vs v2 (BIP-324
          responder).  Falls through to perform_inbound_handshake when the
          peer sends a v1 VERSION header or when CAMLCOIN_BIP324_V2_INBOUND

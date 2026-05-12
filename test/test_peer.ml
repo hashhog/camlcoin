@@ -175,12 +175,13 @@ let test_misbehavior_scores () =
   Alcotest.(check int) "spam = 5" 5
     Peer.misbehavior_spam
 
-(* Test record_misbehavior accumulation *)
+(* Test record_misbehavior accumulation — uses a non-local inbound peer so
+   threshold crossing returns `Ban (not `DisconnectOnly). *)
 let test_record_misbehavior_accumulation () =
   (* Create a dummy peer for testing *)
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"1.2.3.4"
+    ~port:8333 ~id:0 ~direction:Peer.Inbound ~fd () in
   (* Initial score is 0 *)
   let stats = Peer.get_stats peer in
   Alcotest.(check int) "initial score" 0 stats.stat_misbehavior;
@@ -200,11 +201,11 @@ let test_record_misbehavior_accumulation () =
   let stats = Peer.get_stats peer in
   Alcotest.(check int) "score = 100" 100 stats.stat_misbehavior
 
-(* Test record_misbehavior_for categories *)
+(* Test record_misbehavior_for categories — uses a non-local inbound peer. *)
 let test_record_misbehavior_for () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"1.2.3.4"
+    ~port:8333 ~id:0 ~direction:Peer.Inbound ~fd () in
   (* Test invalid_block triggers immediate ban *)
   let result = Peer.record_misbehavior_for peer "invalid_block" in
   Alcotest.(check bool) "banned for invalid_block" true (result = `Ban);
@@ -215,7 +216,7 @@ let test_record_misbehavior_for () =
 let test_record_misbehavior_for_unknown () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   (* Unknown infraction adds 1 point *)
   let result = Peer.record_misbehavior_for peer "something_weird" in
   Alcotest.(check bool) "not banned for unknown" true (result = `Ok);
@@ -226,7 +227,7 @@ let test_record_misbehavior_for_unknown () =
 let test_peer_info_misbehavior () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   let _ = Peer.record_misbehavior peer 42 in
   let info = Peer.peer_info peer in
   (* Check that the info string contains misb=42 somewhere *)
@@ -237,7 +238,7 @@ let test_peer_info_misbehavior () =
 let test_handshake_fields_init () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   Alcotest.(check bool) "handshake not complete" false peer.handshake_complete;
   Alcotest.(check bool) "version not received" false peer.version_received;
   (* our_nonce should be non-zero (random) *)
@@ -257,7 +258,7 @@ let test_min_protocol_version () =
 let test_dispatch_pre_handshake_ping () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   (* Peer starts with handshake_complete = false and version_received = false *)
   let msg = P2p.PingMsg 12345L in
   let result = Lwt_main.run (Peer.dispatch_message peer msg) in
@@ -272,7 +273,7 @@ let test_dispatch_pre_handshake_ping () =
 let test_dispatch_pre_handshake_version () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   let version_msg : Types.version_msg = {
     protocol_version = 70016l;
     services = 9L;  (* NODE_NETWORK | NODE_WITNESS *)
@@ -296,7 +297,7 @@ let test_dispatch_pre_handshake_version () =
 let test_dispatch_duplicate_version () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   let version_msg : Types.version_msg = {
     protocol_version = 70016l;
     services = 9L;
@@ -323,7 +324,7 @@ let test_dispatch_duplicate_version () =
 let test_dispatch_verack_before_version () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   let msg = P2p.VerackMsg in
   let result = Lwt_main.run (Peer.dispatch_message peer msg) in
   match result with
@@ -335,7 +336,7 @@ let test_dispatch_verack_before_version () =
 let test_dispatch_verack_after_version () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   (* Simulate VERSION received *)
   peer.version_received <- true;
   let msg = P2p.VerackMsg in
@@ -350,7 +351,7 @@ let test_dispatch_verack_after_version () =
 let test_dispatch_feature_negotiation () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   (* Simulate VERSION received but not VERACK *)
   peer.version_received <- true;
   (* wtxidrelay should be accepted *)
@@ -371,7 +372,7 @@ let test_dispatch_feature_negotiation () =
 let test_dispatch_feature_before_version () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   let result = Lwt_main.run (Peer.dispatch_message peer P2p.WtxidrelayMsg) in
   match result with
   | `PreHandshake _ ->
@@ -382,7 +383,7 @@ let test_dispatch_feature_before_version () =
 let test_dispatch_wtxidrelay_after_handshake () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   (* Simulate completed handshake *)
   peer.handshake_complete <- true;
   peer.version_received <- true;
@@ -396,7 +397,7 @@ let test_dispatch_wtxidrelay_after_handshake () =
 let test_dispatch_version_after_handshake () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   (* Simulate completed handshake *)
   peer.handshake_complete <- true;
   peer.version_received <- true;
@@ -422,7 +423,7 @@ let test_dispatch_version_after_handshake () =
 let test_dispatch_post_handshake_feefilter () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   (* Simulate completed handshake *)
   peer.handshake_complete <- true;
   peer.version_received <- true;
@@ -440,7 +441,7 @@ let test_dispatch_post_handshake_feefilter () =
 let test_dispatch_sendpackages_pre_verack () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.version_received <- true;
   let msg = P2p.SendpackagesMsg {
     pkg_version = 1L;
@@ -461,7 +462,7 @@ let test_dispatch_sendpackages_pre_verack () =
 let test_dispatch_sendpackages_before_version () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   let msg = P2p.SendpackagesMsg {
     pkg_version = 1L;
     pkg_max_count = 25l;
@@ -477,7 +478,7 @@ let test_dispatch_sendpackages_before_version () =
 let test_dispatch_sendpackages_after_verack () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.handshake_complete <- true;
   peer.version_received <- true;
   let msg = P2p.SendpackagesMsg {
@@ -496,9 +497,9 @@ let test_self_connection_nonce () =
   let fd1 = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let fd2 = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer1 = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd:fd1 in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd:fd1 () in
   let peer2 = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:1 ~direction:Peer.Outbound ~fd:fd2 in
+    ~port:8333 ~id:1 ~direction:Peer.Outbound ~fd:fd2 () in
   (* Each peer should have a unique nonce *)
   Alcotest.(check bool) "nonces differ" true (peer1.our_nonce <> peer2.our_nonce)
 
@@ -527,7 +528,7 @@ let test_trickling_constants () =
 let test_inv_queue_init () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   (* Queue should be empty initially *)
   Alcotest.(check int) "queue empty" 0 (Peer.inv_queue_length peer);
   (* trickling_active should be false initially *)
@@ -540,7 +541,7 @@ let test_inv_queue_init () =
 let test_queue_inv_ready () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   (* Set peer to Ready state *)
   peer.state <- Peer.Ready;
   let hash = Cstruct.create 32 in
@@ -553,7 +554,7 @@ let test_queue_inv_ready () =
 let test_queue_inv_not_ready () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   (* Peer is Connected, not Ready *)
   Alcotest.(check bool) "peer not ready" false (peer.state = Peer.Ready);
   let hash = Cstruct.create 32 in
@@ -565,7 +566,7 @@ let test_queue_inv_not_ready () =
 let test_queue_inv_multiple () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.state <- Peer.Ready;
   for i = 0 to 99 do
     let hash = Cstruct.create 32 in
@@ -579,7 +580,7 @@ let test_queue_inv_multiple () =
 let test_should_flush_inv_empty () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.state <- Peer.Ready;
   peer.next_inv_send <- Unix.gettimeofday () -. 10.0;  (* Past time *)
   Alcotest.(check bool) "should not flush empty queue" false
@@ -589,7 +590,7 @@ let test_should_flush_inv_empty () =
 let test_should_flush_inv_not_time () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.state <- Peer.Ready;
   (* Add an item to the queue *)
   let hash = Cstruct.create 32 in
@@ -604,7 +605,7 @@ let test_should_flush_inv_not_time () =
 let test_should_flush_inv_ready () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.state <- Peer.Ready;
   (* Add an item to the queue *)
   let hash = Cstruct.create 32 in
@@ -619,7 +620,7 @@ let test_should_flush_inv_ready () =
 let test_schedule_next_inv_send () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   let old_time = peer.next_inv_send in
   Peer.schedule_next_inv_send peer;
   (* New time should be in the future relative to now *)
@@ -634,9 +635,9 @@ let test_trickling_intervals () =
   let fd1 = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let fd2 = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let outbound = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd:fd1 in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd:fd1 () in
   let inbound = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:1 ~direction:Peer.Inbound ~fd:fd2 in
+    ~port:8333 ~id:1 ~direction:Peer.Inbound ~fd:fd2 () in
   (* Generate many samples for each and check average is correct *)
   let outbound_delays = List.init 50 (fun _ ->
     Peer.schedule_next_inv_send outbound;
@@ -661,7 +662,7 @@ let test_trickling_intervals () =
 let test_queue_inv_delayed () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.state <- Peer.Ready;
   (* Queue several transactions *)
   for i = 0 to 9 do
@@ -680,7 +681,7 @@ let test_queue_inv_delayed () =
 let test_inv_batching () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.state <- Peer.Ready;
   (* Queue 50 transactions *)
   for i = 0 to 49 do
@@ -700,7 +701,7 @@ let test_inv_batching () =
 let test_inv_batch_max_1000 () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.state <- Peer.Ready;
   (* Queue 1500 transactions *)
   for i = 0 to 1499 do
@@ -724,7 +725,7 @@ let test_inv_batch_max_1000 () =
 let test_queue_inv_no_relay () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.state <- Peer.Ready;
   peer.relay <- false;  (* Peer opted out of tx relay *)
   let hash = Cstruct.create 32 in
@@ -737,7 +738,7 @@ let test_queue_inv_no_relay () =
 let test_queue_inv_block_relay_only () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.state <- Peer.Ready;
   peer.block_relay_only <- true;  (* Block-relay-only connection *)
   let hash = Cstruct.create 32 in
@@ -750,7 +751,7 @@ let test_queue_inv_block_relay_only () =
 let test_queue_inv_block_allowed () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.state <- Peer.Ready;
   peer.relay <- false;  (* Peer opted out of tx relay *)
   peer.block_relay_only <- true;  (* Block-relay-only *)
@@ -765,7 +766,7 @@ let test_queue_inv_block_allowed () =
 let test_queue_inv_witness_tx_no_relay () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.state <- Peer.Ready;
   peer.relay <- false;
   let hash = Cstruct.create 32 in
@@ -782,7 +783,7 @@ let test_queue_inv_witness_tx_no_relay () =
 let test_feefilter_tx_above () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.state <- Peer.Ready;
   (* Peer sets feefilter to 1000 sat/kvB *)
   peer.feefilter <- 1000L;
@@ -797,7 +798,7 @@ let test_feefilter_tx_above () =
 let test_feefilter_tx_below () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.state <- Peer.Ready;
   (* Peer sets feefilter to 5000 sat/kvB *)
   peer.feefilter <- 5000L;
@@ -812,7 +813,7 @@ let test_feefilter_tx_below () =
 let test_feefilter_tx_equal () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.state <- Peer.Ready;
   (* Peer sets feefilter to 2000 sat/kvB *)
   peer.feefilter <- 2000L;
@@ -827,7 +828,7 @@ let test_feefilter_tx_equal () =
 let test_feefilter_zero () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.state <- Peer.Ready;
   (* Default feefilter is 0 (no filter) *)
   Alcotest.(check int64) "default feefilter is 0" 0L peer.feefilter;
@@ -842,7 +843,7 @@ let test_feefilter_zero () =
 let test_feefilter_block_not_affected () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.state <- Peer.Ready;
   (* Set very high feefilter *)
   peer.feefilter <- 1_000_000L;
@@ -857,7 +858,7 @@ let test_feefilter_block_not_affected () =
 let test_feefilter_witness_tx () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.state <- Peer.Ready;
   peer.feefilter <- 5000L;
   (* Queue a witness tx with low fee rate *)
@@ -946,7 +947,7 @@ let test_significant_feefilter_change () =
 let test_passes_feefilter_direct () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.feefilter <- 1000L;
   let hash = Cstruct.create 32 in
   (* Tx above threshold passes *)
@@ -1244,7 +1245,7 @@ let test_transport_default_v1 () =
   let (s1, s2) = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
   let fd = Lwt_unix.of_unix_file_descr s1 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:18444 ~id:42 ~direction:Peer.Outbound ~fd in
+    ~port:18444 ~id:42 ~direction:Peer.Outbound ~fd () in
   Alcotest.(check bool) "default transport is None (= v1)" true
     (peer.Peer.transport = None);
   (* Manually flip to v2 (simulating what connect_outbound_negotiated

@@ -2202,10 +2202,27 @@ let create_v2_transport ~(initiating : bool) ~(magic : int32) : transport =
     network_magic = magic;
   }
 
-(* Check if bytes look like V1 version message magic *)
-let looks_like_v1_magic (data : Cstruct.t) (magic : int32) : bool =
-  if Cstruct.length data < 4 then false
-  else Cstruct.LE.get_uint32 data 0 = magic
+(* Check if the first 16 bytes match the BIP-324 V1 prefix:
+   4-byte network magic + "version\x00\x00\x00\x00\x00" (12 bytes).
+   Per BIP-324 and Core net.cpp:1091-1094, the decision to fall back to V1
+   must only be made after all 16 bytes arrive and they all match.
+   A mismatch at any of the 16 bytes means V2. *)
+let looks_like_v1_prefix (data : Cstruct.t) (magic : int32) : bool =
+  if Cstruct.length data < Bip324.v1_prefix_len then false
+  else begin
+    (* Bytes 0-3: little-endian network magic *)
+    if Cstruct.LE.get_uint32 data 0 <> magic then false
+    else begin
+      (* Bytes 4-15: "version\x00\x00\x00\x00\x00" *)
+      let v1_suffix = "version\x00\x00\x00\x00\x00" in
+      let rec check i =
+        if i >= 12 then true
+        else if Cstruct.get_uint8 data (4 + i) <> Char.code v1_suffix.[i] then false
+        else check (i + 1)
+      in
+      check 0
+    end
+  end
 
 (* Process received bytes for V2 transport *)
 let v2_receive_bytes (state : v2_state) (data : Cstruct.t) : bool =
@@ -2214,9 +2231,39 @@ let v2_receive_bytes (state : v2_state) (data : Cstruct.t) : bool =
   let rec process () =
     match state.recv_state with
     | V2RecvKeyMaybeV1 ->
-      (* Check if this looks like a V1 connection *)
-      if Cstruct.length state.recv_buffer >= 4 then begin
-        if looks_like_v1_magic state.recv_buffer state.network_magic then begin
+      (* BIP-324: wait for the full 16-byte V1 prefix before deciding.
+         Core net.cpp:1094 — only fall back after all 16 bytes arrive and
+         match; any mismatch in bytes 0-15 means V2 (switch to KEY state). *)
+      let buf_len = Cstruct.length state.recv_buffer in
+      if buf_len < Bip324.v1_prefix_len then begin
+        (* Can already reject V1 if any byte before 16 mismatches *)
+        let magic_bytes = Cstruct.create 4 in
+        Cstruct.LE.set_uint32 magic_bytes 0 state.network_magic;
+        let v1_suffix = "version\x00\x00\x00\x00\x00" in
+        let mismatch =
+          (* Check magic bytes received so far *)
+          (buf_len >= 4 && Cstruct.LE.get_uint32 state.recv_buffer 0 <> state.network_magic) ||
+          (* Check suffix bytes received so far *)
+          (let suffix_start = 4 in
+           let suffix_received = max 0 (buf_len - suffix_start) in
+           let rec check_suffix i =
+             if i >= suffix_received then false
+             else if Cstruct.get_uint8 state.recv_buffer (suffix_start + i)
+                     <> Char.code v1_suffix.[i] then true
+             else check_suffix (i + 1)
+           in
+           check_suffix 0)
+        in
+        ignore magic_bytes;
+        if mismatch then begin
+          (* Already not V1 — switch to V2 key state immediately *)
+          state.recv_state <- V2RecvKey;
+          process ()
+        end else
+          true  (* Need more data *)
+      end else begin
+        (* Have all 16 bytes: make the final determination *)
+        if looks_like_v1_prefix state.recv_buffer state.network_magic then begin
           (* Fall back to V1 *)
           state.recv_state <- V2RecvV1Fallback;
           state.send_state <- V2SendV1Fallback;
@@ -2226,8 +2273,7 @@ let v2_receive_bytes (state : v2_state) (data : Cstruct.t) : bool =
           state.recv_state <- V2RecvKey;
           process ()
         end
-      end else
-        true  (* Need more data *)
+      end
 
     | V2RecvKey ->
       if Cstruct.length state.recv_buffer >= Bip324.ellswift_pubkey_size then begin

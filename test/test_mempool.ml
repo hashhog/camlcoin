@@ -3616,6 +3616,57 @@ let test_w96_same_nonwitness_data_distinguished () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* W96 Bug 3 (second branch): txn-same-nonwitness-data-in-mempool.
+   When a mempool entry exists with the same txid as the incoming tx but a
+   DIFFERENT wtxid (e.g. segwit malleability — same non-witness serialisation,
+   different witness), Core returns "txn-same-nonwitness-data-in-mempool" so
+   the p2p layer can cache and request a fresh witness-carrying copy.
+   We test this by injecting a fake entry whose wtxid is a sentinel value
+   that differs from the actual tx's computed wtxid, then re-submitting the
+   original tx. *)
+let test_w96_same_nonwitness_data_in_mempool () =
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  let tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L]
+  in
+  let txid   = Crypto.compute_txid   tx in
+  let wtxid  = Crypto.compute_wtxid  tx in
+  (* Craft a sentinel wtxid that is guaranteed different from the real one. *)
+  let fake_wtxid = Cstruct.create 32 in
+  Cstruct.set_uint8 fake_wtxid 0 0xFF;
+  (* Sanity: the fake must actually differ from the computed wtxid. *)
+  assert (not (Cstruct.equal fake_wtxid wtxid));
+  (* Inject the entry with the *fake* wtxid directly into the mempool. *)
+  let entries_tbl = Mempool.get_entries mp in
+  let fake_entry : Mempool.mempool_entry = {
+    Mempool.tx = tx; txid; wtxid = fake_wtxid;
+    fee = 10_000L; weight = 400; fee_rate = 100.0;
+    time_added = 0.0; height_added = 100;
+    depends_on = [];
+    ancestor_count = 1; ancestor_size = 100;
+    descendant_count = 1; descendant_size = 100;
+  } in
+  Hashtbl.replace entries_tbl (Cstruct.to_string txid) fake_entry;
+  (* Now submit the real tx.  The code finds the entry by txid, computes the
+     actual wtxid, finds it differs from the stored fake_wtxid, and must
+     return "txn-same-nonwitness-data-in-mempool" (not "txn-already-in-mempool"). *)
+  (match Mempool.add_transaction mp tx with
+   | Error e ->
+     Alcotest.(check bool)
+       "same-txid-different-witness yields txn-same-nonwitness-data-in-mempool" true
+       (try ignore (Str.search_forward
+                     (Str.regexp "txn-same-nonwitness-data-in-mempool") e 0); true
+        with Not_found -> false);
+     Alcotest.(check bool)
+       "must NOT yield txn-already-in-mempool" false
+       (try ignore (Str.search_forward
+                     (Str.regexp "txn-already-in-mempool") e 0); true
+        with Not_found -> false)
+   | Ok _ -> Alcotest.fail "expected error for same-txid-different-witness duplicate");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 (* W96 Bug 4: txn-already-known — when a tx's outputs are already in
    the chain coins cache, the tx is already confirmed and ATMP should
    short-circuit with "txn-already-known".  Core uses this to avoid
@@ -4072,6 +4123,8 @@ let () =
         test_w96_min_tx_size_unconditional;
       test_case "txn-already-in-mempool error for exact wtxid duplicate" `Quick
         test_w96_same_nonwitness_data_distinguished;
+      test_case "txn-same-nonwitness-data-in-mempool for same-txid different-wtxid" `Quick
+        test_w96_same_nonwitness_data_in_mempool;
       test_case "txn-already-known via confirmed-output cache hit" `Quick
         test_w96_already_known_via_confirmed_outputs;
       test_case "coinbase maturity off-by-one fix (chainHeight+1 spend)" `Quick

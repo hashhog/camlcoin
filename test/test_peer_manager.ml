@@ -7,7 +7,7 @@ open Camlcoin
 let make_dummy_peer () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd ()
 
 (* Test addr_source type *)
 let test_addr_source () =
@@ -644,7 +644,7 @@ let test_anchor_persistence () =
 let test_eviction_candidate () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"192.168.1.1"
-    ~port:8333 ~id:1 ~direction:Peer.Inbound ~fd in
+    ~port:8333 ~id:1 ~direction:Peer.Inbound ~fd () in
   let ec : Peer_manager.eviction_candidate = {
     ec_peer = peer;
     ec_connected = 1000.0;
@@ -828,7 +828,7 @@ let test_feefilter_rounder_round () =
 let test_peer_feefilter_state () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:1 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:1 ~direction:Peer.Outbound ~fd () in
   (* Initial state *)
   Alcotest.(check int64) "feefilter initially 0" 0L peer.feefilter;
   Alcotest.(check int64) "fee_filter_sent initially 0" 0L peer.fee_filter_sent;
@@ -843,7 +843,7 @@ let test_peer_feefilter_state () =
 let test_tx_filtering_low_fee () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:1 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:1 ~direction:Peer.Outbound ~fd () in
   (* Peer has feefilter of 5000 sat/kvB *)
   peer.feefilter <- 5000L;
   (* Transaction with fee rate of 1000 sat/kvB (below threshold) *)
@@ -857,7 +857,7 @@ let test_tx_filtering_low_fee () =
 let test_tx_filtering_high_fee () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:1 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:1 ~direction:Peer.Outbound ~fd () in
   (* Peer has feefilter of 5000 sat/kvB *)
   peer.feefilter <- 5000L;
   (* Transaction with fee rate of 10000 sat/kvB (above threshold) *)
@@ -871,7 +871,7 @@ let test_tx_filtering_high_fee () =
 let test_block_relay_only_skip_feefilter () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:1 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:1 ~direction:Peer.Outbound ~fd () in
   (* Mark as block-relay-only *)
   peer.block_relay_only <- true;
   (* should_send_feefilter should return false for block-relay-only peers *)
@@ -895,7 +895,7 @@ let test_hb_compact_peers_max_3 () =
 let test_supports_compact_blocks () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:1 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:1 ~direction:Peer.Outbound ~fd () in
   (* By default, peer doesn't support compact blocks (version 0) *)
   let supports = Peer_manager.supports_compact_blocks peer in
   Alcotest.(check bool) "no support without cmpct_version" false supports;

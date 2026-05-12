@@ -2616,7 +2616,7 @@ let test_bip35_handler_no_mempool () =
      mempool is empty / absent. *)
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
-    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd in
+    ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   (* Should complete without raising; the gate accepts because we DO
      advertise NODE_BLOOM, then the empty-mempool branch returns unit. *)
   Lwt_main.run (Sync.handle_mempool_msg ibd peer);

@@ -6490,17 +6490,87 @@ let handle_loadtxoutset (_ctx : rpc_context)
                    "Coins count mismatch: snapshot has %Ld, expected %Ld"
                    metadata.coins_count params.coins_count)
         else begin
-          (* Stream the coins into a fresh snapshot chainstate sibling
-             directory of the active datadir. The active chainstate is
-             unaffected — this matches Core's "second chainstate" model. *)
+          (* B4: header-chain membership check.
+             The base block header must appear in the synced header chain
+             before we invest I/O in loading the snapshot.
+             Mirrors Bitcoin Core ActivateSnapshot [validation.cpp:5611-5615]:
+               snapshot_start_block = m_blockman.LookupBlockIndex(base_blockhash);
+               if (!snapshot_start_block)
+                 return error("The base block header (%s) must appear in the
+                               headers chain. Make sure all headers are syncing")
+          *)
+          if not (Sync.has_header _ctx.chain metadata.base_blockhash) then
+            Error (Printf.sprintf
+                     "The base block header (%s) must appear in the headers \
+                      chain. Make sure all headers are syncing, and call \
+                      loadtxoutset again"
+                     (Types.hash256_to_hex_display metadata.base_blockhash))
+          else
+          (* B5: double-activation guard.
+             Refuse to activate a snapshot if one is already loaded.
+             Mirrors Bitcoin Core ActivateSnapshot [validation.cpp:5600-5602]:
+               if (this->CurrentChainstate().m_from_snapshot_blockhash)
+                 return error("Can't activate a snapshot-based chainstate
+                               more than once")
+             We detect a pre-existing snapshot chainstate by checking whether
+             the snapshot_db directory already exists on disk.
+          *)
           let snapshot_db_path =
             match _ctx.data_dir with
             | Some d -> Filename.concat d "chainstate_snapshot"
             | None ->
-              (* No datadir provided in test contexts: pick a sibling of
-                 the snapshot file so we still have a unique location. *)
               (Filename.dirname path) ^ "/chainstate_snapshot"
           in
+          if Sys.file_exists snapshot_db_path then
+            Error "Can't activate a snapshot-based chainstate more than once"
+          else
+          (* B6: mempool must be empty before snapshot activation.
+             Mirrors Bitcoin Core ActivateSnapshot [validation.cpp:5626-5629]:
+               if (mempool && mempool->size() > 0)
+                 return error("Can't activate a snapshot when mempool not empty")
+          *)
+          let mempool_size = Mempool.count _ctx.mempool in
+          if mempool_size > 0 then
+            Error (Printf.sprintf
+                     "Can't activate a snapshot when mempool not empty \
+                      (%d transactions)"
+                     mempool_size)
+          else
+          (* B7: snapshot work must exceed active chainstate work.
+             Mirrors Bitcoin Core PopulateAndValidateSnapshot
+             [validation.cpp:5787-5789]:
+               if (NOT CBlockIndexWorkComparator()(ActiveTip(),
+                                                   snapshot_start_block))
+                 return error("Work does not exceed active chainstate")
+             We compare the hardcoded params.height as a proxy for chain work
+             — a snapshot at height H has strictly more work than the genesis
+             tip only when H > current tip height.  Use the header-entry
+             total_work fields when both are available for a precise comparison.
+          *)
+          let snapshot_has_more_work =
+            match Sync.get_header _ctx.chain metadata.base_blockhash,
+                  _ctx.chain.Sync.tip with
+            | Some snap_hdr, Some active_tip ->
+              (* Precise: compare cumulative PoW via 32-byte LE big-integer. *)
+              Consensus.work_compare snap_hdr.Sync.total_work
+                active_tip.Sync.total_work > 0
+            | None, _ ->
+              (* B4 guard above already ensures the header is known; reaching
+                 here means the header disappeared between the two lookups —
+                 treat as not-more-work to be conservative. *)
+              false
+            | Some snap_hdr, None ->
+              (* Active tip is genesis (no blocks yet) — any snapshot with
+                 positive height has more work. *)
+              let zero = Cstruct.create 32 in
+              Consensus.work_compare snap_hdr.Sync.total_work zero > 0
+          in
+          if not snapshot_has_more_work then
+            Error "Work does not exceed active chainstate"
+          else
+          (* Stream the coins into a fresh snapshot chainstate sibling
+             directory of the active datadir. The active chainstate is
+             unaffected — this matches Core's "second chainstate" model. *)
           (match Assume_utxo.load_snapshot
                    ~network:_ctx.network
                    ~snapshot_path:path

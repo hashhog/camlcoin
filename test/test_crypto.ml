@@ -638,6 +638,471 @@ let defined_hashtype_tests = [
   Alcotest.test_case "0x84 not defined" `Quick test_defined_hashtype_anyonecanpay_four_invalid;
 ]
 
+(* ============================================================================
+   BIP-340 Schnorr + Tagged Hash tests (W95)
+
+   These tests cover BIP-340 / BIP-341 cryptographic primitives:
+   - tagged_hash construction: SHA256(SHA256(tag) || SHA256(tag) || msg)
+   - tagged_hash known test vectors (TapSighash, TapLeaf, TapBranch, TapTweak,
+     BIP0340/aux, BIP0340/nonce, BIP0340/challenge)
+   - Schnorr sign + verify roundtrip
+   - Schnorr verify rejection on tampered sig / msg / pubkey
+   - BIP-340 test vector from the spec (deterministic vector 0)
+   - x-only pubkey parse strictness
+   - BIP-341 hash_type whitelist (is_valid_taproot_hash_type)
+   - BIP-341 SIGHASH_SINGLE missing-output gate (taproot_sighash_single_safe)
+   ============================================================================ *)
+
+(* Tagged hash basics ------------------------------------------------------- *)
+
+(* Reference implementation from BIP-340: pyspec
+     def tagged_hash(tag, msg):
+         tag_hash = sha256(tag.encode())
+         return sha256(tag_hash + tag_hash + msg)
+   We re-derive the same way (using digestif/openssl underneath) and confirm
+   round-trip against a synthetic input. *)
+let test_w95_tagged_hash_format () =
+  let tag = "BIP0340/challenge" in
+  let msg = Cstruct.of_string "hello world" in
+  let tag_hash_str = Digestif.SHA256.(to_raw_string (digest_string tag)) in
+  let tag_hash_cs = Cstruct.of_string tag_hash_str in
+  let preimage = Cstruct.concat [tag_hash_cs; tag_hash_cs; msg] in
+  let expected = Crypto.sha256 preimage in
+  let got = Crypto.tagged_hash tag msg in
+  Alcotest.(check string) "tagged_hash == sha256(sha256(tag)||sha256(tag)||msg)"
+    (cstruct_to_hex expected) (cstruct_to_hex got)
+
+(* Tag is hashed once with raw bytes, NOT pre-hashed elsewhere. Different
+   tags MUST give different hashes for the same message. *)
+let test_w95_tagged_hash_tag_isolation () =
+  let msg = Cstruct.of_string "same message" in
+  let h_a = Crypto.tagged_hash "TagA" msg in
+  let h_b = Crypto.tagged_hash "TagB" msg in
+  Alcotest.(check bool) "different tags produce different hashes" true
+    (not (Cstruct.equal h_a h_b))
+
+(* Empty-message edge case: tagged_hash(tag, empty) should be reproducible
+   and not crash. *)
+let test_w95_tagged_hash_empty_msg () =
+  let h = Crypto.tagged_hash "TapTweak" Cstruct.empty in
+  Alcotest.(check int) "tagged_hash returns 32 bytes" 32 (Cstruct.length h)
+
+(* BIP-341 known tag bytes — verify each tag produces a distinct, 32-byte
+   hash for a fixed input. This guards against accidental tag-string typos. *)
+let test_w95_known_taproot_tags () =
+  let msg = Cstruct.of_string "fixed" in
+  let h_taptweak  = Crypto.tagged_hash "TapTweak"  msg in
+  let h_tapleaf   = Crypto.tagged_hash "TapLeaf"   msg in
+  let h_tapbranch = Crypto.tagged_hash "TapBranch" msg in
+  let h_tapsig    = Crypto.tagged_hash "TapSighash" msg in
+  Alcotest.(check int) "TapTweak  is 32 bytes" 32 (Cstruct.length h_taptweak);
+  Alcotest.(check int) "TapLeaf   is 32 bytes" 32 (Cstruct.length h_tapleaf);
+  Alcotest.(check int) "TapBranch is 32 bytes" 32 (Cstruct.length h_tapbranch);
+  Alcotest.(check int) "TapSighash is 32 bytes" 32 (Cstruct.length h_tapsig);
+  let all_distinct =
+    not (Cstruct.equal h_taptweak h_tapleaf) &&
+    not (Cstruct.equal h_taptweak h_tapbranch) &&
+    not (Cstruct.equal h_taptweak h_tapsig) &&
+    not (Cstruct.equal h_tapleaf  h_tapbranch) &&
+    not (Cstruct.equal h_tapleaf  h_tapsig) &&
+    not (Cstruct.equal h_tapbranch h_tapsig) in
+  Alcotest.(check bool) "all four BIP-341 tags produce distinct hashes" true all_distinct
+
+(* Compute tagged_hash via the reference pyspec formula and pin one value:
+     tagged_hash("BIP0340/challenge", 0x00..0x1f) [bytes 0..31]
+   Recompute the expected via the same formula but using digestif directly to
+   sidestep the OpenSSL-vs-digestif speedup path. *)
+let test_w95_tagged_hash_pinned_vector () =
+  let msg = Cstruct.create 32 in
+  for i = 0 to 31 do Cstruct.set_uint8 msg i i done;
+  let got = Crypto.tagged_hash "BIP0340/challenge" msg in
+  let tag_hash =
+    let raw = Digestif.SHA256.(to_raw_string (digest_string "BIP0340/challenge")) in
+    Cstruct.of_string raw in
+  let pre = Cstruct.concat [tag_hash; tag_hash; msg] in
+  let expected_raw =
+    Digestif.SHA256.(to_raw_string
+      (digest_string (Cstruct.to_string pre))) in
+  let expected_hex =
+    let b = Buffer.create 64 in
+    String.iter (fun c -> Buffer.add_string b (Printf.sprintf "%02x" (Char.code c)))
+      expected_raw;
+    Buffer.contents b in
+  Alcotest.(check string) "tagged_hash pinned vector"
+    expected_hex (cstruct_to_hex got)
+
+(* Schnorr sign + verify ---------------------------------------------------- *)
+
+let test_w95_schnorr_sign_verify_roundtrip () =
+  let privkey = Crypto.generate_private_key () in
+  let pubkey_x = Crypto.derive_xonly_pubkey privkey in
+  let msg = Crypto.sha256d (Cstruct.of_string "BIP-340 roundtrip") in
+  let sig_ = Crypto.schnorr_sign ~privkey ~msg in
+  Alcotest.(check int) "Schnorr sig is 64 bytes" 64 (Cstruct.length sig_);
+  Alcotest.(check int) "x-only pubkey is 32 bytes" 32 (Cstruct.length pubkey_x);
+  let valid = Crypto.schnorr_verify ~pubkey_x ~msg ~signature:sig_ in
+  Alcotest.(check bool) "valid Schnorr sig verifies" true valid
+
+let test_w95_schnorr_verify_rejects_tampered_sig () =
+  let privkey = Crypto.generate_private_key () in
+  let pubkey_x = Crypto.derive_xonly_pubkey privkey in
+  let msg = Crypto.sha256d (Cstruct.of_string "tamper") in
+  let sig_ = Crypto.schnorr_sign ~privkey ~msg in
+  (* Flip a single bit in the R portion (first byte) *)
+  let tampered = Cstruct.create 64 in
+  Cstruct.blit sig_ 0 tampered 0 64;
+  Cstruct.set_uint8 tampered 0 (Cstruct.get_uint8 tampered 0 lxor 0x01);
+  let valid = Crypto.schnorr_verify ~pubkey_x ~msg ~signature:tampered in
+  Alcotest.(check bool) "tampered sig rejected" false valid
+
+let test_w95_schnorr_verify_rejects_wrong_msg () =
+  let privkey = Crypto.generate_private_key () in
+  let pubkey_x = Crypto.derive_xonly_pubkey privkey in
+  let msg = Crypto.sha256d (Cstruct.of_string "real") in
+  let sig_ = Crypto.schnorr_sign ~privkey ~msg in
+  let wrong = Crypto.sha256d (Cstruct.of_string "fake") in
+  let valid = Crypto.schnorr_verify ~pubkey_x ~msg:wrong ~signature:sig_ in
+  Alcotest.(check bool) "sig over different msg rejected" false valid
+
+let test_w95_schnorr_verify_rejects_wrong_pubkey () =
+  let priv1 = Crypto.generate_private_key () in
+  let priv2 = Crypto.generate_private_key () in
+  let pubkey_x_2 = Crypto.derive_xonly_pubkey priv2 in
+  let msg = Crypto.sha256d (Cstruct.of_string "wrongkey") in
+  let sig_ = Crypto.schnorr_sign ~privkey:priv1 ~msg in
+  let valid = Crypto.schnorr_verify ~pubkey_x:pubkey_x_2 ~msg ~signature:sig_ in
+  Alcotest.(check bool) "wrong pubkey rejected" false valid
+
+(* Length validation: schnorr_verify must return false on malformed inputs *)
+let test_w95_schnorr_verify_rejects_short_sig () =
+  let privkey = Crypto.generate_private_key () in
+  let pubkey_x = Crypto.derive_xonly_pubkey privkey in
+  let msg = Crypto.sha256d (Cstruct.of_string "short") in
+  let short_sig = Cstruct.create 63 in
+  let valid = Crypto.schnorr_verify ~pubkey_x ~msg ~signature:short_sig in
+  Alcotest.(check bool) "63-byte sig rejected" false valid
+
+let test_w95_schnorr_verify_rejects_short_pubkey () =
+  let msg = Crypto.sha256d (Cstruct.of_string "shortpk") in
+  let short_pk = Cstruct.create 31 in
+  let sig_ = Cstruct.create 64 in
+  let valid = Crypto.schnorr_verify ~pubkey_x:short_pk ~msg ~signature:sig_ in
+  Alcotest.(check bool) "31-byte pubkey rejected" false valid
+
+(* BIP-340 test vector 0 from the spec
+   (https://github.com/bitcoin/bips/blob/master/bip-0340/test-vectors.csv):
+     secret  = 0000000000000000000000000000000000000000000000000000000000000003
+     pubkey  = F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9
+     aux     = 0000000000000000000000000000000000000000000000000000000000000000
+     msg     = 0000000000000000000000000000000000000000000000000000000000000000
+     sig     = E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA8215
+               25F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C0
+
+   We verify that the precomputed signature verifies under the precomputed
+   public key + message. (We don't re-derive the signature because our
+   schnorr_sign uses /dev/urandom for aux-rand, which doesn't yield the
+   deterministic vector. Verification, however, is fully deterministic.) *)
+let test_w95_bip340_vector_0_verify () =
+  let pubkey_x = hex_to_cstruct
+    "F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9" in
+  let msg = hex_to_cstruct
+    "0000000000000000000000000000000000000000000000000000000000000000" in
+  let sig_ = hex_to_cstruct
+    ("E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA8215" ^
+     "25F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C0") in
+  let valid = Crypto.schnorr_verify ~pubkey_x ~msg ~signature:sig_ in
+  Alcotest.(check bool) "BIP-340 vector 0 verifies" true valid
+
+(* BIP-340 test vector 5 (an "expected: TRUE" with non-zero msg):
+     secret  = C90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B14E5C9
+     pubkey  = DD308AFEC5777E13121FA72B9CC1B7CC0139715309B086C960E18FD969774EB8
+     aux     = 0000000000000000000000000000000000000000000000000000000000000000
+     msg     = 7E2D58D8B3BCDF1ABADEC7829054F90DDA9805AAB56C77333024B9D0A508B75C
+     sig     = 5831AAEED7B44BB74E5EAB94BA9D4294C49BCF2A60728D8B4C200F50DD313C1B
+               AB745879A5AD954A72C45A91C3A51D3C7ADEA98D82F8481E0E1E03674A6F3FB7
+*)
+let test_w95_bip340_vector_5_verify () =
+  let pubkey_x = hex_to_cstruct
+    "DD308AFEC5777E13121FA72B9CC1B7CC0139715309B086C960E18FD969774EB8" in
+  let msg = hex_to_cstruct
+    "7E2D58D8B3BCDF1ABADEC7829054F90DDA9805AAB56C77333024B9D0A508B75C" in
+  let sig_ = hex_to_cstruct
+    ("5831AAEED7B44BB74E5EAB94BA9D4294C49BCF2A60728D8B4C200F50DD313C1B" ^
+     "AB745879A5AD954A72C45A91C3A51D3C7ADEA98D82F8481E0E1E03674A6F3FB7") in
+  let valid = Crypto.schnorr_verify ~pubkey_x ~msg ~signature:sig_ in
+  Alcotest.(check bool) "BIP-340 vector 5 verifies" true valid
+
+(* Negative vector: tampered signature for vector 0 must fail. *)
+let test_w95_bip340_vector_0_rejects_tampered () =
+  let pubkey_x = hex_to_cstruct
+    "F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9" in
+  let msg = hex_to_cstruct
+    "0000000000000000000000000000000000000000000000000000000000000000" in
+  (* Same sig but flip the last byte of s *)
+  let sig_ = hex_to_cstruct
+    ("E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA8215" ^
+     "25F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C1") in
+  let valid = Crypto.schnorr_verify ~pubkey_x ~msg ~signature:sig_ in
+  Alcotest.(check bool) "tampered BIP-340 vector 0 rejected" false valid
+
+(* BIP-340 verify failure modes — Section "Verification" gates 1-5:
+   - Pubkey not on curve (cannot lift_x): schnorr_verify returns false.
+   - R coordinate out of field range. *)
+let test_w95_schnorr_invalid_pubkey_not_on_curve () =
+  (* x = p-1 lies inside the field but not on the curve for y^2 = x^3 + 7 *)
+  let pubkey_x = hex_to_cstruct
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2E" in
+  let msg = Crypto.sha256d (Cstruct.of_string "nocurve") in
+  let sig_ = Cstruct.create 64 in
+  let valid = Crypto.schnorr_verify ~pubkey_x ~msg ~signature:sig_ in
+  Alcotest.(check bool) "pubkey not on curve rejected" false valid
+
+(* Taproot key-path tweak helpers ------------------------------------------ *)
+
+let test_w95_taptweak_keypath_known () =
+  (* From BIP-341 test vectors: TapTweak("P", []) for an internal key.
+     We don't pin a specific Q here (would require curve math); just verify
+     that compute_taptweak_keypath = tagged_hash("TapTweak", p). *)
+  let p = hex_to_cstruct
+    "F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9" in
+  let got = Crypto.compute_taptweak_keypath p in
+  let expected = Crypto.tagged_hash "TapTweak" p in
+  Alcotest.(check string) "compute_taptweak_keypath == tagged_hash TapTweak p"
+    (cstruct_to_hex expected) (cstruct_to_hex got)
+
+let test_w95_compute_taproot_tweak_no_root () =
+  let p = hex_to_cstruct
+    "F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9" in
+  let got = Crypto.compute_taproot_tweak p None in
+  let expected = Crypto.tagged_hash "TapTweak" p in
+  Alcotest.(check string) "compute_taproot_tweak None == tagged_hash TapTweak p"
+    (cstruct_to_hex expected) (cstruct_to_hex got)
+
+let test_w95_compute_taproot_tweak_with_root () =
+  let p = hex_to_cstruct
+    "F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9" in
+  let root = hex_to_cstruct
+    "0101010101010101010101010101010101010101010101010101010101010101" in
+  let got = Crypto.compute_taproot_tweak p (Some root) in
+  let expected = Crypto.tagged_hash "TapTweak" (Cstruct.concat [p; root]) in
+  Alcotest.(check string) "compute_taproot_tweak Some == tagged_hash TapTweak (p||root)"
+    (cstruct_to_hex expected) (cstruct_to_hex got)
+
+(* TapLeaf hash: tagged_hash("TapLeaf", leaf_version || compact_size(len) || script) *)
+let test_w95_compute_tapleaf_hash () =
+  let leaf_ver = 0xC0 in
+  let script = Cstruct.of_string "\x51" in  (* OP_1, 1 byte *)
+  let got = Crypto.compute_tapleaf_hash leaf_ver script in
+  (* Manual preimage: 0xC0 || compact_size(1)=0x01 || 0x51 *)
+  let preimage = hex_to_cstruct "c00151" in
+  let expected = Crypto.tagged_hash "TapLeaf" preimage in
+  Alcotest.(check string) "tapleaf hash"
+    (cstruct_to_hex expected) (cstruct_to_hex got)
+
+(* TapBranch: sort children lexicographically before concatenation. *)
+let test_w95_compute_tapbranch_sorts () =
+  let lo = hex_to_cstruct
+    "0101010101010101010101010101010101010101010101010101010101010101" in
+  let hi = hex_to_cstruct
+    "0202020202020202020202020202020202020202020202020202020202020202" in
+  (* Both orders produce the same hash. *)
+  let h_lo_hi = Crypto.compute_tapbranch_hash lo hi in
+  let h_hi_lo = Crypto.compute_tapbranch_hash hi lo in
+  Alcotest.(check string) "tapbranch is commutative (sort)"
+    (cstruct_to_hex h_lo_hi) (cstruct_to_hex h_hi_lo);
+  (* Expected = tagged_hash("TapBranch", lo || hi) *)
+  let expected = Crypto.tagged_hash "TapBranch" (Cstruct.concat [lo; hi]) in
+  Alcotest.(check string) "tapbranch lexicographic"
+    (cstruct_to_hex expected) (cstruct_to_hex h_lo_hi)
+
+let test_w95_compute_tapbranch_equal_children () =
+  let h = hex_to_cstruct
+    "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef" in
+  let got = Crypto.compute_tapbranch_hash h h in
+  let expected = Crypto.tagged_hash "TapBranch" (Cstruct.concat [h; h]) in
+  Alcotest.(check string) "tapbranch equal children"
+    (cstruct_to_hex expected) (cstruct_to_hex got)
+
+(* Taproot merkle root from path: fold tapbranch up. *)
+let test_w95_taproot_merkle_root_empty_path () =
+  let leaf = hex_to_cstruct
+    "ababababababababababababababababababababababababababababababab00" in
+  let got = Crypto.compute_taproot_merkle_root_from_path leaf [] in
+  Alcotest.(check string) "empty path returns leaf hash unchanged"
+    (cstruct_to_hex leaf) (cstruct_to_hex got)
+
+let test_w95_taproot_merkle_root_one_path () =
+  let leaf = hex_to_cstruct
+    "ababababababababababababababababababababababababababababababab00" in
+  let sib = hex_to_cstruct
+    "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd00" in
+  let got = Crypto.compute_taproot_merkle_root_from_path leaf [sib] in
+  let expected = Crypto.compute_tapbranch_hash leaf sib in
+  Alcotest.(check string) "single-sibling path"
+    (cstruct_to_hex expected) (cstruct_to_hex got)
+
+(* BIP-341 hash_type validity (W95 fix) -------------------------------------- *)
+
+let test_w95_taproot_hash_type_valid () =
+  List.iter (fun ht ->
+    Alcotest.(check bool) (Printf.sprintf "0x%02x is valid" ht) true
+      (Script.is_valid_taproot_hash_type ht)
+  ) [0x00; 0x01; 0x02; 0x03; 0x81; 0x82; 0x83]
+
+let test_w95_taproot_hash_type_invalid () =
+  List.iter (fun ht ->
+    Alcotest.(check bool) (Printf.sprintf "0x%02x is invalid" ht) false
+      (Script.is_valid_taproot_hash_type ht)
+  ) [0x04; 0x05; 0x10; 0x55; 0x7F; 0x80; 0x84; 0x85; 0xFE; 0xFF]
+
+(* BIP-341 SIGHASH_SINGLE missing-output gate (W95 fix) --------------------- *)
+
+let test_w95_sighash_single_safe_non_single () =
+  (* Non-SINGLE hash_types are safe regardless of input_index. *)
+  List.iter (fun ht ->
+    Alcotest.(check bool)
+      (Printf.sprintf "hash_type 0x%02x is safe even with input_index=5, n_out=2" ht)
+      true
+      (Script.taproot_sighash_single_safe ht 5 2)
+  ) [0x00; 0x01; 0x02; 0x81; 0x82]
+
+let test_w95_sighash_single_safe_single () =
+  (* SINGLE (0x03, 0x83) is safe when input_index < n_outputs. *)
+  Alcotest.(check bool) "SINGLE safe when in=0, out=1" true
+    (Script.taproot_sighash_single_safe 0x03 0 1);
+  Alcotest.(check bool) "SINGLE safe when in=2, out=3" true
+    (Script.taproot_sighash_single_safe 0x03 2 3);
+  Alcotest.(check bool) "SINGLE|ACP safe when in=0, out=1" true
+    (Script.taproot_sighash_single_safe 0x83 0 1);
+  (* And unsafe when in_pos >= n_outputs. *)
+  Alcotest.(check bool) "SINGLE unsafe when in=1, out=1" false
+    (Script.taproot_sighash_single_safe 0x03 1 1);
+  Alcotest.(check bool) "SINGLE unsafe when in=2, out=0" false
+    (Script.taproot_sighash_single_safe 0x03 2 0);
+  Alcotest.(check bool) "SINGLE|ACP unsafe when in=3, out=1" false
+    (Script.taproot_sighash_single_safe 0x83 3 1)
+
+(* compute_sighash_taproot must produce a deterministic 32-byte hash for a
+   well-formed (synthetic) input — and must not crash. We don't pin the
+   exact hash (would need a hand-computed reference) but we confirm shape +
+   determinism + dependence on hash_type. *)
+let make_dummy_tx () =
+  let txid = Cstruct.create 32 in
+  for i = 0 to 31 do Cstruct.set_uint8 txid i i done;
+  let inp = {
+    Types.previous_output = { Types.txid; vout = 0l };
+    script_sig = Cstruct.empty;
+    sequence = 0xFFFFFFFFl;
+  } in
+  let out = {
+    Types.value = 100_000_000L;
+    script_pubkey = hex_to_cstruct "5120deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+  } in
+  {
+    Types.version = 2l;
+    inputs = [inp];
+    outputs = [out];
+    locktime = 0l;
+    witnesses = [];
+  }
+
+let test_w95_compute_sighash_taproot_deterministic () =
+  let tx = make_dummy_tx () in
+  let spk = hex_to_cstruct
+    "5120cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe" in
+  let prevouts = [(50_000_000L, spk)] in
+  let h1 = Script.compute_sighash_taproot tx 0 prevouts 0x00 () in
+  let h2 = Script.compute_sighash_taproot tx 0 prevouts 0x00 () in
+  Alcotest.(check int) "sighash is 32 bytes" 32 (Cstruct.length h1);
+  Alcotest.(check string) "sighash deterministic"
+    (cstruct_to_hex h1) (cstruct_to_hex h2)
+
+let test_w95_compute_sighash_taproot_differs_by_hash_type () =
+  let tx = make_dummy_tx () in
+  let spk = hex_to_cstruct
+    "5120cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe" in
+  let prevouts = [(50_000_000L, spk)] in
+  let h_default = Script.compute_sighash_taproot tx 0 prevouts 0x00 () in
+  let h_all     = Script.compute_sighash_taproot tx 0 prevouts 0x01 () in
+  let h_none    = Script.compute_sighash_taproot tx 0 prevouts 0x02 () in
+  let h_single  = Script.compute_sighash_taproot tx 0 prevouts 0x03 () in
+  let h_acp     = Script.compute_sighash_taproot tx 0 prevouts 0x81 () in
+  (* DEFAULT (0x00) and ALL (0x01) must differ — Core writes the hash_type
+     byte into the preimage, and SIGHASH_DEFAULT (0x00) ≠ SIGHASH_ALL (0x01)
+     at the byte level even though they have the same output semantics. *)
+  Alcotest.(check bool) "DEFAULT != ALL" true
+    (not (Cstruct.equal h_default h_all));
+  Alcotest.(check bool) "ALL != NONE" true
+    (not (Cstruct.equal h_all h_none));
+  Alcotest.(check bool) "ALL != SINGLE" true
+    (not (Cstruct.equal h_all h_single));
+  Alcotest.(check bool) "ALL != ALL|ACP" true
+    (not (Cstruct.equal h_all h_acp))
+
+(* The Failure raised on a bad hash_type is reachable only by callers that
+   skip the whitelist gate. We confirm here that a bad hash_type DOES raise
+   (the function still defends in depth) so a future caller can't silently
+   compute a garbage sighash. *)
+let test_w95_compute_sighash_taproot_invalid_hash_type_raises () =
+  let tx = make_dummy_tx () in
+  let spk = hex_to_cstruct
+    "5120cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe" in
+  let prevouts = [(50_000_000L, spk)] in
+  let raised =
+    try
+      let _ = Script.compute_sighash_taproot tx 0 prevouts 0x55 () in
+      false
+    with Failure _ -> true | _ -> false
+  in
+  Alcotest.(check bool) "compute_sighash_taproot raises on hash_type 0x55"
+    true raised
+
+(* Mismatched prevouts length is also defended in depth. *)
+let test_w95_compute_sighash_taproot_prevouts_mismatch_raises () =
+  let tx = make_dummy_tx () in
+  let raised =
+    try
+      let _ = Script.compute_sighash_taproot tx 0 [] 0x00 () in
+      false
+    with Failure _ -> true | _ -> false
+  in
+  Alcotest.(check bool) "compute_sighash_taproot raises on prevouts mismatch"
+    true raised
+
+let bip340_schnorr_tests = [
+  Alcotest.test_case "tagged_hash format" `Quick test_w95_tagged_hash_format;
+  Alcotest.test_case "tagged_hash tag isolation" `Quick test_w95_tagged_hash_tag_isolation;
+  Alcotest.test_case "tagged_hash empty msg" `Quick test_w95_tagged_hash_empty_msg;
+  Alcotest.test_case "tagged_hash known taproot tags" `Quick test_w95_known_taproot_tags;
+  Alcotest.test_case "tagged_hash pinned vector" `Quick test_w95_tagged_hash_pinned_vector;
+  Alcotest.test_case "schnorr sign+verify roundtrip" `Quick test_w95_schnorr_sign_verify_roundtrip;
+  Alcotest.test_case "schnorr rejects tampered sig" `Quick test_w95_schnorr_verify_rejects_tampered_sig;
+  Alcotest.test_case "schnorr rejects wrong msg" `Quick test_w95_schnorr_verify_rejects_wrong_msg;
+  Alcotest.test_case "schnorr rejects wrong pubkey" `Quick test_w95_schnorr_verify_rejects_wrong_pubkey;
+  Alcotest.test_case "schnorr rejects 63-byte sig" `Quick test_w95_schnorr_verify_rejects_short_sig;
+  Alcotest.test_case "schnorr rejects 31-byte pk" `Quick test_w95_schnorr_verify_rejects_short_pubkey;
+  Alcotest.test_case "BIP-340 vector 0 verifies" `Quick test_w95_bip340_vector_0_verify;
+  Alcotest.test_case "BIP-340 vector 5 verifies" `Quick test_w95_bip340_vector_5_verify;
+  Alcotest.test_case "BIP-340 vector 0 tamper rejects" `Quick test_w95_bip340_vector_0_rejects_tampered;
+  Alcotest.test_case "schnorr invalid pubkey not on curve" `Quick test_w95_schnorr_invalid_pubkey_not_on_curve;
+  Alcotest.test_case "compute_taptweak_keypath" `Quick test_w95_taptweak_keypath_known;
+  Alcotest.test_case "compute_taproot_tweak None" `Quick test_w95_compute_taproot_tweak_no_root;
+  Alcotest.test_case "compute_taproot_tweak Some" `Quick test_w95_compute_taproot_tweak_with_root;
+  Alcotest.test_case "compute_tapleaf_hash" `Quick test_w95_compute_tapleaf_hash;
+  Alcotest.test_case "compute_tapbranch sorts" `Quick test_w95_compute_tapbranch_sorts;
+  Alcotest.test_case "compute_tapbranch equal children" `Quick test_w95_compute_tapbranch_equal_children;
+  Alcotest.test_case "taproot merkle empty path" `Quick test_w95_taproot_merkle_root_empty_path;
+  Alcotest.test_case "taproot merkle one-sibling path" `Quick test_w95_taproot_merkle_root_one_path;
+  Alcotest.test_case "is_valid_taproot_hash_type accepts" `Quick test_w95_taproot_hash_type_valid;
+  Alcotest.test_case "is_valid_taproot_hash_type rejects" `Quick test_w95_taproot_hash_type_invalid;
+  Alcotest.test_case "sighash_single_safe non-single" `Quick test_w95_sighash_single_safe_non_single;
+  Alcotest.test_case "sighash_single_safe single" `Quick test_w95_sighash_single_safe_single;
+  Alcotest.test_case "compute_sighash_taproot deterministic" `Quick test_w95_compute_sighash_taproot_deterministic;
+  Alcotest.test_case "compute_sighash_taproot varies by hash_type" `Quick test_w95_compute_sighash_taproot_differs_by_hash_type;
+  Alcotest.test_case "compute_sighash_taproot raises bad hash_type" `Quick test_w95_compute_sighash_taproot_invalid_hash_type_raises;
+  Alcotest.test_case "compute_sighash_taproot raises prevouts mismatch" `Quick test_w95_compute_sighash_taproot_prevouts_mismatch_raises;
+]
+
 let () = Alcotest.run "test_crypto" [
   ("sha256", sha256_tests);
   ("hash160", hash160_tests);
@@ -649,4 +1114,5 @@ let () = Alcotest.run "test_crypto" [
   ("hardware_accel", hardware_accel_tests);
   ("bip66_der_encoding", bip66_der_tests);
   ("defined_hashtype", defined_hashtype_tests);
+  ("bip340_schnorr_w95", bip340_schnorr_tests);
 ]

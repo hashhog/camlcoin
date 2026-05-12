@@ -159,7 +159,8 @@ type inv_type =
   | InvBlock           (* 2 *)
   | InvFilteredBlock   (* 3 *)
   | InvCompactBlock    (* 4 *)
-  | InvWitnessTx       (* 0x40000001 *)
+  | InvWtx             (* 5  — Core MSG_WTX; wtxid-relay inv (BIP-339) *)
+  | InvWitnessTx       (* 0x40000001 — legacy witness tx inv *)
   | InvWitnessBlock    (* 0x40000002 *)
   | InvUnknown of int32
 
@@ -169,6 +170,7 @@ let inv_type_to_int32 = function
   | InvBlock -> 2l
   | InvFilteredBlock -> 3l
   | InvCompactBlock -> 4l
+  | InvWtx -> 5l
   | InvWitnessTx -> 0x40000001l
   | InvWitnessBlock -> 0x40000002l
   | InvUnknown n -> n
@@ -179,6 +181,7 @@ let inv_type_of_int32 = function
   | 2l -> InvBlock
   | 3l -> InvFilteredBlock
   | 4l -> InvCompactBlock
+  | 5l -> InvWtx
   | n when n = 0x40000001l -> InvWitnessTx
   | n when n = 0x40000002l -> InvWitnessBlock
   | n -> InvUnknown n

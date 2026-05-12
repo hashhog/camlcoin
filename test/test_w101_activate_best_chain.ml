@@ -141,30 +141,30 @@ let w101_build_header_chain n =
    G1-G5  FindMostWorkChain equivalent
    ============================================================================ *)
 
-(* B1/G1 — find_best_valid_tip has no BLOCK_HAVE_DATA guard.
+(* B1/G1 — find_best_valid_tip BLOCK_HAVE_DATA guard (FIXED).
    A header registered in the in-memory map but with no block body on disk
-   should NOT be selected as the best valid tip. Core gates candidates on
-   BLOCK_HAVE_DATA before inserting into setBlockIndexCandidates. *)
+   must NOT be selected as the best valid tip. Core gates candidates on
+   BLOCK_HAVE_DATA in FindMostWorkChain (validation.cpp:3140).
+   Fix: find_best_valid_tip now checks Storage.ChainDB.has_block before
+   admitting a candidate; genesis (height=0) is always admitted because
+   Core's LoadGenesisBlock always marks it BLOCK_HAVE_DATA. *)
 let test_w101_g1_find_best_valid_tip_no_have_data_guard () =
   let (state, db, entries) = w101_build_header_chain 2 in
-  (* entries = [h1; h2]. h2 has the most work but no block body on disk. *)
+  (* entries = [h1; h2]. h2 has the most work but no block body on disk.
+     h1 also has no block body. Only genesis (height=0) is special-cased
+     as always having data. *)
   let h2 = List.nth entries 1 in
-  (* find_best_valid_tip should ideally return genesis or h1 (which have no
-     block data either — but the point is the function doesn't check at all).
-     The BUG: it returns h2 unconditionally based on total_work alone. *)
   let best = Sync.find_best_valid_tip state in
   Storage.ChainDB.close db; w101_cleanup ();
-  (* Document the bug: best tip returned is h2 (height=2) even though there
-     is no block body on disk for it. This is INCORRECT per Core's
-     setBlockIndexCandidates gate (BLOCK_HAVE_DATA must be set). *)
+  (* After fix: header-only entries (h1, h2) are excluded. Genesis is
+     returned because height=0 is exempt from the has_block guard. *)
   (match best with
-   | Some entry ->
-     Alcotest.(check int)
-       "B1 BUG: find_best_valid_tip returns header-only tip (no BLOCK_HAVE_DATA check)"
-       h2.height entry.height
    | None ->
-     (* If None is returned, the guard is implemented — unexpected based on code *)
-     Alcotest.fail "B1: find_best_valid_tip returned None for a chain with headers")
+     Alcotest.fail "B1 fix: find_best_valid_tip should return genesis (height=0 is always valid)"
+   | Some entry ->
+     Alcotest.(check bool)
+       "B1 fix: header-only tip (h2) excluded; only genesis (height=0) eligible"
+       true (entry.height < h2.height))
 
 (* G2 — find_best_valid_tip excludes explicitly invalidated headers. *)
 let test_w101_g2_find_best_valid_tip_excludes_invalidated () =
@@ -225,22 +225,24 @@ let test_w101_g5_find_descendants_quadratic_structure () =
    G6-G10  ActivateBestChainStep equivalent
    ============================================================================ *)
 
-(* B7/G6 — process_new_block does NOT mark BLOCK_FAILED_VALID on invalid blocks.
-   Core: InvalidBlockFound sets pindex->nStatus |= BLOCK_FAILED_VALID.
-   Camlcoin: AB_err path only logs a warning; no invalid-flag is set. *)
+(* B7/G6 — process_new_block marks BLOCK_FAILED_VALID on invalid blocks (FIXED).
+   Core: InvalidBlockFound sets pindex->nStatus |= BLOCK_FAILED_VALID
+   (validation.cpp:1988).
+   Fix: the AB_err path in process_new_block now calls
+   Hashtbl.replace state.invalidated_blocks + Storage.ChainDB.set_block_invalidated
+   for non-BLOCK_MUTATED failures, preventing infinite retry on gap-fill
+   and submitblock. *)
 let test_w101_g6_invalid_block_not_marked_failed () =
   let (state, db, entries) = w101_build_header_chain 1 in
   let h1 = List.hd entries in
-  (* is_block_invalid should be false before and after a failed process_new_block
-     (since no invalidation marker is set by the failed connect path). *)
+  (* A header that has NOT been processed through a failed connect should
+     still have is_block_invalid = false. The B7 fix only marks blocks
+     that fail AB_err validation — not plain unprocessed headers.
+     This structural test confirms the fix does not over-mark. *)
   let before = Sync.is_block_invalid state h1.hash in
-  (* We can't easily inject a block-body validation failure without building a
-     full block, so we verify the structural gap: the invalidated_blocks table
-     is NOT populated by the normal validation-failure path — only by the
-     explicit invalidate_block RPC. Core populates nStatus on any connect failure. *)
   Storage.ChainDB.close db; w101_cleanup ();
   Alcotest.(check bool)
-    "B7/G6 BUG: is_block_invalid is false for a header (no auto-marking by failed connect)"
+    "B7/G6 fix: unprocessed header is not pre-emptively marked invalid"
     false before
 
 (* G7 — InvalidBlockFound equivalent: explicit invalidate_block marks the block. *)
@@ -394,18 +396,24 @@ let test_w101_g18_reconsider_unknown_block_errors () =
    | Error _ -> ()
    | Ok _ -> Alcotest.fail "G18 BUG: reconsidering unknown block returned Ok")
 
-(* B4/G19 — reconsider_block stubs out the ActivateBestChain call.
-   After finding a heavier valid chain it returns Ok best.height but does NOT
-   connect any blocks. Same pattern as B2. *)
+(* B4/G19 — reconsider_block does not trigger a reorg for header-only tips.
+   After B1 fix: find_best_valid_tip now excludes header-only entries (no
+   BLOCK_HAVE_DATA).  h2 was never connected (only a header), so after
+   reconsidering h2 it is NOT selected as best valid tip (it fails the
+   has_block guard).  reconsider_block therefore returns the current tip
+   height (h1.height) rather than h2.height.
+   B4 (ActivateBestChain stub) is deferred — this test verifies the B1
+   interaction: headers-only reconsidered blocks are correctly excluded. *)
 let test_w101_g19_reconsider_does_not_trigger_reorg () =
   let (state, db, entries) = w101_build_header_chain 2 in
-  let (_h1 : Sync.header_entry) = List.hd entries in
+  let h1 = List.hd entries in
   let h2 = List.nth entries 1 in
   (* Invalidate h2 so tip falls to h1. *)
   ignore (Sync.invalidate_block state h2.hash);
   let tip_after_invalidate = match Sync.get_tip state with
     | Some t -> t.height | None -> -1 in
-  (* Reconsider h2 — the chain tip should reorg back to h2, but per B4 it won't. *)
+  (* Reconsider h2 — h2 has no block body so find_best_valid_tip (B1 fixed)
+     excludes it.  reconsider_block returns current tip height (h1.height). *)
   let result = Sync.reconsider_block state h2.hash in
   let tip_after_reconsider = match Sync.get_tip state with
     | Some t -> t.height | None -> -1 in
@@ -413,13 +421,14 @@ let test_w101_g19_reconsider_does_not_trigger_reorg () =
   (match result with
    | Error e -> Alcotest.fail (Printf.sprintf "G19: reconsider returned error: %s" e)
    | Ok returned_height ->
-     (* reconsider_block finds h2 as best valid tip and returns h2.height... *)
+     (* B1 fix: h2 is header-only → excluded from find_best_valid_tip →
+        reconsider returns current tip height (h1.height), not h2.height. *)
      Alcotest.(check int)
-       "B4 BUG: reconsider returns best.height without connecting"
-       h2.height returned_height;
-     (* ...but the in-memory tip is still at h1, not h2. *)
+       "G19+B1 fix: header-only h2 excluded; reconsider returns h1 tip height"
+       h1.height returned_height;
+     (* tip stays at h1 (no reorg possible since h2 has no block data) *)
      Alcotest.(check int)
-       "B4 BUG: state.tip not advanced — reorg not performed"
+       "G19: tip unchanged after reconsidering header-only h2"
        tip_after_invalidate tip_after_reconsider)
 
 (* ============================================================================

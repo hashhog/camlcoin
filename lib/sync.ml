@@ -4313,6 +4313,15 @@ let rec connect_stored_blocks (state : chain_state) : int =
           let msg = Validation.block_error_to_string e in
           Logs.warn (fun m ->
             m "Stored block at height %d failed validation: %s" next_height msg);
+          (* B10 fix: mark the stored block BLOCK_FAILED_VALID so that
+             gap-fill does not retry the same invalid block indefinitely on
+             restart.  Core calls InvalidBlockFound from ConnectBlock which
+             sets pindex->nStatus |= BLOCK_FAILED_VALID
+             (validation.cpp:1988).  Without this mark the same block is
+             retried on every gap-fill round and every restart. *)
+          let block_hash_key = Cstruct.to_string entry.hash in
+          Hashtbl.replace state.invalidated_blocks block_hash_key ();
+          Storage.ChainDB.set_block_invalidated state.db entry.hash;
           0
 
 let process_new_block ?(f_requested = false)
@@ -4500,6 +4509,23 @@ let process_new_block ?(f_requested = false)
           Logs.warn (fun m ->
             m "Block %s at height %d failed validation: %s"
               (Types.hash256_to_hex_display hash) height msg);
+          (* B7 fix: mark the block BLOCK_FAILED_VALID so that gap-fill and
+             submitblock do not retry the same invalid block on every
+             invocation.  Core calls InvalidBlockFound which sets
+             pindex->nStatus |= BLOCK_FAILED_VALID
+             (validation.cpp:1988).  Without this mark the same invalid
+             block is re-submitted via submitblock or gap-fill and will
+             re-run full validation every time. *)
+          let is_mutated = match e with
+            | Validation.BlockBadWitnessCommitment
+            | Validation.BlockBadWitnessNonceSize
+            | Validation.BlockUnexpectedWitness -> true
+            | _ -> false
+          in
+          if not is_mutated then begin
+            Hashtbl.replace state.invalidated_blocks hash_key ();
+            Storage.ChainDB.set_block_invalidated state.db hash
+          end;
           (* G16/G17 fix: Misbehaving on BLOCK_INVALID_HEADER and BLOCK_FAILED_VALID
              (matching Bitcoin Core's InvalidBlockFound / MaybePunishNodeForBlock).
              BLOCK_MUTATED errors (witness commitment, nonce-size, unexpected-witness)
@@ -4507,12 +4533,6 @@ let process_new_block ?(f_requested = false)
              and is not at fault.  All other validation failures indicate the peer
              sent a provably invalid block and should be penalised at score 100.
              Reference: bitcoin-core/src/net_processing.cpp MaybePunishNodeForBlock. *)
-          let is_mutated = match e with
-            | Validation.BlockBadWitnessCommitment
-            | Validation.BlockBadWitnessNonceSize
-            | Validation.BlockUnexpectedWitness -> true
-            | _ -> false
-          in
           if not is_mutated then
             (match peer_id, misbehavior_handler with
              | Some pid, Some handler -> handler pid "invalid_block"
@@ -4667,14 +4687,28 @@ let find_descendants (state : chain_state) (target_hash : Types.hash256)
 
 (* Find the next best valid chain tip after invalidating a block *)
 let find_best_valid_tip (state : chain_state) : header_entry option =
-  let best = ref None in
-  Hashtbl.iter (fun key entry ->
+  (* B1 fix: only consider entries that have block data on disk.
+     Core gates setBlockIndexCandidates on BLOCK_HAVE_DATA
+     (validation.cpp:3140 fMissingData check in FindMostWorkChain).
+     Without this guard, header-only entries (headers-first sync, pruned
+     nodes) can be selected as the best tip and trigger a reorganize that
+     aborts mid-way with "Missing block at height N", leaving the chain
+     rewound but not reconnected.
+     Genesis (height=0) is special-cased: Core always sets BLOCK_HAVE_DATA
+     for genesis in LoadGenesisBlock and it is the chain anchor. *)
+  let best : header_entry option ref = ref None in
+  Hashtbl.iter (fun key (entry : header_entry) ->
     if not (Hashtbl.mem state.invalidated_blocks key) then begin
-      match !best with
-      | None -> best := Some entry
-      | Some b ->
-        if Consensus.work_compare entry.total_work b.total_work > 0 then
-          best := Some entry
+      let have_data =
+        entry.height = 0 || Storage.ChainDB.has_block state.db entry.hash
+      in
+      if have_data then begin
+        match !best with
+        | None -> best := Some entry
+        | Some b ->
+          if Consensus.work_compare entry.total_work b.total_work > 0 then
+            best := Some entry
+      end
     end
   ) state.headers;
   !best

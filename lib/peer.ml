@@ -1408,7 +1408,7 @@ let handle_getdata (peer : peer) (items : P2p.inv_vector list)
           not_found := iv :: !not_found;
           Lwt.return_unit
         end
-      | P2p.InvTx | P2p.InvWitnessTx ->
+      | P2p.InvTx | P2p.InvWtx | P2p.InvWitnessTx ->
         begin match lookup_tx iv.hash with
         | Some data ->
           let r = Serialize.reader_of_cstruct data in
@@ -1668,7 +1668,7 @@ let passes_feefilter (peer : peer) (entry : inv_entry) : bool =
 let queue_inv (peer : peer) (entry : inv_entry) : unit =
   if peer.state = Ready then begin
     let is_tx = match entry.inv_type with
-      | P2p.InvTx | P2p.InvWitnessTx -> true
+      | P2p.InvTx | P2p.InvWtx | P2p.InvWitnessTx -> true
       | _ -> false
     in
     (* Skip if peer opted out of tx relay or if tx is below feefilter *)
@@ -1686,7 +1686,10 @@ let make_block_inv (hash : Types.hash256) : inv_entry =
 
 (* Create an inv entry for a transaction with its fee rate in sat/kvB *)
 let make_tx_inv ~(witness : bool) (hash : Types.hash256) (fee_rate_satkvb : int64) : inv_entry =
-  let inv_type = if witness then P2p.InvWitnessTx else P2p.InvTx in
+  (* Core MSG_WTX = 5 (InvWtx) for wtxid-relay peers per BIP-339 / protocol.h.
+     InvWitnessTx (0x40000001) is the legacy pre-BIP-339 witness-tx flag and
+     should NOT be used as the wtxid-relay inv type. *)
+  let inv_type = if witness then P2p.InvWtx else P2p.InvTx in
   { inv_type; hash; fee_rate = Some fee_rate_satkvb }
 
 (* Inventory trickling: check how many items are queued *)

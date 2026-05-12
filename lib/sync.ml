@@ -4618,7 +4618,7 @@ let handle_mempool_msg_for
         let fee_rate_per_kb = entry.fee_rate *. 4000.0 in
         if fee_rate_per_kb >= feefilter_rate then begin
           let inv_entry = if peer.Peer.wtxid_relay then
-            P2p.{ inv_type = InvWitnessTx; hash = entry.wtxid }
+            P2p.{ inv_type = InvWtx; hash = entry.wtxid }
           else
             P2p.{ inv_type = InvTx; hash = entry.txid }
           in

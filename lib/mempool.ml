@@ -1717,6 +1717,28 @@ let check_conflict (mp : mempool) (tx : Types.transaction)
    ============================================================================ *)
 
 (* Verify all input scripts for a transaction *)
+(* W96 Bug 12 helper: TX_WITNESS_STRIPPED detection — when a tx that should
+   have a witness (its input scripts are witness programs) was relayed without
+   one, peer should re-fetch with witness.  Detect via prev script pubkey +
+   empty witness on that input.  Anchor (P2A) spends are exempt — they are
+   valid without a witness. *)
+let spends_non_anchor_witness_prog (mp : mempool) (tx : Types.transaction) : bool =
+  let result = ref false in
+  List.iteri (fun i inp ->
+    if not !result then
+      match lookup_utxo mp inp.Types.previous_output with
+      | None -> ()
+      | Some entry ->
+        if Script.is_p2a entry.Utxo.script_pubkey then ()
+        else match Script.get_witness_program entry.Utxo.script_pubkey with
+        | None -> ()
+        | Some _ ->
+          if i >= List.length tx.witnesses ||
+             (List.nth tx.witnesses i).Types.items = []
+          then result := true
+  ) tx.inputs;
+  !result
+
 let verify_tx_scripts (mp : mempool) (tx : Types.transaction)
     : (unit, string) result =
   (* Mempool uses standard (policy) flags — stricter than consensus block flags.
@@ -1768,7 +1790,18 @@ let verify_tx_scripts (mp : mempool) (tx : Types.transaction)
   ) tx.inputs;
 
   match !error with
-  | Some e -> Error e
+  | Some e ->
+    (* W96 Bug 12: TX_WITNESS_STRIPPED detection.  Core PolicyScriptChecks
+       (validation.cpp:1147-1151) checks `!tx.HasWitness() &&
+       SpendsNonAnchorWitnessProg(tx, m_view)` and re-tags the error as
+       TX_WITNESS_STRIPPED so the p2p layer can request the tx WITH witness
+       from a peer.  Without this signal, peers cache the bad tx without
+       knowing to retry, hurting block-relay resilience. *)
+    let has_witness = List.exists (fun w -> w.Types.items <> []) tx.witnesses in
+    if not has_witness && spends_non_anchor_witness_prog mp tx then
+      Error (Printf.sprintf "witness-stripped: %s" e)
+    else
+      Error e
   | None -> Ok ()
 
 (* ============================================================================
@@ -1778,34 +1811,77 @@ let verify_tx_scripts (mp : mempool) (tx : Types.transaction)
 (* Validate and add a transaction to the mempool.
    When ~dry_run:true, all validation is performed but the transaction
    is not actually inserted into the mempool. *)
-let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (tx : Types.transaction)
+let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=false)
+    (mp : mempool) (tx : Types.transaction)
     : (mempool_entry, string) result =
   let txid = Crypto.compute_txid tx in
   let txid_key = Cstruct.to_string txid in
 
-  (* Check for duplicate *)
-  if Hashtbl.mem mp.entries txid_key then
-    Error "Transaction already in mempool"
-
-  (* Check for mempool input conflicts (double-spends) *)
-  else
-    let conflict = if not dry_run then check_conflict mp tx else None in
-    if conflict <> None then
-      let conflict_txid = Option.get conflict in
-      Error (Printf.sprintf "txn-mempool-conflict: spends same input as %s"
-        (Types.hash256_to_hex_display conflict_txid))
-
-  (* Basic structure validation *)
-  else match Validation.check_transaction tx with
+  (* Basic structure validation (matches Core PreChecks step 1: CheckTransaction).
+     Must run BEFORE List.hd / coinbase check so empty-inputs txs don't crash. *)
+  (match Validation.check_transaction tx with
   | Error e -> Error (Validation.tx_error_to_string e)
   | Ok () ->
-    (* Must not be a coinbase *)
-    let first_input = List.hd tx.inputs in
-    if Cstruct.equal first_input.previous_output.txid Types.zero_hash then
-      Error "Coinbase in mempool"
+
+  (* W96 Bug 1: coinbase rejection.  Core: validation.cpp:803 — tx.IsCoinBase()
+     requires vin.size() == 1 AND prevout.IsNull() (both txid==0 AND vout==-1).
+     Previously camlcoin only checked first_input.txid == zero, which
+     mis-rejected non-coinbase txs whose first input happens to spend a
+     null-txid prevout AND under-rejected multi-input txs with a null first
+     input. *)
+  if Validation.is_coinbase_tx tx then
+    Error "coinbase"
+  else
+
+  (* Check for duplicate by txid + wtxid.
+     W96 Bug 3: distinguish wtxid-exact-duplicate ("txn-already-in-mempool")
+     from same-txid-different-witness ("txn-same-nonwitness-data-in-mempool").
+     Matches Core validation.cpp:823-830. *)
+  (match Hashtbl.find_opt mp.entries txid_key with
+  | Some existing ->
+    let new_wtxid = Crypto.compute_wtxid tx in
+    if Cstruct.equal existing.wtxid new_wtxid then
+      Error "txn-already-in-mempool"
+    else
+      Error "txn-same-nonwitness-data-in-mempool"
+  | None ->
+
+  (* W96 Bug 4: txn-already-known — tx outputs already in the chain coins
+     cache means the tx is already CONFIRMED.  Core: validation.cpp:858-863.
+     If ANY output of (txid, n) is already a UTXO, the tx is known. *)
+  let already_known =
+    let found = ref false in
+    List.iteri (fun i _out ->
+      if not !found then begin
+        let op = { Types.txid; vout = Int32.of_int i } in
+        if is_confirmed_utxo mp op then found := true
+      end
+    ) tx.outputs;
+    !found
+  in
+  if already_known then
+    Error "txn-already-known"
+  else
+
+  (* Check for mempool input conflicts (double-spends) *)
+  let conflict = if not dry_run then check_conflict mp tx else None in
+  if conflict <> None then
+    let conflict_txid = Option.get conflict in
+    Error (Printf.sprintf "txn-mempool-conflict: spends same input as %s"
+      (Types.hash256_to_hex_display conflict_txid))
+
+  else begin
+    (* W96 Bug 2: MIN_STANDARD_TX_NONWITNESS_SIZE (CVE-2017-12842) must run
+       independently of require_standard.  Core validation.cpp:812-814 places
+       this check OUTSIDE the require_standard guard so that even non-standard
+       relay (regtest/signet/-acceptnonstdtxn) rejects 64-byte malleable txs. *)
+    let nonwitness_size = compute_tx_nonwitness_size tx in
+    if nonwitness_size < min_standard_tx_nonwitness_size then
+      Error "tx-size-small"
+    else
 
     (* Task 7: IsStandard checks (skipped when require_standard=false) *)
-    else match (if mp.require_standard then is_standard_tx mp.min_relay_fee tx else Ok ()) with
+    (match (if mp.require_standard then is_standard_tx mp.min_relay_fee tx else Ok ()) with
     | Error e -> Error e
     | Ok () ->
 
@@ -1859,16 +1935,39 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (t
               (Types.hash256_to_hex_display prev.txid)
               prev.vout)
           | Some entry ->
+            (* W96 Bug 5: coinbase maturity off-by-one.  Core CheckTxInputs uses
+               nSpendHeight = active_chainstate.m_chain.Height() + 1 (the next
+               block) as the spend height.  Previously camlcoin used the
+               current tip height, which is one block too strict — a coinbase
+               at tip-100 was rejected when Core would accept it on the next
+               block.  Reference: validation.cpp:892 (Height()+1 passed to
+               CheckTxInputs), consensus/tx_verify.cpp:88. *)
+            let spend_height = mp.current_height + 1 in
             if entry.is_coinbase &&
-               mp.current_height - entry.height < Consensus.coinbase_maturity then
+               spend_height - entry.height < Consensus.coinbase_maturity then
               error := Some "Spending immature coinbase"
+            (* W96 Bug 7: per-input MoneyRange check.  Core's CheckTxInputs:
+               consensus/tx_verify.cpp:103-105 — every coin.out.nValue must be
+               in [0, MAX_MONEY].  Previously camlcoin accumulated input value
+               without this gate, so a negative or out-of-range UTXO (from a
+               corrupted UTXO set or malicious peer chainstate) could silently
+               poison fee math. *)
+            else if entry.value < 0L || entry.value > Consensus.max_money then
+              error := Some "bad-txns-inputvalues-outofrange"
             else begin
               input_sum := Int64.add !input_sum entry.value;
-              utxo_heights.(i) <- entry.height;
-              utxo_mtps.(i) <- mp.current_median_time;
-              (* Track mempool dependencies *)
-              if Hashtbl.mem mp.entries (Cstruct.to_string prev.txid) then
-                depends := prev.txid :: !depends
+              (* W96 Bug 8: accumulated input MoneyRange.  Core CheckTxInputs:
+                 consensus/tx_verify.cpp:108-110 — after each addition,
+                 nValueIn must remain in [0, MAX_MONEY]. *)
+              if !input_sum < 0L || !input_sum > Consensus.max_money then
+                error := Some "bad-txns-inputvalues-outofrange"
+              else begin
+                utxo_heights.(i) <- entry.height;
+                utxo_mtps.(i) <- mp.current_median_time;
+                (* Track mempool dependencies *)
+                if Hashtbl.mem mp.entries (Cstruct.to_string prev.txid) then
+                  depends := prev.txid :: !depends
+              end
             end
         end
       ) tx.inputs;
@@ -1892,15 +1991,62 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (t
             Error "Output exceeds input"
           else begin
             let fee = Int64.sub !input_sum output_sum in
+            (* W96 Bug 9: tx fee MoneyRange.  Core CheckTxInputs:
+               consensus/tx_verify.cpp:113-115 — txfee = value_in - value_out
+               must be in [0, MAX_MONEY].  Previously camlcoin only checked
+               output_sum <= input_sum, missing the upper bound.  An
+               attacker-controlled UTXO set could produce a fee field that
+               wraps the int64 fee counter in the mempool aggregate. *)
+            if fee < 0L || fee > Consensus.max_money then
+              Error "bad-txns-fee-outofrange"
+            else
             let weight = Validation.compute_tx_weight tx in
-            let fee_rate =
-              Int64.to_float fee /. float_of_int weight in
 
-            (* Check minimum relay fee (uses dynamic minimum when mempool is full) *)
+            (* Sigop-adjusted vsize — policy/policy.cpp:395-398, kernel/mempool_entry.h:110-112.
+               Core's GetTxSize() = GetVirtualTransactionSize(nTxWeight, sigOpCost, nBytesPerSigOp).
+               When the sigop cost inflates vsize beyond the raw weight/4 value, the larger
+               vsize is used for feerate comparisons and ancestor/descendant size accounting.
+               sigops_cost is already computed above for the MAX_STANDARD_TX_SIGOPS_COST gate.
+               Hoisted ABOVE the fee gate (was below) so the floor is computed
+               against the sigop-adjusted vsize, matching Core validation.cpp:948
+               (CheckFeeRate uses ws.m_vsize, the sigop-adjusted value). *)
+            let vsize = Validation.get_virtual_transaction_size
+              ~weight ~sigop_cost:sigops_cost
+              ~bytes_per_sigop:Consensus.default_bytes_per_sigop in
+
+            let fee_rate =
+              Int64.to_float fee /. float_of_int (max 1 vsize) in
+
+            (* W96 Bug 6: PreCheckEphemeralTx — dust outputs require 0 fee
+               (ephemeral anchor policy).  Core validation.cpp:935-938 runs
+               this only when require_standard, BEFORE the fee floor check.
+               Previously camlcoin only ran it from package paths, never from
+               single-tx ATMP.  Skip on bypass_limits (reorg refill). *)
+            (* Inline equivalent of pre_check_ephemeral_tx (defined later) so
+               the gate runs at the right point in PreChecks without forward
+               reference.  Logic mirrors mempool.ml:pre_check_ephemeral_tx. *)
+            let ephemeral_err =
+              if mp.require_standard && not bypass_limits then
+                let has_dust = List.exists (is_dust mp.min_relay_fee) tx.outputs in
+                if has_dust && fee <> 0L then
+                  Some "tx with dust output must be 0-fee"
+                else None
+              else None
+            in
+            (match ephemeral_err with
+             | Some e -> Error e
+             | None ->
+
+            (* W96 Bug 10: fee floor uses sigop-adjusted vsize, not raw weight.
+               Core validation.cpp:948 calls CheckFeeRate(ws.m_vsize, ...).
+               Previously camlcoin computed min_fee = eff_min * weight / 4000
+               which under-charges sigop-heavy txs (a tx with high sigops has
+               vsize > weight/4 and should owe more relay fee).  Use
+               integer-truncation math matching Core's GetFee (CFeeRate
+               feerate.cpp:23: amount * size / 1000). *)
             let eff_min = effective_min_fee mp in
-            let min_fee = Int64.of_float (
-              Int64.to_float eff_min *.
-              float_of_int weight /. 4000.0) in
+            let min_fee =
+              Int64.div (Int64.mul eff_min (Int64.of_int vsize)) 1000L in
 
             if fee < min_fee && not bypass_fee_check then
               Error "Fee below minimum relay fee"
@@ -1917,21 +2063,17 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (t
             | Error e -> Error e
             | Ok () ->
 
-            (* Sigop-adjusted vsize — policy/policy.cpp:395-398, kernel/mempool_entry.h:110-112.
-               Core's GetTxSize() = GetVirtualTransactionSize(nTxWeight, sigOpCost, nBytesPerSigOp).
-               When the sigop cost inflates vsize beyond the raw weight/4 value, the larger
-               vsize is used for feerate comparisons and ancestor/descendant size accounting.
-               sigops_cost is already computed above for the MAX_STANDARD_TX_SIGOPS_COST gate.
-               Computed here (before the TRUC check) so check_truc_policy receives the
-               correct sigop-adjusted vsize matching Core's SingleTRUCChecks. *)
-            let vsize = Validation.get_virtual_transaction_size
-              ~weight ~sigop_cost:sigops_cost
-              ~bytes_per_sigop:Consensus.default_bytes_per_sigop in
-
             (* TRUC/v3 policy (BIP-431).
                Pass sigop-adjusted vsize — Core truc_policy.cpp:SingleTRUCChecks
-               receives the same adjusted vsize. *)
-            match check_truc_policy mp tx !depends vsize with
+               receives the same adjusted vsize.
+               W96 Bug 11: skip TRUC checks when bypass_limits is set.  Core
+               validation.cpp:954 wraps SingleTRUCChecks in
+               `if (!args.m_bypass_limits)` so that reorg refill (txs from a
+               disconnected block) bypasses the TRUC v3 inheritance rules.
+               Without this skip, valid v3 chains that survived a reorg would
+               be re-rejected when the parent has not yet re-entered the
+               mempool. *)
+            match (if bypass_limits then Ok () else check_truc_policy mp tx !depends vsize) with
             | Error e -> Error e
             | Ok () ->
 
@@ -2038,10 +2180,11 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) (mp : mempool) (t
               zmq_notify_tx mp txid tx true
             end;
 
-            Ok entry
+            Ok entry)
           end
         end
-    end)
+    end))
+  end))
 
 (* ============================================================================
    Block Processing
@@ -2458,29 +2601,36 @@ type accept_result = {
 
 let accept_to_memory_pool ?(test_accept=false) (mp : mempool) (tx : Types.transaction)
     : accept_result =
-  let txid = Crypto.compute_txid tx in
-  if test_accept then begin
-    (* Dry-run: validate without modifying state *)
-    match accept_transaction ~dry_run:true mp tx with
-    | Ok entry ->
-      { atmp_accepted = true; atmp_txid = txid; atmp_fee = entry.fee;
-        (* ceil(weight / 4) — must round up, not truncate; policy/policy.cpp:395-398 *)
-        atmp_vsize = (entry.weight + 3) / 4;
-        atmp_reject_reason = None }
-    | Error reason ->
-      { atmp_accepted = false; atmp_txid = txid; atmp_fee = 0L; atmp_vsize = 0;
-        atmp_reject_reason = Some reason }
-  end else begin
-    match accept_transaction mp tx with
-    | Ok entry ->
-      { atmp_accepted = true; atmp_txid = txid; atmp_fee = entry.fee;
-        (* ceil(weight / 4) — must round up, not truncate; policy/policy.cpp:395-398 *)
-        atmp_vsize = (entry.weight + 3) / 4;
-        atmp_reject_reason = None }
-    | Error reason ->
-      { atmp_accepted = false; atmp_txid = txid; atmp_fee = 0L; atmp_vsize = 0;
-        atmp_reject_reason = Some reason }
-  end
+  (* W96 Bug 13: ATMP entry point must catch ALL exceptions.  Matches the
+     W95-class hardening — peer-controlled inputs (txid/wtxid computation,
+     script eval via libsecp, deeply nested helpers) MUST NOT be allowed to
+     propagate failwith/Not_found/Invalid_argument out of ATMP, since RPC,
+     P2P and miner paths call ATMP without their own try/with.  Core's
+     equivalent is the ATMPArgs::m_state mechanism — every failure is
+     reflected through TxValidationState, never via C++ exceptions. *)
+  let txid =
+    try Crypto.compute_txid tx
+    with _ -> Types.zero_hash
+  in
+  let safe_run () =
+    try
+      if test_accept then accept_transaction ~dry_run:true mp tx
+      else accept_transaction mp tx
+    with
+    | Failure msg -> Error (Printf.sprintf "atmp-exception: %s" msg)
+    | Invalid_argument msg -> Error (Printf.sprintf "atmp-exception: %s" msg)
+    | Not_found -> Error "atmp-exception: Not_found"
+    | exn -> Error (Printf.sprintf "atmp-exception: %s" (Printexc.to_string exn))
+  in
+  match safe_run () with
+  | Ok entry ->
+    { atmp_accepted = true; atmp_txid = txid; atmp_fee = entry.fee;
+      (* ceil(weight / 4) — must round up, not truncate; policy/policy.cpp:395-398 *)
+      atmp_vsize = (entry.weight + 3) / 4;
+      atmp_reject_reason = None }
+  | Error reason ->
+    { atmp_accepted = false; atmp_txid = txid; atmp_fee = 0L; atmp_vsize = 0;
+      atmp_reject_reason = Some reason }
 
 (* ============================================================================
    Orphan Transaction Pool (Task 8)

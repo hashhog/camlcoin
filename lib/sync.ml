@@ -3639,11 +3639,22 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
             (* Clear sig cache so stale results from the abandoned chain
                don't leak into post-reorg validation. *)
             Sig_cache.clear_global ();
-            (* Mempool refill: re-add disconnected non-coinbase txs. *)
+            (* Mempool refill: re-add disconnected non-coinbase txs.
+               W96 Bug 14: pass ~bypass_fee_check:true and ~bypass_limits:true
+               so the refill path matches Core's args.m_bypass_limits=true for
+               reorg-driven re-acceptance (validation.cpp ProcessNewBlock →
+               UpdateMempoolForReorg).  Without these, txs whose original
+               feerate was at or just above floor (now subject to a raised
+               dynamic floor due to mempool churn) and TRUC chains valid
+               under the old chain but with parents not yet re-accepted would
+               be wrongly dropped. *)
             (match ibd.mempool with
              | Some mp ->
                List.iter (fun tx ->
-                 ignore (Mempool.add_transaction mp tx)
+                 ignore (Mempool.add_transaction
+                           ~bypass_fee_check:true
+                           ~bypass_limits:true
+                           mp tx)
                ) !disconnected_txs;
                Logs.debug (fun m ->
                  m "Re-added %d disconnected transactions to mempool"

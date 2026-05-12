@@ -2289,11 +2289,16 @@ let v2_receive_bytes (state : v2_state) (data : Cstruct.t) : bool =
       if not state.recv_len_known then begin
         if Cstruct.length state.recv_buffer >= Bip324.length_len then begin
           let enc_len = Cstruct.sub state.recv_buffer 0 Bip324.length_len in
-          state.recv_len <- bip324_decrypt_length cipher enc_len;
-          state.recv_len_known <- true;
-          state.recv_buffer <- Cstruct.sub state.recv_buffer Bip324.length_len
-            (Cstruct.length state.recv_buffer - Bip324.length_len);
-          process ()
+          let decoded_len = bip324_decrypt_length cipher enc_len in
+          if decoded_len > max_message_size then
+            false  (* Oversized message — abort connection (Core MAX_PROTOCOL_MESSAGE_LENGTH = 4 MB) *)
+          else begin
+            state.recv_len <- decoded_len;
+            state.recv_len_known <- true;
+            state.recv_buffer <- Cstruct.sub state.recv_buffer Bip324.length_len
+              (Cstruct.length state.recv_buffer - Bip324.length_len);
+            process ()
+          end
         end else
           true
       end else begin

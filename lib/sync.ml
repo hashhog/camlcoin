@@ -920,7 +920,7 @@ let unconnecting_headers_count (state : chain_state) (peer_id : int) : int =
   | Some n -> n
   | None -> 0
 
-let process_headers (state : chain_state)
+let process_headers ?(min_pow_checked = true) (state : chain_state)
     (headers : Types.block_header list) : (int, string) result =
   (* Header flood prevention: reject if we already have too many headers
      and chain work is below the minimum *)
@@ -940,8 +940,29 @@ let process_headers (state : chain_state)
       if !error = None then
         match validate_header state header with
         | Ok entry ->
-          accept_header state entry;
-          incr accepted
+          (* G8: per-header minimum-chain-work gate.
+             Core: bitcoin-core/src/validation.cpp:4229 —
+               if (!min_pow_checked)
+                 return state.Invalid(BLOCK_HEADER_LOW_WORK,
+                                      "too-little-chainwork");
+             When min_pow_checked=false (i.e. headers arrive from an
+             untrusted peer that has not yet been verified to be on a
+             chain meeting nMinimumChainWork), reject any header whose
+             accumulated chain work falls below the network minimum.
+             This prevents a peer from feeding us a long low-work fork
+             header-by-header to consume memory.  Default true (safe:
+             gate skipped) so that submitblock and internal callers are
+             unaffected. *)
+          if (not min_pow_checked) &&
+             not (Consensus.meets_minimum_chain_work
+                    entry.total_work state.network) then begin
+            if !first_error = None then
+              first_error := Some "too-little-chainwork";
+            error := Some "too-little-chainwork"
+          end else begin
+            accept_header state entry;
+            incr accepted
+          end
         | Error "Header already known" ->
           incr rejected
         | Error e ->
@@ -1133,7 +1154,7 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
         (* Oops — this is actually fresh.  Process it immediately. *)
         if count > 0 then
           Logs.info (fun m -> m "Pre-drained %d stale responses, found fresh batch" count);
-        let _r = process_headers state headers in
+        let _r = process_headers ~min_pow_checked:false state headers in
         drain_queued_stale count
       end else begin
         Logs.debug (fun m -> m "Pre-drain: discarded stale response (%d headers)" (List.length headers));
@@ -1235,7 +1256,7 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
     end else
       process_headers_and_continue state headers count
   and process_headers_and_continue state headers count =
-    match process_headers state headers with
+    match process_headers ~min_pow_checked:false state headers with
     | Ok accepted ->
       Logs.info (fun m -> m "Accepted %d headers, tip at height %d"
         accepted state.headers_synced);

@@ -3404,30 +3404,70 @@ let test_w97_g7_header_difficulty_not_checked () =
 (* G8 — min_pow_checked → "too-little-chainwork" / BLOCK_HEADER_LOW_WORK.
    Core: when min_pow_checked=false (peer's headers have not yet crossed
    nMinimumChainWork), reject with too-little-chainwork.
-   Camlcoin: process_headers gates BATCH on tip-work < minimum AND
-   headers map already full (max_headers_in_memory=1_000_000), so
-   individual low-work headers are silently accepted until either
-   condition triggers.  No equivalent of min_pow_checked.  BUG-8. *)
-let test_w97_g8_no_per_header_min_pow_check () =
-  let (state, db, _) = w97_build_chain 0 in
-  (* Single header below minimum chain work — Core would reject any
-     header whose accumulated work is below nMinimumChainWork at the
-     anti-DoS PRESYNC gate.  Camlcoin's process_headers gate fires only
-     if headers map is also full. *)
+   Fix: process_headers ?(min_pow_checked=true); when false, each accepted
+   header's accumulated work is checked against network.minimum_chain_work;
+   if below, Error "too-little-chainwork" is returned.  W97 G8 FIXED. *)
+
+(* Helper: a regtest-compatible network config whose minimum_chain_work is
+   set above any single regtest block, so the G8 gate can be exercised. *)
+let w97_high_min_work_network () =
+  (* mainnet's minimum_chain_work is far above anything a single regtest
+     block can produce — use it as the "unreachably high" sentinel. *)
+  { Consensus.regtest with
+    minimum_chain_work = Consensus.mainnet.minimum_chain_work }
+
+(* Case 1: min_pow_checked=false + header work below minimum → rejected. *)
+let test_w97_g8_rejects_low_work_when_not_checked () =
+  w97_cleanup_db ();
+  let db = Storage.ChainDB.create w97_db_path in
+  let net = w97_high_min_work_network () in
+  let state = Sync.create_chain_state db net in
   let genesis_hash = Crypto.compute_block_hash Consensus.regtest.genesis_header in
   let h = w97_mine_header
             ~prev_block:genesis_hash
             ~merkle_root:Types.zero_hash
             ~ts:(Int32.add Consensus.regtest.genesis_header.timestamp 600l)
             ~bits:Consensus.regtest.genesis_header.bits () in
-  let result = Sync.process_headers state [h] in
+  let result = Sync.process_headers ~min_pow_checked:false state [h] in
   Storage.ChainDB.close db; w97_cleanup_db ();
-  (match result with
-   | Ok 1 ->
-     (* Camlcoin accepts: no per-header min-pow gate. Document the gap. *)
-     Alcotest.(check pass) "G8: BUG — low-work header accepted batch-by-batch \
-                            (Core: too-little-chainwork rejection)" () ()
-   | _ -> ())  (* Test passes whatever the outcome; this is documentation. *)
+  Alcotest.(check (result int string))
+    "G8 case1: min_pow_checked=false + low work → too-little-chainwork"
+    (Error "too-little-chainwork") result
+
+(* Case 2: min_pow_checked=true (default) + same low-work header → accepted
+   because the gate is bypassed (caller already verified chain work). *)
+let test_w97_g8_accepts_low_work_when_checked () =
+  w97_cleanup_db ();
+  let db = Storage.ChainDB.create w97_db_path in
+  let net = w97_high_min_work_network () in
+  let state = Sync.create_chain_state db net in
+  let genesis_hash = Crypto.compute_block_hash Consensus.regtest.genesis_header in
+  let h = w97_mine_header
+            ~prev_block:genesis_hash
+            ~merkle_root:Types.zero_hash
+            ~ts:(Int32.add Consensus.regtest.genesis_header.timestamp 600l)
+            ~bits:Consensus.regtest.genesis_header.bits () in
+  let result = Sync.process_headers ~min_pow_checked:true state [h] in
+  Storage.ChainDB.close db; w97_cleanup_db ();
+  Alcotest.(check (result int string))
+    "G8 case2: min_pow_checked=true + low work → accepted (gate bypassed)"
+    (Ok 1) result
+
+(* Case 3: min_pow_checked=false + regtest (zero minimum_chain_work) → accepted
+   because any positive work meets zero minimum. *)
+let test_w97_g8_accepts_when_zero_minimum () =
+  let (state, db, _) = w97_build_chain 0 in
+  let genesis_hash = Crypto.compute_block_hash Consensus.regtest.genesis_header in
+  let h = w97_mine_header
+            ~prev_block:genesis_hash
+            ~merkle_root:Types.zero_hash
+            ~ts:(Int32.add Consensus.regtest.genesis_header.timestamp 600l)
+            ~bits:Consensus.regtest.genesis_header.bits () in
+  let result = Sync.process_headers ~min_pow_checked:false state [h] in
+  Storage.ChainDB.close db; w97_cleanup_db ();
+  Alcotest.(check (result int string))
+    "G8 case3: min_pow_checked=false + zero minimum → accepted"
+    (Ok 1) result
 
 (* G9 — AddToBlockIndex updates best_header + nChainWork.
    Core: after accept, best_header is the maximum-work index entry.
@@ -4058,8 +4098,12 @@ let () =
         test_w97_g6_bad_prevblk_not_detected;
       test_case "G7: BUG — difficulty bits not checked at header time" `Quick
         test_w97_g7_header_difficulty_not_checked;
-      test_case "G8: BUG — no min_pow_checked per-header gate" `Quick
-        test_w97_g8_no_per_header_min_pow_check;
+      test_case "G8a: min_pow_checked=false + low work → too-little-chainwork" `Quick
+        test_w97_g8_rejects_low_work_when_not_checked;
+      test_case "G8b: min_pow_checked=true + low work → accepted (gate bypassed)" `Quick
+        test_w97_g8_accepts_low_work_when_checked;
+      test_case "G8c: min_pow_checked=false + zero minimum → accepted" `Quick
+        test_w97_g8_accepts_when_zero_minimum;
       test_case "G9: tip updates on more work" `Quick
         test_w97_g9_tip_updated_on_more_work;
       test_case "G10: validate_header returns entry" `Quick

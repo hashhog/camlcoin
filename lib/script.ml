@@ -995,11 +995,28 @@ let compute_sighash_taproot
     ?(tapleaf_hash : Cstruct.t option)
     ?(codesep_pos : int = 0xFFFFFFFF)
     () : Cstruct.t =
-  (* Validate hash_type *)
+  (* Validate hash_type per BIP-341: only 0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83.
+     Equivalent to Core's `hash_type <= 0x03 || (hash_type >= 0x81 && hash_type <= 0x83)`. *)
   let base_type = hash_type land 0x03 in
   let anyone_can_pay = hash_type land 0x80 <> 0 in
   if not (List.mem hash_type [0x00; 0x01; 0x02; 0x03; 0x81; 0x82; 0x83]) then
     failwith (Printf.sprintf "Invalid Taproot hash_type: 0x%02x" hash_type);
+
+  (* W94/BIP-341: prevouts MUST be exactly one entry per tx input. Core asserts
+     `cache.m_spent_outputs.size() == tx_to.vin.size()` in `PrecomputedTransactionData::Init`.
+     Without this guard, a short or oversized list would silently produce a
+     wrong sha_amounts / sha_scriptpubkeys, leaking a different sighash to
+     callers that don't notice. *)
+  let n_inputs = List.length tx.Types.inputs in
+  let n_prevouts = List.length prevouts in
+  if n_prevouts <> n_inputs then
+    failwith (Printf.sprintf
+                "Taproot sighash: prevouts length %d does not match inputs length %d"
+                n_prevouts n_inputs);
+  if input_index < 0 || input_index >= n_inputs then
+    failwith (Printf.sprintf
+                "Taproot sighash: input_index %d out of range [0, %d)"
+                input_index n_inputs);
 
   (* Compute spend_type byte *)
   let has_annex = annex_hash <> None in
@@ -2983,43 +3000,85 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                       Ok true  (* Unknown leaf version: succeed unconditionally *)
                   end
                   else begin
-                    (* OP_SUCCESSx pre-scan *)
-                    let has_op_success_flag = ref false in
+                    (* W94/BIP-342: OP_SUCCESSx pre-scan.
+                       Per Bitcoin Core ExecuteWitnessScript (interpreter.cpp:1836+):
+                       walk the script using GetOp(); on any GetOp() failure
+                       (truncated push / bad opcode) return SCRIPT_ERR_BAD_OPCODE;
+                       on first OP_SUCCESSx encountered, return immediately. *)
                     let script_bytes = tap_script in
-                    let pc = ref 0 in
                     let slen = Cstruct.length script_bytes in
-                    while !pc < slen do
-                      let op = Cstruct.get_uint8 script_bytes !pc in
-                      incr pc;
-                      (* Skip push data *)
-                      if op >= 0x01 && op <= 0x4b then
-                        pc := !pc + op
-                      else if op = 0x4c && !pc < slen then begin
-                        let dlen = Cstruct.get_uint8 script_bytes !pc in
-                        pc := !pc + 1 + dlen
-                      end else if op = 0x4d && !pc + 2 <= slen then begin
-                        let dlen = Cstruct.get_uint8 script_bytes !pc lor (Cstruct.get_uint8 script_bytes (!pc+1) lsl 8) in
-                        pc := !pc + 2 + dlen
-                      end else if op = 0x4e && !pc + 4 <= slen then begin
-                        let dlen = Cstruct.get_uint8 script_bytes !pc lor
-                                   (Cstruct.get_uint8 script_bytes (!pc+1) lsl 8) lor
-                                   (Cstruct.get_uint8 script_bytes (!pc+2) lsl 16) lor
-                                   (Cstruct.get_uint8 script_bytes (!pc+3) lsl 24) in
-                        pc := !pc + 4 + dlen
-                      end else begin
-                        (* Check for OP_SUCCESSx opcodes *)
-                        if is_op_success op then
-                          has_op_success_flag := true
+                    let rec prescan pc =
+                      if pc >= slen then Ok `NoOpSuccess
+                      else begin
+                        let op = Cstruct.get_uint8 script_bytes pc in
+                        let next_pc = pc + 1 in
+                        (* Direct push (1..75 bytes) *)
+                        if op >= 0x01 && op <= 0x4b then begin
+                          if next_pc + op > slen then
+                            Error "Bad opcode: truncated push in tapscript"
+                          else
+                            prescan (next_pc + op)
+                        end
+                        (* OP_PUSHDATA1 *)
+                        else if op = 0x4c then begin
+                          if next_pc + 1 > slen then
+                            Error "Bad opcode: truncated PUSHDATA1 in tapscript"
+                          else begin
+                            let dlen = Cstruct.get_uint8 script_bytes next_pc in
+                            if next_pc + 1 + dlen > slen then
+                              Error "Bad opcode: truncated PUSHDATA1 body in tapscript"
+                            else
+                              prescan (next_pc + 1 + dlen)
+                          end
+                        end
+                        (* OP_PUSHDATA2 *)
+                        else if op = 0x4d then begin
+                          if next_pc + 2 > slen then
+                            Error "Bad opcode: truncated PUSHDATA2 in tapscript"
+                          else begin
+                            let dlen =
+                              Cstruct.get_uint8 script_bytes next_pc
+                              lor (Cstruct.get_uint8 script_bytes (next_pc + 1) lsl 8)
+                            in
+                            if next_pc + 2 + dlen > slen then
+                              Error "Bad opcode: truncated PUSHDATA2 body in tapscript"
+                            else
+                              prescan (next_pc + 2 + dlen)
+                          end
+                        end
+                        (* OP_PUSHDATA4 *)
+                        else if op = 0x4e then begin
+                          if next_pc + 4 > slen then
+                            Error "Bad opcode: truncated PUSHDATA4 in tapscript"
+                          else begin
+                            let dlen =
+                              Cstruct.get_uint8 script_bytes next_pc
+                              lor (Cstruct.get_uint8 script_bytes (next_pc + 1) lsl 8)
+                              lor (Cstruct.get_uint8 script_bytes (next_pc + 2) lsl 16)
+                              lor (Cstruct.get_uint8 script_bytes (next_pc + 3) lsl 24)
+                            in
+                            if dlen < 0 || next_pc + 4 + dlen > slen then
+                              Error "Bad opcode: truncated PUSHDATA4 body in tapscript"
+                            else
+                              prescan (next_pc + 4 + dlen)
+                          end
+                        end
+                        (* Non-push opcode: check for OP_SUCCESSx (Core stops here) *)
+                        else if is_op_success op then
+                          Ok `OpSuccess
+                        else
+                          prescan next_pc
                       end
-                    done;
-
-                    if !has_op_success_flag then begin
+                    in
+                    let prescan_result = prescan 0 in
+                    (match prescan_result with
+                    | Error e -> Error e
+                    | Ok `OpSuccess ->
                       if flags land script_verify_discourage_op_success <> 0 then
                         Error "Discouraged OP_SUCCESS opcode in tapscript"
                       else
                         Ok true  (* OP_SUCCESS makes script unconditionally succeed *)
-                    end
-                    else begin
+                    | Ok `NoOpSuccess ->
                       (* Compute serialized witness size for sigops budget *)
                       let compact_size_len n =
                         if n < 253 then 1
@@ -3060,8 +3119,7 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                             else
                               check_stack_top st
                           end
-                      end
-                    end
+                      end)
                   end
                 end
               end

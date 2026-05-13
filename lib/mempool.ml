@@ -344,8 +344,8 @@ let rec remove_transaction (mp : mempool) (txid : Types.hash256) : unit =
       match Hashtbl.find_opt mp.entries key with
       | None -> ()
       | Some ancestor_entry ->
-        ancestor_entry.descendant_count <- max 1 (ancestor_entry.descendant_count - 1);
-        ancestor_entry.descendant_size <- max ancestor_entry.descendant_size (ancestor_entry.descendant_size - vsize);
+        ancestor_entry.descendant_count <- max 0 (ancestor_entry.descendant_count - 1);
+        ancestor_entry.descendant_size <- max 0 (ancestor_entry.descendant_size - vsize);
         List.iter (fun gp_txid ->
           let gp_key = Cstruct.to_string gp_txid in
           if not (Hashtbl.mem visited gp_key) then begin

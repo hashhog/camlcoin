@@ -9,6 +9,7 @@
 let message_header_size = 24
 let max_message_size = 4 * 1000 * 1000  (* 4 MB max message, matches Bitcoin Core MAX_PROTOCOL_MESSAGE_LENGTH *)
 let max_inv_count = 50_000
+let max_getdata_count = 1000  (* Core protocol.h:482 MAX_GETDATA_SZ; cap outgoing getdata *)
 let max_headers_count = 2000
 let max_locator_size = 101  (* Core MAX_LOCATOR_SZ; chain.h *)
 let max_addr_count = 1000

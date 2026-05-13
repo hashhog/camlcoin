@@ -1197,7 +1197,7 @@ let handle_sendrawtransaction (ctx : rpc_context)
             let fee_rate = Int64.div entry.fee (Int64.of_int (max 1 (entry.weight / 4))) in
             Lwt.async (fun () ->
               Peer_manager.announce_tx ctx.peer_manager
-                ~txid:entry.txid ~wtxid ~fee_rate
+                ~txid:entry.txid ~wtxid ~fee_rate ~tx:(Some tx) ()
             );
             Ok (`String (Types.hash256_to_hex_display entry.txid))
           end
@@ -3062,7 +3062,7 @@ let handle_submitpackage (ctx : rpc_context)
                in
                Lwt.async (fun () ->
                  Peer_manager.announce_tx ctx.peer_manager
-                   ~txid:e.Mempool.txid ~wtxid ~fee_rate);
+                   ~txid:e.Mempool.txid ~wtxid ~fee_rate ());
                (wtxid_hex, `Assoc [
                  ("txid", `String txid_hex);
                  ("vsize", `Int vsize);

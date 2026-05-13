@@ -1293,17 +1293,32 @@ let announce_block (pm : t) (header : Types.block_header) (hash : Types.hash256)
    on a Poisson-distributed schedule (5s average for inbound, 2s for outbound).
    This improves privacy and reduces bandwidth. *)
 let announce_tx (pm : t) ~(txid : Types.hash256) ~(wtxid : Types.hash256)
-    ~(fee_rate : int64) : unit Lwt.t =
+    ~(fee_rate : int64) ?(tx : Types.transaction option = None) () : unit Lwt.t =
   let ready = get_ready_peers pm in
   List.iter (fun peer ->
-    (* Create inv entry with fee rate for feefilter check in queue_inv *)
-    let entry =
-      if peer.Peer.wtxid_relay then
-        Peer.make_tx_inv ~witness:true wtxid fee_rate
-      else
-        Peer.make_tx_inv ~witness:false txid fee_rate
+    (* BIP-37: if this peer has a bloom filter loaded, only announce the tx
+       if it matches the filter (IsRelevantAndUpdate).  Mirrors Core's
+       net_processing.cpp PeerHasFilter + IsRelevantAndUpdate gate.
+       If no tx is provided (backwards-compat callers), skip the filter check
+       and always announce (conservative: no false negatives). *)
+    let passes_bloom =
+      match peer.Peer.bloom_filter, tx with
+      | None, _ -> true                    (* no filter: always announce *)
+      | Some _, None -> true               (* filter present but no tx object: conserve *)
+      | Some f, Some transaction ->
+        let txid_bytes = Cstruct.to_bytes txid in
+        Bloom.is_relevant_and_update f transaction txid_bytes
     in
-    Peer.queue_inv peer entry  (* queue_inv handles feefilter filtering *)
+    if passes_bloom then begin
+      (* Create inv entry with fee rate for feefilter check in queue_inv *)
+      let entry =
+        if peer.Peer.wtxid_relay then
+          Peer.make_tx_inv ~witness:true wtxid fee_rate
+        else
+          Peer.make_tx_inv ~witness:false txid fee_rate
+      in
+      Peer.queue_inv peer entry  (* queue_inv handles feefilter filtering *)
+    end
   ) ready;
   Lwt.return_unit
 
@@ -1663,15 +1678,18 @@ let peer_message_loop (pm : t) (peer : Peer.peer) : unit Lwt.t =
                  (fun _exn -> Lwt.return_unit)
              ) pm.listeners in
              (* Handle addr/addrv2 messages and relay to 2 random peers *)
-             (match msg with
+             let* () = (match msg with
               | P2p.AddrMsg addrs ->
                 handle_addr pm peer addrs;
-                relay_addr_to_random_peers pm peer
+                relay_addr_to_random_peers pm peer;
+                Lwt.return_unit
               | P2p.Addrv2Msg entries ->
                 handle_addrv2 pm peer entries;
-                relay_addr_to_random_peers pm peer
+                relay_addr_to_random_peers pm peer;
+                Lwt.return_unit
               | P2p.FeefilterMsg fee_rate ->
-                peer.Peer.feefilter <- fee_rate
+                peer.Peer.feefilter <- fee_rate;
+                Lwt.return_unit
               | P2p.MempoolMsg ->
                 (* BIP-35: peer is asking us to inv our mempool contents.
                    The actual send is wired via [Peer_manager.add_listener]
@@ -1680,8 +1698,74 @@ let peer_message_loop (pm : t) (peer : Peer.peer) : unit Lwt.t =
                    case keeps the dispatch self-documenting and ensures
                    that if the listener is ever removed, nothing in
                    [pm] silently drops the message. *)
-                ()
-              | _ -> ());
+                Lwt.return_unit
+              (* BIP-37: Bloom filter messages.
+                 All three gates on (Peer.our_services ()).bloom (BIP-111
+                 §3: node MUST disconnect peers that send filter messages
+                 when NODE_BLOOM is not advertised, unless the peer has
+                 relay permission — camlcoin has no fine-grained permission
+                 layer so we always disconnect).  Mirrors Bitcoin Core
+                 net_processing.cpp:4964/4989/5017. *)
+              | P2p.FilterLoadMsg f ->
+                if not (Peer.our_services ()).bloom then begin
+                  Log.warn (fun m ->
+                    m "filterload from peer %d but NODE_BLOOM not advertised \
+                       — disconnecting (BIP-111)" peer.Peer.id);
+                  remove_peer pm peer.Peer.id
+                end else if not (Bloom.is_within_size_constraints f) then begin
+                  Log.warn (fun m ->
+                    m "filterload from peer %d: oversized filter \
+                       (vdata %d bytes, hash_funcs %d) — disconnecting"
+                      peer.Peer.id
+                      (Bytes.length f.Bloom.vdata)
+                      f.Bloom.n_hash_funcs);
+                  remove_peer pm peer.Peer.id
+                end else begin
+                  peer.Peer.bloom_filter <- Some f;
+                  Log.debug (fun m ->
+                    m "filterload from peer %d: stored filter \
+                       (vdata %d bytes, hash_funcs %d, tweak %d, flags %d)"
+                      peer.Peer.id
+                      (Bytes.length f.Bloom.vdata)
+                      f.Bloom.n_hash_funcs
+                      f.Bloom.n_tweak
+                      f.Bloom.n_flags);
+                  Lwt.return_unit
+                end
+              | P2p.FilterAddMsg data ->
+                if not (Peer.our_services ()).bloom then begin
+                  Log.warn (fun m ->
+                    m "filteradd from peer %d but NODE_BLOOM not advertised \
+                       — disconnecting (BIP-111)" peer.Peer.id);
+                  remove_peer pm peer.Peer.id
+                end else begin
+                  (match peer.Peer.bloom_filter with
+                   | None ->
+                     (* No filter loaded yet; insert acts like filterload with empty filter.
+                        Core does not require filterload first; we mirror that behaviour. *)
+                     let f = { Bloom.vdata = Bytes.create 0;
+                               n_hash_funcs = 0; n_tweak = 0;
+                               n_flags = Bloom.bloom_update_none } in
+                     Bloom.insert f data;
+                     peer.Peer.bloom_filter <- Some f
+                   | Some f ->
+                     Bloom.insert f data);
+                  Lwt.return_unit
+                end
+              | P2p.FilterClearMsg ->
+                if not (Peer.our_services ()).bloom then begin
+                  Log.warn (fun m ->
+                    m "filterclear from peer %d but NODE_BLOOM not advertised \
+                       — disconnecting (BIP-111)" peer.Peer.id);
+                  remove_peer pm peer.Peer.id
+                end else begin
+                  peer.Peer.bloom_filter <- None;
+                  Log.debug (fun m ->
+                    m "filterclear from peer %d: bloom filter cleared" peer.Peer.id);
+                  Lwt.return_unit
+                end
+              | _ -> Lwt.return_unit)
+             in
              loop ())
       ) (fun exn ->
         (* Connection error — log and disconnect the peer gracefully *)

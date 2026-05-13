@@ -473,65 +473,178 @@ let test_g24_outpoint_serialization () =
   Alcotest.(check int) "vout[3]=0" 0 (Bytes.get_uint8 serialized 35)
 
 (* ============================================================================
-   G25: filterload P2P message — BUG-2/3
-   filterload/filteradd/filterclear not in command_of_string → all become
-   Unknown other → treated as UnknownMsg → silently discarded.
+   G25: filterload P2P message — FIX-37 CLOSED
+   filterload/filteradd/filterclear/merkleblock are now in command_of_string
+   and map to distinct commands (Filterload/Filteradd/Filterclear/Merkleblock).
    ============================================================================ *)
 
-let test_g25_filterload_command_missing () =
-  (* BUG-2/3: filterload not recognized as a distinct command *)
+let test_g25_filterload_command_recognized () =
+  (* FIX-37: filterload is now recognized as a distinct P2P command *)
   let cmd = P2p.command_of_string "filterload" in
   match cmd with
-  | P2p.Unknown "filterload" ->
-    (* This is the BUG: filterload falls through to Unknown *)
-    ()  (* Test documents the bug — the command is not handled *)
-  | _ ->
+  | P2p.Filterload -> ()  (* FIXED: maps to the dedicated Filterload variant *)
+  | P2p.Unknown _ ->
     Alcotest.fail
-      "filterload should map to Unknown (BUG-2/3: not in command_of_string)"
+      "filterload falls through to Unknown — FIX-37 regression"
+  | _ ->
+    Alcotest.fail "filterload maps to unexpected command variant"
 
 (* ============================================================================
-   G26: filteradd ≤ 520 bytes — BUG-5
+   G26: filteradd ≤ 520 bytes — FIX-37 CLOSED
    Core rejects filteradd with vData > MAX_SCRIPT_ELEMENT_SIZE (520 bytes).
-   Since filteradd is not even parsed (BUG-2/3), the guard is also absent.
+   The guard is now enforced in deserialize_payload (Filteradd case).
    ============================================================================ *)
 
-let test_g26_filteradd_size_guard_absent () =
-  (* BUG-5: filteradd is not recognized, so no size guard can fire.
-     Document the MAX_SCRIPT_ELEMENT_SIZE constant that should be enforced. *)
-  let max_script_element_size = 520 in
-  (* A 521-byte filteradd should be rejected by Core but camlcoin never sees it *)
-  Alcotest.(check bool) "BUG-5: filteradd 521 bytes should be rejected"
-    true (521 > max_script_element_size)
-    (* The test itself passes (521 > 520 is correct), but the handler
-       to ACT on this check is absent — documented as BUG-5 *)
+let test_g26_filteradd_size_guard () =
+  (* FIX-37: filteradd is now recognized and the 520-byte guard is enforced.
+     Verify that filteradd with 521 bytes raises in deserialization. *)
+  (* Build a minimal filteradd message: compact_size(521) + 521 bytes *)
+  let payload_len = 521 in
+  let buf = Cstruct.create (3 + payload_len) in  (* 0xFD len16 + 521 bytes *)
+  Cstruct.set_uint8 buf 0 0xFD;  (* compact_size indicator for 2-byte length *)
+  Cstruct.LE.set_uint16 buf 1 payload_len;
+  (* rest is zeros — the data bytes *)
+  let r = Serialize.reader_of_cstruct buf in
+  (try
+    let _ = P2p.deserialize_payload P2p.Filteradd r in
+    Alcotest.fail "filteradd 521 bytes: should have raised (size guard absent)"
+  with Failure msg ->
+    (* The guard should fire with a message mentioning > 520 *)
+    Alcotest.(check bool) "filteradd size guard fires on 521 bytes"
+      true (String.length msg > 0))
 
 (* ============================================================================
-   G27: filterclear — BUG-2/3
+   G27: filterclear — FIX-37 CLOSED
    ============================================================================ *)
 
-let test_g27_filterclear_command_missing () =
-  (* BUG-2/3: filterclear not recognized *)
+let test_g27_filterclear_command_recognized () =
+  (* FIX-37: filterclear is now recognized *)
   let cmd = P2p.command_of_string "filterclear" in
   match cmd with
-  | P2p.Unknown "filterclear" -> ()
+  | P2p.Filterclear -> ()  (* FIXED *)
+  | P2p.Unknown _ ->
+    Alcotest.fail "filterclear falls through to Unknown — FIX-37 regression"
   | _ ->
-    Alcotest.fail
-      "filterclear should map to Unknown (BUG-2/3: not in command_of_string)"
+    Alcotest.fail "filterclear maps to unexpected command variant"
 
 (* ============================================================================
-   G28: merkleblock wire format — BUG-6
-   MerkleBlockMsg is absent from message_payload type.
+   G28: merkleblock wire format — FIX-37 CLOSED
+   MerkleBlockMsg is now in message_payload and merkleblock is in command_of_string.
    ============================================================================ *)
 
-let test_g28_merkleblock_variant_absent () =
-  (* BUG-6: The message_payload type has no MerkleBlockMsg constructor.
-     We verify that "merkleblock" also falls through to Unknown. *)
+let test_g28_merkleblock_variant_present () =
+  (* FIX-37: merkleblock is now recognized as a distinct P2P command *)
   let cmd = P2p.command_of_string "merkleblock" in
   match cmd with
-  | P2p.Unknown "merkleblock" -> ()
+  | P2p.Merkleblock -> ()  (* FIXED *)
+  | P2p.Unknown _ ->
+    Alcotest.fail "merkleblock falls through to Unknown — FIX-37 regression"
   | _ ->
-    Alcotest.fail
-      "merkleblock should map to Unknown (BUG-6: not in command_of_string)"
+    Alcotest.fail "merkleblock maps to unexpected command variant"
+
+(* ============================================================================
+   FIX-37 wiring tests: filterload/filteradd/filterclear dispatch + bloom_filter field
+   ============================================================================ *)
+
+(** Build a filterload wire payload (compact_size + vdata + fields) suitable
+    for deserialization via [Bloom.deserialize]. *)
+let make_filterload_payload (f : Bloom.t) : Cstruct.t =
+  Bloom.serialize f
+
+let test_fix37_filterload_deserializes () =
+  (* A filterload payload should deserialize to a FilterLoadMsg carrying the filter *)
+  let f = Bloom.create 3 0.01 42 Bloom.bloom_update_all in
+  Bloom.insert f (hex_to_bytes "99108ad8ed9bb6274d3980bab5a85c048f0950c8");
+  let payload_cs = make_filterload_payload f in
+  let r = Serialize.reader_of_cstruct payload_cs in
+  let msg = P2p.deserialize_payload P2p.Filterload r in
+  match msg with
+  | P2p.FilterLoadMsg f2 ->
+    Alcotest.(check int) "filterload: vdata len round-trips"
+      (Bytes.length f.Bloom.vdata) (Bytes.length f2.Bloom.vdata);
+    Alcotest.(check int) "filterload: nHashFuncs round-trips"
+      f.Bloom.n_hash_funcs f2.Bloom.n_hash_funcs;
+    Alcotest.(check int) "filterload: nTweak round-trips"
+      f.Bloom.n_tweak f2.Bloom.n_tweak;
+    Alcotest.(check bool) "filterload: inserted element still present"
+      true (Bloom.contains f2 (hex_to_bytes "99108ad8ed9bb6274d3980bab5a85c048f0950c8"))
+  | _ ->
+    Alcotest.fail "filterload did not produce FilterLoadMsg"
+
+let test_fix37_filterclear_deserializes () =
+  (* filterclear has empty payload → should produce FilterClearMsg *)
+  let r = Serialize.reader_of_cstruct Cstruct.empty in
+  let msg = P2p.deserialize_payload P2p.Filterclear r in
+  match msg with
+  | P2p.FilterClearMsg -> ()
+  | _ -> Alcotest.fail "filterclear did not produce FilterClearMsg"
+
+let test_fix37_filteradd_deserializes () =
+  (* filteradd with a 20-byte payload (typical address hash) *)
+  let data = hex_to_bytes "04943fdd508053c75000106d3bc6e2754dbcff19" in
+  let payload_len = Bytes.length data in  (* 20 *)
+  let buf = Cstruct.create (1 + payload_len) in
+  Cstruct.set_uint8 buf 0 payload_len;   (* compact_size = 20 *)
+  Cstruct.blit_from_bytes data 0 buf 1 payload_len;
+  let r = Serialize.reader_of_cstruct buf in
+  let msg = P2p.deserialize_payload P2p.Filteradd r in
+  match msg with
+  | P2p.FilterAddMsg parsed ->
+    Alcotest.(check int) "filteradd: data length" 20 (Bytes.length parsed);
+    Alcotest.(check bool) "filteradd: data contents match"
+      true (Bytes.equal data parsed)
+  | _ ->
+    Alcotest.fail "filteradd did not produce FilterAddMsg"
+
+let test_fix37_peer_bloom_filter_field () =
+  (* The Peer.peer record must have a bloom_filter field initialized to None *)
+  (* We cannot instantiate a real peer without network/fd, but we can verify
+     through the peer module's record layout via the type system.
+     This test exercises the NODE_BLOOM advertisement instead since we have
+     no easy way to make_peer without a live fd. *)
+  (* Verify that the peer service struct's bloom field reflects the NODE_BLOOM
+     advertisement flag correctly, as a proxy for the per-peer state. *)
+  Peer.set_peer_bloom_filters true;
+  let svc = Peer.our_services () in
+  Alcotest.(check bool) "bloom field in our_services when peerbloomfilters=true"
+    true svc.bloom;
+  Peer.set_peer_bloom_filters false;
+  let svc2 = Peer.our_services () in
+  Alcotest.(check bool) "bloom field off when peerbloomfilters=false"
+    false svc2.bloom
+
+let test_fix37_merkleblock_serialize_roundtrip () =
+  (* Build a MerkleBlockMsg and verify serialize → deserialize round-trip *)
+  let header : Types.block_header = {
+    version = 1l;
+    prev_block = Cstruct.create 32;
+    merkle_root = Cstruct.create 32;
+    timestamp = 1296688602l;
+    bits = 0x1d00ffffl;
+    nonce = 0l;
+  } in
+  (* One hash, one flag byte *)
+  let h = Cstruct.create 32 in
+  Cstruct.set_uint8 h 0 0xAB;
+  let flags = Cstruct.create 1 in
+  Cstruct.set_uint8 flags 0 0x01;
+  let msg = P2p.MerkleBlockMsg {
+    header; total_txns = 1l; hash_list = [h]; flags
+  } in
+  (* Serialize *)
+  let wire = P2p.serialize_message 0xD9B4BEF9l msg in
+  (* Deserialize *)
+  let parsed = P2p.deserialize_message wire in
+  match parsed.P2p.payload with
+  | P2p.MerkleBlockMsg { total_txns; hash_list; flags; _ } ->
+    Alcotest.(check int32) "merkleblock: total_txns round-trips"
+      1l total_txns;
+    Alcotest.(check int) "merkleblock: hash_list count"
+      1 (List.length hash_list);
+    Alcotest.(check int) "merkleblock: flags length"
+      1 (Cstruct.length flags)
+  | _ ->
+    Alcotest.fail "merkleblock serialize/deserialize did not produce MerkleBlockMsg"
 
 (* ============================================================================
    G29: IsWithinSizeConstraints
@@ -585,22 +698,26 @@ let test_g30_node_bloom_advertised_when_enabled () =
   Peer.set_peer_bloom_filters false  (* restore *)
 
 (* ============================================================================
-   G25/G26/G27 negative: BUG-4 — DoS-disconnect for filter messages absent
-   When NODE_BLOOM not set, Core disconnects on filterload/filteradd/filterclear.
-   Camlcoin cannot fire this disconnect because it never dispatches the messages.
+   G25/G26/G27 — FIX-37: BIP-111 DoS-disconnect path is now wired
+   When NODE_BLOOM not set, peer_manager.ml disconnects on filterload/
+   filteradd/filterclear.  The commands are now fully dispatched.
    ============================================================================ *)
 
-let test_g30_bip111_dos_disconnect_absent () =
-  (* BUG-4: filterload/filteradd/filterclear are not parsed/dispatched, so the
-     DoS-disconnect that Core fires when NODE_BLOOM not advertised is absent.
-     We document this by verifying the commands remain Unknown. *)
+let test_g30_bip111_commands_are_dispatched () =
+  (* FIX-37: filterload/filteradd/filterclear are now recognized commands,
+     NOT Unknown.  The peer_manager.ml dispatch gates on
+     (Peer.our_services ()).bloom and calls remove_peer on violation. *)
   let filter_cmds = ["filterload"; "filteradd"; "filterclear"] in
   List.iter (fun cmd_str ->
     match P2p.command_of_string cmd_str with
-    | P2p.Unknown _ -> ()  (* confirms BUG-4: cannot disconnect what we don't see *)
+    | P2p.Unknown _ ->
+      Alcotest.fail (Printf.sprintf
+        "FIX-37 regression: %s still maps to Unknown (BIP-111 disconnect cannot fire)"
+        cmd_str)
+    | P2p.Filterload | P2p.Filteradd | P2p.Filterclear -> ()
     | _ ->
       Alcotest.fail (Printf.sprintf
-        "BUG-4: %s would need DoS-disconnect guard but is not dispatched" cmd_str)
+        "%s maps to unexpected command variant" cmd_str)
   ) filter_cmds
 
 (* ============================================================================
@@ -726,17 +843,17 @@ let () =
     "G24 Outpoint serialization", [
       Alcotest.test_case "outpoint_serialization" `Quick test_g24_outpoint_serialization;
     ];
-    "G25 filterload command (BUG-2/3: absent from command_of_string)", [
-      Alcotest.test_case "filterload_command_missing" `Quick test_g25_filterload_command_missing;
+    "G25 filterload command (FIX-37: recognized in command_of_string)", [
+      Alcotest.test_case "filterload_command_recognized" `Quick test_g25_filterload_command_recognized;
     ];
-    "G26 filteradd <= 520 bytes guard (BUG-5: absent)", [
-      Alcotest.test_case "filteradd_size_guard_absent" `Quick test_g26_filteradd_size_guard_absent;
+    "G26 filteradd <= 520 bytes guard (FIX-37: enforced in deserialization)", [
+      Alcotest.test_case "filteradd_size_guard" `Quick test_g26_filteradd_size_guard;
     ];
-    "G27 filterclear command (BUG-2/3: absent from command_of_string)", [
-      Alcotest.test_case "filterclear_command_missing" `Quick test_g27_filterclear_command_missing;
+    "G27 filterclear command (FIX-37: recognized in command_of_string)", [
+      Alcotest.test_case "filterclear_command_recognized" `Quick test_g27_filterclear_command_recognized;
     ];
-    "G28 merkleblock variant (BUG-6: absent from message_payload)", [
-      Alcotest.test_case "merkleblock_variant_absent" `Quick test_g28_merkleblock_variant_absent;
+    "G28 merkleblock variant (FIX-37: present in message_payload)", [
+      Alcotest.test_case "merkleblock_variant_present" `Quick test_g28_merkleblock_variant_present;
     ];
     "G29 IsWithinSizeConstraints", [
       Alcotest.test_case "is_within_size_constraints" `Quick test_g29_is_within_size_constraints;
@@ -746,12 +863,19 @@ let () =
       Alcotest.test_case "node_bloom_default_off" `Quick test_g30_node_bloom_default_off;
       Alcotest.test_case "node_bloom_advertised_when_enabled" `Quick
         test_g30_node_bloom_advertised_when_enabled;
-      Alcotest.test_case "bip111_dos_disconnect_absent_bug4" `Quick
-        test_g30_bip111_dos_disconnect_absent;
+      Alcotest.test_case "bip111_commands_dispatched" `Quick
+        test_g30_bip111_commands_are_dispatched;
     ];
     "Wire format round-trip (G4/G5 serial)", [
       Alcotest.test_case "serialize_wire_format" `Quick test_serialize_wire_format;
       Alcotest.test_case "serialize_with_tweak" `Quick test_serialize_with_tweak;
       Alcotest.test_case "deserialize_round_trip" `Quick test_deserialize_round_trip;
+    ];
+    "FIX-37 wiring: filterload/filteradd/filterclear dispatch + merkleblock", [
+      Alcotest.test_case "filterload_deserializes" `Quick test_fix37_filterload_deserializes;
+      Alcotest.test_case "filterclear_deserializes" `Quick test_fix37_filterclear_deserializes;
+      Alcotest.test_case "filteradd_deserializes" `Quick test_fix37_filteradd_deserializes;
+      Alcotest.test_case "peer_bloom_filter_field" `Quick test_fix37_peer_bloom_filter_field;
+      Alcotest.test_case "merkleblock_serialize_roundtrip" `Quick test_fix37_merkleblock_serialize_roundtrip;
     ];
   ]

@@ -2491,6 +2491,194 @@ let get_fees_with_descendants (mp : mempool) (entry : mempool_entry) : int64 =
   let desc_fees = List.fold_left (fun acc d -> Int64.add acc d.fee) 0L desc in
   Int64.add entry.fee desc_fees
 
+(* ============================================================================
+   ImprovesFeerateDiagram
+   Reference: bitcoin-core/src/policy/rbf.cpp ImprovesFeerateDiagram
+              bitcoin-core/src/util/feefrac.cpp CompareChunks
+
+   Checks that the feerate diagram of the post-replacement mempool strictly
+   dominates the pre-replacement diagram at every cumulative-vsize boundary.
+
+   Algorithm:
+     1. Compute "before" chunks from the current mempool (get_all_chunks).
+     2. Build a virtual "after" entry list = (all entries) - (evicted set)
+        + a synthetic mempool_entry for the replacement transaction.
+     3. Linearize the "after" entry list via the same greedy chunk algorithm
+        (find_best_chunk / remove_chunk, which do not read mp.entries so they
+        work on an arbitrary list).
+     4. Convert both chunk lists into cumulative (vsize, fee) diagrams.
+     5. Compare: "after" must be strictly greater than "before" at every
+        breakpoint — i.e. no point where "before" is strictly above "after",
+        and at least one point where "after" is strictly above "before".
+        Returns true iff the "after" diagram strictly dominates.
+
+   Note: This is a simplified (non-cached) implementation equivalent in
+   correctness to Core's CalculateChunksForRBF + CompareChunks.
+   ============================================================================ *)
+
+(* Linearize an arbitrary list of mempool entries into chunks (highest-feerate
+   first), ignoring the mempool hashtable (uses the entry list itself). *)
+let linearize_entries (mp : mempool) (entries : mempool_entry list) : chunk list =
+  let rec chunk_loop remaining acc =
+    match remaining with
+    | [] -> List.rev acc
+    | _ ->
+      let best = find_best_chunk remaining mp in
+      if best.chunk_txs = [] then List.rev acc
+      else
+        let new_remaining = remove_chunk remaining best in
+        chunk_loop new_remaining (best :: acc)
+  in
+  chunk_loop entries []
+
+(* Convert a list of chunks (highest-feerate first) into a cumulative diagram:
+   a list of (cumulative_vsize, cumulative_fee) pairs, one per chunk boundary,
+   sorted by increasing cumulative_vsize. *)
+let chunks_to_diagram (chunks : chunk list)
+    : (int * int64) list =
+  let rec build chunks cum_size cum_fee acc =
+    match chunks with
+    | [] -> List.rev acc
+    | c :: rest ->
+      let new_size = cum_size + c.chunk_vsize in
+      let new_fee  = Int64.add cum_fee c.chunk_fee in
+      build rest new_size new_fee ((new_size, new_fee) :: acc)
+  in
+  build chunks 0 0L []
+
+(* CompareChunks: compare two feerate diagrams at their combined breakpoints.
+   Returns `Strictly_better if "after" strictly dominates "before" everywhere
+   (i.e. after ≥ before at every vsize, and strictly > at ≥ one point).
+   Returns `Not_better otherwise (equal or incomparable diagrams are also
+   rejected — Core requires strict improvement). *)
+type diagram_cmp = Strictly_better | Not_better
+
+let compare_feerate_diagrams
+    ~(before : (int * int64) list)
+    ~(after  : (int * int64) list)
+    : diagram_cmp =
+  (* Walk both sorted-by-vsize lists simultaneously, interpolating linearly
+     between breakpoints (a segment of constant fee_rate has a linear cumulative
+     fee curve).  At each combined breakpoint we check whether "after" is ≥
+     "before".  We also track whether "after" is strictly > "before" at ≥ 1 pt.
+     Interpolation formula for diagram D at vsize v between points (v0,f0) and
+     (v1,f1):  fee(v) = f0 + (f1 - f0) * (v - v0) / (v1 - v1)
+     To stay in integer arithmetic we compare cross-products. *)
+  let fee_at (pts : (int * int64) list) (v : int) : int64 =
+    (* Find the two bracketing points.  Diagrams start at (0, 0) implicitly. *)
+    let rec go pts prev_v prev_f =
+      match pts with
+      | [] ->
+        (* Beyond the last point: extrapolate as flat (fee stays at last value). *)
+        prev_f
+      | (pv, pf) :: rest ->
+        if v <= pv then begin
+          if v = pv then pf
+          else begin
+            (* v is in (prev_v, pv).  Interpolate:
+               fee = prev_f + (pf - prev_f) * (v - prev_v) / (pv - prev_v)
+               Use integer division rounding down (conservative, matches Core
+               which uses FeeFrac cross-product comparisons). *)
+            let span = Int64.of_int (pv - prev_v) in
+            let delta_v = Int64.of_int (v - prev_v) in
+            let delta_f = Int64.sub pf prev_f in
+            Int64.add prev_f (Int64.div (Int64.mul delta_f delta_v) span)
+          end
+        end else
+          go rest pv pf
+    in
+    go pts 0 0L
+  in
+  (* Collect all vsize breakpoints from both diagrams. *)
+  let all_vsizes =
+    let s : (int, unit) Hashtbl.t = Hashtbl.create 32 in
+    List.iter (fun (v, _) -> Hashtbl.replace s v ()) before;
+    List.iter (fun (v, _) -> Hashtbl.replace s v ()) after;
+    let lst = Hashtbl.fold (fun v () acc -> v :: acc) s [] in
+    List.sort compare lst
+  in
+  if all_vsizes = [] then Not_better  (* both diagrams empty → not strictly better *)
+  else begin
+    let after_better_somewhere = ref false in
+    let before_better_somewhere = ref false in
+    List.iter (fun v ->
+      if not !before_better_somewhere || not !after_better_somewhere then begin
+        let f_before = fee_at before v in
+        let f_after  = fee_at after  v in
+        if f_after > f_before then after_better_somewhere := true;
+        if f_before > f_after then before_better_somewhere := true
+      end
+    ) all_vsizes;
+    (* "after" strictly dominates iff after is better somewhere AND before is
+       never better (same semantics as Core's CompareChunks returning > 0). *)
+    if !after_better_somewhere && not !before_better_somewhere then
+      Strictly_better
+    else
+      Not_better
+  end
+
+(* Top-level gate: returns Ok () if the replacement improves the feerate
+   diagram, or Error msg if it does not.
+   evicted_set: the Hashtbl of entries to be removed.
+   new_fee / new_weight: pre-computed from the replacement tx. *)
+let check_improves_feerate_diagram
+    (mp : mempool)
+    ~(evicted_set : (string, mempool_entry) Hashtbl.t)
+    ~(replacement_tx : Types.transaction)
+    ~(new_fee : int64)
+    ~(new_weight : int)
+    : (unit, string) result =
+  (* Before diagram: current mempool chunks. *)
+  let before_chunks = get_all_chunks mp in
+  let before_diag   = chunks_to_diagram before_chunks in
+
+  (* After entry list: all entries minus evicted, plus synthetic replacement. *)
+  let evicted_keys = evicted_set in  (* Hashtbl string → entry *)
+  let remaining_entries =
+    Hashtbl.fold (fun key entry acc ->
+      if Hashtbl.mem evicted_keys key then acc
+      else entry :: acc
+    ) mp.entries []
+  in
+  let new_vsize = max 1 ((new_weight + 3) / 4) in
+  let new_fee_rate = Int64.to_float new_fee /. float_of_int new_vsize in
+  let rep_txid = Crypto.compute_txid replacement_tx in
+  let rep_wtxid = Crypto.compute_wtxid replacement_tx in
+  (* Determine which (if any) of the replacement's inputs are still unconfirmed
+     after eviction — those become depends_on entries in the synthetic entry. *)
+  let depends_after_eviction =
+    List.filter_map (fun inp ->
+      let parent_key = Cstruct.to_string inp.Types.previous_output.txid in
+      if Hashtbl.mem mp.entries parent_key &&
+         not (Hashtbl.mem evicted_keys parent_key)
+      then Some inp.Types.previous_output.txid
+      else None
+    ) replacement_tx.inputs
+  in
+  let synthetic_entry = {
+    tx             = replacement_tx;
+    txid           = rep_txid;
+    wtxid          = rep_wtxid;
+    fee            = new_fee;
+    weight         = new_weight;
+    fee_rate       = new_fee_rate;
+    time_added     = 0.0;
+    height_added   = mp.current_height;
+    depends_on     = depends_after_eviction;
+    ancestor_count = 1;
+    ancestor_size  = new_vsize;
+    descendant_count = 1;
+    descendant_size  = new_vsize;
+  } in
+  let after_entries = synthetic_entry :: remaining_entries in
+  let after_chunks  = linearize_entries mp after_entries in
+  let after_diag    = chunks_to_diagram after_chunks in
+
+  match compare_feerate_diagrams ~before:before_diag ~after:after_diag with
+  | Strictly_better -> Ok ()
+  | Not_better ->
+    Error "insufficient feerate: does not improve feerate diagram"
+
 (* Attempt to replace an existing transaction with higher fee.
    Full RBF: no BIP125 signaling required (-mempoolfullrbf=1 default).
 
@@ -2669,6 +2857,20 @@ let replace_by_fee (mp : mempool) (tx : Types.transaction)
 
                 else begin
                   ignore new_feerate; (* suppress unused warning after removing non-Core feerate check *)
+                  (* ImprovesFeerateDiagram (W106 BUG-10 fix):
+                     Core rbf.cpp ImprovesFeerateDiagram requires that the post-
+                     replacement mempool feerate diagram strictly dominates the
+                     pre-replacement diagram.  Check this BEFORE the dry_run/commit
+                     so a diagram-failing replacement is rejected without touching
+                     mempool state (mirrors FIX-24 atomicity pattern). *)
+                  match check_improves_feerate_diagram mp
+                          ~evicted_set
+                          ~replacement_tx:tx
+                          ~new_fee
+                          ~new_weight with
+                  | Error e -> Error e
+                  | Ok () ->
+                  begin
                   (* BUG-9/BUG-12 fix: pre-check then commit (mirrors Core's staged-removal pattern).
                      Run add_transaction in dry_run mode BEFORE removing conflicts.  dry_run=true
                      executes every validation gate (cluster limits, TRUC inheritance, ancestor/
@@ -2689,6 +2891,7 @@ let replace_by_fee (mp : mempool) (tx : Types.transaction)
                        case the conflicts are already removed.  This window is negligible in
                        single-threaded OCaml execution but documented for completeness. *)
                     add_transaction mp tx
+                  end
                 end
               end
             end

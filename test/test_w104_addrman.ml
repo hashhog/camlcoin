@@ -23,7 +23,7 @@ open Camlcoin
    G15 getaddr_one_time_guard    MISSING — m_getaddr_sent / one-shot getaddr guard absent
    G16 tried_collision_missing   MISSING — test-before-evict / ResolveCollisions absent
    G17 tried_evict_no_check      BUG — move_to_tried_table evicts without Good_/tbevict check
-   G18 routability_filter        MISSING — non-routable addrs accepted (no IsRoutable check)
+   G18 routability_filter        FIXED  — is_routable() added; RFC1918/loopback/link-local rejected
    G19 gossip_no_terrible_filter MISSING — gossip_addresses includes terrible addresses
    G20 getaddr_pct_cap           MISSING — GetAddr 23% cap (MAX_PCT_ADDR_TO_SEND) absent
    G21 persistence_missing       MISSING — no peers.dat persistence (only bans/anchors saved)
@@ -131,10 +131,11 @@ let test_g3_bucket_hash_no_netgroup () =
    Severity: MEDIUM. Core ref: addrman.cpp GetBucketPosition(). *)
 let test_g4_bucket_pos_missing () =
   (* Confirm there is no keyed position: adding same addr twice to a
-     full bucket may silently overwrite or collide in wrong ways. *)
+     full bucket may silently overwrite or collide in wrong ways.
+     Use public routable IPs (50.0.1.x) so G18 filter does not interfere. *)
   let pm = make_pm () in
   for i = 1 to 10 do
-    add_addr pm (Printf.sprintf "10.0.1.%d" i)
+    add_addr pm (Printf.sprintf "50.0.1.%d" i)
   done;
   let stats = Peer_manager.get_bucket_stats pm in
   Alcotest.(check bool) "BUG-G4: entries stored without keyed position"
@@ -413,21 +414,38 @@ let test_g17_tried_evict_no_check () =
     true (stats.tried_table_entries >= 1)
 
 (* ===== G18: routability_filter ====================================
-   Bug: add_to_new_table / handle_addr / add_known_addr accept any IP
-   including private (10.x, 192.168.x), loopback (127.x), and
-   unroutable addresses.  Core calls addr.IsRoutable() and rejects
-   non-routable addresses in AddSingle().
-   Severity: HIGH. Core ref: addrman.cpp AddSingle "if (!addr.IsRoutable())". *)
+   Fixed: add_to_new_table / add_known_addr / handle_addr / handle_addrv2
+   now call is_routable() and reject non-routable addresses, mirroring
+   Bitcoin Core addrman.cpp AddSingle "if (!addr.IsRoutable()) return".
+   Core ref: addrman.cpp AddSingle, netaddress.cpp CNetAddr::IsRoutable(). *)
 let test_g18_routability_filter () =
   let pm = make_pm () in
-  (* Private RFC1918 address — should be rejected by Core *)
+  (* RFC1918 private addresses — must all be rejected *)
   add_addr pm "192.168.1.1";
   add_addr pm "10.0.0.1";
   add_addr pm "172.16.0.1";
   let stats = Peer_manager.get_addr_stats pm in
-  (* BUG: camlcoin accepts all three non-routable addresses *)
-  Alcotest.(check bool) "BUG-G18: private addrs accepted (no IsRoutable check)"
-    true (stats.total_known = 3)
+  Alcotest.(check int) "RFC1918 addrs rejected (IsRoutable fix)"
+    0 stats.total_known;
+  (* Loopback must also be rejected *)
+  let pm2 = make_pm () in
+  add_addr pm2 "127.0.0.1";
+  add_addr pm2 "127.0.0.2";
+  let stats2 = Peer_manager.get_addr_stats pm2 in
+  Alcotest.(check int) "loopback addrs rejected"
+    0 stats2.total_known;
+  (* Link-local (RFC3927) must be rejected *)
+  let pm3 = make_pm () in
+  add_addr pm3 "169.254.1.1";
+  let stats3 = Peer_manager.get_addr_stats pm3 in
+  Alcotest.(check int) "link-local addr rejected"
+    0 stats3.total_known;
+  (* Public routable address must be accepted *)
+  let pm4 = make_pm () in
+  add_addr pm4 "8.8.8.8";
+  let stats4 = Peer_manager.get_addr_stats pm4 in
+  Alcotest.(check int) "public routable addr accepted"
+    1 stats4.total_known
 
 (* ===== G19: gossip_no_terrible_filter =============================
    Bug: gossip_addresses sends up to 1000 addresses from known_addrs
@@ -758,7 +776,7 @@ let () =
         test_g17_tried_evict_no_check;
     ];
     "G18_routability_filter", [
-      Alcotest.test_case "non-routable addrs accepted (no IsRoutable)" `Quick
+      Alcotest.test_case "non-routable addrs rejected (IsRoutable fixed)" `Quick
         test_g18_routability_filter;
     ];
     "G19_gossip_no_terrible_filter", [

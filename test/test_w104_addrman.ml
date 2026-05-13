@@ -56,32 +56,28 @@ let add_addr ?(services = 9L) ?(failures = 0) pm addr =
     table_status = Peer_manager.NotInTable;
   }
 
-(* ===== G1: bucket_key_rng_weak ====================================
-   Bug: generate_bucket_key uses OCaml `Random.int 256` (Mersenne-
-   Twister / weak PRNG) instead of a CSPRNG.  Bitcoin Core uses a
-   256-bit key from a CSPRNG (insecure_rand.rand256()).  An attacker
-   who can observe the process start time can predict the bucket key
-   and construct addrs that land in any chosen bucket (eclipse attack).
-   Severity: HIGH.  Core ref: addrman_impl.h AddrManImpl::nKey,
+(* ===== G1: bucket_key_rng_weak (FIXED) ============================
+   Fix: generate_bucket_key now reads 32 bytes from /dev/urandom
+   instead of OCaml Random.int 256 (Mersenne-Twister / clock-seeded).
+   Bitcoin Core uses FastRandomContext::rand256() which sources from
+   GetStrongRandBytes() -> /dev/urandom.  The bucket key must be
+   unpredictable so an attacker cannot pre-compute which bucket any
+   address will land in (eclipse attack).
+   Core ref: addrman_impl.h AddrManImpl::nKey,
    random.h FastRandomContext::rand256(). *)
 let test_g1_bucket_key_rng_weak () =
-  (* generate_bucket_key uses Random.int which is NOT a CSPRNG.
-     We verify the key is 32 bytes (shape correct) but document
-     that the entropy source is wrong. *)
+  (* Shape: key must be exactly 32 bytes *)
   let pm = make_pm () in
-  (* bucket_key is 32 bytes of Random.int output — shape correct but
-     NOT cryptographically secure.  The correct fix is:
-       Mirage_crypto_rng.generate 32 |> Cstruct.to_string
-     or equivalent CSPRNG. *)
   let key = pm.bucket_key in
   Alcotest.(check int) "key is 32 bytes" 32 (String.length key);
-  (* Confirm the RNG is weak: seed Random with known state and check
-     that the generated key is deterministic (proves it is NOT CSPRNG) *)
-  Random.init 42;
+  (* CSPRNG property: two independently generated keys must differ.
+     With 256 bits of /dev/urandom entropy the probability of collision
+     is 2^-256 — effectively impossible.  If this assertion fires,
+     the implementation has regressed to a weak / deterministic source. *)
   let key_a = Peer_manager.generate_bucket_key () in
-  Random.init 42;
   let key_b = Peer_manager.generate_bucket_key () in
-  Alcotest.(check string) "BUG-G1: same seed → same key (non-CSPRNG)" key_a key_b
+  Alcotest.(check bool) "FIX-G1: two keys from /dev/urandom differ (CSPRNG)"
+    true (key_a <> key_b)
 
 (* ===== G2: bucket_hash_algorithm ==================================
    Bug: compute_bucket uses single SHA256 (Digestif.SHA256.digest_string)

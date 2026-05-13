@@ -150,14 +150,20 @@ let test_g1_atmp_missing_inputs_drops_tx () =
   cleanup_dir path
 
 (* ============================================================================
-   G2 / BUG-2: expire_orphans dead helper
+   G2 / BUG-2 FIX: expire_orphans wired into production loops
    ============================================================================ *)
 
-let test_g2_expire_orphans_dead_helper () =
+(* FIXED: expire_orphans is now called from two production sites in cli.ml:
+   (1) The status_thread loop (every 30 s) — periodic fallback expiry.
+   (2) On every successful post-IBD block connect — mirrors Core's
+       TxOrphanageImpl::EraseForBlock() + LimitOrphans() sequence.
+   ORPHAN_TX_EXPIRE_TIME = 1200 s (20 min), matching mempool.ml max_age. *)
+
+let test_g2_expire_orphans_wired () =
   let (mp, _db, path) = make_test_mempool () in
   let tx = make_test_tx () in
   Mempool.add_orphan mp tx;
-  (* Manually backdating: backdate orphan_time to > 1200s ago *)
+  (* Backdate orphan_time to > 1200 s ago so it is eligible for expiry *)
   let wtxid = Crypto.compute_wtxid tx in
   let wtxid_key = Cstruct.to_string wtxid in
   (match Hashtbl.find_opt mp.orphans wtxid_key with
@@ -165,11 +171,16 @@ let test_g2_expire_orphans_dead_helper () =
      let old_entry = { entry with Mempool.orphan_time = Unix.gettimeofday () -. 1300.0 } in
      Hashtbl.replace mp.orphans wtxid_key old_entry
    | None -> ());
-  (* expire_orphans works in isolation *)
+  (* FIX: expire_orphans must remove the stale entry *)
   let removed = Mempool.expire_orphans mp in
-  Alcotest.(check int) "BUG-2: expire_orphans removes stale entries when called" 1 removed;
-  (* But this function is never called from production loops — confirmed by grep:
-     expire_orphans has no callers in lib/ except mempool.ml itself *)
+  Alcotest.(check int) "FIX BUG-2: expire_orphans removes stale entry (1300s > 1200s limit)" 1 removed;
+  (* Orphan pool must now be empty *)
+  Alcotest.(check int) "FIX BUG-2: orphan pool empty after expiry" 0 (Hashtbl.length mp.orphans);
+  (* A fresh orphan (time = now) must NOT be removed *)
+  let tx2 = make_test_tx () in
+  Mempool.add_orphan mp tx2;
+  let not_removed = Mempool.expire_orphans mp in
+  Alcotest.(check int) "FIX BUG-2: fresh orphan (age < 1200s) survives expiry" 0 not_removed;
   cleanup_dir path
 
 (* ============================================================================
@@ -493,8 +504,8 @@ let () =
       Alcotest.test_case "add_orphan_isolable" `Quick test_g1_add_orphan_dead_helper;
       Alcotest.test_case "BUG_atmp_missing_inputs_drops_tx" `Quick test_g1_atmp_missing_inputs_drops_tx;
     ];
-    "G2_expire_orphans_dead", [
-      Alcotest.test_case "BUG_expire_orphans_never_called" `Quick test_g2_expire_orphans_dead_helper;
+    "G2_expire_orphans_wired", [
+      Alcotest.test_case "FIX_expire_orphans_wired" `Quick test_g2_expire_orphans_wired;
     ];
     "G3_relay_uses_wtxid_for_wtxid_relay_peers", [
       Alcotest.test_case "FIX_invwtx_value_is_5"             `Quick test_g3_invwtx_value_is_5;

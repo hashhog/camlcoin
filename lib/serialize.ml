@@ -76,10 +76,13 @@ let read_compact_size r =
   end
   else if first = 0xFE then begin
     let v32 = read_int32_le r in
-    if Int32.compare v32 0x10000l < 0 then failwith "non-canonical CompactSize";
-    if Int32.compare v32 0l < 0 then failwith "CompactSize exceeds max int";
-    if Int32.compare v32 (Int32.of_int max_size) > 0 then failwith "CompactSize exceeds max size";
-    Int32.to_int v32
+    (* Treat the 4-byte payload as unsigned: mask off the sign bit that OCaml's
+       Int32 would otherwise expose.  Int64.of_int32 sign-extends, so AND with
+       0xFFFFFFFFL gives the correct unsigned 32-bit value. *)
+    let v = Int64.logand (Int64.of_int32 v32) 0xFFFFFFFFL in
+    if Int64.compare v 0x10000L < 0 then failwith "non-canonical CompactSize";
+    if Int64.compare v (Int64.of_int max_size) > 0 then failwith "CompactSize exceeds max size";
+    Int64.to_int v
   end
   else begin
     let v64 = read_int64_le r in
@@ -147,7 +150,9 @@ let read_compact_size_int64 r =
   else if first = 0xFD then
     Int64.of_int (read_uint16_le r)
   else if first = 0xFE then
-    Int64.of_int32 (read_int32_le r)
+    (* Treat the 4-byte payload as unsigned (same fix as read_compact_size):
+       Int64.of_int32 sign-extends, so AND with 0xFFFFFFFFL strips the sign. *)
+    Int64.logand (Int64.of_int32 (read_int32_le r)) 0xFFFFFFFFL
   else
     read_int64_le r
 

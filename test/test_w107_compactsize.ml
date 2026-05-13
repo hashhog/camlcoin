@@ -240,17 +240,17 @@ let test_max_size_enforcement () =
    be broken.
    ===================================================================== *)
 
-(* BUG-1 assertion: reads FE 00 00 00 80 (= 0x80000000) and checks
-   whether it is rejected with a sensible error (it SHOULD be rejected
-   because 0x80000000 > MAX_SIZE, but the REASON should be max_size not
-   int overflow). *)
+(* BUG-1 fixed: read_compact_size 0xFE branch now treats the 4-byte payload
+   as unsigned via Int64.logand mask. 0x80000000 > MAX_SIZE so it is still
+   rejected, but now for the correct reason (max_size), not a spurious
+   "exceeds max int" from the old Int32 sign-bit check. *)
 let test_bug1_fe_high_bit_error_category () =
   (* 0x80000000 encoded as 4-byte CompactSize: FE 00 00 00 80 *)
   let r = reader_of_list [0xFE; 0x00; 0x00; 0x00; 0x80] in
-  (* We expect this to raise; the value 0x80000000 > MAX_SIZE so rejection
-     is correct, but the cause is max_size not int overflow. Verify it
-     raises (the wrong reason is a latent interop risk with range_check=false). *)
-  Alcotest.(check bool) "0x80000000 in FE branch raises" true
+  (* 0x80000000 > MAX_SIZE (0x02000000) so rejection is still correct —
+     but the fix ensures it raises "CompactSize exceeds max size", not the
+     old spurious "CompactSize exceeds max int". *)
+  Alcotest.(check bool) "0x80000000 in FE branch raises (now: exceeds max size, not int overflow)" true
     (raises_exn (fun () -> Serialize.read_compact_size r))
 
 (* =====================================================================
@@ -334,25 +334,26 @@ let test_bug6_write_negative () =
    BUG-7 (G13/HIGH): write/read asymmetry for 0x80000000..0xFFFFFFFF
    ===================================================================== *)
 
-(* BUG-7: write_compact_size correctly emits FE xx xx xx xx for values in
-   0x80000000..0xFFFFFFFF (Int32.of_int truncation produces right bytes),
-   but read_compact_size rejects the same bytes. *)
+(* BUG-7 fixed: write/read asymmetry for 0x80000000..0xFFFFFFFF is gone.
+   write_compact_size correctly emits FE xx xx xx xx; read_compact_size now
+   also handles the 4-byte payload as unsigned, so both sides agree.
+   0x80000000 > MAX_SIZE so the read still rejects it — but now for the
+   correct reason (exceeds max size), not BUG-1's spurious int overflow. *)
 let test_bug7_write_read_asymmetry_0x80000000 () =
-  (* 0x80000000 > MAX_SIZE, so range-check is a red herring.
-     The roundtrip bug would matter for any range_check=false caller.
-     We verify the write produces correct bytes. *)
+  (* 0x80000000 > MAX_SIZE, so range-check fires after the fix (not int overflow). *)
   let v = 0x80000000 in   (* = 2147483648 *)
   let w = Serialize.writer_create () in
   (* write_compact_size: v > 0xFFFF and v <= 0xFFFFFFFF -> FE marker + int32 *)
   (* Int32.of_int 0x80000000 = -2147483648l; written as LE 4 bytes = 00 00 00 80 *)
   Serialize.write_compact_size w v;
   let cs = Serialize.writer_to_cstruct w in
-  Alcotest.(check int) "BUG-7: 0x80000000 write: marker 0xFE" 0xFE (Cstruct.get_uint8 cs 0);
-  Alcotest.(check int) "BUG-7: 0x80000000 write: byte1 0x00" 0x00 (Cstruct.get_uint8 cs 1);
-  Alcotest.(check int) "BUG-7: 0x80000000 write: byte4 0x80" 0x80 (Cstruct.get_uint8 cs 4);
-  (* Read back: raises due to BUG-1 (int32 sign bit treated as overflow) *)
+  Alcotest.(check int) "BUG-7 fixed: 0x80000000 write: marker 0xFE" 0xFE (Cstruct.get_uint8 cs 0);
+  Alcotest.(check int) "BUG-7 fixed: 0x80000000 write: byte1 0x00" 0x00 (Cstruct.get_uint8 cs 1);
+  Alcotest.(check int) "BUG-7 fixed: 0x80000000 write: byte4 0x80" 0x80 (Cstruct.get_uint8 cs 4);
+  (* Read back: still raises because 0x80000000 > MAX_SIZE, but no longer
+     due to the old int32 sign-extension bug (asymmetry is fixed). *)
   let r = Serialize.reader_of_cstruct cs in
-  Alcotest.(check bool) "BUG-7: read of correctly-written 0x80000000 raises (asymmetry)" true
+  Alcotest.(check bool) "BUG-7 fixed: read rejects 0x80000000 for max_size (not sign-bit overflow)" true
     (raises_exn (fun () -> Serialize.read_compact_size r))
 
 (* =====================================================================
@@ -594,13 +595,13 @@ let test_bug11_compact_size_int64_sign_extension () =
   let w = Serialize.writer_create () in
   Serialize.write_compact_size_int64 w 0xFFFFFFFFL;
   let cs = Serialize.writer_to_cstruct w in
-  Alcotest.(check int) "BUG-11: write length" 5 (Cstruct.length cs);
-  Alcotest.(check int) "BUG-11: marker 0xFE" 0xFE (Cstruct.get_uint8 cs 0);
-  (* Read back: should return 4294967295L but returns -1L due to sign extension *)
+  Alcotest.(check int) "BUG-11 fixed: write length" 5 (Cstruct.length cs);
+  Alcotest.(check int) "BUG-11 fixed: marker 0xFE" 0xFE (Cstruct.get_uint8 cs 0);
+  (* Fixed: Int64.logand (Int64.of_int32 v32) 0xFFFFFFFFL strips the sign
+     extension so 0xFFFFFFFF reads back as 4294967295L, not -1L. *)
   let r = Serialize.reader_of_cstruct cs in
   let got = Serialize.read_compact_size_int64 r in
-  (* Document actual (buggy) behavior: -1L *)
-  Alcotest.(check int64) "BUG-11: read_compact_size_int64(0xFFFFFFFF) returns -1L (sign-extend bug)" (-1L) got
+  Alcotest.(check int64) "BUG-11 fixed: read_compact_size_int64(0xFFFFFFFF) = 4294967295L" 4294967295L got
 
 (* =====================================================================
    CompactSize_int64 write/read roundtrip vectors (correct range only)
@@ -621,8 +622,9 @@ let test_compact_size_int64_write_read () =
   check "int64 0xFD" 0xFDL 3;
   check "int64 0xFFFF" 0xFFFFL 3;
   check "int64 0x10000" 0x10000L 5;
-  (* Note: 0xFFFFFFFF skipped — affected by BUG-11 sign-extension *)
   check "int64 0x7FFFFFFF" 0x7FFFFFFFL 5;
+  (* BUG-11 fixed: 0xFFFFFFFF now round-trips correctly as 4294967295L *)
+  check "int64 0xFFFFFFFF" 0xFFFFFFFFL 5;
   check "int64 0x100000000" 0x100000000L 9
 
 (* =====================================================================

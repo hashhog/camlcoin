@@ -914,34 +914,61 @@ let test_g18c_rbf_post_commit_state_consistent () =
    ========================================================================= *)
 
 let test_g19_rbf_feerate_diagram_absent () =
-  (* Document that camlcoin does not check the feerate diagram.
+  (* BUG-10 FIX: ImprovesFeerateDiagram is now implemented.
      Core rbf.cpp ImprovesFeerateDiagram compares pre/post chunk lists.
-     We note this as an observability test — a replacement that LOWERS
-     the feerate diagram should be rejected by Core but accepted by camlcoin. *)
+     A replacement that degrades the feerate diagram must be rejected even if
+     it satisfies Rules 3+4 (higher absolute fee, enough relay bump).
+
+     Scenario: the conflict has high feerate (~1205 sat/vb, fee=100,000, vsize≈83).
+     The replacement passes Rules 3+4 (fee=130,000, additional=30,000 >> relay)
+     but is physically ~2× larger (3 outputs), so feerate drops to ~850 sat/vb.
+     At vsize=83 the "after" diagram yields ≈70,457 sat cumulative fee whereas
+     the "before" diagram yields 100,000 sat — "before" is above "after" at that
+     point, so the diagram does NOT strictly improve → reject. *)
   let (mp, db, txid_a, txid_b, _, _, _) = create_test_mempool () in
-  (* Add high-feerate tx in mempool *)
-  let high_fee_tx = make_tx
-    [make_rbf_input txid_a 0l]
-    [make_test_output 900_000L] in  (* 100,000 fee — very high *)
-  let hf_entry = Result.get_ok (Mempool.add_transaction mp high_fee_tx) in
-  ignore hf_entry;
 
-  (* Add a second tx for context *)
-  let low_fee_tx = make_tx
+  (* Conflict: 1 input (1,000,000 sat), 1 output (900,000) → fee=100,000 *)
+  let conflict_tx = make_tx
+    [make_rbf_input txid_a 0l]
+    [make_test_output 900_000L] in
+  let _ = Result.get_ok (Mempool.add_transaction mp conflict_tx) in
+
+  (* Unrelated bystander tx — gives the mempool more context *)
+  let unrelated_tx = make_tx
     [make_test_input txid_b 0l]
-    [make_test_output 1_999_000L] in  (* 1,000 fee *)
-  let _lf_entry = Result.get_ok (Mempool.add_transaction mp low_fee_tx) in
+    [make_test_output 1_999_000L] in  (* fee = 1,000 *)
+  let _ = Result.get_ok (Mempool.add_transaction mp unrelated_tx) in
 
-  (* Replacement of high-fee tx with lower feerate (more bytes, marginally higher abs fee).
-     Core would check feerate diagram improvement; camlcoin skips this check. *)
-  let replacement = make_tx
+  (* Lower-feerate replacement: 3 outputs total 870,000 → fee=130,000.
+     Rules 3+4: fee(130,000) > fee_orig(100,000) + relay(≈153) ✓
+     But vsize is ~2× the original, feerate ≈ 850 vs 1205 sat/vb.
+     Diagram is NOT strictly better → must be rejected. *)
+  let replacement_bad = make_tx
     [make_rbf_input txid_a 0l]
-    [make_test_output 890_000L] in  (* 110,000 fee, slightly higher abs fee but same weight *)
-  let result = Mempool.replace_by_fee mp replacement in
-  (* camlcoin accepts if new_fee >= old_fee + relay_cost — no diagram check *)
+    [ make_test_output 290_000L
+    ; make_test_output 290_000L
+    ; make_test_output 290_000L ] in   (* fee = 1,000,000 - 870,000 = 130,000 *)
+  let result_bad = Mempool.replace_by_fee mp replacement_bad in
   Alcotest.(check bool)
-    "G19 (BUG-10 audit): feerate-diagram check absent — higher-abs-fee replacement accepted"
-    true (Result.is_ok result);
+    "G19 FIX (BUG-10): replacement with lower feerate rejected by ImprovesFeerateDiagram"
+    false (Result.is_ok result_bad);
+
+  (* Conflict is still present in the mempool (diagram check is pre-commit) *)
+  let conflict_txid = Crypto.compute_txid conflict_tx in
+  Alcotest.(check bool)
+    "G19 FIX: conflict survives after diagram-fail rejection (no state mutation)"
+    true (Mempool.contains mp conflict_txid);
+
+  (* Happy-path: a same-structure replacement (same vsize) with slightly higher
+     fee strictly improves the diagram at every breakpoint → must be accepted. *)
+  let replacement_good = make_tx
+    [make_rbf_input txid_a 0l]
+    [make_test_output 895_000L] in   (* fee = 105,000 > 100,000; same vsize → better feerate *)
+  let result_good = Mempool.replace_by_fee mp replacement_good in
+  Alcotest.(check bool)
+    "G19 FIX: replacement with higher feerate accepted by ImprovesFeerateDiagram"
+    true (Result.is_ok result_good);
+
   Storage.ChainDB.close db;
   cleanup ()
 
@@ -1352,7 +1379,7 @@ let () =
         `Quick test_g18b_rbf_atomic_valid_replacement_succeeds;
       test_case "G18c BUG-9/12 FIX: post-commit state consistent (multi-conflict)"
         `Quick test_g18c_rbf_post_commit_state_consistent;
-      test_case "G19 BUG-10: feerate diagram check absent (audit)"
+      test_case "G19 BUG-10 FIX: ImprovesFeerateDiagram rejects diagram-degrading replacement"
         `Quick test_g19_rbf_feerate_diagram_absent;
       test_case "G20: descendants of conflicting tx evicted by RBF"
         `Quick test_g20_rbf_descendants_evicted;

@@ -2669,11 +2669,26 @@ let replace_by_fee (mp : mempool) (tx : Types.transaction)
 
                 else begin
                   ignore new_feerate; (* suppress unused warning after removing non-Core feerate check *)
-                  (* Remove all conflicting transactions and their descendants, then add new *)
-                  List.iter (fun conflict_entry ->
-                    remove_transaction mp conflict_entry.txid
-                  ) conflicts;
-                  add_transaction mp tx
+                  (* BUG-9/BUG-12 fix: pre-check then commit (mirrors Core's staged-removal pattern).
+                     Run add_transaction in dry_run mode BEFORE removing conflicts.  dry_run=true
+                     executes every validation gate (cluster limits, TRUC inheritance, ancestor/
+                     descendant limits, script verification, fee floor) without mutating mempool state.
+                     Only if the pre-check passes do we proceed with the atomic remove+add.
+                     If the pre-check fails, conflicts remain in the mempool unchanged.
+                     Reference: Bitcoin Core MemPoolAccept::ConsiderReplacement runs ALL gates before
+                     RemoveStaged; Finalize does the atomic RemoveStaged+addUnchecked together. *)
+                  match add_transaction ~dry_run:true mp tx with
+                  | Error e -> Error e
+                  | Ok _ ->
+                    (* All gates passed; now atomically remove conflicts and add replacement. *)
+                    List.iter (fun conflict_entry ->
+                      remove_transaction mp conflict_entry.txid
+                    ) conflicts;
+                    (* Residual risk: add_transaction can fail here if mempool state changed
+                       between dry_run and commit (e.g. concurrent eviction or OOM).  In that
+                       case the conflicts are already removed.  This window is negligible in
+                       single-threaded OCaml execution but documented for completeness. *)
+                    add_transaction mp tx
                 end
               end
             end

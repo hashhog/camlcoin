@@ -780,39 +780,131 @@ let test_g17_rbf_ancestor_disjoint () =
   cleanup ()
 
 (* =========================================================================
-   G18 — RBF BUG-9/BUG-12: atomic replace — detect conflict deletion on failure
+   G18 — RBF BUG-9/BUG-12 FIX: atomic replace — pre-check before remove
    ========================================================================= *)
 
-let test_g18_rbf_atomic_replace () =
-  (* This test documents BUG-9/BUG-12: if replace_by_fee's add_transaction
-     step fails after conflicts are removed, the conflicts are gone from the
-     mempool without the replacement being added.  We can trigger this by
-     making the replacement itself invalid (zero outputs = no output sum to check,
-     but we need something that passes the RBF fee checks but fails add_tx).
-     Use: large fee but script verification would fail.  Since verify_scripts=false
-     in our test mp, we can't easily trigger a post-fee failure.
-     We document the risk with a controlled scenario. *)
+(* Test 1: replacement passes RBF fee checks but fails TRUC inheritance.
+   Scenario:
+     - non-v3 unconfirmed parent P (spends txid_b)
+     - original conflict: non-v3, spends BOTH txid_a AND P's output (P's output is vout=0)
+     - replacement: v3, also spends txid_a AND P's output (same outpoints as original)
+   Rule 2: the replacement's unconfirmed input (P.txid:0) was already in the
+   original conflict's inputs → Rule 2 passes (not a NEW unconfirmed input).
+   TRUC: replacement is v3 with unconfirmed non-v3 parent P → TRUC inheritance failure.
+   ASSERT: after the failed replacement, both P and orig_conflict survive in mempool.
+   BUG-9/BUG-12: before the fix, both would be deleted with no rollback. *)
+let test_g18a_rbf_atomic_conflict_survives_truc_failure () =
+  let (mp, db, txid_a, txid_b, _, _, _) = create_test_mempool () in
+
+  (* Step 1: Add non-v3 unconfirmed parent P spending txid_b. P has one output. *)
+  let parent_p = make_tx ~tx_version:1l
+    [make_test_input txid_b 0l]
+    [make_test_output 1_990_000L] in  (* 10,000 sat fee — above relay threshold *)
+  let p_entry = Result.get_ok (Mempool.add_transaction mp parent_p) in
+
+  (* Step 2: Original conflict: non-v3, spends BOTH txid_a and P's output.
+     The conflict signals RBF (txid_a input has sequence 0xFFFFFFFD).
+     Fee: (1,000,000 + 1,990,000) - 2,980,000 = 10,000 sat. *)
+  let orig_conflict = make_tx ~tx_version:1l
+    [make_rbf_input txid_a 0l;           (* spends confirmed txid_a *)
+     make_test_input p_entry.txid 0l]    (* spends unconfirmed parent P output:0 *)
+    [make_test_output 2_980_000L] in     (* fee = 1M + 1.99M - 2.98M = 10,000 *)
+  let orig_entry = Result.get_ok (Mempool.add_transaction mp orig_conflict) in
+  Alcotest.(check bool) "G18a: orig_conflict in mempool" true
+    (Mempool.contains mp orig_entry.txid);
+  Alcotest.(check bool) "G18a: parent P in mempool" true
+    (Mempool.contains mp p_entry.txid);
+
+  (* Step 3: Replacement is v3, spends same two outpoints as orig_conflict.
+     Rule 2 check: (p_entry.txid, 0) was in orig_conflict.inputs → passes Rule 2.
+     Fee: (1,000,000 + 1,990,000) - 2,940,000 = 50,000 sat >> 10,000 → passes Rules 3+4.
+     TRUC: replacement is version=3, has unconfirmed parent P which is non-v3 → TRUC fails.
+     EXPECTED: replace_by_fee returns Error; orig_conflict AND P both remain in mempool. *)
+  let replacement = make_tx ~tx_version:3l
+    [make_rbf_input txid_a 0l;           (* same outpoint as orig *)
+     make_rbf_input p_entry.txid 0l]     (* same outpoint as orig — Rule 2 passes *)
+    [make_test_output 2_940_000L] in     (* fee = 1M + 1.99M - 2.94M = 50,000 *)
+
+  let result = Mempool.replace_by_fee mp replacement in
+  Alcotest.(check bool)
+    "G18a (BUG-9/12 FIX): v3 replacement with non-v3 parent rejected (TRUC)"
+    true (Result.is_error result);
+  (* CORE ASSERTION: conflicts survive the failed replacement *)
+  Alcotest.(check bool)
+    "G18a (BUG-9/12 FIX): orig_conflict SURVIVES failed replacement (atomicity)"
+    true (Mempool.contains mp orig_entry.txid);
+  Alcotest.(check bool)
+    "G18a (BUG-9/12 FIX): parent P SURVIVES failed replacement (atomicity)"
+    true (Mempool.contains mp p_entry.txid);
+  let rep_txid = Crypto.compute_txid replacement in
+  Alcotest.(check bool)
+    "G18a (BUG-9/12 FIX): failed replacement NOT added to mempool"
+    false (Mempool.contains mp rep_txid);
+  Storage.ChainDB.close db;
+  cleanup ()
+
+(* Test 2: valid replacement succeeds — original removed, replacement added.
+   Happy path verification (existing G18 behavior preserved). *)
+let test_g18b_rbf_atomic_valid_replacement_succeeds () =
   let (mp, db, txid_a, _, _, _, _) = create_test_mempool () in
   let orig_tx = make_tx [make_rbf_input txid_a 0l] [make_test_output 990_000L] in
   let orig_entry = Result.get_ok (Mempool.add_transaction mp orig_tx) in
 
-  (* Verify original is in mempool *)
-  Alcotest.(check bool) "G18: original tx in mempool" true
+  Alcotest.(check bool) "G18b: original tx in mempool" true
     (Mempool.contains mp orig_entry.txid);
 
-  (* A valid high-fee replacement *)
+  (* Valid high-fee replacement: fee=30,000 > 10,000 original, passes all gates *)
   let replacement = make_tx
     [make_rbf_input txid_a 0l]
-    [make_test_output 970_000L] in  (* 30,000 fee > 10,000 original *)
+    [make_test_output 970_000L] in
   let result = Mempool.replace_by_fee mp replacement in
-  Alcotest.(check bool) "G18: valid replacement succeeds" true
+  Alcotest.(check bool) "G18b: valid replacement succeeds" true
     (Result.is_ok result);
 
-  (* Original should be gone, replacement should be present *)
-  Alcotest.(check bool) "G18: original replaced (no longer in mempool)" false
+  Alcotest.(check bool) "G18b: original removed after successful replacement" false
     (Mempool.contains mp orig_entry.txid);
   let rep_txid = Crypto.compute_txid replacement in
-  Alcotest.(check bool) "G18: replacement now in mempool" true
+  Alcotest.(check bool) "G18b: replacement now in mempool" true
+    (Mempool.contains mp rep_txid);
+  Storage.ChainDB.close db;
+  cleanup ()
+
+(* Test 3 (residual risk documentation): after pre-check passes, the commit
+   phase (remove+add) is the only mutation point.  There is no pre-checkable
+   gate that the commit add_transaction skips relative to dry_run — every gate
+   that fires in the real add_transaction also fires in dry_run=true.
+   The only residual risk is a race between dry_run and commit in a
+   hypothetical multi-threaded environment (single-threaded OCaml: negligible).
+   This test verifies the post-commit state is self-consistent. *)
+let test_g18c_rbf_post_commit_state_consistent () =
+  let (mp, db, txid_a, txid_b, _, _, _) = create_test_mempool () in
+  (* Two original conflicts with descendants *)
+  let orig1 = make_tx [make_rbf_input txid_a 0l] [make_test_output 990_000L] in
+  let orig2 = make_tx [make_rbf_input txid_b 0l] [make_test_output 1_990_000L] in
+  let e1 = Result.get_ok (Mempool.add_transaction mp orig1) in
+  let e2 = Result.get_ok (Mempool.add_transaction mp orig2) in
+  (* Children of orig1 and orig2 *)
+  let child1 = make_tx [make_test_input e1.txid 0l] [make_test_output 980_000L] in
+  let child2 = make_tx [make_test_input e2.txid 0l] [make_test_output 1_980_000L] in
+  let ce1 = Result.get_ok (Mempool.add_transaction mp child1) in
+  let ce2 = Result.get_ok (Mempool.add_transaction mp child2) in
+
+  (* Replacement: spends both txid_a and txid_b; fee must exceed both conflicts + relay *)
+  let replacement = make_tx
+    [make_rbf_input txid_a 0l; make_rbf_input txid_b 0l]
+    [make_test_output 2_950_000L] in  (* fee = (1M+2M) - 2.95M = 50,000 sat *)
+  let result = Mempool.replace_by_fee mp replacement in
+  Alcotest.(check bool) "G18c: multi-conflict replacement succeeds" true
+    (Result.is_ok result);
+
+  (* All four originals and their children must be gone *)
+  Alcotest.(check bool) "G18c: orig1 removed" false (Mempool.contains mp e1.txid);
+  Alcotest.(check bool) "G18c: orig2 removed" false (Mempool.contains mp e2.txid);
+  Alcotest.(check bool) "G18c: child1 removed" false (Mempool.contains mp ce1.txid);
+  Alcotest.(check bool) "G18c: child2 removed" false (Mempool.contains mp ce2.txid);
+  (* Replacement is present *)
+  let rep_txid = Crypto.compute_txid replacement in
+  Alcotest.(check bool) "G18c: replacement in mempool" true
     (Mempool.contains mp rep_txid);
   Storage.ChainDB.close db;
   cleanup ()
@@ -1254,8 +1346,12 @@ let () =
         `Quick test_g16_rbf_no_new_unconfirmed_inputs;
       test_case "G17: EntriesAndTxidsDisjoint — ancestor/conflict disjoint"
         `Quick test_g17_rbf_ancestor_disjoint;
-      test_case "G18 BUG-9: atomic replace — valid replacement succeeds"
-        `Quick test_g18_rbf_atomic_replace;
+      test_case "G18a BUG-9/12 FIX: conflict survives failed replacement (atomicity)"
+        `Quick test_g18a_rbf_atomic_conflict_survives_truc_failure;
+      test_case "G18b BUG-9/12 FIX: valid replacement succeeds (happy path)"
+        `Quick test_g18b_rbf_atomic_valid_replacement_succeeds;
+      test_case "G18c BUG-9/12 FIX: post-commit state consistent (multi-conflict)"
+        `Quick test_g18c_rbf_post_commit_state_consistent;
       test_case "G19 BUG-10: feerate diagram check absent (audit)"
         `Quick test_g19_rbf_feerate_diagram_absent;
       test_case "G20: descendants of conflicting tx evicted by RBF"

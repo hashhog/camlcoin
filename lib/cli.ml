@@ -987,8 +987,19 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         else
           None
       ) items in
+      (* Core: MAX_GETDATA_SZ = 1000 (protocol.h:482) — batch outgoing
+         getdata to avoid sending oversized messages when a peer announces
+         more than 1000 inventory items in a single inv. *)
+      let rec send_batches = function
+        | [] -> Lwt.return_unit
+        | reqs ->
+          let batch = List.filteri (fun i _ -> i < P2p.max_getdata_count) reqs in
+          let rest  = List.filteri (fun i _ -> i >= P2p.max_getdata_count) reqs in
+          let%lwt () = Peer.send_message peer (P2p.GetdataMsg batch) in
+          send_batches rest
+      in
       if tx_requests <> [] then
-        Peer.send_message peer (P2p.GetdataMsg tx_requests)
+        send_batches tx_requests
       else
         Lwt.return_unit
     | _ -> Lwt.return_unit);

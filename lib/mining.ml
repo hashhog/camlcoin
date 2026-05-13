@@ -33,6 +33,7 @@ type block_template = {
   height : int;
   target : Cstruct.t;
   network_type : Consensus.network;  (* For correct halving interval in JSON *)
+  transactions_updated : int;  (* mempool entry count at template creation time; used for longpollid *)
 }
 
 (* ============================================================================
@@ -489,6 +490,7 @@ let create_block_template ~(chain : Sync.chain_state)
     height;
     target = Consensus.compact_to_target bits;
     network_type;
+    transactions_updated = Hashtbl.length mp.entries;
   }
 
 (* ============================================================================
@@ -606,16 +608,63 @@ let template_to_json (template : block_template) : Yojson.Safe.t =
     Buffer.contents buf
   in
 
+  (* BIP-9/BIP-23 rules list.
+     Core rpc/mining.cpp:950-963: "csv", "!segwit", "taproot" for all non-signet networks.
+     "!" prefix marks rules that affect coinbase/block structure (require explicit client support).
+     CSV and taproot do not use "!" because they are purely optional for the miner.
+     SegWit uses "!" because the commitment output in the coinbase is required. *)
+  let rules_json =
+    `List [`String "csv"; `String "!segwit"; `String "taproot"]
+  in
+
+  (* BIP-22/BIP-23 capabilities — always includes "proposal" (BIP-23).
+     Core rpc/mining.cpp:895. *)
+  let capabilities_json =
+    `List [`String "proposal"]
+  in
+
+  (* BIP-9 vbavailable: map of deployment_name → bit for signaling deployments
+     (Started or LockedIn). On all current networks (mainnet/testnet4/regtest)
+     taproot is buried (Active), so vbavailable is empty.
+     Core rpc/mining.cpp:965-983. *)
+  let vbavailable_json = `Assoc [] in
+
+  (* vbrequired: bitmask of version bits the miner MUST set. Always 0 for current
+     deployments (no deployment is in LockedIn-but-not-yet-mandatory state).
+     Core rpc/mining.cpp:996. *)
+  let vbrequired_json = `Int 0 in
+
+  (* coinbaseaux: auxiliary data required in coinbase scriptSig. Core returns {}
+     (empty object) since BIP-22's COINBASEAUX flags are not used in current policy.
+     Core rpc/mining.cpp:938,1000. *)
+  let coinbaseaux_json = `Assoc [] in
+
+  (* longpollid: tip hash hex + transactions-updated counter.
+     Miners use this opaque string to detect when the template should be refreshed.
+     Core rpc/mining.cpp:1002: tip.GetHex() + ToString(nTransactionsUpdatedLast).
+     We use the prev_block hash (= current tip) and the mempool entry count
+     captured at template creation time as a proxy for nTransactionsUpdatedLast. *)
+  let longpollid_json =
+    `String (Types.hash256_to_hex_display template.header.prev_block
+             ^ string_of_int template.transactions_updated)
+  in
+
   `Assoc [
+    ("capabilities", capabilities_json);
+    ("rules", rules_json);
+    ("vbavailable", vbavailable_json);
+    ("vbrequired", vbrequired_json);
     ("version", `Int (Int32.to_int template.header.version));
     ("previousblockhash",
       `String (Types.hash256_to_hex_display template.header.prev_block));
     ("transactions", `List txs_json);
+    ("coinbaseaux", coinbaseaux_json);
     ("coinbasevalue",
       `String (Int64.to_string
         (Int64.add
           (Consensus.block_subsidy_for_network template.network_type template.height)
           template.total_fee)));
+    ("longpollid", longpollid_json);
     ("target",
       `String (Types.hash256_to_hex template.target));
     ("mintime",

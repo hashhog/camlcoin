@@ -216,13 +216,16 @@ type t = {
   mutable start_msg_loop : (Peer.peer -> unit);
 }
 
-(* Generate a random bucket key for address hashing *)
+(* Generate a 256-bit eclipse-protection bucket key from /dev/urandom.
+   Bitcoin Core uses FastRandomContext::rand256() which sources from
+   GetStrongRandBytes() -> /dev/urandom.  We mirror that here: the key
+   must be unpredictable so an attacker cannot pre-compute which bucket
+   any address will land in and manufacture an eclipse-attack addr set.
+   Never fall back to OCaml Random (Mersenne Twister / clock-seeded). *)
 let generate_bucket_key () : string =
-  let buf = Bytes.create 32 in
-  for i = 0 to 31 do
-    Bytes.set buf i (Char.chr (Random.int 256))
-  done;
-  Bytes.to_string buf
+  let ic = open_in_bin "/dev/urandom" in
+  Fun.protect ~finally:(fun () -> close_in_noerr ic)
+    (fun () -> really_input_string ic 32)
 
 (* Create a new peer manager *)
 let create ?(config = default_config) (network : Consensus.network_config) : t =

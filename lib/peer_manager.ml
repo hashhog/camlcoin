@@ -317,6 +317,53 @@ let netgroup_of addr =
   | a :: b :: _ -> a ^ "." ^ b
   | _ -> addr
 
+(* Determine whether an IPv4 address string is publicly routable.
+   Mirrors Bitcoin Core CNetAddr::IsRoutable() / IsLocal() / IsRFC1918() etc.
+   from src/netaddress.cpp.  Returns false for:
+     - RFC 1918  private ranges:  10/8, 192.168/16, 172.16-31/12
+     - RFC 3927  link-local:      169.254/16
+     - RFC 2544  benchmarking:    198.18-19/15
+     - RFC 6598  shared address:  100.64-127/10
+     - RFC 5737  documentation:   192.0.2/24, 198.51.100/24, 203.0.113/24
+     - loopback / local:          127/8, 0/8
+   Any address that cannot be parsed as dotted-decimal IPv4 is also
+   considered non-routable.  IPv6 addresses are not handled here and
+   are currently passed through as-is (conservative: treat as routable). *)
+let is_routable (addr : string) : bool =
+  match String.split_on_char '.' addr with
+  | [a_s; b_s; c_s; _d_s] ->
+    (match
+       (int_of_string_opt a_s,
+        int_of_string_opt b_s,
+        int_of_string_opt c_s)
+     with
+     | Some a, Some b, Some c ->
+       (* Loopback / unspecified: 127.0.0.0/8 and 0.0.0.0/8 *)
+       if a = 127 || a = 0 then false
+       (* RFC 1918: 10.0.0.0/8 *)
+       else if a = 10 then false
+       (* RFC 1918: 192.168.0.0/16 *)
+       else if a = 192 && b = 168 then false
+       (* RFC 1918: 172.16.0.0/12 *)
+       else if a = 172 && b >= 16 && b <= 31 then false
+       (* RFC 3927: 169.254.0.0/16 link-local *)
+       else if a = 169 && b = 254 then false
+       (* RFC 2544: 198.18.0.0/15 benchmarking *)
+       else if a = 198 && (b = 18 || b = 19) then false
+       (* RFC 6598: 100.64.0.0/10 shared address space *)
+       else if a = 100 && b >= 64 && b <= 127 then false
+       (* RFC 5737: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 documentation *)
+       else if a = 192 && b = 0 && c = 2 then false
+       else if a = 198 && b = 51 && c = 100 then false
+       else if a = 203 && b = 0 && c = 113 then false
+       else true
+     | _ -> false (* unparseable octet — not a valid IPv4 *))
+  | _ ->
+    (* Not dotted-quad — could be IPv6 or hostname; treat as routable
+       so we do not accidentally drop Tor/I2P/CJDNS addresses that
+       currently arrive as raw strings in this codebase. *)
+    true
+
 (* Compute bucket index for an address using SHA256.
    From Bitcoin Core: bucket = SHA256(key ^ addr)[0] *)
 let compute_bucket (key : string) (addr : string) (bucket_count : int) : int =
@@ -336,8 +383,12 @@ let compute_keyed_netgroup (key : string) (addr : string) : int =
   (Char.code (String.get hash 2) lsl 16) lor
   (Char.code (String.get hash 3) lsl 24)
 
-(* Add address to new table bucket *)
+(* Add address to new table bucket.
+   Returns the bucket index, or -1 if the address is non-routable
+   (matches Bitcoin Core AddrMan::AddSingle "if (!addr.IsRoutable()) return"). *)
 let add_to_new_table (pm : t) (addr : string) : int =
+  if not (is_routable addr) then -1
+  else
   let bucket = compute_bucket pm.bucket_key addr new_bucket_count in
   let current = match Hashtbl.find_opt pm.new_table bucket with
     | Some addrs -> addrs
@@ -633,13 +684,17 @@ let get_fallback_peers (network : Consensus.network_config) : peer_info list =
       table_status = NotInTable }
   ) peers
 
-(* Add a peer address to known addresses with bucketing *)
+(* Add a peer address to known addresses with bucketing.
+   Non-routable addresses (RFC1918, loopback, link-local, etc.) are
+   silently dropped, mirroring Bitcoin Core AddrMan::AddSingle(). *)
 let add_known_addr (pm : t) (info : peer_info) : unit =
   if not (Hashtbl.mem pm.known_addrs info.address) then begin
-    (* Add to new table bucket *)
+    (* add_to_new_table returns -1 for non-routable addresses — drop them *)
     let bucket = add_to_new_table pm info.address in
-    let info_with_bucket = { info with table_status = InNew bucket } in
-    Hashtbl.replace pm.known_addrs info.address info_with_bucket
+    if bucket >= 0 then begin
+      let info_with_bucket = { info with table_status = InNew bucket } in
+      Hashtbl.replace pm.known_addrs info.address info_with_bucket
+    end
   end
 
 (* Check if connecting to this address would violate outbound netgroup diversity *)
@@ -1334,21 +1389,27 @@ let handle_addr (pm : t) (peer : Peer.peer) (addrs : (int32 * Types.net_addr) li
                | Some our_addr -> ip_str = our_addr
                | None -> false) then
         ()  (* Skip our own address *)
+      (* Routability filter (W104 G18): reject private/loopback/non-routable addrs *)
+      else if not (is_routable ip_str) then
+        ()  (* Non-routable address — skip, mirroring Core AddrMan::AddSingle *)
       else if not (Hashtbl.mem pm.known_addrs ip_str) then begin
-        (* Add to new table bucket *)
+        (* Add to new table bucket; returns -1 for non-routable (already
+           guarded above, but defensive in case of direct calls) *)
         let bucket = add_to_new_table pm ip_str in
-        Hashtbl.replace pm.known_addrs ip_str
-          { address = ip_str;
-            port = addr.port;
-            services = addr.services;
-            last_connected = 0.0;
-            last_attempt = 0.0;
-            last_success = 0.0;
-            failures = 0;
-            banned_until = 0.0;
-            source = Addr;
-            table_status = InNew bucket };
-        incr processed
+        if bucket >= 0 then begin
+          Hashtbl.replace pm.known_addrs ip_str
+            { address = ip_str;
+              port = addr.port;
+              services = addr.services;
+              last_connected = 0.0;
+              last_attempt = 0.0;
+              last_success = 0.0;
+              failures = 0;
+              banned_until = 0.0;
+              source = Addr;
+              table_status = InNew bucket };
+          incr processed
+        end
       end
     ) to_process;
     (* Update rate limit counter *)
@@ -1365,19 +1426,22 @@ let handle_addrv2 (pm : t) (_peer : Peer.peer) (entries : P2p.addrv2_addr list) 
         (Cstruct.get_uint8 entry.v2_addr 1)
         (Cstruct.get_uint8 entry.v2_addr 2)
         (Cstruct.get_uint8 entry.v2_addr 3) in
-      if not (Hashtbl.mem pm.known_addrs ip_str) then begin
+      (* Routability filter (W104 G18) *)
+      if not (is_routable ip_str) then ()
+      else if not (Hashtbl.mem pm.known_addrs ip_str) then begin
         let bucket = add_to_new_table pm ip_str in
-        Hashtbl.replace pm.known_addrs ip_str
-          { address = ip_str;
-            port = entry.v2_port;
-            services = entry.v2_services;
-            last_connected = Unix.gettimeofday ();
-            last_attempt = 0.0;
-            last_success = 0.0;
-            failures = 0;
-            banned_until = 0.0;
-            source = Addr;
-            table_status = InNew bucket }
+        if bucket >= 0 then
+          Hashtbl.replace pm.known_addrs ip_str
+            { address = ip_str;
+              port = entry.v2_port;
+              services = entry.v2_services;
+              last_connected = Unix.gettimeofday ();
+              last_attempt = 0.0;
+              last_success = 0.0;
+              failures = 0;
+              banned_until = 0.0;
+              source = Addr;
+              table_status = InNew bucket }
       end
     | _ -> ()  (* Skip non-IPv4 for now *)
   ) entries

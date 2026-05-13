@@ -64,6 +64,11 @@ type command =
   | Cfheaders
   | Getcfcheckpt
   | Cfcheckpt
+  (* BIP 37: Bloom Filtering *)
+  | Filterload
+  | Filteradd
+  | Filterclear
+  | Merkleblock
   | Unknown of string
 
 let command_to_string = function
@@ -107,6 +112,10 @@ let command_to_string = function
   | Cfheaders -> "cfheaders"
   | Getcfcheckpt -> "getcfcheckpt"
   | Cfcheckpt -> "cfcheckpt"
+  | Filterload -> "filterload"
+  | Filteradd -> "filteradd"
+  | Filterclear -> "filterclear"
+  | Merkleblock -> "merkleblock"
   | Unknown s -> s
 
 let command_of_string s =
@@ -151,6 +160,10 @@ let command_of_string s =
   | "cfheaders" -> Cfheaders
   | "getcfcheckpt" -> Getcfcheckpt
   | "cfcheckpt" -> Cfcheckpt
+  | "filterload" -> Filterload
+  | "filteradd" -> Filteradd
+  | "filterclear" -> Filterclear
+  | "merkleblock" -> Merkleblock
   | other -> Unknown other
 
 (* Inventory vector types *)
@@ -411,6 +424,19 @@ type message_payload =
       filter_type : int;
       stop_hash : Types.hash256;
       filter_headers : Types.hash256 list;  (** one per CFCHECKPT_INTERVAL=1000 blocks *)
+    }
+  (* BIP-37: Bloom filter messages *)
+  | FilterLoadMsg of Bloom.t
+      (** filterload: peer sets its bloom filter; we store it on the peer record *)
+  | FilterAddMsg of bytes
+      (** filteradd: peer adds data to its bloom filter (max 520 bytes — MAX_SCRIPT_ELEMENT_SIZE) *)
+  | FilterClearMsg
+      (** filterclear: peer clears its bloom filter *)
+  | MerkleBlockMsg of {
+      header : Types.block_header;
+      total_txns : int32;
+      hash_list : Types.hash256 list;   (** partial-merkle-tree hash nodes *)
+      flags : Cstruct.t;               (** partial-merkle-tree flags (packed bits) *)
     }
   | UnknownMsg of { cmd : string; payload : Cstruct.t }
 
@@ -806,6 +832,25 @@ let serialize_payload w = function
     Serialize.write_bytes w stop_hash;
     Serialize.write_compact_size w (List.length filter_headers);
     List.iter (Serialize.write_bytes w) filter_headers
+  | FilterLoadMsg f ->
+    (* filterload wire: CBloomFilter serialization (vData || nHashFuncs || nTweak || nFlags) *)
+    let cs = Bloom.serialize f in
+    Serialize.write_bytes w cs
+  | FilterAddMsg data ->
+    (* filteradd wire: compact_size || data *)
+    Serialize.write_compact_size w (Bytes.length data);
+    Serialize.write_bytes w (Cstruct.of_bytes data)
+  | FilterClearMsg ->
+    (* filterclear: empty payload *)
+    ()
+  | MerkleBlockMsg { header; total_txns; hash_list; flags } ->
+    (* merkleblock wire: block_header || txn_count (u32 LE) || hashes (compact_size + 32-byte each) || flags (compact_size + bytes) *)
+    Serialize.serialize_block_header w header;
+    Serialize.write_int32_le w total_txns;
+    Serialize.write_compact_size w (List.length hash_list);
+    List.iter (Serialize.write_bytes w) hash_list;
+    Serialize.write_compact_size w (Cstruct.length flags);
+    Serialize.write_bytes w flags
   | RejectMsg { message; ccode; reason; data } ->
     Serialize.write_string w message;
     Serialize.write_uint8 w ccode;
@@ -854,6 +899,10 @@ let payload_to_command = function
   | CfheadersMsg _ -> Cfheaders
   | GetcfcheckptMsg _ -> Getcfcheckpt
   | CfcheckptMsg _ -> Cfcheckpt
+  | FilterLoadMsg _ -> Filterload
+  | FilterAddMsg _ -> Filteradd
+  | FilterClearMsg -> Filterclear
+  | MerkleBlockMsg _ -> Merkleblock
   | UnknownMsg { cmd; _ } -> Unknown cmd
 
 let serialize_message (magic : int32) (payload : message_payload)
@@ -977,6 +1026,33 @@ let deserialize_payload (cmd : command) (r : Serialize.reader)
     let count = Serialize.read_compact_size r in
     let filter_headers = List.init count (fun _ -> Serialize.read_bytes r 32) in
     CfcheckptMsg { filter_type; stop_hash; filter_headers }
+  | Filterload ->
+    (* filterload: CBloomFilter serialization consumed from the reader's current position *)
+    let remaining = Cstruct.length r.buf - r.pos in
+    let cs = Cstruct.sub r.buf r.pos remaining in
+    r.pos <- r.pos + remaining;
+    (match Bloom.deserialize cs with
+     | Ok f -> FilterLoadMsg f
+     | Error e -> failwith ("filterload parse error: " ^ e))
+  | Filteradd ->
+    (* filteradd: compact_size || data (max MAX_SCRIPT_ELEMENT_SIZE = 520 bytes) *)
+    let data_len = Serialize.read_compact_size r in
+    let max_script_element_size = 520 in
+    if data_len > max_script_element_size then
+      failwith (Printf.sprintf "filteradd: data too large (%d > 520)" data_len);
+    let cs = Serialize.read_bytes r data_len in
+    FilterAddMsg (Cstruct.to_bytes cs)
+  | Filterclear ->
+    FilterClearMsg
+  | Merkleblock ->
+    (* merkleblock: block_header || total_txns (u32 LE) || hashes (compact_size + 32 each) || flags (compact_size + bytes) *)
+    let header = Serialize.deserialize_block_header r in
+    let total_txns = Serialize.read_int32_le r in
+    let hash_count = Serialize.read_compact_size r in
+    let hash_list = List.init hash_count (fun _ -> Serialize.read_bytes r 32) in
+    let flag_len = Serialize.read_compact_size r in
+    let flags = Serialize.read_bytes r flag_len in
+    MerkleBlockMsg { header; total_txns; hash_list; flags }
   | Reject ->
     let message = Serialize.read_string r in
     let ccode = Serialize.read_uint8 r in

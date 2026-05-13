@@ -287,6 +287,11 @@ type peer = {
   (* BIP-324 v2 transport.  None = legacy v1 path (the default).  Some
      (P2p.V2 state) = encrypted v2 transport; send/read dispatch on this. *)
   mutable transport : P2p.transport option;
+  (* BIP-37: per-peer bloom filter.  None = no filter (send all txs).
+     Set by filterload, mutated by filteradd, cleared by filterclear.
+     Gated: only populated when (our_services ()).bloom = true.
+     Mirrors Core's CNode::m_tx_relay->pfilter (net.h). *)
+  mutable bloom_filter : Bloom.t option;
 }
 
 (* Generate random bytes from /dev/urandom *)
@@ -391,6 +396,10 @@ let make_peer ~(network : Consensus.network_config) ~(addr : string)
     (* Default to v1 (= None).  The BIP-324 v2 dialer flips this to
        Some (P2p.V2 state) once the cipher handshake completes. *)
     transport = None;
+    (* BIP-37: no bloom filter until peer sends filterload.  Gated on
+       [peer_bloom_filters] at load time; see [peer_message_loop] in
+       peer_manager.ml for the BIP-111 disconnect path. *)
+    bloom_filter = None;
   }
 
 (* Establish TCP connection to a peer with timeout.

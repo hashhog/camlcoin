@@ -912,6 +912,13 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
          (* Feed the fee estimator with confirmed block data *)
          (try Fee_estimation.process_block fee_estimator block chain.blocks_synced
           with _ -> ());
+         (* W103 BUG-2 fix: expire stale orphans on block connect, mirroring
+            Core's TxOrphanageImpl::EraseForBlock() + LimitOrphans() sequence.
+            Transactions that are now confirmed or whose parents are still
+            missing after 20 min are pruned from the pool. *)
+         (let n = Mempool.expire_orphans mempool in
+          if n > 0 then
+            Logs.debug (fun m -> m "Expired %d stale orphan(s) on block connect" n));
          (* Announce the block to other peers if it advanced the tip *)
          Lwt.async (fun () ->
            Peer_manager.announce_block peer_manager block.Types.header hash);
@@ -1269,6 +1276,14 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
           Logs.info (fun m ->
             m "Status: peers=%d/%d height=%d mempool=%d txs (%d weight)"
               ready_count peer_count height mp_count mp_weight);
+          (* W103 BUG-2 fix: expire stale orphans on every status tick (every
+             30 s).  Core mirrors this via TxOrphanageImpl::LimitOrphans() which
+             is triggered on every AddTx / EraseTx call; a periodic fallback is
+             the simplest equivalent for our simpler time-based model.
+             ORPHAN_TX_EXPIRE_TIME = 20 * 60 = 1200 s (matches mempool.ml). *)
+          (let n = Mempool.expire_orphans mempool in
+           if n > 0 then
+             Logs.info (fun m -> m "Expired %d stale orphan(s) from pool" n));
           log_status ()
         end else
           Lwt.return_unit

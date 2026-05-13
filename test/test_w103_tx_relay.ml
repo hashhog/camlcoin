@@ -448,11 +448,10 @@ let test_constants_max_inv_sz () =
   Alcotest.(check int) "MAX_INV_SZ = 50000 (matches Core protocol.h)" 50_000 P2p.max_inv_count
 
 let test_constants_max_getdata_sz () =
-  (* Core: MAX_GETDATA_SZ = 1000 in net_processing.cpp
-     camlcoin: max_getdata_items = 1000 in peer.ml handle_getdata *)
-  (* We verify the value is present via a direct comparison of the known constant *)
-  let max_getdata = 1000 in
-  Alcotest.(check int) "MAX_GETDATA_SZ = 1000 (matches Core)" 1000 max_getdata
+  (* Core: MAX_GETDATA_SZ = 1000 (protocol.h:482).
+     Fixed: P2p.max_getdata_count = 1000; outgoing getdata batched at that limit
+     in cli.ml InvMsg handler. *)
+  Alcotest.(check int) "MAX_GETDATA_SZ = 1000 (matches Core)" 1000 P2p.max_getdata_count
 
 let test_constants_orphan_expire () =
   (* Core: modern orphanage uses weight-based limits, not time-based expiry.

@@ -84,7 +84,7 @@ let test_ban_addr () =
 let test_add_known_addr () =
   let pm = Peer_manager.create Consensus.mainnet in
   let info : Peer_manager.peer_info = {
-    address = "10.0.0.1";
+    address = "8.8.8.8";  (* public routable; was 10.0.0.1 (RFC1918) *)
     port = 8333;
     services = 9L;
     last_connected = 0.0;
@@ -128,7 +128,7 @@ let test_get_candidates_filters_banned () =
 let test_get_candidates_returns_valid () =
   let pm = Peer_manager.create Consensus.mainnet in
   let info : Peer_manager.peer_info = {
-    address = "10.0.0.1";
+    address = "8.8.8.8";  (* public routable; was 10.0.0.1 (RFC1918) *)
     port = 8333;
     services = 9L;
     last_connected = 0.0;
@@ -143,14 +143,14 @@ let test_get_candidates_returns_valid () =
   let candidates = Peer_manager.get_connection_candidates pm 10 in
   Alcotest.(check int) "one candidate" 1 (List.length candidates);
   let c = List.hd candidates in
-  Alcotest.(check string) "correct address" "10.0.0.1" c.address
+  Alcotest.(check string) "correct address" "8.8.8.8" c.address
 
 (* Test get_connection_candidates respects limit *)
 let test_get_candidates_respects_limit () =
   let pm = Peer_manager.create Consensus.mainnet in
   for i = 1 to 10 do
     let info : Peer_manager.peer_info = {
-      address = Printf.sprintf "10.0.0.%d" i;
+      address = Printf.sprintf "8.8.8.%d" i;  (* public routable; was 10.0.0.x (RFC1918) *)
       port = 8333;
       services = 9L;
       last_connected = 0.0;
@@ -234,14 +234,15 @@ let test_handle_addr_empty () =
 (* Test handle_addr adds addresses *)
 let test_handle_addr_adds () =
   let pm = Peer_manager.create Consensus.mainnet in
-  (* Create a net_addr with IPv4-mapped IPv6 address 192.168.1.1 *)
+  (* Create a net_addr with IPv4-mapped IPv6 address 8.8.8.8 (public routable;
+     was 192.168.1.1 which is RFC1918 and now correctly rejected) *)
   let addr_bytes = Cstruct.create 16 in
   Cstruct.set_uint8 addr_bytes 10 0xFF;
   Cstruct.set_uint8 addr_bytes 11 0xFF;
-  Cstruct.set_uint8 addr_bytes 12 192;
-  Cstruct.set_uint8 addr_bytes 13 168;
-  Cstruct.set_uint8 addr_bytes 14 1;
-  Cstruct.set_uint8 addr_bytes 15 1;
+  Cstruct.set_uint8 addr_bytes 12 8;
+  Cstruct.set_uint8 addr_bytes 13 8;
+  Cstruct.set_uint8 addr_bytes 14 8;
+  Cstruct.set_uint8 addr_bytes 15 8;
   let net_addr : Types.net_addr = {
     services = 9L;
     addr = addr_bytes;
@@ -258,10 +259,11 @@ let test_handle_addr_dedupes () =
   let addr_bytes = Cstruct.create 16 in
   Cstruct.set_uint8 addr_bytes 10 0xFF;
   Cstruct.set_uint8 addr_bytes 11 0xFF;
-  Cstruct.set_uint8 addr_bytes 12 10;
-  Cstruct.set_uint8 addr_bytes 13 0;
-  Cstruct.set_uint8 addr_bytes 14 0;
-  Cstruct.set_uint8 addr_bytes 15 1;
+  (* 1.2.3.4 — public routable; was 10.0.0.1 (RFC1918) *)
+  Cstruct.set_uint8 addr_bytes 12 1;
+  Cstruct.set_uint8 addr_bytes 13 2;
+  Cstruct.set_uint8 addr_bytes 14 3;
+  Cstruct.set_uint8 addr_bytes 15 4;
   let net_addr : Types.net_addr = {
     services = 9L;
     addr = addr_bytes;
@@ -452,7 +454,7 @@ let test_bucket_deterministic () =
 let test_addr_goes_to_new_table () =
   let pm = Peer_manager.create Consensus.mainnet in
   let info : Peer_manager.peer_info = {
-    address = "10.20.30.40";
+    address = "1.2.3.4";  (* public routable; was 10.20.30.40 (RFC1918) *)
     port = 8333;
     services = 9L;
     last_connected = 0.0;
@@ -477,12 +479,17 @@ let test_bucket_stats_initial () =
   Alcotest.(check int) "outbound netgroups" 0 stats.outbound_netgroups;
   Alcotest.(check int) "anchors" 0 stats.anchor_count
 
-(* Test multiple addresses distribute across buckets *)
+(* Test multiple addresses distribute across buckets.
+   Use IPs in the 11-110 first-octet range, skipping RFC1918 (10.x) and
+   other non-routable ranges so all 100 addresses are accepted. *)
 let test_addresses_distribute () =
   let pm = Peer_manager.create Consensus.mainnet in
   for i = 1 to 100 do
+    (* Offset first octet by 20 → 21..120, which avoids 10.x (RFC1918),
+       0.x (loopback), 127.x, 169.254.x, 172.16-31.x.
+       100.64-127.x (RFC6598) is also skipped because our offset starts at 21. *)
     let info : Peer_manager.peer_info = {
-      address = Printf.sprintf "%d.%d.%d.%d" (i mod 256) ((i/256) mod 256) ((i/65536) mod 256) 1;
+      address = Printf.sprintf "%d.%d.%d.%d" (20 + (i mod 101)) ((i/101) mod 256) 0 1;
       port = 8333;
       services = 9L;
       last_connected = 0.0;
@@ -541,7 +548,7 @@ let test_eclipse_constants () =
 (* Test move to tried table *)
 let test_move_to_tried_table () =
   let pm = Peer_manager.create Consensus.mainnet in
-  let addr = "10.20.30.40" in
+  let addr = "5.5.5.5" in  (* public routable; was 10.20.30.40 (RFC1918) *)
   (* First add to new table *)
   let info : Peer_manager.peer_info = {
     address = addr;

@@ -1192,32 +1192,45 @@ module FlatFileStorage = struct
     let pos = Int32.to_int (Serialize.read_int32_le r) in
     { file_num; pos }
 
+  (* Bit positions used by camlcoin's internal bitmask serialisation.
+     The HAVE_DATA / HAVE_UNDO / FAILED_* values are fixed to match
+     Bitcoin Core's nStatus constants (chain.h):
+       BLOCK_HAVE_DATA    = 8   (bit 3)
+       BLOCK_HAVE_UNDO    = 16  (bit 4)
+       BLOCK_FAILED_VALID = 32  (bit 5)
+       BLOCK_FAILED_CHILD = 64  (bit 6)
+     Core stores the VALID level (0–5) in bits 0–2 as a raw 3-bit value,
+     but camlcoin uses a list of flags.  To avoid collision between the
+     VALID flags and the HAVE/FAILED flags, VALID flags are mapped to bits
+     16–21 (above any Core-defined bit).  This keeps the wire-level bitmask
+     values for HAVE_DATA and HAVE_UNDO correct while preserving round-trip
+     fidelity for the VALID-level flags in the internal index.dat format. *)
   let status_to_int = function
-    | Block_valid_unknown -> 0
-    | Block_valid_header -> 1
-    | Block_valid_tree -> 2
-    | Block_valid_transactions -> 3
-    | Block_valid_chain -> 4
-    | Block_valid_scripts -> 5
-    | Block_have_data -> 6
-    | Block_have_undo -> 7
-    | Block_failed -> 8
-    | Block_failed_child -> 10
-    | Block_pruned -> 9
+    | Block_valid_unknown      -> 16
+    | Block_valid_header       -> 17
+    | Block_valid_tree         -> 18
+    | Block_valid_transactions -> 19
+    | Block_valid_chain        -> 20
+    | Block_valid_scripts      -> 21
+    | Block_have_data          ->  3  (* 1 lsl 3 = 8  — Core BLOCK_HAVE_DATA *)
+    | Block_have_undo          ->  4  (* 1 lsl 4 = 16 — Core BLOCK_HAVE_UNDO *)
+    | Block_failed             ->  5  (* 1 lsl 5 = 32 — Core BLOCK_FAILED_VALID *)
+    | Block_failed_child       ->  6  (* 1 lsl 6 = 64 — Core BLOCK_FAILED_CHILD *)
+    | Block_pruned             ->  9  (* 1 lsl 9 = 512 — camlcoin-internal, no Core equivalent *)
 
   let int_to_status = function
-    | 0 -> Block_valid_unknown
-    | 1 -> Block_valid_header
-    | 2 -> Block_valid_tree
-    | 3 -> Block_valid_transactions
-    | 4 -> Block_valid_chain
-    | 5 -> Block_valid_scripts
-    | 6 -> Block_have_data
-    | 7 -> Block_have_undo
-    | 8 -> Block_failed
-    | 10 -> Block_failed_child
-    | 9 -> Block_pruned
-    | _ -> Block_valid_unknown
+    | 16 -> Block_valid_unknown
+    | 17 -> Block_valid_header
+    | 18 -> Block_valid_tree
+    | 19 -> Block_valid_transactions
+    | 20 -> Block_valid_chain
+    | 21 -> Block_valid_scripts
+    |  3 -> Block_have_data
+    |  4 -> Block_have_undo
+    |  5 -> Block_failed
+    |  6 -> Block_failed_child
+    |  9 -> Block_pruned
+    |  _ -> Block_valid_unknown
 
   let serialize_entry w (e : block_index_entry) =
     serialize_pos w e.file_pos;

@@ -370,13 +370,42 @@ let is_routable (addr : string) : bool =
        currently arrive as raw strings in this codebase. *)
     true
 
-(* Compute bucket index for an address using SHA256.
-   From Bitcoin Core: bucket = SHA256(key ^ addr)[0] *)
-let compute_bucket (key : string) (addr : string) (bucket_count : int) : int =
-  let input = key ^ addr in
+(* Private helper: compute bucket index from a precomputed group string.
+   Core: bucket = SHA256(key || group)[0] mod bucket_count.
+   The group string is the output of NetGroupManager::GetGroup() — either
+   the 4-byte big-endian ASN (when asmap is active) or the /16 "A.B" string. *)
+let compute_bucket_group (key : string) (group : string) (bucket_count : int) : int =
+  let input = key ^ group in
   let hash = Digestif.SHA256.(to_raw_string (digest_string input)) in
   let first_byte = Char.code (String.get hash 0) in
   first_byte mod bucket_count
+
+(* Compute bucket index for an address using SHA256.
+   Public entry-point: derives the /16 netgroup from [addr] and delegates.
+   Internal callers that have a net_group_manager use compute_bucket_group
+   via Asmap.get_group to get the ASN-aware group when asmap is active. *)
+let compute_bucket (key : string) (addr : string) (bucket_count : int) : int =
+  let group = netgroup_of addr in
+  compute_bucket_group key group bucket_count
+
+(* FIX-51 / W104-G3 carry-forward: compute_bucket variant that includes the
+   source peer's netgroup in the hash, matching Bitcoin Core's GetNewBucket
+   two-round construction:
+     hash1 = SHA256(key || addr_group)
+     bucket = SHA256(key || addr_group || (hash1[0] mod 64)) % bucket_count
+   src_group should be the output of Asmap.get_group for the advertising peer.
+   For tried-bucket use, pass src_group = "" (Core's GetTriedBucket passes
+   GetGroup(addr) twice but the second use is for the inner hash, not a src). *)
+let compute_bucket_with_src (key : string) (addr_group : string)
+    (src_group : string) (bucket_count : int) : int =
+  (* hash1: SHA256(key || addr_group) — determines the per-source slot *)
+  let h1 = Digestif.SHA256.(to_raw_string (digest_string (key ^ addr_group))) in
+  let slot = (Char.code (String.get h1 0)) mod 64 in
+  let slot_str = String.make 1 (Char.chr slot) in
+  (* hash2: SHA256(key || src_group || slot_str) *)
+  let input2 = key ^ src_group ^ slot_str in
+  let h2 = Digestif.SHA256.(to_raw_string (digest_string input2)) in
+  (Char.code (String.get h2 0)) mod bucket_count
 
 (* Compute keyed netgroup hash for eviction algorithm (public, uses /16) *)
 let compute_keyed_netgroup (key : string) (addr : string) : int =
@@ -411,11 +440,13 @@ let using_asmap (pm : t) : bool =
 
 (* Add address to new table bucket.
    Returns the bucket index, or -1 if the address is non-routable
-   (matches Bitcoin Core AddrMan::AddSingle "if (!addr.IsRoutable()) return"). *)
+   (matches Bitcoin Core AddrMan::AddSingle "if (!addr.IsRoutable()) return").
+   FIX-51: uses Asmap.get_group so ASN bytes drive the bucket when asmap active. *)
 let add_to_new_table (pm : t) (addr : string) : int =
   if not (is_routable addr) then -1
   else
-  let bucket = compute_bucket pm.bucket_key addr new_bucket_count in
+  let group = Asmap.get_group pm.net_group_manager addr in
+  let bucket = compute_bucket_group pm.bucket_key group new_bucket_count in
   let current = match Hashtbl.find_opt pm.new_table bucket with
     | Some addrs -> addrs
     | None -> []
@@ -436,10 +467,12 @@ let add_to_new_table (pm : t) (addr : string) : int =
     bucket
   end
 
-(* Move address from new table to tried table (after successful connection) *)
+(* Move address from new table to tried table (after successful connection).
+   FIX-51: uses Asmap.get_group for both bucket lookups. *)
 let move_to_tried_table (pm : t) (addr : string) : int =
-  let new_bucket = compute_bucket pm.bucket_key addr new_bucket_count in
-  let tried_bucket = compute_bucket pm.bucket_key addr tried_bucket_count in
+  let group = Asmap.get_group pm.net_group_manager addr in
+  let new_bucket = compute_bucket_group pm.bucket_key group new_bucket_count in
+  let tried_bucket = compute_bucket_group pm.bucket_key group tried_bucket_count in
   (* Remove from new table *)
   (match Hashtbl.find_opt pm.new_table new_bucket with
    | Some addrs ->
@@ -466,9 +499,11 @@ let move_to_tried_table (pm : t) (addr : string) : int =
   end;
   tried_bucket
 
-(* Check if address is in tried table *)
+(* Check if address is in tried table.
+   FIX-51: uses Asmap.get_group for consistent bucket lookup. *)
 let is_in_tried_table (pm : t) (addr : string) : bool =
-  let bucket = compute_bucket pm.bucket_key addr tried_bucket_count in
+  let group = Asmap.get_group pm.net_group_manager addr in
+  let bucket = compute_bucket_group pm.bucket_key group tried_bucket_count in
   match Hashtbl.find_opt pm.tried_table bucket with
   | Some addrs -> List.mem addr addrs
   | None -> false

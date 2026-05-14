@@ -315,18 +315,18 @@ let test_g7_sendcmpct_version_accept_v2 () =
   let _ = Lwt_main.run (Peer.dispatch_message peer msg) in
   Alcotest.(check int64) "G7: version-2 sendcmpct sets cmpct_version=2" 2L peer.Peer.cmpct_version
 
-let test_g7_sendcmpct_version1_accepted_bug () =
-  (* BUG-2: camlcoin accepts version-1 sendcmpct and stores version=1.
-     Core ignores sendcmpct with version != 2 (CMPCTBLOCKS_VERSION). *)
+let test_g7_sendcmpct_version1_dropped () =
+  (* FIX-43 BUG-2: version-1 sendcmpct must be silently dropped.
+     Core: net_processing.cpp:3907 — ignore sendcmpct where version != 2. *)
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
     ~port:8333 ~id:100 ~direction:Peer.Inbound ~fd () in
   peer.Peer.version_received <- true;
-  (* Send version 1 sendcmpct — Core would ignore it, camlcoin stores it *)
+  (* Send version 1 sendcmpct — must be ignored; cmpct_version stays at default 0L *)
   let msg = P2p.SendcmpctMsg { announce = false; version = 1L } in
   let _ = Lwt_main.run (Peer.dispatch_message peer msg) in
-  (* BUG-2: should be 0L (unchanged) but camlcoin sets it to 1L *)
-  Alcotest.(check int64) "G7/BUG-2: version-1 sendcmpct stored (should be ignored per Core)" 1L peer.Peer.cmpct_version
+  (* FIX-43: version-1 dropped, cmpct_version remains 0L (unchanged default) *)
+  Alcotest.(check int64) "G7/FIX-43: version-1 sendcmpct dropped (cmpct_version unchanged)" 0L peer.Peer.cmpct_version
 
 (* ============================================================================
    G8-G10: compact_block structure and serialization
@@ -743,7 +743,7 @@ let sendcmpct_tests = [
   Alcotest.test_case "G6 sendcmpct version = 2"           `Quick test_g6_sendcmpct_version_constant;
   Alcotest.test_case "G6 sendcmpct LBW flag"              `Quick test_g6_sendcmpct_lbw_flag;
   Alcotest.test_case "G7 sendcmpct v2 accepted"           `Quick test_g7_sendcmpct_version_accept_v2;
-  Alcotest.test_case "G7/BUG-2 sendcmpct v1 stored"       `Quick test_g7_sendcmpct_version1_accepted_bug;
+  Alcotest.test_case "G7/FIX-43 sendcmpct v1 dropped"      `Quick test_g7_sendcmpct_version1_dropped;
 ]
 
 let cmpctblock_tests = [

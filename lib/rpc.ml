@@ -1219,7 +1219,7 @@ let handle_getpeerinfo (ctx : rpc_context) : Yojson.Safe.t =
       (if Int64.logand svc 8L <> 0L then ["WITNESS"] else []) @
       (if Int64.logand svc 1024L <> 0L then ["NETWORK_LIMITED"] else []) in
     let is_inbound = stats.stat_direction = Peer.Inbound in
-    `Assoc [
+    let fields = [
       ("id", `Int stats.Peer.stat_id);
       ("addr", `String (Printf.sprintf "%s:%d"
         stats.stat_addr stats.stat_port));
@@ -1257,7 +1257,13 @@ let handle_getpeerinfo (ctx : rpc_context) : Yojson.Safe.t =
       ("connection_type", `String (if is_inbound then "inbound" else "outbound-full-relay"));
       ("transport_protocol_type", `String "v1");
       ("session_id", `String "");
-    ]
+    ] in
+    (* Include mapped_as when non-zero (asmap active and ASN found).
+       Mirrors Bitcoin Core rpc/net.cpp GetPeerInfo: pushKV("mapped_as", ...) *)
+    let fields = if stats.Peer.stat_mapped_as <> 0l then
+      fields @ [("mapped_as", `Int (Int32.to_int stats.Peer.stat_mapped_as))]
+    else fields in
+    `Assoc fields
   ) peers)
 
 let handle_getconnectioncount (ctx : rpc_context) : Yojson.Safe.t =

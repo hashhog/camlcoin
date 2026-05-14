@@ -90,6 +90,13 @@ type mempool = {
   (* ZMQ notifications *)
   mutable zmq_sequence : int64;                 (* monotonically increasing sequence for ZMQ *)
   mutable zmq_notifier : Zmq_notify.t option;   (* optional ZMQ notifier *)
+  (* Fee-estimation eviction hook.
+     Called by remove_transaction for every tx removed without confirmation
+     (eviction, expiry, RBF conflict).  Wired to Fee_estimation.record_eviction
+     from cli.ml so the estimator can update leftmempool stats.
+     Core: TransactionRemovedFromMempool → CBlockPolicyEstimator::processTransaction
+     Reference: validation.cpp / node/txmempool_impl.cpp *)
+  mutable on_eviction : (Types.hash256 -> unit) option;
 }
 
 (* ============================================================================
@@ -212,6 +219,7 @@ let truc_descendant_limit = 2     (* max unconfirmed descendants including self 
 
 let create ?(require_standard=true) ?(verify_scripts=true)
     ?(zmq_notifier : Zmq_notify.t option)
+    ?(on_eviction : (Types.hash256 -> unit) option = None)
     ~(utxo : Utxo.UtxoSet.t) ~(current_height : int) () : mempool =
   let network = Consensus.regtest in
   { entries = Hashtbl.create 10_000;
@@ -237,7 +245,8 @@ let create ?(require_standard=true) ?(verify_scripts=true)
     max_orphans = 100;
     map_next_tx = Hashtbl.create 10_000;
     zmq_sequence = 0L;
-    zmq_notifier }
+    zmq_notifier;
+    on_eviction }
 
 (* ============================================================================
    Basic Queries
@@ -328,6 +337,14 @@ let rec remove_transaction (mp : mempool) (txid : Types.hash256) : unit =
   | Some entry ->
     (* Notify ZMQ subscribers about removal *)
     zmq_notify_tx mp entry.txid entry.tx false;
+    (* Notify fee estimator — mirrors Core's TransactionRemovedFromMempool hook.
+       Called for every removal: eviction, expiry, RBF conflict, block inclusion.
+       Fee_estimation.record_eviction is a no-op for txids not in tracked_txs,
+       so block-confirmed txs (already removed via process_block→record_confirmation)
+       are silently skipped. *)
+    (match mp.on_eviction with
+     | Some cb -> cb entry.txid
+     | None -> ());
     let vsize = (entry.weight + 3) / 4 in
     (* Update ancestor descendant counts before removal *)
     let visited = Hashtbl.create 16 in

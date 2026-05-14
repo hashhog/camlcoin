@@ -20,7 +20,8 @@
    insufficient data exists.
 
    KNOWN GAPS (W114 audit — see test_w114_fee_estimation.ml):
-   - track_transaction / record_eviction are dead-helpers (not called from cli.ml)
+   - FIX-47: track_transaction wired in cli.ml TxMsg path; record_eviction wired
+     via mempool.on_eviction hook in remove_transaction (G10+G12 closed)
    - scale factors (SHORT=1, MED=2, LONG=24) not implemented
    - validForFeeEstimation guard absent
    - txHeight == nBestSeenHeight guard absent

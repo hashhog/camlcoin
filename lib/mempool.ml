@@ -3739,6 +3739,58 @@ let is_1p1c_package (txs : Types.transaction list) : bool =
       ) child.Types.inputs
     end
 
+(* is_child_with_parents_tree — topology check required by submitpackage.
+   Mirrors Bitcoin Core IsChildWithParentsTree (policy/packages.cpp):
+     1. Package must have ≥ 2 transactions.
+     2. Every non-last transaction must be a direct parent of the last (child)
+        transaction, i.e. the child spends at least one output of each parent.
+     3. No parent may spend an output of another parent (no parent-to-parent deps).
+   Returns Ok () on valid child-with-parents-tree topology, Error msg otherwise.
+   Reference: bitcoin-core/src/policy/packages.cpp IsChildWithParentsTree *)
+let is_child_with_parents_tree (txs : Types.transaction list)
+    : (unit, string) result =
+  let n = List.length txs in
+  if n < 2 then
+    Error "package topology disallowed. not child-with-parents"
+  else begin
+    let parents = List.filteri (fun i _ -> i < n - 1) txs in
+    let child   = List.nth txs (n - 1) in
+    (* Collect all txids the child directly spends *)
+    let child_input_txids =
+      List.fold_left (fun acc inp ->
+        let k = Cstruct.to_string inp.Types.previous_output.txid in
+        Hashtbl.replace acc k (); acc
+      ) (Hashtbl.create 8) child.Types.inputs
+    in
+    (* Every parent must be directly spent by the child *)
+    let bad_parent = List.find_opt (fun p ->
+      let ptxid = Crypto.compute_txid p in
+      not (Hashtbl.mem child_input_txids (Cstruct.to_string ptxid))
+    ) parents in
+    (match bad_parent with
+     | Some _ ->
+       Error "package topology disallowed. not child-with-parents or parents depend on each other."
+     | None ->
+       (* Collect all parent txids *)
+       let parent_txid_set =
+         List.fold_left (fun acc p ->
+           let k = Cstruct.to_string (Crypto.compute_txid p) in
+           Hashtbl.replace acc k (); acc
+         ) (Hashtbl.create 8) parents
+       in
+       (* No parent may spend an output of another parent *)
+       let parent_spends_parent = List.exists (fun p ->
+         List.exists (fun inp ->
+           Hashtbl.mem parent_txid_set
+             (Cstruct.to_string inp.Types.previous_output.txid)
+         ) p.Types.inputs
+       ) parents in
+       if parent_spends_parent then
+         Error "package topology disallowed. not child-with-parents or parents depend on each other."
+       else
+         Ok ())
+  end
+
 (* Calculate fee and vsize for a single transaction given available UTXOs.
    Returns (fee, vsize) or Error if inputs are missing. *)
 let calc_tx_fee_vsize (mp : mempool) (tx : Types.transaction)
@@ -3791,6 +3843,14 @@ let accept_package (mp : mempool) (txs : Types.transaction list)
     match topo_sort txs with
     | Error msg -> PackageRejected msg
     | Ok sorted ->
+      (* BUG-6 fix: enforce IsChildWithParentsTree topology for multi-tx packages.
+         Core rejects any package that is not child-with-parents-tree before
+         calling the validation engine (policy/packages.cpp, net_processing.cpp).
+         Single-tx packages are exempted (equivalent to plain ATMP). *)
+      let n_sorted = List.length sorted in
+      (match (if n_sorted >= 2 then is_child_with_parents_tree sorted else Ok ()) with
+       | Error msg -> PackageRejected msg
+       | Ok () ->
       (* Track UTXOs created by earlier transactions in the package *)
       let package_utxos = Hashtbl.create 16 in
       let total_fee = ref 0L in
@@ -3846,7 +3906,10 @@ let accept_package (mp : mempool) (txs : Types.transaction list)
           Int64.to_float !total_fee *. 1000.0 /. float_of_int !total_vsize
         else 0.0
       in
-      let min_feerate = Int64.to_float mp.min_relay_fee in
+      (* BUG-5 fix: use effective_min_fee (max of static min_relay_fee and rolling
+         decay floor) so that mempool-pressure packages cannot bypass the eviction
+         floor.  Reference: CTxMemPool::GetMinFee + ATMP's mempoolReplacementInfo. *)
+      let min_feerate = Int64.to_float (effective_min_fee mp) in
 
       (* If package fee rate is sufficient, accept txs even if individual is below min *)
       let use_package_feerate = package_feerate >= min_feerate in
@@ -3896,6 +3959,7 @@ let accept_package (mp : mempool) (txs : Types.transaction list)
           PackageRejected (Printf.sprintf "missing-ephemeral-spends: %s" msg)
         | Ok () ->
           PackagePartial { accepted = accepted_list; rejected = rejected_list }
+      )  (* end is_child_with_parents_tree match *)
 
 (* Find a 1p1c package for an orphan transaction.
    When an orphan's parent arrives but is rejected for low fee,

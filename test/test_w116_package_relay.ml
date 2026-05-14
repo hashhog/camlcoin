@@ -272,9 +272,12 @@ let test_g11_submitpackage_wired () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
-(* G12/BUG-6: submitpackage missing IsChildWithParentsTree topology enforcement.
-   Core: "package topology disallowed. not child-with-parents or parents depend
-   on each other." Camlcoin: no such check in accept_package or submitpackage handler. *)
+(* G12/BUG-6 FIX: is_child_with_parents_tree wired into accept_package.
+   Two unrelated parents (no common child) must be rejected by accept_package
+   with the topology error.  is_well_formed_package still accepts them (it only
+   checks count/weight/input-conflicts), but accept_package now enforces
+   IsChildWithParentsTree before any validation.
+   Reference: bitcoin-core/src/policy/packages.cpp IsChildWithParentsTree *)
 let test_g12_bug6_no_topology_enforcement () =
   let (mp, _utxo, db, txid1, txid2, _) = create_test_mempool () in
   let parent_a = make_regular_tx
@@ -285,10 +288,18 @@ let test_g12_bug6_no_topology_enforcement () =
     [make_test_input txid2 0l]
     [make_test_output 999_000L]
   in
-  ignore mp;
-  let result = Mempool.is_well_formed_package [parent_a; parent_b] in
-  Alcotest.(check bool) "G12/BUG-6: topology not checked"
-    true (result = Ok ());
+  (* is_well_formed_package still passes (only checks count/weight/conflicts) *)
+  let wf = Mempool.is_well_formed_package [parent_a; parent_b] in
+  Alcotest.(check bool) "G12/BUG-6: is_well_formed_package ok for 2 unrelated txs"
+    true (wf = Ok ());
+  (* accept_package must now reject with topology error (FIX-53) *)
+  let result = Mempool.accept_package mp [parent_a; parent_b] in
+  (match result with
+   | Mempool.PackageRejected msg ->
+     Alcotest.(check bool) "G12/BUG-6 FIX: accept_package enforces topology"
+       true (String.length msg > 0)
+   | Mempool.PackageAccepted _ | Mempool.PackagePartial _ ->
+     Alcotest.fail "G12/BUG-6: topology enforcement missing — two unrelated parents accepted");
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
@@ -351,33 +362,35 @@ let test_g16_well_formedness_check () =
      Alcotest.(check bool) "G16: 26 txs rejected (>25)" true true
    | Ok () -> Alcotest.fail "G16: should reject > max_package_count")
 
-(* G17/BUG-5: accept_package uses mp.min_relay_fee instead of effective_min_fee.
-   Raises rolling_min_fee_rate to simulate mempool pressure: effective floor = 5000 sat/kvB.
-   Package with ~3000 sat/kvB should be rejected but camlcoin accepts because it
-   checks static min_relay_fee = 1000 sat/kvB. *)
+(* G17/BUG-5 FIX: accept_package now uses effective_min_fee (rolling floor included).
+   Raises rolling_min_fee_rate to 5000 sat/kvB to simulate mempool pressure.
+   Package combined fee = 400 sat over ~166 vbytes ≈ 2410 sat/kvB.
+   With old static floor (1000 sat/kvB) that would be accepted.
+   With effective_min_fee = max(1000, 5000) = 5000 sat/kvB, it must be rejected.
+   Reference: CTxMemPool::GetMinFee + ATMP mempoolReplacementInfo logic *)
 let test_g17_bug5_accept_package_wrong_feerate () =
   let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
   Mempool.set_rolling_min_fee_rate mp 5000.0;
   mp.Mempool.block_since_last_rolling_fee_bump <- false;
   let parent = make_regular_tx
     [make_test_input txid1 0l]
-    [make_test_output 999_500L]  (* 500 sat fee *)
+    [make_test_output 999_900L]  (* 100 sat fee *)
   in
   let parent_txid = Crypto.compute_txid parent in
   let child = make_regular_tx
     [make_test_input parent_txid 0l]
-    [make_test_output 998_500L]  (* 1000 sat fee; combined ~3000 sat/kvB < 5000 floor *)
+    [make_test_output 999_600L]  (* 300 sat fee; combined 400 sat / ~166 vbytes ≈ 2410 sat/kvB *)
   in
   let result = Mempool.accept_package mp [parent; child] in
+  (* FIX-53: must be rejected because effective_min_fee = 5000 sat/kvB > 2410 sat/kvB *)
   (match result with
-   | Mempool.PackageAccepted _ ->
-     (* BUG-5: incorrectly accepted under rolling fee pressure *)
-     Alcotest.(check bool) "G17/BUG-5: accept_package bypasses rolling min fee floor"
-       true true
    | Mempool.PackageRejected _ ->
-     Alcotest.(check bool) "G17/BUG-5: correctly uses effective_min_fee"
+     Alcotest.(check bool) "G17/BUG-5 FIX: correctly uses effective_min_fee"
        true true
-   | Mempool.PackagePartial _ -> ());
+   | Mempool.PackageAccepted _ ->
+     Alcotest.fail "G17/BUG-5: accept_package still bypasses rolling min fee floor"
+   | Mempool.PackagePartial _ ->
+     Alcotest.fail "G17/BUG-5: accept_package partially accepted below floor");
   Storage.ChainDB.close db;
   cleanup_test_db ()
 

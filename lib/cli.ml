@@ -69,6 +69,12 @@ type config = {
        REST endpoints return Core's exact 400 "Index is not enabled for
        filtertype basic". The index is back-filled at startup if it lags
        the validated tip and is updated on every connect/reorg. *)
+  asmap_path : string option;
+    (* Path to an ASMap binary file for IP-to-ASN mapping (eclipse protection).
+       Mirrors Bitcoin Core's -asmap=<file> flag (init.cpp).  When set, peer
+       addresses are mapped to their Autonomous System Number and bucketed by
+       ASN in AddrMan rather than by /16 netgroup.  [None] (default) uses the
+       legacy /16 bucketing. *)
 }
 
 (* ============================================================================
@@ -98,6 +104,7 @@ let default_config : config = {
   rest_port = None;
   rest_bind = None;
   blockfilterindex_basic = false;  (* Mirrors Core DEFAULT_BLOCKFILTERINDEX *)
+  asmap_path = None;
 }
 
 (* Network-specific configuration *)
@@ -415,11 +422,28 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     Logs.warn (fun m ->
       m "Failed to load fee estimates: %s" (Printexc.to_string exn)));
 
+  (* Load ASMap for eclipse-resistant bucketing (--asmap flag) *)
+  let asmap_data = match config.asmap_path with
+    | None -> None
+    | Some path ->
+      let data = Asmap.load_asmap path in
+      (match data with
+       | Some bytes ->
+         let ver = Asmap.asmap_version bytes in
+         let hex = String.concat "" (List.init 8 (fun i ->
+           Printf.sprintf "%02x" (Char.code (String.get ver i))))
+         in
+         Logs.info (fun m -> m "Using asmap version %s... for IP bucketing" hex);
+         Some bytes
+       | None -> None)
+  in
+
   (* Initialize peer manager *)
   let peer_manager = Peer_manager.create
     ~config:{ Peer_manager.default_config with
               max_outbound = config.max_outbound;
               max_inbound = config.max_inbound }
+    ~asmap:asmap_data
     network in
 
   (* Load persisted peer bans from previous session *)

@@ -214,6 +214,8 @@ type t = {
   (* Callback to start the message loop for a newly-connected peer.
      Filled in by [start] once [peer_message_loop] is defined. *)
   mutable start_msg_loop : (Peer.peer -> unit);
+  (* ASMap support: IP-to-ASN mapping for eclipse-resistant bucketing *)
+  net_group_manager : Asmap.net_group_manager;
 }
 
 (* Generate a 256-bit eclipse-protection bucket key from /dev/urandom.
@@ -228,7 +230,7 @@ let generate_bucket_key () : string =
     (fun () -> really_input_string ic 32)
 
 (* Create a new peer manager *)
-let create ?(config = default_config) (network : Consensus.network_config) : t =
+let create ?(config = default_config) ?(asmap : bytes option = None) (network : Consensus.network_config) : t =
   { network;
     config;
     peers = [];
@@ -258,6 +260,7 @@ let create ?(config = default_config) (network : Consensus.network_config) : t =
     start_msg_loop = (fun _peer -> ());
     mempool = None;
     hb_compact_peers = [];
+    net_group_manager = Asmap.create_net_group_manager asmap;
   }
 
 (* Set the mempool reference for feefilter (BIP-133) *)
@@ -375,7 +378,7 @@ let compute_bucket (key : string) (addr : string) (bucket_count : int) : int =
   let first_byte = Char.code (String.get hash 0) in
   first_byte mod bucket_count
 
-(* Compute keyed netgroup hash for eviction algorithm *)
+(* Compute keyed netgroup hash for eviction algorithm (public, uses /16) *)
 let compute_keyed_netgroup (key : string) (addr : string) : int =
   let netgroup = netgroup_of addr in
   let input = key ^ netgroup in
@@ -385,6 +388,26 @@ let compute_keyed_netgroup (key : string) (addr : string) : int =
   (Char.code (String.get hash 1) lsl 8) lor
   (Char.code (String.get hash 2) lsl 16) lor
   (Char.code (String.get hash 3) lsl 24)
+
+(* ASN-aware keyed group hash — used internally for eviction when asmap is active *)
+let compute_keyed_group_hash (key : string) (group : string) : int =
+  let input = key ^ group in
+  let hash = Digestif.SHA256.(to_raw_string (digest_string input)) in
+  (Char.code (String.get hash 0)) lor
+  (Char.code (String.get hash 1) lsl 8) lor
+  (Char.code (String.get hash 2) lsl 16) lor
+  (Char.code (String.get hash 3) lsl 24)
+
+(* ASMap-aware netgroup for a specific peer manager (used for outbound diversity). *)
+let netgroup_of_with_pm (pm : t) (addr : string) : string =
+  Asmap.get_group pm.net_group_manager addr
+
+(* Expose ASMap queries on the peer manager. *)
+let get_mapped_as (pm : t) (addr : string) : int32 =
+  Asmap.get_mapped_as pm.net_group_manager addr
+
+let using_asmap (pm : t) : bool =
+  Asmap.using_asmap pm.net_group_manager
 
 (* Add address to new table bucket.
    Returns the bucket index, or -1 if the address is non-routable
@@ -492,7 +515,7 @@ let build_eviction_candidates (pm : t) : eviction_candidate list =
         ec_min_ping = p.Peer.latency;
         ec_last_block_time = last_block;
         ec_last_tx_time = last_tx;
-        ec_keyed_netgroup = compute_keyed_netgroup pm.bucket_key p.Peer.addr;
+        ec_keyed_netgroup = compute_keyed_group_hash pm.bucket_key (netgroup_of_with_pm pm p.Peer.addr);
         ec_relay_txs = true;  (* Assume all relay txs for now *)
         ec_prefer_evict = false;
       }
@@ -702,7 +725,7 @@ let add_known_addr (pm : t) (info : peer_info) : unit =
 
 (* Check if connecting to this address would violate outbound netgroup diversity *)
 let would_violate_netgroup_diversity (pm : t) (addr : string) : bool =
-  let netgroup = netgroup_of addr in
+  let netgroup = netgroup_of_with_pm pm addr in
   Hashtbl.mem pm.outbound_netgroups netgroup
 
 (* Connect to a peer and add to active peers.
@@ -721,10 +744,10 @@ let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
   (* Check if banned *)
   else if is_banned pm addr then
     Lwt.return_unit
-  (* Eclipse protection: enforce /16 netgroup diversity for outbound *)
+  (* Eclipse protection: enforce netgroup diversity for outbound *)
   else if would_violate_netgroup_diversity pm addr then begin
     Log.debug (fun m -> m "Skipping %s: netgroup %s already connected"
-      addr (netgroup_of addr));
+      addr (netgroup_of_with_pm pm addr));
     Lwt.return_unit
   end
   else begin
@@ -753,7 +776,7 @@ let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
       (* Initialize stale peer tracking *)
       Hashtbl.replace pm.stale_state peer.Peer.id (create_stale_state ());
       (* Track outbound netgroup for diversity *)
-      Hashtbl.replace pm.outbound_netgroups (netgroup_of addr) true;
+      Hashtbl.replace pm.outbound_netgroups (netgroup_of_with_pm pm addr) true;
       (* Start inventory trickling for this peer *)
       Lwt.async (fun () -> Peer.start_trickling peer);
       (* Start message loop if enabled (no-op before enable_message_loops) *)
@@ -834,7 +857,7 @@ let force_add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
       pm.peers <- peer :: pm.peers;
       Hashtbl.replace pm.peer_connected_time peer.Peer.id now;
       Hashtbl.replace pm.stale_state peer.Peer.id (create_stale_state ());
-      Hashtbl.replace pm.outbound_netgroups (netgroup_of addr) true;
+      Hashtbl.replace pm.outbound_netgroups (netgroup_of_with_pm pm addr) true;
       Lwt.async (fun () -> Peer.start_trickling peer);
       pm.start_msg_loop peer;
       let tried_bucket = move_to_tried_table pm addr in
@@ -911,7 +934,7 @@ let add_block_relay_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
       pm.peers <- peer :: pm.peers;
       Hashtbl.replace pm.peer_connected_time peer.Peer.id now;
       Hashtbl.replace pm.stale_state peer.Peer.id (create_stale_state ());
-      Hashtbl.replace pm.outbound_netgroups (netgroup_of addr) true;
+      Hashtbl.replace pm.outbound_netgroups (netgroup_of_with_pm pm addr) true;
       Lwt.async (fun () -> Peer.start_trickling peer);
       (* Start message loop if enabled (no-op before enable_message_loops) *)
       pm.start_msg_loop peer;
@@ -965,7 +988,7 @@ let remove_peer (pm : t) (peer_id : int) : unit Lwt.t =
     Hashtbl.remove pm.stale_state peer_id;
     (* Remove from outbound netgroup tracking if outbound peer *)
     if peer.Peer.direction = Peer.Outbound then
-      Hashtbl.remove pm.outbound_netgroups (netgroup_of peer.Peer.addr);
+      Hashtbl.remove pm.outbound_netgroups (netgroup_of_with_pm pm peer.Peer.addr);
     (* Remove from high-bandwidth compact block list (BIP 152) *)
     pm.hb_compact_peers <- List.filter ((<>) peer_id) pm.hb_compact_peers;
     Lwt.return_unit
@@ -2301,7 +2324,11 @@ let find_peer_by_id (pm : t) (id : int) : Peer.peer option =
 
 (* Get list of all peer statistics *)
 let get_peer_stats (pm : t) : Peer.peer_stats list =
-  List.map Peer.get_stats pm.peers
+  List.map (fun peer ->
+    let stats = Peer.get_stats peer in
+    let mapped_as = Asmap.get_mapped_as pm.net_group_manager peer.Peer.addr in
+    { stats with Peer.stat_mapped_as = mapped_as }
+  ) pm.peers
 
 (* Handle peer disconnect - re-queue in-flight blocks immediately *)
 let on_peer_disconnect (pm : t) (peer_id : int)

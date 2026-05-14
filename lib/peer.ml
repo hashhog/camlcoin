@@ -1686,6 +1686,7 @@ type peer_stats = {
   stat_relay : bool;
   stat_protocol_version : int32;
   stat_time_offset : int64;
+  stat_mapped_as : int32;  (* ASN from asmap lookup; 0 = unknown / no asmap *)
 }
 
 let get_stats (peer : peer) : peer_stats =
@@ -1711,6 +1712,7 @@ let get_stats (peer : peer) : peer_stats =
       | Some v -> v.protocol_version
       | None -> 0l);
     stat_time_offset = peer.time_offset;
+    stat_mapped_as = 0l;
   }
 
 (* Pretty print peer info *)

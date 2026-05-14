@@ -52,6 +52,10 @@
 
 open Camlcoin
 
+(* [Camlcoin__Asmap] alias: tests are compiled with -open Dune__exe which does
+   not propagate the Camlcoin.Asmap alias automatically. *)
+module Asmap = Camlcoin__Asmap
+
 (* ============================================================================
    Helpers
    ============================================================================ *)
@@ -59,6 +63,203 @@ open Camlcoin
 let make_pm () : Peer_manager.t =
   let net = Consensus.testnet4 in
   Peer_manager.create net
+
+(* ============================================================================
+   FIX-50: ASMap interpreter implementation (positive tests)
+   ============================================================================ *)
+
+(* Minimal RETURN(1) asmap:
+   Byte 0: bits [0,0,0,0,0,0,0,0] LSB-first
+     bit 0 = RETURN type cont=0 (class 0 → RETURN)
+     bit 1 = ASN(1) cont=0 (class 0, 15 data bits)
+     bits 2-16 = all zero (ASN mantissa = 0, so ASN = 1)
+   Total = 17 bits; padding = 7 zero bits → 3 bytes.
+   Bytes: 0x00 0x00 0x00 *)
+let return1_asmap () : bytes =
+  Bytes.make 3 '\x00'
+
+(* Minimal JUMP asmap: bit=0 → RETURN(1), bit=1 → RETURN(2).
+   Bit layout (LSB-first):
+     0-1:  JUMP type bits = [1,0]
+     2-7:  JUMP offset (minval=17, class 0): cont=[0], 5 data bits=[0,0,0,0,0] → offset=17
+     8:    RETURN type bit for left subtree: [0]
+     9:    ASN(1) cont bit: [0]
+     10-24: ASN(1) mantissa: 15 zero bits → ASN=1
+     25:   RETURN type bit for right subtree: [0]
+     26:   ASN(2) cont bit: [0]
+     27-41: ASN(2) mantissa (15 bits BE): [0,0,0,0,0,0,0,0,0,0,0,0,0,0,1] → ASN=2
+             bit 41 = position 1 of byte 5 → byte 5 = 0x02
+   Total = 42 bits; padding = 6 zero bits → 6 bytes.
+   Bytes: 0x01 0x00 0x00 0x00 0x00 0x02 *)
+let jump_asmap_1_2 () : bytes =
+  let b = Bytes.make 6 '\x00' in
+  Bytes.set b 0 '\x01';  (* bit 0 = 1 for JUMP type LSB *)
+  Bytes.set b 5 '\x02';  (* bit 41 = ASN=2 mantissa LSB at bit-pos 1 of byte 5 *)
+  b
+
+(* test_fix50_max_asmap_file_size: constant = 8 MiB *)
+let test_fix50_max_asmap_file_size () =
+  Alcotest.(check int) "FIX-50: max_asmap_file_size = 8388608"
+    8_388_608 Asmap.max_asmap_file_size
+
+(* test_fix50_sanity_check_return1: 3-byte RETURN(1) asmap is valid *)
+let test_fix50_sanity_check_return1 () =
+  let data = return1_asmap () in
+  Alcotest.(check bool) "FIX-50: sanity_check_asmap passes on RETURN(1) asmap"
+    true (Asmap.sanity_check_asmap data 128)
+
+(* test_fix50_interpret_return1: interpret always returns ASN=1 *)
+let test_fix50_interpret_return1 () =
+  let data = return1_asmap () in
+  let ip = Bytes.make 16 '\x00' in
+  let asn = Asmap.interpret data ip in
+  Alcotest.(check int32) "FIX-50: interpret RETURN(1) asmap returns 1l"
+    1l asn
+
+(* test_fix50_using_asmap_false: no asmap → using_asmap = false *)
+let test_fix50_using_asmap_false () =
+  let ngm = Asmap.create_net_group_manager None in
+  Alcotest.(check bool) "FIX-50: using_asmap false when no asmap"
+    false (Asmap.using_asmap ngm)
+
+(* test_fix50_using_asmap_true: with asmap → using_asmap = true *)
+let test_fix50_using_asmap_true () =
+  let data = return1_asmap () in
+  let ngm = Asmap.create_net_group_manager (Some data) in
+  Alcotest.(check bool) "FIX-50: using_asmap true when asmap loaded"
+    true (Asmap.using_asmap ngm)
+
+(* test_fix50_get_mapped_as_no_asmap: without asmap, all IPs → 0l *)
+let test_fix50_get_mapped_as_no_asmap () =
+  let ngm = Asmap.create_net_group_manager None in
+  let asn = Asmap.get_mapped_as ngm "8.8.8.8" in
+  Alcotest.(check int32) "FIX-50: get_mapped_as with no asmap returns 0l"
+    0l asn
+
+(* test_fix50_get_mapped_as_with_asmap: RETURN(1) asmap → every IP maps to ASN=1 *)
+let test_fix50_get_mapped_as_with_asmap () =
+  let data = return1_asmap () in
+  let ngm = Asmap.create_net_group_manager (Some data) in
+  let asn = Asmap.get_mapped_as ngm "1.2.3.4" in
+  Alcotest.(check int32) "FIX-50: get_mapped_as with RETURN(1) asmap returns 1l"
+    1l asn
+
+(* test_fix50_get_group_asn: with asmap, get_group returns 4-byte BE ASN *)
+let test_fix50_get_group_asn () =
+  let data = return1_asmap () in
+  let ngm = Asmap.create_net_group_manager (Some data) in
+  let grp = Asmap.get_group ngm "1.2.3.4" in
+  (* ASN=1 → 4 bytes big-endian: 0x00 0x00 0x00 0x01 *)
+  Alcotest.(check int) "FIX-50: get_group with asmap returns 4-byte group" 4 (String.length grp);
+  Alcotest.(check char) "FIX-50: get_group ASN=1 byte[3] = 0x01" '\x01' (String.get grp 3)
+
+(* test_fix50_pm_using_asmap: Peer_manager.using_asmap reflects asmap state *)
+let test_fix50_pm_using_asmap () =
+  let pm_no = Peer_manager.create Consensus.testnet4 in
+  let data = return1_asmap () in
+  let pm_yes = Peer_manager.create ~asmap:(Some data) Consensus.testnet4 in
+  Alcotest.(check bool) "FIX-50: pm without asmap: using_asmap=false"
+    false (Peer_manager.using_asmap pm_no);
+  Alcotest.(check bool) "FIX-50: pm with asmap: using_asmap=true"
+    true (Peer_manager.using_asmap pm_yes)
+
+(* test_fix50_pm_get_mapped_as: Peer_manager.get_mapped_as via pm *)
+let test_fix50_pm_get_mapped_as () =
+  let data = return1_asmap () in
+  let pm = Peer_manager.create ~asmap:(Some data) Consensus.testnet4 in
+  let asn = Peer_manager.get_mapped_as pm "1.2.3.4" in
+  Alcotest.(check int32) "FIX-50: pm.get_mapped_as returns ASN=1l"
+    1l asn
+
+(* test_fix50_default_config_asmap_none: default config has no asmap *)
+let test_fix50_default_config_asmap_none () =
+  let cfg = Cli.default_config in
+  Alcotest.(check bool) "FIX-50: default_config.asmap_path = None"
+    true (cfg.asmap_path = None)
+
+(* test_fix50_asmap_version: SHA256 of data produces 32-byte string *)
+let test_fix50_asmap_version () =
+  let data = return1_asmap () in
+  let ver = Asmap.asmap_version data in
+  Alcotest.(check int) "FIX-50: asmap_version returns 32-byte SHA256"
+    32 (String.length ver)
+
+(* test_fix50_sanity_check_rejects_empty: empty bytes → invalid asmap *)
+let test_fix50_sanity_check_rejects_empty () =
+  let empty = Bytes.make 0 '\x00' in
+  Alcotest.(check bool) "FIX-50: sanity_check_asmap rejects empty bytes"
+    false (Asmap.sanity_check_asmap empty 128)
+
+(* test_fix50_sanity_check_rejects_allones: all-0xff bytes → non-zero padding → invalid *)
+let test_fix50_sanity_check_rejects_allones () =
+  let bad = Bytes.make 3 '\xff' in
+  Alcotest.(check bool) "FIX-50: sanity_check_asmap rejects all-0xff bytes"
+    false (Asmap.sanity_check_asmap bad 128)
+
+(* test_fix50_sanity_check_jump: JUMP asmap with two RETURN subtrees is valid *)
+let test_fix50_sanity_check_jump () =
+  let data = jump_asmap_1_2 () in
+  Alcotest.(check bool) "FIX-50: sanity_check_asmap passes on JUMP(1,2) asmap"
+    true (Asmap.sanity_check_asmap data 128)
+
+(* test_fix50_jump_asmap_routing: JUMP routes on IP bit 0.
+   Uses raw 16-byte buffers: byte 0 = '\x00' → bit 0 = 0 → left → ASN=1;
+   byte 0 = '\x80' → bit 0 = 1 → right → ASN=2. *)
+let test_fix50_jump_asmap_routing () =
+  let data = jump_asmap_1_2 () in
+  let ip_left  = Bytes.make 16 '\x00' in  (* bit 0 = 0 *)
+  let ip_right = Bytes.make 16 '\x00' in
+  Bytes.set ip_right 0 '\x80';            (* bit 0 = 1 (MSB of byte 0) *)
+  let asn_left  = Asmap.interpret data ip_left  in
+  let asn_right = Asmap.interpret data ip_right in
+  Alcotest.(check int32) "FIX-50: JUMP asmap bit=0 → ASN=1" 1l asn_left;
+  Alcotest.(check int32) "FIX-50: JUMP asmap bit=1 → ASN=2" 2l asn_right
+
+(* test_fix50_parse_ipv4_to_bytes: parses dotted-quad into 16-byte IPv4-mapped IPv6 *)
+let test_fix50_parse_ipv4_to_bytes () =
+  match Asmap.parse_ipv4_to_bytes "1.2.3.4" with
+  | None -> Alcotest.fail "FIX-50: parse_ipv4_to_bytes returned None for 1.2.3.4"
+  | Some buf ->
+    Alcotest.(check int) "FIX-50: parse_ipv4_to_bytes returns 16 bytes" 16 (Bytes.length buf);
+    Alcotest.(check char) "FIX-50: byte[10] = 0xff" '\xff' (Bytes.get buf 10);
+    Alcotest.(check char) "FIX-50: byte[11] = 0xff" '\xff' (Bytes.get buf 11);
+    Alcotest.(check char) "FIX-50: byte[12] = 0x01 (a=1)" '\x01' (Bytes.get buf 12);
+    Alcotest.(check char) "FIX-50: byte[15] = 0x04 (d=4)" '\x04' (Bytes.get buf 15)
+
+(* test_fix50_peer_stats_mapped_as: peer_stats record has stat_mapped_as field.
+   Verified by accessing the field on an empty stats list (no peers connected)
+   and by confirming the type signature compiles with stat_mapped_as : int32. *)
+let test_fix50_peer_stats_mapped_as () =
+  let pm = make_pm () in
+  let stats = Peer_manager.get_peer_stats pm in
+  (* No active peers: list is empty.  Verify the field compiles and is
+     accessible by building a dummy record directly. *)
+  let _ = stats in
+  (* The field exists: build a dummy record with the minimal required shape.
+     This test is primarily a compile-time type check. *)
+  let dummy : Peer.peer_stats = {
+    Peer.stat_id = 0;
+    stat_addr = "";
+    stat_port = 0;
+    stat_state = "Connecting";
+    stat_services = 0L;
+    stat_best_height = 0l;
+    stat_latency_ms = 0.0;
+    stat_bytes_sent = 0;
+    stat_bytes_received = 0;
+    stat_msgs_sent = 0;
+    stat_msgs_received = 0;
+    stat_last_seen = 0.0;
+    stat_user_agent = "";
+    stat_direction = Peer.Outbound;
+    stat_misbehavior = 0;
+    stat_relay = false;
+    stat_protocol_version = 0l;
+    stat_time_offset = 0L;
+    stat_mapped_as = 0l;
+  } in
+  Alcotest.(check int32) "FIX-50: peer_stats.stat_mapped_as field default = 0l"
+    0l dummy.Peer.stat_mapped_as
 
 (* ============================================================================
    G1: No --asmap CLI flag
@@ -585,5 +786,25 @@ let () =
     ("BONUS", [
       Alcotest.test_case "BONUS: compute_bucket single-SHA256 no source" `Quick test_bonus_bucket_hash_single_sha256;
       Alcotest.test_case "BONUS: no per-ASN outbound uniqueness" `Quick test_bonus_no_asn_outbound_uniqueness;
+    ]);
+    ("FIX-50 ASMap implementation", [
+      Alcotest.test_case "FIX-50: max_asmap_file_size = 8 MiB" `Quick test_fix50_max_asmap_file_size;
+      Alcotest.test_case "FIX-50: sanity_check passes on RETURN(1) asmap" `Quick test_fix50_sanity_check_return1;
+      Alcotest.test_case "FIX-50: interpret RETURN(1) asmap → ASN=1" `Quick test_fix50_interpret_return1;
+      Alcotest.test_case "FIX-50: using_asmap=false without asmap" `Quick test_fix50_using_asmap_false;
+      Alcotest.test_case "FIX-50: using_asmap=true with asmap" `Quick test_fix50_using_asmap_true;
+      Alcotest.test_case "FIX-50: get_mapped_as returns 0l without asmap" `Quick test_fix50_get_mapped_as_no_asmap;
+      Alcotest.test_case "FIX-50: get_mapped_as returns 1l with RETURN(1) asmap" `Quick test_fix50_get_mapped_as_with_asmap;
+      Alcotest.test_case "FIX-50: get_group returns 4-byte BE ASN" `Quick test_fix50_get_group_asn;
+      Alcotest.test_case "FIX-50: pm.using_asmap reflects asmap state" `Quick test_fix50_pm_using_asmap;
+      Alcotest.test_case "FIX-50: pm.get_mapped_as returns ASN via pm" `Quick test_fix50_pm_get_mapped_as;
+      Alcotest.test_case "FIX-50: default_config.asmap_path = None" `Quick test_fix50_default_config_asmap_none;
+      Alcotest.test_case "FIX-50: asmap_version returns 32-byte SHA256" `Quick test_fix50_asmap_version;
+      Alcotest.test_case "FIX-50: sanity_check rejects empty asmap" `Quick test_fix50_sanity_check_rejects_empty;
+      Alcotest.test_case "FIX-50: sanity_check rejects all-0xff asmap" `Quick test_fix50_sanity_check_rejects_allones;
+      Alcotest.test_case "FIX-50: sanity_check passes JUMP(1,2) asmap" `Quick test_fix50_sanity_check_jump;
+      Alcotest.test_case "FIX-50: JUMP asmap routes by IP bit 0" `Quick test_fix50_jump_asmap_routing;
+      Alcotest.test_case "FIX-50: parse_ipv4_to_bytes produces IPv4-mapped IPv6" `Quick test_fix50_parse_ipv4_to_bytes;
+      Alcotest.test_case "FIX-50: peer_stats.stat_mapped_as field exists" `Quick test_fix50_peer_stats_mapped_as;
     ]);
   ]

@@ -807,8 +807,11 @@ let read_until_verack (peer : peer) : unit Lwt.t =
         peer.sendaddrv2 <- true;
         loop ()
       | Some (P2p.SendcmpctMsg { announce; version }) ->
-        peer.cmpct_high_bandwidth <- announce;
-        peer.cmpct_version <- version;
+        (* Core: net_processing.cpp:3907 — ignore sendcmpct where version != 2 *)
+        if version = 2L then begin
+          peer.cmpct_high_bandwidth <- announce;
+          peer.cmpct_version <- version
+        end;
         loop ()
       | Some (P2p.FeefilterMsg feerate) ->
         (* Accept feefilter during feature negotiation *)
@@ -1535,6 +1538,9 @@ let dispatch_message (peer : peer) (msg : P2p.message_payload)
     if not peer.version_received then begin
       let* () = misbehaving peer 10 "pre-handshake sendcmpct" in
       Lwt.return (`PreHandshake "sendcmpct before VERSION")
+    end else if version <> 2L then begin
+      (* Core: net_processing.cpp:3907 — silently drop sendcmpct where version != 2 *)
+      Lwt.return `Continue
     end else begin
       peer.cmpct_high_bandwidth <- announce;
       peer.cmpct_version <- version;
@@ -1598,8 +1604,11 @@ let dispatch_message (peer : peer) (msg : P2p.message_payload)
     Lwt.return `Continue
 
   | P2p.SendcmpctMsg { announce; version }, true ->
-    peer.cmpct_high_bandwidth <- announce;
-    peer.cmpct_version <- version;
+    (* Core: net_processing.cpp:3907 — silently drop sendcmpct where version != 2 *)
+    if version = 2L then begin
+      peer.cmpct_high_bandwidth <- announce;
+      peer.cmpct_version <- version
+    end;
     Lwt.return `Continue
 
   | P2p.FeefilterMsg feerate, true ->

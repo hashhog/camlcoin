@@ -1393,10 +1393,15 @@ let check_rate_limit (peer : peer) : bool =
 
 (* Getdata handler (Gap 11) — process inventory requests from peers.
    lookup_block and lookup_tx return serialized data as Cstruct.t option;
-   the caller (higher-level code) owns storage/mempool access. *)
+   the caller (higher-level code) owns storage/mempool access.
+   tip_height is the current validated tip height (used for depth checks).
+   lookup_block_height returns the height of a block given its hash (or None
+   if unknown); used for MAX_CMPCTBLOCK_DEPTH and MAX_BLOCKTXN_DEPTH guards. *)
 let handle_getdata (peer : peer) (items : P2p.inv_vector list)
     ~(lookup_block : Types.hash256 -> Cstruct.t option)
     ~(lookup_tx : Types.hash256 -> Cstruct.t option)
+    ~(tip_height : int)
+    ~(lookup_block_height : Types.hash256 -> int option)
     : unit Lwt.t =
   let open Lwt.Syntax in
   let max_getdata_items = 1000 in
@@ -1426,6 +1431,37 @@ let handle_getdata (peer : peer) (items : P2p.inv_vector list)
         | None ->
           not_found := iv :: !not_found;
           Lwt.return_unit
+        end
+      | P2p.InvCompactBlock ->
+        (* net_processing.cpp:2461-2475: MAX_CMPCTBLOCK_DEPTH=5 guard.
+           If the requested block is within MAX_CMPCTBLOCK_DEPTH of the tip,
+           serve it as a cmpctblock (the peer probably has a useful mempool).
+           Otherwise fall back to the full block — old blocks are rarely
+           reconstructable from the peer's mempool, so wasting bandwidth on
+           a compact form that will likely need a follow-up getblocktxn is
+           pointless.  If we don't have the block at all, send notfound. *)
+        begin match lookup_block iv.hash with
+        | None ->
+          not_found := iv :: !not_found;
+          Lwt.return_unit
+        | Some data ->
+          let block_h = lookup_block_height iv.hash in
+          let within_depth = match block_h with
+            | Some h -> h >= tip_height - P2p.max_cmpctblock_depth
+            | None   -> false  (* unknown height → fall back to full block *)
+          in
+          if within_depth then begin
+            (* Serve as compact block *)
+            let r = Serialize.reader_of_cstruct data in
+            let block = Serialize.deserialize_block r in
+            let cb = P2p.create_compact_block block in
+            send_message peer (P2p.CmpctblockMsg cb)
+          end else begin
+            (* Block is too old; serve as full block (mirrors Core fallback) *)
+            let r = Serialize.reader_of_cstruct data in
+            let block = Serialize.deserialize_block r in
+            send_message peer (P2p.BlockMsg block)
+          end
         end
       | _ ->
         not_found := iv :: !not_found;

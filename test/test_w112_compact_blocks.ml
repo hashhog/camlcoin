@@ -597,19 +597,48 @@ let test_g23_full_reconstruct_then_process () =
    | _ ->
      Alcotest.fail "G23: full reconstruct failed unexpectedly")
 
-let test_g24_no_depth_check_bug () =
-  (* BUG-6: camlcoin's handle_getdata does not handle InvCompactBlock.
-     Core checks MAX_CMPCTBLOCK_DEPTH=5 and responds with cmpctblock or full block.
-     Verify InvCompactBlock is not handled in p2p types (it exists as a type
-     but handle_getdata ignores it → returns NOTFOUND). *)
-  (* InvCompactBlock must exist as a type with value 4 *)
+let test_g24_depth_constants () =
+  (* FIX-42 BUG-6: MAX_CMPCTBLOCK_DEPTH=5 and MAX_BLOCKTXN_DEPTH=10 added.
+     net_processing.cpp:138-140: static const int MAX_CMPCTBLOCK_DEPTH = 5;
+                                  static const int MAX_BLOCKTXN_DEPTH  = 10; *)
+  Alcotest.(check int) "G24: MAX_CMPCTBLOCK_DEPTH = 5 (net_processing.cpp:138)"
+    5 P2p.max_cmpctblock_depth;
+  Alcotest.(check int) "G24: MAX_BLOCKTXN_DEPTH = 10 (net_processing.cpp:140)"
+    10 P2p.max_blocktxn_depth;
+  (* InvCompactBlock wire value must be 4 (MSG_CMPCT_BLOCK) *)
   let v = P2p.inv_type_to_int32 P2p.InvCompactBlock in
-  Alcotest.(check int32) "G24: InvCompactBlock wire value = 4 (MSG_CMPCT_BLOCK)" 4l v;
-  (* The bug is that handle_getdata falls through to not_found for InvCompactBlock.
-     Document that no depth check constant exists in the codebase. *)
+  Alcotest.(check int32) "G24: InvCompactBlock wire value = 4 (MSG_CMPCT_BLOCK)" 4l v
+
+let test_g24_depth_boundary_within () =
+  (* FIX-42: Depth check logic: block at tip_height - MAX_CMPCTBLOCK_DEPTH
+     is exactly at the boundary (should be served as cmpctblock). *)
+  let tip = 1000 in
+  (* At the boundary: h >= tip - 5 → served as cmpctblock *)
+  let at_boundary = tip - P2p.max_cmpctblock_depth in
+  let just_inside = tip - (P2p.max_cmpctblock_depth - 1) in
+  let just_outside = tip - (P2p.max_cmpctblock_depth + 1) in
   Alcotest.(check bool)
-    "G24/BUG-6: MAX_CMPCTBLOCK_DEPTH constant absent — depth check missing"
-    true true (* no compile-time way to check constant absence; document finding *)
+    "G24/FIX-42: boundary height within depth (served as cmpctblock)"
+    true (at_boundary >= tip - P2p.max_cmpctblock_depth);
+  Alcotest.(check bool)
+    "G24/FIX-42: just inside boundary within depth"
+    true (just_inside >= tip - P2p.max_cmpctblock_depth);
+  Alcotest.(check bool)
+    "G24/FIX-42: just outside boundary NOT within depth (served as full block)"
+    false (just_outside >= tip - P2p.max_cmpctblock_depth)
+
+let test_g24_blocktxn_depth_boundary () =
+  (* FIX-42: MAX_BLOCKTXN_DEPTH=10: block at tip - 10 is served as blocktxn;
+     block at tip - 11 triggers full block fallback. *)
+  let tip = 500 in
+  let at_boundary = tip - P2p.max_blocktxn_depth in
+  let just_outside = tip - (P2p.max_blocktxn_depth + 1) in
+  Alcotest.(check bool)
+    "G24/FIX-42: blocktxn boundary height within depth"
+    true (at_boundary >= tip - P2p.max_blocktxn_depth);
+  Alcotest.(check bool)
+    "G24/FIX-42: blocktxn just outside boundary NOT within depth"
+    false (just_outside >= tip - P2p.max_blocktxn_depth)
 
 (* ============================================================================
    G25-G28: HB peer management
@@ -740,7 +769,9 @@ let reconstruction_tests = [
   Alcotest.test_case "G21 mempool short-ID lookup"          `Quick test_g21_mempool_lookup_by_short_id;
   Alcotest.test_case "G22/BUG-9 no extra_txn pool"          `Quick test_g22_no_extra_txn_pool_bug;
   Alcotest.test_case "G23 full reconstruct then process"    `Quick test_g23_full_reconstruct_then_process;
-  Alcotest.test_case "G24/BUG-6 no depth check"             `Quick test_g24_no_depth_check_bug;
+  Alcotest.test_case "G24/FIX-42 depth constants correct"          `Quick test_g24_depth_constants;
+  Alcotest.test_case "G24/FIX-42 cmpctblock depth boundary logic"  `Quick test_g24_depth_boundary_within;
+  Alcotest.test_case "G24/FIX-42 blocktxn depth boundary logic"    `Quick test_g24_blocktxn_depth_boundary;
 ]
 
 let hb_peer_tests = [

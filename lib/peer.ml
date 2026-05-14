@@ -308,6 +308,28 @@ let random_nonce () : int64 =
   let nonce_bytes = random_bytes 8 in
   Cstruct.LE.get_uint64 nonce_bytes 0
 
+(* CSPRNG integer in [0, max_exclusive).
+   Mirrors Bitcoin Core's FastRandomContext::randrange() sourced from
+   GetStrongRandBytes() → /dev/urandom.  Used wherever stdlib Random would
+   leak timing or rounding information to an adversary (e.g. FeeFilterRounder).
+   `max_exclusive` must be > 0. *)
+let csprng_int_range (max_exclusive : int) : int =
+  assert (max_exclusive > 0);
+  let buf = Bytes.create 8 in
+  let ic = open_in_bin "/dev/urandom" in
+  really_input ic buf 0 8;
+  close_in ic;
+  let b i = Int64.of_int (Char.code (Bytes.get buf i)) in
+  let ( lsl ) = Int64.shift_left in
+  let ( lor ) = Int64.logor in
+  let raw =
+    (b 0) lor ((b 1) lsl 8) lor ((b 2) lsl 16) lor ((b 3) lsl 24)
+    lor ((b 4) lsl 32) lor ((b 5) lsl 40) lor ((b 6) lsl 48) lor ((b 7) lsl 56)
+  in
+  (* Mask to 62 bits to stay within OCaml's native non-negative int range *)
+  let masked = Int64.logand raw 0x3FFFFFFFFFFFFFFFL in
+  Int64.to_int masked mod max_exclusive
+
 (* Create a local network address (IPv4-mapped IPv6 for 127.0.0.1) *)
 let make_local_addr () : Types.net_addr =
   let addr = Cstruct.create 16 in
@@ -1876,7 +1898,7 @@ module FeeFilterRounder = struct
     (* Possibly move to lower bucket (2/3 probability) *)
     let final_idx =
       if idx >= n then n - 1
-      else if idx > 0 && Random.int 3 <> 0 then idx - 1
+      else if idx > 0 && csprng_int_range 3 <> 0 then idx - 1
       else idx
     in
     Int64.of_float fee_set.(final_idx)

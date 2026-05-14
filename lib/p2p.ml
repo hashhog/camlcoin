@@ -1352,9 +1352,21 @@ let remove_erlay_peer (state : erlay_state) (peer_id : int) : unit =
    BIP 152 Compact Block Functions
    ============================================================================ *)
 
-(* Generate a random nonce for compact block *)
+(* Generate a random nonce for compact block.
+   Uses /dev/urandom (CSPRNG) instead of OCaml stdlib Random.int64 so that
+   short IDs cannot be predicted by an adversary who knows the clock seed.
+   Mirrors Bitcoin Core's GetStrongRandBytes() nonce in BIP-152.
+   W112 BUG-8 fix (FIX-49). *)
 let generate_compact_nonce () : int64 =
-  Random.int64 Int64.max_int
+  let buf = Bytes.create 8 in
+  let ic = open_in_bin "/dev/urandom" in
+  really_input ic buf 0 8;
+  close_in ic;
+  let b i = Int64.of_int (Char.code (Bytes.get buf i)) in
+  let ( lsl ) = Int64.shift_left in
+  let ( lor ) = Int64.logor in
+  (b 0) lor ((b 1) lsl 8) lor ((b 2) lsl 16) lor ((b 3) lsl 24)
+  lor ((b 4) lsl 32) lor ((b 5) lsl 40) lor ((b 6) lsl 48) lor ((b 7) lsl 56)
 
 (* Create a compact block from a full block.
    Always includes coinbase (index 0) as prefilled.

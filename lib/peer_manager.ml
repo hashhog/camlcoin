@@ -1688,6 +1688,54 @@ let start_stale_check_timer (pm : t) : unit =
 let stop_stale_check_timer (pm : t) : unit =
   pm.stale_check_running <- false
 
+(* ============================================================================
+   ASMap health-check periodic task (every 3600 s).
+   Reference: bitcoin-core/src/net.h  ASMAP_HEALTH_CHECK_INTERVAL (24h)
+              bitcoin-core/src/net.cpp CConnman::Start() — run once at startup
+              then schedule every interval.
+   Camlcoin mirrors the pattern but uses a shorter 1-hour interval so operators
+   get timely visibility without waiting 24 h.
+   Only runs when asmap is active (Asmap.using_asmap).
+   ============================================================================ *)
+
+(** Interval between ASMap health-check runs (seconds). *)
+let asmap_health_check_interval = 3600.0
+
+(** Collect all known IPv4 addresses from known_addrs as dotted-quad strings. *)
+let collect_clearnet_addrs (pm : t) : string list =
+  Hashtbl.fold (fun addr _info acc ->
+    (* Include only addresses that look like IPv4 dotted-quad; skip hostnames. *)
+    match String.split_on_char '.' addr with
+    | [_; _; _; _] -> addr :: acc
+    | _             -> acc
+  ) pm.known_addrs []
+
+(** Run a single ASMap health-check against the current known-address table. *)
+let run_asmap_health_check (pm : t) : unit =
+  let clearnet = collect_clearnet_addrs pm in
+  let _result = Asmap.asmap_health_check pm.net_group_manager clearnet in
+  ()
+
+(** Start the periodic ASMap health-check timer (every 3600 s).
+    Mirrors CConnman::Start(): run once immediately, then schedule. *)
+let start_asmap_health_check_timer (pm : t) : unit =
+  if not (Asmap.using_asmap pm.net_group_manager) then ()
+  else begin
+    (* Run once at startup. *)
+    run_asmap_health_check pm;
+    (* Then every 3600 s while running. *)
+    let rec loop () =
+      if not pm.running then Lwt.return_unit
+      else begin
+        let open Lwt.Syntax in
+        let* () = Lwt_unix.sleep asmap_health_check_interval in
+        if pm.running then run_asmap_health_check pm;
+        loop ()
+      end
+    in
+    Lwt.async loop
+  end
+
 (* Peer message handling loop for a single peer *)
 let peer_message_loop (pm : t) (peer : Peer.peer) : unit Lwt.t =
   let open Lwt.Syntax in
@@ -2160,10 +2208,22 @@ let start (pm : t) : unit Lwt.t =
   let fallback = get_fallback_peers pm.network in
   Log.info (fun m -> m "Added %d fallback peers" (List.length fallback));
   List.iter (add_known_addr pm) fallback;
+  (* Log asmap version at startup (mirrors Core: LogInfo "Using asmap version...").
+     Reference: bitcoin-core/src/init.cpp LogInfo("Using asmap version %s...") *)
+  (match pm.net_group_manager.Asmap.asmap with
+   | None -> ()
+   | Some data ->
+     let ver = Asmap.asmap_version data in
+     let hex = String.concat "" (List.init (String.length ver) (fun i ->
+       Printf.sprintf "%02x" (Char.code ver.[i])))
+     in
+     Log.info (fun m -> m "Using asmap version %s for IP bucketing" hex));
   (* Start connection maintenance loop *)
   let maintenance = maintain_connections pm in
   (* Start the 45-second stale peer check timer *)
   start_stale_check_timer pm;
+  (* Start the ASMap health-check timer (every 3600 s; no-op if no asmap). *)
+  start_asmap_health_check_timer pm;
   (* Return immediately, maintenance runs in background *)
   Lwt.async (fun () -> maintenance);
   Lwt.return_unit

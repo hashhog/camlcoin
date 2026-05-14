@@ -506,3 +506,67 @@ let get_group (ngm : net_group_manager) (addr : string) : string =
       Bytes.set buf 3 (Char.chr  (n         land 0xff));
       Bytes.to_string buf
     end
+
+(* ============================================================================
+   asmap_health_check: log bucket distribution statistics for clearnet peers.
+   Reference: bitcoin-core/src/netgroup.cpp NetGroupManager::ASMapHealthCheck()
+              bitcoin-core/src/net.cpp CConnman::ASMapHealthCheck()
+              bitcoin-core/src/net.h  ASMAP_HEALTH_CHECK_INTERVAL (24h)
+
+   Iterates over [clearnet_addrs] (dotted-quad IPv4 strings), maps each to an
+   ASN via [get_mapped_as], counts:
+     - unique ASNs seen
+     - unmapped addresses (ASN = 0)
+   Logs the summary line mirroring Core's format:
+     "ASMap Health Check: N clearnet peers are mapped to M ASNs with U peers being unmapped"
+   Then logs the top [top_n] ASNs by peer count (operational visibility).
+
+   Returns a record with the raw counts so callers (tests) can assert on values
+   without needing to parse log output.
+   ============================================================================ *)
+
+type health_check_result = {
+  total        : int;    (* total addresses examined *)
+  unique_asns  : int;    (* number of distinct ASNs seen *)
+  unmapped     : int;    (* addresses with ASN = 0 *)
+  top_asns     : (int32 * int) list;  (* top-N (asn, count) pairs, desc by count *)
+}
+
+let asmap_health_check ?(top_n = 10) (ngm : net_group_manager)
+    (clearnet_addrs : string list) : health_check_result =
+  (* Count peers per ASN. *)
+  let asn_counts : (int32, int) Hashtbl.t = Hashtbl.create 256 in
+  let unmapped = ref 0 in
+  List.iter (fun addr ->
+    let asn = get_mapped_as ngm addr in
+    if asn = 0l then
+      incr unmapped
+    else begin
+      let prev = try Hashtbl.find asn_counts asn with Not_found -> 0 in
+      Hashtbl.replace asn_counts asn (prev + 1)
+    end
+  ) clearnet_addrs;
+  let total       = List.length clearnet_addrs in
+  let unique_asns = Hashtbl.length asn_counts in
+  (* Compute top-N ASNs by count, descending. *)
+  let all_pairs = Hashtbl.fold (fun asn cnt acc -> (asn, cnt) :: acc) asn_counts [] in
+  let sorted = List.sort (fun (_, c1) (_, c2) -> compare c2 c1) all_pairs in
+  let top_asns = if top_n <= 0 then sorted
+                 else
+                   let rec take n = function
+                     | [] -> []
+                     | _ when n = 0 -> []
+                     | x :: xs -> x :: take (n - 1) xs
+                   in
+                   take top_n sorted
+  in
+  (* Log summary line mirroring Core's ASMapHealthCheck output. *)
+  Logs.info (fun m ->
+    m "ASMap Health Check: %d clearnet peers are mapped to %d ASNs with %d peers being unmapped"
+      total unique_asns !unmapped);
+  (* Log top-N ASNs for operational visibility. *)
+  List.iteri (fun i (asn, cnt) ->
+    Logs.info (fun m ->
+      m "  #%d AS%ld — %d peer(s)" (i + 1) asn cnt)
+  ) top_asns;
+  { total; unique_asns; unmapped = !unmapped; top_asns }

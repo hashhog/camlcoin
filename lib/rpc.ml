@@ -1603,10 +1603,13 @@ let estimate_raw_horizon (h : Fee_estimation.horizon)
           ("leftmempool", `Float 0.0);
         ]
     in
-    let scale = 1.05 in
+    (* BUG-4 fix: "scale" field must be the horizon scale factor (1/2/24),
+       not FEE_SPACING (1.05).
+       Core: horizon_result.pushKV("scale", buckets.scale) where scale=1/2/24
+       rpc/fees.cpp:199.  Was erroneously using 1.05 (FEE_SPACING). *)
     let common = [
       ("decay", `Float h.decay);
-      ("scale", `Float scale);
+      ("scale", `Int h.scale);
     ] in
     if !pass_idx < 0 then
       Some (`Assoc (common @ [

@@ -6,17 +6,28 @@
    blocks they wait before confirmation.
 
    Fee rate buckets group transactions by fee level using exponentially
-   spaced boundaries (spacing factor 1.05, starting at 1 sat/vB),
-   matching Bitcoin Core's bucketing scheme.
+   spaced boundaries (spacing factor 1.05, starting at 0.1 sat/vB =
+   100 sat/kvB = MIN_BUCKET_FEERATE), matching Bitcoin Core's bucketing
+   scheme (block_policy_estimator.h: MIN_BUCKET_FEERATE=100 sat/kvB).
 
    Three estimation horizons are maintained:
-   - Short:  decay 0.998,  max target 12 blocks
-   - Medium: decay 0.9995, max target 48 blocks
-   - Long:   decay 0.99931, max target 1008 blocks
+   - Short:  decay 0.962,   max target 12 blocks  (half-life ~18 blocks)
+   - Medium: decay 0.9952,  max target 48 blocks  (half-life ~144 blocks)
+   - Long:   decay 0.99931, max target 1008 blocks (half-life ~1008 blocks)
 
    KNOWN PITFALL — Estimates require sufficient data points (at least 10
    per bucket) to be reliable. Default fallback rates are used when
-   insufficient data exists. *)
+   insufficient data exists.
+
+   KNOWN GAPS (W114 audit — see test_w114_fee_estimation.ml):
+   - track_transaction / record_eviction are dead-helpers (not called from cli.ml)
+   - scale factors (SHORT=1, MED=2, LONG=24) not implemented
+   - validForFeeEstimation guard absent
+   - txHeight == nBestSeenHeight guard absent
+   - Three-pass estimateSmartFee algorithm absent
+   - confAvg[periods][buckets] / failAvg absent (uses flat sample list)
+   - FlushUnconfirmed on shutdown absent
+   - File format incompatible with Core (OCaml Marshal vs binary 309900) *)
 
 (* ============================================================================
    Estimate Mode
@@ -44,6 +55,11 @@ type horizon = {
   name : string;
   decay : float;
   max_target : int;
+  (* BUG-4 fix: horizon scale factor matching Core's SHORT_SCALE=1 / MED_SCALE=2 / LONG_SCALE=24.
+     Used in the estimaterawfee "scale" field.
+     Core: EstimationResult.scale is set by TxConfirmStats::EstimateMedianVal.
+     Reference: block_policy_estimator.h:152-158 *)
+  scale : int;
   buckets : fee_bucket array;
 }
 
@@ -79,21 +95,38 @@ let default_low_priority = 1.0      (* 25 block target *)
 (* Default maximum age for tracked mempool transactions: 14 days in seconds *)
 let default_max_tx_age = 14.0 *. 24.0 *. 3600.0
 
-(* Confirmation target limits *)
-let min_confirm_target = 1
+(* Confirmation target limits.
+   BUG-5 fix: min_confirm_target = 2 per Bitcoin Core.
+   Core: "It's not possible to get reasonable estimates for confTarget of 1"
+         → confTarget = 2 when input is 1 (estimateSmartFee clamped target).
+   block_policy_estimator.cpp:889-890.
+   Note: estimaterawfee still accepts target=1 (Core allows it there);
+   the clamp applies only to estimateSmartFee path.  We correct the
+   min_confirm_target constant used by estimate_fee (the SmartFee path). *)
+let min_confirm_target = 2
 let max_confirm_target = 1008
 
 (* ============================================================================
    Exponentially Spaced Bucket Boundaries
    ============================================================================ *)
 
-(* Build bucket boundaries matching Bitcoin Core: spacing factor 1.05,
-   starting at 1.0 sat/vB, up to ~10000 sat/vB *)
+(* Build bucket boundaries matching Bitcoin Core:
+   MIN_BUCKET_FEERATE = 100 sat/kvB = 0.1 sat/vB
+   MAX_BUCKET_FEERATE = 1e7 sat/kvB = 10_000 sat/vB
+   FEE_SPACING = 1.05
+   Reference: block_policy_estimator.h:190-198
+
+   BUG-3 fix: was starting at 1.0 sat/vB (1000 sat/kvB).
+   Core starts at 100 sat/kvB = 0.1 sat/vB — 10x lower.
+   This was missing the 100..999 sat/kvB bucket range (0.1..~1 sat/vB). *)
 let make_bucket_boundaries () : float array =
   let factor = 1.05 in
+  (* MIN_BUCKET_FEERATE = 100 sat/kvB = 0.1 sat/vB *)
+  let min_rate = 0.1 in
+  (* MAX_BUCKET_FEERATE = 1e7 sat/kvB = 10_000 sat/vB *)
   let max_rate = 10_000.0 in
-  let boundaries = ref [1.0] in
-  let v = ref (1.0 *. factor) in
+  let boundaries = ref [min_rate] in
+  let v = ref (min_rate *. factor) in
   while !v <= max_rate do
     boundaries := !v :: !boundaries;
     v := !v *. factor
@@ -120,15 +153,24 @@ let make_buckets (boundaries : float array) : fee_bucket array =
   )
 
 let make_horizon (name : string) (decay : float) (max_target : int)
-    (boundaries : float array) : horizon =
-  { name; decay; max_target; buckets = make_buckets boundaries }
+    (scale : int) (boundaries : float array) : horizon =
+  { name; decay; max_target; scale; buckets = make_buckets boundaries }
 
 let create () : t =
   let boundaries = make_bucket_boundaries () in
   { bucket_boundaries = boundaries;
-    short  = make_horizon "short"  0.998   12   boundaries;
-    medium = make_horizon "medium" 0.9995  48   boundaries;
-    long   = make_horizon "long"   0.99931 1008 boundaries;
+    (* BUG-1 fix: SHORT_DECAY = 0.962 (half-life ~18 blocks), was 0.998
+       Core: static constexpr double SHORT_DECAY = .962
+       block_policy_estimator.h:163
+       SHORT_SCALE = 1 (block_policy_estimator.h:152) *)
+    short  = make_horizon "short"  0.962   12   1  boundaries;
+    (* BUG-2 fix: MED_DECAY = 0.9952 (half-life ~144 blocks), was 0.9995
+       Core: static constexpr double MED_DECAY = .9952
+       block_policy_estimator.h:165
+       MED_SCALE = 2 (block_policy_estimator.h:155) *)
+    medium = make_horizon "medium" 0.9952  48   2  boundaries;
+    (* LONG_SCALE = 24 (block_policy_estimator.h:158) *)
+    long   = make_horizon "long"   0.99931 1008 24 boundaries;
     block_height = 0;
     tracked_txs = Hashtbl.create 10_000 }
 
@@ -436,6 +478,7 @@ type serialized_horizon = {
   s_name : string;
   s_decay : float;
   s_max_target : int;
+  s_scale : int;
   s_buckets : serialized_bucket array;
 }
 
@@ -451,6 +494,7 @@ let serialize_horizon (h : horizon) : serialized_horizon =
   { s_name = h.name;
     s_decay = h.decay;
     s_max_target = h.max_target;
+    s_scale = h.scale;
     s_buckets = Array.map (fun b ->
       { s_total_confirmed = b.total_confirmed;
         s_total_unconfirmed = b.total_unconfirmed;

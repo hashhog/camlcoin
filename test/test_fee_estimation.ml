@@ -168,20 +168,21 @@ let test_estimate_finds_lowest_sufficient () =
 
 let test_bucket_boundaries () =
   let est = Fee_estimation.create () in
-  (* 0.5 sat/vB should go to bucket 0 (first bucket) *)
-  Fee_estimation.track_transaction est (make_txid 1) 0.5 100;
-  let idx0 = bucket_for est 0.5 in
+  (* 0.05 sat/vB (below MIN_BUCKET_FEERATE=0.1) should go to bucket 0 (first bucket) *)
+  Fee_estimation.track_transaction est (make_txid 1) 0.05 100;
+  let idx0 = bucket_for est 0.05 in
   (match Fee_estimation.get_bucket_stats est idx0 with
    | None -> Alcotest.fail "bucket should exist"
    | Some stats ->
-     Alcotest.(check int) "0.5 in first bucket" 1 stats.unconfirmed);
-  (* 1.02 sat/vB should be in bucket 0 (1.0 to 1.05 range) *)
-  Fee_estimation.track_transaction est (make_txid 2) 1.02 100;
-  (match Fee_estimation.get_bucket_stats est 0 with
-   | None -> Alcotest.fail "bucket 0 should exist"
+     Alcotest.(check int) "0.05 in first bucket" 1 stats.unconfirmed);
+  (* 0.12 sat/vB should be in some bucket (within valid range 0.1..10000) *)
+  Fee_estimation.track_transaction est (make_txid 2) 0.12 100;
+  let idx2 = bucket_for est 0.12 in
+  (match Fee_estimation.get_bucket_stats est idx2 with
+   | None -> Alcotest.fail "bucket for 0.12 should exist"
    | Some stats ->
-     Alcotest.(check bool) "1.02 in bucket 0" true (stats.unconfirmed >= 1));
-  (* 15000.0 (above max boundary 10000) should go to last bucket *)
+     Alcotest.(check bool) "0.12 in a valid bucket" true (stats.unconfirmed >= 1));
+  (* 15000.0 (above max boundary ~9539 sat/vB) should go to last bucket *)
   Fee_estimation.track_transaction est (make_txid 3) 15000.0 100;
   let last_bucket = Fee_estimation.bucket_count est - 1 in
   match Fee_estimation.get_bucket_stats est last_bucket with

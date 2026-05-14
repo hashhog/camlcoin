@@ -350,12 +350,24 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         n chain.blocks_synced)
   end;
 
+  (* Initialize fee estimator — must be created before the mempool so its
+     eviction callback can be captured in the mempool constructor closure.
+     Core: CBlockPolicyEstimator is created in node/kernel/chain.cpp and wired
+     into CTxMemPool via the TransactionRemovedFromMempool signal. *)
+  let fee_estimator = Fee_estimation.create () in
+
   (* Initialize mempool *)
   let current_height = match chain.tip with
     | Some t -> t.height
     | None -> 0
   in
-  let mempool = Mempool.create ~utxo ~current_height () in
+  (* Wire Fee_estimation.record_eviction as the eviction hook so that every
+     tx removed without confirmation (eviction, expiry, RBF) updates the
+     fee estimator's leftmempool stats.  Fixes W114 G12 dead-helper. *)
+  let mempool = Mempool.create ~utxo ~current_height
+    ~on_eviction:(Some (fun txid ->
+      Fee_estimation.record_eviction fee_estimator txid))
+    () in
 
   (* ZMQ notifier setup. Parses Bitcoin-Core-style "-zmqpub<topic>=<addr>"
      options into endpoint configs, opens a real PUB socket per address
@@ -393,9 +405,6 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   with exn ->
     Logs.warn (fun m ->
       m "Failed to load mempool.dat: %s" (Printexc.to_string exn)));
-
-  (* Initialize fee estimator *)
-  let fee_estimator = Fee_estimation.create () in
 
   (* Load persisted fee estimation data *)
   let fee_est_path = Filename.concat config.data_dir "fee_estimates.dat" in
@@ -947,6 +956,22 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
           m "Accepted tx %s into mempool (fee=%Ld vsize=%d)"
             (Types.hash256_to_hex result.Mempool.atmp_txid)
             result.Mempool.atmp_fee result.Mempool.atmp_vsize);
+        (* Wire fee estimator: track the accepted transaction so the estimator
+           can observe how many blocks it waits before confirmation.
+           fee_rate is in sat/vB (fee / vsize).  Guards out zero-vsize edge case.
+           Fixes W114 G10 dead-helper.
+           Core: CBlockPolicyEstimator::processTransaction called from
+                 TransactionAddedToMempool, block_policy_estimator.cpp:683 *)
+        (let fee_rate_sat_per_vb =
+           if result.Mempool.atmp_vsize > 0 then
+             Int64.to_float result.Mempool.atmp_fee
+             /. float_of_int result.Mempool.atmp_vsize
+           else 0.0
+         in
+         if fee_rate_sat_per_vb > 0.0 then
+           Fee_estimation.track_transaction fee_estimator
+             result.Mempool.atmp_txid fee_rate_sat_per_vb
+             (Fee_estimation.current_height fee_estimator));
         (* Convert fee rate to sat/kvB for feefilter comparison *)
         let fee_rate_kvb =
           if result.Mempool.atmp_vsize > 0 then

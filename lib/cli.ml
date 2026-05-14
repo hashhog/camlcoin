@@ -671,7 +671,13 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
           Serialize.serialize_transaction w entry.Mempool.tx;
           Some (Serialize.writer_to_cstruct w)
       in
+      let tip_height = match chain.tip with
+        | Some t -> t.height
+        | None   -> 0
+      in
+      let lookup_block_height hash = Sync.lookup_block_height chain hash in
       Peer.handle_getdata peer items ~lookup_block ~lookup_tx
+        ~tip_height ~lookup_block_height
     | _ -> Lwt.return_unit);
 
   (* Register a listener for inv messages: when a peer announces a new block
@@ -1114,22 +1120,46 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
           (List.length req.indexes));
       (* Decode differential indices to absolute indices *)
       let abs_indexes = P2p.decode_differential_indices req.indexes in
-      (* Look up the full block and respond with requested transactions *)
+      (* net_processing.cpp:4276-4303: MAX_BLOCKTXN_DEPTH=10 guard.
+         If the requested block is within 10 of the tip, respond with a
+         blocktxn message.  Otherwise send the full block — this forces the
+         peer to receive all block data (anti-DoS: prevents cheap getblocktxn
+         spam from triggering expensive disk reads and cheap responses). *)
+      let gbt_tip_height = match chain.tip with
+        | Some t -> t.height
+        | None   -> 0
+      in
+      let block_height = Sync.lookup_block_height chain req.block_hash in
+      let within_blocktxn_depth = match block_height with
+        | Some h -> h >= gbt_tip_height - P2p.max_blocktxn_depth
+        | None   -> false  (* unknown height → send full block *)
+      in
+      (* Look up the full block and respond *)
       (match Storage.ChainDB.get_block db req.block_hash with
        | Some block ->
-         let txs_array = Array.of_list block.Types.transactions in
-         let requested_txs = List.filter_map (fun idx ->
-           if idx >= 0 && idx < Array.length txs_array then
-             Some txs_array.(idx)
-           else None
-         ) abs_indexes in
-         let resp = P2p.make_blocktxn_msg {
-           P2p.block_hash = req.block_hash;
-           txs = requested_txs;
-         } in
-         Lwt.catch
-           (fun () -> Peer.send_message peer resp)
-           (fun _exn -> Lwt.return_unit)
+         if within_blocktxn_depth then begin
+           let txs_array = Array.of_list block.Types.transactions in
+           let requested_txs = List.filter_map (fun idx ->
+             if idx >= 0 && idx < Array.length txs_array then
+               Some txs_array.(idx)
+             else None
+           ) abs_indexes in
+           let resp = P2p.make_blocktxn_msg {
+             P2p.block_hash = req.block_hash;
+             txs = requested_txs;
+           } in
+           Lwt.catch
+             (fun () -> Peer.send_message peer resp)
+             (fun _exn -> Lwt.return_unit)
+         end else begin
+           (* Block is too old; send full block instead of blocktxn *)
+           Logs.debug (fun m ->
+             m "getblocktxn: block > %d deep, sending full block instead"
+               P2p.max_blocktxn_depth);
+           Lwt.catch
+             (fun () -> Peer.send_message peer (P2p.BlockMsg block))
+             (fun _exn -> Lwt.return_unit)
+         end
        | None ->
          Logs.debug (fun m -> m "getblocktxn: block not found");
          Lwt.return_unit)

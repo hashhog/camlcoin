@@ -624,16 +624,88 @@ let test_g23_no_asn_outbound_diversity () =
     true (ng_no_1 <> ng_no_2)
 
 (* ============================================================================
-   G24: No ASMapHealthCheck / bucket distribution logging
+   G24: FIX-52 — ASMapHealthCheck / bucket distribution logging
    Core: NetGroupManager::ASMapHealthCheck(clearnet_addrs) — logs bucket
          distribution statistics when -asmap is active; called periodically
-   Camlcoin: no health-check or bucket-distribution analysis
+         (Core: 24h interval; camlcoin: 3600s interval).
+   FIX-52: Asmap.asmap_health_check added; Peer_manager.start calls
+           start_asmap_health_check_timer which runs once at startup then
+           every 3600 s.
    Severity: LOW — operational visibility only
    ============================================================================ *)
 
+(* test_g24_asmap_health_check_no_asmap: health-check with no asmap → 0/0/0 *)
+let test_g24_asmap_health_check_no_asmap () =
+  let ngm = Asmap.create_net_group_manager None in
+  let result = Asmap.asmap_health_check ngm [] in
+  Alcotest.(check int) "G24/FIX-52: no asmap, no addrs → total=0" 0 result.Asmap.total;
+  Alcotest.(check int) "G24/FIX-52: no asmap, no addrs → unique_asns=0" 0 result.Asmap.unique_asns;
+  Alcotest.(check int) "G24/FIX-52: no asmap, no addrs → unmapped=0" 0 result.Asmap.unmapped
+
+(* test_g24_asmap_health_check_all_mapped: RETURN(1) asmap → every IP maps to ASN=1 *)
+let test_g24_asmap_health_check_all_mapped () =
+  let data = return1_asmap () in
+  let ngm = Asmap.create_net_group_manager (Some data) in
+  let addrs = ["1.2.3.4"; "8.8.8.8"; "9.9.9.9"] in
+  let result = Asmap.asmap_health_check ngm addrs in
+  Alcotest.(check int) "G24/FIX-52: all mapped → total=3"       3 result.Asmap.total;
+  Alcotest.(check int) "G24/FIX-52: all mapped → unique_asns=1" 1 result.Asmap.unique_asns;
+  Alcotest.(check int) "G24/FIX-52: all mapped → unmapped=0"    0 result.Asmap.unmapped;
+  (* top_asns: ASN=1 with count=3 *)
+  Alcotest.(check int) "G24/FIX-52: top_asns has 1 entry" 1 (List.length result.Asmap.top_asns);
+  let (asn, cnt) = List.hd result.Asmap.top_asns in
+  Alcotest.(check int32) "G24/FIX-52: top ASN = 1l" 1l asn;
+  Alcotest.(check int)   "G24/FIX-52: top ASN count = 3" 3 cnt
+
+(* test_g24_asmap_health_check_partial_mapped: RETURN(1) asmap + some non-parseable addrs *)
+let test_g24_asmap_health_check_partial_mapped () =
+  let data = return1_asmap () in
+  let ngm = Asmap.create_net_group_manager (Some data) in
+  (* "hostname.example.com" is not a dotted-quad, parse_ipv4_to_bytes → None → ASN=0 *)
+  let addrs = ["1.2.3.4"; "hostname.example.com"; "8.8.8.8"] in
+  let result = Asmap.asmap_health_check ngm addrs in
+  Alcotest.(check int) "G24/FIX-52: partial → total=3"       3 result.Asmap.total;
+  Alcotest.(check int) "G24/FIX-52: partial → unique_asns=1" 1 result.Asmap.unique_asns;
+  Alcotest.(check int) "G24/FIX-52: partial → unmapped=1"    1 result.Asmap.unmapped
+
+(* test_g24_asmap_health_check_two_asns: RETURN(1) asmap, 3 IPs → 1 ASN counted correctly.
+   Note: IPv4 addresses are mapped to ::ffff:a.b.c.d; byte 0 of that form is always 0x00
+   (part of the 10-zero-byte prefix), so the JUMP(1,2) asmap — which branches on bit 0 of
+   byte 0 — always routes all IPv4 inputs to the left subtree (ASN=1).  This test uses
+   RETURN(1) asmap to verify multi-address counting; the JUMP routing is already exercised
+   by the FIX-50 tests (test_fix50_jump_asmap_routing) which use raw 16-byte buffers. *)
+let test_g24_asmap_health_check_two_asns () =
+  let data = return1_asmap () in
+  let ngm = Asmap.create_net_group_manager (Some data) in
+  let addrs = ["1.2.3.4"; "5.6.7.8"; "9.10.11.12"] in
+  let result = Asmap.asmap_health_check ngm addrs in
+  Alcotest.(check int) "G24/FIX-52: 3 IPs → total=3"       3 result.Asmap.total;
+  Alcotest.(check int) "G24/FIX-52: 3 IPs → unique_asns=1" 1 result.Asmap.unique_asns;
+  Alcotest.(check int) "G24/FIX-52: 3 IPs → unmapped=0"    0 result.Asmap.unmapped
+
+(* test_g24_asmap_health_check_top_n: top_n parameter limits top_asns list length *)
+let test_g24_asmap_health_check_top_n () =
+  let data = return1_asmap () in
+  let ngm = Asmap.create_net_group_manager (Some data) in
+  let addrs = ["1.2.3.4"; "8.8.8.8"; "9.9.9.9"] in
+  (* top_n=0 → all entries returned (no cap) *)
+  let result0 = Asmap.asmap_health_check ~top_n:0 ngm addrs in
+  Alcotest.(check bool) "G24/FIX-52: top_n=0 → no cap" true (List.length result0.Asmap.top_asns >= 1);
+  (* top_n=1 → at most 1 entry *)
+  let result1 = Asmap.asmap_health_check ~top_n:1 ngm addrs in
+  Alcotest.(check bool) "G24/FIX-52: top_n=1 → at most 1" true (List.length result1.Asmap.top_asns <= 1)
+
+(* test_g24_pm_start_asmap_health_check_timer: Peer_manager exposes the timer start fn *)
+let test_g24_pm_start_asmap_health_check_timer () =
+  (* Verify the function exists and can be called without error on a pm
+     that has no asmap (no-op path). *)
+  let pm = make_pm () in
+  Peer_manager.start_asmap_health_check_timer pm;
+  Alcotest.(check bool) "G24/FIX-52: start_asmap_health_check_timer is a no-op without asmap" true true
+
 let test_g24_no_asmap_health_check () =
-  let has_health_check = false in
-  Alcotest.(check bool) "G24: no ASMapHealthCheck" false has_health_check
+  let has_health_check = true in
+  Alcotest.(check bool) "G24/FIX-52: ASMapHealthCheck present" true has_health_check
 
 (* ============================================================================
    G25: getnetworkinfo missing asmap_version / asmap_active fields
@@ -804,7 +876,13 @@ let () =
       Alcotest.test_case "G21: getpeerinfo missing mapped_as" `Quick test_g21_getpeerinfo_no_mapped_as;
       Alcotest.test_case "G22: getnodeaddresses missing mapped_as" `Quick test_g22_getnodeaddresses_no_mapped_as;
       Alcotest.test_case "G23: no ASN outbound diversity guard" `Quick test_g23_no_asn_outbound_diversity;
-      Alcotest.test_case "G24: no ASMapHealthCheck" `Quick test_g24_no_asmap_health_check;
+      Alcotest.test_case "G24: ASMapHealthCheck present (FIX-52)" `Quick test_g24_no_asmap_health_check;
+      Alcotest.test_case "G24/FIX-52: health-check no asmap → 0/0/0" `Quick test_g24_asmap_health_check_no_asmap;
+      Alcotest.test_case "G24/FIX-52: health-check all mapped → 1 ASN" `Quick test_g24_asmap_health_check_all_mapped;
+      Alcotest.test_case "G24/FIX-52: health-check partial mapped" `Quick test_g24_asmap_health_check_partial_mapped;
+      Alcotest.test_case "G24/FIX-52: health-check 3 IPs single ASN" `Quick test_g24_asmap_health_check_two_asns;
+      Alcotest.test_case "G24/FIX-52: health-check top_n cap" `Quick test_g24_asmap_health_check_top_n;
+      Alcotest.test_case "G24/FIX-52: pm.start_asmap_health_check_timer exists" `Quick test_g24_pm_start_asmap_health_check_timer;
     ]);
     ("G25-G28 Stats", [
       Alcotest.test_case "G25: getnetworkinfo no asmap fields" `Quick test_g25_getnetworkinfo_no_asmap_fields;

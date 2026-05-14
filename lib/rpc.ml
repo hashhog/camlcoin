@@ -6040,9 +6040,11 @@ let handle_walletcreatefundedpsbt (ctx : rpc_context)
             | Some p when p >= 0 && p <= List.length outputs -> p
             | Some _ -> List.length outputs  (* clamp to end *)
             | None ->
-              (* Random insert position so observers cannot trivially tell
-                 the change output apart.  Matches Core's randomization. *)
-              Random.int (List.length outputs + 1)
+              (* CSPRNG insert position so observers cannot trivially tell
+                 the change output apart.  Matches Core's randomization.
+                 Uses Wallet.csprng_int_range — same /dev/urandom source
+                 as shuffle_list and insert_at_random (BUG-7 fix). *)
+              Wallet.csprng_int_range (List.length outputs + 1)
           in
           let rec insert_at i acc = function
             | rest when i = 0 -> List.rev_append acc (change_out :: rest)

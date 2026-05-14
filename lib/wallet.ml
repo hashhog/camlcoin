@@ -14,10 +14,36 @@ let log_src = Logs.Src.create "WALLET" ~doc:"Wallet"
 module Log = (val Logs.src_log log_src : Logs.LOG)
 let _ = Log.info  (* suppress unused module warning *)
 
+(* CSPRNG helper: read 8 bytes from /dev/urandom and return a non-negative
+   integer in [0, max).  Never falls back to OCaml stdlib Random — same
+   pattern used in peer_manager.ml/sync.ml/p2p.ml throughout camlcoin.
+   Mirrors Bitcoin Core's FastRandomContext::randrange() sourced from
+   GetStrongRandBytes() → /dev/urandom.  Called for all privacy-sensitive
+   decisions: coin shuffle order, change output position, anti-fee-sniping
+   trigger.  `max` must be > 0. *)
+let csprng_int_range (max_exclusive : int) : int =
+  assert (max_exclusive > 0);
+  let buf = Bytes.create 8 in
+  let ic = open_in_bin "/dev/urandom" in
+  really_input ic buf 0 8;
+  close_in ic;
+  (* Interpret as a little-endian unsigned 63-bit integer (drop sign bit) to
+     stay within OCaml's native int range on 64-bit systems, then mod. *)
+  let b i = Int64.of_int (Char.code (Bytes.get buf i)) in
+  let ( lsl ) = Int64.shift_left in
+  let ( lor ) = Int64.logor in
+  let raw =
+    (b 0) lor ((b 1) lsl 8) lor ((b 2) lsl 16) lor ((b 3) lsl 24)
+    lor ((b 4) lsl 32) lor ((b 5) lsl 40) lor ((b 6) lsl 48) lor ((b 7) lsl 56)
+  in
+  (* Mask to 62 bits to guarantee non-negative after Int64.to_int *)
+  let masked = Int64.logand raw 0x3FFFFFFFFFFFFFFFL in
+  Int64.to_int masked mod max_exclusive
+
 (* Insert an item at a random position in a list (for output order privacy) *)
 let insert_at_random lst item =
   let n = List.length lst in
-  let pos = Random.int (n + 1) in
+  let pos = csprng_int_range (n + 1) in
   let rec aux i acc = function
     | [] -> List.rev (item :: acc)
     | x :: xs ->
@@ -825,12 +851,13 @@ let estimate_tx_weight (n_inputs : int) (n_outputs : int) : int =
   let output_weight = n_outputs * 31 * 4 in        (* 124 per output *)
   base_weight + input_weight + output_weight
 
-(* Fisher-Yates shuffle for random permutation *)
+(* Fisher-Yates shuffle for random permutation — uses CSPRNG for privacy.
+   Coin selection order must be unpredictable to prevent UTXO fingerprinting. *)
 let shuffle_list (lst : 'a list) : 'a list =
   let arr = Array.of_list lst in
   let n = Array.length arr in
   for i = n - 1 downto 1 do
-    let j = Random.int (i + 1) in
+    let j = csprng_int_range (i + 1) in
     let tmp = arr.(i) in
     arr.(i) <- arr.(j);
     arr.(j) <- tmp
@@ -1403,10 +1430,12 @@ let create_transaction (w : t) ~(dest_address : string)
           sequence = 0xFFFFFFFEl; }
       ) selection.selected in
 
-      (* Anti-fee-sniping locktime *)
+      (* Anti-fee-sniping locktime — use CSPRNG for the 10% trigger.
+         csprng_int_range 10 = 0 triggers with ~10% probability, matching
+         Core's CWallet::CreateTransactionInternal random trigger. *)
       let locktime = match tip_height with
         | Some h ->
-          if Random.int 10 = 0 then Int32.of_int (max 0 (h - 1))
+          if csprng_int_range 10 = 0 then Int32.of_int (max 0 (h - 1))
           else Int32.of_int h
         | None -> 0l
       in
@@ -1486,10 +1515,10 @@ let create_transaction_multi (w : t)
       tx_outputs := insert_at_random !tx_outputs change_output
     end;
 
-    (* Anti-fee-sniping locktime *)
+    (* Anti-fee-sniping locktime — use CSPRNG for the 10% trigger. *)
     let locktime = match tip_height with
       | Some h ->
-        if Random.int 10 = 0 then Int32.of_int (max 0 (h - 1))
+        if csprng_int_range 10 = 0 then Int32.of_int (max 0 (h - 1))
         else Int32.of_int h
       | None -> 0l
     in

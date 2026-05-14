@@ -537,6 +537,16 @@ let deserialize_headers_msg r : Types.block_header list =
 (* BIP 152: Compact block constants *)
 let cmpctblock_version = 2L  (* Version 2 is witness-aware *)
 let max_compact_block_txs = 100_000
+(* net_processing.cpp:138 MAX_CMPCTBLOCK_DEPTH = 5:
+   Only serve cmpctblock (not full block) for requests within this many blocks
+   of the current tip. Older blocks are served as full blocks because the
+   requester is unlikely to have a useful mempool for reconstruction. *)
+let max_cmpctblock_depth = 5
+(* net_processing.cpp:140 MAX_BLOCKTXN_DEPTH = 10:
+   Only respond to getblocktxn with a blocktxn message for blocks within this
+   many blocks of the tip. Deeper requests get a full block response instead,
+   which forces the requester to pay the bandwidth cost (anti-DoS). *)
+let max_blocktxn_depth = 10
 
 (* Write a 6-byte short ID (lower 48 bits of int64) in little-endian *)
 let write_short_id w (id : int64) =

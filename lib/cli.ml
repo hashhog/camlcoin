@@ -75,6 +75,27 @@ type config = {
        addresses are mapped to their Autonomous System Number and bucketed by
        ASN in AddrMan rather than by /16 netgroup.  [None] (default) uses the
        legacy /16 bucketing. *)
+  proxy : string option;
+    (* --proxy=<host:port>.  Default SOCKS5 proxy for outbound TCP dials.
+       Used for IPv4/IPv6 and (when --onion isn't set) for .onion as well.
+       Mirrors Bitcoin Core's -proxy flag (init.cpp).  [None] (default) =
+       direct clearnet connections. *)
+  onion : string option;
+    (* --onion=<host:port>.  Dedicated SOCKS5 proxy for .onion peers.
+       When set, overrides --proxy for Tor hidden-service dials and enables
+       Tor stream-isolation (random SOCKS5 credentials per circuit).
+       Mirrors Bitcoin Core's -onion flag.  [None] = .onion dials use the
+       --proxy default (and fail if neither is set). *)
+  i2psam : string option;
+    (* --i2psam=<host:port>.  I2P SAM 3.1 bridge endpoint for .b32.i2p dials.
+       Mirrors Bitcoin Core's -i2psam flag.  [None] = .b32.i2p dials error
+       out at [P2p.connect_with_proxy]. *)
+  cjdns_reachable : bool;
+    (* --cjdnsreachable.  When [true], we permit direct TCP dials to
+       fc00::/8 CJDNS overlay addresses (the operator has the CJDNS daemon
+       running and a route in the kernel).  Mirrors Bitcoin Core's
+       -cjdnsreachable flag.  [false] (default) = refuse all CJDNS dials
+       to avoid leaking the intent over the clearnet default route. *)
 }
 
 (* ============================================================================
@@ -105,6 +126,10 @@ let default_config : config = {
   rest_bind = None;
   blockfilterindex_basic = false;  (* Mirrors Core DEFAULT_BLOCKFILTERINDEX *)
   asmap_path = None;
+  proxy = None;
+  onion = None;
+  i2psam = None;
+  cjdns_reachable = false;
 }
 
 (* Network-specific configuration *)
@@ -438,11 +463,98 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
        | None -> None)
   in
 
+  (* Build the outbound proxy configuration from the CLI flags.
+     Mirrors Bitcoin Core init.cpp's mapping from -proxy / -onion /
+     -i2psam / -cjdnsreachable into ProxyOptions before the peer
+     manager starts.  Invalid host:port strings are reported as a
+     warning and treated as if the flag wasn't set, so a typo in
+     --proxy doesn't silently strand outbound dials.
+
+     Closes W117 BUG-2 (FIX-56): the wiring exists so
+     Peer_manager.add_peer / force_add_peer / add_block_relay_peer
+     route every dial through P2p.connect_with_proxy. *)
+  let parse_host_port_socks5 raw =
+    (* Accept bare "host:port" (Core syntax) or full "socks5://..." URL. *)
+    match P2p.parse_proxy_url raw with
+    | Some p -> Some p
+    | None ->
+      let with_scheme = "socks5://" ^ raw in
+      P2p.parse_proxy_url with_scheme
+  in
+  let parsed_proxy = match config.proxy with
+    | None -> P2p.NoProxy
+    | Some s ->
+      (match parse_host_port_socks5 s with
+       | Some p -> p
+       | None ->
+         Logs.warn (fun m ->
+           m "ignoring malformed --proxy=%S (expected host:port or socks5://host:port)" s);
+         P2p.NoProxy)
+  in
+  let parsed_onion = match config.onion with
+    | None -> P2p.NoProxy
+    | Some s ->
+      (match parse_host_port_socks5 s with
+       | Some (P2p.Socks5Proxy r) ->
+         (* Dedicated onion proxy: enable Tor stream isolation by default
+            (random SOCKS5 credentials per circuit), matching Bitcoin
+            Core's behaviour when -onion is set.  This is independent
+            from any credentials already encoded in the URL — we never
+            stamp over them. *)
+         let tor_iso = r.credentials = None in
+         P2p.Socks5Proxy { r with tor_stream_isolation = tor_iso }
+       | Some other -> other
+       | None ->
+         Logs.warn (fun m ->
+           m "ignoring malformed --onion=%S (expected host:port)" s);
+         P2p.NoProxy)
+  in
+  let parsed_i2psam = match config.i2psam with
+    | None -> P2p.NoProxy
+    | Some s ->
+      (match P2p.parse_i2p_sam s with
+       | Some p -> p
+       | None ->
+         Logs.warn (fun m ->
+           m "ignoring malformed --i2psam=%S (expected host:port)" s);
+         P2p.NoProxy)
+  in
+  let proxy_config : P2p.proxy_config = {
+    P2p.default_proxy = parsed_proxy;
+    onion_proxy = parsed_onion;
+    i2p_sam = parsed_i2psam;
+    onlynet = P2p.default_proxy_config.onlynet;
+    cjdns_reachable = config.cjdns_reachable;
+  } in
+  (* Operator visibility: report what's wired and what isn't, since
+     "Tor outbound enabled but my .onion peer is unreachable" is the
+     first question anyone will ask. *)
+  (match parsed_proxy with
+   | P2p.NoProxy -> ()
+   | P2p.Socks5Proxy { addr; port; _ } ->
+     Logs.info (fun m -> m "Outbound proxy: SOCKS5 %s:%d" addr port)
+   | _ -> ());
+  (match parsed_onion with
+   | P2p.NoProxy -> ()
+   | P2p.Socks5Proxy { addr; port; tor_stream_isolation; _ } ->
+     Logs.info (fun m ->
+       m "Outbound Tor proxy: SOCKS5 %s:%d (stream-isolation=%b)"
+         addr port tor_stream_isolation)
+   | _ -> ());
+  (match parsed_i2psam with
+   | P2p.NoProxy -> ()
+   | P2p.I2PSam { addr; port } ->
+     Logs.info (fun m -> m "Outbound I2P SAM: %s:%d" addr port)
+   | _ -> ());
+  if config.cjdns_reachable then
+    Logs.info (fun m -> m "CJDNS reachable: outbound fc00::/8 dials enabled");
+
   (* Initialize peer manager *)
   let peer_manager = Peer_manager.create
     ~config:{ Peer_manager.default_config with
               max_outbound = config.max_outbound;
-              max_inbound = config.max_inbound }
+              max_inbound = config.max_inbound;
+              proxy_config }
     ~asmap:asmap_data
     network in
 

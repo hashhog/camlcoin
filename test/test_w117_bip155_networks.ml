@@ -198,19 +198,22 @@ let test_g9_onion_proxy_override () =
    G10 — BUG-2: connect_with_proxy is a dead helper — PeerManager never calls it
    ========================================================================= *)
 
-(* This is a structural / code-path test. We verify the type signatures match
-   but document that Peer_manager.connect_outbound calls
-   Peer.connect_outbound_negotiated (which calls Peer.connect directly) and
-   never calls Peer.connect_with_proxy. The proxy infrastructure is dead. *)
+(* FIX-56: BUG-2 closed.  Peer_manager.config now carries a [proxy_config]
+   field; all 3 [Peer.connect_outbound_negotiated] call-sites in
+   peer_manager.ml pass [Some pm.config.proxy_config] so that .onion /
+   .b32.i2p / fc00::/8 dials honour --proxy / --onion / --i2psam /
+   --cjdnsreachable instead of always making a direct clearnet TCP dial. *)
 let test_g10_dead_helper_proxy () =
-  (* BUG-2: Peer.connect_with_proxy exists and is fully implemented,
-     but Peer_manager.ml calls Peer.connect_outbound_negotiated exclusively,
-     which calls Peer.connect (direct TCP) — bypassing all proxy logic.
-     No outbound Tor/I2P connection is ever made regardless of config. *)
-  check bool "BUG-2: proxy dead-helper documented" true true
-  (* Verified: grep -n "connect_with_proxy" peer_manager.ml = 0 results.
-     All 3 Peer.connect_outbound_negotiated call-sites in peer_manager.ml
-     pass ~network ~addr ~port ~id ~our_height only — no proxy_config. *)
+  (* The default config preserves legacy behaviour (no proxy configured,
+     CJDNS unreachable), so the integration is safe to ship even when the
+     operator never sets a flag. *)
+  let cfg = Peer_manager.default_config in
+  check bool "FIX-56: default_config carries default_proxy_config" true
+    (cfg.Peer_manager.proxy_config = P2p.default_proxy_config);
+  check bool "FIX-56: default proxy is NoProxy"
+    true (cfg.Peer_manager.proxy_config.P2p.default_proxy = P2p.NoProxy);
+  check bool "FIX-56: cjdns_reachable defaults off"
+    false cfg.Peer_manager.proxy_config.P2p.cjdns_reachable
 
 (* =========================================================================
    G11 — I2P addrv2 type is encoded as network ID 5
@@ -358,17 +361,24 @@ let test_g18_cjdns_addrv2_length () =
    ========================================================================= *)
 
 let test_g19_cjdns_not_detected () =
-  (* BUG-4: network_type_of_host cannot detect CJDNS addresses.
-     Bitcoin Core: CJDNS addresses have first byte = 0xFC in their 16-byte raw form.
-     Camlcoin's network_type_of_host only checks .onion suffix and .b32.i2p suffix.
-     CJDNS IPv6 addresses like fc00:... are classified as Net_IPv6, not Net_CJDNS. *)
-  let cjdns_ipv6 = "fc00::1" in   (* looks like IPv6 with colon *)
+  (* BUG-4 (CLOSED by FIX-56): network_type_of_host now detects the CJDNS
+     fc00::/8 prefix BEFORE the generic IPv6 fallthrough.  Mirrors
+     Bitcoin Core netaddress.cpp CJDNSPrefix = {0xFC}. *)
+  let cjdns_ipv6 = "fc00::1" in   (* leading hextet 0xfc00 → high byte 0xfc *)
   let net = P2p.network_type_of_host cjdns_ipv6 in
-  (* BUG-4: returns Net_IPv6 instead of Net_CJDNS *)
-  check bool "BUG-4: CJDNS detected as IPv6 (not Net_CJDNS)"
-    true (net = P2p.Net_IPv6);
-  check bool "BUG-4: CJDNS not correctly identified"
-    false (net = P2p.Net_CJDNS)
+  check bool "FIX-56: fc00::1 correctly identified as CJDNS"
+    true (net = P2p.Net_CJDNS);
+  check bool "FIX-56: fc00::1 NOT classified as plain IPv6"
+    false (net = P2p.Net_IPv6);
+  (* Bracketed form (used by getaddrinfo string formatting) *)
+  check bool "FIX-56: [fc00::1] also CJDNS"
+    true (P2p.network_type_of_host "[fc00::1]" = P2p.Net_CJDNS);
+  (* fd00::/8 is *not* CJDNS — it's the standard RFC 4193 ULA block. *)
+  check bool "FIX-56: fd00::1 stays IPv6 (not CJDNS)"
+    true (P2p.network_type_of_host "fd00::1" = P2p.Net_IPv6);
+  (* Any IPv6 starting with the 'fc' byte counts — including longer prefix *)
+  check bool "FIX-56: fcab:1234::1 detected as CJDNS"
+    true (P2p.network_type_of_host "fcab:1234::1" = P2p.Net_CJDNS)
 
 (* =========================================================================
    G20 — BUG-9: handle_addrv2 drops TorV3/I2P/CJDNS entries
@@ -665,6 +675,158 @@ let test_g35_sendaddrv2_order () =
   check bool "sendaddrv2 timing documented" true true
 
 (* =========================================================================
+   FIX-56 G36..G44 — new dispatch / wiring tests for W117 BUG-2 + BUG-4
+   ========================================================================= *)
+
+(* G36: CJDNS detection — boundary cases.
+   CJDNS = fc00::/8 (first byte of the 16-byte address = 0xFC).
+   In IPv6 textual form that means the first hextet, when expanded to 4
+   hex chars, starts with "fc".  Hextets that expand to "00fc" (e.g.
+   the bare "fc::") are NOT CJDNS — they're 0x00FC at offset 0..1. *)
+let test_g36_cjdns_detection_boundary () =
+  (* Inside the prefix: high byte of first hextet = 0xFC *)
+  check bool "fc00::1 -> CJDNS" true
+    (P2p.network_type_of_host "fc00::1" = P2p.Net_CJDNS);
+  check bool "fcff:ffff::1 -> CJDNS" true
+    (P2p.network_type_of_host "fcff:ffff::1" = P2p.Net_CJDNS);
+  check bool "fcab:cdef::1 -> CJDNS" true
+    (P2p.network_type_of_host "fcab:cdef::1" = P2p.Net_CJDNS);
+  (* "fc::1" expands to 00fc:0000:...:0001 — first byte = 0x00, NOT CJDNS *)
+  check bool "fc::1 -> IPv6 (high byte = 0x00, NOT CJDNS)" true
+    (P2p.network_type_of_host "fc::1" = P2p.Net_IPv6);
+  (* Just outside the prefix *)
+  check bool "fb00::1 -> IPv6 (not CJDNS)" true
+    (P2p.network_type_of_host "fb00::1" = P2p.Net_IPv6);
+  check bool "fd00::1 -> IPv6 (RFC4193 ULA, not CJDNS)" true
+    (P2p.network_type_of_host "fd00::1" = P2p.Net_IPv6);
+  (* IPv4 with first byte 252 (0xFC) must NOT be misclassified — only
+     IPv6 addresses can be CJDNS. *)
+  check bool "252.0.0.1 -> IPv4 (NOT CJDNS, no colon)" true
+    (P2p.network_type_of_host "252.0.0.1" = P2p.Net_IPv4)
+
+(* G37: PeerManager.config carries proxy_config — structural test *)
+let test_g37_peer_manager_config_has_proxy_config () =
+  let cfg = Peer_manager.default_config in
+  check bool "default proxy_config = NoProxy + cjdns_reachable=false" true
+    (cfg.Peer_manager.proxy_config.P2p.default_proxy = P2p.NoProxy
+     && cfg.Peer_manager.proxy_config.P2p.onion_proxy = P2p.NoProxy
+     && cfg.Peer_manager.proxy_config.P2p.i2p_sam = P2p.NoProxy
+     && cfg.Peer_manager.proxy_config.P2p.cjdns_reachable = false)
+
+(* G38: Cli.config carries proxy / onion / i2psam / cjdns_reachable fields *)
+let test_g38_cli_config_proxy_fields () =
+  let c = Cli.default_config in
+  check bool "Cli.default_config.proxy = None" true (c.Cli.proxy = None);
+  check bool "Cli.default_config.onion = None" true (c.Cli.onion = None);
+  check bool "Cli.default_config.i2psam = None" true (c.Cli.i2psam = None);
+  check bool "Cli.default_config.cjdns_reachable = false" false c.Cli.cjdns_reachable
+
+(* G39: Dispatch — .onion without proxy returns error *)
+let test_g39_onion_no_proxy_blocked () =
+  let cfg = P2p.default_proxy_config in
+  let result = Lwt_main.run (
+    P2p.connect_with_proxy ~config:cfg
+      ~host:"pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion"
+      ~port:8333
+  ) in
+  match result with
+  | Error msg ->
+    check bool ".onion error mentions proxy" true
+      (let lc = String.lowercase_ascii msg in
+       let contains needle =
+         let nl = String.length needle in
+         let ml = String.length lc in
+         if nl > ml then false
+         else
+           let rec walk i =
+             if i + nl > ml then false
+             else if String.sub lc i nl = needle then true
+             else walk (i + 1)
+           in walk 0
+       in
+       contains "proxy" || contains "onion")
+  | Ok _ -> Alcotest.fail "expected error for .onion without proxy"
+
+(* G40: Dispatch — fc00:: refused unless cjdns_reachable *)
+let test_g40_cjdns_blocked_when_not_reachable () =
+  let cfg = P2p.default_proxy_config in
+  let result = Lwt_main.run (
+    P2p.connect_with_proxy ~config:cfg ~host:"fc00::1" ~port:8333
+  ) in
+  match result with
+  | Error msg ->
+    check bool "fc00:: error references cjdns" true
+      (let lc = String.lowercase_ascii msg in
+       let contains needle =
+         let nl = String.length needle in
+         let ml = String.length lc in
+         if nl > ml then false
+         else
+           let rec walk i =
+             if i + nl > ml then false
+             else if String.sub lc i nl = needle then true
+             else walk (i + 1)
+           in walk 0
+       in
+       contains "cjdns")
+  | Ok _ -> Alcotest.fail "expected error for fc00:: with cjdns_reachable=false"
+
+(* G41: Dispatch — fc00:: with cjdns_reachable selects NoProxy, never a SOCKS5 *)
+let test_g41_cjdns_routes_direct_when_reachable () =
+  let cfg = { P2p.default_proxy_config with
+    (* Even with a default SOCKS5 proxy set, CJDNS must NEVER tunnel
+       through it — the overlay is kernel-routed. *)
+    default_proxy = P2p.Socks5Proxy {
+      addr = "127.0.0.1"; port = 9050;
+      credentials = None; tor_stream_isolation = false };
+    cjdns_reachable = true;
+  } in
+  let chosen = P2p.get_proxy_for_target cfg "fc00::1" in
+  check bool "CJDNS host always uses NoProxy regardless of default" true
+    (chosen = P2p.NoProxy)
+
+(* G42: Dispatch — .b32.i2p selects I2PSam, NOT default SOCKS5 *)
+let test_g42_i2p_routes_to_sam () =
+  let cfg = { P2p.default_proxy_config with
+    default_proxy = P2p.Socks5Proxy {
+      addr = "127.0.0.1"; port = 9050;
+      credentials = None; tor_stream_isolation = false };
+    i2p_sam = P2p.I2PSam { addr = "127.0.0.1"; port = 7656 };
+  } in
+  let chosen = P2p.get_proxy_for_target cfg
+    "ukeu3k5oycga3uneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq.b32.i2p" in
+  (match chosen with
+   | P2p.I2PSam { addr; port } ->
+     check string "I2P SAM addr" "127.0.0.1" addr;
+     check int "I2P SAM port" 7656 port
+   | _ -> Alcotest.fail "expected I2PSam for .b32.i2p")
+
+(* G43: Dispatch — clearnet IPv4 with default SOCKS5 routes through it *)
+let test_g43_ipv4_routes_through_default_proxy () =
+  let socks5 = P2p.Socks5Proxy {
+    addr = "10.0.0.1"; port = 1080;
+    credentials = None; tor_stream_isolation = false
+  } in
+  let cfg = { P2p.default_proxy_config with default_proxy = socks5 } in
+  check bool "IPv4 uses default proxy" true
+    (P2p.get_proxy_for_target cfg "1.2.3.4" = socks5);
+  check bool "IPv6 uses default proxy" true
+    (P2p.get_proxy_for_target cfg "2001:db8::1" = socks5)
+
+(* G44: Wiring — Peer.connect_outbound_negotiated accepts ?proxy_config *)
+let test_g44_connect_outbound_accepts_proxy_config () =
+  (* This is a type-level test.  If [proxy_config] disappears from the
+     signature, the alias below stops compiling — which is the assertion
+     we care about.  We bind to an [_ignored] so the test does not try
+     to make a network connection.  *)
+  let _f = (Peer.connect_outbound_negotiated :
+              network:Consensus.network_config ->
+              addr:string -> port:int -> id:int -> our_height:int32 ->
+              ?proxy_config:P2p.proxy_config option ->
+              unit -> Peer.peer Lwt.t) in
+  check bool "Peer.connect_outbound_negotiated signature has ?proxy_config" true true
+
+(* =========================================================================
    Test suite registration
    ========================================================================= *)
 
@@ -742,4 +904,22 @@ let () =
       [ test_case "I2P peer port = 0" `Quick test_g34_i2p_peer_port ];
       "G35 sendaddrv2 timing",
       [ test_case "sendaddrv2 ordering documented" `Quick test_g35_sendaddrv2_order ];
+      "G36 FIX-56 CJDNS detection boundary",
+      [ test_case "fc:: detected, fb/fd not (BUG-4 fix)" `Quick test_g36_cjdns_detection_boundary ];
+      "G37 FIX-56 PeerManager.config carries proxy_config",
+      [ test_case "default_config.proxy_config = NoProxy" `Quick test_g37_peer_manager_config_has_proxy_config ];
+      "G38 FIX-56 Cli.config proxy fields",
+      [ test_case "Cli.default_config has proxy/onion/i2psam/cjdns_reachable" `Quick test_g38_cli_config_proxy_fields ];
+      "G39 FIX-56 dispatch — onion no proxy blocked",
+      [ test_case ".onion without proxy returns error" `Quick test_g39_onion_no_proxy_blocked ];
+      "G40 FIX-56 dispatch — cjdns blocked when not reachable",
+      [ test_case "fc00:: without --cjdnsreachable returns error" `Quick test_g40_cjdns_blocked_when_not_reachable ];
+      "G41 FIX-56 dispatch — cjdns_reachable routes direct (never SOCKS5)",
+      [ test_case "fc00:: with --cjdnsreachable bypasses default proxy" `Quick test_g41_cjdns_routes_direct_when_reachable ];
+      "G42 FIX-56 dispatch — i2p routes through SAM",
+      [ test_case ".b32.i2p uses i2p_sam not default_proxy" `Quick test_g42_i2p_routes_to_sam ];
+      "G43 FIX-56 dispatch — ipv4 routes through default proxy",
+      [ test_case "1.2.3.4 uses default SOCKS5" `Quick test_g43_ipv4_routes_through_default_proxy ];
+      "G44 FIX-56 wiring — proxy_config accepted",
+      [ test_case "Peer.connect_outbound_negotiated has ?proxy_config" `Quick test_g44_connect_outbound_accepts_proxy_config ];
     ]

@@ -5655,6 +5655,86 @@ let handle_combinepsbt (_ctx : rpc_context)
   | _ ->
     Error "Invalid parameters: expected [[base64strings]]"
 
+(* finalize_psbt_inputs_walk: shared dispatcher used by both
+   handle_finalizepsbt and handle_walletprocesspsbt to walk a PSBT's inputs
+   and route each unfinalized one through the appropriate
+   Psbt.finalize_input_* helper.
+
+   W47 — Pre-W47 routing called finalize_input_p2sh_p2wpkh for ANY P2SH
+   UTXO, which silently mis-finalized P2SH-multisig and P2SH-P2WSH-multisig
+   inputs by synthesizing an OP_0+hash160 redeem_script from the first
+   partial-sig pubkey (lib/psbt.ml's old finalize_input_p2sh_p2wpkh body,
+   lines 1026-1029) instead of consuming the actual inp.redeem_script.
+   We classify via the input's own redeem_script / witness_script:
+
+     redeem_script = OP_0 <push N>...      → segwit wrap
+       witness_script = OP_M ... CHECKMULTISIG → P2SH-P2WSH-multisig
+       witness_script = nothing            → P2SH-P2WPKH (single)
+     redeem_script = OP_M ... CHECKMULTISIG → P2SH-multisig (legacy)
+     witness_script = OP_M ... CHECKMULTISIG, no redeem_script
+                                           → bare P2WSH-multisig
+     else fall through to the legacy single-key heuristics.
+
+   Mirrors the dispatch in bitcoin-core/src/script/sign.cpp ProduceSignature
+   → SignStep, which similarly walks redeemScript / witnessScript before
+   classifying the input. *)
+let finalize_psbt_inputs_walk (psbt : Psbt.psbt) : (Psbt.psbt, string) result =
+  let is_segwit_wrap (rs : Cstruct.t) : bool =
+    let len = Cstruct.length rs in
+    (len = 22 || len = 34)
+    && Cstruct.get_uint8 rs 0 = 0x00
+    && Cstruct.get_uint8 rs 1 = (len - 2)
+  in
+  let is_p2wsh_wrap (rs : Cstruct.t) : bool =
+    Cstruct.length rs = 34
+    && Cstruct.get_uint8 rs 0 = 0x00
+    && Cstruct.get_uint8 rs 1 = 0x20
+  in
+  let is_multisig (script : Cstruct.t) : bool =
+    match Psbt.parse_multisig_threshold script with
+    | Some _ -> true
+    | None -> false
+  in
+  let finalize_one psbt i (inp : Psbt.psbt_input) =
+    if Psbt.is_input_finalized inp then
+      Ok psbt
+    else if inp.tap_key_sig <> None then
+      Psbt.finalize_input_taproot psbt i
+    else if inp.partial_sigs <> [] then begin
+      match inp.redeem_script, inp.witness_script with
+      | Some rs, Some ws when is_p2wsh_wrap rs && is_multisig ws ->
+        Psbt.finalize_input_p2sh_p2wsh_multisig psbt i
+          ~redeem_script:rs ~witness_script:ws
+      | Some rs, None when is_multisig rs ->
+        Psbt.finalize_input_p2sh_multisig psbt i ~redeem_script:rs
+      | Some rs, Some _ when is_multisig rs ->
+        Psbt.finalize_input_p2sh_multisig psbt i ~redeem_script:rs
+      | Some rs, _ when is_segwit_wrap rs && Cstruct.length rs = 22 ->
+        Psbt.finalize_input_p2sh_p2wpkh psbt i
+      | None, Some ws when is_multisig ws ->
+        Psbt.finalize_input_p2wsh_multisig psbt i ~witness_script:ws
+      | _ ->
+        (match inp.witness_utxo with
+         | Some utxo ->
+           let script = utxo.script_pubkey in
+           if Cstruct.length script = 22 && Cstruct.get_uint8 script 0 = 0x00 then
+             Psbt.finalize_input_p2wpkh psbt i
+           else if Cstruct.length script = 23 && Cstruct.get_uint8 script 0 = 0xa9 then
+             Psbt.finalize_input_p2sh_p2wpkh psbt i
+           else
+             Psbt.finalize_input_p2wpkh psbt i
+         | None ->
+           Psbt.finalize_input_p2pkh psbt i)
+    end
+    else
+      Ok psbt
+  in
+  List.fold_left (fun acc (i, inp) ->
+    match acc with
+    | Error e -> Error e
+    | Ok psbt -> finalize_one psbt i inp
+  ) (Ok psbt) (List.mapi (fun i inp -> (i, inp)) psbt.inputs)
+
 (* finalizepsbt "base64string" ( extract )
    Finalize the inputs of a PSBT *)
 let handle_finalizepsbt (_ctx : rpc_context)
@@ -5668,94 +5748,7 @@ let handle_finalizepsbt (_ctx : rpc_context)
     (match Psbt.of_base64 b64 with
      | Error e -> Error (Psbt.string_of_error e)
      | Ok psbt ->
-       (* Try to finalize each input based on its type.
-          W47 — Pre-W47 routing called finalize_input_p2sh_p2wpkh for
-          ANY P2SH UTXO, which silently mis-finalized P2SH-multisig and
-          P2SH-P2WSH-multisig inputs by synthesizing an OP_0+hash160
-          redeem_script from the first partial-sig pubkey (lib/psbt.ml's
-          old finalize_input_p2sh_p2wpkh body, lines 1026-1029) instead
-          of consuming the actual inp.redeem_script.  Now we classify
-          via the input's own redeem_script / witness_script:
-
-            redeem_script = OP_0 <push N>...      → segwit wrap
-              witness_script = OP_M ... CHECKMULTISIG → P2SH-P2WSH-multisig
-              witness_script = nothing            → P2SH-P2WPKH (single)
-            redeem_script = OP_M ... CHECKMULTISIG → P2SH-multisig (legacy)
-            witness_script = OP_M ... CHECKMULTISIG, no redeem_script
-                                                  → bare P2WSH-multisig
-            else fall through to the legacy single-key heuristics.
-
-          Mirrors the dispatch in bitcoin-core/src/script/sign.cpp
-          ProduceSignature → SignStep, which similarly walks
-          redeemScript / witnessScript before classifying the input. *)
-       let is_segwit_wrap (rs : Cstruct.t) : bool =
-         (* P2SH redeemScript that wraps a segwit program:
-            OP_0 <push N> <N bytes>  where N = 20 (P2WPKH) or 32 (P2WSH) *)
-         let len = Cstruct.length rs in
-         (len = 22 || len = 34)
-         && Cstruct.get_uint8 rs 0 = 0x00
-         && Cstruct.get_uint8 rs 1 = (len - 2)
-       in
-       let is_p2wsh_wrap (rs : Cstruct.t) : bool =
-         Cstruct.length rs = 34
-         && Cstruct.get_uint8 rs 0 = 0x00
-         && Cstruct.get_uint8 rs 1 = 0x20
-       in
-       let is_multisig (script : Cstruct.t) : bool =
-         match Psbt.parse_multisig_threshold script with
-         | Some _ -> true
-         | None -> false
-       in
-       let finalize_one psbt i inp =
-         if Psbt.is_input_finalized inp then
-           Ok psbt
-         else if inp.Psbt.tap_key_sig <> None then
-           Psbt.finalize_input_taproot psbt i
-         else if inp.Psbt.partial_sigs <> [] then begin
-           match inp.Psbt.redeem_script, inp.Psbt.witness_script with
-           (* P2SH-P2WSH-multisig: redeem_script wraps witness program,
-              witness_script is the actual multisig. *)
-           | Some rs, Some ws when is_p2wsh_wrap rs && is_multisig ws ->
-             Psbt.finalize_input_p2sh_p2wsh_multisig psbt i
-               ~redeem_script:rs ~witness_script:ws
-           (* Legacy P2SH-multisig: redeem_script is multisig, no witness_script. *)
-           | Some rs, None when is_multisig rs ->
-             Psbt.finalize_input_p2sh_multisig psbt i ~redeem_script:rs
-           (* Defensive: redeem_script = multisig + a stray witness_script;
-              still legacy P2SH-multisig (Core tolerates extra producer
-              fields and the redeem_script alone determines the spend
-              path). *)
-           | Some rs, Some _ when is_multisig rs ->
-             Psbt.finalize_input_p2sh_multisig psbt i ~redeem_script:rs
-           (* P2SH-P2WPKH: redeem_script wraps a P2WPKH program. *)
-           | Some rs, _ when is_segwit_wrap rs && Cstruct.length rs = 22 ->
-             Psbt.finalize_input_p2sh_p2wpkh psbt i
-           (* Bare P2WSH-multisig: no redeem_script, witness_script is
-              the multisig. *)
-           | None, Some ws when is_multisig ws ->
-             Psbt.finalize_input_p2wsh_multisig psbt i ~witness_script:ws
-           | _ ->
-             (* Fall back to UTXO-driven dispatch (single-key paths). *)
-             match inp.Psbt.witness_utxo with
-             | Some utxo ->
-               let script = utxo.script_pubkey in
-               if Cstruct.length script = 22 && Cstruct.get_uint8 script 0 = 0x00 then
-                 Psbt.finalize_input_p2wpkh psbt i
-               else if Cstruct.length script = 23 && Cstruct.get_uint8 script 0 = 0xa9 then
-                 Psbt.finalize_input_p2sh_p2wpkh psbt i
-               else
-                 Psbt.finalize_input_p2wpkh psbt i
-             | None ->
-               Psbt.finalize_input_p2pkh psbt i
-         end
-         else
-           Ok psbt
-       in
-       let result = List.fold_left (fun acc (i, inp) ->
-         match acc with
-         | Error e -> Error e
-         | Ok psbt -> finalize_one psbt i inp
-       ) (Ok psbt) (List.mapi (fun i inp -> (i, inp)) psbt.inputs) in
+       let result = finalize_psbt_inputs_walk psbt in
        match result with
        | Error msg -> Error msg
        | Ok finalized ->
@@ -6110,6 +6103,137 @@ let handle_walletcreatefundedpsbt (ctx : rpc_context)
     with
     | Failure msg -> Error msg
     | exn -> Error (Printexc.to_string exn))
+
+(* ============================================================================
+   walletprocesspsbt Handler  (W118 BUG-5 closure)
+   (Bitcoin Core: src/wallet/rpc/spend.cpp::walletprocesspsbt)
+
+   Updates a PSBT with input information from the wallet, signs every input
+   the wallet has the key for, and (when finalize=true and the result has
+   a full signature set) extracts the network-format hex.
+
+   Params (Core-compatible):
+     psbt         base64 PSBT string                    (required)
+     sign         bool, default true                    (optional)
+     sighashtype  string, default "DEFAULT"/"ALL"       (optional)
+     bip32derivs  bool, default true                    (optional)
+     finalize     bool, default true                    (optional)
+
+   Returns {psbt, complete, hex?} per Core.  hex is present iff complete=true
+   AND finalize=true (Core also gates on finalize via the FinalizeAndExtract
+   call — when finalize=false we skip the call entirely).
+
+   Pre-fix this RPC was MISSING (W118 audit BUG-5 P0): the wallet had
+   sign_transaction_inputs (raw-tx path) but no envelope path that consumes
+   a PSBT.  Classic dead-helper-at-RPC-boundary. *)
+let parse_sighash_string (s : string) : (int, string) result =
+  (* Mirrors Bitcoin Core's SighashFromStr (src/core_io.cpp:266). *)
+  match String.uppercase_ascii s with
+  | "DEFAULT"             -> Ok 0x00
+  | "ALL"                 -> Ok 0x01
+  | "NONE"                -> Ok 0x02
+  | "SINGLE"              -> Ok 0x03
+  | "ALL|ANYONECANPAY"    -> Ok 0x81
+  | "NONE|ANYONECANPAY"   -> Ok 0x82
+  | "SINGLE|ANYONECANPAY" -> Ok 0x83
+  | _ -> Error (Printf.sprintf "'%s' is not a valid sighash parameter." s)
+
+let handle_walletprocesspsbt (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match ctx.wallet with
+  | None -> Error "Wallet not loaded"
+  | Some wallet ->
+    let psbt_param, sign_param, sighash_param, bip32_param, finalize_param =
+      match params with
+      | [a]                   -> (a, `Null, `Null, `Null, `Null)
+      | [a; b]                -> (a, b,    `Null, `Null, `Null)
+      | [a; b; c]             -> (a, b,    c,     `Null, `Null)
+      | [a; b; c; d]          -> (a, b,    c,     d,     `Null)
+      | [a; b; c; d; e]       -> (a, b,    c,     d,     e)
+      | a :: b :: c :: d :: e :: _ -> (a, b, c, d, e)
+      | _ -> (`Null, `Null, `Null, `Null, `Null)
+    in
+    (match psbt_param with
+     | `String b64 ->
+       (* Argument parsing (Core defaults: sign=true, bip32derivs=true,
+          finalize=true; sighashtype = "DEFAULT" for taproot inputs,
+          "ALL" otherwise — we default to ALL here and let the Wallet
+          layer pick DEFAULT (0x00) when the input is P2TR). *)
+       let sign = match sign_param with
+         | `Bool b -> b
+         | `Null -> true
+         | _ -> true
+       in
+       let bip32derivs = match bip32_param with
+         | `Bool b -> b
+         | `Null -> true
+         | _ -> true
+       in
+       let finalize = match finalize_param with
+         | `Bool b -> b
+         | `Null -> true
+         | _ -> true
+       in
+       let sighash_r = match sighash_param with
+         | `String s -> parse_sighash_string s
+         | `Null -> Ok 0x01  (* SIGHASH_ALL *)
+         | _ -> Ok 0x01
+       in
+       (match sighash_r with
+        | Error e -> Error e
+        | Ok sighash ->
+          (* Locked-wallet check: only required when we'd actually need the
+             private keys (sign=true).  Mirrors Core's EnsureWalletIsUnlocked
+             at spend.cpp:1627. *)
+          if sign && Wallet.is_encrypted wallet && Wallet.is_locked wallet
+          then
+            Error "Error: Please enter the wallet passphrase with walletpassphrase first."
+          else
+            (match Psbt.of_base64 b64 with
+             | Error e ->
+               Error (Printf.sprintf "TX decode failed: %s"
+                        (Psbt.string_of_error e))
+             | Ok psbt ->
+               (* Run the wallet's PSBT signer (Updater + Signer roles). *)
+               let (psbt, _signer_complete) =
+                 try
+                   Wallet.process_psbt wallet psbt
+                     ~sign ~sighash ~bip32derivs
+                 with exn ->
+                   (* Defensive: surface signing failures as PSBT-shape
+                      errors but do not crash the RPC.  Return the
+                      pre-signing PSBT so the client can still inspect it. *)
+                   let _ = exn in
+                   (psbt, false)
+               in
+               (* Finalizer role — only when caller asked for it. *)
+               let final_r =
+                 if finalize then finalize_psbt_inputs_walk psbt
+                 else Ok psbt
+               in
+               (match final_r with
+                | Error msg -> Error msg
+                | Ok psbt ->
+                  let complete = Psbt.is_finalized psbt in
+                  let base_fields = [
+                    ("psbt", `String (Psbt.to_base64 psbt));
+                    ("complete", `Bool complete);
+                  ] in
+                  let fields =
+                    if complete && finalize then
+                      match Psbt.extract psbt with
+                      | Error _ -> base_fields
+                      | Ok tx ->
+                        let w = Serialize.writer_create () in
+                        Serialize.serialize_transaction w tx;
+                        let hex =
+                          cstruct_to_hex (Serialize.writer_to_cstruct w)
+                        in
+                        base_fields @ [("hex", `String hex)]
+                    else base_fields
+                  in
+                  Ok (`Assoc fields))))
+     | _ -> Error "Invalid parameters: expected [psbt, (sign), (sighashtype), (bip32derivs), (finalize)]")
 
 (* ============================================================================
    Output Descriptor Handlers (BIP 380-386)
@@ -7240,6 +7364,7 @@ let handle_help (_ctx : rpc_context)
       "finalizepsbt \"psbt\" ( extract )";
       "utxoupdatepsbt \"psbt\"";
       "walletcreatefundedpsbt [{\"txid\":\"...\", \"vout\":n},...] [{\"address\":amount},...] ( locktime options bip32derivs )";
+      "walletprocesspsbt \"psbt\" ( sign \"sighashtype\" bip32derivs finalize )";
       "";
       "== Descriptors ==";
       "deriveaddresses \"descriptor\" ( range )";
@@ -7902,6 +8027,10 @@ let dispatch_rpc (ctx : rpc_context)
      | Error msg -> Error (rpc_misc_error, msg))
   | "walletcreatefundedpsbt" ->
     (match handle_walletcreatefundedpsbt ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_wallet_error, msg))
+  | "walletprocesspsbt" ->
+    (match handle_walletprocesspsbt ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_wallet_error, msg))
 

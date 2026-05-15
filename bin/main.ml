@@ -271,6 +271,48 @@ let asmap_arg =
   Arg.(value & opt (some string) None &
     info ["asmap"] ~docv:"FILE" ~doc)
 
+(* W117 BUG-2 fix (FIX-56): outbound proxy / overlay routing flags. *)
+let proxy_arg =
+  let doc = "Default SOCKS5 proxy for outbound TCP dials. Accepts either \
+             a bare 'host:port' string (Bitcoin Core syntax) or a full \
+             'socks5://host:port' / 'socks5://user:pass@host:port' URL. \
+             Used for IPv4/IPv6 peers and (when --onion is not set) for \
+             .onion peers too. Default: off (direct clearnet \
+             connections). Mirrors Bitcoin Core's -proxy flag." in
+  Arg.(value & opt (some string) None &
+    info ["proxy"] ~docv:"HOST:PORT" ~doc)
+
+let onion_arg =
+  let doc = "Dedicated SOCKS5 proxy for .onion (Tor v3) hidden-service \
+             dials. When set, overrides --proxy for .onion routing and \
+             enables Tor stream-isolation (random SOCKS5 credentials per \
+             circuit). Accepts 'host:port' or 'socks5://...'. Default: \
+             off (.onion dials use the --proxy default; if neither flag \
+             is set, .onion peers are unreachable). Mirrors Bitcoin \
+             Core's -onion flag." in
+  Arg.(value & opt (some string) None &
+    info ["onion"] ~docv:"HOST:PORT" ~doc)
+
+let i2psam_arg =
+  let doc = "I2P SAM 3.1 bridge endpoint (host:port) for .b32.i2p dials. \
+             When set, outbound dials to I2P destinations go through the \
+             SAM session; without this flag, .b32.i2p peers are \
+             unreachable. The standard I2P SAM port is 7656. Mirrors \
+             Bitcoin Core's -i2psam flag." in
+  Arg.(value & opt (some string) None &
+    info ["i2psam"] ~docv:"HOST:PORT" ~doc)
+
+let cjdnsreachable_arg =
+  let doc = "Assert that this host can route directly into the CJDNS \
+             overlay (fc00::/8). When set, outbound dials to fc00::/8 \
+             addresses are issued as direct TCP connects (the operator \
+             is expected to have cjdroute running and a kernel route in \
+             place). When unset (default), CJDNS dials are rejected by \
+             the proxy layer to avoid leaking the dial intent over the \
+             clearnet default route. Mirrors Bitcoin Core's \
+             -cjdnsreachable flag." in
+  Arg.(value & flag & info ["cjdnsreachable"] ~doc)
+
 (* ============================================================================
    Main Command
    ============================================================================ *)
@@ -280,7 +322,8 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     import_blocks import_utxo metrics_port peer_bloom_filters
     migrate_logstorage daemon_mode pid_path conf_path debug_cats
     logfile printtoconsole ready_fd zmq_pub reindex
-    rest_enabled rest_port rest_bind blockfilterindex asmap =
+    rest_enabled rest_port rest_bind blockfilterindex asmap
+    proxy onion_proxy i2psam cjdnsreachable =
   (* Resolve datadir early so config-file lookup can default to it. *)
   let base = Camlcoin.Cli.config_for_network network in
   let resolved_datadir = match datadir with
@@ -584,6 +627,22 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       asmap_path = (match asmap with
         | Some _ -> asmap
         | None -> Camlcoin.Runtime_config.get_string conf_opts "asmap");
+      (* W117 BUG-2 fix (FIX-56): outbound proxy / overlay routing.
+         CLI flags win over conf-file values, conf wins over [None]. *)
+      proxy = (match proxy with
+        | Some _ -> proxy
+        | None -> Camlcoin.Runtime_config.get_string conf_opts "proxy");
+      onion = (match onion_proxy with
+        | Some _ -> onion_proxy
+        | None -> Camlcoin.Runtime_config.get_string conf_opts "onion");
+      i2psam = (match i2psam with
+        | Some _ -> i2psam
+        | None -> Camlcoin.Runtime_config.get_string conf_opts "i2psam");
+      cjdns_reachable =
+        cjdnsreachable
+        || (match Camlcoin.Runtime_config.get_bool conf_opts "cjdnsreachable" with
+            | Some b -> b
+            | None -> false);
     } in
     (* Ensure datadir exists so we can land the PID file there. *)
     (try Unix.mkdir resolved_datadir 0o755
@@ -685,7 +744,11 @@ let cmd =
     $ rest_port_arg
     $ rest_bind_arg
     $ blockfilterindex_arg
-    $ asmap_arg)
+    $ asmap_arg
+    $ proxy_arg
+    $ onion_arg
+    $ i2psam_arg
+    $ cjdnsreachable_arg)
 
 (* ============================================================================
    Entry Point

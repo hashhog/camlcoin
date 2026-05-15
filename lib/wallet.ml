@@ -1367,6 +1367,294 @@ let sign_transaction_inputs (w : t) (tx : Types.transaction)
   let witnesses = List.map snd signed_inputs_and_witnesses in
   { tx with inputs; witnesses }
 
+(* ============================================================================
+   PSBT processing — the Signer + Updater role per BIP-174.
+
+   Walks a PSBT input by input, fills witness_utxo / bip32 derivation data
+   the wallet knows, and (when sign=true) creates a partial signature for
+   every input the wallet has the key for.  Mirrors Bitcoin Core's
+   CWallet::FillPSBT (src/wallet/scriptpubkeyman.cpp::FillPSBT +
+   src/script/sign.cpp::SignPSBTInput).
+
+   Inputs:
+     w           wallet (must be unlocked when sign=true)
+     psbt        the PSBT to update
+     sign        if true, produce partial sigs / tap_key_sig
+     sighash     sighash type to use when the input has none (default 0x01
+                 for legacy/segwit, 0x00 SIGHASH_DEFAULT for taproot)
+     bip32derivs if true, attach bip32_derivation records for the wallet
+                 keys we touched
+     finalize    [unused at the Wallet layer — RPC handler walks
+                 Psbt.finalize_input_* after this returns]
+
+   Returns (psbt', complete) where complete=true iff every input is either
+   already-finalized or has enough partial sigs to be finalized for its
+   script type.
+
+   Reference: bitcoin-core/src/wallet/rpc/spend.cpp::walletprocesspsbt;
+              src/wallet/scriptpubkeyman.cpp::FillPSBT. *)
+let process_psbt
+    (w : t)
+    (psbt : Psbt.psbt)
+    ~(sign : bool)
+    ~(sighash : int)
+    ~(bip32derivs : bool)
+    : Psbt.psbt * bool =
+  let tx = psbt.Psbt.tx in
+  (* Collect the per-input UTXO (for value + scriptPubKey).  Prefer the
+     witness_utxo when present (BIP-174 says it's authoritative for segwit
+     inputs); otherwise project the non_witness_utxo's vout. *)
+  let prevout_at (inp : Psbt.psbt_input) (tx_in : Types.tx_in)
+      : Types.tx_out option =
+    match inp.witness_utxo with
+    | Some o -> Some o
+    | None ->
+      match inp.non_witness_utxo with
+      | Some prev_tx ->
+        let vout_idx = Int32.to_int tx_in.previous_output.vout in
+        (try Some (List.nth prev_tx.outputs vout_idx)
+         with _ -> None)
+      | None -> None
+  in
+  (* Compute the master fingerprint once (or 0 if no master key — same as
+     Core when the wallet has no HD seed). *)
+  let fingerprint = match w.master_key with
+    | Some mk -> fingerprint_of_key mk
+    | None -> 0l
+  in
+  let make_derivation (pubkey : Cstruct.t) : Psbt.bip32_derivation =
+    { pubkey;
+      origin = { fingerprint; path = [] };
+    }
+  in
+  (* Look up the wallet's owning keypair (if any) for a given scriptPubKey.
+     Reuses [is_mine] for P2WPKH/P2PKH/P2TR, and [is_mine_p2sh_p2wpkh] for
+     the P2SH-P2WPKH wrap case. *)
+  let wallet_kp_for (script_pubkey : Cstruct.t) : key_pair option =
+    match is_mine w script_pubkey with
+    | Some kp -> Some kp
+    | None -> is_mine_p2sh_p2wpkh w script_pubkey
+  in
+  (* Try to derive the scriptPubKey under which the input is claimed —
+     either the direct prevout SPK, or, for P2SH-P2WPKH, the wrapped P2WPKH
+     program from the redeem_script.  For sighash computation we need the
+     "scriptCode" appropriate to the spend path. *)
+  let process_one (i : int) (inp : Psbt.psbt_input) : Psbt.psbt_input * bool =
+    let tx_in = List.nth tx.inputs i in
+    (* If the input is already finalized, leave it alone. *)
+    if Psbt.is_input_finalized inp then (inp, true)
+    else
+      match prevout_at inp tx_in with
+      | None ->
+        (* No UTXO info — can't sign and can't finalize. *)
+        (inp, false)
+      | Some utxo_out ->
+        let value = utxo_out.value in
+        let spk = utxo_out.script_pubkey in
+        match wallet_kp_for spk with
+        | None ->
+          (* Not the wallet's input.  Still attach the witness_utxo we
+             derived so downstream tooling has it.  Cannot sign. *)
+          let inp = match inp.witness_utxo with
+            | Some _ -> inp
+            | None -> { inp with witness_utxo = Some utxo_out }
+          in
+          (inp, false)
+        | Some kp ->
+          let script_type = Script.classify_script spk in
+          (* Resolve the effective sighash byte.  PSBT may override via
+             inp.sighash_type; otherwise use the caller-supplied default.
+             Taproot defaults to SIGHASH_DEFAULT (0x00) per BIP-341. *)
+          let is_taproot = match script_type with
+            | Script.P2TR_script _ -> true
+            | _ -> false
+          in
+          let hash_type =
+            match inp.sighash_type with
+            | Some s -> Int32.to_int s
+            | None ->
+              if is_taproot then 0x00 else sighash
+          in
+          (* Build the bip32 derivation record (best-effort: path empty
+             when wallet doesn't track per-key derivation path). *)
+          let inp =
+            if bip32derivs then begin
+              if is_taproot then
+                let xonly = Crypto.derive_xonly_pubkey kp.private_key in
+                let tap_d : Psbt.tap_bip32_derivation = {
+                  xonly_pubkey = xonly;
+                  leaf_hashes = [];
+                  origin = { fingerprint; path = [] };
+                } in
+                let exists = List.exists (fun (d : Psbt.tap_bip32_derivation) ->
+                  Cstruct.equal d.xonly_pubkey xonly
+                ) inp.tap_bip32_derivations in
+                if exists then inp
+                else { inp with
+                  tap_bip32_derivations =
+                    tap_d :: inp.tap_bip32_derivations }
+              else
+                let d = make_derivation kp.public_key in
+                let exists = List.exists (fun (d2 : Psbt.bip32_derivation) ->
+                  Cstruct.equal d2.pubkey kp.public_key
+                ) inp.bip32_derivations in
+                if exists then inp
+                else { inp with
+                  bip32_derivations = d :: inp.bip32_derivations }
+            end else inp
+          in
+          (* Ensure witness_utxo is present (segwit) — Core fills this when
+             the wallet learns the prevout. *)
+          let inp = match inp.witness_utxo with
+            | Some _ -> inp
+            | None ->
+              (* P2PKH is legacy: non_witness_utxo is what it needs.  For
+                 segwit shapes (P2WPKH, P2TR, P2SH-P2WPKH, P2WSH) attach
+                 witness_utxo. *)
+              (match script_type with
+               | Script.P2PKH_script _ -> inp
+               | _ -> { inp with witness_utxo = Some utxo_out })
+          in
+          (* Sign it. *)
+          if not sign then
+            (* Updater-only path: no partial sig produced.  "complete" is
+               false because we didn't sign. *)
+            (inp, false)
+          else begin
+            match script_type with
+            | Script.P2WPKH_script pkh ->
+              (* BIP-143: scriptCode = OP_DUP OP_HASH160 <pkh>
+                 OP_EQUALVERIFY OP_CHECKSIG. *)
+              let script_code = build_p2pkh_script pkh in
+              let h =
+                Script.compute_sighash_segwit
+                  tx i script_code value hash_type
+              in
+              let der = Crypto.sign kp.private_key h in
+              let ht = Cstruct.create 1 in
+              Cstruct.set_uint8 ht 0 hash_type;
+              let sig_with_ht = Cstruct.concat [der; ht] in
+              let ps : Psbt.partial_sig = {
+                pubkey = kp.public_key;
+                signature = sig_with_ht;
+              } in
+              let exists = List.exists (fun (p : Psbt.partial_sig) ->
+                Cstruct.equal p.pubkey kp.public_key
+              ) inp.partial_sigs in
+              let inp =
+                if exists then inp
+                else { inp with partial_sigs = ps :: inp.partial_sigs }
+              in
+              (inp, true)
+            | Script.P2PKH_script _ ->
+              (* Legacy: sighash over the scriptPubKey itself. *)
+              let h =
+                Script.compute_sighash_legacy tx i spk hash_type
+              in
+              let der = Crypto.sign kp.private_key h in
+              let ht = Cstruct.create 1 in
+              Cstruct.set_uint8 ht 0 hash_type;
+              let sig_with_ht = Cstruct.concat [der; ht] in
+              let ps : Psbt.partial_sig = {
+                pubkey = kp.public_key;
+                signature = sig_with_ht;
+              } in
+              let exists = List.exists (fun (p : Psbt.partial_sig) ->
+                Cstruct.equal p.pubkey kp.public_key
+              ) inp.partial_sigs in
+              let inp =
+                if exists then inp
+                else { inp with partial_sigs = ps :: inp.partial_sigs }
+              in
+              (inp, true)
+            | Script.P2TR_script _ ->
+              (* BIP-341 key-path spend.  Sign the tweaked key with
+                 SIGHASH_DEFAULT (0x00) by default. *)
+              (* Build the prevouts array required for the taproot sighash —
+                 must cover every input.  Use whatever utxo info each input
+                 already carries; abort signing this input if any is
+                 missing. *)
+              let prevouts =
+                List.mapi (fun j ti ->
+                  let inp_j = List.nth psbt.inputs j in
+                  prevout_at inp_j ti
+                ) tx.inputs
+              in
+              if List.exists Option.is_none prevouts then
+                (inp, false)
+              else
+                let prevs = List.map (fun o ->
+                  let o = Option.get o in
+                  (o.Types.value, o.Types.script_pubkey)
+                ) prevouts in
+                let h =
+                  Script.compute_sighash_taproot tx i prevs hash_type ()
+                in
+                let xonly_pk = Crypto.derive_xonly_pubkey kp.private_key in
+                let tweak =
+                  Crypto.compute_taptweak_keypath xonly_pk
+                in
+                let raw_sig =
+                  Crypto.schnorr_sign_tweaked
+                    ~privkey:kp.private_key ~tweak ~msg:h
+                in
+                (* SIGHASH_DEFAULT → bare 64-byte signature; non-default
+                   appends the hashtype byte to make 65. *)
+                let sig_bytes =
+                  if hash_type = 0x00 then raw_sig
+                  else
+                    let ht = Cstruct.create 1 in
+                    Cstruct.set_uint8 ht 0 hash_type;
+                    Cstruct.concat [raw_sig; ht]
+                in
+                let inp = { inp with tap_key_sig = Some sig_bytes } in
+                (inp, true)
+            | Script.P2SH_script _ ->
+              (* Currently only the P2SH-P2WPKH-wrap shape is signable
+                 here (same restriction as sign_transaction_inputs).  We
+                 inject the redeem_script (OP_0 <pkh>) and sign as
+                 P2WPKH per BIP-143. *)
+              let pkh = Crypto.hash160 kp.public_key in
+              let redeem = build_p2wpkh_script pkh in
+              let inp =
+                match inp.redeem_script with
+                | Some _ -> inp
+                | None -> { inp with redeem_script = Some redeem }
+              in
+              let script_code = build_p2pkh_script pkh in
+              let h =
+                Script.compute_sighash_segwit
+                  tx i script_code value hash_type
+              in
+              let der = Crypto.sign kp.private_key h in
+              let ht = Cstruct.create 1 in
+              Cstruct.set_uint8 ht 0 hash_type;
+              let sig_with_ht = Cstruct.concat [der; ht] in
+              let ps : Psbt.partial_sig = {
+                pubkey = kp.public_key;
+                signature = sig_with_ht;
+              } in
+              let exists = List.exists (fun (p : Psbt.partial_sig) ->
+                Cstruct.equal p.pubkey kp.public_key
+              ) inp.partial_sigs in
+              let inp =
+                if exists then inp
+                else { inp with partial_sigs = ps :: inp.partial_sigs }
+              in
+              (inp, true)
+            | _ ->
+              (* Unsupported script type for wallet PSBT signer.  Leave
+                 the input untouched; complete=false. *)
+              (inp, false)
+          end
+  in
+  let processed =
+    List.mapi process_one psbt.inputs
+  in
+  let new_inputs = List.map fst processed in
+  let all_signable = List.for_all snd processed in
+  ({ psbt with inputs = new_inputs }, all_signable)
+
 (* Build output script from an address *)
 let build_output_script (dest_addr : Address.address) : Cstruct.t =
   match dest_addr.Address.addr_type with

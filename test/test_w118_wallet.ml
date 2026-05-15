@@ -134,6 +134,52 @@ let empty_block_with txs : Types.block =
                nonce = 0l };
     transactions = txs }
 
+(* RPC test context for the walletprocesspsbt envelope tests.
+
+   Each call wipes /tmp/camlcoin_w118_rpc_<pid>/ to keep a stable, isolated
+   ChainDB.  Matches the pattern in test_rpc.ml::create_test_context. *)
+let psbt_test_db_path () =
+  Printf.sprintf "/tmp/camlcoin_w118_psbt_db_%d_%f"
+    (Unix.getpid ()) (Unix.gettimeofday ())
+
+let make_psbt_test_ctx ~(wallet : Wallet.t) : Rpc.rpc_context =
+  let db_path = psbt_test_db_path () in
+  let rec rm_rf path =
+    if Sys.file_exists path then begin
+      if Sys.is_directory path then begin
+        Array.iter
+          (fun f -> rm_rf (Filename.concat path f))
+          (Sys.readdir path);
+        Unix.rmdir path
+      end else
+        Unix.unlink path
+    end
+  in
+  rm_rf db_path;
+  let db = Storage.ChainDB.create db_path in
+  let utxo = Utxo.UtxoSet.create db in
+  let mp =
+    Mempool.create
+      ~require_standard:false
+      ~verify_scripts:false
+      ~utxo
+      ~current_height:100
+      ()
+  in
+  let chain = Sync.create_chain_state db Consensus.regtest in
+  let pm = Peer_manager.create Consensus.regtest in
+  let fe = Fee_estimation.create () in
+  { chain;
+    mempool = mp;
+    peer_manager = pm;
+    wallet = Some wallet;
+    wallet_manager = None;
+    fee_estimator = fe;
+    network = Consensus.regtest;
+    filter_index = None;
+    utxo = None;
+    data_dir = None; }
+
 (* ============================================================================
    G1 – G6: Descriptors
    ============================================================================ *)
@@ -386,12 +432,17 @@ let test_g13_psbt_v0_roundtrip () =
      Alcotest.(check int) "G13 input count preserved" 1 (List.length p.inputs);
      Alcotest.(check int) "G13 output count preserved" 1 (List.length p.outputs))
 
-(* G14: BUG-5 — wallet PSBT signer is absent.
-   Verify there is no `Wallet.process_psbt`/`walletprocesspsbt` API.
-   We can construct a PSBT by hand and use Psbt.add_partial_sig (the
-   programmatic surface) — but there's no integration with Wallet.t to
-   add sigs for every input it can sign. *)
-let test_g14_wallet_psbt_signer_absent_bug () =
+(* G14: BUG-5 fix verification — wallet PSBT signer round-trip.
+
+   Pre-fix: Wallet.process_psbt and the walletprocesspsbt RPC did not
+   exist, so a PSBT round-trip through the wallet was a no-op (zero
+   partial sigs added).  Post-fix: Wallet.process_psbt fills witness_utxo,
+   produces a partial_sig for every input the wallet owns, optionally
+   finalizes, and reports complete=true when all inputs are signed.
+
+   Reference: bitcoin-core/src/wallet/rpc/spend.cpp::walletprocesspsbt;
+              CWallet::FillPSBT (scriptpubkeyman.cpp). *)
+let test_g14_walletprocesspsbt_roundtrip () =
   let w = Wallet.create ~network:`Regtest ~db_path:"" in
   let kp = Wallet.generate_key w in
   let pkh = Crypto.hash160 kp.public_key in
@@ -399,8 +450,6 @@ let test_g14_wallet_psbt_signer_absent_bug () =
   let value = 100_000L in
   let funding_tx = make_one_output_tx script value in
   Wallet.scan_block w (empty_block_with [funding_tx]) 100;
-  (* Build a PSBT manually that the wallet *should* be able to sign,
-     but there is no Wallet API that takes a PSBT and signs. *)
   let txid = Crypto.compute_txid funding_tx in
   let spending : Types.transaction = {
     version = 2l;
@@ -416,10 +465,193 @@ let test_g14_wallet_psbt_signer_absent_bug () =
   let psbt = Psbt.create spending in
   let utxo : Types.tx_out = { value; script_pubkey = script } in
   let psbt = Psbt.add_witness_utxo psbt 0 utxo in
-  (* Document: input has zero partial sigs and there's no wallet hook to add one *)
-  let inp = List.hd psbt.inputs in
-  Alcotest.(check int) "G14 no partial sigs (no wallet PSBT-signer)" 0
-    (List.length inp.partial_sigs)
+  (* Pre-fix expectation (now flipped): there WAS no Wallet.process_psbt
+     to call.  Post-fix: the signer must add exactly one partial sig
+     for the input we own. *)
+  let (signed, complete) =
+    Wallet.process_psbt w psbt ~sign:true ~sighash:0x01 ~bip32derivs:true
+  in
+  Alcotest.(check bool) "G14 wallet signer reports complete" true complete;
+  let inp = List.hd signed.inputs in
+  Alcotest.(check int) "G14 one partial sig produced" 1
+    (List.length inp.partial_sigs);
+  let ps = List.hd inp.partial_sigs in
+  Alcotest.(check bool) "G14 partial sig pubkey matches wallet key" true
+    (Cstruct.equal ps.pubkey kp.public_key);
+  (* The signature payload is DER+hashtype: at least 8 bytes for DER + 1
+     hashtype byte. *)
+  Alcotest.(check bool) "G14 signature has DER+hashtype suffix" true
+    (Cstruct.length ps.signature > 8 &&
+     Cstruct.get_uint8 ps.signature (Cstruct.length ps.signature - 1) = 0x01)
+
+(* G14b: missing-key path.  PSBT references a foreign UTXO the wallet
+   does not own — process_psbt must NOT sign, must NOT crash, and must
+   report complete=false. *)
+let test_g14b_walletprocesspsbt_missing_key () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let _ours = Wallet.generate_key w in
+  (* Build a foreign keypair the wallet does NOT have *)
+  let foreign_priv = mk_privkey 0x77 in
+  let foreign_pub  = Crypto.derive_public_key ~compressed:true foreign_priv in
+  let foreign_pkh  = Crypto.hash160 foreign_pub in
+  let foreign_spk  = make_p2wpkh_script foreign_pkh in
+  let foreign_value = 200_000L in
+  let foreign_funding = make_one_output_tx foreign_spk foreign_value in
+  let foreign_txid = Crypto.compute_txid foreign_funding in
+  let spending : Types.transaction = {
+    version = 2l;
+    inputs = [{
+      previous_output = { txid = foreign_txid; vout = 0l };
+      script_sig = Cstruct.create 0;
+      sequence = 0xFFFFFFFEl;
+    }];
+    outputs = [{ value = 150_000L; script_pubkey = foreign_spk }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let psbt = Psbt.create spending in
+  let utxo : Types.tx_out =
+    { value = foreign_value; script_pubkey = foreign_spk } in
+  let psbt = Psbt.add_witness_utxo psbt 0 utxo in
+  let (signed, complete) =
+    Wallet.process_psbt w psbt ~sign:true ~sighash:0x01 ~bip32derivs:true
+  in
+  Alcotest.(check bool) "G14b foreign input → not complete" false complete;
+  let inp = List.hd signed.inputs in
+  Alcotest.(check int) "G14b no partial sigs added" 0
+    (List.length inp.partial_sigs);
+  (* witness_utxo is preserved across the no-op processing *)
+  Alcotest.(check bool) "G14b witness_utxo preserved" true
+    (inp.witness_utxo <> None)
+
+(* G14c: sign=false / finalize=false — wallet attaches UTXO+bip32 derivs
+   but does NOT produce a signature, and does NOT extract a final tx. *)
+let test_g14c_walletprocesspsbt_no_sign () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let kp = Wallet.generate_key w in
+  let pkh = Crypto.hash160 kp.public_key in
+  let script = make_p2wpkh_script pkh in
+  let value = 100_000L in
+  let funding_tx = make_one_output_tx script value in
+  Wallet.scan_block w (empty_block_with [funding_tx]) 100;
+  let txid = Crypto.compute_txid funding_tx in
+  let spending : Types.transaction = {
+    version = 2l;
+    inputs = [{
+      previous_output = { txid; vout = 0l };
+      script_sig = Cstruct.create 0;
+      sequence = 0xFFFFFFFEl;
+    }];
+    outputs = [{ value = 50_000L; script_pubkey = script }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let psbt = Psbt.create spending in
+  let utxo : Types.tx_out = { value; script_pubkey = script } in
+  let psbt = Psbt.add_witness_utxo psbt 0 utxo in
+  let (updated, complete) =
+    Wallet.process_psbt w psbt ~sign:false ~sighash:0x01 ~bip32derivs:true
+  in
+  Alcotest.(check bool) "G14c sign=false → not complete" false complete;
+  let inp = List.hd updated.inputs in
+  Alcotest.(check int) "G14c no partial sigs when sign=false" 0
+    (List.length inp.partial_sigs);
+  Alcotest.(check int) "G14c bip32 derivation attached" 1
+    (List.length inp.bip32_derivations)
+
+(* G14d: locked-encrypted-wallet path through the RPC handler.  Encrypt
+   the wallet (locking it implicitly), then try walletprocesspsbt with
+   sign=true — must reject with the canonical Core error string. *)
+let test_g14d_walletprocesspsbt_locked () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let kp = Wallet.generate_key w in
+  let pkh = Crypto.hash160 kp.public_key in
+  let script = make_p2wpkh_script pkh in
+  let value = 100_000L in
+  let funding_tx = make_one_output_tx script value in
+  Wallet.scan_block w (empty_block_with [funding_tx]) 100;
+  (match Wallet.encrypt_wallet w ~passphrase:"hunter2" with
+   | Ok () -> ()
+   | Error e -> Alcotest.fail ("G14d encrypt_wallet: " ^ e));
+  (* Build a PSBT we'd otherwise be able to sign. *)
+  let txid = Crypto.compute_txid funding_tx in
+  let spending : Types.transaction = {
+    version = 2l;
+    inputs = [{
+      previous_output = { txid; vout = 0l };
+      script_sig = Cstruct.create 0;
+      sequence = 0xFFFFFFFEl;
+    }];
+    outputs = [{ value = 50_000L; script_pubkey = script }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let psbt = Psbt.create spending in
+  let utxo : Types.tx_out = { value; script_pubkey = script } in
+  let psbt = Psbt.add_witness_utxo psbt 0 utxo in
+  let b64 = Psbt.to_base64 psbt in
+  (* Build a minimal RPC context and dispatch through the real handler. *)
+  let ctx = make_psbt_test_ctx ~wallet:w in
+  let r = Rpc.handle_walletprocesspsbt ctx [`String b64] in
+  match r with
+  | Ok _ -> Alcotest.fail "G14d expected error on locked wallet"
+  | Error msg ->
+    Alcotest.(check bool)
+      "G14d error mentions passphrase / locked"
+      true
+      (let lc = String.lowercase_ascii msg in
+       (try ignore (Str.search_forward (Str.regexp_string "passphrase") lc 0);
+         true
+        with Not_found -> false)
+       ||
+       (try ignore (Str.search_forward (Str.regexp_string "locked") lc 0);
+         true
+        with Not_found -> false))
+
+(* G14e: full RPC envelope — base64 → walletprocesspsbt with sign=true
+   finalize=true → {psbt, complete=true, hex}.  Hex must be parseable
+   as a real transaction. *)
+let test_g14e_walletprocesspsbt_rpc_envelope () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let kp = Wallet.generate_key w in
+  let pkh = Crypto.hash160 kp.public_key in
+  let script = make_p2wpkh_script pkh in
+  let value = 100_000L in
+  let funding_tx = make_one_output_tx script value in
+  Wallet.scan_block w (empty_block_with [funding_tx]) 100;
+  let txid = Crypto.compute_txid funding_tx in
+  let spending : Types.transaction = {
+    version = 2l;
+    inputs = [{
+      previous_output = { txid; vout = 0l };
+      script_sig = Cstruct.create 0;
+      sequence = 0xFFFFFFFEl;
+    }];
+    outputs = [{ value = 50_000L; script_pubkey = script }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let psbt = Psbt.create spending in
+  let utxo : Types.tx_out = { value; script_pubkey = script } in
+  let psbt = Psbt.add_witness_utxo psbt 0 utxo in
+  let b64 = Psbt.to_base64 psbt in
+  let ctx = make_psbt_test_ctx ~wallet:w in
+  match Rpc.handle_walletprocesspsbt ctx [`String b64] with
+  | Error e -> Alcotest.fail ("G14e RPC failed: " ^ e)
+  | Ok (`Assoc fields) ->
+    let complete = match List.assoc_opt "complete" fields with
+      | Some (`Bool b) -> b | _ -> false
+    in
+    Alcotest.(check bool) "G14e complete=true" true complete;
+    let hex_present = List.mem_assoc "hex" fields in
+    Alcotest.(check bool) "G14e hex present when complete+finalize" true
+      hex_present;
+    let psbt_b64 = match List.assoc_opt "psbt" fields with
+      | Some (`String s) -> s | _ -> ""
+    in
+    Alcotest.(check bool) "G14e psbt field non-empty" true
+      (String.length psbt_b64 > 0)
+  | Ok _ -> Alcotest.fail "G14e expected JSON object result"
 
 (* G15: PSBT finalize + extract — P2WPKH path *)
 let test_g15_psbt_finalize_extract_p2wpkh () =
@@ -871,7 +1103,12 @@ let bip32_tests = [
 
 let psbt_tests = [
   Alcotest.test_case "G13 PSBT v0 roundtrip"             `Quick test_g13_psbt_v0_roundtrip;
-  Alcotest.test_case "G14 wallet PSBT signer BUG-5"      `Quick test_g14_wallet_psbt_signer_absent_bug;
+  Alcotest.test_case "G14 walletprocesspsbt roundtrip (BUG-5 closed)"
+                                                          `Quick test_g14_walletprocesspsbt_roundtrip;
+  Alcotest.test_case "G14b walletprocesspsbt missing key" `Quick test_g14b_walletprocesspsbt_missing_key;
+  Alcotest.test_case "G14c walletprocesspsbt sign=false"  `Quick test_g14c_walletprocesspsbt_no_sign;
+  Alcotest.test_case "G14d walletprocesspsbt locked"      `Quick test_g14d_walletprocesspsbt_locked;
+  Alcotest.test_case "G14e walletprocesspsbt RPC envelope" `Quick test_g14e_walletprocesspsbt_rpc_envelope;
   Alcotest.test_case "G15 finalize+extract P2WPKH"       `Quick test_g15_psbt_finalize_extract_p2wpkh;
   Alcotest.test_case "G16 combine idempotent"            `Quick test_g16_psbt_combine_idempotent;
   Alcotest.test_case "G17 PSBT v2 rejected BUG-6"        `Quick test_g17_psbt_v2_rejected_bug;

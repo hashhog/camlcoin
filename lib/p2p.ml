@@ -3128,7 +3128,24 @@ module I2P = struct
     ) in
     "camlcoin_" ^ hex
 
-  (* SAM session state *)
+  (* SAM session state.
+
+     [transient]      — when [true], we always ask the SAM bridge for a fresh
+                        destination (DESTINATION=TRANSIENT); when [false] we
+                        try to send a persistent base64-encoded private key,
+                        falling back to TRANSIENT if none is available.
+     [private_key]    — base64-encoded persistent I2P private key, sent
+                        verbatim as the DESTINATION argument in SESSION
+                        CREATE.  When [None] (and [transient = false]) we
+                        fall back to TRANSIENT and capture the returned key
+                        so it can later be persisted (see
+                        [private_key_path]).
+     [private_key_path] — on-disk path for the persistent key.  After a
+                        successful TRANSIENT session, if [transient = false]
+                        and this is [Some p], the SAM-supplied DESTINATION
+                        (an I2P private key in the SAM reply) is written
+                        there so subsequent runs reload it.  Mirrors
+                        Bitcoin Core's i2p.cpp [m_private_key_file] flow. *)
   type session = {
     mutable control_fd : Lwt_unix.file_descr option;
     mutable control_ic : Lwt_io.input_channel option;
@@ -3139,10 +3156,40 @@ module I2P = struct
     sam_addr : string;
     sam_port : int;
     transient : bool;  (* Use transient destination? *)
+    mutable private_key : string option;
+      (* Base64-encoded persistent private key (set explicitly via the CLI
+         loader, or captured from a SAM SESSION CREATE response when we
+         requested TRANSIENT but [transient = false]). *)
+    private_key_path : string option;
+      (* Where to persist a freshly-issued private key (first run with
+         --i2p-private-key=<path> set but the file not yet present). *)
   }
 
-  (* Create a new SAM session *)
-  let create_session ~(sam_addr : string) ~(sam_port : int) ~(transient : bool) : session =
+  (* Last SAM command we sent (test hook).  Updated on every SESSION CREATE
+     so tests can verify the DESTINATION= argument without standing up a
+     mock SAM bridge.  Production code MUST NOT read this — it's a single
+     mutable cell, racy under concurrent sessions. *)
+  let last_session_create_cmd : string ref = ref ""
+
+  (* Create a new SAM session.
+
+     [transient]: when [false] we attempt persistent identity.
+     [private_key]: pass a base64-encoded private key to reuse a destination.
+     [private_key_path]: optional path to persist a freshly-issued key.
+
+     The combinations behave as:
+       transient=true                                 -> always TRANSIENT
+       transient=false, private_key=Some k            -> reuse k
+       transient=false, private_key=None              -> TRANSIENT (warn);
+         on success, captured DESTINATION is written to [private_key_path]
+         if set, so the *next* run can reload it. *)
+  let create_session
+      ~(sam_addr : string)
+      ~(sam_port : int)
+      ~(transient : bool)
+      ?(private_key : string option = None)
+      ?(private_key_path : string option = None)
+      () : session =
     {
       control_fd = None;
       control_ic = None;
@@ -3153,7 +3200,50 @@ module I2P = struct
       sam_addr;
       sam_port;
       transient;
+      private_key;
+      private_key_path;
     }
+
+  (* Read a persistent private key from disk.  Returns [None] if the file
+     does not exist or is unreadable; the caller is expected to fall back
+     to TRANSIENT in that case (with a log warning).  We trim trailing
+     whitespace/newlines so an operator-edited file ('echo "$KEY" > path')
+     still round-trips cleanly. *)
+  let load_private_key (path : string) : string option =
+    try
+      let ic = open_in path in
+      let n = in_channel_length ic in
+      let raw = really_input_string ic n in
+      close_in ic;
+      let trim_right s =
+        let len = String.length s in
+        let rec stop i =
+          if i = 0 then 0
+          else
+            let c = s.[i - 1] in
+            if c = '\n' || c = '\r' || c = ' ' || c = '\t' then stop (i - 1)
+            else i
+        in
+        String.sub s 0 (stop len)
+      in
+      let trimmed = trim_right raw in
+      if trimmed = "" then None else Some trimmed
+    with _ -> None
+
+  (* Persist a base64 private key to disk with permissions tight enough
+     that it can't be read by other users on the host (chmod 0600).  We
+     write through a temp file + rename to avoid leaving a half-written
+     file on crash. *)
+  let save_private_key (path : string) (key : string) : bool =
+    try
+      let tmp = path ^ ".tmp" in
+      let oc = open_out_gen [Open_wronly; Open_creat; Open_trunc] 0o600 tmp in
+      output_string oc key;
+      output_string oc "\n";
+      close_out oc;
+      Sys.rename tmp path;
+      true
+    with _ -> false
 
   (* Connect to SAM bridge and perform handshake *)
   let connect_sam (session : session) : (Lwt_io.input_channel * Lwt_io.output_channel * Lwt_unix.file_descr) option Lwt.t =
@@ -3185,7 +3275,33 @@ module I2P = struct
         Lwt.return None
       )
 
-  (* Initialize the session (create destination) *)
+  (* Compute the DESTINATION= argument for SESSION CREATE.
+
+     Persistent-but-no-key callers fall back to TRANSIENT here so the
+     session still establishes — the subsequent SESSION STATUS RESULT=OK
+     reply contains a fresh DESTINATION (a base64 private key) that
+     [init_session] captures and (when [private_key_path] is set) writes
+     to disk for the next run.  This is the "first run" flow that turns
+     a TRANSIENT request into a persistent identity on the *second*
+     start, matching Bitcoin Core's i2p.cpp::SwallowVerified() behaviour. *)
+  let resolve_dest_spec (session : session) : string =
+    if session.transient then "TRANSIENT"
+    else
+      match session.private_key with
+      | Some k when k <> "" -> k
+      | _ -> "TRANSIENT"
+
+  (* Initialize the session (create destination).
+
+     W117 BUG-7 (FIX-58): previously this was
+       let dest_spec = if session.transient then "TRANSIENT" else "TRANSIENT"
+     — both branches identical, so persistent destinations were impossible
+     to create even with a private key in hand.  We now route through
+     [resolve_dest_spec] which returns the base64 private key when
+     [session.private_key = Some k] and falls back to TRANSIENT
+     otherwise.  When persistent was requested but no key was supplied,
+     we capture the SAM-returned DESTINATION (the freshly-issued private
+     key) and persist it so the next run reloads the same identity. *)
   let init_session (session : session) : bool Lwt.t =
     let open Lwt.Syntax in
     let* conn = connect_sam session in
@@ -3197,11 +3313,15 @@ module I2P = struct
       session.control_oc <- Some oc;
       session.session_id <- generate_session_id ();
 
-      (* Create session with transient or persistent destination *)
-      let dest_spec = if session.transient then "TRANSIENT" else "TRANSIENT" in
+      (* Create session with transient or persistent destination.
+         BUG-7 fix: both branches of the if-else above were "TRANSIENT" —
+         we now derive the DESTINATION argument from [session.private_key]
+         so persistent identity actually works. *)
+      let dest_spec = resolve_dest_spec session in
       let cmd = Printf.sprintf "SESSION CREATE STYLE=STREAM ID=%s DESTINATION=%s SIGNATURE_TYPE=7 i2cp.leaseSetEncType=4,0 inbound.quantity=1 outbound.quantity=1"
         session.session_id dest_spec
       in
+      last_session_create_cmd := cmd;
       let* result = sam_command ic oc cmd in
       match result with
       | Error msg ->
@@ -3212,11 +3332,41 @@ module I2P = struct
         ignore msg;
         Lwt.return false
       | Ok pairs ->
-        (* Extract our destination from the reply *)
+        (* Extract our destination from the reply.  When the bridge
+           returns a DESTINATION (the private key) AND we asked for
+           a persistent identity but didn't have a key on hand, save
+           it to [private_key_path] so a future start can reload it. *)
         (match List.assoc_opt "DESTINATION" pairs with
          | Some dest ->
            session.our_dest <- dest;
-           session.our_addr <- dest_to_b32_addr dest;
+           (* The b32 derivation requires valid I2P-flavoured base64.  We
+              wrap it in a try so a malformed bridge response can't crash
+              the whole init path — log + leave [our_addr] blank instead. *)
+           (try session.our_addr <- dest_to_b32_addr dest
+            with _ ->
+              Logs.warn (fun m ->
+                m "I2P: SESSION CREATE returned a DESTINATION we could \
+                   not decode as I2P-base64; .b32.i2p address will be \
+                   empty until the bridge mints a valid key"));
+           (* First-run persistence: we asked for persistent but had no
+              key — the SAM bridge minted one for us.  Stash it. *)
+           (if (not session.transient) && session.private_key = None then begin
+              session.private_key <- Some dest;
+              match session.private_key_path with
+              | Some path ->
+                let saved = save_private_key path dest in
+                if not saved then
+                  Logs.warn (fun m ->
+                    m "I2P: failed to persist private key to %s; \
+                       destination will not survive restart" path)
+                else
+                  Logs.info (fun m ->
+                    m "I2P: persisted freshly-issued private key to %s" path)
+              | None ->
+                Logs.warn (fun m ->
+                  m "I2P: persistent destination requested but no \
+                     --i2p-private-key path; identity lost on restart")
+            end);
            Lwt.return true
          | None ->
            (* Session created but no destination returned - OK for connect-only *)
@@ -3294,6 +3444,11 @@ type proxy_type =
   | I2PSam of {
       addr : string;
       port : int;
+      private_key_path : string option;
+        (* When [Some path], use a persistent I2P destination loaded
+           from / persisted to [path]; otherwise create a TRANSIENT
+           destination on every restart (the legacy behaviour).
+           Wired by --i2p-private-key=<path>. *)
     }
 
 (* Network type for routing decisions *)
@@ -3495,9 +3650,28 @@ let connect_with_proxy ~(config : proxy_config) ~(host : string) ~(port : int)
        | Socks5.TargetError code ->
          Lwt.return (Error ("target unreachable: " ^ Socks5.reply_code_to_string code)))
 
-    | I2PSam { addr; port = sam_port } ->
-      (* I2P SAM connection *)
-      let session = I2P.create_session ~sam_addr:addr ~sam_port ~transient:true in
+    | I2PSam { addr; port = sam_port; private_key_path } ->
+      (* I2P SAM connection.
+
+         W117 BUG-7 (FIX-58): a [private_key_path] turns this from an
+         always-transient outbound dial into a persistent identity.
+         If the file exists we load it and pass it to create_session
+         so the SAM bridge reuses the existing destination; if it
+         doesn't exist we request TRANSIENT and the session will
+         persist the SAM-returned key to [private_key_path] for the
+         next run. *)
+      let private_key, transient =
+        match private_key_path with
+        | None -> None, true
+        | Some path ->
+          (match I2P.load_private_key path with
+           | Some k -> Some k, false
+           | None -> None, false)
+      in
+      let session =
+        I2P.create_session ~sam_addr:addr ~sam_port ~transient
+          ~private_key ~private_key_path ()
+      in
       let* fd_opt = I2P.connect session host in
       match fd_opt with
       | Some fd -> Lwt.return (Ok fd)
@@ -3543,13 +3717,18 @@ let parse_proxy_url (url : string) : proxy_type option =
   end else
     None
 
-(* Parse I2P SAM address: host:port *)
-let parse_i2p_sam (addr_port : string) : proxy_type option =
+(* Parse I2P SAM address: host:port.
+
+   The returned [I2PSam] carries no [private_key_path] — that's set
+   separately from the --i2p-private-key CLI flag.  See
+   [Cli.run] for the wiring. *)
+let parse_i2p_sam ?(private_key_path : string option = None)
+    (addr_port : string) : proxy_type option =
   match String.rindex_opt addr_port ':' with
   | Some pos ->
     let addr = String.sub addr_port 0 pos in
     let port_str = String.sub addr_port (pos + 1) (String.length addr_port - pos - 1) in
     (match int_of_string_opt port_str with
-     | Some port -> Some (I2PSam { addr; port })
+     | Some port -> Some (I2PSam { addr; port; private_key_path })
      | None -> None)
   | None -> None

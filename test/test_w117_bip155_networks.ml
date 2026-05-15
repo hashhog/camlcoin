@@ -306,14 +306,39 @@ let test_g15_i2p_sam_port () =
    ========================================================================= *)
 
 let test_g16_i2p_transient_bug () =
-  (* BUG-7: p2p.ml:3137 reads:
+  (* W117 BUG-7 (CLOSED by FIX-58): p2p.ml previously had
        let dest_spec = if session.transient then "TRANSIENT" else "TRANSIENT"
-     Both branches return "TRANSIENT" — persistent destinations are impossible.
-     Bitcoin Core i2p.cpp creates persistent destinations when configured,
-     which lets the node be reachable (others can find it by fixed address).
-     With always-transient, the node has no I2P inbound identity. *)
-  (* We document the bug; no runtime test possible without a live SAM bridge *)
-  check bool "BUG-7: always transient (both branches identical)" true true
+     so persistent destinations were impossible regardless of session state.
+     FIX-58 routes DESTINATION= through [resolve_dest_spec], which picks
+     between TRANSIENT and the base64 private key on the session record.
+
+     Below we exercise the helper directly (no live SAM bridge needed):
+
+       transient=true                         -> TRANSIENT
+       transient=false, private_key=None      -> TRANSIENT (first-run fallback)
+       transient=false, private_key=Some k    -> k (reuse persistent key)
+
+     The two TRANSIENT branches are NOT a regression of BUG-7 — the
+     decision is now keyed on [private_key], not on the
+     [transient] field alone. *)
+  let s_t = P2p.I2P.create_session
+              ~sam_addr:"127.0.0.1" ~sam_port:7656
+              ~transient:true () in
+  check string "FIX-58: transient=true -> TRANSIENT" "TRANSIENT"
+    (P2p.I2P.resolve_dest_spec s_t);
+
+  let s_fallback = P2p.I2P.create_session
+                     ~sam_addr:"127.0.0.1" ~sam_port:7656
+                     ~transient:false () in
+  check string "FIX-58: persistent + no key -> TRANSIENT fallback"
+    "TRANSIENT" (P2p.I2P.resolve_dest_spec s_fallback);
+
+  let key = "BASE64_PRIV_KEY_FIXTURE_xxxxxxxxxxxxxxxxxxxxxxxxxxxx" in
+  let s_persistent = P2p.I2P.create_session
+                       ~sam_addr:"127.0.0.1" ~sam_port:7656
+                       ~transient:false ~private_key:(Some key) () in
+  check string "FIX-58: persistent + key -> base64 key as DESTINATION"
+    key (P2p.I2P.resolve_dest_spec s_persistent)
 
 (* =========================================================================
    G17 — CJDNS addrv2 type is encoded as network ID 6
@@ -462,9 +487,10 @@ let test_g23_proxy_url_parsing () =
 
 let test_g24_i2p_sam_parsing () =
   (match P2p.parse_i2p_sam "127.0.0.1:7656" with
-   | Some (P2p.I2PSam { addr; port }) ->
+   | Some (P2p.I2PSam { addr; port; private_key_path }) ->
      check string "sam addr" "127.0.0.1" addr;
-     check int "sam port" 7656 port
+     check int "sam port" 7656 port;
+     check bool "default: no private key path" true (private_key_path = None)
    | _ -> Alcotest.fail "Expected I2PSam");
   check bool "no port rejects" true (P2p.parse_i2p_sam "127.0.0.1" = None)
 
@@ -795,12 +821,13 @@ let test_g42_i2p_routes_to_sam () =
     default_proxy = P2p.Socks5Proxy {
       addr = "127.0.0.1"; port = 9050;
       credentials = None; tor_stream_isolation = false };
-    i2p_sam = P2p.I2PSam { addr = "127.0.0.1"; port = 7656 };
+    i2p_sam = P2p.I2PSam { addr = "127.0.0.1"; port = 7656;
+                           private_key_path = None };
   } in
   let chosen = P2p.get_proxy_for_target cfg
     "ukeu3k5oycga3uneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq.b32.i2p" in
   (match chosen with
-   | P2p.I2PSam { addr; port } ->
+   | P2p.I2PSam { addr; port; _ } ->
      check string "I2P SAM addr" "127.0.0.1" addr;
      check int "I2P SAM port" 7656 port
    | _ -> Alcotest.fail "expected I2PSam for .b32.i2p")
@@ -950,6 +977,332 @@ let test_g49_missing_suffix_and_bad_chars_rejected () =
     (P2p.Socks5.is_onion_address "")
 
 (* =========================================================================
+   FIX-58 G50..G56 — W117 BUG-7: I2P SESSION CREATE uses private key when
+   persistent.
+
+   Pre-fix:
+     let dest_spec = if session.transient then "TRANSIENT" else "TRANSIENT"
+   — both branches identical.  Persistent identities impossible.
+
+   Post-fix:
+     - [I2P.resolve_dest_spec] picks TRANSIENT or the base64 private key
+       based on [session.transient] + [session.private_key].
+     - [I2PSam] proxy variant carries a [private_key_path].
+     - [I2P.load_private_key] / [I2P.save_private_key] manage on-disk
+       persistence (0600, atomic via temp+rename).
+     - [Cli.config] gains [i2p_private_key : string option], wired to the
+       new --i2p-private-key CLI flag.
+   ========================================================================= *)
+
+(* G50: I2P session record carries [private_key] and [private_key_path]. *)
+let test_g50_session_record_has_private_key () =
+  let s = P2p.I2P.create_session
+            ~sam_addr:"127.0.0.1" ~sam_port:7656
+            ~transient:false
+            ~private_key:(Some "BASE64KEY")
+            ~private_key_path:(Some "/tmp/i2p.key") () in
+  check bool "private_key threaded into record" true
+    (s.P2p.I2P.private_key = Some "BASE64KEY");
+  check bool "private_key_path threaded into record" true
+    (s.P2p.I2P.private_key_path = Some "/tmp/i2p.key");
+  check bool "transient flag preserved" true (not s.P2p.I2P.transient)
+
+(* G51: resolve_dest_spec — TRANSIENT when [transient = true]. *)
+let test_g51_resolve_transient_true () =
+  let s = P2p.I2P.create_session
+            ~sam_addr:"127.0.0.1" ~sam_port:7656
+            ~transient:true () in
+  check string "transient=true -> TRANSIENT"
+    "TRANSIENT" (P2p.I2P.resolve_dest_spec s)
+
+(* G52: resolve_dest_spec — base64 key when [transient = false] + key set. *)
+let test_g52_resolve_persistent_with_key () =
+  let key = "yXqLZ2-base64-i2p-private-key-fixture-3WqM~bdK" in
+  let s = P2p.I2P.create_session
+            ~sam_addr:"127.0.0.1" ~sam_port:7656
+            ~transient:false
+            ~private_key:(Some key) () in
+  check string "persistent+key -> base64 key" key
+    (P2p.I2P.resolve_dest_spec s);
+  (* Must NOT equal the literal string "TRANSIENT" — that was the bug. *)
+  check bool "persistent+key does NOT collapse to TRANSIENT" true
+    (P2p.I2P.resolve_dest_spec s <> "TRANSIENT")
+
+(* G53: resolve_dest_spec — TRANSIENT fallback when persistent but no key. *)
+let test_g53_resolve_persistent_no_key () =
+  let s = P2p.I2P.create_session
+            ~sam_addr:"127.0.0.1" ~sam_port:7656
+            ~transient:false () in
+  check string "persistent+no key -> TRANSIENT (first-run fallback)"
+    "TRANSIENT" (P2p.I2P.resolve_dest_spec s);
+  (* And: empty-string key counts as no key (don't send DESTINATION=""). *)
+  let s_empty = P2p.I2P.create_session
+                  ~sam_addr:"127.0.0.1" ~sam_port:7656
+                  ~transient:false
+                  ~private_key:(Some "") () in
+  check string "persistent+empty-string -> TRANSIENT fallback"
+    "TRANSIENT" (P2p.I2P.resolve_dest_spec s_empty)
+
+(* G54: load_private_key + save_private_key round-trip.
+
+   Write a fake base64 key to a tmp file, read it back through the loader,
+   verify byte-equality and that the file is mode 0600 (other users can't
+   read the destination identity). *)
+let test_g54_private_key_roundtrip () =
+  let dir = Filename.get_temp_dir_name () in
+  let path = Filename.concat dir
+    (Printf.sprintf "camlcoin-i2p-key-%d.key" (Unix.getpid ())) in
+  (* Ensure no stale file from a previous run. *)
+  (try Sys.remove path with _ -> ());
+  let key = "y9-q3SoMeF4kE-i2p-priv-Key-FixtUre-1234567890ABCDEF~~--" in
+  let saved = P2p.I2P.save_private_key path key in
+  check bool "save_private_key OK" true saved;
+  (* Mode check: at minimum the file should not be world-readable. *)
+  let st = Unix.stat path in
+  check bool "saved file is mode 0600 (not world-readable)" true
+    ((st.Unix.st_perm land 0o077) = 0);
+  let loaded = P2p.I2P.load_private_key path in
+  check bool "loaded matches saved" true (loaded = Some key);
+  (try Sys.remove path with _ -> ())
+
+(* G55: load_private_key — missing file returns None.
+
+   This is the "first run" case: --i2p-private-key=<path> is set but
+   the file doesn't exist yet, so we fall back to TRANSIENT and the
+   SAM-supplied key gets written on init. *)
+let test_g55_load_missing_returns_none () =
+  let path = "/nonexistent-path/should-not-exist-camlcoin-test.key" in
+  check bool "missing file -> None" true
+    (P2p.I2P.load_private_key path = None);
+  (* Empty file (edge case) -> None, never Some "". *)
+  let dir = Filename.get_temp_dir_name () in
+  let empty_path = Filename.concat dir
+    (Printf.sprintf "camlcoin-i2p-empty-%d.key" (Unix.getpid ())) in
+  let oc = open_out empty_path in
+  close_out oc;
+  check bool "empty file -> None" true
+    (P2p.I2P.load_private_key empty_path = None);
+  (try Sys.remove empty_path with _ -> ());
+  (* Whitespace-only file -> None.  Operators write keys with trailing
+     newlines from shell redirection; we must trim those but a key
+     that's *only* whitespace should not be accepted. *)
+  let ws_path = Filename.concat dir
+    (Printf.sprintf "camlcoin-i2p-ws-%d.key" (Unix.getpid ())) in
+  let oc = open_out ws_path in
+  output_string oc "\n\n  \n";
+  close_out oc;
+  check bool "whitespace-only file -> None" true
+    (P2p.I2P.load_private_key ws_path = None);
+  (try Sys.remove ws_path with _ -> ())
+
+(* G56a: end-to-end SAM bridge mock — verify the wire-level DESTINATION
+   argument is TRANSIENT or the persistent key based on session state.
+
+   This is the strongest assertion against BUG-7 regressing: it
+   reads the bytes the I2P module actually writes to the SAM socket
+   (HELLO + SESSION CREATE) and checks the DESTINATION= argument. *)
+let run_mock_sam_bridge ~(port : int) ~(supply_dest_in_reply : bool)
+    ~(captured_create : string ref) : unit Lwt.t =
+  let open Lwt.Syntax in
+  let addr = Unix.ADDR_INET (Unix.inet_addr_loopback, port) in
+  let server_fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Lwt_unix.setsockopt server_fd Unix.SO_REUSEADDR true;
+  let* () = Lwt_unix.bind server_fd addr in
+  Lwt_unix.listen server_fd 1;
+  let* (client_fd, _) = Lwt_unix.accept server_fd in
+  let ic = Lwt_io.of_fd ~mode:Lwt_io.Input client_fd in
+  let oc = Lwt_io.of_fd ~mode:Lwt_io.Output client_fd in
+  (* Step 1: HELLO VERSION *)
+  let* _hello = Lwt_io.read_line ic in
+  let* () = Lwt_io.write oc "HELLO REPLY RESULT=OK VERSION=3.1\n" in
+  let* () = Lwt_io.flush oc in
+  (* Step 2: SESSION CREATE — capture it. *)
+  let* create_line = Lwt_io.read_line ic in
+  captured_create := create_line;
+  let reply =
+    if supply_dest_in_reply then
+      (* SAM hands back a DESTINATION (the freshly-issued base64 priv key)
+         so the client can persist it. *)
+      "SESSION STATUS RESULT=OK DESTINATION=FAKE_MINTED_KEY_b64==\n"
+    else
+      "SESSION STATUS RESULT=OK\n"
+  in
+  let* () = Lwt_io.write oc reply in
+  let* () = Lwt_io.flush oc in
+  let* () = Lwt_unix.close client_fd in
+  Lwt_unix.close server_fd
+
+let with_timeout (t : 'a Lwt.t) ~(seconds : float) : 'a Lwt.t =
+  let open Lwt.Syntax in
+  let timeout =
+    let* () = Lwt_unix.sleep seconds in
+    Alcotest.fail "test timeout"
+  in
+  Lwt.pick [t; timeout]
+
+(* Helper: extract DESTINATION=<token> from a SESSION CREATE line.
+   We grep for the token rather than splitting on spaces because the
+   command has many key=value parameters. *)
+let dest_arg_of (line : string) : string =
+  let needle = "DESTINATION=" in
+  let nlen = String.length needle in
+  let llen = String.length line in
+  let rec find i =
+    if i + nlen > llen then "<not-found>"
+    else if String.sub line i nlen = needle then begin
+      let start = i + nlen in
+      let rec end_at j =
+        if j >= llen then j
+        else if line.[j] = ' ' || line.[j] = '\n' then j
+        else end_at (j + 1)
+      in
+      let stop = end_at start in
+      String.sub line start (stop - start)
+    end else find (i + 1)
+  in
+  find 0
+
+(* G56b: TRANSIENT branch — transient=true sends DESTINATION=TRANSIENT. *)
+let test_g56b_mock_sam_transient () =
+  let port = 17656 in
+  let captured = ref "" in
+  Lwt_main.run begin
+    let open Lwt.Syntax in
+    let server = run_mock_sam_bridge ~port ~supply_dest_in_reply:true
+                   ~captured_create:captured in
+    let* () = Lwt_unix.sleep 0.05 in
+    let client =
+      let s = P2p.I2P.create_session
+                ~sam_addr:"127.0.0.1" ~sam_port:port
+                ~transient:true () in
+      let* _ok = P2p.I2P.init_session s in
+      Lwt.return_unit
+    in
+    with_timeout ~seconds:5.0
+      (let* () = server in let* () = client in Lwt.return_unit)
+  end;
+  let dest = dest_arg_of !captured in
+  check string "transient -> DESTINATION=TRANSIENT" "TRANSIENT" dest
+
+(* G56c: persistent + private_key=Some k branch — DESTINATION=<base64 key>. *)
+let test_g56c_mock_sam_persistent_with_key () =
+  let port = 17657 in
+  let captured = ref "" in
+  let key = "MYREAL_b64-i2p-priv-key-yEs~3jKzxxxxxxxxxxxxxxxxxxxxxxxxxxxx" in
+  Lwt_main.run begin
+    let open Lwt.Syntax in
+    let server = run_mock_sam_bridge ~port ~supply_dest_in_reply:true
+                   ~captured_create:captured in
+    let* () = Lwt_unix.sleep 0.05 in
+    let client =
+      let s = P2p.I2P.create_session
+                ~sam_addr:"127.0.0.1" ~sam_port:port
+                ~transient:false ~private_key:(Some key) () in
+      let* _ok = P2p.I2P.init_session s in
+      Lwt.return_unit
+    in
+    with_timeout ~seconds:5.0
+      (let* () = server in let* () = client in Lwt.return_unit)
+  end;
+  let dest = dest_arg_of !captured in
+  check string "persistent + key -> DESTINATION=<base64 key>" key dest;
+  check bool "DESTINATION must NOT be TRANSIENT" true (dest <> "TRANSIENT")
+
+(* G56d: first-run flow — persistent + no key, no path.
+
+   We send DESTINATION=TRANSIENT (the bridge will mint one), capture the
+   reply, store it on the session, and (since no path is configured)
+   log a warning.  No on-disk side effect. *)
+let test_g56d_mock_sam_first_run_no_path () =
+  let port = 17658 in
+  let captured = ref "" in
+  let session_ref = ref None in
+  Lwt_main.run begin
+    let open Lwt.Syntax in
+    let server = run_mock_sam_bridge ~port ~supply_dest_in_reply:true
+                   ~captured_create:captured in
+    let* () = Lwt_unix.sleep 0.05 in
+    let client =
+      let s = P2p.I2P.create_session
+                ~sam_addr:"127.0.0.1" ~sam_port:port
+                ~transient:false () in
+      let* _ok = P2p.I2P.init_session s in
+      session_ref := Some s;
+      Lwt.return_unit
+    in
+    with_timeout ~seconds:5.0
+      (let* () = server in let* () = client in Lwt.return_unit)
+  end;
+  let dest = dest_arg_of !captured in
+  check string "first run -> DESTINATION=TRANSIENT" "TRANSIENT" dest;
+  (* And the session NOW carries the SAM-minted key for future use. *)
+  match !session_ref with
+  | Some s ->
+    check bool "private_key captured from SAM reply" true
+      (s.P2p.I2P.private_key = Some "FAKE_MINTED_KEY_b64==")
+  | None -> Alcotest.fail "session was not captured"
+
+(* G56e: first-run flow with --i2p-private-key=<path>.
+
+   Persistent + no key, but [private_key_path] is set.  Expect:
+     - DESTINATION=TRANSIENT on the wire (bootstrap).
+     - SAM-supplied key captured into [session.private_key].
+     - File created at path, mode 0600, with the key as contents. *)
+let test_g56e_mock_sam_first_run_persists_to_disk () =
+  let port = 17659 in
+  let captured = ref "" in
+  let dir = Filename.get_temp_dir_name () in
+  let path = Filename.concat dir
+    (Printf.sprintf "camlcoin-i2p-firstrun-%d.key" (Unix.getpid ())) in
+  (try Sys.remove path with _ -> ());
+  Lwt_main.run begin
+    let open Lwt.Syntax in
+    let server = run_mock_sam_bridge ~port ~supply_dest_in_reply:true
+                   ~captured_create:captured in
+    let* () = Lwt_unix.sleep 0.05 in
+    let client =
+      let s = P2p.I2P.create_session
+                ~sam_addr:"127.0.0.1" ~sam_port:port
+                ~transient:false
+                ~private_key_path:(Some path) () in
+      let* _ok = P2p.I2P.init_session s in
+      Lwt.return_unit
+    in
+    with_timeout ~seconds:5.0
+      (let* () = server in let* () = client in Lwt.return_unit)
+  end;
+  let dest = dest_arg_of !captured in
+  check string "first run -> TRANSIENT bootstrap" "TRANSIENT" dest;
+  check bool "file created on disk" true (Sys.file_exists path);
+  let loaded = P2p.I2P.load_private_key path in
+  check bool "file contents match SAM-minted key" true
+    (loaded = Some "FAKE_MINTED_KEY_b64==");
+  let st = Unix.stat path in
+  check bool "file is mode 0600" true ((st.Unix.st_perm land 0o077) = 0);
+  (try Sys.remove path with _ -> ())
+
+(* G56: I2PSam proxy variant carries private_key_path, dispatch unchanged.
+
+   Mirrors G42 but pins the new field — verifies that wiring the
+   --i2p-private-key flag through parse_i2p_sam does not perturb the
+   existing dispatch (Cli routes .b32.i2p through I2PSam regardless). *)
+let test_g56_i2psam_carries_private_key_path () =
+  (match P2p.parse_i2p_sam
+           ~private_key_path:(Some "/var/lib/camlcoin/i2p.key")
+           "127.0.0.1:7656" with
+   | Some (P2p.I2PSam { addr; port; private_key_path }) ->
+     check string "addr" "127.0.0.1" addr;
+     check int "port" 7656 port;
+     check bool "private_key_path threaded through" true
+       (private_key_path = Some "/var/lib/camlcoin/i2p.key")
+   | _ -> Alcotest.fail "Expected I2PSam with private_key_path");
+  (* Default (no key) still works. *)
+  (match P2p.parse_i2p_sam "127.0.0.1:7656" with
+   | Some (P2p.I2PSam { private_key_path; _ }) ->
+     check bool "default: no private_key_path" true (private_key_path = None)
+   | _ -> Alcotest.fail "Expected I2PSam")
+
+(* =========================================================================
    Test suite registration
    ========================================================================= *)
 
@@ -1055,4 +1408,26 @@ let () =
       [ test_case "valid checksum but version=0x02/0x04 rejected" `Quick test_g48_wrong_version_rejected ];
       "G49 FIX-57 BUG-8 — missing suffix / bad chars rejected",
       [ test_case "non-.onion / non-base32 rejected" `Quick test_g49_missing_suffix_and_bad_chars_rejected ];
+      "G50 FIX-58 BUG-7 — session record has private_key/path",
+      [ test_case "I2P.session carries private_key + private_key_path" `Quick test_g50_session_record_has_private_key ];
+      "G51 FIX-58 BUG-7 — resolve_dest_spec transient=true",
+      [ test_case "transient=true -> TRANSIENT" `Quick test_g51_resolve_transient_true ];
+      "G52 FIX-58 BUG-7 — resolve_dest_spec persistent+key",
+      [ test_case "persistent + private_key=Some k -> k (NOT TRANSIENT)" `Quick test_g52_resolve_persistent_with_key ];
+      "G53 FIX-58 BUG-7 — resolve_dest_spec persistent+no key",
+      [ test_case "persistent + no key -> TRANSIENT fallback" `Quick test_g53_resolve_persistent_no_key ];
+      "G54 FIX-58 BUG-7 — private key file round-trip",
+      [ test_case "save_private_key + load_private_key + 0600" `Quick test_g54_private_key_roundtrip ];
+      "G55 FIX-58 BUG-7 — load_private_key on missing/empty file",
+      [ test_case "missing / empty / whitespace -> None" `Quick test_g55_load_missing_returns_none ];
+      "G56 FIX-58 BUG-7 — I2PSam carries private_key_path",
+      [ test_case "parse_i2p_sam ~private_key_path threads through" `Quick test_g56_i2psam_carries_private_key_path ];
+      "G56b FIX-58 BUG-7 — mock SAM: transient -> DESTINATION=TRANSIENT",
+      [ test_case "wire-level: TRANSIENT" `Quick test_g56b_mock_sam_transient ];
+      "G56c FIX-58 BUG-7 — mock SAM: persistent+key -> DESTINATION=<key>",
+      [ test_case "wire-level: persistent + key" `Quick test_g56c_mock_sam_persistent_with_key ];
+      "G56d FIX-58 BUG-7 — mock SAM: first-run captures returned key",
+      [ test_case "first run + no path: key captured into session" `Quick test_g56d_mock_sam_first_run_no_path ];
+      "G56e FIX-58 BUG-7 — mock SAM: first-run persists to disk",
+      [ test_case "first run + --i2p-private-key path: writes 0600 file" `Quick test_g56e_mock_sam_first_run_persists_to_disk ];
     ]

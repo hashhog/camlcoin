@@ -41,6 +41,17 @@ type config = {
   chain_sync_timeout : float; (* Seconds before evicting outbound peer behind our tip *)
   max_block_relay_only_anchors : int; (* Max anchor connections to persist, default 2 *)
   max_block_relay_only : int; (* Max dedicated block-relay-only outbound connections, default 2 *)
+  proxy_config : P2p.proxy_config;
+    (* Outbound proxy / overlay routing.  When this is the default
+       (all NoProxy, cjdns_reachable=false) every outbound dial is a
+       direct TCP connect on the clearnet — the legacy behaviour.
+       The CLI plumbing in [bin/main.ml] turns this into a
+       fully-populated record from --proxy / --onion / --i2psam /
+       --cjdnsreachable.  The 3 outbound call-sites
+       ([add_peer], [force_add_peer], [add_block_relay_peer]) pass
+       this into [Peer.connect_outbound_negotiated], which in turn
+       routes the dial through [P2p.connect_with_proxy] when a
+       non-default value is in play.  Closes W117 BUG-2 (FIX-56). *)
 }
 
 let default_config : config = {
@@ -54,6 +65,7 @@ let default_config : config = {
   chain_sync_timeout = 1200.0; (* 20 minutes *)
   max_block_relay_only_anchors = 2; (* BIP 155: 2 block-relay-only anchors *)
   max_block_relay_only = 2; (* 2 dedicated block-relay-only outbound connections *)
+  proxy_config = P2p.default_proxy_config;
 }
 
 (* ========== Stale peer eviction constants ========== *)
@@ -801,9 +813,14 @@ let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
          v1-only LRU cache), falling back to v1 on a fresh socket. The
          function performs the application version/verack itself (over v2
          cipher when negotiated, plaintext otherwise), so the previous
-         [Peer.perform_handshake] call is not needed. *)
+         [Peer.perform_handshake] call is not needed.
+         FIX-56: pass [pm.config.proxy_config] so .onion / .b32.i2p /
+         fc00::/8 dials honour the operator's --proxy / --onion /
+         --i2psam / --cjdnsreachable settings instead of always doing
+         a direct TCP connect (closed W117 BUG-2). *)
       let* peer = Peer.connect_outbound_negotiated
-        ~network:pm.network ~addr ~port ~id ~our_height:pm.our_height in
+        ~network:pm.network ~addr ~port ~id ~our_height:pm.our_height
+        ~proxy_config:(Some pm.config.proxy_config) () in
       peer_ref := Some peer;
       pm.peers <- peer :: pm.peers;
       (* Track connection time for eviction algorithm *)
@@ -886,8 +903,10 @@ let force_add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
      | None -> ());
     let peer_ref = ref None in
     Lwt.catch (fun () ->
+      (* FIX-56: addnode RPC path also routes through configured proxy. *)
       let* peer = Peer.connect_outbound_negotiated
-        ~network:pm.network ~addr ~port ~id ~our_height:pm.our_height in
+        ~network:pm.network ~addr ~port ~id ~our_height:pm.our_height
+        ~proxy_config:(Some pm.config.proxy_config) () in
       peer_ref := Some peer;
       pm.peers <- peer :: pm.peers;
       Hashtbl.replace pm.peer_connected_time peer.Peer.id now;
@@ -962,8 +981,11 @@ let add_block_relay_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
      | None -> ());
     let peer_ref = ref None in
     Lwt.catch (fun () ->
+      (* FIX-56: block-relay-only outbound also routes through configured
+         proxy / overlay. *)
       let* peer = Peer.connect_outbound_negotiated
-        ~network:pm.network ~addr ~port ~id ~our_height:pm.our_height in
+        ~network:pm.network ~addr ~port ~id ~our_height:pm.our_height
+        ~proxy_config:(Some pm.config.proxy_config) () in
       peer_ref := Some peer;
       peer.Peer.block_relay_only <- true;
       pm.peers <- peer :: pm.peers;

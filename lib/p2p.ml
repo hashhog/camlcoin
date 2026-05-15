@@ -3241,11 +3241,65 @@ type network_type =
   | Net_CJDNS
   | Net_Internal
 
+(* CJDNS detection: addresses whose first byte (in network-byte order) is
+   0xFC fall inside the fc00::/8 RFC 4193 Unique-Local Addressing block that
+   the Hyperboria CJDNS overlay uses.  Bitcoin Core (netaddress.cpp) detects
+   CJDNS at the same prefix (CJDNSPrefix = {0xFC}).  We accept the textual
+   forms an IPv6-string can take that resolve to that prefix:
+     "fc00::1"  / "[fc00::1]"   — explicit
+     "fcXX:..." / "[fcXX:...]"  — any address inside fc00::/8
+   We do NOT match fd00::/8 (RFC 4193 standard ULA; not CJDNS), or any other
+   IPv6 string.  Returns [true] iff the first hextet starts with 'fc'. *)
+let is_cjdns_address (host : string) : bool =
+  let lower = String.lowercase_ascii host in
+  let len = String.length lower in
+  if len < 4 then false
+  else
+    (* Strip optional bracket *)
+    let start = if lower.[0] = '[' then 1 else 0 in
+    if len - start < 4 then false
+    else if not (String.contains lower ':') then false
+    else
+      (* Read at most the first 4 hex chars before the first ':' and
+         require they parse to a 16-bit hextet whose high byte is 0xFC. *)
+      let colon_idx =
+        let rec find i =
+          if i >= len then None
+          else if lower.[i] = ':' then Some i
+          else find (i + 1)
+        in
+        find start
+      in
+      match colon_idx with
+      | None -> false
+      | Some ci ->
+        let hextet_len = ci - start in
+        if hextet_len < 2 || hextet_len > 4 then false
+        else
+          let hextet = String.sub lower start hextet_len in
+          (* Must be valid hex *)
+          let is_hex c =
+            (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+          in
+          if not (String.for_all is_hex hextet) then false
+          else
+            (* Pad to 4 hex chars (leading zeros), then check high byte = 0xFC *)
+            let padded =
+              String.make (4 - hextet_len) '0' ^ hextet
+            in
+            (* High byte = first 2 hex chars *)
+            String.sub padded 0 2 = "fc"
+
 (* Detect network type from hostname *)
 let network_type_of_host (host : string) : network_type =
   let lower = String.lowercase_ascii host in
   if Socks5.is_onion_address lower then Net_Onion
   else if Socks5.is_i2p_address lower then Net_I2P
+  (* BUG-4 fix: CJDNS prefix (fc00::/8) MUST be detected before the
+     generic IPv6 fallthrough; CJDNS textual addresses are syntactically
+     IPv6, so the previous order misclassified every CJDNS peer as
+     Net_IPv6.  Mirrors Bitcoin Core netaddress.cpp CJDNSPrefix check. *)
+  else if is_cjdns_address lower then Net_CJDNS
   else if String.length lower > 0 && lower.[0] = '[' then Net_IPv6
   else if String.contains lower ':' then Net_IPv6
   else Net_IPv4
@@ -3256,6 +3310,7 @@ type proxy_config = {
   onion_proxy : proxy_type;      (* -onion: proxy for .onion addresses *)
   i2p_sam : proxy_type;          (* -i2psam: I2P SAM bridge *)
   onlynet : network_type list;   (* -onlynet: restrict to these networks *)
+  cjdns_reachable : bool;        (* -cjdnsreachable: this host can route fc00::/8 *)
 }
 
 let default_proxy_config : proxy_config = {
@@ -3263,6 +3318,7 @@ let default_proxy_config : proxy_config = {
   onion_proxy = NoProxy;
   i2p_sam = NoProxy;
   onlynet = [];  (* Empty = all networks allowed *)
+  cjdns_reachable = false;  (* Off by default; needs an explicit operator opt-in *)
 }
 
 (* Get the appropriate proxy for a target *)
@@ -3277,6 +3333,12 @@ let get_proxy_for_target (config : proxy_config) (host : string) : proxy_type =
   | Net_I2P ->
     (* .b32.i2p addresses use I2P SAM *)
     config.i2p_sam
+  | Net_CJDNS ->
+    (* CJDNS is a kernel-routed overlay (fc00::/8); never tunneled through a
+       SOCKS5/I2P proxy. Callers must gate on [config.cjdns_reachable]
+       *before* this function — once we get here we assume the operator
+       owns the route. *)
+    NoProxy
   | _ ->
     (* IPv4/IPv6 use default proxy *)
     config.default_proxy
@@ -3319,6 +3381,13 @@ let connect_with_proxy ~(config : proxy_config) ~(host : string) ~(port : int)
        | Net_I2P -> "i2p"
        | Net_CJDNS -> "cjdns"
        | Net_Internal -> "internal")))
+  (* CJDNS dispatch (BUG-4 follow-on): refuse to dial fc00::/8 unless the
+     operator has explicitly told us we can route into the overlay
+     (-cjdnsreachable).  Without that flag we'd just punch an unroutable
+     packet at the kernel and either ECONNREFUSED or worse, leak the dial
+     intent over the clearnet default route. *)
+  else if net_type = Net_CJDNS && not config.cjdns_reachable then
+    Lwt.return (Error "cannot connect to CJDNS without --cjdnsreachable")
   else begin
     let proxy = get_proxy_for_target config host in
     match proxy with

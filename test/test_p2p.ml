@@ -1436,9 +1436,11 @@ let test_proxy_url_parsing () =
 let test_i2p_sam_parsing () =
   (* Valid address:port *)
   (match P2p.parse_i2p_sam "127.0.0.1:7656" with
-   | Some (P2p.I2PSam { addr; port }) ->
+   | Some (P2p.I2PSam { addr; port; private_key_path }) ->
      Alcotest.(check string) "addr" "127.0.0.1" addr;
-     Alcotest.(check int) "port" 7656 port
+     Alcotest.(check int) "port" 7656 port;
+     Alcotest.(check bool) "no private key by default" true
+       (private_key_path = None)
    | _ -> Alcotest.fail "Expected I2PSam");
 
   (* Invalid - no port *)

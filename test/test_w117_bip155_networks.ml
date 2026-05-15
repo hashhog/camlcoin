@@ -80,10 +80,13 @@ let test_g2_torv3_addrv2_length () =
    ========================================================================= *)
 
 let test_g3_torv3_suffix_detection () =
-  (* Tor v3 hostname ends with .onion; is_onion_address should detect it *)
+  (* Tor v3 hostname ends with .onion; is_onion_address should detect it.
+     FIX-57: also enforces 56-char base32 prefix + version 0x03 + checksum.
+     v2 (16-char prefix) is now rejected per Tor rend-spec-v3 §6. *)
   let v3_host = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion" in
-  check bool "v3 .onion detected" true (P2p.Socks5.is_onion_address v3_host);
-  check bool "v2 .onion detected" true (P2p.Socks5.is_onion_address "abcdefgh12345678.onion");
+  check bool "v3 .onion accepted" true (P2p.Socks5.is_onion_address v3_host);
+  check bool "v2 .onion rejected (FIX-57)" false
+    (P2p.Socks5.is_onion_address "abcdefgh12345678.onion");
   check bool "plain domain not onion" false (P2p.Socks5.is_onion_address "example.com");
   check bool ".onion.com not onion" false (P2p.Socks5.is_onion_address "foo.onion.com")
 
@@ -92,22 +95,18 @@ let test_g3_torv3_suffix_detection () =
    ========================================================================= *)
 
 let test_g4_torv3_length_not_validated () =
-  (* Tor v3 address: 56-char base32 + ".onion" = 62 chars total.
-     Tor v2 (deprecated): 16-char base32 + ".onion" = 22 chars total.
-     The current implementation accepts both without distinguishing. *)
+  (* FIX-57 (BUG-8 closed): is_onion_address now enforces:
+       - prefix = 56 base32 chars (v3 only; v2 rejected)
+       - decoded payload = 35 bytes = pubkey(32) || checksum(2) || ver(1)
+       - version byte = 0x03
+       - checksum = SHA3-256(".onion checksum"||pubkey||0x03)[0:2]
+     Per Tor rend-spec-v3 §6 + BIP-155 §3.  *)
   let v2_like = "aaaaaaaaaaaaaaaa.onion" in  (* 16-char "host" — Tor v2 format *)
   let v3_valid = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion" in
-  (* Both currently accepted — document the gap *)
-  check bool "v2-like accepted (no length check)" true
+  check bool "FIX-57: v2-like (16-char) prefix rejected" false
     (P2p.Socks5.is_onion_address v2_like);
-  check bool "v3 valid accepted" true
-    (P2p.Socks5.is_onion_address v3_valid);
-  (* BUG-8: camlcoin does not verify that the base32 part is 56 chars
-     (i.e., does not distinguish Tor v2 from v3, and does not verify checksum).
-     Bitcoin Core netaddress.cpp:255 DecodeBase32 + 3-byte checksum SHA-512 check.
-     We document the missing length guard here. *)
-  check bool "BUG-8: v3 requires 56-char base32 prefix"
-    false (String.length v2_like - 6 = 56)  (* 22-6=16 <> 56 *)
+  check bool "FIX-57: v3 valid (56-char + correct checksum) accepted" true
+    (P2p.Socks5.is_onion_address v3_valid)
 
 (* =========================================================================
    G5 — Tor v3 outbound routing: .onion -> Net_Onion
@@ -166,8 +165,11 @@ let test_g8_tor_stream_isolation () =
       tor_stream_isolation = true;
     };
   } in
-  (* Verify that stream isolation config is stored correctly *)
-  let proxy = P2p.get_proxy_for_target config "someaddress.onion" in
+  (* Verify that stream isolation config is stored correctly.
+     FIX-57: is_onion_address now requires a valid v3 address, so we use
+     the canonical v3 fixture (real Tor v3 hidden service form). *)
+  let v3_host = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion" in
+  let proxy = P2p.get_proxy_for_target config v3_host in
   (match proxy with
    | P2p.Socks5Proxy { tor_stream_isolation; _ } ->
      check bool "stream isolation enabled" true tor_stream_isolation
@@ -189,7 +191,9 @@ let test_g9_onion_proxy_override () =
   let config = { P2p.default_proxy_config with
     default_proxy; onion_proxy;
   } in
-  let proxy = P2p.get_proxy_for_target config "someaddress.onion" in
+  (* FIX-57: use a valid v3 .onion fixture so is_onion_address accepts it. *)
+  let v3_host = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion" in
+  let proxy = P2p.get_proxy_for_target config v3_host in
   check bool "onion proxy overrides default" true (proxy = onion_proxy);
   let proxy2 = P2p.get_proxy_for_target config "192.168.1.1" in
   check bool "non-onion uses default proxy" true (proxy2 = default_proxy)
@@ -827,6 +831,125 @@ let test_g44_connect_outbound_accepts_proxy_config () =
   check bool "Peer.connect_outbound_negotiated signature has ?proxy_config" true true
 
 (* =========================================================================
+   FIX-57 G45..G49 — BUG-8: is_onion_address v3 length + checksum validation
+
+   Per Tor rend-spec-v3 §6 + BIP-155 §3:
+     onion_address = base32(PUBKEY[32] || CHECKSUM[2] || VERSION[1])
+     CHECKSUM      = SHA3-256(".onion checksum" || PUBKEY || VERSION)[0:2]
+     VERSION       = 0x03
+     prefix length = 56 base32 chars
+
+   Helper: construct a *valid* v3 .onion from an arbitrary 32-byte pubkey
+   by recomputing the checksum.  This lets us verify the positive path
+   without depending on a single hard-coded fixture.
+   ========================================================================= *)
+
+(* RFC 4648 base32 encoder (lowercase, no padding) — local to this test. *)
+let base32_encode_test (data : string) : string =
+  let alphabet = "abcdefghijklmnopqrstuvwxyz234567" in
+  let len = String.length data in
+  if len = 0 then "" else
+  let out_len = ((len * 8 + 4) / 5) in
+  let result = Bytes.create out_len in
+  let bit_buffer = ref 0 in
+  let bits_in_buffer = ref 0 in
+  let out_pos = ref 0 in
+  for i = 0 to len - 1 do
+    bit_buffer := (!bit_buffer lsl 8) lor (Char.code data.[i]);
+    bits_in_buffer := !bits_in_buffer + 8;
+    while !bits_in_buffer >= 5 do
+      bits_in_buffer := !bits_in_buffer - 5;
+      let index = (!bit_buffer lsr !bits_in_buffer) land 0x1F in
+      Bytes.set result !out_pos alphabet.[index];
+      incr out_pos
+    done
+  done;
+  if !bits_in_buffer > 0 then begin
+    let index = (!bit_buffer lsl (5 - !bits_in_buffer)) land 0x1F in
+    Bytes.set result !out_pos alphabet.[index]
+  end;
+  Bytes.sub_string result 0 !out_pos
+
+(* Build a valid v3 .onion address for a 32-byte pubkey + version byte. *)
+let make_v3_onion ?(version=0x03) (pubkey : string) : string =
+  assert (String.length pubkey = 32);
+  let vch = String.make 1 (Char.chr version) in
+  let h = Digestif.SHA3_256.digest_string (".onion checksum" ^ pubkey ^ vch) in
+  let checksum = String.sub (Digestif.SHA3_256.to_raw_string h) 0 2 in
+  base32_encode_test (pubkey ^ checksum ^ vch) ^ ".onion"
+
+(* G45: a freshly-constructed valid v3 .onion (random pubkey, correct
+   checksum, version 0x03) is accepted. *)
+let test_g45_valid_v3_accepted () =
+  let pubkey = String.init 32 (fun i -> Char.chr ((i * 7 + 13) land 0xFF)) in
+  let host = make_v3_onion pubkey in
+  check int "constructed v3 host is 62 chars (56+6)" 62 (String.length host);
+  check bool "freshly-constructed valid v3 .onion accepted" true
+    (P2p.Socks5.is_onion_address host)
+
+(* G46: v2-style 16-char prefix is rejected. *)
+let test_g46_v2_rejected () =
+  (* All 16 valid base32 chars, but length=16 not 56 *)
+  let v2 = "aaaaaaaaaaaaaaaa.onion" in
+  check int "v2 prefix length = 16" 16 (String.length v2 - 6);
+  check bool "v2 (16-char) rejected" false (P2p.Socks5.is_onion_address v2);
+  (* Realistic-looking 16-char v2 fixture *)
+  check bool "duskgytldkxiuqc6 (real v2 form) rejected" false
+    (P2p.Socks5.is_onion_address "duskgytldkxiuqc6.onion")
+
+(* G47: 56-char prefix with WRONG checksum (last byte of checksum flipped) is rejected. *)
+let test_g47_wrong_checksum_rejected () =
+  let pubkey = String.init 32 (fun i -> Char.chr ((i + 1) land 0xFF)) in
+  let good = make_v3_onion pubkey in
+  (* Replace the last char of the base32 prefix with a different valid
+     base32 char — this perturbs the encoded version/checksum tail
+     deterministically and guarantees the checksum no longer matches.
+     The .onion suffix lives at indices 56..61, so we flip index 55. *)
+  let bytes = Bytes.of_string good in
+  let orig = Bytes.get bytes 55 in
+  let alt = if orig = 'a' then 'b' else 'a' in
+  Bytes.set bytes 55 alt;
+  let bad = Bytes.to_string bytes in
+  check bool "good baseline accepted" true
+    (P2p.Socks5.is_onion_address good);
+  check bool "56-char with corrupted last char rejected"
+    false (P2p.Socks5.is_onion_address bad)
+
+(* G48: 56-char prefix but version byte != 0x03 is rejected. *)
+let test_g48_wrong_version_rejected () =
+  let pubkey = String.init 32 (fun i -> Char.chr ((i * 11) land 0xFF)) in
+  (* Build a valid-looking address with version 0x02 (Tor v2 marker)
+     using the SAME SHA3-256 checksum scheme — so the checksum is
+     internally consistent but the version is wrong. *)
+  let v2_proto = make_v3_onion ~version:0x02 pubkey in
+  check bool "version=0x02 rejected even with valid checksum" false
+    (P2p.Socks5.is_onion_address v2_proto);
+  let v4_proto = make_v3_onion ~version:0x04 pubkey in
+  check bool "version=0x04 rejected even with valid checksum" false
+    (P2p.Socks5.is_onion_address v4_proto)
+
+(* G49: missing .onion suffix and non-base32 chars are rejected. *)
+let test_g49_missing_suffix_and_bad_chars_rejected () =
+  let pubkey = String.init 32 (fun i -> Char.chr ((i * 3) land 0xFF)) in
+  let good = make_v3_onion pubkey in
+  let prefix_only = String.sub good 0 56 in
+  check bool "no .onion suffix rejected" false
+    (P2p.Socks5.is_onion_address prefix_only);
+  check bool "wrong suffix (.com) rejected" false
+    (P2p.Socks5.is_onion_address (prefix_only ^ ".com"));
+  (* Inject an invalid base32 char (digit '1' not in RFC 4648 base32) *)
+  let bytes = Bytes.of_string good in
+  Bytes.set bytes 0 '1';
+  check bool "non-base32 char in prefix rejected" false
+    (P2p.Socks5.is_onion_address (Bytes.to_string bytes));
+  (* Suffix-only is too short *)
+  check bool "bare .onion rejected" false
+    (P2p.Socks5.is_onion_address ".onion");
+  (* Empty string *)
+  check bool "empty string rejected" false
+    (P2p.Socks5.is_onion_address "")
+
+(* =========================================================================
    Test suite registration
    ========================================================================= *)
 
@@ -922,4 +1045,14 @@ let () =
       [ test_case "1.2.3.4 uses default SOCKS5" `Quick test_g43_ipv4_routes_through_default_proxy ];
       "G44 FIX-56 wiring — proxy_config accepted",
       [ test_case "Peer.connect_outbound_negotiated has ?proxy_config" `Quick test_g44_connect_outbound_accepts_proxy_config ];
+      "G45 FIX-57 BUG-8 — valid v3 .onion accepted",
+      [ test_case "constructed v3 + correct checksum accepted" `Quick test_g45_valid_v3_accepted ];
+      "G46 FIX-57 BUG-8 — v2 .onion rejected",
+      [ test_case "16-char prefix rejected" `Quick test_g46_v2_rejected ];
+      "G47 FIX-57 BUG-8 — wrong checksum rejected",
+      [ test_case "56-char prefix with bad checksum rejected" `Quick test_g47_wrong_checksum_rejected ];
+      "G48 FIX-57 BUG-8 — wrong version rejected",
+      [ test_case "valid checksum but version=0x02/0x04 rejected" `Quick test_g48_wrong_version_rejected ];
+      "G49 FIX-57 BUG-8 — missing suffix / bad chars rejected",
+      [ test_case "non-.onion / non-base32 rejected" `Quick test_g49_missing_suffix_and_bad_chars_rejected ];
     ]

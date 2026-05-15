@@ -2908,10 +2908,74 @@ module Socks5 = struct
         )
     end
 
-  (* Check if an address is a .onion address *)
+  (* Base32 decoder (RFC 4648, lower- and upper-case alphabet, no padding).
+     Returns Some bytes when [s] decodes cleanly using exactly the bits
+     consumed; None otherwise.  Trailing partial groups whose padding bits
+     are non-zero are accepted (Tor encodes 35 bytes into 56 chars = 280
+     bits, so all bits are consumed and there is no slack to reject). *)
+  let base32_decode (s : string) : string option =
+    let lower = String.lowercase_ascii s in
+    let alphabet = "abcdefghijklmnopqrstuvwxyz234567" in
+    let len = String.length lower in
+    let buf = Buffer.create ((len * 5) / 8) in
+    let bit_buffer = ref 0 in
+    let bits_in_buffer = ref 0 in
+    let ok = ref true in
+    let i = ref 0 in
+    while !ok && !i < len do
+      let c = lower.[!i] in
+      (match String.index_opt alphabet c with
+       | None -> ok := false
+       | Some idx ->
+         bit_buffer := (!bit_buffer lsl 5) lor idx;
+         bits_in_buffer := !bits_in_buffer + 5;
+         while !bits_in_buffer >= 8 do
+           bits_in_buffer := !bits_in_buffer - 8;
+           let byte = (!bit_buffer lsr !bits_in_buffer) land 0xFF in
+           Buffer.add_char buf (Char.chr byte)
+         done);
+      incr i
+    done;
+    if !ok then Some (Buffer.contents buf) else None
+
+  (* Check if an address is a valid Tor v3 .onion address.
+
+     Per Tor rend-spec-v3 §6 + BIP-155 §3:
+       onion_address = base32(PUBKEY[32] || CHECKSUM[2] || VERSION[1])
+       CHECKSUM      = SHA3-256(".onion checksum" || PUBKEY || VERSION)[0:2]
+       VERSION       = 0x03
+     The textual prefix (before ".onion") MUST be exactly 56 base32 chars.
+
+     v2 (16-char prefix) is deprecated and MUST be rejected — Tor 0.4.6+
+     refuses to even resolve them.  We mirror that behaviour. *)
   let is_onion_address (host : string) : bool =
     let lower = String.lowercase_ascii host in
-    String.length lower > 6 && String.sub lower (String.length lower - 6) 6 = ".onion"
+    let hl = String.length lower in
+    let suffix_len = 6 in (* ".onion" *)
+    if hl <= suffix_len then false
+    else if String.sub lower (hl - suffix_len) suffix_len <> ".onion" then false
+    else
+      let prefix = String.sub lower 0 (hl - suffix_len) in
+      (* v3 only: prefix is exactly 56 base32 chars *)
+      if String.length prefix <> 56 then false
+      else
+        match base32_decode prefix with
+        | None -> false
+        | Some bin when String.length bin <> 35 -> false
+        | Some bin ->
+          let pubkey   = String.sub bin 0 32 in
+          let checksum = String.sub bin 32 2 in
+          let version  = bin.[34] in
+          if version <> '\x03' then false
+          else
+            let h =
+              Digestif.SHA3_256.digest_string
+                (".onion checksum" ^ pubkey ^ String.make 1 version)
+            in
+            let expected =
+              String.sub (Digestif.SHA3_256.to_raw_string h) 0 2
+            in
+            checksum = expected
 
   (* Check if an address is a .b32.i2p address *)
   let is_i2p_address (host : string) : bool =

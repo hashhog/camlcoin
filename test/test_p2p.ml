@@ -1321,13 +1321,15 @@ let test_addrv2_command () =
    SOCKS5 Proxy Tests
    ============================================================================ *)
 
-(* Test onion address detection *)
+(* Test onion address detection.
+   FIX-57 (BUG-8): is_onion_address now validates v3 length + checksum
+   and rejects v2 (16-char) addresses per Tor rend-spec-v3 §6. *)
 let test_onion_address_detection () =
-  Alcotest.(check bool) ".onion detected"
-    true (P2p.Socks5.is_onion_address "abcd1234.onion");
-  Alcotest.(check bool) ".onion uppercase"
-    true (P2p.Socks5.is_onion_address "ABCD1234.ONION");
-  Alcotest.(check bool) "v3 onion"
+  Alcotest.(check bool) "FIX-57: v2 .onion rejected (deprecated)"
+    false (P2p.Socks5.is_onion_address "abcd1234.onion");
+  Alcotest.(check bool) "FIX-57: v2 .onion uppercase also rejected"
+    false (P2p.Socks5.is_onion_address "ABCD1234.ONION");
+  Alcotest.(check bool) "v3 onion (valid checksum + length)"
     true (P2p.Socks5.is_onion_address "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion");
   Alcotest.(check bool) "not onion ipv4"
     false (P2p.Socks5.is_onion_address "192.168.1.1");

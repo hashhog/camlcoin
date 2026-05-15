@@ -302,6 +302,18 @@ let i2psam_arg =
   Arg.(value & opt (some string) None &
     info ["i2psam"] ~docv:"HOST:PORT" ~doc)
 
+let i2p_private_key_arg =
+  let doc = "Path to a file holding the persistent I2P destination private \
+             key.  When set, the SAM session is created with \
+             DESTINATION=<base64-priv-key> (loaded from this file) so the \
+             same .b32.i2p inbound address is reused across restarts. \
+             On first run the file is created automatically (mode 0600) \
+             from the SAM-returned key after a TRANSIENT bootstrap. \
+             When unset, every restart creates a fresh transient \
+             destination. Closes W117 BUG-7 — see lib/p2p.ml." in
+  Arg.(value & opt (some string) None &
+    info ["i2p-private-key"] ~docv:"PATH" ~doc)
+
 let cjdnsreachable_arg =
   let doc = "Assert that this host can route directly into the CJDNS \
              overlay (fc00::/8). When set, outbound dials to fc00::/8 \
@@ -323,7 +335,7 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     migrate_logstorage daemon_mode pid_path conf_path debug_cats
     logfile printtoconsole ready_fd zmq_pub reindex
     rest_enabled rest_port rest_bind blockfilterindex asmap
-    proxy onion_proxy i2psam cjdnsreachable =
+    proxy onion_proxy i2psam i2p_private_key cjdnsreachable =
   (* Resolve datadir early so config-file lookup can default to it. *)
   let base = Camlcoin.Cli.config_for_network network in
   let resolved_datadir = match datadir with
@@ -638,6 +650,9 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       i2psam = (match i2psam with
         | Some _ -> i2psam
         | None -> Camlcoin.Runtime_config.get_string conf_opts "i2psam");
+      i2p_private_key = (match i2p_private_key with
+        | Some _ -> i2p_private_key
+        | None -> Camlcoin.Runtime_config.get_string conf_opts "i2pprivatekey");
       cjdns_reachable =
         cjdnsreachable
         || (match Camlcoin.Runtime_config.get_bool conf_opts "cjdnsreachable" with
@@ -748,6 +763,7 @@ let cmd =
     $ proxy_arg
     $ onion_arg
     $ i2psam_arg
+    $ i2p_private_key_arg
     $ cjdnsreachable_arg)
 
 (* ============================================================================

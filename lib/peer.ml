@@ -1088,6 +1088,25 @@ let perform_inbound_handshake (peer : peer) (our_height : int32) : unit Lwt.t =
   in
   Lwt.pick [handshake; timeout]
 
+(* Pick the right socket-establishing dialer: when [proxy_config] is
+   [Some _] we route every dial through [connect_with_proxy] (which itself
+   falls through to a plain TCP connect for IPv4/IPv6/CJDNS when no proxy
+   is configured and the network is reachable); when [None], we fall back
+   to the direct-TCP [connect] used historically.
+
+   The wrapper is the single place that decides "proxy or direct"; both
+   the v1 and v2 dial paths below share it so a Tor/I2P/CJDNS-aware
+   PeerManager configuration applies to every outbound connection
+   regardless of which transport (v1 or v2) we negotiate first.
+
+   Closes W117 BUG-2 (FIX-56). *)
+let connect_outbound_dial
+    ~(network : Consensus.network_config) ~(addr : string) ~(port : int)
+    ~(id : int) ~(proxy_config : P2p.proxy_config option) : peer Lwt.t =
+  match proxy_config with
+  | None -> connect ~network ~addr ~port ~id
+  | Some cfg -> connect_with_proxy ~network ~addr ~port ~id ~proxy_config:cfg
+
 (* ============================================================================
    BIP-324 v2 outbound dialer (entry point)
    ----------------------------------------------------------------------------
@@ -1095,10 +1114,19 @@ let perform_inbound_handshake (peer : peer) (our_height : int32) : unit Lwt.t =
    v1-only LRU cache); on cipher failure, mark address v1-only and reconnect
    on a fresh socket in v1.  Sending v2 ellswift garbage is destructive on a
    v1 peer so the original socket cannot be reused.
+
+   [?proxy_config] (FIX-56): when provided, every outbound socket created by
+   this entry point (both the optimistic v2 socket and the v1-fallback
+   socket) is established through [P2p.connect_with_proxy], which routes
+   .onion through SOCKS5, .b32.i2p through I2P SAM, fc00::/8 directly
+   (gated by [cjdns_reachable]), and everything else through the
+   configured default proxy / clearnet.  [None] preserves the legacy
+   direct-TCP behaviour.
    ============================================================================ *)
 let connect_outbound_negotiated
     ~(network : Consensus.network_config) ~(addr : string) ~(port : int)
-    ~(id : int) ~(our_height : int32) : peer Lwt.t =
+    ~(id : int) ~(our_height : int32)
+    ?(proxy_config : P2p.proxy_config option = None) () : peer Lwt.t =
   let open Lwt.Syntax in
   let try_v2 =
     bip324_v2_outbound_enabled () && not (V1OnlyCache.is_v1_only ~addr ~port)
@@ -1106,7 +1134,7 @@ let connect_outbound_negotiated
   if not try_v2 then begin
     (* v1 path: behave exactly as the legacy [connect; perform_handshake]
        sequence used to. *)
-    let* peer = connect ~network ~addr ~port ~id in
+    let* peer = connect_outbound_dial ~network ~addr ~port ~id ~proxy_config in
     Lwt.catch
       (fun () ->
         let* () = perform_handshake peer our_height in
@@ -1117,7 +1145,7 @@ let connect_outbound_negotiated
   end
   else begin
     (* Phase 1: try v2 on a fresh socket. *)
-    let* peer = connect ~network ~addr ~port ~id in
+    let* peer = connect_outbound_dial ~network ~addr ~port ~id ~proxy_config in
     Lwt.catch
       (fun () ->
         (* Attach an initiator V2Transport.  Its send_buffer already
@@ -1144,7 +1172,8 @@ let connect_outbound_negotiated
         V1OnlyCache.mark ~addr ~port;
         let* () = Lwt.catch (fun () -> disconnect peer) (fun _ -> Lwt.return_unit) in
         (* Phase 2: v1 fallback on a brand-new socket. *)
-        let* fresh = connect ~network ~addr ~port ~id in
+        let* fresh =
+          connect_outbound_dial ~network ~addr ~port ~id ~proxy_config in
         Lwt.catch
           (fun () ->
             let* () = perform_handshake fresh our_height in

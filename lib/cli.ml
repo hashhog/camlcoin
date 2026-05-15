@@ -90,6 +90,19 @@ type config = {
     (* --i2psam=<host:port>.  I2P SAM 3.1 bridge endpoint for .b32.i2p dials.
        Mirrors Bitcoin Core's -i2psam flag.  [None] = .b32.i2p dials error
        out at [P2p.connect_with_proxy]. *)
+  i2p_private_key : string option;
+    (* --i2p-private-key=<path>.  Persistent I2P destination identity.
+
+       When set:
+         - First run: send DESTINATION=TRANSIENT to SAM, capture the
+           returned base64 private key, write it to <path> with 0600.
+         - Subsequent runs: read <path> and send DESTINATION=<key> to
+           SAM so the destination (and therefore the .b32.i2p inbound
+           address) is stable across restarts.
+       When unset (default): every restart gets a fresh transient
+       destination (matches Bitcoin Core's behaviour when -i2psam is
+       set but -i2psam-persistent is left off).
+       W117 BUG-7 (FIX-58) — see lib/p2p.ml [I2P.init_session]. *)
   cjdns_reachable : bool;
     (* --cjdnsreachable.  When [true], we permit direct TCP dials to
        fc00::/8 CJDNS overlay addresses (the operator has the CJDNS daemon
@@ -129,6 +142,7 @@ let default_config : config = {
   proxy = None;
   onion = None;
   i2psam = None;
+  i2p_private_key = None;
   cjdns_reachable = false;
 }
 
@@ -512,7 +526,11 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   let parsed_i2psam = match config.i2psam with
     | None -> P2p.NoProxy
     | Some s ->
-      (match P2p.parse_i2p_sam s with
+      (* W117 BUG-7 (FIX-58): thread --i2p-private-key=<path> through to
+         the I2PSam variant so [P2p.connect_with_proxy] can request a
+         persistent identity (SAMv3 SESSION CREATE DESTINATION=<key>)
+         instead of always sending TRANSIENT. *)
+      (match P2p.parse_i2p_sam ~private_key_path:config.i2p_private_key s with
        | Some p -> p
        | None ->
          Logs.warn (fun m ->
@@ -543,8 +561,15 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
    | _ -> ());
   (match parsed_i2psam with
    | P2p.NoProxy -> ()
-   | P2p.I2PSam { addr; port } ->
-     Logs.info (fun m -> m "Outbound I2P SAM: %s:%d" addr port)
+   | P2p.I2PSam { addr; port; private_key_path } ->
+     (match private_key_path with
+      | None ->
+        Logs.info (fun m ->
+          m "Outbound I2P SAM: %s:%d (transient identity)" addr port)
+      | Some path ->
+        Logs.info (fun m ->
+          m "Outbound I2P SAM: %s:%d (persistent identity at %s)"
+            addr port path))
    | _ -> ());
   if config.cjdns_reachable then
     Logs.info (fun m -> m "CJDNS reachable: outbound fc00::/8 dials enabled");

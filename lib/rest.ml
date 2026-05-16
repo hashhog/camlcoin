@@ -740,6 +740,61 @@ let starts_with (s : string) (prefix : string) : bool =
   let n = String.length prefix in
   String.length s >= n && String.sub s 0 n = prefix
 
+(* ============================================================================
+   POST /payjoin  (BIP-78 receiver — FIX-65)
+   ============================================================================
+
+   Activates the FIX-60 cross-wave dep: [Wallet.process_psbt] is called
+   here to sign the receiver's appended input.  Returns the PayjoinPSBT
+   base64 on success or one of BIP-78's 4 wire-error envelopes on
+   failure.
+
+   Path:  POST /payjoin
+   Query: v=1 [&pjos=0|1] [&additionalfeeoutputindex=N]
+          [&maxadditionalfeecontribution=SAT] [&minfeerate=F]
+   Body:  Content-Type: text/plain, base64-encoded PSBT
+
+   Reference: BIP-78 §"Receiver responses". *)
+let handle_payjoin (ctx : Rpc.rpc_context) (req : Cohttp.Request.t)
+    (body_str : string) =
+  let h = Cohttp.Request.headers req in
+  let uri = Cohttp.Request.uri req in
+  let query = Uri.query uri in
+  let ct_ok = Payjoin.validate_content_type h in
+  let respond_payjoin_error err msg =
+    let status = Payjoin.error_http_status err in
+    let body = Payjoin.error_to_json_string ~message:msg err in
+    let headers = Cohttp.Header.init_with "Content-Type" "application/json" in
+    Cohttp_lwt_unix.Server.respond_string ~status ~headers ~body ()
+  in
+  match Payjoin.parse_sender_params query with
+  | Error err ->
+    (* v=N with N != 1 — version-unsupported per BIP-78. *)
+    respond_payjoin_error err "Unsupported PayJoin version (only v=1 supported)"
+  | Ok params ->
+    (* The receiver wallet is required to be loaded.  Without a wallet
+       we have nothing to sign with — emit "unavailable" per spec. *)
+    match ctx.Rpc.wallet with
+    | None ->
+      respond_payjoin_error Payjoin.Unavailable
+        "PayJoin receiver wallet not loaded"
+    | Some wallet ->
+      let result =
+        Payjoin.process_request wallet
+          ~content_type_ok:ct_ok ~params ~body_b64:body_str
+          ~receiver_utxo:None  (* no-op PayJoin: validates + signs the
+                                  unmodified OrigPSBT.  Higher-level
+                                  RPC may pre-stage a UTXO. *)
+          ()
+      in
+      match result with
+      | Error (err, msg) ->
+        respond_payjoin_error err msg
+      | Ok signed_b64 ->
+        let headers = Cohttp.Header.init_with "Content-Type" "text/plain" in
+        Cohttp_lwt_unix.Server.respond_string
+          ~status:`OK ~headers ~body:signed_b64 ()
+
 let dispatch_rest (ctx : Rpc.rpc_context) (req : Cohttp.Request.t)
     (path : string) =
   (* Route based on path prefix - most specific matches first.
@@ -807,13 +862,18 @@ let start_rest_server ~(ctx : Rpc.rpc_context)
     ?(tls_cert_path : string option = None)
     ?(tls_key_path : string option = None)
     () : unit Lwt.t =
-  let callback _conn req _body =
+  let callback _conn req body =
     let meth = Cohttp.Request.meth req in
     let uri = Cohttp.Request.uri req in
     let path = Uri.path uri in
 
+    (* FIX-65: BIP-78 PayJoin receiver — POST /payjoin only.  Routed
+       before the REST GET-only guard so the POST path is reachable. *)
+    if meth = `POST && (path = "/payjoin" || path = "/payjoin/") then
+      Lwt.bind (Cohttp_lwt.Body.to_string body) (fun body_str ->
+        handle_payjoin ctx req body_str)
     (* REST only accepts GET requests *)
-    if meth <> `GET then
+    else if meth <> `GET then
       respond_error `Method_not_allowed "Method not allowed"
     (* Only handle /rest/* paths *)
     else if String.length path < 6 || String.sub path 0 6 <> "/rest/" then

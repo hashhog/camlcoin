@@ -214,14 +214,17 @@ let assert_rpc_unknown ctx method_name =
    ============================================================================ *)
 
 let test_g1_no_receiver_http_endpoint () =
-  (* The REST server handles only GET endpoints (block/tx/headers).
-     There is no POST /payjoin handler.  We assert this by exercising
-     the dispatch table: if a PayJoin POST handler existed it would
-     be registered as an RPC method or a REST path.  Since no source
-     file mentions "payjoin", neither is present. *)
+  (* FIX-65 (FIX-60 → FIX-65 cleanest-cross-wave-dep): the REST server
+     now handles POST /payjoin AND the payjoinreceive RPC is registered.
+     `getpayjoinendpoint` remains unimplemented; this assertion is now
+     ONE-of-two — payjoinreceive is the closed half. *)
   let ctx = make_rpc_ctx () in
   assert_rpc_unknown ctx "getpayjoinendpoint";
-  assert_rpc_unknown ctx "payjoinreceive"
+  (* G1 flipped: payjoinreceive MUST now dispatch (not method-not-found). *)
+  match Rpc.dispatch_rpc ctx "payjoinreceive" [] with
+  | Error (-32601, _) ->
+    Alcotest.fail "G1 FIX-65 flip: payjoinreceive should now be dispatched"
+  | Error _ | Ok _ -> ()
 
 let test_g2_no_sender_http_client () =
   (* No `Cohttp_lwt_unix.Client.post` call to a PayJoin endpoint
@@ -356,8 +359,14 @@ let test_g20_no_anti_fp_utxo_selection () =
    ============================================================================ *)
 
 let test_g21_no_v1_header_handling () =
+  (* G21 FIX-65 flip: getpayjoinversion now registered (returns v=1). *)
   let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "getpayjoinversion"
+  match Rpc.dispatch_rpc ctx "getpayjoinversion" [] with
+  | Error (-32601, _) ->
+    Alcotest.fail "G21 FIX-65 flip: getpayjoinversion should now be dispatched"
+  | Error (code, msg) ->
+    Alcotest.failf "G21 dispatched but errored: %d %s" code msg
+  | Ok _ -> ()
 
 let test_g22_no_sender_fallback () =
   (* On receiver timeout/error sender must broadcast the OrigPSBT as
@@ -371,8 +380,17 @@ let test_g22_no_sender_fallback () =
    ============================================================================ *)
 
 let test_g23_no_content_type_validator () =
+  (* G23 FIX-65 flip: validatepayjoincontenttype now registered.  The
+     wire-side Content-Type guard also runs inside Rest.handle_payjoin
+     before any PSBT decode is attempted. *)
   let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "validatepayjoincontenttype"
+  match Rpc.dispatch_rpc ctx
+          "validatepayjoincontenttype" [`String "text/plain"] with
+  | Error (-32601, _) ->
+    Alcotest.fail "G23 FIX-65 flip: validatepayjoincontenttype should now be dispatched"
+  | Error (code, msg) ->
+    Alcotest.failf "G23 dispatched but errored: %d %s" code msg
+  | Ok _ -> ()
 
 let test_g24_no_https_cert_check () =
   let ctx = make_rpc_ctx () in
@@ -452,7 +470,7 @@ let test_walletprocesspsbt_is_present_baseline () =
    ============================================================================ *)
 
 let receiver_http_tests = [
-  Alcotest.test_case "G1  no receiver HTTP endpoint (BUG-1, P0)"
+  Alcotest.test_case "G1  receiver HTTP endpoint CLOSED (FIX-65) — flipped"
     `Quick test_g1_no_receiver_http_endpoint;
   Alcotest.test_case "G3  no HTTPS/TLS endpoint (BUG-3, P0)"
     `Quick test_g3_no_https_tls_termination;
@@ -462,7 +480,7 @@ let receiver_http_tests = [
     `Quick test_g19_no_receiver_double_spend_check;
   Alcotest.test_case "G20 no anti-fp UTXO selection (BUG-20, P1)"
     `Quick test_g20_no_anti_fp_utxo_selection;
-  Alcotest.test_case "G23 no Content-Type validator (BUG-23, P0)"
+  Alcotest.test_case "G23 Content-Type validator CLOSED (FIX-65) — flipped"
     `Quick test_g23_no_content_type_validator;
   Alcotest.test_case "G24 no HTTPS cert/hostname check (BUG-24, P0)"
     `Quick test_g24_no_https_cert_check;
@@ -518,7 +536,7 @@ let uri_wire_tests = [
     `Quick test_g16_no_query_param_parser;
   Alcotest.test_case "G17 no PayJoin wire-error codes (BUG-17, P0)"
     `Quick test_g17_no_payjoin_error_codes;
-  Alcotest.test_case "G21 no v=1 version header handling (BUG-21, P0)"
+  Alcotest.test_case "G21 v=1 version handling CLOSED (FIX-65) — flipped"
     `Quick test_g21_no_v1_header_handling;
   Alcotest.test_case "G28 no BIP-21 bitcoin: URI parser (BUG-28, P0)"
     `Quick test_g28_no_bip21_uri_parser;

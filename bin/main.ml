@@ -325,6 +325,41 @@ let cjdnsreachable_arg =
              -cjdnsreachable flag." in
   Arg.(value & flag & info ["cjdnsreachable"] ~doc)
 
+(* W119 / FIX-64: HTTPS/TLS termination flags. *)
+let rpc_tls_cert_arg =
+  let doc = "PEM-encoded X.509 certificate file for the JSON-RPC \
+             listener. When set, the listener serves HTTPS instead of \
+             plain HTTP; must be paired with --rpc-tls-key. The cert \
+             may be self-signed (no chain validation is performed on \
+             the server side). Default: off (plain HTTP). \
+             Mirrors Bitcoin Core's BIP-78 §\"Protocol\" TLS \
+             requirement and the httpserver.cpp option." in
+  Arg.(value & opt (some string) None &
+    info ["rpc-tls-cert"] ~docv:"PATH" ~doc)
+
+let rpc_tls_key_arg =
+  let doc = "PEM-encoded private key file paired with --rpc-tls-cert. \
+             Should be mode 0600. Both --rpc-tls-cert and --rpc-tls-key \
+             must be supplied together; supplying only one is a startup \
+             error." in
+  Arg.(value & opt (some string) None &
+    info ["rpc-tls-key"] ~docv:"PATH" ~doc)
+
+let rest_tls_cert_arg =
+  let doc = "PEM-encoded X.509 certificate for the REST listener \
+             (independent of the JSON-RPC cert, so the two listeners \
+             may be terminated with different certificates). Requires \
+             --rest. Must be paired with --rest-tls-key. Default: off." in
+  Arg.(value & opt (some string) None &
+    info ["rest-tls-cert"] ~docv:"PATH" ~doc)
+
+let rest_tls_key_arg =
+  let doc = "PEM-encoded private key paired with --rest-tls-cert. \
+             Both --rest-tls-cert and --rest-tls-key must be supplied \
+             together." in
+  Arg.(value & opt (some string) None &
+    info ["rest-tls-key"] ~docv:"PATH" ~doc)
+
 (* ============================================================================
    Main Command
    ============================================================================ *)
@@ -335,7 +370,8 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     migrate_logstorage daemon_mode pid_path conf_path debug_cats
     logfile printtoconsole ready_fd zmq_pub reindex
     rest_enabled rest_port rest_bind blockfilterindex asmap
-    proxy onion_proxy i2psam i2p_private_key cjdnsreachable =
+    proxy onion_proxy i2psam i2p_private_key cjdnsreachable
+    rpc_tls_cert rpc_tls_key rest_tls_cert rest_tls_key =
   (* Resolve datadir early so config-file lookup can default to it. *)
   let base = Camlcoin.Cli.config_for_network network in
   let resolved_datadir = match datadir with
@@ -658,6 +694,21 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
         || (match Camlcoin.Runtime_config.get_bool conf_opts "cjdnsreachable" with
             | Some b -> b
             | None -> false);
+      (* W119 / FIX-64: HTTPS/TLS termination.  CLI wins over conf.  Conf
+         keys mirror the CLI long names with hyphens stripped (per the
+         bitcoin.conf convention: keys are lowercase, no separators). *)
+      rpc_tls_cert = (match rpc_tls_cert with
+        | Some _ -> rpc_tls_cert
+        | None -> Camlcoin.Runtime_config.get_string conf_opts "rpctlscert");
+      rpc_tls_key = (match rpc_tls_key with
+        | Some _ -> rpc_tls_key
+        | None -> Camlcoin.Runtime_config.get_string conf_opts "rpctlskey");
+      rest_tls_cert = (match rest_tls_cert with
+        | Some _ -> rest_tls_cert
+        | None -> Camlcoin.Runtime_config.get_string conf_opts "resttlscert");
+      rest_tls_key = (match rest_tls_key with
+        | Some _ -> rest_tls_key
+        | None -> Camlcoin.Runtime_config.get_string conf_opts "resttlskey");
     } in
     (* Ensure datadir exists so we can land the PID file there. *)
     (try Unix.mkdir resolved_datadir 0o755
@@ -764,7 +815,11 @@ let cmd =
     $ onion_arg
     $ i2psam_arg
     $ i2p_private_key_arg
-    $ cjdnsreachable_arg)
+    $ cjdnsreachable_arg
+    $ rpc_tls_cert_arg
+    $ rpc_tls_key_arg
+    $ rest_tls_cert_arg
+    $ rest_tls_key_arg)
 
 (* ============================================================================
    Entry Point

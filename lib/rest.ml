@@ -800,8 +800,13 @@ let dispatch_rest (ctx : Rpc.rpc_context) (req : Cohttp.Request.t)
    REST Server
    ============================================================================ *)
 
+(* W119 / FIX-64: optional HTTPS/TLS termination on the REST listener.
+   Semantics match Rpc.start_rpc_server. *)
 let start_rest_server ~(ctx : Rpc.rpc_context)
-    ~(host : string) ~(port : int) : unit Lwt.t =
+    ~(host : string) ~(port : int)
+    ?(tls_cert_path : string option = None)
+    ?(tls_key_path : string option = None)
+    () : unit Lwt.t =
   let callback _conn req _body =
     let meth = Cohttp.Request.meth req in
     let uri = Cohttp.Request.uri req in
@@ -818,8 +823,36 @@ let start_rest_server ~(ctx : Rpc.rpc_context)
   in
 
   let server = Cohttp_lwt_unix.Server.make ~callback () in
-  let mode = `TCP (`Port port) in
-  Logs.info (fun m -> m "REST server listening on %s:%d" host port);
+  let mode : Conduit_lwt_unix.server =
+    match tls_cert_path, tls_key_path with
+    | None, None ->
+      Logs.info (fun m -> m "REST server listening on %s:%d (HTTP, plaintext)" host port);
+      `TCP (`Port port)
+    | Some cert, Some key ->
+      if not (Sys.file_exists cert) then begin
+        Logs.err (fun m -> m "REST TLS cert file does not exist: %s" cert);
+        failwith ("REST TLS cert file not found: " ^ cert)
+      end;
+      if not (Sys.file_exists key) then begin
+        Logs.err (fun m -> m "REST TLS key file does not exist: %s" key);
+        failwith ("REST TLS key file not found: " ^ key)
+      end;
+      Logs.info (fun m ->
+        m "REST server listening on %s:%d (HTTPS, cert=%s key=%s)"
+          host port cert key);
+      `TLS (`Crt_file_path cert,
+            `Key_file_path key,
+            `No_password,
+            `Port port)
+    | Some _, None ->
+      Logs.err (fun m ->
+        m "--rest-tls-cert was set but --rest-tls-key was not.");
+      failwith "REST TLS: cert provided without key"
+    | None, Some _ ->
+      Logs.err (fun m ->
+        m "--rest-tls-key was set but --rest-tls-cert was not.");
+      failwith "REST TLS: key provided without cert"
+  in
   Cohttp_lwt_unix.Server.create ~mode server
 
 (* Default REST port *)

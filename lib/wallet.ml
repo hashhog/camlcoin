@@ -14,6 +14,16 @@ let log_src = Logs.Src.create "WALLET" ~doc:"Wallet"
 module Log = (val Logs.src_log log_src : Logs.LOG)
 let _ = Log.info  (* suppress unused module warning *)
 
+(* FIX-70 / W120 BUG-2: Core's CWallet default for wallet-created inputs.
+   Reference: bitcoin-core/src/wallet/wallet.h
+     static constexpr uint32_t MAX_BIP125_RBF_SEQUENCE = 0xfffffffd;
+   Wallet-created transactions opt into BIP-125 RBF by default since
+   Bitcoin Core v23 (m_signal_rbf=true).  Any input with
+   nSequence <= 0xFFFFFFFD signals replaceability per BIP-125.
+   Use 0xFFFFFFFE only when nLockTime enforcement is needed but RBF
+   signaling is not (coinbase, explicit non-replaceable opt-out). *)
+let max_bip125_rbf_sequence : int32 = 0xFFFFFFFDl
+
 (* CSPRNG helper: read 8 bytes from /dev/urandom and return a non-negative
    integer in [0, max).  Never falls back to OCaml stdlib Random — same
    pattern used in peer_manager.ml/sync.ml/p2p.ml throughout camlcoin.
@@ -1711,11 +1721,16 @@ let create_transaction (w : t) ~(dest_address : string)
         outputs := insert_at_random !outputs change_output
       end;
 
-      (* Build unsigned transaction inputs *)
+      (* Build unsigned transaction inputs.
+         FIX-70 / W120 BUG-2: default nSequence = MAX_BIP125_RBF_SEQUENCE
+         (0xFFFFFFFD) so the created tx opts into BIP-125 RBF, matching
+         Core CWallet since v23.  Previously 0xFFFFFFFE made every
+         wallet-created tx unreplaceable and broke bump_fee's BIP-125
+         rule 1 enforcement on mempools that require ancestor signaling. *)
       let inputs = List.map (fun wutxo ->
         { Types.previous_output = wutxo.outpoint;
           script_sig = Cstruct.create 0;  (* Empty for segwit *)
-          sequence = 0xFFFFFFFEl; }
+          sequence = max_bip125_rbf_sequence; }
       ) selection.selected in
 
       (* Anti-fee-sniping locktime — use CSPRNG for the 10% trigger.
@@ -1811,11 +1826,13 @@ let create_transaction_multi (w : t)
       | None -> 0l
     in
 
-    (* Build and sign transaction *)
+    (* Build and sign transaction.
+       FIX-70 / W120 BUG-2: default nSequence = MAX_BIP125_RBF_SEQUENCE
+       (0xFFFFFFFD) — opts into BIP-125 RBF.  See create_transaction. *)
     let inputs = List.map (fun wutxo ->
       { Types.previous_output = wutxo.outpoint;
         script_sig = Cstruct.create 0;
-        sequence = 0xFFFFFFFEl; }
+        sequence = max_bip125_rbf_sequence; }
     ) selection.selected in
 
     let tx : Types.transaction = {

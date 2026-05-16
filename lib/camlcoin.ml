@@ -19,6 +19,7 @@ module Rest = Rest
 module Bip39 = Bip39
 module Bip21 = Bip21
 module Wallet = Wallet
+module Payjoin = Payjoin
 module Cli = Cli
 module Perf = Perf
 module Block_index = Block_index

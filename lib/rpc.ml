@@ -8176,10 +8176,25 @@ let context_with_wallet (ctx : rpc_context) (wallet_name : string option) : rpc_
      | None -> ctx)
   | Some _, None -> ctx  (* No manager, use existing *)
 
+(* W119 / FIX-64: optional HTTPS/TLS termination.
+
+   [tls_cert_path] + [tls_key_path] = both [Some _]:
+     wrap the listener in Cohttp's [`TLS] mode (Conduit_lwt_tls / OCaml-TLS).
+     Operator is responsible for PEM cert + PEM-encoded private key files
+     stored mode 0600.  Self-signed certificates are accepted; cohttp does
+     not chain-validate the server-side cert (only the client does).
+   Both [None]: plain HTTP (backward compat).
+   Exactly one [Some] is a startup error — caller must catch and surface.
+
+   Mirrors Bitcoin Core's BIP-78 §"Protocol" TLS-only payment server
+   requirement.  Reference: bitcoin-core/src/httpserver.cpp. *)
 let start_rpc_server ~(ctx : rpc_context)
     ~(host : string) ~(port : int)
     ~(rpc_user : string) ~(rpc_password : string)
     ~(cookie_password : string option)
+    ?(tls_cert_path : string option = None)
+    ?(tls_key_path : string option = None)
+    ()
     : unit Lwt.t =
   let open Lwt.Syntax in
 
@@ -8293,8 +8308,43 @@ let start_rpc_server ~(ctx : rpc_context)
   in
 
   let server = Cohttp_lwt_unix.Server.make ~callback () in
-  let mode = `TCP (`Port port) in
-  Logs.info (fun m -> m "RPC server listening on %s:%d" host port);
+  let mode : Conduit_lwt_unix.server =
+    match tls_cert_path, tls_key_path with
+    | None, None ->
+      Logs.info (fun m -> m "RPC server listening on %s:%d (HTTP, plaintext)" host port);
+      `TCP (`Port port)
+    | Some cert, Some key ->
+      (* Validate files exist + are readable BEFORE binding, so a missing
+         cert produces a single clear log line instead of conduit's
+         lower-level Unix_error from inside the TLS handshake. *)
+      if not (Sys.file_exists cert) then begin
+        Logs.err (fun m ->
+          m "RPC TLS cert file does not exist: %s" cert);
+        failwith ("RPC TLS cert file not found: " ^ cert)
+      end;
+      if not (Sys.file_exists key) then begin
+        Logs.err (fun m ->
+          m "RPC TLS key file does not exist: %s" key);
+        failwith ("RPC TLS key file not found: " ^ key)
+      end;
+      Logs.info (fun m ->
+        m "RPC server listening on %s:%d (HTTPS, cert=%s key=%s)"
+          host port cert key);
+      `TLS (`Crt_file_path cert,
+            `Key_file_path key,
+            `No_password,
+            `Port port)
+    | Some _, None ->
+      Logs.err (fun m ->
+        m "--rpc-tls-cert was set but --rpc-tls-key was not. \
+           Both must be provided together for HTTPS.");
+      failwith "RPC TLS: cert provided without key"
+    | None, Some _ ->
+      Logs.err (fun m ->
+        m "--rpc-tls-key was set but --rpc-tls-cert was not. \
+           Both must be provided together for HTTPS.");
+      failwith "RPC TLS: key provided without cert"
+  in
   Cohttp_lwt_unix.Server.create ~mode server
 
 (* ============================================================================

@@ -16,6 +16,7 @@ depends: [
   "lwt" {>= "5.6.0"}
   "lwt_ppx" {>= "2.1.0"}
   "cohttp-lwt-unix" {>= "5.0.0"}
+  "tls-lwt" {>= "1.0.0"}
   "yojson" {>= "2.0.0"}
   "digestif" {>= "1.1.0"}
   "mirage-crypto" {>= "1.0.0"}

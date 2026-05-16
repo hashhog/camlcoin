@@ -109,6 +109,23 @@ type config = {
        running and a route in the kernel).  Mirrors Bitcoin Core's
        -cjdnsreachable flag.  [false] (default) = refuse all CJDNS dials
        to avoid leaking the intent over the clearnet default route. *)
+  rpc_tls_cert : string option;
+    (* --rpc-tls-cert=<PATH>.  PEM-encoded X.509 certificate file used by the
+       JSON-RPC listener for HTTPS termination.  When [Some _], the matching
+       --rpc-tls-key must also be set; otherwise startup aborts.  When [None]
+       (default), the RPC listener serves plain HTTP for backward compatibility.
+       Mirrors Bitcoin Core's BIP-78 §"Protocol" TLS-only payment requirement
+       and the equivalent httpserver.cpp option.  W119 / FIX-64. *)
+  rpc_tls_key : string option;
+    (* --rpc-tls-key=<PATH>.  PEM-encoded private key file paired with
+       --rpc-tls-cert.  Should be mode 0600.  See [rpc_tls_cert]. *)
+  rest_tls_cert : string option;
+    (* --rest-tls-cert=<PATH>.  PEM cert for the public REST listener.
+       Independent from the RPC pair so REST and RPC can be terminated with
+       different certs (e.g. RPC under a private CA, REST under a public CA).
+       When unset, the REST listener serves plain HTTP. *)
+  rest_tls_key : string option;
+    (* --rest-tls-key=<PATH>.  PEM private key paired with --rest-tls-cert. *)
 }
 
 (* ============================================================================
@@ -144,6 +161,10 @@ let default_config : config = {
   i2psam = None;
   i2p_private_key = None;
   cjdns_reachable = false;
+  rpc_tls_cert = None;
+  rpc_tls_key = None;
+  rest_tls_cert = None;
+  rest_tls_key = None;
 }
 
 (* Network-specific configuration *)
@@ -682,6 +703,9 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       ~rpc_user:config.rpc_user
       ~rpc_password:config.rpc_password
       ~cookie_password:(Some cookie_password)
+      ~tls_cert_path:config.rpc_tls_cert
+      ~tls_key_path:config.rpc_tls_key
+      ()
   in
 
 
@@ -723,6 +747,9 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         ~ctx:rpc_ctx
         ~host:rest_host
         ~port:rest_port
+        ~tls_cert_path:config.rest_tls_cert
+        ~tls_key_path:config.rest_tls_key
+        ()
     end
   in
 

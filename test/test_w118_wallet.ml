@@ -760,9 +760,10 @@ let test_g18_joinpsbts_missing_bug () =
    G19 – G22: Fee bumping
    ============================================================================ *)
 
-(* G19: BUG-8 — create_transaction does NOT signal RBF (sequence=0xFFFFFFFE
-   instead of 0xFFFFFFFD).  Mempools enforcing BIP-125 will reject the
-   later bumpfee replacement. *)
+(* G19: was BUG-8 — FIX-70 FLIPPED.  create_transaction now signals RBF
+   with default sequence = 0xFFFFFFFD (MAX_BIP125_RBF_SEQUENCE), matching
+   Core CWallet since v23 (m_signal_rbf=true).  The earlier 0xFFFFFFFE
+   default broke bump_fee on BIP-125-enforcing mempools. *)
 let test_g19_create_tx_not_rbf_signaling_bug () =
   let w = Wallet.create ~network:`Regtest ~db_path:"" in
   let kp = Wallet.generate_key w in
@@ -778,10 +779,9 @@ let test_g19_create_tx_not_rbf_signaling_bug () =
   | Error e -> Alcotest.fail ("G19 create_transaction: " ^ e)
   | Ok tx ->
     let inp = List.hd tx.inputs in
-    (* Current behaviour: 0xFFFFFFFE — non-RBF.  Spec BIP-125: any input
-       with sequence <= 0xFFFFFFFD signals replaceability. *)
-    Alcotest.(check int32) "G19 sequence non-RBF (BUG: should be <=0xFFFFFFFD)"
-      0xFFFFFFFEl inp.sequence
+    (* FIX-70: BIP-125 RBF-signaling default. *)
+    Alcotest.(check int32) "G19 sequence is 0xFFFFFFFD (RBF, FIX-70)"
+      0xFFFFFFFDl inp.sequence
 
 (* G20: bump_fee succeeds + replacement sequence is RBF-signaling
    AND replacement fee > old fee. *)

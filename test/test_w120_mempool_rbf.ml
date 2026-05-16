@@ -681,14 +681,104 @@ let test_g23_mempoolfullrbf_cli_flag_missing () =
    G24 — wallet default sequence
    ============================================================================ *)
 
-(* G24.  BUG-2 P0.  Wallet defaults to 0xFFFFFFFE (NON-replaceable). *)
+(* G24.  BUG-2 P0 — FIX-70 FLIPPED.  Wallet now defaults to
+   MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD), matching Core CWallet v23+.
+   This test now ASSERTS the fix: create_transaction (+ multi variant +
+   walletcreatefundedpsbt + createpsbt) emit `max_bip125_rbf_sequence`
+   on wallet-built inputs.  The bumpfee path already used 0xFFFFFFFDl. *)
 let test_g24_wallet_default_sequence_not_rbf () =
-  (* The bug is present iff create_transaction emits 0xFFFFFFFE not 0xFFFFFFFD. *)
-  Alcotest.(check bool) "BUG-2: wallet still uses 0xFFFFFFFEl for default sends" true
+  (* Post-FIX-70: the buggy literal `sequence = 0xFFFFFFFEl;` is gone
+     from wallet.ml.  (The coinbase mining path lives in mining.ml and
+     correctly keeps 0xFFFFFFFEl as MAX_SEQUENCE_NONFINAL.) *)
+  Alcotest.(check bool) "FIX-70: wallet.ml no longer hardcodes 0xFFFFFFFEl for default sends" false
     (file_has_marker "lib/wallet.ml" "sequence = 0xFFFFFFFEl;");
-  (* The bumpfee path correctly uses 0xFFFFFFFDl — distinct from default. *)
+  (* New default constant is named MAX_BIP125_RBF_SEQUENCE. *)
+  Alcotest.(check bool) "FIX-70: wallet.ml defines max_bip125_rbf_sequence" true
+    (file_has_marker "lib/wallet.ml" "max_bip125_rbf_sequence");
+  (* Wallet defaults to the constant, not a magic literal. *)
+  Alcotest.(check bool) "FIX-70: create_transaction uses max_bip125_rbf_sequence" true
+    (file_has_marker "lib/wallet.ml" "sequence = max_bip125_rbf_sequence");
+  (* The bumpfee path correctly uses 0xFFFFFFFDl — unchanged. *)
   Alcotest.(check bool) "bumpfee path uses 0xFFFFFFFDl correctly" true
     (file_has_marker "lib/wallet.ml" "sequence = 0xFFFFFFFDl")
+
+(* FIX-70 FORWARD REGRESSION GUARD: behavioural check that the wallet
+   actually emits 0xFFFFFFFD on freshly-built tx inputs.  Catches the
+   future drive-by revert that re-introduces 0xFFFFFFFE in the create
+   path even if the file_has_marker text-greps still pass.
+
+   The setup mirrors W118 G19 (create_transaction with a funded wallet)
+   but asserts the OPPOSITE outcome: every input.sequence == 0xFFFFFFFD. *)
+let test_g24_create_transaction_emits_rbf_sequence () =
+  let open Camlcoin in
+  (* Same in-memory minimal funding pattern used by test_w118_wallet:
+     a one-output funding tx to the wallet's first key, scanned at
+     block height 100, then create a 0.5 BTC send to a fresh dest. *)
+  let make_p2wpkh_script pkh =
+    let s = Cstruct.create 22 in
+    Cstruct.set_uint8 s 0 0x00;
+    Cstruct.set_uint8 s 1 0x14;
+    Cstruct.blit pkh 0 s 2 20;
+    s
+  in
+  let make_one_output_tx script value : Types.transaction =
+    let txid = Cstruct.create 32 in
+    { Types.version = 2l;
+      inputs = [{
+        previous_output = { txid; vout = 0l };
+        script_sig = Cstruct.create 0;
+        sequence = 0xFFFFFFFEl;  (* synthetic parent — unrelated to wallet *)
+      }];
+      outputs = [{ value; script_pubkey = script }];
+      witnesses = [];
+      locktime = 0l }
+  in
+  let empty_block_with txs : Types.block =
+    { header = { version = 1l;
+                 prev_block = Types.zero_hash;
+                 merkle_root = Types.zero_hash;
+                 timestamp = 0l;
+                 bits = 0x1d00ffffl;
+                 nonce = 0l };
+      transactions = txs }
+  in
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let kp = Wallet.generate_key w in
+  let pkh = Crypto.hash160 kp.public_key in
+  let script = make_p2wpkh_script pkh in
+  let funding_tx = make_one_output_tx script 1_000_000L in
+  Wallet.scan_block w (empty_block_with [funding_tx]) 100;
+  let dest_w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let dest = Wallet.get_new_address dest_w in
+  (* create_transaction *)
+  (match Wallet.create_transaction w ~dest_address:dest ~amount:500_000L
+           ~fee_rate:1.0 () with
+   | Error e -> Alcotest.fail ("FIX-70 G24 create_transaction: " ^ e)
+   | Ok tx ->
+     List.iter (fun inp ->
+       Alcotest.(check int32)
+         "FIX-70: create_transaction emits 0xFFFFFFFD on every input"
+         0xFFFFFFFDl inp.Types.sequence
+     ) tx.inputs);
+  (* create_transaction_multi — same invariant *)
+  let w2 = Wallet.create ~network:`Regtest ~db_path:"" in
+  let kp2 = Wallet.generate_key w2 in
+  let pkh2 = Crypto.hash160 kp2.public_key in
+  let script2 = make_p2wpkh_script pkh2 in
+  let funding_tx2 = make_one_output_tx script2 1_000_000L in
+  Wallet.scan_block w2 (empty_block_with [funding_tx2]) 100;
+  (match Wallet.create_transaction_multi w2
+           ~outputs:[(dest, 400_000L)] ~fee_rate:1.0 () with
+   | Error e -> Alcotest.fail ("FIX-70 G24 create_transaction_multi: " ^ e)
+   | Ok tx ->
+     List.iter (fun inp ->
+       Alcotest.(check int32)
+         "FIX-70: create_transaction_multi emits 0xFFFFFFFD on every input"
+         0xFFFFFFFDl inp.Types.sequence
+     ) tx.inputs);
+  (* The named constant is the canonical source of truth. *)
+  Alcotest.(check int32) "FIX-70: max_bip125_rbf_sequence = 0xFFFFFFFDl"
+    0xFFFFFFFDl Wallet.max_bip125_rbf_sequence
 
 (* ============================================================================
    G25-G27 — wallet / RPC surface for fee bumping + prioritisation
@@ -806,7 +896,8 @@ let fullrbf_tests = [
 ]
 
 let wallet_tests = [
-  Alcotest.test_case "G24 wallet default 0xFFFFFFFE not RBF (BUG-2, P0)" `Quick test_g24_wallet_default_sequence_not_rbf;
+  Alcotest.test_case "G24 wallet default 0xFFFFFFFD RBF (FIX-70, was BUG-2)" `Quick test_g24_wallet_default_sequence_not_rbf;
+  Alcotest.test_case "G24 forward-regression: create_tx emits 0xFFFFFFFD (FIX-70)" `Quick test_g24_create_transaction_emits_rbf_sequence;
   Alcotest.test_case "G25 no bumpfee/psbtbumpfee RPC (BUG-9, P2)"        `Quick test_g25_no_bumpfee_rpc;
   Alcotest.test_case "G26 no prioritisetransaction RPC (BUG-10, P2)"    `Quick test_g26_no_prioritisetransaction_rpc;
   Alcotest.test_case "G27 sendrawtransaction error envelope present"   `Quick test_g27_sendraw_decode_envelope_present;

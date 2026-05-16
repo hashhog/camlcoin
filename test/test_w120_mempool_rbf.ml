@@ -604,11 +604,205 @@ let test_g17_error_strings_not_aligned_to_core () =
   Alcotest.(check bool) "BUG-13: 'replacement-spends-conflicting-tx' missing" false
     (file_has_marker "lib/mempool.ml" "replacement-spends-conflicting-tx")
 
-(* G18.  BUG-4 P0.  submitpackage hard-codes ("replaced-transactions", `List []).
-   Even when RBF replacement happened in the package, the field stays empty. *)
+(* G18.  BUG-4 P0 — FIX-73 CLOSED.  submitpackage no longer hard-codes
+   ("replaced-transactions", `List []).  The handler now pulls the
+   deduplicated evicted-txid union from [Mempool.accept_package_with_replaced]
+   and shapes it into a JSON array, matching Core's
+   PackageMempoolAcceptResult::m_replaced_transactions plumbing
+   (validation.cpp:760 + rpc/mempool.cpp:1500).
+
+   Forward-regression guard: assert the hardcoded literal is GONE and the
+   correct dispatch + JSON-shaping is wired.  This deliberately fails fast
+   if a future refactor reintroduces the empty literal. *)
 let test_g18_submitpackage_replaces_field_hardcoded_empty () =
-  Alcotest.(check bool) "BUG-4: 'replaced-transactions', `List []' is hard-coded" true
-    (file_has_marker "lib/rpc.ml" "(\"replaced-transactions\", `List [])")
+  (* FIX-73: hardcoded literal MUST be absent *)
+  Alcotest.(check bool) "BUG-4 FIX-73: hardcoded empty list literal removed" false
+    (file_has_marker "lib/rpc.ml" "(\"replaced-transactions\", `List [])");
+  (* FIX-73: handler dispatches through the _with_replaced variant *)
+  Alcotest.(check bool) "BUG-4 FIX-73: accept_package_with_replaced wired in" true
+    (file_has_marker "lib/rpc.ml" "Mempool.accept_package_with_replaced ctx.mempool txs");
+  (* FIX-73: replaced_json shape exists in the handler *)
+  Alcotest.(check bool) "BUG-4 FIX-73: replaced_json list constructed from replaced_txids" true
+    (file_has_marker "lib/rpc.ml" "let replaced_json");
+  (* FIX-73: mempool exposes the underlying primitive *)
+  Alcotest.(check bool) "BUG-4 FIX-73: Mempool.accept_package_with_replaced defined" true
+    (file_has_marker "lib/mempool.ml" "let accept_package_with_replaced");
+  Alcotest.(check bool) "BUG-4 FIX-73: replace_by_fee_with_replaced primitive defined" true
+    (file_has_marker "lib/mempool.ml" "let replace_by_fee_with_replaced")
+
+(* ============================================================================
+   G18 FIX-73 functional tests — replaced_transactions plumbing
+   ============================================================================ *)
+
+(* G18a.  FIX-73 W120 BUG-4 — functional.  Call [replace_by_fee_with_replaced]
+   directly on a real conflict.  Assert that:
+     (1) the replacement is admitted (Ok),
+     (2) the returned evicted-txid list contains exactly the conflicting tx,
+     (3) the conflicting tx is gone from the mempool after the call.
+   Mirrors test_g26_rule3_uses_modified_fee_functional's setup so the same
+   minimum-viable mempool harness is reused. *)
+let test_g18a_replace_by_fee_with_replaced_returns_evicted_txid () =
+  rm_rf "/tmp/camlcoin_w120_g18a";
+  let db = Storage.ChainDB.create "/tmp/camlcoin_w120_g18a" in
+  let utxo = Utxo.UtxoSet.create db in
+  let parent_txid = Types.hash256_of_hex
+    "1111111111111111111111111111111111111111111111111111111111111111" in
+  Utxo.UtxoSet.add utxo parent_txid 0 Utxo.{
+    value = 1_000_000L;
+    script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac";
+    height = 0;
+    is_coinbase = false;
+  };
+  let mp = Mempool.create
+    ~require_standard:false ~verify_scripts:false
+    ~utxo ~current_height:100 () in
+  let inp = { Types.previous_output = { Types.txid = parent_txid; vout = 0l };
+              script_sig = Cstruct.of_string "\x00";
+              sequence = 0xFFFFFFFDl } in
+  (* Original tx: fee = 50_000. *)
+  let tx_orig = { Types.version = 2l;
+                  inputs = [inp];
+                  outputs = [{ Types.value = 950_000L;
+                               script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac" }];
+                  witnesses = [];
+                  locktime = 0l } in
+  let orig_entry = Result.get_ok (Mempool.add_transaction mp tx_orig) in
+  (* Replacement with much higher fee → satisfies Rule 3 + Rule 4. *)
+  let tx_replacement = { Types.version = 2l;
+                         inputs = [inp];
+                         outputs = [{ Types.value = 700_000L;
+                                      script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac" }];
+                         witnesses = [];
+                         locktime = 0l } in
+  match Mempool.replace_by_fee_with_replaced mp tx_replacement with
+  | Error msg ->
+    Alcotest.failf "BUG-4 FIX-73: replacement rejected: %s" msg
+  | Ok (_entry, evicted) ->
+    Alcotest.(check int) "BUG-4 FIX-73: exactly one tx evicted" 1
+      (List.length evicted);
+    let evicted_hex =
+      List.map Types.hash256_to_hex_display evicted in
+    Alcotest.(check bool)
+      "BUG-4 FIX-73: evicted list contains the conflicting tx"
+      true
+      (List.mem (Types.hash256_to_hex_display orig_entry.txid) evicted_hex);
+    Alcotest.(check bool)
+      "BUG-4 FIX-73: conflicting tx removed from mempool"
+      false (Mempool.contains mp orig_entry.txid);
+    Storage.ChainDB.close db
+
+(* G18b.  FIX-73 W120 BUG-4 — functional.  Single-tx submitpackage that does
+   NOT trigger any RBF → [replaced-transactions] field must be an empty list,
+   and the JSON shape must still be present (Core always emits the field, even
+   when empty — see rpc/mempool.cpp:1510).
+   Runs through the RPC dispatcher to exercise the whole plumbing path. *)
+let test_g18b_submitpackage_no_rbf_returns_empty_list () =
+  let ctx = make_rpc_ctx () in
+  (* Hand-craft a hex tx that the RPC will decode but cannot insert (no UTXO).
+     We don't care about the package_msg outcome here — only that the
+     "replaced-transactions" field is present and is an empty list. *)
+  let dummy_tx_hex =
+    "02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff00ffffffff0100e1f50500000000160014abababababababababababababababababababab00000000"
+  in
+  match Rpc.dispatch_rpc ctx "submitpackage" [`List [`String dummy_tx_hex]] with
+  | Error (code, msg) ->
+    Alcotest.failf "BUG-4 FIX-73: submitpackage dispatch failed: %d %s" code msg
+  | Ok (`Assoc fields) ->
+    (match List.assoc_opt "replaced-transactions" fields with
+     | Some (`List []) -> ()  (* The expected shape when no RBF happens. *)
+     | Some (`List xs) ->
+       Alcotest.failf
+         "BUG-4 FIX-73: replaced-transactions non-empty when no RBF happened (got %d entries)"
+         (List.length xs)
+     | Some other ->
+       Alcotest.failf
+         "BUG-4 FIX-73: replaced-transactions wrong type, got %s"
+         (Yojson.Safe.to_string other)
+     | None ->
+       Alcotest.fail "BUG-4 FIX-73: replaced-transactions field missing")
+  | Ok other ->
+    Alcotest.failf "BUG-4 FIX-73: unexpected response shape: %s"
+      (Yojson.Safe.to_string other)
+
+(* G18c.  FIX-73 W120 BUG-4 — accept_result.atmp_replaced_txids field plumbed
+   through accept_to_memory_pool.  No-conflict path returns empty list. *)
+let test_g18c_atmp_replaced_txids_empty_when_no_rbf () =
+  rm_rf "/tmp/camlcoin_w120_g18c";
+  let db = Storage.ChainDB.create "/tmp/camlcoin_w120_g18c" in
+  let utxo = Utxo.UtxoSet.create db in
+  let funding_txid = Types.hash256_of_hex
+    "2222222222222222222222222222222222222222222222222222222222222222" in
+  Utxo.UtxoSet.add utxo funding_txid 0 Utxo.{
+    value = 1_000_000L;
+    script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac";
+    height = 0;
+    is_coinbase = false;
+  };
+  let mp = Mempool.create
+    ~require_standard:false ~verify_scripts:false
+    ~utxo ~current_height:100 () in
+  let inp = { Types.previous_output = { Types.txid = funding_txid; vout = 0l };
+              script_sig = Cstruct.of_string "\x00";
+              sequence = 0xFFFFFFFDl } in
+  let tx = { Types.version = 2l;
+             inputs = [inp];
+             outputs = [{ Types.value = 950_000L;
+                          script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac" }];
+             witnesses = [];
+             locktime = 0l } in
+  let r = Mempool.accept_to_memory_pool mp tx in
+  Alcotest.(check bool) "atmp_accepted true" true r.atmp_accepted;
+  Alcotest.(check int) "atmp_replaced_txids empty when no RBF" 0
+    (List.length r.atmp_replaced_txids);
+  Storage.ChainDB.close db
+
+(* G18d.  FIX-73 W120 BUG-4 — accept_result.atmp_replaced_txids populated when
+   ATMP triggers an RBF.  Submit tx1, then submit tx2 (same input, higher
+   fee) — second admission's accept_result must list tx1 in its
+   atmp_replaced_txids. *)
+let test_g18d_atmp_replaced_txids_populated_on_rbf () =
+  rm_rf "/tmp/camlcoin_w120_g18d";
+  let db = Storage.ChainDB.create "/tmp/camlcoin_w120_g18d" in
+  let utxo = Utxo.UtxoSet.create db in
+  let funding_txid = Types.hash256_of_hex
+    "3333333333333333333333333333333333333333333333333333333333333333" in
+  Utxo.UtxoSet.add utxo funding_txid 0 Utxo.{
+    value = 1_000_000L;
+    script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac";
+    height = 0;
+    is_coinbase = false;
+  };
+  let mp = Mempool.create
+    ~require_standard:false ~verify_scripts:false
+    ~utxo ~current_height:100 () in
+  let inp = { Types.previous_output = { Types.txid = funding_txid; vout = 0l };
+              script_sig = Cstruct.of_string "\x00";
+              sequence = 0xFFFFFFFDl } in
+  let tx1 = { Types.version = 2l;
+              inputs = [inp];
+              outputs = [{ Types.value = 950_000L;
+                           script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac" }];
+              witnesses = [];
+              locktime = 0l } in
+  let r1 = Mempool.accept_to_memory_pool mp tx1 in
+  Alcotest.(check bool) "first tx accepted" true r1.atmp_accepted;
+  Alcotest.(check int) "first tx has no evictions" 0
+    (List.length r1.atmp_replaced_txids);
+  let tx2 = { Types.version = 2l;
+              inputs = [inp];
+              outputs = [{ Types.value = 700_000L;
+                           script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac" }];
+              witnesses = [];
+              locktime = 0l } in
+  let r2 = Mempool.accept_to_memory_pool mp tx2 in
+  Alcotest.(check bool) "second tx accepted (RBF)" true r2.atmp_accepted;
+  Alcotest.(check int) "second tx evicted exactly one" 1
+    (List.length r2.atmp_replaced_txids);
+  let evicted_hex =
+    List.map Types.hash256_to_hex_display r2.atmp_replaced_txids in
+  Alcotest.(check bool) "second tx eviction list contains first tx" true
+    (List.mem (Types.hash256_to_hex_display r1.atmp_txid) evicted_hex);
+  Storage.ChainDB.close db
 
 (* ============================================================================
    G19-G20 — RBF routing through validators + fee-estimator skip
@@ -1096,7 +1290,11 @@ let rpc_surface_tests = [
   Alcotest.test_case "G15a non-signaling child of signaling parent → true (BIP-125)" `Quick test_g15a_non_signaling_child_of_signaling_parent_true;
   Alcotest.test_case "G16 sendrawtransaction bypasses RBF (BUG-3, P1)"         `Quick test_g16_sendrawtransaction_bypasses_rbf;
   Alcotest.test_case "G17 error strings not Core-aligned (BUG-13, P2)"         `Quick test_g17_error_strings_not_aligned_to_core;
-  Alcotest.test_case "G18 submitpackage replaced-transactions hardcoded [] (BUG-4, P0)" `Quick test_g18_submitpackage_replaces_field_hardcoded_empty;
+  Alcotest.test_case "G18  submitpackage replaced-transactions hardcoded [] (BUG-4 FIX-73)" `Quick test_g18_submitpackage_replaces_field_hardcoded_empty;
+  Alcotest.test_case "G18a replace_by_fee_with_replaced returns evicted txid (BUG-4 FIX-73)" `Quick test_g18a_replace_by_fee_with_replaced_returns_evicted_txid;
+  Alcotest.test_case "G18b submitpackage no-RBF returns empty list (BUG-4 FIX-73)" `Quick test_g18b_submitpackage_no_rbf_returns_empty_list;
+  Alcotest.test_case "G18c atmp_replaced_txids empty when no RBF (BUG-4 FIX-73)" `Quick test_g18c_atmp_replaced_txids_empty_when_no_rbf;
+  Alcotest.test_case "G18d atmp_replaced_txids populated on RBF (BUG-4 FIX-73)" `Quick test_g18d_atmp_replaced_txids_populated_on_rbf;
 ]
 
 let routing_tests = [

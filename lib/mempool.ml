@@ -2819,14 +2819,27 @@ let get_prioritised_transactions (mp : mempool)
    1. New fee > sum of all conflicting fees (including descendants)
    2. New fee_rate > conflicting fee_rate + incremental_relay_fee
    3. Max 100 transactions evicted
-   4. No new unconfirmed inputs (except from conflicting txs) *)
-let replace_by_fee (mp : mempool) (tx : Types.transaction)
-    : (mempool_entry, string) result =
+   4. No new unconfirmed inputs (except from conflicting txs)
+
+   FIX-73 W120 BUG-4: [replace_by_fee_with_replaced] returns the deduplicated
+   list of evicted txids alongside the new entry so the submitpackage RPC can
+   populate `replaced-transactions` matching Core's
+   PackageMempoolAcceptResult::m_replaced_transactions (validation.cpp:1236).
+   The list comes straight from [evicted_set] (direct conflicts + descendants,
+   dedup'd by txid) so it is the exact set of mempool entries that were
+   physically removed by the replacement.  Empty list ⇒ no RBF happened (the
+   add was on a free outpoint).  Existing [replace_by_fee] is preserved as
+   a thin discard-wrapper so the ~20 call sites in test_mempool.ml continue
+   to compile. *)
+let replace_by_fee_with_replaced (mp : mempool) (tx : Types.transaction)
+    : (mempool_entry * Types.hash256 list, string) result =
   let conflicts = find_all_conflicts mp tx in
   match conflicts with
   | [] ->
-    (* No conflict, just add normally *)
-    add_transaction mp tx
+    (* No conflict, just add normally — empty replaced list *)
+    (match add_transaction mp tx with
+     | Ok e -> Ok (e, [])
+     | Error s -> Error s)
   | _ ->
     (* Full RBF: no BIP125 signaling check required *)
     (* Calculate new transaction fee *)
@@ -3028,7 +3041,16 @@ let replace_by_fee (mp : mempool) (tx : Types.transaction)
                   match add_transaction ~dry_run:true mp tx with
                   | Error e -> Error e
                   | Ok _ ->
-                    (* All gates passed; now atomically remove conflicts and add replacement. *)
+                    (* All gates passed; now atomically remove conflicts and add replacement.
+                       FIX-73 W120 BUG-4: collect the deduplicated evicted txid list from
+                       [evicted_set] (direct conflicts + descendants) BEFORE [remove_transaction]
+                       so even though removal triggers cascading dependents-cleanup we still
+                       return the canonical Core PackageMempoolAcceptResult set: every entry that
+                       was in [evicted_set] is one Core would include in m_replaced_transactions.
+                       Order is unspecified (Core uses a std::set<uint256> on the RPC side too —
+                       rpc/mempool.cpp:1500). *)
+                    let evicted_txids =
+                      Hashtbl.fold (fun _k e acc -> e.txid :: acc) evicted_set [] in
                     List.iter (fun conflict_entry ->
                       remove_transaction mp conflict_entry.txid
                     ) conflicts;
@@ -3036,7 +3058,9 @@ let replace_by_fee (mp : mempool) (tx : Types.transaction)
                        between dry_run and commit (e.g. concurrent eviction or OOM).  In that
                        case the conflicts are already removed.  This window is negligible in
                        single-threaded OCaml execution but documented for completeness. *)
-                    add_transaction mp tx
+                    (match add_transaction mp tx with
+                     | Ok e -> Ok (e, evicted_txids)
+                     | Error s -> Error s)
                   end
                 end
               end
@@ -3045,18 +3069,35 @@ let replace_by_fee (mp : mempool) (tx : Types.transaction)
         end
       end
 
+(* Thin discard-wrapper: legacy [replace_by_fee] callers (tests + internal
+   accept_transaction) that don't care about the evicted-txid list.  Mirrors
+   the original API exactly so the FIX-73 refactor does not ripple. *)
+let replace_by_fee (mp : mempool) (tx : Types.transaction)
+    : (mempool_entry, string) result =
+  match replace_by_fee_with_replaced mp tx with
+  | Ok (e, _) -> Ok e
+  | Error s -> Error s
+
 (* Accept a transaction with full RBF support.
    If the transaction conflicts with existing mempool entries, automatically
    attempts replacement if the new transaction pays higher fees.
-   This is the main entry point for accepting transactions with full RBF. *)
-let accept_transaction ?(dry_run=false) (mp : mempool) (tx : Types.transaction)
-    : (mempool_entry, string) result =
+   This is the main entry point for accepting transactions with full RBF.
+
+   FIX-73 W120 BUG-4: [accept_transaction_with_replaced] forwards the
+   evicted-txid list from [replace_by_fee_with_replaced] so package and
+   single-tx paths can plumb it into Core-compatible RPC responses.  The
+   legacy [accept_transaction] wrapper preserves the old return type for
+   the test suite. *)
+let accept_transaction_with_replaced ?(dry_run=false) (mp : mempool) (tx : Types.transaction)
+    : (mempool_entry * Types.hash256 list, string) result =
   (* First check if there are conflicts *)
   let conflicts = find_all_conflicts mp tx in
   match conflicts with
   | [] ->
-    (* No conflicts, use normal add_transaction *)
-    add_transaction ~dry_run mp tx
+    (* No conflicts, use normal add_transaction — empty replaced list *)
+    (match add_transaction ~dry_run mp tx with
+     | Ok e -> Ok (e, [])
+     | Error s -> Error s)
   | _ ->
     if dry_run then
       (* For dry_run, just check if RBF would succeed by doing validation *)
@@ -3064,7 +3105,13 @@ let accept_transaction ?(dry_run=false) (mp : mempool) (tx : Types.transaction)
       Error "txn-mempool-conflict (dry run with conflicts)"
     else
       (* Attempt full RBF replacement *)
-      replace_by_fee mp tx
+      replace_by_fee_with_replaced mp tx
+
+let accept_transaction ?(dry_run=false) (mp : mempool) (tx : Types.transaction)
+    : (mempool_entry, string) result =
+  match accept_transaction_with_replaced ~dry_run mp tx with
+  | Ok (e, _) -> Ok e
+  | Error s -> Error s
 
 (* AcceptToMemoryPool — main entry point matching Bitcoin Core's AcceptToMemoryPool.
    Validates and adds a transaction to the mempool, handling RBF conflicts.
@@ -3076,6 +3123,11 @@ type accept_result = {
   atmp_fee : int64;
   atmp_vsize : int;
   atmp_reject_reason : string option;
+  (* FIX-73 W120 BUG-4: list of txids physically evicted by RBF when this tx
+     was accepted as a replacement.  Empty when no conflicts were resolved
+     (the common case: fresh outpoint admission).  Matches the per-tx
+     contribution to Core's PackageMempoolAcceptResult::m_replaced_transactions. *)
+  atmp_replaced_txids : Types.hash256 list;
 }
 
 let accept_to_memory_pool ?(test_accept=false) (mp : mempool) (tx : Types.transaction)
@@ -3093,8 +3145,12 @@ let accept_to_memory_pool ?(test_accept=false) (mp : mempool) (tx : Types.transa
   in
   let safe_run () =
     try
-      if test_accept then accept_transaction ~dry_run:true mp tx
-      else accept_transaction mp tx
+      if test_accept then
+        (* dry_run path never mutates — no real evictions possible. *)
+        (match accept_transaction ~dry_run:true mp tx with
+         | Ok e -> Ok (e, [])
+         | Error s -> Error s)
+      else accept_transaction_with_replaced mp tx
     with
     | Failure msg -> Error (Printf.sprintf "atmp-exception: %s" msg)
     | Invalid_argument msg -> Error (Printf.sprintf "atmp-exception: %s" msg)
@@ -3102,14 +3158,16 @@ let accept_to_memory_pool ?(test_accept=false) (mp : mempool) (tx : Types.transa
     | exn -> Error (Printf.sprintf "atmp-exception: %s" (Printexc.to_string exn))
   in
   match safe_run () with
-  | Ok entry ->
+  | Ok (entry, replaced_txids) ->
     { atmp_accepted = true; atmp_txid = txid; atmp_fee = entry.fee;
       (* ceil(weight / 4) — must round up, not truncate; policy/policy.cpp:395-398 *)
       atmp_vsize = (entry.weight + 3) / 4;
-      atmp_reject_reason = None }
+      atmp_reject_reason = None;
+      atmp_replaced_txids = replaced_txids; }
   | Error reason ->
     { atmp_accepted = false; atmp_txid = txid; atmp_fee = 0L; atmp_vsize = 0;
-      atmp_reject_reason = Some reason }
+      atmp_reject_reason = Some reason;
+      atmp_replaced_txids = []; }
 
 (* ============================================================================
    Orphan Transaction Pool (Task 8)
@@ -3970,16 +4028,25 @@ let calc_tx_fee_vsize (mp : mempool) (tx : Types.transaction)
 (* Accept a package of transactions.
    Validates topologically (parents before children).
    Computes package fee rate as total_fees / total_vsize.
-   Accepts if package fee rate meets minimum, even if individual txs don't. *)
-let accept_package (mp : mempool) (txs : Types.transaction list)
-    : package_result =
+   Accepts if package fee rate meets minimum, even if individual txs don't.
+
+   FIX-73 W120 BUG-4: the [_with_replaced] variant returns the deduplicated
+   union of all txids evicted by the package's admissions (across every
+   per-tx RBF triggered inside the package).  Matches Core's
+   PackageMempoolAcceptResult::m_replaced_transactions which accumulates the
+   per-MempoolAcceptResult::m_replaced_transactions across the package
+   (validation.cpp:760, rpc/mempool.cpp:1500).  The legacy [accept_package]
+   wrapper returns only the package_result so the existing test suite +
+   net-processing call sites stay source-compatible. *)
+let accept_package_with_replaced (mp : mempool) (txs : Types.transaction list)
+    : package_result * Types.hash256 list =
   (* Validate well-formedness *)
   match is_well_formed_package txs with
-  | Error msg -> PackageRejected msg
+  | Error msg -> (PackageRejected msg, [])
   | Ok () ->
     (* Topologically sort *)
     match topo_sort txs with
-    | Error msg -> PackageRejected msg
+    | Error msg -> (PackageRejected msg, [])
     | Ok sorted ->
       (* BUG-6 fix: enforce IsChildWithParentsTree topology for multi-tx packages.
          Core rejects any package that is not child-with-parents-tree before
@@ -3987,7 +4054,7 @@ let accept_package (mp : mempool) (txs : Types.transaction list)
          Single-tx packages are exempted (equivalent to plain ATMP). *)
       let n_sorted = List.length sorted in
       (match (if n_sorted >= 2 then is_child_with_parents_tree sorted else Ok ()) with
-       | Error msg -> PackageRejected msg
+       | Error msg -> (PackageRejected msg, [])
        | Ok () ->
       (* Track UTXOs created by earlier transactions in the package *)
       let package_utxos = Hashtbl.create 16 in
@@ -3996,6 +4063,9 @@ let accept_package (mp : mempool) (txs : Types.transaction list)
       let accepted = ref [] in
       let rejected = ref [] in
       let package_txids = Hashtbl.create 16 in
+      (* FIX-73 W120 BUG-4: accumulator for evicted-txid union across the
+         package.  Hashtbl provides O(1) dedup keyed by binary txid string. *)
+      let evicted_union : (string, Types.hash256) Hashtbl.t = Hashtbl.create 16 in
 
       (* First pass: calculate fees and check for already-in-mempool txs *)
       let fees_vsizes = List.map (fun tx ->
@@ -4066,38 +4136,72 @@ let accept_package (mp : mempool) (txs : Types.transaction list)
           if not passes_feerate then
             rejected := (tx, "Fee below minimum relay fee (not enough CPFP)") :: !rejected
           else begin
-            (* Always use add_transaction to ensure full validation including
-               script verification. Pass ~bypass_fee_check for CPFP packages. *)
+            (* FIX-73 W120 BUG-4: per-tx admission inside the package.  Pre-
+               check for conflicts; if any are present route through the FIX-72
+               wired [replace_by_fee_with_replaced] so RBF Rule 3 (with modified
+               fees on both sides) gates the replacement and the evicted-txid
+               list propagates up into the package's m_replaced_transactions
+               union.  No conflicts → plain [add_transaction] path is preserved
+               so CPFP-style packages keep their ~bypass_fee_check behaviour
+               (replace_by_fee_with_replaced has no need for it — it operates
+               on the candidate's own fees vs the conflict set).
+               Note: this NARROWS BUG-7 (package-RBF) — per-tx RBF inside a
+               package now works, but true package-feerate-based replacement
+               (treating the whole package as one replacement unit per BIP-431
+               §"RBF for packages") is still missing and tracked separately. *)
+            let conflicts_for_tx = find_all_conflicts mp tx in
             let add_result =
-              add_transaction ~bypass_fee_check:use_package_feerate mp tx
+              if conflicts_for_tx = [] then
+                (match add_transaction ~bypass_fee_check:use_package_feerate mp tx with
+                 | Ok e -> Ok (e, [])
+                 | Error s -> Error s)
+              else
+                replace_by_fee_with_replaced mp tx
             in
             match add_result with
-            | Ok entry -> accepted := entry :: !accepted
+            | Ok (entry, evicted) ->
+              accepted := entry :: !accepted;
+              List.iter (fun (txid : Types.hash256) ->
+                let k = Cstruct.to_string txid in
+                if not (Hashtbl.mem evicted_union k) then
+                  Hashtbl.replace evicted_union k txid
+              ) evicted
             | Error msg -> rejected := (tx, msg) :: !rejected
           end
       ) fees_vsizes;
 
       let accepted_list = List.rev !accepted in
       let rejected_list = List.rev !rejected in
+      let evicted_list =
+        Hashtbl.fold (fun _k txid acc -> txid :: acc) evicted_union [] in
 
       (* Check ephemeral anchor policy: all dust outputs must be spent *)
-      if rejected_list = [] && accepted_list <> [] then begin
-        match check_ephemeral_spends mp sorted with
-        | Error (msg, _txid) ->
-          PackageRejected (Printf.sprintf "missing-ephemeral-spends: %s" msg)
-        | Ok () ->
-          PackageAccepted accepted_list
-      end else if accepted_list = [] then
-        PackageRejected (snd (List.hd rejected_list))
-      else
-        (* Partial acceptance - still check ephemeral spends for accepted txs *)
-        let accepted_txs = List.map (fun e -> e.tx) accepted_list in
-        match check_ephemeral_spends mp accepted_txs with
-        | Error (msg, _txid) ->
-          PackageRejected (Printf.sprintf "missing-ephemeral-spends: %s" msg)
-        | Ok () ->
-          PackagePartial { accepted = accepted_list; rejected = rejected_list }
+      let pkg_result =
+        if rejected_list = [] && accepted_list <> [] then begin
+          match check_ephemeral_spends mp sorted with
+          | Error (msg, _txid) ->
+            PackageRejected (Printf.sprintf "missing-ephemeral-spends: %s" msg)
+          | Ok () ->
+            PackageAccepted accepted_list
+        end else if accepted_list = [] then
+          PackageRejected (snd (List.hd rejected_list))
+        else
+          (* Partial acceptance - still check ephemeral spends for accepted txs *)
+          let accepted_txs = List.map (fun e -> e.tx) accepted_list in
+          match check_ephemeral_spends mp accepted_txs with
+          | Error (msg, _txid) ->
+            PackageRejected (Printf.sprintf "missing-ephemeral-spends: %s" msg)
+          | Ok () ->
+            PackagePartial { accepted = accepted_list; rejected = rejected_list }
+      in
+      (pkg_result, evicted_list)
       )  (* end is_child_with_parents_tree match *)
+
+(* Thin discard-wrapper: legacy [accept_package] callers (test suite +
+   net-processing) that don't surface the evicted-txid list. *)
+let accept_package (mp : mempool) (txs : Types.transaction list)
+    : package_result =
+  fst (accept_package_with_replaced mp txs)
 
 (* Find a 1p1c package for an orphan transaction.
    When an orphan's parent arrives but is rejected for low fee,

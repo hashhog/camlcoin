@@ -1035,6 +1035,37 @@ let lookup_block_height (state : chain_state) (hash : Types.hash256)
   | Some entry -> Some entry.height
   | None -> None
 
+(* [get_ancestor state idx height] returns the header_entry that is the
+   ancestor of [idx] at [height], walking the parent chain by
+   [header.prev_block]. Mirrors Bitcoin Core's
+   `CBlockIndex::GetAncestor(int height)` (chain.cpp).  Returns [None]
+   when [height] is out of range (negative, above [idx.height], or
+   unreachable because a parent header is missing from the in-memory
+   table).  Used by the BIP-157 compact-filter request handlers and the
+   REST blockfilterheaders endpoint to anchor the height-keyed walk on
+   the peer-supplied stop_hash, rather than the active chain.  Without
+   this anchor, a peer that supplies a stale/orphan stop_hash receives
+   active-chain filters signed with the stale stop_hash — a DoS vector
+   + privacy leak about which fork the peer is interested in.  Core
+   intentionally serves stale-fork filters here (compact filters are
+   stored by block hash regardless of fork membership); we match that
+   by walking parent links rather than gating on chain.contains.    *)
+let get_ancestor (state : chain_state) (idx : header_entry) (height : int)
+    : header_entry option =
+  if height < 0 || height > idx.height then None
+  else if height = idx.height then Some idx
+  else
+    let rec walk (e : header_entry) =
+      if e.height = height then Some e
+      else if e.height < height then None
+      else
+        let pkey = Cstruct.to_string e.header.prev_block in
+        match Hashtbl.find_opt state.headers pkey with
+        | Some p -> walk p
+        | None -> None
+    in
+    walk idx
+
 (* The validated-block tip — the header_entry for the highest block that has
    been fully validated and connected (UTXO set updated).  This is distinct
    from [state.tip], which tracks the best-work *header* and may lead

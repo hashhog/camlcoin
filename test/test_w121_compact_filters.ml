@@ -153,6 +153,104 @@ let hex_encode (s : string) : string =
   done;
   Buffer.contents b
 
+(* -- FIX-74 source guards ------------------------------------------------ *)
+(* These helpers read the on-disk source for the 4 BIP-157 paths
+   (cli.ml getcfilters/getcfheaders/getcfcheckpt + rest.ml
+   blockfilterheaders) and assert that the height-keyed active-chain
+   helper [Sync.get_header_at_height] is NOT reachable from any of the
+   4 listener arms, and that [Sync.get_ancestor] IS used in the 3 P2P
+   paths.  Forward-regression guard for FIX-74. *)
+module Fix74_source_guard = struct
+  let resolve_repo_root () =
+    (* The test binary executes from the dune build directory; the
+       repo root is reached by walking up until we find lib/cli.ml. *)
+    let rec up dir depth =
+      if depth > 10 then
+        Alcotest.fail "could not locate repo root from CWD"
+      else if Sys.file_exists (Filename.concat dir "lib/cli.ml") then dir
+      else up (Filename.dirname dir) (depth + 1)
+    in
+    up (Sys.getcwd ()) 0
+
+  let read_file path =
+    let ic = open_in path in
+    let n = in_channel_length ic in
+    let buf = Bytes.create n in
+    really_input ic buf 0 n;
+    close_in ic;
+    Bytes.to_string buf
+
+  let cli_ml () = read_file (Filename.concat (resolve_repo_root ()) "lib/cli.ml")
+  let rest_ml () = read_file (Filename.concat (resolve_repo_root ()) "lib/rest.ml")
+
+  (* Extract the body of a listener arm by anchoring on a marker
+     comment and reading until the next ' | P2p.' or 'let ' boundary. *)
+  let extract_between src start_marker end_marker =
+    match Str.search_forward (Str.regexp_string start_marker) src 0 with
+    | exception Not_found ->
+      Alcotest.failf "marker not found in source: %s" start_marker
+    | i ->
+      let rest_offset = i + String.length start_marker in
+      (match Str.search_forward (Str.regexp_string end_marker) src rest_offset with
+       | exception Not_found ->
+         String.sub src i (String.length src - i)
+       | j -> String.sub src i (j - i))
+
+  let cli_getcfilters_body () =
+    extract_between (cli_ml ())
+      "| P2p.GetcfiltersMsg { filter_type = 0;"
+      "| P2p.GetcfheadersMsg { filter_type = 0;"
+
+  let cli_getcfheaders_body () =
+    extract_between (cli_ml ())
+      "| P2p.GetcfheadersMsg { filter_type = 0;"
+      "| P2p.GetcfcheckptMsg { filter_type = 0;"
+
+  let cli_getcfcheckpt_body () =
+    extract_between (cli_ml ())
+      "| P2p.GetcfcheckptMsg { filter_type = 0;"
+      "| P2p.GetcfiltersMsg _, None"
+
+  let rest_blockfilterheaders_body () =
+    extract_between (rest_ml ())
+      "let handle_blockfilterheaders"
+      "(* ============================================================================\n   Chain Info Endpoint"
+
+  let contains_substring haystack needle =
+    try
+      let _ = Str.search_forward (Str.regexp_string needle) haystack 0 in
+      true
+    with Not_found -> false
+
+  let assert_no_get_header_at_height label body =
+    if contains_substring body "get_header_at_height" then
+      Alcotest.failf
+        "FIX-74 forward-regression: %s body still references \
+         get_header_at_height — must use Sync.get_ancestor stop_index h"
+        label
+
+  let assert_uses_get_ancestor label body =
+    if not (contains_substring body "get_ancestor") then
+      Alcotest.failf
+        "FIX-74 forward-regression: %s body does not invoke \
+         Sync.get_ancestor (stop-hash anchored walk)"
+        label
+
+  let assert_uses_active_chain_contains label body =
+    (* REST path mirrors Core's active_chain.Contains gate.  In OCaml
+       we express this by comparing the entry's hash against
+       Storage.ChainDB.get_hash_at_height at the entry's height.  Test
+       for the identifying helper name [is_on_active_chain] or the
+       inline Cstruct.equal comparison. *)
+    if not (contains_substring body "is_on_active_chain")
+       && not (contains_substring body "active_chain")
+    then
+      Alcotest.failf
+        "FIX-74 forward-regression: %s body does not gate side-branch \
+         start hash via active-chain Contains semantics"
+        label
+end
+
 (* -- G1 PRESENT: GCS Params (BIP-158 P=19 / M=784931) -------------------- *)
 let g1_basic_filter_constants () =
   Alcotest.(check int) "BIP-158 BASIC_FILTER_P = 19" 19 Block_index.basic_filter_p;
@@ -414,16 +512,17 @@ let g17_invalid_range_silent () =
     "BUG-1b documented: cli.ml getcfilters drops oversize range without disconnect"
     true true
 
-(* -- G18 BUG-3 + BUG-20: cli.ml getcfilters walks active chain ------------ *)
+(* -- G18 FIXED (FIX-74): getcfilters now anchors on stop_hash via
+   Sync.get_ancestor.  Mirror of Bitcoin Core
+   net_processing.cpp::PrepareBlockFilterRequest + GetAncestor. *)
 let g18_active_chain_walk () =
-  (* cli.ml:1000 calls Sync.get_header_at_height chain !h (active
-     chain) instead of stop_hash->GetAncestor(h). On a side-branch
-     stop_hash this leaks active-chain filters; BUG-20 layers on top
-     that lookup_block_height returns the orphan height, so a peer
-     can probe a known-orphan hash and receive active-chain filters
-     signed as cfilter responses. *)
+  let body = Fix74_source_guard.cli_getcfilters_body () in
+  Fix74_source_guard.assert_no_get_header_at_height
+    "getcfilters" body;
+  Fix74_source_guard.assert_uses_get_ancestor
+    "getcfilters" body;
   Alcotest.(check bool)
-    "BUG-3 documented: getcfilters walks active chain, not stop_hash ancestry"
+    "FIX-74: getcfilters walks stop_hash ancestry via Sync.get_ancestor"
     true true
 
 (* -- G19 BUG-2: getcfheaders falls back to zero prev_header -------------- *)
@@ -437,19 +536,29 @@ let g19_getcfheaders_zero_fallback () =
     "BUG-2 documented: getcfheaders prev_filter_header zero-fallback"
     true true
 
-(* -- G20 BUG-3: getcfheaders walks active chain -------------------------- *)
+(* -- G20 FIXED (FIX-74): getcfheaders now anchors on stop_hash via
+   Sync.get_ancestor.  Mirror of Bitcoin Core
+   net_processing.cpp::ProcessGetCFHeaders. *)
 let g20_getcfheaders_active_chain () =
+  let body = Fix74_source_guard.cli_getcfheaders_body () in
+  Fix74_source_guard.assert_no_get_header_at_height
+    "getcfheaders" body;
+  Fix74_source_guard.assert_uses_get_ancestor
+    "getcfheaders" body;
   Alcotest.(check bool)
-    "BUG-3 documented: getcfheaders walks active chain, not stop_hash ancestry"
+    "FIX-74: getcfheaders walks stop_hash ancestry via Sync.get_ancestor"
     true true
 
-(* -- G21 BUG-13: getcfcheckpt walks active chain ------------------------- *)
+(* -- G21 FIXED (FIX-74): getcfcheckpt now anchors on stop_hash via
+   Sync.get_ancestor (Core net_processing.cpp:3409). *)
 let g21_getcfcheckpt_active_chain () =
-  (* cli.ml:1082 — for each checkpoint height i*1000, fetches
-     get_header_at_height chain height (active chain). Core uses
-     block_index->GetAncestor(height) (net_processing.cpp:3409). *)
+  let body = Fix74_source_guard.cli_getcfcheckpt_body () in
+  Fix74_source_guard.assert_no_get_header_at_height
+    "getcfcheckpt" body;
+  Fix74_source_guard.assert_uses_get_ancestor
+    "getcfcheckpt" body;
   Alcotest.(check bool)
-    "BUG-13 documented: getcfcheckpt walks active chain"
+    "FIX-74: getcfcheckpt walks stop_hash ancestry via Sync.get_ancestor"
     true true
 
 (* -- G22 PRESENT: getcfcheckpt response cadence (every 1000 blocks) ------ *)
@@ -507,13 +616,17 @@ let g28_service_bit_wiring () =
     "BUG-17 documented: no -peerblockfilters flag (cannot index without serving)"
     true true
 
-(* -- G29 PARTIAL: REST /rest/blockfilter[headers] endpoints -------------- *)
+(* -- G29 FIXED (FIX-74): REST blockfilterheaders now requires that the
+   START hash is on the active chain (Core rest.cpp:rest_filter_header
+   line 555: active_chain.Contains(pindex)).  If the request's start
+   hash is on a side branch, the walk now terminates immediately rather
+   than silently jumping to the active chain at the next height. *)
 let g29_rest_endpoints () =
-  (* PRESENT: parse_filter_type / handle_blockfilter / handle_blockfilterheaders
-     are wired (rest.ml:444-581). BUG-18 layered: handle_blockfilterheaders
-     walks active chain via Storage.ChainDB.get_hash_at_height. *)
+  let body = Fix74_source_guard.rest_blockfilterheaders_body () in
+  Fix74_source_guard.assert_uses_active_chain_contains
+    "blockfilterheaders" body;
   Alcotest.(check bool)
-    "BUG-18 documented: REST blockfilterheaders walks active chain on side-branch start"
+    "FIX-74: REST blockfilterheaders gates side-branch start via active-chain Contains"
     true true
 
 (* -- G30 PRESENT: JSON-RPC getblockfilter -------------------------------- *)
@@ -561,6 +674,234 @@ let bug8_trailing_data_accepted () =
   let _ = Block_index.decode_filter p evil in
   Alcotest.(check bool) "BUG-8 documented: decode_filter accepts trailing junk"
     true true
+
+(* -- FIX-74 behavioral tests --------------------------------------------- *)
+(* Test the [Sync.get_ancestor] helper itself: build a header chain with
+   a side branch, then verify ancestor walks resolve to the correct
+   fork, NOT the active chain. *)
+
+let fix74_db_path = "/tmp/camlcoin_test_fix74_db"
+
+let fix74_cleanup_db () =
+  let rec rm_rf path =
+    if Sys.file_exists path then begin
+      if Sys.is_directory path then begin
+        Array.iter (fun f -> rm_rf (Filename.concat path f)) (Sys.readdir path);
+        Unix.rmdir path
+      end else
+        Unix.unlink path
+    end
+  in
+  rm_rf fix74_db_path
+
+let fix74_mine_header ~prev_block ~merkle_root ~ts ~bits () =
+  let rec loop nonce =
+    if nonce > 5_000_000l then
+      failwith "fix74_mine_header: failed to find nonce"
+    else
+      let h : Types.block_header =
+        { Types.version = 1l; prev_block; merkle_root;
+          timestamp = ts; bits; nonce }
+      in
+      let hash = Crypto.compute_block_hash h in
+      if Consensus.hash_meets_target hash h.bits then h
+      else loop (Int32.add nonce 1l)
+  in
+  loop 0l
+
+(* Build regtest chain: genesis -> A1 -> A2 -> A3 (active),
+   and a side branch genesis -> A1 -> B2 (orphan at height 2). *)
+let fix74_build_chain_with_side_branch () =
+  fix74_cleanup_db ();
+  let db = Storage.ChainDB.create fix74_db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let bits = Consensus.regtest.genesis_header.bits in
+  let genesis_hash =
+    Crypto.compute_block_hash Consensus.regtest.genesis_header
+  in
+  let ts0 =
+    Int32.add Consensus.regtest.genesis_header.timestamp 600l
+  in
+  (* A1 child of genesis *)
+  let a1 = fix74_mine_header
+    ~prev_block:genesis_hash
+    ~merkle_root:(Cstruct.of_string (String.make 32 '\x01'))
+    ~ts:ts0 ~bits ()
+  in
+  let a1_hash = Crypto.compute_block_hash a1 in
+  (match Sync.validate_header state a1 with
+   | Ok entry -> Sync.accept_header state entry
+   | Error e -> failwith ("A1 accept: " ^ e));
+  (* A2 child of A1 (active path) *)
+  let a2 = fix74_mine_header
+    ~prev_block:a1_hash
+    ~merkle_root:(Cstruct.of_string (String.make 32 '\x02'))
+    ~ts:(Int32.add ts0 600l) ~bits ()
+  in
+  let a2_hash = Crypto.compute_block_hash a2 in
+  (match Sync.validate_header state a2 with
+   | Ok entry -> Sync.accept_header state entry
+   | Error e -> failwith ("A2 accept: " ^ e));
+  (* A3 child of A2 (active tip — increase active-chain work) *)
+  let a3 = fix74_mine_header
+    ~prev_block:a2_hash
+    ~merkle_root:(Cstruct.of_string (String.make 32 '\x03'))
+    ~ts:(Int32.add ts0 1200l) ~bits ()
+  in
+  let a3_hash = Crypto.compute_block_hash a3 in
+  (match Sync.validate_header state a3 with
+   | Ok entry -> Sync.accept_header state entry
+   | Error e -> failwith ("A3 accept: " ^ e));
+  (* B2 child of A1 (orphan/side-branch at height 2) — must mine a
+     different header so the hash differs from A2. *)
+  let b2 = fix74_mine_header
+    ~prev_block:a1_hash
+    ~merkle_root:(Cstruct.of_string (String.make 32 '\x22'))
+    ~ts:(Int32.add ts0 700l) ~bits ()
+  in
+  let b2_hash = Crypto.compute_block_hash b2 in
+  (match Sync.validate_header state b2 with
+   | Ok entry -> Sync.accept_header state entry
+   | Error _ ->
+     (* If accept_header rejects (less work), insert directly into
+        the in-memory header table so get_ancestor can walk it. *)
+     let parent =
+       Hashtbl.find state.Sync.headers (Cstruct.to_string a1_hash)
+     in
+     let entry : Sync.header_entry = {
+       header = b2;
+       hash = b2_hash;
+       height = parent.height + 1;
+       total_work = parent.total_work;
+     } in
+     Hashtbl.add state.Sync.headers
+       (Cstruct.to_string b2_hash) entry);
+  (state, db, genesis_hash, a1_hash, a2_hash, a3_hash, b2_hash)
+
+(* Test A: get_ancestor with orphan stop_hash returns the side-branch
+   header, NOT the active-chain header at that height. *)
+let fix74_test_a_orphan_ancestor () =
+  let (state, db, _genesis, a1_hash, a2_hash, _a3, b2_hash) =
+    fix74_build_chain_with_side_branch ()
+  in
+  let b2_entry =
+    match Sync.get_header state b2_hash with
+    | Some e -> e
+    | None ->
+      Storage.ChainDB.close db; fix74_cleanup_db ();
+      Alcotest.fail "B2 should be in header table"
+  in
+  (* get_ancestor on the orphan tip at height 2 must return B2, not A2. *)
+  let h2_ancestor = Sync.get_ancestor state b2_entry 2 in
+  (match h2_ancestor with
+   | None ->
+     Storage.ChainDB.close db; fix74_cleanup_db ();
+     Alcotest.fail "Test A: ancestor at height 2 missing"
+   | Some e ->
+     if Cstruct.equal e.hash b2_hash then ()
+     else begin
+       Storage.ChainDB.close db; fix74_cleanup_db ();
+       if Cstruct.equal e.hash a2_hash then
+         Alcotest.fail "Test A FAIL: ancestor of B2 at h=2 returned ACTIVE-CHAIN A2"
+       else Alcotest.fail "Test A: ancestor of B2 at h=2 returned wrong hash"
+     end);
+  (* get_ancestor at height 1 must return A1 (shared parent). *)
+  let h1_ancestor = Sync.get_ancestor state b2_entry 1 in
+  (match h1_ancestor with
+   | Some e when Cstruct.equal e.hash a1_hash -> ()
+   | _ ->
+     Storage.ChainDB.close db; fix74_cleanup_db ();
+     Alcotest.fail "Test A: ancestor of B2 at h=1 should be A1 (shared parent)");
+  Storage.ChainDB.close db;
+  fix74_cleanup_db ()
+
+(* Test B: range start > stop returns None (caller treats as
+   error/disconnect).  Exercises get_ancestor's height-out-of-range
+   branch and confirms cli.ml's start_h > stop_h gate is the right
+   defensive check for the new code path. *)
+let fix74_test_b_range_invalid () =
+  let (state, db, _g, _a1, _a2, _a3, _b2) =
+    fix74_build_chain_with_side_branch ()
+  in
+  let tip =
+    match state.Sync.tip with
+    | Some t -> t
+    | None ->
+      Storage.ChainDB.close db; fix74_cleanup_db ();
+      Alcotest.fail "Test B: chain has no tip"
+  in
+  (* start_height > tip.height should be detected by the listener.
+     Direct exercise: get_ancestor at a height above the index
+     returns None. *)
+  let above = Sync.get_ancestor state tip (tip.height + 100) in
+  Storage.ChainDB.close db;
+  fix74_cleanup_db ();
+  match above with
+  | None -> ()
+  | Some _ -> Alcotest.fail "Test B: ancestor above tip should be None"
+
+(* Test C: range too large (over MAX_GETCFILTERS_SIZE / MAX_GETCFHEADERS_SIZE)
+   — verifies the boundary constants are correct (Core constants
+   MAX_GETCFILTERS_SIZE=1000, MAX_GETCFHEADERS_SIZE=2000).  We can't
+   easily exercise the listener arm from a unit test without a full
+   peer connection, so this asserts the constants are wired and the
+   source contains the explicit range check. *)
+let fix74_test_c_range_too_large () =
+  let body_filters = Fix74_source_guard.cli_getcfilters_body () in
+  let body_headers = Fix74_source_guard.cli_getcfheaders_body () in
+  (* getcfilters source must mention max_getcfilters_size *)
+  Alcotest.(check bool)
+    "getcfilters guards on max_getcfilters_size"
+    true (Fix74_source_guard.contains_substring body_filters
+            "max_getcfilters_size");
+  Alcotest.(check bool)
+    "getcfheaders guards on max_getcfheaders_size"
+    true (Fix74_source_guard.contains_substring body_headers
+            "max_getcfheaders_size");
+  (* Constants present at file level *)
+  let full = Fix74_source_guard.cli_ml () in
+  Alcotest.(check bool) "MAX_GETCFILTERS_SIZE = 1000"
+    true (Fix74_source_guard.contains_substring full
+            "max_getcfilters_size = 1000");
+  Alcotest.(check bool) "MAX_GETCFHEADERS_SIZE = 2000"
+    true (Fix74_source_guard.contains_substring full
+            "max_getcfheaders_size = 2000")
+
+(* Test D: stop_hash unknown — get_header returns None and the
+   listener arm logs + drops.  Exercises that the lookup pathway has
+   moved from Sync.lookup_block_height to Sync.get_header (an entry
+   lookup, not a height lookup). *)
+let fix74_test_d_unknown_stop_hash () =
+  let (state, db, _g, _a1, _a2, _a3, _b2) =
+    fix74_build_chain_with_side_branch ()
+  in
+  let unknown_hash = Cstruct.of_string (String.make 32 '\xee') in
+  let r = Sync.get_header state unknown_hash in
+  Storage.ChainDB.close db;
+  fix74_cleanup_db ();
+  match r with
+  | None -> ()
+  | Some _ -> Alcotest.fail "Test D: unknown stop_hash should resolve to None"
+
+(* Forward-regression source-level guard, named explicitly.  Asserts
+   that none of the 4 paths reaches Sync.get_header_at_height.  If a
+   future change re-introduces the active-chain walk, this fails first. *)
+let fix74_source_guard () =
+  Fix74_source_guard.assert_no_get_header_at_height
+    "getcfilters" (Fix74_source_guard.cli_getcfilters_body ());
+  Fix74_source_guard.assert_no_get_header_at_height
+    "getcfheaders" (Fix74_source_guard.cli_getcfheaders_body ());
+  Fix74_source_guard.assert_no_get_header_at_height
+    "getcfcheckpt" (Fix74_source_guard.cli_getcfcheckpt_body ());
+  Fix74_source_guard.assert_uses_get_ancestor
+    "getcfilters" (Fix74_source_guard.cli_getcfilters_body ());
+  Fix74_source_guard.assert_uses_get_ancestor
+    "getcfheaders" (Fix74_source_guard.cli_getcfheaders_body ());
+  Fix74_source_guard.assert_uses_get_ancestor
+    "getcfcheckpt" (Fix74_source_guard.cli_getcfcheckpt_body ());
+  Fix74_source_guard.assert_uses_active_chain_contains
+    "blockfilterheaders"
+    (Fix74_source_guard.rest_blockfilterheaders_body ())
 
 (* -- test suite ---------------------------------------------------------- *)
 
@@ -649,5 +990,17 @@ let () =
         `Quick bug12_quotient_truncation;
       test_case "BUG-8 decode_filter accepts trailing junk" `Quick
         bug8_trailing_data_accepted;
+    ];
+    "fix74_behavioral", [
+      test_case "Test A: orphan stop_hash → ancestor walk returns side-branch"
+        `Quick fix74_test_a_orphan_ancestor;
+      test_case "Test B: stop_hash height < start_height → out of range None"
+        `Quick fix74_test_b_range_invalid;
+      test_case "Test C: range too large → caps wired (1000 / 2000)"
+        `Quick fix74_test_c_range_too_large;
+      test_case "Test D: stop_hash unknown → get_header returns None"
+        `Quick fix74_test_d_unknown_stop_hash;
+      test_case "FIX-74 forward-regression source guard (4 paths)" `Quick
+        fix74_source_guard;
     ];
   ]

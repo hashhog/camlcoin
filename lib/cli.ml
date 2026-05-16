@@ -977,76 +977,111 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   Peer_manager.add_listener peer_manager (fun msg peer ->
     match msg, bip157_index with
     | P2p.GetcfiltersMsg { filter_type = 0; start_height; stop_hash }, Some idx ->
-      (* BIP-157 §getcfilters: send one cfilter per height in [start, stop] *)
+      (* BIP-157 §getcfilters: send one cfilter per height in [start, stop].
+
+         FIX-74: Anchor the height walk on the peer-supplied stop_hash via
+         Sync.get_ancestor, mirroring Bitcoin Core's
+         net_processing.cpp::PrepareBlockFilterRequest + GetAncestor.  Do
+         NOT walk the active chain by height.  When the peer supplies a
+         stale/orphan stop_hash, Core deliberately serves filters from
+         THAT FORK (compact filters are stored by block hash regardless
+         of fork membership) — we match that behaviour. *)
       let start_h = Int32.to_int start_height in
-      (* Resolve stop_hash to a height using the chain header table *)
-      (match Sync.lookup_block_height chain stop_hash with
+      (match Sync.get_header chain stop_hash with
        | None ->
          Logs.debug (fun m ->
            m "BIP-157 getcfilters: unknown stop_hash %s"
              (Types.hash256_to_hex_display stop_hash))
-       | Some stop_h ->
-         if start_h > stop_h then ()
-         else if stop_h - start_h >= max_getcfilters_size then begin
+       | Some stop_index ->
+         let stop_h = stop_index.Sync.height in
+         if start_h > stop_h then
+           (* Core net_processing.cpp:3296: node.fDisconnect = true. We
+              don't yet wire peer-disconnect from a listener; log + drop. *)
            Logs.debug (fun m ->
-             m "BIP-157 getcfilters: range %d too large (%d max)"
-               (stop_h - start_h + 1) max_getcfilters_size);
-         end else begin
-           (* Walk height range, send one cfilter per block *)
+             m "BIP-157 getcfilters: invalid range start=%d > stop=%d (peer should be disconnected)"
+               start_h stop_h)
+         else if stop_h - start_h >= max_getcfilters_size then
+           Logs.debug (fun m ->
+             m "BIP-157 getcfilters: range %d too large (%d max, peer should be disconnected)"
+               (stop_h - start_h + 1) max_getcfilters_size)
+         else begin
+           (* Walk parent chain from stop_index, sending one cfilter per
+              height in [start_h..stop_h].  Filter lookup is by the
+              ancestor's block_hash, NOT by active-chain block-at-h. *)
            let all_ok = ref true in
            let h = ref start_h in
            while !h <= stop_h && !all_ok do
-             (match Block_index.read_filter idx.Block_index.filter_idx
-                       (Option.get (Sync.get_header_at_height chain !h)).Sync.hash with
+             (match Sync.get_ancestor chain stop_index !h with
               | None ->
                 Logs.debug (fun m ->
-                  m "BIP-157 getcfilters: filter missing at height %d" !h);
+                  m "BIP-157 getcfilters: ancestor missing at height %d" !h);
                 all_ok := false
-              | Some bf ->
-                let filter_cstruct = Cstruct.of_string bf.Block_index.filter.Block_index.encoded in
-                Lwt.async (fun () ->
-                  Peer.send_message peer
-                    (P2p.CfilterMsg {
-                       filter_type = 0;
-                       block_hash = bf.Block_index.block_hash;
-                       filter_data = filter_cstruct;
-                     })));
+              | Some anc ->
+                (match Block_index.read_filter idx.Block_index.filter_idx
+                         anc.Sync.hash with
+                 | None ->
+                   Logs.debug (fun m ->
+                     m "BIP-157 getcfilters: filter missing at height %d" !h);
+                   all_ok := false
+                 | Some bf ->
+                   let filter_cstruct =
+                     Cstruct.of_string bf.Block_index.filter.Block_index.encoded
+                   in
+                   Lwt.async (fun () ->
+                     Peer.send_message peer
+                       (P2p.CfilterMsg {
+                          filter_type = 0;
+                          block_hash = bf.Block_index.block_hash;
+                          filter_data = filter_cstruct;
+                        }))));
              incr h
            done
          end);
       Lwt.return_unit
     | P2p.GetcfheadersMsg { filter_type = 0; start_height; stop_hash }, Some idx ->
-      (* BIP-157 §getcfheaders: send cfheaders for the range *)
+      (* BIP-157 §getcfheaders: send cfheaders for the range.
+
+         FIX-74: anchor walk on stop_hash via Sync.get_ancestor instead of
+         walking the active chain by height. *)
       let start_h = Int32.to_int start_height in
-      (match Sync.lookup_block_height chain stop_hash with
+      (match Sync.get_header chain stop_hash with
        | None ->
          Logs.debug (fun m ->
            m "BIP-157 getcfheaders: unknown stop_hash %s"
              (Types.hash256_to_hex_display stop_hash))
-       | Some stop_h ->
-         if start_h > stop_h then ()
+       | Some stop_index ->
+         let stop_h = stop_index.Sync.height in
+         if start_h > stop_h then
+           Logs.debug (fun m ->
+             m "BIP-157 getcfheaders: invalid range start=%d > stop=%d (peer should be disconnected)"
+               start_h stop_h)
          else if stop_h - start_h >= max_getcfheaders_size then
            Logs.debug (fun m ->
-             m "BIP-157 getcfheaders: range %d too large (%d max)"
+             m "BIP-157 getcfheaders: range %d too large (%d max, peer should be disconnected)"
                (stop_h - start_h + 1) max_getcfheaders_size)
          else begin
-           (* Compute prev_filter_header (header at start_h - 1, or zero for genesis) *)
+           (* prev_filter_header is the filter header of the block at
+              start_h - 1 along the stop_hash ancestry, or zero for
+              genesis.  Walking the stop_hash ancestry — not the active
+              chain — is required so that a peer querying an orphan fork
+              receives the correct chain anchor for that fork. *)
            let prev_fh =
              if start_h = 0 then Types.zero_hash
              else
-               match Sync.get_header_at_height chain (start_h - 1) with
+               match Sync.get_ancestor chain stop_index (start_h - 1) with
                | None -> Types.zero_hash
                | Some e ->
                  (match Block_index.get_filter_header idx.Block_index.filter_idx e.Sync.hash with
                   | Some h -> h
                   | None -> Types.zero_hash)
            in
-           (* Collect filter hashes over [start_h..stop_h] *)
+           (* Collect filter hashes over [start_h..stop_h] via
+              ancestor walk on stop_index. *)
            let hashes = ref [] in
            let all_ok = ref true in
            for h = start_h to stop_h do
              if !all_ok then
-               match Sync.get_header_at_height chain h with
+               match Sync.get_ancestor chain stop_index h with
                | None -> all_ok := false
                | Some e ->
                  (match Block_index.get_filter_entry idx.Block_index.filter_idx e.Sync.hash with
@@ -1066,20 +1101,24 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
          end);
       Lwt.return_unit
     | P2p.GetcfcheckptMsg { filter_type = 0; stop_hash }, Some idx ->
-      (* BIP-157 §getcfcheckpt: send filter headers at every CFCHECKPT_INTERVAL *)
-      (match Sync.lookup_block_height chain stop_hash with
+      (* BIP-157 §getcfcheckpt: send filter headers at every CFCHECKPT_INTERVAL.
+
+         FIX-74: anchor each checkpoint lookup on stop_index via
+         Sync.get_ancestor — mirrors Core net_processing.cpp:3409. *)
+      (match Sync.get_header chain stop_hash with
        | None ->
          Logs.debug (fun m ->
            m "BIP-157 getcfcheckpt: unknown stop_hash %s"
              (Types.hash256_to_hex_display stop_hash))
-       | Some stop_h ->
+       | Some stop_index ->
+         let stop_h = stop_index.Sync.height in
          let n_checkpts = stop_h / cfcheckpt_interval in
          let headers = ref [] in
          let all_ok = ref true in
          for i = 1 to n_checkpts do
            if !all_ok then begin
              let height = i * cfcheckpt_interval in
-             match Sync.get_header_at_height chain height with
+             match Sync.get_ancestor chain stop_index height with
              | None -> all_ok := false
              | Some e ->
                (match Block_index.get_filter_header idx.Block_index.filter_idx e.Sync.hash with

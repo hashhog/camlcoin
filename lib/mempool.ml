@@ -97,6 +97,17 @@ type mempool = {
      Core: TransactionRemovedFromMempool → CBlockPolicyEstimator::processTransaction
      Reference: validation.cpp / node/txmempool_impl.cpp *)
   mutable on_eviction : (Types.hash256 -> unit) option;
+  (* FIX-72 W120 BUG-10: prioritisetransaction fee deltas.
+     Maps txid (binary string key, internal byte order) to a signed satoshi
+     delta added by `prioritisetransaction` RPC.  Used by `get_modified_fee`
+     and `apply_delta` to bias selection/RBF math.  NOT persisted across
+     restart (Core parity — txmempool.cpp:411 only persists when
+     LoadMempool/DumpMempool is invoked, and the in-memory map is the
+     authoritative source).
+     Reference: bitcoin-core/src/txmempool.h:299 (`mapDeltas`),
+     txmempool.cpp:630 (`PrioritiseTransaction`),
+     txmempool.cpp:657 (`ApplyDelta`). *)
+  map_deltas : (string, int64) Hashtbl.t;
 }
 
 (* ============================================================================
@@ -246,7 +257,9 @@ let create ?(require_standard=true) ?(verify_scripts=true)
     map_next_tx = Hashtbl.create 10_000;
     zmq_sequence = 0L;
     zmq_notifier;
-    on_eviction }
+    on_eviction;
+    (* FIX-72: prioritisetransaction deltas, in-memory only. *)
+    map_deltas = Hashtbl.create 64; }
 
 (* ============================================================================
    Basic Queries
@@ -2696,6 +2709,109 @@ let check_improves_feerate_diagram
   | Not_better ->
     Error "insufficient feerate: does not improve feerate diagram"
 
+(* ============================================================================
+   FIX-72 / W120 BUG-10 — prioritisetransaction (mapDeltas) machinery
+
+   Mirrors Bitcoin Core's mempool fee-delta mechanism.  An out-of-band signed
+   satoshi delta can be attached to a txid (whether the tx is in the mempool
+   yet or not).  All fee comparisons that affect ordering / admission /
+   replacement use the *modified* fee = base_fee + delta.
+
+   Core references:
+     - src/txmempool.cpp:630   PrioritiseTransaction(hash, nFeeDelta)
+     - src/txmempool.cpp:657   ApplyDelta(hash, nFeeDelta)   const
+     - src/txmempool.cpp:667   ClearPrioritisation(hash)
+     - src/rpc/mining.cpp:502  prioritisetransaction RPC
+     - src/policy/rbf.cpp:100  PaysForRBF (uses GetModifiedFee on both sides
+                                 — validation.cpp:1006, 1090)
+
+   Persistence: Core writes mapDeltas to mempool.dat; we mirror that on
+   dump_mempool but the in-memory map is the source of truth and is NOT
+   re-loaded across a fresh start unless mempool.dat exists.  The
+   docstring on `prioritise_transaction` makes the "not persisted across
+   restart" property explicit so tests can pin it (Core parity).
+   ============================================================================ *)
+
+(* int64-saturating add — matches Core's SaturatingAdd<CAmount> used in
+   PrioritiseTransaction so a malicious operator can't wrap the delta to a
+   negative value with int64-overflow tricks. *)
+let saturating_add_i64 (a : int64) (b : int64) : int64 =
+  let r = Int64.add a b in
+  let a_pos = Int64.compare a 0L >= 0 in
+  let b_pos = Int64.compare b 0L >= 0 in
+  let r_pos = Int64.compare r 0L >= 0 in
+  if a_pos = b_pos && r_pos <> a_pos then
+    (if a_pos then Int64.max_int else Int64.min_int)
+  else r
+
+(* Look up the prioritise delta for a txid.  Returns 0L if no delta has been
+   set (Core: ApplyDelta is a no-op when mapDeltas does not contain the key). *)
+let get_delta (mp : mempool) (txid : Types.hash256) : int64 =
+  match Hashtbl.find_opt mp.map_deltas (Cstruct.to_string txid) with
+  | Some d -> d
+  | None -> 0L
+
+(* Apply the prioritise delta to a base fee.
+   Mirrors Core's CTxMemPool::ApplyDelta(hash, nFeeDelta) which mutates a
+   reference parameter.  We return a fresh int64 instead. *)
+let apply_delta (mp : mempool) (txid : Types.hash256) (base_fee : int64)
+    : int64 =
+  let delta = get_delta mp txid in
+  if Int64.equal delta 0L then base_fee
+  else saturating_add_i64 base_fee delta
+
+(* Modified fee = base fee + prioritise delta for this entry.
+   Wired into RBF Rule 3, getmempoolentry "fees.modified", and any other
+   selection / admission math that must respect operator-applied priority.
+   Core: CTxMemPoolEntry::GetModifiedFee() = m_fee + m_fee_delta (the
+   per-entry copy maintained by UpdateModifiedFee). *)
+let get_modified_fee (mp : mempool) (entry : mempool_entry) : int64 =
+  apply_delta mp entry.txid entry.fee
+
+(* prioritise_transaction txid delta_sats
+   Apply a signed fee delta to a txid's mapDeltas slot.  If the delta
+   accumulates to exactly 0, the entry is removed from the map entirely
+   (Core txmempool.cpp:644 — "if (delta == 0) { mapDeltas.erase(hash); }").
+   The txid does NOT need to be in the mempool — Core also allows
+   prioritising a not-yet-seen tx, and the delta will be picked up if/when
+   the tx arrives.
+
+   NOT persisted across restart: Core only persists via mempool.dat write,
+   and even there it is opt-in via -persistmempool / importmempool
+   `apply_fee_delta_priority`.  camlcoin keeps the map in-memory only. *)
+let prioritise_transaction (mp : mempool) (txid : Types.hash256)
+    (delta_sats : int64) : unit =
+  let key = Cstruct.to_string txid in
+  let cur = match Hashtbl.find_opt mp.map_deltas key with
+    | Some d -> d
+    | None -> 0L
+  in
+  let new_delta = saturating_add_i64 cur delta_sats in
+  if Int64.equal new_delta 0L then
+    Hashtbl.remove mp.map_deltas key
+  else
+    Hashtbl.replace mp.map_deltas key new_delta
+
+(* Clear a prioritisation for a txid (Core: ClearPrioritisation). *)
+let clear_prioritisation (mp : mempool) (txid : Types.hash256) : unit =
+  Hashtbl.remove mp.map_deltas (Cstruct.to_string txid)
+
+(* Snapshot of all current prioritisations as a list of (txid, delta, in_pool)
+   tuples.  Backs the getprioritisedtransactions RPC. *)
+let get_prioritised_transactions (mp : mempool)
+    : (Types.hash256 * int64 * bool * int64 option) list =
+  Hashtbl.fold (fun k delta acc ->
+    let in_pool = Hashtbl.mem mp.entries k in
+    let modified_fee = if in_pool then
+      match Hashtbl.find_opt mp.entries k with
+      | Some e -> Some (Int64.add e.fee delta)
+      | None -> None
+    else None in
+    (* Reconstruct a Cstruct.t txid from the binary string key. *)
+    let txid_cs = Cstruct.of_string k in
+    (txid_cs, delta, in_pool, modified_fee) :: acc
+  ) mp.map_deltas []
+
 (* Attempt to replace an existing transaction with higher fee.
    Full RBF: no BIP125 signaling required (-mempoolfullrbf=1 default).
 
@@ -2813,24 +2929,37 @@ let replace_by_fee (mp : mempool) (tx : Types.transaction)
             Error "replacement tx spends a conflicting transaction"
 
           else begin
-            (* Rule #3 (Gate 6): replacement_fees >= original_fees.
+            (* Rule #3 (Gate 6): replacement_modified_fees >= original_modified_fees.
                Core: PaysForRBF rejects when replacement_fees < original_fees.
                Note: equal is ALLOWED (>= not >).  Previous code used <= which
-               was wrong — it rejected replacements with exactly the same fee. *)
-            let total_conflict_fee = Hashtbl.fold
-              (fun _ e acc -> Int64.add acc e.fee) evicted_set 0L in
+               was wrong — it rejected replacements with exactly the same fee.
 
-            if new_fee < total_conflict_fee then
+               FIX-72 W120 BUG-10: both sides MUST use GetModifiedFee — Core's
+               validation.cpp:930+1006+1090 calls ws.m_tx_handle->GetModifiedFee()
+               for the candidate and it->GetModifiedFee() for every conflict.
+               Without this, operator-applied prioritisetransaction deltas are
+               ignored by Rule 3 and the modified-fee field becomes ornamental.
+
+               Forward-regression: raw-fee comparison in Rule 3 path is
+               explicitly forbidden — `apply_delta` MUST be called on both
+               sides before the `<` check.  test_w120 G3-FIX72-guard asserts
+               this by source inspection. *)
+            let rep_txid_for_delta = Crypto.compute_txid tx in
+            let new_modified_fee = apply_delta mp rep_txid_for_delta new_fee in
+            let total_conflict_fee = Hashtbl.fold
+              (fun _ e acc -> Int64.add acc (get_modified_fee mp e)) evicted_set 0L in
+
+            if new_modified_fee < total_conflict_fee then
               Error (Printf.sprintf
                 "rejecting replacement, less fees than conflicting txs; %Ld < %Ld"
-                new_fee total_conflict_fee)
+                new_modified_fee total_conflict_fee)
 
             else begin
               (* Rule #4 (Gate 7): additional_fees >= relay_fee.GetFee(replacement_vsize).
                  Core: PaysForRBF, additional_fees = replacement_fees − original_fees.
                  relay_fee is in sat/kvB; GetFee(vsize) = ceil(rate * vsize / 1000).
                  We use integer arithmetic to match Core's truncating GetFee. *)
-              let additional_fees = Int64.sub new_fee total_conflict_fee in
+              let additional_fees = Int64.sub new_modified_fee total_conflict_fee in
               let relay_fee_for_replacement =
                 Int64.div (Int64.mul mp.min_relay_fee (Int64.of_int new_vsize)) 1000L in
               if additional_fees < relay_fee_for_replacement then
@@ -3436,12 +3565,21 @@ let save_mempool (mp : mempool) (path : string) : unit =
       Buffer.add_string payload (Cstruct.to_string tx_cs);
       (* int64 LE nTime (seconds since epoch) *)
       put_int64_le payload (Int64.of_float entry.time_added);
-      (* int64 LE nFeeDelta — camlcoin does not (yet) track prioritisetransaction
-         deltas, so we emit 0.  Core treats absent deltas the same way. *)
-      put_int64_le payload 0L
+      (* int64 LE nFeeDelta — FIX-72: emit any prioritisetransaction delta
+         attached to this txid (Core txmempool.cpp:411 writes the same field
+         under "all entries with a delta tracked"). *)
+      put_int64_le payload (get_delta mp entry.txid)
     ) entries;
-    (* mapDeltas: empty (camlcoin lacks prioritisetransaction tracking) *)
-    put_compact_size payload 0;
+    (* mapDeltas: FIX-72 — write the full prioritisation map so Core / a
+       restart with -persistmempool=1 and apply_fee_delta_priority=true can
+       reconstruct.  Default-on-load behaviour in camlcoin is to ignore the
+       map (matches Core's apply_fee_delta_priority=false default). *)
+    let deltas = Hashtbl.fold (fun k d acc -> (k, d) :: acc) mp.map_deltas [] in
+    put_compact_size payload (List.length deltas);
+    List.iter (fun (txid_str, delta) ->
+      Buffer.add_string payload txid_str;
+      put_int64_le payload delta
+    ) deltas;
     (* unbroadcast_txids: empty (camlcoin lacks an unbroadcast set) *)
     put_compact_size payload 0;
     (* XOR the entire payload, then write. Payload starts at file offset 17. *)

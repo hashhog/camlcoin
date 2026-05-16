@@ -1369,18 +1369,31 @@ let handle_getmempoolinfo (ctx : rpc_context) : Yojson.Safe.t =
 let mempool_entry_to_json (mp : Mempool.mempool) (entry : Mempool.mempool_entry)
     : Yojson.Safe.t =
   let fee_btc = Int64.to_float entry.fee /. 100_000_000.0 in
-  (* Ancestor fees: sum of ancestor fees including self *)
+  (* FIX-72 W120 BUG-10: modified fee = base + prioritisetransaction delta.
+     Core (entryToJSON, rpc/mempool.cpp:529) emits both:
+       fees.base     = e.GetFee()
+       fees.modified = e.GetModifiedFee()
+     Previously fees.modified was a copy of fees.base.  After FIX-72 it
+     reflects any operator-applied delta. *)
+  let modified_fee_int64 = Mempool.get_modified_fee mp entry in
+  let modified_fee_btc = Int64.to_float modified_fee_int64 /. 100_000_000.0 in
+  (* Ancestor fees: sum of ancestor MODIFIED fees including self.
+     Core (rpc/mempool.cpp:534): "ancestor" uses ancestor modified fees so
+     prioritised ancestors propagate.  See txmempool.cpp:923 ancestor_fees += anc.GetModifiedFee(). *)
   let anc_fees_int64 =
     let ancs = Mempool.get_ancestors mp entry.txid in
-    List.fold_left (fun acc (e : Mempool.mempool_entry) -> Int64.add acc e.fee)
-      entry.fee ancs
+    List.fold_left (fun acc (e : Mempool.mempool_entry) ->
+      Int64.add acc (Mempool.get_modified_fee mp e))
+      modified_fee_int64 ancs
   in
   let ancestorfees_btc = Int64.to_float anc_fees_int64 /. 100_000_000.0 in
-  (* Descendant fees: sum of descendant fees including self *)
+  (* Descendant fees: sum of descendant MODIFIED fees including self.
+     Core txmempool.cpp:938 descendant_fees += desc.GetModifiedFee(). *)
   let desc_fees_int64 =
     let descs = Mempool.get_descendants mp entry.txid in
-    List.fold_left (fun acc (e : Mempool.mempool_entry) -> Int64.add acc e.fee)
-      entry.fee descs
+    List.fold_left (fun acc (e : Mempool.mempool_entry) ->
+      Int64.add acc (Mempool.get_modified_fee mp e))
+      modified_fee_int64 descs
   in
   let descendantfees_btc = Int64.to_float desc_fees_int64 /. 100_000_000.0 in
   let wtxid_hex = Types.hash256_to_hex_display entry.wtxid in
@@ -1408,10 +1421,10 @@ let mempool_entry_to_json (mp : Mempool.mempool) (entry : Mempool.mempool_entry)
     ("chunkweight",     `Int entry.weight);
     ("fees", `Assoc [
       ("base",       `Float fee_btc);
-      ("modified",   `Float fee_btc);
+      ("modified",   `Float modified_fee_btc);
       ("ancestor",   `Float ancestorfees_btc);
       ("descendant", `Float descendantfees_btc);
-      ("chunk",      `Float fee_btc);
+      ("chunk",      `Float modified_fee_btc);
     ]);
     ("depends",   `List (List.map (fun dep ->
       `String (Types.hash256_to_hex_display dep)
@@ -1525,6 +1538,82 @@ let handle_getmempoolentry (ctx : rpc_context)
        Error "Transaction not in mempool")
   | _ ->
     Error "Invalid parameters: expected [txid]"
+
+(* ============================================================================
+   FIX-72 / W120 BUG-10 — prioritisetransaction + getprioritisedtransactions
+
+   Core RPC: prioritisetransaction txid dummy_fee_delta_btc fee_delta_satoshis
+     - dummy must be 0 (legacy priority semantics removed; argument kept
+       for API compat — Core mining.cpp:529 throws RPC_INVALID_PARAMETER
+       if dummy is non-zero).
+     - fee_delta is in satoshis (int64) and may be negative.
+     - Returns true on success.
+
+   References:
+     - bitcoin-core/src/rpc/mining.cpp:502  RPCHelpMan prioritisetransaction
+     - bitcoin-core/src/txmempool.cpp:630   PrioritiseTransaction
+   ============================================================================ *)
+let handle_prioritisetransaction (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  (* Parse the dummy argument: must be present (positional API) and equal to
+     exactly 0 / 0.0 / null.  Core throws RPC_INVALID_PARAMETER on any other
+     value.  In Core's signature dummy comes second and fee_delta third. *)
+  let parse_dummy (j : Yojson.Safe.t) : (unit, string) result =
+    match j with
+    | `Int 0 | `Float 0.0 | `Null -> Ok ()
+    | _ ->
+      Error "Priority is no longer supported, dummy argument to prioritisetransaction must be 0."
+  in
+  let parse_delta (j : Yojson.Safe.t) : (int64, string) result =
+    match j with
+    | `Int i -> Ok (Int64.of_int i)
+    | `Intlit s -> (try Ok (Int64.of_string s) with _ -> Error "fee_delta must be an integer (sats)")
+    | `Float f ->
+      (* Core requires getInt<int64_t>; accept whole-number floats only. *)
+      if Float.is_finite f && Float.equal (Float.round f) f
+      then Ok (Int64.of_float f)
+      else Error "fee_delta must be an integer (sats)"
+    | _ -> Error "fee_delta must be an integer (sats)"
+  in
+  match params with
+  | [`String txid_hex; dummy; delta_param] ->
+    (match parse_dummy dummy with
+     | Error e -> Error e
+     | Ok () ->
+       (match parse_delta delta_param with
+        | Error e -> Error e
+        | Ok delta_sats ->
+          let txid = parse_txid_param txid_hex in
+          Mempool.prioritise_transaction ctx.mempool txid delta_sats;
+          Ok (`Bool true)))
+  | [`String txid_hex; delta_param] ->
+    (* Tolerant 2-arg form (some clients omit the dummy). *)
+    (match parse_delta delta_param with
+     | Error e -> Error e
+     | Ok delta_sats ->
+       let txid = parse_txid_param txid_hex in
+       Mempool.prioritise_transaction ctx.mempool txid delta_sats;
+       Ok (`Bool true))
+  | _ ->
+    Error "Invalid parameters: expected [txid, dummy=0, fee_delta_sats]"
+
+(* getprioritisedtransactions — Core rpc/mining.cpp:547.
+   Returns a JSON object keyed by txid hex with {fee_delta, in_mempool,
+   modified_fee?} per entry in mapDeltas. *)
+let handle_getprioritisedtransactions (ctx : rpc_context) : Yojson.Safe.t =
+  let entries = Mempool.get_prioritised_transactions ctx.mempool in
+  `Assoc (List.map (fun (txid_cs, delta, in_mempool, modified_fee_opt) ->
+    let txid_hex = Types.hash256_to_hex_display txid_cs in
+    let fields = [
+      ("fee_delta", `Intlit (Int64.to_string delta));
+      ("in_mempool", `Bool in_mempool);
+    ] in
+    let fields = match modified_fee_opt with
+      | Some mf -> fields @ [("modified_fee", `Intlit (Int64.to_string mf))]
+      | None -> fields
+    in
+    (txid_hex, `Assoc fields)
+  ) entries)
 
 (* ============================================================================
    Fee Estimation Handlers
@@ -8537,6 +8626,18 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_loadmempool ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
+
+  (* FIX-72 W120 BUG-10 — Mining-group prioritisation RPCs.
+     Core registers `prioritisetransaction` + `getprioritisedtransactions`
+     under the "mining" category, but they manipulate mempool state, so
+     they live in the mempool dispatch block here.
+     Reference: bitcoin-core/src/rpc/mining.cpp:1153 register table. *)
+  | "prioritisetransaction" ->
+    (match handle_prioritisetransaction ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_invalid_params, msg))
+  | "getprioritisedtransactions" ->
+    Ok (handle_getprioritisedtransactions ctx)
 
   (* Fee estimation / Util *)
   | "estimatesmartfee" ->

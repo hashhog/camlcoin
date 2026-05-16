@@ -534,19 +534,32 @@ let handle_blockfilterheaders (ctx : Rpc.rpc_context) (req : Cohttp.Request.t)
       | None ->
         respond_error `Bad_request ("Invalid hash: " ^ hash_str)
       | Some hash ->
-        (* Walk forward from [hash] along the active chain, collecting
-           filter headers. Mirrors Core's loop over active_chain.Next. *)
+        (* FIX-74: Walk forward from [hash] along the active chain.
+           Core rest.cpp:rest_filter_header uses LookupBlockIndex(hash)
+           and then iterates via active_chain.Next(pindex), guarded by
+           active_chain.Contains(pindex).  We mirror that: at each step
+           we verify the current entry is on the active chain by
+           comparing the header table entry's hash to
+           Storage.ChainDB.get_hash_at_height at that entry's height.
+
+           Previously this loop walked active chain via
+           get_hash_at_height keyed by [entry.height + 1] without first
+           verifying [entry] itself is on the active chain.  When the
+           initial [hash] was on an orphan branch, the first emitted
+           filter header was the orphan's (BUG-18), then the walk
+           silently jumped to the active chain at the next height. *)
+        let is_on_active_chain (entry : Sync.header_entry) =
+          match Storage.ChainDB.get_hash_at_height ctx.chain.db entry.height with
+          | None -> false
+          | Some h -> Cstruct.equal h entry.hash
+        in
         let rec collect h remaining acc =
           if remaining = 0 then List.rev acc
           else
             match Sync.get_header ctx.chain h with
             | None -> List.rev acc
             | Some entry ->
-              let in_chain = match ctx.chain.tip with
-                | None -> false
-                | Some tip -> entry.height <= tip.height
-              in
-              if not in_chain then List.rev acc
+              if not (is_on_active_chain entry) then List.rev acc
               else
                 match Block_index.get_filter_header idx h with
                 | None -> List.rev acc  (* index gap → return what we have *)

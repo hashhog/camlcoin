@@ -3389,9 +3389,13 @@ let handle_createpsbt (ctx : rpc_context)
           | Some (`Int n) -> Int32.of_int n
           | _ -> failwith "Missing vout"
         in
+        (* FIX-70 / W120 BUG-2: default nSequence = MAX_BIP125_RBF_SEQUENCE
+           (0xFFFFFFFD), matching Core's wallet/rpc/spend.cpp::createpsbt
+           default (CWallet m_signal_rbf=true since v23).  Previously
+           0xFFFFFFFE made every createpsbt-built tx non-replaceable. *)
         let sequence = match List.assoc_opt "sequence" fields with
           | Some (`Int n) -> Int32.of_int n
-          | _ -> 0xFFFFFFFEl
+          | _ -> Wallet.max_bip125_rbf_sequence
         in
         { Types.previous_output = { txid; vout };
           script_sig = Cstruct.empty;
@@ -5885,9 +5889,12 @@ let handle_walletcreatefundedpsbt (ctx : rpc_context)
                 | Some (`Int n) -> Int32.of_int n
                 | _ -> failwith "Missing input vout"
               in
+              (* FIX-70 / W120 BUG-2: default nSequence =
+                 MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD), matching Core's
+                 walletcreatefundedpsbt default (m_signal_rbf=true). *)
               let sequence = match List.assoc_opt "sequence" fields with
                 | Some (`Int n) -> Int32.of_int n
-                | _ -> 0xFFFFFFFEl
+                | _ -> Wallet.max_bip125_rbf_sequence
               in
               { Types.previous_output = { txid; vout };
                 script_sig = Cstruct.empty;
@@ -6011,10 +6018,13 @@ let handle_walletcreatefundedpsbt (ctx : rpc_context)
           match Wallet.select_coins wallet target_amount fee_rate with
           | Error e -> failwith e
           | Ok sel ->
+            (* FIX-70 / W120 BUG-2: auto-selected inputs from coin selection
+               also default to MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD) so the
+               funded PSBT signals RBF, matching Core's m_signal_rbf path. *)
             let auto_inputs = List.map (fun (wu : Wallet.wallet_utxo) ->
               { Types.previous_output = wu.outpoint;
                 script_sig = Cstruct.empty;
-                sequence = 0xFFFFFFFEl }
+                sequence = Wallet.max_bip125_rbf_sequence }
             ) sel.selected in
             (manual_inputs @ auto_inputs,
              sel.selected,

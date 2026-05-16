@@ -122,11 +122,18 @@
                      RPC surface is missing the standard
                      bumpfee/psbtbumpfee API.
 
-   BUG-10 (P2 G26) : No `prioritisetransaction` RPC.  Core uses
-                     `prioritisetransaction` to bias miners' selection
-                     and override RBF math.  Comment at mempool.ml:3439
-                     explicitly admits "camlcoin does not (yet) track
-                     prioritisetransaction".  Absent at RPC surface.
+   BUG-10 (P2 G26) : [FIX-72]  prioritisetransaction RPC + mapDeltas wiring
+                     CLOSED in FIX-72.  Mempool.prioritise_transaction adds
+                     to a Hashtbl<txid → int64>; get_modified_fee +
+                     apply_delta surface the modified fee; Rule 3 PaysForRBF
+                     uses modified fees on both sides;
+                     mempool_entry_to_json emits fees.modified honouring
+                     delta; RPC handler dispatches `prioritisetransaction`
+                     (txid, dummy, fee_delta_sats).  Test G26 forward-
+                     regression: prioritise + getmempoolentry round-trip
+                     reflects delta in fees.modified.  Source guard
+                     asserts Rule 3 path calls apply_delta/get_modified_fee
+                     (not raw `entry.fee`).
 
    BUG-11 (P1 G29) : No mempool counters expose
                      `replacement_count` / `replaced_count` /
@@ -150,7 +157,7 @@
    ==========
      P0 : BUG-1, BUG-2, BUG-4, BUG-5, BUG-6, BUG-7
      P1 : BUG-3, BUG-8, BUG-11, BUG-12
-     P2 : BUG-9, BUG-10, BUG-13
+     P2 : BUG-9, [FIX-72]BUG-10, BUG-13
 
    Implemented & correct (no bug):
      - signals_rbf (mempool.ml:2449) — unsigned-int32 BIP-125 check
@@ -314,12 +321,14 @@ let test_g2_rule2_no_new_unconfirmed_present () =
   Alcotest.(check bool) "rule 2: 'conflict_outpoints' present" true
     (file_has_marker "lib/mempool.ml" "conflict_outpoints")
 
-(* G3.  Rule 3 (PaysForRBF: replacement_fees >= original_fees).
-   The comparison is `if new_fee < total_conflict_fee` then reject.
-   Equal-fee replacements MUST be allowed (Core: rbf.cpp PaysForRBF). *)
+(* G3.  Rule 3 (PaysForRBF: replacement_modified_fees >= original_modified_fees).
+   The comparison is `if new_modified_fee < total_conflict_fee` then reject.
+   Equal-fee replacements MUST be allowed (Core: rbf.cpp PaysForRBF).
+   FIX-72: both sides use GetModifiedFee — total_conflict_fee is summed via
+   get_modified_fee, new_modified_fee = apply_delta on candidate. *)
 let test_g3_rule3_pays_for_rbf_present () =
-  Alcotest.(check bool) "rule 3: PaysForRBF uses '<' not '<='" true
-    (file_has_marker "lib/mempool.ml" "new_fee < total_conflict_fee")
+  Alcotest.(check bool) "rule 3: PaysForRBF uses '<' not '<=' (modified fees)" true
+    (file_has_marker "lib/mempool.ml" "new_modified_fee < total_conflict_fee")
 
 (* G4.  Rule 4 (PaysForRBF incremental fee).
    additional_fees >= relay_fee.GetFee(replacement_vsize). *)
@@ -790,10 +799,219 @@ let test_g25_no_bumpfee_rpc () =
   assert_rpc_unknown ctx "bumpfee";
   assert_rpc_unknown ctx "psbtbumpfee"
 
-(* G26.  BUG-10 P2.  prioritisetransaction RPC missing. *)
-let test_g26_no_prioritisetransaction_rpc () =
+(* G26.  [FIX-72]  prioritisetransaction RPC PRESENT (BUG-10 closed).
+   Was: assert_rpc_unknown ctx "prioritisetransaction"
+   Now: dispatcher routes the call; the RPC returns true; modified fee on a
+   subsequent getmempoolentry reflects the delta. *)
+let test_g26_prioritisetransaction_rpc_present () =
   let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "prioritisetransaction"
+  (* dummy=0 + positive delta succeeds for any txid (Core allows priorities
+     on not-yet-arrived txs — the delta is parked in mapDeltas). *)
+  let txid_hex = String.make 64 'a' in
+  match Rpc.dispatch_rpc ctx "prioritisetransaction"
+          [`String txid_hex; `Int 0; `Int 12345] with
+  | Ok (`Bool true) -> ()
+  | Ok _ -> Alcotest.fail "prioritisetransaction returned non-Bool true"
+  | Error (-32601, _) ->
+    Alcotest.fail "FIX-72 BUG-10: prioritisetransaction still routes to method-not-found"
+  | Error (code, msg) ->
+    Alcotest.failf "prioritisetransaction unexpected error %d: %s" code msg
+
+(* FIX-72 G26b.  Non-zero dummy rejected (matches Core mining.cpp:529). *)
+let test_g26_prioritisetransaction_dummy_must_be_zero () =
+  let ctx = make_rpc_ctx () in
+  let txid_hex = String.make 64 'a' in
+  match Rpc.dispatch_rpc ctx "prioritisetransaction"
+          [`String txid_hex; `Float 0.001; `Int 12345] with
+  | Error (_, msg) ->
+    Alcotest.(check bool) "FIX-72: dummy!=0 rejected" true
+      (try ignore (Str.search_forward (Str.regexp_string "must be 0") msg 0); true
+       with Not_found -> false)
+  | Ok _ -> Alcotest.fail "FIX-72: dummy=0.001 must be rejected"
+
+(* FIX-72 G26c.  Forward-regression source guard: Rule 3 PaysForRBF MUST use
+   modified-fee accessors (apply_delta or get_modified_fee) so prioritise
+   deltas affect the comparison.  Raw `entry.fee` on the conflict side is a
+   regression marker. *)
+let test_g26_rule3_uses_modified_fee () =
+  let mempool_text = slurp_file "lib/mempool.ml" in
+  (* The new fee path is apply_delta on the candidate. *)
+  Alcotest.(check bool) "FIX-72: Rule 3 candidate uses apply_delta" true
+    (try
+       let _ = Str.search_forward
+         (Str.regexp_string "apply_delta mp rep_txid_for_delta new_fee") mempool_text 0 in true
+     with Not_found -> false);
+  (* The conflict sum side uses get_modified_fee mp e. *)
+  Alcotest.(check bool) "FIX-72: Rule 3 conflict sum uses get_modified_fee" true
+    (try
+       let _ = Str.search_forward
+         (Str.regexp_string "get_modified_fee mp e") mempool_text 0 in true
+     with Not_found -> false)
+
+(* FIX-72 G26d.  Delta application + cancellation semantics.
+   - First call: delta=+5000 → map_deltas[txid] = 5000
+   - Second call: delta=-5000 → entry removed (Core: if delta==0, erase). *)
+let test_g26_delta_cancellation () =
+  rm_rf "/tmp/camlcoin_w120_g26d";
+  let db = Storage.ChainDB.create "/tmp/camlcoin_w120_g26d" in
+  let utxo = Utxo.UtxoSet.create db in
+  let mp = Mempool.create
+    ~require_standard:false ~verify_scripts:false
+    ~utxo ~current_height:0 () in
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0xcd;
+  (* Initial state: no delta. *)
+  Alcotest.(check int64) "no delta initially" 0L
+    (Mempool.get_delta mp txid);
+  Mempool.prioritise_transaction mp txid 5000L;
+  Alcotest.(check int64) "delta=5000 after first call" 5000L
+    (Mempool.get_delta mp txid);
+  Mempool.prioritise_transaction mp txid (-5000L);
+  Alcotest.(check int64) "delta=0 erased after cancellation" 0L
+    (Mempool.get_delta mp txid);
+  (* Accumulation: +1000 then +2500 = +3500. *)
+  Mempool.prioritise_transaction mp txid 1000L;
+  Mempool.prioritise_transaction mp txid 2500L;
+  Alcotest.(check int64) "accumulated delta=3500" 3500L
+    (Mempool.get_delta mp txid)
+
+(* FIX-72 G26e.  Modified fee = base + delta.  Synthesize a mempool_entry-
+   shaped value via the test helper that the existing test uses. *)
+let test_g26_modified_fee_on_entry () =
+  rm_rf "/tmp/camlcoin_w120_g26e";
+  let db = Storage.ChainDB.create "/tmp/camlcoin_w120_g26e" in
+  let utxo = Utxo.UtxoSet.create db in
+  let mp = Mempool.create
+    ~require_standard:false ~verify_scripts:false
+    ~utxo ~current_height:0 () in
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0xef;
+  let entry : Mempool.mempool_entry = {
+    tx = mk_tx_with_sequence ~seq:0;
+    txid;
+    wtxid = txid;
+    fee = 10_000L;
+    weight = 400;
+    fee_rate = 25.0;
+    time_added = 0.0;
+    height_added = 0;
+    depends_on = [];
+    ancestor_count = 1;
+    ancestor_size = 100;
+    descendant_count = 1;
+    descendant_size = 100;
+  } in
+  (* Without delta, modified_fee = base_fee. *)
+  Alcotest.(check int64) "modified_fee = base before delta" 10_000L
+    (Mempool.get_modified_fee mp entry);
+  Mempool.prioritise_transaction mp txid 2_500L;
+  Alcotest.(check int64) "modified_fee = base + delta" 12_500L
+    (Mempool.get_modified_fee mp entry);
+  Mempool.prioritise_transaction mp txid (-2_500L);
+  Alcotest.(check int64) "modified_fee = base after cancellation" 10_000L
+    (Mempool.get_modified_fee mp entry)
+
+(* FIX-72 G26f.  Restart semantics.  map_deltas is in-memory only by default;
+   creating a fresh mempool with the same utxo/db must NOT carry the deltas. *)
+let test_g26_deltas_not_persisted_across_restart () =
+  rm_rf "/tmp/camlcoin_w120_g26f";
+  let db = Storage.ChainDB.create "/tmp/camlcoin_w120_g26f" in
+  let utxo = Utxo.UtxoSet.create db in
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0x77;
+  let mp1 = Mempool.create
+    ~require_standard:false ~verify_scripts:false
+    ~utxo ~current_height:0 () in
+  Mempool.prioritise_transaction mp1 txid 9_999L;
+  Alcotest.(check int64) "mp1 delta set" 9_999L (Mempool.get_delta mp1 txid);
+  (* Fresh mempool with the same backing store — no carry-over. *)
+  let mp2 = Mempool.create
+    ~require_standard:false ~verify_scripts:false
+    ~utxo ~current_height:0 () in
+  Alcotest.(check int64) "mp2 fresh: delta = 0" 0L
+    (Mempool.get_delta mp2 txid)
+
+(* FIX-72 G26g.  getprioritisedtransactions RPC routes (returns object). *)
+let test_g26_getprioritisedtransactions_rpc_present () =
+  let ctx = make_rpc_ctx () in
+  match Rpc.dispatch_rpc ctx "getprioritisedtransactions" [] with
+  | Ok (`Assoc _) -> ()
+  | Ok _ -> Alcotest.fail "FIX-72: getprioritisedtransactions must return object"
+  | Error (-32601, _) ->
+    Alcotest.fail "FIX-72: getprioritisedtransactions still method-not-found"
+  | Error (code, msg) ->
+    Alcotest.failf "getprioritisedtransactions unexpected %d: %s" code msg
+
+(* FIX-72 G26h.  Positive delta affects Rule 3 conflict-side total.
+   Construct a real RBF flow:
+     - Add a high-fee parent at txid_a with raw_fee=50_000.
+     - Prioritise the parent up by +30_000 → modified_fee=80_000.
+     - A replacement with raw_fee=60_000 would have beaten the un-prioritised
+       parent (60_000 >= 50_000) but should now be REJECTED because Rule 3
+       compares modified fees on both sides: 60_000 < 80_000.
+
+   This is the strongest functional witness that modified-fee plumbing is
+   wired into the actual Rule 3 path — not just exposed at the RPC. *)
+let test_g26_rule3_uses_modified_fee_functional () =
+  rm_rf "/tmp/camlcoin_w120_g26h";
+  let db = Storage.ChainDB.create "/tmp/camlcoin_w120_g26h" in
+  let utxo = Utxo.UtxoSet.create db in
+  let parent_txid = Types.hash256_of_hex
+    "1111111111111111111111111111111111111111111111111111111111111111" in
+  Utxo.UtxoSet.add utxo parent_txid 0 Utxo.{
+    value = 1_000_000L;
+    script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac";
+    height = 0;
+    is_coinbase = false;
+  };
+  let mp = Mempool.create
+    ~require_standard:false ~verify_scripts:false
+    ~utxo ~current_height:100 () in
+  let in_a = { Types.previous_output = { Types.txid = parent_txid; vout = 0l };
+               script_sig = Cstruct.of_string "\x00";
+               sequence = 0xFFFFFFFDl } in
+  (* Original tx: 1,000,000 in, 950,000 out → fee = 50_000. *)
+  let tx_orig = { Types.version = 2l;
+                  inputs = [in_a];
+                  outputs = [{ Types.value = 950_000L;
+                               script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac" }];
+                  witnesses = [];
+                  locktime = 0l } in
+  let orig_entry = Result.get_ok (Mempool.add_transaction mp tx_orig) in
+  Alcotest.(check int64) "original fee" 50_000L orig_entry.fee;
+  (* Prioritise the original UP by +30_000 → modified_fee = 80_000. *)
+  Mempool.prioritise_transaction mp orig_entry.txid 30_000L;
+  Alcotest.(check int64) "modified_fee = 80_000 after prioritise" 80_000L
+    (Mempool.get_modified_fee mp orig_entry);
+  (* Replacement: 1,000,000 in, 940,000 out → raw fee = 60_000.
+     Without prioritise: 60_000 >= 50_000 → would have replaced.
+     With prioritise applied to conflict side: 60_000 < 80_000 → REJECT. *)
+  let tx_replacement = { Types.version = 2l;
+                         inputs = [in_a];
+                         outputs = [{ Types.value = 940_000L;
+                                      script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac" }];
+                         witnesses = [];
+                         locktime = 0l } in
+  let r = Mempool.replace_by_fee mp tx_replacement in
+  Alcotest.(check bool) "60k fee REJECTED vs 80k modified-fee conflict" true
+    (Result.is_error r);
+  (* Sanity: error message names the comparison. *)
+  (match r with
+   | Error msg ->
+     Alcotest.(check bool) "error names 'less fees'" true
+       (try ignore (Str.search_forward (Str.regexp_string "less fees") msg 0); true
+        with Not_found -> false)
+   | Ok _ -> ());
+  (* Now prioritise the replacement up by +25_000 → modified_fee = 85_000,
+     beating the conflict's 80_000.  Need to know the replacement txid first. *)
+  let rep_txid = Crypto.compute_txid tx_replacement in
+  Mempool.prioritise_transaction mp rep_txid 25_000L;
+  let r2 = Mempool.replace_by_fee mp tx_replacement in
+  Alcotest.(check bool) "85k modified-fee replacement now ACCEPTED" true
+    (Result.is_ok r2);
+  Alcotest.(check bool) "original removed after success" false
+    (Mempool.contains mp orig_entry.txid);
+  Storage.ChainDB.close db
 
 (* G27.  sendrawtransaction error envelope for RBF cases — collateral of
    BUG-3.  When an RBF replacement would succeed in Core's pipeline,
@@ -899,7 +1117,14 @@ let wallet_tests = [
   Alcotest.test_case "G24 wallet default 0xFFFFFFFD RBF (FIX-70, was BUG-2)" `Quick test_g24_wallet_default_sequence_not_rbf;
   Alcotest.test_case "G24 forward-regression: create_tx emits 0xFFFFFFFD (FIX-70)" `Quick test_g24_create_transaction_emits_rbf_sequence;
   Alcotest.test_case "G25 no bumpfee/psbtbumpfee RPC (BUG-9, P2)"        `Quick test_g25_no_bumpfee_rpc;
-  Alcotest.test_case "G26 no prioritisetransaction RPC (BUG-10, P2)"    `Quick test_g26_no_prioritisetransaction_rpc;
+  Alcotest.test_case "G26 prioritisetransaction RPC present (FIX-72, was BUG-10)" `Quick test_g26_prioritisetransaction_rpc_present;
+  Alcotest.test_case "G26b prioritisetransaction dummy must be 0 (FIX-72)" `Quick test_g26_prioritisetransaction_dummy_must_be_zero;
+  Alcotest.test_case "G26c Rule 3 PaysForRBF uses modified-fee (FIX-72 source guard)" `Quick test_g26_rule3_uses_modified_fee;
+  Alcotest.test_case "G26d prioritise delta cancellation + accumulation (FIX-72)" `Quick test_g26_delta_cancellation;
+  Alcotest.test_case "G26e get_modified_fee = base + delta (FIX-72)"  `Quick test_g26_modified_fee_on_entry;
+  Alcotest.test_case "G26f deltas NOT persisted across restart (FIX-72, Core parity)" `Quick test_g26_deltas_not_persisted_across_restart;
+  Alcotest.test_case "G26g getprioritisedtransactions RPC present (FIX-72)" `Quick test_g26_getprioritisedtransactions_rpc_present;
+  Alcotest.test_case "G26h positive delta wins/loses RBF Rule 3 (FIX-72)" `Quick test_g26_rule3_uses_modified_fee_functional;
   Alcotest.test_case "G27 sendrawtransaction error envelope present"   `Quick test_g27_sendraw_decode_envelope_present;
 ]
 

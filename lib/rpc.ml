@@ -1361,7 +1361,11 @@ let handle_getmempoolinfo (ctx : rpc_context) : Yojson.Safe.t =
    - spentby: we don't maintain a child index in O(1); iterate mempool to find
      entries whose depends_on includes this txid. This is O(mempool_size) but
      rare (only called on explicit entry queries).
-   - bip125-replaceable: use Mempool.signals_rbf on the tx. *)
+   - bip125-replaceable: use Mempool.signals_rbf_with_ancestors so the
+     reported flag matches Core's BIP-125 inheritable opt-in (entryToJSON
+     calls IsRBFOptIn(it, mp) which walks the in-mempool ancestor set).
+     A child whose own nSequence is final (0xFFFFFFFF) but whose parent
+     signals RBF is still reported replaceable. *)
 let mempool_entry_to_json (mp : Mempool.mempool) (entry : Mempool.mempool_entry)
     : Yojson.Safe.t =
   let fee_btc = Int64.to_float entry.fee /. 100_000_000.0 in
@@ -1413,7 +1417,7 @@ let mempool_entry_to_json (mp : Mempool.mempool) (entry : Mempool.mempool_entry)
       `String (Types.hash256_to_hex_display dep)
     ) entry.depends_on));
     ("spentby",   `List spentby);
-    ("bip125-replaceable", `Bool (Mempool.signals_rbf entry.tx));
+    ("bip125-replaceable", `Bool (Mempool.signals_rbf_with_ancestors mp entry.tx));
     ("unbroadcast",        `Bool false);
   ]
 

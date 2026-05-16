@@ -441,16 +441,137 @@ let test_g14_100_cap_error_format () =
    G15-G18 — RPC surface
    ============================================================================ *)
 
-(* G15.  BUG-5 P0.  `bip125-replaceable` in mempool_entry_to_json uses
-   `Mempool.signals_rbf` (only this tx) instead of
-   `Mempool.signals_rbf_with_ancestors` (BIP-125 inheritable opt-in). *)
+(* G15.  BUG-5 P0 (FIX-68 W120 BUG-5).  `bip125-replaceable` in
+   `mempool_entry_to_json` MUST use `Mempool.signals_rbf_with_ancestors`
+   (BIP-125 inheritable opt-in) rather than `Mempool.signals_rbf`
+   (only this tx).  Core: src/rpc/mempool.cpp entryToJSON calls
+   IsRBFOptIn(it, mp) which walks the in-mempool ancestor set. *)
 let test_g15_bip125_replaceable_no_ancestor_walk () =
-  (* The bug is present iff `bip125-replaceable` is set from `signals_rbf` and
-     NOT from `signals_rbf_with_ancestors`. *)
-  Alcotest.(check bool) "BUG-5: bip125-replaceable still uses signals_rbf alone" true
-    (file_has_marker "lib/rpc.ml" "(\"bip125-replaceable\", `Bool (Mempool.signals_rbf entry.tx))");
-  Alcotest.(check bool) "BUG-5: rpc.ml does NOT yet call signals_rbf_with_ancestors" false
+  (* Self-only call form must NOT appear at the rpc.ml call site any more. *)
+  Alcotest.(check bool)
+    "FIX-68: bip125-replaceable no longer uses signals_rbf alone at call site"
+    false
+    (file_has_marker "lib/rpc.ml"
+       "(\"bip125-replaceable\", `Bool (Mempool.signals_rbf entry.tx))");
+  (* Ancestor-walking call form is present. *)
+  Alcotest.(check bool)
+    "FIX-68: rpc.ml now calls signals_rbf_with_ancestors"
+    true
     (file_has_marker "lib/rpc.ml" "signals_rbf_with_ancestors")
+
+(* G15-A.  FIX-68 positive runtime tests for `bip125-replaceable` ancestor walk.
+   These exercise `Rpc.mempool_entry_to_json` directly — the same helper used
+   by getrawmempool (verbose), getmempoolentry, getmempoolancestors (verbose),
+   getmempooldescendants (verbose) — to confirm the BIP-125 inheritable opt-in
+   behaviour now appears at the JSON surface, not just in the marker file. *)
+
+let g15_make_output value : Types.tx_out =
+  { Types.value;
+    script_pubkey = Cstruct.of_string "\x76\xa9\x14g15_replaceable_test\x88\xac" }
+
+let g15_make_input ?(sequence = 0xFFFFFFFFl) txid vout : Types.tx_in =
+  { Types.previous_output = { Types.txid; vout };
+    script_sig = Cstruct.of_string "\x00";
+    sequence }
+
+let g15_make_tx ?(version = 2l) inputs outputs : Types.transaction =
+  { Types.version; inputs; outputs; witnesses = []; locktime = 0l }
+
+let g15_add_seed_utxo utxo txid_hex value =
+  let txid = Types.hash256_of_hex txid_hex in
+  Utxo.UtxoSet.add utxo txid 0 Utxo.{
+    value;
+    script_pubkey = Cstruct.of_string "\x76\xa9\x14g15_seed_aaaa\x88\xac";
+    height = 100;
+    is_coinbase = false;
+  };
+  txid
+
+let g15_make_mempool path =
+  rm_rf path;
+  let db = Storage.ChainDB.create path in
+  let utxo = Utxo.UtxoSet.create db in
+  let mp = Mempool.create
+    ~require_standard:false ~verify_scripts:false
+    ~utxo ~current_height:100 () in
+  (mp, db, utxo)
+
+(* Locate a mempool_entry whose JSON bip125-replaceable field we want to
+   inspect.  Looks up by txid in the live mempool table. *)
+let g15_lookup_entry mp txid =
+  match Mempool.get mp txid with
+  | Some e -> e
+  | None -> Alcotest.failf "expected mempool entry for txid; not found"
+
+let g15_bip125_flag_of_json json =
+  match json with
+  | `Assoc kvs ->
+    (match List.assoc_opt "bip125-replaceable" kvs with
+     | Some (`Bool b) -> b
+     | _ -> Alcotest.failf "bip125-replaceable not present in entry json")
+  | _ -> Alcotest.failf "expected `Assoc for mempool_entry_to_json result"
+
+(* G15-A.1: self-signaling tx → bip125-replaceable = true. *)
+let test_g15a_self_signaling_true () =
+  let (mp, db, utxo) = g15_make_mempool "/tmp/camlcoin_w120_g15a1" in
+  let seed = g15_add_seed_utxo utxo
+    "1111111111111111111111111111111111111111111111111111111111111111"
+    1_000_000L in
+  let tx = g15_make_tx
+    [g15_make_input ~sequence:0xFFFFFFFDl seed 0l]
+    [g15_make_output 990_000L] in
+  let entry = Result.get_ok (Mempool.add_transaction mp tx) in
+  let j = Rpc.mempool_entry_to_json mp entry in
+  Alcotest.(check bool) "self-signaling tx reports bip125-replaceable=true"
+    true (g15_bip125_flag_of_json j);
+  Storage.ChainDB.close db
+
+(* G15-A.2: non-signaling tx with NO ancestors → bip125-replaceable = false. *)
+let test_g15a_non_signaling_no_ancestor_false () =
+  let (mp, db, utxo) = g15_make_mempool "/tmp/camlcoin_w120_g15a2" in
+  let seed = g15_add_seed_utxo utxo
+    "2222222222222222222222222222222222222222222222222222222222222222"
+    1_000_000L in
+  let tx = g15_make_tx
+    [g15_make_input ~sequence:0xFFFFFFFFl seed 0l]
+    [g15_make_output 990_000L] in
+  let entry = Result.get_ok (Mempool.add_transaction mp tx) in
+  let j = Rpc.mempool_entry_to_json mp entry in
+  Alcotest.(check bool)
+    "non-signaling tx with no mempool ancestor reports bip125-replaceable=false"
+    false (g15_bip125_flag_of_json j);
+  Storage.ChainDB.close db
+
+(* G15-A.3: non-signaling child of a signaling parent → bip125-replaceable = true.
+   This is the BUG-5 demonstration test — pre-FIX-68 the call site uses
+   `signals_rbf` (self-only) so this returns false; post-FIX-68 it walks
+   ancestors via `signals_rbf_with_ancestors` and returns true. *)
+let test_g15a_non_signaling_child_of_signaling_parent_true () =
+  let (mp, db, utxo) = g15_make_mempool "/tmp/camlcoin_w120_g15a3" in
+  let seed = g15_add_seed_utxo utxo
+    "3333333333333333333333333333333333333333333333333333333333333333"
+    1_000_000L in
+  (* Parent: signals RBF via nSequence = 0xFFFFFFFD. *)
+  let parent_tx = g15_make_tx
+    [g15_make_input ~sequence:0xFFFFFFFDl seed 0l]
+    [g15_make_output 990_000L] in
+  let parent_entry = Result.get_ok (Mempool.add_transaction mp parent_tx) in
+  (* Child: spends parent's output, nSequence = final → does NOT signal itself. *)
+  let child_tx = g15_make_tx
+    [g15_make_input ~sequence:0xFFFFFFFFl parent_entry.txid 0l]
+    [g15_make_output 980_000L] in
+  let child_entry = Result.get_ok (Mempool.add_transaction mp child_tx) in
+  let child_entry = g15_lookup_entry mp child_entry.txid in
+  let j_child = Rpc.mempool_entry_to_json mp child_entry in
+  Alcotest.(check bool)
+    "non-signaling child of signaling parent reports bip125-replaceable=true \
+     (BIP-125 inheritable opt-in)"
+    true (g15_bip125_flag_of_json j_child);
+  (* Sanity: parent itself reports true. *)
+  let j_parent = Rpc.mempool_entry_to_json mp parent_entry in
+  Alcotest.(check bool) "self-signaling parent reports bip125-replaceable=true"
+    true (g15_bip125_flag_of_json j_parent);
+  Storage.ChainDB.close db
 
 (* G16.  BUG-3 P1.  sendrawtransaction does not route through accept_transaction. *)
 let test_g16_sendrawtransaction_bypasses_rbf () =
@@ -661,9 +782,12 @@ let feerate_tests = [
 ]
 
 let rpc_surface_tests = [
-  Alcotest.test_case "G15 bip125-replaceable no ancestor walk (BUG-5, P0)" `Quick test_g15_bip125_replaceable_no_ancestor_walk;
-  Alcotest.test_case "G16 sendrawtransaction bypasses RBF (BUG-3, P1)"     `Quick test_g16_sendrawtransaction_bypasses_rbf;
-  Alcotest.test_case "G17 error strings not Core-aligned (BUG-13, P2)"     `Quick test_g17_error_strings_not_aligned_to_core;
+  Alcotest.test_case "G15  bip125-replaceable ancestor walk (FIX-68 BUG-5, P0)" `Quick test_g15_bip125_replaceable_no_ancestor_walk;
+  Alcotest.test_case "G15a self-signaling tx → bip125-replaceable=true"        `Quick test_g15a_self_signaling_true;
+  Alcotest.test_case "G15a non-signaling, no ancestor → false"                 `Quick test_g15a_non_signaling_no_ancestor_false;
+  Alcotest.test_case "G15a non-signaling child of signaling parent → true (BIP-125)" `Quick test_g15a_non_signaling_child_of_signaling_parent_true;
+  Alcotest.test_case "G16 sendrawtransaction bypasses RBF (BUG-3, P1)"         `Quick test_g16_sendrawtransaction_bypasses_rbf;
+  Alcotest.test_case "G17 error strings not Core-aligned (BUG-13, P2)"         `Quick test_g17_error_strings_not_aligned_to_core;
   Alcotest.test_case "G18 submitpackage replaced-transactions hardcoded [] (BUG-4, P0)" `Quick test_g18_submitpackage_replaces_field_hardcoded_empty;
 ]
 

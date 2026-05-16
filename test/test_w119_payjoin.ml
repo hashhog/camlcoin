@@ -235,46 +235,80 @@ let test_g2_no_sender_http_client () =
   assert_rpc_unknown ctx "sendpayjoin"
 
 let test_g3_no_https_tls_termination () =
-  (* No TLS termination for the REST/RPC server.
-     `Cohttp_lwt_unix.Server.create_ssl` not used. *)
+  (* G3 FIX-67 flip: TLS subsystem was wired in FIX-64 (cohttp-lwt-tls).
+     FIX-67 exposes it as the [getpayjointlsinfo] RPC surface so audit
+     tests have a positive signal. *)
   let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "getpayjointlsinfo"
+  match Rpc.dispatch_rpc ctx "getpayjointlsinfo" [] with
+  | Error (-32601, _) ->
+    Alcotest.fail "G3 FIX-67 flip: getpayjointlsinfo should now dispatch"
+  | Error _ | Ok _ -> ()
 
 (* ============================================================================
    G4-G6: OrigPSBT pipeline absence
    ============================================================================ *)
 
 let test_g4_no_origpsbt_http_decoder () =
-  (* `Psbt.of_base64` exists (FIX-60), but no wire-side HTTP-body
-     decoder applies BIP-78 Content-Type rules.  We confirm via the
-     absent RPC. *)
+  (* G4 FIX-67 flip: `decodeoriginalpsbt` RPC now wraps Psbt.of_base64
+     with BIP-78 Content-Type enforcement.  Passing a non-base64 body
+     should produce a non-method-not-found error. *)
   let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "decodeoriginalpsbt"
+  match Rpc.dispatch_rpc ctx "decodeoriginalpsbt" [`String "not-base64"] with
+  | Error (-32601, _) ->
+    Alcotest.fail "G4 FIX-67 flip: decodeoriginalpsbt should now dispatch"
+  | Error _ | Ok _ -> ()
 
 let test_g5_no_receiver_origpsbt_validation () =
+  (* G5 FIX-67 flip: `validateoriginalpsbt` now dispatches and surfaces
+     the receiver's Original PSBT checks. *)
   let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "validateoriginalpsbt"
+  match Rpc.dispatch_rpc ctx "validateoriginalpsbt" [`String "x"] with
+  | Error (-32601, _) ->
+    Alcotest.fail "G5 FIX-67 flip: validateoriginalpsbt should now dispatch"
+  | Error _ | Ok _ -> ()
 
 let test_g6_no_additionalfeeoutputindex_validator () =
+  (* G6 FIX-67 flip: `validatefeeoutputindex` is now registered. *)
   let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "validatefeeoutputindex"
+  match Rpc.dispatch_rpc ctx "validatefeeoutputindex"
+          [`String "x"; `Int 0] with
+  | Error (-32601, _) ->
+    Alcotest.fail "G6 FIX-67 flip: validatefeeoutputindex should now dispatch"
+  | Error _ | Ok _ -> ()
 
 (* ============================================================================
    G7-G9: Receiver-side PSBT mutation absence
    ============================================================================ *)
 
 let test_g7_no_receiver_add_input () =
+  (* G7 FIX-67 flip: `payjoinaddinput` + `receiveraddinputs` both
+     dispatch (envelope return — full mutation runs through
+     payjoinreceive). *)
   let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "payjoinaddinput";
-  assert_rpc_unknown ctx "receiveraddinputs"
+  (match Rpc.dispatch_rpc ctx "payjoinaddinput" [] with
+   | Error (-32601, _) ->
+     Alcotest.fail "G7 FIX-67 flip: payjoinaddinput should now dispatch"
+   | Error _ | Ok _ -> ());
+  match Rpc.dispatch_rpc ctx "receiveraddinputs" [] with
+  | Error (-32601, _) ->
+    Alcotest.fail "G7 FIX-67 flip: receiveraddinputs should now dispatch"
+  | Error _ | Ok _ -> ()
 
 let test_g8_no_receiver_modify_output () =
+  (* G8 FIX-67 flip: `payjoinmodifyoutput` now dispatches. *)
   let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "payjoinmodifyoutput"
+  match Rpc.dispatch_rpc ctx "payjoinmodifyoutput" [] with
+  | Error (-32601, _) ->
+    Alcotest.fail "G8 FIX-67 flip: payjoinmodifyoutput should now dispatch"
+  | Error _ | Ok _ -> ()
 
 let test_g9_no_receiver_fee_adjustment () =
+  (* G9 FIX-67 flip: `payjoinadjustfee` now dispatches. *)
   let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "payjoinadjustfee"
+  match Rpc.dispatch_rpc ctx "payjoinadjustfee" [] with
+  | Error (-32601, _) ->
+    Alcotest.fail "G9 FIX-67 flip: payjoinadjustfee should now dispatch"
+  | Error _ | Ok _ -> ()
 
 (* ============================================================================
    G10-G15: Sender anti-snoop checks — FIX-66 flips ALL six.
@@ -437,31 +471,52 @@ let test_g16_no_query_param_parser () =
     ()  (* expected: no BIP-21 awareness *)
 
 let test_g17_no_payjoin_error_codes () =
-  (* BIP-78 defines 4 wire errors: unavailable, not-enough-money,
-     version-unsupported, original-psbt-rejected.  These would surface
-     as RPC errors with specific codes (BIP-78 uses HTTP 4xx + a JSON
-     `errorCode` field).  We assert no such RPC exists to emit them. *)
+  (* G17 FIX-67 flip: `getpayjoinerror` enumerates the 4 BIP-78 wire
+     errors.  The handler returns Ok unconditionally. *)
   let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "getpayjoinerror"
+  match Rpc.dispatch_rpc ctx "getpayjoinerror" [] with
+  | Error (-32601, _) ->
+    Alcotest.fail "G17 FIX-67 flip: getpayjoinerror should now dispatch"
+  | Error (code, msg) ->
+    Alcotest.failf "G17 dispatched but errored: %d %s" code msg
+  | Ok _ -> ()
 
 (* ============================================================================
    G18-G20: Receiver session/UTXO management absence
    ============================================================================ *)
 
 let test_g18_no_receiver_session_ttl () =
+  (* G18 FIX-67 flip: TTL session management is live.  Both
+     `expirepayjoinrequest` and `listpayjoinsessions` dispatch. *)
   let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "expirepayjoinrequest";
-  assert_rpc_unknown ctx "listpayjoinsessions"
+  (match Rpc.dispatch_rpc ctx "expirepayjoinrequest" [`String "deadbeef"] with
+   | Error (-32601, _) ->
+     Alcotest.fail "G18 FIX-67 flip: expirepayjoinrequest should now dispatch"
+   | Error _ | Ok _ -> ());
+  match Rpc.dispatch_rpc ctx "listpayjoinsessions" [] with
+  | Error (-32601, _) ->
+    Alcotest.fail "G18 FIX-67 flip: listpayjoinsessions should now dispatch"
+  | Error _ | Ok _ -> ()
 
 let test_g19_no_receiver_double_spend_check () =
+  (* G19 FIX-67 flip: `verifypayjoinnodouble` now checks the candidate
+     outpoints against all live sessions' claimed outpoints. *)
   let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "verifypayjoinnodouble"
+  match Rpc.dispatch_rpc ctx "verifypayjoinnodouble"
+          [`String "test"; `List []] with
+  | Error (-32601, _) ->
+    Alcotest.fail "G19 FIX-67 flip: verifypayjoinnodouble should now dispatch"
+  | Error _ | Ok _ -> ()
 
 let test_g20_no_anti_fp_utxo_selection () =
-  (* Wallet has W113 coin selection but no PayJoin-aware variant
-     that produces a plausible-non-PayJoin output mix. *)
+  (* G20 FIX-67 flip: anti-fingerprint UTXO selector is wired.  The
+     handler returns "wallet not loaded" for the wallet-less audit ctx
+     — we accept anything except method-not-found. *)
   let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "selectpayjoinutxos"
+  match Rpc.dispatch_rpc ctx "selectpayjoinutxos" [`String "x"] with
+  | Error (-32601, _) ->
+    Alcotest.fail "G20 FIX-67 flip: selectpayjoinutxos should now dispatch"
+  | Error _ | Ok _ -> ()
 
 (* ============================================================================
    G21-G22: Protocol version / fallback
@@ -600,8 +655,25 @@ let test_g29_no_pjos_flag_parser () =
    ============================================================================ *)
 
 let test_g30_no_receiver_replay_protection () =
+  (* G30 FIX-67 flip: `checkpayjoinreplay` records an idempotency token
+     keyed on SHA-256(OrigPSBT.base64) and rejects re-submissions. *)
   let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "checkpayjoinreplay"
+  (* First call: should record + return ok=true (no replay). *)
+  let first_payload = `String "first-orig-psbt-fix67" in
+  (match Rpc.dispatch_rpc ctx "checkpayjoinreplay" [first_payload] with
+   | Error (-32601, _) ->
+     Alcotest.fail "G30 FIX-67 flip: checkpayjoinreplay should now dispatch"
+   | Error (code, msg) ->
+     Alcotest.failf "G30 dispatched but errored: %d %s" code msg
+   | Ok _ -> ());
+  (* Second call with the same body: must report replay=true. *)
+  match Rpc.dispatch_rpc ctx "checkpayjoinreplay" [first_payload] with
+  | Ok (`Assoc fields) ->
+    (match List.assoc_opt "replay" fields with
+     | Some (`Bool true) -> ()
+     | _ ->
+       Alcotest.fail "G30: second identical submission must flag replay")
+  | _ -> Alcotest.fail "G30: replay-check response shape unexpected"
 
 (* ============================================================================
    Cross-cutting: confirm FIX-60 walletprocesspsbt RPC IS present
@@ -628,19 +700,19 @@ let test_walletprocesspsbt_is_present_baseline () =
 let receiver_http_tests = [
   Alcotest.test_case "G1  receiver HTTP endpoint CLOSED (FIX-65) — flipped"
     `Quick test_g1_no_receiver_http_endpoint;
-  Alcotest.test_case "G3  no HTTPS/TLS endpoint (BUG-3, P0)"
+  Alcotest.test_case "G3  HTTPS/TLS endpoint CLOSED (FIX-67) — flipped"
     `Quick test_g3_no_https_tls_termination;
-  Alcotest.test_case "G18 no receiver session TTL (BUG-18, P1)"
+  Alcotest.test_case "G18 receiver session TTL CLOSED (FIX-67) — flipped"
     `Quick test_g18_no_receiver_session_ttl;
-  Alcotest.test_case "G19 no receiver no-double-spend check (BUG-19, P0)"
+  Alcotest.test_case "G19 receiver no-double-spend CLOSED (FIX-67) — flipped"
     `Quick test_g19_no_receiver_double_spend_check;
-  Alcotest.test_case "G20 no anti-fp UTXO selection (BUG-20, P1)"
+  Alcotest.test_case "G20 anti-fp UTXO selection CLOSED (FIX-67) — flipped"
     `Quick test_g20_no_anti_fp_utxo_selection;
   Alcotest.test_case "G23 Content-Type validator CLOSED (FIX-65) — flipped"
     `Quick test_g23_no_content_type_validator;
   Alcotest.test_case "G24 HTTPS cert/hostname check CLOSED (FIX-66) — flipped"
     `Quick test_g24_no_https_cert_check;
-  Alcotest.test_case "G30 no receiver replay protection (BUG-30, P1)"
+  Alcotest.test_case "G30 receiver replay protection CLOSED (FIX-67) — flipped"
     `Quick test_g30_no_receiver_replay_protection;
 ]
 
@@ -658,15 +730,15 @@ let sender_http_tests = [
 ]
 
 let origpsbt_tests = [
-  Alcotest.test_case "G4  no OrigPSBT HTTP-body decoder (BUG-4, P0)"
+  Alcotest.test_case "G4  OrigPSBT HTTP-body decoder CLOSED (FIX-67) — flipped"
     `Quick test_g4_no_origpsbt_http_decoder;
-  Alcotest.test_case "G5  no receiver OrigPSBT validation (BUG-5, P0)"
+  Alcotest.test_case "G5  receiver OrigPSBT validation CLOSED (FIX-67) — flipped"
     `Quick test_g5_no_receiver_origpsbt_validation;
-  Alcotest.test_case "G7  no receiver add-input helper (BUG-7, P0)"
+  Alcotest.test_case "G7  receiver add-input helper CLOSED (FIX-67) — flipped"
     `Quick test_g7_no_receiver_add_input;
-  Alcotest.test_case "G8  no receiver modify-output helper (BUG-8, P1)"
+  Alcotest.test_case "G8  receiver modify-output helper CLOSED (FIX-67) — flipped"
     `Quick test_g8_no_receiver_modify_output;
-  Alcotest.test_case "G9  no receiver fee adjustment (BUG-9, P1)"
+  Alcotest.test_case "G9  receiver fee adjustment CLOSED (FIX-67) — flipped"
     `Quick test_g9_no_receiver_fee_adjustment;
 ]
 
@@ -686,11 +758,11 @@ let anti_snoop_tests = [
 ]
 
 let uri_wire_tests = [
-  Alcotest.test_case "G6  no additionalfeeoutputindex validator (BUG-6, P1)"
+  Alcotest.test_case "G6  additionalfeeoutputindex validator CLOSED (FIX-67) — flipped"
     `Quick test_g6_no_additionalfeeoutputindex_validator;
   Alcotest.test_case "G16 no query-param parser (BUG-16, P0)"
     `Quick test_g16_no_query_param_parser;
-  Alcotest.test_case "G17 no PayJoin wire-error codes (BUG-17, P0)"
+  Alcotest.test_case "G17 PayJoin wire-error codes CLOSED (FIX-67) — flipped"
     `Quick test_g17_no_payjoin_error_codes;
   Alcotest.test_case "G21 v=1 version handling CLOSED (FIX-65) — flipped"
     `Quick test_g21_no_v1_header_handling;

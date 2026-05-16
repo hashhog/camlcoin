@@ -3089,8 +3089,13 @@ let handle_submitpackage (ctx : rpc_context)
              "Unspendable output exceeds maximum: %Ld > %Ld satoshis"
              burn max_burn_amount)
          | None ->
-           (* Validate as a package via existing engine *)
-           let pkg_result = Mempool.accept_package ctx.mempool txs in
+           (* Validate as a package via existing engine.
+              FIX-73 W120 BUG-4: use [accept_package_with_replaced] so the
+              evicted-txid union surfaces back into this handler — matches
+              Core's PackageMempoolAcceptResult::m_replaced_transactions
+              (validation.cpp:760, rpc/mempool.cpp:1500). *)
+           let (pkg_result, replaced_txids) =
+             Mempool.accept_package_with_replaced ctx.mempool txs in
            (* Build a wtxid -> entry-or-error lookup *)
            let entry_by_wtxid_key : (string, Mempool.mempool_entry) Hashtbl.t =
              Hashtbl.create n in
@@ -3185,10 +3190,22 @@ let handle_submitpackage (ctx : rpc_context)
                  ("error", `String err_msg);
                ])
            ) txs in
+           (* FIX-73 W120 BUG-4: populate `replaced-transactions` from the
+              per-package evicted-txid union returned by
+              [accept_package_with_replaced].  Was hardcoded [] — Core fills
+              this with the union of MempoolAcceptResult::m_replaced_transactions
+              across every per-tx admission in the package (rpc/mempool.cpp:1500
+              uses a std::set<uint256> for dedup; we use a Hashtbl on the
+              mempool side and convert to a list here). *)
+           let replaced_json =
+             List.map (fun (t : Types.hash256) ->
+               `String (Types.hash256_to_hex_display t)
+             ) replaced_txids
+           in
            Ok (`Assoc [
              ("package_msg", `String !package_msg);
              ("tx-results", `Assoc tx_results);
-             ("replaced-transactions", `List []);
+             ("replaced-transactions", `List replaced_json);
            ]))
     end
 

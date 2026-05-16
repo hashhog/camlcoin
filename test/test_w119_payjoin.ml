@@ -277,32 +277,141 @@ let test_g9_no_receiver_fee_adjustment () =
   assert_rpc_unknown ctx "payjoinadjustfee"
 
 (* ============================================================================
-   G10-G15: Sender anti-snoop checks absence
-   ============================================================================ *)
+   G10-G15: Sender anti-snoop checks — FIX-66 flips ALL six.
+   ============================================================================
+
+   The six BIP-78 sender-side anti-snoop validators are now available as
+   pure functions in `Payjoin` (validate_anti_snoop_outputs,
+   validate_anti_snoop_scriptsig_types, validate_anti_snoop_no_new_sender_inputs,
+   validate_anti_snoop_max_fee, validate_anti_snoop_disable_os,
+   validate_anti_snoop_minfeerate).  We verify presence + correct happy-
+   path behaviour against a tiny synthetic round-trip PSBT pair.
+*)
+
+(* Minimal helpers — local to keep this audit file self-contained. *)
+let _spk_v ~(byte : int) : Cstruct.t =
+  let s = Cstruct.create 22 in
+  Cstruct.set_uint8 s 0 0x00;
+  Cstruct.set_uint8 s 1 0x14;
+  Cstruct.set_uint8 s 5 byte;
+  s
+
+let _make_orig_payjoin_pair () =
+  let spk_a = _spk_v ~byte:0x11 in
+  let spk_b = _spk_v ~byte:0x22 in
+  let prev = { Types.value = 100_000L; script_pubkey = spk_a } in
+  let tx_orig : Types.transaction = {
+    version = 2l;
+    inputs = [{
+      previous_output = { txid = Cstruct.create 32; vout = 0l };
+      script_sig = Cstruct.empty;
+      sequence = 0xFFFFFFFDl;
+    }];
+    outputs = [
+      { value = 50_000L; script_pubkey = spk_a };
+      { value = 40_000L; script_pubkey = spk_b };
+    ];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let psbt_orig = Psbt.create tx_orig in
+  let psbt_orig =
+    { psbt_orig with inputs = [
+        { Psbt.empty_input with
+          witness_utxo = Some prev;
+          final_scriptwitness = Some [Cstruct.of_string "\x00"]; };
+      ] }
+  in
+  (* PayjoinPSBT: receiver appended its own input (60k) and bumped no
+     outputs.  Fee delta = receiver_value (60k) since the outputs
+     are unchanged — the test compares "happy path" (no fee cap).  *)
+  let recv_prev = { Types.value = 60_000L; script_pubkey = spk_a } in
+  let tx_pj : Types.transaction = {
+    tx_orig with
+    inputs = tx_orig.inputs @ [{
+      previous_output = { txid = Cstruct.create 32; vout = 1l };
+      script_sig = Cstruct.empty;
+      sequence = 0xFFFFFFFDl;
+    }];
+  } in
+  let psbt_pj = Psbt.create tx_pj in
+  let psbt_pj =
+    { psbt_pj with inputs = [
+        { Psbt.empty_input with
+          witness_utxo = Some prev;
+          final_scriptwitness = Some [Cstruct.of_string "\x00"]; };
+        { Psbt.empty_input with
+          witness_utxo = Some recv_prev; };
+      ] }
+  in
+  (psbt_orig, psbt_pj)
 
 let test_g10_no_sender_output_anti_snoop () =
-  let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "verifypayjoinoutputs"
+  (* FIX-66 flip: validate_anti_snoop_outputs is now a present pure
+     function on Payjoin.  On the happy-path round-trip pair it returns
+     Ok (). *)
+  let (orig, pj) = _make_orig_payjoin_pair () in
+  match Payjoin.validate_anti_snoop_outputs
+          ~orig ~payjoin:pj ~fee_idx:None with
+  | Ok () -> ()
+  | Error v ->
+    Alcotest.failf "G10 FIX-66 flip: output anti-snoop should pass: %s"
+      (Payjoin.string_of_violation v)
 
 let test_g11_no_sender_scriptsig_type_check () =
-  let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "verifypayjoinscriptsigtypes"
+  (* FIX-66 flip: validate_anti_snoop_scriptsig_types is now present.
+     Round-trip pair uses uniformly p2wpkh-shape outputs, so the check
+     returns Ok (). *)
+  let (_orig, pj) = _make_orig_payjoin_pair () in
+  match Payjoin.validate_anti_snoop_scriptsig_types ~payjoin:pj with
+  | Ok () -> ()
+  | Error v ->
+    Alcotest.failf "G11 FIX-66 flip: scriptsig-type check should pass: %s"
+      (Payjoin.string_of_violation v)
 
 let test_g12_no_sender_no_new_inputs_check () =
-  let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "verifypayjoinnoneworiginal"
+  (* FIX-66 flip: validate_anti_snoop_no_new_sender_inputs is now present.
+     Receiver appended an input but did NOT remove the sender's — Ok. *)
+  let (orig, pj) = _make_orig_payjoin_pair () in
+  match Payjoin.validate_anti_snoop_no_new_sender_inputs ~orig ~payjoin:pj with
+  | Ok () -> ()
+  | Error v ->
+    Alcotest.failf "G12 FIX-66 flip: input-preservation check should pass: %s"
+      (Payjoin.string_of_violation v)
 
 let test_g13_no_sender_max_fee_check () =
-  let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "verifypayjoinmaxfee"
+  (* FIX-66 flip: validate_anti_snoop_max_fee is now present.  Round-trip
+     pair has fee delta = -60k (receiver added a 60k input, no output
+     bump), which is < cap=infinity → Ok. *)
+  let (orig, pj) = _make_orig_payjoin_pair () in
+  match Payjoin.validate_anti_snoop_max_fee
+          ~orig ~payjoin:pj ~max_contribution:(Some 100_000L) with
+  | Ok () -> ()
+  | Error v ->
+    Alcotest.failf "G13 FIX-66 flip: max-fee check should pass: %s"
+      (Payjoin.string_of_violation v)
 
 let test_g14_no_sender_disableos_honour () =
-  let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "verifypayjoindisableos"
+  (* FIX-66 flip: validate_anti_snoop_disable_os is now present.
+     disable_os=true + no output substitution → Ok. *)
+  let (orig, pj) = _make_orig_payjoin_pair () in
+  match Payjoin.validate_anti_snoop_disable_os
+          ~orig ~payjoin:pj ~disable_os:true ~fee_idx:None with
+  | Ok () -> ()
+  | Error v ->
+    Alcotest.failf "G14 FIX-66 flip: disable_os check should pass: %s"
+      (Payjoin.string_of_violation v)
 
 let test_g15_no_sender_minfeerate_enforcement () =
-  let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "verifypayjoinminfeerate"
+  (* FIX-66 flip: validate_anti_snoop_minfeerate is now present.
+     No minfeerate set → returns Ok () (vacuous). *)
+  let (_orig, pj) = _make_orig_payjoin_pair () in
+  match Payjoin.validate_anti_snoop_minfeerate
+          ~payjoin:pj ~minfeerate:None with
+  | Ok () -> ()
+  | Error v ->
+    Alcotest.failf "G15 FIX-66 flip: minfeerate check should pass: %s"
+      (Payjoin.string_of_violation v)
 
 (* ============================================================================
    G16-G17: URI / wire-error absence
@@ -369,11 +478,31 @@ let test_g21_no_v1_header_handling () =
   | Ok _ -> ()
 
 let test_g22_no_sender_fallback () =
-  (* On receiver timeout/error sender must broadcast the OrigPSBT as
-     a plain tx.  This logic would live behind sendpayjoinrequest;
-     absent. *)
-  let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "fallbacksendoriginalpsbt"
+  (* FIX-66 flip: the fallback policy lives in [Payjoin.finalize_send]:
+     when the receiver does NOT reply ([send_outcome] =
+     [Fallback_broadcast_origpsbt]) the verdict is [`Fallback_broadcast]
+     and the operator broadcasts the OrigPSBT.  We assert presence by
+     exercising the function on a transport-error outcome. *)
+  let spk = _spk_v ~byte:0x33 in
+  let tx : Types.transaction = {
+    version = 2l;
+    inputs = [{
+      previous_output = { txid = Cstruct.create 32; vout = 0l };
+      script_sig = Cstruct.empty;
+      sequence = 0xFFFFFFFDl;
+    }];
+    outputs = [{ value = 100L; script_pubkey = spk }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let orig = Psbt.create tx in
+  let verdict = Payjoin.finalize_send
+    ~orig ~params:Payjoin.default_sender_params
+    (Payjoin.Fallback_broadcast_origpsbt "receiver unreachable")
+  in
+  match verdict with
+  | `Fallback_broadcast _ -> ()
+  | _ -> Alcotest.fail "G22 FIX-66 flip: transport-error must yield Fallback_broadcast"
 
 (* ============================================================================
    G23-G25: Wire / transport guards
@@ -393,8 +522,22 @@ let test_g23_no_content_type_validator () =
   | Ok _ -> ()
 
 let test_g24_no_https_cert_check () =
-  let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "verifypayjointlscert"
+  (* FIX-66 flip: Payjoin.verify_tls_cert is now present.  We exercise
+     it with a deliberately-empty cert chain — the validator MUST
+     reject (verify_chain returns `EmptyCertificateChain). *)
+  let authenticator
+    : ?ip:Ipaddr.t -> host:[`host] Domain_name.t option ->
+      X509.Certificate.t list -> X509.Validation.r
+    = fun ?ip:_ ~host:_ chain ->
+      match chain with
+      | [] -> Error (`EmptyCertificateChain)
+      | _  -> Ok None
+  in
+  match Payjoin.verify_tls_cert
+          ~authenticator ~hostname:"example.com" [] with
+  | Ok () ->
+    Alcotest.fail "G24 FIX-66 flip: empty chain must be rejected"
+  | Error _ -> ()
 
 let test_g25_no_tor_onion_inbound_for_receiver () =
   (* W117 FIX-58 wired persistent I2P session AND added Tor outbound,
@@ -409,12 +552,25 @@ let test_g25_no_tor_onion_inbound_for_receiver () =
    ============================================================================ *)
 
 let test_g26_no_getpayjoinrequest_rpc () =
+  (* FIX-66 flip: getpayjoinrequest is now a registered RPC.  The
+     wallet-less ctx in this audit harness causes the handler to
+     return its own error ("wallet not loaded") — both Ok and
+     Error-other-than-method-not-found are acceptable presence
+     signals. *)
   let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "getpayjoinrequest"
+  match Rpc.dispatch_rpc ctx "getpayjoinrequest" [`Int 50000] with
+  | Error (-32601, _) ->
+    Alcotest.fail "G26 FIX-66 flip: getpayjoinrequest should now dispatch"
+  | Error _ | Ok _ -> ()
 
 let test_g27_no_sendpayjoinrequest_rpc () =
+  (* FIX-66 flip: sendpayjoinrequest is now a registered RPC.  Same
+     wallet-less acceptance criterion as G26. *)
   let ctx = make_rpc_ctx () in
-  assert_rpc_unknown ctx "sendpayjoinrequest"
+  match Rpc.dispatch_rpc ctx "sendpayjoinrequest" [`String "bitcoin:bc1q"] with
+  | Error (-32601, _) ->
+    Alcotest.fail "G27 FIX-66 flip: sendpayjoinrequest should now dispatch"
+  | Error _ | Ok _ -> ()
 
 (* ============================================================================
    G28-G29: BIP-21 URI parser absence (covers `pj=` + `pjos=`)
@@ -482,7 +638,7 @@ let receiver_http_tests = [
     `Quick test_g20_no_anti_fp_utxo_selection;
   Alcotest.test_case "G23 Content-Type validator CLOSED (FIX-65) — flipped"
     `Quick test_g23_no_content_type_validator;
-  Alcotest.test_case "G24 no HTTPS cert/hostname check (BUG-24, P0)"
+  Alcotest.test_case "G24 HTTPS cert/hostname check CLOSED (FIX-66) — flipped"
     `Quick test_g24_no_https_cert_check;
   Alcotest.test_case "G30 no receiver replay protection (BUG-30, P1)"
     `Quick test_g30_no_receiver_replay_protection;
@@ -491,13 +647,13 @@ let receiver_http_tests = [
 let sender_http_tests = [
   Alcotest.test_case "G2  no sender HTTP client (BUG-2, P1)"
     `Quick test_g2_no_sender_http_client;
-  Alcotest.test_case "G22 no sender fallback to non-PayJoin (BUG-22, P1)"
+  Alcotest.test_case "G22 sender fallback CLOSED (FIX-66) — flipped"
     `Quick test_g22_no_sender_fallback;
   Alcotest.test_case "G25 no Tor .onion inbound for receiver (BUG-25, P1)"
     `Quick test_g25_no_tor_onion_inbound_for_receiver;
-  Alcotest.test_case "G26 no getpayjoinrequest RPC (BUG-26, P1)"
+  Alcotest.test_case "G26 getpayjoinrequest RPC CLOSED (FIX-66) — flipped"
     `Quick test_g26_no_getpayjoinrequest_rpc;
-  Alcotest.test_case "G27 no sendpayjoinrequest RPC (BUG-27, P1)"
+  Alcotest.test_case "G27 sendpayjoinrequest RPC CLOSED (FIX-66) — flipped"
     `Quick test_g27_no_sendpayjoinrequest_rpc;
 ]
 
@@ -515,17 +671,17 @@ let origpsbt_tests = [
 ]
 
 let anti_snoop_tests = [
-  Alcotest.test_case "G10 no sender output anti-snoop (BUG-10, P0)"
+  Alcotest.test_case "G10 sender output anti-snoop CLOSED (FIX-66) — flipped"
     `Quick test_g10_no_sender_output_anti_snoop;
-  Alcotest.test_case "G11 no sender scriptSig-type check (BUG-11, P0)"
+  Alcotest.test_case "G11 sender scriptSig-type check CLOSED (FIX-66) — flipped"
     `Quick test_g11_no_sender_scriptsig_type_check;
-  Alcotest.test_case "G12 no sender no-new-inputs check (BUG-12, P0)"
+  Alcotest.test_case "G12 sender no-new-inputs check CLOSED (FIX-66) — flipped"
     `Quick test_g12_no_sender_no_new_inputs_check;
-  Alcotest.test_case "G13 no sender max-fee check (BUG-13, P0)"
+  Alcotest.test_case "G13 sender max-fee check CLOSED (FIX-66) — flipped"
     `Quick test_g13_no_sender_max_fee_check;
-  Alcotest.test_case "G14 no sender disableos honour (BUG-14, P1)"
+  Alcotest.test_case "G14 sender disable_os honour CLOSED (FIX-66) — flipped"
     `Quick test_g14_no_sender_disableos_honour;
-  Alcotest.test_case "G15 no sender minfeerate enforcement (BUG-15, P1)"
+  Alcotest.test_case "G15 sender minfeerate enforcement CLOSED (FIX-66) — flipped"
     `Quick test_g15_no_sender_minfeerate_enforcement;
 ]
 

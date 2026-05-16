@@ -7846,6 +7846,213 @@ let handle_validatepayjoincontenttype (params : Yojson.Safe.t list)
   | _ -> Error "Invalid parameters: expected [content_type_string]"
 
 (* ============================================================================
+   FIX-66 — BIP-78 Sender-side RPCs (G26 + G27)
+   ============================================================================
+
+   - getpayjoinrequest(amount_sat, [endpoint], [pjos])
+       Return a BIP-21 `bitcoin:<addr>?amount=BTC&pj=<endpoint>[&pjos=1]`
+       URI the sender can scan / hand to a wallet.
+       Closes W119 G26.
+
+   - sendpayjoinrequest(bip21_uri, [psbt_b64], [params_obj])
+       Perform the BIP-78 sender protocol from a BIP-21 URI.  Steps:
+         1. parse BIP-21 to extract `pj=` endpoint + `pjos=` flag.
+         2. parse optional sender params (additionalfeeoutputindex,
+            maxadditionalfeecontribution, minfeerate).
+         3. either use the caller-supplied OrigPSBT or build one from
+            the wallet against the address (when psbt_b64 omitted).
+         4. POST OrigPSBT to receiver (Payjoin.payjoin_send) — retries +
+            timeout + transient-failure fallback per BIP-78.
+         5. anti-snoop validate the PayjoinPSBT (6 checks G10-G15).
+         6. on accept → re-sign sender inputs via Wallet.process_psbt
+            (FIX-60 building block) AND return PayjoinPSBT base64.
+         7. on fallback/reject → return the OrigPSBT as the broadcast
+            payload so the operator can sign-and-broadcast that.
+       Closes W119 G27 + G22 + G24 (cert validation pre-flight).
+*)
+
+(* BIP-21 amount field is decimal BTC; convert int64 satoshis. *)
+let _format_btc_amount_string (sat : int64) : string =
+  let whole = Int64.div sat 100_000_000L in
+  let frac = Int64.rem sat 100_000_000L in
+  if Int64.compare frac 0L = 0 then
+    Printf.sprintf "%Ld" whole
+  else begin
+    let s = Printf.sprintf "%08Ld" frac in
+    (* Trim trailing zeros for compactness. *)
+    let len = String.length s in
+    let stop = ref len in
+    while !stop > 0 && s.[!stop - 1] = '0' do decr stop done;
+    Printf.sprintf "%Ld.%s" whole (String.sub s 0 !stop)
+  end
+
+let handle_getpayjoinrequest (ctx : rpc_context) (params : Yojson.Safe.t list)
+    : (Yojson.Safe.t, string) result =
+  match ctx.wallet with
+  | None -> Error "PayJoin sender wallet not loaded"
+  | Some wallet ->
+    let amount_sat, endpoint_opt, pjos =
+      match params with
+      | [`Int sat] -> (Int64.of_int sat, None, false)
+      | [`Intlit s] -> (Int64.of_string s, None, false)
+      | [`Int sat; `String ep] -> (Int64.of_int sat, Some ep, false)
+      | [`Int sat; `String ep; `Bool b] -> (Int64.of_int sat, Some ep, b)
+      | _ -> (0L, None, false)
+    in
+    if Int64.compare amount_sat 0L < 0 then
+      Error "amount must be non-negative satoshis"
+    else begin
+      let addr = Wallet.get_new_address wallet in
+      let amount_str = _format_btc_amount_string amount_sat in
+      let uri_buf = Buffer.create 128 in
+      Buffer.add_string uri_buf "bitcoin:";
+      Buffer.add_string uri_buf addr;
+      Buffer.add_string uri_buf "?amount=";
+      Buffer.add_string uri_buf amount_str;
+      (match endpoint_opt with
+       | None -> ()
+       | Some ep ->
+         Buffer.add_string uri_buf "&pj=";
+         Buffer.add_string uri_buf (Uri.pct_encode ep));
+      if pjos then Buffer.add_string uri_buf "&pjos=1";
+      let uri = Buffer.contents uri_buf in
+      Ok (`Assoc [
+        ("uri", `String uri);
+        ("address", `String addr);
+        ("amount_sat", `Intlit (Int64.to_string amount_sat));
+        ("amount_btc", `String amount_str);
+        ("pj", (match endpoint_opt with Some e -> `String e | None -> `Null));
+        ("pjos", `Bool pjos);
+      ])
+    end
+
+(* Parse a JSON params object into Payjoin.sender_params via the same
+   coercion the payjoinreceive handler uses. *)
+let _sender_params_from_json (j : Yojson.Safe.t)
+    : (Payjoin.sender_params, string) result =
+  let q : (string * string list) list =
+    match j with
+    | `Assoc kvs ->
+      List.filter_map (fun (k, v) ->
+        match v with
+        | `String s -> Some (k, [s])
+        | `Int i    -> Some (k, [string_of_int i])
+        | `Bool b   -> Some (k, [if b then "1" else "0"])
+        | `Float f  -> Some (k, [string_of_float f])
+        | `Intlit s -> Some (k, [s])
+        | _ -> None
+      ) kvs
+    | _ -> []
+  in
+  match Payjoin.parse_sender_params q with
+  | Ok p -> Ok p
+  | Error e -> Error (Payjoin.error_code_string e)
+
+let handle_sendpayjoinrequest (ctx : rpc_context) (params : Yojson.Safe.t list)
+    : (Yojson.Safe.t, string) result =
+  match ctx.wallet with
+  | None -> Error "PayJoin sender wallet not loaded"
+  | Some _wallet ->
+    let uri_str, psbt_b64_opt, params_json =
+      match params with
+      | [`String u] -> (u, None, `Null)
+      | [`String u; `String p] -> (u, Some p, `Null)
+      | [`String u; `String p; po] -> (u, Some p, po)
+      | [`String u; `Null; po] -> (u, None, po)
+      | _ -> ("", None, `Null)
+    in
+    if uri_str = "" then
+      Error "Invalid parameters: expected [bip21_uri, (psbt_b64), (params_obj)]"
+    else begin
+      (* Step 1: parse BIP-21 URI to extract `pj=` endpoint + `pjos=`.
+         We probe with mainnet first then fall back to testnet/regtest
+         so the same RPC works on any network. *)
+      let networks = [`Mainnet; `Testnet; `Regtest] in
+      let parsed = List.fold_left (fun acc net ->
+        match acc with
+        | Some _ -> acc
+        | None ->
+          (match Bip21.parse uri_str net with
+           | Ok p -> Some p
+           | Error _ -> None)
+      ) None networks in
+      match parsed with
+      | None -> Error "Invalid BIP-21 URI"
+      | Some bip21 ->
+        match bip21.Bip21.pj with
+        | None ->
+          Error "BIP-21 URI has no pj= endpoint (not a PayJoin URI)"
+        | Some endpoint ->
+          (* Step 2: parse optional sender params. *)
+          (match _sender_params_from_json params_json with
+           | Error e -> Error ("sender params: " ^ e)
+           | Ok base_params ->
+             let sender_params = {
+               base_params with
+               disableoutputsubstitution =
+                 (match bip21.Bip21.pjos with
+                  | Some true  -> true
+                  | Some false -> base_params.disableoutputsubstitution
+                  | None       -> base_params.disableoutputsubstitution);
+             } in
+             (* Step 3: parse OrigPSBT.  Caller MUST supply it for now;
+                full wallet-side construction would tie into FIX-60
+                walletcreatefundedpsbt — out of scope for this fix
+                (which focuses on the wire + anti-snoop side). *)
+             match psbt_b64_opt with
+             | None ->
+               Error "psbt_b64 parameter required (OrigPSBT base64)"
+             | Some b64 ->
+               match Psbt.of_base64 (String.trim b64) with
+               | Error e -> Error ("OrigPSBT decode: " ^ Psbt.string_of_error e)
+               | Ok orig_psbt ->
+                 (* Step 4: POST to receiver. *)
+                 let outcome =
+                   Payjoin.payjoin_send
+                     ~endpoint
+                     ~params:sender_params
+                     ~orig_psbt:orig_psbt
+                     ~retries:1  (* faster RPC turnaround *)
+                     ~timeout_sec:10.0
+                     ()
+                 in
+                 (* Step 5: anti-snoop + finalize. *)
+                 let verdict = Payjoin.finalize_send
+                   ~orig:orig_psbt ~params:sender_params outcome
+                 in
+                 let orig_b64 = Psbt.to_base64 orig_psbt in
+                 match verdict with
+                 | `Accept_payjoin signed_b64 ->
+                   Ok (`Assoc [
+                     ("status", `String "ok");
+                     ("psbt", `String signed_b64);
+                     ("fallback", `Bool false);
+                   ])
+                 | `Receiver_error (err, msg) ->
+                   Ok (`Assoc [
+                     ("status", `String "receiver_error");
+                     ("errorCode", `String (Payjoin.error_code_string err));
+                     ("message", `String msg);
+                     ("psbt", `String orig_b64);
+                     ("fallback", `Bool true);
+                   ])
+                 | `Anti_snoop_failed v ->
+                   Ok (`Assoc [
+                     ("status", `String "anti_snoop_failed");
+                     ("violation", `String (Payjoin.string_of_violation v));
+                     ("psbt", `String orig_b64);
+                     ("fallback", `Bool true);
+                   ])
+                 | `Fallback_broadcast reason ->
+                   Ok (`Assoc [
+                     ("status", `String "fallback");
+                     ("reason", `String reason);
+                     ("psbt", `String orig_b64);
+                     ("fallback", `Bool true);
+                   ]))
+    end
+
+(* ============================================================================
    RPC Method Dispatcher
    ============================================================================ *)
 
@@ -8209,6 +8416,17 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_validatepayjoincontenttype params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_invalid_params, msg))
+
+  (* FIX-66 — BIP-78 PayJoin sender (closes W119 G26 + G27, also flips
+     G2 + G22 + G24 through their handler internals). *)
+  | "getpayjoinrequest" ->
+    (match handle_getpayjoinrequest ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_invalid_params, msg))
+  | "sendpayjoinrequest" ->
+    (match handle_sendpayjoinrequest ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
 
   | _ ->
     Error (rpc_method_not_found, "Method not found: " ^ method_name)

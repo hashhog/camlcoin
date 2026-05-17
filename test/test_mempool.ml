@@ -2661,6 +2661,227 @@ let test_load_rejects_legacy_be_format () =
   cleanup_test_db ()
 
 (* ============================================================================
+   FIX-77: mapDeltas LOAD-side wiring — closes FIX-72 brief-error.
+
+   FIX-72 (commit 3a59a18) added the Core-byte-compat EMIT of map_deltas in
+   save_mempool, but the load path read-and-discarded both the per-entry
+   nFeeDelta and the standalone-deltas tail block.  Per Core
+   node/mempool_persist.cpp:99-102 + 125-132, the LoadMempool ApplyDelta
+   loop calls PrioritiseTransaction on each delta (gated on
+   apply_fee_delta_priority, default TRUE for the auto-restart path; only
+   the RPC `importmempool` defaults the flag to FALSE).
+
+   These tests assert:
+     - In-mempool entry's delta survives save→fresh-pool→load.
+     - Standalone delta (absent txid) survives save→fresh-pool→load and is
+       picked up by future admission via apply_delta.
+     - Empty map_deltas survives round-trip (no spurious entries).
+     - Old-format files (no tail block / no inline delta != 0) load cleanly.
+     - Mixed in-pool + standalone deltas both restore correctly with no
+       double-counting (Core erases per-entry txids from the standalone map
+       before serializing, mempool_persist.cpp:200).
+     - Source-level forward-regression guard: load_mempool's source calls
+       prioritise_transaction for both the inline and the tail-block paths.
+   ============================================================================ *)
+
+(* Helper: drain map_deltas as a sorted list of (hex-txid, delta) pairs. *)
+let snapshot_deltas (mp : Mempool.mempool) : (string * int64) list =
+  let lst = Hashtbl.fold (fun k d acc ->
+    let hex = String.init (String.length k * 2) (fun i ->
+      let b = Char.code k.[i / 2] in
+      let nib = if i mod 2 = 0 then b lsr 4 else b land 0xF in
+      "0123456789abcdef".[nib]
+    ) in
+    (hex, d) :: acc
+  ) mp.map_deltas [] in
+  List.sort compare lst
+
+let test_fix77_in_pool_delta_roundtrip () =
+  (* Prioritise a tx that IS in the mempool, save, fresh pool, load: the
+     delta must be restored into map_deltas AND apply_delta should yield
+     base_fee + delta on the restored entry. *)
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  let tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L]  (* 10_000 sat base fee *)
+  in
+  let added = Result.get_ok (Mempool.add_transaction mp tx) in
+  let txid_in_pool = added.txid in
+  (* Apply a +5_000 sat priority delta. *)
+  Mempool.prioritise_transaction mp txid_in_pool 5_000L;
+  Alcotest.(check (int64)) "pre-save modified fee = 15_000"
+    15_000L (Mempool.get_modified_fee mp added);
+  let path = mempool_dat_path () in
+  Mempool.save_mempool mp path;
+  Storage.ChainDB.close db;
+  cleanup_test_db ();
+  (* Fresh pool over a fresh UTXO that still has the spendable txid1. *)
+  let (mp2, _utxo2, db2, _, _, _) = create_test_mempool () in
+  let loaded = Mempool.load_mempool mp2 path in
+  Alcotest.(check int) "1 tx loaded" 1 loaded;
+  (* The delta should now be in map_deltas. *)
+  let snap = snapshot_deltas mp2 in
+  Alcotest.(check int) "1 delta restored" 1 (List.length snap);
+  let (_, restored_delta) = List.hd snap in
+  Alcotest.(check int64) "delta amount = 5_000" 5_000L restored_delta;
+  (* The reloaded entry's modified fee should also reflect the delta. *)
+  (match Mempool.get mp2 txid_in_pool with
+   | Some entry ->
+     Alcotest.(check (int64)) "post-load modified fee = 15_000"
+       15_000L (Mempool.get_modified_fee mp2 entry)
+   | None -> Alcotest.fail "loaded entry missing from mempool");
+  Sys.remove path;
+  Storage.ChainDB.close db2;
+  cleanup_test_db ()
+
+let test_fix77_standalone_delta_roundtrip () =
+  (* Prioritise a txid that is NOT in the mempool, save, fresh pool, load:
+     map_deltas must contain the entry so a future admission picks it up
+     via apply_delta. *)
+  let (mp, _utxo, db, _, _, _) = create_test_mempool () in
+  let absent_txid = Types.hash256_of_hex
+    "deadbeef00000000000000000000000000000000000000000000000000000000" in
+  Mempool.prioritise_transaction mp absent_txid 7_500L;
+  Alcotest.(check int64) "pre-save get_delta = 7_500"
+    7_500L (Mempool.get_delta mp absent_txid);
+  let path = mempool_dat_path () in
+  Mempool.save_mempool mp path;
+  Storage.ChainDB.close db;
+  cleanup_test_db ();
+  let (mp2, _utxo2, db2, _, _, _) = create_test_mempool () in
+  let loaded = Mempool.load_mempool mp2 path in
+  Alcotest.(check int) "0 txs (absent txid)" 0 loaded;
+  let snap = snapshot_deltas mp2 in
+  Alcotest.(check int) "1 standalone delta restored" 1 (List.length snap);
+  Alcotest.(check int64) "standalone delta amount"
+    7_500L (Mempool.get_delta mp2 absent_txid);
+  Sys.remove path;
+  Storage.ChainDB.close db2;
+  cleanup_test_db ()
+
+let test_fix77_empty_deltas_roundtrip () =
+  (* An empty map_deltas (no prioritise_transaction calls) must round-trip
+     cleanly: no spurious entries appear on load. *)
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  let tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L]
+  in
+  let _ = Mempool.add_transaction mp tx in
+  let path = mempool_dat_path () in
+  Mempool.save_mempool mp path;
+  Storage.ChainDB.close db;
+  cleanup_test_db ();
+  let (mp2, _utxo2, db2, _, _, _) = create_test_mempool () in
+  let loaded = Mempool.load_mempool mp2 path in
+  Alcotest.(check int) "1 tx loaded" 1 loaded;
+  let snap = snapshot_deltas mp2 in
+  Alcotest.(check int) "empty deltas survive (no spurious entry)"
+    0 (List.length snap);
+  Sys.remove path;
+  Storage.ChainDB.close db2;
+  cleanup_test_db ()
+
+let test_fix77_old_format_no_deltas_loads_clean () =
+  (* A mempool.dat written by a node that has the same v=2 header but emits
+     zero deltas (a totally cold pool, or a non-camlcoin Core dump pre-
+     dating prioritisetransaction usage) must still load without
+     populating spurious entries in map_deltas. *)
+  let (mp, _utxo, db, _, _, _) = create_test_mempool () in
+  let path = mempool_dat_path () in
+  Mempool.save_mempool mp path;  (* completely empty pool, empty deltas *)
+  Storage.ChainDB.close db;
+  cleanup_test_db ();
+  let (mp2, _utxo2, db2, _, _, _) = create_test_mempool () in
+  let loaded = Mempool.load_mempool mp2 path in
+  Alcotest.(check int) "0 txs (empty pool)" 0 loaded;
+  let snap = snapshot_deltas mp2 in
+  Alcotest.(check int) "no deltas restored from empty file"
+    0 (List.length snap);
+  Sys.remove path;
+  Storage.ChainDB.close db2;
+  cleanup_test_db ()
+
+let test_fix77_mixed_in_pool_and_standalone () =
+  (* Mixed: one in-pool entry with a delta + one standalone (absent) txid
+     with a different delta.  Both must survive round-trip, neither must
+     be double-counted (Core mempool_persist.cpp:200 erases the in-pool
+     entries from the standalone map before serializing, so save_mempool
+     emits each delta in exactly one slot). *)
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  let tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 990_000L]
+  in
+  let added = Result.get_ok (Mempool.add_transaction mp tx) in
+  let in_pool_txid = added.txid in
+  let absent_txid = Types.hash256_of_hex
+    "feedface00000000000000000000000000000000000000000000000000000000" in
+  Mempool.prioritise_transaction mp in_pool_txid 3_333L;
+  Mempool.prioritise_transaction mp absent_txid 4_444L;
+  let path = mempool_dat_path () in
+  Mempool.save_mempool mp path;
+  Storage.ChainDB.close db;
+  cleanup_test_db ();
+  let (mp2, _utxo2, db2, _, _, _) = create_test_mempool () in
+  let loaded = Mempool.load_mempool mp2 path in
+  Alcotest.(check int) "1 tx loaded" 1 loaded;
+  Alcotest.(check int64) "in-pool delta = 3_333 (no double-count)"
+    3_333L (Mempool.get_delta mp2 in_pool_txid);
+  Alcotest.(check int64) "absent-txid delta = 4_444"
+    4_444L (Mempool.get_delta mp2 absent_txid);
+  let snap = snapshot_deltas mp2 in
+  Alcotest.(check int) "exactly 2 deltas restored" 2 (List.length snap);
+  Sys.remove path;
+  Storage.ChainDB.close db2;
+  cleanup_test_db ()
+
+(* Forward-regression source guard: the load_mempool implementation must
+   call prioritise_transaction in BOTH the inline-per-entry path AND the
+   standalone-tail-block path.  If a future refactor drops either call,
+   this test catches it before runtime. *)
+let test_fix77_source_calls_prioritise_transaction () =
+  let read_all path =
+    let ic = open_in path in
+    let n = in_channel_length ic in
+    let s = really_input_string ic n in
+    close_in ic; s
+  in
+  (* Find lib/mempool.ml relative to the project root.  Tests run from
+     _build/default/test/, so back up to repo root. *)
+  let candidates = [
+    "lib/mempool.ml";
+    "../lib/mempool.ml";
+    "../../lib/mempool.ml";
+    "../../../lib/mempool.ml";
+    "../../../../lib/mempool.ml";
+  ] in
+  let path = List.find Sys.file_exists candidates in
+  let src = read_all path in
+  let load_start_re = Str.regexp_string "let load_mempool" in
+  let load_start = Str.search_forward load_start_re src 0 in
+  (* Take a 6000-char window from the start of load_mempool — load_mempool
+     itself is the only routine that should be wiring deltas on the load
+     side.  We assert prioritise_transaction is referenced at least twice
+     (once for the inline path, once for the tail-block path). *)
+  let window_len = min 8000 (String.length src - load_start) in
+  let window = String.sub src load_start window_len in
+  let count_substring ~needle s =
+    let nlen = String.length needle in
+    let slen = String.length s in
+    let rec go i acc =
+      if i + nlen > slen then acc
+      else if String.sub s i nlen = needle then go (i + nlen) (acc + 1)
+      else go (i + 1) acc
+    in
+    go 0 0
+  in
+  let n_calls = count_substring ~needle:"prioritise_transaction mp" window in
+  Alcotest.(check bool)
+    "load_mempool calls prioritise_transaction mp at least twice (inline + tail-block)"
+    true (n_calls >= 2)
+
+(* ============================================================================
    W72 IsWitnessStandard tests — all 6 gates from Core policy/policy.cpp:265-352.
    We drive is_witness_standard directly with a closure for the UTXO lookup
    so tests do not need a full mempool/DB setup.
@@ -4204,6 +4425,14 @@ let () =
       test_case "empty mempool roundtrip" `Quick test_empty_roundtrip;
       test_case "legacy BE format rejected" `Quick test_load_rejects_legacy_be_format;
       test_case "payload decodes with Core obfuscation" `Quick test_dat_payload_decodes_with_core_obfuscation;
+    ];
+    "fix77_map_deltas_load", [
+      test_case "in-pool delta roundtrip" `Quick test_fix77_in_pool_delta_roundtrip;
+      test_case "standalone delta roundtrip" `Quick test_fix77_standalone_delta_roundtrip;
+      test_case "empty deltas roundtrip" `Quick test_fix77_empty_deltas_roundtrip;
+      test_case "old-format / empty pool loads clean" `Quick test_fix77_old_format_no_deltas_loads_clean;
+      test_case "mixed in-pool + standalone (no double-count)" `Quick test_fix77_mixed_in_pool_and_standalone;
+      test_case "source guard: load_mempool calls prioritise_transaction (inline + tail)" `Quick test_fix77_source_calls_prioritise_transaction;
     ];
     "ephemeral_anchors", [
       test_case "get_dust_outputs" `Quick test_get_dust_outputs;

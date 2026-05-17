@@ -100,13 +100,15 @@ type mempool = {
   (* FIX-72 W120 BUG-10: prioritisetransaction fee deltas.
      Maps txid (binary string key, internal byte order) to a signed satoshi
      delta added by `prioritisetransaction` RPC.  Used by `get_modified_fee`
-     and `apply_delta` to bias selection/RBF math.  NOT persisted across
-     restart (Core parity — txmempool.cpp:411 only persists when
-     LoadMempool/DumpMempool is invoked, and the in-memory map is the
-     authoritative source).
+     and `apply_delta` to bias selection/RBF math.  Persisted across
+     restart by save_mempool (per-entry inline nFeeDelta + standalone tail
+     map) and restored by load_mempool via prioritise_transaction (FIX-77).
+     Matches Core's auto-restart LoadMempool default
+     apply_fee_delta_priority=true (mempool_persist.h:23).
      Reference: bitcoin-core/src/txmempool.h:299 (`mapDeltas`),
      txmempool.cpp:630 (`PrioritiseTransaction`),
-     txmempool.cpp:657 (`ApplyDelta`). *)
+     txmempool.cpp:657 (`ApplyDelta`),
+     node/mempool_persist.cpp:99-102 + 125-132 (LoadMempool ApplyDelta). *)
   map_deltas : (string, int64) Hashtbl.t;
 }
 
@@ -2776,9 +2778,12 @@ let get_modified_fee (mp : mempool) (entry : mempool_entry) : int64 =
    prioritising a not-yet-seen tx, and the delta will be picked up if/when
    the tx arrives.
 
-   NOT persisted across restart: Core only persists via mempool.dat write,
-   and even there it is opt-in via -persistmempool / importmempool
-   `apply_fee_delta_priority`.  camlcoin keeps the map in-memory only. *)
+   Persisted across restart via mempool.dat: save_mempool emits each delta
+   as the per-entry inline nFeeDelta (for in-pool txids) plus the standalone
+   tail map (for absent txids); load_mempool replays via this function on
+   restart (FIX-77).  Matches Core's auto-restart default
+   apply_fee_delta_priority=true (mempool_persist.h:23); only the
+   `importmempool` RPC opts the flag back to false. *)
 let prioritise_transaction (mp : mempool) (txid : Types.hash256)
     (delta_sats : int64) : unit =
   let key = Cstruct.to_string txid in
@@ -3629,10 +3634,23 @@ let save_mempool (mp : mempool) (path : string) : unit =
       put_int64_le payload (get_delta mp entry.txid)
     ) entries;
     (* mapDeltas: FIX-72 — write the full prioritisation map so Core / a
-       restart with -persistmempool=1 and apply_fee_delta_priority=true can
-       reconstruct.  Default-on-load behaviour in camlcoin is to ignore the
-       map (matches Core's apply_fee_delta_priority=false default). *)
-    let deltas = Hashtbl.fold (fun k d acc -> (k, d) :: acc) mp.map_deltas [] in
+       restart with -persistmempool=1 can reconstruct.  FIX-77: load_mempool
+       now applies these deltas via prioritise_transaction, matching Core's
+       node/mempool_persist.cpp:128-132 LoadMempool ApplyDelta loop (default
+       apply_fee_delta_priority=true since Core v25; only the RPC
+       `importmempool` defaults the flag to false).
+       FIX-77: exclude in-mempool entries from the standalone tail map —
+       matches Core mempool_persist.cpp:200 [mapDeltas.erase(i.tx->GetHash())]
+       which removes per-entry txids from the standalone map before
+       serializing.  Without this exclusion, deltas for in-mempool entries
+       would be written twice (once inline, once in the tail) and the
+       LoadMempool ApplyDelta loop on the tail would double-count them. *)
+    let in_pool = Hashtbl.create (Hashtbl.length mp.entries) in
+    Hashtbl.iter (fun k _e -> Hashtbl.replace in_pool k ()) mp.entries;
+    let deltas = Hashtbl.fold (fun k d acc ->
+      if Hashtbl.mem in_pool k then acc
+      else (k, d) :: acc
+    ) mp.map_deltas [] in
     put_compact_size payload (List.length deltas);
     List.iter (fun (txid_str, delta) ->
       Buffer.add_string payload txid_str;
@@ -3758,17 +3776,42 @@ let load_mempool (mp : mempool) (path : string) : int =
           (* Advance our cursor by however many bytes Serialize consumed. *)
           r.r_pos <- r.r_pos + sr.pos;
           let _n_time = r_read_int64_le r in   (* discarded — mempool re-times *)
-          let _n_fee_delta = r_read_int64_le r in (* no prioritisetx tracking *)
+          let n_fee_delta = r_read_int64_le r in
           (match add_transaction mp tx with
-           | Ok _ -> incr loaded
-           | Error _ -> ())
+           | Ok entry ->
+             incr loaded;
+             (* FIX-77: apply the per-entry inline nFeeDelta to map_deltas so
+                modified-fee, RBF Rule 3, and getmempoolentry "fees.modified"
+                pick it up.  Matches Core node/mempool_persist.cpp:99-102
+                (LoadMempool ApplyDelta on per-entry nFeeDelta).  We record
+                via prioritise_transaction so the delta survives eviction +
+                re-admission via the standard apply_delta lookup path. *)
+             if not (Int64.equal n_fee_delta 0L) then
+               prioritise_transaction mp entry.txid n_fee_delta
+           | Error _ ->
+             (* FIX-77: entry could not be admitted (e.g. UTXO missing on
+                fresh chain) — Core still records the standalone-delta path
+                so any future arrival picks up priority.  Per-entry deltas
+                for failed-admission txs are intentionally dropped (Core
+                applies only when the loop body sees a valid tx). *)
+             ())
         done;
-        (* mapDeltas: read + discard *)
+        (* mapDeltas: FIX-77 — apply standalone deltas via
+           prioritise_transaction so txids that are NOT (yet) in the mempool
+           still get their delta recorded.  Matches Core
+           node/mempool_persist.cpp:125-132 — read the full
+           std::map<Txid, CAmount> mapDeltas and call PrioritiseTransaction
+           for each entry.  Core gates this on apply_fee_delta_priority
+           (default true on LoadMempool restart, false only on the
+           `importmempool` RPC). *)
         let n_deltas = r_read_compact_size r in
         for _i = 1 to n_deltas do
-          let _txid = r_read_bytes r 32 in
-          let _amount = r_read_int64_le r in
-          ()
+          let txid_str = r_read_bytes r 32 in
+          let amount = r_read_int64_le r in
+          if not (Int64.equal amount 0L) then begin
+            let txid_cs = Cstruct.of_string txid_str in
+            prioritise_transaction mp txid_cs amount
+          end
         done;
         (* unbroadcast_txids: read + discard *)
         let n_unbcast =

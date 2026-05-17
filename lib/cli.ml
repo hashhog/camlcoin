@@ -974,6 +974,38 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   let max_getcfilters_size = 1000 in
   let max_getcfheaders_size = 2000 in
   let cfcheckpt_interval = 1000 in
+  (* FIX-78 (W121 BUG-1): BIP-157 protocol-violation disconnect channel.
+     Core net_processing.cpp::PrepareBlockFilterRequest sets
+     node.fDisconnect = true unconditionally on five distinct violation
+     paths:
+       (1) unsupported filter_type (line 3274)
+       (2) unknown stop_hash (line 3286)
+       (3) start_height > stop_height (line 3296)
+       (4) range > max_height_diff (line 3302)
+       (5) — for getcfilters / getcfheaders / getcfcheckpt collectively —
+            NODE_COMPACT_FILTERS not in m_our_services (line 3274 path,
+            because [supported_filter_type] is gated on that bit).
+     The listener arms below previously logged "peer should be disconnected"
+     but had no wired path to the peer-manager's disconnect API.  We thread
+     [Peer.misbehaving peer 100 reason] which (a) increments the misbehavior
+     score by 100 — reaching the ban/disconnect threshold immediately —
+     and (b) calls [Peer.disconnect peer], which closes the socket
+     (peer_message_loop next iteration sees state=Disconnected and exits).
+     Score 100 (rather than just disconnect) mirrors how camlcoin elsewhere
+     tracks accumulated misbehavior, and is the strongest signal we can
+     emit for a single protocol violation.  Reference:
+       bitcoin-core/src/net_processing.cpp:3262 PrepareBlockFilterRequest
+       lib/peer.ml:1411 misbehaving (score >= 100 → disconnect)              *)
+  let bip157_disconnect (peer : Peer.peer) (reason : string) : unit Lwt.t =
+    (* FIX-78 disconnect-on-protocol-violation marker. The literal string
+       is asserted by test/test_w121_compact_filters.ml's
+       Fix78_disconnect_source_guard to forward-regress against accidental
+       removal of any of the three listener-arm wirings below. *)
+    Logs.info (fun m ->
+      m "BIP-157 protocol violation from peer %d (%s): %s — disconnecting"
+        peer.Peer.id peer.Peer.addr reason);
+    Peer.misbehaving peer 100 reason
+  in
   Peer_manager.add_listener peer_manager (fun msg peer ->
     match msg, bip157_index with
     | P2p.GetcfiltersMsg { filter_type = 0; start_height; stop_hash }, Some idx ->
@@ -989,21 +1021,26 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       let start_h = Int32.to_int start_height in
       (match Sync.get_header chain stop_hash with
        | None ->
-         Logs.debug (fun m ->
-           m "BIP-157 getcfilters: unknown stop_hash %s"
-             (Types.hash256_to_hex_display stop_hash))
+         (* FIX-78: Core net_processing.cpp:3286 — unknown stop_hash sets
+            node.fDisconnect = true. *)
+         Lwt.async (fun () ->
+           bip157_disconnect peer
+             (Printf.sprintf "getcfilters unknown stop_hash %s"
+                (Types.hash256_to_hex_display stop_hash)))
        | Some stop_index ->
          let stop_h = stop_index.Sync.height in
          if start_h > stop_h then
-           (* Core net_processing.cpp:3296: node.fDisconnect = true. We
-              don't yet wire peer-disconnect from a listener; log + drop. *)
-           Logs.debug (fun m ->
-             m "BIP-157 getcfilters: invalid range start=%d > stop=%d (peer should be disconnected)"
-               start_h stop_h)
+           (* FIX-78: Core net_processing.cpp:3296: node.fDisconnect = true *)
+           Lwt.async (fun () ->
+             bip157_disconnect peer
+               (Printf.sprintf "getcfilters invalid range start=%d > stop=%d"
+                  start_h stop_h))
          else if stop_h - start_h >= max_getcfilters_size then
-           Logs.debug (fun m ->
-             m "BIP-157 getcfilters: range %d too large (%d max, peer should be disconnected)"
-               (stop_h - start_h + 1) max_getcfilters_size)
+           (* FIX-78: Core net_processing.cpp:3302: node.fDisconnect = true *)
+           Lwt.async (fun () ->
+             bip157_disconnect peer
+               (Printf.sprintf "getcfilters range %d too large (max %d)"
+                  (stop_h - start_h + 1) max_getcfilters_size))
          else begin
            (* Walk parent chain from stop_index, sending one cfilter per
               height in [start_h..stop_h].  Filter lookup is by the
@@ -1046,19 +1083,26 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       let start_h = Int32.to_int start_height in
       (match Sync.get_header chain stop_hash with
        | None ->
-         Logs.debug (fun m ->
-           m "BIP-157 getcfheaders: unknown stop_hash %s"
-             (Types.hash256_to_hex_display stop_hash))
+         (* FIX-78: Core net_processing.cpp:3286 — unknown stop_hash sets
+            node.fDisconnect = true. *)
+         Lwt.async (fun () ->
+           bip157_disconnect peer
+             (Printf.sprintf "getcfheaders unknown stop_hash %s"
+                (Types.hash256_to_hex_display stop_hash)))
        | Some stop_index ->
          let stop_h = stop_index.Sync.height in
          if start_h > stop_h then
-           Logs.debug (fun m ->
-             m "BIP-157 getcfheaders: invalid range start=%d > stop=%d (peer should be disconnected)"
-               start_h stop_h)
+           (* FIX-78: Core net_processing.cpp:3296: node.fDisconnect = true *)
+           Lwt.async (fun () ->
+             bip157_disconnect peer
+               (Printf.sprintf "getcfheaders invalid range start=%d > stop=%d"
+                  start_h stop_h))
          else if stop_h - start_h >= max_getcfheaders_size then
-           Logs.debug (fun m ->
-             m "BIP-157 getcfheaders: range %d too large (%d max, peer should be disconnected)"
-               (stop_h - start_h + 1) max_getcfheaders_size)
+           (* FIX-78: Core net_processing.cpp:3302: node.fDisconnect = true *)
+           Lwt.async (fun () ->
+             bip157_disconnect peer
+               (Printf.sprintf "getcfheaders range %d too large (max %d)"
+                  (stop_h - start_h + 1) max_getcfheaders_size))
          else begin
            (* prev_filter_header is the filter header of the block at
               start_h - 1 along the stop_hash ancestry, or zero for
@@ -1107,9 +1151,12 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
          Sync.get_ancestor — mirrors Core net_processing.cpp:3409. *)
       (match Sync.get_header chain stop_hash with
        | None ->
-         Logs.debug (fun m ->
-           m "BIP-157 getcfcheckpt: unknown stop_hash %s"
-             (Types.hash256_to_hex_display stop_hash))
+         (* FIX-78: Core net_processing.cpp:3286 — unknown stop_hash sets
+            node.fDisconnect = true. *)
+         Lwt.async (fun () ->
+           bip157_disconnect peer
+             (Printf.sprintf "getcfcheckpt unknown stop_hash %s"
+                (Types.hash256_to_hex_display stop_hash)))
        | Some stop_index ->
          let stop_h = stop_index.Sync.height in
          let n_checkpts = stop_h / cfcheckpt_interval in
@@ -1135,11 +1182,24 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
                   filter_headers = List.rev !headers;
                 })));
       Lwt.return_unit
-    | P2p.GetcfiltersMsg _, None
-    | P2p.GetcfheadersMsg _, None
-    | P2p.GetcfcheckptMsg _, None ->
-      (* Index not enabled; silently ignore, per Core behaviour *)
-      Lwt.return_unit
+    | P2p.GetcfiltersMsg { filter_type; _ }, _
+    | P2p.GetcfheadersMsg { filter_type; _ }, _
+    | P2p.GetcfcheckptMsg { filter_type; _ }, _ ->
+      (* FIX-78: Core net_processing.cpp:3271-3274 — when filter_type is not
+         supported OR NODE_COMPACT_FILTERS is not in m_our_services, set
+         node.fDisconnect = true and return.
+         The arms above match filter_type = 0 AND Some idx. Falling
+         through to here means either:
+           (a) filter_type != 0 (unsupported type) — always a violation; or
+           (b) bip157_index = None (NODE_COMPACT_FILTERS not advertised, so
+               the peer shouldn't be sending these at all). *)
+      let reason =
+        if filter_type <> 0 then
+          Printf.sprintf "BIP-157 unsupported filter_type=%d" filter_type
+        else
+          "BIP-157 request received but NODE_COMPACT_FILTERS not advertised"
+      in
+      bip157_disconnect peer reason
     | _ -> Lwt.return_unit);
 
   (* Register a listener for blocks received post-IBD (when ibd_state is None).

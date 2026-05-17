@@ -40,6 +40,25 @@ let rpc_verify_error = -25
 let rpc_verify_rejected = -26
 
 (* ============================================================================
+   Network Name Translation
+   ============================================================================
+   Internal network names (consensus.ml) → canonical Bitcoin Core RPC strings
+   as defined by src/util/chaintype.cpp::ChainTypeToString:
+     mainnet  → main
+     testnet3 → test
+     testnet4 → testnet4
+     signet   → signet
+     regtest  → regtest
+   All RPC endpoints that emit the chain field MUST translate via this helper
+   so daily consensus-diff vs Core stays clean (FIX-80). *)
+let core_chain_name (internal_name : string) : string =
+  match internal_name with
+  | "mainnet"  -> "main"
+  | "testnet"  -> "test"
+  | "testnet3" -> "test"
+  | other      -> other
+
+(* ============================================================================
    RPC Context
    ============================================================================ *)
 
@@ -509,7 +528,7 @@ let handle_getblockchaininfo (ctx : rpc_context)
   let softforks = `Assoc (build_deployments_assoc
     ~net:ctx.network ~query_height ~get_block) in
   let base_fields = [
-    ("chain", `String ctx.network.name);
+    ("chain", `String (core_chain_name ctx.network.name));
     ("blocks", `Int validated_height);
     ("headers", `Int ctx.chain.headers_synced);
     ("bestblockhash", `String tip_hash);
@@ -686,11 +705,7 @@ let handle_getsyncstate (ctx : rpc_context) : Yojson.Safe.t =
   let best_header_hash = tip_hash in
   let is_ibd = ctx.chain.sync_state <> Sync.FullySynced in
   let num_peers = Peer_manager.peer_count ctx.peer_manager in
-  let chain_name = match ctx.network.name with
-    | "mainnet" -> "main"
-    | "testnet3" -> "test"
-    | other -> other
-  in
+  let chain_name = core_chain_name ctx.network.name in
   let progress =
     if header_height = 0 then 0.0
     else
@@ -1801,7 +1816,7 @@ let handle_getmininginfo (ctx : rpc_context) : Yojson.Safe.t =
     ("blockmintxfee", `Float 0.00001000);
     ("networkhashps", `Float 0.0);
     ("pooledtx", `Int (Hashtbl.length ctx.mempool.entries));
-    ("chain", `String ctx.network.name);
+    ("chain", `String (core_chain_name ctx.network.name));
     ("next", `Assoc [
       ("height", `Int next_height);
       ("bits", `String bits_hex);

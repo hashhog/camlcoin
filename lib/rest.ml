@@ -616,7 +616,7 @@ let handle_chaininfo (ctx : Rpc.rpc_context) (_req : Cohttp.Request.t)
       | None -> String.make 64 '0'
     in
     let json = `Assoc [
-      ("chain", `String ctx.network.name);
+      ("chain", `String (Rpc.core_chain_name ctx.network.name));
       ("blocks", `Int tip_height);
       ("headers", `Int ctx.chain.headers_synced);
       ("bestblockhash", `String tip_hash);

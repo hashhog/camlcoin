@@ -4,9 +4,20 @@
    the same inputs during block connection and mempool acceptance.
 
    Matches Bitcoin Core's sigcache.cpp behavior:
-   - Cache key: (txid, input_index, flags)
+   - Cache key: (wtxid, input_index, flags)
    - Bounded size with random eviction when full
-   - Clear on reorg to prevent stale entries *)
+   - Clear on reorg to prevent stale entries
+
+   W159 BUG-17 / W160 BUG-1 fix: key on wtxid (witness-covering) not txid
+   (no-witness). For SegWit inputs, two transactions can share the same
+   non-witness txid but differ in witness data; keying on txid lets a
+   malleated witness cache-hit a previously-verified valid witness and
+   bypass script verification — a chain-split candidate vs Bitcoin Core
+   which keys its sigcache on the full (sighash, pubkey, sig) tuple
+   (sigcache.cpp:39-49). wtxid is SHA256d of the full serialised tx
+   INCLUDING witness, so any witness mutation produces a different wtxid
+   and therefore a different cache key — closing the malleability
+   oracle. *)
 
 (* ============================================================================
    Types
@@ -15,26 +26,31 @@
 (** Cache key uniquely identifies a script verification.
     The key must include script verification flags because verification
     under stricter flags (e.g., SCRIPT_VERIFY_WITNESS) should not satisfy
-    a check under looser flags. *)
+    a check under looser flags.
+
+    [wtxid] is the WITNESS transaction id (SHA256d of full serialised
+    transaction including witness data), NOT the no-witness txid.  See
+    module-level comment for the SegWit-malleability chain-split this
+    closes. *)
 type cache_key = {
-  txid : Types.hash256;
+  wtxid : Types.hash256;
   input_index : int;
   flags : int;
 }
 
 (** Hash function for cache keys.
-    Combines txid bytes with input_index and flags into a single int. *)
+    Combines wtxid bytes with input_index and flags into a single int. *)
 let hash_key (key : cache_key) : int =
-  (* Use first 8 bytes of txid as base, XOR with index and flags *)
+  (* Use first 8 bytes of wtxid as base, XOR with index and flags *)
   let h = ref 0 in
-  for i = 0 to min 7 (Cstruct.length key.txid - 1) do
-    h := (!h lsl 8) lxor (Cstruct.get_uint8 key.txid i)
+  for i = 0 to min 7 (Cstruct.length key.wtxid - 1) do
+    h := (!h lsl 8) lxor (Cstruct.get_uint8 key.wtxid i)
   done;
   !h lxor (key.input_index * 31) lxor (key.flags * 17)
 
 (** Equality for cache keys. *)
 let key_equal (a : cache_key) (b : cache_key) : bool =
-  Cstruct.equal a.txid b.txid &&
+  Cstruct.equal a.wtxid b.wtxid &&
   a.input_index = b.input_index &&
   a.flags = b.flags
 

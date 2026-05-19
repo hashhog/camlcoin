@@ -6,11 +6,15 @@ open Camlcoin
    Helper Functions
    ============================================================================ *)
 
-(* Create a cache key with the given parameters *)
+(* Create a cache key with the given parameters.
+   W159 BUG-17 / W160 BUG-1: field renamed txid → wtxid (witness-covering)
+   to prevent SegWit-malleability cache poisoning.  Helper keeps the
+   [txid_byte] argument name for backward-compatibility of test bodies;
+   the byte is written into wtxid. *)
 let make_key ?(txid_byte=1) ?(input_index=0) ?(flags=0) () : Sig_cache.cache_key =
-  let txid = Cstruct.create 32 in
-  Cstruct.set_uint8 txid 0 txid_byte;
-  { Sig_cache.txid; input_index; flags }
+  let wtxid = Cstruct.create 32 in
+  Cstruct.set_uint8 wtxid 0 txid_byte;
+  { Sig_cache.wtxid; input_index; flags }
 
 (* ============================================================================
    Basic Cache Operations Tests
@@ -261,6 +265,85 @@ let test_key_inequality_flags () =
   Alcotest.(check bool) "different flags" false (Sig_cache.key_equal key1 key2)
 
 (* ============================================================================
+   W159 BUG-17 / W160 BUG-1 — SegWit Malleability Cache-Poisoning Test
+   ============================================================================ *)
+
+(* Helper: build a non-coinbase tx with a single SegWit input and a single
+   output.  Differs only in witness items.  Used by the malleability test
+   to construct two transactions with IDENTICAL txid (witness data is NOT
+   covered by txid serialisation) but DIFFERENT wtxid. *)
+let make_segwit_tx (witness_items : Cstruct.t list) : Types.transaction =
+  let outpoint_txid = Cstruct.create 32 in
+  Cstruct.set_uint8 outpoint_txid 0 0xAA;
+  let script_pubkey = Cstruct.create 22 in
+  Cstruct.set_uint8 script_pubkey 0 0x00;  (* OP_0 *)
+  Cstruct.set_uint8 script_pubkey 1 0x14;  (* push 20 *)
+  {
+    version = 2l;
+    inputs = [
+      { previous_output = { txid = outpoint_txid; vout = 0l };
+        script_sig = Cstruct.empty;
+        sequence = 0xFFFFFFFFl }
+    ];
+    outputs = [
+      { value = 50_000L; script_pubkey }
+    ];
+    witnesses = [{ items = witness_items }];
+    locktime = 0l;
+  }
+
+(* Test: Two SegWit transactions with the SAME non-witness txid but
+   DIFFERENT witnesses must produce DIFFERENT cache keys.  This is the
+   SegWit-malleability chain-split candidate the audit (W159 BUG-17 /
+   W160 BUG-1) documents.
+
+   Pre-fix behaviour: cache_key = (txid, input_index, flags); since
+   compute_txid excludes witness data (BIP-141), the two txs hash to the
+   SAME cache_key — a malleated invalid witness inherits the cached
+   `true` of the canonical valid witness and is admitted.
+
+   Post-fix behaviour: cache_key = (wtxid, input_index, flags); wtxid
+   COVERS witness data, so the two txs hash to DIFFERENT cache_keys and
+   the malleated witness must be re-verified (and rejected). *)
+let test_segwit_malleability_distinct_cache_keys () =
+  let open Camlcoin in
+  (* Two SegWit txs identical EXCEPT witness items. *)
+  let sig_valid = Cstruct.of_string (String.make 71 '\x01') in
+  let sig_malleated = Cstruct.of_string (String.make 71 '\x02') in
+  let pubkey = Cstruct.of_string (String.make 33 '\xAB') in
+  let tx_canonical = make_segwit_tx [sig_valid; pubkey] in
+  let tx_malleated = make_segwit_tx [sig_malleated; pubkey] in
+  (* Sanity: txid identical (no-witness serialisation is bit-equal). *)
+  let txid_canonical  = Crypto.compute_txid tx_canonical in
+  let txid_malleated  = Crypto.compute_txid tx_malleated in
+  Alcotest.(check bool) "txids match (witness not covered by txid)" true
+    (Cstruct.equal txid_canonical txid_malleated);
+  (* But wtxid MUST differ (witness IS covered by wtxid). *)
+  let wtxid_canonical = Crypto.compute_wtxid tx_canonical in
+  let wtxid_malleated = Crypto.compute_wtxid tx_malleated in
+  Alcotest.(check bool) "wtxids differ (witness covered by wtxid)" true
+    (not (Cstruct.equal wtxid_canonical wtxid_malleated));
+  (* The chain-split-closing assertion: cache keys for the two txs must
+     differ at the same input_index and flags. *)
+  let key_canonical : Sig_cache.cache_key =
+    { wtxid = wtxid_canonical; input_index = 0; flags = 0 } in
+  let key_malleated : Sig_cache.cache_key =
+    { wtxid = wtxid_malleated; input_index = 0; flags = 0 } in
+  Alcotest.(check bool)
+    "SegWit-malleated witness must NOT cache-hit the canonical witness"
+    false (Sig_cache.key_equal key_canonical key_malleated);
+  (* End-to-end via the actual cache: insert canonical, lookup malleated
+     MUST miss.  Pre-fix this returned Some true (the bug). *)
+  let cache = Sig_cache.create () in
+  Sig_cache.insert cache key_canonical true;
+  match Sig_cache.lookup cache key_malleated with
+  | None -> ()  (* Expected after fix. *)
+  | Some _ ->
+    Alcotest.fail
+      "BUG: malleated witness cache-hit the canonical entry — \
+       chain-split candidate vs Core (W159 BUG-17 / W160 BUG-1 NOT fixed)"
+
+(* ============================================================================
    Test Registration
    ============================================================================ *)
 
@@ -299,5 +382,9 @@ let () =
       test_case "different txid" `Quick test_key_inequality_txid;
       test_case "different input_index" `Quick test_key_inequality_input_index;
       test_case "different flags" `Quick test_key_inequality_flags;
+    ];
+    "segwit_malleability", [
+      test_case "W159 BUG-17 / W160 BUG-1: malleated witness must not cache-hit"
+        `Quick test_segwit_malleability_distinct_cache_keys;
     ];
   ]

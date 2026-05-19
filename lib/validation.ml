@@ -1156,10 +1156,15 @@ let validate_tx_inputs (tx : Types.transaction) ~(lookup : utxo_lookup)
                   { Types.items = [] }
               in
 
-              (* Compute txid for cache key *)
-              let txid = Crypto.compute_txid tx in
+              (* Compute wtxid for cache key.
+                 W159 BUG-17 / W160 BUG-1: must use witness-covering wtxid,
+                 NOT no-witness txid, otherwise SegWit malleation can poison
+                 the cache (two txs with same txid but different witness
+                 cache-hit each other, accepting an invalid witness via the
+                 cached "true" → chain-split vs Core). *)
+              let wtxid = Crypto.compute_wtxid tx in
               let cache_key : Sig_cache.cache_key = {
-                txid;
+                wtxid;
                 input_index = i;
                 flags;
               } in
@@ -1224,11 +1229,14 @@ let cache_insert (cache : Sig_cache.t) (key : Sig_cache.cache_key) (v : bool) : 
   Mutex.unlock sig_cache_mutex
 
 (* Verify a single input.  Returns Ok () on success, Error (index, msg) on
-   failure.  Safe to call from any Domain — sig-cache access is serialised. *)
+   failure.  Safe to call from any Domain — sig-cache access is serialised.
+
+   W159 BUG-17 / W160 BUG-1: cache key uses wtxid (witness-covering),
+   NOT txid (no-witness), to prevent SegWit-malleability cache poisoning. *)
 let verify_one_input
     ~(tx : Types.transaction) ~(flags : int)
     ~(prevouts : (int64 * Cstruct.t) list)
-    ~(txid : Types.hash256)
+    ~(wtxid : Types.hash256)
     ~(cache : Sig_cache.t)
     (i : int) (inp : Types.tx_in) (utxo : utxo)
     : (unit, int * string) result =
@@ -1236,7 +1244,7 @@ let verify_one_input
     if i < List.length tx.witnesses then List.nth tx.witnesses i
     else { Types.items = [] }
   in
-  let cache_key : Sig_cache.cache_key = { txid; input_index = i; flags } in
+  let cache_key : Sig_cache.cache_key = { wtxid; input_index = i; flags } in
   match cache_lookup cache cache_key with
   | Some true -> Ok ()
   | _ ->
@@ -1258,14 +1266,14 @@ let verify_one_input
 let verify_input_slice
     ~(tx : Types.transaction) ~(flags : int)
     ~(prevouts : (int64 * Cstruct.t) list)
-    ~(txid : Types.hash256)
+    ~(wtxid : Types.hash256)
     ~(cache : Sig_cache.t)
     (tasks : (int * Types.tx_in * utxo) list)
     : (unit, int * string) result =
   List.fold_left (fun acc (i, inp, utxo) ->
     match acc with
     | Error _ as e -> e
-    | Ok () -> verify_one_input ~tx ~flags ~prevouts ~txid ~cache i inp utxo
+    | Ok () -> verify_one_input ~tx ~flags ~prevouts ~wtxid ~cache i inp utxo
   ) (Ok ()) tasks
 
 (* Verify all inputs of a transaction in parallel using OCaml 5 Domains.
@@ -1306,14 +1314,18 @@ let verify_scripts_parallel_domain
     let ntasks = List.length tasks in
     if ntasks = 0 then Ok ()
     else begin
-      let txid = Crypto.compute_txid tx in
+      (* W159 BUG-17 / W160 BUG-1: cache key must use wtxid (witness-covering)
+         to prevent SegWit-malleability cache poisoning across parallel
+         workers (the cache is global; the malleated tx's wtxid differs
+         from the canonical tx's wtxid → cache miss → re-verify → reject). *)
+      let wtxid = Crypto.compute_wtxid tx in
       let cache = Sig_cache.get_global () in
       (* Number of domains: min(cpu_count, ntasks), at least 1. *)
       let ncpus = Domain.recommended_domain_count () in
       let ndomains = max 1 (min ncpus ntasks) in
       if ndomains = 1 then begin
         (* Serial fallback — avoid Domain overhead for tiny transactions. *)
-        match verify_input_slice ~tx ~flags ~prevouts ~txid ~cache tasks with
+        match verify_input_slice ~tx ~flags ~prevouts ~wtxid ~cache tasks with
         | Ok () -> Ok ()
         | Error (idx, msg) -> Error (TxScriptFailed (idx, msg))
       end else begin
@@ -1334,11 +1346,11 @@ let verify_scripts_parallel_domain
           let len   = stop - start in  (* always >= 0: start <= stop *)
           let slice = Array.to_list (Array.sub task_arr start len) in
           Domain.spawn (fun () ->
-            verify_input_slice ~tx ~flags ~prevouts ~txid ~cache slice)
+            verify_input_slice ~tx ~flags ~prevouts ~wtxid ~cache slice)
         ) in
         (* Main domain processes first chunk. *)
         let main_slice = Array.to_list (Array.sub task_arr 0 (min chunk ntasks)) in
-        let main_result = verify_input_slice ~tx ~flags ~prevouts ~txid ~cache main_slice in
+        let main_result = verify_input_slice ~tx ~flags ~prevouts ~wtxid ~cache main_slice in
         (* Join all worker domains. *)
         let worker_results = Array.map Domain.join workers in
         (* Collect first error across all results. *)

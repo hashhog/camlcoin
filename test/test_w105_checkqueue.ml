@@ -84,7 +84,9 @@ let make_txid ?(byte = 1) () =
   t
 
 let make_key ?(txid_byte = 1) ?(input_index = 0) ?(flags = 0) () : Sig_cache.cache_key =
-  { Sig_cache.txid = make_txid ~byte:txid_byte (); input_index; flags }
+  (* W159 BUG-17 / W160 BUG-1: cache key field renamed txid → wtxid
+     (witness-covering) to prevent SegWit-malleability cache poisoning. *)
+  { Sig_cache.wtxid = make_txid ~byte:txid_byte (); input_index; flags }
 
 (* ================================================================
    G3 — min_inputs_for_parallel defined but never consulted

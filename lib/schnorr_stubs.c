@@ -54,6 +54,25 @@ static secp256k1_context *schnorr_ctx = NULL;
 static void ensure_ctx(void) {
     if (schnorr_ctx == NULL) {
         schnorr_ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+        if (schnorr_ctx == NULL) {
+            caml_failwith("ensure_ctx: secp256k1_context_create failed");
+        }
+        /* Side-channel blinding: randomize the context with 32 bytes of
+         * fresh entropy from /dev/urandom. Mirrors Bitcoin Core's
+         * ECC_Start (key.cpp:578-584) and the libsecp256k1 docs'
+         * "highly recommended" guidance for any context used with
+         * secret keys. Closes W159 BUG-2 (side-channel-blinding-disabled).
+         */
+        unsigned char seed[32];
+        FILE *f = fopen("/dev/urandom", "rb");
+        if (f == NULL || fread(seed, 1, 32, f) != 32) {
+            if (f) fclose(f);
+            caml_failwith("ensure_ctx: failed to read /dev/urandom for context randomization");
+        }
+        fclose(f);
+        if (!secp256k1_context_randomize(schnorr_ctx, seed)) {
+            caml_failwith("ensure_ctx: secp256k1_context_randomize failed");
+        }
     }
 }
 

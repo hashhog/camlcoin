@@ -429,6 +429,123 @@ let test_record_eviction_idempotent () =
     (Fee_estimation.tracked_count est)
 
 (* ============================================================================
+   Persistence Tests — save_to_file / load_from_file
+   ----------------------------------------------------------------------------
+   Regression coverage for the 2026-05-19 mainnet incident: a SIGKILL during
+   the fleet deploy left fee_estimates.dat as a structurally-self-consistent
+   but semantically-corrupt OCaml Marshal stream. Marshal.from_channel
+   reconstructed garbage and the blind cast to serialized_state SIGSEGV'd on
+   the first field access in restore_horizon — killing the node silently on
+   every restart. load_from_file must now degrade to a fresh estimator
+   instead of crashing.
+   ============================================================================ *)
+
+let with_temp_path (f : string -> unit) : unit =
+  let path = Filename.temp_file "feeest_test" ".dat" in
+  (* temp_file creates the file; remove it so load_from_file's
+     Sys.file_exists check behaves like a fresh datadir when needed. *)
+  (try Sys.remove path with _ -> ());
+  Fun.protect ~finally:(fun () ->
+    (try Sys.remove path with _ -> ());
+    (try Sys.remove (path ^ ".tmp") with _ -> ()))
+    (fun () -> f path)
+
+let test_persist_round_trip () =
+  with_temp_path (fun path ->
+    let est = Fee_estimation.create () in
+    for i = 1 to 15 do
+      let txid = make_txid i in
+      Fee_estimation.track_transaction est txid 120.0 500;
+      Fee_estimation.record_confirmation est txid 502
+    done;
+    est.Fee_estimation.block_height <- 777;
+    Fee_estimation.save_to_file est path;
+    Alcotest.(check bool) "file was written" true (Sys.file_exists path);
+    let est2 = Fee_estimation.create () in
+    let ok = Fee_estimation.load_from_file est2 path in
+    Alcotest.(check bool) "load succeeded" true ok;
+    Alcotest.(check int) "block height restored" 777
+      (Fee_estimation.current_height est2))
+
+let test_persist_missing_file () =
+  with_temp_path (fun path ->
+    (* File deliberately absent — must return false, not raise. *)
+    let est = Fee_estimation.create () in
+    let ok = Fee_estimation.load_from_file est path in
+    Alcotest.(check bool) "missing file -> false" false ok)
+
+let test_persist_truncated_file () =
+  with_temp_path (fun path ->
+    (* Write a valid file, then truncate it mid-payload. The 20-byte
+       Marshal header survives but declares more payload than is present
+       — caught by the header/length check, no object reconstruction. *)
+    let est = Fee_estimation.create () in
+    for i = 1 to 10 do
+      Fee_estimation.track_transaction est (make_txid i) 50.0 100
+    done;
+    Fee_estimation.save_to_file est path;
+    let full = in_channel_length (open_in_bin path) in
+    Alcotest.(check bool) "have a non-trivial file" true (full > 40);
+    let oc = open_out_gen [Open_wronly] 0o644 path in
+    (* Keep the header but lop off most of the payload. *)
+    Unix.ftruncate (Unix.descr_of_out_channel oc) 30;
+    close_out oc;
+    let est2 = Fee_estimation.create () in
+    (* Must NOT crash, must report failure. *)
+    let ok = Fee_estimation.load_from_file est2 path in
+    Alcotest.(check bool) "truncated file -> false" false ok;
+    Alcotest.(check int) "estimator left fresh" 0
+      (Fee_estimation.current_height est2))
+
+let test_persist_garbage_file () =
+  with_temp_path (fun path ->
+    (* Random bytes — not an OCaml Marshal stream at all (wrong magic). *)
+    let oc = open_out_bin path in
+    for _ = 1 to 4096 do output_char oc (Char.chr (Random.int 256)) done;
+    close_out oc;
+    let est = Fee_estimation.create () in
+    let ok = Fee_estimation.load_from_file est path in
+    Alcotest.(check bool) "garbage file -> false" false ok)
+
+let test_persist_corrupt_marshal_no_segv () =
+  (* The exact 2026-05-19 incident shape: a Marshal stream whose 20-byte
+     header is length-consistent (so the truncation check passes) but
+     whose object body is corrupt — Marshal.from_channel returns a poison
+     value and a deep field access faults. load_from_file must contain
+     that fault (via the forked validator child) and return false. *)
+  with_temp_path (fun path ->
+    (* Build a real, valid serialized fee-estimates file first. *)
+    let est = Fee_estimation.create () in
+    for i = 1 to 12 do
+      Fee_estimation.track_transaction est (make_txid i) 80.0 300;
+      Fee_estimation.record_confirmation est (make_txid i) 303
+    done;
+    Fee_estimation.save_to_file est path;
+    (* Corrupt the marshalled payload IN PLACE without touching the
+       20-byte header, so header_size/data_size still agree with the
+       file length. We flip bytes deep in the payload — enough to make
+       a reconstructed pointer field bogus. *)
+    let len = in_channel_length (open_in_bin path) in
+    let data = really_input_string (open_in_bin path) len in
+    let buf = Bytes.of_string data in
+    (* Scribble over the body, leaving header (first 20 bytes) intact. *)
+    for i = 24 to Bytes.length buf - 1 do
+      Bytes.set buf i (Char.chr ((Char.code (Bytes.get buf i) * 7 + 3) land 0xff))
+    done;
+    let oc = open_out_bin path in
+    output_bytes oc buf;
+    close_out oc;
+    let est2 = Fee_estimation.create () in
+    (* The whole point: this call used to SIGSEGV the process. It must
+       now return cleanly. If the fix regresses, the test binary dies
+       here with signal 11 and the suite fails loudly. *)
+    let ok = Fee_estimation.load_from_file est2 path in
+    Alcotest.(check bool) "corrupt-body marshal -> false (no segfault)"
+      false ok;
+    Alcotest.(check int) "estimator left fresh after corrupt load" 0
+      (Fee_estimation.current_height est2))
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -472,5 +589,13 @@ let () =
       test_case "eviction removes tx" `Quick test_record_eviction_removes_tx;
       test_case "eviction no confirmation" `Quick test_record_eviction_no_confirmation;
       test_case "eviction idempotent" `Quick test_record_eviction_idempotent;
+    ];
+    "persistence", [
+      test_case "save/load round trip" `Quick test_persist_round_trip;
+      test_case "missing file -> false" `Quick test_persist_missing_file;
+      test_case "truncated file -> false" `Quick test_persist_truncated_file;
+      test_case "garbage file -> false" `Quick test_persist_garbage_file;
+      test_case "corrupt marshal body -> no segfault"
+        `Quick test_persist_corrupt_marshal_no_segv;
     ];
   ]

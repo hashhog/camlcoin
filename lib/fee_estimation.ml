@@ -523,6 +523,18 @@ let save_to_file (est : t) (path : string) : unit =
   let oc = open_out_bin tmp in
   (try
     Marshal.to_channel oc state [];
+    flush oc;
+    (* fsync the payload before the rename so a crash (SIGKILL / power
+       loss) cannot leave [path] pointing at a tmp file whose bytes were
+       only partially flushed from the OS page cache. Without this, an
+       interrupted save can yield a Marshal frame whose 20-byte header
+       length is self-consistent but whose object body is garbage — and
+       Marshal.from_channel reconstructs that garbage and casts it to
+       [serialized_state] with no type check, segfaulting on first field
+       access (see load_from_file's child-process guard for the read
+       side). Best-effort: a platform without fsync still gets tmp+rename
+       atomicity. *)
+    (try Unix.fsync (Unix.descr_of_out_channel oc) with _ -> ());
     close_out oc;
     Sys.rename tmp path
   with exn ->
@@ -530,9 +542,133 @@ let save_to_file (est : t) (path : string) : unit =
     (try Sys.remove tmp with _ -> ());
     raise exn)
 
+(* Deeply traverse a [serialized_state] so that every field, array
+   element, and list cell is actually dereferenced. When the value came
+   from [Marshal.from_channel] over a corrupt file, OCaml has blind-cast
+   structurally-bogus bytes to [serialized_state]; touching a field that
+   is really a non-pointer (or a wrong-tag block) dereferences arbitrary
+   memory and faults. Running this inside a forked child confines that
+   fault to the child — the parent observes WSIGNALED and falls back to a
+   fresh estimator instead of taking down the whole node. Returns unit;
+   it is the *act* of traversal that matters. *)
+let touch_serialized_state (s : serialized_state) : unit =
+  let touch_horizon (h : serialized_horizon) =
+    (* String length forces the header read of s_name. *)
+    ignore (String.length h.s_name);
+    ignore (Sys.opaque_identity h.s_decay);
+    ignore (Sys.opaque_identity h.s_max_target);
+    ignore (Sys.opaque_identity h.s_scale);
+    Array.iter (fun (b : serialized_bucket) ->
+      ignore (Sys.opaque_identity b.s_total_confirmed);
+      ignore (Sys.opaque_identity b.s_total_unconfirmed);
+      List.iter (fun x -> ignore (Sys.opaque_identity x))
+        b.s_blocks_to_confirm
+    ) h.s_buckets
+  in
+  ignore (Sys.opaque_identity s.s_version);
+  ignore (Sys.opaque_identity s.s_block_height);
+  touch_horizon s.s_short;
+  touch_horizon s.s_medium;
+  touch_horizon s.s_long
+
+(* Validate that [path] holds a structurally-sound OCaml Marshal stream
+   by inspecting the 20-byte header ONLY (no object reconstruction, so
+   this step itself can never fault). Returns the declared payload size
+   on success. Catches the truncation / wrong-magic failure modes
+   cheaply and in-process. *)
+let marshal_payload_ok (path : string) : bool =
+  try
+    let ic = open_in_bin path in
+    Fun.protect ~finally:(fun () -> close_in_noerr ic) (fun () ->
+      let hdr_len = Marshal.header_size in
+      let hdr = Bytes.create hdr_len in
+      really_input ic hdr 0 hdr_len;
+      (* Marshal.data_size raises Failure if the magic number is wrong. *)
+      let data_len = Marshal.data_size hdr 0 in
+      let file_len = in_channel_length ic in
+      (* The on-disk file must hold at least header + declared payload.
+         A short file is a truncated (interrupted) save. *)
+      data_len >= 0 && file_len >= hdr_len + data_len)
+  with _ -> false
+
+(* Unmarshal [path] in a forked child and structurally traverse the
+   result. The child exits 0 iff Marshal.from_channel + a full deep
+   touch both completed without faulting; any segfault/abort confines
+   itself to the child. Returns true iff the bytes are proven safe for
+   the parent to unmarshal.
+
+   The child does only synchronous Marshal work and then [_exit]s — it
+   never touches Lwt, RocksDB, or sockets, so although it inherits those
+   FDs across the fork it neither uses nor corrupts them, and the parent
+   (which keeps its own FD table and Lwt engine intact) is unaffected.
+   The wait is bounded: in the pathological case where the child wedges
+   (e.g. a glibc malloc-arena lock held by another thread at fork time),
+   we SIGKILL it after [child_timeout_s] and reject the file rather than
+   hang node startup. *)
+let child_timeout_s = 30.0
+
+let child_validates_marshal (path : string) : bool =
+  match Unix.fork () with
+  | 0 ->
+    (* Child: never returns to caller — always _exit. *)
+    let code =
+      try
+        let ic = open_in_bin path in
+        let s : serialized_state = Marshal.from_channel ic in
+        close_in_noerr ic;
+        touch_serialized_state s;
+        0
+      with _ -> 1
+    in
+    (* _exit (not exit): skip at_exit handlers / channel flushes that
+       could double-run in the child. *)
+    (try Unix._exit code with _ -> exit code)
+  | child_pid ->
+    (* Bounded wait: poll with WNOHANG until the child reaps or the
+       deadline passes. *)
+    let deadline = Unix.gettimeofday () +. child_timeout_s in
+    let rec wait () =
+      match (try Unix.waitpid [Unix.WNOHANG] child_pid
+             with _ -> (child_pid, Unix.WEXITED 1)) with
+      | (0, _) ->
+        if Unix.gettimeofday () > deadline then begin
+          (* Child wedged — kill it and reject the file. *)
+          (try Unix.kill child_pid Sys.sigkill with _ -> ());
+          (try ignore (Unix.waitpid [] child_pid) with _ -> ());
+          false
+        end else begin
+          (try Unix.sleepf 0.02 with _ -> ());
+          wait ()
+        end
+      | (_, Unix.WEXITED 0) -> true
+      | (_, _) -> false  (* WEXITED <>0, WSIGNALED (segfault), WSTOPPED *)
+    in
+    wait ()
+
 let load_from_file (est : t) (path : string) : bool =
   if not (Sys.file_exists path) then false
+  else if not (marshal_payload_ok path) then begin
+    (* Truncated or non-Marshal file — almost always an interrupted
+       save (e.g. SIGKILL mid-write). Regenerable cache: warn + skip. *)
+    Logs.warn (fun m ->
+      m "fee_estimates.dat at %s is not a valid serialized stream \
+         (truncated/corrupt) — starting with a fresh fee estimator" path);
+    false
+  end
+  else if not (child_validates_marshal path) then begin
+    (* Header is well-formed but the marshalled object graph is corrupt:
+       Marshal.from_channel would reconstruct garbage and a blind cast to
+       serialized_state segfaults on field access. The forked child hit
+       that fault for us. Treat the cache as unusable. *)
+    Logs.warn (fun m ->
+      m "fee_estimates.dat at %s failed integrity validation \
+         (corrupt marshalled data) — starting with a fresh fee estimator"
+        path);
+    false
+  end
   else begin
+    (* The child proved these exact bytes deserialize and traverse
+       cleanly, so this in-process unmarshal is now safe. *)
     try
       let ic = open_in_bin path in
       let state : serialized_state =

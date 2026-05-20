@@ -13,6 +13,16 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* Per-store cap on open SST file descriptors. The daemon opens two
+   RocksDB stores in one process and its Lwt loop runs on the select(2)
+   backend, which cannot poll any fd >= FD_SETSIZE (1024). Two stores at
+   256 each (= 512) plus stdio, sockets, WAL/MANIFEST and RocksDB
+   internals stays well under that ceiling with headroom for the
+   chainstate to keep growing. Applied via rocksdb_options_set_max_open_
+   files() in every DB-open path below; see the open-path comment for
+   the full rationale. */
+#define ROCKSDB_MAX_OPEN_FILES 256
+
 /* ---------- Cached read/write options ------------------------------------- */
 /* Creating and destroying rocksdb_{read,write}options on every get/put call
    is surprisingly expensive: each call does a malloc + memset + free.
@@ -104,6 +114,22 @@ CAMLprim value caml_rocksdb_open(value v_path,
   rocksdb_options_set_max_background_jobs(opts, 4);
   rocksdb_options_set_level_compaction_dynamic_level_bytes(opts, 1);
   rocksdb_options_set_compression(opts, rocksdb_no_compression);
+
+  /* Cap the number of SST file descriptors RocksDB keeps open.
+     RocksDB's default (max_open_files = -1) holds an FD open for every
+     SST file in the LSM tree. A mature mainnet chainstate has 500+ SST
+     files PER store, and this process opens two RocksDB stores
+     (rocksdb_utxo + chainstate-rocks). Left unbounded, the combined FD
+     count climbs past 1024 — and the daemon's Lwt event loop uses the
+     select(2) backend (the libev backend is not installed), whose
+     fd_set bitmap cannot represent any descriptor >= FD_SETSIZE (1024).
+     The first such descriptor makes select() fail hard with EINVAL and
+     the whole node aborts right after the RPC/P2P listeners come up.
+     ROCKSDB_MAX_OPEN_FILES bounds each store so the process-wide FD
+     total stays comfortably under the select() ceiling; RocksDB falls
+     back to its internal table cache for any SST beyond the cap, which
+     costs a re-open on a cold read but is otherwise transparent. */
+  rocksdb_options_set_max_open_files(opts, ROCKSDB_MAX_OPEN_FILES);
 
   /* Block-based table with bloom filter and LRU block cache */
   rocksdb_block_based_table_options_t *table_opts =
@@ -391,6 +417,13 @@ CAMLprim value caml_rocksdb_open_cfs(value v_path,
   rocksdb_options_set_max_background_jobs(opts, 4);
   rocksdb_options_set_level_compaction_dynamic_level_bytes(opts, 1);
   rocksdb_options_set_compression(opts, rocksdb_no_compression);
+  /* Bound the open-SST-fd count — see the ROCKSDB_MAX_OPEN_FILES define
+     and caml_rocksdb_open for the full rationale. max_open_files is a
+     DB-wide option, so setting it on the shared db_options here caps the
+     whole chainstate store regardless of CF count. Without this the
+     chainstate + UTXO stores together exhaust the select(2) FD_SETSIZE
+     ceiling and the daemon aborts on EINVAL just after startup. */
+  rocksdb_options_set_max_open_files(opts, ROCKSDB_MAX_OPEN_FILES);
 
   rocksdb_block_based_table_options_t *table_opts =
       rocksdb_block_based_options_create();

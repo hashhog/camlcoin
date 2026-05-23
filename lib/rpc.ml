@@ -680,7 +680,8 @@ let handle_getblockcount (ctx : rpc_context) : Yojson.Safe.t =
   `Int ctx.chain.blocks_synced
 
 let handle_getbestblockhash (ctx : rpc_context) : Yojson.Safe.t =
-  match ctx.chain.tip with
+  (* Validated-block tip — not [chain.tip], the best-work header (Core compat). *)
+  match Sync.block_tip ctx.chain with
   | Some t -> `String (Types.hash256_to_hex_display t.hash)
   | None -> `String "0000000000000000000000000000000000000000000000000000000000000000"
 

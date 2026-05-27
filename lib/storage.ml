@@ -622,11 +622,46 @@ module ChainDB = struct
      CF batch:        UTXO puts + deletes + chain_tip + header_tip
      RocksDB batch:   UTXO puts + deletes + tip_height (via batch_write)
 
-     Commit order is CF-first so a crash between the two commits leaves
-     rdb_tip < chain_tip, which [cli.ml]'s boot consistency check
-     already handles (rewinds blocks_synced to rdb_tip; the next IBD
-     re-processes the gap using RocksDB as the authoritative pre-gap
-     UTXO snapshot via [get_utxo]'s fallback path). *)
+     Two physically separate RocksDB DB instances (the CF chainstate and
+     the rocksdb_utxo store) cannot share a single WriteBatch, so the
+     two commits cannot be made atomic in the strict ACID sense.  We
+     pick the safer of the two possible crash windows by committing
+     RDB FIRST and CF SECOND:
+
+       rdb commit ── (crash window) ── cf commit
+
+     If a crash lands inside the window, the on-disk state is
+     [rdb_tip = N, chain_tip <= N-1] (RDB advanced, CF did NOT).  This
+     is the SAFE direction:
+
+       (a) The in-memory + on-disk authoritative tip is [chain_tip],
+           which still says N-1.  IBD/connect_stored_blocks resumes
+           from N-1 and re-applies block N.  RDB puts/deletes are
+           idempotent (put-existing is a no-op, delete-absent is a
+           no-op), so re-application converges both backends to N.
+
+       (b) The boot check in [cli.ml] detects [rdb_tip > chain_tip]
+           and logs it; no rewind needed because [chain_tip] is already
+           the lower of the two.
+
+     The PREVIOUS order (CF first, RDB second) had the inverse window:
+     [chain_tip = N, rdb_tip = N-1].  The boot check rewound
+     [chain.blocks_synced] in-memory to [rdb_tip], BUT did not persist
+     the rewind to the on-disk [tip_hash]/[tip_height] in the CF
+     chain_state.  Any other reader of [get_chain_tip db] continued to
+     see N, producing the silent skew where heights matched
+     numerically (chain_tip persisted as N, rdb_tip restored to N by
+     the next per-block apply) but individual UTXOs for the missing
+     window were never written.  That was the root cause of the
+     mainnet stall at h=950351 with `transaction references missing
+     inputs`.  See `CORE-PARITY-AUDIT/_chainstate-atomicity-family-
+     2026-05-26.md` row 6 + the haskoin f768a01 / blockbrew e1c7e7b
+     parallels.
+
+     Note: header_tip is intentionally written ONLY to the CF batch.
+     Headers can run ahead of validated blocks (header-first sync);
+     advancing the header_tip after a crash window does not violate
+     consensus because validation re-runs on the body anyway. *)
   let apply_block_atomic t
       ~(tip_hash : Types.hash256) ~(tip_height : int)
       ~(header_tip_hash : Types.hash256) ~(header_tip_height : int)
@@ -653,10 +688,13 @@ module ChainDB = struct
       "header_tip_hash" (Cstruct.to_string header_tip_hash);
     Cf_chainstate.batch_put_chain_state cf_batch
       "header_tip_height" (encode_height header_tip_height);
-    Cf_chainstate.batch_write cf_batch;
+    (* RDB FIRST, CF SECOND — see commentary above for crash-window
+       analysis.  Skipping the RDB commit when [rdb_ops] is empty AND
+       there is no rocksdb_utxo attached is the same no-op as before. *)
     (match t.rocksdb_utxo with
      | None -> ()
-     | Some r -> Rocksdb_store.batch_write ~tip_height r rdb_ops)
+     | Some r -> Rocksdb_store.batch_write ~tip_height r rdb_ops);
+    Cf_chainstate.batch_write cf_batch
 
   (* Chain state - tip hash and height (validated blocks) *)
   let set_chain_tip t (hash : Types.hash256) (height : int) =

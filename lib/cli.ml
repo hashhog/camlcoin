@@ -1237,7 +1237,9 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   Peer_manager.add_listener peer_manager (fun msg peer ->
     match msg with
     | P2p.TxMsg tx when chain.sync_state = Sync.FullySynced ->
-      let result = Mempool.accept_to_memory_pool mempool tx in
+      (* let%lwt so the Lwt.pause yields inside accept_to_memory_pool can
+         interleave RPC handlers between tx accepts. Bug #134. *)
+      let%lwt result = Mempool.accept_to_memory_pool mempool tx in
       if result.Mempool.atmp_accepted then begin
         Logs.info (fun m ->
           m "Accepted tx %s into mempool (fee=%Ld vsize=%d)"

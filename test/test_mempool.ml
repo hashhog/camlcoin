@@ -4090,7 +4090,7 @@ let test_w96_atmp_no_exception_on_empty_inputs () =
     witnesses = [];
     locktime = 0l;
   } in
-  let res = Mempool.accept_to_memory_pool mp bad_tx in
+  let res = Lwt_main.run (Mempool.accept_to_memory_pool mp bad_tx) in
   Alcotest.(check bool) "ATMP returned (no exception)" true
     (not res.atmp_accepted && res.atmp_reject_reason <> None);
   Storage.ChainDB.close db;
@@ -4286,7 +4286,7 @@ let test_w96_accept_to_memory_pool_basic_ok () =
     [make_test_input txid1 0l]
     [make_test_output 990_000L]
   in
-  let res = Mempool.accept_to_memory_pool mp tx in
+  let res = Lwt_main.run (Mempool.accept_to_memory_pool mp tx) in
   Alcotest.(check bool) "ATMP accepts valid tx" true res.atmp_accepted;
   Alcotest.(check bool) "ATMP returns fee" true (res.atmp_fee = 10_000L);
   Alcotest.(check bool) "ATMP vsize > 0" true (res.atmp_vsize > 0);

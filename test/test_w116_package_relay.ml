@@ -545,7 +545,7 @@ let test_g24_bug15_try_1p1c_not_wired () =
     [make_test_output 949_990L]  (* 50k sat fee *)
   in
   Mempool.add_orphan mp child;
-  let atmp_result = Mempool.accept_to_memory_pool mp parent in
+  let atmp_result = Lwt_main.run (Mempool.accept_to_memory_pool mp parent) in
   (* BUG-15: ATMP does NOT trigger try_1p1c_with_orphans on fee rejection *)
   Alcotest.(check bool) "G24/BUG-15: single-tx ATMP rejection does not trigger CPFP"
     false atmp_result.Mempool.atmp_accepted;

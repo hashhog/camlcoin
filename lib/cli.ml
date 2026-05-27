@@ -376,22 +376,178 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   (* Consistency check: detect when RocksDB was wiped but chainstate still
      has a non-zero chain_tip.  Without this, the node would skip blocks
      whose UTXO outputs are missing from the fresh RocksDB, causing
-     "transaction references missing inputs" errors (e.g. at block 16226). *)
+     "transaction references missing inputs" errors (e.g. at block 16226).
+
+     [apply_block_atomic] commits RDB first, CF second (see
+     [Storage.ChainDB.apply_block_atomic] commentary for the crash-window
+     analysis).  The expected post-crash invariant is therefore
+     [rdb_tip >= chain_tip].  We handle all four combinations:
+
+       1. rdb_tip = None              -> RDB wiped; force chain_tip to 0.
+       2. rdb_tip < chain_tip         -> Inverse of the expected window
+                                          (legacy data, or a CF-only write
+                                          path).  Rewind chain_tip to
+                                          rdb_tip AND persist the rewind
+                                          to the on-disk CF chain_state
+                                          so subsequent readers of
+                                          [get_chain_tip] see the rewound
+                                          value (this was the latent bug
+                                          behind the 950351 stall: the
+                                          rewind was in-memory only, the
+                                          CF still said the higher height,
+                                          and later code paths re-used
+                                          the stale on-disk tip).
+       3. rdb_tip > chain_tip         -> Expected crash window: RDB
+                                          committed, CF didn't.  Leave
+                                          chain_tip where it is; IBD will
+                                          re-apply the missing block(s)
+                                          and the puts/deletes are
+                                          idempotent on RDB.
+       4. rdb_tip = chain_tip         -> Heights match.  Sample the tip
+                                          block's spendable outputs in
+                                          RDB to detect content-level
+                                          skew (heights agree but
+                                          individual UTXOs are missing).
+                                          If any missing, rewind one
+                                          block and persist.  Bounded
+                                          O(N_outputs_at_tip) cost. *)
+  let persist_rewind_to_height ?(reason="") (target : int) : unit =
+    (* Persist the rewind to the CF chain_state so a subsequent
+       [get_chain_tip] reads the rewound value, and update the in-memory
+       [chain.blocks_synced] mirror.  Looks up the header for [target]
+       from the block_height CF; on lookup failure (extremely unusual —
+       implies the height->hash map is also corrupt) we fall back to a
+       zero hash + 0 height which forces a full re-sync. *)
+    let new_hash, new_height =
+      if target <= 0 then (Cstruct.create 32, 0)
+      else
+        match Storage.ChainDB.get_hash_at_height db target with
+        | Some h -> (h, target)
+        | None -> (Cstruct.create 32, 0)
+    in
+    chain.blocks_synced <- new_height;
+    Storage.ChainDB.set_chain_tip db new_hash new_height;
+    if reason <> "" then
+      Logs.warn (fun m ->
+        m "chainstate rewind persisted to height=%d (%s)" new_height reason)
+  in
   if chain.blocks_synced > 0 then begin
     match Rocksdb_store.get_tip_height rocksdb with
     | None ->
       Logs.warn (fun m ->
         m "RocksDB UTXO store has no tip height but chainstate claims blocks_synced=%d — resetting to 0 (UTXO store was likely wiped)"
           chain.blocks_synced);
-      chain.blocks_synced <- 0;
-      Storage.ChainDB.set_chain_tip db
-        (Cstruct.create 32) 0
+      persist_rewind_to_height ~reason:"RDB wiped" 0
     | Some rdb_height when rdb_height < chain.blocks_synced ->
       Logs.warn (fun m ->
         m "RocksDB UTXO tip (%d) is behind chainstate chain_tip (%d) — resetting to RocksDB tip"
           rdb_height chain.blocks_synced);
-      chain.blocks_synced <- rdb_height
-    | Some _ -> ()  (* Consistent — proceed normally *)
+      persist_rewind_to_height
+        ~reason:(Printf.sprintf "rdb_tip=%d < chain_tip=%d" rdb_height chain.blocks_synced)
+        rdb_height
+    | Some rdb_height when rdb_height > chain.blocks_synced ->
+      (* Expected crash window: apply_block_atomic committed RDB but
+         not CF.  The chain_tip is the authoritative lower bound; the
+         excess RDB state for blocks (chain.blocks_synced, rdb_height]
+         will be overwritten idempotently by the next IBD pass. *)
+      Logs.info (fun m ->
+        m "RocksDB UTXO tip (%d) is ahead of chainstate chain_tip (%d) — \
+           consistent with a crash inside apply_block_atomic; IBD will \
+           re-apply the missing block(s) idempotently"
+          rdb_height chain.blocks_synced)
+    | Some _ ->
+      (* Heights match.  Per-block content validation: read the tip
+         block, sample each non-coinbase spendable output, and verify
+         it is present in RDB.  If anything is missing, rewind one
+         block and persist; the next IBD step will refill.
+
+         Cost: one block-body read + one RDB get per non-unspendable
+         output of the tip block (typically a few thousand for a full
+         mainnet block).  Negligible against the cost of re-IBDing
+         from scratch when the alternative is a silent missing-UTXO
+         stall. *)
+      let tip_height = chain.blocks_synced in
+      let do_rewind reason =
+        Logs.warn (fun m ->
+          m "Per-block content check FAILED at height=%d (%s) — rewinding one block"
+            tip_height reason);
+        persist_rewind_to_height
+          ~reason:(Printf.sprintf "content skew at h=%d: %s" tip_height reason)
+          (tip_height - 1)
+      in
+      (match Storage.ChainDB.get_hash_at_height db tip_height with
+       | None ->
+         Logs.warn (fun m ->
+           m "chainstate claims blocks_synced=%d but block_height CF has no entry — rewinding to 0"
+             tip_height);
+         persist_rewind_to_height ~reason:"missing height->hash map" 0
+       | Some tip_hash ->
+         (match Storage.ChainDB.get_block db tip_hash with
+          | None ->
+            (* No body to validate against; safest action is to leave
+               state alone.  The body-store could legitimately be
+               pruned in a pruned-node configuration. *)
+            Logs.info (fun m ->
+              m "Per-block content check skipped at height=%d (no block body on disk; pruned?)"
+                tip_height)
+          | Some block ->
+            (* Collect outputs SPENT by any non-coinbase tx in this same
+               block — those legitimately do NOT appear in the on-disk
+               UTXO set (they were created and destroyed in one block,
+               so apply_block_atomic's batch issued Add+Del back-to-back
+               and only the Del survives in RDB).  Without this filter
+               we would false-positive on every block that includes a
+               child-spending-parent tx and trigger a needless rewind. *)
+            let spent_in_block : (string, unit) Hashtbl.t =
+              Hashtbl.create 32 in
+            List.iteri (fun tx_idx (tx : Types.transaction) ->
+              (* Coinbase is always tx_idx=0 (Bitcoin invariant) and its
+                 inputs do not reference real prior outpoints. *)
+              if tx_idx <> 0 then
+                List.iter (fun (inp : Types.tx_in) ->
+                  let k =
+                    Cstruct.to_string inp.Types.previous_output.Types.txid
+                    ^ Int32.to_string inp.Types.previous_output.Types.vout
+                  in
+                  Hashtbl.replace spent_in_block k ()
+                ) tx.Types.inputs
+            ) block.transactions;
+            (* Walk outputs; bail on the FIRST true miss (output that is
+               NOT spent-in-block AND not present in RDB). *)
+            let missing = ref None in
+            (try
+               List.iter (fun (tx : Types.transaction) ->
+                 let txid = Crypto.compute_txid tx in
+                 List.iteri (fun vout (out : Types.tx_out) ->
+                   if !missing = None
+                      && not (Utxo.is_unspendable_script out.Types.script_pubkey)
+                   then begin
+                     let spent_key =
+                       Cstruct.to_string txid ^ Int32.to_string (Int32.of_int vout)
+                     in
+                     if Hashtbl.mem spent_in_block spent_key then ()
+                     else begin
+                       let key =
+                         Storage.ChainDB.rocksdb_utxo_key txid vout in
+                       match Rocksdb_store.get rocksdb key with
+                       | Some _ -> ()
+                       | None ->
+                         missing := Some (txid, vout);
+                         raise Exit
+                     end
+                   end
+                 ) tx.Types.outputs
+               ) block.transactions
+             with Exit -> ());
+            (match !missing with
+             | None ->
+               Logs.info (fun m ->
+                 m "Per-block content check PASSED at height=%d (rdb_tip=chain_tip and tip block's outputs are present in RDB)"
+                   tip_height)
+             | Some (mtxid, mvout) ->
+               do_rewind (Printf.sprintf
+                 "tip block output %s:%d missing from RDB"
+                 (Types.hash256_to_hex_display mtxid) mvout))))
   end;
 
   (* Optimized UTXO set for IBD – dirty entries are flushed periodically

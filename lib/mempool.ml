@@ -87,6 +87,14 @@ type mempool = {
   max_orphans : int;
   (* Spending index: outpoint (txid_str * vout) -> spending txid_str for O(1) conflict detection *)
   map_next_tx : (string * int32, string) Hashtbl.t;
+  (* Reverse parent->children index (#135 step 1): for each parent txid_key,
+     a set (Hashtbl-as-set with unit values) of child txid_keys that depend
+     on it. Maintained in add_transaction (insert) and remove_transaction
+     (delete) so get_descendants is O(D) instead of O(N·D). The prior
+     implementation did Hashtbl.fold over all mp.entries per recursion step
+     — at a 50k-entry mempool with a 100-tx RBF cluster, that was ~5M
+     comparisons per call. *)
+  children : (string, (string, unit) Hashtbl.t) Hashtbl.t;
   (* ZMQ notifications *)
   mutable zmq_sequence : int64;                 (* monotonically increasing sequence for ZMQ *)
   mutable zmq_notifier : Zmq_notify.t option;   (* optional ZMQ notifier *)
@@ -261,7 +269,9 @@ let create ?(require_standard=true) ?(verify_scripts=true)
     zmq_notifier;
     on_eviction;
     (* FIX-72: prioritisetransaction deltas, in-memory only. *)
-    map_deltas = Hashtbl.create 64; }
+    map_deltas = Hashtbl.create 64;
+    (* #135 step 1: reverse parent→children index, sized for typical mempool. *)
+    children = Hashtbl.create 10_000; }
 
 (* ============================================================================
    Basic Queries
@@ -387,6 +397,16 @@ let rec remove_transaction (mp : mempool) (txid : Types.hash256) : unit =
         ) ancestor_entry.depends_on
     done;
     Hashtbl.remove mp.entries txid_key;
+    (* #135 step 1: remove this tx from the children-set of each parent in
+       the reverse children index. *)
+    List.iter (fun parent_txid ->
+      let parent_key = Cstruct.to_string parent_txid in
+      match Hashtbl.find_opt mp.children parent_key with
+      | None -> ()
+      | Some s ->
+        Hashtbl.remove s txid_key;
+        if Hashtbl.length s = 0 then Hashtbl.remove mp.children parent_key
+    ) entry.depends_on;
     mp.total_weight <- mp.total_weight - entry.weight;
     mp.total_fee <- Int64.sub mp.total_fee entry.fee;
     List.iter (fun inp ->
@@ -394,11 +414,23 @@ let rec remove_transaction (mp : mempool) (txid : Types.hash256) : unit =
                      inp.Types.previous_output.vout) in
       Hashtbl.remove mp.map_next_tx out_key
     ) entry.tx.inputs;
-    let dependent_txids = Hashtbl.fold (fun _k dep acc ->
-      if List.exists (fun d -> Cstruct.equal d txid) dep.depends_on then
-        dep.txid :: acc
-      else acc
-    ) mp.entries [] in
+    (* #135 step 1: O(D) via reverse children index instead of O(N·D) over
+       all mp.entries. The children-set was already cleaned of THIS txid
+       above, so we read its remaining children (txs that still depend on
+       us, which we recursively remove). *)
+    let dependent_txids =
+      match Hashtbl.find_opt mp.children txid_key with
+      | None -> []
+      | Some s ->
+        let children_keys = Hashtbl.fold (fun k () acc -> k :: acc) s [] in
+        List.filter_map (fun child_key ->
+          match Hashtbl.find_opt mp.entries child_key with
+          | Some child_entry -> Some child_entry.txid
+          | None -> None
+        ) children_keys
+    in
+    (* Clear the now-orphaned children entry for this parent. *)
+    Hashtbl.remove mp.children txid_key;
     List.iter (fun dep_txid -> remove_transaction mp dep_txid) dependent_txids
 
 (* ============================================================================
@@ -427,7 +459,11 @@ let get_ancestors (mp : mempool) (txid : Types.hash256)
   | Some entry ->
     List.concat_map (collect visited) entry.depends_on
 
-(* Get all descendants of a transaction (transactions that depend on it) *)
+(* Get all descendants of a transaction (transactions that depend on it).
+   #135 step 1: O(D) via the reverse children index in mp.children. The
+   prior implementation did Hashtbl.fold over all mp.entries per recursion
+   step — O(N·D) total, which at 50k-entry mempools and 100-tx clusters
+   was ~5M comparisons per call (the dominant cost in replace_by_fee). *)
 let get_descendants (mp : mempool) (txid : Types.hash256)
     : mempool_entry list =
   let rec collect visited txid =
@@ -435,13 +471,17 @@ let get_descendants (mp : mempool) (txid : Types.hash256)
     if Hashtbl.mem visited txid_key then []
     else begin
       Hashtbl.add visited txid_key ();
-      (* Find all entries that depend on this txid *)
-      let children = Hashtbl.fold (fun _ entry acc ->
-        if List.exists (fun d -> Cstruct.equal d txid) entry.depends_on
-        then entry :: acc
-        else acc
-      ) mp.entries [] in
-
+      (* O(D): look up direct children from the reverse index. *)
+      let children =
+        match Hashtbl.find_opt mp.children txid_key with
+        | None -> []
+        | Some s ->
+          Hashtbl.fold (fun child_key () acc ->
+            match Hashtbl.find_opt mp.entries child_key with
+            | Some entry -> entry :: acc
+            | None -> acc
+          ) s []
+      in
       (* Recursively get descendants of children *)
       let grandchildren = List.concat_map
         (fun e -> collect visited e.txid) children in
@@ -2282,6 +2322,20 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
 
             if not dry_run then begin
               Hashtbl.replace mp.entries txid_key entry;
+              (* #135 step 1: register this tx as a child of each parent in
+                 the reverse children index, so get_descendants is O(D). *)
+              List.iter (fun parent_txid ->
+                let parent_key = Cstruct.to_string parent_txid in
+                let children_set =
+                  match Hashtbl.find_opt mp.children parent_key with
+                  | Some s -> s
+                  | None ->
+                    let s = Hashtbl.create 4 in
+                    Hashtbl.replace mp.children parent_key s;
+                    s
+                in
+                Hashtbl.replace children_set txid_key ()
+              ) !depends;
               mp.total_weight <- mp.total_weight + weight;
               mp.total_fee <- Int64.add mp.total_fee fee;
               List.iter (fun inp ->

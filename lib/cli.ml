@@ -797,6 +797,34 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
      route incoming BlockMsg / NotfoundMsg to the download manager. *)
   let ibd_state_ref : Sync.ibd_state option ref = ref None in
 
+  (* #135 step 3: persistent Validation_worker Domain for post-IBD block
+     validation. The IBD batch path has its own worker (sync.ml:3978) that
+     is shut down when IBD completes — for steady-state block validation
+     after FullySynced we keep this separate worker alive for the node's
+     lifetime so the 0.5-3s per-block validation no longer blocks the Lwt
+     main thread / RPC handlers. Lazily created so tests + early startup
+     don't pay the cost. Plumbed into Sync.process_new_block as
+     ?worker:!post_ibd_worker_ref. *)
+  let post_ibd_worker_ref : Sync.Validation_worker.t option ref = ref None in
+  let ensure_post_ibd_worker () =
+    if !post_ibd_worker_ref = None then begin
+      let w = Sync.Validation_worker.create () in
+      post_ibd_worker_ref := Some w;
+      Logs.info (fun m ->
+        m "spawned persistent post-IBD validation worker Domain (#135)")
+    end
+  in
+  ignore ensure_post_ibd_worker;
+  (* #135 step 3: serialize the post-IBD BlockMsg listener with an
+     Lwt_mutex. Without this, the new `let%lwt vresult` yield in
+     Sync.process_new_block lets a second BlockMsg arrival begin running
+     while the first is still mutating chain_state — racing on
+     state.blocks_synced / state.tip / Storage.ChainDB writes. The mutex
+     queues subsequent BlockMsgs without serializing the underlying
+     validation work (that still runs on the worker Domain while we hold
+     the mutex — RPC handlers still get scheduled). *)
+  let block_listener_mutex = Lwt_mutex.create () in
+
   (* Register a listener BEFORE starting sync so that block and notfound
      messages arriving via the peer_message_loop are forwarded to the IBD
      download queue. Without this, GetData responses are silently dropped. *)
@@ -1209,26 +1237,33 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     | P2p.BlockMsg block when !ibd_state_ref = None
                               && chain.sync_state = Sync.FullySynced ->
       let hash = Crypto.compute_block_hash block.Types.header in
-      (match Sync.process_new_block chain block with
-       | Ok () ->
-         (* Feed the fee estimator with confirmed block data *)
-         (try Fee_estimation.process_block fee_estimator block chain.blocks_synced
-          with _ -> ());
-         (* W103 BUG-2 fix: expire stale orphans on block connect, mirroring
-            Core's TxOrphanageImpl::EraseForBlock() + LimitOrphans() sequence.
-            Transactions that are now confirmed or whose parents are still
-            missing after 20 min are pruned from the pool. *)
-         (let n = Mempool.expire_orphans mempool in
-          if n > 0 then
-            Logs.debug (fun m -> m "Expired %d stale orphan(s) on block connect" n));
-         (* Announce the block to other peers if it advanced the tip *)
-         Lwt.async (fun () ->
-           Peer_manager.announce_block peer_manager block.Types.header hash);
-         Lwt.return_unit
-       | Error e ->
-         Logs.debug (fun m ->
-           m "Post-IBD block rejected: %s" e);
-         Lwt.return_unit)
+      (* #135 step 3: pass post_ibd_worker so validation runs on its Domain
+         and the Lwt main thread can serve RPC during the 0.5-3s window.
+         Hold block_listener_mutex so two BlockMsg arrivals can't race on
+         chain_state mutations across the worker-await yield. *)
+      Lwt_mutex.with_lock block_listener_mutex (fun () ->
+        let%lwt pnb_result =
+          Sync.process_new_block ?worker:!post_ibd_worker_ref chain block in
+        (match pnb_result with
+         | Ok () ->
+           (* Feed the fee estimator with confirmed block data *)
+           (try Fee_estimation.process_block fee_estimator block chain.blocks_synced
+            with _ -> ());
+           (* W103 BUG-2 fix: expire stale orphans on block connect, mirroring
+              Core's TxOrphanageImpl::EraseForBlock() + LimitOrphans() sequence.
+              Transactions that are now confirmed or whose parents are still
+              missing after 20 min are pruned from the pool. *)
+           (let n = Mempool.expire_orphans mempool in
+            if n > 0 then
+              Logs.debug (fun m -> m "Expired %d stale orphan(s) on block connect" n));
+           (* Announce the block to other peers if it advanced the tip *)
+           Lwt.async (fun () ->
+             Peer_manager.announce_block peer_manager block.Types.header hash);
+           Lwt.return_unit
+         | Error e ->
+           Logs.debug (fun m ->
+             m "Post-IBD block rejected: %s" e);
+           Lwt.return_unit))
     | _ -> Lwt.return_unit);
 
   (* Transaction relay: accept incoming tx messages into the mempool and relay
@@ -1361,16 +1396,20 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
          (* All transactions found *)
          Logs.info (fun m ->
            m "Compact block fully reconstructed: %s" (Types.hash256_to_hex header_hash));
-         (match Sync.process_new_block ~f_requested:true chain block with
-          | Ok () ->
-            (try Fee_estimation.process_block fee_estimator block chain.blocks_synced
-             with _ -> ());
-            Lwt.async (fun () ->
-              Peer_manager.announce_block peer_manager block.Types.header header_hash);
-            Lwt.return_unit
-          | Error e ->
-            Logs.debug (fun m -> m "Reconstructed compact block rejected: %s" e);
-            Lwt.return_unit)
+         Lwt_mutex.with_lock block_listener_mutex (fun () ->
+           let%lwt pnb_result =
+             Sync.process_new_block ~f_requested:true
+               ?worker:!post_ibd_worker_ref chain block in
+           (match pnb_result with
+            | Ok () ->
+              (try Fee_estimation.process_block fee_estimator block chain.blocks_synced
+               with _ -> ());
+              Lwt.async (fun () ->
+                Peer_manager.announce_block peer_manager block.Types.header header_hash);
+              Lwt.return_unit
+            | Error e ->
+              Logs.debug (fun m -> m "Reconstructed compact block rejected: %s" e);
+              Lwt.return_unit))
        | P2p.ReconstructNeedTxs missing ->
          (* Store partial state and request missing transactions *)
          Logs.info (fun m ->
@@ -1411,16 +1450,20 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
           | Ok block ->
             Logs.info (fun m ->
               m "Compact block reconstructed from blocktxn: %s" hash_hex);
-            (match Sync.process_new_block ~f_requested:true chain block with
-             | Ok () ->
-               (try Fee_estimation.process_block fee_estimator block chain.blocks_synced
-                with _ -> ());
-               Lwt.async (fun () ->
-                 Peer_manager.announce_block peer_manager block.Types.header resp.block_hash);
-               Lwt.return_unit
-             | Error e ->
-               Logs.debug (fun m -> m "Reconstructed block rejected: %s" e);
-               Lwt.return_unit)
+            Lwt_mutex.with_lock block_listener_mutex (fun () ->
+              let%lwt pnb_result =
+                Sync.process_new_block ~f_requested:true
+                  ?worker:!post_ibd_worker_ref chain block in
+              (match pnb_result with
+               | Ok () ->
+                 (try Fee_estimation.process_block fee_estimator block chain.blocks_synced
+                  with _ -> ());
+                 Lwt.async (fun () ->
+                   Peer_manager.announce_block peer_manager block.Types.header resp.block_hash);
+                 Lwt.return_unit
+               | Error e ->
+                 Logs.debug (fun m -> m "Reconstructed block rejected: %s" e);
+                 Lwt.return_unit))
           | Error reason ->
             Logs.warn (fun m -> m "blocktxn fill failed for %s: %s" hash_hex reason);
             Lwt.return_unit)
@@ -1578,6 +1621,10 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
           chain get_peers in
         (* Clear IBD state so post-IBD listeners take over *)
         ibd_state_ref := None;
+        (* #135 step 3: spawn the persistent post-IBD validation worker now
+           that the IBD worker has shut down. Post-IBD BlockMsg validation
+           runs on this Domain so RPC handlers can interleave. *)
+        ensure_post_ibd_worker ();
         Lwt.return_unit
       end else
         Lwt.return_unit

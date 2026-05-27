@@ -750,7 +750,7 @@ let test_g18c_atmp_replaced_txids_empty_when_no_rbf () =
                           script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac" }];
              witnesses = [];
              locktime = 0l } in
-  let r = Mempool.accept_to_memory_pool mp tx in
+  let r = Lwt_main.run (Mempool.accept_to_memory_pool mp tx) in
   Alcotest.(check bool) "atmp_accepted true" true r.atmp_accepted;
   Alcotest.(check int) "atmp_replaced_txids empty when no RBF" 0
     (List.length r.atmp_replaced_txids);
@@ -784,7 +784,7 @@ let test_g18d_atmp_replaced_txids_populated_on_rbf () =
                            script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac" }];
               witnesses = [];
               locktime = 0l } in
-  let r1 = Mempool.accept_to_memory_pool mp tx1 in
+  let r1 = Lwt_main.run (Mempool.accept_to_memory_pool mp tx1) in
   Alcotest.(check bool) "first tx accepted" true r1.atmp_accepted;
   Alcotest.(check int) "first tx has no evictions" 0
     (List.length r1.atmp_replaced_txids);
@@ -794,7 +794,7 @@ let test_g18d_atmp_replaced_txids_populated_on_rbf () =
                            script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac" }];
               witnesses = [];
               locktime = 0l } in
-  let r2 = Mempool.accept_to_memory_pool mp tx2 in
+  let r2 = Lwt_main.run (Mempool.accept_to_memory_pool mp tx2) in
   Alcotest.(check bool) "second tx accepted (RBF)" true r2.atmp_accepted;
   Alcotest.(check int) "second tx evicted exactly one" 1
     (List.length r2.atmp_replaced_txids);

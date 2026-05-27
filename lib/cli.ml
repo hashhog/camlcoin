@@ -814,7 +814,13 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         m "spawned persistent post-IBD validation worker Domain (#135)")
     end
   in
-  ignore ensure_post_ibd_worker;
+  (* Spawn the post-IBD worker eagerly if chain_state is ALREADY FullySynced
+     at startup (i.e. this is a restart after a previous successful IBD).
+     Without this, start_ibd never runs → the worker spawn at IBD-complete
+     never fires → post-IBD BlockMsg listener uses the synchronous fallback,
+     defeating the whole #135 step 3 win. *)
+  if chain.sync_state = Sync.FullySynced then
+    ensure_post_ibd_worker ();
   (* #135 step 3: serialize the post-IBD BlockMsg listener with an
      Lwt_mutex. Without this, the new `let%lwt vresult` yield in
      Sync.process_new_block lets a second BlockMsg arrival begin running

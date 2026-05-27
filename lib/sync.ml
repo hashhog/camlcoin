@@ -4358,15 +4358,16 @@ let rec connect_stored_blocks (state : chain_state) : int =
 let process_new_block ?(f_requested = false)
     ?(peer_id : int option)
     ?(misbehavior_handler : (int -> string -> unit) option)
+    ?(worker : Validation_worker.t option)
     (state : chain_state)
-    (block : Types.block) : (unit, string) result =
+    (block : Types.block) : (unit, string) result Lwt.t =
   let hash = Crypto.compute_block_hash block.header in
   let hash_key = Cstruct.to_string hash in
   (* Ignore blocks we already have — but still try to advance from stored
      out-of-order blocks in case a recent fill brought us what we needed. *)
   if Storage.ChainDB.has_block state.db hash then begin
     let _ = connect_stored_blocks state in
-    Ok ()
+    Lwt.return (Ok ())
   end else begin
     (* The block's header must already be known (via headers-first sync). If
        not, accept the header first so we know the height. *)
@@ -4380,7 +4381,7 @@ let process_new_block ?(f_requested = false)
     in
     match header_entry with
     | None ->
-      Error "Unknown header and failed to validate"
+      Lwt.return (Error "Unknown header and failed to validate")
     | Some entry ->
       let height = entry.height in
       (* G19c — fTooFarAhead anti-DoS gate.
@@ -4395,7 +4396,7 @@ let process_new_block ?(f_requested = false)
       let min_blocks_to_keep = 288 in
       let f_too_far_ahead = height > state.blocks_synced + min_blocks_to_keep in
       if (not f_requested) && f_too_far_ahead then
-        Error "too-far-ahead"
+        Lwt.return (Error "too-far-ahead")
       else
       (* Only connect blocks that extend the current BLOCK tip (see
          `chain_state` comment on why `state.tip` is not used here). *)
@@ -4420,7 +4421,7 @@ let process_new_block ?(f_requested = false)
           Logs.info (fun m ->
             m "Connected %d stored blocks after gap-fill store, tip now at %d"
               connected state.blocks_synced);
-        Ok ()
+        Lwt.return (Ok ())
       end else begin
         let expected_bits = compute_expected_bits state height block.header in
         let median_time = compute_median_time_past state height in
@@ -4453,14 +4454,41 @@ let process_new_block ?(f_requested = false)
            ContextualCheckBlock → ConnectBlock validation sequence.
            Both submitblock RPC and this P2P path go through accept_block,
            guaranteeing identical check semantics.
-           Reference: bitcoin-core/src/validation.cpp ProcessNewBlock. *)
-        match Validation.accept_block
-                ~network:state.network ~block ~height
-                ~expected_bits ~median_time ~prev_block_time ~base_lookup:lookup
-                ~flags:validation_flags ~skip_scripts:false
-                ~get_mtp_at_height:(get_mtp_for_height state)
-                ?bip34_height_hash:(bip34_height_hash_for state) () with
-        | Validation.AB_ok (_fees, txid_arr, spent_utxos) ->
+           Reference: bitcoin-core/src/validation.cpp ProcessNewBlock.
+
+           #135 step 3: when [worker] is provided, dispatch validation to
+           the Validation_worker Domain so RPC handlers can interleave
+           during the 0.5-3s wall-clock window. When [None] (e.g. tests,
+           submit_block paths that don't carry a worker), fall back to
+           the synchronous accept_block call wrapped in Lwt.return.
+           Mirrors the IBD pattern at sync.ml:2402-2429. *)
+        let%lwt vresult =
+          match worker with
+          | Some w ->
+            let job : Validation_worker.job = {
+              block; height;
+              expected_bits; median_time; prev_block_time;
+              lookup;
+              flags = validation_flags;
+              skip_scripts = false;
+              network = state.network;
+              get_mtp_at_height = Some (get_mtp_for_height state);
+              bip34_height_hash = bip34_height_hash_for state;
+            } in
+            Validation_worker.submit_lwt w job
+          | None ->
+            Lwt.return (
+              match Validation.accept_block
+                      ~network:state.network ~block ~height
+                      ~expected_bits ~median_time ~prev_block_time ~base_lookup:lookup
+                      ~flags:validation_flags ~skip_scripts:false
+                      ~get_mtp_at_height:(get_mtp_for_height state)
+                      ?bip34_height_hash:(bip34_height_hash_for state) () with
+              | Validation.AB_ok (fees, txid_arr, spent) -> Ok (fees, txid_arr, spent)
+              | Validation.AB_err e -> Error e)
+        in
+        match vresult with
+        | Ok (_fees, txid_arr, spent_utxos) ->
           (* Store the block *)
           Storage.ChainDB.store_block state.db hash block;
           (* Write tx_index entries for every tx in the new block
@@ -4534,8 +4562,8 @@ let process_new_block ?(f_requested = false)
             Logs.info (fun m ->
               m "Connected %d additional stored blocks, tip now at %d"
                 connected state.blocks_synced);
-          Ok ()
-        | Validation.AB_err e ->
+          Lwt.return (Ok ())
+        | Error e ->
           let msg = Validation.block_error_to_string e in
           Logs.warn (fun m ->
             m "Block %s at height %d failed validation: %s"
@@ -4568,7 +4596,7 @@ let process_new_block ?(f_requested = false)
             (match peer_id, misbehavior_handler with
              | Some pid, Some handler -> handler pid "invalid_block"
              | _ -> ());
-          Error msg
+          Lwt.return (Error msg)
       end
   end
 

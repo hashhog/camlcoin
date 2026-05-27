@@ -3136,14 +3136,22 @@ type accept_result = {
 }
 
 let accept_to_memory_pool ?(test_accept=false) (mp : mempool) (tx : Types.transaction)
-    : accept_result =
-  (* W96 Bug 13: ATMP entry point must catch ALL exceptions.  Matches the
+    : accept_result Lwt.t =
+  (* Wrap the synchronous ATMP body in Lwt.pause yields so the cooperative
+     scheduler can interleave RPC handlers between tx accepts. mempool.ml
+     itself is fully synchronous OCaml, so the *single* accept call still
+     monopolises the main thread for its duration; but for a stream of
+     accepts (the steady-state path from cli.ml:1240's P2p.TxMsg listener),
+     RPC tasks now get a slot between each one. Bug #134.
+
+     W96 Bug 13: ATMP entry point must catch ALL exceptions.  Matches the
      W95-class hardening — peer-controlled inputs (txid/wtxid computation,
      script eval via libsecp, deeply nested helpers) MUST NOT be allowed to
      propagate failwith/Not_found/Invalid_argument out of ATMP, since RPC,
      P2P and miner paths call ATMP without their own try/with.  Core's
      equivalent is the ATMPArgs::m_state mechanism — every failure is
      reflected through TxValidationState, never via C++ exceptions. *)
+  let%lwt () = Lwt.pause () in
   let txid =
     try Crypto.compute_txid tx
     with _ -> Types.zero_hash
@@ -3162,7 +3170,7 @@ let accept_to_memory_pool ?(test_accept=false) (mp : mempool) (tx : Types.transa
     | Not_found -> Error "atmp-exception: Not_found"
     | exn -> Error (Printf.sprintf "atmp-exception: %s" (Printexc.to_string exn))
   in
-  match safe_run () with
+  let result = match safe_run () with
   | Ok (entry, replaced_txids) ->
     { atmp_accepted = true; atmp_txid = txid; atmp_fee = entry.fee;
       (* ceil(weight / 4) — must round up, not truncate; policy/policy.cpp:395-398 *)
@@ -3173,6 +3181,9 @@ let accept_to_memory_pool ?(test_accept=false) (mp : mempool) (tx : Types.transa
     { atmp_accepted = false; atmp_txid = txid; atmp_fee = 0L; atmp_vsize = 0;
       atmp_reject_reason = Some reason;
       atmp_replaced_txids = []; }
+  in
+  let%lwt () = Lwt.pause () in
+  Lwt.return result
 
 (* ============================================================================
    Orphan Transaction Pool (Task 8)

@@ -141,7 +141,7 @@ let test_g1_atmp_missing_inputs_drops_tx () =
   let (mp, _db, path) = make_test_mempool () in
   (* Transaction spending an unknown UTXO → TxMissingInputs *)
   let tx = make_test_tx () in
-  let result = Mempool.accept_to_memory_pool mp tx in
+  let result = Lwt_main.run (Mempool.accept_to_memory_pool mp tx) in
   (* ATMP must reject due to missing inputs *)
   Alcotest.(check bool) "BUG-1: ATMP rejects tx with missing inputs" false result.Mempool.atmp_accepted;
   (* BUG: orphan pool should now have 1 entry, but it has 0 *)
@@ -368,9 +368,9 @@ let test_g11_no_recent_rejects_cache () =
   let tx = make_test_tx () in
   (* Submit the same invalid tx three times; each time full ATMP runs.
      Core: m_lazy_recent_rejects cache prevents this after first rejection. *)
-  let r1 = Mempool.accept_to_memory_pool mp tx in
-  let r2 = Mempool.accept_to_memory_pool mp tx in
-  let r3 = Mempool.accept_to_memory_pool mp tx in
+  let r1 = Lwt_main.run (Mempool.accept_to_memory_pool mp tx) in
+  let r2 = Lwt_main.run (Mempool.accept_to_memory_pool mp tx) in
+  let r3 = Lwt_main.run (Mempool.accept_to_memory_pool mp tx) in
   Alcotest.(check bool) "BUG-11: repeated ATMP call 1 rejected" false r1.Mempool.atmp_accepted;
   Alcotest.(check bool) "BUG-11: repeated ATMP call 2 rejected" false r2.Mempool.atmp_accepted;
   Alcotest.(check bool) "BUG-11: repeated ATMP call 3 rejected" false r3.Mempool.atmp_accepted;

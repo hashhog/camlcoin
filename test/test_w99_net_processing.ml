@@ -370,8 +370,8 @@ let test_g16_block_mutated_not_punished () =
     timestamp = Int32.add genesis.timestamp 1l;
   } in
   let block = Types.{ header; transactions = [cb_tx] } in
-  let _result = Sync.process_new_block ~peer_id:42
-    ~misbehavior_handler:handler state block in
+  let _result = Lwt_main.run (Sync.process_new_block ~peer_id:42
+    ~misbehavior_handler:handler state block) in
   Storage.ChainDB.close db;
   cleanup_dir path;
   Alcotest.(check bool)
@@ -427,8 +427,8 @@ let test_g17_misbehavior_score_constants () =
     locktime = 0l;
   } in
   let block = Types.{ header = h1; transactions = [cb1] } in
-  let result = Sync.process_new_block ~peer_id:99
-    ~misbehavior_handler:handler state block in
+  let result = Lwt_main.run (Sync.process_new_block ~peer_id:99
+    ~misbehavior_handler:handler state block) in
   let result_str = match result with Ok () -> "Ok()" | Error e -> "Error(" ^ e ^ ")" in
   Storage.ChainDB.close db;
   cleanup_dir path;

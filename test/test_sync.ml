@@ -3656,7 +3656,7 @@ let test_w97_g19c_no_too_far_ahead_gate () =
       Alcotest.fail "G19c case1: could not retrieve header at height 289"
   in
   let block_289 = Types.{ header = header_289; transactions = [] } in
-  let result1 = Sync.process_new_block state1 block_289 in
+  let result1 = Lwt_main.run (Sync.process_new_block state1 block_289) in
   Storage.ChainDB.close db1; w97_cleanup_db ();
   (match result1 with
    | Error "too-far-ahead" -> ()
@@ -3677,7 +3677,7 @@ let test_w97_g19c_no_too_far_ahead_gate () =
       Alcotest.fail "G19c case2: could not retrieve header at height 288"
   in
   let block_288 = Types.{ header = header_288; transactions = [] } in
-  let result2 = Sync.process_new_block state2 block_288 in
+  let result2 = Lwt_main.run (Sync.process_new_block state2 block_288) in
   Storage.ChainDB.close db2; w97_cleanup_db ();
   (match result2 with
    | Error "too-far-ahead" ->
@@ -3695,7 +3695,7 @@ let test_w97_g19c_no_too_far_ahead_gate () =
       Alcotest.fail "G19c case3: could not retrieve header at height 289"
   in
   let block_289b = Types.{ header = header_289b; transactions = [] } in
-  let result3 = Sync.process_new_block ~f_requested:true state3 block_289b in
+  let result3 = Lwt_main.run (Sync.process_new_block ~f_requested:true state3 block_289b) in
   Storage.ChainDB.close db3; w97_cleanup_db ();
   match result3 with
   | Error "too-far-ahead" ->

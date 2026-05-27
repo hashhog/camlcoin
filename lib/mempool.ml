@@ -1975,14 +1975,141 @@ let verify_tx_scripts (mp : mempool) (tx : Types.transaction)
       Error e
   | None -> Ok ()
 
+(* Bug #135 step 2: Lwt-flavoured script verification that delegates the
+   per-input ECDSA/Schnorr/witness evaluation to
+   [Validation.verify_scripts_parallel], which fans the work out across
+   OCaml 5 Domains and returns a `(unit, _) result Lwt.t`.
+
+   This is the script-verify entry point used by the Lwt ATMP wrapper
+   ([accept_transaction_lwt] / [accept_to_memory_pool]).  Behaviour MUST
+   match the sync [verify_tx_scripts] above bit-for-bit on the
+   accept/reject decision — the only difference is *how* the work is
+   scheduled (Domain workers + an Lwt.pause yield instead of a sequential
+   List.iteri on the Lwt main thread).  Specifically:
+
+   1. Pre-pass: per-input P2A witness-stuffing policy gate.  P2A spends
+      must have an empty witness; otherwise reject with the exact same
+      error string the sync path produces.  This is a policy check that
+      lives *outside* the consensus script evaluator, so we keep it here
+      and short-circuit before fanning out to Domains.
+   2. Build [utxos : utxo option array] from [lookup_utxo].  Missing
+      inputs propagate as [None] and are mapped to the same
+      "Missing input for script verification" error string the sync
+      path emits, in input-index order.
+   3. Build the [prevouts] list (Taproot sighash dependency) — same
+      shape as the sync path.
+   4. Hand off to [Validation.verify_scripts_parallel] which runs the
+      Domain workers and returns the first failure.
+   5. Post-pass: on error, re-check the TX_WITNESS_STRIPPED condition
+      via [spends_non_anchor_witness_prog] and wrap the error so the
+      P2P layer can re-request the witness — identical to sync. *)
+let verify_tx_scripts_lwt (mp : mempool) (tx : Types.transaction)
+    : (unit, string) result Lwt.t =
+  let flags =
+    Consensus.get_standard_policy_flags (mp.current_height + 1) mp.network in
+
+  (* Build prevouts (Taproot sighash dependency).  Missing inputs are
+     represented as (0L, empty) to match the sync path; the per-input
+     missing-input rejection is produced by the utxos[] None branch
+     inside Validation.verify_scripts_parallel. *)
+  let prevouts = List.map (fun inp ->
+    let prev = inp.Types.previous_output in
+    match lookup_utxo mp prev with
+    | Some entry -> (entry.Utxo.value, entry.Utxo.script_pubkey)
+    | None -> (0L, Cstruct.empty)
+  ) tx.inputs in
+
+  (* Pre-pass (P2A witness stuffing).  Iterate inputs in order; first
+     violation short-circuits with the sync-compatible error string. *)
+  let p2a_error = ref None in
+  List.iteri (fun i inp ->
+    if !p2a_error = None then begin
+      match lookup_utxo mp inp.Types.previous_output with
+      | None -> ()  (* missing input is reported by Validation path below *)
+      | Some utxo_entry ->
+        let witness =
+          if i < List.length tx.witnesses then List.nth tx.witnesses i
+          else { Types.items = [] }
+        in
+        if Script.is_p2a utxo_entry.Utxo.script_pubkey &&
+           witness.Types.items <> [] then
+          p2a_error := Some (Printf.sprintf
+            "P2A input %d has non-empty witness (witness stuffing)" i)
+    end
+  ) tx.inputs;
+
+  (* Wrap helper that adds the TX_WITNESS_STRIPPED tag when applicable. *)
+  let tag_witness_stripped (e : string) : string =
+    let has_witness =
+      List.exists (fun w -> w.Types.items <> []) tx.witnesses in
+    if not has_witness && spends_non_anchor_witness_prog mp tx then
+      Printf.sprintf "witness-stripped: %s" e
+    else e
+  in
+
+  match !p2a_error with
+  | Some e -> Lwt.return (Error (tag_witness_stripped e))
+  | None ->
+    (* Build [utxos : utxo option array] in input order.  This array
+       carries both presence (Some/None) and the full UTXO record
+       (height/is_coinbase) needed by the script evaluator. *)
+    let n = List.length tx.inputs in
+    let utxos = Array.make n None in
+    List.iteri (fun i inp ->
+      let prev = inp.Types.previous_output in
+      match lookup_utxo mp prev with
+      | None -> utxos.(i) <- None
+      | Some e ->
+        utxos.(i) <- Some {
+          Validation.txid = prev.txid;
+          vout = prev.vout;
+          value = e.Utxo.value;
+          script_pubkey = e.Utxo.script_pubkey;
+          height = e.Utxo.height;
+          is_coinbase = e.Utxo.is_coinbase;
+        }
+    ) tx.inputs;
+
+    let%lwt result =
+      Validation.verify_scripts_parallel ~tx ~flags ~prevouts ~utxos in
+    match result with
+    | Ok () -> Lwt.return (Ok ())
+    | Error (Validation.TxScriptFailed (i, msg)) ->
+      (* Re-shape the error to match the sync path's wording so callers
+         (and tests asserting on substring matches) remain stable.
+         Mirror the three branches of sync [verify_tx_scripts]:
+           "missing input"           → "Missing input for script verification: %d"
+           "Script returned false"   → "Script returned false for input %d"
+           anything else (script err)→ "Script verification failed for input %d: %s" *)
+      let mapped =
+        if msg = "missing input" then
+          Printf.sprintf "Missing input for script verification: %d" i
+        else if msg = "Script returned false" then
+          Printf.sprintf "Script returned false for input %d" i
+        else
+          Printf.sprintf "Script verification failed for input %d: %s" i msg
+      in
+      Lwt.return (Error (tag_witness_stripped mapped))
+    | Error other ->
+      Lwt.return (Error (tag_witness_stripped
+        (Validation.tx_error_to_string other)))
+
 (* ============================================================================
    Transaction Addition
    ============================================================================ *)
 
 (* Validate and add a transaction to the mempool.
    When ~dry_run:true, all validation is performed but the transaction
-   is not actually inserted into the mempool. *)
+   is not actually inserted into the mempool.
+
+   Bug #135 step 2: [~skip_verify_scripts:true] suppresses the internal
+   [verify_tx_scripts] call.  Used by [accept_transaction_lwt] which has
+   already performed Lwt-flavoured script verification via the
+   Validation Domain worker BEFORE entering the sync ATMP body.  Callers
+   on the sync path leave the flag at its default [false] and the
+   existing sync verify_tx_scripts runs as before. *)
 let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=false)
+    ?(skip_verify_scripts=false)
     (mp : mempool) (tx : Types.transaction)
     : (mempool_entry, string) result =
   let txid = Crypto.compute_txid tx in
@@ -2264,8 +2391,11 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
             | Error e -> Error e
             | Ok () ->
 
-            (* Task 1: Script verification at acceptance (skipped when verify_scripts=false) *)
-            match (if mp.verify_scripts then verify_tx_scripts mp tx else Ok ()) with
+            (* Task 1: Script verification at acceptance (skipped when
+               verify_scripts=false, or when the Lwt entry has already
+               performed parallel script verification — bug #135 step 2). *)
+            match (if mp.verify_scripts && not skip_verify_scripts
+                   then verify_tx_scripts mp tx else Ok ()) with
             | Error e -> Error e
             | Ok () ->
 
@@ -2890,13 +3020,14 @@ let get_prioritised_transactions (mp : mempool)
    add was on a free outpoint).  Existing [replace_by_fee] is preserved as
    a thin discard-wrapper so the ~20 call sites in test_mempool.ml continue
    to compile. *)
-let replace_by_fee_with_replaced (mp : mempool) (tx : Types.transaction)
+let replace_by_fee_with_replaced ?(skip_verify_scripts=false)
+    (mp : mempool) (tx : Types.transaction)
     : (mempool_entry * Types.hash256 list, string) result =
   let conflicts = find_all_conflicts mp tx in
   match conflicts with
   | [] ->
     (* No conflict, just add normally — empty replaced list *)
-    (match add_transaction mp tx with
+    (match add_transaction ~skip_verify_scripts mp tx with
      | Ok e -> Ok (e, [])
      | Error s -> Error s)
   | _ ->
@@ -3097,7 +3228,7 @@ let replace_by_fee_with_replaced (mp : mempool) (tx : Types.transaction)
                      If the pre-check fails, conflicts remain in the mempool unchanged.
                      Reference: Bitcoin Core MemPoolAccept::ConsiderReplacement runs ALL gates before
                      RemoveStaged; Finalize does the atomic RemoveStaged+addUnchecked together. *)
-                  match add_transaction ~dry_run:true mp tx with
+                  match add_transaction ~dry_run:true ~skip_verify_scripts mp tx with
                   | Error e -> Error e
                   | Ok _ ->
                     (* All gates passed; now atomically remove conflicts and add replacement.
@@ -3117,7 +3248,7 @@ let replace_by_fee_with_replaced (mp : mempool) (tx : Types.transaction)
                        between dry_run and commit (e.g. concurrent eviction or OOM).  In that
                        case the conflicts are already removed.  This window is negligible in
                        single-threaded OCaml execution but documented for completeness. *)
-                    (match add_transaction mp tx with
+                    (match add_transaction ~skip_verify_scripts mp tx with
                      | Ok e -> Ok (e, evicted_txids)
                      | Error s -> Error s)
                   end
@@ -3147,14 +3278,16 @@ let replace_by_fee (mp : mempool) (tx : Types.transaction)
    single-tx paths can plumb it into Core-compatible RPC responses.  The
    legacy [accept_transaction] wrapper preserves the old return type for
    the test suite. *)
-let accept_transaction_with_replaced ?(dry_run=false) (mp : mempool) (tx : Types.transaction)
+let accept_transaction_with_replaced ?(dry_run=false)
+    ?(skip_verify_scripts=false)
+    (mp : mempool) (tx : Types.transaction)
     : (mempool_entry * Types.hash256 list, string) result =
   (* First check if there are conflicts *)
   let conflicts = find_all_conflicts mp tx in
   match conflicts with
   | [] ->
     (* No conflicts, use normal add_transaction — empty replaced list *)
-    (match add_transaction ~dry_run mp tx with
+    (match add_transaction ~dry_run ~skip_verify_scripts mp tx with
      | Ok e -> Ok (e, [])
      | Error s -> Error s)
   | _ ->
@@ -3164,13 +3297,55 @@ let accept_transaction_with_replaced ?(dry_run=false) (mp : mempool) (tx : Types
       Error "txn-mempool-conflict (dry run with conflicts)"
     else
       (* Attempt full RBF replacement *)
-      replace_by_fee_with_replaced mp tx
+      replace_by_fee_with_replaced ~skip_verify_scripts mp tx
 
-let accept_transaction ?(dry_run=false) (mp : mempool) (tx : Types.transaction)
+let accept_transaction ?(dry_run=false) ?(skip_verify_scripts=false)
+    (mp : mempool) (tx : Types.transaction)
     : (mempool_entry, string) result =
-  match accept_transaction_with_replaced ~dry_run mp tx with
+  match accept_transaction_with_replaced ~dry_run ~skip_verify_scripts mp tx with
   | Ok (e, _) -> Ok e
   | Error s -> Error s
+
+(* Bug #135 step 2: Lwt-flavoured ATMP entry that runs script verification
+   on the Domain worker (via [verify_tx_scripts_lwt]) BEFORE entering the
+   synchronous body of [accept_transaction_with_replaced].  All other
+   pre-script gates (size, standardness, locktime, BIP-68, fee floor,
+   cluster + ancestor/descendant limits, TRUC) keep running on the Lwt
+   main thread inside the sync body — they are cheap relative to the
+   script-verify step that this refactor moves off the main thread.
+
+   Correctness note (TOCTOU): mempool / UTXO state is single-threaded
+   under Lwt; cooperative yields can only land at our explicit Lwt.pause
+   points (and inside the Domain wait in verify_scripts_parallel).  An
+   interleaved handler can spend a UTXO out from under us between the
+   pre-verify and the sync body, but the sync body re-reads
+   [lookup_utxo] for every input and will produce a Missing-input error
+   in that case — i.e. the worst case is a redundant verify + a clean
+   reject, never a false-accept (UTXOs are immutable once present;
+   they can only disappear, not change value/script). *)
+let accept_transaction_with_replaced_lwt ?(dry_run=false)
+    (mp : mempool) (tx : Types.transaction)
+    : (mempool_entry * Types.hash256 list, string) result Lwt.t =
+  let verify_first =
+    if mp.verify_scripts then verify_tx_scripts_lwt mp tx
+    else Lwt.return (Ok ())
+  in
+  let%lwt verified = verify_first in
+  match verified with
+  | Error e -> Lwt.return (Error e)
+  | Ok () ->
+    Lwt.return
+      (accept_transaction_with_replaced ~dry_run
+         ~skip_verify_scripts:true mp tx)
+
+let accept_transaction_lwt ?(dry_run=false)
+    (mp : mempool) (tx : Types.transaction)
+    : (mempool_entry, string) result Lwt.t =
+  let%lwt res =
+    accept_transaction_with_replaced_lwt ~dry_run mp tx in
+  match res with
+  | Ok (e, _) -> Lwt.return (Ok e)
+  | Error s -> Lwt.return (Error s)
 
 (* AcceptToMemoryPool — main entry point matching Bitcoin Core's AcceptToMemoryPool.
    Validates and adds a transaction to the mempool, handling RBF conflicts.
@@ -3191,12 +3366,14 @@ type accept_result = {
 
 let accept_to_memory_pool ?(test_accept=false) (mp : mempool) (tx : Types.transaction)
     : accept_result Lwt.t =
-  (* Wrap the synchronous ATMP body in Lwt.pause yields so the cooperative
-     scheduler can interleave RPC handlers between tx accepts. mempool.ml
-     itself is fully synchronous OCaml, so the *single* accept call still
-     monopolises the main thread for its duration; but for a stream of
-     accepts (the steady-state path from cli.ml:1240's P2p.TxMsg listener),
-     RPC tasks now get a slot between each one. Bug #134.
+  (* Bug #134 + bug #135 step 2: cooperative-yield + Domain-parallel
+     script verification.  The entry/exit [Lwt.pause] yields preserve
+     bug #134's behaviour (RPC tasks get a slot between every tx
+     accept).  Bug #135 step 2 additionally moves the per-tx script
+     verification off the Lwt main thread by routing through
+     [accept_transaction_with_replaced_lwt] / [accept_transaction_lwt],
+     which delegate verify to [Validation.verify_scripts_parallel]
+     (OCaml 5 Domain workers).
 
      W96 Bug 13: ATMP entry point must catch ALL exceptions.  Matches the
      W95-class hardening — peer-controlled inputs (txid/wtxid computation,
@@ -3210,21 +3387,29 @@ let accept_to_memory_pool ?(test_accept=false) (mp : mempool) (tx : Types.transa
     try Crypto.compute_txid tx
     with _ -> Types.zero_hash
   in
-  let safe_run () =
-    try
+  let safe_run () : (mempool_entry * Types.hash256 list, string) result Lwt.t =
+    Lwt.catch (fun () ->
       if test_accept then
         (* dry_run path never mutates — no real evictions possible. *)
-        (match accept_transaction ~dry_run:true mp tx with
-         | Ok e -> Ok (e, [])
-         | Error s -> Error s)
-      else accept_transaction_with_replaced mp tx
-    with
-    | Failure msg -> Error (Printf.sprintf "atmp-exception: %s" msg)
-    | Invalid_argument msg -> Error (Printf.sprintf "atmp-exception: %s" msg)
-    | Not_found -> Error "atmp-exception: Not_found"
-    | exn -> Error (Printf.sprintf "atmp-exception: %s" (Printexc.to_string exn))
+        let%lwt r = accept_transaction_lwt ~dry_run:true mp tx in
+        (match r with
+         | Ok e -> Lwt.return (Ok (e, []))
+         | Error s -> Lwt.return (Error s))
+      else
+        accept_transaction_with_replaced_lwt mp tx)
+    (function
+      | Failure msg ->
+        Lwt.return (Error (Printf.sprintf "atmp-exception: %s" msg))
+      | Invalid_argument msg ->
+        Lwt.return (Error (Printf.sprintf "atmp-exception: %s" msg))
+      | Not_found ->
+        Lwt.return (Error "atmp-exception: Not_found")
+      | exn ->
+        Lwt.return (Error
+          (Printf.sprintf "atmp-exception: %s" (Printexc.to_string exn))))
   in
-  let result = match safe_run () with
+  let%lwt outcome = safe_run () in
+  let result = match outcome with
   | Ok (entry, replaced_txids) ->
     { atmp_accepted = true; atmp_txid = txid; atmp_fee = entry.fee;
       (* ceil(weight / 4) — must round up, not truncate; policy/policy.cpp:395-398 *)

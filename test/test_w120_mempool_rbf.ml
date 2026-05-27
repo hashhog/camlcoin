@@ -391,10 +391,13 @@ let test_g8_package_rbf_missing () =
 
 (* G9.  Conflicts then eviction order: replace_by_fee MUST run every
    validation gate BEFORE removing conflicts (FIX-24 atomicity).  The
-   `add_transaction ~dry_run:true` pre-check at mempool.ml:2899 enforces this. *)
+   `add_transaction ~dry_run:true` pre-check at mempool.ml:2899 enforces this.
+   Bug #135 step 2 added an optional [~skip_verify_scripts] argument that
+   is forwarded from the Lwt entry; the marker still pins the dry_run
+   pre-check pattern regardless of skip-verify state. *)
 let test_g9_conflicts_before_eviction () =
   Alcotest.(check bool) "dry_run pre-check before commit" true
-    (file_has_marker "lib/mempool.ml" "add_transaction ~dry_run:true mp tx")
+    (file_has_marker "lib/mempool.ml" "add_transaction ~dry_run:true ~skip_verify_scripts mp tx")
 
 (* G10.  Replaceability surface — find_all_conflicts.  This is the
    O(1)-per-input map_next_tx lookup that drives RBF.  Hand a tx with no

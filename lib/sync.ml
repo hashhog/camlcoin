@@ -166,6 +166,26 @@ type chain_state = {
        CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
        (Pattern B). *)
   mutable invalidated_blocks : (string, unit) Hashtbl.t;  (* manually invalidated block hashes *)
+  peer_headers_sync : (int, peer_header_sync) Hashtbl.t;
+    (* Per-peer PRESYNC/REDOWNLOAD state, mirrors Bitcoin Core's
+       [Peer.m_headers_sync] (net_processing.cpp).  Populated when a peer's
+       first headers batch arrives on a chain whose [tip.total_work] is below
+       [network.minimum_chain_work] (the bare from-genesis re-IBD case), and
+       cleaned up on disconnect via [cleanup_peer_headers_sync] or on PRESYNC
+       failure / REDOWNLOAD completion via the internal sync loop.
+
+       Prior to the 2026-05-28 PRESYNC unwedge, the per-peer state machinery
+       in this module ([create_presync_state], [process_presync_headers],
+       [process_redownload_headers], …) existed but was NEVER STORED anywhere
+       — the live sync loop called [process_headers ~min_pow_checked:false]
+       directly, which rejected every from-genesis batch with
+       [too-little-chainwork] because the bare batch's chainwork is far below
+       [minimum_chain_work].  On mainnet camlcoin this manifested as 985+
+       retries of the same getheaders-then-reject cycle pinning the node at
+       h=0.  Mirrors the nimrod PRESYNC unwedge of 2026-05-27/28
+       (commits 4deead0 + 1c82891) — see
+       CORE-PARITY-AUDIT/_nimrod-presync-part2-2026-05-27.md and
+       _nimrod-presync-part3-2026-05-28.md. *)
   mutable block_submission_paused : bool;
   (* NetworkDisable flag (Bitcoin Core
      [src/rpc/blockchain.cpp::NetworkDisable] around [TemporaryRollback]).
@@ -614,12 +634,24 @@ let build_redownload_locator (ps : peer_header_sync) (chain_state : chain_state)
     [Crypto.compute_block_hash chain_state.network.genesis_header]
 
 (* Build a getheaders locator for PRESYNC continuation.
-   Returns a locator with just the last known hash. *)
+   Returns a locator with just the last known hash.
+
+   NOTE: this is the legacy 1-entry-only locator kept for the existing tests.
+   The live sync loop uses [build_presync_locator_full] below, which is the
+   Core-parity version that prepends the per-phase continue-from hash and
+   then appends the exponential-backoff locator from [chain_start] back to
+   genesis (mirrors Core headerssync.cpp:296 NextHeadersRequestLocator). *)
 let build_presync_locator (ps : peer_header_sync) : Types.hash256 list =
   match ps.state with
   | Presync { last_hash; _ } -> [last_hash]
   | Redownload { target_hash; _ } -> [target_hash]
   | Synced -> []
+
+(* Forward-declaration site: [build_presync_locator_full] needs
+   [build_locator_from_height] which is defined below alongside [build_locator]
+   to keep all locator code clustered.  See [build_presync_locator_full] below
+   for the full-locator implementation that is wired into the live sync loop.
+*)
 
 (* Should we request more headers from this peer?
    Checks rate limiting and whether sync is complete. *)
@@ -665,6 +697,7 @@ let create_chain_state (db : Storage.ChainDB.t)
     headers_from_peer = Hashtbl.create 16;
     unconnecting_headers = Hashtbl.create 16;
     invalidated_blocks = Hashtbl.create 16;
+    peer_headers_sync = Hashtbl.create 16;
     block_submission_paused = false;
     bip157_index = None;
   } in
@@ -710,6 +743,7 @@ let restore_chain_state (db : Storage.ChainDB.t)
     headers_from_peer = Hashtbl.create 16;
     unconnecting_headers = Hashtbl.create 16;
     invalidated_blocks = Hashtbl.create 16;
+    peer_headers_sync = Hashtbl.create 16;
     block_submission_paused = false;
     bip157_index = None;
   } in
@@ -920,6 +954,21 @@ let unconnecting_headers_count (state : chain_state) (peer_id : int) : int =
   | Some n -> n
   | None -> 0
 
+(* Look up the per-peer PRESYNC/REDOWNLOAD state, if any.  Returns [None] if
+   the peer is not currently using the anti-DoS header-sync pipeline (the
+   common steady-state case for any peer past the [minimum_chain_work]
+   threshold). *)
+let get_peer_headers_sync (state : chain_state) (peer_id : int)
+    : peer_header_sync option =
+  Hashtbl.find_opt state.peer_headers_sync peer_id
+
+(* Drop the per-peer PRESYNC/REDOWNLOAD state for a disconnected peer.
+   Mirrors Bitcoin Core's [Peer::m_headers_sync.reset(nullptr)] in
+   [net_processing.cpp::ProcessHeadersMessage] error paths and
+   [PeerManagerImpl::FinalizeNode].  Idempotent — no-op if no entry exists. *)
+let cleanup_peer_headers_sync (state : chain_state) (peer_id : int) : unit =
+  Hashtbl.remove state.peer_headers_sync peer_id
+
 let process_headers ?(min_pow_checked = true) (state : chain_state)
     (headers : Types.block_header list) : (int, string) result =
   (* Header flood prevention: reject if we already have too many headers
@@ -981,18 +1030,36 @@ let process_headers ?(min_pow_checked = true) (state : chain_state)
     | _ -> Ok !accepted
   end
 
-(* Build a block locator for getheaders request.
-   Returns exponentially spaced block hashes from tip back to genesis. *)
-let build_locator (state : chain_state) : Types.hash256 list =
-  let tip_height = match state.tip with
-    | Some t -> t.height
-    | None -> 0
+(* Build a block locator with exponential backoff starting from [start_height].
+   Mirrors Bitcoin Core's [chain.cpp::LocatorEntries(index)]: collect hashes at
+   heights [start_height, start_height-1, ..., start_height-9], then doubling
+   the step back to 0, always terminating with the genesis hash.
+
+   Used by both [build_locator] (start_height == headers tip) and the
+   PRESYNC/REDOWNLOAD locator path ([build_presync_locator_full],
+   start_height == chain_start_height).  Prior to the PRESYNC unwedge of
+   2026-05-28 the PRESYNC/REDOWNLOAD locator only included two entries
+   ([last_hash] + [chain_start_hash]), which on a from-genesis re-IBD where
+   tip == 0 meant we sent a SINGLE-ENTRY locator — peers replied with the
+   same first 2000 mainnet headers over and over, and [process_headers]
+   rejected them with [too-little-chainwork] because the bare-batch chainwork
+   gate fires before any PRESYNC commitment-phase amortisation can take place.
+   See nimrod commits 4deead0 + 1c82891 for the cross-impl pattern fix and
+   CORE-PARITY-AUDIT/_nimrod-presync-part2-2026-05-27.md +
+   _nimrod-presync-part3-2026-05-28.md for the upstream investigation. *)
+let build_locator_from_height (state : chain_state) (start_height : int)
+    : Types.hash256 list =
+  let genesis_hash () =
+    Storage.ChainDB.get_hash_at_height state.db 0
   in
   let rec collect acc step height =
     if height < 0 then
-      (* Always include genesis *)
-      match Storage.ChainDB.get_hash_at_height state.db 0 with
-      | Some h -> List.rev (h :: acc)
+      (* Always terminate with genesis. *)
+      match genesis_hash () with
+      | Some h ->
+        (match acc with
+         | h' :: _ when Cstruct.equal h h' -> List.rev acc
+         | _ -> List.rev (h :: acc))
       | None -> List.rev acc
     else begin
       match Storage.ChainDB.get_hash_at_height state.db height with
@@ -1003,12 +1070,67 @@ let build_locator (state : chain_state) : Types.hash256 list =
         collect acc step (height - 1)
     end
   in
-  if tip_height <= 0 then
-    match Storage.ChainDB.get_hash_at_height state.db 0 with
+  if start_height <= 0 then
+    match genesis_hash () with
     | Some h -> [h]
     | None -> []
   else
-    collect [] 1 tip_height
+    collect [] 1 start_height
+
+(* Build a block locator for getheaders request.
+   Returns exponentially spaced block hashes from tip back to genesis. *)
+let build_locator (state : chain_state) : Types.hash256 list =
+  let tip_height = match state.tip with
+    | Some t -> t.height
+    | None -> 0
+  in
+  build_locator_from_height state tip_height
+
+(* Build the full getheaders locator for an in-flight PRESYNC/REDOWNLOAD sync.
+
+   Mirrors Bitcoin Core's [HeadersSyncState::NextHeadersRequestLocator]
+   ([bitcoin-core/src/headerssync.cpp:296]): the locator starts with the
+   per-phase "where to continue from" hash ([last_hash] in PRESYNC,
+   [redownload_last_hash] in REDOWNLOAD) and is followed by the
+   exponential-backoff locator built from [chain_start_height] back to
+   genesis (Core's [chain.cpp::LocatorEntries]).
+
+   Why the original 2-entry locator ([build_presync_locator] +
+   [build_redownload_locator]) was buggy: on a from-genesis re-IBD where the
+   local tip is height 0, [chain_start_hash] == genesis and [last_hash] in
+   PRESYNC is also genesis until any commitment-only header is processed —
+   the peer therefore receives a locator with at most ONE hash entry (visible
+   in the live restart.log as "Sending getheaders with 1 locators").  A peer
+   that has pruned or simply does not recognise [last_hash] (the common case
+   during PRESYNC, because commitment-only headers never leave the per-peer
+   state machine and are never relayed) falls back to genesis and replies
+   with the SAME initial 2000 headers over and over.  The next PRESYNC
+   continuity check ([headers[0].prev_block == last_hash]) then fails because
+   the peer is sending from genesis+1, not [last_hash]+1, and the PRESYNC
+   pipeline tears down on every batch.  See nimrod commits 4deead0 + 1c82891
+   and CORE-PARITY-AUDIT/_nimrod-presync-part2-2026-05-27.md for the
+   cross-impl pattern. *)
+let build_presync_locator_full (ps : peer_header_sync)
+    (chain_state : chain_state) : Types.hash256 list =
+  let prefix =
+    match ps.state with
+    | Presync { last_hash; _ } -> [last_hash]
+    | Redownload rd -> [rd.redownload_last_hash]
+    | Synced -> []
+  in
+  (* Append the chain_start exponential-backoff locator.  Skip any leading
+     entry that duplicates the last hash already in [prefix] so the on-wire
+     locator does not repeat the continue-from hash twice. *)
+  let chain_start_locator =
+    build_locator_from_height chain_state ps.chain_start_height in
+  let merged =
+    List.fold_left (fun acc h ->
+      match acc with
+      | last :: _ when Cstruct.equal last h -> acc
+      | _ -> h :: acc
+    ) (List.rev prefix) chain_start_locator
+  in
+  List.rev merged
 
 (* Get header entry by hash *)
 let get_header (state : chain_state) (hash : Types.hash256)
@@ -1103,9 +1225,12 @@ let bip34_height_hash_for (state : chain_state) : Types.hash256 option =
      | None -> None
      | Some entry -> Some entry.hash)
 
-(* Request headers from a peer, starting from our current tip *)
-let request_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
-  let locator = build_locator state in
+(* Send a getheaders message with [locator].  Common helper used by both
+   the main-chain [request_headers] (locator from headers tip) and the
+   PRESYNC/REDOWNLOAD path (locator from the per-peer continue-from hash
+   appended with the chain_start exponential backoff). *)
+let send_getheaders_with_locator (peer : Peer.peer)
+    (locator : Types.hash256 list) (tip_height : int) : unit Lwt.t =
   (match locator with
    | first :: _ ->
      Logs.info (fun m -> m "Sending getheaders with %d locators, first=%s (tip=%d)"
@@ -1115,7 +1240,7 @@ let request_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
           Buffer.add_string buf (Printf.sprintf "%02x" (Cstruct.get_uint8 first i))
         done;
         Buffer.contents buf)
-       state.headers_synced)
+       tip_height)
    | [] -> Logs.info (fun m -> m "Sending getheaders with empty locator"));
   Peer.send_message peer
     (P2p.GetheadersMsg {
@@ -1123,6 +1248,26 @@ let request_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
       locator_hashes = locator;
       hash_stop = Types.zero_hash;
     })
+
+(* Request headers from a peer.  When the peer has an active PRESYNC or
+   REDOWNLOAD state, the locator is built via [build_presync_locator_full]
+   so the per-phase continue-from hash is prepended to the chain_start
+   exponential-backoff locator (mirrors Core
+   [HeadersSyncState::NextHeadersRequestLocator],
+   bitcoin-core/src/headerssync.cpp:296).  Otherwise the locator starts at
+   our current headers tip.  Skipping the PRESYNC locator when one is in
+   flight (as the pre-2026-05-28 code did) torpedoes the continuity check
+   in [process_presync_headers] / [process_redownload_headers] — see the
+   commentary on [build_presync_locator_full] above. *)
+let request_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
+  let locator =
+    match get_peer_headers_sync state peer.Peer.id with
+    | Some ps when ps.state <> Synced ->
+      build_presync_locator_full ps state
+    | _ ->
+      build_locator state
+  in
+  send_getheaders_with_locator peer locator state.headers_synced
 
 (* Main header sync loop - requests headers repeatedly until caught up.
    Enforces headers_download_timeout (15 min total) and uses
@@ -1287,6 +1432,121 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
     end else
       process_headers_and_continue state headers count
   and process_headers_and_continue state headers count =
+    (* PRESYNC anti-DoS routing.
+       When our local [tip.total_work] is still below [minimum_chain_work]
+       (the bare-from-genesis re-IBD case), every batch of unknown headers is
+       a candidate for the PRESYNC pipeline.  The pre-PRESYNC code path
+       (calling [process_headers ~min_pow_checked:false] directly) would
+       reject every such batch with [too-little-chainwork] because the bare
+       batch's accumulated work is far below the threshold and the gate
+       fires per-header.  Mirrors Bitcoin Core's
+       [PeerManagerImpl::TryLowWorkHeadersSync] / [HeadersSyncState]
+       dispatch in [net_processing.cpp::ProcessHeadersMessage], and the
+       cross-impl pattern fixed in nimrod 4deead0 + 1c82891 (2026-05-27/28
+       — see CORE-PARITY-AUDIT/_nimrod-presync-part{2,3}-2026-05-{27,28}.md).
+       Skip the PRESYNC path entirely for empty batches (peer's tip
+       reached); those follow the original fall-through below. *)
+    let lowwork = needs_lowwork_sync ~chain_state:state in
+    if lowwork && headers <> [] then
+      process_headers_via_presync state headers count
+    else
+      process_direct_acceptance state headers count
+
+  and process_headers_via_presync state headers count =
+    (* Look up or lazily create per-peer PRESYNC state.  The chain_start is
+       the current best-work header tip — the same fork point Core uses
+       when constructing [HeadersSyncState] in [TryLowWorkHeadersSync].
+       Both branches of the get-or-create are safe at peer.id resolution:
+       any previous Synced state for the same peer would have been left in
+       place (re-entry is no-op), and a torn-down state will be replaced. *)
+    let ps =
+      match get_peer_headers_sync state peer.Peer.id with
+      | Some existing when existing.state <> Synced -> existing
+      | _ ->
+        let chain_start =
+          match state.tip with
+          | Some t -> t
+          | None ->
+            (* Should never happen — [create_chain_state] inserts genesis.
+               If it does, fall through to the direct-acceptance path so the
+               original error semantics surface. *)
+            failwith "process_headers_via_presync: no tip available"
+        in
+        let fresh =
+          create_presync_state ~peer_id:peer.Peer.id ~chain_start in
+        Hashtbl.replace state.peer_headers_sync peer.Peer.id fresh;
+        Logs.info (fun m ->
+          m "Started PRESYNC for peer %d at chain_start height=%d \
+             (tip_work < minimum_chain_work)"
+            peer.Peer.id chain_start.height);
+        fresh
+    in
+    let phase = get_header_sync_phase ps in
+    let outcome_lwt =
+      match phase with
+      | `Presync ->
+        let r = process_presync_headers ~ps ~headers ~network:state.network in
+        (match r with
+         | Ok _accepted ->
+           (* If PRESYNC just transitioned to REDOWNLOAD inside the call,
+              report that for visibility; either way, request the next batch. *)
+           let after = get_header_sync_phase ps in
+           if after = `Redownload then
+             Logs.info (fun m ->
+               m "PRESYNC -> REDOWNLOAD for peer %d after batch of %d headers"
+                 peer.Peer.id (List.length headers));
+           Lwt.return `Continue
+         | Error e ->
+           Lwt.return (`Failure e))
+      | `Redownload ->
+        let r = process_redownload_headers
+                  ~ps ~headers ~chain_state:state in
+        (match r with
+         | Ok _released ->
+           (* [process_redownload_headers] already wrote any released headers
+              into [chain_state.headers] / [tip] / [headers_synced], so we
+              just continue to drive the next getheaders batch. *)
+           Lwt.return `Continue
+         | Error e ->
+           Lwt.return (`Failure e))
+      | `Synced ->
+        (* PRESYNC -> REDOWNLOAD -> Synced fully completed.  Drop the
+           per-peer state and re-enter the direct-acceptance path; any
+           subsequent batches from this peer go straight through
+           [process_headers] as they would for a sufficiently-worked tip. *)
+        cleanup_peer_headers_sync state peer.Peer.id;
+        Logs.info (fun m ->
+          m "PRESYNC/REDOWNLOAD pipeline complete for peer %d, switching to \
+             direct-acceptance for subsequent batches" peer.Peer.id);
+        Lwt.return `Switch_to_direct
+    in
+    let* outcome = outcome_lwt in
+    (match outcome with
+     | `Continue ->
+       (* Any progress through PRESYNC/REDOWNLOAD counts as a connecting
+          batch for the unconnecting-headers counter purposes (Core's
+          [nUnconnectingHeaders = 0] in the success path). *)
+       reset_unconnecting_headers state peer.Peer.id;
+       if count = P2p.max_headers_count then
+         sync_iteration ()
+       else begin
+         (* Peer's tip reached during low-work sync.  Stay in Idle so the
+            outer driver can pick a different peer; do not transition to
+            SyncingBlocks while [tip_work < minimum_chain_work]. *)
+         state.sync_state <- Idle;
+         Lwt.return_unit
+       end
+     | `Switch_to_direct ->
+       process_direct_acceptance state headers count
+     | `Failure e ->
+       Logs.warn (fun m ->
+         m "PRESYNC/REDOWNLOAD failure for peer %d: %s — dropping state"
+           peer.Peer.id e);
+       cleanup_peer_headers_sync state peer.Peer.id;
+       state.sync_state <- Idle;
+       Lwt.return_unit)
+
+  and process_direct_acceptance state headers count =
     match process_headers ~min_pow_checked:false state headers with
     | Ok accepted ->
       Logs.info (fun m -> m "Accepted %d headers, tip at height %d"

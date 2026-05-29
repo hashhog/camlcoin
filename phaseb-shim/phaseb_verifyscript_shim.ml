@@ -26,6 +26,7 @@
 module Script = Camlcoin.Script
 module Types = Camlcoin.Types
 module Crypto = Camlcoin.Crypto
+module Serialize = Camlcoin.Serialize
 
 (* hex string -> Cstruct.t *)
 let hex_decode (s : string) : Cstruct.t =
@@ -153,46 +154,169 @@ let json_escape (s : string) : string =
     s;
   Buffer.contents buf
 
+(* op "verifyscript" (back-compat default): rebuild Core's synthetic
+   credit/spend pair (transaction_utils.cpp) and run verify_script on the
+   single input. Drives script_tests.json. *)
+let process_verifyscript (j : Yojson.Safe.t) : string =
+  let member k = Yojson.Safe.Util.member k j in
+  let to_hex v = Yojson.Safe.Util.to_string v in
+  let ssig = hex_decode (to_hex (member "scriptSig_hex")) in
+  let spk = hex_decode (to_hex (member "scriptPubKey_hex")) in
+  let amount =
+    match member "amount_sats" with
+    | `Int i -> Int64.of_int i
+    | `Intlit s -> Int64.of_string s
+    | `Null -> 0L
+    | other -> Int64.of_string (Yojson.Safe.to_string other)
+  in
+  let witness_items =
+    match member "witness" with
+    | `List l -> List.map (fun v -> hex_decode (to_hex v)) l
+    | `Null -> []
+    | _ -> failwith "witness not a list"
+  in
+  let flags =
+    match member "flags" with
+    | `List l -> build_flags (List.map (fun v -> to_hex v) l)
+    | `Null -> Script.script_verify_none
+    | _ -> failwith "flags not a list"
+  in
+  let witness : Types.tx_witness = { Types.items = witness_items } in
+  let credit = build_crediting_tx spk amount in
+  let spend = build_spending_tx ssig witness credit in
+  (* prevouts: (amount, scriptPubKey) for all inputs (one here) — needed
+     for BIP-341 taproot sighash, and harmless for legacy/BIP-143. *)
+  let prevouts = [ (amount, spk) ] in
+  match
+    Script.verify_script ~tx:spend ~input_index:0 ~script_pubkey:spk
+      ~script_sig:ssig ~witness ~amount ~flags ~prevouts ()
+  with
+  | Ok true -> {|{"result":true}|}
+  | Ok false -> {|{"result":false,"reason":"VerifyFailed (stack-top false)"}|}
+  | Error e ->
+      Printf.sprintf {|{"result":false,"reason":"%s"}|} (json_escape e)
+
+(* op "verifytx" (tx_valid.json / tx_invalid.json): unlike verifyscript,
+   these vectors give a REAL serialized multi-input tx, so the sighash is
+   computed over THAT tx (transaction_tests.cpp::CheckTxScripts). Mirror
+   the rustoshi-shim template (rustoshi-shim/src/main.rs::process_verifytx):
+   deserialize tx_hex with camlcoin's own segwit-aware deserializer, build
+   the prevout map (txid,vout)->(amount,scriptPubKey), then run camlcoin's
+   real verify_script per input with the signature checker bound to THE REAL
+   TX + input index + amount + all-prevouts (BIP-143/BIP-341 commitment).
+   Valid iff ALL inputs pass; reject on the FIRST failing input (Core's
+   `i < vin.size() && fValid` short-circuit). *)
+let process_verifytx (j : Yojson.Safe.t) : string =
+  let member k = Yojson.Safe.Util.member k j in
+  let to_hex v = Yojson.Safe.Util.to_string v in
+  let to_int64 v =
+    match v with
+    | `Int i -> Int64.of_int i
+    | `Intlit s -> Int64.of_string s
+    | `Null -> 0L
+    | other -> Int64.of_string (Yojson.Safe.to_string other)
+  in
+  let tx_bytes = hex_decode (to_hex (member "tx_hex")) in
+  let r = Serialize.reader_of_cstruct tx_bytes in
+  let tx = Serialize.deserialize_transaction r in
+  let flags =
+    match member "flags" with
+    | `List l -> build_flags (List.map (fun v -> to_hex v) l)
+    | `Null -> Script.script_verify_none
+    | _ -> failwith "flags not a list"
+  in
+  (* Build the prevout map keyed by (DISPLAY-order txid hex, vout). The
+     request supplies txid as Bitcoin display-order hex; we key the lookup
+     on the SAME display-order string so no reversal logic lives in the
+     shim — for each tx input we render its wire-order prevout txid back to
+     display order via hash256_to_hex_display. The driver already cast vout
+     to a u32 (coinbase -1 -> 0xFFFFFFFF), matching the deserialized int32
+     when both are read as 32 unsigned bits. amount defaults to 0 (Core). *)
+  let tbl : (string * int32, int64 * Cstruct.t) Hashtbl.t = Hashtbl.create 16 in
+  let prevouts_json =
+    match member "prevouts" with
+    | `List l -> l
+    | _ -> failwith "prevouts not a list"
+  in
+  List.iter
+    (fun p ->
+      let pm k = Yojson.Safe.Util.member k p in
+      let txid_hex = to_hex (pm "txid") in
+      let vout =
+        match pm "vout" with
+        | `Int i -> Int32.of_int i
+        | `Intlit s -> Int32.of_string s
+        | other -> Int32.of_string (Yojson.Safe.to_string other)
+      in
+      let spk = hex_decode (to_hex (pm "scriptPubKey_hex")) in
+      let amount = to_int64 (pm "amount_sats") in
+      Hashtbl.replace tbl (txid_hex, vout) (amount, spk))
+    prevouts_json;
+  (* Assemble per-input (amount, scriptPubKey) in the tx's own input order
+     so verify_script's ~prevouts lines up with input i (BIP-341 commits to
+     ALL prevouts). A prevout missing from the map => malformed row =>
+     failwith => {"error"} so the driver SKIPS it (never fake-pass). *)
+  let inputs = Array.of_list tx.Types.inputs in
+  let n = Array.length inputs in
+  let per_input =
+    Array.map
+      (fun (input : Types.tx_in) ->
+        let key =
+          ( Types.hash256_to_hex_display input.previous_output.txid,
+            input.previous_output.vout )
+        in
+        match Hashtbl.find_opt tbl key with
+        | Some pv -> pv
+        | None ->
+            failwith
+              (Printf.sprintf "no prevout for input %s:%lu"
+                 (Types.hash256_to_hex_display input.previous_output.txid)
+                 input.previous_output.vout))
+      inputs
+  in
+  let prevouts = Array.to_list (Array.map (fun (a, s) -> (a, s)) per_input) in
+  let witnesses = Array.of_list tx.Types.witnesses in
+  let n_wit = Array.length witnesses in
+  (* Per-input VerifyScript over the real tx; reject on first failure. *)
+  let rec loop i =
+    if i >= n then {|{"valid":true}|}
+    else begin
+      let input = inputs.(i) in
+      let amount, spk = per_input.(i) in
+      (* tx.witnesses is empty for a non-segwit tx, else one stack per input
+         in input order. *)
+      let witness : Types.tx_witness =
+        if n_wit = 0 then { Types.items = [] }
+        else if i < n_wit then witnesses.(i)
+        else { Types.items = [] }
+      in
+      match
+        Script.verify_script ~tx ~input_index:i ~script_pubkey:spk
+          ~script_sig:input.script_sig ~witness ~amount ~flags ~prevouts ()
+      with
+      | Ok true -> loop (i + 1)
+      | Ok false ->
+          Printf.sprintf {|{"valid":false,"reason":"input %d: %s"}|} i
+            (json_escape "VerifyFailed (stack-top false)")
+      | Error e ->
+          Printf.sprintf {|{"valid":false,"reason":"input %d: %s"}|} i
+            (json_escape e)
+    end
+  in
+  loop 0
+
 let process (line : string) : string =
   try
     let j = Yojson.Safe.from_string line in
-    let member k = Yojson.Safe.Util.member k j in
-    let to_hex v = Yojson.Safe.Util.to_string v in
-    let ssig = hex_decode (to_hex (member "scriptSig_hex")) in
-    let spk = hex_decode (to_hex (member "scriptPubKey_hex")) in
-    let amount =
-      match member "amount_sats" with
-      | `Int i -> Int64.of_int i
-      | `Intlit s -> Int64.of_string s
-      | `Null -> 0L
-      | other -> Int64.of_string (Yojson.Safe.to_string other)
+    let op =
+      match Yojson.Safe.Util.member "op" j with
+      | `String s -> s
+      | _ -> "verifyscript"
     in
-    let witness_items =
-      match member "witness" with
-      | `List l -> List.map (fun v -> hex_decode (to_hex v)) l
-      | `Null -> []
-      | _ -> failwith "witness not a list"
-    in
-    let flags =
-      match member "flags" with
-      | `List l -> build_flags (List.map (fun v -> to_hex v) l)
-      | `Null -> Script.script_verify_none
-      | _ -> failwith "flags not a list"
-    in
-    let witness : Types.tx_witness = { Types.items = witness_items } in
-    let credit = build_crediting_tx spk amount in
-    let spend = build_spending_tx ssig witness credit in
-    (* prevouts: (amount, scriptPubKey) for all inputs (one here) — needed
-       for BIP-341 taproot sighash, and harmless for legacy/BIP-143. *)
-    let prevouts = [ (amount, spk) ] in
-    match
-      Script.verify_script ~tx:spend ~input_index:0 ~script_pubkey:spk
-        ~script_sig:ssig ~witness ~amount ~flags ~prevouts ()
-    with
-    | Ok true -> {|{"result":true}|}
-    | Ok false -> {|{"result":false,"reason":"VerifyFailed (stack-top false)"}|}
-    | Error e ->
-        Printf.sprintf {|{"result":false,"reason":"%s"}|} (json_escape e)
+    match op with
+    | "verifyscript" -> process_verifyscript j
+    | "verifytx" -> process_verifytx j
+    | other -> Printf.sprintf {|{"error":"unknown op: %s"}|} (json_escape other)
   with
   | Failure msg -> Printf.sprintf {|{"error":"%s"}|} (json_escape msg)
   | e ->

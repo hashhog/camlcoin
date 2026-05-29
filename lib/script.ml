@@ -2326,8 +2326,13 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
             if Int64.logand sequence 0x80000000L <> 0L then
               Ok ()
             else begin
-              (* Check tx version >= 2 *)
-              if st.tx.version < 2l then
+              (* Check tx version >= 2 (BIP-68 / interpreter.cpp:1790).
+                 Core's txTo->version is uint32_t, so the "< 2" compare is
+                 UNSIGNED. OCaml Int32 is signed (a 0xffffffff version parses
+                 to -1l), so mask to the unsigned 32-bit value before comparing,
+                 matching the tx_seq / tx_locktime handling in this function. *)
+              let tx_version = Int64.logand (Int64.of_int32 st.tx.version) 0xFFFFFFFFL in
+              if tx_version < 2L then
                 Error "CSV requires tx version >= 2"
               else begin
                 let inp = List.nth st.tx.inputs st.input_index in

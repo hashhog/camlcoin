@@ -1,0 +1,3 @@
+(executable
+ (name phaseb_verifyscript_shim)
+ (libraries camlcoin cstruct yojson))

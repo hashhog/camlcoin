@@ -27,6 +27,8 @@ module Script = Camlcoin.Script
 module Types = Camlcoin.Types
 module Crypto = Camlcoin.Crypto
 module Serialize = Camlcoin.Serialize
+module Validation = Camlcoin.Validation
+module Consensus = Camlcoin.Consensus
 
 (* hex string -> Cstruct.t *)
 let hex_decode (s : string) : Cstruct.t =
@@ -305,6 +307,67 @@ let process_verifytx (j : Yojson.Safe.t) : string =
   in
   loop 0
 
+(* op "checktx" (tx_invalid BADTX rows + tx_valid checktx invariant):
+   CheckTransaction-level, CONTEXT-FREE structural validation. Mirrors
+   bitcoin-core/src/consensus/tx_check.cpp::CheckTransaction — the checks
+   `verifytx` (per-input VerifyScript only) cannot catch: empty vin/vout,
+   output value range + running total, duplicate inputs, oversize,
+   non-coinbase null prevout, and coinbase scriptSig length.
+
+   It delegates to camlcoin's OWN consensus code (lib/validation.ml), so a
+   divergence here is a camlcoin CheckTransaction bug, NOT a shim bug. No
+   UTXO/chain state is needed. Two camlcoin design facts shape the call:
+
+   1. `Validation.check_transaction` takes an `?is_coinbase` flag (default
+      false) instead of detecting coinbase internally the way Core's
+      CheckTransaction does (`tx.IsCoinBase()`). With the default, a
+      coinbase-shaped tx (single null-prevout input) is rejected as
+      `TxNullPrevout` and the bad-cb-length check is never reached — which
+      would WRONGLY reject the structurally-valid coinbase rows in
+      tx_valid.json (idx 49/52). So we first detect coinbase via camlcoin's
+      own `Validation.is_coinbase_tx` and pass `~is_coinbase` accordingly,
+      exactly mirroring Core's `if (tx.IsCoinBase()) ... else ...` branch.
+
+   2. camlcoin's bad-cb-length rule (scriptSig length in [2,100],
+      tx_check.cpp:49) lives in `Validation.check_coinbase`, not in
+      `check_transaction`. `check_coinbase` also folds in context-DEPENDENT
+      BIP-34 height encoding, gated on `height >= network.bip34_height`. We
+      call it with `~network:Consensus.mainnet` and `height = 0`, which is
+      below mainnet's bip34_height (227931), so the BIP-34 branch is skipped
+      and `check_coinbase` reduces to exactly the context-free coinbase
+      structural checks (one input, null outpoint, scriptSig length 2..100)
+      — i.e. Core's coinbase branch of CheckTransaction. This reuses
+      camlcoin's real consensus code for bad-cb-length rather than
+      reimplementing the [2,100] bound in the shim.
+
+   A tx is structurally VALID iff `check_transaction` accepts AND (for a
+   coinbase) `check_coinbase` accepts; reject on the first failing check,
+   matching Core's early-return order. *)
+let process_checktx (j : Yojson.Safe.t) : string =
+  let member k = Yojson.Safe.Util.member k j in
+  let to_hex v = Yojson.Safe.Util.to_string v in
+  let tx_bytes = hex_decode (to_hex (member "tx_hex")) in
+  let r = Serialize.reader_of_cstruct tx_bytes in
+  let tx = Serialize.deserialize_transaction r in
+  let is_coinbase = Validation.is_coinbase_tx tx in
+  match Validation.check_transaction ~is_coinbase tx with
+  | Error e ->
+      Printf.sprintf {|{"valid":false,"reason":"%s"}|}
+        (json_escape (Validation.tx_error_to_string e))
+  | Ok () ->
+      if is_coinbase then
+        (* Apply camlcoin's own bad-cb-length rule via check_coinbase with
+           height=0 (< bip34_height) so only the context-free coinbase
+           structural checks run. *)
+        (match
+           Validation.check_coinbase ~network:Consensus.mainnet tx 0
+         with
+        | Error e ->
+            Printf.sprintf {|{"valid":false,"reason":"%s"}|}
+              (json_escape (Validation.tx_error_to_string e))
+        | Ok () -> {|{"valid":true}|})
+      else {|{"valid":true}|}
+
 let process (line : string) : string =
   try
     let j = Yojson.Safe.from_string line in
@@ -316,6 +379,7 @@ let process (line : string) : string =
     match op with
     | "verifyscript" -> process_verifyscript j
     | "verifytx" -> process_verifytx j
+    | "checktx" -> process_checktx j
     | other -> Printf.sprintf {|{"error":"unknown op: %s"}|} (json_escape other)
   with
   | Failure msg -> Printf.sprintf {|{"error":"%s"}|} (json_escape msg)

@@ -347,18 +347,32 @@ let is_disabled_opcode (n : int) : bool =
     -> true
   | _ -> false
 
-(* Check if number requires more than 4 bytes (overflow for arithmetic) *)
+(* Check whether [data] is a minimally-encoded CScriptNum.
+
+   This mirrors Bitcoin Core's CScriptNum constructor minimality test
+   (script.h:251-268), which is INDEPENDENT of the byte-length limit. The
+   length limit (nMaxNumSize: 4 for normal arithmetic, 5 for CLTV/CSV) is a
+   SEPARATE check enforced by [script_num_of_bytes] via [max_bytes]. Do NOT
+   fold the 4-byte limit into minimality here: a 5-byte minimally-encoded
+   operand is perfectly minimal, and is legal at OP_CHECKLOCKTIMEVERIFY /
+   OP_CHECKSEQUENCEVERIFY which read with nMaxNumSize=5. (Previously this
+   returned false for any operand >4 bytes, which false-rejected valid
+   5-byte CLTV/CSV operands.) *)
 let script_num_require_minimal (data : Cstruct.t) : bool =
   let len = Cstruct.length data in
   if len = 0 then true
-  else if len > 4 then false
-  else if len = 1 then
-    let byte = Cstruct.get_uint8 data 0 in
-    (byte land 0x7f) <> 0
   else
+    (* If the most-significant byte (excluding the sign bit) is zero then the
+       number is not minimally encoded (also rejects negative-zero 0x80)...
+       unless there is more than one byte and the second-most-significant
+       byte has its high bit set (would otherwise clash with the sign bit),
+       e.g. +-255 encode to 0xff00 / 0xff80. *)
     let last = Cstruct.get_uint8 data (len - 1) in
-    let second_last = Cstruct.get_uint8 data (len - 2) in
-    if (last = 0x00 || last = 0x80) && (second_last land 0x80 = 0) then false
+    if (last land 0x7f) = 0 then
+      if len <= 1 then false
+      else
+        let second_last = Cstruct.get_uint8 data (len - 2) in
+        (second_last land 0x80) <> 0
     else true
 
 (* Decode script number from bytes (sign-magnitude little-endian) *)

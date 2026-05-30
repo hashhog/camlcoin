@@ -453,6 +453,56 @@ let process_nextwork (j : Yojson.Safe.t) : string =
   in
   Printf.sprintf {|{"nbits":"%08lx"}|} nbits
 
+(* op "merkleroot" (Phase B tx-merkle + CVE-2012-2459 differential): drive
+   camlcoin's REAL merkle primitive Crypto.merkle_root (lib/crypto.ml:359),
+   which returns (root, mutated) where `mutated` is camlcoin's own
+   block-acceptance-path CVE-2012-2459 adjacent-pair-equal check
+   (crypto.ml:378, run BEFORE odd-element duplication, mirroring Core's
+   ComputeMerkleRoot). We do NOT re-implement that check in the shim — we
+   report whatever camlcoin's real merkle code concludes, so a cve2459 row
+   coming back mutated=false would be a genuine camlcoin false-accept finding.
+
+   request:  {"op":"merkleroot","txids":["<64-hex display-order>",...]}
+   response: {"root":"<64-hex display-order>","mutated":<bool>}
+             {"error":"..."}   (could not compute -> driver SKIPS)
+
+   txids arrive in Bitcoin DISPLAY order (Core getblock convention,
+   big-endian). camlcoin's merkle code works in INTERNAL (wire) byte order, so
+   we reverse each txid into internal order before feeding merkle_root — the
+   inverse of the verifytx op, which renders internal txids back to display via
+   Types.hash256_to_hex_display for its prevout-map keys. The computed internal
+   root is then reversed back to display order (hash256_to_hex_display) so it
+   matches Core's header merkleroot. *)
+let cstruct_rev (c : Cstruct.t) : Cstruct.t =
+  let n = Cstruct.length c in
+  let out = Cstruct.create n in
+  for i = 0 to n - 1 do
+    Cstruct.set_uint8 out i (Cstruct.get_uint8 c (n - 1 - i))
+  done;
+  out
+
+let process_merkleroot (j : Yojson.Safe.t) : string =
+  let member k = Yojson.Safe.Util.member k j in
+  let txids_json =
+    match member "txids" with
+    | `List l -> l
+    | _ -> failwith "txids not a list"
+  in
+  (* display-order hex -> 32-byte cstruct (display byte order) -> reverse to
+     internal/wire byte order for the merkle primitive. *)
+  let hashes =
+    List.map
+      (fun v ->
+        let hex = Yojson.Safe.Util.to_string v in
+        cstruct_rev (Types.hash256_of_hex hex))
+      txids_json
+  in
+  if hashes = [] then failwith "empty txids";
+  let root_internal, mutated = Crypto.merkle_root hashes in
+  (* reverse the internal root back to display order to match Core's header. *)
+  let root_display = Types.hash256_to_hex_display root_internal in
+  Printf.sprintf {|{"root":"%s","mutated":%b}|} root_display mutated
+
 let process (line : string) : string =
   try
     let j = Yojson.Safe.from_string line in
@@ -466,6 +516,7 @@ let process (line : string) : string =
     | "verifytx" -> process_verifytx j
     | "checktx" -> process_checktx j
     | "nextwork" -> process_nextwork j
+    | "merkleroot" -> process_merkleroot j
     | other -> Printf.sprintf {|{"error":"unknown op: %s"}|} (json_escape other)
   with
   | Failure msg -> Printf.sprintf {|{"error":"%s"}|} (json_escape msg)

@@ -631,8 +631,11 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
         chain.blocks_synced <- rdb_h
       | Some _ -> ()
     end;
+    (* UTXO LRU raised 2M -> 20M coins (~1% -> ~10% of the ~190M-coin set):
+       profiling showed the 2M cache served ~1% of lookups, leaving the sync
+       disk-I/O bound. Larger LRU cuts random RocksDB reads on the hot set. *)
     let utxo = Camlcoin.Utxo.OptimizedUtxoSet.create
-      ~cache_size:2_000_000 ~rocksdb db in
+      ~cache_size:20_000_000 ~rocksdb db in
     let ic = if import_path = "-" then stdin
              else open_in_bin import_path in
     Printf.eprintf "CamlCoin import: reading blocks from %s\n%!"

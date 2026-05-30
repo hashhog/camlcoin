@@ -383,7 +383,11 @@ let merkle_root (hashes : Types.hash256 list) : (Types.hash256 * bool) =
         pair items;
         loop (List.rev !pairs)
     in
-    (loop hashes, !mutated)
+    (* OCaml evaluates tuple elements RIGHT-TO-LEFT, so writing
+       `(loop hashes, !mutated)` reads !mutated BEFORE loop runs and the flag
+       is always still false. Force loop to run first by binding root. *)
+    let root = loop hashes in
+    (root, !mutated)
 
 (* Compute witness transaction ID (wtxid).
    For the coinbase transaction (index 0), the wtxid is always 32 zero bytes.

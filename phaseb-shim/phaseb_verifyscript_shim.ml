@@ -368,6 +368,91 @@ let process_checktx (j : Yojson.Safe.t) : string =
         | Ok () -> {|{"valid":true}|})
       else {|{"valid":true}|}
 
+(* op "nextwork" (Phase B PoW differential): drive camlcoin's REAL
+   Consensus.get_next_work_required (the BlockIndex/chain-generic entrypoint
+   at lib/consensus.ml:376 that does the retarget + off-by-one + clamps +
+   powLimit + BIP94) against Core's GetNextWorkRequired (pow.cpp).
+
+   request:  {"op":"nextwork","network":"mainnet","height":<H>,
+              "block_time":<u32>,
+              "last":{"height":<int>,"bits":"<8hex>","time":<u32>},
+              "first":{"height":<int>,"bits":"<8hex>","time":<u32>}}
+             "first" present ONLY on retarget-boundary rows (H%2016==0); it is
+             the block at height H-2016 (= pindexLast.height-2015).
+   response: {"nbits":"<8hex>"}   (the impl's REAL computed required nBits)
+             {"error":"..."}      (could not compute -> driver SKIPS)
+
+   bits are 8-lowercase-hex (Core getblockheader format). camlcoin stores bits
+   as int32 internally, so we parse on entry and Printf "%08lx" on exit.
+
+   For boundary rows we populate a Hashtbl(height -> (time,bits)) with the
+   `first` block (and `last`, for completeness) and close a get_block_info
+   over it. The mainnet boundary branch looks up get_block_info(H-2016) which
+   lands exactly on `first`. For passthrough rows the impl returns last.bits
+   and never consults get_block_info. block_time only matters for testnet
+   min-diff (mainnet ignores it). *)
+let network_of_string (s : string) : Consensus.network_config =
+  match s with
+  | "mainnet" | "main" -> Consensus.mainnet
+  | "testnet" | "testnet3" | "test" -> Consensus.testnet
+  | "testnet4" -> Consensus.testnet4
+  | "regtest" -> Consensus.regtest
+  | other -> failwith (Printf.sprintf "unknown network: %s" other)
+
+(* parse a JSON int (Int / Intlit / String) into an OCaml int *)
+let json_to_int (v : Yojson.Safe.t) : int =
+  match v with
+  | `Int i -> i
+  | `Intlit s -> int_of_string s
+  | `String s -> int_of_string s
+  | other -> failwith (Printf.sprintf "expected int, got %s" (Yojson.Safe.to_string other))
+
+(* parse a u32 timestamp into int32 *)
+let json_to_u32 (v : Yojson.Safe.t) : int32 =
+  match v with
+  | `Int i -> Int32.of_int i
+  | `Intlit s -> Int32.of_string s
+  | `String s -> Int32.of_string s
+  | other -> failwith (Printf.sprintf "expected u32, got %s" (Yojson.Safe.to_string other))
+
+(* parse 8-lowercase-hex bits (Core getblockheader format) -> int32 compact *)
+let bits_of_hex (s : string) : int32 =
+  if String.length s <> 8 then failwith (Printf.sprintf "bits must be 8 hex chars: %s" s);
+  (* Int32.of_string handles 0x-prefixed; prepend 0x and accept the full u32. *)
+  Int32.of_string ("0x" ^ s)
+
+let process_nextwork (j : Yojson.Safe.t) : string =
+  let member k = Yojson.Safe.Util.member k j in
+  let network = network_of_string (Yojson.Safe.Util.to_string (member "network")) in
+  let height = json_to_int (member "height") in
+  let block_time = json_to_u32 (member "block_time") in
+  let last = member "last" in
+  let lm k = Yojson.Safe.Util.member k last in
+  let prev_block_time = json_to_u32 (lm "time") in
+  let prev_bits = bits_of_hex (Yojson.Safe.Util.to_string (lm "bits")) in
+  let last_height = json_to_int (lm "height") in
+  (* Build the height -> (time, bits) table from last (+ first if present). *)
+  let tbl : (int, int32 * int32) Hashtbl.t = Hashtbl.create 4 in
+  Hashtbl.replace tbl last_height (prev_block_time, prev_bits);
+  (match member "first" with
+   | `Null -> ()
+   | first ->
+       let fm k = Yojson.Safe.Util.member k first in
+       let f_height = json_to_int (fm "height") in
+       let f_time = json_to_u32 (fm "time") in
+       let f_bits = bits_of_hex (Yojson.Safe.Util.to_string (fm "bits")) in
+       Hashtbl.replace tbl f_height (f_time, f_bits));
+  let get_block_info (h : int) : int32 * int32 =
+    match Hashtbl.find_opt tbl h with
+    | Some v -> v
+    | None -> failwith (Printf.sprintf "no block info at height %d" h)
+  in
+  let nbits =
+    Consensus.get_next_work_required ~height ~block_time ~prev_block_time
+      ~prev_bits ~get_block_info ~network
+  in
+  Printf.sprintf {|{"nbits":"%08lx"}|} nbits
+
 let process (line : string) : string =
   try
     let j = Yojson.Safe.from_string line in
@@ -380,6 +465,7 @@ let process (line : string) : string =
     | "verifyscript" -> process_verifyscript j
     | "verifytx" -> process_verifytx j
     | "checktx" -> process_checktx j
+    | "nextwork" -> process_nextwork j
     | other -> Printf.sprintf {|{"error":"unknown op: %s"}|} (json_escape other)
   with
   | Failure msg -> Printf.sprintf {|{"error":"%s"}|} (json_escape msg)

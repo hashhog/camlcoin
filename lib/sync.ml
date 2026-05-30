@@ -779,6 +779,72 @@ let restore_chain_state (db : Storage.ChainDB.t)
      | Some (_chain_hash, chain_height) ->
        state.blocks_synced <- chain_height
      | None -> ());
+    (* ---- AssumeUTXO snapshot-bootstrap forward-sync repair (3-layer fix) ----
+       After [load_snapshot_into_primary], the DB carries:
+         - header_tip + chain_tip at the snapshot base (e.g. 944183),
+         - a height->hash row for the base,
+         - genesis's header (seeded by the loader),
+       but NOT the base block's real header bytes (a UTXO snapshot carries no
+       headers).  The restore loop above therefore skips the base height
+       ([get_block_header] miss at line ~757), so [state.tip] is left = None
+       even though [headers_synced]/[blocks_synced] = base height.
+
+       That broken state stalls forward-sync at the base for three reasons,
+       the three layers of the assumeUTXO forward-sync bug:
+
+         LAYER 1 (chainwork): with no in-memory tip, every peer-served header
+           batch is routed through the PRESYNC/low-work pipeline and its
+           cumulative work is computed from ~0, so it never clears
+           [minimum_chain_work] cleanly and honest peers risk header-flood
+           scoring.
+         LAYER 2 (base block-index): block base+1's parent (the base) is absent
+           from the connectable in-memory header table, so [get_header_at_height
+           base] and the [validate_header] parent lookup both miss -> the base+1
+           header never connects and [fill_download_queue] (gated on
+           [state.tip.height]) never requests a single forward block.
+         LAYER 3 (MTP window): the first ~11 post-base blocks have a
+           median-time-past window reaching below the un-indexed base, so
+           [compute_median_time_past] returns nothing -> nLockTimeCutoff = 0 ->
+           time-locked txs fail bad-txns-nonfinal.
+
+       Fix (nimrod's proven header-persist model, network/sync.nim:1229-1271):
+       re-anchor the in-memory tip to genesis and rewind [headers_synced] to 0
+       so the from-genesis P2P header sync rebuilds the FULL header chain.
+       camlcoin already persists every accepted header to the block-index DB
+       (accept_header / process_redownload_headers store header + height->hash
+       and advance header_tip), so once header sync passes the base:
+         - the base acquires a REAL header row carrying its REAL cumulative
+           chainwork (LAYER 1 + LAYER 2 — chainwork accrues header-by-header
+           from genesis, exactly as it would on a from-genesis IBD), and
+         - heights base-10 .. base are all in memory with their REAL
+           timestamps, so the MTP window for base+1 .. base+11 is exact, no
+           proxy needed (LAYER 3).
+       Block bodies still resume at base+1: [blocks_synced] is intentionally
+       LEFT at the snapshot base (the UTXO set is already there); only the
+       header chain is rebuilt (headers are the cheap part assumeUTXO does NOT
+       skip).  This touches ONLY the forward-sync header bootstrap; the reorg
+       path is untouched.
+
+       Detection is conservative: trigger ONLY when the restore left no
+       in-memory tip while [headers_synced] claims a non-genesis height AND
+       genesis itself is present to re-anchor on.  A normal restart (whose
+       header_tip header bytes ARE on disk) sets [state.tip] in the loop and
+       never enters this branch. *)
+    let genesis_hash = Crypto.compute_block_hash network.genesis_header in
+    let genesis_entry =
+      Hashtbl.find_opt state.headers (Cstruct.to_string genesis_hash) in
+    (match state.tip, genesis_entry with
+     | None, Some gen when state.headers_synced > 0 ->
+       Logs.warn (fun m ->
+         m "Snapshot-bootstrap detected (header_tip at height %d has no header \
+            bytes on disk); re-anchoring header sync to genesis to rebuild the \
+            header chain forward past the snapshot base. UTXO set + \
+            blocks_synced=%d are preserved."
+           state.headers_synced state.blocks_synced);
+       state.tip <- Some gen;
+       state.headers_synced <- 0
+       (* blocks_synced intentionally left at the snapshot base. *)
+     | _ -> ());
     (* Load invalidated blocks from database *)
     List.iter (fun hash ->
       Hashtbl.replace state.invalidated_blocks (Cstruct.to_string hash) ()

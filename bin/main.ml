@@ -58,9 +58,18 @@ let max_inbound_arg =
     info ["maxinbound"] ~docv:"N" ~doc)
 
 let connect_arg =
-  let doc = "Connect to specific peer (host:port or host). Can be specified multiple times." in
+  let doc = "Connect to specific peer (host:port or host). Can be specified \
+             multiple times. Like Bitcoin Core -connect, this pins the node \
+             to ONLY these peers and disables DNS-seed resolution and \
+             addrman/auto-outbound dialing." in
   Arg.(value & opt_all string [] &
     info ["connect"; "c"] ~docv:"ADDR" ~doc)
+
+let no_dnsseed_arg =
+  let doc = "Disable DNS seed resolution (Bitcoin Core -nodnsseed / \
+             -dnsseed=0). Independent of --connect: suppresses only DNS \
+             while leaving addrman / fallback outbound dialing on." in
+  Arg.(value & flag & info ["nodnsseed"] ~doc)
 
 let debug_arg =
   let doc = "Enable debug logging." in
@@ -99,16 +108,21 @@ let import_utxo_arg =
   (* cmdliner treats unescaped '$' and '\\' specially in doc strings, so
      the wire-format magic 'utxo<0xff>' and the path '<datadir>/...'
      are written without those characters. *)
-  let doc = "Load a Bitcoin Core dumptxoutset (UTXO snapshot) into a fresh \
-             snapshot chainstate. The file MUST be in Core wire format \
+  let doc = "Bootstrap from a Bitcoin Core dumptxoutset (UTXO snapshot) and \
+             then forward-sync. The file MUST be in Core wire format \
              (magic bytes 'utxo' followed by 0xff, version 2, \
              ScriptCompression-encoded coins). The base blockhash and \
              coin count are checked against camlcoin's hardcoded \
              AssumeUTXO parameters before any coin is loaded; mismatches \
-             fail fast. Snapshot data populates a SECONDARY chainstate \
-             at <datadir>/chainstate_snapshot/; the existing IBD \
-             chainstate is left intact. The historical alias \
-             '--load-snapshot' is also accepted." in
+             fail fast. The snapshot UTXO set is written into the PRIMARY \
+             chainstate (the running node's UTXO store), the validated \
+             chain tip is set to the snapshot base height, and the node \
+             then continues into normal P2P header sync + forward block \
+             download from the base height onward. Only acted on when the \
+             chainstate is fresh (height 0); over an existing tip the flag \
+             is ignored and the existing chainstate is used. Without the \
+             flag, sync proceeds from genesis as before. The historical \
+             alias '--load-snapshot' is also accepted." in
   Arg.(value & opt (some string) None &
     info ["import-utxo"; "load-snapshot"] ~docv:"PATH" ~doc)
 
@@ -365,7 +379,7 @@ let rest_tls_key_arg =
    ============================================================================ *)
 
 let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
-    p2p_port max_outbound max_inbound connect debug no_wallet prune benchmark
+    p2p_port max_outbound max_inbound connect no_dnsseed debug no_wallet prune benchmark
     import_blocks import_utxo metrics_port peer_bloom_filters
     migrate_logstorage daemon_mode pid_path conf_path debug_cats
     logfile printtoconsole ready_fd zmq_pub reindex
@@ -494,55 +508,95 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     Camlcoin.Cli.setup_logging debug ();
     Camlcoin.Perf.run_benchmarks ();
     ()
-  end else match import_utxo with
-  | Some utxo_path ->
-    (* UTXO snapshot import: Bitcoin Core dumptxoutset format.
+  end else begin
+  (* UTXO snapshot bootstrap: Bitcoin Core dumptxoutset format.
 
-       The HDOG path retired 2026-04-29: the prior bespoke 52-byte header
-       + per-coin (txid, vout LE, amount, height, scriptlen, script)
-       layout was incompatible with the rest of the fleet and prevented
-       camlcoin from consuming snapshots produced by Bitcoin Core or any
-       other implementation. We now read Core's wire format byte-for-byte
-       (magic 'utxo\xff', VARINT/CompressAmount/ScriptCompression). *)
-    Camlcoin.Cli.setup_logging debug ();
-    let base = Camlcoin.Cli.config_for_network network in
-    let data_dir = match datadir with
-      | Some d -> d
-      | None -> base.data_dir in
-    (try Unix.mkdir data_dir 0o755
-     with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
-    let network_cfg = match network with
-      | `Mainnet -> Camlcoin.Consensus.mainnet
-      | `Testnet -> Camlcoin.Consensus.testnet4
-      | `Regtest -> Camlcoin.Consensus.regtest
-    in
-    let snapshot_db_path =
-      Filename.concat data_dir "chainstate_snapshot" in
-    let on_progress (p : Camlcoin.Assume_utxo.load_progress) =
-      if Int64.rem p.coins_loaded 1_000_000L = 0L
-         && Int64.compare p.coins_loaded 0L > 0 then
-        Printf.eprintf "[utxo-import] %Ld / %Ld coins (%.1f%%)\n%!"
-          p.coins_loaded p.total_coins p.pct
-    in
-    Printf.eprintf "[utxo-import] Loading Core-format snapshot: %s\n%!"
-      utxo_path;
-    Printf.eprintf "[utxo-import] Network: %s | snapshot chainstate: %s\n%!"
-      network_cfg.Camlcoin.Consensus.name snapshot_db_path;
-    (match Camlcoin.Assume_utxo.load_snapshot
-             ~network:network_cfg
-             ~snapshot_path:utxo_path
-             ~snapshot_db_path
-             ~on_progress
-             () with
-    | Ok cs ->
-      Printf.eprintf
-        "[utxo-import] Loaded snapshot at height %d (%s)\n%!"
-        cs.tip_height
-        (Camlcoin.Types.hash256_to_hex_display cs.tip_hash)
-    | Error msg ->
-      Printf.eprintf "[utxo-import] failed: %s\n%!" msg;
-      exit 1)
-  | None ->
+     The HDOG path retired 2026-04-29: the prior bespoke 52-byte header
+     + per-coin (txid, vout LE, amount, height, scriptlen, script)
+     layout was incompatible with the rest of the fleet and prevented
+     camlcoin from consuming snapshots produced by Bitcoin Core or any
+     other implementation. We now read Core's wire format byte-for-byte
+     (magic 'utxo\xff', VARINT/CompressAmount/ScriptCompression).
+
+     2026-05-29: --load-snapshot/--import-utxo now bootstraps the PRIMARY
+     chainstate (the one Cli.run / Sync reads) and FALLS THROUGH into normal
+     node-run, instead of writing a dead chainstate_snapshot/ directory and
+     exiting. The import streams coins into the primary Rocksdb_store, records
+     its tip_height + the CF chain_tip at the snapshot base height, then
+     control continues to the node-run branch below where restore_chain_state
+     reads chain_tip -> blocks_synced and forward-sync continues
+     (accept-then-continue, mirroring rustoshi / blockbrew). When the flag is
+     absent this is a no-op and the genesis sync path is unchanged. *)
+  (match import_utxo with
+   | None -> ()
+   | Some utxo_path ->
+     Camlcoin.Cli.setup_logging debug ();
+     let base = Camlcoin.Cli.config_for_network network in
+     let data_dir = match datadir with
+       | Some d -> d
+       | None -> base.data_dir in
+     (try Unix.mkdir data_dir 0o755
+      with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+     let network_cfg = match network with
+       | `Mainnet -> Camlcoin.Consensus.mainnet
+       | `Testnet -> Camlcoin.Consensus.testnet4
+       | `Regtest -> Camlcoin.Consensus.regtest
+     in
+     let db_path = Filename.concat data_dir "chainstate" in
+     let rocksdb_path = Filename.concat data_dir "rocksdb_utxo" in
+     let on_progress (p : Camlcoin.Assume_utxo.load_progress) =
+       if Int64.rem p.coins_loaded 1_000_000L = 0L
+          && Int64.compare p.coins_loaded 0L > 0 then
+         Printf.eprintf "[utxo-import] %Ld / %Ld coins (%.1f%%)\n%!"
+           p.coins_loaded p.total_coins p.pct
+     in
+     Printf.eprintf "[utxo-import] Loading Core-format snapshot: %s\n%!"
+       utxo_path;
+     Printf.eprintf
+       "[utxo-import] Network: %s | bootstrapping PRIMARY chainstate at %s\n%!"
+       network_cfg.Camlcoin.Consensus.name data_dir;
+     (* Guard: only bootstrap a fresh chainstate. If a validated tip already
+        exists, importing a snapshot over it would corrupt the chain view.
+        Mirrors blockbrew main.go:785-789 (-load-snapshot ignored when the
+        chainstate is not fresh). *)
+     let probe_db = Camlcoin.Storage.ChainDB.create db_path in
+     let existing_tip =
+       match Camlcoin.Storage.ChainDB.get_chain_tip probe_db with
+       | Some (_, h) when h > 0 -> Some h
+       | _ -> None
+     in
+     Camlcoin.Storage.ChainDB.close probe_db;
+     (match existing_tip with
+      | Some h ->
+        Printf.eprintf
+          "[utxo-import] chainstate already at height %d — refusing to \
+           overwrite; remove %s to re-bootstrap. Continuing with existing \
+           chainstate.\n%!" h db_path
+      | None ->
+        let db = Camlcoin.Storage.ChainDB.create db_path in
+        let rocksdb = Camlcoin.Rocksdb_store.open_db rocksdb_path in
+        (match Camlcoin.Assume_utxo.load_snapshot_into_primary
+                 ~network:network_cfg
+                 ~snapshot_path:utxo_path
+                 ~db
+                 ~rocksdb
+                 ~on_progress
+                 () with
+         | Ok r ->
+           Printf.eprintf
+             "[utxo-import] Bootstrapped %Ld coins; chain tip set to \
+              height %d (%s). Forward-sync will continue from there.\n%!"
+             r.coins_loaded r.base_height
+             (Camlcoin.Types.hash256_to_hex_display r.base_blockhash)
+         | Error msg ->
+           Printf.eprintf "[utxo-import] failed: %s\n%!" msg;
+           Camlcoin.Rocksdb_store.close rocksdb;
+           Camlcoin.Storage.ChainDB.close db;
+           exit 1);
+        (* Close both stores before falling through: the node-run path
+           reopens them, and RocksDB takes an exclusive process lock. *)
+        Camlcoin.Rocksdb_store.close rocksdb;
+        Camlcoin.Storage.ChainDB.close db));
   match import_blocks with
   | Some import_path ->
     (* Block import mode: bypass P2P entirely *)
@@ -594,6 +648,14 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     let conf_rpc_port = Camlcoin.Runtime_config.get_int conf_opts "rpcport" in
     let conf_p2p_port = Camlcoin.Runtime_config.get_int conf_opts "port" in
     let conf_connect = Camlcoin.Runtime_config.get_all conf_opts "connect" in
+    (* DNS seeding: ON by default (Core DEFAULT_DNSSEED). Disabled by
+       --nodnsseed on the CLI or dnsseed=0 in the conf file. *)
+    let eff_dns_seed =
+      if no_dnsseed then false
+      else match Camlcoin.Runtime_config.get_bool conf_opts "dnsseed" with
+        | Some b -> b
+        | None -> true
+    in
     let config : Camlcoin.Cli.config = {
       network;
       data_dir = resolved_datadir;
@@ -611,6 +673,7 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       max_outbound = eff_max_outbound;
       max_inbound = eff_max_inbound;
       connect = (if connect <> [] then connect else conf_connect);
+      dns_seed = eff_dns_seed;
       debug;
       wallet_enabled = not no_wallet;
       prune = eff_prune;
@@ -753,6 +816,7 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     Camlcoin.Runtime_config.remove_pid_file ();
     exit 0
   end
+  end
 
 let cmd =
   let doc = "CamlCoin - Bitcoin full node implemented in OCaml" in
@@ -788,6 +852,7 @@ let cmd =
     $ max_outbound_arg
     $ max_inbound_arg
     $ connect_arg
+    $ no_dnsseed_arg
     $ debug_arg
     $ no_wallet_arg
     $ prune_arg

@@ -52,6 +52,12 @@ type config = {
        this into [Peer.connect_outbound_negotiated], which in turn
        routes the dial through [P2p.connect_with_proxy] when a
        non-default value is in play.  Closes W117 BUG-2 (FIX-56). *)
+  dns_seed : bool;
+    (* Mirrors Bitcoin Core's -dnsseed (init.cpp DEFAULT_DNSSEED=true).
+       When [false] (set by --nodnsseed / --dnsseed=0), [start] skips
+       [resolve_dns_seeds] entirely.  Independent of --connect: -connect
+       implies dns_seed=false in Core, but -nodnsseed alone suppresses
+       only DNS while leaving addrman / fallback outbound dialing on. *)
 }
 
 let default_config : config = {
@@ -66,6 +72,7 @@ let default_config : config = {
   max_block_relay_only_anchors = 2; (* BIP 155: 2 block-relay-only anchors *)
   max_block_relay_only = 2; (* 2 dedicated block-relay-only outbound connections *)
   proxy_config = P2p.default_proxy_config;
+  dns_seed = true;           (* Core DEFAULT_DNSSEED; --nodnsseed flips to false *)
 }
 
 (* ========== Stale peer eviction constants ========== *)
@@ -228,6 +235,13 @@ type t = {
   mutable start_msg_loop : (Peer.peer -> unit);
   (* ASMap support: IP-to-ASN mapping for eclipse-resistant bucketing *)
   net_group_manager : Asmap.net_group_manager;
+  (* --connect peer pinning (Bitcoin Core -connect semantics).  When
+     non-empty the node connects to ONLY these (addr, port) peers:
+     [start] skips DNS-seed resolution AND the addrman/fallback bootstrap,
+     and [maintain_connections] does NOT fill outbound slots from addrman —
+     it only re-dials these pinned peers when they drop.  Empty = legacy
+     auto-discovery behaviour. *)
+  mutable connect_peers : (string * int) list;
 }
 
 (* Generate a 256-bit eclipse-protection bucket key from /dev/urandom.
@@ -273,7 +287,19 @@ let create ?(config = default_config) ?(asmap : bytes option = None) (network : 
     mempool = None;
     hb_compact_peers = [];
     net_group_manager = Asmap.create_net_group_manager asmap;
+    connect_peers = [];
   }
+
+(* Pin the node to a fixed set of --connect peers (Bitcoin Core -connect).
+   Call BEFORE [start].  Once set (non-empty), [start] skips DNS seeds +
+   addrman/fallback bootstrap, and [maintain_connections] only re-dials
+   these peers — never auto-fills outbound slots from addrman. *)
+let set_connect_peers (pm : t) (peers : (string * int) list) : unit =
+  pm.connect_peers <- peers
+
+(* True when the node is pinned to a fixed --connect peer set. *)
+let connect_only (pm : t) : bool =
+  pm.connect_peers <> []
 
 (* Set the mempool reference for feefilter (BIP-133) *)
 let set_mempool (pm : t) (mp : Mempool.mempool) : unit =
@@ -2017,31 +2043,49 @@ let maintain_connections (pm : t) : unit Lwt.t =
     if not pm.running then Lwt.return_unit
     else begin
       Lwt.catch (fun () ->
-        (* Count active outbound connections *)
-        let active_outbound = List.filter (fun p ->
-          p.Peer.state = Peer.Ready && p.Peer.direction = Peer.Outbound
-        ) pm.peers in
-        let needed = pm.config.max_outbound - List.length active_outbound in
-        (* Try to connect to more peers if needed *)
+        let connect_mode = connect_only pm in
+        (* Outbound slot maintenance.
+           --connect mode (Core -connect / clearbit peer.zig:7050): do NOT
+           auto-fill from addrman and do NOT open block-relay-only peers —
+           the only outbound dials permitted are the pinned --connect peers.
+           Re-dial any pinned peer that is not currently connected so a
+           dropped/dead pinned peer keeps being retried (clearbit's
+           maintainManualConnections). [add_peer] no-ops if already
+           connected or if max_outbound is reached. *)
         let* () =
-          if needed > 0 then begin
-            let candidates = get_connection_candidates pm needed in
-            Lwt_list.iter_s (fun info ->
-              add_peer pm info.address info.port
-            ) candidates
-          end else
-            Lwt.return_unit
-        in
-        (* Maintain block-relay-only outbound connections *)
-        let* () =
-          let bro_needed = pm.config.max_block_relay_only - block_relay_only_count pm in
-          if bro_needed > 0 then begin
-            let candidates = get_connection_candidates pm bro_needed in
-            Lwt_list.iter_s (fun info ->
-              add_block_relay_peer pm info.address info.port
-            ) candidates
-          end else
-            Lwt.return_unit
+          if connect_mode then begin
+            Lwt_list.iter_s (fun (addr, port) ->
+              if List.exists (fun p ->
+                   p.Peer.addr = addr && p.Peer.port = port) pm.peers
+              then Lwt.return_unit
+              else add_peer pm addr port
+            ) pm.connect_peers
+          end else begin
+            (* Count active outbound connections *)
+            let active_outbound = List.filter (fun p ->
+              p.Peer.state = Peer.Ready && p.Peer.direction = Peer.Outbound
+            ) pm.peers in
+            let needed = pm.config.max_outbound - List.length active_outbound in
+            (* Try to connect to more peers if needed *)
+            let* () =
+              if needed > 0 then begin
+                let candidates = get_connection_candidates pm needed in
+                Lwt_list.iter_s (fun info ->
+                  add_peer pm info.address info.port
+                ) candidates
+              end else
+                Lwt.return_unit
+            in
+            (* Maintain block-relay-only outbound connections *)
+            let bro_needed = pm.config.max_block_relay_only - block_relay_only_count pm in
+            if bro_needed > 0 then begin
+              let candidates = get_connection_candidates pm bro_needed in
+              Lwt_list.iter_s (fun info ->
+                add_block_relay_peer pm info.address info.port
+              ) candidates
+            end else
+              Lwt.return_unit
+          end
         in
         (* Ping idle peers *)
         let* () = Lwt_list.iter_p (fun peer ->
@@ -2220,16 +2264,38 @@ let start_listener (pm : t) (port : int) : unit Lwt.t =
 let start (pm : t) : unit Lwt.t =
   let open Lwt.Syntax in
   pm.running <- true;
-  (* Resolve DNS seeds *)
-  let* seed_addrs = resolve_dns_seeds pm.network in
-  Log.info (fun m -> m "Resolved %d addresses from DNS seeds" (List.length seed_addrs));
-  List.iter (fun info ->
-    Hashtbl.replace pm.known_addrs info.address info
-  ) seed_addrs;
-  (* Add fallback peers *)
-  let fallback = get_fallback_peers pm.network in
-  Log.info (fun m -> m "Added %d fallback peers" (List.length fallback));
-  List.iter (add_known_addr pm) fallback;
+  let connect_mode = connect_only pm in
+  (* Resolve DNS seeds — skipped when:
+       (a) --connect pins the node to a fixed peer set (Core -connect
+           implies -dnsseed=0), or
+       (b) --nodnsseed / --dnsseed=0 was given (pm.config.dns_seed = false).
+     Mirrors clearbit peer.zig:7039 (dnsSeeds() only on the non-connect
+     branch) and bitcoin-core init.cpp DEFAULT_DNSSEED gating. *)
+  let* () =
+    if connect_mode then begin
+      Log.info (fun m -> m
+        "--connect: %d pinned peer(s); skipping DNS seeds + addrman bootstrap"
+        (List.length pm.connect_peers));
+      Lwt.return_unit
+    end else if not pm.config.dns_seed then begin
+      Log.info (fun m -> m "--nodnsseed: DNS seed resolution disabled");
+      Lwt.return_unit
+    end else begin
+      let* seed_addrs = resolve_dns_seeds pm.network in
+      Log.info (fun m -> m "Resolved %d addresses from DNS seeds" (List.length seed_addrs));
+      List.iter (fun info ->
+        Hashtbl.replace pm.known_addrs info.address info
+      ) seed_addrs;
+      Lwt.return_unit
+    end
+  in
+  (* Add fallback peers — also skipped in --connect mode so the only
+     outbound dials are the pinned peers (no addrman bootstrap). *)
+  if not connect_mode then begin
+    let fallback = get_fallback_peers pm.network in
+    Log.info (fun m -> m "Added %d fallback peers" (List.length fallback));
+    List.iter (add_known_addr pm) fallback
+  end;
   (* Log asmap version at startup (mirrors Core: LogInfo "Using asmap version...").
      Reference: bitcoin-core/src/init.cpp LogInfo("Using asmap version %s...") *)
   (match pm.net_group_manager.Asmap.asmap with

@@ -19,6 +19,12 @@ type config = {
   max_outbound : int;
   max_inbound : int;
   connect : string list;  (* manual peer addresses *)
+  dns_seed : bool;
+    (* Mirrors Bitcoin Core -dnsseed (DEFAULT_DNSSEED=true). When [false]
+       (--nodnsseed / -dnsseed=0 / conf dnsseed=0) the peer manager skips
+       DNS-seed resolution. Note: a non-empty [connect] list also implies
+       no DNS seeding (Core -connect semantics), handled in the peer
+       manager regardless of this flag. *)
   debug : bool;
   wallet_enabled : bool;
   prune : int;
@@ -143,6 +149,7 @@ let default_config : config = {
   max_outbound = 8;
   max_inbound = 117;
   connect = [];
+  dns_seed = true;  (* Core DEFAULT_DNSSEED *)
   debug = false;
   wallet_enabled = true;
   prune = 0;
@@ -756,9 +763,37 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     ~config:{ Peer_manager.default_config with
               max_outbound = config.max_outbound;
               max_inbound = config.max_inbound;
-              proxy_config }
+              proxy_config;
+              dns_seed = config.dns_seed }
     ~asmap:asmap_data
     network in
+
+  (* --connect peer pinning (Bitcoin Core -connect): when manual peers are
+     given, pin the node to ONLY those peers. [set_connect_peers] makes
+     [Peer_manager.start] skip DNS-seed resolution + addrman/fallback
+     bootstrap, and [maintain_connections] only re-dial the pinned peers
+     (never auto-fill outbound from addrman). Parse host[:port] the same
+     way as the manual-connect dialer below. *)
+  (if config.connect <> [] then begin
+    let pinned =
+      List.filter_map (fun addr_port ->
+        match String.split_on_char ':' addr_port with
+        | [addr; port_str] ->
+          (match int_of_string_opt port_str with
+           | Some port -> Some (addr, port)
+           | None ->
+             Logs.warn (fun m ->
+               m "Invalid --connect peer address (bad port): %s" addr_port);
+             None)
+        | [addr] -> Some (addr, network.default_port)
+        | _ ->
+          Logs.warn (fun m ->
+            m "Invalid --connect peer address format: %s" addr_port);
+          None
+      ) config.connect
+    in
+    Peer_manager.set_connect_peers peer_manager pinned
+  end);
 
   (* Load persisted peer bans from previous session *)
   (try

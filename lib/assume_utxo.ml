@@ -183,6 +183,15 @@ let mainnet_au_data : assumeutxo_params list = [
       "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050"
     ~coins_count:0L
     ~chain_tx_count:1_305_397_408L;
+  (* height = 944183. *)
+  make_au
+    ~height:944_183
+    ~blockhash_display:
+      "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817"
+    ~coins_hash_display:
+      "2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8"
+    ~coins_count:165_095_935L
+    ~chain_tx_count:1_334_000_000L;
 ]
 
 (** Testnet4 has no Core-published AssumeUTXO entries as of release 31.99.
@@ -311,6 +320,28 @@ module Stream_reader = struct
   }
 
   let buf_size = 1 lsl 20  (* 1 MiB chunks *)
+
+  (* Low-water mark for the streaming top-up in the coin-reader hot loop.
+     The reader must never trigger a buffer refill on EVERY record: doing so
+     reallocates a fresh [buf_size] Cstruct and memmoves the (up to ~1 MiB)
+     unconsumed tail for each of the ~165M coins, which collapses throughput
+     to a few hundred coins/sec and storms the major GC — the import then
+     appears wedged (0% CPU, no further disk writes) for hours.
+
+     Instead the hot path tops up to this [low_water] target: [ensure_soft]
+     returns instantly (no allocation, no copy) while [remaining >= low_water],
+     and only refills — to a full [buf_size] — once the buffer drops below it.
+     A refill therefore happens about once per (buf_size - low_water) bytes
+     consumed (≈ every ~12k coins) rather than once per coin.
+
+     [low_water] must comfortably exceed the largest single record the reader
+     consumes between top-up checks: a per-txid group header (32-byte txid +
+     CompactSize) plus one coin body (vout CompactSize + code/amount VARINTs +
+     a ScriptCompression script up to [Compressor.max_script_size] = 10_000
+     bytes). 64 KiB leaves ample headroom; oversized / malicious scripts that
+     exceed even the full buffer are still caught by the hard [ensure] guards
+     and the deserializer's own bounds checks. *)
+  let low_water = 64 * 1024
 
   let create ic ~start_offset =
     seek_in ic start_offset;
@@ -538,10 +569,13 @@ let iter_snapshot_coins ?(base_height : int = max_int)
   try
     while Int64.compare !coins_left 0L > 0 do
       (* Read the next per-txid group header. The minimum is 32 (txid) +
-         1 (smallest CompactSize) bytes. We top up generously through the
-         soft variant so a near-EOF group still succeeds even when fewer
-         than [buf_size] bytes remain. *)
-      let _ = Stream_reader.ensure_soft sr ~target:Stream_reader.buf_size in
+         1 (smallest CompactSize) bytes. We top up through the soft variant
+         only when the buffer has fallen below the [low_water] mark, so the
+         common case is a no-op (no realloc, no memmove) and a refill happens
+         roughly once per ~1 MiB consumed rather than once per group. The
+         hard [ensure ~need:33] below still guarantees the header bytes are
+         present (and a near-EOF group still succeeds). *)
+      let _ = Stream_reader.ensure_soft sr ~target:Stream_reader.low_water in
       Stream_reader.ensure sr ~need:33;
       let r = Stream_reader.to_serialize_reader sr in
       let txid = Serialize.read_bytes r 32 in
@@ -552,11 +586,15 @@ let iter_snapshot_coins ?(base_height : int = max_int)
           "Mismatch in coins count in snapshot metadata and actual snapshot data";
       for _ = 1 to coins_per_txid do
         (* Each coin needs at minimum 4 bytes (vout CompactSize 1 + code
-           VARINT 1 + amount VARINT 1 + script size VARINT 1). Top up
-           to a buffer-friendly value but never fail if the file is
-           legitimately short. *)
+           VARINT 1 + amount VARINT 1 + script size VARINT 1). Top up only
+           when the buffer has dropped below [low_water]; while it is above
+           that mark this is a pure length comparison with no allocation or
+           copy, which is what keeps the 165M-coin import streaming instead
+           of reallocating + memmoving a fresh ~1 MiB buffer per coin. The
+           hard [ensure ~need:4] fallback still guarantees forward progress
+           at EOF / on a short tail. *)
         let avail =
-          Stream_reader.ensure_soft sr ~target:Stream_reader.buf_size in
+          Stream_reader.ensure_soft sr ~target:Stream_reader.low_water in
         if avail < 4 then
           Stream_reader.ensure sr ~need:4;
         let r = Stream_reader.to_serialize_reader sr in
@@ -682,6 +720,198 @@ type load_progress = {
   total_coins : int64;
   pct : float;
 }
+
+(** Result of a primary-chainstate snapshot bootstrap. *)
+type primary_load_result = {
+  base_blockhash : Types.hash256;  (** Snapshot base block hash (internal LE). *)
+  base_height : int;               (** Snapshot base height. *)
+  coins_loaded : int64;            (** Number of coins streamed into the store. *)
+}
+
+(** Load a UTXO snapshot into the PRIMARY chainstate that the running node
+    (Cli.run / Sync) reads, then record the snapshot base block as the
+    validated chain tip so that forward-sync continues from there
+    ("accept-then-continue", mirroring rustoshi / blockbrew).
+
+    Unlike [load_snapshot] (which writes a SECONDARY, inert
+    [chainstate_snapshot/] directory), this writes coins into the same
+    [Rocksdb_store] the IBD path's [OptimizedUtxoSet] reads from at
+    [cli.ml:560], records the RocksDB [tip_height], stores the base block
+    header + height->hash mapping, and sets the CF [chain_tip] to the base
+    height. After this returns, the caller should fall through into normal
+    node-run: [restore_chain_state] reads [chain_tip] -> [blocks_synced] =
+    base_height; P2P header sync from genesis (the locator gracefully skips
+    the sparse heights) drives the in-memory header tip past base_height;
+    then [start_ibd] downloads block base_height+1 onward.
+
+    Coins are written ONLY to [Rocksdb_store] (not the cf_chainstate UTXO
+    column family). This matches the established camlcoin convention that
+    assume-valid IBD UTXOs live only in RocksDB (see cli.ml:369-373); the
+    [Storage.ChainDB.get_utxo] fallback reads RocksDB on a CF miss, and the
+    IBD [OptimizedUtxoSet.get] reads RocksDB directly, so forward-sync
+    prevout lookups resolve. (dumptxoutset / gettxoutsetinfo, which iterate
+    the CF, will not enumerate snapshot coins until they are re-validated;
+    that does not affect forward-sync.)
+
+    The snapshot file MUST be in Bitcoin Core's [dumptxoutset] format
+    (per-txid-grouped, ScriptCompression-encoded coins). The metadata is
+    validated against the hardcoded AssumeUTXO parameters before any coin
+    is loaded; mismatches reject the snapshot up front. *)
+let load_snapshot_into_primary
+    ~(network : Consensus.network_config)
+    ~(snapshot_path : string)
+    ~(db : Storage.ChainDB.t)
+    ~(rocksdb : Rocksdb_store.t)
+    ?(on_progress : load_progress -> unit = fun _ -> ())
+    ()
+    : (primary_load_result, string) result =
+  match read_snapshot_metadata snapshot_path ~expected_network_magic:network.magic with
+  | Error e -> Error e
+  | Ok metadata ->
+    match get_assumeutxo_for_hash ~network metadata.base_blockhash with
+    | None ->
+      Error (Printf.sprintf "Snapshot blockhash %s not recognized for this network"
+               (Types.hash256_to_hex_display metadata.base_blockhash))
+    | Some params ->
+      if Int64.compare params.coins_count 0L <> 0
+         && metadata.coins_count <> params.coins_count then
+        Error (Printf.sprintf "Coins count mismatch: snapshot has %Ld, expected %Ld"
+                 metadata.coins_count params.coins_count)
+      else begin
+        (* Write coins through OptimizedUtxoSet so the on-disk key format
+           and per-coin serialization are byte-identical to what the IBD
+           reader ([Sync] via the same module) expects. A modest cache is
+           fine — we flush in bounded batches to keep RSS in check. *)
+        let utxo =
+          Utxo.OptimizedUtxoSet.create ~cache_size:1_000_000 ~rocksdb db in
+        let ic = open_in_bin snapshot_path in
+        try
+          let sr = Stream_reader.create ic
+                     ~start_offset:snapshot_body_offset in
+          let total = metadata.coins_count in
+          let coins_loaded = ref 0L in
+          let progress_step = 10_000 in
+          let since_progress = ref 0 in
+          (* Bounded-memory flush: drain the dirty set to RocksDB every
+             [flush_every] coins so a 165M-coin snapshot never accumulates
+             the whole set in memory. The tip_height is recorded only on the
+             final flush below. *)
+          let flush_every = 1_000_000 in
+          let since_flush = ref 0 in
+          let res = iter_snapshot_coins ~base_height:params.height sr
+            ~coins_count:total
+            ~f:(fun coin ->
+              let entry = {
+                Utxo.value = coin.value;
+                script_pubkey = coin.script_pubkey;
+                height = coin.height;
+                is_coinbase = coin.is_coinbase;
+              } in
+              Utxo.OptimizedUtxoSet.add utxo
+                coin.outpoint.Types.txid
+                (Int32.to_int coin.outpoint.Types.vout)
+                entry;
+              coins_loaded := Int64.add !coins_loaded 1L;
+              incr since_flush;
+              if !since_flush >= flush_every then begin
+                since_flush := 0;
+                (* No tip_height yet — only mutations. *)
+                Utxo.OptimizedUtxoSet.flush utxo
+              end;
+              incr since_progress;
+              if !since_progress >= progress_step then begin
+                since_progress := 0;
+                let pct =
+                  if Int64.equal total 0L then 100.0
+                  else 100.0 *. Int64.to_float !coins_loaded
+                       /. Int64.to_float total in
+                on_progress {
+                  coins_loaded = !coins_loaded;
+                  total_coins = total;
+                  pct;
+                }
+              end)
+          in
+          close_in ic;
+          match res with
+          | Error msg -> Error msg
+          | Ok _ ->
+            (* Final flush: drain any remaining dirty coins AND record the
+               RocksDB tip_height. The cli.ml:434 boot consistency check
+               compares [Rocksdb_store.get_tip_height] against
+               [chain_tip.height]; both must equal base_height or the boot
+               check rewinds blocks_synced to 0 and defeats the snapshot. *)
+            Utxo.OptimizedUtxoSet.flush ~tip_height:params.height utxo;
+            (* Seed the genesis header into the chainstate DB. On a fresh
+               snapshot-bootstrapped datadir [create_chain_state] (which is
+               what normally inserts genesis — sync.ml:704-718) is NEVER
+               called, because [restore_chain_state] takes the Some-branch
+               once we set header_tip below. The from-genesis P2P header
+               rebuild needs genesis present so the FIRST received header
+               (height 1) finds its parent: [process_headers] connects each
+               header via a parent lookup in [state.headers], and that table
+               is populated by restore_chain_state's 0..tip walk, which reads
+               headers out of the block_header CF. Without genesis in the CF,
+               restore loads an empty header table, header 1 is unconnecting,
+               and forward-sync wedges at the snapshot base. Mirrors the
+               genesis insert in create_chain_state. *)
+            let genesis_hash =
+              Crypto.compute_block_hash network.genesis_header in
+            if not (Storage.ChainDB.has_block_header db genesis_hash) then begin
+              Storage.ChainDB.store_block_header db genesis_hash
+                network.genesis_header;
+              Storage.ChainDB.set_height_hash db 0 genesis_hash
+            end;
+            (* Store the base block height->hash so the getheaders locator can
+               anchor at base_height (build_locator_from_height gracefully
+               skips the unfilled intermediate heights). We only have the base
+               block's hash (from this network's hardcoded AssumeUTXO
+               whitelist), not its real header bytes — the UTXO snapshot
+               carries no headers — so the height->hash map is recorded but
+               the in-memory header entry for the base is left to the normal
+               P2P header sync from genesis. *)
+            Storage.ChainDB.set_height_hash db params.height
+              metadata.base_blockhash;
+            (* Record the validated chain tip. restore_chain_state reads this
+               into blocks_synced so forward block download begins at
+               base_height+1 (create_ibd_state: start_height =
+               blocks_synced + 1). *)
+            Storage.ChainDB.set_chain_tip db metadata.base_blockhash
+              params.height;
+            (* CRITICAL: also record the header tip at the snapshot base.
+               restore_chain_state (sync.ml:751) keys EVERYTHING off
+               [get_header_tip]: if header_tip is absent it falls through to
+               [create_chain_state] (a genesis-fresh state) and NEVER reads
+               [chain_tip], silently discarding the snapshot and rewinding
+               blocks_synced to 0. Setting header_tip here makes restore take
+               the Some-branch, walk the (sparse) stored height->hash map, and
+               then read chain_tip into blocks_synced = base_height.
+               We do NOT have the snapshot base block's real header bytes (the
+               UTXO snapshot carries no headers), so the restore loop's
+               [get_block_header base] miss leaves [state.tip = None] with
+               [headers_synced = base_height]; P2P header sync from genesis
+               then rebuilds the in-memory header chain forward past the base
+               (build_locator falls back to genesis when tip is None, and
+               every current network peer advertises best_height > base_height
+               so should_request_headers fires). Mirrors rustoshi
+               main.rs:2287-2289 (HeaderSync::new(genesis) +
+               set_best_header(snapshot_height, snapshot_hash)) and
+               blockbrew main.go:2083-2091 (SetChainState + SetBlockHeight). *)
+            Storage.ChainDB.set_header_tip db metadata.base_blockhash
+              params.height;
+            Ok {
+              base_blockhash = metadata.base_blockhash;
+              base_height = params.height;
+              coins_loaded = !coins_loaded;
+            }
+        with
+        | Failure msg -> close_in_noerr ic; Error msg
+        | End_of_file -> close_in_noerr ic; Error "Unexpected end of snapshot file"
+        | exn ->
+          close_in_noerr ic;
+          Error (Printf.sprintf "Failed to load snapshot into primary chainstate: %s"
+                   (Printexc.to_string exn))
+      end
 
 (** Load a UTXO snapshot into a new chainstate.
 

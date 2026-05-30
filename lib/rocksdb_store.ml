@@ -7,8 +7,11 @@ type t = {
 }
 
 (* Open (or create) a RocksDB database at [path].
-   Tuning: 64 MB write buffer, 512 MB block cache, 10-bit bloom filter. *)
-let open_db ?(write_buffer_mb=256) ?(block_cache_mb=2048) ?(bloom_bits=10)
+   Tuning: 256 MB write buffer, 8 GB block cache, 10-bit bloom filter.
+   The block cache was raised 2 GB -> 8 GB: profiling the mainnet sync showed
+   camlcoin disk-I/O bound (~40% of time in random RocksDB UTXO reads), so a
+   larger SST block cache cuts read amplification on the hot UTXO column. *)
+let open_db ?(write_buffer_mb=256) ?(block_cache_mb=8192) ?(bloom_bits=10)
     (path : string) : t =
   (* Ensure parent directory exists *)
   (try Unix.mkdir path 0o755

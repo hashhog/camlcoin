@@ -776,6 +776,29 @@ let process_checkblock (j : Yojson.Safe.t) : string =
   (* expected_bits = the block's OWN header bits (the difficulty-target equality
      rule is satisfied trivially; skip_pow only drops the hash<=target test). *)
   let expected_bits = block.Types.header.bits in
+  (* BIP-30 / BIP-34 short-circuit (CVE-2012-1909): camlcoin's
+     bip30_should_enforce (validation.ml:1456) mirrors Core ConnectBlock
+     (validation.cpp:2460-2467) — once BIP34 is confirmed activated on the
+     CANONICAL chain (the block at network.bip34_height has hash =
+     network.bip34_hash), the HaveCoin BIP30 scan is SKIPPED for heights in
+     [bip34_height, BIP34_IMPLIES_BIP30_LIMIT). Core gets this confirmation for
+     free by walking pindex->pprev->GetAncestor(BIP34Height); camlcoin's
+     production callers supply it via Sync.bip34_height_hash_for (sync.ml:1286 —
+     reads the header at bip34_height from chain state). This stateless shim has
+     no header store, so we model the CANONICAL chain (the scenario the corpus
+     N1 vector asserts: a post-BIP34 mainnet block) by passing the network's own
+     bip34_hash as the bip34-height block hash. Faithful + default-preserving:
+       - pre-BIP34 (R1/P1 @ h=91000 < 227931): bip30_should_enforce's Gate-4
+         skip requires height >= bip34_height, which is false here, so BIP30
+         stays ENFORCED regardless of this value (the collision still rejects).
+       - post-BIP34 (N1 @ h=400000): Gate-4 confirms canonical activation and
+         skips the scan exactly as Core does (and as a real camlcoin mainnet
+         node would, since its header store holds the canonical bip34 block).
+     Omitting it (None) triggers camlcoin's CONSERVATIVE fallback (enforce BIP30
+     everywhere >= bip34_height), which would over-enforce N1 — a shim artifact,
+     not a consensus divergence (the production path never hits the fallback on
+     the canonical chain). *)
+  let bip34_height_hash = Consensus.mainnet.Consensus.bip34_hash in
   (* MAINNET consensus flags at spend_height (post-Taproot: all forks active). *)
   let flags = Consensus.get_block_script_flags spend_height Consensus.mainnet in
   (* median_time (= the prev block's GetMedianTimePast). Not supplied by the
@@ -796,7 +819,7 @@ let process_checkblock (j : Yojson.Safe.t) : string =
   match
     Validation.accept_block ~network:Consensus.mainnet ~block
       ~height:spend_height ~expected_bits ~median_time ~base_lookup ~flags
-      ~skip_scripts ~skip_pow ()
+      ~skip_scripts ~skip_pow ?bip34_height_hash ()
   with
   | Validation.AB_ok _ -> {|{"valid":true}|}
   | Validation.AB_err e ->

@@ -49,6 +49,15 @@ let hex_decode (s : string) : Cstruct.t =
   done;
   out
 
+(* reverse a Cstruct's bytes (Bitcoin display<->internal/wire byte order) *)
+let cstruct_rev (c : Cstruct.t) : Cstruct.t =
+  let n = Cstruct.length c in
+  let out = Cstruct.create n in
+  for i = 0 to n - 1 do
+    Cstruct.set_uint8 out i (Cstruct.get_uint8 c (n - 1 - i))
+  done;
+  out
+
 (* Map Core flag tokens (interpreter.cpp:2168 ScriptFlagNamesToEnum) to
    camlcoin's integer flag bitmask (lib/script.ml:116-139). Unknown token
    raises Failure so the driver records it as a shim error (skipped). *)
@@ -368,6 +377,143 @@ let process_checktx (j : Yojson.Safe.t) : string =
         | Ok () -> {|{"valid":true}|})
       else {|{"valid":true}|}
 
+(* op "connecttx" (Phase B connect-time ECONOMIC differential): drive
+   camlcoin's REAL connect-time Consensus::CheckTxInputs equivalent
+   (bitcoin-core/src/consensus/tx_verify.cpp:164-214) — the no-inflation rule
+   (value-in >= value-out, bad-txns-in-belowout) + per-input & running-sum
+   MoneyRange (bad-txns-inputvalues-outofrange) + coinbase maturity 100
+   (bad-txns-premature-spend-of-coinbase) + missing/spent inputs
+   (bad-txns-inputs-missingorspent).
+
+   CRITICAL per-impl wiring: camlcoin's `Validation.validate_tx_inputs` ALONE
+   returns total_in WITHOUT the value-in >= value-out no-inflation check
+   (driving it alone = a real inflation false-accept). So we drive the REAL
+   composite that connect-time validation actually uses:
+
+     valid  IFF  Validation.validate_tx_inputs = Ok            (maturity / MoneyRange / missing)
+             AND  Validation.calculate_tx_fee   = Some f        (the no-inflation Some/None: total_in>=total_out)
+             AND  Consensus.is_valid_money f                    (fee in MoneyRange)
+
+   We do NOT re-implement value-in>=out / maturity / missing in the shim — each
+   of the three real predicates is camlcoin's own consensus code, so a crafted
+   reject returning valid=true is a genuine camlcoin false-accept finding.
+
+   SCRIPT verification is isolated OUT (~skip_scripts:true on
+   validate_tx_inputs) so a script failure cannot mask the ECONOMIC verdict —
+   this op scores only the connect-time economic decision, exactly as Core's
+   CheckTxInputs is amount-only (script checks live in CheckInputScripts).
+
+   In-memory UTXO VIEW: one coin per prevout entry (value + height +
+   is_coinbase). The lookup is keyed on the prevout txid in Bitcoin DISPLAY
+   order; for each tx input we render its wire-order prevout txid back to
+   display via hash256_to_hex_display (reusing the verifytx prevout plumbing —
+   no reversal logic in the shim). An OMITTED prevout (absent from the view)
+   models a missing/spent input → lookup returns None → TxMissingInputs.
+
+   request:  {"op":"connecttx","tx_hex":"<segwit-aware>",
+              "prevouts":[{"txid":"<DISPLAY-hex>","vout":N,
+                           "scriptPubKey_hex":"<spk>","value_sats":<i64>,
+                           "height":<int coin.nHeight>,"is_coinbase":<bool>}],
+              "spend_height":<int nSpendHeight>}
+   response: {"valid":true,"fee_sats":<i64>}
+             {"valid":false,"reason":"<bad-txns-*>"}
+             {"error":"..."}   (could not evaluate -> driver SKIPS) *)
+let process_connecttx (j : Yojson.Safe.t) : string =
+  let member k = Yojson.Safe.Util.member k j in
+  let to_hex v = Yojson.Safe.Util.to_string v in
+  let to_int64 v =
+    match v with
+    | `Int i -> Int64.of_int i
+    | `Intlit s -> Int64.of_string s
+    | `Null -> 0L
+    | other -> Int64.of_string (Yojson.Safe.to_string other)
+  in
+  let to_int v =
+    match v with
+    | `Int i -> i
+    | `Intlit s -> int_of_string s
+    | `String s -> int_of_string s
+    | other -> failwith (Printf.sprintf "expected int, got %s" (Yojson.Safe.to_string other))
+  in
+  let to_bool v =
+    match v with
+    | `Bool b -> b
+    | `Int i -> i <> 0
+    | `Null -> false
+    | other -> failwith (Printf.sprintf "expected bool, got %s" (Yojson.Safe.to_string other))
+  in
+  let tx_bytes = hex_decode (to_hex (member "tx_hex")) in
+  let r = Serialize.reader_of_cstruct tx_bytes in
+  let tx = Serialize.deserialize_transaction r in
+  let spend_height = to_int (member "spend_height") in
+  (* Seed the in-memory UTXO view: one coin per prevout entry, keyed by
+     (DISPLAY-order txid hex, vout). Carries value + height + is_coinbase
+     (script_pubkey too, though scripts are skipped for this op). *)
+  let tbl : (string * int32, Validation.utxo) Hashtbl.t = Hashtbl.create 16 in
+  let prevouts_json =
+    match member "prevouts" with
+    | `List l -> l
+    | _ -> failwith "prevouts not a list"
+  in
+  List.iter
+    (fun p ->
+      let pm k = Yojson.Safe.Util.member k p in
+      let txid_hex = to_hex (pm "txid") in
+      let vout =
+        match pm "vout" with
+        | `Int i -> Int32.of_int i
+        | `Intlit s -> Int32.of_string s
+        | other -> Int32.of_string (Yojson.Safe.to_string other)
+      in
+      let spk = hex_decode (to_hex (pm "scriptPubKey_hex")) in
+      let value = to_int64 (pm "value_sats") in
+      let height = to_int (pm "height") in
+      let is_coinbase = to_bool (pm "is_coinbase") in
+      (* internal/wire txid for the utxo record (mirror display->wire) *)
+      let txid_wire = cstruct_rev (Types.hash256_of_hex txid_hex) in
+      let coin : Validation.utxo =
+        { txid = txid_wire; vout; value; script_pubkey = spk; height; is_coinbase }
+      in
+      Hashtbl.replace tbl (txid_hex, vout) coin)
+    prevouts_json;
+  (* UTXO lookup: render the incoming outpoint's wire-order txid back to
+     DISPLAY order (hash256_to_hex_display) and probe the view. Absent entry =>
+     None => missing/spent input (no reversal logic lives in the shim). *)
+  let lookup (op : Types.outpoint) : Validation.utxo option =
+    let key = (Types.hash256_to_hex_display op.Types.txid, op.Types.vout) in
+    Hashtbl.find_opt tbl key
+  in
+  (* REAL composite connect-time economic decision. skip_scripts:true isolates
+     the economic verdict from any script failure (Core CheckTxInputs is
+     amount-only). flags=0 is irrelevant under skip_scripts. *)
+  match
+    Validation.validate_tx_inputs tx ~lookup ~block_height:spend_height
+      ~flags:Script.script_verify_none ~skip_scripts:true ()
+  with
+  | Error TxMissingInputs ->
+      {|{"valid":false,"reason":"bad-txns-inputs-missingorspent"}|}
+  | Error TxOutputOverflow ->
+      {|{"valid":false,"reason":"bad-txns-inputvalues-outofrange"}|}
+  | Error (TxCoinbaseMaturity _) ->
+      {|{"valid":false,"reason":"bad-txns-premature-spend-of-coinbase"}|}
+  | Error e ->
+      (* any other validate_tx_inputs error: reject with the impl's own text *)
+      Printf.sprintf {|{"valid":false,"reason":"%s"}|}
+        (json_escape (Validation.tx_error_to_string e))
+  | Ok _total_in -> (
+      (* maturity / MoneyRange / missing all passed; now the no-inflation
+         (value-in >= value-out) Some/None gate + fee MoneyRange. *)
+      match Validation.calculate_tx_fee tx ~lookup with
+      | None ->
+          (* total_in < total_out (no-inflation violation), or a missing input
+             — but missing was already caught above, so this is belowout. *)
+          {|{"valid":false,"reason":"bad-txns-in-belowout"}|}
+      | Some fee ->
+          if not (Consensus.is_valid_money fee) then
+            {|{"valid":false,"reason":"bad-txns-in-belowout"}|}
+          else
+            Printf.sprintf {|{"valid":true,"fee_sats":%Ld}|} fee)
+
 (* op "nextwork" (Phase B PoW differential): drive camlcoin's REAL
    Consensus.get_next_work_required (the BlockIndex/chain-generic entrypoint
    at lib/consensus.ml:376 that does the retarget + off-by-one + clamps +
@@ -473,14 +619,6 @@ let process_nextwork (j : Yojson.Safe.t) : string =
    Types.hash256_to_hex_display for its prevout-map keys. The computed internal
    root is then reversed back to display order (hash256_to_hex_display) so it
    matches Core's header merkleroot. *)
-let cstruct_rev (c : Cstruct.t) : Cstruct.t =
-  let n = Cstruct.length c in
-  let out = Cstruct.create n in
-  for i = 0 to n - 1 do
-    Cstruct.set_uint8 out i (Cstruct.get_uint8 c (n - 1 - i))
-  done;
-  out
-
 let process_merkleroot (j : Yojson.Safe.t) : string =
   let member k = Yojson.Safe.Util.member k j in
   let txids_json =
@@ -531,6 +669,7 @@ let process (line : string) : string =
     | "verifyscript" -> process_verifyscript j
     | "verifytx" -> process_verifytx j
     | "checktx" -> process_checktx j
+    | "connecttx" -> process_connecttx j
     | "nextwork" -> process_nextwork j
     | "merkleroot" -> process_merkleroot j
     | "subsidy" -> process_subsidy j

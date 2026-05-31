@@ -988,11 +988,39 @@ let check_block ~network:(network : Consensus.network_config) (block : Types.blo
    Context-Free Block Header Validation
    ============================================================================ *)
 
-(* Check block header without full chain context *)
-let check_block_header (header : Types.block_header) : (unit, string) result =
-  (* Check that timestamp is not too far in the future *)
-  let max_future_time = Int32.add (Int32.of_float (Unix.time ())) 7200l in  (* 2 hours *)
-  if header.timestamp > max_future_time then
+(* Check block header without full chain context.
+
+   [current_time] injects the adjusted-network-time "now" the time-too-new gate
+   measures against (Core ContextualCheckBlockHeader:4108, against
+   GetAdjustedTime()). It is an [int32 option]:
+     - None    (the DEFAULT, every existing production caller) — use the wall
+               clock (Unix.time ()), byte-identical to the original behavior.
+     - Some 0l (harness sentinel) — DISABLE the time-too-new gate (vector is
+               not exercising it), matching the rustoshi/blockbrew header
+               differential contract.
+     - Some t  (t<>0l) — measure against the deterministic injected clock t.
+   Default-preserving: with the argument omitted the branch below is exactly
+   the prior `Int32.add (Int32.of_float (Unix.time ())) 7200l` test.
+   Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4108
+   (block.GetBlockTime() > now + MAX_FUTURE_BLOCK_TIME). *)
+let check_block_header ?(current_time : int32 option) (header : Types.block_header)
+    : (unit, string) result =
+  (* Check that timestamp is not too far in the future. *)
+  let future_violation =
+    match current_time with
+    | None ->
+        (* Production default: wall clock (preserves original behavior). *)
+        let max_future_time = Int32.add (Int32.of_float (Unix.time ())) 7200l in
+        header.timestamp > max_future_time
+    | Some 0l ->
+        (* Harness sentinel: time-too-new disabled. *)
+        false
+    | Some now ->
+        (* Deterministic injected clock. *)
+        let max_future_time = Int32.add now 7200l in
+        header.timestamp > max_future_time
+  in
+  if future_violation then
     Error "Block timestamp too far in future"
   else begin
     (* Check proof of work *)

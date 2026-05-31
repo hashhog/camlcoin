@@ -1187,6 +1187,153 @@ let process_reorg (j : Yojson.Safe.t) : string =
     end
   end
 
+(* op "checkheader" (Phase B HEADER-LEVEL reject differential): drive camlcoin's
+   REAL header-acceptance gates over an EXPLICIT (header, prev-context) tuple —
+   never the live tip / wall clock. This is the header-only differential the
+   `checkblock` op cannot reach: `checkblock` synthesizes median_time = ts-1 to
+   keep the time gates NON-binding and passes the block's OWN bits as
+   expected_bits (a diffbits tautology), so bad-diffbits / time-too-old /
+   time-too-new / timewarp / bad-version are otherwise un-exercised at HEADER
+   level. This op makes each its own scored gate. MECHANISM: extend-checkblock —
+   the very same camlcoin consensus primitives `check_block` invokes
+   (validation.ml:808-985), driven directly in Core's CheckBlockHeader +
+   ContextualCheckBlockHeader order so no header rule is reimplemented in the
+   shim. A crafted reject coming back accept=true is a genuine camlcoin
+   header-level false-accept finding.
+
+   GATE ORDER (Core validation.cpp):
+     Stage 1 (CheckBlockHeader -> CheckProofOfWork, validation.cpp:3831):
+       high-hash via camlcoin's STRICT `Consensus.check_proof_of_work`
+       (consensus.ml:469 — the DeriveTarget twin that rejects
+       negative/overflow/zero/target>powLimit AND hash>target, folding all into
+       the single bip22 token "high-hash"). NOT the looser `hash_meets_target`
+       (consensus.ml:243), which only tests hash<=target and would MISS the
+       target>powLimit row. Gated by skip_pow (default false here — exercising
+       high-hash is the whole point, unlike checkblock's mutated bodies).
+     Stage 2 (ContextualCheckBlockHeader):
+       (a) bad-diffbits @4088 (FIRST contextual gate): header.bits must equal
+           expected_bits = camlcoin's OWN `Consensus.get_next_work_required`
+           over the prev-context (consensus.ml:376) — the REAL retarget fn the
+           `nextwork` op differentially tests, now at DECISION level. An explicit
+           "expected_bits" override is honored (retarget-boundary rows that
+           isolate a different gate). This is the FLAGSHIP false-accept guard:
+           camlcoin's check_block compares against whatever expected_bits its
+           CALLER computes, so the false-accept hole only exists if a caller
+           passes the block's own bits; here the shim computes the REAL expected.
+       (b) time-too-old @4092: header.timestamp <= mtp (prev's 11-ancestor MTP).
+       (c) BIP-94 timewarp @4097: `Consensus.check_timewarp_rule` (consensus.ml:836
+           — testnet4 enforce_bip94 only; first-interval-block ts < prev-600).
+       (d) time-too-new @4108 (WALL CLOCK in production): header.timestamp >
+           current_time + 7200. current_time is INJECTED (sentinel 0 disables);
+           this is the only gate using the flag-gated current_time added to
+           `Validation.check_block_header` (validation.ml:1006). We compute it
+           inline here (the same > now+7200 test) so the header op scores it as a
+           distinct gate in Core's position rather than ahead of bad-version.
+       (e) bad-version @4112: v<2 post-BIP34 / v<3 post-BIP66 / v<4 post-BIP65,
+           the exact triple `check_block` enforces (validation.ml:831-836).
+
+   request:  {"op":"checkheader","network":"mainnet|testnet4|regtest|...",
+              "header_hex":"<80-byte header>","height":<int>,
+              "prev":{"bits":"<8hex>","time":<u32>,"hash":"<display-hex>"},
+              "first":{"height":<int>,"time":<u32>,"bits":"<8hex>"}  // opt; boundary
+              "mtp":<u32 median-time-past of prev's 11 ancestors>,
+              "current_time":<u64; 0 = disable time-too-new (sentinel)>,
+              "skip_pow":<bool; false = exercise high-hash, true = bypass>,
+              "expected_bits":"<8hex>"}  // opt override; else GetNextWorkRequired
+   response: {"accept":true} | {"accept":false,"reason":"<bip22 token>"} *)
+let process_checkheader (j : Yojson.Safe.t) : string =
+  let member k = Yojson.Safe.Util.member k j in
+  let to_hex v = Yojson.Safe.Util.to_string v in
+  let network =
+    network_of_string (to_hex (member "network")) in
+  let header_bytes = hex_decode (to_hex (member "header_hex")) in
+  if Cstruct.length header_bytes <> 80 then
+    failwith (Printf.sprintf "header_hex not 80 bytes: %d" (Cstruct.length header_bytes));
+  let r = Serialize.reader_of_cstruct header_bytes in
+  let header = Serialize.deserialize_block_header r in
+  let height = json_to_int (member "height") in
+  (* current_time: 0 = disable time-too-new (sentinel), else injected clock. *)
+  let current_time =
+    match member "current_time" with
+    | `Null -> 0l
+    | v -> json_to_u32 v
+  in
+  (* skip_pow defaults FALSE for checkheader (exercise high-hash). *)
+  let skip_pow =
+    match member "skip_pow" with `Bool b -> b | `Int i -> i <> 0 | _ -> false
+  in
+  let prev = member "prev" in
+  let pm k = Yojson.Safe.Util.member k prev in
+  let prev_bits = bits_of_hex (to_hex (pm "bits")) in
+  let prev_time = json_to_u32 (pm "time") in
+  let mtp =
+    match member "mtp" with `Null -> 0l | v -> json_to_u32 v
+  in
+
+  (* ---- Stage 1: high-hash (STRICT CheckProofOfWork) ----
+     consensus.ml:469 folds target>powLimit / negative / overflow / zero /
+     hash>target all into a single reject -> "high-hash". *)
+  let block_hash = Crypto.compute_block_hash header in
+  if (not skip_pow)
+     && not (Consensus.check_proof_of_work block_hash header.Types.bits network)
+  then {|{"accept":false,"reason":"high-hash"}|}
+  else begin
+    (* ---- expected_bits = GetNextWorkRequired(prev) (or explicit override) ---- *)
+    let expected_bits =
+      match member "expected_bits" with
+      | `Null ->
+          (* Build height -> (time, bits) table from prev (+ first if boundary).
+             For off-boundary mainnet/regtest rows get_next_work_required returns
+             prev_bits without consulting the table; the `first` entry only matters
+             at retarget boundaries (which the corpus isolates via the override). *)
+          let tbl : (int, int32 * int32) Hashtbl.t = Hashtbl.create 4 in
+          Hashtbl.replace tbl (height - 1) (prev_time, prev_bits);
+          (match member "first" with
+           | `Null -> ()
+           | first ->
+               let fm k = Yojson.Safe.Util.member k first in
+               let f_height = json_to_int (fm "height") in
+               let f_time = json_to_u32 (fm "time") in
+               let f_bits = bits_of_hex (to_hex (fm "bits")) in
+               Hashtbl.replace tbl f_height (f_time, f_bits));
+          let get_block_info (h : int) : int32 * int32 =
+            match Hashtbl.find_opt tbl h with
+            | Some v -> v
+            | None -> failwith (Printf.sprintf "no block info at height %d" h)
+          in
+          Consensus.get_next_work_required ~height ~block_time:header.Types.timestamp
+            ~prev_block_time:prev_time ~prev_bits ~get_block_info ~network
+      | v -> bits_of_hex (to_hex v)
+    in
+
+    (* ---- Stage 2: ContextualCheckBlockHeader, in Core order ---- *)
+    (* (a) bad-diffbits @4088 — the FLAGSHIP false-accept guard. *)
+    if header.Types.bits <> expected_bits then
+      {|{"accept":false,"reason":"bad-diffbits"}|}
+    (* (b) time-too-old @4092 *)
+    else if header.Types.timestamp <= mtp then
+      {|{"accept":false,"reason":"time-too-old"}|}
+    (* (c) BIP-94 timewarp @4097 (testnet4 enforce_bip94) *)
+    else if not (Consensus.check_timewarp_rule ~height
+                   ~header_time:header.Types.timestamp
+                   ~prev_block_time:prev_time ~network) then
+      {|{"accept":false,"reason":"time-timewarp-attack"}|}
+    (* (d) time-too-new @4108 (injected current_time; 0 sentinel disables) *)
+    else if (not (Int32.equal current_time 0l))
+            && header.Types.timestamp > Int32.add current_time 7200l then
+      {|{"accept":false,"reason":"time-too-new"}|}
+    (* (e) bad-version @4112 (v<2 post-BIP34 / v<3 post-BIP66 / v<4 post-BIP65) *)
+    else if (height >= network.Consensus.bip34_height
+             && Int32.compare header.Types.version 2l < 0)
+            || (height >= network.Consensus.bip66_height
+                && Int32.compare header.Types.version 3l < 0)
+            || (height >= network.Consensus.bip65_height
+                && Int32.compare header.Types.version 4l < 0) then
+      Printf.sprintf {|{"accept":false,"reason":"bad-version(0x%08lx)"}|}
+        header.Types.version
+    else {|{"accept":true}|}
+  end
+
 let process (line : string) : string =
   try
     let j = Yojson.Safe.from_string line in
@@ -1202,6 +1349,7 @@ let process (line : string) : string =
     | "connecttx" -> process_connecttx j
     | "checkblock" -> process_checkblock j
     | "reorg" -> process_reorg j
+    | "checkheader" -> process_checkheader j
     | "nextwork" -> process_nextwork j
     | "merkleroot" -> process_merkleroot j
     | "subsidy" -> process_subsidy j

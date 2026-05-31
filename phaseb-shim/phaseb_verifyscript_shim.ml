@@ -503,6 +503,22 @@ let process_merkleroot (j : Yojson.Safe.t) : string =
   let root_display = Types.hash256_to_hex_display root_internal in
   Printf.sprintf {|{"root":"%s","mutated":%b}|} root_display mutated
 
+(* op "subsidy" (Phase B block-subsidy differential): drive camlcoin's REAL
+   block-subsidy fn (Consensus.block_subsidy_for_network, lib/consensus.ml:93)
+   at MAINNET params (halving interval 210000) — the same fn block validation
+   uses for the coinbase cap. We do NOT re-implement the halving schedule here,
+   so a halving-boundary off-by-one or missing >=64 zero-guard in the impl
+   surfaces directly.
+
+   request:  {"op":"subsidy","height":<int>}
+   response: {"subsidy_sats":<int>}   (the impl's REAL subsidy in satoshis)
+             {"error":"..."}          (could not compute -> driver SKIPS) *)
+let process_subsidy (j : Yojson.Safe.t) : string =
+  let member k = Yojson.Safe.Util.member k j in
+  let height = json_to_int (member "height") in
+  let subsidy = Consensus.block_subsidy_for_network Consensus.Mainnet height in
+  Printf.sprintf {|{"subsidy_sats":%Ld}|} subsidy
+
 let process (line : string) : string =
   try
     let j = Yojson.Safe.from_string line in
@@ -517,6 +533,7 @@ let process (line : string) : string =
     | "checktx" -> process_checktx j
     | "nextwork" -> process_nextwork j
     | "merkleroot" -> process_merkleroot j
+    | "subsidy" -> process_subsidy j
     | other -> Printf.sprintf {|{"error":"unknown op: %s"}|} (json_escape other)
   with
   | Failure msg -> Printf.sprintf {|{"error":"%s"}|} (json_escape msg)

@@ -657,6 +657,149 @@ let process_subsidy (j : Yojson.Safe.t) : string =
   let subsidy = Consensus.block_subsidy_for_network Consensus.Mainnet height in
   Printf.sprintf {|{"subsidy_sats":%Ld}|} subsidy
 
+(* op "checkblock" (Phase B VALIDATE-ONLY block differential): generalizes
+   `connecttx` from a single tx to a FULL BLOCK. Drives camlcoin's REAL
+   block-acceptance pipeline end to end:
+
+     CheckBlock(check_pow = not skip_pow)        (structural + contextual gates)
+       -> ContextualCheckBlock(spend_height)     (IsFinalTx, witness commitment, ...)
+         -> ConnectBlock(spend_height, seeded-view) with REAL scripts
+            (skip_scripts:false) + the block's OWN coinbase + MAINNET params.
+
+   This is exactly `Validation.accept_block`, which folds all three layers into
+   `validate_block_with_utxos`. We do NOT re-implement any block rule in the
+   shim — a crafted mutant returning valid=true is a genuine camlcoin
+   false-accept finding, and the real block rejecting is a genuine false-reject.
+
+   MAINNET params (NOT regtest): regtest's halving interval (150) breaks
+   bad-cb-amount and its soft-fork activation heights collapse to 1, which would
+   change the bad-cb-height / version / witness verdicts. spend_height 709742 is
+   post-Taproot so every mainnet deployment is active.
+
+   skip_pow:true is REQUIRED here: the corpus block_hex is the FINAL/mutated
+   block, which no longer meets mainnet's PoW target. With skip_pow false, EVERY
+   case (real + 9 mutants) would reject on the PoW hash gate before any body gate
+   runs — a silent DEAD-GATE. skip_pow gates ONLY the hash<=target test
+   (Core CheckBlock fCheckPOW), never the expected_bits difficulty-equality rule.
+
+   block_hex is validated AS-IS (we deserialize with camlcoin's own segwit-aware
+   deserializer; the merkle root is NOT recomputed — the block's stored header
+   merkle_root is checked against the txs by check_block, which is precisely how
+   bad-txnmrklroot / bad-witness-merkle-match are caught).
+
+   UTXO VIEW: identical seeding plumbing to `connecttx` — one coin per prevout
+   entry (value + height + is_coinbase + scriptPubKey, NOW USED because
+   skip_scripts:false), keyed by (DISPLAY-order txid hex, vout). The lookup
+   renders each incoming wire-order outpoint txid back to display via
+   hash256_to_hex_display; an OMITTED prevout => None => missing input. This is
+   passed as accept_block's ~base_lookup.
+
+   request:  {"op":"checkblock","block_hex":"<FINAL block bytes>",
+              "prevouts":[{"txid":"<DISPLAY-hex>","vout":N,
+                           "scriptPubKey_hex":"<spk>","value_sats":<u64>,
+                           "height":<int>,"is_coinbase":<bool>}...one per
+                          NON-COINBASE input across all non-coinbase txs],
+              "spend_height":709742,"skip_pow":true,"skip_scripts":false}
+   response: {"valid":true} | {"valid":false,"reason":"<advisory>"} | {"error":".."}
+*)
+let process_checkblock (j : Yojson.Safe.t) : string =
+  let member k = Yojson.Safe.Util.member k j in
+  let to_hex v = Yojson.Safe.Util.to_string v in
+  let to_int64 v =
+    match v with
+    | `Int i -> Int64.of_int i
+    | `Intlit s -> Int64.of_string s
+    | `Null -> 0L
+    | other -> Int64.of_string (Yojson.Safe.to_string other)
+  in
+  let to_int v =
+    match v with
+    | `Int i -> i
+    | `Intlit s -> int_of_string s
+    | `String s -> int_of_string s
+    | other -> failwith (Printf.sprintf "expected int, got %s" (Yojson.Safe.to_string other))
+  in
+  let to_bool v =
+    match v with
+    | `Bool b -> b
+    | `Int i -> i <> 0
+    | `Null -> false
+    | other -> failwith (Printf.sprintf "expected bool, got %s" (Yojson.Safe.to_string other))
+  in
+  let to_bool_default v d =
+    match v with `Null -> d | other -> to_bool other
+  in
+  (* Deserialize the FINAL block AS-IS with camlcoin's segwit-aware reader. *)
+  let block_bytes = hex_decode (to_hex (member "block_hex")) in
+  let r = Serialize.reader_of_cstruct block_bytes in
+  let block = Serialize.deserialize_block r in
+  let spend_height = to_int (member "spend_height") in
+  let skip_pow = to_bool_default (member "skip_pow") true in
+  let skip_scripts = to_bool_default (member "skip_scripts") false in
+  (* Seed the in-memory UTXO view: one coin per prevout entry, keyed by
+     (DISPLAY-order txid hex, vout). Identical plumbing to process_connecttx. *)
+  let tbl : (string * int32, Validation.utxo) Hashtbl.t = Hashtbl.create 1024 in
+  let prevouts_json =
+    match member "prevouts" with
+    | `List l -> l
+    | _ -> failwith "prevouts not a list"
+  in
+  List.iter
+    (fun p ->
+      let pm k = Yojson.Safe.Util.member k p in
+      let txid_hex = to_hex (pm "txid") in
+      let vout =
+        match pm "vout" with
+        | `Int i -> Int32.of_int i
+        | `Intlit s -> Int32.of_string s
+        | other -> Int32.of_string (Yojson.Safe.to_string other)
+      in
+      let spk = hex_decode (to_hex (pm "scriptPubKey_hex")) in
+      let value = to_int64 (pm "value_sats") in
+      let height = to_int (pm "height") in
+      let is_coinbase = to_bool (pm "is_coinbase") in
+      let txid_wire = cstruct_rev (Types.hash256_of_hex txid_hex) in
+      let coin : Validation.utxo =
+        { txid = txid_wire; vout; value; script_pubkey = spk; height; is_coinbase }
+      in
+      Hashtbl.replace tbl (txid_hex, vout) coin)
+    prevouts_json;
+  (* base_lookup: render the incoming outpoint's wire-order txid back to DISPLAY
+     order and probe the seeded view. Absent => None => missing input. *)
+  let base_lookup (op : Types.outpoint) : Validation.utxo option =
+    let key = (Types.hash256_to_hex_display op.Types.txid, op.Types.vout) in
+    Hashtbl.find_opt tbl key
+  in
+  (* expected_bits = the block's OWN header bits (the difficulty-target equality
+     rule is satisfied trivially; skip_pow only drops the hash<=target test). *)
+  let expected_bits = block.Types.header.bits in
+  (* MAINNET consensus flags at spend_height (post-Taproot: all forks active). *)
+  let flags = Consensus.get_block_script_flags spend_height Consensus.mainnet in
+  (* median_time (= the prev block's GetMedianTimePast). Not supplied by the
+     corpus, so we synthesize a faithful value: ONE SECOND below the block's own
+     timestamp. Two camlcoin gates consume median_time:
+       (a) the time-too-old gate (block.timestamp <= median_time) — Core's
+           ContextualCheckBlockHeader rule; MTP is strictly < a valid block's
+           time, so timestamp-1 keeps this NON-binding (real block passes) while
+           NOT being self-referential (which `= timestamp` would be, tripping
+           the <= and spuriously rejecting EVERY case before any body gate).
+       (b) the BIP-113 IsFinalTx lock_time_cutoff (CSV active at 709742) — Core's
+           MTP at this height sits just below the block time, so timestamp-1
+           keeps the real already-mined final txs final (no spurious
+           TxNonFinalLocktime), exactly matching mainnet semantics.
+     This makes the time gates non-binding so the body verdict (the 9 mutants)
+     is what gets scored, never masked by a synthetic time rejection. *)
+  let median_time = Int32.sub block.Types.header.timestamp 1l in
+  match
+    Validation.accept_block ~network:Consensus.mainnet ~block
+      ~height:spend_height ~expected_bits ~median_time ~base_lookup ~flags
+      ~skip_scripts ~skip_pow ()
+  with
+  | Validation.AB_ok _ -> {|{"valid":true}|}
+  | Validation.AB_err e ->
+      Printf.sprintf {|{"valid":false,"reason":"%s"}|}
+        (json_escape (Validation.block_error_to_string e))
+
 let process (line : string) : string =
   try
     let j = Yojson.Safe.from_string line in
@@ -670,6 +813,7 @@ let process (line : string) : string =
     | "verifytx" -> process_verifytx j
     | "checktx" -> process_checktx j
     | "connecttx" -> process_connecttx j
+    | "checkblock" -> process_checkblock j
     | "nextwork" -> process_nextwork j
     | "merkleroot" -> process_merkleroot j
     | "subsidy" -> process_subsidy j

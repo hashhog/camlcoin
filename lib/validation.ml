@@ -808,6 +808,7 @@ let is_tx_final (tx : Types.transaction) ~(block_height : int) ~(block_time : in
 let check_block ~network:(network : Consensus.network_config) (block : Types.block) (height : int)
     ~(expected_bits : int32) ~(median_time : int32)
     ?(prev_block_time = 0l)
+    ?(skip_pow = false)
     ()
     : (unit, block_validation_error) result =
   let txs = block.transactions in
@@ -839,9 +840,18 @@ let check_block ~network:(network : Consensus.network_config) (block : Types.blo
         if block.header.bits <> expected_bits then
           Error BlockBadDifficulty
         else begin
-          (* Check that block hash meets target *)
+          (* Check that block hash meets target.
+             skip_pow mirrors Bitcoin Core's CheckBlock(..., fCheckPOW)
+             (validation.cpp CheckBlockHeader -> CheckProofOfWork). The
+             fCheckPOW parameter defaults true (PoW enforced); a false value
+             skips ONLY the proof-of-work hash<=target test (the
+             expected_bits/difficulty-target equality check above is the
+             ContextualCheckBlockHeader rule and is NOT gated by fCheckPOW).
+             Default skip_pow=false preserves current behavior for all
+             existing callers. *)
           let block_hash = Crypto.compute_block_hash block.header in
-          if not (Consensus.hash_meets_target block_hash block.header.bits) then
+          if (not skip_pow)
+             && not (Consensus.hash_meets_target block_hash block.header.bits) then
             Error BlockBadDifficulty
           else begin
             (* Check timestamp is after median time past (time-too-old).
@@ -1490,7 +1500,7 @@ let bip30_should_enforce
 let validate_block_with_utxos ~network:(network : Consensus.network_config) (block : Types.block) (height : int)
     ~(expected_bits : int32) ~(median_time : int32)
     ~(base_lookup : utxo_lookup) ~(flags : int)
-    ?(skip_scripts=false) ?(prev_block_time = 0l) ?get_mtp_at_height ?bip34_height_hash ()
+    ?(skip_scripts=false) ?(skip_pow=false) ?(prev_block_time = 0l) ?get_mtp_at_height ?bip34_height_hash ()
     : ((int64 * Types.hash256 array * (Types.outpoint * utxo) list), block_validation_error) result =
 
   (* W93 Bug 5/6 fix: BIP-68 SequenceLocks and BIP-113 IsFinalTx are
@@ -1530,7 +1540,7 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
        Calling check_block here restores parity: CheckBlock runs on
        BOTH paths; only the inner script verification is skipped. *)
     match check_block ~network block height ~expected_bits ~median_time
-            ~prev_block_time () with
+            ~prev_block_time ~skip_pow () with
     | Error e -> Error e
     | Ok () ->
     let txs = block.transactions in
@@ -1812,7 +1822,7 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
      ==================================================================== *)
   else begin
   (* First do context-free + contextual header checks *)
-  match check_block ~network block height ~expected_bits ~median_time ~prev_block_time () with
+  match check_block ~network block height ~expected_bits ~median_time ~prev_block_time ~skip_pow () with
   | Error e -> Error e
   | Ok () ->
     (* Build local UTXO set for intra-block spending *)
@@ -2109,6 +2119,7 @@ let accept_block
     ~(base_lookup : utxo_lookup)
     ~(flags : int)
     ?(skip_scripts = false)
+    ?(skip_pow = false)
     ?(prev_block_time = 0l)
     ?get_mtp_at_height
     ?bip34_height_hash
@@ -2116,7 +2127,7 @@ let accept_block
     : accept_block_result =
   match validate_block_with_utxos ~network block height
           ~expected_bits ~median_time ~prev_block_time
-          ~base_lookup ~flags ~skip_scripts
+          ~base_lookup ~flags ~skip_scripts ~skip_pow
           ?get_mtp_at_height ?bip34_height_hash () with
   | Ok (fees, txid_arr, spent_utxos) ->
     AB_ok (fees, txid_arr, spent_utxos)

@@ -3673,6 +3673,7 @@ let disconnect_block_into_batch
    disconnect step (or created by an earlier connect step) is found
    without an intermediate disk flush. *)
 let connect_block_into_batch
+    ?(skip_pow = false)
     (ibd : ibd_state) (batch : Storage.ChainDB.batch)
     (view : reorg_view)
     (entry : header_entry)
@@ -3728,10 +3729,20 @@ let connect_block_into_batch
       if skip_scripts then 0
       else Consensus.get_block_script_flags height state.network
     in
+    (* [skip_pow] mirrors Bitcoin Core's CheckBlock(..., fCheckPOW) parameter
+       (validation.cpp CheckBlockHeader -> CheckProofOfWork). It gates ONLY the
+       block-hash <= target proof-of-work test, NOT the expected_bits
+       difficulty-equality rule (which remains enforced via [expected_bits]
+       above). Default [false] preserves the production reorg path exactly
+       (the live caller [reorganize] never passes it, so PoW stays enforced on
+       every real reorg-connected block). It exists so an out-of-band
+       differential harness can drive [connect_block_into_batch] over
+       crafted-synthetic blocks whose nonce was not mined to the network
+       target. *)
     (match Validation.accept_block
              ~network:state.network ~block ~height
              ~expected_bits ~median_time ~prev_block_time ~base_lookup:lookup
-             ~flags:validation_flags ~skip_scripts
+             ~flags:validation_flags ~skip_scripts ~skip_pow
              ~get_mtp_at_height:(get_mtp_for_height state)
              ?bip34_height_hash:(bip34_height_hash_for state) () with
      | Validation.AB_err e ->

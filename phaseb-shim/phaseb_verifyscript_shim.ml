@@ -29,6 +29,9 @@ module Crypto = Camlcoin.Crypto
 module Serialize = Camlcoin.Serialize
 module Validation = Camlcoin.Validation
 module Consensus = Camlcoin.Consensus
+module Sync = Camlcoin.Sync
+module Utxo = Camlcoin.Utxo
+module Storage = Camlcoin.Storage
 
 (* hex string -> Cstruct.t *)
 let hex_decode (s : string) : Cstruct.t =
@@ -800,6 +803,367 @@ let process_checkblock (j : Yojson.Safe.t) : string =
       Printf.sprintf {|{"valid":false,"reason":"%s"}|}
         (json_escape (Validation.block_error_to_string e))
 
+(* op "reorg" (Phase B deterministic side-branch re-validation differential):
+   drive camlcoin's REAL reorg machinery (lib/sync.ml) over an explicit,
+   seeded chain-state — NEVER the live tip / first-seen / nSequenceId race.
+   The most-work DECISION, the fork-point coins-VIEW, and the per-block UNDO
+   are supplied as EXPLICIT DATA, exactly the inputs that eliminate the race.
+
+   Three phases, driving the REAL functions [reorganize] orchestrates:
+     (1) work-compare: Consensus.work_compare (pure 256-bit comparator) STRICT
+         new>old; else outcome=no-reorg-equal-or-less-work, view untouched.
+     (2) depth cap: Sync.max_reorg_depth (=100) on disconnect/connect spans
+         (Sync.reorganize bounds both halves; >cap => reorg-too-deep).
+     (3) disconnect phase (tip-first): REAL Sync.disconnect_block_into_batch
+         per old-branch block — Core DisconnectBlock + ApplyTxInUndo, 4-field
+         coin-identity check, BIP30 91722/91812 exemption, tri-valued
+         disconnect_result (ok/unclean/failed).
+     (4) connect phase (in order): REAL Sync.connect_block_into_batch per
+         side-branch block at THAT block's OWN height — full Validation.accept_block
+         re-validation (scripts ON, economics, per-height flags). Stop at the
+         FIRST reject; connected_count = blocks that passed before it.
+
+   We seed a REAL Storage.ChainDB (temp dir) with: the fork_utxo coins (the
+   WORKING coins-view), each disconnect block's body + undo blob, and each
+   connect block's body. We then drive disconnect/connect over the REAL
+   Sync.reorg_view overlay, whose [base_lookup] reads the overlay first then
+   falls through to the seeded ChainDB — identical to the production path.
+
+   work hex is 32B BIG-ENDIAN per the corpus contract; camlcoin stores work
+   little-endian (header_entry.total_work, "32-byte LE") and Consensus.work_compare
+   delegates to target_compare which reads index 31 down as MSB (LE). So we
+   reverse BE->LE before comparing — semantically faithful to camlcoin's own work.
+
+   skip_pow:true is REQUIRED on the connect path: the corpus blocks are
+   crafted-synthetic (nonce not mined to even the easy regtest target), so with
+   PoW enforced every connect block would reject on the hash<=target gate
+   before any body gate runs (a silent DEAD-GATE). skip_pow gates ONLY the
+   hash<=target test; expected_bits difficulty-equality stays enforced (regtest
+   pow_no_retargeting => expected_bits = parent bits = pow_limit = the crafted
+   block's own bits, so it passes trivially). This mirrors the checkblock op's
+   existing skip_pow:true rationale and Core's CheckBlock fCheckPOW.
+
+   digest = sha256 of the FINAL coins-view, canonicalized BYTE-IDENTICAL to the
+   rustoshi driver's view_digest: sort by (txid wire-bytes, vout), then per coin
+     txid[32] || vout u32 LE || height u32 LE || is_coinbase u8 || value u64 LE
+     || spk_len u32 LE || spk
+   The final coins-view = seeded fork_utxo with the reorg_view overlay applied
+   (view_deletes removed, view_writes added/overwritten). *)
+
+(* Map camlcoin's structured block-validation error (returned by the REAL
+   Validation.accept_block inside connect_block_into_batch, wrapped by the
+   "Block validation failed ...: <str>" message) to a canonical Core reject
+   token. connect_block_into_batch returns a [string] error, so we re-derive
+   the canonical token from the embedded camlcoin error text — but to stay
+   robust we match on substrings of the impl's own error strings
+   (validation.ml tx_error_to_string / block_error_to_string). The decision is
+   what is scored; reject_reason is advisory. *)
+let str_contains (hay : string) (needle : string) : bool =
+  let nl = String.length needle and hl = String.length hay in
+  if nl = 0 then true
+  else if nl > hl then false
+  else begin
+    let found = ref false in
+    let i = ref 0 in
+    while (not !found) && !i <= hl - nl do
+      if String.sub hay !i nl = needle then found := true;
+      incr i
+    done;
+    !found
+  end
+
+let reorg_reject_reason (e : string) : string =
+  let has sub = str_contains e sub in
+  if has "coinbase value too high" then "bad-cb-amount"
+  else if has "script verification failed" then "block-script-verify-flag-failed"
+  else if has "references missing inputs" then "bad-txns-inputs-missingorspent"
+  else if has "immature coinbase" then "bad-txns-premature-spend-of-coinbase"
+  else if has "duplicate inputs" then "bad-txns-inputs-duplicate"
+  else if has "BIP30" then "bad-txns-BIP30"
+  else if has "sequence locks" then "bad-txns-nonfinal"
+  else if has "total output value overflow" then "bad-txns-inputvalues-outofrange"
+  else if has "fee is insufficient" then "bad-txns-in-belowout"
+  else e  (* fall through: emit the impl's own text (advisory) *)
+
+(* SHA-256 via camlcoin's own primitive (single, not double — this is a
+   coins-view digest, not a Bitcoin hash). *)
+let sha256_hex (data : Cstruct.t) : string =
+  Types.hash256_to_hex_display (cstruct_rev (Crypto.sha256 data))
+(* NOTE: hash256_to_hex_display reverses; we pre-reverse so the emitted hex is
+   the straight (non-reversed) sha256 digest hex, matching Python hexdigest. *)
+
+(* A coin in the canonical-digest sense: wire-order txid + fields. *)
+type digest_coin = {
+  dc_txid_wire : Cstruct.t;   (* 32 bytes, wire order *)
+  dc_vout : int;
+  dc_height : int;
+  dc_is_coinbase : bool;
+  dc_value : int64;
+  dc_spk : Cstruct.t;
+}
+
+let canonical_view_digest (coins : digest_coin list) : string =
+  let sorted =
+    List.sort (fun a b ->
+        let c = compare (Cstruct.to_string a.dc_txid_wire)
+                  (Cstruct.to_string b.dc_txid_wire) in
+        if c <> 0 then c else compare a.dc_vout b.dc_vout)
+      coins
+  in
+  let w = Serialize.writer_create () in
+  List.iter (fun c ->
+      Serialize.write_bytes w c.dc_txid_wire;          (* txid[32] wire *)
+      Serialize.write_int32_le w (Int32.of_int c.dc_vout);
+      Serialize.write_int32_le w (Int32.of_int c.dc_height);
+      Serialize.write_uint8 w (if c.dc_is_coinbase then 1 else 0);
+      Serialize.write_int64_le w c.dc_value;
+      Serialize.write_int32_le w (Int32.of_int (Cstruct.length c.dc_spk));
+      Serialize.write_bytes w c.dc_spk
+    ) sorted;
+  sha256_hex (Serialize.writer_to_cstruct w)
+
+let process_reorg (j : Yojson.Safe.t) : string =
+  let member k = Yojson.Safe.Util.member k j in
+  let to_hex v = Yojson.Safe.Util.to_string v in
+  let to_int64 v =
+    match v with
+    | `Int i -> Int64.of_int i
+    | `Intlit s -> Int64.of_string s
+    | `Null -> 0L
+    | other -> Int64.of_string (Yojson.Safe.to_string other)
+  in
+  let to_int v =
+    match v with
+    | `Int i -> i
+    | `Intlit s -> int_of_string s
+    | `String s -> int_of_string s
+    | other -> failwith (Printf.sprintf "expected int, got %s" (Yojson.Safe.to_string other))
+  in
+  let to_bool v =
+    match v with
+    | `Bool b -> b
+    | `Int i -> i <> 0
+    | `Null -> false
+    | other -> failwith (Printf.sprintf "expected bool, got %s" (Yojson.Safe.to_string other))
+  in
+  let list_of = function `List l -> l | `Null -> [] | _ -> failwith "expected list" in
+  let network =
+    match member "network" with
+    | `String s -> network_of_string s
+    | _ -> Consensus.regtest
+  in
+  (* --- parse a coin spec {txid(display),vout,scriptPubKey_hex,value_sats,
+         height,is_coinbase} into a (wire-txid, vout, Validation.utxo) --- *)
+  let parse_coin (p : Yojson.Safe.t) : Types.hash256 * int * Validation.utxo =
+    let pm k = Yojson.Safe.Util.member k p in
+    let txid_hex = to_hex (pm "txid") in
+    let vout = to_int (pm "vout") in
+    let spk = hex_decode (to_hex (pm "scriptPubKey_hex")) in
+    let coin_value = to_int64 (pm "value_sats") in
+    let coin_height = to_int (pm "height") in
+    let coin_is_cb = to_bool (pm "is_coinbase") in
+    let txid_wire = cstruct_rev (Types.hash256_of_hex txid_hex) in
+    (txid_wire, vout,
+     { Validation.txid = txid_wire; vout = Int32.of_int vout;
+       value = coin_value; script_pubkey = spk;
+       height = coin_height; is_coinbase = coin_is_cb })
+  in
+  (* --- (1) work-compare decision (BE hex -> LE cstruct) --- *)
+  let work_le hexk =
+    match member hexk with
+    | `String s -> cstruct_rev (Types.hash256_of_hex s)
+    | _ -> failwith (Printf.sprintf "missing %s" hexk)
+  in
+  let old_work = work_le "old_tip_work_hex" in
+  let new_work = work_le "new_tip_work_hex" in
+  (* Seed coin specs (the WORKING coins-view) regardless of branch, so the
+     no-reorg path can still emit the (untouched) digest. *)
+  let fork_coins = List.map parse_coin (list_of (member "fork_utxo")) in
+  let digest_of_seed () =
+    canonical_view_digest
+      (List.map (fun (txid_wire, vout, (u : Validation.utxo)) ->
+           { dc_txid_wire = txid_wire; dc_vout = vout;
+             dc_height = u.Validation.height;
+             dc_is_coinbase = u.Validation.is_coinbase;
+             dc_value = u.Validation.value;
+             dc_spk = u.Validation.script_pubkey })
+         fork_coins)
+  in
+  if Consensus.work_compare new_work old_work <= 0 then
+    (* STRICT new>old failed: no reorg, view untouched. *)
+    Printf.sprintf
+      {|{"outcome":"no-reorg-equal-or-less-work","connected_count":0,"fork_utxo_digest":"%s"}|}
+      (digest_of_seed ())
+  else begin
+    let disconnect_specs = list_of (member "disconnect") in
+    let connect_specs = list_of (member "connect") in
+    let disconnect_depth = List.length disconnect_specs in
+    let connect_depth = List.length connect_specs in
+    (* --- (2) depth cap (Sync.reorganize bounds BOTH halves) --- *)
+    if disconnect_depth > Sync.max_reorg_depth
+       || connect_depth > Sync.max_reorg_depth then
+      {|{"outcome":"reorg-too-deep"}|}
+    else begin
+      (* --- seed a REAL throwaway ChainDB + chain_state + ibd_state --- *)
+      let tmp = Filename.temp_file "camlcoin-reorg-" "" in
+      Unix.unlink tmp;
+      Unix.mkdir tmp 0o755;
+      let db = Storage.ChainDB.create tmp in
+      let cleanup () = (try Storage.ChainDB.close db with _ -> ()) in
+      Fun.protect ~finally:cleanup (fun () ->
+        let state = Sync.create_chain_state db network in
+        let ibd = Sync.create_ibd_state state in
+        (* Seed fork_utxo coins into the ChainDB (encode_utxo layout, the same
+           the reorg overlay/disk reader expect). This IS the working
+           coins-view the disconnect/connect base_lookup falls through to. *)
+        List.iter (fun (txid_wire, vout, (u : Validation.utxo)) ->
+            let data = Sync.encode_utxo u.Validation.value u.Validation.script_pubkey
+                u.Validation.height u.Validation.is_coinbase in
+            Storage.ChainDB.store_utxo db txid_wire vout data)
+          fork_coins;
+        (* Build a header_entry + store body (+ undo) for one block spec. *)
+        let entry_of_block_hex (block_hex : string) (height : int)
+            (undo_opt : Yojson.Safe.t option) : Sync.header_entry =
+          let block_bytes = hex_decode block_hex in
+          let r = Serialize.reader_of_cstruct block_bytes in
+          let block = Serialize.deserialize_block r in
+          let hash = Crypto.compute_block_hash block.Types.header in
+          (* store body so disconnect/connect can get_block it *)
+          if not (Storage.ChainDB.has_block db hash) then
+            Storage.ChainDB.store_block db hash block;
+          Storage.ChainDB.store_block_header db hash block.Types.header;
+          (match undo_opt with
+           | None -> ()
+           | Some undo_json ->
+             (* Build Utxo.undo_data from [{tx_index, vin:[coin...]}].
+                tx_undos must be ordered one per non-coinbase tx; the
+                disconnect indexes tx_undos[i-1] for block tx i, restoring
+                inputs in reverse against the input's own prevout. We key
+                each tx_undo by its block tx_index and emit them sorted so
+                tx_undos[i-1] aligns with block tx i. *)
+             let entries =
+               List.map (fun u ->
+                   let tx_index = to_int (Yojson.Safe.Util.member "tx_index" u) in
+                   let vin = list_of (Yojson.Safe.Util.member "vin" u) in
+                   let spent =
+                     List.map (fun c ->
+                         let (txid_wire, vout, (uu : Validation.utxo)) = parse_coin c in
+                         let op : Types.outpoint =
+                           { Types.txid = txid_wire; vout = Int32.of_int vout } in
+                         let ue : Utxo.utxo_entry =
+                           { Utxo.value = uu.Validation.value;
+                             script_pubkey = uu.Validation.script_pubkey;
+                             height = uu.Validation.height;
+                             is_coinbase = uu.Validation.is_coinbase } in
+                         (op, ue))
+                       vin
+                     in
+                     (tx_index, Utxo.{ spent_outputs = spent }))
+                 (list_of undo_json)
+             in
+             let entries =
+               List.sort (fun (a, _) (b, _) -> compare a b) entries in
+             let tx_undos = List.map snd entries in
+             let undo : Utxo.undo_data = { height; tx_undos } in
+             let uw = Serialize.writer_create () in
+             Utxo.serialize_undo_data uw undo;
+             Storage.ChainDB.store_undo_data db hash
+               (Cstruct.to_string (Serialize.writer_to_cstruct uw)));
+          { Sync.header = block.Types.header; hash; height;
+            total_work = Cstruct.create 32 }
+        in
+        let view = Sync.reorg_view_create () in
+        let batch = Storage.ChainDB.batch_create () in
+        (* --- (3) DISCONNECT phase (tip-first, as given) --- *)
+        let disc_result = ref "ok" in
+        let disc_error = ref None in
+        List.iter (fun spec ->
+            if !disc_error = None then begin
+              let sm k = Yojson.Safe.Util.member k spec in
+              let bh = to_hex (sm "block_hex") in
+              let h = to_int (sm "height") in
+              let undo_json = sm "undo" in
+              let entry = entry_of_block_hex bh h (Some undo_json) in
+              match Sync.disconnect_block_into_batch ibd batch view entry with
+              | Error e -> disc_error := Some e; disc_result := "failed"
+              | Ok (_txs, dres) ->
+                (match dres with
+                 | Sync.Disconnect_unclean -> disc_result := "unclean"
+                 | Sync.Disconnect_failed -> disc_result := "failed"
+                 | Sync.Disconnect_ok -> ())
+            end)
+          disconnect_specs;
+        (match !disc_error with
+         | Some e ->
+           Printf.sprintf
+             {|{"outcome":"reorg-rejected","disconnect_result":"failed","connected_count":0,"reject_reason":"%s"}|}
+             (json_escape e)
+         | None ->
+           (* --- (4) CONNECT phase (in order, stop at first reject) --- *)
+           let connected = ref 0 in
+           let conn_error = ref None in
+           List.iter (fun spec ->
+               if !conn_error = None then begin
+                 let sm k = Yojson.Safe.Util.member k spec in
+                 let bh = to_hex (sm "block_hex") in
+                 let h = to_int (sm "height") in
+                 let entry = entry_of_block_hex bh h None in
+                 match Sync.connect_block_into_batch ~skip_pow:true ibd batch view entry with
+                 | Ok _block -> incr connected
+                 | Error e -> conn_error := Some e
+               end)
+             connect_specs;
+           (match !conn_error with
+            | Some e ->
+              Printf.sprintf
+                {|{"outcome":"reorg-rejected","disconnect_result":"%s","connected_count":%d,"reject_reason":"%s"}|}
+                !disc_result !connected (json_escape (reorg_reject_reason e))
+            | None ->
+              (* reorg-applied: materialize the FINAL coins-view = seeded
+                 fork_utxo with the reorg_view overlay applied, and digest it. *)
+              let final = Hashtbl.create 64 in
+              (* start from seeded coins *)
+              List.iter (fun (txid_wire, vout, (u : Validation.utxo)) ->
+                  let key = Sync.utxo_view_key txid_wire vout in
+                  Hashtbl.replace final key
+                    { dc_txid_wire = txid_wire; dc_vout = vout;
+                      dc_height = u.Validation.height;
+                      dc_is_coinbase = u.Validation.is_coinbase;
+                      dc_value = u.Validation.value;
+                      dc_spk = u.Validation.script_pubkey })
+                fork_coins;
+              (* apply overlay deletes *)
+              Hashtbl.iter (fun k () -> Hashtbl.remove final k)
+                view.Sync.view_deletes;
+              (* apply overlay writes (decode the encoded UTXO blob) *)
+              Hashtbl.iter (fun k data ->
+                  (* key = txid_wire[32] ++ vout u32 LE *)
+                  let txid_wire = Cstruct.of_string (String.sub k 0 32) in
+                  let vout =
+                    (Char.code k.[32])
+                    lor ((Char.code k.[33]) lsl 8)
+                    lor ((Char.code k.[34]) lsl 16)
+                    lor ((Char.code k.[35]) lsl 24)
+                  in
+                  let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+                  let value = Serialize.read_int64_le r in
+                  let slen = Serialize.read_compact_size r in
+                  let spk = Serialize.read_bytes r slen in
+                  let height = Int32.to_int (Serialize.read_int32_le r) in
+                  let is_cb = Serialize.read_uint8 r = 1 in
+                  Hashtbl.replace final k
+                    { dc_txid_wire = txid_wire; dc_vout = vout;
+                      dc_height = height; dc_is_coinbase = is_cb;
+                      dc_value = value; dc_spk = spk })
+                view.Sync.view_writes;
+              let coins = Hashtbl.fold (fun _ v acc -> v :: acc) final [] in
+              let digest = canonical_view_digest coins in
+              Printf.sprintf
+                {|{"outcome":"reorg-applied","disconnect_result":"%s","connected_count":%d,"fork_utxo_digest":"%s"}|}
+                !disc_result !connected digest)))
+    end
+  end
+
 let process (line : string) : string =
   try
     let j = Yojson.Safe.from_string line in
@@ -814,6 +1178,7 @@ let process (line : string) : string =
     | "checktx" -> process_checktx j
     | "connecttx" -> process_connecttx j
     | "checkblock" -> process_checkblock j
+    | "reorg" -> process_reorg j
     | "nextwork" -> process_nextwork j
     | "merkleroot" -> process_merkleroot j
     | "subsidy" -> process_subsidy j

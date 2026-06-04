@@ -382,13 +382,30 @@ type wallet_utxo = {
   confirmed : bool;
 }
 
-(* Transaction history entry *)
+(* Transaction history entry.
+
+   Mirrors a single Bitcoin Core wallet "category" row as emitted by
+   listtransactions / gettransaction (wallet/rpc/transactions.cpp
+   ListTransactions): one entry per wallet-relevant credit (a receive /
+   coinbase-generate) or debit (a send), carrying the per-output/input vout, the
+   net amount, the fee (sends only), and the confirming block coordinates.
+
+   [hist_category] distinguishes the four Core categories.  Coinbase credits are
+   recorded as [`Generate]; whether listtransactions reports them as "generate"
+   (mature) or "immature" is decided dynamically at RPC time from the live
+   confirmation count + coinbase maturity, exactly like Core's
+   IsTxImmatureCoinBase check — so a stored entry never goes stale as the chain
+   advances. *)
 type tx_history_entry = {
   hist_txid : string;
-  hist_category : [`Send | `Receive];
+  hist_category : [`Send | `Receive | `Generate];
   hist_amount : int64;
-  hist_fee : int64;
+  (* Stored as a POSITIVE magnitude in satoshis; the RPC layer applies Core's
+     sign convention (negative for [`Send]). *)
+  hist_fee : int64;       (* positive magnitude; sends only, else 0 *)
   hist_address : string;
+  hist_vout : int;        (* the credited output index, or spent-input vout *)
+  hist_is_coinbase : bool;(* surfaces Core's "generated" boolean *)
   hist_confirmations : int;
   hist_block_hash : string;
   hist_block_height : int;
@@ -710,11 +727,17 @@ let cstruct_to_hex (cs : Cstruct.t) : string =
 (* Scan a block for wallet-relevant transactions *)
 let scan_block (w : t) (block : Types.block) (height : int) : unit =
   let block_hash = Crypto.compute_block_hash block.header in
-  let block_hash_hex = cstruct_to_hex block_hash in
+  (* Display (reversed) byte order for the user-facing block hash + txids, so
+     listtransactions / gettransaction return the SAME hashes as every other RPC
+     (getbestblockhash, sendtoaddress, getrawmempool, ...).  [txid_hex] stays in
+     internal order purely as the [sent_transactions] Hashtbl key (which is
+     keyed by the internal-order hex throughout the wallet). *)
+  let block_hash_hex = Types.hash256_to_hex_display block_hash in
   let block_timestamp = Int32.to_float block.header.timestamp in
   List.iter (fun tx ->
     let txid = Crypto.compute_txid tx in
     let txid_hex = cstruct_to_hex txid in
+    let txid_display = Types.hash256_to_hex_display txid in
 
     (* Check outputs for our addresses *)
     List.iteri (fun vout out ->
@@ -776,22 +799,60 @@ let scan_block (w : t) (block : Types.block) (height : int) : unit =
           confirmed = true;
         } in
         w.utxos <- wutxo :: w.utxos;
-        w.balance_confirmed <- Int64.add w.balance_confirmed out.Types.value;
-        (* Record receive history entry *)
-        let hist_entry = {
-          hist_txid = txid_hex;
-          hist_category = `Receive;
-          hist_amount = out.Types.value;
-          hist_fee = 0L;
-          hist_address = Address.address_to_string kp.address;
-          hist_confirmations = 1;
-          hist_block_hash = block_hash_hex;
-          hist_block_height = height;
-          hist_timestamp = block_timestamp;
-        } in
-        w.tx_history <- hist_entry :: w.tx_history)
+        w.balance_confirmed <- Int64.add w.balance_confirmed out.Types.value);
+        (* Record a credit history entry, deduped by {txid,vout} so a re-scanned
+           block does not duplicate it.  A coinbase credit is [`Generate]
+           (listtransactions reports "generate"/"immature" dynamically from the
+           live maturity); a non-coinbase credit to an output of a tx the wallet
+           itself sent is the wallet's OWN change — Core's CachedTxGetAmounts
+           classifies change out of listReceived, so we skip recording a
+           standalone receive row for it (the [`Send] row already accounts for
+           the spend).  Every other non-coinbase credit is a [`Receive]. *)
+        let already_logged =
+          List.exists (fun h ->
+            h.hist_txid = txid_display && h.hist_vout = vout
+            && (match h.hist_category with `Send -> false | _ -> true))
+            w.tx_history
+        in
+        let is_own_send = Hashtbl.mem w.sent_transactions txid_hex in
+        if (not already_logged) && (is_coinbase || not is_own_send) then begin
+          let hist_entry = {
+            hist_txid = txid_display;
+            hist_category = (if is_coinbase then `Generate else `Receive);
+            hist_amount = out.Types.value;
+            hist_fee = 0L;
+            hist_address = Address.address_to_string kp.address;
+            hist_vout = vout;
+            hist_is_coinbase = is_coinbase;
+            hist_confirmations = 1;
+            hist_block_hash = block_hash_hex;
+            hist_block_height = height;
+            hist_timestamp = block_timestamp;
+          } in
+          w.tx_history <- hist_entry :: w.tx_history
+        end
       | None -> ()
     ) tx.Types.outputs;
+
+    (* If this tx is one the wallet itself sent, its unconfirmed [`Send] history
+       row (recorded at create_transaction time with the correct destination,
+       negative-magnitude amount and fee) is now confirmed at this block.
+       Promote it in place — set the confirming block coordinates — mirroring
+       Core's CWallet::transactionAddedToMempool -> blockConnected state
+       transition.  This is how a send appears as confirmed in listtransactions:
+       the spent input UTXO was already removed from [w.utxos] at sendtoaddress
+       time (scan_transaction / CommitTransaction-style), so the input-scan below
+       can no longer find it; the promotion here is the authoritative path. *)
+    if Hashtbl.mem w.sent_transactions txid_hex then
+      w.tx_history <- List.map (fun h ->
+        if h.hist_txid = txid_display && h.hist_category = `Send
+           && h.hist_block_height = 0
+        then { h with
+               hist_block_hash = block_hash_hex;
+               hist_block_height = height;
+               hist_timestamp = block_timestamp;
+               hist_confirmations = 1 }
+        else h) w.tx_history;
 
     (* Check inputs for spent UTXOs *)
     List.iter (fun inp ->
@@ -811,24 +872,34 @@ let scan_block (w : t) (block : Types.block) (height : int) : unit =
         else
           w.balance_unconfirmed <-
             Int64.sub w.balance_unconfirmed wutxo.utxo.Utxo.value;
-        (* Record send history entry *)
-        let kp_opt = is_mine w wutxo.utxo.Utxo.script_pubkey in
-        let addr_str = match kp_opt with
-          | Some kp -> Address.address_to_string kp.address
-          | None -> ""
-        in
-        let hist_entry = {
-          hist_txid = txid_hex;
-          hist_category = `Send;
-          hist_amount = wutxo.utxo.Utxo.value;
-          hist_fee = 0L;
-          hist_address = addr_str;
-          hist_confirmations = 1;
-          hist_block_hash = block_hash_hex;
-          hist_block_height = height;
-          hist_timestamp = block_timestamp;
-        } in
-        w.tx_history <- hist_entry :: w.tx_history
+        (* Record a send history entry ONLY for a spend the wallet did not
+           itself originate (a tx not in [sent_transactions]).  The wallet's own
+           sends are surfaced by promoting their pre-recorded [`Send] row above
+           (with the real destination + fee), so emitting another row here would
+           double-list them with the wrong address (our own input addr) and a
+           wrong amount (the whole spent UTXO rather than the value that left the
+           wallet). *)
+        if not (Hashtbl.mem w.sent_transactions txid_hex) then begin
+          let kp_opt = is_mine w wutxo.utxo.Utxo.script_pubkey in
+          let addr_str = match kp_opt with
+            | Some kp -> Address.address_to_string kp.address
+            | None -> ""
+          in
+          let hist_entry = {
+            hist_txid = txid_display;
+            hist_category = `Send;
+            hist_amount = wutxo.utxo.Utxo.value;
+            hist_fee = 0L;
+            hist_address = addr_str;
+            hist_vout = Int32.to_int wutxo.outpoint.vout;
+            hist_is_coinbase = false;
+            hist_confirmations = 1;
+            hist_block_hash = block_hash_hex;
+            hist_block_height = height;
+            hist_timestamp = block_timestamp;
+          } in
+          w.tx_history <- hist_entry :: w.tx_history
+        end
       ) spent
     ) tx.Types.inputs
   ) block.transactions
@@ -1889,12 +1960,21 @@ let create_transaction (w : t) ~(dest_address : string)
         Int64.add acc out.Types.value
       ) 0L signed_tx.Types.outputs in
       let fee = Int64.sub total_input total_output in
+      (* The destination output index (change may have been inserted at a random
+         position, so it is not necessarily 0). *)
+      let dest_vout =
+        match list_find_index (fun out ->
+          Cstruct.equal out.Types.script_pubkey dest_script) signed_tx.Types.outputs
+        with Some i -> i | None -> 0
+      in
       let hist_entry = {
-        hist_txid = txid_hex;
+        hist_txid = Types.hash256_to_hex_display txid;
         hist_category = `Send;
         hist_amount = amount;
         hist_fee = fee;
         hist_address = dest_address;
+        hist_vout = dest_vout;
+        hist_is_coinbase = false;
         hist_confirmations = 0;
         hist_block_hash = "";
         hist_block_height = 0;
@@ -1980,12 +2060,26 @@ let create_transaction_multi (w : t)
     ) 0L signed_tx.Types.outputs in
     let fee = Int64.sub total_input total_output in
     List.iter (fun (addr_str, amt) ->
+      (* Locate this destination output's index in the signed tx (change may
+         have been inserted at a random position). *)
+      let dest_vout =
+        match Address.address_of_string addr_str with
+        | Ok dest_addr ->
+          let script = build_output_script dest_addr in
+          (match list_find_index (fun out ->
+             Cstruct.equal out.Types.script_pubkey script
+             && out.Types.value = amt) signed_tx.Types.outputs
+           with Some i -> i | None -> 0)
+        | Error _ -> 0
+      in
       let hist_entry = {
-        hist_txid = txid_hex;
+        hist_txid = Types.hash256_to_hex_display txid;
         hist_category = `Send;
         hist_amount = amt;
         hist_fee = fee;
         hist_address = addr_str;
+        hist_vout = dest_vout;
+        hist_is_coinbase = false;
         hist_confirmations = 0;
         hist_block_hash = "";
         hist_block_height = 0;
@@ -2578,10 +2672,13 @@ let save (w : t) : unit =
   let history_json = List.map (fun h ->
     `Assoc [
       ("txid", `String h.hist_txid);
-      ("category", `String (match h.hist_category with `Send -> "send" | `Receive -> "receive"));
+      ("category", `String (match h.hist_category with
+        | `Send -> "send" | `Generate -> "generate" | `Receive -> "receive"));
       ("amount", `String (Int64.to_string h.hist_amount));
       ("fee", `String (Int64.to_string h.hist_fee));
       ("address", `String h.hist_address);
+      ("vout", `Int h.hist_vout);
+      ("is_coinbase", `Bool h.hist_is_coinbase);
       ("confirmations", `Int h.hist_confirmations);
       ("blockhash", `String h.hist_block_hash);
       ("blockheight", `Int h.hist_block_height);
@@ -2639,10 +2736,13 @@ let save_encrypted (w : t) ~(passphrase : string) : unit =
   let history_json = List.map (fun h ->
     `Assoc [
       ("txid", `String h.hist_txid);
-      ("category", `String (match h.hist_category with `Send -> "send" | `Receive -> "receive"));
+      ("category", `String (match h.hist_category with
+        | `Send -> "send" | `Generate -> "generate" | `Receive -> "receive"));
       ("amount", `String (Int64.to_string h.hist_amount));
       ("fee", `String (Int64.to_string h.hist_fee));
       ("address", `String h.hist_address);
+      ("vout", `Int h.hist_vout);
+      ("is_coinbase", `Bool h.hist_is_coinbase);
       ("confirmations", `Int h.hist_confirmations);
       ("blockhash", `String h.hist_block_hash);
       ("blockheight", `Int h.hist_block_height);
@@ -2805,13 +2905,20 @@ let load_wallet_json (w : t) (network : [`Mainnet | `Testnet | `Regtest]) (json 
            let hist_txid = match List.assoc_opt "txid" ef with
              | Some (`String s) -> s | _ -> "" in
            let hist_category = match List.assoc_opt "category" ef with
-             | Some (`String "send") -> `Send | _ -> `Receive in
+             | Some (`String "send") -> `Send
+             | Some (`String "generate") -> `Generate
+             | _ -> `Receive in
            let hist_amount = match List.assoc_opt "amount" ef with
              | Some (`String s) -> Int64.of_string s | _ -> 0L in
            let hist_fee = match List.assoc_opt "fee" ef with
              | Some (`String s) -> Int64.of_string s | _ -> 0L in
            let hist_address = match List.assoc_opt "address" ef with
              | Some (`String s) -> s | _ -> "" in
+           let hist_vout = match List.assoc_opt "vout" ef with
+             | Some (`Int n) -> n | _ -> 0 in
+           let hist_is_coinbase = match List.assoc_opt "is_coinbase" ef with
+             | Some (`Bool b) -> b
+             | _ -> (hist_category = `Generate) in
            let hist_confirmations = match List.assoc_opt "confirmations" ef with
              | Some (`Int n) -> n | _ -> 0 in
            let hist_block_hash = match List.assoc_opt "blockhash" ef with
@@ -2824,7 +2931,8 @@ let load_wallet_json (w : t) (network : [`Mainnet | `Testnet | `Regtest]) (json 
              | _ -> 0.0 in
            let h = {
              hist_txid; hist_category; hist_amount; hist_fee;
-             hist_address; hist_confirmations; hist_block_hash;
+             hist_address; hist_vout; hist_is_coinbase;
+             hist_confirmations; hist_block_hash;
              hist_block_height; hist_timestamp;
            } in
            w.tx_history <- w.tx_history @ [h]

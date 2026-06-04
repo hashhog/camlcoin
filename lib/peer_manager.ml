@@ -207,7 +207,8 @@ type t = {
   mutable listeners : (P2p.message_payload -> Peer.peer -> unit Lwt.t) list;
   mutable listener_fd : Lwt_unix.file_descr option;  (* TCP listen socket *)
   mutable last_tip_update : float;           (* Timestamp of last chain tip update *)
-  stale_tip_check_interval : float;          (* Default 1800.0 = 30 minutes *)
+  stale_tip_check_interval : float;          (* Default 1800.0 = 30 minutes — peer-eviction threshold *)
+  tip_poll_interval : float;                 (* Default 120.0 = 2 minutes — proactive getheaders poll *)
   addr_rate : (string, int * float) Hashtbl.t;  (* Per-peer addr rate limiting: (count, window_start) *)
   mutable listen_addr : string option;           (* Our own listening address, if known *)
   chain_sync_behind_since : (int, float) Hashtbl.t; (* peer_id -> timestamp when first noticed behind *)
@@ -268,6 +269,7 @@ let create ?(config = default_config) ?(asmap : bytes option = None) (network : 
     listener_fd = None;
     last_tip_update = Unix.gettimeofday ();
     stale_tip_check_interval = 1800.0;
+    tip_poll_interval = 120.0;
     addr_rate = Hashtbl.create 256;
     listen_addr = None;
     chain_sync_behind_since = Hashtbl.create 16;
@@ -1959,7 +1961,24 @@ let check_stale_tip (pm : t) : unit Lwt.t =
      unbounded as the chain advances. Fix: when the higher_peers gate
      would otherwise suppress, fall back to polling any ready peer — the
      reply is cheap (empty if peer has no new headers, the canonical
-     getheaders/headers handshake otherwise). *)
+     getheaders/headers handshake otherwise).
+
+     2026-06-04 tip-follow fix: the poll is gated on [tip_poll_interval]
+     (2 min), NOT the 30-min [stale_tip_check_interval], which is far too
+     coarse to follow Bitcoin's ~10-min block cadence. The earlier 30-min
+     gate is why camlcoin stalled at a post-IBD tip when its single
+     [-connect] peer (Core over loopback) did NOT push a [headers]
+     announcement: Core's SendMessages block-announce (net_processing.cpp
+     ~5876-5888) needs an up-to-date [pindexBestKnownBlock] for us to send
+     headers, but we never announce our own tip to Core (we only ever
+     RECEIVE during IBD), so Core's view of our best block stays stale and
+     it bails out of announcing. A proactive getheaders REQUEST is
+     request-driven — Core answers from our locator's fork point regardless
+     of [pindexBestKnownBlock] (net_processing.cpp:4306 / FindForkInGlobalIndex)
+     — so a short self-poll reliably discovers new tip blocks. Peer
+     eviction below stays on the 30-min interval (we don't want to churn
+     peers every 2 min). Core's analogous STALE_CHECK_INTERVAL is 10 min;
+     2 min is conservative and well within our 2s getheaders rate limit. *)
   let poll_peer =
     if higher_peers <> [] then
       (* Sort by best_height descending; ask the peer claiming the most. *)
@@ -1976,7 +1995,7 @@ let check_stale_tip (pm : t) : unit Lwt.t =
           compare b.Peer.last_seen a.Peer.last_seen
         ) peers))
   in
-  if time_since_update > pm.stale_tip_check_interval && poll_peer <> None then begin
+  if time_since_update > pm.tip_poll_interval && poll_peer <> None then begin
     let best_peer = match poll_peer with Some p -> p | None -> assert false in
     Log.info (fun m -> m "Stale tip check (no update for %.0fs), \
       polling peer %d (peer reports height %ld vs our %ld)"

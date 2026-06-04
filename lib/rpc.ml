@@ -7359,6 +7359,165 @@ let scantxoutset_resolve (scanobjects : Yojson.Safe.t list)
   in
   aux [] scanobjects
 
+(* ============================================================================
+   rescanblockchain ( start_height stop_height )
+   ============================================================================
+
+   Rescan EXISTING chain blocks for outputs paying wallet-owned scripts,
+   crediting them into the wallet UTXO set + history and debiting spent inputs.
+   This is the backward counterpart of the forward block-connect scan wired at
+   block-connect time (Cli.run -> Sync.set_wallet_hooks -> Wallet.scan_block);
+   it lets a wallet rediscover its own funds AFTER a seed-only restore (which
+   derives keys but does not walk the chain) or after importing a key.
+
+   Mirrors Bitcoin Core's rescanblockchain (wallet/rpc/transactions.cpp) ->
+   CWallet::ScanForWalletTransactions(start_block, start_height, stop_height,
+   fUpdate=true): it re-derives every wallet credit/debit from the blocks in the
+   [start_height, stop_height] range by re-walking each block through the SAME
+   scan logic the connect hook uses.
+
+   Arguments (positional, Core ordering):
+     1. start_height (int, optional, default 0) — first block height to scan.
+        Must be 0 <= start_height <= tip.
+     2. stop_height  (int, optional) — last block height to scan. If omitted,
+        scans up to the validated tip. Must be 0 <= stop_height <= tip and
+        stop_height >= start_height.
+
+   Returns: { "start_height", "stop_height" } (Core shape), having credited
+   every wallet-owned output found in the range. *)
+let handle_rescanblockchain (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match ctx.wallet with
+  | None -> Error "Wallet not loaded"
+  | Some wallet ->
+    let int_arg = function
+      | `Int n -> Some n
+      | `Float f -> Some (int_of_float f)
+      | `Intlit s -> (try Some (int_of_string s) with _ -> None)
+      | _ -> None
+    in
+    (* The validated-block tip height (getblockcount semantics). *)
+    let tip_height = ctx.chain.Sync.blocks_synced in
+    let start_height =
+      match params with
+      | a :: _ -> (match int_arg a with Some n -> n | None -> 0)
+      | [] -> 0
+    in
+    let stop_height_opt =
+      match params with
+      | _ :: b :: _ -> int_arg b
+      | _ -> None
+    in
+    if start_height < 0 || start_height > tip_height then
+      Error "Invalid start_height"
+    else
+      let stop_height =
+        match stop_height_opt with
+        | Some s -> s
+        | None -> tip_height
+      in
+      if stop_height < 0 || stop_height > tip_height then
+        Error "Invalid stop_height"
+      else if stop_height < start_height then
+        Error "stop_height must be greater than start_height"
+      else begin
+        (* A from-scratch rescan (start at genesis) rebuilds the whole ledger:
+           clear the chain-derived UTXO/history state first so re-applying the
+           range does not double-count. A partial rescan (start_height > 0)
+           leaves the existing ledger in place and relies on scan_block's
+           {txid,vout} idempotency. *)
+        if start_height = 0 then Wallet.clear_for_rescan wallet;
+        (* Walk the active chain by height, re-applying each block through the
+           same scan logic the block-connect hook uses. Heights with no block
+           body persisted (assume-valid IBD does not store bodies) are skipped;
+           on regtest / a fully-synced node every block body is present. *)
+        for h = start_height to stop_height do
+          match Sync.get_header_at_height ctx.chain h with
+          | None -> ()
+          | Some entry ->
+            (match Storage.ChainDB.get_block ctx.chain.db entry.Sync.hash with
+             | None -> ()
+             | Some block -> Wallet.scan_block wallet block h)
+        done;
+        (* Persist the rebuilt ledger so it survives restart. *)
+        (try Wallet.save wallet with _ -> ());
+        Ok (`Assoc [
+          ("start_height", `Int start_height);
+          ("stop_height", `Int stop_height);
+        ])
+      end
+
+(* ============================================================================
+   importprivkey "privkey" ( "label" rescan )
+   ============================================================================
+
+   Decode a WIF-encoded private key, add the key + its P2WPKH address/script to
+   the wallet, and (if rescan, the default) rescan the chain so the key's
+   existing funds are credited into the wallet. Mirrors Bitcoin Core's
+   importprivkey (wallet/rpc/backup.cpp): on success it returns null, having
+   added the key and — when rescan=true — run ScanForWalletTransactions over the
+   whole chain.
+
+   Arguments (positional, Core ordering):
+     1. privkey (string, required) — the WIF-encoded private key.
+     2. label   (string, optional) — accepted for API parity; camlcoin's wallet
+        has no per-address label store, so it is ignored.
+     3. rescan  (bool, optional, default true) — rescan the chain after import.
+
+   Returns: null on success. *)
+let handle_importprivkey (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match ctx.wallet with
+  | None -> Error "Wallet not loaded"
+  | Some wallet ->
+    let wif =
+      match params with
+      | `String s :: _ -> Some (String.trim s)
+      | _ -> None
+    in
+    let do_rescan =
+      match params with
+      | _ :: _ :: `Bool b :: _ -> b
+      | _ -> true
+    in
+    (match wif with
+     | None -> Error "privkey (WIF) argument is required"
+     | Some wif ->
+       (* A locked encrypted wallet cannot accept a new private key. *)
+       let locked =
+         wallet.Wallet.encryption.encrypted &&
+         (match wallet.Wallet.encryption.lock_state with
+          | Wallet.Locked -> true
+          | Wallet.Unlocked _ -> false)
+       in
+       if locked then
+         Error "Error: Please enter the wallet passphrase with \
+                walletpassphrase first."
+       else
+         match Wallet.import_wif wallet wif with
+         | Error e -> Error (Printf.sprintf "Invalid private key encoding: %s" e)
+         | Ok _kp ->
+           (* Rescan from genesis to the validated tip so the imported key's
+              existing on-chain funds are credited (Core's fRescan default). A
+              partial-range rescan is not exposed by importprivkey in Core; it
+              always rescans from the key's birthdate (here: genesis). *)
+           if do_rescan then begin
+             let tip_height = ctx.chain.Sync.blocks_synced in
+             (* Re-apply the whole range. scan_block is {txid,vout}-idempotent,
+                so already-tracked wallet coins are not double-credited; only
+                the newly-imported key's outputs are added. *)
+             for h = 0 to tip_height do
+               match Sync.get_header_at_height ctx.chain h with
+               | None -> ()
+               | Some entry ->
+                 (match Storage.ChainDB.get_block ctx.chain.db entry.Sync.hash with
+                  | None -> ()
+                  | Some block -> Wallet.scan_block wallet block h)
+             done
+           end;
+           (try Wallet.save wallet with _ -> ());
+           Ok `Null)
+
 let handle_scantxoutset (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   let action = match params with
@@ -7956,6 +8115,8 @@ let handle_help (_ctx : rpc_context)
       "listlockunspent";
       "sendtoaddress \"address\" amount";
       "signrawtransactionwithwallet \"hexstring\"";
+      "rescanblockchain ( start_height stop_height )";
+      "importprivkey \"privkey\" ( \"label\" rescan )";
       "encryptwallet \"passphrase\"";
       "walletpassphrase \"passphrase\" timeout";
       "walletlock";
@@ -9182,6 +9343,14 @@ let dispatch_rpc (ctx : rpc_context)
      | Error msg -> Error (rpc_invalid_params, msg))
   | "listlockunspent" ->
     Ok (handle_listlockunspent ctx params)
+  | "rescanblockchain" ->
+    (match handle_rescanblockchain ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "importprivkey" ->
+    (match handle_importprivkey ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_wallet_error, msg))
 
   (* Wallet Management *)
   | "createwallet" ->

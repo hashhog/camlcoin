@@ -921,6 +921,16 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
              (* Remove confirmed transactions from mempool *)
              Mempool.remove_for_block mp block height;
 
+             (* Notify the wallet so its UTXO ledger tracks coins this block
+                pays to / spends from wallet addresses (credits wallet-script
+                outputs, debits spent wallet UTXOs).  Mirrors Bitcoin Core's
+                CWallet::blockConnected firing on every connected block.
+                Best-effort via [run_wallet_scan_hook]: a wallet-side failure
+                never rolls back this already-connected block.  This is the
+                single block-connect choke-point for the mining / generate /
+                generatetoaddress / generateblock / submitblock paths. *)
+             Sync.run_wallet_scan_hook chain block height;
+
              Logs.info (fun m -> m "Accepted mined block at height %d: %s"
                height (Types.hash256_to_hex_display hash));
 

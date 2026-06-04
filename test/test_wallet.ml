@@ -166,11 +166,15 @@ let make_p2wpkh_script (pkh : Cstruct.t) : Cstruct.t =
   script
 
 (* Helper to create a mock transaction *)
-let make_mock_tx ~(outputs : Types.tx_out list)
-    ~(is_coinbase : bool) : Types.transaction =
+let make_mock_tx ?(tag = "coinbase") ~(outputs : Types.tx_out list)
+    ~(is_coinbase : bool) () : Types.transaction =
+  (* [tag] varies the coinbase scriptSig so distinct mock coinbases get
+     distinct txids — every real coinbase differs (BIP-34 height push), and
+     Bitcoin outpoints are globally unique, so the wallet ledger now dedups by
+     {txid,vout}.  Tests that want N independent UTXOs must pass distinct tags. *)
   let inputs = if is_coinbase then
     [{ Types.previous_output = { txid = Types.zero_hash; vout = 0xFFFFFFFFl };
-       script_sig = Cstruct.of_string "coinbase";
+       script_sig = Cstruct.of_string tag;
        sequence = 0xFFFFFFFFl }]
   else
     [{ Types.previous_output = {
@@ -191,7 +195,7 @@ let test_scan_block_add_utxo () =
   let pkh = Crypto.hash160 kp.Wallet.public_key in
   let script = make_p2wpkh_script pkh in
   let output = { Types.value = 100_000L; script_pubkey = script } in
-  let tx = make_mock_tx ~outputs:[output] ~is_coinbase:true in
+  let tx = make_mock_tx ~outputs:[output] ~is_coinbase:true () in
   let block : Types.block = {
     header = {
       version = 1l;
@@ -215,7 +219,7 @@ let test_scan_block_skip_others () =
   let other_pkh = hex_to_cstruct "0000000000000000000000000000000000000000" in
   let script = make_p2wpkh_script other_pkh in
   let output = { Types.value = 100_000L; script_pubkey = script } in
-  let tx = make_mock_tx ~outputs:[output] ~is_coinbase:true in
+  let tx = make_mock_tx ~outputs:[output] ~is_coinbase:true () in
   let block : Types.block = {
     header = {
       version = 1l;
@@ -238,7 +242,7 @@ let test_recalculate_balance () =
   let pkh = Crypto.hash160 kp.Wallet.public_key in
   let script = make_p2wpkh_script pkh in
   let output = { Types.value = 50_000L; script_pubkey = script } in
-  let tx = make_mock_tx ~outputs:[output] ~is_coinbase:true in
+  let tx = make_mock_tx ~outputs:[output] ~is_coinbase:true () in
   let block : Types.block = {
     header = {
       version = 1l;
@@ -269,7 +273,7 @@ let test_coin_selection_simple () =
   let script = make_p2wpkh_script pkh in
   (* Add a UTXO *)
   let output = { Types.value = 100_000L; script_pubkey = script } in
-  let tx = make_mock_tx ~outputs:[output] ~is_coinbase:true in
+  let tx = make_mock_tx ~outputs:[output] ~is_coinbase:true () in
   let block : Types.block = {
     header = {
       version = 1l;
@@ -283,7 +287,7 @@ let test_coin_selection_simple () =
   } in
   Wallet.scan_block w block 100; (* Height 100 for coinbase maturity *)
   (* Select coins for 10000 sats *)
-  match Wallet.select_coins w 10_000L 1.0 with
+  match Wallet.select_coins w 10_000L 1.0 () with
   | Error e -> Alcotest.fail ("selection failed: " ^ e)
   | Ok sel ->
     Alcotest.(check int) "one input selected" 1 (List.length sel.selected);
@@ -297,7 +301,7 @@ let test_coin_selection_insufficient () =
   let script = make_p2wpkh_script pkh in
   (* Add a small UTXO *)
   let output = { Types.value = 1_000L; script_pubkey = script } in
-  let tx = make_mock_tx ~outputs:[output] ~is_coinbase:true in
+  let tx = make_mock_tx ~outputs:[output] ~is_coinbase:true () in
   let block : Types.block = {
     header = {
       version = 1l;
@@ -311,7 +315,7 @@ let test_coin_selection_insufficient () =
   } in
   Wallet.scan_block w block 100;
   (* Try to select for more than we have *)
-  match Wallet.select_coins w 1_000_000L 1.0 with
+  match Wallet.select_coins w 1_000_000L 1.0 () with
   | Ok _ -> Alcotest.fail "should have failed"
   | Error e ->
     Alcotest.(check bool) "insufficient funds error" true
@@ -328,7 +332,7 @@ let test_create_transaction () =
   let script = make_p2wpkh_script pkh in
   (* Add funds *)
   let output = { Types.value = 1_000_000L; script_pubkey = script } in
-  let tx = make_mock_tx ~outputs:[output] ~is_coinbase:true in
+  let tx = make_mock_tx ~outputs:[output] ~is_coinbase:true () in
   let block : Types.block = {
     header = {
       version = 1l;
@@ -359,7 +363,7 @@ let test_create_transaction_invalid_address () =
   let pkh = Crypto.hash160 kp.Wallet.public_key in
   let script = make_p2wpkh_script pkh in
   let output = { Types.value = 1_000_000L; script_pubkey = script } in
-  let tx = make_mock_tx ~outputs:[output] ~is_coinbase:true in
+  let tx = make_mock_tx ~outputs:[output] ~is_coinbase:true () in
   let block : Types.block = {
     header = {
       version = 1l;
@@ -655,8 +659,8 @@ let test_coin_select_bnb_exact_match () =
   (* Add two UTXOs that sum to exactly target + fee *)
   let output1 = { Types.value = 50_000L; script_pubkey = script } in
   let output2 = { Types.value = 30_000L; script_pubkey = script } in
-  let tx1 = make_mock_tx ~outputs:[output1] ~is_coinbase:true in
-  let tx2 = make_mock_tx ~outputs:[output2] ~is_coinbase:true in
+  let tx1 = make_mock_tx ~outputs:[output1] ~is_coinbase:true () in
+  let tx2 = make_mock_tx ~outputs:[output2] ~is_coinbase:true () in
   let block1 : Types.block = {
     header = { version = 1l; prev_block = Types.zero_hash;
                merkle_root = Types.zero_hash; timestamp = 0l;
@@ -678,10 +682,13 @@ let test_coin_select_with_many_utxos () =
   let kp = Wallet.generate_key w in
   let pkh = Crypto.hash160 kp.Wallet.public_key in
   let script = make_p2wpkh_script pkh in
-  (* Add multiple small UTXOs *)
+  (* Add multiple small UTXOs.  Each coinbase needs a DISTINCT scriptSig tag
+     so the mock txids differ — otherwise all ten share one outpoint and the
+     wallet ledger (correctly) dedups them to a single UTXO. *)
   for i = 0 to 9 do
     let output = { Types.value = 10_000L; script_pubkey = script } in
-    let tx = make_mock_tx ~outputs:[output] ~is_coinbase:true in
+    let tx = make_mock_tx ~tag:(Printf.sprintf "coinbase-%d" i)
+        ~outputs:[output] ~is_coinbase:true () in
     let block : Types.block = {
       header = { version = 1l; prev_block = Types.zero_hash;
                  merkle_root = Types.zero_hash; timestamp = 0l;
@@ -691,7 +698,7 @@ let test_coin_select_with_many_utxos () =
     Wallet.scan_block w block (100 + i)
   done;
   (* Total: 100_000 satoshis *)
-  match Wallet.select_coins w 50_000L 1.0 with
+  match Wallet.select_coins w 50_000L 1.0 () with
   | Error e -> Alcotest.fail ("selection failed: " ^ e)
   | Ok sel ->
     (* Should select enough to cover 50000 + fees *)
@@ -706,7 +713,7 @@ let test_coin_select_srd_randomness () =
   let script = make_p2wpkh_script pkh in
   for i = 0 to 4 do
     let output = { Types.value = Int64.of_int ((i + 1) * 10_000); script_pubkey = script } in
-    let tx = make_mock_tx ~outputs:[output] ~is_coinbase:true in
+    let tx = make_mock_tx ~outputs:[output] ~is_coinbase:true () in
     let block : Types.block = {
       header = { version = 1l; prev_block = Types.zero_hash;
                  merkle_root = Types.zero_hash; timestamp = 0l;

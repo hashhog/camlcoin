@@ -124,10 +124,15 @@ let make_multi_funded_wallet (values : int64 list) : Wallet.t =
   Cstruct.blit pkh 0 script 2 20;
   List.iteri (fun i value ->
     let output = { Types.value; script_pubkey = script } in
+    (* Vary the coinbase scriptSig per index so equal-valued UTXOs still get
+       distinct txids (real coinbases differ via the BIP-34 height push, and
+       outpoints are globally unique).  Without this, repeated values collapse
+       to a single UTXO under the wallet ledger's {txid,vout} dedup. *)
     let tx : Types.transaction =
       { version = 1l;
         inputs = [{ Types.previous_output = { txid = Types.zero_hash; vout = 0xFFFFFFFFl };
-                    script_sig = Cstruct.of_string "coinbase"; sequence = 0xFFFFFFFFl }];
+                    script_sig = Cstruct.of_string (Printf.sprintf "coinbase-%d" i);
+                    sequence = 0xFFFFFFFFl }];
         outputs = [output]; witnesses = []; locktime = 0l }
     in
     let block : Types.block =
@@ -232,7 +237,7 @@ let test_g12_bnb_no_waste_minimization () =
      Core's result carries waste, allowing min-waste selection across algorithms.
      wallet.ml: coin_selection = {selected; total_input; change} — 3 fields only. *)
   let w = make_multi_funded_wallet [50000L; 30000L; 20000L] in
-  (match Wallet.select_coins w 40000L 1.0 with
+  (match Wallet.select_coins w 40000L 1.0 () with
    | Ok sel ->
      let _ = sel.Wallet.selected in
      let _ = sel.Wallet.total_input in
@@ -569,7 +574,7 @@ let test_bnb_window_match () =
 (* select_coins full path: error on empty wallet *)
 let test_select_coins_empty_wallet_error () =
   let w = Wallet.create ~network:`Regtest ~db_path:"" in
-  (match Wallet.select_coins w 10000L 1.0 with
+  (match Wallet.select_coins w 10000L 1.0 () with
    | Error msg ->
      Alcotest.(check bool) "Empty wallet returns Error" true
        (String.length msg > 0)

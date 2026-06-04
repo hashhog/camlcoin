@@ -733,8 +733,39 @@ let scan_block (w : t) (block : Types.block) (height : int) : unit =
             (List.hd tx.Types.inputs).previous_output.txid
             Types.zero_hash
         in
+        let vout32 = Int32.of_int vout in
+        (* Idempotency: if this outpoint is already tracked (e.g. it was first
+           seen unconfirmed via [scan_transaction] when [sendtoaddress]
+           accepted the change output to mempool, or the same block is
+           re-scanned), do NOT double-credit. Instead promote the existing
+           entry to confirmed at this height so [select_coins] (which filters on
+           [confirmed]) and the confirmation count are correct, and adjust the
+           confirmed/unconfirmed balance split. Mirrors Core's
+           CWallet::AddToWallet upsert-by-{txid,vout}. *)
+        let existing =
+          List.find_opt (fun u ->
+            Cstruct.equal u.outpoint.txid txid && u.outpoint.vout = vout32)
+            w.utxos
+        in
+        (match existing with
+         | Some prev ->
+           if not prev.confirmed then begin
+             (* Promote unconfirmed -> confirmed; move value across the split. *)
+             w.balance_unconfirmed <-
+               Int64.sub w.balance_unconfirmed prev.utxo.Utxo.value;
+             w.balance_confirmed <-
+               Int64.add w.balance_confirmed prev.utxo.Utxo.value;
+             w.utxos <- List.map (fun u ->
+               if Cstruct.equal u.outpoint.txid txid && u.outpoint.vout = vout32
+               then { u with
+                      confirmed = true;
+                      utxo = { u.utxo with Utxo.height; is_coinbase } }
+               else u) w.utxos
+           end
+           (* already confirmed: same block re-scanned -> no-op (idempotent). *)
+         | None ->
         let wutxo = {
-          outpoint = { txid; vout = Int32.of_int vout };
+          outpoint = { txid; vout = vout32 };
           utxo = {
             Utxo.value = out.Types.value;
             script_pubkey = out.Types.script_pubkey;
@@ -758,7 +789,7 @@ let scan_block (w : t) (block : Types.block) (height : int) : unit =
           hist_block_height = height;
           hist_timestamp = block_timestamp;
         } in
-        w.tx_history <- hist_entry :: w.tx_history
+        w.tx_history <- hist_entry :: w.tx_history)
       | None -> ()
     ) tx.Types.outputs;
 
@@ -771,8 +802,15 @@ let scan_block (w : t) (block : Types.block) (height : int) : unit =
       ) w.utxos in
       List.iter (fun wutxo ->
         w.utxos <- List.filter (fun u -> not (Cstruct.equal u.outpoint.txid wutxo.outpoint.txid && u.outpoint.vout = wutxo.outpoint.vout)) w.utxos;
-        w.balance_confirmed <-
-          Int64.sub w.balance_confirmed wutxo.utxo.Utxo.value;
+        (* Debit from the matching balance bucket: a spent input may have been
+           tracked unconfirmed (a mempool change output we credited earlier),
+           in which case it never contributed to balance_confirmed. *)
+        if wutxo.confirmed then
+          w.balance_confirmed <-
+            Int64.sub w.balance_confirmed wutxo.utxo.Utxo.value
+        else
+          w.balance_unconfirmed <-
+            Int64.sub w.balance_unconfirmed wutxo.utxo.Utxo.value;
         (* Record send history entry *)
         let kp_opt = is_mine w wutxo.utxo.Utxo.script_pubkey in
         let addr_str = match kp_opt with
@@ -793,6 +831,41 @@ let scan_block (w : t) (block : Types.block) (height : int) : unit =
         w.tx_history <- hist_entry :: w.tx_history
       ) spent
     ) tx.Types.inputs
+  ) block.transactions
+
+(* Reverse [scan_block] for a block being disconnected on a reorg (mirrors
+   Bitcoin Core CWallet::blockDisconnected).  Removes the credits this block
+   created so the ledger does not over-count coins that no longer exist on the
+   active chain.  Note: like beamchain's unscan, this does NOT restore coins
+   the disconnected block SPENT — camlcoin has no per-spend undo in the wallet
+   ledger; the authoritative recovery path (rescan / scantxoutset) rebuilds the
+   set.  Best-effort, keeps the spendable set from drifting upward. *)
+let unscan_block (w : t) (block : Types.block) (_height : int) : unit =
+  List.iter (fun tx ->
+    let txid = Crypto.compute_txid tx in
+    List.iteri (fun vout out ->
+      match is_mine w out.Types.script_pubkey with
+      | Some _ ->
+        let vout32 = Int32.of_int vout in
+        let removed =
+          List.find_opt (fun u ->
+            Cstruct.equal u.outpoint.txid txid && u.outpoint.vout = vout32)
+            w.utxos
+        in
+        (match removed with
+         | Some u ->
+           w.utxos <- List.filter (fun x ->
+             not (Cstruct.equal x.outpoint.txid txid && x.outpoint.vout = vout32))
+             w.utxos;
+           if u.confirmed then
+             w.balance_confirmed <-
+               Int64.sub w.balance_confirmed u.utxo.Utxo.value
+           else
+             w.balance_unconfirmed <-
+               Int64.sub w.balance_unconfirmed u.utxo.Utxo.value
+         | None -> ())
+      | None -> ()
+    ) tx.Types.outputs
   ) block.transactions
 
 (* Scan a single transaction (for mempool tracking) *)
@@ -840,6 +913,30 @@ let scan_transaction (w : t) (tx : Types.transaction) : unit =
         w.balance_unconfirmed <- Int64.sub w.balance_unconfirmed wutxo.utxo.Utxo.value
     ) spent
   ) tx.Types.inputs
+
+(* Is a tracked UTXO spendable at the given chain tip height?  Applies Bitcoin
+   Core's coinbase-maturity rule: a coinbase output created at height H is
+   spendable once it has [coinbase_maturity] (=100) confirmations, i.e. once
+   [tip_height - H >= 100] (validation.cpp CheckInputs:
+   premature_spend_of_coinbase / consensus/tx_verify.cpp).  Non-coinbase coins
+   are spendable as soon as they are confirmed.  Unconfirmed coins are never
+   selected for spending (Core's default min-conf is 1). *)
+let is_spendable_at (wutxo : wallet_utxo) (tip_height : int) : bool =
+  wutxo.confirmed &&
+  (if wutxo.utxo.Utxo.is_coinbase then
+     tip_height - wutxo.utxo.Utxo.height >= Consensus.coinbase_maturity
+   else true)
+
+(* The wallet's spendable UTXOs at the given chain tip (maturity-filtered).
+   This is the set coin-selection runs over and getbalance counts. *)
+let get_spendable_utxos (w : t) (tip_height : int) : wallet_utxo list =
+  List.filter (fun u -> is_spendable_at u tip_height) w.utxos
+
+(* Spendable (mature, confirmed) balance at the given chain tip, in satoshis.
+   This is what Core's getbalance reports: immature coinbase is EXCLUDED. *)
+let get_spendable_balance (w : t) (tip_height : int) : int64 =
+  List.fold_left (fun acc u -> Int64.add acc u.utxo.Utxo.value)
+    0L (get_spendable_utxos w tip_height)
 
 (* Get confirmed and unconfirmed balance *)
 let get_balance (w : t) : (int64 * int64) =
@@ -978,14 +1075,19 @@ let select_coins_bnb (utxos : wallet_utxo list) (target : int64)
 
 (* Select coins to meet target amount, trying BnB first then greedy fallback *)
 let select_coins (w : t) (target : int64) (fee_rate : float)
-    : (coin_selection, string) result =
+    ?tip_height () : (coin_selection, string) result =
   (* Sort by value descending *)
   let available = List.sort (fun a b ->
     Int64.compare b.utxo.Utxo.value a.utxo.Utxo.value
   ) w.utxos in
 
-  (* Filter only confirmed UTXOs for safety *)
-  let available = List.filter (fun u -> u.confirmed) available in
+  (* Only confirmed coins are spendable; when the chain tip height is known,
+     also exclude immature coinbase (Core's premature_spend_of_coinbase rule).
+     Without a tip height (no chain yet) fall back to the confirmed filter. *)
+  let available = match tip_height with
+    | Some h -> List.filter (fun u -> is_spendable_at u h) available
+    | None -> List.filter (fun u -> u.confirmed) available
+  in
 
   (* Estimate fee for a typical transaction (start with 1 input, 2 outputs) *)
   let estimated_tx_weight = estimate_tx_weight 1 2 in
@@ -1721,8 +1823,8 @@ let create_transaction (w : t) ~(dest_address : string)
   match Address.address_of_string dest_address with
   | Error e -> Error e
   | Ok dest_addr ->
-    (* Select coins *)
-    match select_coins w amount fee_rate with
+    (* Select coins (maturity-aware when the tip height is known) *)
+    match select_coins w amount fee_rate ?tip_height () with
     | Error e -> Error e
     | Ok selection ->
       let dest_script = build_output_script dest_addr in
@@ -1822,8 +1924,8 @@ let create_transaction_multi (w : t)
       { Types.value = amount; script_pubkey = script }
   ) outputs in
 
-  (* Select coins *)
-  match select_coins w total_amount fee_rate with
+  (* Select coins (maturity-aware when the tip height is known) *)
+  match select_coins w total_amount fee_rate ?tip_height () with
   | Error e -> Error e
   | Ok selection ->
     (* Build all outputs including change *)

@@ -216,6 +216,24 @@ type chain_state = {
      Mirrors Bitcoin Core's [BlockFilterIndex] singleton attached to
      [ChainstateManager] via [g_indexes_ready_to_sync]
      ([src/index/blockfilterindex.cpp]). *)
+  mutable wallet_scan_hook : (Types.block -> int -> unit) option;
+  (* Wallet block-connect notification, mirroring Bitcoin Core's
+     [CWallet::blockConnected] (wallet/wallet.cpp).  Installed by [cli.ml] /
+     [bin/main.ml] right after the wallet is loaded when one is enabled, and
+     invoked by every block-connect choke-point (currently [Mining.submit_block]
+     for the mining / generate* / submitblock paths) *after* the block has been
+     fully validated and the validated tip advanced.  The callback credits
+     wallet-owned outputs and debits spent wallet UTXOs (see
+     [Wallet.scan_block]).  A generic [Types.block -> int -> unit] callback is
+     used (rather than a direct [Wallet.t] reference) so the [Sync] module stays
+     independent of [Wallet] and there is no module cycle.  [None] when no
+     wallet is loaded.  Best-effort: a wallet-side failure must never roll back
+     an already-validated, already-connected block. *)
+  mutable wallet_unscan_hook : (Types.block -> int -> unit) option;
+  (* Symmetric counterpart to [wallet_scan_hook] for a block being
+     disconnected (reorg), mirroring [CWallet::blockDisconnected].  Removes the
+     wallet credits the disconnected block created so a reorg cannot leave the
+     ledger over-counting coins that no longer exist on the active chain. *)
 }
 
 (* Header flood prevention: reject new headers when this limit is reached
@@ -700,6 +718,8 @@ let create_chain_state (db : Storage.ChainDB.t)
     peer_headers_sync = Hashtbl.create 16;
     block_submission_paused = false;
     bip157_index = None;
+    wallet_scan_hook = None;
+    wallet_unscan_hook = None;
   } in
   (* Insert genesis block header *)
   let genesis_hash = Crypto.compute_block_hash network.genesis_header in
@@ -746,6 +766,8 @@ let restore_chain_state (db : Storage.ChainDB.t)
     peer_headers_sync = Hashtbl.create 16;
     block_submission_paused = false;
     bip157_index = None;
+    wallet_scan_hook = None;
+    wallet_unscan_hook = None;
   } in
   (* Check for stored header tip *)
   match Storage.ChainDB.get_header_tip db with
@@ -853,6 +875,42 @@ let restore_chain_state (db : Storage.ChainDB.t)
   | None ->
     (* No stored state, create fresh with genesis *)
     create_chain_state db network
+
+(* Install / replace the wallet block-connect + block-disconnect notification
+   callbacks.  Called once by [cli.ml] / [bin/main.ml] after the wallet is
+   loaded.  Both default to [None] (no wallet loaded). *)
+let set_wallet_hooks (state : chain_state)
+    ?(on_connect : (Types.block -> int -> unit) option)
+    ?(on_disconnect : (Types.block -> int -> unit) option) () : unit =
+  (match on_connect with Some _ -> state.wallet_scan_hook <- on_connect | None -> ());
+  (match on_disconnect with Some _ -> state.wallet_unscan_hook <- on_disconnect | None -> ())
+
+(* Invoke the wallet block-connect hook for a freshly-connected block, if one
+   is installed.  Best-effort: a wallet-side exception is logged and swallowed
+   so it can never roll back an already-validated, already-connected block
+   (mirrors Core's CWallet notifications running off the validation thread). *)
+let run_wallet_scan_hook (state : chain_state) (block : Types.block)
+    (height : int) : unit =
+  match state.wallet_scan_hook with
+  | None -> ()
+  | Some f ->
+    (try f block height with exn ->
+      Logs.warn (fun m ->
+        m "wallet block-connect scan raised at height %d (ignored): %s"
+          height (Printexc.to_string exn)))
+
+(* Invoke the wallet block-disconnect hook for a block being removed on a
+   reorg, if one is installed.  Best-effort, same rationale as
+   [run_wallet_scan_hook]. *)
+let run_wallet_unscan_hook (state : chain_state) (block : Types.block)
+    (height : int) : unit =
+  match state.wallet_unscan_hook with
+  | None -> ()
+  | Some f ->
+    (try f block height with exn ->
+      Logs.warn (fun m ->
+        m "wallet block-disconnect unscan raised at height %d (ignored): %s"
+          height (Printexc.to_string exn)))
 
 (* Average block size used to convert a byte-denominated [prune_target] into
    a block-count keep window. 1.5 MB matches lunarblock's AVG_BLOCK_SIZE

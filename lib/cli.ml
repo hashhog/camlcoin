@@ -816,6 +816,24 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     Some (Wallet.load ~network:config.network ~db_path:wallet_path)
   end else None in
 
+  (* Wire the block-connect -> wallet UTXO ledger hook (mirrors Bitcoin Core's
+     CWallet::blockConnected / blockDisconnected).  Every block-connect
+     choke-point (Mining.submit_block for the mining / generate* / submitblock
+     paths) calls [Sync.run_wallet_scan_hook], which dispatches to this closure
+     so the wallet credits coins paid to its addresses and debits coins it
+     spends.  Without this the wallet UTXO ledger stays empty and
+     getbalance/listunspent/sendtoaddress can never see or spend owned coins.
+     A generic closure is installed (not a Wallet.t reference) so the Sync
+     module stays free of any dependency on Wallet. *)
+  (match wallet with
+   | Some w ->
+     Sync.set_wallet_hooks chain
+       ~on_connect:(fun block height -> Wallet.scan_block w block height)
+       ~on_disconnect:(fun block height ->
+         Wallet.unscan_block w block height)
+       ()
+   | None -> ());
+
   (* Create RPC context. The [filter_index] field of [rpc_context]
      is the inner [Block_index.filter_index] sub-handle (used by
      [rest.ml]'s blockfilter handlers); we extract it from the bundle

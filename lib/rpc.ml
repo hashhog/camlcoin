@@ -2197,10 +2197,13 @@ let handle_getbalance (ctx : rpc_context)
   match ctx.wallet with
   | None -> `Float 0.0
   | Some wallet ->
-    let utxos = Wallet.get_utxos wallet in
-    let total = List.fold_left (fun acc (wutxo : Wallet.wallet_utxo) ->
-      Int64.add acc wutxo.utxo.Utxo.value
-    ) 0L utxos in
+    (* Core's getbalance counts only SPENDABLE coins: confirmed and, for
+       coinbase, past the 100-confirmation maturity window.  Sum the
+       maturity-filtered spendable set at the current validated tip height so
+       immature coinbase is excluded (premature_spend_of_coinbase). *)
+    let tip_height = match ctx.chain.tip with
+      | Some t -> t.height | None -> 0 in
+    let total = Wallet.get_spendable_balance wallet tip_height in
     `Float (Int64.to_float total /. 100_000_000.0)
 
 let handle_getnewaddress (ctx : rpc_context)
@@ -2316,11 +2319,16 @@ let handle_listunspent (ctx : rpc_context)
         if wutxo.confirmed then tip_height - wutxo.utxo.Utxo.height + 1
         else 0
       in
+      (* Core marks immature coinbase non-spendable in listunspent
+         (rpc/coins.cpp: "spendable").  We compute the same maturity flag so a
+         caller distinguishes mature (selectable) coins from immature coinbase. *)
+      let spendable = Wallet.is_spendable_at wutxo tip_height in
       `Assoc [
         ("txid", `String (Types.hash256_to_hex_display wutxo.outpoint.txid));
         ("vout", `Int (Int32.to_int wutxo.outpoint.vout));
         ("amount", `Float (Int64.to_float wutxo.utxo.Utxo.value /. 100_000_000.0));
         ("confirmations", `Int confirmations);
+        ("spendable", `Bool spendable);
       ]
     ) utxos)
 
@@ -2358,6 +2366,11 @@ let handle_sendtoaddress (ctx : rpc_context)
        | Ok tx ->
          match Mempool.add_transaction ctx.mempool tx with
          | Ok entry ->
+           (* Core's CWallet::CommitTransaction marks the spent coins used and
+              tracks the (unconfirmed) change so the funds cannot be selected
+              again before the tx confirms.  scan_transaction debits the spent
+              wallet inputs and credits any wallet-owned change as unconfirmed. *)
+           Wallet.scan_transaction wallet tx;
            Ok (`String (Types.hash256_to_hex_display entry.txid))
          | Error msg ->
            Error msg)
@@ -2377,6 +2390,7 @@ let handle_sendtoaddress (ctx : rpc_context)
        | Ok tx ->
          match Mempool.add_transaction ctx.mempool tx with
          | Ok entry ->
+           Wallet.scan_transaction wallet tx;
            Ok (`String (Types.hash256_to_hex_display entry.txid))
          | Error msg ->
            Error msg)
@@ -6226,7 +6240,9 @@ let handle_walletcreatefundedpsbt (ctx : rpc_context)
             (Int64.add target_amount est_fee) in
           (manual_inputs, resolved, change)
         else
-          match Wallet.select_coins wallet target_amount fee_rate with
+          let tip_height = match ctx.chain.tip with
+            | Some t -> Some t.height | None -> None in
+          match Wallet.select_coins wallet target_amount fee_rate ?tip_height () with
           | Error e -> failwith e
           | Ok sel ->
             (* FIX-70 / W120 BUG-2: auto-selected inputs from coin selection

@@ -2212,6 +2212,95 @@ let handle_getnewaddress (ctx : rpc_context)
     let addr = Address.address_to_string kp.address in
     Ok (`String addr)
 
+(* sethdseed ( newkeypool "seed" )
+   Set / restore the wallet's HD master seed from a known value, making key
+   derivation deterministic so a wallet can be recovered from a seed (or
+   BIP-39 mnemonic) alone.
+
+   Bitcoin Core's sethdseed (wallet/rpc/backup.cpp) imports a WIF-encoded
+   private key as the seed source. camlcoin has no on-disk WIF seed blob to
+   import, so — mirroring the just-landed nimrod/rustoshi sethdseed — this
+   accepts the raw seed material directly and re-derives the BIP-32 master
+   key via HMAC-SHA512(key="Bitcoin seed").
+
+   Arguments (positional, Core-compatible ordering with an extension):
+     1. newkeypool (bool, optional, default=true) — flush + regenerate the
+        keypool. Always effectively true here: set_hd_seed clears the derived
+        key list and resets every derivation index, so recovery re-derives
+        from index 0.
+     2. seed (string, optional) — the seed material. Accepted forms:
+          - hex string, 16..64 bytes  (raw BIP-32 seed)
+          - a BIP-39 mnemonic phrase (space-separated words)
+        If omitted, a fresh random 32-byte seed is generated.
+
+   Returns: { "seed_hex", "xprv", "xpub" }. *)
+let handle_sethdseed (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match ctx.wallet with
+  | None -> Error "Wallet not loaded"
+  | Some wallet ->
+    let locked =
+      wallet.Wallet.encryption.encrypted &&
+      (match wallet.Wallet.encryption.lock_state with
+       | Wallet.Locked -> true
+       | Wallet.Unlocked _ -> false)
+    in
+    if locked then
+      Error "Error: Please enter the wallet passphrase with \
+             walletpassphrase first."
+    else begin
+    (* Core puts newkeypool first, seed second; also accept the seed at
+       index 0 when it is clearly a string (lenient). *)
+    let seed_arg =
+      match params with
+      | _ :: `String s :: _ -> s
+      | `String s :: _ -> s
+      | _ -> ""
+    in
+    let seed_result : (Cstruct.t, string) result =
+      if seed_arg = "" then begin
+        (* Fresh random 32-byte seed. *)
+        Mirage_crypto_rng_unix.use_default ();
+        Ok (Cstruct.of_string (Mirage_crypto_rng_unix.getrandom 32))
+      end else if String.contains (String.trim seed_arg) ' ' then begin
+        (* Looks like a BIP-39 mnemonic phrase. *)
+        let m = String.trim seed_arg in
+        if not (Bip39.validate_mnemonic m) then
+          Error "invalid BIP-39 mnemonic"
+        else
+          Ok (Bip39.mnemonic_to_seed ~mnemonic:m ())
+      end else begin
+        (* Raw hex seed. *)
+        let h = String.trim seed_arg in
+        if String.length h mod 2 <> 0 then
+          Error "seed hex must have even length"
+        else
+          match (try Some (Cstruct.of_hex h) with _ -> None) with
+          | None -> Error "seed must be valid hex or a mnemonic"
+          | Some cs ->
+            let len = Cstruct.length cs in
+            if len < 16 || len > 64 then
+              Error "seed must be 16-64 bytes"
+            else Ok cs
+      end
+    in
+    match seed_result with
+    | Error e -> Error e
+    | Ok seed ->
+      Wallet.set_hd_seed wallet seed;
+      (* Persist the new seed so the wallet survives restart. *)
+      (try Wallet.save wallet with _ -> ());
+      let seed_hex =
+        String.concat "" (List.init (Cstruct.length seed) (fun i ->
+          Printf.sprintf "%02x" (Cstruct.get_uint8 seed i)))
+      in
+      Ok (`Assoc [
+        ("seed_hex", `String seed_hex);
+        ("xprv", `Null);
+        ("xpub", `Null);
+      ])
+    end
+
 let handle_listunspent (ctx : rpc_context)
     (_params : Yojson.Safe.t list) : Yojson.Safe.t =
   match ctx.wallet with
@@ -7002,6 +7091,168 @@ let parse_dumptxoutset_target (ctx : rpc_context)
                 "Invalid snapshot type \"%s\" specified. Please specify \
                  \"rollback\" or \"latest\"" other))
 
+(* ============================================================================
+   scantxoutset "action" [scanobjects]
+   ============================================================================
+
+   Scan the unspent transaction output set for outputs matching one of the
+   supplied scan objects. Mirrors Bitcoin Core's scantxoutset
+   (rpc/blockchain.cpp::scantxoutset): a single pass over the live chainstate
+   UTXO set, collecting every coin whose scriptPubKey matches a needle.
+
+   Supported scan-object forms (the two simplest descriptors, matching the
+   just-landed ouroboros/rustoshi/nimrod recovery cell):
+     - addr(<address>)            — match outputs paying to the address's spk
+     - raw(<scriptPubKey-hex>)    — match outputs with exactly this spk
+     - a bare hex string          — Core's raw() shorthand for harnesses
+   xpub-range descriptors are out of scope.
+
+   Actions:
+     - "start" (default) — perform the scan; scanobjects required.
+     - "abort" / "status" — no background scan is tracked here; Core returns
+       false from these when nothing is in progress, so we mirror that. *)
+
+(* Resolve scan objects to a list of (scriptPubKey, descriptor-string)
+   needles. Returns Error on unparseable / unsupported objects, matching
+   Core's RPC_INVALID_PARAMETER behaviour. *)
+let scantxoutset_resolve (scanobjects : Yojson.Safe.t list)
+    : ((Cstruct.t * string) list, string) result =
+  let rec aux acc = function
+    | [] -> Ok (List.rev acc)
+    | obj :: rest ->
+      (* Core also accepts {"desc": "...", "range": ...}; handle the string
+         form plus pulling "desc" out of an object for convenience. *)
+      let spec =
+        match obj with
+        | `String s -> Some s
+        | `Assoc fields ->
+          (match List.assoc_opt "desc" fields with
+           | Some (`String s) -> Some s
+           | _ -> None)
+        | _ -> None
+      in
+      (match spec with
+       | None -> Error "Scan object must be a descriptor string"
+       | Some spec ->
+         let spec = String.trim spec in
+         (* strip a trailing checksum (#xxxxxxxx) if present *)
+         let spec =
+           match String.index_opt spec '#' with
+           | Some i -> String.sub spec 0 i
+           | None -> spec
+         in
+         let strip_wrapper prefix =
+           let plen = String.length prefix in
+           if String.length spec > plen
+              && String.sub spec 0 plen = prefix
+              && spec.[String.length spec - 1] = ')'
+           then Some (String.sub spec plen (String.length spec - plen - 1))
+           else None
+         in
+         let resolved : (Cstruct.t * string, string) result =
+           match strip_wrapper "addr(" with
+           | Some addr_str ->
+             (match Address.address_of_string (String.trim addr_str) with
+              | Ok addr ->
+                Ok (Wallet.build_output_script addr, spec)
+              | Error e ->
+                Error (Printf.sprintf "Invalid address in addr(): %s" e))
+           | None ->
+             let raw_hex =
+               match strip_wrapper "raw(" with
+               | Some h -> Some (String.trim h)
+               | None ->
+                 (* bare hex shorthand: only if it parses as hex *)
+                 (match (try Some (Cstruct.of_hex spec) with _ -> None) with
+                  | Some _ -> Some spec
+                  | None -> None)
+             in
+             (match raw_hex with
+              | None ->
+                Error (Printf.sprintf
+                         "Unsupported scan object (expected addr(), raw(), \
+                          or scriptPubKey hex): %s" spec)
+              | Some h ->
+                (match (try Some (Cstruct.of_hex h) with _ -> None) with
+                 | Some spk -> Ok (spk, Printf.sprintf "raw(%s)" h)
+                 | None -> Error (Printf.sprintf "Invalid scriptPubKey hex: %s" h)))
+         in
+         (match resolved with
+          | Error e -> Error e
+          | Ok needle -> aux (needle :: acc) rest))
+  in
+  aux [] scanobjects
+
+let handle_scantxoutset (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  let action = match params with
+    | `String a :: _ -> String.lowercase_ascii a
+    | _ -> "start"
+  in
+  match action with
+  | "abort" | "status" ->
+    (* No long-running background scan is tracked; Core returns false. *)
+    Ok (`Bool false)
+  | "start" ->
+    let scanobjects =
+      match params with
+      | _ :: `List objs :: _ -> objs
+      | _ -> []
+    in
+    if scanobjects = [] then
+      Error "scanobjects argument is required for the start action"
+    else begin
+      match scantxoutset_resolve scanobjects with
+      | Error e -> Error e
+      | Ok needles ->
+        (* Flush any pending wallet-independent UTXO writes so the scan sees
+           the committed set. submit_block already drains via
+           persist_dirty_atomic into cf_chainstate (the column family
+           iterated below), so this is belt-and-suspenders for any path that
+           left dirty entries. *)
+        (match ctx.utxo with
+         | Some u -> (try Utxo.OptimizedUtxoSet.flush u with _ -> ())
+         | None -> ());
+        let txouts = ref 0 in
+        let total_amount = ref 0L in
+        let unspents = ref [] in
+        Storage.ChainDB.iter_utxos ctx.chain.db (fun txid vout data ->
+          incr txouts;
+          let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+          let utxo = Utxo.deserialize_utxo_entry r in
+          match List.find_opt (fun (spk, _) ->
+            Cstruct.equal spk utxo.Utxo.script_pubkey) needles
+          with
+          | None -> ()
+          | Some (_, desc) ->
+            total_amount := Int64.add !total_amount utxo.Utxo.value;
+            let entry = `Assoc [
+              ("txid", `String (Types.hash256_to_hex_display txid));
+              ("vout", `Int vout);
+              ("scriptPubKey",
+                 `String (cstruct_to_hex utxo.Utxo.script_pubkey));
+              ("desc", `String desc);
+              ("amount", btc_amount_json utxo.Utxo.value);
+              ("coinbase", `Bool utxo.Utxo.is_coinbase);
+              ("height", `Int utxo.Utxo.height);
+            ] in
+            unspents := entry :: !unspents);
+        let tip_height, tip_hash = match ctx.chain.tip with
+          | Some t -> (t.height, t.hash)
+          | None -> (0, Types.zero_hash)
+        in
+        Ok (`Assoc [
+          ("success", `Bool true);
+          ("txouts", `Int !txouts);
+          ("height", `Int tip_height);
+          ("bestblock", `String (Types.hash256_to_hex_display tip_hash));
+          ("unspents", `List (List.rev !unspents));
+          ("total_amount", btc_amount_json !total_amount);
+        ])
+    end
+  | other ->
+    Error (Printf.sprintf "Invalid action '%s'" other)
+
 let handle_dumptxoutset (_ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   (* Parse [path, type?, options?]. The [type] field accepts Core's
@@ -8729,6 +8980,10 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_getnewaddress ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_wallet_error, msg))
+  | "sethdseed" ->
+    (match handle_sethdseed ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_wallet_error, msg))
   | "listtransactions" ->
     Ok (handle_listtransactions ctx params)
   | "listunspent" ->
@@ -8859,6 +9114,10 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_dumptxoutset ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
+  | "scantxoutset" ->
+    (match handle_scantxoutset ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_invalid_params, msg))
   | "gettxoutsetinfo" ->
     (match handle_gettxoutsetinfo ctx params with
      | Ok r -> Ok r

@@ -490,6 +490,25 @@ let init_from_mnemonic (w : t) (mnemonic : string) ?(passphrase = "") () : unit 
     let seed = Bip39.mnemonic_to_seed ~mnemonic ~passphrase () in
     init_from_seed w seed
 
+(* Restore the wallet's HD master seed from a known value (seed-only recovery).
+   Mirrors Bitcoin Core's sethdseed (CWallet::SetHDSeed + keypool flush):
+   the master key is replaced and every derivation index is reset to 0 so
+   that re-deriving addresses with [generate_key*] reproduces the exact same
+   sequence the original wallet produced. The already-derived [keys] list is
+   cleared (Core's "newkeypool" flush) — recovery re-derives from index 0.
+   Reference: bitcoin-core/src/wallet/rpc/backup.cpp sethdseed. *)
+let set_hd_seed (w : t) (seed : Cstruct.t) : unit =
+  let master = derive_master_key seed in
+  w.master_key <- Some master;
+  w.keys <- [];
+  w.next_key_index <- 0;
+  w.receive_index <- 0;
+  w.change_index <- 0;
+  w.bip44_receive_index <- 0;
+  w.bip44_change_index <- 0;
+  w.bip86_receive_index <- 0;
+  w.bip86_change_index <- 0
+
 (* ============================================================================
    Key Management
    ============================================================================ *)

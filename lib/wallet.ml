@@ -513,7 +513,14 @@ let init_from_mnemonic (w : t) (mnemonic : string) ?(passphrase = "") () : unit 
    that re-deriving addresses with [generate_key*] reproduces the exact same
    sequence the original wallet produced. The already-derived [keys] list is
    cleared (Core's "newkeypool" flush) — recovery re-derives from index 0.
-   Reference: bitcoin-core/src/wallet/rpc/backup.cpp sethdseed. *)
+   Reference: bitcoin-core/src/wallet/rpc/backup.cpp sethdseed.
+
+   The chain-derived ledger (UTXO set, both balance buckets, and on-chain
+   history) is ALSO reset: a wallet restored from a seed has no tracked funds
+   until it walks the chain (rescanblockchain / scantxoutset). Mirrors Core,
+   where SetHDSeed on a fresh wallet leaves an empty CWallet::mapWallet until a
+   rescan re-derives the credits/debits from the blocks. Without this, getbalance
+   would report stale coins from the pre-reseed key set before any rescan ran. *)
 let set_hd_seed (w : t) (seed : Cstruct.t) : unit =
   let master = derive_master_key seed in
   w.master_key <- Some master;
@@ -524,7 +531,12 @@ let set_hd_seed (w : t) (seed : Cstruct.t) : unit =
   w.bip44_receive_index <- 0;
   w.bip44_change_index <- 0;
   w.bip86_receive_index <- 0;
-  w.bip86_change_index <- 0
+  w.bip86_change_index <- 0;
+  (* Fresh-wallet ledger reset: re-deriving keys does not re-derive funds. *)
+  w.utxos <- [];
+  w.balance_confirmed <- 0L;
+  w.balance_unconfirmed <- 0L;
+  w.tx_history <- []
 
 (* ============================================================================
    Key Management
@@ -3040,6 +3052,24 @@ let clear_utxos (w : t) : unit =
   w.utxos <- [];
   w.balance_confirmed <- 0L;
   w.balance_unconfirmed <- 0L
+
+(* Reset the wallet's chain-derived ledger ahead of a from-scratch rescan
+   (rescanblockchain with start_height = 0).  Clears the UTXO set, both balance
+   buckets, and the on-chain history rows so re-applying [scan_block] over the
+   block range rebuilds the ledger without double-counting.  Mirrors Bitcoin
+   Core's CWallet::ScanForWalletTransactions(fUpdate=true) over the full chain,
+   which re-derives every wallet credit/debit from the blocks themselves.
+
+   The [sent_transactions] table is intentionally preserved: it records txs the
+   wallet itself originated (with their real destination / fee), and [scan_block]
+   re-promotes their pre-recorded [`Send] history rows as it re-walks the range.
+   A wallet restored from seed alone (the recovery -> rescan path) has an empty
+   [sent_transactions] table, so this is a no-op for that case. *)
+let clear_for_rescan (w : t) : unit =
+  w.utxos <- [];
+  w.balance_confirmed <- 0L;
+  w.balance_unconfirmed <- 0L;
+  w.tx_history <- []
 
 (* ============================================================================
    Locked coins (lockunspent / listlockunspent)

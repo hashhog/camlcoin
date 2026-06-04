@@ -2573,51 +2573,211 @@ let handle_listlockunspent (ctx : rpc_context)
    Transaction History Handler
    ============================================================================ *)
 
+(* Live confirmation count for a wallet history entry, computed against the
+   current validated tip exactly like Core's GetTxDepthInMainChain: a tx in the
+   block at height H has [tip - H + 1] confirmations; an unconfirmed (mempool /
+   just-broadcast) entry has 0.  Stored [hist_confirmations] is NOT trusted —
+   camlcoin never calls update_confirmations on every block — so it is always
+   recomputed here so the value can never go stale as the chain advances. *)
+let hist_confirmations (ctx : rpc_context) (h : Wallet.tx_history_entry) : int =
+  if h.Wallet.hist_block_height <= 0 then 0
+  else
+    let tip = ctx.chain.Sync.blocks_synced in
+    max 0 (tip - h.Wallet.hist_block_height + 1)
+
+(* Core's listtransactions / gettransaction category string for one history
+   row, applying the live confirmation count.  A coinbase credit ([`Generate])
+   is reported as "immature" until it has COINBASE_MATURITY (=100) confirmations
+   beyond the one that mined it — i.e. spendable at depth >= 101 confirmations
+   (validation: premature_spend_of_coinbase / IsTxImmatureCoinBase) — and
+   "generate" once mature; "orphan" if it somehow has 0 confirmations. *)
+let hist_category_str (h : Wallet.tx_history_entry) (confs : int) : string =
+  match h.Wallet.hist_category with
+  | `Send -> "send"
+  | `Receive -> "receive"
+  | `Generate ->
+    if confs < 1 then "orphan"
+    else if confs <= Consensus.coinbase_maturity then "immature"
+    else "generate"
+
+(* Build the Core-shaped listtransactions / gettransaction-details object for
+   one wallet history row.  Sign conventions match wallet/rpc/transactions.cpp
+   ListTransactions: the amount is NEGATIVE for a "send" (value left the
+   wallet), POSITIVE for receive/generate/immature; the fee is present and
+   NEGATIVE for sends only.  [generated]=true is emitted only for coinbase
+   credits.  [blockhash]/[blockheight]/[blocktime] appear once confirmed. *)
+let hist_entry_json (ctx : rpc_context) (h : Wallet.tx_history_entry)
+    : Yojson.Safe.t =
+  let confs = hist_confirmations ctx h in
+  let cat = hist_category_str h confs in
+  let amt_btc = Int64.to_float h.Wallet.hist_amount /. 100_000_000.0 in
+  let signed_amt = if cat = "send" then -. amt_btc else amt_btc in
+  let base = [
+    ("address", `String h.Wallet.hist_address);
+    ("category", `String cat);
+    ("amount", `Float signed_amt);
+    ("vout", `Int h.Wallet.hist_vout);
+  ] in
+  let fee_field =
+    if cat = "send" then
+      [ ("fee", `Float (-. (Int64.to_float h.Wallet.hist_fee /. 100_000_000.0))) ]
+    else [] in
+  let generated_field =
+    if h.Wallet.hist_is_coinbase then [ ("generated", `Bool true) ] else [] in
+  let confirm_fields =
+    if h.Wallet.hist_block_height > 0 then
+      [ ("blockhash", `String h.Wallet.hist_block_hash);
+        ("blockheight", `Int h.Wallet.hist_block_height);
+        ("blocktime", `Int (int_of_float h.Wallet.hist_timestamp)) ]
+    else [] in
+  `Assoc (base @ fee_field @ generated_field @
+    [ ("confirmations", `Int confs) ] @ confirm_fields @
+    [ ("txid", `String h.Wallet.hist_txid);
+      ("time", `Int (int_of_float h.Wallet.hist_timestamp));
+      ("timereceived", `Int (int_of_float h.Wallet.hist_timestamp)) ])
+
+(* listtransactions ( "label" count skip include_watchonly )
+   Returns the most recent wallet transactions, newest first, Core-shaped.
+   Core's positional layout is (label, count, skip, include_watchonly); for
+   backward-compatibility a leading integer is also accepted as the count (the
+   pre-Core-shape camlcoin layout).  Default count=10, skip=0. *)
 let handle_listtransactions (ctx : rpc_context)
     (params : Yojson.Safe.t list) : Yojson.Safe.t =
   match ctx.wallet with
   | None -> `List []
   | Some wallet ->
-    let count = match params with
-      | `Int c :: _ -> c
-      | _ -> 10
+    (* Resolve count + skip across both the Core layout (label first) and the
+       legacy layout (count first). *)
+    let count, skip = match params with
+      | `Int c :: `Int s :: _ -> c, s            (* legacy: count, skip *)
+      | `Int c :: _ -> c, 0                       (* legacy: count *)
+      | _ :: `Int c :: `Int s :: _ -> c, s        (* Core: label, count, skip *)
+      | _ :: `Int c :: _ -> c, 0                  (* Core: label, count *)
+      | _ -> 10, 0
     in
-    let skip = match params with
-      | _ :: `Int s :: _ -> s
-      | _ -> 0
-    in
-    (* Sort by timestamp descending *)
+    (* Newest first.  Confirmed entries sort by block height (then by recorded
+       time); unconfirmed (height 0) entries sort to the very top by their
+       wall-clock time — matching Core listing the most recent activity first
+       and keeping a just-broadcast send visible above older confirmed rows. *)
     let sorted = List.sort (fun a b ->
-      compare b.Wallet.hist_timestamp a.Wallet.hist_timestamp
+      let ha = a.Wallet.hist_block_height and hb = b.Wallet.hist_block_height in
+      let rank h = if h <= 0 then max_int else h in
+      let c = compare (rank hb) (rank ha) in
+      if c <> 0 then c
+      else compare b.Wallet.hist_timestamp a.Wallet.hist_timestamp
     ) wallet.Wallet.tx_history in
-    (* Apply skip *)
     let rec drop n lst = match n, lst with
-      | 0, l -> l
-      | _, [] -> []
-      | n, _ :: rest -> drop (n - 1) rest
-    in
-    let skipped = drop skip sorted in
-    (* Apply count *)
+      | 0, l -> l | _, [] -> [] | n, _ :: rest -> drop (n - 1) rest in
     let rec take n lst = match n, lst with
-      | 0, _ -> []
-      | _, [] -> []
-      | n, x :: rest -> x :: take (n - 1) rest
-    in
-    let entries = take count skipped in
-    `List (List.map (fun h ->
-      `Assoc [
-        ("txid", `String h.Wallet.hist_txid);
-        ("category", `String (match h.Wallet.hist_category with
-          | `Send -> "send" | `Receive -> "receive"));
-        ("amount", `Float (Int64.to_float h.Wallet.hist_amount /. 100_000_000.0));
-        ("fee", `Float (Int64.to_float h.Wallet.hist_fee /. 100_000_000.0));
-        ("address", `String h.Wallet.hist_address);
-        ("confirmations", `Int h.Wallet.hist_confirmations);
-        ("blockhash", `String h.Wallet.hist_block_hash);
-        ("blockheight", `Int h.Wallet.hist_block_height);
-        ("time", `Int (int_of_float h.Wallet.hist_timestamp));
-      ]
-    ) entries)
+      | 0, _ -> [] | _, [] -> [] | n, x :: rest -> x :: take (n - 1) rest in
+    let entries = take count (drop skip sorted) in
+    `List (List.map (hist_entry_json ctx) entries)
+
+(* gettransaction "txid" ( include_watchonly verbose )
+   Returns detailed wallet information about an in-wallet transaction, Core-shaped
+   (wallet/rpc/transactions.cpp gettransaction): the net [amount], a negative
+   [fee] when the wallet originated the tx, the live confirmation count, the
+   confirming block coordinates, the [generated] flag for coinbase, a [details]
+   array of the per-output/input category rows, and the raw [hex].  Errors with
+   "Invalid or non-wallet transaction id" for a txid the wallet does not know
+   (Core RPC_INVALID_ADDRESS_OR_KEY). *)
+let handle_gettransaction (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match ctx.wallet with
+  | None -> Error "Wallet not loaded"
+  | Some wallet ->
+    match params with
+    | `String txid :: _ ->
+      let txid = String.lowercase_ascii (String.trim txid) in
+      let rows = List.filter (fun h -> h.Wallet.hist_txid = txid)
+        wallet.Wallet.tx_history in
+      if rows = [] then
+        Error "Invalid or non-wallet transaction id"
+      else begin
+        (* Net amount = sum of credits (positive) minus the value the wallet
+           sent (the send rows' amounts), minus fee — mirroring Core's
+           nNet - nFee.  A pure receive/generate nets +amount with no fee; a
+           send nets -(amount) and reports the fee. *)
+        let is_send = List.exists (fun h -> h.Wallet.hist_category = `Send) rows in
+        let fee =
+          List.fold_left (fun acc h ->
+            if h.Wallet.hist_category = `Send then h.Wallet.hist_fee else acc)
+            0L rows in
+        let net =
+          List.fold_left (fun acc h ->
+            match h.Wallet.hist_category with
+            | `Send -> Int64.sub acc h.Wallet.hist_amount
+            | _ -> Int64.add acc h.Wallet.hist_amount) 0L rows in
+        (* representative row for the top-level block / coinbase fields *)
+        let repr = List.hd rows in
+        let confs = hist_confirmations ctx repr in
+        let is_coinbase = List.exists (fun h -> h.Wallet.hist_is_coinbase) rows in
+        let amount_btc = Int64.to_float net /. 100_000_000.0 in
+        let top = [
+          ("amount", `Float amount_btc);
+        ] in
+        let fee_field =
+          if is_send then
+            [ ("fee", `Float (-. (Int64.to_float fee /. 100_000_000.0))) ]
+          else [] in
+        let generated_field =
+          if is_coinbase then [ ("generated", `Bool true) ] else [] in
+        let confirm_fields =
+          if repr.Wallet.hist_block_height > 0 then
+            [ ("blockhash", `String repr.Wallet.hist_block_hash);
+              ("blockheight", `Int repr.Wallet.hist_block_height);
+              ("blocktime", `Int (int_of_float repr.Wallet.hist_timestamp)) ]
+          else [] in
+        (* Raw hex.  Convert the user-facing display-order txid to the
+           internal-order Cstruct used as keys / lookup arguments.  The wallet
+           retains the signed tx for its own sends (keyed by internal-order
+           hex); otherwise fall back to the chain/mempool lookup. *)
+        let internal_txid_cs =
+          try
+            let disp = Types.hash256_of_hex txid in   (* 32 bytes, display order *)
+            let internal = Cstruct.create 32 in
+            for i = 0 to 31 do
+              Cstruct.set_uint8 internal i (Cstruct.get_uint8 disp (31 - i))
+            done;
+            Some internal
+          with _ -> None
+        in
+        let hex_field =
+          let from_wallet =
+            match internal_txid_cs with
+            | Some cs ->
+              let internal_hex =
+                let buf = Buffer.create 64 in
+                for i = 0 to 31 do
+                  Buffer.add_string buf (Printf.sprintf "%02x" (Cstruct.get_uint8 cs i))
+                done;
+                Buffer.contents buf
+              in
+              (match Hashtbl.find_opt wallet.Wallet.sent_transactions internal_hex with
+               | Some tx -> Some (tx_to_hex tx)
+               | None -> None)
+            | None -> None
+          in
+          let hx = match from_wallet with
+            | Some h -> Some h
+            | None ->
+              (match internal_txid_cs with
+               | Some cs ->
+                 (match lookup_transaction ctx cs None with
+                  | Ok (tx, _) -> Some (tx_to_hex tx)
+                  | Error _ -> None)
+               | None -> None)
+          in
+          match hx with Some h -> [ ("hex", `String h) ] | None -> [] in
+        let details = `List (List.map (hist_entry_json ctx) rows) in
+        Ok (`Assoc (top @ fee_field @ generated_field @
+          [ ("confirmations", `Int confs) ] @ confirm_fields @
+          [ ("txid", `String txid);
+            ("time", `Int (int_of_float repr.Wallet.hist_timestamp));
+            ("timereceived", `Int (int_of_float repr.Wallet.hist_timestamp));
+            ("details", details) ] @ hex_field))
+      end
+    | _ -> Error "Invalid parameters: expected [txid]"
 
 (* ============================================================================
    Multi-Wallet Management Handlers
@@ -9002,6 +9162,10 @@ let dispatch_rpc (ctx : rpc_context)
      | Error msg -> Error (rpc_wallet_error, msg))
   | "listtransactions" ->
     Ok (handle_listtransactions ctx params)
+  | "gettransaction" ->
+    (match handle_gettransaction ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_invalid_address, msg))
   | "listunspent" ->
     Ok (handle_listunspent ctx params)
   | "sendtoaddress" ->

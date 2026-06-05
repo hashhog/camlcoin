@@ -8065,10 +8065,12 @@ let handle_help (_ctx : rpc_context)
       "";
       "== Network ==";
       "addnode \"node\" \"add\"|\"remove\"|\"onetry\"";
+      "addpeeraddress \"address\" port ( tried )";
       "clearbanned";
       "disconnectnode \"address\"";
       "getconnectioncount";
       "getnetworkinfo";
+      "getnodeaddresses ( count \"network\" )";
       "getpeerinfo";
       "listbanned";
       "setban \"address\" \"add\"|\"remove\" ( bantime )";
@@ -9359,6 +9361,164 @@ let handle_getindexinfo (ctx : rpc_context)
   in
   Ok (`Assoc entries)
 
+(* ----- getnodeaddresses — read-only addrman dump ----- *)
+
+(* Map a stored address string to the Core RPC network name as emitted by
+   getnodeaddresses (GetNetworkName(addr.GetNetClass()), netbase.cpp:114-128):
+   ipv4 / ipv6 / onion / i2p / cjdns / internal.  Core can also emit
+   not_publicly_routable for an unroutable address, but the addrman only ever
+   stores routable addresses (AddrMan::AddSingle drops non-routable), so a
+   dumped entry never carries that class. *)
+let core_network_name_of_addr (addr : string) : string =
+  match P2p.network_type_of_host addr with
+  | P2p.Net_IPv4 -> "ipv4"
+  | P2p.Net_IPv6 -> "ipv6"
+  | P2p.Net_Onion -> "onion"
+  | P2p.Net_I2P -> "i2p"
+  | P2p.Net_CJDNS -> "cjdns"
+  | P2p.Net_Internal -> "internal"
+
+(* Parse the optional [network] filter argument the way Bitcoin Core's
+   ParseNetwork (netbase.cpp:100-112) does: lowercase, accept ONLY
+   ipv4|ipv6|onion|i2p|cjdns.  Returns:
+     Ok None             -> no filter (arg absent / null)
+     Ok (Some net)       -> filter to this Core network name
+     Error raw           -> unrecognised network (caller throws -8) *)
+let parse_network_filter (arg : Yojson.Safe.t option)
+    : (string option, string) result =
+  match arg with
+  | None | Some `Null -> Ok None
+  | Some (`String raw) ->
+    (match String.lowercase_ascii raw with
+     | "ipv4" -> Ok (Some "ipv4")
+     | "ipv6" -> Ok (Some "ipv6")
+     | "onion" -> Ok (Some "onion")
+     | "i2p" -> Ok (Some "i2p")
+     | "cjdns" -> Ok (Some "cjdns")
+     | _ -> Error raw)
+  | Some _ -> Error "non-string network argument"
+
+(* getnodeaddresses ( count "network" )
+   Faithful port of Bitcoin Core src/rpc/net.cpp:911-970.
+   Returns a JSON ARRAY of objects, each with EXACTLY 5 keys in order:
+     time (NUM_TIME, unix seconds int), services (NUM, raw bitfield int),
+     address (STR, no port), port (NUM int),
+     network (STR: ipv4/ipv6/onion/i2p/cjdns/internal).
+   PARAMS:
+     count (positional 0, default 1) = MAX to return; 0 = return ALL known.
+       count < 0 -> error -8 "Address count out of range".
+     network (positional 1, optional) = filter to that network; an
+       unrecognised string -> error -8 "Network not recognized: <raw>".
+   The source addrman is shuffled by Core; callers must treat order as
+   non-deterministic. *)
+let handle_getnodeaddresses (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  (* count: default 1, 0 means ALL, negative is an error. *)
+  let count_arg = match params with
+    | [] -> None
+    | `Null :: _ -> None
+    | j :: _ -> Some j
+  in
+  let count_result : (int, int * string) result =
+    match count_arg with
+    | None -> Ok 1
+    | Some (`Int n) -> Ok n
+    | Some (`Intlit s) ->
+      (match int_of_string_opt s with
+       | Some n -> Ok n
+       | None -> Error (rpc_invalid_parameter, "Address count out of range"))
+    | Some _ -> Error (rpc_invalid_parameter, "Address count out of range")
+  in
+  match count_result with
+  | Error e -> Error e
+  | Ok count ->
+    if count < 0 then
+      Error (rpc_invalid_parameter, "Address count out of range")
+    else begin
+      let network_arg = match params with
+        | _ :: nw :: _ -> Some nw
+        | _ -> None
+      in
+      match parse_network_filter network_arg with
+      | Error raw ->
+        Error (rpc_invalid_parameter,
+               Printf.sprintf "Network not recognized: %s" raw)
+      | Ok net_filter ->
+        let all = Peer_manager.get_addr_dump ctx.peer_manager in
+        (* Map each addr to (network_name, json-object) and apply the filter. *)
+        let objs =
+          List.filter_map (fun (info : Peer_manager.peer_info) ->
+            let net = core_network_name_of_addr info.address in
+            match net_filter with
+            | Some want when want <> net -> None
+            | _ ->
+              (* time = unix seconds as INTEGER (Core: TicksSinceEpoch<seconds>).
+                 We store last_connected as a float unix timestamp. *)
+              let time_int = int_of_float info.last_connected in
+              Some (`Assoc [
+                ("time", `Int time_int);
+                (* services: raw bitfield as INTEGER, not hex. *)
+                ("services", `Intlit (Int64.to_string info.services));
+                ("address", `String info.address);
+                ("port", `Int info.port);
+                ("network", `String net);
+              ])
+          ) all
+        in
+        (* count == 0 means ALL; otherwise cap at count. *)
+        let limited =
+          if count = 0 then objs
+          else List.filteri (fun i _ -> i < count) objs
+        in
+        Ok (`List limited)
+    end
+
+(* ----- addpeeraddress — testing-only addrman injector ----- *)
+
+(* addpeeraddress "address" port ( tried )
+   Faithful (minimal) port of Bitcoin Core src/rpc/net.cpp:972-1024.
+   Inserts {address, port} into the addrman so getnodeaddresses can be tested
+   deterministically.  Returns {"success": bool}.  We additionally accept an
+   optional 4th positional "services" integer so a known bitfield can be
+   injected; absent -> NODE_NETWORK|NODE_WITNESS (1033) as Core sets. The
+   "tried" arg is accepted for Core-shape compatibility but treated as a
+   no-op (camlcoin's addrman new/tried split is internal). *)
+let handle_addpeeraddress (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  let address_arg = match params with
+    | (`String s) :: _ -> Ok s
+    | _ -> Error (rpc_type_error, "address must be a string")
+  in
+  match address_arg with
+  | Error e -> Error e
+  | Ok address ->
+    let port_arg = match params with
+      | _ :: (`Int p) :: _ -> Ok p
+      | _ :: (`Intlit s) :: _ ->
+        (match int_of_string_opt s with
+         | Some p -> Ok p
+         | None -> Error (rpc_type_error, "port must be an integer"))
+      | _ -> Error (rpc_type_error, "port must be an integer")
+    in
+    (match port_arg with
+     | Error e -> Error e
+     | Ok port ->
+       (* Optional 4th positional services bitfield; default 9
+          (NODE_NETWORK | NODE_WITNESS = 1 | 8), matching Core's
+          addpeeraddress (net.cpp:1009 ServiceFlags{NODE_NETWORK|NODE_WITNESS}). *)
+       let services =
+         match params with
+         | _ :: _ :: _ :: (`Int s) :: _ -> Int64.of_int s
+         | _ :: _ :: _ :: (`Intlit s) :: _ ->
+           (match Int64.of_string_opt s with Some v -> v | None -> 9L)
+         | _ -> 9L
+       in
+       let success =
+         Peer_manager.add_peer_address ctx.peer_manager
+           ~address ~port ~services
+       in
+       Ok (`Assoc [("success", `Bool success)]))
+
 (* ============================================================================
    RPC Method Dispatcher
    ============================================================================ *)
@@ -9405,6 +9565,10 @@ let dispatch_rpc (ctx : rpc_context)
     handle_getchaintxstats ctx params
   | "getindexinfo" ->
     handle_getindexinfo ctx params
+  | "getnodeaddresses" ->
+    handle_getnodeaddresses ctx params
+  | "addpeeraddress" ->
+    handle_addpeeraddress ctx params
   | "invalidateblock" ->
     (match handle_invalidateblock ctx params with
      | Ok r -> Ok r

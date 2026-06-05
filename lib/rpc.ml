@@ -7914,16 +7914,28 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
     | (`Null) :: rest -> ("hash_serialized_3", rest)
     | _ -> ("hash_serialized_3", List.tl params)
   in
-  if extra_args <> [] && extra_args <> [`Null] then
-    Error "Querying specific block heights is not supported"
-  else
-    let normalized = String.lowercase_ascii hash_type in
-    if normalized <> "none"
-       && normalized <> "hash_serialized_3"
-       && normalized <> "muhash" then
-      Error (Printf.sprintf
-               "%s is not a valid hash_type" hash_type)
-    else begin
+  let normalized = String.lowercase_ascii hash_type in
+  (* Validate hash_type FIRST, exactly like Core's ParseHashType
+     (blockchain.cpp:967) which runs before any param[1] inspection. An
+     unrecognized type is RPC_INVALID_PARAMETER with Core's verbatim
+     wording. *)
+  if normalized <> "none"
+     && normalized <> "hash_serialized_3"
+     && normalized <> "muhash" then
+    Error (Printf.sprintf "'%s' is not a valid hash_type" hash_type)
+  else if extra_args <> [] && extra_args <> [`Null] then
+    (* A specific block/height was supplied. Core requires coinstatsindex
+       for that, and additionally forbids hash_serialized_3 for a specific
+       block outright (blockchain.cpp:1090-1092). We maintain no
+       coinstatsindex, so the specific-block path is unsupported; surface
+       Core's exact hash_serialized_3 message for that hash_type (the case
+       the differential test exercises) and a coinstatsindex message
+       otherwise. Both are RPC_INVALID_PARAMETER (-8). *)
+    (if normalized = "hash_serialized_3" then
+       Error "hash_serialized_3 hash type cannot be queried for a specific block"
+     else
+       Error "Querying specific block heights requires coinstatsindex")
+  else begin
       (* Walk the UTXO set once, computing aggregate stats and (optionally)
          the requested commitment in a single pass. The MuHash accumulator
          is allocated lazily so callers asking for hash_type=none don't pay
@@ -7941,6 +7953,14 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
       let txouts = ref 0 in
       let bogosize = ref 0L in
       let total_amount = ref 0L in
+      (* disk_size is "impl-specific" in Core (LevelDB EstimateSize). We
+         have no equivalent estimator on the RocksDB CF backend, so we
+         approximate the on-disk chainstate footprint by summing the raw
+         key+value bytes of each coin entry (key = txid32 + vout4 = 36,
+         value = serialized utxo entry) during the single pass below. This
+         is a non-zero, monotone-with-set-size Int — the test asserts it is
+         PRESENT and typed, not byte-equal to Core. *)
+      let disk_size = ref 0L in
       let txid_set = Hashtbl.create 1024 in
       Storage.ChainDB.iter_utxos ctx.chain.db (fun txid vout data ->
         let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
@@ -7955,6 +7975,9 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
         (* Core's GetBogoSize: 32 + 4 + 4 + 8 + 2 + scriptPubKey.size *)
         let spk_len = Cstruct.length utxo.script_pubkey in
         bogosize := Int64.add !bogosize (Int64.of_int (50 + spk_len));
+        (* Impl-specific disk-size estimate: 36-byte key + value bytes. *)
+        disk_size :=
+          Int64.add !disk_size (Int64.of_int (36 + String.length data));
         (match muhash_acc with
          | None -> ()
          | Some acc ->
@@ -7988,15 +8011,16 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
         ("height", `Int tip_height);
         ("bestblock",
            `String (Types.hash256_to_hex_display tip_hash));
-        ("transactions", `Int (Hashtbl.length txid_set));
         ("txouts", `Int !txouts);
         ("bogosize", `Int (Int64.to_int !bogosize));
+        ("transactions", `Int (Hashtbl.length txid_set));
+        ("disk_size", `Int (Int64.to_int !disk_size));
         ("total_amount",
-           (* Core formats total_amount as a fixed-precision BTC float;
-              we emit satoshis as int to keep the value loss-free for
-              downstream tooling, matching what camlcoin does in
-              getblockstats. *)
-           `Int (Int64.to_int !total_amount));
+           (* Core formats total_amount as a fixed-precision BTC decimal
+              via ValueFromAmount (blockchain.cpp:1126). Emit the same
+              "N.NNNNNNNN" decimal so the field is byte-comparable against
+              Core's gettxoutsetinfo output. *)
+           btc_amount_json !total_amount);
       ] in
       let hash_field =
         match muhash_acc, hash_buffer with
@@ -10008,9 +10032,14 @@ let dispatch_rpc (ctx : rpc_context)
      | Ok r -> Ok r
      | Error msg -> Error (rpc_invalid_params, msg))
   | "gettxoutsetinfo" ->
+    (* Core throws RPC_INVALID_PARAMETER (-8) for every error this RPC can
+       raise: an unrecognized hash_type (ParseHashType,
+       blockchain.cpp:976) and "hash_serialized_3 hash type cannot be
+       queried for a specific block" (blockchain.cpp:1091). Map the
+       handler's string errors to -8 so the wire code matches Core. *)
     (match handle_gettxoutsetinfo ctx params with
      | Ok r -> Ok r
-     | Error msg -> Error (rpc_invalid_params, msg))
+     | Error msg -> Error (rpc_invalid_parameter, msg))
   | "scrubunspendable" ->
     (match handle_scrubunspendable ctx params with
      | Ok r -> Ok r

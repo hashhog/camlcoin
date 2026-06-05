@@ -35,6 +35,7 @@ let rpc_type_error = -3
 let rpc_invalid_address = -5
 let rpc_wallet_error = -4
 let rpc_insufficient_funds = -6
+let rpc_invalid_parameter = -8
 let rpc_deserialization_error = -22
 let rpc_verify_error = -25
 let rpc_verify_rejected = -26
@@ -8038,6 +8039,7 @@ let handle_help (_ctx : rpc_context)
       "getdeploymentinfo ( \"blockhash\" )";
       "getdifficulty";
       "getchaintips";
+      "getchaintxstats ( nblocks \"blockhash\" )";
       "";
       "== Mining ==";
       "getblocktemplate";
@@ -9107,6 +9109,169 @@ let handle_checkpayjoinreplay (params : Yojson.Safe.t list)
        ]))
   | _ -> Error "Invalid parameters: expected [orig_psbt_base64]"
 
+(* ----- getchaintxstats — chain transaction statistics ----- *)
+
+(* Core m_chain_tx_count analogue: the cumulative number of transactions in
+   the active chain from genesis up to and including [height].  Bitcoin Core
+   stores this as a running counter on each CBlockIndex (chain.h:129); we
+   reconstruct it on demand by summing the per-block tx count over the active
+   chain.  Every connected block records its tx count in the dedicated ntx
+   index (see [Storage.ChainDB.store_block_ntx], written on every IBD /
+   generate / submitblock connect), so this is an index lookup per height; if
+   the ntx index is missing for some height we fall back to counting the
+   stored block body.  Returns the cumulative count, exactly matching Core's
+   m_chain_tx_count for a standard (non-assumeutxo) chain. *)
+let chain_tx_count_at_height (ctx : rpc_context) (height : int) : int =
+  let db = ctx.chain.db in
+  let total = ref 0 in
+  for h = 0 to height do
+    match Sync.get_header_at_height ctx.chain h with
+    | None -> ()
+    | Some entry ->
+      let ntx =
+        match Storage.ChainDB.get_block_ntx db entry.hash with
+        | Some n -> n
+        | None ->
+          (match Storage.ChainDB.get_block db entry.hash with
+           | Some block ->
+             let n = List.length block.transactions in
+             (* Cache for subsequent calls *)
+             Storage.ChainDB.store_block_ntx db entry.hash n;
+             n
+           | None ->
+             (* Genesis (height 0) carries exactly one transaction — the
+                genesis coinbase — on every Bitcoin network, but its body is
+                never persisted to the block CF (only the header lives in
+                chainparams), so both the ntx index and the body lookup miss.
+                Core counts it in m_chain_tx_count (genesis nChainTx = 1),
+                so a faithful txcount must include it. *)
+             if h = 0 then 1 else 0)
+      in
+      total := !total + ntx
+  done;
+  !total
+
+(* getchaintxstats ( nblocks "blockhash" )
+   Faithful port of Bitcoin Core src/rpc/blockchain.cpp:1809-1898.
+   Both args optional. Errors: -5 (block not found), -8 (not in main chain /
+   invalid block count). *)
+let handle_getchaintxstats (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  (* Default window = "one month" of blocks = 30*24*60*60 / nPowTargetSpacing.
+     Core: blockchain.cpp:1844.  nPowTargetSpacing is 600s on all networks
+     camlcoin supports (mainnet/testnet/regtest), matching Core chainparams. *)
+  let target_spacing =
+    if Consensus.target_block_time <= 0 then 600 else Consensus.target_block_time
+  in
+  let default_blockcount = (30 * 24 * 60 * 60) / target_spacing in
+
+  (* Resolve the window-final block index [pindex]. *)
+  let nblocks_arg = match params with
+    | (`Int _ as j) :: _ | (`Intlit _ as j) :: _ -> Some j
+    | `Null :: _ -> None
+    | [] -> None
+    | _ :: _ -> Some (List.hd params)
+  in
+  let blockhash_arg = match params with
+    | _ :: (`String _ as j) :: _ -> Some j
+    | _ -> None
+  in
+
+  let pindex_result : (Sync.header_entry, int * string) result =
+    match blockhash_arg with
+    | None ->
+      (* Default: active-chain validated tip. *)
+      (match Sync.block_tip ctx.chain with
+       | Some t -> Ok t
+       | None -> Error (rpc_misc_error, "No blocks in chain"))
+    | Some (`String hex) ->
+      (match parse_blockhash_hex hex with
+       | Error m -> Error (rpc_invalid_parameter, m)
+       | Ok hash ->
+         (match Sync.get_header ctx.chain hash with
+          | None -> Error (rpc_invalid_address, "Block not found")
+          | Some entry ->
+            (* Active-chain membership (Core: ActiveChain().Contains): the
+               block at [entry.height] in the active chain must be exactly
+               this hash. *)
+            (match Sync.get_header_at_height ctx.chain entry.height with
+             | Some main when Cstruct.equal main.hash entry.hash -> Ok entry
+             | _ -> Error (rpc_invalid_parameter, "Block is not in main chain"))))
+    | Some _ -> Error (rpc_invalid_parameter, "blockhash must be a string")
+  in
+
+  match pindex_result with
+  | Error e -> Error e
+  | Ok pindex ->
+    (* Resolve the window size [blockcount]. Core: blockchain.cpp:1863-1872. *)
+    let blockcount_result : (int, int * string) result =
+      match nblocks_arg with
+      | None ->
+        (* Default clamps to [0, height-1]. *)
+        Ok (max 0 (min default_blockcount (pindex.height - 1)))
+      | Some j ->
+        let n = match j with
+          | `Int n -> Some n
+          | `Intlit s -> (try Some (int_of_string s) with _ -> None)
+          | _ -> None
+        in
+        (match n with
+         | None -> Error (rpc_invalid_parameter, "nblocks must be an integer")
+         | Some bc ->
+           if bc < 0 || (bc > 0 && bc >= pindex.height) then
+             Error (rpc_invalid_parameter,
+               "Invalid block count: should be between 0 and the block's height - 1")
+           else Ok bc)
+    in
+    (match blockcount_result with
+     | Error e -> Error e
+     | Ok blockcount ->
+       (* The window-start block (ancestor of pindex at height-blockcount).
+          Core: pindex->GetAncestor(pindex->nHeight - blockcount). *)
+       let past_height = pindex.height - blockcount in
+       let past_block = Sync.get_ancestor ctx.chain pindex past_height in
+       (* window_interval = MEDIAN-TIME-PAST(pindex) - MEDIAN-TIME-PAST(past).
+          Core uses GetMedianTimePast (11-block window, includes the block).
+          [compute_median_time_for_display] is exactly that variant. *)
+       let mtp h = Int32.to_int (Sync.compute_median_time_for_display ctx.chain h) in
+       let time_diff =
+         match past_block with
+         | Some pb -> (mtp pindex.height) - (mtp pb.height)
+         | None -> 0
+       in
+       (* time = the FINAL block's RAW header nTime (NOT mediantime). *)
+       let final_time = Int32.to_int pindex.header.timestamp in
+       let txcount = chain_tx_count_at_height ctx pindex.height in
+       let past_txcount = match past_block with
+         | Some pb -> chain_tx_count_at_height ctx pb.height
+         | None -> 0
+       in
+       let base = [
+         ("time", `Int final_time);
+         (* txcount is optional in Core (absent under assumeutxo); on a normal
+            chain it is always present. *)
+         ("txcount", `Int txcount);
+         ("window_final_block_hash",
+          `String (Types.hash256_to_hex_display pindex.hash));
+         ("window_final_block_height", `Int pindex.height);
+         ("window_block_count", `Int blockcount);
+       ] in
+       let fields =
+         if blockcount > 0 then begin
+           let f = base @ [("window_interval", `Int time_diff)] in
+           (* window_tx_count only when txcount exists for both ends. On a
+              normal chain both are known. *)
+           let window_tx_count = txcount - past_txcount in
+           let f = f @ [("window_tx_count", `Int window_tx_count)] in
+           (* txrate only when window_interval > 0. *)
+           if time_diff > 0 then
+             f @ [("txrate", `Float (float_of_int window_tx_count /. float_of_int time_diff))]
+           else f
+         end
+         else base
+       in
+       Ok (`Assoc fields))
+
 (* ============================================================================
    RPC Method Dispatcher
    ============================================================================ *)
@@ -9149,6 +9314,8 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_getblockstats ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
+  | "getchaintxstats" ->
+    handle_getchaintxstats ctx params
   | "invalidateblock" ->
     (match handle_invalidateblock ctx params with
      | Ok r -> Ok r

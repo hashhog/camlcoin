@@ -915,6 +915,13 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
              (* Store the block body *)
              Storage.ChainDB.store_block chain.db hash block;
 
+             (* Record this block's tx count in the dedicated ntx index so
+                getblockheader / getchaintxstats can read it without parsing
+                the body.  Mirrors the IBD / process_new_block connect path's
+                store_block_ntx call. *)
+             Storage.ChainDB.store_block_ntx chain.db hash
+               (List.length block.transactions);
+
              (* Update blocks_synced to match *)
              chain.blocks_synced <- height;
 

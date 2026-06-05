@@ -585,12 +585,21 @@ let test_g15a_non_signaling_child_of_signaling_parent_true () =
     true (g15_bip125_flag_of_json j_parent);
   Storage.ChainDB.close db
 
-(* G16.  BUG-3 P1.  sendrawtransaction does not route through accept_transaction. *)
+(* G16.  BUG-3 P1 — CLOSED.  sendrawtransaction now routes through the
+   RBF-aware acceptance path [accept_transaction_with_replaced] so an input
+   conflict triggers BIP125 replacement (Core: sendrawtransaction →
+   AcceptToMemoryPool → ConsiderReplacement).  Forward-regression guard:
+   assert the RBF-aware dispatch is wired into the sendrawtransaction handler.
+   (NOTE: a bare `match Mempool.add_transaction ctx.mempool tx with` still
+   appears in the WALLET send path [handle_sendtoaddress]; that is a different
+   handler — sendtoaddress builds its own non-conflicting tx — so this guard
+   pins the sendrawtransaction-specific RBF dispatch rather than grepping for
+   the absence of the generic add_transaction string, which would collide.) *)
 let test_g16_sendrawtransaction_bypasses_rbf () =
-  Alcotest.(check bool) "BUG-3: sendrawtransaction still calls add_transaction" true
-    (file_has_marker "lib/rpc.ml" "match Mempool.add_transaction ctx.mempool tx with");
-  Alcotest.(check bool) "BUG-3: sendrawtransaction does not call accept_transaction" false
-    (file_has_marker "lib/rpc.ml" "Mempool.accept_transaction ctx.mempool tx")
+  Alcotest.(check bool) "BUG-3 FIX: sendrawtransaction routes through accept_transaction_with_replaced" true
+    (file_has_marker "lib/rpc.ml" "match Mempool.accept_transaction_with_replaced ctx.mempool tx with");
+  Alcotest.(check bool) "BUG-3 FIX: sendrawtransaction returns the evicted (replaced) txid list" true
+    (file_has_marker "lib/rpc.ml" "Ok (entry, replaced_txids) ->")
 
 (* G17.  Error reject reasons.  Core emits:
      "txn-mempool-conflict", "insufficient fee, rejecting replacement",
@@ -811,13 +820,17 @@ let test_g18d_atmp_replaced_txids_populated_on_rbf () =
    G19-G20 — RBF routing through validators + fee-estimator skip
    ============================================================================ *)
 
-(* G19.  BUG-1 P0.  testmempoolaccept uses add_transaction (no RBF). *)
+(* G19.  BUG-1 P0 — CLOSED.  testmempoolaccept now evaluates the full RBF rule
+   set in dry_run mode via [accept_transaction ~dry_run:true], instead of
+   [add_transaction ~dry_run:true] which SKIPS conflict detection entirely (the
+   conflict check is guarded by `if not dry_run`).  Forward-regression guard:
+   assert the old dispatch is GONE and the RBF-aware dry-run dispatch is wired. *)
 let test_g19_testmempoolaccept_bypasses_rbf () =
   Alcotest.(check bool)
-    "BUG-1: testmempoolaccept still uses Mempool.add_transaction ~dry_run:true" true
+    "BUG-1 FIX: testmempoolaccept no longer uses add_transaction ~dry_run:true" false
     (file_has_marker "lib/rpc.ml" "match Mempool.add_transaction ~dry_run:true ctx.mempool tx with");
   Alcotest.(check bool)
-    "BUG-1: testmempoolaccept does NOT call accept_transaction" false
+    "BUG-1 FIX: testmempoolaccept evaluates RBF via accept_transaction ~dry_run:true" true
     (file_has_marker "lib/rpc.ml" "Mempool.accept_transaction ~dry_run:true ctx.mempool tx")
 
 (* G20.  BUG-8 P1.  Fee estimator does not differentiate eviction reasons.

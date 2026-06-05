@@ -8040,6 +8040,7 @@ let handle_help (_ctx : rpc_context)
       "getdifficulty";
       "getchaintips";
       "getchaintxstats ( nblocks \"blockhash\" )";
+      "getindexinfo ( \"index_name\" )";
       "";
       "== Mining ==";
       "getblocktemplate";
@@ -9272,6 +9273,92 @@ let handle_getchaintxstats (ctx : rpc_context)
        in
        Ok (`Assoc fields))
 
+(* ----- getindexinfo — running-index status ----- *)
+
+(* getindexinfo ( "index_name" )
+   Faithful port of Bitcoin Core src/rpc/node.cpp:351-410 (getindexinfo +
+   SummaryToJSON) over IndexSummary (src/index/base.h:30-35) / GetSummary
+   (src/index/base.cpp:472-484).
+
+   Returns a dynamic JSON OBJECT keyed BY INDEX NAME.  For each *running*
+   index, one entry whose value has EXACTLY two fields, in THIS ORDER:
+     { "<index name>": { "synced": <bool>, "best_block_height": <int> } }
+   No best_hash, no best_block_hash, no name-inside-the-value — Core's
+   SummaryToJSON pushes only [synced] then [best_block_height].
+
+   Index names are the literal Core GetName() strings:
+     "txindex"                     (txindex.cpp:69)
+     "basic block filter index"    (blockfilterindex.cpp:78)
+   An index appears ONLY if it is enabled/running (Core guards each with
+   `if (g_txindex){...}` / `ForEachBlockFilterIndex(...)`).
+
+   camlcoin index set:
+     - txindex: ALWAYS running.  camlcoin writes the txid -> (block_hash,
+       index) mapping (cf_tx_index) in lockstep at every connect-block
+       (Sync.tx_index_write_for_block); there is no enable/disable flag, so
+       this entry is always present.  best_block_height = the validated
+       block tip the index follows (chain.blocks_synced); synced = it has
+       caught up to the best-work header tip.
+     - basic block filter index: present ONLY when the daemon was started
+       with --blockfilterindex=basic (chain.bip157_index = Some _).
+       best_block_height = the highest indexed height (clamped to 0 for an
+       empty index, matching Core's m_best_block_height sentinel ->
+       best_block_height 0); synced = it has reached the validated block tip.
+
+   ARG index_name (optional, positional 0): filters to a single index.  An
+   entry is DROPPED when index_name is non-empty AND != the index name, so
+   `getindexinfo "txindex"` returns only the txindex entry and
+   `getindexinfo "no-such-index"` returns {} (an empty object, NOT an
+   error).  Empty / omitted arg = all running indexes. *)
+let handle_getindexinfo (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  let index_name =
+    match params with
+    | [] -> ""
+    | `String s :: _ -> s
+    | `Null :: _ -> ""
+    | _ -> ""
+  in
+  (* Core's SummaryToJSON: emit the entry only when the filter is empty or
+     matches this index's name. Value object is EXACTLY {synced,
+     best_block_height} in that order. *)
+  let summary ~name ~synced ~best_block_height acc =
+    if index_name <> "" && index_name <> name then acc
+    else
+      acc @ [ (name, `Assoc [
+        ("synced", `Bool synced);
+        ("best_block_height", `Int best_block_height);
+      ]) ]
+  in
+  (* Best-work header tip height, used as the "chain tip" the indexes chase. *)
+  let tip_height =
+    match ctx.chain.tip with
+    | Some t -> t.height
+    | None -> 0
+  in
+  let block_tip = ctx.chain.blocks_synced in
+  let entries = [] in
+  (* txindex — always running. *)
+  let entries =
+    summary ~name:"txindex"
+      ~synced:(block_tip >= tip_height)
+      ~best_block_height:block_tip
+      entries
+  in
+  (* basic block filter index — only when enabled. *)
+  let entries =
+    match ctx.chain.bip157_index with
+    | None -> entries
+    | Some idx ->
+      let best = Block_index.bip157_best_height idx in
+      let best = if best < 0 then 0 else best in
+      summary ~name:"basic block filter index"
+        ~synced:(best >= block_tip)
+        ~best_block_height:best
+        entries
+  in
+  Ok (`Assoc entries)
+
 (* ============================================================================
    RPC Method Dispatcher
    ============================================================================ *)
@@ -9316,6 +9403,8 @@ let dispatch_rpc (ctx : rpc_context)
      | Error msg -> Error (rpc_misc_error, msg))
   | "getchaintxstats" ->
     handle_getchaintxstats ctx params
+  | "getindexinfo" ->
+    handle_getindexinfo ctx params
   | "invalidateblock" ->
     (match handle_invalidateblock ctx params with
      | Ok r -> Ok r

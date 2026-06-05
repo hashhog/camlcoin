@@ -585,7 +585,7 @@ let handle_getblockheader (ctx : rpc_context)
       Cstruct.set_uint8 hash i (Cstruct.get_uint8 hash_bytes (31 - i))
     done;
     (match Storage.ChainDB.get_block_header ctx.chain.db hash with
-     | None -> Error "Block header not found"
+     | None -> Error "Block not found"
      | Some header ->
        let entry = Sync.get_header ctx.chain hash in
        let height = match entry with
@@ -596,8 +596,22 @@ let handle_getblockheader (ctx : rpc_context)
          | Some e -> Types.hash256_to_hex_display e.total_work
          | None -> "0000000000000000000000000000000000000000000000000000000000000000"
        in
-       let tip_height = match ctx.chain.tip with Some t -> t.height | None -> 0 in
-       let confirmations = tip_height - height + 1 in
+       let tip_height = match Sync.block_tip ctx.chain with
+         | Some t -> t.height
+         | None -> (match ctx.chain.tip with Some t -> t.height | None -> 0)
+       in
+       (* Core blockheaderToJSON / ComputeNextBlockAndDepth: confirmations is
+          tipHeight - height + 1 ONLY when the block is on the active chain
+          (the chain's block at [height] is THIS block); otherwise -1.
+          The active-chain membership check also gates nextblockhash. *)
+       let in_active_chain =
+         match Sync.get_header_at_height ctx.chain height with
+         | Some e -> Cstruct.equal e.hash hash
+         | None -> false
+       in
+       let confirmations =
+         if in_active_chain then tip_height - height + 1 else -1
+       in
        (* mediantime in RPC output = GetMedianTimePast() which INCLUDES the
           current block (Core src/chain.h:233). Use the display variant
           that starts at [height] (not [height-1] used for validation MTP). *)
@@ -620,9 +634,12 @@ let handle_getblockheader (ctx : rpc_context)
                | Some n -> n
                | None -> 0))
        in
-       (* nextblockhash: look up the block at height+1 in the active chain *)
+       (* nextblockhash: Core's ComputeNextBlockAndDepth only sets pnext when
+          THIS block is on the active chain (a fork tip has no "next").  Look
+          up the block at height+1 only when in_active_chain. *)
        let next_block_hash =
-         match Sync.get_header_at_height ctx.chain (height + 1) with
+         if not in_active_chain then None
+         else match Sync.get_header_at_height ctx.chain (height + 1) with
          | Some next_entry ->
            Some (Types.hash256_to_hex_display next_entry.hash)
          | None -> None
@@ -633,6 +650,14 @@ let handle_getblockheader (ctx : rpc_context)
          if Int32.compare n 0l >= 0 then Int32.to_int n
          else Int32.to_int n + 0x100000000
        in
+       (* Field order mirrors Core blockheaderToJSON
+          (bitcoin-core/src/rpc/blockchain.cpp:154-182):
+            hash, confirmations, height, version, versionHex, merkleroot,
+            time, mediantime, nonce, bits, target, difficulty, chainwork, nTx,
+            previousblockhash?, nextblockhash?
+          previousblockhash is emitted ONLY when the block has a parent
+          (Core: `if (blockindex.pprev)`), i.e. NOT for genesis (height 0).
+          nextblockhash ONLY when a next block exists on the active chain. *)
        let fields = [
          ("hash", `String hash_hex);
          ("confirmations", `Int confirmations);
@@ -645,13 +670,17 @@ let handle_getblockheader (ctx : rpc_context)
          ("mediantime", `Int (Int32.to_int median_time));
          ("nonce", `Int nonce_unsigned);
          ("bits", `String (Printf.sprintf "%08lx" header.bits));
+         ("target", `String (bits_to_target_hex header.bits));
          ("difficulty", json_difficulty (Consensus.difficulty_from_bits header.bits));
          ("chainwork", `String chainwork);
          ("nTx", `Int n_tx);
-         ("previousblockhash", `String
-           (Types.hash256_to_hex_display header.prev_block));
-         ("target", `String (bits_to_target_hex header.bits));
        ] in
+       let fields =
+         if height > 0 then
+           fields @ [("previousblockhash", `String
+             (Types.hash256_to_hex_display header.prev_block))]
+         else fields
+       in
        let fields = match next_block_hash with
          | Some nxt -> fields @ [("nextblockhash", `String nxt)]
          | None -> fields
@@ -665,7 +694,7 @@ let handle_getblockheader (ctx : rpc_context)
       Cstruct.set_uint8 hash i (Cstruct.get_uint8 hash_bytes (31 - i))
     done;
     (match Storage.ChainDB.get_block_header ctx.chain.db hash with
-     | None -> Error "Block header not found"
+     | None -> Error "Block not found"
      | Some header ->
        let w = Serialize.writer_create () in
        Serialize.serialize_block_header w header;
@@ -9571,9 +9600,11 @@ let dispatch_rpc (ctx : rpc_context)
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
   | "getblockheader" ->
+    (* Core: a blockhash not in the index -> RPC_INVALID_ADDRESS_OR_KEY (-5)
+       "Block not found" (bitcoin-core/src/rpc/blockchain.cpp:654-656). *)
     (match handle_getblockheader ctx params with
      | Ok r -> Ok r
-     | Error msg -> Error (rpc_misc_error, msg))
+     | Error msg -> Error (rpc_invalid_address, msg))
   | "getblockcount" ->
     Ok (handle_getblockcount ctx)
   | "getbestblockhash" ->

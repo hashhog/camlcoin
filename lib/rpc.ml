@@ -972,7 +972,7 @@ let lookup_transaction (ctx : rpc_context) (txid : Cstruct.t)
   match blockhash_opt with
   | Some block_hash ->
     (match Storage.ChainDB.get_block ctx.chain.db block_hash with
-     | None -> Error "Block not found"
+     | None -> Error "Block hash not found"
      | Some block ->
        (* Search for transaction in block *)
        let rec find_tx idx = function
@@ -5125,6 +5125,17 @@ let handle_getrawtransaction (ctx : rpc_context)
     match parse_txid txid_hex with
     | None -> Error "Invalid txid"
     | Some txid ->
+      (* Special exception for the genesis block coinbase transaction.
+         Core compares the requested txid against the genesis block's
+         hashMerkleRoot (the genesis coinbase txid == merkle root) and
+         throws RPC_INVALID_ADDRESS_OR_KEY (-5).  camlcoin stores
+         [genesis_header.merkle_root] in internal byte order, which is the
+         same order as [parse_txid]'s output and [Crypto.compute_txid], so a
+         direct Cstruct comparison is correct.
+         Reference: bitcoin-core/src/rpc/rawtransaction.cpp:290-293. *)
+      if Cstruct.equal txid ctx.network.genesis_header.merkle_root then
+        Error "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved"
+      else
       (* For lookup, extract just the blockhash Cstruct *)
       let blockhash_opt = Option.map fst blockhash_with_hex_opt in
       match lookup_transaction ctx txid blockhash_opt with
@@ -9590,9 +9601,13 @@ let dispatch_rpc (ctx : rpc_context)
 
   (* Transactions *)
   | "getrawtransaction" ->
+    (* Core throws every getrawtransaction lookup failure (tx-not-found,
+       block-hash-not-found, genesis-coinbase) as RPC_INVALID_ADDRESS_OR_KEY
+       (-5), not the generic RPC_MISC_ERROR (-1).
+       Reference: bitcoin-core/src/rpc/rawtransaction.cpp:292,303,329. *)
     (match handle_getrawtransaction ctx params with
      | Ok r -> Ok r
-     | Error msg -> Error (rpc_misc_error, msg))
+     | Error msg -> Error (rpc_invalid_address, msg))
   | "sendrawtransaction" ->
     (match handle_sendrawtransaction ctx params with
      | Ok r -> Ok r

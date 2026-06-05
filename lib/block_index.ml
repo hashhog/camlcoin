@@ -1048,6 +1048,43 @@ let append_block_filter (idx : bip157_index)
       Ok ()
   end
 
+(** The Bitcoin genesis block coinbase output scriptPubKey, IDENTICAL across
+    every network (mainnet / testnet / testnet4 / signet / regtest). Bitcoin
+    Core builds all of them via the same [CreateGenesisBlock] with
+    [genesisOutputScript = CScript() << "04678afd...5f"_hex << OP_CHECKSIG]
+    (bitcoin-core/src/kernel/chainparams.cpp:71). It is a bare P2PK script:
+    65-byte uncompressed pubkey push (0x41 ...) followed by OP_CHECKSIG (0xac).
+
+    The genesis block's basic filter therefore has exactly ONE element — this
+    script — and is identical across networks once you fix the per-network
+    SipHash key (= the first 16 bytes of that network's genesis block hash). *)
+let genesis_coinbase_script : Cstruct.t =
+  Cstruct.of_hex
+    "4104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac"
+
+(** Append the genesis-block (height 0) basic filter directly from the known
+    genesis coinbase scriptPubKey, WITHOUT needing the full genesis block body
+    on disk. camlcoin stores only the genesis HEADER in chainparams (not the
+    full block with its coinbase tx), so the ordinary backfill path can't read
+    a genesis body to build the filter — yet Bitcoin Core DOES index the
+    genesis filter, and every later block's filter HEADER chains off it
+    (height-1 header = SHA256d(SHA256d(filter1) || genesis_filter_header)).
+    Without this, every camlcoin filter header would diverge from Core from
+    height 1 onward.
+
+    The genesis filter's prev header is the all-zero hash (BIP-157: genesis's
+    parent header is zero). Idempotent. *)
+let append_genesis_filter (idx : bip157_index)
+    ~(genesis_hash : Types.hash256) : unit =
+  if bip157_has_height idx 0 then ()  (* idempotent *)
+  else begin
+    let params = basic_filter_params genesis_hash in
+    let filter = build_filter params [ Cstruct.to_string genesis_coinbase_script ] in
+    let bf = { filter_type = Basic; block_hash = genesis_hash; filter } in
+    store_filter idx.filter_idx bf Types.zero_hash;
+    set_hash_at_height idx.height_idx 0 genesis_hash
+  end
+
 (** Reorg-aware rewind. Drops every indexed entry strictly above
     [target_height]. Used by [sync.ml]'s reorganize path so the disconnect
     half of a reorg leaves the index in lock-step with the active chain. *)

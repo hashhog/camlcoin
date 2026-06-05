@@ -783,37 +783,90 @@ let handle_getchaintips (ctx : rpc_context) : Yojson.Safe.t =
    Block Filter Handler (BIP-157/158)
    ============================================================================ *)
 
+(* getblockfilter "blockhash" ( "filtertype" )
+
+   Faithful port of Bitcoin Core src/rpc/blockchain.cpp:2975-3028
+   (getblockfilter).  Retrieves a BIP-157 content filter (the BIP-158 basic
+   GCS filter) for a particular block.  Returns
+     { "filter": <hex GCS bitstream>, "header": <hex 32-byte filter header> }.
+
+   Error semantics MIRROR Core's ORDERING and codes EXACTLY:
+   1. Parse blockhash (param 0).  Malformed hash  -> -8  (invalid parameter,
+      Core's ParseHashV throws RPC_INVALID_PARAMETER on a non-hex / wrong-len
+      string before anything else).
+   2. Resolve filtertype (param 1, default "basic").  Unknown type ->
+      RPC_INVALID_ADDRESS_OR_KEY (-5) "Unknown filtertype".  This check runs
+      BEFORE the index-enabled and block-lookup checks (Core ordering), so a
+      bogus filtertype with a valid hash always yields -5 "Unknown filtertype"
+      regardless of whether the index is on or the block exists.
+   3. Index not enabled for this filtertype -> RPC_MISC_ERROR (-1)
+      "Index is not enabled for filtertype basic".
+   4. Block not in the block index at all -> RPC_INVALID_ADDRESS_OR_KEY (-5)
+      "Block not found".
+   5. Block exists but the filter has not been computed/connected ->
+      RPC_INVALID_ADDRESS_OR_KEY (-5) "Filter not found. ..." (Core's
+      LookupFilter-failure branch). *)
 let handle_getblockfilter (ctx : rpc_context)
-    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
-  match ctx.filter_index with
-  | None -> Error "Block filter index is not enabled"
-  | Some idx ->
-    (match params with
-     | [`String hash_hex] | [`String hash_hex; `String "basic"] ->
-       (* Parse hash in display format (reversed) *)
-       let hash_bytes = Types.hash256_of_hex hash_hex in
-       let hash = Cstruct.create 32 in
-       for i = 0 to 31 do
-         Cstruct.set_uint8 hash i (Cstruct.get_uint8 hash_bytes (31 - i))
-       done;
-       (match Block_index.read_filter idx hash with
-        | None -> Error "Block filter not found"
-        | Some bf ->
-          (* Get filter header *)
-          let header_opt = Block_index.get_filter_header idx hash in
-          let header_hex = match header_opt with
-            | Some h -> Types.hash256_to_hex_display h
-            | None -> ""
-          in
-          Ok (`Assoc [
-            (* W27-A: BIP-158 filter is variable-length (potentially KB);
-               hash256_to_hex would silently truncate to 32 bytes. *)
-            ("filter", `String (cstruct_to_hex_early
-              (Cstruct.of_string bf.filter.Block_index.encoded)));
-            ("header", `String header_hex);
-          ]))
-     | _ ->
-       Error "Invalid parameters: expected [blockhash] or [blockhash, \"basic\"]")
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  (* Step 1: parse the blockhash (param 0).  Core's ParseHashV runs FIRST,
+     before the filtertype check, so a malformed hash wins over an unknown
+     filtertype. *)
+  match params with
+  | `String hash_hex :: rest ->
+    let hash_result =
+      (* Core ParseHashV: 64 hex chars required; otherwise RPC_INVALID_PARAMETER. *)
+      match (try Some (Types.hash256_of_hex hash_hex) with _ -> None) with
+      | None -> Error (rpc_invalid_parameter,
+          Printf.sprintf "blockhash must be of length 64 (not %d, for '%s')"
+            (String.length hash_hex) hash_hex)
+      | Some display_hash ->
+        (* Convert display (reversed) form to internal little-endian form. *)
+        let hash = Cstruct.create 32 in
+        for i = 0 to 31 do
+          Cstruct.set_uint8 hash i (Cstruct.get_uint8 display_hash (31 - i))
+        done;
+        Ok hash
+    in
+    (* Step 2: resolve filtertype (default "basic"); unknown -> -5. *)
+    let filtertype_result =
+      match rest with
+      | [] -> Ok "basic"
+      | [`String "basic"] -> Ok "basic"
+      | [`Null] -> Ok "basic"
+      | _ -> Error (rpc_invalid_address, "Unknown filtertype")
+    in
+    (match hash_result with
+     | Error e -> Error e
+     | Ok hash ->
+       (match filtertype_result with
+        | Error e -> Error e
+        | Ok _filtertype ->
+          (* Step 3: index enabled? *)
+          (match ctx.filter_index with
+           | None -> Error (rpc_misc_error,
+               "Index is not enabled for filtertype basic")
+           | Some idx ->
+             (* Step 4: does the block exist in the block index at all? *)
+             if not (Storage.ChainDB.has_block_header ctx.chain.db hash) then
+               Error (rpc_invalid_address, "Block not found")
+             else
+               (* Step 5: look up the computed filter + header. *)
+               (match Block_index.read_filter idx hash,
+                      Block_index.get_filter_header idx hash with
+                | Some bf, Some header ->
+                  Ok (`Assoc [
+                    (* W27-A: BIP-158 filter is variable-length (potentially
+                       KB); hash256_to_hex would silently truncate to 32 bytes. *)
+                    ("filter", `String (cstruct_to_hex_early
+                      (Cstruct.of_string bf.filter.Block_index.encoded)));
+                    ("header", `String (Types.hash256_to_hex_display header));
+                  ])
+                | _ ->
+                  Error (rpc_invalid_address,
+                    "Filter not found. Block was not connected to active chain.")))))
+  | _ ->
+    Error (rpc_invalid_parameter,
+      "JSON value of type null is not of expected type string")
 
 (* ============================================================================
    Block Invalidation Handlers
@@ -9640,9 +9693,10 @@ let dispatch_rpc (ctx : rpc_context)
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
   | "getblockfilter" ->
-    (match handle_getblockfilter ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_misc_error, msg))
+    (* handle_getblockfilter already returns Core-exact (code, message) pairs:
+       -5 Unknown filtertype / Block not found, -1 index-not-enabled,
+       -8 malformed blockhash.  Pass them through verbatim. *)
+    handle_getblockfilter ctx params
   | "getdeploymentinfo" ->
     (try
       (match handle_getdeploymentinfo ctx params with

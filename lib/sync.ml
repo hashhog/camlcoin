@@ -4564,6 +4564,18 @@ let backfill_bip157_index (state : chain_state) : int =
             raise Exit
           | Some entry ->
             (match Storage.ChainDB.get_block state.db entry.hash with
+             | None when h = 0 ->
+               (* Genesis (height 0): camlcoin stores only the genesis HEADER
+                  in chainparams, not the full block body, so there is no body
+                  to read here. But Bitcoin Core DOES index the genesis filter
+                  and every later filter HEADER chains off it. Build the
+                  genesis filter directly from the known (network-invariant)
+                  genesis coinbase scriptPubKey so the header chain matches
+                  Core from height 1 onward. *)
+               let genesis_hash =
+                 Crypto.compute_block_hash state.network.genesis_header in
+               Block_index.append_genesis_filter idx ~genesis_hash;
+               incr count
              | None ->
                (* Block body missing (likely pruned). Stop here; the
                   filter index can't be populated for pruned heights. *)

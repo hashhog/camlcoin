@@ -863,6 +863,15 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
           (* Register header in in-memory chain state and persist height→hash
              mapping so subsequent get_header_at_height lookups succeed. *)
           Sync.accept_header chain entry;
+          (* Collected during connect for the BIP-157 filter-index append
+             below.  The spent prevout scriptPubKeys live in the [undo]
+             produced by [connect_block_optimized]; we capture them here so
+             the post-connect filter append (which mirrors Core's
+             [BlockFilterIndex::CustomAppend] firing on every connected block)
+             includes the spent-prevout element set.  Empty list = no UTXO
+             path / no spends, which still produces the correct coinbase-only
+             filter. *)
+          let spent_entries_for_filter = ref [] in
           (* Connect through the atomic UTXO path when available *)
           let utxo_result = match utxo with
             | Some utxo_set ->
@@ -885,6 +894,12 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
                  Utxo.serialize_undo_data uw undo;
                  Storage.ChainDB.store_undo_data chain.db hash
                    (Cstruct.to_string (Serialize.writer_to_cstruct uw));
+                 (* Flatten the per-tx spent outputs into the (outpoint,
+                    utxo_entry) list shape expected by the BIP-157 filter
+                    append helper. *)
+                 spent_entries_for_filter :=
+                   List.concat_map (fun (tu : Utxo.tx_undo) -> tu.spent_outputs)
+                     undo.Utxo.tx_undos;
                  (* Drain the per-block dirty set into BOTH stores
                     (cf_chainstate UTXO column family + rocksdb_utxo) via
                     the same [apply_block_atomic] path used by
@@ -924,6 +939,17 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
 
              (* Update blocks_synced to match *)
              chain.blocks_synced <- height;
+
+             (* BIP-157/158 filter index append (no-op when --blockfilterindex
+                is off).  Mirrors Bitcoin Core's [BlockFilterIndex::CustomAppend]
+                firing on every connected block — without this, blocks that
+                arrive via submitblock (rather than IBD / process_new_block)
+                never get a filter computed, so getblockfilter would 404 for
+                them.  Uses the spent prevout scriptPubKeys captured from the
+                connect undo above so the spend-block filter includes both the
+                output spk and the spent-prevout spk. *)
+             Sync.append_filter_if_enabled_from_entries chain
+               ~block ~height ~spent_entries:!spent_entries_for_filter;
 
              (* Remove confirmed transactions from mempool *)
              Mempool.remove_for_block mp block height;

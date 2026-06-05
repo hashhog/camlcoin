@@ -3020,14 +3020,14 @@ let get_prioritised_transactions (mp : mempool)
    add was on a free outpoint).  Existing [replace_by_fee] is preserved as
    a thin discard-wrapper so the ~20 call sites in test_mempool.ml continue
    to compile. *)
-let replace_by_fee_with_replaced ?(skip_verify_scripts=false)
+let replace_by_fee_with_replaced ?(dry_run=false) ?(skip_verify_scripts=false)
     (mp : mempool) (tx : Types.transaction)
     : (mempool_entry * Types.hash256 list, string) result =
   let conflicts = find_all_conflicts mp tx in
   match conflicts with
   | [] ->
     (* No conflict, just add normally — empty replaced list *)
-    (match add_transaction ~skip_verify_scripts mp tx with
+    (match add_transaction ~dry_run ~skip_verify_scripts mp tx with
      | Ok e -> Ok (e, [])
      | Error s -> Error s)
   | _ ->
@@ -3161,10 +3161,18 @@ let replace_by_fee_with_replaced ?(skip_verify_scripts=false)
               (* Rule #4 (Gate 7): additional_fees >= relay_fee.GetFee(replacement_vsize).
                  Core: PaysForRBF, additional_fees = replacement_fees − original_fees.
                  relay_fee is in sat/kvB; GetFee(vsize) = ceil(rate * vsize / 1000).
-                 We use integer arithmetic to match Core's truncating GetFee. *)
+                 We use integer arithmetic to match Core's truncating GetFee.
+
+                 W120 BUG-RBF4-FEERATE fix: Core's PaysForRBF is called with
+                 m_pool.m_opts.incremental_relay_feerate (validation.cpp:1011),
+                 NOT the minimum relay feerate.  camlcoin previously used
+                 [mp.min_relay_fee] (1000 sat/kvB default) which is 10× Core's
+                 DEFAULT_INCREMENTAL_RELAY_FEE (100 sat/kvB, policy/policy.h:48),
+                 making Rule 4 over-strict and diverging from a default-flag Core
+                 oracle.  Switch to [incremental_relay_fee] to match Core exactly. *)
               let additional_fees = Int64.sub new_modified_fee total_conflict_fee in
               let relay_fee_for_replacement =
-                Int64.div (Int64.mul mp.min_relay_fee (Int64.of_int new_vsize)) 1000L in
+                Int64.div (Int64.mul incremental_relay_fee (Int64.of_int new_vsize)) 1000L in
               if additional_fees < relay_fee_for_replacement then
                 Error (Printf.sprintf
                   "rejecting replacement, not enough additional fees to relay; %Ld < %Ld"
@@ -3230,27 +3238,42 @@ let replace_by_fee_with_replaced ?(skip_verify_scripts=false)
                      RemoveStaged; Finalize does the atomic RemoveStaged+addUnchecked together. *)
                   match add_transaction ~dry_run:true ~skip_verify_scripts mp tx with
                   | Error e -> Error e
-                  | Ok _ ->
-                    (* All gates passed; now atomically remove conflicts and add replacement.
-                       FIX-73 W120 BUG-4: collect the deduplicated evicted txid list from
-                       [evicted_set] (direct conflicts + descendants) BEFORE [remove_transaction]
-                       so even though removal triggers cascading dependents-cleanup we still
-                       return the canonical Core PackageMempoolAcceptResult set: every entry that
-                       was in [evicted_set] is one Core would include in m_replaced_transactions.
-                       Order is unspecified (Core uses a std::set<uint256> on the RPC side too —
-                       rpc/mempool.cpp:1500). *)
+                  | Ok dry_entry ->
+                    (* All gates passed; collect the deduplicated evicted txid list. *)
                     let evicted_txids =
                       Hashtbl.fold (fun _k e acc -> e.txid :: acc) evicted_set [] in
-                    List.iter (fun conflict_entry ->
-                      remove_transaction mp conflict_entry.txid
-                    ) conflicts;
-                    (* Residual risk: add_transaction can fail here if mempool state changed
-                       between dry_run and commit (e.g. concurrent eviction or OOM).  In that
-                       case the conflicts are already removed.  This window is negligible in
-                       single-threaded OCaml execution but documented for completeness. *)
-                    (match add_transaction ~skip_verify_scripts mp tx with
-                     | Ok e -> Ok (e, evicted_txids)
-                     | Error s -> Error s)
+                    if dry_run then
+                      (* W120 BUG-RBF-DRYRUN fix: testmempoolaccept must evaluate the
+                         FULL RBF rule set (1-4 + diagram) WITHOUT mutating the mempool.
+                         Every gate above has run against the live state; we now return
+                         the dry-run synthetic entry + the would-be-evicted set without
+                         performing the remove+add.  This makes testmempoolaccept's
+                         allowed/reject-reason agree with what sendrawtransaction would
+                         actually do for the same conflicting submit (Core's
+                         testmempoolaccept runs MemPoolAccept with test_accept=true,
+                         which executes ConsiderReplacement before bailing out at the
+                         Finalize step). *)
+                      Ok (dry_entry, evicted_txids)
+                    else begin
+                      (* Now atomically remove conflicts and add replacement.
+                         FIX-73 W120 BUG-4: the evicted txid list (direct conflicts +
+                         descendants) was collected BEFORE [remove_transaction] so even
+                         though removal triggers cascading dependents-cleanup we still
+                         return the canonical Core PackageMempoolAcceptResult set: every
+                         entry that was in [evicted_set] is one Core would include in
+                         m_replaced_transactions.  Order is unspecified (Core uses a
+                         std::set<uint256> on the RPC side too — rpc/mempool.cpp:1500). *)
+                      List.iter (fun conflict_entry ->
+                        remove_transaction mp conflict_entry.txid
+                      ) conflicts;
+                      (* Residual risk: add_transaction can fail here if mempool state changed
+                         between dry_run and commit (e.g. concurrent eviction or OOM).  In that
+                         case the conflicts are already removed.  This window is negligible in
+                         single-threaded OCaml execution but documented for completeness. *)
+                      (match add_transaction ~skip_verify_scripts mp tx with
+                       | Ok e -> Ok (e, evicted_txids)
+                       | Error s -> Error s)
+                    end
                   end
                 end
               end
@@ -3291,13 +3314,16 @@ let accept_transaction_with_replaced ?(dry_run=false)
      | Ok e -> Ok (e, [])
      | Error s -> Error s)
   | _ ->
-    if dry_run then
-      (* For dry_run, just check if RBF would succeed by doing validation *)
-      (* We can't actually call replace_by_fee since it modifies state *)
-      Error "txn-mempool-conflict (dry run with conflicts)"
-    else
-      (* Attempt full RBF replacement *)
-      replace_by_fee_with_replaced ~skip_verify_scripts mp tx
+    (* Conflict(s) present: evaluate the full RBF rule set.  In dry_run mode
+       (testmempoolaccept) [replace_by_fee_with_replaced ~dry_run:true] runs
+       every gate (rules 1-4 + ImprovesFeerateDiagram + the standardness/limit
+       pre-check) against the live mempool but does NOT mutate state, so the
+       reject-reason it surfaces is exactly what a real submit would produce.
+       In non-dry-run mode it performs the eviction + insert.  This replaces the
+       old behaviour where dry_run returned a generic
+       "txn-mempool-conflict (dry run with conflicts)" that disagreed with the
+       real sendrawtransaction outcome for the same conflicting tx. *)
+    replace_by_fee_with_replaced ~dry_run ~skip_verify_scripts mp tx
 
 let accept_transaction ?(dry_run=false) ?(skip_verify_scripts=false)
     (mp : mempool) (tx : Types.transaction)

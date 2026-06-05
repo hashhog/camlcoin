@@ -1191,8 +1191,17 @@ let handle_sendrawtransaction (ctx : rpc_context)
           "Unspendable output exceeds maximum: %Ld > %Ld satoshis"
           burn_amount max_burn_amount)
       else
-        match Mempool.add_transaction ctx.mempool tx with
-        | Ok entry ->
+        (* W120 BUG-RBF-SENDRAW fix: route sendrawtransaction through the
+           RBF-aware acceptance path ([accept_transaction_with_replaced]) rather
+           than [add_transaction].  [add_transaction] rejects ANY input conflict
+           with "txn-mempool-conflict", so RBF replacement (BIP125) never
+           happened from the RPC path even though the engine fully implemented it.
+           Core's sendrawtransaction calls AcceptToMemoryPool, which runs
+           MemPoolAccept → ConsiderReplacement → evicts the conflicting tx(s) and
+           accepts the replacement when rules 3+4 pass (validation.cpp:990-1030).
+           The returned evicted-txid list mirrors Core's m_replaced_transactions. *)
+        match Mempool.accept_transaction_with_replaced ctx.mempool tx with
+        | Ok (entry, replaced_txids) ->
           (* Check fee rate limit (maxfeerate in BTC/kvB)
              Convert to satoshis per vbyte: BTC/kvB * 100_000_000 / 1000 = sat/vB
              Then multiply by vsize to get max acceptable fee *)
@@ -1209,6 +1218,7 @@ let handle_sendrawtransaction (ctx : rpc_context)
               entry.fee max_fee_sats max_fee_rate)
           end
           else begin
+            ignore replaced_txids;
             (* Relay to peers *)
             let wtxid = Crypto.compute_wtxid tx in
             let fee_rate = Int64.div entry.fee (Int64.of_int (max 1 (entry.weight / 4))) in
@@ -3257,7 +3267,17 @@ let handle_testmempoolaccept (ctx : rpc_context)
       let tx = Serialize.deserialize_transaction r in
       let txid = Crypto.compute_txid tx in
       let hex_txid = Types.hash256_to_hex_display txid in
-      match Mempool.add_transaction ~dry_run:true ctx.mempool tx with
+      (* W120 BUG-RBF-DRYRUN fix: evaluate the FULL acceptance path, including
+         RBF conflict resolution, in dry_run mode.  Previously this called
+         [add_transaction ~dry_run:true], which SKIPS conflict detection
+         entirely (the conflict check is guarded by `if not dry_run`), so a
+         conflicting tx that would actually be rejected (Rule 3/4 failure) or
+         that would replace an existing entry was incorrectly reported as
+         allowed=true.  [accept_transaction_with_replaced ~dry_run:true] runs
+         the BIP125 rule set against the live mempool without mutating it, so
+         testmempoolaccept now agrees with sendrawtransaction for the same tx
+         (Core: testmempoolaccept = MemPoolAccept with test_accept=true). *)
+      match Mempool.accept_transaction ~dry_run:true ctx.mempool tx with
       | Ok entry ->
         let vsize = (entry.Mempool.weight + 3) / 4 in
         let fee_btc = Int64.to_float entry.Mempool.fee /. 100_000_000.0 in

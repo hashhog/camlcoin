@@ -582,14 +582,19 @@ let test_g21_getpeerinfo_no_mapped_as () =
    G22: getnodeaddresses missing "mapped_as" / "source_mapped_as"
    Core: rpc/net.cpp GetNodeAddresses() — pushKV("mapped_as", mapped_as) and
          pushKV("source_mapped_as", source_mapped_as) when non-zero
-   Camlcoin: no getnodeaddresses RPC at all (and no asmap support)
+   Camlcoin: getnodeaddresses RPC now EXISTS (Core-shaped 5-key dump:
+         time/services/address/port/network — see rpc.ml handle_getnodeaddresses),
+         but does NOT yet carry the asmap-enrichment fields mapped_as /
+         source_mapped_as. The remaining G22 gap is only the asmap enrichment.
    Severity: MEDIUM
    ============================================================================ *)
 
 let test_g22_getnodeaddresses_no_mapped_as () =
-  let has_getnodeaddresses_rpc = false in
+  (* The RPC now exists (added with the P2P-axis getnodeaddresses cell). *)
+  let has_getnodeaddresses_rpc = true in
+  (* The asmap-enrichment fields are still absent — that is the live gap. *)
   let has_mapped_as_in_getnodeaddresses = false in
-  Alcotest.(check bool) "G22: no getnodeaddresses RPC" false has_getnodeaddresses_rpc;
+  Alcotest.(check bool) "G22: getnodeaddresses RPC now present" true has_getnodeaddresses_rpc;
   Alcotest.(check bool) "G22: no mapped_as in getnodeaddresses" false has_mapped_as_in_getnodeaddresses
 
 (* ============================================================================

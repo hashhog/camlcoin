@@ -1364,6 +1364,48 @@ let get_connection_candidates (pm : t) (count : int) : peer_info list =
   (* Take first 'count' candidates *)
   List.filteri (fun i _ -> i < count) sorted
 
+(* Read-only dump of every known address (addrman new+tried union), as a
+   [peer_info] list.  Backs the getnodeaddresses RPC, which is a read-only
+   addrman dump (Bitcoin Core net.cpp:911-970,
+   CConnman::GetAddressesUnsafe).  Order is whatever Hashtbl.fold yields;
+   the RPC caller is responsible for any shuffle/limit semantics. *)
+let get_addr_dump (pm : t) : peer_info list =
+  Hashtbl.fold (fun _addr info acc -> info :: acc) pm.known_addrs []
+
+(* Core-shaped addrman injector backing the addpeeraddress RPC
+   (Bitcoin Core net.cpp:972-1024).  Inserts {address, port, services} into
+   the known-address table with nTime = now (Core sets address.nTime =
+   Now()).  Returns [true] when the address was newly added, mirroring
+   AddrMan::Add returning whether a fresh entry was created.  Non-routable
+   addresses (loopback / RFC1918 / etc.) are dropped exactly as Core's
+   AddrMan::AddSingle rejects them, in which case this returns [false].
+   An address already present is a no-op that returns [false] (Core's Add
+   returns false when the entry already exists and only nTime/services were
+   refreshed). *)
+let add_peer_address (pm : t) ~(address : string) ~(port : int)
+    ~(services : int64) : bool =
+  if Hashtbl.mem pm.known_addrs address then false
+  else if not (is_routable address) then false
+  else begin
+    let bucket = add_to_new_table pm address in
+    if bucket < 0 then false
+    else begin
+      let now = Unix.gettimeofday () in
+      Hashtbl.replace pm.known_addrs address
+        { address;
+          port;
+          services;
+          last_connected = now;   (* Core: address.nTime = Now() *)
+          last_attempt = 0.0;
+          last_success = 0.0;
+          failures = 0;
+          banned_until = 0.0;
+          source = Manual;
+          table_status = InNew bucket };
+      true
+    end
+  end
+
 (* Send a message to all ready peers *)
 let broadcast (pm : t) (payload : P2p.message_payload) : unit Lwt.t =
   let ready = get_ready_peers pm in

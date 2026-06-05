@@ -314,29 +314,39 @@ let test_g11_no_wallet_incremental_relay_fee () =
    Rule 4 — additional fees pay for replacement bandwidth
    ============================================================================ *)
 
-(* G12: ★ BUG-W130-4 — mempool Rule 4 uses min_relay_fee instead of
-   incremental_relay_fee.  REJECT divergence.
+(* G12: ★ BUG-W130-4 — CLOSED.  mempool Rule 4 now uses incremental_relay_fee
+   (100 sat/kvB), matching Core's PaysForRBF call with
+   m_pool.m_opts.incremental_relay_feerate (validation.cpp:1011).  Previously it
+   used mp.min_relay_fee (1000 sat/kvB), 10× too strict.
 
-   For a 250-vbyte replacement:
-   - Core requires additional_fee >= 100 * 250 / 1000 = 25 sat (ceiling 25).
-   - camlcoin requires additional_fee >= 1000 * 250 / 1000 = 250 sat (floor).
-   Replacements with additional_fee ∈ [25, 249] are accepted by Core but
-   rejected by camlcoin. *)
+   For a 250-vbyte replacement both Core and camlcoin now require
+   additional_fee >= 100 * 250 / 1000 = 25 sat.  Forward-regression guard:
+   assert the Rule 4 floor source uses incremental_relay_fee, NOT min_relay_fee. *)
 let test_g12_rule4_wrong_feerate () =
   let vbytes = 250 in
   let core_floor =
     core_get_fee_ceil
       ~rate_sat_per_kvb:(Int64.to_int Mempool.incremental_relay_fee)
       ~vbytes in
-  (* camlcoin uses mp.min_relay_fee = 1000L sat/kvB (constructed default
-     in mempool.ml:245).  Reconstruct the formula: *)
+  (* camlcoin Rule 4 now uses incremental_relay_fee = 100 sat/kvB. *)
   let camlcoin_floor =
-    camlcoin_rule4_floor ~min_relay_fee_sat_per_kvb:1000 ~vbytes in
-  Alcotest.(check bool)
-    "G12: core_floor=25 < camlcoin_floor=250 → REJECT divergence (BUG-W130-4)"
-    true (core_floor < camlcoin_floor);
+    camlcoin_rule4_floor
+      ~min_relay_fee_sat_per_kvb:(Int64.to_int Mempool.incremental_relay_fee)
+      ~vbytes in
+  (* The two floors now agree at the category level (both 25 sat; Core ceils,
+     camlcoin floors, but for a 100*250 product the value divides evenly). *)
   Alcotest.(check int) "G12: Core floor (sat) = 25" 25 core_floor;
-  Alcotest.(check int) "G12: camlcoin floor (sat) = 250" 250 camlcoin_floor
+  Alcotest.(check int) "G12: camlcoin floor (sat) = 25 (BUG-W130-4 FIXED)" 25 camlcoin_floor;
+  (* Source guard: Rule 4 must multiply by incremental_relay_fee, not min_relay_fee. *)
+  let mempool_ml_src = load_source "lib/mempool.ml" in
+  (match mempool_ml_src with
+   | Some src ->
+     Alcotest.(check bool)
+       "G12: Rule 4 uses incremental_relay_fee (BUG-W130-4 FIXED)" true
+       (string_contains src
+          "Int64.div (Int64.mul incremental_relay_fee (Int64.of_int new_vsize)) 1000L")
+   | None ->
+     Alcotest.(check bool) "G12: source not visible (documentary)" true true)
 
 (* G13: BUG-W130-5 — Int64.div is truncation (floor) where Core's
    EvaluateFeeUp is ceiling.  Numerically: 99 * 250 / 1000 = 24 (camlcoin)

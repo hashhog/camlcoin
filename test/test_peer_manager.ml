@@ -924,6 +924,76 @@ let test_hb_compact_remove_on_disconnect () =
   let hb_after = Peer_manager.get_hb_compact_peers pm in
   Alcotest.(check int) "hb_compact_peers after" 0 (List.length hb_after)
 
+(* ========== Disconnected-peer reaping (zombie-peer starvation) ========== *)
+
+(* Helper: build a peer wired into [pm.peers] with a real (but unconnected)
+   socket fd, the way an outbound dial would leave it. *)
+let make_peer_in_pm pm ~addr ~port ~id ~direction =
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr ~port ~id
+    ~direction ~fd () in
+  pm.Peer_manager.peers <- peer :: pm.Peer_manager.peers;
+  peer
+
+(* Regression: a peer whose read side flipped it to Disconnected used to exit
+   peer_message_loop SILENTLY without calling remove_peer, leaving a zombie in
+   pm.peers (peer_manager.ml ~1834 guard). Drive the real loop with a peer
+   already in the Disconnected state (exactly what read_message_with_timeout
+   leaves behind on a read failure) and assert the loop reaps it. *)
+let test_disconnected_peer_reaped_by_loop () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  pm.running <- true;
+  let peer = make_peer_in_pm pm ~addr:"203.0.113.7" ~port:8333
+    ~id:42 ~direction:Peer.Outbound in
+  Alcotest.(check int) "peer present before" 1 (Peer_manager.peer_count pm);
+  (* Simulate the read-side failure path: state flipped to Disconnected,
+     loop re-entered. *)
+  peer.Peer.state <- Peer.Disconnected;
+  Lwt_main.run (Peer_manager.peer_message_loop pm peer);
+  Alcotest.(check int) "zombie reaped after loop exit" 0
+    (Peer_manager.peer_count pm);
+  Alcotest.(check bool) "not found by id" true
+    (Option.is_none (Peer_manager.find_peer_by_id pm 42))
+
+(* Regression: after the disconnected peer is reaped, a pinned --connect target
+   must be re-dialable. The maintain_connections re-dial guard tests presence by
+   (addr,port) with NO state filter, so a leftover zombie at the same (addr,port)
+   would block the re-dial forever. Assert that once the loop reaps the zombie,
+   no peer with that (addr,port) remains, i.e. the re-dial guard would fire. *)
+let test_redial_unblocked_after_reap () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  pm.running <- true;
+  let addr = "203.0.113.9" and port = 8333 in
+  Peer_manager.set_connect_peers pm [(addr, port)];
+  let peer = make_peer_in_pm pm ~addr ~port ~id:7 ~direction:Peer.Outbound in
+  (* Pre-condition: the (addr,port) presence test the re-dial uses sees it. *)
+  let present_before =
+    List.exists (fun p -> p.Peer.addr = addr && p.Peer.port = port)
+      pm.Peer_manager.peers in
+  Alcotest.(check bool) "addr/port present before" true present_before;
+  (* Read-side failure: state -> Disconnected, loop re-entered and exits. *)
+  peer.Peer.state <- Peer.Disconnected;
+  Lwt_main.run (Peer_manager.peer_message_loop pm peer);
+  let present_after =
+    List.exists (fun p -> p.Peer.addr = addr && p.Peer.port = port)
+      pm.Peer_manager.peers in
+  Alcotest.(check bool) "addr/port gone after reap (re-dial unblocked)" false
+    present_after
+
+(* Sanity: the shutdown guard (not pm.running) must NOT reap via this path —
+   shutdown owns pm.peers cleanup. A Ready peer left in pm.peers while the
+   manager is stopped stays put when the loop exits. *)
+let test_loop_exit_on_shutdown_does_not_reap () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  pm.running <- false;  (* manager not running *)
+  let peer = make_peer_in_pm pm ~addr:"203.0.113.11" ~port:8333
+    ~id:99 ~direction:Peer.Outbound in
+  peer.Peer.state <- Peer.Ready;  (* healthy peer, only shutdown stops the loop *)
+  Alcotest.(check int) "peer present before" 1 (Peer_manager.peer_count pm);
+  Lwt_main.run (Peer_manager.peer_message_loop pm peer);
+  Alcotest.(check int) "peer left intact on shutdown exit" 1
+    (Peer_manager.peer_count pm)
+
 (* All tests *)
 let () =
   Alcotest.run "Peer_manager" [
@@ -1031,5 +1101,13 @@ let () =
       Alcotest.test_case "hb_compact_peers_max_3" `Quick test_hb_compact_peers_max_3;
       Alcotest.test_case "supports_compact_blocks" `Quick test_supports_compact_blocks;
       Alcotest.test_case "hb_compact_remove_on_disconnect" `Quick test_hb_compact_remove_on_disconnect;
+    ];
+    "disconnected_peer_reaping", [
+      Alcotest.test_case "disconnected_peer_reaped_by_loop" `Quick
+        test_disconnected_peer_reaped_by_loop;
+      Alcotest.test_case "redial_unblocked_after_reap" `Quick
+        test_redial_unblocked_after_reap;
+      Alcotest.test_case "loop_exit_on_shutdown_does_not_reap" `Quick
+        test_loop_exit_on_shutdown_does_not_reap;
     ];
   ]

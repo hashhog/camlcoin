@@ -453,15 +453,51 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         ~reason:(Printf.sprintf "rdb_tip=%d < chain_tip=%d" rdb_height chain.blocks_synced)
         rdb_height
     | Some rdb_height when rdb_height > chain.blocks_synced ->
-      (* Expected crash window: apply_block_atomic committed RDB but
-         not CF.  The chain_tip is the authoritative lower bound; the
-         excess RDB state for blocks (chain.blocks_synced, rdb_height]
-         will be overwritten idempotently by the next IBD pass. *)
-      Logs.info (fun m ->
+      (* Crash window: apply_block_atomic committed RDB (UTXO set) but not
+         CF (chain_tip), leaving the persisted UTXO set AHEAD of chain_tip.
+
+         The OLD behaviour here merely LOGGED and trusted a "forward
+         re-apply is idempotent" claim (storage.ml:638-641).  That claim is
+         FALSE for cross-block spends: re-applying chain_tip+1 reads the
+         UTXO set (validation.ml:1136-1182) and hits TxMissingInputs because
+         a prevout was already deleted by an already-committed later block in
+         the window -> block rejected -> re-downloaded forever -> permanent
+         wedge at chain_tip (the live mainnet wedge at 952223/952224).
+
+         Bitcoin Core does NOT trust forward re-apply here.  Its
+         [ReplayBlocks] / [RollbackBlock] (validation.cpp:4773-4858) rolls
+         the UTXO set BACK along the over-applied branch using stored undo
+         data, down to the consistent point, then rolls forward.  We do the
+         same: reconcile the RDB UTXO set DOWN to chain_tip so the UTXO state
+         matches the authoritative validated tip, then let IBD re-apply
+         forward from a consistent base.
+
+         If undo data for any window block is missing (the post-IBD connect
+         paths do not persist undo), reconciliation is impossible — fall back
+         to a full resync (persist_rewind_to_height 0) rather than spinning in
+         the infinite missing-inputs loop. *)
+      Logs.warn (fun m ->
         m "RocksDB UTXO tip (%d) is ahead of chainstate chain_tip (%d) — \
-           consistent with a crash inside apply_block_atomic; IBD will \
-           re-apply the missing block(s) idempotently"
-          rdb_height chain.blocks_synced)
+           crash inside apply_block_atomic; reconciling UTXO set down to \
+           chain_tip (Core ReplayBlocks/RollbackBlock model)"
+          rdb_height chain.blocks_synced);
+      (match Sync.reconcile_rdb_to_chain_tip chain rocksdb
+               ~rdb_height ~target_height:chain.blocks_synced with
+       | Ok () ->
+         Logs.info (fun m ->
+           m "UTXO reconcile succeeded; UTXO set now matches chain_tip=%d, \
+              IBD will re-apply forward from a consistent base"
+             chain.blocks_synced)
+       | Error msg ->
+         Logs.warn (fun m ->
+           m "UTXO reconcile FAILED (%s) — undo data unavailable for the \
+              crash window; falling back to full resync to avoid the \
+              missing-inputs wedge" msg);
+         persist_rewind_to_height
+           ~reason:(Printf.sprintf
+             "reconcile-unavailable (rdb_tip=%d > chain_tip=%d): %s"
+             rdb_height chain.blocks_synced msg)
+           0)
     | Some _ ->
       (* Heights match.  Per-block content validation: read the tip
          block, sample each non-coinbase spendable output, and verify

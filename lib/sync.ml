@@ -2990,7 +2990,23 @@ let process_downloaded_blocks ?(max_blocks = 1)
              | Validation.BlockUnexpectedWitness -> true
              | _ -> false
            in
-           if not is_mutated_witness then
+           (* TxMissingInputs during IBD is a LOCAL-state failure, NOT
+              peer-supplied bad data: the peer delivered a perfectly valid
+              block whose inputs we cannot resolve because our own UTXO set
+              is inconsistent (e.g. the apply_block_atomic crash window where
+              a later block already deleted a prevout — the bug this branch
+              is part of fixing).  Core would not (and could not) attribute a
+              local CoinsView miss to the peer.  Re-request without scoring,
+              exactly like the is_mutated_witness exemption, so we do not
+              disconnect a healthy peer for our own corruption (the ~1033
+              Channel_closed drops observed on the wedged mainnet node). *)
+           let is_local_missing_inputs = match e with
+             | Validation.BlockTxValidationFailed
+                 (_, Validation.TxMissingInputs) -> true
+             | _ -> false
+           in
+           let skip_scoring = is_mutated_witness || is_local_missing_inputs in
+           if not skip_scoring then
              (match peer_id with
               | Some pid ->
                 (match ibd.misbehavior_handler with
@@ -3000,7 +3016,10 @@ let process_downloaded_blocks ?(max_blocks = 1)
            Logs.warn (fun m ->
              m "Block validation failed at height %d: %s%s — resetting to re-download"
                height err_str
-               (if is_mutated_witness then " (BLOCK_MUTATED — will retry)" else ""));
+               (if is_mutated_witness then " (BLOCK_MUTATED — will retry)"
+                else if is_local_missing_inputs then
+                  " (local UTXO inconsistency — peer not scored, will retry)"
+                else ""));
            (* Reset to NotRequested so the block is re-downloaded from a
               different peer.  Leaving it in Downloaded causes an infinite
               retry loop against the same (possibly corrupt/stripped) data. *)
@@ -3186,6 +3205,148 @@ let disconnect_to_target (state : chain_state) (target : header_entry)
             m "Rollback complete: tip rewound from height %d to %d"
               current_tip.height target.height);
           Ok ()))
+
+(* Boot-time UTXO-set reconciliation for the apply_block_atomic crash window.
+
+   [apply_block_atomic] commits the rocksdb_utxo (RDB) batch FIRST and the
+   cf_chainstate chain_tip SECOND (storage.ml:665-697), so a crash inside that
+   window leaves the persisted UTXO set AHEAD of chain_tip:
+   [rdb_tip = N, chain_tip = M] with N > M.
+
+   The old boot path (cli.ml) treated this as SAFE on the false premise that
+   "forward re-apply is idempotent" (storage.ml:638-641).  That premise is
+   FALSE for cross-block spends: re-applying block M+1 from chain_tip+1 runs
+   validate_tx_inputs (validation.ml:1136-1182), which READS the UTXO set and
+   raises TxMissingInputs because a prevout was already DELETED by an
+   already-committed later block (M+2..N) inside the crash window.  The block
+   is rejected, re-downloaded forever, and the node wedges at chain_tip
+   (the live mainnet camlcoin wedge at 952223/952224).
+
+   This mirrors Bitcoin Core's [Chainstate::ReplayBlocks] / [RollbackBlock]
+   (validation.cpp:4773-4858): when the coins DB tip and the block-index tip
+   disagree after an interrupted flush, Core ROLLS THE UTXO SET BACK along the
+   over-applied branch using each block's undo data (DisconnectBlock) down to
+   the last consistent point, then rolls forward.  Both writing and deleting a
+   UTXO are idempotent, so a window block whose mutations were only partially
+   applied still ends up cleanly undone.
+
+   [reconcile_rdb_to_chain_tip] rolls the RDB UTXO set (and the mirrored CF
+   utxo column) DOWN from [rdb_height] to [target_height] (= chain_tip),
+   tip-first, restoring spent outputs and removing created outputs from each
+   window block's stored undo data.  After it returns Ok, the UTXO set matches
+   chain_tip exactly and forward IBD re-applies M+1..N from a consistent base.
+
+   If undo data is MISSING for ANY block in the window (sync.ml:3135-3140 style
+   failure — the post-IBD connect paths at apply_block_atomic do not persist
+   undo data), reconciliation is impossible, so we return Error and the caller
+   falls back to a full resync rather than spinning in the missing-inputs loop. *)
+let reconcile_rdb_to_chain_tip (state : chain_state)
+    (rocksdb : Rocksdb_store.t) ~(rdb_height : int) ~(target_height : int)
+    : (unit, string) result =
+  if rdb_height <= target_height then Ok ()
+  else begin
+    (* Walk window blocks tip-first (rdb_height down to target_height+1).
+       Accumulate inverse UTXO ops for ONE atomic RDB WriteBatch + mirror
+       them into a CF batch so both backends stay consistent. *)
+    let rdb_ops = ref [] in          (* (key, Some data | None) for RDB *)
+    let cf_batch = Storage.ChainDB.batch_create () in
+    let undo_to_delete = ref [] in   (* block hashes whose undo we invalidate *)
+    let error = ref None in
+    let h = ref rdb_height in
+    while !error = None && !h > target_height do
+      let height = !h in
+      (match Storage.ChainDB.get_hash_at_height state.db height with
+       | None ->
+         error := Some (Printf.sprintf
+           "reconcile: no height->hash mapping for window block %d" height)
+       | Some bhash ->
+         (match Storage.ChainDB.get_block state.db bhash with
+          | None ->
+            error := Some (Printf.sprintf
+              "reconcile: missing block body at window height %d" height)
+          | Some block ->
+            (match Storage.ChainDB.get_undo_data state.db bhash with
+             | None ->
+               (* No undo data — cannot restore spent outputs. The post-IBD
+                  connect paths (connect_stored_blocks / process_new_block)
+                  do not write undo data, so this is the common case. Bail
+                  to the caller's full-resync fallback. *)
+               error := Some (Printf.sprintf
+                 "reconcile: missing undo data at window height %d \
+                  (post-IBD connect path does not persist undo)" height)
+             | Some undo_raw ->
+               let r = Serialize.reader_of_cstruct
+                         (Cstruct.of_string undo_raw) in
+               let undo = Utxo.deserialize_undo_data r in
+               (* Remove outputs created by this block (skip provably-
+                  unspendable: they were never written to the UTXO set,
+                  matching apply_block_atomic's is_unspendable_script filter
+                  on the connect path). Deleting an absent UTXO is a no-op,
+                  so this is safe even for the partially-applied tip block. *)
+               List.iter (fun (tx : Types.transaction) ->
+                 let txid = Crypto.compute_txid tx in
+                 List.iteri (fun vout (out : Types.tx_out) ->
+                   if not (Utxo.is_unspendable_script out.Types.script_pubkey)
+                   then begin
+                     let key = Storage.ChainDB.rocksdb_utxo_key txid vout in
+                     rdb_ops := (key, None) :: !rdb_ops;
+                     Storage.ChainDB.batch_delete_utxo cf_batch txid vout
+                   end
+                 ) tx.Types.outputs
+               ) block.transactions;
+               (* Restore spent outputs from undo data. Re-adding an existing
+                  UTXO is an idempotent overwrite. *)
+               List.iter (fun (tx_undo : Utxo.tx_undo) ->
+                 List.iter
+                   (fun (outpoint, (e : Utxo.utxo_entry)) ->
+                     let data = encode_utxo e.Utxo.value e.Utxo.script_pubkey
+                                  e.Utxo.height e.Utxo.is_coinbase in
+                     let txid = outpoint.Types.txid in
+                     let vout = Int32.to_int outpoint.Types.vout in
+                     let key = Storage.ChainDB.rocksdb_utxo_key txid vout in
+                     rdb_ops := (key, Some data) :: !rdb_ops;
+                     Storage.ChainDB.batch_store_utxo cf_batch txid vout data
+                   ) tx_undo.spent_outputs
+               ) undo.tx_undos;
+               undo_to_delete := bhash :: !undo_to_delete)));
+      decr h
+    done;
+    match !error with
+    | Some msg -> Error msg
+    | None ->
+      (* Commit the inverse UTXO ops atomically to RDB, and in the SAME
+         WriteBatch lower the RDB tip_height to target_height so the
+         backend's recorded tip can never lead chain_tip again.
+
+         ORDER MATTERS: [rdb_ops] is prepended while walking tip-first, so it
+         is in reverse disconnect order.  [List.rev] restores disconnect order
+         (highest window block first, chain_tip+1 last).  In a RocksDB
+         WriteBatch the LAST write to a key wins, so disconnect order makes the
+         lower (closer-to-chain_tip) block's op override a higher block's op on
+         the same key — exactly Core's sequential cache mutation in
+         RollbackBlock.  Concretely, for a spend chain X->Y->Z across the
+         window, block N+2 restores Y while block N+1 must then DELETE Y (it
+         created Y); applying N+1 after N+2 yields the correct "Y absent at
+         chain_tip" result.  Without the rev, N+2's restore would win and leak
+         a phantom Y into the rolled-back set. *)
+      Rocksdb_store.batch_write ~tip_height:target_height rocksdb
+        (List.rev !rdb_ops);
+      (* Mirror into the CF utxo column so a CF-side reader sees the same
+         rolled-back set. *)
+      Storage.ChainDB.batch_write state.db cf_batch;
+      (* The undo data for the rolled-back window blocks is no longer valid;
+         the connect path rebuilds it fresh when those blocks re-apply. *)
+      List.iter (fun bhash ->
+        Storage.ChainDB.delete_undo_data state.db bhash) !undo_to_delete;
+      (* Stale sig-cache results from the over-applied segment must not leak
+         forward into re-validation. *)
+      Sig_cache.clear_global ();
+      Logs.warn (fun m ->
+        m "UTXO reconcile complete: rolled RDB tip back from %d to %d \
+           (matches chain_tip); IBD will re-apply forward from a consistent base"
+          rdb_height target_height);
+      Ok ()
+  end
 
 (* ============================================================================
    Tx-index connect/disconnect (Pattern C0 closure 2026-05-05)

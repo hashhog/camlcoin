@@ -858,24 +858,41 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
      The wallet persists [last_synced_height]; an unclean restart (SIGKILL /
      OOM / power loss) leaves a gap [last_synced_height+1 .. tip] of blocks
      that were connected but whose wallet credits/debits were not yet durably
-     written.  We rescan that gap here (idempotent {txid,vout} scan), so the
+     written.  We rescan that gap (idempotent {txid,vout} scan), so the
      wallet recovers every coin without manual rescanblockchain.  A fresh /
      recovered-from-nothing wallet (last_synced_height = -1) rescans from
-     genesis, rebuilding the ledger.  Mirrors Core CWallet::AttachChain. *)
-  (match wallet with
-   | Some w ->
-     (try
-        Wallet.reconcile_to_tip w
-          ~tip_height:chain.Sync.blocks_synced
-          ~get_block_at:(fun h ->
-            match Sync.get_header_at_height chain h with
-            | None -> None
-            | Some entry ->
-              Storage.ChainDB.get_block chain.Sync.db entry.Sync.hash)
-      with exn ->
-        Logs.warn (fun m ->
-          m "wallet startup reconcile failed: %s" (Printexc.to_string exn)))
-   | None -> ());
+     genesis, rebuilding the ledger.  Mirrors Core CWallet::AttachChain.
+
+     IMPORTANT: this must NOT run synchronously on the boot path.  A
+     full-chain rescan (last_synced_height = -1 — first restart after the
+     wallet fix deploys, or a seed-restored wallet) walks 0..tip (~950k
+     blocks on mainnet) and would block the process for many minutes BEFORE
+     [Lwt_main.run] schedules the RPC bind below — making the node look
+     DOWN.  Instead we capture a thunk here and spawn it as a NON-BLOCKING
+     Lwt.async task further down, AFTER the RPC / P2P / sync services are
+     set up, exactly as Core runs ScanForWalletTransactions off the
+     init-critical path (getwalletinfo.scanning stays responsive).  The
+     yielding variant [reconcile_to_tip_lwt] pauses the scheduler every N
+     blocks so RPC handlers and peer loops keep running. *)
+  let wallet_reconcile_task () : unit Lwt.t =
+    match wallet with
+    | None -> Lwt.return_unit
+    | Some w ->
+      Lwt.catch
+        (fun () ->
+          Wallet.reconcile_to_tip_lwt w
+            ~tip_height:chain.Sync.blocks_synced
+            ~get_block_at:(fun h ->
+              match Sync.get_header_at_height chain h with
+              | None -> None
+              | Some entry ->
+                Storage.ChainDB.get_block chain.Sync.db entry.Sync.hash))
+        (fun exn ->
+          Logs.warn (fun m ->
+            m "wallet background reconcile failed: %s"
+              (Printexc.to_string exn));
+          Lwt.return_unit)
+  in
 
   (* Wire the block-connect -> wallet UTXO ledger hook (mirrors Bitcoin Core's
      CWallet::blockConnected / blockDisconnected).  Every block-connect
@@ -2120,6 +2137,16 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   Lwt.async (fun () -> peer_thread);
   Lwt.async (fun () -> listener_thread);
   Lwt.async (fun () -> sync_thread);
+
+  (* Deferred wallet recovery rescan (see [wallet_reconcile_task] above).
+     Spawned here — AFTER the RPC server thread and the peer / listener /
+     sync threads have been scheduled — so the RPC server binds and answers
+     getblockcount / getwalletinfo immediately while the (possibly
+     full-chain) wallet rescan proceeds concurrently in the background.
+     [reconcile_to_tip_lwt] yields the scheduler every N blocks so this
+     never starves the event loop.  Mirrors Bitcoin Core CWallet::AttachChain
+     keeping the node responsive during a wallet rescan. *)
+  Lwt.async (fun () -> wallet_reconcile_task ());
 
   (* Supervisor handshake: now that the RPC, peer manager, and P2P listener
      have been kicked off, signal readiness on the file descriptor passed by

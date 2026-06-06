@@ -1832,7 +1832,24 @@ let start_asmap_health_check_timer (pm : t) : unit =
 let peer_message_loop (pm : t) (peer : Peer.peer) : unit Lwt.t =
   let open Lwt.Syntax in
   let rec loop () =
-    if peer.state = Peer.Disconnected || not pm.running then
+    if peer.state = Peer.Disconnected then
+      (* The read side (Peer.read_message_with_timeout, lib/peer.ml:645-661)
+         may flip peer.state to Disconnected on a read failure and return a
+         clean [None] (= timeout).  The [None] maintenance arm below then
+         re-enters [loop ()] and we land here.  Historically this guard
+         exited SILENTLY without calling [remove_peer], leaving the peer as a
+         zombie in [pm.peers]: the pinned re-dial in [maintain_connections]
+         tests presence by (addr,port) with no state filter so it would never
+         re-dial, and the stale/eviction reapers gate on [state = Ready] so
+         none would reap it — permanently starving the connection.  Every
+         OTHER exit path of this loop (ping-timeout, the exception handler,
+         the protocol [`Disconnect]) calls [remove_peer]; this one must too.
+         [remove_peer] is the only function that filters [pm.peers]; it is a
+         no-op if the peer is already gone, so this cannot double-remove. *)
+      remove_peer pm peer.id
+    else if not pm.running then
+      (* Manager is shutting down — [disconnect_all]/shutdown owns cleanup of
+         [pm.peers], so do not remove here (preserves prior behaviour). *)
       Lwt.return_unit
     else begin
       Lwt.catch (fun () ->

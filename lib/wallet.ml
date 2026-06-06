@@ -3250,6 +3250,65 @@ let reconcile_to_tip (w : t)
     save_safe w
   end
 
+(* Lwt-aware, cooperatively-yielding variant of [reconcile_to_tip].
+
+   Identical recovery semantics to [reconcile_to_tip] (genesis-clear on a
+   from-scratch rescan, {txid,vout}-idempotent [scan_block] over the gap,
+   monotonic [last_synced_height] advance, one durable [save_safe] at the
+   end) — but it yields the Lwt scheduler ([Lwt.pause]) every [yield_every]
+   blocks so the rescan can run as an Lwt.async background task WITHOUT
+   starving the event loop.  This lets the RPC server bind and stay
+   responsive (getblockcount / getwalletinfo) while a full-chain rescan
+   (last_synced_height = -1, e.g. first restart after the wallet fix, or a
+   seed-restored wallet) walks 0..tip — mirroring Bitcoin Core
+   CWallet::AttachChain, which runs ScanForWalletTransactions off the
+   init-critical path and keeps the RPC (getwalletinfo.scanning) live.
+
+   Because OCaml runs single-threaded between [Lwt.pause] yields, each
+   per-block [scan_block] is atomic with respect to the live block-connect
+   hook ([scan_block_and_persist]); interleaving can only occur at a yield
+   boundary, where [scan_block]'s {txid,vout} idempotency and the monotonic
+   [last_synced_height] guard make a concurrent connect harmless.  No
+   preemptive worker thread is used, so no OCaml-heap data race is possible. *)
+let reconcile_to_tip_lwt (w : t)
+    ~(tip_height : int)
+    ~(get_block_at : int -> Types.block option) : unit Lwt.t =
+  let start = w.last_synced_height + 1 in
+  if start > tip_height then Lwt.return_unit  (* at/ahead of tip: nothing to do *)
+  else begin
+    if start <= 0 then begin
+      w.utxos <- [];
+      w.balance_confirmed <- 0L;
+      w.balance_unconfirmed <- 0L;
+      w.tx_history <- []
+    end;
+    Log.info (fun m ->
+      m "wallet reconcile (background): scanning blocks %d..%d to catch up to \
+         chain tip" (max 0 start) tip_height);
+    let yield_every = 500 in
+    let rec loop h =
+      if h > tip_height then Lwt.return_unit
+      else begin
+        (match get_block_at h with
+         | None -> ()  (* body not stored (e.g. assume-valid IBD height) *)
+         | Some block -> scan_block w block h);
+        (* Advance the synced frontier per block so a crash mid-rescan
+           resumes from here rather than restarting at genesis. *)
+        if h > w.last_synced_height then w.last_synced_height <- h;
+        if h mod yield_every = 0 then
+          Lwt.bind (Lwt.pause ()) (fun () -> loop (h + 1))
+        else loop (h + 1)
+      end
+    in
+    Lwt.bind (loop (max 0 start)) (fun () ->
+      w.last_synced_height <- tip_height;
+      save_safe w;
+      Log.info (fun m ->
+        m "wallet reconcile (background): complete, synced to height %d"
+          tip_height);
+      Lwt.return_unit)
+  end
+
 (* ============================================================================
    Wallet Info
    ============================================================================ *)

@@ -4244,6 +4244,21 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
             state.blocks_synced <- new_tip.height;
             if new_tip.height > state.headers_synced then
               state.headers_synced <- new_tip.height;
+            (* Feed the wallet across the reorg: first reverse the blocks that
+               left the active chain (unscan), then apply the blocks that joined
+               it (scan).  Each hook durably persists, so the wallet ledger
+               tracks the new active chain even across an unclean restart mid-
+               reorg.  Best-effort; never rolls back the committed reorg.
+               Disconnected block bodies are read back from the DB (tip-back-to-
+               fork order). *)
+            List.iter (fun (entry : header_entry) ->
+              match Storage.ChainDB.get_block state.db entry.hash with
+              | Some block -> run_wallet_unscan_hook state block entry.height
+              | None -> ()
+            ) to_disconnect;
+            List.iter (fun ((entry : header_entry), (block : Types.block)) ->
+              run_wallet_scan_hook state block entry.height
+            ) (List.rev !connected_blocks);
             (* Clear sig cache so stale results from the abandoned chain
                don't leak into post-reorg validation. *)
             Sig_cache.clear_global ();
@@ -4904,6 +4919,10 @@ let rec connect_stored_blocks (state : chain_state) : int =
              count without needing the full block body. *)
           Storage.ChainDB.store_block_ntx state.db entry.hash
             (List.length stored_block.transactions);
+          (* Feed the wallet from the gap-fill catch-up connect path too, so
+             out-of-order blocks drained here also update + persist the wallet
+             ledger.  Best-effort (see process_new_block). *)
+          run_wallet_scan_hook state stored_block next_height;
           Logs.info (fun m ->
             m "Connected stored block %s at height %d (catch-up from gap-fill)"
               (Types.hash256_to_hex_display entry.hash) next_height);
@@ -5119,9 +5138,12 @@ let process_new_block ?(f_requested = false)
              returns the correct count without needing the full block body. *)
           Storage.ChainDB.store_block_ntx state.db hash
             (List.length block.transactions);
-          Logs.info (fun m ->
-            m "Connected new block %s at height %d"
-              (Types.hash256_to_hex_display hash) height);
+          (* Feed the wallet from the LIVE P2P / IBD connect path (not just the
+             mining/RPC path).  [run_wallet_scan_hook] credits/debits + durably
+             persists the wallet ledger so a coin received over P2P survives an
+             unclean restart.  Best-effort: a wallet-side failure must never
+             roll back this already-connected block. *)
+          run_wallet_scan_hook state block height;
           (* W34 fix: try to connect any subsequent stored blocks that were
              received out-of-order by the gap-fill but couldn't be processed
              because their parent wasn't yet connected. *)

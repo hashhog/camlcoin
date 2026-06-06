@@ -452,6 +452,13 @@ type t = {
   mutable encryption : encryption_state;
   (* lockunspent: outpoint -> persistent flag (true = written to disk) *)
   locked_coins : (string * int32, bool) Hashtbl.t;
+  (* Highest block height whose body has been folded into the wallet ledger
+     (the [scan_block] credit/debit pass). Persisted so a restart knows the
+     gap [last_synced_height+1 .. tip] still to reconcile against the chain.
+     -1 means "nothing scanned yet" (fresh wallet). Mirrors the role of
+     CWallet::m_last_block_processed / GetLastBlockHeight in Bitcoin Core,
+     which the wallet uses to drive the startup catch-up scan. *)
+  mutable last_synced_height : int;
 }
 
 (* ============================================================================
@@ -486,6 +493,7 @@ let create ~(network : [`Mainnet | `Testnet | `Regtest])
       encrypted_keys = Hashtbl.create 16;
     };
     locked_coins = Hashtbl.create 16;
+    last_synced_height = -1;
   }
 
 (* ============================================================================
@@ -2658,129 +2666,117 @@ let addr_type_of_string = function
   | "p2tr" -> P2TR
   | _ -> P2WPKH  (* default *)
 
-(* Save wallet to file (unencrypted) *)
+(* ----------------------------------------------------------------------------
+   Atomic + durable file write.
+
+   Mirrors the tmp+fsync+rename+dir-fsync protocol used elsewhere in camlcoin
+   (assume_utxo.ml write_snapshot, mempool.ml save_mempool, block_index.ml,
+   storage.ml) and Bitcoin Core's walletdb.cpp BerkeleyBatch/SQLite durable
+   commit + dumptxoutset's "<path>.incomplete" -> rename pattern:
+
+     1. write the full contents to [<path>.tmp]
+     2. fsync the fd  (so the bytes are on stable storage before the rename)
+     3. atomic rename [<path>.tmp] -> [<path>]  (a reader sees old-or-new,
+        never a torn / half-written file)
+     4. fsync the containing directory  (so the rename itself is durable; a
+        power loss after rename but before the dir entry is flushed could
+        otherwise lose the rename and resurrect the old file)
+
+   On any failure the temp file is best-effort removed and the exception is
+   re-raised to the caller (the call sites that must not abort wrap this in a
+   try/with — see [save_safe]).  Never does an in-place [open_out path] that a
+   SIGKILL / OOM / power loss could leave half-written and unparseable. *)
+let atomic_write_file (path : string) (contents : string) : unit =
+  let tmp = path ^ ".tmp" in
+  (let oc = open_out_bin tmp in
+   Fun.protect ~finally:(fun () -> close_out_noerr oc) (fun () ->
+     output_string oc contents;
+     flush oc;
+     (try Unix.fsync (Unix.descr_of_out_channel oc)
+      with Unix.Unix_error _ -> ())));
+  Sys.rename tmp path;
+  (* fsync the directory so the rename is durable across a crash. *)
+  (try
+     let dir = Filename.dirname path in
+     let dfd = Unix.openfile dir [ Unix.O_RDONLY ] 0 in
+     Fun.protect ~finally:(fun () -> try Unix.close dfd with _ -> ())
+       (fun () -> try Unix.fsync dfd with Unix.Unix_error _ -> ())
+   with _ -> ())
+
+(* Build the plaintext wallet JSON document.  Shared by [save] (writes it
+   directly) and [save_encrypted] (encrypts it).  Factored out so the two
+   serializers can never drift in which fields they persist — both now carry
+   [last_synced_height] for the startup reconcile. *)
+let wallet_to_json (w : t) : Yojson.Safe.t =
+  let keys_json = List.map (fun kp ->
+    `Assoc [
+      ("private_key", `String (cstruct_to_hex kp.private_key));
+      ("address", `String (Address.address_to_string kp.address));
+      ("addr_type", `String (addr_type_to_string kp.addr_type));
+    ]
+  ) w.keys in
+
+  let utxos_json = List.map (fun wutxo ->
+    `Assoc [
+      ("txid", `String (cstruct_to_hex wutxo.outpoint.txid));
+      ("vout", `Int (Int32.to_int wutxo.outpoint.vout));
+      ("value", `String (Int64.to_string wutxo.utxo.Utxo.value));
+      ("script_pubkey", `String (cstruct_to_hex wutxo.utxo.Utxo.script_pubkey));
+      ("height", `Int wutxo.utxo.Utxo.height);
+      ("is_coinbase", `Bool wutxo.utxo.Utxo.is_coinbase);
+      ("key_index", `Int wutxo.key_index);
+      ("confirmed", `Bool wutxo.confirmed);
+    ]
+  ) w.utxos in
+
+  let history_json = List.map (fun h ->
+    `Assoc [
+      ("txid", `String h.hist_txid);
+      ("category", `String (match h.hist_category with
+        | `Send -> "send" | `Generate -> "generate" | `Receive -> "receive"));
+      ("amount", `String (Int64.to_string h.hist_amount));
+      ("fee", `String (Int64.to_string h.hist_fee));
+      ("address", `String h.hist_address);
+      ("vout", `Int h.hist_vout);
+      ("is_coinbase", `Bool h.hist_is_coinbase);
+      ("confirmations", `Int h.hist_confirmations);
+      ("blockhash", `String h.hist_block_hash);
+      ("blockheight", `Int h.hist_block_height);
+      ("time", `Float h.hist_timestamp);
+    ]
+  ) w.tx_history in
+
+  let network_str = match w.network with
+    | `Mainnet -> "mainnet"
+    | `Testnet -> "testnet"
+    | `Regtest -> "regtest"
+  in
+
+  `Assoc [
+    ("network", `String network_str);
+    ("keys", `List keys_json);
+    ("utxos", `List utxos_json);
+    ("next_key_index", `Int w.next_key_index);
+    ("balance_confirmed", `String (Int64.to_string w.balance_confirmed));
+    ("balance_unconfirmed", `String (Int64.to_string w.balance_unconfirmed));
+    ("bip44_receive_index", `Int w.bip44_receive_index);
+    ("bip44_change_index", `Int w.bip44_change_index);
+    ("bip86_receive_index", `Int w.bip86_receive_index);
+    ("bip86_change_index", `Int w.bip86_change_index);
+    ("tx_history", `List history_json);
+    ("last_synced_height", `Int w.last_synced_height);
+  ]
+
+(* Save wallet to file (unencrypted).  Atomic + durable: writes to a temp file,
+   fsyncs, atomic-renames into place, and fsyncs the directory — never an
+   in-place write a crash could leave torn (see [atomic_write_file]). *)
 let save (w : t) : unit =
-  let keys_json = List.map (fun kp ->
-    `Assoc [
-      ("private_key", `String (cstruct_to_hex kp.private_key));
-      ("address", `String (Address.address_to_string kp.address));
-      ("addr_type", `String (addr_type_to_string kp.addr_type));
-    ]
-  ) w.keys in
+  atomic_write_file w.db_path (Yojson.Safe.to_string (wallet_to_json w))
 
-  let utxos_json = List.map (fun wutxo ->
-    `Assoc [
-      ("txid", `String (cstruct_to_hex wutxo.outpoint.txid));
-      ("vout", `Int (Int32.to_int wutxo.outpoint.vout));
-      ("value", `String (Int64.to_string wutxo.utxo.Utxo.value));
-      ("script_pubkey", `String (cstruct_to_hex wutxo.utxo.Utxo.script_pubkey));
-      ("height", `Int wutxo.utxo.Utxo.height);
-      ("is_coinbase", `Bool wutxo.utxo.Utxo.is_coinbase);
-      ("key_index", `Int wutxo.key_index);
-      ("confirmed", `Bool wutxo.confirmed);
-    ]
-  ) w.utxos in
-
-  let history_json = List.map (fun h ->
-    `Assoc [
-      ("txid", `String h.hist_txid);
-      ("category", `String (match h.hist_category with
-        | `Send -> "send" | `Generate -> "generate" | `Receive -> "receive"));
-      ("amount", `String (Int64.to_string h.hist_amount));
-      ("fee", `String (Int64.to_string h.hist_fee));
-      ("address", `String h.hist_address);
-      ("vout", `Int h.hist_vout);
-      ("is_coinbase", `Bool h.hist_is_coinbase);
-      ("confirmations", `Int h.hist_confirmations);
-      ("blockhash", `String h.hist_block_hash);
-      ("blockheight", `Int h.hist_block_height);
-      ("time", `Float h.hist_timestamp);
-    ]
-  ) w.tx_history in
-
-  let network_str = match w.network with
-    | `Mainnet -> "mainnet"
-    | `Testnet -> "testnet"
-    | `Regtest -> "regtest"
-  in
-
-  let json = `Assoc [
-    ("network", `String network_str);
-    ("keys", `List keys_json);
-    ("utxos", `List utxos_json);
-    ("next_key_index", `Int w.next_key_index);
-    ("balance_confirmed", `String (Int64.to_string w.balance_confirmed));
-    ("balance_unconfirmed", `String (Int64.to_string w.balance_unconfirmed));
-    ("bip44_receive_index", `Int w.bip44_receive_index);
-    ("bip44_change_index", `Int w.bip44_change_index);
-    ("bip86_receive_index", `Int w.bip86_receive_index);
-    ("bip86_change_index", `Int w.bip86_change_index);
-    ("tx_history", `List history_json);
-  ] in
-
-  let oc = open_out w.db_path in
-  output_string oc (Yojson.Safe.to_string json);
-  close_out oc
-
-(* Save wallet to file with AES-256-CBC encryption *)
+(* Save wallet to file with AES-256-CBC encryption.  Atomic + durable via the
+   same tmp+fsync+rename+dir-fsync protocol as the plaintext [save]. *)
 let save_encrypted (w : t) ~(passphrase : string) : unit =
-  let keys_json = List.map (fun kp ->
-    `Assoc [
-      ("private_key", `String (cstruct_to_hex kp.private_key));
-      ("address", `String (Address.address_to_string kp.address));
-      ("addr_type", `String (addr_type_to_string kp.addr_type));
-    ]
-  ) w.keys in
-
-  let utxos_json = List.map (fun wutxo ->
-    `Assoc [
-      ("txid", `String (cstruct_to_hex wutxo.outpoint.txid));
-      ("vout", `Int (Int32.to_int wutxo.outpoint.vout));
-      ("value", `String (Int64.to_string wutxo.utxo.Utxo.value));
-      ("script_pubkey", `String (cstruct_to_hex wutxo.utxo.Utxo.script_pubkey));
-      ("height", `Int wutxo.utxo.Utxo.height);
-      ("is_coinbase", `Bool wutxo.utxo.Utxo.is_coinbase);
-      ("key_index", `Int wutxo.key_index);
-      ("confirmed", `Bool wutxo.confirmed);
-    ]
-  ) w.utxos in
-
-  let history_json = List.map (fun h ->
-    `Assoc [
-      ("txid", `String h.hist_txid);
-      ("category", `String (match h.hist_category with
-        | `Send -> "send" | `Generate -> "generate" | `Receive -> "receive"));
-      ("amount", `String (Int64.to_string h.hist_amount));
-      ("fee", `String (Int64.to_string h.hist_fee));
-      ("address", `String h.hist_address);
-      ("vout", `Int h.hist_vout);
-      ("is_coinbase", `Bool h.hist_is_coinbase);
-      ("confirmations", `Int h.hist_confirmations);
-      ("blockhash", `String h.hist_block_hash);
-      ("blockheight", `Int h.hist_block_height);
-      ("time", `Float h.hist_timestamp);
-    ]
-  ) w.tx_history in
-
-  let network_str = match w.network with
-    | `Mainnet -> "mainnet"
-    | `Testnet -> "testnet"
-    | `Regtest -> "regtest"
-  in
-
-  let json = `Assoc [
-    ("network", `String network_str);
-    ("keys", `List keys_json);
-    ("utxos", `List utxos_json);
-    ("next_key_index", `Int w.next_key_index);
-    ("balance_confirmed", `String (Int64.to_string w.balance_confirmed));
-    ("balance_unconfirmed", `String (Int64.to_string w.balance_unconfirmed));
-    ("bip44_receive_index", `Int w.bip44_receive_index);
-    ("bip44_change_index", `Int w.bip44_change_index);
-    ("bip86_receive_index", `Int w.bip86_receive_index);
-    ("bip86_change_index", `Int w.bip86_change_index);
-    ("tx_history", `List history_json);
-  ] in
+  let json = wallet_to_json w in
 
   (* Encrypt the JSON content *)
   let salt = generate_salt () in
@@ -2797,9 +2793,7 @@ let save_encrypted (w : t) ~(passphrase : string) : unit =
     ("data", `String (cstruct_to_hex ciphertext));
   ] in
 
-  let oc = open_out w.db_path in
-  output_string oc (Yojson.Safe.to_string header);
-  close_out oc;
+  atomic_write_file w.db_path (Yojson.Safe.to_string header);
 
   (* Update encryption state *)
   w.encryption.encrypted <- true;
@@ -2907,6 +2901,11 @@ let load_wallet_json (w : t) (network : [`Mainnet | `Testnet | `Regtest]) (json 
      | Some (`Int n) -> w.bip86_receive_index <- n | _ -> ());
     (match List.assoc_opt "bip86_change_index" fields with
      | Some (`Int n) -> w.bip86_change_index <- n | _ -> ());
+    (* last_synced_height: absent in pre-fix wallet files -> leave at the
+       create-time default (-1) so the startup reconcile rescans from genesis,
+       rebuilding the ledger exactly as a from-scratch rescan would. *)
+    (match List.assoc_opt "last_synced_height" fields with
+     | Some (`Int n) -> w.last_synced_height <- n | _ -> ());
 
     (* Load transaction history *)
     (match List.assoc_opt "tx_history" fields with
@@ -2953,34 +2952,129 @@ let load_wallet_json (w : t) (network : [`Mainnet | `Testnet | `Regtest]) (json 
      | _ -> ())
   | _ -> ()
 
-(* Load wallet from file (unencrypted) *)
+(* Read the full contents of a file, or None if it does not exist / cannot be
+   read.  Never raises. *)
+let read_file_opt (path : string) : string option =
+  if not (Sys.file_exists path) then None
+  else
+    try
+      let ic = open_in_bin path in
+      Fun.protect ~finally:(fun () -> close_in_noerr ic) (fun () ->
+        let len = in_channel_length ic in
+        Some (really_input_string ic len))
+    with _ -> None
+
+(* Best-effort: parse a candidate wallet payload into a fresh wallet.  Returns
+   None if the bytes are missing, empty, not JSON, or structurally not a wallet
+   object.  Never raises — a partially-written / corrupt file just yields None
+   so the caller can fall through to recovery. *)
+let try_load_plaintext ~network ~db_path (data_opt : string option) : t option =
+  match data_opt with
+  | None -> None
+  | Some data ->
+    if String.length (String.trim data) = 0 then None
+    else
+      (try
+         match Yojson.Safe.from_string data with
+         | `Assoc _ as json ->
+           let w = create ~network ~db_path in
+           load_wallet_json w network json;
+           Some w
+         | _ -> None
+       with _ -> None)
+
+(* Load wallet from file (unencrypted).
+
+   FAULT-TOLERANT: a missing, empty, truncated, or otherwise corrupt wallet
+   file MUST NOT crash node startup (Bitcoin Core's BerkeleyDatabase::Verify /
+   RecoverDatabaseFile salvage path).  Recovery order:
+     1. parse [db_path]                       — the happy path
+     2. else parse a leftover [db_path.tmp]   — a SIGKILL between the temp
+        write and the atomic rename can leave a complete temp file even when
+        [db_path] itself is absent / older
+     3. else parse [db_path.bak]              — a prior good copy
+     4. else start a fresh wallet
+   When [db_path] exists but is unparseable, its bytes are preserved to
+   [db_path.corrupt] before we fall through, so nothing is silently discarded.
+   In every case the returned wallet's [last_synced_height] (default -1 on a
+   fresh / recovered-from-nothing wallet) drives the startup reconcile to
+   rebuild the on-chain ledger from the blocks. *)
 let load ~(network : [`Mainnet | `Testnet | `Regtest])
     ~(db_path : string) : t =
-  if Sys.file_exists db_path then begin
-    let ic = open_in db_path in
-    let len = in_channel_length ic in
-    let data = really_input_string ic len in
-    close_in ic;
-
-    let json = Yojson.Safe.from_string data in
-    let w = create ~network ~db_path in
-    load_wallet_json w network json;
+  let tmp_path = db_path ^ ".tmp" in
+  let bak_path = db_path ^ ".bak" in
+  match try_load_plaintext ~network ~db_path (read_file_opt db_path) with
+  | Some w ->
+    (* On a clean load, keep a backup copy so a future corruption has a
+       fallback.  Best-effort; never fatal. *)
+    (try
+       (match read_file_opt db_path with
+        | Some data -> atomic_write_file bak_path data
+        | None -> ())
+     with _ -> ());
     w
-  end else
-    create ~network ~db_path
+  | None ->
+    if Sys.file_exists db_path then
+      Log.warn (fun m ->
+        m "wallet file %s is missing/corrupt/truncated; attempting recovery"
+          db_path)
+    else if Sys.file_exists tmp_path || Sys.file_exists bak_path then
+      Log.warn (fun m ->
+        m "wallet file %s absent; attempting recovery from temp/backup" db_path);
+    (* Preserve the corrupt bytes (if any) before we overwrite db_path. *)
+    (if Sys.file_exists db_path then
+       try
+         (match read_file_opt db_path with
+          | Some data -> atomic_write_file (db_path ^ ".corrupt") data
+          | None -> ())
+       with _ -> ());
+    (match try_load_plaintext ~network ~db_path (read_file_opt tmp_path) with
+     | Some w ->
+       Log.warn (fun m -> m "recovered wallet from %s" tmp_path);
+       (try save w with _ -> ());  (* re-materialise db_path atomically *)
+       w
+     | None ->
+       (match try_load_plaintext ~network ~db_path (read_file_opt bak_path) with
+        | Some w ->
+          Log.warn (fun m -> m "recovered wallet from %s" bak_path);
+          (try save w with _ -> ());
+          w
+        | None ->
+          if Sys.file_exists db_path || Sys.file_exists tmp_path
+             || Sys.file_exists bak_path then
+            Log.err (fun m ->
+              m "could not recover wallet %s from any source; starting fresh \
+                 (a startup rescan will rebuild the ledger)" db_path);
+          create ~network ~db_path))
 
-(* Load wallet from encrypted file *)
+(* Load wallet from encrypted file.
+
+   FAULT-TOLERANT: a truncated / corrupt header (not valid JSON, or an
+   incomplete temp left by a crash) returns a graceful [Error] rather than
+   raising, so the daemon's startup path can fall back (and the operator can
+   re-supply the passphrase) instead of the process aborting.  A leftover
+   [db_path.tmp] from a crash mid-rename is tried as a fallback. *)
 let load_encrypted ~(network : [`Mainnet | `Testnet | `Regtest])
     ~(db_path : string) ~(passphrase : string) : (t, string) result =
-  if not (Sys.file_exists db_path) then
-    Error "Wallet file does not exist"
-  else begin
-    let ic = open_in db_path in
-    let len = in_channel_length ic in
-    let data = really_input_string ic len in
-    close_in ic;
-
-    let json = Yojson.Safe.from_string data in
+  let tmp_path = db_path ^ ".tmp" in
+  let candidate =
+    match read_file_opt db_path with
+    | Some d when String.length (String.trim d) > 0 -> Some d
+    | _ -> read_file_opt tmp_path  (* crash before the rename completed *)
+  in
+  match candidate with
+  | None -> Error "Wallet file does not exist"
+  | Some data ->
+    let json_opt = try Some (Yojson.Safe.from_string data) with _ -> None in
+    (match json_opt with
+    | None ->
+      (* Preserve the corrupt bytes; do not crash. *)
+      (try atomic_write_file (db_path ^ ".corrupt") data with _ -> ());
+      Log.warn (fun m ->
+        m "encrypted wallet file %s is corrupt/truncated" db_path);
+      Error "Wallet file is corrupt or truncated"
+    | Some json ->
+    try
     match json with
     | `Assoc fields ->
       (match List.assoc_opt "encrypted" fields with
@@ -3017,6 +3111,143 @@ let load_encrypted ~(network : [`Mainnet | `Testnet | `Regtest])
          load_wallet_json w network json;
          Ok w)
     | _ -> Error "Invalid wallet file format"
+    with exn ->
+      Log.warn (fun m ->
+        m "encrypted wallet load failed: %s" (Printexc.to_string exn));
+      Error "Wallet file is corrupt or could not be decoded")
+
+(* ============================================================================
+   Save-on-mutation + startup reconcile
+
+   The pre-fix bug: wallet state was persisted ONLY at clean shutdown
+   (cli.ml graceful_shutdown Phase 2).  A SIGKILL / OOM / power loss lost every
+   credit/debit since the last clean exit, and an in-place write torn by such a
+   crash made the file unparseable -> node startup crashed.  We now (a) write
+   atomically + durably (above), and (b) persist after every state-changing op
+   via [save_safe], mirroring Bitcoin Core's WalletBatch flush-per-mutation.
+   ============================================================================ *)
+
+(* Best-effort persist that never raises and never writes plaintext for an
+   encrypted wallet.
+
+   - Unencrypted wallet: atomic plaintext [save].
+   - Encrypted wallet: a passphrase-derived key is required to re-encrypt and
+     it is NOT held in plaintext, so a background auto-save cannot rewrite the
+     ciphertext.  We skip silently here; the explicit [save_encrypted] paths
+     (RPC, shutdown) still persist with the supplied passphrase.  This avoids
+     ever leaking an encrypted wallet's contents to a plaintext file.
+
+   Use this at every mutation site (connect-loop credit/debit, keypool advance,
+   new address, send) so an unclean restart loses nothing. *)
+let save_safe (w : t) : unit =
+  if w.encryption.encrypted then ()
+  else
+    try save w
+    with exn ->
+      Log.warn (fun m ->
+        m "wallet save failed (state kept in memory): %s"
+          (Printexc.to_string exn))
+
+(* A cheap fingerprint of the wallet's persisted ledger so per-block saves can
+   be skipped when a connected block did not touch the wallet (the common case
+   during IBD on a node whose wallet owns no coins in most blocks).  Captures
+   everything [save] would change that a block-connect can move. *)
+let ledger_fingerprint (w : t) : int =
+  Hashtbl.hash
+    (List.length w.keys, List.length w.utxos, w.balance_confirmed,
+     w.balance_unconfirmed, List.length w.tx_history,
+     w.next_key_index, w.bip44_receive_index, w.bip44_change_index,
+     w.bip86_receive_index, w.bip86_change_index)
+
+(* Periodic-flush throttle state: when a block-connect did NOT change the
+   ledger fingerprint, we still want [last_synced_height] to advance on disk so
+   the startup reconcile gap stays bounded — but writing the whole file every
+   block during IBD is wasteful.  We therefore flush an unchanged-ledger height
+   bump at most once every [save_flush_interval] seconds; a fingerprint change
+   always flushes immediately (no coin movement is ever delayed to disk). *)
+let save_flush_interval = 30.0
+let last_flush_time = ref 0.0
+let last_flush_fingerprint = ref min_int
+
+(* Fold a single connected block into the ledger AND persist the result, and
+   advance [last_synced_height].  This is the block-connect choke point the
+   live P2P/IBD loop and the mining path both call (wired in cli.ml).  Bundling
+   the scan + height-bump + durable save here guarantees the on-disk wallet can
+   never silently fall behind the chain across an unclean restart: whatever
+   height the file records, the startup reconcile rescans [height+1 .. tip].
+
+   Persist policy:
+     - ledger changed (a coin credited/debited, a key/index advanced) -> flush
+       immediately and durably, so no coin movement is ever lost on a crash.
+     - ledger unchanged -> only [last_synced_height] moved; flush at most once
+       per [save_flush_interval] to bound IBD write amplification.  The worst
+       case on a crash is re-scanning up to that interval of empty blocks on
+       restart, which is idempotent and cheap. *)
+let scan_block_and_persist (w : t) (block : Types.block) (height : int) : unit =
+  let fp_before = ledger_fingerprint w in
+  scan_block w block height;
+  if height > w.last_synced_height then w.last_synced_height <- height;
+  let fp_after = ledger_fingerprint w in
+  let now = Unix.gettimeofday () in
+  if fp_after <> fp_before
+     || fp_after <> !last_flush_fingerprint
+     || now -. !last_flush_time >= save_flush_interval
+  then begin
+    save_safe w;
+    last_flush_time := now;
+    last_flush_fingerprint := fp_after
+  end
+
+(* Reverse a block on a reorg AND persist. *)
+let unscan_block_and_persist (w : t) (block : Types.block) (height : int) : unit =
+  unscan_block w block height;
+  (* A disconnect rewinds the synced frontier to the parent height so the
+     reconcile re-applies the new active-chain block at [height]. *)
+  if w.last_synced_height >= height then w.last_synced_height <- height - 1;
+  save_safe w
+
+(* Startup reconcile: bring the wallet's UTXO ledger up to the chain tip.
+
+   Mirrors Bitcoin Core CWallet::AttachChain -> ScanForWalletTransactions over
+   [last_block_processed+1 .. tip].  [get_block_at height] returns the block
+   body at the active-chain height (None if the body is not stored, e.g.
+   assume-valid IBD heights) and [tip_height] is the validated tip
+   (getblockcount).  We rescan the gap with the SAME [scan_block] logic the
+   connect hook uses ({txid,vout}-idempotent, so re-applying an already-scanned
+   block is a no-op), advance [last_synced_height] to [tip_height], and persist
+   once at the end.  A wallet whose [last_synced_height] is already >= tip does
+   nothing (no gap).  -1 (fresh / recovered-from-nothing) rescans from genesis,
+   exactly rebuilding the ledger.
+
+   The per-entry [hist_confirmations] in tx_history is recomputed lazily by the
+   RPC layer (listtransactions/gettransaction derive confirmations from the live
+   tip), so no separate confirmation-recompute pass is needed here. *)
+let reconcile_to_tip (w : t)
+    ~(tip_height : int)
+    ~(get_block_at : int -> Types.block option) : unit =
+  let start = w.last_synced_height + 1 in
+  if start > tip_height then ()  (* already at / ahead of tip: nothing to do *)
+  else begin
+    (* If we are rescanning from genesis (fresh / recovered), clear the chain-
+       derived ledger first so re-applying does not double-count.  A partial
+       gap-fill (start > 0) relies on scan_block's {txid,vout} idempotency.
+       (Inlines clear_for_rescan, which is defined later in this module.) *)
+    if start <= 0 then begin
+      w.utxos <- [];
+      w.balance_confirmed <- 0L;
+      w.balance_unconfirmed <- 0L;
+      w.tx_history <- []
+    end;
+    Log.info (fun m ->
+      m "wallet reconcile: scanning blocks %d..%d to catch up to chain tip"
+        (max 0 start) tip_height);
+    for h = (max 0 start) to tip_height do
+      match get_block_at h with
+      | None -> ()  (* body not stored (e.g. assume-valid IBD height) *)
+      | Some block -> scan_block w block h
+    done;
+    w.last_synced_height <- tip_height;
+    save_safe w
   end
 
 (* ============================================================================

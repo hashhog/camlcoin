@@ -2083,6 +2083,9 @@ let handle_generate (ctx : rpc_context)
       let payout_script = match ctx.wallet with
         | Some wallet ->
           let kp = Wallet.generate_key wallet in
+          (* Save-on-mutation: persist the keypool/index advance so the derived
+             coinbase address survives a crash before the block connects. *)
+          Wallet.save_safe wallet;
           Wallet.build_output_script kp.address
         | None ->
           (* Fallback: P2SH output to dummy script hash *)
@@ -2305,6 +2308,10 @@ let handle_getnewaddress (ctx : rpc_context)
   | None -> Error "Wallet not loaded"
   | Some wallet ->
     let kp = Wallet.generate_key wallet in
+    (* Save-on-mutation: a freshly derived address (keypool/index advance) must
+       survive an unclean restart, else funds sent to it before the next clean
+       shutdown become unrecoverable without a manual reseed. *)
+    Wallet.save_safe wallet;
     let addr = Address.address_to_string kp.address in
     Ok (`String addr)
 
@@ -2464,6 +2471,10 @@ let handle_sendtoaddress (ctx : rpc_context)
               again before the tx confirms.  scan_transaction debits the spent
               wallet inputs and credits any wallet-owned change as unconfirmed. *)
            Wallet.scan_transaction wallet tx;
+           (* Save-on-mutation: persist the spent-input debit + unconfirmed
+              change credit so a crash before the next block does not let the
+              already-spent coins be re-selected (double-spend) on restart. *)
+           Wallet.save_safe wallet;
            Ok (`String (Types.hash256_to_hex_display entry.txid))
          | Error msg ->
            Error msg)
@@ -2484,6 +2495,7 @@ let handle_sendtoaddress (ctx : rpc_context)
          match Mempool.add_transaction ctx.mempool tx with
          | Ok entry ->
            Wallet.scan_transaction wallet tx;
+           Wallet.save_safe wallet;  (* save-on-mutation: see above *)
            Ok (`String (Types.hash256_to_hex_display entry.txid))
          | Error msg ->
            Error msg)

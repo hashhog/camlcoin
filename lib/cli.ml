@@ -849,24 +849,54 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   (* Initialize wallet *)
   let wallet = if config.wallet_enabled then begin
     let wallet_path = Filename.concat config.data_dir "wallet.json" in
+    (* Fault-tolerant load: a missing / corrupt / partially-written wallet
+       file is recovered or started fresh, never crashing startup. *)
     Some (Wallet.load ~network:config.network ~db_path:wallet_path)
   end else None in
+
+  (* Startup reconcile: bring the wallet ledger up to the validated chain tip.
+     The wallet persists [last_synced_height]; an unclean restart (SIGKILL /
+     OOM / power loss) leaves a gap [last_synced_height+1 .. tip] of blocks
+     that were connected but whose wallet credits/debits were not yet durably
+     written.  We rescan that gap here (idempotent {txid,vout} scan), so the
+     wallet recovers every coin without manual rescanblockchain.  A fresh /
+     recovered-from-nothing wallet (last_synced_height = -1) rescans from
+     genesis, rebuilding the ledger.  Mirrors Core CWallet::AttachChain. *)
+  (match wallet with
+   | Some w ->
+     (try
+        Wallet.reconcile_to_tip w
+          ~tip_height:chain.Sync.blocks_synced
+          ~get_block_at:(fun h ->
+            match Sync.get_header_at_height chain h with
+            | None -> None
+            | Some entry ->
+              Storage.ChainDB.get_block chain.Sync.db entry.Sync.hash)
+      with exn ->
+        Logs.warn (fun m ->
+          m "wallet startup reconcile failed: %s" (Printexc.to_string exn)))
+   | None -> ());
 
   (* Wire the block-connect -> wallet UTXO ledger hook (mirrors Bitcoin Core's
      CWallet::blockConnected / blockDisconnected).  Every block-connect
      choke-point (Mining.submit_block for the mining / generate* / submitblock
-     paths) calls [Sync.run_wallet_scan_hook], which dispatches to this closure
-     so the wallet credits coins paid to its addresses and debits coins it
-     spends.  Without this the wallet UTXO ledger stays empty and
-     getbalance/listunspent/sendtoaddress can never see or spend owned coins.
-     A generic closure is installed (not a Wallet.t reference) so the Sync
-     module stays free of any dependency on Wallet. *)
+     paths AND the live P2P/IBD connect loop) calls [Sync.run_wallet_scan_hook],
+     which dispatches to this closure so the wallet credits coins paid to its
+     addresses and debits coins it spends.  Without this the wallet UTXO ledger
+     stays empty and getbalance/listunspent/sendtoaddress can never see or
+     spend owned coins.  A generic closure is installed (not a Wallet.t
+     reference) so the Sync module stays free of any dependency on Wallet.
+
+     The [*_and_persist] variants advance [last_synced_height] and durably
+     save after each connect/disconnect, so an unclean restart never loses
+     wallet state since the last block (not just since the last clean exit). *)
   (match wallet with
    | Some w ->
      Sync.set_wallet_hooks chain
-       ~on_connect:(fun block height -> Wallet.scan_block w block height)
+       ~on_connect:(fun block height ->
+         Wallet.scan_block_and_persist w block height)
        ~on_disconnect:(fun block height ->
-         Wallet.unscan_block w block height)
+         Wallet.unscan_block_and_persist w block height)
        ()
    | None -> ());
 

@@ -12,6 +12,22 @@
 #include <rocksdb/c.h>
 #include <string.h>
 #include <stdlib.h>
+#include <malloc.h>
+
+/* Force glibc to return free heap at the top of its arenas to the OS.
+   camlcoin's Cstruct-based validation churns millions of tiny transient
+   Bigarrays per block; glibc retains the freed blocks in its per-thread
+   arenas (worsened by the multicore validation Domain) instead of returning
+   them, so forward-sync RSS crept ~6MB/block off-heap even with
+   MALLOC_ARENA_MAX/MALLOC_TRIM_THRESHOLD_ set passively. Called from sync.ml
+   right after each Gc.compact() (which frees the OCaml-side Bigarray proxies)
+   so the now-unused arena memory is actively released. malloc_trim is cheap
+   relative to the surrounding compaction + validation. */
+CAMLprim value caml_rocksdb_malloc_trim(value v_unit) {
+  CAMLparam1(v_unit);
+  malloc_trim(0);
+  CAMLreturn(Val_unit);
+}
 
 /* Per-store cap on open SST file descriptors. The daemon opens two
    RocksDB stores in one process and its Lwt loop runs on the select(2)

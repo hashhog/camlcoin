@@ -4672,6 +4672,13 @@ let run_ibd ?(shutdown_flag : bool ref option)
         then begin
           last_compact_height := ibd.chain.blocks_synced;
           Gc.compact ();
+          (* Gc.compact frees the OCaml-side proxies for the millions of
+             transient validation Bigarrays; malloc_trim(0) then returns that
+             now-unused glibc arena memory to the OS. Without this active trim,
+             glibc retains it (passive MALLOC_TRIM_THRESHOLD_ is not aggressive
+             enough), leaving a ~6MB/block off-heap RSS creep that would still
+             reach the cgroup cap before tip. *)
+          Rocksdb.malloc_trim ();
           let mb_of_words w = float_of_int w *. 8.0 /. 1_048_576.0 in
           let st = Gc.quick_stat () in
           let rss_mb =

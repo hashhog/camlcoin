@@ -7831,6 +7831,249 @@ let handle_scantxoutset (ctx : rpc_context)
   | other ->
     Error (Printf.sprintf "Invalid action '%s'" other)
 
+(* ============================================================================
+   scanblocks "action" ( [scanobjects] start_height stop_height "filtertype" options )
+   ============================================================================
+
+   Faithful port of Bitcoin Core src/rpc/blockchain.cpp::scanblocks
+   (the "start"/"status"/"abort" action handler).  Drives the EXISTING BIP-157
+   basic block filter index (the same index getblockfilter reads) to find every
+   block in [start_height, stop_height] whose BIP-158 GCS filter MATCHES any of
+   the scanobjects' scriptPubKeys, returning
+
+     { from_height : int,
+       to_height   : int,
+       relevant_blocks : [ <64-hex display blockhash> ... ],
+       completed   : bool }
+
+   It is the index-side counterpart to scantxoutset (which walks the live UTXO
+   set): scanblocks walks the compact block filters, so it can locate the block
+   a script was funded/spent in even after the coin is gone.
+
+   CENTRAL CAVEAT: block filters have FALSE POSITIVES (rate ~1/M, M=784931), so
+   relevant_blocks may legitimately contain EXTRA blocks. The single
+   non-negotiable is that the block which actually contains the matched script
+   (output OR spent prevout, the latter via undo data) MUST appear.
+
+   Actions (Core ordering):
+     - "status" — camlcoin scans synchronously (no background scan is ever in
+       progress), so this returns JSON null (Core's reserve-succeeded branch
+       returns NullUniValue).
+     - "abort"  — returns false (no scan running to abort; Core's
+       reserve-succeeded branch returns false).
+     - "start"  — performs the scan; scanobjects required.
+     - any other action -> RPC_INVALID_PARAMETER (-8) "Invalid action '<x>'".
+
+   Error semantics MIRROR Core's codes EXACTLY:
+     - unknown filtertype                -> RPC_INVALID_ADDRESS_OR_KEY (-5)
+                                            "Unknown filtertype"
+     - index not enabled for filtertype  -> RPC_MISC_ERROR (-1)
+                                            "Index is not enabled for filtertype <name>"
+     - start_height < 0 or > tip         -> RPC_MISC_ERROR (-1) "Invalid start_height"
+     - stop_height  < start or > tip     -> RPC_MISC_ERROR (-1) "Invalid stop_height"
+     - unparseable scanobject            -> RPC_INVALID_PARAMETER (-8) (via resolve) *)
+let handle_scanblocks (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  let int_arg = function
+    | `Int n -> Some n
+    | `Float f -> Some (int_of_float f)
+    | `Intlit s -> (try Some (int_of_string s) with _ -> None)
+    | _ -> None
+  in
+  let action = match params with
+    | `String a :: _ -> a
+    | _ -> "start"
+  in
+  match action with
+  | "status" ->
+    (* Synchronous scanner: no scan is ever in progress -> Core returns null. *)
+    Ok `Null
+  | "abort" ->
+    (* No scan running to abort -> Core's reserve-succeeded branch returns false. *)
+    Ok (`Bool false)
+  | "start" ->
+    (* (1) filtertype validation (Core: BlockFilterTypeByName). Param index 4.
+       Default "basic"; only "basic" is implemented. Unknown -> -5. This runs
+       BEFORE the index/height checks, matching Core's ordering. *)
+    let filtertype_name =
+      match params with
+      | _ :: _ :: _ :: _ :: `String ft :: _ -> ft
+      | _ :: _ :: _ :: _ :: `Null :: _ -> "basic"
+      | _ -> "basic"
+    in
+    if filtertype_name <> "basic" then
+      Error (rpc_invalid_address, "Unknown filtertype")
+    else begin
+      (* (2) options.filter_false_positives (Core). Param index 5. Default
+         false; reading it must never error when absent / null / non-object.
+         When set, each filter MatchAny hit is re-verified by re-scanning the
+         block's scripts (drops GCS false positives — a strict subset, can
+         only REMOVE false positives, never a genuine match). *)
+      let filter_false_positives =
+        match params with
+        | _ :: _ :: _ :: _ :: _ :: `Assoc fields :: _ ->
+          (match List.assoc_opt "filter_false_positives" fields with
+           | Some (`Bool b) -> b
+           | _ -> false)
+        | _ -> false
+      in
+      (* (3) scanobjects required for "start" (Core: params[1].get_array). *)
+      let scanobjects =
+        match params with
+        | _ :: `List objs :: _ -> objs
+        | _ -> []
+      in
+      if scanobjects = [] then
+        Error (rpc_invalid_parameter,
+               "scanobjects argument is required for the start action")
+      else begin
+        (* (4) Index-enabled gate (Core: GetBlockFilterIndex==null ->
+           RPC_MISC_ERROR "Index is not enabled for filtertype <name>"). *)
+        match ctx.filter_index with
+        | None ->
+          Error (rpc_misc_error,
+                 Printf.sprintf "Index is not enabled for filtertype %s"
+                   filtertype_name)
+        | Some idx ->
+          (* (5) Resolve scanobjects to scriptPubKey needles (reuse the same
+             helper scantxoutset uses; addr()/raw()/bare-hex parity is already
+             proven by the scantxoutset differential). The block filter
+             ElementSet stores scripts as raw bytes (Cstruct.to_string), so the
+             needle must be matched in that same byte form. *)
+          (match scantxoutset_resolve scanobjects with
+           | Error e -> Error (rpc_invalid_parameter, e)
+           | Ok needles ->
+             let needle_strs =
+               List.map (fun (spk, _desc) -> Cstruct.to_string spk) needles
+             in
+             (* (6) Height range (Core: active_chain.Genesis() ..
+                active_chain.Tip(), with bad params -> RPC_MISC_ERROR). The
+                ceiling is the validated block tip height. *)
+             let tip_height =
+               match ctx.chain.tip with
+               | Some t -> t.height
+               | None -> 0
+             in
+             let start_height =
+               match params with
+               | _ :: _ :: a :: _ ->
+                 (match int_arg a with Some n -> n | None -> 0)
+               | _ -> 0
+             in
+             let stop_opt =
+               match params with
+               | _ :: _ :: _ :: b :: _ -> int_arg b
+               | _ -> None
+             in
+             if start_height < 0 || start_height > tip_height then
+               Error (rpc_misc_error, "Invalid start_height")
+             else
+               let stop_height =
+                 match stop_opt with Some s -> s | None -> tip_height
+               in
+               if stop_height > tip_height || stop_height < start_height then
+                 Error (rpc_misc_error, "Invalid stop_height")
+               else begin
+                 (* (7) Scan loop (Core). Walk each height in
+                    [start_height, stop_height], read the block's basic filter
+                    from the index, and test MatchAny against the needle set.
+                    Core chunks in 10000-block windows via LookupFilterRange;
+                    camlcoin's filter index is a per-blockhash hashtable, so we
+                    iterate by height and read each filter directly — same
+                    result set, no chunking primitive needed. *)
+                 let relevant = ref [] in
+                 let err = ref None in
+                 let h = ref start_height in
+                 while !err = None && !h <= stop_height do
+                   (match Storage.ChainDB.get_hash_at_height ctx.chain.db !h with
+                    | None ->
+                      (* A height in range has no active-chain hash: the chain
+                         is shorter than tip_height claims. Should not happen
+                         for [0,tip]; treat as a lagging index error. *)
+                      err := Some (rpc_misc_error,
+                        "Filter not found. Block filters are still in the \
+                         process of being indexed.")
+                    | Some bh ->
+                      (match Block_index.read_filter idx bh with
+                       | None ->
+                         (* Block on the active chain but its filter is not
+                            computed: the index is lagging. Core's
+                            LookupFilterRange returning false silently skips,
+                            but raising a clear error avoids a misleadingly
+                            incomplete relevant_blocks list (matches the
+                            getblockfilter tri-state). *)
+                         err := Some (rpc_misc_error,
+                           "Filter not found. Block filters are still in the \
+                            process of being indexed.")
+                       | Some bf ->
+                         if Block_index.match_any bf.Block_index.filter
+                              needle_strs
+                         then begin
+                           (* Optional re-scan to drop GCS false positives. *)
+                           let keep =
+                             if not filter_false_positives then true
+                             else
+                               match Storage.ChainDB.get_block
+                                       ctx.chain.db bh with
+                               | None -> true (* cannot re-check; keep the hit *)
+                               | Some block ->
+                                 (* Re-derive the filter from the actual block
+                                    (outputs handled by build_basic_filter_from_scripts;
+                                    spent prevouts pulled from undo data when
+                                    present) and re-test. A strict subset of the
+                                    stored-filter match: can only drop GCS false
+                                    positives, never a genuine match. *)
+                                 let spent_scripts =
+                                   match Storage.ChainDB.get_undo_data
+                                           ctx.chain.db bh with
+                                   | None -> []
+                                   | Some undo_raw ->
+                                     (try
+                                        let r = Serialize.reader_of_cstruct
+                                                  (Cstruct.of_string undo_raw) in
+                                        let undo = Utxo.deserialize_undo_data r in
+                                        List.concat_map (fun (tu : Utxo.tx_undo) ->
+                                          List.map
+                                            (fun (_op, (e : Utxo.utxo_entry)) ->
+                                               e.Utxo.script_pubkey)
+                                            tu.Utxo.spent_outputs)
+                                          undo.Utxo.tx_undos
+                                      with _ -> [])
+                                 in
+                                 let rebuilt =
+                                   Block_index.build_basic_filter_from_scripts
+                                     block spent_scripts
+                                 in
+                                 Block_index.match_any
+                                   rebuilt.Block_index.filter needle_strs
+                           in
+                           if keep then
+                             (* Display-order (big-endian) block hash, matching
+                                Core's GetBlockHash().GetHex(). *)
+                             relevant :=
+                               Types.hash256_to_hex_display bh :: !relevant
+                         end));
+                   incr h
+                 done;
+                 (match !err with
+                  | Some e -> Error e
+                  | None ->
+                    (* (8) Return (Core field order: from_height, to_height,
+                       relevant_blocks, completed). The synchronous scan is
+                       never aborted, so completed is always true. *)
+                    Ok (`Assoc [
+                      ("from_height", `Int start_height);
+                      ("to_height", `Int stop_height);
+                      ("relevant_blocks",
+                         `List (List.rev_map (fun s -> `String s) !relevant));
+                      ("completed", `Bool true);
+                    ]))
+               end)
+      end
+    end
+  | other ->
+    Error (rpc_invalid_parameter, Printf.sprintf "Invalid action '%s'" other)
+
 let handle_dumptxoutset (_ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   (* Parse [path, type?, options?]. The [type] field accepts Core's
@@ -10166,6 +10409,12 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_scantxoutset ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_invalid_params, msg))
+  | "scanblocks" ->
+    (* handle_scanblocks already returns Core-exact (code, message) pairs:
+       -5 Unknown filtertype, -1 index-not-enabled / Invalid start_height /
+       Invalid stop_height, -8 unparseable scanobject / Invalid action.
+       Pass them through verbatim (mirrors getblockfilter). *)
+    handle_scanblocks ctx params
   | "gettxoutsetinfo" ->
     (* Core throws RPC_INVALID_PARAMETER (-8) for every error this RPC can
        raise: an unrecognized hash_type (ParseHashType,

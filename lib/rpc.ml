@@ -7777,6 +7777,13 @@ let handle_scantxoutset (ctx : rpc_context)
         let txouts = ref 0 in
         let total_amount = ref 0L in
         let unspents = ref [] in
+        (* tip_height is needed inside the iteration to compute each coin's
+           confirmations (Core: tipHeight - coinHeight + 1), so resolve it
+           BEFORE the scan rather than after. *)
+        let tip_height, tip_hash = match ctx.chain.tip with
+          | Some t -> (t.height, t.hash)
+          | None -> (0, Types.zero_hash)
+        in
         Storage.ChainDB.iter_utxos ctx.chain.db (fun txid vout data ->
           incr txouts;
           let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
@@ -7787,6 +7794,18 @@ let handle_scantxoutset (ctx : rpc_context)
           | None -> ()
           | Some (_, desc) ->
             total_amount := Int64.add !total_amount utxo.Utxo.value;
+            (* blockhash = hash of the block at the coin's height
+               (big-endian display hex); confirmations = tip_height -
+               coin_height + 1.  Mirrors Bitcoin Core
+               (rpc/blockchain.cpp:2455-2466 scantxoutset unspents). *)
+            let coin_height = utxo.Utxo.height in
+            let blockhash_hex =
+              match Storage.ChainDB.get_hash_at_height
+                      ctx.chain.db coin_height with
+              | Some bh -> Types.hash256_to_hex_display bh
+              | None -> Types.hash256_to_hex_display Types.zero_hash
+            in
+            let confirmations = tip_height - coin_height + 1 in
             let entry = `Assoc [
               ("txid", `String (Types.hash256_to_hex_display txid));
               ("vout", `Int vout);
@@ -7795,13 +7814,11 @@ let handle_scantxoutset (ctx : rpc_context)
               ("desc", `String desc);
               ("amount", btc_amount_json utxo.Utxo.value);
               ("coinbase", `Bool utxo.Utxo.is_coinbase);
-              ("height", `Int utxo.Utxo.height);
+              ("height", `Int coin_height);
+              ("blockhash", `String blockhash_hex);
+              ("confirmations", `Int confirmations);
             ] in
             unspents := entry :: !unspents);
-        let tip_height, tip_hash = match ctx.chain.tip with
-          | Some t -> (t.height, t.hash)
-          | None -> (0, Types.zero_hash)
-        in
         Ok (`Assoc [
           ("success", `Bool true);
           ("txouts", `Int !txouts);

@@ -153,6 +153,13 @@ let max_cluster_size_vbytes = 101_000  (* DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 
    sigops exceed this limit to mitigate expensive-script DoS. *)
 let max_p2sh_sigops = 15
 
+(* ORPHAN_EXPIRE_TIME — orphan transactions are dropped this many seconds after
+   they are added to the pool.
+   Reference: Bitcoin Core src/node/txorphanage.cpp ORPHAN_TX_EXPIRE_TIME = 20 min.
+   Used by expire_orphans (the sweeper). Note: Core's getorphantxs RPC does NOT
+   expose an expiration field, so this is sweeper-only. *)
+let orphan_expire_seconds = 1200.0  (* 20 minutes *)
+
 (* ============================================================================
    Union-Find Data Structure for Clustering
 
@@ -3704,7 +3711,7 @@ let expire_old_transactions (mp : mempool) : int =
 (* Gap 9: Expire orphan transactions older than 20 minutes *)
 let expire_orphans (mp : mempool) : int =
   let now = Unix.gettimeofday () in
-  let max_age = 1200.0 in (* 20 minutes *)
+  let max_age = orphan_expire_seconds in (* 20 minutes — shared with getorphantxs *)
   let to_remove = Hashtbl.fold (fun k entry acc ->
     if now -. entry.orphan_time > max_age then (k, entry) :: acc else acc
   ) mp.orphans [] in

@@ -438,6 +438,93 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       Logs.warn (fun m ->
         m "chainstate rewind persisted to height=%d (%s)" new_height reason)
   in
+  (* [rdb_consistent_at height]: spot-check that the RDB UTXO set is internally
+     consistent at [height] by reading that block's body and verifying every
+     spendable output it CREATED (and did not also spend within the same block)
+     is present in the RDB UTXO store.  Used by the large-skew roll-up recovery
+     below to gate trusting [rdb_tip] as the authoritative validated tip.
+       `Consistent      — outputs present; safe to trust this height.
+       `Inconsistent r  — a created output is missing from RDB (real skew).
+       `CannotVerify r  — header/body not on disk (cannot judge; do not trust). *)
+  let rdb_consistent_at (height : int)
+      : [ `Consistent | `Inconsistent of string | `CannotVerify of string ] =
+    match Storage.ChainDB.get_hash_at_height db height with
+    | None -> `CannotVerify (Printf.sprintf "no height->hash map at %d" height)
+    | Some bhash ->
+      match Storage.ChainDB.get_block db bhash with
+      | None -> `CannotVerify (Printf.sprintf "no block body at %d" height)
+      | Some block ->
+        let spent_in_block : (string, unit) Hashtbl.t = Hashtbl.create 32 in
+        List.iteri (fun tx_idx (tx : Types.transaction) ->
+          if tx_idx <> 0 then
+            List.iter (fun (inp : Types.tx_in) ->
+              let k =
+                Cstruct.to_string inp.Types.previous_output.Types.txid
+                ^ Int32.to_string inp.Types.previous_output.Types.vout in
+              Hashtbl.replace spent_in_block k ()
+            ) tx.Types.inputs
+        ) block.transactions;
+        let missing = ref None in
+        (try
+           List.iter (fun (tx : Types.transaction) ->
+             let txid = Crypto.compute_txid tx in
+             List.iteri (fun vout (out : Types.tx_out) ->
+               if !missing = None
+                  && not (Utxo.is_unspendable_script out.Types.script_pubkey)
+               then begin
+                 let spent_key =
+                   Cstruct.to_string txid ^ Int32.to_string (Int32.of_int vout) in
+                 if Hashtbl.mem spent_in_block spent_key then ()
+                 else begin
+                   let key = Storage.ChainDB.rocksdb_utxo_key txid vout in
+                   match Rocksdb_store.get rocksdb key with
+                   | Some _ -> ()
+                   | None -> missing := Some (txid, vout); raise Exit
+                 end
+               end
+             ) tx.Types.outputs
+           ) block.transactions
+         with Exit -> ());
+        (match !missing with
+         | None -> `Consistent
+         | Some (mtxid, mvout) ->
+           `Inconsistent (Printf.sprintf "block output %s:%d missing from RDB"
+             (Types.hash256_to_hex_display mtxid) mvout))
+  in
+  (* [reconcile_or_resync rdb_height]: the original case-3 recovery — roll the
+     RDB UTXO set DOWN to chain_tip via stored undo data (Core ReplayBlocks /
+     RollbackBlock), or, if undo data is unavailable for any window block, fall
+     back to a full resync.  Correct + cheap for the live apply_block_atomic
+     crash window (≤1 block); pathological for a large skew (see roll-up below). *)
+  let reconcile_or_resync (rdb_height : int) : unit =
+    Logs.warn (fun m ->
+      m "RocksDB UTXO tip (%d) is ahead of chainstate chain_tip (%d) — \
+         crash inside apply_block_atomic; reconciling UTXO set down to \
+         chain_tip (Core ReplayBlocks/RollbackBlock model)"
+        rdb_height chain.blocks_synced);
+    (match Sync.reconcile_rdb_to_chain_tip chain rocksdb
+             ~rdb_height ~target_height:chain.blocks_synced with
+     | Ok () ->
+       Logs.info (fun m ->
+         m "UTXO reconcile succeeded; UTXO set now matches chain_tip=%d, \
+            IBD will re-apply forward from a consistent base"
+           chain.blocks_synced)
+     | Error msg ->
+       Logs.warn (fun m ->
+         m "UTXO reconcile FAILED (%s) — undo data unavailable for the \
+            crash window; falling back to full resync to avoid the \
+            missing-inputs wedge" msg);
+       persist_rewind_to_height
+         ~reason:(Printf.sprintf
+           "reconcile-unavailable (rdb_tip=%d > chain_tip=%d): %s"
+           rdb_height chain.blocks_synced msg)
+         0)
+  in
+  (* A LIVE apply_block_atomic crash window is at most ONE block (RDB commits,
+     then CF chain_tip commits — storage.ml:665-697).  Only treat a gap LARGER
+     than this margin as the corruption/re-bootstrap class that the roll-up
+     recovery targets; anything at or below it stays on the cheap reconcile. *)
+  let roll_up_min_gap = 100 in
   if chain.blocks_synced > 0 then begin
     match Rocksdb_store.get_tip_height rocksdb with
     | None ->
@@ -453,51 +540,56 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         ~reason:(Printf.sprintf "rdb_tip=%d < chain_tip=%d" rdb_height chain.blocks_synced)
         rdb_height
     | Some rdb_height when rdb_height > chain.blocks_synced ->
-      (* Crash window: apply_block_atomic committed RDB (UTXO set) but not
-         CF (chain_tip), leaving the persisted UTXO set AHEAD of chain_tip.
+      let gap = rdb_height - chain.blocks_synced in
+      (* Two distinct causes put rdb_tip ahead of chain_tip:
 
-         The OLD behaviour here merely LOGGED and trusted a "forward
-         re-apply is idempotent" claim (storage.ml:638-641).  That claim is
-         FALSE for cross-block spends: re-applying chain_tip+1 reads the
-         UTXO set (validation.ml:1136-1182) and hits TxMissingInputs because
-         a prevout was already deleted by an already-committed later block in
-         the window -> block rejected -> re-downloaded forever -> permanent
-         wedge at chain_tip (the live mainnet wedge at 952223/952224).
+         (1) SMALL gap (<= roll_up_min_gap): the live apply_block_atomic crash
+             window — RDB committed the block's UTXO delta + tip_height but the
+             process died before the CF chain_tip commit (storage.ml:665-697).
+             At most ~1 block.  Reconcile the RDB UTXO set DOWN to chain_tip via
+             stored undo (Core ReplayBlocks/RollbackBlock), then re-apply
+             forward; cheap because the window is tiny.  [reconcile_or_resync].
 
-         Bitcoin Core does NOT trust forward re-apply here.  Its
-         [ReplayBlocks] / [RollbackBlock] (validation.cpp:4773-4858) rolls
-         the UTXO set BACK along the over-applied branch using stored undo
-         data, down to the consistent point, then rolls forward.  We do the
-         same: reconcile the RDB UTXO set DOWN to chain_tip so the UTXO state
-         matches the authoritative validated tip, then let IBD re-apply
-         forward from a consistent base.
-
-         If undo data for any window block is missing (the post-IBD connect
-         paths do not persist undo), reconciliation is impossible — fall back
-         to a full resync (persist_rewind_to_height 0) rather than spinning in
-         the infinite missing-inputs loop. *)
-      Logs.warn (fun m ->
-        m "RocksDB UTXO tip (%d) is ahead of chainstate chain_tip (%d) — \
-           crash inside apply_block_atomic; reconciling UTXO set down to \
-           chain_tip (Core ReplayBlocks/RollbackBlock model)"
-          rdb_height chain.blocks_synced);
-      (match Sync.reconcile_rdb_to_chain_tip chain rocksdb
-               ~rdb_height ~target_height:chain.blocks_synced with
-       | Ok () ->
-         Logs.info (fun m ->
-           m "UTXO reconcile succeeded; UTXO set now matches chain_tip=%d, \
-              IBD will re-apply forward from a consistent base"
-             chain.blocks_synced)
-       | Error msg ->
-         Logs.warn (fun m ->
-           m "UTXO reconcile FAILED (%s) — undo data unavailable for the \
-              crash window; falling back to full resync to avoid the \
-              missing-inputs wedge" msg);
-         persist_rewind_to_height
-           ~reason:(Printf.sprintf
-             "reconcile-unavailable (rdb_tip=%d > chain_tip=%d): %s"
-             rdb_height chain.blocks_synced msg)
-           0)
+         (2) LARGE gap (> roll_up_min_gap): NOT a live crash window (that is
+             bounded to ~1 block).  This only arises when a chainstate CF
+             corruption + assumeUTXO re-bootstrap reset chain_tip back to the
+             snapshot base while a STALE rdb_tip survived (the 2026-06-07
+             mainnet incident: chain_tip=944183, rdb_tip=952614).  For a
+             snapshot/IBD-bootstrapped node the UTXO set lives ONLY in RDB
+             (assume_utxo.ml:747; get_utxo reads CF then RDB) and rdb_tip is set
+             ATOMICALLY with each flush batch, so the RDB UTXO set is the
+             COMPLETE, authoritative validated set at rdb_tip.  Reconciling DOWN
+             across thousands of blocks builds a giant in-memory inverse
+             WriteBatch and then re-IBDs forward from the base — on mainnet that
+             drove RSS to ~111G at ~0 blk/s.  Instead, roll chain_tip UP to
+             rdb_tip (O(1), zero extra RAM), gated on: the header at rdb_tip is
+             on disk AND a content spot-check of that block's outputs in RDB
+             passes.  If either guard fails (e.g. the header chain past the base
+             was also lost in the corruption), fall back to reconcile_or_resync
+             so we never trust an unverifiable RDB tip. *)
+      if gap > roll_up_min_gap then begin
+        match rdb_consistent_at rdb_height with
+        | `Consistent ->
+          Logs.warn (fun m ->
+            m "RocksDB UTXO tip (%d) is FAR ahead of chainstate chain_tip \
+               (%d, gap=%d) — not a live crash window (chainstate corruption + \
+               snapshot re-bootstrap).  RDB UTXO set verified consistent at %d; \
+               rolling chain_tip UP to rdb_tip (O(1)) instead of reconciling \
+               down + re-IBD."
+              rdb_height chain.blocks_synced gap rdb_height);
+          persist_rewind_to_height
+            ~reason:(Printf.sprintf
+              "roll-up to rdb_tip=%d (gap=%d above chain_tip=%d; RDB authoritative)"
+              rdb_height gap chain.blocks_synced)
+            rdb_height
+        | `Inconsistent reason | `CannotVerify reason ->
+          Logs.warn (fun m ->
+            m "RocksDB UTXO tip (%d) far ahead of chain_tip (%d, gap=%d) but the \
+               roll-up guard failed (%s) — falling back to reconcile-down / resync"
+              rdb_height chain.blocks_synced gap reason);
+          reconcile_or_resync rdb_height
+      end else
+        reconcile_or_resync rdb_height
     | Some _ ->
       (* Heights match.  Per-block content validation: read the tip
          block, sample each non-coinbase spendable output, and verify

@@ -7,6 +7,12 @@ type batch  (* opaque: rocksdb_writebatch_t* wrapped in a custom block *)
 external open_db : string -> int -> int -> int -> t
   = "caml_rocksdb_open"
 
+(* Actively return glibc free-arena memory to the OS (malloc_trim(0)).
+   Called after Gc.compact() during forward-sync so the freed transient-Bigarray
+   memory is released rather than retained in glibc's arenas. *)
+external malloc_trim : unit -> unit
+  = "caml_rocksdb_malloc_trim"
+
 external close : t -> unit
   = "caml_rocksdb_close"
 

@@ -4543,6 +4543,9 @@ let run_ibd ?(shutdown_flag : bool ref option)
   let last_progress_log = ref (Unix.gettimeofday ()) in
   let ibd_start_time = Unix.gettimeofday () in
   let total_processed = ref 0 in
+  (* Height of the last heap compaction (see the compaction block in the
+     progress logger below). *)
+  let last_compact_height = ref 0 in
   (* Spawn the persistent validation worker Domain (wave 11 option B).
      The worker runs block validation off the Lwt main thread; all ibd.*
      mutation remains on the Lwt thread. *)
@@ -4641,7 +4644,49 @@ let run_ibd ?(shutdown_flag : bool ref option)
         Logs.info (fun m ->
           m "Processed %d blocks, height now %d, in-flight: %d (avg %.0f blk/s)"
             !round_processed ibd.chain.blocks_synced
-            ibd.total_blocks_in_flight rate)
+            ibd.total_blocks_in_flight rate);
+        (* Periodic heap compaction during forward-sync (2026-06-07 fix, part 1).
+           Forward-sync RSS grew unbounded to 36G+ and hit the cgroup cap at
+           ~block 945300, so camlcoin could never reach tip on a shared box.
+           Profiling (Gc.compact + Gc.stat live_words) split it into TWO causes;
+           this is the fix for the OCaml-heap half:
+             Block validation allocates furiously (~500k minor collections over
+             ~1100 blocks); OCaml's incremental major GC does not keep pace and
+             the best-fit allocator does not return freed major-heap chunks to
+             the OS. The TRUE reachable set is bounded (live_words plateaus
+             ~6.7G), so a full Gc.compact() reclaims the unreachable data AND
+             returns the freed chunks. Compact on a bounded cadence (every
+             [compact_interval] blocks): stop-the-world (~1-2s) but cheap against
+             the validation rate, a few times per thousand blocks. Also fixes
+             camlcoin's anomalous ~37G at-tip steady-state RSS.
+           Part 2 (the OFF-HEAP half) lives in the launcher, not here: the
+           millions of tiny transient Cstruct/Bigarrays this validation churns
+           per block were retained by glibc's per-thread malloc arenas (worsened
+           by the multicore validation Domain) — a residual ~16MB/block off-heap
+           creep that Gc.compact cannot touch. start_mainnet.sh sets
+           MALLOC_ARENA_MAX=2 + MALLOC_TRIM_THRESHOLD_=131072 so glibc returns
+           that memory. With BOTH parts, forward-sync RSS holds flat ~17G (proven
+           over height 946864->947044) vs the old unbounded 36G+. *)
+        let compact_interval = 16 in
+        if ibd.chain.blocks_synced - !last_compact_height >= compact_interval
+        then begin
+          last_compact_height := ibd.chain.blocks_synced;
+          Gc.compact ();
+          let mb_of_words w = float_of_int w *. 8.0 /. 1_048_576.0 in
+          let st = Gc.quick_stat () in
+          let rss_mb =
+            try
+              let ic = open_in "/proc/self/statm" in
+              let line = input_line ic in
+              close_in ic;
+              (match String.split_on_char ' ' line with
+               | _ :: res :: _ -> float_of_string res *. 4096.0 /. 1_048_576.0
+               | _ -> 0.0)
+            with _ -> 0.0 in
+          Logs.info (fun m ->
+            m "compacted heap at height %d: rss=%.0fMB ocaml_heap=%.0fMB"
+              ibd.chain.blocks_synced rss_mb (mb_of_words st.Gc.heap_words))
+        end
       end else begin
         let now = Unix.gettimeofday () in
         if now -. !last_progress_log > 30.0 then begin

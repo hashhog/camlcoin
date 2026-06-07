@@ -483,6 +483,161 @@ let test_getrawtransaction_invalid_txid () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* ============================================================================
+   getorphantxs Tests
+   ============================================================================ *)
+
+(* Helper: pull a string field out of a JSON object (fails the test if absent). *)
+let json_str_field obj key =
+  match obj with
+  | `Assoc fields ->
+    (match List.assoc_opt key fields with
+     | Some (`String s) -> s
+     | _ -> Alcotest.failf "expected string field %s" key)
+  | _ -> Alcotest.fail "expected JSON object"
+
+let json_int_field obj key =
+  match obj with
+  | `Assoc fields ->
+    (match List.assoc_opt key fields with
+     | Some (`Int n) -> n
+     | _ -> Alcotest.failf "expected int field %s" key)
+  | _ -> Alcotest.fail "expected JSON object"
+
+(* Insert a transaction into the orphan pool and return (tx, txid, wtxid). *)
+let seed_orphan ctx =
+  (* Reference an unknown parent so this is a genuine orphan shape. *)
+  let parent = Types.hash256_of_hex
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" in
+  let tx = make_regular_tx
+    [make_test_input parent 0l]
+    [make_test_output 1_000_000L]
+  in
+  Mempool.add_orphan ctx.Rpc.mempool tx;
+  let txid = Crypto.compute_txid tx in
+  let wtxid = Crypto.compute_wtxid tx in
+  (tx, txid, wtxid)
+
+(* verbosity 0 → array of TXID strings (Core: orphan.tx->GetHash()), one per
+   orphan. NOT wtxid. *)
+let test_getorphantxs_verbosity0_txid_array () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  let (_tx, txid, wtxid) = seed_orphan ctx in
+  let expected_txid = Types.hash256_to_hex_display txid in
+  let wtxid_hex = Types.hash256_to_hex_display wtxid in
+  (match Rpc.handle_getorphantxs ctx [] with
+   | Ok (`List items) ->
+     Alcotest.(check int) "one orphan" 1 (List.length items);
+     (match items with
+      | [`String s] ->
+        Alcotest.(check int) "txid is 64 hex" 64 (String.length s);
+        Alcotest.(check string) "v0 is txid (Core GetHash), not wtxid"
+          expected_txid s;
+        (* Guard the exact regression: must NOT be the wtxid. *)
+        if expected_txid <> wtxid_hex then
+          Alcotest.(check bool) "v0 string is not the wtxid" false (s = wtxid_hex)
+      | _ -> Alcotest.fail "expected single txid string")
+   | Ok _ -> Alcotest.fail "expected JSON array"
+   | Error (c, m) -> Alcotest.failf "unexpected error %d %s" c m);
+  (* default arg (missing) behaves as verbosity 0 *)
+  (match Rpc.handle_getorphantxs ctx [`Null] with
+   | Ok (`List [ `String _ ]) -> ()
+   | _ -> Alcotest.fail "null verbosity should default to 0 array-of-strings");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* verbosity 1 → array of objects with EXACTLY the Core field set, in order:
+   txid, wtxid, bytes, vsize, weight, from. NO expiration. *)
+let test_getorphantxs_verbosity1_fields () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  let (tx, txid, wtxid) = seed_orphan ctx in
+  (match Rpc.handle_getorphantxs ctx [`Int 1] with
+   | Ok (`List [ obj ]) ->
+     Alcotest.(check string) "txid field"
+       (Types.hash256_to_hex_display txid) (json_str_field obj "txid");
+     Alcotest.(check string) "wtxid field"
+       (Types.hash256_to_hex_display wtxid) (json_str_field obj "wtxid");
+     Alcotest.(check int) "bytes = total serialized size"
+       (Validation.compute_tx_size tx) (json_int_field obj "bytes");
+     Alcotest.(check int) "vsize"
+       (Validation.compute_tx_vsize tx) (json_int_field obj "vsize");
+     Alcotest.(check int) "weight"
+       (Validation.compute_tx_weight tx) (json_int_field obj "weight");
+     (match obj with
+      | `Assoc fields ->
+        (* from is present and (this node) empty *)
+        (match List.assoc_opt "from" fields with
+         | Some (`List []) -> ()
+         | Some (`List _) -> ()  (* tolerate future per-peer tracking *)
+         | _ -> Alcotest.fail "expected `from` array");
+        (* Core has NO expiration field — assert it is absent. *)
+        Alcotest.(check bool) "no expiration field (Core parity)" false
+          (List.mem_assoc "expiration" fields);
+        (* verbosity 1 must NOT carry the hex blob *)
+        Alcotest.(check bool) "no hex at verbosity 1" false
+          (List.mem_assoc "hex" fields);
+        (* The exact Core field set, in Core order. *)
+        let keys = List.map fst fields in
+        Alcotest.(check (list string)) "exact Core v1 field set + order"
+          ["txid"; "wtxid"; "bytes"; "vsize"; "weight"; "from"] keys
+      | _ -> Alcotest.fail "expected object")
+   | _ -> Alcotest.fail "expected single-object array at verbosity 1");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* verbosity 2 → verbosity-1 fields PLUS hex. *)
+let test_getorphantxs_verbosity2_adds_hex () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  let (tx, _txid, _wtxid) = seed_orphan ctx in
+  (match Rpc.handle_getorphantxs ctx [`Int 2] with
+   | Ok (`List [ `Assoc fields ]) ->
+     Alcotest.(check bool) "has hex at verbosity 2" true (List.mem_assoc "hex" fields);
+     Alcotest.(check bool) "still has wtxid" true (List.mem_assoc "wtxid" fields);
+     Alcotest.(check bool) "no expiration at verbosity 2" false
+       (List.mem_assoc "expiration" fields);
+     (* Exact Core v2 field set: v1 fields + hex, in Core order. *)
+     let keys = List.map fst fields in
+     Alcotest.(check (list string)) "exact Core v2 field set + order"
+       ["txid"; "wtxid"; "bytes"; "vsize"; "weight"; "from"; "hex"] keys;
+     (match List.assoc_opt "hex" fields with
+      | Some (`String h) ->
+        Alcotest.(check string) "hex matches serialized tx" (tx_to_hex tx) h
+      | _ -> Alcotest.fail "expected hex string")
+   | _ -> Alcotest.fail "expected single-object array at verbosity 2");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* empty pool → empty array. *)
+let test_getorphantxs_empty_pool () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  (match Rpc.handle_getorphantxs ctx [`Int 1] with
+   | Ok (`List []) -> ()
+   | _ -> Alcotest.fail "expected empty array for empty orphan pool");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* out-of-range verbosity → RPC_INVALID_PARAMETER (-8) with Core message. *)
+let test_getorphantxs_invalid_verbosity () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  (match Rpc.handle_getorphantxs ctx [`Int 3] with
+   | Error (code, msg) ->
+     Alcotest.(check int) "code is -8" (-8) code;
+     Alcotest.(check string) "Core message" "Invalid verbosity value 3" msg
+   | Ok _ -> Alcotest.fail "expected error for verbosity 3");
+  (match Rpc.handle_getorphantxs ctx [`Int (-1)] with
+   | Error (code, _) -> Alcotest.(check int) "code is -8 for negative" (-8) code
+   | Ok _ -> Alcotest.fail "expected error for verbosity -1");
+  (* Core ParseVerbosity(allow_bool=false): a boolean argument must be REJECTED
+     with an error, NOT mapped to 0/1. *)
+  (match Rpc.handle_getorphantxs ctx [`Bool true] with
+   | Error _ -> ()
+   | Ok _ -> Alcotest.fail "bool verbosity must be rejected, not mapped to 1");
+  (match Rpc.handle_getorphantxs ctx [`Bool false] with
+   | Error _ -> ()
+   | Ok _ -> Alcotest.fail "bool verbosity must be rejected, not mapped to 0");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 (* Test: getrawtransaction for confirmed transaction includes block info *)
 let test_getrawtransaction_confirmed_has_block_info () =
   cleanup_test_db ();
@@ -2547,6 +2702,13 @@ let () =
       test_case "confirmed has block info" `Quick test_getrawtransaction_confirmed_has_block_info;
       test_case "with blockhash param" `Quick test_getrawtransaction_with_blockhash;
       test_case "wrong blockhash error" `Quick test_getrawtransaction_wrong_blockhash;
+    ];
+    "getorphantxs", [
+      test_case "verbosity 0 → txid array" `Quick test_getorphantxs_verbosity0_txid_array;
+      test_case "verbosity 1 → detail fields" `Quick test_getorphantxs_verbosity1_fields;
+      test_case "verbosity 2 → adds hex" `Quick test_getorphantxs_verbosity2_adds_hex;
+      test_case "empty pool → empty array" `Quick test_getorphantxs_empty_pool;
+      test_case "invalid verbosity → -8" `Quick test_getorphantxs_invalid_verbosity;
     ];
     "batch", [
       test_case "multiple valid calls" `Quick test_batch_multiple_valid;

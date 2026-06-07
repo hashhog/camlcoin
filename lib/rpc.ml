@@ -1649,6 +1649,106 @@ let handle_getmempoolentry (ctx : rpc_context)
     Error "Invalid parameters: expected [txid]"
 
 (* ============================================================================
+   getorphantxs — show transactions currently in the tx orphanage.
+
+   Core RPC (added in v28, registered "hidden"): rpc/mempool.cpp:1233
+     getorphantxs ( verbosity )
+       - verbosity, integer, default 0; Core supports 0/1/2. ParseVerbosity is
+         called with allow_bool=false, so a boolean argument is REJECTED with a
+         type error (never coerced to 0/1).
+       - 0 → JSON array of txid strings (orphan.tx->GetHash(); may contain
+         duplicates). NOT wtxid.
+       - 1 → array of objects: { txid, wtxid, bytes, vsize, weight, from }.
+       - 2 → verbosity-1 objects PLUS "hex" (serialized, hex-encoded tx).
+       - invalid verbosity (outside 0..2) → RPC_INVALID_PARAMETER (-8),
+         message "Invalid verbosity value <n>".
+
+   Field mapping vs Core's OrphanToJSON (rpc/mempool.cpp:1217):
+     txid   = orphan.tx->GetHash()         → display-reversed txid
+     wtxid  = orphan.tx->GetWitnessHash()  → display-reversed wtxid
+     bytes  = orphan.tx->ComputeTotalSize()→ Validation.compute_tx_size (with witness)
+     vsize  = GetVirtualTransactionSize     → Validation.compute_tx_vsize
+     weight = GetTransactionWeight          → Validation.compute_tx_weight
+     from   = orphan.announcers (peer ids)  → see note below
+
+   Returns (Yojson.Safe.t, int * string) result so the dispatcher can pass the
+   Core-exact (-8) verbosity error through verbatim, the same convention as
+   handle_getblockfilter.
+
+   Divergences from Core (documented so consensus-diff vs Core is explainable):
+   - `from`: camlcoin's orphan_entry does NOT carry per-peer announcer tracking
+     (the type has only orphan_tx / orphan_txid / orphan_wtxid / orphan_time).
+     We therefore emit an empty array for `from` (best-effort, per spec). If
+     per-peer announcer tracking is added to orphan_entry later, populate it
+     here. *)
+let handle_getorphantxs (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  (* Parse verbosity (alias verbose). Core: ParseVerbosity(default=0,
+     allow_bool=false) — integers only, no bool coercion. We accept `Int and
+     treat `Null / missing as the default 0; any other JSON type is a type
+     mismatch. Out-of-range integers fall through to the -8 branch below so the
+     Core message is produced. *)
+  let verbosity_result =
+    match params with
+    | [] | [`Null] -> Ok 0
+    | [`Int n] -> Ok n
+    (* Core ParseVerbosity(allow_bool=false): a boolean argument is rejected
+       with RPC_TYPE_ERROR, NOT coerced to 0/1 (rpc/util.cpp:86-89). *)
+    | [`Bool _] -> Error (rpc_type_error, "Verbosity was boolean but only integer allowed")
+    | [_] -> Error (rpc_type_error, "JSON value is not an integer as expected")
+    | _ -> Error (rpc_invalid_parameter, "getorphantxs ( verbosity )")
+  in
+  match verbosity_result with
+  | Error e -> Error e
+  | Ok verbosity ->
+    if verbosity < 0 || verbosity > 2 then
+      (* Core: RPC_INVALID_PARAMETER, "Invalid verbosity value <n>" *)
+      Error (rpc_invalid_parameter,
+        Printf.sprintf "Invalid verbosity value %d" verbosity)
+    else begin
+      (* Build one orphan-detail object (verbosity >= 1). *)
+      let orphan_to_json (entry : Mempool.orphan_entry) : Yojson.Safe.t =
+        let tx = entry.Mempool.orphan_tx in
+        (* `from`: no per-peer announcer tracking in this node's orphan_entry —
+           emit an empty array (best-effort). *)
+        let from = `List [] in
+        (* Core OrphanToJSON (rpc/mempool.cpp:1217-1231): exactly these fields,
+           in this order. There is NO `expiration` field in Core. *)
+        `Assoc [
+          ("txid",       `String (Types.hash256_to_hex_display entry.Mempool.orphan_txid));
+          ("wtxid",      `String (Types.hash256_to_hex_display entry.Mempool.orphan_wtxid));
+          ("bytes",      `Int (Validation.compute_tx_size tx));
+          ("vsize",      `Int (Validation.compute_tx_vsize tx));
+          ("weight",     `Int (Validation.compute_tx_weight tx));
+          ("from",       from);
+        ]
+      in
+      (* Stable enumeration: snapshot the pool into a list once. *)
+      let orphans =
+        Hashtbl.fold (fun _k entry acc -> entry :: acc) ctx.mempool.Mempool.orphans []
+      in
+      let items =
+        if verbosity = 0 then
+          (* Core verbosity 0: array of TXID strings (orphan.tx->GetHash(), the
+             non-witness txid; help text "0 for an array of txids"). NOT wtxid. *)
+          List.map (fun (entry : Mempool.orphan_entry) ->
+            `String (Types.hash256_to_hex_display entry.Mempool.orphan_txid)
+          ) orphans
+        else if verbosity = 1 then
+          List.map orphan_to_json orphans
+        else
+          (* verbosity = 2: verbosity-1 object + serialized hex. *)
+          List.map (fun (entry : Mempool.orphan_entry) ->
+            match orphan_to_json entry with
+            | `Assoc fields ->
+              `Assoc (fields @ [("hex", `String (tx_to_hex entry.Mempool.orphan_tx))])
+            | other -> other
+          ) orphans
+      in
+      Ok (`List items)
+    end
+
+(* ============================================================================
    FIX-72 / W120 BUG-10 — prioritisetransaction + getprioritisedtransactions
 
    Core RPC: prioritisetransaction txid dummy_fee_delta_btc fee_delta_satoshis
@@ -8207,6 +8307,7 @@ let handle_help (_ctx : rpc_context)
       "getmempooldescendants \"txid\"";
       "getmempoolentry \"txid\"";
       "getmempoolinfo";
+      "getorphantxs ( verbosity )";
       "getrawmempool ( verbose )";
       "loadmempool";
       "savemempool";
@@ -9807,6 +9908,11 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_getmempoolentry ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
+  | "getorphantxs" ->
+    (* handle_getorphantxs already returns Core-exact (code, message) pairs:
+       -8 (RPC_INVALID_PARAMETER) "Invalid verbosity value <n>" for an
+       out-of-range verbosity. Pass them through verbatim. *)
+    handle_getorphantxs ctx params
   | "testmempoolaccept" ->
     (match handle_testmempoolaccept ctx params with
      | Ok r -> Ok r

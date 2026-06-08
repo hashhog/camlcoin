@@ -75,6 +75,16 @@ type config = {
        REST endpoints return Core's exact 400 "Index is not enabled for
        filtertype basic". The index is back-filled at startup if it lags
        the validated tip and is updated on every connect/reorg. *)
+  coinstatsindex : bool;
+    (* Mirrors Bitcoin Core's -coinstatsindex
+       (init.cpp / index/coinstatsindex.cpp). When [true], the daemon
+       maintains a per-height running MuHash3072 + UTXO counts index at
+       [<data_dir>/indexes/coinstats], updated on every block
+       connect/disconnect/reorg, and [gettxoutsetinfo hash_or_height]
+       serves the per-height snapshot byte-exactly versus Core. When
+       [false] (default, matching Core DEFAULT_COINSTATSINDEX), a non-tip
+       [gettxoutsetinfo] query returns Core's -8
+       "Querying specific block heights requires coinstatsindex". *)
   asmap_path : string option;
     (* Path to an ASMap binary file for IP-to-ASN mapping (eclipse protection).
        Mirrors Bitcoin Core's -asmap=<file> flag (init.cpp).  When set, peer
@@ -162,6 +172,7 @@ let default_config : config = {
   rest_port = None;
   rest_bind = None;
   blockfilterindex_basic = false;  (* Mirrors Core DEFAULT_BLOCKFILTERINDEX *)
+  coinstatsindex = false;  (* Mirrors Core DEFAULT_COINSTATSINDEX *)
   asmap_path = None;
   proxy = None;
   onion = None;
@@ -360,6 +371,38 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         Logs.err (fun m ->
           m "BIP-157: failed to open filter index at %s: %s"
             (Filename.concat config.data_dir "indexes/blockfilter/basic")
+            (Printexc.to_string exn));
+        None
+    end
+  in
+
+  (* Coin-stats index.  Mirrors Bitcoin Core's -coinstatsindex (init.cpp +
+     index/coinstatsindex.cpp).  Created here so it's attached to [chain]
+     before any IBD or post-IBD block listener fires; closed in
+     graceful_shutdown.  When the flag is off we leave
+     [chain.coinstatsindex = None] and every connect/disconnect path
+     no-ops via the coinstats_*_if_enabled helpers, so a non-tip
+     gettxoutsetinfo keeps Core's -8 error. *)
+  let coinstatsindex =
+    if not config.coinstatsindex then None
+    else begin
+      try
+        let idx = Coinstats_index.create ~data_dir:config.data_dir in
+        chain.coinstatsindex <- Some idx;
+        Logs.info (fun m ->
+          m "coinstatsindex opened at %s (best_height=%d, target=%d)"
+            idx.Coinstats_index.root_dir
+            (Coinstats_index.best_height idx)
+            chain.blocks_synced);
+        (* Synchronous startup backfill so the upcoming RPC listener can
+           immediately answer gettxoutsetinfo at any indexed height. Bounded
+           by [chain.blocks_synced]; stops on missing block bodies / undo. *)
+        let _ = Sync.backfill_coinstats_index chain in
+        Some idx
+      with exn ->
+        Logs.err (fun m ->
+          m "coinstatsindex: failed to open index at %s: %s"
+            (Filename.concat config.data_dir "indexes/coinstats")
             (Printexc.to_string exn));
         None
     end
@@ -2167,6 +2210,17 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
        with exn ->
          Logs.warn (fun m ->
            m "BIP-157: close failed: %s" (Printexc.to_string exn))));
+    (* Phase 4b': flush + close the coin-stats index. Same ordering
+       rationale as the BIP-157 close above. Best-effort. *)
+    (match coinstatsindex with
+     | None -> ()
+     | Some idx ->
+       (try
+         Coinstats_index.close idx;
+         Logs.info (fun m -> m "coinstatsindex: flushed and closed")
+       with exn ->
+         Logs.warn (fun m ->
+           m "coinstatsindex: close failed: %s" (Printexc.to_string exn))));
     (* Phase 4: close databases. *)
     Logs.info (fun m -> m "closing DB");
     (try Rocksdb_store.close rocksdb

@@ -951,6 +951,18 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
              Sync.append_filter_if_enabled_from_entries chain
                ~block ~height ~spent_entries:!spent_entries_for_filter;
 
+             (* Coin-stats index append for the submitblock / mining /
+                generate* accept path (no-op when --coinstatsindex is off).
+                Uses the spent prevout entries captured from the connect
+                undo above so the per-height MuHash removes exactly the
+                coins this block spent (with their ORIGINAL height +
+                coinbase flag). Mirrors Bitcoin Core's
+                [CoinStatsIndex::CustomAppend] firing on every connected
+                block — this is the block-connect choke-point for the
+                submitblock path the harness drives. *)
+             Sync.coinstats_connect_if_enabled_from_entries chain
+               ~block ~height ~spent_entries:!spent_entries_for_filter;
+
              (* Remove confirmed transactions from mempool *)
              Mempool.remove_for_block mp block height;
 

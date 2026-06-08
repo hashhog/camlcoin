@@ -895,7 +895,13 @@ let handle_invalidateblock (ctx : rpc_context)
     (match parse_blockhash_hex blockhash_hex with
      | Error msg -> Error msg
      | Ok hash ->
-       match Sync.invalidate_block ctx.chain hash with
+       (* Thread the live OptimizedUtxoSet through so the disconnect path
+          rolls back BOTH the on-disk UTXO set AND the in-memory cache/dirty
+          set. Without this the cache keeps the just-disconnected chain's
+          coins, and a subsequent submitblock of the competing chain
+          validates against a stale UTXO view. Mirrors Core's
+          InvalidateBlock running under the active Chainstate's CoinsTip. *)
+       match Sync.invalidate_block ctx.chain ?utxo_set:ctx.utxo hash with
        | Ok _new_height -> Ok `Null
        | Error msg -> Error msg)
   | _ ->
@@ -8295,18 +8301,84 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
      && normalized <> "hash_serialized_3"
      && normalized <> "muhash" then
     Error (Printf.sprintf "'%s' is not a valid hash_type" hash_type)
-  else if extra_args <> [] && extra_args <> [`Null] then
-    (* A specific block/height was supplied. Core requires coinstatsindex
-       for that, and additionally forbids hash_serialized_3 for a specific
-       block outright (blockchain.cpp:1090-1092). We maintain no
-       coinstatsindex, so the specific-block path is unsupported; surface
-       Core's exact hash_serialized_3 message for that hash_type (the case
-       the differential test exercises) and a coinstatsindex message
-       otherwise. Both are RPC_INVALID_PARAMETER (-8). *)
-    (if normalized = "hash_serialized_3" then
-       Error "hash_serialized_3 hash type cannot be queried for a specific block"
-     else
-       Error "Querying specific block heights requires coinstatsindex")
+  else if extra_args <> [] && extra_args <> [`Null] then begin
+    (* A specific block/height (hash_or_height) was supplied. Core's order
+       (blockchain.cpp:1083-1098):
+         1. hash_serialized_3 at a specific block is forbidden outright
+            (RPC_INVALID_PARAMETER -8), regardless of coinstatsindex.
+         2. Otherwise, a specific height requires coinstatsindex
+            (RPC_INVALID_PARAMETER -8 "Querying specific block heights
+            requires coinstatsindex").
+         3. With coinstatsindex present and synced past the height, serve
+            the per-height snapshot. *)
+    if normalized = "hash_serialized_3" then
+      Error "hash_serialized_3 hash type cannot be queried for a specific block"
+    else
+      match ctx.chain.coinstatsindex with
+      | None ->
+        Error "Querying specific block heights requires coinstatsindex"
+      | Some idx ->
+        (* Resolve hash_or_height (param[1]) -> (height, expected hash). A
+           bare int is a height; a hex string is a block hash whose height
+           we look up. Mirrors Core's ParseHashOrHeight. *)
+        let resolve () : (int * Types.hash256 option, string) result =
+          match extra_args with
+          | (`Int h) :: _ ->
+            if h < 0 then Error "Target block height negative"
+            else Ok (h, Storage.ChainDB.get_hash_at_height ctx.chain.db h)
+          | (`String hex) :: _ ->
+            (match parse_blockhash_hex hex with
+             | Error msg -> Error msg
+             | Ok hash ->
+               (match Sync.get_header ctx.chain hash with
+                | Some entry -> Ok (entry.height, Some entry.hash)
+                | None -> Error "Block not found"))
+          | _ -> Error "Invalid hash_or_height parameter"
+        in
+        (match resolve () with
+         | Error msg -> Error msg
+         | Ok (height, _expected_hash) ->
+           let best = Coinstats_index.best_height idx in
+           if height > best then
+             (* Core: RPC_INTERNAL_ERROR while the index is still syncing,
+                but for a query above the validated tip the height simply
+                does not exist. Surface the syncing message Core uses. *)
+             Error (Printf.sprintf
+               "Unable to get data because coinstatsindex is still syncing. \
+                Current height: %d" best)
+           else
+             (match Coinstats_index.get_at_height idx height with
+              | None ->
+                Error (Printf.sprintf
+                  "coinstatsindex has no snapshot for height %d" height)
+              | Some s ->
+                (* Per-height response. When coinstatsindex is used Core
+                   OMITS [transactions] and [disk_size] (they are
+                   cursor-only fields). We emit the gated set:
+                   height, bestblock (the hash AT this height, internal->
+                   display reversed), txouts, bogosize, total_amount, and
+                   the requested hash field (muhash; none -> no hash). *)
+                let base_fields = [
+                  ("height", `Int s.Coinstats_index.s_height);
+                  ("bestblock",
+                     `String (Types.hash256_to_hex_display
+                                s.Coinstats_index.s_block_hash));
+                  ("txouts", `Int s.Coinstats_index.s_txouts);
+                  ("bogosize",
+                     `Int (Int64.to_int s.Coinstats_index.s_bogo_size));
+                  ("total_amount",
+                     btc_amount_json s.Coinstats_index.s_total_amount);
+                ] in
+                let hash_field =
+                  if normalized = "muhash" then
+                    [("muhash",
+                        `String (Types.hash256_to_hex_display
+                                   (Cstruct.of_bytes
+                                      s.Coinstats_index.s_muhash)))]
+                  else []
+                in
+                Ok (`Assoc (base_fields @ hash_field))))
+  end
   else begin
       (* Walk the UTXO set once, computing aggregate stats and (optionally)
          the requested commitment in a single pass. The MuHash accumulator
@@ -9865,6 +9937,22 @@ let handle_getindexinfo (ctx : rpc_context)
       let best = Block_index.bip157_best_height idx in
       let best = if best < 0 then 0 else best in
       summary ~name:"basic block filter index"
+        ~synced:(best >= block_tip)
+        ~best_block_height:best
+        entries
+  in
+  (* coinstatsindex — only when enabled (chain.coinstatsindex = Some _).
+     Core's GetName() for CoinStatsIndex is the literal "coinstatsindex"
+     (src/index/coinstatsindex.cpp). best_block_height = highest indexed
+     height (clamped to 0 for an empty index); synced = it has reached the
+     validated block tip. *)
+  let entries =
+    match ctx.chain.coinstatsindex with
+    | None -> entries
+    | Some idx ->
+      let best = Coinstats_index.best_height idx in
+      let best = if best < 0 then 0 else best in
+      summary ~name:"coinstatsindex"
         ~synced:(best >= block_tip)
         ~best_block_height:best
         entries

@@ -268,6 +268,40 @@ let blockfilterindex_arg =
   Arg.(value & opt (some string) None &
     info ["blockfilterindex"] ~docv:"VAL" ~doc)
 
+let coinstatsindex_arg =
+  (* Bitcoin Core's -coinstatsindex flag (init.cpp / index/coinstatsindex.cpp).
+     Accepts a boolean ('1'/'0' / 'true'/'false'). When on, the daemon
+     maintains a per-height running MuHash3072 + UTXO counts index at
+     <datadir>/indexes/coinstats, updated on every block
+     connect/disconnect/reorg, so [gettxoutsetinfo "hash_type" <height>]
+     can answer for a HISTORICAL height byte-exactly versus Core. Default
+     off, matching DEFAULT_COINSTATSINDEX. *)
+  let doc = "Maintain a per-height UTXO-set MuHash3072 + counts index at \
+             <datadir>/indexes/coinstats. Required for \
+             gettxoutsetinfo at a historical hash_or_height; without it a \
+             non-tip query returns Core's exact -8 'Querying specific block \
+             heights requires coinstatsindex'. On startup any gap to the \
+             validated tip is back-filled from stored blocks + undo data. \
+             Accepted values: '0' / 'false' (off, default), \
+             '1' / 'true' (on)." in
+  Arg.(value & opt (some string) None &
+    info ["coinstatsindex"] ~docv:"VAL" ~doc)
+
+let txindex_arg =
+  (* Bitcoin Core's -txindex flag (init.cpp / index/txindex.cpp).
+     camlcoin maintains the txid -> (block_hash, index) mapping
+     unconditionally on every block connect (Sync.tx_index_write_for_block),
+     so there is no separate enable path — this flag is ACCEPTED for CLI
+     compatibility (Core operators and tooling pass -txindex=1 alongside
+     -coinstatsindex=1) and is otherwise a no-op. Default off (the index is
+     present regardless). *)
+  let doc = "Accepted for Bitcoin Core CLI compatibility. camlcoin always \
+             maintains the transaction index (getrawtransaction works \
+             without this flag), so this option is a no-op. \
+             Accepted values: '0' / 'false' / '1' / 'true'." in
+  Arg.(value & opt (some string) None &
+    info ["txindex"] ~docv:"VAL" ~doc)
+
 let asmap_arg =
   (* Bitcoin Core's -asmap=<file> flag (init.cpp).
      When set, IP addresses are looked up in the ASMap binary trie and
@@ -385,7 +419,11 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     logfile printtoconsole ready_fd zmq_pub reindex
     rest_enabled rest_port rest_bind blockfilterindex asmap
     proxy onion_proxy i2psam i2p_private_key cjdnsreachable
-    rpc_tls_cert rpc_tls_key rest_tls_cert rest_tls_key =
+    rpc_tls_cert rpc_tls_key rest_tls_cert rest_tls_key
+    coinstatsindex_cli txindex_cli =
+  (* --txindex is accepted for Core CLI compatibility (camlcoin always
+     maintains the tx index); validate its value but otherwise ignore it. *)
+  ignore txindex_cli;
   (* Resolve datadir early so config-file lookup can default to it. *)
   let base = Camlcoin.Cli.config_for_network network in
   let resolved_datadir = match datadir with
@@ -738,6 +776,33 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
                Printf.eprintf "[camlcoin] %s\n%!" msg;
                exit 1)
         end;
+      coinstatsindex =
+        (* Resolve CLI / conf-file value into a boolean. Accepted enables:
+           '1', 'true'. Accepted disables: '0', 'false', missing. Anything
+           else is fatal (mirrors the --blockfilterindex resolution). *)
+        begin
+          let parse_one v =
+            match String.lowercase_ascii v with
+            | "" | "0" | "false" -> Ok false
+            | "1" | "true" -> Ok true
+            | other ->
+              Error (Printf.sprintf
+                "Invalid --coinstatsindex value: %S (accepted: 0/1/true/false)"
+                other)
+          in
+          let chosen = match coinstatsindex_cli with
+            | Some v -> Some v
+            | None -> Camlcoin.Runtime_config.get_string conf_opts "coinstatsindex"
+          in
+          match chosen with
+          | None -> false
+          | Some v ->
+            (match parse_one v with
+             | Ok b -> b
+             | Error msg ->
+               Printf.eprintf "[camlcoin] %s\n%!" msg;
+               exit 1)
+        end;
       asmap_path = (match asmap with
         | Some _ -> asmap
         | None -> Camlcoin.Runtime_config.get_string conf_opts "asmap");
@@ -887,7 +952,9 @@ let cmd =
     $ rpc_tls_cert_arg
     $ rpc_tls_key_arg
     $ rest_tls_cert_arg
-    $ rest_tls_key_arg)
+    $ rest_tls_key_arg
+    $ coinstatsindex_arg
+    $ txindex_arg)
 
 (* ============================================================================
    Entry Point

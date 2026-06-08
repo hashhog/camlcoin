@@ -216,6 +216,27 @@ type chain_state = {
      Mirrors Bitcoin Core's [BlockFilterIndex] singleton attached to
      [ChainstateManager] via [g_indexes_ready_to_sync]
      ([src/index/blockfilterindex.cpp]). *)
+  mutable coinstatsindex : Coinstats_index.t option;
+  (* Coin-stats index handle (Bitcoin Core [-coinstatsindex]).
+
+     [Some _] when the daemon was started with --coinstatsindex=1; [None]
+     otherwise. Every connect-block path in this module calls
+     [coinstats_connect_if_enabled] when this is [Some], in lockstep with
+     the validated-tip advance, so the per-height running MuHash3072 + UTXO
+     counts never lag or lead the active chain by more than one block.
+     Reorgs call [Coinstats_index.rewind_to] from [reorganize]'s disconnect
+     half, and [Coinstats_index.disconnect_block] from
+     [disconnect_to_target] / [invalidate_block]. The handle is created in
+     [cli.ml] after [restore_chain_state] returns and before any IBD or
+     post-IBD block listener is wired; the graceful-shutdown phase calls
+     [Coinstats_index.close] on the way down.
+
+     With the index [Some], [gettxoutsetinfo hash_or_height] serves the
+     per-height snapshot byte-exactly versus Core; with [None] a non-tip
+     query keeps Core's -8 "requires coinstatsindex" error.
+
+     Mirrors Bitcoin Core's [CoinStatsIndex] singleton attached to
+     [ChainstateManager] ([src/index/coinstatsindex.cpp]). *)
   mutable wallet_scan_hook : (Types.block -> int -> unit) option;
   (* Wallet block-connect notification, mirroring Bitcoin Core's
      [CWallet::blockConnected] (wallet/wallet.cpp).  Installed by [cli.ml] /
@@ -718,6 +739,7 @@ let create_chain_state (db : Storage.ChainDB.t)
     peer_headers_sync = Hashtbl.create 16;
     block_submission_paused = false;
     bip157_index = None;
+    coinstatsindex = None;
     wallet_scan_hook = None;
     wallet_unscan_hook = None;
   } in
@@ -766,6 +788,7 @@ let restore_chain_state (db : Storage.ChainDB.t)
     peer_headers_sync = Hashtbl.create 16;
     block_submission_paused = false;
     bip157_index = None;
+    coinstatsindex = None;
     wallet_scan_hook = None;
     wallet_unscan_hook = None;
   } in
@@ -1892,6 +1915,92 @@ let append_filter_if_enabled_from_entries
        Logs.warn (fun m ->
          m "BIP-157: failed to append filter at height %d: %s" height msg))
 
+(* ============================================================================
+   Coin-stats index connect / disconnect hooks
+   ============================================================================
+
+   These mirror [append_filter_if_enabled] exactly: a no-op when
+   [chain.coinstatsindex = None], so every connect-block / disconnect-block
+   call site can invoke them unconditionally. The per-height running
+   MuHash3072 + UTXO counts are maintained in lockstep with the validated
+   tip advance — on the PRIMARY connect path (IBD, post-IBD
+   process_new_block / connect_stored_blocks, the submitblock / mining
+   accept path, and both halves of [reorganize]) and on every disconnect
+   path ([reorganize] disconnect, [disconnect_to_target],
+   [invalidate_block]). This is the same set of choke-points
+   [tx_index_write_for_block] / [append_block_filter] use, so a real
+   P2P/IBD sync (not just submitblock) stays indexed.
+
+   Mirrors Bitcoin Core's [CoinStatsIndex::CustomAppend] firing from
+   [BaseIndex::BlockConnected] ([src/index/coinstatsindex.cpp]). *)
+
+(* Map [Validation.utxo] spent-prevouts into [Coinstats_index.spent_coin]. *)
+let coinstats_spent_of_validation
+    (spent : (Types.outpoint * Validation.utxo) list)
+    : Coinstats_index.spent_coin list =
+  List.map (fun (op, (u : Validation.utxo)) ->
+    { Coinstats_index.sc_outpoint = op;
+      sc_value = u.Validation.value;
+      sc_script_pubkey = u.Validation.script_pubkey;
+      sc_height = u.Validation.height;
+      sc_is_coinbase = u.Validation.is_coinbase }
+  ) spent
+
+(* Map [Utxo.utxo_entry] spent-prevouts into [Coinstats_index.spent_coin]. *)
+let coinstats_spent_of_entries
+    (spent : (Types.outpoint * Utxo.utxo_entry) list)
+    : Coinstats_index.spent_coin list =
+  List.map (fun (op, (e : Utxo.utxo_entry)) ->
+    { Coinstats_index.sc_outpoint = op;
+      sc_value = e.Utxo.value;
+      sc_script_pubkey = e.Utxo.script_pubkey;
+      sc_height = e.Utxo.height;
+      sc_is_coinbase = e.Utxo.is_coinbase }
+  ) spent
+
+(* Connect hook taking [Validation.utxo] spent prevouts (IBD / post-IBD). *)
+let coinstats_connect_if_enabled
+    (chain : chain_state) ~(block : Types.block) ~(height : int)
+    ~(spent_utxos : (Types.outpoint * Validation.utxo) list) : unit =
+  match chain.coinstatsindex with
+  | None -> ()
+  | Some idx ->
+    let spent = coinstats_spent_of_validation spent_utxos in
+    (match Coinstats_index.connect_block idx ~block ~height ~spent with
+     | Ok () -> ()
+     | Error msg ->
+       Logs.warn (fun m ->
+         m "coinstatsindex: connect at height %d failed: %s" height msg))
+
+(* Connect hook taking [Utxo.utxo_entry] spent prevouts (reorg / submitblock). *)
+let coinstats_connect_if_enabled_from_entries
+    (chain : chain_state) ~(block : Types.block) ~(height : int)
+    ~(spent_entries : (Types.outpoint * Utxo.utxo_entry) list) : unit =
+  match chain.coinstatsindex with
+  | None -> ()
+  | Some idx ->
+    let spent = coinstats_spent_of_entries spent_entries in
+    (match Coinstats_index.connect_block idx ~block ~height ~spent with
+     | Ok () -> ()
+     | Error msg ->
+       Logs.warn (fun m ->
+         m "coinstatsindex: connect at height %d failed: %s" height msg))
+
+(* Disconnect hook: drop the snapshot at [height] (reorg / invalidate). *)
+let coinstats_disconnect_if_enabled (chain : chain_state) ~(height : int)
+    : unit =
+  match chain.coinstatsindex with
+  | None -> ()
+  | Some idx -> Coinstats_index.disconnect_block idx ~height
+
+(* Rewind hook: drop every snapshot above [target_height] (reorg disconnect
+   half, done once for the whole reorg). *)
+let coinstats_rewind_if_enabled (chain : chain_state) ~(target_height : int)
+    : unit =
+  match chain.coinstatsindex with
+  | None -> ()
+  | Some idx -> Coinstats_index.rewind_to idx ~target_height
+
 (* IBD configuration constants *)
 let max_blocks_per_peer = 16           (* Max in-flight blocks per peer, matching Bitcoin Core MAX_BLOCKS_IN_TRANSIT_PER_PEER *)
 let max_total_blocks_in_flight = 128   (* Global cap on blocks in flight (8 peers × 16 per peer) *)
@@ -2824,6 +2933,13 @@ let process_downloaded_blocks ?(max_blocks = 1)
               as inputs were resolved). *)
            append_filter_if_enabled ibd.chain ~block ~height
              ~spent_utxos:spent_utxo_list;
+           (* Coin-stats index append on the IBD connect path (no-op when
+              --coinstatsindex is off). Done in BOTH the assume-valid
+              fast-path and the full-validation slow-path so a real P2P/IBD
+              sync stays indexed (not just submitblock). Mirrors Core's
+              [CoinStatsIndex::CustomAppend]. *)
+           coinstats_connect_if_enabled ibd.chain ~block ~height
+             ~spent_utxos:spent_utxo_list;
            (* Fix 3: Skip block/undo storage during assume-valid IBD *)
            if not ibd_mode then begin
              (* Store block *)
@@ -3197,12 +3313,122 @@ let disconnect_to_target (state : chain_state) (target : header_entry)
           (* Clear sig cache: stale validation results from the
              disconnected segment must not leak forward. *)
           Sig_cache.clear_global ();
+          (* Coin-stats index rollback: drop every per-height snapshot
+             above the rollback target (no-op when --coinstatsindex is
+             off). When the chain is later re-applied (e.g. dumptxoutset's
+             [finally_restore] via [reorganize]), the connect half
+             re-appends the snapshots from target+1. *)
+          coinstats_rewind_if_enabled state ~target_height:target.height;
           (* Update in-memory + on-disk chain tip pointer. *)
           state.tip <- Some target;
           state.blocks_synced <- target.height;
           Storage.ChainDB.set_chain_tip state.db target.hash target.height;
           Logs.info (fun m ->
             m "Rollback complete: tip rewound from height %d to %d"
+              current_tip.height target.height);
+          Ok ()))
+
+(* UTXO-aware rollback to [target], rolling the LIVE [OptimizedUtxoSet]
+   (its in-memory dirty set + LRU cache) back from each disconnected
+   block's undo data, then committing through [persist_dirty_atomic] so
+   BOTH backing stores (cf_chainstate AND rocksdb_utxo) and the tip pointer
+   move together.
+
+   This is the disconnect primitive [invalidate_block] uses when the RPC
+   caller threaded an [OptimizedUtxoSet] through.  The DB-direct
+   [disconnect_to_target] above writes only to cf_chainstate via
+   [Storage.ChainDB.batch_*]; but the live [OptimizedUtxoSet] reads UTXOs
+   from the SEPARATE rocksdb_utxo store ([OptimizedUtxoSet.get] queries
+   [t.rocksdb] when present).  So a DB-direct rollback leaves rocksdb_utxo —
+   what the next submitblock validates against — still reflecting the
+   disconnected chain: every restored prevout shows up "Missing UTXO" and
+   the competing chain's first block is rejected.  By mutating the
+   OptimizedUtxoSet and flushing via [persist_dirty_atomic] (the same path
+   [submit_block]'s connect uses), both stores stay consistent.
+
+   Also rewinds the coin-stats index to [target.height] (no-op when the
+   index is off).  Mirrors Bitcoin Core's [InvalidateBlock] -> [DisconnectTip]
+   loop operating on the active Chainstate's CoinsTip ([validation.cpp]). *)
+let disconnect_to_target_via_utxo (state : chain_state)
+    (utxo : Utxo.OptimizedUtxoSet.t) (target : header_entry)
+    : (unit, string) result =
+  match state.tip with
+  | None -> Error "No current tip"
+  | Some current_tip when current_tip.height < target.height ->
+    Error (Printf.sprintf
+             "Target height %d is above current tip %d"
+             target.height current_tip.height)
+  | Some current_tip when Cstruct.equal current_tip.hash target.hash ->
+    Ok ()  (* Already at target — no-op. *)
+  | Some current_tip ->
+    let rec walk_back (h : header_entry) : (header_entry, string) result =
+      if h.height = target.height then
+        if Cstruct.equal h.hash target.hash then Ok h
+        else Error "Target is not an ancestor of the current tip"
+      else
+        let pkey = Cstruct.to_string h.header.prev_block in
+        match Hashtbl.find_opt state.headers pkey with
+        | Some p -> walk_back p
+        | None -> Error "Cannot walk to target (missing parent)"
+    in
+    (match walk_back current_tip with
+     | Error _ as e -> e
+     | Ok _ ->
+       (* tip-first disconnect order. *)
+       let to_disconnect = collect_path state target current_tip in
+       let rec disconnect = function
+         | [] -> Ok ()
+         | (entry : header_entry) :: rest ->
+           (match Storage.ChainDB.get_block state.db entry.hash with
+            | None ->
+              Error (Printf.sprintf
+                       "Missing block at height %d during invalidate disconnect"
+                       entry.height)
+            | Some block ->
+              match Storage.ChainDB.get_undo_data state.db entry.hash with
+              | None ->
+                Error (Printf.sprintf
+                         "Missing undo data at height %d during invalidate \
+                          disconnect" entry.height)
+              | Some undo_raw ->
+                let r = Serialize.reader_of_cstruct
+                          (Cstruct.of_string undo_raw) in
+                let undo = Utxo.deserialize_undo_data r in
+                (* Remove outputs this block created (reverse tx order). *)
+                let txs = List.rev block.transactions in
+                List.iter (fun (tx : Types.transaction) ->
+                  let txid = Crypto.compute_txid tx in
+                  List.iteri (fun vout _out ->
+                    Utxo.OptimizedUtxoSet.remove_fast utxo txid vout
+                  ) tx.Types.outputs
+                ) txs;
+                (* Restore prevouts this block spent, from undo data. *)
+                List.iter (fun (tx_undo : Utxo.tx_undo) ->
+                  List.iter
+                    (fun (outpoint, (utxo_entry : Utxo.utxo_entry)) ->
+                      Utxo.OptimizedUtxoSet.add utxo
+                        outpoint.Types.txid
+                        (Int32.to_int outpoint.Types.vout)
+                        utxo_entry
+                    ) tx_undo.spent_outputs
+                ) undo.tx_undos;
+                Storage.ChainDB.delete_undo_data state.db entry.hash;
+                disconnect rest)
+       in
+       (match disconnect (List.rev to_disconnect) with
+        | Error _ as e -> e
+        | Ok () ->
+          (* Commit the rolled-back UTXO delta + the new (lower) tip to BOTH
+             stores atomically. *)
+          Utxo.OptimizedUtxoSet.persist_dirty_atomic utxo
+            ~tip_hash:target.hash ~tip_height:target.height
+            ~header_tip_hash:target.hash ~header_tip_height:target.height;
+          Sig_cache.clear_global ();
+          coinstats_rewind_if_enabled state ~target_height:target.height;
+          state.tip <- Some target;
+          state.blocks_synced <- target.height;
+          Logs.info (fun m ->
+            m "Rollback (utxo-aware) complete: tip rewound from height %d to %d"
               current_tip.height target.height);
           Ok ()))
 
@@ -4010,6 +4236,15 @@ let connect_block_into_batch
        in
        append_filter_if_enabled_from_entries state ~block ~height
          ~spent_entries;
+       (* Coin-stats index append on the reorg-CONNECT half (no-op when
+          --coinstatsindex is off). The reorg disconnect half already
+          called [coinstats_rewind_if_enabled] (see [reorganize]) to roll
+          the index back to the fork point, so this append at [height] sees
+          a fresh parent snapshot just like a normal IBD connect. Mirrors
+          Core's [CoinStatsIndex] following [ActivateBestChainStep]'s
+          connect side. *)
+       coinstats_connect_if_enabled_from_entries state ~block ~height
+         ~spent_entries;
        (* Stage tx_index pointers (Pattern C0 counterpart of
           [TxIndex::CustomAppend]). The raw tx blob goes into the
           [tx] CF, the txid->(block_hash, tx_idx) pointer into the
@@ -4188,6 +4423,12 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
            | Some idx ->
              Block_index.rewind_bip157_index idx
                ~target_height:fork_point.height);
+          (* Coin-stats index disconnect-half: drop every per-height
+             snapshot above the fork point so the connect-half's appender
+             re-applies from [fork_point.height + 1]. Done once for the
+             whole reorg (O(disconnect_depth)), mirroring the bip157 rewind
+             above. No-op when --coinstatsindex is off. *)
+          coinstats_rewind_if_enabled state ~target_height:fork_point.height;
           (* Connect side: iterate fork-forward-to-new-tip. *)
           let connect_error = ref None in
           let connected_blocks = ref [] in
@@ -4854,6 +5095,115 @@ let backfill_bip157_index (state : chain_state) : int =
     end
 
 (* ============================================================================
+   Coin-stats index startup backfill
+
+   Reference: Bitcoin Core's [CoinStatsIndex::CustomInit] + [BaseIndex::Sync]
+   ([src/index/coinstatsindex.cpp]). Symmetric to [backfill_bip157_index]:
+   on every daemon start, if --coinstatsindex is enabled, walk the stored
+   chain from [last_indexed_height + 1] up to [blocks_synced], re-reading
+   each block body + undo data and feeding them into
+   [Coinstats_index.connect_block]. The undo data supplies the ORIGINAL
+   (height, coinbase, value, script) of every spent prevout — required so
+   the per-height MuHash removes the exact element Core would. If undo data
+   is missing for a height (assume-valid IBD path skips undo storage), we
+   stop the backfill: a coinstats snapshot built without the spent-coin
+   metadata would diverge from Core, so leaving the index short and letting
+   the live connect path resume (or a later full reindex) catch up is the
+   honest behaviour. Returns the count of heights newly indexed. *)
+let backfill_coinstats_index (state : chain_state) : int =
+  match state.coinstatsindex with
+  | None -> 0
+  | Some idx ->
+    let target = state.blocks_synced in
+    let start = Coinstats_index.best_height idx + 1 in
+    if start > target then 0
+    else begin
+      Logs.info (fun m ->
+        m "coinstatsindex: starting backfill from height %d to %d (%d blocks)"
+          start target (target - start + 1));
+      let count = ref 0 in
+      let progress_step = 10000 in
+      (try
+        for h = start to target do
+          match get_header_at_height state h with
+          | None -> raise Exit
+          | Some entry ->
+            let block_opt =
+              if h = 0 then
+                (* Genesis: camlcoin stores only the genesis HEADER, not the
+                   body. The genesis coinbase is never in the UTXO set, so the
+                   genesis coinstats snapshot is the EMPTY MuHash + zero
+                   counts. Synthesize a one-tx body matching the genesis
+                   header so [connect_block] writes the empty-state snapshot
+                   keyed by the genesis hash; the delta is a no-op because
+                   the (height=0, coinbase) case is excluded in
+                   [apply_block_delta]. *)
+                Some {
+                  Types.header = state.network.genesis_header;
+                  transactions = [];
+                }
+              else Storage.ChainDB.get_block state.db entry.hash
+            in
+            (match block_opt with
+             | None ->
+               Logs.warn (fun m ->
+                 m "coinstatsindex: stopping backfill at height %d (block \
+                    body not on disk — pruned or missing)" h);
+               raise Exit
+             | Some block ->
+               let spent =
+                 match Storage.ChainDB.get_undo_data state.db entry.hash with
+                 | None -> []
+                 | Some undo_raw ->
+                   (try
+                     let r =
+                       Serialize.reader_of_cstruct (Cstruct.of_string undo_raw)
+                     in
+                     let undo = Utxo.deserialize_undo_data r in
+                     coinstats_spent_of_entries
+                       (List.concat_map (fun (tu : Utxo.tx_undo) ->
+                          tu.spent_outputs) undo.tx_undos)
+                   with _ -> [])
+               in
+               (* A non-genesis block with spends but no undo data on disk
+                  cannot be indexed correctly — bail rather than write a
+                  divergent snapshot. *)
+               let has_spends =
+                 List.exists (fun (tx : Types.transaction) ->
+                   List.exists (fun inp ->
+                     not (Cstruct.equal inp.Types.previous_output.Types.txid
+                            Types.zero_hash)) tx.Types.inputs)
+                   (match block.Types.transactions with
+                    | _ :: rest -> rest | [] -> [])
+               in
+               if h > 0 && has_spends && spent = [] then begin
+                 Logs.warn (fun m ->
+                   m "coinstatsindex: stopping backfill at height %d (undo \
+                      data missing for a block with spends)" h);
+                 raise Exit
+               end;
+               (match Coinstats_index.connect_block idx ~block ~height:h
+                        ~spent with
+                | Ok () ->
+                  incr count;
+                  if !count mod progress_step = 0 then
+                    Logs.info (fun m ->
+                      m "coinstatsindex: backfill progress: %d/%d (height %d)"
+                        !count (target - start + 1) h)
+                | Error msg ->
+                  Logs.warn (fun m ->
+                    m "coinstatsindex: backfill stopped at height %d: %s"
+                      h msg);
+                  raise Exit))
+        done
+      with Exit -> ());
+      Logs.info (fun m ->
+        m "coinstatsindex: backfill complete, %d new entries (best_height=%d)"
+          !count (Coinstats_index.best_height idx));
+      !count
+    end
+
+(* ============================================================================
    Post-IBD Block Processing
    ============================================================================ *)
 
@@ -4932,6 +5282,11 @@ let rec connect_stored_blocks (state : chain_state) : int =
           (* BIP-157 filter index append (no-op when --blockfilterindex
              is off). Mirrors Core's [BlockFilterIndex::CustomAppend]. *)
           append_filter_if_enabled state ~block:stored_block
+            ~height:next_height ~spent_utxos;
+          (* Coin-stats index append for the gap-fill catch-up connect path
+             (no-op when --coinstatsindex is off). PRIMARY out-of-order
+             drain connect path. *)
+          coinstats_connect_if_enabled state ~block:stored_block
             ~height:next_height ~spent_utxos;
           let ops = ref [] in
           List.iteri (fun tx_idx tx ->
@@ -5144,6 +5499,11 @@ let process_new_block ?(f_requested = false)
              is off). Mirrors Core's [BlockFilterIndex::CustomAppend]
              fired from [BaseIndex::BlockConnected]. *)
           append_filter_if_enabled state ~block ~height ~spent_utxos;
+          (* Coin-stats index per-height MuHash + counts append (no-op when
+             --coinstatsindex is off). Mirrors Core's
+             [CoinStatsIndex::CustomAppend]. PRIMARY post-IBD P2P connect
+             path. *)
+          coinstats_connect_if_enabled state ~block ~height ~spent_utxos;
           (* Collect UTXO mutations for a single atomic block commit *)
           let ops = ref [] in
           List.iteri (fun tx_idx tx ->
@@ -5457,80 +5817,61 @@ let invalidate_block (state : chain_state)
       match Hashtbl.find_opt state.headers parent_key with
       | None -> Error "Cannot find parent of invalidated block"
       | Some parent_entry ->
-        (* We need to disconnect blocks from tip back to the invalidated block.
-           This requires the ibd_state machinery for UTXO updates. For now,
-           we update the chain state and let the caller handle UTXO updates
-           via the utxo_set parameter if provided. *)
-        (match utxo_set with
-         | Some utxo ->
-           (* Disconnect blocks from tip back to parent of invalidated block *)
-           let current_tip = match state.tip with
-             | Some t -> t
-             | None -> failwith "No current tip"
-           in
-           let rec disconnect_to_height target_height (current : header_entry) =
-             if current.height <= target_height then Ok ()
-             else begin
-               match Storage.ChainDB.get_block state.db current.hash with
-               | None ->
-                 Error (Printf.sprintf "Missing block at height %d" current.height)
-               | Some block ->
-                 match Storage.ChainDB.get_undo_data state.db current.hash with
-                 | None ->
-                   Error (Printf.sprintf "Missing undo data at height %d" current.height)
-                 | Some undo_raw ->
-                   let r = Serialize.reader_of_cstruct (Cstruct.of_string undo_raw) in
-                   let undo = Utxo.deserialize_undo_data r in
-                   (* Remove outputs created by this block *)
-                   let txs = List.rev block.transactions in
-                   List.iter (fun tx ->
-                     let txid = Crypto.compute_txid tx in
-                     List.iteri (fun vout _out ->
-                       ignore (Utxo.OptimizedUtxoSet.remove utxo txid vout)
-                     ) tx.Types.outputs
-                   ) txs;
-                   (* Restore spent outputs from undo data *)
-                   List.iter (fun (tx_undo : Utxo.tx_undo) ->
-                     List.iter (fun (outpoint, utxo_entry) ->
-                       Utxo.OptimizedUtxoSet.add utxo
-                         outpoint.Types.txid
-                         (Int32.to_int outpoint.Types.vout)
-                         utxo_entry
-                     ) tx_undo.spent_outputs
-                   ) undo.tx_undos;
-                   Storage.ChainDB.delete_undo_data state.db current.hash;
-                   Logs.debug (fun m ->
-                     m "Disconnected block at height %d during invalidation"
-                       current.height);
-                   let parent_key = Cstruct.to_string current.header.prev_block in
-                   match Hashtbl.find_opt state.headers parent_key with
-                   | None -> Error "Missing parent during disconnect"
-                   | Some parent -> disconnect_to_height target_height parent
-             end
-           in
-           (match disconnect_to_height parent_entry.height current_tip with
-            | Error e -> Error e
-            | Ok () ->
-              (* Update tip to parent of invalidated block *)
-              state.tip <- Some parent_entry;
-              state.blocks_synced <- parent_entry.height;
-              Storage.ChainDB.set_chain_tip state.db parent_entry.hash parent_entry.height;
-              (* Find the best valid chain and try to activate it *)
-              match find_best_valid_tip state with
-              | Some best when Consensus.work_compare best.total_work parent_entry.total_work > 0 ->
-                Logs.info (fun m ->
-                  m "Found better valid chain at height %d, activating..."
-                    best.height);
-                (* For now, just set the tip; full reorg would require more work *)
-                Ok parent_entry.height
-              | _ ->
-                Ok parent_entry.height)
-         | None ->
-           (* No UTXO set provided - just update chain state *)
-           state.tip <- Some parent_entry;
-           state.blocks_synced <- parent_entry.height;
-           Storage.ChainDB.set_chain_tip state.db parent_entry.hash parent_entry.height;
-           Ok parent_entry.height)
+        (* Disconnect the active chain from its tip back to the parent of
+           the invalidated block, rolling the UTXO set back from each
+           disconnected block's undo data, lowering the chain tip, AND
+           rewinding the coin-stats index (so its per-height snapshots above
+           the parent are dropped).
+
+           When the RPC caller threaded a live [OptimizedUtxoSet] through
+           ([invalidateblock] always does), use [disconnect_to_target_via_utxo]
+           so BOTH backing stores (cf_chainstate AND the separate rocksdb_utxo
+           store the live UTXO set actually reads from) and the tip move
+           together — a DB-direct rollback would leave rocksdb_utxo stale and
+           the next submitblock would reject the competing chain's first block
+           with "Missing UTXO" on a restored prevout.  When no UTXO set was
+           threaded, fall back to the DB-direct [disconnect_to_target] (the
+           same primitive [dumptxoutset rollback] uses).  Mirrors Bitcoin
+           Core's [InvalidateBlock] -> [DisconnectTip] loop operating on the
+           active Chainstate's CoinsTip ([validation.cpp]). *)
+        let disconnect_result =
+          match utxo_set with
+          | Some utxo -> disconnect_to_target_via_utxo state utxo parent_entry
+          | None -> disconnect_to_target state parent_entry
+        in
+        (match disconnect_result with
+         | Error e -> Error e
+         | Ok () ->
+           (* After the rewind, try to activate the best remaining valid
+              chain (a side-branch already on disk with more work). Mirrors
+              Core's [ActivateBestChain] firing at the end of
+              [InvalidateBlock]. If none exists, the chain simply stays at
+              the parent of the invalidated block (the common case when the
+              heavier replacement chain has not been received yet — it
+              arrives via submitblock / P2P afterwards and triggers
+              [reorganize]). *)
+           (match find_best_valid_tip state with
+            | Some best
+              when Consensus.work_compare best.total_work parent_entry.total_work > 0
+                   && not (Cstruct.equal best.hash parent_entry.hash) ->
+              Logs.info (fun m ->
+                m "Found better valid chain at height %d after invalidate, \
+                   activating..." best.height);
+              let ibd = create_ibd_state ?utxo_set state in
+              (match reorganize ibd best with
+               | Ok () -> Ok best.height
+               | Error e ->
+                 (* Reorg to the alternate chain failed; we are still
+                    cleanly at the parent of the invalidated block (the
+                    disconnect already committed). Surface the parent
+                    height rather than the error so the node is in a
+                    consistent state. *)
+                 Logs.warn (fun m ->
+                   m "Post-invalidate reorg to height %d failed: %s \
+                      (staying at parent height %d)"
+                     best.height e parent_entry.height);
+                 Ok parent_entry.height)
+            | _ -> Ok parent_entry.height))
     end else begin
       (* Block not on active chain, just mark as invalid *)
       match state.tip with

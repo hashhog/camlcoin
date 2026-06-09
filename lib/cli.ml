@@ -2080,16 +2080,110 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
      reclamation and no time-based timer. The off-heap Cstruct/Bigarray +
      Domain-arena churn (thousands of transient allocations per block + idle /
      mempool churn) then creeps RSS unbounded until the cgroup cap OOM-kills the
-     node. We piggy-back a TIME-gated Gc.compact()+malloc_trim() onto this 30 s
-     status loop: fire only when FullySynced and at least [compact_interval_s]
-     of wall-clock have elapsed. Time cadence (not block count) because at-tip
-     blocks are ~10 min apart and the idle/mempool allocation churn between
-     blocks must also be reclaimed. Firing while the live heap is still small
-     (~6-7G, not 46G) keeps each Gc.compact ~1-2s and bounds RSS flat ~17G.
+     node. We re-establish the Gc.compact()+malloc_trim() cadence at tip via a
+     dedicated fast-ticking timer ([gc_thread] below).
+
+     HEAP-SIZE THRESHOLD (not pure wall-clock): a fixed 120 s interval let the
+     OCaml heap accumulate up to ~17.5 GB of TRANSIENT mempool/relay churn
+     within a single window (live set is only ~667 MB — this is churn, not a
+     leak). Gc.compact is a global stop-the-world over the whole runtime and
+     malloc_trim's cost scales with the freed-arena size, so compacting 17.5 GB
+     blocked every OS thread — including the RPC/metrics threads — for >30 s
+     once per window, leaving the node RPC-unavailable ~17-25 % of the time.
+     Both Gc.compact and malloc_trim durations scale with how much heap/arena
+     memory has accumulated since the last compaction, so CAPPING THE PEAK via
+     a heap-size threshold makes each reclamation small + fast (sub-second),
+     trading one 30 s blackout per 120 s for several short pauses. This mirrors
+     Bitcoin Core's FlushStateToDisk, which flushes on a COIN-CACHE SIZE
+     threshold (nCoinCacheUsage vs -dbcache) rather than pure wall-clock — see
+     bitcoin-core/src/validation.cpp. We retain a 120 s TIME-FLOOR so idle
+     memory is still returned when allocation is slow and the threshold is
+     never reached, and a MIN-INTERVAL anti-thrash floor so a sustained
+     high-allocation burst cannot spin compactions back-to-back.
      Gc.compact (not Gc.major_slice) because only compact + malloc_trim return
      freed major-heap chunks and glibc-arena pages to the OS. *)
   let last_compact_time = ref 0.0 in
+  (* Time-floor fallback: compact at least this often even under the threshold,
+     so idle off-heap/arena memory is still returned (matches the prior 120 s
+     behavior). *)
   let compact_interval_s = 120.0 in
+  (* Heap-size cap: compact as soon as the live OCaml heap exceeds this many
+     bytes. ~3 GB keeps each Gc.compact + malloc_trim small (the freed amount,
+     not the 17.5 GB the 120 s window used to accumulate) so the RPC stall is
+     sub-second. Read via Gc.quick_stat().heap_words (cheap — no heap walk). *)
+  let compact_heap_threshold_bytes = 3.0 *. 1024.0 *. 1024.0 *. 1024.0 in
+  (* Anti-thrash floor: never compact more often than this even when over the
+     threshold, so a sustained allocation burst does not spin Gc.compact (each
+     is still stop-the-world) back-to-back and starve the event loop. *)
+  let compact_min_interval_s = 8.0 in
+  (* Fast-tick cadence for the dedicated GC timer. Must be <= the min-interval
+     floor so we can react to a threshold breach within roughly one floor
+     window (Gc.quick_stat is cheap, so this poll is near-free). *)
+  let gc_check_interval_s = 5.0 in
+  (* Shared compaction step used by both the threshold timer and the time-floor
+     in the status loop. [reason] tags the [gc] log line so soak logs show
+     whether the peak cap (threshold) or the idle floor (time-floor) fired. *)
+  let do_compaction reason =
+    last_compact_time := Unix.gettimeofday ();
+    let mb_of_words w = float_of_int w *. 8.0 /. 1_048_576.0 in
+    let st_before = Gc.quick_stat () in
+    Gc.compact ();
+    (* Gc.compact frees the OCaml-side proxies for the transient
+       validation/idle Bigarrays; malloc_trim(0) then returns that
+       now-unused glibc arena memory to the OS. Same binding the IBD
+       path uses at sync.ml:4922. (rocksdb_stubs.c wraps malloc_trim in
+       caml_release/acquire_runtime_system so other OS threads — incl. the
+       RPC thread — run during the trim; do not remove that.) *)
+    Rocksdb.malloc_trim ();
+    let st_after = Gc.quick_stat () in
+    let rss_mb =
+      try
+        let ic = open_in "/proc/self/statm" in
+        let line = input_line ic in
+        close_in ic;
+        (match String.split_on_char ' ' line with
+         | _ :: res :: _ ->
+           float_of_string res *. 4096.0 /. 1_048_576.0
+         | _ -> 0.0)
+      with _ -> 0.0
+    in
+    Logs.info (fun m ->
+      m "[gc] at-tip compaction (%s): heap=%d words (%.0fMB->%.0fMB) \
+         rss=%.0fMB"
+        reason
+        st_after.Gc.heap_words
+        (mb_of_words st_before.Gc.heap_words)
+        (mb_of_words st_after.Gc.heap_words)
+        rss_mb)
+  in
+  (* Dedicated heap-size-threshold timer. Wakes every [gc_check_interval_s] and
+     compacts when the OCaml heap is over [compact_heap_threshold_bytes],
+     subject to the [compact_min_interval_s] anti-thrash floor. This caps the
+     RSS sawtooth peak (was creeping 3.9G -> 13G -> 18.7G over a soak) so each
+     reclamation stays small + the RPC stall sub-second. FullySynced-gated so
+     it never runs during IBD (run_ibd owns reclamation then). The 120 s
+     time-floor fallback lives in the status loop below. *)
+  let gc_thread =
+    let rec gc_loop () =
+      if !shutdown then Lwt.return_unit
+      else begin
+        let* () = Lwt_unix.sleep gc_check_interval_s in
+        if not !shutdown then begin
+          (if chain.sync_state = Sync.FullySynced then begin
+             let now = Unix.gettimeofday () in
+             let heap_bytes =
+               float_of_int (Gc.quick_stat ()).Gc.heap_words *. 8.0 in
+             if heap_bytes >= compact_heap_threshold_bytes
+                && now -. !last_compact_time >= compact_min_interval_s
+             then do_compaction "threshold"
+           end);
+          gc_loop ()
+        end else
+          Lwt.return_unit
+      end
+    in
+    gc_loop ()
+  in
   let status_thread =
     let rec log_status () =
       if !shutdown then Lwt.return_unit
@@ -2125,43 +2219,17 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
           (let n = Mempool.expire_orphans mempool in
            if n > 0 then
              Logs.info (fun m -> m "Expired %d stale orphan(s) from pool" n));
-          (* At-tip memory reclamation (see [last_compact_time] above). The IBD
-             path's Gc.compact()+malloc_trim() cadence dies with run_ibd at tip;
-             this re-establishes it on a wall-clock cadence once FullySynced so
-             the off-heap/Domain-arena churn at tip is reclaimed and RSS stays
-             bounded. Time-gated, not block-gated. *)
+          (* At-tip memory reclamation TIME-FLOOR (see [last_compact_time] and
+             [do_compaction] above). The dedicated [gc_thread] caps the RSS peak
+             via the heap-size threshold; this status-loop branch is the slow
+             fallback that guarantees idle off-heap/Domain-arena memory is still
+             returned on a wall-clock cadence even when allocation is slow and
+             the threshold is never reached. Both share [last_compact_time], so
+             a threshold-driven compaction also resets this floor. *)
           (if chain.sync_state = Sync.FullySynced then begin
              let now = Unix.gettimeofday () in
-             if now -. !last_compact_time >= compact_interval_s then begin
-               last_compact_time := now;
-               let mb_of_words w = float_of_int w *. 8.0 /. 1_048_576.0 in
-               let st_before = Gc.quick_stat () in
-               Gc.compact ();
-               (* Gc.compact frees the OCaml-side proxies for the transient
-                  validation/idle Bigarrays; malloc_trim(0) then returns that
-                  now-unused glibc arena memory to the OS. Same binding the IBD
-                  path uses at sync.ml:4922. *)
-               Rocksdb.malloc_trim ();
-               let st_after = Gc.quick_stat () in
-               let rss_mb =
-                 try
-                   let ic = open_in "/proc/self/statm" in
-                   let line = input_line ic in
-                   close_in ic;
-                   (match String.split_on_char ' ' line with
-                    | _ :: res :: _ ->
-                      float_of_string res *. 4096.0 /. 1_048_576.0
-                    | _ -> 0.0)
-                 with _ -> 0.0
-               in
-               Logs.info (fun m ->
-                 m "[gc] at-tip compaction: heap=%d words (%.0fMB->%.0fMB) \
-                    rss=%.0fMB"
-                   st_after.Gc.heap_words
-                   (mb_of_words st_before.Gc.heap_words)
-                   (mb_of_words st_after.Gc.heap_words)
-                   rss_mb)
-             end
+             if now -. !last_compact_time >= compact_interval_s then
+               do_compaction "time-floor"
            end);
           log_status ()
         end else
@@ -2407,6 +2475,13 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       (fun exn ->
         Logs.warn (fun m ->
           m "status_thread exited: %s" (Printexc.to_string exn));
+        Lwt.return_unit));
+  Lwt.async (fun () ->
+    Lwt.catch
+      (fun () -> gc_thread)
+      (fun exn ->
+        Logs.warn (fun m ->
+          m "gc_thread exited: %s" (Printexc.to_string exn));
         Lwt.return_unit));
   Lwt.async (fun () ->
     Lwt.catch

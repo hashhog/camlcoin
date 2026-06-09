@@ -9,6 +9,7 @@
 #include <caml/fail.h>
 #include <caml/custom.h>
 #include <caml/callback.h>
+#include <caml/threads.h>
 #include <rocksdb/c.h>
 #include <string.h>
 #include <stdlib.h>
@@ -25,7 +26,14 @@
    relative to the surrounding compaction + validation. */
 CAMLprim value caml_rocksdb_malloc_trim(value v_unit) {
   CAMLparam1(v_unit);
+  /* malloc_trim can walk every glibc arena and be slow; release the OCaml
+     runtime lock around it (mirrors the pattern in zmq_stubs.c around the
+     blocking zmq_send) so SIGTERM handling and the RPC thread stay responsive
+     even if the trim takes a while. malloc_trim touches no OCaml values, so
+     releasing the runtime system around it is safe. */
+  caml_release_runtime_system();
   malloc_trim(0);
+  caml_acquire_runtime_system();
   CAMLreturn(Val_unit);
 }
 

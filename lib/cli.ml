@@ -2073,6 +2073,23 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
      rotation in peer_manager.ml fired against an apparent multi-hour
      stall, killing every connected peer and wedging IBD entirely. *)
   let last_block_height_observed = ref chain.blocks_synced in
+  (* At-tip memory reclamation cadence. The IBD path (sync.ml run_ibd) runs
+     Gc.compact()+Rocksdb.malloc_trim() every [compact_interval] blocks, but
+     run_ibd EXITS at tip (sets FullySynced and returns), so once FullySynced
+     the at-tip block path (process_new_block / connect_stored_blocks) has NO
+     reclamation and no time-based timer. The off-heap Cstruct/Bigarray +
+     Domain-arena churn (thousands of transient allocations per block + idle /
+     mempool churn) then creeps RSS unbounded until the cgroup cap OOM-kills the
+     node. We piggy-back a TIME-gated Gc.compact()+malloc_trim() onto this 30 s
+     status loop: fire only when FullySynced and at least [compact_interval_s]
+     of wall-clock have elapsed. Time cadence (not block count) because at-tip
+     blocks are ~10 min apart and the idle/mempool allocation churn between
+     blocks must also be reclaimed. Firing while the live heap is still small
+     (~6-7G, not 46G) keeps each Gc.compact ~1-2s and bounds RSS flat ~17G.
+     Gc.compact (not Gc.major_slice) because only compact + malloc_trim return
+     freed major-heap chunks and glibc-arena pages to the OS. *)
+  let last_compact_time = ref 0.0 in
+  let compact_interval_s = 120.0 in
   let status_thread =
     let rec log_status () =
       if !shutdown then Lwt.return_unit
@@ -2108,6 +2125,44 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
           (let n = Mempool.expire_orphans mempool in
            if n > 0 then
              Logs.info (fun m -> m "Expired %d stale orphan(s) from pool" n));
+          (* At-tip memory reclamation (see [last_compact_time] above). The IBD
+             path's Gc.compact()+malloc_trim() cadence dies with run_ibd at tip;
+             this re-establishes it on a wall-clock cadence once FullySynced so
+             the off-heap/Domain-arena churn at tip is reclaimed and RSS stays
+             bounded. Time-gated, not block-gated. *)
+          (if chain.sync_state = Sync.FullySynced then begin
+             let now = Unix.gettimeofday () in
+             if now -. !last_compact_time >= compact_interval_s then begin
+               last_compact_time := now;
+               let mb_of_words w = float_of_int w *. 8.0 /. 1_048_576.0 in
+               let st_before = Gc.quick_stat () in
+               Gc.compact ();
+               (* Gc.compact frees the OCaml-side proxies for the transient
+                  validation/idle Bigarrays; malloc_trim(0) then returns that
+                  now-unused glibc arena memory to the OS. Same binding the IBD
+                  path uses at sync.ml:4922. *)
+               Rocksdb.malloc_trim ();
+               let st_after = Gc.quick_stat () in
+               let rss_mb =
+                 try
+                   let ic = open_in "/proc/self/statm" in
+                   let line = input_line ic in
+                   close_in ic;
+                   (match String.split_on_char ' ' line with
+                    | _ :: res :: _ ->
+                      float_of_string res *. 4096.0 /. 1_048_576.0
+                    | _ -> 0.0)
+                 with _ -> 0.0
+               in
+               Logs.info (fun m ->
+                 m "[gc] at-tip compaction: heap=%d words (%.0fMB->%.0fMB) \
+                    rss=%.0fMB"
+                   st_after.Gc.heap_words
+                   (mb_of_words st_before.Gc.heap_words)
+                   (mb_of_words st_after.Gc.heap_words)
+                   rss_mb)
+             end
+           end);
           log_status ()
         end else
           Lwt.return_unit

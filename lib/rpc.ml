@@ -4496,7 +4496,10 @@ let psbt_script_pubkey_json (script : Cstruct.t) (network : Address.network) : Y
 let handle_gettxout (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
-  | [`String txid_hex; `Int vout] ->
+  (* Core gettxout takes (txid, n, [include_mempool=true]); accept the optional
+     3rd arg (camlcoin serves the confirmed UTXO set either way). *)
+  | [`String txid_hex; `Int vout]
+  | [`String txid_hex; `Int vout; `Bool _] ->
     let txid = parse_txid_param txid_hex in
     let utxo_set = Utxo.UtxoSet.create ctx.chain.db in
     (match Utxo.UtxoSet.get utxo_set txid vout with

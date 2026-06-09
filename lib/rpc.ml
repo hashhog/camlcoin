@@ -7177,6 +7177,68 @@ let handle_disconnectnode (ctx : rpc_context)
   | _ ->
     Error "Invalid parameters: expected [address] or [node_id]"
 
+(* getblockfrompeer - Attempt to fetch a block from a given peer.
+   Mirrors Bitcoin Core rpc/blockchain.cpp:getblockfrompeer + net_processing.cpp
+   PeerManagerImpl::FetchBlock. Args: (blockhash hex, peer_id int). Returns an
+   empty JSON object ({}) on success; the fetch is fire-and-forget.
+
+   Error parity (all RPC_MISC_ERROR = -1, mapped at the dispatch arm):
+     - "Block header missing"  — we don't have the header for this block.
+     - "Block already downloaded" — block data is already on disk (cheap
+       short-circuit; matches Core's BLOCK_HAVE_DATA gate).
+     - "Peer does not exist"   — peer_id doesn't resolve to a connected peer
+       (Core FetchBlock GetPeerRef == nullptr).
+
+   peer_id uses the SAME convention as getpeerinfo: getpeerinfo emits
+   [stat_id = peer.id] and [find_peer_by_id] matches on [peer.id], so the id an
+   operator sees in getpeerinfo is exactly the id accepted here.
+
+   On success we send a single getdata for [InvWitnessBlock | hash] to THAT
+   peer — InvWitnessBlock (0x40000002) is Core's MSG_BLOCK | MSG_WITNESS_FLAG,
+   the same inv type the IBD block-download path uses (sync.ml:2350). *)
+let handle_getblockfrompeer (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`String blockhash_hex; `Int peer_id] ->
+    (* Parse the display-format (reversed) block hash to internal LE order,
+       exactly as handle_getblockheader does. *)
+    (match (try Some (Types.hash256_of_hex blockhash_hex) with _ -> None) with
+     | None -> Error "Block header missing"
+     | Some hash_display ->
+       let hash = Cstruct.create 32 in
+       for i = 0 to 31 do
+         Cstruct.set_uint8 hash i (Cstruct.get_uint8 hash_display (31 - i))
+       done;
+       (* (1) The block's HEADER must already be known (Core: LookupBlockIndex
+          returns null -> RPC_MISC_ERROR "Block header missing"). *)
+       (match Sync.get_header ctx.chain hash with
+        | None -> Error "Block header missing"
+        | Some _entry ->
+          (* (3, cheap) already-have-data short-circuit (Core's BLOCK_HAVE_DATA
+             gate -> "Block already downloaded"). *)
+          (match Storage.ChainDB.get_block ctx.chain.db hash with
+           | Some _ -> Error "Block already downloaded"
+           | None ->
+             (* (2) Resolve peer_id to a connected peer (Core FetchBlock:
+                GetPeerRef == nullptr -> "Peer does not exist"). *)
+             (match Peer_manager.find_peer_by_id ctx.peer_manager peer_id with
+              | None -> Error "Peer does not exist"
+              | Some peer ->
+                (* (4) Fire-and-forget: send a block getdata to THAT peer and
+                   return {} immediately. InvWitnessBlock == MSG_BLOCK |
+                   MSG_WITNESS_FLAG. *)
+                let inv = P2p.{ inv_type = InvWitnessBlock; hash } in
+                Lwt.async (fun () ->
+                  Lwt.catch
+                    (fun () ->
+                       Peer.send_message peer (P2p.GetdataMsg [inv]))
+                    (fun _exn -> Lwt.return_unit));
+                Ok (`Assoc [])))))
+  | [`String _; _] ->
+    Error "Invalid parameters: peer_id must be an integer (see getpeerinfo)"
+  | _ ->
+    Error "Invalid parameters: expected [blockhash, peer_id]"
+
 (* addnode - Manually connect to or disconnect from a peer *)
 let handle_addnode (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
@@ -8650,6 +8712,7 @@ let handle_help (_ctx : rpc_context)
       "addpeeraddress \"address\" port ( tried )";
       "clearbanned";
       "disconnectnode \"address\"";
+      "getblockfrompeer \"blockhash\" peer_id";
       "getconnectioncount";
       "getnetworkinfo";
       "getnodeaddresses ( count \"network\" )";
@@ -10232,6 +10295,12 @@ let dispatch_rpc (ctx : rpc_context)
     Ok (handle_clearbanned ctx)
   | "disconnectnode" ->
     (match handle_disconnectnode ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_misc_error, msg))
+  | "getblockfrompeer" ->
+    (* Core getblockfrompeer throws RPC_MISC_ERROR (-1) for every failure
+       case (header missing / already downloaded / peer does not exist). *)
+    (match handle_getblockfrompeer ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
   | "addnode" ->

@@ -2670,6 +2670,143 @@ let test_decoderawtransaction_scriptpubkey_full_hex () =
   cleanup_test_db ()
 
 (* ============================================================================
+   getblockfrompeer Tests
+
+   Mirrors Bitcoin Core rpc/blockchain.cpp:getblockfrompeer +
+   net_processing.cpp PeerManagerImpl::FetchBlock.
+
+   (a) unknown header           -> RPC_MISC_ERROR "Block header missing"
+   (b) unknown/absent peer_id   -> RPC_MISC_ERROR "Peer does not exist"
+   (c) header known + peer known -> {} returned AND a getdata(InvWitnessBlock,
+       hash) is genuinely sent to the resolved peer (captured via a socketpair).
+   ============================================================================ *)
+
+(* Build a deterministic header and insert it into the in-memory header table
+   that handle_getblockfrompeer consults via Sync.get_header. Returns the
+   internal-order hash. *)
+let insert_test_header (ctx : Rpc.rpc_context) : Types.hash256 =
+  let header : Types.block_header = {
+    version = 0x20000000l;
+    prev_block = Types.hash256_of_hex
+      "0000000000000000000000000000000000000000000000000000000000000000";
+    merkle_root = Types.hash256_of_hex
+      "2222222222222222222222222222222222222222222222222222222222222222";
+    timestamp = 0x5a5a5a5al;
+    bits = 0x207fffffl;
+    nonce = 0xcafef00dl;
+  } in
+  let hash = Crypto.compute_block_hash header in
+  let entry : Sync.header_entry = {
+    header;
+    hash;
+    height = 1;
+    total_work = Types.hash256_of_hex
+      "0000000000000000000000000000000000000000000000000000000000000001";
+  } in
+  Hashtbl.replace ctx.Rpc.chain.Sync.headers (Cstruct.to_string hash) entry;
+  hash
+
+(* (a) Unknown header → "Block header missing", code RPC_MISC_ERROR (-1). *)
+let test_getblockfrompeer_unknown_header () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  (* A hash whose header we never inserted. Display-format hex. *)
+  let bogus_hash =
+    "00000000000000000000000000000000000000000000000000000000deadbeef" in
+  let result = Rpc.dispatch_rpc ctx "getblockfrompeer"
+    [`String bogus_hash; `Int 0] in
+  (match result with
+   | Error (code, msg) ->
+     Alcotest.(check int) "code is RPC_MISC_ERROR (-1)" (-1) code;
+     Alcotest.(check string) "Block header missing" "Block header missing" msg
+   | Ok _ -> Alcotest.fail "expected error for unknown header");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* (b) Header known but peer_id not connected → "Peer does not exist", -1. *)
+let test_getblockfrompeer_unknown_peer () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  let hash = insert_test_header ctx in
+  let hash_hex = Types.hash256_to_hex_display hash in
+  (* No peers added to the manager: peer 7 cannot resolve. *)
+  let result = Rpc.dispatch_rpc ctx "getblockfrompeer"
+    [`String hash_hex; `Int 7] in
+  (match result with
+   | Error (code, msg) ->
+     Alcotest.(check int) "code is RPC_MISC_ERROR (-1)" (-1) code;
+     Alcotest.(check string) "Peer does not exist" "Peer does not exist" msg
+   | Ok _ -> Alcotest.fail "expected error for unknown peer");
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* (c) Header known + peer connected → returns {} AND a getdata for the block
+   is sent to THAT peer. We build the peer on one end of a socketpair, dispatch,
+   then read the bytes from the other end and confirm it deserializes to a
+   GetdataMsg carrying [InvWitnessBlock; hash]. The peer-id we register
+   (id = 3) is exactly what getpeerinfo would surface (stat_id = peer.id). *)
+let test_getblockfrompeer_success_sends_getdata () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  let hash = insert_test_header ctx in
+  let hash_hex = Types.hash256_to_hex_display hash in
+  (* socketpair: [fd_peer] backs the peer's oc/ic; we read from [fd_remote]. *)
+  let (fd_peer_u, fd_remote_u) =
+    Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let fd_peer = Lwt_unix.of_unix_file_descr fd_peer_u in
+  let fd_remote = Lwt_unix.of_unix_file_descr fd_remote_u in
+  let peer_id = 3 in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:peer_id ~direction:Peer.Outbound ~fd:fd_peer () in
+  (* Sanity: getpeerinfo peer-id convention — stat_id == peer.id == 3. *)
+  let stats = Peer.get_stats peer in
+  Alcotest.(check int) "getpeerinfo stat_id matches peer.id"
+    peer_id stats.Peer.stat_id;
+  ctx.Rpc.peer_manager.Peer_manager.peers <-
+    peer :: ctx.Rpc.peer_manager.Peer_manager.peers;
+  Alcotest.(check bool) "find_peer_by_id resolves the registered id" true
+    (Peer_manager.find_peer_by_id ctx.Rpc.peer_manager peer_id <> None);
+
+  (* Dispatch and capture the wire bytes the handler sent to the peer. *)
+  let result = Rpc.dispatch_rpc ctx "getblockfrompeer"
+    [`String hash_hex; `Int peer_id] in
+  (* Success returns {} (empty JSON object). *)
+  (match result with
+   | Ok (`Assoc []) -> ()
+   | Ok other -> Alcotest.fail
+       (Printf.sprintf "expected {} got %s" (Yojson.Safe.to_string other))
+   | Error (_, msg) -> Alcotest.fail (Printf.sprintf "unexpected error: %s" msg));
+
+  (* The send is fire-and-forget via Lwt.async; drain the remote end. Read a
+     bounded chunk with a short timeout so the test can never hang. *)
+  let read_buf = Bytes.create 4096 in
+  let ric = Lwt_io.of_fd ~mode:Lwt_io.Input fd_remote in
+  let n =
+    Lwt_main.run
+      (Lwt.pick [
+         (let%lwt n = Lwt_io.read_into ric read_buf 0 4096 in Lwt.return n);
+         (let%lwt () = Lwt_unix.sleep 2.0 in Lwt.return 0);
+       ])
+  in
+  Alcotest.(check bool) "bytes were sent to the peer" true (n > 0);
+  let wire = Cstruct.of_bytes (Bytes.sub read_buf 0 n) in
+  (* Deserialize the P2P message off the wire and assert it's a getdata for the
+     block hash with the witness-block inv type (MSG_BLOCK | MSG_WITNESS_FLAG). *)
+  let msg = P2p.deserialize_message wire in
+  (match msg.P2p.payload with
+   | P2p.GetdataMsg [iv] ->
+     Alcotest.(check bool) "inv is InvWitnessBlock" true
+       (iv.P2p.inv_type = P2p.InvWitnessBlock);
+     Alcotest.(check bool) "getdata hash matches the requested block" true
+       (Cstruct.equal iv.P2p.hash hash)
+   | P2p.GetdataMsg ivs ->
+     Alcotest.fail (Printf.sprintf
+       "expected exactly one inv in getdata, got %d" (List.length ivs))
+   | _ -> Alcotest.fail "expected a getdata message on the wire");
+
+  (try Lwt_main.run (Lwt_io.close ric) with _ -> ());
+  (try Lwt_unix.close fd_peer |> Lwt_main.run with _ -> ());
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -2709,6 +2846,14 @@ let () =
       test_case "verbosity 2 → adds hex" `Quick test_getorphantxs_verbosity2_adds_hex;
       test_case "empty pool → empty array" `Quick test_getorphantxs_empty_pool;
       test_case "invalid verbosity → -8" `Quick test_getorphantxs_invalid_verbosity;
+    ];
+    "getblockfrompeer", [
+      test_case "unknown header → -1 Block header missing" `Quick
+        test_getblockfrompeer_unknown_header;
+      test_case "unknown peer → -1 Peer does not exist" `Quick
+        test_getblockfrompeer_unknown_peer;
+      test_case "success returns {} and sends block getdata to peer" `Quick
+        test_getblockfrompeer_success_sends_getdata;
     ];
     "batch", [
       test_case "multiple valid calls" `Quick test_batch_multiple_valid;

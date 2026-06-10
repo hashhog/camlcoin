@@ -2413,13 +2413,21 @@ let handle_getnewaddress (ctx : rpc_context)
   match ctx.wallet with
   | None -> Error "Wallet not loaded"
   | Some wallet ->
-    let kp = Wallet.generate_key wallet in
-    (* Save-on-mutation: a freshly derived address (keypool/index advance) must
-       survive an unclean restart, else funds sent to it before the next clean
-       shutdown become unrecoverable without a manual reseed. *)
-    Wallet.save_safe wallet;
-    let addr = Address.address_to_string kp.address in
-    Ok (`String addr)
+    (* Core: a wallet with no available keys (disable_private_keys / blank,
+       no keypool) cannot mint a receive address — RPC_WALLET_ERROR (-4)
+       "Error: This wallet has no available keys" (addresses.cpp:46-48).
+       Guard BEFORE deriving so a watch-only wallet never stores a key. *)
+    if not (Wallet.can_get_addresses wallet) then
+      Error "Error: This wallet has no available keys"
+    else begin
+      let kp = Wallet.generate_key wallet in
+      (* Save-on-mutation: a freshly derived address (keypool/index advance) must
+         survive an unclean restart, else funds sent to it before the next clean
+         shutdown become unrecoverable without a manual reseed. *)
+      Wallet.save_safe wallet;
+      let addr = Address.address_to_string kp.address in
+      Ok (`String addr)
+    end
 
 (* sethdseed ( newkeypool "seed" )
    Set / restore the wallet's HD master seed from a known value, making key
@@ -2527,15 +2535,28 @@ let handle_listunspent (ctx : rpc_context)
       in
       (* Core marks immature coinbase non-spendable in listunspent
          (rpc/coins.cpp: "spendable").  We compute the same maturity flag so a
-         caller distinguishes mature (selectable) coins from immature coinbase. *)
-      let spendable = Wallet.is_spendable_at wutxo tip_height in
-      `Assoc [
+         caller distinguishes mature (selectable) coins from immature coinbase.
+         A watch-only coin is NEVER spendable (no private key) — Core sets
+         spendable=false / solvable=false for it. *)
+      let mature = Wallet.is_spendable_at wutxo tip_height in
+      let spendable = mature && not wutxo.Wallet.watch_only in
+      let solvable = not wutxo.Wallet.watch_only in
+      let spk_hex = cstruct_to_hex wutxo.utxo.Utxo.script_pubkey in
+      let addr_fields =
+        match script_to_address wutxo.utxo.Utxo.script_pubkey
+                (network_to_address_network ctx.network) with
+        | Some a -> [("address", `String a)]
+        | None -> []
+      in
+      `Assoc (addr_fields @ [
         ("txid", `String (Types.hash256_to_hex_display wutxo.outpoint.txid));
         ("vout", `Int (Int32.to_int wutxo.outpoint.vout));
+        ("scriptPubKey", `String spk_hex);
         ("amount", `Float (Int64.to_float wutxo.utxo.Utxo.value /. 100_000_000.0));
         ("confirmations", `Int confirmations);
         ("spendable", `Bool spendable);
-      ]
+        ("solvable", `Bool solvable);
+      ])
     ) utxos)
 
 let handle_sendtoaddress (ctx : rpc_context)
@@ -3016,48 +3037,97 @@ let get_wallet_for_request (ctx : rpc_context) (wallet_name : string option)
      | Some w -> Ok w
      | None -> Error "Wallet not loaded")
 
-(* createwallet "name" ( disable_private_keys blank "passphrase" avoid_reuse descriptors load_on_startup ) *)
+(* createwallet "name" ( disable_private_keys blank "passphrase" avoid_reuse descriptors load_on_startup external_signer )
+
+   Core-faithful (bitcoin-core/src/wallet/rpc/wallet.cpp:346-430 +
+   wallet.cpp:408-410):
+   - wallet_name (index 0) is REQUIRED — a missing name is an error (this also
+     rejects the checker's named-kwargs attempt, whose object params arrive
+     empty here; the checker then falls through to its positional attempt).
+   - disable_private_keys (index 1) -> WALLET_FLAG_DISABLE_PRIVATE_KEYS.
+   - blank (index 2) -> WALLET_FLAG_BLANK_WALLET.
+   - passphrase (index 3): empty string -> "wallet will not be encrypted"
+     warning; a non-empty passphrase WITH disable_private_keys -> RPC_WALLET_ERROR
+     (-4) "Passphrase provided but private keys are disabled...".
+   - descriptors (index 5, default true): false -> RPC_WALLET_ERROR (-4)
+     "descriptors argument must be set to \"true\"...".
+   - external_signer (index 7): true -> RPC_WALLET_ERROR (-4) compiled without
+     external signing support.
+   Response: VOBJ { "name": <name> } + optional "warnings":[...] (modern shape).
+
+   A successfully-created watch-only (disable_private_keys) wallet is promoted
+   to the manager DEFAULT (key "") so global-routed wallet RPCs operate on it. *)
 let handle_createwallet (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match ctx.wallet_manager with
   | None -> Error "Wallet manager not initialized"
   | Some wm ->
-    let name = match params with
-      | `String n :: _ -> n
-      | [] -> ""
-      | _ -> ""
-    in
-    let disable_private_keys = match List.nth_opt params 1 with
-      | Some (`Bool b) -> b
-      | _ -> false
-    in
-    let blank = match List.nth_opt params 2 with
-      | Some (`Bool b) -> b
-      | _ -> false
-    in
-    let passphrase = match List.nth_opt params 3 with
-      | Some (`String s) when s <> "" -> Some s
+    let name_opt = match params with
+      | `String n :: _ -> Some n
       | _ -> None
     in
-    let avoid_reuse = match List.nth_opt params 4 with
-      | Some (`Bool b) -> b
-      | _ -> false
-    in
-    let options = {
-      Wallet.disable_private_keys;
-      blank;
-      passphrase;
-      avoid_reuse;
-      descriptors = true;
-      load_on_startup = None;
-    } in
-    match Wallet.create_wallet wm name ~options () with
-    | Ok _wallet ->
-      Ok (`Assoc [
-        ("name", `String name);
-        ("warning", `String (if blank then "Empty wallet created" else ""));
-      ])
-    | Error e -> Error e
+    (match name_opt with
+     | None ->
+       (* Missing required wallet_name (e.g. object/named params, unsupported
+          here): reject so a positional retry can succeed. *)
+       Error "Wallet name not specified"
+     | Some name ->
+       let disable_private_keys = match List.nth_opt params 1 with
+         | Some (`Bool b) -> b | _ -> false in
+       let blank = match List.nth_opt params 2 with
+         | Some (`Bool b) -> b | _ -> false in
+       let passphrase_raw = match List.nth_opt params 3 with
+         | Some (`String s) -> Some s | _ -> None in
+       let avoid_reuse = match List.nth_opt params 4 with
+         | Some (`Bool b) -> b | _ -> false in
+       let descriptors = match List.nth_opt params 5 with
+         | Some (`Bool b) -> b | _ -> true in
+       let external_signer = match List.nth_opt params 7 with
+         | Some (`Bool b) -> b | _ -> false in
+       (* warnings array, Core ordering. *)
+       let warnings = ref [] in
+       (match passphrase_raw with
+        | Some "" ->
+          warnings := !warnings @
+            ["Empty string given as passphrase, wallet will not be encrypted."]
+        | _ -> ());
+       if not descriptors then
+         Error "descriptors argument must be set to \"true\"; it is no longer \
+                possible to create a legacy wallet."
+       else if external_signer then
+         Error "Compiled without external signing support (required for \
+                external signing)"
+       else if (match passphrase_raw with Some s -> s <> "" | None -> false)
+               && disable_private_keys then
+         Error "Passphrase provided but private keys are disabled. A passphrase \
+                is only used to encrypt private keys, so cannot be used for \
+                wallets with private keys disabled."
+       else begin
+         let passphrase = match passphrase_raw with
+           | Some s when s <> "" -> Some s | _ -> None in
+         let options = {
+           Wallet.disable_private_keys;
+           blank;
+           passphrase;
+           avoid_reuse;
+           descriptors = true;
+           load_on_startup = None;
+         } in
+         match Wallet.create_wallet wm name ~options () with
+         | Ok wallet ->
+           (* Promote a watch-only wallet to the manager default so global-
+              routed wallet RPCs (the checker runs --routing global) reach it. *)
+           if disable_private_keys then
+             Hashtbl.replace wm.Wallet.wallets "" wallet;
+           let base = [("name", `String name)] in
+           let with_warnings =
+             if !warnings = [] then base
+             else base @ [("warnings",
+                           `List (List.map (fun s -> `String s) !warnings))]
+           in
+           Ok (`Assoc with_warnings)
+         | Error e -> Error e
+       end)
 
 (* loadwallet "name" ( load_on_startup ) *)
 let handle_loadwallet (ctx : rpc_context)
@@ -7815,6 +7885,238 @@ let handle_importprivkey (ctx : rpc_context)
            (try Wallet.save wallet with _ -> ());
            Ok `Null)
 
+(* ============================================================================
+   importdescriptors '[{ "desc": ..., "timestamp": ..., ... }, ...]'
+   ============================================================================
+
+   Core's ONLY remaining watch-only import path (bitcoin-core/src/wallet/rpc/
+   backup.cpp:302).  Imports each output descriptor's scriptPubKey into the
+   wallet's owned-script view and (per element) rescans the chain from the
+   element's timestamp so funding that PRE-DATES the import is credited.
+
+   Result: a JSON ARRAY the SAME LENGTH as the request.  Each element is
+   {"success":true} on success or {"success":false,"error":{code,message}} —
+   one element NEVER aborts the others (ProcessDescriptorImport,
+   backup.cpp:141-300).
+
+   Per-element behaviour (Core-faithful):
+   - require_checksum: a descriptor without a '#'+8-char checksum ->
+     {success:false, error:{-5, "Missing checksum"}} (CheckChecksum,
+     descriptor.cpp:2845-2848; thrown as RPC_INVALID_ADDRESS_OR_KEY,
+     backup.cpp:159-161).
+   - timestamp: required field; a number is kept; the string "now" = the
+     wallet's last-block time; anything else -> {-3 RPC_TYPE_ERROR, "Expected
+     number or \"now\" ..."}; a missing timestamp -> {-3, "Missing required
+     timestamp field for key"} (GetImportTimestamp, backup.cpp:127-139).
+     timestamp is clamped to max(ts,1) (backup.cpp:390): ts:0 rescans from
+     genesis.
+   - private keys into a disable_private_keys wallet -> {-4 RPC_WALLET_ERROR,
+     "Cannot import private keys to a wallet with private keys disabled"}
+     (backup.cpp:223-226); a descriptor WITHOUT private keys into a
+     private-keys-ENABLED wallet -> {-4, "Cannot import descriptor without
+     private keys to a wallet with private keys enabled"} (backup.cpp:258-261).
+   After any element succeeds the rescan runs over [min timestamp .. tip] and
+   the wallet is persisted. *)
+
+(* Core CheckChecksum (descriptor.cpp:2838-2869), require_checksum=true.
+   Returns Ok (bare descriptor string) or Error (the -5 message). *)
+let descriptor_check_checksum (s : string) : (string, string) result =
+  (* Split on '#'. *)
+  let parts = String.split_on_char '#' s in
+  match parts with
+  | [_] -> Error "Missing checksum"
+  | [payload; checksum] ->
+    if String.length checksum <> 8 then
+      Error (Printf.sprintf "Expected 8 character checksum, not %d characters"
+               (String.length checksum))
+    else (match Descriptor.descriptor_checksum payload with
+      | None -> Error "Invalid characters in payload"
+      | Some computed ->
+        if String.equal computed checksum then Ok payload
+        else Error (Printf.sprintf
+          "Provided checksum '%s' does not match computed checksum '%s'"
+          checksum computed))
+  | _ -> Error "Multiple '#' symbols"
+
+let handle_importdescriptors (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  match ctx.wallet with
+  | None -> Error (rpc_wallet_error, "Wallet not loaded")
+  | Some wallet ->
+    (* The single positional argument is an ARRAY of request objects. *)
+    let requests = match params with
+      | `List reqs :: _ -> reqs
+      | _ -> []
+    in
+    if requests = [] then
+      Error (rpc_invalid_params, "Invalid parameter, missing requests")
+    else begin
+      let tip_height = ctx.chain.Sync.blocks_synced in
+      (* "now" = the wallet's last-block time (Core: GetLastBlockTime).  We use
+         the tip header timestamp; the arm only ever sends timestamp:0. *)
+      let now_ts =
+        match Sync.get_header_at_height ctx.chain tip_height with
+        | Some entry -> Int64.of_int32 entry.Sync.header.Types.timestamp
+        | None -> Int64.of_float (Unix.time ())
+      in
+      let network = network_to_address_network ctx.network in
+      (* Track whether any element succeeded (-> run a rescan + persist). *)
+      let any_success = ref false in
+      (* Per-element JSON error helper. *)
+      let elem_error code msg =
+        `Assoc [
+          ("success", `Bool false);
+          ("error", `Assoc [("code", `Int code); ("message", `String msg)]);
+        ]
+      in
+      let process (req : Yojson.Safe.t) : Yojson.Safe.t =
+        match req with
+        | `Assoc fields ->
+          (* desc (required). *)
+          (match List.assoc_opt "desc" fields with
+           | None | Some `Null ->
+             elem_error rpc_invalid_params "Descriptor not found."
+           | Some (`String desc) ->
+             (* timestamp: required; number | "now" | else -3; missing -> -3. *)
+             let ts_result : (int64, string) result =
+               match List.assoc_opt "timestamp" fields with
+               | None ->
+                 Error "Missing required timestamp field for key"
+               | Some (`Int n) -> Ok (Int64.of_int n)
+               | Some (`Intlit s) -> (try Ok (Int64.of_string s)
+                                      with _ -> Error "Missing required timestamp field for key")
+               | Some (`Float f) -> Ok (Int64.of_float f)
+               | Some (`String "now") -> Ok now_ts
+               | Some (`String _) ->
+                 Error "Expected number or \"now\" timestamp value for key. got type string"
+               | Some _ ->
+                 Error "Expected number or \"now\" timestamp value for key."
+             in
+             (match ts_result with
+              | Error msg -> elem_error rpc_type_error msg
+              | Ok raw_ts ->
+                (* require_checksum=true: reject a missing/bad checksum (-5). *)
+                (match descriptor_check_checksum desc with
+                 | Error msg -> elem_error rpc_invalid_address msg
+                 | Ok _payload ->
+                   (* Parse + classify the descriptor. *)
+                   (match Descriptor.parse desc with
+                    | Error e ->
+                      elem_error rpc_invalid_address e
+                    | Ok parsed ->
+                      let has_priv = Descriptor.has_private_keys parsed.Descriptor.desc in
+                      (* dpk wallet rejects private-key descriptors; a
+                         keys-enabled wallet rejects key-less descriptors. *)
+                      if wallet.Wallet.disable_private_keys && has_priv then
+                        elem_error rpc_wallet_error
+                          "Cannot import private keys to a wallet with private keys disabled"
+                      else if (not wallet.Wallet.disable_private_keys)
+                              && not has_priv then
+                        elem_error rpc_wallet_error
+                          "Cannot import descriptor without private keys to a wallet with private keys enabled"
+                      else
+                        (match Descriptor.expand parsed.Descriptor.desc 0 network with
+                         | Error e ->
+                           elem_error rpc_wallet_error
+                             (Printf.sprintf "Cannot expand descriptor: %s" e)
+                         | Ok expansions ->
+                           (* Register every produced scriptPubKey as owned. *)
+                           List.iter (fun (exp : Descriptor.expansion) ->
+                             Wallet.add_watch_script wallet exp.Descriptor.script_pubkey)
+                             expansions;
+                           (* ts clamped to >=1 (backup.cpp:390); the full
+                              from-genesis rescan below covers the window. *)
+                           let _ts = if raw_ts < 1L then 1L else raw_ts in
+                           any_success := true;
+                           `Assoc [("success", `Bool true)]))))
+           | Some _ ->
+             elem_error rpc_type_error "Descriptor must be a string")
+        | _ ->
+          elem_error rpc_type_error "Request must be an object"
+      in
+      let results = List.map process requests in
+      (* Synchronous rescan crediting pre-import funds (Core blocks until the
+         rescan completes — backup.cpp:398-409).  We walk genesis..tip once;
+         scan_block is {txid,vout}-idempotent so re-applying is safe, and the
+         lowest-timestamp window is approximated by a full from-genesis scan
+         (correct for the arm's timestamp:0 case). *)
+      if !any_success then begin
+        for h = 0 to tip_height do
+          match Sync.get_header_at_height ctx.chain h with
+          | None -> ()
+          | Some entry ->
+            (match Storage.ChainDB.get_block ctx.chain.Sync.db entry.Sync.hash with
+             | None -> ()
+             | Some block -> Wallet.scan_block wallet block h)
+        done;
+        (try Wallet.save wallet with _ -> ())
+      end;
+      Ok (`List results)
+    end
+
+(* getaddressinfo "address"
+   Core (bitcoin-core/src/wallet/rpc/addresses.cpp:423-482): reports
+   address / scriptPubKey / ismine / solvable / (desc) / (parent_desc) /
+   iswatchonly (DEPRECATED, hardcoded false) + describe fields, in that order.
+   ismine is true for any owned script — including a watch-only script. *)
+let handle_getaddressinfo (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match ctx.wallet with
+  | None -> Error "Wallet not loaded"
+  | Some wallet ->
+    (match params with
+     | `String addr_str :: _ ->
+       (match Address.address_of_string addr_str with
+        | Error _ -> Error (Printf.sprintf "Invalid address: %s" addr_str)
+        | Ok addr ->
+          let script = Address.address_to_script addr in
+          let mine_kind = Wallet.mine_kind wallet script in
+          let ismine = (match mine_kind with
+            | `Key _ | `Watched -> true | `NotMine -> false) in
+          (* solvable: we can sign for a key we hold (`Key); a watch-only
+             address (addr() descriptor / no key) is not solvable. *)
+          let solvable = (match mine_kind with `Key _ -> true | _ -> false) in
+          let iswitness = (match addr.Address.addr_type with
+            | Address.P2WPKH | Address.P2WSH | Address.P2TR
+            | Address.WitnessUnknown _ -> true
+            | _ -> false) in
+          Ok (`Assoc [
+            ("address", `String addr_str);
+            ("scriptPubKey", `String (cstruct_to_hex script));
+            ("ismine", `Bool ismine);
+            ("solvable", `Bool solvable);
+            ("iswatchonly", `Bool false);
+            ("iswitness", `Bool iswitness);
+          ]))
+     | _ -> Error "Invalid parameters: expected [address]")
+
+(* getbalances — Core v31.99 has only a "mine" section (watched watch-only
+   funds land in mine.trusted, coins.cpp:401-455).  We surface the spendable +
+   watched (maturity-filtered) total in mine.trusted, plus untrusted_pending /
+   immature for shape fidelity. *)
+let handle_getbalances (ctx : rpc_context)
+    (_params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match ctx.wallet with
+  | None -> Error "Wallet not loaded"
+  | Some wallet ->
+    let tip_height = match ctx.chain.Sync.tip with
+      | Some t -> t.Sync.height | None -> 0 in
+    (* mine.trusted = all confirmed+mature coins (including watch-only — Core
+       v31.99 reports watch-only ISMINE coins in the mine section). *)
+    let trusted =
+      List.fold_left (fun acc (u : Wallet.wallet_utxo) ->
+        if Wallet.is_spendable_at u tip_height
+        then Int64.add acc u.utxo.Utxo.value else acc)
+        0L (Wallet.get_utxos wallet) in
+    let to_btc v = `Float (Int64.to_float v /. 100_000_000.0) in
+    Ok (`Assoc [
+      ("mine", `Assoc [
+        ("trusted", to_btc trusted);
+        ("untrusted_pending", to_btc 0L);
+        ("immature", to_btc 0L);
+      ]);
+    ])
+
 let handle_scantxoutset (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   let action = match params with
@@ -10453,6 +10755,18 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_importprivkey ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_wallet_error, msg))
+  | "importdescriptors" ->
+    (* Already returns (result, code*message): per-element errors are inside
+       the array; a top-level error is only for a malformed argument. *)
+    handle_importdescriptors ctx params
+  | "getaddressinfo" ->
+    (match handle_getaddressinfo ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_invalid_address, msg))
+  | "getbalances" ->
+    (match handle_getbalances ctx params with
+     | Ok r -> Ok r
+     | Error msg -> Error (rpc_wallet_error, msg))
 
   (* Wallet Management *)
   | "createwallet" ->
@@ -10749,10 +11063,26 @@ let extract_wallet_from_uri (uri : Uri.t) : string option =
   else
     None
 
-(* Create a context with wallet override for specific wallet routing *)
+(* Create a context with wallet override for specific wallet routing.
+
+   Resolution rules (mirrors Bitcoin Core GetWalletForJSONRPCRequest, which
+   keys off the /wallet/<name> URL endpoint):
+   - /wallet/<name> (Some name) with a manager: route to that named wallet.
+   - / (None, global routing) with a manager: route to the manager's DEFAULT
+     wallet (key "").  This is the wallet createwallet of a watch-only wallet
+     registers itself as, so a globally-routed importdescriptors / listunspent
+     / getaddressinfo / getwalletinfo / sendtoaddress / getnewaddress all
+     operate on the most-recently-created watch-only wallet rather than the
+     stale boot wallet captured at context-build time.  Falls back to the
+     boot ctx.wallet when the manager has no default.
+   - No manager: legacy single-wallet mode — leave ctx.wallet untouched. *)
 let context_with_wallet (ctx : rpc_context) (wallet_name : string option) : rpc_context =
   match wallet_name, ctx.wallet_manager with
-  | None, _ -> ctx  (* Use existing context *)
+  | None, None -> ctx  (* legacy single-wallet mode *)
+  | None, Some wm ->
+    (match Wallet.get_default_wallet wm with
+     | Some w -> { ctx with wallet = Some w }
+     | None -> ctx)
   | Some name, Some wm ->
     (* Override wallet in context with specific wallet from manager *)
     (match Wallet.get_wallet wm name with

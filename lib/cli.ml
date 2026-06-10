@@ -1052,6 +1052,21 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
        ()
    | None -> ());
 
+  (* Wire the live mempool block-connect eviction hook so the forward
+     block-connect choke-points in [Sync] ([process_new_block] /
+     [connect_stored_blocks]) prune the now-confirmed txs from the live
+     mempool, mirroring Bitcoin Core's removeForBlock from ConnectTip
+     (validation.cpp:3073-3074).  Unconditional (not gated on a wallet),
+     installed in the same lexical scope as the wallet hook where both
+     [chain] and [mempool] are bound.  The reorg connect path (sync.ml:4543)
+     and the mining/submitblock path (mining.ml:967) evict via their own
+     mempool refs and do NOT go through this hook, so there is no
+     double-eviction.  Without this wiring, a tx confirmed by a block that
+     arrived over P2P stayed stuck in the mempool forever (the live
+     26k-stuck-tx bug). *)
+  Sync.set_mempool_remove_hook chain
+    (Some (fun block height -> Mempool.remove_for_block mempool block height));
+
   (* Create RPC context. The [filter_index] field of [rpc_context]
      is the inner [Block_index.filter_index] sub-handle (used by
      [rest.ml]'s blockfilter handlers); we extract it from the bundle

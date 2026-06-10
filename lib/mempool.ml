@@ -3312,25 +3312,38 @@ let accept_transaction_with_replaced ?(dry_run=false)
     ?(skip_verify_scripts=false)
     (mp : mempool) (tx : Types.transaction)
     : (mempool_entry * Types.hash256 list, string) result =
-  (* First check if there are conflicts *)
-  let conflicts = find_all_conflicts mp tx in
-  match conflicts with
-  | [] ->
-    (* No conflicts, use normal add_transaction — empty replaced list *)
-    (match add_transaction ~dry_run ~skip_verify_scripts mp tx with
-     | Ok e -> Ok (e, [])
-     | Error s -> Error s)
-  | _ ->
-    (* Conflict(s) present: evaluate the full RBF rule set.  In dry_run mode
-       (testmempoolaccept) [replace_by_fee_with_replaced ~dry_run:true] runs
-       every gate (rules 1-4 + ImprovesFeerateDiagram + the standardness/limit
-       pre-check) against the live mempool but does NOT mutate state, so the
-       reject-reason it surfaces is exactly what a real submit would produce.
-       In non-dry-run mode it performs the eviction + insert.  This replaces the
-       old behaviour where dry_run returned a generic
-       "txn-mempool-conflict (dry run with conflicts)" that disagreed with the
-       real sendrawtransaction outcome for the same conflicting tx. *)
-    replace_by_fee_with_replaced ~dry_run ~skip_verify_scripts mp tx
+  let result =
+    (* First check if there are conflicts *)
+    let conflicts = find_all_conflicts mp tx in
+    match conflicts with
+    | [] ->
+      (* No conflicts, use normal add_transaction — empty replaced list *)
+      (match add_transaction ~dry_run ~skip_verify_scripts mp tx with
+       | Ok e -> Ok (e, [])
+       | Error s -> Error s)
+    | _ ->
+      (* Conflict(s) present: evaluate the full RBF rule set.  In dry_run mode
+         (testmempoolaccept) [replace_by_fee_with_replaced ~dry_run:true] runs
+         every gate (rules 1-4 + ImprovesFeerateDiagram + the standardness/limit
+         pre-check) against the live mempool but does NOT mutate state, so the
+         reject-reason it surfaces is exactly what a real submit would produce.
+         In non-dry-run mode it performs the eviction + insert.  This replaces the
+         old behaviour where dry_run returned a generic
+         "txn-mempool-conflict (dry run with conflicts)" that disagreed with the
+         real sendrawtransaction outcome for the same conflicting tx. *)
+      replace_by_fee_with_replaced ~dry_run ~skip_verify_scripts mp tx
+  in
+  (* Hot-path heap check (2026-06-09): this synchronous function is the single
+     choke point for RPC sendrawtransaction (rpc.ml handle_sendrawtransaction
+     runs it with ZERO Lwt yields — the detached gc_thread timer can never
+     preempt it) as well as the _lwt wrapper and the RBF path.  Mirrors
+     Bitcoin Core's AcceptToMemoryPool ending with
+     FlushStateToDisk(PERIODIC) (validation.cpp:1803) — the budget check
+     rides the work itself.  Once per tx accept, never per-input; O(1)
+     (Gc.quick_stat) when it does not fire; shares the threshold +
+     anti-thrash floor with every other trigger via Gc_guard. *)
+  Gc_guard.maybe_compact ~reason:"hot-path:sendraw";
+  result
 
 let accept_transaction ?(dry_run=false) ?(skip_verify_scripts=false)
     (mp : mempool) (tx : Types.transaction)
@@ -3454,6 +3467,13 @@ let accept_to_memory_pool ?(test_accept=false) (mp : mempool) (tx : Types.transa
       atmp_reject_reason = Some reason;
       atmp_replaced_txids = []; }
   in
+  (* Hot-path heap check (2026-06-09): covers the P2P TxMsg arm
+     (cli.ml's listener routes every relayed tx through here).  Core
+     analog: AcceptToMemoryPool ends with FlushStateToDisk(PERIODIC)
+     (validation.cpp:1803).  Once per tx, never per-input; the shared
+     Gc_guard anti-thrash floor makes the overlap with the inner
+     accept_transaction_with_replaced check free. *)
+  Gc_guard.maybe_compact ~reason:"hot-path:atmp";
   let%lwt () = Lwt.pause () in
   Lwt.return result
 
@@ -4520,6 +4540,11 @@ let accept_package_with_replaced (mp : mempool) (txs : Types.transaction list)
           | Ok () ->
             PackagePartial { accepted = accepted_list; rejected = rejected_list }
       in
+      (* Hot-path heap check (2026-06-09): once per <=25-tx package batch
+         (covers P2P pkgtxns via package_relay.ml and RPC submitpackage),
+         never per-tx/per-input.  Core analog: ProcessNewPackage ends with
+         FlushStateToDisk(PERIODIC) (validation.cpp:1835). *)
+      Gc_guard.maybe_compact ~reason:"hot-path:package";
       (pkg_result, evicted_list)
       )  (* end is_child_with_parents_tree match *)
 

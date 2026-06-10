@@ -4912,28 +4912,23 @@ let run_ibd ?(shutdown_flag : bool ref option)
         if ibd.chain.blocks_synced - !last_compact_height >= compact_interval
         then begin
           last_compact_height := ibd.chain.blocks_synced;
-          Gc.compact ();
           (* Gc.compact frees the OCaml-side proxies for the millions of
              transient validation Bigarrays; malloc_trim(0) then returns that
              now-unused glibc arena memory to the OS. Without this active trim,
              glibc retains it (passive MALLOC_TRIM_THRESHOLD_ is not aggressive
              enough), leaving a ~6MB/block off-heap RSS creep that would still
-             reach the cgroup cap before tip. *)
-          Rocksdb.malloc_trim ();
-          let mb_of_words w = float_of_int w *. 8.0 /. 1_048_576.0 in
+             reach the cgroup cap before tip.
+             2026-06-09: routed through [Gc_guard.compact_now] (same
+             Gc.compact + Rocksdb.malloc_trim pair) so this cadence stamps
+             the SHARED [Gc_guard.last_compact_time] — the hot-path checks'
+             anti-thrash floor then prevents an IBD-cadence compact and a
+             hot-path compact from firing back-to-back. *)
+          Gc_guard.compact_now ~reason:"ibd-cadence";
           let st = Gc.quick_stat () in
-          let rss_mb =
-            try
-              let ic = open_in "/proc/self/statm" in
-              let line = input_line ic in
-              close_in ic;
-              (match String.split_on_char ' ' line with
-               | _ :: res :: _ -> float_of_string res *. 4096.0 /. 1_048_576.0
-               | _ -> 0.0)
-            with _ -> 0.0 in
           Logs.info (fun m ->
             m "compacted heap at height %d: rss=%.0fMB ocaml_heap=%.0fMB"
-              ibd.chain.blocks_synced rss_mb (mb_of_words st.Gc.heap_words))
+              ibd.chain.blocks_synced (Gc_guard.rss_mb ())
+              (Gc_guard.mb_of_words st.Gc.heap_words))
         end
       end else begin
         let now = Unix.gettimeofday () in
@@ -5333,6 +5328,16 @@ let rec connect_stored_blocks (state : chain_state) : int =
           Logs.info (fun m ->
             m "Connected stored block %s at height %d (catch-up from gap-fill)"
               (Types.hash256_to_hex_display entry.hash) next_height);
+          (* Hot-path heap check (2026-06-09): THE critical site.  This
+             recursion is a fully-synchronous multi-block drain on the Lwt
+             main thread — no Lwt timer (incl. cli.ml's gc_thread) can EVER
+             interrupt it, and during catch-up/reindex sync_state is not
+             FullySynced so the timer is gated off anyway (the 111 G re-IBD
+             pathology).  Checking once per connected block mirrors Core's
+             ConnectTip -> FlushStateToDisk(IF_NEEDED)
+             (validation.cpp:3063).  Bounded by Gc_guard's shared
+             anti-thrash floor. *)
+          Gc_guard.maybe_compact ~reason:"hot-path:drain";
           1 + connect_stored_blocks state
         | Validation.AB_err e ->
           let msg = Validation.block_error_to_string e in
@@ -5564,6 +5569,13 @@ let process_new_block ?(f_requested = false)
             Logs.info (fun m ->
               m "Connected %d additional stored blocks, tip now at %d"
                 connected state.blocks_synced);
+          (* Hot-path heap check (2026-06-09): once per block connected via
+             the at-tip P2P BlockMsg path (and after any gap-fill drain
+             above).  Mirrors Core's ConnectTip ->
+             FlushStateToDisk(IF_NEEDED) (validation.cpp:3063) — the budget
+             check rides the block-connect work itself instead of a
+             starvable detached timer. *)
+          Gc_guard.maybe_compact ~reason:"hot-path:block";
           Lwt.return (Ok ())
         | Error e ->
           let msg = Validation.block_error_to_string e in

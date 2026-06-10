@@ -2274,7 +2274,8 @@ let make_wallet_utxo (w : Wallet.t) ~txid ~vout ~value : Wallet.wallet_utxo =
   { Wallet.outpoint = { Types.txid; vout };
     utxo = { Utxo.value; script_pubkey; height = 1; is_coinbase = false };
     key_index = 0;
-    confirmed = true; }
+    confirmed = true;
+    watch_only = false; }
 
 (* Stand up a wallet-backed RPC context with two known wallet UTXOs that
    coin selection can pick from.  Returns the context, the chain DB handle

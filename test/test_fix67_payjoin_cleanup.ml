@@ -175,7 +175,8 @@ let _wallet_utxo_of (script : Cstruct.t) (value : int64)
     utxo = { Utxo.value; script_pubkey = script;
              height = 100; is_coinbase = false };
     key_index = 0;
-    confirmed = true; }
+    confirmed = true;
+    watch_only = false; }
 
 let test_g20_prefer_matching_script_type () =
   let pkh = Cstruct.create 20 in

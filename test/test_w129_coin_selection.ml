@@ -100,7 +100,7 @@ let make_utxo ?(confirmed = true) (idx : int) (value : int64) : Wallet.wallet_ut
     { value; script_pubkey = Cstruct.create 22;
       height = 100; is_coinbase = false }
   in
-  { Wallet.outpoint; utxo; key_index = 0; confirmed }
+  { Wallet.outpoint; utxo; key_index = 0; confirmed; watch_only = false }
 
 let make_utxos (n : int) (value : int64) : Wallet.wallet_utxo list =
   List.init n (fun i -> make_utxo i value)

@@ -1062,9 +1062,61 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     Option.map (fun (idx : Block_index.bip157_index) -> idx.filter_idx)
       bip157_index
   in
+  (* Multi-wallet manager.  The boot wallet.json wallet is registered as the
+     DEFAULT wallet (key ""), so global-routed wallet RPCs resolve to it.
+     createwallet of a watch-only (disable_private_keys) wallet then registers
+     the new wallet AND promotes it to the default, so subsequent global-routed
+     importdescriptors / listunspent / getaddressinfo / sendtoaddress /
+     getnewaddress operate on the watch-only wallet (see
+     Rpc.context_with_wallet + handle_createwallet).  When the wallet is
+     disabled entirely (no boot wallet), no manager is created and the node
+     stays in legacy single-wallet mode (manager = None). *)
+  let wallet_manager =
+    match wallet with
+    | None -> None
+    | Some w ->
+      let wallets_dir = Filename.concat config.data_dir "wallets" in
+      let wm =
+        Wallet.create_wallet_manager ~wallets_dir ~network:config.network
+      in
+      Hashtbl.replace wm.Wallet.wallets "" w;
+      (* Restart-safety: re-load every named wallet persisted under
+         <datadir>/wallets/ so watch-only (disable_private_keys) wallets created
+         in a prior run — and the funding their import-rescan credited — survive
+         a restart.  A re-loaded disable_private_keys wallet is re-promoted to
+         the manager DEFAULT (key "") so global-routed wallet RPCs keep
+         resolving to it (matching the in-session createwallet promotion).
+         Without this the watch-only UTXOs would be unreachable after restart
+         even though they round-trip in the on-disk wallet JSON. *)
+      (try
+        if Sys.file_exists wallets_dir && Sys.is_directory wallets_dir then
+          Array.iter (fun name ->
+            if name <> "" && name <> "wallet.dat"
+               && not (Hashtbl.mem wm.Wallet.wallets name) then
+              match Wallet.load_wallet wm name with
+              | Ok lw ->
+                if lw.Wallet.disable_private_keys then
+                  Hashtbl.replace wm.Wallet.wallets "" lw
+              | Error _ -> ())
+            (Sys.readdir wallets_dir)
+      with _ -> ());
+      Some wm
+  in
+  (* If a watch-only wallet was re-promoted to default above, [wallet] (the
+     ctx.wallet used by create_context) should track it so global-routed RPCs
+     agree with the manager default.  Keep the original boot wallet ref so
+     shutdown can still flush it even if it was displaced. *)
+  let boot_wallet = wallet in
+  let wallet =
+    match wallet_manager with
+    | Some wm -> (match Wallet.get_default_wallet wm with
+                  | Some w -> Some w | None -> wallet)
+    | None -> wallet
+  in
   let rpc_ctx = Rpc.create_context
     ~chain ~mempool ~peer_manager
     ~wallet ~fee_estimator ~network
+    ~wallet_manager
     ~filter_index:filter_index_for_rpc
     ~utxo:(Some optimized_utxo)
     ~data_dir:(Some config.data_dir) () in
@@ -2204,11 +2256,20 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
             m "Peer_manager.stop raised: %s" (Printexc.to_string exn));
           Lwt.return_unit)
     in
-    (* Phase 2: save wallet state. *)
+    (* Phase 2: save wallet state.  With a manager, flush EVERY loaded wallet
+       (boot wallet under "" + any watch-only wallets) so none is lost; else
+       fall back to the single-wallet save. *)
     (try
-      (match wallet with
-       | Some w -> Wallet.save w
-       | None -> ())
+      (match wallet_manager with
+       | Some wm ->
+         Hashtbl.iter (fun _name w -> Wallet.flush w) wm.Wallet.wallets;
+         (* Also flush the boot wallet ref in case it was displaced from the
+            manager default by a watch-only promotion (keeps it durable). *)
+         (match boot_wallet with Some w -> Wallet.flush w | None -> ())
+       | None ->
+         (match wallet with
+          | Some w -> Wallet.save w
+          | None -> ()))
     with exn ->
       Logs.warn (fun m ->
         m "Failed to save wallet: %s" (Printexc.to_string exn)));

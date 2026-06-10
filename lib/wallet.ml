@@ -380,6 +380,13 @@ type wallet_utxo = {
   utxo : Utxo.utxo_entry;
   key_index : int;
   confirmed : bool;
+  (* Watch-only coins are credited by a watch-only descriptor import (no
+     private key in the wallet).  They are observable (listunspent / balance)
+     but NOT spendable — coin selection excludes them so sendtoaddress on a
+     watch-only wallet errors with Insufficient funds, mirroring Core where a
+     WALLET_FLAG_DISABLE_PRIVATE_KEYS wallet cannot sign.  Defaults to false
+     for the ordinary (key-owned) credit path. *)
+  watch_only : bool;
 }
 
 (* Transaction history entry.
@@ -452,6 +459,19 @@ type t = {
   mutable encryption : encryption_state;
   (* lockunspent: outpoint -> persistent flag (true = written to disk) *)
   locked_coins : (string * int32, bool) Hashtbl.t;
+  (* Watch-only owned-script set.  scriptPubKeys imported via a watch-only
+     descriptor (importdescriptors against a private-keys-disabled wallet):
+     the wallet OWNS these scripts (is_mine_or_watched is true, so scan_block
+     credits their coins) but holds NO private key for them, so they are not
+     spendable.  Persisted in [wallet_to_json] / [load_wallet_json] so a
+     restart re-credits funding and getaddressinfo keeps reporting ismine. *)
+  mutable watch_scripts : Cstruct.t list;
+  (* WALLET_FLAG_DISABLE_PRIVATE_KEYS: a watch-only wallet cannot mint keys.
+     Drives getwalletinfo.private_keys_enabled and the getnewaddress guard. *)
+  mutable disable_private_keys : bool;
+  (* WALLET_FLAG_BLANK_WALLET: no HD seed / keypool created at construction.
+     Recorded for getwalletinfo / round-trip fidelity. *)
+  mutable blank : bool;
   (* Highest block height whose body has been folded into the wallet ledger
      (the [scan_block] credit/debit pass). Persisted so a restart knows the
      gap [last_synced_height+1 .. tip] still to reconcile against the chain.
@@ -493,6 +513,9 @@ let create ~(network : [`Mainnet | `Testnet | `Regtest])
       encrypted_keys = Hashtbl.create 16;
     };
     locked_coins = Hashtbl.create 16;
+    watch_scripts = [];
+    disable_private_keys = false;
+    blank = false;
     last_synced_height = -1;
   }
 
@@ -686,6 +709,51 @@ let is_mine (w : t) (script_pubkey : Cstruct.t)
     ) w.keys
   | _ -> None
 
+(* Best-effort scriptPubKey -> address string (for watch-only credit-history
+   rows / getaddressinfo).  Returns None for non-address scripts. *)
+let script_to_address_string (w : t) (script_pubkey : Cstruct.t) : string option =
+  match Script.classify_script script_pubkey with
+  | Script.P2PKH_script hash ->
+    Some (Address.address_to_string { addr_type = Address.P2PKH; hash; network = w.network })
+  | Script.P2SH_script hash ->
+    Some (Address.address_to_string { addr_type = Address.P2SH; hash; network = w.network })
+  | Script.P2WPKH_script hash ->
+    Some (Address.address_to_string { addr_type = Address.P2WPKH; hash; network = w.network })
+  | Script.P2WSH_script hash ->
+    Some (Address.address_to_string { addr_type = Address.P2WSH; hash; network = w.network })
+  | Script.P2TR_script hash ->
+    Some (Address.address_to_string { addr_type = Address.P2TR; hash; network = w.network })
+  | _ -> None
+
+(* Is a scriptPubKey in the watch-only owned-script set? *)
+let is_watched (w : t) (script_pubkey : Cstruct.t) : bool =
+  List.exists (fun s -> Cstruct.equal s script_pubkey) w.watch_scripts
+
+(* Register a scriptPubKey as watch-only owned (idempotent). *)
+let add_watch_script (w : t) (script_pubkey : Cstruct.t) : unit =
+  if not (is_watched w script_pubkey) then
+    w.watch_scripts <- w.watch_scripts @ [script_pubkey]
+
+(* Does this script belong to the wallet, either as a key we hold or a
+   watch-only script we imported?  This is the ownership chokepoint the
+   credit paths (scan_block / coinbase) consult.  Returns the owning keypair
+   when we hold the key (so signing / history can name the address), or
+   [`Watched] when it is a watch-only script (no key), or [`NotMine]. *)
+let mine_kind (w : t) (script_pubkey : Cstruct.t) : [`Key of key_pair | `Watched | `NotMine] =
+  match is_mine w script_pubkey with
+  | Some kp -> `Key kp
+  | None -> if is_watched w script_pubkey then `Watched else `NotMine
+
+(* Can this wallet mint a fresh receive/change address?  Mirrors Core's
+   CWallet::CanGetAddresses: a private-keys-disabled wallet (watch-only) has no
+   active SPKMan that can hand out keys, and a blank wallet with no HD seed and
+   no keys cannot derive one either.  getnewaddress / getrawchangeaddress must
+   return RPC_WALLET_ERROR "Error: This wallet has no available keys" when this
+   is false instead of minting a key. *)
+let can_get_addresses (w : t) : bool =
+  if w.disable_private_keys then false
+  else (Option.is_some w.master_key) || (w.keys <> [])
+
 (* Find keypair by address string *)
 let find_by_address (w : t) (addr_str : string) : key_pair option =
   List.find_opt (fun kp ->
@@ -761,13 +829,28 @@ let scan_block (w : t) (block : Types.block) (height : int) : unit =
 
     (* Check outputs for our addresses *)
     List.iteri (fun vout out ->
-      match is_mine w out.Types.script_pubkey with
-      | Some kp ->
-        (* Find key index *)
+      match mine_kind w out.Types.script_pubkey with
+      | (`Key _ | `Watched) as owner ->
+        (* A coin is watch-only when the matching ownership is a watch-only
+           script rather than a held key — it is observed but not spendable. *)
+        let watch_only = (owner = `Watched) in
+        (* Find key index (sentinel -1 for watch-only: there is no key). *)
         let key_index =
-          match list_find_index (fun k -> k == kp) w.keys with
-          | Some idx -> idx
-          | None -> 0
+          match owner with
+          | `Key kp ->
+            (match list_find_index (fun k -> k == kp) w.keys with
+             | Some idx -> idx
+             | None -> 0)
+          | `Watched -> -1
+        in
+        (* Address string for the credit history row. *)
+        let owner_addr =
+          match owner with
+          | `Key kp -> Address.address_to_string kp.address
+          | `Watched ->
+            (match script_to_address_string w out.Types.script_pubkey with
+             | Some a -> a
+             | None -> "")
         in
         (* Check if this is a coinbase transaction *)
         let is_coinbase =
@@ -817,6 +900,7 @@ let scan_block (w : t) (block : Types.block) (height : int) : unit =
           };
           key_index;
           confirmed = true;
+          watch_only;
         } in
         w.utxos <- wutxo :: w.utxos;
         w.balance_confirmed <- Int64.add w.balance_confirmed out.Types.value);
@@ -841,7 +925,7 @@ let scan_block (w : t) (block : Types.block) (height : int) : unit =
             hist_category = (if is_coinbase then `Generate else `Receive);
             hist_amount = out.Types.value;
             hist_fee = 0L;
-            hist_address = Address.address_to_string kp.address;
+            hist_address = owner_addr;
             hist_vout = vout;
             hist_is_coinbase = is_coinbase;
             hist_confirmations = 1;
@@ -851,7 +935,7 @@ let scan_block (w : t) (block : Types.block) (height : int) : unit =
           } in
           w.tx_history <- hist_entry :: w.tx_history
         end
-      | None -> ()
+      | `NotMine -> ()
     ) tx.Types.outputs;
 
     (* If this tx is one the wallet itself sent, its unconfirmed [`Send] history
@@ -935,8 +1019,8 @@ let unscan_block (w : t) (block : Types.block) (_height : int) : unit =
   List.iter (fun tx ->
     let txid = Crypto.compute_txid tx in
     List.iteri (fun vout out ->
-      match is_mine w out.Types.script_pubkey with
-      | Some _ ->
+      match mine_kind w out.Types.script_pubkey with
+      | `Key _ | `Watched ->
         let vout32 = Int32.of_int vout in
         let removed =
           List.find_opt (fun u ->
@@ -955,7 +1039,7 @@ let unscan_block (w : t) (block : Types.block) (_height : int) : unit =
              w.balance_unconfirmed <-
                Int64.sub w.balance_unconfirmed u.utxo.Utxo.value
          | None -> ())
-      | None -> ()
+      | `NotMine -> ()
     ) tx.Types.outputs
   ) block.transactions
 
@@ -983,6 +1067,7 @@ let scan_transaction (w : t) (tx : Types.transaction) : unit =
         };
         key_index;
         confirmed = false;
+        watch_only = false;
       } in
       w.utxos <- wutxo :: w.utxos;
       w.balance_unconfirmed <- Int64.add w.balance_unconfirmed out.Types.value
@@ -1167,10 +1252,15 @@ let select_coins_bnb (utxos : wallet_utxo list) (target : int64)
 (* Select coins to meet target amount, trying BnB first then greedy fallback *)
 let select_coins (w : t) (target : int64) (fee_rate : float)
     ?tip_height () : (coin_selection, string) result =
+  (* Watch-only coins are observed but unspendable (we hold no private key) —
+     exclude them from coin selection so sendtoaddress on a watch-only wallet
+     errors with Insufficient funds, mirroring Core where a
+     WALLET_FLAG_DISABLE_PRIVATE_KEYS wallet cannot sign. *)
+  let spendable_set = List.filter (fun u -> not u.watch_only) w.utxos in
   (* Sort by value descending *)
   let available = List.sort (fun a b ->
     Int64.compare b.utxo.Utxo.value a.utxo.Utxo.value
-  ) w.utxos in
+  ) spendable_set in
 
   (* Only confirmed coins are spendable; when the chain tip height is known,
      also exclude immature coinbase (Core's premature_spend_of_coinbase rule).
@@ -2292,6 +2382,7 @@ let bump_fee (w : t) ~(txid : Types.hash256) ~(new_fee_rate : float)
               };
               key_index = 0;
               confirmed = true;
+              watch_only = false;
             }
           | _ ->
             List.find_opt (fun wutxo ->
@@ -2726,6 +2817,7 @@ let wallet_to_json (w : t) : Yojson.Safe.t =
       ("is_coinbase", `Bool wutxo.utxo.Utxo.is_coinbase);
       ("key_index", `Int wutxo.key_index);
       ("confirmed", `Bool wutxo.confirmed);
+      ("watch_only", `Bool wutxo.watch_only);
     ]
   ) w.utxos in
 
@@ -2765,6 +2857,13 @@ let wallet_to_json (w : t) : Yojson.Safe.t =
     ("bip86_change_index", `Int w.bip86_change_index);
     ("tx_history", `List history_json);
     ("last_synced_height", `Int w.last_synced_height);
+    (* Watch-only owned-script set (hex scriptPubKeys), persisted so a restart
+       re-credits funding through the genesis reconcile and getaddressinfo
+       keeps reporting ismine for imported watch-only addresses. *)
+    ("watch_scripts",
+     `List (List.map (fun s -> `String (cstruct_to_hex s)) w.watch_scripts));
+    ("disable_private_keys", `Bool w.disable_private_keys);
+    ("blank", `Bool w.blank);
   ]
 
 (* Save wallet to file (unencrypted).  Atomic + durable: writes to a temp file,
@@ -2875,11 +2974,18 @@ let load_wallet_json (w : t) (network : [`Mainnet | `Testnet | `Regtest]) (json 
              | Some (`Bool b) -> b
              | _ -> true
            in
+           (* watch_only absent in pre-fix wallet files -> false (the coin was
+              key-owned, the only kind that existed before watch-only). *)
+           let watch_only = match List.assoc_opt "watch_only" uf with
+             | Some (`Bool b) -> b
+             | _ -> false
+           in
            let wutxo = {
              outpoint = { txid; vout };
              utxo = { Utxo.value; script_pubkey; height; is_coinbase };
              key_index;
              confirmed;
+             watch_only;
            } in
            w.utxos <- w.utxos @ [wutxo]
          | _ -> ()
@@ -2906,6 +3012,20 @@ let load_wallet_json (w : t) (network : [`Mainnet | `Testnet | `Regtest]) (json 
        rebuilding the ledger exactly as a from-scratch rescan would. *)
     (match List.assoc_opt "last_synced_height" fields with
      | Some (`Int n) -> w.last_synced_height <- n | _ -> ());
+
+    (* Watch-only owned-script set (restart-safety: without this the imported
+       watch addresses would lose ismine and post-shutdown blocks would stop
+       crediting).  Absent in pre-fix wallet files -> empty set. *)
+    (match List.assoc_opt "watch_scripts" fields with
+     | Some (`List entries) ->
+       w.watch_scripts <- List.filter_map (function
+         | `String h -> (try Some (hex_to_cstruct h) with _ -> None)
+         | _ -> None) entries
+     | _ -> ());
+    (match List.assoc_opt "disable_private_keys" fields with
+     | Some (`Bool b) -> w.disable_private_keys <- b | _ -> ());
+    (match List.assoc_opt "blank" fields with
+     | Some (`Bool b) -> w.blank <- b | _ -> ());
 
     (* Load transaction history *)
     (match List.assoc_opt "tx_history" fields with
@@ -3534,7 +3654,11 @@ let create_wallet (wm : wallet_manager) (name : string) ?(options = default_wall
     Error (Printf.sprintf "Wallet \"%s\" already exists" name)
   else begin
     let wallet = create ~network:wm.network ~db_path:path in
-    (* Initialize with HD seed unless blank *)
+    (* Record the wallet flags so private_keys_enabled / can_get_addresses /
+       importdescriptors-privkey-rejection behave per WALLET_FLAG_*. *)
+    wallet.disable_private_keys <- options.disable_private_keys;
+    wallet.blank <- options.blank;
+    (* Initialize with HD seed unless blank or private keys disabled *)
     if not options.blank && not options.disable_private_keys then begin
       let mnemonic = Bip39.generate_mnemonic ~strength:128 () in
       init_from_mnemonic wallet mnemonic ()
@@ -3591,9 +3715,12 @@ let get_wallet_info (name : string) (w : t) : wallet_info =
     balance = Int64.to_float confirmed /. 100_000_000.0;
     unconfirmed_balance = Int64.to_float unconfirmed /. 100_000_000.0;
     immature_balance = 0.0;  (* TODO: track immature coinbase *)
-    (* Private keys enabled if wallet has master key or any non-empty private keys *)
-    private_keys_enabled = (Option.is_some w.master_key) ||
-      (w.keys <> [] && not (List.for_all (fun kp -> Cstruct.length kp.private_key = 0) w.keys));
+    (* WALLET_FLAG_DISABLE_PRIVATE_KEYS forces private_keys_enabled=false
+       regardless of any (watch-only) keys/scripts.  Otherwise: enabled if the
+       wallet has a master key or any non-empty private key. *)
+    private_keys_enabled = (not w.disable_private_keys) &&
+      ((Option.is_some w.master_key) ||
+      (w.keys <> [] && not (List.for_all (fun kp -> Cstruct.length kp.private_key = 0) w.keys)));
     avoid_reuse = false;
     scanning = false;
     descriptors = true;

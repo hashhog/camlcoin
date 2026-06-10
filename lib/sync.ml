@@ -255,6 +255,24 @@ type chain_state = {
      disconnected (reorg), mirroring [CWallet::blockDisconnected].  Removes the
      wallet credits the disconnected block created so a reorg cannot leave the
      ledger over-counting coins that no longer exist on the active chain. *)
+  mutable mempool_remove_hook : (Types.block -> int -> unit) option;
+  (* Mempool block-connect eviction notification, mirroring Bitcoin Core's
+     [CTxMemPool::removeForBlock] called from [Chainstate::ConnectTip]
+     (validation.cpp:3073-3074) after [FlushStateToDisk] and before
+     [SetTip].  Installed by [cli.ml] right after the wallet-hook wiring,
+     unconditionally (not gated on a wallet), and invoked by every forward
+     block-connect choke-point reachable from [process_new_block] /
+     [connect_stored_blocks] *after* the validated tip has advanced.  The
+     callback drops the now-confirmed txs (and their in-mempool descendants
+     and conflicts) from the live mempool (see [Mempool.remove_for_block]).
+     A generic [Types.block -> int -> unit] callback is used (rather than a
+     direct [Mempool.t] reference) so the [Sync] module stays independent of
+     [Mempool] and there is no module cycle — the same pattern as
+     [wallet_scan_hook].  [None] until [cli.ml] wires it (e.g. in tests that
+     build a [chain_state] without the live mempool), in which case the
+     runner is a no-op.  Best-effort: a mempool-side failure must never roll
+     back an already-validated, already-connected block (Core runs
+     removeForBlock after the chainstate flush). *)
 }
 
 (* Header flood prevention: reject new headers when this limit is reached
@@ -742,6 +760,7 @@ let create_chain_state (db : Storage.ChainDB.t)
     coinstatsindex = None;
     wallet_scan_hook = None;
     wallet_unscan_hook = None;
+    mempool_remove_hook = None;
   } in
   (* Insert genesis block header *)
   let genesis_hash = Crypto.compute_block_hash network.genesis_header in
@@ -791,6 +810,7 @@ let restore_chain_state (db : Storage.ChainDB.t)
     coinstatsindex = None;
     wallet_scan_hook = None;
     wallet_unscan_hook = None;
+    mempool_remove_hook = None;
   } in
   (* Check for stored header tip *)
   match Storage.ChainDB.get_header_tip db with
@@ -933,6 +953,28 @@ let run_wallet_unscan_hook (state : chain_state) (block : Types.block)
     (try f block height with exn ->
       Logs.warn (fun m ->
         m "wallet block-disconnect unscan raised at height %d (ignored): %s"
+          height (Printexc.to_string exn)))
+
+(* Install / replace the mempool block-connect eviction callback.  Called once
+   by [cli.ml] after the live mempool exists, unconditionally (not gated on a
+   wallet).  [None] when unset (e.g. tests). *)
+let set_mempool_remove_hook (state : chain_state)
+    (f : (Types.block -> int -> unit) option) : unit =
+  state.mempool_remove_hook <- f
+
+(* Invoke the mempool block-connect eviction hook for a freshly-connected
+   block, if one is installed.  Best-effort: a mempool-side exception is logged
+   and swallowed so it can never roll back an already-validated,
+   already-connected block (mirrors Core running removeForBlock after the
+   chainstate flush in ConnectTip). *)
+let run_mempool_remove_hook (state : chain_state) (block : Types.block)
+    (height : int) : unit =
+  match state.mempool_remove_hook with
+  | None -> ()
+  | Some f ->
+    (try f block height with exn ->
+      Logs.warn (fun m ->
+        m "mempool remove_for_block raised at height %d (ignored): %s"
           height (Printexc.to_string exn)))
 
 (* Average block size used to convert a byte-denominated [prune_target] into
@@ -5325,6 +5367,12 @@ let rec connect_stored_blocks (state : chain_state) : int =
              out-of-order blocks drained here also update + persist the wallet
              ledger.  Best-effort (see process_new_block). *)
           run_wallet_scan_hook state stored_block next_height;
+          (* Evict the now-confirmed txs (and their in-mempool descendants /
+             conflicts) from the live mempool, mirroring Core's
+             removeForBlock from ConnectTip.  Fires from the gap-fill
+             catch-up drain too so out-of-order blocks connected here prune
+             the mempool just like the at-tip path.  Best-effort. *)
+          run_mempool_remove_hook state stored_block next_height;
           Logs.info (fun m ->
             m "Connected stored block %s at height %d (catch-up from gap-fill)"
               (Types.hash256_to_hex_display entry.hash) next_height);
@@ -5561,6 +5609,18 @@ let process_new_block ?(f_requested = false)
              unclean restart.  Best-effort: a wallet-side failure must never
              roll back this already-connected block. *)
           run_wallet_scan_hook state block height;
+          (* Evict the now-confirmed txs (and their in-mempool descendants /
+             conflicts) from the live mempool, mirroring Core's
+             removeForBlock from ConnectTip (validation.cpp:3073-3074), fired
+             once per forward block-connect right after the validated tip
+             advanced.  This is the at-tip P2P BlockMsg / compact-block /
+             blocktxn connect path; the connect_stored_blocks drain below
+             evicts each subsequent stored block via the same hook.  The reorg
+             connect path (4543) and the mining/submitblock path
+             (mining.ml:967) evict via their own mempool refs and do NOT route
+             through this hook, so there is no double-eviction.
+             Best-effort. *)
+          run_mempool_remove_hook state block height;
           (* W34 fix: try to connect any subsequent stored blocks that were
              received out-of-order by the gap-fill but couldn't be processed
              because their parent wasn't yet connected. *)

@@ -693,8 +693,9 @@ let test_g30_node_bloom_advertised_when_enabled () =
   let ours = Peer.our_services () in
   Alcotest.(check bool) "NODE_BLOOM on when enabled" true ours.bloom;
   let as_int = Peer.services_to_int64 ours in
-  (* NODE_NETWORK(1) | NODE_BLOOM(4) | NODE_WITNESS(8) = 13 *)
-  Alcotest.(check int64) "services value with bloom = 13" 13L as_int;
+  (* NODE_NETWORK(1) | NODE_BLOOM(4) | NODE_WITNESS(8) | NODE_NETWORK_LIMITED(1024)
+     = 0x40D = 1037.  NODE_NETWORK_LIMITED advertised unconditionally (Core init.cpp:863). *)
+  Alcotest.(check int64) "services value with bloom = 0x40D" 0x40DL as_int;
   Peer.set_peer_bloom_filters false  (* restore *)
 
 (* ============================================================================

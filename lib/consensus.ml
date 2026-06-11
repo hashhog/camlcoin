@@ -252,6 +252,13 @@ type network_config = {
   magic : int32;  (* Network magic bytes for P2P messages *)
   default_port : int;
   dns_seeds : string list;
+  (* Core-vetted fixed-IP last-resort seeds (Bitcoin Core net.cpp
+     ConvertSeeds / chainparams.cpp m_params.FixedSeeds()).  Each entry is an
+     "ip:port" string.  Used ONLY as a fallback when DNS seeding is empty/off
+     AND the address book is empty (see Peer_manager.maybe_add_fixed_seeds).
+     Mainnet only — testnet3/testnet4/regtest leave this [] (Core clears
+     vFixedSeeds for non-mainnet test chains). *)
+  fixed_seeds : string list;
   genesis_hash : Types.hash256;
   genesis_header : Types.block_header;
   pubkey_address_prefix : int;  (* Version byte for P2PKH addresses *)
@@ -594,6 +601,51 @@ let mainnet : network_config = {
     "dnsseed.emzy.de";
     "seed.bitcoin.wiz.biz";
   ];
+  (* Curated IPv4 last-resort seeds (Core ConvertSeeds fixed-seed fallback).
+     Fired only when DNS is empty/off AND addrman is empty — never a
+     replacement for DNS. *)
+  fixed_seeds = [
+    "2.121.116.198:8333";
+    "3.86.179.235:8333";
+    "4.2.51.251:8333";
+    "5.2.23.226:8333";
+    "12.11.29.34:8333";
+    "14.49.142.41:8333";
+    "18.27.125.103:8333";
+    "23.93.18.82:8333";
+    "24.16.202.74:8333";
+    "27.83.109.113:8333";
+    "31.41.23.249:8333";
+    "34.65.45.157:8333";
+    "35.78.97.86:8333";
+    "37.15.61.236:8333";
+    "38.52.3.192:8333";
+    "40.160.1.232:8333";
+    "44.223.26.178:8333";
+    "45.19.130.200:8333";
+    "46.126.216.3:8333";
+    "47.90.137.13:8333";
+    "50.4.123.66:8333";
+    "51.154.0.142:8333";
+    "52.182.185.242:8333";
+    "60.241.1.72:8333";
+    "62.34.57.141:8333";
+    "63.247.147.166:8333";
+    "64.23.97.128:8333";
+    "65.94.134.253:8333";
+    "66.35.84.14:8333";
+    "67.4.139.122:8333";
+    "68.61.69.53:8333";
+    "69.4.94.226:8333";
+    "70.44.20.24:8333";
+    "71.56.178.136:8333";
+    "72.88.192.74:8333";
+    "73.42.33.255:8333";
+    "74.48.195.218:8333";
+    "75.80.3.4:8333";
+    "76.124.35.108:8333";
+    "77.38.72.37:8333";
+  ];
   genesis_hash = Types.hash256_of_hex
     "6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000";
   genesis_header = mainnet_genesis_header;
@@ -653,6 +705,7 @@ let testnet : network_config = {
     "seed.testnet.bitcoin.sprovoost.nl";
     "testnet-seed.bluematt.me";
   ];
+  fixed_seeds = [];  (* No fixed-IP fallback on testnet3 (Core clears vFixedSeeds) *)
   genesis_hash = Types.hash256_of_hex
     "43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000";
   genesis_header = {
@@ -699,6 +752,7 @@ let testnet4 : network_config = {
     "seed.testnet4.bitcoin.sprovoost.nl";
     "seed.testnet4.wiz.biz";
   ];
+  fixed_seeds = [];  (* No fixed-IP fallback on testnet4 (Core clears vFixedSeeds) *)
   genesis_hash = Types.hash256_of_hex
     "43f08bdab050e35b567c864b91f47f50ae725ae2de53bcfbbaf284da00000000";
   genesis_header = {
@@ -741,6 +795,7 @@ let regtest : network_config = {
   magic = 0xDAB5BFFAl;
   default_port = 18444;
   dns_seeds = [];  (* No seeds for local testing *)
+  fixed_seeds = [];  (* No fixed-IP fallback on regtest (Core clears vFixedSeeds) *)
   genesis_hash = Types.hash256_of_hex
     "06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f";
   genesis_header = {

@@ -77,22 +77,28 @@ let set_peer_bloom_filters (b : bool) : unit =
   peer_bloom_filters := b
 
 (* BIP-159 NODE_NETWORK_LIMITED advertisement gate.  Set at startup by
-   [Cli.run] from [config.prune > 0].  When ON, [our_services ()] OR's
-   in the [network_limited] flag so the version handshake signals that
-   we serve only the recent ~288-block window.  Mirrors Core's
-   `init.cpp` (`nLocalServices |= NODE_NETWORK_LIMITED` when
-   `IsPruneMode()` is true). *)
+   [Cli.run] from [config.prune > 0].  Retained for callers/diagnostics,
+   but NO LONGER gates the advertised NODE_NETWORK_LIMITED bit:
+   Bitcoin Core advertises NODE_NETWORK_LIMITED UNCONDITIONALLY for a full
+   node (init.cpp:863 — `g_local_services = ServiceFlags(NODE_NETWORK_LIMITED
+   | NODE_WITNESS)`), because every full node serves at least the recent
+   ~288-block window.  A pruned node advertises the SAME bit and simply
+   omits NODE_NETWORK; it is NOT the trigger for NODE_NETWORK_LIMITED.
+   So [our_services ()] now sets [network_limited = true] unconditionally. *)
 let prune_mode_advertise : bool ref = ref false
 
 let set_prune_mode_advertise (b : bool) : unit =
   prune_mode_advertise := b
 
-(* Our node's advertised services: full node with witness support, plus
-   NODE_BLOOM iff [peer_bloom_filters] is set, plus NODE_NETWORK_LIMITED
-   iff [prune_mode_advertise] is set.  Returns a fresh record on every
-   call so callers see the current values of the flags.  Core advertises
-   NODE_NETWORK alongside NODE_NETWORK_LIMITED in the auto-prune case
-   (the node still has the recent-288 window). *)
+(* Our node's advertised services: full node with witness support and
+   NODE_NETWORK_LIMITED, plus NODE_BLOOM iff [peer_bloom_filters] is set.
+   NODE_NETWORK_LIMITED is advertised UNCONDITIONALLY (Core init.cpp:863:
+   `g_local_services = ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS)`),
+   not gated on prune mode — a full node serves the recent ~288-block
+   window regardless.  We do NOT advertise NODE_P2P_V2: BIP-324 v2 is
+   default-off here (see [bip324_v2_outbound_enabled]), so advertising it
+   would signal a capability not on the wire.  Returns a fresh record on
+   every call so callers see the current values of the flags. *)
 (* Whether to advertise NODE_COMPACT_FILTERS (bit 6 = 64).
    Set to true by [enable_compact_filters ()] when the operator passes
    --blockfilterindex, mirroring Bitcoin Core's init.cpp wiring. *)
@@ -106,7 +112,7 @@ let our_services () : peer_services = {
   bloom = !peer_bloom_filters;
   witness = true;
   compact_filters = !compact_filters_enabled;
-  network_limited = !prune_mode_advertise;
+  network_limited = true;
 }
 
 (* Connection and read timeouts *)

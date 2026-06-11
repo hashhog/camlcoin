@@ -2781,7 +2781,10 @@ let test_bip35_default_off () =
   let bits = Peer.services_to_int64 (Peer.our_services ()) in
   Alcotest.(check bool) "service bits exclude NODE_BLOOM (4) by default"
     true (Int64.logand bits 4L = 0L);
-  Alcotest.(check int64) "default service bits = 9 (NETWORK|WITNESS)" 9L bits
+  (* NODE_NETWORK_LIMITED is advertised unconditionally (Core init.cpp:863),
+     so default bits = NETWORK|WITNESS|NETWORK_LIMITED = 1|8|1024 = 0x409. *)
+  Alcotest.(check int64) "default service bits = 0x409 (NETWORK|WITNESS|NETWORK_LIMITED)"
+    0x409L bits
 
 (* When the operator passes --peerbloomfilters, NODE_BLOOM is set and the
    MEMPOOL handler will serve InvMsg responses to peers. *)
@@ -2792,8 +2795,10 @@ let test_bip35_advertise_when_enabled () =
   let bits = Peer.services_to_int64 (Peer.our_services ()) in
   Alcotest.(check bool) "service bits include NODE_BLOOM (4) when enabled"
     true (Int64.logand bits 4L <> 0L);
-  Alcotest.(check int64) "enabled service bits = 13 (NETWORK|BLOOM|WITNESS)"
-    13L bits;
+  (* NODE_NETWORK_LIMITED advertised unconditionally (Core init.cpp:863):
+     NETWORK|BLOOM|WITNESS|NETWORK_LIMITED = 1|4|8|1024 = 0x40D = 1037. *)
+  Alcotest.(check int64) "enabled service bits = 0x40D (NETWORK|BLOOM|WITNESS|NETWORK_LIMITED)"
+    0x40DL bits;
   (* Restore Core default for subsequent tests *)
   Peer.set_peer_bloom_filters false
 

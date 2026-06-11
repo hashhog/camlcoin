@@ -5,9 +5,10 @@ module Log = (val Logs.src_log log_src : Logs.LOG)
 
 (* Source of peer address discovery *)
 type addr_source =
-  | Dns      (* From DNS seed resolution *)
-  | Addr     (* From addr message from peer *)
-  | Manual   (* Manually added by user *)
+  | Dns       (* From DNS seed resolution *)
+  | Addr      (* From addr message from peer *)
+  | Manual    (* Manually added by user *)
+  | FixedSeed (* From the curated fixed-IP last-resort fallback *)
 
 (* Address table status (for eclipse protection bucketing) *)
 type addr_table_status =
@@ -243,6 +244,13 @@ type t = {
      it only re-dials these pinned peers when they drop.  Empty = legacy
      auto-discovery behaviour. *)
   mutable connect_peers : (string * int) list;
+  (* Fixed-seed last-resort fallback (Core net.cpp ThreadOpenConnections
+     add_fixed_seeds).  [fixed_seeds_added] is the one-shot guard — once the
+     curated IPs have been injected it stays true so later ticks are no-ops.
+     [start_ts] anchors the 60s grace window that gives DNS / -addnode /
+     -seednode time to populate the book before we fall back. *)
+  mutable fixed_seeds_added : bool;
+  mutable start_ts : float;
 }
 
 (* Generate a 256-bit eclipse-protection bucket key from /dev/urandom.
@@ -290,6 +298,8 @@ let create ?(config = default_config) ?(asmap : bytes option = None) (network : 
     hb_compact_peers = [];
     net_group_manager = Asmap.create_net_group_manager asmap;
     connect_peers = [];
+    fixed_seeds_added = false;
+    start_ts = Unix.gettimeofday ();
   }
 
 (* Pin the node to a fixed set of --connect peers (Bitcoin Core -connect).
@@ -409,6 +419,51 @@ let is_routable (addr : string) : bool =
        so we do not accidentally drop Tor/I2P/CJDNS addresses that
        currently arrive as raw strings in this codebase. *)
     true
+
+(* True iff [addr] is a numeric IP *literal* (a resolved address), as opposed
+   to a DNS-seed hostname placeholder ("seed.bitcoin.sipa.be") that the
+   hostname-fallback bootstrap parks in [known_addrs] before resolution.
+
+   Core never stores unresolved hostnames in addrman — ThreadDNSAddressSeed
+   resolves them to IPs first — so its "addrman empty for a reachable network"
+   check (GetReachableEmptyNetworks → addrman.Size) genuinely counts only
+   resolved IP entries.  This impl, by contrast, admits hostnames into
+   [known_addrs] via [add_known_addr] (is_routable returns true for any
+   non-dotted-quad string).  This predicate lets the fixed-seed fallback
+   reproduce Core's IP-only emptiness semantics: a parked hostname must NOT
+   count as "the book has a usable address".
+
+   IPv4: four all-integer dotted octets.  IPv6: contains ':' and every
+   non-empty hextet is valid hex (covers "::1", "2001:db8::1", etc.).
+   Anything else (a hostname like "seed.bitcoin.sipa.be") is NOT a literal. *)
+let is_ip_literal (addr : string) : bool =
+  match String.split_on_char '.' addr with
+  | [a; b; c; d] when
+      List.for_all (fun s -> s <> "" && int_of_string_opt s <> None)
+        [a; b; c; d] -> true
+  | _ ->
+    (* IPv6 literal: must contain a ':' and every non-empty ':'-separated
+       hextet must parse as hex (handles "::" elision via empty segments). *)
+    if String.contains addr ':' then
+      List.for_all
+        (fun seg ->
+           seg = ""  (* empty segment from "::" elision is fine *)
+           || (match int_of_string_opt ("0x" ^ seg) with
+               | Some _ -> true
+               | None -> false))
+        (String.split_on_char ':' addr)
+    else
+      false
+
+(* Count entries in the address book that are *usable IP peers* for the
+   fixed-seed emptiness check: real numeric IP literals (not parked DNS-seed
+   hostnames) that are also routable.  Mirrors Core's
+   GetReachableEmptyNetworks()/addrman.Size semantics, which only ever see
+   resolved IPs.  Used solely by [maybe_add_fixed_seeds]. *)
+let routable_ip_addr_count (pm : t) : int =
+  Hashtbl.fold (fun addr _info acc ->
+    if is_ip_literal addr && is_routable addr then acc + 1 else acc
+  ) pm.known_addrs 0
 
 (* Private helper: compute bucket index from a precomputed group string.
    Core: bucket = SHA256(key || group)[0] mod bucket_count.
@@ -796,6 +851,92 @@ let add_known_addr (pm : t) (info : peer_info) : unit =
       let info_with_bucket = { info with table_status = InNew bucket } in
       Hashtbl.replace pm.known_addrs info.address info_with_bucket
     end
+  end
+
+(* Split a curated seed "ip:port" string on the LAST ':' (IPv4-only set here,
+   but last-colon split is forward-safe for bracketed forms).  Returns
+   (ip, port) or None when the port is missing/unparseable. *)
+let parse_fixed_seed (s : string) : (string * int) option =
+  match String.rindex_opt s ':' with
+  | None -> None
+  | Some i ->
+    let ip = String.sub s 0 i in
+    let port_str = String.sub s (i + 1) (String.length s - i - 1) in
+    (match int_of_string_opt port_str with
+     | Some port when ip <> "" -> Some (ip, port)
+     | _ -> None)
+
+(* Inject the network's curated fixed-IP seeds into the address book.
+   Mirrors Core net.cpp ConvertSeeds + addrman.Add(seed_addrs, "fixedseeds").
+   Each entry carries the [FixedSeed] source tag; [add_known_addr] applies the
+   normal routable/dedup filter (non-routable / already-known entries dropped),
+   matching Core AddrMan::AddSingle.  Returns the number actually added. *)
+let add_fixed_seeds (pm : t) : int =
+  let before = Hashtbl.length pm.known_addrs in
+  List.iter (fun entry ->
+    match parse_fixed_seed entry with
+    | None -> ()
+    | Some (ip, port) ->
+      add_known_addr pm {
+        address = ip;
+        port;
+        services = Int64.of_int 1;  (* NODE_NETWORK *)
+        last_connected = 0.0;
+        last_attempt = 0.0;
+        last_success = 0.0;
+        failures = 0;
+        banned_until = 0.0;
+        source = FixedSeed;
+        table_status = NotInTable;
+      }
+  ) pm.network.fixed_seeds;
+  Hashtbl.length pm.known_addrs - before
+
+(* Core net.cpp:2607-2643 (ThreadOpenConnections fixed-seed trigger).
+   One-shot last-resort fallback: dial the curated fixed IPs only when ALL of:
+     (1) ENABLED — not in --connect mode (Core folds -connect into the
+         fixed-seed-off path) AND the per-network fixedSeeds list is non-empty
+         (mainnet only; empty for testnet/regtest, matching Core clearing
+         vFixedSeeds).
+     (2) BOOK EMPTY — the address book has no usable IP peers.  Counts only
+         numeric IP literals (not parked DNS-seed *hostnames* like
+         "seed.bitcoin.sipa.be" that the hostname-fallback bootstrap adds
+         before resolution), matching Core's GetReachableEmptyNetworks →
+         addrman.Size semantics, which only ever see resolved IPs.  The naive
+         Hashtbl.length test was always non-zero in production because the
+         hostname fallback runs first and parks hostnames in known_addrs —
+         so the fixed seeds never injected (dead code).
+     (3) EITHER >60s elapsed since [start_ts] (Core: GetTime() > start + 1min,
+         giving DNS / -addnode / -seednode time to populate addrman first),
+         OR DNS seeding is disabled (pm.config.dns_seed = false) with no
+         pinned source (Core's cheap !dnsseed && !use_seednodes shortcut —
+         nothing to wait for, fire immediately).
+   After firing, set the one-shot guard so subsequent ticks are no-ops.  This
+   is layered AFTER the untouched normal DNS bootstrap — it never replaces DNS,
+   never bypasses it.  Returns true iff it fired this tick. *)
+let maybe_add_fixed_seeds (pm : t) : bool =
+  (* (1) ENABLED *)
+  if pm.fixed_seeds_added then false
+  else if connect_only pm then false
+  else if pm.network.fixed_seeds = [] then false
+  (* (2) BOOK EMPTY — count only usable IP peers (resolved literals), NOT
+     parked DNS-seed hostname placeholders, mirroring Core addrman.Size. *)
+  else if routable_ip_addr_count pm <> 0 then false
+  else begin
+    (* (3) 60s grace elapsed, OR DNS disabled (nothing left to wait for) *)
+    let grace_elapsed =
+      Unix.gettimeofday () -. pm.start_ts > 60.0 in
+    let dns_disabled_no_source = not pm.config.dns_seed in
+    if grace_elapsed || dns_disabled_no_source then begin
+      let added = add_fixed_seeds pm in
+      pm.fixed_seeds_added <- true;  (* one-shot guard (Core add_fixed_seeds=false) *)
+      Log.info (fun m -> m
+        "Added %d fixed seeds (last-resort fallback: addrman empty, %s)"
+        added
+        (if dns_disabled_no_source then "DNS disabled" else "60s elapsed"));
+      true
+    end else
+      false
   end
 
 (* Check if connecting to this address would violate outbound netgroup diversity *)
@@ -2139,6 +2280,12 @@ let maintain_connections (pm : t) : unit Lwt.t =
               else add_peer pm addr port
             ) pm.connect_peers
           end else begin
+            (* Last-resort fixed-seed fallback (Core net.cpp add_fixed_seeds):
+               fires the curated IPs when the address book is still empty after
+               the 60s grace window (DNS / -addnode / -seednode had their
+               chance).  One-shot, falls THROUGH after the normal DNS bootstrap
+               — never replaces it.  No-op once fired / on a non-empty book. *)
+            let _ : bool = maybe_add_fixed_seeds pm in
             (* Count active outbound connections *)
             let active_outbound = List.filter (fun p ->
               p.Peer.state = Peer.Ready && p.Peer.direction = Peer.Outbound
@@ -2342,6 +2489,10 @@ let start_listener (pm : t) (port : int) : unit Lwt.t =
 let start (pm : t) : unit Lwt.t =
   let open Lwt.Syntax in
   pm.running <- true;
+  (* Anchor the fixed-seed grace window now: the 60s clock for the
+     last-resort fallback starts from the moment the connection loop begins
+     (Core net.cpp: start = GetTime() in ThreadOpenConnections). *)
+  pm.start_ts <- Unix.gettimeofday ();
   let connect_mode = connect_only pm in
   (* Resolve DNS seeds — skipped when:
        (a) --connect pins the node to a fixed peer set (Core -connect
@@ -2374,6 +2525,12 @@ let start (pm : t) : unit Lwt.t =
     Log.info (fun m -> m "Added %d fallback peers" (List.length fallback));
     List.iter (add_known_addr pm) fallback
   end;
+  (* Last-resort fixed-IP fallback (Core net.cpp add_fixed_seeds).  Fires here
+     only for the immediate DNS-off / connect-disabled-but-empty case (the
+     dns_disabled branch of the predicate); the 60s-grace empty-book case is
+     handled by the maintain_connections loop below.  Falls THROUGH after the
+     DNS + hostname-fallback bootstrap above — never replaces it. *)
+  let _ : bool = maybe_add_fixed_seeds pm in
   (* Log asmap version at startup (mirrors Core: LogInfo "Using asmap version...").
      Reference: bitcoin-core/src/init.cpp LogInfo("Using asmap version %s...") *)
   (match pm.net_group_manager.Asmap.asmap with

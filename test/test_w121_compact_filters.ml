@@ -719,7 +719,7 @@ let g26_rewind_disk_leak () =
 let g27_service_bit_present () =
   let s : Peer.peer_services = {
     network = true; getutxo = false; bloom = false; witness = true;
-    compact_filters = true; network_limited = false
+    compact_filters = true; network_limited = false; p2p_v2 = false
   } in
   let bits = Peer.services_to_int64 s in
   let bit6 = Int64.logand bits 64L in

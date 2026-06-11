@@ -1394,6 +1394,7 @@ let handle_getnetworkinfo (ctx : rpc_context) : Yojson.Safe.t =
   let localservices_hex = Printf.sprintf "%016Lx" svc_bits in
   let localservicesnames =
     let names = ref [] in
+    if svc.p2p_v2 then names := `String "P2P_V2" :: !names;
     if svc.network_limited then names := `String "NETWORK_LIMITED" :: !names;
     if svc.compact_filters then names := `String "COMPACT_FILTERS" :: !names;
     if svc.witness then names := `String "WITNESS" :: !names;

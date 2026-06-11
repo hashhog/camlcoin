@@ -31,6 +31,7 @@ type peer_services = {
   witness : bool;           (* NODE_WITNESS = 8 *)
   compact_filters : bool;   (* NODE_COMPACT_FILTERS = 64 *)
   network_limited : bool;   (* NODE_NETWORK_LIMITED = 1024 *)
+  p2p_v2 : bool;            (* NODE_P2P_V2 = 0x800 = 1 lsl 11 (BIP-324) *)
 }
 
 let services_of_int64 (s : int64) : peer_services =
@@ -39,7 +40,8 @@ let services_of_int64 (s : int64) : peer_services =
     bloom = Int64.logand s 4L <> 0L;
     witness = Int64.logand s 8L <> 0L;
     compact_filters = Int64.logand s 64L <> 0L;
-    network_limited = Int64.logand s 1024L <> 0L }
+    network_limited = Int64.logand s 1024L <> 0L;
+    p2p_v2 = Int64.logand s 0x800L <> 0L }
 
 let services_to_int64 (s : peer_services) : int64 =
   let v = ref 0L in
@@ -49,6 +51,7 @@ let services_to_int64 (s : peer_services) : int64 =
   if s.witness then v := Int64.logor !v 8L;
   if s.compact_filters then v := Int64.logor !v 64L;
   if s.network_limited then v := Int64.logor !v 1024L;
+  if s.p2p_v2 then v := Int64.logor !v 0x800L;
   !v
 
 let empty_services : peer_services =
@@ -57,7 +60,8 @@ let empty_services : peer_services =
     bloom = false;
     witness = false;
     compact_filters = false;
-    network_limited = false }
+    network_limited = false;
+    p2p_v2 = false }
 
 (* Bloom-filter / BIP-35 (NODE_BLOOM) advertisement gate.
 
@@ -90,15 +94,14 @@ let prune_mode_advertise : bool ref = ref false
 let set_prune_mode_advertise (b : bool) : unit =
   prune_mode_advertise := b
 
-(* Our node's advertised services: full node with witness support and
-   NODE_NETWORK_LIMITED, plus NODE_BLOOM iff [peer_bloom_filters] is set.
+(* [our_services] (defined below) returns our node's advertised service flags:
+   full node with witness support and NODE_NETWORK_LIMITED, plus NODE_BLOOM iff
+   [peer_bloom_filters] is set, plus NODE_P2P_V2 iff BIP-324 v2 is enabled.
    NODE_NETWORK_LIMITED is advertised UNCONDITIONALLY (Core init.cpp:863:
    `g_local_services = ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS)`),
-   not gated on prune mode — a full node serves the recent ~288-block
-   window regardless.  We do NOT advertise NODE_P2P_V2: BIP-324 v2 is
-   default-off here (see [bip324_v2_outbound_enabled]), so advertising it
-   would signal a capability not on the wire.  Returns a fresh record on
-   every call so callers see the current values of the flags. *)
+   not gated on prune mode — a full node serves the recent ~288-block window
+   regardless.  It returns a fresh record on every call so callers see the
+   current values of the flags. *)
 (* Whether to advertise NODE_COMPACT_FILTERS (bit 6 = 64).
    Set to true by [enable_compact_filters ()] when the operator passes
    --blockfilterindex, mirroring Bitcoin Core's init.cpp wiring. *)
@@ -106,6 +109,46 @@ let compact_filters_enabled = ref false
 
 let enable_compact_filters () = compact_filters_enabled := true
 
+(* Helper: parse a CAMLCOIN_BIP324_V2* env var as a boolean.
+
+   BIP-324 v2 is now DEFAULT-ON (matching Bitcoin Core v31.99, which speaks v2
+   by default and advertises NODE_P2P_V2).  The variable enables v2 unless it
+   is explicitly set to a falsy value {0, false, off}.  An UNSET variable, or
+   any other value (including ""), means ON.  This mirrors the haskoin flip
+   (unset -> on, explicit 0/false/off -> off) and Core binding the on-wire bit
+   to the transport: see [our_services] which ORs NODE_P2P_V2 on the SAME
+   predicate, so the advertised bit can never lie about the wire capability. *)
+let env_flag_on (key : string) : bool =
+  match Sys.getenv_opt key with
+  | None -> true
+  | Some v ->
+    let v = String.lowercase_ascii v in
+    not (v = "0" || v = "false" || v = "off")
+
+(* Returns true iff BIP-324 v2 outbound is enabled.  DEFAULT-ON: opt out
+   per-process via CAMLCOIN_BIP324_V2_OUTBOUND=0 (or the umbrella
+   CAMLCOIN_BIP324_V2=0 which gates both directions). *)
+let bip324_v2_outbound_enabled () : bool =
+  env_flag_on "CAMLCOIN_BIP324_V2_OUTBOUND" && env_flag_on "CAMLCOIN_BIP324_V2"
+
+(* Returns true iff BIP-324 v2 inbound (responder mode) is enabled.  DEFAULT-ON:
+   opt out per-process via CAMLCOIN_BIP324_V2_INBOUND=0 (or the umbrella
+   CAMLCOIN_BIP324_V2=0 which gates both directions).  When OFF the inbound
+   listener hands every byte straight to read_message_v1 (legacy behaviour).
+   When ON the listener peeks the first 16 bytes of the stream, classifies the
+   connection (v1 magic + "version\0\0\0\0\0" → v1; anything else → v2), and on
+   v2 detection drives the BIP-324 cipher handshake in responder mode before
+   falling through to the application version/verack. *)
+let bip324_v2_inbound_enabled () : bool =
+  env_flag_on "CAMLCOIN_BIP324_V2_INBOUND" && env_flag_on "CAMLCOIN_BIP324_V2"
+
+(* Our node's advertised services.  We advertise NODE_P2P_V2 (bit 11 = 0x800)
+   iff BIP-324 v2 is enabled in EITHER direction, gated on the SAME predicate
+   that actually drives the v2 transport — Core net.cpp gates every v2 attempt
+   on GetLocalServices() & NODE_P2P_V2, so the bit must never be advertised
+   without the capability being on the wire (and vice versa).  With the v2
+   default-on flip the steady-state localservices is 0xc09 (NETWORK | WITNESS |
+   NETWORK_LIMITED | P2P_V2); an explicit opt-out drops it back to 0x409. *)
 let our_services () : peer_services = {
   network = true;
   getutxo = false;
@@ -113,6 +156,7 @@ let our_services () : peer_services = {
   witness = true;
   compact_filters = !compact_filters_enabled;
   network_limited = true;
+  p2p_v2 = bip324_v2_outbound_enabled () || bip324_v2_inbound_enabled ();
 }
 
 (* Connection and read timeouts *)
@@ -125,34 +169,6 @@ let handshake_timeout = 60.0   (* 60 seconds for version/verack handshake *)
 (* BIP-324 v2 outbound probe deadline.  Bitcoin Core net.cpp uses ~30s; we
    mirror it so a stalled remote doesn't wedge the dialer for long. *)
 let v2_handshake_deadline = 30.0  (* seconds for cipher handshake *)
-
-(* Helper: parse a CAMLCOIN_BIP324_V2* env var as a boolean.  Returns true
-   iff the variable is set to a value other than {0, false, off, ""}. *)
-let env_flag_on (key : string) : bool =
-  match Sys.getenv_opt key with
-  | None -> false
-  | Some v ->
-    let v = String.lowercase_ascii v in
-    not (v = "0" || v = "false" || v = "off" || v = "")
-
-(* Returns true iff BIP-324 v2 outbound is enabled. Default OFF (conservative)
-   since this code path is brand new — enable per-process via
-   CAMLCOIN_BIP324_V2_OUTBOUND=1 (or the umbrella CAMLCOIN_BIP324_V2=1 which
-   gates both directions).  Mirrors clearbit's CLEARBIT_BIP324_V2 gate pattern
-   (clearbit/src/peer.zig:653). *)
-let bip324_v2_outbound_enabled () : bool =
-  env_flag_on "CAMLCOIN_BIP324_V2_OUTBOUND" || env_flag_on "CAMLCOIN_BIP324_V2"
-
-(* Returns true iff BIP-324 v2 inbound (responder mode) is enabled.  Default
-   OFF — enable per-process via CAMLCOIN_BIP324_V2_INBOUND=1 (or the umbrella
-   CAMLCOIN_BIP324_V2=1 which gates both directions).  When OFF the inbound
-   listener hands every byte straight to read_message_v1 (legacy behaviour).
-   When ON the listener peeks the first 16 bytes of the stream, classifies
-   the connection (v1 magic + "version\0\0\0\0\0" → v1; anything else → v2),
-   and on v2 detection drives the BIP-324 cipher handshake in responder mode
-   before falling through to the application version/verack. *)
-let bip324_v2_inbound_enabled () : bool =
-  env_flag_on "CAMLCOIN_BIP324_V2_INBOUND" || env_flag_on "CAMLCOIN_BIP324_V2"
 
 (* 12-byte v1 command for VERSION ("version" plus 5 NUL bytes).  Used by the
    inbound peek-classifier to distinguish a v1 VERSION header from a v2

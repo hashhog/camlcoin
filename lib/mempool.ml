@@ -136,6 +136,17 @@ let max_standard_tx_weight = 400_000
 let incremental_relay_fee = 100L  (* sat/kvB — policy/policy.h DEFAULT_INCREMENTAL_RELAY_FEE *)
 let incremental_relay_fee_float = 100.0  (* float copy for rolling-fee math *)
 
+(* DUST_RELAY_TX_FEE = 3000 sat/kvB — the feerate used to compute the dust
+   threshold. This is SEPARATE from min_relay_fee (the relay/admission floor):
+   Core's IsDust/GetDustThreshold and IsStandardTx take a distinct dustRelayFee
+   CFeeRate (default DUST_RELAY_TX_FEE). Keeping dust on its own constant means
+   lowering min_relay_fee to the Core default (100) does NOT collapse the dust
+   limit (it would 10x undercount if coupled). The dust threshold stays
+   3 * 3000 * size / 1000 == Core.
+   Reference: bitcoin-core/src/policy/policy.h:68 (DUST_RELAY_TX_FEE),
+   policy.h:140/142/159 (dustRelayFee separate from the min-relay floor). *)
+let dust_relay_fee = 3000L  (* sat/kvB — policy/policy.h DUST_RELAY_TX_FEE *)
+
 (* ROLLING_FEE_HALFLIFE = 12 hours in seconds.
    Reference: bitcoin-core/src/txmempool.h:212 *)
 let rolling_fee_halflife = float_of_int (60 * 60 * 12)  (* 43200.0 s *)
@@ -257,7 +268,13 @@ let create ?(require_standard=true) ?(verify_scripts=true)
        Reference: bitcoin-core/src/kernel/mempool_options.h:40
        Previous value was 300 * 1024 * 1024 = 314,572,800 (too large by ~4.9%). *)
     max_size_bytes = 300 * 1_000_000;
-    min_relay_fee = 1000L;  (* 1 sat/vB = 1000 sat/kvB *)
+    (* DEFAULT_MIN_RELAY_TX_FEE = 100 sat/kvB.
+       Reference: bitcoin-core/src/policy/policy.h:70.
+       Previous value was 1000 sat/kvB (10x Core's default). The dust
+       threshold is intentionally NOT coupled to this floor — dust uses the
+       separate dust_relay_fee = 3000 (DUST_RELAY_TX_FEE), so lowering this
+       admission/relay floor does NOT drop the dust limit (Core parity). *)
+    min_relay_fee = 100L;
     dynamic_min_fee = 0L;
     rolling_min_fee_rate = 0.0;
     last_rolling_fee_update = Unix.gettimeofday ();
@@ -985,9 +1002,13 @@ let output_serialized_size (output : Types.tx_out) : int =
   let varint_len = if script_len < 0xFD then 1 else if script_len <= 0xFFFF then 3 else 5 in
   8 + varint_len + script_len
 
-(* Check if an output is dust. Dust = value < 3 * min_relay_fee * spending_size / 1000
-   P2A outputs have a fixed dust limit of 240 satoshis *)
-let is_dust (min_relay_fee : int64) (output : Types.tx_out) : bool =
+(* Check if an output is dust. Dust = value < 3 * dust_relay_fee * spending_size / 1000.
+   The fee argument is the DUST feerate (dust_relay_fee = 3000 sat/kvB,
+   DUST_RELAY_TX_FEE), NOT the min-relay floor — Core's IsDust takes its own
+   dustRelayFee CFeeRate. The 3.0* multiplier matches Core GetDustThreshold
+   (3 * dustRelayFee.GetFee(size)).
+   P2A outputs have a fixed dust limit of 240 satoshis. *)
+let is_dust (dust_relay_fee : int64) (output : Types.tx_out) : bool =
   match Script.classify_script output.script_pubkey with
   | Script.OP_RETURN_data _ -> false  (* OP_RETURN is not dust *)
   | Script.P2A_script ->
@@ -998,7 +1019,7 @@ let is_dust (min_relay_fee : int64) (output : Types.tx_out) : bool =
     if spend_size = 0 then false
     else begin
       let threshold = Int64.of_float (
-        3.0 *. Int64.to_float min_relay_fee *.
+        3.0 *. Int64.to_float dust_relay_fee *.
         float_of_int (output_serialized_size output + spend_size) /. 1000.0) in
       output.Types.value < threshold
     end
@@ -1542,7 +1563,11 @@ let compute_tx_nonwitness_size (tx : Types.transaction) : int =
    5. per-output: standard scriptPubKey; cumulative OP_RETURN ≤ 100,000 bytes
    6. dust: at most MAX_DUST_OUTPUTS_PER_TX (1) dust outputs
    7. P2WSH witness policy limits (check_p2wsh_witness_limits) *)
-let is_standard_tx (min_relay_fee : int64) (tx : Types.transaction) : (unit, string) result =
+(* The first parameter is kept for call-site stability (tests pass a feerate
+   positionally) but is no longer consulted: the dust gate below uses the
+   dedicated module constant dust_relay_fee (3000), decoupled from the relay
+   floor, per Core IsStandardTx(..., dust_relay_fee, ...). *)
+let is_standard_tx (_min_relay_fee : int64) (tx : Types.transaction) : (unit, string) result =
   (* Gate 1: Version must be in [1, TX_MAX_STANDARD_VERSION=3].
      v3/TRUC transactions (BIP-431) are standard. *)
   let version = Int32.to_int tx.version in
@@ -1612,9 +1637,11 @@ let is_standard_tx (min_relay_fee : int64) (tx : Types.transaction) : (unit, str
           | None ->
             (* Gate 6: Dust check.
                Core allows at most MAX_DUST_OUTPUTS_PER_TX (1) dust outputs (ephemeral dust).
-               Count dust outputs and reject if more than 1. *)
+               Count dust outputs and reject if more than 1.
+               Uses the dedicated dust_relay_fee (3000), NOT the relay floor
+               (min_relay_fee), matching Core IsStandardTx(..., dust_relay_fee, ...). *)
             let dust_count = List.fold_left (fun acc out ->
-              if is_dust min_relay_fee out then acc + 1 else acc
+              if is_dust dust_relay_fee out then acc + 1 else acc
             ) 0 tx.outputs in
             if dust_count > max_dust_outputs_per_tx then
               Error (Printf.sprintf
@@ -2348,7 +2375,7 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
                reference.  Logic mirrors mempool.ml:pre_check_ephemeral_tx. *)
             let ephemeral_err =
               if mp.require_standard && not bypass_limits then
-                let has_dust = List.exists (is_dust mp.min_relay_fee) tx.outputs in
+                let has_dust = List.exists (is_dust dust_relay_fee) tx.outputs in
                 if has_dust && fee <> 0L then
                   Some "tx with dust output must be 0-fee"
                 else None
@@ -3173,7 +3200,8 @@ let replace_by_fee_with_replaced ?(dry_run=false) ?(skip_verify_scripts=false)
                  W120 BUG-RBF4-FEERATE fix: Core's PaysForRBF is called with
                  m_pool.m_opts.incremental_relay_feerate (validation.cpp:1011),
                  NOT the minimum relay feerate.  camlcoin previously used
-                 [mp.min_relay_fee] (1000 sat/kvB default) which is 10× Core's
+                 [mp.min_relay_fee] (the relay/admission floor, not the
+                 incremental feerate) instead of Core's
                  DEFAULT_INCREMENTAL_RELAY_FEE (100 sat/kvB, policy/policy.h:48),
                  making Rule 4 over-strict and diverging from a default-flag Core
                  oracle.  Switch to [incremental_relay_fee] to match Core exactly. *)
@@ -3581,20 +3609,22 @@ let process_orphans (mp : mempool) (new_txid : Types.hash256)
 let max_dust_outputs_per_tx = 1
 
 (* Check if an output is dust (would fail is_dust check).
-   Zero-value outputs are always dust. Returns list of dust output indices. *)
-let get_dust_outputs (min_relay_fee : int64) (tx : Types.transaction)
+   Zero-value outputs are always dust. Returns list of dust output indices.
+   The fee argument is the DUST feerate (dust_relay_fee = 3000), not the
+   relay floor — see is_dust. *)
+let get_dust_outputs (dust_relay_fee : int64) (tx : Types.transaction)
     : int list =
   List.mapi (fun i out ->
-    if is_dust min_relay_fee out then Some i else None
+    if is_dust dust_relay_fee out then Some i else None
   ) tx.outputs |> List.filter_map Fun.id
 
 (* PreCheckEphemeralTx: A transaction with dust outputs must have 0 fee.
    This prevents miners from having incentive to mine the tx alone, which
    would leave dust in the UTXO set.
    Reference: Bitcoin Core PreCheckEphemeralTx *)
-let pre_check_ephemeral_tx (min_relay_fee : int64) (tx : Types.transaction)
+let pre_check_ephemeral_tx (dust_relay_fee : int64) (tx : Types.transaction)
     (fee : int64) : (unit, string) result =
-  let dust_outs = get_dust_outputs min_relay_fee tx in
+  let dust_outs = get_dust_outputs dust_relay_fee tx in
   if dust_outs <> [] && fee <> 0L then
     Error "tx with dust output must be 0-fee"
   else
@@ -3625,7 +3655,7 @@ let find_parent_dust_outputs (mp : mempool) (tx : Types.transaction)
       match parent_tx_opt with
       | Some parent_tx ->
         (* Check each output of the parent for dust *)
-        let dust_indices = get_dust_outputs mp.min_relay_fee parent_tx in
+        let dust_indices = get_dust_outputs dust_relay_fee parent_tx in
         List.iter (fun idx ->
           dust_list := (parent_txid, idx) :: !dust_list
         ) dust_indices
@@ -3696,14 +3726,14 @@ let check_ephemeral_spends (mp : mempool) (package : Types.transaction list)
 (* Check ephemeral anchor policy for a single transaction.
    For standalone txs, this just checks that there are no dust outputs
    (since dust is only allowed with package validation). *)
-let check_ephemeral_single (mp : mempool) (tx : Types.transaction)
+let check_ephemeral_single (_mp : mempool) (tx : Types.transaction)
     (fee : int64) : (unit, string) result =
-  match pre_check_ephemeral_tx mp.min_relay_fee tx fee with
+  match pre_check_ephemeral_tx dust_relay_fee tx fee with
   | Error msg -> Error msg
   | Ok () ->
     (* Standalone tx with dust is rejected unless it has 0 fee
        and will be validated as part of a package *)
-    let dust_outs = get_dust_outputs mp.min_relay_fee tx in
+    let dust_outs = get_dust_outputs dust_relay_fee tx in
     if List.length dust_outs > max_dust_outputs_per_tx then
       Error (Printf.sprintf "Too many dust outputs (%d > %d)"
         (List.length dust_outs) max_dust_outputs_per_tx)

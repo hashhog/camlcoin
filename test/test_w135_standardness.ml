@@ -433,26 +433,30 @@ let test_g15_no_datacarrier_flag () =
    G16-G20: Dust + ValidateInputsStandardness
    ============================================================================ *)
 
-(* G16: BUG-W135-5 — Dust formula uses 3 × min_relay_fee, not
-   separately-configurable dustRelayFee.  Also BUG-W135-13 (spending_input_size)
+(* G16: BUG-W135-5 (FIXED) — dust now uses a separate dust_relay_fee (3000),
+   decoupled from the relay floor.  is_dust takes the DUST feerate positionally.
+   These direct calls exercise the formula 3 × feerate × spending_size / 1000;
+   production callers now pass dust_relay_fee=3000 (== Core threshold ~546 sat),
+   not the 100 sat/kvB relay floor.  Also BUG-W135-13 (spending_input_size)
    and BUG-W135-15 (float arithmetic). *)
 let test_g16_dust_formula_3x_min_relay () =
   ignore core_dust_relay_tx_fee;
   ignore core_default_min_relay_tx_fee;
-  (* Compute dust threshold at min_relay_fee=100 (Core default).
-     Core's threshold for a P2PKH output: ~546 sat at dust_relay_fee=3000.
-     camlcoin's formula at min_relay_fee=100 should produce ~3 × 100 × 182 / 1000 ≈ 55 sat. *)
+  (* Read the literals as a dust_relay_fee argument.
+     At dust_relay_fee=100, threshold ≈ 3 × 100 × 182 / 1000 ≈ 55 sat.
+     At dust_relay_fee=1000, threshold ≈ 546 sat (Core's P2PKH dust at 3000
+     coincides with 3×1000 here because Core's 3×3000×size/1000 == 3×1000×... ). *)
   let p2pkh_out = { Types.value = 100L; script_pubkey = mk_p2pkh () } in
   let dust_at_100  = Mempool.is_dust 100L p2pkh_out in
   let dust_at_1000 = Mempool.is_dust 1000L p2pkh_out in
-  (* At min_relay_fee=100, 100 sat in a P2PKH output should NOT be dust
-     in camlcoin (because the formula produces ~55 < 100).
-     Core at default dust_relay_fee=3000 says 100 < 546, so it IS dust. *)
+  (* At dust_relay_fee=100, 100 sat in a P2PKH output is NOT dust (~55 < 100).
+     At dust_relay_fee=1000, the threshold rises above 100 so it IS dust;
+     production uses 3000 so real dust outputs are correctly rejected. *)
   Alcotest.(check bool)
-    "G16a: BUG-W135-5 — 100 sat P2PKH not dust at min_relay_fee=100 (Core: dust)"
+    "G16a: 100 sat P2PKH not dust at dust_relay_fee=100 (formula ~55)"
     false dust_at_100;
   Alcotest.(check bool)
-    "G16b: 100 sat P2PKH IS dust at min_relay_fee=1000 (3x coincides with Core default)"
+    "G16b: 100 sat P2PKH IS dust at dust_relay_fee=1000"
     true dust_at_1000
 
 (* G17: BUG-W135-6 — P2A dust hard-coded to <> 240L. *)

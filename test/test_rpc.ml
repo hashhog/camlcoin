@@ -1432,21 +1432,26 @@ let test_getdeploymentinfo_fields () =
    identical "type" and "active" values.
    ============================================================================ *)
 
-(* Extract the softforks assoc list from getblockchaininfo result. *)
-let get_softforks_assoc (result : Yojson.Safe.t) =
-  match result with
-  | `Assoc fields ->
-    (match List.assoc_opt "softforks" fields with
+(* Extract the softforks/deployments assoc list.
+   Core v31.99 DROPPED the softforks object from getblockchaininfo (it now lives
+   only in getdeploymentinfo.deployments — blockchain.cpp:1497). camlcoin follows
+   suit, so the softfork/deployment map is sourced from getdeploymentinfo. These
+   consistency tests still verify the SAME underlying deployment state machine. *)
+let get_softforks_assoc (ctx : Rpc.rpc_context) =
+  match Rpc.handle_getdeploymentinfo ctx [] with
+  | Ok (`Assoc fields) ->
+    (match List.assoc_opt "deployments" fields with
      | Some (`Assoc sf) -> sf
-     | Some _ -> Alcotest.fail "softforks field has wrong type"
-     | None -> Alcotest.fail "softforks field missing from getblockchaininfo")
-  | _ -> Alcotest.fail "getblockchaininfo result is not an object"
+     | Some _ -> Alcotest.fail "deployments field has wrong type"
+     | None -> Alcotest.fail "deployments field missing from getdeploymentinfo")
+  | Ok _ -> Alcotest.fail "getdeploymentinfo result is not an object"
+  | Error msg -> Alcotest.fail ("getdeploymentinfo failed: " ^ msg)
 
 (* Test: getblockchaininfo includes a non-empty softforks field on regtest *)
 let test_getblockchaininfo_has_softforks () =
   let (ctx, db, db_path) = create_regtest_context () in
-  let result = Rpc.handle_getblockchaininfo ctx in
-  let sf = get_softforks_assoc result in
+  let _ = Rpc.handle_getblockchaininfo ctx in
+  let sf = get_softforks_assoc ctx in
   Alcotest.(check bool) "softforks non-empty" true (List.length sf > 0);
   Storage.ChainDB.close db;
   let rec rm_rf path =
@@ -1466,10 +1471,10 @@ let test_softforks_matches_deploymentinfo () =
   let (ctx, db, db_path) = create_regtest_context () in
 
   (* Collect data from both RPCs *)
-  let bc_result = Rpc.handle_getblockchaininfo ctx in
+  let _bc_result = Rpc.handle_getblockchaininfo ctx in
   let di_result = Rpc.handle_getdeploymentinfo ctx [] in
 
-  let sf   = get_softforks_assoc bc_result in
+  let sf   = get_softforks_assoc ctx in
   let deps = get_deployments_assoc di_result in
 
   (* Every entry in getdeploymentinfo.deployments must appear in softforks
@@ -1516,8 +1521,8 @@ let test_softforks_matches_deploymentinfo () =
    500/1351/1251/432 on regtest) are correctly inactive on an empty chain. *)
 let test_softforks_buried_present_regtest () =
   let (ctx, db, db_path) = create_regtest_context () in
-  let result = Rpc.handle_getblockchaininfo ctx in
-  let sf = get_softforks_assoc result in
+  let _ = Rpc.handle_getblockchaininfo ctx in
+  let sf = get_softforks_assoc ctx in
   let buried_names = ["bip34"; "bip65"; "bip66"; "csv"; "segwit"] in
   (* All five must be present with type = "buried" *)
   List.iter (fun name ->

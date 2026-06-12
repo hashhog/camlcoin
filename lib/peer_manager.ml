@@ -2003,7 +2003,7 @@ let peer_message_loop (pm : t) (peer : Peer.peer) : unit Lwt.t =
             if Peer.should_send_feefilter peer then
               let min_fee = match pm.mempool with
                 | Some mp -> mp.Mempool.min_relay_fee
-                | None -> 1000L (* default 1 sat/vB *)
+                | None -> 100L (* DEFAULT_MIN_RELAY_TX_FEE, policy.h:70 *)
               in
               let* _sent = Peer.maybe_send_feefilter peer min_fee in
               Lwt.return_unit

@@ -237,6 +237,34 @@ type chain_state = {
 
      Mirrors Bitcoin Core's [CoinStatsIndex] singleton attached to
      [ChainstateManager] ([src/index/coinstatsindex.cpp]). *)
+  mutable txospenderindex : Txospender_index.t option;
+  (* Transaction-output spender index handle (Bitcoin Core
+     [-txospenderindex]).
+
+     [Some _] when the daemon was started with --txospenderindex=1; [None]
+     otherwise. Every connect-block path in this module calls
+     [txospender_connect_if_enabled] when this is [Some], writing
+     [spent_outpoint -> spending tx] for every non-coinbase input, in
+     lockstep with the validated-tip advance. Every disconnect path
+     ([reorganize]'s disconnect loop, [disconnect_to_target],
+     [disconnect_to_target_via_utxo] / [invalidate_block]) calls
+     [txospender_disconnect_if_enabled] with the disconnected block so the
+     keys it wrote are RE-DERIVED from the block's own inputs and erased
+     (Core [CustomRemove]). Unlike coinstatsindex (per-height snapshot,
+     trivially rewindable) the spender keys are derived from each block's
+     inputs, so the disconnect side must be handed the actual disconnected
+     block — wired into BOTH the invalidateblock path AND the live reorg
+     path, disconnect-BEFORE-connect. The handle is created in [cli.ml]
+     after [restore_chain_state] returns and before any block listener is
+     wired; the graceful-shutdown phase calls [Txospender_index.close].
+
+     With the index [Some], [gettxspendingprevout] can resolve a CONFIRMED
+     spend (and report its blockhash); with [None] a non-mempool query
+     throws Core's "Mempool lacks a relevant spend, and txospenderindex is
+     unavailable." error.
+
+     Mirrors Bitcoin Core's [TxoSpenderIndex] singleton attached to
+     [ChainstateManager] ([src/index/txospenderindex.cpp]). *)
   mutable wallet_scan_hook : (Types.block -> int -> unit) option;
   (* Wallet block-connect notification, mirroring Bitcoin Core's
      [CWallet::blockConnected] (wallet/wallet.cpp).  Installed by [cli.ml] /
@@ -758,6 +786,7 @@ let create_chain_state (db : Storage.ChainDB.t)
     block_submission_paused = false;
     bip157_index = None;
     coinstatsindex = None;
+    txospenderindex = None;
     wallet_scan_hook = None;
     wallet_unscan_hook = None;
     mempool_remove_hook = None;
@@ -808,6 +837,7 @@ let restore_chain_state (db : Storage.ChainDB.t)
     block_submission_paused = false;
     bip157_index = None;
     coinstatsindex = None;
+    txospenderindex = None;
     wallet_scan_hook = None;
     wallet_unscan_hook = None;
     mempool_remove_hook = None;
@@ -2043,6 +2073,50 @@ let coinstats_rewind_if_enabled (chain : chain_state) ~(target_height : int)
   | None -> ()
   | Some idx -> Coinstats_index.rewind_to idx ~target_height
 
+(* ============================================================================
+   Tx-output spender index connect / disconnect hooks
+   ============================================================================
+
+   These mirror the coinstats_*_if_enabled helpers: a no-op when
+   [chain.txospenderindex = None], so every connect / disconnect call site can
+   invoke them unconditionally.  On connect we write
+   [spent_outpoint -> spending tx] for every non-coinbase input; on disconnect
+   we RE-DERIVE the exact same keys from the disconnected block's own inputs
+   and erase them (Core [CustomRemove], no undo data).
+
+   ⚠️ REORG-SAFETY — the disconnect side takes the BLOCK (not just a height /
+   target like coinstats' snapshot rewind) because the keys are a pure
+   function of the block's inputs.  It is wired into BOTH the invalidateblock
+   path AND the live reorg path's disconnect loop, disconnect-BEFORE-connect,
+   so a reorg that spends the same outpoint by different txs on each branch
+   erases the old-branch key before the new-branch key is written.
+
+   Mirrors Bitcoin Core's [TxoSpenderIndex::CustomAppend] / [CustomRemove]
+   firing from [BaseIndex::BlockConnected] / [BlockDisconnected]
+   ([src/index/txospenderindex.cpp]). *)
+
+(* Connect hook: write the block's spend keys (no-op when index is off). *)
+let txospender_connect_if_enabled
+    (chain : chain_state) ~(block : Types.block) ~(height : int) : unit =
+  match chain.txospenderindex with
+  | None -> ()
+  | Some idx ->
+    let block_hash = Crypto.compute_block_hash block.Types.header in
+    Txospender_index.connect_block idx ~block ~height ~block_hash
+
+(* Disconnect hook: erase the block's spend keys (no-op when index is off).
+   [prev_block_hash] is the block's parent hash, used to roll the best-pointer
+   back to the now-tip; [block.header.prev_block] supplies it. *)
+let txospender_disconnect_if_enabled
+    (chain : chain_state) ~(block : Types.block) ~(height : int) : unit =
+  match chain.txospenderindex with
+  | None -> ()
+  | Some idx ->
+    let prev_block_hash =
+      if height <= 0 then None else Some block.Types.header.Types.prev_block
+    in
+    Txospender_index.disconnect_block idx ~block ~height ~prev_block_hash
+
 (* IBD configuration constants *)
 let max_blocks_per_peer = 16           (* Max in-flight blocks per peer, matching Bitcoin Core MAX_BLOCKS_IN_TRANSIT_PER_PEER *)
 let max_total_blocks_in_flight = 128   (* Global cap on blocks in flight (8 peers × 16 per peer) *)
@@ -2982,6 +3056,11 @@ let process_downloaded_blocks ?(max_blocks = 1)
               [CoinStatsIndex::CustomAppend]. *)
            coinstats_connect_if_enabled ibd.chain ~block ~height
              ~spent_utxos:spent_utxo_list;
+           (* Tx-output spender index append on the IBD connect path (no-op
+              when --txospenderindex is off). Writes [spent_outpoint ->
+              spending tx] for every non-coinbase input. Mirrors Core's
+              [TxoSpenderIndex::CustomAppend]. *)
+           txospender_connect_if_enabled ibd.chain ~block ~height;
            (* Fix 3: Skip block/undo storage during assume-valid IBD *)
            if not ibd_mode then begin
              (* Store block *)
@@ -3346,6 +3425,12 @@ let disconnect_to_target (state : chain_state) (target : header_entry)
                   [reorganize] will rebuild it on the connect path
                   when the chain is re-applied. *)
                Storage.ChainDB.delete_undo_data state.db entry.hash;
+               (* Tx-output spender index erase (DB-direct disconnect path,
+                  e.g. dumptxoutset rollback / invalidateblock without a
+                  threaded UTXO set). RE-DERIVES this block's spend keys and
+                  erases them. No-op when --txospenderindex is off. *)
+               txospender_disconnect_if_enabled state ~block
+                 ~height:entry.height;
                disconnect rest
        in
        (match disconnect (List.rev to_disconnect) with
@@ -3455,6 +3540,14 @@ let disconnect_to_target_via_utxo (state : chain_state)
                     ) tx_undo.spent_outputs
                 ) undo.tx_undos;
                 Storage.ChainDB.delete_undo_data state.db entry.hash;
+                (* Tx-output spender index erase on the invalidateblock /
+                   UTXO-aware disconnect path. RE-DERIVES this block's spend
+                   keys and erases them, mirroring Core's
+                   [TxoSpenderIndex::CustomRemove] following
+                   [InvalidateBlock] -> [DisconnectTip]. No-op when
+                   --txospenderindex is off. *)
+                txospender_disconnect_if_enabled state ~block
+                  ~height:entry.height;
                 disconnect rest)
        in
        (match disconnect (List.rev to_disconnect) with
@@ -4138,6 +4231,17 @@ let disconnect_block_into_batch
              let txid = Crypto.compute_txid tx in
              Storage.ChainDB.batch_delete_tx_index batch txid
            ) block.transactions;
+           (* Tx-output spender index erase on the LIVE reorg-DISCONNECT half
+              (no-op when --txospenderindex is off). RE-DERIVES this block's
+              spend keys from its own inputs and erases them, mirroring Core's
+              [TxoSpenderIndex::CustomRemove]. This is the live reorg path
+              (a heavier branch orphaning these blocks); it fires per
+              disconnected block BEFORE the connect half re-writes the new
+              branch's keys, so a same-outpoint re-spend by a different tx on
+              the new branch is correct. The invalidateblock path
+              ([disconnect_to_target] / [disconnect_to_target_via_utxo])
+              erases via the same hook. *)
+           txospender_disconnect_if_enabled state ~block ~height:entry.height;
            let result =
              if !fclean then Disconnect_ok else Disconnect_unclean
            in
@@ -4287,6 +4391,15 @@ let connect_block_into_batch
           connect side. *)
        coinstats_connect_if_enabled_from_entries state ~block ~height
          ~spent_entries;
+       (* Tx-output spender index append on the reorg-CONNECT half (no-op
+          when --txospenderindex is off). The reorg disconnect half already
+          erased the disconnected branch's spend keys per-block (see
+          [reorganize]), so this append at [height] writes the new branch's
+          keys. disconnect-BEFORE-connect ordering makes a same-outpoint
+          re-spend by a different tx correct. Mirrors Core's
+          [TxoSpenderIndex] following the connect side of
+          [ActivateBestChainStep]. *)
+       txospender_connect_if_enabled state ~block ~height;
        (* Stage tx_index pointers (Pattern C0 counterpart of
           [TxIndex::CustomAppend]). The raw tx blob goes into the
           [tx] CF, the txid->(block_hash, tx_idx) pointer into the
@@ -5241,6 +5354,76 @@ let backfill_coinstats_index (state : chain_state) : int =
     end
 
 (* ============================================================================
+   Tx-output spender index startup backfill
+
+   Reference: Bitcoin Core's [TxoSpenderIndex::CustomInit] + [BaseIndex::Sync]
+   ([src/index/txospenderindex.cpp]). Symmetric to [backfill_coinstats_index]
+   but simpler: the spender index needs only each block's OWN inputs (NO undo
+   data), so on every daemon start, if --txospenderindex is enabled, we walk
+   the stored chain from [best_indexed_height + 1] up to [blocks_synced],
+   re-reading each block body and feeding it into
+   [Txospender_index.connect_block]. The genesis block has only a coinbase, so
+   it indexes nothing (just advances the best pointer). If a block body is
+   missing (pruned), the backfill stops. Returns the count of heights newly
+   indexed. *)
+let backfill_txospender_index (state : chain_state) : int =
+  match state.txospenderindex with
+  | None -> 0
+  | Some idx ->
+    let target = state.blocks_synced in
+    let start = Txospender_index.best_height idx + 1 in
+    if start > target then 0
+    else begin
+      Logs.info (fun m ->
+        m "txospenderindex: starting backfill from height %d to %d (%d blocks)"
+          start target (target - start + 1));
+      let count = ref 0 in
+      let progress_step = 10000 in
+      (try
+        for h = start to target do
+          match get_header_at_height state h with
+          | None -> raise Exit
+          | Some entry ->
+            let block_opt =
+              if h = 0 then
+                (* Genesis: camlcoin stores only the genesis HEADER. The
+                   genesis coinbase spends nothing, so the spender index has
+                   no keys for it; synthesize a coinbase-only body so
+                   [connect_block] just advances the best pointer keyed by the
+                   genesis hash. *)
+                Some {
+                  Types.header = state.network.genesis_header;
+                  transactions = [];
+                }
+              else Storage.ChainDB.get_block state.db entry.hash
+            in
+            (match block_opt with
+             | None ->
+               Logs.warn (fun m ->
+                 m "txospenderindex: stopping backfill at height %d (block \
+                    body not on disk — pruned or missing)" h);
+               raise Exit
+             | Some block ->
+               let block_hash =
+                 if h = 0 then Crypto.compute_block_hash
+                                 state.network.genesis_header
+                 else entry.hash
+               in
+               Txospender_index.connect_block idx ~block ~height:h ~block_hash;
+               incr count;
+               if !count mod progress_step = 0 then
+                 Logs.info (fun m ->
+                   m "txospenderindex: backfill progress: %d/%d (height %d)"
+                     !count (target - start + 1) h))
+        done
+      with Exit -> ());
+      Logs.info (fun m ->
+        m "txospenderindex: backfill complete, %d new entries (best_height=%d)"
+          !count (Txospender_index.best_height idx));
+      !count
+    end
+
+(* ============================================================================
    Post-IBD Block Processing
    ============================================================================ *)
 
@@ -5325,6 +5508,11 @@ let rec connect_stored_blocks (state : chain_state) : int =
              drain connect path. *)
           coinstats_connect_if_enabled state ~block:stored_block
             ~height:next_height ~spent_utxos;
+          (* Tx-output spender index append for the gap-fill catch-up connect
+             path (no-op when --txospenderindex is off). PRIMARY out-of-order
+             drain connect path. *)
+          txospender_connect_if_enabled state ~block:stored_block
+            ~height:next_height;
           let ops = ref [] in
           List.iteri (fun tx_idx tx ->
             let is_cb = (tx_idx = 0) in
@@ -5557,6 +5745,10 @@ let process_new_block ?(f_requested = false)
              [CoinStatsIndex::CustomAppend]. PRIMARY post-IBD P2P connect
              path. *)
           coinstats_connect_if_enabled state ~block ~height ~spent_utxos;
+          (* Tx-output spender index append (no-op when --txospenderindex is
+             off). Mirrors Core's [TxoSpenderIndex::CustomAppend]. PRIMARY
+             post-IBD P2P connect path. *)
+          txospender_connect_if_enabled state ~block ~height;
           (* Collect UTXO mutations for a single atomic block commit *)
           let ops = ref [] in
           List.iteri (fun tx_idx tx ->

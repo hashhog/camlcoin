@@ -85,6 +85,16 @@ type config = {
        [false] (default, matching Core DEFAULT_COINSTATSINDEX), a non-tip
        [gettxoutsetinfo] query returns Core's -8
        "Querying specific block heights requires coinstatsindex". *)
+  txospenderindex : bool;
+    (* Mirrors Bitcoin Core's -txospenderindex
+       (init.cpp / index/txospenderindex.cpp). When [true], the daemon
+       maintains a [spent outpoint -> spending tx] index at
+       [<data_dir>/indexes/txospender], updated on every block
+       connect/disconnect/reorg, so [gettxspendingprevout] can resolve a
+       CONFIRMED spend (and report its blockhash) — not just mempool spends.
+       When [false] (default, matching Core DEFAULT_TXOSPENDERINDEX), a
+       non-mempool [gettxspendingprevout] query throws Core's "Mempool lacks
+       a relevant spend, and txospenderindex is unavailable." *)
   asmap_path : string option;
     (* Path to an ASMap binary file for IP-to-ASN mapping (eclipse protection).
        Mirrors Bitcoin Core's -asmap=<file> flag (init.cpp).  When set, peer
@@ -173,6 +183,7 @@ let default_config : config = {
   rest_bind = None;
   blockfilterindex_basic = false;  (* Mirrors Core DEFAULT_BLOCKFILTERINDEX *)
   coinstatsindex = false;  (* Mirrors Core DEFAULT_COINSTATSINDEX *)
+  txospenderindex = false;  (* Mirrors Core DEFAULT_TXOSPENDERINDEX *)
   asmap_path = None;
   proxy = None;
   onion = None;
@@ -403,6 +414,38 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         Logs.err (fun m ->
           m "coinstatsindex: failed to open index at %s: %s"
             (Filename.concat config.data_dir "indexes/coinstats")
+            (Printexc.to_string exn));
+        None
+    end
+  in
+
+  (* Tx-output spender index.  Mirrors Bitcoin Core's -txospenderindex
+     (init.cpp + index/txospenderindex.cpp).  Created here so it's attached to
+     [chain] before any IBD or post-IBD block listener fires; closed in
+     graceful_shutdown.  When the flag is off we leave
+     [chain.txospenderindex = None] and every connect/disconnect path no-ops
+     via the txospender_*_if_enabled helpers, so a non-mempool
+     gettxspendingprevout keeps Core's "txospenderindex is unavailable" error. *)
+  let txospenderindex =
+    if not config.txospenderindex then None
+    else begin
+      try
+        let idx = Txospender_index.create ~data_dir:config.data_dir in
+        chain.txospenderindex <- Some idx;
+        Logs.info (fun m ->
+          m "txospenderindex opened at %s (best_height=%d, target=%d)"
+            (Txospender_index.root_dir idx)
+            (Txospender_index.best_height idx)
+            chain.blocks_synced);
+        (* Synchronous startup backfill so the upcoming RPC listener can
+           immediately answer gettxspendingprevout for any confirmed spend.
+           Bounded by [chain.blocks_synced]; stops on missing block bodies. *)
+        let _ = Sync.backfill_txospender_index chain in
+        Some idx
+      with exn ->
+        Logs.err (fun m ->
+          m "txospenderindex: failed to open index at %s: %s"
+            (Filename.concat config.data_dir "indexes/txospender")
             (Printexc.to_string exn));
         None
     end
@@ -2370,6 +2413,17 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
        with exn ->
          Logs.warn (fun m ->
            m "coinstatsindex: close failed: %s" (Printexc.to_string exn))));
+    (* Phase 4b'': flush + close the tx-output spender index. Same ordering
+       rationale as the BIP-157 / coinstats closes above. Best-effort. *)
+    (match txospenderindex with
+     | None -> ()
+     | Some idx ->
+       (try
+         Txospender_index.close idx;
+         Logs.info (fun m -> m "txospenderindex: flushed and closed")
+       with exn ->
+         Logs.warn (fun m ->
+           m "txospenderindex: close failed: %s" (Printexc.to_string exn))));
     (* Phase 4: close databases. *)
     Logs.info (fun m -> m "closing DB");
     (try Rocksdb_store.close rocksdb

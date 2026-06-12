@@ -10565,6 +10565,22 @@ let handle_getindexinfo (ctx : rpc_context)
         ~best_block_height:best
         entries
   in
+  (* txospenderindex — only when enabled (chain.txospenderindex = Some _).
+     Core's GetName() for TxoSpenderIndex is the literal "txospenderindex"
+     (src/index/txospenderindex.cpp). best_block_height = highest indexed
+     height (clamped to 0 for an empty index); synced = it has reached the
+     validated block tip. *)
+  let entries =
+    match ctx.chain.txospenderindex with
+    | None -> entries
+    | Some idx ->
+      let best = Txospender_index.best_height idx in
+      let best = if best < 0 then 0 else best in
+      summary ~name:"txospenderindex"
+        ~synced:(best >= block_tip)
+        ~best_block_height:best
+        entries
+  in
   Ok (`Assoc entries)
 
 (* ----- getnodeaddresses — read-only addrman dump ----- *)
@@ -10726,6 +10742,210 @@ let handle_addpeeraddress (ctx : rpc_context)
        Ok (`Assoc [("success", `Bool success)]))
 
 (* ============================================================================
+   gettxspendingprevout — Core rpc/mempool.cpp:897-1041
+   ============================================================================
+
+   Scans the mempool (and the txospenderindex, if available) for transactions
+   spending any of the given outputs.
+
+   Params:
+     [0] outputs : ARR of {txid, vout} (REQUIRED, non-empty). Empty ->
+         "Invalid parameter, outputs are missing". Negative vout ->
+         "Invalid parameter, vout cannot be negative". Unknown keys rejected.
+     [1] options : OBJ (optional), strict:
+           mempool_only       : BOOL, default = (txospenderindex unavailable).
+                                When false and mempool lacks a relevant spend,
+                                consult the index (throws if unavailable).
+           return_spending_tx : BOOL, default false. When true, include the
+                                full spending tx hex.
+
+   Algorithm (Core order):
+     1. mempool reverse-index (GetConflictTx) first. If the outpoint is spent
+        in the mempool OR this is a mempool_only request, emit the result and
+        drop it from the worklist.
+     2. If all resolved, return early.
+     3. Otherwise the index is required: if absent, throw "Mempool lacks a
+        relevant spend, and txospenderindex is unavailable." For each remaining
+        outpoint, FindSpender in the index; if found, emit
+        txid/vout/spendingtxid(+spendingtx)/blockhash; else emit a bare
+        txid/vout (unspent).
+
+   pushKV order per result: txid, vout, spendingtxid (if found), spendingtx
+   (iff return_spending_tx and found), blockhash (CONFIRMED/index path only). *)
+
+(* Parse a strict {txid, vout} output object, rejecting unknown keys and
+   matching Core's exact error strings.  Returns the internal-byte-order
+   outpoint plus the display txid hex (for the bare echo in the result). *)
+let parse_spendingprevout_output (obj : Yojson.Safe.t)
+    : (Types.outpoint * string, int * string) result =
+  match obj with
+  | `Assoc fields ->
+    (* Strict unknown-key reject (Core RPCTypeCheckObj fStrict=true). *)
+    let unknown =
+      List.find_opt (fun (k, _) -> k <> "txid" && k <> "vout") fields in
+    (match unknown with
+     | Some (k, _) ->
+       Error (rpc_type_error, Printf.sprintf "Unexpected key %s" k)
+     | None ->
+       let txid_hex_r = match List.assoc_opt "txid" fields with
+         | Some (`String s) -> Ok s
+         | Some _ -> Error (rpc_type_error, "Expected type string for txid")
+         | None -> Error (rpc_type_error, "Missing txid")
+       in
+       (match txid_hex_r with
+        | Error e -> Error e
+        | Ok txid_hex ->
+          (match parse_blockhash_hex txid_hex with
+           | Error _ -> Error (rpc_type_error, "txid must be hexadecimal string")
+           | Ok txid ->
+             let vout_r = match List.assoc_opt "vout" fields with
+               | Some (`Int n) -> Ok n
+               | Some (`Intlit s) ->
+                 (match int_of_string_opt s with
+                  | Some n -> Ok n
+                  | None -> Error (rpc_type_error, "Expected type number for vout"))
+               | Some _ -> Error (rpc_type_error, "Expected type number for vout")
+               | None -> Error (rpc_type_error, "Missing vout")
+             in
+             (match vout_r with
+              | Error e -> Error e
+              | Ok n ->
+                if n < 0 then
+                  Error (rpc_invalid_parameter,
+                         "Invalid parameter, vout cannot be negative")
+                else
+                  Ok ({ Types.txid; vout = Int32.of_int n }, txid_hex)))))
+  | _ -> Error (rpc_type_error, "Expected output object {txid, vout}")
+
+let handle_gettxspendingprevout (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  (* Param 0: outputs array (required, non-empty). *)
+  let outputs_r = match params with
+    | (`List l) :: _ -> Ok l
+    | _ -> Error (rpc_invalid_parameter, "Invalid parameter, outputs are missing")
+  in
+  match outputs_r with
+  | Error e -> Error e
+  | Ok outputs ->
+    if outputs = [] then
+      Error (rpc_invalid_parameter, "Invalid parameter, outputs are missing")
+    else begin
+      (* Param 1: options object (optional), strict keys. *)
+      let options_r = match params with
+        | _ :: (`Assoc opts) :: _ ->
+          let unknown = List.find_opt (fun (k, _) ->
+            k <> "mempool_only" && k <> "return_spending_tx") opts in
+          (match unknown with
+           | Some (k, _) -> Error (rpc_type_error, Printf.sprintf "Unexpected key %s" k)
+           | None -> Ok opts)
+        | _ :: `Null :: _ | [_] | [] -> Ok []
+        | _ :: _ :: _ -> Error (rpc_type_error, "options must be an object")
+      in
+      match options_r with
+      | Error e -> Error e
+      | Ok opts ->
+        let index_available = ctx.chain.txospenderindex <> None in
+        let bool_opt key default = match List.assoc_opt key opts with
+          | Some (`Bool b) -> Ok b
+          | Some _ -> Error (rpc_type_error, Printf.sprintf "Expected type bool for %s" key)
+          | None -> Ok default
+        in
+        (* Default mempool_only = true iff the index is unavailable. *)
+        match bool_opt "mempool_only" (not index_available),
+              bool_opt "return_spending_tx" false with
+        | Error e, _ | _, Error e -> Error e
+        | Ok mempool_only, Ok return_spending_tx ->
+          (* Parse all outputs up front (fail fast on malformed input). *)
+          let rec parse_all acc = function
+            | [] -> Ok (List.rev acc)
+            | o :: rest ->
+              (match parse_spendingprevout_output o with
+               | Error e -> Error e
+               | Ok parsed -> parse_all (parsed :: acc) rest)
+          in
+          match parse_all [] outputs with
+          | Error e -> Error e
+          | Ok parsed_outputs ->
+            (* Build a result object for one outpoint.  When [spending_tx] is
+               Some, include spendingtxid (+ spendingtx if requested).
+               [blockhash] is added by the caller for the confirmed/index
+               path only. *)
+            let make_output txid_hex vout
+                (spending_tx : Types.transaction option) : (string * Yojson.Safe.t) list =
+              let base = [ ("txid", `String txid_hex);
+                           ("vout", `Int (Int32.to_int vout)) ] in
+              match spending_tx with
+              | None -> base
+              | Some tx ->
+                let base = base @
+                  [ ("spendingtxid",
+                     `String (Types.hash256_to_hex_display (Crypto.compute_txid tx))) ] in
+                if return_spending_tx then
+                  base @ [ ("spendingtx", `String (tx_to_hex tx)) ]
+                else base
+            in
+            (* Pass 1: mempool reverse-index.  map_next_tx maps
+               (txid_str, vout) -> spending txid_key; entries resolves it to
+               the full tx.  Mirrors Core CTxMemPool::GetConflictTx. *)
+            let mp = ctx.mempool in
+            let results = ref [] in       (* completed result objects (rev) *)
+            let unresolved = ref [] in    (* (outpoint, txid_hex) still open *)
+            List.iter (fun ((outpoint : Types.outpoint), txid_hex) ->
+              let key = (Cstruct.to_string outpoint.Types.txid, outpoint.Types.vout) in
+              let mempool_spender =
+                match Hashtbl.find_opt mp.Mempool.map_next_tx key with
+                | Some spending_key ->
+                  (match Hashtbl.find_opt mp.Mempool.entries spending_key with
+                   | Some entry -> Some entry.Mempool.tx
+                   | None -> None)
+                | None -> None
+              in
+              match mempool_spender with
+              | Some tx ->
+                results := `Assoc (make_output txid_hex outpoint.Types.vout (Some tx)) :: !results
+              | None ->
+                if mempool_only then
+                  (* Unspent in the mempool and the request is mempool-only:
+                     emit the bare outpoint (unspent). *)
+                  results := `Assoc (make_output txid_hex outpoint.Types.vout None) :: !results
+                else
+                  unresolved := (outpoint, txid_hex) :: !unresolved
+            ) parsed_outputs;
+            let unresolved = List.rev !unresolved in
+            (* Return early if the mempool pass (or mempool_only) handled all. *)
+            if unresolved = [] then
+              Ok (`List (List.rev !results))
+            else begin
+              (* Pass 2: the index is required. *)
+              match ctx.chain.txospenderindex with
+              | None ->
+                Error (rpc_misc_error,
+                       "Mempool lacks a relevant spend, and txospenderindex is unavailable.")
+              | Some idx ->
+                List.iter (fun ((outpoint : Types.outpoint), txid_hex) ->
+                  match Txospender_index.find_spender idx outpoint with
+                  | Some spender ->
+                    (* Decode the stored spending tx for the result. *)
+                    let tx =
+                      let r = Serialize.reader_of_cstruct spender.Txospender_index.spending_tx_bytes in
+                      Serialize.deserialize_transaction r
+                    in
+                    let fields =
+                      make_output txid_hex outpoint.Types.vout (Some tx) @
+                      [ ("blockhash",
+                         `String (Types.hash256_to_hex_display
+                                    spender.Txospender_index.block_hash)) ]
+                    in
+                    results := `Assoc fields :: !results
+                  | None ->
+                    (* Unspent on-chain too: bare outpoint. *)
+                    results := `Assoc (make_output txid_hex outpoint.Types.vout None) :: !results
+                ) unresolved;
+                Ok (`List (List.rev !results))
+            end
+    end
+
+(* ============================================================================
    RPC Method Dispatcher
    ============================================================================ *)
 
@@ -10875,6 +11095,10 @@ let dispatch_rpc (ctx : rpc_context)
        -8 (RPC_INVALID_PARAMETER) "Invalid verbosity value <n>" for an
        out-of-range verbosity. Pass them through verbatim. *)
     handle_getorphantxs ctx params
+  | "gettxspendingprevout" ->
+    (* handle_gettxspendingprevout already returns Core-exact (code, message)
+       pairs (-8 outputs-missing / vout-negative, -1 index-unavailable). *)
+    handle_gettxspendingprevout ctx params
   | "testmempoolaccept" ->
     (match handle_testmempoolaccept ctx params with
      | Ok r -> Ok r

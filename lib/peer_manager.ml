@@ -251,6 +251,19 @@ type t = {
      -seednode time to populate the book before we fall back. *)
   mutable fixed_seeds_added : bool;
   mutable start_ts : float;
+  (* P2P anti-eclipse: feeler + getaddr anti-DoS guards (Core net.cpp
+     ThreadOpenConnections FEELER branch + net_processing.cpp getaddr guards).
+     [last_feeler] is the wall-clock time the last feeler probe was opened
+     (FEELER_INTERVAL = 120s gate); [feeler_in_flight] counts feelers currently
+     connecting/handshaking so we never exceed MAX_FEELER_CONNECTIONS = 1.
+     [getaddr_recvd] is the per-peer one-shot guard (Core m_getaddr_recvd):
+     only the FIRST getaddr per connection is answered.  [addr_token] is the
+     per-peer inbound-addr token bucket (Core m_addr_token_bucket /
+     m_addr_token_timestamp): (bucket, last_refill_time). *)
+  mutable last_feeler : float;
+  mutable feeler_in_flight : int;
+  getaddr_recvd : (int, bool) Hashtbl.t;
+  addr_token : (int, float * float) Hashtbl.t;
 }
 
 (* Generate a 256-bit eclipse-protection bucket key from /dev/urandom.
@@ -300,6 +313,10 @@ let create ?(config = default_config) ?(asmap : bytes option = None) (network : 
     connect_peers = [];
     fixed_seeds_added = false;
     start_ts = Unix.gettimeofday ();
+    last_feeler = 0.0;
+    feeler_in_flight = 0;
+    getaddr_recvd = Hashtbl.create 64;
+    addr_token = Hashtbl.create 64;
   }
 
 (* Pin the node to a fixed set of --connect peers (Bitcoin Core -connect).
@@ -1210,6 +1227,9 @@ let remove_peer (pm : t) (peer_id : int) : unit Lwt.t =
     Hashtbl.remove pm.peer_last_tx_time peer_id;
     Hashtbl.remove pm.peer_last_block_time peer_id;
     Hashtbl.remove pm.peer_connected_time peer_id;
+    (* Clean up getaddr one-shot guard + inbound-addr token bucket (anti-DoS). *)
+    Hashtbl.remove pm.getaddr_recvd peer_id;
+    Hashtbl.remove pm.addr_token peer_id;
     (* Clean up stale peer tracking *)
     Hashtbl.remove pm.stale_state peer_id;
     (* Remove from outbound netgroup tracking if outbound peer *)
@@ -1505,6 +1525,204 @@ let get_connection_candidates (pm : t) (count : int) : peer_info list =
   (* Take first 'count' candidates *)
   List.filteri (fun i _ -> i < count) sorted
 
+(* ===================================================================
+   P2P anti-eclipse: feeler connections + getaddr anti-DoS guards.
+
+   Mirrors Bitcoin Core net.cpp ThreadOpenConnections FEELER branch
+   (net.h:61 FEELER_INTERVAL=2min, net.h:75 MAX_FEELER_CONNECTIONS=1) and the
+   net_processing.cpp getaddr guards (m_getaddr_recvd answer-once @4833;
+   MAX_PCT_ADDR_TO_SEND=23 @188; inbound-addr token-bucket
+   MAX_ADDR_RATE_PER_SECOND=0.1 + MAX_ADDR_PROCESSING_TOKEN_BUCKET=1000 @193).
+   Modelled on the rustoshi template (89c6d7f); camlcoin already has a Core
+   NEW/TRIED bucketed addrman (move_to_tried_table = Good()), so this is pure
+   wiring on top of it.
+   =================================================================== *)
+
+(* Core net.h:61 — open ONE short-lived feeler every FEELER_INTERVAL to probe a
+   NEW-table address; on a successful handshake the address is promoted
+   NEW->TRIED, keeping TRIED fresh (the primary eclipse-attack mitigation). *)
+let feeler_interval = 120.0
+(* Core net.h:75 MAX_FEELER_CONNECTIONS = 1 — at most one feeler in flight. *)
+let max_feeler_connections = 1
+(* Core net_processing.cpp:188 MAX_PCT_ADDR_TO_SEND = 23. *)
+let max_pct_addr_to_send = 23
+(* Core net_processing.cpp:190 MAX_ADDR_TO_SEND = 1000. *)
+let max_addr_to_send = 1000
+(* Core net_processing.cpp:193 MAX_ADDR_RATE_PER_SECOND = 0.1 tokens/sec. *)
+let max_addr_rate_per_second = 0.1
+(* Core net_processing.cpp:197 MAX_ADDR_PROCESSING_TOKEN_BUCKET = MAX_ADDR_TO_SEND. *)
+let max_addr_processing_token_bucket = 1000.0
+
+(* Compute the getaddr 23%-cap over an addrman of [size] entries: the number of
+   addresses we are willing to return in a single getaddr response, i.e.
+   min(MAX_ADDR_TO_SEND, ceil(0.23 * size)).  Mirrors Core's GetAddr_ cap
+   (addrman.cpp:798-803 nNodes = max_pct * nNodes / 100, then clamped to
+   max_addresses).  We use a ceil so a tiny non-empty addrman still shares at
+   least one address, matching the rustoshi template (min(1000, ceil(0.23*n))). *)
+let getaddr_cap (size : int) : int =
+  if size <= 0 then 0
+  else begin
+    let pct = (size * max_pct_addr_to_send + 99) / 100 in  (* ceil *)
+    let pct = if pct < 1 then 1 else pct in
+    min pct max_addr_to_send
+  end
+
+(* Number of addresses eligible to be shared in a getaddr response — the pool
+   the 23%-cap is computed over.  Core shares from the whole addrman; we use the
+   known_addrs size (new+tried union, the same set get_addr_dump walks). *)
+let shareable_count (pm : t) : int =
+  Hashtbl.length pm.known_addrs
+
+(* Select an address FROM THE NEW TABLE for a feeler probe (Core
+   addrman Select(newOnly=true), net.cpp ThreadOpenConnections FEELER branch).
+   Feelers exist to confirm NEW-table addresses are reachable so the
+   subsequent Good() promotes them NEW->TRIED.  We only consider addresses
+   whose table_status is InNew, that are routable, not banned, not already
+   connected, and not retried within the retry window.  Returns the chosen
+   (addr, port) or None when the NEW table yields no candidate. *)
+let select_for_feeler (pm : t) : (string * int) option =
+  let now = Unix.gettimeofday () in
+  let candidates = Hashtbl.fold (fun _ info acc ->
+    match info.table_status with
+    | InNew _ when
+        info.banned_until < now &&
+        is_routable info.address &&
+        now -. info.last_attempt > pm.config.retry_delay &&
+        not (List.exists (fun p -> p.Peer.addr = info.address) pm.peers) ->
+      info :: acc
+    | _ -> acc
+  ) pm.known_addrs [] in
+  match candidates with
+  | [] -> None
+  | _ ->
+    (* Pick uniformly at random from the NEW candidates (Core Select draws a
+       random bucket/position).  csprng so the choice is not predictable. *)
+    let n = List.length candidates in
+    let info = List.nth candidates (Peer.csprng_int_range n) in
+    Some (info.address, info.port)
+
+(* Promote a feeler-probed address NEW->TRIED on a SUCCESSFUL handshake only
+   (Core net.cpp:2816 addrman.Good() for feelers).  On a feeler FAILURE this
+   is never called, so TRIED is left unchanged — the falsification guard.
+   Reuses the existing move_to_tried_table (= Good()) so promotion goes through
+   the same NEW->TRIED path the normal outbound-success path uses, then records
+   the success bookkeeping on the known_addrs entry.  A feeler is short-lived
+   and is NOT added to the outbound netgroup-diversity set. *)
+let mark_feeler_success (pm : t) (addr : string) : unit =
+  match Hashtbl.find_opt pm.known_addrs addr with
+  | None -> ()
+  | Some info ->
+    let now = Unix.gettimeofday () in
+    let tried_bucket = move_to_tried_table pm addr in
+    Hashtbl.replace pm.known_addrs addr
+      { info with
+        last_connected = now;
+        last_success = now;
+        last_attempt = now;
+        failures = 0;
+        table_status = InTried tried_bucket }
+
+(* Refill a peer's inbound-addr token bucket and consume up to [requested]
+   tokens, returning how many addresses may be admitted (Core ProcessAddrs
+   token-bucket, net_processing.cpp:5644-5671).  The bucket refills at
+   MAX_ADDR_RATE_PER_SECOND tokens/sec since the last addr message, capped at
+   MAX_ADDR_PROCESSING_TOKEN_BUCKET; each admitted address costs one token; once
+   the bucket drops below 1.0 the remaining addresses are dropped (we hold no
+   Addr-permission peers, so all inbound addr traffic is rate-limited, matching
+   Core's default).  A peer with no prior state starts at bucket = 1.0. *)
+let take_addr_tokens (pm : t) (peer_id : int) (requested : int) : int =
+  let now = Unix.gettimeofday () in
+  let (bucket, last_ts) =
+    match Hashtbl.find_opt pm.addr_token peer_id with
+    | Some (b, ts) -> (b, ts)
+    | None -> (1.0, now)
+  in
+  (* Refill (skip when already at/above the soft cap, matching Core's
+     "don't increment if already full" guard). *)
+  let bucket =
+    if bucket < max_addr_processing_token_bucket then begin
+      let elapsed = Float.max (now -. last_ts) 0.0 in
+      let increment = elapsed *. max_addr_rate_per_second in
+      Float.min (bucket +. increment) max_addr_processing_token_bucket
+    end else bucket
+  in
+  (* Admit up to floor(bucket) addresses, bounded by the request size. *)
+  let admit = min (int_of_float (Float.floor bucket)) (max requested 0) in
+  let bucket = bucket -. float_of_int admit in
+  Hashtbl.replace pm.addr_token peer_id (bucket, now);
+  admit
+
+(* Open at most one short-lived feeler connection (Core net.cpp
+   ThreadOpenConnections FEELER branch).  Selects a NEW-table address (the
+   addresses a feeler exists to probe), dials it, completes the handshake, and
+   on SUCCESS promotes the address NEW->TRIED (mark_feeler_success -> Good())
+   then disconnects immediately; on FAILURE nothing is promoted, so TRIED stays
+   unchanged (the falsification guard).
+
+   A feeler is OFF the full-outbound budget: it does NOT count toward
+   max_outbound / max_block_relay_only and is NOT inserted into the outbound
+   netgroup-diversity set — it is a short-lived probe that disconnects right
+   after the handshake.  Bounded to MAX_FEELER_CONNECTIONS = 1 in flight and
+   gated to once per FEELER_INTERVAL = 120s.  No-ops under --connect pinning
+   (addrman-driven dialing is disabled) and when the NEW table is empty. *)
+let maybe_open_feeler (pm : t) : unit Lwt.t =
+  let open Lwt.Syntax in
+  let now = Unix.gettimeofday () in
+  (* --connect pinning: no addrman-driven outbound, so no feeler. *)
+  if connect_only pm then Lwt.return_unit
+  (* Bound: at most MAX_FEELER_CONNECTIONS in flight. *)
+  else if pm.feeler_in_flight >= max_feeler_connections then Lwt.return_unit
+  (* Gate: at most one feeler per FEELER_INTERVAL. *)
+  else if now -. pm.last_feeler < feeler_interval then Lwt.return_unit
+  else begin
+    match select_for_feeler pm with
+    | None -> Lwt.return_unit
+    | Some (addr, port) ->
+      pm.last_feeler <- now;
+      pm.feeler_in_flight <- pm.feeler_in_flight + 1;
+      (* Record the attempt so a never-answering NEW entry ages out. *)
+      (match Hashtbl.find_opt pm.known_addrs addr with
+       | Some info ->
+         Hashtbl.replace pm.known_addrs addr { info with last_attempt = now }
+       | None -> ());
+      let peer_ref = ref None in
+      Lwt.finalize
+        (fun () ->
+          Lwt.catch
+            (fun () ->
+              Log.debug (fun m -> m "Making feeler connection to %s:%d" addr port);
+              let* peer = Peer.connect_outbound_negotiated
+                ~network:pm.network ~addr ~port ~id:pm.next_peer_id
+                ~our_height:pm.our_height
+                ~proxy_config:(Some pm.config.proxy_config) () in
+              pm.next_peer_id <- pm.next_peer_id + 1;
+              peer_ref := Some peer;
+              (* Handshake SUCCESS: promote NEW->TRIED, then disconnect.
+                 The feeler is never added to pm.peers / netgroup diversity —
+                 it is a probe that tears down immediately. *)
+              mark_feeler_success pm addr;
+              Log.debug (fun m ->
+                m "Feeler to %s handshook; promoted NEW->TRIED, disconnecting" addr);
+              Lwt.catch (fun () -> Peer.disconnect peer) (fun _ -> Lwt.return_unit))
+            (fun exn ->
+              (* Handshake / connect FAILURE: do NOT call Good(); TRIED stays
+                 unchanged.  Record the failure on the addrman entry. *)
+              Log.debug (fun m ->
+                m "Feeler to %s:%d failed: %s" addr port (Printexc.to_string exn));
+              (match Hashtbl.find_opt pm.known_addrs addr with
+               | Some info ->
+                 Hashtbl.replace pm.known_addrs addr
+                   { info with failures = info.failures + 1; last_attempt = now }
+               | None -> ());
+              (match !peer_ref with
+               | Some peer ->
+                 Lwt.catch (fun () -> Peer.disconnect peer) (fun _ -> Lwt.return_unit)
+               | None -> Lwt.return_unit)))
+        (fun () ->
+          pm.feeler_in_flight <- pm.feeler_in_flight - 1;
+          Lwt.return_unit)
+  end
+
 (* Read-only dump of every known address (addrman new+tried union), as a
    [peer_info] list.  Backs the getnodeaddresses RPC, which is a read-only
    addrman dump (Bitcoin Core net.cpp:911-970,
@@ -1671,15 +1889,25 @@ let handle_addr (pm : t) (peer : Peer.peer) (addrs : (int32 * Types.net_addr) li
     | None -> (0, now)
   in
   let remaining = max_addrs_per_day - count in
+  (* Core inbound-addr token-bucket (net_processing.cpp:5644-5671): refill by
+     elapsed*0.1 capped at 1000, then admit at most floor(bucket) addresses and
+     drop the rest.  Layered on top of the coarse 24h window; the per-message
+     token bucket is the faithful Core mechanism (MAX_ADDR_RATE_PER_SECOND). *)
+  let n_addrs = List.length addrs in
+  let token_admit = take_addr_tokens pm peer.Peer.id n_addrs in
+  if token_admit < n_addrs then
+    Log.debug (fun m -> m "addr rate-limit (token bucket): dropped %d of %d \
+      addrs from peer %d" (n_addrs - token_admit) n_addrs peer.Peer.id);
   if remaining <= 0 then begin
     (* Rate limit exceeded, ignore all addresses *)
     Log.info (fun m -> m "Addr rate limit exceeded for peer %d (%s)"
       peer.Peer.id peer.Peer.addr);
     ()
   end else begin
-    (* Only process up to the remaining quota *)
-    let to_process = if List.length addrs > remaining then
-      List.filteri (fun i _ -> i < remaining) addrs
+    (* Admit min(token-bucket allowance, 24h-window remaining) addresses. *)
+    let quota = min remaining token_admit in
+    let to_process = if List.length addrs > quota then
+      List.filteri (fun i _ -> i < quota) addrs
     else
       addrs
     in
@@ -1726,7 +1954,19 @@ let handle_addr (pm : t) (peer : Peer.peer) (addrs : (int32 * Types.net_addr) li
   end
 
 (* Handle addrv2 messages (BIP155) — extract IPv4 addresses and add to known_addrs *)
-let handle_addrv2 (pm : t) (_peer : Peer.peer) (entries : P2p.addrv2_addr list) : unit =
+let handle_addrv2 (pm : t) (peer : Peer.peer) (entries : P2p.addrv2_addr list) : unit =
+  (* Core inbound-addr token-bucket (G12 fix): addrv2 is rate-limited exactly
+     like legacy addr — refill elapsed*0.1 capped 1000, admit floor(bucket),
+     drop the rest (net_processing.cpp:5644-5671). *)
+  let n_entries = List.length entries in
+  let token_admit = take_addr_tokens pm peer.Peer.id n_entries in
+  if token_admit < n_entries then
+    Log.debug (fun m -> m "addrv2 rate-limit (token bucket): dropped %d of %d \
+      addrs from peer %d" (n_entries - token_admit) n_entries peer.Peer.id);
+  let entries =
+    if n_entries > token_admit then List.filteri (fun i _ -> i < token_admit) entries
+    else entries
+  in
   List.iter (fun (entry : P2p.addrv2_addr) ->
     match entry.v2_network_id with
     | P2p.Addrv2_IPv4 when Cstruct.length entry.v2_addr = 4 ->
@@ -1800,6 +2040,105 @@ let relay_addr_to_random_peers (pm : t) (source : Peer.peer) : unit =
             (fun () -> Peer.send_message peer msg)
             (fun _exn -> Lwt.return_unit))
       ) targets
+    end
+  end
+
+(* Encode a known-address IPv4 string into a 16-byte IPv4-mapped IPv6 net_addr,
+   for legacy addr responses.  Returns None for non-dotted-quad strings. *)
+let net_addr_of_known (info : peer_info) : Types.net_addr option =
+  let parts = String.split_on_char '.' info.address in
+  if List.length parts <> 4 then None
+  else begin
+    let addr_bytes = Cstruct.create 16 in
+    for i = 0 to 9 do Cstruct.set_uint8 addr_bytes i 0 done;
+    Cstruct.set_uint8 addr_bytes 10 0xFF;
+    Cstruct.set_uint8 addr_bytes 11 0xFF;
+    let ok = ref true in
+    List.iteri (fun i s ->
+      match int_of_string_opt s with
+      | Some b when b >= 0 && b <= 255 -> Cstruct.set_uint8 addr_bytes (12 + i) b
+      | _ -> ok := false
+    ) parts;
+    if !ok then Some { Types.services = info.services; addr = addr_bytes; port = info.port }
+    else None
+  end
+
+(* Build the capped list of shareable addresses for a getaddr response.  The
+   response is capped at min(MAX_ADDR_TO_SEND, ceil(0.23 * addrman_size)) (Core
+   MAX_PCT_ADDR_TO_SEND).  The pool is the known_addrs union (new+tried), the
+   same set get_addr_dump walks; the getnodeaddresses RPC dump path stays
+   uncapped (byte-exact, a separate closed axis). *)
+let getaddr_shareable (pm : t) : peer_info list =
+  let cap = getaddr_cap (shareable_count pm) in
+  if cap <= 0 then []
+  else begin
+    let all = Hashtbl.fold (fun _ info acc -> info :: acc) pm.known_addrs [] in
+    (* Take up to [cap] (Core GetAddr_ draws a random subset; we take a prefix —
+       the cap is what matters for the anti-DoS guard). *)
+    List.filteri (fun i _ -> i < cap) all
+  end
+
+(* Respond to an inbound peer's GETADDR (Core net_processing.cpp:4816-4849).
+   Two anti-DoS guards apply:
+   - INBOUND-ONLY: only inbound connections are answered.  Answering outbound
+     getaddr enables an addr-stamping fingerprint attack; Core returns early for
+     non-inbound (net_processing.cpp:4821).
+   - ANSWER-ONCE (m_getaddr_recvd): only the FIRST getaddr per connection is
+     answered; repeats are ignored.
+   The response itself is capped at the 23% MAX_PCT_ADDR_TO_SEND limit. *)
+let handle_getaddr (pm : t) (peer : Peer.peer) : unit Lwt.t =
+  (* Core net_processing.cpp:4821: ignore getaddr from non-inbound peers. *)
+  if peer.Peer.direction <> Peer.Inbound then begin
+    Log.debug (fun m -> m "Ignoring getaddr from outbound peer %d" peer.Peer.id);
+    Lwt.return_unit
+  end
+  (* Core m_getaddr_recvd: answer at most once per connection. *)
+  else if (match Hashtbl.find_opt pm.getaddr_recvd peer.Peer.id with
+           | Some true -> true | _ -> false) then begin
+    Log.debug (fun m -> m "Ignoring repeated getaddr from peer %d" peer.Peer.id);
+    Lwt.return_unit
+  end else begin
+    Hashtbl.replace pm.getaddr_recvd peer.Peer.id true;
+    let shareable = getaddr_shareable pm in
+    if shareable = [] then Lwt.return_unit
+    else begin
+      let now = Int32.of_float (Unix.gettimeofday ()) in
+      Lwt.catch
+        (fun () ->
+          if peer.Peer.sendaddrv2 then begin
+            let entries = List.filter_map (fun info ->
+              match net_addr_of_known info with
+              | None -> None
+              | Some _ ->
+                let parts = String.split_on_char '.' info.address in
+                if List.length parts <> 4 then None
+                else begin
+                  let addr_bytes = Cstruct.create 4 in
+                  let ok = ref true in
+                  List.iteri (fun i s ->
+                    match int_of_string_opt s with
+                    | Some b when b >= 0 && b <= 255 -> Cstruct.set_uint8 addr_bytes i b
+                    | _ -> ok := false) parts;
+                  if !ok then Some {
+                    P2p.v2_time = now;
+                    v2_services = info.services;
+                    v2_network_id = P2p.Addrv2_IPv4;
+                    v2_addr = addr_bytes;
+                    v2_port = info.port } else None
+                end
+            ) shareable in
+            if entries = [] then Lwt.return_unit
+            else Peer.send_message peer (P2p.Addrv2Msg entries)
+          end else begin
+            let addrs = List.filter_map (fun info ->
+              match net_addr_of_known info with
+              | None -> None
+              | Some na -> Some (now, na)
+            ) shareable in
+            if addrs = [] then Lwt.return_unit
+            else Peer.send_message peer (P2p.AddrMsg addrs)
+          end)
+        (fun _exn -> Lwt.return_unit)
     end
   end
 
@@ -2043,6 +2382,10 @@ let peer_message_loop (pm : t) (peer : Peer.peer) : unit Lwt.t =
                 handle_addrv2 pm peer entries;
                 relay_addr_to_random_peers pm peer;
                 Lwt.return_unit
+              | P2p.GetaddrMsg ->
+                (* Anti-DoS getaddr response (Core net_processing.cpp:4816):
+                   inbound-only + answer-once + 23%-capped. *)
+                handle_getaddr pm peer
               | P2p.FeefilterMsg fee_rate ->
                 peer.Peer.feefilter <- fee_rate;
                 Lwt.return_unit
@@ -2363,6 +2706,12 @@ let maintain_connections (pm : t) : unit Lwt.t =
         in
         (* Check for stale chain tip *)
         let* () = check_stale_tip pm in
+        (* Anti-eclipse feeler probe (Core net.cpp ThreadOpenConnections FEELER
+           branch): every FEELER_INTERVAL=120s open ONE feeler to a NEW-table
+           address to keep TRIED fresh.  Internally gated/bounded/off-budget and
+           a no-op under --connect; fire-and-forget so a slow probe never stalls
+           the connection-maintenance loop. *)
+        Lwt.async (fun () -> maybe_open_feeler pm);
         (* Sleep before next iteration *)
         let* () = Lwt_unix.sleep 10.0 in
         loop ()

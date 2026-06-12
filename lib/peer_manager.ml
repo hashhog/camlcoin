@@ -1554,18 +1554,18 @@ let max_addr_rate_per_second = 0.1
 let max_addr_processing_token_bucket = 1000.0
 
 (* Compute the getaddr 23%-cap over an addrman of [size] entries: the number of
-   addresses we are willing to return in a single getaddr response, i.e.
-   min(MAX_ADDR_TO_SEND, ceil(0.23 * size)).  Mirrors Core's GetAddr_ cap
-   (addrman.cpp:798-803 nNodes = max_pct * nNodes / 100, then clamped to
-   max_addresses).  We use a ceil so a tiny non-empty addrman still shares at
-   least one address, matching the rustoshi template (min(1000, ceil(0.23*n))). *)
+   addresses we are willing to return in a single getaddr response.  Mirrors
+   Core's GetAddr_ cap EXACTLY (addrman.cpp:797-804):
+       nNodes = max_pct * nNodes / 100;   // integer FLOOR division
+       nNodes = std::min(nNodes, max_addresses);
+   Core uses C++ integer division (truncation toward zero = floor for the
+   non-negative operands here) and applies NO minimum-of-1, so a tiny addrman
+   below the 1/0.23≈4.35 threshold legitimately returns 0 (e.g. size=1..4 -> 0,
+   size=5 -> 1).  We previously rounded UP (ceil via +99) and forced a floor of
+   1, both of which diverged from Core; this is now a faithful integer floor. *)
 let getaddr_cap (size : int) : int =
   if size <= 0 then 0
-  else begin
-    let pct = (size * max_pct_addr_to_send + 99) / 100 in  (* ceil *)
-    let pct = if pct < 1 then 1 else pct in
-    min pct max_addr_to_send
-  end
+  else min (size * max_pct_addr_to_send / 100) max_addr_to_send
 
 (* Number of addresses eligible to be shared in a getaddr response — the pool
    the 23%-cap is computed over.  Core shares from the whole addrman; we use the
@@ -2064,8 +2064,9 @@ let net_addr_of_known (info : peer_info) : Types.net_addr option =
   end
 
 (* Build the capped list of shareable addresses for a getaddr response.  The
-   response is capped at min(MAX_ADDR_TO_SEND, ceil(0.23 * addrman_size)) (Core
-   MAX_PCT_ADDR_TO_SEND).  The pool is the known_addrs union (new+tried), the
+   response is capped at min(MAX_ADDR_TO_SEND, floor(0.23 * addrman_size)) (Core
+   MAX_PCT_ADDR_TO_SEND, integer floor — addrman.cpp:800).  The pool is the
+   known_addrs union (new+tried), the
    same set get_addr_dump walks; the getnodeaddresses RPC dump path stays
    uncapped (byte-exact, a separate closed axis). *)
 let getaddr_shareable (pm : t) : peer_info list =

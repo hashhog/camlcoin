@@ -12,7 +12,8 @@
          SUCCESS only (NOT on failure) + is bounded (1 in-flight, 120s) + does
          NOT consume the full-outbound budget.
      (2) GETADDR answered once (2nd getaddr from same peer ignored) + inbound-only.
-     (3) GETADDR 23%-cap: min(1000, ceil(0.23*addrman)).
+     (3) GETADDR 23%-cap: min(1000, floor(0.23*addrman)) = Core GetAddr_
+         integer floor (addrman.cpp:800).
      (4) inbound-addr token-bucket drops excess.
 
    Falsification: pre-impl camlcoin had no feeler / no getaddr response / no
@@ -41,18 +42,37 @@ let add_new pm addr =
 let in_tried pm addr = Peer_manager.is_in_tried_table pm addr
 
 (* ===== (3) 23%-cap formula ====================================== *)
-(* getaddr_cap n = min(1000, ceil(0.23*n)); 0 for empty addrman. *)
+(* getaddr_cap n = min(1000, floor(0.23*n)) = min(1000, 23*n/100) with C++
+   integer FLOOR division, matching Core GetAddr_ EXACTLY
+   (addrman.cpp:800 nNodes = max_pct * nNodes / 100; addrman.cpp:803 clamps to
+   max_addresses=MAX_ADDR_TO_SEND).  Core applies NO minimum-of-1, so a tiny
+   addrman below the 1/0.23≈4.35 threshold returns 0.  The distinguishing cases
+   (where floor != ceil) are the load-bearing assertions: N=10 -> 2 (NOT 3),
+   N=1 -> 0 (NOT 1), N=4 -> 0, N=5 -> 1. *)
 let test_getaddr_cap_formula () =
   Alcotest.(check int) "empty -> 0" 0 (Peer_manager.getaddr_cap 0);
-  (* ceil(0.23*1)=1 *)
-  Alcotest.(check int) "1 addr -> 1" 1 (Peer_manager.getaddr_cap 1);
-  (* ceil(0.23*10)=ceil(2.3)=3 *)
-  Alcotest.(check int) "10 addrs -> 3" 3 (Peer_manager.getaddr_cap 10);
-  (* ceil(0.23*100)=23 *)
+  (* DISTINGUISHING: floor(0.23*1)=floor(0.23)=0 (Core has no min-of-1) *)
+  Alcotest.(check int) "1 addr -> 0 (floor, no min-of-1)" 0
+    (Peer_manager.getaddr_cap 1);
+  (* DISTINGUISHING: floor(0.23*4)=floor(0.92)=0 *)
+  Alcotest.(check int) "4 addrs -> 0 (floor)" 0 (Peer_manager.getaddr_cap 4);
+  (* BOUNDARY: floor(0.23*5)=floor(1.15)=1 — first non-zero cap *)
+  Alcotest.(check int) "5 addrs -> 1 (floor boundary)" 1
+    (Peer_manager.getaddr_cap 5);
+  (* DISTINGUISHING: 23*10/100 = 230/100 = 2 (floor), NOT ceil 3 *)
+  Alcotest.(check int) "10 addrs -> 2 (FLOOR not 3)" 2
+    (Peer_manager.getaddr_cap 10);
+  (* DISTINGUISHING: 23*43/100 = 989/100 = 9 (floor), ceil would be 10 *)
+  Alcotest.(check int) "43 addrs -> 9 (FLOOR not 10)" 9
+    (Peer_manager.getaddr_cap 43);
+  (* floor(0.23*100)=23 (floor==ceil here, non-distinguishing but exact) *)
   Alcotest.(check int) "100 addrs -> 23" 23 (Peer_manager.getaddr_cap 100);
-  (* ceil(0.23*1000)=230 *)
+  (* DISTINGUISHING: 23*999/100 = 22977/100 = 229 (floor), ceil would be 230 *)
+  Alcotest.(check int) "999 addrs -> 229 (FLOOR not 230)" 229
+    (Peer_manager.getaddr_cap 999);
+  (* floor(0.23*1000)=230 *)
   Alcotest.(check int) "1000 addrs -> 230" 230 (Peer_manager.getaddr_cap 1000);
-  (* min(1000, ceil(0.23*100000)=23000)=1000 — clamps at MAX_ADDR_TO_SEND *)
+  (* min(1000, floor(0.23*100000)=23000)=1000 — clamps at MAX_ADDR_TO_SEND *)
   Alcotest.(check int) "100000 addrs -> 1000 (clamp)" 1000
     (Peer_manager.getaddr_cap 100000)
 

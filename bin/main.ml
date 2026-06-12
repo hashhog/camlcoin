@@ -302,6 +302,25 @@ let txindex_arg =
   Arg.(value & opt (some string) None &
     info ["txindex"] ~docv:"VAL" ~doc)
 
+let txospenderindex_arg =
+  (* Bitcoin Core's -txospenderindex flag (init.cpp /
+     index/txospenderindex.cpp).  Accepts a boolean ('1'/'0' /
+     'true'/'false'). When on, the daemon maintains a [spent outpoint ->
+     spending tx] index at <datadir>/indexes/txospender, updated on every
+     block connect/disconnect/reorg, so [gettxspendingprevout] can resolve a
+     CONFIRMED spend (and report its blockhash) — not only mempool spends.
+     Default off, matching DEFAULT_TXOSPENDERINDEX. *)
+  let doc = "Maintain a spent-outpoint -> spending-transaction index at \
+             <datadir>/indexes/txospender. Required for \
+             gettxspendingprevout to resolve a CONFIRMED (on-chain) spend; \
+             without it a non-mempool query throws Core's exact 'Mempool \
+             lacks a relevant spend, and txospenderindex is unavailable.' \
+             On startup any gap to the validated tip is back-filled from \
+             stored blocks. Accepted values: '0' / 'false' (off, default), \
+             '1' / 'true' (on)." in
+  Arg.(value & opt (some string) None &
+    info ["txospenderindex"] ~docv:"VAL" ~doc)
+
 let asmap_arg =
   (* Bitcoin Core's -asmap=<file> flag (init.cpp).
      When set, IP addresses are looked up in the ASMap binary trie and
@@ -420,7 +439,7 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     rest_enabled rest_port rest_bind blockfilterindex asmap
     proxy onion_proxy i2psam i2p_private_key cjdnsreachable
     rpc_tls_cert rpc_tls_key rest_tls_cert rest_tls_key
-    coinstatsindex_cli txindex_cli =
+    coinstatsindex_cli txindex_cli txospenderindex_cli =
   (* --txindex is accepted for Core CLI compatibility (camlcoin always
      maintains the tx index); validate its value but otherwise ignore it. *)
   ignore txindex_cli;
@@ -803,6 +822,33 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
                Printf.eprintf "[camlcoin] %s\n%!" msg;
                exit 1)
         end;
+      txospenderindex =
+        (* Resolve CLI / conf-file value into a boolean, mirroring the
+           --coinstatsindex resolution above. Default off
+           (DEFAULT_TXOSPENDERINDEX). *)
+        begin
+          let parse_one v =
+            match String.lowercase_ascii v with
+            | "" | "0" | "false" -> Ok false
+            | "1" | "true" -> Ok true
+            | other ->
+              Error (Printf.sprintf
+                "Invalid --txospenderindex value: %S (accepted: 0/1/true/false)"
+                other)
+          in
+          let chosen = match txospenderindex_cli with
+            | Some v -> Some v
+            | None -> Camlcoin.Runtime_config.get_string conf_opts "txospenderindex"
+          in
+          match chosen with
+          | None -> false
+          | Some v ->
+            (match parse_one v with
+             | Ok b -> b
+             | Error msg ->
+               Printf.eprintf "[camlcoin] %s\n%!" msg;
+               exit 1)
+        end;
       asmap_path = (match asmap with
         | Some _ -> asmap
         | None -> Camlcoin.Runtime_config.get_string conf_opts "asmap");
@@ -954,7 +1000,8 @@ let cmd =
     $ rest_tls_cert_arg
     $ rest_tls_key_arg
     $ coinstatsindex_arg
-    $ txindex_arg)
+    $ txindex_arg
+    $ txospenderindex_arg)
 
 (* ============================================================================
    Entry Point

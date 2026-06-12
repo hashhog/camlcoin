@@ -1569,9 +1569,9 @@ let test_rbf_gate6_lower_fee_rejected () =
    Tests that bumping fee by exactly the min increment succeeds. *)
 let test_rbf_gate7_pays_for_rbf_bandwidth () =
   let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
-  (* mp.min_relay_fee = 1000 sat/kvB; tx ~452 WU = 113 vbytes.
-     relay_fee_for_replacement = floor(1000 * 113 / 1000) = 113 sat.
-     original_fee = 10_000; need additional >= 113. *)
+  (* Rule 4 uses incremental_relay_fee = 100 sat/kvB; tx ~452 WU = 113 vbytes.
+     relay_fee_for_replacement = floor(100 * 113 / 1000) = 11 sat.
+     original_fee = 10_000; a 1-sat bump still fails, a 2000-sat bump passes. *)
   let tx_orig = make_regular_tx
     [make_test_input_rbf txid1 0l]
     [make_test_output 990_000L]  (* 10k fee *)
@@ -1684,10 +1684,13 @@ let test_topo_sort_cycle () =
 (* Test: CPFP package where child pays for low-fee parent *)
 let test_cpfp_package () =
   let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
-  (* Create a parent with very low fee (below min relay fee) *)
+  (* Create a parent with 0 fee (below the min relay floor of 100 sat/kvB).
+     Was 10 sat (only below the old 1000 floor); 0 fee keeps the parent below
+     the lowered 100 sat/kvB floor so it is still rejected alone and the CPFP
+     child must rescue it. *)
   let parent_tx = make_regular_tx
     [make_test_input txid1 0l]
-    [make_test_output 999_990L]  (* only 10 sat fee - way below minimum *)
+    [make_test_output 1_000_000L]  (* 0 fee - below relay floor, rejected alone *)
   in
   (* Try adding parent alone - should fail *)
   let parent_result = Mempool.add_transaction mp parent_tx in
@@ -2250,18 +2253,19 @@ let test_p2a_is_standard () =
   let p2a_script = make_p2a_script () in
   Alcotest.(check bool) "P2A is standard" true (Mempool.is_standard_output p2a_script)
 
-(* Test: P2A output with correct dust value (240) is not dust *)
+(* Test: P2A output with correct dust value (240) is not dust.
+   P2A branch is fee-independent; pass the production dust_relay_fee for clarity. *)
 let test_p2a_dust_correct_value () =
   let output = make_p2a_output 240L in
-  let is_dust = Mempool.is_dust 1000L output in
+  let is_dust = Mempool.is_dust Mempool.dust_relay_fee output in
   Alcotest.(check bool) "240 sat P2A is not dust" false is_dust
 
 (* Test: P2A output with incorrect value is considered dust *)
 let test_p2a_dust_wrong_value () =
   let output_too_low = make_p2a_output 239L in
   let output_too_high = make_p2a_output 241L in
-  Alcotest.(check bool) "239 sat P2A is dust" true (Mempool.is_dust 1000L output_too_low);
-  Alcotest.(check bool) "241 sat P2A is dust" true (Mempool.is_dust 1000L output_too_high)
+  Alcotest.(check bool) "239 sat P2A is dust" true (Mempool.is_dust Mempool.dust_relay_fee output_too_low);
+  Alcotest.(check bool) "241 sat P2A is dust" true (Mempool.is_dust Mempool.dust_relay_fee output_too_high)
 
 (* Test: P2A spending input size is reasonable *)
 let test_p2a_spending_size () =
@@ -2310,7 +2314,7 @@ let test_is_standard_output_op_return_valid () =
   Alcotest.(check bool)
     "valid OP_RETURN output is not dust"
     false
-    (Mempool.is_dust 1000L out)
+    (Mempool.is_dust Mempool.dust_relay_fee out)
 
 (* Test: mempool rejects a tx whose vout contains a truncated OP_RETURN script.
    This confirms PATH B: is_standard_tx iterates outputs and calls is_standard_output
@@ -3570,7 +3574,7 @@ let test_w86_get_min_fee_max_with_incremental () =
   (* No block since bump — no decay, returns the stored rate directly *)
   let result = Mempool.get_min_fee mp in
   (* Since blockSinceBump=false, returns llround(rolling) = 80, and the caller
-     effective_min_fee takes max(min_relay_fee=1000, 80) = 1000.
+     effective_min_fee takes max(min_relay_fee=100, 80) = 100.
      get_min_fee itself returns 80 in this case. *)
   Alcotest.(check int64) "get_min_fee returns rolling when no decay" 80L result;
   Storage.ChainDB.close db;
@@ -3578,9 +3582,10 @@ let test_w86_get_min_fee_max_with_incremental () =
 
 let test_w86_effective_min_fee_baseline () =
   let (mp, db) = make_w86_pool () in
-  (* No evictions: rolling = 0, effective = min_relay_fee = 1000 sat/kvB *)
+  (* No evictions: rolling = 0, effective = min_relay_fee = 100 sat/kvB
+     (DEFAULT_MIN_RELAY_TX_FEE, policy.h:70). *)
   let result = Mempool.effective_min_fee mp in
-  Alcotest.(check int64) "effective = min_relay_fee when no evictions" 1000L result;
+  Alcotest.(check int64) "effective = min_relay_fee when no evictions" 100L result;
   Storage.ChainDB.close db;
   cleanup_test_db ()
 

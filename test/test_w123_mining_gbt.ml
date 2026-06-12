@@ -421,17 +421,21 @@ let test_g25_regtest_mining_rpcs () =
     true (contains_substring src
             "ctx.network.network_type <> Consensus.Regtest")
 
-(* G26 — BUG-4 P2 : getmininginfo emits constant-zero current-block stats. *)
+(* G26 — getmininginfo current-block stats. Core v31.99 getmininginfo has NO
+   currentblocksize field (mining.cpp:51 emits only currentblockweight /
+   currentblocktx, both optional). The byte-diff alignment dropped the
+   impl-invented currentblocksize; currentblockweight/currentblocktx remain
+   (constant-zero, masked by the byte-diff harness). *)
 let test_g26_getmininginfo_currentblock_constant_zero () =
   let src = slurp_lib "rpc.ml" in
   Alcotest.(check bool)
-    "BUG-4 (pre-fix): currentblocksize emitted as `Int 0"
-    true (contains_substring src "(\"currentblocksize\", `Int 0);");
+    "currentblocksize removed (not present in Core v31.99 getmininginfo)"
+    false (contains_substring src "(\"currentblocksize\", `Int 0);");
   Alcotest.(check bool)
-    "BUG-4 (pre-fix): currentblockweight emitted as `Int 0"
+    "currentblockweight emitted as `Int 0"
     true (contains_substring src "(\"currentblockweight\", `Int 0);");
   Alcotest.(check bool)
-    "BUG-4 (pre-fix): currentblocktx emitted as `Int 0"
+    "currentblocktx emitted as `Int 0"
     true (contains_substring src "(\"currentblocktx\", `Int 0);")
 
 (* G27 — BUG-5 P2 : getnetworkhashps ignores height + nblocks=-1. *)

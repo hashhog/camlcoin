@@ -670,9 +670,9 @@ let test_g14_rbf_rule4_incremental_fee () =
   let _orig_entry = Result.get_ok (Mempool.add_transaction mp orig_tx) in
 
   (* Replacement with same fee as original (0 additional) — rule 4 requires
-     additional_fees >= relay_fee.GetFee(vsize). With min_relay_fee=1000 sat/kvB
-     and a typical ~200 vbyte tx, relay_cost = ~200 sat.  Additional_fees = 0
-     must fail rule 4. *)
+     additional_fees >= incremental_relay_fee.GetFee(vsize). With
+     incremental_relay_fee=100 sat/kvB and a typical ~200 vbyte tx,
+     relay_cost = ~20 sat.  Additional_fees = 0 must fail rule 4 regardless. *)
   let same_fee_replacement = make_tx
     [make_rbf_input txid_a 0l]
     [make_test_output 990_000L] in  (* same 10,000 fee — 0 additional *)
@@ -1208,7 +1208,7 @@ let test_g27_package_topo_sort () =
 
 let test_g28_package_cpfp () =
   let (mp, db, txid_a, _, _, _, _) = create_test_mempool () in
-  (* Parent tx with 0 fee (below min_relay_fee 1000 sat/kvB) *)
+  (* Parent tx with 0 fee (below min_relay_fee 100 sat/kvB) *)
   let zero_fee_parent = make_tx
     [make_test_input txid_a 0l]
     [make_test_output 1_000_000L] in  (* 0 fee *)

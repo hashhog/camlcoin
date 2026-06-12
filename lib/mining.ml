@@ -963,6 +963,15 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
              Sync.coinstats_connect_if_enabled_from_entries chain
                ~block ~height ~spent_entries:!spent_entries_for_filter;
 
+             (* Tx-output spender index append for the submitblock / mining /
+                generate* accept path (no-op when --txospenderindex is off).
+                Writes [spent_outpoint -> spending tx] for every non-coinbase
+                input. This is the block-connect choke-point for the
+                submitblock path the harness drives; without it a node fed
+                only via submitblock would never index a confirmed spend.
+                Mirrors Core's [TxoSpenderIndex::CustomAppend]. *)
+             Sync.txospender_connect_if_enabled chain ~block ~height;
+
              (* Remove confirmed transactions from mempool *)
              Mempool.remove_for_block mp block height;
 

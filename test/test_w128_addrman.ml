@@ -125,13 +125,13 @@ let test_g1_thread_open_connection_types () =
     true (contains_substring src "add_peer pm info.address info.port");
   Alcotest.(check bool) "BUG-1: maintain_connections opens add_block_relay_peer"
     true (contains_substring src "add_block_relay_peer pm info.address info.port");
-  (* Confirm: NO feeler / extra-block-relay / extra-network-peer path. *)
+  (* FIX-1: a FEELER branch now exists (maybe_open_feeler wired into
+     maintain_connections — Core net.cpp ThreadOpenConnections FEELER). *)
   Alcotest.(check bool)
-    "BUG-1: maintain_connections has no FEELER branch"
-    false (contains_substring src "open_feeler" ||
-           contains_substring src "ConnectionType.Feeler" ||
-           contains_substring src "fFeeler" ||
-           contains_substring src "feeler_connection");
+    "FIX-1: maintain_connections has a FEELER branch"
+    true (contains_substring src "open_feeler" ||
+          contains_substring src "maybe_open_feeler" ||
+          contains_substring src "feeler_connection");
   Alcotest.(check bool)
     "BUG-2: maintain_connections has no EXTRA_BLOCK_RELAY periodic timer"
     false (contains_substring src "EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL" ||

@@ -1018,6 +1018,17 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     Logs.warn (fun m ->
       m "Failed to load peer bans: %s" (Printexc.to_string exn)));
 
+  (* Restore the persisted bucketed addrman (peers.dat-equivalent, axis #2) so
+     the address book + bucket/position layout + tried-vs-new classification
+     survive restart instead of cold-starting empty.  A missing/corrupt file
+     is guarded → empty addrman + DNS/fixed seeds, never crashes. *)
+  (try
+    if Peer_manager.load_addrman peer_manager config.data_dir then
+      Logs.info (fun m -> m "Restored persisted addrman from peers.dat")
+  with exn ->
+    Logs.warn (fun m ->
+      m "Failed to load addrman: %s" (Printexc.to_string exn)));
+
   (* Set peer manager's DB and initial block height so that the stale-tip
      check can build locators and knows our validated chain height. *)
   Peer_manager.set_db peer_manager db;
@@ -1295,6 +1306,10 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     Logs.info (fun m -> m "Starting peer manager");
     Peer_manager.start peer_manager
   in
+
+  (* Start the periodic addrman dump timer (peers.dat-equivalent, axis #2) so a
+     crash/SIGKILL still leaves a recent address book to restore on next boot. *)
+  Peer_manager.start_addrman_dump_timer peer_manager config.data_dir;
 
   (* Start P2P listener for inbound connections *)
   let listener_thread =
@@ -2353,6 +2368,15 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     with exn ->
       Logs.warn (fun m ->
         m "Failed to save bans: %s" (Printexc.to_string exn)));
+    (* Persist the bucketed addrman (peers.dat-equivalent, axis #2) on shutdown
+       so the address book + bucket layout survive the restart (Core dumps
+       addresses on shutdown via DumpAddresses()). *)
+    (try
+      Peer_manager.save_addrman peer_manager config.data_dir;
+      Logs.info (fun m -> m "Saved addrman to disk")
+    with exn ->
+      Logs.warn (fun m ->
+        m "Failed to save addrman: %s" (Printexc.to_string exn)));
     (try
       let dirty = Utxo.OptimizedUtxoSet.dirty_count optimized_utxo in
       if dirty > 0 then begin

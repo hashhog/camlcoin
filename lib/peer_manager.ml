@@ -215,7 +215,7 @@ type t = {
   chain_sync_behind_since : (int, float) Hashtbl.t; (* peer_id -> timestamp when first noticed behind *)
   mutable db : Storage.ChainDB.t option;            (* Chain database for building locators *)
   (* Eclipse protection: address bucketing *)
-  bucket_key : string;                            (* Random key for bucket hashing *)
+  mutable bucket_key : string;                    (* Random key for bucket hashing *)
   new_table : (int, string list) Hashtbl.t;       (* New address buckets: bucket_id -> addresses *)
   tried_table : (int, string list) Hashtbl.t;     (* Tried address buckets: bucket_id -> addresses *)
   mutable anchors : anchor_info list;             (* Block-relay-only anchor connections *)
@@ -2873,6 +2873,345 @@ let connect_to_anchors (pm : t) : unit Lwt.t =
     clear_anchors pm;
     Lwt.return_unit
   end
+
+(* ========== Address Manager Persistence (peers.dat-equivalent) ==========
+
+   Axis #2 (persistent bucketed addrman).  Ports the lunarblock pilot
+   (ac3eb03, src/peerman.lua _save_addrman/_load_addrman) to camlcoin.
+
+   Reference: Bitcoin Core addrman.cpp Serialize/Unserialize (FILE_FORMAT,
+   nKey, vvNew/vvTried) and CConnman::DumpAddresses / DumpPeerAddresses
+   (every DUMP_PEERS_INTERVAL = 15min and on shutdown).  Core serialises the
+   new + tried tables plus nKey so bucket layout survives restart; on load it
+   restores placement (it does NOT re-shuffle into a flat list) unless the
+   asmap changed, in which case it re-buckets from source.
+
+   camlcoin twist (vs the lunarblock pilot): the bucket tables
+   (new_table / tried_table : (int, string list) Hashtbl.t) store ONLY the
+   addr-key strings (one bare IP per slot, position = list index).  The full
+   peer_info lives in a SEPARATE known_addrs : (string, peer_info) Hashtbl.t.
+   So we serialise BOTH the bucket key-lists AND known_addrs and RE-JOIN on
+   load (the extra join the lunarblock single-table layout did not need).
+
+   The file is an impl-native Yojson document (peers.dat is a LOCAL file, not
+   wire/RPC, so byte-identical Core format is not required).  Each bucket is
+   stored WITH its index and its ordered addr-key list, so bucket AND position
+   (list order) are restored verbatim.  The salt (bucket_key) and asmap version
+   are persisted so a future Core-style recompute-on-load remains possible
+   without a format bump.  Atomic temp-file + rename, mirroring save_anchors.
+   ====================================================================== *)
+
+(* Serialised peers.dat version.  Bump only on an incompatible schema change. *)
+let addrman_persist_version = 1
+
+(* Hard ceiling on persisted addr-keys (matches the in-memory addrman capacity:
+   new_bucket_count*bucket_size + tried_bucket_count*bucket_size).  The file
+   cannot drive unbounded growth past this — load stops at the cap. *)
+let addrman_persist_max_entries =
+  new_bucket_count * bucket_size + tried_bucket_count * bucket_size
+
+(* Path to the peers.dat-equivalent file in the datadir. *)
+let addrman_file_path (datadir : string) : string =
+  Filename.concat datadir "peers.dat"
+
+(* Lowercase hex encode / decode for the raw 32-byte salt + asmap-version blob. *)
+let to_hex (s : string) : string =
+  let buf = Buffer.create (String.length s * 2) in
+  String.iter (fun c -> Buffer.add_string buf (Printf.sprintf "%02x" (Char.code c))) s;
+  Buffer.contents buf
+
+let of_hex (h : string) : string option =
+  let n = String.length h in
+  if n = 0 || n land 1 <> 0 then None
+  else
+    try
+      let buf = Buffer.create (n / 2) in
+      let i = ref 0 in
+      while !i < n do
+        Buffer.add_char buf (Char.chr (int_of_string ("0x" ^ String.sub h !i 2)));
+        i := !i + 2
+      done;
+      Some (Buffer.contents buf)
+    with _ -> None
+
+(* The asmap version currently in effect (hex SHA256 of the asmap bytes, or ""
+   when no asmap is loaded), round-tripped like Core's serialized asmap checksum. *)
+let current_asmap_version (pm : t) : string =
+  match pm.net_group_manager.Asmap.asmap with
+  | None -> ""
+  | Some data -> to_hex (Asmap.asmap_version data)
+
+(* Serialise one peer_info to JSON (the full record stored in known_addrs). *)
+let peer_info_to_json (info : peer_info) : Yojson.Safe.t =
+  let src_str = match info.source with
+    | Dns -> "dns" | Addr -> "addr" | Manual -> "manual" | FixedSeed -> "fixedseed"
+  in
+  let status = match info.table_status with
+    | InNew b -> `Assoc [("t", `String "new"); ("b", `Int b)]
+    | InTried b -> `Assoc [("t", `String "tried"); ("b", `Int b)]
+    | NotInTable -> `Assoc [("t", `String "none")]
+  in
+  `Assoc [
+    ("address", `String info.address);
+    ("port", `Int info.port);
+    ("services", `String (Int64.to_string info.services));
+    ("last_connected", `Float info.last_connected);
+    ("last_attempt", `Float info.last_attempt);
+    ("failures", `Int info.failures);
+    ("banned_until", `Float info.banned_until);
+    ("source", `String src_str);
+    ("last_success", `Float info.last_success);
+    ("table_status", status);
+  ]
+
+let peer_info_of_json (j : Yojson.Safe.t) : peer_info option =
+  match j with
+  | `Assoc f ->
+    let s k = match List.assoc_opt k f with Some (`String v) -> Some v | _ -> None in
+    let i k = match List.assoc_opt k f with
+      | Some (`Int v) -> Some v | Some (`Intlit v) -> int_of_string_opt v | _ -> None in
+    let fl k = match List.assoc_opt k f with
+      | Some (`Float v) -> Some v | Some (`Int v) -> Some (float_of_int v) | _ -> None in
+    (match s "address", i "port" with
+     | Some address, Some port ->
+       let services =
+         match List.assoc_opt "services" f with
+         | Some (`String v) -> (try Int64.of_string v with _ -> 0L)
+         | Some (`Int v) -> Int64.of_int v
+         | _ -> 0L
+       in
+       let source = match s "source" with
+         | Some "dns" -> Dns | Some "manual" -> Manual
+         | Some "fixedseed" -> FixedSeed | _ -> Addr
+       in
+       let table_status = match List.assoc_opt "table_status" f with
+         | Some (`Assoc tf) ->
+           (match (match List.assoc_opt "t" tf with Some (`String t) -> t | _ -> "none"),
+                  (match List.assoc_opt "b" tf with
+                   | Some (`Int b) -> b | _ -> -1) with
+            | "new", b -> InNew b
+            | "tried", b -> InTried b
+            | _ -> NotInTable)
+         | _ -> NotInTable
+       in
+       Some {
+         address; port; services;
+         last_connected = Option.value (fl "last_connected") ~default:0.0;
+         last_attempt = Option.value (fl "last_attempt") ~default:0.0;
+         failures = Option.value (i "failures") ~default:0;
+         banned_until = Option.value (fl "banned_until") ~default:0.0;
+         source;
+         last_success = Option.value (fl "last_success") ~default:0.0;
+         table_status;
+       }
+     | _ -> None)
+  | _ -> None
+
+(* Build a serialisable snapshot of the bucketed addrman + known_addrs.
+   Bucket key-lists are emitted in list order so position survives verbatim. *)
+let serialize_addrman (pm : t) : Yojson.Safe.t =
+  let table_to_json (tbl : (int, string list) Hashtbl.t) : Yojson.Safe.t =
+    let buckets = Hashtbl.fold (fun bucket addrs acc ->
+      `Assoc [
+        ("b", `Int bucket);
+        ("a", `List (List.map (fun a -> `String a) addrs));
+      ] :: acc
+    ) tbl [] in
+    `List buckets
+  in
+  let known = Hashtbl.fold (fun _addr info acc ->
+    peer_info_to_json info :: acc
+  ) pm.known_addrs [] in
+  `Assoc [
+    ("version", `Int addrman_persist_version);
+    ("nkey", `String (to_hex pm.bucket_key));
+    ("asmap_version", `String (current_asmap_version pm));
+    ("new", table_to_json pm.new_table);
+    ("tried", table_to_json pm.tried_table);
+    ("known", `List known);
+  ]
+
+(* Restore the bucketed addrman + known_addrs from a parsed snapshot.
+   Resets the in-memory tables, restores bucket_key (so subsequent inserts
+   bucket consistently with the persisted layout), re-populates the bucket
+   key-lists VERBATIM (bucket index + list order = position), and RE-JOINS the
+   known_addrs records.  Any addr-key that lacks a known record is rebuilt with
+   a minimal peer_info so the join never drops a bucket slot.  Bounded at
+   addrman_persist_max_entries.  Raises on a structurally broken snapshot; the
+   caller guards with try/with and falls back to an empty addrman. *)
+let deserialize_addrman (pm : t) (snap : Yojson.Safe.t) : unit =
+  let fields = match snap with `Assoc f -> f | _ -> failwith "not an object" in
+  let get k = List.assoc_opt k fields in
+  (* version gate *)
+  (match get "version" with
+   | Some (`Int v) when v = addrman_persist_version -> ()
+   | _ -> failwith "bad/missing version");
+  (* shape gate *)
+  let new_j = match get "new" with Some (`List l) -> l | _ -> failwith "missing new" in
+  let tried_j = match get "tried" with Some (`List l) -> l | _ -> failwith "missing tried" in
+  let known_j = match get "known" with Some (`List l) -> l | _ -> [] in
+
+  (* Restore the salt FIRST so any later re-bucketing matches the file. *)
+  (match get "nkey" with
+   | Some (`String h) -> (match of_hex h with Some k when String.length k = 32 -> pm.bucket_key <- k | _ -> ())
+   | _ -> ());
+
+  (* Start from a clean, empty addrman. *)
+  Hashtbl.reset pm.new_table;
+  Hashtbl.reset pm.tried_table;
+  Hashtbl.reset pm.known_addrs;
+
+  let loaded = ref 0 in
+  let cap = addrman_persist_max_entries in
+
+  (* Re-join: index the persisted full records by address. *)
+  let known_idx : (string, peer_info) Hashtbl.t = Hashtbl.create 1024 in
+  List.iter (fun j ->
+    match peer_info_of_json j with
+    | Some info -> Hashtbl.replace known_idx info.address info
+    | None -> ()
+  ) known_j;
+
+  (* Restore one bucket table verbatim, capped, populating known_addrs via the
+     re-join (synthesising a minimal record for any orphaned addr-key). *)
+  let restore_table (entries : Yojson.Safe.t list)
+      (tbl : (int, string list) Hashtbl.t) (nbuckets : int)
+      (mk_status : int -> addr_table_status) : unit =
+    List.iter (fun je ->
+      match je with
+      | `Assoc bf ->
+        let bucket = match List.assoc_opt "b" bf with Some (`Int b) -> b | _ -> -1 in
+        let addrs = match List.assoc_opt "a" bf with
+          | Some (`List l) -> List.filter_map (function `String s -> Some s | _ -> None) l
+          | _ -> []
+        in
+        if bucket >= 0 && bucket < nbuckets then begin
+          (* Preserve list order (= position); cap per-bucket and overall. *)
+          let kept = ref [] in
+          List.iter (fun a ->
+            if !loaded < cap && List.length !kept < bucket_size then begin
+              kept := a :: !kept;
+              incr loaded;
+              (* Re-join the full record (or synthesise a minimal one). *)
+              if not (Hashtbl.mem pm.known_addrs a) then begin
+                let info =
+                  match Hashtbl.find_opt known_idx a with
+                  | Some info -> { info with table_status = mk_status bucket }
+                  | None ->
+                    { address = a; port = 0; services = 0L;
+                      last_connected = 0.0; last_attempt = 0.0; failures = 0;
+                      banned_until = 0.0; source = Addr; last_success = 0.0;
+                      table_status = mk_status bucket }
+                in
+                Hashtbl.replace pm.known_addrs a info
+              end
+            end
+          ) addrs;
+          let ordered = List.rev !kept in
+          if ordered <> [] then Hashtbl.replace tbl bucket ordered
+        end
+      | _ -> ()
+    ) entries
+  in
+
+  (* Tried first (Core: tried placement is authoritative). *)
+  restore_table tried_j pm.tried_table tried_bucket_count (fun b -> InTried b);
+  restore_table new_j pm.new_table new_bucket_count (fun b -> InNew b);
+
+  (* Re-join any remaining known records whose addr was NOT in a bucket (e.g.
+     ban-only entries, parked hostnames) so known_addrs is fully restored. *)
+  Hashtbl.iter (fun addr info ->
+    if not (Hashtbl.mem pm.known_addrs addr) then
+      Hashtbl.replace pm.known_addrs addr info
+  ) known_idx;
+
+  let asmap_v = match get "asmap_version" with Some (`String s) -> s | _ -> "" in
+  let cur = current_asmap_version pm in
+  if asmap_v <> "" && cur <> "" && asmap_v <> cur then
+    Log.info (fun m -> m "addrman: asmap changed since last save (placement kept; \
+                          Core would re-bucket new entries from source)")
+
+(* Persist the bucketed addrman to peers.dat (atomic temp-file + rename).
+   Mirrors save_anchors / save_bans_json.  Never raises — a failed write leaves
+   the in-memory addrman untouched and is logged, not fatal. *)
+let save_addrman (pm : t) (datadir : string) : unit =
+  let filepath = addrman_file_path datadir in
+  let tmp = filepath ^ ".tmp" in
+  try
+    let json = serialize_addrman pm in
+    let oc = open_out tmp in
+    output_string oc (Yojson.Safe.to_string json);
+    close_out oc;
+    Sys.rename tmp filepath;
+    Log.info (fun m -> m "Saved addrman (%d new + %d tried) to %s"
+      (new_table_size pm) (tried_table_size pm) filepath)
+  with exn ->
+    (try Sys.remove tmp with _ -> ());
+    Log.warn (fun m -> m "Failed to save addrman: %s" (Printexc.to_string exn))
+
+(* Load the bucketed addrman from peers.dat, replacing the empty cold start.
+   Graceful on every failure mode (missing / unreadable / corrupt JSON / wrong
+   version / wrong shape / oversized): falls back to the already-initialised
+   empty addrman and returns false, so the caller proceeds to DNS/fixed seeds.
+   NEVER raises — a truncated file from an unclean shutdown must not hard-down
+   boot.  Returns true if a valid snapshot was loaded. *)
+let load_addrman (pm : t) (datadir : string) : bool =
+  let filepath = addrman_file_path datadir in
+  if not (Sys.file_exists filepath) then
+    false  (* missing file → cold start (normal first boot) *)
+  else
+    try
+      let ic = open_in filepath in
+      let len = in_channel_length ic in
+      (* Guard against a pathologically large file before reading it in. *)
+      let max_bytes = 64 * 1024 * 1024 in
+      if len > max_bytes then begin
+        close_in ic;
+        Log.warn (fun m -> m "addrman: peers.dat too large (%d bytes) — cold start" len);
+        false
+      end else begin
+        let content = really_input_string ic len in
+        close_in ic;
+        let snap = Yojson.Safe.from_string content in
+        (* Reset to a clean empty addrman before applying, so a mid-way failure
+           leaves a coherent (empty) state, never a half-loaded one. *)
+        Hashtbl.reset pm.new_table;
+        Hashtbl.reset pm.tried_table;
+        Hashtbl.reset pm.known_addrs;
+        deserialize_addrman pm snap;
+        Log.info (fun m -> m "Loaded addrman from %s: %d new + %d tried"
+          filepath (new_table_size pm) (tried_table_size pm));
+        true
+      end
+    with exn ->
+      Log.warn (fun m -> m "addrman: peers.dat corrupt/unreadable (%s) — cold start"
+        (Printexc.to_string exn));
+      (* Ensure a clean empty addrman after a partial/failed load. *)
+      Hashtbl.reset pm.new_table;
+      Hashtbl.reset pm.tried_table;
+      Hashtbl.reset pm.known_addrs;
+      false
+
+(* Interval between periodic addrman dumps (Core CConnman DUMP_PEERS_INTERVAL
+   = 15min) so a crash/SIGKILL (no clean shutdown) still leaves a recent
+   peers.dat to restore on the next boot. *)
+let addrman_dump_interval = 900.0
+
+(* Start the periodic addrman dump timer.  Mirrors start_asmap_health_check_timer
+   / Core CConnman::Start scheduling DumpAddresses.  Runs every
+   addrman_dump_interval while the manager is running.  Started from cli.ml
+   (which owns the datadir), beside the anchors/bans persistence. *)
+let start_addrman_dump_timer (pm : t) (datadir : string) : unit =
+  let rec loop () =
+    if not pm.running then Lwt.return_unit
+    else begin
+      let open Lwt.Syntax in
+      let* () = Lwt_unix.sleep addrman_dump_interval in
+      if pm.running then save_addrman pm datadir;
+      loop ()
+    end
+  in
+  Lwt.async loop
 
 (* ========== Eclipse protection statistics ========== *)
 

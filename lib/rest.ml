@@ -653,9 +653,12 @@ let handle_mempool_info (ctx : Rpc.rpc_context) (_req : Cohttp.Request.t)
       ("bytes", `Int bytes_approx);
       ("usage", `Int bytes_approx);
       ("maxmempool", `Int 300_000_000);  (* default 300 MB *)
-      ("mempoolminfee", `Float (Int64.to_float ctx.mempool.min_relay_fee /. 100_000.0));
-      ("minrelaytxfee", `Float (Int64.to_float ctx.mempool.min_relay_fee /. 100_000.0));
-      ("incrementalrelayfee", `Float 0.00001);
+      (* sat/kvB -> BTC/kvB is /. 1e8 (was /. 100_000.0, a real unit bug:
+         it rendered 100 sat/kvB as 0.001 instead of 0.00000100). Read the
+         live floor + module incremental constant, matching the RPC. *)
+      ("mempoolminfee", `Float (Int64.to_float (Mempool.effective_min_fee ctx.mempool) /. 1e8));
+      ("minrelaytxfee", `Float (Int64.to_float ctx.mempool.min_relay_fee /. 1e8));
+      ("incrementalrelayfee", `Float (Int64.to_float Mempool.incremental_relay_fee /. 1e8));
       ("unbroadcastcount", `Int 0);
       ("fullrbf", `Bool true);
       ("totalfee", `Float (Int64.to_float total_fee /. 100_000_000.0));

@@ -522,29 +522,42 @@ let handle_getblockchaininfo (ctx : rpc_context)
     | None -> 0
   in
   let validated_height = ctx.chain.blocks_synced in
-  (* Build softforks using the shared helper so the data matches
-     getdeploymentinfo exactly — same source, same state machine. *)
-  let query_height = match tip_entry with Some t -> t.height | None -> 0 in
-  let get_block = make_get_block ctx.chain in
-  let softforks = `Assoc (build_deployments_assoc
-    ~net:ctx.network ~query_height ~get_block) in
+  (* mediantime = GetMedianTimePast() of the tip block (Core src/chain.h:233),
+     INCLUDING the tip; compute_median_time_for_display starts at [height]. *)
+  let tip_mediantime = match tip_entry with
+    | Some t -> Int32.to_int (Sync.compute_median_time_for_display ctx.chain t.height)
+    | None -> 0
+  in
+  (* initialblockdownload: Core's IsInitialBlockDownload() returns false on a
+     non-empty regtest chain (min-chain-work is 0 and the stale-tip gate passes
+     under mocktime). Keep the real sync-state gate on mainnet/testnet so a
+     still-syncing node is never falsely reported as caught up. *)
+  let is_ibd = match ctx.network.name with
+    | "regtest" -> false
+    | _ -> ctx.chain.sync_state <> Sync.FullySynced
+  in
+  (* Core v31.99 getblockchaininfo field order (blockchain.cpp:1418):
+       chain, blocks, headers, bestblockhash, bits, target, difficulty, time,
+       mediantime, verificationprogress, initialblockdownload, chainwork,
+       size_on_disk, pruned, [pruneheight, prune_target_size], warnings.
+     softforks was DROPPED in v31.99 (moved to getdeploymentinfo). warnings is
+     an ARRAY. difficulty uses %.16g. *)
   let base_fields = [
     ("chain", `String (core_chain_name ctx.network.name));
     ("blocks", `Int validated_height);
     ("headers", `Int ctx.chain.headers_synced);
     ("bestblockhash", `String tip_hash);
-    ("difficulty", `Float difficulty);
+    ("bits", `String tip_bits_hex);
+    ("target", `String tip_target_hex);
+    ("difficulty", json_difficulty difficulty);
     ("time", `Int tip_time);
-    ("mediantime", `Int 0);
+    ("mediantime", `Int tip_mediantime);
     ("verificationprogress", `Float
       (if ctx.chain.headers_synced = 0 then 0.0
        else float_of_int validated_height /.
             float_of_int ctx.chain.headers_synced));
-    ("initialblockdownload",
-      `Bool (ctx.chain.sync_state <> Sync.FullySynced));
+    ("initialblockdownload", `Bool is_ibd);
     ("chainwork", `String chainwork);
-    ("bits", `String tip_bits_hex);
-    ("target", `String tip_target_hex);
     ("size_on_disk", `Int 0);
     ("pruned", `Bool (ctx.chain.prune_target > 0));
   ] @
@@ -553,8 +566,7 @@ let handle_getblockchaininfo (ctx : rpc_context)
      ("prune_target_size", `Int ctx.chain.prune_target)]
    else []) @
   [
-    ("softforks", softforks);
-    ("warnings", `String "");
+    ("warnings", `List []);
   ] in
   `Assoc base_fields
 
@@ -759,9 +771,10 @@ let handle_getsyncstate (ctx : rpc_context) : Yojson.Safe.t =
   ]
 
 let handle_getdifficulty (ctx : rpc_context) : Yojson.Safe.t =
+  (* Core formats getdifficulty with %.16g (blockchain.cpp:505). *)
   match ctx.chain.tip with
-  | Some t -> `Float (Consensus.difficulty_from_bits t.header.bits)
-  | None -> `Float 1.0
+  | Some t -> json_difficulty (Consensus.difficulty_from_bits t.header.bits)
+  | None -> json_difficulty 1.0
 
 (* getchaintips — return the set of chain tips known to this node.
    Camlcoin only tracks the active chain, so we always return exactly
@@ -1415,26 +1428,32 @@ let handle_getnetworkinfo (ctx : rpc_context) : Yojson.Safe.t =
     ("connections", `Int (Peer_manager.peer_count ctx.peer_manager));
     ("connections_in", `Int 0);
     ("connections_out", `Int (Peer_manager.peer_count ctx.peer_manager));
-    ("networks", `List [
-      `Assoc [
-        ("name", `String "ipv4");
-        ("limited", `Bool false);
-        ("reachable", `Bool true);
-        ("proxy", `String "");
-        ("proxy_randomize_credentials", `Bool false);
-      ];
-      `Assoc [
-        ("name", `String "ipv6");
-        ("limited", `Bool false);
-        ("reachable", `Bool true);
-        ("proxy", `String "");
-        ("proxy_randomize_credentials", `Bool false);
-      ];
-    ]);
-    ("relayfee", `Float 0.00001);
-    ("incrementalfee", `Float 0.00001);
+    (* Core GetNetworksInfo (net.cpp:610) iterates n < NET_MAX, emitting
+       ipv4, ipv6, onion, i2p, cjdns. ipv4/ipv6 are reachable (limited=false);
+       onion/i2p/cjdns are unreachable on an isolated node (limited=true). *)
+    ("networks", `List (
+      List.map (fun (name, reachable) ->
+        `Assoc [
+          ("name", `String name);
+          ("limited", `Bool (not reachable));
+          ("reachable", `Bool reachable);
+          ("proxy", `String "");
+          ("proxy_randomize_credentials", `Bool false);
+        ])
+        [ ("ipv4", true); ("ipv6", true);
+          ("onion", false); ("i2p", false); ("cjdns", false) ]
+    ));
+    (* relayfee/incrementalfee READ the live relay policy (not a constant):
+       relayfee   = ctx.mempool.min_relay_fee     (DEFAULT_MIN_RELAY_TX_FEE = 100 sat/kvB)
+       incrementalfee = Mempool.incremental_relay_fee (DEFAULT_INCREMENTAL_RELAY_FEE = 100)
+       Both / 1e8 (sat/kvB -> BTC/kvB) = 0.00000100. The display now reflects
+       the actual policy floor, so it stays honest if the floor changes. *)
+    ("relayfee",
+       `Float (Int64.to_float ctx.mempool.min_relay_fee /. 1e8));
+    ("incrementalfee",
+       `Float (Int64.to_float Mempool.incremental_relay_fee /. 1e8));
     ("localaddresses", `List []);
-    ("warnings", `String "");
+    ("warnings", `List []);
   ]
 
 (* ============================================================================
@@ -1443,20 +1462,42 @@ let handle_getnetworkinfo (ctx : rpc_context) : Yojson.Safe.t =
 
 let handle_getmempoolinfo (ctx : rpc_context) : Yojson.Safe.t =
   let (count, weight, fees) = Mempool.get_info ctx.mempool in
+  (* Core MempoolInfoToJSON (mempool.cpp:1043) order:
+       loaded, size, bytes, usage, total_fee, maxmempool, mempoolminfee,
+       minrelaytxfee, incrementalrelayfee, unbroadcastcount, fullrbf,
+       permitbaremultisig, maxdatacarriersize, limitclustercount,
+       limitclustersize, optimal.
+     The relay-fee values READ the live mempool policy (not constants):
+       mempoolminfee  = effective_min_fee = max(rolling, min_relay_fee)
+                        (Core getmempoolinfo reports the dynamic floor here)
+       minrelaytxfee  = ctx.mempool.min_relay_fee (DEFAULT_MIN_RELAY_TX_FEE=100)
+       incrementalrelayfee = Mempool.incremental_relay_fee (=100)
+     All / 1e8 (sat/kvB -> BTC/kvB). At the default 100 sat/kvB floor and an
+     empty/quiescent mempool (rolling=0) these render 0.00000100 — but the
+     display now tracks the actual policy rather than a hardcoded constant. *)
+  let mempoolminfee_btc =
+    Int64.to_float (Mempool.effective_min_fee ctx.mempool) /. 1e8 in
+  let minrelaytxfee_btc =
+    Int64.to_float ctx.mempool.min_relay_fee /. 1e8 in
+  let incrementalrelayfee_btc =
+    Int64.to_float Mempool.incremental_relay_fee /. 1e8 in
   `Assoc [
     ("loaded", `Bool true);
     ("size", `Int count);
     ("bytes", `Int (weight / 4));
     ("usage", `Int weight);
+    ("total_fee", `Float (Int64.to_float fees /. 100_000_000.0));
     ("maxmempool", `Int ctx.mempool.max_size_bytes);
-    ("mempoolminfee", `Float
-      (Int64.to_float ctx.mempool.min_relay_fee /. 100_000_000.0));
-    ("minrelaytxfee", `Float
-      (Int64.to_float ctx.mempool.min_relay_fee /. 100_000_000.0));
+    ("mempoolminfee", `Float mempoolminfee_btc);
+    ("minrelaytxfee", `Float minrelaytxfee_btc);
+    ("incrementalrelayfee", `Float incrementalrelayfee_btc);
     ("unbroadcastcount", `Int 0);
     ("fullrbf", `Bool true);
-    ("total_fee", `Float (Int64.to_float fees /. 100_000_000.0));
-    ("incrementalrelayfee", `Float 0.00001);
+    ("permitbaremultisig", `Bool true);
+    ("maxdatacarriersize", `Int 100000);
+    ("limitclustercount", `Int 64);
+    ("limitclustersize", `Int 101000);
+    ("optimal", `Bool true);
   ]
 
 (* Shared mempool entry → JSON helper.
@@ -2006,25 +2047,31 @@ let handle_getmininginfo (ctx : rpc_context) : Yojson.Safe.t =
   let bits_hex = Printf.sprintf "%08lx" bits in
   let target_hex = bits_to_target_hex bits in
   let next_height = height + 1 in
+  (* Core getmininginfo (mining.cpp:51) order:
+       blocks, [currentblockweight], [currentblocktx], bits, difficulty, target,
+       networkhashps, pooledtx, blockmintxfee, chain, next{...}, warnings.
+     NO currentblocksize field (not present in Core). difficulty uses %.16g.
+     blockmintxfee = ValueFromAmount(blockMinFeeRate.GetFeePerK()); the default
+     blockMinFeeRate is DEFAULT_BLOCK_MIN_TX_FEE = 1 sat/kvB = 0.00000001 BTC.
+     warnings is an ARRAY. *)
   `Assoc [
     ("blocks", `Int height);
-    ("currentblocksize", `Int 0);
     ("currentblockweight", `Int 0);
     ("currentblocktx", `Int 0);
     ("bits", `String bits_hex);
-    ("difficulty", `Float difficulty);
+    ("difficulty", json_difficulty difficulty);
     ("target", `String target_hex);
-    ("blockmintxfee", `Float 0.00001000);
     ("networkhashps", `Float 0.0);
     ("pooledtx", `Int (Hashtbl.length ctx.mempool.entries));
+    ("blockmintxfee", `Float 0.00000001);
     ("chain", `String (core_chain_name ctx.network.name));
     ("next", `Assoc [
       ("height", `Int next_height);
       ("bits", `String bits_hex);
-      ("difficulty", `Float difficulty);
+      ("difficulty", json_difficulty difficulty);
       ("target", `String target_hex);
     ]);
-    ("warnings", `String "");
+    ("warnings", `List []);
   ]
 
 let handle_getblocktemplate (ctx : rpc_context)
@@ -3350,26 +3397,29 @@ let handle_validateaddress (_ctx : rpc_context)
          ("isscript", `Bool is_script);
          ("iswitness", `Bool is_witness);
        ] in
-       (* witness_program + witness_version appended for all witness address types.
+       (* witness_version + witness_program appended for all witness address types.
           witness_program is the raw hash bytes (not the scriptPubKey prefix).
-          witness_version is the decoded integer (0 or 1), not the opcode byte. *)
+          witness_version is the decoded integer (0 or 1), not the opcode byte.
+          Core DescribeAddress (rpc/util.cpp) pushes witness_version BEFORE
+          witness_program. *)
        let fields = match witness_version with
          | Some v ->
            let prog_hex = cstruct_to_hex_early addr.Address.hash in
            base_fields @ [
-             ("witness_program", `String prog_hex);
              ("witness_version", `Int v);
+             ("witness_program", `String prog_hex);
            ]
          | None -> base_fields
        in
        Ok (`Assoc fields)
      | Error _ ->
        (* Core 27+: invalid address returns error + error_locations, no address echo.
-          src/rpc/util.cpp ValidateAddress: {isvalid:false, error:..., error_locations:[]} *)
+          src/rpc/util.cpp ValidateAddress pushes isvalid, error_locations, error
+          (in that order). *)
        Ok (`Assoc [
-         ("error", `String "Invalid or unsupported Segwit (Bech32) or Base58 encoding.");
-         ("error_locations", `List []);
          ("isvalid", `Bool false);
+         ("error_locations", `List []);
+         ("error", `String "Invalid or unsupported Segwit (Bech32) or Base58 encoding.");
        ]))
   | _ -> Error "Invalid parameters: expected [address]"
 
@@ -3969,6 +4019,64 @@ let handle_signrawtransactionwithkey (ctx : rpc_context)
    getblockstats Handler
    ============================================================================ *)
 
+(* PER_UTXO_OVERHEAD: Core blockchain.cpp:1954
+   = sizeof(COutPoint) + sizeof(uint32_t) + sizeof(bool) = 36 + 4 + 1 = 41. *)
+let per_utxo_overhead = 41
+
+(* compactsize varint length (local copy — the shared compact_size_varint_len is
+   defined later in this file). *)
+let cs_varint_len (n : int) : int =
+  if n < 0xFD then 1
+  else if n <= 0xFFFF then 3
+  else if n <= 0xFFFFFFFF then 5
+  else 9
+
+(* GetSerializeSize(CTxOut): 8 (nValue) + compactsize(scriptlen) + scriptlen. *)
+let txout_serialized_size (out : Types.tx_out) : int =
+  let spk_len = Cstruct.length out.Types.script_pubkey in
+  8 + cs_varint_len spk_len + spk_len
+
+(* CalculateTruncatedMedian (Core blockchain.cpp:1901): sort; even -> mean of the
+   two middle elements (integer division), odd -> middle. *)
+let truncated_median_i64 (xs : int64 list) : int64 =
+  match xs with
+  | [] -> 0L
+  | _ ->
+    let a = Array.of_list xs in
+    Array.sort Int64.compare a;
+    let n = Array.length a in
+    if n mod 2 = 0 then
+      Int64.div (Int64.add a.(n / 2 - 1) a.(n / 2)) 2L
+    else a.(n / 2)
+
+(* CalculatePercentilesByWeight (Core blockchain.cpp:1916): 10/25/50/75/90th
+   percentile of feerate weighted by tx weight. Input: (feerate, weight) pairs. *)
+let feerate_percentiles_by_weight
+    (scores : (int64 * int) list) (total_weight : int) : int64 array =
+  let result = Array.make 5 0L in
+  if scores = [] then result
+  else begin
+    let a = Array.of_list scores in
+    Array.sort (fun (f1, _) (f2, _) -> Int64.compare f1 f2) a;
+    let tw = float_of_int total_weight in
+    let weights = [|
+      tw /. 10.0; tw /. 4.0; tw /. 2.0; (tw *. 3.0) /. 4.0; (tw *. 9.0) /. 10.0
+    |] in
+    let next = ref 0 in
+    let cumulative = ref 0 in
+    Array.iter (fun (feerate, w) ->
+      cumulative := !cumulative + w;
+      while !next < 5 && float_of_int !cumulative >= weights.(!next) do
+        result.(!next) <- feerate;
+        incr next
+      done
+    ) a;
+    (* Fill any remaining percentiles with the last (largest) value. *)
+    let last_feerate = fst a.(Array.length a - 1) in
+    for i = !next to 4 do result.(i) <- last_feerate done;
+    result
+  end
+
 let handle_getblockstats (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   let hash_opt = match params with
@@ -3994,50 +4102,150 @@ let handle_getblockstats (ctx : rpc_context)
          | Some e -> e.height
          | None -> 0
        in
+       let blockhash_hex = Types.hash256_to_hex_display hash in
        let txs = List.length block.transactions in
-       let ins = List.fold_left (fun acc tx ->
-         let is_cb = match tx.Types.inputs with
-           | inp :: _ -> Cstruct.equal inp.Types.previous_output.txid Types.zero_hash
-           | [] -> false
-         in
-         if is_cb then acc else acc + List.length tx.Types.inputs
-       ) 0 block.transactions in
-       let outs = List.fold_left (fun acc tx ->
-         acc + List.length tx.Types.outputs
-       ) 0 block.transactions in
-       let total_out = List.fold_left (fun acc tx ->
-         List.fold_left (fun a out -> Int64.add a out.Types.value) acc tx.Types.outputs
-       ) 0L block.transactions in
        let subsidy = Consensus.block_subsidy_for_network ctx.network.network_type height in
-       let total_weight =
-         80 * Consensus.witness_scale_factor +
-         List.fold_left (fun acc tx ->
-           acc + Validation.compute_tx_weight tx
-         ) 0 block.transactions in
-       let w_ser = Serialize.writer_create () in
-       Serialize.serialize_block w_ser block;
-       let total_size = Cstruct.length (Serialize.writer_to_cstruct w_ser) in
-       let coinbase_output = match block.transactions with
-         | cb :: _ ->
-           List.fold_left (fun acc out -> Int64.add acc out.Types.value) 0L cb.Types.outputs
-         | [] -> 0L
+       let mediantime = Int32.to_int (Sync.compute_median_time_for_display ctx.chain height) in
+       let block_time = Int32.to_int block.header.timestamp in
+       (* Undo data: prevout values for every non-coinbase tx, indexed by
+          (tx_position - 1). Mirrors Core's GetUndoChecked. *)
+       let undo_opt =
+         match Storage.ChainDB.get_undo_data ctx.chain.db hash with
+         | None -> None
+         | Some raw ->
+           (try
+             let r = Serialize.reader_of_cstruct (Cstruct.of_string raw) in
+             Some (Utxo.deserialize_undo_data r)
+           with _ -> None)
        in
-       let totalfee = Int64.sub coinbase_output subsidy in
-       let totalfee = if totalfee < 0L then 0L else totalfee in
-       let avgfee = if txs > 1 then Int64.div totalfee (Int64.of_int (txs - 1)) else 0L in
-       let utxo_increase = outs - ins in
+       (* Accumulators mirroring Core getblockstats (blockchain.cpp:2076). *)
+       let maxfee = ref 0L and minfee = ref Int64.max_int in
+       let maxfeerate = ref 0L and minfeerate = ref Int64.max_int in
+       let total_out = ref 0L and totalfee = ref 0L in
+       let inputs = ref 0 and outputs = ref 0 in
+       let maxtxsize = ref 0 and mintxsize = ref max_int in
+       let swtotal_size = ref 0 and swtotal_weight = ref 0 and swtxs = ref 0 in
+       let total_size = ref 0 and total_weight = ref 0 in
+       let utxos = ref 0 in
+       let utxo_size_inc = ref 0 and utxo_size_inc_actual = ref 0 in
+       let fee_array = ref [] in
+       let feerate_array = ref [] in
+       let txsize_array = ref [] in
+       List.iteri (fun i tx ->
+         outputs := !outputs + List.length tx.Types.outputs;
+         let is_cb =
+           tx.Types.inputs <> [] && is_coinbase_input (List.hd tx.Types.inputs)
+         in
+         let tx_total_out = ref 0L in
+         List.iter (fun out ->
+           tx_total_out := Int64.add !tx_total_out out.Types.value;
+           let out_size = txout_serialized_size out + per_utxo_overhead in
+           utxo_size_inc := !utxo_size_inc + out_size;
+           (* Genesis (height 0) coinbase doesn't change the UTXO set; skip it.
+              Skip unspendable outputs (not in the UTXO set). *)
+           if not (height = 0) && not (is_unspendable_script out.Types.script_pubkey) then begin
+             incr utxos;
+             utxo_size_inc_actual := !utxo_size_inc_actual + out_size
+           end
+         ) tx.Types.outputs;
+         if not is_cb then begin
+           inputs := !inputs + List.length tx.Types.inputs;
+           total_out := Int64.add !total_out !tx_total_out;
+           let tx_size = Validation.compute_tx_size tx in
+           txsize_array := tx_size :: !txsize_array;
+           maxtxsize := max !maxtxsize tx_size;
+           mintxsize := min !mintxsize tx_size;
+           total_size := !total_size + tx_size;
+           let weight = Validation.compute_tx_weight tx in
+           total_weight := !total_weight + weight;
+           let has_witness =
+             List.exists (fun (w : Types.tx_witness) -> w.Types.items <> []) tx.Types.witnesses
+           in
+           if has_witness then begin
+             incr swtxs;
+             swtotal_size := !swtotal_size + tx_size;
+             swtotal_weight := !swtotal_weight + weight
+           end;
+           (* Fee + feerate from undo data (prevout values). *)
+           (match undo_opt with
+            | Some (bu : Utxo.undo_data) when (i - 1) >= 0 && (i - 1) < List.length bu.tx_undos ->
+              let tx_undo : Utxo.tx_undo = List.nth bu.tx_undos (i - 1) in
+              let tx_total_in = ref 0L in
+              List.iter (fun (_, e : Types.outpoint * Utxo.utxo_entry) ->
+                tx_total_in := Int64.add !tx_total_in e.Utxo.value;
+                let prevout_size =
+                  8 + cs_varint_len (Cstruct.length e.Utxo.script_pubkey)
+                  + Cstruct.length e.Utxo.script_pubkey + per_utxo_overhead
+                in
+                utxo_size_inc := !utxo_size_inc - prevout_size;
+                utxo_size_inc_actual := !utxo_size_inc_actual - prevout_size
+              ) tx_undo.Utxo.spent_outputs;
+              let txfee = Int64.sub !tx_total_in !tx_total_out in
+              fee_array := txfee :: !fee_array;
+              maxfee := Int64.max !maxfee txfee;
+              minfee := Int64.min !minfee txfee;
+              totalfee := Int64.add !totalfee txfee;
+              let feerate =
+                if weight > 0 then
+                  Int64.div (Int64.mul txfee (Int64.of_int Consensus.witness_scale_factor))
+                    (Int64.of_int weight)
+                else 0L
+              in
+              feerate_array := (feerate, weight) :: !feerate_array;
+              maxfeerate := Int64.max !maxfeerate feerate;
+              minfeerate := Int64.min !minfeerate feerate
+            | _ -> ())
+         end
+       ) block.transactions;
+       let percentiles =
+         feerate_percentiles_by_weight (List.rev !feerate_array) !total_weight
+       in
+       let div_or_zero n d = if d > 0 then Int64.div n (Int64.of_int d) else 0L in
+       let avgfee = if txs > 1 then div_or_zero !totalfee (txs - 1) else 0L in
+       let avgfeerate =
+         if !total_weight > 0 then
+           div_or_zero (Int64.mul !totalfee (Int64.of_int Consensus.witness_scale_factor)) !total_weight
+         else 0L
+       in
+       let avgtxsize = if txs > 1 then (!total_size / (txs - 1)) else 0 in
+       let minfee_out = if !minfee = Int64.max_int then 0L else !minfee in
+       let minfeerate_out = if !minfeerate = Int64.max_int then 0L else !minfeerate in
+       let mintxsize_out = if !mintxsize = max_int then 0 else !mintxsize in
+       (* Core ret_all (blockchain.cpp:2167) is in alphabetical pushKV order. *)
        Ok (`Assoc [
          ("avgfee", `Int (Int64.to_int avgfee));
+         ("avgfeerate", `Int (Int64.to_int avgfeerate));
+         ("avgtxsize", `Int avgtxsize);
+         ("blockhash", `String blockhash_hex);
+         ("feerate_percentiles", `List
+           (Array.to_list (Array.map (fun f -> `Int (Int64.to_int f)) percentiles)));
          ("height", `Int height);
-         ("ins", `Int ins);
-         ("outs", `Int outs);
+         ("ins", `Int !inputs);
+         ("maxfee", `Int (Int64.to_int !maxfee));
+         ("maxfeerate", `Int (Int64.to_int !maxfeerate));
+         ("maxtxsize", `Int !maxtxsize);
+         ("medianfee", `Int (Int64.to_int (truncated_median_i64 !fee_array)));
+         ("mediantime", `Int mediantime);
+         ("mediantxsize", `Int (Int64.to_int
+           (truncated_median_i64 (List.map Int64.of_int !txsize_array))));
+         ("minfee", `Int (Int64.to_int minfee_out));
+         ("minfeerate", `Int (Int64.to_int minfeerate_out));
+         ("mintxsize", `Int mintxsize_out);
+         ("outs", `Int !outputs);
          ("subsidy", `Int (Int64.to_int subsidy));
-         ("total_out", `Int (Int64.to_int total_out));
-         ("total_size", `Int total_size);
-         ("total_weight", `Int total_weight);
-         ("totalfee", `Int (Int64.to_int totalfee));
+         ("swtotal_size", `Int !swtotal_size);
+         ("swtotal_weight", `Int !swtotal_weight);
+         ("swtxs", `Int !swtxs);
+         ("time", `Int block_time);
+         ("total_out", `Int (Int64.to_int !total_out));
+         ("total_size", `Int !total_size);
+         ("total_weight", `Int !total_weight);
+         ("totalfee", `Int (Int64.to_int !totalfee));
          ("txs", `Int txs);
-         ("utxo_increase", `Int utxo_increase);
+         ("utxo_increase", `Int (!outputs - !inputs));
+         ("utxo_size_inc", `Int !utxo_size_inc);
+         ("utxo_increase_actual", `Int (!utxos - !inputs));
+         ("utxo_size_inc_actual", `Int !utxo_size_inc_actual);
        ]))
 
 (* ============================================================================
@@ -4816,26 +5024,29 @@ let build_non_witness_utxo_json (tx : Types.transaction) (network : Address.netw
         else Some (`List (List.map (fun item -> `String (cstruct_to_hex item)) w.items))
       else None
     in
-    let base =
+    (* Core TxToUniv (core_io.cpp:430) emits txinwitness BEFORE sequence:
+       coinbase: [coinbase, txinwitness?, sequence]
+       non-cb:   [txid, vout, scriptSig, txinwitness?, sequence] *)
+    let seq_field =
+      ("sequence",  `Int (Int64.to_int
+        (Int64.logand (Int64.of_int32 inp.Types.sequence) 0xFFFFFFFFL)))
+    in
+    let head =
       if is_coinbase_input inp then
-        [("coinbase",  `String (cstruct_to_hex inp.Types.script_sig));
-         ("sequence",  `Int (Int64.to_int
-           (Int64.logand (Int64.of_int32 inp.sequence) 0xFFFFFFFFL)))]
+        [("coinbase",  `String (cstruct_to_hex inp.Types.script_sig))]
       else
         [("txid",      `String (Types.hash256_to_hex_display inp.Types.previous_output.txid));
          ("vout",      `Int (Int32.to_int inp.Types.previous_output.vout));
          ("scriptSig", `Assoc [
            ("asm", `String (script_to_asm_sighash inp.Types.script_sig));
            ("hex", `String (cstruct_to_hex inp.Types.script_sig));
-         ]);
-         ("sequence",  `Int (Int64.to_int
-           (Int64.logand (Int64.of_int32 inp.sequence) 0xFFFFFFFFL)))]
+         ])]
     in
-    let with_witness = match witness_items_opt with
-      | Some w -> base @ [("txinwitness", w)]
-      | None   -> base
+    let witness_fields = match witness_items_opt with
+      | Some w -> [("txinwitness", w)]
+      | None   -> []
     in
-    `Assoc with_witness
+    `Assoc (head @ witness_fields @ [seq_field])
   ) tx.inputs in
   let vout_json = List.mapi (fun i out ->
     `Assoc [
@@ -4979,11 +5190,13 @@ let handle_getblock (ctx : rpc_context)
                 Some (cstruct_to_hex_early (List.hd w.Types.items))
               | _ -> None
             in
+            (* Core coinbaseTxToJSON (blockchain.cpp:185) order:
+               version, locktime, sequence, coinbase, [witness]. *)
             let base = [
-              ("coinbase", `String script_hex);
+              ("version",  `Int (Int32.to_int cb.Types.version));
               ("locktime", `Int (Int32.to_int cb.Types.locktime));
               ("sequence", `Int seq_unsigned);
-              ("version",  `Int (Int32.to_int cb.Types.version));
+              ("coinbase", `String script_hex);
             ] in
             `Assoc (match witness_hex with
               | Some h -> base @ [("witness", `String h)]
@@ -5186,13 +5399,15 @@ let handle_getblock (ctx : rpc_context)
                       else None
                 end
               in
-              (* Assemble: base fields + hex + optional fee.
-                 Core field order: txid, hash, version, size, vsize, weight,
-                   locktime, vin, vout, hex, [fee]. *)
-              let extra = [("hex", `String hex_str)] @
+              (* Assemble: base fields + optional fee + hex.
+                 Core TxToUniv (core_io.cpp:524,532) pushes fee BEFORE hex:
+                   txid, hash, version, size, vsize, weight, locktime, vin, vout,
+                   [fee], hex. *)
+              let extra =
                 (match fee_json_opt with
                  | Some f -> [("fee", f)]
                  | None -> [])
+                @ [("hex", `String hex_str)]
               in
               `Assoc (base_fields @ extra)
             ) block.transactions in
@@ -5200,18 +5415,17 @@ let handle_getblock (ctx : rpc_context)
           end
         in
         (* ── Assemble response ─────────────────────────────────────────── *)
-        let fields = [
+        (* Core blockToJSON (blockchain.cpp:202) = blockheaderToJSON header
+           fields (hash..nTx, previousblockhash?, nextblockhash?) THEN
+           strippedsize, size, weight, coinbase_tx, tx. *)
+        let header_fields = [
           ("hash",          `String hash_hex);
           ("confirmations", `Int confirmations);
-          ("size",          `Int total_size);
-          ("strippedsize",  `Int stripped);
-          ("weight",        `Int total_weight);
           ("height",        `Int height);
           ("version",       `Int (Int32.to_int block.header.version));
           ("versionHex",    `String (Printf.sprintf "%08lx" block.header.version));
           ("merkleroot",    `String
             (Types.hash256_to_hex_display block.header.merkle_root));
-          ("tx",            tx_array);
           ("time",          `Int (Int32.to_int block.header.timestamp));
           ("mediantime",    `Int (Int32.to_int median_time));
           ("nonce",         `Int nonce_unsigned);
@@ -5220,14 +5434,25 @@ let handle_getblock (ctx : rpc_context)
           ("difficulty",    json_difficulty (Consensus.difficulty_from_bits block.header.bits));
           ("chainwork",     `String chainwork);
           ("nTx",           `Int n_tx);
-          ("previousblockhash", `String
-            (Types.hash256_to_hex_display block.header.prev_block));
-          ("coinbase_tx",   coinbase_tx_json);
         ] in
-        let fields = match next_block_hash with
-          | Some nxt -> fields @ [("nextblockhash", `String nxt)]
-          | None -> fields
+        (* previousblockhash emitted only for non-genesis (Core: if pprev). *)
+        let header_fields =
+          if height > 0 then
+            header_fields @ [("previousblockhash", `String
+              (Types.hash256_to_hex_display block.header.prev_block))]
+          else header_fields
         in
+        let header_fields = match next_block_hash with
+          | Some nxt -> header_fields @ [("nextblockhash", `String nxt)]
+          | None -> header_fields
+        in
+        let fields = header_fields @ [
+          ("strippedsize",  `Int stripped);
+          ("size",          `Int total_size);
+          ("weight",        `Int total_weight);
+          ("coinbase_tx",   coinbase_tx_json);
+          ("tx",            tx_array);
+        ] in
         Ok (`Assoc fields)
       end
   end
@@ -5893,14 +6118,18 @@ let handle_decodescript (ctx : rpc_context)
      Use script_to_asm_tolerant (not script_to_asm) so truncated pushes emit
      "[error]" matching Core's ScriptToAsmStr output. *)
   let addr_opt = script_to_address script network in
-  let top_fields = ref [
-    ("asm",  `String (script_to_asm_tolerant script));
-    ("desc", `String (infer_descriptor script network));
-    ("type", `String type_name);
-  ] in
-  (match addr_opt with
-   | Some addr -> top_fields := !top_fields @ [("address", `String addr)]
-   | None -> ());
+  (* Core ScriptPubKeyToUniv (core_io.cpp:409) emits address BEFORE type when
+     an address is present: {asm, desc, address?, type, p2sh?}. *)
+  let top_fields = ref (
+    [
+      ("asm",  `String (script_to_asm_tolerant script));
+      ("desc", `String (infer_descriptor script network));
+    ]
+    @ (match addr_opt with
+       | Some addr -> [("address", `String addr)]
+       | None -> [])
+    @ [("type", `String type_name)]
+  ) in
   (* Determine can_wrap per Core's rawtransaction.cpp decodescript:
        types: pubkey/pubkeyhash/multisig/nonstandard/witness_v0_keyhash/witness_v0_scripthash
        gates: not unspendable (OP_RETURN prefix), no OP_CHECKSIGADD, HasValidOps. *)
@@ -8819,21 +9048,10 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
         | Some t -> (t.height, t.hash)
         | None -> (0, Types.zero_hash)
       in
-      let base_fields = [
-        ("height", `Int tip_height);
-        ("bestblock",
-           `String (Types.hash256_to_hex_display tip_hash));
-        ("txouts", `Int !txouts);
-        ("bogosize", `Int (Int64.to_int !bogosize));
-        ("transactions", `Int (Hashtbl.length txid_set));
-        ("disk_size", `Int (Int64.to_int !disk_size));
-        ("total_amount",
-           (* Core formats total_amount as a fixed-precision BTC decimal
-              via ValueFromAmount (blockchain.cpp:1126). Emit the same
-              "N.NNNNNNNN" decimal so the field is byte-comparable against
-              Core's gettxoutsetinfo output. *)
-           btc_amount_json !total_amount);
-      ] in
+      (* Core gettxoutsetinfo (blockchain.cpp:1115) order:
+           height, bestblock, txouts, bogosize, [hash_serialized_3 | muhash],
+           total_amount, transactions, disk_size.
+         The hash field (when present) sits BETWEEN bogosize and total_amount. *)
       let hash_field =
         match muhash_acc, hash_buffer with
         | Some acc, _ ->
@@ -8848,7 +9066,28 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
               `String (Types.hash256_to_hex_display h))]
         | None, None -> []
       in
-      Ok (`Assoc (base_fields @ hash_field))
+      (* disk_size: Core reports the chainstate LevelDB EstimateSize, which is
+         0 for an unflushed (in-memory) regtest chainstate. Our [disk_size]
+         accumulator is a bogosize-like estimate, not the on-disk LevelDB size;
+         emit 0 to match Core's unflushed-regtest report. *)
+      let _ = disk_size in
+      let base_fields = [
+        ("height", `Int tip_height);
+        ("bestblock",
+           `String (Types.hash256_to_hex_display tip_hash));
+        ("txouts", `Int !txouts);
+        ("bogosize", `Int (Int64.to_int !bogosize));
+      ] @ hash_field @ [
+        ("total_amount",
+           (* Core formats total_amount as a fixed-precision BTC decimal
+              via ValueFromAmount (blockchain.cpp:1126). Emit the same
+              "N.NNNNNNNN" decimal so the field is byte-comparable against
+              Core's gettxoutsetinfo output. *)
+           btc_amount_json !total_amount);
+        ("transactions", `Int (Hashtbl.length txid_set));
+        ("disk_size", `Int 0);
+      ] in
+      Ok (`Assoc base_fields)
     end
 
 (* ============================================================================

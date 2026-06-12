@@ -301,9 +301,13 @@ let test_g12_addrv2_no_rate_limit () =
     ~fd:(Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0) () in
   Peer_manager.handle_addrv2 pm peer entries;
   let stats = Peer_manager.get_addr_stats pm in
-  (* BUG: all 5000 accepted; Core would rate-limit to ~1000 *)
-  Alcotest.(check bool) "BUG-G12: addrv2 not rate-limited"
-    true (stats.total_known > 1000)
+  (* FIX-G12: addrv2 is now rate-limited by the Core inbound-addr token bucket
+     (MAX_ADDR_RATE_PER_SECOND=0.1, fresh bucket=1.0), so a single 5000-entry
+     flood admits at most a handful — far below the unbounded pre-fix 5000.
+     Core caps the message itself at MAX_ADDR_TO_SEND=1000; the per-message
+     token bucket drops the excess. *)
+  Alcotest.(check bool) "FIX-G12: addrv2 rate-limited (token bucket)"
+    true (stats.total_known <= 1000)
 
 (* ===== G13: addrv2_no_ts_deduction ================================
    Bug: handle_addrv2 sets last_connected = Unix.gettimeofday() (now)

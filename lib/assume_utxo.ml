@@ -1468,36 +1468,166 @@ let run_background_validation
   validate_next_block ()
 
 (* ============================================================================
-   Activation — DELETED 2026-05-05
+   Snapshot Activation — REAL dual-chainstate background validation
    ============================================================================
 
-   [activate_snapshot] used to live here. It operated on [node_state] (the
-   2-chainstate IBD/snapshot pair below) and was meant to mirror Bitcoin
-   Core's [ChainstateManager::ActivateSnapshot] in [src/validation.cpp:5588]:
-   promote a freshly-loaded snapshot chainstate to "active" and demote the
-   prior tip to "background" for behind-the-scenes IBD validation.
+   Brings [run_background_validation] (above) to life as a true background
+   chainstate, mirroring Bitcoin Core's snapshot machinery in
+   [src/validation.cpp]:
 
-   It was removed because it had zero callers across [lib/], [bin/], and
-   [test/] — and the wider 2-chainstate machinery it depended on is dormant:
-   [node_state] / [active_chainstate] / [background_chainstate] /
-   [has_snapshot_chainstate] / [create_chainstate] are never instantiated
-   anywhere in the codebase. They were a 2026-04-29 design draft for
-   in-process Core-style dual-chainstate switching that camlcoin never
-   integrated.
+     - [ActivateSnapshot] (:5588): the snapshot is loaded into the NEW active
+       chainstate (here, the [snapshot_chainstate] produced by [load_snapshot],
+       carrying [assumeutxo_state = Unvalidated]).
+     - [AddChainstate] (:6170): the original genesis-validated chainstate is
+       DEMOTED to a BACKGROUND chainstate whose [m_target_blockhash] is the
+       snapshot base, keeping its OWN coins DB.
+     - [MaybeValidateSnapshot] (:5967): at the base, the background chainstate
+       computes the [HASH_SERIALIZED] of its OWN coins and compares it to
+       [au_data.hash_serialized]. MATCH -> snapshot VALIDATED + retire bg;
+       MISMATCH -> snapshot INVALID + [AbortNode] (never silently accepted).
 
-   What ships instead: both the CLI ([bin/main.ml::import_utxo]) and the
-   RPC ([lib/rpc.ml::handle_loadtxoutset]) symmetrically write the snapshot
-   into a sibling [chainstate_snapshot/] RocksDB directory. That data is
-   currently inert with respect to the running daemon — the live chainstate
-   used by [Sync] / [Block_import] / [Peer_manager] is the genesis-rooted
-   IBD chainstate at [<datadir>/chainstate/] and is never swapped or
-   merged with the snapshot directory. Wiring real snapshot activation is
-   an architectural change (camlcoin's chain data model would need to
-   become dual-chainstate) and is out of scope here. See the
-   2026-05-05 snapshot CLI/RPC parity audit for the GREEN scoring rationale.
+   The load-time hash gate ([verify_loaded_utxo_hash]) already authenticates
+   the snapshot; this background pass is the trustless re-verification by
+   INDEPENDENT re-computation that Core performs — the background chainstate
+   re-connects every block genesis->base into a SEPARATE UTXO store and the
+   recomputed hash, not the loaded one, is what flips the snapshot validated.
 
-   The orphan supporting surface ([node_state] + [create_chainstate] +
-   [has_snapshot_chainstate]) is intentionally retained for now to keep
-   the diff narrow; a follow-up cleanup may remove that whole cluster
-   together with [run_background_validation] once the assumeutxo
-   integration plan is decided. *)
+   History: [activate_snapshot] previously lived here operating on [node_state];
+   it was deleted 2026-05-05 as dead draft code with zero callers because the
+   live daemon only wrote an inert sibling [chainstate_snapshot/] directory.
+   This is the resurrection of that path with a genuinely separate background
+   coins store (cross-impl reference: lunarblock a39dd42). *)
+
+(** A live snapshot activation: the snapshot (active) chainstate, the
+    background (genesis-rooted) chainstate with its OWN separate coins store,
+    and the background-validation context that drives the re-computation.
+
+    Mirrors the triple Core threads through [ActivateSnapshot] /
+    [AddChainstate]: the unvalidated snapshot chainstate, the validated
+    background chainstate targeting the snapshot base, and the work that
+    re-derives the snapshot's UTXO hash. *)
+type snapshot_activation = {
+  snapshot : chainstate;             (** Active chainstate (Unvalidated). *)
+  background : chainstate;           (** Background chainstate, SEPARATE store. *)
+  bg_validation : background_validation;
+  get_block : Types.hash256 -> Types.block option;
+  get_header_at_height : int -> Sync.header_entry option;
+  network : Consensus.network_config;
+}
+
+(** [make_background_chainstate ~db_path ~network] constructs the SECOND
+    (background) chainstate for snapshot validation: a genesis-rooted
+    chainstate with its OWN [Storage.ChainDB] (a distinct directory / object,
+    NOT the active snapshot store) and a fresh, EMPTY [Utxo.UtxoCache] at
+    height 0.
+
+    This is Core's [AddChainstate] demotion: the genesis-validated chainstate
+    keeps its own coins DB and is re-purposed as the background validator.
+    Its [assumeutxo_state] is [Validated] (the background chain is itself
+    fully validated from genesis), and it carries no [from_snapshot_blockhash]
+    (it is the IBD/genesis chain, not the snapshot chain). *)
+let make_background_chainstate ~(db_path : string)
+    ~(network : Consensus.network_config) : chainstate =
+  let bg = create_chainstate ~id:Ibd ~db_path ~network in
+  (* A freshly-created chainstate seeds its tip from the persisted chain_tip
+     if present; for a brand-new background store there is none, so it starts
+     at the genesis hash / height 0 with an EMPTY UTXO set — exactly the
+     genesis state Core's background chainstate replays forward from. *)
+  bg.tip_hash <- network.Consensus.genesis_hash;
+  bg.tip_height <- 0;
+  bg.assumeutxo_state <- Validated;
+  bg.from_snapshot_blockhash <- None;
+  bg
+
+(** [activate_snapshot_with_background ~snapshot ~bg_db_path ~assumed_hash
+      ~base_height ~get_block ~get_header_at_height ~network] wires up a real
+    dual-chainstate validation for an already-loaded snapshot chainstate.
+
+    [snapshot] is the chainstate produced by [load_snapshot] (the snapshot's
+    coins streamed into its own store, [assumeutxo_state = Unvalidated]).  This
+    function builds the SECOND background chainstate at [bg_db_path] with its
+    OWN separate coins store (via [make_background_chainstate]) and a
+    [background_validation] context targeting [base_height] with the assumed
+    [assumed_hash] (the chainparams [coins_hash] / Core's
+    [au_data.hash_serialized]).
+
+    The returned [snapshot_activation] is driven to completion by
+    [run_background_to_completion] below.  The activation itself performs NO
+    block connection — exactly like Core's [ActivateSnapshot], which returns
+    after demoting the prior chainstate and lets the validation queue do the
+    background work.
+
+    Aliasing guarantee: [background.db] / [background.utxo_cache] are distinct
+    objects from [snapshot.db] / [snapshot.utxo_cache]; the background store is
+    rooted at a different on-disk directory.  A write to one is invisible in
+    the other (proven by the dual-chainstate spec). *)
+let activate_snapshot_with_background
+    ~(snapshot : chainstate)
+    ~(bg_db_path : string)
+    ~(assumed_hash : Types.hash256)
+    ~(base_height : int)
+    ~(get_block : Types.hash256 -> Types.block option)
+    ~(get_header_at_height : int -> Sync.header_entry option)
+    ~(network : Consensus.network_config)
+    () : snapshot_activation =
+  (* The snapshot must be the active, not-yet-validated chainstate. *)
+  snapshot.assumeutxo_state <- Unvalidated;
+  let background = make_background_chainstate ~db_path:bg_db_path ~network in
+  let bg_validation = {
+    state = BgNotStarted;
+    validated_height = 0;
+    target_height = base_height;
+    snapshot_coins_hash = assumed_hash;
+  } in
+  { snapshot; background; bg_validation;
+    get_block; get_header_at_height; network }
+
+(** [run_background_to_completion activation] synchronously drives the
+    background validation to its terminal state (Core's
+    [MaybeValidateSnapshot] reached at the base) and reports the verdict.
+
+    Returns [(true, None)] when the background chainstate's independently
+    re-computed UTXO hash MATCHED the assumed hash — the snapshot flips to
+    [Validated] (and the background chainstate is logically retired).
+
+    Returns [(false, Some error)] when the background pass connected every
+    block genesis->base but the recomputed hash MISMATCHED the assumed hash,
+    or a block failed to connect: the snapshot is marked [Invalid] (Core's
+    [handle_invalid_snapshot] / [AbortNode]) and the error string carries the
+    word "mismatch" so external tooling that scrapes it keeps working.  The
+    snapshot is NEVER silently accepted on a mismatch.
+
+    The state mutation (snapshot [assumeutxo_state] <- Validated / Invalid) is
+    performed inside [run_background_validation]; this wrapper only runs the
+    Lwt thread to completion and translates the terminal [bg_validation.state]
+    into a verdict. *)
+let run_background_to_completion (activation : snapshot_activation)
+    : bool * string option =
+  Lwt_main.run
+    (run_background_validation
+       ~ibd_chainstate:activation.background
+       ~snapshot_chainstate:activation.snapshot
+       ~bg_validation:activation.bg_validation
+       ~get_block:activation.get_block
+       ~get_header_at_height:activation.get_header_at_height
+       ~network:activation.network
+       ());
+  match activation.bg_validation.state with
+  | BgCompleted -> (true, None)
+  | BgFailed msg -> (false, Some msg)
+  | BgValidating _ | BgNotStarted ->
+    (* Should be unreachable: [run_background_validation] only returns after
+       reaching the terminal MATCH/MISMATCH branch. Treat a non-terminal
+       state as a failure rather than silently accepting. *)
+    (false, Some "background validation did not reach a terminal state")
+
+(** [snapshot_is_validated cs] / [snapshot_is_invalid cs] are the
+    getchainstates-facing predicates Core derives from a chainstate's
+    [m_assumeutxo] field ([ChainstateRole.validated]).  While the background
+    pass runs the snapshot is [Unvalidated] (validated=false); after a MATCH
+    it is [Validated] (validated=true); after a MISMATCH it is [Invalid]. *)
+let snapshot_is_validated (cs : chainstate) : bool =
+  cs.assumeutxo_state = Validated
+
+let snapshot_is_invalid (cs : chainstate) : bool =
+  cs.assumeutxo_state = Invalid

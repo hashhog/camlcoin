@@ -40,6 +40,32 @@ let rpc_deserialization_error = -22
 let rpc_verify_error = -25
 let rpc_verify_rejected = -26
 
+(* ParseHashV — Core's rpc/util.cpp:117 boundary check for a txid/blockhash
+   string argument.  A txid/blockhash must be exactly 64 hex characters
+   (a uint256).  If it is NOT, Core throws JSONRPCError(RPC_INVALID_PARAMETER)
+   = -8 at the PARSE boundary, BEFORE any lookup, with one of two messages:
+     - wrong length            -> "<name> must be of length 64 (not N, for '<hex>')"
+     - right length, bad hex   -> "<name> must be hexadecimal string (not '<hex>')"
+   A well-formed-but-absent 64-hex hash is NOT this function's concern — that
+   stays whatever the handler returns (-5 / null), which is correct.
+
+   Returns Ok () when the string is a valid 64-char hex uint256, else the
+   Core-exact (-8, message) pair.  [name] is the argument label Core uses
+   ("txid", "blockhash", "parameter 1"). *)
+let is_hex_char (c : char) : bool =
+  (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+
+let parse_hash_v (s : string) ~(name : string) : (unit, int * string) result =
+  let len = String.length s in
+  if len <> 64 then
+    Error (rpc_invalid_parameter,
+      Printf.sprintf "%s must be of length 64 (not %d, for '%s')" name len s)
+  else if not (String.for_all is_hex_char s) then
+    Error (rpc_invalid_parameter,
+      Printf.sprintf "%s must be hexadecimal string (not '%s')" name s)
+  else
+    Ok ()
+
 (* ============================================================================
    Network Name Translation
    ============================================================================
@@ -10949,6 +10975,23 @@ let handle_gettxspendingprevout (ctx : rpc_context)
    RPC Method Dispatcher
    ============================================================================ *)
 
+(* ParseHashV dispatch guard — Core runs ParseHashV on the txid/blockhash
+   argument BEFORE any lookup, so a MALFORMED hash (wrong length / non-hex)
+   short-circuits with RPC_INVALID_PARAMETER (-8) regardless of what the
+   handler would otherwise return for a not-found hash (-5 / null / -1).
+   We only intercept when the first param is a string (the hash position);
+   a non-string / missing first arg falls through to the handler's own
+   param-shape error, matching the existing per-method behaviour. *)
+let guard_hash_param ~(name : string) (params : Yojson.Safe.t list)
+    (k : unit -> (Yojson.Safe.t, int * string) result)
+    : (Yojson.Safe.t, int * string) result =
+  match params with
+  | `String s :: _ ->
+    (match parse_hash_v s ~name with
+     | Error e -> Error e
+     | Ok () -> k ())
+  | _ -> k ()
+
 let dispatch_rpc (ctx : rpc_context)
     (method_name : string)
     (params : Yojson.Safe.t list)
@@ -10962,15 +11005,20 @@ let dispatch_rpc (ctx : rpc_context)
      | Ok r -> Ok r
      | Error msg -> Error (rpc_invalid_params, msg))
   | "getblock" ->
-    (match handle_getblock ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_misc_error, msg))
+    (* Core ParseHashV on the blockhash arg -> malformed = -8 before lookup;
+       a well-formed-but-absent hash stays the handler's "Block not found". *)
+    guard_hash_param ~name:"blockhash" params (fun () ->
+      match handle_getblock ctx params with
+      | Ok r -> Ok r
+      | Error msg -> Error (rpc_misc_error, msg))
   | "getblockheader" ->
     (* Core: a blockhash not in the index -> RPC_INVALID_ADDRESS_OR_KEY (-5)
-       "Block not found" (bitcoin-core/src/rpc/blockchain.cpp:654-656). *)
-    (match handle_getblockheader ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_invalid_address, msg))
+       "Block not found" (bitcoin-core/src/rpc/blockchain.cpp:654-656).
+       A MALFORMED blockhash hits ParseHashV first -> -8 before lookup. *)
+    guard_hash_param ~name:"blockhash" params (fun () ->
+      match handle_getblockheader ctx params with
+      | Ok r -> Ok r
+      | Error msg -> Error (rpc_invalid_address, msg))
   | "getblockcount" ->
     Ok (handle_getblockcount ctx)
   | "getbestblockhash" ->
@@ -10982,9 +11030,12 @@ let dispatch_rpc (ctx : rpc_context)
   | "getchaintips" ->
     Ok (handle_getchaintips ctx)
   | "gettxout" ->
-    (match handle_gettxout ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_misc_error, msg))
+    (* Core ParseHashV on the txid arg -> malformed = -8 before lookup; a
+       well-formed-but-absent txid stays null (handler returns Ok `Null). *)
+    guard_hash_param ~name:"txid" params (fun () ->
+      match handle_gettxout ctx params with
+      | Ok r -> Ok r
+      | Error msg -> Error (rpc_misc_error, msg))
   | "getblockstats" ->
     (match handle_getblockstats ctx params with
      | Ok r -> Ok r
@@ -11022,10 +11073,12 @@ let dispatch_rpc (ctx : rpc_context)
     (* Core throws every getrawtransaction lookup failure (tx-not-found,
        block-hash-not-found, genesis-coinbase) as RPC_INVALID_ADDRESS_OR_KEY
        (-5), not the generic RPC_MISC_ERROR (-1).
-       Reference: bitcoin-core/src/rpc/rawtransaction.cpp:292,303,329. *)
-    (match handle_getrawtransaction ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_invalid_address, msg))
+       Reference: bitcoin-core/src/rpc/rawtransaction.cpp:292,303,329.
+       A MALFORMED txid hits ParseHashV first -> -8 before any lookup. *)
+    guard_hash_param ~name:"txid" params (fun () ->
+      match handle_getrawtransaction ctx params with
+      | Ok r -> Ok r
+      | Error msg -> Error (rpc_invalid_address, msg))
   | "sendrawtransaction" ->
     (match handle_sendrawtransaction ctx params with
      | Ok r -> Ok r
@@ -11087,9 +11140,12 @@ let dispatch_rpc (ctx : rpc_context)
      | Ok r -> Ok r
      | Error msg -> Error (rpc_invalid_params, msg))
   | "getmempoolentry" ->
-    (match handle_getmempoolentry ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_misc_error, msg))
+    (* Core ParseHashV on the txid arg -> malformed = -8 before lookup; a
+       well-formed-but-absent txid stays "Transaction not in mempool". *)
+    guard_hash_param ~name:"txid" params (fun () ->
+      match handle_getmempoolentry ctx params with
+      | Ok r -> Ok r
+      | Error msg -> Error (rpc_misc_error, msg))
   | "getorphantxs" ->
     (* handle_getorphantxs already returns Core-exact (code, message) pairs:
        -8 (RPC_INVALID_PARAMETER) "Invalid verbosity value <n>" for an

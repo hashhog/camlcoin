@@ -818,6 +818,75 @@ let handle_getchaintips (ctx : rpc_context) : Yojson.Safe.t =
   | None ->
     `List []
 
+(* getchainstates — return information about this node's chainstates.
+
+   Faithful port of Bitcoin Core src/rpc/blockchain.cpp:3462 (getchainstates) +
+   RPCHelpForChainstate (:3448).  Result shape:
+     { "headers": <int>,            (best-header height; -1 if none)
+       "chainstates": [             (ordered by work; most-work/ACTIVE LAST)
+         { "blocks": <int>,
+           "bestblockhash": <hex>,
+           "difficulty": <num>,
+           "verificationprogress": <num [0..1]>,
+           "snapshot_blockhash": <hex>,   (OPTIONAL — snapshot-based only)
+           "coins_db_cache_bytes": <int>,
+           "coins_tip_cache_bytes": <int>,
+           "validated": <bool> } ] }
+
+   Camlcoin runs a SINGLE, fully-validated chainstate (it has no active
+   AssumeUTXO snapshot chainstate at runtime), so [chainstates] is always a
+   1-element array with validated=true and snapshot_blockhash OMITTED — which
+   is trivially "most-work last" with one element.
+
+   Cache sizes are the node's GENUINE configured budgets (not fabricated):
+   - coins_db_cache_bytes  = the RocksDB UTXO-store block cache.  cli.ml opens
+     the coins DB via Rocksdb_store.open_db, whose default block_cache_mb is
+     8192 MiB (rocksdb_store.ml:14).
+   - coins_tip_cache_bytes = the in-memory coins-cache byte budget,
+     Utxo.default_max_cache_bytes = 1 GiB (utxo.ml:812).  The live LRU
+     (OptimizedUtxoSet) is sized in ENTRIES rather than a per-instance byte
+     budget, so we surface the canonical configured byte budget for the
+     in-memory coins tip cache (Core reports cs.m_coinstip_cache_size_bytes). *)
+let coins_db_cache_bytes = 8192 * 1024 * 1024   (* Rocksdb_store.open_db default block_cache_mb *)
+let coins_tip_cache_bytes = Utxo.default_max_cache_bytes  (* in-memory coins-cache byte budget *)
+
+let handle_getchainstates (ctx : rpc_context) : Yojson.Safe.t =
+  (* Active chainstate tip — height / hash / difficulty from the validated tip.
+     Core reads cs.m_chain.Tip(); camlcoin's [chain.tip] is the active tip. *)
+  let blocks = ctx.chain.blocks_synced in
+  let bestblockhash, difficulty = match ctx.chain.tip with
+    | Some t ->
+      (Types.hash256_to_hex_display t.hash,
+       Consensus.difficulty_from_bits t.header.bits)
+    | None ->
+      ("0000000000000000000000000000000000000000000000000000000000000000", 1.0)
+  in
+  (* verificationprogress in [0..1] — mirror getblockchaininfo's derivation
+     (validated height / best-header height; Core GuessVerificationProgress
+     toward the network tip). *)
+  let verificationprogress =
+    if ctx.chain.headers_synced = 0 then 0.0
+    else
+      let p = float_of_int blocks /. float_of_int ctx.chain.headers_synced in
+      if p > 1.0 then 1.0 else p
+  in
+  let chainstate = `Assoc [
+    ("blocks",               `Int blocks);
+    ("bestblockhash",        `String bestblockhash);
+    ("difficulty",           json_difficulty difficulty);
+    ("verificationprogress", `Float verificationprogress);
+    (* snapshot_blockhash OMITTED: no active snapshot chainstate. *)
+    ("coins_db_cache_bytes",  `Int coins_db_cache_bytes);
+    ("coins_tip_cache_bytes", `Int coins_tip_cache_bytes);
+    ("validated",            `Bool true);
+  ] in
+  (* headers = best-header height seen so far (-1 if none).  camlcoin always
+     has at least the genesis header, so headers_synced is well-defined. *)
+  `Assoc [
+    ("headers",      `Int ctx.chain.headers_synced);
+    ("chainstates",  `List [chainstate]);
+  ]
+
 (* ============================================================================
    Block Filter Handler (BIP-157/158)
    ============================================================================ *)
@@ -9253,6 +9322,7 @@ let handle_help (_ctx : rpc_context)
       "getdeploymentinfo ( \"blockhash\" )";
       "getdifficulty";
       "getchaintips";
+      "getchainstates";
       "getchaintxstats ( nblocks \"blockhash\" )";
       "getindexinfo ( \"index_name\" )";
       "";
@@ -11029,6 +11099,8 @@ let dispatch_rpc (ctx : rpc_context)
     Ok (handle_getdifficulty ctx)
   | "getchaintips" ->
     Ok (handle_getchaintips ctx)
+  | "getchainstates" ->
+    Ok (handle_getchainstates ctx)
   | "gettxout" ->
     (* Core ParseHashV on the txid arg -> malformed = -8 before lookup; a
        well-formed-but-absent txid stays null (handler returns Ok `Null). *)

@@ -2922,6 +2922,80 @@ let test_parsehashv_getmempoolentry () =
   cleanup_test_db ()
 
 (* ============================================================================
+   getchainstates Tests (Core v31.99 getchainstates, blockchain.cpp:3462)
+   ============================================================================ *)
+
+(* getchainstates returns:
+     { headers: <int>,
+       chainstates: [ { blocks, bestblockhash, difficulty,
+                        verificationprogress, coins_db_cache_bytes,
+                        coins_tip_cache_bytes, validated } ] }
+   For camlcoin's single fully-validated chainstate, chainstates is a
+   1-element array, validated == true, and snapshot_blockhash is OMITTED. *)
+let test_getchainstates_shape () =
+  let (ctx, db, _utxo, _t1, _t2) = create_test_context () in
+  let result = Rpc.dispatch_rpc ctx "getchainstates" [] in
+  Alcotest.(check bool) "getchainstates dispatches Ok" true (Result.is_ok result);
+  (match result with
+   | Ok (`Assoc top) ->
+     (* headers is an int *)
+     (match List.assoc_opt "headers" top with
+      | Some (`Int _) -> ()
+      | Some other ->
+        Alcotest.failf "headers should be Int, got %s" (Yojson.Safe.to_string other)
+      | None -> Alcotest.fail "missing headers field");
+     (* chainstates is a 1-element array *)
+     let chainstates = match List.assoc_opt "chainstates" top with
+       | Some (`List l) -> l
+       | Some other ->
+         Alcotest.failf "chainstates should be List, got %s" (Yojson.Safe.to_string other)
+       | None -> Alcotest.fail "missing chainstates field"
+     in
+     Alcotest.(check int) "chainstates has exactly 1 element" 1 (List.length chainstates);
+     let cs = match chainstates with
+       | [`Assoc fields] -> fields
+       | _ -> Alcotest.fail "chainstates[0] should be an object"
+     in
+     (* blocks: int *)
+     (match List.assoc_opt "blocks" cs with
+      | Some (`Int _) -> ()
+      | _ -> Alcotest.fail "blocks should be Int");
+     (* bestblockhash: 64-hex string *)
+     (match List.assoc_opt "bestblockhash" cs with
+      | Some (`String h) -> Alcotest.(check int) "bestblockhash is 64 hex chars" 64 (String.length h)
+      | _ -> Alcotest.fail "bestblockhash should be String");
+     (* difficulty: numeric (json_difficulty emits `Intlit so it parses as a JSON number) *)
+     (match List.assoc_opt "difficulty" cs with
+      | Some (`Intlit _) | Some (`Float _) | Some (`Int _) -> ()
+      | _ -> Alcotest.fail "difficulty should be numeric");
+     (* verificationprogress: float *)
+     (match List.assoc_opt "verificationprogress" cs with
+      | Some (`Float _) -> ()
+      | _ -> Alcotest.fail "verificationprogress should be Float");
+     (* coins_db_cache_bytes: int, genuine configured budget (>0) *)
+     (match List.assoc_opt "coins_db_cache_bytes" cs with
+      | Some (`Int n) -> Alcotest.(check bool) "coins_db_cache_bytes > 0" true (n > 0)
+      | _ -> Alcotest.fail "coins_db_cache_bytes should be Int");
+     (* coins_tip_cache_bytes: int, genuine configured budget (>0) *)
+     (match List.assoc_opt "coins_tip_cache_bytes" cs with
+      | Some (`Int n) -> Alcotest.(check bool) "coins_tip_cache_bytes > 0" true (n > 0)
+      | _ -> Alcotest.fail "coins_tip_cache_bytes should be Int");
+     (* validated == true for the single fully-validated chainstate *)
+     (match List.assoc_opt "validated" cs with
+      | Some (`Bool b) -> Alcotest.(check bool) "validated == true" true b
+      | _ -> Alcotest.fail "validated should be Bool");
+     (* snapshot_blockhash MUST be absent (no active snapshot chainstate) *)
+     Alcotest.(check bool) "snapshot_blockhash key absent" false
+       (List.mem_assoc "snapshot_blockhash" cs)
+   | Ok other ->
+     Alcotest.failf "getchainstates should return an object, got %s"
+       (Yojson.Safe.to_string other)
+   | Error (code, msg) ->
+     Alcotest.failf "getchainstates errored: (%d, %s)" code msg);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -2998,6 +3072,10 @@ let () =
       test_case "deriveaddresses single" `Quick test_deriveaddresses_single;
       test_case "deriveaddresses range" `Quick test_deriveaddresses_range;
       test_case "deriveaddresses ranged no range" `Quick test_deriveaddresses_ranged_no_range;
+    ];
+    "getchainstates", [
+      test_case "shape: headers + 1-element validated chainstate" `Quick
+        test_getchainstates_shape;
     ];
     "getdeploymentinfo", [
       test_case "non-empty deployments" `Quick test_getdeploymentinfo_non_empty;

@@ -2813,6 +2813,115 @@ let test_getblockfrompeer_success_sends_getdata () =
   cleanup_test_db ()
 
 (* ============================================================================
+   ParseHashV error-code parity (Core rpc/util.cpp:117)
+   ----------------------------------------------------------------------------
+   A MALFORMED txid/blockhash (wrong length OR right-length-non-hex) must throw
+   RPC_INVALID_PARAMETER (-8) at the PARSE boundary, BEFORE any lookup. A
+   WELL-FORMED-but-absent 64-hex hash must stay RPC_INVALID_ADDRESS_OR_KEY (-5)
+   (or null for gettxout). These go through Rpc.dispatch_rpc so the error CODE
+   (not just the Result.is_error shape) is exercised.
+   ========================================================================== *)
+
+let zero_hash64 =
+  "0000000000000000000000000000000000000000000000000000000000000000"
+let short_hex = "abc"                         (* wrong length -> -8 *)
+let nonhex64 = String.make 64 'z'             (* right length, bad hex -> -8 *)
+
+(* Assert a dispatch result is Error with the given code. *)
+let check_err_code label expected_code result =
+  match result with
+  | Error (code, _msg) ->
+    Alcotest.(check int) label expected_code code
+  | Ok j ->
+    Alcotest.failf "%s: expected Error code %d, got Ok %s"
+      label expected_code (Yojson.Safe.to_string j)
+
+let test_parsehashv_getrawtransaction () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  (* (a) malformed -> -8 (both wrong-length and non-hex-right-length) *)
+  check_err_code "getrawtransaction short hex -> -8" (-8)
+    (Rpc.dispatch_rpc ctx "getrawtransaction" [`String short_hex]);
+  check_err_code "getrawtransaction 64z non-hex -> -8" (-8)
+    (Rpc.dispatch_rpc ctx "getrawtransaction" [`String nonhex64]);
+  (* (b) well-formed-but-absent 64-zero txid -> still -5 (not found) *)
+  check_err_code "getrawtransaction absent 64-zero -> -5" (-5)
+    (Rpc.dispatch_rpc ctx "getrawtransaction" [`String zero_hash64]);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_parsehashv_gettxout () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  (* (a) malformed -> -8 *)
+  check_err_code "gettxout short hex -> -8" (-8)
+    (Rpc.dispatch_rpc ctx "gettxout" [`String short_hex; `Int 0]);
+  check_err_code "gettxout 64z non-hex -> -8" (-8)
+    (Rpc.dispatch_rpc ctx "gettxout" [`String nonhex64; `Int 0]);
+  (* (b) well-formed-but-absent 64-zero txid -> null (NOT an error) *)
+  (match Rpc.dispatch_rpc ctx "gettxout" [`String zero_hash64; `Int 0] with
+   | Ok `Null -> ()
+   | Ok j -> Alcotest.failf "gettxout absent: expected null, got %s"
+       (Yojson.Safe.to_string j)
+   | Error (code, msg) ->
+     Alcotest.failf "gettxout absent: expected null, got Error (%d, %s)" code msg);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_parsehashv_getblock () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  (* (a) malformed -> -8 *)
+  check_err_code "getblock short hex -> -8" (-8)
+    (Rpc.dispatch_rpc ctx "getblock" [`String short_hex]);
+  check_err_code "getblock 64z non-hex -> -8" (-8)
+    (Rpc.dispatch_rpc ctx "getblock" [`String nonhex64]);
+  (* (b) well-formed-but-absent 64-zero blockhash -> the handler's own error
+     code (NOT -8). getblock routes its string errors through rpc_misc_error
+     (-1) "Block not found"; assert the code is the handler's, not the -8
+     parse boundary. *)
+  (match Rpc.dispatch_rpc ctx "getblock" [`String zero_hash64] with
+   | Error (code, _) ->
+     Alcotest.(check bool) "getblock absent 64-zero -> NOT -8 (handler error)"
+       true (code <> (-8))
+   | Ok j ->
+     Alcotest.failf "getblock absent: expected handler Error, got Ok %s"
+       (Yojson.Safe.to_string j));
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_parsehashv_getblockheader () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  (* (a) malformed -> -8 *)
+  check_err_code "getblockheader short hex -> -8" (-8)
+    (Rpc.dispatch_rpc ctx "getblockheader" [`String short_hex]);
+  check_err_code "getblockheader 64z non-hex -> -8" (-8)
+    (Rpc.dispatch_rpc ctx "getblockheader" [`String nonhex64]);
+  (* (b) well-formed-but-absent 64-zero blockhash -> still -5 (Block not found) *)
+  check_err_code "getblockheader absent 64-zero -> -5" (-5)
+    (Rpc.dispatch_rpc ctx "getblockheader" [`String zero_hash64]);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+let test_parsehashv_getmempoolentry () =
+  let (ctx, db, _, _, _) = create_test_context () in
+  (* (a) malformed -> -8 *)
+  check_err_code "getmempoolentry short hex -> -8" (-8)
+    (Rpc.dispatch_rpc ctx "getmempoolentry" [`String short_hex]);
+  check_err_code "getmempoolentry 64z non-hex -> -8" (-8)
+    (Rpc.dispatch_rpc ctx "getmempoolentry" [`String nonhex64]);
+  (* (b) well-formed-but-absent 64-zero txid -> the handler's own error code
+     (NOT -8). getmempoolentry routes string errors through rpc_misc_error
+     (-1) "Transaction not in mempool". *)
+  (match Rpc.dispatch_rpc ctx "getmempoolentry" [`String zero_hash64] with
+   | Error (code, _) ->
+     Alcotest.(check bool)
+       "getmempoolentry absent 64-zero -> NOT -8 (handler error)"
+       true (code <> (-8))
+   | Ok j ->
+     Alcotest.failf "getmempoolentry absent: expected handler Error, got Ok %s"
+       (Yojson.Safe.to_string j));
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -2986,5 +3095,17 @@ let () =
         test_getblockheader_raw_returns_160_hex;
       test_case "decoderawtransaction emits full scriptPubKey hex" `Quick
         test_decoderawtransaction_scriptpubkey_full_hex;
+    ];
+    "ParseHashV_error_parity_minus8", [
+      test_case "getrawtransaction malformed->-8, absent->-5" `Quick
+        test_parsehashv_getrawtransaction;
+      test_case "gettxout malformed->-8, absent->null" `Quick
+        test_parsehashv_gettxout;
+      test_case "getblock malformed->-8, absent->handler" `Quick
+        test_parsehashv_getblock;
+      test_case "getblockheader malformed->-8, absent->-5" `Quick
+        test_parsehashv_getblockheader;
+      test_case "getmempoolentry malformed->-8, absent->handler" `Quick
+        test_parsehashv_getmempoolentry;
     ];
   ]

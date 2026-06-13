@@ -6888,23 +6888,173 @@ let handle_converttopsbt (_ctx : rpc_context)
       | [_; `Bool b] -> b
       | _ -> false
     in
-    (try
-      let data = Cstruct.of_hex hex in
-      let r = Serialize.reader_of_cstruct data in
-      let tx = Serialize.deserialize_transaction r in
-      (* Check if there are signatures *)
-      let has_sigs = List.exists (fun inp ->
-        Cstruct.length inp.Types.script_sig > 0
-      ) tx.inputs || tx.witnesses <> [] in
-      if has_sigs && not permitsigdata then
-        Error "Transaction has signature data. Set permitsigdata=true to strip them."
-      else
-        let psbt = Psbt.create tx in
-        Ok (`String (Psbt.to_base64 psbt))
-    with exn ->
-      Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn)))
+    (* Core (rpc/rawtransaction.cpp::converttopsbt) raises two distinct
+       RPC_DESERIALIZATION_ERROR (-22) failures, distinguished here so the
+       dispatch arm can pin the exact code/message:
+         - "TX decode failed"                              (hex decode fails)
+         - "Inputs must not have scriptSigs and scriptWitnesses"
+                                                            (sig data present
+                                                             without permit). *)
+    let has_witness_items wits =
+      List.exists (fun (w : Types.tx_witness) -> w.items <> []) wits
+    in
+    (match (try
+              let data = Cstruct.of_hex hex in
+              let r = Serialize.reader_of_cstruct data in
+              Ok (Serialize.deserialize_transaction r)
+            with _ -> Error "TX decode failed")
+     with
+     | Error msg -> Error msg
+     | Ok tx ->
+       (* Check if there are signatures *)
+       let has_sigs =
+         List.exists (fun inp -> Cstruct.length inp.Types.script_sig > 0) tx.inputs
+         || has_witness_items tx.witnesses
+       in
+       if has_sigs && not permitsigdata then
+         Error "Inputs must not have scriptSigs and scriptWitnesses"
+       else
+         let psbt = Psbt.create tx in
+         Ok (`String (Psbt.to_base64 psbt)))
   | _ ->
     Error "Invalid parameters: expected [hexstring, (permitsigdata)]"
+
+(* joinpsbts ["base64string", ...]
+   Joins multiple distinct PSBTs into one with inputs+outputs from all.
+   Reference: bitcoin-core/src/rpc/rawtransaction.cpp::joinpsbts (1778).
+
+   Semantics matched to Core:
+     - require >= 2 PSBTs, else RPC_INVALID_PARAMETER (-8)
+       "At least two PSBTs are required to join PSBTs."
+     - decode each base64 PSBT; on failure RPC_DESERIALIZATION_ERROR (-22)
+       "TX decode failed <err>"
+     - merged tx.version  = max over all inputs (start at 1)
+     - merged tx.locktime = min over all inputs (start at 0xffffffff)
+     - union of every input (dup prevout -> -8
+       "Input <txid>:<n> exists in multiple PSBTs"), union of every output
+       (no dedup), merge global xpubs + unknown global maps.
+     - SHUFFLE inputs and outputs for privacy (Core uses FastRandomContext);
+       we shuffle with a Fisher-Yates over the parallel (tx-entry, psbt-entry)
+       pairs so result order is randomized but the input/output SETS match.
+
+   Error-code routing is done at the dispatch arm: a message beginning with
+   "TX decode failed" maps to -22; all others (the two messages above) to -8. *)
+let handle_joinpsbts (_ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match params with
+  | [`List txs] ->
+    if List.length txs <= 1 then
+      Error "At least two PSBTs are required to join PSBTs."
+    else begin
+      (* Decode every PSBT, propagating the first decode failure as -22. *)
+      let decoded =
+        List.map (fun j ->
+          match j with
+          | `String b64 ->
+            (match Psbt.of_base64 b64 with
+             | Ok p -> Ok p
+             | Error e ->
+               Error (Printf.sprintf "TX decode failed %s" (Psbt.string_of_error e)))
+          | _ -> Error "TX decode failed not a string")
+          txs
+      in
+      match List.find_opt (function Error _ -> true | Ok _ -> false) decoded with
+      | Some (Error msg) -> Error msg
+      | _ ->
+        let psbts = List.filter_map (function Ok p -> Some p | Error _ -> None) decoded in
+        (* best_version = max (start 1); best_locktime = min (start 0xffffffff).
+           Compare versions/locktimes as UNSIGNED 32-bit, matching Core. *)
+        let to_u32 (x : int32) : int64 =
+          Int64.logand (Int64.of_int32 x) 0xFFFFFFFFL
+        in
+        let best_version =
+          List.fold_left (fun acc (p : Psbt.psbt) ->
+            let v = to_u32 p.tx.version in if Int64.compare v acc > 0 then v else acc)
+            1L psbts
+        in
+        let best_locktime =
+          List.fold_left (fun acc (p : Psbt.psbt) ->
+            let l = to_u32 p.tx.locktime in if Int64.compare l acc < 0 then l else acc)
+            0xFFFFFFFFL psbts
+        in
+        (* Collect parallel (tx-input, psbt-input) and (tx-output, psbt-output)
+           pairs across all PSBTs, detecting duplicate input prevouts. *)
+        let seen_prevouts = Hashtbl.create 64 in
+        let dup_err = ref None in
+        let in_pairs = ref [] in
+        let out_pairs = ref [] in
+        List.iter (fun (p : Psbt.psbt) ->
+          (* tx.inputs and psbt.inputs are parallel; same for outputs. *)
+          List.iter2 (fun (txin : Types.tx_in) (pin : Psbt.psbt_input) ->
+            let op = txin.previous_output in
+            let key =
+              (Cstruct.to_string op.txid)
+              ^ "|" ^ Int32.to_string op.vout
+            in
+            if Hashtbl.mem seen_prevouts key then begin
+              if !dup_err = None then
+                dup_err := Some (Printf.sprintf "Input %s:%ld exists in multiple PSBTs"
+                                   (Types.hash256_to_hex_display op.txid) op.vout)
+            end else begin
+              Hashtbl.add seen_prevouts key ();
+              in_pairs := (txin, pin) :: !in_pairs
+            end
+          ) p.tx.inputs p.inputs;
+          List.iter2 (fun (txout : Types.tx_out) (pout : Psbt.psbt_output) ->
+            out_pairs := (txout, pout) :: !out_pairs
+          ) p.tx.outputs p.outputs
+        ) psbts;
+        (match !dup_err with
+         | Some msg -> Error msg
+         | None ->
+           let in_pairs = List.rev !in_pairs in
+           let out_pairs = List.rev !out_pairs in
+           (* Merge global xpubs (dedup) and unknown global maps. *)
+           let merged_xpubs =
+             Psbt.dedup_global_xpubs
+               (List.concat_map (fun (p : Psbt.psbt) -> p.global_xpubs) psbts)
+           in
+           let merged_unknown =
+             Psbt.dedup_unknown_kvs
+               (List.concat_map (fun (p : Psbt.psbt) -> p.unknown) psbts)
+           in
+           (* Shuffle input and output pair lists (Fisher-Yates). Core shuffles
+              for privacy with FastRandomContext; we randomize order too, so the
+              result is order-independent — tests compare input/output SETS. *)
+           let shuffle : 'a. 'a list -> 'a list = fun lst ->
+             let arr = Array.of_list lst in
+             let n = Array.length arr in
+             for i = n - 1 downto 1 do
+               let j = Random.int (i + 1) in
+               let tmp = arr.(i) in arr.(i) <- arr.(j); arr.(j) <- tmp
+             done;
+             Array.to_list arr
+           in
+           let in_pairs = shuffle in_pairs in
+           let out_pairs = shuffle out_pairs in
+           (* Build merged transaction skeleton.  Inputs carry empty scriptSig
+              (PSBT unsigned-tx invariant) and original sequence; the signing
+              data lives in the parallel psbt_input records. *)
+           let merged_tx : Types.transaction = {
+             version = Int32.of_int (Int64.to_int (Int64.logand best_version 0xFFFFFFFFL));
+             inputs = List.map (fun ((txin : Types.tx_in), _) ->
+               { txin with Types.script_sig = Cstruct.empty }) in_pairs;
+             outputs = List.map (fun ((txout : Types.tx_out), _) -> txout) out_pairs;
+             witnesses = [];
+             locktime = Int32.of_int (Int64.to_int (Int64.logand best_locktime 0xFFFFFFFFL));
+           } in
+           let merged_psbt : Psbt.psbt = {
+             tx = merged_tx;
+             global_xpubs = merged_xpubs;
+             version = None;
+             inputs = List.map (fun (_, pin) -> pin) in_pairs;
+             outputs = List.map (fun (_, pout) -> pout) out_pairs;
+             unknown = merged_unknown;
+           } in
+           Ok (`String (Psbt.to_base64 merged_psbt)))
+    end
+  | _ ->
+    Error "Invalid parameters: expected [[base64strings]]"
 
 (* ============================================================================
    walletcreatefundedpsbt Handler
@@ -11781,6 +11931,15 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_combinepsbt ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
+  | "joinpsbts" ->
+    (match handle_joinpsbts ctx params with
+     | Ok r -> Ok r
+     (* Core: decode failure -> RPC_DESERIALIZATION_ERROR (-22); the
+        fewer-than-2 and duplicate-input errors -> RPC_INVALID_PARAMETER (-8). *)
+     | Error msg
+       when String.length msg >= 16 && String.sub msg 0 16 = "TX decode failed" ->
+       Error (rpc_deserialization_error, msg)
+     | Error msg -> Error (rpc_invalid_parameter, msg))
   | "finalizepsbt" ->
     (match handle_finalizepsbt ctx params with
      | Ok r -> Ok r
@@ -11792,7 +11951,13 @@ let dispatch_rpc (ctx : rpc_context)
   | "converttopsbt" ->
     (match handle_converttopsbt ctx params with
      | Ok r -> Ok r
-     | Error msg -> Error (rpc_misc_error, msg))
+     (* Core throws RPC_DESERIALIZATION_ERROR (-22) for both failure modes:
+        "TX decode failed" and "Inputs must not have scriptSigs and
+        scriptWitnesses".  Anything else (param-shape errors) stays -8. *)
+     | Error msg when msg = "TX decode failed"
+                   || msg = "Inputs must not have scriptSigs and scriptWitnesses" ->
+       Error (rpc_deserialization_error, msg)
+     | Error msg -> Error (rpc_invalid_parameter, msg))
   | "walletcreatefundedpsbt" ->
     (match handle_walletcreatefundedpsbt ctx params with
      | Ok r -> Ok r

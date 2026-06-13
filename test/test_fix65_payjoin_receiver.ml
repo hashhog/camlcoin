@@ -138,7 +138,8 @@ let make_rpc_ctx_with_wallet (w : Wallet.t) : Rpc.rpc_context =
   { Rpc.chain; mempool = mp; peer_manager = pm;
     wallet = Some w; wallet_manager = None;
     fee_estimator = fe; network = Consensus.regtest;
-    filter_index = None; utxo = None; data_dir = None; }
+    filter_index = None; utxo = None; data_dir = None;
+    snapshot_activation = None; }
 
 (* ============================================================================
    G17  — 4 BIP-78 wire-error codes round-trip

@@ -178,7 +178,8 @@ let make_psbt_test_ctx ~(wallet : Wallet.t) : Rpc.rpc_context =
     network = Consensus.regtest;
     filter_index = None;
     utxo = None;
-    data_dir = None; }
+    data_dir = None;
+    snapshot_activation = None; }
 
 (* ============================================================================
    G1 – G6: Descriptors

@@ -330,7 +330,8 @@ let make_scrub_test_ctx (db : Storage.ChainDB.t) : Rpc.rpc_context =
   { chain; mempool = mp; peer_manager = pm;
     wallet = None; wallet_manager = None;
     fee_estimator = fe; network = Consensus.regtest;
-    filter_index = None; utxo = None; data_dir = None }
+    filter_index = None; utxo = None; data_dir = None;
+    snapshot_activation = None }
 
 (* Persist a synthetic [utxo_entry] directly into the cf_chainstate UTXO
    CF, bypassing the write-time filter so we can simulate a pre-fix

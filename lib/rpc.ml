@@ -826,7 +826,9 @@ let handle_getchaintips (ctx : rpc_context) : Yojson.Safe.t =
        "chainstates": [             (ordered by work; most-work/ACTIVE LAST)
          { "blocks": <int>,
            "bestblockhash": <hex>,
+           "bits": <hex>,                 (tip nBits, 8-char lower-hex)
            "difficulty": <num>,
+           "target": <hex>,               (tip target from nBits, 64-char hex)
            "verificationprogress": <num [0..1]>,
            "snapshot_blockhash": <hex>,   (OPTIONAL — snapshot-based only)
            "coins_db_cache_bytes": <int>,
@@ -854,12 +856,17 @@ let handle_getchainstates (ctx : rpc_context) : Yojson.Safe.t =
   (* Active chainstate tip — height / hash / difficulty from the validated tip.
      Core reads cs.m_chain.Tip(); camlcoin's [chain.tip] is the active tip. *)
   let blocks = ctx.chain.blocks_synced in
-  let bestblockhash, difficulty = match ctx.chain.tip with
+  let bestblockhash, difficulty, bits_hex, target_hex = match ctx.chain.tip with
     | Some t ->
       (Types.hash256_to_hex_display t.hash,
-       Consensus.difficulty_from_bits t.header.bits)
+       Consensus.difficulty_from_bits t.header.bits,
+       (* bits/target: SAME tip-nBits source + conversion as getblockchaininfo
+          (Core make_chain_data: strprintf("%08x", nBits) / GetTarget().GetHex()). *)
+       Printf.sprintf "%08lx" t.header.bits,
+       bits_to_target_hex t.header.bits)
     | None ->
-      ("0000000000000000000000000000000000000000000000000000000000000000", 1.0)
+      ("0000000000000000000000000000000000000000000000000000000000000000", 1.0,
+       "1d00ffff", String.make 64 '0')
   in
   (* verificationprogress in [0..1] — mirror getblockchaininfo's derivation
      (validated height / best-header height; Core GuessVerificationProgress
@@ -873,7 +880,11 @@ let handle_getchainstates (ctx : rpc_context) : Yojson.Safe.t =
   let chainstate = `Assoc [
     ("blocks",               `Int blocks);
     ("bestblockhash",        `String bestblockhash);
+    (* bits/target match Core make_chain_data (blockchain.cpp:3496) and this
+       impl's own getblockchaininfo for the same tip. *)
+    ("bits",                 `String bits_hex);
     ("difficulty",           json_difficulty difficulty);
+    ("target",               `String target_hex);
     ("verificationprogress", `Float verificationprogress);
     (* snapshot_blockhash OMITTED: no active snapshot chainstate. *)
     ("coins_db_cache_bytes",  `Int coins_db_cache_bytes);

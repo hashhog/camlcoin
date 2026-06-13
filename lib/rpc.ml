@@ -7136,6 +7136,256 @@ let handle_walletcreatefundedpsbt (ctx : rpc_context)
     | exn -> Error (Printexc.to_string exn))
 
 (* ============================================================================
+   fundrawtransaction Handler
+   (Bitcoin Core: src/wallet/rpc/spend.cpp::fundrawtransaction → FundTransaction)
+
+   The raw-tx sibling of walletcreatefundedpsbt: decode a raw-tx hexstring,
+   keep its existing inputs/outputs, run the SAME wallet coin-selection engine
+   (Wallet.select_coins) to add inputs + a change output so the wallet funds all
+   existing outputs plus the fee, then serialize the funded tx back to hex.
+
+   Signature: fundrawtransaction "hexstring" ( options iswitness )
+   Result:    { "hex": <funded raw tx hex>,
+                "fee": <amount BTC>,
+                "changepos": <added change output index, or -1> }
+
+   This deliberately mirrors handle_walletcreatefundedpsbt's funding/change
+   logic (target = sum of existing outputs; Wallet.select_coins for the inputs;
+   CSPRNG / user change position; change script keyed to the first output's
+   type) — the only differences are the source of the base tx (decoded hex vs.
+   user inputs/outputs) and the serialized form of the result (network-format
+   hex vs. PSBT base64).  Coin selection is NOT reimplemented. *)
+let handle_fundrawtransaction (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match ctx.wallet with
+  | None -> Error "Wallet not loaded"
+  | Some wallet ->
+    let hex_param, options_param =
+      match params with
+      | [a]          -> (a, `Assoc [])
+      | [a; b]       -> (a, b)
+      | a :: b :: _  -> (a, b)
+      | _            -> (`Null, `Assoc [])
+    in
+    (match hex_param with
+     | `String hex ->
+       (try
+         let network = network_to_address_network ctx.network in
+         (* --- Decode the raw tx.  Core's DecodeHexTx tries non-witness
+            deserialization first, then witness (rawtransaction.cpp /
+            DecodeHexTx with try_no_witness/try_witness).  We mirror that:
+            a tx with no inputs serializes with a leading 0x00 input-count
+            byte that the witness-aware Serialize.deserialize_transaction would
+            misread as a segwit marker — so attempt a strict non-witness parse
+            (which must consume the ENTIRE buffer) first, and fall back to the
+            witness path only if that fails. --- *)
+         let decode_no_witness (data : Cstruct.t) : Types.transaction =
+           let r = Serialize.reader_of_cstruct data in
+           let version = Serialize.read_int32_le r in
+           let in_count = Serialize.read_compact_size r in
+           let inputs = List.init in_count
+             (fun _ -> Serialize.deserialize_tx_in r) in
+           let out_count = Serialize.read_compact_size r in
+           let outputs = List.init out_count
+             (fun _ -> Serialize.deserialize_tx_out r) in
+           let locktime = Serialize.read_int32_le r in
+           (* Must consume the whole buffer for a valid non-witness tx. *)
+           if r.Serialize.pos <> Cstruct.length data then
+             failwith "trailing bytes";
+           { Types.version; inputs; outputs; witnesses = []; locktime }
+         in
+         let base_tx =
+           let data =
+             try Cstruct.of_hex hex with _ -> failwith "TX decode failed" in
+           match (try Some (decode_no_witness data) with _ -> None) with
+           | Some tx -> tx
+           | None ->
+             (try
+               let r = Serialize.reader_of_cstruct data in
+               Serialize.deserialize_transaction r
+             with _ -> failwith "TX decode failed")
+         in
+         let existing_inputs = base_tx.Types.inputs in
+         let existing_outputs = base_tx.Types.outputs in
+         (* --- Options parsing (mirrors Core's FundTransaction options
+            block; supports the tractable subset). --- *)
+         let opt_field name = match options_param with
+           | `Assoc fields -> List.assoc_opt name fields
+           | _ -> None
+         in
+         (* fee_rate: sat/vB (preferred), feeRate: BTC/kvB legacy alias.
+            BTC/kvB → sat/vB == f * 1e5.  Same rule as walletcreatefundedpsbt. *)
+         let fee_rate = match opt_field "fee_rate" with
+           | Some (`Float f) -> f
+           | Some (`Int n) -> float_of_int n
+           | _ ->
+             (match opt_field "feeRate" with
+              | Some (`Float f) -> f *. 100_000.0
+              | Some (`Int n) -> float_of_int n *. 100_000.0
+              | _ -> 1.0)
+         in
+         let lock_unspents = match opt_field "lockUnspents" with
+           | Some (`Bool b) -> b
+           | _ -> false
+         in
+         let change_address_opt = match opt_field "changeAddress" with
+           | Some (`String s) -> Some s
+           | _ -> None
+         in
+         let change_position = match opt_field "changePosition" with
+           | Some (`Int n) -> Some n
+           | _ -> None
+         in
+         (* subtractFeeFromOutputs: array of zero-based output indices the fee
+            is deducted from equally.  Core: when set, the sender does not pay
+            the fee — existing outputs are reduced instead, so the funding
+            target shrinks by the fee. *)
+         let sffo_indices = match opt_field "subtractFeeFromOutputs" with
+           | Some (`List arr) ->
+             List.filter_map (function `Int i -> Some i | _ -> None) arr
+           | _ -> []
+         in
+         (* add_inputs: for a tx with existing inputs, whether to auto-select
+            more.  Default true (Core).  With no existing inputs we always
+            select. *)
+         let add_inputs = match opt_field "add_inputs" with
+           | Some (`Bool b) -> b
+           | _ -> true
+         in
+         (* --- Funding target = sum of the existing outputs. --- *)
+         let target_amount = List.fold_left (fun acc o ->
+           Int64.add acc o.Types.value
+         ) 0L existing_outputs in
+         let tip_height = match ctx.chain.tip with
+           | Some t -> Some t.height | None -> None in
+         if existing_inputs <> [] && not add_inputs then
+           failwith "Insufficient funds (add_inputs disabled with existing inputs)";
+         (* --- Coin selection: the SAME engine walletcreatefundedpsbt uses
+            (Wallet.select_coins, lib/wallet.ml:1253). --- *)
+         let sel = match Wallet.select_coins wallet target_amount fee_rate
+                           ?tip_height () with
+           | Error e -> failwith e
+           | Ok s -> s
+         in
+         (* FIX-70 / W120 BUG-2 parity: auto-selected inputs default to
+            MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD) so the funded tx signals RBF,
+            matching Core's m_signal_rbf default. *)
+         let auto_inputs = List.map (fun (wu : Wallet.wallet_utxo) ->
+           { Types.previous_output = wu.outpoint;
+             script_sig = Cstruct.empty;
+             sequence = Wallet.max_bip125_rbf_sequence }
+         ) sel.selected in
+         let final_inputs = existing_inputs @ auto_inputs in
+         let selected_wutxos = sel.selected in
+         let change_amount = sel.change in
+         (* --- subtractFeeFromOutputs: deduct the fee from the chosen outputs
+            (equally), folding any change back so the wallet pays nothing
+            extra.  When no indices are given the sender pays via change. --- *)
+         let total_input = List.fold_left (fun acc (wu : Wallet.wallet_utxo) ->
+           Int64.add acc wu.utxo.Utxo.value
+         ) 0L selected_wutxos in
+         let (existing_outputs, change_amount) =
+           if sffo_indices = [] then (existing_outputs, change_amount)
+           else begin
+             (* fee = inputs - outputs (with no change output the sender keeps
+                nothing); deduct it from the named outputs equally. *)
+             let fee_total = Int64.sub total_input target_amount in
+             let n = List.length sffo_indices in
+             if n = 0 || Int64.compare fee_total 0L <= 0 then
+               (existing_outputs, change_amount)
+             else begin
+               let per = Int64.div fee_total (Int64.of_int n) in
+               let rem = Int64.rem fee_total (Int64.of_int n) in
+               let adjusted = List.mapi (fun i (o : Types.tx_out) ->
+                 match List.find_index (fun j -> j = i) sffo_indices with
+                 | Some k ->
+                   (* last named output absorbs the rounding remainder *)
+                   let extra = if k = n - 1 then rem else 0L in
+                   let deducted = Int64.add per extra in
+                   { o with value = Int64.sub o.value deducted }
+                 | None -> o
+               ) existing_outputs in
+               (* With SFFO the fee is paid by the outputs, so there is no
+                  change output (Core: sender pays nothing extra). *)
+               (adjusted, 0L)
+             end
+           end
+         in
+         (* --- Assemble outputs with an optional change output (identical
+            logic to walletcreatefundedpsbt). --- *)
+         let dust = 546L in
+         let (final_outputs, changepos) =
+           if Int64.compare change_amount dust > 0 then
+             let change_script = match change_address_opt with
+               | Some addr_str ->
+                 (match Address.address_of_string addr_str with
+                  | Ok a when a.Address.network = network ->
+                    Address.address_to_script a
+                  | _ -> failwith
+                      (Printf.sprintf "Change address must be a valid bitcoin address: %s" addr_str))
+               | None ->
+                 let kp = Wallet.generate_change_key wallet in
+                 let dest_script = match existing_outputs with
+                   | first :: _ -> first.Types.script_pubkey
+                   | [] -> Cstruct.empty
+                 in
+                 Wallet.build_change_script dest_script kp.Wallet.public_key
+             in
+             let change_out = { Types.value = change_amount;
+                                script_pubkey = change_script } in
+             let pos = match change_position with
+               | Some p when p >= 0 && p <= List.length existing_outputs -> p
+               | Some _ -> failwith "changePosition out of bounds"
+               | None ->
+                 Wallet.csprng_int_range (List.length existing_outputs + 1)
+             in
+             let rec insert_at i acc = function
+               | rest when i = 0 -> List.rev_append acc (change_out :: rest)
+               | x :: rest -> insert_at (i - 1) (x :: acc) rest
+               | [] -> List.rev (change_out :: acc)
+             in
+             (insert_at pos [] existing_outputs, pos)
+           else
+             (existing_outputs, -1)
+         in
+         (* --- The funded tx.  Newly-added inputs are unsigned (no witness),
+            matching Core: "The inputs added will not be signed". --- *)
+         let funded_tx : Types.transaction = {
+           version = base_tx.Types.version;
+           inputs = final_inputs;
+           outputs = final_outputs;
+           witnesses = [];
+           locktime = base_tx.Types.locktime;
+         } in
+         (* lockUnspents=true: lock every selected wallet utxo (Core locks
+            atomically after building — FundTransaction). *)
+         if lock_unspents then
+           List.iter (fun (wu : Wallet.wallet_utxo) ->
+             let _ = Wallet.lock_coin wallet wu.outpoint ~persistent:false in ()
+           ) selected_wutxos;
+         (* fee = sum(selected inputs) - sum(all final outputs).  With change
+            present this is exactly the coin-selection fee; with SFFO the
+            deducted-output reduction equals the fee. *)
+         let total_output = List.fold_left (fun acc o ->
+           Int64.add acc o.Types.value
+         ) 0L final_outputs in
+         let fee = Int64.sub total_input total_output in
+         let fee = if Int64.compare fee 0L < 0 then 0L else fee in
+         (* Serialize the funded tx back to network-format hex. *)
+         let w = Serialize.writer_create () in
+         Serialize.serialize_transaction w funded_tx;
+         let funded_hex = cstruct_to_hex (Serialize.writer_to_cstruct w) in
+         Ok (`Assoc [
+           ("hex", `String funded_hex);
+           ("fee", `Float (Int64.to_float fee /. 100_000_000.0));
+           ("changepos", `Int changepos);
+         ])
+       with
+       | Failure msg -> Error msg
+       | exn -> Error (Printexc.to_string exn))
+     | _ -> Error "Invalid parameters: expected [hexstring, (options, iswitness)]")
+
+(* ============================================================================
    walletprocesspsbt Handler  (W118 BUG-5 closure)
    (Bitcoin Core: src/wallet/rpc/spend.cpp::walletprocesspsbt)
 
@@ -9377,6 +9627,7 @@ let handle_help (_ctx : rpc_context)
       "finalizepsbt \"psbt\" ( extract )";
       "utxoupdatepsbt \"psbt\"";
       "walletcreatefundedpsbt [{\"txid\":\"...\", \"vout\":n},...] [{\"address\":amount},...] ( locktime options bip32derivs )";
+      "fundrawtransaction \"hexstring\" ( options iswitness )";
       "walletprocesspsbt \"psbt\" ( sign \"sighashtype\" bip32derivs finalize )";
       "";
       "== Descriptors ==";
@@ -11427,6 +11678,19 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_walletcreatefundedpsbt ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_wallet_error, msg))
+  | "fundrawtransaction" ->
+    (match handle_fundrawtransaction ctx params with
+     | Ok r -> Ok r
+     | Error msg ->
+       (* "TX decode failed" → deserialization error (RPC -22); change/address
+          and bounds problems → invalid-parameter; everything else (chiefly
+          Insufficient funds) → wallet error (RPC -4), matching Core. *)
+       if msg = "TX decode failed" then
+         Error (rpc_deserialization_error, msg)
+       else if msg = "changePosition out of bounds" then
+         Error (rpc_invalid_parameter, msg)
+       else
+         Error (rpc_wallet_error, msg))
   | "walletprocesspsbt" ->
     (match handle_walletprocesspsbt ctx params with
      | Ok r -> Ok r

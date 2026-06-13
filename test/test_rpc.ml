@@ -3050,6 +3050,40 @@ let test_getchainstates_shape () =
      (match List.assoc_opt "difficulty" cs with
       | Some (`Intlit _) | Some (`Float _) | Some (`Int _) -> ()
       | _ -> Alcotest.fail "difficulty should be numeric");
+     (* bits: 8-char lower-hex string (Core make_chain_data: %08x of tip nBits) *)
+     let cs_bits = match List.assoc_opt "bits" cs with
+       | Some (`String b) ->
+         Alcotest.(check int) "bits is 8 hex chars" 8 (String.length b);
+         Alcotest.(check bool) "bits is lower-hex" true
+           (String.for_all (fun c ->
+              (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) b);
+         b
+       | _ -> Alcotest.fail "bits should be String"
+     in
+     (* target: 64-char hex string (Core make_chain_data: GetTarget().GetHex()) *)
+     let cs_target = match List.assoc_opt "target" cs with
+       | Some (`String t) ->
+         Alcotest.(check int) "target is 64 hex chars" 64 (String.length t);
+         Alcotest.(check bool) "target is lower-hex" true
+           (String.for_all (fun c ->
+              (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) t);
+         t
+       | _ -> Alcotest.fail "target should be String"
+     in
+     (* bits/target MUST equal what getblockchaininfo reports for the SAME tip
+        (same tip-nBits source + conversion helpers — Core parity). *)
+     let bci_bits, bci_target = match Rpc.handle_getblockchaininfo ctx with
+       | `Assoc bci ->
+         ((match List.assoc_opt "bits" bci with
+           | Some (`String b) -> b | _ -> Alcotest.fail "getblockchaininfo missing bits"),
+          (match List.assoc_opt "target" bci with
+           | Some (`String t) -> t | _ -> Alcotest.fail "getblockchaininfo missing target"))
+       | _ -> Alcotest.fail "getblockchaininfo should return an object"
+     in
+     Alcotest.(check string) "getchainstates.bits == getblockchaininfo.bits"
+       bci_bits cs_bits;
+     Alcotest.(check string) "getchainstates.target == getblockchaininfo.target"
+       bci_target cs_target;
      (* verificationprogress: float *)
      (match List.assoc_opt "verificationprogress" cs with
       | Some (`Float _) -> ()

@@ -2495,6 +2495,88 @@ let test_walletcreatefundedpsbt_basic () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* fundrawtransaction: build a raw tx with one output and NO inputs, encode it,
+   and fund it.  The handler must (a) add wallet inputs via coin selection,
+   (b) add a change output, (c) return a real positive fee, and (d) return hex
+   that decodes to a tx whose selected-input value covers outputs + fee.  Uses
+   the same regtest-style funded wallet fixture as the walletcreatefundedpsbt
+   test (create_lockunspent_context: two wallet UTXOs 0.5 + 0.3 BTC). *)
+let test_fundrawtransaction_basic () =
+  let (ctx, db, _wallet, _op_a, _op_b) = create_lockunspent_context () in
+  (* Destination address (mainnet P2WPKH). *)
+  let dest_priv = Cstruct.of_hex
+    "3030303030303030303030303030303030303030303030303030303030303030" in
+  let dest_pub = Crypto.derive_public_key ~compressed:true dest_priv in
+  let dest_addr = Address.of_pubkey ~network:`Mainnet
+    Address.P2WPKH dest_pub in
+  let dest_script = Address.address_to_script dest_addr in
+  (* Raw tx: ONE output of 0.1 BTC, zero inputs. *)
+  let base_tx = make_regular_tx [] [Types.{ value = 10_000_000L;
+                                            script_pubkey = dest_script }] in
+  let raw_hex = tx_to_hex base_tx in
+  let result = Rpc.handle_fundrawtransaction ctx [`String raw_hex] in
+  Alcotest.(check bool) "fundraw ok" true (Result.is_ok result);
+  let fields = match result with
+    | Ok (`Assoc f) -> f
+    | _ -> Alcotest.fail "expected assoc result"
+  in
+  let funded_hex = match List.assoc "hex" fields with
+    | `String s -> s | _ -> Alcotest.fail "hex field shape"
+  in
+  Alcotest.(check bool) "hex nonempty" true (String.length funded_hex > 0);
+  let fee = match List.assoc "fee" fields with
+    | `Float f -> f | _ -> Alcotest.fail "fee field shape"
+  in
+  Alcotest.(check bool) "fee > 0" true (fee > 0.0);
+  let changepos = match List.assoc "changepos" fields with
+    | `Int n -> n | _ -> Alcotest.fail "changepos field shape"
+  in
+  (* Decode the funded hex and assert structural properties. *)
+  let funded_tx =
+    let r = Serialize.reader_of_cstruct (Cstruct.of_hex funded_hex) in
+    Serialize.deserialize_transaction r
+  in
+  (* (a) inputs were added. *)
+  Alcotest.(check bool) "vin non-empty" true
+    (List.length funded_tx.Types.inputs >= 1);
+  (* (b) a change output exists (or changepos = -1 only on an exact match). *)
+  let n_out = List.length funded_tx.Types.outputs in
+  if changepos >= 0 then begin
+    Alcotest.(check bool) "changepos in range" true
+      (changepos < n_out);
+    (* The non-change outputs include our original destination. *)
+    Alcotest.(check bool) "≥2 outputs when change present" true (n_out >= 2);
+    (* The change output value must be positive. *)
+    let change_out = List.nth funded_tx.Types.outputs changepos in
+    Alcotest.(check bool) "change value > 0" true
+      (Int64.compare change_out.Types.value 0L > 0)
+  end else
+    Alcotest.(check int) "no-change → exactly the original outputs" 1 n_out;
+  (* (d) selected input value covers outputs + fee, i.e.
+     sum(inputs) == sum(outputs) + fee.  Resolve each input against the
+     wallet UTXO set to get its value. *)
+  let wallet_utxos = Wallet.get_utxos _wallet in
+  let total_input = List.fold_left (fun acc (inp : Types.tx_in) ->
+    match List.find_opt (fun (wu : Wallet.wallet_utxo) ->
+      Cstruct.equal wu.outpoint.txid inp.previous_output.txid &&
+      wu.outpoint.vout = inp.previous_output.vout
+    ) wallet_utxos with
+    | Some wu -> Int64.add acc wu.utxo.Utxo.value
+    | None -> acc
+  ) 0L funded_tx.Types.inputs in
+  let total_output = List.fold_left (fun acc (o : Types.tx_out) ->
+    Int64.add acc o.Types.value
+  ) 0L funded_tx.Types.outputs in
+  let fee_sats = Int64.of_float (fee *. 100_000_000.0) in
+  (* sum(inputs) - sum(outputs) == fee (exact conservation). *)
+  Alcotest.(check bool) "inputs == outputs + fee"
+    true (Int64.compare total_input (Int64.add total_output fee_sats) = 0);
+  (* inputs cover outputs + fee (the funded tx is fundable). *)
+  Alcotest.(check bool) "inputs cover outputs+fee" true
+    (Int64.compare total_input (Int64.add total_output fee_sats) >= 0);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 (* ============================================================================
    signrawtransactionwithkey: P2PKH (legacy) WIF path
    ============================================================================
@@ -3165,6 +3247,8 @@ let () =
         test_signmessage_non_p2pkh_address_rejected;
       test_case "walletcreatefundedpsbt basic funding" `Quick
         test_walletcreatefundedpsbt_basic;
+      test_case "fundrawtransaction basic funding" `Quick
+        test_fundrawtransaction_basic;
       test_case "signrawtransactionwithkey P2PKH (WIF) signs" `Quick
         test_signrawtransactionwithkey_p2pkh_wif;
     ];

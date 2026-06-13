@@ -1026,6 +1026,7 @@ let make_dump_test_ctx () =
     filter_index = None;
     utxo = None;
     data_dir = Some dir;
+    snapshot_activation = None;
   } in
   (ctx, db, dir)
 

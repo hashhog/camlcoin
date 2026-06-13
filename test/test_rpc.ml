@@ -140,6 +140,7 @@ let create_test_context () =
     filter_index = None;
     utxo = None;
     data_dir = None;
+    snapshot_activation = None;
   } in
   (ctx, db, utxo, txid1, txid2)
 
@@ -683,6 +684,7 @@ let test_getrawtransaction_confirmed_has_block_info () =
     filter_index = None;
     utxo = None;
     data_dir = None;
+    snapshot_activation = None;
   } in
 
   let txid_hex = Types.hash256_to_hex_display txid in
@@ -754,6 +756,7 @@ let test_getrawtransaction_with_blockhash () =
     filter_index = None;
     utxo = None;
     data_dir = None;
+    snapshot_activation = None;
   } in
 
   let txid_hex = Types.hash256_to_hex_display txid in
@@ -810,6 +813,7 @@ let test_getrawtransaction_wrong_blockhash () =
     filter_index = None;
     utxo = None;
     data_dir = None;
+    snapshot_activation = None;
   } in
 
   (* Try to find tx that doesn't exist in this block *)
@@ -1040,6 +1044,7 @@ let create_regtest_context () =
     filter_index = None;
     utxo = None;
     data_dir = None;
+    snapshot_activation = None;
   } in
   (ctx, db, utxo)
 
@@ -1311,6 +1316,7 @@ let create_regtest_context () =
     filter_index = None;
     utxo = None;
     data_dir = None;
+    snapshot_activation = None;
   } in
   (ctx, db, db_path)
 

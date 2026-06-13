@@ -75,6 +75,7 @@ let make_ctx () =
     filter_index = None;
     utxo = None;
     data_dir = None;
+    snapshot_activation = None;
   } in
   (ctx, pm)
 

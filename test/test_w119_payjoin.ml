@@ -195,6 +195,7 @@ let make_rpc_ctx () : Rpc.rpc_context =
       filter_index = None;
       utxo = None;
       data_dir = None;
+      snapshot_activation = None;
     } in
     rpc_ctx_cache := Some ctx;
     ctx

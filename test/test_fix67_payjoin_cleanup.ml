@@ -328,7 +328,8 @@ let make_rpc_ctx () : Rpc.rpc_context =
   { Rpc.chain; mempool = mp; peer_manager = pm;
     wallet = None; wallet_manager = None;
     fee_estimator = fe; network = Consensus.mainnet;
-    filter_index = None; utxo = None; data_dir = None; }
+    filter_index = None; utxo = None; data_dir = None;
+    snapshot_activation = None; }
 
 let _shared_ctx : Rpc.rpc_context option ref = ref None
 let shared_ctx () =

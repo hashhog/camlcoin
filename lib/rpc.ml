@@ -100,6 +100,15 @@ type rpc_context = {
   filter_index : Block_index.filter_index option;  (* BIP-157/158 block filter index *)
   utxo : Utxo.OptimizedUtxoSet.t option;  (* UTXO set for submitblock atomic writes *)
   data_dir : string option;  (* Datadir for dumpmempool / loadmempool — None disables *)
+  (* Live AssumeUTXO snapshot activation (Core ChainstateManager's second
+     chainstate).  None while no snapshot is loaded; Some once
+     handle_loadtxoutset has activated a snapshot + run the background
+     validator.  Read by handle_getchainstates to surface
+     validated/snapshot_blockhash.  Mutable so the snapshot handler can record
+     the activation on the SAME context the getter reads — mirrors Core where
+     ActivateSnapshot installs the chainstate into the long-lived
+     ChainstateManager that getchainstates later inspects. *)
+  mutable snapshot_activation : Assume_utxo.snapshot_activation option;
 }
 
 (* ============================================================================
@@ -877,7 +886,38 @@ let handle_getchainstates (ctx : rpc_context) : Yojson.Safe.t =
       let p = float_of_int blocks /. float_of_int ctx.chain.headers_synced in
       if p > 1.0 then 1.0 else p
   in
-  let chainstate = `Assoc [
+  (* AssumeUTXO awareness (Core getchainstates / make_chain_data,
+     blockchain.cpp:3462-3519).  When a snapshot has been activated via
+     loadtxoutset, the ACTIVE chainstate is the snapshot one: it carries
+     [snapshot_blockhash] (the snapshot base) and [validated] reflects whether
+     the background re-validation has matched the base UTXO hash yet.  Core's
+     ChainstateRole.validated is derived from the snapshot chainstate's
+     [m_assumeutxo]: false while the background pass runs / after a mismatch,
+     true after a match.  When no snapshot is active we keep the single
+     fully-validated chainstate (validated=true, snapshot_blockhash omitted). *)
+  let snapshot_validated, snapshot_blockhash_hex =
+    match ctx.snapshot_activation with
+    | None -> (true, None)
+    | Some act ->
+      let snap = act.Assume_utxo.snapshot in
+      let validated = Assume_utxo.snapshot_is_validated snap in
+      let blockhash_hex =
+        match snap.Assume_utxo.from_snapshot_blockhash with
+        | Some h -> Some (Types.hash256_to_hex_display h)
+        | None -> None
+      in
+      (validated, blockhash_hex)
+  in
+  (* Field order mirrors Core make_chain_data: snapshot_blockhash is emitted
+     between verificationprogress and the coins_*_cache_bytes pair, and only
+     when the active chainstate is a from-snapshot chainstate (Core only sets
+     it when m_from_snapshot_blockhash is present). *)
+  let snapshot_field =
+    match snapshot_blockhash_hex with
+    | Some h -> [("snapshot_blockhash", `String h)]
+    | None -> []
+  in
+  let chainstate = `Assoc ([
     ("blocks",               `Int blocks);
     ("bestblockhash",        `String bestblockhash);
     (* bits/target match Core make_chain_data (blockchain.cpp:3496) and this
@@ -886,11 +926,11 @@ let handle_getchainstates (ctx : rpc_context) : Yojson.Safe.t =
     ("difficulty",           json_difficulty difficulty);
     ("target",               `String target_hex);
     ("verificationprogress", `Float verificationprogress);
-    (* snapshot_blockhash OMITTED: no active snapshot chainstate. *)
+  ] @ snapshot_field @ [
     ("coins_db_cache_bytes",  `Int coins_db_cache_bytes);
     ("coins_tip_cache_bytes", `Int coins_tip_cache_bytes);
-    ("validated",            `Bool true);
-  ] in
+    ("validated",            `Bool snapshot_validated);
+  ]) in
   (* headers = best-header height seen so far (-1 if none).  camlcoin always
      has at least the genesis header, so headers_synced is well-defined. *)
   `Assoc [
@@ -7938,12 +7978,12 @@ let handle_addnode (ctx : rpc_context)
    ScriptCompression-encoded scriptPubKeys). The bespoke "HDOG" format is
    retired (2026-04-29) — see lib/compressor.ml + lib/assume_utxo.ml. *)
 
-let handle_loadtxoutset (_ctx : rpc_context)
+let handle_loadtxoutset (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
   | [`String path] ->
     (match Assume_utxo.read_snapshot_metadata path
-             ~expected_network_magic:_ctx.network.magic with
+             ~expected_network_magic:ctx.network.magic with
     | Error e -> Error e
     | Ok metadata ->
       (* Core-strict whitelist check: refuse any snapshot whose
@@ -7961,11 +8001,11 @@ let handle_loadtxoutset (_ctx : rpc_context)
          when the lookup fails attempt to resolve the height from the
          header index for the error message. Falls back to -1 (matching
          Core's behaviour for an unknown blockhash). *)
-      (match Assume_utxo.get_assumeutxo_for_hash ~network:_ctx.network
+      (match Assume_utxo.get_assumeutxo_for_hash ~network:ctx.network
                metadata.base_blockhash with
       | None ->
         let base_height =
-          match Sync.get_header _ctx.chain metadata.base_blockhash with
+          match Sync.get_header ctx.chain metadata.base_blockhash with
           | Some hdr -> hdr.height
           | None -> -1
         in
@@ -7989,7 +8029,7 @@ let handle_loadtxoutset (_ctx : rpc_context)
                  return error("The base block header (%s) must appear in the
                                headers chain. Make sure all headers are syncing")
           *)
-          if not (Sync.has_header _ctx.chain metadata.base_blockhash) then
+          if not (Sync.has_header ctx.chain metadata.base_blockhash) then
             Error (Printf.sprintf
                      "The base block header (%s) must appear in the headers \
                       chain. Make sure all headers are syncing, and call \
@@ -8006,7 +8046,7 @@ let handle_loadtxoutset (_ctx : rpc_context)
              the snapshot_db directory already exists on disk.
           *)
           let snapshot_db_path =
-            match _ctx.data_dir with
+            match ctx.data_dir with
             | Some d -> Filename.concat d "chainstate_snapshot"
             | None ->
               (Filename.dirname path) ^ "/chainstate_snapshot"
@@ -8019,7 +8059,7 @@ let handle_loadtxoutset (_ctx : rpc_context)
                if (mempool && mempool->size() > 0)
                  return error("Can't activate a snapshot when mempool not empty")
           *)
-          let mempool_size = Mempool.count _ctx.mempool in
+          let mempool_size = Mempool.count ctx.mempool in
           if mempool_size > 0 then
             Error (Printf.sprintf
                      "Can't activate a snapshot when mempool not empty \
@@ -8038,8 +8078,8 @@ let handle_loadtxoutset (_ctx : rpc_context)
              total_work fields when both are available for a precise comparison.
           *)
           let snapshot_has_more_work =
-            match Sync.get_header _ctx.chain metadata.base_blockhash,
-                  _ctx.chain.Sync.tip with
+            match Sync.get_header ctx.chain metadata.base_blockhash,
+                  ctx.chain.Sync.tip with
             | Some snap_hdr, Some active_tip ->
               (* Precise: compare cumulative PoW via 32-byte LE big-integer. *)
               Consensus.work_compare snap_hdr.Sync.total_work
@@ -8062,7 +8102,7 @@ let handle_loadtxoutset (_ctx : rpc_context)
              directory of the active datadir. The active chainstate is
              unaffected — this matches Core's "second chainstate" model. *)
           (match Assume_utxo.load_snapshot
-                   ~network:_ctx.network
+                   ~network:ctx.network
                    ~snapshot_path:path
                    ~snapshot_db_path
                    () with
@@ -8105,6 +8145,74 @@ let handle_loadtxoutset (_ctx : rpc_context)
                      ~db:cs.db ~expected:params.coins_hash with
             | Error msg -> Error msg
             | Ok actual_hash ->
+              (* DUAL-CHAINSTATE ACTIVATION (Core ActivateSnapshot /
+                 AddChainstate / MaybeValidateSnapshot, validation.cpp).
+
+                 The load-time hash gate above ([verify_loaded_utxo_hash])
+                 authenticates the snapshot against the chainparams-pinned
+                 commitment.  That alone is the load-time check; Core ALSO
+                 spins up a BACKGROUND chainstate that re-derives the base
+                 UTXO set genesis->base in its OWN coins DB and validates the
+                 assumeutxo hash by independent re-computation.  We mirror that
+                 here: [activate_snapshot_with_background] builds the second
+                 (background) chainstate with a SEPARATE store, and
+                 [run_background_to_completion] connects every block
+                 genesis->base and compares.
+
+                 The background pass reads block bodies + the header index
+                 from the node's live chain (Core shares BlockManager across
+                 chainstates): [get_block] from the ChainDB block store,
+                 [get_header_at_height] from the header index.
+
+                 Core runs MaybeValidateSnapshot ASYNCHRONOUSLY, so
+                 loadtxoutset itself returns success even when the background
+                 pass will later reject: a HASH MISMATCH triggers a fatal
+                 AbortNode in the background, not an error from the
+                 loadtxoutset call.  We mirror that contract — loadtxoutset
+                 returns success and the verdict is surfaced via the snapshot
+                 chainstate's [assumeutxo_state] (Validated / Invalid), read by
+                 getchainstates.  A mismatch is NEVER silently accepted: the
+                 snapshot is marked Invalid (validated=false there), exactly
+                 Core's background AbortNode equivalent.
+
+                 (camlcoin drives the background pass SYNCHRONOUSLY here — the
+                 test/function-level gate does the same; the live tree's
+                 historical blocks resolve via the shared block store.  Whether
+                 every block is already present or not, the verdict reflects
+                 what the background validator could re-derive: a complete
+                 genesis->base replay that mismatches marks the snapshot
+                 Invalid.) *)
+              let bg_db_path =
+                match ctx.data_dir with
+                | Some d -> Filename.concat d "chainstate_background"
+                | None -> (Filename.dirname path) ^ "/chainstate_background"
+              in
+              let activation =
+                Assume_utxo.activate_snapshot_with_background
+                  ~snapshot:cs
+                  ~bg_db_path
+                  ~assumed_hash:params.coins_hash
+                  ~base_height:params.height
+                  ~get_block:(fun h ->
+                    Storage.ChainDB.get_block ctx.chain.Sync.db h)
+                  ~get_header_at_height:(fun h ->
+                    Sync.get_header_at_height ctx.chain h)
+                  ~network:ctx.network
+                  ()
+              in
+              (* Drive the background validation to its terminal verdict.  This
+                 flips cs.assumeutxo_state to Validated (match) or Invalid
+                 (mismatch / connect failure) inside run_background_validation;
+                 a mismatch is surfaced ONLY via that state, not via an Error
+                 return (Core async AbortNode model). *)
+              let (_validated, _bg_err) =
+                Assume_utxo.run_background_to_completion activation
+              in
+              (* Record the activation on the context so getchainstates can
+                 read validated / snapshot_blockhash from the snapshot
+                 chainstate.  Core: ChainstateManager retains the snapshot
+                 chainstate that getchainstates later inspects. *)
+              ctx.snapshot_activation <- Some activation;
               Ok (`Assoc [
                 ("coins_loaded", `Int (Int64.to_int metadata.coins_count));
                 ("base_hash",
@@ -12145,7 +12253,7 @@ let create_context
     ?(utxo : Utxo.OptimizedUtxoSet.t option = None)
     ?(data_dir : string option = None) () : rpc_context =
   { chain; mempool; peer_manager; wallet; wallet_manager; fee_estimator; network;
-    filter_index; utxo; data_dir }
+    filter_index; utxo; data_dir; snapshot_activation = None }
 
 (* Create an RPC context with multi-wallet support *)
 let create_context_with_wallet_manager
@@ -12161,7 +12269,7 @@ let create_context_with_wallet_manager
   (* Get default wallet from manager for backward compatibility *)
   let wallet = Wallet.get_default_wallet wallet_manager in
   { chain; mempool; peer_manager; wallet; wallet_manager = Some wallet_manager;
-    fee_estimator; network; filter_index; utxo; data_dir }
+    fee_estimator; network; filter_index; utxo; data_dir; snapshot_activation = None }
 
 (* Default RPC ports by network *)
 let default_port (network : Consensus.network_config) : int =

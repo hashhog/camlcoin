@@ -199,6 +199,39 @@ let mainnet_au_data : assumeutxo_params list = [
     flow but flag it explicitly. *)
 let testnet4_au_data : assumeutxo_params list = []
 
+(** Regtest AssumeUTXO entries.
+
+    Core's regtest chainparams DOES carry [m_assumeutxo_data] entries (heights
+    110 / 200 / 299 in [bitcoin-core/src/kernel/chainparams.cpp:607-628],
+    explicitly "for use by test/functional/feature_assumeutxo.py" and the
+    snapshot fuzz target).  Those Core values are pinned to Core's deterministic
+    regtest mining chain; camlcoin's snapshot tests build their own short
+    regtest chains, so the regtest table is REGISTERABLE at runtime
+    ([register_regtest_assumeutxo]) — exactly mirroring how Core's regtest is a
+    mockable chain whose assumeutxo data is purpose-built for the snapshot tests
+    rather than a permanent network commitment.
+
+    This table is NEVER consulted on mainnet/testnet4 (the whitelist for those
+    networks remains the hardcoded, immutable Core values above); it only gates
+    the regtest snapshot test path. *)
+let regtest_au_data : assumeutxo_params list ref = ref []
+
+(** [register_regtest_assumeutxo p] adds [p] to the regtest AssumeUTXO
+    whitelist so a regtest snapshot whose base block is [p.blockhash] can be
+    loaded via [handle_loadtxoutset].  Idempotent on [(height, blockhash)]:
+    re-registering the same base replaces the prior entry.  Regtest only — see
+    [regtest_au_data]. *)
+let register_regtest_assumeutxo (p : assumeutxo_params) : unit =
+  regtest_au_data :=
+    p :: List.filter
+           (fun q -> not (q.height = p.height
+                          && Cstruct.equal q.blockhash p.blockhash))
+           !regtest_au_data
+
+(** [clear_regtest_assumeutxo ()] empties the regtest whitelist (test teardown
+    hygiene so registrations never leak across test cases). *)
+let clear_regtest_assumeutxo () : unit = regtest_au_data := []
+
 (** Get assumeUTXO parameters for mainnet at specific heights.
     Returns None if the height doesn't have hardcoded params. *)
 let get_assumeutxo_params_mainnet (height : int) : assumeutxo_params option =
@@ -214,6 +247,7 @@ let get_assumeutxo_for_hash ~network:(network : Consensus.network_config)
   let candidates = match network.network_type with
     | Consensus.Mainnet -> mainnet_au_data
     | Consensus.Testnet4 -> testnet4_au_data
+    | Consensus.Regtest -> !regtest_au_data
     | _ -> []
   in
   List.find_opt (fun p -> Cstruct.equal p.blockhash blockhash) candidates
@@ -224,6 +258,7 @@ let available_snapshot_heights (network : Consensus.network_config) : int list =
   let candidates = match network.network_type with
     | Consensus.Mainnet -> mainnet_au_data
     | Consensus.Testnet4 -> testnet4_au_data
+    | Consensus.Regtest -> !regtest_au_data
     | _ -> []
   in
   List.sort compare (List.map (fun p -> p.height) candidates)

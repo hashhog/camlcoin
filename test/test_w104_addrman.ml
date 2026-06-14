@@ -252,11 +252,11 @@ let test_g10_time_penalty_missing () =
     true (stats.total_known > 0)
 
 (* ===== G11: addr_ts_lower_bound ===================================
-   Bug: handle_addr only rejects ts > now + 600.  Core also rejects
-   ts ≤ 100000000 (Unix epoch ≈ 1973-03-03) as obviously invalid.
-   camlcoin stores any non-future timestamp including ts=0.
-   Severity: LOW. Core ref: net_processing.cpp line 5678:
-   addr.nTime <= NodeSeconds{100000000s}. *)
+   Fix: handle_addr now applies Core's nTime clamp (net_processing.cpp:5678-5680).
+   Both pre-2001 (nTime <= 100000000) and far-future (nTime > now+600) timestamps
+   are clamped to (now - 5*24*60*60) before storing — matching Core exactly.
+   Core does NOT reject these addresses; it stores them with a corrected nTime.
+   Severity: LOW. Core ref: net_processing.cpp line 5678. *)
 let test_g11_addr_ts_lower_bound () =
   let pm = make_pm () in
   let addr_bytes = Cstruct.create 16 in
@@ -270,11 +270,23 @@ let test_g11_addr_ts_lower_bound () =
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"1.2.3.4"
     ~port:8333 ~id:0 ~direction:Peer.Outbound
     ~fd:(Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0) () in
-  (* ts = 1 (way below 100000000 threshold) — Core rejects, camlcoin accepts *)
+  (* ts = 1 (way below 100000000 threshold) — Core clamps to now-5days *)
   Peer_manager.handle_addr pm peer [(1l, net_addr)];
   let stats = Peer_manager.get_addr_stats pm in
-  Alcotest.(check bool) "BUG-G11: ts=1 accepted (lower bound missing)"
-    true (stats.total_known > 0)
+  (* FIX: addr is stored (Core stores it with a clamped nTime, not rejected) *)
+  Alcotest.(check bool) "FIX-G11: ts=1 stored with clamped last_connected"
+    true (stats.total_known > 0);
+  (* Verify the stored timestamp is the clamp value (now - 5 days),
+     NOT the raw ts=1 from the message. *)
+  let now = Unix.gettimeofday () in
+  let five_days = 5.0 *. 86400.0 in
+  (match Hashtbl.find_opt pm.known_addrs "71.0.0.1" with
+  | None -> Alcotest.fail "addr not stored in known_addrs"
+  | Some info ->
+    (* clamped value must be within 2s of now - 5days *)
+    let delta = Float.abs (info.last_connected -. (now -. five_days)) in
+    Alcotest.(check bool) "FIX-G11: last_connected clamped to now-5days (not raw ts=1)"
+      true (delta < 2.0))
 
 (* ===== G12: addrv2_no_rate_limit ==================================
    Bug: handle_addrv2 applies no rate limiting.  Core uses the same
@@ -310,9 +322,10 @@ let test_g12_addrv2_no_rate_limit () =
     true (stats.total_known <= 1000)
 
 (* ===== G13: addrv2_no_ts_deduction ================================
-   Bug: handle_addrv2 sets last_connected = Unix.gettimeofday() (now)
-   instead of using the timestamp from the addr message.  This inflates
-   freshness and prevents IsTerrible from working correctly.
+   Fix: handle_addrv2 now stores the clamped v2_time as last_connected
+   instead of Unix.gettimeofday().  The clamp (Core net_processing.cpp:5678-5680)
+   is applied: pre-2001 or far-future timestamps → now-5days; in-range timestamps
+   are stored as-is.
    Severity: MEDIUM. Core ref: addrman.cpp AddSingle nTime usage. *)
 let test_g13_addrv2_no_ts_deduction () =
   let pm = make_pm () in
@@ -321,7 +334,10 @@ let test_g13_addrv2_no_ts_deduction () =
   Cstruct.set_uint8 ip 1 1;
   Cstruct.set_uint8 ip 2 2;
   Cstruct.set_uint8 ip 3 3;
-  let old_ts = Int32.of_float (Unix.gettimeofday () -. 1_000_000.0) in
+  (* Use a timestamp ~11.5 days ago — in-range (>100000000 and not future),
+     so it must be stored AS-IS (not clamped). *)
+  let old_ts_float = Unix.gettimeofday () -. 1_000_000.0 in
+  let old_ts = Int32.of_float old_ts_float in
   let entry = {
     P2p.v2_network_id = P2p.Addrv2_IPv4;
     v2_addr = ip;
@@ -333,10 +349,23 @@ let test_g13_addrv2_no_ts_deduction () =
     ~port:8333 ~id:0 ~direction:Peer.Outbound
     ~fd:(Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0) () in
   Peer_manager.handle_addrv2 pm peer [entry];
-  (* BUG: last_connected is set to now, not old_ts *)
   let stats = Peer_manager.get_addr_stats pm in
-  Alcotest.(check bool) "BUG-G13: addrv2 sets wrong timestamp"
-    true (stats.total_known = 1)
+  Alcotest.(check bool) "FIX-G13: addrv2 entry stored"
+    true (stats.total_known = 1);
+  (* FIX: last_connected must be the message timestamp (old_ts_float), NOT now.
+     Int32.of_float truncates precision; allow ±2s. *)
+  (match Hashtbl.find_opt pm.known_addrs "80.1.2.3" with
+  | None -> Alcotest.fail "addrv2 addr not found in known_addrs"
+  | Some info ->
+    let now = Unix.gettimeofday () in
+    (* The stored time must NOT be close to now (which was the pre-fix bug) *)
+    let delta_now = Float.abs (info.last_connected -. now) in
+    Alcotest.(check bool) "FIX-G13: last_connected is NOT current time"
+      true (delta_now > 100.0);
+    (* The stored time must be close to the message timestamp *)
+    let delta_msg = Float.abs (info.last_connected -. old_ts_float) in
+    Alcotest.(check bool) "FIX-G13: last_connected matches addrv2 v2_time"
+      true (delta_msg < 2.0))
 
 (* ===== G14: addr_relay_csprng =====================================
    Bug: relay_addr_to_random_peers shuffles candidates with
@@ -701,6 +730,111 @@ let test_g30_good_call_not_atomic () =
     true (stats_after.tried_table_entries > 0)
   (* Note: no mutex around the two-step operation — Lwt race possible *)
 
+(* ===== Finding 3G: addr/addrv2 nTime clamp (Core-faithful fix) ======
+   Core net_processing.cpp:5678-5680 clamps timestamps that are either
+   pre-2001 (nTime <= 100000000) OR more than 10 minutes in the future
+   to (now - 5 * 24 * 60 * 60).  Both the ADDR and ADDRV2 ingestion
+   paths must apply this clamp before storing last_connected.
+
+   These tests FAIL on the pre-fix code (addr stored with ts=1 or ts=now+9999
+   unclamped / addrv2 stored with ts=now instead of msg ts) and PASS after. *)
+
+(* Helper: make an IPv4-mapped 16-byte addr for handle_addr *)
+let make_net_addr a b c d port =
+  let addr_bytes = Cstruct.create 16 in
+  Cstruct.set_uint8 addr_bytes 10 0xFF;
+  Cstruct.set_uint8 addr_bytes 11 0xFF;
+  Cstruct.set_uint8 addr_bytes 12 a;
+  Cstruct.set_uint8 addr_bytes 13 b;
+  Cstruct.set_uint8 addr_bytes 14 c;
+  Cstruct.set_uint8 addr_bytes 15 d;
+  { Types.services = 1L; addr = addr_bytes; port }
+
+let make_peer_for_test () =
+  Peer.make_peer ~network:Consensus.mainnet ~addr:"1.2.3.4"
+    ~port:8333 ~id:0 ~direction:Peer.Outbound
+    ~fd:(Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0) ()
+
+(* Pre-2001 timestamp (ts=1) must be clamped to now-5days in ADDR message *)
+let test_3g_addr_pre2001_ts_clamped () =
+  let pm = make_pm () in
+  let peer = make_peer_for_test () in
+  let net_addr = make_net_addr 72 0 0 1 8333 in
+  Peer_manager.handle_addr pm peer [(1l, net_addr)];
+  let now = Unix.gettimeofday () in
+  let five_days = 5.0 *. 86400.0 in
+  (match Hashtbl.find_opt pm.known_addrs "72.0.0.1" with
+  | None -> Alcotest.fail "addr not stored"
+  | Some info ->
+    let delta = Float.abs (info.last_connected -. (now -. five_days)) in
+    Alcotest.(check bool)
+      "3G FIX: pre-2001 ADDR ts clamped to now-5days" true (delta < 2.0))
+
+(* Future timestamp (now + 9999s, well past 600s threshold) must be clamped *)
+let test_3g_addr_future_ts_clamped () =
+  let pm = make_pm () in
+  let peer = make_peer_for_test () in
+  let now = Unix.gettimeofday () in
+  let future_ts = Int32.of_float (now +. 9999.0) in
+  let net_addr = make_net_addr 73 0 0 1 8333 in
+  Peer_manager.handle_addr pm peer [(future_ts, net_addr)];
+  let five_days = 5.0 *. 86400.0 in
+  (match Hashtbl.find_opt pm.known_addrs "73.0.0.1" with
+  | None -> Alcotest.fail "future-ts ADDR not stored (should be clamped and stored)"
+  | Some info ->
+    let delta = Float.abs (info.last_connected -. (now -. five_days)) in
+    Alcotest.(check bool)
+      "3G FIX: future ADDR ts clamped to now-5days" true (delta < 2.0))
+
+(* In-range timestamp (now - 3600) passes through unclamped *)
+let test_3g_addr_valid_ts_stored () =
+  let pm = make_pm () in
+  let peer = make_peer_for_test () in
+  let now = Unix.gettimeofday () in
+  let valid_ts_float = now -. 3600.0 in
+  let valid_ts = Int32.of_float valid_ts_float in
+  let net_addr = make_net_addr 74 0 0 1 8333 in
+  Peer_manager.handle_addr pm peer [(valid_ts, net_addr)];
+  (match Hashtbl.find_opt pm.known_addrs "74.0.0.1" with
+  | None -> Alcotest.fail "valid-ts ADDR not stored"
+  | Some info ->
+    let delta = Float.abs (info.last_connected -. valid_ts_float) in
+    Alcotest.(check bool)
+      "3G FIX: valid ADDR ts stored as-is (no clamping)" true (delta < 2.0))
+
+(* Pre-2001 timestamp in ADDRV2 must be clamped to now-5days *)
+let test_3g_addrv2_pre2001_ts_clamped () =
+  let pm = make_pm () in
+  let peer = make_peer_for_test () in
+  let ip = Cstruct.create 4 in
+  Cstruct.set_uint8 ip 0 81;
+  Cstruct.set_uint8 ip 1 0;
+  Cstruct.set_uint8 ip 2 0;
+  Cstruct.set_uint8 ip 3 1;
+  let entry = { P2p.v2_network_id = P2p.Addrv2_IPv4;
+                v2_addr = ip; v2_port = 8333; v2_services = 1L;
+                v2_time = 1l } in
+  Peer_manager.handle_addrv2 pm peer [entry];
+  let now = Unix.gettimeofday () in
+  let five_days = 5.0 *. 86400.0 in
+  (match Hashtbl.find_opt pm.known_addrs "81.0.0.1" with
+  | None -> Alcotest.fail "addrv2 entry not stored"
+  | Some info ->
+    let delta = Float.abs (info.last_connected -. (now -. five_days)) in
+    Alcotest.(check bool)
+      "3G FIX: pre-2001 ADDRV2 ts clamped to now-5days" true (delta < 2.0))
+
+let finding_3g_tests = [
+  Alcotest.test_case "3G: pre-2001 ADDR ts clamped to now-5days" `Quick
+    test_3g_addr_pre2001_ts_clamped;
+  Alcotest.test_case "3G: future ADDR ts clamped to now-5days" `Quick
+    test_3g_addr_future_ts_clamped;
+  Alcotest.test_case "3G: valid ADDR ts stored as-is" `Quick
+    test_3g_addr_valid_ts_stored;
+  Alcotest.test_case "3G: pre-2001 ADDRV2 ts clamped to now-5days" `Quick
+    test_3g_addrv2_pre2001_ts_clamped;
+]
+
 (* ===================================================================
    Runner
    =================================================================== *)
@@ -827,4 +961,5 @@ let () =
       Alcotest.test_case "move_to_tried is not atomic (no mutex)" `Quick
         test_g30_good_call_not_atomic;
     ];
+    "finding_3g_addr_ts_clamp", finding_3g_tests;
   ]

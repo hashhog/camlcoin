@@ -1912,17 +1912,25 @@ let handle_addr (pm : t) (peer : Peer.peer) (addrs : (int32 * Types.net_addr) li
       addrs
     in
     let processed = ref 0 in
+    (* Core net_processing.cpp:5678-5680: clamp nTime that is pre-2001
+       (nTime <= 100000000) OR more than 10 minutes in the future to
+       (now - 5 * 24 * 60 * 60).  We do NOT skip out-of-range timestamps;
+       we clamp them before storing.  "now - 5 days" is the sentinel Core
+       uses so the address sorts as "seen recently but not today". *)
+    let clamp_timestamp ts_float =
+      if ts_float <= 100_000_000.0 || ts_float > now +. 600.0 then
+        now -. (5.0 *. 86400.0)
+      else
+        ts_float
+    in
     List.iter (fun (ts, addr) ->
       (* Extract address from 16-byte network address field *)
       match format_address addr.Types.addr with
       | None -> ()  (* Unspecified address, skip *)
       | Some ip_str ->
-      (* Timestamp validation: reject addresses > 600 seconds in the future *)
-      let ts_float = Int32.to_float ts in
-      if ts_float > now +. 600.0 then
-        ()  (* Skip future-timestamped addresses *)
+      let ts_float = clamp_timestamp (Int32.to_float ts) in
       (* Self-address filtering: don't store our own listening address *)
-      else if (match pm.listen_addr with
+      if (match pm.listen_addr with
                | Some our_addr -> ip_str = our_addr
                | None -> false) then
         ()  (* Skip our own address *)
@@ -1938,7 +1946,7 @@ let handle_addr (pm : t) (peer : Peer.peer) (addrs : (int32 * Types.net_addr) li
             { address = ip_str;
               port = addr.port;
               services = addr.services;
-              last_connected = 0.0;
+              last_connected = ts_float;
               last_attempt = 0.0;
               last_success = 0.0;
               failures = 0;
@@ -1967,6 +1975,15 @@ let handle_addrv2 (pm : t) (peer : Peer.peer) (entries : P2p.addrv2_addr list) :
     if n_entries > token_admit then List.filteri (fun i _ -> i < token_admit) entries
     else entries
   in
+  let now = Unix.gettimeofday () in
+  (* Core net_processing.cpp:5678-5680: same nTime clamp applies to addrv2.
+     Pre-2001 (<=100000000) or >10-minutes-future → now - 5 days. *)
+  let clamp_timestamp ts_float =
+    if ts_float <= 100_000_000.0 || ts_float > now +. 600.0 then
+      now -. (5.0 *. 86400.0)
+    else
+      ts_float
+  in
   List.iter (fun (entry : P2p.addrv2_addr) ->
     match entry.v2_network_id with
     | P2p.Addrv2_IPv4 when Cstruct.length entry.v2_addr = 4 ->
@@ -1980,11 +1997,12 @@ let handle_addrv2 (pm : t) (peer : Peer.peer) (entries : P2p.addrv2_addr list) :
       else if not (Hashtbl.mem pm.known_addrs ip_str) then begin
         let bucket = add_to_new_table pm ip_str in
         if bucket >= 0 then
+          let ts_float = clamp_timestamp (Int32.to_float entry.v2_time) in
           Hashtbl.replace pm.known_addrs ip_str
             { address = ip_str;
               port = entry.v2_port;
               services = entry.v2_services;
-              last_connected = Unix.gettimeofday ();
+              last_connected = ts_float;
               last_attempt = 0.0;
               last_success = 0.0;
               failures = 0;

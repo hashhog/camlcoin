@@ -116,6 +116,20 @@ let test_block_weight_includes_header_and_varint () =
     "block weight strictly exceeds the naive per-tx sum"
     true (block_weight > per_tx_sum)
 
+let test_bip68_version_active_compares_unsigned () =
+  (* Core stores version as uint32_t and compares unsigned >= 2 (tx_verify.cpp:51),
+     so a high-bit version (0x80000002) still enforces BIP-68. A signed compare (the
+     bug) treats it as negative (< 2) and skips enforcement, false-accepting a tx with
+     an unmet relative timelock. 0x80000002l is the int32 -2147483646. *)
+  Alcotest.(check bool) "high-bit version 0x80000002 enables BIP-68" true
+    (Validation.bip68_version_active 0x80000002l);
+  Alcotest.(check bool) "version 0xFFFFFFFF enables BIP-68" true
+    (Validation.bip68_version_active 0xFFFFFFFFl);
+  Alcotest.(check bool) "version 2 enables BIP-68" true (Validation.bip68_version_active 2l);
+  Alcotest.(check bool) "version 3 enables BIP-68" true (Validation.bip68_version_active 3l);
+  Alcotest.(check bool) "version 1 does not enable BIP-68" false (Validation.bip68_version_active 1l);
+  Alcotest.(check bool) "version 0 does not enable BIP-68" false (Validation.bip68_version_active 0l)
+
 (* ============================================================================
    Transaction Validation Tests
    ============================================================================ *)
@@ -3618,6 +3632,7 @@ let () =
       test_case "weight without witness" `Quick test_tx_weight_no_witness;
       test_case "weight with witness" `Quick test_tx_weight_with_witness;
       test_case "block weight includes 80-byte header + tx-count varint (Core GetBlockWeight)" `Quick test_block_weight_includes_header_and_varint;
+      test_case "BIP-68 version gate compares unsigned (Core uint32_t)" `Quick test_bip68_version_active_compares_unsigned;
     ];
     "bip141_weight_vsize", [
       test_case "G7: legacy weight = base_size*4" `Quick test_weight_legacy_formula;

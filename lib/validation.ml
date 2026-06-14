@@ -1071,10 +1071,21 @@ let check_block_header ?(current_time : int32 option) (header : Types.block_head
      When get_mtp_at_height is provided, both this array and the time-based lock
      check use MTP at (utxo_height - 1) per BIP68. Otherwise falls back to the
      caller-supplied approximation. Height-based locks are implemented correctly. *)
+
+(* BIP-68 applies only when version >= 2. Core stores version as uint32_t and
+   compares it UNSIGNED (fEnforceBIP68 = tx.version >= 2, tx_verify.cpp:51), so a
+   high-bit version (e.g. 0x80000002) STILL enforces BIP-68. OCaml Int32 is signed
+   (0x80000002 parses to a negative int32), so a signed compare would treat it as
+   < 2 and SKIP enforcement, false-accepting a tx with an unmet relative timelock
+   (a chain split). Mask to the unsigned 32-bit value before comparing -- same as
+   the OP_CSV path (script.ml:2348). *)
+let bip68_version_active (version : int32) : bool =
+  Int64.logand (Int64.of_int32 version) 0xFFFFFFFFL >= 2L
+
 let check_sequence_locks (tx : Types.transaction) ~(block_height : int)
     ~(median_time : int32) ~(utxo_heights : int array) ~(utxo_mtps : int32 array)
     ?(get_mtp_at_height : (int -> int32) option) ~flags () : bool =
-  if Int32.compare tx.version 2l < 0 then true
+  if not (bip68_version_active tx.version) then true
   else if flags land Script.script_verify_checksequenceverify = 0 then true
   else begin
     let ok = ref true in

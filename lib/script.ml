@@ -2850,7 +2850,16 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                 else
                   Ok true
               | _ ->
-                (* Regular P2SH: run redeem script with remaining stack *)
+                (* Regular P2SH (non-witness redeemScript).
+                   Core interpreter.cpp:2110-2117: stray witness data on a
+                   non-witness input is SCRIPT_ERR_WITNESS_UNEXPECTED when
+                   SCRIPT_VERIFY_WITNESS is set.  The P2PKH and Nonstandard
+                   arms already carry this guard; it was absent here. *)
+                if flags land script_verify_witness <> 0 &&
+                   witness.Types.items <> [] then
+                  Error "Unexpected witness data for non-witness script"
+                else
+                (* Run redeem script with remaining stack *)
                 let st2 = create_eval_state ~tx ~input_index ~amount ~flags
                             ~sig_version:SigVersionBase () in
                 st2.stack <- List.tl stack_copy;

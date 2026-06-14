@@ -109,7 +109,15 @@ let rss_mb () =
 let compact_now ~reason =
   last_compact_time := Unix.gettimeofday ();
   let st_before = Gc.quick_stat () in
+  (* Instrumentation (pure logging, no behaviour change): Gc.compact is a
+     stop-the-world pause that blocks every OCaml thread — it IS the RPC /
+     block-connect stall.  malloc_trim releases the runtime lock (see below),
+     so it does NOT stall RPC.  Time them separately so a soak can histogram
+     the real stall distribution and correlate it with the pre-compaction heap
+     size (the lever a threshold/cadence tune would pull). *)
+  let t0 = Unix.gettimeofday () in
   Gc.compact ();
+  let t1 = Unix.gettimeofday () in
   (* Gc.compact frees the OCaml-side proxies for the transient
      validation/idle Bigarrays; malloc_trim(0) then returns that now-unused
      glibc arena memory to the OS.  Same binding the IBD path uses.
@@ -117,15 +125,19 @@ let compact_now ~reason =
      runtime_system so other OS threads — incl. the RPC thread — run during
      the trim; do not remove that.) *)
   Rocksdb.malloc_trim ();
+  let t2 = Unix.gettimeofday () in
   let st_after = Gc.quick_stat () in
   Logs.info (fun m ->
     m "[gc] at-tip compaction (%s): heap=%d words (%.0fMB->%.0fMB) \
-       rss=%.0fMB"
+       rss=%.0fMB compact_stall=%.3fs trim=%.3fs total=%.3fs"
       reason
       st_after.Gc.heap_words
       (mb_of_words st_before.Gc.heap_words)
       (mb_of_words st_after.Gc.heap_words)
-      (rss_mb ()))
+      (rss_mb ())
+      (t1 -. t0)
+      (t2 -. t1)
+      (t2 -. t0))
 
 (* The hot-path / threshold check: compact iff the major heap is over the
    size threshold AND the anti-thrash floor has elapsed.  O(1) when it does

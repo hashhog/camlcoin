@@ -126,6 +126,30 @@ let compute_tx_weight (tx : Types.transaction) : int =
   (* weight = base_size * 3 + total_size *)
   base_size * (Consensus.witness_scale_factor - 1) + total_size
 
+(* Byte length of a Bitcoin CompactSize encoding of [n] (the tx-count prefix). *)
+let compact_size_len (n : int) : int =
+  if n < 0xFD then 1
+  else if n <= 0xFFFF then 3
+  else if n <= 0xFFFF_FFFF then 5
+  else 9
+
+(* Block weight, Bitcoin Core consensus/validation.h::GetBlockWeight:
+   GetSerializeSize(TX_NO_WITNESS(block)) * (WSF-1) + GetSerializeSize(TX_WITH_WITNESS(block)).
+   This serializes the WHOLE block, which prepends an 80-byte header and a
+   CompactSize transaction count to the transactions. Both are witness-free, so
+   they appear in both serializations and count at the full WITNESS_SCALE_FACTOR:
+   the block weight is (80 + compact_size_len n) * WSF + sum(per-tx weight).
+   Summing only the per-tx weights under-counts by (80 + varint) * WSF (324 for a
+   1-byte varint, up to 332), which false-accepts a block whose true Core weight
+   is in (MAX_BLOCK_WEIGHT, MAX_BLOCK_WEIGHT + that gap] -- Core rejects it with
+   bad-blk-weight, so accepting it is a chain split. *)
+let compute_block_weight (txs : Types.transaction list) : int =
+  let n = List.length txs in
+  let header_varint_weight =
+    (80 + compact_size_len n) * Consensus.witness_scale_factor
+  in
+  List.fold_left (fun acc tx -> acc + compute_tx_weight tx) header_varint_weight txs
+
 (* Virtual size is weight / 4, rounded up.
    For the plain (no-sigop-adjustment) case only. Use get_virtual_transaction_size
    when you have a sigop cost to apply. *)
@@ -900,12 +924,12 @@ let check_block ~network:(network : Consensus.network_config) (block : Types.blo
                   if block_size > Consensus.max_block_serialized_size then
                     Error (BlockOversized block_size)
                   else
-                  (* Check total block weight: sum of individual transaction
-                     weights only. Bitcoin Core's CheckBlock does NOT include
-                     the block header or txcount varint in the weight. *)
-                  let total_weight = List.fold_left (fun acc tx ->
-                    acc + compute_tx_weight tx
-                  ) 0 txs in
+                  (* Check total block weight. Bitcoin Core's GetBlockWeight
+                     (consensus/validation.h) is the weight of the WHOLE
+                     serialized block: the 80-byte header and the CompactSize
+                     tx-count count at the full WITNESS_SCALE_FACTOR on top of
+                     the per-tx weights. See compute_block_weight. *)
+                  let total_weight = compute_block_weight txs in
                   if total_weight > Consensus.max_block_weight then
                     Error (BlockOverweight total_weight)
                   else begin

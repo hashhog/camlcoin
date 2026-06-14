@@ -93,6 +93,29 @@ let test_tx_weight_with_witness () =
   (* With witness, weight < 4 * vsize due to discount *)
   Alcotest.(check bool) "vsize rounds correctly" true (vsize * 4 >= weight)
 
+let test_block_weight_includes_header_and_varint () =
+  (* Core GetBlockWeight (consensus/validation.h) is the weight of the WHOLE
+     serialized block: the 80-byte header and the CompactSize tx-count count at
+     WITNESS_SCALE_FACTOR on top of the per-tx weights. Summing only the per-tx
+     weights under-counts and false-accepts a marginally overweight block that
+     Core rejects with bad-blk-weight (a chain split). *)
+  let tx1 = make_tx ~inputs:[make_input ()] ~outputs:[make_output ~value:1000L ()] () in
+  let tx2 = make_tx ~inputs:[make_input ~vout:1l ()] ~outputs:[make_output ~value:500L ()] () in
+  let txs = [tx1; tx2] in
+  let per_tx_sum =
+    List.fold_left (fun acc t -> acc + Validation.compute_tx_weight t) 0 txs in
+  let block_weight = Validation.compute_block_weight txs in
+  (* 2 txs -> the CompactSize tx-count is 1 byte; extra = (80 + 1) * WSF. *)
+  let expected_extra = (80 + 1) * Consensus.witness_scale_factor in
+  Alcotest.(check int)
+    "block weight = per-tx sum + (80-byte header + tx-count varint) * WSF"
+    (per_tx_sum + expected_extra) block_weight;
+  (* Non-vacuity: a per-tx-only sum (the bug) under-counts by exactly that gap,
+     so this strictly-greater assertion fails on the buggy code. *)
+  Alcotest.(check bool)
+    "block weight strictly exceeds the naive per-tx sum"
+    true (block_weight > per_tx_sum)
+
 (* ============================================================================
    Transaction Validation Tests
    ============================================================================ *)
@@ -3594,6 +3617,7 @@ let () =
     "tx_weight", [
       test_case "weight without witness" `Quick test_tx_weight_no_witness;
       test_case "weight with witness" `Quick test_tx_weight_with_witness;
+      test_case "block weight includes 80-byte header + tx-count varint (Core GetBlockWeight)" `Quick test_block_weight_includes_header_and_varint;
     ];
     "bip141_weight_vsize", [
       test_case "G7: legacy weight = base_size*4" `Quick test_weight_legacy_formula;

@@ -3625,6 +3625,67 @@ let test_w93_bip30_enforce_with_wrong_bip34_hash () =
   Alcotest.(check bool) "W93: BIP-30 ENFORCED when bip34_height_hash mismatches"
     true result
 
+(* ============================================================================
+   Finding 6D: IsFinalTx must include the coinbase transaction.
+   Bitcoin Core validation.cpp:4144-4148 loops ALL block.vtx with no coinbase
+   exemption. A coinbase with a non-zero nLockTime and a non-SEQUENCE_FINAL
+   input is non-final and must be rejected.
+   ============================================================================ *)
+
+(* Build a minimal regtest block at height 0 (no BIP34/CSV) whose coinbase
+   has the given locktime and input sequence, then call check_block.
+   skip_pow=true avoids PoW grinding; height=0 exempts BIP34 enforcement. *)
+let make_block_with_coinbase_locktime ~(cb_locktime : int32) ~(cb_sequence : int32) () =
+  (* Coinbase input: null outpoint, 2-byte scriptSig (satisfies 2-100 check),
+     and the caller-supplied sequence. *)
+  let cb_input : Types.tx_in = {
+    previous_output = { txid = Types.zero_hash; vout = (-1l) };
+    script_sig = Cstruct.of_string "\x00\x00";   (* 2 bytes: passes script_sig length check *)
+    sequence = cb_sequence;
+  } in
+  let coinbase : Types.transaction = {
+    version = 1l;
+    inputs = [cb_input];
+    outputs = [make_output ~value:(Consensus.block_subsidy 0) ()];
+    witnesses = [];
+    locktime = cb_locktime;
+  } in
+  let txid = Crypto.compute_txid coinbase in
+  let (merkle_root, _) = Crypto.merkle_root [txid] in
+  (* Use a timestamp well above median_time=0l to pass the time-too-old check.
+     Height=0 on regtest: bip34_height=1 so no BIP34, csv_height=1 so no CSV,
+     bip65/66_height=1 so block version=1 is fine. *)
+  let header = make_header ~version:1l ~merkle_root ~bits:0x207fffffl ~timestamp:1l () in
+  { Types.header; transactions = [coinbase] }
+
+(* 6D reject: a block whose coinbase has nLockTime=1000 (future height)
+   and a non-SEQUENCE_FINAL input must be rejected as bad-txns-nonfinal.
+   Demonstrates the bug: before the fix camlcoin accepted such a block. *)
+let test_6d_nonfinal_coinbase_rejected () =
+  (* locktime=1000 (height-based), block_height=0 → 0 < 1000 → not satisfied.
+     sequence=0l ≠ 0xFFFFFFFF → SEQUENCE_FINAL override inactive → non-final. *)
+  let block = make_block_with_coinbase_locktime ~cb_locktime:1000l ~cb_sequence:0l () in
+  match Validation.check_block ~network:Consensus.regtest block 0
+          ~expected_bits:0x207fffffl ~median_time:0l ~skip_pow:true () with
+  | Error (Validation.BlockTxValidationFailed (0, Validation.TxNonFinalLocktime)) -> ()
+  | Error e ->
+    Alcotest.failf "6D: expected BlockTxValidationFailed(0,TxNonFinalLocktime), got: %s"
+      (Validation.block_error_to_string e)
+  | Ok () ->
+    Alcotest.fail "6D: non-final coinbase must be rejected (bad-txns-nonfinal)"
+
+(* 6D accept: a block whose coinbase has locktime=0 must still be accepted,
+   confirming the fix does not over-reject well-formed blocks. *)
+let test_6d_final_coinbase_accepted () =
+  (* locktime=0 → is_tx_final returns true immediately (Core tx_verify.cpp:19-20). *)
+  let block = make_block_with_coinbase_locktime ~cb_locktime:0l ~cb_sequence:0l () in
+  match Validation.check_block ~network:Consensus.regtest block 0
+          ~expected_bits:0x207fffffl ~median_time:0l ~skip_pow:true () with
+  | Ok () -> ()
+  | Error e ->
+    Alcotest.failf "6D: final coinbase (locktime=0) must be accepted, got: %s"
+      (Validation.block_error_to_string e)
+
 let () =
   let open Alcotest in
   run "Validation" [
@@ -3917,5 +3978,12 @@ let () =
         test_w93_bip30_skip_with_bip34_height_hash;
       test_case "bip30_should_enforce enforces when bip34_hash mismatches (Bug 1)" `Quick
         test_w93_bip30_enforce_with_wrong_bip34_hash;
+    ];
+    (* Finding 6D: IsFinalTx must apply to the coinbase too *)
+    "finding_6d_coinbase_isfinal", [
+      test_case "6D: non-final coinbase rejected (bad-txns-nonfinal)" `Quick
+        test_6d_nonfinal_coinbase_rejected;
+      test_case "6D: final coinbase (locktime=0) accepted" `Quick
+        test_6d_final_coinbase_accepted;
     ];
   ]

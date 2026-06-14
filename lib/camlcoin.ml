@@ -39,4 +39,5 @@ module Runtime_config = Runtime_config
 module Compressor = Compressor
 module Reindex = Reindex
 module Muhash = Muhash
+module Coinstats_index = Coinstats_index
 module Bloom = Bloom

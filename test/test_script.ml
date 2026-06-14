@@ -3636,6 +3636,126 @@ let finding_3a_tests = [
     test_p2sh_regular_stray_witness_allowed_no_flag;
 ]
 
+(* ============================================================================
+   WITNESS_MALLEATED_P2SH: byte-exact scriptSig check for P2SH-wrapped witness
+   ============================================================================
+   Bitcoin Core interpreter.cpp:2082-2086: for a P2SH-wrapped witness program,
+   scriptSig must equal EXACTLY (CScript() << redeemScript), i.e. the minimal
+   canonical push. A non-canonical encoding (e.g. OP_PUSHDATA1 for a 22-byte
+   redeemScript) is push-only and evaluates correctly on the stack, but must be
+   rejected. MINIMALDATA is a POLICY flag (not in GetBlockScriptFlags), so the
+   byte-exact malleation check is the sole consensus guard.
+
+   Test vector: redeemScript W = OP_0 0x14 <20-byte hash> (22 bytes, P2WPKH).
+   Minimal scriptSig: 0x16 <W>          (23 bytes, direct push — ACCEPTED)
+   Malleated scriptSig: 0x4c 0x16 <W>   (24 bytes, OP_PUSHDATA1 — REJECTED)
+   Flags: P2SH | WITNESS (block-validation flags; MINIMALDATA is OFF).
+*)
+
+(* Build the 22-byte P2WPKH redeemScript: OP_0 <20-byte hash> *)
+let make_p2wpkh_redeem_script () =
+  (* Use a fixed 20-byte hash for determinism *)
+  let hash20 = hex_to_cstruct "0102030405060708090a0b0c0d0e0f1011121314" in
+  let w = Serialize.writer_create () in
+  Serialize.write_uint8 w 0x00;  (* OP_0 *)
+  Serialize.write_uint8 w 0x14;  (* push 20 bytes *)
+  Serialize.write_bytes w hash20;
+  Serialize.writer_to_cstruct w  (* 22 bytes *)
+
+(* Minimal canonical scriptSig: single direct-push byte 0x16 followed by redeemScript *)
+let make_canonical_p2sh_sig redeem_script =
+  let rs_len = Cstruct.length redeem_script in
+  let w = Serialize.writer_create () in
+  Serialize.write_uint8 w rs_len;       (* 0x16 for 22-byte redeemScript *)
+  Serialize.write_bytes w redeem_script;
+  Serialize.writer_to_cstruct w
+
+(* Non-canonical OP_PUSHDATA1 scriptSig: 0x4c <length> <redeemScript> *)
+let make_pushdata1_p2sh_sig redeem_script =
+  let rs_len = Cstruct.length redeem_script in
+  let w = Serialize.writer_create () in
+  Serialize.write_uint8 w 0x4c;         (* OP_PUSHDATA1 *)
+  Serialize.write_uint8 w rs_len;       (* 0x16 = 22 *)
+  Serialize.write_bytes w redeem_script;
+  Serialize.writer_to_cstruct w
+
+(* Dummy witness for P2WPKH: 2 items (sig placeholder + compressed pubkey placeholder).
+   We use a dummy compressed pubkey (33 bytes, 0x02 prefix) whose hash does NOT match
+   the redeemScript's 20-byte program — so sig verification will fail — but the
+   WITNESS_MALLEATED check fires BEFORE that, which is what we are testing. *)
+let make_dummy_p2wpkh_witness () =
+  let dummy_sig    = hex_to_cstruct "3006020101020101" in  (* minimal DER placeholder *)
+  let dummy_pubkey = hex_to_cstruct ("02" ^ String.make 64 'a') in  (* 33-byte compressed *)
+  { Types.items = [dummy_sig; dummy_pubkey] }
+
+(* Helper: check whether a string contains a substring (case-insensitive) *)
+let str_contains_ci haystack needle =
+  let h = String.lowercase_ascii haystack in
+  let n = String.lowercase_ascii needle in
+  let hlen = String.length h and nlen = String.length n in
+  if nlen = 0 then true
+  else
+    let rec loop i =
+      if i + nlen > hlen then false
+      else if String.sub h i nlen = n then true
+      else loop (i + 1)
+    in
+    loop 0
+
+(* Block-validation flags: P2SH + WITNESS, MINIMALDATA deliberately absent *)
+let block_flags = Script.script_verify_p2sh lor Script.script_verify_witness
+
+(* TEST 1: non-canonical OP_PUSHDATA1 scriptSig is rejected with WITNESS_MALLEATED_P2SH
+   Core ref: interpreter.cpp:2082-2086 — byte-exact comparison rejects this. *)
+let test_witness_malleated_p2sh_pushdata1_rejected () =
+  let tx = make_test_tx () in
+  let redeem_script = make_p2wpkh_redeem_script () in
+  let script_pubkey = make_p2sh_pubkey redeem_script in
+  (* Non-canonical: OP_PUSHDATA1 0x16 <22 bytes> — push-only but not minimal *)
+  let script_sig = make_pushdata1_p2sh_sig redeem_script in
+  let witness = make_dummy_p2wpkh_witness () in
+  (match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+           ~script_sig ~witness ~amount:0L ~flags:block_flags () with
+  | Error msg ->
+    if not (str_contains_ci msg "malleated") then
+      Alcotest.fail
+        ("Expected WITNESS_MALLEATED_P2SH error, got: " ^ msg)
+    (* else: correctly rejected *)
+  | Ok _ ->
+    Alcotest.fail
+      "Non-canonical OP_PUSHDATA1 scriptSig must be rejected as WITNESS_MALLEATED_P2SH")
+
+(* TEST 2: canonical (minimal) direct-push scriptSig passes the malleation check.
+   The spend will ultimately fail signature verification (dummy witness data), but
+   the error must NOT be a WITNESS_MALLEATED_P2SH rejection — proving the canonical
+   form clears the byte-exact guard. *)
+let test_witness_malleated_p2sh_canonical_not_rejected () =
+  let tx = make_test_tx () in
+  let redeem_script = make_p2wpkh_redeem_script () in
+  let script_pubkey = make_p2sh_pubkey redeem_script in
+  (* Canonical: 0x16 <22 bytes> — minimal direct push *)
+  let script_sig = make_canonical_p2sh_sig redeem_script in
+  let witness = make_dummy_p2wpkh_witness () in
+  (match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+           ~script_sig ~witness ~amount:0L ~flags:block_flags () with
+  | Error msg ->
+    if str_contains_ci msg "malleated" then
+      Alcotest.fail
+        ("Canonical scriptSig must NOT trigger WITNESS_MALLEATED_P2SH, got: " ^ msg)
+    (* else: failed for another reason (sig check) — expected, malleation check passed *)
+  | Ok _ ->
+    (* Accepted or hash-mismatch false — malleation check passed, which is what we test *)
+    ())
+
+let finding_3b_p2sh_witness_malleated_tests = [
+  Alcotest.test_case
+    "3B: OP_PUSHDATA1 scriptSig for P2SH-witness rejected (WITNESS_MALLEATED_P2SH)" `Quick
+    test_witness_malleated_p2sh_pushdata1_rejected;
+  Alcotest.test_case
+    "3B: canonical direct-push scriptSig for P2SH-witness passes malleation check" `Quick
+    test_witness_malleated_p2sh_canonical_not_rejected;
+]
+
 let () = Alcotest.run "test_script" [
   ("script_num", script_num_tests);
   ("parsing", parsing_tests);
@@ -3666,4 +3786,5 @@ let () = Alcotest.run "test_script" [
   ("bip66_gates", bip66_script_tests);
   ("w94_taproot", w94_taproot_tests);
   ("finding_3a_p2sh_witness_unexpected", finding_3a_tests);
+  ("finding_3b_p2sh_witness_malleated", finding_3b_p2sh_witness_malleated_tests);
 ]

@@ -3756,6 +3756,59 @@ let finding_3b_p2sh_witness_malleated_tests = [
     test_witness_malleated_p2sh_canonical_not_rejected;
 ]
 
+(* ============================================================================
+   Finding 6E: MAX_SCRIPT_ELEMENT_SIZE (520 bytes) applies in tapscript too.
+   Bitcoin Core interpreter.cpp:447-448 checks push-data size unconditionally
+   before the sigversion branch; BIP-342 does not exempt tapscript from the
+   520-byte push-element limit.
+   ============================================================================ *)
+
+(* Build a raw script that pushes [n] zero bytes using OP_PUSHDATA2.
+   Encoding: 0x4d <lo> <hi> followed by n zero bytes. *)
+let make_pushdata2_script (n : int) : Cstruct.t =
+  let buf = Cstruct.create (3 + n) in
+  Cstruct.set_uint8 buf 0 0x4d;          (* OP_PUSHDATA2 *)
+  Cstruct.set_uint8 buf 1 (n land 0xFF); (* length low byte *)
+  Cstruct.set_uint8 buf 2 (n lsr 8);     (* length high byte *)
+  (* remaining n bytes are already zero *)
+  buf
+
+(* 6E reject: in tapscript, a push of 521 bytes must be rejected.
+   Before the fix camlcoin allowed this; after the fix it is an error. *)
+let test_6e_tapscript_oversized_push_rejected () =
+  let tx = w94_make_tx ~input_count:1 in
+  let prevouts = w94_make_prevouts_simple ~count:1 in
+  let st = Script.create_eval_state ~tx ~input_index:0 ~amount:0L
+             ~flags:0 ~sig_version:Script.SigVersionTapscript
+             ~prevouts () in
+  let script = make_pushdata2_script 521 in  (* 521 > MAX_SCRIPT_ELEMENT_SIZE=520 *)
+  match Script.eval_script st script with
+  | Error _ -> ()  (* expected: push-size error *)
+  | Ok () -> Alcotest.fail "6E: tapscript >520-byte push must be rejected (PUSH_SIZE)"
+
+(* 6E accept: a 520-byte push in tapscript must still succeed, confirming the
+   fix does not over-reject pushes at the exact limit. *)
+let test_6e_tapscript_exact_limit_push_accepted () =
+  let tx = w94_make_tx ~input_count:1 in
+  let prevouts = w94_make_prevouts_simple ~count:1 in
+  let st = Script.create_eval_state ~tx ~input_index:0 ~amount:0L
+             ~flags:0 ~sig_version:Script.SigVersionTapscript
+             ~prevouts () in
+  let script = make_pushdata2_script 520 in  (* 520 = MAX_SCRIPT_ELEMENT_SIZE: allowed *)
+  match Script.eval_script st script with
+  | Ok () -> ()
+  | Error e ->
+    Alcotest.failf "6E: tapscript 520-byte push must be accepted, got: %s" e
+
+let finding_6e_tapscript_push_size_tests = [
+  Alcotest.test_case
+    "6E: tapscript >520-byte push rejected (PUSH_SIZE)" `Quick
+    test_6e_tapscript_oversized_push_rejected;
+  Alcotest.test_case
+    "6E: tapscript 520-byte push accepted (at limit)" `Quick
+    test_6e_tapscript_exact_limit_push_accepted;
+]
+
 let () = Alcotest.run "test_script" [
   ("script_num", script_num_tests);
   ("parsing", parsing_tests);
@@ -3787,4 +3840,5 @@ let () = Alcotest.run "test_script" [
   ("w94_taproot", w94_taproot_tests);
   ("finding_3a_p2sh_witness_unexpected", finding_3a_tests);
   ("finding_3b_p2sh_witness_malleated", finding_3b_p2sh_witness_malleated_tests);
+  ("finding_6e_tapscript_push_size", finding_6e_tapscript_push_size_tests);
 ]

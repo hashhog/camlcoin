@@ -984,9 +984,12 @@ let check_block ~network:(network : Consensus.network_config) (block : Types.blo
                           let error2 = ref None in
                           List.iteri (fun i tx ->
                             if !error2 = None then begin
-                              let is_cb = (i = 0) in
-                              if not is_cb &&
-                                 not (is_tx_final tx ~block_height:height ~block_time:lock_time_cutoff) then
+                              (* 6D: IsFinalTx applies to ALL transactions including the
+                                 coinbase (i=0). Bitcoin Core validation.cpp:4144-4148 loops
+                                 ALL block.vtx with no coinbase exemption. A coinbase with
+                                 a non-zero nLockTime and a non-SEQUENCE_FINAL input is
+                                 non-final and must be rejected. *)
+                              if not (is_tx_final tx ~block_height:height ~block_time:lock_time_cutoff) then
                                 error2 := Some (BlockTxValidationFailed (i, TxNonFinalLocktime))
                             end
                           ) txs;
@@ -1666,10 +1669,11 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
             let txid = txid_arr.(i) in
             let is_cb = (i = 0) in
 
-            (* IsFinalTx check — coinbase is always final (locktime=0), but we
-               check all txs for correctness, same as Core's vtx loop. *)
-            if not is_cb &&
-               not (is_tx_final tx ~block_height:height ~block_time:locktime_cutoff_fast) then
+            (* IsFinalTx check — applies to ALL transactions including the coinbase.
+               6D: Bitcoin Core validation.cpp:4144-4148 loops ALL block.vtx with no
+               coinbase exemption; a non-final coinbase (non-zero nLockTime + non-final
+               sequence) must be rejected. *)
+            if not (is_tx_final tx ~block_height:height ~block_time:locktime_cutoff_fast) then
               error := Some (BlockTxValidationFailed (i, TxNonFinalLocktime));
 
             (* BIP-30: always run even on the fast (assumevalid) path.
@@ -1952,13 +1956,14 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
             error := Some BlockTooManySigops
         end;
 
-        (* Validate inputs (skip for coinbase) *)
-        if !error = None && not is_cb then begin
-          (* BIP-113: use median time past for locktime comparison
-             only after CSV activation. Before CSV, use block timestamp.
-             W93: use lock_time_flags (CSV-aware regardless of caller's
-             script flags) for parity with the fast path; on the full
-             path lock_time_flags == flags so this is a no-op. *)
+        (* 6D: IsFinalTx — applies to ALL transactions including the coinbase.
+           Bitcoin Core validation.cpp:4144-4148 loops ALL block.vtx with no
+           coinbase exemption; a non-final coinbase must be rejected.
+           BIP-113: use median time past for locktime comparison after CSV
+           activation. Before CSV, use block timestamp.
+           W93: use lock_time_flags (CSV-aware regardless of caller's script
+           flags) for parity with the fast path. *)
+        if !error = None then begin
           let locktime_cutoff =
             if lock_time_flags land Script.script_verify_checksequenceverify <> 0 then
               median_time
@@ -1967,30 +1972,33 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
           in
           if not (is_tx_final tx ~block_height:height ~block_time:locktime_cutoff) then
             error := Some (BlockTxValidationFailed (i, TxNonFinalLocktime))
-          else begin
-            (* Fix 3: Single-pass UTXO lookup for non-coinbase txs.
-               Pre-compute string keys once per input to avoid repeated
-               Cstruct.to_string allocations. *)
-            let n_inputs = List.length tx.inputs in
-            let resolved_utxos = Array.make n_inputs None in
-            let resolve_error = ref None in
-            List.iteri (fun j inp ->
-              if !resolve_error = None then begin
-                match lookup inp.Types.previous_output with
-                | None ->
-                  resolve_error := Some TxMissingInputs
-                | Some utxo ->
-                  (* Check coinbase maturity *)
-                  if utxo.is_coinbase && height - utxo.height < Consensus.coinbase_maturity then
-                    resolve_error := Some (TxCoinbaseMaturity (height - utxo.height))
-                  else if not (Consensus.is_valid_money utxo.value) then
-                    resolve_error := Some TxOutputOverflow
-                  else
-                    resolved_utxos.(j) <- Some utxo
-              end
-            ) tx.inputs;
+        end;
 
-            match !resolve_error with
+        (* Validate inputs (skip for coinbase) *)
+        if !error = None && not is_cb then begin
+          (* Fix 3: Single-pass UTXO lookup for non-coinbase txs.
+             Pre-compute string keys once per input to avoid repeated
+             Cstruct.to_string allocations. *)
+          let n_inputs = List.length tx.inputs in
+          let resolved_utxos = Array.make n_inputs None in
+          let resolve_error = ref None in
+          List.iteri (fun j inp ->
+            if !resolve_error = None then begin
+              match lookup inp.Types.previous_output with
+              | None ->
+                resolve_error := Some TxMissingInputs
+              | Some utxo ->
+                (* Check coinbase maturity *)
+                if utxo.is_coinbase && height - utxo.height < Consensus.coinbase_maturity then
+                  resolve_error := Some (TxCoinbaseMaturity (height - utxo.height))
+                else if not (Consensus.is_valid_money utxo.value) then
+                  resolve_error := Some TxOutputOverflow
+                else
+                  resolved_utxos.(j) <- Some utxo
+            end
+          ) tx.inputs;
+
+          match !resolve_error with
             | Some e ->
               error := Some (BlockTxValidationFailed (i, e))
             | None ->
@@ -2089,7 +2097,6 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
                   end
               end (* if !error = None then begin — script-eval guard *)
               end (* else begin — MoneyRange check *)
-          end
         end;
 
         (* Add outputs to local UTXO set for intra-block spending.

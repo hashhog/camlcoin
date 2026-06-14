@@ -3545,6 +3545,97 @@ let w94_taproot_tests = [
   Alcotest.test_case "W94: tapleaf hash changes sighash" `Quick test_w94_sighash_codesep_pos_default_changes_hash;
 ]
 
+(* ============================================================================
+   Finding-3A: WITNESS_UNEXPECTED for regular (non-witness) P2SH redeemScript
+   Core ref: interpreter.cpp:2110-2117 — hadWitness stays false for plain P2SH
+   so stray witness data must be rejected when SCRIPT_VERIFY_WITNESS is set.
+   ============================================================================ *)
+
+(* Build a P2SH scriptPubKey for a given redeemScript *)
+let make_p2sh_pubkey redeem_script =
+  let script_hash = Crypto.hash160 redeem_script in
+  let w = Serialize.writer_create () in
+  Serialize.write_uint8 w 0xa9;  (* OP_HASH160 *)
+  Serialize.write_uint8 w 0x14;  (* push 20 bytes *)
+  Serialize.write_bytes w script_hash;
+  Serialize.write_uint8 w 0x87;  (* OP_EQUAL *)
+  Serialize.writer_to_cstruct w
+
+(* Build a P2SH scriptSig that pushes the redeemScript *)
+let make_p2sh_sig redeem_script =
+  let w = Serialize.writer_create () in
+  let len = Cstruct.length redeem_script in
+  Serialize.write_uint8 w len;
+  Serialize.write_bytes w redeem_script;
+  Serialize.writer_to_cstruct w
+
+(* A non-witness redeemScript: OP_TRUE (0x51) — not a witness program.
+   Core: get_witness_program returns None, so hadWitness is never set.
+   Stray witness data must therefore be rejected (WITNESS_UNEXPECTED). *)
+
+(* FIX: stray witness on regular P2SH redeemScript is rejected *)
+let test_p2sh_regular_stray_witness_rejected () =
+  let tx = make_test_tx () in
+  let redeem_script = hex_to_cstruct "51" in  (* OP_TRUE — not a witness program *)
+  let script_pubkey = make_p2sh_pubkey redeem_script in
+  let script_sig = make_p2sh_sig redeem_script in
+  let stray_item = Cstruct.of_string "deadbeef" in
+  let witness = { Types.items = [stray_item] } in
+  let flags = Script.script_verify_p2sh lor Script.script_verify_witness in
+  (match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+           ~script_sig ~witness ~amount:0L ~flags () with
+  | Error msg ->
+    let msg_lower = String.lowercase_ascii msg in
+    let has_unexpected =
+      let rec check i =
+        if i + 10 > String.length msg_lower then false
+        else if String.sub msg_lower i 10 = "unexpected" then true
+        else check (i + 1)
+      in check 0
+    in
+    if not has_unexpected then
+      Alcotest.fail ("Expected witness-unexpected error, got: " ^ msg)
+  | Ok _ ->
+    Alcotest.fail "Stray witness on regular P2SH redeemScript must be rejected")
+
+(* No witness on regular P2SH must succeed (the positive control) *)
+let test_p2sh_regular_no_witness_accepted () =
+  let tx = make_test_tx () in
+  let redeem_script = hex_to_cstruct "51" in  (* OP_TRUE *)
+  let script_pubkey = make_p2sh_pubkey redeem_script in
+  let script_sig = make_p2sh_sig redeem_script in
+  let witness = { Types.items = [] } in
+  let flags = Script.script_verify_p2sh lor Script.script_verify_witness in
+  (match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+           ~script_sig ~witness ~amount:0L ~flags () with
+  | Ok true -> ()
+  | Ok false -> Alcotest.fail "Regular P2SH with OP_TRUE redeemScript should succeed"
+  | Error e -> Alcotest.fail ("Unexpected error: " ^ e))
+
+(* Without SCRIPT_VERIFY_WITNESS flag, stray witness on regular P2SH is allowed *)
+let test_p2sh_regular_stray_witness_allowed_no_flag () =
+  let tx = make_test_tx () in
+  let redeem_script = hex_to_cstruct "51" in  (* OP_TRUE *)
+  let script_pubkey = make_p2sh_pubkey redeem_script in
+  let script_sig = make_p2sh_sig redeem_script in
+  let stray_item = Cstruct.of_string "ignored" in
+  let witness = { Types.items = [stray_item] } in
+  let flags = Script.script_verify_p2sh in  (* no WITNESS flag *)
+  (match Script.verify_script ~tx ~input_index:0 ~script_pubkey
+           ~script_sig ~witness ~amount:0L ~flags () with
+  | Ok true -> ()
+  | Ok false -> Alcotest.fail "Should succeed (no WITNESS flag, stray witness allowed)"
+  | Error e -> Alcotest.fail ("Unexpected error without WITNESS flag: " ^ e))
+
+let finding_3a_tests = [
+  Alcotest.test_case "3A: stray witness on regular P2SH redeemScript rejected (FIX)" `Quick
+    test_p2sh_regular_stray_witness_rejected;
+  Alcotest.test_case "3A: no witness on regular P2SH accepted (positive control)" `Quick
+    test_p2sh_regular_no_witness_accepted;
+  Alcotest.test_case "3A: stray witness allowed when WITNESS flag absent" `Quick
+    test_p2sh_regular_stray_witness_allowed_no_flag;
+]
+
 let () = Alcotest.run "test_script" [
   ("script_num", script_num_tests);
   ("parsing", parsing_tests);
@@ -3574,4 +3665,5 @@ let () = Alcotest.run "test_script" [
   ("csv_gates", csv_gate_tests);
   ("bip66_gates", bip66_script_tests);
   ("w94_taproot", w94_taproot_tests);
+  ("finding_3a_p2sh_witness_unexpected", finding_3a_tests);
 ]

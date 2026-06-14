@@ -1325,8 +1325,11 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
     Error "CONST_SCRIPTCODE: OP_CODESEPARATOR in legacy script"
 
   | OP_PUSHDATA (_, data) when not executing ->
-    (* Push size limit is enforced even in non-executing branches, but not in tapscript *)
-    if st.sig_version <> SigVersionTapscript && Cstruct.length data > max_script_element_size then
+    (* Push size limit is enforced for ALL sigversions including tapscript.
+       6E: Bitcoin Core interpreter.cpp:447-448 checks vchPushValue.size() >
+       MAX_SCRIPT_ELEMENT_SIZE unconditionally before the sigversion branch;
+       BIP-342 does not exempt tapscript from the 520-byte element limit. *)
+    if Cstruct.length data > max_script_element_size then
       Error "Push data exceeds maximum size"
     else
       Ok ()
@@ -1340,7 +1343,10 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
     stack_push st (Cstruct.create 0)
 
   | OP_PUSHDATA (opbyte, data) ->
-    if st.sig_version <> SigVersionTapscript && Cstruct.length data > max_script_element_size then
+    (* 6E: MAX_SCRIPT_ELEMENT_SIZE applies to ALL sigversions including tapscript.
+       Bitcoin Core interpreter.cpp:447-448 is unconditional before the sigversion
+       branch; BIP-342 keeps the 520-byte stack-element limit for tapscript. *)
+    if Cstruct.length data > max_script_element_size then
       Error "Push data exceeds maximum size"
     else if st.flags land script_verify_minimaldata <> 0 then begin
       let dlen = Cstruct.length data in

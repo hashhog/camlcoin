@@ -324,38 +324,54 @@ type spent_coin = {
 
    [created]: for every tx in the block, every (vout, tx_out) that is NOT
    provably-unspendable, paired with whether the tx is the coinbase.  The
-   caller passes block + height; we compute txids.
+   caller passes block + height + block_hash; we compute txids.
    [spent]: the spent prevouts with original metadata (empty for the
    coinbase, which spends nothing).
 
    Mirrors coinstatsindex.cpp CustomAppend: insert created, remove spent.
    Genesis coinbase (height 0) is excluded by the caller (Core never adds
-   the genesis coinbase to the UTXO set). *)
+   the genesis coinbase to the UTXO set).
+
+   BIP30 duplicate-coinbase skip (Core coinstatsindex.cpp:128-131):
+   At mainnet heights 91722 and 91812 the coinbase txs were later duplicated
+   by repeat blocks; those earlier coinbase outputs became permanently
+   unspendable.  Core skips them entirely (no insert into MuHash, no
+   txouts/total_amount/bogo_size increment) and instead tallies their value
+   in m_total_unspendables_bip30.  We do the same here via
+   Consensus.is_bip30_unspendable. *)
 let apply_block_delta (run : running) ~(block : Types.block) ~(height : int)
-    ~(spent : spent_coin list) : unit =
+    ~(block_hash : Types.hash256) ~(spent : spent_coin list) : unit =
   (* Created outputs. *)
   List.iteri (fun tx_idx (tx : Types.transaction) ->
     let is_cb = (tx_idx = 0) in
     (* Genesis coinbase is never added to the UTXO set. *)
     if not (height = 0 && is_cb) then begin
-      let txid = Crypto.compute_txid tx in
-      List.iteri (fun vout (out : Types.tx_out) ->
-        if not (Utxo.is_unspendable_script out.Types.script_pubkey) then begin
-          let outpoint = { Types.txid; vout = Int32.of_int vout } in
-          let buf =
-            Muhash.serialize_txout outpoint
-              ~value:out.Types.value
-              ~script_pubkey:out.Types.script_pubkey
-              ~height ~is_coinbase:is_cb
-          in
-          Muhash.add run.muhash (Bytes.unsafe_to_string buf);
-          run.txouts <- run.txouts + 1;
-          run.total_amount <- Int64.add run.total_amount out.Types.value;
-          run.bogo_size <-
-            Int64.add run.bogo_size
-              (Int64.of_int (bogo_size_of out.Types.script_pubkey))
-        end
-      ) tx.Types.outputs
+      (* BIP30: skip coinbase outputs at the two historical duplicate-coinbase
+         mainnet blocks (heights 91722 / 91812 with their specific block hashes).
+         Core coinstatsindex.cpp:128-131: "Skip duplicate txid coinbase
+         transactions (BIP30)." *)
+      if is_cb && Consensus.is_bip30_unspendable height block_hash then
+        ()  (* entire coinbase tx skipped — outputs are unspendable *)
+      else begin
+        let txid = Crypto.compute_txid tx in
+        List.iteri (fun vout (out : Types.tx_out) ->
+          if not (Utxo.is_unspendable_script out.Types.script_pubkey) then begin
+            let outpoint = { Types.txid; vout = Int32.of_int vout } in
+            let buf =
+              Muhash.serialize_txout outpoint
+                ~value:out.Types.value
+                ~script_pubkey:out.Types.script_pubkey
+                ~height ~is_coinbase:is_cb
+            in
+            Muhash.add run.muhash (Bytes.unsafe_to_string buf);
+            run.txouts <- run.txouts + 1;
+            run.total_amount <- Int64.add run.total_amount out.Types.value;
+            run.bogo_size <-
+              Int64.add run.bogo_size
+                (Int64.of_int (bogo_size_of out.Types.script_pubkey))
+          end
+        ) tx.Types.outputs
+      end
     end
   ) block.transactions;
   (* Spent prevouts. *)
@@ -406,7 +422,7 @@ let connect_block (t : t) ~(block : Types.block) ~(height : int)
           "coinstatsindex: parent snapshot for height %d missing (backfill needed)"
           (height - 1))
       | Some run ->
-        apply_block_delta run ~block ~height ~spent;
+        apply_block_delta run ~block ~height ~block_hash ~spent;
         let muhash_serialized = Muhash.serialize run.muhash in
         let snap = {
           height; block_hash; muhash_serialized;

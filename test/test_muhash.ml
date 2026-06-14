@@ -274,6 +274,94 @@ let test_coin_apply_reversible () =
   else fail name (Printf.sprintf "%s vs %s" f1 f2)
 
 (* ============================================================================
+   Vector 10: BIP30 duplicate-coinbase skip in coinstatsindex
+   ============================================================================
+
+   Core coinstatsindex.cpp:128-131 skips the coinbase tx entirely at the two
+   historical BIP30 duplicate-coinbase mainnet blocks (heights 91722 / 91812).
+   Their outputs became permanently unspendable and must NOT be double-applied
+   to the MuHash / txouts / total_amount / bogo_size accumulators.
+
+   Non-vacuous test: construct a one-coinbase-output block, run apply_block_delta
+   twice — once with the BIP30 unspendable block hash (must be skipped) and once
+   with a different hash (must be applied).  The skipped case leaves running
+   state at zero; the non-skipped case advances txouts / total_amount. *)
+
+let make_dummy_coinbase_tx () : Types.transaction =
+  let coinbase_input : Types.tx_in = {
+    Types.previous_output = {
+      Types.txid = Cstruct.create 32;  (* all-zero txid for coinbase *)
+      vout = 0xFFFFFFFFl;
+    };
+    script_sig = Cstruct.of_string "\x03\x01\x00\x00"; (* block height push *)
+    sequence = 0xFFFFFFFFl;
+  } in
+  let coinbase_output : Types.tx_out = {
+    Types.value = 50_00000000L;  (* 50 BTC *)
+    (* P2PKH script (spendable, not OP_RETURN) — 25 bytes *)
+    script_pubkey = Cstruct.of_string
+      "\x76\xa9\x14\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\
+       \x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x88\xac";
+  } in
+  {
+    Types.version = 1l;
+    inputs = [coinbase_input];
+    outputs = [coinbase_output];
+    witnesses = [];
+    locktime = 0l;
+  }
+
+let make_dummy_block_header () : Types.block_header = {
+  Types.version = 1l;
+  prev_block = Cstruct.create 32;
+  merkle_root = Cstruct.create 32;
+  timestamp = 1296688602l;
+  bits = 0x1d00ffffl;
+  nonce = 0l;
+}
+
+(* BIP30 unspendable block hashes (internal byte order, as stored by
+   compute_block_hash).  Core validation.cpp:6195-6198.
+   Display: 00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e
+   Display: 00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f *)
+let bip30_hash_91722 : Types.hash256 =
+  Types.hash256_of_hex "8ed04d57f2f3cdc6a6e55569dc1654e1f219847f66e726dca271020000000000"
+
+let test_bip30_coinbase_skip () =
+  let name = "coinstatsindex: BIP30 duplicate-coinbase skipped at height 91722" in
+  let cb_tx = make_dummy_coinbase_tx () in
+  let blk : Types.block = {
+    header = make_dummy_block_header ();
+    transactions = [cb_tx];
+  } in
+  (* Case A: BIP30 unspendable block hash — coinbase MUST be skipped. *)
+  let run_a = Coinstats_index.running_empty () in
+  Coinstats_index.apply_block_delta run_a ~block:blk ~height:91722
+    ~block_hash:bip30_hash_91722 ~spent:[];
+  let txouts_a = run_a.Coinstats_index.txouts in
+  let amount_a = run_a.Coinstats_index.total_amount in
+  if txouts_a <> 0 then
+    fail name (Printf.sprintf "BIP30 case: expected txouts=0 (skip), got %d" txouts_a)
+  else if amount_a <> 0L then
+    fail name (Printf.sprintf "BIP30 case: expected total_amount=0, got %Ld" amount_a)
+  else
+    (* Case B: different block hash at same height — coinbase MUST be applied. *)
+    let different_hash = Cstruct.create 32 in
+    Cstruct.set_uint8 different_hash 0 0xff; (* not a BIP30 hash *)
+    let run_b = Coinstats_index.running_empty () in
+    Coinstats_index.apply_block_delta run_b ~block:blk ~height:91722
+      ~block_hash:different_hash ~spent:[];
+    let txouts_b = run_b.Coinstats_index.txouts in
+    let amount_b = run_b.Coinstats_index.total_amount in
+    if txouts_b <> 1 then
+      fail name (Printf.sprintf "non-BIP30 case: expected txouts=1, got %d" txouts_b)
+    else if amount_b <> 50_00000000L then
+      fail name (Printf.sprintf "non-BIP30 case: expected total_amount=5000000000, got %Ld"
+                   amount_b)
+    else
+      pass name
+
+(* ============================================================================
    Runner
    ============================================================================ *)
 
@@ -290,4 +378,5 @@ let () =
   test_txoutser_shape ();
   test_txoutser_coinbase_bit ();
   test_coin_apply_reversible ();
+  test_bip30_coinbase_skip ();
   Printf.printf "All muhash tests passed!\n"

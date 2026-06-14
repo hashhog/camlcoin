@@ -1150,6 +1150,16 @@ let compute_sighash_taproot
     Serialize.write_int32_le w (Int32.of_int input_index)
   end;
 
+  (* If annex is present. Core writes the annex hash BEFORE the SIGHASH_SINGLE
+     single-output hash (interpreter.cpp:1544-1557: annex at 1544-1546, then
+     sha_single_output at 1548-1557). This order is consensus-critical: a taproot
+     spend that carries BOTH a witness annex AND base hash_type SIGHASH_SINGLE
+     would otherwise get a different TapSighash than Core (and the other 9 impls),
+     false-rejecting an otherwise-valid block -> chain split. *)
+  (match annex_hash with
+   | Some ah -> Serialize.write_bytes w ah
+   | None -> ());
+
   (* If SIGHASH_SINGLE, write sha_single_output *)
   if base_type = 3 then begin
     if input_index >= List.length tx.outputs then
@@ -1162,11 +1172,6 @@ let compute_sighash_taproot
     let sha_single_output = Crypto.sha256 (Serialize.writer_to_cstruct pw) in
     Serialize.write_bytes w sha_single_output
   end;
-
-  (* If annex is present *)
-  (match annex_hash with
-   | Some ah -> Serialize.write_bytes w ah
-   | None -> ());
 
   (* If tapscript (script path spend) *)
   (match tapleaf_hash with

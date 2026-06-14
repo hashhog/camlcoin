@@ -1057,6 +1057,28 @@ let test_w95_compute_sighash_taproot_invalid_hash_type_raises () =
   Alcotest.(check bool) "compute_sighash_taproot raises on hash_type 0x55"
     true raised
 
+(* Bug-hunt 2026-06-14: BIP-341 TapSighash MUST serialize the annex hash BEFORE
+   the SIGHASH_SINGLE single-output hash (Core interpreter.cpp:1544-1557 writes
+   annex at 1544-1546, then sha_single_output at 1548-1557). A field-order swap
+   (single before annex) produced a different TapSighash for any taproot spend
+   carrying BOTH a witness annex AND base hash_type SIGHASH_SINGLE, false-rejecting
+   an otherwise-valid block -> chain split vs Core and the other 9 impls. The
+   golden digest below was produced by an independent Python BIP-341 oracle that
+   reproduces ALL 7 official bip341_wallet_vectors.json sigHashes; with the fields
+   swapped the function instead yields 35f5cd44...39151b3a, so this test is
+   non-vacuous (it fails on the buggy order). *)
+let test_bughunt_taproot_annex_single_field_order () =
+  let tx = make_dummy_tx () in
+  let spk = hex_to_cstruct
+    "5120cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe" in
+  let prevouts = [(50_000_000L, spk)] in
+  (* annex_hash = 32 bytes of 0xaa (matches the oracle constant) *)
+  let annex_h = hex_to_cstruct (String.make 64 'a') in
+  let h = Script.compute_sighash_taproot tx 0 prevouts 0x03 ~annex_hash:annex_h () in
+  Alcotest.(check string) "annex-before-single TapSighash matches BIP-341 oracle"
+    "07cb2ac922b93e8b5cf44f12efbefbcb6bed5eea8c63ce435679e0ffb29f9df7"
+    (cstruct_to_hex h)
+
 (* Mismatched prevouts length is also defended in depth. *)
 let test_w95_compute_sighash_taproot_prevouts_mismatch_raises () =
   let tx = make_dummy_tx () in
@@ -1100,6 +1122,7 @@ let bip340_schnorr_tests = [
   Alcotest.test_case "compute_sighash_taproot deterministic" `Quick test_w95_compute_sighash_taproot_deterministic;
   Alcotest.test_case "compute_sighash_taproot varies by hash_type" `Quick test_w95_compute_sighash_taproot_differs_by_hash_type;
   Alcotest.test_case "compute_sighash_taproot raises bad hash_type" `Quick test_w95_compute_sighash_taproot_invalid_hash_type_raises;
+  Alcotest.test_case "taproot annex-before-single field order (bug-hunt)" `Quick test_bughunt_taproot_annex_single_field_order;
   Alcotest.test_case "compute_sighash_taproot raises prevouts mismatch" `Quick test_w95_compute_sighash_taproot_prevouts_mismatch_raises;
 ]
 

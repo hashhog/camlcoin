@@ -131,6 +131,43 @@ let test_bech32m_decode_p2tr () =
     Alcotest.(check int) "witness version" 1 (List.hd data)
   | None -> Alcotest.fail "decode failed"
 
+(* BIP-173/BIP-350 cap a Bech32/Bech32m address at 90 characters.  Beyond 89
+   characters the underlying BCH code can no longer guarantee detection of up
+   to 4 errors, so any over-long string must be rejected regardless of whether
+   its checksum verifies.  Bitcoin Core enforces this in bech32::Decode:
+     `if (str.size() > limit) return {};`  (bitcoin-core/src/bech32.cpp:378)
+   with CharLimit::BECH32 = 90 (src/bech32.h:38-40), applied to the address
+   path via the default-limit bech32::Decode(str) call.
+
+   Construct strings with a VALID checksum (via bech32_encode) so the ONLY
+   reason to reject is length.  Geometry: total length = len(hrp) + 1 + len(data)
+   + 6, with hrp="bc" => total = 9 + len(data).  len(data)=82 -> 91 chars (must
+   reject); len(data)=81 -> 90 chars (must decode).  Mutation-proof: removing
+   the `String.length s > 90` guard lets the 91-char string decode as Some. *)
+let test_bech32_reject_overlong () =
+  let data = List.init 82 (fun i -> i mod 32) in
+  let overlong = Address.bech32_encode Address.Bech32m "bc" data in
+  Alcotest.(check int) "test setup: 91-char string" 91 (String.length overlong);
+  (* Checksum is valid by construction, so length is the only reason to reject. *)
+  (match Address.bech32_decode overlong with
+   | None -> ()
+   | Some _ ->
+     Alcotest.fail "over-90-char bech32 string must be rejected (CharLimit::BECH32=90)")
+
+let test_bech32_accept_exactly_90 () =
+  let data = List.init 81 (fun i -> i mod 32) in
+  let at_limit = Address.bech32_encode Address.Bech32m "bc" data in
+  Alcotest.(check int) "test setup: 90-char string" 90 (String.length at_limit);
+  (match Address.bech32_decode at_limit with
+   | Some (enc, hrp, decoded) ->
+     Alcotest.(check string) "hrp" "bc" hrp;
+     (match enc with
+      | Address.Bech32m -> ()
+      | Address.Bech32 -> Alcotest.fail "expected Bech32m");
+     Alcotest.(check (list int)) "payload round-trips" data decoded
+   | None ->
+     Alcotest.fail "exactly-90-char bech32 string is within the limit and must decode")
+
 (* ========== High-level Address Tests ========== *)
 
 let test_address_p2pkh_roundtrip () =
@@ -308,6 +345,8 @@ let bech32_tests = [
   Alcotest.test_case "decode P2WPKH" `Quick test_bech32_decode_p2wpkh;
   Alcotest.test_case "encode P2TR (Bech32m)" `Quick test_bech32m_encode_p2tr;
   Alcotest.test_case "decode P2TR (Bech32m)" `Quick test_bech32m_decode_p2tr;
+  Alcotest.test_case "reject >90 chars (CharLimit::BECH32)" `Quick test_bech32_reject_overlong;
+  Alcotest.test_case "accept exactly 90 chars" `Quick test_bech32_accept_exactly_90;
 ]
 
 let address_tests = [

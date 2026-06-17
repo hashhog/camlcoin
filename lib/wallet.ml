@@ -170,6 +170,17 @@ let derive_child_key (parent : extended_key) (index : int32) : (extended_key, st
   let is_hardened = Int32.unsigned_compare index hardened_offset >= 0 in
   if is_hardened && not parent_is_private then
     Error "BIP-32: hardened derivation requires private key (xprv)"
+  else if parent.depth >= 0xFF then
+    (* BIP-32 depth-byte guard: the serialized extended key stores depth in a
+       single byte, so deriving from a parent already at depth 255 would
+       overflow it and produce a wrong-depth child Core never emits.  Core
+       refuses the derivation outright once the parent is at the max depth:
+       bitcoin-core/src/key.cpp:483 (CExtKey::Derive) and
+       src/pubkey.cpp:416 (CExtPubKey::Derive) both
+         `if (nDepth == std::numeric_limits<unsigned char>::max()) return false;`
+       Non-consensus: derive_child_key is reached only from wallet/descriptor
+       key derivation, never from block/tx/script validation. *)
+    Error "BIP-32: cannot derive child past depth 255 (depth byte would overflow)"
   else
     let data =
       if is_hardened then

@@ -467,6 +467,63 @@ let persistence_tests = [
 ]
 
 (* ============================================================================
+   BIP-32 Depth-Overflow Guard Test
+   ============================================================================ *)
+
+(* BIP-32 stores the depth in a single serialized byte, so deriving from a
+   parent already at depth 255 would overflow it and produce a wrong-depth
+   child that Core never emits.  Core refuses the derivation outright once the
+   parent is at the max depth:
+     bitcoin-core/src/key.cpp:483    CExtKey::Derive
+     bitcoin-core/src/pubkey.cpp:416 CExtPubKey::Derive
+   both `if (nDepth == std::numeric_limits<unsigned char>::max()) return false;`.
+
+   This test derives a genuine child to obtain a valid (private key, chain
+   code) pair, then drives the boundary directly via the `depth` record field:
+   a depth-254 parent must still derive to exactly 255 (no off-by-one), while
+   a depth-255 parent must FAIL for BOTH the private (xprv) and public (xpub)
+   derivation paths.  Mutation-proof: reverting the guard so the depth-255
+   parent derives a (silently saturated/overflowed) child makes the two
+   "must fail" assertions fail. *)
+let test_bip32_depth_overflow_guard () =
+  let seed = hex_to_cstruct "000102030405060708090a0b0c0d0e0f" in
+  let master = Wallet.derive_master_key seed in
+  (* A real one-level derivation gives a valid 32-byte private key + chain code. *)
+  let child =
+    match Wallet.derive_normal master 0 with
+    | Ok ek -> ek
+    | Error e -> Alcotest.fail ("master->child derivation must succeed: " ^ e)
+  in
+  (* Depth-254 parent: derive must succeed and land exactly on depth 255. *)
+  let parent_254 = { child with Wallet.depth = 254 } in
+  (match Wallet.derive_normal parent_254 7 with
+   | Ok ek -> Alcotest.(check int) "depth-254 child lands on 255" 255 ek.Wallet.depth
+   | Error e -> Alcotest.fail ("derive at depth 254 must succeed: " ^ e));
+  (* Depth-255 parent: the private (xprv) derivation must be REFUSED, not
+     silently produce another depth-255 child. *)
+  let parent_255 = { child with Wallet.depth = 255 } in
+  (match Wallet.derive_normal parent_255 0 with
+   | Error _ -> ()
+   | Ok ek ->
+     Alcotest.failf "private derive at depth 255 must fail, got depth %d"
+       ek.Wallet.depth);
+  (* Same guard on the public-key (xpub) derivation path: take the 33-byte
+     compressed pubkey of a depth-255 parent and attempt a normal derive. *)
+  let pubkey_255 =
+    { parent_255 with
+      Wallet.key = Crypto.derive_public_key ~compressed:true parent_255.Wallet.key }
+  in
+  (match Wallet.derive_normal pubkey_255 0 with
+   | Error _ -> ()
+   | Ok ek ->
+     Alcotest.failf "public derive at depth 255 must fail, got depth %d"
+       ek.Wallet.depth)
+
+let bip32_depth_tests = [
+  Alcotest.test_case "depth-255 overflow guard" `Quick test_bip32_depth_overflow_guard;
+]
+
+(* ============================================================================
    BIP-39 Mnemonic Tests
    ============================================================================ *)
 
@@ -1281,6 +1338,7 @@ let () = Alcotest.run "test_wallet" [
   ("encryption", encryption_tests);
   ("lock_unlock", lock_unlock_tests);
   ("address_types", address_type_tests);
+  ("bip32_depth", bip32_depth_tests);
   ("bip39", bip39_tests);
   ("multi_wallet", multi_wallet_tests);
   ("w28_segwit_v0_wraps", w28_segwit_wrap_tests);

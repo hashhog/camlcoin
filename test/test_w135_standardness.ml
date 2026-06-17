@@ -138,6 +138,43 @@ let mk_bare_multisig_1of1 ~(header : int) : Cstruct.t =
   Cstruct.set_uint8 s 36 0xae;
   s
 
+(* Build a bare 1-of-1 multisig whose single 33-byte compressed pubkey is
+   pushed with OP_PUSHDATA1 (0x4c 0x21 <33 bytes>) instead of the direct 0x21
+   push.  Core's MatchMultisig (GetScriptOp + CPubKey::ValidSize) accepts this;
+   a direct-opcode-only matcher rejects it. Layout:
+     OP_1 (0x51) OP_PUSHDATA1 (0x4c) 0x21 <header,0,...,0> OP_1 (0x51)
+     OP_CHECKMULTISIG (0xae)  = 1 + 2 + 33 + 1 + 1 = 38 bytes *)
+let mk_bare_multisig_1of1_pushdata1 ~(header : int) : Cstruct.t =
+  let s = Cstruct.create 38 in
+  Cstruct.set_uint8 s 0 0x51;   (* OP_1 (m) *)
+  Cstruct.set_uint8 s 1 0x4c;   (* OP_PUSHDATA1 *)
+  Cstruct.set_uint8 s 2 0x21;   (* push length 33 *)
+  Cstruct.set_uint8 s 3 header;
+  for i = 4 to 35 do Cstruct.set_uint8 s i 0x00 done;
+  Cstruct.set_uint8 s 36 0x51;  (* OP_1 (n) *)
+  Cstruct.set_uint8 s 37 0xae;  (* OP_CHECKMULTISIG *)
+  s
+
+(* Build a witness program scriptPubKey of the given version (OP_n) and a
+   32-byte program.  version 0 ⇒ OP_0 (0x00), version v∈[1,16] ⇒ OP_v
+   (0x50+v).  Total length = 34 bytes (1 version + 1 push-32 + 32 data). *)
+let mk_witness_program ~(version : int) : Cstruct.t =
+  let s = Cstruct.create 34 in
+  Cstruct.set_uint8 s 0 (if version = 0 then 0x00 else 0x50 + version);
+  Cstruct.set_uint8 s 1 0x20;   (* push 32 *)
+  for i = 2 to 33 do Cstruct.set_uint8 s i 0x00 done;
+  s
+
+(* A version-0 witness program of an INVALID size (30-byte program): OP_0
+   followed by a 30-byte push.  Core: NONSTANDARD (witnessversion == 0 with
+   unrecognised size). *)
+let mk_witness_v0_badsize () : Cstruct.t =
+  let s = Cstruct.create 32 in
+  Cstruct.set_uint8 s 0 0x00;   (* OP_0 *)
+  Cstruct.set_uint8 s 1 0x1e;   (* push 30 *)
+  for i = 2 to 31 do Cstruct.set_uint8 s i 0x00 done;
+  s
+
 (* P2A scriptPubKey: OP_1 OP_PUSHBYTES_2 0x4e 0x73 *)
 let mk_p2a () : Cstruct.t =
   let s = Cstruct.create 4 in
@@ -365,6 +402,27 @@ let test_g9_bare_multisig_no_header_check () =
     "G9d: BUG-W135-2 — top-level standard check passes for invalid-header bare-multisig"
     true (Mempool.is_standard_output bm_invalid_00)
 
+(* G9-FIX: bare-multisig matcher is PUSHDATA-aware (Core MatchMultisig via
+   GetScriptOp + CPubKey::ValidSize, solver.cpp:85-105).  A pubkey pushed with
+   OP_PUSHDATA1 0x21 <33 bytes> (instead of the direct 0x21 push) is a valid
+   pubkey-size push and MUST decode as a 1-of-1 bare multisig.  Before the
+   PUSHDATA-aware reader, decode_bare_multisig only recognised the direct
+   0x21/0x41 opcodes and returned None for this shape (FAIL-without-fix).
+   RELAY policy only. *)
+let test_g9_fix_bare_multisig_pushdata_aware () =
+  let bm_pd1 = mk_bare_multisig_1of1_pushdata1 ~header:0x02 in
+  Alcotest.(check bool)
+    "G9-FIX-a: OP_PUSHDATA1-pushed pubkey decodes as 1-of-1 bare multisig"
+    true (Mempool.decode_bare_multisig bm_pd1 = Some (1, 1));
+  Alcotest.(check bool)
+    "G9-FIX-b: PUSHDATA1 bare-multisig passes top-level is_standard_output"
+    true (Mempool.is_standard_output bm_pd1);
+  (* Sanity: the direct-push form still decodes (no regression). *)
+  let bm_direct = mk_bare_multisig_1of1 ~header:0x02 in
+  Alcotest.(check bool)
+    "G9-FIX-c: direct-push bare multisig still decodes (no regression)"
+    true (Mempool.decode_bare_multisig bm_direct = Some (1, 1))
+
 (* G10: OP_RETURN with push-only tail recognised; truncated push rejected. *)
 let test_g10_op_return_null_data () =
   (* Valid: 0x6a 0x04 0xde 0xad 0xbe 0xef *)
@@ -426,6 +484,38 @@ let test_g12_witness_unknown_distinction () =
     true (Script.classify_script wv2 = Script.Nonstandard);
   Alcotest.(check bool) "G12b: v2 witness program get_witness_program returns Some"
     true (Script.get_witness_program wv2 <> None)
+
+(* G12-FIX: WITNESS_UNKNOWN relay standardness (Core Solver solver.cpp:172-176
+   + IsStandard policy.cpp:80-98).  A witness program of version >= 1 (e.g. v2,
+   v3) is a recognisable witness shape of unknown type → relay-STANDARD
+   (TxoutType::WITNESS_UNKNOWN), NOT nonstandard.  is_standard_output must
+   return true for these.  A v0 witness program of unrecognised size stays
+   NONSTANDARD (Core: witnessversion == 0 with wrong size → NONSTANDARD).
+   This is mempool RELAY policy only; classify_script (consensus-shared)
+   still returns Nonstandard for these and is intentionally NOT changed. *)
+let test_g12_fix_witness_unknown_relay_standard () =
+  let wv2 = mk_witness_program ~version:2 in
+  let wv3 = mk_witness_program ~version:3 in
+  let wv16 = mk_witness_program ~version:16 in
+  let v0_bad = mk_witness_v0_badsize () in
+  (* PASS-with-fix / FAIL-without: v2..v16 witness programs are relay-standard. *)
+  Alcotest.(check bool)
+    "G12-FIX-a: v2 witness program is relay-standard (WITNESS_UNKNOWN)"
+    true (Mempool.is_standard_output wv2);
+  Alcotest.(check bool)
+    "G12-FIX-b: v3 witness program is relay-standard (WITNESS_UNKNOWN)"
+    true (Mempool.is_standard_output wv3);
+  Alcotest.(check bool)
+    "G12-FIX-c: v16 witness program is relay-standard (WITNESS_UNKNOWN)"
+    true (Mempool.is_standard_output wv16);
+  (* A v0 witness program of unrecognised size remains NONSTANDARD. *)
+  Alcotest.(check bool)
+    "G12-FIX-d: v0 witness program of wrong size is NONSTANDARD"
+    false (Mempool.is_standard_output v0_bad);
+  (* classify_script (consensus-shared) is unchanged: still Nonstandard. *)
+  Alcotest.(check bool)
+    "G12-FIX-e: classify_script still returns Nonstandard for v2 (unchanged)"
+    true (Script.classify_script wv2 = Script.Nonstandard)
 
 (* G13: P2A (Pay-to-Anchor) recognition matches Core IsPayToAnchor. *)
 let test_g13_p2a_recognition () =
@@ -743,11 +833,13 @@ let () =
       Alcotest.test_case "G7: P2PKH recognised" `Quick test_g7_p2pkh_recognised;
       Alcotest.test_case "G8: P2SH recognised" `Quick test_g8_p2sh_recognised;
       Alcotest.test_case "G9: bare-multisig no header check (BUG-W135-2 P0-CDIV)" `Quick test_g9_bare_multisig_no_header_check;
+      Alcotest.test_case "G9-FIX: bare-multisig PUSHDATA-aware (relay)" `Quick test_g9_fix_bare_multisig_pushdata_aware;
       Alcotest.test_case "G10: OP_RETURN NULL_DATA + truncation" `Quick test_g10_op_return_null_data;
     ];
     "G11-G15 Witness + anchor + datacarrier", [
       Alcotest.test_case "G11: P2WPKH/P2WSH/P2TR" `Quick test_g11_witness_program_recognition;
       Alcotest.test_case "G12: WITNESS_UNKNOWN distinction" `Quick test_g12_witness_unknown_distinction;
+      Alcotest.test_case "G12-FIX: WITNESS_UNKNOWN relay-standard (v>=1)" `Quick test_g12_fix_witness_unknown_relay_standard;
       Alcotest.test_case "G13: P2A recognition" `Quick test_g13_p2a_recognition;
       Alcotest.test_case "G14: no -permitbaremultisig flag (BUG-W135-3 P1)" `Quick test_g14_no_permit_bare_multisig_flag;
       Alcotest.test_case "G15: no -datacarrier flag (BUG-W135-4 P0-CDIV)" `Quick test_g15_no_datacarrier_flag;

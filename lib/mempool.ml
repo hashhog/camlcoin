@@ -1102,22 +1102,44 @@ let decode_bare_multisig (script : Cstruct.t) : (int * int) option =
       if m_byte < 0x51 || m_byte > 0x60 then None
       else begin
         let m = m_byte - 0x50 in
-        (* Walk pubkeys — each must be a 0x21 (33) or 0x41 (65) byte push *)
+        (* Walk pubkeys — each must be a push whose pushed-data length is a
+           valid pubkey size (33 or 65).  Core's MatchMultisig (solver.cpp:
+           97) reads each operand with CScript::GetOp (PUSHDATA-aware) and
+           keeps it while CPubKey::ValidSize(data) holds.  So a pubkey may be
+           pushed with a direct opcode (0x21 / 0x41) OR via OP_PUSHDATA1/2/4 —
+           e.g. OP_PUSHDATA1 0x21 <33 bytes>.  We decode the push opcode in a
+           PUSHDATA-aware way and validate the *pushed-data length*, mirroring
+           the length component of CPubKey::ValidSize.  RELAY policy only. *)
         let i = ref 1 in
         let n = ref 0 in
         let bad = ref false in
         while not !bad && !i < len - 2 do
-          let push_byte = Cstruct.get_uint8 script !i in
-          let pk_len =
-            if push_byte = 0x21 then 33
-            else if push_byte = 0x41 then 65
-            else 0
+          let op = Cstruct.get_uint8 script !i in
+          (* (data_offset_from_op, pk_len): data_offset includes the opcode
+             byte and any length prefix.  pk_len = -1 ⇒ not a usable push. *)
+          let data_off, pk_len =
+            if op >= 0x01 && op <= 0x4b then
+              (* direct push of [op] bytes *)
+              (1, op)
+            else if op = 0x4c (* OP_PUSHDATA1 *) then
+              (if !i + 1 < len then (2, Cstruct.get_uint8 script (!i + 1))
+               else (0, -1))
+            else if op = 0x4d (* OP_PUSHDATA2 *) then
+              (if !i + 2 < len then (3, Cstruct.LE.get_uint16 script (!i + 1))
+               else (0, -1))
+            else if op = 0x4e (* OP_PUSHDATA4 *) then
+              (if !i + 4 < len then
+                 (5, Int32.to_int (Cstruct.LE.get_uint32 script (!i + 1)))
+               else (0, -1))
+            else (0, -1)
           in
-          if pk_len = 0 then bad := true
-          else if !i + 1 + pk_len > len - 2 then bad := true
+          (* Pushed-data length must be a valid pubkey size (33 or 65),
+             matching CPubKey::ValidSize's length test. *)
+          if pk_len <> 33 && pk_len <> 65 then bad := true
+          else if !i + data_off + pk_len > len - 2 then bad := true
           else begin
             incr n;
-            i := !i + 1 + pk_len
+            i := !i + data_off + pk_len
           end
         done;
         if !bad then None
@@ -1156,10 +1178,24 @@ let is_standard_output (script_pubkey : Cstruct.t) : bool =
   | Script.Nonstandard ->
     (* Check P2PK (bare pubkey) — not in classify_script but standard in Core *)
     if is_p2pk_script script_pubkey then true
-    (* Check bare multisig m-of-n with n <= 3 (Core policy limit) *)
-    else match decode_bare_multisig script_pubkey with
-    | Some (m, n) -> n >= 1 && n <= 3 && m >= 1 && m <= n
-    | None -> false
+    (* WITNESS_UNKNOWN — a witness program of version >= 1 (future segwit
+       versions) is a recognisable witness shape of unknown type.  Core's
+       Solver (script/solver.cpp:172-176) returns TxoutType::WITNESS_UNKNOWN
+       for witnessversion != 0, and IsStandard (policy/policy.cpp:80-98)
+       returns true for every type except NONSTANDARD / out-of-range MULTISIG.
+       So a v2..v16 witness program (and a v1 program of non-taproot,
+       non-anchor shape) is relay-standard, NOT nonstandard.  Known v0/v1
+       shapes (P2WPKH/P2WSH/P2TR/P2A) are already matched above; a v0 witness
+       program of wrong size stays NONSTANDARD (Core: witnessversion == 0 with
+       unrecognised size → NONSTANDARD), which is why this only triggers for
+       version >= 1.  RELAY policy only — never consensus. *)
+    else (match Script.get_witness_program script_pubkey with
+      | Some (v, _) when v >= 1 -> true
+      | _ ->
+        (* Check bare multisig m-of-n with n <= 3 (Core policy limit) *)
+        match decode_bare_multisig script_pubkey with
+        | Some (m, n) -> n >= 1 && n <= 3 && m >= 1 && m <= n
+        | None -> false)
 
 (* Count UTXO-aware sigops cost for a mempool transaction.
    Delegates to Validation.count_tx_sigops_cost which correctly implements

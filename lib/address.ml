@@ -195,6 +195,17 @@ let bech32_decode (s : string) : (bech32_encoding * string * int list) option =
     if c >= 'A' && c <= 'Z' then has_upper := true
   ) s;
   if !has_lower && !has_upper then None
+  (* BIP-173/BIP-350 cap a Bech32/Bech32m address at 90 characters.  Beyond 89
+     characters the BCH code's guarantee of detecting up to 4 errors no longer
+     holds, so an over-long string must be rejected regardless of whether its
+     checksum happens to verify.  Mirrors Bitcoin Core's
+     `if (str.size() > limit) return {};` in bech32::Decode
+     (bitcoin-core/src/bech32.cpp:378) with CharLimit::BECH32 = 90
+     (src/bech32.h:38-40), checked after CheckCharacters (the mixed-case check
+     above) to match Core's ordering.  Non-consensus: bech32_decode is reached
+     only from address parsing (wallet/RPC/descriptor/bip21), never from
+     block/tx/script validation. *)
+  else if String.length s > 90 then None
   else
   (* Find the separator '1' (last occurrence) *)
   let pos = match String.rindex_opt s '1' with

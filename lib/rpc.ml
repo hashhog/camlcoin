@@ -1509,6 +1509,12 @@ let handle_getpeerinfo (ctx : rpc_context) : Yojson.Safe.t =
       ("services", `String (Printf.sprintf "%016Lx" svc));
       ("servicesnames", `List (List.map (fun s -> `String s) svc_names));
       ("relaytxes", `Bool stats.stat_relay);
+      (* Core v31.99 rpc/net.cpp:243-244 emits these two NUM fields immediately
+         after relaytxes and before lastsend. camlcoin does not track per-peer
+         INV sequence / queued-announcement counts at the peer-manager layer,
+         so emit 0 — same convention as addr_processed/addr_rate_limited below. *)
+      ("last_inv_sequence", `Int 0);
+      ("inv_to_send", `Int 0);
       ("lastsend", `Int (int_of_float stats.stat_last_seen));
       ("lastrecv", `Int (int_of_float stats.stat_last_seen));
       ("last_transaction", `Int 0);
@@ -1524,7 +1530,9 @@ let handle_getpeerinfo (ctx : rpc_context) : Yojson.Safe.t =
       ("inbound", `Bool is_inbound);
       ("bip152_hb_to", `Bool false);
       ("bip152_hb_from", `Bool false);
-      ("startingheight", `Int (Int32.to_int stats.stat_best_height));
+      (* Core v31.99 removed startingheight from getpeerinfo: net.cpp pushes
+         presynced_headers directly after bip152_hb_from (no startingheight
+         pushKV); m_starting_height is no longer surfaced via RPC. *)
       ("presynced_headers", `Int (-1));
       ("synced_headers", `Int (-1));
       ("synced_blocks", `Int (-1));

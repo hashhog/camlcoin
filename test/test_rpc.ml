@@ -3118,6 +3118,71 @@ let test_getchainstates_shape () =
   cleanup_test_db ()
 
 (* ============================================================================
+   getpeerinfo wire-order parity (Core v31.99 rpc/net.cpp)
+   ============================================================================ *)
+
+(* Helper: register one peer into ctx and return the ordered field-name list
+   of the first getpeerinfo object (the wire order serde/Yojson emits). *)
+let getpeerinfo_field_order ctx =
+  let (fd_peer_u, _fd_remote_u) =
+    Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let fd_peer = Lwt_unix.of_unix_file_descr fd_peer_u in
+  let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
+    ~port:8333 ~id:7 ~direction:Peer.Outbound ~fd:fd_peer () in
+  ctx.Rpc.peer_manager.Peer_manager.peers <-
+    peer :: ctx.Rpc.peer_manager.Peer_manager.peers;
+  match Rpc.handle_getpeerinfo ctx with
+  | `List (`Assoc fields :: _) -> List.map fst fields
+  | _ -> Alcotest.fail "getpeerinfo did not return a non-empty peer list"
+
+(* Index of [key] in the ordered field list, or -1 if absent. *)
+let idx_of keys k =
+  let rec go i = function
+    | [] -> -1
+    | x :: _ when x = k -> i
+    | _ :: tl -> go (i + 1) tl
+  in go 0 keys
+
+(* Core v31.99 emits, immediately after relaytxes and before lastsend, two NUM
+   fields: last_inv_sequence then inv_to_send (rpc/net.cpp:242-245). camlcoin
+   tracks neither at the manager layer, so emits 0 — but the fields and their
+   exact wire position must be present for getpeerinfo parity. *)
+let test_getpeerinfo_last_inv_seq_inv_to_send () =
+  let (ctx, _, _, _, _) = create_test_context () in
+  let keys = getpeerinfo_field_order ctx in
+  let i_relay = idx_of keys "relaytxes" in
+  let i_lis   = idx_of keys "last_inv_sequence" in
+  let i_its   = idx_of keys "inv_to_send" in
+  let i_send  = idx_of keys "lastsend" in
+  Alcotest.(check bool) "relaytxes present" true (i_relay >= 0);
+  Alcotest.(check bool) "last_inv_sequence present" true (i_lis >= 0);
+  Alcotest.(check bool) "inv_to_send present" true (i_its >= 0);
+  Alcotest.(check bool) "lastsend present" true (i_send >= 0);
+  (* Exact contiguous wire order: relaytxes, last_inv_sequence, inv_to_send,
+     lastsend. *)
+  Alcotest.(check int) "last_inv_sequence directly after relaytxes"
+    (i_relay + 1) i_lis;
+  Alcotest.(check int) "inv_to_send directly after last_inv_sequence"
+    (i_lis + 1) i_its;
+  Alcotest.(check int) "lastsend directly after inv_to_send"
+    (i_its + 1) i_send
+
+(* Core v31.99 removed startingheight from getpeerinfo: presynced_headers is
+   pushed directly after bip152_hb_from (rpc/net.cpp:269-270). Emitting
+   startingheight is an extra-field parity bug. *)
+let test_getpeerinfo_no_startingheight () =
+  let (ctx, _, _, _, _) = create_test_context () in
+  let keys = getpeerinfo_field_order ctx in
+  Alcotest.(check int) "startingheight is absent (removed in Core v31.99)"
+    (-1) (idx_of keys "startingheight");
+  let i_hb_from = idx_of keys "bip152_hb_from" in
+  let i_presync = idx_of keys "presynced_headers" in
+  Alcotest.(check bool) "bip152_hb_from present" true (i_hb_from >= 0);
+  Alcotest.(check bool) "presynced_headers present" true (i_presync >= 0);
+  Alcotest.(check int) "presynced_headers directly after bip152_hb_from"
+    (i_hb_from + 1) i_presync
+
+(* ============================================================================
    Test Runner
    ============================================================================ *)
 
@@ -3309,5 +3374,11 @@ let () =
         test_parsehashv_getblockheader;
       test_case "getmempoolentry malformed->-8, absent->handler" `Quick
         test_parsehashv_getmempoolentry;
+    ];
+    "getpeerinfo_wire_order_v3199", [
+      test_case "last_inv_sequence + inv_to_send between relaytxes and lastsend"
+        `Quick test_getpeerinfo_last_inv_seq_inv_to_send;
+      test_case "no startingheight; bip152_hb_from -> presynced_headers"
+        `Quick test_getpeerinfo_no_startingheight;
     ];
   ]

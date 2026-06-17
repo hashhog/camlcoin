@@ -158,6 +158,56 @@ let mk_p2pkh () : Cstruct.t =
   Cstruct.set_uint8 s 24 0xac; (* OP_CHECKSIG *)
   s
 
+(* P2SH: OP_HASH160 <20> OP_EQUAL (23 bytes, non-witness). *)
+let mk_p2sh () : Cstruct.t =
+  let s = Cstruct.create 23 in
+  Cstruct.set_uint8 s 0 0xa9; Cstruct.set_uint8 s 1 0x14;
+  for i = 2 to 21 do Cstruct.set_uint8 s i 0x00 done;
+  Cstruct.set_uint8 s 22 0x87; s
+
+(* P2WPKH: OP_0 <20> (22 bytes, witness program v0). *)
+let mk_p2wpkh () : Cstruct.t =
+  let s = Cstruct.create 22 in
+  Cstruct.set_uint8 s 0 0x00; Cstruct.set_uint8 s 1 0x14;
+  for i = 2 to 21 do Cstruct.set_uint8 s i 0x00 done; s
+
+(* P2WSH: OP_0 <32> (34 bytes, witness program v0). *)
+let mk_p2wsh () : Cstruct.t =
+  let s = Cstruct.create 34 in
+  Cstruct.set_uint8 s 0 0x00; Cstruct.set_uint8 s 1 0x20;
+  for i = 2 to 33 do Cstruct.set_uint8 s i 0x00 done; s
+
+(* P2TR: OP_1 <32> (34 bytes, witness program v1). *)
+let mk_p2tr () : Cstruct.t =
+  let s = Cstruct.create 34 in
+  Cstruct.set_uint8 s 0 0x51; Cstruct.set_uint8 s 1 0x20;
+  for i = 2 to 33 do Cstruct.set_uint8 s i 0x00 done; s
+
+(* Independent reference reimplementation of Core GetDustThreshold
+   (policy/policy.cpp:27-63), kept deliberately distinct from the production
+   code under test (no shared helpers) so the assertions are a real oracle.
+     nSize = (8 + CompactSize(scriptlen) + scriptlen) + spending_cost
+     spending_cost = 67 if witness program else 148
+     threshold = CeilDiv(nSize * dustRelayFee, 1000)
+     unspendable (OP_RETURN / size>10000) => 0 *)
+let core_dust_threshold ~(dust_relay_fee : int) (spk : Cstruct.t) : int =
+  let len = Cstruct.length spk in
+  let unspendable = (len > 0 && Cstruct.get_uint8 spk 0 = 0x6a) || len > 10_000 in
+  if unspendable then 0
+  else begin
+    let cs_prefix = if len < 0xfd then 1 else if len <= 0xffff then 3 else 5 in
+    let txout_ser = 8 + cs_prefix + len in
+    let is_witness_program =
+      len >= 4 && len <= 42 &&
+      (let v = Cstruct.get_uint8 spk 0 in
+       v = 0x00 || (v >= 0x51 && v <= 0x60)) &&
+      (let push = Cstruct.get_uint8 spk 1 in
+       push >= 2 && push <= 40 && len = push + 2) in
+    let spending_cost = if is_witness_program then 67 else 148 in
+    let n_size = txout_ser + spending_cost in
+    (n_size * dust_relay_fee + 999) / 1000
+  end
+
 (* ============================================================================
    G1-G5: IsStandardTx outer gates (version, weight, scriptSig, output)
    ============================================================================ *)
@@ -433,49 +483,61 @@ let test_g15_no_datacarrier_flag () =
    G16-G20: Dust + ValidateInputsStandardness
    ============================================================================ *)
 
-(* G16: BUG-W135-5 (FIXED) — dust now uses a separate dust_relay_fee (3000),
-   decoupled from the relay floor.  is_dust takes the DUST feerate positionally.
-   These direct calls exercise the formula 3 × feerate × spending_size / 1000;
-   production callers now pass dust_relay_fee=3000 (== Core threshold ~546 sat),
-   not the 100 sat/kvB relay floor.  Also BUG-W135-13 (spending_input_size)
-   and BUG-W135-15 (float arithmetic). *)
-let test_g16_dust_formula_3x_min_relay () =
-  ignore core_dust_relay_tx_fee;
+(* G16: BUG-W135-5 + BUG-W135-13 + BUG-W135-15 (FIXED) — dust_threshold is now
+   Core-faithful (GetDustThreshold, policy.cpp:27-63): nSize = GetSerializeSize
+   (txout) + spending_cost, spending_cost = 67 for witness programs / 148
+   otherwise, threshold = CeilDiv(nSize*dustRelayFee, 1000). No bogus 3x
+   multiplier, no per-shape spending-size table, integer ceil-div (no float).
+   At the default dustRelayFee=3000 the five canonical thresholds match Core:
+   P2PKH 546, P2SH 540, P2WPKH 294, P2WSH 330, P2TR 330. Verified against an
+   independent reference (core_dust_threshold) plus a 545/546 boundary pin. *)
+let test_g16_dust_threshold_core_faithful () =
   ignore core_default_min_relay_tx_fee;
-  (* Read the literals as a dust_relay_fee argument.
-     At dust_relay_fee=100, threshold ≈ 3 × 100 × 182 / 1000 ≈ 55 sat.
-     At dust_relay_fee=1000, threshold ≈ 546 sat (Core's P2PKH dust at 3000
-     coincides with 3×1000 here because Core's 3×3000×size/1000 == 3×1000×... ). *)
-  let p2pkh_out = { Types.value = 100L; script_pubkey = mk_p2pkh () } in
-  let dust_at_100  = Mempool.is_dust 100L p2pkh_out in
-  let dust_at_1000 = Mempool.is_dust 1000L p2pkh_out in
-  (* At dust_relay_fee=100, 100 sat in a P2PKH output is NOT dust (~55 < 100).
-     At dust_relay_fee=1000, the threshold rises above 100 so it IS dust;
-     production uses 3000 so real dust outputs are correctly rejected. *)
-  Alcotest.(check bool)
-    "G16a: 100 sat P2PKH not dust at dust_relay_fee=100 (formula ~55)"
-    false dust_at_100;
-  Alcotest.(check bool)
-    "G16b: 100 sat P2PKH IS dust at dust_relay_fee=1000"
-    true dust_at_1000
+  let drf = core_dust_relay_tx_fee in   (* 3000 *)
+  let cases =
+    [ "P2PKH",  mk_p2pkh (),  546L;
+      "P2SH",   mk_p2sh (),   540L;
+      "P2WPKH", mk_p2wpkh (), 294L;
+      "P2WSH",  mk_p2wsh (),  330L;
+      "P2TR",   mk_p2tr (),   330L ] in
+  List.iter (fun (name, spk, expected) ->
+    let out = { Types.value = 0L; script_pubkey = spk } in
+    (* production code matches the expected Core threshold ... *)
+    Alcotest.(check int64)
+      (Printf.sprintf "G16: %s dust threshold = Core %Ld" name expected)
+      expected (Mempool.dust_threshold (Int64.of_int drf) out);
+    (* ... and matches the independent reference oracle. *)
+    Alcotest.(check int)
+      (Printf.sprintf "G16: %s threshold == independent reference" name)
+      (core_dust_threshold ~dust_relay_fee:drf spk)
+      (Int64.to_int (Mempool.dust_threshold (Int64.of_int drf) out))
+  ) cases;
+  (* 545/546 boundary pin on P2PKH at the default dustRelayFee. *)
+  let spk = mk_p2pkh () in
+  Alcotest.(check bool) "G16: 545 sat P2PKH IS dust (< 546)"
+    true  (Mempool.is_dust (Int64.of_int drf) { Types.value = 545L; script_pubkey = spk });
+  Alcotest.(check bool) "G16: 546 sat P2PKH is NOT dust (>= 546)"
+    false (Mempool.is_dust (Int64.of_int drf) { Types.value = 546L; script_pubkey = spk })
 
-(* G17: BUG-W135-6 — P2A dust hard-coded to <> 240L. *)
-let test_g17_p2a_dust_exact_240 () =
+(* G17: BUG-W135-6 (FIXED) — P2A dust is no longer the <> 240 exact-match
+   hard-code. Core does NOT special-case P2A in GetDustThreshold; a P2A output
+   is a witness program, so it gets spending_cost=67 and a real threshold of
+   exactly 240 sat. So a P2A output is dust iff value < 240 (240, 241, 500 are
+   all NOT dust; 239 is dust) — exactly what Core does. *)
+let test_g17_p2a_dust_core_threshold () =
+  let drf = Int64.of_int core_dust_relay_tx_fee in
   let p2a = mk_p2a () in
-  let out_240 = { Types.value = 240L; script_pubkey = p2a } in
-  let out_241 = { Types.value = 241L; script_pubkey = p2a } in
-  let out_500 = { Types.value = 500L; script_pubkey = p2a } in
-  let out_239 = { Types.value = 239L; script_pubkey = p2a } in
-  Alcotest.(check bool) "G17a: 240 sat P2A is NOT dust" false (Mempool.is_dust 100L out_240);
-  Alcotest.(check bool)
-    "G17b: BUG-W135-6 — 241 sat P2A is dust in camlcoin (Core: not dust)"
-    true (Mempool.is_dust 100L out_241);
-  Alcotest.(check bool)
-    "G17c: BUG-W135-6 — 500 sat P2A is dust in camlcoin (Core: not dust)"
-    true (Mempool.is_dust 100L out_500);
-  Alcotest.(check bool)
-    "G17d: 239 sat P2A is dust in camlcoin AND Core (below threshold)"
-    true (Mempool.is_dust 100L out_239)
+  (* The P2A threshold is exactly 240 sat (witness-program formula). *)
+  Alcotest.(check int64) "G17: P2A dust threshold = 240 (Core formula, no hard-code)"
+    240L (Mempool.dust_threshold drf { Types.value = 0L; script_pubkey = p2a });
+  let out v = { Types.value = v; script_pubkey = p2a } in
+  Alcotest.(check bool) "G17a: 240 sat P2A is NOT dust" false (Mempool.is_dust drf (out 240L));
+  Alcotest.(check bool) "G17b: 241 sat P2A is NOT dust (Core: not dust)"
+    false (Mempool.is_dust drf (out 241L));
+  Alcotest.(check bool) "G17c: 500 sat P2A is NOT dust (Core: not dust)"
+    false (Mempool.is_dust drf (out 500L));
+  Alcotest.(check bool) "G17d: 239 sat P2A IS dust (below 240 threshold)"
+    true  (Mempool.is_dust drf (out 239L))
 
 (* G18: MAX_DUST_OUTPUTS_PER_TX = 1 (ephemeral dust). *)
 let test_g18_max_dust_outputs_per_tx () =
@@ -691,8 +753,8 @@ let () =
       Alcotest.test_case "G15: no -datacarrier flag (BUG-W135-4 P0-CDIV)" `Quick test_g15_no_datacarrier_flag;
     ];
     "G16-G20 Dust + ValidateInputsStandardness", [
-      Alcotest.test_case "G16: dust formula uses 3×min_relay_fee (BUG-W135-5 P0-CDIV)" `Quick test_g16_dust_formula_3x_min_relay;
-      Alcotest.test_case "G17: P2A dust exact 240 (BUG-W135-6 P0-CDIV)" `Quick test_g17_p2a_dust_exact_240;
+      Alcotest.test_case "G16: dust threshold Core-faithful (BUG-W135-5/13/15 FIXED)" `Quick test_g16_dust_threshold_core_faithful;
+      Alcotest.test_case "G17: P2A dust = Core 240 threshold (BUG-W135-6 FIXED)" `Quick test_g17_p2a_dust_core_threshold;
       Alcotest.test_case "G18: MAX_DUST_OUTPUTS_PER_TX=1" `Quick test_g18_max_dust_outputs_per_tx;
       Alcotest.test_case "G19: no CheckSigopsBIP54 (BUG-W135-7 P0-CONSENSUS)" `Quick test_g19_no_bip54_sigops_check;
       Alcotest.test_case "G20: extract_last_push_data skips OP_n (BUG-W135-8 P1)" `Quick test_g20_extract_last_push_misses_opn;

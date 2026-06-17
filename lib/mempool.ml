@@ -1002,27 +1002,48 @@ let output_serialized_size (output : Types.tx_out) : int =
   let varint_len = if script_len < 0xFD then 1 else if script_len <= 0xFFFF then 3 else 5 in
   8 + varint_len + script_len
 
-(* Check if an output is dust. Dust = value < 3 * dust_relay_fee * spending_size / 1000.
-   The fee argument is the DUST feerate (dust_relay_fee = 3000 sat/kvB,
-   DUST_RELAY_TX_FEE), NOT the min-relay floor — Core's IsDust takes its own
-   dustRelayFee CFeeRate. The 3.0* multiplier matches Core GetDustThreshold
-   (3 * dustRelayFee.GetFee(size)).
-   P2A outputs have a fixed dust limit of 240 satoshis. *)
+(* Spending cost (in vbytes) of the CTxIn needed to redeem an output, faithful
+   to Core GetDustThreshold (policy/policy.cpp:46-61). This is a binary choice,
+   NOT a per-script-type table: every witness program (P2WPKH/P2WSH/P2TR and any
+   unknown-version witness program — Core's IsWitnessProgram test) takes the
+   75%-segwit-discounted 67 vbytes; everything else takes 148.
+     witness:     32 + 4 + 1 + (107 / WITNESS_SCALE_FACTOR=4) + 4 = 67
+     non-witness: 32 + 4 + 1 + 107 + 4                           = 148 *)
+let dust_spending_cost (script_pubkey : Cstruct.t) : int =
+  match Script.get_witness_program script_pubkey with
+  | Some _ -> 32 + 4 + 1 + (107 / 4) + 4   (* = 67, segwit-discounted *)
+  | None   -> 32 + 4 + 1 + 107 + 4          (* = 148 *)
+
+(* Dust threshold (satoshis) for an output at the given dust relay fee rate
+   (sat/kvB), faithful to Core GetDustThreshold (policy/policy.cpp:27-63):
+     nSize     = GetSerializeSize(txout) + spending_cost
+     threshold = dustRelayFee.GetFee(nSize) = CeilDiv(nSize * fee, 1000)
+   Unspendable outputs (OP_RETURN, or scriptPubKey > MAX_SCRIPT_SIZE) can never
+   be dust (Core: txout.scriptPubKey.IsUnspendable() => return 0). There is NO
+   3x multiplier and NO P2A special-case: P2A is a witness program, so Core
+   gives it spending_cost=67 and a real threshold of 240 sat (a P2A output
+   below 240 is dust, 240+ is not). Integer ceil-div matches Core's CeilDiv;
+   no float arithmetic. *)
+let dust_threshold (dust_relay_fee : int64) (output : Types.tx_out) : int64 =
+  let spk = output.Types.script_pubkey in
+  let len = Cstruct.length spk in
+  let is_unspendable =
+    (len > 0 && Cstruct.get_uint8 spk 0 = 0x6a)  (* OP_RETURN *)
+    || len > Script.max_script_size in
+  if is_unspendable then 0L
+  else begin
+    let n_size =
+      Int64.of_int (output_serialized_size output + dust_spending_cost spk) in
+    (* CeilDiv(n_size * fee, 1000) *)
+    let num = Int64.mul n_size dust_relay_fee in
+    Int64.div (Int64.add num 999L) 1000L
+  end
+
+(* Check if an output is dust: value < dust_threshold. The fee argument is the
+   DUST feerate (dust_relay_fee = 3000 sat/kvB, DUST_RELAY_TX_FEE), NOT the
+   min-relay floor — Core's IsDust takes its own dustRelayFee CFeeRate. *)
 let is_dust (dust_relay_fee : int64) (output : Types.tx_out) : bool =
-  match Script.classify_script output.script_pubkey with
-  | Script.OP_RETURN_data _ -> false  (* OP_RETURN is not dust *)
-  | Script.P2A_script ->
-    (* P2A outputs must have exactly 240 satoshis -- the P2A dust limit *)
-    output.Types.value <> Script.p2a_dust_limit
-  | _ ->
-    let spend_size = spending_input_size output.script_pubkey in
-    if spend_size = 0 then false
-    else begin
-      let threshold = Int64.of_float (
-        3.0 *. Int64.to_float dust_relay_fee *.
-        float_of_int (output_serialized_size output + spend_size) /. 1000.0) in
-      output.Types.value < threshold
-    end
+  Int64.compare output.Types.value (dust_threshold dust_relay_fee output) < 0
 
 (* ============================================================================
    IsStandard Checks (Task 7)

@@ -2253,19 +2253,22 @@ let test_p2a_is_standard () =
   let p2a_script = make_p2a_script () in
   Alcotest.(check bool) "P2A is standard" true (Mempool.is_standard_output p2a_script)
 
-(* Test: P2A output with correct dust value (240) is not dust.
-   P2A branch is fee-independent; pass the production dust_relay_fee for clarity. *)
+(* Test: P2A output at/above the Core dust threshold (240 sat) is not dust.
+   Core does not special-case P2A: it is a witness program with a real
+   GetDustThreshold of exactly 240 sat (spending_cost 67). *)
 let test_p2a_dust_correct_value () =
   let output = make_p2a_output 240L in
   let is_dust = Mempool.is_dust Mempool.dust_relay_fee output in
   Alcotest.(check bool) "240 sat P2A is not dust" false is_dust
 
-(* Test: P2A output with incorrect value is considered dust *)
+(* Test: P2A dust is value < 240 (Core threshold), NOT an exact-240 match.
+   Below 240 is dust; 240 and above (241, 500, ...) are NOT dust — matching
+   Core GetDustThreshold for a P2A output. *)
 let test_p2a_dust_wrong_value () =
-  let output_too_low = make_p2a_output 239L in
-  let output_too_high = make_p2a_output 241L in
-  Alcotest.(check bool) "239 sat P2A is dust" true (Mempool.is_dust Mempool.dust_relay_fee output_too_low);
-  Alcotest.(check bool) "241 sat P2A is dust" true (Mempool.is_dust Mempool.dust_relay_fee output_too_high)
+  let output_below = make_p2a_output 239L in
+  let output_above = make_p2a_output 241L in
+  Alcotest.(check bool) "239 sat P2A is dust (< 240)" true (Mempool.is_dust Mempool.dust_relay_fee output_below);
+  Alcotest.(check bool) "241 sat P2A is NOT dust (>= 240)" false (Mempool.is_dust Mempool.dust_relay_fee output_above)
 
 (* Test: P2A spending input size is reasonable *)
 let test_p2a_spending_size () =

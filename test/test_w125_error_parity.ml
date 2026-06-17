@@ -351,25 +351,27 @@ let g21_client_not_connected_NOT_declared () =
 let g22_client_in_ibd_NOT_declared () =
   assert_code_not_declared ~name:"rpc_client_in_initial_download"
 
-(* -- G23 RPC_CLIENT_NODE_ALREADY_ADDED -23 MISSING ------------------- *)
+(* -- G23 RPC_CLIENT_NODE_ALREADY_ADDED -23 GATE CLOSED ---------------- *)
+(* Closed by the RPC error-code parity port: addnode "add" of an already-added
+   node now returns -23 (was a silent no-op). The behavioral assertion lives in
+   test_w125b_rpc_error_codes_live.ml; here we pin the declaration. *)
+let g23_node_already_added_declared () =
+  assert_code_declared ~name:"rpc_client_node_already_added" ~value:(-23)
 
-let g23_node_already_added_NOT_declared () =
-  assert_code_not_declared ~name:"rpc_client_node_already_added"
+(* -- G24 RPC_CLIENT_NODE_NOT_ADDED -24 GATE CLOSED ------------------- *)
 
-(* -- G24 RPC_CLIENT_NODE_NOT_ADDED -24 MISSING ------------------------ *)
+let g24_node_not_added_declared () =
+  assert_code_declared ~name:"rpc_client_node_not_added" ~value:(-24)
 
-let g24_node_not_added_NOT_declared () =
-  assert_code_not_declared ~name:"rpc_client_node_not_added"
+(* -- G25 RPC_CLIENT_NODE_NOT_CONNECTED -29 GATE CLOSED -------------- *)
 
-(* -- G25 RPC_CLIENT_NODE_NOT_CONNECTED -29 MISSING ------------------- *)
+let g25_node_not_connected_declared () =
+  assert_code_declared ~name:"rpc_client_node_not_connected" ~value:(-29)
 
-let g25_node_not_connected_NOT_declared () =
-  assert_code_not_declared ~name:"rpc_client_node_not_connected"
+(* -- G26 RPC_CLIENT_INVALID_IP_OR_SUBNET -30 GATE CLOSED ------------ *)
 
-(* -- G26 RPC_CLIENT_INVALID_IP_OR_SUBNET -30 MISSING ----------------- *)
-
-let g26_invalid_ip_or_subnet_NOT_declared () =
-  assert_code_not_declared ~name:"rpc_client_invalid_ip_or_subnet"
+let g26_invalid_ip_or_subnet_declared () =
+  assert_code_declared ~name:"rpc_client_invalid_ip_or_subnet" ~value:(-30)
 
 (* -- G27 RPC_CLIENT_P2P_DISABLED -31 MISSING ------------------------- *)
 
@@ -453,28 +455,28 @@ let as1_declared_code_count () =
     "AS1 W125 baseline: exactly 13 codes declared in rpc.ml table"
     13 declared
 
-(* Audit framework expects 14 Core codes are NOT declared (the MISSING
-   gates G7, G12, G13, G14, G18, G19, G20, G21, G22, G23, G24, G25,
-   G26, G27, G28, G29 plus G30's 11-code wallet cluster).  The cluster
-   counts as 1 gate, but if we enumerate every distinct code Core
-   defines that camlcoin does not, the total is 14 (top-level codes) +
-   11 (wallet sub-codes) = 25 missing distinct codes versus Core. *)
+(* Count, from the original W125 missing-list, how many Core codes remain
+   undeclared.  The list still enumerates every code the W125 audit flagged
+   as MISSING at baseline; this gate counts how many are STILL missing so it
+   tracks gate-closing fix waves.  Codes that have since been declared (the
+   RPC error-code parity port closed -23/-24/-29/-30, and -8
+   rpc_invalid_parameter is declared for ParseHashV) contribute 0. *)
 let as2_missing_distinct_codes () =
   let src = rpc_ml () in
   let missing = [
-    "rpc_forbidden_by_safe_mode";     (* G7 *)
+    "rpc_forbidden_by_safe_mode";     (* G7  *)
     "rpc_out_of_memory";              (* G12 *)
-    "rpc_invalid_parameter";          (* G13 *)
+    "rpc_invalid_parameter";          (* G13 — now declared (-8, ParseHashV) *)
     "rpc_database_error";             (* G14 *)
     "rpc_verify_already_in_utxo_set"; (* G18 *)
     "rpc_in_warmup";                  (* G19 *)
     "rpc_method_deprecated";          (* G20 *)
     "rpc_client_not_connected";       (* G21 *)
     "rpc_client_in_initial_download"; (* G22 *)
-    "rpc_client_node_already_added";  (* G23 *)
-    "rpc_client_node_not_added";      (* G24 *)
-    "rpc_client_node_not_connected";  (* G25 *)
-    "rpc_client_invalid_ip_or_subnet"; (* G26 *)
+    "rpc_client_node_already_added";  (* G23 — now declared (-23) *)
+    "rpc_client_node_not_added";      (* G24 — now declared (-24) *)
+    "rpc_client_node_not_connected";  (* G25 — now declared (-29) *)
+    "rpc_client_invalid_ip_or_subnet"; (* G26 — now declared (-30) *)
     "rpc_client_p2p_disabled";        (* G27 *)
     "rpc_client_node_capacity_reached"; (* G28 *)
     "rpc_client_mempool_disabled";    (* G29 *)
@@ -495,9 +497,10 @@ let as2_missing_distinct_codes () =
     let pat = Printf.sprintf "let %s =" c in
     if contains_substring src pat then acc else acc + 1
   ) 0 missing in
+  (* 27 baseline - 5 now-declared (G13 + G23/G24/G25/G26) = 22 still missing. *)
   Alcotest.(check int)
-    "AS2 W125 baseline: 27 Core codes NOT declared (16 top-level + 11 wallet)"
-    27 still_missing
+    "AS2: 22 of the original 27 W125-missing Core codes remain undeclared"
+    22 still_missing
 
 (* Bug count: 22 catalogued in audit/w125_rpc_error_parity.md.  This
    assertion encodes the audit-time count via a sentinel constant. *)
@@ -600,17 +603,17 @@ let () =
     "G22 RPC_CLIENT_IN_INITIAL_DOWNLOAD -10 MISSING (BUG-2)", [
       test_case "NOT declared" `Quick g22_client_in_ibd_NOT_declared;
     ];
-    "G23 RPC_CLIENT_NODE_ALREADY_ADDED -23 MISSING (BUG-10)", [
-      test_case "NOT declared" `Quick g23_node_already_added_NOT_declared;
+    "G23 RPC_CLIENT_NODE_ALREADY_ADDED -23 GATE CLOSED (BUG-10)", [
+      test_case "declared" `Quick g23_node_already_added_declared;
     ];
-    "G24 RPC_CLIENT_NODE_NOT_ADDED -24 MISSING (BUG-11)", [
-      test_case "NOT declared" `Quick g24_node_not_added_NOT_declared;
+    "G24 RPC_CLIENT_NODE_NOT_ADDED -24 GATE CLOSED (BUG-11)", [
+      test_case "declared" `Quick g24_node_not_added_declared;
     ];
-    "G25 RPC_CLIENT_NODE_NOT_CONNECTED -29 MISSING (BUG-12)", [
-      test_case "NOT declared" `Quick g25_node_not_connected_NOT_declared;
+    "G25 RPC_CLIENT_NODE_NOT_CONNECTED -29 GATE CLOSED (BUG-12)", [
+      test_case "declared" `Quick g25_node_not_connected_declared;
     ];
-    "G26 RPC_CLIENT_INVALID_IP_OR_SUBNET -30 MISSING (BUG-13)", [
-      test_case "NOT declared" `Quick g26_invalid_ip_or_subnet_NOT_declared;
+    "G26 RPC_CLIENT_INVALID_IP_OR_SUBNET -30 GATE CLOSED (BUG-13)", [
+      test_case "declared" `Quick g26_invalid_ip_or_subnet_declared;
     ];
     "G27 RPC_CLIENT_P2P_DISABLED -31 MISSING (BUG-14)", [
       test_case "NOT declared" `Quick g27_p2p_disabled_NOT_declared;

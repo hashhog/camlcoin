@@ -40,6 +40,14 @@ let rpc_deserialization_error = -22
 let rpc_verify_error = -25
 let rpc_verify_rejected = -26
 
+(* P2P client error codes (bitcoin-core/src/rpc/protocol.h:60-63). These are
+   distinct from the JSON-RPC transport codes; Core raises them from the net
+   RPCs (addnode / setban / disconnectnode) for operator-input failures. *)
+let rpc_client_node_already_added = -23  (* addnode "add" of an already-added node *)
+let rpc_client_node_not_added = -24      (* addnode "remove" of a node not added *)
+let rpc_client_node_not_connected = -29  (* disconnectnode for a non-connected peer *)
+let rpc_client_invalid_ip_or_subnet = -30 (* setban with an invalid IP/subnet *)
+
 (* ParseHashV — Core's rpc/util.cpp:117 boundary check for a txid/blockhash
    string argument.  A txid/blockhash must be exactly 64 hex characters
    (a uint256).  If it is NOT, Core throws JSONRPCError(RPC_INVALID_PARAMETER)
@@ -7987,44 +7995,95 @@ let handle_listbanned (ctx : rpc_context) : Yojson.Safe.t =
   ) bans)
 
 (* setban - Add or remove an address from the ban list *)
+(* Validate a setban IP/subnet argument the way Core does
+   (bitcoin-core/src/rpc/net.cpp:768-781): a '/' makes it a subnet
+   (LookupSubNet); otherwise it is a bare host (LookupHost). When the parse
+   fails Core throws RPC_CLIENT_INVALID_IP_OR_SUBNET (-30) "Error: Invalid
+   IP/Subnet" BEFORE the add/remove branch.
+
+   [Unix.inet_addr_of_string] parses both IPv4 and IPv6 literals and raises
+   Failure on anything malformed; for a subnet we additionally require a
+   non-empty, all-digit prefix length within the family's bit range. *)
+let setban_ip_or_subnet_valid (arg : string) : bool =
+  match String.index_opt arg '/' with
+  | None ->
+    (match Unix.inet_addr_of_string arg with
+     | _ -> true
+     | exception _ -> false)
+  | Some idx ->
+    let host = String.sub arg 0 idx in
+    let prefix = String.sub arg (idx + 1) (String.length arg - idx - 1) in
+    (match Unix.inet_addr_of_string host with
+     | exception _ -> false
+     | inet ->
+       (* Max prefix: 32 for IPv4, 128 for IPv6. *)
+       let max_bits =
+         if String.contains (Unix.string_of_inet_addr inet) ':' then 128 else 32
+       in
+       prefix <> ""
+       && String.for_all (fun c -> c >= '0' && c <= '9') prefix
+       && (match int_of_string_opt prefix with
+           | Some n -> n >= 0 && n <= max_bits
+           | None -> false))
+
 let handle_setban (ctx : rpc_context)
-    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  (* Core validates the IP/subnet first; an un-parseable arg ->
+     RPC_CLIENT_INVALID_IP_OR_SUBNET (-30) "Error: Invalid IP/Subnet". *)
+  let guard_ip addr k =
+    if setban_ip_or_subnet_valid addr then k ()
+    else Error (rpc_client_invalid_ip_or_subnet, "Error: Invalid IP/Subnet")
+  in
   match params with
   | [`String addr; `String "add"] ->
-    Peer_manager.ban_addr ctx.peer_manager addr ~duration:86400.0 ();
-    Ok `Null
+    guard_ip addr (fun () ->
+      Peer_manager.ban_addr ctx.peer_manager addr ~duration:86400.0 ();
+      Ok `Null)
   | [`String addr; `String "add"; `Int duration] ->
-    Peer_manager.ban_addr ctx.peer_manager addr ~duration:(float_of_int duration) ();
-    Ok `Null
+    guard_ip addr (fun () ->
+      Peer_manager.ban_addr ctx.peer_manager addr ~duration:(float_of_int duration) ();
+      Ok `Null)
   | [`String addr; `String "remove"] ->
-    Peer_manager.unban_addr ctx.peer_manager addr;
-    Ok `Null
+    guard_ip addr (fun () ->
+      Peer_manager.unban_addr ctx.peer_manager addr;
+      Ok `Null)
   | _ ->
-    Error "Invalid parameters: expected [address, \"add\"|\"remove\", (bantime)]"
+    Error (rpc_invalid_params,
+           "Invalid parameters: expected [address, \"add\"|\"remove\", (bantime)]")
 
 (* clearbanned - Clear all banned addresses *)
 let handle_clearbanned (ctx : rpc_context) : Yojson.Safe.t =
   Peer_manager.clear_bans ctx.peer_manager;
   `Null
 
-(* disconnectnode - Disconnect from a peer *)
+(* disconnectnode - Disconnect from a peer.
+
+   Core error parity (bitcoin-core/src/rpc/net.cpp:467-479): when the
+   disconnect matches no currently-connected peer (by address or by id), Core
+   throws RPC_CLIENT_NODE_NOT_CONNECTED (-29) "Node not found in connected
+   nodes" instead of silently succeeding. CConnman::DisconnectNode returns
+   true on a match / false on a miss (net.cpp:3817/3849). Returns Core-exact
+   (code, message) pairs so the dispatch arm can route the -29 code; the
+   param-shape case keeps the generic RPC_INVALID_PARAMS code. *)
 let handle_disconnectnode (ctx : rpc_context)
-    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
   match params with
   | [`String addr] ->
     (match Peer_manager.find_peer_by_addr ctx.peer_manager addr with
      | Some peer ->
        Lwt.async (fun () -> Peer_manager.remove_peer ctx.peer_manager peer.Peer.id);
        Ok `Null
-     | None -> Error ("Peer not found: " ^ addr))
+     | None ->
+       Error (rpc_client_node_not_connected, "Node not found in connected nodes"))
   | [`Int id] ->
     (match Peer_manager.find_peer_by_id ctx.peer_manager id with
      | Some _ ->
        Lwt.async (fun () -> Peer_manager.remove_peer ctx.peer_manager id);
        Ok `Null
-     | None -> Error ("Peer not found with id: " ^ string_of_int id))
+     | None ->
+       Error (rpc_client_node_not_connected, "Node not found in connected nodes"))
   | _ ->
-    Error "Invalid parameters: expected [address] or [node_id]"
+    Error (rpc_invalid_params, "Invalid parameters: expected [address] or [node_id]")
 
 (* getblockfrompeer - Attempt to fetch a block from a given peer.
    Mirrors Bitcoin Core rpc/blockchain.cpp:getblockfrompeer + net_processing.cpp
@@ -8088,12 +8147,27 @@ let handle_getblockfrompeer (ctx : rpc_context)
   | _ ->
     Error "Invalid parameters: expected [blockhash, peer_id]"
 
-(* addnode - Manually connect to or disconnect from a peer *)
+(* addnode - Manually connect to or disconnect from a peer.
+
+   Core error parity (bitcoin-core/src/rpc/net.cpp:355-371):
+     - "add"    of an already-added node -> RPC_CLIENT_NODE_ALREADY_ADDED (-23)
+                "Error: Node already added"
+     - "remove" of a node not previously added -> RPC_CLIENT_NODE_NOT_ADDED (-24)
+                "Error: Node could not be removed. It has not been added previously."
+   The addnode-managed list ([Peer_manager.add_added_node]/[remove_added_node],
+   keyed on the exact node string) is Core's m_added_node_params: its contents,
+   not the live connection state, decide whether add/remove is an error.
+   "onetry" never touches the list (Core: OpenNetworkConnection only).
+
+   Returns Core-exact (code, message) pairs so the dispatch arm can route the
+   distinct -23 / -24 codes; the param-shape and bad-command cases keep the
+   generic RPC_INVALID_PARAMS code at the dispatch arm. *)
 let handle_addnode (ctx : rpc_context)
-    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
   match params with
   | [`String node; `String command] ->
-    (* Parse host:port *)
+    (* Parse host:port (used for the actual connection attempt; the addnode
+       list is keyed on the original [node] string, matching Core). *)
     let (host, port) =
       match String.rindex_opt node ':' with
       | Some idx ->
@@ -8105,19 +8179,30 @@ let handle_addnode (ctx : rpc_context)
       | None -> (node, ctx.network.Consensus.default_port)
     in
     (match command with
-     | "onetry" | "add" ->
+     | "onetry" ->
        Lwt.async (fun () -> Peer_manager.force_add_peer ctx.peer_manager host port);
        Ok `Null
+     | "add" ->
+       if Peer_manager.add_added_node ctx.peer_manager node then begin
+         Lwt.async (fun () -> Peer_manager.force_add_peer ctx.peer_manager host port);
+         Ok `Null
+       end else
+         Error (rpc_client_node_already_added, "Error: Node already added")
      | "remove" ->
-       (match Peer_manager.find_peer_by_addr ctx.peer_manager host with
-        | Some peer ->
-          Lwt.async (fun () -> Peer_manager.remove_peer ctx.peer_manager peer.Peer.id);
-          Ok `Null
-        | None -> Ok `Null)
-     | _ -> Error ("Invalid command: " ^ command ^
+       if Peer_manager.remove_added_node ctx.peer_manager node then begin
+         (match Peer_manager.find_peer_by_addr ctx.peer_manager host with
+          | Some peer ->
+            Lwt.async (fun () -> Peer_manager.remove_peer ctx.peer_manager peer.Peer.id)
+          | None -> ());
+         Ok `Null
+       end else
+         Error (rpc_client_node_not_added,
+                "Error: Node could not be removed. It has not been added previously.")
+     | _ -> Error (rpc_invalid_params,
+                   "Invalid command: " ^ command ^
                    ". Expected \"onetry\", \"add\", or \"remove\""))
   | _ ->
-    Error "Invalid parameters: expected [\"node\", \"command\"]"
+    Error (rpc_invalid_params, "Invalid parameters: expected [\"node\", \"command\"]")
 
 (* ============================================================================
    AssumeUTXO Handlers (loadtxoutset / dumptxoutset)
@@ -11591,9 +11676,13 @@ let dispatch_rpc (ctx : rpc_context)
   | "getblockchaininfo" ->
     Ok (handle_getblockchaininfo ctx)
   | "getblockhash" ->
+    (* Core getblockhash: an out-of-range height throws RPC_INVALID_PARAMETER
+       (-8) "Block height out of range" (bitcoin-core/src/rpc/blockchain.cpp:591),
+       NOT the generic JSON-RPC transport code RPC_INVALID_PARAMS (-32602). The
+       handler already emits Core's exact message; route it to -8. *)
     (match handle_getblockhash ctx params with
      | Ok r -> Ok r
-     | Error msg -> Error (rpc_invalid_params, msg))
+     | Error msg -> Error (rpc_invalid_parameter, msg))
   | "getblock" ->
     (* Core ParseHashV on the blockhash arg -> malformed = -8 before lookup;
        a well-formed-but-absent hash stays the handler's "Block not found". *)
@@ -11698,15 +11787,17 @@ let dispatch_rpc (ctx : rpc_context)
   | "listbanned" ->
     Ok (handle_listbanned ctx)
   | "setban" ->
-    (match handle_setban ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_invalid_params, msg))
+    (* handle_setban returns Core-exact (code, message) pairs: -30
+       invalid-IP/subnet (RPC_CLIENT_INVALID_IP_OR_SUBNET) / -32602 param-shape.
+       Pass them through verbatim. *)
+    handle_setban ctx params
   | "clearbanned" ->
     Ok (handle_clearbanned ctx)
   | "disconnectnode" ->
-    (match handle_disconnectnode ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_misc_error, msg))
+    (* handle_disconnectnode returns Core-exact (code, message) pairs: -29
+       not-connected (RPC_CLIENT_NODE_NOT_CONNECTED) / -32602 param-shape.
+       Pass them through verbatim. *)
+    handle_disconnectnode ctx params
   | "getblockfrompeer" ->
     (* Core getblockfrompeer throws RPC_MISC_ERROR (-1) for every failure
        case (header missing / already downloaded / peer does not exist). *)
@@ -11714,9 +11805,10 @@ let dispatch_rpc (ctx : rpc_context)
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
   | "addnode" ->
-    (match handle_addnode ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_invalid_params, msg))
+    (* handle_addnode returns Core-exact (code, message) pairs:
+       -23 already-added / -24 not-added / -32602 bad-command|param-shape.
+       Pass them through verbatim. *)
+    handle_addnode ctx params
 
   (* Mempool *)
   | "getmempoolinfo" ->

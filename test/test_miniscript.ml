@@ -98,6 +98,47 @@ let test_type_after () =
     Alcotest.(check bool) "has f property" true (TypeProp.has t.props TypeProp.prop_f)
   | Error _ -> Alcotest.fail "type_check failed for Ms_after"
 
+(* BIP-65/BIP-68 + miniscript bound: older(n) / after(n) are valid only for
+   1 <= n < 2^31.  Bitcoin Core's miniscript parser rejects any value with
+   bit 31 set (`*num < 1 || *num >= 0x80000000L`,
+   bitcoin-core/src/script/miniscript.h:2027 [after] / :2034 [older]).
+   For older() bit 31 collides with the BIP-68 disable flag; for after() it
+   is outside the expressible absolute-locktime range.  The largest in-range
+   value (2^31 - 1) must type_check OK, while 2^31, max_int's-low-bit set,
+   and 0 must be rejected.  Mutation-proof: reverting compute_type's guard
+   to only `n <= 0` lets the 2^31 cases type_check OK and fails this test. *)
+let test_type_older_after_timelock_bound () =
+  let max_valid = (1 lsl 31) - 1 in       (* 2^31 - 1 = 2147483647 *)
+  let out_of_range = 1 lsl 31 in          (* 2^31     = 2147483648 *)
+  (* Largest in-range value must type_check for both fragments. *)
+  (match type_check P2WSH (Ms_older max_valid) with
+   | Ok _ -> ()
+   | Error _ -> Alcotest.fail "older(2^31 - 1) is in range and must type_check");
+  (match type_check P2WSH (Ms_after max_valid) with
+   | Ok _ -> ()
+   | Error _ -> Alcotest.fail "after(2^31 - 1) is in range and must type_check");
+  (* 2^31 has bit 31 set — Core rejects it; so must we. *)
+  (match type_check P2WSH (Ms_older out_of_range) with
+   | Error _ -> ()
+   | Ok _ -> Alcotest.fail "older(2^31) must be rejected (bit-31 set)");
+  (match type_check P2WSH (Ms_after out_of_range) with
+   | Error _ -> ()
+   | Ok _ -> Alcotest.fail "after(2^31) must be rejected (bit-31 set)");
+  (* A larger out-of-range value must also reject for both. *)
+  (match type_check P2WSH (Ms_older 0xFFFFFFFF) with
+   | Error _ -> ()
+   | Ok _ -> Alcotest.fail "older(0xFFFFFFFF) must be rejected");
+  (match type_check P2WSH (Ms_after 0xFFFFFFFF) with
+   | Error _ -> ()
+   | Ok _ -> Alcotest.fail "after(0xFFFFFFFF) must be rejected");
+  (* n = 0 (below the 1..2^31-1 range) must reject for both. *)
+  (match type_check P2WSH (Ms_older 0) with
+   | Error _ -> ()
+   | Ok _ -> Alcotest.fail "older(0) must be rejected (n < 1)");
+  (match type_check P2WSH (Ms_after 0) with
+   | Error _ -> ()
+   | Ok _ -> Alcotest.fail "after(0) must be rejected (n < 1)")
+
 let test_type_sha256 () =
   let node = Ms_sha256 test_hash32 in
   match type_check P2WSH node with
@@ -559,6 +600,7 @@ let type_tests = [
   "type pk_h", `Quick, test_type_pk_h;
   "type older", `Quick, test_type_older;
   "type after", `Quick, test_type_after;
+  "type older/after timelock bound", `Quick, test_type_older_after_timelock_bound;
   "type sha256", `Quick, test_type_sha256;
   "type and_v", `Quick, test_type_and_v;
   "type and_b", `Quick, test_type_and_b;

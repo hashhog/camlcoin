@@ -264,6 +264,14 @@ type t = {
   mutable feeler_in_flight : int;
   getaddr_recvd : (int, bool) Hashtbl.t;
   addr_token : (int, float * float) Hashtbl.t;
+  (* The addnode-managed list of persistent peer node strings, keyed by the
+     exact string the operator supplied. Mirrors Bitcoin Core's
+     [CConnman::m_added_node_params] (src/net.cpp): membership is what
+     addnode "add"/"remove" toggle, and the list's contents — not the live
+     connection state — decide whether a duplicate add (-> -23) or a stale
+     remove (-> -24) is an error. Distinct from [known_addrs] (which also
+     holds gossiped/seed addresses); only operator-pinned entries live here. *)
+  mutable added_nodes : string list;
 }
 
 (* Generate a 256-bit eclipse-protection bucket key from /dev/urandom.
@@ -317,6 +325,7 @@ let create ?(config = default_config) ?(asmap : bytes option = None) (network : 
     feeler_in_flight = 0;
     getaddr_recvd = Hashtbl.create 64;
     addr_token = Hashtbl.create 64;
+    added_nodes = [];
   }
 
 (* Pin the node to a fixed set of --connect peers (Bitcoin Core -connect).
@@ -3107,6 +3116,35 @@ let find_peer_by_addr (pm : t) (addr : string) : Peer.peer option =
 (* Find peer by id *)
 let find_peer_by_id (pm : t) (id : int) : Peer.peer option =
   List.find_opt (fun p -> p.Peer.id = id) pm.peers
+
+(* addnode "add" — record a node string on the addnode-managed list, the
+   camlcoin equivalent of [CConnman::AddNode] (bitcoin-core/src/net.cpp).
+   Returns [false] — and makes NO change — when the node is already on the
+   list, exactly as Core does (AddNode returns false on a string collision).
+   The RPC layer turns that [false] into RPC_CLIENT_NODE_ALREADY_ADDED (-23)
+   (src/rpc/net.cpp:362). Returns [true] when a fresh entry is recorded. *)
+let add_added_node (pm : t) (node : string) : bool =
+  if List.mem node pm.added_nodes then false
+  else begin
+    pm.added_nodes <- pm.added_nodes @ [node];
+    true
+  end
+
+(* addnode "remove" — drop a node string from the addnode-managed list, the
+   camlcoin equivalent of [CConnman::RemoveAddedNode] (src/net.cpp). Returns
+   [false] when the node was never added (Core returns false after scanning
+   the whole list), which the RPC layer turns into RPC_CLIENT_NODE_NOT_ADDED
+   (-24) (src/rpc/net.cpp:368). Returns [true] when an entry was erased. *)
+let remove_added_node (pm : t) (node : string) : bool =
+  if List.mem node pm.added_nodes then begin
+    pm.added_nodes <- List.filter (fun n -> n <> node) pm.added_nodes;
+    true
+  end else false
+
+(* Snapshot of the current addnode-managed node strings (for getaddednodeinfo
+   and tests). Mirrors reading [CConnman::m_added_node_params]. *)
+let added_nodes (pm : t) : string list =
+  pm.added_nodes
 
 (* Get list of all peer statistics *)
 let get_peer_stats (pm : t) : Peer.peer_stats list =

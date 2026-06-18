@@ -1488,6 +1488,23 @@ let request_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
   in
   send_getheaders_with_locator peer locator state.headers_synced
 
+(* Forward reference to [handle_getheaders_request] (defined far below).  The
+   header-sync loop must SERVE a peer's getheaders request while it is itself
+   blocked reading its own headers response: during initial header sync the
+   per-peer [peer_message_loop] that normally drives the getheaders responder
+   (via a Peer_manager listener) is NOT yet running — [enable_message_loops] is
+   deliberately deferred until header sync finishes because this loop reads the
+   socket directly and would otherwise race it.  Without serving here, two
+   freshly-started camlcoin nodes that header-sync from each other DEADLOCK:
+   each reads the other's getheaders request off the socket and discards it, so
+   neither ever answers and neither receives the competing chain (the P2P
+   header-exchange deadlock that left the reorg path unreachable).  Set once at
+   module init right after [handle_getheaders_request] is defined. *)
+let getheaders_responder_ref
+    : (chain_state -> Types.hash256 list -> Types.hash256
+       -> Types.block_header list) ref =
+  ref (fun _ _ _ -> [])
+
 (* Main header sync loop - requests headers repeatedly until caught up.
    Enforces headers_download_timeout (15 min total) and uses
    read_message_with_timeout for per-response timeout (2 min). *)
@@ -1507,6 +1524,14 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
 
   (* Helper: read one message, handling ping/pong and non-header messages.
      Returns `Some headers` for a HeadersMsg, or `None` on timeout. *)
+  (* Serve a peer's getheaders REQUEST inline while we are blocked reading our
+     own headers response (see getheaders_responder_ref above).  Breaks the
+     two-node header-sync deadlock so a competing chain is actually exchanged. *)
+  let serve_getheaders locator_hashes hash_stop =
+    let headers = !getheaders_responder_ref state locator_hashes hash_stop in
+    if headers <> [] then Peer.send_message peer (P2p.HeadersMsg headers)
+    else Lwt.return_unit
+  in
   let rec read_next_headers () =
     let* msg_opt = Peer.read_message_with_timeout peer headers_response_timeout in
     match msg_opt with
@@ -1514,6 +1539,9 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
     | Some (P2p.HeadersMsg headers) -> Lwt.return_some headers
     | Some (P2p.PingMsg nonce) ->
       let* () = Peer.send_message peer (P2p.PongMsg nonce) in
+      read_next_headers ()
+    | Some (P2p.GetheadersMsg { locator_hashes; hash_stop; _ }) ->
+      let* () = serve_getheaders locator_hashes hash_stop in
       read_next_headers ()
     | Some _msg ->
       read_next_headers ()
@@ -1528,6 +1556,9 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
     | Some (P2p.HeadersMsg headers) -> Lwt.return_some headers
     | Some (P2p.PingMsg nonce) ->
       let* () = Peer.send_message peer (P2p.PongMsg nonce) in
+      Lwt.return_none
+    | Some (P2p.GetheadersMsg { locator_hashes; hash_stop; _ }) ->
+      let* () = serve_getheaders locator_hashes hash_stop in
       Lwt.return_none
     | Some _msg ->
       Lwt.return_none
@@ -5901,6 +5932,12 @@ let handle_getheaders_request (state : chain_state)
     incr h
   done;
   List.rev !result
+
+(* Wire the header-sync loop's inline getheaders responder (see
+   getheaders_responder_ref / serve_getheaders above) now that
+   handle_getheaders_request is in scope.  Runs once at module init, before any
+   sync_headers call. *)
+let () = getheaders_responder_ref := handle_getheaders_request
 
 (* ============================================================================
    Mempool Request Handler

@@ -334,9 +334,27 @@ CAMLprim value caml_rocksdb_writebatch_write(value v_db, value v_wb) {
   if (!wb) caml_failwith("rocksdb_writebatch_write: batch is destroyed");
 
   rocksdb_writeoptions_t *wopts = rocksdb_writeoptions_create();
-  /* Disable WAL sync for batch writes during IBD — much faster,
-     acceptable because we flush periodically and can re-sync on crash. */
-  rocksdb_writeoptions_disable_WAL(wopts, 1);
+  /* WAL stays ENABLED (rocksdb default). The previous code disabled the WAL
+     here ("much faster ... can re-sync on crash"), but that premise was false:
+     there is NO periodic WAL/memtable flush, so the chain tip + UTXO deltas —
+     written ONLY through this batch path (storage.ml apply_block_atomic /
+     set_chain_tip) — were durable only on a clean rocksdb_close (graceful
+     SIGTERM). An unclean exit (SIGKILL/OOM/power loss) rewound the tip to the
+     last natural SST flush, so the node booted to genesis ("Chain state
+     initialized, headers at height 0") and re-IBD'd. With the WAL on, rocksdb
+     appends each batch to the WAL and replays it on Open, recovering the tip to
+     the crash height with no boot-path change — matching Core/leveldb, which
+     always WAL the coins + DB_BEST_BLOCK batch (dbwrapper.cpp:285, txdb.cpp:159).
+     WriteOptions.sync stays false (default): the WAL append is buffered, so this
+     survives process death (page cache) though not a hard power loss without an
+     fsync — matching Core's default (it syncs only on its periodic Flush). This
+     preserves the RDB-then-CF "RDB >= CF durable" ordering invariant
+     (apply_block_atomic) because BOTH stores commit through this same stub, so
+     they gain WAL durability in lockstep (a crash can only leave RDB ahead of
+     CF — the safe direction). NOTE: this adds a WAL append per batch; on a full
+     re-IBD the bulk 500-block UTXO flush (sync.ml ~2609) doubles its write
+     volume. A surgical `disable_wal` opt-out for ONLY the bulk-IBD flush (keeping
+     the connect path WAL-on) is the throughput follow-up if re-IBD regresses. */
   char *err = NULL;
 
   rocksdb_write(db, wopts, wb, &err);

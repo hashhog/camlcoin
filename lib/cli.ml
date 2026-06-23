@@ -53,6 +53,19 @@ type config = {
        opening, replay every stored block from height 0 forward to
        rebuild the UTXO set. Headers + block bodies + height->hash
        are retained. Mirrors Bitcoin Core's -reindex (init.cpp). *)
+  dbcache_lru_entries : int;
+    (* PERF/config only — NOT consensus. Number of entries in the
+       OptimizedUtxoSet in-memory LRU that fronts RocksDB during IBD
+       (lib/cli.ml OptimizedUtxoSet.create call). The LRU is a pure
+       cache over the authoritative RocksDB UTXO store: it changes IBD
+       read-amplification / throughput only, never any validation
+       result. Default 4_000_000 (~1 GB) preserves current behavior.
+       *** GC/RSS WARNING: raising this enlarges the live OCaml heap
+       and worsens major-GC / Gc.compact pause time. 8_000_000 was
+       previously tried and pushed RSS past 12 GB (see the cache-size
+       comment near the create call). Operator opt-in for IBD only;
+       keep at the default for steady-state on the loopback-pinned
+       mainnet node. *)
   rest_enabled : bool;
     (* Mirrors Bitcoin Core's -rest (init.cpp:153 DEFAULT_REST_ENABLE).
        When true, a public read-only REST HTTP listener is spawned in
@@ -178,6 +191,7 @@ let default_config : config = {
   peer_bloom_filters = false;  (* Mirrors Core DEFAULT_PEERBLOOMFILTERS *)
   zmq_pub_options = [];
   reindex = false;
+  dbcache_lru_entries = 4_000_000;  (* PERF: current hardcoded LRU budget (~1 GB). Default-preserving. *)
   rest_enabled = false;  (* Mirrors Core DEFAULT_REST_ENABLE = false *)
   rest_port = None;
   rest_bind = None;
@@ -777,8 +791,15 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
      Without this, every UTXO lookup during block validation is a disk read.
      Reduced from 8M: at 8M the dirty set + LRU + OCaml GC overhead pushed
      RSS to 12+ GB.  4M keeps RSS under control while still caching the
-     hot working set. *)
-  let optimized_utxo = Utxo.OptimizedUtxoSet.create ~cache_size:4_000_000 ~rocksdb db in
+     hot working set.
+     The budget is now operator-tunable via --dbcache / dbcache= (config
+     field [dbcache_lru_entries]); it defaults to 4_000_000 so absent the
+     flag behavior is unchanged. PERF only — see the field's GC/RSS
+     warning before raising it on the mainnet node. *)
+  let optimized_utxo =
+    Utxo.OptimizedUtxoSet.create
+      ~cache_size:config.dbcache_lru_entries ~rocksdb db
+  in
 
   (* -reindex post-open replay. With cf_chain_state cleared, restore
      above set blocks_synced = 0 (no tip on disk). Headers were

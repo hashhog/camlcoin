@@ -131,6 +131,20 @@ let metrics_port_arg =
   Arg.(value & opt int 9332 &
     info ["metricsport"] ~docv:"PORT" ~doc)
 
+let dbcache_arg =
+  (* PERF/config only — NOT consensus. Sizes the in-memory OptimizedUtxoSet
+     LRU (entries) that fronts RocksDB during IBD. *)
+  let doc = "UTXO LRU cache entries (default 4000000; PERF/IBD-opt-in only \
+             — raising it enlarges the heap & GC pauses; camlcoin is \
+             loopback-pinned). This is a pure read cache over the \
+             authoritative RocksDB UTXO store and changes IBD speed only, \
+             never any validation result. Omitting the flag keeps the \
+             4000000-entry (~1 GB) default. WARNING: 8000000 has been \
+             observed to push RSS past 12 GB; raise only for an IBD run, \
+             watch RSS, and return to the default for steady-state." in
+  Arg.(value & opt (some int) None &
+    info ["dbcache"] ~docv:"ENTRIES" ~doc)
+
 let peer_bloom_filters_arg =
   let doc = "Advertise NODE_BLOOM (BIP-35 / BIP-111) and serve MEMPOOL \
              requests + bloom-filter setup messages. Defaults to false to \
@@ -439,7 +453,7 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     rest_enabled rest_port rest_bind blockfilterindex asmap
     proxy onion_proxy i2psam i2p_private_key cjdnsreachable
     rpc_tls_cert rpc_tls_key rest_tls_cert rest_tls_key
-    coinstatsindex_cli txindex_cli txospenderindex_cli =
+    coinstatsindex_cli txindex_cli txospenderindex_cli dbcache_cli =
   (* --txindex is accepted for Core CLI compatibility (camlcoin always
      maintains the tx index); validate its value but otherwise ignore it. *)
   ignore txindex_cli;
@@ -756,6 +770,24 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
         reindex
         || (match Camlcoin.Runtime_config.get_bool conf_opts "reindex" with
             | Some b -> b | None -> false);
+      (* PERF/config: UTXO LRU entry budget. CLI > conf > base default
+         (base.dbcache_lru_entries = 4_000_000, default-preserving). A
+         non-positive value is rejected so a typo can't silently disable
+         the cache or crash Perf.LRU. *)
+      dbcache_lru_entries =
+        (let resolved =
+           Camlcoin.Runtime_config.overlay_int
+             ~cli:dbcache_cli
+             ~conf:(Camlcoin.Runtime_config.get_int conf_opts "dbcache")
+             ~default:base.dbcache_lru_entries
+         in
+         if resolved <= 0 then begin
+           Printf.eprintf
+             "[camlcoin] Invalid --dbcache value: %d (must be a positive number of entries)\n%!"
+             resolved;
+           exit 1
+         end;
+         resolved);
       rest_enabled =
         rest_enabled
         || (match Camlcoin.Runtime_config.get_bool conf_opts "rest" with
@@ -1001,7 +1033,8 @@ let cmd =
     $ rest_tls_key_arg
     $ coinstatsindex_arg
     $ txindex_arg
-    $ txospenderindex_arg)
+    $ txospenderindex_arg
+    $ dbcache_arg)
 
 (* ============================================================================
    Entry Point

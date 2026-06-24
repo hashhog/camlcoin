@@ -10230,6 +10230,7 @@ let handle_help (_ctx : rpc_context)
       "";
       "== Control ==";
       "help ( \"command\" )";
+      "logging ( [\"include_category\",...] [\"exclude_category\",...] )";
       "stop";
       "uptime";
       "";
@@ -11852,6 +11853,119 @@ let handle_getmemoryinfo (_ctx : rpc_context)
     Error (rpc_invalid_parameter, Printf.sprintf "unknown mode %s" other)
 
 (* ============================================================================
+   logging — Core rpc/node.cpp:200-275 + logging.cpp
+   ============================================================================
+
+   Gets and (optionally) sets the debug-logging category configuration.
+
+   SHAPE / param-semantics (Core-faithful — node.cpp:200-273):
+     params[0] = include : ARR of category strings to ENABLE.
+     params[1] = exclude : ARR of category strings to DISABLE.
+   Each param is acted on ONLY when it is an array (Core's `isArray()` guard,
+   node.cpp:253/256); a null/omitted/missing slot is a no-op, so `logging`
+   with no args is a pure read-and-report. include is applied FIRST, then
+   exclude, so a category named in both ends up DISABLED ("exclude wins",
+   node.cpp:224-225).
+
+   Special input-only tokens (never emitted as output keys): "all" / "1"
+   expand to the whole mask; in the exclude slot "all"/"1" (and ""/"none"/"0")
+   clear it. These mirror Core's EnableCategory("all") / the "none" effect.
+
+   Returns: a JSON OBJECT mapping every REAL category name -> bool (whether it
+   is currently being debug logged), in ascending alphabetical key order (Core
+   iterates a std::map; alphabetical is byte-stable). The category NAMES are
+   camlcoin's own `Logs.Src` names (PEER/NET/MEMPOOL/...) — the task permits
+   the names to differ per node; only the SHAPE, param-semantics and the -8
+   error must match Core.
+
+   Errors:
+     - Unknown category in either array -> RPC_INVALID_PARAMETER (-8),
+       message EXACTLY "unknown logging category <cat>" (node.cpp:213).
+       Thrown as soon as the bad name is hit: include is scanned fully first,
+       then exclude, in order; any valid categories BEFORE the bad one in the
+       same call have ALREADY been applied (partial application, no rollback —
+       Core EnableOrDisableLogCategories parity, node.cpp:200-216).
+     - Non-string array element -> RPC_TYPE_ERROR (-3), Core's `get_str()`
+       type error.
+
+   Live effect: this mutates the running node's real `Logs.Src` levels via
+   Runtime_config.{enable,disable}_category, so enabling a category here makes
+   its `Log.debug` records start flowing with no restart — exactly like Core's
+   in-memory m_categories mutation, and with no snapshot to go stale. NOT
+   persisted: resets on restart to the `-debug` startup flags. *)
+let handle_logging (_ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  (* Core's special input-only tokens. "all"/"1" -> whole mask. In the exclude
+     slot, ""/"none"/"0" additionally clear it (DisableCategory("all"/...)). *)
+  let is_all_token c = (c = "all" || c = "1") in
+  let is_none_token c = (c = "none" || c = "0" || c = "") in
+  (* Apply one include/exclude array. enable=true for include, false for
+     exclude. Acts ONLY on a JSON array (Core isArray() guard); any other
+     value (null/omitted/number/...) is a no-op for that slot.
+     Returns Ok () or the first Core-exact error encountered (after applying
+     every valid element before it — partial application, no rollback). *)
+  let apply (slot : Yojson.Safe.t option) (enable : bool)
+      : (unit, int * string) result =
+    match slot with
+    | Some (`List items) ->
+      let rec go = function
+        | [] -> Ok ()
+        | (`String cat) :: rest ->
+          if is_all_token cat then begin
+            (if enable then Runtime_config.enable_all_categories ()
+             else Runtime_config.disable_all_categories ());
+            go rest
+          end else if is_none_token cat then begin
+            (* "" / "none" / "0": Core's DisableCategory clears the whole mask;
+               EnableCategory("") would not match a real category, but Core
+               treats "" as the all-token in EnableCategory too. Mirror that:
+               on include do nothing harmful (no real category named these),
+               on exclude clear all. To stay strictly Core-faithful we clear
+               on exclude and treat as the all-mask on include. *)
+            (if enable then Runtime_config.enable_all_categories ()
+             else Runtime_config.disable_all_categories ());
+            go rest
+          end else begin
+            let ok =
+              if enable then Runtime_config.enable_category cat
+              else Runtime_config.disable_category cat
+            in
+            if ok then go rest
+            else
+              (* Core node.cpp:213 — EnableCategory/DisableCategory returned
+                 false for an unknown name. Elements before this one have
+                 already been applied (partial application). *)
+              Error (rpc_invalid_parameter,
+                     "unknown logging category " ^ cat)
+          end
+        | bad :: _ ->
+          (* Core get_str() type error on a non-string element. *)
+          Error (rpc_type_error,
+                 Printf.sprintf
+                   "JSON value of type %s is not of expected type string"
+                   (core_uvtype bad))
+      in
+      go items
+    | _ -> Ok ()  (* not an array -> no-op slot (Core isArray() guard) *)
+  in
+  (* Core order: include (params[0]) THEN exclude (params[1]); exclude wins. *)
+  let include_slot = match params with x :: _ -> Some x | [] -> None in
+  let exclude_slot = match params with _ :: x :: _ -> Some x | _ -> None in
+  let build_result () : Yojson.Safe.t =
+    (* Full {category: active} map, alphabetical, built fresh from live
+       Logs.Src levels (no cache). *)
+    `Assoc (List.map
+              (fun (name, active) -> (name, `Bool active))
+              (Runtime_config.logging_status_map ()))
+  in
+  match apply include_slot true with
+  | Error e -> Error e
+  | Ok () ->
+    (match apply exclude_slot false with
+     | Error e -> Error e
+     | Ok () -> Ok (build_result ()))
+
+(* ============================================================================
    gettxspendingprevout — Core rpc/mempool.cpp:897-1041
    ============================================================================
 
@@ -12582,6 +12696,11 @@ let dispatch_rpc (ctx : rpc_context)
      | Error msg -> Error (rpc_misc_error, msg))
   | "getrpcinfo" ->
     Ok (handle_getrpcinfo ctx)
+  | "logging" ->
+    (* handle_logging returns Core-exact (code, message) pairs: -8 unknown
+       logging category <cat> (after partial application of valid names) and
+       -3 non-string array element. Pass them through verbatim. *)
+    handle_logging ctx params
 
   (* FIX-65 — BIP-78 PayJoin receiver (closes W119 G1, G21, G23). *)
   | "payjoinreceive" ->

@@ -10046,6 +10046,7 @@ let handle_help (_ctx : rpc_context)
       "reconsiderblock \"blockhash\"";
       "";
       "== Util ==";
+      "getmemoryinfo ( \"mode\" )";
       "estimatesmartfee conf_target";
       "estimaterawfee conf_target ( threshold )";
       "signmessage \"address\" \"message\"";
@@ -11587,6 +11588,110 @@ let handle_getaddrmaninfo (ctx : rpc_context) : Yojson.Safe.t =
   in
   `Assoc (per_network @ [ all_networks ])
 
+(* ----- getmemoryinfo — secure locked-memory-pool stats (Core node.cpp) ----- *)
+
+(* getmemoryinfo
+   Faithful port of Bitcoin Core src/rpc/node.cpp getmemoryinfo (:145-198) +
+   RPCLockedMemoryInfo (:113-124) + RPCMallocInfo (:126-143).
+
+   IMPORTANT SEMANTICS: this RPC reports Core's SECURE LOCKED-MEMORY POOL
+   (LockedPoolManager — the mlock()-backed allocator that keeps sensitive data
+   such as wallet private keys OFF swap), NOT general process/heap memory and
+   NOT the transaction "memory pool" (mempool). Core's help text explicitly
+   warns against the "pool" confusion.
+
+   Param:
+     mode (STR, OPTIONAL, default "stats") — what kind of information is
+     returned. Core reads it as Arg<std::string_view> (a non-string value is a
+     JSON type error BEFORE any handler logic). Accepted values:
+       - "stats"      : general statistics about memory usage in the daemon.
+       - "mallocinfo" : an XML string describing low-level heap state (Core:
+                        only when built with glibc / HAVE_MALLOC_INFO).
+
+   Returns (mode-dependent type, matching Core exactly):
+     - mode == "stats" (default) -> OBJECT
+         { "locked": { "used": int, "free": int, "total": int,
+                       "locked": int, "chunks_used": int, "chunks_free": int } }
+       All six inner values are non-negative integers (Core size_t), in this
+       exact pushKV order (RPCLockedMemoryInfo node.cpp:113-124). camlcoin is a
+       from-scratch OCaml port with NO Core-style mlock()-backed secure pool
+       (no LockedPool / sodium_mlock / VirtualLock exists in the codebase —
+       verified by grep), so the honest answer is all zeros. The keys/structure
+       are ALWAYS present and identical to Core: a node with an empty/absent
+       locked pool legitimately reports zeros (shape-match parity holds). We do
+       NOT fabricate nonzero values.
+
+     - mode == "mallocinfo" -> Core returns a glibc malloc_info(3) XML string
+       ONLY when built with glibc (HAVE_MALLOC_INFO); on every other build it
+       throws -8 "mallocinfo mode not available". OCaml has no glibc
+       malloc_info equivalent we expose, so we faithfully take Core's non-glibc
+       path: the exact -8 error (we do NOT fabricate a stub XML string Core
+       never emits).
+
+   Errors (Core node.cpp:189-195):
+     - mode == "mallocinfo" (non-glibc path) -> RPC_INVALID_PARAMETER (-8),
+       "mallocinfo mode not available".
+     - any other string mode -> RPC_INVALID_PARAMETER (-8), "unknown mode <mode>"
+       (Core tfm::format("unknown mode %s", mode)).
+     - non-string mode -> RPC_TYPE_ERROR (-3), "JSON value of type <type> is not
+       of expected type string" (Core util.cpp:907 / Arg<std::string_view>),
+       checked BEFORE any handler logic.
+
+   Pure read-only introspection of the daemon's own memory accounting: no side
+   effects, no chain/mempool/peer locks. Safe at any lifecycle stage. *)
+
+(* Core uvTypeName (univalue.cpp:217-226): the wire type name used in
+   "JSON value of type <type> is not of expected type ..." messages. *)
+let core_uvtype (v : Yojson.Safe.t) : string =
+  match v with
+  | `Null -> "null"
+  | `Bool _ -> "bool"
+  | `Assoc _ -> "object"
+  | `List _ -> "array"
+  | `String _ -> "string"
+  | `Int _ | `Intlit _ | `Float _ -> "number"
+
+let handle_getmemoryinfo (_ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  (* mode is read by Core as Arg<std::string_view> — a present-but-non-string
+     value is a JSON type error (-3) BEFORE any handler logic runs. An omitted
+     mode defaults to "stats". *)
+  let mode_r =
+    match params with
+    | [] -> Ok "stats"
+    | (`String s) :: _ -> Ok s
+    | bad :: _ ->
+      Error (rpc_type_error,
+        Printf.sprintf
+          "JSON value of type %s is not of expected type string"
+          (core_uvtype bad))
+  in
+  match mode_r with
+  | Error e -> Error e
+  | Ok "stats" ->
+    (* Core RPCLockedMemoryInfo() reads LockedPoolManager::Instance().stats()
+       and emits the six counters under "locked" in this exact order. camlcoin
+       has no mlock'd secure allocator, so every counter is an honest 0. *)
+    Ok (`Assoc [
+      ("locked", `Assoc [
+        ("used", `Int 0);
+        ("free", `Int 0);
+        ("total", `Int 0);
+        ("locked", `Int 0);
+        ("chunks_used", `Int 0);
+        ("chunks_free", `Int 0);
+      ])
+    ])
+  | Ok "mallocinfo" ->
+    (* Core returns glibc malloc_info(3) XML ONLY when built with glibc
+       (HAVE_MALLOC_INFO); otherwise it raises -8 "mallocinfo mode not
+       available". We take Core's non-glibc path rather than fabricate a stub
+       XML string Core never emits. *)
+    Error (rpc_invalid_parameter, "mallocinfo mode not available")
+  | Ok other ->
+    (* Core: RPC_INVALID_PARAMETER (-8) tfm::format("unknown mode %s", mode). *)
+    Error (rpc_invalid_parameter, Printf.sprintf "unknown mode %s" other)
+
 (* ============================================================================
    gettxspendingprevout — Core rpc/mempool.cpp:897-1041
    ============================================================================
@@ -11931,6 +12036,11 @@ let dispatch_rpc (ctx : rpc_context)
     Ok (handle_getnetworkinfo ctx)
   | "getaddrmaninfo" ->
     Ok (handle_getaddrmaninfo ctx)
+  | "getmemoryinfo" ->
+    (* handle_getmemoryinfo returns Core-exact (code, message) pairs: -8
+       mallocinfo-unavailable / -8 unknown-mode / -3 non-string mode. Pass
+       through verbatim. mode defaults to "stats" -> {locked:{6 int keys}}. *)
+    handle_getmemoryinfo ctx params
   | "listbanned" ->
     Ok (handle_listbanned ctx)
   | "setban" ->

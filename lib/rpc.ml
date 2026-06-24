@@ -47,6 +47,8 @@ let rpc_client_node_already_added = -23  (* addnode "add" of an already-added no
 let rpc_client_node_not_added = -24      (* addnode "remove" of a node not added *)
 let rpc_client_node_not_connected = -29  (* disconnectnode for a non-connected peer *)
 let rpc_client_invalid_ip_or_subnet = -30 (* setban with an invalid IP/subnet *)
+let rpc_client_p2p_disabled = -31        (* No valid connection manager instance found
+                                            (Core protocol.h:64 RPC_CLIENT_P2P_DISABLED) *)
 
 (* ParseHashV — Core's rpc/util.cpp:117 boundary check for a txid/blockhash
    string argument.  A txid/blockhash must be exactly 64 hex characters
@@ -1586,7 +1588,11 @@ let handle_getnetworkinfo (ctx : rpc_context) : Yojson.Safe.t =
     ("localservicesnames", localservicesnames);
     ("localrelay", `Bool true);
     ("timeoffset", `Int 0);
-    ("networkactive", `Bool true);
+    (* networkactive mirrors the node-global P2P-active flag toggled by the
+       setnetworkactive RPC (Core net.cpp:709 reads connman->GetNetworkActive).
+       Defaults true; set false suppresses NEW connection establishment only. *)
+    ("networkactive",
+       `Bool (Peer_manager.get_network_active ctx.peer_manager));
     ("connections", `Int (Peer_manager.peer_count ctx.peer_manager));
     ("connections_in", `Int 0);
     ("connections_out", `Int (Peer_manager.peer_count ctx.peer_manager));
@@ -8093,6 +8099,42 @@ let handle_disconnectnode (ctx : rpc_context)
   | _ ->
     Error (rpc_invalid_params, "Invalid parameters: expected [address] or [node_id]")
 
+(* setnetworkactive — disable/enable all P2P network activity.
+   Reference: Bitcoin Core rpc/net.cpp setnetworkactive (RPCHelpMan :889;
+   logic CConnman::SetNetworkActive net.cpp:3361, GetNetworkActive net.h:1164).
+
+   Param: one positional [state] (BOOL, REQUIRED, RPCArg::Optional::NO).
+     true  -> enable networking
+     false -> disable networking
+   Core reads request.params[0].get_bool().  A missing arg is a parameter
+   error (-8 RPC_INVALID_PARAMETER); a non-bool is a type error (-3
+   RPC_TYPE_ERROR).  We reject `Int / `Float / `String etc. explicitly to
+   match get_bool()'s strictness (Core's UniValue::get_bool throws on any
+   non-VBOOL).
+
+   Returns a bare JSON boolean — the value read back from the peer manager
+   after the toggle (Core returns connman.GetNetworkActive(), which absent a
+   race equals [state]).  Setting false suppresses NEW connection
+   establishment only — existing peers are NOT disconnected.  The networkactive
+   field of getnetworkinfo mirrors this flag.
+
+   EnsureConnman parity (server_util.cpp:100): a missing connection manager is
+   RPC_CLIENT_P2P_DISABLED (-31), NOT an empty success.  camlcoin always
+   carries a peer_manager in the rpc_context, so this path is not reachable in
+   practice, but the contract is preserved for faithfulness. *)
+let handle_setnetworkactive (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  match params with
+  | [] ->
+    Error (rpc_invalid_parameter, "Missing required argument: state")
+  | [`Bool state] ->
+    (* SetNetworkActive then return the read-back value (Core net.cpp:904-906). *)
+    Ok (`Bool (Peer_manager.set_network_active ctx.peer_manager state))
+  | [_] ->
+    Error (rpc_type_error, "JSON value is not of expected type bool")
+  | _ ->
+    Error (rpc_invalid_params, "setnetworkactive ( state )")
+
 (* getblockfrompeer - Attempt to fetch a block from a given peer.
    Mirrors Bitcoin Core rpc/blockchain.cpp:getblockfrompeer + net_processing.cpp
    PeerManagerImpl::FetchBlock. Args: (blockhash hex, peer_id int). Returns an
@@ -11806,6 +11848,10 @@ let dispatch_rpc (ctx : rpc_context)
        not-connected (RPC_CLIENT_NODE_NOT_CONNECTED) / -32602 param-shape.
        Pass them through verbatim. *)
     handle_disconnectnode ctx params
+  | "setnetworkactive" ->
+    (* handle_setnetworkactive returns Core-exact (code, message) pairs: -8
+       missing arg / -3 non-bool / -31 connman-disabled. Pass through verbatim. *)
+    handle_setnetworkactive ctx params
   | "getblockfrompeer" ->
     (* Core getblockfrompeer throws RPC_MISC_ERROR (-1) for every failure
        case (header missing / already downloaded / peer does not exist). *)

@@ -272,6 +272,19 @@ type t = {
      remove (-> -24) is an error. Distinct from [known_addrs] (which also
      holds gossiped/seed addresses); only operator-pinned entries live here. *)
   mutable added_nodes : string list;
+  (* Node-global "P2P network active" flag (Core CConnman.fNetworkActive,
+     net.h:1592 default true / SetNetworkActive net.cpp:3361).  Toggled by the
+     [setnetworkactive] RPC and surfaced read-only as [networkactive] in
+     getnetworkinfo (net.cpp:709).  When false we suppress NEW connection
+     establishment ONLY — existing peers are NOT force-dropped (Core's
+     contract): (a) inbound accepts are refused (net.cpp:1786,
+     [accept_inbound]); (b) the outbound auto-dial refill AND the pinned
+     --connect re-dial loop are skipped (net.cpp:2351/3022/3219,
+     [maintain_connections]); (c) DNS / fixed-seed re-seeding and the feeler
+     probe are held off ([maybe_add_fixed_seeds] / [maybe_open_feeler]).
+     Health / dead-peer / stale-tip / eviction sweeps keep running.  Not
+     persisted; resets to enabled on restart. *)
+  mutable network_active : bool;
 }
 
 (* Generate a 256-bit eclipse-protection bucket key from /dev/urandom.
@@ -326,6 +339,7 @@ let create ?(config = default_config) ?(asmap : bytes option = None) (network : 
     getaddr_recvd = Hashtbl.create 64;
     addr_token = Hashtbl.create 64;
     added_nodes = [];
+    network_active = true;
   }
 
 (* Pin the node to a fixed set of --connect peers (Bitcoin Core -connect).
@@ -338,6 +352,30 @@ let set_connect_peers (pm : t) (peers : (string * int) list) : unit =
 (* True when the node is pinned to a fixed --connect peer set. *)
 let connect_only (pm : t) : bool =
   pm.connect_peers <> []
+
+(* Read the node-global P2P-active flag (Core CConnman::GetNetworkActive,
+   net.h:1164).  Surfaced read-only as [networkactive] in getnetworkinfo. *)
+let get_network_active (pm : t) : bool =
+  pm.network_active
+
+(* Enable/disable all NEW P2P network activity (Core
+   CConnman::SetNetworkActive, net.cpp:3361).  Idempotent: when the flag
+   already equals [state] this logs and early-returns the current value, no
+   notification (Core's fNetworkActive == active early-return).  Otherwise it
+   flips the flag.  Does NOT disconnect existing/established peers — only
+   suppresses establishing NEW connections (inbound accept, outbound auto-dial
+   refill, --connect re-dial, DNS / fixed-seed re-seed, feeler).  Returns the
+   read-back value (Core returns GetNetworkActive(), which absent a race equals
+   [state]).  Not persisted; resets to enabled on restart. *)
+let set_network_active (pm : t) (state : bool) : bool =
+  if pm.network_active = state then begin
+    Log.info (fun m -> m "SetNetworkActive: %b (unchanged)" state);
+    pm.network_active
+  end else begin
+    pm.network_active <- state;
+    Log.info (fun m -> m "SetNetworkActive: %b" state);
+    pm.network_active
+  end
 
 (* Set the mempool reference for feefilter (BIP-133) *)
 let set_mempool (pm : t) (mp : Mempool.mempool) : unit =
@@ -1677,8 +1715,12 @@ let take_addr_tokens (pm : t) (peer_id : int) (requested : int) : int =
 let maybe_open_feeler (pm : t) : unit Lwt.t =
   let open Lwt.Syntax in
   let now = Unix.gettimeofday () in
+  (* Network-active gate (Core net.cpp:3219 — the feeler branch checks
+     fNetworkActive too): a feeler is a NEW outbound establishment, so hold it
+     off while networking is disabled. *)
+  if not pm.network_active then Lwt.return_unit
   (* --connect pinning: no addrman-driven outbound, so no feeler. *)
-  if connect_only pm then Lwt.return_unit
+  else if connect_only pm then Lwt.return_unit
   (* Bound: at most MAX_FEELER_CONNECTIONS in flight. *)
   else if pm.feeler_in_flight >= max_feeler_connections then Lwt.return_unit
   (* Gate: at most one feeler per FEELER_INTERVAL. *)
@@ -2634,6 +2676,13 @@ let maintain_connections (pm : t) : unit Lwt.t =
     else begin
       Lwt.catch (fun () ->
         let connect_mode = connect_only pm in
+        (* Network-active gate (Core net.cpp:2351/3022/3219): while networking
+           is disabled (`setnetworkactive false`) the outbound connect loop
+           holds off establishing ANY new connection — the pinned --connect
+           re-dial AND the addrman auto-outbound / block-relay refill AND the
+           fixed-seed re-seed alike.  Existing peers stay up: the ping / dead-
+           peer / behind-tip-eviction / stale-tip sweeps below run
+           unconditionally.  Only NEW establishment is suppressed. *)
         (* Outbound slot maintenance.
            --connect mode (Core -connect / clearbit peer.zig:7050): do NOT
            auto-fill from addrman and do NOT open block-relay-only peers —
@@ -2643,7 +2692,8 @@ let maintain_connections (pm : t) : unit Lwt.t =
            maintainManualConnections). [add_peer] no-ops if already
            connected or if max_outbound is reached. *)
         let* () =
-          if connect_mode then begin
+          if not pm.network_active then Lwt.return_unit
+          else if connect_mode then begin
             Lwt_list.iter_s (fun (addr, port) ->
               if List.exists (fun p ->
                    p.Peer.addr = addr && p.Peer.port = port) pm.peers
@@ -2761,6 +2811,18 @@ let accept_inbound (pm : t) (client_fd : Lwt_unix.file_descr)
   let addr_str, port = match client_addr with
     | Unix.ADDR_INET (ip, p) -> (Unix.string_of_inet_addr ip, p)
     | Unix.ADDR_UNIX s -> (s, 0) in
+  (* Network-active gate (Core net.cpp:1786): while networking is disabled
+     (`setnetworkactive false`) refuse NEW inbound connections.  Existing peers
+     are untouched — only new establishment is suppressed.  Checked FIRST so we
+     drop the socket before any eviction / handshake work. *)
+  if not pm.network_active then begin
+    Log.debug (fun m ->
+      m "connection from %s:%d dropped: not accepting new connections"
+        addr_str port);
+    Lwt.catch
+      (fun () -> Lwt_unix.close client_fd)
+      (fun _ -> Lwt.return_unit)
+  end else
   (* Check inbound limits - try eviction before rejecting *)
   let* () =
     if inbound_peer_count pm >= pm.config.max_inbound then

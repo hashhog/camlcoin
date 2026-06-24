@@ -8254,6 +8254,114 @@ let handle_addnode (ctx : rpc_context)
   | _ ->
     Error (rpc_invalid_params, "Invalid parameters: expected [\"node\", \"command\"]")
 
+(* getaddednodeinfo — information about the persistent added-node list.
+
+   Reference: Bitcoin Core rpc/net.cpp getaddednodeinfo (RPCHelpMan :486;
+   lambda :517-556) + CConnman::GetAddedNodeInfo (net.cpp:2914).  Mirrors
+   Core's exact shape:
+
+     [
+       {
+         "addednode": <str>,             (* node as provided to addnode *)
+         "connected": <bool>,            (* a current peer matches *)
+         "addresses": [                  (* ALWAYS present; [] when not connected *)
+           { "address": <str ip:port>,
+             "connected": "inbound" | "outbound" }   (* at most ONE entry *)
+         ]
+       },
+       ...
+     ]
+
+   Param: optional positional [node] (STR).  If provided, return only the
+   single matching added node; matching is EXACT STRING equality against the
+   value originally passed to [addnode] (Core: m_params.m_added_node == node,
+   net.cpp:527), NOT a resolved-address comparison.  A requested node NOT on
+   the persistent added list -> RPC_CLIENT_NODE_NOT_ADDED (-24), message
+   exactly "Error: Node has not been added." (net.cpp:534).  When [node] is
+   omitted, all added nodes are returned ([] when none — onetry adds are never
+   listed, Core parity: OpenNetworkConnection never touches m_added_node_params).
+
+   The persistent added-node list is [Peer_manager.added_nodes] (camlcoin's
+   m_added_node_params equivalent — the raw strings recorded by `addnode <x>
+   add`, minus `remove`d ones; `onetry` never enters it — see handle_addnode).
+   "connected"/direction is decided by joining each added entry against the
+   LIVE peer table: parse the added string into (host, port) the same way
+   handle_addnode does (default port when the entry has none), then look for a
+   connected peer with that exact (addr, port).  The reported inner "address"
+   is the peer's "host:port" — the same format getpeerinfo's "addr" uses
+   (rpc.ml:1508, Core CService::ToStringAddrPort).  The bare direction string
+   is "inbound" / "outbound" per net.cpp:548 (NOT "manual"/"feeler").  Output
+   order is the added-list insertion order (Peer_manager.added_nodes preserves
+   append order).  Pure read — no side effects.
+
+   Returns a plain Yojson value: the optional-[node] miss is the only error,
+   and it carries a Core-exact (code, message) pair routed at the dispatch arm
+   (-24).  The param-shape case keeps the generic RPC_INVALID_PARAMS code. *)
+let handle_getaddednodeinfo (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  (* Parse an added-node string into (host, port), mirroring handle_addnode:
+     a trailing ":<port>" is split off when it parses as an int, otherwise the
+     default port is appended.  Used to join an entry against the peer table. *)
+  let host_port_of (node : string) : string * int =
+    match String.rindex_opt node ':' with
+    | Some idx ->
+      let h = String.sub node 0 idx in
+      let p_str = String.sub node (idx + 1) (String.length node - idx - 1) in
+      (match int_of_string_opt p_str with
+       | Some p -> (h, p)
+       | None -> (node, ctx.network.Consensus.default_port))
+    | None -> (node, ctx.network.Consensus.default_port)
+  in
+  (* Build one result object for an added-node string by joining it to the
+     live peer table.  Connected -> one address entry with the bare
+     inbound/outbound direction; not connected -> empty addresses array. *)
+  let entry_of (node : string) : Yojson.Safe.t =
+    let (host, port) = host_port_of node in
+    let connected_peer =
+      List.find_opt
+        (fun p -> p.Peer.addr = host && p.Peer.port = port)
+        (Peer_manager.get_peers ctx.peer_manager)
+    in
+    let is_connected, addresses =
+      match connected_peer with
+      | Some peer ->
+        let direction =
+          match peer.Peer.direction with
+          | Peer.Inbound -> "inbound"
+          | Peer.Outbound -> "outbound"
+        in
+        (true,
+         [ `Assoc [
+             ("address", `String (Printf.sprintf "%s:%d"
+                                     peer.Peer.addr peer.Peer.port));
+             ("connected", `String direction);
+           ] ])
+      | None -> (false, [])
+    in
+    `Assoc [
+      ("addednode", `String node);
+      ("connected", `Bool is_connected);
+      ("addresses", `List addresses);
+    ]
+  in
+  let added = Peer_manager.added_nodes ctx.peer_manager in
+  match params with
+  | [] ->
+    (* No filter: all added nodes, insertion order ([] when none). *)
+    Ok (`List (List.map entry_of added))
+  | [`String node] ->
+    (* Optional [node] filter: exact-string match against the added list.
+       Miss -> -24 "Error: Node has not been added." (Core net.cpp:533-535). *)
+    if List.mem node added then
+      Ok (`List [ entry_of node ])
+    else
+      Error (rpc_client_node_not_added, "Error: Node has not been added.")
+  | [_] ->
+    (* Core ParseString-style: a non-string [node] is a type error. *)
+    Error (rpc_type_error, "JSON value is not of expected type string")
+  | _ ->
+    Error (rpc_invalid_params, "getaddednodeinfo ( \"node\" )")
+
 (* ============================================================================
    AssumeUTXO Handlers (loadtxoutset / dumptxoutset)
    ============================================================================ *)
@@ -10007,6 +10115,7 @@ let handle_help (_ctx : rpc_context)
       "addpeeraddress \"address\" port ( tried )";
       "clearbanned";
       "disconnectnode \"address\"";
+      "getaddednodeinfo ( \"node\" )";
       "getaddrmaninfo";
       "getblockfrompeer \"blockhash\" peer_id";
       "getconnectioncount";
@@ -12070,6 +12179,12 @@ let dispatch_rpc (ctx : rpc_context)
        -23 already-added / -24 not-added / -32602 bad-command|param-shape.
        Pass them through verbatim. *)
     handle_addnode ctx params
+  | "getaddednodeinfo" ->
+    (* handle_getaddednodeinfo returns Core-exact (code, message) pairs:
+       -24 (RPC_CLIENT_NODE_NOT_ADDED) "Error: Node has not been added." for a
+       requested-but-not-added node / -3 non-string node / -32602 param-shape.
+       Pass them through verbatim. No arg -> [] (no added nodes). *)
+    handle_getaddednodeinfo ctx params
 
   (* Mempool *)
   | "getmempoolinfo" ->

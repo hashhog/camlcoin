@@ -8135,6 +8135,55 @@ let handle_setnetworkactive (ctx : rpc_context)
   | _ ->
     Error (rpc_invalid_params, "setnetworkactive ( state )")
 
+(* ping — request that a P2P ping be sent to every connected peer.
+   Reference: Bitcoin Core rpc/net.cpp ping (RPCHelpMan :84-107) →
+   PeerManager::SendPings (net_processing.cpp).
+
+   Params: NONE. Any positional argument is an arity error
+   (rpc_invalid_params), never a silent accept.
+
+   Behaviour: side-effect-only control method. Iterates every connected
+   (Ready) peer and triggers camlcoin's BIP-31 PING-send primitive
+   [Peer.send_ping] (a fresh nonce, recorded in [peer.ping_nonce] /
+   [peer.last_ping]). It does NOT measure latency synchronously and does NOT
+   wait for the PONGs — fire-and-forget, mirroring Core which only QUEUES the
+   ping per peer ([m_ping_queued]) and emits it on the next message pass. The
+   round-trip results surface LATER via getpeerinfo's [pingtime] / [minping]
+   fields once the matching PONG lands ([Peer.handle_pong] sets [peer.latency]).
+   With zero peers it is a successful no-op (the per-peer loop is empty).
+   Returns JSON null immediately (Core UniValue::VNULL).
+
+   The send is scheduled with [Lwt.async] (the same fire-and-forget pattern
+   disconnectnode uses for [remove_peer]) so the RPC returns null without
+   blocking on the socket writes; the dispatch path is synchronous. A per-peer
+   send failure must not fail the whole RPC (Core loops over the peer map and
+   returns regardless), so each send is wrapped in an exception-swallowing
+   catch. We target the SAME Ready peer set whose round-trip stats getpeerinfo
+   surfaces, so the observable (pingtime/minping after the pong) lines up with
+   the ids a caller sees.
+
+   EnsurePeerman parity: camlcoin always carries a [peer_manager]
+   (rpc_context.peer_manager is non-optional), so the -31
+   RPC_CLIENT_P2P_DISABLED "no connman" path is structurally unreachable here;
+   it is documented for fidelity. *)
+let handle_ping (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  match params with
+  | [] ->
+    let peers = Peer_manager.get_ready_peers ctx.peer_manager in
+    (* Fire a BIP-31 ping at each connected peer; never block the RPC on the
+       writes, and never let one peer's send error fail the call. *)
+    Lwt.async (fun () ->
+      Lwt_list.iter_p (fun peer ->
+        Lwt.catch
+          (fun () -> Peer.send_ping peer)
+          (fun _exn -> Lwt.return_unit))
+        peers);
+    (* Core returns UniValue::VNULL → JSON null, immediately, peerless or not. *)
+    Ok `Null
+  | _ ->
+    Error (rpc_invalid_params, "ping")
+
 (* getblockfrompeer - Attempt to fetch a block from a given peer.
    Mirrors Bitcoin Core rpc/blockchain.cpp:getblockfrompeer + net_processing.cpp
    PeerManagerImpl::FetchBlock. Args: (blockhash hex, peer_id int). Returns an
@@ -10123,6 +10172,7 @@ let handle_help (_ctx : rpc_context)
       "getnodeaddresses ( count \"network\" )";
       "getpeerinfo";
       "listbanned";
+      "ping";
       "setban \"address\" \"add\"|\"remove\" ( bantime )";
       "";
       "== Rawtransactions ==";
@@ -12168,6 +12218,12 @@ let dispatch_rpc (ctx : rpc_context)
     (* handle_setnetworkactive returns Core-exact (code, message) pairs: -8
        missing arg / -3 non-bool / -31 connman-disabled. Pass through verbatim. *)
     handle_setnetworkactive ctx params
+  | "ping" ->
+    (* No params; fire-and-forget BIP-31 ping to every connected peer; returns
+       JSON null immediately (peerless -> null no error). Core rpc/net.cpp ping
+       -> PeerManager::SendPings. handle_ping returns Core-exact (code, message)
+       pairs (-32602 on any positional arg). Pass through verbatim. *)
+    handle_ping ctx params
   | "getblockfrompeer" ->
     (* Core getblockfrompeer throws RPC_MISC_ERROR (-1) for every failure
        case (header missing / already downloaded / peer does not exist). *)

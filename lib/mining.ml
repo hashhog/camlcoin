@@ -988,13 +988,17 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
              Logs.info (fun m -> m "Accepted mined block at height %d: %s"
                height (Types.hash256_to_hex_display hash));
 
-             (* Hot-path heap check (2026-06-09): once per block connected
-                via the mining / generate* / submitblock path (the third
-                primary-connect choke point alongside
-                Sync.process_new_block and Sync.connect_stored_blocks).
-                Mirrors Core's ConnectTip -> FlushStateToDisk(IF_NEEDED)
-                (validation.cpp:3063). *)
-             Gc_guard.maybe_compact ~reason:"hot-path:block";
+             (* Hot-path GC keep-up (2026-06-09, made non-STW 2026-06-24):
+                once per block connected via the mining / generate* /
+                submitblock path (the third primary-connect choke point
+                alongside Sync.process_new_block and
+                Sync.connect_stored_blocks).  Mirrors Core's ConnectTip ->
+                FlushStateToDisk(IF_NEEDED) (validation.cpp:3063).  Uses the
+                NON-STW [Gc.major_slice] keep-up so connecting a block at tip
+                does not stop-the-world the RPC-serving domain (2026-06-24
+                fix); the rare STW backstop is owned by the gc_thread on a
+                dedicated domain. *)
+             Gc_guard.maybe_keep_up ~reason:"hot-path:block";
 
              Ok ()))
       end

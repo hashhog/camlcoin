@@ -11811,6 +11811,199 @@ let core_uvtype (v : Yojson.Safe.t) : string =
   | `String _ -> "string"
   | `Int _ | `Intlit _ | `Float _ -> "number"
 
+(* ============================================================================
+   combinerawtransaction "[\"hexstring\",...]"
+   Core: bitcoin-core/src/rpc/rawtransaction.cpp combinerawtransaction
+         (RPCHelpMan :585, impl body :605-668).
+   Reference port (canonical SCOPE + error strings): ouroboros f4c98ee
+         src/ouroboros/rpc.py rpc_combinerawtransaction.
+   ============================================================================
+
+   Combine multiple partially-signed versions of the SAME transaction into one
+   carrying the union of their signature data. The first variant is the
+   structural template (version / locktime / vin / vout define the result);
+   only each input's scriptSig + witness get rebuilt. Returns the WITNESS-
+   serialized lowercase hex of the merged transaction.
+
+   MERGE SCOPE (single-sig parity — the dominant case, identical to ouroboros):
+   for every input index i, across all variants that have that input, pick the
+   variant that actually CARRIES signature data (non-empty scriptSig OR a
+   non-empty witness stack), tie-broken by total sig-data length (longer = more
+   sigs), earliest variant winning on an exact tie. This is BYTE-IDENTICAL to
+   Core for single-key inputs (P2PKH / P2WPKH / P2SH-P2WPKH), because Core's
+   DataFromTransaction returns the variant's scriptSig + scriptWitness verbatim
+   once VerifyScript marks the input complete, and MergeSignatureData adopts
+   that complete sigdata wholesale.
+
+   KNOWN LIMITATION (flagged, NOT faked): the FULL Core behaviour also merges
+   PARTIAL multisig signatures WITHIN a single input (two variants each holding
+   one of M sigs for a bare/P2SH/P2WSH M-of-N) via SignatureData::Merge over the
+   extracted pubkey->sig map. That needs Solver / VerifyScript-with-a-signature-
+   extracting-checker / sighash validation, which this handler does NOT
+   implement. For an input partially signed in BOTH variants (neither alone
+   complete) we keep the LONGER scriptSig rather than splicing the two sig sets;
+   that input's output is therefore NOT guaranteed byte-identical to Core. The
+   per-input single-sig pick — the dominant case — IS byte-identical.
+
+   DEVIATION (flagged): Core resolves every input's prevout from its own UTXO +
+   mempool view and throws RPC_VERIFY_ERROR (-25) "Input not found or already
+   spent" for a missing/spent coin. This handler does NOT consult chainstate —
+   combine is a pure function of the provided variants — so it does NOT raise
+   -25 for unresolvable prevouts. The -22 empty / -22 decode-failure error paths
+   DO match Core byte-for-byte.
+
+   WITNESS re-serialization: Core re-encodes WITH witness (TX_WITH_WITNESS)
+   unconditionally; Serialize.serialize_transaction emits the segwit marker/flag
+   iff [tx.witnesses <> []]. To mirror Core's CTransaction::HasWitness — which
+   drives the marker iff ANY input has a non-empty witness — we populate
+   [witnesses] (one tx_witness per input, empty stacks for inputs without one)
+   when ANY picked input carries a non-empty witness, else leave it []. *)
+let handle_combinerawtransaction (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  ignore ctx;
+  (* Core: request.params[0].get_array(); a non-array is a JSON type error (-3)
+     raised by get_array() BEFORE any handler logic runs. *)
+  let arr_r =
+    match params with
+    | [`List items] -> Ok items
+    | bad :: _ ->
+      Error (rpc_type_error,
+        Printf.sprintf
+          "JSON value of type %s is not of expected type array"
+          (core_uvtype bad))
+    | [] ->
+      (* No positional arg at all: Core's required-array arg means get_array()
+         on a missing/null param errors as a type error (null -> array). *)
+      Error (rpc_type_error,
+        "JSON value of type null is not of expected type array")
+  in
+  match arr_r with
+  | Error e -> Error e
+  | Ok items ->
+    (* 1. Decode every variant (witness-aware). Core: DecodeHexTx per idx; on
+       failure -> -22 "TX decode failed for tx %d. ..." (0-based idx). Each
+       element must be a JSON string (Core reads it with .get_str() -> -3). *)
+    let rec decode_all idx acc = function
+      | [] -> Ok (List.rev acc)
+      | item :: rest ->
+        (match item with
+         | `String hex ->
+           let decoded =
+             try
+               let data = Cstruct.of_hex hex in
+               let r = Serialize.reader_of_cstruct data in
+               let tx = Serialize.deserialize_transaction r in
+               (* Core's DecodeHexTx rejects a tx with zero inputs (the error
+                  text literally says "Make sure the tx has at least one
+                  input."). Mirror that. *)
+               if List.length tx.Types.inputs = 0 then None
+               else Some tx
+             with _ -> None
+           in
+           (match decoded with
+            | Some tx -> decode_all (idx + 1) (tx :: acc) rest
+            | None ->
+              Error (rpc_deserialization_error,
+                Printf.sprintf
+                  "TX decode failed for tx %d. Make sure the tx has at \
+                   least one input." idx))
+         | bad ->
+           (* Core reads each element with .get_str() -> type error (-3). *)
+           Error (rpc_type_error,
+             Printf.sprintf
+               "JSON value of type %s is not of expected type string"
+               (core_uvtype bad)))
+    in
+    (match decode_all 0 [] items with
+     | Error e -> Error e
+     | Ok variants ->
+       (* 2. Empty array -> -22 "Missing transactions". *)
+       (match variants with
+        | [] -> Error (rpc_deserialization_error, "Missing transactions")
+        | template :: _ ->
+          (* Helper: input i of a variant, if it has that index. *)
+          let variant_input v i =
+            match List.nth_opt v.Types.inputs i with
+            | Some inp -> Some inp
+            | None -> None
+          in
+          (* Helper: witness stack (Cstruct list) for input i of a variant.
+             camlcoin stores witnesses as a list parallel to inputs (one
+             tx_witness per input) when segwit, or [] when non-segwit. *)
+          let variant_witness v i =
+            match v.Types.witnesses with
+            | [] -> []
+            | ws ->
+              (match List.nth_opt ws i with
+               | Some w -> w.Types.items
+               | None -> [])
+          in
+          let total_len cs = Cstruct.length cs in
+          let witness_total ws =
+            List.fold_left (fun a c -> a + total_len c) 0 ws
+          in
+          let witness_nonempty ws =
+            List.exists (fun c -> total_len c > 0) ws
+          in
+          (* 3. Per input i of the template: pick the variant carrying sig data.
+             Score: 0 if no sig data, else 1_000_000 + total sig-data length;
+             higher score wins, earliest variant wins on an exact tie. *)
+          let num_inputs = List.length template.Types.inputs in
+          let any_witness = ref false in
+          let merged_inputs =
+            List.mapi (fun i base_in ->
+              let best_ss = ref base_in.Types.script_sig in
+              let best_wit = ref [] in
+              let best_score = ref (-1) in
+              List.iter (fun v ->
+                match variant_input v i with
+                | None -> ()
+                | Some vin ->
+                  let ss = vin.Types.script_sig in
+                  let wit = variant_witness v i in
+                  let ss_nonempty = Cstruct.length ss > 0 in
+                  let wit_nonempty = witness_nonempty wit in
+                  let score =
+                    if (not ss_nonempty) && (not wit_nonempty) then 0
+                    else 1_000_000 + Cstruct.length ss + witness_total wit
+                  in
+                  if score > !best_score then begin
+                    best_score := score;
+                    best_ss := ss;
+                    best_wit := wit
+                  end
+              ) variants;
+              if witness_nonempty !best_wit then any_witness := true;
+              ({ Types.previous_output = base_in.Types.previous_output;
+                 script_sig = !best_ss;
+                 sequence = base_in.Types.sequence },
+               !best_wit)
+            ) template.Types.inputs
+          in
+          let inputs = List.map fst merged_inputs in
+          (* 4. Build the witness list. Core re-encodes WITH witness iff ANY
+             input has a non-empty witness (CTransaction::HasWitness). When
+             any_witness, emit one tx_witness per input (empty stacks for
+             inputs without one) so serialize_transaction writes the marker
+             plus all per-input stacks; otherwise leave it [] (no marker). *)
+          let witnesses =
+            if !any_witness then
+              List.map (fun (_, wit) -> { Types.items = wit }) merged_inputs
+            else []
+          in
+          ignore num_inputs;
+          let merged =
+            { Types.version = template.Types.version;
+              inputs;
+              outputs = template.Types.outputs;
+              witnesses;
+              locktime = template.Types.locktime }
+          in
+          let w = Serialize.writer_create () in
+          Serialize.serialize_transaction w merged;
+          let cs = Serialize.writer_to_cstruct w in
+          Ok (`String (cstruct_to_hex_early cs))))
+
 let handle_getmemoryinfo (_ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
   (* mode is read by Core as Arg<std::string_view> — a present-but-non-string
@@ -12299,6 +12492,18 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_signrawtransactionwithkey ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
+  | "combinerawtransaction" ->
+    (* handle_combinerawtransaction returns Core-exact (code, message) pairs:
+       -22 (RPC_DESERIALIZATION_ERROR) "Missing transactions" for an empty
+       array / -22 "TX decode failed for tx N. Make sure the tx has at least
+       one input." for an undecodable element (N 0-based) / -3 (RPC_TYPE_ERROR)
+       non-array param or non-string element. Pass through verbatim. Returns the
+       witness-serialized hex of the merged tx (bare JSON string). SCOPE =
+       single-sig parity (see handler doc): the per-input non-empty-sig pick is
+       byte-identical to Core for P2PKH/P2WPKH/P2SH-P2WPKH; partial-multisig
+       merge within one input and the -25 unresolvable-prevout path are
+       documented out of scope (matches the ouroboros reference). *)
+    handle_combinerawtransaction ctx params
 
   (* Network *)
   | "getpeerinfo" ->

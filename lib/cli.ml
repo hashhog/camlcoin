@@ -1851,6 +1851,15 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   Peer_manager.add_listener peer_manager (fun msg peer ->
     match msg with
     | P2p.TxMsg tx when chain.sync_state = Sync.FullySynced ->
+      (* Un-pin gate (2026-06-24): rate-limit per-peer tx ingress
+         (Peer.check_rate_limit, 60s window / 500 msgs) BEFORE the GC-heavy
+         accept_to_memory_pool, so a public-mempool flood can't drive a
+         Gc.compact thrash — the cause of camlcoin's loopback pin
+         (camlcoin-loopback-pinned-gc-limited-2026-06-19). Dropping an over-rate
+         peer's relay is POLICY-ONLY (non-consensus): the tx still arrives and
+         validates in blocks normally; only its mempool relay is throttled. *)
+      if not (Peer.check_rate_limit peer) then Lwt.return_unit
+      else
       (* let%lwt so the Lwt.pause yields inside accept_to_memory_pool can
          interleave RPC handlers between tx accepts. Bug #134. *)
       let%lwt result = Mempool.accept_to_memory_pool mempool tx in

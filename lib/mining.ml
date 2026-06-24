@@ -1000,5 +1000,16 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
                 dedicated domain. *)
              Gc_guard.maybe_keep_up ~reason:"hot-path:block";
 
+             (* Wake the wait-family RPCs on this submitblock / generate /
+                generatetoaddress / generateblock accept-path tip advance
+                (Core KernelNotifications blockTip / WaitTipChanged fires on
+                the ProcessNewBlock accept path too).  The side-branch /
+                heavier-fork submission path delegates to
+                [Sync.try_attach_side_branch_and_reorg] -> [Sync.reorganize],
+                which carries its own notify, so this covers the direct-extend
+                case here.  Best-effort: a notifier fault must never fail an
+                already-accepted block. *)
+             (try Tip_notifier.notify () with _ -> ());
+
              Ok ()))
       end

@@ -10007,6 +10007,7 @@ let handle_help (_ctx : rpc_context)
       "addpeeraddress \"address\" port ( tried )";
       "clearbanned";
       "disconnectnode \"address\"";
+      "getaddrmaninfo";
       "getblockfrompeer \"blockhash\" peer_id";
       "getconnectioncount";
       "getnetworkinfo";
@@ -11454,8 +11455,9 @@ let handle_getnodeaddresses (ctx : rpc_context)
    deterministically.  Returns {"success": bool}.  We additionally accept an
    optional 4th positional "services" integer so a known bitfield can be
    injected; absent -> NODE_NETWORK|NODE_WITNESS (1033) as Core sets. The
-   "tried" arg is accepted for Core-shape compatibility but treated as a
-   no-op (camlcoin's addrman new/tried split is internal). *)
+   optional 3rd positional "tried" bool, when true, promotes the freshly-added
+   entry into the tried table (Core net.cpp:1015-1021 AddrMan::Good), so the
+   new/tried split surfaced by getaddrmaninfo can be exercised deterministically. *)
 let handle_addpeeraddress (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
   let address_arg = match params with
@@ -11486,11 +11488,104 @@ let handle_addpeeraddress (ctx : rpc_context)
            (match Int64.of_string_opt s with Some v -> v | None -> 9L)
          | _ -> 9L
        in
+       (* Optional 3rd positional "tried" bool (Core net.cpp:979 default false);
+          when true the entry is promoted into the tried table. *)
+       let tried =
+         match params with
+         | _ :: _ :: (`Bool b) :: _ -> b
+         | _ -> false
+       in
        let success =
          Peer_manager.add_peer_address ctx.peer_manager
-           ~address ~port ~services
+           ~address ~port ~services ~tried ()
        in
        Ok (`Assoc [("success", `Bool success)]))
+
+(* ----- getaddrmaninfo — per-network new/tried address-manager counts ----- *)
+
+(* getaddrmaninfo
+   Faithful port of Bitcoin Core src/rpc/net.cpp:1080-1117 (lambda :1096-1115)
+   + AddrMan::Size (addrman.cpp Size_ :1006-1026).
+
+   Params: NONE (Core net.cpp:1086 — any argument is a "too many params" error,
+   enforced generically by the dispatcher).
+
+   Output: a JSON OBJECT keyed by network name. The key set is FIXED and ALWAYS
+   present (Core's loop emits an entry for every routable network even at count
+   0), in Core's enum order NET_IPV4..NET_CJDNS — skipping NET_UNROUTABLE
+   (not_publicly_routable) and NET_INTERNAL (internal), which are never keys —
+   followed by a final literal "all_networks":
+
+     ipv4, ipv6, onion, i2p, cjdns, all_networks
+
+   Each value is an object with EXACTLY three integer keys in order:
+
+     { "new":   addresses in the new table for this network   (Size(net,true)),
+       "tried": addresses in the tried table for this network (Size(net,false)),
+       "total": new + tried                                   (Size(net)) }
+
+   "all_networks" carries the global sums (Core: nNew / nTried / vRandom.size()).
+
+   Invariants (oracle-free, hold by construction):
+     - per network:        total == new + tried
+     - all_networks.new   == Σ networks.new
+     - all_networks.tried == Σ networks.tried
+     - all_networks.total == Σ networks.total == all_networks.new + tried
+
+   Pure read-only snapshot of the address manager: no params, no side effects,
+   no peers/sockets/disk touched. *)
+let handle_getaddrmaninfo (ctx : rpc_context) : Yojson.Safe.t =
+  (* Fixed routable-network key order (Core enum NET_IPV4..NET_CJDNS, skipping
+     NET_UNROUTABLE / NET_INTERNAL). Every key is emitted even at count 0, so
+     an IPv4-only node still reports onion/i2p/cjdns as 0/0/0. *)
+  let network_keys = [ "ipv4"; "ipv6"; "onion"; "i2p"; "cjdns" ] in
+  (* Pre-seed all routable networks at zero so the key set is always complete,
+     then accumulate. tbl: net_name -> (new_ref, tried_ref). *)
+  let counts = Hashtbl.create 8 in
+  List.iter (fun name -> Hashtbl.replace counts name (ref 0, ref 0)) network_keys;
+  (* camlcoin's address manager (peer_manager) records, per known address, a
+     [table_status] of InNew / InTried / NotInTable (the new vs tried split,
+     Core's new/tried tables). Iterate every stored entry, classify its network
+     via P2p.network_type_of_host (GetNetClass parity; same helper getnodeaddresses
+     uses), and bump the matching (network, table) counter. Entries whose network
+     class is internal / not_publicly_routable are skipped (never keys), matching
+     Core's loop. NotInTable entries are not yet in either Core table, so — like
+     Core's Size_, which counts only nNew (new buckets) + nTried (tried buckets) —
+     they are not counted. *)
+  let all = Peer_manager.get_addr_dump ctx.peer_manager in
+  List.iter (fun (info : Peer_manager.peer_info) ->
+    let net = core_network_name_of_addr info.address in
+    match Hashtbl.find_opt counts net with
+    | None -> ()  (* internal / not_publicly_routable: never a key *)
+    | Some (new_ref, tried_ref) ->
+      (match info.table_status with
+       | Peer_manager.InNew _ -> incr new_ref
+       | Peer_manager.InTried _ -> incr tried_ref
+       | Peer_manager.NotInTable -> ())
+  ) all;
+  let total_new = ref 0 in
+  let total_tried = ref 0 in
+  let per_network =
+    List.map (fun name ->
+      let (new_ref, tried_ref) = Hashtbl.find counts name in
+      let n_new = !new_ref and n_tried = !tried_ref in
+      total_new := !total_new + n_new;
+      total_tried := !total_tried + n_tried;
+      (name, `Assoc [
+        ("new", `Int n_new);
+        ("tried", `Int n_tried);
+        ("total", `Int (n_new + n_tried));
+      ])
+    ) network_keys
+  in
+  let all_networks =
+    ("all_networks", `Assoc [
+      ("new", `Int !total_new);
+      ("tried", `Int !total_tried);
+      ("total", `Int (!total_new + !total_tried));
+    ])
+  in
+  `Assoc (per_network @ [ all_networks ])
 
 (* ============================================================================
    gettxspendingprevout — Core rpc/mempool.cpp:897-1041
@@ -11834,6 +11929,8 @@ let dispatch_rpc (ctx : rpc_context)
     Ok (handle_getconnectioncount ctx)
   | "getnetworkinfo" ->
     Ok (handle_getnetworkinfo ctx)
+  | "getaddrmaninfo" ->
+    Ok (handle_getaddrmaninfo ctx)
   | "listbanned" ->
     Ok (handle_listbanned ctx)
   | "setban" ->

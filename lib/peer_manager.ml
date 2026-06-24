@@ -1793,7 +1793,7 @@ let get_addr_dump (pm : t) : peer_info list =
    returns false when the entry already exists and only nTime/services were
    refreshed). *)
 let add_peer_address (pm : t) ~(address : string) ~(port : int)
-    ~(services : int64) : bool =
+    ~(services : int64) ?(tried : bool = false) () : bool =
   if Hashtbl.mem pm.known_addrs address then false
   else if not (is_routable address) then false
   else begin
@@ -1801,6 +1801,16 @@ let add_peer_address (pm : t) ~(address : string) ~(port : int)
     if bucket < 0 then false
     else begin
       let now = Unix.gettimeofday () in
+      (* When [tried] is requested, immediately move the freshly-added entry
+         from the new table to the tried table.  Mirrors Bitcoin Core's
+         addpeeraddress (net.cpp:1015-1021): after AddrMan::Add succeeds, a
+         [tried] request calls AddrMan::Good to promote the address to the
+         tried table.  We record the resulting [table_status] so the
+         getaddrmaninfo per-network new/tried split reflects the move. *)
+      let table_status =
+        if tried then InTried (move_to_tried_table pm address)
+        else InNew bucket
+      in
       Hashtbl.replace pm.known_addrs address
         { address;
           port;
@@ -1811,7 +1821,7 @@ let add_peer_address (pm : t) ~(address : string) ~(port : int)
           failures = 0;
           banned_until = 0.0;
           source = Manual;
-          table_status = InNew bucket };
+          table_status };
       true
     end
   end

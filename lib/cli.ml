@@ -2267,14 +2267,21 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
      timer is starvable by any long synchronous stretch on the main thread
      (the ~17 G heap-spike incident).  The timer below survives only as the
      idle fallback. *)
-  (* Dedicated heap-size-threshold timer. Wakes every
-     [Gc_guard.gc_check_interval_s] and compacts when the OCaml heap is over
-     [Gc_guard.compact_heap_threshold_bytes], subject to the
-     [Gc_guard.compact_min_interval_s] anti-thrash floor. This caps the
-     RSS sawtooth peak (was creeping 3.9G -> 13G -> 18.7G over a soak) so each
-     reclamation stays small + the RPC stall sub-second. FullySynced-gated so
-     it never runs during IBD (run_ibd owns reclamation then; the UNGATED
-     hot-path checks in Gc_guard back-stop catch-up/drain states). The 120 s
+  (* Dedicated GC timer. Wakes every [Gc_guard.gc_check_interval_s] and:
+       (a) drives the major collector forward with a NON-STW
+           [Gc.major_slice] ([maybe_keep_up]) every tick — keeps the
+           collector caught up with the transient-allocation churn so the
+           heap never balloons, WITHOUT freezing the RPC mutator (the
+           2026-06-24 RPC-stall fix; see Gc_guard header); and
+       (b) only when the heap crosses the HIGH backstop ceiling, requests a
+           rare genuine STW [Gc.compact]+[malloc_trim] on the dedicated
+           [Gc_guard.Backstop] worker domain, with the Lwt scheduler parked
+           via [Lwt_preemptive.detach] so the main domain releases the
+           runtime lock (the malloc_trim half then interleaves with RPC; the
+           compact half is sub-second because (a) keeps the heap small).
+     FullySynced-gated so it never runs during IBD (run_ibd owns reclamation
+     then via the 16-block compact_now cadence; the UNGATED hot-path slice
+     checks in Gc_guard back-stop catch-up/drain states). The 300 s backstop
      time-floor fallback lives in the status loop below. *)
   let gc_thread =
     let rec gc_loop () =
@@ -2282,8 +2289,19 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       else begin
         let* () = Lwt_unix.sleep Gc_guard.gc_check_interval_s in
         if not !shutdown then begin
-          (if chain.sync_state = Sync.FullySynced then
-             Gc_guard.maybe_compact ~reason:"threshold");
+          let* () =
+            if chain.sync_state = Sync.FullySynced then begin
+              (* (a) non-STW steady-state slice every tick *)
+              Gc_guard.maybe_keep_up ~reason:"threshold";
+              (* (b) rare STW backstop only on the high ceiling; park the Lwt
+                 scheduler so the runtime lock is released during the worker
+                 compaction (esp. the trim half). *)
+              if Gc_guard.backstop_due ~reason:"threshold" then
+                Lwt_preemptive.detach
+                  (fun () -> Gc_guard.Backstop.run_blocking ~reason:"threshold") ()
+              else Lwt.return_unit
+            end else Lwt.return_unit
+          in
           gc_loop ()
         end else
           Lwt.return_unit
@@ -2326,16 +2344,25 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
           (let n = Mempool.expire_orphans mempool in
            if n > 0 then
              Logs.info (fun m -> m "Expired %d stale orphan(s) from pool" n));
-          (* At-tip memory reclamation TIME-FLOOR (see [Gc_guard]). The
-             dedicated [gc_thread] caps the RSS peak via the heap-size
-             threshold; this status-loop branch is the slow fallback that
-             guarantees idle off-heap/Domain-arena memory is still returned
-             on a wall-clock cadence even when allocation is slow and the
-             threshold is never reached. Every trigger (incl. the hot-path
-             sites) shares [Gc_guard.last_compact_time], so any compaction
-             also resets this floor. *)
-          (if chain.sync_state = Sync.FullySynced then
-             Gc_guard.compact_if_overdue ~reason:"time-floor");
+          (* At-tip memory reclamation BACKSTOP TIME-FLOOR (see [Gc_guard]).
+             The dedicated [gc_thread] keeps the collector caught up with the
+             non-STW [Gc.major_slice] and fires the rare STW backstop on the
+             high ceiling; this status-loop branch is the slow fallback that
+             guarantees idle off-heap/Domain-arena memory is still returned on
+             a coarse 300 s wall-clock cadence even when allocation is slow and
+             the ceiling is never reached. Routed through the [Backstop] worker
+             domain with the Lwt scheduler parked (Lwt_preemptive.detach) so
+             the runtime lock is released during the worker compaction. All
+             backstop triggers share [Gc_guard.last_compact_time], so any
+             compaction resets this floor. *)
+          let* () =
+            if chain.sync_state = Sync.FullySynced
+               && Gc_guard.backstop_overdue ~reason:"time-floor"
+            then
+              Lwt_preemptive.detach
+                (fun () -> Gc_guard.Backstop.run_blocking ~reason:"time-floor") ()
+            else Lwt.return_unit
+          in
           log_status ()
         end else
           Lwt.return_unit
@@ -2349,6 +2376,13 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
      failure does not skip subsequent flushes.  Phased log lines match the
      blockbrew / Bitcoin Core init.cpp shutdown trace. *)
   let graceful_shutdown () =
+    (* Phase 0: stop the GC backstop compaction worker domain (if it was
+       spawned). Join is bounded (a backstop compaction on the kept-small heap
+       is sub-second); doing it first frees the domain before the DB flushes. *)
+    (try Gc_guard.Backstop.shutdown ()
+     with exn ->
+       Logs.warn (fun m ->
+         m "Gc_guard.Backstop.shutdown raised: %s" (Printexc.to_string exn)));
     (* Phase 1: stop P2P networking (listener + peer manager + outbound). *)
     Logs.info (fun m -> m "stopping P2P");
     let* () =

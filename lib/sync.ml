@@ -5595,16 +5595,23 @@ let rec connect_stored_blocks (state : chain_state) : int =
           Logs.info (fun m ->
             m "Connected stored block %s at height %d (catch-up from gap-fill)"
               (Types.hash256_to_hex_display entry.hash) next_height);
-          (* Hot-path heap check (2026-06-09): THE critical site.  This
-             recursion is a fully-synchronous multi-block drain on the Lwt
-             main thread — no Lwt timer (incl. cli.ml's gc_thread) can EVER
-             interrupt it, and during catch-up/reindex sync_state is not
-             FullySynced so the timer is gated off anyway (the 111 G re-IBD
-             pathology).  Checking once per connected block mirrors Core's
-             ConnectTip -> FlushStateToDisk(IF_NEEDED)
-             (validation.cpp:3063).  Bounded by Gc_guard's shared
+          (* Hot-path GC check (2026-06-09; non-STW slice + dedicated-domain
+             backstop 2026-06-24): THE critical site.  This recursion is a
+             fully-synchronous multi-block drain on the Lwt main thread — no
+             Lwt timer (incl. cli.ml's gc_thread) can EVER interrupt it, and
+             during catch-up/reindex sync_state is not FullySynced so the
+             timer is gated off anyway (the 111 G re-IBD pathology).  Drive
+             the major collector forward with the NON-STW [Gc.major_slice]
+             keep-up every block (mirrors Core's ConnectTip ->
+             FlushStateToDisk(IF_NEEDED), validation.cpp:3063), AND — because
+             this synchronous drain can outrun the slice and the Lwt-parked
+             ceiling backstop in cli.ml can never run here — fire-and-forget a
+             rare ceiling backstop to the dedicated [Backstop] worker domain
+             ([maybe_backstop]: the request is serviced on its own domain even
+             during this synchronous drain).  Bounded by Gc_guard's shared
              anti-thrash floor. *)
-          Gc_guard.maybe_compact ~reason:"hot-path:drain";
+          Gc_guard.maybe_keep_up ~reason:"hot-path:drain";
+          Gc_guard.maybe_backstop ~reason:"hot-path:drain";
           1 + connect_stored_blocks state
         | Validation.AB_err e ->
           let msg = Validation.block_error_to_string e in
@@ -5852,13 +5859,17 @@ let process_new_block ?(f_requested = false)
             Logs.info (fun m ->
               m "Connected %d additional stored blocks, tip now at %d"
                 connected state.blocks_synced);
-          (* Hot-path heap check (2026-06-09): once per block connected via
-             the at-tip P2P BlockMsg path (and after any gap-fill drain
-             above).  Mirrors Core's ConnectTip ->
-             FlushStateToDisk(IF_NEEDED) (validation.cpp:3063) — the budget
-             check rides the block-connect work itself instead of a
-             starvable detached timer. *)
-          Gc_guard.maybe_compact ~reason:"hot-path:block";
+          (* Hot-path GC check (2026-06-09; non-STW slice + dedicated-domain
+             backstop 2026-06-24): once per block connected via the at-tip
+             P2P BlockMsg path (and after any gap-fill drain above).  Mirrors
+             Core's ConnectTip -> FlushStateToDisk(IF_NEEDED)
+             (validation.cpp:3063) — the budget check rides the
+             block-connect work itself instead of a starvable detached timer.
+             Non-STW [Gc.major_slice] keep-up so connecting a block does not
+             stop-the-world the RPC-serving domain; ceiling backstop is
+             fire-and-forget to the dedicated [Backstop] worker domain. *)
+          Gc_guard.maybe_keep_up ~reason:"hot-path:block";
+          Gc_guard.maybe_backstop ~reason:"hot-path:block";
           Lwt.return (Ok ())
         | Error e ->
           let msg = Validation.block_error_to_string e in

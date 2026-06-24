@@ -10136,6 +10136,9 @@ let handle_help (_ctx : rpc_context)
       "getchainstates";
       "getchaintxstats ( nblocks \"blockhash\" )";
       "getindexinfo ( \"index_name\" )";
+      "waitfornewblock ( timeout \"current_tip\" )";
+      "waitforblock \"blockhash\" ( timeout )";
+      "waitforblockheight height ( timeout )";
       "";
       "== Mining ==";
       "getblocktemplate";
@@ -12383,6 +12386,246 @@ let guard_hash_param ~(name : string) (params : Yojson.Safe.t list)
      | Ok () -> k ())
   | _ -> k ()
 
+(* ============================================================================
+   Wait-family RPCs: waitfornewblock / waitforblock / waitforblockheight
+   ----------------------------------------------------------------------------
+   Port of bitcoin-core/src/rpc/blockchain.cpp:290-470.  Each RPC blocks on a
+   tip-change condition variable ([Tip_notifier], the camlcoin analogue of
+   Core's KernelNotifications blockTip / WaitTipChanged), re-checking its
+   predicate against the AUTHORITATIVE database tip after each wake, and
+   returns the current tip {hash, height} on predicate-match OR on timeout
+   (Core returns the current block in both cases).
+
+   These handlers are Lwt-returning (they must block the request coroutine,
+   not the whole single-domain event loop) and are routed from the HTTP
+   request handler BEFORE the synchronous [dispatch_rpc] (see
+   [dispatch_wait_rpc] / its use in the single-request + batch paths).
+   ============================================================================ *)
+
+(* Core uvTypeName (univalue.cpp:217) — the JSON type label embedded in the
+   RPC_TYPE_ERROR (-3) message Core throws from getInt<int>. *)
+let wait_json_type_name (j : Yojson.Safe.t) : string =
+  match j with
+  | `Null -> "null"
+  | `Bool _ -> "bool"
+  | `Assoc _ -> "object"
+  | `List _ -> "array"
+  | `String _ -> "string"
+  | `Int _ | `Intlit _ | `Float _ -> "number"
+
+(* Read a wait-family timeout argument (milliseconds; 0 = no timeout).
+
+   Mirrors Core's [request.params[i].getInt<int>()] followed by the
+   [if (timeout < 0) throw RPC_MISC_ERROR "Negative timeout"] guard:
+     - argument absent / JSON null  -> default 0
+     - not an integer (string / float / bool / etc.) -> RPC_TYPE_ERROR (-3)
+       "JSON value of type <t> is not of expected type number"
+     - negative integer             -> RPC_MISC_ERROR (-1) "Negative timeout"
+   Note Core's getInt<int> rejects a non-integral JSON number; OCaml's
+   Yojson keeps `Int and `Float distinct, so a `Float is a type error here,
+   matching Core (which also rejects a fractional NUM for an int field).
+   Bitcoin's JSON booleans are NOT numbers, so a `Bool is a type error. *)
+let wait_parse_timeout (j : Yojson.Safe.t) : (int, int * string) result =
+  match j with
+  | `Null -> Ok 0
+  | `Int n ->
+    if n < 0 then Error (rpc_misc_error, "Negative timeout") else Ok n
+  | other ->
+    Error (rpc_type_error,
+      Printf.sprintf
+        "JSON value of type %s is not of expected type number"
+        (wait_json_type_name other))
+
+(* Read a wait-family integer argument (waitforblockheight's height).  Core
+   reads it with getInt<int> (no negativity guard — a negative target height
+   simply makes the predicate [tip.height >= height] hold immediately).
+   Non-integer -> RPC_TYPE_ERROR (-3), byte-matching Core's getInt. *)
+let wait_parse_int (j : Yojson.Safe.t) : (int, int * string) result =
+  match j with
+  | `Int n -> Ok n
+  | other ->
+    Error (rpc_type_error,
+      Printf.sprintf
+        "JSON value of type %s is not of expected type number"
+        (wait_json_type_name other))
+
+(* The AUTHORITATIVE current tip the wait loop re-reads on every wake:
+   the VALIDATED-block tip (Sync.block_tip — same source getbestblockhash /
+   getblockcount resolve through), as (display_hash, height).  Never a value
+   cached inside the notifier, so a coalesced / missed notify can never
+   produce a wrong answer. *)
+let wait_current_tip (ctx : rpc_context) : string * int =
+  match Sync.block_tip ctx.chain with
+  | Some t -> (Types.hash256_to_hex_display t.hash, t.height)
+  | None ->
+    ("0000000000000000000000000000000000000000000000000000000000000000", 0)
+
+let wait_tip_result (display : string) (height : int) : Yojson.Safe.t =
+  `Assoc [ ("hash", `String display); ("height", `Int height) ]
+
+(* Core's wait-tip-changed loop shared by all three wait-family RPCs
+   (blockchain.cpp:335-344 / 387-400 / 450-463).  [predicate display height]
+   returns true once the desired tip condition holds.  [timeout_ms] is
+   milliseconds; 0 = wait indefinitely.  Returns the current tip
+   {hash, height} once the predicate holds OR the timeout elapses. *)
+let wait_for_tip_loop (ctx : rpc_context)
+    (predicate : string -> int -> bool) (timeout_ms : int)
+    : (Yojson.Safe.t, int * string) result Lwt.t =
+  let display, height = wait_current_tip ctx in
+  if predicate display height then
+    Lwt.return (Ok (wait_tip_result display height))
+  else begin
+    (* Absolute deadline (monotonic) for the bounded-timeout case; Core uses a
+       steady_clock deadline and re-derives the remaining slice after each
+       wake. *)
+    let deadline =
+      if timeout_ms > 0 then
+        Some (Unix.gettimeofday () +. (float_of_int timeout_ms /. 1000.0))
+      else None
+    in
+    let rec loop () : (Yojson.Safe.t, int * string) result Lwt.t =
+      (* Snapshot the generation BEFORE re-reading the tip + checking the
+         predicate, so a notify that races in between the check and the await
+         is observed (no lost wakeup). *)
+      let gen = Tip_notifier.generation () in
+      let display, height = wait_current_tip ctx in
+      if predicate display height then
+        Lwt.return (Ok (wait_tip_result display height))
+      else begin
+        match deadline with
+        | None ->
+          Lwt.bind (Tip_notifier.wait_for_change ~last_generation:gen
+                      ~timeout:None)
+            (fun _ -> loop ())
+        | Some dl ->
+          let remaining = dl -. Unix.gettimeofday () in
+          if remaining <= 0.0 then
+            (* Timed out — return the current tip (Core's behaviour). *)
+            Lwt.return (Ok (wait_tip_result display height))
+          else
+            Lwt.bind
+              (Tip_notifier.wait_for_change ~last_generation:gen
+                 ~timeout:(Some remaining))
+              (fun _ -> loop ())
+      end
+    in
+    loop ()
+  end
+
+(* waitfornewblock(timeout=0, current_tip=optional)
+   Core blockchain.cpp:290.  Waits until the tip hash differs from the
+   reference (current_tip if supplied, else the tip observed at call entry).
+   timeout in milliseconds; 0 = no timeout.  Returns the current tip on
+   timeout. *)
+let handle_waitfornewblock (ctx : rpc_context)
+    (params : Yojson.Safe.t list)
+    : (Yojson.Safe.t, int * string) result Lwt.t =
+  (* Core reads params[0] (timeout) first, then params[1] (current_tip).  A
+     negative/non-int timeout therefore errors BEFORE current_tip is parsed. *)
+  let timeout_arg = match params with t :: _ -> t | [] -> `Null in
+  match wait_parse_timeout timeout_arg with
+  | Error e -> Lwt.return (Error e)
+  | Ok timeout_ms ->
+    (* Reference hash the new tip must differ from. *)
+    let ref_hash_res =
+      match params with
+      | _ :: ct :: _ when ct <> `Null ->
+        (* current_tip supplied: parse as a 64-hex uint256 (ParseHashV -> -8
+           on malformed).  Core normalises via the parsed uint256; we compare
+           in the canonical display form, so lowercase the (validated) hex. *)
+        (match ct with
+         | `String s ->
+           (match parse_hash_v s ~name:"current_tip" with
+            | Error e -> Error e
+            | Ok () -> Ok (String.lowercase_ascii s))
+         | other ->
+           (* A non-string current_tip: Core's RPCHelpMan rejects the wrong
+              positional type with RPC_TYPE_ERROR (-3) BEFORE ParseHashV's
+              get_str runs — verified against live Core v31.99
+              (waitfornewblock [100,123] -> code -3 "Wrong type passed ...
+              JSON value of type number is not of expected type string").
+              parse_hash_v only sees strings (a non-64-hex string still hits
+              its -8 above); mirror Core's -3 type error here. *)
+           Error (rpc_type_error,
+             Printf.sprintf
+               "JSON value of type %s is not of expected type string"
+               (wait_json_type_name other)))
+      | _ ->
+        (* Omitted: snapshot the live tip. *)
+        let display, _ = wait_current_tip ctx in
+        Ok display
+    in
+    (match ref_hash_res with
+     | Error e -> Lwt.return (Error e)
+     | Ok ref_hash ->
+       wait_for_tip_loop ctx
+         (fun h _ht -> not (String.equal h ref_hash)) timeout_ms)
+
+(* waitforblock(blockhash, timeout=0)
+   Core blockchain.cpp:349.  Parses blockhash FIRST (before reading timeout —
+   so a malformed blockhash errors -8 even when timeout is also negative),
+   then waits until the tip hash == blockhash. *)
+let handle_waitforblock (ctx : rpc_context)
+    (params : Yojson.Safe.t list)
+    : (Yojson.Safe.t, int * string) result Lwt.t =
+  (* Core: uint256 hash(ParseHashV(params[0], "blockhash")) — BEFORE timeout. *)
+  let blockhash_arg = match params with h :: _ -> h | [] -> `Null in
+  let target_res =
+    match blockhash_arg with
+    | `String s ->
+      (match parse_hash_v s ~name:"blockhash" with
+       | Error e -> Error e
+       | Ok () -> Ok (String.lowercase_ascii s))
+    | other ->
+      (* Non-string / missing first arg: Core's ParseHashV -> get_str
+         type-errors before timeout is read. *)
+      Error (rpc_misc_error,
+        Printf.sprintf
+          "JSON value of type %s is not of expected type string"
+          (wait_json_type_name other))
+  in
+  match target_res with
+  | Error e -> Lwt.return (Error e)
+  | Ok target ->
+    let timeout_arg = match params with _ :: t :: _ -> t | _ -> `Null in
+    (match wait_parse_timeout timeout_arg with
+     | Error e -> Lwt.return (Error e)
+     | Ok timeout_ms ->
+       wait_for_tip_loop ctx
+         (fun h _ht -> String.equal h target) timeout_ms)
+
+(* waitforblockheight(height, timeout=0)
+   Core blockchain.cpp:410.  Reads height (getInt -> -3 on non-int), then
+   waits until tip height >= height. *)
+let handle_waitforblockheight (ctx : rpc_context)
+    (params : Yojson.Safe.t list)
+    : (Yojson.Safe.t, int * string) result Lwt.t =
+  let height_arg = match params with h :: _ -> h | [] -> `Null in
+  match wait_parse_int height_arg with
+  | Error e -> Lwt.return (Error e)
+  | Ok target_height ->
+    let timeout_arg = match params with _ :: t :: _ -> t | _ -> `Null in
+    (match wait_parse_timeout timeout_arg with
+     | Error e -> Lwt.return (Error e)
+     | Ok timeout_ms ->
+       wait_for_tip_loop ctx
+         (fun _h ht -> ht >= target_height) timeout_ms)
+
+(* Lwt-returning dispatch for the wait-family methods.  Returns
+   [Some <result Lwt.t>] when [method_name] is one of the three wait RPCs,
+   else [None] so the caller falls through to the synchronous [dispatch_rpc].
+   Kept separate from [dispatch_rpc] because those handlers must block the
+   request coroutine (Lwt), not the synchronous result path. *)
+let dispatch_wait_rpc (ctx : rpc_context)
+    (method_name : string)
+    (params : Yojson.Safe.t list)
+    : (Yojson.Safe.t, int * string) result Lwt.t option =
+  match method_name with
+  | "waitfornewblock" -> Some (handle_waitfornewblock ctx params)
+  | "waitforblock" -> Some (handle_waitforblock ctx params)
+  | "waitforblockheight" -> Some (handle_waitforblockheight ctx params)
+  | _ -> None
+
 let dispatch_rpc (ctx : rpc_context)
     (method_name : string)
     (params : Yojson.Safe.t list)
@@ -13021,24 +13264,66 @@ let handle_single_request (ctx : rpc_context) (json : Yojson.Safe.t)
   | Ok r -> json_rpc_response ~id ~result:r
   | Error (code, message) -> json_rpc_error ~id ~code ~message
 
+(* Lwt-returning single-request handler.  The wait-family RPCs
+   (waitfornewblock / waitforblock / waitforblockheight) must BLOCK the
+   request coroutine on a tip-change condition variable, which the
+   synchronous [handle_single_request] / [dispatch_rpc] path cannot express.
+   This wrapper routes those three methods through [dispatch_wait_rpc] (Lwt)
+   and falls back to the synchronous dispatcher for every other method,
+   keeping a single shared response-encoding path. *)
+let handle_single_request_lwt (ctx : rpc_context) (json : Yojson.Safe.t)
+    : Yojson.Safe.t Lwt.t =
+  let method_name = match json with
+    | `Assoc fields ->
+      (match List.assoc_opt "method" fields with
+       | Some (`String m) -> m
+       | _ -> "")
+    | _ -> ""
+  in
+  let params = match json with
+    | `Assoc fields ->
+      (match List.assoc_opt "params" fields with
+       | Some (`List l) -> l
+       | Some (`Null) -> []
+       | None -> []
+       | _ -> [])
+    | _ -> []
+  in
+  let id = match json with
+    | `Assoc fields ->
+      (match List.assoc_opt "id" fields with
+       | Some v -> v
+       | None -> `Null)
+    | _ -> `Null
+  in
+  match dispatch_wait_rpc ctx method_name params with
+  | Some result_lwt ->
+    Lwt.bind result_lwt (function
+      | Ok r -> Lwt.return (json_rpc_response ~id ~result:r)
+      | Error (code, message) ->
+        Lwt.return (json_rpc_error ~id ~code ~message))
+  | None ->
+    (* Non-wait method: synchronous dispatch (unchanged behaviour). *)
+    Lwt.return (handle_single_request ctx json)
+
 (* Handle a batch of JSON-RPC requests in parallel *)
 let handle_batch_request (ctx : rpc_context) (requests : Yojson.Safe.t list)
     : Yojson.Safe.t list Lwt.t =
   Lwt_list.map_p (fun req ->
     (* Each request is processed independently - errors in one don't affect others *)
-    try
-      Lwt.return (handle_single_request ctx req)
-    with exn ->
-      (* Extract id from malformed request if possible *)
-      let id = match req with
-        | `Assoc fields ->
-          (match List.assoc_opt "id" fields with
-           | Some v -> v
-           | None -> `Null)
-        | _ -> `Null
-      in
-      Lwt.return (json_rpc_error ~id ~code:rpc_parse_error
-                    ~message:(Printexc.to_string exn))
+    Lwt.catch
+      (fun () -> handle_single_request_lwt ctx req)
+      (fun exn ->
+        (* Extract id from malformed request if possible *)
+        let id = match req with
+          | `Assoc fields ->
+            (match List.assoc_opt "id" fields with
+             | Some v -> v
+             | None -> `Null)
+          | _ -> `Null
+        in
+        Lwt.return (json_rpc_error ~id ~code:rpc_parse_error
+                      ~message:(Printexc.to_string exn)))
   ) requests
 
 (* Extract wallet name from URI path: /wallet/<name> or / *)
@@ -13175,7 +13460,10 @@ let start_rpc_server ~(ctx : rpc_context)
 
         (* Single request: JSON object *)
         | `Assoc _ as single_request ->
-          let result = handle_single_request request_ctx single_request in
+          (* Lwt path so the wait-family RPCs (waitfornewblock /
+             waitforblock / waitforblockheight) can block the request
+             coroutine on a tip change without stalling the event loop. *)
+          let* result = handle_single_request_lwt request_ctx single_request in
           let response_body = Yojson.Safe.to_string result in
           let response_headers = Cohttp.Header.init_with
             "Content-Type" "application/json" in

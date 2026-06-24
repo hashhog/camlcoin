@@ -1043,16 +1043,28 @@ let cmd =
 let () =
   (* Tune the OCaml GC for a large-heap server process.
      - minor_heap_size: 4M words (32MB) reduces minor collections during
-       block validation which allocates many short-lived Cstruct/string values.
-     - space_overhead: 200 (default 120) lets the major heap grow 2x before
-       collecting, reducing major GC frequency at the cost of ~2x peak RSS.
-       With 128GB RAM this is a good trade.
-     - max_overhead: 500 means compaction only triggers when free space exceeds
-       5x live data, effectively disabling it (we use Gc.major() explicitly). *)
+       block validation which allocates many short-lived Cstruct/string
+       values — KEPT large so transients die young in the minor heap and never
+       reach the major heap (this directly cuts major-GC pressure).
+     - space_overhead: 120 (was 200; default 120) — LOWERED 2026-06-24 as part
+       of the GC-compaction RPC-stall fix.  The old 200 let the major heap
+       grow ~2x before collecting, on the "let it grow, then Gc.compact
+       explicitly" stance.  That backfired under autonomous public load: the
+       heap was ALLOWED to balloon, raising RSS and making each STW compaction
+       bigger + more frequent (the un-pin thrash).  Now that Gc_guard drives
+       the collector incrementally with non-STW Gc.major_slice on the Lwt loop
+       (no explicit STW on the RPC path), a tighter space_overhead keeps the
+       major heap small continuously instead of crushing it periodically.
+       (Soak-tunable knob in [80,120]: lower = tighter heap + more GC CPU;
+       overridable via the OCAMLRUNPARAM env if needed.)
+     - max_overhead: 500 keeps the runtime's OWN auto-compaction effectively
+       disabled — we do NOT want the runtime to surprise us with a STW
+       compaction.  ALL compaction is owned by Gc_guard's dedicated [Backstop]
+       worker domain (rare, high-RSS-ceiling only). *)
   let gc = Gc.get () in
   Gc.set { gc with
     minor_heap_size = 4 * 1024 * 1024;
-    space_overhead = 200;
+    space_overhead = 120;
     max_overhead = 500;
   };
   exit (Cmd.eval cmd)

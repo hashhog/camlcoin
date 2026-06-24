@@ -3418,16 +3418,21 @@ let accept_transaction_with_replaced ?(dry_run=false)
          real sendrawtransaction outcome for the same conflicting tx. *)
       replace_by_fee_with_replaced ~dry_run ~skip_verify_scripts mp tx
   in
-  (* Hot-path heap check (2026-06-09): this synchronous function is the single
-     choke point for RPC sendrawtransaction (rpc.ml handle_sendrawtransaction
-     runs it with ZERO Lwt yields — the detached gc_thread timer can never
-     preempt it) as well as the _lwt wrapper and the RBF path.  Mirrors
-     Bitcoin Core's AcceptToMemoryPool ending with
-     FlushStateToDisk(PERIODIC) (validation.cpp:1803) — the budget check
-     rides the work itself.  Once per tx accept, never per-input; O(1)
-     (Gc.quick_stat) when it does not fire; shares the threshold +
-     anti-thrash floor with every other trigger via Gc_guard. *)
-  Gc_guard.maybe_compact ~reason:"hot-path:sendraw";
+  (* Hot-path GC keep-up (2026-06-09, made non-STW 2026-06-24): this
+     synchronous function is the single choke point for RPC
+     sendrawtransaction (rpc.ml handle_sendrawtransaction runs it with ZERO
+     Lwt yields — the detached gc_thread timer can never preempt it) as well
+     as the _lwt wrapper and the RBF path.  Mirrors Bitcoin Core's
+     AcceptToMemoryPool ending with FlushStateToDisk(PERIODIC)
+     (validation.cpp:1803) — the budget check rides the work itself.  Drives
+     the major collector forward with a NON-STW [Gc.major_slice]
+     ([maybe_keep_up]) so the per-accept churn is reclaimed incrementally
+     WITHOUT a stop-the-world pause on the RPC-serving domain (the 2026-06-24
+     RPC-stall fix — the old [Gc.compact] here was the stall).  The rare STW
+     backstop is owned by the gc_thread/status-loop on a dedicated domain, not
+     this hot path.  Once per tx accept, never per-input; O(1)
+     (Gc.major_slice 0 + one gettimeofday). *)
+  Gc_guard.maybe_keep_up ~reason:"hot-path:sendraw";
   result
 
 let accept_transaction ?(dry_run=false) ?(skip_verify_scripts=false)
@@ -3552,13 +3557,17 @@ let accept_to_memory_pool ?(test_accept=false) (mp : mempool) (tx : Types.transa
       atmp_reject_reason = Some reason;
       atmp_replaced_txids = []; }
   in
-  (* Hot-path heap check (2026-06-09): covers the P2P TxMsg arm
-     (cli.ml's listener routes every relayed tx through here).  Core
-     analog: AcceptToMemoryPool ends with FlushStateToDisk(PERIODIC)
-     (validation.cpp:1803).  Once per tx, never per-input; the shared
-     Gc_guard anti-thrash floor makes the overlap with the inner
-     accept_transaction_with_replaced check free. *)
-  Gc_guard.maybe_compact ~reason:"hot-path:atmp";
+  (* Hot-path GC check (2026-06-09; non-STW slice + dedicated-domain backstop
+     2026-06-24): covers the P2P TxMsg arm (cli.ml's listener routes every
+     relayed tx through here — THE public-flood path that drove the un-pin
+     thrash).  Core analog: AcceptToMemoryPool ends with
+     FlushStateToDisk(PERIODIC) (validation.cpp:1803).  Non-STW
+     [Gc.major_slice] keep-up reclaims the per-accept churn incrementally
+     without stopping the RPC-serving domain; the ceiling backstop is
+     fire-and-forget to the dedicated [Backstop] worker domain.  Once per tx,
+     never per-input. *)
+  Gc_guard.maybe_keep_up ~reason:"hot-path:atmp";
+  Gc_guard.maybe_backstop ~reason:"hot-path:atmp";
   let%lwt () = Lwt.pause () in
   Lwt.return result
 
@@ -4627,11 +4636,15 @@ let accept_package_with_replaced (mp : mempool) (txs : Types.transaction list)
           | Ok () ->
             PackagePartial { accepted = accepted_list; rejected = rejected_list }
       in
-      (* Hot-path heap check (2026-06-09): once per <=25-tx package batch
-         (covers P2P pkgtxns via package_relay.ml and RPC submitpackage),
-         never per-tx/per-input.  Core analog: ProcessNewPackage ends with
-         FlushStateToDisk(PERIODIC) (validation.cpp:1835). *)
-      Gc_guard.maybe_compact ~reason:"hot-path:package";
+      (* Hot-path GC check (2026-06-09; non-STW slice + dedicated-domain
+         backstop 2026-06-24): once per <=25-tx package batch (covers P2P
+         pkgtxns via package_relay.ml and RPC submitpackage), never
+         per-tx/per-input.  Core analog: ProcessNewPackage ends with
+         FlushStateToDisk(PERIODIC) (validation.cpp:1835).  Non-STW slice +
+         dedicated-domain ceiling backstop (same rationale as the atmp/block
+         sites). *)
+      Gc_guard.maybe_keep_up ~reason:"hot-path:package";
+      Gc_guard.maybe_backstop ~reason:"hot-path:package";
       (pkg_result, evicted_list)
       )  (* end is_child_with_parents_tree match *)
 

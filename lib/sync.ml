@@ -3208,6 +3208,10 @@ let process_downloaded_blocks ?(max_blocks = 1)
            entry.download_state <- Validated;
            ibd.next_process_height <- ibd.next_process_height + 1;
            ibd.chain.blocks_synced <- height;
+           (* Wake the wait-family RPCs on this IBD tip advance (Core
+              KernelNotifications blockTip / WaitTipChanged).  Best-effort:
+              a notifier fault must never stall IBD. *)
+           (try Tip_notifier.notify () with _ -> ());
            ibd.blocks_since_flush <- ibd.blocks_since_flush + 1;
            incr processed;
            (* Store nTx for every connected block so getblockheader can
@@ -3481,6 +3485,11 @@ let disconnect_to_target (state : chain_state) (target : header_entry)
           state.tip <- Some target;
           state.blocks_synced <- target.height;
           Storage.ChainDB.set_chain_tip state.db target.hash target.height;
+          (* Wake the wait-family RPCs: a rollback (invalidateblock /
+             disconnect-to-target) is a tip change too — Core's
+             KernelNotifications blockTip fires on the disconnect half of a
+             reorg.  Best-effort. *)
+          (try Tip_notifier.notify () with _ -> ());
           Logs.info (fun m ->
             m "Rollback complete: tip rewound from height %d to %d"
               current_tip.height target.height);
@@ -3593,6 +3602,10 @@ let disconnect_to_target_via_utxo (state : chain_state)
           coinstats_rewind_if_enabled state ~target_height:target.height;
           state.tip <- Some target;
           state.blocks_synced <- target.height;
+          (* Wake the wait-family RPCs: a utxo-aware rollback
+             (invalidateblock / disconnect-to-target) is a tip change too —
+             Core's blockTip fires on the disconnect half.  Best-effort. *)
+          (try Tip_notifier.notify () with _ -> ());
           Logs.info (fun m ->
             m "Rollback (utxo-aware) complete: tip rewound from height %d to %d"
               current_tip.height target.height);
@@ -4736,6 +4749,14 @@ let reorganize (ibd : ibd_state) (new_tip : header_entry)
             Logs.info (fun m ->
               m "Reorganization complete, new tip at height %d"
                 new_tip.height);
+            (* Wake the wait-family RPCs — a reorg is a tip change (Core
+               KernelNotifications blockTip / WaitTipChanged fires on reorg
+               too).  The disconnect + connect halves are committed atomically
+               in one [batch_write] above and [blocks_synced] flips once to the
+               new tip, so a single notify here covers both halves: no
+               intermediate fork-point tip is ever observable to a waiter (the
+               chain lock is held across the reorg).  Best-effort. *)
+            (try Tip_notifier.notify () with _ -> ());
             Ok ()
       end
   end
@@ -5567,6 +5588,10 @@ let rec connect_stored_blocks (state : chain_state) : int =
           ) stored_block.transactions;
           state.blocks_synced <- next_height;
           state.tip <- Some entry;
+          (* Wake the wait-family RPCs on this gap-fill / catch-up tip advance
+             (Core KernelNotifications blockTip / WaitTipChanged).
+             Best-effort: a notifier fault must never stall block connect. *)
+          (try Tip_notifier.notify () with _ -> ());
           (* Bug 8 fix (2026-04-26): keep in-memory headers_synced in sync
              with state.tip. apply_block_atomic persists header_tip to DB,
              but the locator builder reads the in-memory field; without
@@ -5829,6 +5854,12 @@ let process_new_block ?(f_requested = false)
             ~tip_hash:hash ~tip_height:height
             ~header_tip_hash:hash ~header_tip_height:height
             (List.rev !ops);
+          (* Wake the wait-family RPCs on this LIVE post-IBD tip advance (Core
+             KernelNotifications blockTip / WaitTipChanged).  Placed AFTER the
+             atomic chainstate commit so a waiter that wakes and re-reads the
+             authoritative DB tip observes the committed value.  Best-effort:
+             a notifier fault must never roll back this connected block. *)
+          (try Tip_notifier.notify () with _ -> ());
           (* Store nTx for this newly-connected block so getblockheader
              returns the correct count without needing the full block body. *)
           Storage.ChainDB.store_block_ntx state.db hash

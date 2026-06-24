@@ -103,6 +103,11 @@ let run ~(ic : in_channel) ~(db : Storage.ChainDB.t)
          Sync.tx_index_write_for_block_recompute db block hash;
          (* Update chain tip in DB *)
          chain.blocks_synced <- height;
+         (* Wake any wait-family RPC blocked on a tip change (Core
+            KernelNotifications blockTip / WaitTipChanged).  Best-effort —
+            the offline --import-blocks path normally has no RPC server up,
+            but wiring it keeps every blocks_synced advance covered. *)
+         (try Tip_notifier.notify () with _ -> ());
          (match Hashtbl.find_opt chain.headers hash_key with
           | Some entry -> chain.tip <- Some entry
           | None -> ());

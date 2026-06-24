@@ -3218,6 +3218,12 @@ let remove_added_node (pm : t) (node : string) : bool =
 let added_nodes (pm : t) : string list =
   pm.added_nodes
 
+(* Snapshot of the live peer list (for getaddednodeinfo's added-list ->
+   peer-table join). Mirrors iterating CConnman::m_nodes; per peer the caller
+   reads [Peer.addr]/[Peer.port]/[Peer.direction]. *)
+let get_peers (pm : t) : Peer.peer list =
+  pm.peers
+
 (* Get list of all peer statistics *)
 let get_peer_stats (pm : t) : Peer.peer_stats list =
   List.map (fun peer ->

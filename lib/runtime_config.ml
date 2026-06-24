@@ -341,6 +341,115 @@ let resolve_debug_categories (raw : string list) : string list =
     raw |> List.concat_map split_categories |> List.filter (fun s -> s <> "")
 
 (* ============================================================================
+   Live debug-category mask (for the `logging` RPC)
+   ----------------------------------------------------------------------------
+   Bitcoin Core keeps an in-memory per-category bitmask (BCLog::Logger
+   ::m_categories) that the `logging` RPC mutates with EnableCategory /
+   DisableCategory; every LogPrint() consults it on each record, so a toggle
+   takes effect immediately with no restart (logging.cpp:149 WillLogCategory).
+
+   camlcoin's logging is genuinely category-based: each module owns a named
+   `Logs.Src` (PEER / NET / MEMPOOL / VALIDATION / RPC / WALLET / MINING /
+   REST / PKG-RELAY / PayJoin). The Logs library reports a `Debug`-level
+   record for a source IFF that source's level is `Some Debug`
+   (logs.mli:22-25), and `Logs.debug`/`Log.debug` re-reads `Src.level` on
+   EVERY call. So the live mask is just each source's own reporting level —
+   there is NO snapshot to go stale (the trap the ouroboros port called out):
+   we mutate the real `Logs.Src` the running node logs through, and the next
+   `Log.debug` honours it.
+
+   "Active" (== being debug logged, Core's `WillLogCategory`) is defined as
+   `Logs.Src.level src = Some Debug`. enable -> set the source to `Some Debug`
+   (its `Log.debug` calls start flowing); disable -> set it to `Some Info`
+   (Debug records are suppressed again while Info/Warn/Error survive, matching
+   Core where a non-debug category still emits at higher levels).
+
+   The application's default source (`Logs.default`) is intentionally
+   EXCLUDED from the category set: it is the unnamed catch-all, not a real
+   Core-style debug category, and Core does not expose it either. *)
+
+(* camlcoin's OWN debug categories — the named `Logs.Src` each node module
+   registers (one per subsystem). This is the documented category set the
+   `logging` RPC exposes; it deliberately EXCLUDES (a) the unnamed default
+   application source and (b) the library-internal sources that linked deps
+   (cohttp / tls / x509 / mirage-crypto / bos / ca-certs / ...) create via
+   their own `Logs.Src.create`. Core only reports its own categories
+   (LOG_CATEGORIES_BY_STR), not the logging substrate's internals, so we do
+   the same: an allowlist keyed by the source NAME the camlcoin modules use.
+
+   Keep this in sync with the `Logs.Src.create` calls across lib/*.ml:
+     RPC          rpc.ml            REST       rest.ml
+     NET          peer_manager.ml   PEER       peer.ml
+     MEMPOOL      mempool.ml        VALIDATION sync.ml
+     WALLET       wallet.ml         MINING     mining.ml
+     PKG-RELAY    package_relay.ml  PayJoin    payjoin.ml *)
+let camlcoin_category_names : string list =
+  [ "RPC"; "REST"; "NET"; "PEER"; "MEMPOOL"; "VALIDATION";
+    "WALLET"; "MINING"; "PKG-RELAY"; "PayJoin" ]
+
+(* The live `Logs.Src` objects for camlcoin's own categories (those present in
+   the running source list whose name is in the allowlist). Discovered from
+   the live list so we mutate the exact source the node logs through. *)
+let logging_category_sources () : Logs.src list =
+  Logs.Src.list ()
+  |> List.filter (fun src ->
+         (not (Logs.Src.equal src Logs.default))
+         && List.mem (Logs.Src.name src) camlcoin_category_names)
+
+(* Category names, alphabetically sorted (Core iterates a std::map, so the
+   `logging` output is alphabetical and byte-stable). De-duplicated in the
+   unlikely event two modules share a source name. *)
+let logging_category_names () : string list =
+  logging_category_sources ()
+  |> List.map Logs.Src.name
+  |> List.sort_uniq String.compare
+
+(* A category is "active" (being debug logged) iff its source reports Debug. *)
+let category_is_active (src : Logs.src) : bool =
+  match Logs.Src.level src with
+  | Some Logs.Debug -> true
+  | _ -> false
+
+(* Look up a source by exact name (Core's category names are case-sensitive
+   lookups against LOG_CATEGORIES_BY_STR). Returns None for an unknown name so
+   the caller can raise Core's -8 "unknown logging category". *)
+let find_category_source (name : string) : Logs.src option =
+  List.find_opt
+    (fun src -> Logs.Src.name src = name)
+    (logging_category_sources ())
+
+(* Enable one category by name: source -> Some Debug (its Log.debug flows).
+   Returns false for an unknown name (Core EnableCategory contract). *)
+let enable_category (name : string) : bool =
+  match find_category_source name with
+  | Some src -> Logs.Src.set_level src (Some Logs.Debug); true
+  | None -> false
+
+(* Disable one category by name: source -> Some Info (Debug suppressed, higher
+   levels survive). Returns false for an unknown name. *)
+let disable_category (name : string) : bool =
+  match find_category_source name with
+  | Some src -> Logs.Src.set_level src (Some Logs.Info); true
+  | None -> false
+
+(* Special tokens "all" / "1" (and "" / "none" / "0") — enable or disable the
+   WHOLE mask in one shot, like Core's EnableCategory("all"). Always succeeds. *)
+let enable_all_categories () : unit =
+  List.iter (fun src -> Logs.Src.set_level src (Some Logs.Debug))
+    (logging_category_sources ())
+
+let disable_all_categories () : unit =
+  List.iter (fun src -> Logs.Src.set_level src (Some Logs.Info))
+    (logging_category_sources ())
+
+(* The full {category: active} snapshot, alphabetical — built fresh on each
+   call (never cached), so it always reflects the live source levels. *)
+let logging_status_map () : (string * bool) list =
+  logging_category_sources ()
+  |> List.map (fun src -> (Logs.Src.name src, category_is_active src))
+  |> List.sort_uniq (fun (a, _) (b, _) -> String.compare a b)
+
+(* ============================================================================
    Ready-fd handshake (--ready-fd=<N>)
    ----------------------------------------------------------------------------
    When the launcher is a supervisor (systemd Type=notify, runit, custom),

@@ -1352,15 +1352,218 @@ let verify_input_slice
     | Ok () -> verify_one_input ~tx ~flags ~prevouts ~wtxid ~cache i inp utxo
   ) (Ok ()) tasks
 
-(* Verify all inputs of a transaction in parallel using OCaml 5 Domains.
+(* ----------------------------------------------------------------------------
+   W143: Persistent IBD-scoped script-check worker pool.
+
+   Reference: Bitcoin Core's CCheckQueue (src/checkqueue.h) — a fixed-size
+   thread pool created ONCE for the lifetime of the chainstate, fed batches of
+   CScriptCheck closures, never re-spawned per transaction.
+
+   The PRE-W143 code spawned up to recommended_domain_count()-1 (≈31) fresh
+   OCaml Domains PER TRANSACTION inside verify_scripts_parallel_domain.  During
+   IBD that is tens of thousands of Domain spawn/join cycles per block — the
+   spawn/join overhead dwarfs the secp256k1 work (~0 blk/s) and every Domain
+   reserves a minor-heap arena (~111 GB RSS).  Core never does this: it has one
+   pool with at most MAX_SCRIPTCHECK_THREADS=15 workers (validation.h:90).
+
+   This pool replaces the per-call spawn with submission to a persistent,
+   fixed-size, generation-barrier parallel-map pool (hand-rolled on Mutex +
+   Condition — Domainslib is intentionally NOT a dependency of this sensitive
+   node).  It processes ONE batch at a time: verify_scripts_parallel_domain
+   submits a transaction's input slices synchronously and blocks until they all
+   complete.  No two batches overlap, so a single results array + a single
+   generation counter suffice.
+
+   IBD-scoped: created in Validation_worker.create (sync.ml) when the IBD
+   validation Domain starts, torn down in Validation_worker.shutdown.  When no
+   pool is active (script_check_pool = None — e.g. at-tip / regtest /
+   submitblock paths) verify_scripts_parallel_domain falls back to a pure
+   serial in-thread fold.  This deliberately keeps idle script Domains out of
+   the FullySynced at-tip path (camlcoin's documented Gc.compact thrash).
+   ---------------------------------------------------------------------------- *)
+
+(* Per-batch parameters shared with the workers.  verify_scripts_parallel_domain
+   sets these under the mutex before bumping the generation, so each worker
+   reads the CURRENT batch's tx/flags/prevouts/wtxid/cache for its slice. *)
+type batch_params = {
+  bp_tx : Types.transaction;
+  bp_flags : int;
+  bp_prevouts : (int64 * Cstruct.t) list;
+  bp_wtxid : Types.hash256;
+  bp_cache : Sig_cache.t;
+}
+
+type script_check_pool = {
+  pool_mutex : Mutex.t;
+  work_cond : Condition.t;   (* workers wait here for a new generation *)
+  done_cond : Condition.t;   (* submitter waits here for pending = 0 *)
+  nworkers : int;            (* 0 ⇒ serial-in-thread submit (no Domains) *)
+  (* Per-worker slices for the current batch; index = worker id. *)
+  mutable slices : (int * Types.tx_in * utxo) list array;
+  (* Per-worker result for the current batch. *)
+  mutable results : (unit, int * string) result array;
+  (* Current batch parameters (None between batches). *)
+  mutable params : batch_params option;
+  mutable generation : int;  (* bumped once per submitted batch *)
+  mutable pending : int;     (* workers still to finish this batch *)
+  mutable shutdown : bool;
+  mutable workers : unit Domain.t array;
+}
+
+(* Worker loop: each worker services slices.(my_index) for every generation it
+   has not yet serviced.  Bookkeeping is under the mutex; the expensive
+   verify_input_slice runs OUTSIDE the mutex. *)
+let pool_worker_loop (pool : script_check_pool) (my_index : int) : unit =
+  let last_serviced = ref 0 in
+  let continue = ref true in
+  while !continue do
+    Mutex.lock pool.pool_mutex;
+    (* Wait until either shutdown or a new generation appears.  Guard against
+       spurious wakeups by re-checking the predicate in the while condition. *)
+    while (not pool.shutdown) && pool.generation = !last_serviced do
+      Condition.wait pool.work_cond pool.pool_mutex
+    done;
+    if pool.shutdown then begin
+      Mutex.unlock pool.pool_mutex;
+      continue := false
+    end else begin
+      let gen = pool.generation in
+      let slice = pool.slices.(my_index) in
+      let params = match pool.params with
+        | Some p -> p
+        | None -> assert false   (* generation advanced ⇒ params set *)
+      in
+      Mutex.unlock pool.pool_mutex;
+      (* Run the slice outside the lock — this is the expensive part. *)
+      let r =
+        try
+          verify_input_slice
+            ~tx:params.bp_tx ~flags:params.bp_flags
+            ~prevouts:params.bp_prevouts ~wtxid:params.bp_wtxid
+            ~cache:params.bp_cache slice
+        with e ->
+          (* Never let a worker exception deadlock the submitter: surface it as
+             an Error so pending still reaches 0.  Index -1 marks "no specific
+             input" (the submitter's first-error scan still reports it). *)
+          Error (-1, Printexc.to_string e)
+      in
+      Mutex.lock pool.pool_mutex;
+      pool.results.(my_index) <- r;
+      pool.pending <- pool.pending - 1;
+      last_serviced := gen;
+      if pool.pending = 0 then Condition.signal pool.done_cond;
+      Mutex.unlock pool.pool_mutex
+    end
+  done
+
+(* Partition [tasks] into [n] near-even contiguous slices (slice i gets every
+   item; sizes differ by at most 1).  Deterministic worker-index order: slice 0
+   holds the lowest input indices, matching a pure serial left-to-right fold. *)
+let partition_tasks (tasks : (int * Types.tx_in * utxo) list) (n : int)
+    : (int * Types.tx_in * utxo) list array =
+  let arr = Array.of_list tasks in
+  let total = Array.length arr in
+  let base = total / n in
+  let rem = total mod n in
+  let slices = Array.make n [] in
+  let pos = ref 0 in
+  for i = 0 to n - 1 do
+    let len = base + (if i < rem then 1 else 0) in
+    slices.(i) <- Array.to_list (Array.sub arr !pos len);
+    pos := !pos + len
+  done;
+  slices
+
+(* Submit one batch synchronously and return its first error (deterministic:
+   scanned in worker-index then in-slice order, identical to a serial fold). *)
+let pool_submit (pool : script_check_pool)
+    (tx : Types.transaction) (flags : int)
+    (prevouts : (int64 * Cstruct.t) list)
+    (wtxid : Types.hash256) (cache : Sig_cache.t)
+    (tasks : (int * Types.tx_in * utxo) list)
+    : (unit, int * string) result =
+  if pool.nworkers = 0 then
+    (* No Domains: run the whole batch serially in the calling thread. *)
+    verify_input_slice ~tx ~flags ~prevouts ~wtxid ~cache tasks
+  else begin
+    let params = {
+      bp_tx = tx; bp_flags = flags; bp_prevouts = prevouts;
+      bp_wtxid = wtxid; bp_cache = cache;
+    } in
+    let slices = partition_tasks tasks pool.nworkers in
+    Mutex.lock pool.pool_mutex;
+    pool.slices <- slices;
+    pool.results <- Array.make pool.nworkers (Ok ());
+    pool.params <- Some params;
+    pool.pending <- pool.nworkers;
+    pool.generation <- pool.generation + 1;
+    Condition.broadcast pool.work_cond;
+    while pool.pending > 0 do
+      Condition.wait pool.done_cond pool.pool_mutex
+    done;
+    (* Snapshot results before releasing the lock; clear params so a leaked
+       reference cannot pin the batch's tx/prevouts. *)
+    let results = Array.copy pool.results in
+    pool.params <- None;
+    Mutex.unlock pool.pool_mutex;
+    (* First error in deterministic order (worker-index then in-slice, which is
+       input-index order because partition_tasks keeps slices contiguous). *)
+    let rec scan i =
+      if i >= Array.length results then Ok ()
+      else match results.(i) with
+        | Error _ as e -> e
+        | Ok () -> scan (i + 1)
+    in
+    scan 0
+  end
+
+(* Create the worker pool.  nworkers = min(recommended-1, 15) clamped at >= 0,
+   mirroring Core MAX_SCRIPTCHECK_THREADS (validation.h:90).  nworkers = 0
+   yields a pool whose submit runs serially in-thread (no Domains) — for tiny
+   machines / regtest. *)
+let create_pool () : script_check_pool =
+  let nworkers = max 0 (min (Domain.recommended_domain_count () - 1) 15) in
+  let pool = {
+    pool_mutex = Mutex.create ();
+    work_cond = Condition.create ();
+    done_cond = Condition.create ();
+    nworkers;
+    slices = [||];
+    results = [||];
+    params = None;
+    generation = 0;
+    pending = 0;
+    shutdown = false;
+    workers = [||];
+  } in
+  if nworkers > 0 then
+    pool.workers <- Array.init nworkers (fun i ->
+      Domain.spawn (fun () -> pool_worker_loop pool i));
+  pool
+
+(* Tear down the pool: signal shutdown, wake all workers, join them. *)
+let shutdown_pool (pool : script_check_pool) : unit =
+  Mutex.lock pool.pool_mutex;
+  pool.shutdown <- true;
+  Condition.broadcast pool.work_cond;
+  Mutex.unlock pool.pool_mutex;
+  Array.iter Domain.join pool.workers;
+  pool.workers <- [||]
+
+(* Global handle for the active IBD-scoped pool.
+   None ⇒ no pool active ⇒ verify_scripts_parallel_domain uses serial fallback
+   (at-tip / not-IBD / submitblock / regtest / tests). *)
+let script_check_pool : script_check_pool option ref = ref None
+
+(* Verify all inputs of a transaction.
    Reference: Bitcoin Core's CCheckQueue (src/checkqueue.h) which distributes
    CScriptCheck jobs across N-1 worker threads + the master thread.
 
-   Implementation:
-   - Collect all (index, input, utxo) tasks.
-   - Partition across min(ncpus, ntasks) domains.
-   - Spawn N-1 domains; the main domain processes the last partition.
-   - Join all domains and collect the first error.
+   W143: the per-tx Domain.spawn/join was replaced by submission to the
+   persistent IBD-scoped script_check_pool.  No code path spawns a Domain per
+   transaction anymore.  The accept/reject DECISION is identical to the old
+   per-tx-spawn code and to a pure serial fold: the FIRST error (deterministic,
+   in input-index order), else Ok ().
 
    UTXO apply (the caller's responsibility) must complete in tx order before
    this function is called — scripts are checked after the UTXO is committed,
@@ -1396,45 +1599,30 @@ let verify_scripts_parallel_domain
          from the canonical tx's wtxid → cache miss → re-verify → reject). *)
       let wtxid = Crypto.compute_wtxid tx in
       let cache = Sig_cache.get_global () in
-      (* Number of domains: min(cpu_count, ntasks), at least 1. *)
-      let ncpus = Domain.recommended_domain_count () in
-      let ndomains = max 1 (min ncpus ntasks) in
-      if ndomains = 1 then begin
-        (* Serial fallback — avoid Domain overhead for tiny transactions. *)
-        match verify_input_slice ~tx ~flags ~prevouts ~wtxid ~cache tasks with
-        | Ok () -> Ok ()
-        | Error (idx, msg) -> Error (TxScriptFailed (idx, msg))
-      end else begin
-        (* Partition tasks across ndomains.
-           chunk = ceiling(ntasks/ndomains) so that every domain gets at most
-           chunk tasks.  However, when ntasks is not evenly divisible by
-           ndomains the ceiling over-allocates: the last few workers compute
-           start = (d+1)*chunk > ntasks.  The W22 fix added max 0 for len, but
-           Array.sub raises Invalid_argument when pos > Array.length even with
-           len=0.  Fix: clamp start to ntasks before computing stop/len so
-           both pos and pos+len are always within [0, ntasks]. *)
-        let chunk = (ntasks + ndomains - 1) / ndomains in
-        let task_arr = Array.of_list tasks in
-        (* Spawn ndomains-1 worker domains; main domain handles first chunk. *)
-        let workers = Array.init (ndomains - 1) (fun d ->
-          let start = min ntasks ((d + 1) * chunk) in
-          let stop  = min ntasks (start + chunk) in
-          let len   = stop - start in  (* always >= 0: start <= stop *)
-          let slice = Array.to_list (Array.sub task_arr start len) in
-          Domain.spawn (fun () ->
-            verify_input_slice ~tx ~flags ~prevouts ~wtxid ~cache slice)
-        ) in
-        (* Main domain processes first chunk. *)
-        let main_slice = Array.to_list (Array.sub task_arr 0 (min chunk ntasks)) in
-        let main_result = verify_input_slice ~tx ~flags ~prevouts ~wtxid ~cache main_slice in
-        (* Join all worker domains. *)
-        let worker_results = Array.map Domain.join workers in
-        (* Collect first error across all results. *)
-        let all_results = main_result :: Array.to_list worker_results in
-        match List.find_opt (fun r -> match r with Error _ -> true | Ok () -> false) all_results with
-        | Some (Error (idx, msg)) -> Error (TxScriptFailed (idx, msg))
-        | _ -> Ok ()
-      end
+      (* Decide serial-in-thread vs pool submission.  USE the previously-dead
+         min_inputs_for_parallel threshold (fixes audit G3): below it the pool
+         hand-off costs more than the saved secp256k1 work.  Also fall back to
+         serial when no pool is active (at-tip / not-IBD / nworkers=0). *)
+      let result =
+        match !script_check_pool with
+        | Some pool when ntasks >= min_inputs_for_parallel && pool.nworkers > 0 ->
+          (* Fun.protect: an exception escaping the submit must not leave the
+             pool half-submitted (fixes audit G18).  The pool is internally
+             exception-safe — workers catch their own exceptions — so the
+             finaliser only has to guarantee params is cleared. *)
+          Fun.protect
+            ~finally:(fun () ->
+              Mutex.lock pool.pool_mutex;
+              pool.params <- None;
+              Mutex.unlock pool.pool_mutex)
+            (fun () -> pool_submit pool tx flags prevouts wtxid cache tasks)
+        | _ ->
+          (* Serial fallback — no Domains spawned. *)
+          verify_input_slice ~tx ~flags ~prevouts ~wtxid ~cache tasks
+      in
+      match result with
+      | Ok () -> Ok ()
+      | Error (idx, msg) -> Error (TxScriptFailed (idx, msg))
     end
 
 (* Lwt-compatible wrapper: executes Domain-parallel verification synchronously.

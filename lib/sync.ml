@@ -2955,6 +2955,26 @@ module Validation_worker = struct
   let shutdown (t : t) : unit =
     put_req t.req Shutdown;
     Domain.join t.domain
+
+  (* W143: bring up / tear down the persistent script-check worker pool.
+     These are deliberately SEPARATE from create/shutdown so the pool is bound
+     to the IBD validation loop ONLY (start_ibd, below) and is NOT created for
+     the post-IBD / at-tip worker (cli.ml ensure_post_ibd_worker).  This keeps
+     the FullySynced steady state free of idle script Domains — camlcoin's
+     documented at-tip Gc.compact thrash lives on the loopback-pin, and we must
+     not carry 15 idle Domains into it.  Idempotent: safe to call once per IBD
+     run; the at-tip path simply never calls them, so verify_scripts_* falls
+     back to its serial in-thread path (script_check_pool = None). *)
+  let start_script_pool () : unit =
+    match !Validation.script_check_pool with
+    | Some _ -> ()  (* already active — never double-create *)
+    | None -> Validation.script_check_pool := Some (Validation.create_pool ())
+
+  let stop_script_pool () : unit =
+    (match !Validation.script_check_pool with
+     | Some p -> Validation.shutdown_pool p
+     | None -> ());
+    Validation.script_check_pool := None
 end
 
 (* Process downloaded blocks in height order.
@@ -5290,6 +5310,11 @@ let run_ibd ?(shutdown_flag : bool ref option)
      The worker runs block validation off the Lwt main thread; all ibd.*
      mutation remains on the Lwt thread. *)
   let worker = Validation_worker.create () in
+  (* W143: IBD-scoped persistent script-check pool (replaces the per-tx
+     Domain.spawn in verify_scripts_parallel_domain).  Bound to this IBD loop
+     only — torn down at every IBD-exit below — so the at-tip steady state
+     carries no idle script Domains. *)
+  Validation_worker.start_script_pool ();
   Logs.info (fun m -> m "IBD: spawned persistent validation worker Domain");
   (* Helper: send requests to all active peers *)
   let send_requests () =
@@ -5308,6 +5333,7 @@ let run_ibd ?(shutdown_flag : bool ref option)
     if is_shutdown () then begin
       Logs.info (fun m -> m "IBD: shutdown requested, stopping loop");
       (try Validation_worker.shutdown worker with _ -> ());
+      (try Validation_worker.stop_script_pool () with _ -> ());
       Lwt.return_unit
     end else begin
     fill_download_queue ibd;
@@ -5328,6 +5354,9 @@ let run_ibd ?(shutdown_flag : bool ref option)
       ibd.chain.sync_state <- FullySynced;
       (* Shut down the persistent validation worker cleanly. *)
       (try Validation_worker.shutdown worker with _ -> ());
+      (* W143: tear down the IBD-scoped script-check pool at IBD completion so
+         the FullySynced steady state carries no idle script Domains. *)
+      (try Validation_worker.stop_script_pool () with _ -> ());
       Lwt.return_unit
     end else begin
       (* Periodic orphan expiry (cheap, runs ~once/loop) *)

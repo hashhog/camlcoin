@@ -3955,214 +3955,14 @@ let decode_utxo_for_lookup (txid : Types.hash256) (vout_le : int32)
 (* ============================================================================
    verifychain — re-validate the last N blocks of the active chain.
 
-   Mirrors bitcoin-core/src/validation.cpp CVerifyDB::VerifyDB
-   (called by rpc/blockchain.cpp::verifychain). Walks from the validated
-   tip backward for [nblocks] blocks, applying progressively heavier checks
-   per [checklevel]:
+   The implementation lives further down (after the reorg disconnect/connect
+   machinery it now reuses): see [verify_chain] below
+   [stage_pending_utxos_into_batch]. It is placed there so it can call the
+   real [disconnect_block_into_batch] / [connect_block_into_batch] over an
+   in-memory [reorg_view] overlay (the exact path a live reorg uses) instead
+   of a separate verifychain-only undo/disconnect reimplementation.
+   ============================================================================ *)
 
-     0  read block from disk            (Storage.ChainDB.get_block)
-     1  + CheckBlock                    (Validation.check_block)
-     2  + undo data present + decodes + Core's vtxundo/vtx size-consistency
-        rule (validation.cpp:2190-2193: vtxundo.size()+1 == block.vtx.size())
-     3  + reconstruct the block's pre-spend UTXO view from its OWN undo data
-        and re-run the full ConnectBlock machinery (Validation.accept_block:
-        input resolution, value/maturity, BIP-68/112/113 locktime, sigops,
-        and signature/script verification) against that sandbox view. This
-        is the read-only analogue of Core's level-3 disconnect-into-sandbox /
-        level-4 reconnect: camlcoin's UTXO set is the live RocksDB store, so
-        instead of mutating it we rebuild the exact spent-coin view the block
-        consumed (the same data Core's DisconnectBlock would restore) and
-        replay ConnectBlock over it. No live chainstate is touched.
-     4  + same as 3 but PoW is re-checked too (skip_pow=false) and scripts are
-        always verified even inside the assumevalid window (the on-disk block
-        was accepted under assumevalid, so a full verifychain must re-run the
-        scripts Core would have on a from-genesis verify).
-
-   nblocks=0 or nblocks > chain-height ⇒ entire chain (clamped, Core
-   validation.cpp:4624). checklevel clamped to [0,4] (Core :4627).
-   A chain with only genesis (or empty) returns true vacuously (Core :4619).
-
-   Returns true iff every walked block passes every requested check.
-   Logs the failing height/hash/reason and returns false on the first
-   failure — it is NOT a constant stub; the heavy levels invoke the same
-   [Validation.accept_block] the live sync/reorg paths use. *)
-let verify_chain (state : chain_state) ~(checklevel : int) ~(nblocks : int)
-    : bool =
-  let checklevel = max 0 (min 4 checklevel) in
-  match block_tip state with
-  | None ->
-    (* Empty chain: nothing to verify (Core returns SUCCESS when Tip()==null). *)
-    true
-  | Some tip ->
-    let tip_height = tip.height in
-    (* Core: genesis-only chain (Tip()->pprev == null) is vacuously valid. *)
-    if tip_height <= 0 then true
-    else begin
-      (* Core validation.cpp:4624 — nblocks<=0 or > height means the whole
-         chain. We verify heights [start_height .. tip_height], stopping at 1
-         (genesis at height 0 has no parent / no undo, exactly as Core's loop
-         halts at pindex->pprev). *)
-      let depth =
-        if nblocks <= 0 || nblocks > tip_height then tip_height
-        else nblocks
-      in
-      let start_height = max 1 (tip_height - depth + 1) in
-      Logs.info (fun m ->
-        m "verifychain: verifying last %d blocks (heights %d..%d) at level %d"
-          (tip_height - start_height + 1) start_height tip_height checklevel);
-      let ok = ref true in
-      let h = ref tip_height in
-      while !ok && !h >= start_height do
-        let height = !h in
-        (match get_header_at_height state height with
-         | None ->
-           Logs.err (fun m ->
-             m "verifychain: header missing at height %d" height);
-           ok := false
-         | Some entry ->
-           (* Level 0: read block from disk. *)
-           (match Storage.ChainDB.get_block state.db entry.hash with
-            | None ->
-              Logs.err (fun m ->
-                m "verifychain: ReadBlock failed at %d, hash=%s"
-                  height (Types.hash256_to_hex_display entry.hash));
-              ok := false
-            | Some block ->
-              let expected_bits =
-                compute_expected_bits state height block.header in
-              let median_time = compute_median_time_past state height in
-              let prev_block_time = get_prev_block_time state height in
-              (* Level 1: CheckBlock (header sanity, merkle root, coinbase,
-                 weight/sigops, witness commitment, dup-txid, IsFinalTx). PoW
-                 hash<=target is re-checked at level>=4 (skip_pow=false). *)
-              let level1_ok =
-                if checklevel < 1 then true
-                else
-                  match Validation.check_block ~network:state.network block
-                          height ~expected_bits ~median_time ~prev_block_time
-                          ~skip_pow:(checklevel < 4) () with
-                  | Ok () -> true
-                  | Error e ->
-                    Logs.err (fun m ->
-                      m "verifychain: bad block at %d, hash=%s (%s)"
-                        height (Types.hash256_to_hex_display entry.hash)
-                        (Validation.block_error_to_string e));
-                    false
-              in
-              if not level1_ok then ok := false
-              else begin
-                (* Level 2: undo data present, decodes, and is size-consistent
-                   with the block (Core validation.cpp:2190-2193). *)
-                let undo_opt =
-                  if checklevel < 2 then None
-                  else match Storage.ChainDB.get_undo_data state.db entry.hash with
-                    | None ->
-                      Logs.err (fun m ->
-                        m "verifychain: bad undo data at %d, hash=%s (missing)"
-                          height (Types.hash256_to_hex_display entry.hash));
-                      ok := false;
-                      None
-                    | Some raw ->
-                      (try
-                        let r =
-                          Serialize.reader_of_cstruct (Cstruct.of_string raw) in
-                        let undo = Utxo.deserialize_undo_data r in
-                        let num_txs = List.length block.transactions in
-                        let num_undos = List.length undo.tx_undos in
-                        if num_undos + 1 <> num_txs then begin
-                          Logs.err (fun m ->
-                            m "verifychain: undo/block size mismatch at %d \
-                               (txs=%d undos=%d)" height num_txs num_undos);
-                          ok := false;
-                          None
-                        end else Some undo
-                      with ex ->
-                        Logs.err (fun m ->
-                          m "verifychain: undo decode failed at %d: %s"
-                            height (Printexc.to_string ex));
-                        ok := false;
-                        None)
-                in
-                (* Levels 3 and 4: rebuild the block's pre-spend UTXO view
-                   from its undo data and re-run ConnectBlock over it. This
-                   re-validates every script/input the same way the live sync
-                   path does, without mutating the live UTXO set. *)
-                if !ok && checklevel >= 3 then begin
-                  match undo_opt with
-                  | None ->
-                    (* checklevel>=3 needs undo to rebuild the spent view;
-                       a missing one was already flagged at level 2. *)
-                    if !ok then begin
-                      Logs.err (fun m ->
-                        m "verifychain: no undo data to reconnect block at %d"
-                          height);
-                      ok := false
-                    end
-                  | Some undo ->
-                    (* Build a lookup over the spent coins the block consumed.
-                       undo.tx_undos[i] corresponds to block tx (i+1) (Core
-                       encodes one vtxundo per NON-coinbase tx, in tx order);
-                       each spent_output is (outpoint, utxo_entry) — exactly
-                       the coin that input spent. This is the pre-spend view
-                       ConnectBlock would see on a from-genesis verify. *)
-                    let tbl : (string, Validation.utxo) Hashtbl.t =
-                      Hashtbl.create 256 in
-                    List.iter (fun (tu : Utxo.tx_undo) ->
-                      List.iter (fun (op, (e : Utxo.utxo_entry)) ->
-                        let key =
-                          Cstruct.to_string op.Types.txid
-                          ^ Int32.to_string op.Types.vout in
-                        Hashtbl.replace tbl key
-                          Validation.{
-                            txid = op.Types.txid;
-                            vout = op.Types.vout;
-                            value = e.value;
-                            script_pubkey = e.script_pubkey;
-                            height = e.height;
-                            is_coinbase = e.is_coinbase;
-                          })
-                        tu.spent_outputs)
-                      undo.tx_undos;
-                    let base_lookup (op : Types.outpoint) =
-                      Hashtbl.find_opt tbl
-                        (Cstruct.to_string op.Types.txid
-                         ^ Int32.to_string op.Types.vout)
-                    in
-                    (* Full ConnectBlock. At level 4 scripts are verified even
-                       inside the assumevalid window; at level 3 we honour the
-                       node's assumevalid skip (matches the work the live
-                       connect path did for this block). *)
-                    let skip_scripts =
-                      checklevel < 4 && is_assume_valid state height in
-                    let flags =
-                      if skip_scripts then 0
-                      else Consensus.get_block_script_flags height state.network
-                    in
-                    (match Validation.accept_block
-                             ~network:state.network ~block ~height
-                             ~expected_bits ~median_time ~prev_block_time
-                             ~base_lookup ~flags ~skip_scripts
-                             ~skip_pow:(checklevel < 4)
-                             ~get_mtp_at_height:(get_mtp_for_height state)
-                             ?bip34_height_hash:(bip34_height_hash_for state)
-                             () with
-                     | Validation.AB_ok _ -> ()
-                     | Validation.AB_err e ->
-                       Logs.err (fun m ->
-                         m "verifychain: unconnectable block at %d, hash=%s (%s)"
-                           height (Types.hash256_to_hex_display entry.hash)
-                           (Validation.block_error_to_string e));
-                       ok := false)
-                end
-              end));
-        decr h
-      done;
-      if !ok then
-        Logs.info (fun m ->
-          m "verifychain: no inconsistencies in last %d blocks"
-            (tip_height - start_height + 1));
-      !ok
-    end
 
 (* [batch] in this module is [Storage.ChainDB.batch]; the alias keeps the
    reorg helpers below readable without importing the whole module. *)
@@ -4750,6 +4550,286 @@ let stage_pending_utxos_into_batch
   ) view.view_deletes;
   ibd.pending_utxo_updates <- [];
   ibd.pending_utxo_deletes <- []
+
+(* ============================================================================
+   verifychain — re-validate the last N blocks of the active chain.
+
+   Mirrors bitcoin-core/src/validation.cpp CVerifyDB::VerifyDB
+   (called by rpc/blockchain.cpp::verifychain). Walks from the validated
+   tip backward for [nblocks] blocks, applying progressively heavier checks
+   per [checklevel]:
+
+     0  read block from disk            (Storage.ChainDB.get_block)
+     1  + CheckBlock                    (Validation.check_block)
+     2  + undo data validity. Mirrors Core validation.cpp:4672-4680 exactly:
+        undo is read+decoded ONLY when this block HAS undo recorded (Core's
+        [!pindex->GetUndoPos().IsNull()]). A block with no undo on disk —
+        a coinbase-only block (trivially empty undo) OR a block connected
+        under assume-valid IBD where undo was intentionally not written
+        (sync.ml:3096 [if not ibd_mode]) OR a pruned block — is SKIPPED for
+        the undo/disconnect checks, NOT failed (Core never reads a null
+        undo pos). Only undo that is PRESENT-but-corrupt (decode failure or
+        the vtxundo.size()+1 == block.vtx.size() rule, validation.cpp:2190-2193)
+        is a verification error.
+     3  + memory-only disconnect of the tip blocks using the block's own undo
+        data, exactly as Core's level-3 [DisconnectBlock] into a
+        [CCoinsViewCache] over [CoinsTip()] (validation.cpp:4684-4701). We
+        REUSE the live reorg's [disconnect_block_into_batch] against a
+        throwaway [reorg_view] overlay layered over the live UTXO store —
+        the same coin-restore-from-undo path a real reorg runs. The live
+        chainstate is never mutated: the overlay and the batch are discarded
+        (no [batch_write]), and the index appenders are masked off (the
+        verify-only [chain_state] copy nulls the three index handles).
+        A DISCONNECT_FAILED is a corruption error; a DISCONNECT_UNCLEAN
+        records the inconsistency (Core's [pindexFailure]/[nGoodTransactions]=0).
+     4  + reconnect the disconnected blocks forward via the live reorg's
+        [connect_block_into_batch] over the same overlay (Core
+        validation.cpp:4716-4735 [ConnectBlock]). Scripts are ALWAYS verified
+        at level 4 even inside the assumevalid window (the on-disk block was
+        accepted under assume-valid, so a full verify must re-run the scripts
+        Core would on a from-genesis verify) and PoW is re-checked
+        ([skip_pow:false]).
+
+   nblocks=0 or nblocks > chain-height => entire chain (clamped, Core
+   validation.cpp:4624). checklevel clamped to [0,4] (Core :4627).
+   A chain with only genesis (or empty) returns true vacuously (Core :4619).
+
+   Returns true iff every walked block passes every requested check.
+   Logs the failing height/hash/reason and returns false on the first
+   failure — it is NOT a constant stub; the heavy levels invoke the same
+   [disconnect_block_into_batch]/[connect_block_into_batch] the live reorg
+   path uses. *)
+let verify_chain (state : chain_state) ~(checklevel : int) ~(nblocks : int)
+    : bool =
+  let checklevel = max 0 (min 4 checklevel) in
+  match block_tip state with
+  | None ->
+    (* Empty chain: nothing to verify (Core returns SUCCESS when Tip()==null). *)
+    true
+  | Some tip ->
+    let tip_height = tip.height in
+    (* Core: genesis-only chain (Tip()->pprev == null) is vacuously valid. *)
+    if tip_height <= 0 then true
+    else begin
+      (* Core validation.cpp:4624 — nblocks<=0 or > height means the whole
+         chain. We verify heights [start_height .. tip_height], stopping at 1
+         (genesis at height 0 has no parent / no undo, exactly as Core's loop
+         halts at pindex->pprev). *)
+      let depth =
+        if nblocks <= 0 || nblocks > tip_height then tip_height
+        else nblocks
+      in
+      let start_height = max 1 (tip_height - depth + 1) in
+      Logs.info (fun m ->
+        m "verifychain: verifying last %d blocks (heights %d..%d) at level %d"
+          (tip_height - start_height + 1) start_height tip_height checklevel);
+
+      (* Level 3/4 disconnect+reconnect run against a verify-only shallow copy
+         of [chain_state] with the three on-disk indexes masked to [None], so
+         the index appenders inside [disconnect_block_into_batch] /
+         [connect_block_into_batch] (coinstats MuHash, BIP-157 filters, txo
+         spender) are no-ops and the live indexes are never touched. The
+         [db] handle is shared (reads only — UTXO reads fall through the
+         overlay); all writes go to a [batch]/[reorg_view] that is discarded. *)
+      let verify_chain_state = {
+        state with
+        bip157_index = None;
+        coinstatsindex = None;
+        txospenderindex = None;
+      } in
+      (* Level 4 forces script verification even inside the assumevalid
+         window: clear [assume_valid_hash] on the network used by the
+         reconnect path so [connect_block_into_batch] does not skip scripts. *)
+      let l4_chain_state =
+        if checklevel < 4 then verify_chain_state
+        else { verify_chain_state with
+               network = { verify_chain_state.network with
+                           assume_valid_hash = None } }
+      in
+      (* One throwaway [ibd_state] + [batch] + [reorg_view] for the whole
+         disconnect/reconnect walk. The batch is never written; the overlay
+         layers over the live UTXO store and accumulates the disconnect
+         changes (Core's single [CCoinsViewCache coins]). *)
+      let disc_ibd = create_ibd_state verify_chain_state in
+      let conn_ibd = create_ibd_state l4_chain_state in
+      let batch = Storage.ChainDB.batch_create () in
+      let view = reorg_view_create () in
+
+      let ok = ref true in
+      (* Blocks actually disconnected at level>=3. We prepend each tip-first
+         block as we disconnect it, so after the loop the list is in forward
+         (lowest -> highest) order, ready for the level-4 reconnect. *)
+      let disconnected : header_entry list ref = ref [] in
+      (* The level-3 disconnect walks the tip-suffix contiguously. The moment
+         we reach a block with no undo on disk (assume-valid IBD / pruned), we
+         CANNOT roll the overlay back any further, so we stop the disconnect
+         walk there — mirroring Core's [break] when [!BLOCK_HAVE_DATA] under
+         pruning / a snapshot (validation.cpp:4652-4658). Heights below the
+         gap are left unverified at level>=3 (Core verifies only the suffix it
+         can reach), but the L2 presence/format check keeps walking them. *)
+      let disconnect_gap = ref false in
+
+      (* ---- Levels 0/1/2 + the level-3 disconnect, tip -> start_height. ---- *)
+      let h = ref tip_height in
+      while !ok && !h >= start_height do
+        let height = !h in
+        (match get_header_at_height state height with
+         | None ->
+           Logs.err (fun m ->
+             m "verifychain: header missing at height %d" height);
+           ok := false
+         | Some entry ->
+           (* Level 0: read block from disk. *)
+           (match Storage.ChainDB.get_block state.db entry.hash with
+            | None ->
+              Logs.err (fun m ->
+                m "verifychain: ReadBlock failed at %d, hash=%s"
+                  height (Types.hash256_to_hex_display entry.hash));
+              ok := false
+            | Some block ->
+              let expected_bits =
+                compute_expected_bits state height block.header in
+              let median_time = compute_median_time_past state height in
+              let prev_block_time = get_prev_block_time state height in
+              (* Level 1: CheckBlock (header sanity, merkle root, coinbase,
+                 weight/sigops, witness commitment, dup-txid, IsFinalTx). PoW
+                 hash<=target is re-checked at level>=4 (skip_pow=false). *)
+              let level1_ok =
+                if checklevel < 1 then true
+                else
+                  match Validation.check_block ~network:state.network block
+                          height ~expected_bits ~median_time ~prev_block_time
+                          ~skip_pow:(checklevel < 4) () with
+                  | Ok () -> true
+                  | Error e ->
+                    Logs.err (fun m ->
+                      m "verifychain: bad block at %d, hash=%s (%s)"
+                        height (Types.hash256_to_hex_display entry.hash)
+                        (Validation.block_error_to_string e));
+                    false
+              in
+              if not level1_ok then ok := false
+              else if checklevel >= 2 then begin
+                (* Level 2: undo data validity. Core (validation.cpp:4672-4680)
+                   reads undo ONLY when the block HAS an undo position; a null
+                   undo pos is skipped, never failed. camlcoin's equivalent of
+                   "undo pos is null" is "get_undo_data returns None": this is
+                   the case for coinbase-only blocks (no spends), assume-valid
+                   IBD blocks (undo intentionally not stored, sync.ml:3096),
+                   and pruned blocks. We reuse the SAME read path the reorg
+                   disconnect uses ([Storage.ChainDB.get_undo_data] ->
+                   [Utxo.deserialize_undo_data]); present-but-corrupt undo
+                   (decode failure or size-rule violation) is the only L2
+                   failure. *)
+                let has_undo =
+                  match Storage.ChainDB.get_undo_data state.db entry.hash with
+                  | None ->
+                    (* No undo recorded for this block — Core skips it
+                       (GetUndoPos().IsNull()). NOT an error. *)
+                    Logs.debug (fun m ->
+                      m "verifychain: no undo data at %d (skipping undo/\
+                         disconnect checks, Core GetUndoPos().IsNull parity)"
+                        height);
+                    false
+                  | Some raw ->
+                    (try
+                       let r =
+                         Serialize.reader_of_cstruct (Cstruct.of_string raw) in
+                       let undo = Utxo.deserialize_undo_data r in
+                       let num_txs = List.length block.transactions in
+                       let num_undos = List.length undo.tx_undos in
+                       (* Core validation.cpp:2190-2193 — one vtxundo per
+                          NON-coinbase tx. This is the same consistency rule
+                          [disconnect_block_into_batch] enforces. *)
+                       if num_undos + 1 <> num_txs then begin
+                         Logs.err (fun m ->
+                           m "verifychain: undo/block size mismatch at %d \
+                              (txs=%d undos=%d)" height num_txs num_undos);
+                         ok := false;
+                         false
+                       end else true
+                     with ex ->
+                       Logs.err (fun m ->
+                         m "verifychain: undo decode failed at %d: %s"
+                           height (Printexc.to_string ex));
+                       ok := false;
+                       false)
+                in
+                (* Level 3: memory-only disconnect using the REAL reorg path.
+                   Attempted only on the contiguous tip-suffix of blocks that
+                   all have undo: the first block without undo (assume-valid /
+                   pruned) ends the disconnect walk (Core's pruning [break]),
+                   because the overlay cannot be rolled back past a gap. *)
+                if !ok && checklevel >= 3 && not !disconnect_gap then begin
+                  if not has_undo then begin
+                    (* Core validation.cpp:4655 log + break. *)
+                    Logs.info (fun m ->
+                      m "verifychain: stopping disconnect at height %d \
+                         (no undo data; assume-valid IBD or pruning). \
+                         Heights below this are not re-disconnected."
+                        height);
+                    disconnect_gap := true
+                  end else
+                  match disconnect_block_into_batch disc_ibd batch view entry with
+                  | Error e ->
+                    (* Core: DISCONNECT_FAILED => CORRUPTED_BLOCK_DB. *)
+                    Logs.err (fun m ->
+                      m "verifychain: irrecoverable inconsistency \
+                         (disconnect) at %d, hash=%s (%s)"
+                        height (Types.hash256_to_hex_display entry.hash) e);
+                    ok := false
+                  | Ok (_txs, Disconnect_failed) ->
+                    Logs.err (fun m ->
+                      m "verifychain: disconnect FAILED at %d, hash=%s"
+                        height (Types.hash256_to_hex_display entry.hash));
+                    ok := false
+                  | Ok (_txs, Disconnect_unclean) ->
+                    (* Core records this as an inconsistency
+                       (pindexFailure/nGoodTransactions=0) -> overall failure. *)
+                    Logs.err (fun m ->
+                      m "verifychain: disconnect UNCLEAN (UTXO/output \
+                         mismatch) at %d, hash=%s"
+                        height (Types.hash256_to_hex_display entry.hash));
+                    ok := false
+                  | Ok (_txs, Disconnect_ok) ->
+                    disconnected := entry :: !disconnected
+                end
+              end));
+        decr h
+      done;
+
+      (* ---- Level 4: reconnect the disconnected blocks forward. ----
+         [!disconnected] is in forward (lowest -> highest) order because we
+         prepended each block as we walked tip -> start. Reconnecting
+         head-to-tail mirrors Core's [pindex = Next(pindex)] forward walk
+         (validation.cpp:4717-4725). *)
+      if !ok && checklevel >= 4 then begin
+        let to_connect = !disconnected in
+        let rec go = function
+          | [] -> ()
+          | (entry : header_entry) :: rest ->
+            if !ok then begin
+              match
+                connect_block_into_batch ~skip_pow:false conn_ibd batch view entry
+              with
+              | Error e ->
+                Logs.err (fun m ->
+                  m "verifychain: unconnectable block at %d, hash=%s (%s)"
+                    entry.height
+                    (Types.hash256_to_hex_display entry.hash) e);
+                ok := false
+              | Ok _ -> go rest
+            end
+        in
+        go to_connect
+      end;
+
+      if !ok then
+        Logs.info (fun m ->
+          m "verifychain: no inconsistencies in last %d blocks"
+            (tip_height - start_height + 1));
+      !ok
+    end
 
 (* Perform chain reorganization to new tip.  D-FULL atomicity: all
    disk writes from BOTH halves of the reorg land in ONE [batch_write].

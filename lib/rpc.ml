@@ -2359,6 +2359,85 @@ let handle_submitblock (ctx : rpc_context)
   | _ ->
     Error "Invalid parameters: expected [hexdata]"
 
+(* submitheader "hexdata"
+   Decode the given hexdata as an 80-byte block header and submit it as a
+   candidate chain tip if valid.  Throws when the header is invalid.
+
+   Reference: bitcoin-core/src/rpc/mining.cpp::submitheader (RPCHelpMan,
+   lines ~1108-1146).  Core semantics, reproduced byte-for-byte:
+     1. DecodeHexBlockHeader(h, params[0]) fails (bad hex / not exactly 80
+        bytes / undecodable) -> RPC_DESERIALIZATION_ERROR (-22)
+        "Block header decode failed".
+     2. LookupBlockIndex(h.hashPrevBlock) miss (parent unknown to this node)
+        -> RPC_VERIFY_ERROR (-25)
+        "Must submit previous header (<prevhash>) first", where <prevhash>
+        is the big-endian DISPLAY hex (Core's h.hashPrevBlock.GetHex()).
+     3. ProcessNewBlockHeaders({{h}}, min_pow_checked=true, state):
+        - state.IsValid()  -> JSON null (also covers an already-known header,
+          which Core re-accepts as valid).
+        - otherwise        -> RPC_VERIFY_ERROR (-25) with the reject reason.
+
+   Reuses the SAME headers-first accept path as the P2P sync loop
+   ([Sync.process_headers] -> [Sync.validate_header] + [Sync.accept_header],
+   which writes [set_height_hash]); no parallel validator is introduced.
+   This mirrors the ouroboros pilot (rpc.py::rpc_submitheader, which reuses
+   BlockSync._header_meets_pow + _validated_headers / _store_fork_header).
+
+   Returns [Ok json] or [Error (code, message)] so the distinct -22 / -25
+   codes can be carried to the dispatcher unchanged. *)
+let handle_submitheader (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  match params with
+  | [`String hex] ->
+    (* Step 1: decode the hex as exactly an 80-byte block header.
+       Core's DecodeHexBlockHeader rejects bad hex, a non-80-byte payload,
+       AND any trailing bytes after the 80-byte header.  We replicate all
+       three: of_hex throws on malformed hex; we length-check 80 up front;
+       deserialize_block_header then consumes exactly 80 bytes. *)
+    let decoded =
+      try
+        let data = Cstruct.of_hex hex in
+        if Cstruct.length data <> 80 then None
+        else
+          let r = Serialize.reader_of_cstruct data in
+          let header = Serialize.deserialize_block_header r in
+          Some header
+      with _ -> None
+    in
+    (match decoded with
+     | None ->
+       Error (rpc_deserialization_error, "Block header decode failed")
+     | Some header ->
+       (* Step 2: parent-known check.
+          Core: chainman.m_blockman.LookupBlockIndex(h.hashPrevBlock).
+          camlcoin's in-memory header index is [ctx.chain.headers], keyed by
+          the internal (little-endian) 32-byte hash; the genesis header and
+          every accepted header live there (Sync.create/restore_chain_state +
+          Sync.accept_header). *)
+       let prev_key = Cstruct.to_string header.prev_block in
+       if not (Hashtbl.mem ctx.chain.headers prev_key) then
+         (* prevhash in big-endian DISPLAY hex, matching Core's GetHex(). *)
+         let prev_display = Types.hash256_to_hex_display header.prev_block in
+         Error (rpc_verify_error,
+           Printf.sprintf "Must submit previous header (%s) first" prev_display)
+       else
+         (* Step 3: run through the real headers-first validation + store.
+            min_pow_checked=true (default) matches Core's submitheader call,
+            which passes /*min_pow_checked=*/true — this is a trusted,
+            operator-submitted header, so the too-little-chainwork anti-DoS
+            gate is skipped, exactly as in Core. *)
+         (match Sync.process_headers ctx.chain [header] with
+          | Ok _ ->
+            (* IsValid: newly accepted, OR an already-known header (which
+               process_headers reports as 0-accepted with no error, just like
+               Core re-accepting a known index entry as valid). -> null. *)
+            Ok `Null
+          | Error reason ->
+            (* PoW / contextual validation failure -> -25 with reject reason. *)
+            Error (rpc_verify_error, reason)))
+  | _ ->
+    Error (rpc_invalid_parameter, "submitheader requires a hexdata string argument")
+
 (* ============================================================================
    Regtest Mining RPCs (generate, generatetoaddress, generateblock)
    ============================================================================ *)
@@ -12899,6 +12978,10 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_submitblock ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_verify_rejected, msg))
+  | "submitheader" ->
+    (* handle_submitheader already returns the Core-exact (code, message)
+       pair (-22 decode / -25 verify), so pass it straight through. *)
+    handle_submitheader ctx params
   | "generate" ->
     (match handle_generate ctx params with
      | Ok r -> Ok r

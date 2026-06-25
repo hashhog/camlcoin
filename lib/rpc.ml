@@ -1561,6 +1561,50 @@ let handle_getpeerinfo (ctx : rpc_context) : Yojson.Safe.t =
 let handle_getconnectioncount (ctx : rpc_context) : Yojson.Safe.t =
   `Int (Peer_manager.peer_count ctx.peer_manager)
 
+(* getnettotals
+   Returns information about network traffic, including total bytes in/out and
+   the current epoch time in ms.
+   Reference: bitcoin-core/src/rpc/net.cpp getnettotals() (net.cpp:560-606).
+   Shape (Core, in order):
+     { totalbytesrecv, totalbytessent, timemillis,
+       uploadtarget: { timeframe, target, target_reached,
+                       serve_historical_blocks, bytes_left_in_cycle,
+                       time_left_in_cycle } }
+   totalbytesrecv/sent reuse the node-global cumulative P2P byte counters
+   (Peer_manager.get_total_bytes — live peers' current counts plus the rolled-up
+   totals of already-disconnected peers, mirroring CConnman m_total_bytes_recv
+   / m_total_bytes_sent).
+   uploadtarget: camlcoin has no -maxuploadtarget, so (exactly like Core when
+   nMaxOutboundLimit == 0) target=0, target_reached=false,
+   serve_historical_blocks=true, bytes_left_in_cycle=0, time_left_in_cycle=0,
+   timeframe = the default UPLOAD_TARGET_FRAME = 60*60*24 = 86400s
+   (Core net.h: m_max_outbound_timeframe default 24h, GetMaxOutboundTimeframe
+   returns it regardless of the limit being set). *)
+let handle_getnettotals (ctx : rpc_context) : Yojson.Safe.t =
+  let total_recv, total_sent = Peer_manager.get_total_bytes ctx.peer_manager in
+  let time_millis = Int64.of_float (Unix.gettimeofday () *. 1000.0) in
+  `Assoc [
+    ("totalbytesrecv", `Int total_recv);
+    ("totalbytessent", `Int total_sent);
+    ("timemillis", `Intlit (Int64.to_string time_millis));
+    ("uploadtarget", `Assoc [
+      (* Core GetMaxOutboundTimeframe(): default 24h frame, independent of
+         whether a byte target is configured (net.h m_max_outbound_timeframe). *)
+      ("timeframe", `Int 86400);
+      (* No -maxuploadtarget configured → GetMaxOutboundTarget() == 0. *)
+      ("target", `Int 0);
+      (* OutboundTargetReached(false): never reached when no limit is set. *)
+      ("target_reached", `Bool false);
+      (* serve_historical_blocks = !OutboundTargetReached(true): true when no
+         limit (Core serves historical blocks freely). *)
+      ("serve_historical_blocks", `Bool true);
+      (* GetOutboundTargetBytesLeft(): 0 when nMaxOutboundLimit == 0. *)
+      ("bytes_left_in_cycle", `Int 0);
+      (* GetMaxOutboundTimeLeftInCycle(): 0s when nMaxOutboundLimit == 0. *)
+      ("time_left_in_cycle", `Int 0);
+    ]);
+  ]
+
 let handle_getnetworkinfo (ctx : rpc_context) : Yojson.Safe.t =
   (* Render localservices straight from [Peer.our_services] so the RPC
      output matches the bits we actually advertise on the wire.  When
@@ -6227,6 +6271,253 @@ let handle_decoderawtransaction (ctx : rpc_context)
   | _ ->
     Error "Invalid parameters: expected [hexstring]"
 
+(* createrawtransaction [{"txid","vout","sequence"?},...]
+                        {"address":amount,...} | {"data":hex} ( locktime replaceable )
+   Build an UNSIGNED raw transaction and return its serialized hex.
+   Reference: bitcoin-core/src/rpc/rawtransaction.cpp createrawtransaction()
+   → ConstructTransaction (rawtransaction_util.cpp:147), AddInputs (:24),
+     AddOutputs / ParseOutputs (:101).
+   REUSE: Serialize.serialize_transaction (the same writer the wallet /
+   createpsbt / signrawtransaction path uses), Address.address_of_string +
+   Address.address_to_script (the same address→scriptPubKey machinery as
+   createpsbt / decoderawtransaction), Bip21.parse_amount (exact-decimal
+   BTC→satoshi, mirroring Core's ParseFixedPoint inside AmountFromValue —
+   no float rounding).
+   nSequence mapping (rawtransaction_util.cpp:47-66), explicit sequence wins:
+     replaceable                 → MAX_BIP125_RBF_SEQUENCE 0xFFFFFFFD
+     !replaceable && locktime!=0  → MAX_SEQUENCE_NONFINAL   0xFFFFFFFE
+     !replaceable && locktime==0  → SEQUENCE_FINAL          0xFFFFFFFF
+   Core defaults replaceable to TRUE (rbf.value_or(true)).  No segwit marker on
+   an all-empty-scriptSig unsigned tx (witnesses=[]) — matches Core, which only
+   emits the marker when a witness is present.
+   Error codes match Core: bad/cross-network address → -5
+   (RPC_INVALID_ADDRESS_OR_KEY "Invalid Bitcoin address: <a>"); bad amount → -3
+   (RPC_TYPE_ERROR "Invalid amount" / "Amount out of range"); duplicate address
+   → -8; duplicate data → -8; out-of-range vout/sequence/locktime → -8. *)
+let max_sequence_nonfinal : int32 = 0xFFFFFFFEl
+let sequence_final : int32 = 0xFFFFFFFFl
+
+let handle_createrawtransaction (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  let network = network_to_address_network ctx.network in
+  (* Core uses a custom exception class; we surface (code, message) via a
+     local exception so the nested parsers can raise the Core-exact pair. *)
+  let module E = struct exception Rpc of int * string end in
+  let fail code msg = raise (E.Rpc (code, msg)) in
+  try
+    let inputs_param, outputs_param, locktime_param, replaceable_param =
+      match params with
+      | [a; b] -> a, b, `Null, `Null
+      | [a; b; c] -> a, b, c, `Null
+      | [a; b; c; d] -> a, b, c, d
+      | _ ->
+        fail rpc_invalid_params
+          "createrawtransaction [{\"txid\":\"id\",\"vout\":n},...] \
+           [{\"address\":amount},...] ( locktime replaceable )"
+    in
+    (* --- locktime (parsed first: it feeds the !replaceable sequence) ----
+       Core: getInt<int64>(); range [0, LOCKTIME_MAX=0xFFFFFFFF]. *)
+    let locktime =
+      match locktime_param with
+      | `Null -> 0L
+      | `Int n -> Int64.of_int n
+      | `Intlit s -> (try Int64.of_string s with _ ->
+          fail rpc_invalid_parameter "Invalid parameter, locktime out of range")
+      | _ -> fail rpc_type_error "Locktime must be an integer"
+    in
+    if Int64.compare locktime 0L < 0 || Int64.compare locktime 0xFFFFFFFFL > 0 then
+      fail rpc_invalid_parameter "Invalid parameter, locktime out of range";
+    let locktime_i32 = Int64.to_int32 locktime in
+    (* Core: rbf is std::optional<bool>; unset → value_or(true). *)
+    let replaceable =
+      match replaceable_param with
+      | `Null -> true
+      | `Bool b -> b
+      | _ -> fail rpc_type_error "Replaceable must be a boolean"
+    in
+    let default_sequence =
+      if replaceable then Wallet.max_bip125_rbf_sequence
+      else if Int64.compare locktime 0L <> 0 then max_sequence_nonfinal
+      else sequence_final
+    in
+    (* --- inputs (AddInputs) -------------------------------------------- *)
+    let input_items =
+      match inputs_param with
+      | `List arr -> arr
+      | `Null -> fail rpc_type_error
+          "Expected type array, got null"
+      | _ -> fail rpc_type_error "Expected type array for inputs"
+    in
+    let tx_inputs =
+      List.map (fun obj ->
+        let fields = match obj with
+          | `Assoc f -> f
+          | _ -> fail rpc_invalid_parameter "Invalid parameter, expected object"
+        in
+        (* txid: Core ParseHashO → 64-hex; arrives in display (BE) order, store
+           internal LE (reverse), same as createpsbt input parse. *)
+        let txid =
+          match List.assoc_opt "txid" fields with
+          | Some (`String s) ->
+            (match parse_hash_v s ~name:"txid" with
+             | Error (c, m) -> fail c m
+             | Ok () ->
+               let display = Types.hash256_of_hex s in
+               let h = Cstruct.create 32 in
+               for i = 0 to 31 do
+                 Cstruct.set_uint8 h i (Cstruct.get_uint8 display (31 - i))
+               done;
+               h)
+          | _ -> fail rpc_invalid_parameter
+                   "Invalid parameter, missing txid key"
+        in
+        (* vout: Core getInt<int>(); must be >= 0. *)
+        let vout =
+          match List.assoc_opt "vout" fields with
+          | Some (`Int n) ->
+            if n < 0 then
+              fail rpc_invalid_parameter
+                "Invalid parameter, vout cannot be negative";
+            Int32.of_int n
+          | Some _ -> fail rpc_invalid_parameter
+                        "Invalid parameter, missing vout key"
+          | None -> fail rpc_invalid_parameter
+                      "Invalid parameter, missing vout key"
+        in
+        (* explicit sequence wins; Core range [0, SEQUENCE_FINAL=0xFFFFFFFF]. *)
+        let sequence =
+          match List.assoc_opt "sequence" fields with
+          | Some (`Int n) ->
+            if n < 0 || Int64.compare (Int64.of_int n) 0xFFFFFFFFL > 0 then
+              fail rpc_invalid_parameter
+                "Invalid parameter, sequence number is out of range";
+            Int32.of_int n
+          | Some (`Intlit s) ->
+            (match Int64.of_string_opt s with
+             | Some v when Int64.compare v 0L >= 0
+                        && Int64.compare v 0xFFFFFFFFL <= 0 ->
+               Int64.to_int32 v
+             | _ -> fail rpc_invalid_parameter
+                      "Invalid parameter, sequence number is out of range")
+          | Some _ -> fail rpc_invalid_parameter
+                        "Invalid parameter, sequence number is out of range"
+          | None -> default_sequence
+        in
+        { Types.previous_output = { txid; vout };
+          script_sig = Cstruct.empty;
+          sequence })
+        input_items
+    in
+    (* --- outputs (NormalizeOutputs + ParseOutputs) --------------------- *)
+    (* Core NormalizeOutputs: accepts an object {addr:amt} OR an array of
+       single-key objects [{addr:amt},...]; the array form is flattened. *)
+    let output_fields =
+      match outputs_param with
+      | `Null -> fail rpc_invalid_parameter
+          "Invalid parameter, output argument must be non-null"
+      | `Assoc fields -> fields
+      | `List arr ->
+        List.concat_map (function
+          | `Assoc [kv] -> [kv]
+          | `Assoc _ -> fail rpc_invalid_parameter
+              "Invalid parameter, key-value pair must contain exactly one key"
+          | _ -> fail rpc_invalid_parameter
+              "Invalid parameter, key-value pair not an object as expected")
+          arr
+      | _ -> fail rpc_type_error "Expected type array or object for outputs"
+    in
+    (* Core ParseOutputs: dup-data and dup-address detection. *)
+    let seen_data = ref false in
+    let seen_addrs = Hashtbl.create 8 in
+    let tx_outputs =
+      List.map (fun (name, amt) ->
+        if name = "data" then begin
+          if !seen_data then
+            fail rpc_invalid_parameter "Invalid parameter, duplicate key: data";
+          seen_data := true;
+          let hex_data = match amt with
+            | `String s -> s
+            | _ -> fail rpc_type_error "Data must be a hex string"
+          in
+          let data =
+            try hex_to_cstruct hex_data
+            with _ -> fail rpc_type_error
+                        (Printf.sprintf "Data must be hexadecimal string (not '%s')"
+                           hex_data)
+          in
+          (* OP_RETURN <data> built via the script writer, mirroring Core's
+             CScript() << OP_RETURN << data (canonical push-opcode encoding). *)
+          let n = Cstruct.length data in
+          let script =
+            if n < 0x4c then begin
+              let s = Cstruct.create (2 + n) in
+              Cstruct.set_uint8 s 0 0x6a;        (* OP_RETURN *)
+              Cstruct.set_uint8 s 1 n;           (* direct push *)
+              Cstruct.blit data 0 s 2 n; s
+            end else if n <= 0xff then begin
+              let s = Cstruct.create (3 + n) in
+              Cstruct.set_uint8 s 0 0x6a;        (* OP_RETURN *)
+              Cstruct.set_uint8 s 1 0x4c;        (* OP_PUSHDATA1 *)
+              Cstruct.set_uint8 s 2 n;
+              Cstruct.blit data 0 s 3 n; s
+            end else begin
+              let s = Cstruct.create (4 + n) in
+              Cstruct.set_uint8 s 0 0x6a;        (* OP_RETURN *)
+              Cstruct.set_uint8 s 1 0x4d;        (* OP_PUSHDATA2 *)
+              Cstruct.set_uint8 s 2 (n land 0xff);
+              Cstruct.set_uint8 s 3 ((n lsr 8) land 0xff);
+              Cstruct.blit data 0 s 4 n; s
+            end
+          in
+          { Types.value = 0L; script_pubkey = script }
+        end else begin
+          (* Address output. Core DecodeDestination → IsValidDestination →
+             -5 "Invalid Bitcoin address" on failure (incl. wrong-network). *)
+          let addr =
+            match Address.address_of_string name with
+            | Ok a when a.Address.network = network -> a
+            | _ -> fail rpc_invalid_address
+                     (Printf.sprintf "Invalid Bitcoin address: %s" name)
+          in
+          if Hashtbl.mem seen_addrs name then
+            fail rpc_invalid_parameter
+              (Printf.sprintf "Invalid parameter, duplicated address: %s" name);
+          Hashtbl.replace seen_addrs name ();
+          (* AmountFromValue: -3 on non-number / out-of-range; exact decimal. *)
+          let value =
+            let valstr = match amt with
+              | `Int i -> string_of_int i
+              | `Intlit s -> s
+              | `Float f -> Printf.sprintf "%.8f" f
+              | `String s -> s
+              | _ -> fail rpc_type_error "Amount is not a number or string"
+            in
+            match Bip21.parse_amount valstr with
+            | Ok v -> v
+            | Error _ -> fail rpc_type_error "Invalid amount"
+          in
+          if not (Consensus.is_valid_money value) then
+            fail rpc_type_error "Amount out of range";
+          let script_pubkey = Address.address_to_script addr in
+          { Types.value; script_pubkey }
+        end)
+        output_fields
+    in
+    (* Build the unsigned tx. version 2 = Core's default (TX_MAX_STANDARD).
+       No witnesses → serialize_transaction emits the legacy (no marker) form. *)
+    let tx =
+      { Types.version = 2l;
+        inputs = tx_inputs;
+        outputs = tx_outputs;
+        witnesses = [];
+        locktime = locktime_i32 }
+    in
+    let w = Serialize.writer_create () in
+    Serialize.serialize_transaction w tx;
+    let cs = Serialize.writer_to_cstruct w in
+    Ok (`String (cstruct_to_hex_early cs))
+  with E.Rpc (code, msg) -> Error (code, msg)
+
 (* decodescript "hexstring"
    Decode a hex-encoded script and return its components.
    Reference: bitcoin-core/src/rpc/rawtransaction.cpp `decodescript` handler.
@@ -10251,6 +10542,7 @@ let handle_help (_ctx : rpc_context)
       "getblockfrompeer \"blockhash\" peer_id";
       "getconnectioncount";
       "getnetworkinfo";
+      "getnettotals";
       "getnodeaddresses ( count \"network\" )";
       "getpeerinfo";
       "listbanned";
@@ -10258,6 +10550,7 @@ let handle_help (_ctx : rpc_context)
       "setban \"address\" \"add\"|\"remove\" ( bantime )";
       "";
       "== Rawtransactions ==";
+      "createrawtransaction [{\"txid\":\"id\",\"vout\":n},...] [{\"address\":amount},...] ( locktime replaceable )";
       "decoderawtransaction \"hexstring\"";
       "getrawtransaction \"txid\" ( verbose )";
       "sendrawtransaction \"hexstring\"";
@@ -12802,6 +13095,14 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_sendrawtransaction ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_verify_rejected, msg))
+  | "createrawtransaction" ->
+    (* handle_createrawtransaction returns Core-exact (code, message) pairs:
+       -5 bad/cross-network address, -3 bad amount (Invalid amount / Amount out
+       of range / not a number), -8 dup address / dup data / out-of-range
+       vout/sequence/locktime / missing key, -3 wrong-type locktime/replaceable.
+       Pass through verbatim. Returns the unsigned witness-free tx hex (bare
+       JSON string), byte-identical to Core's createrawtransaction. *)
+    handle_createrawtransaction ctx params
   | "decoderawtransaction" ->
     (match handle_decoderawtransaction ctx params with
      | Ok r -> Ok r
@@ -12834,6 +13135,8 @@ let dispatch_rpc (ctx : rpc_context)
     Ok (handle_getconnectioncount ctx)
   | "getnetworkinfo" ->
     Ok (handle_getnetworkinfo ctx)
+  | "getnettotals" ->
+    Ok (handle_getnettotals ctx)
   | "getaddrmaninfo" ->
     Ok (handle_getaddrmaninfo ctx)
   | "getmemoryinfo" ->

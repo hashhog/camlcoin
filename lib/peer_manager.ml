@@ -285,6 +285,17 @@ type t = {
      Health / dead-peer / stale-tip / eviction sweeps keep running.  Not
      persisted; resets to enabled on restart. *)
   mutable network_active : bool;
+  (* Node-global cumulative P2P byte totals across ALL connections,
+     including peers that have since disconnected (Core CConnman
+     m_total_bytes_recv / m_total_bytes_sent, surfaced by getnettotals via
+     GetTotalBytesRecv/Sent — net.cpp:3300).  Per-peer counters live on each
+     [Peer.peer] and vanish when [remove_peer] drops the peer from [peers];
+     these two accumulate a departing peer's final counts at disconnect so the
+     global totals are monotonic.  [get_total_bytes] returns these PLUS the
+     live peers' current counts.  Not persisted; resets on restart (Core's
+     totals are also process-lifetime, not persisted). *)
+  mutable disconnected_bytes_recv : int;
+  mutable disconnected_bytes_sent : int;
 }
 
 (* Generate a 256-bit eclipse-protection bucket key from /dev/urandom.
@@ -340,6 +351,8 @@ let create ?(config = default_config) ?(asmap : bytes option = None) (network : 
     addr_token = Hashtbl.create 64;
     added_nodes = [];
     network_active = true;
+    disconnected_bytes_recv = 0;
+    disconnected_bytes_sent = 0;
   }
 
 (* Pin the node to a fixed set of --connect peers (Bitcoin Core -connect).
@@ -1268,6 +1281,14 @@ let remove_peer (pm : t) (peer_id : int) : unit Lwt.t =
   | None -> Lwt.return_unit
   | Some peer ->
     let* () = Peer.disconnect peer in
+    (* Roll this peer's final byte counts into the node-global totals before
+       it leaves [peers], so getnettotals stays monotonic across the peer's
+       lifetime (Core CConnman accumulates into m_total_bytes_* in
+       RecordBytesRecv/Sent regardless of the peer's later disconnect). *)
+    pm.disconnected_bytes_recv <-
+      pm.disconnected_bytes_recv + peer.Peer.bytes_received;
+    pm.disconnected_bytes_sent <-
+      pm.disconnected_bytes_sent + peer.Peer.bytes_sent;
     pm.peers <- List.filter (fun p -> p.Peer.id <> peer_id) pm.peers;
     Hashtbl.remove pm.chain_sync_behind_since peer_id;
     (* Clean up eviction tracking *)
@@ -3231,6 +3252,18 @@ let get_peer_stats (pm : t) : Peer.peer_stats list =
     let mapped_as = Asmap.get_mapped_as pm.net_group_manager peer.Peer.addr in
     { stats with Peer.stat_mapped_as = mapped_as }
   ) pm.peers
+
+(* Node-global cumulative P2P byte totals (recv, sent) across ALL connections
+   including disconnected ones — the values getnettotals reports as
+   totalbytesrecv / totalbytessent (Core CConnman::GetTotalBytesRecv/Sent,
+   net.cpp:3300).  = bytes from already-departed peers (rolled up at
+   [remove_peer]) PLUS the live peers' current per-peer counts. *)
+let get_total_bytes (pm : t) : int * int =
+  List.fold_left
+    (fun (recv, sent) peer ->
+       (recv + peer.Peer.bytes_received, sent + peer.Peer.bytes_sent))
+    (pm.disconnected_bytes_recv, pm.disconnected_bytes_sent)
+    pm.peers
 
 (* Handle peer disconnect - re-queue in-flight blocks immediately *)
 let on_peer_disconnect (pm : t) (peer_id : int)

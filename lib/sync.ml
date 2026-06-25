@@ -3952,6 +3952,218 @@ let decode_utxo_for_lookup (txid : Types.hash256) (vout_le : int32)
     is_coinbase = utxo_is_coinbase;
   }
 
+(* ============================================================================
+   verifychain — re-validate the last N blocks of the active chain.
+
+   Mirrors bitcoin-core/src/validation.cpp CVerifyDB::VerifyDB
+   (called by rpc/blockchain.cpp::verifychain). Walks from the validated
+   tip backward for [nblocks] blocks, applying progressively heavier checks
+   per [checklevel]:
+
+     0  read block from disk            (Storage.ChainDB.get_block)
+     1  + CheckBlock                    (Validation.check_block)
+     2  + undo data present + decodes + Core's vtxundo/vtx size-consistency
+        rule (validation.cpp:2190-2193: vtxundo.size()+1 == block.vtx.size())
+     3  + reconstruct the block's pre-spend UTXO view from its OWN undo data
+        and re-run the full ConnectBlock machinery (Validation.accept_block:
+        input resolution, value/maturity, BIP-68/112/113 locktime, sigops,
+        and signature/script verification) against that sandbox view. This
+        is the read-only analogue of Core's level-3 disconnect-into-sandbox /
+        level-4 reconnect: camlcoin's UTXO set is the live RocksDB store, so
+        instead of mutating it we rebuild the exact spent-coin view the block
+        consumed (the same data Core's DisconnectBlock would restore) and
+        replay ConnectBlock over it. No live chainstate is touched.
+     4  + same as 3 but PoW is re-checked too (skip_pow=false) and scripts are
+        always verified even inside the assumevalid window (the on-disk block
+        was accepted under assumevalid, so a full verifychain must re-run the
+        scripts Core would have on a from-genesis verify).
+
+   nblocks=0 or nblocks > chain-height ⇒ entire chain (clamped, Core
+   validation.cpp:4624). checklevel clamped to [0,4] (Core :4627).
+   A chain with only genesis (or empty) returns true vacuously (Core :4619).
+
+   Returns true iff every walked block passes every requested check.
+   Logs the failing height/hash/reason and returns false on the first
+   failure — it is NOT a constant stub; the heavy levels invoke the same
+   [Validation.accept_block] the live sync/reorg paths use. *)
+let verify_chain (state : chain_state) ~(checklevel : int) ~(nblocks : int)
+    : bool =
+  let checklevel = max 0 (min 4 checklevel) in
+  match block_tip state with
+  | None ->
+    (* Empty chain: nothing to verify (Core returns SUCCESS when Tip()==null). *)
+    true
+  | Some tip ->
+    let tip_height = tip.height in
+    (* Core: genesis-only chain (Tip()->pprev == null) is vacuously valid. *)
+    if tip_height <= 0 then true
+    else begin
+      (* Core validation.cpp:4624 — nblocks<=0 or > height means the whole
+         chain. We verify heights [start_height .. tip_height], stopping at 1
+         (genesis at height 0 has no parent / no undo, exactly as Core's loop
+         halts at pindex->pprev). *)
+      let depth =
+        if nblocks <= 0 || nblocks > tip_height then tip_height
+        else nblocks
+      in
+      let start_height = max 1 (tip_height - depth + 1) in
+      Logs.info (fun m ->
+        m "verifychain: verifying last %d blocks (heights %d..%d) at level %d"
+          (tip_height - start_height + 1) start_height tip_height checklevel);
+      let ok = ref true in
+      let h = ref tip_height in
+      while !ok && !h >= start_height do
+        let height = !h in
+        (match get_header_at_height state height with
+         | None ->
+           Logs.err (fun m ->
+             m "verifychain: header missing at height %d" height);
+           ok := false
+         | Some entry ->
+           (* Level 0: read block from disk. *)
+           (match Storage.ChainDB.get_block state.db entry.hash with
+            | None ->
+              Logs.err (fun m ->
+                m "verifychain: ReadBlock failed at %d, hash=%s"
+                  height (Types.hash256_to_hex_display entry.hash));
+              ok := false
+            | Some block ->
+              let expected_bits =
+                compute_expected_bits state height block.header in
+              let median_time = compute_median_time_past state height in
+              let prev_block_time = get_prev_block_time state height in
+              (* Level 1: CheckBlock (header sanity, merkle root, coinbase,
+                 weight/sigops, witness commitment, dup-txid, IsFinalTx). PoW
+                 hash<=target is re-checked at level>=4 (skip_pow=false). *)
+              let level1_ok =
+                if checklevel < 1 then true
+                else
+                  match Validation.check_block ~network:state.network block
+                          height ~expected_bits ~median_time ~prev_block_time
+                          ~skip_pow:(checklevel < 4) () with
+                  | Ok () -> true
+                  | Error e ->
+                    Logs.err (fun m ->
+                      m "verifychain: bad block at %d, hash=%s (%s)"
+                        height (Types.hash256_to_hex_display entry.hash)
+                        (Validation.block_error_to_string e));
+                    false
+              in
+              if not level1_ok then ok := false
+              else begin
+                (* Level 2: undo data present, decodes, and is size-consistent
+                   with the block (Core validation.cpp:2190-2193). *)
+                let undo_opt =
+                  if checklevel < 2 then None
+                  else match Storage.ChainDB.get_undo_data state.db entry.hash with
+                    | None ->
+                      Logs.err (fun m ->
+                        m "verifychain: bad undo data at %d, hash=%s (missing)"
+                          height (Types.hash256_to_hex_display entry.hash));
+                      ok := false;
+                      None
+                    | Some raw ->
+                      (try
+                        let r =
+                          Serialize.reader_of_cstruct (Cstruct.of_string raw) in
+                        let undo = Utxo.deserialize_undo_data r in
+                        let num_txs = List.length block.transactions in
+                        let num_undos = List.length undo.tx_undos in
+                        if num_undos + 1 <> num_txs then begin
+                          Logs.err (fun m ->
+                            m "verifychain: undo/block size mismatch at %d \
+                               (txs=%d undos=%d)" height num_txs num_undos);
+                          ok := false;
+                          None
+                        end else Some undo
+                      with ex ->
+                        Logs.err (fun m ->
+                          m "verifychain: undo decode failed at %d: %s"
+                            height (Printexc.to_string ex));
+                        ok := false;
+                        None)
+                in
+                (* Levels 3 and 4: rebuild the block's pre-spend UTXO view
+                   from its undo data and re-run ConnectBlock over it. This
+                   re-validates every script/input the same way the live sync
+                   path does, without mutating the live UTXO set. *)
+                if !ok && checklevel >= 3 then begin
+                  match undo_opt with
+                  | None ->
+                    (* checklevel>=3 needs undo to rebuild the spent view;
+                       a missing one was already flagged at level 2. *)
+                    if !ok then begin
+                      Logs.err (fun m ->
+                        m "verifychain: no undo data to reconnect block at %d"
+                          height);
+                      ok := false
+                    end
+                  | Some undo ->
+                    (* Build a lookup over the spent coins the block consumed.
+                       undo.tx_undos[i] corresponds to block tx (i+1) (Core
+                       encodes one vtxundo per NON-coinbase tx, in tx order);
+                       each spent_output is (outpoint, utxo_entry) — exactly
+                       the coin that input spent. This is the pre-spend view
+                       ConnectBlock would see on a from-genesis verify. *)
+                    let tbl : (string, Validation.utxo) Hashtbl.t =
+                      Hashtbl.create 256 in
+                    List.iter (fun (tu : Utxo.tx_undo) ->
+                      List.iter (fun (op, (e : Utxo.utxo_entry)) ->
+                        let key =
+                          Cstruct.to_string op.Types.txid
+                          ^ Int32.to_string op.Types.vout in
+                        Hashtbl.replace tbl key
+                          Validation.{
+                            txid = op.Types.txid;
+                            vout = op.Types.vout;
+                            value = e.value;
+                            script_pubkey = e.script_pubkey;
+                            height = e.height;
+                            is_coinbase = e.is_coinbase;
+                          })
+                        tu.spent_outputs)
+                      undo.tx_undos;
+                    let base_lookup (op : Types.outpoint) =
+                      Hashtbl.find_opt tbl
+                        (Cstruct.to_string op.Types.txid
+                         ^ Int32.to_string op.Types.vout)
+                    in
+                    (* Full ConnectBlock. At level 4 scripts are verified even
+                       inside the assumevalid window; at level 3 we honour the
+                       node's assumevalid skip (matches the work the live
+                       connect path did for this block). *)
+                    let skip_scripts =
+                      checklevel < 4 && is_assume_valid state height in
+                    let flags =
+                      if skip_scripts then 0
+                      else Consensus.get_block_script_flags height state.network
+                    in
+                    (match Validation.accept_block
+                             ~network:state.network ~block ~height
+                             ~expected_bits ~median_time ~prev_block_time
+                             ~base_lookup ~flags ~skip_scripts
+                             ~skip_pow:(checklevel < 4)
+                             ~get_mtp_at_height:(get_mtp_for_height state)
+                             ?bip34_height_hash:(bip34_height_hash_for state)
+                             () with
+                     | Validation.AB_ok _ -> ()
+                     | Validation.AB_err e ->
+                       Logs.err (fun m ->
+                         m "verifychain: unconnectable block at %d, hash=%s (%s)"
+                           height (Types.hash256_to_hex_display entry.hash)
+                           (Validation.block_error_to_string e));
+                       ok := false)
+                end
+              end));
+        decr h
+      done;
+      if !ok then
+        Logs.info (fun m ->
+          m "verifychain: no inconsistencies in last %d blocks"
+            (tip_height - start_height + 1));
+      !ok
+    end
+
 (* [batch] in this module is [Storage.ChainDB.batch]; the alias keeps the
    reorg helpers below readable without importing the whole module. *)
 

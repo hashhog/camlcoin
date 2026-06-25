@@ -10506,6 +10506,7 @@ let handle_help (_ctx : rpc_context)
       "getchainstates";
       "getchaintxstats ( nblocks \"blockhash\" )";
       "getindexinfo ( \"index_name\" )";
+      "verifychain ( checklevel nblocks )";
       "waitfornewblock ( timeout \"current_tip\" )";
       "waitforblock \"blockhash\" ( timeout )";
       "waitforblockheight height ( timeout )";
@@ -12983,6 +12984,43 @@ let handle_waitforblockheight (ctx : rpc_context)
        wait_for_tip_loop ctx
          (fun _h ht -> ht >= target_height) timeout_ms)
 
+(* verifychain ( checklevel nblocks ) — re-validate the last [nblocks]
+   blocks of the active chain at the given [checklevel].
+
+   Mirrors bitcoin-core/src/rpc/blockchain.cpp::verifychain, which calls
+   CVerifyDB().VerifyDB(...) == VerifyDBResult::SUCCESS and returns the
+   resulting bool. Defaults: checklevel=3, nblocks=6 (Core
+   DEFAULT_CHECKLEVEL / DEFAULT_CHECKBLOCKS). checklevel is clamped to
+   [0,4]; nblocks=0 or > height means the whole chain. The heavy lifting
+   (and the actual block re-validation) lives in [Sync.verify_chain], which
+   replays the same CheckBlock/ConnectBlock machinery the live sync path
+   uses — this is NOT a constant-true stub. *)
+let handle_verifychain (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  let parse_int_opt = function
+    | `Int n -> Ok (Some n)
+    | `Intlit s -> (try Ok (Some (int_of_string s))
+                    with _ -> Error "JSON integer out of range")
+    | `Null -> Ok None
+    | _ -> Error "expected an integer"
+  in
+  let checklevel_res, nblocks_res =
+    match params with
+    | [] -> Ok (Some 3), Ok (Some 6)
+    | [a] -> parse_int_opt a, Ok (Some 6)
+    | a :: b :: _ -> parse_int_opt a, parse_int_opt b
+  in
+  match checklevel_res, nblocks_res with
+  | Error m, _ ->
+    Error (rpc_type_error, Printf.sprintf "checklevel: %s" m)
+  | _, Error m ->
+    Error (rpc_type_error, Printf.sprintf "nblocks: %s" m)
+  | Ok cl, Ok nb ->
+    let checklevel = match cl with Some n -> n | None -> 3 in
+    let nblocks = match nb with Some n -> n | None -> 6 in
+    let ok = Sync.verify_chain ctx.chain ~checklevel ~nblocks in
+    Ok (`Bool ok)
+
 (* Lwt-returning dispatch for the wait-family methods.  Returns
    [Some <result Lwt.t>] when [method_name] is one of the three wait RPCs,
    else [None] so the caller falls through to the synchronous [dispatch_rpc].
@@ -13033,6 +13071,12 @@ let dispatch_rpc (ctx : rpc_context)
     Ok (handle_getblockcount ctx)
   | "getbestblockhash" ->
     Ok (handle_getbestblockhash ctx)
+  | "verifychain" ->
+    (* handle_verifychain already returns Core-exact (code, message) pairs
+       (-3 RPC_TYPE_ERROR for a non-integer checklevel/nblocks). Pass them
+       through verbatim; the success value is a bare JSON bool, matching
+       Core's verifychain return. *)
+    handle_verifychain ctx params
   | "getsyncstate" ->
     Ok (handle_getsyncstate ctx)
   | "getdifficulty" ->

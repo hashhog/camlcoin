@@ -4129,10 +4129,20 @@ let handle_signrawtransactionwithkey (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
   | [`String hex_tx; `List wif_keys] | [`String hex_tx; `List wif_keys; _] ->
+    (* Core rawtransaction.cpp:742 (signrawtransactionwithkey): a tx hex that
+       fails DecodeHexTx throws RPC_DESERIALIZATION_ERROR (-22) with the exact
+       message "TX decode failed. Make sure the tx has at least one input."
+       Decode up front so this maps to -22 at the dispatch arm, distinct from
+       downstream signing failures. *)
+    (match (try
+              let data = Cstruct.of_hex hex_tx in
+              let r = Serialize.reader_of_cstruct data in
+              Some (Serialize.deserialize_transaction r)
+            with _ -> None) with
+     | None ->
+       Error "TX decode failed. Make sure the tx has at least one input."
+     | Some tx ->
     (try
-      let data = Cstruct.of_hex hex_tx in
-      let r = Serialize.reader_of_cstruct data in
-      let tx = Serialize.deserialize_transaction r in
       (* Decode all WIF keys *)
       let decoded_keys = List.filter_map (fun wif_json ->
         match wif_json with
@@ -4302,7 +4312,7 @@ let handle_signrawtransactionwithkey (ctx : rpc_context)
         ("complete", `Bool complete);
       ])
     with exn ->
-      Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn)))
+      Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn))))
   | _ ->
     Error "Invalid parameters: expected [hexstring, [privkeys]]"
 
@@ -7245,7 +7255,12 @@ let handle_utxoupdatepsbt (ctx : rpc_context)
   match params with
   | [`String b64] ->
     (match Psbt.of_base64 b64 with
-     | Error e -> Error (Psbt.string_of_error e)
+     (* Core rawtransaction.cpp:1065 (utxoupdatepsbt) throws
+        RPC_DESERIALIZATION_ERROR (-22) strprintf("TX decode failed %s", error)
+        when DecodeBase64PSBT fails; for a bad base64 blob psbt.cpp:611 sets
+        error = "invalid base64", giving "TX decode failed invalid base64".
+        Emit the "TX decode failed " prefix so the dispatch arm routes -22. *)
+     | Error e -> Error (Printf.sprintf "TX decode failed %s" (Psbt.string_of_error e))
      | Ok psbt ->
        (* Create UTXO set accessor *)
        let utxo_set = Utxo.UtxoSet.create ctx.chain.db in
@@ -13156,8 +13171,20 @@ let dispatch_rpc (ctx : rpc_context)
      | Ok r -> Ok r
      | Error msg -> Error (rpc_deserialization_error, msg))
   | "signrawtransactionwithkey" ->
+    (* Core rawtransaction.cpp:742 throws RPC_DESERIALIZATION_ERROR (-22) with
+       exactly "TX decode failed. Make sure the tx has at least one input." when
+       the up-front DecodeHexTx fails.  Match that EXACT string (not a prefix):
+       the handler's signing-stage catch-all emits "TX decode failed: <exn>",
+       which shares the 16-char prefix but is a SIGNING failure, not a decode
+       failure — Core does not deserialization-error those (SignTransaction at
+       rawtransaction.cpp:772 records them in the result "errors" array).  Exact
+       match keeps only true decode failures on -22; everything else (signing
+       catch-all, param-shape) falls through to RPC_MISC_ERROR (-1). *)
     (match handle_signrawtransactionwithkey ctx params with
      | Ok r -> Ok r
+     | Error msg
+       when msg = "TX decode failed. Make sure the tx has at least one input." ->
+       Error (rpc_deserialization_error, msg)
      | Error msg -> Error (rpc_misc_error, msg))
   | "combinerawtransaction" ->
     (* handle_combinerawtransaction returns Core-exact (code, message) pairs:
@@ -13461,8 +13488,15 @@ let dispatch_rpc (ctx : rpc_context)
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
   | "utxoupdatepsbt" ->
+    (* Core rawtransaction.cpp:1065 throws RPC_DESERIALIZATION_ERROR (-22) with
+       "TX decode failed <error>" when the PSBT fails to decode; route that
+       prefix to -22 (mirrors the decodepsbt/combinepsbt arms).  Param-shape
+       errors fall through to the default. *)
     (match handle_utxoupdatepsbt ctx params with
      | Ok r -> Ok r
+     | Error msg
+       when String.length msg >= 16 && String.sub msg 0 16 = "TX decode failed" ->
+       Error (rpc_deserialization_error, msg)
      | Error msg -> Error (rpc_misc_error, msg))
   | "converttopsbt" ->
     (match handle_converttopsbt ctx params with

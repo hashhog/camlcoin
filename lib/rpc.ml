@@ -1090,6 +1090,32 @@ let handle_reconsiderblock (ctx : rpc_context)
   | _ ->
     Error "Invalid parameters: expected [blockhash]"
 
+(* preciousblock - treats a block as if it were received before others with
+   the same work, then re-runs chain selection (Bitcoin Core
+   CChainState::PreciousBlock + the preciousblock RPC, validation.cpp /
+   rpc/blockchain.cpp).  Returns JSON null on success; an unknown blockhash
+   yields RPC_INVALID_ADDRESS_OR_KEY (-5) "Block not found"; a malformed hash
+   yields RPC_INVALID_PARAMETER (-8) at the parse boundary (Core ParseHashV).
+   Threads the live UTXO set through so a precious-triggered reorg moves both
+   the on-disk UTXO set and the in-memory cache together, the same as
+   invalidateblock. *)
+let handle_preciousblock (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  match params with
+  | `String blockhash_hex :: _ ->
+    (match parse_hash_v blockhash_hex ~name:"blockhash" with
+     | Error (code, msg) -> Error (code, msg)
+     | Ok () ->
+       (match parse_blockhash_hex blockhash_hex with
+        | Error msg -> Error (rpc_invalid_parameter, msg)
+        | Ok hash ->
+          (match Sync.precious_block ctx.chain ?utxo_set:ctx.utxo hash with
+           | Ok _new_height -> Ok `Null
+           | Error msg -> Error (rpc_invalid_address, msg))))
+  | _ ->
+    Error (rpc_invalid_parameter,
+      "JSON value of type null is not of expected type string")
+
 (* ============================================================================
    Transaction Handlers
    ============================================================================ *)
@@ -10594,6 +10620,7 @@ let handle_help (_ctx : rpc_context)
       "gettxout \"txid\" vout";
       "invalidateblock \"blockhash\"";
       "reconsiderblock \"blockhash\"";
+      "preciousblock \"blockhash\"";
       "";
       "== Util ==";
       "getmemoryinfo ( \"mode\" )";
@@ -13127,6 +13154,11 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_reconsiderblock ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
+  | "preciousblock" ->
+    (* handle_preciousblock already returns Core-exact (code, message) pairs:
+       -5 RPC_INVALID_ADDRESS_OR_KEY "Block not found" for an unknown hash,
+       -8 RPC_INVALID_PARAMETER for a malformed hash.  Pass them through. *)
+    handle_preciousblock ctx params
   | "getblockfilter" ->
     (* handle_getblockfilter already returns Core-exact (code, message) pairs:
        -5 Unknown filtertype / Block not found, -1 index-not-enabled,

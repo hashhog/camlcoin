@@ -4854,14 +4854,24 @@ let verify_chain (state : chain_state) ~(checklevel : int) ~(nblocks : int)
 (* Perform chain reorganization to new tip.  D-FULL atomicity: all
    disk writes from BOTH halves of the reorg land in ONE [batch_write].
    See the comment block above [max_reorg_depth] for the rationale. *)
-let reorganize (ibd : ibd_state) (new_tip : header_entry)
+let reorganize ?(allow_equal_work = false) (ibd : ibd_state)
+    (new_tip : header_entry)
     : (unit, string) result =
   let state = ibd.chain in
   let current_tip = match state.tip with
     | Some t -> t
     | None -> failwith "No current tip"
   in
-  if Consensus.work_compare new_tip.total_work current_tip.total_work <= 0 then
+  (* Normal chain selection requires STRICTLY more work to switch tips
+     ([work_cmp <= 0] refused).  The [preciousblock] RPC path passes
+     [~allow_equal_work:true] so that a block marked precious can win an
+     EQUAL-work tie against the block that is currently the tip — mirroring
+     Bitcoin Core's [CChainState::PreciousBlock] giving the block a lower
+     [nSequenceId] so it sorts ahead of equal-work competitors in
+     [setBlockIndexCandidates] before [ActivateBestChain] runs
+     ([validation.cpp]).  We never switch on STRICTLY less work. *)
+  let work_cmp = Consensus.work_compare new_tip.total_work current_tip.total_work in
+  if work_cmp < 0 || (work_cmp = 0 && not allow_equal_work) then
     Error "New tip does not have more work"
   else begin
     match find_fork_point state current_tip new_tip with
@@ -6764,3 +6774,144 @@ let reconsider_block (state : chain_state) (hash : Types.hash256)
       match state.tip with
       | Some tip -> Ok tip.height
       | None -> Ok 0
+
+(* ============================================================================
+   preciousblock — Bitcoin Core CChainState::PreciousBlock (validation.cpp)
+
+   Marks a block as "precious": gives it a more-favorable ordering so it WINS
+   chain-selection ties against equal-work blocks that were already chosen as
+   the tip, then re-runs chain selection (ActivateBestChain).  If the precious
+   block is a valid equal-or-greater-work competitor it triggers a reorg onto
+   it; if it is already the active tip (or has strictly less work, or is
+   invalid / lacks block data) it is effectively a no-op.
+
+   Core tracks two scalars on the ChainstateManager:
+     - nBlockReverseSequenceId : a counter that starts at -1 and DECREMENTS on
+       every precious call (floored at INT32_MIN).  Each precious block is
+       stamped with the current value, so a LATER preciousblock call (more
+       negative id) overrides an EARLIER one — exactly the documented
+       "A later preciousblock call can override the effect of an earlier one."
+     - nLastPreciousChainwork : the tip work at the last precious call; when
+       the chain has since been extended (tip work grew) the reverse-sequence
+       counter is reset to -1.
+
+   camlcoin runs a single active chainstate, so — like [pending_compact_blocks]
+   above — these live as module-global mutable state rather than as fields on
+   [chain_state] (which would force every record constructor to change).  The
+   stamp is a map blockhash -> reverse-sequence-id; a non-precious block is
+   treated as sequence-id 0, and since precious ids are always negative a
+   precious block always sorts ahead of a non-precious one at equal work. *)
+
+let precious_blocks : (string, int) Hashtbl.t = Hashtbl.create 16
+let block_reverse_sequence_id : int ref = ref (-1)
+let last_precious_chainwork : Cstruct.t ref = ref Consensus.zero_work
+
+(* INT32_MIN — Core floors nBlockReverseSequenceId here so 2**31-1 precious
+   calls on the same tip set cannot underflow. *)
+let int32_min = -2147483648
+
+(* Reverse-sequence id stamped on a candidate; non-precious -> 0. *)
+let precious_seq (entry : header_entry) : int =
+  match Hashtbl.find_opt precious_blocks (Cstruct.to_string entry.hash) with
+  | Some s -> s
+  | None -> 0
+
+(* Total order on chain-selection candidates mirroring Core's
+   CBlockIndexWorkComparator: more total_work wins; on an EQUAL-work tie the
+   LOWER (more negative => more recently / more strongly precious) sequence id
+   wins.  Returns >0 if [a] is the better tip than [b], <0 if worse, 0 if they
+   are interchangeable.  With both blocks non-precious this is just the work
+   comparison, so existing equal-work behavior (incumbent kept) is unchanged. *)
+let candidate_compare (a : header_entry) (b : header_entry) : int =
+  let wc = Consensus.work_compare a.total_work b.total_work in
+  if wc <> 0 then wc
+  else compare (precious_seq b) (precious_seq a)
+
+(* Like [find_best_valid_tip] but breaks equal-work ties with the precious
+   sequence id, so a block marked precious is selected over the equal-work
+   block that is currently the tip.  Same data/validity gating as
+   [find_best_valid_tip]: skip manually-invalidated entries and entries whose
+   block data is not on disk (Core's BLOCK_HAVE_DATA gate in FindMostWorkChain;
+   genesis is always considered to have data). *)
+let find_best_candidate_precious (state : chain_state) : header_entry option =
+  let best : header_entry option ref = ref None in
+  Hashtbl.iter (fun key (entry : header_entry) ->
+    if not (Hashtbl.mem state.invalidated_blocks key) then begin
+      let have_data =
+        entry.height = 0 || Storage.ChainDB.has_block state.db entry.hash
+      in
+      if have_data then begin
+        match !best with
+        | None -> best := Some entry
+        | Some b ->
+          if candidate_compare entry b > 0 then best := Some entry
+      end
+    end
+  ) state.headers;
+  !best
+
+(* preciousblock RPC entry point.  Returns the active chain height on success
+   (the RPC layer discards it and returns JSON null, matching Core which
+   returns VNULL); [Error "Block not found"] when the hash is unknown (the RPC
+   layer maps this to JSON-RPC code -5, RPC_INVALID_ADDRESS_OR_KEY).  Threads
+   the live UTXO set through the reorg the same way [invalidate_block] does so
+   both backing stores and the tip move together. *)
+let precious_block (state : chain_state)
+    ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
+    (hash : Types.hash256) : (int, string) result =
+  let hash_key = Cstruct.to_string hash in
+  match Hashtbl.find_opt state.headers hash_key with
+  | None -> Error "Block not found"
+  | Some entry ->
+    match state.tip with
+    | None ->
+      (* No active tip yet; nothing to activate against. *)
+      Ok 0
+    | Some tip ->
+      (* Core: "if (pindex->nChainWork < m_chain.Tip()->nChainWork) return
+         true;" — a block with strictly LESS work than the tip is not at the
+         tip, so preciousblock is a no-op. *)
+      if Consensus.work_compare entry.total_work tip.total_work < 0 then begin
+        Logs.debug (fun m ->
+          m "preciousblock: block at height %d has less work than tip \
+             (height %d); no-op" entry.height tip.height);
+        Ok tip.height
+      end else begin
+        (* Reset the reverse-sequence counter if the chain has been extended
+           since the last precious call (tip work grew). *)
+        (if Consensus.work_compare tip.total_work !last_precious_chainwork > 0 then
+           block_reverse_sequence_id := -1);
+        last_precious_chainwork := tip.total_work;
+        (* Stamp this block with the current reverse-sequence id, then
+           decrement (floored at INT32_MIN) so a later call overrides it. *)
+        Hashtbl.replace precious_blocks hash_key !block_reverse_sequence_id;
+        (if !block_reverse_sequence_id > int32_min then
+           block_reverse_sequence_id := !block_reverse_sequence_id - 1);
+        Logs.info (fun m ->
+          m "preciousblock: marked block at height %d precious: %s"
+            entry.height (Types.hash256_to_hex_display hash));
+        (* Re-run chain selection with the precious tiebreak (Core's
+           ActivateBestChain).  If the precious block now out-sorts the
+           current tip, reorg onto it — allowing an EQUAL-work switch. *)
+        match find_best_candidate_precious state with
+        | Some best when not (Cstruct.equal best.hash tip.hash) ->
+          Logs.info (fun m ->
+            m "preciousblock: activating precious chain at height %d \
+               (was %d)" best.height tip.height);
+          let ibd = create_ibd_state ?utxo_set state in
+          (match reorganize ~allow_equal_work:true ibd best with
+           | Ok () -> Ok best.height
+           | Error e ->
+             (* Activation failed; the chain is unchanged (reorganize commits
+                atomically or not at all).  Surface the unchanged tip height
+                so the node stays consistent, matching the [invalidate_block]
+                post-reorg-failure convention above. *)
+             Logs.warn (fun m ->
+               m "preciousblock: activation to height %d failed: %s \
+                  (staying at tip height %d)" best.height e tip.height);
+             Ok tip.height)
+        | _ ->
+          (* Precious block is already the best candidate (the current tip)
+             or could not be selected (no data / invalid) — no-op. *)
+          Ok tip.height
+      end

@@ -660,11 +660,14 @@ let handle_getblockheader (ctx : rpc_context)
        (* Core blockheaderToJSON / ComputeNextBlockAndDepth: confirmations is
           tipHeight - height + 1 ONLY when the block is on the active chain
           (the chain's block at [height] is THIS block); otherwise -1.
-          The active-chain membership check also gates nextblockhash. *)
+          The active-chain membership check also gates nextblockhash.
+          height > tip_height cannot be on the active chain (get_header_at_height
+          may return a stale above-tip entry after a bare invalidateblock). *)
        let in_active_chain =
-         match Sync.get_header_at_height ctx.chain height with
-         | Some e -> Cstruct.equal e.hash hash
-         | None -> false
+         height <= tip_height &&
+         (match Sync.get_header_at_height ctx.chain height with
+          | Some e -> Cstruct.equal e.hash hash
+          | None -> false)
        in
        let confirmations =
          if in_active_chain then tip_height - height + 1 else -1
@@ -5478,15 +5481,32 @@ let handle_getblock (ctx : rpc_context)
         let total_weight = 3 * stripped + total_size in
         (* Chain-context fields *)
         let tip_height = match ctx.chain.tip with Some t -> t.height | None -> 0 in
-        let confirmations = tip_height - height + 1 in
+        (* Core ComputeNextBlockAndDepth (rpc/blockchain.cpp): confirmations is
+           tip - height + 1 ONLY when this block is on the active chain (the
+           active-chain block at [height] is THIS block); otherwise -1. Mirror
+           getblockheader's membership check instead of computing it
+           unconditionally. The same check gates nextblockhash. *)
+        (* height > tip_height cannot be on the active chain (get_header_at_height
+           may return a stale above-tip entry after a bare invalidateblock). *)
+        let in_active_chain =
+          height <= tip_height &&
+          (match Sync.get_header_at_height ctx.chain height with
+           | Some e -> Cstruct.equal e.hash hash
+           | None -> false)
+        in
+        let confirmations =
+          if in_active_chain then tip_height - height + 1 else -1
+        in
         (* mediantime: GetMedianTimePast() includes current block (Core src/chain.h:233).
            Use compute_median_time_for_display (starts at [height], not height-1). *)
         let median_time = Sync.compute_median_time_for_display ctx.chain height in
         (* nTx: count transactions in block body *)
         let n_tx = List.length block.transactions in
-        (* nextblockhash: block at height+1 in the active chain *)
+        (* nextblockhash: block at height+1 in the active chain — only meaningful
+           when this block itself is on the active chain (Core gates it the same). *)
         let next_block_hash =
-          match Sync.get_header_at_height ctx.chain (height + 1) with
+          if not in_active_chain then None
+          else match Sync.get_header_at_height ctx.chain (height + 1) with
           | Some next_entry -> Some (Types.hash256_to_hex_display next_entry.hash)
           | None -> None
         in

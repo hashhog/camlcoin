@@ -13298,11 +13298,13 @@ let dispatch_rpc (ctx : rpc_context)
        pairs (-32602 on any positional arg). Pass through verbatim. *)
     handle_ping ctx params
   | "getblockfrompeer" ->
-    (* Core getblockfrompeer throws RPC_MISC_ERROR (-1) for every failure
-       case (header missing / already downloaded / peer does not exist). *)
-    (match handle_getblockfrompeer ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_misc_error, msg))
+    (* Core getblockfrompeer: a malformed blockhash -> -8 RPC_INVALID_PARAMETER
+       at the parse boundary (ParseHashV); every other failure (header missing /
+       already downloaded / peer does not exist) stays -1 RPC_MISC_ERROR. *)
+    guard_hash_param ~name:"blockhash" params (fun () ->
+      match handle_getblockfrompeer ctx params with
+      | Ok r -> Ok r
+      | Error msg -> Error (rpc_misc_error, msg))
   | "addnode" ->
     (* handle_addnode returns Core-exact (code, message) pairs:
        -23 already-added / -24 not-added / -32602 bad-command|param-shape.
@@ -13657,9 +13659,25 @@ let dispatch_rpc (ctx : rpc_context)
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
   | "gettxoutproof" ->
-    (match handle_gettxoutproof ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_misc_error, msg))
+    (* Core gettxoutproof: a malformed blockhash (the optional arg after the
+       txid list) -> -8 RPC_INVALID_PARAMETER at the parse boundary (ParseHashV),
+       checked here since it is arg 1 (guard_hash_param only guards arg 0); an
+       unknown block -> -5 RPC_INVALID_ADDRESS_OR_KEY "Block not found". *)
+    let bh_check = match params with
+      | _ :: `String s :: _ -> parse_hash_v s ~name:"blockhash"
+      | _ -> Ok ()
+    in
+    (match bh_check with
+     | Error e -> Error e
+     | Ok () ->
+       (match handle_gettxoutproof ctx params with
+        | Ok r -> Ok r
+        | Error msg ->
+          let code =
+            if msg = "Block not found" then rpc_invalid_address
+            else rpc_misc_error
+          in
+          Error (code, msg)))
   | "verifytxoutproof" ->
     (match handle_verifytxoutproof ctx params with
      | Ok r -> Ok r

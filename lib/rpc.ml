@@ -13100,7 +13100,11 @@ let dispatch_rpc (ctx : rpc_context)
     guard_hash_param ~name:"blockhash" params (fun () ->
       match handle_getblock ctx params with
       | Ok r -> Ok r
-      | Error msg -> Error (rpc_misc_error, msg))
+      | Error msg ->
+        (* Core getblock (blockchain.cpp:855): a well-formed-but-absent hash ->
+           -5 RPC_INVALID_ADDRESS_OR_KEY "Block not found"; other errors stay -1. *)
+        let code = if msg = "Block not found" then rpc_invalid_address else rpc_misc_error in
+        Error (code, msg))
   | "getblockheader" ->
     (* Core: a blockhash not in the index -> RPC_INVALID_ADDRESS_OR_KEY (-5)
        "Block not found" (bitcoin-core/src/rpc/blockchain.cpp:654-656).
@@ -13135,9 +13139,17 @@ let dispatch_rpc (ctx : rpc_context)
       | Ok r -> Ok r
       | Error msg -> Error (rpc_misc_error, msg))
   | "getblockstats" ->
-    (match handle_getblockstats ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_misc_error, msg))
+    (* Core getblockstats (blockchain.cpp:2026) resolves arg 0 via
+       ParseHashOrHeight -> ParseHashV on a string hash: a malformed hash -> -8
+       before any lookup; a well-formed-but-absent hash -> -5 "Block not found".
+       guard_hash_param only validates a string arg, so an integer height passes
+       straight through to the handler. *)
+    guard_hash_param ~name:"hash_or_height" params (fun () ->
+      match handle_getblockstats ctx params with
+      | Ok r -> Ok r
+      | Error msg ->
+        let code = if msg = "Block not found" then rpc_invalid_address else rpc_misc_error in
+        Error (code, msg))
   | "getchaintxstats" ->
     handle_getchaintxstats ctx params
   | "getindexinfo" ->
@@ -13147,13 +13159,27 @@ let dispatch_rpc (ctx : rpc_context)
   | "addpeeraddress" ->
     handle_addpeeraddress ctx params
   | "invalidateblock" ->
-    (match handle_invalidateblock ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_misc_error, msg))
+    (* Core invalidateblock (blockchain.cpp:1754): ParseHashV("blockhash") runs
+       before any lookup -> a malformed hash is -8 RPC_INVALID_PARAMETER; a
+       well-formed-but-absent hash -> -5 RPC_INVALID_ADDRESS_OR_KEY "Block not
+       found" (other failures stay -1). *)
+    guard_hash_param ~name:"blockhash" params (fun () ->
+      match handle_invalidateblock ctx params with
+      | Ok r -> Ok r
+      | Error msg ->
+        let code = if msg = "Block not found" then rpc_invalid_address else rpc_misc_error in
+        Error (code, msg))
   | "reconsiderblock" ->
-    (match handle_reconsiderblock ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_misc_error, msg))
+    (* Core reconsiderblock (blockchain.cpp:1800): ParseHashV("blockhash") runs
+       before any lookup -> a malformed hash is -8 RPC_INVALID_PARAMETER; a
+       well-formed-but-absent hash -> -5 RPC_INVALID_ADDRESS_OR_KEY "Block not
+       found" (other failures stay -1). *)
+    guard_hash_param ~name:"blockhash" params (fun () ->
+      match handle_reconsiderblock ctx params with
+      | Ok r -> Ok r
+      | Error msg ->
+        let code = if msg = "Block not found" then rpc_invalid_address else rpc_misc_error in
+        Error (code, msg))
   | "preciousblock" ->
     (* handle_preciousblock already returns Core-exact (code, message) pairs:
        -5 RPC_INVALID_ADDRESS_OR_KEY "Block not found" for an unknown hash,

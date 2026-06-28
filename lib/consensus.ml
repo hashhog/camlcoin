@@ -780,7 +780,11 @@ let testnet4 : network_config = {
   pow_limit = 0x1d00ffffl;
   enforce_bip94 = true;  (* BIP-94 time warp fix enabled *)
   network_type = Testnet4;
-  minimum_chain_work = zero_work;
+  (* From Bitcoin Core kernel/chainparams.cpp CTestNet4Params (block 123613).
+     Was zero_work, which disabled the anti-low-work-fork / IBD header-work gate
+     on testnet4 (Core ships a non-zero value here). *)
+  minimum_chain_work = work_of_hex
+    "0000000000000000000000000000000000000000000009a0fe15d0177d086304";
   (* Testnet4 assumevalid — block 123613 in internal LE byte order.
      Display hash: 0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a *)
   assume_valid_hash = Some (Types.hash256_of_hex

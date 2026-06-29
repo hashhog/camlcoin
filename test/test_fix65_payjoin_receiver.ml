@@ -130,7 +130,7 @@ let make_rpc_ctx_with_wallet (w : Wallet.t) : Rpc.rpc_context =
   rm_rf pid_seed;
   let db = Storage.ChainDB.create pid_seed in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:100 () in
   let chain = Sync.create_chain_state db Consensus.regtest in
   let pm = Peer_manager.create Consensus.regtest in

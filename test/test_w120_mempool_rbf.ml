@@ -210,7 +210,7 @@ let make_rpc_ctx () : Rpc.rpc_context =
     rm_rf test_db_root;
     let db = Storage.ChainDB.create test_db_root in
     let utxo = Utxo.UtxoSet.create db in
-    let mp = Mempool.create
+    let mp = Mempool.create ~network:Consensus.regtest
       ~require_standard:false
       ~verify_scripts:false
       ~utxo
@@ -355,7 +355,7 @@ let test_g6_ancestor_walk_present () =
   rm_rf "/tmp/camlcoin_w120_g6";
   let db = Storage.ChainDB.create "/tmp/camlcoin_w120_g6" in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create
+  let mp = Mempool.create ~network:Consensus.regtest
     ~require_standard:false ~verify_scripts:false
     ~utxo ~current_height:0 () in
   let tx_non_rbf = mk_tx_with_sequence ~seq:(Int32.to_int 0xFFFFFFFEl) in
@@ -407,7 +407,7 @@ let test_g10_no_conflicts_when_disjoint () =
   rm_rf "/tmp/camlcoin_w120_g10";
   let db = Storage.ChainDB.create "/tmp/camlcoin_w120_g10" in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create
+  let mp = Mempool.create ~network:Consensus.regtest
     ~require_standard:false ~verify_scripts:false
     ~utxo ~current_height:0 () in
   let tx = mk_tx_with_sequence ~seq:0 in
@@ -504,7 +504,7 @@ let g15_make_mempool path =
   rm_rf path;
   let db = Storage.ChainDB.create path in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create
+  let mp = Mempool.create ~network:Consensus.regtest
     ~require_standard:false ~verify_scripts:false
     ~utxo ~current_height:100 () in
   (mp, db, utxo)
@@ -666,7 +666,7 @@ let test_g18a_replace_by_fee_with_replaced_returns_evicted_txid () =
     height = 0;
     is_coinbase = false;
   };
-  let mp = Mempool.create
+  let mp = Mempool.create ~network:Consensus.regtest
     ~require_standard:false ~verify_scripts:false
     ~utxo ~current_height:100 () in
   let inp = { Types.previous_output = { Types.txid = parent_txid; vout = 0l };
@@ -751,7 +751,7 @@ let test_g18c_atmp_replaced_txids_empty_when_no_rbf () =
     height = 0;
     is_coinbase = false;
   };
-  let mp = Mempool.create
+  let mp = Mempool.create ~network:Consensus.regtest
     ~require_standard:false ~verify_scripts:false
     ~utxo ~current_height:100 () in
   let inp = { Types.previous_output = { Types.txid = funding_txid; vout = 0l };
@@ -785,7 +785,7 @@ let test_g18d_atmp_replaced_txids_populated_on_rbf () =
     height = 0;
     is_coinbase = false;
   };
-  let mp = Mempool.create
+  let mp = Mempool.create ~network:Consensus.regtest
     ~require_standard:false ~verify_scripts:false
     ~utxo ~current_height:100 () in
   let inp = { Types.previous_output = { Types.txid = funding_txid; vout = 0l };
@@ -1066,7 +1066,7 @@ let test_g26_delta_cancellation () =
   rm_rf "/tmp/camlcoin_w120_g26d";
   let db = Storage.ChainDB.create "/tmp/camlcoin_w120_g26d" in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create
+  let mp = Mempool.create ~network:Consensus.regtest
     ~require_standard:false ~verify_scripts:false
     ~utxo ~current_height:0 () in
   let txid = Cstruct.create 32 in
@@ -1092,7 +1092,7 @@ let test_g26_modified_fee_on_entry () =
   rm_rf "/tmp/camlcoin_w120_g26e";
   let db = Storage.ChainDB.create "/tmp/camlcoin_w120_g26e" in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create
+  let mp = Mempool.create ~network:Consensus.regtest
     ~require_standard:false ~verify_scripts:false
     ~utxo ~current_height:0 () in
   let txid = Cstruct.create 32 in
@@ -1130,13 +1130,13 @@ let test_g26_deltas_not_persisted_across_restart () =
   let utxo = Utxo.UtxoSet.create db in
   let txid = Cstruct.create 32 in
   Cstruct.set_uint8 txid 0 0x77;
-  let mp1 = Mempool.create
+  let mp1 = Mempool.create ~network:Consensus.regtest
     ~require_standard:false ~verify_scripts:false
     ~utxo ~current_height:0 () in
   Mempool.prioritise_transaction mp1 txid 9_999L;
   Alcotest.(check int64) "mp1 delta set" 9_999L (Mempool.get_delta mp1 txid);
   (* Fresh mempool with the same backing store — no carry-over. *)
-  let mp2 = Mempool.create
+  let mp2 = Mempool.create ~network:Consensus.regtest
     ~require_standard:false ~verify_scripts:false
     ~utxo ~current_height:0 () in
   Alcotest.(check int64) "mp2 fresh: delta = 0" 0L
@@ -1175,7 +1175,7 @@ let test_g26_rule3_uses_modified_fee_functional () =
     height = 0;
     is_coinbase = false;
   };
-  let mp = Mempool.create
+  let mp = Mempool.create ~network:Consensus.regtest
     ~require_standard:false ~verify_scripts:false
     ~utxo ~current_height:100 () in
   let in_a = { Types.previous_output = { Types.txid = parent_txid; vout = 0l };

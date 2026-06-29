@@ -669,9 +669,9 @@ let mainnet : network_config = {
   pow_limit = 0x1d00ffffl;
   enforce_bip94 = false;
   network_type = Mainnet;
-  (* From Bitcoin Core chainparams.cpp (approximately block 804000) *)
+  (* From Bitcoin Core kernel/chainparams.cpp (approximately block 938343) *)
   minimum_chain_work = work_of_hex
-    "000000000000000000000000000000000000000052b2559353df4117b7348b64";
+    "0000000000000000000000000000000000000001128750f82f4c366153a3a030";
   (* Mainnet assumevalid — block 938343 in internal LE byte order.
      Display hash: 00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac *)
   assume_valid_hash = Some (Types.hash256_of_hex
@@ -737,8 +737,13 @@ let testnet : network_config = {
   pow_limit = 0x1d00ffffl;
   enforce_bip94 = false;
   network_type = Testnet3;
-  minimum_chain_work = zero_work;
-  assume_valid_hash = None;
+  (* From Bitcoin Core kernel/chainparams.cpp CTestNetParams (block ~4842348) *)
+  minimum_chain_work = work_of_hex
+    "0000000000000000000000000000000000000000000017dde1c649f3708d14b6";
+  (* Testnet3 assumevalid — block 4842348 in internal LE byte order.
+     Display hash: 000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4 *)
+  assume_valid_hash = Some (Types.hash256_of_hex
+    "f4675b50a62f7d98f8f2fac17ae30d13a0e5b5b65cac280b23e4617a00000000");
   checkpoints = [];
   halving_interval = default_halving_interval;
 }

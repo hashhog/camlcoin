@@ -1676,9 +1676,9 @@ let mine_test_header ?(merkle_marker : int32 = 0l) ~prev_block ~prev_height ~bit
    guard the in-process invariants that the corpus harness cannot
    observe directly. *)
 
-(* MAX_REORG_DEPTH cap: a reorg whose depth exceeds 100 must return an
-   error and MUST NOT touch the disk batch, mirroring Bitcoin Core's
-   [DEFAULT_MAX_REORG_DEPTH] in validation.h. *)
+(* MAX_REORG_DEPTH cap: a reorg whose depth exceeds 288 must return an
+   error and MUST NOT touch the disk batch.  This is an impl-specific
+   memory-safety bound; Bitcoin Core has no equivalent reorg-depth cap. *)
 let test_reorganize_max_reorg_depth_cap () =
   cleanup_test_db ();
   let db = Storage.ChainDB.create test_db_path in
@@ -1689,10 +1689,10 @@ let test_reorganize_max_reorg_depth_cap () =
   let genesis_entry = match Sync.get_header state genesis_hash with
     | Some e -> e | None -> failwith "genesis missing" in
 
-  (* Build a 102-deep side-branch chain on genesis, all distinct from
+  (* Build a 290-deep side-branch chain on genesis, all distinct from
      the active chain so [find_fork_point] resolves to genesis and the
      depth check fires.  The active chain stays at genesis (height 0).  *)
-  let chain_depth = 102 in
+  let chain_depth = 290 in
   let last = ref genesis_entry in
   let last_marker = ref 0xC0DECAFEl in
   for _ = 1 to chain_depth do
@@ -1723,7 +1723,7 @@ let test_reorganize_max_reorg_depth_cap () =
    | Ok () ->
      Alcotest.fail
        (Printf.sprintf
-         "reorganize over MAX_REORG_DEPTH=100 unexpectedly succeeded \
+         "reorganize over MAX_REORG_DEPTH=288 unexpectedly succeeded \
           (chain_depth=%d)" chain_depth)
    | Error msg ->
      Alcotest.(check bool)

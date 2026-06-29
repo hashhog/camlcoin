@@ -1907,7 +1907,7 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
                              | None -> None)
               in
               let sigops_flags =
-                Consensus.get_block_script_flags height network
+                Consensus.get_block_script_flags ~block_hash:block_hash_for_bip30 height network
               in
               let tx_sigops = count_tx_sigops_cost tx
                                 ~prev_script_pubkey_lookup:prev_script_pubkey_lookup_fast

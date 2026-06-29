@@ -823,7 +823,7 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
                })
         in
         let validation_flags =
-          Consensus.get_block_script_flags height chain.network
+          Consensus.get_block_script_flags ~block_hash:hash height chain.network
         in
         (match Validation.accept_block
                  ~network:chain.network ~block ~height

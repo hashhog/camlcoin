@@ -1390,6 +1390,95 @@ let test_permitted_difficulty_transition () =
     (Consensus.permitted_difficulty_transition ~network:Consensus.regtest
        ~height:2016 ~old_nbits:0x207fffffl ~new_nbits:0x1d00ffffl)
 
+(* ============================================================================
+   Script-flag exception table tests (GetBlockScriptFlags)
+   Bitcoin Core: src/validation.cpp GetBlockScriptFlags script_flag_exceptions
+   ============================================================================ *)
+
+(* Test that the mainnet BIP-16 exception block (height 170060) returns
+   SCRIPT_VERIFY_NONE when the correct hash is passed, and normal P2SH-only
+   flags for a non-exception hash at the same height.
+   Canonical override: 0 (no flags at all, not even P2SH).
+   display hash: 00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22 *)
+let test_script_flag_exception_mainnet_bip16 () =
+  let exception_hash = Types.hash256_of_hex
+    "229c4fac88bab194eb08f1a528cc308ded2397f4f4eb6e75dc02000000000000" in
+  (* With the exception hash: override fires → 0 (no flags) *)
+  Alcotest.(check int) "mainnet BIP16 exception: override fires" 0
+    (Consensus.get_block_script_flags ~block_hash:exception_hash 170060 Consensus.mainnet);
+  (* With zero_hash (non-exception) at the same height: height-derived flags.
+     Height 170060 is pre-DERSIG/CLTV/CSV/SegWit/Taproot, so only P2SH. *)
+  let p2sh = Consensus.script_verify_p2sh in
+  Alcotest.(check int) "mainnet height 170060 normal hash: P2SH only" p2sh
+    (Consensus.get_block_script_flags ~block_hash:Types.zero_hash 170060 Consensus.mainnet)
+
+(* Test that the mainnet Taproot exception block (height 692261) returns
+   P2SH | WITNESS only when the correct hash is passed, and the full
+   height-derived flags (which additionally include DERSIG/CLTV/CSV/NULLDUMMY)
+   for a non-exception hash at the same height.
+   Canonical override: script_verify_p2sh | script_verify_witness.
+   display hash: 0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad *)
+let test_script_flag_exception_mainnet_taproot () =
+  let exception_hash = Types.hash256_of_hex
+    "ad95e3a15ee5ffd585c5e81d44b56a981e842d5bc3140f000000000000000000" in
+  let expected_override =
+    Consensus.script_verify_p2sh lor Consensus.script_verify_witness in
+  (* With the exception hash: override fires → P2SH | WITNESS (no taproot, no DERSIG etc.) *)
+  Alcotest.(check int) "mainnet taproot exception: override fires" expected_override
+    (Consensus.get_block_script_flags ~block_hash:exception_hash 692261 Consensus.mainnet);
+  (* With zero_hash at the same height: normal flags include DERSIG, CLTV, CSV,
+     WITNESS, NULLDUMMY (height 692261 is below taproot_height=709632). *)
+  let normal_flags =
+    Consensus.script_verify_p2sh
+    lor Consensus.script_verify_dersig
+    lor Consensus.script_verify_checklocktimeverify
+    lor Consensus.script_verify_checksequenceverify
+    lor Consensus.script_verify_witness
+    lor Consensus.script_verify_nulldummy in
+  Alcotest.(check int) "mainnet height 692261 normal hash: full pre-taproot flags" normal_flags
+    (Consensus.get_block_script_flags ~block_hash:Types.zero_hash 692261 Consensus.mainnet)
+
+(* Test that the testnet3 BIP-16 exception block (height 514) returns
+   SCRIPT_VERIFY_NONE when the correct hash is passed, and normal flags for a
+   non-exception hash at the same height.
+   Canonical override: 0.
+   display hash: 00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105 *)
+let test_script_flag_exception_testnet3_bip16 () =
+  let exception_hash = Types.hash256_of_hex
+    "05b132a4f74a8799a57a4202d0eeb09612cc08d295401f007c4530dd00000000" in
+  (* With exception hash: override fires → 0 (no flags) *)
+  Alcotest.(check int) "testnet3 BIP16 exception: override fires" 0
+    (Consensus.get_block_script_flags ~block_hash:exception_hash 514 Consensus.testnet);
+  (* With zero_hash at same height on testnet3: height-derived flags.
+     testnet3 bip66_height=330776, bip65_height=581885 — both > 514, so P2SH only. *)
+  let p2sh = Consensus.script_verify_p2sh in
+  Alcotest.(check int) "testnet3 height 514 normal hash: P2SH only" p2sh
+    (Consensus.get_block_script_flags ~block_hash:Types.zero_hash 514 Consensus.testnet)
+
+(* Test that testnet4/regtest have NO exception entries
+   (exception table is empty for those networks).  We verify this by checking
+   that passing the mainnet BIP16 exception hash gives the same result as
+   zero_hash (i.e., the exception table is not consulted and the height-derived
+   flags are returned in both cases). *)
+let test_script_flag_exception_empty_on_other_nets () =
+  let mainnet_hash = Types.hash256_of_hex
+    "229c4fac88bab194eb08f1a528cc308ded2397f4f4eb6e75dc02000000000000" in
+  (* testnet4 activates all softforks from height 1, so at height 170060 ALL
+     flags are set.  The key assertion is that the exception does NOT fire
+     (result == height-derived flags, not 0). *)
+  let testnet4_normal =
+    Consensus.get_block_script_flags ~block_hash:Types.zero_hash 170060 Consensus.testnet4 in
+  Alcotest.(check int) "testnet4: mainnet hash does not trigger exception" testnet4_normal
+    (Consensus.get_block_script_flags ~block_hash:mainnet_hash 170060 Consensus.testnet4);
+  (* Also verify it's non-zero (i.e., we're not accidentally returning 0) *)
+  Alcotest.(check bool) "testnet4: normal flags at height 170060 are non-zero" true
+    (testnet4_normal <> 0);
+  (* regtest: all softforks from genesis, so normal flags are also all flags *)
+  let regtest_normal =
+    Consensus.get_block_script_flags ~block_hash:Types.zero_hash 170060 Consensus.regtest in
+  Alcotest.(check int) "regtest: mainnet hash does not trigger exception" regtest_normal
+    (Consensus.get_block_script_flags ~block_hash:mainnet_hash 170060 Consensus.regtest)
+
 let () =
   let open Alcotest in
   run "Consensus" [
@@ -1479,5 +1568,11 @@ let () =
       test_case "should skip scripts" `Quick test_should_skip_scripts;
       test_case "mainnet assume valid" `Quick test_mainnet_assume_valid;
       test_case "mainnet checkpoints" `Quick test_mainnet_checkpoints;
+    ];
+    "script_flag_exceptions", [
+      test_case "mainnet BIP16 exception block" `Quick test_script_flag_exception_mainnet_bip16;
+      test_case "mainnet taproot exception block" `Quick test_script_flag_exception_mainnet_taproot;
+      test_case "testnet3 BIP16 exception block" `Quick test_script_flag_exception_testnet3_bip16;
+      test_case "no exceptions on testnet4/regtest" `Quick test_script_flag_exception_empty_on_other_nets;
     ];
   ]

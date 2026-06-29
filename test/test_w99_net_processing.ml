@@ -223,7 +223,7 @@ let test_g11_max_orphan_tx_100 () =
   cleanup_dir path;
   let db = Storage.ChainDB.create path in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~utxo ~current_height:0 () in
+  let mp = Mempool.create ~network:Consensus.regtest ~utxo ~current_height:0 () in
   Alcotest.(check int) "G11: orphan_count starts 0" 0 (Mempool.orphan_count mp);
   Storage.ChainDB.close db;
   cleanup_dir path
@@ -238,7 +238,7 @@ let test_g12_orphan_tx_expiry_bug () =
   cleanup_dir path;
   let db = Storage.ChainDB.create path in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~utxo ~current_height:0 () in
+  let mp = Mempool.create ~network:Consensus.regtest ~utxo ~current_height:0 () in
   (* expire_orphans runs without crashing and returns 0 for empty pool *)
   let removed = Mempool.expire_orphans mp in
   Storage.ChainDB.close db;
@@ -255,7 +255,7 @@ let test_g13_recursive_orphan_exported () =
   cleanup_dir path;
   let db = Storage.ChainDB.create path in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~utxo ~current_height:0 () in
+  let mp = Mempool.create ~network:Consensus.regtest ~utxo ~current_height:0 () in
   let _accepted = Mempool.process_orphans mp (Cstruct.create 32) in
   Storage.ChainDB.close db;
   cleanup_dir path;
@@ -272,7 +272,7 @@ let test_g14_orphan_pool_keyed_by_txid () =
   cleanup_dir path;
   let db = Storage.ChainDB.create path in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:0 () in
   (* Build a minimal transaction with a missing parent — it will be orphaned.
      Two copies: tx_a has no witness data, tx_b has a dummy witness stack.

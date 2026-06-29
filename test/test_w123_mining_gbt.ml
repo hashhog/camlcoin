@@ -89,7 +89,7 @@ let create_test_chain_state () =
 let make_template () =
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:0 () in
   let payout_script = Cstruct.of_string "\x76\xa9\x14test_w123\x88\xac" in
   let template = Mining.create_block_template ~chain ~mp ~payout_script in

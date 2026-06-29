@@ -39,7 +39,7 @@ let make_ctx () : Rpc.rpc_context * Storage.ChainDB.t =
   cleanup_test_db ();
   let db = Storage.ChainDB.create test_db_path in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create
+  let mp = Mempool.create ~network:Consensus.regtest
     ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
   let chain = Sync.create_chain_state db Consensus.regtest in
   let pm = Peer_manager.create Consensus.regtest in

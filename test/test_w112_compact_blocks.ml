@@ -559,7 +559,7 @@ let test_g22_no_extra_txn_pool_bug () =
   let path = Printf.sprintf "/tmp/camlcoin_w112_g22_%d" (Random.int 1_000_000) in
   let db = Storage.ChainDB.create path in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
       ~utxo ~current_height:100 () in
   let block = make_test_block 3 in
   let cb = P2p.create_compact_block block in

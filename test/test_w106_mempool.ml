@@ -231,7 +231,7 @@ let create_test_mempool () =
     "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" 0 4_000_000L in
   let txid_e = add_utxo utxo
     "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" 0 5_000_000L in
-  let mp = Mempool.create
+  let mp = Mempool.create ~network:Consensus.regtest
     ~require_standard:false ~verify_scripts:false
     ~utxo ~current_height:100 () in
   (mp, db, txid_a, txid_b, txid_c, txid_d, txid_e)

@@ -130,7 +130,7 @@ let create_test_context () =
   let db = Storage.ChainDB.create test_db_path in
   last_db := Some db;
   let utxo = Utxo.UtxoSet.create db in
-  let mempool = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mempool = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
                   ~utxo ~current_height:0 () in
   let network = Consensus.testnet4 in
 

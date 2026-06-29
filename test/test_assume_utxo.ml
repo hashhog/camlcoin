@@ -1007,7 +1007,7 @@ let make_dump_test_ctx () =
   let db = Storage.ChainDB.create db_path in
   let utxo = Utxo.UtxoSet.create db in
   let chain = Sync.create_chain_state db Consensus.mainnet in
-  let mp = Mempool.create
+  let mp = Mempool.create ~network:Consensus.regtest
     ~require_standard:false
     ~verify_scripts:false
     ~utxo

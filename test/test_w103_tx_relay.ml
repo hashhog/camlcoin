@@ -100,7 +100,7 @@ let make_test_mempool () =
   let path = unique_path "mempool" in
   let db = Storage.ChainDB.create path in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
       ~utxo ~current_height:100 () in
   (mp, db, path)
 

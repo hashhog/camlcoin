@@ -175,7 +175,7 @@ let make_rpc_ctx () : Rpc.rpc_context =
     rm_rf test_db_root;
     let db = Storage.ChainDB.create test_db_root in
     let utxo = Utxo.UtxoSet.create db in
-    let mp = Mempool.create
+    let mp = Mempool.create ~network:Consensus.regtest
       ~require_standard:false
       ~verify_scripts:false
       ~utxo

@@ -231,7 +231,7 @@ let make_live_ctx (blocks : built list)
   Hashtbl.replace chain.Sync.headers
     (Cstruct.to_string regtest.Consensus.genesis_hash) genesis_entry;
   chain.Sync.tip <- Some genesis_entry;
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:0 () in
   let pm = Peer_manager.create regtest in
   let fe = Fee_estimation.create () in

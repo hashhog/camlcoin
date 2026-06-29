@@ -80,7 +80,7 @@ let make_rpc_ctx () =
   rm_rf path;
   let db = Storage.ChainDB.create path in
   let utxo = Utxo.UtxoSet.create db in
-  let mempool = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mempool = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
                   ~utxo ~current_height:0 () in
   let network = Consensus.testnet4 in
   let chain_state = Sync.create_chain_state db network in
@@ -310,7 +310,7 @@ let make_parent_only_ctx () =
   rm_rf path;
   let db = Storage.ChainDB.create path in
   let utxo = Utxo.UtxoSet.create db in
-  let mempool = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mempool = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
                   ~utxo ~current_height:0 () in
   let network = Consensus.testnet4 in
   let chain_state = Sync.create_chain_state db network in

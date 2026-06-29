@@ -829,7 +829,7 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   (* Wire Fee_estimation.record_eviction as the eviction hook so that every
      tx removed without confirmation (eviction, expiry, RBF) updates the
      fee estimator's leftmempool stats.  Fixes W114 G12 dead-helper. *)
-  let mempool = Mempool.create ~utxo ~current_height
+  let mempool = Mempool.create ~network ~utxo ~current_height
     ~on_eviction:(Some (fun txid ->
       Fee_estimation.record_eviction fee_estimator txid))
     () in

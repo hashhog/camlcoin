@@ -70,7 +70,7 @@ let create_test_chain_state () =
 let make_template () =
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:0 () in
   let payout_script = Cstruct.of_string "\x76\xa9\x14test_w108\x88\xac" in
   let template = Mining.create_block_template ~chain ~mp ~payout_script in
@@ -225,7 +225,7 @@ let test_bug8_sizelimit_is_4000000 () =
 let test_bug9_mintime_is_mtp_plus_one () =
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:0 () in
   let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
   let template = Mining.create_block_template ~chain ~mp ~payout_script in
@@ -363,7 +363,7 @@ let test_bug13_no_ibd_guard () =
   (* Verify: we can observe that chain.sync_state is accessible but GBT ignores it *)
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:0 () in
 
   (* Simulate IBD state by marking chain as syncing *)
@@ -406,7 +406,7 @@ let test_bug14_gbt_tx_entry_has_hash_field () =
     height = 0;
     is_coinbase = false;
   };
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:0 () in
   let tx = Types.{
     version = 1l;
@@ -489,7 +489,7 @@ let test_bug16_getnetworkhashps_height_param () =
   (* Verify the function signature accepts a height param — document the gap *)
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:0 () in
   let _ = mp in
   (* Mine a few blocks to have something to measure *)
@@ -559,7 +559,7 @@ let test_bug18_min_fee_rate_not_wired () =
     script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac";
     height = 0; is_coinbase = false;
   };
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:0 () in
   (* 1-sat-fee tx: fee rate ≈ 1/500 = 0.002 sat/wu ≈ 8 sat/kvB — far below DEFAULT_BLOCK_MIN_TX_FEE=1000.
      Use bypass_fee_check to inject it past the mempool relay threshold — we want to test
@@ -616,7 +616,7 @@ let test_bug19_extra_nonce_predictable () =
      camlcoin: height_bytes + 8 bytes timestamp = 9-12 bytes (overly long) *)
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:0 () in
   let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
   let template = Mining.create_block_template ~chain ~mp ~payout_script in
@@ -673,7 +673,7 @@ let test_pass21_weightlimit_correct () =
 let test_pass22_bip34_height_encoding () =
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:0 () in
   let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
   let template = Mining.create_block_template ~chain ~mp ~payout_script in
@@ -714,7 +714,7 @@ let test_pass23_coinbase_sequence_nonfinal () =
 let test_pass24_coinbase_locktime_height_minus_one () =
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:0 () in
   let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
   let template = Mining.create_block_template ~chain ~mp ~payout_script in
@@ -741,7 +741,7 @@ let test_pass25_isfinal_tx_check () =
     script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac";
     height = 0; is_coinbase = false;
   };
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:0 () in
   (* Non-final tx: locktime=10000, sequence non-final, at height=1 *)
   let tx_nonfinal = Types.{
@@ -789,7 +789,7 @@ let test_pass27_blockminfeerate_gate_works () =
     script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac";
     height = 0; is_coinbase = false;
   };
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:0 () in
   (* Very-low-fee tx: 1 sat fee on ~500 weight ≈ 0.002 sat/wu << any threshold *)
   let tx_low = Types.{
@@ -840,7 +840,7 @@ let test_bug28_witness_commitment_double_computation () =
      coinbase output, and also document the recomputation gap. *)
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:0 () in
   let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
   let template = Mining.create_block_template ~chain ~mp ~payout_script in
@@ -937,7 +937,7 @@ let test_bug30_submitblock_no_update_uncommitted () =
   (* Structural test: verify the submit path has no commitment-regeneration call *)
   let (chain, db) = create_test_chain_state () in
   let utxo_set = Utxo.OptimizedUtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo:(Utxo.UtxoSet.create db) ~current_height:0 () in
   let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
   let template = Mining.create_block_template ~chain ~mp ~payout_script in

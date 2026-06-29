@@ -1421,7 +1421,7 @@ let run_background_validation
         | Some block ->
           (* Validate block against IBD chainstate *)
           let median_time = 0l in (* TODO: compute properly from chain *)
-          let flags = Validation.get_script_flags_for_height ~network next_height in
+          let flags = Consensus.get_block_script_flags ~block_hash:header_entry.hash next_height network in
           let base_lookup outpoint =
             match Utxo.UtxoCache.get_coin ibd_chainstate.utxo_cache outpoint with
             | Some coin ->

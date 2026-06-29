@@ -3894,11 +3894,12 @@ let tx_index_erase_for_block (db : Storage.ChainDB.t)
    UTXOs) and reject the new chain's first spend. *)
 
 (* Cap multi-block reorg depth.  Rolling back more than this many blocks
-   is almost certainly a misconfigured peer or a malicious attempt to
-   replace deep history; abort rather than burn unbounded I/O.  Bitcoin
-   Core has the same conceptual cap via the [-maxreorgdepth] knob (default
-   100 in [validation.h]'s [DEFAULT_MAX_REORG_DEPTH]).  *)
-let max_reorg_depth = 100
+   is an impl-specific memory-safety bound: the entire reorg is staged in
+   one in-memory batch, so an unbounded depth would exhaust RAM.  Bitcoin
+   Core has NO equivalent cap — Core follows most-work with no reorg-depth
+   limit.  288 = MIN_BLOCKS_TO_KEEP aligns with Core's pruned-node undo
+   retention floor, so a validating peer always has undo data this deep. *)
+let max_reorg_depth = 288
 
 (* O(1) overlay used by the reorg connect-side [base_lookup] and by the
    undo-data construction loop. Mirrors the in-progress UTXO state held

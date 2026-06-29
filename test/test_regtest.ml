@@ -131,7 +131,7 @@ let test_regtest_instant_mining () =
   (* On regtest, mining should find a valid nonce almost instantly *)
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
   let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
 
   let template = Mining.create_block_template ~chain ~mp ~payout_script in
@@ -176,7 +176,7 @@ let test_mine_multiple_blocks_regtest () =
   (* Test mining multiple blocks in sequence *)
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
   let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
 
   let hashes = ref [] in
@@ -235,7 +235,7 @@ let test_submit_block_populates_chainstate_iter () =
   let optimized = Utxo.OptimizedUtxoSet.create
     ~cache_size:1024 ~rocksdb db in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create
+  let mp = Mempool.create ~network:Consensus.regtest
     ~require_standard:false ~verify_scripts:false
     ~utxo ~current_height:0 () in
   let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
@@ -322,7 +322,7 @@ let test_is_unspendable_script () =
 let make_scrub_test_ctx (db : Storage.ChainDB.t) : Rpc.rpc_context =
   let chain = Sync.create_chain_state db Consensus.regtest in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create
+  let mp = Mempool.create ~network:Consensus.regtest
     ~require_standard:false ~verify_scripts:false
     ~utxo ~current_height:0 () in
   let pm = Peer_manager.create Consensus.regtest in
@@ -517,7 +517,7 @@ let test_coinbase_uses_regtest_subsidy () =
 let test_block_template_regtest_subsidy () =
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
   let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
 
   let template = Mining.create_block_template ~chain ~mp ~payout_script in

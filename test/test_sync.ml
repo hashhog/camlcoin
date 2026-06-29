@@ -3067,7 +3067,7 @@ let test_submit_block_side_branch_gate () =
   Alcotest.(check bool) "B1 distinct from A1" true
     (not (Cstruct.equal a1_entry.hash b1_entry.hash));
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
     ~utxo ~current_height:1 () in
   let block_b1 : Types.block = { header = b1_entry.header; transactions = [] } in
   let result = Mining.submit_block ~network_type:Consensus.Regtest

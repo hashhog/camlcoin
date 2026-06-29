@@ -96,7 +96,7 @@ let create_test_mempool () =
     height = 0;
     is_coinbase = false;
   };
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
   (mp, utxo, db, txid1, txid2, txid3)
 
 (* ============================================================================
@@ -232,7 +232,7 @@ let test_mempool_reject_immature_coinbase () =
     is_coinbase = true;
   };
   (* Create mempool at height 100 (only 50 confirmations) *)
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
   let tx = make_regular_tx
     [make_test_input cb_txid 0l]
     [make_test_output 4_999_990_000L]
@@ -1288,7 +1288,7 @@ let test_full_rbf_eviction_limit () =
     };
     txid
   ) in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
   (* Add 101 independent transactions all spending from same "fake" parent output *)
   let parent_txid = Types.hash256_of_hex
     "1111111111111111111111111111111111111111111111111111111111111111" in
@@ -1460,7 +1460,7 @@ let test_rbf_gate3_eviction_limit_enforced () =
       height = 0; is_coinbase = false;
     };
     txid) in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
   (* Add a shared parent UTXO *)
   let shared_txid = Types.hash256_of_hex
     "2222222222222222222222222222222222222222222222222222222222222222" in
@@ -2037,7 +2037,7 @@ let test_cluster_size_limit () =
     height = 0;
     is_coinbase = false;
   };
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
 
   (* Add a simple parent tx *)
   let parent_tx = make_regular_tx
@@ -2117,7 +2117,7 @@ let test_cluster_count_gate_at_limit () =
   cleanup_test_db ();
   let db = Storage.ChainDB.create test_db_path in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
   (* Build a linear chain of 63 fake entries injected directly into mp.entries.
      Each entry i depends on entry i-1 so the UF groups them all into one cluster. *)
   let txids = Array.init 64 (fun i ->
@@ -2183,7 +2183,7 @@ let test_cluster_vsize_gate () =
   cleanup_test_db ();
   let db = Storage.ChainDB.create test_db_path in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
   (* Inject a single fake entry with a large vsize (100_000 vbytes = weight 400_000) *)
   let large_txid = Cstruct.create 32 in
   Cstruct.set_uint8 large_txid 0 0xA1;
@@ -3215,7 +3215,7 @@ let create_sigops_mempool () =
     height = 100;
     is_coinbase = false;
   };
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:200 () in
   (mp, db, path, txid_a)
 
@@ -3449,7 +3449,7 @@ let make_w86_pool () =
   cleanup_test_db ();
   let db = Storage.ChainDB.create test_db_path in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
     ~utxo ~current_height:100 () in
   (mp, db)
 
@@ -3683,7 +3683,7 @@ let test_w86_expire_uses_336h () =
     script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac";
     height = 0; is_coinbase = false;
   };
-  let mp2 = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp2 = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
     ~utxo:utxo2 ~current_height:100 () in
   let tx = make_regular_tx
     [make_test_input txid_src 0l]
@@ -3790,7 +3790,7 @@ let test_w96_min_tx_size_unconditional () =
     is_coinbase = false;
   };
   (* require_standard:false — would previously skip the gate. *)
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:100 () in
   (* Build a minimal tx — empty scriptSig, empty scriptPubKey output → ~60 bytes *)
   let tiny_tx = Types.{
@@ -3912,7 +3912,7 @@ let test_w96_already_known_via_confirmed_outputs () =
     height = 0;
     is_coinbase = false;
   };
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:100 () in
   let tx = make_regular_tx
     [make_test_input prev_txid 0l]
@@ -3959,7 +3959,7 @@ let test_w96_coinbase_maturity_off_by_one_fix () =
   };
   (* current_height = 200.  Spending in next block (201) means
      201 - 101 = 100 confirmations, exactly at COINBASE_MATURITY. *)
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:200 () in
   let tx = make_regular_tx
     [make_test_input cb_txid 0l]
@@ -3985,7 +3985,7 @@ let test_w96_coinbase_maturity_just_immature () =
     height = 101;
     is_coinbase = true;
   };
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:199 () in
   let tx = make_regular_tx
     [make_test_input cb_txid 0l]
@@ -4033,7 +4033,7 @@ let test_w96_ephemeral_dust_nonzero_fee_rejected_single_tx () =
     height = 0;
     is_coinbase = false;
   };
-  let mp = Mempool.create ~require_standard:true ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:true ~verify_scripts:false
              ~utxo ~current_height:100 () in
   (* P2A dust output (script_pubkey = 0x51 0x02 0x4e 0x73 → "OP_1 0x4e73",
      amount 240 is the standard P2A dust threshold; under it = dust). *)
@@ -4303,6 +4303,61 @@ let test_w96_accept_to_memory_pool_basic_ok () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* ============================================================================
+   Network-config propagation test (EFFECTIVE proof for Mempool.create fix)
+   ============================================================================ *)
+
+(* Before the fix Mempool.create hardcoded Consensus.regtest regardless of
+   caller input.  This test creates two mempools — one with mainnet config,
+   one with regtest — at current_height=0 and verifies that their script flags
+   for the next block (height 1) differ.  On mainnet only P2SH is active at
+   height 1; on regtest all soft forks are active from genesis.  The test
+   would have failed before the fix because both mempools would have produced
+   identical (regtest) flags. *)
+let test_network_config_propagates_to_script_flags () =
+  let path = "/tmp/camlcoin_test_network_config_mempool" in
+  let rm_rf p =
+    let rec go f =
+      if Sys.file_exists f then begin
+        if Sys.is_directory f then begin
+          Array.iter (fun e -> go (Filename.concat f e)) (Sys.readdir f);
+          Unix.rmdir f
+        end else
+          Unix.unlink f
+      end
+    in go p
+  in
+  rm_rf path;
+  let db = Storage.ChainDB.create path in
+  let utxo = Utxo.UtxoSet.create db in
+  (* Mainnet mempool at height 0 (next block = 1):
+     BIP-66 activates at 363725, segwit at 481824, taproot at 709632.
+     At height 1 only script_verify_p2sh is active. *)
+  let mp_mainnet = Mempool.create ~network:Consensus.mainnet
+      ~require_standard:false ~verify_scripts:false
+      ~utxo ~current_height:0 () in
+  (* Regtest mempool at height 0 (next block = 1):
+     segwit_height=0 and taproot_height=0 → all soft forks active from genesis. *)
+  let mp_regtest = Mempool.create ~network:Consensus.regtest
+      ~require_standard:false ~verify_scripts:false
+      ~utxo ~current_height:0 () in
+  (* Next block = 1 (mempools were created with current_height:0). *)
+  let flags_mainnet =
+    Consensus.get_standard_policy_flags 1 mp_mainnet.network in
+  let flags_regtest =
+    Consensus.get_standard_policy_flags 1 mp_regtest.network in
+  (* The two sets of flags must differ — before the fix both returned regtest flags. *)
+  Alcotest.(check bool) "mainnet and regtest flags differ at height 1"
+    true (flags_mainnet <> flags_regtest);
+  (* Mainnet at height 1: only P2SH is active (no BIP-66/65/CSV/segwit/taproot). *)
+  Alcotest.(check int) "mainnet at height 1: only P2SH active"
+    Consensus.script_verify_p2sh flags_mainnet;
+  (* Regtest at height 1: taproot must be active (taproot_height = 0). *)
+  Alcotest.(check bool) "regtest at height 1: taproot active"
+    true (flags_regtest land Consensus.script_verify_taproot <> 0);
+  Storage.ChainDB.close db;
+  rm_rf path
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
@@ -4568,5 +4623,9 @@ let () =
         test_w96_atmp_no_exception_on_empty_inputs;
       test_case "accept_to_memory_pool happy path" `Quick
         test_w96_accept_to_memory_pool_basic_ok;
+    ];
+    "network_config_propagation", [
+      test_case "create uses provided network (not hardcoded regtest)" `Quick
+        test_network_config_propagates_to_script_flags;
     ];
   ]

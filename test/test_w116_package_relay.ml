@@ -90,7 +90,7 @@ let create_test_mempool () =
     height = 0;
     is_coinbase = false;
   };
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
     ~utxo ~current_height:100 () in
   (mp, utxo, db, txid1, txid2, txid3)
 
@@ -504,7 +504,7 @@ let test_g23_bug9_find_1p1c_stub () =
   let (_, _utxo, db, _, _, _) = create_test_mempool () in
   let mp2 =
     let utxo2 = Utxo.UtxoSet.create (Storage.ChainDB.create "/tmp/camlcoin_test_w116_db2") in
-    Mempool.create ~require_standard:false ~verify_scripts:false
+    Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
       ~utxo:utxo2 ~current_height:100 ()
   in
   let parent_txid =

@@ -159,7 +159,7 @@ let make_psbt_test_ctx ~(wallet : Wallet.t) : Rpc.rpc_context =
   let db = Storage.ChainDB.create db_path in
   let utxo = Utxo.UtxoSet.create db in
   let mp =
-    Mempool.create
+    Mempool.create ~network:Consensus.regtest
       ~require_standard:false
       ~verify_scripts:false
       ~utxo

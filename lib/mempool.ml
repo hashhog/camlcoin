@@ -259,8 +259,8 @@ let truc_descendant_limit = 2     (* max unconfirmed descendants including self 
 let create ?(require_standard=true) ?(verify_scripts=true)
     ?(zmq_notifier : Zmq_notify.t option)
     ?(on_eviction : (Types.hash256 -> unit) option = None)
+    ~(network : Consensus.network_config)
     ~(utxo : Utxo.UtxoSet.t) ~(current_height : int) () : mempool =
-  let network = Consensus.regtest in
   { entries = Hashtbl.create 10_000;
     total_weight = 0;
     total_fee = 0L;
@@ -3847,9 +3847,6 @@ let update_height (mp : mempool) (height : int) : unit =
 
 let update_median_time (mp : mempool) (mtp : int32) : unit =
   mp.current_median_time <- mtp
-
-let set_network (mp : mempool) (network : Consensus.network_config) : unit =
-  mp.network <- network
 
 (* ============================================================================
    Clear Mempool

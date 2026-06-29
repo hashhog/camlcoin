@@ -113,7 +113,7 @@ let create_test_context () =
     is_coinbase = false;
   };
 
-  let mp = Mempool.create
+  let mp = Mempool.create ~network:Consensus.regtest
     ~require_standard:false
     ~verify_scripts:false
     ~utxo
@@ -671,7 +671,7 @@ let test_getrawtransaction_confirmed_has_block_info () =
   let chain = Sync.create_chain_state db Consensus.mainnet in
   let pm = Peer_manager.create Consensus.mainnet in
   let fe = Fee_estimation.create () in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
 
   let ctx : Rpc.rpc_context = {
     chain = chain;
@@ -743,7 +743,7 @@ let test_getrawtransaction_with_blockhash () =
   let chain = Sync.create_chain_state db Consensus.mainnet in
   let pm = Peer_manager.create Consensus.mainnet in
   let fe = Fee_estimation.create () in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
 
   let ctx : Rpc.rpc_context = {
     chain = chain;
@@ -800,7 +800,7 @@ let test_getrawtransaction_wrong_blockhash () =
   let chain = Sync.create_chain_state db Consensus.mainnet in
   let pm = Peer_manager.create Consensus.mainnet in
   let fe = Fee_estimation.create () in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in
 
   let ctx : Rpc.rpc_context = {
     chain = chain;
@@ -1031,7 +1031,7 @@ let create_regtest_context () =
   let chain = Sync.create_chain_state db Consensus.regtest in
   let pm = Peer_manager.create Consensus.regtest in
   let fe = Fee_estimation.create () in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
 
   let ctx : Rpc.rpc_context = {
     chain = chain;
@@ -1301,7 +1301,7 @@ let create_regtest_context () =
   rm_rf db_path;
   let db = Storage.ChainDB.create db_path in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
   let chain = Sync.create_chain_state db Consensus.regtest in
   let pm = Peer_manager.create Consensus.regtest in
   let fe = Fee_estimation.create () in

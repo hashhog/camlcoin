@@ -66,7 +66,7 @@ let () =
   let optimized =
     Utxo.OptimizedUtxoSet.create ~cache_size:65536 ~rocksdb db in
   let utxo = Utxo.UtxoSet.create db in
-  let mp = Mempool.create
+  let mp = Mempool.create ~network:Consensus.regtest
     ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
 
   (* Attach the txospender index to the live chain — exactly as cli.ml does

@@ -54,7 +54,7 @@ let make_ctx () =
   let db = Storage.ChainDB.create test_db_path in
   let utxo = Utxo.UtxoSet.create db in
   let mp =
-    Mempool.create
+    Mempool.create ~network:Consensus.regtest
       ~require_standard:false
       ~verify_scripts:false
       ~utxo

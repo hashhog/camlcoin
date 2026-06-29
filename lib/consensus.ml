@@ -923,22 +923,63 @@ let script_verify_nullfail              = 1 lsl 12  (* BIP-146 *)
 let script_verify_witness_pubkeytype    = 1 lsl 14  (* BIP-141 compressed keys *)
 let script_verify_taproot               = 1 lsl 17  (* BIP-341/342 *)
 
+(* ============================================================================
+   Script-flag exception tables (Bitcoin Core GetBlockScriptFlags exceptions)
+   ============================================================================ *)
+
+(* Per-block script-flag overrides.  Bitcoin Core's GetBlockScriptFlags checks
+   this table BEFORE computing height-derived flags: if the block hash matches,
+   the override value is returned DIRECTLY (height-derived flags are NOT
+   additionally OR'd in).  Hashes are stored in INTERNAL little-endian byte
+   order (display hash bytes reversed), mirroring the bip30_repeat_blocks
+   convention used in this file. *)
+
+(* Mainnet exceptions.
+   - height 170060: BIP-16 P2SH violator.  Core returns SCRIPT_VERIFY_NONE (0).
+     display: 00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22
+   - height 692261: Taproot violator.  Core returns P2SH | WITNESS only.
+     display: 0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad *)
+let mainnet_script_flag_exceptions : (string * int) list = [
+  ("229c4fac88bab194eb08f1a528cc308ded2397f4f4eb6e75dc02000000000000", 0);
+  ("ad95e3a15ee5ffd585c5e81d44b56a981e842d5bc3140f000000000000000000",
+   script_verify_p2sh lor script_verify_witness);
+]
+
+(* Testnet3 exceptions.
+   - height 514: BIP-16 P2SH violator.  Core returns SCRIPT_VERIFY_NONE (0).
+     display: 00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105 *)
+let testnet3_script_flag_exceptions : (string * int) list = [
+  ("05b132a4f74a8799a57a4202d0eeb09612cc08d295401f007c4530dd00000000", 0);
+]
+
 (* Compute the correct script verification flags for a given block height.
-   Bitcoin Core has script_flag_exceptions for specific blocks where script
-   rules are relaxed (e.g., the BIP16 exception at block 170060 on mainnet). *)
-let get_block_script_flags ?(block_hash="") (height : int) (network : network_config) : int =
-  (* Check script_flag_exceptions: block 170060 on mainnet was mined before
-     BIP16 P2SH enforcement but contains a tx that fails P2SH validation.
-     Bitcoin Core skips ALL script flags for this block. *)
-  let is_bip16_exception =
-    height = 170060 && (
-      block_hash = "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"
-      || block_hash = ""  (* If hash not provided, use height-only check on mainnet *)
-    ) && network.name = "mainnet"
+   Checks the per-block exception table first (Bitcoin Core GetBlockScriptFlags).
+
+   [block_hash]: the block's hash in internal LE byte order (same convention as
+   bip30_repeat_blocks).  Defaults to [Types.zero_hash] (all zeros), which never
+   matches any real exception entry, preserving the height-only path for callers
+   that do not have the block hash (mempool next-block flags, tests).
+
+   Every block-VALIDATION caller MUST supply the real hash so the override fires
+   on the two mainnet exception blocks (heights 170060, 692261) and the testnet3
+   exception block (height 514).  Omitting the hash on a validation path is the
+   original bug this function fixes: the old code triggered by height alone when
+   no hash was supplied (false-positive hazard removed here). *)
+let get_block_script_flags ?(block_hash = Types.zero_hash) (height : int) (network : network_config) : int =
+  (* Check exception table first.  If the hash matches, return the override
+     DIRECTLY without OR-ing in height-derived flags (matches Bitcoin Core
+     GetBlockScriptFlags which returns early on any script_flag_exceptions hit). *)
+  let exception_table = match network.network_type with
+    | Mainnet  -> mainnet_script_flag_exceptions
+    | Testnet3 -> testnet3_script_flag_exceptions
+    | _        -> []
   in
-  if is_bip16_exception then 0
-  else
-  (* P2SH active for all other blocks *)
+  match List.find_opt (fun (hex, _) ->
+    Cstruct.equal block_hash (Types.hash256_of_hex hex)
+  ) exception_table with
+  | Some (_, override) -> override
+  | None ->
+  (* Normal height-derived consensus flags. *)
   let flags = script_verify_p2sh in
   (* BIP-66: strict DER signatures *)
   let flags =

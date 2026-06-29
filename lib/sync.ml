@@ -3057,7 +3057,7 @@ let process_downloaded_blocks ?(max_blocks = 1)
         let skip_scripts = is_assume_valid ibd.chain height in
         let validation_flags =
           if skip_scripts then 0
-          else Consensus.get_block_script_flags height ibd.chain.network
+          else Consensus.get_block_script_flags ~block_hash:entry.hash height ibd.chain.network
         in
         let%lwt vresult =
           match worker with
@@ -4395,7 +4395,7 @@ let connect_block_into_batch
     let skip_scripts = is_assume_valid state height in
     let validation_flags =
       if skip_scripts then 0
-      else Consensus.get_block_script_flags height state.network
+      else Consensus.get_block_script_flags ~block_hash:entry.hash height state.network
     in
     (* [skip_pow] mirrors Bitcoin Core's CheckBlock(..., fCheckPOW) parameter
        (validation.cpp CheckBlockHeader -> CheckProofOfWork). It gates ONLY the
@@ -5865,7 +5865,7 @@ let rec connect_stored_blocks (state : chain_state) : int =
             }
         in
         let validation_flags =
-          Consensus.get_block_script_flags next_height state.network
+          Consensus.get_block_script_flags ~block_hash:entry.hash next_height state.network
         in
         (* accept_block: unified ProcessNewBlock check pipeline.
            Same sequence as process_new_block and submit_block.
@@ -6077,7 +6077,7 @@ let process_new_block ?(f_requested = false)
             }
         in
         let validation_flags =
-          Consensus.get_block_script_flags height state.network
+          Consensus.get_block_script_flags ~block_hash:hash height state.network
         in
         (* accept_block: unified ProcessNewBlock check pipeline.
            Mirrors Bitcoin Core's AcceptBlock → CheckBlock →

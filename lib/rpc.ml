@@ -1532,11 +1532,24 @@ let handle_getpeerinfo (ctx : rpc_context) : Yojson.Safe.t =
       (if Int64.logand svc 8L <> 0L then ["WITNESS"] else []) @
       (if Int64.logand svc 1024L <> 0L then ["NETWORK_LIMITED"] else []) in
     let is_inbound = stats.stat_direction = Peer.Inbound in
+    (* Derive "network" from the peer's address — mirrors Bitcoin Core
+       rpc/net.cpp GetPeerInfo() which calls peer.ConnectedThroughNetwork().
+       We use P2p.network_type_of_host which already handles IPv4, IPv6,
+       .onion (Tor v3), .b32.i2p (I2P), fc00::/8 (CJDNS), and loopback
+       (Net_Internal -> "not_publicly_routable"). *)
+    let network_str = match P2p.network_type_of_host stats.stat_addr with
+      | P2p.Net_IPv4     -> "ipv4"
+      | P2p.Net_IPv6     -> "ipv6"
+      | P2p.Net_Onion    -> "onion"
+      | P2p.Net_I2P      -> "i2p"
+      | P2p.Net_CJDNS    -> "cjdns"
+      | P2p.Net_Internal -> "not_publicly_routable"
+    in
     let fields = [
       ("id", `Int stats.Peer.stat_id);
       ("addr", `String (Printf.sprintf "%s:%d"
         stats.stat_addr stats.stat_port));
-      ("network", `String "ipv4");
+      ("network", `String network_str);
       ("services", `String (Printf.sprintf "%016Lx" svc));
       ("servicesnames", `List (List.map (fun s -> `String s) svc_names));
       ("relaytxes", `Bool stats.stat_relay);

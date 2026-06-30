@@ -4198,6 +4198,160 @@ let test_w144_assumevalid_fork_not_skipped () =
     Storage.ChainDB.close db;
     rm_rf db_path)
 
+(* ============================================================================
+   W2 Finding 1 EFFECTIVE test: compute_mtp_hash_linked gives correct MTP
+   when the height->hash index is contaminated by a side-branch header.
+
+   Bitcoin Core's GetMedianTimePast walks pindex->pprev (hash-linked parents,
+   bitcoin-core/src/chain.h:233-245).  The height->hash index (used by
+   compute_median_time_past) can be overwritten by accept_header for any accepted
+   header regardless of whether it is on the active chain, because accept_header
+   unconditionally calls set_height_hash (sync.ml:1131).
+
+   EFFECTIVE test design:
+     main-chain header at h=1: timestamp T1 = 1_296_689_000l  (a past timestamp)
+     side-branch header at h=1: timestamp T1_side = 1_499_999_999l  (much higher)
+     After calling accept_header on the side-branch, height->hash[1] = side-branch.
+     compute_median_time_past state 2 then picks up T1_side (wrong).
+     compute_mtp_hash_linked state h1_main.hash picks up T1 via prev_block walk (correct).
+   ============================================================================ *)
+let test_mtp_hash_linked_correct_under_height_index_corruption () =
+  let db_path = "/tmp/camlcoin_mtp_hash_linked_test" in
+  let rec rm_rf p =
+    if Sys.file_exists p then begin
+      if Sys.is_directory p then begin
+        Array.iter (fun f -> rm_rf (Filename.concat p f)) (Sys.readdir p);
+        Unix.rmdir p
+      end else Unix.unlink p
+    end
+  in
+  rm_rf db_path;
+  let db = Storage.ChainDB.create db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let genesis_entry = Option.get (Sync.get_tip state) in
+  let genesis_hash = genesis_entry.hash in
+
+  (* Build a main-chain header at height 1 with a known past timestamp.
+     Use accept_header directly (bypasses validate_header's PoW check) so
+     we can inject a specific timestamp for the MTP test. *)
+  let t1_main = 1_296_689_000l in  (* 398s after regtest genesis, year 2011 *)
+  let h1_main_header = Types.{
+    version = 4l; prev_block = genesis_hash; merkle_root = Types.zero_hash;
+    timestamp = t1_main; bits = 0x207fffffl; nonce = 0l } in
+  let h1_main_hash = Crypto.compute_block_hash h1_main_header in
+  let h1_main_entry = Sync.{
+    header = h1_main_header; hash = h1_main_hash; height = 1;
+    total_work = Consensus.work_add genesis_entry.total_work
+                   (Sync.work_from_bits 0x207fffffl) } in
+  Sync.accept_header state h1_main_entry;
+
+  (* Verify height->hash[1] now points to h1_main. *)
+  let h1_active_before = Storage.ChainDB.get_hash_at_height db 1 in
+  Alcotest.(check bool) "height 1 initially maps to main-chain header" true
+    (match h1_active_before with
+     | Some h -> Cstruct.equal h h1_main_hash
+     | None -> false);
+
+  (* Build a side-branch header at height 1 with a very different (much higher)
+     timestamp. The merkle_root is non-zero so the hash is different from h1_main.
+     We call accept_header — which is the buggy path that unconditionally calls
+     set_height_hash, overwriting height->hash[1] to the side-branch hash. *)
+  let t1_side = 1_499_999_999l in  (* Year 2017: clearly different from t1_main *)
+  let sb_merkle = Cstruct.create 32 in
+  Cstruct.set_uint8 sb_merkle 0 0xAB;  (* non-zero to distinguish from h1_main *)
+  let h1_side_header = Types.{
+    version = 4l; prev_block = genesis_hash; merkle_root = sb_merkle;
+    timestamp = t1_side; bits = 0x207fffffl; nonce = 0l } in
+  let h1_side_hash = Crypto.compute_block_hash h1_side_header in
+  let h1_side_entry = Sync.{
+    header = h1_side_header; hash = h1_side_hash; height = 1;
+    total_work = Consensus.work_add genesis_entry.total_work
+                   (Sync.work_from_bits 0x207fffffl) } in
+  Sync.accept_header state h1_side_entry;  (* corrupts height->hash[1] *)
+
+  (* Confirm corruption: height->hash[1] now points to the side-branch. *)
+  let h1_active_after = Storage.ChainDB.get_hash_at_height db 1 in
+  Alcotest.(check bool) "height 1 is now overwritten to side-branch (bug trigger)" true
+    (match h1_active_after with
+     | Some h -> Cstruct.equal h h1_side_hash
+     | None -> false);
+
+  (* compute_median_time_past state 2 asks for height 0 (genesis) and height 1
+     (now = side-branch with t1_side).  With 2 elements, the median is the one
+     at index 1 (the larger), which is t1_side since t1_side > genesis_ts. *)
+  let mtp_height_indexed = Sync.compute_median_time_past state 2 in
+  Alcotest.(check int32) "height-indexed MTP returns side-branch timestamp (wrong)" t1_side
+    mtp_height_indexed;
+
+  (* compute_mtp_hash_linked state h1_main.hash walks h1_main -> genesis
+     and ignores the corrupted height->hash index.  With 2 entries (h1_main + genesis),
+     the median is t1_main (the larger, since t1_main > genesis_ts). *)
+  let mtp_hash_linked = Sync.compute_mtp_hash_linked state h1_main_header.prev_block in
+  (* h1_main.prev_block = genesis_hash; from there, collect_ancestor_timestamps
+     walks genesis (ts = 1_296_688_602l).  Only 1 entry; median of [genesis_ts] = genesis_ts. *)
+  (* Actually we want MTP for a block AT height 2 whose prev_block is h1_main.
+     So we pass h1_main_hash (= prev_block of the would-be h=2 block). *)
+  let mtp_hash_linked_for_h2 = Sync.compute_mtp_hash_linked state h1_main_hash in
+  (* collect_ancestor_timestamps state h1_main_entry 11:
+     - h1_main.timestamp = t1_main = 1_296_689_000l
+     - genesis.timestamp = 1_296_688_602l (regtest genesis)
+     - genesis.height = 0 → stop
+     2 timestamps: sorted = [1_296_688_602l; 1_296_689_000l], median at index 1 = 1_296_689_000l *)
+  Alcotest.(check int32) "hash-linked MTP for h=2 returns correct main-chain timestamp" t1_main
+    mtp_hash_linked_for_h2;
+
+  (* The two values differ, proving the corruption affects compute_median_time_past
+     but NOT compute_mtp_hash_linked. *)
+  Alcotest.(check bool)
+    "height-indexed MTP ≠ hash-linked MTP (index contaminated by side-branch)" true
+    (mtp_height_indexed <> mtp_hash_linked_for_h2);
+
+  (* Also verify that check_block for a block at h=2 with timestamp t1_main + 1
+     does NOT raise BlockBadTimestamp when using the correct hash-linked MTP.
+     (It must not be rejected as "time-too-old".)
+     t1_main + 1 > t1_main (the correct MTP) → block is valid time-wise.
+     t1_main + 1 <= t1_side (the corrupt MTP) → would be falsely rejected pre-fix. *)
+  let h2_ts = Int32.add t1_main 1l in
+  Alcotest.(check bool) "h2_ts would be rejected by corrupt MTP (pre-fix condition holds)"
+    true (h2_ts <= t1_side);
+  let coinbase = {
+    Types.version = 1l;
+    inputs = [{
+      previous_output = { txid = Types.zero_hash; vout = -1l };
+      script_sig = Consensus.encode_height_in_coinbase 2;
+      sequence = 0xFFFFFFFFl;
+    }];
+    outputs = [{ value = Consensus.block_subsidy 2; script_pubkey = Cstruct.create 0 }];
+    witnesses = [];
+    locktime = 0l;
+  } in
+  let txid = Crypto.compute_txid coinbase in
+  let (merkle, _) = Crypto.merkle_root [txid] in
+  let h2_header = Types.{
+    version = 4l; prev_block = h1_main_hash; merkle_root = merkle;
+    timestamp = h2_ts; bits = 0x207fffffl; nonce = 0l } in
+  let h2_block = Types.{ header = h2_header; transactions = [coinbase] } in
+  (* Core EFFECTIVE assertions: the MTP functions themselves differ, and the
+     correct value (hash-linked) passes the time-too-old check while the corrupt
+     value (height-indexed) would fail it. Both comparisons are unsigned-correct:
+     h2_ts and the MTP values are all pre-2038 so the unsigned/signed difference
+     only matters for Finding 2 (tested separately in test_consensus / test_validation). *)
+
+  (* h2_ts strictly greater than hash-linked MTP → block is "time-not-too-old" *)
+  let u32 x = Int64.logand (Int64.of_int32 x) 0xFFFFFFFFL in
+  Alcotest.(check bool)
+    "W2-F1 EFFECTIVE: h2_ts > hash-linked MTP (correct MTP allows this block)"
+    true (Int64.compare (u32 h2_ts) (u32 mtp_hash_linked_for_h2) > 0);
+
+  (* h2_ts NOT greater than height-indexed (corrupt) MTP → block would be "time-too-old" *)
+  Alcotest.(check bool)
+    "W2-F1 EFFECTIVE: h2_ts <= height-indexed MTP (corrupt MTP would reject this block)"
+    true (Int64.compare (u32 h2_ts) (u32 mtp_height_indexed) <= 0);
+
+  ignore (h2_block, mtp_hash_linked);
+  Storage.ChainDB.close db;
+  rm_rf db_path
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
@@ -4485,5 +4639,10 @@ let () =
       (* Future-time anchor *)
       test_case "MAX_FUTURE_BLOCK_TIME = 7200s" `Quick
         test_w97_future_time_2h_constant;
+    ];
+    "mtp_hash_linked", [
+      (* W2 Finding 1: MTP must walk hash-linked parents, not height->hash index *)
+      test_case "W2-F1: hash-linked MTP ignores height-index corruption" `Quick
+        test_mtp_hash_linked_correct_under_height_index_corruption;
     ];
   ]

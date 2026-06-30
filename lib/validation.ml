@@ -361,60 +361,120 @@ let get_script_flags_for_height ~(network : Consensus.network_config) (height : 
    Signature Operation Counting
    ============================================================================ *)
 
-(* Count legacy sigops in a script (for block sigop limit) *)
-let count_sigops (script : Cstruct.t) : int =
-  try
-    let ops = Script.parse_script script in
-    List.fold_left (fun count op ->
-      match op with
-      | Script.OP_CHECKSIG | Script.OP_CHECKSIGVERIFY ->
-        count + 1
-      | Script.OP_CHECKMULTISIG | Script.OP_CHECKMULTISIGVERIFY ->
-        (* Worst case: 20 pubkeys *)
-        count + 20
-      | _ -> count
-    ) 0 ops
-  with _ ->
-    (* If parsing fails, return 0 (unparseable scripts have no sigops) *)
-    0
+(* Raw byte walker for sigop counting, mirroring Bitcoin Core's
+   CScript::GetSigOpCount (script/script.cpp:158-180).
 
-(* Count P2SH sigops (called when evaluating P2SH scripts) *)
-let count_p2sh_sigops (redeem_script : Cstruct.t) : int =
-  try
-    let ops = Script.parse_script redeem_script in
-    (* For P2SH, we use actual pubkey count for multisig *)
-    let rec count_with_context ops last_push_value acc =
-      match ops with
-      | [] -> acc
-      | Script.OP_CHECKSIG :: rest | Script.OP_CHECKSIGVERIFY :: rest ->
-        count_with_context rest None (acc + 1)
-      | Script.OP_CHECKMULTISIG :: rest | Script.OP_CHECKMULTISIGVERIFY :: rest ->
-        (* Use last push value as pubkey count if available *)
-        let n = match last_push_value with
-          | Some n when n >= 0 && n <= 20 -> n
-          | _ -> 20  (* Worst case *)
+   The previous implementation wrapped parse_script in `try ... with _ -> 0`,
+   so ANY script that failed to fully parse (e.g. leading OP_CHECKSIGs followed
+   by a truncated push) returned 0 sigops.  Bitcoin Core's GetSigOpCount instead
+   walks the script opcode-by-opcode via GetOp and, when GetOp returns false
+   (truncated push — not enough bytes for the length prefix or the data body),
+   BREAKS and returns the count accumulated SO FAR.  An attacker can construct a
+   block whose true (Core) sigop cost exceeds MAX_BLOCK_SIGOPS_COST while this
+   node counted ~0, causing a false-accept and a latent chain-split.
+
+   [accurate=false]: OP_CHECKMULTISIG/VERIFY always counts as MAX_PUBKEYS_PER_MULTISIG
+   (20), matching GetSigOpCount(fAccurate=false).  Used for legacy scriptSig /
+   scriptPubKey counting.
+   [accurate=true]: OP_CHECKMULTISIG/VERIFY uses the directly preceding OP_1..OP_16
+   opcode value (0x51..0x60 → 1..16), matching GetSigOpCount(fAccurate=true).
+   Used for P2SH redeem-script and witness-script counting.
+
+   In both modes, on a truncated push the walker STOPS and returns the partial
+   count — NOT 0. *)
+let count_sigops_raw ~(accurate : bool) (script : Cstruct.t) : int =
+  let len = Cstruct.length script in
+  let count = ref 0 in
+  let last_opcode = ref 0x00 in   (* 0 is OP_0, not in OP_1..OP_16 range *)
+  let pos = ref 0 in
+  let stop = ref false in
+  while not !stop && !pos < len do
+    let opcode = Cstruct.get_uint8 script !pos in
+    pos := !pos + 1;
+    (* Skip push data.  Mirror GetOp: if the script is truncated (not enough
+       bytes for the length prefix or the data itself), Core's GetOp returns
+       false → the loop breaks BEFORE the sigop check.  We set stop := true and
+       skip the sigop-count update below. *)
+    if opcode >= 0x01 && opcode <= 0x4b then begin
+      (* Direct push of [opcode] bytes *)
+      let new_pos = !pos + opcode in
+      if new_pos > len then stop := true
+      else pos := new_pos
+    end else if opcode = 0x4c then begin
+      (* OP_PUSHDATA1: 1-byte length then data *)
+      if !pos >= len then stop := true
+      else begin
+        let data_len = Cstruct.get_uint8 script !pos in
+        let new_pos = !pos + 1 + data_len in
+        if new_pos > len then stop := true
+        else pos := new_pos
+      end
+    end else if opcode = 0x4d then begin
+      (* OP_PUSHDATA2: 2-byte LE length then data *)
+      if !pos + 1 >= len then stop := true
+      else begin
+        let data_len =
+          Cstruct.get_uint8 script !pos
+          lor (Cstruct.get_uint8 script (!pos + 1) lsl 8)
         in
-        count_with_context rest None (acc + n)
-      | Script.OP_1 :: rest -> count_with_context rest (Some 1) acc
-      | Script.OP_2 :: rest -> count_with_context rest (Some 2) acc
-      | Script.OP_3 :: rest -> count_with_context rest (Some 3) acc
-      | Script.OP_4 :: rest -> count_with_context rest (Some 4) acc
-      | Script.OP_5 :: rest -> count_with_context rest (Some 5) acc
-      | Script.OP_6 :: rest -> count_with_context rest (Some 6) acc
-      | Script.OP_7 :: rest -> count_with_context rest (Some 7) acc
-      | Script.OP_8 :: rest -> count_with_context rest (Some 8) acc
-      | Script.OP_9 :: rest -> count_with_context rest (Some 9) acc
-      | Script.OP_10 :: rest -> count_with_context rest (Some 10) acc
-      | Script.OP_11 :: rest -> count_with_context rest (Some 11) acc
-      | Script.OP_12 :: rest -> count_with_context rest (Some 12) acc
-      | Script.OP_13 :: rest -> count_with_context rest (Some 13) acc
-      | Script.OP_14 :: rest -> count_with_context rest (Some 14) acc
-      | Script.OP_15 :: rest -> count_with_context rest (Some 15) acc
-      | Script.OP_16 :: rest -> count_with_context rest (Some 16) acc
-      | _ :: rest -> count_with_context rest None acc
-    in
-    count_with_context ops None 0
-  with _ -> 0
+        let new_pos = !pos + 2 + data_len in
+        if new_pos > len then stop := true
+        else pos := new_pos
+      end
+    end else if opcode = 0x4e then begin
+      (* OP_PUSHDATA4: 4-byte LE length then data *)
+      if !pos + 3 >= len then stop := true
+      else begin
+        let b0 = Cstruct.get_uint8 script !pos in
+        let b1 = Cstruct.get_uint8 script (!pos + 1) in
+        let b2 = Cstruct.get_uint8 script (!pos + 2) in
+        let b3 = Cstruct.get_uint8 script (!pos + 3) in
+        (* OCaml int is 63 bits on 64-bit systems; safe for all PUSHDATA4 values *)
+        let data_len = b0 lor (b1 lsl 8) lor (b2 lsl 16) lor (b3 lsl 24) in
+        if data_len < 0 then stop := true  (* defensive guard for 32-bit builds *)
+        else begin
+          let new_pos = !pos + 4 + data_len in
+          if new_pos > len then stop := true
+          else pos := new_pos
+        end
+      end
+    end;
+    (* Count sigop opcodes — only when the opcode was fully consumed (not stopped
+       by a truncated push), matching Core's post-GetOp sigop check. *)
+    if not !stop then begin
+      (* OP_CHECKSIG=0xac, OP_CHECKSIGVERIFY=0xad *)
+      (if opcode = 0xac || opcode = 0xad then
+        count := !count + 1
+      (* OP_CHECKMULTISIG=0xae, OP_CHECKMULTISIGVERIFY=0xaf *)
+      else if opcode = 0xae || opcode = 0xaf then begin
+        let n =
+          if accurate && !last_opcode >= 0x51 && !last_opcode <= 0x60 then
+            (* OP_1=0x51→1, OP_2=0x52→2, …, OP_16=0x60→16 (DecodeOP_N) *)
+            !last_opcode - 0x50
+          else
+            20  (* MAX_PUBKEYS_PER_MULTISIG *)
+        in
+        count := !count + n
+      end);
+      last_opcode := opcode
+    end
+  done;
+  !count
+
+(* Count legacy sigops in a script (for block sigop limit).
+   Mirrors CScript::GetSigOpCount(fAccurate=false) (script/script.cpp:158-180):
+   walks raw bytes, counts CHECKSIG/CHECKSIGVERIFY as 1,
+   CHECKMULTISIG/CHECKMULTISIGVERIFY as 20, and on a truncated push STOPS and
+   returns the count so far (not 0). *)
+let count_sigops (script : Cstruct.t) : int =
+  count_sigops_raw ~accurate:false script
+
+(* Count P2SH / witness sigops (accurate multisig counting).
+   Mirrors CScript::GetSigOpCount(fAccurate=true): same raw byte walk but
+   OP_CHECKMULTISIG/VERIFY uses the value of the directly preceding OP_1..OP_16
+   opcode (if any) rather than the 20-pubkey worst-case. *)
+let count_p2sh_sigops (redeem_script : Cstruct.t) : int =
+  count_sigops_raw ~accurate:true redeem_script
 
 (* Count witness sigops (for segwit transactions) *)
 let count_witness_sigops (witness_script : Cstruct.t) : int =

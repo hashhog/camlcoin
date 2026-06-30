@@ -4077,6 +4077,127 @@ let test_w97_future_time_2h_constant () =
      Alcotest.fail "future-time constant tighter than Core's 7200s"
    | Error _ -> ()  (* MTP/other rejection is fine *))
 
+(* ---------------------------------------------------------------------------
+   W144: Faithful assumevalid script-skip gate — fork block test
+   ---------------------------------------------------------------------------
+
+   Proves that the height-only bypass is gone.  Old code:
+     is_assume_valid state height → true for height <= av_entry.height
+   New code:
+     is_assume_valid state block_hash height → 5-condition gate, where
+     condition 3a (ancestor-of-av-block) correctly rejects fork blocks.
+
+   Setup: genesis → h1 (av block) → h2_synthetic (best header, large work).
+   Fork block: genesis → fork_h1 (different hash, same height as h1).
+
+   EFFECTIVE test: fork_h1 is NOT skipped (old code skipped it; new code
+   correctly rejects it because fork_h1 is not on the av block's ancestry chain).
+   Sanity test: h1 (the actual av block, an ancestor of itself) IS skipped
+   when the best-header has enough equivalent-work burial. *)
+let test_w144_assumevalid_fork_not_skipped () =
+  let db_path = "/tmp/camlcoin_test_w144_av" in
+  let rec rm_rf p =
+    if Sys.file_exists p then begin
+      if Sys.is_directory p then begin
+        Array.iter (fun f -> rm_rf (Filename.concat p f)) (Sys.readdir p);
+        Unix.rmdir p
+      end else
+        Unix.unlink p
+    end
+  in
+  rm_rf db_path;
+  let genesis_hash = Crypto.compute_block_hash Consensus.regtest.genesis_header in
+
+  (* Mine a valid h1 header on regtest *)
+  let h1_hdr = w97_mine_header
+    ~prev_block:genesis_hash
+    ~merkle_root:Types.zero_hash
+    ~ts:(Int32.add Consensus.regtest.genesis_header.timestamp 600l)
+    ~bits:Consensus.regtest.genesis_header.bits () in
+  let h1_hash = Crypto.compute_block_hash h1_hdr in
+
+  (* Create network with assume_valid pointing to h1 *)
+  let av_network = { Consensus.regtest with
+    Consensus.assume_valid_hash = Some h1_hash } in
+  let db = Storage.ChainDB.create db_path in
+  let state = Sync.create_chain_state db av_network in
+
+  (* Accept h1 into the chain via validate_header + accept_header *)
+  (match Sync.validate_header state h1_hdr with
+  | Error e ->
+    Storage.ChainDB.close db; rm_rf db_path;
+    Alcotest.fail (Printf.sprintf "W144: validate_header h1 failed: %s" e)
+  | Ok h1_entry ->
+    Sync.accept_header state h1_entry;
+
+    (* Mine a fork block at height 1 with a slightly different timestamp so its
+       hash differs from h1 (same parent, different content). *)
+    let fork_hdr = w97_mine_header
+      ~prev_block:genesis_hash
+      ~merkle_root:Types.zero_hash
+      ~ts:(Int32.add Consensus.regtest.genesis_header.timestamp 601l)
+      ~bits:Consensus.regtest.genesis_header.bits () in
+    let fork_hash = Crypto.compute_block_hash fork_hdr in
+    (* Sanity: fork must have a different hash *)
+    if Cstruct.equal fork_hash h1_hash then begin
+      Storage.ChainDB.close db; rm_rf db_path;
+      Alcotest.fail "W144: fork_hash == h1_hash (test setup broken)"
+    end;
+    (* Insert the fork block into state.headers (so is_assume_valid can find
+       its total_work for condition 5 — though condition 3a will fail first). *)
+    let fork_entry = ({
+      Sync.header = fork_hdr;
+      hash = fork_hash;
+      height = 1;
+      total_work = h1_entry.total_work;  (* same height ≈ same work *)
+    } : Sync.header_entry) in
+    Hashtbl.replace state.headers (Cstruct.to_string fork_hash) fork_entry;
+
+    (* Create a synthetic best-header h2 at height 2 with enough total_work
+       that condition 5 (2-week burial) passes for h1.
+       With regtest bits=0x207fffff, block_proof ≈ 2 units.
+       Condition 5: (big_work - h1_work) * 600 / block_proof > 1_209_600
+         ↔ work_diff > 4032 (using block_proof=2).
+       We add 5000 units to h1.total_work to give a comfortable margin:
+         equiv_time = 5000 * 600 / 2 = 1_500_000 s > 1_209_600 s. ✓
+       5000 = 0x1388 → bytes: 0x88, 0x13 in little-endian. *)
+    let big_extra = Cstruct.create 32 in
+    Cstruct.set_uint8 big_extra 0 0x88;
+    Cstruct.set_uint8 big_extra 1 0x13;
+    let big_work = Consensus.work_add h1_entry.total_work big_extra in
+    (* h2 is a synthetic entry with prev_block = h1_hash so that
+       get_ancestor(state, best, 1) correctly walks back to h1_entry. *)
+    let h2_hash = Cstruct.create 32 in
+    Cstruct.set_uint8 h2_hash 0 0x02;  (* unique non-zero hash *)
+    let h2_hdr = { h1_hdr with Types.prev_block = h1_hash } in
+    let h2_entry = ({
+      Sync.header = h2_hdr;
+      hash = h2_hash;
+      height = 2;
+      total_work = big_work;
+    } : Sync.header_entry) in
+    Hashtbl.replace state.headers (Cstruct.to_string h2_hash) h2_entry;
+    state.tip <- Some h2_entry;
+
+    (* --- EFFECTIVE TEST ---
+       Old gate: fork_hash at height 1 <= av_height 1 → true (WRONG, skips scripts).
+       New gate: condition 3a fails — get_ancestor(state, h1_entry, 1) returns h1_entry
+                 whose hash ≠ fork_hash → is_assume_valid returns false. *)
+    let fork_skipped = Sync.is_assume_valid state fork_hash 1 in
+    Alcotest.(check bool)
+      "W144 EFFECTIVE: fork block at av_height is NOT script-skipped (cond 3a fails)"
+      false fork_skipped;
+
+    (* --- SANITY TEST ---
+       h1 (the av block itself) with sufficient burial should be skipped. *)
+    let h1_skipped = Sync.is_assume_valid state h1_hash 1 in
+    Alcotest.(check bool)
+      "W144 SANITY: on-chain av block with sufficient burial IS script-skipped"
+      true h1_skipped;
+
+    Storage.ChainDB.close db;
+    rm_rf db_path)
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
@@ -4357,6 +4478,10 @@ let () =
         test_w97_assumevalid_runs_check_block_w93_anchor;
       test_case "AV-2: validate_header not bypassed by assumevalid" `Quick
         test_w97_assumevalid_does_not_skip_validate_header;
+      (* W144: Faithful assumevalid gate — fork block must not be script-skipped *)
+      test_case "AV-3: W144 fork block at av_height NOT skipped (cond 3a), \
+                 on-chain buried block IS skipped (sanity)" `Quick
+        test_w144_assumevalid_fork_not_skipped;
       (* Future-time anchor *)
       test_case "MAX_FUTURE_BLOCK_TIME = 7200s" `Quick
         test_w97_future_time_2h_constant;

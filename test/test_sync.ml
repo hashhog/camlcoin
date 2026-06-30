@@ -4352,6 +4352,142 @@ let test_mtp_hash_linked_correct_under_height_index_corruption () =
   Storage.ChainDB.close db;
   rm_rf db_path
 
+(* -------------------------------------------------------------------------
+   Wave-3 Finding 2 EFFECTIVE test: compute_expected_bits ~parent_entry uses
+   the validated block's own parent ancestry (hash-linked), not the active-chain
+   height->hash index.
+
+   Setup: two headers at height 1 with DIFFERENT bits.
+     h1_main: bits = 0x207fffffl  (regtest pow_limit — the "correct" value)
+     h1_side: bits = 0x1d00ffffl  (mainnet default — an artificial contaminant)
+   accept_header(h1_side) AFTER h1_main → overwrites height-1 in the DB index.
+
+   compute_expected_bits without ~parent_entry reads the height index → B_side.
+   compute_expected_bits ~parent_entry:h1_main_entry reads the parent ancestry
+   (get_ancestor state h1_main_entry 1 = h1_main_entry itself) → B_main.
+   ------------------------------------------------------------------------- *)
+let test_w3f2_retarget_ancestry_correct_under_height_index_corruption () =
+  let db_path = "/tmp/camlcoin_test_w3f2_retarget_db" in
+  let rec rm_rf p =
+    if Sys.file_exists p then begin
+      if Sys.is_directory p then begin
+        Array.iter (fun f -> rm_rf (Filename.concat p f)) (Sys.readdir p);
+        Unix.rmdir p
+      end else Unix.unlink p
+    end
+  in
+  rm_rf db_path;
+  let db = Storage.ChainDB.create db_path in
+  (* Use regtest: pow_no_retargeting=true → compute_expected_bits returns parent.bits.
+     This makes the test deterministic without needing a full 2016-block retarget. *)
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let genesis_entry = Option.get (Sync.get_tip state) in
+  let genesis_hash = genesis_entry.hash in
+
+  let b_main = 0x207fffffl in  (* regtest pow_limit — the "correct" parent bits *)
+  let b_side = 0x1d00ffffl in  (* artificial contaminant — mainnet-like bits *)
+
+  (* h1_main: height 1, bits = b_main. *)
+  let h1_main_header = Types.{
+    version = 4l; prev_block = genesis_hash; merkle_root = Types.zero_hash;
+    timestamp = Int32.add Consensus.regtest.genesis_header.timestamp 600l;
+    bits = b_main; nonce = 0l } in
+  let h1_main_hash = Crypto.compute_block_hash h1_main_header in
+  let h1_main_entry = Sync.{
+    header = h1_main_header; hash = h1_main_hash; height = 1;
+    total_work = Consensus.work_add genesis_entry.total_work
+                   (Sync.work_from_bits b_main) } in
+  Sync.accept_header state h1_main_entry;
+
+  (* h1_side: height 1, bits = b_side, different merkle so hash differs. *)
+  let side_merkle = Cstruct.create 32 in
+  Cstruct.set_uint8 side_merkle 0 0xBC;
+  let h1_side_header = Types.{
+    version = 4l; prev_block = genesis_hash; merkle_root = side_merkle;
+    timestamp = Int32.add Consensus.regtest.genesis_header.timestamp 600l;
+    bits = b_side; nonce = 0l } in
+  let h1_side_hash = Crypto.compute_block_hash h1_side_header in
+  let h1_side_entry = Sync.{
+    header = h1_side_header; hash = h1_side_hash; height = 1;
+    total_work = Consensus.work_add genesis_entry.total_work
+                   (Sync.work_from_bits b_side) } in
+  Sync.accept_header state h1_side_entry;  (* contaminates height-1 index *)
+
+  (* Confirm corruption: height-1 now points at h1_side. *)
+  let height1_hash = Storage.ChainDB.get_hash_at_height db 1 in
+  Alcotest.(check bool) "height-1 index overwritten by side entry (precondition)" true
+    (match height1_hash with Some h -> Cstruct.equal h h1_side_hash | None -> false);
+
+  (* Fabricate a dummy block header at height 2, building on h1_main. *)
+  let h2_block_header = Types.{
+    version = 4l; prev_block = h1_main_hash; merkle_root = Types.zero_hash;
+    timestamp = Int32.add Consensus.regtest.genesis_header.timestamp 1200l;
+    bits = b_main; nonce = 0l } in
+
+  (* Without parent_entry: active-chain height index → h1_side → returns b_side.
+     This is the pre-fix (wrong) behaviour on a fork. *)
+  let bits_without_parent = Sync.compute_expected_bits state 2 h2_block_header in
+  Alcotest.(check int32) "W3-F2 PRE-FIX: no parent_entry → corrupted index → b_side"
+    b_side bits_without_parent;
+
+  (* With parent_entry = h1_main_entry: get_ancestor(h1_main_entry, 1) = h1_main_entry
+     → returns b_main. This is the post-fix (correct) behaviour. *)
+  let bits_with_parent =
+    Sync.compute_expected_bits ~parent_entry:h1_main_entry state 2 h2_block_header in
+  Alcotest.(check int32) "W3-F2 POST-FIX: parent_entry ancestor walk → b_main"
+    b_main bits_with_parent;
+
+  (* Sanity: pre-fix and post-fix differ (demonstrates the bug is real). *)
+  Alcotest.(check bool) "W3-F2: pre-fix ≠ post-fix result (bug is real)" true
+    (bits_without_parent <> bits_with_parent);
+
+  Storage.ChainDB.close db;
+  rm_rf db_path
+
+(* -------------------------------------------------------------------------
+   Wave-3 Finding 3 EFFECTIVE test: validate_header must enforce DeriveTarget
+   range checks, not merely hash<=target.
+
+   A header with nBits = 0x2100ffff has a target above regtest pow_limit
+   (0x207fffff).  Bitcoin Core's CheckProofOfWork / DeriveTarget rejects it
+   (target > pow_limit).  Pre-fix: validate_header used hash_meets_target which
+   does NOT check pow_limit → accepted.  Post-fix: validate_header uses
+   check_proof_of_work → rejected with "Insufficient proof of work".
+
+   nBits = 0x2100ffff:  exponent=33, mantissa=0x00ffff, target = 0xffff << 240.
+   Since 0xffff << 240 > 0x7fffff << 232 (regtest pow_limit), any hash that
+   satisfies regtest pow_limit also satisfies this easy target.  The
+   w97_mine_header helper (which calls hash_meets_target) will immediately find
+   nonce=0 for almost any input. *)
+let test_w3f3_validate_header_rejects_above_pow_limit_nbits () =
+  let (state, db, _) = w97_build_chain 0 in
+  let genesis_hash = Crypto.compute_block_hash Consensus.regtest.genesis_header in
+
+  (* Construct a header with nBits above regtest pow_limit.
+     0x2100ffff: exponent=33, mantissa=0x00ffff.
+     Not negative (sign bit in mantissa = 0), not overflow (exponent=33 with
+     nWord=0x00ffff ≤ 0xff → no overflow per Core rule), but target > pow_limit. *)
+  let above_limit_bits = 0x2100ffffl in
+
+  (* Mine a nonce so hash_meets_target accepts (it will on any nonce since target is huge).
+     The w97_mine_header helper uses hash_meets_target internally. *)
+  let h = w97_mine_header
+            ~prev_block:genesis_hash
+            ~merkle_root:Types.zero_hash
+            ~ts:(Int32.add Consensus.regtest.genesis_header.timestamp 600l)
+            ~bits:above_limit_bits () in
+
+  (* Post-fix: validate_header must REJECT this (target > regtest pow_limit). *)
+  let result = Sync.validate_header state h in
+  Storage.ChainDB.close db; w97_cleanup_db ();
+  (match result with
+   | Error "Insufficient proof of work" -> ()
+   | Error e ->
+     Alcotest.fail (Printf.sprintf "W3-F3: wrong rejection message: %s" e)
+   | Ok _ ->
+     Alcotest.fail
+       "W3-F3 BUG: validate_header accepted nBits above pow_limit (pre-fix behaviour)")
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
@@ -4644,5 +4780,22 @@ let () =
       (* W2 Finding 1: MTP must walk hash-linked parents, not height->hash index *)
       test_case "W2-F1: hash-linked MTP ignores height-index corruption" `Quick
         test_mtp_hash_linked_correct_under_height_index_corruption;
+    ];
+    "w3_difficulty_retarget_ancestry", [
+      (* Wave-3 Finding 2: compute_expected_bits must walk the validated block's own
+         parent ancestry (hash-linked), not the active-chain height->hash index.
+         EFFECTIVE test: without ~parent_entry the height index (contaminated by
+         a side-branch) gives wrong bits; with ~parent_entry the correct bits are
+         returned via get_ancestor. *)
+      test_case "W3-F2: ~parent_entry walks own ancestry, ignoring index corruption" `Quick
+        test_w3f2_retarget_ancestry_correct_under_height_index_corruption;
+    ];
+    "w3_pow_nbits_bounds", [
+      (* Wave-3 Finding 3: validate_header must enforce DeriveTarget range checks
+         (negative / overflow / zero / above pow_limit) not just hash<=target.
+         EFFECTIVE test: a header with nBits above regtest pow_limit passes
+         hash_meets_target (easy target) but is rejected by check_proof_of_work. *)
+      test_case "W3-F3: validate_header rejects nBits above pow_limit" `Quick
+        test_w3f3_validate_header_rejects_above_pow_limit_nbits;
     ];
   ]

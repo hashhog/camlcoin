@@ -1083,8 +1083,11 @@ let validate_header (state : chain_state) (header : Types.block_header)
     match Hashtbl.find_opt state.headers parent_key with
     | None -> Error "Unknown parent header"
     | Some parent ->
-      (* Check proof of work *)
-      if not (Consensus.hash_meets_target hash header.bits) then
+      (* Check proof of work — use check_proof_of_work (not hash_meets_target) so
+         that nBits with negative/overflow/zero/above-pow_limit is also rejected,
+         matching Bitcoin Core's CheckProofOfWork / DeriveTarget (pow.cpp:146-170).
+         hash_meets_target only tests hash<=target without validating nBits bounds. *)
+      if not (Consensus.check_proof_of_work hash header.bits state.network) then
         Error "Insufficient proof of work"
       (* Check timestamp not too far in future (2 hours) *)
       else if Int32.to_float header.timestamp > Unix.gettimeofday () +. 7200.0 then
@@ -2846,26 +2849,41 @@ let compute_median_time_for_display (state : chain_state) (height : int) : int32
    - Regtest (pow_no_retargeting): use parent's bits (every block same difficulty)
    - Difficulty adjustment boundary (height mod 2016 = 0): compute retarget
    - Testnet min-difficulty: if block timestamp > 20 min after parent, allow pow_limit
-   - Otherwise: use parent's bits *)
-let compute_expected_bits (state : chain_state) (height : int)
+   - Otherwise: use parent's bits
+
+   [parent_entry]: when provided, all height-based ancestor lookups are resolved by
+   walking [parent_entry]'s own prev_block chain (via [get_ancestor]), mirroring
+   Bitcoin Core's pindexLast->GetAncestor(nHeightFirst) in pow.cpp:44,72.  This
+   avoids reading the active-chain height->hash index, which can point at a competing
+   fork when the block being validated is on a side branch.  Callers on the active
+   chain (IBD, verifychain, etc.) may omit this parameter and fall back to
+   [get_header_at_height] which is correct when the height index is up to date. *)
+let compute_expected_bits ?parent_entry (state : chain_state) (height : int)
     (block_header : Types.block_header) : int32 =
   let network = state.network in
+  (* Resolve the header at height [h] via the validated block's own ancestry
+     (when parent_entry is provided) or the active-chain height index (fallback). *)
+  let get_at_height h =
+    match parent_entry with
+    | Some pe -> get_ancestor state pe h
+    | None -> get_header_at_height state h
+  in
   if height = 0 then
     network.genesis_header.bits
   else if network.pow_no_retargeting then
     (* Regtest: no retargeting, use parent's bits *)
-    (match get_header_at_height state (height - 1) with
+    (match get_at_height (height - 1) with
      | Some parent -> parent.header.bits
      | None -> network.pow_limit)
   else if height mod Consensus.difficulty_adjustment_interval = 0 then begin
     (* Difficulty adjustment boundary *)
     let parent =
-      match get_header_at_height state (height - 1) with
+      match get_at_height (height - 1) with
       | Some entry -> entry.header
       | None -> network.genesis_header
     in
     let get_block_info h =
-      match get_header_at_height state h with
+      match get_at_height h with
       | Some entry -> (entry.header.timestamp, entry.header.bits)
       | None -> (0l, network.pow_limit)
     in
@@ -2878,12 +2896,12 @@ let compute_expected_bits (state : chain_state) (height : int)
       ~network
   end else begin
     (* Non-adjustment block *)
-    match get_header_at_height state (height - 1) with
+    match get_at_height (height - 1) with
     | Some parent ->
       (* Testnet min-difficulty rule: if block timestamp is > 20 min after
          parent, allow mining at pow_limit *)
       let get_bits h =
-        match get_header_at_height state h with
+        match get_at_height h with
         | Some hdr -> hdr.header.bits
         | None -> network.pow_limit
       in
@@ -4465,7 +4483,17 @@ let connect_block_into_batch
       "Missing block at height %d during reorg connect" entry.height)
   | Some block ->
     let height = entry.height in
-    let expected_bits = compute_expected_bits state height block.header in
+    (* Resolve the period-first-block and min-diff walk-back via the block's
+       own parent ancestry, not the active-chain height index.  During a reorg
+       the height index still reflects the pre-reorg chain; using get_ancestor
+       on the parent entry mirrors Core's pindexLast->GetAncestor(nHeightFirst)
+       (pow.cpp:44,72) and avoids false-accepts/-rejects on the incoming fork. *)
+    let parent_entry = get_header state entry.header.prev_block in
+    let expected_bits =
+      match parent_entry with
+      | Some pe -> compute_expected_bits ~parent_entry:pe state height block.header
+      | None -> compute_expected_bits state height block.header
+    in
     (* Hash-linked MTP: during a reorg the height->hash index still reflects the
        pre-reorg chain; use prev_block links to get the true side-branch MTP. *)
     let median_time = compute_mtp_hash_linked state entry.header.prev_block in
@@ -5280,7 +5308,7 @@ let try_attach_side_branch_and_reorg
        mapping. So we inline the relevant pieces, indexed against the
        in-memory parent (not the active height->hash mapping which may
        point at the competing chain). *)
-    if not (Consensus.hash_meets_target hash header.bits) then
+    if not (Consensus.check_proof_of_work hash header.bits state.network) then
       Error "Insufficient proof of work"
     else if Int32.to_float header.timestamp >
             Unix.gettimeofday () +. 7200.0 then
@@ -5303,20 +5331,16 @@ let try_attach_side_branch_and_reorg
         | Consensus.CheckpointMismatch _ as mismatch ->
           Error (Consensus.checkpoint_result_to_string mismatch)
         | Consensus.CheckpointOk ->
-        (* Compute expected difficulty from the parent's bits. For
-           regtest/[pow_no_retargeting], parent.bits is authoritative.
-           For mainnet retargeting, the difficulty-adjustment boundary
-           on a side-branch is intentionally deferred — a future patch
-           can wire a side-branch-aware [compute_expected_bits] (the
-           current implementation walks the active height->hash
-           mapping). For non-boundary heights with retargeting,
-           parent.bits is also the right answer. The corpus entry
-           [reorg-via-submitblock] runs on regtest, so this path is
-           exercised under [pow_no_retargeting]. *)
+        (* Compute expected difficulty via the parent's own ancestry (hash-linked
+           walk), mirroring Core's pindexLast->GetAncestor(nHeightFirst) (pow.cpp:44,72).
+           This is correct on both the best chain and any fork: get_ancestor walks
+           prev_block links rather than the active height->hash index, which may point
+           at the competing chain during a reorg or when a side-branch header arrived
+           before the block body. *)
         let expected_bits =
           if state.network.pow_no_retargeting then parent.header.bits
           else if height mod Consensus.difficulty_adjustment_interval = 0
-          then compute_expected_bits state height block.header
+          then compute_expected_bits ~parent_entry:parent state height block.header
           else parent.header.bits
         in
         if header.bits <> expected_bits then

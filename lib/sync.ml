@@ -1949,17 +1949,108 @@ type peer_download_state = {
   mutable current_timeout : float;
 }
 
-(* Check if a block at the given height/hash is at or below the assumevalid
-   checkpoint. If assume_valid_hash is set, we look up that hash in our
-   header map to find its height; any block at or below that height on the
-   best chain is considered assume-valid, so script verification is skipped. *)
-let is_assume_valid (state : chain_state) (height : int) : bool =
+(* Compute the equivalent time in seconds between [best_header] and [pindex],
+   mirroring Bitcoin Core's GetBlockProofEquivalentTime (chain.cpp):
+     r = (best.total_work - pindex.total_work) * nPowTargetSpacing
+         / GetBlockProof(best.header.bits)
+   Result is clamped to [0, max_int].  Returns 0 when best has less work
+   than pindex (should not occur on the skip-scripts path) or when
+   GetBlockProof is zero.  Used by is_assume_valid to implement condition 5
+   (2-week equivalent-work burial guard, Bitcoin Core validation.cpp:2364). *)
+let get_block_proof_equivalent_time
+    (best : header_entry) (pindex : header_entry) : int =
+  (* Convert a 32-byte little-endian work Cstruct.t to a Zarith bigint *)
+  let z_of_le32 buf =
+    let r = ref Z.zero in
+    for i = 31 downto 0 do
+      r := Z.add (Z.shift_left !r 8) (Z.of_int (Cstruct.get_uint8 buf i))
+    done;
+    !r
+  in
+  let best_work   = z_of_le32 best.total_work in
+  let pindex_work = z_of_le32 pindex.total_work in
+  let work_diff =
+    if Z.compare best_work pindex_work >= 0
+    then Z.sub best_work pindex_work
+    else Z.zero   (* defensive: caller should only reach this on skip path *)
+  in
+  if Z.equal work_diff Z.zero then 0
+  else begin
+    (* GetBlockProof(best) = work_from_compact(best.header.bits) *)
+    let best_proof = z_of_le32 (Consensus.work_from_compact best.header.bits) in
+    if Z.equal best_proof Z.zero then 0
+    else begin
+      let r = Z.div
+        (Z.mul work_diff (Z.of_int Consensus.target_spacing))
+        best_proof
+      in
+      (* Clamp to int max (mirrors Core's `r.bits() > 63` guard) *)
+      if Z.compare r (Z.of_int max_int) > 0 then max_int
+      else Z.to_int r
+    end
+  end
+
+(* Check if a block at the given height/hash should have script verification
+   skipped, implementing Bitcoin Core's faithful 5-condition assume-valid gate
+   (validation.cpp:2346-2382).
+
+   The previous implementation only checked [height <= av_entry.height], which
+   incorrectly skipped script verification for a FORK block below the av block's
+   height — a fork block is NOT on the av block's ancestry chain and must have
+   its scripts verified.
+
+   Scripts are skipped ONLY when ALL five conditions hold:
+   1. assume_valid_hash is configured (Some av_hash).
+   2. The av block is in our header index.
+   3a. This block is an ANCESTOR OF the av block (av_entry.GetAncestor(height)
+       == this block).  A fork block at the same height fails here because
+       get_ancestor returns the main-chain block, not the fork.
+   3b. This block is on the BEST-HEADER CHAIN (state.tip.GetAncestor(height)
+       == this block).  Ensures the av block is itself on our best chain.
+   4. best_header.total_work >= minimum_chain_work (eclipse-attack defense).
+   5. get_block_proof_equivalent_time(best_header, this_block) > 2 weeks
+      (DoS defense against forcing script-skip of recently-mined blocks).
+
+   This gate is STRICTLY NARROWER than the old height-only check so it can
+   only ever verify MORE scripts, never fewer. *)
+let is_assume_valid (state : chain_state) (block_hash : Types.hash256)
+    (height : int) : bool =
+  let two_weeks_secs = 60 * 60 * 24 * 7 * 2 in  (* 1 209 600 s *)
+  (* Condition 1: assumevalid must be configured *)
   match state.network.assume_valid_hash with
   | None -> false
   | Some av_hash ->
-    match Hashtbl.find_opt state.headers (Cstruct.to_string av_hash) with
-    | None -> false  (* assumevalid block not in our chain yet *)
-    | Some av_entry -> height <= av_entry.height
+    (* Condition 2: assumevalid block must be in our header index *)
+    (match Hashtbl.find_opt state.headers (Cstruct.to_string av_hash) with
+    | None -> false
+    | Some av_entry ->
+      (* Look up this block's header entry (needed for total_work in cond 5) *)
+      (match Hashtbl.find_opt state.headers (Cstruct.to_string block_hash) with
+      | None -> false  (* block not in index; cannot confirm ancestry *)
+      | Some this_entry ->
+        (* Condition 3a: this block must be an ancestor of the av block.
+           get_ancestor returns the entry at [height] on av_entry's ancestry
+           chain.  If that entry's hash differs from block_hash, this block is
+           on a fork and scripts must be verified. *)
+        (match get_ancestor state av_entry height with
+        | None -> false
+        | Some anc when not (Cstruct.equal anc.hash block_hash) -> false
+        | _ ->
+          (* Condition 3b: this block must be on the best-header chain *)
+          (match state.tip with
+          | None -> false
+          | Some best ->
+            (match get_ancestor state best height with
+            | None -> false
+            | Some best_anc when not (Cstruct.equal best_anc.hash block_hash) -> false
+            | _ ->
+              (* Condition 4: best-header chainwork >= minimum_chain_work *)
+              Consensus.work_compare best.total_work
+                state.network.minimum_chain_work >= 0
+              &&
+              (* Condition 5: this block has > 2 weeks of equivalent-work burial
+                 behind the best header *)
+              get_block_proof_equivalent_time best this_entry > two_weeks_secs)))))
 
 (* ============================================================================
    BIP-157 filter index helpers
@@ -3054,7 +3145,7 @@ let process_downloaded_blocks ?(max_blocks = 1)
                })
         in
         (* Validate block with UTXO tracking *)
-        let skip_scripts = is_assume_valid ibd.chain height in
+        let skip_scripts = is_assume_valid ibd.chain entry.hash height in
         let validation_flags =
           if skip_scripts then 0
           else Consensus.get_block_script_flags ~block_hash:entry.hash height ibd.chain.network
@@ -4392,7 +4483,7 @@ let connect_block_into_batch
          | None -> None
          | Some data -> Some (prev, decode_entry data))
     in
-    let skip_scripts = is_assume_valid state height in
+    let skip_scripts = is_assume_valid state entry.hash height in
     let validation_flags =
       if skip_scripts then 0
       else Consensus.get_block_script_flags ~block_hash:entry.hash height state.network

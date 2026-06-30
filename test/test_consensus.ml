@@ -69,6 +69,39 @@ let test_median_time_past () =
   Alcotest.(check int32) "four elements" 30l
     (Consensus.median_time_past [10l; 20l; 30l; 40l])
 
+(* W2 Finding 2 EFFECTIVE test: median_time_past must sort timestamps as UNSIGNED
+   uint32.  A timestamp of 0x80000000l (= 2^31 = year 2038 boundary) is negative
+   in OCaml's signed int32, so a signed sort would place it before all positive
+   values.  In unsigned order it is the largest of any current timestamp.
+
+   Pre-fix (signed Int32.compare): sorted [1l; 0x80000000l] → [0x80000000l; 1l]
+     → median at index 1 = 1l (wrong: treats year-2038 block as "before" year 1970).
+   Post-fix (unsigned compare via Int64): sorted [1l; 0x80000000l] → [1l; 0x80000000l]
+     → median at index 1 = 0x80000000l (correct).
+
+   Reference: bitcoin-core/src/chain.h:233-244 (GetMedianTimePast sorts int64_t,
+   because nTime is uint32_t widened to int64_t via GetBlockTime). *)
+let test_median_time_past_unsigned_sort () =
+  (* 2-element list: 1 (year 1970) and 0x80000000 (year 2038, negative as int32).
+     Unsigned median = the larger of the two = 0x80000000. *)
+  Alcotest.(check int32)
+    "post-2038 timestamp sorts AFTER past timestamps (unsigned)"
+    0x80000000l
+    (Consensus.median_time_past [1l; 0x80000000l]);
+  (* Prove direction: if signed sort were used the result would be 1l, not 0x80000000l.
+     The assertion above would FAIL on the unfixed code (signed Int32.compare). *)
+  (* 3-element: two past and one post-2038. Unsigned median = the middle (past value). *)
+  Alcotest.(check int32)
+    "mixed list median with post-2038 element"
+    500_000_000l
+    (Consensus.median_time_past [100_000_000l; 500_000_000l; 0x80000000l]);
+  (* All timestamps > 0x7FFFFFFF (all post-2038, all negative in signed int32).
+     Unsigned sort: 0x80000000 < 0xC0000000 < 0xFFFFFFFF. Median of 3 = 0xC0000000. *)
+  Alcotest.(check int32)
+    "all post-2038 timestamps: unsigned sort gives correct median"
+    0xC0000000l
+    (Consensus.median_time_past [0xFFFFFFFFl; 0x80000000l; 0xC0000000l])
+
 (* Test difficulty adjustment height detection *)
 let test_difficulty_adjustment_height () =
   Alcotest.(check bool) "height 0 is not adjustment" false
@@ -1496,6 +1529,7 @@ let () =
     ];
     "time", [
       test_case "median time past" `Quick test_median_time_past;
+      test_case "median time past unsigned sort (W2 Finding 2)" `Quick test_median_time_past_unsigned_sort;
     ];
     "timewarp_rule", [
       test_case "mainnet no enforcement" `Quick test_timewarp_not_enforced_mainnet;

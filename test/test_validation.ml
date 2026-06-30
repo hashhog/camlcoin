@@ -384,6 +384,84 @@ let test_count_p2sh_sigops_truncated_push () =
     "partial count (accurate): 3+1 before truncated push" 4
     (Validation.count_p2sh_sigops script)
 
+(* Wave-3 Finding 1: P2SH scriptSig trailing OP_0/small-int → 0 sigops (Core parity).
+   Bitcoin Core GetSigOpCount(scriptSig) uses GetScriptOp which clears vData at the
+   top of every call.  For OP_0 (0x00) and OP_1NEGATE..OP_16 (0x4f..0x60) the data is
+   not refilled → empty redeemScript → 0 sigops.  For opcodes > OP_16 (0x61+) Core
+   returns 0 immediately.  Pre-fix: extract_last_push_data's else-branch left `last`
+   pointing at the prior push → over-counted (false-reject on block sigop limit).
+
+   Helpers shared by the three sub-tests. *)
+let make_p2sh_sigop_tx ~(script_sig : Cstruct.t) : Types.transaction =
+  let txid = Cstruct.create 32 in
+  Cstruct.set_uint8 txid 0 0xf1;
+  let inp = { (make_input ~txid ()) with Types.script_sig } in
+  { Types.version = 1l;
+    inputs = [inp];
+    outputs = [make_output ~value:1000L ()];
+    witnesses = [];
+    locktime = 0l }
+
+let make_p2sh_spk () : Cstruct.t =
+  (* OP_HASH160 <20-byte-placeholder> OP_EQUAL *)
+  let spk = Cstruct.create 23 in
+  Cstruct.set_uint8 spk 0 0xa9;   (* OP_HASH160 *)
+  Cstruct.set_uint8 spk 1 0x14;   (* push 20 bytes *)
+  Cstruct.set_uint8 spk 22 0x87;  (* OP_EQUAL *)
+  spk
+
+(* Trailing OP_0 (0x00): Core → empty vData → 0 sigops.
+   scriptSig = <push 1-byte OP_CHECKSIG(0xac)> OP_0(0x00). *)
+let test_w3f1_p2sh_sigop_trailing_op0 () =
+  let redeem = Cstruct.of_string "\xac" in  (* OP_CHECKSIG: 1 sigop *)
+  (* scriptSig: 0x01 0xac 0x00 *)
+  let script_sig = Cstruct.create 3 in
+  Cstruct.set_uint8 script_sig 0 0x01;          (* push 1 byte *)
+  Cstruct.blit redeem 0 script_sig 1 1;          (* OP_CHECKSIG *)
+  Cstruct.set_uint8 script_sig 2 0x00;           (* OP_0 *)
+  let tx = make_p2sh_sigop_tx ~script_sig in
+  let spk = make_p2sh_spk () in
+  let cost = Validation.count_tx_sigops_cost tx
+    ~prev_script_pubkey_lookup:(fun _ -> Some spk)
+    ~flags:Script.script_verify_p2sh in
+  (* Core: trailing OP_0 → empty subscript → 0 P2SH sigops → 0 weighted cost.
+     Pre-fix: kept prior push (OP_CHECKSIG) → 1 * 4 = 4. *)
+  Alcotest.(check int) "W3-F1: trailing OP_0 → 0 P2SH sigops" 0 cost
+
+(* Trailing OP_1 (0x51 = OP_1): Core → empty vData → 0 sigops.
+   scriptSig = <push OP_CHECKMULTISIG(0xae, accurate=20 sigops)> OP_1(0x51). *)
+let test_w3f1_p2sh_sigop_trailing_op1 () =
+  let redeem = Cstruct.of_string "\xae" in  (* OP_CHECKMULTISIG: 20 sigops accurate *)
+  let script_sig = Cstruct.create 3 in
+  Cstruct.set_uint8 script_sig 0 0x01;
+  Cstruct.blit redeem 0 script_sig 1 1;
+  Cstruct.set_uint8 script_sig 2 0x51;           (* OP_1 *)
+  let tx = make_p2sh_sigop_tx ~script_sig in
+  let spk = make_p2sh_spk () in
+  let cost = Validation.count_tx_sigops_cost tx
+    ~prev_script_pubkey_lookup:(fun _ -> Some spk)
+    ~flags:Script.script_verify_p2sh in
+  (* Core: trailing OP_1 (> OP_PUSHDATA4) → empty vData → 0 sigops.
+     Pre-fix: kept prior push (OP_CHECKMULTISIG) → 20 * 4 = 80. *)
+  Alcotest.(check int) "W3-F1: trailing OP_1 → 0 P2SH sigops" 0 cost
+
+(* Opcode > OP_16 (e.g. OP_HASH160 = 0xa9): Core returns 0 immediately.
+   scriptSig = <push OP_CHECKSIG> OP_HASH160(0xa9). *)
+let test_w3f1_p2sh_sigop_opcode_above_op16 () =
+  let redeem = Cstruct.of_string "\xac" in  (* OP_CHECKSIG: 1 sigop *)
+  let script_sig = Cstruct.create 3 in
+  Cstruct.set_uint8 script_sig 0 0x01;
+  Cstruct.blit redeem 0 script_sig 1 1;
+  Cstruct.set_uint8 script_sig 2 0xa9;           (* OP_HASH160 > OP_16 *)
+  let tx = make_p2sh_sigop_tx ~script_sig in
+  let spk = make_p2sh_spk () in
+  let cost = Validation.count_tx_sigops_cost tx
+    ~prev_script_pubkey_lookup:(fun _ -> Some spk)
+    ~flags:Script.script_verify_p2sh in
+  (* Core: opcode > OP_16 → immediate 0 return → 0 sigops.
+     Pre-fix: else-branch just advanced i without clearing last, kept prior push. *)
+  Alcotest.(check int) "W3-F1: opcode > OP_16 → 0 P2SH sigops" 0 cost
+
 (* Test sigop cost with witness discount *)
 let test_sigop_cost_legacy_tx () =
   (* Legacy transaction with 1 CHECKSIG in scriptPubKey *)
@@ -3828,6 +3906,13 @@ let () =
         test_count_sigops_truncated_pushdata2;
       test_case "partial count (accurate): 3+1 before truncated push" `Quick
         test_count_p2sh_sigops_truncated_push;
+      (* Wave-3 Finding 1: P2SH trailing OP_0/small-int/above-OP_16 must yield 0 sigops *)
+      test_case "W3-F1: trailing OP_0 → 0 P2SH sigops" `Quick
+        test_w3f1_p2sh_sigop_trailing_op0;
+      test_case "W3-F1: trailing OP_1 → 0 P2SH sigops" `Quick
+        test_w3f1_p2sh_sigop_trailing_op1;
+      test_case "W3-F1: opcode > OP_16 → 0 P2SH sigops" `Quick
+        test_w3f1_p2sh_sigop_opcode_above_op16;
       test_case "legacy tx sigop cost" `Quick test_sigop_cost_legacy_tx;
       test_case "p2wpkh sigop cost" `Quick test_sigop_cost_p2wpkh;
       test_case "p2wsh multisig sigop cost" `Quick test_sigop_cost_p2wsh_multisig;

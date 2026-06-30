@@ -536,8 +536,22 @@ let extract_last_push_data (script : Cstruct.t) : Cstruct.t option =
         end else
           i := len
       end else begin
-        (* Non-push opcode, just skip *)
-        i := !i + 1
+        (* Bitcoin Core GetScriptOp clears pvchRet at the top of every call and only
+           refills it for opcodes <= OP_PUSHDATA4 (0x4e).  Opcodes outside that range
+           leave vData EMPTY.  GetSigOpCount(scriptSig) also returns 0 immediately for
+           any opcode above OP_16 (0x60).  Mirror both rules here:
+           - opcode > OP_16 (0x61+): signal "return 0 sigops" by setting last := None
+             and breaking out of the loop.
+           - OP_0 (0x00), OP_1NEGATE (0x4f), OP_RESERVED (0x50), OP_1..OP_16 (0x51..0x60):
+             Core clears vData → empty redeemScript → 0 sigops; mirror with empty Cstruct. *)
+        if opcode > 0x60 then begin
+          last := None;
+          i := len  (* Break: opcode > OP_16, Core returns 0 immediately *)
+        end else begin
+          (* OP_0 (0x00) or OP_1NEGATE..OP_16 (0x4f..0x60): empty vData in Core *)
+          last := Some (Cstruct.create 0);
+          i := !i + 1
+        end
       end
     done;
     !last
@@ -1095,7 +1109,8 @@ let check_block ~network:(network : Consensus.network_config) (block : Types.blo
    the prior `Int32.add (Int32.of_float (Unix.time ())) 7200l` test.
    Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4108
    (block.GetBlockTime() > now + MAX_FUTURE_BLOCK_TIME). *)
-let check_block_header ?(current_time : int32 option) (header : Types.block_header)
+let check_block_header ?(current_time : int32 option)
+    ?(network : Consensus.network_config option) (header : Types.block_header)
     : (unit, string) result =
   (* Check that timestamp is not too far in the future. *)
   (* Widen timestamps to unsigned int64 before comparing, matching Core's
@@ -1121,9 +1136,21 @@ let check_block_header ?(current_time : int32 option) (header : Types.block_head
   if future_violation then
     Error "Block timestamp too far in future"
   else begin
-    (* Check proof of work *)
+    (* Check proof of work.
+       When [network] is provided, use check_proof_of_work which enforces the full
+       DeriveTarget validation from Bitcoin Core pow.cpp:146-170:
+         - negative nBits (sign bit set with non-zero mantissa)
+         - overflow nBits (target would exceed 2^256)
+         - zero target
+         - target above pow_limit
+       When [network] is absent (legacy callers), fall back to hash_meets_target
+       which only checks hash <= target without validating nBits bounds. *)
     let block_hash = Crypto.compute_block_hash header in
-    if not (Consensus.hash_meets_target block_hash header.bits) then
+    let pow_ok = match network with
+      | None -> Consensus.hash_meets_target block_hash header.bits
+      | Some n -> Consensus.check_proof_of_work block_hash header.bits n
+    in
+    if not pow_ok then
       Error "Block does not meet difficulty target"
     else
       Ok ()

@@ -720,8 +720,8 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
 
   let hash = Crypto.compute_block_hash block.header in
 
-  (* Validate the block header *)
-  match Validation.check_block_header block.header with
+  (* Validate the block header (DeriveTarget bounds: negative/overflow/above-pow_limit) *)
+  match Validation.check_block_header ?network:(Some chain.network) block.header with
   | Error e -> Error e
   | Ok () ->
     (* For submitblock we must compare against the validated-block tip, not

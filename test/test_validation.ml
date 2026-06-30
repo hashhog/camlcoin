@@ -781,6 +781,46 @@ let test_check_block_bad_timestamp () =
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
   | Ok () -> Alcotest.fail "Should have failed with BlockBadTimestamp"
 
+(* W2 Finding 2 EFFECTIVE test: check_block time-too-old uses unsigned timestamp
+   comparison.  A block with timestamp 0x80000000l (the year-2038 boundary, negative
+   in signed int32) and a positive median_time (e.g. 1_296_688_602l for year 2011)
+   must NOT be rejected as "time-too-old" because unsigned(0x80000000) = 2^31 >> MTP.
+
+   Pre-fix (signed OCaml polymorphic <=): 0x80000000l <= 1_296_688_602l evaluates
+     as (-2147483648 <= 1296688602) = TRUE → falsely rejects with BlockBadTimestamp.
+   Post-fix (unsigned via Int64.logand 0xFFFFFFFFL): 2147483648 <= 1296688602 = FALSE
+     → the timestamp check does NOT fire (the block may still fail PoW, but not for
+     the time-too-old reason).
+
+   Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4092-4093;
+              bitcoin-core/src/chain.h:221 GetBlockTime returns (int64_t)nTime. *)
+let test_check_block_timestamp_post_2038_unsigned () =
+  let coinbase = make_tx
+    ~inputs:[make_coinbase_input ~height:100]
+    ~outputs:[make_output ~value:(Consensus.block_subsidy 100) ()]
+    ()
+  in
+  let txid = Crypto.compute_txid coinbase in
+  let (merkle, _) = Crypto.merkle_root [txid] in
+  (* Post-2038 timestamp: 0x80000000l — largest unsigned int32 boundary. *)
+  let post_2038_ts = 0x80000000l in
+  (* Use a past median_time well before post_2038_ts in unsigned comparison. *)
+  let past_mtp = 1_296_688_602l in  (* regtest genesis timestamp, year 2011 *)
+  let header = make_header ~version:4l ~merkle_root:merkle ~bits:0x207fffffl
+                 ~timestamp:post_2038_ts () in
+  let block = { Types.header; transactions = [coinbase] } in
+  (match Validation.check_block ~network:Consensus.regtest block 100
+           ~expected_bits:0x207fffffl ~median_time:past_mtp () with
+   | Error Validation.BlockBadTimestamp ->
+     Alcotest.fail
+       "Falsely rejected post-2038 block as time-too-old \
+        (signed int32 comparison bug — pre-fix behavior)"
+   | Error Validation.BlockBadDifficulty ->
+     (* PoW hash > target: expected since we did not mine a valid nonce *)
+     ()
+   | Error _ -> () (* Other error is fine: timestamp check did not fire *)
+   | Ok () -> ())  (* Accepted: timestamp check did not fire *)
+
 (* BIP-94 timewarp attack: check_block fires BlockTimeWarpAttack on testnet4 at a
    difficulty-adjustment boundary when header_time < prev_block_time - MAX_TIMEWARP.
    Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4097-4104. *)
@@ -3815,6 +3855,7 @@ let () =
       test_case "BIP94 timewarp attack testnet4" `Quick test_check_block_timewarp_attack;
       test_case "BIP94 no timewarp on mainnet" `Quick test_check_block_no_timewarp_mainnet;
       test_case "BIP94 no timewarp at non-boundary" `Quick test_check_block_no_timewarp_non_boundary;
+      test_case "post-2038 timestamp uses unsigned comparison (W2 Finding 2)" `Quick test_check_block_timestamp_post_2038_unsigned;
     ];
     "witness_commitment", [
       test_case "valid commitment" `Quick test_witness_commitment_valid;

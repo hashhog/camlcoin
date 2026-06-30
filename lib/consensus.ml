@@ -875,9 +875,15 @@ let encode_height_in_coinbase (height : int) : Cstruct.t =
     cs
   end
 
-(* Calculate median time past (MTP) from last 11 block timestamps *)
+(* Calculate median time past (MTP) from last 11 block timestamps.
+   Bitcoin Core stores nTime as uint32_t; timestamps >= 0x80000000 (post-2038)
+   are negative in OCaml's signed int32.  Sort by the unsigned 64-bit widening
+   (matching Core's int64_t cast in GetMedianTimePast) so timestamps near or
+   after the 2038 boundary sort correctly.
+   Reference: bitcoin-core/src/chain.h:233-244 (GetMedianTimePast sorts int64_t). *)
 let median_time_past (timestamps : int32 list) : int32 =
-  let sorted = List.sort Int32.compare timestamps in
+  let u32 x = Int64.logand (Int64.of_int32 x) 0xFFFFFFFFL in
+  let sorted = List.sort (fun a b -> Int64.compare (u32 a) (u32 b)) timestamps in
   let len = List.length sorted in
   if len = 0 then 0l
   else List.nth sorted (len / 2)

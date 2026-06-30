@@ -939,8 +939,13 @@ let check_block ~network:(network : Consensus.network_config) (block : Types.blo
             Error BlockBadDifficulty
           else begin
             (* Check timestamp is after median time past (time-too-old).
-               Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4092-4093. *)
-            if block.header.timestamp <= median_time then
+               Core treats nTime as uint32_t; widen both sides to unsigned int64
+               before comparing so post-2038 timestamps (>= 0x80000000, negative in
+               OCaml int32) sort after past MTP values, matching Core's int64_t cast.
+               Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4092-4093;
+                          bitcoin-core/src/chain.h:221 (GetBlockTime returns (int64_t)nTime). *)
+            let u32 x = Int64.logand (Int64.of_int32 x) 0xFFFFFFFFL in
+            if Int64.compare (u32 block.header.timestamp) (u32 median_time) <= 0 then
               Error BlockBadTimestamp
             (* BIP-94 timewarp protection: at difficulty-adjustment boundaries the new
                block's timestamp must not predate the previous block's by more than
@@ -1093,19 +1098,25 @@ let check_block ~network:(network : Consensus.network_config) (block : Types.blo
 let check_block_header ?(current_time : int32 option) (header : Types.block_header)
     : (unit, string) result =
   (* Check that timestamp is not too far in the future. *)
+  (* Widen timestamps to unsigned int64 before comparing, matching Core's
+     (int64_t)nTime semantics (block.Time() is std::chrono derived from uint32_t nTime).
+     OCaml int32 is signed, so timestamps >= 0x80000000 (post-2038) appear negative
+     and would slip past a signed > check even when they are far in the future.
+     Reference: bitcoin-core/src/validation.cpp:4108 (block.Time() vs NodeClock::now()). *)
+  let u32 x = Int64.logand (Int64.of_int32 x) 0xFFFFFFFFL in
   let future_violation =
     match current_time with
     | None ->
-        (* Production default: wall clock (preserves original behavior). *)
-        let max_future_time = Int32.add (Int32.of_float (Unix.time ())) 7200l in
-        header.timestamp > max_future_time
+        (* Production default: wall clock. *)
+        let max_future_time = Int64.add (Int64.of_float (Unix.time ())) 7200L in
+        Int64.compare (u32 header.timestamp) max_future_time > 0
     | Some 0l ->
         (* Harness sentinel: time-too-new disabled. *)
         false
     | Some now ->
         (* Deterministic injected clock. *)
-        let max_future_time = Int32.add now 7200l in
-        header.timestamp > max_future_time
+        let max_future_time = Int64.add (u32 now) 7200L in
+        Int64.compare (u32 header.timestamp) max_future_time > 0
   in
   if future_violation then
     Error "Block timestamp too far in future"

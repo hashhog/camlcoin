@@ -2805,6 +2805,26 @@ let compute_median_time_past (state : chain_state) (height : int) : int32 =
   let timestamps = collect [] (height - 1) 11 in
   Consensus.median_time_past timestamps
 
+(* Compute MTP by following hash-linked parent pointers, matching Core's
+   GetMedianTimePast walk (bitcoin-core/src/chain.h:233-245: walks pindex->pprev).
+   Safe for side-branch blocks: uses entry.header.prev_block hash links rather
+   than the height->hash index, which can be contaminated when accept_header writes
+   set_height_hash for every accepted header unconditionally (sync.ml:1131).
+
+   Pass the block being validated's own hash (not prev_block) or the parent entry
+   directly; the caller supplies the prev_block hash of the block under validation.
+
+   Falls back to 0l (MTP = "accept any timestamp") when the parent hash is not in
+   the in-memory header table — this matches compute_median_time_past's behavior
+   when height-1 is missing, e.g. just after a snapshot restore. *)
+let compute_mtp_hash_linked (state : chain_state) (prev_block : Types.hash256) : int32 =
+  let parent_key = Cstruct.to_string prev_block in
+  match Hashtbl.find_opt state.headers parent_key with
+  | None -> 0l
+  | Some parent ->
+    let timestamps = collect_ancestor_timestamps state parent 11 in
+    Consensus.median_time_past timestamps
+
 (* Compute the median time past FOR DISPLAY in getblockheader/getblock RPC,
    which mirrors Bitcoin Core's CBlockIndex::GetMedianTimePast() that starts
    at the CURRENT block (inclusive):
@@ -3095,8 +3115,9 @@ let process_downloaded_blocks ?(max_blocks = 1)
         let height = entry.height in
         (* Compute expected difficulty from chain state *)
         let expected_bits = compute_expected_bits ibd.chain height block.header in
-        (* Compute median time past from last 11 blocks *)
-        let median_time = compute_median_time_past ibd.chain height in
+        (* Compute MTP via hash-linked parent walk (immune to height-index contamination
+           from side-branch headers).  Reference: bitcoin-core/src/chain.h:233-245. *)
+        let median_time = compute_mtp_hash_linked ibd.chain block.header.prev_block in
         (* BIP-94: parent block timestamp for timewarp check *)
         let prev_block_time = get_prev_block_time ibd.chain height in
         (* Build UTXO lookup function.  When an OptimizedUtxoSet is
@@ -4445,7 +4466,9 @@ let connect_block_into_batch
   | Some block ->
     let height = entry.height in
     let expected_bits = compute_expected_bits state height block.header in
-    let median_time = compute_median_time_past state height in
+    (* Hash-linked MTP: during a reorg the height->hash index still reflects the
+       pre-reorg chain; use prev_block links to get the true side-branch MTP. *)
+    let median_time = compute_mtp_hash_linked state entry.header.prev_block in
     let prev_block_time = get_prev_block_time state height in
     (* Lookup that reads through the overlay first, then disk. Used by
        [accept_block] for input resolution and below for undo-data
@@ -4801,7 +4824,7 @@ let verify_chain (state : chain_state) ~(checklevel : int) ~(nblocks : int)
             | Some block ->
               let expected_bits =
                 compute_expected_bits state height block.header in
-              let median_time = compute_median_time_past state height in
+              let median_time = compute_mtp_hash_linked state entry.header.prev_block in
               let prev_block_time = get_prev_block_time state height in
               (* Level 1: CheckBlock (header sanity, merkle root, coinbase,
                  weight/sigops, witness commitment, dup-txid, IsFinalTx). PoW
@@ -5933,7 +5956,7 @@ let rec connect_stored_blocks (state : chain_state) : int =
       | None -> 0
       | Some stored_block ->
         let expected_bits = compute_expected_bits state next_height stored_block.header in
-        let median_time = compute_median_time_past state next_height in
+        let median_time = compute_mtp_hash_linked state entry.header.prev_block in
         let prev_block_time = get_prev_block_time state next_height in
         let lookup outpoint =
           let vout = Int32.to_int outpoint.Types.vout in
@@ -6145,7 +6168,7 @@ let process_new_block ?(f_requested = false)
         Lwt.return (Ok ())
       end else begin
         let expected_bits = compute_expected_bits state height block.header in
-        let median_time = compute_median_time_past state height in
+        let median_time = compute_mtp_hash_linked state block.header.prev_block in
         let prev_block_time = get_prev_block_time state height in
         let lookup outpoint =
           let vout = Int32.to_int outpoint.Types.vout in

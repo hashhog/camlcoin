@@ -340,6 +340,50 @@ let test_count_p2sh_sigops_mixed () =
   let script = Cstruct.of_string "\xac\x55\xae\xad" in
   Alcotest.(check int) "mixed sigops" 7 (Validation.count_p2sh_sigops script)
 
+(* Regression tests for Core-parity partial sigop counting on malformed scripts.
+   Bitcoin Core CScript::GetSigOpCount (script/script.cpp:158-180) walks the
+   script opcode-by-opcode via GetOp and, on a truncated push (GetOp returns
+   false), BREAKS and returns the count accumulated SO FAR.  The previous
+   camlcoin code used `try parse_script ... with _ -> 0` which returned 0 for
+   ANY script that failed to fully parse.  The sigop count feeds the consensus
+   MAX_BLOCK_SIGOPS_COST check, so undercounting lets an attacker craft a block
+   whose true (Core) sigop cost exceeds the cap while camlcoin counted ~0 —
+   false-accept leading to a chain split.
+   These tests prove the partial-count behaviour now matches Core. *)
+
+let test_count_sigops_truncated_direct_push () =
+  (* OP_CHECKSIG OP_CHECKSIG 0x4b: direct push of 75 bytes, but no data follows.
+     Core counts 2 (the two CHECKSIGs before the truncated push); old code → 0. *)
+  let script = Cstruct.of_string "\xac\xac\x4b" in
+  Alcotest.(check int)
+    "partial count: 2 CHECKSIGs before truncated direct push" 2
+    (Validation.count_sigops script)
+
+let test_count_sigops_truncated_pushdata1 () =
+  (* OP_CHECKSIG 0x4c 0x05: PUSHDATA1 declares 5 bytes but none follow.
+     Core counts 1 (leading CHECKSIG); old code → 0. *)
+  let script = Cstruct.of_string "\xac\x4c\x05" in
+  Alcotest.(check int)
+    "partial count: 1 CHECKSIG before truncated PUSHDATA1" 1
+    (Validation.count_sigops script)
+
+let test_count_sigops_truncated_pushdata2 () =
+  (* OP_CHECKSIG 0x4d 0x10: PUSHDATA2 has only one length byte (needs two).
+     Core breaks GetOp, counts 1; old code → 0. *)
+  let script = Cstruct.of_string "\xac\x4d\x10" in
+  Alcotest.(check int)
+    "partial count: 1 CHECKSIG before truncated PUSHDATA2 (missing 2nd len byte)" 1
+    (Validation.count_sigops script)
+
+let test_count_p2sh_sigops_truncated_push () =
+  (* OP_3 OP_CHECKMULTISIG OP_CHECKSIG 0x4b (accurate mode):
+     Core counts 3 (CHECKMULTISIG with OP_3) + 1 (CHECKSIG) = 4 before the
+     truncated direct push; old code → 0. *)
+  let script = Cstruct.of_string "\x53\xae\xac\x4b" in
+  Alcotest.(check int)
+    "partial count (accurate): 3+1 before truncated push" 4
+    (Validation.count_p2sh_sigops script)
+
 (* Test sigop cost with witness discount *)
 let test_sigop_cost_legacy_tx () =
   (* Legacy transaction with 1 CHECKSIG in scriptPubKey *)
@@ -3734,6 +3778,16 @@ let () =
       test_case "p2sh multisig accurate" `Quick test_count_p2sh_sigops_multisig_accurate;
       test_case "p2sh multisig no prefix" `Quick test_count_p2sh_sigops_multisig_no_prefix;
       test_case "p2sh mixed sigops" `Quick test_count_p2sh_sigops_mixed;
+      (* Partial-count regression tests (Core parity): truncated scripts must
+         return the count accumulated before the truncation, not 0. *)
+      test_case "partial count: 2 CHECKSIGs before truncated direct push" `Quick
+        test_count_sigops_truncated_direct_push;
+      test_case "partial count: CHECKSIG before truncated PUSHDATA1" `Quick
+        test_count_sigops_truncated_pushdata1;
+      test_case "partial count: CHECKSIG before truncated PUSHDATA2" `Quick
+        test_count_sigops_truncated_pushdata2;
+      test_case "partial count (accurate): 3+1 before truncated push" `Quick
+        test_count_p2sh_sigops_truncated_push;
       test_case "legacy tx sigop cost" `Quick test_sigop_cost_legacy_tx;
       test_case "p2wpkh sigop cost" `Quick test_sigop_cost_p2wpkh;
       test_case "p2wsh multisig sigop cost" `Quick test_sigop_cost_p2wsh_multisig;

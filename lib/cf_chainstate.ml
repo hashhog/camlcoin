@@ -394,6 +394,10 @@ let batch_put_block_height (b : batch) (height : int) (hash : Types.hash256) =
   Rocksdb.write_batch_put_cf b.raw b.parent.cfh_block_height
     (encode_height height) (Cstruct.to_string hash)
 
+let batch_delete_block_height (b : batch) (height : int) =
+  Rocksdb.write_batch_delete_cf b.raw b.parent.cfh_block_height
+    (encode_height height)
+
 let batch_put_tx_index (b : batch) (txid : Types.hash256) (data : string) =
   Rocksdb.write_batch_put_cf b.raw b.parent.cfh_tx_index
     (Cstruct.to_string txid) data

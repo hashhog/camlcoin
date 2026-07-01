@@ -696,6 +696,36 @@ module ChainDB = struct
      | Some r -> Rocksdb_store.batch_write ~tip_height r rdb_ops);
     Cf_chainstate.batch_write cf_batch
 
+  (* Apply a UTXO delta DIRECTLY to the rocksdb_utxo store (no-op when it is
+     not attached), advancing its tip_height marker in the same atomic batch.
+
+     Used by the reorg commit path ([Sync.reorganize] /
+     [stage_pending_utxos_into_batch]) on the DB-direct (no OptimizedUtxoSet)
+     live-P2P reorg.  That path stages its net UTXO delta into the CF
+     chainstate batch, but [get_utxo] reads the CF FIRST and FALLS BACK to
+     rocksdb_utxo on a CF miss.  A CF-only delete of a coin that also lives in
+     rocksdb_utxo (every coin connected via [apply_block_atomic] does) would be
+     resurrected by that fallback, leaving the reverted branch's coins
+     reachable via [gettxout] / validation input lookups.  Mirror the same net
+     delta into rocksdb_utxo, exactly as the RDB half of [apply_block_atomic]
+     does on the forward path.  Committed RDB-first (before the caller's CF
+     [batch_write]) so the crash window matches [apply_block_atomic]'s SAFE
+     direction (RDB ahead, authoritative chain_tip in CF still lower). *)
+  let batch_apply_utxo_rocksdb t ~(tip_height : int)
+      (puts : (Types.hash256 * int * string) list)
+      (deletes : (Types.hash256 * int) list) : unit =
+    match t.rocksdb_utxo with
+    | None -> ()
+    | Some r ->
+      let ops =
+        List.rev_append
+          (List.rev_map (fun (txid, vout, data) ->
+             (rocksdb_utxo_key txid vout, Some data)) puts)
+          (List.rev_map (fun (txid, vout) ->
+             (rocksdb_utxo_key txid vout, None)) deletes)
+      in
+      if ops <> [] then Rocksdb_store.batch_write ~tip_height r ops
+
   (* Chain state - tip hash and height (validated blocks) *)
   let set_chain_tip t (hash : Types.hash256) (height : int) =
     let batch = Cf_chainstate.batch_create t.cf in

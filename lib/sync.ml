@@ -1418,12 +1418,35 @@ let get_ancestor (state : chain_state) (idx : header_entry) (height : int)
    it falls back to [state.tip] for the fresh-chain case where genesis may
    only be in the in-memory Hashtbl (pre-persistence). *)
 let block_tip (state : chain_state) : header_entry option =
-  match get_header_at_height state state.blocks_synced with
-  | Some _ as x -> x
+  (* The AUTHORITATIVE validated tip is the [chain_tip] pointer, advanced
+     ONLY by an actual block connect / disconnect / reorg
+     ([apply_block_atomic] / [reorganize] / [disconnect_to_target]).  Prefer
+     it over the height->hash index: [accept_header] overwrites that index
+     (and [state.tip]) with the best-WORK header chain the moment a heavier
+     competing branch's headers arrive over P2P — long before those blocks
+     are validated and connected.  Resolving the validated tip from the
+     clobbered index made [connect_stored_blocks] / [process_new_block] treat
+     a not-yet-connected side-branch block at [blocks_synced] as the current
+     tip and extend the heavier chain ON TOP of the still-live old chain
+     WITHOUT disconnecting it — the live-P2P reorg UTXO corruption.  Bitcoin
+     Core keeps the active chain (CChain) strictly separate from the
+     block-index / best-header pointer. *)
+  match Storage.ChainDB.get_chain_tip state.db with
+  | Some (hash, _) ->
+    (match Hashtbl.find_opt state.headers (Cstruct.to_string hash) with
+     | Some _ as x -> x
+     | None ->
+       (* Pointer set but header not in the in-memory map (shouldn't happen
+          post-load): fall back to the index lookup. *)
+       (match get_header_at_height state state.blocks_synced with
+        | Some _ as x -> x
+        | None -> if state.blocks_synced = 0 then state.tip else None))
   | None ->
-    (* Fresh chain: genesis may not yet be persisted at height 0 in DB;
-       state.tip points directly to the validated tip in that case. *)
-    if state.blocks_synced = 0 then state.tip else None
+    (* Fresh chain: [chain_tip] not yet persisted; genesis may only live in
+       the in-memory Hashtbl.  Fall back to the index / state.tip. *)
+    (match get_header_at_height state state.blocks_synced with
+     | Some _ as x -> x
+     | None -> if state.blocks_synced = 0 then state.tip else None)
 
 (* W93 Bug 1 fix: provide the hash of the block at the network's
    BIP34Height so Bitcoin Core's BIP-30 skip optimization (Gate 4) can
@@ -3297,31 +3320,43 @@ let process_downloaded_blocks ?(max_blocks = 1)
              (* Add outputs as new UTXOs (skip genesis coinbase) *)
              if not (Consensus.is_genesis_coinbase height txid) then begin
                if ibd_mode then begin
-                 (* IBD: only OptimizedUtxoSet *)
+                 (* IBD: only OptimizedUtxoSet. Skip provably-unspendable
+                    outputs (OP_RETURN, oversized scripts) to match Core's
+                    [CCoinsViewCache::AddCoin] early-return on
+                    [scriptPubKey.IsUnspendable()] (coins.cpp) — otherwise
+                    every SegWit coinbase's OP_RETURN witness-commitment output
+                    is stored, inflating the chainstate vs Core (the other
+                    connect paths — process_new_block / connect_stored_blocks /
+                    reorg-connect — already filter here). *)
                  (match ibd.utxo_set with
                   | Some utxo ->
                     List.iteri (fun vout out ->
-                      Utxo.OptimizedUtxoSet.add utxo txid vout
-                        Utxo.{ value = out.Types.value;
-                               script_pubkey = out.Types.script_pubkey;
-                               height;
-                               is_coinbase = is_cb }
+                      if not (Utxo.is_unspendable_script
+                                out.Types.script_pubkey) then
+                        Utxo.OptimizedUtxoSet.add utxo txid vout
+                          Utxo.{ value = out.Types.value;
+                                 script_pubkey = out.Types.script_pubkey;
+                                 height;
+                                 is_coinbase = is_cb }
                     ) tx.Types.outputs
                   | None -> ())
                end else begin
                  List.iteri (fun vout out ->
-                   let data = encode_utxo out.Types.value out.Types.script_pubkey
-                       height is_cb in
-                   ibd.pending_utxo_updates <-
-                     (txid, vout, data) :: ibd.pending_utxo_updates;
-                   (match ibd.utxo_set with
-                    | Some utxo ->
-                      Utxo.OptimizedUtxoSet.add utxo txid vout
-                        Utxo.{ value = out.Types.value;
-                               script_pubkey = out.Types.script_pubkey;
-                               height;
-                               is_coinbase = is_cb }
-                    | None -> ())
+                   if not (Utxo.is_unspendable_script
+                             out.Types.script_pubkey) then begin
+                     let data = encode_utxo out.Types.value
+                         out.Types.script_pubkey height is_cb in
+                     ibd.pending_utxo_updates <-
+                       (txid, vout, data) :: ibd.pending_utxo_updates;
+                     (match ibd.utxo_set with
+                      | Some utxo ->
+                        Utxo.OptimizedUtxoSet.add utxo txid vout
+                          Utxo.{ value = out.Types.value;
+                                 script_pubkey = out.Types.script_pubkey;
+                                 height;
+                                 is_coinbase = is_cb }
+                      | None -> ())
+                   end
                  ) tx.Types.outputs
                end
              end;
@@ -4691,6 +4726,7 @@ let connect_block_into_batch
    path has its own [flush_utxos] commit that still uses those
    lists (forward-only path, no put/delete collisions, no view). *)
 let stage_pending_utxos_into_batch
+    ?(tip_height : int option)
     (ibd : ibd_state) (batch : Storage.ChainDB.batch)
     (view : reorg_view) : unit =
   let decode_key (k : string) : Types.hash256 * int =
@@ -4703,14 +4739,33 @@ let stage_pending_utxos_into_batch
     in
     (txid, vout)
   in
+  let rdb_puts = ref [] and rdb_dels = ref [] in
   Hashtbl.iter (fun k data ->
     let (txid, vout) = decode_key k in
-    Storage.ChainDB.batch_store_utxo batch txid vout data
+    Storage.ChainDB.batch_store_utxo batch txid vout data;
+    rdb_puts := (txid, vout, data) :: !rdb_puts
   ) view.view_writes;
   Hashtbl.iter (fun k () ->
     let (txid, vout) = decode_key k in
-    Storage.ChainDB.batch_delete_utxo batch txid vout
+    Storage.ChainDB.batch_delete_utxo batch txid vout;
+    rdb_dels := (txid, vout) :: !rdb_dels
   ) view.view_deletes;
+  (* Dual-store consistency for the DB-direct reorg (no OptimizedUtxoSet
+     threaded, i.e. the live-P2P path).  The CF batch above is not enough:
+     [get_utxo] reads CF-first then FALLS BACK to the separate rocksdb_utxo
+     store, so a CF-only delete of a coin still present in rocksdb_utxo (every
+     coin connected via [apply_block_atomic] is) would be resurrected via the
+     fallback — leaving the reverted branch's coins reachable by [gettxout]
+     and by validation input lookups.  Mirror the net delta into rocksdb_utxo
+     (RDB-first, before the caller's CF [batch_write]), exactly as
+     [apply_block_atomic] does on the forward path.  Skipped when an
+     OptimizedUtxoSet is threaded (submitblock / mining), which manages
+     rocksdb_utxo through its own flush — that path is left untouched. *)
+  (match ibd.utxo_set, tip_height with
+   | None, Some th ->
+     Storage.ChainDB.batch_apply_utxo_rocksdb ibd.chain.db
+       ~tip_height:th !rdb_puts !rdb_dels
+   | _ -> ());
   ibd.pending_utxo_updates <- [];
   ibd.pending_utxo_deletes <- []
 
@@ -5001,9 +5056,20 @@ let reorganize ?(allow_equal_work = false) (ibd : ibd_state)
     (new_tip : header_entry)
     : (unit, string) result =
   let state = ibd.chain in
-  let current_tip = match state.tip with
+  (* The reorg SOURCE is the VALIDATED tip (the block whose UTXO set is
+     currently live), NOT [state.tip].  On the live-P2P path [state.tip]
+     tracks the best-WORK header and has already been advanced to the
+     competing branch's header tip by [accept_header]; disconnecting from
+     there (blocks that were never connected) would be wrong and would trip
+     the work-guard below.  [block_tip] resolves the authoritative validated
+     tip via the [chain_tip] pointer.  On the submitblock / precious /
+     invalidate callers [block_tip] == [state.tip], so this is a no-op there. *)
+  let current_tip = match block_tip state with
     | Some t -> t
-    | None -> failwith "No current tip"
+    | None ->
+      (match state.tip with
+       | Some t -> t
+       | None -> failwith "No current tip")
   in
   (* Normal chain selection requires STRICTLY more work to switch tips
      ([work_cmp <= 0] refused).  The [preciousblock] RPC path passes
@@ -5116,7 +5182,8 @@ let reorganize ?(allow_equal_work = false) (ibd : ibd_state)
                The [view] is the source of truth (it correctly
                resolves put/delete collisions across the reorg's
                disconnect+connect halves). *)
-            stage_pending_utxos_into_batch ibd batch view;
+            stage_pending_utxos_into_batch ~tip_height:new_tip.height
+              ibd batch view;
             (* Update the active-chain height->hash index so getblockhash /
                getbestblockhash (both read the height->hash CF via
                get_hash_at_height / block_tip) reflect the new chain.
@@ -5972,6 +6039,127 @@ let backfill_txospender_index (state : chain_state) : int =
    Post-IBD Block Processing
    ============================================================================ *)
 
+(* Build and persist a block's undo data (spent-prevout records) from the
+   validation-supplied [spent_utxos] list, keyed by block hash.  Mirrors the
+   IBD connect path (sync.ml:3245-3289) and Bitcoin Core's undo file write on
+   every ConnectTip.  This is REQUIRED on the live-P2P connect path: without
+   it, a block connected via [process_new_block] / [connect_stored_blocks]
+   leaves no undo record, so a later [reorganize] that must DISCONNECT it
+   aborts with "Missing undo data" — the P2P reorg then either fails or (before
+   the ActivateBestChain wiring) silently extended the heavier chain on top of
+   the old one.  [spent_utxos] is the ordered (outpoint, coin) list of prevouts
+   the block spent, in tx/input order (the coinbase has none). *)
+let store_block_undo_data
+    (db : Storage.ChainDB.t) (block : Types.block) (height : int)
+    (block_hash : Types.hash256)
+    (spent_utxos : (Types.outpoint * Validation.utxo) list) : unit =
+  let spent_by_tx : (int, (Types.outpoint * Utxo.utxo_entry) list) Hashtbl.t =
+    Hashtbl.create 16 in
+  let tx_input_counts = Array.of_list (List.mapi (fun i tx ->
+    if i = 0 then 0 else List.length tx.Types.inputs) block.transactions) in
+  let cur_tx = ref 1 and cur_inp = ref 0 in
+  List.iter (fun (outpoint, (utxo : Validation.utxo)) ->
+    while !cur_tx < Array.length tx_input_counts
+          && !cur_inp >= tx_input_counts.(!cur_tx) do
+      cur_tx := !cur_tx + 1; cur_inp := 0
+    done;
+    let entry = Utxo.{
+      value = utxo.Validation.value;
+      script_pubkey = utxo.Validation.script_pubkey;
+      height = utxo.Validation.height;
+      is_coinbase = utxo.Validation.is_coinbase;
+    } in
+    let existing = match Hashtbl.find_opt spent_by_tx !cur_tx with
+      | Some l -> l | None -> [] in
+    Hashtbl.replace spent_by_tx !cur_tx ((outpoint, entry) :: existing);
+    cur_inp := !cur_inp + 1
+  ) spent_utxos;
+  let n_txs = List.length block.transactions in
+  let tx_undos = List.init (n_txs - 1) (fun i ->
+    let tx_idx = i + 1 in
+    let spent = match Hashtbl.find_opt spent_by_tx tx_idx with
+      | Some l -> List.rev l | None -> [] in
+    Utxo.{ spent_outputs = spent }
+  ) in
+  let undo : Utxo.undo_data = { height; tx_undos } in
+  let uw = Serialize.writer_create () in
+  Utxo.serialize_undo_data uw undo;
+  Storage.ChainDB.store_undo_data db block_hash
+    (Cstruct.to_string (Serialize.writer_to_cstruct uw))
+
+(* ActivateBestChain for the live-P2P block path (Bitcoin Core's
+   ProcessNewBlock -> ActivateBestChain).  Before this, [process_new_block] /
+   [connect_stored_blocks] only ever EXTENDED the validated tip; a heavier
+   competing chain arriving over inv->headers->getdata->block was connected on
+   top of the old chain WITHOUT disconnecting it (the P2P-reorg UTXO
+   corruption).  The submitblock RPC path was clean because it already routes
+   through [reorganize].
+
+   Called after a side-branch block is stored.  If the best-header chain
+   ([state.tip]) forks BELOW the validated tip (a genuine reorg, not a straight
+   extension the drain already handles), find the heaviest non-invalidated
+   header whose ENTIRE branch back to the fork is downloaded (every ancestor
+   has BLOCK_HAVE_DATA) and, if it out-works the validated tip, disconnect the
+   active chain to the fork and connect that branch via [reorganize] — the same
+   DRY, undo-driven, dual-store disconnect/connect the submitblock path uses.
+   Robust to out-of-order block arrival: it activates whenever the full heavier
+   branch has landed, regardless of which block completed it.  Returns [true]
+   iff a reorg was committed. *)
+let maybe_activate_best_chain (state : chain_state) : bool =
+  match block_tip state, state.tip with
+  | Some validated, Some best_hdr ->
+    (* Cheap gate: only a best-header chain that strictly out-works the
+       validated tip AND forks below it needs a disconnect.  A straight
+       extension is left to [connect_stored_blocks]; the common
+       forward-relay / linear-catch-up case skips the scan below entirely. *)
+    let forks_below =
+      Consensus.work_compare best_hdr.total_work validated.total_work > 0
+      && (match get_ancestor state best_hdr validated.height with
+          | Some a -> not (Cstruct.equal a.hash validated.hash)
+          | None -> true)
+    in
+    if not forks_below then false
+    else begin
+      (* Heaviest header whose whole fork_point->cand path is downloaded.
+         Mirrors FindMostWorkChain gated on BLOCK_HAVE_DATA for every
+         ancestor. Only runs on a genuine fork (rare), so the header scan is
+         acceptable. *)
+      let best = ref None in
+      Hashtbl.iter (fun key (cand : header_entry) ->
+        if (not (Hashtbl.mem state.invalidated_blocks key))
+           && Consensus.work_compare cand.total_work validated.total_work > 0
+           && (match !best with
+               | Some b ->
+                 Consensus.work_compare cand.total_work b.total_work > 0
+               | None -> true)
+        then
+          match find_fork_point state validated cand with
+          | Ok fork_point ->
+            if List.for_all
+                 (fun (e : header_entry) ->
+                    Storage.ChainDB.has_block state.db e.hash)
+                 (collect_path state fork_point cand)
+            then best := Some cand
+          | Error _ -> ()
+      ) state.headers;
+      match !best with
+      | None -> false  (* heavier branch not fully downloaded yet — wait *)
+      | Some cand when Cstruct.equal cand.hash validated.hash -> false
+      | Some cand ->
+        (match reorganize (create_ibd_state state) cand with
+         | Ok () ->
+           Logs.info (fun m ->
+             m "P2P ActivateBestChain: reorged active chain to height %d \
+                (heavier competing branch received over live P2P)" cand.height);
+           true
+         | Error e ->
+           Logs.warn (fun m ->
+             m "P2P ActivateBestChain: reorg to height %d failed: %s"
+               cand.height e);
+           false)
+    end
+  | _ -> false
+
 (* Process a single new block received after IBD is complete (e.g. from an inv
    announcement or unsolicited push).  Validates the block against the current
    UTXO set and, on success, stores it and advances the chain tip.
@@ -6038,6 +6226,11 @@ let rec connect_stored_blocks (state : chain_state) : int =
                 ~get_mtp_at_height:(get_mtp_for_height state)
                 ?bip34_height_hash:(bip34_height_hash_for state) () with
         | Validation.AB_ok (_fees, txid_arr, spent_utxos) ->
+          (* Persist undo data so a later [reorganize] can DISCONNECT this
+             block (Core writes an undo record on every ConnectTip). Without
+             it the block is un-disconnectable and a reorg over it aborts. *)
+          store_block_undo_data state.db stored_block next_height entry.hash
+            spent_utxos;
           (* Write tx_index entries for the connected stored block
              (Pattern C0 closure 2026-05-05). Mirrors process_new_block
              below; the gap-fill catch-up path needs the same wiring or
@@ -6212,6 +6405,12 @@ let process_new_block ?(f_requested = false)
           Logs.info (fun m ->
             m "Connected %d stored blocks after gap-fill store, tip now at %d"
               connected state.blocks_synced);
+        (* ActivateBestChain: this side-branch block did not extend the active
+           validated tip; if it now completes a heavier branch forking below
+           that tip, [reorganize] to it (see [maybe_activate_best_chain]).
+           Then drain any further stored blocks that now extend the new tip. *)
+        if maybe_activate_best_chain state then
+          ignore (connect_stored_blocks state);
         Lwt.return (Ok ())
       end else begin
         let expected_bits = compute_expected_bits state height block.header in
@@ -6282,6 +6481,10 @@ let process_new_block ?(f_requested = false)
         | Ok (_fees, txid_arr, spent_utxos) ->
           (* Store the block *)
           Storage.ChainDB.store_block state.db hash block;
+          (* Persist undo data so a later [reorganize] can DISCONNECT this
+             block (Core writes an undo record on every ConnectTip). Without
+             it a heavier competing branch cannot roll this one back. *)
+          store_block_undo_data state.db block height hash spent_utxos;
           (* Write tx_index entries for every tx in the new block
              (Pattern C0 closure 2026-05-05). Mirrors Bitcoin Core's
              [TxIndex::CustomAppend] fired from [BaseIndex::BlockConnected]

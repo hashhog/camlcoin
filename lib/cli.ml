@@ -1555,6 +1555,38 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
                 :: !block_requests
           | None -> ()
         done;
+        (* Fork-below-tip fill.  The height-indexed scan above only covers
+           heights ABOVE [blocks_synced]; a heavier branch that FORKS BELOW the
+           validated tip has blocks at heights that collide with our current
+           active chain (whose bodies we already have), so those competing
+           blocks are never requested — the node then can never obtain the
+           bodies a reorg needs and stays stuck on the lighter chain.  Walk the
+           best-header chain ([chain.tip]) down from [blocks_synced] along its
+           true ancestry (get_ancestor follows prev_block links, not the
+           height->hash index, which [accept_header] has already repointed at
+           the heavier branch), requesting every block whose body we lack until
+           we reach one we already have (the fork point).  Bounded by
+           [max_reorg_depth].  Mirrors Bitcoin Core's FindNextBlocksToDownload,
+           which requests every BLOCK_HAVE_DATA=false block on the best-header
+           chain regardless of height. *)
+        (match chain.tip with
+         | Some tip when tip.height > chain.blocks_synced ->
+           let floor_h = min chain.blocks_synced tip.height in
+           let stop = ref false in
+           let h = ref floor_h in
+           let steps = ref 0 in
+           while not !stop && !h >= 1 && !steps <= Sync.max_reorg_depth do
+             (match Sync.get_ancestor chain tip !h with
+              | Some anc ->
+                if Storage.ChainDB.has_block db anc.hash then stop := true
+                else
+                  block_requests :=
+                    { P2p.inv_type = P2p.InvWitnessBlock; hash = anc.hash }
+                    :: !block_requests
+              | None -> stop := true);
+             decr h; incr steps
+           done
+         | _ -> ());
         if !block_requests <> [] then begin
           let n_requests = List.length !block_requests in
           Logs.info (fun m ->

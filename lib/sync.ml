@@ -5117,6 +5117,29 @@ let reorganize ?(allow_equal_work = false) (ibd : ibd_state)
                resolves put/delete collisions across the reorg's
                disconnect+connect halves). *)
             stage_pending_utxos_into_batch ibd batch view;
+            (* Update the active-chain height->hash index so getblockhash /
+               getbestblockhash (both read the height->hash CF via
+               get_hash_at_height / block_tip) reflect the new chain.
+               Mirrors Bitcoin Core's [CChain::SetTip] (chain.cpp:16),
+               which resizes vChain to [new_tip.height + 1] and rewrites
+               every slot from the new tip back to the fork point.
+               Without this the index still points at the ABANDONED
+               branch: the height counter (blocks_synced) advanced to the
+               new chain's length while getblockhash(h) returned the old
+               chain's block (or null above the old tip) and
+               getbestblockhash — which resolves height->hash at
+               blocks_synced — returned all-zeros. Staged into the SAME
+               batch as the UTXO delta + chain-tip flip so the index and
+               the tip commit atomically. *)
+            List.iter (fun (entry : header_entry) ->
+              Storage.ChainDB.batch_set_height_hash batch
+                entry.height entry.hash
+            ) to_connect;
+            (* Truncate any heights above the new tip left over from a
+               taller disconnected branch (Core's vChain.resize shrink). *)
+            for h = new_tip.height + 1 to current_tip.height do
+              Storage.ChainDB.batch_delete_height_hash batch h
+            done;
             Storage.ChainDB.batch_set_chain_tip batch new_tip.hash
               new_tip.height;
             Storage.ChainDB.batch_write state.db batch;

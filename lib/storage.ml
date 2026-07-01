@@ -951,6 +951,13 @@ module ChainDB = struct
     queue_op batch (fun b ->
       Cf_chainstate.batch_put_block_height b height hash)
 
+  (* Remove a height->hash active-chain index entry. Used by the reorg
+     path to truncate heights above the new tip (Core's CChain::SetTip
+     resizes vChain down to new_tip.height+1). *)
+  let batch_delete_height_hash batch (height : int) =
+    queue_op batch (fun b ->
+      Cf_chainstate.batch_delete_block_height b height)
+
   let batch_store_transaction batch (txid : Types.hash256)
       (tx : Types.transaction) =
     let w = Serialize.writer_create () in

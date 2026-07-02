@@ -1402,6 +1402,20 @@ let cache_insert (cache : Sig_cache.t) (key : Sig_cache.cache_key) (v : bool) : 
   Sig_cache.insert cache key v;
   Mutex.unlock sig_cache_mutex
 
+(* Thread-safe global sig-cache clear (called on reorg by sync.ml).
+   W165 (un-pin deep fix): with the at-tip mempool-verify pool
+   (Mempool_verify_pool, below) verification now runs on worker Domains
+   ASYNCHRONOUSLY with respect to the block/reorg path — a reorg that clears
+   the cache can race a worker's cache_insert.  Both the sig-cache result and
+   the eviction are deterministic per (wtxid,input_index,flags), so the only
+   real hazard is the Hashtbl STRUCTURAL race (clear vs insert mutating the
+   same table).  Routing clear through sig_cache_mutex closes it.  Cost is one
+   uncontended lock on the reorg path (rare). *)
+let cache_clear_global () : unit =
+  Mutex.lock sig_cache_mutex;
+  Sig_cache.clear_global ();
+  Mutex.unlock sig_cache_mutex
+
 (* Verify a single input.  Returns Ok () on success, Error (index, msg) on
    failure.  Safe to call from any Domain — sig-cache access is serialised.
 
@@ -1723,14 +1737,191 @@ let verify_scripts_parallel_domain
       | Error (idx, msg) -> Error (TxScriptFailed (idx, msg))
     end
 
-(* Lwt-compatible wrapper: executes Domain-parallel verification synchronously.
-   (The Lwt scheduler calls this from a single-threaded context; the Domains
-   run concurrently and are joined before we return to Lwt.) *)
+(* ============================================================================
+   W165 UN-PIN DEEP FIX — at-tip mempool-verify Domain pool
+   ============================================================================
+   Root cause of the camlcoin un-pin blocker (elimination ladder: NOT reads
+   [#6], NOT STW Gc.compact [#7], IS single-domain accept serialization):
+   at tip the IBD [script_check_pool] is torn down (Sync.Validation_worker.
+   stop_script_pool), so [verify_scripts_parallel] below used to run
+   [verify_scripts_parallel_domain] INLINE on the Lwt main thread (serial
+   fold, no Domains).  Per-input ECDSA/Schnorr/witness verification is the
+   CPU-heavy part; running it on the Lwt/RPC domain blocks the Cohttp RPC
+   callback (another promise on the same domain) for the whole verify, so a
+   sustained mempool flood wedges getblockcount to 60s (soak #4/#7).
+
+   Fix: a persistent pool of N worker Domains that verify whole transactions
+   OFF the Lwt main thread.  The Lwt wrapper submits an IMMUTABLE job to the
+   pool and awaits the result via [Lwt_preemptive.detach], so the Lwt
+   scheduler PARKS (releasing domain-0's runtime lock) and keeps servicing
+   RPC while the worker Domain — its OWN domain, its OWN runtime lock — runs
+   secp256k1 in true parallel.  Mirrors the already-proven
+   Sync.Validation_worker pattern (Lwt_preemptive.detach put/take around a
+   Domain), specialised for per-tx script verification.
+
+   Correctness / race-freedom:
+   - Jobs carry only immutable copies (tx, flags, prevouts list, utxos array)
+     built by the caller BEFORE submission; workers never touch live
+     UTXO/mempool state.  TOCTOU is handled by the sync ATMP body re-reading
+     lookup_utxo after verify (mempool.ml accept_transaction_with_replaced_lwt
+     comment) — UTXOs only disappear, never change, so the worst case is a
+     redundant verify + a clean reject, never a false-accept.
+   - Sig-cache access is serialised via sig_cache_mutex (cache_lookup /
+     cache_insert / cache_clear_global).
+   - secp256k1 uses a single static context that is const after a one-time
+     init; concurrent verify is thread-safe.  We WARM it on the main thread
+     before spawning workers so the assumeUTXO-start path (which may reach tip
+     without IBD-replay verification) cannot hit the lazy-init race.
+   - Each job has a private result slot (Mutex+Condition); the shared work
+     queue is Mutex+Condition protected.  N workers verify N distinct txs
+     concurrently — no per-tx shared mutable state.
+   - Domains are spawned LAZILY on first at-tip accept — i.e. after
+     daemonize + Lwt_main.run — never before the fork (Domain.spawn before a
+     fork would be lost).
+
+   Bound: CAMLCOIN_VERIFY_WORKERS (default 3; 0 disables the pool and restores
+   the previous inline behaviour — the safe revert lever). *)
+module Mempool_verify_pool = struct
+  type job = {
+    j_tx : Types.transaction;
+    j_flags : int;
+    j_prevouts : (int64 * Cstruct.t) list;
+    j_utxos : utxo option array;
+    j_mutex : Mutex.t;
+    j_cond : Condition.t;
+    mutable j_result : (unit, tx_validation_error) result option;
+  }
+
+  type t = {
+    q_mutex : Mutex.t;
+    q_cond : Condition.t;               (* workers wait for a non-empty queue *)
+    q : job Queue.t;
+    mutable shutdown : bool;
+    mutable workers : unit Domain.t array;
+  }
+
+  (* Worker loop: pop a job, verify it wholly on THIS Domain (script_check_pool
+     is None at tip, so verify_scripts_parallel_domain runs its serial in-thread
+     fold here — off the Lwt main thread), publish the result. *)
+  let worker_loop (t : t) : unit =
+    let rec loop () =
+      Mutex.lock t.q_mutex;
+      while (not t.shutdown) && Queue.is_empty t.q do
+        Condition.wait t.q_cond t.q_mutex
+      done;
+      if t.shutdown && Queue.is_empty t.q then
+        Mutex.unlock t.q_mutex
+      else begin
+        let job = Queue.pop t.q in
+        Mutex.unlock t.q_mutex;
+        let r =
+          try
+            verify_scripts_parallel_domain
+              ~tx:job.j_tx ~flags:job.j_flags
+              ~prevouts:job.j_prevouts ~utxos:job.j_utxos
+          with e ->
+            Error (TxScriptFailed (-1, Printexc.to_string e))
+        in
+        Mutex.lock job.j_mutex;
+        job.j_result <- Some r;
+        Condition.broadcast job.j_cond;
+        Mutex.unlock job.j_mutex;
+        loop ()
+      end
+    in
+    loop ()
+
+  let create (nworkers : int) : t =
+    (* Warm the single static secp256k1 context on THIS (main) thread before
+       spawning workers, so the first concurrent verify cannot race the lazy
+       ensure_ctx() init.  Crypto.verify swallows all exceptions internally. *)
+    (try
+       ignore (Crypto.verify (Cstruct.create 33) (Cstruct.create 32)
+                 (Cstruct.create 64))
+     with _ -> ());
+    let t = {
+      q_mutex = Mutex.create ();
+      q_cond = Condition.create ();
+      q = Queue.create ();
+      shutdown = false;
+      workers = [||];
+    } in
+    t.workers <- Array.init nworkers (fun _ ->
+      Domain.spawn (fun () -> worker_loop t));
+    t
+
+  (* Enqueue a job and block the CALLING (Lwt_preemptive) systhread until the
+     result is ready.  Never called on the Lwt main thread directly — always
+     wrapped in Lwt_preemptive.detach by verify_scripts_parallel. *)
+  let submit_blocking (t : t)
+      ~(tx : Types.transaction) ~(flags : int)
+      ~(prevouts : (int64 * Cstruct.t) list)
+      ~(utxos : utxo option array)
+      : (unit, tx_validation_error) result =
+    let job = {
+      j_tx = tx; j_flags = flags; j_prevouts = prevouts; j_utxos = utxos;
+      j_mutex = Mutex.create (); j_cond = Condition.create (); j_result = None;
+    } in
+    Mutex.lock t.q_mutex;
+    Queue.push job t.q;
+    Condition.signal t.q_cond;
+    Mutex.unlock t.q_mutex;
+    Mutex.lock job.j_mutex;
+    while job.j_result = None do Condition.wait job.j_cond job.j_mutex done;
+    let r = match job.j_result with Some v -> v | None -> assert false in
+    Mutex.unlock job.j_mutex;
+    r
+end
+
+(* Number of at-tip mempool-verify worker Domains.  0 ⇒ pool disabled ⇒
+   verify_scripts_parallel runs inline on the Lwt main thread (previous
+   behaviour / safe revert). *)
+let mempool_verify_workers : int =
+  match Sys.getenv_opt "CAMLCOIN_VERIFY_WORKERS" with
+  | Some s -> (try max 0 (int_of_string (String.trim s)) with _ -> 3)
+  | None -> 3
+
+let mempool_verify_pool : Mempool_verify_pool.t option ref = ref None
+let mempool_verify_pool_lock : Mutex.t = Mutex.create ()
+
+(* Lazily create the pool on first use (post-fork, post-Lwt_main.run). *)
+let get_mempool_verify_pool () : Mempool_verify_pool.t option =
+  if mempool_verify_workers <= 0 then None
+  else match !mempool_verify_pool with
+    | Some _ as p -> p
+    | None ->
+      Mutex.lock mempool_verify_pool_lock;
+      let p = (match !mempool_verify_pool with
+        | Some _ as p -> p
+        | None ->
+          let p = Mempool_verify_pool.create mempool_verify_workers in
+          mempool_verify_pool := Some p;
+          Some p) in
+      Mutex.unlock mempool_verify_pool_lock;
+      p
+
+(* Lwt-compatible wrapper for at-tip mempool-accept script verification.
+
+   W165 un-pin deep fix: when the mempool-verify pool is enabled, submit the
+   (immutable) verification job to a worker Domain and await it via
+   [Lwt_preemptive.detach], so the Lwt scheduler PARKS and keeps servicing RPC
+   while secp256k1 runs on another Domain.  This is the fix for the at-tip
+   RPC-stall un-pin blocker.  When disabled (CAMLCOIN_VERIFY_WORKERS=0) or when
+   the IBD [script_check_pool] is active (in which case the Domains are already
+   off the main thread inside verify_scripts_parallel_domain), fall back to the
+   previous inline behaviour. *)
 let verify_scripts_parallel ~(tx : Types.transaction) ~(flags : int)
     ~(prevouts : (int64 * Cstruct.t) list)
     ~(utxos : utxo option array)
     : (unit, tx_validation_error) result Lwt.t =
-  Lwt.return (verify_scripts_parallel_domain ~tx ~flags ~prevouts ~utxos)
+  match get_mempool_verify_pool () with
+  | None ->
+    Lwt.return (verify_scripts_parallel_domain ~tx ~flags ~prevouts ~utxos)
+  | Some pool ->
+    Lwt_preemptive.detach
+      (fun () ->
+         Mempool_verify_pool.submit_blocking pool ~tx ~flags ~prevouts ~utxos)
+      ()
 
 (* Calculate transaction fee *)
 let calculate_tx_fee (tx : Types.transaction) ~(lookup : utxo_lookup)

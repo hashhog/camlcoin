@@ -2741,20 +2741,28 @@ let remove_for_block (mp : mempool) (block : Types.block) (height : int)
     let txid = Crypto.compute_txid tx in
     remove_transaction mp txid;
 
-    (* Collect conflicting txids first, then remove *)
+    (* Evict any mempool tx that double-spends an input now spent by this block
+       tx.  W165 un-pin fix (#9): each outpoint is spent by AT MOST ONE mempool
+       tx (double-spends are rejected at accept / resolved by RBF), so the
+       [map_next_tx] spent-outpoint index gives the sole conflicting spender in
+       O(1) — mirroring Core's mapNextTx-driven removeForBlock
+       (txmempool.cpp).  The previous code did a full [Hashtbl.fold] over the
+       ENTIRE mempool for EVERY input of EVERY block tx (O(block_txs * pool)),
+       which — with a saturated ~20k-tx pool and a full block — monopolised the
+       single Lwt/RPC domain for tens of seconds on block connection (a 60-90s
+       RPC stall under sustained-saturation soak; the second serialization layer
+       after the RBF-diagram O(N^2)).  [remove_transaction] keeps map_next_tx
+       consistent (it erases the tx's own outpoints on removal) and cascades to
+       descendants, so a direct lookup is behaviourally identical. *)
     List.iter (fun inp ->
-      let to_remove = Hashtbl.fold (fun _k entry acc ->
-        let dominated = List.exists (fun entry_inp ->
-          Cstruct.equal
-            entry_inp.Types.previous_output.txid
-            inp.Types.previous_output.txid &&
-          entry_inp.previous_output.vout = inp.previous_output.vout
-        ) entry.tx.inputs in
-        if dominated then entry.txid :: acc else acc
-      ) mp.entries [] in
-      List.iter (fun conflict_txid ->
-        remove_transaction mp conflict_txid
-      ) to_remove
+      let out_key = (Cstruct.to_string inp.Types.previous_output.txid,
+                     inp.Types.previous_output.vout) in
+      match Hashtbl.find_opt mp.map_next_tx out_key with
+      | None -> ()
+      | Some conflict_key ->
+        (match Hashtbl.find_opt mp.entries conflict_key with
+         | Some ce -> remove_transaction mp ce.txid
+         | None -> ())
     ) tx.inputs
   ) block.transactions;
   (* Reset rolling fee update timestamp and mark block-since-last-bump so the
@@ -3039,6 +3047,69 @@ let compare_feerate_diagrams
       Not_better
   end
 
+(* Collect the full connected components (clusters) TOUCHED by an RBF
+   replacement: every mempool tx reachable through parent/child edges from any
+   evicted tx (= the direct conflicts plus their descendants) or from any
+   in-pool parent of the replacement.  Those clusters are the ONLY part of the
+   mempool whose feerate-diagram chunks differ before vs after the replacement;
+   every other cluster is byte-identical in both diagrams and cancels in
+   CompareChunks, so it cannot affect the strictly-improves decision.
+
+   This mirrors Bitcoin Core exactly: ImprovesFeerateDiagram compares the
+   diagrams returned by ChangeSet::CalculateChunksForRBF ->
+   TxGraph::GetMainStagingDiagrams (src/policy/rbf.cpp:130,
+   src/txmempool.cpp:994), which are computed over the staged (affected)
+   clusters only — never the whole mempool.
+
+   Bounded / un-pin fix (W165 #9): each mempool cluster is capped at
+   max_cluster_count (64) txs by check_cluster_size_limit at accept time, and
+   the number of seed clusters is bounded by MAX_REPLACEMENT_CANDIDATES (100).
+   So this is O(affected) — INDEPENDENT of total mempool size.  The previous
+   code linearized the ENTIRE mempool via [get_all_chunks] / whole-pool
+   [linearize_entries]; because [find_best_chunk] rescans its whole [remaining]
+   list per extracted chunk, that made [check_improves_feerate_diagram] O(N^2)
+   in mempool size, run twice (before+after) per RBF replacement, synchronously
+   on the single Lwt/RPC domain with no yield.  At a saturated pool (~16k txs)
+   one replacement monopolized the domain for tens of seconds and wedged RPC
+   (getblockcount 60s timeout, no self-recovery — the un-pin blocker). *)
+let collect_affected_cluster_entries
+    (mp : mempool)
+    ~(evicted_set : (string, mempool_entry) Hashtbl.t)
+    ~(replacement_tx : Types.transaction)
+    : mempool_entry list =
+  let result : (string, mempool_entry) Hashtbl.t = Hashtbl.create 128 in
+  let visited : (string, unit) Hashtbl.t = Hashtbl.create 128 in
+  let queue = Queue.create () in
+  let enqueue key =
+    if Hashtbl.mem mp.entries key && not (Hashtbl.mem visited key) then begin
+      Hashtbl.replace visited key ();
+      Queue.push key queue
+    end
+  in
+  (* Seeds: every evicted tx (conflicts + their descendants) and every in-pool
+     parent of the replacement (post-eviction the replacement lands in the
+     cluster formed by those parents). *)
+  Hashtbl.iter (fun k _ -> enqueue k) evicted_set;
+  List.iter (fun inp ->
+    enqueue (Cstruct.to_string inp.Types.previous_output.txid)
+  ) replacement_tx.inputs;
+  (* BFS the parent/child graph so the collected subset is CLOSED under the
+     cluster relation (every collected tx has all its in-pool parents AND
+     children collected too); [linearize_entries] then behaves identically to
+     how it would within the full pool for these clusters. *)
+  while not (Queue.is_empty queue) do
+    let key = Queue.pop queue in
+    (match Hashtbl.find_opt mp.entries key with
+     | None -> ()
+     | Some e ->
+       Hashtbl.replace result key e;
+       List.iter (fun p -> enqueue (Cstruct.to_string p)) e.depends_on;
+       (match Hashtbl.find_opt mp.children key with
+        | None -> ()
+        | Some s -> Hashtbl.iter (fun ck () -> enqueue ck) s))
+  done;
+  Hashtbl.fold (fun _ e acc -> e :: acc) result []
+
 (* Top-level gate: returns Ok () if the replacement improves the feerate
    diagram, or Error msg if it does not.
    evicted_set: the Hashtbl of entries to be removed.
@@ -3050,17 +3121,21 @@ let check_improves_feerate_diagram
     ~(new_fee : int64)
     ~(new_weight : int)
     : (unit, string) result =
-  (* Before diagram: current mempool chunks. *)
-  let before_chunks = get_all_chunks mp in
+  (* Only the clusters touched by the replacement can differ between the before
+     and after diagrams; compute over exactly those (Core-faithful, bounded). *)
+  let affected_entries =
+    collect_affected_cluster_entries mp ~evicted_set ~replacement_tx in
+
+  (* Before diagram: chunks of the affected clusters as they currently stand. *)
+  let before_chunks = linearize_entries mp affected_entries in
   let before_diag   = chunks_to_diagram before_chunks in
 
-  (* After entry list: all entries minus evicted, plus synthetic replacement. *)
+  (* After entry list: affected entries minus evicted, plus synthetic replacement. *)
   let evicted_keys = evicted_set in  (* Hashtbl string → entry *)
   let remaining_entries =
-    Hashtbl.fold (fun key entry acc ->
-      if Hashtbl.mem evicted_keys key then acc
-      else entry :: acc
-    ) mp.entries []
+    List.filter
+      (fun entry -> not (Hashtbl.mem evicted_keys (Cstruct.to_string entry.txid)))
+      affected_entries
   in
   let new_vsize = max 1 ((new_weight + 3) / 4) in
   let new_fee_rate = Int64.to_float new_fee /. float_of_int new_vsize in

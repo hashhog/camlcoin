@@ -851,29 +851,72 @@ let get_min_fee (mp : mempool) : int64 =
    Uses track_package_removed to maintain the rolling floor.
    Reference: Core TrimToSize evicts until DynamicMemoryUsage() <= sizelimit (full limit,
    not 75%).  The per-chunk feerate floor is raised by incremental_relay_fee each round.
-   Reference: txmempool.cpp:877-878 — removed += incremental_relay_feerate before track. *)
+   Reference: txmempool.cpp:877-878 — removed += incremental_relay_feerate before track.
+
+   2026-07-01 GC-churn fix (un-pin attempt #3 post-mortem): the old loop called
+   [get_worst_chunk] PER EVICTED CHUNK, and get_worst_chunk = get_all_chunks =
+   whole-pool union-find + cluster grouping + per-cluster linearization + a full
+   sort — all rebuilt from scratch, allocating multiple MB, to pick ONE chunk.
+   Once the pool sits at its 300 MB cap (exactly the public-mempool-flood
+   regime), eviction runs on ~every accept, so the per-accept garbage was
+   O(pool) and the OCaml major heap inflated at ~300 MB/s — faster than the
+   incremental collector's pacing — driving the 2500 MB backstop ceiling and a
+   1.2-1.4 s STW Gc.compact every ~8 s (the residual RPC stall of the
+   2026-07-01 soak).  Fixed by (a) building the chunk list ONCE per trim and
+   evicting worst-first from it, and (b) a small overshoot slack at the
+   add_transaction trigger (see there) so trims are batched.
+
+   Evicting ascending from one snapshot is equivalent to the old
+   re-linearize-per-round loop: within a cluster, [linearize_cluster] emits
+   chunks in non-increasing feerate order, so the globally-worst remaining
+   chunk is always a not-yet-evicted suffix chunk of its cluster, and removing
+   it never changes the linearization of the chunks before it.  A chunk whose
+   txs were already removed as descendants of an earlier evicted chunk is
+   skipped (remove_transaction on a missing txid is a no-op; the floor is only
+   bumped for chunks that still evict something). *)
 let evict_by_chunks (mp : mempool) : unit =
-  let rec evict_loop () =
-    if mp.total_weight <= mp.max_size_bytes then ()
-    else begin
-      match get_worst_chunk mp with
-      | None -> ()
-      | Some worst_chunk ->
-        (* chunk_fee_rate is in sat/weight-unit; convert to sat/kvB for rolling fee.
-           1 sat/wu * 4 wu/vB * 1000 vB/kvB = 4000 sat/kvB per (sat/wu). *)
-        let evicted_fee_rate_kvb =
-          worst_chunk.chunk_fee_rate *. 4.0 *. 1000.0 in
-        (* Add incremental_relay_fee before updating the floor, so the floor is
-           strictly above the just-evicted rate (Core txmempool.cpp:877-878). *)
-        let floor_rate = evicted_fee_rate_kvb +. incremental_relay_fee_float in
-        track_package_removed mp floor_rate;
-        List.iter (fun e ->
-          remove_transaction mp e.txid
-        ) worst_chunk.chunk_txs;
-        evict_loop ()
-    end
-  in
-  evict_loop ()
+  if mp.total_weight > mp.max_size_bytes then begin
+    (* Single structure rebuild per trim; get_all_chunks sorts descending, so
+       walk the reversed list (worst chunk first). *)
+    let worst_first = List.rev (get_all_chunks mp) in
+    let rec evict_loop chunks =
+      if mp.total_weight <= mp.max_size_bytes then ()
+      else match chunks with
+        | [] -> ()
+        | chunk :: rest ->
+          (* Skip members already removed (descendant cascade of an earlier
+             evicted chunk); only bump the rolling floor when this chunk
+             actually evicts something, matching the old per-round behavior. *)
+          let live =
+            List.filter
+              (fun e -> Hashtbl.mem mp.entries (Cstruct.to_string e.txid))
+              chunk.chunk_txs
+          in
+          if live <> [] then begin
+            (* chunk_fee_rate is in sat/weight-unit; convert to sat/kvB for the
+               rolling fee.  1 sat/wu * 4 wu/vB * 1000 vB/kvB. *)
+            let evicted_fee_rate_kvb = chunk.chunk_fee_rate *. 4.0 *. 1000.0 in
+            (* Add incremental_relay_fee before updating the floor, so the floor
+               is strictly above the just-evicted rate (Core txmempool.cpp:877-878). *)
+            let floor_rate = evicted_fee_rate_kvb +. incremental_relay_fee_float in
+            track_package_removed mp floor_rate;
+            List.iter (fun e -> remove_transaction mp e.txid) live
+          end;
+          evict_loop rest
+    in
+    evict_loop worst_first
+  end
+
+(* Overshoot slack before a trim is triggered from the accept hot path.
+   Core's TrimToSize is O(log n) per eviction (multi-indexed mempool), so it
+   trims on every accept; camlcoin's chunk-based trim rebuilds the cluster
+   linearization (O(pool)), so triggering it per-accept at the cap is the GC
+   churn documented above.  Allowing the pool to overshoot the cap by ~1.6 %
+   (300 MB → ≤ ~304.7 MB) batches ~thousands of accepts per rebuild; each trim
+   still evicts back down to max_size_bytes exactly.  Memory stays bounded by
+   cap + slack.  Policy-only (mempool contents; non-consensus). *)
+let eviction_trigger_slack (mp : mempool) : int =
+  mp.max_size_bytes / 64
 
 (* effective_min_fee — the minimum fee rate (sat/kvB) a new transaction must meet.
    Uses the rolling exponential-decay model from get_min_fee, then takes the max
@@ -899,53 +942,84 @@ let effective_min_fee (mp : mempool) : int64 =
 
 (* Check if adding a transaction would exceed either cluster limit.
    [new_tx_weight] is the weight of the new transaction being added; used to
-   compute its vsize contribution to the merged cluster total. *)
+   compute its vsize contribution to the merged cluster total.
+
+   2026-07-01 GC-churn fix (un-pin attempt #3 post-mortem): the old
+   implementation built a union-find over the ENTIRE mempool
+   (build_clusters_uf) plus a full Hashtbl.fold — O(pool) time AND O(pool)
+   allocation — on EVERY accept that has an in-mempool parent.  Under the
+   public-mempool flood this was a major contributor (with the per-accept
+   eviction rebuild, see evict_by_chunks) to the ~300 MB/s major-heap churn
+   behind the residual RPC stall.  A cluster is just the connected component
+   of the parent/child graph, and it is BOUNDED by these very limits (64 txs /
+   101 kvB), so a local BFS from the new tx's in-pool parents over
+   depends_on + the [mp.children] reverse index, with early exit as soon as a
+   limit is exceeded, computes the identical accept/reject decision in
+   O(cluster) ≤ O(65) instead of O(pool).
+
+   Note on the error text: with early exit the reported count/vsize is the
+   value at the first violation (e.g. "65 > 64"), not the full merged-cluster
+   total the old code printed.  The accept/reject DECISION is unchanged; the
+   reason tag ("too-large-cluster") is unchanged. *)
 let check_cluster_size_limit ?(new_tx_weight=0) (mp : mempool)
     (depends : Types.hash256 list) (new_txid : Types.hash256)
     : (unit, string) result =
+  ignore new_txid;
   if depends = [] then
     (* No dependencies — would form a singleton cluster of size 1.
        Singleton always passes both count (1 ≤ 64) and size limits. *)
     Ok ()
   else begin
-    (* Find the cluster(s) that would be affected *)
-    let uf = build_clusters_uf mp in
-
-    (* Simulate adding the new tx to UF *)
-    let new_txid_key = Cstruct.to_string new_txid in
-    ignore (uf_find uf new_txid_key);
-
-    (* Union with all parent clusters *)
-    List.iter (fun parent_txid ->
-      let parent_key = Cstruct.to_string parent_txid in
-      if Hashtbl.mem mp.entries parent_key then
-        uf_union uf new_txid_key parent_key
-    ) depends;
-
-    (* Count the resulting cluster tx count AND total vsize *)
-    let merged_root = uf_find uf new_txid_key in
     let new_tx_vsize = (new_tx_weight + 3) / 4 in
-    let (cluster_count, cluster_vsize) =
-      Hashtbl.fold (fun txid_key entry (cnt, vsz) ->
-        if uf_find uf txid_key = merged_root then
-          (cnt + 1, vsz + (entry.weight + 3) / 4)
-        else
-          (cnt, vsz)
-      ) mp.entries (1, new_tx_vsize)  (* +1/+vsize for the new tx itself *)
+    (* BFS over the union of the parents' connected components (= the merged
+       cluster after adding the new tx).  The new tx itself contributes
+       1 tx / new_tx_vsize; it has no children yet, and its only in-pool
+       edges are [depends]. *)
+    let visited : (string, unit) Hashtbl.t =
+      Hashtbl.create (max_cluster_count * 2) in
+    let queue = Queue.create () in
+    let push key =
+      if Hashtbl.mem mp.entries key && not (Hashtbl.mem visited key) then begin
+        Hashtbl.replace visited key ();
+        Queue.push key queue
+      end
     in
-
-    (* Gate 1: cluster transaction count limit (DEFAULT_CLUSTER_LIMIT = 64) *)
-    if cluster_count > max_cluster_count then
-      Error (Printf.sprintf
-        "cluster tx count limit exceeded (%d > %d); too-large-cluster"
-        cluster_count max_cluster_count)
-    (* Gate 2: cluster vsize limit (DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 = 101_000 vbytes) *)
-    else if cluster_vsize > max_cluster_size_vbytes then
-      Error (Printf.sprintf
-        "cluster vsize limit exceeded (%d > %d vbytes); too-large-cluster"
-        cluster_vsize max_cluster_size_vbytes)
-    else
-      Ok ()
+    List.iter (fun parent_txid -> push (Cstruct.to_string parent_txid)) depends;
+    let cluster_count = ref 1 in           (* the new tx itself *)
+    let cluster_vsize = ref new_tx_vsize in
+    let violation = ref None in
+    while !violation = None && not (Queue.is_empty queue) do
+      let key = Queue.pop queue in
+      (match Hashtbl.find_opt mp.entries key with
+       | None -> ()
+       | Some entry ->
+         incr cluster_count;
+         cluster_vsize := !cluster_vsize + (entry.weight + 3) / 4;
+         (* Gate 1: cluster transaction count limit (DEFAULT_CLUSTER_LIMIT = 64) *)
+         if !cluster_count > max_cluster_count then
+           violation := Some (Printf.sprintf
+             "cluster tx count limit exceeded (%d > %d); too-large-cluster"
+             !cluster_count max_cluster_count)
+         (* Gate 2: cluster vsize limit (DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000) *)
+         else if !cluster_vsize > max_cluster_size_vbytes then
+           violation := Some (Printf.sprintf
+             "cluster vsize limit exceeded (%d > %d vbytes); too-large-cluster"
+             !cluster_vsize max_cluster_size_vbytes)
+         else begin
+           (* Expand the component: in-pool parents ... *)
+           List.iter
+             (fun p -> push (Cstruct.to_string p))
+             entry.depends_on;
+           (* ... and in-pool children (reverse index, #135 step 1). *)
+           (match Hashtbl.find_opt mp.children key with
+            | None -> ()
+            | Some children_set ->
+              Hashtbl.iter (fun child_key () -> push child_key) children_set)
+         end)
+    done;
+    match !violation with
+    | Some e -> Error e
+    | None -> Ok ()
   end
 
 (* ============================================================================
@@ -2594,8 +2668,15 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
               (* Evict if over size limit - use cluster-based eviction.
                  Reference: Core validation.cpp:275 calls TrimToSize(max_size_bytes)
                  after every accept — triggers when total weight exceeds the full
-                 limit (not 25% of it as the old code did). *)
-              if mp.total_weight > mp.max_size_bytes then
+                 limit (not 25% of it as the old code did).
+                 2026-07-01 GC-churn fix: trigger only past a small overshoot
+                 slack (~1.6 % of the cap) so the O(pool) chunk rebuild inside
+                 evict_by_chunks is amortized over many accepts instead of
+                 running on EVERY accept once the pool sits at the cap (the
+                 public-flood churn that stalled RPC — see evict_by_chunks).
+                 Each trim still evicts back down to max_size_bytes exactly;
+                 memory is bounded by cap + slack. *)
+              if mp.total_weight > mp.max_size_bytes + eviction_trigger_slack mp then
                 evict_by_chunks mp;
 
               (* Notify ZMQ subscribers about new transaction *)

@@ -305,6 +305,11 @@ type peer = {
   inv_queue : inv_entry Queue.t;     (* Pending tx inventory to announce *)
   mutable next_inv_send : float;     (* Next time to flush inv queue *)
   mutable trickling_active : bool;   (* Whether the trickle timer is running *)
+  mutable msg_loop_started : bool;   (* Whether peer_message_loop is already draining this peer's socket.
+                                        Inbound peers get a loop at accept time so their pings are ponged
+                                        regardless of header-sync state (Core services every peer from
+                                        handshake onward); the flag makes loop-start idempotent and keeps
+                                        the header-sync source selector from double-reading a looped peer. *)
   mutable pending_read : P2p.message_payload Lwt.t option;  (* In-flight read to prevent concurrent reads *)
   (* BIP-324 v2 transport.  None = legacy v1 path (the default).  Some
      (P2p.V2 state) = encrypted v2 transport; send/read dispatch on this. *)
@@ -436,6 +441,7 @@ let make_peer ~(network : Consensus.network_config) ~(addr : string)
     inv_queue = Queue.create ();
     next_inv_send = Unix.gettimeofday () +. poisson_delay avg_interval;
     trickling_active = false;
+    msg_loop_started = false;
     pending_read = None;
     (* Default to v1 (= None).  The BIP-324 v2 dialer flips this to
        Some (P2p.V2 state) once the cipher handshake completes. *)

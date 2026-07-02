@@ -3659,7 +3659,7 @@ let disconnect_to_target (state : chain_state) (target : header_entry)
           Storage.ChainDB.batch_write state.db batch;
           (* Clear sig cache: stale validation results from the
              disconnected segment must not leak forward. *)
-          Sig_cache.clear_global ();
+          Validation.cache_clear_global ();
           (* Coin-stats index rollback: drop every per-height snapshot
              above the rollback target (no-op when --coinstatsindex is
              off). When the chain is later re-applied (e.g. dumptxoutset's
@@ -3783,7 +3783,7 @@ let disconnect_to_target_via_utxo (state : chain_state)
           Utxo.OptimizedUtxoSet.persist_dirty_atomic utxo
             ~tip_hash:target.hash ~tip_height:target.height
             ~header_tip_hash:target.hash ~header_tip_height:target.height;
-          Sig_cache.clear_global ();
+          Validation.cache_clear_global ();
           coinstats_rewind_if_enabled state ~target_height:target.height;
           state.tip <- Some target;
           state.blocks_synced <- target.height;
@@ -3930,7 +3930,7 @@ let reconcile_rdb_to_chain_tip (state : chain_state)
         Storage.ChainDB.delete_undo_data state.db bhash) !undo_to_delete;
       (* Stale sig-cache results from the over-applied segment must not leak
          forward into re-validation. *)
-      Sig_cache.clear_global ();
+      Validation.cache_clear_global ();
       Logs.warn (fun m ->
         m "UTXO reconcile complete: rolled RDB tip back from %d to %d \
            (matches chain_tip); IBD will re-apply forward from a consistent base"
@@ -5256,7 +5256,7 @@ let reorganize ?(allow_equal_work = false) (ibd : ibd_state)
             ) (List.rev !connected_blocks);
             (* Clear sig cache so stale results from the abandoned chain
                don't leak into post-reorg validation. *)
-            Sig_cache.clear_global ();
+            Validation.cache_clear_global ();
             (* Mempool refill: re-add disconnected non-coinbase txs.
                W96 Bug 14: pass ~bypass_fee_check:true and ~bypass_limits:true
                so the refill path matches Core's args.m_bypass_limits=true for

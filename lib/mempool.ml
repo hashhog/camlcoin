@@ -130,6 +130,22 @@ let max_ancestor_size = 101_000
 let max_descendant_size = 101_000
 let max_rbf_evictions = 100
 let max_standard_tx_weight = 400_000
+
+(* 2026-07-02 at-tip RPC-stall fix: how many inputs the Lwt mempool-accept path
+   processes between cooperative [Lwt.pause] yields while it does the SYNCHRONOUS
+   per-input UTXO reads (lookup_utxo → direct RocksDB point read, which blocks the
+   single Lwt/RPC domain).  Bounds the worst-case uninterrupted read storm — and
+   thus the RPC stall — from one large-input tx to ~this many reads.  Scheduling
+   only: does not affect the accept/reject decision.  Overridable via
+   CAMLCOIN_ATMP_YIELD_EVERY for soak tuning; <=0 disables interior yielding
+   (restores the old single-stretch behaviour); invalid values fall back. *)
+let atmp_yield_every =
+  match Sys.getenv_opt "CAMLCOIN_ATMP_YIELD_EVERY" with
+  | Some s ->
+    (match int_of_string_opt (String.trim s) with
+     | Some v -> v
+     | None -> 16)
+  | None -> 16
 (* DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB.
    Reference: bitcoin-core/src/policy/policy.h:48
    Previous value was 1000 sat/kvB (10× too high). *)
@@ -2173,35 +2189,73 @@ let verify_tx_scripts_lwt (mp : mempool) (tx : Types.transaction)
   let flags =
     Consensus.get_standard_policy_flags (mp.current_height + 1) mp.network in
 
-  (* Build prevouts (Taproot sighash dependency).  Missing inputs are
-     represented as (0L, empty) to match the sync path; the per-input
-     missing-input rejection is produced by the utxos[] None branch
-     inside Validation.verify_scripts_parallel. *)
-  let prevouts = List.map (fun inp ->
-    let prev = inp.Types.previous_output in
-    match lookup_utxo mp prev with
-    | Some entry -> (entry.Utxo.value, entry.Utxo.script_pubkey)
-    | None -> (0L, Cstruct.empty)
-  ) tx.inputs in
+  (* 2026-07-02 at-tip RPC-stall fix (un-pin soak #4 — see
+     CORE-PARITY-AUDIT/_camlcoin-gc-rpc-stall-rootcause-2026-06-24.md follow-up):
+     the multi-second RPC stalls that failed the soak are NOT GC (stw_cum=0,
+     RSS flat) — they are the single Lwt/RPC domain being blocked by the
+     SYNCHRONOUS UTXO reads on the mempool-accept path.  [lookup_utxo] →
+     Utxo.UtxoSet.get is a DIRECT RocksDB point read (utxo.ml: "no in-process
+     caching … prevents unbounded GC heap growth" — which is exactly why RSS
+     stays flat), and caml_rocksdb_get holds the OCaml runtime lock for the read.
+     The old body did THREE separate O(inputs) lookup passes (prevouts, P2A,
+     utxos) with NO cooperative yield, so a large-input tx — or a public-flood
+     backlog of many accepts — storms the RocksDB reads and freezes the Cohttp
+     RPC callback (another promise on this same domain) for the whole run.
 
-  (* Pre-pass (P2A witness stuffing).  Iterate inputs in order; first
-     violation short-circuits with the sync-compatible error string. *)
+     Fix (pure scheduling + read-dedup; the derived prevouts/p2a_error/utxos are
+     bit-identical to the previous three-pass version, so the accept/reject
+     decision is unchanged):
+       (1) ONE lookup_utxo per input instead of three  → 3× fewer synchronous
+           RocksDB reads on the loop; and
+       (2) [Lwt.pause] every [atmp_yield_every] inputs so no single accept
+           monopolises the event loop while it reads — bounding the worst-case
+           synchronous stretch (and thus the RPC stall) to that many reads.
+     The bounded-in-flight gate on the P2P relay path (cli.ml) bounds the
+     AGGREGATE flood; this bounds a single large-input tx. *)
+  let inputs = Array.of_list tx.inputs in
+  let witnesses = Array.of_list tx.witnesses in
+  let n = Array.length inputs in
+  let utxos = Array.make n None in
+  let prevouts_arr = Array.make n (0L, Cstruct.empty) in
   let p2a_error = ref None in
-  List.iteri (fun i inp ->
-    if !p2a_error = None then begin
-      match lookup_utxo mp inp.Types.previous_output with
-      | None -> ()  (* missing input is reported by Validation path below *)
-      | Some utxo_entry ->
-        let witness =
-          if i < List.length tx.witnesses then List.nth tx.witnesses i
-          else { Types.items = [] }
-        in
-        if Script.is_p2a utxo_entry.Utxo.script_pubkey &&
-           witness.Types.items <> [] then
-          p2a_error := Some (Printf.sprintf
-            "P2A input %d has non-empty witness (witness stuffing)" i)
+  let rec pass i =
+    if i >= n then Lwt.return_unit
+    else begin
+      let inp = inputs.(i) in
+      let prev = inp.Types.previous_output in
+      (match lookup_utxo mp prev with
+       | None -> ()  (* utxos.(i) stays None (missing-input rejection is produced
+                        by the utxos[] None branch inside the verifier); prevout
+                        stays (0L, empty) to match the sync path. *)
+       | Some e ->
+         prevouts_arr.(i) <- (e.Utxo.value, e.Utxo.script_pubkey);
+         utxos.(i) <- Some {
+           Validation.txid = prev.txid;
+           vout = prev.vout;
+           value = e.Utxo.value;
+           script_pubkey = e.Utxo.script_pubkey;
+           height = e.Utxo.height;
+           is_coinbase = e.Utxo.is_coinbase;
+         };
+         (* P2A witness-stuffing pre-pass: first violation in input order wins
+            (identical to the old separate pass). *)
+         if !p2a_error = None then begin
+           let witness =
+             if i < Array.length witnesses then witnesses.(i)
+             else { Types.items = [] }
+           in
+           if Script.is_p2a e.Utxo.script_pubkey &&
+              witness.Types.items <> [] then
+             p2a_error := Some (Printf.sprintf
+               "P2A input %d has non-empty witness (witness stuffing)" i)
+         end);
+      if atmp_yield_every > 0 && (i + 1) mod atmp_yield_every = 0 then
+        let%lwt () = Lwt.pause () in pass (i + 1)
+      else pass (i + 1)
     end
-  ) tx.inputs;
+  in
+  let%lwt () = pass 0 in
+  let prevouts = Array.to_list prevouts_arr in
 
   (* Wrap helper that adds the TX_WITNESS_STRIPPED tag when applicable. *)
   let tag_witness_stripped (e : string) : string =
@@ -2215,26 +2269,6 @@ let verify_tx_scripts_lwt (mp : mempool) (tx : Types.transaction)
   match !p2a_error with
   | Some e -> Lwt.return (Error (tag_witness_stripped e))
   | None ->
-    (* Build [utxos : utxo option array] in input order.  This array
-       carries both presence (Some/None) and the full UTXO record
-       (height/is_coinbase) needed by the script evaluator. *)
-    let n = List.length tx.inputs in
-    let utxos = Array.make n None in
-    List.iteri (fun i inp ->
-      let prev = inp.Types.previous_output in
-      match lookup_utxo mp prev with
-      | None -> utxos.(i) <- None
-      | Some e ->
-        utxos.(i) <- Some {
-          Validation.txid = prev.txid;
-          vout = prev.vout;
-          value = e.Utxo.value;
-          script_pubkey = e.Utxo.script_pubkey;
-          height = e.Utxo.height;
-          is_coinbase = e.Utxo.is_coinbase;
-        }
-    ) tx.inputs;
-
     let%lwt result =
       Validation.verify_scripts_parallel ~tx ~flags ~prevouts ~utxos in
     match result with

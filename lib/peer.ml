@@ -543,9 +543,37 @@ let read_message_v1 (peer : peer) : P2p.message_payload Lwt.t =
           peer.bytes_received + P2p.message_header_size + length;
         peer.msgs_received <- peer.msgs_received + 1;
         peer.last_seen <- Unix.gettimeofday ();
-        (* Deserialize the payload based on command *)
+        (* Deserialize the payload based on command.
+           Wrap the deserialize so a malformed payload becomes a clean Lwt
+           rejection (-> the read loop disconnects the peer) rather than a
+           synchronous exception escaping promise construction. *)
         let pr = Serialize.reader_of_cstruct payload_cs in
-        Lwt.return (P2p.deserialize_payload _cmd pr)
+        (try
+           (* Bitcoin Core net_processing.cpp:4040 (inv) / :4131 (getdata):
+              an inv/getdata carrying more than MAX_INV_SZ (50000) entries is
+              peer misbehavior — Misbehaving(peer, "inv message size = ...")
+              + disconnect.  Guard at the message entry (peeking the compact-
+              size count) so an oversized inv discourages + drops the peer with
+              a misbehavior score, instead of the bare Failure that
+              deserialize_inv_list would raise (which the read loop otherwise
+              mis-reports as a benign timeout with NO score). *)
+           (match _cmd with
+            | P2p.Inv | P2p.Getdata ->
+              let peek = Serialize.reader_of_cstruct payload_cs in
+              let count = Serialize.read_compact_size peek in
+              if count > P2p.max_inv_count then begin
+                peer.misbehavior_score <- peer.misbehavior_score + 100;
+                Log.warn (fun m ->
+                  m "[%s:%d] oversize %s: %d entries (> MAX_INV_SZ=%d) — \
+                     discouraging + disconnecting"
+                    peer.addr peer.port (P2p.command_to_string _cmd)
+                    count P2p.max_inv_count);
+                raise (Peer_protocol_error
+                         (Printf.sprintf "inv message size = %d" count))
+              end
+            | _ -> ());
+           Lwt.return (P2p.deserialize_payload _cmd pr)
+         with exn -> Lwt.fail exn)
       end
     end
   end

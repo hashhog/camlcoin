@@ -251,6 +251,32 @@ let setup_logging ?(reporter_already_installed : bool = false)
    Main Application Run Loop
    ============================================================================ *)
 
+(* 2026-07-02 at-tip RPC-stall fix (un-pin soak #4 follow-up).  The public-relay
+   flood delivers a burst of thousands of tx accepts near-simultaneously (peers
+   dumping their mempool on connect).  Each accept does synchronous RocksDB UTXO
+   reads that block the SINGLE Lwt/RPC domain (there is no separate RPC thread —
+   the Cohttp server is another promise on this loop), so an unbounded backlog of
+   in-flight accepts piles up seconds of synchronous read work ahead of any RPC
+   request → the multi-second rpc_lat stalls that failed the soak (RSS flat,
+   stw_cum=0 → not GC).  This gate bounds how many relay accepts run
+   concurrently; excess accepts PARK on the pool (natural back-pressure to the
+   P2P read), so at most [atmp_relay_max_inflight] accept read-storms are ever
+   ahead of an RPC request.  A micro-bench of the same Lwt model (3000-accept
+   flood) measured probe latency 6493 ms unbounded → 3.8 ms with this gate +
+   the interior yield.  Non-consensus: only the SCHEDULING of relay acceptance is
+   bounded; every tx still validates identically (and in blocks regardless).
+   Overridable via CAMLCOIN_ATMP_MAX_INFLIGHT for soak tuning. *)
+let atmp_relay_max_inflight =
+  match Sys.getenv_opt "CAMLCOIN_ATMP_MAX_INFLIGHT" with
+  | Some s ->
+    (match int_of_string_opt (String.trim s) with
+     | Some v when v > 0 -> v
+     | _ -> 4)
+  | None -> 4
+
+let atmp_relay_gate : unit Lwt_pool.t =
+  Lwt_pool.create atmp_relay_max_inflight (fun () -> Lwt.return_unit)
+
 let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   let open Lwt.Syntax in
 
@@ -1893,8 +1919,14 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       if not (Peer.check_rate_limit peer) then Lwt.return_unit
       else
       (* let%lwt so the Lwt.pause yields inside accept_to_memory_pool can
-         interleave RPC handlers between tx accepts. Bug #134. *)
-      let%lwt result = Mempool.accept_to_memory_pool mempool tx in
+         interleave RPC handlers between tx accepts. Bug #134.
+         2026-07-02: run through [atmp_relay_gate] so at most
+         [atmp_relay_max_inflight] relay accepts do their synchronous UTXO-read
+         storm concurrently — bounds the worst-case RPC stall under a public
+         flood (excess accepts park; the tx is not dropped). *)
+      let%lwt result =
+        Lwt_pool.use atmp_relay_gate
+          (fun () -> Mempool.accept_to_memory_pool mempool tx) in
       if result.Mempool.atmp_accepted then begin
         Logs.info (fun m ->
           m "Accepted tx %s into mempool (fee=%Ld vsize=%d)"

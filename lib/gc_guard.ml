@@ -132,6 +132,31 @@ let compact_heap_threshold_bytes =
    path needs no floor (it is cheap + non-STW). *)
 let compact_min_interval_s = 8.0
 
+(* Minimum heap size below which the wall-clock TIME-FLOOR backstop is
+   skipped (2026-07-01, un-pin attempt #3 post-mortem).  The soak logs showed
+   the 300 s time-floor firing a genuine STW Gc.compact with the heap already
+   at its post-compact baseline (591 MB -> 591 MB, compact_stall ~0.6 s) —
+   i.e. a guaranteed ~0.6 s RPC stall every 5 minutes that reclaimed NOTHING.
+   With the steady-state slice + 60 s malloc_trim already returning transient
+   memory, a compaction is only worth its STW when the heap has actually
+   grown.  Gate the time-floor on heap ≥ this floor; the heap-size CEILING
+   backstop is unaffected (it is the emergency guard).  Overridable via
+   CAMLCOIN_BACKSTOP_MIN_HEAP_MB (the regtest gc-load gate can lower it to
+   exercise the time-floor path); invalid / non-positive values fall back to
+   the default. *)
+let default_backstop_min_heap_mb = 1024.0
+
+let backstop_min_heap_bytes =
+  let mb =
+    match Sys.getenv_opt "CAMLCOIN_BACKSTOP_MIN_HEAP_MB" with
+    | Some s ->
+      (match float_of_string_opt (String.trim s) with
+       | Some v when v > 0.0 -> v
+       | _ -> default_backstop_min_heap_mb)
+    | None -> default_backstop_min_heap_mb
+  in
+  mb *. 1024.0 *. 1024.0
+
 (* Fast-tick cadence for cli.ml's dedicated GC timer.  Drives the
    steady-state [Gc.major_slice] every tick (keeping the collector caught up)
    and checks the backstop ceiling.  5 s keeps the slice cadence frequent
@@ -355,10 +380,15 @@ let maybe_backstop ~reason =
   if backstop_due ~reason then Backstop.request ~reason
 
 (* Backstop wall-clock time-floor: request a compaction when
-   [compact_interval_s] has elapsed since the last backstop, regardless of
-   heap size — guarantees idle off-heap/arena memory is still returned. *)
+   [compact_interval_s] has elapsed since the last backstop AND the heap has
+   actually grown past [backstop_min_heap_bytes].  (2026-07-01: no longer
+   unconditional — an idle-heap time-floor compaction is a pure ~0.6 s STW
+   RPC stall that reclaims nothing; transient arena memory is already
+   returned by the 60 s slice-path malloc_trim.) *)
 let backstop_overdue ~reason:_ =
   Unix.gettimeofday () -. !last_compact_time >= compact_interval_s
+  && float_of_int (Gc.quick_stat ()).Gc.heap_words *. 8.0
+     >= backstop_min_heap_bytes
 
 let backstop_if_overdue ~reason =
   if backstop_overdue ~reason then Backstop.request ~reason

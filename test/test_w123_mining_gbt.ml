@@ -231,9 +231,15 @@ let test_g9d_eviction_uses_raw_chunk_fee_rate () =
                           (raw fee)"
     true (contains_substring src
             "let chunks = get_all_chunks mp in");
+  (* W144 (2026-07-01): evict_by_chunks was rewritten to build the chunk list
+     once per trim and evict worst-first from it (GC-churn fix), so the
+     binding is now [chunk] inside the batch loop rather than [worst_chunk].
+     The documented BUG-1 property is unchanged: the rolling-min-fee bump
+     still reads the RAW chunk_fee_rate (not the modified fee). *)
   Alcotest.(check bool)
-    "BUG-1.9d (pre-fix): rolling-min-fee bump reads worst_chunk.chunk_fee_rate"
-    true (contains_substring src "worst_chunk.chunk_fee_rate")
+    "BUG-1.9d (pre-fix): rolling-min-fee bump reads chunk.chunk_fee_rate"
+    true (contains_substring src
+            "let evicted_fee_rate_kvb = chunk.chunk_fee_rate *. 4.0 *. 1000.0 in")
 
 (* 9e — informational: template_to_json per-tx `fee` field IS raw fee,
    which matches Core's behaviour (Core also emits entry.GetFee() not

@@ -2190,7 +2190,12 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         let ready = Peer_manager.ready_peer_count peer_manager in
         if attempts mod 5 = 0 then
           Logs.info (fun m -> m "Waiting for peers: %d total, %d ready (attempt %d/60)" all_peers ready attempts);
-        match get_peers () with
+        (* Only sync headers from a peer we are NOT already draining with a
+           [peer_message_loop].  Inbound peers get a loop at accept time, so
+           reading their socket directly here would race the loop; skipping
+           them steers header sync onto an outbound peer (Core-parity: initial
+           header sync is driven from outbound peers). *)
+        match List.filter (fun p -> not p.Peer.msg_loop_started) (get_peers ()) with
         | [] -> wait_for_peer (attempts + 1)
         | peer :: _ -> Lwt.return_some peer
       end

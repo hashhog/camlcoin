@@ -2585,6 +2585,17 @@ let peer_message_loop (pm : t) (peer : Peer.peer) : unit Lwt.t =
   in
   loop ()
 
+(* Start [peer_message_loop] for [peer] exactly once.  Idempotent via
+   [peer.msg_loop_started]: inbound peers get their loop at accept time (so
+   their pings are ponged from handshake onward, matching Core which services
+   every peer regardless of IBD/header-sync state), and [enable_message_loops]
+   later skips any peer already looping instead of spawning a second reader. *)
+let ensure_msg_loop (pm : t) (peer : Peer.peer) : unit =
+  if not peer.Peer.msg_loop_started then begin
+    peer.Peer.msg_loop_started <- true;
+    Lwt.async (fun () -> peer_message_loop pm peer)
+  end
+
 (* Check for stale chain tip and take corrective action *)
 let check_stale_tip (pm : t) : unit Lwt.t =
   if pm.header_sync_active then Lwt.return_unit
@@ -2904,10 +2915,15 @@ let accept_inbound (pm : t) (client_fd : Lwt_unix.file_descr)
       Hashtbl.replace pm.stale_state peer.Peer.id (create_stale_state ());
       (* Start inventory trickling for this peer *)
       Lwt.async (fun () -> Peer.start_trickling peer);
-      (* Start the message loop via the callback.  Before
-         enable_message_loops this is a no-op, so sync_headers can
-         read from the socket without a concurrent reader. *)
-      pm.start_msg_loop peer;
+      (* Inbound peers get their message loop immediately — Core pongs and
+         otherwise services every peer from handshake onward, independent of
+         our own header-sync/IBD state.  Deferring inbound peers to
+         [enable_message_loops] (post header sync) left an idle inbound peer
+         with no reader, so its pings went unanswered until the remote's
+         ping-timeout dropped us.  The header-sync source selector skips
+         looped peers ([Peer.msg_loop_started]) so [sync_headers] never
+         double-reads the socket this loop now drains. *)
+      ensure_msg_loop pm peer;
       Lwt.return_unit
     ) (fun exn ->
       (* Handshake failed — log the reason and clean up *)
@@ -3026,13 +3042,11 @@ let start (pm : t) : unit Lwt.t =
    MUST be called AFTER header sync finishes, because sync_headers reads
    directly from the peer socket and would race with peer_message_loop. *)
 let enable_message_loops (pm : t) : unit =
-  (* Start message loops for all currently connected peers *)
-  List.iter (fun peer ->
-    Lwt.async (fun () -> peer_message_loop pm peer)
-  ) pm.peers;
+  (* Start message loops for all currently connected peers (idempotent: an
+     inbound peer already looping since accept is skipped, not double-read). *)
+  List.iter (fun peer -> ensure_msg_loop pm peer) pm.peers;
   (* Install callback so future peers also get message loops *)
-  pm.start_msg_loop <- (fun peer ->
-    Lwt.async (fun () -> peer_message_loop pm peer))
+  pm.start_msg_loop <- (fun peer -> ensure_msg_loop pm peer)
 
 (* Stop the peer manager *)
 let stop (pm : t) : unit Lwt.t =

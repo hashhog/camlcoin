@@ -4058,12 +4058,17 @@ let tx_index_erase_for_block (db : Storage.ChainDB.t)
    the overlay, [accept_block] would read disk-only state (pre-reorg
    UTXOs) and reject the new chain's first spend. *)
 
-(* Cap multi-block reorg depth.  Rolling back more than this many blocks
-   is an impl-specific memory-safety bound: the entire reorg is staged in
-   one in-memory batch, so an unbounded depth would exhaust RAM.  Bitcoin
-   Core has NO equivalent cap — Core follows most-work with no reorg-depth
-   limit.  288 = MIN_BLOCKS_TO_KEEP aligns with Core's pruned-node undo
-   retention floor, so a validating peer always has undo data this deep. *)
+(* Reorg-depth cap for PRUNED nodes only.  Bitcoin Core has NO reorg-depth
+   limit — [ActivateBestChainStep] disconnects to the fork point unbounded and
+   an archive node follows the most-work valid chain to any depth.  This cap is
+   therefore GATED on pruning in [reorganize]: it fires only when
+   [prune_target > 0], where a reorg deeper than the retained undo window would
+   reference deleted undo data.  288 = MIN_BLOCKS_TO_KEEP is the conservative
+   FLOOR of the pruned keep window (max(target_blocks, 288); see
+   [prune_old_blocks]), so any reorg the cap permits is guaranteed to have its
+   undo on disk.  On the default archive config ([prune_target = 0]) the cap is
+   never consulted — undo data is always present and the node stays in
+   consensus with Core at any reorg depth. *)
 let max_reorg_depth = 288
 
 (* O(1) overlay used by the reorg connect-side [base_lookup] and by the
@@ -5086,14 +5091,32 @@ let reorganize ?(allow_equal_work = false) (ibd : ibd_state)
     match find_fork_point state current_tip new_tip with
     | Error e -> Error e
     | Ok fork_point ->
-      (* Cap reorg depth.  Counted from the OLD tip back to the fork
-         point — that's how many blocks we'd need to disconnect. *)
+      (* Reorg-depth cap — Core-parity gating (Class-A fix).
+         Bitcoin Core's [ActivateBestChainStep] disconnects to the fork
+         point with NO depth limit: an ARCHIVE node retains ALL undo data
+         and MUST follow the most-work valid chain to ANY depth.
+         MIN_BLOCKS_TO_KEEP=288 is a PRUNING retention floor, not a reorg
+         cap.  Enforcing the cap unconditionally made camlcoin gratuitously
+         refuse a >288-deep higher-work chain and strand itself on the
+         lower-work minority branch — a consensus SPLIT.  The cap therefore
+         applies ONLY when pruning is enabled ([prune_target > 0]), where a
+         too-deep reorg could reference undo data that has been deleted; the
+         288 value is the conservative floor of the pruned keep window
+         (max(target_blocks, 288) >= 288, see [prune_old_blocks]), so any
+         reorg the cap permits is guaranteed to have its undo on disk.  On
+         the default archive config ([prune_target = 0]) the undo data is
+         always present, so the cap does not fire and the reorg proceeds to
+         the normal connect machinery below.
+         Counted from the OLD tip back to the fork point (disconnect) and
+         from the new tip back (connect). *)
       let disconnect_depth = current_tip.height - fork_point.height in
       let connect_depth = new_tip.height - fork_point.height in
-      if disconnect_depth > max_reorg_depth
-         || connect_depth > max_reorg_depth then
+      let pruning_enabled = state.prune_target > 0 in
+      if pruning_enabled
+         && (disconnect_depth > max_reorg_depth
+             || connect_depth > max_reorg_depth) then
         Error (Printf.sprintf
-          "Reorg depth %d exceeds MAX_REORG_DEPTH=%d (disconnect=%d, connect=%d)"
+          "Reorg depth %d exceeds MAX_REORG_DEPTH=%d (disconnect=%d, connect=%d, pruned node)"
           (max disconnect_depth connect_depth) max_reorg_depth
           disconnect_depth connect_depth)
       else begin

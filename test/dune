@@ -4,3 +4,13 @@
             tls tls-lwt x509 threads.posix)
  (deps (source_tree ../resources))
  (preprocess (pps lwt_ppx)))
+
+; Standalone LIVE proof for the Core-parity reorg-depth-cap gating
+; (Class-A fix): drives a real >288-deep reorg through Mining.submit_block ->
+; Sync.reorganize. PRE-fix the deep reorg is refused (exit 1); POST-fix the
+; archive node's tip flips to the heavier branch. Not part of the default
+; test run (it builds two ~290-block chains); invoke explicitly:
+;   dune exec test/test_deep_reorg_over_cap.exe
+(executable
+ (name test_deep_reorg_over_cap)
+ (libraries camlcoin))

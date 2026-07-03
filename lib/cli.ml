@@ -25,6 +25,16 @@ type config = {
        DNS-seed resolution. Note: a non-empty [connect] list also implies
        no DNS seeding (Core -connect semantics), handled in the peer
        manager regardless of this flag. *)
+  no_assume_valid : bool;
+    (* Mirrors Bitcoin Core -assumevalid=0 (--noassumevalid). When [true],
+       the built-in assume-valid block for the active network is disabled by
+       setting [network.assume_valid_hash = None] before the chain state is
+       created. With assume-valid disabled, [Sync.is_assume_valid] returns
+       [false] for EVERY block, so all scripts — including pre-segwit
+       (481824) and pre-taproot (709632) history below the compiled-in
+       assumevalid height (mainnet 938343) — are fully verified. Default
+       [false] keeps the compiled-in assumevalid unchanged, so this flag is
+       INERT unless explicitly passed. *)
   debug : bool;
   wallet_enabled : bool;
   prune : int;
@@ -183,6 +193,7 @@ let default_config : config = {
   max_inbound = 117;
   connect = [];
   dns_seed = true;  (* Core DEFAULT_DNSSEED *)
+  no_assume_valid = false;  (* Core -assumevalid enabled by default *)
   debug = false;
   wallet_enabled = true;
   prune = 0;
@@ -377,6 +388,20 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     | `Mainnet -> Consensus.mainnet
     | `Testnet -> Consensus.testnet4
     | `Regtest -> Consensus.regtest
+  in
+  (* --noassumevalid (Bitcoin Core -assumevalid=0): disable the built-in
+     assume-valid block by nulling [assume_valid_hash]. With it set to
+     [None], [Sync.is_assume_valid] returns [false] for every block, so all
+     scripts (including pre-segwit/pre-taproot history) are fully verified.
+     INERT by default: when the flag is off the compiled-in assumevalid is
+     kept unchanged. *)
+  let network =
+    if config.no_assume_valid then begin
+      Logs.info (fun m ->
+        m "assumevalid disabled (--noassumevalid): full script \
+           verification of every block");
+      { network with Consensus.assume_valid_hash = None }
+    end else network
   in
 
   (* Initialize or restore chain state *)

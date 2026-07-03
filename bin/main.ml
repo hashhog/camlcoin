@@ -71,6 +71,14 @@ let no_dnsseed_arg =
              while leaving addrman / fallback outbound dialing on." in
   Arg.(value & flag & info ["nodnsseed"] ~doc)
 
+let no_assume_valid_arg =
+  let doc = "Disable the built-in assume-valid block (Bitcoin Core \
+             -assumevalid=0). Forces full script verification of EVERY \
+             block, including pre-segwit (481824) / pre-taproot (709632) \
+             history below the compiled-in assumevalid height (mainnet \
+             938343). Default: off (assumevalid enabled)." in
+  Arg.(value & flag & info ["noassumevalid"] ~doc)
+
 let debug_arg =
   let doc = "Enable debug logging." in
   Arg.(value & flag & info ["debug"] ~doc)
@@ -446,7 +454,7 @@ let rest_tls_key_arg =
    ============================================================================ *)
 
 let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
-    p2p_port max_outbound max_inbound connect no_dnsseed debug no_wallet prune benchmark
+    p2p_port max_outbound max_inbound connect no_dnsseed no_assume_valid debug no_wallet prune benchmark
     import_blocks import_utxo metrics_port peer_bloom_filters
     migrate_logstorage daemon_mode pid_path conf_path debug_cats
     logfile printtoconsole ready_fd zmq_pub reindex
@@ -730,6 +738,15 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
         | Some b -> b
         | None -> true
     in
+    (* --noassumevalid on the CLI, or assumevalid=0 in the conf file
+       (Bitcoin Core -assumevalid=0), disables the built-in assume-valid
+       block. Default: assumevalid enabled (kept). *)
+    let eff_no_assume_valid =
+      if no_assume_valid then true
+      else match Camlcoin.Runtime_config.get_bool conf_opts "assumevalid" with
+        | Some b -> not b
+        | None -> false
+    in
     let config : Camlcoin.Cli.config = {
       network;
       data_dir = resolved_datadir;
@@ -748,6 +765,7 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       max_inbound = eff_max_inbound;
       connect = (if connect <> [] then connect else conf_connect);
       dns_seed = eff_dns_seed;
+      no_assume_valid = eff_no_assume_valid;
       debug;
       wallet_enabled = not no_wallet;
       prune = eff_prune;
@@ -999,6 +1017,7 @@ let cmd =
     $ max_inbound_arg
     $ connect_arg
     $ no_dnsseed_arg
+    $ no_assume_valid_arg
     $ debug_arg
     $ no_wallet_arg
     $ prune_arg

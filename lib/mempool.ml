@@ -3461,40 +3461,19 @@ let replace_by_fee_with_replaced ?(dry_run=false) ?(skip_verify_scripts=false)
                   additional_fees relay_fee_for_replacement)
 
               else begin
-                (* Rule #2 (Gate 4, HasNoNewUnconfirmed / BIP125 Rule 2):
-                   The replacement may only include an unconfirmed input if that
-                   exact outpoint (txid:vout) was already spent by one of the
-                   directly conflicting transactions.
-                   Rationale: prevents the replacement from pulling in new
-                   unconfirmed parents that were never part of the original
-                   conflict cluster.
-                   BIP125: "The replacement transaction may only include an
-                   unconfirmed input if that input was included in one of the
-                   original transactions." *)
-                let conflict_outpoints : (string * int32, unit) Hashtbl.t =
-                  Hashtbl.create 16 in
-                List.iter (fun ce ->
-                  List.iter (fun inp ->
-                    let key = (Cstruct.to_string inp.Types.previous_output.txid,
-                               inp.Types.previous_output.vout) in
-                    Hashtbl.replace conflict_outpoints key ()
-                  ) ce.tx.inputs
-                ) conflicts;
-
-                let new_unconfirmed = List.exists (fun inp ->
-                  let parent_key = Cstruct.to_string inp.Types.previous_output.txid in
-                  let outpoint_key = (parent_key, inp.Types.previous_output.vout) in
-                  (* Only flag as "new unconfirmed" if:
-                     1. The parent is in the mempool (so it's an unconfirmed input), AND
-                     2. This exact outpoint was NOT already spent by a conflicting tx *)
-                  Hashtbl.mem mp.entries parent_key &&
-                  not (Hashtbl.mem conflict_outpoints outpoint_key)
-                ) tx.inputs in
-
-                if new_unconfirmed then
-                  Error "replacement tx introduces new unconfirmed inputs not in original transactions"
-
-                else begin
+                (* Rule #2 (HasNoNewUnconfirmed / BIP125 Rule 2) is intentionally
+                   NOT enforced. Core's cluster-mempool RBF removed this gate:
+                   src/policy/rbf.cpp defines no HasNoNewUnconfirmed, and
+                   validation.cpp PreChecks runs only GetEntriesForConflicts
+                   (Rule 5), PaysForRBF (Rules 3/4) and ImprovesFeerateDiagram —
+                   there is no "new unconfirmed inputs" check anywhere in the RBF
+                   flow. Enforcing it made camlcoin STRICTER than the reference,
+                   rejecting valid replacements Core accepts (e.g. a fee-bump
+                   that pulls in an extra unconfirmed input while still improving
+                   the feerate diagram). Policy-only: this RBF path is reached
+                   only from mempool accept / testmempoolaccept / package relay,
+                   never from block/consensus validation. *)
+                begin
                   ignore new_feerate; (* suppress unused warning after removing non-Core feerate check *)
                   (* ImprovesFeerateDiagram (W106 BUG-10 fix):
                      Core rbf.cpp ImprovesFeerateDiagram requires that the post-

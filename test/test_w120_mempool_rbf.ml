@@ -313,14 +313,16 @@ let test_g1_rule1_signals_rbf_boundary () =
   Alcotest.(check bool) "seq=0xFFFFFFFF does NOT signal RBF" false
     (Mempool.signals_rbf (mk_tx_with_sequence ~seq:(Int32.to_int 0xFFFFFFFFl)))
 
-(* G2.  Rule 2 (HasNoNewUnconfirmed): the replacement may not pull in new
-   unconfirmed inputs that weren't present in the original conflict cluster.
-   Asserted by code inspection of mempool.ml:2842-2873. *)
-let test_g2_rule2_no_new_unconfirmed_present () =
-  Alcotest.(check bool) "rule 2: 'new_unconfirmed' present" true
-    (file_has_marker "lib/mempool.ml" "new_unconfirmed");
-  Alcotest.(check bool) "rule 2: 'conflict_outpoints' present" true
-    (file_has_marker "lib/mempool.ml" "conflict_outpoints")
+(* G2.  Rule 2 (HasNoNewUnconfirmed) is intentionally NOT enforced — it was
+   removed in Core's cluster-mempool RBF (glass-box 2026-07-01 fix). rbf.cpp
+   defines no HasNoNewUnconfirmed and validation.cpp PreChecks runs only
+   GetEntriesForConflicts / PaysForRBF / ImprovesFeerateDiagram. Enforcing it
+   made camlcoin stricter than the reference. Assert the gate is gone. *)
+let test_g2_rule2_removed_for_cluster_mempool_parity () =
+  Alcotest.(check bool) "rule 2: 'new_unconfirmed' gate removed" false
+    (file_has_marker "lib/mempool.ml" "let new_unconfirmed");
+  Alcotest.(check bool) "rule 2: 'introduces new unconfirmed' reject removed" false
+    (file_has_marker "lib/mempool.ml" "introduces new unconfirmed inputs")
 
 (* G3.  Rule 3 (PaysForRBF: replacement_modified_fees >= original_modified_fees).
    The comparison is `if new_modified_fee < total_conflict_fee` then reject.
@@ -1273,7 +1275,7 @@ let test_g30_zmq_no_replaced_event () =
 
 let bip125_rule_tests = [
   Alcotest.test_case "G1  rule 1 — signals_rbf boundary"  `Quick test_g1_rule1_signals_rbf_boundary;
-  Alcotest.test_case "G2  rule 2 — HasNoNewUnconfirmed present" `Quick test_g2_rule2_no_new_unconfirmed_present;
+  Alcotest.test_case "G2  rule 2 — HasNoNewUnconfirmed removed (cluster-mempool parity)" `Quick test_g2_rule2_removed_for_cluster_mempool_parity;
   Alcotest.test_case "G3  rule 3 — PaysForRBF '<' not '<='"  `Quick test_g3_rule3_pays_for_rbf_present;
   Alcotest.test_case "G4  rule 4 — incremental relay fee"   `Quick test_g4_rule4_incremental_fee_present;
   Alcotest.test_case "G5  rule 5 — MAX_REPLACEMENT_CANDIDATES = 100" `Quick test_g5_rule5_100_cap_present;

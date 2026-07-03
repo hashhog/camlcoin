@@ -3108,25 +3108,43 @@ module Validation_worker = struct
     put_req t.req Shutdown;
     Domain.join t.domain
 
-  (* W143: bring up / tear down the persistent script-check worker pool.
-     These are deliberately SEPARATE from create/shutdown so the pool is bound
-     to the IBD validation loop ONLY (start_ibd, below) and is NOT created for
-     the post-IBD / at-tip worker (cli.ml ensure_post_ibd_worker).  This keeps
-     the FullySynced steady state free of idle script Domains — camlcoin's
-     documented at-tip Gc.compact thrash lives on the loopback-pin, and we must
-     not carry 15 idle Domains into it.  Idempotent: safe to call once per IBD
-     run; the at-tip path simply never calls them, so verify_scripts_* falls
-     back to its serial in-thread path (script_check_pool = None). *)
+  (* W143 / #8: bring up / tear down the persistent script-check worker pool.
+     During IBD the pool runs the FULL width (create_pool () = up to 15 Domains,
+     Core MAX_SCRIPTCHECK_THREADS).  At tip (#8 block-connect offload) we keep a
+     SMALL bounded pool alive (tip_script_pool_workers) so per-block script
+     verification parallelises on the post-IBD block-connect Domain instead of
+     running serial (the residual ~3-4s block-connect stall).  A small cap keeps
+     the FullySynced steady state to a handful of PARKED worker Domains (blocked
+     on a condvar, in a blocking section ⇒ they neither spin nor hold up STW GC),
+     unlike the old per-tx Domain.spawn churn that caused the documented at-tip
+     Gc.compact thrash. *)
+  let tip_script_pool_workers = 4
+
+  (* Ensure a small at-tip block-connect pool exists.  Idempotent: never
+     replaces an already-active pool (e.g. the full IBD pool during a re-IBD, or
+     an existing tip pool). *)
+  let ensure_tip_script_pool () : unit =
+    match !Validation.script_check_pool with
+    | Some _ -> ()
+    | None ->
+      Validation.script_check_pool :=
+        Some (Validation.create_pool ~max_workers:tip_script_pool_workers ())
+
   let start_script_pool () : unit =
     match !Validation.script_check_pool with
     | Some _ -> ()  (* already active — never double-create *)
     | None -> Validation.script_check_pool := Some (Validation.create_pool ())
 
-  let stop_script_pool () : unit =
+  (* [leave_tip_pool]: after tearing down the (IBD-width) pool, install the
+     small at-tip pool so post-IBD block-connect stays parallel.  Called with
+     ~leave_tip_pool:true at IBD completion; false (default) on shutdown, where
+     we want no lingering Domains. *)
+  let stop_script_pool ?(leave_tip_pool = false) () : unit =
     (match !Validation.script_check_pool with
      | Some p -> Validation.shutdown_pool p
      | None -> ());
-    Validation.script_check_pool := None
+    Validation.script_check_pool := None;
+    if leave_tip_pool then ensure_tip_script_pool ()
 end
 
 (* Process downloaded blocks in height order.
@@ -5616,9 +5634,12 @@ let run_ibd ?(shutdown_flag : bool ref option)
       ibd.chain.sync_state <- FullySynced;
       (* Shut down the persistent validation worker cleanly. *)
       (try Validation_worker.shutdown worker with _ -> ());
-      (* W143: tear down the IBD-scoped script-check pool at IBD completion so
-         the FullySynced steady state carries no idle script Domains. *)
-      (try Validation_worker.stop_script_pool () with _ -> ());
+      (* W143 / #8: tear down the FULL IBD-width script-check pool and install
+         the SMALL at-tip pool, so post-IBD block-connect script verification
+         stays parallel (removes the residual ~3-4s serial block-connect stall)
+         while keeping the FullySynced steady state to only a handful of parked
+         worker Domains. *)
+      (try Validation_worker.stop_script_pool ~leave_tip_pool:true () with _ -> ());
       Lwt.return_unit
     end else begin
       (* Periodic orphan expiry (cheap, runs ~once/loop) *)

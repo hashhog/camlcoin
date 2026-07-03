@@ -1509,6 +1509,16 @@ type script_check_pool = {
   pool_mutex : Mutex.t;
   work_cond : Condition.t;   (* workers wait here for a new generation *)
   done_cond : Condition.t;   (* submitter waits here for pending = 0 *)
+  (* #8 at-tip block-connect offload: the pool is now live at tip (small,
+     bounded) as well as during IBD.  During IBD the sole submitter is the IBD
+     validation Domain; at tip the sole submitter is the post-IBD block-connect
+     Domain (the mempool path stays serial — verify_scripts_parallel passes
+     ~use_pool:false).  submit_mutex serialises whole batches so that ANY future
+     concurrent submitter (e.g. a reorg path) cannot clobber the single shared
+     slices/results/params/generation state mid-batch.  Held across the entire
+     pool_submit (including the done_cond wait); uncontended in the
+     single-submitter case ⇒ zero behaviour change for the proven IBD path. *)
+  submit_mutex : Mutex.t;
   nworkers : int;            (* 0 ⇒ serial-in-thread submit (no Domains) *)
   (* Per-worker slices for the current batch; index = worker id. *)
   mutable slices : (int * Types.tx_in * utxo) list array;
@@ -1598,6 +1608,23 @@ let pool_submit (pool : script_check_pool)
     (* No Domains: run the whole batch serially in the calling thread. *)
     verify_input_slice ~tx ~flags ~prevouts ~wtxid ~cache tasks
   else begin
+    (* Serialise the whole batch: only ONE submitter may drive the shared
+       slices/results/params/generation state at a time.  Held across the
+       done_cond wait below (which releases only pool_mutex, not submit_mutex),
+       so a second submitter blocks here until this batch fully completes. *)
+    Mutex.lock pool.submit_mutex;
+    Fun.protect
+      ~finally:(fun () ->
+        (* G18: guarantee params is cleared even if the batch body raised, so a
+           raised submit cannot pin the batch's tx.  Done HERE (still holding
+           submit_mutex) so it is serialised against other submitters and can
+           never nil a concurrent batch's params.  On the normal path params was
+           already set to None below (redundant, harmless). *)
+        Mutex.lock pool.pool_mutex;
+        pool.params <- None;
+        Mutex.unlock pool.pool_mutex;
+        Mutex.unlock pool.submit_mutex)
+      (fun () ->
     let params = {
       bp_tx = tx; bp_flags = flags; bp_prevouts = prevouts;
       bp_wtxid = wtxid; bp_cache = cache;
@@ -1626,19 +1653,23 @@ let pool_submit (pool : script_check_pool)
         | Error _ as e -> e
         | Ok () -> scan (i + 1)
     in
-    scan 0
+    scan 0)
   end
 
-(* Create the worker pool.  nworkers = min(recommended-1, 15) clamped at >= 0,
-   mirroring Core MAX_SCRIPTCHECK_THREADS (validation.h:90).  nworkers = 0
-   yields a pool whose submit runs serially in-thread (no Domains) — for tiny
-   machines / regtest. *)
-let create_pool () : script_check_pool =
-  let nworkers = max 0 (min (Domain.recommended_domain_count () - 1) 15) in
+(* Create the worker pool.  nworkers = min(recommended-1, max_workers) clamped
+   at >= 0, mirroring Core MAX_SCRIPTCHECK_THREADS (validation.h:90).
+   [max_workers] defaults to 15 (the IBD full pool); the #8 at-tip block-connect
+   pool passes a small cap (4) so the FullySynced steady state carries only a
+   handful of parked worker Domains (see Validation_worker.ensure_tip_script_pool
+   in sync.ml).  nworkers = 0 yields a pool whose submit runs serially in-thread
+   (no Domains) — for tiny machines / regtest. *)
+let create_pool ?(max_workers = 15) () : script_check_pool =
+  let nworkers = max 0 (min (Domain.recommended_domain_count () - 1) max_workers) in
   let pool = {
     pool_mutex = Mutex.create ();
     work_cond = Condition.create ();
     done_cond = Condition.create ();
+    submit_mutex = Mutex.create ();
     nworkers;
     slices = [||];
     results = [||];
@@ -1684,9 +1715,11 @@ let script_check_pool : script_check_pool option ref = ref None
    Sig-cache reads/inserts are serialised via sig_cache_mutex to prevent
    data races on the underlying Hashtbl. *)
 let verify_scripts_parallel_domain
+    ?(use_pool = true)
     ~(tx : Types.transaction) ~(flags : int)
     ~(prevouts : (int64 * Cstruct.t) list)
     ~(utxos : utxo option array)
+    ()
     : (unit, tx_validation_error) result =
   (* Build task list, propagating any missing-input errors immediately. *)
   let tasks_or_error =
@@ -1716,18 +1749,18 @@ let verify_scripts_parallel_domain
          hand-off costs more than the saved secp256k1 work.  Also fall back to
          serial when no pool is active (at-tip / not-IBD / nworkers=0). *)
       let result =
-        match !script_check_pool with
+        match (if use_pool then !script_check_pool else None) with
         | Some pool when ntasks >= min_inputs_for_parallel && pool.nworkers > 0 ->
-          (* Fun.protect: an exception escaping the submit must not leave the
-             pool half-submitted (fixes audit G18).  The pool is internally
-             exception-safe — workers catch their own exceptions — so the
-             finaliser only has to guarantee params is cleared. *)
-          Fun.protect
-            ~finally:(fun () ->
-              Mutex.lock pool.pool_mutex;
-              pool.params <- None;
-              Mutex.unlock pool.pool_mutex)
-            (fun () -> pool_submit pool tx flags prevouts wtxid cache tasks)
+          (* G18 exception-safety (clearing pool.params so a raised submit cannot
+             pin the batch's tx) lives INSIDE pool_submit's own submit_mutex-
+             protected finaliser.  It MUST NOT be done here: an outer clear runs
+             AFTER pool_submit has released submit_mutex, so with a concurrent
+             submitter it would nil the params of the NEXT batch mid-flight — a
+             worker of that batch then reads params=None ⇒ assert false ⇒ worker
+             Domain dies ⇒ permanent deadlock (pending never reaches 0).  This
+             was latent under the single IBD submitter; the #8 at-tip pool with a
+             concurrent path (or back-to-back tip submits) exposes it. *)
+          pool_submit pool tx flags prevouts wtxid cache tasks
         | _ ->
           (* Serial fallback — no Domains spawned. *)
           verify_input_slice ~tx ~flags ~prevouts ~wtxid ~cache tasks
@@ -1800,9 +1833,13 @@ module Mempool_verify_pool = struct
     mutable workers : unit Domain.t array;
   }
 
-  (* Worker loop: pop a job, verify it wholly on THIS Domain (script_check_pool
-     is None at tip, so verify_scripts_parallel_domain runs its serial in-thread
-     fold here — off the Lwt main thread), publish the result. *)
+  (* Worker loop: pop a job, verify it wholly on THIS Domain (off the Lwt main
+     thread), publish the result.  ~use_pool:false: THIS worker Domain IS the
+     mempool parallelism (one whole tx per worker) — it must verify its tx's
+     inputs serially in-thread and must NOT re-dispatch into the #8 at-tip
+     block-connect [script_check_pool] (which is now live at tip).  That keeps
+     the mempool path fully decoupled from the block pool and leaves the block
+     pool with a single submitter (the post-IBD block-connect Domain). *)
   let worker_loop (t : t) : unit =
     let rec loop () =
       Mutex.lock t.q_mutex;
@@ -1817,8 +1854,9 @@ module Mempool_verify_pool = struct
         let r =
           try
             verify_scripts_parallel_domain
+              ~use_pool:false
               ~tx:job.j_tx ~flags:job.j_flags
-              ~prevouts:job.j_prevouts ~utxos:job.j_utxos
+              ~prevouts:job.j_prevouts ~utxos:job.j_utxos ()
           with e ->
             Error (TxScriptFailed (-1, Printexc.to_string e))
         in
@@ -1916,7 +1954,12 @@ let verify_scripts_parallel ~(tx : Types.transaction) ~(flags : int)
     : (unit, tx_validation_error) result Lwt.t =
   match get_mempool_verify_pool () with
   | None ->
-    Lwt.return (verify_scripts_parallel_domain ~tx ~flags ~prevouts ~utxos)
+    (* Safe-revert / workers=0: inline serial on the Lwt main thread, exactly as
+       before.  ~use_pool:false so it does not submit into the #8 at-tip
+       block-connect [script_check_pool] (which would block the Lwt loop on the
+       pool's done_cond) — preserving the documented inline-revert behaviour. *)
+    Lwt.return
+      (verify_scripts_parallel_domain ~use_pool:false ~tx ~flags ~prevouts ~utxos ())
   | Some pool ->
     Lwt_preemptive.detach
       (fun () ->
@@ -2536,7 +2579,7 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
                    UTXO apply must have completed before entering this section. *)
                 let script_result =
                   verify_scripts_parallel_domain
-                    ~tx ~flags ~prevouts ~utxos:resolved_utxos
+                    ~tx ~flags ~prevouts ~utxos:resolved_utxos ()
                 in
 
                 match script_result with

@@ -1594,9 +1594,19 @@ let test_rbf_gate7_pays_for_rbf_bandwidth () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
-(* Gate 4: HasNoNewUnconfirmed — replacement must not introduce new unconfirmed inputs
-   that are not outputs of the conflicting txs.
-   Core: rbf.cpp — inputs of replacement whose parent is in mempool AND not in conflict set. *)
+(* Rule 2 (HasNoNewUnconfirmed) was REMOVED for cluster-mempool parity
+   (glass-box 2026-07-01): Core's cluster-mempool rbf.cpp has no such gate, so a
+   replacement pulling in a new unconfirmed input must no longer be Rule-2
+   rejected. It may still be accepted or rejected by a fee/diagram gate, but
+   never with the "new unconfirmed inputs" reason. *)
+let rbf_str_contains (s : string) (sub : string) : bool =
+  let ls = String.length s and lsub = String.length sub in
+  let rec loop i =
+    if i + lsub > ls then false
+    else if String.sub s i lsub = sub then true
+    else loop (i + 1)
+  in loop 0
+
 let test_rbf_gate4_no_new_unconfirmed () =
   let (mp, _utxo, db, txid1, txid2, _) = create_test_mempool () in
   (* Add an unrelated confirmed-only tx to the mempool as a parent *)
@@ -1615,13 +1625,17 @@ let test_rbf_gate4_no_new_unconfirmed () =
      make_test_input up_entry.txid 0l]  (* NEW unconfirmed input *)
     [make_test_output 2_950_000L] in
   let result = Mempool.replace_by_fee mp replacement in
-  Alcotest.(check bool) "new unconfirmed input → rejected" true (Result.is_error result);
-  (* A replacement that only spends confirmed inputs is fine *)
-  let replacement_clean = make_regular_tx
-    [make_test_input txid1 0l]  (* confirmed UTXO *)
-    [make_test_output 985_000L] in  (* 15k fee > 10k + relay *)
-  let result_clean = Mempool.replace_by_fee mp replacement_clean in
-  Alcotest.(check bool) "only confirmed inputs → accepted" true (Result.is_ok result_clean);
+  (* Verify-first: pre-fix this was rejected with the Rule-2 "new unconfirmed
+     inputs" reason; post-fix Rule 2 is gone, so the replacement (which pays a
+     higher fee and improves the diagram) is accepted — matching cluster-mempool
+     Core. Assert it is NOT rejected by the removed Rule-2 gate. *)
+  (match result with
+   | Ok _ -> ()  (* accepted — Rule 2 no longer blocks it *)
+   | Error msg ->
+     Alcotest.(check bool) "new unconfirmed input NOT rejected by removed Rule-2 gate"
+       false (rbf_str_contains msg "new unconfirmed inputs"));
+  Alcotest.(check bool) "new-unconfirmed-input replacement now accepted (Rule 2 removed)"
+    true (Result.is_ok result);
   Storage.ChainDB.close db;
   cleanup_test_db ()
 

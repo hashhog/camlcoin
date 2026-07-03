@@ -126,7 +126,7 @@ let flags = Script.script_verify_p2sh
 
 (* Run one case under the current script_check_pool setting. *)
 let run_case (tx, utxos) =
-  Validation.verify_scripts_parallel_domain ~tx ~flags ~prevouts:[] ~utxos
+  Validation.verify_scripts_parallel_domain ~tx ~flags ~prevouts:[] ~utxos ()
 
 (* Normalise a result to (is_ok, error_index option) for comparison.  We do NOT
    compare the error *message* — Core's failure-reason among several is not
@@ -232,6 +232,61 @@ let test_first_error_is_deterministic () =
   Alcotest.(check (option int)) "first error index = 9 (pool)"   (Some 9) (snd parallel);
   Alcotest.(check string) "same decision" (pp_norm serial) (pp_norm parallel)
 
+(* ----------------------------------------------------------------------------
+   Test 4 (#8 at-tip block-connect pool) — the SMALL bounded pool used at tip
+   (create_pool ~max_workers:4) gives IDENTICAL results to serial over the full
+   corpus.  This is the exact pool configuration Validation_worker.
+   ensure_tip_script_pool installs post-IBD.
+   ---------------------------------------------------------------------------- *)
+let test_tip_pool4_equals_serial () =
+  Sig_cache.init_global ~max_entries:100_000 ();
+  Validation.script_check_pool := None;
+  let serial = run_corpus () in
+  let pool = Validation.create_pool ~max_workers:4 () in
+  Validation.script_check_pool := Some pool;
+  let parallel = run_corpus () in
+  Validation.shutdown_pool pool;
+  Validation.script_check_pool := None;
+  List.iter2 (fun (name, s) (_, p) ->
+    Alcotest.(check string)
+      (Printf.sprintf "%s: pool(4) result == serial result" name)
+      (pp_norm s) (pp_norm p)
+  ) serial parallel
+
+(* ----------------------------------------------------------------------------
+   Test 5 (#8 submit_mutex) — CONCURRENT submitters to a single shared pool.
+   At tip the block-connect Domain is the sole submitter, but submit_mutex must
+   make ANY concurrent submission safe (defence-in-depth for reorg / future
+   paths).  Two Domains hammer the same 4-worker pool with the whole corpus,
+   many iterations; every result MUST equal the serial baseline.  A broken
+   submit_mutex would let one batch clobber another's shared slices/results/
+   generation mid-flight, producing wrong (garbled) decisions here.
+   ---------------------------------------------------------------------------- *)
+let test_concurrent_submitters_safe () =
+  Sig_cache.init_global ~max_entries:100_000 ();
+  (* Serial baseline (distinct wtxid + cache clear per case, via run_corpus). *)
+  Validation.script_check_pool := None;
+  let baseline = Array.of_list (run_corpus ()) in
+  let pool = Validation.create_pool ~max_workers:4 () in
+  Validation.script_check_pool := Some pool;
+  let indexed = List.mapi (fun uid (name, kinds) -> (uid, name, kinds)) corpus in
+  let mismatches = Atomic.make 0 in
+  let submitter () =
+    for _ = 1 to 40 do
+      List.iter (fun (uid, _name, kinds) ->
+        let got = normalise (run_case (make_case ~uid kinds)) in
+        let (_, expected) = baseline.(uid) in
+        if pp_norm got <> pp_norm expected then ignore (Atomic.fetch_and_add mismatches 1)
+      ) indexed
+    done
+  in
+  let d1 = Domain.spawn submitter in
+  let d2 = Domain.spawn submitter in
+  Domain.join d1; Domain.join d2;
+  Validation.shutdown_pool pool;
+  Validation.script_check_pool := None;
+  Alcotest.(check int) "zero concurrent-submitter mismatches" 0 (Atomic.get mismatches)
+
 let () =
   let open Alcotest in
   run "W143 script-check pool" [
@@ -239,5 +294,7 @@ let () =
       test_case "pool result == serial result (corpus)" `Quick test_pool_equals_serial;
       test_case "invalid rejected + valid accepted under both" `Quick test_invalid_rejected_both;
       test_case "first error is deterministic (lowest index)" `Quick test_first_error_is_deterministic;
+      test_case "at-tip pool(4) result == serial result (#8)" `Quick test_tip_pool4_equals_serial;
+      test_case "concurrent submitters are safe (#8 submit_mutex)" `Quick test_concurrent_submitters_safe;
     ];
   ]

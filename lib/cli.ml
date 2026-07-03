@@ -1409,8 +1409,16 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     if !post_ibd_worker_ref = None then begin
       let w = Sync.Validation_worker.create () in
       post_ibd_worker_ref := Some w;
+      (* #8 block-connect offload: ensure the small at-tip script-check pool is
+         live so this worker Domain verifies block scripts in PARALLEL instead of
+         serial (the residual ~3-4s block-connect stall).  On the IBD-complete
+         path the pool was already installed by stop_script_pool ~leave_tip_pool
+         (a no-op here); this call matters for the already-FullySynced-at-startup
+         path, where start_ibd's IBD loop never runs. *)
+      Sync.Validation_worker.ensure_tip_script_pool ();
       Logs.info (fun m ->
-        m "spawned persistent post-IBD validation worker Domain (#135)")
+        m "spawned persistent post-IBD validation worker Domain (#135) \
+           + at-tip script-check pool (#8)")
     end
   in
   (* Spawn the post-IBD worker eagerly if chain_state is ALREADY FullySynced

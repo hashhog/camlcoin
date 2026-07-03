@@ -1676,10 +1676,35 @@ let mine_test_header ?(merkle_marker : int32 = 0l) ~prev_block ~prev_height ~bit
    guard the in-process invariants that the corpus harness cannot
    observe directly. *)
 
-(* MAX_REORG_DEPTH cap: a reorg whose depth exceeds 288 must return an
-   error and MUST NOT touch the disk batch.  This is an impl-specific
-   memory-safety bound; Bitcoin Core has no equivalent reorg-depth cap. *)
-let test_reorganize_max_reorg_depth_cap () =
+(* MAX_REORG_DEPTH cap is GATED on pruning (Core-parity Class-A fix).
+
+   Bitcoin Core has NO reorg-depth cap: [ActivateBestChainStep]
+   disconnects to the fork point unbounded, and an archive node follows the
+   most-work valid chain to ANY depth.  Enforcing the 288 cap on an archive
+   node gratuitously refused a >288-deep higher-work chain and stranded the
+   node on the lower-work minority branch — a consensus split.
+
+   This test drives a 290-deep (> 288) side branch off genesis under BOTH
+   configs and asserts:
+     - ARCHIVE ([prune_target = 0], the default): the depth cap does NOT
+       fire.  [reorganize] proceeds past the depth gate into the normal
+       connect machinery (which then errors on the header-only branch's
+       missing block bodies — an ordinary connect error, NOT the depth-cap
+       error).  The point is that the reorg is NO LONGER refused by the cap.
+     - PRUNED ([prune_target > 0]): the cap IS retained — a reorg deeper
+       than the retained undo window is refused with the MAX_REORG_DEPTH
+       error, preserving the missing-undo protection.
+   In BOTH cases the aborted reorg must leave the disk batch and the
+   in-memory tip untouched. *)
+let str_contains msg needle =
+  let nlen = String.length needle and mlen = String.length msg in
+  let rec go i =
+    if i + nlen > mlen then false
+    else if String.sub msg i nlen = needle then true
+    else go (i + 1)
+  in go 0
+
+let test_reorganize_depth_cap_gated_on_pruning () =
   cleanup_test_db ();
   let db = Storage.ChainDB.create test_db_path in
   let state = Sync.create_chain_state db Consensus.regtest in
@@ -1691,7 +1716,10 @@ let test_reorganize_max_reorg_depth_cap () =
 
   (* Build a 290-deep side-branch chain on genesis, all distinct from
      the active chain so [find_fork_point] resolves to genesis and the
-     depth check fires.  The active chain stays at genesis (height 0).  *)
+     depth check (were it enabled) would fire.  The active chain stays at
+     genesis (height 0).  Headers only (no block bodies): enough for the
+     depth gate to be evaluated; the archive path then fails downstream on
+     the missing bodies, which is exactly the non-cap error we assert. *)
   let chain_depth = 290 in
   let last = ref genesis_entry in
   let last_marker = ref 0xC0DECAFEl in
@@ -1710,43 +1738,52 @@ let test_reorganize_max_reorg_depth_cap () =
     last := entry
   done;
 
-  (* Capture batch_write_count BEFORE the reorg attempt.  Setup writes
-     above touched the counter, so we record the baseline. *)
-  let baseline = Storage.ChainDB.get_batch_write_count db in
-
   let new_tip = !last in
   Alcotest.(check int) "side-branch tip at expected height"
     chain_depth new_tip.height;
 
-  let result = Sync.reorganize ibd new_tip in
-  (match result with
+  (* --- ARCHIVE (prune_target = 0): the depth cap must NOT fire. --- *)
+  state.prune_target <- 0;
+  let baseline_archive = Storage.ChainDB.get_batch_write_count db in
+  let archive_result = Sync.reorganize ibd new_tip in
+  (match archive_result with
    | Ok () ->
-     Alcotest.fail
-       (Printf.sprintf
-         "reorganize over MAX_REORG_DEPTH=288 unexpectedly succeeded \
-          (chain_depth=%d)" chain_depth)
+     (* A full 290-deep reorg over header-only blocks cannot commit (no
+        bodies to connect), but the KEY property — the cap did not refuse
+        it — is what matters; a full-body deep-reorg tip-flip (real blocks
+        via [Mining.submit_block]) is proven by the standalone
+        [test_deep_reorg_over_cap.ml] harness. *)
+     ()
    | Error msg ->
      Alcotest.(check bool)
        (Printf.sprintf
-         "depth-cap error mentions MAX_REORG_DEPTH (got: %S)" msg)
-       true
-       (let needle = "MAX_REORG_DEPTH" in
-        let nlen = String.length needle in
-        let mlen = String.length msg in
-        let rec contains i =
-          if i + nlen > mlen then false
-          else if String.sub msg i nlen = needle then true
-          else contains (i + 1)
-        in contains 0));
-
-  (* No batch_write must have fired during the aborted reorg. *)
+         "ARCHIVE: reorg NOT refused by depth cap (error was: %S)" msg)
+       false (str_contains msg "MAX_REORG_DEPTH"));
   Alcotest.(check int)
-    "no batch_write committed during depth-cap rejection"
-    baseline (Storage.ChainDB.get_batch_write_count db);
-
-  (* In-memory chain state must be unchanged. *)
-  Alcotest.(check int) "tip height unchanged after depth-cap reject"
+    "ARCHIVE: no batch_write committed during the aborted deep reorg"
+    baseline_archive (Storage.ChainDB.get_batch_write_count db);
+  Alcotest.(check int) "ARCHIVE: tip height unchanged after aborted reorg"
     0 (match state.tip with Some t -> t.height | None -> -1);
+
+  (* --- PRUNED (prune_target > 0): the depth cap IS retained. --- *)
+  state.prune_target <- 550 * 1024 * 1024;
+  let baseline_pruned = Storage.ChainDB.get_batch_write_count db in
+  let pruned_result = Sync.reorganize ibd new_tip in
+  (match pruned_result with
+   | Ok () ->
+     Alcotest.fail
+       "PRUNED: >288-deep reorg unexpectedly bypassed the depth cap"
+   | Error msg ->
+     Alcotest.(check bool)
+       (Printf.sprintf
+         "PRUNED: reorg refused with MAX_REORG_DEPTH (got: %S)" msg)
+       true (str_contains msg "MAX_REORG_DEPTH"));
+  Alcotest.(check int)
+    "PRUNED: no batch_write committed during depth-cap rejection"
+    baseline_pruned (Storage.ChainDB.get_batch_write_count db);
+  Alcotest.(check int) "PRUNED: tip height unchanged after depth-cap reject"
+    0 (match state.tip with Some t -> t.height | None -> -1);
+  state.prune_target <- 0;
 
   Storage.ChainDB.close db;
   cleanup_test_db ()
@@ -4542,8 +4579,11 @@ let () =
          single-batch invariant of [Sync.reorganize] across the
          disconnect+reconnect halves; reference:
          CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md *)
-      test_case "MAX_REORG_DEPTH cap returns error" `Quick
-        test_reorganize_max_reorg_depth_cap;
+      (* Core-parity Class-A fix: the reorg-depth cap is gated on pruning.
+         Archive (default) follows most-work to any depth; pruned retains
+         the missing-undo protection. *)
+      test_case "reorg depth cap gated on pruning" `Quick
+        test_reorganize_depth_cap_gated_on_pruning;
       test_case "crash pre-commit leaves disk untouched" `Quick
         test_reorganize_crash_pre_commit_no_disk_change;
       test_case "single-batch commit (3-disconnect + 4-reconnect)" `Quick

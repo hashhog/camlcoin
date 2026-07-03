@@ -1172,6 +1172,38 @@ let test_mainnet_assume_valid () =
   Alcotest.(check bool) "regtest has no assume_valid" true
     (Consensus.regtest.assume_valid_hash = None)
 
+(* --noassumevalid flag: verify-first proof.
+   [apply_no_assume_valid] mirrors EXACTLY the override in lib/cli.ml run:
+   when [config.no_assume_valid] is set, [assume_valid_hash] is nulled;
+   otherwise the network is returned unchanged (INERT default). *)
+let apply_no_assume_valid flag (net : Consensus.network_config)
+    : Consensus.network_config =
+  if flag then { net with Consensus.assume_valid_hash = None } else net
+
+let test_noassumevalid_flag () =
+  (* av_height stands in for the built-in mainnet assumevalid (block
+     938343); pick a block below it (e.g. taproot 709632, or segwit
+     481824) to model history that would otherwise be script-skipped. *)
+  let av_height = 938343 in
+  let block_height = 709632 in  (* taproot activation, < 938343 *)
+  (* (a) Flag OFF (default): assumevalid kept -> ancestor block SKIPS. *)
+  let net_off = apply_no_assume_valid false Consensus.mainnet in
+  Alcotest.(check bool) "flag OFF keeps assumevalid" true
+    (net_off.assume_valid_hash <> None);
+  Alcotest.(check bool) "flag OFF -> <=av block skips scripts" true
+    (Consensus.should_skip_scripts ~block_height
+       ~assume_valid_height:(Some av_height) ~network:net_off);
+  (* (b) Flag ON: assumevalid nulled -> same block VERIFIES scripts. *)
+  let net_on = apply_no_assume_valid true Consensus.mainnet in
+  Alcotest.(check bool) "flag ON nulls assumevalid" true
+    (net_on.assume_valid_hash = None);
+  Alcotest.(check bool) "flag ON -> same block verifies scripts" false
+    (Consensus.should_skip_scripts ~block_height
+       ~assume_valid_height:(Some av_height) ~network:net_on);
+  (* (c) default is inert: unmodified mainnet unchanged. *)
+  Alcotest.(check bool) "default inert (mainnet unchanged)" true
+    (Consensus.mainnet.assume_valid_hash <> None)
+
 (* Test mainnet has checkpoints *)
 let test_mainnet_checkpoints () =
   Alcotest.(check bool) "mainnet has checkpoints" true
@@ -1601,6 +1633,7 @@ let () =
       test_case "meets minimum chain work" `Quick test_meets_minimum_chain_work;
       test_case "should skip scripts" `Quick test_should_skip_scripts;
       test_case "mainnet assume valid" `Quick test_mainnet_assume_valid;
+      test_case "--noassumevalid flag" `Quick test_noassumevalid_flag;
       test_case "mainnet checkpoints" `Quick test_mainnet_checkpoints;
     ];
     "script_flag_exceptions", [

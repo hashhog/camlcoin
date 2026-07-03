@@ -715,7 +715,16 @@ let test_g15_rbf_max_evictions () =
    G16 — RBF rule 2: no new unconfirmed inputs
    ========================================================================= *)
 
-let test_g16_rbf_no_new_unconfirmed_inputs () =
+(* Naive substring test (no external deps). *)
+let str_contains_sub (s : string) (sub : string) : bool =
+  let ls = String.length s and lsub = String.length sub in
+  let rec loop i =
+    if i + lsub > ls then false
+    else if String.sub s i lsub = sub then true
+    else loop (i + 1)
+  in loop 0
+
+let test_g16_rbf_new_unconfirmed_no_longer_rule2_rejected () =
   let (mp, db, txid_a, txid_b, txid_c, _, _) = create_test_mempool () in
   (* Add a transaction that will be conflicted *)
   let orig_tx = make_tx
@@ -737,9 +746,17 @@ let test_g16_rbf_no_new_unconfirmed_inputs () =
      make_rbf_input txid_c 0l]  (* confirmed — OK *)
     [make_test_output 3_970_000L] in
   let result = Mempool.replace_by_fee mp replacement in
-  Alcotest.(check bool)
-    "G16: replacement with new unconfirmed input rejected (rule 2)"
-    true (Result.is_error result);
+  (* Rule 2 (HasNoNewUnconfirmed) was removed for cluster-mempool parity
+     (glass-box 2026-07-01): a replacement pulling in a NEW unconfirmed input
+     must no longer be rejected by the Rule-2 gate. It may still be accepted or
+     rejected by a fee/diagram gate, but NEVER with the "new unconfirmed
+     inputs" reason. Core's cluster-mempool RBF has no such gate. *)
+  (match result with
+   | Ok _ -> ()  (* accepted — Rule 2 no longer blocks it *)
+   | Error msg ->
+     Alcotest.(check bool)
+       "G16: rejection (if any) is NOT the removed Rule-2 gate"
+       false (str_contains_sub msg "new unconfirmed inputs"));
   Storage.ChainDB.close db;
   cleanup ()
 
@@ -1369,8 +1386,8 @@ let () =
         `Quick test_g14_rbf_rule4_incremental_fee;
       test_case "G15: rule 5 — <100 evictions succeeds"
         `Quick test_g15_rbf_max_evictions;
-      test_case "G16: rule 2 — no new unconfirmed inputs"
-        `Quick test_g16_rbf_no_new_unconfirmed_inputs;
+      test_case "G16: rule 2 removed — new unconfirmed input no longer Rule-2-rejected"
+        `Quick test_g16_rbf_new_unconfirmed_no_longer_rule2_rejected;
       test_case "G17: EntriesAndTxidsDisjoint — ancestor/conflict disjoint"
         `Quick test_g17_rbf_ancestor_disjoint;
       test_case "G18a BUG-9/12 FIX: conflict survives failed replacement (atomicity)"

@@ -270,6 +270,88 @@ let test_submit_block_populates_chainstate_iter () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* Regression test for the submitblock/mining bad-diffbits consensus fork
+   (fix 2026-07): [Mining.submit_block] passed [~expected_bits:block.header.bits]
+   into [accept_block], so validation.ml's ContextualCheckBlockHeader
+   difficulty-equality check (block.header.bits <> expected_bits) reduced to
+   the tautology x<>x and could NEVER fire — nothing on the submitblock/mining
+   path compared the declared nBits against the consensus-required difficulty,
+   letting a wrong-nBits block connect into the chainstate.
+
+   On regtest fPowNoRetargeting the required nBits is the parent's bits
+   (genesis 0x207fffff).  A block that declares a DIFFERENT nBits (0x207ffffe)
+   but is otherwise valid — its hash still meets its own declared target — MUST
+   be rejected bad-diffbits, matching Bitcoin Core ContextualCheckBlockHeader
+   (validation.cpp:4088-4089, pow.cpp GetNextWorkRequired).  We also assert a
+   correct-nBits block still ACCEPTS, guarding against a false rejection. *)
+let substr_contains (haystack : string) (needle : string) : bool =
+  let hl = String.length haystack and nl = String.length needle in
+  if nl = 0 then true
+  else begin
+    let found = ref false and i = ref 0 in
+    while not !found && !i <= hl - nl do
+      if String.sub haystack !i nl = needle then found := true;
+      incr i
+    done;
+    !found
+  end
+
+let test_submit_block_rejects_wrong_nbits () =
+  let (chain, db) = create_test_chain_state () in
+  let utxo = Utxo.UtxoSet.create db in
+  let mp = Mempool.create ~network:Consensus.regtest
+    ~require_standard:false ~verify_scripts:false
+    ~utxo ~current_height:0 () in
+  let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
+
+  (* --- 1. WRONG nBits: override the template's declared bits to 0x207ffffe
+     (!= required 0x207fffff) and mine a nonce meeting THAT (still trivially
+     easy) target, so the ONLY consensus violation is the difficulty-equality
+     rule (the PoW hash<=target test would pass). --- *)
+  let template = Mining.create_block_template ~chain ~mp ~payout_script in
+  let required_bits = template.header.bits in
+  Alcotest.(check int32) "regtest required bits = 0x207fffff"
+    0x207fffffl required_bits;
+  let wrong_bits = 0x207ffffel in
+  let wrong_template =
+    { template with header = { template.header with bits = wrong_bits } } in
+  (match Mining.mine_block wrong_template 100_000l with
+   | None -> Alcotest.fail "failed to mine wrong-nBits block"
+   | Some block ->
+     let bhash = Crypto.compute_block_hash block.header in
+     (* Hash meets the block's OWN (wrong) declared target: any rejection
+        below therefore comes from the difficulty-EQUALITY rule, not PoW. *)
+     Alcotest.(check bool) "wrong-nBits block hash meets its own target" true
+       (Consensus.hash_meets_target bhash block.header.bits);
+     Alcotest.(check int32) "block declares wrong bits"
+       wrong_bits block.header.bits;
+     (match Mining.submit_block block chain mp with
+      | Ok () ->
+        Alcotest.fail
+          "CONSENSUS FORK: submit_block ACCEPTED a wrong-nBits block \
+           (Core rejects bad-diffbits)"
+      | Error msg ->
+        Alcotest.(check bool)
+          (Printf.sprintf
+             "wrong-nBits rejected as bad-difficulty (got: %s)" msg)
+          true (substr_contains msg "difficulty")));
+
+  (* --- 2. CORRECT nBits: a normally-mined block still ACCEPTS — no false
+     rejection introduced by the fix. --- *)
+  let good_template = Mining.create_block_template ~chain ~mp ~payout_script in
+  (match Mining.mine_block good_template 100_000l with
+   | None -> Alcotest.fail "failed to mine correct-nBits block"
+   | Some block ->
+     Alcotest.(check int32) "good block declares required bits"
+       required_bits block.header.bits;
+     (match Mining.submit_block block chain mp with
+      | Error msg ->
+        Alcotest.fail ("correct-nBits block wrongly rejected: " ^ msg)
+      | Ok () -> ()));
+
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 (* Direct unit test for [Utxo.is_unspendable_script]: OP_RETURN scripts
    must be flagged unspendable so they are excluded from the UTXO set
    at block-connect time, matching Bitcoin Core's [AddCoins] semantics
@@ -596,6 +678,8 @@ let () =
       test_case "mine multiple blocks" `Slow test_mine_multiple_blocks_regtest;
       test_case "submit_block populates cf_chainstate iter_utxos"
         `Slow test_submit_block_populates_chainstate_iter;
+      test_case "submit_block rejects wrong-nBits block (bad-diffbits)"
+        `Slow test_submit_block_rejects_wrong_nbits;
     ];
     "utxo_filter", [
       test_case "is_unspendable_script" `Quick test_is_unspendable_script;

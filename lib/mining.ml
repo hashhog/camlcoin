@@ -784,6 +784,24 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
            Reference: bitcoin-core/src/validation.cpp ProcessNewBlock. *)
         let median_time = Sync.compute_median_time_past chain height in
         let prev_block_time = Sync.get_prev_block_time chain height in
+        (* Consensus difficulty check (bad-diffbits).  Compute the REQUIRED
+           nBits from the parent (the validated tip [vtip]) using the same
+           retarget/no-retarget logic the P2P/IBD path uses
+           (Sync.compute_expected_bits, cf. sync.ml:5471-5476), then pass THAT
+           as ~expected_bits so validation.ml's ContextualCheckBlockHeader
+           equality test (block.header.bits <> expected_bits) actually
+           compares the declared bits against consensus — instead of the block
+           against itself.  Passing block.header.bits here made the check a
+           tautology (x <> x) that could never fire, so submitblock/mining
+           accepted wrong-nBits blocks Core rejects.
+           Uses ~parent_entry so the required bits are derived from vtip's own
+           hash-linked ancestry (immune to height-index clobbering by heavier
+           competing header chains — see block_tip's doc comment).
+           Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4088-4089,
+                      pow.cpp GetNextWorkRequired. *)
+        let expected_bits =
+          Sync.compute_expected_bits ~parent_entry:vtip chain height block.header
+        in
         let base_lookup (outpoint : Types.outpoint) : Validation.utxo option =
           let txid = outpoint.Types.txid in
           let vout = Int32.to_int outpoint.Types.vout in
@@ -827,7 +845,7 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
         in
         (match Validation.accept_block
                  ~network:chain.network ~block ~height
-                 ~expected_bits:block.header.bits ~median_time ~prev_block_time
+                 ~expected_bits ~median_time ~prev_block_time
                  ~base_lookup ~flags:validation_flags
                  ~skip_scripts:false
                  ~get_mtp_at_height:(Sync.get_mtp_for_height chain)

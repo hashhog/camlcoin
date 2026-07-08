@@ -1415,6 +1415,82 @@ let handle_getrawtransaction (ctx : rpc_context)
           Ok (`Assoc with_block_info)
         end
 
+(* ============================================================================
+   Mempool reject-reason canonicalization (Bitcoin Core bare-token parity)
+
+   camlcoin's mempool acceptance engine ([Mempool.accept_transaction] et al.)
+   returns human-readable English prose in its [Error msg]. Bitcoin Core's
+   testmempoolaccept / sendrawtransaction instead surface the *bare* reject
+   token from the TxValidationState (`state.GetRejectReason()` — e.g.
+   "bad-txns-in-belowout", "version", "non-final"). The differential oracle
+   compares those tokens across nodes, so this function translates camlcoin's
+   prose into the exact Core token WITHOUT changing any accept/reject decision.
+
+   Token sources (bitcoin-core/src):
+     - consensus/tx_check.cpp   — CheckTransaction  (bad-txns-vin-empty, …)
+     - consensus/tx_verify.cpp  — CheckTxInputs     (bad-txns-in-belowout, …)
+     - policy/policy.cpp        — IsStandardTx      (version, tx-size, …)
+     - validation.cpp PreChecks — coinbase, non-final, non-BIP68-final,
+                                   bad-txns-too-many-sigops, min-relay floor
+     - rpc/mempool.cpp:399-404  — testmempoolaccept remaps TX_MISSING_INPUTS
+                                   to the bare literal "missing-inputs"; every
+                                   other reason is the state's bare token.
+
+   Messages that are ALREADY the correct bare token (or a token-prefixed
+   detail string such as "scriptsig-size: …", "scriptpubkey: …", "dust: …",
+   "datacarrier: …", "txn-mempool-conflict: …", "coinbase",
+   "txn-already-in-mempool", "tx-size-small", "bad-txns-inputvalues-outofrange",
+   "bad-txns-fee-outofrange") are passed through unchanged.
+
+   [~testmempoolaccept] selects the only path-dependent case: a missing input
+   surfaces as the RPC-layer literal "missing-inputs" for testmempoolaccept
+   (rpc/mempool.cpp) but as the consensus token "bad-txns-inputs-missingorspent"
+   for sendrawtransaction (state.ToString() via node/transaction.cpp). *)
+let canonical_mempool_reject_reason ~testmempoolaccept (msg : string) : string =
+  let contains sub =
+    let ls = String.length sub and lm = String.length msg in
+    let rec go i =
+      if i + ls > lm then false
+      else if String.sub msg i ls = sub then true
+      else go (i + 1)
+    in
+    ls = 0 || go 0
+  in
+  let has_prefix p =
+    String.length msg >= String.length p
+    && String.sub msg 0 (String.length p) = p
+  in
+  match msg with
+  (* --- consensus: CheckTransaction (consensus/tx_check.cpp) --- *)
+  | "transaction has no inputs" -> "bad-txns-vin-empty"
+  | "transaction has no outputs" -> "bad-txns-vout-empty"
+  | "total output value overflow" -> "bad-txns-txouttotal-toolarge"
+  | "transaction has duplicate inputs" -> "bad-txns-inputs-duplicate"
+  | "non-coinbase transaction references null outpoint" -> "bad-txns-prevout-null"
+  (* --- consensus: CheckTxInputs (consensus/tx_verify.cpp) --- *)
+  | "Output exceeds input" -> "bad-txns-in-belowout"
+  | "Spending immature coinbase" -> "bad-txns-premature-spend-of-coinbase"
+  (* --- policy: IsStandardTx (policy/policy.cpp) --- *)
+  | "Non-standard transaction version" -> "version"
+  | "Transaction weight exceeds standard limit" -> "tx-size"
+  | "Transaction non-witness size too small (CVE-2017-12842)" -> "tx-size-small"
+  (* --- policy: PreChecks (validation.cpp) --- *)
+  | "Transaction exceeds max standard sigops cost" -> "bad-txns-too-many-sigops"
+  | "Transaction is not final (locktime not reached)" -> "non-final"
+  | "Transaction sequence locks not satisfied (BIP68)" -> "non-BIP68-final"
+  | "Fee below minimum relay fee" -> "min relay fee not met"
+  | _ ->
+    (* Prefix / substring forms produced by Printf.sprintf. *)
+    if has_prefix "Missing input:" then
+      (if testmempoolaccept then "missing-inputs"
+       else "bad-txns-inputs-missingorspent")
+    else if has_prefix "transaction exceeds max weight" then "bad-txns-oversize"
+    else if contains "has negative value" then "bad-txns-vout-negative"
+    else if contains "value exceeds MAX_MONEY" then "bad-txns-vout-toolarge"
+    else
+      (* Already a bare token or a token-prefixed detail string: pass through. *)
+      msg
+
 (* Default constants for sendrawtransaction *)
 let default_max_raw_tx_fee_rate = 0.10  (* 0.10 BTC/kvB *)
 let default_max_burn_amount = 0L        (* 0 BTC by default *)
@@ -1515,7 +1591,9 @@ let handle_sendrawtransaction (ctx : rpc_context)
             Ok (`String (Types.hash256_to_hex_display entry.txid))
           end
         | Error msg ->
-          Error msg
+          (* Emit Bitcoin Core's bare reject token, not English prose
+             (state.ToString() surface for sendrawtransaction). *)
+          Error (canonical_mempool_reject_reason ~testmempoolaccept:false msg)
     with exn ->
       Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn)))
 
@@ -3947,7 +4025,11 @@ let handle_testmempoolaccept (ctx : rpc_context)
         Ok (`List [`Assoc [
           ("txid", `String hex_txid);
           ("allowed", `Bool false);
-          ("reject-reason", `String msg);
+          (* Bitcoin Core surfaces the bare reject token here
+             (rpc/mempool.cpp: state.GetRejectReason(), with TX_MISSING_INPUTS
+             remapped to the literal "missing-inputs"). *)
+          ("reject-reason",
+           `String (canonical_mempool_reject_reason ~testmempoolaccept:true msg));
         ]])
     with exn ->
       Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn)))

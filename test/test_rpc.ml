@@ -3186,10 +3186,97 @@ let test_getpeerinfo_no_startingheight () =
    Test Runner
    ============================================================================ *)
 
+(* ============================================================================
+   Reject-reason token parity (Bitcoin Core bare-token surface)
+
+   Asserts that [Rpc.canonical_mempool_reject_reason] maps camlcoin's mempool
+   prose to the exact bare Core reject token emitted by testmempoolaccept
+   (state.GetRejectReason() / rpc/mempool.cpp) and sendrawtransaction
+   (state.ToString() / node/transaction.cpp). Decisions are unaffected; only
+   the emitted string changes. Tokens cross-checked against bitcoin-core/src:
+   consensus/tx_check.cpp, consensus/tx_verify.cpp, policy/policy.cpp,
+   validation.cpp.
+   ============================================================================ *)
+let check_token prose expected =
+  Alcotest.(check string) prose expected
+    (Rpc.canonical_mempool_reject_reason ~testmempoolaccept:true prose)
+
+let test_reject_token_check_transaction () =
+  (* consensus/tx_check.cpp — CheckTransaction family *)
+  check_token "transaction has no inputs" "bad-txns-vin-empty";
+  check_token "transaction has no outputs" "bad-txns-vout-empty";
+  check_token "total output value overflow" "bad-txns-txouttotal-toolarge";
+  check_token "transaction has duplicate inputs" "bad-txns-inputs-duplicate";
+  check_token "non-coinbase transaction references null outpoint"
+    "bad-txns-prevout-null";
+  check_token "transaction exceeds max weight (4000001 > 4000000)"
+    "bad-txns-oversize";
+  check_token "output 2 has negative value" "bad-txns-vout-negative";
+  check_token "output 0 value exceeds MAX_MONEY" "bad-txns-vout-toolarge"
+
+let test_reject_token_check_tx_inputs () =
+  (* consensus/tx_verify.cpp — CheckTxInputs family *)
+  check_token "Output exceeds input" "bad-txns-in-belowout";
+  check_token "Spending immature coinbase"
+    "bad-txns-premature-spend-of-coinbase"
+
+let test_reject_token_policy () =
+  (* policy/policy.cpp IsStandardTx + validation.cpp PreChecks *)
+  check_token "Non-standard transaction version" "version";
+  check_token "Transaction weight exceeds standard limit" "tx-size";
+  check_token "Transaction non-witness size too small (CVE-2017-12842)"
+    "tx-size-small";
+  check_token "Transaction exceeds max standard sigops cost"
+    "bad-txns-too-many-sigops";
+  check_token "Transaction is not final (locktime not reached)" "non-final";
+  check_token "Transaction sequence locks not satisfied (BIP68)"
+    "non-BIP68-final";
+  check_token "Fee below minimum relay fee" "min relay fee not met"
+
+let test_reject_token_missing_inputs_path_dependent () =
+  (* rpc/mempool.cpp remaps TX_MISSING_INPUTS -> "missing-inputs" for
+     testmempoolaccept only; sendrawtransaction surfaces the consensus token. *)
+  let prose = "Missing input: 0000000000000000000000000000000000000000000000000000000000000001:0" in
+  Alcotest.(check string) "testmempoolaccept remap" "missing-inputs"
+    (Rpc.canonical_mempool_reject_reason ~testmempoolaccept:true prose);
+  Alcotest.(check string) "sendrawtransaction token"
+    "bad-txns-inputs-missingorspent"
+    (Rpc.canonical_mempool_reject_reason ~testmempoolaccept:false prose)
+
+let test_reject_token_passthrough () =
+  (* Already-canonical tokens / token-prefixed detail strings pass unchanged. *)
+  List.iter (fun s -> check_token s s) [
+    "coinbase";
+    "txn-already-in-mempool";
+    "txn-same-nonwitness-data-in-mempool";
+    "txn-already-known";
+    "tx-size-small";
+    "bad-txns-inputvalues-outofrange";
+    "bad-txns-fee-outofrange";
+    "scriptsig-size: scriptSig at input 0 too large (2000 > 1650)";
+    "scriptsig-not-pushonly: non-push-only scriptSig at input 0";
+    "scriptpubkey: non-standard output script at index 0";
+    "dust: transaction has 2 dust outputs (max 1)";
+    "datacarrier: OP_RETURN output at index 0 exceeds datacarrier budget";
+    "txn-mempool-conflict: spends same input as abcd";
+  ]
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
   run "RPC" [
+    "reject_reason_token_parity", [
+      test_case "CheckTransaction family -> bare tokens" `Quick
+        test_reject_token_check_transaction;
+      test_case "CheckTxInputs family -> bare tokens" `Quick
+        test_reject_token_check_tx_inputs;
+      test_case "policy/PreChecks -> bare tokens" `Quick
+        test_reject_token_policy;
+      test_case "missing-inputs is path-dependent" `Quick
+        test_reject_token_missing_inputs_path_dependent;
+      test_case "already-canonical tokens pass through" `Quick
+        test_reject_token_passthrough;
+    ];
     "sendrawtransaction", [
       test_case "valid tx accepted" `Quick test_sendrawtransaction_valid;
       test_case "invalid hex rejected" `Quick test_sendrawtransaction_invalid_hex;

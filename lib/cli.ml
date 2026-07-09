@@ -2125,23 +2125,17 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
             | Error e ->
               Logs.debug (fun m -> m "Reconstructed compact block rejected: %s" e);
               Lwt.return_unit))
-       | P2p.ReconstructNeedTxs missing ->
-         (* Store partial state and request missing transactions *)
+       | P2p.ReconstructNeedTxs (partial_txs, missing) ->
+         (* Store partial state and request missing transactions.
+            partial_txs already has the prefilled AND mempool-matched slots
+            filled (from reconstruct_block); storing it as-is — rather than
+            rebuilding from prefilled only — means the blocktxn fill needs only
+            the truly-missing txs, so reconstruction completes even when the
+            mempool held some of the block's txs (previously that left those
+            slots None and fill_missing_txs failed "not all filled"). *)
          Logs.info (fun m ->
            m "Compact block %s missing %d txns, sending getblocktxn"
              (Types.hash256_to_hex header_hash) (List.length missing));
-         (* Build partial_txs array from reconstruction attempt *)
-         let tx_count = P2p.compact_block_tx_count cb in
-         let partial_txs = Array.make tx_count None in
-         (* Fill in prefilled transactions *)
-         let last_idx = ref (-1) in
-         List.iter (fun ptx ->
-           let abs_idx = !last_idx + ptx.P2p.index + 1 in
-           if abs_idx < tx_count then begin
-             partial_txs.(abs_idx) <- Some ptx.P2p.tx;
-             last_idx := abs_idx
-           end
-         ) cb.prefilled_txs;
          Hashtbl.replace compact_pending header_hash (cb, partial_txs, missing);
          let req = P2p.make_getblocktxn_request header_hash missing in
          let getblocktxn_msg = P2p.make_getblocktxn_msg req in

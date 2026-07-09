@@ -1558,8 +1558,38 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         else
           None
       ) items in
-      if block_hashes <> [] then
-        Peer.send_message peer (P2p.GetdataMsg block_hashes)
+      if block_hashes <> [] then begin
+        let send_getdata () = Peer.send_message peer (P2p.GetdataMsg block_hashes) in
+        (* Headers-first jump recovery (Bitcoin Core parity,
+           net_processing.cpp:4065-4118): a block inv is Core's cue to send a
+           getheaders — the announced hash is the peer's tip and may be many
+           blocks ahead of ours (e.g. a burst of blocks mined while we were
+           connected, as regtest's generatetoaddress produces).  The direct
+           getdata above only fetches the announced hash itself; if its parents
+           are missing that block is an unconnectable orphan and we stall until
+           the slow proactive tip-poll (tip_poll_interval, 2 min) finally issues
+           a getheaders.  Issuing the getheaders here — using the best-header
+           locator, exactly like Core's GetLocator(m_best_header) — lets the
+           existing post-IBD HeadersMsg gap-fill discover and download the whole
+           intermediate range immediately.  Gated on FullySynced so it only
+           affects the post-IBD tip-follow path (during IBD the header-sync loop
+           already drives getheaders); on mainnet steady state this adds at most
+           one getheaders per announced block, which is precisely Core's
+           behaviour. *)
+        if chain.sync_state = Sync.FullySynced then begin
+          let getheaders = P2p.GetheadersMsg {
+            version = 70016l;
+            locator_hashes = Sync.build_locator chain;
+            hash_stop = Types.zero_hash;
+          } in
+          Lwt.bind
+            (Lwt.catch
+               (fun () -> Peer.send_message peer getheaders)
+               (fun _ -> Lwt.return_unit))
+            (fun () -> send_getdata ())
+        end else
+          send_getdata ()
+      end
       else
         Lwt.return_unit
     | _ -> Lwt.return_unit);

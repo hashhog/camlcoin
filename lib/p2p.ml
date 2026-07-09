@@ -1401,7 +1401,14 @@ let compact_block_tx_count (cb : compact_block) : int =
 (* Result type for block reconstruction *)
 type reconstruct_status =
   | ReconstructComplete of Types.block
-  | ReconstructNeedTxs of int list  (* missing transaction indices *)
+  | ReconstructNeedTxs of Types.transaction option array * int list
+    (* (partial_txs, missing indices).  partial_txs is the reconstruction
+       array with prefilled AND mempool-matched slots already filled and the
+       missing slots left None — the caller must store THIS array (not rebuild
+       from prefilled only) so that when the blocktxn response arrives,
+       fill_missing_txs only needs to place the truly-missing txs and the
+       all-filled check passes even when the mempool held some of the block's
+       txs (the common at-tip case). *)
   | ReconstructFailed of string
 
 (* Build a lookup table mapping wtxid to transaction *)
@@ -1489,7 +1496,7 @@ let reconstruct_block (cb : compact_block) (lookup : tx_lookup)
       done;
 
       if !missing <> [] then
-        ReconstructNeedTxs (List.rev !missing)
+        ReconstructNeedTxs (txs, List.rev !missing)
       else begin
         (* All transactions found - build the block *)
         let transactions = Array.to_list (Array.map Option.get txs) in

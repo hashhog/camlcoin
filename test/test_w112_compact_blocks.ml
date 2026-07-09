@@ -383,7 +383,7 @@ let test_g11_reconstruct_complete () =
     Alcotest.(check int) "G11: reconstructed block has correct tx count"
       (List.length block.transactions)
       (List.length reconstructed.transactions)
-  | P2p.ReconstructNeedTxs missing ->
+  | P2p.ReconstructNeedTxs (_, missing) ->
     Alcotest.failf "G11: reconstruction failed, missing %d txs" (List.length missing)
   | P2p.ReconstructFailed reason ->
     Alcotest.failf "G11: reconstruction failed: %s" reason
@@ -397,7 +397,7 @@ let test_g12_reconstruct_need_txs () =
   let empty_lookup = P2p.create_tx_lookup ~k0:0L ~k1:0L [] in
   let result = P2p.reconstruct_block cb empty_lookup in
   match result with
-  | P2p.ReconstructNeedTxs missing ->
+  | P2p.ReconstructNeedTxs (_, missing) ->
     (* 4 normal txs → 4 short IDs → 4 missing *)
     Alcotest.(check int) "G12: ReconstructNeedTxs contains all short-ID positions"
       (List.length cb.short_ids) (List.length missing)
@@ -757,7 +757,55 @@ let cmpctblock_tests = [
   Alcotest.test_case "G15 empty compact block rejected"   `Quick test_g15_empty_block_rejected;
 ]
 
+(* G31/BUG: mempool-overlap round-trip. reconstruct_block must hand back the
+   partial array with the mempool-matched slots already filled, so the blocktxn
+   fill completes. The live cli.ml handler previously rebuilt the partial array
+   from prefilled txns ONLY, leaving the mempool-matched slots None; then
+   fill_missing_txs (which only fills the missing indices) failed "not all
+   transactions filled" whenever the mempool held any of the block's txns — i.e.
+   the common at-tip case. This exercises the reconstruct_block -> fill_missing_txs
+   data flow and asserts both the fix and (via a prefilled-only control) the bug. *)
+let test_g31_mempool_overlap_roundtrip () =
+  let block = make_test_block 4 in            (* coinbase + 4 normal = 5 txs *)
+  let cb = P2p.create_compact_block block in
+  let (k0, k1) = Crypto.SipHash.derive_keys cb.header cb.nonce in
+  let normal = List.tl block.transactions in  (* 4 normal txns *)
+  (* Mempool holds a SUBSET (overlap): the first two normal txns. *)
+  let in_mempool = [List.nth normal 0; List.nth normal 1] in
+  let lookup = P2p.create_tx_lookup ~k0 ~k1 in_mempool in
+  match P2p.reconstruct_block cb lookup with
+  | P2p.ReconstructNeedTxs (partial_txs, missing) ->
+    let filled =
+      Array.to_list partial_txs |> List.filter (fun x -> x <> None) |> List.length in
+    (* coinbase (prefilled) + 2 mempool matches = 3 of 5 filled *)
+    Alcotest.(check int) "G31: partial carries prefilled + mempool matches" 3 filled;
+    (* blocktxn supplies exactly the missing txns, in index order. *)
+    let received = List.map (fun idx -> List.nth block.transactions idx) missing in
+    (match P2p.fill_missing_txs cb partial_txs missing received with
+     | Ok reconstructed ->
+       Alcotest.(check int) "G31: full block reconstructed after blocktxn"
+         (List.length block.transactions) (List.length reconstructed.transactions)
+     | Error e -> Alcotest.failf "G31: fill failed post-fix: %s" e);
+    (* CONTROL (the pre-fix rebuild): partial from prefilled ONLY leaves the
+       mempool-matched slots None, so the identical fill fails. *)
+    let tx_count = P2p.compact_block_tx_count cb in
+    let prefilled_only = Array.make tx_count None in
+    let last = ref (-1) in
+    List.iter (fun ptx ->
+      let abs = !last + ptx.P2p.index + 1 in
+      if abs < tx_count then (prefilled_only.(abs) <- Some ptx.P2p.tx; last := abs)
+    ) cb.prefilled_txs;
+    (match P2p.fill_missing_txs cb prefilled_only missing received with
+     | Error _ ->
+       Alcotest.(check bool) "G31: prefilled-only rebuild fails (reproduces the bug)"
+         true true
+     | Ok _ -> Alcotest.fail "G31: prefilled-only unexpectedly succeeded")
+  | P2p.ReconstructComplete _ ->
+    Alcotest.fail "G31: unexpected full reconstruction (mempool held only a subset)"
+  | P2p.ReconstructFailed r -> Alcotest.failf "G31: unexpected ReconstructFailed: %s" r
+
 let getblocktxn_tests = [
+  Alcotest.test_case "G31 mempool-overlap getblocktxn roundtrip" `Quick test_g31_mempool_overlap_roundtrip;
   Alcotest.test_case "G16 getblocktxn differential encoding"  `Quick test_g16_getblocktxn_differential_encoding;
   Alcotest.test_case "G17 getblocktxn roundtrip"              `Quick test_g17_getblocktxn_roundtrip;
   Alcotest.test_case "G18 blocktxn fill_missing_txs"          `Quick test_g18_blocktxn_fill_missing;

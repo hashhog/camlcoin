@@ -7029,7 +7029,7 @@ let handle_cmpctblock (ibd : ibd_state) (cb : P2p.compact_block)
         m "Reconstructed compact block %s from mempool"
           (Types.hash256_to_hex_display header_hash));
       Lwt.return (`Reconstructed block)
-    | P2p.ReconstructNeedTxs indices ->
+    | P2p.ReconstructNeedTxs (_partial_txs, indices) ->
       Logs.debug (fun m ->
         m "Compact block %s missing %d transactions, requesting"
           (Types.hash256_to_hex_display header_hash)

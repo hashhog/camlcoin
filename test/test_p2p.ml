@@ -644,7 +644,7 @@ let test_block_reconstruction () =
       Alcotest.(check int32) (Printf.sprintf "tx %d version" i)
         orig.version recon.version
     ) blk_txs
-  | P2p.ReconstructNeedTxs missing ->
+  | P2p.ReconstructNeedTxs (_, missing) ->
     Alcotest.fail (Printf.sprintf "Missing %d transactions" (List.length missing))
   | P2p.ReconstructFailed msg ->
     Alcotest.fail msg
@@ -658,7 +658,7 @@ let test_block_reconstruction_missing () =
   let lookup : P2p.tx_lookup = { by_short_id = Hashtbl.create 0 } in
 
   match P2p.reconstruct_block cb lookup with
-  | P2p.ReconstructNeedTxs missing ->
+  | P2p.ReconstructNeedTxs (_, missing) ->
     (* Should be missing non-coinbase transactions *)
     Alcotest.(check int) "missing tx count" 1 (List.length missing)
   | P2p.ReconstructComplete _ ->
@@ -792,7 +792,7 @@ let test_reconstruct_shortid_collision () =
      so its short-ID slot ends up in the missing list *)
   let empty_lookup : P2p.tx_lookup = { by_short_id = Hashtbl.create 0 } in
   (match P2p.reconstruct_block cb empty_lookup with
-   | P2p.ReconstructNeedTxs missing ->
+   | P2p.ReconstructNeedTxs (_, missing) ->
      Alcotest.(check bool) "missing list non-empty" true (missing <> [])
    | P2p.ReconstructComplete _ ->
      Alcotest.fail "should not complete without matching tx"

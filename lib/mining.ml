@@ -724,6 +724,27 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
   match Validation.check_block_header ?network:(Some chain.network) block.header with
   | Error e -> Error e
   | Ok () ->
+    (* Context-free CheckBlock: the transaction merkle root must match the
+       header, and the merkle tree must not carry the CVE-2012-2459
+       duplicate-tx mutation.  Bitcoin Core runs this inside CheckBlock
+       (validation.cpp CheckBlock -> BlockMerkleRoot, consensus/merkle.cpp)
+       which precedes ALL contextual / connect logic and fires for
+       submitblock too.  It must therefore run BEFORE the "does this block
+       extend the validated tip / defer as inconclusive" branch below —
+       otherwise a non-extending block with a bad merkle root is deferred and
+       rendered as BIP-22 success (Ok ()), diverging from Core's
+       `bad-txnmrklroot` reject.  A block that PASSES this context-free check
+       but legitimately does not extend the tip (side branch) still flows into
+       the deferred/inconclusive path unchanged.
+       Reference: bitcoin-core/src/validation.cpp CheckBlock;
+                  CORE-PARITY-AUDIT/fuzz-sweep-6nodes-2026-07-11.md Finding 1. *)
+    let txids = List.map Crypto.compute_txid block.transactions in
+    let (computed_merkle, mutated) = Crypto.merkle_root txids in
+    if mutated then
+      Error (Validation.block_error_to_string Validation.BlockMutatedMerkle)
+    else if not (Cstruct.equal computed_merkle block.header.merkle_root) then
+      Error (Validation.block_error_to_string Validation.BlockBadMerkleRoot)
+    else
     (* For submitblock we must compare against the validated-block tip, not
        the header tip (which may lead `blocks_synced` post-IBD).  Use the
        `Sync.block_tip` helper instead of reading `chain.tip` directly. *)

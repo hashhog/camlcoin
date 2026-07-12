@@ -534,6 +534,40 @@ let bits_to_target_hex (bits : int32) : string =
   done;
   Buffer.contents buf
 
+(* size_on_disk: total bytes of the on-disk block store, mirroring Bitcoin
+   Core's getblockchaininfo.size_on_disk (CalculateCurrentUsage over the block +
+   undo files, rpc/blockchain.cpp). camlcoin keeps block bodies + undo in the
+   RocksDB block store at <datadir>/chainstate/; the UTXO set lives separately
+   in <datadir>/rocksdb_utxo/, which is excluded here exactly as Core excludes
+   its chainstate leveldb from size_on_disk. Recursively sums regular-file sizes
+   and caches for 60s so the ~800-file walk never runs on the hot
+   getblockchaininfo path more than once a minute. Fully defensive: any error
+   yields 0 (never fails the RPC). *)
+let rec dir_size_bytes (path : string) : int =
+  match Sys.is_directory path with
+  | true ->
+    Array.fold_left (fun acc name ->
+      acc + dir_size_bytes (Filename.concat path name)
+    ) 0 (try Sys.readdir path with _ -> [||])
+  | false -> (try (Unix.stat path).Unix.st_size with _ -> 0)
+  | exception _ -> 0
+
+let size_on_disk_cache : (float * int) ref = ref (0.0, 0)
+
+let compute_size_on_disk (data_dir : string option) : int =
+  match data_dir with
+  | None -> 0
+  | Some d ->
+    let now = Unix.gettimeofday () in
+    let (ts, cached) = !size_on_disk_cache in
+    if cached > 0 && now -. ts < 60.0 then cached
+    else begin
+      let block_store = Filename.concat d "chainstate" in
+      let sz = try dir_size_bytes block_store with _ -> 0 in
+      if sz > 0 then size_on_disk_cache := (now, sz);
+      sz
+    end
+
 (* ============================================================================
    Blockchain Info Handlers
    ============================================================================ *)
@@ -603,7 +637,7 @@ let handle_getblockchaininfo (ctx : rpc_context)
             float_of_int ctx.chain.headers_synced));
     ("initialblockdownload", `Bool is_ibd);
     ("chainwork", `String chainwork);
-    ("size_on_disk", `Int 0);
+    ("size_on_disk", `Int (compute_size_on_disk ctx.data_dir));
     ("pruned", `Bool (ctx.chain.prune_target > 0));
   ] @
   (if ctx.chain.prune_target > 0 then
@@ -2491,6 +2525,20 @@ let bip22_of_submitblock_error (msg : string) : string =
        state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout", ...)
      validation.ml emits "transaction fee is insufficient" for TxInsufficientFee. *)
   else if c "fee is insufficient" then "bad-txns-in-belowout"
+  (* Block size/weight ceiling: Core CheckBlock "size limits failed"
+     (validation.cpp) -> bad-blk-length when
+     GetSerializeSize(TX_NO_WITNESS(block)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT.
+     camlcoin surfaces this over-limit as "block exceeds max weight (...)"
+     (BlockOverweight / compute_block_weight) and "block exceeds max serialized
+     size (...)" (BlockOversized) — both are Core's block size-limit family, and
+     both were previously collapsing to the generic "rejected" bucket. The
+     regression corpus entry block-weight-too-large is the no-witness base*4 gate,
+     for which Core emits exactly bad-blk-length (its early CheckBlock gate,
+     confirmed against Core 31.99). Core's sibling full-weight gate bad-blk-weight
+     is only reached for witness-inflated blocks, which camlcoin's single weight
+     gate folds into the same reject; the accept/reject decision is identical
+     either way, so this is reason-string only (no decision-path change). *)
+  else if c "max serialized size" || c "max weight" then "bad-blk-length"
   else "rejected"
 
 let handle_submitblock (ctx : rpc_context)

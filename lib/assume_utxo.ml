@@ -199,22 +199,64 @@ let mainnet_au_data : assumeutxo_params list = [
     flow but flag it explicitly. *)
 let testnet4_au_data : assumeutxo_params list = []
 
+(** Core-parity regtest AssumeUTXO entries — verbatim from
+    [bitcoin-core/src/kernel/chainparams.cpp] [CRegTestParams::m_assumeutxo_data]
+    (heights 110 / 200 / 299). These are pinned to Core's own deterministic
+    regtest mining chain (the same chain [feature_assumeutxo.py],
+    [test/fuzz/utxo_snapshot.cpp], and hashhog's [tools/boot-smoke.sh] fixture
+    build), so a regtest snapshot generated against that chain is recognized
+    out of the box with no env var or runtime registration required
+    (boot-smoke.sh "compliance contract A: pure Core parity"). Core's
+    [AssumeutxoData] struct carries no coin count, so [coins_count] is [0L]
+    (disables the pre-decode count check — see [load_snapshot]/[load_snapshot_into_primary]). *)
+let core_regtest_au_data : assumeutxo_params list = [
+  (* height = 110 — "For use by unit tests" (chainparams.cpp:608). *)
+  make_au
+    ~height:110
+    ~blockhash_display:
+      "6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397"
+    ~coins_hash_display:
+      "b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327"
+    ~coins_count:0L
+    ~chain_tx_count:111L;
+  (* height = 200 — "For use by fuzz target src/test/fuzz/utxo_snapshot.cpp"
+     (chainparams.cpp:615). *)
+  make_au
+    ~height:200
+    ~blockhash_display:
+      "385901ccbd69dff6bbd00065d01fb8a9e464dede7cfe0372443884f9b1dcf6b9"
+    ~coins_hash_display:
+      "17dcc016d188d16068907cdeb38b75691a118d43053b8cd6a25969419381d13a"
+    ~coins_count:0L
+    ~chain_tx_count:201L;
+  (* height = 299 — "For use by test/functional/feature_assumeutxo.py and
+     test/functional/tool_bitcoin_chainstate.py" (chainparams.cpp:621). This
+     is the entry hashhog's boot-smoke fixture (height 299) matches. *)
+  make_au
+    ~height:299
+    ~blockhash_display:
+      "7cc695046fec709f8c9394b6f928f81e81fd3ac20977bb68760fa1faa7916ea2"
+    ~coins_hash_display:
+      "d2b051ff5e8eef46520350776f4100dd710a63447a8e01d917e92e79751a63e2"
+    ~coins_count:0L
+    ~chain_tx_count:334L;
+]
+
 (** Regtest AssumeUTXO entries.
 
-    Core's regtest chainparams DOES carry [m_assumeutxo_data] entries (heights
-    110 / 200 / 299 in [bitcoin-core/src/kernel/chainparams.cpp:607-628],
-    explicitly "for use by test/functional/feature_assumeutxo.py" and the
-    snapshot fuzz target).  Those Core values are pinned to Core's deterministic
-    regtest mining chain; camlcoin's snapshot tests build their own short
-    regtest chains, so the regtest table is REGISTERABLE at runtime
-    ([register_regtest_assumeutxo]) — exactly mirroring how Core's regtest is a
-    mockable chain whose assumeutxo data is purpose-built for the snapshot tests
-    rather than a permanent network commitment.
+    Seeded with [core_regtest_au_data] (Core parity, see above) and further
+    REGISTERABLE at runtime ([register_regtest_assumeutxo]) for camlcoin's
+    own short synthetic regtest chains used by its snapshot tests — mirroring
+    how Core's regtest is a mockable chain whose assumeutxo data is
+    purpose-built per test rather than a permanent network commitment.
 
     This table is NEVER consulted on mainnet/testnet4 (the whitelist for those
     networks remains the hardcoded, immutable Core values above); it only gates
-    the regtest snapshot test path. *)
-let regtest_au_data : assumeutxo_params list ref = ref []
+    the regtest snapshot test path. Tests that need a clean slate call
+    [clear_regtest_assumeutxo] first (which also drops the Core built-ins —
+    intentional, since those tests build their own synthetic chains at
+    different heights/hashes and re-register whatever they need). *)
+let regtest_au_data : assumeutxo_params list ref = ref core_regtest_au_data
 
 (** [register_regtest_assumeutxo p] adds [p] to the regtest AssumeUTXO
     whitelist so a regtest snapshot whose base block is [p.blockhash] can be
@@ -232,6 +274,33 @@ let register_regtest_assumeutxo (p : assumeutxo_params) : unit =
     hygiene so registrations never leak across test cases). *)
 let clear_regtest_assumeutxo () : unit = regtest_au_data := []
 
+(** Campaign-only AssumeUTXO entries — see [load_campaign_assumeutxo_from_env]
+    below. Populated at most once per process, at startup, from the file
+    named by the [HASHHOG_CAMPAIGN_ASSUMEUTXO] env var. Empty (and therefore
+    inert) unless that var is set: [get_assumeutxo_for_hash] and
+    [available_snapshot_heights] special-case the empty list so an unset flag
+    reads exactly the pre-campaign [mainnet_au_data] / [testnet4_au_data]
+    values with no extra allocation — bit-identical lookup behavior.
+    Regtest campaign entries do NOT use this ref; they route through
+    [register_regtest_assumeutxo] instead, reusing that existing hook rather
+    than adding a second regtest whitelist. See
+    receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md. *)
+let campaign_au_data : assumeutxo_params list ref = ref []
+
+(** [register_campaign_assumeutxo p] adds [p] to the campaign whitelist.
+    Idempotent on [(height, blockhash)], mirroring
+    [register_regtest_assumeutxo]. *)
+let register_campaign_assumeutxo (p : assumeutxo_params) : unit =
+  campaign_au_data :=
+    p :: List.filter
+           (fun q -> not (q.height = p.height
+                          && Cstruct.equal q.blockhash p.blockhash))
+           !campaign_au_data
+
+(** [clear_campaign_assumeutxo ()] empties the campaign whitelist (test
+    teardown hygiene, mirroring [clear_regtest_assumeutxo]). *)
+let clear_campaign_assumeutxo () : unit = campaign_au_data := []
+
 (** Get assumeUTXO parameters for mainnet at specific heights.
     Returns None if the height doesn't have hardcoded params. *)
 let get_assumeutxo_params_mainnet (height : int) : assumeutxo_params option =
@@ -245,8 +314,12 @@ let get_assumeutxo_params_testnet4 (height : int) : assumeutxo_params option =
 let get_assumeutxo_for_hash ~network:(network : Consensus.network_config)
     (blockhash : Types.hash256) : assumeutxo_params option =
   let candidates = match network.network_type with
-    | Consensus.Mainnet -> mainnet_au_data
-    | Consensus.Testnet4 -> testnet4_au_data
+    | Consensus.Mainnet ->
+      if !campaign_au_data = [] then mainnet_au_data
+      else mainnet_au_data @ !campaign_au_data
+    | Consensus.Testnet4 ->
+      if !campaign_au_data = [] then testnet4_au_data
+      else testnet4_au_data @ !campaign_au_data
     | Consensus.Regtest -> !regtest_au_data
     | _ -> []
   in
@@ -256,12 +329,134 @@ let get_assumeutxo_for_hash ~network:(network : Consensus.network_config)
     Mirrors Core's [GetAvailableSnapshotHeights]. *)
 let available_snapshot_heights (network : Consensus.network_config) : int list =
   let candidates = match network.network_type with
-    | Consensus.Mainnet -> mainnet_au_data
-    | Consensus.Testnet4 -> testnet4_au_data
+    | Consensus.Mainnet ->
+      if !campaign_au_data = [] then mainnet_au_data
+      else mainnet_au_data @ !campaign_au_data
+    | Consensus.Testnet4 ->
+      if !campaign_au_data = [] then testnet4_au_data
+      else testnet4_au_data @ !campaign_au_data
     | Consensus.Regtest -> !regtest_au_data
     | _ -> []
   in
   List.sort compare (List.map (fun p -> p.height) candidates)
+
+(* ============================================================================
+   Campaign flag — HASHHOG_CAMPAIGN_ASSUMEUTXO
+   ============================================================================
+
+   Full spec: receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md. Summary: the M2
+   boundary campaign boots each impl with "mainnet params" and fast-forwards
+   a UTXO snapshot to a boundary height that is NOT one of the four
+   Core-published mainnet AssumeUTXO heights. Rather than widen the
+   production [mainnet_au_data] table (the v1 mistake this design corrects —
+   see ONE-WEEK-PLAN.md correction #7), campaign snapshot bases live in a
+   separate file, named by this env var, read once at startup and merged
+   into the in-memory allowlist only. *)
+
+(** Parse one JSON object from the campaign fixture schema into an
+    [assumeutxo_params]. Required keys: "height" (int > 0), "blockhash" and
+    "hash_serialized" (64 hex chars, Core DISPLAY order — converted to
+    camlcoin's internal storage order by [make_au], exactly like the
+    hardcoded tables above), "m_chain_tx_count" (int). The schema's three
+    optional keys ("base_mtp", "base_header", "chainwork") are accepted but
+    not yet consumed — camlcoin's [assumeutxo_params] carries no MTP/header/
+    chainwork field and nothing on the snapshot-load path needs them today;
+    revisit if a campaign boundary reproduces rustoshi's post-snapshot
+    [bad-txns-nonfinal] wedge (CAMPAIGN-SNAPSHOT-TABLE-SPEC.md). *)
+let campaign_entry_of_json (j : Yojson.Safe.t) : (assumeutxo_params, string) result =
+  let open Yojson.Safe.Util in
+  try
+    let height = j |> member "height" |> to_int in
+    let blockhash_display = j |> member "blockhash" |> to_string in
+    let hash_serialized = j |> member "hash_serialized" |> to_string in
+    let chain_tx_count = j |> member "m_chain_tx_count" |> to_int |> Int64.of_int in
+    if height <= 0 then
+      Error (Printf.sprintf "campaign entry height %d must be > 0" height)
+    else if String.length blockhash_display <> 64 then
+      Error (Printf.sprintf
+               "campaign entry height %d: blockhash must be 64 hex chars" height)
+    else if String.length hash_serialized <> 64 then
+      Error (Printf.sprintf
+               "campaign entry height %d: hash_serialized must be 64 hex chars"
+               height)
+    else
+      (try
+         Ok (make_au ~height ~blockhash_display ~coins_count:0L
+               ~coins_hash_display:hash_serialized ~chain_tx_count)
+       with
+       | Invalid_argument msg | Failure msg ->
+         Error (Printf.sprintf
+                  "campaign entry height %d: not valid hex (%s)" height msg))
+  with
+  | Type_error (msg, _) -> Error ("campaign entry malformed: " ^ msg)
+  | Yojson.Json_error msg -> Error ("campaign entry malformed: " ^ msg)
+
+(** [load_campaign_assumeutxo_from_env ~network ()] reads
+    [HASHHOG_CAMPAIGN_ASSUMEUTXO] exactly once and, if set to a non-empty
+    path, parses + validates its JSON array and merges every entry into
+    [network]'s in-memory assumeutxo allowlist: [register_regtest_assumeutxo]
+    when [network] is regtest (reusing the existing hook), otherwise
+    [register_campaign_assumeutxo]. Refuses to start ([exit 1]) on any parse
+    error or on a collision (same height OR same blockhash) with a built-in
+    or already-loaded entry for this network — campaign data may never
+    override a production hash. Emits the greppable
+    "[CAMPAIGN-ASSUMEUTXO] loaded N entries ..." banner on success.
+
+    When the env var is unset or empty this function performs exactly one
+    [Sys.getenv_opt] call and returns — no file I/O, no JSON parsing, no
+    table mutation, matching the spec's "bit-identical to today" invariant. *)
+let load_campaign_assumeutxo_from_env
+    ~(network : Consensus.network_config) () : unit =
+  match Sys.getenv_opt "HASHHOG_CAMPAIGN_ASSUMEUTXO" with
+  | None -> ()
+  | Some path when String.trim path = "" -> ()
+  | Some path ->
+    let fail msg =
+      Printf.eprintf "[CAMPAIGN-ASSUMEUTXO] FATAL: %s (path=%s)\n%!" msg path;
+      exit 1
+    in
+    let json =
+      try Yojson.Safe.from_file path
+      with
+      | Sys_error msg -> fail ("cannot read file: " ^ msg)
+      | Yojson.Json_error msg -> fail ("invalid JSON: " ^ msg)
+    in
+    let items = match json with
+      | `List l -> l
+      | _ -> fail "top-level JSON value must be an array"
+    in
+    let parsed =
+      List.map (fun j ->
+        match campaign_entry_of_json j with
+        | Ok p -> p
+        | Error msg -> fail msg
+      ) items
+    in
+    let existing_for_network = match network.network_type with
+      | Consensus.Mainnet -> mainnet_au_data
+      | Consensus.Testnet4 -> testnet4_au_data
+      | Consensus.Regtest -> !regtest_au_data
+      | _ -> []
+    in
+    List.iter (fun p ->
+      if List.exists
+           (fun q -> q.height = p.height || Cstruct.equal q.blockhash p.blockhash)
+           existing_for_network
+      then
+        fail (Printf.sprintf
+                "campaign entry height=%d collides with a built-in/already-\
+                 loaded assumeutxo entry for this network — refusing to \
+                 start (campaign data may never override a production hash)"
+                p.height);
+      (match network.network_type with
+       | Consensus.Regtest -> register_regtest_assumeutxo p
+       | _ -> register_campaign_assumeutxo p)
+    ) parsed;
+    Printf.eprintf
+      "[CAMPAIGN-ASSUMEUTXO] loaded %d entries from %s heights=[%s]\n%!"
+      (List.length parsed) path
+      (String.concat ", "
+         (List.map (fun p -> string_of_int p.height) parsed))
 
 (* ============================================================================
    Snapshot Coin Entry

@@ -465,6 +465,25 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
   (* --txindex is accepted for Core CLI compatibility (camlcoin always
      maintains the tx index); validate its value but otherwise ignore it. *)
   ignore txindex_cli;
+  (* HASHHOG_CAMPAIGN_ASSUMEUTXO — read exactly once here, at the very top of
+     the single entry point every subcommand below (migrate / benchmark /
+     --import-utxo / normal node-run via Cli.run) funnels through, right
+     after [network] is resolved. This guarantees the flag is loaded before
+     ANY path that can call [Assume_utxo.get_assumeutxo_for_hash] /
+     [load_snapshot_into_primary] / [load_snapshot], regardless of which
+     branch below actually runs. See receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md
+     and lib/assume_utxo.ml [load_campaign_assumeutxo_from_env]. When the env
+     var is unset (the default / production case) this is a single
+     [Sys.getenv_opt] and nothing else. *)
+  let () =
+    let campaign_network_cfg = match network with
+      | `Mainnet -> Camlcoin.Consensus.mainnet
+      | `Testnet -> Camlcoin.Consensus.testnet4
+      | `Regtest -> Camlcoin.Consensus.regtest
+    in
+    Camlcoin.Assume_utxo.load_campaign_assumeutxo_from_env
+      ~network:campaign_network_cfg ()
+  in
   (* Resolve datadir early so config-file lookup can default to it. *)
   let base = Camlcoin.Cli.config_for_network network in
   let resolved_datadir = match datadir with

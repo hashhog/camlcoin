@@ -2488,7 +2488,17 @@ let bip22_of_submitblock_error (msg : string) : string =
   in
   if c "difficulty target" || c "does not meet" then "high-hash"
   else if c "merkle root" || c "mutated" then "bad-txnmrklroot"
-  else if c "witness commitment" then "bad-witness-merkle-match"
+  (* Witness-commitment failures (BIP-141 CheckWitnessMalleation,
+     validation.cpp:3870-3916). validation.ml's block_error_to_string already
+     emits Core's canonical tokens VERBATIM ("bad-witness-merkle-match" /
+     "bad-witness-nonce-size" / "unexpected-witness"), so match them directly.
+     The old "witness commitment" substring never matched any emitted string, so
+     every witness-commitment rejection collapsed to the generic "rejected"
+     bucket — the standing witness-merkle-mismatch consensus-difftest divergence
+     (camlcoin rejected correctly, but with the wrong BIP-22 token). *)
+  else if c "bad-witness-merkle-match" then "bad-witness-merkle-match"
+  else if c "bad-witness-nonce-size" then "bad-witness-nonce-size"
+  else if c "unexpected-witness" then "unexpected-witness"
   else if c "coinbase value" || c "coinbase value too high" then "bad-cb-amount"
   else if c "sigop" then "bad-blk-sigops"
   (* BIP-30 cross-block duplicate UTXO: "transaction has duplicate txid in UTXO set (BIP30)"

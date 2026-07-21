@@ -192,6 +192,20 @@ let mainnet_au_data : assumeutxo_params list = [
       "2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8"
     ~coins_count:165_095_935L
     ~chain_tx_count:1_334_000_000L;
+  (* height = 481823 — Track-B WINDOWED replay base (last pre-segwit block;
+     segwit activates at 481824). coins_hash + coins_count + chain_tx_count from
+     the boundary-snapshot result JSON (Core dumptxoutset rollback=481823);
+     blockhash from Core getblockhash 481823. Consulted ONLY via --import-utxo
+     (bin/main.ml:649) and the loadtxoutset / dumptxoutset-rollback RPCs
+     (rpc.ml:8890 / 9203) — inert for normal boot & validation. *)
+  make_au
+    ~height:481_823
+    ~blockhash_display:
+      "000000000000000000cbeff0b533f8e1189cf09dfbebf57a8ebe349362811b80"
+    ~coins_hash_display:
+      "25429c30cfa0b6051106c29d15b188d746d8e7ecd184bf34fae1cebe2ea447f4"
+    ~coins_count:51165627L
+    ~chain_tx_count:249036369L;
 ]
 
 (** Testnet4 has no Core-published AssumeUTXO entries as of release 31.99.

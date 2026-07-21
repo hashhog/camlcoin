@@ -23,6 +23,7 @@
   (digestif (>= 1.1.0))
   (mirage-crypto (>= 1.0.0))
   (zarith (>= 1.13))
+  (bigstring (>= 0.2))
   (bigstringaf (>= 0.9.0))
   (base64 (>= 3.5.0))
   (alcotest (and (>= 1.6.0) :with-test))

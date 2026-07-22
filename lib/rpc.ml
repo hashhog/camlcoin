@@ -2926,7 +2926,7 @@ let handle_getbalance (ctx : rpc_context)
     `Float (Int64.to_float total /. 100_000_000.0)
 
 let handle_getnewaddress (ctx : rpc_context)
-    (_params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match ctx.wallet with
   | None -> Error "Wallet not loaded"
   | Some wallet ->
@@ -2937,13 +2937,38 @@ let handle_getnewaddress (ctx : rpc_context)
     if not (Wallet.can_get_addresses wallet) then
       Error "Error: This wallet has no available keys"
     else begin
-      let kp = Wallet.generate_key wallet in
-      (* Save-on-mutation: a freshly derived address (keypool/index advance) must
-         survive an unclean restart, else funds sent to it before the next clean
-         shutdown become unrecoverable without a manual reseed. *)
-      Wallet.save_safe wallet;
-      let addr = Address.address_to_string kp.address in
-      Ok (`String addr)
+      (* Core getnewaddress( "label", "address_type" ): the OPTIONAL 2nd
+         positional arg selects the output type (rpc/addresses.cpp
+         getnewaddress -> ParseOutputType). The previous handler ignored it and
+         always minted the default P2WPKH, so a "bech32m" request silently got a
+         v0 address — taproot receive was unreachable even though the wallet
+         derives BIP-86 P2TR keys (Wallet.generate_key_typed .. P2TR). Honour
+         the arg. Default (absent/null) follows Core's default -addresstype
+         "bech32" => P2WPKH. *)
+      let addr_type_result =
+        match List.nth_opt params 1 with
+        | None | Some `Null | Some (`String "") -> Ok Wallet.P2WPKH
+        | Some (`String "bech32") -> Ok Wallet.P2WPKH
+        | Some (`String "bech32m") -> Ok Wallet.P2TR
+        | Some (`String "legacy") -> Ok Wallet.P2PKH
+        | Some (`String other) ->
+          (* Core accepts "p2sh-segwit" too; camlcoin's wallet key model has no
+             P2SH-P2WPKH derivation path, so it is reported as unsupported here
+             rather than silently mislabelled. Mirrors Core's
+             RPC_INVALID_ADDRESS_OR_KEY "Unknown address type" surface. *)
+          Error (Printf.sprintf "Unknown address type '%s'" other)
+        | Some _ -> Error "Invalid address type argument"
+      in
+      match addr_type_result with
+      | Error e -> Error e
+      | Ok addr_type ->
+        let kp = Wallet.generate_key_typed wallet addr_type in
+        (* Save-on-mutation: a freshly derived address (keypool/index advance)
+           must survive an unclean restart, else funds sent to it before the
+           next clean shutdown become unrecoverable without a manual reseed. *)
+        Wallet.save_safe wallet;
+        let addr = Address.address_to_string kp.Wallet.address in
+        Ok (`String addr)
     end
 
 (* sethdseed ( newkeypool "seed" )
@@ -3632,10 +3657,20 @@ let handle_createwallet (ctx : rpc_context)
          } in
          match Wallet.create_wallet wm name ~options () with
          | Ok wallet ->
-           (* Promote a watch-only wallet to the manager default so global-
-              routed wallet RPCs (the checker runs --routing global) reach it. *)
-           if disable_private_keys then
-             Hashtbl.replace wm.Wallet.wallets "" wallet;
+           (* Promote the freshly-created wallet to the manager DEFAULT (key "")
+              so a base-"/" (no /wallet/<name>) request routes to it. Core's
+              createwallet makes the new wallet immediately usable via the
+              no-URL endpoint (GetWalletForJSONRPCRequest returns it as the sole
+              / most-relevant loaded wallet); the previous code promoted ONLY
+              watch-only (disable_private_keys) wallets, so a normal keyed
+              createwallet left base routing pointing at the stale blank boot
+              wallet loaded under "" at startup — every subsequent getnewaddress
+              / walletcreatefundedpsbt on "/" hit that keyless wallet and failed
+              "This wallet has no available keys" / "Insufficient funds". The
+              watch-only rationale in the original comment applies identically to
+              keyed wallets, so promote unconditionally. Named access via
+              /wallet/<name> is unaffected (still registered under its name). *)
+           Hashtbl.replace wm.Wallet.wallets "" wallet;
            let base = [("name", `String name)] in
            let with_warnings =
              if !warnings = [] then base
@@ -8338,11 +8373,21 @@ let handle_getdescriptorinfo (_ctx : rpc_context)
        Ok (`Assoc [
          ("descriptor", `String info.Descriptor.descriptor);
          ("checksum", `String (
-           (* Extract just the checksum from "desc#checksum" *)
-           match String.rindex_opt info.Descriptor.descriptor '#' with
-           | Some pos ->
-             String.sub info.descriptor (pos + 1)
-               (String.length info.descriptor - pos - 1)
+           (* Core semantics (rpc/output_script.cpp getdescriptorinfo ->
+              GetDescriptorChecksum -> CheckChecksum): the "checksum" field is
+              the BIP-380 checksum of the INPUT descriptor AS GIVEN, with any
+              existing "#<checksum>" suffix stripped — NOT the checksum of the
+              re-serialized canonical form. The two differ whenever the input
+              is non-canonical (e.g. hardened marker "h" vs "'", or a tprv the
+              canonical form normalises to tpub), so keying off info.descriptor
+              (the canonical) diverged for every corpus entry. *)
+           let stripped =
+             match String.rindex_opt desc_str '#' with
+             | Some pos -> String.sub desc_str 0 pos
+             | None -> desc_str
+           in
+           match Descriptor.descriptor_checksum stripped with
+           | Some c -> c
            | None -> ""
          ));
          ("isrange", `Bool info.is_range);
@@ -14068,7 +14113,21 @@ let context_with_wallet (ctx : rpc_context) (wallet_name : string option) : rpc_
   | None, Some wm ->
     (match Wallet.get_default_wallet wm with
      | Some w -> { ctx with wallet = Some w }
-     | None -> ctx)
+     | None ->
+       (* Core GetWalletForJSONRPCRequest (wallet/rpc/util.cpp): with NO
+          /wallet/<name> in the URL and EXACTLY ONE wallet loaded, the request
+          routes to that sole wallet. Only when zero or many are loaded does it
+          fall back / error. Previously a normal (keyed) createwallet — which is
+          NOT promoted to the "" default (that promotion is watch-only-only) —
+          left base-"/" routing pointing at the stale keyless boot wallet
+          captured at context-build time, so getnewaddress on the freshly
+          created single wallet failed "no available keys". *)
+       (match Wallet.list_wallets wm with
+        | [only] ->
+          (match Wallet.get_wallet wm only with
+           | Some w -> { ctx with wallet = Some w }
+           | None -> ctx)
+        | _ -> ctx))
   | Some name, Some wm ->
     (* Override wallet in context with specific wallet from manager *)
     (match Wallet.get_wallet wm name with

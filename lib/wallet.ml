@@ -592,6 +592,22 @@ let list_find_index (pred : 'a -> bool) (lst : 'a list) : int option =
   in
   aux 0 lst
 
+(* BIP-86 taproot OUTPUT key (x-only) for a private key:
+   Q = P + int(H_TapTweak(P))*G, key-path-only (no script tree). This is the key
+   that a P2TR receive/change scriptPubKey MUST commit to, because the signer
+   (sign_transaction_inputs / PSBT) signs with the TWEAKED key via
+   secp256k1_keypair_xonly_tweak_add — a signature that verifies against Q, not
+   against the raw internal key P. The prior wallet code committed the raw
+   internal key P in the address / is_mine / import paths while signing for Q,
+   so Core rejected every taproot key-path spend as "Invalid Schnorr signature".
+   This matches Core's BIP-86 descriptor output (camlcoin's own deriveaddresses
+   is byte-exact vs Core) and the already-correct build_change_script.
+   NOTE: any taproot UTXO a pre-fix wallet received sat at OP_1 <P> and was
+   NEVER Core-spendable (the sig was always for Q), so moving ownership to Q
+   loses no genuinely spendable funds. *)
+let taproot_output_key_of_privkey (private_key : Cstruct.t) : Cstruct.t =
+  Crypto.compute_taproot_output_key (Crypto.derive_xonly_pubkey private_key) None
+
 (* Generate a new keypair with specified address type.
    If master_key is set, derive via appropriate BIP path; otherwise use random. *)
 let generate_key_typed (w : t) (addr_type : address_type) : key_pair =
@@ -623,9 +639,9 @@ let generate_key_typed (w : t) (addr_type : address_type) : key_pair =
   let public_key = Crypto.derive_public_key ~compressed:true private_key in
   let address = match addr_type with
     | P2TR ->
-      (* P2TR uses x-only pubkey for address *)
-      let xonly = Crypto.derive_xonly_pubkey private_key in
-      Address.of_pubkey ~network:w.network addr_constructor xonly
+      (* P2TR address = BIP-86 TWEAKED output key (not the raw internal key). *)
+      let output_key = taproot_output_key_of_privkey private_key in
+      Address.of_pubkey ~network:w.network addr_constructor output_key
     | _ ->
       Address.of_pubkey ~network:w.network addr_constructor public_key
   in
@@ -669,8 +685,9 @@ let generate_change_key_typed (w : t) (addr_type : address_type) : key_pair =
   let public_key = Crypto.derive_public_key ~compressed:true private_key in
   let address = match addr_type with
     | P2TR ->
-      let xonly = Crypto.derive_xonly_pubkey private_key in
-      Address.of_pubkey ~network:w.network addr_constructor xonly
+      (* P2TR change address = BIP-86 TWEAKED output key (see receive path). *)
+      let output_key = taproot_output_key_of_privkey private_key in
+      Address.of_pubkey ~network:w.network addr_constructor output_key
     | _ ->
       Address.of_pubkey ~network:w.network addr_constructor public_key
   in
@@ -714,9 +731,13 @@ let is_mine (w : t) (script_pubkey : Cstruct.t)
       Cstruct.equal kp_hash hash
     ) w.keys
   | Script.P2TR_script xonly_hash ->
+    (* Match the BIP-86 TWEAKED output key committed in the scriptPubKey, not
+       the raw internal key — so the wallet recognises (and can then sign) the
+       taproot coins it actually owns. Must stay consistent with the tweaked
+       address minted in generate_key_typed / import. *)
     List.find_opt (fun kp ->
-      let xonly = Crypto.derive_xonly_pubkey kp.private_key in
-      Cstruct.equal xonly xonly_hash
+      let output_key = taproot_output_key_of_privkey kp.private_key in
+      Cstruct.equal output_key xonly_hash
     ) w.keys
   | _ -> None
 
@@ -794,8 +815,9 @@ let import_wif (w : t) ?(addr_type = P2WPKH) (wif : string) : (key_pair, string)
     in
     let address = match addr_type with
       | P2TR ->
-        let xonly = Crypto.derive_xonly_pubkey private_key in
-        Address.of_pubkey ~network:w.network address_constructor xonly
+        (* P2TR imported key address = BIP-86 TWEAKED output key. *)
+        let output_key = taproot_output_key_of_privkey private_key in
+        Address.of_pubkey ~network:w.network address_constructor output_key
       | _ ->
         Address.of_pubkey ~network:w.network address_constructor public_key
     in
@@ -2936,8 +2958,9 @@ let load_wallet_json (w : t) (network : [`Mainnet | `Testnet | `Regtest]) (json 
               in
               let address = match addr_type with
                 | P2TR ->
-                  let xonly = Crypto.derive_xonly_pubkey private_key in
-                  Address.of_pubkey ~network addr_constructor xonly
+                  (* P2TR address = BIP-86 TWEAKED output key. *)
+                  let output_key = taproot_output_key_of_privkey private_key in
+                  Address.of_pubkey ~network addr_constructor output_key
                 | _ ->
                   Address.of_pubkey ~network addr_constructor public_key
               in

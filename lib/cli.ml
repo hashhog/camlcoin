@@ -1167,16 +1167,16 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
 
      The [*_and_persist] variants advance [last_synced_height] and durably
      save after each connect/disconnect, so an unclean restart never loses
-     wallet state since the last block (not just since the last clean exit). *)
-  (match wallet with
-   | Some w ->
-     Sync.set_wallet_hooks chain
-       ~on_connect:(fun block height ->
-         Wallet.scan_block_and_persist w block height)
-       ~on_disconnect:(fun block height ->
-         Wallet.unscan_block_and_persist w block height)
-       ()
-   | None -> ());
+     wallet state since the last block (not just since the last clean exit).
+
+     NOTE: the actual [Sync.set_wallet_hooks] call is deferred until AFTER the
+     [wallet_manager] is built (below), because Core's CWallet::blockConnected
+     notifies EVERY loaded wallet — not just the boot wallet captured here. A
+     wallet created later via RPC [createwallet] is registered in the manager,
+     and blocks connected after that (generate* / submitblock / P2P) must scan
+     into it too, or its coinbase/receive UTXOs are never credited
+     (getbalance/listunspent stay empty). Wiring only the boot wallet here was
+     the pre-fix behaviour that left RPC-created wallets permanently at 0. *)
 
   (* Wire the live mempool block-connect eviction hook so the forward
      block-connect choke-points in [Sync] ([process_new_block] /
@@ -1254,6 +1254,51 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
                   | Some w -> Some w | None -> wallet)
     | None -> wallet
   in
+
+  (* Wire the block-connect -> wallet UTXO ledger hook (mirrors Bitcoin Core's
+     CWallet::blockConnected / blockDisconnected). Deferred to here — AFTER the
+     wallet_manager is built — so the hook scans EVERY loaded wallet, read from
+     the manager's live set at call time. This is why a wallet created later via
+     RPC [createwallet] gets its coinbase/receive coins credited: the closure
+     re-reads [wm.wallets] on each connect rather than capturing a single
+     boot-wallet ref. [scan_block] is {txid,vout}-idempotent, so a wallet
+     reachable under two manager keys (e.g. "" plus its own name, as watch-only
+     promotion does) is credited exactly once via physical-identity dedup.
+     The [*_and_persist] variants advance each wallet's own last_synced_height
+     and durably save after every connect/disconnect, so an unclean restart
+     never loses wallet state since the last block. *)
+  (match wallet_manager with
+   | Some wm ->
+     let for_each_loaded_wallet (f : Wallet.t -> unit) : unit =
+       (* Dedup by physical identity: the same wallet object may be registered
+          under multiple manager keys; scan it once per block. *)
+       let seen = ref [] in
+       Hashtbl.iter (fun _ w ->
+         if not (List.memq w !seen) then begin
+           seen := w :: !seen;
+           f w
+         end) wm.Wallet.wallets
+     in
+     Sync.set_wallet_hooks chain
+       ~on_connect:(fun block height ->
+         for_each_loaded_wallet (fun w ->
+           Wallet.scan_block_and_persist w block height))
+       ~on_disconnect:(fun block height ->
+         for_each_loaded_wallet (fun w ->
+           Wallet.unscan_block_and_persist w block height))
+       ()
+   | None ->
+     (* Wallet disabled -> no manager; fall back to the boot wallet if any. *)
+     (match boot_wallet with
+      | Some w ->
+        Sync.set_wallet_hooks chain
+          ~on_connect:(fun block height ->
+            Wallet.scan_block_and_persist w block height)
+          ~on_disconnect:(fun block height ->
+            Wallet.unscan_block_and_persist w block height)
+          ()
+      | None -> ()));
+
   let rpc_ctx = Rpc.create_context
     ~chain ~mempool ~peer_manager
     ~wallet ~fee_estimator ~network

@@ -799,8 +799,22 @@ let process_checkblock (j : Yojson.Safe.t) : string =
      not a consensus divergence (the production path never hits the fallback on
      the canonical chain). *)
   let bip34_height_hash = Consensus.mainnet.Consensus.bip34_hash in
-  (* MAINNET consensus flags at spend_height (post-Taproot: all forks active). *)
-  let flags = Consensus.get_block_script_flags spend_height Consensus.mainnet in
+  (* MAINNET consensus flags for THIS block.
+     WAVE B: the block hash is MANDATORY here, not optional.  P2SH|WITNESS|
+     TAPROOT are now unconditional at every height (Core validation.cpp:2262),
+     so the hash-keyed script_flag_exceptions lookup
+     (kernel/chainparams.cpp:85-88) is load-bearing on every block: without the
+     hash this shim would compute TAPROOT-on at 692261 and P2SH-on at 170060
+     and false-REJECT both grandfathered blocks — reporting a divergence
+     against camlcoin's own correct production behaviour, since every
+     production caller (sync.ml:3231/4598/6261/6484, validation.ml:2242,
+     mining.ml:865, assume_utxo.ml:1633) does pass the real hash.
+     `block` is already deserialized above, so the hash costs one sha256d.
+     Note: compute_block_hash returns INTERNAL LE order, which is exactly the
+     order the exception table is keyed on. *)
+  let block_hash = Crypto.compute_block_hash block.Types.header in
+  let flags =
+    Consensus.get_block_script_flags ~block_hash spend_height Consensus.mainnet in
   (* median_time (= the prev block's GetMedianTimePast). Not supplied by the
      corpus, so we synthesize a faithful value: ONE SECOND below the block's own
      timestamp. Two camlcoin gates consume median_time:

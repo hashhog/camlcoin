@@ -42,7 +42,7 @@
        G16 Sighash spend_type byte                                PRESENT
        G17 ANYONECANPAY handling                                  PRESENT
        G18 prevouts.size == vin.size invariant                    PRESENT
-       G19 TAPROOT activation flag gated by taproot_height        PRESENT
+       G19 TAPROOT unconditional + hash-keyed 692261 exception    PRESENT
 
      BIP-342 (11):
        G20 Control block size 33 + 32k, 0 <= k <= 128             PRESENT
@@ -283,17 +283,60 @@ let g18_prevouts_inputs_invariant () =
     "G18 sighash asserts prevouts length == inputs length" true
     (contains_substring s "n_prevouts <> n_inputs")
 
-(* G19: TAPROOT activation flag gated by taproot_height *)
+(* G19: TAPROOT is UNCONDITIONAL in the block-script-flag computer, with the
+   692261 violator handled by the hash-keyed exception table.
+
+   REWRITTEN IN WAVE B.  This gate previously asserted the opposite — that
+   validation.ml set SCRIPT_VERIFY_TAPROOT iff `height >= network.taproot_height`.
+   That was never Core's behaviour: Core has NO taprootHeight in its consensus
+   params at all.  It sets SCRIPT_VERIFY_P2SH|WITNESS|TAPROOT unconditionally
+   for every block (validation.cpp:2262, since v23) and deviates only via
+   consensus.script_flag_exceptions, keyed on BLOCK HASH
+   (kernel/chainparams.cpp:85-88).  The old gate therefore pinned an invented
+   height gate, and the second, hash-blind copy of GetBlockScriptFlags that it
+   grepped for has been removed from validation.ml (see the tombstone there).
+
+   Asserted BEHAVIOURALLY rather than by source grep, so it cannot be satisfied
+   by a comment and cannot be broken by reformatting. *)
 let g19_activation_flag () =
-  let v = validation_ml () in
   let c = consensus_ml () in
+  let v = validation_ml () in
+  let taproot = Camlcoin.Consensus.script_verify_taproot in
+  let flags ?(hash = Camlcoin.Types.zero_hash) h net =
+    Camlcoin.Consensus.get_block_script_flags ~block_hash:hash h net in
+  (* G19a: TAPROOT on at every height, on every network, with no gate. *)
+  List.iter (fun (label, net) ->
+    List.iter (fun h ->
+      Alcotest.(check int)
+        (Printf.sprintf "G19a TAPROOT unconditional: %s height %d" label h)
+        taproot (flags h net land taproot))
+      [0; 1; 170060; 481823; 692261; 709631; 709632; 800000])
+    [ ("mainnet",  Camlcoin.Consensus.mainnet);
+      ("testnet3", Camlcoin.Consensus.testnet);
+      ("testnet4", Camlcoin.Consensus.testnet4);
+      ("regtest",  Camlcoin.Consensus.regtest) ];
+  (* G19b: the 692261 Taproot violator clears TAPROOT — and ONLY via the
+     block-hash exception, never via height. *)
+  let violator = Camlcoin.Types.hash256_of_hex
+    "ad95e3a15ee5ffd585c5e81d44b56a981e842d5bc3140f000000000000000000" in
+  Alcotest.(check int) "G19b TAPROOT cleared for the 692261 exception hash" 0
+    (flags ~hash:violator 692261 Camlcoin.Consensus.mainnet land taproot);
+  Alcotest.(check int) "G19b TAPROOT still cleared for that hash at a later height" 0
+    (flags ~hash:violator 800000 Camlcoin.Consensus.mainnet land taproot);
+  Alcotest.(check int) "G19b TAPROOT set at 692261 for any other hash" taproot
+    (flags 692261 Camlcoin.Consensus.mainnet land taproot);
+  (* G19c: taproot_height survives ONLY as the BIP9 min_activation_height
+     parity anchor (Core keeps DEPLOYMENT_TAPROOT.min_activation_height too);
+     it must no longer gate a script flag anywhere in lib/. *)
   Alcotest.(check bool)
-    "G19a validation.ml sets script_verify_taproot iff height >= taproot_height" true
-    (contains_substring v "height >= network.taproot_height" &&
-     contains_substring v "script_verify_taproot");
+    "G19c consensus.ml still declares taproot_height for BIP9 parity" true
+    (contains_substring c "taproot_height : int");
   Alcotest.(check bool)
-    "G19b consensus.ml declares taproot_height in network params" true
-    (contains_substring c "taproot_height : int")
+    "G19c no taproot_height script-flag gate remains in validation.ml" false
+    (contains_substring v "height >= network.taproot_height");
+  Alcotest.(check bool)
+    "G19c no taproot_height script-flag gate remains in consensus.ml" false
+    (contains_substring c "if height >= network.taproot_height then flags lor")
 
 (* -- BIP-342 Tapscript opcodes + sigops budget --------------------------- *)
 
@@ -557,7 +600,7 @@ let () =
     "G18 prevouts.size == vin.size", [
       test_case "PRESENT" `Quick g18_prevouts_inputs_invariant;
     ];
-    "G19 TAPROOT activation flag", [
+    "G19 TAPROOT unconditional + hash-keyed exception", [
       test_case "PRESENT" `Quick g19_activation_flag;
     ];
 

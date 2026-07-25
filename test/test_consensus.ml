@@ -1464,65 +1464,143 @@ let test_permitted_difficulty_transition () =
    Bitcoin Core: src/validation.cpp GetBlockScriptFlags script_flag_exceptions
    ============================================================================ *)
 
-(* Test that the mainnet BIP-16 exception block (height 170060) returns
-   SCRIPT_VERIFY_NONE when the correct hash is passed, and normal P2SH-only
-   flags for a non-exception hash at the same height.
-   Canonical override: 0 (no flags at all, not even P2SH).
+(* WAVE B: the base flag set is P2SH|WITNESS|TAPROOT at EVERY height
+   (Core validation.cpp:2262), and an exception hit REPLACES that set before
+   the four height-gated flags are OR'd back on.  The expected values below are
+   the ones Core itself produces; they are cross-checked byte-for-byte against
+   tools/boundary-blocks/<h>/exception-fixture.json ("expected_script_flags"
+   and "expected_script_flags_if_no_exception"). *)
+let trio =
+  Consensus.script_verify_p2sh
+  lor Consensus.script_verify_witness
+  lor Consensus.script_verify_taproot
+
+(* Test the mainnet BIP-16 exception block (height 170060).
+   Override = SCRIPT_VERIFY_NONE.  No height-gated flag is active at 170060
+   (DERSIG 363725 / CLTV 388381 / CSV 419328 / SegWit 481824 are all later),
+   so the effective flag set is 0x0 — matching the fixture.
+   The non-exception control at that height is now the full trio, 0x20801,
+   NOT "P2SH only": that is the Wave B flip.
    display hash: 00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22 *)
 let test_script_flag_exception_mainnet_bip16 () =
   let exception_hash = Types.hash256_of_hex
     "229c4fac88bab194eb08f1a528cc308ded2397f4f4eb6e75dc02000000000000" in
-  (* With the exception hash: override fires → 0 (no flags) *)
-  Alcotest.(check int) "mainnet BIP16 exception: override fires" 0
+  (* With the exception hash: override REPLACES the trio → 0 (no flags) *)
+  Alcotest.(check int) "mainnet BIP16 exception: override fires (fixture 0x0)" 0
     (Consensus.get_block_script_flags ~block_hash:exception_hash 170060 Consensus.mainnet);
-  (* With zero_hash (non-exception) at the same height: height-derived flags.
-     Height 170060 is pre-DERSIG/CLTV/CSV/SegWit/Taproot, so only P2SH. *)
-  let p2sh = Consensus.script_verify_p2sh in
-  Alcotest.(check int) "mainnet height 170060 normal hash: P2SH only" p2sh
+  (* With zero_hash (non-exception) at the same height: unconditional trio.
+     Fixture expected_script_flags_if_no_exception.mask = 0x20801. *)
+  Alcotest.(check int)
+    "mainnet height 170060 normal hash: unconditional P2SH|WITNESS|TAPROOT (fixture 0x20801)"
+    0x20801
+    (Consensus.get_block_script_flags ~block_hash:Types.zero_hash 170060 Consensus.mainnet);
+  Alcotest.(check int) "…and that control is exactly the trio" trio
     (Consensus.get_block_script_flags ~block_hash:Types.zero_hash 170060 Consensus.mainnet)
 
-(* Test that the mainnet Taproot exception block (height 692261) returns
-   P2SH | WITNESS only when the correct hash is passed, and the full
-   height-derived flags (which additionally include DERSIG/CLTV/CSV/NULLDUMMY)
-   for a non-exception hash at the same height.
-   Canonical override: script_verify_p2sh | script_verify_witness.
+(* Test the mainnet Taproot exception block (height 692261).
+
+   THIS IS THE REPLACE-THEN-OR DISCRIMINATOR.  The override is P2SH|WITNESS,
+   but DERSIG, CLTV, CSV and NULLDUMMY are ALL active at 692261, and Core ORs
+   them on top of the override (validation.cpp:2268-2286 run AFTER the
+   exception assignment at :2263-2266).  Core's answer is therefore 0xe15.
+   An early-return on the exception hit yields 0x801 and silently drops four
+   consensus flags — the bug this test now pins.
    display hash: 0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad *)
 let test_script_flag_exception_mainnet_taproot () =
   let exception_hash = Types.hash256_of_hex
     "ad95e3a15ee5ffd585c5e81d44b56a981e842d5bc3140f000000000000000000" in
-  let expected_override =
+  let raw_override =
     Consensus.script_verify_p2sh lor Consensus.script_verify_witness in
-  (* With the exception hash: override fires → P2SH | WITNESS (no taproot, no DERSIG etc.) *)
-  Alcotest.(check int) "mainnet taproot exception: override fires" expected_override
-    (Consensus.get_block_script_flags ~block_hash:exception_hash 692261 Consensus.mainnet);
-  (* With zero_hash at the same height: normal flags include DERSIG, CLTV, CSV,
-     WITNESS, NULLDUMMY (height 692261 is below taproot_height=709632). *)
-  let normal_flags =
-    Consensus.script_verify_p2sh
-    lor Consensus.script_verify_dersig
+  let height_gated =
+    Consensus.script_verify_dersig
     lor Consensus.script_verify_checklocktimeverify
     lor Consensus.script_verify_checksequenceverify
-    lor Consensus.script_verify_witness
     lor Consensus.script_verify_nulldummy in
-  Alcotest.(check int) "mainnet height 692261 normal hash: full pre-taproot flags" normal_flags
+  let got =
+    Consensus.get_block_script_flags ~block_hash:exception_hash 692261 Consensus.mainnet in
+  (* Fixture expected_script_flags.mask = 0xe15 *)
+  Alcotest.(check int) "mainnet taproot exception: replace-then-OR (fixture 0xe15)"
+    0xe15 got;
+  Alcotest.(check int) "…= override lor the four height-gated flags"
+    (raw_override lor height_gated) got;
+  (* Guard against a regression to early-return, which would give 0x801. *)
+  Alcotest.(check bool) "exception result is NOT the bare override (early-return bug)"
+    true (got <> raw_override);
+  (* TAPROOT must be the only trio bit stripped. *)
+  Alcotest.(check int) "TAPROOT cleared, P2SH|WITNESS kept" 0
+    (got land Consensus.script_verify_taproot);
+  Alcotest.(check int) "P2SH and WITNESS survive the override" raw_override
+    (got land raw_override);
+  (* With zero_hash at the same height: trio + the four height-gated flags.
+     Fixture expected_script_flags_if_no_exception.mask = 0x20e15. *)
+  Alcotest.(check int)
+    "mainnet height 692261 normal hash: trio + height flags (fixture 0x20e15)"
+    0x20e15
     (Consensus.get_block_script_flags ~block_hash:Types.zero_hash 692261 Consensus.mainnet)
 
-(* Test that the testnet3 BIP-16 exception block (height 514) returns
-   SCRIPT_VERIFY_NONE when the correct hash is passed, and normal flags for a
-   non-exception hash at the same height.
-   Canonical override: 0.
+(* Test the testnet3 BIP-16 exception block (height 514).
+   Override = SCRIPT_VERIFY_NONE; testnet3 DERSIG 330776 / CLTV 581885 /
+   CSV 770112 / SegWit 834624 are all far later, so the effective set is 0.
    display hash: 00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105 *)
 let test_script_flag_exception_testnet3_bip16 () =
   let exception_hash = Types.hash256_of_hex
     "05b132a4f74a8799a57a4202d0eeb09612cc08d295401f007c4530dd00000000" in
-  (* With exception hash: override fires → 0 (no flags) *)
+  (* With exception hash: override REPLACES the trio → 0 (no flags) *)
   Alcotest.(check int) "testnet3 BIP16 exception: override fires" 0
     (Consensus.get_block_script_flags ~block_hash:exception_hash 514 Consensus.testnet);
-  (* With zero_hash at same height on testnet3: height-derived flags.
-     testnet3 bip66_height=330776, bip65_height=581885 — both > 514, so P2SH only. *)
-  let p2sh = Consensus.script_verify_p2sh in
-  Alcotest.(check int) "testnet3 height 514 normal hash: P2SH only" p2sh
+  (* With zero_hash at same height on testnet3: unconditional trio. *)
+  Alcotest.(check int) "testnet3 height 514 normal hash: unconditional trio" trio
     (Consensus.get_block_script_flags ~block_hash:Types.zero_hash 514 Consensus.testnet)
+
+(* WAVE B: the base trio must be on at EVERY height, on every network, with no
+   BIP16Height / taprootHeight gate anywhere.  Core has no such parameters
+   (validation.cpp:2262).  Sampled well below every camlcoin activation height
+   so a reintroduced gate cannot hide. *)
+let test_base_trio_unconditional_at_all_heights () =
+  List.iter (fun (label, network) ->
+    List.iter (fun height ->
+      let flags =
+        Consensus.get_block_script_flags ~block_hash:Types.zero_hash height network in
+      Alcotest.(check int)
+        (Printf.sprintf "%s height %d: P2SH|WITNESS|TAPROOT unconditional" label height)
+        trio (flags land trio))
+      [0; 1; 2; 170059; 170060; 170061; 363724; 481823; 692261; 709631; 709632; 800000])
+    [ ("mainnet",  Consensus.mainnet);
+      ("testnet3", Consensus.testnet);
+      ("testnet4", Consensus.testnet4);
+      ("regtest",  Consensus.regtest) ]
+
+(* WAVE B: DERSIG / CLTV / CSV / NULLDUMMY are the ONLY flags that stay
+   height-gated (Core validation.cpp:2268-2286).  Each must be OFF one block
+   before its activation height and ON at it. *)
+let test_only_four_flags_remain_height_gated () =
+  let n = Consensus.mainnet in
+  let f h = Consensus.get_block_script_flags ~block_hash:Types.zero_hash h n in
+  List.iter (fun (label, activation, bit) ->
+    Alcotest.(check int) (label ^ " off one block before activation") 0
+      (f (activation - 1) land bit);
+    Alcotest.(check int) (label ^ " on at activation") bit
+      (f activation land bit))
+    [ ("DERSIG",    n.bip66_height,  Consensus.script_verify_dersig);
+      ("CLTV",      n.bip65_height,  Consensus.script_verify_checklocktimeverify);
+      ("CSV",       n.csv_height,    Consensus.script_verify_checksequenceverify);
+      ("NULLDUMMY", n.segwit_height, Consensus.script_verify_nulldummy) ];
+  (* WITNESS specifically must NOT be gated on segwit_height any more. *)
+  Alcotest.(check int) "WITNESS is on one block before segwit_height"
+    Consensus.script_verify_witness
+    (f (n.segwit_height - 1) land Consensus.script_verify_witness);
+  (* Nothing outside trio + the four may ever be set by the consensus computer. *)
+  let allowed =
+    trio
+    lor Consensus.script_verify_dersig
+    lor Consensus.script_verify_checklocktimeverify
+    lor Consensus.script_verify_checksequenceverify
+    lor Consensus.script_verify_nulldummy in
+  List.iter (fun h ->
+    Alcotest.(check int)
+      (Printf.sprintf "no policy flag leaks into consensus flags at height %d" h) 0
+      (f h land (lnot allowed)))
+    [0; 1; 481824; 709632; 800000; 1_000_000]
 
 (* Test that testnet4/regtest have NO exception entries
    (exception table is empty for those networks).  We verify this by checking
@@ -1547,6 +1625,141 @@ let test_script_flag_exception_empty_on_other_nets () =
     Consensus.get_block_script_flags ~block_hash:Types.zero_hash 170060 Consensus.regtest in
   Alcotest.(check int) "regtest: mainnet hash does not trigger exception" regtest_normal
     (Consensus.get_block_script_flags ~block_hash:mainnet_hash 170060 Consensus.regtest)
+
+(* ============================================================================
+   W-B0 NEGATIVE CONTROL — the BYTE-REVERSED exception hash must NOT match
+   ============================================================================
+
+   Asserting the flag set AT an exception block is VACUOUS on its own: at
+   height 170060 "the exception fired and returned SCRIPT_VERIFY_NONE" and
+   "no exception fired and every flag is off by height" give the SAME answer.
+   A byte-order slip anywhere in the chain (the stored constant, the storage
+   convention, or the block-hash producer) would therefore pass the entire
+   positive suite while the lookup never fires on a real block — the
+   silently-inert table the Wave B call-site census went hunting for.
+
+   camlcoin is the one node in the fleet that stores the PRE-REVERSED internal
+   form in [mainnet_script_flag_exceptions] / [testnet3_script_flag_exceptions],
+   so the byte-reversed probe here is literally Core's DISPLAY hex.  That makes
+   this control the direct test of camlcoin's storage convention: if the table
+   were ever "corrected" to display hex, or if a caller handed
+   [get_block_script_flags] a display-order hash, this test fails.
+
+   Per entry:
+     (a) reversed == a known-non-exception control hash, at the violator's own
+         height AND at [trio_live_height], a height where all four remaining
+         height-gated flags are active.  Compared against a control rather
+         than a hard-coded by-height answer, so it survives future param edits.
+     (b) non-vacuity guard: the CORRECT hash must NOT equal the control at
+         those heights.  Without this, (a) proves nothing.  This arm also pins
+         Core's REPLACE-THEN-OR value (override lor the active height flags),
+         so a regression to early-return fails here as well.
+     (c) at [trio_live_height] the reversed hash carries the FULL
+         P2SH|WITNESS|TAPROOT trio while the correct hash does not.  That pair
+         is what a byte-order slip cannot fake.
+
+   Bitcoin Core: validation.cpp:2262 (unconditional P2SH|WITNESS|TAPROOT),
+   kernel/chainparams.cpp:85-88 + :210-211 (hash-keyed script_flag_exceptions). *)
+
+(* Reverse a hex string byte-wise (2 chars at a time). *)
+let byte_reverse_hex (s : string) : string =
+  let n = String.length s / 2 in
+  String.concat "" (List.init n (fun i -> String.sub s ((n - 1 - i) * 2) 2))
+
+(* One negative-control case.  [internal_hex] is the table's storage form,
+   [display_hex] is Core's display form = the byte-reversed probe. *)
+let check_byte_reversed_negative_control
+    ~(label : string)
+    ~(network : Consensus.network_config)
+    ~(internal_hex : string)
+    ~(display_hex : string)
+    ~(violator_height : int)
+    ~(trio_live_height : int)
+    ~(override : int) =
+  (* Pin the two literals as genuine byte-reverses of each other; guards the
+     helper against silently becoming the identity function. *)
+  Alcotest.(check string) (label ^ ": literals are byte-reverses")
+    display_hex (byte_reverse_hex internal_hex);
+  Alcotest.(check bool) (label ^ ": not a byte-order palindrome") true
+    (internal_hex <> display_hex);
+
+  let correct = Types.hash256_of_hex internal_hex in
+  let reversed = Types.hash256_of_hex display_hex in
+  let control = Types.zero_hash in
+  let flags h bh = Consensus.get_block_script_flags ~block_hash:bh h network in
+  (* Core's replace-then-OR contract, expressed against the runtime control so
+     it stays true at any height and on any network: an exception hit yields
+     exactly [override] plus whichever of DERSIG/CLTV/CSV/NULLDUMMY are active,
+     and the active set is observable as the non-trio bits of the control. *)
+  let expected h = override lor (flags h control land (lnot trio)) in
+
+  (* (a) The reversed hash must be ordinary at BOTH heights. *)
+  Alcotest.(check int)
+    (label ^ ": byte-reversed hash does NOT fire at the violator height")
+    (flags violator_height control) (flags violator_height reversed);
+  Alcotest.(check int)
+    (label ^ ": byte-reversed hash does NOT fire at the trio-live height")
+    (flags trio_live_height control) (flags trio_live_height reversed);
+
+  (* (b) Non-vacuity: the correct hash must differ from the control, and must
+     return exactly Core's replace-then-OR value. *)
+  Alcotest.(check int) (label ^ ": exception fires at the violator height")
+    (expected violator_height) (flags violator_height correct);
+  Alcotest.(check bool)
+    (label ^ ": violator-height assertion is NOT vacuous (override <> control)")
+    true (flags violator_height correct <> flags violator_height control);
+  Alcotest.(check int) (label ^ ": exception fires at the trio-live height")
+    (expected trio_live_height) (flags trio_live_height correct);
+  (* The trio-live height is chosen so that at least one height-gated flag is
+     active; that is what makes replace-then-OR distinguishable from an
+     early-return.  Assert it rather than assume it. *)
+  Alcotest.(check bool)
+    (label ^ ": trio-live height actually has height-gated flags active")
+    true (flags trio_live_height control land (lnot trio) <> 0);
+  Alcotest.(check bool)
+    (label ^ ": exception result is NOT the bare override (early-return bug)")
+    true (flags trio_live_height correct <> override);
+  Alcotest.(check bool)
+    (label ^ ": trio-live assertion is NOT vacuous (override <> control)")
+    true (flags trio_live_height correct <> flags trio_live_height control);
+
+  (* (c) reversed => full trio; correct => not the full trio. *)
+  Alcotest.(check int)
+    (label ^ ": byte-reversed hash carries the full P2SH|WITNESS|TAPROOT trio")
+    trio (flags trio_live_height reversed land trio);
+  Alcotest.(check bool)
+    (label ^ ": exception hash does NOT carry the full trio")
+    true (flags trio_live_height correct land trio <> trio)
+
+let test_script_flag_exception_mainnet_bip16_byte_reversed () =
+  check_byte_reversed_negative_control
+    ~label:"mainnet BIP16 (height 170060)"
+    ~network:Consensus.mainnet
+    ~internal_hex:"229c4fac88bab194eb08f1a528cc308ded2397f4f4eb6e75dc02000000000000"
+    ~display_hex:"00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"
+    ~violator_height:170060
+    ~trio_live_height:800000 (* DERSIG|CLTV|CSV|NULLDUMMY all active there *)
+    ~override:0
+
+let test_script_flag_exception_mainnet_taproot_byte_reversed () =
+  check_byte_reversed_negative_control
+    ~label:"mainnet taproot (height 692261)"
+    ~network:Consensus.mainnet
+    ~internal_hex:"ad95e3a15ee5ffd585c5e81d44b56a981e842d5bc3140f000000000000000000"
+    ~display_hex:"0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"
+    ~violator_height:692261
+    ~trio_live_height:800000 (* DERSIG|CLTV|CSV|NULLDUMMY all active there *)
+    ~override:(Consensus.script_verify_p2sh lor Consensus.script_verify_witness)
+
+let test_script_flag_exception_testnet3_bip16_byte_reversed () =
+  check_byte_reversed_negative_control
+    ~label:"testnet3 BIP16 (height 514)"
+    ~network:Consensus.testnet
+    ~internal_hex:"05b132a4f74a8799a57a4202d0eeb09612cc08d295401f007c4530dd00000000"
+    ~display_hex:"00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105"
+    ~violator_height:514
+    ~trio_live_height:2100000 (* DERSIG|CLTV|CSV|NULLDUMMY all active there *)
+    ~override:0
 
 let () =
   let open Alcotest in
@@ -1645,5 +1858,15 @@ let () =
       test_case "mainnet taproot exception block" `Quick test_script_flag_exception_mainnet_taproot;
       test_case "testnet3 BIP16 exception block" `Quick test_script_flag_exception_testnet3_bip16;
       test_case "no exceptions on testnet4/regtest" `Quick test_script_flag_exception_empty_on_other_nets;
+      test_case "Wave B: base trio unconditional at every height/network"
+        `Quick test_base_trio_unconditional_at_all_heights;
+      test_case "Wave B: only DERSIG/CLTV/CSV/NULLDUMMY stay height-gated"
+        `Quick test_only_four_flags_remain_height_gated;
+      test_case "W-B0 negative control: mainnet BIP16 byte-reversed hash does NOT fire"
+        `Quick test_script_flag_exception_mainnet_bip16_byte_reversed;
+      test_case "W-B0 negative control: mainnet taproot byte-reversed hash does NOT fire"
+        `Quick test_script_flag_exception_mainnet_taproot_byte_reversed;
+      test_case "W-B0 negative control: testnet3 BIP16 byte-reversed hash does NOT fire"
+        `Quick test_script_flag_exception_testnet3_bip16_byte_reversed;
     ];
   ]

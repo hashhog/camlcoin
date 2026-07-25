@@ -2488,7 +2488,14 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
       match !error with
       | Some e -> Error e
       | None ->
-        (* Task 5: BIP68 sequence lock enforcement *)
+        (* Task 5: BIP68 sequence lock enforcement.
+           No ~block_hash here ON PURPOSE: this is a "next block" prediction and
+           that block does not exist yet, so there is no hash to key the
+           script_flag_exceptions table on.  Core's mempool path is likewise
+           exception-free (the exceptions only ever fire on three historical
+           blocks).  Do NOT "fix" this by inventing a hash — every real
+           block-VALIDATION site does pass one; see the tombstone in
+           validation.ml above the sigop-counting section. *)
         let flags = Consensus.get_block_script_flags (mp.current_height + 1) mp.network in
         if not (Validation.check_sequence_locks tx
                   ~block_height:(mp.current_height + 1)

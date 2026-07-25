@@ -319,43 +319,32 @@ let check_coinbase ~network:(network : Consensus.network_config) (tx : Types.tra
   end
 
 (* ============================================================================
-   Script Verification Flags by Height
+   Script Verification Flags — see Consensus.get_block_script_flags
+   ============================================================================
+
+   TOMBSTONE (Wave B).  [get_script_flags_for_height ~network height] used to
+   live here: a second, hash-BLIND copy of GetBlockScriptFlags that gated P2SH
+   on an invented `height >= 1` rule and TAPROOT on an invented
+   `network.taproot_height`.  It had zero callers, but it was a loaded gun.
+
+   Bitcoin Core sets SCRIPT_VERIFY_P2SH|WITNESS|TAPROOT unconditionally for
+   every block (validation.cpp:2262) and handles the three historical violators
+   through consensus.script_flag_exceptions, keyed on BLOCK HASH
+   (kernel/chainparams.cpp:85-88, :210-211).  A flag computer that takes only a
+   height therefore CANNOT be correct: it has no way to see the exception, so
+   at mainnet 170060 it would enforce P2SH and at 692261 it would enforce
+   TAPROOT, false-rejecting both blocks and hard-forking off mainnet on any
+   full revalidation.  While the trio was height-gated this was invisible;
+   making the trio unconditional makes the hash lookup load-bearing on every
+   block-validation path.  (Same shape as the latent bug fixed in clearbit
+   bc7cb98: a hash-less flag overload that skipped the exception lookup.)
+
+   There is exactly ONE block-script-flag computer in camlcoin now:
+   [Consensus.get_block_script_flags ?block_hash height network].  Call it with
+   the real block hash (internal LE byte order) from every validation path.
+   Do not reintroduce a height-only variant.
+
    ============================================================================ *)
-
-(** Get the consensus script verification flags for a given block height.
-    This matches Bitcoin Core's GetBlockScriptFlags() in validation.cpp.
-    IMPORTANT: Only consensus flags are included. Policy flags (CLEANSTACK,
-    SIGPUSHONLY, LOW_S, etc.) must NOT be added here. *)
-let get_script_flags_for_height ~(network : Consensus.network_config) (height : int) : int =
-  let flags = ref 0 in
-
-  (* BIP16: P2SH (activated at different heights per network) *)
-  if height >= 1 then  (* P2SH is active from genesis in practice *)
-    flags := !flags lor Script.script_verify_p2sh;
-
-  (* BIP66: Strict DER signatures *)
-  if height >= network.bip66_height then
-    flags := !flags lor Script.script_verify_dersig;
-
-  (* BIP65: OP_CHECKLOCKTIMEVERIFY *)
-  if height >= network.bip65_height then
-    flags := !flags lor Script.script_verify_checklocktimeverify;
-
-  (* BIP68/112/113: Relative lock-time (CSV) *)
-  if height >= network.csv_height then
-    flags := !flags lor Script.script_verify_checksequenceverify;
-
-  (* BIP141/143: SegWit + NULLDUMMY *)
-  if height >= network.segwit_height then begin
-    flags := !flags lor Script.script_verify_witness;
-    flags := !flags lor Script.script_verify_nulldummy
-  end;
-
-  (* BIP341/342: Taproot *)
-  if height >= network.taproot_height then
-    flags := !flags lor Script.script_verify_taproot;
-
-  !flags
 
 (* ============================================================================
    Signature Operation Counting

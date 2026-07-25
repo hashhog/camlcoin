@@ -751,7 +751,22 @@ let testnet : network_config = {
 (* Testnet4 configuration (BIP-94) *)
 let testnet4 : network_config = {
   name = "testnet4";
-  magic = 0x1c163f28l;  (* BIP-94 testnet4 magic: bytes 1c 16 3f 28, matching Bitcoin Core chainparams *)
+  (* Core chainparams.cpp:335-338 gives pchMessageStart = {0x1c,0x16,0x3f,0x28}
+     in WIRE order. This field is serialised little-endian (p2p.ml:452
+     Serialize.write_int32_le -> serialize.ml:120-123 Cstruct.LE.set_uint32), so
+     the literal must be the byte-reverse of the wire order: 0x283F161C writes
+     1c 16 3f 28. Every other network in this file follows the same convention
+     (mainnet 0xD9B4BEF9 -> f9 be b4 d9; testnet3 0x0709110B -> 0b 11 09 07;
+     regtest 0xDAB5BFFA -> fa bf b5 da).
+     NB storage.ml uses the OPPOSITE convention (mainnet_magic = 0xF9BEB4D9) for
+     snapshot metadata and is self-consistent — do not "align" the two.
+     REGRESSION HISTORY: d271f3b (2026-03-21) fixed this to 0x283f161cl;
+     90040e6 (2026-04-10) reverted it to 0x1c163f28l and pinned the wrong value
+     into test_consensus.ml, which then locked the bug in. With the reversed
+     value camlcoin emits a magic no peer accepts and rejects every inbound
+     message (peer.ml:525) on BOTH transports — the v2 HKDF salt is built from
+     it too (p2p.ml:2039) — i.e. total testnet4 P2P isolation. *)
+  magic = 0x283F161Cl;
   default_port = 48333;
   dns_seeds = [
     "seed.testnet4.bitcoin.sprovoost.nl";

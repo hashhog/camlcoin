@@ -1060,8 +1060,13 @@ let perform_handshake_inner (peer : peer) (our_height : int32) : unit Lwt.t =
   let* () = send_message peer P2p.SendheadersMsg in
   (* BIP 152: Send sendcmpct version 2 (segwit-aware) in low-bandwidth mode *)
   let* () = send_message peer (P2p.make_sendcmpct_msg ~high_bandwidth:false) in
-  (* BIP 133: Send initial feefilter - 100 sat/vbyte = 100000 sat/kvB *)
-  let* () = send_message peer (P2p.FeefilterMsg 100_000L) in
+  (* BIP 133: advertise the fee rate our mempool actually enforces —
+     Mempool.min_relay_fee = 100L sat/kvB (mempool.ml:293, Core
+     policy/policy.h:70 DEFAULT_MIN_RELAY_TX_FEE, lowered from 1000).
+     This used to send 100_000L (= 100 sat/vB), 1000x Core, so under BIP-133
+     peers withheld essentially all transaction relay from us while our own
+     getmempoolinfo reported 100. *)
+  let* () = send_message peer (P2p.FeefilterMsg 100L) in
   peer.state <- Ready;
   (* Reset last_ping so the message loop does not immediately fire a ping.
      Without this, last_ping=0.0 triggers needs_ping on the first iteration,
@@ -1117,8 +1122,13 @@ let perform_inbound_handshake_inner (peer : peer) (our_height : int32) : unit Lw
   let* () = send_message peer P2p.SendheadersMsg in
   (* BIP 152: Send sendcmpct version 2 (segwit-aware) in low-bandwidth mode *)
   let* () = send_message peer (P2p.make_sendcmpct_msg ~high_bandwidth:false) in
-  (* BIP 133: Send initial feefilter - 100 sat/vbyte = 100000 sat/kvB *)
-  let* () = send_message peer (P2p.FeefilterMsg 100_000L) in
+  (* BIP 133: advertise the fee rate our mempool actually enforces —
+     Mempool.min_relay_fee = 100L sat/kvB (mempool.ml:293, Core
+     policy/policy.h:70 DEFAULT_MIN_RELAY_TX_FEE, lowered from 1000).
+     This used to send 100_000L (= 100 sat/vB), 1000x Core, so under BIP-133
+     peers withheld essentially all transaction relay from us while our own
+     getmempoolinfo reported 100. *)
+  let* () = send_message peer (P2p.FeefilterMsg 100L) in
   peer.state <- Ready;
   peer.last_ping <- Unix.gettimeofday ();
   Lwt.return_unit

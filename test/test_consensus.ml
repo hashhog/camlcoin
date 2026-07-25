@@ -216,7 +216,11 @@ let test_protocol_versions () =
 (* Test testnet4 configuration *)
 let test_testnet4_config () =
   Alcotest.(check string) "testnet4 name" "testnet4" Consensus.testnet4.name;
-  Alcotest.(check int32) "testnet4 magic" 0x1c163f28l Consensus.testnet4.magic;
+  (* Wire bytes 1c 16 3f 28 (Core chainparams.cpp:335-338), serialised LE, so the
+     literal is the byte-reverse. This assertion previously pinned the reversed
+     value 0x1c163f28l and locked in the 90040e6 regression — keep it in step
+     with the same convention mainnet/testnet3/regtest use below. *)
+  Alcotest.(check int32) "testnet4 magic" 0x283F161Cl Consensus.testnet4.magic;
   Alcotest.(check int) "testnet4 port" 48333 Consensus.testnet4.default_port;
   Alcotest.(check bool) "testnet4 allows min difficulty" true
     Consensus.testnet4.pow_allow_min_difficulty;

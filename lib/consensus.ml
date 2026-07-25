@@ -953,17 +953,33 @@ let script_verify_taproot               = 1 lsl 17  (* BIP-341/342 *)
    Script-flag exception tables (Bitcoin Core GetBlockScriptFlags exceptions)
    ============================================================================ *)
 
-(* Per-block script-flag overrides.  Bitcoin Core's GetBlockScriptFlags checks
-   this table BEFORE computing height-derived flags: if the block hash matches,
-   the override value is returned DIRECTLY (height-derived flags are NOT
-   additionally OR'd in).  Hashes are stored in INTERNAL little-endian byte
-   order (display hash bytes reversed), mirroring the bip30_repeat_blocks
-   convention used in this file. *)
+(* Per-block script-flag overrides, keyed on BLOCK HASH (never on height).
+   Bitcoin Core: consensus.script_flag_exceptions, populated in
+   kernel/chainparams.cpp:85-88 (mainnet) and :210-211 (testnet3), consumed by
+   GetBlockScriptFlags at validation.cpp:2262-2266.
+
+   Core's semantics are REPLACE-THEN-OR, not early-return:
+     flags = P2SH | WITNESS | TAPROOT          // unconditional, every block
+     if (hash in script_flag_exceptions) flags = exceptions[hash];   // REPLACE
+     flags |= DERSIG | CLTV | CSV | NULLDUMMY  // each if active at this height
+   i.e. an exception hit REPLACES the trio-derived base set and the four
+   height-gated flags are then OR'd on TOP of the override.  Returning the
+   override directly (early-return) is WRONG: at height 692261 all four
+   height-gated flags are active on mainnet, so Core computes
+   P2SH|WITNESS|DERSIG|CLTV|CSV|NULLDUMMY = 0xe15, not 0x801.
+
+   Hashes are stored in INTERNAL little-endian byte order (display hash bytes
+   reversed), mirroring the bip30_repeat_blocks convention used in this file.
+   Do NOT "align" these with the display-order convention other nodes use —
+   [get_block_script_flags] is fed internal-order hashes by every caller. *)
 
 (* Mainnet exceptions.
-   - height 170060: BIP-16 P2SH violator.  Core returns SCRIPT_VERIFY_NONE (0).
+   - height 170060: BIP-16 P2SH violator.  Override = SCRIPT_VERIFY_NONE (0).
+     No height-gated flag is active there, so the effective flag set is 0.
      display: 00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22
-   - height 692261: Taproot violator.  Core returns P2SH | WITNESS only.
+   - height 692261: Taproot violator.  Override = P2SH | WITNESS, which strips
+     TAPROOT from the base trio; DERSIG|CLTV|CSV|NULLDUMMY are all active at
+     that height and are OR'd back on top => effective flag set 0xe15.
      display: 0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad *)
 let mainnet_script_flag_exceptions : (string * int) list = [
   ("229c4fac88bab194eb08f1a528cc308ded2397f4f4eb6e75dc02000000000000", 0);
@@ -978,35 +994,59 @@ let testnet3_script_flag_exceptions : (string * int) list = [
   ("05b132a4f74a8799a57a4202d0eeb09612cc08d295401f007c4530dd00000000", 0);
 ]
 
-(* Compute the correct script verification flags for a given block height.
-   Checks the per-block exception table first (Bitcoin Core GetBlockScriptFlags).
+(* The unconditional base flag set Bitcoin Core applies to EVERY block.
+   validation.cpp:2262 — "For simplicity, always leave P2SH+WITNESS+TAPROOT on
+   except for the two violating blocks."  This has been Core's behaviour since
+   v23; there is NO BIP16Height and NO taprootHeight in Core's consensus params
+   and neither may be reintroduced here.  [network.taproot_height] survives
+   ONLY as the BIP9 min_activation_height parity anchor used by
+   [check_buried_deployment_consistency] and the deployment-status RPCs — it
+   must never gate a script flag again. *)
+let base_block_script_flags =
+  script_verify_p2sh lor script_verify_witness lor script_verify_taproot
+
+(* Compute the consensus script-verification flags for a block.
+   Byte-for-byte port of Bitcoin Core's GetBlockScriptFlags
+   (validation.cpp:2250-2290).  Order is load-bearing:
+
+     1. start from P2SH|WITNESS|TAPROOT, UNCONDITIONALLY, at every height;
+     2. on a block-hash hit in script_flag_exceptions, REPLACE the whole set
+        with the override (it is an assignment in Core, not a mask-off);
+     3. OR the four height-gated flags (DERSIG, CLTV, CSV, NULLDUMMY) on top —
+        including on top of an override.
+
+   Step 3 running AFTER step 2 is the part that is easy to get wrong: an
+   early-return on the exception hit silently drops DERSIG|CLTV|CSV|NULLDUMMY
+   at mainnet height 692261, where Core has all four active.
 
    [block_hash]: the block's hash in internal LE byte order (same convention as
    bip30_repeat_blocks).  Defaults to [Types.zero_hash] (all zeros), which never
-   matches any real exception entry, preserving the height-only path for callers
-   that do not have the block hash (mempool next-block flags, tests).
+   matches any real exception entry — the correct behaviour for callers that
+   legitimately have no block hash yet (mempool "next block" flags), and safe
+   for every other caller because the exception table is hash-keyed only.
 
-   Every block-VALIDATION caller MUST supply the real hash so the override fires
-   on the two mainnet exception blocks (heights 170060, 692261) and the testnet3
-   exception block (height 514).  Omitting the hash on a validation path is the
-   original bug this function fixes: the old code triggered by height alone when
-   no hash was supplied (false-positive hazard removed here). *)
+   Every block-VALIDATION caller MUST supply the real hash.  With the base trio
+   now unconditional the lookup is LOAD-BEARING on every block: a validation
+   path that omits the hash computes TAPROOT-on at 692261 and P2SH-on at 170060
+   and false-REJECTS both blocks — i.e. it hard-forks off mainnet on any full
+   revalidation.  That is exactly the latent bug found in clearbit (bc7cb98). *)
 let get_block_script_flags ?(block_hash = Types.zero_hash) (height : int) (network : network_config) : int =
-  (* Check exception table first.  If the hash matches, return the override
-     DIRECTLY without OR-ing in height-derived flags (matches Bitcoin Core
-     GetBlockScriptFlags which returns early on any script_flag_exceptions hit). *)
   let exception_table = match network.network_type with
     | Mainnet  -> mainnet_script_flag_exceptions
     | Testnet3 -> testnet3_script_flag_exceptions
     | _        -> []
   in
-  match List.find_opt (fun (hex, _) ->
-    Cstruct.equal block_hash (Types.hash256_of_hex hex)
-  ) exception_table with
-  | Some (_, override) -> override
-  | None ->
-  (* Normal height-derived consensus flags. *)
-  let flags = script_verify_p2sh in
+  (* Steps 1 + 2: unconditional trio, REPLACED wholesale on an exception hit. *)
+  let flags =
+    match List.find_opt (fun (hex, _) ->
+      Cstruct.equal block_hash (Types.hash256_of_hex hex)
+    ) exception_table with
+    | Some (_, override) -> override
+    | None -> base_block_script_flags
+  in
+  (* Step 3: the four height-gated flags, OR'd on top of whatever step 2 left.
+     These are the ONLY flags Core still gates by activation state
+     (validation.cpp:2268-2286). *)
   (* BIP-66: strict DER signatures *)
   let flags =
     if height >= network.bip66_height then flags lor script_verify_dersig
@@ -1022,22 +1062,16 @@ let get_block_script_flags ?(block_hash = Types.zero_hash) (height : int) (netwo
     if height >= network.csv_height then flags lor script_verify_checksequenceverify
     else flags
   in
-  (* SegWit (BIP-141/143/147): WITNESS + NULLDUMMY only.
+  (* BIP-147 NULLDUMMY — activated simultaneously with segwit, and the ONLY
+     part of the segwit deployment that is still height-gated in Core.
+     SCRIPT_VERIFY_WITNESS itself is in the unconditional base set above.
      CLEANSTACK, SIGPUSHONLY, NULLFAIL, LOW_S, MINIMALDATA, WITNESS_PUBKEYTYPE
      are STANDARD_SCRIPT_VERIFY_FLAGS (policy only) per Bitcoin Core
      policy/policy.h:119-132.  They must NOT appear in the consensus block-
      script-flag computer.  Use [get_standard_policy_flags] to add them for
      mempool/relay purposes. *)
   let flags =
-    if height >= network.segwit_height then
-      flags
-      lor script_verify_witness
-      lor script_verify_nulldummy
-    else flags
-  in
-  (* Taproot (BIP-341/342) *)
-  let flags =
-    if height >= network.taproot_height then flags lor script_verify_taproot
+    if height >= network.segwit_height then flags lor script_verify_nulldummy
     else flags
   in
   flags

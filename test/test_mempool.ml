@@ -4345,13 +4345,16 @@ let test_network_config_propagates_to_script_flags () =
   let db = Storage.ChainDB.create path in
   let utxo = Utxo.UtxoSet.create db in
   (* Mainnet mempool at height 0 (next block = 1):
-     BIP-66 activates at 363725, segwit at 481824, taproot at 709632.
-     At height 1 only script_verify_p2sh is active. *)
+     BIP-66 activates at 363725, segwit (and therefore NULLDUMMY) at 481824.
+     Wave B: P2SH|WITNESS|TAPROOT are unconditional at every height
+     (Core validation.cpp:2262), so at height 1 the consensus flags are exactly
+     that trio and no height-gated flag is on. *)
   let mp_mainnet = Mempool.create ~network:Consensus.mainnet
       ~require_standard:false ~verify_scripts:false
       ~utxo ~current_height:0 () in
   (* Regtest mempool at height 0 (next block = 1):
-     segwit_height=0 and taproot_height=0 → all soft forks active from genesis. *)
+     segwit_height=0 → every height-gated flag AND the policy extras are on
+     from genesis, so regtest is strictly richer than mainnet at height 1. *)
   let mp_regtest = Mempool.create ~network:Consensus.regtest
       ~require_standard:false ~verify_scripts:false
       ~utxo ~current_height:0 () in
@@ -4363,10 +4366,16 @@ let test_network_config_propagates_to_script_flags () =
   (* The two sets of flags must differ — before the fix both returned regtest flags. *)
   Alcotest.(check bool) "mainnet and regtest flags differ at height 1"
     true (flags_mainnet <> flags_regtest);
-  (* Mainnet at height 1: only P2SH is active (no BIP-66/65/CSV/segwit/taproot). *)
-  Alcotest.(check int) "mainnet at height 1: only P2SH active"
-    Consensus.script_verify_p2sh flags_mainnet;
-  (* Regtest at height 1: taproot must be active (taproot_height = 0). *)
+  (* Mainnet at height 1: exactly the unconditional trio — no DERSIG/CLTV/CSV/
+     NULLDUMMY (all activate far later) and no policy extras (gated on
+     segwit_height by get_standard_policy_flags). *)
+  let trio =
+    Consensus.script_verify_p2sh
+    lor Consensus.script_verify_witness
+    lor Consensus.script_verify_taproot in
+  Alcotest.(check int) "mainnet at height 1: exactly P2SH|WITNESS|TAPROOT"
+    trio flags_mainnet;
+  (* Regtest at height 1: taproot must be active. *)
   Alcotest.(check bool) "regtest at height 1: taproot active"
     true (flags_regtest land Consensus.script_verify_taproot <> 0);
   Storage.ChainDB.close db;

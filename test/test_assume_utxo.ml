@@ -1617,7 +1617,7 @@ let test_b6_mempool_checked_before_snapshot_load () =
     wtxid = fake_txid;
     tx = fake_tx;
     fee = 1000L;
-    weight = 400;
+    weight = 400; sigops_cost = 0;
     fee_rate = 2.5;
     time_added = 0.0;
     height_added = 0;

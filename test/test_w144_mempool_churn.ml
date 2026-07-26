@@ -104,8 +104,23 @@ let accept_err mp tx =
 (* ── Reference implementation of the cluster-limit decision ─────────────────
    Whole-pool computation via get_clusters (the shape of the pre-W144 code):
    the merged cluster after adding a tx with in-pool parents [depends] is the
-   union of the DISTINCT clusters containing those parents, plus the new tx. *)
-let reference_cluster_decision mp depends ~new_tx_vsize =
+   union of the DISTINCT clusters containing those parents, plus the new tx.
+
+   Units follow Core exactly: each tx contributes max(weight, sigops_cost * 20)
+   and the sum is compared in WEIGHT against 404_000 with a strict > — no
+   per-tx division and no rounding (policy.cpp:390, txmempool.cpp:181/:1017,
+   txgraph.cpp:2059).
+
+   The verdict is binary.  Core raises the same bare "too-large-cluster" token
+   for the count overflow and the size overflow (both come from TxGraph's single
+   m_oversized flag), so a caller cannot tell them apart and neither can this
+   reference. *)
+let reference_cluster_decision mp depends ~new_tx_weight =
+  let adj (e : Mempool.mempool_entry) =
+    Camlcoin.Validation.get_sigops_adjusted_weight
+      ~weight:e.weight ~sigop_cost:e.sigops_cost
+      ~bytes_per_sigop:Camlcoin.Consensus.default_bytes_per_sigop
+  in
   let clusters = Mempool.get_clusters mp in
   let dep_keys =
     List.map (fun txid -> Cstruct.to_string txid) depends in
@@ -117,11 +132,10 @@ let reference_cluster_decision mp depends ~new_tx_vsize =
   let count =
     1 + List.fold_left (fun acc (c : Mempool.cluster) ->
       acc + List.length c.txs) 0 merged in
-  let vsize =
-    new_tx_vsize + List.fold_left (fun acc (c : Mempool.cluster) ->
-      acc + c.total_vsize) 0 merged in
-  if count > 64 then `Reject_count
-  else if vsize > 101_000 then `Reject_vsize
+  let weight =
+    new_tx_weight + List.fold_left (fun acc (c : Mempool.cluster) ->
+      acc + List.fold_left (fun a e -> a + adj e) 0 c.txs) 0 merged in
+  if count > 64 || weight > 404_000 then `Reject
   else `Accept
 
 (* ── 1. Zigzag cluster: >64 txs with anc/desc counts far below their limits.
@@ -162,9 +176,9 @@ let test_cluster_count_zigzag () =
     (try ignore (Str.search_forward (Str.regexp_string "too-large-cluster") err 0); true
      with Not_found -> false);
   (* Decision equivalence vs the whole-pool reference on the same depends. *)
-  (match reference_cluster_decision mp [p32; p33] ~new_tx_vsize:100 with
-   | `Reject_count -> ()
-   | _ -> Alcotest.fail "reference disagrees: expected count reject");
+  (match reference_cluster_decision mp [p32; p33] ~new_tx_weight:400 with
+   | `Reject -> ()
+   | `Accept -> Alcotest.fail "reference disagrees: expected reject");
   Storage.ChainDB.close db
 
 (* ── 2. Cluster-vsize gate: 3-tx chain of ~40 kvB each crosses 101 kvB. *)
@@ -217,15 +231,16 @@ let test_cluster_check_matches_reference () =
     ("mid-chain parent (A2)", [a2.Mempool.txid]);
   ] in
   List.iter (fun (name, depends) ->
+    (* DECISION, not reason string: Core emits one bare token for both the
+       count and the size overflow, so there is nothing to key on but the
+       accept/reject verdict itself. *)
     let got =
       match Mempool.check_cluster_size_limit ~new_tx_weight:400 mp depends
               Types.zero_hash with
       | Ok () -> `Accept
-      | Error e ->
-        (try ignore (Str.search_forward (Str.regexp_string "count") e 0); `Reject_count
-         with Not_found -> `Reject_vsize)
+      | Error _ -> `Reject
     in
-    let expected = reference_cluster_decision mp depends ~new_tx_vsize:100 in
+    let expected = reference_cluster_decision mp depends ~new_tx_weight:400 in
     Alcotest.(check bool)
       (Printf.sprintf "%s: local BFS matches whole-pool reference" name)
       true (got = expected)

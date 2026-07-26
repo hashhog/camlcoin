@@ -11,7 +11,7 @@
    - Script verification at acceptance
    - IsStandard policy checks
    - Dust output filtering
-   - Ancestor/descendant limits
+   - Cluster limits (count + size); TRUC 1-parent-1-child
    - RBF rules 1-5
    - Locktime and BIP68 sequence lock enforcement
    - Orphan transaction pool
@@ -33,6 +33,14 @@ type mempool_entry = {
   wtxid : Types.hash256;
   fee : int64;
   weight : int;
+  (* Sigop cost, as counted at acceptance (kernel/mempool_entry.h sigOpCost).
+     Retained because the cluster SIZE bound charges each tx
+     max(weight, sigops_cost * bytes_per_sigop) — policy.cpp:390 via
+     txmempool.cpp:1017 — so the sigop term must be recoverable for every
+     in-pool entry when a later tx merges its cluster.  Recomputing it during
+     the accept-time BFS would mean re-parsing scripts (and re-reading prevout
+     scriptPubKeys) for up to 64 entries on every accept. *)
+  sigops_cost : int;
   fee_rate : float;           (* satoshis per weight unit *)
   time_added : float;
   height_added : int;
@@ -124,10 +132,16 @@ type mempool = {
    Constants
    ============================================================================ *)
 
+(* DEFAULT_ANCESTOR_LIMIT / DEFAULT_DESCENDANT_LIMIT — policy.h:76/:78, carried
+   in MemPoolLimits (kernel/mempool_limits.h:24/:26).  As of Core v31 these are
+   NOT admission criteria: nothing in ATMP enforces them.  They survive only as
+   wallet-facing hints via getPackageLimits (node/interfaces.cpp:715 ->
+   wallet/spend.cpp:881), so they are kept here as reportable defaults.
+   The corresponding ancestor/descendant SIZE limits were deleted in Core
+   (-limitancestorsize/-limitdescendantsize now only warn, init.cpp:930-934);
+   their bound is subsumed by the cluster size limit below. *)
 let max_ancestor_count = 25
 let max_descendant_count = 25
-let max_ancestor_size = 101_000
-let max_descendant_size = 101_000
 let max_rbf_evictions = 100
 let max_standard_tx_weight = 400_000
 
@@ -174,6 +188,24 @@ let rolling_fee_halflife = float_of_int (60 * 60 * 12)  (* 43200.0 s *)
    Note: 101 is the *size* limit in kvB, NOT the count limit. Count limit is 64. *)
 let max_cluster_count = 64     (* DEFAULT_CLUSTER_LIMIT — max transactions per cluster *)
 let max_cluster_size_vbytes = 101_000  (* DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 — max cluster vsize *)
+
+(* The cluster SIZE bound is enforced in WEIGHT units, not vbytes.
+   Reference: txmempool.cpp:181 —
+     max_cluster_size = m_opts.limits.cluster_size_vbytes * WITNESS_SCALE_FACTOR
+   and txmempool.cpp:1017, which feeds TxGraph
+     GetSigOpsAdjustedWeight(GetTransactionWeight(tx), sigops_cost, nBytesPerSigOp)
+   as the per-tx quantity.  TxGraph sums those UNROUNDED weights and compares
+   with a STRICT > (txgraph.cpp:2059), so the per-tx quantity is never divided
+   and never rounded.
+
+   This distinction is not cosmetic.  Because ceiling is superadditive,
+     Σ⌈wᵢ/4⌉ ≥ (Σwᵢ)/4,
+   summing per-tx ceilinged vbytes against 101_000 is systematically STRICTER
+   than Core, always in the same direction (up to 48 vB over a 64-tx cluster).
+   Keep [max_cluster_size_vbytes] for RPC reporting (Core's rpc/mempool.cpp:1062
+   reports cluster_size_vbytes, i.e. 101_000) and enforce against this. *)
+let max_cluster_size_weight =
+  max_cluster_size_vbytes * Consensus.witness_scale_factor   (* 404_000 *)
 (* MAX_P2SH_SIGOPS = 15 — maximum legacy sigops in a P2SH redeemScript.
    Reference: Bitcoin Core policy/policy.h:42.
    ValidateInputsStandardness gate 3: reject P2SH inputs whose redeemScript
@@ -946,19 +978,34 @@ let effective_min_fee (mp : mempool) : int64 =
 (* ============================================================================
    Cluster Size Limit Check
 
-   Enforces both cluster count and cluster vsize limits.
+   Enforces both cluster limits: the transaction COUNT and the cluster SIZE.
+   The size bound is in weight units (see [max_cluster_size_weight]); the
+   vbyte constant is kept only for RPC reporting.
    Reference: Bitcoin Core txmempool.cpp CTxMemPool::CTxMemPool() lines 179-181;
    kernel/mempool_limits.h MemPoolLimits::cluster_count + cluster_size_vbytes;
    policy/policy.h DEFAULT_CLUSTER_LIMIT=64, DEFAULT_CLUSTER_SIZE_LIMIT_KVB=101.
 
    Core enforces:
      max_cluster_count=64   — no more than 64 txs in one connected cluster
-     max_cluster_size=101_000 vbytes — cluster total vsize ≤ 101 kvB
+     max_cluster_size=404_000 WEIGHT (= cluster_size_vbytes 101_000 * 4) —
+       the sum over the cluster of max(tx_weight, tx_sigops_cost * 20),
+       compared with a strict >.
    ============================================================================ *)
 
 (* Check if adding a transaction would exceed either cluster limit.
-   [new_tx_weight] is the weight of the new transaction being added; used to
-   compute its vsize contribution to the merged cluster total.
+   [new_tx_weight] / [new_tx_sigops] describe the transaction being added; its
+   own sigop-adjusted weight is part of the merged-cluster total.
+
+   UNITS (Core v31 exact form — policy.h:72/:74, kernel/mempool_limits.h:20-22,
+   txmempool.cpp:181/:1017, policy.cpp:390, txgraph.cpp:2059):
+
+     per-tx  := max(tx_weight, tx_sigops_cost * bytes_per_sigop)   [20]
+     cluster := Σ per-tx                    -- no per-tx division, no rounding
+     reject  := cluster_count > 64  ||  cluster_weight > 404_000   [strict >]
+
+   The sum is taken in WEIGHT, so 64 accepts / 65 rejects and 404_000 accepts /
+   404_001 rejects.  Summing per-tx ceil(w/4) against 101_000 instead is
+   strictly harsher than Core (see [max_cluster_size_weight]).
 
    2026-07-01 GC-churn fix (un-pin attempt #3 post-mortem): the old
    implementation built a union-find over the ENTIRE mempool
@@ -973,36 +1020,82 @@ let effective_min_fee (mp : mempool) : int64 =
    limit is exceeded, computes the identical accept/reject decision in
    O(cluster) ≤ O(65) instead of O(pool).
 
-   Note on the error text: with early exit the reported count/vsize is the
-   value at the first violation (e.g. "65 > 64"), not the full merged-cluster
-   total the old code printed.  The accept/reject DECISION is unchanged; the
-   reason tag ("too-large-cluster") is unchanged. *)
-let check_cluster_size_limit ?(new_tx_weight=0) (mp : mempool)
+   Error string: the BARE Core reject token with an empty debug string.
+   Core emits state.Invalid(TX_MEMPOOL_POLICY, "too-large-cluster", "") at
+   validation.cpp:1024/:1116/:1343/:1521 and does NOT distinguish the count
+   overflow from the size overflow — both come from the single m_oversized flag
+   in TxGraph.  Callers must key on the DECISION, never on the text. *)
+let too_large_cluster = "too-large-cluster"
+
+(* [staged_removals] — the RBF changeset.  Core does NOT evaluate the cluster
+   gate against the live mempool: MemPoolAccept::ReplacementChecks stages every
+   conflict (direct conflicts + their descendants) with
+   ChangeSet::StageRemoval() — which calls m_txgraph->RemoveTransaction()
+   immediately, txmempool.cpp:1030-1035 — and only THEN calls
+   ChangeSet::CheckMemPoolPolicyLimits() -> TxGraph::IsOversized()
+   (validation.cpp:1018-1025, and again at :1342 for the single-tx path once
+   the removals are already staged).  So the component TxGraph measures is the
+   post-eviction one.
+
+   Passing the evicted set here reproduces exactly that: entries staged for
+   removal are neither COUNTED nor TRAVERSED THROUGH.  Skipping traversal is
+   the load-bearing half — RemoveTransaction drops a node's edges too, so a
+   removal in the middle of a chain SPLITS the cluster, and a BFS that walked
+   past an evicted tx into its (also-evicted) descendants would re-measure the
+   very component the replacement dissolves.
+
+   Without this the gate is ordered wrong and a legitimate fee-bump on a deep
+   cluster is spuriously rejected with [too_large_cluster]: a replacement for
+   tx2 of a 64-tx chain evicts 63 entries and lands on a 2-tx cluster, but
+   measured against the live pool it reads 65 > 64.  Corpus:
+   tools/diff-test-corpus/regression/cluster-rbf-frees-room (index 65 =
+   cluster_count_if_added 2, decision accept).  Unreachable before the cluster
+   wave, because the old 25-ancestor limit made 64-tx clusters impossible. *)
+let check_cluster_size_limit ?(new_tx_weight=0) ?(new_tx_sigops=0)
+    ?staged_removals (mp : mempool)
     (depends : Types.hash256 list) (new_txid : Types.hash256)
     : (unit, string) result =
   ignore new_txid;
-  if depends = [] then
-    (* No dependencies — would form a singleton cluster of size 1.
-       Singleton always passes both count (1 ≤ 64) and size limits. *)
-    Ok ()
+  let is_staged_for_removal key =
+    match staged_removals with
+    | None -> false
+    | Some set -> Hashtbl.mem set key
+  in
+  (* The new transaction's own contribution, in weight units. *)
+  let new_tx_adj_weight =
+    Validation.get_sigops_adjusted_weight
+      ~weight:new_tx_weight ~sigop_cost:new_tx_sigops
+      ~bytes_per_sigop:Consensus.default_bytes_per_sigop
+  in
+  if depends = [] then begin
+    (* No dependencies — a singleton cluster: 1 tx, its own adjusted weight.
+       Count (1 ≤ 64) always passes; the size bound still applies, exactly as
+       TxGraph applies it to a one-cluster component. *)
+    if new_tx_adj_weight > max_cluster_size_weight then Error too_large_cluster
+    else Ok ()
+  end
   else begin
-    let new_tx_vsize = (new_tx_weight + 3) / 4 in
     (* BFS over the union of the parents' connected components (= the merged
        cluster after adding the new tx).  The new tx itself contributes
-       1 tx / new_tx_vsize; it has no children yet, and its only in-pool
+       1 tx / new_tx_adj_weight; it has no children yet, and its only in-pool
        edges are [depends]. *)
     let visited : (string, unit) Hashtbl.t =
       Hashtbl.create (max_cluster_count * 2) in
     let queue = Queue.create () in
     let push key =
-      if Hashtbl.mem mp.entries key && not (Hashtbl.mem visited key) then begin
+      (* A tx staged for removal is not in the graph any more (StageRemoval ->
+         TxGraph::RemoveTransaction), so it is neither counted nor expanded
+         through — its edges are gone with it. *)
+      if Hashtbl.mem mp.entries key
+         && not (is_staged_for_removal key)
+         && not (Hashtbl.mem visited key) then begin
         Hashtbl.replace visited key ();
         Queue.push key queue
       end
     in
     List.iter (fun parent_txid -> push (Cstruct.to_string parent_txid)) depends;
-    let cluster_count = ref 1 in           (* the new tx itself *)
-    let cluster_vsize = ref new_tx_vsize in
+    let cluster_count = ref 1 in                    (* the new tx itself *)
+    let cluster_weight = ref new_tx_adj_weight in   (* WEIGHT units, unrounded *)
     let violation = ref None in
     while !violation = None && not (Queue.is_empty queue) do
       let key = Queue.pop queue in
@@ -1010,17 +1103,21 @@ let check_cluster_size_limit ?(new_tx_weight=0) (mp : mempool)
        | None -> ()
        | Some entry ->
          incr cluster_count;
-         cluster_vsize := !cluster_vsize + (entry.weight + 3) / 4;
-         (* Gate 1: cluster transaction count limit (DEFAULT_CLUSTER_LIMIT = 64) *)
+         (* Per-tx contribution = GetSigOpsAdjustedWeight(weight, sigops, 20)
+            — policy.cpp:390, fed to TxGraph at txmempool.cpp:1017.
+            NOT divided by 4, NOT rounded. *)
+         cluster_weight := !cluster_weight +
+           Validation.get_sigops_adjusted_weight
+             ~weight:entry.weight ~sigop_cost:entry.sigops_cost
+             ~bytes_per_sigop:Consensus.default_bytes_per_sigop;
+         (* Gate 1: cluster transaction count (DEFAULT_CLUSTER_LIMIT = 64).
+            Gate 2: cluster size in weight (101_000 vB * 4 = 404_000).
+            Both are STRICT > (txgraph.cpp:2059) and both raise the SAME bare
+            token, because Core cannot tell them apart either. *)
          if !cluster_count > max_cluster_count then
-           violation := Some (Printf.sprintf
-             "cluster tx count limit exceeded (%d > %d); too-large-cluster"
-             !cluster_count max_cluster_count)
-         (* Gate 2: cluster vsize limit (DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000) *)
-         else if !cluster_vsize > max_cluster_size_vbytes then
-           violation := Some (Printf.sprintf
-             "cluster vsize limit exceeded (%d > %d vbytes); too-large-cluster"
-             !cluster_vsize max_cluster_size_vbytes)
+           violation := Some too_large_cluster
+         else if !cluster_weight > max_cluster_size_weight then
+           violation := Some too_large_cluster
          else begin
            (* Expand the component: in-pool parents ... *)
            List.iter
@@ -1806,82 +1903,28 @@ let is_standard_tx (_min_relay_fee : int64) (tx : Types.transaction) : (unit, st
   end
 
 (* ============================================================================
-   Ancestor/Descendant Limit Checks (Task 3 + Gap 6: size limits)
+   Ancestor/Descendant Limits — REMOVED (Core v31 cluster mempool)
 
-   Uses BFS to compute ancestor set. Cached descendant counts in mempool_entry
-   allow O(1) limit checks after initial ancestor walk.
+   [check_ancestor_descendant_limits] used to live here and was called from
+   [add_transaction] immediately after the cluster gate.  Bitcoin Core v31
+   deleted this class of limit outright:
+     - `-limitancestorsize` / `-limitdescendantsize` are hidden no-op args that
+       only emit "ancestor size limits have been replaced with cluster size
+       limits (see -limitclustersize)"            (init.cpp:652-655, :930-934)
+     - no ancestor/descendant bound is enforced in ATMP; the only mempool
+       topology gates left are CheckMemPoolPolicyLimits (cluster) and TRUC
+     - the reject token "too-long-mempool-chain" no longer exists in Core
+     - MemPoolLimits::ancestor_count / descendant_count remain ONLY as
+       wallet-facing hints, surfaced through getPackageLimits
+       (kernel/mempool_limits.h:24/:26 -> node/interfaces.cpp:715 ->
+        wallet/spend.cpp:881).  They are not admission criteria.
+
+   The cluster gate is strictly wider and runs FIRST, so the connected
+   component stays bounded at 64 txs / 404_000 weight at all times — removing
+   this gate never leaves cluster size unbounded.  [max_ancestor_count] and
+   [max_descendant_count] are kept above as the reportable Core defaults (25);
+   the ancestor/descendant SIZE constants are gone, as they are in Core.
    ============================================================================ *)
-
-(* Check if adding a transaction would violate ancestor/descendant limits.
-   Uses BFS to walk parent links and compute ancestor set. *)
-let check_ancestor_descendant_limits (mp : mempool) (depends : Types.hash256 list)
-    (_txid : Types.hash256) (new_tx_weight : int) : (unit, string) result =
-  let new_tx_vsize = (new_tx_weight + 3) / 4 in
-
-  (* BFS to compute ancestor set *)
-  let all_ancestors = Hashtbl.create 16 in
-  let queue = Queue.create () in
-  List.iter (fun parent_txid ->
-    let parent_key = Cstruct.to_string parent_txid in
-    if not (Hashtbl.mem all_ancestors parent_key) then begin
-      Hashtbl.replace all_ancestors parent_key ();
-      Queue.push parent_key queue
-    end
-  ) depends;
-  let ancestor_size_sum = ref 0 in
-  while not (Queue.is_empty queue) do
-    let key = Queue.pop queue in
-    match Hashtbl.find_opt mp.entries key with
-    | None -> ()
-    | Some entry ->
-      ancestor_size_sum := !ancestor_size_sum + (entry.weight + 3) / 4;
-      List.iter (fun gp_txid ->
-        let gp_key = Cstruct.to_string gp_txid in
-        if not (Hashtbl.mem all_ancestors gp_key) then begin
-          Hashtbl.replace all_ancestors gp_key ();
-          Queue.push gp_key queue
-        end
-      ) entry.depends_on
-  done;
-
-  let ancestor_count = Hashtbl.length all_ancestors + 1 in  (* +1 for self *)
-  if ancestor_count > max_ancestor_count then
-    Error (Printf.sprintf "Too many ancestors (%d > %d)"
-      ancestor_count max_ancestor_count)
-  else begin
-    (* Check ancestor cumulative size (in vbytes) *)
-    let total_ancestor_size = !ancestor_size_sum + new_tx_vsize in
-    if total_ancestor_size > max_ancestor_size then
-      Error (Printf.sprintf "Ancestor size limit exceeded (%d > %d)"
-        total_ancestor_size max_ancestor_size)
-    else begin
-      (* Check descendant limits for each ancestor using cached counts.
-         Adding this tx increases the descendant count of all ancestors by 1. *)
-      let too_many_desc = ref false in
-      let desc_size_exceeded = ref false in
-      Hashtbl.iter (fun ancestor_key () ->
-        if not !too_many_desc && not !desc_size_exceeded then begin
-          match Hashtbl.find_opt mp.entries ancestor_key with
-          | None -> ()
-          | Some ancestor_entry ->
-            (* Use cached descendant_count: current + 1 for new tx *)
-            if ancestor_entry.descendant_count + 1 > max_descendant_count then
-              too_many_desc := true;
-            (* Use cached descendant_size: current + new tx vsize *)
-            if ancestor_entry.descendant_size + new_tx_vsize > max_descendant_size then
-              desc_size_exceeded := true
-        end
-      ) all_ancestors;
-      if !too_many_desc then
-        Error (Printf.sprintf "Adding transaction would exceed descendant limit (%d)"
-          max_descendant_count)
-      else if !desc_size_exceeded then
-        Error (Printf.sprintf "Descendant size limit exceeded (%d)"
-          max_descendant_size)
-      else
-        Ok ()
-    end
-  end
 
 (* ============================================================================
    TRUC/v3 Transaction Policy (BIP-431)
@@ -2306,9 +2349,19 @@ let verify_tx_scripts_lwt (mp : mempool) (tx : Types.transaction)
    already performed Lwt-flavoured script verification via the
    Validation Domain worker BEFORE entering the sync ATMP body.  Callers
    on the sync path leave the flag at its default [false] and the
-   existing sync verify_tx_scripts runs as before. *)
+   existing sync verify_tx_scripts runs as before.
+
+   [~staged_removals] is the RBF changeset: the set of in-pool entries (keyed
+   by [Cstruct.to_string txid]) that the caller is about to evict as part of
+   the same atomic operation.  It is forwarded to [check_cluster_size_limit]
+   so the cluster gate measures the POST-eviction component, the way Core's
+   ChangeSet does (StageRemoval before CheckMemPoolPolicyLimits,
+   validation.cpp:1018-1025).  Only the RBF dry-run pre-check passes it; the
+   commit-path [add_transaction] runs after [remove_transaction] has already
+   taken the conflicts out of [mp], so the live pool is already the
+   post-eviction graph and no set is needed. *)
 let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=false)
-    ?(skip_verify_scripts=false)
+    ?(skip_verify_scripts=false) ?staged_removals
     (mp : mempool) (tx : Types.transaction)
     : (mempool_entry, string) result =
   let txid = Crypto.compute_txid tx in
@@ -2571,15 +2624,35 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
             if fee < min_fee && not bypass_fee_check then
               Error "Fee below minimum relay fee"
 
-            (* Cluster size limit check: enforce both count (≤64) and vsize (≤101 kvB) limits.
-               Reference: Bitcoin Core txmempool.cpp:1341-1344 (CheckMemPoolPolicyLimits).
-               Pass the new tx weight so the vsize gate can account for this tx's contribution. *)
-            else match check_cluster_size_limit ~new_tx_weight:weight mp !depends txid with
-            | Error e -> Error e
-            | Ok () ->
+            (* Cluster limits: count (≤64) and size (≤404_000 weight).
+               Reference: Bitcoin Core validation.cpp:1343 (and :1024/:1116/:1521)
+               -> ChangeSet::CheckMemPoolPolicyLimits -> TxGraph oversizedness.
+               Pass BOTH the new tx's weight and its sigop cost: the per-tx
+               charge is max(weight, sigops_cost * 20) (policy.cpp:390, fed to
+               TxGraph at txmempool.cpp:1017), so omitting the sigop term would
+               under-count a sigop-heavy tx by up to 20x.
+               [sigops_cost] is bound above for the MAX_STANDARD_TX_SIGOPS_COST
+               gate and already drives [vsize]; it is the same quantity Core
+               passes to StageAddition.
 
-            (* Task 3 + Gap 6: Ancestor/descendant limits (count + size) - kept for backward compat *)
-            match check_ancestor_descendant_limits mp !depends txid weight with
+               This gate SUPERSEDES the ancestor/descendant count+size limits,
+               which Core v31 removed: `-limitancestorsize`/`-limitdescendantsize`
+               are now no-op args that only warn ("ancestor size limits have been
+               replaced with cluster size limits", init.cpp:930-934), and no
+               ancestor/descendant bound is enforced in ATMP at all —
+               MemPoolLimits::ancestor_count/descendant_count survive solely as
+               wallet-facing hints via getPackageLimits (node/interfaces.cpp:715
+               -> wallet/spend.cpp:881).  "too-long-mempool-chain" no longer
+               exists anywhere in Core.  The cluster bound is strictly wider and
+               is checked FIRST, so the connected component — and therefore every
+               ancestor and descendant set within it — stays bounded at 64 txs /
+               404_000 weight with no intermediate unbounded state.
+               TRUC/v3's 2-ancestor/2-descendant rules below are the only
+               surviving ancestor/descendant enforcement, and are untouched. *)
+            else match check_cluster_size_limit
+                         ~new_tx_weight:weight ~new_tx_sigops:sigops_cost
+                         ?staged_removals
+                         mp !depends txid with
             | Error e -> Error e
             | Ok () ->
 
@@ -2646,6 +2719,7 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
               wtxid;
               fee;
               weight;
+              sigops_cost;
               fee_rate;
               time_added = Unix.gettimeofday ();
               height_added = mp.current_height;
@@ -3165,6 +3239,15 @@ let check_improves_feerate_diagram
     wtxid          = rep_wtxid;
     fee            = new_fee;
     weight         = new_weight;
+    (* This synthetic entry is local to the feerate-diagram comparison below:
+       it is never inserted into [mp.entries], so it is never walked by
+       [check_cluster_size_limit].  [linearize_entries] / [chunks_to_diagram]
+       consume [fee] and [weight] only, so 0 here cannot change the RBF
+       decision.  (Core computes diagram feerates over the sigop-adjusted
+       weight — FeePerWeight at txmempool.cpp:1017 — which camlcoin does not
+       yet do anywhere in the diagram path; that is a pre-existing gap, out of
+       scope for the cluster-limit change.) *)
+    sigops_cost    = 0;
     fee_rate       = new_fee_rate;
     time_added     = 0.0;
     height_added   = mp.current_height;
@@ -3503,8 +3586,31 @@ let replace_by_fee_with_replaced ?(dry_run=false) ?(skip_verify_scripts=false)
                      Only if the pre-check passes do we proceed with the atomic remove+add.
                      If the pre-check fails, conflicts remain in the mempool unchanged.
                      Reference: Bitcoin Core MemPoolAccept::ConsiderReplacement runs ALL gates before
-                     RemoveStaged; Finalize does the atomic RemoveStaged+addUnchecked together. *)
-                  match add_transaction ~dry_run:true ~skip_verify_scripts mp tx with
+                     RemoveStaged; Finalize does the atomic RemoveStaged+addUnchecked together.
+
+                     GATE-ORDER FIX (cluster-rbf-frees-room): this pre-check runs while the
+                     conflicts are STILL in [mp], so the cluster gate inside would measure the
+                     pre-eviction component and spuriously reject a legitimate fee-bump on a
+                     deep cluster ("too-large-cluster").  Core does not have this problem
+                     because ReplacementChecks calls StageRemoval() on every conflict — which
+                     removes it from the TxGraph there and then (txmempool.cpp:1030-1035) —
+                     BEFORE CheckMemPoolPolicyLimits() (validation.cpp:1018-1025).  Forward
+                     [evicted_set] as the changeset so the gate sees the post-eviction graph;
+                     the commit path below needs no such argument because
+                     [remove_transaction] has by then really removed them.
+
+                     Concretely: a replacement for tx2 of a 64-tx chain evicts 63 entries and
+                     leaves a 2-tx cluster (Core accepts); measuring against the live pool reads
+                     65 > 64 and rejects.  Unreachable before the cluster wave — the old
+                     25-ancestor limit made 64-tx clusters impossible — so the wave made it live.
+
+                     NB for future editors: test_w120_mempool_rbf G28 pins the ABSENCE of Core's
+                     RBF-eviction log marker in THIS file as the open-bug marker for BUG-13, by
+                     plain substring match.  Prose here must not accidentally spell that literal
+                     out — an earlier draft of the comment above did, and turned a source-marker
+                     guard red with no behavioural change at all. *)
+                  match add_transaction ~dry_run:true ~skip_verify_scripts
+                          ~staged_removals:evicted_set mp tx with
                   | Error e -> Error e
                   | Ok dry_entry ->
                     (* All gates passed; collect the deduplicated evicted txid list. *)
@@ -3622,7 +3728,7 @@ let accept_transaction ?(dry_run=false) ?(skip_verify_scripts=false)
    on the Domain worker (via [verify_tx_scripts_lwt]) BEFORE entering the
    synchronous body of [accept_transaction_with_replaced].  All other
    pre-script gates (size, standardness, locktime, BIP-68, fee floor,
-   cluster + ancestor/descendant limits, TRUC) keep running on the Lwt
+   cluster limits, TRUC) keep running on the Lwt
    main thread inside the sync body — they are cheap relative to the
    script-verify step that this refactor moves off the main thread.
 

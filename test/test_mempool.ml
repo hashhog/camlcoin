@@ -1098,27 +1098,31 @@ let test_ancestor_limit_25_pass () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
-(* Test: chain of 26 transactions should be rejected (exceeds 25 ancestor limit) *)
-let test_ancestor_limit_26_fail () =
+(* Test: a chain of 26 transactions is ACCEPTED under Core v31 cluster mempool.
+   The old 25-ancestor limit is gone (init.cpp:930-934 marks -limitancestorsize
+   a no-op; nothing in ATMP enforces ancestor counts).  A 26-tx chain is one
+   cluster of 26 <= 64, so every tx admits.
+   Matches diff-test corpus entry regression/cluster-linear-26 (26x accept),
+   which was confirmed empirically against bitcoin-core v31.99.0. *)
+let test_ancestor_chain_26_accepted () =
   let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
   (* Build a chain of 25 txs first *)
   let result = build_tx_chain mp ~start_txid:txid1 ~start_value:1_000_000L ~chain_length:25 in
   Alcotest.(check bool) "chain of 25 txs built" true (Result.is_ok result);
   let entries = Result.get_ok result in
   Alcotest.(check int) "25 txs in chain" 25 (List.length entries);
-  (* Now try to add the 26th tx - this should fail *)
+  (* The 26th tx used to be rejected for "Too many ancestors (26 > 25)".
+     Core v31 admits it: the cluster is 26 txs, well under the 64 limit. *)
   let last_entry = List.nth entries 24 in
   let final_tx = make_regular_tx
     [make_test_input last_entry.txid 0l]
     [make_test_output (Int64.sub (List.hd (List.nth entries 24).tx.outputs).Types.value 1000L)]
   in
   let final_result = Mempool.add_transaction mp final_tx in
-  Alcotest.(check bool) "26th tx in chain rejected" true (Result.is_error final_result);
   (match final_result with
+   | Ok _ -> ()
    | Error msg ->
-     Alcotest.(check bool) "error mentions ancestors" true
-       (string_contains msg "ancestor")
-   | Ok _ -> Alcotest.fail "expected error");
+     Alcotest.failf "26th tx in chain must be accepted under cluster mempool, got: %s" msg);
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
@@ -1192,38 +1196,185 @@ let test_descendant_limit_fail () =
     [make_test_output 29_000L]
   in
   let fail_result = Mempool.add_transaction mp child_fail_tx in
-  (* Bitcoin Core: the limit is 25 *including* the tx itself, so:
-     - A tx can have at most 24 descendants (itself + 24 = 25)
-     - Adding the 25th descendant would exceed the limit *)
+  (* Core v31: there is no descendant-count limit any more.  The parent plus 26
+     children is a 27-tx cluster, still far under the 64-tx cluster limit, so
+     both the 25th and the 26th child admit. *)
   (match fail_result with
+   | Ok _ -> ()
    | Error msg ->
-     Alcotest.(check bool) "error mentions descendant" true
-       (string_contains msg "descendant")
-   | Ok _ ->
-     (* If it succeeded, try adding one more to trigger the limit *)
-     let child_26_tx = make_regular_tx
-       [make_test_input parent_entry.txid 25l]
-       [make_test_output 29_000L]
-     in
-     let result_26 = Mempool.add_transaction mp child_26_tx in
-     Alcotest.(check bool) "26th descendant rejected" true (Result.is_error result_26);
-     match result_26 with
-     | Error msg ->
-       Alcotest.(check bool) "error mentions descendant" true
-         (string_contains msg "descendant")
-     | Ok _ -> Alcotest.fail "expected descendant limit error");
+     Alcotest.failf "25th child must be accepted under cluster mempool, got: %s" msg);
+  let child_26_tx = make_regular_tx
+    [make_test_input parent_entry.txid 25l]
+    [make_test_output 29_000L]
+  in
+  (match Mempool.add_transaction mp child_26_tx with
+   | Ok _ -> ()
+   | Error msg ->
+     Alcotest.failf "26th child must be accepted under cluster mempool, got: %s" msg);
   ignore utxo;
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
-(* Test: ancestor size limit (101 kvB) *)
-let test_ancestor_size_limit () =
-  (* This test would require creating large transactions to exceed 101 kvB *)
-  (* For now, verify the constants are correct *)
+(* Test: the mempool limit constants match Core v31.
+   ancestor/descendant COUNT defaults survive as reportable values only
+   (kernel/mempool_limits.h:24/:26 -> getPackageLimits); the ancestor/descendant
+   SIZE limits were deleted and replaced by the cluster size limit. *)
+let test_mempool_limit_constants () =
   Alcotest.(check int) "max_ancestor_count" 25 Mempool.max_ancestor_count;
   Alcotest.(check int) "max_descendant_count" 25 Mempool.max_descendant_count;
-  Alcotest.(check int) "max_ancestor_size" 101_000 Mempool.max_ancestor_size;
-  Alcotest.(check int) "max_descendant_size" 101_000 Mempool.max_descendant_size
+  (* Cluster limits: policy.h:72/:74 + kernel/mempool_limits.h:20-22. *)
+  Alcotest.(check int) "max_cluster_count" 64 Mempool.max_cluster_count;
+  (* RPC-reportable vbyte form — rpc/mempool.cpp:1062 reports cluster_size_vbytes *)
+  Alcotest.(check int) "max_cluster_size_vbytes" 101_000 Mempool.max_cluster_size_vbytes;
+  (* ENFORCED form: weight units, = cluster_size_vbytes * WITNESS_SCALE_FACTOR
+     (txmempool.cpp:181).  This is the constant the gate compares against. *)
+  Alcotest.(check int) "max_cluster_size_weight" 404_000 Mempool.max_cluster_size_weight
+
+(* ============================================================================
+   GATE-ORDER REGRESSION — "RBF frees cluster room"
+
+   Corpus: tools/diff-test-corpus/regression/cluster-rbf-frees-room, verified
+   against bitcoin-core v31.99.0-2b6af628b140.  Same shape, in-process:
+
+     P                       2 outputs
+     A1..A63                 chained off P.out0  -> cluster is exactly 64
+     X  (spends P.out1)      would be the 65th   -> REJECT "too-large-cluster"
+     A1' (respends P.out0)   evicts A1 + its 62 descendants -> cluster {P,A1'}
+                             = 2                 -> ACCEPT
+     X   (resubmitted)       cluster {P,A1',X} = 3 -> ACCEPT
+
+   The same txid must be rejected at one point and accepted at another, so no
+   static rule can pass this.
+
+   PRE-FIX camlcoin rejected A1' with "too-large-cluster": the RBF path ran
+   [add_transaction ~dry_run:true] — and therefore the cluster gate — while the
+   63 conflicts were STILL in [mp], measuring 65 > 64.  Core cannot make that
+   mistake: ReplacementChecks StageRemoval()s every conflict, which calls
+   TxGraph::RemoveTransaction immediately (txmempool.cpp:1030-1035), BEFORE
+   CheckMemPoolPolicyLimits() (validation.cpp:1018-1025).
+
+   This was UNREACHABLE before the cluster wave — the 25-ancestor limit made
+   64-tx clusters impossible — so it is the wave that makes legitimate
+   fee-bumps on deep clusters spuriously fail.
+
+   Control (test_full_rbf_descendant_fees, above): the identical RBF on a 2-tx
+   cluster always passed, so the RBF machinery is sound and this is purely gate
+   ORDER.
+   ============================================================================ *)
+let test_cluster_rbf_frees_room () =
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  (* P: 1_000_000 in, 2 x 490_000 out => 20_000 fee, two spendable branches. *)
+  let p_tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 490_000L; make_test_output 490_000L]
+  in
+  let p_entry =
+    match Mempool.add_transaction mp p_tx with
+    | Ok e -> e
+    | Error m -> Alcotest.failf "P must be accepted: %s" m
+  in
+  (* A1..A63 off P.out0 (build_tx_chain always spends vout 0), 1000 sat each. *)
+  let chain =
+    match build_tx_chain mp ~start_txid:p_entry.txid
+            ~start_value:490_000L ~chain_length:63 with
+    | Ok es -> es
+    | Error m -> Alcotest.failf "A-chain of 63 must build: %s" m
+  in
+  Alcotest.(check int) "63 txs in A-chain" 63 (List.length chain);
+  Alcotest.(check int) "cluster is exactly at the limit (P + 63 = 64)"
+    64 (Mempool.get_cluster_size mp p_entry.txid);
+  let a1 = List.hd chain in
+  let a63 = List.nth chain 62 in
+
+  (* X spends P.out1: it would be the 65th member. Core rejects, we reject. *)
+  let x_tx = make_regular_tx
+    [make_test_input p_entry.txid 1l]
+    [make_test_output 480_000L]
+  in
+  (match Mempool.accept_transaction mp x_tx with
+   | Ok _ -> Alcotest.fail "X must be rejected while the cluster is full (65 > 64)"
+   | Error msg ->
+     Alcotest.(check string) "bare Core reject token" "too-large-cluster" msg);
+
+  (* A1' respends P.out0 at 100_000 fee, beating the 63_000 it evicts.
+     THE REGRESSION: pre-fix this returned "too-large-cluster". *)
+  let a1_prime = make_regular_tx
+    [make_test_input p_entry.txid 0l]
+    [make_test_output 390_000L]
+  in
+  (match Mempool.accept_transaction mp a1_prime with
+   | Ok _ -> ()
+   | Error msg ->
+     Alcotest.failf
+       "A1' is a legitimate fee-bump that DISSOLVES the cluster (post-eviction \
+        count = 2); the gate must run against the changeset, not the live \
+        pool. Got: %s" msg);
+  Alcotest.(check bool) "A1 evicted" false (Mempool.contains mp a1.txid);
+  Alcotest.(check bool) "A63 evicted (descendant)" false (Mempool.contains mp a63.txid);
+  Alcotest.(check bool) "P survives" true (Mempool.contains mp p_entry.txid);
+  let (count_after_rbf, _, _) = Mempool.get_info mp in
+  Alcotest.(check int) "mempool is exactly {P, A1'}" 2 count_after_rbf;
+  Alcotest.(check int) "cluster is 2 after the replacement"
+    2 (Mempool.get_cluster_size mp p_entry.txid);
+
+  (* X now fits: {P, A1', X} = 3.  Same txid, opposite decision. *)
+  (match Mempool.accept_transaction mp x_tx with
+   | Ok _ -> ()
+   | Error msg ->
+     Alcotest.failf "X must be accepted once the RBF freed room, got: %s" msg);
+  let (count_final, _, _) = Mempool.get_info mp in
+  Alcotest.(check int) "final mempool is {P, A1', X}" 3 count_final;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Companion: the gate must STILL reject when the eviction does NOT free enough
+   room.  Guards against "fix" degenerating into skipping the gate on the RBF
+   path.  P + A1..A63 = 64 again, but the replacement A1'' keeps the branch
+   alive by paying for only ONE evicted tx... which is impossible here (evicting
+   A1 always drags its descendants), so instead: replace the TIP A63, which
+   evicts exactly 1 tx and leaves the cluster at 64 — then a further tx off
+   P.out1 must still be rejected. *)
+let test_cluster_rbf_tip_replacement_does_not_free_room () =
+  let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
+  let p_tx = make_regular_tx
+    [make_test_input txid1 0l]
+    [make_test_output 490_000L; make_test_output 490_000L]
+  in
+  let p_entry =
+    match Mempool.add_transaction mp p_tx with
+    | Ok e -> e
+    | Error m -> Alcotest.failf "P must be accepted: %s" m
+  in
+  let chain =
+    match build_tx_chain mp ~start_txid:p_entry.txid
+            ~start_value:490_000L ~chain_length:63 with
+    | Ok es -> es
+    | Error m -> Alcotest.failf "A-chain of 63 must build: %s" m
+  in
+  let a62 = List.nth chain 61 in
+  let a63 = List.nth chain 62 in
+  (* Replace the chain TIP: evicts exactly 1 (A63 has no descendants), so the
+     cluster stays at 64 and nothing is freed. *)
+  let a63_prime = make_regular_tx
+    [make_test_input a62.txid 0l]
+    [make_test_output (Int64.sub (List.hd a62.tx.outputs).Types.value 20_000L)]
+  in
+  (match Mempool.accept_transaction mp a63_prime with
+   | Ok _ -> ()
+   | Error msg -> Alcotest.failf "tip replacement must be accepted: %s" msg);
+  Alcotest.(check bool) "old tip evicted" false (Mempool.contains mp a63.txid);
+  Alcotest.(check int) "cluster still 64" 64 (Mempool.get_cluster_size mp p_entry.txid);
+  (* A 65th member must still be refused. *)
+  let x_tx = make_regular_tx
+    [make_test_input p_entry.txid 1l]
+    [make_test_output 480_000L]
+  in
+  (match Mempool.accept_transaction mp x_tx with
+   | Ok _ -> Alcotest.fail "65th cluster member must still be rejected"
+   | Error msg ->
+     Alcotest.(check string) "bare Core reject token" "too-large-cluster" msg);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
 
 (* ============================================================================
    Full RBF Tests (BIP-125)
@@ -2150,7 +2301,7 @@ let test_cluster_count_gate_at_limit () =
       make_regular_tx [make_test_input parent_txid 0l] [make_test_output 1000L] in
     let e : Mempool.mempool_entry = {
       Mempool.tx = fake_tx; txid = txids.(i); wtxid = txids.(i);
-      fee = 1000L; weight = 400 (* 100 vbytes *); fee_rate = 2.5;
+      fee = 1000L; weight = 400 (* 100 vbytes *); sigops_cost = 0; fee_rate = 2.5;
       time_added = 0.0; height_added = 100;
       depends_on = (if i = 0 then [] else [txids.(i - 1)]);
       ancestor_count = i + 1; ancestor_size = (i + 1) * 100;
@@ -2170,7 +2321,7 @@ let test_cluster_count_gate_at_limit () =
     make_regular_tx [make_test_input txids.(62) 0l] [make_test_output 1000L] in
   let e64 : Mempool.mempool_entry = {
     Mempool.tx = fake_tx_64; txid = txids.(63); wtxid = txids.(63);
-    fee = 1000L; weight = 400; fee_rate = 2.5;
+    fee = 1000L; weight = 400; sigops_cost = 0; fee_rate = 2.5;
     time_added = 0.0; height_added = 100;
     depends_on = [txids.(62)];
     ancestor_count = 64; ancestor_size = 6400;
@@ -2206,7 +2357,7 @@ let test_cluster_vsize_gate () =
   let large_entry : Mempool.mempool_entry = {
     Mempool.tx = make_regular_tx [make_test_input base_txid 0l] [make_test_output 1000L];
     txid = large_txid; wtxid = large_txid;
-    fee = 1000L; weight = 400_000 (* 100_000 vbytes *); fee_rate = 0.0025;
+    fee = 1000L; weight = 400_000 (* 100_000 vbytes *); sigops_cost = 0; fee_rate = 0.0025;
     time_added = 0.0; height_added = 100;
     depends_on = [];
     ancestor_count = 1; ancestor_size = 100_000;
@@ -2239,8 +2390,196 @@ let test_cluster_vsize_gate () =
 let test_cluster_constants () =
   (* DEFAULT_CLUSTER_LIMIT = 64 — max transactions per cluster *)
   Alcotest.(check int) "max_cluster_count" 64 Mempool.max_cluster_count;
-  (* DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 → 101_000 vbytes *)
-  Alcotest.(check int) "max_cluster_size_vbytes" 101_000 Mempool.max_cluster_size_vbytes
+  (* DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 → 101_000 vbytes (RPC-reportable) *)
+  Alcotest.(check int) "max_cluster_size_vbytes" 101_000 Mempool.max_cluster_size_vbytes;
+  (* ENFORCED bound is in weight: 101_000 * WITNESS_SCALE_FACTOR (txmempool.cpp:181) *)
+  Alcotest.(check int) "max_cluster_size_weight" 404_000 Mempool.max_cluster_size_weight
+
+(* ============================================================================
+   WAVE A — Core v31 cluster limit boundaries.
+
+   Ground truth (all read from bitcoin-core/src):
+     policy.h:50  DEFAULT_BYTES_PER_SIGOP        = 20
+     policy.h:72  DEFAULT_CLUSTER_LIMIT          = 64
+     policy.h:74  DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101
+     kernel/mempool_limits.h:20-22  cluster_size_vbytes = 101 * 1000
+     txmempool.cpp:181   max_cluster_size = cluster_size_vbytes * WITNESS_SCALE_FACTOR
+     txmempool.cpp:1017  TxGraph is fed GetSigOpsAdjustedWeight(weight, sigops, 20)
+     policy.cpp:390      GetSigOpsAdjustedWeight = max(weight, sigops * bytes_per_sigop)
+     txgraph.cpp:2059    total_count > max_count || total_size > max_size  [STRICT >]
+
+   So: per-tx max(weight, sigops*20), summed in WEIGHT, reject when > 404_000.
+   ============================================================================ *)
+
+(* Inject a linear chain of [n] fake entries with the given per-entry weight and
+   sigop cost, returning their txids.  entry i depends on entry i-1, so the whole
+   run is one connected cluster.  [tag] keeps txids distinct between tests. *)
+let inject_cluster_chain mp ~tag ~n ~weight ~sigops =
+  let entries_tbl = Mempool.get_entries mp in
+  let txids = Array.init n (fun i ->
+    let t = Cstruct.create 32 in
+    Cstruct.set_uint8 t 0 tag;
+    Cstruct.set_uint8 t 1 (i land 0xFF);
+    Cstruct.set_uint8 t 2 ((i lsr 8) land 0xFF);
+    t)
+  in
+  for i = 0 to n - 1 do
+    let parent = if i = 0 then Cstruct.create 32 else txids.(i - 1) in
+    let fake_tx =
+      make_regular_tx [make_test_input parent 0l] [make_test_output 1000L] in
+    let e : Mempool.mempool_entry = {
+      Mempool.tx = fake_tx; txid = txids.(i); wtxid = txids.(i);
+      fee = 1000L; weight; sigops_cost = sigops; fee_rate = 2.5;
+      time_added = 0.0; height_added = 100;
+      depends_on = (if i = 0 then [] else [txids.(i - 1)]);
+      ancestor_count = i + 1; ancestor_size = (i + 1) * ((weight + 3) / 4);
+      descendant_count = 1; descendant_size = (weight + 3) / 4;
+    } in
+    Hashtbl.replace entries_tbl (Cstruct.to_string txids.(i)) e
+  done;
+  txids
+
+let fresh_txid tag =
+  let t = Cstruct.create 32 in
+  Cstruct.set_uint8 t 0 tag;
+  Cstruct.set_uint8 t 31 0xEE;
+  t
+
+let with_pool f =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let utxo = Utxo.UtxoSet.create db in
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false
+      ~verify_scripts:false ~utxo ~current_height:100 () in
+  f mp;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* BOUNDARY 1 — cluster COUNT: 64 accepts, 65 rejects (strict >, policy.h:72). *)
+let test_wavea_count_boundary_64_65 () =
+  with_pool (fun mp ->
+    (* 63 in-pool + the new tx = 64 -> at the limit, admits. *)
+    let ids = inject_cluster_chain mp ~tag:0x11 ~n:63 ~weight:400 ~sigops:0 in
+    Alcotest.(check bool) "cluster of exactly 64 accepted" true
+      (Result.is_ok
+         (Mempool.check_cluster_size_limit ~new_tx_weight:400
+            mp [ids.(62)] (fresh_txid 0x12))));
+  with_pool (fun mp ->
+    (* 64 in-pool + the new tx = 65 -> over, rejects. *)
+    let ids = inject_cluster_chain mp ~tag:0x13 ~n:64 ~weight:400 ~sigops:0 in
+    match Mempool.check_cluster_size_limit ~new_tx_weight:400
+            mp [ids.(63)] (fresh_txid 0x14) with
+    | Ok () -> Alcotest.fail "cluster of 65 must be rejected"
+    | Error e ->
+      (* Bare Core token, empty debug string — validation.cpp:1343. *)
+      Alcotest.(check string) "bare too-large-cluster token" "too-large-cluster" e)
+
+(* BOUNDARY 2 — cluster SIZE in WEIGHT: 404_000 accepts, 404_001 rejects.
+   Single in-pool parent of weight 400_000; the new tx tops it up. *)
+let test_wavea_weight_boundary_404000 () =
+  with_pool (fun mp ->
+    let ids = inject_cluster_chain mp ~tag:0x21 ~n:1 ~weight:400_000 ~sigops:0 in
+    Alcotest.(check bool) "cluster weight exactly 404_000 accepted" true
+      (Result.is_ok
+         (Mempool.check_cluster_size_limit ~new_tx_weight:4_000
+            mp [ids.(0)] (fresh_txid 0x22))));
+  with_pool (fun mp ->
+    let ids = inject_cluster_chain mp ~tag:0x23 ~n:1 ~weight:400_000 ~sigops:0 in
+    match Mempool.check_cluster_size_limit ~new_tx_weight:4_001
+            mp [ids.(0)] (fresh_txid 0x24) with
+    | Ok () -> Alcotest.fail "cluster weight 404_001 must be rejected"
+    | Error e ->
+      Alcotest.(check string) "bare too-large-cluster token" "too-large-cluster" e)
+
+(* BOUNDARY 3 — UNITS.  This is the test that catches a constant swap
+   (101_000 -> 404_000) that leaves the per-tx ceil(w/4) rounding in place.
+
+   64 txs whose weights sum to EXACTLY 404_000:
+     63 x 6313 = 397_719, plus one of 6_281  ->  404_000.
+   Core's form: 404_000 is not > 404_000, so it ADMITS.
+   The per-tx-ceiling form: 63*ceil(6313/4) + ceil(6281/4)
+                          = 63*1579 + 1571 = 99_477 + 1_571 = 101_048,
+   which IS > 101_000, so it would REJECT.
+   Same cluster, opposite verdicts — only the units differ.
+
+   This mirrors diff-test corpus entry regression/cluster-units-weight-exact
+   (64 txs, cluster_size_if_added_weight = 404_000 on the last tx, all accept),
+   confirmed empirically against bitcoin-core v31.99.0. *)
+let test_wavea_units_weight_not_ceiled_vbytes () =
+  (* Arithmetic guard: the scenario really is a discriminating one. *)
+  let ceil4 w = (w + 3) / 4 in
+  Alcotest.(check int) "sum of weights is exactly the bound"
+    404_000 (63 * 6_313 + 6_281);
+  Alcotest.(check bool) "sum of per-tx ceilings would exceed 101_000" true
+    (63 * ceil4 6_313 + ceil4 6_281 > 101_000);
+  with_pool (fun mp ->
+    let ids = inject_cluster_chain mp ~tag:0x31 ~n:63 ~weight:6_313 ~sigops:0 in
+    match Mempool.check_cluster_size_limit ~new_tx_weight:6_281
+            mp [ids.(62)] (fresh_txid 0x32) with
+    | Ok () -> ()
+    | Error e ->
+      Alcotest.failf
+        "cluster of Sigma-weight exactly 404_000 must be ACCEPTED (got %s); \
+         rejecting it means the bound is still being applied to per-tx \
+         ceil(weight/4) vbytes rather than to summed weight" e);
+  (* One weight unit more must reject, pinning the strict >. *)
+  with_pool (fun mp ->
+    let ids = inject_cluster_chain mp ~tag:0x33 ~n:63 ~weight:6_313 ~sigops:0 in
+    Alcotest.(check bool) "Sigma-weight 404_001 rejected" true
+      (Result.is_error
+         (Mempool.check_cluster_size_limit ~new_tx_weight:6_282
+            mp [ids.(62)] (fresh_txid 0x34))))
+
+(* BOUNDARY 4 — SIGOPS dominate.  max(weight, sigops*20) is what trips the
+   limit: the raw weights here total 3_146, a rounding error against the bound,
+   but the sigop term makes each tx contribute 202_000.
+
+   Numbers taken from diff-test corpus entry regression/cluster-sigop-bound:
+   3 chained txs, each raw weight 1573 with sigops_cost 10_100, so each
+   contributes max(1573, 10_100*20) = 202_000.  Core accepts tx[0] (202_000)
+   and tx[1] (exactly 404_000 — admissible only because the comparison is
+   strict >), and rejects tx[2] (606_000). *)
+let test_wavea_sigop_adjusted_weight_dominates () =
+  let contribution = max 1_573 (10_100 * 20) in
+  Alcotest.(check int) "per-tx charge is the sigop term" 202_000 contribution;
+  (* One 202_000-contribution parent in the pool; the new tx is identical.
+     Cluster = 404_000 exactly -> accept. *)
+  with_pool (fun mp ->
+    let ids = inject_cluster_chain mp ~tag:0x41 ~n:1 ~weight:1_573 ~sigops:10_100 in
+    Alcotest.(check bool) "two sigop-heavy txs = exactly 404_000, accepted" true
+      (Result.is_ok
+         (Mempool.check_cluster_size_limit ~new_tx_weight:1_573 ~new_tx_sigops:10_100
+            mp [ids.(0)] (fresh_txid 0x42))));
+  (* Two such parents in the pool; the new tx makes 606_000 -> reject. *)
+  with_pool (fun mp ->
+    let ids = inject_cluster_chain mp ~tag:0x43 ~n:2 ~weight:1_573 ~sigops:10_100 in
+    match Mempool.check_cluster_size_limit ~new_tx_weight:1_573 ~new_tx_sigops:10_100
+            mp [ids.(1)] (fresh_txid 0x44) with
+    | Ok () ->
+      Alcotest.fail
+        "three sigop-heavy txs (606_000 weight) must be rejected; accepting \
+         means the sigop term is missing and only the 3_146 raw weight is summed"
+    | Error e ->
+      Alcotest.(check string) "bare too-large-cluster token" "too-large-cluster" e);
+  (* Control: identical txs with sigops_cost = 0 are nowhere near the bound,
+     so it really is the sigop term doing the work. *)
+  with_pool (fun mp ->
+    let ids = inject_cluster_chain mp ~tag:0x45 ~n:2 ~weight:1_573 ~sigops:0 in
+    Alcotest.(check bool) "same shape without sigops is far under the bound" true
+      (Result.is_ok
+         (Mempool.check_cluster_size_limit ~new_tx_weight:1_573 ~new_tx_sigops:0
+            mp [ids.(1)] (fresh_txid 0x46))))
+
+(* Ancestor/descendant limits are GONE (Core v31): a 26-long chain, which the
+   old 25-ancestor gate rejected, is one cluster of 26 and must admit.
+   Corpus: regression/cluster-linear-26 (26x accept). *)
+let test_wavea_no_ancestor_limit_at_26 () =
+  with_pool (fun mp ->
+    let ids = inject_cluster_chain mp ~tag:0x51 ~n:25 ~weight:400 ~sigops:0 in
+    Alcotest.(check bool) "26th tx in a chain accepted (no ancestor limit)" true
+      (Result.is_ok
+         (Mempool.check_cluster_size_limit ~new_tx_weight:400
+            mp [ids.(24)] (fresh_txid 0x52))))
 
 (* ============================================================================
    P2A (Pay-to-Anchor) Tests
@@ -3884,7 +4223,7 @@ let test_w96_same_nonwitness_data_in_mempool () =
   let entries_tbl = Mempool.get_entries mp in
   let fake_entry : Mempool.mempool_entry = {
     Mempool.tx = tx; txid; wtxid = fake_wtxid;
-    fee = 10_000L; weight = 400; fee_rate = 100.0;
+    fee = 10_000L; weight = 400; sigops_cost = 0; fee_rate = 100.0;
     time_added = 0.0; height_added = 100;
     depends_on = [];
     ancestor_count = 1; ancestor_size = 100;
@@ -4462,10 +4801,17 @@ let () =
     ];
     "ancestor_descendant_limits", [
       test_case "25-tx ancestor chain passes" `Quick test_ancestor_limit_25_pass;
-      test_case "26-tx ancestor chain fails" `Quick test_ancestor_limit_26_fail;
+      test_case "26-tx ancestor chain accepted (cluster mempool)" `Quick test_ancestor_chain_26_accepted;
       test_case "descendant limit pass" `Quick test_descendant_limit_pass;
       test_case "descendant limit fail" `Quick test_descendant_limit_fail;
-      test_case "ancestor/descendant size constants" `Quick test_ancestor_size_limit;
+      test_case "mempool limit constants (cluster)" `Quick test_mempool_limit_constants;
+    ];
+    "cluster_gate_order", [
+      (* corpus regression/cluster-rbf-frees-room *)
+      test_case "RBF frees cluster room (gate runs on the changeset, not the live pool)"
+        `Quick test_cluster_rbf_frees_room;
+      test_case "tip replacement frees nothing — 65th still rejected" `Quick
+        test_cluster_rbf_tip_replacement_does_not_free_room;
     ];
     "package_relay", [
       test_case "topo_sort basic" `Quick test_topo_sort_basic;
@@ -4490,6 +4836,17 @@ let () =
       test_case "cluster count gate at 64 (W75)" `Quick test_cluster_count_gate_at_limit;
       test_case "cluster vsize gate at 101 kvB (W75)" `Quick test_cluster_vsize_gate;
       test_case "cluster constants" `Quick test_cluster_constants;
+      (* WAVE A — Core v31 cluster limit boundaries *)
+      test_case "WAVE A: count boundary 64 accepts / 65 rejects" `Quick
+        test_wavea_count_boundary_64_65;
+      test_case "WAVE A: weight boundary 404000 accepts / 404001 rejects" `Quick
+        test_wavea_weight_boundary_404000;
+      test_case "WAVE A: UNITS — summed weight, not per-tx ceil(w/4) vbytes" `Quick
+        test_wavea_units_weight_not_ceiled_vbytes;
+      test_case "WAVE A: sigop-adjusted weight max(w, sigops*20) trips limit" `Quick
+        test_wavea_sigop_adjusted_weight_dominates;
+      test_case "WAVE A: no ancestor limit at 26 (cluster mempool)" `Quick
+        test_wavea_no_ancestor_limit_at_26;
     ];
     "p2a", [
       test_case "P2A is standard" `Quick test_p2a_is_standard;

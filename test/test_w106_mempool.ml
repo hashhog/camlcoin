@@ -362,17 +362,26 @@ let test_g3_stale_descendant_count_doesnt_block_new_child () =
   cleanup ()
 
 (* =========================================================================
-   G4 — ancestor limit enforced correctly (25 max)
+   G4 — chain length is bounded by the CLUSTER COUNT limit (64), not by a
+   25-ancestor limit.  Core v31 removed ancestor/descendant limits entirely
+   (init.cpp:930-934; "too-long-mempool-chain" no longer exists in the tree),
+   so a 26-long chain admits and the first refusal comes at 65.
+   This drives the LIVE add_transaction path end to end.
+   Corpus: regression/cluster-linear-26 (26x accept),
+           regression/cluster-linear-64 (64x accept),
+           regression/cluster-linear-65 (64x accept + 1 reject).
    ========================================================================= *)
 
-let test_g4_ancestor_limit_enforced () =
-  (* Build a chain of 25 transactions; the 26th should be rejected. *)
+let test_g4_chain_bounded_by_cluster_count () =
   let (mp, db, txid_a, _, _, _, _) = create_test_mempool () in
   let cur_txid = ref txid_a in
   let cur_value = ref 1_000_000L in
   let ok_count = ref 0 in
+  let first_error = ref None in
 
-  for _ = 1 to 25 do
+  (* A 64-tx cluster is exactly at DEFAULT_CLUSTER_LIMIT and must fully admit.
+     Under the old 25-ancestor gate this stopped at 25. *)
+  for _ = 1 to 64 do
     let fee = 1000L in
     let out_value = Int64.sub !cur_value fee in
     let tx = make_tx [make_test_input !cur_txid 0l] [make_test_output out_value] in
@@ -381,19 +390,23 @@ let test_g4_ancestor_limit_enforced () =
        cur_txid := entry.txid;
        cur_value := out_value;
        incr ok_count
-     | Error _ -> ())
+     | Error e -> if !first_error = None then first_error := Some e)
   done;
-  (* 25 should succeed (including the root which has 1 ancestor = self) *)
-  Alcotest.(check int) "G4: 25 transactions accepted" 25 !ok_count;
+  Alcotest.(check int)
+    (Printf.sprintf "G4: 64-tx chain fully accepted (first error: %s)"
+       (match !first_error with None -> "none" | Some e -> e))
+    64 !ok_count;
 
-  (* 26th should exceed the limit *)
+  (* The 65th makes the cluster 65 > 64 and must be rejected, with Core's bare
+     token and an empty debug string (validation.cpp:1343). *)
   let fee = 1000L in
   let out_value = Int64.sub !cur_value fee in
-  let tx26 = make_tx [make_test_input !cur_txid 0l] [make_test_output out_value] in
-  let result26 = Mempool.add_transaction mp tx26 in
-  Alcotest.(check bool)
-    "G4: 26th transaction rejected for ancestor limit"
-    true (Result.is_error result26);
+  let tx65 = make_tx [make_test_input !cur_txid 0l] [make_test_output out_value] in
+  (match Mempool.add_transaction mp tx65 with
+   | Ok _ -> Alcotest.fail "G4: 65th transaction must be rejected (cluster count)"
+   | Error e ->
+     Alcotest.(check string) "G4: bare too-large-cluster token"
+       "too-large-cluster" e);
   Storage.ChainDB.close db;
   cleanup ()
 
@@ -441,14 +454,16 @@ let test_g5_descendant_limit_enforced () =
      cur_value := out_value
    | Error _ -> ());
 
-  (* 26th descendant — root would now have 26, exceeding the 25 limit *)
+  (* 26th descendant — under Core v31 there is no descendant limit, and the
+     cluster is only 27 txs, so this admits too. *)
   let fee = 1000L in
   let out_value = Int64.sub !cur_value fee in
   let tx26 = make_tx [make_test_input !cur_txid 0l] [make_test_output out_value] in
-  let result26 = Mempool.add_transaction mp tx26 in
-  Alcotest.(check bool)
-    "G5: 26th descendant rejected (exceeds limit)"
-    true (Result.is_error result26);
+  (match Mempool.add_transaction mp tx26 with
+   | Ok _ -> ()
+   | Error e ->
+     Alcotest.failf
+       "G5: 26th descendant must be accepted (no descendant limit in v31), got: %s" e);
   Storage.ChainDB.close db;
   cleanup ()
 
@@ -1360,9 +1375,9 @@ let () =
         `Quick test_g2_descendant_count_decrements_to_zero;
       test_case "G3: stale descendant_count doesn't block new child"
         `Quick test_g3_stale_descendant_count_doesnt_block_new_child;
-      test_case "G4: ancestor limit enforced at 25"
-        `Quick test_g4_ancestor_limit_enforced;
-      test_case "G5: descendant limit enforced at 25"
+      test_case "G4: chain bounded by cluster count 64, not ancestors 25"
+        `Quick test_g4_chain_bounded_by_cluster_count;
+      test_case "G5: descendants bounded by cluster count, not 25"
         `Quick test_g5_descendant_limit_enforced;
       test_case "G6: ancestor_size limit constant (informational)"
         `Quick test_g6_ancestor_size_limit_enforced;

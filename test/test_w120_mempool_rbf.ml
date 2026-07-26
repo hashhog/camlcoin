@@ -397,10 +397,23 @@ let test_g8_package_rbf_missing () =
    `add_transaction ~dry_run:true` pre-check at mempool.ml:2899 enforces this.
    Bug #135 step 2 added an optional [~skip_verify_scripts] argument that
    is forwarded from the Lwt entry; the marker still pins the dry_run
-   pre-check pattern regardless of skip-verify state. *)
+   pre-check pattern regardless of skip-verify state.
+
+   2026-07-26 cluster gate-order fix: the call now also forwards
+   [~staged_removals:evicted_set] and wraps, so the old single-line literal
+   no longer matches.  The marker is split in two — one for the dry-run
+   pre-check (unchanged intent), one for the changeset argument — and the
+   second one is the REAL guard: without it the cluster gate inside the
+   pre-check measures the mempool WITH the conflicts still in it and
+   spuriously rejects a fee-bump on a deep cluster with "too-large-cluster"
+   (corpus regression/cluster-rbf-frees-room, index 65).  Core stages the
+   removals into the ChangeSet before CheckMemPoolPolicyLimits
+   (validation.cpp:1018-1025 / txmempool.cpp:1030-1035). *)
 let test_g9_conflicts_before_eviction () =
   Alcotest.(check bool) "dry_run pre-check before commit" true
-    (file_has_marker "lib/mempool.ml" "add_transaction ~dry_run:true ~skip_verify_scripts mp tx")
+    (file_has_marker "lib/mempool.ml" "add_transaction ~dry_run:true ~skip_verify_scripts");
+  Alcotest.(check bool) "pre-check sees the eviction changeset (gate order)" true
+    (file_has_marker "lib/mempool.ml" "~staged_removals:evicted_set mp tx")
 
 (* G10.  Replaceability surface — find_all_conflicts.  This is the
    O(1)-per-input map_next_tx lookup that drives RBF.  Hand a tx with no
@@ -1104,7 +1117,7 @@ let test_g26_modified_fee_on_entry () =
     txid;
     wtxid = txid;
     fee = 10_000L;
-    weight = 400;
+    weight = 400; sigops_cost = 0;
     fee_rate = 25.0;
     time_added = 0.0;
     height_added = 0;

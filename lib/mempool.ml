@@ -142,7 +142,11 @@ type mempool = {
    their bound is subsumed by the cluster size limit below. *)
 let max_ancestor_count = 25
 let max_descendant_count = 25
-let max_rbf_evictions = 100
+(* Core v31 MAX_REPLACEMENT_CANDIDATES (policy/rbf.h). Rule #5 bounds the number
+   of DISTINCT CLUSTERS the direct conflicts belong to — NOT the number of
+   evicted entries. See the gate in check_rbf_replacement for why that
+   distinction matters. *)
+let max_replacement_candidates = 100
 let max_standard_tx_weight = 400_000
 
 (* 2026-07-02 at-tip RPC-stall fix: how many inputs the Lwt mempool-accept path
@@ -3432,12 +3436,10 @@ let replace_by_fee_with_replaced ?(dry_run=false) ?(skip_verify_scripts=false)
         let new_vsize = max 1 ((new_weight + 3) / 4) in
         let new_feerate = Int64.to_float new_fee /. float_of_int new_vsize in
 
-        (* Rule #5 (Gate 3): Collect the full set of transactions that would be
-           evicted (conflicts + all their descendants). Deduplicate by txid so
-           that a tx that appears as both a direct conflict and a descendant of
-           another conflict is only counted once (same as Core's unique-cluster
-           bound — rbf.cpp GetEntriesForConflicts uses a set<txiter>).
-           Core constant: MAX_REPLACEMENT_CANDIDATES = 100. *)
+        (* Collect the full set of transactions that would be evicted
+           (conflicts + all their descendants), deduplicated by txid. This set
+           is what the replacement actually displaces and is used downstream;
+           it is NOT what Rule #5 bounds — see the cluster gate below. *)
         let evicted_set : (string, mempool_entry) Hashtbl.t = Hashtbl.create 16 in
         List.iter (fun conflict_entry ->
           let key = Cstruct.to_string conflict_entry.txid in
@@ -3450,12 +3452,45 @@ let replace_by_fee_with_replaced ?(dry_run=false) ?(skip_verify_scripts=false)
               Hashtbl.replace evicted_set dk d
           ) desc
         ) conflicts;
-        let eviction_count = Hashtbl.length evicted_set in
+        (* Rule #5 (Gate 3) — Core v31 policy/rbf.cpp:63-74.
 
-        if eviction_count > max_rbf_evictions then
+           Core bounds the number of DISTINCT CLUSTERS the direct conflicts
+           belong to:
+               num_clusters = pool.GetUniqueClusterCount(iters_conflicting)
+               if (num_clusters > MAX_REPLACEMENT_CANDIDATES) reject
+           The bound exists to cap how many clusters must be re-linearised, so
+           the unit is clusters, not entries.
+
+           camlcoin previously bounded Hashtbl.length evicted_set — the count of
+           EVICTED ENTRIES — which is strictly OVER-STRICT: it rejects
+           replacements Core accepts. Verified against bitcoind v31.99.0: two
+           full 64-tx clusters with one replacement conflicting with the root of
+           each gives 126 evicted entries across 2 clusters. Core ACCEPTS all
+           129 transactions; the entry-count form rejected them.
+
+           Wave A is what made this reachable in practice — under the old
+           25-ancestor limit you needed 4+ clusters to accumulate 100 entries;
+           with 64-tx clusters, 2 suffice.
+
+           All descendants of a conflict live in that conflict's cluster by
+           construction, so counting over the direct conflicts (as Core does)
+           and over the full eviction set agree; we mirror Core and use the
+           direct conflicts. *)
+        let conflict_cluster_count =
+          let uf = build_clusters_uf mp in
+          let roots : (string, unit) Hashtbl.t = Hashtbl.create 16 in
+          List.iter (fun conflict_entry ->
+            let key = Cstruct.to_string conflict_entry.txid in
+            if Hashtbl.mem mp.entries key then
+              Hashtbl.replace roots (uf_find uf key) ()
+          ) conflicts;
+          Hashtbl.length roots
+        in
+
+        if conflict_cluster_count > max_replacement_candidates then
           Error (Printf.sprintf
-            "rejecting replacement; too many conflicting transactions (%d > %d)"
-            eviction_count max_rbf_evictions)
+            "rejecting replacement; too many conflicting clusters (%d > %d)"
+            conflict_cluster_count max_replacement_candidates)
 
         else begin
           (* Build set of conflict txids for the disjoint check below *)

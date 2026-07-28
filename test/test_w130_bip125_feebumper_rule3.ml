@@ -382,39 +382,52 @@ let test_g14_bump_fee_vsize_floor () =
    Rule 5 — MAX_REPLACEMENT_CANDIDATES
    ============================================================================ *)
 
-(* G15: max_rbf_evictions = 100 constant. *)
-let test_g15_max_rbf_evictions () =
+(* G15: max_replacement_candidates = 100 constant. Renamed from
+   max_rbf_evictions when Rule 5 was corrected to bound CLUSTERS rather than
+   evicted entries — the old name asserted the wrong unit. *)
+let test_g15_max_replacement_candidates () =
   Alcotest.(check int)
-    "G15: max_rbf_evictions = MAX_REPLACEMENT_CANDIDATES = 100"
-    100 Mempool.max_rbf_evictions
+    "G15: max_replacement_candidates = MAX_REPLACEMENT_CANDIDATES = 100"
+    100 Mempool.max_replacement_candidates
 
-(* G16: BUG-W130-7 — Rule 5 counts evicted txids instead of unique
-   clusters.  Structural evidence: `Hashtbl.length evicted_set` at
-   mempool.ml:2897 is the count surface; no `unique_clusters` helper. *)
-let test_g16_rule5_counts_txids_not_clusters () =
-  let mempool_ml_src = load_source "lib/mempool.ml" in
-  let has_unique_cluster_count =
-    match mempool_ml_src with
-    | None -> None
-    | Some src ->
-      Some (string_contains src "GetUniqueClusterCount" ||
-            string_contains src "unique_cluster_count" ||
-            string_contains src "get_unique_cluster_count")
-  in
-  (match has_unique_cluster_count with
-   | Some present ->
-     Alcotest.(check bool)
-       "G16: GetUniqueClusterCount absent (BUG-W130-7 / BUG-W130-8)"
-       false present
-   | None ->
-     Alcotest.(check bool)
-       "G16: BUG-W130-7 PRESENT (documentary)" true true)
+(* G16 (INVERTED 2026-07-28 — BUG-W130-7 FIXED). Was: assert Rule 5 counts
+   evicted txids and that no unique-cluster helper exists. Core v31
+   policy/rbf.cpp:63-74 bounds DISTINCT CLUSTERS
+   (GetUniqueClusterCount(iters_conflicting) > MAX_REPLACEMENT_CANDIDATES),
+   and the entry-count form is strictly OVER-STRICT: verified against bitcoind
+   v31.99.0, two full 64-tx clusters with one replacement conflicting with the
+   root of each gives 126 evicted entries across 2 clusters — Core accepts all
+   129 transactions, the entry-count form rejected them.
 
-(* G17: BUG-W130-8 — GetUniqueClusterCount absent (subsumed by G16
-   evidence — same source grep). *)
-let test_g17_no_cluster_count () =
-  Alcotest.(check bool)
-    "G17: GetUniqueClusterCount absent (BUG-W130-8 — see G16)" true true
+   The marker now DEMANDS the cluster form and FORBIDS a regression to bounding
+   the eviction-set size. *)
+let test_g16_rule5_counts_clusters_not_txids () =
+  match load_source "lib/mempool.ml" with
+  | None -> Alcotest.fail "G16: could not load lib/mempool.ml"
+  | Some src ->
+    Alcotest.(check bool)
+      "G16: Rule 5 gate counts distinct conflict CLUSTERS"
+      true (string_contains src "conflict_cluster_count");
+    Alcotest.(check bool)
+      "G16: Rule 5 rejection names clusters, not transactions"
+      true (string_contains src "too many conflicting clusters");
+    (* Regression guard: the old over-strict gate compared the eviction-set
+       size against the cap. That exact comparison must not come back. *)
+    Alcotest.(check bool)
+      "G16: eviction-set size is NOT the Rule 5 bound"
+      false (string_contains src "eviction_count > max_replacement_candidates"
+             || string_contains src "Hashtbl.length evicted_set > ")
+
+(* G17 (INVERTED 2026-07-28 — BUG-W130-8 FIXED): a unique-cluster count now
+   exists and is derived from the union-find cluster partition, mirroring
+   Core's TxGraph::CountDistinctClusters over the direct conflicts. *)
+let test_g17_cluster_count_present () =
+  match load_source "lib/mempool.ml" with
+  | None -> Alcotest.fail "G17: could not load lib/mempool.ml"
+  | Some src ->
+    Alcotest.(check bool)
+      "G17: cluster count derived from the union-find partition"
+      true (string_contains src "uf_find uf key" )
 
 (* ============================================================================
    Disjoint check + ImprovesFeerateDiagram + maxtxfee
@@ -629,7 +642,7 @@ let test_inv2_incremental_below_minrelay () =
 
 (* INV-3: MAX_REPLACEMENT_CANDIDATES = 100 (Core constant). *)
 let test_inv3_max_replacement_candidates_value () =
-  Alcotest.(check int) "INV-3: max_rbf_evictions = 100" 100 Mempool.max_rbf_evictions
+  Alcotest.(check int) "INV-3: max_replacement_candidates = 100" 100 Mempool.max_replacement_candidates
 
 (* INV-4: bump_fee error path on missing txid (smoke test).  Confirms the
    function exists and can be called without exception. *)
@@ -671,9 +684,9 @@ let () =
       Alcotest.test_case "G14: bump_fee vsize_floor (BUG-W130-6)" `Quick test_g14_bump_fee_vsize_floor;
     ];
     "Rule 5 — MAX_REPLACEMENT_CANDIDATES", [
-      Alcotest.test_case "G15: max_rbf_evictions = 100" `Quick test_g15_max_rbf_evictions;
-      Alcotest.test_case "G16: Rule 5 counts txids not clusters (BUG-W130-7)" `Quick test_g16_rule5_counts_txids_not_clusters;
-      Alcotest.test_case "G17: no GetUniqueClusterCount (BUG-W130-8)" `Quick test_g17_no_cluster_count;
+      Alcotest.test_case "G15: max_replacement_candidates = 100" `Quick test_g15_max_replacement_candidates;
+      Alcotest.test_case "G16: Rule 5 counts txids not clusters (BUG-W130-7)" `Quick test_g16_rule5_counts_clusters_not_txids;
+      Alcotest.test_case "G17: no GetUniqueClusterCount (BUG-W130-8)" `Quick test_g17_cluster_count_present;
     ];
     "Disjoint + ImprovesFeerateDiagram + maxtxfee", [
       Alcotest.test_case "G18: EntriesAndTxidsDisjoint" `Quick test_g18_entries_and_txids_disjoint;

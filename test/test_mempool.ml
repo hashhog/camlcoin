@@ -1076,6 +1076,82 @@ let build_tx_chain (mp : Mempool.mempool) ~(start_txid : Types.hash256)
   | Some msg -> Error msg
   | None -> Ok (List.rev !entries)
 
+
+(* ============================================================================
+   Rule 5 — MAX_REPLACEMENT_CANDIDATES bounds CLUSTERS, not evicted entries
+   (Core v31 policy/rbf.cpp:63-74, GetUniqueClusterCount).
+   ============================================================================ *)
+
+(* Builds an RBF-signalling chain of [len] transactions rooted at
+   [funding_txid]:0 and returns the entries. The root signals RBF explicitly;
+   descendants inherit replaceability via the ancestor walk. *)
+let build_rbf_chain mp ~funding_txid ~start_value ~len =
+  let entries = ref [] in
+  let cur_txid = ref funding_txid in
+  let cur_value = ref start_value in
+  let err = ref None in
+  for i = 1 to len do
+    if !err = None then begin
+      let new_value = Int64.sub !cur_value 1000L in
+      let input =
+        if i = 1 then make_test_input_rbf !cur_txid 0l
+        else make_test_input !cur_txid 0l
+      in
+      let tx = make_regular_tx [input] [make_test_output new_value] in
+      match Mempool.add_transaction mp tx with
+      | Ok e -> entries := e :: !entries; cur_txid := e.txid; cur_value := new_value
+      | Error m -> err := Some (Printf.sprintf "chain tx %d: %s" i m)
+    end
+  done;
+  match !err with Some m -> Error m | None -> Ok (List.rev !entries)
+
+(* A replacement that conflicts with the ROOT of two separate chains evicts
+   both chains in full. With 55 txs per chain that is 110 evicted entries
+   spread over exactly 2 CLUSTERS.
+
+   Core accepts it: Rule 5 bounds distinct clusters (2 <= 100).
+   The pre-2026-07-28 camlcoin gate bounded evicted ENTRIES (110 > 100) and
+   rejected — strictly over-strict vs Core, verified against bitcoind v31.99.0.
+
+   Wave A is what made this reachable: under the old 25-ancestor limit you
+   needed 4+ clusters to accumulate 100 entries; with 64-tx clusters, 2 do. *)
+let test_rule5_bounds_clusters_not_evicted_entries () =
+  let (mp, _utxo, db, txid1, txid2, _) = create_test_mempool () in
+  let chain_len = 55 in
+
+  let a = build_rbf_chain mp ~funding_txid:txid1 ~start_value:1_000_000L ~len:chain_len in
+  Alcotest.(check bool) "chain A built" true (Result.is_ok a);
+  let b = build_rbf_chain mp ~funding_txid:txid2 ~start_value:2_000_000L ~len:chain_len in
+  Alcotest.(check bool) "chain B built" true (Result.is_ok b);
+
+  let entries_a = Result.get_ok a and entries_b = Result.get_ok b in
+  let evicted = List.length entries_a + List.length entries_b in
+  (* The whole point of the fixture: MORE than the 100 cap in entries, but
+     only 2 clusters. If this ever drops to <= 100 the test proves nothing. *)
+  Alcotest.(check bool)
+    (Printf.sprintf "fixture evicts >100 entries (got %d) across 2 clusters" evicted)
+    true (evicted > 100);
+
+  let conflict_fees = Int64.of_int (evicted * 1000) in
+  (* Pay far above the combined conflict fees so Rules 3/4 cannot be the
+     reason for a rejection — the only bound under test is Rule 5. *)
+  let replacement =
+    make_regular_tx
+      [make_test_input_rbf txid1 0l; make_test_input_rbf txid2 0l]
+      [make_test_output (Int64.sub 3_000_000L (Int64.mul conflict_fees 4L))]
+  in
+  (* Must go through the RBF path: add_transaction rejects any conflict
+     outright with txn-mempool-conflict and never reaches Rule 5. *)
+  (match Mempool.replace_by_fee mp replacement with
+   | Ok _ -> ()
+   | Error msg ->
+     Alcotest.failf
+       "RULE 5 OVER-STRICT: replacement conflicting with 2 clusters (%d evicted \
+        entries) was REJECTED with %S. Core v31 bounds DISTINCT CLUSTERS \
+        (2 <= 100) and accepts this; bounding evicted entries does not."
+       evicted msg);
+  Storage.ChainDB.close db
+
 (* Test: chain of 25 transactions should be accepted (25 ancestors including self) *)
 let test_ancestor_limit_25_pass () =
   let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
@@ -4805,6 +4881,10 @@ let () =
       test_case "descendant limit pass" `Quick test_descendant_limit_pass;
       test_case "descendant limit fail" `Quick test_descendant_limit_fail;
       test_case "mempool limit constants (cluster)" `Quick test_mempool_limit_constants;
+    ];
+    "rbf_rule5_clusters", [
+      test_case "Rule 5 bounds distinct clusters, not evicted entries"
+        `Quick test_rule5_bounds_clusters_not_evicted_entries;
     ];
     "cluster_gate_order", [
       (* corpus regression/cluster-rbf-frees-room *)

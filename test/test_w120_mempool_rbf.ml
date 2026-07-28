@@ -341,8 +341,8 @@ let test_g4_rule4_incremental_fee_present () =
 
 (* G5.  Rule 5 (MAX_REPLACEMENT_CANDIDATES = 100). *)
 let test_g5_rule5_100_cap_present () =
-  Alcotest.(check int) "rule 5: max_rbf_evictions = 100" 100
-    Mempool.max_rbf_evictions
+  Alcotest.(check int) "rule 5: max_replacement_candidates = 100" 100
+    Mempool.max_replacement_candidates
 
 (* ============================================================================
    G6-G7 — ancestor walk + descendant tracking
@@ -462,8 +462,12 @@ let test_g13_find_all_conflicts_is_public () =
    here we also pin the rejection-string format. *)
 let test_g14_100_cap_error_format () =
   (* Core: "rejecting replacement %s; too many potential replacements (%d > %d)" *)
-  Alcotest.(check bool) "100-cap error: 'too many conflicting transactions'" true
-    (file_has_marker "lib/mempool.ml" "too many conflicting transactions")
+  (* Core v31 policy/rbf.cpp:71 words this in CLUSTERS, matching what Rule 5
+     actually bounds: "too many conflicting clusters (%u > %d)". The previous
+     assertion pinned the old "conflicting transactions" wording, which went
+     with the over-strict entry-count gate. *)
+  Alcotest.(check bool) "100-cap error: 'too many conflicting clusters'" true
+    (file_has_marker "lib/mempool.ml" "too many conflicting clusters")
 
 (* ============================================================================
    G15-G18 — RPC surface

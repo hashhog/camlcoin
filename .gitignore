@@ -9,6 +9,12 @@ _opam/
 *.cmx
 *.o
 
+# Erlang leftovers from cross-repo experiments (not camlcoin artifacts)
+erl_crash.dump
+*.dump
+feed-*.log
+rebar.lock
+
 # Claude config
 .claude/
 

@@ -1,5 +1,6 @@
 (lang dune 3.0)
 (name camlcoin)
+(version 1.0.0)
 (generate_opam_files true)
 (source (github camlcoin/camlcoin))
 (license MIT)
@@ -9,7 +10,7 @@
  (name camlcoin)
  (synopsis "Bitcoin full node implementation in OCaml")
  (depends
-  (ocaml (>= 4.14.0))
+  (ocaml (>= 5.1))
   (dune (>= 3.0))
   (cstruct (>= 6.0.0))
   (cstruct-unix (>= 6.0.0))
@@ -23,6 +24,7 @@
   (digestif (>= 1.1.0))
   (mirage-crypto (>= 1.0.0))
   (zarith (>= 1.13))
+  (bigstring (>= 0.3))
   (bigstringaf (>= 0.9.0))
   (base64 (>= 3.5.0))
   (alcotest (and (>= 1.6.0) :with-test))

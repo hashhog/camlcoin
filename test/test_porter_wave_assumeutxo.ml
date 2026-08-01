@@ -78,18 +78,19 @@ let test_change1_available_heights_include_boot_smoke_299 () =
     (Printf.sprintf "heights=[%s]"
        (String.concat "," (List.map string_of_int heights)))
 
-(* NOTE: mainnet_au_data currently carries 5 Core-published heights (840k /
-   880k / 910k / 935k / 944183) — the pre-existing
-   test_w138_assumeutxo.ml "INV-4: 4 mainnet heights present" pin is stale
-   (dates from before the 944183 entry was added) and already fails on an
-   unmodified checkout; not something this porter-wave change touches or
-   fixes. This test pins the CURRENT (correct) 5-height set instead. *)
+(* NOTE: mainnet_au_data carries 6 heights: the 4 Core-published (840k /
+   880k / 910k / 935k) plus camlcoin's intentional additions 944183
+   (snapshot-bootstrap entry) and 481823 (Track-B WINDOWED replay base,
+   commit cd5d750 — inert for normal boot & validation, consulted only via
+   --import-utxo / loadtxoutset / dumptxoutset-rollback).  This test pins
+   the CURRENT (correct) 6-height set; testnet4 remains empty (no
+   Core-published entries as of 31.99). *)
 let test_change1_mainnet_testnet4_untouched () =
-  let name = "Change-1: mainnet/testnet4 tables untouched (regtest-only widening)" in
+  let name = "Change-1: mainnet/testnet4 tables pinned (4 Core + 944183 + Track-B 481823)" in
   let mainnet_heights = Assume_utxo.available_snapshot_heights Consensus.mainnet in
   let testnet4_heights = Assume_utxo.available_snapshot_heights Consensus.testnet4 in
   check name
-    (mainnet_heights = [840_000; 880_000; 910_000; 935_000; 944_183]
+    (mainnet_heights = [481_823; 840_000; 880_000; 910_000; 935_000; 944_183]
      && testnet4_heights = [])
     (Printf.sprintf "mainnet=[%s] testnet4=[%s]"
        (String.concat "," (List.map string_of_int mainnet_heights))
@@ -124,7 +125,7 @@ let test_change2_unset_flag_bit_identical () =
     (before_mainnet = after_mainnet
      && before_testnet4 = after_testnet4
      && before_regtest = after_regtest
-     && after_mainnet = [840_000; 880_000; 910_000; 935_000; 944_183]
+     && after_mainnet = [481_823; 840_000; 880_000; 910_000; 935_000; 944_183]
      && after_testnet4 = []
      && List.mem 110 after_regtest && List.mem 200 after_regtest
      && List.mem 299 after_regtest)
@@ -142,9 +143,9 @@ let temp_campaign_fixture ?(entries : string = "") () =
   path
 
 (* A well-formed campaign entry at a height that does NOT collide with any
-   built-in mainnet/testnet4/regtest entry (Core mainnet heights 840k/880k/
-   910k/935k, Core regtest 110/200/299). Mirrors the Track-B 481823 shape
-   from CAMPAIGN-SNAPSHOT-TABLE-SPEC.md, using a dummy but well-formed hash. *)
+   built-in mainnet/testnet4/regtest entry (built-in mainnet heights
+   481823/840k/880k/910k/935k/944183, Core regtest 110/200/299). Uses a
+   dummy but well-formed hash in the CAMPAIGN-SNAPSHOT-TABLE-SPEC.md shape. *)
 let campaign_entry_json ~height ~blockhash_display ~hash_serialized_display
     ~chain_tx_count =
   Printf.sprintf
@@ -158,8 +159,11 @@ let test_change2_campaign_appends_mainnet () =
   let name = "Change-2: campaign entry appends to mainnet allowlist without disturbing built-ins" in
   Assume_utxo.clear_campaign_assumeutxo ();
   let before = Assume_utxo.available_snapshot_heights Consensus.mainnet in
+  (* Height 500_000: does not collide with any built-in entry (481823 is
+     built-in since commit cd5d750, so it can no longer stand in as the
+     campaign-height stand-in it once was). *)
   let entry_hash = dummy_hash_display 0xab in
-  let entry = campaign_entry_json ~height:481_823
+  let entry = campaign_entry_json ~height:500_000
       ~blockhash_display:entry_hash ~hash_serialized_display:entry_hash
       ~chain_tx_count:249_036_369L in
   let path = temp_campaign_fixture ~entries:entry () in
@@ -182,10 +186,10 @@ let test_change2_campaign_appends_mainnet () =
   Assume_utxo.clear_campaign_assumeutxo ();
   (try Sys.remove path with _ -> ());
   check name
-    (before = [840_000; 880_000; 910_000; 935_000; 944_183]
-     && List.mem 481_823 after
+    (before = [481_823; 840_000; 880_000; 910_000; 935_000; 944_183]
+     && List.mem 500_000 after
      && List.for_all (fun h -> List.mem h after) before
-     && (match resolved with Some p -> p.height = 481_823 | None -> false))
+     && (match resolved with Some p -> p.height = 500_000 | None -> false))
     (Printf.sprintf "before=[%s] after=[%s] resolved=%b"
        (String.concat "," (List.map string_of_int before))
        (String.concat "," (List.map string_of_int after))

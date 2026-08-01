@@ -667,8 +667,38 @@ let test_getrawtransaction_confirmed_has_block_info () =
     "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f" in
   Storage.ChainDB.store_tx_index db txid block_hash 0;
 
+  (* A txindex record implies the containing block was CONNECTED, so its
+     header must also be known — store it in the DB (feeds
+     ChainDB.get_block_header, i.e. time/blocktime) and register it in the
+     in-memory header table (feeds Sync.get_header, i.e. height used for
+     confirmations).  Without this the fixture confirms the tx in name only:
+     since d56434f (getrawtransaction byte-identity with Core 31.99) the
+     handler derives the block context from the real header instead of
+     fabricating 0s, matching Core's TxToJSON, which always has the
+     blockindex for a txindex-confirmed tx
+     (bitcoin-core/src/rpc/rawtransaction.cpp:70-84). *)
+  let header : Types.block_header = {
+    version = 0x20000000l;
+    prev_block = Types.hash256_of_hex
+      "0000000000000000000000000000000000000000000000000000000000000000";
+    merkle_root = Types.hash256_of_hex
+      "2222222222222222222222222222222222222222222222222222222222222222";
+    timestamp = 0x5a5a5a5al;
+    bits = 0x207fffffl;
+    nonce = 0xcafef00dl;
+  } in
+  Storage.ChainDB.store_block_header db block_hash header;
+
   (* Create chain state with a tip *)
   let chain = Sync.create_chain_state db Consensus.mainnet in
+  let entry : Sync.header_entry = {
+    header;
+    hash = block_hash;
+    height = 1;
+    total_work = Types.hash256_of_hex
+      "0000000000000000000000000000000000000000000000000000000000000001";
+  } in
+  Hashtbl.replace chain.Sync.headers (Cstruct.to_string block_hash) entry;
   let pm = Peer_manager.create Consensus.mainnet in
   let fe = Fee_estimation.create () in
   let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false ~utxo ~current_height:100 () in

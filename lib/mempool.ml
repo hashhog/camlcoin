@@ -1965,6 +1965,7 @@ let is_truc_tx (tx : Types.transaction) : bool =
 
    Reference: bitcoin-core/src/policy/truc_policy.cpp:171-261. *)
 let check_truc_policy (mp : mempool) (tx : Types.transaction)
+    ?staged_removals
     (depends : Types.hash256 list) (vsize : int) : (unit, string) result =
   let is_v3 = is_truc_tx tx in
 
@@ -2053,8 +2054,30 @@ let check_truc_policy (mp : mempool) (tx : Types.transaction)
                    parent.descendant_count + 1 > TRUC_DESCENDANT_LIMIT
                  descendant_count includes the parent itself, so:
                    0 children ⟹ count=1, 1+1=2≤2 ✓
-                   1 child    ⟹ count=2, 2+1=3>2 ✗ *)
-              if parent_entry.descendant_count + 1 > truc_descendant_limit then
+                   1 child    ⟹ count=2, 2+1=3>2 ✗
+
+                 child_will_be_replaced exception (Core truc_policy.cpp:239-247):
+                 when this tx is an RBF replacement whose eviction set includes
+                 a descendant of the parent, that descendant is already staged
+                 for removal (Core stages every conflict via
+                 ChangeSet::StageRemoval BEFORE SingleTRUCChecks runs) and must
+                 not count against the limit.  [staged_removals] is the same RBF
+                 changeset da4220c threads to the cluster gate.  Under TRUC's
+                 1-descendant topology the parent's only descendant is its
+                 direct child, so membership in the staged set coincides with
+                 Core's direct_conflicts membership — this reproduces Core's
+                 "sibling eviction" admission of a replacement for the existing
+                 v3 child. *)
+              let child_will_be_replaced =
+                match staged_removals with
+                | None -> false
+                | Some removals ->
+                  List.exists (fun d ->
+                    Hashtbl.mem removals (Cstruct.to_string d.txid)
+                  ) (get_descendants mp parent_txid)
+              in
+              if parent_entry.descendant_count + 1 > truc_descendant_limit
+                 && not child_will_be_replaced then
                 Error (Printf.sprintf
                   "TRUC/v3 parent %s already has an unconfirmed child \
                    (descendant count %d would exceed limit %d)"
@@ -2663,6 +2686,10 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
             (* TRUC/v3 policy (BIP-431).
                Pass sigop-adjusted vsize — Core truc_policy.cpp:SingleTRUCChecks
                receives the same adjusted vsize.
+               [staged_removals] (the RBF changeset) is forwarded so Gate 6 can
+               apply Core's child_will_be_replaced exception
+               (truc_policy.cpp:239-247) against the post-eviction graph,
+               matching the StageRemoval-before-SingleTRUCChecks ordering.
                W96 Bug 11: skip TRUC checks when bypass_limits is set.  Core
                validation.cpp:954 wraps SingleTRUCChecks in
                `if (!args.m_bypass_limits)` so that reorg refill (txs from a
@@ -2670,7 +2697,7 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
                Without this skip, valid v3 chains that survived a reorg would
                be re-rejected when the parent has not yet re-entered the
                mempool. *)
-            match (if bypass_limits then Ok () else check_truc_policy mp tx !depends vsize) with
+            match (if bypass_limits then Ok () else check_truc_policy ?staged_removals mp tx !depends vsize) with
             | Error e -> Error e
             | Ok () ->
 

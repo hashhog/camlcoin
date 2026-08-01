@@ -649,9 +649,15 @@ let test_g19_no_bip54_sigops_check () =
     "G19: BUG-W135-7 — CheckSigopsBIP54 (MAX_TX_LEGACY_SIGOPS=2500) missing"
     true true
 
-(* G20: BUG-W135-8 — extract_last_push_data skips OP_n / OP_0 / OP_1NEGATE.
-   For a scriptSig "<PUSH redeem> OP_1", Core EvalScript leaves [redeem; 0x01]
-   on stack; "last item" is 0x01.  camlcoin returns `redeem` instead. *)
+(* G20: BUG-W135-8 (FIXED) — extract_last_push_data no longer skips
+   OP_n / OP_0 / OP_1NEGATE.  Core's CScript::GetSigOpCount(scriptSig)
+   (script/script.cpp:182-204) loops GetOp over the scriptSig, and
+   GetScriptOp (script/script.cpp:312-316) CLEARS vData at the top of
+   every call, refilling it only for opcodes <= OP_PUSHDATA4.  So for a
+   scriptSig "<PUSH redeem> OP_1" the final vData is EMPTY (subscript =
+   empty script, 0 sigops) — not the prior `redeem` push.  validation.ml
+   now mirrors this: OP_0 / OP_1NEGATE / OP_1..OP_16 yield Some empty,
+   and any opcode > OP_16 returns None (Core: return 0 immediately). *)
 let test_g20_extract_last_push_misses_opn () =
   (* Build scriptSig: PUSH_2 <0xde 0xad> OP_1 *)
   let scriptsig = Cstruct.create 4 in
@@ -662,10 +668,14 @@ let test_g20_extract_last_push_misses_opn () =
   match Validation.extract_last_push_data scriptsig with
   | Some last ->
     let last_bytes = Cstruct.to_string last in
-    (* camlcoin returns 0xde 0xad (the literal push) — NOT 0x01 like Core. *)
+    (* Post-fix: trailing OP_1 yields Core's cleared (empty) vData. *)
     Alcotest.(check bool)
-      "G20: BUG-W135-8 — extract_last_push_data returns prior push, not OP_1 value"
-      true (last_bytes = "\xde\xad")
+      "G20 (post-fix BUG-W135-8): trailing OP_1 returns Core's cleared (empty) vData"
+      true (last_bytes = "");
+    (* Regression pin: the old bug returned the prior push 0xde 0xad. *)
+    Alcotest.(check bool)
+      "G20 (post-fix BUG-W135-8): prior push 0xde 0xad no longer returned"
+      false (last_bytes = "\xde\xad")
   | None ->
     Alcotest.fail "G20: extract_last_push_data returned None"
 
@@ -849,7 +859,7 @@ let () =
       Alcotest.test_case "G17: P2A dust = Core 240 threshold (BUG-W135-6 FIXED)" `Quick test_g17_p2a_dust_core_threshold;
       Alcotest.test_case "G18: MAX_DUST_OUTPUTS_PER_TX=1" `Quick test_g18_max_dust_outputs_per_tx;
       Alcotest.test_case "G19: no CheckSigopsBIP54 (BUG-W135-7 P0-CONSENSUS)" `Quick test_g19_no_bip54_sigops_check;
-      Alcotest.test_case "G20: extract_last_push_data skips OP_n (BUG-W135-8 P1)" `Quick test_g20_extract_last_push_misses_opn;
+      Alcotest.test_case "G20: extract_last_push_data Core GetOp vData (BUG-W135-8 FIXED)" `Quick test_g20_extract_last_push_misses_opn;
     ];
     "G21-G25 IsWitnessStandard", [
       Alcotest.test_case "G21: coinbase exemption" `Quick test_g21_coinbase_exemption;

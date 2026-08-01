@@ -238,12 +238,16 @@
    `dune exec test/test_w124_operator.exe`, or from `dune runtest` (which
    does in-tree copy and chdir's into the test dir). We search up to 6
    parents for a [lib/cli.ml] sibling, then read every file relative to
-   that root. *)
+   that root.  The [dune-project] conjoint skips [_build/default]: dune
+   stages [lib/cli.ml] there, so a run from inside [_build] (e.g. via
+   `dune runtest`) would otherwise resolve the root to the staging dir
+   and fail to find repo-root files such as [config.example.toml]. *)
 let project_root =
   let cwd = Sys.getcwd () in
   let rec walk dir n =
     if n > 6 then None
-    else if Sys.file_exists (Filename.concat dir "lib/cli.ml") then Some dir
+    else if Sys.file_exists (Filename.concat dir "lib/cli.ml")
+         && Sys.file_exists (Filename.concat dir "dune-project") then Some dir
     else
       let parent = Filename.dirname dir in
       if parent = dir then None
@@ -521,23 +525,26 @@ let g15_log_format_thin_partial () =
     (contains snippet "category")
 
 (* ============================================================================
-   Gate G16: No `logging` RPC method (BUG-4, MISSING).
+   Gate G16: `logging` RPC method implemented (post-fix BUG-4 — dispatcher
+   arm rpc.ml:13905, handle_logging rpc.ml:12725; Core rpc/node.cpp:200-275).
    ============================================================================ *)
 let g16_logging_rpc_missing () =
   let src = read_file "lib/rpc.ml" in
-  Alcotest.(check bool) "BUG-4: no \"logging\" RPC dispatcher case" false
+  Alcotest.(check bool) "G16 (post-fix BUG-4): \"logging\" RPC dispatcher case" true
     (contains src "| \"logging\" ->");
-  Alcotest.(check bool) "BUG-4: no handle_logging helper" false
+  Alcotest.(check bool) "G16 (post-fix BUG-4): handle_logging helper" true
     (contains src "let handle_logging ")
 
 (* ============================================================================
-   Gate G17: No `getmemoryinfo` RPC method (BUG-5, MISSING).
+   Gate G17: `getmemoryinfo` RPC method implemented (post-fix BUG-5 —
+   dispatcher arm rpc.ml:13489, handle_getmemoryinfo rpc.ml:12643, with
+   Core's stats / mallocinfo modes; Core rpc/server.cpp::getmemoryinfo).
    ============================================================================ *)
 let g17_getmemoryinfo_rpc_missing () =
   let src = read_file "lib/rpc.ml" in
-  Alcotest.(check bool) "BUG-5: no \"getmemoryinfo\" RPC dispatcher case" false
+  Alcotest.(check bool) "G17 (post-fix BUG-5): \"getmemoryinfo\" RPC dispatcher case" true
     (contains src "| \"getmemoryinfo\" ->");
-  Alcotest.(check bool) "BUG-5: no handle_getmemoryinfo helper" false
+  Alcotest.(check bool) "G17 (post-fix BUG-5): handle_getmemoryinfo helper" true
     (contains src "let handle_getmemoryinfo ")
 
 (* ============================================================================

@@ -167,18 +167,17 @@ let test_g2_siphash_key_deterministic () =
   Alcotest.(check int64) "G2: key derivation is deterministic (k1)" k1_a k1_b
 
 let test_g2_nonce_csprng_bug () =
-  (* BUG-8: Random.int64 is not CSPRNG. Document by confirming the function
-     exists and produces non-negative int64, but note it uses stdlib PRNG. *)
-  (* generate_compact_nonce is private; test indirectly via create_compact_block *)
+  (* BUG-8 POST-FIX: generate_compact_nonce now draws 8 bytes from
+     /dev/urandom (CSPRNG) instead of stdlib Random.int64.  Core's BIP-152
+     nonce is a random uint64_t — every 64-bit pattern is valid, so a
+     sign-bit-set (negative-in-OCaml) value is perfectly fine; the old
+     "nonce is non-negative" assertion was a 50% coin flip per run and has
+     been replaced by a distinctness check (collision probability 2^-64). *)
   let block = make_test_block 2 in
   let cb1 = P2p.create_compact_block block in
   let cb2 = P2p.create_compact_block block in
-  (* With CSPRNG nonces should rarely (essentially never) collide — as a
-     discovery test we just confirm they are non-negative int64. The real
-     bug is using stdlib Random.int64 instead of CSPRNG. *)
-  Alcotest.(check bool) "G2/BUG-8: nonce is non-negative int64" true (cb1.nonce >= 0L);
-  (* Two compact blocks of same block typically have different nonces *)
-  ignore (cb1.nonce, cb2.nonce)  (* just document the path exists *)
+  Alcotest.(check bool) "G2/BUG-8 (post-fix): sequential CSPRNG nonces differ"
+    true (cb1.nonce <> cb2.nonce)
 
 (* ============================================================================
    G3: Constants — total tx count cap BUG-1
@@ -731,7 +730,7 @@ let constant_tests = [
   Alcotest.test_case "G1 short-ID roundtrip"            `Quick test_g1_short_id_roundtrip;
   Alcotest.test_case "G2 SipHash key derivation"        `Quick test_g2_siphash_key_derivation;
   Alcotest.test_case "G2 SipHash key deterministic"     `Quick test_g2_siphash_key_deterministic;
-  Alcotest.test_case "G2/BUG-8 nonce non-CSPRNG"        `Quick test_g2_nonce_csprng_bug;
+  Alcotest.test_case "G2/BUG-8 nonce CSPRNG (post-fix)"        `Quick test_g2_nonce_csprng_bug;
   Alcotest.test_case "G3/BUG-1 total-tx-cap = 65535"   `Quick test_g3_total_tx_cap_bug;
   Alcotest.test_case "G3 individual-count-cap correct"  `Quick test_g3_individual_count_cap_correct;
   Alcotest.test_case "G4 SipHash-2-4 constants"         `Quick test_g4_siphash_constants;

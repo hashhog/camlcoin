@@ -150,8 +150,12 @@ let https_request_status ~port =
     Tls_lwt.connect_ext tls_cfg ("127.0.0.1", port) >>= fun (ic, oc) ->
     Lwt_io.write oc (make_post_request_str ~host:"127.0.0.1" ~port) >>= fun () ->
     Lwt_io.read_line_opt ic >>= fun line ->
-    Lwt_io.close ic >>= fun () ->
-    Lwt_io.close oc >|= fun () ->
+    (* Best-effort teardown: the request is HTTP/1.0 (no keep-alive), so
+       cohttp closes the TCP connection right after responding; writing
+       the TLS close_notify into that dead socket raises EPIPE in
+       tls-lwt.  Swallow it — the roundtrip already succeeded. *)
+    Lwt.catch (fun () -> Lwt_io.close oc) (fun _ -> Lwt.return_unit)
+    >|= fun () ->
     line
   in
   Lwt_main.run promise
@@ -167,7 +171,8 @@ let http_request_status ~port =
     let oc = Lwt_io.of_fd ~mode:Lwt_io.output fd in
     Lwt_io.write oc (make_post_request_str ~host:"127.0.0.1" ~port) >>= fun () ->
     Lwt_io.read_line_opt ic >>= fun line ->
-    Lwt_io.close ic >>= fun () ->
+    (* ic and oc wrap the SAME fd — closing both would raise EBADF on
+       the second close; closing oc alone releases the fd. *)
     Lwt_io.close oc >|= fun () ->
     line
   in
@@ -206,37 +211,33 @@ let wait_for_port ~port =
    Tests
    ============================================================================ *)
 
-(* Spawn the server in a CHILD PROCESS.  Lwt's "nested Lwt_main.run"
-   check is per-process, so running an independent Lwt_main in the
-   child + another in the parent (for the client request) is the
-   simplest way to avoid the check while still owning a real scheduler
-   on each side.  Returns the child PID; caller is responsible for
-   killing it (we use kill_child below).
+(* Spawn the server in a CHILD PROCESS via fork+EXEC of this same
+   binary in a hidden server mode (--fix64-server ...), NOT a bare
+   Unix.fork.  A bare fork deadlocks with lwt 5.9 on OCaml 5: the
+   Lwt_unix module initializer (lwt_unix.cppo.ml [event_notifications])
+   creates the notification eventfd + self-pipe at PROGRAM STARTUP, so
+   a forked child shares those kernel objects with the parent.  Both
+   processes then run their own Lwt_main.run selecting on the SAME
+   eventfd; whichever side loses the race to
+   eventfd_notification_recv blocks in read() while holding
+   notification_mutex, and that process's next send_notification (job
+   completion) then blocks on the mutex — a permanent cross-process
+   deadlock (observed on the OCaml 5.1.1 switch as the suite hanging:
+   parent in select with zero sockets, server child idle).  exec gives
+   the child a fresh runtime with private Lwt notification fds, so
+   each side owns a real, independent scheduler.
 
-   The [server_factory ctx] thunk is INVOKED INSIDE THE CHILD, after the
-   ctx has been built inside the child.  This keeps the RocksDB / mempool
-   / peer-manager handles entirely owned by the child — inheriting an
-   open RocksDB handle across fork would deadlock the next .create() call.
+   Returns the child PID; caller is responsible for killing it (we use
+   kill_child below).
 
    POSIX-thread variant was tried and rejected: Lwt's main-loop check
    uses a global, so two threads in the same process cannot both run
    Lwt_main. *)
-let spawn_server (server_factory : Rpc.rpc_context -> unit Lwt.t) =
-  match Unix.fork () with
-  | 0 ->
-    (* Child.  Build a fresh ctx and run the server.  If anything
-       raises, log + exit 1 so the parent's wait_for_port deadline
-       catches the failure. *)
-    (try
-       let ctx = make_rpc_ctx () in
-       Lwt_main.run (server_factory ctx);
-       exit 0
-     with exn ->
-       Printf.eprintf "[fix64-server-child] %s\n%!" (Printexc.to_string exn);
-       exit 1)
-  | pid ->
-    (* Parent — return PID so it can be killed at the end of the test. *)
-    pid
+let spawn_server args =
+  let argv =
+    Array.of_list (Sys.executable_name :: "--fix64-server" :: args) in
+  Unix.create_process Sys.executable_name argv
+    Unix.stdin Unix.stdout Unix.stderr
 
 let kill_child pid =
   (try Unix.kill pid Sys.sigkill with _ -> ());
@@ -248,15 +249,8 @@ let test_rpc_https_roundtrip () =
   let cert, key = ensure_self_signed_cert tmp_dir in
   let port = pick_free_port () in
   let _ = wait_until_some in
-  let pid = spawn_server (fun ctx ->
-    Rpc.start_rpc_server
-      ~ctx
-      ~host:"127.0.0.1" ~port
-      ~rpc_user:"camlcoin" ~rpc_password:"camlcoin"
-      ~cookie_password:None
-      ~tls_cert_path:(Some cert)
-      ~tls_key_path:(Some key)
-      ())
+  let pid = spawn_server
+    ["rpc"; "--port"; string_of_int port; "--cert"; cert; "--key"; key]
   in
   let cleanup () = kill_child pid in
   Fun.protect ~finally:cleanup (fun () ->
@@ -275,14 +269,7 @@ let test_rpc_https_roundtrip () =
 (* Test 2: RPC over HTTP (no cert/key set) — backward compat. *)
 let test_rpc_http_backward_compat () =
   let port = pick_free_port () in
-  let pid = spawn_server (fun ctx ->
-    Rpc.start_rpc_server
-      ~ctx
-      ~host:"127.0.0.1" ~port
-      ~rpc_user:"camlcoin" ~rpc_password:"camlcoin"
-      ~cookie_password:None
-      ())
-  in
+  let pid = spawn_server ["rpc"; "--port"; string_of_int port] in
   let cleanup () = kill_child pid in
   Fun.protect ~finally:cleanup (fun () ->
     wait_for_port ~port;
@@ -402,13 +389,8 @@ let test_rest_https_roundtrip () =
   let tmp_dir = "/tmp/camlcoin_fix64_certs" in
   let cert, key = ensure_self_signed_cert tmp_dir in
   let port = pick_free_port () in
-  let pid = spawn_server (fun ctx ->
-    Rest.start_rest_server
-      ~ctx
-      ~host:"127.0.0.1" ~port
-      ~tls_cert_path:(Some cert)
-      ~tls_key_path:(Some key)
-      ())
+  let pid = spawn_server
+    ["rest"; "--port"; string_of_int port; "--cert"; cert; "--key"; key]
   in
   let cleanup () = kill_child pid in
   Fun.protect ~finally:cleanup (fun () ->
@@ -433,8 +415,9 @@ let test_rest_https_roundtrip () =
         Tls_lwt.connect_ext tls_cfg ("127.0.0.1", port) >>= fun (ic, oc) ->
         Lwt_io.write oc make_get_str >>= fun () ->
         Lwt_io.read_line_opt ic >>= fun line ->
-        Lwt_io.close ic >>= fun () ->
-        Lwt_io.close oc >|= fun () ->
+        (* Best-effort teardown — see https_request_status. *)
+        Lwt.catch (fun () -> Lwt_io.close oc) (fun _ -> Lwt.return_unit)
+        >|= fun () ->
         line)
     in
     match status with
@@ -446,11 +429,71 @@ let test_rest_https_roundtrip () =
       Alcotest.fail "no REST HTTPS response line read")
 
 (* ============================================================================
+   Hidden server mode (the exec'd child — see spawn_server)
+   ============================================================================ *)
+
+(* Entry point for the exec'd server child:
+     test_fix64_tls.exe --fix64-server rpc|rest --port N [--cert C --key K]
+   Builds the RPC ctx in-process (fresh RocksDB handle, owned entirely
+   by this process) and runs the requested server under Lwt_main.run.
+   Never returns: exits 0 if the server promise resolves, 1 on error
+   (logged so the parent's wait_for_port deadline catches it). *)
+let fix64_server_main () =
+  let impl = Sys.argv.(2) in
+  let port = ref 0 in
+  let cert = ref None in
+  let key = ref None in
+  let i = ref 3 in
+  while !i < Array.length Sys.argv do
+    (match Sys.argv.(!i) with
+     | "--port" -> port := int_of_string Sys.argv.(!i + 1)
+     | "--cert" -> cert := Some Sys.argv.(!i + 1)
+     | "--key"  -> key  := Some Sys.argv.(!i + 1)
+     | arg ->
+       Printf.eprintf "[fix64-server] bad arg %s\n%!" arg;
+       exit 2);
+    i := !i + 2
+  done;
+  if !port = 0 then begin
+    Printf.eprintf "[fix64-server] missing --port\n%!";
+    exit 2
+  end;
+  (try
+     let ctx = make_rpc_ctx () in
+     let server = match impl with
+       | "rpc" ->
+         Rpc.start_rpc_server
+           ~ctx
+           ~host:"127.0.0.1" ~port:!port
+           ~rpc_user:"camlcoin" ~rpc_password:"camlcoin"
+           ~cookie_password:None
+           ~tls_cert_path:!cert ~tls_key_path:!key
+           ()
+       | "rest" ->
+         Rest.start_rest_server
+           ~ctx
+           ~host:"127.0.0.1" ~port:!port
+           ~tls_cert_path:!cert ~tls_key_path:!key
+           ()
+       | other ->
+         Printf.eprintf "[fix64-server] bad impl %s\n%!" other;
+         exit 2
+     in
+     Lwt_main.run server;
+     exit 0
+   with exn ->
+     Printf.eprintf "[fix64-server-child] %s\n%!" (Printexc.to_string exn);
+     exit 1)
+
+(* ============================================================================
    Suite
    ============================================================================ *)
 
 let () =
-  Alcotest.run "fix64_tls" [
+  if Array.length Sys.argv >= 3 && Sys.argv.(1) = "--fix64-server" then
+    fix64_server_main ()
+  else
+    Alcotest.run "fix64_tls" [
     "rpc-tls", [
       Alcotest.test_case "https roundtrip"           `Slow test_rpc_https_roundtrip;
       Alcotest.test_case "http backward compat"      `Slow test_rpc_http_backward_compat;

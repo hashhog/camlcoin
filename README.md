@@ -14,7 +14,7 @@ docker run -v camlcoin-data:/data -p 48347:48347 -p 48337:48337 camlcoin
 ### From Source
 
 ```bash
-opam switch create . 4.14.2 --deps-only -y
+opam switch create . 5.1.1 --deps-only -y
 eval $(opam env)
 opam install . --deps-only --with-test -y
 dune build
@@ -98,7 +98,7 @@ Bitcoin Core-compatible JSON-RPC with batch request support.
 | Descriptors | `deriveaddresses`, `getdescriptorinfo`, `listdescriptors` |
 | Util | `estimatesmartfee`, `validateaddress` |
 | Chain Mgmt | `invalidateblock`, `reconsiderblock` |
-| assumeUTXO | `loadtxoutset`, `dumptxoutset` |
+| assumeUTXO | `loadtxoutset`, `dumptxoutset`, `getchainstates` |
 | Control | `help`, `stop`, `uptime` |
 | Debug | `getperfstats` |
 

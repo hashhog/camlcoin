@@ -598,7 +598,9 @@ let test_g25_no_signed_and_verified_check () =
    G26-G30: RPC surface gaps + analyzepsbt fidelity
    ============================================================================ *)
 
-(* G26: joinpsbts RPC absent (BUG-W137-20). *)
+(* G26: joinpsbts RPC — implemented (post-fix BUG-W137-20).
+   rpc.ml defines handle_joinpsbts, mirroring Core
+   rawtransaction.cpp::joinpsbts. *)
 let test_g26_no_joinpsbts_rpc () =
   let src = rpc_ml () in
   let has =
@@ -606,7 +608,7 @@ let test_g26_no_joinpsbts_rpc () =
     || source_contains ~path:src ~needle:"\"joinpsbts\""
     || source_contains ~path:src ~needle:"join_psbts"
   in
-  Alcotest.(check bool) "G26: joinpsbts RPC absent (BUG-W137-20)" false has
+  Alcotest.(check bool) "G26: joinpsbts RPC present (post-fix BUG-W137-20)" true has
 
 (* G27: descriptorprocesspsbt RPC absent (BUG-W137-21). *)
 let test_g27_no_descriptorprocesspsbt_rpc () =
@@ -856,7 +858,7 @@ let () =
       Alcotest.test_case "G25: no PSBTInputSignedAndVerified (P0-CDIV BUG-W137-4)" `Quick test_g25_no_signed_and_verified_check;
     ];
     "G26-G30 RPC surface + analyzepsbt fidelity", [
-      Alcotest.test_case "G26: joinpsbts RPC absent (BUG-W137-20)" `Quick test_g26_no_joinpsbts_rpc;
+      Alcotest.test_case "G26: joinpsbts RPC present (post-fix BUG-W137-20)" `Quick test_g26_no_joinpsbts_rpc;
       Alcotest.test_case "G27: descriptorprocesspsbt RPC absent (BUG-W137-21)" `Quick test_g27_no_descriptorprocesspsbt_rpc;
       Alcotest.test_case "G28: psbtbumpfee RPC absent (BUG-W137-22)" `Quick test_g28_no_psbtbumpfee_rpc;
       Alcotest.test_case "G29: estimated_vsize hard-coded 0 (P0-CDIV BUG-W137-1)" `Quick test_g29_analyzepsbt_estimated_vsize_stubbed;

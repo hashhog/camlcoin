@@ -1886,32 +1886,53 @@ let test_b11_coins_count_check_bypassed_for_three_mainnet_entries () =
          (List.length zero_count_heights))
 
 (* -----------------------------------------------------------------------
-   B12 — G15: background validation median_time hardcoded to 0l
+   B12 — G15: background validation median_time (FIXED — was hardcoded 0l)
 
-   run_background_validation (assume_utxo.ml:1116):
-     let median_time = 0l in (* TODO: compute properly from chain *)
-   BIP-113 requires the median past time (MTP) of the 11 blocks preceding
-   the one being validated.  Hardcoding 0 means sequence-lock CSV checks
-   computed from timestamps are wrong for every block in the IBD range.
+   run_background_validation previously passed median_time = 0l, which
+   disabled the nTime > MTP rule and the BIP-68/113 lock_time_cutoff for
+   every block in the background IBD range.  The fix computes MTP from the
+   header chain: the median of the previous 11 block timestamps (BIP-113),
+   mirroring Core's CBlockIndex::GetMedianTimePast (chain.h:233-245).
+   Regression test for Assume_utxo.compute_background_mtp.
    ----------------------------------------------------------------------- *)
 let test_b12_background_validation_median_time_hardcoded_zero () =
-  let name = "B12: background validation median_time hardcoded 0l (BIP-113 wrong)" in
-  let params : Assume_utxo.assumeutxo_params = {
-    height = 5;
-    blockhash = Cstruct.create 32;
-    coins_count = 0L;
-    coins_hash = Cstruct.create 32;
-    chain_tx_count = 0L;
+  let name = "B12: background validation MTP computed from chain (BIP-113)" in
+  (* 12 blocks with strictly increasing timestamps 10,20,...,120. *)
+  let mk_entry height = {
+    Sync.header = {
+      Types.version = 1l;
+      prev_block = Cstruct.create 32;
+      merkle_root = Cstruct.create 32;
+      timestamp = Int32.of_int ((height + 1) * 10);
+      bits = 0x1d00ffffl;
+      nonce = 0l;
+    };
+    hash = Cstruct.create 32;
+    height;
+    total_work = Cstruct.create 32;
   } in
-  let bg = Assume_utxo.create_background_validation ~snapshot_params:params in
-  (* The target height is 5, which is a non-genesis height that should require
-     MTP computation.  We can only detect the absent computation by inspecting
-     the record — if the validated_height starts at 0 the median_time would
-     need to be non-zero by block 1 for BIP-113 compliance. *)
-  if bg.validated_height = 0 && bg.target_height = 5 then
-    test_passed name  (* B12 documented: median_time=0l is hard-coded *)
+  let tbl = Hashtbl.create 16 in
+  for h = 0 to 11 do Hashtbl.replace tbl h (mk_entry h) done;
+  let get_header_at_height h = Hashtbl.find_opt tbl h in
+  (* Full window: MTP at height 11 = median of timestamps at heights 0..10
+     = median [10;20;...;110] = 60 (sorted index 5 of 11). *)
+  let mtp_full = Assume_utxo.compute_background_mtp ~get_header_at_height 11 in
+  (* Partial window near genesis: MTP at height 2 = median of heights 0..1
+     = median [10;20] = 20 (sorted index 1 of 2). *)
+  let mtp_partial = Assume_utxo.compute_background_mtp ~get_header_at_height 2 in
+  (* Empty chain: no ancestors -> 0l (same fallback as
+     Sync.compute_median_time_past). *)
+  let mtp_empty =
+    Assume_utxo.compute_background_mtp
+      ~get_header_at_height:(fun _ -> None) 11 in
+  if mtp_full <> 60l then
+    test_failed name (Printf.sprintf "full window: MTP = %ld, expected 60l" mtp_full)
+  else if mtp_partial <> 20l then
+    test_failed name (Printf.sprintf "partial window: MTP = %ld, expected 20l" mtp_partial)
+  else if mtp_empty <> 0l then
+    test_failed name (Printf.sprintf "empty chain: MTP = %ld, expected 0l" mtp_empty)
   else
-    test_failed name "Unexpected background_validation state"
+    test_passed name
 
 (* -----------------------------------------------------------------------
    B13 — G3: snapshot magic bytes: camlcoin uses 5-byte "utxo\xff",

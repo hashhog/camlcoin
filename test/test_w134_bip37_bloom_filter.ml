@@ -27,6 +27,20 @@ let hex_to_bytes (h : string) : bytes =
 
 let zero_hash () : Cstruct.t = Cstruct.create 32
 
+(* Walk up from CWD until we find the camlcoin repo root (recognised by
+   lib/bloom.ml). Alcotest invokes test executables from a CWD deep inside
+   _build, so we cannot use a fixed absolute path. *)
+let resolve_repo_root () =
+  let rec up dir depth =
+    if depth > 10 then
+      Alcotest.fail "could not locate repo root from CWD"
+    else if Sys.file_exists (Filename.concat dir "lib/bloom.ml") then dir
+    else up (Filename.dirname dir) (depth + 1)
+  in
+  up (Sys.getcwd ()) 0
+
+let lib_src name = Filename.concat (resolve_repo_root ()) ("lib/" ^ name)
+
 (* ============================================================================
    G1 — MAX_BLOOM_FILTER_SIZE = 36000
    ============================================================================ *)
@@ -460,7 +474,7 @@ let test_g26_filteradd_520_byte_guard () =
   (* The wire deserializer in p2p.ml uses `max_script_element_size = 520`.
      This unit test pins the boundary by reading the constant referenced
      in the dispatch arm. The actual reject happens at deserialization. *)
-  let src = "/home/work/hashhog/camlcoin/lib/p2p.ml" in
+  let src = lib_src "p2p.ml" in
   let buf = Buffer.create 65536 in
   let ic = open_in src in
   (try
@@ -480,11 +494,11 @@ let test_g26_filteradd_520_byte_guard () =
 (* ============================================================================
    G27 — BUG-1: filteradd without prior filterload → MUST misbehavior-disconnect
    PIN CURRENT (BUGGY) BEHAVIOUR: the FilterAddMsg arm at
-   peer_manager.ml:1870-1878 creates a zero-size match-all filter instead of
+   peer_manager.ml:2542-2550 creates a zero-size match-all filter instead of
    disconnecting. Match by source grep.
    ============================================================================ *)
 let test_g27_filteradd_without_filterload_BUG1 () =
-  let src = "/home/work/hashhog/camlcoin/lib/peer_manager.ml" in
+  let src = lib_src "peer_manager.ml" in
   let buf = Buffer.create 65536 in
   let ic = open_in src in
   (try
@@ -510,7 +524,7 @@ let test_g27_filteradd_without_filterload_BUG1 () =
    PIN CURRENT (BUGGY) BEHAVIOUR: the arms do not set peer.Peer.relay <- true.
    ============================================================================ *)
 let test_g28_filterload_filterclear_flip_relay_BUG3 () =
-  let src = "/home/work/hashhog/camlcoin/lib/peer_manager.ml" in
+  let src = lib_src "peer_manager.ml" in
   let buf = Buffer.create 65536 in
   let ic = open_in src in
   (try
@@ -531,7 +545,7 @@ let test_g28_filterload_filterclear_flip_relay_BUG3 () =
    InvFilteredBlock. Grep for the InvFilteredBlock arm.
    ============================================================================ *)
 let test_g29_msg_filtered_block_getdata_BUG2 () =
-  let src = "/home/work/hashhog/camlcoin/lib/peer.ml" in
+  let src = lib_src "peer.ml" in
   let buf = Buffer.create 1_000_000 in
   let ic = open_in src in
   (try
@@ -547,9 +561,9 @@ let test_g29_msg_filtered_block_getdata_BUG2 () =
     false (contains contents needle_fix);
   (* The MerkleBlockMsg construction site must exist somewhere in handle_getdata. *)
   let needle_merkleblock = "MerkleBlockMsg" in
-  let src_files = ["/home/work/hashhog/camlcoin/lib/peer.ml";
-                   "/home/work/hashhog/camlcoin/lib/peer_manager.ml";
-                   "/home/work/hashhog/camlcoin/lib/sync.ml"] in
+  let src_files = [lib_src "peer.ml";
+                   lib_src "peer_manager.ml";
+                   lib_src "sync.ml"] in
   let any_constructs = List.exists (fun fp ->
     let b = Buffer.create 1_000_000 in
     let ic = open_in fp in
@@ -570,7 +584,7 @@ let test_g29_msg_filtered_block_getdata_BUG2 () =
    PIN CURRENT (BUGGY) BEHAVIOUR: bloom.ml has no CRollingBloomFilter analogue.
    ============================================================================ *)
 let test_g30_crolling_bloom_filter_BUG5 () =
-  let src = "/home/work/hashhog/camlcoin/lib/bloom.ml" in
+  let src = lib_src "bloom.ml" in
   let buf = Buffer.create 65536 in
   let ic = open_in src in
   (try

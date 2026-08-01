@@ -532,12 +532,26 @@ let test_g23_bug9_find_1p1c_stub () =
     in rm_rf "/tmp/camlcoin_test_w116_db2");
   cleanup_test_db ()
 
-(* G24/BUG-15: try_1p1c_with_orphans not called from single-tx rejection path. *)
+(* G24/BUG-15: try_1p1c_with_orphans not called from single-tx rejection path.
+   KNOWN-GAP BUG-15 (still open): grep of lib/ and bin/ shows the only caller
+   of Mempool.try_1p1c_with_orphans is test code (test/test_mempool.ml) — the
+   single-tx ATMP fee-rejection path never invokes it, so a low-fee parent
+   whose orphan child would pay for it stays rejected.  This sentinel stays
+   live: if the wiring is ever added, the orphan CPFP child below would get
+   the parent accepted and the check flips red.
+
+   Fixture note: the parent must pay a fee below the mempool floor for this
+   probe to exercise the rejection path at all.  The original 10-sat fee went
+   stale when min_relay_fee dropped 1000 -> 100 sat/kvB (Core
+   DEFAULT_MIN_RELAY_TX_FEE, policy/policy.h:70; commit 20e6647): 10 sat on
+   this ~84-vB tx is ~119 sat/kvB, above the floor, so ATMP accepted the
+   parent outright (no CPFP involved) and the sentinel inverted.  A 1-sat fee
+   (~12 sat/kvB) is again below the 8-sat floor for this tx and is rejected. *)
 let test_g24_bug15_try_1p1c_not_wired () =
   let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
   let parent = make_regular_tx
     [make_test_input txid1 0l]
-    [make_test_output 999_990L]  (* 10 sat fee — below min *)
+    [make_test_output 999_999L]  (* 1 sat fee — below the 100 sat/kvB floor *)
   in
   let parent_txid = Crypto.compute_txid parent in
   let child = make_regular_tx
@@ -546,7 +560,8 @@ let test_g24_bug15_try_1p1c_not_wired () =
   in
   Mempool.add_orphan mp child;
   let atmp_result = Lwt_main.run (Mempool.accept_to_memory_pool mp parent) in
-  (* BUG-15: ATMP does NOT trigger try_1p1c_with_orphans on fee rejection *)
+  (* BUG-15 (open): ATMP does NOT trigger try_1p1c_with_orphans on fee
+     rejection, so the parent is NOT rescued by its orphan CPFP child. *)
   Alcotest.(check bool) "G24/BUG-15: single-tx ATMP rejection does not trigger CPFP"
     false atmp_result.Mempool.atmp_accepted;
   Storage.ChainDB.close db;

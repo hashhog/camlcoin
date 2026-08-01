@@ -2892,6 +2892,8 @@ let handle_generateblock (ctx : rpc_context)
              target = Consensus.compact_to_target ctx.network.pow_limit;
              network_type = ctx.network.network_type;
              transactions_updated = 0;
+             (* GetMinimumTime = MTP+1 of prev block; Core node/miner.cpp:38 *)
+             mintime = Int32.add mtp 1l;
            } in
            (* Mine the block *)
            match Mining.mine_block template 100_000_000l with

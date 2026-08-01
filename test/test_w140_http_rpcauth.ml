@@ -75,14 +75,19 @@ let read_file path =
   Bytes.to_string buf
 
 (* Walk up from the current working directory until we find the
-   camlcoin repo root (recognised by the lib/rpc.ml marker file).
-   Alcotest invokes test executables from a CWD deep inside _build, so
-   we cannot use a fixed relative path.  Borrowed from W125. *)
+   camlcoin repo root.  The marker must be lib/rpc.ml AND dune-project
+   together: under `dune runtest` the CWD is _build/default/test and
+   _build/default contains lib/rpc.ml (staged for compilation) but NOT
+   dune-project and NOT bin/main.ml (bin is only materialised by a full
+   `dune build`, which CI's test-only job never runs) — stopping at the
+   _build mirror made bin/main.ml reads fail on a test-only build tree.
+   Borrowed from W125. *)
 let resolve_repo_root () =
   let rec up dir depth =
     if depth > 10 then
       Alcotest.fail "could not locate repo root from CWD"
-    else if Sys.file_exists (Filename.concat dir "lib/rpc.ml") then dir
+    else if Sys.file_exists (Filename.concat dir "lib/rpc.ml")
+            && Sys.file_exists (Filename.concat dir "dune-project") then dir
     else up (Filename.dirname dir) (depth + 1)
   in
   up (Sys.getcwd ()) 0

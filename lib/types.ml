@@ -1,6 +1,6 @@
 (* Core Bitcoin types using OCaml's algebraic type system *)
 
-let version = "0.1.0"
+let version = "1.0.0"
 let protocol_version = 70016l
 
 (* Hash types *)

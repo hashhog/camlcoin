@@ -355,16 +355,16 @@ let test_g19_longpollid_format () =
             "Types.hash256_to_hex_display template.header.prev_block\n\
              \             ^ string_of_int template.transactions_updated")
 
-(* G20 PARTIAL — mintime is the (already-clamped) header timestamp, not
-   strictly MTP+1.  W108 BUG-9 carry-forward. *)
+(* G20 — mintime = GetMinimumTime = MTP+1 of the previous block (post-fix).
+   W108 BUG-9 carry-forward; fixed in mining.ml (template.mintime). *)
 let test_g20_mintime_partial () =
   let src = slurp_lib "mining.ml" in
   Alcotest.(check bool)
-    "G20 (pre-fix): mintime emitted from template.header.timestamp \
-                     (not pindexPrev.GetMTP() + 1).  W108 BUG-9."
+    "G20 (post-fix): mintime emitted from template.mintime \
+                     (= MTP+1; Core rpc/mining.cpp:1004).  W108 BUG-9 fixed."
     true (contains_substring src
             "(\"mintime\",\n\
-             \      `Int (Int32.to_int template.header.timestamp));")
+             \      `Int (Int32.to_int template.mintime));")
 
 (* G21 PARTIAL — submitblock BIP-22 result strings present-shape. *)
 let test_g21_bip22_result_strings () =
@@ -403,15 +403,17 @@ let test_g23_submitblock_no_update_uncommitted_pre_fix () =
     false (contains_substring src "GenerateCoinbaseCommitment" ||
            contains_substring src "UpdateUncommittedBlockStructures")
 
-(* G24 — BUG-3 P2 : submitheader RPC not registered. *)
+(* G24 — BUG-3 P2 : submitheader RPC not registered.  FIXED: rpc.ml now
+   defines handle_submitheader (mirrors Core rpc/mining.cpp::submitheader)
+   and routes "submitheader" in the dispatcher. *)
 let test_g24_submitheader_rpc_missing () =
   let src = slurp_lib "rpc.ml" in
   Alcotest.(check bool)
-    "BUG-3 (pre-fix): no handle_submitheader function defined"
-    false (contains_substring src "handle_submitheader");
+    "BUG-3 (post-fix): handle_submitheader function defined"
+    true (contains_substring src "handle_submitheader");
   Alcotest.(check bool)
-    "BUG-3 (pre-fix): \"submitheader\" not in dispatcher switch"
-    false (contains_substring src "| \"submitheader\" ->")
+    "BUG-3 (post-fix): \"submitheader\" in dispatcher switch"
+    true (contains_substring src "| \"submitheader\" ->")
 
 (* G25 — generatetoaddress / generateblock present, regtest-gated. *)
 let test_g25_regtest_mining_rpcs () =
@@ -626,7 +628,7 @@ let () =
       test_case "G19 longpollid format" `Quick test_g19_longpollid_format;
     ];
     "G20-G25 mixed", [
-      test_case "G20 (W108 BUG-9) mintime is header.timestamp" `Quick
+      test_case "G20 (W108 BUG-9 FIXED) mintime is MTP+1" `Quick
         test_g20_mintime_partial;
       test_case "G21 BIP-22 result strings (W108 BUG-15 carry)" `Quick
         test_g21_bip22_result_strings;

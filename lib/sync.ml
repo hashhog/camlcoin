@@ -6884,16 +6884,39 @@ let invalidate_block (state : chain_state)
     ) descendants;
     Logs.debug (fun m ->
       m "Marked %d descendant blocks as invalid" (List.length descendants));
-    (* Check if invalidated block is on the active chain *)
-    let on_active_chain =
+    (* Check if invalidated block is on the active chain.
+       Bitcoin Core's InvalidateBlock (validation.cpp:3521) disconnects
+       only while [m_chain.Contains(pindex)] — m_chain holds CONNECTED
+       blocks; a header-only block-index entry is merely flag-marked and
+       the call succeeds.  camlcoin's [state.tip] is the best-*header* tip
+       (advanced by [accept_header] ahead of connection — see the [tip] vs
+       [block_tip] note at the [chain_state] type), so gating the UTXO
+       rollback on it made invalidating any not-yet-connected header
+       attempt a rollback of blocks never connected, failing with
+       "Missing block at height N during rollback disconnect" (and leaving
+       the flags persisted on a half-mutated state Core never produces).
+       Gate on the *connected* tip ([block_tip], resolved via the
+       [chain_tip] pointer) AND require the invalidated block to have a
+       stored body — a connected block necessarily has one. *)
+    let invalidated_connected =
+      Storage.ChainDB.has_block state.db hash &&
+      (match block_tip state with
+       | None -> false
+       | Some tip ->
+         Cstruct.equal tip.hash hash ||
+         List.exists (fun (d : header_entry) -> Cstruct.equal d.hash tip.hash) descendants)
+    in
+    (* Whether the best-*header* tip is the invalidated block or one of its
+       descendants — used below to retreat the header tip when no UTXO
+       rollback is needed (the header-only case). *)
+    let header_tip_invalidated =
       match state.tip with
       | None -> false
       | Some tip ->
-        (* Check if tip is the invalidated block or one of its descendants *)
         Cstruct.equal tip.hash hash ||
         List.exists (fun (d : header_entry) -> Cstruct.equal d.hash tip.hash) descendants
     in
-    if on_active_chain then begin
+    if invalidated_connected then begin
       Logs.info (fun m -> m "Invalidated block is on active chain, rewinding...");
       (* Find the parent of the invalidated block *)
       let parent_key = Cstruct.to_string entry.header.prev_block in
@@ -6956,10 +6979,27 @@ let invalidate_block (state : chain_state)
                  Ok parent_entry.height)
             | _ -> Ok parent_entry.height))
     end else begin
-      (* Block not on active chain, just mark as invalid *)
-      match state.tip with
-      | Some tip -> Ok tip.height
-      | None -> Ok 0
+      (* Block not on the CONNECTED chain: just flag-marked (above), no
+         UTXO rollback — Core's InvalidateBlock behaves the same for
+         header-only block-index entries (validation.cpp:3521, the
+         m_chain.Contains guard).  If the invalidated block (or a
+         descendant) was the best-*header* tip, retreat [state.tip] to the
+         invalidated block's parent so the header chain no longer points
+         at an invalid entry — the Core analogue of the invalid chain
+         becoming ineligible for activation — and report the parent's
+         height. *)
+      if header_tip_invalidated then begin
+        let parent_key = Cstruct.to_string entry.header.prev_block in
+        match Hashtbl.find_opt state.headers parent_key with
+        | Some parent_entry ->
+          state.tip <- Some parent_entry;
+          Ok parent_entry.height
+        | None -> Ok 0
+      end else begin
+        match state.tip with
+        | Some tip -> Ok tip.height
+        | None -> Ok 0
+      end
     end
 
 (* ============================================================================

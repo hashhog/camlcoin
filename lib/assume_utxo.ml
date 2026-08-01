@@ -1568,6 +1568,22 @@ let connect_block_to_cache ~(cache : Utxo.UtxoCache.t) ~(block : Types.block)
     else
       Ok !total_fees
 
+(** Median time past for background validation: median of the previous 11
+    block timestamps (BIP-113), mirroring Core's CBlockIndex::GetMedianTimePast
+    walk (bitcoin-core/src/chain.h:233-245) and Sync.compute_median_time_past.
+    Background validation replays the linear header chain from genesis to the
+    snapshot height, so height-based ancestor lookup is exact. *)
+let compute_background_mtp
+    ~(get_header_at_height : int -> Sync.header_entry option)
+    (height : int) : int32 =
+  let rec collect acc h count =
+    if count <= 0 || h < 0 then acc
+    else match get_header_at_height h with
+      | Some e -> collect (e.header.timestamp :: acc) (h - 1) (count - 1)
+      | None -> acc
+  in
+  Consensus.median_time_past (collect [] (height - 1) 11)
+
 (** Run background validation in an Lwt thread.
     Validates blocks from genesis to snapshot height, then compares UTXO hashes. *)
 let run_background_validation
@@ -1628,8 +1644,11 @@ let run_background_validation
           let* () = Lwt_unix.sleep 1.0 in
           validate_next_block ()
         | Some block ->
-          (* Validate block against IBD chainstate *)
-          let median_time = 0l in (* TODO: compute properly from chain *)
+          (* Validate block against IBD chainstate.
+             MTP feeds the nTime > MTP rule and the BIP-68/113
+             lock_time_cutoff; passing 0l would silently disable those
+             checks on this path. *)
+          let median_time = compute_background_mtp ~get_header_at_height next_height in
           let flags = Consensus.get_block_script_flags ~block_hash:header_entry.hash next_height network in
           let base_lookup outpoint =
             match Utxo.UtxoCache.get_coin ibd_chainstate.utxo_cache outpoint with

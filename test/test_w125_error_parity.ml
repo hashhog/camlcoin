@@ -212,17 +212,19 @@ let g6_misc_error_overused () =
 let g7_forbidden_by_safe_mode_NOT_declared () =
   assert_code_not_declared ~name:"rpc_forbidden_by_safe_mode"
 
-(* -- G8 RPC_TYPE_ERROR -3 PARTIAL ------------------------------------- *)
+(* -- G8 RPC_TYPE_ERROR -3 GATE CLOSED ---------------------------------- *)
 
 let g8_type_error_declared () =
   assert_code_declared ~name:"rpc_type_error" ~value:(-3)
 
-let g8_type_error_NOT_routed () =
-  (* PARTIAL: declared at line 34 but never routed by the dispatcher. *)
+let g8_type_error_routed () =
+  (* GATE CLOSED (post-fix BUG-7): at the W125 baseline rpc_type_error
+     was declared (line 34) but never routed by the dispatcher; the
+     [Error (rpc_type_error,] route count is now > 0. *)
   let n = count_routes ~name:"rpc_type_error" in
-  Alcotest.(check int)
-    "G8 rpc_type_error PARTIAL: routed 0 times (declared, never used)"
-    0 n
+  Alcotest.(check bool)
+    "G8 (post-fix BUG-7): rpc_type_error routed > 0 times (was declared, never used)"
+    true (n > 0)
 
 (* -- G9 RPC_WALLET_ERROR -4 PRESENT ----------------------------------- *)
 
@@ -234,21 +236,22 @@ let g9_wallet_error_routed () =
   Alcotest.(check bool)
     "G9 rpc_wallet_error routed >= 10 times" true (n >= 10)
 
-(* -- G10 RPC_INVALID_ADDRESS_OR_KEY -5 PARTIAL ------------------------ *)
+(* -- G10 RPC_INVALID_ADDRESS_OR_KEY -5 GATE CLOSED --------------------- *)
 
 let g10_invalid_address_declared () =
   assert_code_declared ~name:"rpc_invalid_address" ~value:(-5)
 
-let g10_invalid_address_under_routed () =
-  (* PARTIAL: routed only for validateaddress/signmessage*/verifymessage
-     (4 dispatcher arms).  Core uses it for ~12 distinct call sites
-     including block-not-found / txid-not-found.  Assert 3..6 routes
-     captures the current under-routed state.  When the gate closes,
-     this count will rise. *)
+let g10_invalid_address_routed () =
+  (* GATE CLOSED (post-fix BUG-6): routing fan-out rose from the 4
+     validateaddress/signmessage/verifymessage arms at the W125 baseline
+     to >= Core's ~12 usage sites, now including block-not-found
+     (getblockheader/getblockfilter/getblockstats — lib/rpc.ml:13333,
+     1057, 11934) and txid-not-found (getrawtransaction —
+     lib/rpc.ml:13428). *)
   let n = count_routes ~name:"rpc_invalid_address" in
   Alcotest.(check bool)
-    (Printf.sprintf "G10 rpc_invalid_address PARTIAL: routed %d times (3..6 = under-routed)" n)
-    true (n >= 3 && n <= 6)
+    (Printf.sprintf "G10 (post-fix BUG-6): rpc_invalid_address routed %d times (>= 12 Core usage sites)" n)
+    true (n >= 12)
 
 (* -- G11 RPC_WALLET_INSUFFICIENT_FUNDS -6 PARTIAL -------------------- *)
 
@@ -268,10 +271,12 @@ let g11_insufficient_funds_NOT_routed () =
 let g12_out_of_memory_NOT_declared () =
   assert_code_not_declared ~name:"rpc_out_of_memory"
 
-(* -- G13 RPC_INVALID_PARAMETER -8 MISSING ----------------------------- *)
+(* -- G13 RPC_INVALID_PARAMETER -8 GATE CLOSED -------------------------- *)
 
-let g13_invalid_parameter_NOT_declared () =
-  assert_code_not_declared ~name:"rpc_invalid_parameter"
+let g13_invalid_parameter_declared () =
+  (* GATE CLOSED (post-fix BUG-20): rpc_invalid_parameter = -8 is now
+     declared (lib/rpc.ml:38) and routed via guard_hash_param/ParseHashV. *)
+  assert_code_declared ~name:"rpc_invalid_parameter" ~value:(-8)
 
 (* -- G14 RPC_DATABASE_ERROR -20 MISSING ------------------------------- *)
 
@@ -294,15 +299,16 @@ let g15_deserialization_error_routed () =
 let g16_verify_error_declared () =
   assert_code_declared ~name:"rpc_verify_error" ~value:(-25)
 
-let g16_verify_error_NOT_routed () =
-  (* PARTIAL: declared at line 39 but never routed by the dispatcher.
-     submitblock errors are routed to -26 (rpc_verify_rejected) instead
-     of -25, which is Core's choice for submitblock (mining.cpp:1141,
-     1143).  See BUG-3 in audit/w125_rpc_error_parity.md. *)
+let g16_verify_error_routed () =
+  (* GATE CLOSED (post-fix BUG-3, routed half): rpc_verify_error is now
+     routed by handle_submitheader (lib/rpc.ml:2643, 2659).  The other
+     half of BUG-3 — submitblock mis-routed to -26 instead of Core's -25
+     (mining.cpp:1141, 1143) — remains open and is pinned by
+     g16_submitblock_routes_through_wrong_code below. *)
   let n = count_routes ~name:"rpc_verify_error" in
-  Alcotest.(check int)
-    "G16 rpc_verify_error PARTIAL: routed 0 times (declared, never used)"
-    0 n
+  Alcotest.(check bool)
+    "G16 (post-fix BUG-3): rpc_verify_error routed > 0 times (submitheader)"
+    true (n > 0)
 
 let g16_submitblock_routes_through_wrong_code () =
   (* Confirm the BUG-3 mis-routing: submitblock uses
@@ -373,10 +379,12 @@ let g25_node_not_connected_declared () =
 let g26_invalid_ip_or_subnet_declared () =
   assert_code_declared ~name:"rpc_client_invalid_ip_or_subnet" ~value:(-30)
 
-(* -- G27 RPC_CLIENT_P2P_DISABLED -31 MISSING ------------------------- *)
+(* -- G27 RPC_CLIENT_P2P_DISABLED -31 GATE CLOSED ---------------------- *)
 
-let g27_p2p_disabled_NOT_declared () =
-  assert_code_not_declared ~name:"rpc_client_p2p_disabled"
+let g27_p2p_disabled_declared () =
+  (* GATE CLOSED (post-fix BUG-14): rpc_client_p2p_disabled = -31 is now
+     declared (lib/rpc.ml:50). *)
+  assert_code_declared ~name:"rpc_client_p2p_disabled" ~value:(-31)
 
 (* -- G28 RPC_CLIENT_NODE_CAPACITY_REACHED -34 MISSING --------------- *)
 
@@ -459,7 +467,7 @@ let as1_declared_code_count () =
    undeclared.  The list still enumerates every code the W125 audit flagged
    as MISSING at baseline; this gate counts how many are STILL missing so it
    tracks gate-closing fix waves.  Codes that have since been declared (the
-   RPC error-code parity port closed -23/-24/-29/-30, and -8
+   RPC error-code parity port closed -23/-24/-29/-30/-31, and -8
    rpc_invalid_parameter is declared for ParseHashV) contribute 0. *)
 let as2_missing_distinct_codes () =
   let src = rpc_ml () in
@@ -477,7 +485,7 @@ let as2_missing_distinct_codes () =
     "rpc_client_node_not_added";      (* G24 — now declared (-24) *)
     "rpc_client_node_not_connected";  (* G25 — now declared (-29) *)
     "rpc_client_invalid_ip_or_subnet"; (* G26 — now declared (-30) *)
-    "rpc_client_p2p_disabled";        (* G27 *)
+    "rpc_client_p2p_disabled";        (* G27 — now declared (-31) *)
     "rpc_client_node_capacity_reached"; (* G28 *)
     "rpc_client_mempool_disabled";    (* G29 *)
     (* G30 wallet cluster (11 codes) *)
@@ -497,10 +505,10 @@ let as2_missing_distinct_codes () =
     let pat = Printf.sprintf "let %s =" c in
     if contains_substring src pat then acc else acc + 1
   ) 0 missing in
-  (* 27 baseline - 5 now-declared (G13 + G23/G24/G25/G26) = 22 still missing. *)
+  (* 27 baseline - 6 now-declared (G13 + G23/G24/G25/G26 + G27) = 21 still missing. *)
   Alcotest.(check int)
-    "AS2: 22 of the original 27 W125-missing Core codes remain undeclared"
-    22 still_missing
+    "AS2: 21 of the original 27 W125-missing Core codes remain undeclared"
+    21 still_missing
 
 (* Bug count: 22 catalogued in audit/w125_rpc_error_parity.md.  This
    assertion encodes the audit-time count via a sentinel constant. *)
@@ -511,11 +519,16 @@ let as3_audit_bug_count () =
 let as4_audit_gate_count () =
   Alcotest.(check int) "AS4 W125 gate count == 30" 30 30
 
-(* Confirm the audit document exists at the canonical path. *)
+(* Audit docs moved out of this repo to the project-meta repo
+   (hashhog/audit-archive/) — see .gitignore "Project-meta audit
+   artifacts".  Non-failing marker: report location status without
+   gating the suite on files outside this repository. *)
 let as5_audit_doc_exists () =
-  Alcotest.(check bool)
-    "AS5 audit doc exists at audit/w125_rpc_error_parity.md" true
-    (Sys.file_exists (audit_doc_path ()))
+  let doc = audit_doc_path () in
+  Printf.printf "  [MOVED] AS5 audit/w125_rpc_error_parity.md now lives in \
+                 hashhog/audit-archive (in-repo copy present: %b)\n%!"
+    (Sys.file_exists doc);
+  Alcotest.(check pass) "AS5 audit doc moved to meta-repo (non-fatal)" () ()
 
 (* -- test suite ------------------------------------------------------- *)
 
@@ -549,17 +562,17 @@ let () =
     "G7 RPC_FORBIDDEN_BY_SAFE_MODE -2 MISSING (BUG-9)", [
       test_case "NOT declared" `Quick g7_forbidden_by_safe_mode_NOT_declared;
     ];
-    "G8 RPC_TYPE_ERROR -3 PARTIAL (BUG-7)", [
+    "G8 RPC_TYPE_ERROR -3 GATE CLOSED (BUG-7)", [
       test_case "declared" `Quick g8_type_error_declared;
-      test_case "NOT routed" `Quick g8_type_error_NOT_routed;
+      test_case "routed" `Quick g8_type_error_routed;
     ];
     "G9 RPC_WALLET_ERROR -4 PRESENT", [
       test_case "declared" `Quick g9_wallet_error_declared;
       test_case "routed" `Quick g9_wallet_error_routed;
     ];
-    "G10 RPC_INVALID_ADDRESS_OR_KEY -5 PARTIAL (BUG-6)", [
+    "G10 RPC_INVALID_ADDRESS_OR_KEY -5 GATE CLOSED (BUG-6)", [
       test_case "declared" `Quick g10_invalid_address_declared;
-      test_case "under-routed" `Quick g10_invalid_address_under_routed;
+      test_case "routed" `Quick g10_invalid_address_routed;
     ];
     "G11 RPC_WALLET_INSUFFICIENT_FUNDS -6 PARTIAL (BUG-5)", [
       test_case "declared" `Quick g11_insufficient_funds_declared;
@@ -568,8 +581,8 @@ let () =
     "G12 RPC_OUT_OF_MEMORY -7 MISSING (BUG-17)", [
       test_case "NOT declared" `Quick g12_out_of_memory_NOT_declared;
     ];
-    "G13 RPC_INVALID_PARAMETER -8 MISSING (BUG-20)", [
-      test_case "NOT declared" `Quick g13_invalid_parameter_NOT_declared;
+    "G13 RPC_INVALID_PARAMETER -8 GATE CLOSED (BUG-20)", [
+      test_case "declared" `Quick g13_invalid_parameter_declared;
     ];
     "G14 RPC_DATABASE_ERROR -20 MISSING (BUG-8)", [
       test_case "NOT declared" `Quick g14_database_error_NOT_declared;
@@ -580,7 +593,7 @@ let () =
     ];
     "G16 RPC_VERIFY_ERROR -25 PARTIAL (BUG-3)", [
       test_case "declared" `Quick g16_verify_error_declared;
-      test_case "NOT routed" `Quick g16_verify_error_NOT_routed;
+      test_case "routed (submitheader)" `Quick g16_verify_error_routed;
       test_case "submitblock currently uses wrong code" `Quick
         g16_submitblock_routes_through_wrong_code;
     ];
@@ -615,8 +628,8 @@ let () =
     "G26 RPC_CLIENT_INVALID_IP_OR_SUBNET -30 GATE CLOSED (BUG-13)", [
       test_case "declared" `Quick g26_invalid_ip_or_subnet_declared;
     ];
-    "G27 RPC_CLIENT_P2P_DISABLED -31 MISSING (BUG-14)", [
-      test_case "NOT declared" `Quick g27_p2p_disabled_NOT_declared;
+    "G27 RPC_CLIENT_P2P_DISABLED -31 GATE CLOSED (BUG-14)", [
+      test_case "declared" `Quick g27_p2p_disabled_declared;
     ];
     "G28 RPC_CLIENT_NODE_CAPACITY_REACHED -34 MISSING (BUG-15)", [
       test_case "NOT declared" `Quick g28_node_capacity_reached_NOT_declared;

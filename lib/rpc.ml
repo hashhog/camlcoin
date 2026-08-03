@@ -2499,6 +2499,25 @@ let bip22_of_submitblock_error (msg : string) : string =
   else if c "bad-witness-merkle-match" then "bad-witness-merkle-match"
   else if c "bad-witness-nonce-size" then "bad-witness-nonce-size"
   else if c "unexpected-witness" then "unexpected-witness"
+  (* First transaction is not a coinbase. Core CheckBlock (validation.cpp:3952)
+     emits "bad-cb-missing" / "first tx is not coinbase". validation.ml:80
+     renders BlockNoCoinbase as "block has no coinbase transaction" and no rule
+     matched it, so it fell through to the generic "rejected".
+
+     MUST precede the "coinbase value" rule below: that one matches the bare
+     substring "coinbase", so it would steal this message. The same ordering
+     hazard bit ouroboros, hotbuns and lunarblock while applying this fix.
+
+     Found by the 2026-08-02 corpus sweep, entry F-coinbase-prevout-nonnull: a
+     coinbase with a non-null prevout fails the is-coinbase test. camlcoin
+     returned NO-RPC in that sweep so it was recorded as UNKNOWN rather than
+     passing; a re-run on 2026-08-03 confirmed the gap was real. Equivalents:
+     blockbrew 72a5519, ouroboros a8f40ab, hotbuns 7c8a950, nimrod 5736da6,
+     lunarblock 91a7ed4, clearbit cc0f1b2, haskoin bfa81a7.
+
+     Decision unchanged (rejected either way): R2 reason-code parity. *)
+  else if c "bad-cb-missing" || c "no coinbase transaction"
+          || c "first tx is not coinbase" then "bad-cb-missing"
   else if c "coinbase value" || c "coinbase value too high" then "bad-cb-amount"
   else if c "sigop" then "bad-blk-sigops"
   (* BIP-30 cross-block duplicate UTXO: "transaction has duplicate txid in UTXO set (BIP30)"

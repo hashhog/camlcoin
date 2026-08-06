@@ -2592,10 +2592,25 @@ let handle_submitblock (ctx : rpc_context)
       (* Return canonical BIP-22 string in result field (not as an error).
          Bitcoin Core BIP22ValidationResult() returns the string as a
          successful JSON-RPC result, not a JSON-RPC error object. *)
-      | Error msg -> Ok (`String (bip22_of_submitblock_error msg))
+      | Error msg ->
+        (* Log the RAW validation message before it is collapsed to a BIP-22
+           token. `block_error_to_string` renders "transaction %d validation
+           failed: ..." (validation.ml:92-93) — it already carries the index of
+           the offending transaction, which `bip22_of_submitblock_error` then
+           discards. Without this line the operator sees only
+           "bad-txns-nonfinal" with no way to find WHICH transaction, which is
+           exactly the wall hit while diagnosing camlcoin's deterministic
+           rejection of mainnet block 961085 (2026-08-05): the index existed in
+           the code the whole time and was thrown away one call before the
+           response. *)
+        Logs.warn (fun m -> m "submitblock rejected: %s" msg);
+        Ok (`String (bip22_of_submitblock_error msg))
     with exn ->
       (* Deserialization / structural failure: still a BIP-22 "rejected". *)
-      let _ = Printf.sprintf "Block decode failed: %s" (Printexc.to_string exn) in
+      (* Same defect as above in miniature — this message was computed and
+         bound to `_`, i.e. built and immediately discarded. *)
+      Logs.warn (fun m ->
+        m "submitblock decode failed: %s" (Printexc.to_string exn));
       Ok (`String "rejected"))
   | _ ->
     Error "Invalid parameters: expected [hexdata]"

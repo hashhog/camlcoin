@@ -1210,8 +1210,25 @@ let check_sequence_locks (tx : Types.transaction) ~(block_height : int)
             (* Core semantics: required = nCoinTime + offset - 1; fail if block_mtp <= required,
                i.e. fail if median_time64 < input_mtp64 + time_offset64 *)
             let required_time64 = Int64.add input_mtp64 time_offset64 in
-            if Int64.compare median_time64 required_time64 < 0 then
+            if Int64.compare median_time64 required_time64 < 0 then begin
+              (* DIAGNOSTIC (2026-08-06): camlcoin rejects mainnet block 961085
+                 because tx 2785's time-based BIP68 lock reads as unsatisfied,
+                 while every other node accepts it. Recomputing this comparison
+                 by hand from chain data says it should PASS with ~13,000s of
+                 margin, so the runtime inputs are not what they appear to be.
+                 Log the actual operands rather than infer them again — the
+                 same mistake cost two days when the offending tx index was
+                 already being computed and discarded.
+                 Remove once the divergence is fixed. *)
+              Logs.warn (fun m ->
+                m "BIP68 time-lock FAIL: input=%d coin_height=%d block_height=%d \
+                   masked=%d offset=%Ld input_mtp=%Ld median_time=%Ld required=%Ld \
+                   short_by=%Lds"
+                  i utxo_heights.(i) block_height masked time_offset64
+                  input_mtp64 median_time64 required_time64
+                  (Int64.sub required_time64 median_time64));
               ok := false
+            end
           end
         end
       end

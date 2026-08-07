@@ -654,8 +654,13 @@ let process_redownload_headers ~(ps : peer_header_sync)
                 (Consensus.work_from_compact header.bits) in
             let entry = { header; hash; height; total_work = work } in
             Hashtbl.replace chain_state.headers hash_key entry;
+            (* No [set_height_hash] here — same rule as [accept_header]:
+               the height->hash index projects the ACTIVE VALIDATED chain,
+               not the header chain.  This is the anti-DoS header
+               REDOWNLOAD path, which by construction processes headers
+               that may never become active, so writing the index here
+               was the same contamination bug in a second place. *)
             Storage.ChainDB.store_block_header chain_state.db hash header;
-            Storage.ChainDB.set_height_hash chain_state.db height hash;
             let is_new_tip = match chain_state.tip with
               | None -> true
               | Some tip -> Consensus.work_compare work tip.total_work > 0
@@ -1129,9 +1134,32 @@ let validate_header (state : chain_state) (header : Types.block_header)
 let accept_header (state : chain_state) (entry : header_entry) : unit =
   let hash_key = Cstruct.to_string entry.hash in
   Hashtbl.replace state.headers hash_key entry;
-  (* Store to disk *)
+  (* Store to disk.  Keyed by HASH only — accepting a header must NOT
+     touch the height->hash index.
+
+     Core keeps three structures strictly apart (validation.h / chain.h):
+       - [m_block_index]      every known block, keyed by hash
+       - [pindexBestHeader]   best-work HEADER, may be on a side branch
+       - [CChain m_chain]     the ACTIVE VALIDATED chain, height-keyed
+     Only the third is height-indexed, and it is written only by
+     [CChain::SetTip] from ConnectTip/DisconnectTip — never on header
+     acceptance.
+
+     This line used to write [set_height_hash] here, unconditionally and
+     BEFORE the [is_new_tip] work check below, which made the index a
+     projection of the best-work HEADER chain.  A lower-work side branch
+     therefore overwrote main-chain entries at its heights, and nothing
+     ever reconciled them: getblockhash(958774) returned a foreign block
+     with ~9 leading zero-nibbles instead of ~19.  Three consensus rules
+     read this index — BIP113/BIP68 MTP (:2825), BIP-94 timewarp (:2951),
+     BIP34 (:1469) — so on mainnet it drove BIP68 input_mtp ~405,000s
+     late and camlcoin refused a valid block at 961085.
+
+     The index is now written only where the active chain actually
+     moves: [Storage.ChainDB.apply_block_atomic] (forward connect) and
+     [reorganize] (full SetTip walk + truncate above the new tip).
+     See receipts/camlcoin-height-index-2026-08-07.md. *)
   Storage.ChainDB.store_block_header state.db entry.hash entry.header;
-  Storage.ChainDB.set_height_hash state.db entry.height entry.hash;
   (* Update tip if this has more cumulative work *)
   let is_new_tip = match state.tip with
     | None -> true

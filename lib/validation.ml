@@ -1200,8 +1200,31 @@ let check_sequence_locks (tx : Types.transaction) ~(block_height : int)
                    nCoinTime + (int64_t)((seq & MASK) << GRANULARITY) - 1)
                then EvaluateSequenceLocks checks nMinTime >= nBlockTime.
                Int32 would overflow for large timestamps + offsets. *)
+            (* Core (tx_verify.cpp CalculateSequenceLocks):
+                 nCoinTime = block.GetAncestor(max(nCoinHeight - 1, 0))
+                               ->GetMedianTimePast()
+               GetMedianTimePast() is INCLUSIVE of the block it is called
+               on, so Core's value is "the MTP of the block at
+               nCoinHeight - 1".
+
+               camlcoin's callback is [Sync.get_mtp_for_height] =
+               [compute_median_time_past], which collects the 11
+               timestamps from (h - 1) DOWNWARDS — exclusive of h.  So
+                 get_mtp_for_height h  ==  GetAncestor(h-1)->GetMedianTimePast()
+               and the decrement Core applies is ALREADY baked in.
+
+               Passing (utxo_height - 1) therefore decremented twice and
+               read the MTP one block too early — typically ~600s low.
+               That is PERMISSIVE (a smaller nCoinTime lowers the required
+               time), so it accepted time-based BIP68 locks Core rejects.
+               Verified against bitcoin-core/src/consensus/tx_verify.cpp
+               and lib/sync.ml:compute_median_time_past on 2026-08-07.
+
+               Independent of the height->hash index bug fixed in the same
+               commit; this one does NOT unblock block 961085 (it tightens,
+               and 961085 was failing already). *)
             let input_mtp = match get_mtp_at_height with
-              | Some f -> f (max 0 (utxo_heights.(i) - 1))
+              | Some f -> f utxo_heights.(i)
               | None -> utxo_mtps.(i)
             in
             let input_mtp64 = Int64.logand (Int64.of_int32 input_mtp) 0xFFFFFFFFL in

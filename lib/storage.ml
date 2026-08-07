@@ -688,6 +688,26 @@ module ChainDB = struct
       "header_tip_hash" (Cstruct.to_string header_tip_hash);
     Cf_chainstate.batch_put_chain_state cf_batch
       "header_tip_height" (encode_height header_tip_height);
+    (* Core [CChain::SetTip] (chain.cpp:16), forward-extension case.
+       The height->hash index is a PROJECTION OF THE ACTIVE VALIDATED
+       CHAIN, so connecting one block writes exactly one slot: the new
+       tip's.  SetTip's while-loop walks [pprev] only until it reaches a
+       height already pointing at the right block; for a simple extension
+       that is the parent, immediately, so the loop body runs once.
+       (The reorg path needs the full walk and has it —
+       [Sync.reorganize] rewrites every slot in [to_connect] and deletes
+       the heights above the new tip.)
+
+       Staged into the SAME batch as the tip flip so the index and the
+       tip commit atomically: a crash between them would leave
+       getblockhash(tip) disagreeing with getbestblockhash.
+
+       Before this, NOTHING wrote the index on the forward-connect path —
+       it was maintained entirely by [Sync.accept_header] on the HEADER
+       path, which is why it tracked the best-work header chain (and its
+       side branches) instead of the validated chain.  See
+       receipts/camlcoin-height-index-2026-08-07.md. *)
+    Cf_chainstate.batch_put_block_height cf_batch tip_height tip_hash;
     (* RDB FIRST, CF SECOND — see commentary above for crash-window
        analysis.  Skipping the RDB commit when [rdb_ops] is empty AND
        there is no rocksdb_utxo attached is the same no-op as before. *)

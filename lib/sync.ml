@@ -1073,6 +1073,169 @@ let collect_ancestor_timestamps (state : chain_state)
   in
   walk [] 0 entry
 
+(* Get header entry by hash *)
+let get_header (state : chain_state) (hash : Types.hash256)
+    : header_entry option =
+  Hashtbl.find_opt state.headers (Cstruct.to_string hash)
+
+(* Get header entry by height *)
+let get_header_at_height (state : chain_state) (height : int)
+    : header_entry option =
+  match Storage.ChainDB.get_hash_at_height state.db height with
+  | Some hash -> Hashtbl.find_opt state.headers (Cstruct.to_string hash)
+  | None -> None
+
+(* Look up a block's height via the in-memory header table.  Returns [None]
+   if the header is not in memory (the block predates the running process
+   and is not in the loaded header set).  Used by the BIP-159 peer-served-
+   blocks gate in [Cli.run]: when prune mode is on, we refuse to serve
+   blocks below tip - 288 even if [Storage.ChainDB.get_block] could return
+   them.  Best-effort only — if we don't know the height, the gate falls
+   through to the existing serve-or-notfound path. *)
+let lookup_block_height (state : chain_state) (hash : Types.hash256)
+    : int option =
+  match Hashtbl.find_opt state.headers (Cstruct.to_string hash) with
+  | Some entry -> Some entry.height
+  | None -> None
+
+(* [get_ancestor state idx height] returns the header_entry that is the
+   ancestor of [idx] at [height], walking the parent chain by
+   [header.prev_block]. Mirrors Bitcoin Core's
+   `CBlockIndex::GetAncestor(int height)` (chain.cpp).  Returns [None]
+   when [height] is out of range (negative, above [idx.height], or
+   unreachable because a parent header is missing from the in-memory
+   table).  Used by the BIP-157 compact-filter request handlers and the
+   REST blockfilterheaders endpoint to anchor the height-keyed walk on
+   the peer-supplied stop_hash, rather than the active chain.  Without
+   this anchor, a peer that supplies a stale/orphan stop_hash receives
+   active-chain filters signed with the stale stop_hash — a DoS vector
+   + privacy leak about which fork the peer is interested in.  Core
+   intentionally serves stale-fork filters here (compact filters are
+   stored by block hash regardless of fork membership); we match that
+   by walking parent links rather than gating on chain.contains.    *)
+let get_ancestor (state : chain_state) (idx : header_entry) (height : int)
+    : header_entry option =
+  if height < 0 || height > idx.height then None
+  else if height = idx.height then Some idx
+  else
+    let rec walk (e : header_entry) =
+      if e.height = height then Some e
+      else if e.height < height then None
+      else
+        let pkey = Cstruct.to_string e.header.prev_block in
+        match Hashtbl.find_opt state.headers pkey with
+        | Some p -> walk p
+        | None -> None
+    in
+    walk idx
+
+(* Compute the expected difficulty bits for a block at the given height.
+   - Genesis block (height 0): use genesis header bits
+   - Regtest (pow_no_retargeting): use parent's bits (every block same difficulty)
+   - Difficulty adjustment boundary (height mod 2016 = 0): compute retarget
+   - Testnet min-difficulty: if block timestamp > 20 min after parent, allow pow_limit
+   - Otherwise: use parent's bits
+
+   [parent_entry]: when provided, all height-based ancestor lookups are resolved by
+   walking [parent_entry]'s own prev_block chain (via [get_ancestor]), mirroring
+   Bitcoin Core's pindexLast->GetAncestor(nHeightFirst) in pow.cpp:44,72.  This
+   avoids reading the active-chain height->hash index, which can point at a competing
+   fork when the block being validated is on a side branch.  Callers on the active
+   chain (IBD, verifychain, etc.) may omit this parameter and fall back to
+   [get_header_at_height] which is correct when the height index is up to date.
+
+   [ancestry_incomplete]: optional out-parameter.  Set to [true] if ANY ancestor
+   lookup missed and the corresponding [| None ->] fallback below substituted a
+   placeholder ([network.pow_limit] / [genesis_header] / [(0l, pow_limit)]).
+   Bitcoin Core cannot reach that state — it asserts (pow.cpp:42-45
+   `assert(nHeightFirst >= 0); assert(pindexFirst);`) because its block index is
+   complete by construction.  camlcoin's fallbacks silently return a
+   PLAUSIBLE-BUT-WRONG value, so any caller that COMPARES the result against an
+   observed nBits (i.e. enforces bad-diffbits) MUST pass this ref and refuse to
+   compare when it is set — otherwise a lookup miss inverts the check into
+   "expected == pow_limit", which rejects every honest mainnet header and
+   rubber-stamps exactly the difficulty-1 headers the check exists to reject.
+   Callers that only need a best-effort value may omit it (unchanged behavior). *)
+let compute_expected_bits ?parent_entry ?ancestry_incomplete
+    (state : chain_state) (height : int)
+    (block_header : Types.block_header) : int32 =
+  let network = state.network in
+  let miss () =
+    match ancestry_incomplete with Some r -> r := true | None -> ()
+  in
+  (* Resolve the header at height [h] via the validated block's own ancestry
+     (when parent_entry is provided) or the active-chain height index (fallback).
+
+     With [parent_entry] the walk is anchored on a monotonically descending
+     cursor: every consumer below probes heights in non-increasing order
+     (height-1, then either the period-first block at height-2016 or the
+     min-difficulty walk-back height-1, height-2, ...), so resuming the
+     prev_block walk from the previously resolved entry makes a full
+     walk-back O(k) instead of O(k^2).  A non-monotone probe simply restarts
+     from [pe], so correctness does not depend on the ordering. *)
+  let get_at_height =
+    match parent_entry with
+    | Some pe ->
+      let cursor = ref pe in
+      (fun h ->
+         if h > (!cursor).height then cursor := pe;
+         match get_ancestor state !cursor h with
+         | Some e -> cursor := e; Some e
+         | None -> miss (); None)
+    | None ->
+      (fun h ->
+         match get_header_at_height state h with
+         | Some _ as x -> x
+         | None -> miss (); None)
+  in
+  if height = 0 then
+    network.genesis_header.bits
+  else if network.pow_no_retargeting then
+    (* Regtest: no retargeting, use parent's bits *)
+    (match get_at_height (height - 1) with
+     | Some parent -> parent.header.bits
+     | None -> network.pow_limit)
+  else if height mod Consensus.difficulty_adjustment_interval = 0 then begin
+    (* Difficulty adjustment boundary *)
+    let parent =
+      match get_at_height (height - 1) with
+      | Some entry -> entry.header
+      | None -> network.genesis_header
+    in
+    let get_block_info h =
+      match get_at_height h with
+      | Some entry -> (entry.header.timestamp, entry.header.bits)
+      | None -> (0l, network.pow_limit)
+    in
+    Consensus.get_next_work_required
+      ~height
+      ~block_time:block_header.timestamp
+      ~prev_block_time:parent.timestamp
+      ~prev_bits:parent.bits
+      ~get_block_info
+      ~network
+  end else begin
+    (* Non-adjustment block *)
+    match get_at_height (height - 1) with
+    | Some parent ->
+      (* Testnet min-difficulty rule: if block timestamp is > 20 min after
+         parent, allow mining at pow_limit *)
+      let get_bits h =
+        match get_at_height h with
+        | Some hdr -> hdr.header.bits
+        | None -> network.pow_limit
+      in
+      (match Consensus.testnet_min_difficulty_bits
+               ~prev_block_time:parent.header.timestamp
+               ~current_time:block_header.timestamp
+               ~network
+               ~get_bits_at_height:get_bits
+               ~height () with
+       | Some min_bits -> min_bits
+       | None -> parent.header.bits)
+    | None -> network.pow_limit
+  end
+
 (* Validate a header against the current chain state.
    Checks: not duplicate, parent exists, proof-of-work valid, timestamp, MTP *)
 let validate_header (state : chain_state) (header : Types.block_header)
@@ -1105,6 +1268,55 @@ let validate_header (state : chain_state) (header : Types.block_header)
           Error "Header timestamp not greater than median-time-past"
         else begin
           let height = parent.height + 1 in
+          (* bad-diffbits: the claimed nBits must EQUAL the nBits consensus
+             requires for a child of [parent].  Reference:
+             bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4086-4089
+               if (block.nBits != GetNextWorkRequired(pindexPrev, &block, params))
+                 return state.Invalid(BLOCK_INVALID_HEADER, "bad-diffbits",
+                                      "incorrect proof of work");
+             This is DISTINCT from the [check_proof_of_work] call above
+             ("high-hash": the hash meets the target you CLAIMED).  Without it a
+             peer can hand us a chain of difficulty-1 headers whose PoW is
+             trivially valid for their own declared target — which is exactly
+             what happened on mainnet: 1,254 headers with bits=0x1d00ffff
+             forking off 957599.  See receipts/camlcoin-bad-diffbits-2026-08-09.md.
+
+             [~parent_entry:parent] is LOAD-BEARING, not an optimisation.  Without
+             it [compute_expected_bits] resolves ancestors through
+             [get_header_at_height] -> [Storage.ChainDB.get_hash_at_height], the
+             active-chain height->hash index — which (a) is the very structure the
+             attack poisoned, and (b) since fecf534 covers only the VALIDATED
+             chain, so every header accepted ahead of the validated tip would miss
+             and fall back to [network.pow_limit].  On mainnet that inverts the
+             check: honest headers (0x1702369d) would be rejected and the
+             difficulty-1 attack headers accepted.  With [~parent_entry] the walk
+             follows prev_block links through [state.headers], mirroring Core's
+             pindexPrev->GetAncestor (pow.cpp:44,72), and is poison-immune.
+
+             [~ancestry_incomplete] guards the residual case Core asserts against
+             (pow.cpp:42-45): if an ancestor is genuinely absent from the in-memory
+             header table we have NO expected value, only a placeholder, so we log
+             and skip the comparison rather than reject a header we cannot judge.
+             Not attacker-reachable — [parent] is in [state.headers] and the table
+             is populated contiguously from genesis (accept_header /
+             restore_chain_state) — so on a healthy node this never fires; the
+             block-connect check (validation.ml:927) remains the backstop. *)
+          let ancestry_incomplete = ref false in
+          let expected_bits =
+            compute_expected_bits ~parent_entry:parent ~ancestry_incomplete
+              state height header
+          in
+          if !ancestry_incomplete then
+            Logs.err (fun m ->
+              m "bad-diffbits check SKIPPED at height %d: ancestor missing from \
+                 the in-memory header table (expected_bits unresolvable). \
+                 Header %s admitted without a difficulty check."
+                height (Types.hash256_to_hex_display hash));
+          if (not !ancestry_incomplete) && header.bits <> expected_bits then
+            Error (Printf.sprintf
+                     "bad-diffbits (got 0x%08lx expected 0x%08lx at height %d)"
+                     header.bits expected_bits height)
+          else
           (* BIP-94 timewarp protection: at retarget boundaries on testnet4,
              the new block's timestamp must not predate the parent's by more
              than MAX_TIMEWARP=600 seconds.
@@ -1381,62 +1593,6 @@ let build_presync_locator_full (ps : peer_header_sync)
     ) (List.rev prefix) chain_start_locator
   in
   List.rev merged
-
-(* Get header entry by hash *)
-let get_header (state : chain_state) (hash : Types.hash256)
-    : header_entry option =
-  Hashtbl.find_opt state.headers (Cstruct.to_string hash)
-
-(* Get header entry by height *)
-let get_header_at_height (state : chain_state) (height : int)
-    : header_entry option =
-  match Storage.ChainDB.get_hash_at_height state.db height with
-  | Some hash -> Hashtbl.find_opt state.headers (Cstruct.to_string hash)
-  | None -> None
-
-(* Look up a block's height via the in-memory header table.  Returns [None]
-   if the header is not in memory (the block predates the running process
-   and is not in the loaded header set).  Used by the BIP-159 peer-served-
-   blocks gate in [Cli.run]: when prune mode is on, we refuse to serve
-   blocks below tip - 288 even if [Storage.ChainDB.get_block] could return
-   them.  Best-effort only — if we don't know the height, the gate falls
-   through to the existing serve-or-notfound path. *)
-let lookup_block_height (state : chain_state) (hash : Types.hash256)
-    : int option =
-  match Hashtbl.find_opt state.headers (Cstruct.to_string hash) with
-  | Some entry -> Some entry.height
-  | None -> None
-
-(* [get_ancestor state idx height] returns the header_entry that is the
-   ancestor of [idx] at [height], walking the parent chain by
-   [header.prev_block]. Mirrors Bitcoin Core's
-   `CBlockIndex::GetAncestor(int height)` (chain.cpp).  Returns [None]
-   when [height] is out of range (negative, above [idx.height], or
-   unreachable because a parent header is missing from the in-memory
-   table).  Used by the BIP-157 compact-filter request handlers and the
-   REST blockfilterheaders endpoint to anchor the height-keyed walk on
-   the peer-supplied stop_hash, rather than the active chain.  Without
-   this anchor, a peer that supplies a stale/orphan stop_hash receives
-   active-chain filters signed with the stale stop_hash — a DoS vector
-   + privacy leak about which fork the peer is interested in.  Core
-   intentionally serves stale-fork filters here (compact filters are
-   stored by block hash regardless of fork membership); we match that
-   by walking parent links rather than gating on chain.contains.    *)
-let get_ancestor (state : chain_state) (idx : header_entry) (height : int)
-    : header_entry option =
-  if height < 0 || height > idx.height then None
-  else if height = idx.height then Some idx
-  else
-    let rec walk (e : header_entry) =
-      if e.height = height then Some e
-      else if e.height < height then None
-      else
-        let pkey = Cstruct.to_string e.header.prev_block in
-        match Hashtbl.find_opt state.headers pkey with
-        | Some p -> walk p
-        | None -> None
-    in
-    walk idx
 
 (* The validated-block tip — the header_entry for the highest block that has
    been fully validated and connected (UTXO set updated).  This is distinct
@@ -2894,78 +3050,6 @@ let compute_median_time_for_display (state : chain_state) (height : int) : int32
   in
   let timestamps = collect [] height 11 in
   Consensus.median_time_past timestamps
-
-(* Compute the expected difficulty bits for a block at the given height.
-   - Genesis block (height 0): use genesis header bits
-   - Regtest (pow_no_retargeting): use parent's bits (every block same difficulty)
-   - Difficulty adjustment boundary (height mod 2016 = 0): compute retarget
-   - Testnet min-difficulty: if block timestamp > 20 min after parent, allow pow_limit
-   - Otherwise: use parent's bits
-
-   [parent_entry]: when provided, all height-based ancestor lookups are resolved by
-   walking [parent_entry]'s own prev_block chain (via [get_ancestor]), mirroring
-   Bitcoin Core's pindexLast->GetAncestor(nHeightFirst) in pow.cpp:44,72.  This
-   avoids reading the active-chain height->hash index, which can point at a competing
-   fork when the block being validated is on a side branch.  Callers on the active
-   chain (IBD, verifychain, etc.) may omit this parameter and fall back to
-   [get_header_at_height] which is correct when the height index is up to date. *)
-let compute_expected_bits ?parent_entry (state : chain_state) (height : int)
-    (block_header : Types.block_header) : int32 =
-  let network = state.network in
-  (* Resolve the header at height [h] via the validated block's own ancestry
-     (when parent_entry is provided) or the active-chain height index (fallback). *)
-  let get_at_height h =
-    match parent_entry with
-    | Some pe -> get_ancestor state pe h
-    | None -> get_header_at_height state h
-  in
-  if height = 0 then
-    network.genesis_header.bits
-  else if network.pow_no_retargeting then
-    (* Regtest: no retargeting, use parent's bits *)
-    (match get_at_height (height - 1) with
-     | Some parent -> parent.header.bits
-     | None -> network.pow_limit)
-  else if height mod Consensus.difficulty_adjustment_interval = 0 then begin
-    (* Difficulty adjustment boundary *)
-    let parent =
-      match get_at_height (height - 1) with
-      | Some entry -> entry.header
-      | None -> network.genesis_header
-    in
-    let get_block_info h =
-      match get_at_height h with
-      | Some entry -> (entry.header.timestamp, entry.header.bits)
-      | None -> (0l, network.pow_limit)
-    in
-    Consensus.get_next_work_required
-      ~height
-      ~block_time:block_header.timestamp
-      ~prev_block_time:parent.timestamp
-      ~prev_bits:parent.bits
-      ~get_block_info
-      ~network
-  end else begin
-    (* Non-adjustment block *)
-    match get_at_height (height - 1) with
-    | Some parent ->
-      (* Testnet min-difficulty rule: if block timestamp is > 20 min after
-         parent, allow mining at pow_limit *)
-      let get_bits h =
-        match get_at_height h with
-        | Some hdr -> hdr.header.bits
-        | None -> network.pow_limit
-      in
-      (match Consensus.testnet_min_difficulty_bits
-               ~prev_block_time:parent.header.timestamp
-               ~current_time:block_header.timestamp
-               ~network
-               ~get_bits_at_height:get_bits
-               ~height () with
-       | Some min_bits -> min_bits
-       | None -> parent.header.bits)
-    | None -> network.pow_limit
-  end
 
 (* Compute MTP for a given height - used as callback for BIP-68 validation *)
 let get_mtp_for_height (state : chain_state) (h : int) : int32 =

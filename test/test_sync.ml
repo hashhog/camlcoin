@@ -3608,12 +3608,15 @@ let test_w97_g6_bad_prevblk_not_detected () =
 
 (* G7 — ContextualCheckBlockHeader with pindexPrev: difficulty bits gate.
    Core: ContextualCheckBlockHeader checks expected nBits against
-   GetNextWorkRequired(pindexPrev).
-   Camlcoin: validate_header DOES NOT verify expected_bits against parent.
-   The bits-vs-expected check fires only at block-accept time inside
-   check_block (validation.ml line 839).  This means a peer can spam
-   header chains with WRONG difficulty and validate_header will accept
-   them as long as PoW for the WRONG bits is met.  BUG-7. *)
+   GetNextWorkRequired(pindexPrev) (validation.cpp:4086-4089, "bad-diffbits").
+   FIXED: validate_header now computes the required nBits via
+   [compute_expected_bits ~parent_entry:parent] and rejects on mismatch, so a
+   peer can no longer spam header chains with WRONG difficulty whose PoW only
+   meets their own declared target.  This test used to assert the BUG (that the
+   wrong-bits header was accepted); it now asserts the fix.
+   Cross-network coverage — regtest alone cannot distinguish "bits must equal
+   expected" from "bits must equal parent's bits" — lives in
+   test/test_w145_bad_diffbits.ml. *)
 let test_w97_g7_header_difficulty_not_checked () =
   let (state, db, _) = w97_build_chain 0 in
   let genesis_hash = Crypto.compute_block_hash Consensus.regtest.genesis_header in
@@ -3629,17 +3632,15 @@ let test_w97_g7_header_difficulty_not_checked () =
             ~bits:wrong_bits () in
   let result = Sync.validate_header state h in
   Storage.ChainDB.close db; w97_cleanup_db ();
-  (* SPEC: Core's ContextualCheckBlockHeader would reject (bad-diffbits).
-     Camlcoin: validate_header accepts because difficulty is not checked
-     in the header pipeline. *)
-  let accepted_at_header_time = match result with
-    | Ok _ -> true
-    | Error _ -> false
+  (* SPEC: Core's ContextualCheckBlockHeader rejects (bad-diffbits). *)
+  let rejected_as_bad_diffbits = match result with
+    | Error e -> String.length e >= 12 && String.sub e 0 12 = "bad-diffbits"
+    | Ok _ -> false
   in
   Alcotest.(check bool)
-    "G7: BUG — wrong nBits accepted at header time \
-     (Core: ContextualCheckBlockHeader rejects bad-diffbits)"
-    true accepted_at_header_time
+    "G7: wrong nBits rejected at header time as bad-diffbits \
+     (Core: ContextualCheckBlockHeader validation.cpp:4086-4089)"
+    true rejected_as_bad_diffbits
 
 (* G8 — min_pow_checked → "too-little-chainwork" / BLOCK_HEADER_LOW_WORK.
    Core: when min_pow_checked=false (peer's headers have not yet crossed

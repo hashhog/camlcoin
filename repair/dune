@@ -1,0 +1,3 @@
+(executable
+ (name repair_height_index)
+ (libraries camlcoin cstruct))

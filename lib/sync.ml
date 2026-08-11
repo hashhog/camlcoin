@@ -3804,6 +3804,17 @@ let process_downloaded_blocks ?(max_blocks = 1)
            entry.download_state <- Validated;
            ibd.next_process_height <- ibd.next_process_height + 1;
            ibd.chain.blocks_synced <- height;
+           (* Write the active-chain height->hash index for this connected block
+              (Core ConnectTip -> CChain::SetTip, chain.cpp:16).  The IBD
+              download-connect path advanced blocks_synced + the UTXO set but
+              never wrote set_height_hash, so getblockhash/getbestblockhash
+              (which resolve height->hash at blocks_synced) and the restore loop
+              lagged the block tip — the W146 catch-up EXPOSED this by actually
+              downloading the header-ahead gap (blocks connected, index/pointer
+              left at the pre-catch-up height).  Written per block like the reorg
+              batch path (batch_set_height_hash) and Core; the periodic UTXO +
+              chain_tip flush below commits the coins. *)
+           Storage.ChainDB.set_height_hash ibd.chain.db height entry.hash;
            (* Wake the wait-family RPCs on this IBD tip advance (Core
               KernelNotifications blockTip / WaitTipChanged).  Best-effort:
               a notifier fault must never stall IBD. *)

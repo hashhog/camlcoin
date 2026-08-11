@@ -59,6 +59,44 @@ let run ~(ic : in_channel) ~(db : Storage.ChainDB.t)
       (* Compute block hash for storage *)
       let hash = Crypto.compute_block_hash block.header in
 
+      (* Resolve the parent by prev_block hash and DERIVE this block's height
+         from it (parent.height + 1) — NEVER the attacker-supplied frame
+         [height].  GATE 4 coverage + attack-residue fix: this offline
+         --import-blocks path writes the header AND the height->hash index
+         directly (below) without routing through [Sync.validate_header], so the
+         exact GetNextWorkRequired check (Core ContextualCheckBlockHeader,
+         validation.cpp:4086-4089) would otherwise never run here.  Feeding the
+         frame height (which a malicious blocks file controls, decoupled from the
+         parent) into [compute_expected_bits] let an attacker force its ancestor
+         lookup to miss -> ancestry_incomplete -> the gate short-circuited to
+         admit, re-poisoning the height->hash index BIP113/68/94/34 read.  Core
+         always takes height from pindexPrev->nHeight+1 (validation.cpp:4084) and
+         refuses prev-blk-not-found (validation.cpp:4215-4217).  [~parent_entry]
+         makes [Sync.compute_expected_bits] walk prev_block links through
+         [chain.headers] (Core pindexPrev->GetAncestor, pow.cpp:44,72), never the
+         poisonable active-chain height index. *)
+      match Hashtbl.find_opt chain.Sync.headers
+              (Cstruct.to_string block.header.prev_block) with
+      | None ->
+        Printf.eprintf
+          "\nprev-blk-not-found at frame height %d: parent header absent — \
+           refusing to import an unplaceable block\n%!" height;
+        running := false
+      | Some parent ->
+      let height = parent.Sync.height + 1 in
+      let ancestry_incomplete = ref false in
+      let expected_bits =
+        Sync.compute_expected_bits ~parent_entry:parent ~ancestry_incomplete
+          chain height block.header
+      in
+      if not (!ancestry_incomplete || block.header.bits = expected_bits) then begin
+        Printf.eprintf
+          "\nbad-diffbits at height %d: header 0x%08lx does not match the \
+           difficulty its parent requires — aborting import\n%!"
+          height block.header.bits;
+        running := false
+      end else begin
+
       (* Store the block in the database *)
       Storage.ChainDB.store_block db hash block;
 
@@ -144,6 +182,7 @@ let run ~(ic : in_channel) ~(db : Storage.ChainDB.t)
          Printf.eprintf "\nFailed to connect block at height %d: %s\n%!"
            height msg;
          running := false)
+      end (* else begin: bad-diffbits gate passed *)
       end (* if height > blocks_synced *)
   done;
   (* Final flush *)

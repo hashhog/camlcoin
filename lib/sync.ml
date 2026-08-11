@@ -589,6 +589,31 @@ let get_ancestor (state : chain_state) (idx : header_entry) (height : int)
     in
     walk idx
 
+(* Resolve the best-HEADER-chain entry at [height].
+
+   The on-disk height->hash index projects only the ACTIVE validated chain
+   (<= the validated tip; see fecf534 "height->hash index projects the
+   ACTIVE chain") — the header-ahead span (blocks_synced, header tip] has
+   NO rows.  [get_header_at_height] therefore returns [None] for exactly
+   the heights a catch-up needs, which froze the post-IBD gap-fill and the
+   IBD download queue whenever the header tip ran ahead of the block tip
+   (mainnet incident, receipts/camlcoin-repair-executed-2026-08-11.md).
+
+   This helper falls back to walking prev_block links from [state.tip] —
+   mirroring Bitcoin Core, which resolves download targets from
+   pindexBestHeader->GetAncestor (net_processing.cpp
+   FindNextBlocksToDownload), never from the active chain.  O(1) via the
+   index at/below the validated tip, O(tip.height - height) link hops
+   above it. *)
+let best_header_at_height (state : chain_state) (height : int)
+    : header_entry option =
+  match get_header_at_height state height with
+  | Some _ as x -> x
+  | None ->
+    (match state.tip with
+     | Some t when t.height >= height -> get_ancestor state t height
+     | _ -> None)
+
 (* Compute the expected difficulty bits for a block at the given height.
    - Genesis block (height 0): use genesis header bits
    - Regtest (pow_no_retargeting): use parent's bits (every block same difficulty)
@@ -1075,6 +1100,91 @@ let restore_chain_state (db : Storage.ChainDB.t)
      | Some (_chain_hash, chain_height) ->
        state.blocks_synced <- chain_height
      | None -> ());
+    (* ---- Header-ahead restore repair (2026-08-11) ----
+       The height->hash index projects only the ACTIVE validated chain
+       (fecf534), so a restart taken while header sync ran ahead of block
+       validation finds NO index rows for (chain_tip, header_tip]; the
+       restore loop above then never reaches [tip_height] and leaves
+       [state.tip] = None even though every header's bytes ARE in the
+       block_header CF.  Left alone, that state falls into the
+       snapshot-bootstrap re-anchor below, which rewinds header sync to
+       genesis and then DEADLOCKS: every peer batch is already present in
+       [state.headers], so it is discarded as stale ("2000 known headers
+       -> stale -> fail") and [headers_synced] never leaves 0 (mainnet
+       incident, receipts/camlcoin-repair-executed-2026-08-11.md).
+
+       Rebuild the in-memory best-header chain instead: walk prev_block
+       links back from the stored header tip to the first entry the index
+       loop already loaded (normally the validated tip; the virtual
+       pre-genesis root if the index is empty), then insert forward with
+       cumulative work.  Mirrors Bitcoin Core's LoadBlockIndex
+       (node/blockstorage.cpp), which reconstructs the FULL header tree —
+       and pindexBestHeader — from the block index, independent of the
+       active chain.  The snapshot re-anchor below now fires ONLY when the
+       header-tip bytes are genuinely absent (a bare UTXO snapshot). *)
+    (match state.tip with
+     | Some _ -> ()
+     | None ->
+       (* Collect (hash, header) pairs walking back from the stored header
+          tip until we connect to an in-memory entry, walk past genesis, or
+          run out of header bytes (genuine snapshot base -> leave the state
+          untouched for the re-anchor branch below). *)
+       let collected = ref [] in
+       let cursor = ref _tip_hash in
+       let anchor = ref None in
+       let missing = ref false in
+       let continue_walk = ref true in
+       while !continue_walk do
+         match Hashtbl.find_opt state.headers (Cstruct.to_string !cursor) with
+         | Some e -> anchor := Some e; continue_walk := false
+         | None ->
+           if Cstruct.equal !cursor Types.zero_hash then
+             (* Walked past genesis with an empty height index: anchor on
+                the virtual pre-genesis root (height -1, zero work). *)
+             continue_walk := false
+           else
+             (match Storage.ChainDB.get_block_header db !cursor with
+              | Some hdr ->
+                collected := (!cursor, hdr) :: !collected;
+                cursor := hdr.Types.prev_block
+              | None -> missing := true; continue_walk := false)
+       done;
+       if not !missing && !collected <> [] then begin
+         let start_height, start_work =
+           match !anchor with
+           | Some a -> a.height, a.total_work
+           | None -> -1, Consensus.zero_work
+         in
+         let h = ref start_height in
+         let parent_work = ref start_work in
+         let last = ref None in
+         List.iter (fun (hash, (hdr : Types.block_header)) ->
+           incr h;
+           let entry = {
+             header = hdr; hash; height = !h;
+             total_work =
+               Consensus.work_add !parent_work (work_from_bits hdr.bits);
+           } in
+           Hashtbl.replace state.headers (Cstruct.to_string hash) entry;
+           parent_work := entry.total_work;
+           last := Some entry
+         ) !collected;
+         (match !last with
+          | Some entry ->
+            state.tip <- Some entry;
+            state.headers_synced <- entry.height;
+            if entry.height <> tip_height then
+              Logs.warn (fun m ->
+                m "Restore: header-chain walk rebuilt the tip at height %d \
+                   but the stored header_tip record claims %d — trusting \
+                   the walk" entry.height tip_height);
+            Logs.info (fun m ->
+              m "Restore: rebuilt %d header-ahead in-memory headers from \
+                 the block-header CF (validated tip %d, header tip %d); \
+                 block download will fetch the gap"
+                (List.length !collected) state.blocks_synced entry.height)
+          | None -> ())
+       end);
     (* ---- AssumeUTXO snapshot-bootstrap forward-sync repair (3-layer fix) ----
        After [load_snapshot_into_primary], the DB carries:
          - header_tip + chain_tip at the snapshot base (e.g. 944183),
@@ -1552,6 +1662,35 @@ let build_locator_from_height (state : chain_state) (start_height : int)
   let genesis_hash () =
     Storage.ChainDB.get_hash_at_height state.db 0
   in
+  (* Best-header-chain hash at [height].  Above the validated tip the
+     height->hash index has NO rows (it projects only the ACTIVE chain,
+     fecf534), so the header-ahead span must be resolved by walking
+     prev_block links from [state.tip] — Bitcoin Core's GetLocator anchors
+     on pindexBestHeader and walks GetAncestor (chain.cpp::GetLocator /
+     LocatorEntries).  Without this, a restart taken with header_tip >
+     block_tip built a locator anchored at the VALIDATED tip, so peers
+     replied with already-known headers, the batch was discarded as stale,
+     and header sync could never complete (so block download never
+     started).  The cursor descends monotonically with the locator's
+     exponential steps, so the whole header-ahead span costs O(gap) link
+     hops total; at/below the validated tip the O(1) index is used as
+     before. *)
+  let cursor = ref state.tip in
+  let hash_at (height : int) : Types.hash256 option =
+    let mem_hit =
+      if height > state.blocks_synced then
+        match !cursor with
+        | Some c when c.height >= height ->
+          (match get_ancestor state c height with
+           | Some e -> cursor := Some e; Some e.hash
+           | None -> None)
+        | _ -> None
+      else None
+    in
+    match mem_hit with
+    | Some _ as x -> x
+    | None -> Storage.ChainDB.get_hash_at_height state.db height
+  in
   let rec collect acc step height =
     if height < 0 then
       (* Always terminate with genesis. *)
@@ -1562,7 +1701,7 @@ let build_locator_from_height (state : chain_state) (start_height : int)
          | _ -> List.rev (h :: acc))
       | None -> List.rev acc
     else begin
-      match Storage.ChainDB.get_hash_at_height state.db height with
+      match hash_at height with
       | Some hash ->
         let next_step = if List.length acc >= 10 then step * 2 else step in
         collect (hash :: acc) next_step (height - next_step)
@@ -2528,6 +2667,18 @@ type ibd_state = {
   orphan_blocks : (string, orphan_block_entry) Hashtbl.t;
   misbehavior_handler : (int -> string -> unit) option;
   mutable zmq_notifier : Zmq_notify.t option;  (* ZMQ notification publisher *)
+  (* Cached best-header-chain download path: forward-ordered entries for
+     heights [next_download_height ..], a suffix of the best header chain.
+     Needed because the on-disk height->hash index only covers the ACTIVE
+     validated chain (fecf534) — the (blocks_synced, header tip] span the
+     download queue must service has no index rows, so it is materialised
+     from the in-memory header table by walking prev_block links from
+     [chain.tip] (Core: FindNextBlocksToDownload walks
+     pindexBestHeader->GetAncestor).  [download_path_tip] records the tip
+     the path was computed against, so tip advancement appends O(new
+     headers) and a reorg triggers a full rebuild. *)
+  download_path : header_entry Queue.t;
+  mutable download_path_tip : header_entry option;
 }
 
 (* Create IBD state from existing chain state *)
@@ -2551,7 +2702,9 @@ let create_ibd_state ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
     mempool = None;
     orphan_blocks = Hashtbl.create 100;
     misbehavior_handler;
-    zmq_notifier }
+    zmq_notifier;
+    download_path = Queue.create ();
+    download_path_tip = None }
 
 let set_mempool (ibd : ibd_state) (mp : Mempool.mempool) =
   ibd.mempool <- Some mp
@@ -2619,39 +2772,119 @@ let get_peer_state (ibd : ibd_state) (peer_id : int) : peer_download_state =
    Download Queue Management
    ============================================================================ *)
 
-(* Fill the download queue from header chain *)
+(* Rebuild the cached best-header-chain download path from scratch:
+   forward-ordered entries for heights
+   [ibd.next_download_height .. tip.height], collected by walking
+   prev_block links down from [tip]. *)
+let rebuild_download_path (ibd : ibd_state) (tip : header_entry) : unit =
+  Queue.clear ibd.download_path;
+  let entries = ref [] in
+  let cur = ref (Some tip) in
+  let continue_walk = ref true in
+  while !continue_walk do
+    match !cur with
+    | Some e when e.height >= ibd.next_download_height ->
+      entries := e :: !entries;
+      cur := Hashtbl.find_opt ibd.chain.headers
+               (Cstruct.to_string e.header.prev_block)
+    | _ -> continue_walk := false
+  done;
+  List.iter (fun e -> Queue.push e ibd.download_path) !entries;
+  ibd.download_path_tip <- Some tip
+
+(* Bring the cached download path up to date with the current header tip:
+   no-op when unchanged, O(new headers) append when the tip extended the
+   chain the path was built on, full rebuild on a reorg. *)
+let sync_download_path (ibd : ibd_state) (tip : header_entry) : unit =
+  match ibd.download_path_tip with
+  | Some pt when Cstruct.equal pt.hash tip.hash -> ()
+  | Some pt when pt.height < tip.height ->
+    (* Collect [tip]'s ancestry down to pt.height + 1; if it connects to
+       [pt], append, otherwise the best chain reorged below the cached
+       path and it must be rebuilt. *)
+    let ext = ref [] in
+    let cur = ref (Some tip) in
+    let verdict = ref `Walking in
+    while !verdict = `Walking do
+      match !cur with
+      | Some e when e.height > pt.height ->
+        ext := e :: !ext;
+        cur := Hashtbl.find_opt ibd.chain.headers
+                 (Cstruct.to_string e.header.prev_block)
+      | Some e when e.height = pt.height && Cstruct.equal e.hash pt.hash ->
+        verdict := `Connected
+      | _ -> verdict := `Reorg
+    done;
+    if !verdict = `Connected then begin
+      List.iter (fun e -> Queue.push e ibd.download_path) !ext;
+      ibd.download_path_tip <- Some tip
+    end else
+      rebuild_download_path ibd tip
+  | _ -> rebuild_download_path ibd tip
+
+(* Fill the download queue from the header chain.
+
+   Targets come from the IN-MEMORY best-header chain (the cached
+   [download_path]), NOT the on-disk height->hash index: since fecf534 the
+   index projects only the ACTIVE validated chain, so every height in
+   (blocks_synced, header tip] has no row.  The previous index-driven loop
+   silently skipped exactly those heights (its [None] arm advanced
+   [next_download_height] without queueing), so the download queue stayed
+   empty whenever the header tip was ahead of the block tip, run_ibd
+   declared "IBD complete (0 blocks)" immediately, and the block tip froze
+   while the header tip advanced (mainnet incident,
+   receipts/camlcoin-repair-executed-2026-08-11.md).  Bitcoin Core drives
+   block download from the header tree (net_processing.cpp
+   FindNextBlocksToDownload, walking pindexBestHeader->GetAncestor), never
+   from the active chain. *)
 let fill_download_queue (ibd : ibd_state) : unit =
-  let tip_height = match ibd.chain.tip with
-    | Some t -> t.height
-    | None -> 0
-  in
-  let max_queue_size = block_download_window in
-  while ibd.next_download_height <= tip_height &&
-        Queue.length ibd.block_queue < max_queue_size do
-    let height = ibd.next_download_height in
-    match Storage.ChainDB.get_hash_at_height ibd.chain.db height with
-    | Some hash ->
-      (* If the block is already stored on disk and is ABOVE blocks_synced
-         (i.e. stored from a crashed session but not yet validated with
-         consistent UTXO state), load it directly to avoid re-downloading. *)
-      if Storage.ChainDB.has_block ibd.chain.db hash then begin
-        match Storage.ChainDB.get_block ibd.chain.db hash with
-        | Some block ->
-          queue_add ibd {
-            hash; height;
-            download_state = Downloaded { block; peer_id = None };
-            tried_peers = [];
-          }
-        | None ->
+  match ibd.chain.tip with
+  | None -> ()
+  | Some tip ->
+    sync_download_path ibd tip;
+    let max_queue_size = block_download_window in
+    (* Drop path entries already below the download cursor (left over after
+       a rebuild raced the cursor forward, or duplicated after a reorg). *)
+    let dropping = ref true in
+    while !dropping do
+      if Queue.is_empty ibd.download_path then dropping := false
+      else if (Queue.peek ibd.download_path).height < ibd.next_download_height
+      then ignore (Queue.pop ibd.download_path)
+      else dropping := false
+    done;
+    let progressing = ref true in
+    while !progressing
+          && not (Queue.is_empty ibd.download_path)
+          && Queue.length ibd.block_queue < max_queue_size do
+      let e = Queue.peek ibd.download_path in
+      if e.height <> ibd.next_download_height then begin
+        (* Path is stale relative to the cursor (e.g. the cursor moved
+           backwards): rebuild once and resume on the next call. *)
+        rebuild_download_path ibd tip;
+        progressing := false
+      end else begin
+        ignore (Queue.pop ibd.download_path);
+        let hash = e.hash and height = e.height in
+        (* If the block is already stored on disk and is ABOVE blocks_synced
+           (i.e. stored from a crashed session but not yet validated with
+           consistent UTXO state), load it directly to avoid re-downloading. *)
+        if Storage.ChainDB.has_block ibd.chain.db hash then begin
+          match Storage.ChainDB.get_block ibd.chain.db hash with
+          | Some block ->
+            queue_add ibd {
+              hash; height;
+              download_state = Downloaded { block; peer_id = None };
+              tried_peers = [];
+            }
+          | None ->
+            queue_add ibd { hash; height;
+                            download_state = NotRequested; tried_peers = [] }
+        end else
           queue_add ibd { hash; height;
-                          download_state = NotRequested; tried_peers = [] }
-      end else
-        queue_add ibd { hash; height;
-                        download_state = NotRequested; tried_peers = [] };
-      ibd.next_download_height <- ibd.next_download_height + 1
-    | None ->
-      ibd.next_download_height <- ibd.next_download_height + 1
-  done
+                          download_state = NotRequested; tried_peers = [] };
+        ibd.next_download_height <- ibd.next_download_height + 1
+      end
+    done
 
 (* ============================================================================
    Timeout Management with Adaptive Backoff
@@ -3322,8 +3555,18 @@ let process_downloaded_blocks ?(max_blocks = 1)
       | Downloaded { block; peer_id } ->
         (* Validate the block *)
         let height = entry.height in
-        (* Compute expected difficulty from chain state *)
-        let expected_bits = compute_expected_bits ibd.chain height block.header in
+        (* Compute expected difficulty via the block's own parent ancestry
+           (hash-linked walk), NEVER the active-chain height index: the index
+           does not cover header-ahead-of-block heights during catch-up, so an
+           unguarded lookup mis-resolves the retarget ancestor and fails every
+           gap block (W146 reengage fix).  Mirrors Core pindexLast->GetAncestor
+           (pow.cpp:44,72); same pattern as the reorg + submitblock paths. *)
+        let parent_entry = get_header ibd.chain block.header.prev_block in
+        let expected_bits =
+          match parent_entry with
+          | Some pe -> compute_expected_bits ~parent_entry:pe ibd.chain height block.header
+          | None -> compute_expected_bits ibd.chain height block.header
+        in
         (* Compute MTP via hash-linked parent walk (immune to height-index contamination
            from side-branch headers).  Reference: bitcoin-core/src/chain.h:233-245. *)
         let median_time = compute_mtp_hash_linked ibd.chain block.header.prev_block in

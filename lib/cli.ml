@@ -1680,12 +1680,37 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       let start_h = chain.blocks_synced + 1 in
       if start_h <= tip_height then begin
         let block_requests = ref [] in
+        (* Resolve the best-header-chain entries for the whole
+           [start_h .. tip_height] gap in ONE downward prev_block walk from
+           the header tip.  The height->hash index only covers the ACTIVE
+           validated chain (fecf534), so [Sync.get_header_at_height] returns
+           [None] for every height above [blocks_synced] — which left this
+           gap-fill requesting NOTHING while the header tip ran ahead of the
+           block tip: the post-IBD frozen-block-tip bug
+           (receipts/camlcoin-repair-executed-2026-08-11.md).  Core resolves
+           these from pindexBestHeader->GetAncestor
+           (net_processing.cpp::FindNextBlocksToDownload). *)
+        let gap_entries : Sync.header_entry option array =
+          Array.make (tip_height - start_h + 1) None in
+        (match chain.tip with
+         | Some t ->
+           let cur = ref (Some t) in
+           let walking = ref true in
+           while !walking do
+             (match !cur with
+              | Some e when e.Sync.height >= start_h ->
+                if e.Sync.height <= tip_height then
+                  gap_entries.(e.Sync.height - start_h) <- Some e;
+                cur := Sync.get_header chain e.Sync.header.Types.prev_block
+              | _ -> walking := false)
+           done
+         | None -> ());
         for h = start_h to tip_height do
-          match Sync.get_header_at_height chain h with
+          match gap_entries.(h - start_h) with
           | Some entry ->
-            if not (Storage.ChainDB.has_block db entry.hash) then
+            if not (Storage.ChainDB.has_block db entry.Sync.hash) then
               block_requests :=
-                { P2p.inv_type = P2p.InvWitnessBlock; hash = entry.hash }
+                { P2p.inv_type = P2p.InvWitnessBlock; hash = entry.Sync.hash }
                 :: !block_requests
           | None -> ()
         done;

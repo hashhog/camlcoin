@@ -2539,6 +2539,15 @@ let bip22_of_submitblock_error (msg : string) : string =
      Decision unchanged (rejected either way): R2 reason-code parity. *)
   else if c "bad-cb-missing" || c "no coinbase transaction"
           || c "first tx is not coinbase" then "bad-cb-missing"
+  (* More than one coinbase. Core CheckBlock (validation.cpp:3955) rejects any
+     block whose vtx[i>0] is a coinbase with "bad-cb-multiple" / "more than one
+     coinbase". validation.ml's per-tx loop emits TxUnexpectedCoinbase for the
+     same condition, rendered "transaction %d validation failed: unexpected
+     coinbase transaction (not first in block)" (validation.ml:70), which no
+     rule matched — so it collapsed to the generic "rejected" bucket (bwmc
+     corpus entries A5-two-coinbases / A6-coinbase-at-index2, 2026-08 sweep).
+     Decision unchanged (rejected either way): R2 reason-code parity only. *)
+  else if c "unexpected coinbase" then "bad-cb-multiple"
   else if c "coinbase value" || c "coinbase value too high" then "bad-cb-amount"
   else if c "sigop" then "bad-blk-sigops"
   (* BIP-30 cross-block duplicate UTXO: "transaction has duplicate txid in UTXO set (BIP30)"
@@ -2600,6 +2609,15 @@ let bip22_of_submitblock_error (msg : string) : string =
      gate folds into the same reject; the accept/reject decision is identical
      either way, so this is reason-string only (no decision-path change). *)
   else if c "max serialized size" || c "max weight" then "bad-blk-length"
+  (* Empty block (zero transactions). Core folds vtx.empty() into the SAME
+     size-limits gate as the weight/serialized-size caps (validation.cpp:3947-3948
+     "block.vtx.empty() || ..." -> "bad-blk-length" / "size limits failed"), and
+     that gate runs BEFORE the coinbase-presence check, so an empty block is
+     bad-blk-length, NOT bad-cb-missing. validation.ml's check_block emits
+     BlockEmptyTransactions -> "block has no transactions" (validation.ml:79),
+     which no rule matched — generic "rejected" (bwmc corpus entry
+     A2-empty-block, 2026-08 sweep). Decision unchanged: reason parity only. *)
+  else if c "block has no transactions" then "bad-blk-length"
   else "rejected"
 
 let handle_submitblock (ctx : rpc_context)

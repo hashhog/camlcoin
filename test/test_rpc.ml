@@ -1947,6 +1947,30 @@ let test_bip22_error_mapping () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* Direct-mapper checks for the bwmc corpus reason-parity fixes (2026-08).
+   Core CheckBlock, bitcoin-core/src/validation.cpp:
+     :3948 vtx.empty() folds into the size-limits gate -> "bad-blk-length"
+     :3955 any vtx[i>0] coinbase -> "bad-cb-multiple"
+   validation.ml renders these as "block has no transactions"
+   (BlockEmptyTransactions) and "transaction %d validation failed: unexpected
+   coinbase transaction (not first in block)" (TxUnexpectedCoinbase). *)
+let test_bip22_bwmc_reason_parity () =
+  let bip22 = Rpc.bip22_of_submitblock_error in
+  Alcotest.(check string) "A2 empty block -> bad-blk-length"
+    "bad-blk-length" (bip22 "block has no transactions");
+  Alcotest.(check string) "A5/A6 extra coinbase -> bad-cb-multiple"
+    "bad-cb-multiple"
+    (bip22 "transaction 1 validation failed: unexpected coinbase transaction (not first in block)");
+  Alcotest.(check string) "A6 coinbase at index 2 -> bad-cb-multiple"
+    "bad-cb-multiple"
+    (bip22 "transaction 2 validation failed: unexpected coinbase transaction (not first in block)");
+  (* Guard the neighbouring mappings the new rules must not steal. *)
+  Alcotest.(check string) "first tx not coinbase stays bad-cb-missing"
+    "bad-cb-missing" (bip22 "block has no coinbase transaction");
+  Alcotest.(check string) "cb scriptSig length stays bad-cb-length"
+    "bad-cb-length"
+    (bip22 "transaction 0 validation failed: coinbase scriptSig length out of range (bad-cb-length)")
+
 let test_dumptxoutset_emits_muhash_txoutset_hash () =
   let (ctx, db, _utxo, _txid1, _txid2) = create_test_context () in
   let path = Printf.sprintf "/tmp/camlcoin_dump_muhash_%d.dat"
@@ -3405,6 +3429,8 @@ let () =
         test_submitblock_missing_params_returns_error;
       test_case "zero block returns BIP-22 token" `Quick
         test_bip22_error_mapping;
+      test_case "bwmc reason parity (bad-blk-length / bad-cb-multiple)" `Quick
+        test_bip22_bwmc_reason_parity;
     ];
     "wallet_encryption_rpc", [
       test_case "encrypt → wrong then right passphrase" `Quick

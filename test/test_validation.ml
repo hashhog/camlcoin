@@ -1432,7 +1432,7 @@ let test_block_error_strings () =
     Validation.BlockBadWitnessCommitment;
     Validation.BlockBadWitnessNonceSize;
     Validation.BlockUnexpectedWitness;
-    Validation.BlockBadVersion;
+    Validation.BlockBadVersion 2l;
     Validation.BlockMutatedMerkle;
     Validation.BlockTimeWarpAttack;
   ] in
@@ -1504,7 +1504,7 @@ let test_block_version_too_low_bip34 () =
   let block = { Types.header; transactions = [coinbase] } in
   match Validation.check_block ~network:Consensus.regtest block 500
           ~expected_bits:0x207fffffl ~median_time:0l () with
-  | Error Validation.BlockBadVersion -> ()
+  | Error (Validation.BlockBadVersion _) -> ()
   | Error Validation.BlockBadDifficulty -> ()  (* May fail PoW first *)
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
   | Ok () -> Alcotest.fail "Should have rejected version 1 block after BIP34"
@@ -1524,7 +1524,7 @@ let test_block_version_ok_before_bip34 () =
   let block = { Types.header; transactions = [coinbase] } in
   match Validation.check_block ~network:Consensus.mainnet block 100
           ~expected_bits:0x207fffffl ~median_time:0l () with
-  | Error Validation.BlockBadVersion ->
+  | Error (Validation.BlockBadVersion _) ->
     Alcotest.fail "Should NOT reject version 1 block before BIP34 activation"
   | Error Validation.BlockBadDifficulty -> ()  (* Expected: PoW check may fail on mainnet params *)
   | Error _ -> ()  (* Other errors are acceptable *)
@@ -1543,7 +1543,7 @@ let test_block_version_too_low_bip66 () =
   let block = { Types.header; transactions = [coinbase] } in
   match Validation.check_block ~network:Consensus.regtest block 1251
           ~expected_bits:0x207fffffl ~median_time:0l () with
-  | Error Validation.BlockBadVersion -> ()
+  | Error (Validation.BlockBadVersion _) -> ()
   | Error Validation.BlockBadDifficulty -> ()
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
   | Ok () -> Alcotest.fail "Should have rejected version 2 block after BIP66"
@@ -1561,7 +1561,7 @@ let test_block_version_too_low_bip65 () =
   let block = { Types.header; transactions = [coinbase] } in
   match Validation.check_block ~network:Consensus.regtest block 1351
           ~expected_bits:0x207fffffl ~median_time:0l () with
-  | Error Validation.BlockBadVersion -> ()
+  | Error (Validation.BlockBadVersion _) -> ()
   | Error Validation.BlockBadDifficulty -> ()
   | Error e -> Alcotest.fail ("Wrong error: " ^ Validation.block_error_to_string e)
   | Ok () -> Alcotest.fail "Should have rejected version 3 block after BIP65"
@@ -2401,9 +2401,14 @@ let test_bip30_should_enforce_at_limit () =
     true result2
 
 let test_bip30_should_enforce_regtest_no_window () =
-  (* On regtest/testnet4 (bip34_hash=None, BIP34 active from genesis),
-     BIP-30 is never enforced for heights in [bip34_height, 1983702).
-     No pre-BIP34 window means no duplicate coinbases are possible. *)
+  (* On regtest/testnet4 Core sets BIP34Hash = uint256() (all-zeros; here
+     network.bip34_hash = None). Core's ConnectBlock gate (validation.cpp:2460-2467)
+     skips BIP-30 only when the ancestor at BIP34Height EQUALS BIP34Hash. An
+     all-zeros hash never equals any real ancestor block hash, so Core ENFORCES
+     BIP-30 on these networks. The previous expectation (skip) was a latent BIP-30
+     consensus split: it would ACCEPT a pure duplicate-txid coinbase Core rejects
+     with bad-txns-BIP30. bip34_height_hash=None (unconfirmed canonical chain)
+     also enforces, matching Core's !pindexBIP34height branch. *)
   let any_hash = Types.zero_hash in
   let result = Validation.bip30_should_enforce
     ~network:Consensus.regtest
@@ -2411,8 +2416,8 @@ let test_bip30_should_enforce_regtest_no_window () =
     ~block_hash:any_hash
     ~bip34_height_hash:None in
   Alcotest.(check bool)
-    "Gate 4 regtest: bip34_hash=None → no BIP-30 enforcement"
-    false result
+    "Gate 4 regtest: bip34_hash=None (Core BIP34Hash=uint256()) → BIP-30 enforced"
+    true result
 
 (* Gate 6: BIP-30 applies to ALL transactions, not just coinbase.
    Verify check_bip30 is called for non-coinbase txs too. *)
@@ -2606,7 +2611,7 @@ let test_bip34_block_version_gate () =
   (* block version check is in check_block; call it at height >= bip34_height *)
   (match Validation.check_block ~network:Consensus.regtest v1_block_h500 500
            ~expected_bits:0x207fffffl ~median_time:0l () with
-   | Error Validation.BlockBadVersion -> ()
+   | Error (Validation.BlockBadVersion _) -> ()
    | Error Validation.BlockBadDifficulty -> ()  (* PoW check may fire first *)
    | Error e -> Alcotest.fail ("Unexpected error: " ^ Validation.block_error_to_string e)
    | Ok () -> Alcotest.fail "Version 1 block at regtest h=500 should fail")
@@ -3550,7 +3555,7 @@ let test_w93_fast_path_enforces_bip34_block_version () =
   match Validation.validate_block_with_utxos ~network:Consensus.regtest block height
           ~expected_bits:0x207fffffl ~median_time:0l
           ~base_lookup ~flags ~skip_scripts:true () with
-  | Error Validation.BlockBadVersion -> ()
+  | Error (Validation.BlockBadVersion _) -> ()
   | Error e -> Alcotest.fail
                  ("W93: expected BlockBadVersion on fast path, got: "
                   ^ Validation.block_error_to_string e)

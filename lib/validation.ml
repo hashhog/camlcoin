@@ -40,7 +40,7 @@ type block_validation_error =
   | BlockBadWitnessCommitment    (* bad-witness-merkle-match *)
   | BlockBadWitnessNonceSize     (* bad-witness-nonce-size: coinbase scriptWitness must be 1 item of 32 bytes *)
   | BlockUnexpectedWitness       (* unexpected-witness: witness data in non-segwit block *)
-  | BlockBadVersion
+  | BlockBadVersion of int32   (* block nVersion below a buried BIP34/66/65 gate; carries nVersion for bad-version(0x%08x) *)
   | BlockMutatedMerkle
   | BlockTimeWarpAttack  (* time-timewarp-attack: BIP-94 retarget-boundary timestamp too early *)
 
@@ -94,7 +94,12 @@ let block_error_to_string = function
   | BlockBadWitnessCommitment -> "bad-witness-merkle-match"
   | BlockBadWitnessNonceSize -> "bad-witness-nonce-size"
   | BlockUnexpectedWitness -> "unexpected-witness"
-  | BlockBadVersion -> "block version too low for active soft forks"
+  (* Core validation.cpp:4116 ContextualCheckBlockHeader emits
+     strprintf("bad-version(0x%08x)", block.nVersion) at the buried BIP34/66/65
+     height gates. nVersion is a signed int32 reinterpreted UNSIGNED, zero-padded
+     to 8 lowercase hex digits (%08lx treats the OCaml int32 as unsigned, so the
+     high-bit 0x80000000 and -1 = 0xffffffff cases format correctly). *)
+  | BlockBadVersion v -> Printf.sprintf "bad-version(0x%08lx)" v
   | BlockMutatedMerkle -> "merkle tree has mutated duplicate transactions"
   | BlockTimeWarpAttack -> "time-timewarp-attack"
 
@@ -916,11 +921,11 @@ let check_block ~network:(network : Consensus.network_config) (block : Types.blo
         (* Block version enforcement after BIP activation heights.
            Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4113-4118. *)
         if height >= network.bip34_height && Int32.compare block.header.version 2l < 0 then
-          Error BlockBadVersion
+          Error (BlockBadVersion block.header.version)
         else if height >= network.bip66_height && Int32.compare block.header.version 3l < 0 then
-          Error BlockBadVersion
+          Error (BlockBadVersion block.header.version)
         else if height >= network.bip65_height && Int32.compare block.header.version 4l < 0 then
-          Error BlockBadVersion
+          Error (BlockBadVersion block.header.version)
         else
         (* Check difficulty target.
            Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4088-4089. *)
@@ -2090,17 +2095,27 @@ let bip30_should_enforce
         Cstruct.equal expected_hash actual_hash
       | _ -> false  (* No BIP34 hash info → cannot confirm canonical chain *)
     in
+    (* Core validation.cpp:2460-2467:
+         pindexBIP34height = pprev->GetAncestor(BIP34Height);
+         fEnforceBIP30 &= (!pindexBIP34height || !(pindexBIP34height->hash == BIP34Hash));
+         enforce = fEnforceBIP30 || height >= BIP34_IMPLIES_BIP30_LIMIT;
+       i.e. BIP-30 is skipped ONLY when the ancestor at BIP34Height matches the
+       hard-coded BIP34Hash (the canonical chain is confirmed BIP34-active) AND
+       we are below the wrap-around limit.
+
+       For regtest and testnet4 Core sets BIP34Hash = uint256() (all-zeros; here
+       represented as network.bip34_hash = None). An all-zeros hash never equals
+       any real ancestor block hash, so Core ENFORCES BIP-30 on those networks.
+       The previous `bip34_hash = None -> skip` fallback was a latent BIP-30
+       consensus split: camlcoin would ACCEPT a pure duplicate-txid coinbase that
+       Core rejects with bad-txns-BIP30 on regtest/testnet4. Enforce to match. *)
     if bip34_confirmed_on_canonical_chain
        && height >= network.Consensus.bip34_height
        && height < bip34_implies_bip30_limit then
-      false  (* BIP34 active on canonical chain: skip BIP-30 for performance *)
-    else if height >= network.Consensus.bip34_height
-            && height < bip34_implies_bip30_limit
-            && network.Consensus.bip34_hash = None then
-      false  (* bip34_hash=None means BIP34 active from genesis (testnet4/regtest);
-                no pre-BIP34 window exists, so BIP30 violations are impossible *)
+      false  (* BIP34 confirmed on canonical chain: skip BIP-30 for performance *)
     else
-      true  (* Enforce BIP-30: either pre-BIP34, or >= BIP34_IMPLIES_BIP30_LIMIT *)
+      true  (* Enforce BIP-30: pre-BIP34, unconfirmed canonical chain
+               (incl. regtest/testnet4 zero BIP34Hash), or >= BIP34_IMPLIES_BIP30_LIMIT *)
 
 (* Validate block with full UTXO tracking
 

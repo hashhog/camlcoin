@@ -2486,6 +2486,27 @@ let bip22_of_submitblock_error (msg : string) : string =
                      else go (i + 1)
       in go 0
   in
+  (* Return the index of the first occurrence of [s] in [msg], or None. *)
+  let find_sub s = let open String in
+    let n = length s and m = length msg in
+    if n > m then None
+    else
+      let rec go i = if i > m - n then None
+                     else if sub msg i n = s then Some i
+                     else go (i + 1)
+      in go 0
+  in
+  (* bad-version(0x%08x): Core ContextualCheckBlockHeader (validation.cpp:4116)
+     emits the block nVersion at the buried BIP34/66/65 height gates. validation.ml
+     already renders BlockBadVersion as the exact token "bad-version(0x........)";
+     surface it verbatim (extract the token in case a "transaction N ..." prefix
+     is present, so the dynamic hex survives). *)
+  match find_sub "bad-version(0x" with
+  | Some start ->
+    (match String.index_from_opt msg start ')' with
+     | Some close -> String.sub msg start (close - start + 1)
+     | None -> String.sub msg start (String.length msg - start))
+  | None ->
   if c "difficulty target" || c "does not meet" then "high-hash"
   else if c "merkle root" || c "mutated" then "bad-txnmrklroot"
   (* Witness-commitment failures (BIP-141 CheckWitnessMalleation,
@@ -2528,6 +2549,17 @@ let bip22_of_submitblock_error (msg : string) : string =
      — Core reaches ConnectBlock prevout-already-spent and returns
      "bad-txns-inputs-missingorspent" for the same block (dup-txid-merkle-malleation corpus). *)
   else if c "duplicate transaction" then "bad-txns-inputs-missingorspent"
+  (* In-tx duplicate inputs (CheckTransaction, consensus/tx_check.cpp:44
+     "bad-txns-inputs-duplicate"): validation.ml TxDuplicateInputs renders
+     "transaction has duplicate inputs". Distinct from the cross-block BIP30
+     dup-txid ("...(BIP30)" -> bad-txns-BIP30, matched above) and the in-block
+     dup-tx case ("duplicate transaction", matched above). *)
+  else if c "duplicate inputs" then "bad-txns-inputs-duplicate"
+  (* Empty vout (CheckTransaction, consensus/tx_check.cpp:17 vout.empty()
+     "bad-txns-vout-empty"): validation.ml TxEmptyOutputs renders "transaction
+     has no outputs". Rejects at CheckTransaction BEFORE script verification, for
+     both the coinbase and normal txs. *)
+  else if c "no outputs" then "bad-txns-vout-empty"
   else if c "non-final" || c "not final" || c "sequence locks" then "bad-txns-nonfinal"
   (* bad-cb-length: coinbase scriptSig 2..100 byte cap (consensus/tx_check.cpp:49) *)
   else if c "bad-cb-length" then "bad-cb-length"

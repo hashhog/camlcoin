@@ -10857,6 +10857,7 @@ let handle_help (_ctx : rpc_context)
       "getblockheader \"blockhash\" ( verbose )";
       "getblockstats hash_or_height";
       "getblockfilter \"blockhash\" ( filtertype )";
+      "scanblocks \"action\" ( [scanobjects,...] start_height stop_height \"filtertype\" options )";
       "getdeploymentinfo ( \"blockhash\" )";
       "getdifficulty";
       "getchaintips";
@@ -10871,7 +10872,9 @@ let handle_help (_ctx : rpc_context)
       "== Mining ==";
       "getblocktemplate";
       "getmininginfo";
+      "getprioritisedtransactions";
       "submitblock \"hexdata\"";
+      "submitheader \"hexdata\"";
       "";
       "== Regtest Mining ==";
       "generate nblocks (regtest only)";
@@ -10906,6 +10909,7 @@ let handle_help (_ctx : rpc_context)
       "listbanned";
       "ping";
       "setban \"address\" \"add\"|\"remove\" ( bantime )";
+      "setnetworkactive state";
       "";
       "== Rawtransactions ==";
       "createrawtransaction [{\"txid\":\"id\",\"vout\":n},...] [{\"address\":amount},...] ( locktime replaceable )";
@@ -10934,6 +10938,7 @@ let handle_help (_ctx : rpc_context)
       "";
       "== Blockchain ==";
       "gettxout \"txid\" vout";
+      "gettxspendingprevout [{\"txid\":\"hex\",\"vout\":n},...] ( {\"mempool_only\":bool,\"return_spending_tx\":bool,...} )";
       "invalidateblock \"blockhash\"";
       "reconsiderblock \"blockhash\"";
       "preciousblock \"blockhash\"";
@@ -10963,6 +10968,7 @@ let handle_help (_ctx : rpc_context)
       "walletlock";
       "";
       "== Control ==";
+      "getrpcinfo";
       "help ( \"command\" )";
       "logging ( [\"include_category\",...] [\"exclude_category\",...] )";
       "stop";

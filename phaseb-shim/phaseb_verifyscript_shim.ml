@@ -660,6 +660,40 @@ let process_subsidy (j : Yojson.Safe.t) : string =
   let subsidy = Consensus.block_subsidy_for_network Consensus.Mainnet height in
   Printf.sprintf {|{"subsidy_sats":%Ld}|} subsidy
 
+(* op "sighash" (Core sighash.json byte-exact legacy SignatureHash
+   differential): drive camlcoin's REAL legacy sighash —
+   `Script.compute_sighash_legacy` (lib/script.ml:867), the exact function the
+   interpreter's CHECKSIG/CHECKMULTISIG paths call (script.ml:1997/2115/2246):
+   opcode-aware OP_CODESEPARATOR strip, ANYONECANPAY/NONE/SINGLE modified-tx
+   serialization incl. the SIGHASH_SINGLE nIn>=nOuts "hash of one" bug
+   (0x01 + 31 zero bytes, internal order), and the nHashType 4-byte LE footer
+   (its `Int32.of_int hash_type` truncates to the low 32 bits exactly as
+   Core's (int32_t)nHashType serialization does). The shim reimplements
+   NOTHING: tx_hex is deserialized with camlcoin's OWN wire parser (the same
+   Serialize.deserialize_transaction the verifytx op uses), and the RAW
+   SIGNED hashtype is passed through untouched — OCaml's `land` on negative
+   ints is two's-complement, so the impl's own `land 0x1f` / `land 0x80`
+   mode-bit masks behave exactly like Core's `nHashType & 0x1f / & 0x80`.
+   The returned INTERNAL 32-byte digest is reversed ONCE at the boundary to
+   Core GetHex/display order via Types.hash256_to_hex_display (the digest is
+   the ONLY thing reversed; prevout txids inside the tx stay internal).
+
+   request:  {"op":"sighash","tx_hex":"...","script_hex":"...",
+              "input_index":<int>,"hashtype":<signed int>}
+   response: {"sighash":"<64-hex display order>"}
+             {"error":"..."}   (could not compute -> scored as FAIL) *)
+let process_sighash (j : Yojson.Safe.t) : string =
+  let member k = Yojson.Safe.Util.member k j in
+  let to_hex v = Yojson.Safe.Util.to_string v in
+  let tx_bytes = hex_decode (to_hex (member "tx_hex")) in
+  let r = Serialize.reader_of_cstruct tx_bytes in
+  let tx = Serialize.deserialize_transaction r in
+  let script_code = hex_decode (to_hex (member "script_hex")) in
+  let input_index = json_to_int (member "input_index") in
+  let hashtype = json_to_int (member "hashtype") in
+  let digest = Script.compute_sighash_legacy tx input_index script_code hashtype in
+  Printf.sprintf {|{"sighash":"%s"}|} (Types.hash256_to_hex_display digest)
+
 (* op "checkblock" (Phase B VALIDATE-ONLY block differential): generalizes
    `connecttx` from a single tx to a FULL BLOCK. Drives camlcoin's REAL
    block-acceptance pipeline end to end:
@@ -1367,6 +1401,7 @@ let process (line : string) : string =
     | "nextwork" -> process_nextwork j
     | "merkleroot" -> process_merkleroot j
     | "subsidy" -> process_subsidy j
+    | "sighash" -> process_sighash j
     | other -> Printf.sprintf {|{"error":"unknown op: %s"}|} (json_escape other)
   with
   | Failure msg -> Printf.sprintf {|{"error":"%s"}|} (json_escape msg)

@@ -2508,7 +2508,21 @@ let bip22_of_submitblock_error (msg : string) : string =
      | None -> String.sub msg start (String.length msg - start))
   | None ->
   if c "difficulty target" || c "does not meet" then "high-hash"
-  else if c "merkle root" || c "mutated" then "bad-txnmrklroot"
+  (* Mutated merkle tree (CVE-2012-2459 malleability collision): Core
+     CheckMerkleRoot (validation.cpp:3853) distinguishes this from a plain
+     root mismatch — mutated -> "bad-txns-duplicate", hashMerkleRoot
+     mismatch -> "bad-txnmrklroot" (validation.cpp:3843). validation.ml
+     renders BlockMutatedMerkle as "merkle tree has mutated duplicate
+     transactions" and BlockBadMerkleRoot as "merkle root mismatch"; the
+     old combined rule collapsed BOTH into bad-txnmrklroot (corpus entries
+     reject-leaf-dup / reject-subtree-dup, cve-2012-2459-merkle-dup).
+     MUST stay ABOVE the "duplicate transaction" rule below: the mutated
+     message contains that substring, and that rule is the explicit
+     dup-txid scan Core only reaches at ConnectBlock
+     (bad-txns-inputs-missingorspent, reject-misaligned-dup).
+     Decision unchanged (rejected either way): R2 reason-code parity only. *)
+  else if c "mutated" then "bad-txns-duplicate"
+  else if c "merkle root" then "bad-txnmrklroot"
   (* Witness-commitment failures (BIP-141 CheckWitnessMalleation,
      validation.cpp:3870-3916). validation.ml's block_error_to_string already
      emits Core's canonical tokens VERBATIM ("bad-witness-merkle-match" /

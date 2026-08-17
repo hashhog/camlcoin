@@ -1845,6 +1845,34 @@ let activate_snapshot_with_background
     performed inside [run_background_validation]; this wrapper only runs the
     Lwt thread to completion and translates the terminal [bg_validation.state]
     into a verdict. *)
+(** Spawn background validation onto the ALREADY-RUNNING Lwt scheduler and
+    return immediately.
+
+    This is the Core-faithful shape and the only one usable from the RPC
+    server. Core's [loadtxoutset] returns as soon as the snapshot is loaded and
+    validates the historical chain asynchronously; it does not block the caller
+    until a verdict exists. [run_background_to_completion] below blocks via
+    [Lwt_main.run], which is fine from the CLI but raises "Nested calls to
+    Lwt_main.run are not allowed" when called from inside the RPC server, which
+    is already running under [Lwt_main.run].
+
+    The verdict is not lost by returning early: [run_background_validation]
+    performs its own state mutation, flipping the snapshot chainstate's
+    [assumeutxo_state] to Validated or Invalid, which is exactly what
+    [getchainstates] reads. A caller that polls immediately sees
+    [validated = false] until validation finishes — which is precisely what
+    Core reports. *)
+let run_background_in_scheduler (activation : snapshot_activation) : unit =
+  Lwt.async (fun () ->
+    run_background_validation
+      ~ibd_chainstate:activation.background
+      ~snapshot_chainstate:activation.snapshot
+      ~bg_validation:activation.bg_validation
+      ~get_block:activation.get_block
+      ~get_header_at_height:activation.get_header_at_height
+      ~network:activation.network
+      ())
+
 let run_background_to_completion (activation : snapshot_activation)
     : bool * string option =
   Lwt_main.run

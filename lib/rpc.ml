@@ -9389,14 +9389,30 @@ let handle_loadtxoutset (ctx : rpc_context)
                   ~network:ctx.network
                   ()
               in
-              (* Drive the background validation to its terminal verdict.  This
-                 flips cs.assumeutxo_state to Validated (match) or Invalid
-                 (mismatch / connect failure) inside run_background_validation;
-                 a mismatch is surfaced ONLY via that state, not via an Error
-                 return (Core async AbortNode model). *)
-              let (_validated, _bg_err) =
-                Assume_utxo.run_background_to_completion activation
-              in
+              (* Spawn background validation onto the running Lwt scheduler and
+                 return; do NOT drive it to a terminal verdict here.
+
+                 Two reasons. (a) Correctness: this handler already runs inside
+                 [Lwt_main.run], so the blocking wrapper
+                 [run_background_to_completion] raises "Nested calls to
+                 Lwt_main.run are not allowed" and loadtxoutset fails outright
+                 over RPC — while the CLI path, which is not inside the
+                 scheduler, worked. That asymmetry is exactly what the
+                 boot-smoke gate saw as `cliload` PASS against `load` FAIL.
+                 (b) Core parity: Core's loadtxoutset returns as soon as the
+                 snapshot is loaded and validates the historical chain in the
+                 background — it does not block the RPC caller until a verdict
+                 exists.
+
+                 The verdict is not lost. run_background_validation performs
+                 its own state mutation, flipping cs.assumeutxo_state to
+                 Validated (match) or Invalid (mismatch / connect failure) —
+                 which is what getchainstates reads. A mismatch is still
+                 surfaced ONLY via that state, never as an Error return (Core
+                 async AbortNode model), so the snapshot is never silently
+                 accepted. A caller polling immediately sees validated=false
+                 until it completes, matching Core. *)
+              Assume_utxo.run_background_in_scheduler activation;
               (* Record the activation on the context so getchainstates can
                  read validated / snapshot_blockhash from the snapshot
                  chainstate.  Core: ChainstateManager retains the snapshot

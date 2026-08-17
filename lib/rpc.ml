@@ -9247,8 +9247,28 @@ let handle_loadtxoutset (ctx : rpc_context)
              total_work fields when both are available for a precise comparison.
           *)
           let snapshot_has_more_work =
+            (* Compare against the VALIDATED-BLOCK tip, not [chain.tip].
+               [chain.tip] is the best-work HEADER entry (see the "NOTE on
+               `tip` semantics" at sync.ml:118) — [accept_header] advances it
+               the moment heavier headers arrive over P2P, long before those
+               blocks are validated. Core compares the snapshot base against
+               ActiveTip() == m_chain.Tip(), the active VALIDATED chain
+               (validation.cpp:5786-5789).
+
+               Using the header tip made this guard UNSATISFIABLE in practice:
+               a node that has header-synced to the network tip has
+               chain.tip.total_work >= any snapshot's base work, so
+               loadtxoutset answered "Work does not exceed active chainstate"
+               on every datadir and the assumeutxo path was 100% dead. That is
+               what the nightly boot-smoke gate had been reporting as a `load`
+               FAIL since at least 2026-08-11 (silently — the wrapper only
+               alerted on the pass->fail transition).
+
+               [Sync.block_tip] is the same helper handle_getbestblockhash
+               already uses (rpc.ml:806) and resolves through the authoritative
+               chain_tip pointer. *)
             match Sync.get_header ctx.chain metadata.base_blockhash,
-                  ctx.chain.Sync.tip with
+                  Sync.block_tip ctx.chain with
             | Some snap_hdr, Some active_tip ->
               (* Precise: compare cumulative PoW via 32-byte LE big-integer. *)
               Consensus.work_compare snap_hdr.Sync.total_work

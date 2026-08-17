@@ -983,6 +983,43 @@ module UtxoCache = struct
   (** Flush all changes to parent view.
       Fresh/Dirty entries are written, Erased entries are deleted.
       Returns the number of entries flushed. *)
+  (** Synchronous flush. Every byte of work here is synchronous — the batch
+      write and the cache clear — so this is the whole operation minus the
+      cooperative [Lwt.pause] yield that [flush] adds for the benefit of
+      long-running CLI batches.
+
+      It exists because callers that are ALREADY inside [Lwt_main.run] (the RPC
+      server) cannot use the Lwt variant: [assume_utxo.ml] wrapped it as
+      [Lwt_main.run (flush cache)], which raises "Nested calls to Lwt_main.run
+      are not allowed" the moment [loadtxoutset] is driven over RPC instead of
+      from the CLI. That is why boot-smoke's `cliload` passed while `load`
+      failed. *)
+  let flush_sync t =
+    let count = Hashtbl.length t.entries in
+    if count = 0 then 0
+    else begin
+      let batch = Storage.ChainDB.batch_create () in
+      Hashtbl.iter (fun key entry ->
+        let key_cs = Cstruct.of_string key in
+        let txid = Cstruct.sub key_cs 0 32 in
+        let vout = Int32.to_int (Cstruct.LE.get_uint32 key_cs 32) in
+        match entry with
+        | Fresh coin | Dirty coin ->
+          let data = DbView.serialize_coin coin in
+          Storage.ChainDB.batch_store_utxo batch txid vout data
+        | Erased ->
+          Storage.ChainDB.batch_delete_utxo batch txid vout
+      ) t.entries;
+      Storage.ChainDB.batch_write (DbView.db t.parent) batch;
+      Hashtbl.clear t.entries;
+      t.memory_usage <- 0;
+      t.stats.fresh_count <- 0;
+      t.stats.dirty_count <- 0;
+      t.stats.erased_count <- 0;
+      Logs.debug (fun m -> m "Flushed %d UTXO cache entries to disk" count);
+      count
+    end
+
   let flush t =
     let open Lwt.Syntax in
     let count = Hashtbl.length t.entries in

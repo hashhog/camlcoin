@@ -1224,7 +1224,7 @@ let load_snapshot ~(network : Consensus.network_config)
           match res with
           | Error msg -> Error msg
           | Ok _ ->
-            let _ = Lwt_main.run (Utxo.UtxoCache.flush utxo_cache) in
+            let _ = Utxo.UtxoCache.flush_sync utxo_cache in
             Storage.ChainDB.set_chain_tip db
               metadata.base_blockhash params.height;
             Ok {
@@ -1367,7 +1367,7 @@ let compute_utxo_hash_from_cache (cache : Utxo.UtxoCache.t)
     (db : Storage.ChainDB.t) : Types.hash256 =
   (* For computing the hash, we need to iterate all UTXOs.
      We flush the cache first to ensure consistency, then iterate the DB. *)
-  let _ = Lwt_main.run (Utxo.UtxoCache.flush cache) in
+  let _ = Utxo.UtxoCache.flush_sync cache in
   compute_utxo_hash_from_db db
 
 (** Compute the MuHash3072-based [txoutset_hash] over the UTXO set.
@@ -1403,7 +1403,7 @@ let compute_utxo_muhash_from_db (db : Storage.ChainDB.t) : Types.hash256 =
     set is the one we accumulate. *)
 let compute_utxo_muhash_from_cache (cache : Utxo.UtxoCache.t)
     (db : Storage.ChainDB.t) : Types.hash256 =
-  let _ = Lwt_main.run (Utxo.UtxoCache.flush cache) in
+  let _ = Utxo.UtxoCache.flush_sync cache in
   compute_utxo_muhash_from_db db
 
 (** [verify_loaded_utxo_hash ~db ~expected] is the strict snapshot

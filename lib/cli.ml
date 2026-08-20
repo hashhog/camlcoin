@@ -2526,6 +2526,101 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
             last_block_height_observed := block_height;
             Peer_manager.notify_tip_updated peer_manager
           end;
+          (* AT-TIP GAP FILL. Without this the node can never recover from
+             falling behind at tip, and on 2026-08-17 it did not: mainnet
+             camlcoin sat at block 962909 with headers at 963307 for 2.9 days
+             (246,898 s by its own "Stale tip check" line) and never closed the
+             gap on its own.
+
+             Why nothing else covers it. [Sync.request_blocks] -- the only code
+             that fetches a block by height rather than by announcement -- is
+             reachable only from inside [Sync.run_ibd], and run_ibd EXITS at tip
+             and sets [ibd_state_ref := None]. The at-tip paths are all
+             ANNOUNCEMENT-driven (inv / cmpctblock), so they fetch the block a
+             peer just told us about; that block's parent is inside the gap, so
+             it cannot connect and the tip never moves. The existing stale-tip
+             recovery in peer_manager.ml notices the staleness correctly but
+             responds with getheaders (we already HAVE every header -- that is
+             the whole point) and by rotating peers (the peers were never the
+             problem), so it can run forever without fetching one block.
+
+             Core has no such hole: FindNextBlocksToDownload runs from
+             SendMessages on every peer regardless of IBD state, so being behind
+             the best header is itself sufficient reason to request blocks. This
+             restores that property with the same trigger -- header tip ahead of
+             the validated block tip -- on the 30 s status tick.
+
+             Bounded to 16 blocks per tick, matching Core's
+             MAX_BLOCKS_IN_TRANSIT_PER_PEER, so a large gap is closed steadily
+             rather than in one oversized getdata. *)
+          let header_tip_height =
+            match chain.tip with Some t -> t.Sync.height | None -> 0 in
+          if !ibd_state_ref = None && header_tip_height > block_height then begin
+            match Peer_manager.get_ready_peers peer_manager with
+            | [] -> ()
+            | peer :: _ ->
+              (* Collect the gap blocks nearest our validated tip by walking the
+                 HEADER chain back from the header tip.
+
+                 It has to be a walk. The height->hash index cannot answer this:
+                 [set_height_hash] is deliberately written only for the ACTIVE
+                 VALIDATED chain (sync.ml:1508 -- writing it on header accept
+                 let a lower-work side branch overwrite main-chain entries and
+                 corrupted BIP68/BIP113/BIP34, which all read that index). So
+                 every height inside the gap returns None, and asking it here
+                 would make this whole recovery a silent no-op.
+
+                 The walk is BOUNDED at [max_walk]. An unbounded ancestry walk
+                 on a periodic tick is how the lunarblock fork-floor fix hung
+                 that node twice on 2026-08-19 -- there the only termination
+                 guard was a cap that was math.huge on an archive node. A gap
+                 deeper than max_walk simply closes over several ticks. *)
+              let want_lo = block_height + 1 in
+              let want_hi = block_height + 16 in
+              let max_walk = 4096 in
+              let acc = ref [] in
+              let steps = ref 0 in
+              let cur = ref chain.tip in
+              let stop = ref false in
+              while not !stop do
+                match !cur with
+                | None -> stop := true
+                | Some (e : Sync.header_entry) ->
+                  if !steps >= max_walk || e.Sync.height < want_lo then
+                    stop := true
+                  else begin
+                    if e.Sync.height <= want_hi then
+                      acc := P2p.{ inv_type = InvWitnessBlock; hash = e.Sync.hash }
+                             :: !acc;
+                    incr steps;
+                    cur := Hashtbl.find_opt chain.Sync.headers
+                             (Cstruct.to_string e.Sync.header.Types.prev_block)
+                  end
+              done;
+              let reqs = !acc in
+              if reqs <> [] then begin
+                Logs.info (fun m ->
+                  m "At-tip gap fill: block tip %d behind header tip %d; \
+                     requesting %d block(s) from peer %d (walked %d headers)"
+                    block_height header_tip_height (List.length reqs)
+                    peer.Peer.id !steps);
+                Lwt.async (fun () ->
+                  Lwt.catch
+                    (fun () -> Peer.send_message peer (P2p.GetdataMsg reqs))
+                    (fun _exn -> Lwt.return_unit))
+              end else
+                (* Behind, but the walk yielded nothing to ask for. Say so
+                   LOUDLY rather than tick silently: a recovery path that
+                   quietly does nothing is indistinguishable from one that is
+                   not needed, which is precisely how this wedge went unnoticed
+                   for 2.9 days. Most likely cause is the header entry for a
+                   gap height not being resident in [chain.headers]. *)
+                Logs.warn (fun m ->
+                  m "At-tip gap fill FOUND NOTHING TO REQUEST: block tip %d, \
+                     header tip %d, walked %d header(s) (max %d) — gap is real \
+                     but no header entry was resolvable in that range"
+                    block_height header_tip_height !steps max_walk)
+          end;
           let prev_height = Peer_manager.get_height peer_manager in
           if Int32.of_int block_height > prev_height then
             Peer_manager.set_height peer_manager (Int32.of_int block_height);

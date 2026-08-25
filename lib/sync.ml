@@ -4977,25 +4977,12 @@ let connect_block_into_batch
            Some (decode_utxo_for_lookup outpoint.Types.txid
                    outpoint.Types.vout data))
     in
-    (* Same overlay-aware reader, but returns a [Utxo.utxo_entry] for the
-       undo-data builder.  Both call sites must share the overlay so the
-       undo data we write reflects what the connect step actually spent
-       (rather than the stale pre-reorg disk image). *)
-    let lookup_utxo_entry (prev : Types.outpoint)
-        : (Types.outpoint * Utxo.utxo_entry) option =
-      let vout = Int32.to_int prev.Types.vout in
-      let decode_entry data : Utxo.utxo_entry =
-        let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
-        Utxo.deserialize_utxo_entry r
-      in
-      match reorg_view_get view prev.Types.txid vout with
-      | View_absent -> None
-      | View_present data -> Some (prev, decode_entry data)
-      | View_unknown ->
-        (match Storage.ChainDB.get_utxo state.db prev.Types.txid vout with
-         | None -> None
-         | Some data -> Some (prev, decode_entry data))
-    in
+    (* [lookup_utxo_entry] used to live here: an overlay-then-disk reader
+       for the undo-data builder, whose own comment said the undo "reflects
+       what the connect step actually spent". It could not deliver that —
+       neither the overlay nor disk holds THIS block's own outputs — so the
+       undo builder now takes validation's [spent_utxo_list] directly (see
+       the AB_ok arm below) and this reader has no remaining callers. *)
     let skip_scripts = is_assume_valid state entry.hash height in
     let validation_flags =
       if skip_scripts then 0
@@ -5026,22 +5013,67 @@ let connect_block_into_batch
        Error (Printf.sprintf
          "Block validation failed at height %d during reorg: %s"
          height (Validation.block_error_to_string e))
-     | Validation.AB_ok (_fees, _txid_arr, _spent_utxos) ->
+     | Validation.AB_ok (_fees, _txid_arr, spent_utxo_list) ->
        (* Stage block body if not already on disk. The disk write is
           idempotent — the active path that brought us here always
           stored the body when it was first received, but a side-branch
           accepted via [register_side_branch_header] may not have. *)
        if not (Storage.ChainDB.has_block state.db entry.hash) then
          Storage.ChainDB.batch_store_block batch entry.hash block;
-       (* Build undo data from overlay-aware lookups. *)
-       let tx_undos = List.filter_map (fun (tx_idx, tx) ->
-         if tx_idx > 0 then begin
-           let spent = List.filter_map (fun inp ->
-             lookup_utxo_entry inp.Types.previous_output
-           ) tx.Types.inputs in
-           Some Utxo.{ spent_outputs = spent }
-         end else None
-       ) (List.mapi (fun i tx -> (i, tx)) block.transactions) in
+       (* Build undo data from validation's [spent_utxo_list], exactly as
+          the IBD connect path does (see the identical block at :3683).
+
+          It previously re-derived the undo here via [lookup_utxo_entry],
+          which consults the reorg overlay and then disk — NEITHER of which
+          holds THIS block's own outputs at this point. Bitcoin permits a tx
+          to spend an output created by an EARLIER tx in the SAME block (an
+          intra-block chain; real blocks are full of them — mainnet 963853
+          has 6,084). For such an input the lookup returned [None] and
+          [List.filter_map] SILENTLY DROPPED it, so the tx's [spent_outputs]
+          came out SHORTER than its input list.
+
+          That is fatal on the way back out: [disconnect] checks
+          [n_undos <> n_inputs] and aborts with "DisconnectBlock: tx and undo
+          inconsistent" (:4854). It also under-fed [spent_entries] below,
+          which drives the BIP-157 filter index and the coin-stats index.
+
+          [spent_utxo_list] is already intra-block correct — validation
+          resolves through its per-block [local_utxos] overlay — and is
+          returned in block order ([List.rev !spent_utxos],
+          validation.ml:2446,2698), so the same cursor walk the IBD path
+          uses regroups it per transaction. *)
+       let spent_by_tx : (int, (Types.outpoint * Utxo.utxo_entry) list) Hashtbl.t =
+         Hashtbl.create 16 in
+       let tx_input_counts = Array.of_list (List.mapi (fun i tx ->
+         if i = 0 then 0  (* coinbase *)
+         else List.length tx.Types.inputs
+       ) block.transactions) in
+       let cur_tx = ref 1 in  (* start at tx 1, skip coinbase *)
+       let cur_inp = ref 0 in
+       List.iter (fun (outpoint, (utxo : Validation.utxo)) ->
+         while !cur_tx < Array.length tx_input_counts &&
+               !cur_inp >= tx_input_counts.(!cur_tx) do
+           cur_tx := !cur_tx + 1;
+           cur_inp := 0
+         done;
+         let entry = Utxo.{
+           value = utxo.Validation.value;
+           script_pubkey = utxo.Validation.script_pubkey;
+           height = utxo.Validation.height;
+           is_coinbase = utxo.Validation.is_coinbase;
+         } in
+         let existing = match Hashtbl.find_opt spent_by_tx !cur_tx with
+           | Some l -> l | None -> [] in
+         Hashtbl.replace spent_by_tx !cur_tx ((outpoint, entry) :: existing);
+         cur_inp := !cur_inp + 1
+       ) spent_utxo_list;
+       let n_txs = List.length block.transactions in
+       let tx_undos = List.init (max 0 (n_txs - 1)) (fun i ->
+         let tx_idx = i + 1 in
+         let spent = match Hashtbl.find_opt spent_by_tx tx_idx with
+           | Some l -> List.rev l | None -> [] in
+         Utxo.{ spent_outputs = spent }
+       ) in
        let undo : Utxo.undo_data = { height; tx_undos } in
        let uw = Serialize.writer_create () in
        Utxo.serialize_undo_data uw undo;

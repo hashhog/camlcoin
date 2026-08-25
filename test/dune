@@ -14,3 +14,19 @@
 (executable
  (name test_deep_reorg_over_cap)
  (libraries camlcoin))
+
+; Standalone LIVE proof that the reorg CONNECT path writes undo data that
+; covers INTRA-BLOCK transaction chains (a tx spending an output created by an
+; earlier tx in the SAME block). The reorg path used to rebuild undo from an
+; overlay-then-disk reader, which cannot see the connecting block's own
+; outputs, so List.filter_map silently dropped those prevouts and the undo
+; came out SHORTER than the tx's input list -- which makes any later
+; disconnect abort with "DisconnectBlock: tx and undo inconsistent".
+; Ships with a CONTROL scenario (same block shape, txB spending a different
+; on-disk coin) that must pass both pre- and post-fix.
+; Not part of the default test run (it mines ~130 blocks across three
+; branches, twice); invoke explicitly:
+;   dune exec test/test_reorg_intrablock_undo.exe
+(executable
+ (name test_reorg_intrablock_undo)
+ (libraries camlcoin))

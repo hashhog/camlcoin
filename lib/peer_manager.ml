@@ -1856,14 +1856,21 @@ let broadcast (pm : t) (payload : P2p.message_payload) : unit Lwt.t =
       (fun _exn -> Lwt.return_unit)
   ) ready
 
-(* Send a message to a specific peer *)
+(* Send a message to a specific peer. Best-effort: failures are LOGGED but
+   not reported (the unit return means callers structurally cannot check —
+   request-tracking callers must handle their own sends, #74). *)
 let send_to_peer (pm : t) (peer_id : int) (payload : P2p.message_payload) : unit Lwt.t =
   match List.find_opt (fun p -> p.Peer.id = peer_id) pm.peers with
-  | None -> Lwt.return_unit
+  | None ->
+    Printf.eprintf "[peerman] send_to_peer: unknown peer %d — message dropped\n%!" peer_id;
+    Lwt.return_unit
   | Some peer ->
     Lwt.catch
       (fun () -> Peer.send_message peer payload)
-      (fun _exn -> Lwt.return_unit)
+      (fun exn ->
+        Printf.eprintf "[peerman] send_to_peer: send to peer %d failed: %s\n%!"
+          peer_id (Printexc.to_string exn);
+        Lwt.return_unit)
 
 (* Announce a new block to all connected peers, respecting send_headers (BIP-130).
    Peers that opted in via sendheaders receive the header directly;
@@ -2327,11 +2334,22 @@ let check_stale_peers (pm : t) : (int * string) list Lwt.t =
               | None -> []);
             hash_stop = Types.zero_hash;
           } in
-          let* () = Lwt.catch
-            (fun () -> Peer.send_message peer getheaders)
-            (fun _exn -> Lwt.return_unit) in
-          mark_getheaders_sent pm peer.Peer.id;
-          Lwt.return_unit
+          (* #74 (2026-08-27): mark the challenge as sent ONLY when the
+             send actually succeeded. The old code marked it after a
+             SWALLOWED exception, consuming the ChainWaitingForHeaders
+             latch for a getheaders that never left the process — which
+             disarmed the Core ConsiderEviction stale-tip challenge for
+             that peer forever, with zero log. *)
+          Lwt.catch
+            (fun () ->
+               let* () = Peer.send_message peer getheaders in
+               mark_getheaders_sent pm peer.Peer.id;
+               Lwt.return_unit)
+            (fun exn ->
+               Printf.eprintf
+                 "[peerman] stale-tip challenge getheaders to peer %d DROPPED: %s — challenge stays armed\n%!"
+                 peer.Peer.id (Printexc.to_string exn);
+               Lwt.return_unit)
         end else
           Lwt.return_unit
     end

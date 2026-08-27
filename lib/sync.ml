@@ -7438,9 +7438,17 @@ let handle_cmpctblock (ibd : ibd_state) (cb : P2p.compact_block)
       (* Send getblocktxn request with differential encoding *)
       let getblocktxn_req = P2p.make_getblocktxn_request header_hash indices in
       let msg = P2p.make_getblocktxn_msg getblocktxn_req in
+      (* #74: if the getblocktxn never leaves the process, free the
+         one-per-peer pending slot instead of stranding it (it blocked
+         any retry for this hash until the sweeper). *)
       let* () = Lwt.catch
         (fun () -> Peer.send_message peer msg)
-        (fun _exn -> Lwt.return_unit)
+        (fun exn ->
+          Hashtbl.remove pending_compact_blocks hash_key;
+          Printf.eprintf
+            "[sync] getblocktxn to peer %d DROPPED (%s) — pending compact-block slot freed\n%!"
+            peer.Peer.id (Printexc.to_string exn);
+          Lwt.return_unit)
       in
       Lwt.return (`NeedTx indices)
     | P2p.ReconstructFailed msg ->

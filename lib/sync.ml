@@ -729,7 +729,8 @@ let compute_expected_bits ?parent_entry ?ancestry_incomplete
    Bug 6 fix: calls permitted_difficulty_transition.
    Bug 7 fix: uses redownload_buffer_size before releasing to acceptance.
    Bug 10 fix: implements process_all_remaining flag.
-   Bug 9 fix: build_redownload_locator now uses chain_start_hash (see below). *)
+   Bug 9 fix: the REDOWNLOAD locator resumes from the cursor, not genesis
+   (now built by build_presync_locator_full). *)
 let process_redownload_headers ~(ps : peer_header_sync)
     ~(headers : Types.block_header list)
     ~(chain_state : chain_state)
@@ -921,51 +922,6 @@ let get_header_sync_phase (ps : peer_header_sync) : [`Presync | `Redownload | `S
   | Redownload _ -> `Redownload
   | Synced -> `Synced
 
-(* Build a getheaders locator for REDOWNLOAD phase.
-   Returns a locator starting from the redownload cursor (last accepted hash).
-
-   Bug 9 fix: was always returning the genesis hash, forcing a full re-download
-   from block 0 even when the chain_start was at height 900k.  Core uses
-   m_redownload_buffer_last_hash (initialized to chain_start.GetBlockHash()),
-   which starts at chain_start and advances as headers are accepted. *)
-let build_redownload_locator (ps : peer_header_sync) (chain_state : chain_state)
-    : Types.hash256 list =
-  match ps.state with
-  | Redownload rd ->
-    (* Start from the last accepted redownloaded hash, with chain_start as fallback. *)
-    [rd.redownload_last_hash]
-    @ (* Append chain_start locator entries as per Core's NextHeadersRequestLocator *)
-    (let chain_start_entry_opt = Hashtbl.find_opt chain_state.headers
-         (Cstruct.to_string ps.chain_start_hash) in
-     match chain_start_entry_opt with
-     | None -> [ps.chain_start_hash]
-     | Some _ -> [ps.chain_start_hash])
-  | _ ->
-    (* Fallback: genesis (should not be reached in normal operation) *)
-    [Crypto.compute_block_hash chain_state.network.genesis_header]
-
-(* Build a getheaders locator for PRESYNC continuation.
-   Returns a locator with just the last known hash.
-
-   NOTE: this is the legacy 1-entry-only locator kept for the existing tests.
-   The live sync loop uses [build_presync_locator_full] below, which is the
-   Core-parity version that prepends the per-phase continue-from hash and
-   then appends the exponential-backoff locator from [chain_start] back to
-   genesis (mirrors Core headerssync.cpp:296 NextHeadersRequestLocator). *)
-let build_presync_locator (ps : peer_header_sync) : Types.hash256 list =
-  match ps.state with
-  | Presync { last_hash; _ } -> [last_hash]
-  | Redownload { target_hash; _ } -> [target_hash]
-  | Synced -> []
-
-(* Forward-declaration site: [build_presync_locator_full] needs
-   [build_locator_from_height] which is defined below alongside [build_locator]
-   to keep all locator code clustered.  See [build_presync_locator_full] below
-   for the full-locator implementation that is wired into the live sync loop.
-*)
-
-(* Should we request more headers from this peer?
-   Checks rate limiting and whether sync is complete. *)
 let should_request_more_headers (ps : peer_header_sync) : bool =
   match ps.state with
   | Synced -> false

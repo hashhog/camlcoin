@@ -763,7 +763,7 @@ let test_get_header_sync_phase () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
-(* Test build_presync_locator *)
+(* Test the PRESYNC arm of build_presync_locator_full *)
 let test_build_presync_locator () =
   cleanup_test_db ();
   let db = Storage.ChainDB.create test_db_path in
@@ -772,7 +772,7 @@ let test_build_presync_locator () =
 
   let ps = Sync.create_presync_state ~peer_id:1 ~chain_start:genesis_entry in
 
-  let locator = Sync.build_presync_locator ps in
+  let locator = Sync.build_presync_locator_full ps chain in
   Alcotest.(check int) "locator has 1 hash" 1 (List.length locator);
 
   (* The locator should contain the genesis hash (last_hash) *)
@@ -783,7 +783,7 @@ let test_build_presync_locator () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
-(* Test build_redownload_locator *)
+(* Test the REDOWNLOAD arm of build_presync_locator_full *)
 let test_build_redownload_locator () =
   cleanup_test_db ();
   let db = Storage.ChainDB.create test_db_path in
@@ -803,7 +803,7 @@ let test_build_redownload_locator () =
     buffer = Queue.create ();
   };
 
-  let locator = Sync.build_redownload_locator ps chain in
+  let locator = Sync.build_presync_locator_full ps chain in
   Alcotest.(check bool) "locator non-empty" true (List.length locator >= 1);
 
   (* The locator should start from the redownload cursor (genesis in this case) *)
@@ -1041,7 +1041,7 @@ let test_w88_redownload_locator_from_chain_start () =
     headers_received = 0;
     buffer = Queue.create ();
   };
-  let locator = Sync.build_redownload_locator ps chain in
+  let locator = Sync.build_presync_locator_full ps chain in
   (* Must start from the redownload cursor (genesis here), NOT from genesis directly
      via Crypto.compute_block_hash — they should be equal, but the key test is that
      it's not hardcoded to genesis when chain_start is elsewhere. *)

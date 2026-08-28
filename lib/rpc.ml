@@ -863,16 +863,37 @@ let handle_getdifficulty (ctx : rpc_context) : Yojson.Safe.t =
    one entry with status "active" and branchlen 0 (same as beamchain).
    Bitcoin Core: src/rpc/blockchain.cpp::getchaintips *)
 let handle_getchaintips (ctx : rpc_context) : Yojson.Safe.t =
-  match ctx.chain.tip with
-  | Some t ->
-    `List [`Assoc [
-      ("height",    `Int t.height);
-      ("hash",      `String (Types.hash256_to_hex_display t.hash));
-      ("branchlen", `Int 0);
-      ("status",    `String "active");
-    ]]
-  | None ->
-    `List []
+  (* The ACTIVE tip is the VALIDATED tip ([block_tip], advanced only by an
+     actual block connect/reorg), NOT [chain.tip] — which [accept_header]
+     re-points to the best-WORK HEADER chain the moment heavier competing
+     headers arrive over P2P, long before those blocks are validated
+     (#43 header-tip-as-active; Core keeps CChain separate from the
+     best-header pointer). *)
+  match Sync.block_tip ctx.chain with
+  | None -> `List []
+  | Some validated ->
+    let active =
+      `Assoc [
+        ("height",    `Int validated.height);
+        ("hash",      `String (Types.hash256_to_hex_display validated.hash));
+        ("branchlen", `Int 0);
+        ("status",    `String "active");
+      ]
+    in
+    (* If the best-header tip is ahead of the validated tip (headers-first
+       sync / bodies pending), report it as a distinct "headers-only" tip. *)
+    let extra =
+      match ctx.chain.tip with
+      | Some h when h.height > validated.height ->
+        [`Assoc [
+          ("height",    `Int h.height);
+          ("hash",      `String (Types.hash256_to_hex_display h.hash));
+          ("branchlen", `Int (h.height - validated.height));
+          ("status",    `String "headers-only");
+        ]]
+      | _ -> []
+    in
+    `List (active :: extra)
 
 (* getchainstates — return information about this node's chainstates.
 

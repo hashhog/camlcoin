@@ -3285,6 +3285,59 @@ let test_reject_token_passthrough () =
     "txn-mempool-conflict: spends same input as abcd";
   ]
 
+(* #43 camlcoin slice: getchaintips must report the VALIDATED tip (block_tip)
+   as "active", not chain.tip (the best-WORK HEADER tip that accept_header
+   re-points the moment heavier competing headers arrive over P2P).  We set
+   chain.tip to a synthetic header AHEAD of the validated block_tip and
+   assert the active tip is the validated one, with a separate headers-only
+   entry.  FAILS AT PARENT (which reported chain.tip as active). *)
+let test_getchaintips_active_is_validated_tip () =
+  let (ctx, _db, _, _, _) = create_test_context () in
+  let validated =
+    match Sync.block_tip ctx.chain with
+    | Some t -> t
+    | None -> Alcotest.fail "expected a validated block_tip"
+  in
+  (* Fabricate a header entry 3 blocks above the validated tip and install it
+     as chain.tip (the header-first / bodies-pending state). *)
+  let hdr : Types.block_header = {
+    version = 0x20000000l;
+    prev_block = validated.hash;
+    merkle_root = Types.hash256_of_hex
+      "2222222222222222222222222222222222222222222222222222222222222222";
+    timestamp = 0x30303030l;
+    bits = 0x207fffffl;
+    nonce = 0x01020304l;
+  } in
+  let hhash = Crypto.compute_block_hash hdr in
+  let header_tip_height = validated.height + 3 in
+  ctx.chain.tip <- Some { header = hdr; hash = hhash;
+                          height = header_tip_height;
+                          total_work = validated.total_work };
+  let result = Rpc.handle_getchaintips ctx in
+  match result with
+  | `List tips ->
+    let active =
+      List.find_opt (fun t ->
+        match t with
+        | `Assoc kv -> (try List.assoc "status" kv = `String "active" with Not_found -> false)
+        | _ -> false) tips
+    in
+    (match active with
+     | Some (`Assoc kv) ->
+       let h = match List.assoc "height" kv with `Int i -> i | _ -> -1 in
+       Alcotest.(check int) "active tip is the VALIDATED tip, not the header tip"
+         validated.height h
+     | _ -> Alcotest.fail "no active tip in getchaintips result");
+    let has_headers_only =
+      List.exists (fun t ->
+        match t with
+        | `Assoc kv -> (try List.assoc "status" kv = `String "headers-only" with Not_found -> false)
+        | _ -> false) tips
+    in
+    Alcotest.(check bool) "header tip ahead is reported headers-only" true has_headers_only
+  | _ -> Alcotest.fail "getchaintips did not return a list"
+
 let () =
   cleanup_test_db ();
   let open Alcotest in
@@ -3300,6 +3353,10 @@ let () =
         test_reject_token_missing_inputs_path_dependent;
       test_case "already-canonical tokens pass through" `Quick
         test_reject_token_passthrough;
+    ];
+    "getchaintips", [
+      test_case "active tip is the validated tip (#43)" `Quick
+        test_getchaintips_active_is_validated_tip;
     ];
     "sendrawtransaction", [
       test_case "valid tx accepted" `Quick test_sendrawtransaction_valid;

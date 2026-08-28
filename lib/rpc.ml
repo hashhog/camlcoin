@@ -6691,11 +6691,22 @@ let handle_createrawtransaction (ctx : rpc_context)
     if Int64.compare locktime 0L < 0 || Int64.compare locktime 0xFFFFFFFFL > 0 then
       fail rpc_invalid_parameter "Invalid parameter, locktime out of range";
     let locktime_i32 = Int64.to_int32 locktime in
-    (* Core: rbf is std::optional<bool>; unset → value_or(true). *)
-    let replaceable =
+    (* Core: rbf is std::optional<bool>; unset → value_or(true).
+
+       [replaceable_explicit] records whether the caller ACTUALLY SUPPLIED the
+       argument, which Core keeps distinct from its value: the RPC builds a
+       [std::optional<bool> rbf] that stays [nullopt] when the param
+       [isNull()], and the two consumers ask DIFFERENT questions of it —
+       [AddInputs] uses [rbf.value_or(true)] (absent behaves as true when
+       CHOOSING the default sequence) while the contradiction check below uses
+       [rbf.has_value() && rbf.value()] (absent is NOT a request, so it can
+       contradict nothing).  Our `Null covers both "arg omitted" (the 2-/3-arg
+       match arms above supply `Null) and an explicit JSON null, which is
+       exactly right: Core's isNull() collapses those two the same way. *)
+    let replaceable, replaceable_explicit =
       match replaceable_param with
-      | `Null -> true
-      | `Bool b -> b
+      | `Null -> true, false
+      | `Bool b -> b, true
       | _ -> fail rpc_type_error "Replaceable must be a boolean"
     in
     let default_sequence =
@@ -6881,6 +6892,62 @@ let handle_createrawtransaction (ctx : rpc_context)
         end)
         output_fields
     in
+    (* --- replaceable-vs-sequence contradiction (the LAST check) ---------
+       Core, rawtransaction_util.cpp ConstructTransaction:
+
+         if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
+             !SignalsOptInRBF(CTransaction(rawTx)))
+             throw JSONRPCError(RPC_INVALID_PARAMETER,
+               "Invalid parameter combination: Sequence number(s) contradict "
+               "replaceable option");
+
+       WHY THIS MATTERS.  Without it a caller who explicitly asks for
+       replaceable=true AND pins a final sequence on every input gets back a
+       perfectly well-formed transaction that CANNOT EVER BE FEE-BUMPED, and
+       gets it as a SUCCESS.  The node silently resolves the contradiction in
+       favour of the sequence (explicit sequence wins over default_sequence,
+       above) and says nothing.  The caller only discovers the RBF request was
+       dropped when the transaction is stuck at a low feerate and the bump is
+       refused by the network.  Core refuses to guess which half of the
+       contradiction the caller meant; nine of the ten nodes in this repo
+       accepted it silently.
+
+       WHY IT LIVES HERE AND NOT EARLIER.  Core runs it after BOTH AddInputs
+       and AddOutputs, so an output-parsing error (bad address -5, duplicate
+       address -8, bad amount -3, duplicate data key -8) still WINS over this
+       one.  Hoisting it up next to the sequence parse would silently reorder
+       those error codes, so it is placed here, immediately before the record
+       is assembled, to match.
+
+       WHY IT DOES NOT FIRE ON AN ABSENT ARGUMENT.  See replaceable_explicit
+       above: absent defaults to true for CHOOSING the sequence but is not a
+       request, so `createrawtransaction [{...,"sequence":4294967295}] {...}`
+       with no 4th arg is accepted, exactly as in Core.
+
+       SIGNED/UNSIGNED TRAP.  SignalsOptInRBF (bitcoin-core/src/util/rbf.cpp)
+       is [txin.nSequence <= MAX_BIP125_RBF_SEQUENCE] on a uint32_t, with
+       MAX_BIP125_RBF_SEQUENCE = 0xfffffffd.  Our [sequence] field is an
+       int32, so 0xFFFFFFFF is stored as -1l and 0xFFFFFFFE as -2l — i.e. the
+       precise values that must NOT signal are the ones stored NEGATIVE.  A
+       signed comparison would rate every one of them <= 0xFFFFFFFD, make
+       every transaction look like it opts in, and disable this check entirely
+       while still compiling and still passing any test that only exercises
+       small sequences.  The comparison is therefore done UNSIGNED, by
+       widening to int64 and masking off the sign extension. *)
+    let signals_opt_in_rbf (ins : Types.tx_in list) : bool =
+      List.exists (fun (i : Types.tx_in) ->
+        let useq = Int64.logand (Int64.of_int32 i.Types.sequence) 0xFFFFFFFFL in
+        Int64.compare useq 0xFFFFFFFDL <= 0)
+        ins
+    in
+    (match tx_inputs with
+     | [] -> ()  (* Core's rawTx.vin.size() > 0 guard: no inputs, no conflict. *)
+     | _ :: _ ->
+       if replaceable_explicit && replaceable
+          && not (signals_opt_in_rbf tx_inputs) then
+         fail rpc_invalid_parameter
+           "Invalid parameter combination: Sequence number(s) contradict \
+            replaceable option");
     (* Build the unsigned tx. version 2 = Core's default (TX_MAX_STANDARD).
        No witnesses → serialize_transaction emits the legacy (no marker) form. *)
     let tx =

@@ -216,6 +216,234 @@ let test_control_ordinary_vout_accepted () =
   check_accepted ~what:"vout 7 (ordinary)" ~expected_vout:7l
     (call_create_raw [ input_with_vout 7 ])
 
+
+(* ==========================================================================
+   SECOND DEFECT (same RPC, same file): replaceable=true silently contradicted
+   ==========================================================================
+
+   THE DEFECT
+   ----------
+   createrawtransaction lets the caller say two incompatible things at once:
+
+       createrawtransaction '[{"txid":"..","vout":0,"sequence":4294967295}]' \
+                            '{"data":"deadbeef"}' 0 true
+                                                    ^^^^ "make it replaceable"
+                             ^^^^^^^^^^^^^^^^^^^^ "...and make it final"
+
+   An explicit [sequence] wins over the replaceable-derived default, so the
+   node quietly picked FINAL and returned a perfectly well-formed transaction
+   -- as a SUCCESS -- that CANNOT EVER BE FEE-BUMPED.  The caller's explicit
+   RBF request was dropped on the floor with no error, no warning and no log
+   line.  The failure only surfaces much later, when the transaction is stuck
+   at a low feerate and the fee bump is refused by the network.  Nine of the
+   ten node implementations in this repo accept this contradiction today.
+
+   WHAT BITCOIN CORE DOES
+   ----------------------
+   It refuses to guess.  At the very END of ConstructTransaction
+   (bitcoin-core/src/rpc/rawtransaction_util.cpp), after BOTH AddInputs and
+   AddOutputs have run:
+
+       if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
+           !SignalsOptInRBF(CTransaction(rawTx)))
+           throw JSONRPCError(RPC_INVALID_PARAMETER,
+             "Invalid parameter combination: Sequence number(s) contradict "
+             "replaceable option");
+
+   with (bitcoin-core/src/util/rbf.cpp, MAX_BIP125_RBF_SEQUENCE = 0xfffffffd):
+
+       bool SignalsOptInRBF(const CTransaction &tx) {
+           for (const CTxIn &txin : tx.vin)
+               if (txin.nSequence <= MAX_BIP125_RBF_SEQUENCE) return true;
+           return false;
+       }
+
+   THREE conditions must ALL hold, and each one is a separate way to get this
+   wrong.  The four ACCEPT rows below are therefore not garnish: they are the
+   teeth that stop an over-eager check from breaking ordinary RBF usage.
+
+   THE ABSENT-VS-EXPLICIT ASYMMETRY (row 1 -- easy to get wrong)
+   ------------------------------------------------------------
+   [rbf] is a [std::optional<bool>] that stays [nullopt] when the parameter
+   [isNull()], and Core's two consumers ask DIFFERENT questions of it:
+   AddInputs uses [rbf.value_or(true)], so an ABSENT argument still defaults
+   to true when CHOOSING the sequence; but the check above uses
+   [rbf.has_value() && rbf.value()], so an ABSENT argument can contradict
+   nothing.  Omitting the argument and pinning a final sequence is therefore
+   ACCEPTED, while passing an explicit [true] and the same sequence is
+   REJECTED.  That asymmetry is deliberate, and collapsing the two -- the
+   obvious simplification -- breaks every caller who never passes the 4th arg.
+
+   ONE SIGNALLING INPUT IS ENOUGH (row 6 -- the other easy one)
+   -----------------------------------------------------------
+   SignalsOptInRBF is [return true] on the FIRST signalling input, not "all
+   inputs signal".  BIP 125 spells out why: in a multi-party protocol a single
+   counterparty must not be able to disable replacement by opting out in their
+   own input.  A check written with List.for_all instead of List.exists passes
+   rows 1-5 and 7-8 and fails only here.
+
+   THE SIGNED/UNSIGNED TRAP
+   ------------------------
+   Core compares uint32_t.  Our [sequence] field is an int32, so the exact
+   values that must NOT signal are stored NEGATIVE: 0xFFFFFFFF is -1l and
+   0xFFFFFFFE is -2l.  A signed [<= 0xFFFFFFFDl] comparison rates every one of
+   them as signalling, which makes the check unreachable -- it still compiles,
+   still passes rows 1, 2, 5, 6, 7 and 8, and disables the feature silently.
+   Rows 3 and 4 are the ones that catch it.
+
+   EVERY ROW BELOW WAS VERIFIED AGAINST A LIVE BITCOIN CORE NODE.
+
+     # | rbf arg | inputs                          | expected
+     --+---------+---------------------------------+---------------------
+     1 | ABSENT  | one, sequence 0xFFFFFFFF        | ACCEPT (no explicit rbf)
+     2 | true    | one, sequence 0xFFFFFFFD        | ACCEPT (signals)
+     3 | true    | one, sequence 0xFFFFFFFE        | REJECT -8
+     4 | true    | one, sequence 0xFFFFFFFF        | REJECT -8
+     5 | true    | none at all ([])                | ACCEPT (no inputs)
+     6 | true    | two: 0xFFFFFFFF and 0           | ACCEPT (one signals)
+     7 | false   | one, sequence 0xFFFFFFFF        | ACCEPT (rbf not true)
+     8 | true    | one, NO explicit sequence       | ACCEPT (default signals)
+
+   References:
+     bitcoin-core/src/rpc/rawtransaction_util.cpp  ConstructTransaction (end)
+     bitcoin-core/src/util/rbf.cpp                 SignalsOptInRBF
+     bitcoin-core/src/util/rbf.h                   MAX_BIP125_RBF_SEQUENCE
+     bitcoin-core/src/rpc/protocol.h               RPC_INVALID_PARAMETER = -8
+   ========================================================================== *)
+
+let rbf_error_msg =
+  "Invalid parameter combination: Sequence number(s) contradict replaceable \
+   option"
+
+(* Core's 4-arg form: inputs, outputs, locktime, replaceable. locktime is 0
+   throughout so that the !replaceable default sequence is SEQUENCE_FINAL and
+   the rows differ only in the axis under test. *)
+let call_create_raw_rbf (inputs : Yojson.Safe.t list) (rbf : Yojson.Safe.t) =
+  let ctx, _db = create_test_context () in
+  Rpc.handle_createrawtransaction ctx
+    [ `List inputs; outputs_param; `Int 0; rbf ]
+
+let input_with_sequence (v : int) (seq : int) : Yojson.Safe.t =
+  `Assoc [ ("txid", `String test_txid); ("vout", `Int v);
+           ("sequence", `Int seq) ]
+
+(* Every sequence that actually reached the wire bytes, decoded with the
+   node's own deserializer -- the same "assert on the serialized form, not on
+   the absence of an error" discipline the vout controls above use. *)
+let input_sequences (hex : string) : int32 list =
+  let r = Serialize.reader_of_cstruct (hex_to_cstruct hex) in
+  let tx = Serialize.deserialize_transaction r in
+  List.map (fun (i : Types.tx_in) -> i.Types.sequence) tx.Types.inputs
+
+let check_accepted_sequences ~what ~expected result =
+  match result with
+  | Error (c, m) ->
+    Alcotest.failf "%s: expected success but got error %d %S" what c m
+  | Ok (`String hex) ->
+    Alcotest.(check bool) (what ^ ": non-empty hex") true (String.length hex > 0);
+    Alcotest.(check (list int32)) (what ^ ": sequences in the tx bytes")
+      expected (input_sequences hex)
+  | Ok other ->
+    Alcotest.failf "%s: expected a hex string result, got %s" what
+      (Yojson.Safe.to_string other)
+
+(* ---- ROW 1: ABSENT rbf + final sequence -> ACCEPT ------------------------ *)
+
+(* The asymmetry test. Uses the 2-ARG form, so replaceable_param is genuinely
+   absent rather than explicitly null-or-false. A check that keys off the
+   effective value of replaceable (which still defaults to TRUE here) instead
+   of off has_value() rejects this and breaks every ordinary caller. *)
+let test_rbf_absent_final_sequence_accepted () =
+  let ctx, _db = create_test_context () in
+  check_accepted_sequences ~what:"row 1: rbf ABSENT, sequence 0xFFFFFFFF"
+    ~expected:[ -1l ]
+    (Rpc.handle_createrawtransaction ctx
+       [ `List [ input_with_sequence 0 0xFFFFFFFF ]; outputs_param ])
+
+(* ---- ROW 2: rbf=true + a signalling sequence -> ACCEPT ------------------- *)
+
+(* MAX_BIP125_RBF_SEQUENCE itself: the boundary is <=, not <. Stored as -3l. *)
+let test_rbf_true_max_bip125_sequence_accepted () =
+  check_accepted_sequences ~what:"row 2: rbf=true, sequence 0xFFFFFFFD"
+    ~expected:[ -3l ]
+    (call_create_raw_rbf [ input_with_sequence 0 0xFFFFFFFD ] (`Bool true))
+
+(* ---- ROWS 3 & 4: rbf=true + non-signalling sequences -> REJECT -8 -------- *)
+
+(* One past the boundary. Stored as -2l, so a SIGNED comparison lets this
+   through: this row and row 4 are what catch the int32 sign trap. *)
+let test_rbf_true_sequence_nonfinal_rejected () =
+  check_error ~what:"row 3: rbf=true, sequence 0xFFFFFFFE" ~code:(-8)
+    ~msg:rbf_error_msg
+    (call_create_raw_rbf [ input_with_sequence 0 0xFFFFFFFE ] (`Bool true))
+
+(* SEQUENCE_FINAL, stored as -1l. The headline case: "make it replaceable and
+   also make it final". *)
+let test_rbf_true_sequence_final_rejected () =
+  check_error ~what:"row 4: rbf=true, sequence 0xFFFFFFFF" ~code:(-8)
+    ~msg:rbf_error_msg
+    (call_create_raw_rbf [ input_with_sequence 0 0xFFFFFFFF ] (`Bool true))
+
+(* ---- ROW 5: rbf=true + NO inputs -> ACCEPT ------------------------------- *)
+
+(* Core's [rawTx.vin.size() > 0] guard. An empty input list cannot signal
+   opt-in, so a check that forgot this guard rejects a legitimate
+   outputs-only skeleton (the normal first step of a funded-by-the-wallet
+   build) and would be caught here.
+
+   Asserted on the RAW BYTES rather than through deserialize_transaction: a
+   0-input transaction serializes its input count as 0x00, which BIP-144
+   parsers -- including this node's -- read as the witness MARKER. Decoding it
+   would misparse, so the honest assertion is the prefix itself:
+   "02000000" (version 2, LE) followed by "00" (input count 0). *)
+let test_rbf_true_no_inputs_accepted () =
+  match call_create_raw_rbf [] (`Bool true) with
+  | Error (c, m) ->
+    Alcotest.failf "row 5: rbf=true with no inputs: expected success, got %d %S"
+      c m
+  | Ok (`String hex) ->
+    let hex = String.lowercase_ascii hex in
+    Alcotest.(check bool) "row 5: hex long enough" true (String.length hex >= 10);
+    Alcotest.(check string) "row 5: version 2 + input count 0 in the tx bytes"
+      "0200000000" (String.sub hex 0 10)
+  | Ok other ->
+    Alcotest.failf "row 5: expected a hex string result, got %s"
+      (Yojson.Safe.to_string other)
+
+(* ---- ROW 6: rbf=true + ONE signalling input among two -> ACCEPT ---------- *)
+
+(* BIP 125's multi-party rule: ANY signalling input is enough. Input 0 is
+   final (-1l), input 1 is sequence 0 (0l, deeply signalling). List.for_all
+   instead of List.exists fails here and ONLY here. *)
+let test_rbf_true_one_of_two_signals_accepted () =
+  check_accepted_sequences
+    ~what:"row 6: rbf=true, inputs 0xFFFFFFFF and 0"
+    ~expected:[ -1l; 0l ]
+    (call_create_raw_rbf
+       [ input_with_sequence 0 0xFFFFFFFF; input_with_sequence 1 0 ]
+       (`Bool true))
+
+(* ---- ROW 7: rbf=false + final sequence -> ACCEPT ------------------------- *)
+
+(* rbf.has_value() is true but rbf.value() is false: the caller asked for
+   non-replaceable and got it. Nothing to contradict. *)
+let test_rbf_false_final_sequence_accepted () =
+  check_accepted_sequences ~what:"row 7: rbf=false, sequence 0xFFFFFFFF"
+    ~expected:[ -1l ]
+    (call_create_raw_rbf [ input_with_sequence 0 0xFFFFFFFF ] (`Bool false))
+
+(* ---- ROW 8: rbf=true + no explicit sequence -> ACCEPT -------------------- *)
+
+(* The ordinary, overwhelmingly common RBF call. The default sequence derived
+   from replaceable=true IS MAX_BIP125_RBF_SEQUENCE (-3l), so it signals and
+   the transaction is built. If this row ever fails, the check is firing on
+   the normal path and the RPC is broken for its main use. It also pins that
+   the new check did not perturb default_sequence. *)
+let test_rbf_true_default_sequence_accepted () =
+  check_accepted_sequences ~what:"row 8: rbf=true, no explicit sequence"
+    ~expected:[ -3l ]
+    (call_create_raw_rbf [ input_with_vout 0 ] (`Bool true))
+
 let () =
   Alcotest.run "createrawtransaction vout range"
     [
@@ -245,5 +473,27 @@ let () =
             `Quick test_control_int32_max_accepted;
           Alcotest.test_case "vout 7 accepted, lands in tx bytes" `Quick
             test_control_ordinary_vout_accepted;
+        ] );
+      ( "rbf_sequence_contradiction_REGRESSION",
+        [
+          Alcotest.test_case "row 3: rbf=true + sequence 0xFFFFFFFE -> -8"
+            `Quick test_rbf_true_sequence_nonfinal_rejected;
+          Alcotest.test_case "row 4: rbf=true + sequence 0xFFFFFFFF -> -8"
+            `Quick test_rbf_true_sequence_final_rejected;
+        ] );
+      ( "rbf_CONTROLS_must_still_be_accepted",
+        [
+          Alcotest.test_case "row 1: rbf ABSENT + 0xFFFFFFFF accepted" `Quick
+            test_rbf_absent_final_sequence_accepted;
+          Alcotest.test_case "row 2: rbf=true + 0xFFFFFFFD accepted" `Quick
+            test_rbf_true_max_bip125_sequence_accepted;
+          Alcotest.test_case "row 5: rbf=true + no inputs accepted" `Quick
+            test_rbf_true_no_inputs_accepted;
+          Alcotest.test_case "row 6: rbf=true + one of two signals accepted"
+            `Quick test_rbf_true_one_of_two_signals_accepted;
+          Alcotest.test_case "row 7: rbf=false + 0xFFFFFFFF accepted" `Quick
+            test_rbf_false_final_sequence_accepted;
+          Alcotest.test_case "row 8: rbf=true + default sequence accepted"
+            `Quick test_rbf_true_default_sequence_accepted;
         ] );
     ]

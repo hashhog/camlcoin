@@ -776,6 +776,12 @@ let process_checkblock (j : Yojson.Safe.t) : string =
   (* Seed the in-memory UTXO view: one coin per prevout entry, keyed by
      (DISPLAY-order txid hex, vout). Identical plumbing to process_connecttx. *)
   let tbl : (string * int32, Validation.utxo) Hashtbl.t = Hashtbl.create 1024 in
+  (* height -> median-time-past at that height, from the request's per-prevout
+     "mtp" values.  Without it accept_block falls back to the TIP's median_time
+     for every input, so each coin's time-based BIP-68 lock starts "now" and can
+     never be satisfied — that spuriously refused real mainnet blocks
+     871178 / 902103 / 937170. *)
+  let coin_mtps : (int, int32) Hashtbl.t = Hashtbl.create 64 in
   let prevouts_json =
     match member "prevouts" with
     | `List l -> l
@@ -795,6 +801,19 @@ let process_checkblock (j : Yojson.Safe.t) : string =
       let value = to_int64 (pm "value_sats") in
       let height = to_int (pm "height") in
       let is_coinbase = to_bool (pm "is_coinbase") in
+      (* OPTIONAL per-prevout lock-start MTP (corpus packs).  Core's
+         CalculateSequenceLocks reads
+         GetAncestor(coin_height-1)->GetMedianTimePast().
+
+         Key it at the RAW coin height: camlcoin's callback convention is
+         f h = "MTP of the block BEFORE h" (the node passes
+         Sync.get_mtp_for_height, and compute_median_time_past collects the
+         11 timestamps from h-1 downwards).  check_sequence_locks invokes it
+         as `f utxo_heights.(i)` — the raw coin height — which is therefore
+         already Core-correct; keying at height-1 asks one block too early. *)
+      (match pm "mtp" with
+       | `Null -> ()
+       | v -> Hashtbl.replace coin_mtps height (json_to_u32 v));
       let txid_wire = cstruct_rev (Types.hash256_of_hex txid_hex) in
       let coin : Validation.utxo =
         { txid = txid_wire; vout; value; script_pubkey = spk; height; is_coinbase }
@@ -867,7 +886,13 @@ let process_checkblock (j : Yojson.Safe.t) : string =
   match
     Validation.accept_block ~network:Consensus.mainnet ~block
       ~height:spend_height ~expected_bits ~median_time ~base_lookup ~flags
-      ~skip_scripts ~skip_pow ?bip34_height_hash ()
+      ~skip_scripts ~skip_pow ?bip34_height_hash
+      ?get_mtp_at_height:(if Hashtbl.length coin_mtps = 0 then None
+                          else Some (fun h ->
+                            match Hashtbl.find_opt coin_mtps h with
+                            | Some m -> m
+                            | None -> median_time))
+      ()
   with
   | Validation.AB_ok _ -> {|{"valid":true}|}
   | Validation.AB_err e ->

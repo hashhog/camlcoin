@@ -6734,14 +6734,29 @@ let handle_createrawtransaction (ctx : rpc_context)
           | _ -> fail rpc_invalid_parameter
                    "Invalid parameter, missing txid key"
         in
-        (* vout: Core getInt<int>(); must be >= 0. *)
+        (* vout: Core getInt<int>() -- a 32-BIT int -- so the RANGE check fires
+           BEFORE the sign test and an out-of-int32 value surfaces as
+           univalue's own "JSON integer out of range" at RPC_MISC_ERROR, not a
+           vout-specific error. That ordering is Core's, not the obvious one.
+
+           Without the upper bound, [Int32.of_int n] below WRAPPED: on the live
+           mainnet node vout 2^32 and vout 2^33 both became vout 0, so a
+           request to spend one outpoint silently became a request to spend a
+           DIFFERENT, probably real one -- returned as success.
+           (rawtransaction_util.cpp AddInputs:41-45.) *)
         let vout =
           match List.assoc_opt "vout" fields with
           | Some (`Int n) ->
+            if n < -2147483648 || n > 2147483647 then
+              fail rpc_misc_error "JSON integer out of range";
             if n < 0 then
               fail rpc_invalid_parameter
                 "Invalid parameter, vout cannot be negative";
             Int32.of_int n
+          | Some (`Intlit _) ->
+            (* Yojson parks an integer too large for OCaml's int here; Core's
+               from_chars into a 32-bit int fails on it. *)
+            fail rpc_misc_error "JSON integer out of range" 
           | Some _ -> fail rpc_invalid_parameter
                         "Invalid parameter, missing vout key"
           | None -> fail rpc_invalid_parameter

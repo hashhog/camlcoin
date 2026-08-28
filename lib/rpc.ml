@@ -6773,7 +6773,40 @@ let handle_createrawtransaction (ctx : rpc_context)
           | None -> fail rpc_invalid_parameter
                       "Invalid parameter, missing vout key"
         in
-        (* explicit sequence wins; Core range [0, SEQUENCE_FINAL=0xFFFFFFFF]. *)
+        (* explicit sequence wins; Core range [0, SEQUENCE_FINAL=0xFFFFFFFF].
+
+           Core guards the WHOLE read with a type test and offers no `else`
+           (rawtransaction_util.cpp:57-65):
+
+             const UniValue& sequenceObj = o.find_value("sequence");
+             if (sequenceObj.isNum()) {
+                 int64_t seqNr64 = sequenceObj.getInt<int64_t>();
+                 if (seqNr64 < 0 || seqNr64 > CTxIn::SEQUENCE_FINAL) throw ...;
+                 else nSequence = (uint32_t)seqNr64;
+             }
+
+           So a `sequence` that is PRESENT but NOT a number -- a string, bool,
+           object, array or null -- is IGNORED and [default_sequence] survives.
+           Core ACCEPTS such a call; camlcoin rejected it with -8 "Invalid
+           parameter, sequence number is out of range", a message wrong twice
+           over: nothing was out of range, and the value had no range to be
+           out of.
+
+           The DEFAULT is the point of the row, not the acceptance. With
+           `replaceable` absent, rbf.value_or(true) is TRUE, so the surviving
+           default is MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD) and the built
+           transaction is REPLACEABLE. Falling through to SEQUENCE_FINAL would
+           also "accept", while quietly producing a NON-replaceable
+           transaction -- the other side of the same trap.
+
+           `Float is the one case a dynamically-typed impl cannot see and
+           OCaml can. univalue keeps the RAW TOKEN and getInt<int64_t>
+           converts it with std::from_chars, which stops at the '.' or the 'e'
+           and leaves trailing characters, so the conversion FAILS. Verified
+           against the live Core node (2026-08-28): `sequence: 1.5` AND
+           `sequence: 100.0` are both -1 "JSON integer out of range" -- neither
+           ignored nor accepted. Yojson produces `Float only for a token
+           carrying a fraction or an exponent, which is exactly that set. *)
         let sequence =
           match List.assoc_opt "sequence" fields with
           | Some (`Int n) ->
@@ -6788,8 +6821,11 @@ let handle_createrawtransaction (ctx : rpc_context)
                Int64.to_int32 v
              | _ -> fail rpc_invalid_parameter
                       "Invalid parameter, sequence number is out of range")
-          | Some _ -> fail rpc_invalid_parameter
-                        "Invalid parameter, sequence number is out of range"
+          | Some (`Float _) ->
+            (* isNum() is TRUE, but the integral conversion of the raw token
+               fails -- Core's own -1, not the sequence-specific -8. *)
+            fail rpc_misc_error "JSON integer out of range"
+          | Some _ -> default_sequence  (* non-numeric: ignored, default stands *)
           | None -> default_sequence
         in
         { Types.previous_output = { txid; vout };

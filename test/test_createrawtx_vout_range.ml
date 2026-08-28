@@ -444,6 +444,91 @@ let test_rbf_true_default_sequence_accepted () =
     ~expected:[ -3l ]
     (call_create_raw_rbf [ input_with_vout 0 ] (`Bool true))
 
+(* ==========================================================================
+   THIRD DEFECT (same RPC, same handler): a PRESENT but NON-NUMERIC
+   [sequence] must be IGNORED, not rejected.
+   ==========================================================================
+
+   Core guards the WHOLE read with a type test and offers no [else]
+   (bitcoin-core/src/rpc/rawtransaction_util.cpp:57-65):
+
+       const UniValue& sequenceObj = o.find_value("sequence");
+       if (sequenceObj.isNum()) {
+           int64_t seqNr64 = sequenceObj.getInt<int64_t>();
+           if (seqNr64 < 0 || seqNr64 > CTxIn::SEQUENCE_FINAL) {
+               throw JSONRPCError(RPC_INVALID_PARAMETER,
+                   "Invalid parameter, sequence number is out of range");
+           } else { nSequence = (uint32_t)seqNr64; }
+       }
+
+   A string, bool, object, array or null never enters the branch, so the
+   default computed a few lines above simply survives and Core ACCEPTS the
+   call.  camlcoin answered -8 "Invalid parameter, sequence number is out of
+   range" -- wrong twice over: nothing was out of range, and the value had no
+   range to be out of.
+
+   THE ASSERTION IS ON THE EMITTED SEQUENCE, NOT ON MERE ACCEPTANCE.  This is
+   a TWO-SIDED trap.  With [replaceable] absent, rbf.value_or(true) is TRUE,
+   so the surviving default is MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD = -3l as a
+   signed int32) and the transaction is REPLACEABLE.  An implementation that
+   fell through to SEQUENCE_FINAL (-1l) would also "accept" -- while quietly
+   handing back a NON-replaceable transaction.  rustoshi originally did
+   exactly that, so "the call succeeded" is not evidence of anything.
+
+   THE FLOAT ROWS are the case a dynamically-typed implementation cannot
+   express and OCaml can.  univalue keeps the RAW TOKEN and converts it with
+   std::from_chars, which stops at the '.' or the 'e' and leaves trailing
+   characters, so the conversion FAILS.  Verified against the live Core node
+   (2026-08-28): [sequence: 1.5] AND [sequence: 100.0] are both
+   -1 "JSON integer out of range" -- neither ignored nor accepted.  Yojson
+   produces [`Float] only for a token carrying a fraction or an exponent,
+   which is exactly that set.
+
+   Oracle rows captured from the live Core node on 2026-08-28:
+     sequence "nope" / true / false / null / {} / []  ACCEPT, emits 0xFFFFFFFD
+     the same with replaceable=false                  ACCEPT, emits 0xFFFFFFFF
+     sequence 1.5 / 100.0                             REJECT -1
+     sequence 4294967296 (NUMERIC)                    REJECT -8  (unchanged) *)
+
+let input_with_raw_sequence (v : int) (seq : Yojson.Safe.t) : Yojson.Safe.t =
+  `Assoc [ ("txid", `String test_txid); ("vout", `Int v); ("sequence", seq) ]
+
+(* Each non-numeric JSON type must be ignored, leaving the RBF default. *)
+let test_non_numeric_sequence_ignored (label : string) (seq : Yojson.Safe.t) () =
+  check_accepted_sequences
+    ~what:(label ^ " sequence is ignored; RBF default reaches the bytes")
+    ~expected:[ -3l ]
+    (call_create_raw [ input_with_raw_sequence 0 seq ])
+
+(* The fall-through must reach the real default COMPUTATION, not a hard-coded
+   0xFFFFFFFD: with replaceable explicitly false and locktime 0, AddInputs
+   picks SEQUENCE_FINAL. *)
+let test_non_numeric_sequence_honours_rbf_false () =
+  check_accepted_sequences
+    ~what:"non-numeric sequence + rbf=false -> SEQUENCE_FINAL"
+    ~expected:[ -1l ]
+    (call_create_raw_rbf
+       [ input_with_raw_sequence 0 (`String "nope") ] (`Bool false))
+
+let test_float_sequence_is_misc_error (label : string) (f : float) () =
+  check_error ~what:(label ^ ": isNum() but no integral token")
+    ~code:(-1) ~msg:"JSON integer out of range"
+    (call_create_raw [ input_with_raw_sequence 0 (`Float f) ])
+
+(* CONTROLS: the NUMERIC branch must be untouched.  Without these the fix is
+   satisfiable by deleting the range check outright, or by ignoring every
+   sequence including the valid ones. *)
+let test_control_numeric_sequence_negative_still_rejected () =
+  check_error ~what:"CONTROL: numeric sequence -1"
+    ~code:(-8) ~msg:"Invalid parameter, sequence number is out of range"
+    (call_create_raw [ input_with_sequence 0 (-1) ])
+
+let test_control_ordinary_numeric_sequence_still_assigned () =
+  check_accepted_sequences
+    ~what:"CONTROL: ordinary numeric sequence 12345 reaches the bytes"
+    ~expected:[ 12345l ]
+    (call_create_raw [ input_with_sequence 0 12345 ])
+
 let () =
   Alcotest.run "createrawtransaction vout range"
     [
@@ -495,5 +580,33 @@ let () =
             test_rbf_false_final_sequence_accepted;
           Alcotest.test_case "row 8: rbf=true + default sequence accepted"
             `Quick test_rbf_true_default_sequence_accepted;
+        ] );
+      ( "non_numeric_sequence_ignored_REGRESSION",
+        [
+          Alcotest.test_case "string sequence ignored -> 0xFFFFFFFD" `Quick
+            (test_non_numeric_sequence_ignored "string" (`String "nope"));
+          Alcotest.test_case "bool true sequence ignored -> 0xFFFFFFFD" `Quick
+            (test_non_numeric_sequence_ignored "bool true" (`Bool true));
+          Alcotest.test_case "bool false sequence ignored -> 0xFFFFFFFD" `Quick
+            (test_non_numeric_sequence_ignored "bool false" (`Bool false));
+          Alcotest.test_case "null sequence ignored -> 0xFFFFFFFD" `Quick
+            (test_non_numeric_sequence_ignored "null" `Null);
+          Alcotest.test_case "object sequence ignored -> 0xFFFFFFFD" `Quick
+            (test_non_numeric_sequence_ignored "object" (`Assoc []));
+          Alcotest.test_case "array sequence ignored -> 0xFFFFFFFD" `Quick
+            (test_non_numeric_sequence_ignored "array" (`List []));
+          Alcotest.test_case "ignored sequence still honours rbf=false" `Quick
+            test_non_numeric_sequence_honours_rbf_false;
+          Alcotest.test_case "float sequence 1.5 -> -1 out of range" `Quick
+            (test_float_sequence_is_misc_error "sequence 1.5" 1.5);
+          Alcotest.test_case "float sequence 100.0 -> -1 out of range" `Quick
+            (test_float_sequence_is_misc_error "sequence 100.0" 100.0);
+        ] );
+      ( "numeric_sequence_branch_CONTROLS",
+        [
+          Alcotest.test_case "numeric sequence -1 still -8" `Quick
+            test_control_numeric_sequence_negative_still_rejected;
+          Alcotest.test_case "ordinary numeric sequence still assigned" `Quick
+            test_control_ordinary_numeric_sequence_still_assigned;
         ] );
     ]

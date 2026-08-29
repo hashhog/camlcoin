@@ -36,6 +36,43 @@ let rpc_invalid_address = -5
 let rpc_wallet_error = -4
 let rpc_insufficient_funds = -6
 let rpc_invalid_parameter = -8
+(* Core reads every numeric RPC argument through UniValue::getInt<T>()
+   (univalue.h), which runs std::from_chars INTO THE DESTINATION WIDTH.  The
+   width check therefore lives INSIDE the conversion and fires BEFORE the
+   handler's own domain test: out of width -> RPC_MISC_ERROR (-1) "JSON integer
+   out of range", and only values that survive the conversion reach a -8 range
+   check.
+
+   OCaml's native int is 63-bit, so a hostile JSON integer arrives INTACT and
+   nothing overflows -- but [Int32.of_int] WRAPS SILENTLY, and the chainstate
+   height key is written with exactly that (cf_chainstate.ml encode_height), so
+   `getblockhash 4294967296` returned the GENESIS hash and reported success.
+   These bounds are the only thing standing between an argument and that. *)
+let core_json_int_range_msg = "JSON integer out of range"
+let core_in_int32 (n : int) = n >= -2147483648 && n <= 2147483647
+let core_in_uint32 (n : int) = n >= 0 && n <= 4294967295
+
+(* Core validates estimate_mode with FeeModeFromString (common/messages.cpp),
+   comparing after ToUpper, so the match is case-insensitive. *)
+let core_estimate_mode_msg =
+  "Invalid estimate_mode parameter, must be one of: \
+   \"unset\", \"economical\", \"conservative\""
+let core_valid_estimate_mode (s : string) =
+  match String.uppercase_ascii s with
+  | "UNSET" | "ECONOMICAL" | "CONSERVATIVE" -> true
+  | _ -> false
+
+(* Handlers whose result type carries only a string report Core-shaped
+   rejections as "<code> <message>"; split the code back off at the dispatch
+   boundary. *)
+let split_coded_error (msg : string) : int * string =
+  match String.index_opt msg ' ' with
+  | Some i ->
+    (match int_of_string_opt (String.sub msg 0 i) with
+     | Some code -> (code, String.sub msg (i + 1) (String.length msg - i - 1))
+     | None -> (-1, msg))
+  | None -> (-1, msg)
+
 let rpc_deserialization_error = -22
 let rpc_verify_error = -25
 let rpc_verify_rejected = -26
@@ -652,6 +689,11 @@ let handle_getblockchaininfo (ctx : rpc_context)
 let handle_getblockhash (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
+  (* getInt<int> first: without this the height went into encode_height's
+     Int32.of_int, which WRAPS, so 4294967296 read block 0 and answered with
+     the genesis hash. *)
+  | [`Int height] when not (core_in_int32 height) ->
+    Error core_json_int_range_msg
   | [`Int height] ->
     (match Storage.ChainDB.get_hash_at_height ctx.chain.db height with
      | Some hash ->
@@ -2266,6 +2308,17 @@ let handle_getprioritisedtransactions (ctx : rpc_context) : Yojson.Safe.t =
 let handle_estimatesmartfee (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
+  (* Core: ParseConfirmTarget (rpc/util.cpp) reads conf_target with getInt<int>
+     and then REJECTS anything outside [1, HighestTargetTracked] -- it does not
+     clamp -- and estimate_mode is validated by FeeModeFromString.  Ignoring
+     either answered a question the caller never asked. *)
+  | [`Int conf_target] | [`Int conf_target; _] when not (core_in_int32 conf_target) ->
+    ignore conf_target; Error core_json_int_range_msg
+  | [`Int conf_target] | [`Int conf_target; _]
+    when conf_target < 1 || conf_target > 1008 ->
+    Error "Invalid conf_target, must be between 1 and 1008"
+  | [`Int _; `String mode] when not (core_valid_estimate_mode mode) ->
+    Error core_estimate_mode_msg
   | [`Int conf_target] | [`Int conf_target; _] ->
     let fee_rate = Fee_estimation.estimate_fee ctx.fee_estimator conf_target in
     (match fee_rate with
@@ -4964,6 +5017,29 @@ let parse_createraw_version fail (v : Yojson.Safe.t) : int32 =
   | `Intlit _ -> out_of_range ()
   | _ -> out_of_range ()
 
+(* Core: ConstructTransaction (rawtransaction_util.cpp:151-156) reads locktime
+   with getInt<int64_t> and bounds it to [0, LOCKTIME_MAX].  createrawtransaction,
+   createpsbt AND walletcreatefundedpsbt all build through that ONE routine, so
+   all three must answer identically.  Only createrawtransaction did:
+   createpsbt did a bare [Int32.of_int lt], which WRAPS, so locktime 4294967296
+   became 0l and the caller got a SUCCESS reply describing a transaction it had
+   not asked for. *)
+let parse_createraw_locktime fail (v : Yojson.Safe.t) : int32 =
+  let rpc_misc = -1 and rpc_invalid_param = -8 and rpc_type = -3 in
+  match v with
+  | `Null -> 0l
+  | `Int n ->
+    if n < 0 || n > 0xFFFFFFFF then
+      fail rpc_invalid_param "Invalid parameter, locktime out of range"
+    else Int32.of_int n
+  | `Intlit str ->
+    (match Int64.of_string_opt str with
+     | Some n when Int64.compare n 0L >= 0
+                && Int64.compare n 0xFFFFFFFFL <= 0 -> Int64.to_int32 n
+     | Some _ -> fail rpc_invalid_param "Invalid parameter, locktime out of range"
+     | None -> fail rpc_misc "JSON integer out of range")
+  | _ -> fail rpc_type "Locktime must be an integer"
+
 let handle_createpsbt (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   let extract_inputs inputs_json =
@@ -5044,17 +5120,18 @@ let handle_createpsbt (ctx : rpc_context)
       let network = network_to_address_network ctx.network in
       let inputs = extract_inputs inputs_json in
       let outputs = extract_outputs outputs_json network in
-      let locktime = match params with
-        | [_; _; `Int lt] -> Int32.of_int lt
-        | [_; _; `Int lt; _] | [_; _; `Int lt; _; _] -> Int32.of_int lt
-        | _ -> 0l
+      let coded_fail code msg = failwith (Printf.sprintf "%d %s" code msg) in
+      let locktime =
+        parse_createraw_locktime coded_fail
+          (match params with
+           | [_; _; lt] | [_; _; lt; _] | [_; _; lt; _; _] -> lt
+           | _ -> `Null)
       in
       (* Core builds createpsbt from the SAME ConstructTransaction as
          createrawtransaction, so it takes the same 5th [version] argument
          (rpc/rawtransaction.cpp:1642). *)
       let psbt_version =
-        parse_createraw_version
-          (fun code msg -> failwith (Printf.sprintf "%d %s" code msg))
+        parse_createraw_version coded_fail
           (match params with [_; _; _; _; v] -> v | _ -> `Null)
       in
       let tx : Types.transaction = {
@@ -5497,6 +5574,13 @@ let handle_gettxout (ctx : rpc_context)
   match params with
   (* Core gettxout takes (txid, n, [include_mempool=true]); accept the optional
      3rd arg (camlcoin serves the confirmed UTXO set either way). *)
+  (* Core reads n as getInt<uint32_t> (rpc/blockchain.cpp): from_chars accepts
+     no sign for an unsigned destination, so a NEGATIVE vout fails the
+     CONVERSION with -1, the same error as one above 2^32-1.  Answering `null`
+     for either was an ACCEPT of an argument Core refuses. *)
+  | [`String _; `Int vout]
+  | [`String _; `Int vout; `Bool _] when not (core_in_uint32 vout) ->
+    Error core_json_int_range_msg
   | [`String txid_hex; `Int vout]
   | [`String txid_hex; `Int vout; `Bool _] ->
     let txid = parse_txid_param txid_hex in
@@ -12560,6 +12644,9 @@ let handle_getnodeaddresses (ctx : rpc_context)
   let count_result : (int, int * string) result =
     match count_arg with
     | None -> Ok 1
+    (* getInt<int> BEFORE the handler's own -8 range test below. *)
+    | Some (`Int n) when not (core_in_int32 n) ->
+      Error (rpc_misc_error, core_json_int_range_msg)
     | Some (`Int n) -> Ok n
     | Some (`Intlit s) ->
       (match int_of_string_opt s with
@@ -13429,7 +13516,9 @@ let wait_parse_timeout (j : Yojson.Safe.t) : (int, int * string) result =
   match j with
   | `Null -> Ok 0
   | `Int n ->
-    if n < 0 then Error (rpc_misc_error, "Negative timeout") else Ok n
+    (* getInt<int>'s width check runs BEFORE the negative-timeout test. *)
+    if not (core_in_int32 n) then Error (rpc_misc_error, core_json_int_range_msg)
+    else if n < 0 then Error (rpc_misc_error, "Negative timeout") else Ok n
   | other ->
     Error (rpc_type_error,
       Printf.sprintf
@@ -13442,7 +13531,9 @@ let wait_parse_timeout (j : Yojson.Safe.t) : (int, int * string) result =
    Non-integer -> RPC_TYPE_ERROR (-3), byte-matching Core's getInt. *)
 let wait_parse_int (j : Yojson.Safe.t) : (int, int * string) result =
   match j with
-  | `Int n -> Ok n
+  | `Int n ->
+    if core_in_int32 n then Ok n
+    else Error (rpc_misc_error, core_json_int_range_msg)
   | other ->
     Error (rpc_type_error,
       Printf.sprintf
@@ -13678,6 +13769,8 @@ let dispatch_rpc (ctx : rpc_context)
        handler already emits Core's exact message; route it to -8. *)
     (match handle_getblockhash ctx params with
      | Ok r -> Ok r
+     (* A failed getInt<int> CONVERSION is -1, not the handler's -8. *)
+     | Error msg when msg = core_json_int_range_msg -> Error (rpc_misc_error, msg)
      | Error msg -> Error (rpc_invalid_parameter, msg))
   | "getblock" ->
     (* Core ParseHashV on the blockhash arg -> malformed = -8 before lookup;
@@ -13964,6 +14057,11 @@ let dispatch_rpc (ctx : rpc_context)
   | "estimatesmartfee" ->
     (match handle_estimatesmartfee ctx params with
      | Ok r -> Ok r
+     (* ParseConfirmTarget's domain error and FeeModeFromString's are
+        RPC_INVALID_PARAMETER; a failed conversion stays -1. *)
+     | Error msg when msg = "Invalid conf_target, must be between 1 and 1008"
+                   || msg = core_estimate_mode_msg ->
+       Error (rpc_invalid_parameter, msg)
      | Error msg -> Error (rpc_misc_error, msg))
   | "estimaterawfee" ->
     (match handle_estimaterawfee ctx params with
@@ -14104,9 +14202,14 @@ let dispatch_rpc (ctx : rpc_context)
 
   (* PSBT *)
   | "createpsbt" ->
+    (* handle_createpsbt's result type carries only a string, so its
+       Core-shaped rejections travel as "<code> <message>" (that is what the
+       [coded_fail] closure writes).  Split the code back off: before this the
+       node answered -1 "-8 Invalid parameter, version out of range(1~3)",
+       with Core's code stranded inside the message text. *)
     (match handle_createpsbt ctx params with
      | Ok r -> Ok r
-     | Error msg -> Error (rpc_misc_error, msg))
+     | Error msg -> Error (split_coded_error msg))
   | "decodepsbt" ->
     (match handle_decodepsbt ctx params with
      | Ok r -> Ok r

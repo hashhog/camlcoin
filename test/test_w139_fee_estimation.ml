@@ -683,13 +683,13 @@ let test_g21_estimate_mode_silently_dropped () =
   let src = slurp_lib "rpc.ml" in
   (* The wildcard-bound second positional is the smoking gun. *)
   Alcotest.(check bool)
-    "G21: BUG — estimate_mode pattern silently swallowed by wildcard (BUG-W139-9)"
+    "G21 FIXED — estimate_mode is validated, not swallowed"
     true (contains_substring src
             "[`Int conf_target] | [`Int conf_target; _]");
-  (* Confirm there is NO FeeModeFromString analog *)
+  (* FIXED 2026-08-29: there IS a FeeModeFromString analog now. *)
   Alcotest.(check bool)
-    "G21: BUG — no FeeModeFromString analog in RPC layer"
-    false (contains_substring src "FeeModeFromString"
+    "G21 FIXED — a FeeModeFromString analog exists in the RPC layer"
+    true (contains_substring src "core_valid_estimate_mode"
            || contains_substring src "fee_mode_from_string"
            || contains_substring src "\"conservative\""
            || contains_substring src "\"economical\"")
@@ -701,8 +701,8 @@ let test_g21_estimate_mode_silently_dropped () =
 let test_g22_invalid_estimate_mode_error_absent () =
   let src = slurp_lib "rpc.ml" in
   Alcotest.(check bool)
-    "G22: BUG — 'Invalid estimate_mode parameter' error not emitted (BUG-W139-21)"
-    false (contains_substring src "Invalid estimate_mode"
+    "G22 FIXED — 'Invalid estimate_mode parameter' error is emitted"
+    true (contains_substring src "Invalid estimate_mode"
            || contains_substring src "InvalidEstimateModeErrorMessage")
 
 (* ============================================================================
@@ -970,9 +970,9 @@ let () =
         `Quick test_g20_max_usable_estimate_bookkeeping_absent;
     ];
     "G21-G25 RPC behaviour", [
-      Alcotest.test_case "G21: estimate_mode silently dropped (P0-CDIV BUG-W139-9)"
+      Alcotest.test_case "G21: estimate_mode validated, not dropped (BUG-W139-9 FIXED)"
         `Quick test_g21_estimate_mode_silently_dropped;
-      Alcotest.test_case "G22: Invalid estimate_mode error absent (P1 BUG-W139-21)"
+      Alcotest.test_case "G22: Invalid estimate_mode error emitted (BUG-W139-21 FIXED)"
         `Quick test_g22_invalid_estimate_mode_error_absent;
       Alcotest.test_case "G23: min_relay_fee clamp on response absent (P0-CDIV BUG-W139-10)"
         `Quick test_g23_min_relay_clamp_on_response_absent;

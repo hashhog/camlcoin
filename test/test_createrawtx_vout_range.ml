@@ -529,6 +529,83 @@ let test_control_ordinary_numeric_sequence_still_assigned () =
     ~expected:[ 12345l ]
     (call_create_raw [ input_with_sequence 0 12345 ])
 
+
+(* ------------------------------------------------------------------ *)
+(* createrawtransaction must HONOUR the [version] argument (#84).      *)
+(*                                                                     *)
+(* Core's createrawtransaction takes a 5th argument, [version]         *)
+(* (rpc/rawtransaction.cpp:122), reads it as Arg<uint32_t>, bounds it  *)
+(* to [1,3] (policy/policy.h:152-153) and EMITS it                     *)
+(* (rawtransaction_util.cpp:158-161).                                  *)
+(*                                                                     *)
+(* camlcoin did not accept the argument AT ALL: the arity match        *)
+(* rejected a five-parameter call with -32602 and Core's help text, so *)
+(* a caller asking for version 3 could not reach the builder. Version  *)
+(* 3 is TRUC (BIP 431) and carries different policy rules.             *)
+(*                                                                     *)
+(* THE UNSIGNED WIDTH decides which error you get: 2147483648 fits a   *)
+(* uint32, survives the conversion and reaches the DOMAIN error (-8),  *)
+(* while -1 and 4294967296 fail the CONVERSION first (-1). Both are    *)
+(* asserted; collapsing them would look close enough and be wrong      *)
+(* twice.                                                              *)
+(*                                                                     *)
+(* OCAML HAZARD: [Int32.of_int] WRAPS, so the uint32 bound must be     *)
+(* checked on the 63-bit int BEFORE conversion. The 2^32 case pins it. *)
+(*                                                                     *)
+(* THE ASSERTIONS DECODE THE VERSION BYTES off the returned            *)
+(* transaction. Checking that the call was accepted is exactly the     *)
+(* pre-fix behaviour... except here it is worse, because pre-fix the   *)
+(* call was REJECTED, so an "accepted" assertion would pass the moment *)
+(* the argument was tolerated and ignored.                             *)
+(* ------------------------------------------------------------------ *)
+
+let call_create_raw_version (version : Yojson.Safe.t option) =
+  let ctx, _db = create_test_context () in
+  let base =
+    [ `List [ input_with_vout 0 ]; outputs_param; `Int 0; `Bool false ]
+  in
+  Rpc.handle_createrawtransaction ctx
+    (match version with None -> base | Some v -> base @ [ v ])
+
+let tx_version_of (hex : string) : int32 =
+  let r = Serialize.reader_of_cstruct (hex_to_cstruct hex) in
+  (Serialize.deserialize_transaction r).Types.version
+
+let check_version ~what ~expected result =
+  match result with
+  | Error (c, m) ->
+    Alcotest.failf "%s: expected success but got error %d %S" what c m
+  | Ok (`String hex) ->
+    Alcotest.(check int32) (what ^ ": tx version") expected (tx_version_of hex)
+  | Ok other ->
+    Alcotest.failf "%s: expected a hex string, got %s" what
+      (Yojson.Safe.to_string other)
+
+let test_version_emitted (v : int) () =
+  check_version ~what:(Printf.sprintf "version %d" v)
+    ~expected:(Int32.of_int v)
+    (call_create_raw_version (Some (`Int v)))
+
+let test_version_out_of_domain (v : int) () =
+  check_error ~what:(Printf.sprintf "version %d" v) ~code:(-8)
+    ~msg:"Invalid parameter, version out of range(1~3)"
+    (call_create_raw_version (Some (`Int v)))
+
+let test_version_out_of_uint32 (v : int) () =
+  check_error ~what:(Printf.sprintf "version %d" v) ~code:(-1)
+    ~msg:"JSON integer out of range"
+    (call_create_raw_version (Some (`Int v)))
+
+(* CONTROLS. Without these, a handler that rejected every version would
+   satisfy every rejection assertion above. *)
+let test_control_version_absent_defaults_to_2 () =
+  check_version ~what:"absent version" ~expected:2l
+    (call_create_raw_version None)
+
+let test_control_version_null_defaults_to_2 () =
+  check_version ~what:"null version" ~expected:2l
+    (call_create_raw_version (Some `Null))
+
 let () =
   Alcotest.run "createrawtransaction vout range"
     [
@@ -601,6 +678,30 @@ let () =
             (test_float_sequence_is_misc_error "sequence 1.5" 1.5);
           Alcotest.test_case "float sequence 100.0 -> -1 out of range" `Quick
             (test_float_sequence_is_misc_error "sequence 100.0" 100.0);
+        ] );
+      ( "version_argument_REGRESSION",
+        [
+          Alcotest.test_case "version 1 is emitted" `Quick (test_version_emitted 1);
+          Alcotest.test_case "version 2 is emitted" `Quick (test_version_emitted 2);
+          Alcotest.test_case "version 3 (TRUC) is emitted" `Quick
+            (test_version_emitted 3);
+          Alcotest.test_case "version 0 -> -8 out of range(1~3)" `Quick
+            (test_version_out_of_domain 0);
+          Alcotest.test_case "version 4 -> -8 out of range(1~3)" `Quick
+            (test_version_out_of_domain 4);
+          Alcotest.test_case "version 2^31 fits uint32 -> -8, not -1" `Quick
+            (test_version_out_of_domain 2147483648);
+          Alcotest.test_case "version 2^32 outside uint32 -> -1, not -8" `Quick
+            (test_version_out_of_uint32 4294967296);
+          Alcotest.test_case "version -1 outside uint32 -> -1" `Quick
+            (test_version_out_of_uint32 (-1));
+        ] );
+      ( "version_argument_CONTROLS",
+        [
+          Alcotest.test_case "absent version defaults to 2" `Quick
+            test_control_version_absent_defaults_to_2;
+          Alcotest.test_case "null version defaults to 2" `Quick
+            test_control_version_null_defaults_to_2;
         ] );
       ( "numeric_sequence_branch_CONTROLS",
         [

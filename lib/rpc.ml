@@ -4927,6 +4927,43 @@ let handle_getblockstats (ctx : rpc_context)
 
 (* createpsbt [{"txid":"...", "vout":n},...] [{"address":amount},...] ( locktime )
    Creates an unsigned PSBT from raw transaction components *)
+(* Core's [version] argument for the createrawtransaction family
+   (bitcoin-core/src/rpc/rawtransaction.cpp:122).
+
+   Core reads it as [self.Arg<uint32_t>("version")] -- a THIRTY-TWO BIT
+   UNSIGNED parse, unlike the int32 used for [vout] -- then bounds it to
+   [TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION] = [1, 3]
+   (policy/policy.h:152-153) inside ConstructTransaction
+   (rawtransaction_util.cpp:158-161) and ASSIGNS it to the transaction.
+
+   Neither handler here accepted the argument at all: the arity match rejected
+   a five-parameter call outright with -32602 and Core's help text, so a caller
+   asking for version 3 could not even reach the builder. Version 3 is TRUC
+   (BIP 431).
+
+   THE UNSIGNED WIDTH decides which error you get: 2147483648 fits a uint32,
+   survives the conversion and reaches the DOMAIN error (-8), while -1 and
+   4294967296 fail the CONVERSION first (-1).
+
+   OCAML HAZARD: [Int32.of_int] WRAPS silently, so the uint32 bound is checked
+   on the 63-bit int BEFORE any conversion. [`Intlit] carries integers too
+   large for OCaml's int, and is treated as out of range rather than parsed --
+   any value that needs it is far outside [1,3] regardless.
+
+   Returns the version, or raises via [fail]. *)
+let parse_createraw_version fail (v : Yojson.Safe.t) : int32 =
+  let rpc_misc = -1 and rpc_invalid_param = -8 in
+  let out_of_range () = fail rpc_misc "JSON integer out of range" in
+  match v with
+  | `Null -> 2l                       (* Core DEFAULT_RAWTX_VERSION *)
+  | `Int n ->
+    if n < 0 || n > 4294967295 then out_of_range ()
+    else if n < 1 || n > 3 then
+      fail rpc_invalid_param "Invalid parameter, version out of range(1~3)"
+    else Int32.of_int n
+  | `Intlit _ -> out_of_range ()
+  | _ -> out_of_range ()
+
 let handle_createpsbt (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   let extract_inputs inputs_json =
@@ -5001,17 +5038,27 @@ let handle_createpsbt (ctx : rpc_context)
     | _ -> failwith "Outputs must be an array"
   in
   match params with
-  | [inputs_json; outputs_json] | [inputs_json; outputs_json; _] ->
+  | [inputs_json; outputs_json] | [inputs_json; outputs_json; _]
+  | [inputs_json; outputs_json; _; _] | [inputs_json; outputs_json; _; _; _] ->
     (try
       let network = network_to_address_network ctx.network in
       let inputs = extract_inputs inputs_json in
       let outputs = extract_outputs outputs_json network in
       let locktime = match params with
         | [_; _; `Int lt] -> Int32.of_int lt
+        | [_; _; `Int lt; _] | [_; _; `Int lt; _; _] -> Int32.of_int lt
         | _ -> 0l
       in
+      (* Core builds createpsbt from the SAME ConstructTransaction as
+         createrawtransaction, so it takes the same 5th [version] argument
+         (rpc/rawtransaction.cpp:1642). *)
+      let psbt_version =
+        parse_createraw_version
+          (fun code msg -> failwith (Printf.sprintf "%d %s" code msg))
+          (match params with [_; _; _; _; v] -> v | _ -> `Null)
+      in
       let tx : Types.transaction = {
-        version = 2l;
+        version = psbt_version;
         inputs;
         outputs;
         witnesses = [];
@@ -6704,11 +6751,15 @@ let handle_createrawtransaction (ctx : rpc_context)
   let module E = struct exception Rpc of int * string end in
   let fail code msg = raise (E.Rpc (code, msg)) in
   try
+    let version_param =
+      match params with [_; _; _; _; e] -> e | _ -> `Null in
+    let tx_version = parse_createraw_version fail version_param in
     let inputs_param, outputs_param, locktime_param, replaceable_param =
       match params with
       | [a; b] -> a, b, `Null, `Null
       | [a; b; c] -> a, b, c, `Null
       | [a; b; c; d] -> a, b, c, d
+      | [a; b; c; d; _] -> a, b, c, d
       | _ ->
         fail rpc_invalid_params
           "createrawtransaction [{\"txid\":\"id\",\"vout\":n},...] \
@@ -7023,7 +7074,8 @@ let handle_createrawtransaction (ctx : rpc_context)
     (* Build the unsigned tx. version 2 = Core's default (TX_MAX_STANDARD).
        No witnesses → serialize_transaction emits the legacy (no marker) form. *)
     let tx =
-      { Types.version = 2l;
+      (* Was hardcoded 2l, discarding the caller's [version]. *)
+      { Types.version = tx_version;
         inputs = tx_inputs;
         outputs = tx_outputs;
         witnesses = [];

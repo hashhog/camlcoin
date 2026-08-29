@@ -1900,13 +1900,34 @@ let submitblock_result ctx hex_str =
   | Ok _ -> "unexpected-json"
   | Error e -> "rpc-error:" ^ e
 
-(* submitblock with unparseable hex (single byte "00") must return
-   "rejected" — a BIP-22 string, not a raw OCaml exception message. *)
-let test_submitblock_bad_hex_returns_rejected () =
+(* submitblock with an undecodable payload (single byte "00") must return
+   Core's DecodeHexBlk failure — "Block decode failed" — NOT a BIP-22
+   result string.  Core rpc/mining.cpp:1079-1081 throws
+   JSONRPCError(RPC_DESERIALIZATION_ERROR, "Block decode failed") before
+   any validation runs, so a decode failure never reaches
+   BIP22ValidationResult().  Updated 2026-08-23 with the
+   C1-noncanonical-compactsize reason-parity fix (this previously asserted
+   the BIP-22 "rejected" catch-all). *)
+let test_submitblock_bad_hex_returns_decode_failed () =
   let (ctx, db, _utxo, _txid1, _txid2) = create_test_context () in
   let r = submitblock_result ctx "00" in
-  Alcotest.(check bool) "bad hex returns BIP-22 rejected" true
-    (r = "rejected" || not (String.contains r ':'));
+  Alcotest.(check string) "bad hex returns Core decode-failed error"
+    "rpc-error:Block decode failed" r;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
+(* Non-canonical CompactSize on the block-level tx count.  Regression guard
+   for diff-test corpus
+   [_tierc-guards-2026-07-06/C1-noncanonical-compactsize]: Core rejects
+   inside ReadCompactSize (serialize.h:344, chSize==253 && value<253), which
+   propagates out of DecodeHexBlk as "Block decode failed". *)
+let test_submitblock_noncanonical_compactsize_decode_failed () =
+  let (ctx, db, _utxo, _txid1, _txid2) = create_test_context () in
+  (* 80-byte zero header + tx count 1 written in the 3-byte 0xfd form. *)
+  let hex = String.concat "" [String.make 160 '0'; "fd0100"] in
+  let r = submitblock_result ctx hex in
+  Alcotest.(check string) "non-canonical CompactSize is a decode failure"
+    "rpc-error:Block decode failed" r;
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
@@ -3478,8 +3499,10 @@ let () =
         test_submitblock_unblocks_after_pause_cleared;
     ];
     "bip22_result_strings", [
-      test_case "bad hex returns BIP-22 rejected" `Quick
-        test_submitblock_bad_hex_returns_rejected;
+      test_case "bad hex returns Core decode-failed error" `Quick
+        test_submitblock_bad_hex_returns_decode_failed;
+      test_case "non-canonical CompactSize is a decode failure" `Quick
+        test_submitblock_noncanonical_compactsize_decode_failed;
       test_case "odd hex returns BIP-22 rejected or error" `Quick
         test_submitblock_odd_hex_returns_rejected;
       test_case "missing params returns Error" `Quick

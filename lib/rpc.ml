@@ -2666,10 +2666,46 @@ let handle_submitblock (ctx : rpc_context)
   else
   match params with
   | [`String hex] ->
+    (* Step 1 — Core's DecodeHexBlk (rpc/mining.cpp:1079-1081).
+
+       A block that does not DESERIALIZE is not a BIP-22 consensus
+       rejection.  Core decodes first and, on failure, throws
+         JSONRPCError(RPC_DESERIALIZATION_ERROR, "Block decode failed")
+       — a FIXED message; the underlying ios_base::failure text
+       ("non-canonical ReadCompactSize()", serialize.h:344/:350/:356) is
+       swallowed by DecodeHexBlk and never reaches the client.
+
+       This decode used to live inside the same [try] as the whole
+       validate-and-connect path, whose [with exn] arm collapses to the
+       BIP-22 catch-all ["rejected"].  That is the R2 reason-token
+       divergence measured on all 4 rows of diff-test corpus
+       [_tierc-guards-2026-07-06/C1-noncanonical-compactsize]: camlcoin
+       answered [reject:rejected] where Core answers
+       [reject:block-decode-failed].  Both REJECTED and neither tip moved,
+       so this is reason parity, not a consensus split.
+
+       RESIDUAL (R5, not R2): the dispatcher routes this [Error] through
+       [rpc_verify_rejected] (-26), whereas Core uses
+       [rpc_deserialization_error] (-22).  That mis-routing is already
+       tracked as BUG-3 in audit/w125_rpc_error_parity.md and is asserted
+       by [test_w125_error_parity.ml] G16; carrying the Core-exact code
+       needs [handle_submitblock] to return the (code, message) pair the
+       way [handle_submitheader] already does, which is a separate change. *)
+    let decoded =
+      try
+        let data = Cstruct.of_hex hex in
+        let r = Serialize.reader_of_cstruct data in
+        Some (Serialize.deserialize_block r)
+      with exn ->
+        (* Keep the detail for the operator; Core discards it. *)
+        Logs.warn (fun m ->
+          m "submitblock decode failed: %s" (Printexc.to_string exn));
+        None
+    in
+    (match decoded with
+     | None -> Error "Block decode failed"
+     | Some block ->
     (try
-      let data = Cstruct.of_hex hex in
-      let r = Serialize.reader_of_cstruct data in
-      let block = Serialize.deserialize_block r in
       match Mining.submit_block ?utxo:ctx.utxo
               ~network_type:ctx.network.network_type
               block ctx.chain ctx.mempool with
@@ -2691,12 +2727,12 @@ let handle_submitblock (ctx : rpc_context)
         Logs.warn (fun m -> m "submitblock rejected: %s" msg);
         Ok (`String (bip22_of_submitblock_error msg))
     with exn ->
-      (* Deserialization / structural failure: still a BIP-22 "rejected". *)
-      (* Same defect as above in miniature — this message was computed and
-         bound to `_`, i.e. built and immediately discarded. *)
+      (* Unexpected exception from the validate/connect path (the decode
+         now has its own arm above).  BIP-22 catch-all, matching Core's
+         BIP22ValidationResult default of "rejected". *)
       Logs.warn (fun m ->
-        m "submitblock decode failed: %s" (Printexc.to_string exn));
-      Ok (`String "rejected"))
+        m "submitblock failed: %s" (Printexc.to_string exn));
+      Ok (`String "rejected")))
   | _ ->
     Error "Invalid parameters: expected [hexdata]"
 

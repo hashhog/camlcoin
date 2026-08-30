@@ -30,3 +30,20 @@
 (executable
  (name test_reorg_intrablock_undo)
  (libraries camlcoin))
+
+; Standalone LIVE-REORG proof for txospender_index (the verifier walks a real
+; reorg and checks the spender index agrees with the chain afterwards).
+;
+; This file existed from 2026-06-29 with NO dune stanza at all -- not excluded
+; on purpose like the two above, which document their cost and give a `dune
+; exec` line, but simply never wired in. It was therefore never COMPILED, let
+; alone run, so nothing would have caught it bit-rotting against the library.
+; Found 2026-08-30 by the #92 audit (how many test files does the suite
+; actually execute?).
+;
+; Kept out of the default `tests` stanza for the same reason as its two
+; neighbours -- it drives a live reorg and is slow. Invoke explicitly:
+;   dune exec test/test_txospender_livereorg.exe
+(executable
+ (name test_txospender_livereorg)
+ (libraries camlcoin))

@@ -5917,7 +5917,15 @@ let handle_getblock (ctx : rpc_context)
     | [`String h; `Float v]    -> (h, int_of_float v)
     | _ -> ("", -1)
   in
-  if verbosity = -1 then
+  if verbosity <> -1 && not (core_in_int32 verbosity) then
+    (* Core reads verbosity with getInt<int>, whose width check lives INSIDE the
+       conversion (std::from_chars into the destination width) and therefore
+       fires BEFORE the block lookup.  OCaml's native int is 63-bit, so the
+       hostile value arrived intact and we looked the block up anyway, answering
+       -5 "Block not found" where Core answers -1.  The dispatch arm maps any
+       message other than "Block not found" to -1. *)
+    Error core_json_int_range_msg
+  else if verbosity = -1 then
     Error "Invalid parameters: expected [blockhash] or [blockhash, verbosity]"
   else begin
     (* Parse display-format hash (reversed byte order) to internal format *)
@@ -6447,6 +6455,15 @@ let handle_getrawtransaction (ctx : rpc_context)
     with _ -> None
   in
 
+  (* Core's getInt<int> fails in the CONVERSION, before the tx is looked up.
+     parse_verbosity returns None for anything outside [0,2] and the caller
+     defaulted it to 0 -- so an out-of-int32 verbosity was silently READ AS 0
+     and the lookup ran, answering -5.  An argument read and then discarded. *)
+  let verbosity_out_of_width =
+    match params with
+    | _ :: `Int n :: _ when not (core_in_int32 n) -> true
+    | _ -> false
+  in
   let (txid_hex, verbosity, blockhash_with_hex_opt) = match params with
     | [`String txid_hex] ->
       (Some txid_hex, 0, None)
@@ -6459,6 +6476,8 @@ let handle_getrawtransaction (ctx : rpc_context)
     | _ -> (None, 0, None)
   in
 
+  if verbosity_out_of_width then Error core_json_int_range_msg
+  else
   match txid_hex with
   | None -> Error "Invalid parameters: expected [txid] or [txid, verbose] or [txid, verbose, blockhash]"
   | Some txid_hex ->
@@ -9127,13 +9146,22 @@ let handle_disconnectnode (ctx : rpc_context)
        Ok `Null
      | None ->
        Error (rpc_client_node_not_connected, "Node not found in connected nodes"))
-  | [`Int id] ->
+  | [`Int id]
+  (* Core's documented by-id forms: "to disconnect by nodeid, either set
+     `address` to the empty string, or call using the named `nodeid` argument
+     only" (rpc/net.cpp).  camlcoin accepted only the bare [id] and refused
+     BOTH of Core's two-argument spellings with -32602 -- and the harness, like
+     any Core client, sends the two-argument one. *)
+  | [`String ""; `Int id] | [`Null; `Int id] ->
     (match Peer_manager.find_peer_by_id ctx.peer_manager id with
      | Some _ ->
        Lwt.async (fun () -> Peer_manager.remove_peer ctx.peer_manager id);
        Ok `Null
      | None ->
        Error (rpc_client_node_not_connected, "Node not found in connected nodes"))
+  | [`String _; `Int _] ->
+    (* Strictly one of address and nodeid (rpc/net.cpp). *)
+    Error (rpc_invalid_params, "Only one of address and nodeid should be provided.")
   | _ ->
     Error (rpc_invalid_params, "Invalid parameters: expected [address] or [node_id]")
 
@@ -12410,6 +12438,10 @@ let handle_getchaintxstats (ctx : rpc_context)
         in
         (match n with
          | None -> Error (rpc_invalid_parameter, "nblocks must be an integer")
+         | Some bc when not (core_in_int32 bc) ->
+           (* getInt<int> fails in the CONVERSION: an out-of-int32 nblocks never
+              reaches the domain test below, which answered -8. *)
+           Error (rpc_misc_error, core_json_int_range_msg)
          | Some bc ->
            if bc < 0 || (bc > 0 && bc >= pindex.height) then
              Error (rpc_invalid_parameter,
@@ -13885,7 +13917,14 @@ let dispatch_rpc (ctx : rpc_context)
     guard_hash_param ~name:"txid" params (fun () ->
       match handle_getrawtransaction ctx params with
       | Ok r -> Ok r
-      | Error msg -> Error (rpc_invalid_address, msg))
+      | Error msg ->
+        (* ...except the CONVERSION failure, which is Core's -1 and happens
+           before any lookup could have produced a -5. *)
+        let code =
+          if msg = core_json_int_range_msg then rpc_misc_error
+          else rpc_invalid_address
+        in
+        Error (code, msg))
   | "sendrawtransaction" ->
     (match handle_sendrawtransaction ctx params with
      | Ok r -> Ok r

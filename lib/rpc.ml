@@ -13786,10 +13786,101 @@ let dispatch_wait_rpc (ctx : rpc_context)
   | "waitforblockheight" -> Some (handle_waitforblockheight ctx params)
   | _ -> None
 
+(* ---------------------------------------------------------------------------
+   Dispatcher arity check (Core rpc/util.cpp:644 -> IsValidNumArgs at :733)
+   ---------------------------------------------------------------------------
+
+   Core validates argument COUNT centrally, before any handler runs:
+     if (GET_HELP || !IsValidNumArgs(request.params.size())) throw HelpResult{..}
+     IsValidNumArgs = num_required <= n && n <= num_declared
+   and the violation surfaces as error -1 carrying the method's help text.
+
+   No implementation in this fleet had that check: handlers decline to police
+   argument count because the dispatcher is supposed to, and no dispatcher did.
+   The operator probe found savemempool accepting a surplus argument in 10 of 10
+   implementations and clearbanned in 9 of 10 (2026-08-31).
+
+   The table is DERIVED FROM CORE by tools/core-arity.py, which reads
+   `help <method>` (optional arguments are parenthesised in the signature line),
+   rather than hand-written once per language. Validated by calling Core with
+   declared+1 arguments on nine read-only methods: all nine returned -1.
+
+   COVERAGE: 87 of the 103 operator-subset methods. A method ABSENT from the
+   table is NOT checked, deliberately -- treating an unknown method as zero-arg
+   would reject calls Core accepts, a worse failure than the one being fixed. *)
+
+let core_arity : (string, int * int) Hashtbl.t =
+  let tbl = Hashtbl.create 128 in
+  (* Same search shape as find_vector_file: resources/ may sit at several
+     depths depending on whether we are run from the repo root, this submodule,
+     or a dune _build subdirectory. *)
+  let rels = [ "resources/"; "../resources/"; "../../resources/";
+               "../../../resources/"; "../../../../resources/" ] in
+  let path =
+    List.find_opt (fun r -> Sys.file_exists (r ^ "core-arity.json")) rels
+  in
+  (match path with
+   | None ->
+     prerr_endline
+       "camlcoin: WARNING core-arity.json not found -- RPC argument-count \
+        checking is DISABLED"
+   | Some r ->
+     (try
+        let ic = open_in (r ^ "core-arity.json") in
+        let n = in_channel_length ic in
+        let text = really_input_string ic n in
+        close_in ic;
+        match Yojson.Safe.from_string text with
+        | `Assoc entries ->
+          List.iter
+            (fun (name, spec) ->
+               match spec with
+               | `Assoc fields ->
+                 let get k =
+                   match List.assoc_opt k fields with
+                   | Some (`Int v) -> Some v
+                   | _ -> None
+                 in
+                 (match get "required", get "declared" with
+                  | Some req, Some dec -> Hashtbl.replace tbl name (req, dec)
+                  | _ -> ())
+               | _ -> ())
+            entries
+        | _ -> prerr_endline "camlcoin: WARNING core-arity.json is not an object"
+      with e ->
+        prerr_endline
+          ("camlcoin: WARNING core-arity.json unreadable: " ^ Printexc.to_string e)));
+  tbl
+
+(* Returns [Some (code, message)] when Core would refuse this argument count. *)
+let check_core_arity (method_name : string) (params : Yojson.Safe.t list)
+  : (int * string) option =
+  match Hashtbl.find_opt core_arity method_name with
+  | None -> None                      (* fail OPEN -- see COVERAGE above *)
+  | Some (required, declared) ->
+    (* Named (object) params arrive as a single `Assoc and are not subject to
+       the positional check. *)
+    (match params with
+     | [ `Assoc _ ] -> None
+     | _ ->
+       let n = List.length params in
+       if n < required || n > declared then
+         let want =
+           if required = declared then string_of_int declared
+           else string_of_int required ^ " to " ^ string_of_int declared
+         in
+         Some (-1, method_name ^ " takes " ^ want ^ " argument(s), got "
+                   ^ string_of_int n)
+       else None)
+
 let dispatch_rpc (ctx : rpc_context)
     (method_name : string)
     (params : Yojson.Safe.t list)
     : (Yojson.Safe.t, int * string) result =
+  (* Core checks argument count centrally before dispatching (see above). *)
+  match check_core_arity method_name params with
+  | Some err -> Error err
+  | None ->
   match method_name with
   (* Blockchain *)
   | "getblockchaininfo" ->

@@ -1,3 +1,24 @@
+; #103 -- embed Core's argument-count table INTO the binary.
+;
+; It used to be read from resources/core-arity.json at startup via a relative
+; path search. That works under dune and under a repo-root invocation, and it
+; silently FAILS in production: tools/promote_mainnet.sh copies the executable
+; to deploy/camlcoin/, and the live unit's cwd is /home/work/hashhog, where no
+; resources/ directory exists. The node logged
+;   "WARNING core-arity.json not found -- RPC argument-count checking is DISABLED"
+; and served surplus arguments happily, while the test suite passed. Embedding
+; removes the runtime file dependency entirely.
+(rule
+ (target core_arity_data.ml)
+ (deps %{workspace_root}/resources/core-arity.json)
+ (action
+  (with-stdout-to
+   %{target}
+   (progn
+    (echo "let json = {json|")
+    (cat %{deps})
+    (echo "|json}\n")))))
+
 (library
  (name camlcoin)
  (public_name camlcoin)

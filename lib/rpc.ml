@@ -13810,46 +13810,44 @@ let dispatch_wait_rpc (ctx : rpc_context)
    would reject calls Core accepts, a worse failure than the one being fixed. *)
 
 let core_arity : (string, int * int) Hashtbl.t =
+  (* The table is EMBEDDED in the binary by the (rule) at the top of lib/dune,
+     not read from resources/ at startup.
+
+     It used to be located by a relative-path search. That resolved under dune
+     and from the repo root, and silently failed in production: the promoted
+     executable runs from deploy/camlcoin/ with cwd /home/work/hashhog, where no
+     resources/ directory exists. The node printed
+       "WARNING core-arity.json not found -- RPC argument-count checking is
+        DISABLED"
+     on 2026-08-31 and served surplus arguments happily -- while every test
+     passed, because the tests run under dune where the path DOES resolve. *)
   let tbl = Hashtbl.create 128 in
-  (* Same search shape as find_vector_file: resources/ may sit at several
-     depths depending on whether we are run from the repo root, this submodule,
-     or a dune _build subdirectory. *)
-  let rels = [ "resources/"; "../resources/"; "../../resources/";
-               "../../../resources/"; "../../../../resources/" ] in
-  let path =
-    List.find_opt (fun r -> Sys.file_exists (r ^ "core-arity.json")) rels
-  in
-  (match path with
-   | None ->
-     prerr_endline
-       "camlcoin: WARNING core-arity.json not found -- RPC argument-count \
-        checking is DISABLED"
-   | Some r ->
-     (try
-        let ic = open_in (r ^ "core-arity.json") in
-        let n = in_channel_length ic in
-        let text = really_input_string ic n in
-        close_in ic;
-        match Yojson.Safe.from_string text with
-        | `Assoc entries ->
-          List.iter
-            (fun (name, spec) ->
-               match spec with
-               | `Assoc fields ->
-                 let get k =
-                   match List.assoc_opt k fields with
-                   | Some (`Int v) -> Some v
-                   | _ -> None
-                 in
-                 (match get "required", get "declared" with
-                  | Some req, Some dec -> Hashtbl.replace tbl name (req, dec)
-                  | _ -> ())
+  (try
+     match Yojson.Safe.from_string Core_arity_data.json with
+     | `Assoc entries ->
+       List.iter
+         (fun (name, spec) ->
+            match spec with
+            | `Assoc fields ->
+              let get k =
+                match List.assoc_opt k fields with
+                | Some (`Int v) -> Some v
+                | _ -> None
+              in
+              (match get "required", get "declared" with
+               | Some req, Some dec -> Hashtbl.replace tbl name (req, dec)
                | _ -> ())
-            entries
-        | _ -> prerr_endline "camlcoin: WARNING core-arity.json is not an object"
-      with e ->
-        prerr_endline
-          ("camlcoin: WARNING core-arity.json unreadable: " ^ Printexc.to_string e)));
+            | _ -> ())
+         entries
+     | _ -> prerr_endline "camlcoin: WARNING embedded core-arity is not an object"
+   with e ->
+     prerr_endline
+       ("camlcoin: WARNING embedded core-arity unparseable: "
+        ^ Printexc.to_string e));
+  if Hashtbl.length tbl = 0 then
+    prerr_endline
+      "camlcoin: WARNING core-arity table is EMPTY -- RPC argument-count \
+       checking is DISABLED";
   tbl
 
 (* Returns [Some (code, message)] when Core would refuse this argument count. *)

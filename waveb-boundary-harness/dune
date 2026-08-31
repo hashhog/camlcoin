@@ -1,0 +1,8 @@
+; WAVE B verification harness — NOT part of the camlcoin build or test suite.
+; Untracked scratch: build explicitly with `dune build waveb-boundary-harness`.
+;   flagdump         — prints get_block_script_flags across heights/hashes.
+;   boundary_harness — drives tools/boundary-blocks/{170060,692261} (the W-B0
+;                      exception fixtures) through camlcoin's REAL block-hash
+;                      producer, exception lookup and script interpreter,
+;                      including the fixture's MANDATORY negative control.
+(executables (names flagdump boundary_harness) (libraries camlcoin yojson))

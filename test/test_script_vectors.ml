@@ -3,10 +3,35 @@
 
 open Camlcoin
 
-let script_tests_path =
-  (* resources/ is available relative to the test working directory via
-     (deps (source_tree ../resources)) in test/dune *)
-  "../resources/script_tests.json"
+(* Locate a Bitcoin Core test-vector file.
+
+   The path used to be the bare relative "../resources/script_tests.json",
+   which only resolves if the process happens to start in the right directory.
+   Under `dune exec` it does not, so this harness died with
+   Sys_error("../resources/script_tests.json: No such file or directory")
+   before checking a single vector. Found 2026-08-30 while fixing the same
+   class of breakage in clearbit.
+
+   Try the impl-local resources copy and the in-repo Bitcoin Core checkout, at
+   several depths so it works whether the cwd is the repo root, this submodule,
+   or a dune _build subdirectory. Fail LOUDLY naming everything tried — a
+   vector harness that cannot find its vectors must never look like a pass. *)
+let find_vector_file name =
+  let rels =
+    [ "resources/"; "../resources/"; "../../resources/"; "../../../resources/";
+      "bitcoin-core/src/test/data/"; "../bitcoin-core/src/test/data/";
+      "../../bitcoin-core/src/test/data/"; "../../../bitcoin-core/src/test/data/";
+      "../../../../bitcoin-core/src/test/data/" ]
+  in
+  let candidates = List.map (fun r -> r ^ name) rels in
+  match List.find_opt Sys.file_exists candidates with
+  | Some p -> p
+  | None ->
+    prerr_endline ("FATAL: could not find test vectors '" ^ name ^ "'. Tried:");
+    List.iter (fun c -> prerr_endline ("  " ^ c)) candidates;
+    exit 1
+
+let script_tests_path = find_vector_file "script_tests.json"
 
 (* ---- Hex utilities ---- *)
 

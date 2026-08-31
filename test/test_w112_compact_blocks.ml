@@ -167,18 +167,48 @@ let test_g2_siphash_key_deterministic () =
   Alcotest.(check int64) "G2: key derivation is deterministic (k1)" k1_a k1_b
 
 let test_g2_nonce_csprng_bug () =
-  (* BUG-8: Random.int64 is not CSPRNG. Document by confirming the function
-     exists and produces non-negative int64, but note it uses stdlib PRNG. *)
-  (* generate_compact_nonce is private; test indirectly via create_compact_block *)
+  (* BUG-8 is FIXED: generate_compact_nonce reads 8 bytes from /dev/urandom
+     rather than the stdlib PRNG (lib/p2p.ml:1360).
+
+     This test used to assert [cb.nonce >= 0L], which made it FLAKY at roughly
+     one run in two (measured 7 failures in 15 on 2026-08-31). That assertion
+     was wrong, not unlucky. BIP-152's nonce is a uint64 --
+     bitcoin-core/src/blockencodings.h:92 declares [uint64_t nonce] -- and
+     camlcoin serialises it with write_int64_le as raw little-endian bytes
+     (lib/p2p.ml:581), so the sign of OCaml's *signed* Int64 never reaches the
+     wire. Half of all correct full-range nonces have the top bit set and so
+     compare as negative. Requiring non-negativity would demand a nonce drawn
+     from only 63 bits, which is weaker, not safer.
+
+     What actually matters is tested instead: the full 64-bit range is in use,
+     the value is not a constant, and it round-trips through serialisation with
+     the top bit set. *)
   let block = make_test_block 2 in
-  let cb1 = P2p.create_compact_block block in
-  let cb2 = P2p.create_compact_block block in
-  (* With CSPRNG nonces should rarely (essentially never) collide — as a
-     discovery test we just confirm they are non-negative int64. The real
-     bug is using stdlib Random.int64 instead of CSPRNG. *)
-  Alcotest.(check bool) "G2/BUG-8: nonce is non-negative int64" true (cb1.nonce >= 0L);
-  (* Two compact blocks of same block typically have different nonces *)
-  ignore (cb1.nonce, cb2.nonce)  (* just document the path exists *)
+  let nonces =
+    List.init 24 (fun _ -> (P2p.create_compact_block block).nonce)
+  in
+  (* Not a constant: a stuck generator is the failure that matters. *)
+  Alcotest.(check bool)
+    "G2/BUG-8: successive nonces differ (CSPRNG, not fixed)"
+    true
+    (List.exists (fun n -> n <> List.hd nonces) (List.tl nonces));
+  (* Full 64-bit range. The TOP bit is the one at issue: a generator capped to
+     63 bits (the old Random.int64 Int64.max_int shape) never sets it, and
+     never produces a negative Int64. Over 24 draws a correct generator sets it
+     at least once with probability 1 - 2^-24. Testing any lower bit would pass
+     for a capped generator too, which is why this checks n < 0L alone. *)
+  Alcotest.(check bool)
+    "G2/BUG-8: nonce uses the full uint64 range, not just 63 bits"
+    true
+    (List.exists (fun n -> n < 0L) nonces);
+  (* A top-bit-set nonce must survive the wire round-trip unchanged. *)
+  let w = Serialize.writer_create () in
+  Serialize.write_int64_le w Int64.min_int;
+  let r = Serialize.reader_of_cstruct (Serialize.writer_to_cstruct w) in
+  Alcotest.(check int64)
+    "G2/BUG-8: negative (top-bit-set) nonce round-trips as uint64"
+    Int64.min_int
+    (Serialize.read_int64_le r)
 
 (* ============================================================================
    G3: Constants — total tx count cap BUG-1

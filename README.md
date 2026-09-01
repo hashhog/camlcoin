@@ -13,6 +13,9 @@ docker run -v camlcoin-data:/data -p 48347:48347 -p 48337:48337 camlcoin
 
 ### From Source
 
+Toolchain: OCaml >= 4.14.0 (`camlcoin.opam`; 4.14.2 below, Docker uses 5.1) with dune >= 3.0 and opam.
+System libraries (linked by `lib/dune`; secp256k1 is vendored): librocksdb-dev, libssl-dev (libcrypto), libzmq (libzmq.so.5), libgmp-dev, libffi-dev, libev-dev, pkg-config, a C++ runtime (libstdc++).
+
 ```bash
 opam switch create . 4.14.2 --deps-only -y
 eval $(opam env)

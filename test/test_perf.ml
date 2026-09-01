@@ -94,7 +94,13 @@ let test_timer_basic () =
 let test_timer_time_function () =
   let timer = Perf.Timer.create "test_timer_time" in
   let result = Perf.Timer.time timer (fun () ->
-    (* Do some work *)
+    (* Do some work.  A 1000-iteration integer loop finishes well inside the
+       1 us resolution of Unix.gettimeofday (lib/perf.ml Timer.time), so the
+       measured elapsed time was 0.0 on a fast run and "total time increased"
+       flipped on the clock's granularity.  Pin the workload to a duration
+       the clock can resolve: spin until the clock has advanced. *)
+    let t0 = Unix.gettimeofday () in
+    while Unix.gettimeofday () -. t0 < 0.001 do () done;
     let sum = ref 0 in
     for i = 0 to 1000 do sum := !sum + i done;
     !sum

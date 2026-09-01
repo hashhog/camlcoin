@@ -116,6 +116,48 @@ let find_source filename =
 let assume_utxo_ml () = find_source "assume_utxo.ml"
 let rpc_ml () = find_source "rpc.ml"
 
+(* Slice of a source file from the line containing [start_needle] up to the
+   next top-level "let " binding — used to scope a pin to ONE handler so a
+   comment elsewhere in the 15k-line rpc.ml cannot satisfy or break it. *)
+let source_region ~path ~start_needle : string =
+  if not (Sys.file_exists path) then ""
+  else begin
+    let ic = open_in path in
+    let n = in_channel_length ic in
+    let s = really_input_string ic n in
+    close_in ic;
+    match Str.search_forward (Str.regexp_string start_needle) s 0 with
+    | exception Not_found -> ""
+    | start ->
+      let body_start = start + String.length start_needle in
+      let stop =
+        try Str.search_forward (Str.regexp "^let ") s body_start
+        with Not_found -> String.length s
+      in
+      String.sub s start (stop - start)
+  end
+
+(* Count the lib/ + bin/ source files (other than assume_utxo.ml) that mention
+   [symbol].  Pure OCaml — the previous version shelled out to grep and
+   parked its answer in /tmp. *)
+let count_external_refs (symbol : string) : int =
+  let lib_dir = Filename.dirname (assume_utxo_ml ()) in
+  let bin_dir = Filename.concat (Filename.dirname lib_dir) "bin" in
+  let files_in d =
+    if Sys.file_exists d && Sys.is_directory d then
+      Array.to_list (Sys.readdir d)
+      |> List.filter (fun f ->
+           Filename.check_suffix f ".ml"
+           (* skip dune's ppx outputs (foo.pp.ml) — they duplicate foo.ml *)
+           && not (String.contains (Filename.chop_suffix f ".ml") '.'))
+      |> List.map (Filename.concat d)
+    else []
+  in
+  files_in lib_dir @ files_in bin_dir
+  |> List.filter (fun p -> Filename.basename p <> "assume_utxo.ml")
+  |> List.filter (fun p -> source_contains ~path:p ~needle:symbol)
+  |> List.length
+
 (* Temp dir for tests that need filesystem state. *)
 let temp_dir () =
   let name = Printf.sprintf "/tmp/camlcoin_w138_%d_%d"
@@ -306,12 +348,22 @@ let test_g9_block_failed_valid_gate_absent () =
 
 (* G10: best_header GetAncestor check — Core 5622-5624 absent (BUG-W138-3). *)
 let test_g10_best_header_ancestor_check_absent () =
-  let src_has = source_contains ~path:(rpc_ml ())
-                  ~needle:"GetAncestor" in
+  (* Scoped to handle_loadtxoutset: Core validation.cpp ActivateSnapshot
+     refuses when m_best_header->GetAncestor(base_height) != snapshot base
+     ("A forked headers-chain with more work ... exists").  The whole-file
+     grep started matching the getchaintxstats doc-comment that cites
+     GetAncestor and pinned nothing. *)
+  let handler = source_region ~path:(rpc_ml ())
+                  ~start_needle:"let handle_loadtxoutset" in
+  Alcotest.(check bool) "G10: handle_loadtxoutset located" true (handler <> "");
+  let region_has needle =
+    try ignore (Str.search_forward (Str.regexp_string needle) handler 0); true
+    with Not_found -> false in
+  let src_has = region_has "GetAncestor" || region_has "get_ancestor" in
   let src_has_forked = source_contains ~path:(rpc_ml ())
                          ~needle:"forked headers-chain" in
   Alcotest.(check bool)
-    "G10: rpc.ml has no GetAncestor-style check (BUG-W138-3)"
+    "G10: handle_loadtxoutset has no best-header GetAncestor check (BUG-W138-3 still open; Core validation.cpp ActivateSnapshot)"
     false src_has;
   Alcotest.(check bool)
     "G10: rpc.ml has no 'forked headers-chain with more work' refusal"
@@ -392,8 +444,12 @@ let test_g17_chain_tx_count_writeback_absent () =
                         ~needle:"chain_tx_count" in
   let src_has_writeback = source_contains ~path:(assume_utxo_ml ())
                             ~needle:"params.chain_tx_count" in
+  (* rpc.ml now has its own m_chain_tx_count analogue
+     (chain_tx_count_at_height, a per-height recount for getchaintxstats);
+     the pin is about consulting the SNAPSHOT PARAMS' chain_tx_count, so
+     look for that field access specifically. *)
   let rpc_has_writeback = source_contains ~path:(rpc_ml ())
-                            ~needle:"chain_tx_count" in
+                            ~needle:".chain_tx_count" in
   Alcotest.(check bool)
     "G17: assumeutxo_params.chain_tx_count field exists (W47 work)"
     true src_has_field;
@@ -461,17 +517,19 @@ let test_g20_load_assumeutxo_on_startup_absent () =
 
 (* G21: m_target_blockhash field absent — Core 6176 (BUG-W138-9). *)
 let test_g21_target_blockhash_field_absent () =
+  (* BUG-W138-9 CLOSED: the background validation carries its target block
+     hash (Core validation.h Chainstate::m_target_blockhash /
+     validation.cpp MaybeValidateSnapshot) and flips the snapshot chainstate
+     Unvalidated -> Validated / Invalid (assume_utxo.ml run_background_validation). *)
   let src_has = source_contains ~path:(assume_utxo_ml ())
                   ~needle:"target_blockhash" in
-  let src_has_m_target = source_contains ~path:(assume_utxo_ml ())
-                           ~needle:"m_target_blockhash" in
   Alcotest.(check bool)
-    "G21: assume_utxo.ml has NO target_blockhash field on chainstate \
-     (BUG-W138-9 P0-CDIV: unvalidated→validated transition never happens)"
-    false src_has;
+    "G21: assume_utxo.ml carries a target_blockhash (Core m_target_blockhash; BUG-W138-9 closed)"
+    true src_has;
   Alcotest.(check bool)
-    "G21: no m_target_blockhash reference at all"
-    false src_has_m_target
+    "G21: unvalidated -> validated transition exists (assumeutxo_state <- Validated)"
+    true (source_contains ~path:(assume_utxo_ml ())
+            ~needle:"assumeutxo_state <- Validated")
 
 (* G22: MaybeValidateSnapshot — dormant (BUG-W138-10).
    The skeleton run_background_validation exists but has zero callers. *)
@@ -481,27 +539,14 @@ let test_g22_background_validation_skeleton_dormant () =
   Alcotest.(check bool)
     "G22: run_background_validation skeleton exists in assume_utxo.ml"
     true src_has_skeleton;
-  (* Verify NO production caller exists. Search all lib + bin + test files
-     for an invocation pattern (not just the definition). *)
-  let all_callers_grep =
-    Sys.command "grep -rln 'run_background_validation' \
-                 /home/work/hashhog/camlcoin/lib/ \
-                 /home/work/hashhog/camlcoin/bin/ 2>/dev/null \
-                 | grep -v assume_utxo.ml | wc -l > /tmp/w138_callers.txt"
-  in
-  let _ = all_callers_grep in
-  let caller_count =
-    try
-      let ic = open_in "/tmp/w138_callers.txt" in
-      let s = String.trim (input_line ic) in
-      close_in ic;
-      int_of_string s
-    with _ -> -1
-  in
-  Alcotest.(check int)
-    "G22: run_background_validation has ZERO production callers \
-     outside assume_utxo.ml (BUG-W138-10 / BUG-W138-21 dormant cluster)"
-    0 caller_count
+  (* BUG-W138-10 CLOSED: handle_loadtxoutset (rpc.ml) spawns the background
+     validator via Assume_utxo.run_background_in_scheduler — Core's
+     MaybeValidateSnapshot path (validation.cpp) — so it has a production
+     caller now. *)
+  let caller_count = count_external_refs "run_background_validation" in
+  Alcotest.(check bool)
+    (Printf.sprintf "G22: run_background_validation has >= 1 production caller outside assume_utxo.ml (rpc.ml loadtxoutset; Core MaybeValidateSnapshot), got %d" caller_count)
+    true (caller_count >= 1)
 
 (* G23: InvalidateCoinsDBOnDisk rename-to-_INVALID — absent (BUG-W138-11). *)
 let test_g23_invalidate_rename_absent () =
@@ -550,16 +595,19 @@ let test_g25_target_utxohash_record_absent () =
 
 (* G26: getchainstates RPC — absent (BUG-W138-14). *)
 let test_g26_getchainstates_rpc_absent () =
+  (* BUG-W138-14 CLOSED: Core rpc/blockchain.cpp getchainstates() is
+     implemented (handle_getchainstates + dispatch arm; test_loadtxoutset_live
+     drives it end to end). *)
   let src_has_handler = source_contains ~path:(rpc_ml ())
                           ~needle:"handle_getchainstates" in
   let src_has_dispatch = source_contains ~path:(rpc_ml ())
                            ~needle:"\"getchainstates\" ->" in
   Alcotest.(check bool)
-    "G26: rpc.ml has no handle_getchainstates handler (BUG-W138-14)"
-    false src_has_handler;
+    "G26: rpc.ml has handle_getchainstates (Core rpc/blockchain.cpp getchainstates)"
+    true src_has_handler;
   Alcotest.(check bool)
-    "G26: rpc.ml has no 'getchainstates' command dispatch arm"
-    false src_has_dispatch
+    "G26: rpc.ml has a 'getchainstates' dispatch arm"
+    true src_has_dispatch
 
 (* G27: NODE_NETWORK → NODE_NETWORK_LIMITED swap on loadtxoutset
    success — absent (BUG-W138-15). *)
@@ -620,27 +668,17 @@ let test_g30_dumptxoutset_pruned_mode_check () =
    will flip and the BUG should be re-classified.
 *)
 
-let count_external_refs symbol =
-  let cmd = Printf.sprintf
-    "grep -rln '%s' \
-     /home/work/hashhog/camlcoin/lib/ \
-     /home/work/hashhog/camlcoin/bin/ 2>/dev/null \
-     | grep -v assume_utxo.ml | wc -l > /tmp/w138_count.txt"
-    symbol in
-  let _ = Sys.command cmd in
-  try
-    let ic = open_in "/tmp/w138_count.txt" in
-    let s = String.trim (input_line ic) in
-    close_in ic;
-    int_of_string s
-  with _ -> -1
-
 let test_inv_orphan_cluster_remains_dormant () =
+  (* run_background_validation left the dormant cluster when loadtxoutset was
+     wired (BUG-W138-10 closed, see G22); the remaining helpers still have no
+     production caller outside assume_utxo.ml. *)
+  Alcotest.(check bool)
+    "INV: run_background_validation is WIRED (>= 1 production caller; BUG-W138-10 closed)"
+    true (count_external_refs "run_background_validation" >= 1);
   let symbols = [
     "create_chainstate";
     "has_snapshot_chainstate";
     "background_chainstate";
-    "run_background_validation";
     "connect_block_to_cache";
   ] in
   List.iter (fun sym ->
@@ -695,12 +733,21 @@ let test_inv_hash_serialized_is_strict_gate () =
     "INV-3: docstring explicitly contrasts HASH_SERIALIZED vs MuHash3072"
     true src_has_not_the
 
-(* INV-4: mainnet AssumeUTXO entries are all 4 Core 31.99 heights. *)
+(* INV-4: mainnet AssumeUTXO entries = the 4 Core 31.99 heights
+   (bitcoin-core/src/kernel/chainparams.cpp:158-182 m_assumeutxo_data:
+   840000 / 880000 / 910000 / 935000) plus camlcoin's two hashhog-local
+   entries: 944183 (R4 capture) and 481823 (Track-B windowed-replay base,
+   cd5d750; INERT for normal boot, consulted only by --import-utxo and the
+   snapshot RPCs).  Pin the exact table so a silent addition or a dropped
+   Core entry both fail loudly. *)
 let test_inv_mainnet_au_entries_complete () =
   let heights = Assume_utxo.available_snapshot_heights
                   Consensus.mainnet in
-  Alcotest.(check (list int)) "INV-4: 4 mainnet heights present"
-    [840_000; 880_000; 910_000; 935_000] heights
+  let core_heights = [840_000; 880_000; 910_000; 935_000] in
+  Alcotest.(check bool) "INV-4: all 4 Core chainparams.cpp mainnet heights present"
+    true (List.for_all (fun h -> List.mem h heights) core_heights);
+  Alcotest.(check (list int)) "INV-4: exact mainnet table = Core 4 + hashhog 944183 + Track-B 481823"
+    [481_823; 840_000; 880_000; 910_000; 935_000; 944_183] heights
 
 (* INV-5: testnet4 has no published AssumeUTXO heights (Core 31.99). *)
 let test_inv_testnet4_au_entries_empty () =

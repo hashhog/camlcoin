@@ -241,13 +241,26 @@
    that root. *)
 let project_root =
   let cwd = Sys.getcwd () in
-  let rec walk dir n =
+  (* Prefer the real source tree — the one that also carries
+     config.example.toml (G10 reads it).  The dune sandbox copies lib/ into
+     _build/default, which is the first "lib/cli.ml" hit from a test exe's
+     CWD but has no config.example.toml, so a plain lib/cli.ml probe resolved
+     G10's fixture path into the sandbox and raised Sys_error. *)
+  let is_root dir = Sys.file_exists (Filename.concat dir "lib/cli.ml") in
+  let is_source_root dir =
+    is_root dir && Sys.file_exists (Filename.concat dir "config.example.toml") in
+  let rec walk pred dir n =
     if n > 6 then None
-    else if Sys.file_exists (Filename.concat dir "lib/cli.ml") then Some dir
+    else if pred dir then Some dir
     else
       let parent = Filename.dirname dir in
       if parent = dir then None
-      else walk parent (n + 1)
+      else walk pred parent (n + 1)
+  in
+  let walk dir n =
+    match walk is_source_root dir n with
+    | Some d -> Some d
+    | None -> walk is_root dir n
   in
   match walk cwd 0 with
   | Some d -> d
@@ -525,9 +538,10 @@ let g15_log_format_thin_partial () =
    ============================================================================ *)
 let g16_logging_rpc_missing () =
   let src = read_file "lib/rpc.ml" in
-  Alcotest.(check bool) "BUG-4: no \"logging\" RPC dispatcher case" false
+  (* BUG-4 FIXED: Core rpc/node.cpp logging() — handle_logging + dispatch arm. *)
+  Alcotest.(check bool) "BUG-4 fixed: \"logging\" RPC dispatcher case (Core rpc/node.cpp logging)" true
     (contains src "| \"logging\" ->");
-  Alcotest.(check bool) "BUG-4: no handle_logging helper" false
+  Alcotest.(check bool) "BUG-4 fixed: handle_logging helper present" true
     (contains src "let handle_logging ")
 
 (* ============================================================================
@@ -535,9 +549,10 @@ let g16_logging_rpc_missing () =
    ============================================================================ *)
 let g17_getmemoryinfo_rpc_missing () =
   let src = read_file "lib/rpc.ml" in
-  Alcotest.(check bool) "BUG-5: no \"getmemoryinfo\" RPC dispatcher case" false
+  (* BUG-5 FIXED: Core rpc/node.cpp getmemoryinfo() — handler + dispatch arm. *)
+  Alcotest.(check bool) "BUG-5 fixed: \"getmemoryinfo\" RPC dispatcher case (Core rpc/node.cpp getmemoryinfo)" true
     (contains src "| \"getmemoryinfo\" ->");
-  Alcotest.(check bool) "BUG-5: no handle_getmemoryinfo helper" false
+  Alcotest.(check bool) "BUG-5 fixed: handle_getmemoryinfo helper present" true
     (contains src "let handle_getmemoryinfo ")
 
 (* ============================================================================

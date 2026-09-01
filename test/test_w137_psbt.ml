@@ -606,7 +606,9 @@ let test_g26_no_joinpsbts_rpc () =
     || source_contains ~path:src ~needle:"\"joinpsbts\""
     || source_contains ~path:src ~needle:"join_psbts"
   in
-  Alcotest.(check bool) "G26: joinpsbts RPC absent (BUG-W137-20)" false has
+  (* BUG-W137-20 FIXED: Core rpc/rawtransaction.cpp joinpsbts is implemented
+     (lib/rpc.ml handle_joinpsbts + dispatch; test_w142_joinpsbts covers it). *)
+  Alcotest.(check bool) "G26: joinpsbts RPC present (BUG-W137-20 fixed)" true has
 
 (* G27: descriptorprocesspsbt RPC absent (BUG-W137-21). *)
 let test_g27_no_descriptorprocesspsbt_rpc () =

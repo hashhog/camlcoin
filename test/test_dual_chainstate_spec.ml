@@ -167,6 +167,13 @@ let seed_blockstore (chain : Sync.chain_state) (db : Storage.ChainDB.t)
   List.iter (fun b ->
     Storage.ChainDB.store_block db b.hash b.block;
     Storage.ChainDB.store_block_header db b.hash b.block.Types.header;
+    (* The bg validator walks get_header_at_height, i.e. the height->hash
+       index of the ACTIVE chain.  Since fecf534 accept_header no longer
+       writes that index (Core chain.h: only CChain::SetTip does, on
+       connect), so the fixture — which stands in for the shared blockman
+       whose chain these blocks ARE — writes the slot itself; without it the
+       validator's "wait for more blocks" loop (assume_utxo.ml) spun forever. *)
+    Storage.ChainDB.set_height_hash db b.height b.hash;
     cum := Consensus.work_add !cum
              (Consensus.work_from_compact b.block.Types.header.bits);
     let entry : Sync.header_entry = {

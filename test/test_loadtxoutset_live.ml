@@ -243,6 +243,29 @@ let make_live_ctx (blocks : built list)
   } in
   (ctx, dir, db)
 
+(* handle_loadtxoutset spawns the background validator with Lwt.async
+   (757856c — Core runs MaybeValidateSnapshot asynchronously and loadtxoutset
+   returns before a verdict exists).  This test is synchronous, so nothing
+   drives the Lwt scheduler after the call: pump it until the snapshot
+   chainstate leaves Unvalidated (or a deadline), the way a daemon's main loop
+   would, then read the verdict through getchainstates as before. *)
+let drive_background_validation (ctx : Rpc.rpc_context) : unit =
+  match ctx.Rpc.snapshot_activation with
+  | None -> ()
+  | Some act ->
+    let deadline = Unix.gettimeofday () +. 60.0 in
+    let rec pump () =
+      if act.Assume_utxo.snapshot.Assume_utxo.assumeutxo_state
+         <> Assume_utxo.Unvalidated then ()
+      else if Unix.gettimeofday () > deadline then
+        failwith "background validation did not reach a verdict within 60s"
+      else begin
+        Lwt_main.run (Lwt_unix.sleep 0.05);
+        pump ()
+      end
+    in
+    pump ()
+
 (* Pull validated + snapshot_blockhash out of a getchainstates JSON response. *)
 let read_getchainstates (j : Yojson.Safe.t) : bool * string option =
   match j with
@@ -325,6 +348,11 @@ let test_live_loadtxoutset_accept () =
     (* The wiring must have recorded an activation on the context. *)
     check name (ctx.Rpc.snapshot_activation <> None)
       "loadtxoutset must record a snapshot activation (dual-chainstate wired)";
+    (* Core-faithful: immediately after the call the verdict is pending. *)
+    let (v_pending, _) = read_getchainstates (Rpc.handle_getchainstates ctx) in
+    check name (not v_pending)
+      "validated must be false while the background validation is pending (Core async MaybeValidateSnapshot)";
+    drive_background_validation ctx;
 
     (* getchainstates must now report the snapshot chainstate: validated=true
        (bg matched) + snapshot_blockhash = the base. *)
@@ -420,6 +448,7 @@ let test_live_loadtxoutset_reject () =
 
     check name (ctx.Rpc.snapshot_activation <> None)
       "loadtxoutset must still record the activation (so the invalid verdict is visible)";
+    drive_background_validation ctx;
 
     (* getchainstates must report the snapshot chainstate as NOT validated. *)
     let (validated, snap) = read_getchainstates (Rpc.handle_getchainstates ctx) in

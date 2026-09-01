@@ -537,7 +537,12 @@ let test_g24_bug15_try_1p1c_not_wired () =
   let (mp, _utxo, db, txid1, _, _) = create_test_mempool () in
   let parent = make_regular_tx
     [make_test_input txid1 0l]
-    [make_test_output 999_990L]  (* 10 sat fee — below min *)
+    [make_test_output 999_999L]
+    (* 1 sat fee (~10 sat/kvB) — below the relay floor.  The fixture used a
+       10 sat fee, which on a ~100-byte tx is ~100 sat/kvB and MEETS the floor
+       now that min_relay_fee mirrors Core policy.h:70
+       DEFAULT_MIN_RELAY_TX_FEE = 100 sat/kvB (it was 1000 when this pin was
+       written), so the parent was accepted on its own and the pin misfired. *)
   in
   let parent_txid = Crypto.compute_txid parent in
   let child = make_regular_tx

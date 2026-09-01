@@ -649,9 +649,14 @@ let test_g19_no_bip54_sigops_check () =
     "G19: BUG-W135-7 — CheckSigopsBIP54 (MAX_TX_LEGACY_SIGOPS=2500) missing"
     true true
 
-(* G20: BUG-W135-8 — extract_last_push_data skips OP_n / OP_0 / OP_1NEGATE.
-   For a scriptSig "<PUSH redeem> OP_1", Core EvalScript leaves [redeem; 0x01]
-   on stack; "last item" is 0x01.  camlcoin returns `redeem` instead. *)
+(* G20: BUG-W135-8 FIXED — extract_last_push_data no longer skips OP_n /
+   OP_0 / OP_1NEGATE.  Every caller (Validation.count_*_sigops, Mempool
+   AreInputsStandard gate 3) mirrors Core CScript::GetSigOpCount(scriptSig)
+   (script.cpp), which takes the LAST vchRet of GetScriptOp: GetScriptOp
+   clears pvchRet at the top of every call and only refills it for opcodes
+   <= OP_PUSHDATA4, so for "<PUSH redeem> OP_1" the last data is EMPTY (and
+   the subscript counts 0 sigops) — not `redeem` (the pre-fix bug) and not
+   0x01 (that is EvalScript's stack, a different Core function). *)
 let test_g20_extract_last_push_misses_opn () =
   (* Build scriptSig: PUSH_2 <0xde 0xad> OP_1 *)
   let scriptsig = Cstruct.create 4 in
@@ -662,10 +667,10 @@ let test_g20_extract_last_push_misses_opn () =
   match Validation.extract_last_push_data scriptsig with
   | Some last ->
     let last_bytes = Cstruct.to_string last in
-    (* camlcoin returns 0xde 0xad (the literal push) — NOT 0x01 like Core. *)
-    Alcotest.(check bool)
-      "G20: BUG-W135-8 — extract_last_push_data returns prior push, not OP_1 value"
-      true (last_bytes = "\xde\xad")
+    (* Core script.cpp GetScriptOp: vchRet cleared for OP_1 -> empty last push. *)
+    Alcotest.(check int)
+      "G20: BUG-W135-8 fixed — trailing OP_1 yields an EMPTY last push (Core GetScriptOp clears vchRet), not the prior push"
+      0 (String.length last_bytes)
   | None ->
     Alcotest.fail "G20: extract_last_push_data returned None"
 

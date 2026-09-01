@@ -2671,11 +2671,29 @@ let test_invalidate_reorg_reconsider () =
     ~prev_height:0
     ~bits:Consensus.regtest.genesis_header.bits () in
 
-  (* Manually add block1 to state *)
+  (* Manually add block1 to state.  invalidate_block rewinds the active
+     chain through Sync.disconnect_to_target (Core InvalidateBlock ->
+     DisconnectTip), which needs each connected block's BODY and UNDO data on
+     disk — so store a coinbase-only body plus an empty undo record for every
+     block this fixture puts on the active chain. *)
+  let store_body (entry : Sync.header_entry) =
+    let body = make_coinbase_only_block
+      ~prev_block:entry.header.prev_block ~ts:entry.header.timestamp
+      ~nc:entry.header.nonce ~output_value:50_00000000L
+      ~output_script:(Cstruct.of_string "\x51") in
+    let body = { body with Types.header = entry.header } in
+    Storage.ChainDB.store_block state.db entry.hash body;
+    let undo : Utxo.undo_data = { height = entry.height; tx_undos = [] } in
+    let uw = Serialize.writer_create () in
+    Utxo.serialize_undo_data uw undo;
+    Storage.ChainDB.store_undo_data state.db entry.hash
+      (Cstruct.to_string (Serialize.writer_to_cstruct uw))
+  in
   let block1_key = Cstruct.to_string block1_entry.hash in
   Hashtbl.replace state.headers block1_key block1_entry;
   Storage.ChainDB.store_block_header state.db block1_entry.hash block1_entry.header;
   Storage.ChainDB.set_height_hash state.db block1_entry.height block1_entry.hash;
+  store_body block1_entry;
 
   (* Properly compute block1's cumulative work *)
   let block1_work = Consensus.work_add genesis_entry.total_work
@@ -2698,6 +2716,7 @@ let test_invalidate_reorg_reconsider () =
   Hashtbl.replace state.headers block2_key block2_entry;
   Storage.ChainDB.store_block_header state.db block2_entry.hash block2_entry.header;
   Storage.ChainDB.set_height_hash state.db block2_entry.height block2_entry.hash;
+  store_body block2_entry;
 
   (* Properly compute block2's cumulative work *)
   let block2_work = Consensus.work_add block1_entry.total_work
@@ -2820,8 +2839,9 @@ let test_bip35_default_off () =
     true (Int64.logand bits 4L = 0L);
   (* NODE_NETWORK_LIMITED is advertised unconditionally (Core init.cpp:863),
      so default bits = NETWORK|WITNESS|NETWORK_LIMITED = 1|8|1024 = 0x409. *)
-  Alcotest.(check int64) "default service bits = 0x409 (NETWORK|WITNESS|NETWORK_LIMITED)"
-    0x409L bits
+  (* | NODE_P2P_V2 (0x800): Core net.h:101 DEFAULT_V2_TRANSPORT = true -> 0xC09. *)
+  Alcotest.(check int64) "default service bits = 0xC09 (NETWORK|WITNESS|NETWORK_LIMITED|P2P_V2)"
+    0xC09L bits
 
 (* When the operator passes --peerbloomfilters, NODE_BLOOM is set and the
    MEMPOOL handler will serve InvMsg responses to peers. *)
@@ -2834,8 +2854,9 @@ let test_bip35_advertise_when_enabled () =
     true (Int64.logand bits 4L <> 0L);
   (* NODE_NETWORK_LIMITED advertised unconditionally (Core init.cpp:863):
      NETWORK|BLOOM|WITNESS|NETWORK_LIMITED = 1|4|8|1024 = 0x40D = 1037. *)
-  Alcotest.(check int64) "enabled service bits = 0x40D (NETWORK|BLOOM|WITNESS|NETWORK_LIMITED)"
-    0x40DL bits;
+  (* | NODE_P2P_V2 (0x800): Core net.h:101 DEFAULT_V2_TRANSPORT = true -> 0xC0D. *)
+  Alcotest.(check int64) "enabled service bits = 0xC0D (NETWORK|BLOOM|WITNESS|NETWORK_LIMITED|P2P_V2)"
+    0xC0DL bits;
   (* Restore Core default for subsequent tests *)
   Peer.set_peer_bloom_filters false
 
@@ -3015,7 +3036,13 @@ let test_register_side_branch_header_invariants () =
   Sync.accept_header state a1_entry;
   Alcotest.(check bool) "A1 in headers map" true
     (Hashtbl.mem state.headers (Cstruct.to_string a1_entry.hash));
-  (* set_height_hash 1 -> A1 *)
+  (* Header acceptance must NOT touch the height->hash index: Core chain.h
+     CChain::SetTip is its only writer (from ConnectTip/DisconnectTip), never
+     AcceptBlockHeader (camlcoin fecf534; lib/sync.ml accept_header). *)
+  Alcotest.(check bool) "h=1 mapping untouched by accept_header (Core chain.h SetTip is the only writer)"
+    true (Storage.ChainDB.get_hash_at_height db 1 = None);
+  (* Stand in for SetTip: connect A1 as the active block at height 1. *)
+  Storage.ChainDB.set_height_hash db 1 a1_entry.hash;
   let h1_active_pre = Storage.ChainDB.get_hash_at_height db 1 in
   Alcotest.(check bool) "h=1 active mapping = A1" true
     (match h1_active_pre with
@@ -3886,12 +3913,15 @@ let test_w97_g19b_no_hasmoresamework_gate () =
 let test_w97_g19c_no_too_far_ahead_gate () =
   (* blocks_synced starts at 0 (genesis), so tip+288 = 288. *)
   (* --- case 1: unrequested, height = 289 (> 0+288) — must be rejected --- *)
-  let (state1, db1, _) = w97_build_chain 289 in
+  let (state1, db1, headers1) = w97_build_chain 289 in
   (* w97_build_chain 289 builds 289 header entries (heights 1..289) without
-     advancing blocks_synced; the block-tip remains at height 0. *)
+     advancing blocks_synced; the block-tip remains at height 0.  These are
+     HEADERS ONLY, so they are not in the height->hash index (Core chain.h:
+     only CChain::SetTip writes it, on connect) — take the header from the
+     builder's own list instead of get_header_at_height. *)
   let header_289 =
-    match Sync.get_header_at_height state1 289 with
-    | Some e -> e.header
+    match List.nth_opt headers1 288 with
+    | Some h -> h
     | None ->
       Storage.ChainDB.close db1; w97_cleanup_db ();
       Alcotest.fail "G19c case1: could not retrieve header at height 289"
@@ -3909,10 +3939,10 @@ let test_w97_g19c_no_too_far_ahead_gate () =
        "G19c case1 FAIL: expected too-far-ahead, got Error %S" e));
 
   (* --- case 2: unrequested, height = 288 (= 0+288) — boundary must pass --- *)
-  let (state2, db2, _) = w97_build_chain 288 in
+  let (state2, db2, headers2) = w97_build_chain 288 in
   let header_288 =
-    match Sync.get_header_at_height state2 288 with
-    | Some e -> e.header
+    match List.nth_opt headers2 287 with  (* headers only: not in the active-chain index *)
+    | Some h -> h
     | None ->
       Storage.ChainDB.close db2; w97_cleanup_db ();
       Alcotest.fail "G19c case2: could not retrieve header at height 288"
@@ -3927,10 +3957,10 @@ let test_w97_g19c_no_too_far_ahead_gate () =
    | Ok () | Error _ -> ());   (* any other result is fine for this boundary check *)
 
   (* --- case 3: explicitly requested, height = 289 — must NOT be rejected --- *)
-  let (state3, db3, _) = w97_build_chain 289 in
+  let (state3, db3, headers3) = w97_build_chain 289 in
   let header_289b =
-    match Sync.get_header_at_height state3 289 with
-    | Some e -> e.header
+    match List.nth_opt headers3 288 with  (* headers only: not in the active-chain index *)
+    | Some h -> h
     | None ->
       Storage.ChainDB.close db3; w97_cleanup_db ();
       Alcotest.fail "G19c case3: could not retrieve header at height 289"
@@ -4282,6 +4312,10 @@ let test_mtp_hash_linked_correct_under_height_index_corruption () =
     total_work = Consensus.work_add genesis_entry.total_work
                    (Sync.work_from_bits 0x207fffffl) } in
   Sync.accept_header state h1_main_entry;
+  (* accept_header no longer writes the height->hash index (Core chain.h:
+     CChain::SetTip is its only writer; camlcoin fecf534).  Connect h1_main
+     as the active block at height 1 explicitly. *)
+  Storage.ChainDB.set_height_hash db 1 h1_main_hash;
 
   (* Verify height->hash[1] now points to h1_main. *)
   let h1_active_before = Storage.ChainDB.get_hash_at_height db 1 in
@@ -4305,7 +4339,11 @@ let test_mtp_hash_linked_correct_under_height_index_corruption () =
     header = h1_side_header; hash = h1_side_hash; height = 1;
     total_work = Consensus.work_add genesis_entry.total_work
                    (Sync.work_from_bits 0x207fffffl) } in
-  Sync.accept_header state h1_side_entry;  (* corrupts height->hash[1] *)
+  Sync.accept_header state h1_side_entry;
+  (* Post-fecf534 accept_header cannot corrupt the index any more; the test
+     is about compute_mtp_hash_linked NOT trusting the index, so inject the
+     corruption directly (as a stale pre-fix datadir would present it). *)
+  Storage.ChainDB.set_height_hash db 1 h1_side_hash;
 
   (* Confirm corruption: height->hash[1] now points to the side-branch. *)
   let h1_active_after = Storage.ChainDB.get_hash_at_height db 1 in
@@ -4449,7 +4487,12 @@ let test_w3f2_retarget_ancestry_correct_under_height_index_corruption () =
     header = h1_side_header; hash = h1_side_hash; height = 1;
     total_work = Consensus.work_add genesis_entry.total_work
                    (Sync.work_from_bits b_side) } in
-  Sync.accept_header state h1_side_entry;  (* contaminates height-1 index *)
+  Sync.accept_header state h1_side_entry;
+  (* accept_header no longer writes the height->hash index (Core chain.h
+     CChain::SetTip is its only writer; camlcoin fecf534), so inject the
+     contamination directly — the test is about compute_expected_bits NOT
+     trusting the index when a parent_entry is supplied. *)
+  Storage.ChainDB.set_height_hash db 1 h1_side_hash;
 
   (* Confirm corruption: height-1 now points at h1_side. *)
   let height1_hash = Storage.ChainDB.get_hash_at_height db 1 in

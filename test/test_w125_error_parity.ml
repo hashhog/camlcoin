@@ -79,8 +79,26 @@ let resolve_repo_root () =
 let rpc_ml () : string =
   read_file (Filename.concat (resolve_repo_root ()) "lib/rpc.ml")
 
-let audit_doc_path () : string =
-  Filename.concat (resolve_repo_root ()) "audit/w125_rpc_error_parity.md"
+
+(* The per-node audit/*.md documents were moved out of the submodule into the
+   meta-repo archive (camlcoin b04204b, 2026-06-28):
+     <meta-repo>/audit-archive/nodes/camlcoin/audit/<name>
+   Walk up from the CWD until that archive directory is found (from the dune
+   sandbox the first "repo root" hit is _build/default, whose parent chain
+   still reaches the meta-repo). *)
+let audit_archive_doc (name : string) : string =
+  let rel = Filename.concat "audit-archive/nodes/camlcoin/audit" name in
+  let rec up dir depth =
+    let cand = Filename.concat dir rel in
+    if Sys.file_exists cand then cand
+    else if depth > 12 then cand  (* not found: return a path that fails loudly *)
+    else
+      let parent = Filename.dirname dir in
+      if parent = dir then cand else up parent (depth + 1)
+  in
+  up (Sys.getcwd ()) 0
+
+let audit_doc_path () : string = audit_archive_doc "w125_rpc_error_parity.md"
 
 let contains_substring (haystack : string) (needle : string) : bool =
   let h = String.length haystack in
@@ -218,11 +236,13 @@ let g8_type_error_declared () =
   assert_code_declared ~name:"rpc_type_error" ~value:(-3)
 
 let g8_type_error_NOT_routed () =
-  (* PARTIAL: declared at line 34 but never routed by the dispatcher. *)
+  (* BUG-7 CLOSED: RPC_TYPE_ERROR (-3) is now routed by the dispatcher —
+     Core rpc/protocol.h RPC_TYPE_ERROR is the code for wrong-typed
+     arguments (rpc/util.cpp ParseHashV / getInt<T> failures). *)
   let n = count_routes ~name:"rpc_type_error" in
-  Alcotest.(check int)
-    "G8 rpc_type_error PARTIAL: routed 0 times (declared, never used)"
-    0 n
+  Alcotest.(check bool)
+    (Printf.sprintf "G8 rpc_type_error routed >= 1 time (Core rpc/protocol.h RPC_TYPE_ERROR -3), got %d" n)
+    true (n >= 1)
 
 (* -- G9 RPC_WALLET_ERROR -4 PRESENT ----------------------------------- *)
 
@@ -245,10 +265,13 @@ let g10_invalid_address_under_routed () =
      including block-not-found / txid-not-found.  Assert 3..6 routes
      captures the current under-routed state.  When the gate closes,
      this count will rise. *)
+  (* BUG-6 CLOSED: block-not-found / txid-not-found / bad-address paths now
+     route -5 the way Core does (~12 call sites, rpc/blockchain.cpp
+     "Block not found", rpc/rawtransaction.cpp, rpc/util.cpp). *)
   let n = count_routes ~name:"rpc_invalid_address" in
   Alcotest.(check bool)
-    (Printf.sprintf "G10 rpc_invalid_address PARTIAL: routed %d times (3..6 = under-routed)" n)
-    true (n >= 3 && n <= 6)
+    (Printf.sprintf "G10 rpc_invalid_address routed >= 7 times (Core RPC_INVALID_ADDRESS_OR_KEY -5 at ~12 sites), got %d" n)
+    true (n >= 7)
 
 (* -- G11 RPC_WALLET_INSUFFICIENT_FUNDS -6 PARTIAL -------------------- *)
 
@@ -271,7 +294,8 @@ let g12_out_of_memory_NOT_declared () =
 (* -- G13 RPC_INVALID_PARAMETER -8 MISSING ----------------------------- *)
 
 let g13_invalid_parameter_NOT_declared () =
-  assert_code_not_declared ~name:"rpc_invalid_parameter"
+  (* BUG-20 CLOSED: -8 is declared (Core rpc/protocol.h RPC_INVALID_PARAMETER). *)
+  assert_code_declared ~name:"rpc_invalid_parameter" ~value:(-8)
 
 (* -- G14 RPC_DATABASE_ERROR -20 MISSING ------------------------------- *)
 
@@ -299,10 +323,12 @@ let g16_verify_error_NOT_routed () =
      submitblock errors are routed to -26 (rpc_verify_rejected) instead
      of -25, which is Core's choice for submitblock (mining.cpp:1141,
      1143).  See BUG-3 in audit/w125_rpc_error_parity.md. *)
+  (* BUG-3 CLOSED: -25 is routed (Core rpc/mining.cpp submitblock ->
+     RPC_VERIFY_ERROR for "Block decode failed" / "Block does not start with a coinbase"). *)
   let n = count_routes ~name:"rpc_verify_error" in
-  Alcotest.(check int)
-    "G16 rpc_verify_error PARTIAL: routed 0 times (declared, never used)"
-    0 n
+  Alcotest.(check bool)
+    (Printf.sprintf "G16 rpc_verify_error routed >= 1 time (Core rpc/mining.cpp RPC_VERIFY_ERROR -25), got %d" n)
+    true (n >= 1)
 
 let g16_submitblock_routes_through_wrong_code () =
   (* Confirm the BUG-3 mis-routing: submitblock uses
@@ -376,7 +402,8 @@ let g26_invalid_ip_or_subnet_declared () =
 (* -- G27 RPC_CLIENT_P2P_DISABLED -31 MISSING ------------------------- *)
 
 let g27_p2p_disabled_NOT_declared () =
-  assert_code_not_declared ~name:"rpc_client_p2p_disabled"
+  (* BUG-14 CLOSED: -31 declared (Core rpc/protocol.h RPC_CLIENT_P2P_DISABLED). *)
+  assert_code_declared ~name:"rpc_client_p2p_disabled" ~value:(-31)
 
 (* -- G28 RPC_CLIENT_NODE_CAPACITY_REACHED -34 MISSING --------------- *)
 
@@ -497,10 +524,11 @@ let as2_missing_distinct_codes () =
     let pat = Printf.sprintf "let %s =" c in
     if contains_substring src pat then acc else acc + 1
   ) 0 missing in
-  (* 27 baseline - 5 now-declared (G13 + G23/G24/G25/G26) = 22 still missing. *)
+  (* 27 baseline - 6 now-declared (G13 -8, G23 -23, G24 -24, G25 -29,
+     G26 -30, G27 -31; all per Core rpc/protocol.h) = 21 still missing. *)
   Alcotest.(check int)
-    "AS2: 22 of the original 27 W125-missing Core codes remain undeclared"
-    22 still_missing
+    "AS2: 21 of the original 27 W125-missing Core codes remain undeclared"
+    21 still_missing
 
 (* Bug count: 22 catalogued in audit/w125_rpc_error_parity.md.  This
    assertion encodes the audit-time count via a sentinel constant. *)

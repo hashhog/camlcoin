@@ -96,8 +96,26 @@ let cli_ml () : string =
 let main_ml () : string =
   read_file (Filename.concat (resolve_repo_root ()) "bin/main.ml")
 
-let audit_doc_path () : string =
-  Filename.concat (resolve_repo_root ()) "audit/w140_http_rpcauth.md"
+
+(* The per-node audit/*.md documents were moved out of the submodule into the
+   meta-repo archive (camlcoin b04204b, 2026-06-28):
+     <meta-repo>/audit-archive/nodes/camlcoin/audit/<name>
+   Walk up from the CWD until that archive directory is found (from the dune
+   sandbox the first "repo root" hit is _build/default, whose parent chain
+   still reaches the meta-repo). *)
+let audit_archive_doc (name : string) : string =
+  let rel = Filename.concat "audit-archive/nodes/camlcoin/audit" name in
+  let rec up dir depth =
+    let cand = Filename.concat dir rel in
+    if Sys.file_exists cand then cand
+    else if depth > 12 then cand  (* not found: return a path that fails loudly *)
+    else
+      let parent = Filename.dirname dir in
+      if parent = dir then cand else up parent (depth + 1)
+  in
+  up (Sys.getcwd ()) 0
+
+let audit_doc_path () : string = audit_archive_doc "w140_http_rpcauth.md"
 
 let contains_substring (haystack : string) (needle : string) : bool =
   let h = String.length haystack in
@@ -202,10 +220,15 @@ let g4_tcp_nodelay_NOT_set () =
 
 let g5_no_unsafe_bind_warning () =
   let rpc = rpc_ml () in
+  (* Core httpserver.cpp:347 logs "The RPC server is not safe to expose to
+     untrusted networks such as the public internet" on a non-loopback bind.
+     The needle is the warning text itself: a bare "untrusted" now matches the
+     getbalances "untrusted_pending" field (Core wallet/rpc/coins.cpp) and
+     pinned nothing. *)
   Alcotest.(check bool)
-    "G5 (BUG-19) no \"not safe to expose to untrusted networks\" warning"
+    "G5 (BUG-19) no \"not safe to expose to untrusted networks\" warning (Core httpserver.cpp:347)"
     false
-    (contains_substring rpc "untrusted"
+    (contains_substring rpc "not safe to expose to untrusted networks"
      || contains_substring rpc "unsafe to expose")
 
 (* ============================================================================
@@ -439,11 +462,15 @@ let g21_empty_batch_invalid_request () =
 
 let g22_single_object_dispatch () =
   let rpc = rpc_ml () in
+  (* Single-object dispatch now goes through the Lwt wrapper so the
+     wait-family RPCs can block the request coroutine; the sync
+     handle_single_request is reached from handle_single_request_lwt. *)
   Alcotest.(check bool)
-    "G22 single `Assoc request → handle_single_request"
+    "G22 single `Assoc request → handle_single_request_lwt → handle_single_request"
     true
     (contains_substring rpc "| `Assoc _ as single_request"
-     && contains_substring rpc "handle_single_request request_ctx single_request")
+     && contains_substring rpc "handle_single_request_lwt request_ctx single_request"
+     && contains_substring rpc "Lwt.return (handle_single_request ctx json)")
 
 (* -- G23 Array (batch) dispatch — PRESENT ------------------------------- *)
 
@@ -576,12 +603,15 @@ let g30_no_max_body_size () =
 
 let g30_no_max_headers_size () =
   let rpc = rpc_ml () in
+  (* Core httpserver.cpp:51/409 evhttp_set_max_headers_size(MAX_HEADERS_SIZE
+     = 8192).  A bare "8192" needle matched the rocksdb 8192 MiB cache comment
+     in rpc.ml and pinned nothing; look for the limit by name. *)
   Alcotest.(check bool)
-    "G30 (BUG-17) no MAX_HEADERS_SIZE (8192) limit"
+    "G30 (BUG-17) no MAX_HEADERS_SIZE (8192) limit (Core httpserver.cpp:409)"
     false
     (contains_substring rpc "MAX_HEADERS_SIZE"
      || contains_substring rpc "max_headers_size"
-     || contains_substring rpc "8192")
+     || contains_substring rpc "set_max_headers_size")
 
 (* ============================================================================
    Audit-status checks

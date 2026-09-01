@@ -299,21 +299,22 @@ let test_g7_no_per_tx_hashtx_on_block_connect () =
       "G7: BUG-W141-7 — no per-tx hashtx/rawtx in zmq_notify_block"
       false has_tx_iter
 
-(* G8: BUG-W141-8 — no role.historical / assumeutxo background gate. *)
+(* G8: BUG-W141-8 — background-chainstate ZMQ gate.
+   Core zmq/zmqnotificationinterface.cpp:180-182 BlockConnected returns
+   early `if (role.historical)`, so the assumeutxo background validator
+   never publishes block notifications.  camlcoin satisfies this
+   structurally: the background validator (lib/assume_utxo.ml
+   run_background_validation) has no ZMQ publish path at all — only the
+   active-chain connect path in Sync/Cli reaches Zmq_notify.  The old pin
+   grepped for the identifier "ChainstateRole" and started matching a
+   doc-comment that cites Core's field name, so it pinned nothing. *)
 let test_g8_no_historical_role_gate () =
-  let sync = load_source "lib/sync.ml" in
-  let assume = load_source "lib/assume_utxo.ml" in
-  let combined =
-    Option.value sync ~default:"" ^ Option.value assume ~default:""
-  in
-  let has_historical_gate =
-    string_contains combined "role.historical" ||
-    string_contains combined "ChainstateRole" ||
-    string_contains combined "is_historical"
-  in
+  let assume = Option.value (load_source "lib/assume_utxo.ml") ~default:"" in
   Alcotest.(check bool)
-    "G8: BUG-W141-8 — no `role.historical` gate threaded into ZMQ"
-    false has_historical_gate
+    "G8: assume_utxo.ml source is readable" true (assume <> "");
+  Alcotest.(check bool)
+    "G8: background validator has no ZMQ publish path (Core zmqnotificationinterface.cpp:182 role.historical skip)"
+    false (string_contains assume "Zmq_notify")
 
 (* G9: BUG-W141-9 — ZMQ_LINGER=0 is set, but at SOCKET-CREATE time
    (zmq_stubs.c:141-145 caml_zmq_pub_socket), NOT just-before-close

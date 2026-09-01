@@ -435,16 +435,16 @@ let test_g20_outbound_select_10min_30tries_gate () =
    addnode list. camlcoin has no parallel set or check. *)
 let test_g21_outbound_skip_addnode () =
   let src = peer_manager_ml () in
+  (* BUG-18 FIXED: peer_manager.ml keeps an addnode table
+     ([added_nodes] field + add_added_node / remove_added_node), the
+     analogue of Core CConnman::m_added_node_params (net.cpp AddedNodesContain). *)
   Alcotest.(check bool)
-    "BUG-18: no AddedNodesContain / addnode-skip predicate"
-    false (contains_substring src "AddedNodesContain" ||
-           contains_substring src "added_nodes_contains" ||
-           contains_substring src "is_added_node");
-  (* Force-confirm: no separate addnode tracking table. *)
+    "BUG-18 fixed: added_nodes table present (Core net.cpp m_added_node_params)"
+    true (contains_substring src "mutable added_nodes" &&
+          contains_substring src "let add_added_node");
   Alcotest.(check bool)
-    "BUG-18: no m_added_node_params / added_nodes table"
-    false (contains_substring src "m_added_node_params" ||
-           contains_substring src "added_node_params")
+    "BUG-18 fixed: addnode membership check present (Core AddedNodesContain)"
+    true (contains_substring src "List.mem node pm.added_nodes")
 
 (* ===== G22: outbound_is_bad_port_filter — MISSING ==================
    Core IsBadPort filter (net.cpp:2859) rejects ports 25/110/465/1080/…
@@ -501,11 +501,12 @@ let test_g25_outbound_fixed_seeds_60s_fallback () =
     "BUG-22: get_fallback_peers / hardcoded seed lists exist"
     true (contains_substring src "mainnet_fallback_peers" ||
           contains_substring src "testnet_fallback_peers");
+  (* BUG-22 FIXED: [add_fixed_seeds] / [maybe_add_fixed_seeds] gate the fixed
+     seeds on Core's GetReachableEmptyNetworks + 60s rule (net.cpp:2614). *)
   Alcotest.(check bool)
-    "BUG-22: no 60s reachable-empty gate before fallback"
-    false (contains_substring src "add_fixed_seeds" ||
-           contains_substring src "GetReachableEmptyNetworks" ||
-           contains_substring src "fixed_seeds_after_60s")
+    "BUG-22 fixed: fixed-seed gate present (Core net.cpp GetReachableEmptyNetworks / 60s)"
+    true (contains_substring src "let add_fixed_seeds" &&
+          contains_substring src "GetReachableEmptyNetworks")
 
 (* ===== G26: outbound_use_v2_transport_decision — PARTIAL ===========
    Core: const bool use_v2transport = (addr.nServices & GetLocalServices()
@@ -597,9 +598,28 @@ let as_audit_bug_count () =
 let as_audit_gate_count () =
   Alcotest.(check int) "AS2 W128 gate count == 30" 30 30
 
+
+(* The per-node audit/*.md documents were moved out of the submodule into the
+   meta-repo archive (camlcoin b04204b, 2026-06-28):
+     <meta-repo>/audit-archive/nodes/camlcoin/audit/<name>
+   Walk up from the CWD until that archive directory is found (from the dune
+   sandbox the first "repo root" hit is _build/default, whose parent chain
+   still reaches the meta-repo). *)
+let audit_archive_doc (name : string) : string =
+  let rel = Filename.concat "audit-archive/nodes/camlcoin/audit" name in
+  let rec up dir depth =
+    let cand = Filename.concat dir rel in
+    if Sys.file_exists cand then cand
+    else if depth > 12 then cand  (* not found: return a path that fails loudly *)
+    else
+      let parent = Filename.dirname dir in
+      if parent = dir then cand else up parent (depth + 1)
+  in
+  up (Sys.getcwd ()) 0
+
 let as_audit_doc_exists () =
-  let p = Filename.concat (resolve_repo_root ()) "audit/w128_addrman.md" in
-  Alcotest.(check bool) "AS3 audit doc on disk" true (Sys.file_exists p)
+  let p = audit_archive_doc "w128_addrman.md" in
+  Alcotest.(check bool) ("AS3 archived audit doc on disk: " ^ p) true (Sys.file_exists p)
 
 (* Spot-check addrman behaviour with the existing API: add three IPs
    and confirm the new-table is populated. Same shape as W104 helper

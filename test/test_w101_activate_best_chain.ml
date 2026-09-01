@@ -137,6 +137,31 @@ let w101_build_header_chain n =
   done;
   (state, db, List.rev !entries)
 
+(* Build a regtest chain of N CONNECTED blocks: every entry also gets a
+   coinbase-only body + empty undo record on disk and its height->hash slot,
+   i.e. what Core's ConnectTip/CChain::SetTip leave behind.  Sync.invalidate_block
+   rewinds the active chain through Sync.disconnect_to_target (Core
+   InvalidateBlock -> DisconnectTip), which needs those bodies; the header-only
+   builder above stands in for AcceptBlockHeader and cannot be rewound. *)
+let w101_build_block_chain n =
+  let (state, db, entries) = w101_build_header_chain n in
+  List.iter (fun (e : Sync.header_entry) ->
+    let coinbase : Types.transaction = {
+      Types.version = 1l;
+      inputs = [{ Types.previous_output = { Types.txid = Types.zero_hash; vout = 0xffffffffl };
+                  script_sig = Cstruct.of_string "\x51"; sequence = 0xffffffffl }];
+      outputs = [{ Types.value = 50_00000000L; script_pubkey = Cstruct.of_string "\x51" }];
+      witnesses = []; locktime = 0l } in
+    Storage.ChainDB.store_block db e.hash { Types.header = e.header; transactions = [coinbase] };
+    let undo : Utxo.undo_data = { height = e.height; tx_undos = [] } in
+    let uw = Serialize.writer_create () in
+    Utxo.serialize_undo_data uw undo;
+    Storage.ChainDB.store_undo_data db e.hash
+      (Cstruct.to_string (Serialize.writer_to_cstruct uw));
+    Storage.ChainDB.set_height_hash db e.height e.hash
+  ) entries;
+  (state, db, entries)
+
 (* ============================================================================
    G1-G5  FindMostWorkChain equivalent
    ============================================================================ *)
@@ -299,7 +324,8 @@ let test_w101_g10_invalidate_unknown_block_errors () =
    Core: InvalidateBlock → ActivateBestChain is called after the rewind
    to reconnect the best valid chain. *)
 let test_w101_g11_invalidate_active_chain_does_not_reactivate_alt_chain () =
-  let (state, db, entries) = w101_build_header_chain 2 in
+  (* Connected blocks: the rewind disconnects h2's body (Core DisconnectTip). *)
+  let (state, db, entries) = w101_build_block_chain 2 in
   let h1 = List.hd entries in
   let h2 = List.nth entries 1 in
   (* tip is at height 2. Invalidating h2 should rewind to h1 and then
@@ -324,12 +350,16 @@ let test_w101_g11_invalidate_active_chain_does_not_reactivate_alt_chain () =
 
 (* G12 — invalidate_block when block not on active chain returns Ok. *)
 let test_w101_g12_invalidate_off_chain_block_succeeds () =
-  let (state, db, entries) = w101_build_header_chain 1 in
+  (* Active chain h1 -> h2 (connected).  A side header on h1 at height 2 has
+     EQUAL work to h2, so it is genuinely off the active chain (with a 1-block
+     chain the side header had MORE work, became state.tip, and the
+     "off-chain" invalidation was really an on-chain rewind). *)
+  let (state, db, entries) = w101_build_block_chain 2 in
   let h1 = List.hd entries in
   (* Register a side-branch header that is not the active tip *)
   let h1_hash = Crypto.compute_block_hash (List.hd entries).header in
   let bits = Consensus.regtest.genesis_header.bits in
-  let ts = Int32.add (List.hd entries).header.timestamp 600l in
+  let ts = Int32.add (List.hd entries).header.timestamp 900l in
   let side_h = w101_mine ~prev_block:h1_hash ~ts ~bits in
   let side_hash = Crypto.compute_block_hash side_h in
   (match Sync.validate_header state side_h with
@@ -405,11 +435,23 @@ let test_w101_g18_reconsider_unknown_block_errors () =
    B4 (ActivateBestChain stub) is deferred — this test verifies the B1
    interaction: headers-only reconsidered blocks are correctly excluded. *)
 let test_w101_g19_reconsider_does_not_trigger_reorg () =
-  let (state, db, entries) = w101_build_header_chain 2 in
+  (* h1 is CONNECTED (body on disk); h2 is a HEADER ONLY on top of it.  Core
+     keeps pindexBestHeader (h2) apart from the active m_chain tip (h1); the
+     header-only builder leaves state.tip at h2, so pin the active tip to h1
+     the way the block-connect path would (Core chain.h SetTip). *)
+  let (state, db, entries) = w101_build_block_chain 1 in
   let h1 = List.hd entries in
-  let h2 = List.nth entries 1 in
-  (* Invalidate h2 so tip falls to h1. *)
-  ignore (Sync.invalidate_block state h2.hash);
+  let bits = Consensus.regtest.genesis_header.bits in
+  let h2_header = w101_mine ~prev_block:h1.hash
+      ~ts:(Int32.add h1.header.timestamp 600l) ~bits in
+  let h2 = match Sync.validate_header state h2_header with
+    | Ok e -> Sync.accept_header state e; e
+    | Error e -> Alcotest.fail ("G19: h2 header rejected: " ^ e) in
+  state.tip <- Some h1;
+  (* Invalidate h2: it is off the ACTIVE chain, so this only marks it. *)
+  (match Sync.invalidate_block state h2.hash with
+   | Ok _ -> ()
+   | Error e -> Alcotest.fail ("G19: invalidate h2 failed: " ^ e));
   let tip_after_invalidate = match Sync.get_tip state with
     | Some t -> t.height | None -> -1 in
   (* Reconsider h2 — h2 has no block body so find_best_valid_tip (B1 fixed)

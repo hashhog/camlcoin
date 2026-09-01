@@ -504,16 +504,22 @@ let g30_per_sigop_weight () =
 
 let bug1_tapscript_push_size_bypass () =
   let s = script_ml () in
-  (* The buggy guard is exactly "sig_version <> SigVersionTapscript &&"
-     in front of the push-size check at script.ml:1310 and 1324. *)
+  (* BUG-1 FIXED (6E): the buggy guard was "sig_version <> SigVersionTapscript &&"
+     in front of the push-size check at both PUSHDATA call sites.  Core
+     script/interpreter.cpp:447-448 checks vchPushValue.size() >
+     MAX_SCRIPT_ELEMENT_SIZE unconditionally, before any sigversion branch
+     (BIP-342 keeps the 520-byte element limit for tapscript), so the exempting
+     form must not appear anywhere. *)
   let buggy_form =
     "st.sig_version <> SigVersionTapscript && Cstruct.length data > max_script_element_size"
   in
   let n = count_substring s buggy_form in
+  Alcotest.(check int)
+    "BUG-1 fixed: no tapscript exemption from the 520-byte push cap (Core interpreter.cpp:447 is unconditional)"
+    0 n;
   Alcotest.(check bool)
-    "BUG-1 P0-CONSENSUS: tapscript exempted from 520-byte push cap \
-     at both PUSHDATA call sites"
-    true (n >= 2)
+    "BUG-1 fixed: the unconditional push-size check is present"
+    true (count_substring s "Cstruct.length data > max_script_element_size" >= 2)
 
 (* -- Audit-status meta tests --------------------------------------------- *)
 
@@ -527,10 +533,28 @@ let as2_bug_count () =
 let as3_p0_consensus_count () =
   Alcotest.(check int) "AS3 P0-CONSENSUS count == 1 (BUG-1)" 1 1
 
+
+(* The per-node audit/*.md documents were moved out of the submodule into the
+   meta-repo archive (camlcoin b04204b, 2026-06-28):
+     <meta-repo>/audit-archive/nodes/camlcoin/audit/<name>
+   Walk up from the CWD until that archive directory is found (from the dune
+   sandbox the first "repo root" hit is _build/default, whose parent chain
+   still reaches the meta-repo). *)
+let audit_archive_doc (name : string) : string =
+  let rel = Filename.concat "audit-archive/nodes/camlcoin/audit" name in
+  let rec up dir depth =
+    let cand = Filename.concat dir rel in
+    if Sys.file_exists cand then cand
+    else if depth > 12 then cand  (* not found: return a path that fails loudly *)
+    else
+      let parent = Filename.dirname dir in
+      if parent = dir then cand else up parent (depth + 1)
+  in
+  up (Sys.getcwd ()) 0
+
 let as4_audit_doc_exists () =
-  let root = resolve_repo_root () in
-  let doc = Filename.concat root "audit/w127_taproot.md" in
-  Alcotest.(check bool) "AS4 audit/w127_taproot.md exists" true
+  let doc = audit_archive_doc "w127_taproot.md" in
+  Alcotest.(check bool) ("AS4 archived audit doc exists: " ^ doc) true
     (Sys.file_exists doc)
 
 let as5_test_file_self_check () =

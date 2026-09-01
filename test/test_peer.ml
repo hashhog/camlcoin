@@ -82,9 +82,10 @@ let test_our_services () =
      NOT gated on prune mode. *)
   Alcotest.(check bool) "our network_limited" true ours.network_limited;
 
-  (* NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED = 1 | 8 | 1024 = 0x409 *)
+  (* NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED | NODE_P2P_V2
+     = 1 | 8 | 1024 | 2048 = 0xC09.  (* NODE_P2P_V2 (0x800) is advertised by default: Core net.h:101 DEFAULT_V2_TRANSPORT = true; lib/peer.ml our_services ORs it on the same predicate that drives the v2 transport. *) *)
   let as_int = Peer.services_to_int64 ours in
-  Alcotest.(check int64) "our services value (default)" 0x409L as_int
+  Alcotest.(check int64) "our services value (default)" 0xC09L as_int
 
 (* Test our_services with --peerbloomfilters=1: NODE_BLOOM advertised,
    bits = NODE_NETWORK | NODE_BLOOM | NODE_WITNESS | NODE_NETWORK_LIMITED
@@ -94,7 +95,8 @@ let test_our_services_bloom_enabled () =
   let ours = Peer.our_services () in
   Alcotest.(check bool) "our bloom enabled" true ours.bloom;
   let as_int = Peer.services_to_int64 ours in
-  Alcotest.(check int64) "our services value (bloom on)" 0x40DL as_int;
+  (* 0x40D | NODE_P2P_V2 (0x800, Core net.h:101 DEFAULT_V2_TRANSPORT) = 0xC0D *)
+  Alcotest.(check int64) "our services value (bloom on)" 0xC0DL as_int;
   (* Restore Core default for subsequent tests *)
   Peer.set_peer_bloom_filters false
 
@@ -110,13 +112,15 @@ let test_our_services_advertised_bitset () =
   List.iter (fun prune ->
     Peer.set_prune_mode_advertise prune;
     let bits = Peer.services_to_int64 (Peer.our_services ()) in
-    Alcotest.(check int64) "advertised bitset == 0x409" 0x409L bits;
+    (* 0xC09 = 0x409 | NODE_P2P_V2; Core net.h:101 DEFAULT_V2_TRANSPORT = true *)
+    Alcotest.(check int64) "advertised bitset == 0xC09" 0xC09L bits;
     (* NODE_NETWORK_LIMITED (0x400) set *)
     Alcotest.(check bool) "NODE_NETWORK_LIMITED set"
       true (Int64.logand bits 0x400L <> 0L);
-    (* NODE_P2P_V2 (0x800) NOT set *)
-    Alcotest.(check bool) "NODE_P2P_V2 not set"
-      true (Int64.logand bits 0x800L = 0L))
+    (* NODE_P2P_V2 (0x800) SET by default, and only because the v2 transport
+       is on (lib/peer.ml our_services shares the predicate) *)
+    Alcotest.(check bool) "NODE_P2P_V2 set (v2 transport default-on)"
+      true (Int64.logand bits 0x800L <> 0L))
     [false; true];
   (* Restore defaults for subsequent tests *)
   Peer.set_prune_mode_advertise false
@@ -157,7 +161,8 @@ let test_make_local_addr () =
   (* Check services: with NODE_BLOOM off (Core default), bits are
      NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED = 1|8|1024 = 0x409.
      NODE_NETWORK_LIMITED is advertised unconditionally (Core init.cpp:863). *)
-  Alcotest.(check int64) "local addr services (default)" 0x409L addr.services;
+  (* 0x409 | NODE_P2P_V2 (0x800): Core net.h:101 DEFAULT_V2_TRANSPORT = true *)
+  Alcotest.(check int64) "local addr services (default)" 0xC09L addr.services;
   (* Check port is 0 *)
   Alcotest.(check int) "local addr port" 0 addr.port
 
@@ -1085,8 +1090,10 @@ let with_v2_env (v : string option) (f : unit -> unit) : unit =
   (try f (); restore () with e -> restore (); raise e)
 
 let test_bip324_v2_default_off () =
+  (* BIP-324 v2 is DEFAULT-ON (Core net.h:101 DEFAULT_V2_TRANSPORT = true);
+     an unset / empty variable means ON, only 0/false/off opts out. *)
   with_v2_env None (fun () ->
-    Alcotest.(check bool) "default OFF (no env)" false
+    Alcotest.(check bool) "default ON (no env)" true
       (Peer.bip324_v2_outbound_enabled ()))
 
 let test_bip324_v2_env_one () =
@@ -1186,9 +1193,10 @@ let with_v2_umbrella_env (v : string option) (f : unit -> unit) : unit =
   (try f (); restore () with e -> restore (); raise e)
 
 let test_bip324_v2_inbound_default_off () =
+  (* DEFAULT-ON: Core net.h:101 DEFAULT_V2_TRANSPORT = true. *)
   with_v2_inbound_env None (fun () ->
     with_v2_umbrella_env None (fun () ->
-      Alcotest.(check bool) "default OFF (no env)" false
+      Alcotest.(check bool) "default ON (no env)" true
         (Peer.bip324_v2_inbound_enabled ())))
 
 let test_bip324_v2_inbound_env_one () =
@@ -1298,7 +1306,7 @@ let () =
       Alcotest.test_case "our services (default off)" `Quick test_our_services;
       Alcotest.test_case "our services (bloom on)" `Quick
         test_our_services_bloom_enabled;
-      Alcotest.test_case "advertised bitset == 0x409 (no P2P_V2)" `Quick
+      Alcotest.test_case "advertised bitset == 0xC09 (P2P_V2 default-on)" `Quick
         test_our_services_advertised_bitset;
     ];
     "peer_state", [
@@ -1386,7 +1394,7 @@ let () =
         `Slow test_connect_timeout_no_fd_leak;
     ];
     "bip324_v2_outbound", [
-      Alcotest.test_case "env_var_default_off" `Quick test_bip324_v2_default_off;
+      Alcotest.test_case "env_var_default_on" `Quick test_bip324_v2_default_off;
       Alcotest.test_case "env_var_honors_one" `Quick test_bip324_v2_env_one;
       Alcotest.test_case "env_var_honors_zero" `Quick test_bip324_v2_env_zero;
       Alcotest.test_case "env_var_honors_false" `Quick test_bip324_v2_env_false;
@@ -1397,7 +1405,7 @@ let () =
       Alcotest.test_case "transport_dispatch_default_v1" `Quick test_transport_default_v1;
     ];
     "bip324_v2_inbound", [
-      Alcotest.test_case "env_var_default_off"
+      Alcotest.test_case "env_var_default_on"
         `Quick test_bip324_v2_inbound_default_off;
       Alcotest.test_case "env_var_honors_one"
         `Quick test_bip324_v2_inbound_env_one;

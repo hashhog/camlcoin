@@ -1902,9 +1902,16 @@ let test_sequence_lock_get_mtp_callback () =
   (* Without callback: utxo_mtp is whatever caller supplies *)
   let utxo_mtp_approx = [| 1_000_000_000l |] in
   let flags = Script.script_verify_checksequenceverify in
-  (* With callback: mtp at height 49 = 900_000_000, required = 900_000_000 + 1024 = 900_001_024 *)
+  (* With callback: the callback contract is get_mtp_at_height h ==
+     GetAncestor(h-1)->GetMedianTimePast() — Core consensus/tx_verify.cpp:74
+     reads nCoinTime = block.GetAncestor(max(nCoinHeight-1,0))->GetMedianTimePast(),
+     and camlcoin's Sync.compute_median_time_past h already collects the 11
+     timestamps BELOW h (exclusive), so check_sequence_locks passes the
+     utxo height itself (50), not 49 (that double-decremented; fixed in
+     fecf534, lib/validation.ml).  MTP for utxo_height 50 = 900_000_000,
+     required = 900_000_000 + 1024 = 900_001_024 *)
   let get_mtp h =
-    if h = 49 then 900_000_000l
+    if h = 50 then 900_000_000l
     else 1_000_000_000l
   in
   (* block MTP 900_001_100 > 900_001_024 → pass with callback *)

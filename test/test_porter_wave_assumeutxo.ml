@@ -88,8 +88,12 @@ let test_change1_mainnet_testnet4_untouched () =
   let name = "Change-1: mainnet/testnet4 tables untouched (regtest-only widening)" in
   let mainnet_heights = Assume_utxo.available_snapshot_heights Consensus.mainnet in
   let testnet4_heights = Assume_utxo.available_snapshot_heights Consensus.testnet4 in
+  (* mainnet = Core kernel/chainparams.cpp:158-182 m_assumeutxo_data
+     (840000/880000/910000/935000) + hashhog 944183 (R4 capture) + Track-B
+     481823 (cd5d750, INERT for normal boot).  The regtest widening must not
+     have touched this exact list. *)
   check name
-    (mainnet_heights = [840_000; 880_000; 910_000; 935_000; 944_183]
+    (mainnet_heights = [481_823; 840_000; 880_000; 910_000; 935_000; 944_183]
      && testnet4_heights = [])
     (Printf.sprintf "mainnet=[%s] testnet4=[%s]"
        (String.concat "," (List.map string_of_int mainnet_heights))
@@ -124,7 +128,8 @@ let test_change2_unset_flag_bit_identical () =
     (before_mainnet = after_mainnet
      && before_testnet4 = after_testnet4
      && before_regtest = after_regtest
-     && after_mainnet = [840_000; 880_000; 910_000; 935_000; 944_183]
+     (* Core chainparams.cpp 4 + hashhog 944183 + Track-B 481823 (cd5d750) *)
+     && after_mainnet = [481_823; 840_000; 880_000; 910_000; 935_000; 944_183]
      && after_testnet4 = []
      && List.mem 110 after_regtest && List.mem 200 after_regtest
      && List.mem 299 after_regtest)
@@ -143,8 +148,12 @@ let temp_campaign_fixture ?(entries : string = "") () =
 
 (* A well-formed campaign entry at a height that does NOT collide with any
    built-in mainnet/testnet4/regtest entry (Core mainnet heights 840k/880k/
-   910k/935k, Core regtest 110/200/299). Mirrors the Track-B 481823 shape
-   from CAMPAIGN-SNAPSHOT-TABLE-SPEC.md, using a dummy but well-formed hash. *)
+   910k/935k + hashhog 944183 + Track-B 481823, Core regtest 110/200/299).
+   Mirrors the Track-B 481823 shape from CAMPAIGN-SNAPSHOT-TABLE-SPEC.md,
+   using a dummy but well-formed hash.  The fixture used height 481823 itself,
+   which became a BUILT-IN entry in cd5d750 — the loader then (correctly)
+   refused the collision and exited the test executable. *)
+let campaign_fixture_height = 700_000
 let campaign_entry_json ~height ~blockhash_display ~hash_serialized_display
     ~chain_tx_count =
   Printf.sprintf
@@ -159,7 +168,7 @@ let test_change2_campaign_appends_mainnet () =
   Assume_utxo.clear_campaign_assumeutxo ();
   let before = Assume_utxo.available_snapshot_heights Consensus.mainnet in
   let entry_hash = dummy_hash_display 0xab in
-  let entry = campaign_entry_json ~height:481_823
+  let entry = campaign_entry_json ~height:campaign_fixture_height
       ~blockhash_display:entry_hash ~hash_serialized_display:entry_hash
       ~chain_tx_count:249_036_369L in
   let path = temp_campaign_fixture ~entries:entry () in
@@ -182,10 +191,10 @@ let test_change2_campaign_appends_mainnet () =
   Assume_utxo.clear_campaign_assumeutxo ();
   (try Sys.remove path with _ -> ());
   check name
-    (before = [840_000; 880_000; 910_000; 935_000; 944_183]
-     && List.mem 481_823 after
+    (before = [481_823; 840_000; 880_000; 910_000; 935_000; 944_183]
+     && List.mem campaign_fixture_height after
      && List.for_all (fun h -> List.mem h after) before
-     && (match resolved with Some p -> p.height = 481_823 | None -> false))
+     && (match resolved with Some p -> p.height = campaign_fixture_height | None -> false))
     (Printf.sprintf "before=[%s] after=[%s] resolved=%b"
        (String.concat "," (List.map string_of_int before))
        (String.concat "," (List.map string_of_int after))

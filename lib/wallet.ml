@@ -2560,7 +2560,16 @@ let aes_256_cbc_encrypt ~(key : Cstruct.t) ~(iv : Cstruct.t) (plaintext : Cstruc
 
 (* Decrypt data with AES-256-CBC *)
 let aes_256_cbc_decrypt ~(key : Cstruct.t) ~(iv : Cstruct.t) (ciphertext : Cstruct.t) : Cstruct.t option =
-  if Cstruct.length ciphertext = 0 || Cstruct.length ciphertext mod 16 <> 0 then
+  (* Core wallet/crypter.cpp:65 CCrypter::SetKey refuses keying material that
+     is not exactly WALLET_CRYPTO_KEY_SIZE (32) / WALLET_CRYPTO_IV_SIZE (16)
+     bytes, so a garbage "master key" never reaches AES.  Here the caller's
+     key can be the output of a wrong-passphrase decrypt whose random
+     plaintext happened to unpad (last byte 0x01, ~1 in 256 attempts): a
+     47-byte key made Mirage_crypto raise Invalid_argument
+     ("AES.of_secret: key length 47") out of walletpassphrase. *)
+  if Cstruct.length key <> 32 || Cstruct.length iv <> 16 then
+    None
+  else if Cstruct.length ciphertext = 0 || Cstruct.length ciphertext mod 16 <> 0 then
     None
   else begin
     let cipher = Mirage_crypto.AES.CBC.of_secret (Cstruct.to_string key) in
@@ -2612,7 +2621,12 @@ let decrypt_private_key ~(master_key : Cstruct.t) ~(public_key : Cstruct.t)
     (encrypted : Cstruct.t) : Cstruct.t option =
   let pubkey_hash = Crypto.sha256d public_key in
   let iv = Cstruct.sub pubkey_hash 0 16 in
-  aes_256_cbc_decrypt ~key:master_key ~iv encrypted
+  (* Core wallet/crypter.cpp DecryptKey: `if (secret.size() != 32) return false;`
+     — a decrypted secret of any other length is a failed decryption, not a
+     key (the caller blits 32 bytes out of it). *)
+  match aes_256_cbc_decrypt ~key:master_key ~iv encrypted with
+  | Some secret when Cstruct.length secret = 32 -> Some secret
+  | Some _ | None -> None
 
 (* Encrypt the wallet with a passphrase.
    This encrypts all private keys and stores the encrypted master key. *)
@@ -2668,8 +2682,18 @@ let wallet_passphrase (w : t) ~(passphrase : string) ~(timeout : float)
       (* Derive key from passphrase *)
       let (derived_key, derived_iv) = derive_key_and_iv passphrase salt in
 
-      (* Try to decrypt master key *)
-      (match aes_256_cbc_decrypt ~key:derived_key ~iv:derived_iv encrypted_master with
+      (* Try to decrypt master key.  Core CWallet::Unlock feeds the
+         decrypted material to CCrypter::SetKey (crypter.cpp:65), which
+         refuses anything but a 32-byte key — so a wrong passphrase whose
+         garbage plaintext happened to unpad to some other length is
+         "passphrase incorrect", never an unlock with a bogus master key
+         (a wallet with no keys yet would otherwise have unlocked on it). *)
+      let decrypted_master =
+        match aes_256_cbc_decrypt ~key:derived_key ~iv:derived_iv encrypted_master with
+        | Some mk when Cstruct.length mk = 32 -> Some mk
+        | Some _ | None -> None
+      in
+      (match decrypted_master with
        | Some master_key ->
          (* Verify the master key by decrypting one private key *)
          let valid = List.length w.keys = 0 ||

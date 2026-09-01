@@ -935,8 +935,70 @@ let test_encryption_round_trip () =
   let _ = Wallet.wallet_passphrase w ~passphrase:"mypassword" ~timeout:60.0 in
   Alcotest.(check bool) "unlocked again" false (Wallet.is_locked w)
 
+(* A wrong passphrase decrypts the stored master key to 48 random bytes; about
+   1 attempt in 256 the last byte is 0x01, PKCS7 unpad "succeeds", and the
+   47-byte garbage went on to Mirage_crypto's AES.of_secret, which raised
+   Invalid_argument ("AES.of_secret: key length 47") out of walletpassphrase
+   (seen intermittently in test_rpc wallet_encryption_rpc).  Core refuses any
+   keying material that is not WALLET_CRYPTO_KEY_SIZE = 32 bytes
+   (wallet/crypter.cpp:65 CCrypter::SetKey; DecryptKey also rejects a decrypted
+   secret whose size != 32), so the outcome is simply "passphrase incorrect".
+   Make the 1-in-256 shape deterministic: forge an encrypted master key that
+   decrypts, under the RIGHT passphrase, to 47 bytes. *)
+let forge_wrong_length_master_key (w : Wallet.t) ~(passphrase : string) =
+  let salt = match w.Wallet.encryption.Wallet.salt with
+    | Some s -> s | None -> Alcotest.fail "encrypted wallet has no salt" in
+  let (key, iv) = Wallet.derive_key_and_iv passphrase salt in
+  let bogus = Cstruct.create 47 in
+  Cstruct.memset bogus 0xAB;
+  w.Wallet.encryption.Wallet.encrypted_master_key <-
+    Some (Wallet.aes_256_cbc_encrypt ~key ~iv bogus)
+
+let test_wallet_passphrase_wrong_length_master_key () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let _ = Wallet.get_new_address w in
+  (match Wallet.encrypt_wallet w ~passphrase:"secret" with
+   | Error e -> Alcotest.fail ("encrypt_wallet failed: " ^ e) | Ok () -> ());
+  forge_wrong_length_master_key w ~passphrase:"secret";
+  (match Wallet.wallet_passphrase w ~passphrase:"secret" ~timeout:60.0 with
+   | Error _ -> ()
+   | Ok () -> Alcotest.fail "47-byte master key must not unlock (Core crypter.cpp:65 SetKey)"
+   | exception Invalid_argument m ->
+     Alcotest.fail ("walletpassphrase raised instead of rejecting: " ^ m));
+  Alcotest.(check bool) "still locked after wrong-length master key" true
+    (Wallet.is_locked w)
+
+(* Same forgery on a wallet with NO keys: the only verification step was
+   "decrypt one private key", so a 47-byte master key used to UNLOCK. *)
+let test_wallet_passphrase_wrong_length_master_key_no_keys () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  (match Wallet.encrypt_wallet w ~passphrase:"secret" with
+   | Error e -> Alcotest.fail ("encrypt_wallet failed: " ^ e) | Ok () -> ());
+  forge_wrong_length_master_key w ~passphrase:"secret";
+  (match Wallet.wallet_passphrase w ~passphrase:"secret" ~timeout:60.0 with
+   | Error _ -> ()
+   | Ok () -> Alcotest.fail "empty wallet unlocked on a 47-byte master key (Core crypter.cpp:65 SetKey rejects)"
+   | exception Invalid_argument m ->
+     Alcotest.fail ("walletpassphrase raised instead of rejecting: " ^ m));
+  Alcotest.(check bool) "still locked (no keys)" true (Wallet.is_locked w)
+
+(* Unit pin for the primitive itself: Core CCrypter::SetKey length gate. *)
+let test_aes_decrypt_rejects_wrong_key_length () =
+  let iv = Cstruct.create 16 in
+  let ct = Cstruct.create 32 in
+  let key47 = Cstruct.create 47 in
+  let r = try Wallet.aes_256_cbc_decrypt ~key:key47 ~iv ct
+          with Invalid_argument m -> Alcotest.fail ("raised: " ^ m) in
+  Alcotest.(check bool) "47-byte key -> None, not an exception" true (r = None)
+
 let lock_unlock_tests = [
   Alcotest.test_case "encrypt wallet" `Quick test_encrypt_wallet;
+  Alcotest.test_case "wrong-length master key rejected" `Quick
+    test_wallet_passphrase_wrong_length_master_key;
+  Alcotest.test_case "wrong-length master key rejected (no keys)" `Quick
+    test_wallet_passphrase_wrong_length_master_key_no_keys;
+  Alcotest.test_case "aes decrypt rejects wrong key length" `Quick
+    test_aes_decrypt_rejects_wrong_key_length;
   Alcotest.test_case "empty passphrase rejected" `Quick test_encrypt_wallet_empty_passphrase;
   Alcotest.test_case "already encrypted rejected" `Quick test_encrypt_wallet_already_encrypted;
   Alcotest.test_case "correct passphrase" `Quick test_wallet_passphrase_correct;

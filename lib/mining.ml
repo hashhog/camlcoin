@@ -34,6 +34,9 @@ type block_template = {
   target : Cstruct.t;
   network_type : Consensus.network;  (* For correct halving interval in JSON *)
   transactions_updated : int;  (* mempool entry count at template creation time; used for longpollid *)
+  min_time : int32;  (* GBT "mintime": Core node/miner.cpp:36 GetMinimumTime(pindexPrev)
+                        = MTP(prev)+1, raised to prev.nTime - MAX_TIMEWARP on a
+                        retarget-boundary height (BIP-94).  NOT curtime. *)
 }
 
 (* ============================================================================
@@ -416,7 +419,15 @@ let create_block_template ~(chain : Sync.chain_state)
      Core miner.cpp:52: nNewTime = max(GetMinimumTime(pindexPrev, ...), now) *)
   let mtp = lock_time_cutoff in  (* MTP = median_time_past tip_ts_list, already computed *)
   let now = Int32.of_float (Unix.gettimeofday ()) in
-  let timestamp = max (Int32.add mtp 1l) now in
+  (* Core node/miner.cpp:36-47 GetMinimumTime: MTP+1, and on a difficulty
+     adjustment boundary max'd with prev.nTime - MAX_TIMEWARP (BIP-94). *)
+  let min_time =
+    let mt = Int32.add mtp 1l in
+    if height mod Consensus.difficulty_adjustment_interval = 0 then
+      max mt (Int32.sub tip.header.timestamp (Int32.of_int Consensus.max_timewarp))
+    else mt
+  in
+  let timestamp = max min_time now in
 
   (* Compute correct difficulty target using consensus rules *)
   let bits =
@@ -491,6 +502,7 @@ let create_block_template ~(chain : Sync.chain_state)
     target = Consensus.compact_to_target bits;
     network_type;
     transactions_updated = Hashtbl.length mp.entries;
+    min_time;
   }
 
 (* ============================================================================
@@ -587,6 +599,9 @@ let template_to_json (template : block_template) : Yojson.Safe.t =
     `Assoc [
       ("data", `String (tx_to_hex tx));
       ("txid", `String (Types.hash256_to_hex_display txid));
+      (* Core rpc/mining.cpp:915 entry.pushKV("hash", tx.GetWitnessHash()) — the
+         wtxid, distinct from txid for segwit txs (BIP-141 fee accounting). *)
+      ("hash", `String (Types.hash256_to_hex_display (Crypto.compute_wtxid tx)));
       ("fee", `Int (Int64.to_int fee));
       ("depends", `List (List.map (fun i -> `Int i) depends));
       ("sigops", `Int (Validation.count_tx_sigops_cost_simple tx
@@ -659,21 +674,28 @@ let template_to_json (template : block_template) : Yojson.Safe.t =
       `String (Types.hash256_to_hex_display template.header.prev_block));
     ("transactions", `List txs_json);
     ("coinbaseaux", coinbaseaux_json);
+    (* Core rpc/mining.cpp:1001 pushKV("coinbasevalue", nValue): a JSON NUMBER
+       of satoshis (RPCResult::Type::NUM, BIP-22), not a string. *)
     ("coinbasevalue",
-      `String (Int64.to_string
+      `Int (Int64.to_int
         (Int64.add
           (Consensus.block_subsidy_for_network template.network_type template.height)
           template.total_fee)));
     ("longpollid", longpollid_json);
     ("target",
       `String (Types.hash256_to_hex template.target));
+    (* Core rpc/mining.cpp:1004 pushKV("mintime", GetMinimumTime(pindexPrev, ...)) *)
     ("mintime",
-      `Int (Int32.to_int template.header.timestamp));
+      `Int (Int32.to_int template.min_time));
     ("mutable",
       `List [`String "time"; `String "transactions"; `String "prevblock"]);
     ("noncerange", `String "00000000ffffffff");
     ("sigoplimit", `Int Consensus.max_block_sigops_cost);
-    ("sizelimit", `Int 1000000);
+    (* Core rpc/mining.cpp:1008 nSizeLimit = MAX_BLOCK_SERIALIZED_SIZE
+       (consensus/consensus.h:13, 4_000_000); 1_000_000 was the pre-segwit
+       limit (Core only divides by WITNESS_SCALE_FACTOR for a pre-segwit
+       template, which no current network produces). *)
+    ("sizelimit", `Int Consensus.max_block_serialized_size);
     ("weightlimit", `Int Consensus.max_block_weight);
     ("curtime",
       `Int (Int32.to_int template.header.timestamp));

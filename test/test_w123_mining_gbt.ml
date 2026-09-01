@@ -355,16 +355,23 @@ let test_g19_longpollid_format () =
             "Types.hash256_to_hex_display template.header.prev_block\n\
              \             ^ string_of_int template.transactions_updated")
 
-(* G20 PARTIAL — mintime is the (already-clamped) header timestamp, not
-   strictly MTP+1.  W108 BUG-9 carry-forward. *)
+(* G20 FIXED — mintime = GetMinimumTime(pindexPrev) (Core rpc/mining.cpp:1004,
+   node/miner.cpp:36: MTP+1, raised by the BIP-94 timewarp bound on a
+   retarget height), carried on the template as [min_time]; no longer the
+   clamped header timestamp (W108 BUG-9 closed; behavioural pin in
+   test_w108_gbt BUG-9). *)
 let test_g20_mintime_partial () =
   let src = slurp_lib "mining.ml" in
   Alcotest.(check bool)
-    "G20 (pre-fix): mintime emitted from template.header.timestamp \
-                     (not pindexPrev.GetMTP() + 1).  W108 BUG-9."
+    "G20 fixed: mintime emitted from template.min_time (Core GetMinimumTime), not header.timestamp"
     true (contains_substring src
             "(\"mintime\",\n\
-             \      `Int (Int32.to_int template.header.timestamp));")
+             \      `Int (Int32.to_int template.min_time));");
+  Alcotest.(check bool)
+    "G20 fixed: the curtime-as-mintime form is gone"
+    false (contains_substring src
+             "(\"mintime\",\n\
+              \      `Int (Int32.to_int template.header.timestamp));")
 
 (* G21 PARTIAL — submitblock BIP-22 result strings present-shape. *)
 let test_g21_bip22_result_strings () =
@@ -403,15 +410,18 @@ let test_g23_submitblock_no_update_uncommitted_pre_fix () =
     false (contains_substring src "GenerateCoinbaseCommitment" ||
            contains_substring src "UpdateUncommittedBlockStructures")
 
-(* G24 — BUG-3 P2 : submitheader RPC not registered. *)
+(* G24 — BUG-3 FIXED: submitheader RPC is registered.
+   Core rpc/mining.cpp submitheader(); camlcoin lib/rpc.ml handle_submitheader
+   + the "submitheader" dispatcher arm.  The pre-fix absence pin was inverted
+   once the handler landed (it kept failing as a stale "bug still present"). *)
 let test_g24_submitheader_rpc_missing () =
   let src = slurp_lib "rpc.ml" in
   Alcotest.(check bool)
-    "BUG-3 (pre-fix): no handle_submitheader function defined"
-    false (contains_substring src "handle_submitheader");
+    "BUG-3 fixed: handle_submitheader function defined (Core rpc/mining.cpp submitheader)"
+    true (contains_substring src "handle_submitheader");
   Alcotest.(check bool)
-    "BUG-3 (pre-fix): \"submitheader\" not in dispatcher switch"
-    false (contains_substring src "| \"submitheader\" ->")
+    "BUG-3 fixed: \"submitheader\" in dispatcher switch"
+    true (contains_substring src "| \"submitheader\" ->")
 
 (* G25 — generatetoaddress / generateblock present, regtest-gated. *)
 let test_g25_regtest_mining_rpcs () =

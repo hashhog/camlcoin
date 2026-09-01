@@ -3100,6 +3100,7 @@ let handle_generateblock (ctx : rpc_context)
              target = Consensus.compact_to_target ctx.network.pow_limit;
              network_type = ctx.network.network_type;
              transactions_updated = 0;
+             min_time = Int32.add mtp 1l;  (* GetMinimumTime; regtest has no retarget boundary *)
            } in
            (* Mine the block *)
            match Mining.mine_block template 100_000_000l with

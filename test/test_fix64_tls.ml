@@ -57,11 +57,16 @@ let ensure_self_signed_cert dir =
    RPC context helper
    ============================================================================ *)
 
-(* Each child process gets its own RocksDB datadir (under PID) so that
-   parallel test runs do not collide and the parent never holds an
-   open handle that the fork would inherit. *)
+(* Per-process RocksDB scratch.  The server child (a separate process, see
+   spawn_server) uses ITS pid; the parent derives the same path from the
+   child pid to remove it after kill — a SIGKILLed child never cleans up,
+   and 83 leaked 286 MB datadirs from this harness filled the 63 GB /tmp
+   tmpfs on 2026-09-01. *)
+let db_path_for_pid pid =
+  Printf.sprintf "/tmp/camlcoin_test_fix64_db_%d" pid
+
 let unique_db_path () =
-  Printf.sprintf "/tmp/camlcoin_test_fix64_db_%d" (Unix.getpid ())
+  db_path_for_pid (Unix.getpid ())
 
 let rec rm_rf path =
   if Sys.file_exists path then begin
@@ -72,9 +77,8 @@ let rec rm_rf path =
       Unix.unlink path
   end
 
-(* Build an RPC context.  Called from inside the child process to keep
-   the RocksDB handle entirely owned by the child (a handle inherited
-   across fork would deadlock the parent's later open + close). *)
+(* Build an RPC context.  Called from inside the server child process
+   (see spawn_server) so the RocksDB handle is owned by that process only. *)
 let make_rpc_ctx () =
   let path = unique_db_path () in
   rm_rf path;
@@ -138,6 +142,45 @@ let null_authenticator
     X509.Certificate.t list -> X509.Validation.r
   = fun ?ip:_ ~host:_ _ -> Ok None
 
+(* OCaml-TLS draws its randoms from Mirage_crypto_rng's DEFAULT generator,
+   which raises No_default_generator until someone installs one.  The daemon
+   installs it in Cli.run (lib/cli.ml, before start_rpc_server /
+   start_rest_server); this harness builds its server contexts directly, so
+   the server child process and the client side seed it themselves, exactly
+   as the daemon would have. *)
+let seed_rng () = Mirage_crypto_rng_unix.use_default ()
+
+(* Why this executable used to HANG (TIMEOUT at 90s, both tests never
+   reached): the client went through [Tls_lwt.connect_ext], whose
+   [Lwt_unix.getaddrinfo] is a detached thread-pool job, and in the old
+   fork()-based harness that job never resolved — the promise sat in
+   connect_ext before any byte hit the wire, and nothing bounded the wait.
+   Connect the loopback socket directly and hand the fd to
+   [Tls_lwt.Unix.client_of_fd]: the handshake and the response complete in
+   milliseconds.  (The server side has since moved out of process too — see
+   spawn_server — so no Lwt state is shared with a child at all.) *)
+let tls_connect_loopback tls_cfg ~port =
+  let open Lwt.Infix in
+  let sa = Unix.ADDR_INET (Unix.inet_addr_loopback, port) in
+  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Lwt_unix.connect fd sa >>= fun () ->
+  Tls_lwt.Unix.client_of_fd tls_cfg fd >|= fun t ->
+  Tls_lwt.of_t t
+
+
+
+(* Bound every client-side wait so a stalled handshake / response fails the
+   test loudly instead of hanging the whole executable. *)
+let client_timeout_s = 10.0
+let with_client_timeout (p : 'a Lwt.t) : 'a Lwt.t =
+  Lwt.pick [
+    p;
+    (let open Lwt.Infix in
+     Lwt_unix.sleep client_timeout_s >>= fun () ->
+     Lwt.fail_with (Printf.sprintf "client request timed out after %.0fs"
+                      client_timeout_s));
+  ]
+
 (* HTTPS request: TLS handshake then send the raw bytes; return the
    first response line (e.g. "HTTP/1.0 401 Unauthorized"). *)
 let https_request_status ~port =
@@ -147,14 +190,16 @@ let https_request_status ~port =
       | Ok c -> c
       | Error (`Msg m) -> failwith ("Tls.Config.client: " ^ m)
     in
-    Tls_lwt.connect_ext tls_cfg ("127.0.0.1", port) >>= fun (ic, oc) ->
+    tls_connect_loopback tls_cfg ~port >>= fun (ic, oc) ->
     Lwt_io.write oc (make_post_request_str ~host:"127.0.0.1" ~port) >>= fun () ->
     Lwt_io.read_line_opt ic >>= fun line ->
-    Lwt_io.close ic >>= fun () ->
-    Lwt_io.close oc >|= fun () ->
-    line
+    (* No explicit close: the server drops the HTTP/1.0 connection right after
+       the response, and closing the TLS channel then stalled on a
+       close_notify write into the dead socket (observed EPIPE / 10s client
+       timeout).  The process exit tears the fd down. *)
+    Lwt.return line
   in
-  Lwt_main.run promise
+  Lwt_main.run (with_client_timeout promise)
 
 (* HTTP request: plain TCP, send the raw bytes, read first response line. *)
 let http_request_status ~port =
@@ -167,11 +212,13 @@ let http_request_status ~port =
     let oc = Lwt_io.of_fd ~mode:Lwt_io.output fd in
     Lwt_io.write oc (make_post_request_str ~host:"127.0.0.1" ~port) >>= fun () ->
     Lwt_io.read_line_opt ic >>= fun line ->
-    Lwt_io.close ic >>= fun () ->
-    Lwt_io.close oc >|= fun () ->
-    line
+    (* No explicit close: the server drops the HTTP/1.0 connection right after
+       the response, and closing the TLS channel then stalled on a
+       close_notify write into the dead socket (observed EPIPE / 10s client
+       timeout).  The process exit tears the fd down. *)
+    Lwt.return line
   in
-  Lwt_main.run promise
+  Lwt_main.run (with_client_timeout promise)
 
 (* Wait until [check ()] returns Some _ or the deadline expires. *)
 let rec wait_until_some ?(deadline=Unix.gettimeofday () +. 2.0) check =
@@ -187,7 +234,7 @@ let rec wait_until_some ?(deadline=Unix.gettimeofday () +. 2.0) check =
 (* Spin up the server in an Lwt.async and wait for the port to accept
    connections, so the test doesn't race the bind. *)
 let wait_for_port ~port =
-  let deadline = Unix.gettimeofday () +. 3.0 in
+  let deadline = Unix.gettimeofday () +. 15.0 in
   let rec loop () =
     if Unix.gettimeofday () > deadline then
       failwith (Printf.sprintf "Port %d never came up" port);
@@ -206,41 +253,80 @@ let wait_for_port ~port =
    Tests
    ============================================================================ *)
 
-(* Spawn the server in a CHILD PROCESS.  Lwt's "nested Lwt_main.run"
-   check is per-process, so running an independent Lwt_main in the
-   child + another in the parent (for the client request) is the
-   simplest way to avoid the check while still owning a real scheduler
-   on each side.  Returns the child PID; caller is responsible for
-   killing it (we use kill_child below).
+(* Out-of-process server.  The server for a round-trip test runs in a FRESH
+   PROCESS: the parent re-executes this very test binary with
+   [CAMLCOIN_FIX64_SERVER=<kind>,<port>,<cert>,<key>] in the environment, and
+   [maybe_run_as_server] (called first thing in main) builds a ctx, runs the
+   requested listener under its own Lwt_main and never returns.
 
-   The [server_factory ctx] thunk is INVOKED INSIDE THE CHILD, after the
-   ctx has been built inside the child.  This keeps the RocksDB / mempool
-   / peer-manager handles entirely owned by the child — inheriting an
-   open RocksDB handle across fork would deadlock the next .create() call.
+   Why not fork(): the earlier harness Unix.fork'd the server from a parent
+   that had already driven Lwt_main.run for previous clients.  The first two
+   children bound fine; the third (the REST child) NEVER reached its bind —
+   deterministic "Port never came up", 12/12 runs across Unix.fork and
+   Lwt_unix.fork — while the same test alone (`test rest-tls`) passed 3/3 in
+   under 100 ms.  A forked child inherits the parent's Lwt thread-pool
+   bookkeeping without the threads; the child's listener bind is a
+   detached job that nobody services.  exec() side-steps all of it.
 
-   POSIX-thread variant was tried and rejected: Lwt's main-loop check
-   uses a global, so two threads in the same process cannot both run
-   Lwt_main. *)
-let spawn_server (server_factory : Rpc.rpc_context -> unit Lwt.t) =
-  match Unix.fork () with
-  | 0 ->
-    (* Child.  Build a fresh ctx and run the server.  If anything
-       raises, log + exit 1 so the parent's wait_for_port deadline
-       catches the failure. *)
-    (try
-       let ctx = make_rpc_ctx () in
-       Lwt_main.run (server_factory ctx);
-       exit 0
-     with exn ->
-       Printf.eprintf "[fix64-server-child] %s\n%!" (Printexc.to_string exn);
-       exit 1)
-  | pid ->
-    (* Parent — return PID so it can be killed at the end of the test. *)
-    pid
+   Returns the child PID; caller kills it with [kill_child]. *)
+type server_kind = Rpc_https | Rpc_http | Rest_https
+
+let server_kind_to_string = function
+  | Rpc_https -> "rpc-https" | Rpc_http -> "rpc-http" | Rest_https -> "rest-https"
+
+let server_kind_of_string = function
+  | "rpc-https" -> Rpc_https | "rpc-http" -> Rpc_http | "rest-https" -> Rest_https
+  | k -> failwith ("unknown server kind " ^ k)
+
+let server_factory kind ~port ~cert ~key (ctx : Rpc.rpc_context) : unit Lwt.t =
+  match kind with
+  | Rpc_https ->
+    Rpc.start_rpc_server ~ctx ~host:"127.0.0.1" ~port
+      ~rpc_user:"camlcoin" ~rpc_password:"camlcoin" ~cookie_password:None
+      ~tls_cert_path:(Some cert) ~tls_key_path:(Some key) ()
+  | Rpc_http ->
+    Rpc.start_rpc_server ~ctx ~host:"127.0.0.1" ~port
+      ~rpc_user:"camlcoin" ~rpc_password:"camlcoin" ~cookie_password:None ()
+  | Rest_https ->
+    Rest.start_rest_server ~ctx ~host:"127.0.0.1" ~port
+      ~tls_cert_path:(Some cert) ~tls_key_path:(Some key) ()
+
+let server_env_var = "CAMLCOIN_FIX64_SERVER"
+
+(* Child entry point: when the env var is set, run the server and exit.
+   If anything raises, log + exit 1 so the parent's wait_for_port deadline
+   catches the failure. *)
+let maybe_run_as_server () =
+  match Sys.getenv_opt server_env_var with
+  | None -> ()
+  | Some spec ->
+    (match String.split_on_char ',' spec with
+     | [kind; port; cert; key] ->
+       (try
+          seed_rng ();  (* what Cli.run does before starting the listeners *)
+          let ctx = make_rpc_ctx () in
+          Lwt_main.run
+            (server_factory (server_kind_of_string kind)
+               ~port:(int_of_string port) ~cert ~key ctx);
+          exit 0
+        with exn ->
+          Printf.eprintf "[fix64-server-child] %s\n%!" (Printexc.to_string exn);
+          exit 1)
+     | _ ->
+       Printf.eprintf "[fix64-server-child] bad spec %S\n%!" spec;
+       exit 2)
+
+let spawn_server kind ~port ~cert ~key =
+  let spec = Printf.sprintf "%s,%d,%s,%s" (server_kind_to_string kind) port cert key in
+  let env = Array.append [| server_env_var ^ "=" ^ spec |] (Unix.environment ()) in
+  let exe = Sys.executable_name in
+  Unix.create_process_env exe [| exe |] env Unix.stdin Unix.stdout Unix.stderr
 
 let kill_child pid =
   (try Unix.kill pid Sys.sigkill with _ -> ());
-  (try ignore (Unix.waitpid [] pid) with _ -> ())
+  (try ignore (Unix.waitpid [] pid) with _ -> ());
+  (* The child was SIGKILLed: reap its RocksDB datadir here. *)
+  rm_rf (db_path_for_pid pid)
 
 (* Test 1: RPC over HTTPS — TLS handshake completes, request reaches auth. *)
 let test_rpc_https_roundtrip () =
@@ -248,16 +334,7 @@ let test_rpc_https_roundtrip () =
   let cert, key = ensure_self_signed_cert tmp_dir in
   let port = pick_free_port () in
   let _ = wait_until_some in
-  let pid = spawn_server (fun ctx ->
-    Rpc.start_rpc_server
-      ~ctx
-      ~host:"127.0.0.1" ~port
-      ~rpc_user:"camlcoin" ~rpc_password:"camlcoin"
-      ~cookie_password:None
-      ~tls_cert_path:(Some cert)
-      ~tls_key_path:(Some key)
-      ())
-  in
+  let pid = spawn_server Rpc_https ~port ~cert ~key in
   let cleanup () = kill_child pid in
   Fun.protect ~finally:cleanup (fun () ->
     wait_for_port ~port;
@@ -275,14 +352,7 @@ let test_rpc_https_roundtrip () =
 (* Test 2: RPC over HTTP (no cert/key set) — backward compat. *)
 let test_rpc_http_backward_compat () =
   let port = pick_free_port () in
-  let pid = spawn_server (fun ctx ->
-    Rpc.start_rpc_server
-      ~ctx
-      ~host:"127.0.0.1" ~port
-      ~rpc_user:"camlcoin" ~rpc_password:"camlcoin"
-      ~cookie_password:None
-      ())
-  in
+  let pid = spawn_server Rpc_http ~port ~cert:"" ~key:"" in
   let cleanup () = kill_child pid in
   Fun.protect ~finally:cleanup (fun () ->
     wait_for_port ~port;
@@ -402,14 +472,7 @@ let test_rest_https_roundtrip () =
   let tmp_dir = "/tmp/camlcoin_fix64_certs" in
   let cert, key = ensure_self_signed_cert tmp_dir in
   let port = pick_free_port () in
-  let pid = spawn_server (fun ctx ->
-    Rest.start_rest_server
-      ~ctx
-      ~host:"127.0.0.1" ~port
-      ~tls_cert_path:(Some cert)
-      ~tls_key_path:(Some key)
-      ())
-  in
+  let pid = spawn_server Rest_https ~port ~cert ~key in
   let cleanup () = kill_child pid in
   Fun.protect ~finally:cleanup (fun () ->
     wait_for_port ~port;
@@ -425,17 +488,15 @@ let test_rest_https_roundtrip () =
     in
     let status =
       let open Lwt.Infix in
-      Lwt_main.run (
+      Lwt_main.run (with_client_timeout (
         let tls_cfg = match Tls.Config.client ~authenticator:null_authenticator () with
           | Ok c -> c
           | Error (`Msg m) -> failwith ("Tls.Config.client: " ^ m)
         in
-        Tls_lwt.connect_ext tls_cfg ("127.0.0.1", port) >>= fun (ic, oc) ->
+        tls_connect_loopback tls_cfg ~port >>= fun (ic, oc) ->
         Lwt_io.write oc make_get_str >>= fun () ->
         Lwt_io.read_line_opt ic >>= fun line ->
-        Lwt_io.close ic >>= fun () ->
-        Lwt_io.close oc >|= fun () ->
-        line)
+        Lwt.return line))
     in
     match status with
     | Some line ->
@@ -450,15 +511,19 @@ let test_rest_https_roundtrip () =
    ============================================================================ *)
 
 let () =
+  maybe_run_as_server ();  (* server-mode child: runs a listener, never returns *)
+  seed_rng ();
   Alcotest.run "fix64_tls" [
     "rpc-tls", [
       Alcotest.test_case "https roundtrip"           `Slow test_rpc_https_roundtrip;
       Alcotest.test_case "http backward compat"      `Slow test_rpc_http_backward_compat;
-      Alcotest.test_case "cert without key errors"   `Quick test_rpc_tls_cert_without_key;
-      Alcotest.test_case "key without cert errors"   `Quick test_rpc_tls_key_without_cert;
-      Alcotest.test_case "missing cert file errors"  `Quick test_rpc_tls_missing_cert_file;
     ];
     "rest-tls", [
       Alcotest.test_case "https roundtrip"           `Slow test_rest_https_roundtrip;
+    ];
+    "rpc-tls-startup-errors", [
+      Alcotest.test_case "cert without key errors"   `Quick test_rpc_tls_cert_without_key;
+      Alcotest.test_case "key without cert errors"   `Quick test_rpc_tls_key_without_cert;
+      Alcotest.test_case "missing cert file errors"  `Quick test_rpc_tls_missing_cert_file;
     ];
   ]

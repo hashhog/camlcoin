@@ -663,8 +663,13 @@ let test_getrawtransaction_confirmed_has_block_info () =
 
   (* Store the transaction and its index *)
   Storage.ChainDB.store_transaction db txid tx;
-  let block_hash = Types.hash256_of_hex
-    "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f" in
+  (* Index the tx into a block the node KNOWS and has on its active chain —
+     mainnet genesis, in internal byte order (Consensus.mainnet.genesis_hash).
+     The fixture used to pass the display-order hex through hash256_of_hex
+     unreversed, i.e. a block hash no index entry matches; Core
+     rpc/rawtransaction.cpp:70-83 then emits "blockhash" alone (pindex not
+     found), so "confirmations"/"time" could never be expected for it. *)
+  let block_hash = Consensus.mainnet.Consensus.genesis_hash in
   Storage.ChainDB.store_tx_index db txid block_hash 0;
 
   (* Create chain state with a tip *)
@@ -700,6 +705,27 @@ let test_getrawtransaction_confirmed_has_block_info () =
      Alcotest.(check bool) "has time" true (List.mem_assoc "time" fields);
      Alcotest.(check bool) "has blocktime" true (List.mem_assoc "blocktime" fields)
    | _ -> Alcotest.fail "expected Ok(`Assoc fields)");
+
+  (* Core rpc/rawtransaction.cpp:70-83 TxToJSON: a txindex hit whose block is
+     NOT in the block index still reports "blockhash" (pushed whenever
+     hashBlock is set) — and no confirmations/time (pindex not found). *)
+  let tx2 = make_regular_tx
+    [make_test_input txid1 1l]
+    [make_test_output 9_990_000L] in
+  let txid2 = Crypto.compute_txid tx2 in
+  Storage.ChainDB.store_transaction db txid2 tx2;
+  let unknown_block = Types.hash256_of_hex
+    "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f" in
+  Storage.ChainDB.store_tx_index db txid2 unknown_block 0;
+  (match Rpc.handle_getrawtransaction ctx
+           [`String (Types.hash256_to_hex_display txid2); `Bool true] with
+   | Ok (`Assoc fields) ->
+     Alcotest.(check bool) "unknown block: has blockhash (Core TxToJSON)" true
+       (List.mem_assoc "blockhash" fields);
+     Alcotest.(check bool) "unknown block: no confirmations (pindex not found)" false
+       (List.mem_assoc "confirmations" fields)
+   | Ok _ -> Alcotest.fail "expected Ok(`Assoc fields)"
+   | Error e -> Alcotest.fail ("unknown-block lookup failed: " ^ e));
 
   Storage.ChainDB.close db;
   cleanup_test_db ()

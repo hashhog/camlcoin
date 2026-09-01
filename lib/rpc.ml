@@ -1397,7 +1397,13 @@ let get_block_height (ctx : rpc_context) (block_hash : Cstruct.t) : int option =
 let get_block_time (ctx : rpc_context) (block_hash : Cstruct.t) : int32 option =
   match Storage.ChainDB.get_block_header ctx.chain.db block_hash with
   | Some header -> Some header.timestamp
-  | None -> None
+  | None ->
+    (* Core reads pindex->GetBlockTime() from the block INDEX entry; genesis
+       lives only in the in-memory header table (chainparams), never in the
+       header CF, so fall back to the index entry the height lookup uses. *)
+    (match Sync.get_header ctx.chain block_hash with
+     | Some entry -> Some entry.header.timestamp
+     | None -> None)
 
 (* Handle getrawtransaction RPC — stub (superseded by the W60 definition after
    build_non_witness_utxo_json; retained for structure only).
@@ -6777,16 +6783,27 @@ let handle_getrawtransaction (ctx : rpc_context)
             let hex_field = [("hex", `String hex)] in
             (* block context: blockhash, confirmations, time, blocktime
                (Core: TxToJSON pushes these after TxToUniv, but only if block is found) *)
-            let block_ctx = match (block_hash_opt, block_height, block_time) with
-              | (Some bh, Some h, Some t) ->
-                let tip_height = match ctx.chain.tip with Some e -> e.height | None -> 0 in
-                let confirmations = tip_height - h + 1 in
+            (* Core rpc/rawtransaction.cpp:70-83 TxToJSON: "blockhash" is
+               pushed whenever hashBlock is known (txindex hit or explicit
+               blockhash arg); confirmations/time/blocktime only when the
+               block index entry is found AND on the active chain; a known
+               entry off the active chain yields "confirmations": 0; an
+               unknown entry yields blockhash alone.  The previous form
+               dropped blockhash too whenever the header was not resolvable. *)
+            let block_ctx = match block_hash_opt with
+              | None -> []
+              | Some bh ->
                 let bh_hex = Types.hash256_to_hex_display bh in
-                [("blockhash", `String bh_hex);
-                 ("confirmations", `Int confirmations);
-                 ("time", `Int (Int32.to_int t));
-                 ("blocktime", `Int (Int32.to_int t))]
-              | _ -> []
+                let base = [("blockhash", `String bh_hex)] in
+                (match (block_height, block_time, in_active_chain_opt) with
+                 | (Some h, Some t, Some true) ->
+                   let tip_height = match ctx.chain.tip with Some e -> e.height | None -> 0 in
+                   let confirmations = tip_height - h + 1 in
+                   base @ [("confirmations", `Int confirmations);
+                           ("time", `Int (Int32.to_int t));
+                           ("blocktime", `Int (Int32.to_int t))]
+                 | (Some _, _, _) -> base @ [("confirmations", `Int 0)]
+                 | (None, _, _) -> base)
             in
             prefix @ base_fields @ fee_fields @ hex_field @ block_ctx
           in

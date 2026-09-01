@@ -1964,7 +1964,7 @@ let is_truc_tx (tx : Types.transaction) : bool =
         count + 1 ≤ 2.
 
    Reference: bitcoin-core/src/policy/truc_policy.cpp:171-261. *)
-let check_truc_policy (mp : mempool) (tx : Types.transaction)
+let check_truc_policy ?staged_removals (mp : mempool) (tx : Types.transaction)
     (depends : Types.hash256 list) (vsize : int) : (unit, string) result =
   let is_v3 = is_truc_tx tx in
 
@@ -2054,7 +2054,27 @@ let check_truc_policy (mp : mempool) (tx : Types.transaction)
                  descendant_count includes the parent itself, so:
                    0 children ⟹ count=1, 1+1=2≤2 ✓
                    1 child    ⟹ count=2, 2+1=3>2 ✗ *)
-              if parent_entry.descendant_count + 1 > truc_descendant_limit then
+              (* Core truc_policy.cpp:237-243: "Don't double-count a transaction
+                 that is going to be replaced" — when this is an RBF and one of
+                 the parent's children is a direct conflict (staged for
+                 removal), the descendant-count gate is bypassed:
+                   if (GetDescendantCount(parent) + 1 > TRUC_DESCENDANT_LIMIT
+                       && !child_will_be_replaced) reject
+                 Without this a v3 child could never be fee-bumped: the RBF
+                 dry-run evaluates the replacement against the live pool, where
+                 the child it replaces still counts. *)
+              let child_will_be_replaced =
+                match staged_removals with
+                | None -> false
+                | Some staged ->
+                  (match Hashtbl.find_opt mp.children (Cstruct.to_string parent_txid) with
+                   | None -> false
+                   | Some kids ->
+                     Hashtbl.fold (fun kid () acc -> acc || Hashtbl.mem staged kid)
+                       kids false)
+              in
+              if parent_entry.descendant_count + 1 > truc_descendant_limit
+                 && not child_will_be_replaced then
                 Error (Printf.sprintf
                   "TRUC/v3 parent %s already has an unconfirmed child \
                    (descendant count %d would exceed limit %d)"
@@ -2670,7 +2690,8 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
                Without this skip, valid v3 chains that survived a reorg would
                be re-rejected when the parent has not yet re-entered the
                mempool. *)
-            match (if bypass_limits then Ok () else check_truc_policy mp tx !depends vsize) with
+            match (if bypass_limits then Ok ()
+                   else check_truc_policy ?staged_removals mp tx !depends vsize) with
             | Error e -> Error e
             | Ok () ->
 

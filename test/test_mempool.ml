@@ -897,7 +897,9 @@ let test_truc_sibling_eviction () =
     [make_test_output 450_000L]  (* 40k fee - higher than 10k *)
   in
   let replace_result = Mempool.replace_by_fee mp replacement_tx in
-  Alcotest.(check bool) "v3 child replacement via RBF succeeded" true (Result.is_ok replace_result);
+  (match replace_result with
+   | Error e -> Alcotest.failf "v3 child replacement via RBF succeeded: %s" e
+   | Ok _ -> ());
   (* Original child should be gone *)
   Alcotest.(check bool) "original child removed" false (Mempool.contains mp child1_entry.txid);
   Storage.ChainDB.close db;

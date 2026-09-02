@@ -4,7 +4,7 @@ A Bitcoin full node implementation in OCaml.
 
 ## Status — v1.0.0
 
-**Label: "Replay-verified — pending the stateless-replay run now in flight"**
+**Label: "Replay-pending — awaiting the stateless-replay run now in flight"**
 (`receipts/RELEASE-v1.0-SCORECARD.md`, §What each label means). That label is
 deliberately weaker than "Validated", and the scorecard spells out why: it means
 camlcoin agreed with Core on every block the nightly instruments showed it — 169
@@ -38,7 +38,9 @@ these are self-test output, not captures
 from-genesis proof. A reader of this repository alone should assume camlcoin's
 from-genesis validation is untested.
 
-**Operator RPC parity: 50 of Bitcoin Core's 85** — the lowest in the fleet. From
+**Operator RPC parity: 50 of Bitcoin Core's 85** — arithmetically the lowest in
+the fleet *in this run*; two probe runs ten minutes apart disagreed by ±2 on other
+nodes with no deploy between them, so treat the ranking as run-scoped. From
 the 103-method R5 operator probe run 2026-09-01
 (`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`): camlcoin 50 PASS /
 35 FAIL, Bitcoin Core 85 PASS on the same probe, 18 methods unmeasured
@@ -62,6 +64,12 @@ unlock it with a 47-byte garbage key.
 
 > Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
 > the hashhog meta-repo, not to this repository.
+> **Two notes on the citations above.** The R5 probe JSON is **gitignored** in the
+> meta-repo (`.gitignore:60  tools/diff-test-artifacts/`), so a stranger cloning
+> either repository cannot read it; regenerate it with `python3 tools/r5_probe.py`
+> against a running fleet. The nightly `diffguard-*.log` files are likewise
+> gitignored (`.gitignore:43  *.log`). Paths under `receipts/`, `docs/` and
+> `CORE-PARITY-AUDIT/` are tracked, but in the **meta-repo**, not here.
 
 ## Quick Start
 

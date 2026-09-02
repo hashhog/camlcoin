@@ -2,6 +2,67 @@
 
 A Bitcoin full node implementation in OCaml.
 
+## Status — v1.0.0
+
+**Label: "Replay-verified — pending the stateless-replay run now in flight"**
+(`receipts/RELEASE-v1.0-SCORECARD.md`, §What each label means). That label is
+deliberately weaker than "Validated", and the scorecard spells out why: it means
+camlcoin agreed with Core on every block the nightly instruments showed it — 169
+distilled real mainnet blocks, 10 block-context corpus entries, and its row in the
+nightly corpus sweep — and that a 26,067-height stateless replay was still running
+when the release was written. **Until that run produces a `summary.json`, this node
+has no from-genesis evidence at all.** The git tag `v0.1.0-beta1`
+(`receipts/RELEASE-v1.0-FREEZE.md`) says the same thing from the other side: `rc`
+is reserved for an independent from-genesis `--assumevalid=0` reproduction of
+Core's UTXO-set commitment, and `beta` means that receipt does not exist
+(`receipts/beta1-tag-drafts-2026-08-20.md:23-27`). Neither label certifies wallet
+or fund-custody readiness — see `SECURITY.md`.
+
+**camlcoin has not been shown to validate the chain from genesis.** There is no
+camlcoin row in the reproduction ledger (`receipts/TRUST-ANCHOR.md:140-145`) and
+no camlcoin replay ledger in `CORE-PARITY-AUDIT/replay-ledgers/`.
+`receipts/SYNCS.md:29` records the live mainnet chainstate as a Core-format UTXO
+snapshot bootstrap at base height 944183, with "from-genesis full script
+validation **UNKNOWN** — no banked AV=0/genesis replay found". Two capture
+receipts written 15 seconds apart on 2026-07-30 disagree with each other:
+`receipts/T2-capture-camlcoin-20260730T235234Z.md` reports a MISMATCH whose
+"got" value is the literal sentinel `deadbeefdeadbeef…` (a harness self-test),
+and `receipts/T2-capture-camlcoin-20260730T235249Z.md` reports a MATCH; neither
+was ever ratified into the ledger, and the second says of itself "This receipt is
+EVIDENCE, not a ledger entry." The release scorecard adjudicates them: both were
+written the same day as `8c56180`, whose commit body documents a four-branch
+mock-RPC self-test that emits exactly a MISMATCH receipt followed by a MATCH
+receipt, and a `deadbeef` sentinel is not a chain value — so on that evidence
+these are self-test output, not captures
+(`receipts/RELEASE-v1.0-SCORECARD.md`, camlcoin row). Do not read either as a
+from-genesis proof. A reader of this repository alone should assume camlcoin's
+from-genesis validation is untested.
+
+**Operator RPC parity: 50 of Bitcoin Core's 85** — the lowest in the fleet. From
+the 103-method R5 operator probe run 2026-09-01
+(`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`): camlcoin 50 PASS /
+35 FAIL, Bitcoin Core 85 PASS on the same probe, 18 methods unmeasured
+(`SKIP-REGTEST`) for every node including Core. Failures include wrong error
+codes (`getmempoolentry` on a transaction not in the mempool returns `-1` where
+Core returns `-5`) and calls that succeed where Core errors
+(`getblockstats` with an invalid stat name).
+
+**Known gaps in this repo** (`receipts/UNIT-BASELINE-v1.0.md`, 2026-09-01): the
+suite went 26 failing → 0 across 109 test executables, but 24 gates in
+`test_w109_block_index` are carried as explicit skips (`W109-G2` … `W109-G29` —
+Core-internal structures such as the skip list, VARINT `CDiskBlockIndex`, the
+LevelDB `BlockTreeDB`, 16 MiB preallocation and `nMinDiskSpace`, which have no
+camlcoin equivalent); `G17` and `G25` are flagged for a behavioural re-check
+before closing. Four real bugs were fixed and mutation-verified in that pass,
+including `f7d05a8`: before it, a wrong passphrase on an empty wallet could
+unlock it with a 47-byte garbage key.
+
+**Fleet-wide comparison:** `receipts/RELEASE-v1.0-SCORECARD.md` in the
+[hashhog meta-repo](https://github.com/hashhog/hashhog).
+
+> Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
+> the hashhog meta-repo, not to this repository.
+
 ## Quick Start
 
 ### Docker
@@ -87,7 +148,7 @@ Cookie-based authentication is generated automatically in `$datadir/.cookie`.
 
 ## RPC API
 
-Bitcoin Core-compatible JSON-RPC with batch request support.
+JSON-RPC modelled on Bitcoin Core's, with batch request support. Not behaviourally compatible: on the 2026-09-01 operator probe camlcoin answers 50 of the 103 probed methods correctly against Core's 85 — the lowest of the ten implementations — with 35 failures, including wrong error codes and calls that succeed where Core errors (`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`).
 
 | Category | Methods |
 |----------|---------|

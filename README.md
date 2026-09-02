@@ -4,14 +4,19 @@ A Bitcoin full node implementation in OCaml.
 
 ## Status — v1.0.0
 
-**Label: "Replay-pending — awaiting the stateless-replay run now in flight"**
+**Label: "Replay-verified"**
 (`receipts/RELEASE-v1.0-SCORECARD.md`, §What each label means). That label is
 deliberately weaker than "Validated", and the scorecard spells out why: it means
 camlcoin agreed with Core on every block the nightly instruments showed it — 169
 distilled real mainnet blocks, 10 block-context corpus entries, and its row in the
-nightly corpus sweep — and that a 26,067-height stateless replay was still running
-when the release was written. **Until that run produces a `summary.json`, this node
-has no from-genesis evidence at all.** The git tag `v0.1.0-beta1`
+nightly corpus sweep — and that the 26,067-height stateless replay has since
+COMPLETED: 26,067 distinct heights, `accept` on every one, 0 disagreements, 0
+harness-limit rows, against 51,512 rejected control twins (scorecard footnote
+[1], which also records that the first run silently compared only 65% of its
+input and had to be re-run).
+> **What that does and does not mean.** It is a *stateless* re-check of each block
+> against Core's rules with scripts on. It is **not** a from-genesis reproduction
+> of Core's UTXO set, and this node still has **no from-genesis evidence at all**. The git tag `v0.1.0-beta1`
 (`receipts/RELEASE-v1.0-FREEZE.md`) says the same thing from the other side: `rc`
 is reserved for an independent from-genesis `--assumevalid=0` reproduction of
 Core's UTXO-set commitment, and `beta` means that receipt does not exist

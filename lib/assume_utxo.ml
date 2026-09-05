@@ -355,6 +355,98 @@ let available_snapshot_heights (network : Consensus.network_config) : int list =
   List.sort compare (List.map (fun p -> p.height) candidates)
 
 (* ============================================================================
+   Development-only whitelist escape — HASHHOG_UNSAFE_SNAPSHOT_HEIGHT
+   ============================================================================
+
+   [loadtxoutset] is a TRUST SHORTCUT for end users: the snapshot contents are
+   taken on faith at load time, which is exactly why Core hardcodes the base
+   blockhash + [hash_serialized] anchors in [m_assumeutxo_data] and refuses
+   anything else.
+
+   This project needs to validate arbitrary block ranges IN PARALLEL from a
+   locally generated snapshot ladder, whose base blocks are of course in
+   nobody's chainparams. Correctness there is established by checking each
+   range OUTPUT utxo hash against an independent commitment — not by trusting
+   the input snapshot — so the whitelist buys nothing there and only blocks
+   the rig.
+
+   Setting [HASHHOG_UNSAFE_SNAPSHOT_HEIGHT=<height>] therefore accepts a
+   snapshot whose base blockhash is NOT a trust anchor, taking <height> on
+   faith as the base height (the whitelist entry is what normally supplies
+   it). ONLY whitelist membership and the associated hardcoded
+   [hash_serialized] / [coins_count] comparison are bypassed: file magic,
+   format version, network magic, declared coin count and per-coin parsing
+   are all still enforced.
+
+   UNSET (the default, and what ships) = one [Sys.getenv_opt] and then
+   byte-for-byte the pre-existing production trust semantics.
+
+   Deliberately PURE env-var logic with no file and no path resolution: a
+   prior camlcoin change shipped dead because it reached for a relative
+   [resources/] path that did not resolve once the binary ran out of
+   [deploy/]. There is nothing here to fail to resolve. *)
+let unsafe_snapshot_height () : int option =
+  match Sys.getenv_opt "HASHHOG_UNSAFE_SNAPSHOT_HEIGHT" with
+  | None -> None
+  | Some raw ->
+    let raw = String.trim raw in
+    if raw = "" then None
+    else
+      match int_of_string_opt raw with
+      | Some h when h >= 0 -> Some h
+      | _ ->
+        Printf.eprintf
+          "[UNSAFE-SNAPSHOT] WARNING: HASHHOG_UNSAFE_SNAPSHOT_HEIGHT=%s is not \
+           a non-negative integer block height - ignoring it and keeping the \
+           chainparams whitelist gate.\n%!" raw;
+        None
+
+(** [resolve_assumeutxo_for_snapshot ~network metadata] is
+    [get_assumeutxo_for_hash] plus the development-only
+    [HASHHOG_UNSAFE_SNAPSHOT_HEIGHT] escape documented above.
+
+    Returns [Some (params, unverified)]. [unverified] is [true] only when the
+    escape synthesized [params] for a base blockhash that is NOT a chainparams
+    trust anchor; callers MUST then skip the hardcoded [hash_serialized]
+    comparison (there is no anchor to compare against) and MUST NOT skip
+    anything else. [None] means reject — exactly what a
+    [get_assumeutxo_for_hash] miss means today, and the only outcome reachable
+    when the env var is unset. *)
+let resolve_assumeutxo_for_snapshot
+    ~network:(network : Consensus.network_config)
+    (metadata : snapshot_metadata) : (assumeutxo_params * bool) option =
+  match get_assumeutxo_for_hash ~network metadata.base_blockhash with
+  | Some p -> Some (p, false)
+  | None ->
+    match unsafe_snapshot_height () with
+    | None -> None
+    | Some height ->
+      Printf.eprintf
+        "[UNSAFE-SNAPSHOT] *** WARNING: HASHHOG_UNSAFE_SNAPSHOT_HEIGHT=%d - \
+         accepting an UNVERIFIED snapshot. Base blockhash %s is NOT a \
+         chainparams trust anchor for %s, so its hardcoded hash_serialized \
+         commitment cannot be checked and the base height %d is taken on \
+         faith. DEVELOPMENT ONLY - never enable this in production. ***\n%!"
+        height
+        (Types.hash256_to_hex_display metadata.base_blockhash)
+        network.Consensus.name
+        height;
+      Some ({
+        height;
+        blockhash = metadata.base_blockhash;
+        (* 0L disables the pre-decode count check exactly the way the
+           whitelist entries that carry no Core coin count already do: with no
+           whitelist entry there is simply no hardcoded count to compare
+           against. The snapshot own declared [coins_count] is still enforced
+           per-coin by [iter_snapshot_coins]. *)
+        coins_count = 0L;
+        (* No anchor exists. Callers keyed off [unverified] must not compare
+           against this placeholder. *)
+        coins_hash = Cstruct.create 32;
+        chain_tx_count = 0L;
+      }, true)
+
+(* ============================================================================
    Campaign flag — HASHHOG_CAMPAIGN_ASSUMEUTXO
    ============================================================================
 
@@ -1012,11 +1104,16 @@ let load_snapshot_into_primary
   match read_snapshot_metadata snapshot_path ~expected_network_magic:network.magic with
   | Error e -> Error e
   | Ok metadata ->
-    match get_assumeutxo_for_hash ~network metadata.base_blockhash with
+    (* Whitelist gate, plus the development-only HASHHOG_UNSAFE_SNAPSHOT_HEIGHT
+       escape (see [resolve_assumeutxo_for_snapshot]). With the env var unset
+       this is exactly the previous [get_assumeutxo_for_hash] lookup and the
+       same rejection. This path performs no hardcoded hash_serialized
+       comparison, so it has nothing to skip when the escape is in use. *)
+    match resolve_assumeutxo_for_snapshot ~network metadata with
     | None ->
       Error (Printf.sprintf "Snapshot blockhash %s not recognized for this network"
                (Types.hash256_to_hex_display metadata.base_blockhash))
-    | Some params ->
+    | Some (params, _unverified) ->
       if Int64.compare params.coins_count 0L <> 0
          && metadata.coins_count <> params.coins_count then
         Error (Printf.sprintf "Coins count mismatch: snapshot has %Ld, expected %Ld"
@@ -1172,11 +1269,16 @@ let load_snapshot ~(network : Consensus.network_config)
   match read_snapshot_metadata snapshot_path ~expected_network_magic:network.magic with
   | Error e -> Error e
   | Ok metadata ->
-    match get_assumeutxo_for_hash ~network metadata.base_blockhash with
+    (* Whitelist gate, plus the development-only HASHHOG_UNSAFE_SNAPSHOT_HEIGHT
+       escape (see [resolve_assumeutxo_for_snapshot]). With the env var unset
+       this is exactly the previous [get_assumeutxo_for_hash] lookup and the
+       same rejection. This path performs no hardcoded hash_serialized
+       comparison, so it has nothing to skip when the escape is in use. *)
+    match resolve_assumeutxo_for_snapshot ~network metadata with
     | None ->
       Error (Printf.sprintf "Snapshot blockhash %s not recognized for this network"
                (Types.hash256_to_hex_display metadata.base_blockhash))
-    | Some params ->
+    | Some (params, _unverified) ->
       if Int64.compare params.coins_count 0L <> 0
          && metadata.coins_count <> params.coins_count then
         Error (Printf.sprintf "Coins count mismatch: snapshot has %Ld, expected %Ld"

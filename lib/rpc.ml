@@ -9526,9 +9526,21 @@ let handle_loadtxoutset (ctx : rpc_context)
          (hash-keyed lookup against [mainnet_au_data]); reuse that, and
          when the lookup fails attempt to resolve the height from the
          header index for the error message. Falls back to -1 (matching
-         Core's behaviour for an unknown blockhash). *)
-      (match Assume_utxo.get_assumeutxo_for_hash ~network:ctx.network
-               metadata.base_blockhash with
+         Core's behaviour for an unknown blockhash).
+         HASHHOG_UNSAFE_SNAPSHOT_HEIGHT: development-only escape from that
+         whitelist. loadtxoutset is a trust shortcut for end users, which is
+         why Core hardcodes the anchors; this project needs to validate
+         arbitrary block ranges in parallel from a locally generated snapshot
+         ladder, where correctness comes from checking each range OUTPUT utxo
+         hash against an independent commitment rather than from trusting the
+         input snapshot. When the var is set and the base blockhash is not an
+         anchor, [resolve_assumeutxo_for_snapshot] logs a loud UNVERIFIED
+         warning and synthesizes params at the supplied height; [unverified]
+         then tells us to skip the hardcoded hash_serialized comparison below
+         (there is no anchor to compare against) and NOTHING else. Unset - the
+         default, and what ships - is byte-for-byte the behaviour above. *)
+      (match Assume_utxo.resolve_assumeutxo_for_snapshot
+               ~network:ctx.network metadata with
       | None ->
         let base_height =
           match Sync.get_header ctx.chain metadata.base_blockhash with
@@ -9539,7 +9551,7 @@ let handle_loadtxoutset (ctx : rpc_context)
                  "Assumeutxo height in snapshot metadata not recognized \
                   (%d) - refusing to load snapshot"
                  base_height)
-      | Some params ->
+      | Some (params, unverified) ->
         if Int64.compare params.coins_count 0L <> 0
            && metadata.coins_count <> params.coins_count then
           Error (Printf.sprintf
@@ -9687,8 +9699,19 @@ let handle_loadtxoutset (ctx : rpc_context)
                [Cstruct.equal] is the right check. For the error
                message we render both via [hash256_to_hex_display] so
                the operator sees the same hex Core would print. *)
-            (match Assume_utxo.verify_loaded_utxo_hash
-                     ~db:cs.db ~expected:params.coins_hash with
+            (match
+               (if unverified then
+                  (* HASHHOG_UNSAFE_SNAPSHOT_HEIGHT bypass: this base block is
+                     not a chainparams trust anchor, so there is no pinned
+                     hash_serialized to compare against. Still compute the
+                     snapshot's own HASH_SERIALIZED commitment so txoutset_hash
+                     is reported and the background chainstate below has a
+                     target to re-derive independently. Nothing else is
+                     skipped. *)
+                  Ok (Assume_utxo.compute_utxo_hash_from_db cs.db)
+                else
+                  Assume_utxo.verify_loaded_utxo_hash
+                    ~db:cs.db ~expected:params.coins_hash) with
             | Error msg -> Error msg
             | Ok actual_hash ->
               (* DUAL-CHAINSTATE ACTIVATION (Core ActivateSnapshot /
@@ -9737,7 +9760,15 @@ let handle_loadtxoutset (ctx : rpc_context)
                 Assume_utxo.activate_snapshot_with_background
                   ~snapshot:cs
                   ~bg_db_path
-                  ~assumed_hash:params.coins_hash
+                  (* Under the HASHHOG_UNSAFE_SNAPSHOT_HEIGHT bypass there is
+                     no chainparams commitment, so the background pass targets
+                     the snapshot's own computed hash: the genesis->base
+                     re-derivation is still an independent check, it just is
+                     not anchored in chainparams. In the normal path
+                     [actual_hash] and [params.coins_hash] are equal by
+                     construction (verify_loaded_utxo_hash returned Ok). *)
+                  ~assumed_hash:(if unverified then actual_hash
+                                 else params.coins_hash)
                   ~base_height:params.height
                   ~get_block:(fun h ->
                     Storage.ChainDB.get_block ctx.chain.Sync.db h)

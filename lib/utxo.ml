@@ -471,7 +471,45 @@ module OptimizedUtxoSet = struct
            | `Removed ->
              Hashtbl.replace serialized key `Removed
          ) t.dirty;
-         Rocksdb_store.flush_dirty ?tip_height rdb serialized
+         Rocksdb_store.flush_dirty ?tip_height rdb serialized;
+         (* Mirror the SAME deltas into the cf_chainstate UTXO column
+            family.  [Storage.ChainDB] keeps two physical UTXO backends and
+            every other writer keeps them in step: [apply_block_atomic]
+            (live connect / submitblock) puts and deletes in BOTH,
+            [delete_utxo] deletes from both, [batch_apply_utxo_rocksdb]
+            mirrors the reorg path's CF batch into RocksDB.  This branch was
+            the one asymmetry — RocksDB only — so every coin written through
+            it was invisible to [Storage.ChainDB.iter_utxos], which reads the
+            column family alone.  [get_utxo] hid the gap by falling back to
+            RocksDB on a CF miss, so validation was unaffected and the
+            breakage surfaced only on the ITERATING RPCs: dumptxoutset,
+            gettxoutsetinfo and scantxoutset.  A node bootstrapped from a
+            UTXO snapshot ([Assume_utxo], which loads through this flush)
+            therefore dumped a snapshot containing only the coins created
+            AFTER the base — 34 of 6,038 at the M2 6316 boundary.
+
+            This is the same defect, and the same remedy, as
+            [persist_dirty_atomic] below: that one was added when a regtest
+            node fed only via submitblock dumped a 51-byte header-only
+            snapshot with 0 coins.  RocksDB is committed FIRST and the CF
+            SECOND, matching [apply_block_atomic]'s crash-window ordering
+            (RocksDB ahead of the authoritative CF chain_tip is the safe
+            direction).  No tip pointer is written here — [flush] only ever
+            recorded the RocksDB tip_height marker, and callers set the CF
+            chain_tip themselves. *)
+         let cf_batch = Storage.ChainDB.batch_create () in
+         Hashtbl.iter (fun key entry ->
+           let key_cs = Cstruct.of_string key in
+           let txid = Cstruct.sub key_cs 0 32 in
+           let vout = Int32.to_int (Cstruct.LE.get_uint32 key_cs 32) in
+           match entry with
+           | `Added data ->
+             Storage.ChainDB.batch_store_utxo cf_batch txid vout
+               (Cstruct.to_string data)
+           | `Removed ->
+             Storage.ChainDB.batch_delete_utxo cf_batch txid vout
+         ) serialized;
+         Storage.ChainDB.batch_write t.db cf_batch
        | None ->
          (* Legacy LogStorage path *)
          let batch = Storage.ChainDB.batch_create () in

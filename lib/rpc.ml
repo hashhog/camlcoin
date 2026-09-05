@@ -9841,7 +9841,14 @@ let parse_dumptxoutset_target (ctx : rpc_context)
     (snapshot_type : string) (options : Yojson.Safe.t)
   : (Sync.header_entry option, string) result =
   let lookup_at_height (h : int) : (Sync.header_entry, string) result =
-    let tip_height = match ctx.chain.tip with
+    (* Core's [ParseHashOrHeight] bounds the target by
+       [chainman.ActiveChain().Height()] — the ACTIVE VALIDATED chain, not
+       the best-work header index.  [ctx.chain.tip] is the header tip (see
+       the "NOTE on `tip` semantics" at sync.ml:118): [accept_header]
+       advances it the moment heavier headers arrive over P2P, long before
+       those blocks are validated.  Bounding by it accepted rollback
+       targets hundreds of thousands of blocks above the validated tip. *)
+    let tip_height = match Sync.block_tip ctx.chain with
       | Some t -> t.height
       | None -> -1
     in
@@ -9902,8 +9909,11 @@ let parse_dumptxoutset_target (ctx : rpc_context)
      | "rollback" ->
        (* No explicit target: pick the highest hardcoded assumeutxo
           entry that is ≤ current tip. Mirrors Core's
-          [GetAvailableSnapshotHeights] loop in blockchain.cpp:3122-3125. *)
-       let tip_height = match ctx.chain.tip with
+          [GetAvailableSnapshotHeights] loop in blockchain.cpp:3122-3125.
+          VALIDATED tip, as in [lookup_at_height] above — an entry between
+          the validated tip and the header tip is not a block we could roll
+          back to. *)
+       let tip_height = match Sync.block_tip ctx.chain with
          | Some t -> t.height
          | None -> -1
        in
@@ -10767,7 +10777,15 @@ let handle_dumptxoutset (_ctx : rpc_context)
     match parse_dumptxoutset_target _ctx snapshot_type options with
     | Error e -> Error e
     | Ok target_opt ->
-      let original_tip = _ctx.chain.tip in
+      (* Core: [tip = chainman.ActiveChain().Tip()] — the ACTIVE VALIDATED
+         chain tip (blockchain.cpp:3112), which is what "latest" dumps
+         ([target_index = tip], blockchain.cpp:3126-3127) and what the
+         "do we need to roll back at all?" test compares against
+         (blockchain.cpp:3161).  NOT [_ctx.chain.tip], the best-work HEADER
+         entry — see the "NOTE on `tip` semantics" at sync.ml:118 and the
+         same correction already made in [handle_getbestblockhash] and in
+         loadtxoutset's work comparison. *)
+      let original_tip = Sync.block_tip _ctx.chain in
       (* Pruned-mode pre-check (Bitcoin Core
          [rpc/blockchain.cpp:dumptxoutset]):
              if (IsPruneMode() &&
@@ -10833,9 +10851,18 @@ let handle_dumptxoutset (_ctx : rpc_context)
         finally_restore_pause ();
         Error (Printf.sprintf "rollback failed: %s" msg)
       | Ok () ->
-        (* Resolve the base block (post-rollback tip) used in metadata. *)
+        (* Resolve the base block (post-rollback tip) used in metadata.
+           The VALIDATED tip: this is the block the dumped UTXO set
+           actually corresponds to, and it is what Core reports as
+           base_height/base_hash (WriteUTXOSnapshot is handed the tip from
+           [PrepareUTXOSnapshot(ActiveChainstate())], blockchain.cpp:3211).
+           Reading [_ctx.chain.tip] here stamped the snapshot — both the
+           RPC response AND the on-disk file header — with the best-work
+           HEADER height, which on a node whose peers serve headers ahead
+           of blocks is an arbitrary height far above the chain the coins
+           came from. *)
         let base_height, base_hash =
-          match _ctx.chain.tip with
+          match Sync.block_tip _ctx.chain with
           | Some t -> (t.height, t.hash)
           | None -> (0, Types.zero_hash)
         in
@@ -11101,7 +11128,11 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
            Assume_utxo.serialize_coin_for_hash w outpoint coin;
            let cs = Serialize.writer_to_cstruct w in
            Buffer.add_string buf (Cstruct.to_string cs)));
-      let tip_height, tip_hash = match ctx.chain.tip with
+      (* Core reports [stats.nHeight] / [stats.hashBlock], which
+         [GetUTXOStats] takes from the coins view's best block — the ACTIVE
+         VALIDATED chainstate tip, never the header index.  Same correction
+         as [handle_dumptxoutset]'s base_height/base_hash above. *)
+      let tip_height, tip_hash = match Sync.block_tip ctx.chain with
         | Some t -> (t.height, t.hash)
         | None -> (0, Types.zero_hash)
       in

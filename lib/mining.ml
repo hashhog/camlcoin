@@ -912,10 +912,54 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
         let entry_result = match Sync.validate_header chain block.header with
           | Ok entry -> Ok entry
           | Error "Header already known" ->
-            (* Header already exists — look it up. This is the normal IBD case. *)
-            (match Sync.get_header_at_height chain height with
+            (* Header already exists — look it up BY HASH.
+
+               Bitcoin Core resolves an already-known header out of
+               [m_blockman.m_block_index], the hash-keyed index of every
+               known block, and never via a height lookup:
+
+                 BlockMap::iterator miSelf{m_blockman.m_block_index.find(hash)};
+                 if (miSelf != m_blockman.m_block_index.end()) {
+                     // Block header is already known.
+                     CBlockIndex* pindex = &(miSelf->second);
+                     if (ppindex) *ppindex = pindex;
+                     ...
+                     return true;
+                 }
+
+               (bitcoin-core/src/validation.cpp AcceptBlockHeader:4190-4206.)
+
+               This used to call [Sync.get_header_at_height chain height],
+               which resolves through [Storage.ChainDB.get_hash_at_height]
+               — the height->hash index.  Since the 2026-08-07 height-index
+               fix that index projects ONLY the ACTIVE VALIDATED chain:
+               [accept_header] is explicitly forbidden from writing it (see
+               its comment; it is written only by [apply_block_atomic] and
+               [reorganize], mirroring Core's CChain::SetTip), so there is
+               NO row at any height above [blocks_synced].
+
+               The header of the first block above the validated tip is
+               therefore always present in [state.headers] (header sync put
+               it there) and always absent from the height index — so this
+               lookup missed and submitblock returned "rejected" for a block
+               Core accepts.  It reproduced as a hard consensus divergence at
+               an assumeutxo boundary, where the validated tip is pinned at
+               the snapshot base while headers run far ahead: camlcoin
+               rejected block 6300, the first real main-chain block above
+               base 6299 (M2 boundary campaign run 20260905T164716Z).
+
+               The hash lookup also removes a latent wrong-entry hazard the
+               height lookup carried: had the index held a row at [height]
+               from a competing branch, it would have returned that OTHER
+               block's header entry for the block being submitted.
+
+               [Sync.get_header] reads the same [state.headers] table that
+               [validate_header] just probed to produce this error, so the
+               [None] arm below is unreachable; it is kept as a total-match
+               guard rather than an assertion. *)
+            (match Sync.get_header chain hash with
              | Some entry -> Ok entry
-             | None -> Error "Header already known but not found at expected height")
+             | None -> Error "Header already known but not found in block index")
           | Error e -> Error e
         in
         match entry_result with

@@ -609,14 +609,40 @@ let compute_size_on_disk (data_dir : string option) : int =
    Blockchain Info Handlers
    ============================================================================ *)
 
+(* Hash of the ACTIVE VALIDATED chain tip, in RPC display order.
+
+   Core: [ActiveChain().Tip()->GetBlockHash()] — never the header index.
+   [Sync.block_tip] resolves that chain.  It can be [None] on a
+   snapshot-bootstrapped datadir, where the base block's 80-byte header is
+   not part of the snapshot and no [header_entry] exists until the
+   re-anchored header sync rebuilds past the base; the UTXO-flush marker
+   still records the hash, and Core's Tip() is never null once a chainstate
+   is loaded, so fall back to the marker rather than to an all-zero hash
+   that belongs to no block.  Shared by [handle_getbestblockhash] and
+   [handle_getblockchaininfo] so the two can never disagree. *)
+let best_block_hash_hex (ctx : rpc_context) : string =
+  match Sync.block_tip ctx.chain with
+  | Some t -> Types.hash256_to_hex_display t.hash
+  | None ->
+    (match Storage.ChainDB.get_chain_tip ctx.chain.db with
+     | Some (hash, _) when not (Cstruct.equal hash Types.zero_hash) ->
+       Types.hash256_to_hex_display hash
+     | _ -> "0000000000000000000000000000000000000000000000000000000000000000")
+
 let handle_getblockchaininfo (ctx : rpc_context)
     : Yojson.Safe.t =
-  let tip_entry = ctx.chain.tip in
-  let _tip_height, tip_hash = match tip_entry with
-    | Some t -> (t.height,
-        Types.hash256_to_hex_display t.hash)
-    | None -> (0, "0000000000000000000000000000000000000000000000000000000000000000")
-  in
+  (* Core takes EVERY tip-derived field here from one index:
+       const CBlockIndex& tip{*active_chainstate.m_chain.Tip()};
+     (rpc/blockchain.cpp:1418) — blocks, bestblockhash, bits, target,
+     difficulty, time, mediantime, chainwork.  Only [headers] comes from
+     the header index ([chainman.m_best_header], :1423).
+     This read [ctx.chain.tip], the best-work HEADER entry, so the response
+     paired [blocks] (already the validated height) with a bestblockhash,
+     difficulty and chainwork from a block that had not been connected —
+     during headers-first sync those describe a chain hundreds of thousands
+     of blocks ahead of the one the node has actually validated. *)
+  let tip_entry = Sync.block_tip ctx.chain in
+  let tip_hash = best_block_hash_hex ctx in
   let difficulty = match tip_entry with
     | Some t -> Consensus.difficulty_from_bits t.header.bits
     | None -> 1.0
@@ -843,13 +869,22 @@ let handle_getblockheader (ctx : rpc_context)
     Error "Invalid parameters: expected [blockhash] or [blockhash, verbose]"
 
 let handle_getblockcount (ctx : rpc_context) : Yojson.Safe.t =
+  (* Core: [chainman.ActiveChain().Height()] (rpc/blockchain.cpp:264) — the
+     height of the most-work FULLY VALIDATED chain, never the header index.
+     [blocks_synced] is that height: it is advanced only where a block is
+     actually connected/disconnected, and it is the in-memory half of
+     camlcoin's active chain (see the note on [Sync.block_tip]).  It is
+     deliberately NOT [chain.tip.height], which is the best-work HEADER. *)
   `Int ctx.chain.blocks_synced
 
 let handle_getbestblockhash (ctx : rpc_context) : Yojson.Safe.t =
-  (* Validated-block tip — not [chain.tip], the best-work header (Core compat). *)
-  match Sync.block_tip ctx.chain with
-  | Some t -> `String (Types.hash256_to_hex_display t.hash)
-  | None -> `String "0000000000000000000000000000000000000000000000000000000000000000"
+  (* Core: [chainman.ActiveChain().Tip()->GetBlockHash()]
+     (rpc/blockchain.cpp:286).  The VALIDATED tip — not [chain.tip], the
+     best-work header.  [Sync.block_tip] resolves the active chain and, as
+     of the fix alongside this comment, prefers the in-memory active chain
+     over the (periodically written) UTXO-flush marker, so this answers the
+     block at [getblockcount] rather than the last flushed one. *)
+  `String (best_block_hash_hex ctx)
 
 (* hashhog W70: uniform fleet-wide sync-state report.
    Spec: meta-repo `spec/getsyncstate.md`.
@@ -5595,13 +5630,20 @@ let handle_gettxout (ctx : rpc_context)
     (match Utxo.UtxoSet.get utxo_set txid vout with
      | None -> Ok `Null
      | Some utxo ->
-       let tip_hash_hex = match ctx.chain.tip with
-         | Some t -> Types.hash256_to_hex_display t.hash
-         | None -> "0000000000000000000000000000000000000000000000000000000000000000"
-       in
-       let tip_height = match ctx.chain.tip with
+       (* Core resolves BOTH fields from the coins view's best block:
+            pindex = LookupBlockIndex(coins_view->GetBestBlock());
+            ret.pushKV("bestblock", pindex->GetBlockHash()...);
+            ret.pushKV("confirmations", pindex->nHeight - coin->nHeight + 1);
+          (rpc/blockchain.cpp:1244-1250), where coins_view is CoinsTip() —
+          the ACTIVE VALIDATED chain's coin cache.  Reading [ctx.chain.tip]
+          took the best-work HEADER instead, so a coin's confirmations
+          counted every header the node had merely *seen*, and bestblock
+          named a block whose UTXO effects were not in the set the coin was
+          just read from. *)
+       let tip_hash_hex = best_block_hash_hex ctx in
+       let tip_height = match Sync.block_tip ctx.chain with
          | Some t -> t.height
-         | None -> 0
+         | None -> ctx.chain.blocks_synced
        in
        let confirmations = max 1 (tip_height - utxo.Utxo.height + 1) in
        let net = network_to_address_network ctx.network in
@@ -11061,6 +11103,26 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
                 Ok (`Assoc (base_fields @ hash_field))))
   end
   else begin
+      (* Core runs [active_chainstate.ForceFlushStateToDisk(wipe_cache=false)]
+         BEFORE it takes the coins cursor (rpc/blockchain.cpp:1075), because
+         [GetUTXOStats] reads [CoinsDB()] — the on-disk view — while the
+         freshly connected blocks' coins are still sitting in the in-memory
+         CCoinsViewCache.  camlcoin has exactly the same split: the loop
+         below iterates [Storage.ChainDB.iter_utxos] (the cf_chainstate
+         column family), but during IBD the connect path only touches
+         [OptimizedUtxoSet]'s dirty map and flushes it every
+         [utxo_flush_interval] (500) blocks.  Without this flush a range
+         shorter than the flush interval reported the tip's height and hash
+         next to the UTXO set of the LAST FLUSHED block — a mismatching but
+         entirely plausible pair, which reads exactly like a consensus
+         divergence.  A 30-block range run answered with the height-91795
+         snapshot base's set after connecting through 91825.
+         [handle_scantxoutset] already flushes here for the same reason;
+         errors are swallowed the same way, since a flush fault must not
+         turn a read-only RPC into a hard error. *)
+      (match ctx.utxo with
+       | Some u -> (try Utxo.OptimizedUtxoSet.flush u with _ -> ())
+       | None -> ());
       (* Walk the UTXO set once, computing aggregate stats and (optionally)
          the requested commitment in a single pass. The MuHash accumulator
          is allocated lazily so callers asking for hash_type=none don't pay

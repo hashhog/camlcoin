@@ -1735,35 +1735,73 @@ let build_presync_locator_full (ps : peer_header_sync)
    it falls back to [state.tip] for the fresh-chain case where genesis may
    only be in the in-memory Hashtbl (pre-persistence). *)
 let block_tip (state : chain_state) : header_entry option =
-  (* The AUTHORITATIVE validated tip is the [chain_tip] pointer, advanced
-     ONLY by an actual block connect / disconnect / reorg
-     ([apply_block_atomic] / [reorganize] / [disconnect_to_target]).  Prefer
-     it over the height->hash index: [accept_header] overwrites that index
-     (and [state.tip]) with the best-WORK header chain the moment a heavier
-     competing branch's headers arrive over P2P — long before those blocks
-     are validated and connected.  Resolving the validated tip from the
-     clobbered index made [connect_stored_blocks] / [process_new_block] treat
-     a not-yet-connected side-branch block at [blocks_synced] as the current
-     tip and extend the heavier chain ON TOP of the still-live old chain
-     WITHOUT disconnecting it — the live-P2P reorg UTXO corruption.  Bitcoin
-     Core keeps the active chain (CChain) strictly separate from the
-     block-index / best-header pointer. *)
+  (* Bitcoin Core keeps THREE structures strictly apart, and the validated
+     tip is the third one:
+       - [m_block_index]  every known header, keyed by hash
+       - [pindexBestHeader] the best-work HEADER (may be a side branch)
+                            == camlcoin's [state.tip]
+       - [CChain m_chain]   the ACTIVE VALIDATED chain, height-keyed,
+                            advanced per block by [CChain::SetTip] from
+                            ConnectTip / DisconnectTip.
+     [ActiveChain().Tip()] is m_chain's back element: purely in memory, and
+     it moves on every connected block.  It is NOT the coins-DB best-block
+     marker, which only advances when [FlushStateToDisk] runs.
+
+     camlcoin's counterpart of m_chain is the pair
+       [state.blocks_synced]  (in-memory height, set on every connect)
+       + the on-disk height->hash index (written per connect by
+         [apply_block_atomic], the IBD connect step, and [reorganize];
+         deliberately NOT written by [accept_header] /
+         [register_side_branch_header] / the REDOWNLOAD path, so it projects
+         the ACTIVE chain only — see the comment in [accept_header] and
+         receipts/camlcoin-height-index-2026-08-07.md).
+
+     [Storage.ChainDB.get_chain_tip] is the OTHER thing: the durability
+     marker written next to a UTXO flush, i.e. Core's coins-DB best block.
+     During IBD it is only written every [utxo_flush_interval] (500) blocks,
+     so it LAGS the connected tip by up to 500 blocks.  Resolving the
+     validated tip from it alone reported a block that had been superseded
+     hundreds of blocks earlier: a 30-block range run connected 91796..91825
+     yet [getbestblockhash] answered with the height-91795 snapshot base,
+     because no flush had fired inside the window.  The same staleness fed
+     [connect_stored_blocks] / [process_new_block] / [reorganize], whose
+     "does this block extend the validated tip?" tests compare against this
+     hash.
+
+     So: prefer the in-memory active chain whenever it is AHEAD of the
+     persisted marker, exactly as Core prefers m_chain over CoinsDB's
+     hashBlock, and keep the marker as the authority (and as the fallback)
+     otherwise.  After a restart [restore_chain_state] seeds [blocks_synced]
+     FROM this marker, so the two agree and this is a no-op on every
+     recovery path. *)
+  let from_active_chain () =
+    match get_header_at_height state state.blocks_synced with
+    | Some _ as x -> x
+    | None -> if state.blocks_synced = 0 then state.tip else None
+  in
+  let from_flush_marker hash =
+    Hashtbl.find_opt state.headers (Cstruct.to_string hash)
+  in
   match Storage.ChainDB.get_chain_tip state.db with
-  | Some (hash, _) ->
-    (match Hashtbl.find_opt state.headers (Cstruct.to_string hash) with
+  | Some (hash, marker_height) when marker_height >= state.blocks_synced ->
+    (* Marker is level with (or ahead of) the in-memory chain — the
+       historical case, unchanged. *)
+    (match from_flush_marker hash with
      | Some _ as x -> x
      | None ->
        (* Pointer set but header not in the in-memory map (shouldn't happen
           post-load): fall back to the index lookup. *)
-       (match get_header_at_height state state.blocks_synced with
-        | Some _ as x -> x
-        | None -> if state.blocks_synced = 0 then state.tip else None))
+       from_active_chain ())
+  | Some (hash, _) ->
+    (* Marker LAGS the connected tip: blocks have been connected since the
+       last UTXO flush.  Core's ActiveChain().Tip() is those blocks' tip. *)
+    (match from_active_chain () with
+     | Some _ as x -> x
+     | None -> from_flush_marker hash)
   | None ->
     (* Fresh chain: [chain_tip] not yet persisted; genesis may only live in
        the in-memory Hashtbl.  Fall back to the index / state.tip. *)
-    (match get_header_at_height state state.blocks_synced with
-     | Some _ as x -> x
-     | None -> if state.blocks_synced = 0 then state.tip else None)
+    from_active_chain ()
 
 (* W93 Bug 1 fix: provide the hash of the block at the network's
    BIP34Height so Bitcoin Core's BIP-30 skip optimization (Gate 4) can

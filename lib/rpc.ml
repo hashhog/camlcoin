@@ -10482,9 +10482,44 @@ let handle_scantxoutset (ctx : rpc_context)
            the committed set. submit_block already drains via
            persist_dirty_atomic into cf_chainstate (the column family
            iterated below), so this is belt-and-suspenders for any path that
-           left dirty entries. *)
+           left dirty entries.
+
+           The flush MUST advance the durability markers with the coins —
+           same reasoning, same two lines, as [handle_gettxoutsetinfo]
+           (49aa827); see the long note there.  Core's ForceFlushStateToDisk
+           writes the coins and DB_BEST_BLOCK in ONE
+           CCoinsViewDB::BatchWrite, so on-disk coins are never ahead of the
+           on-disk best block.  A bare [flush u] persists every block
+           connected since the last periodic flush while BOTH markers still
+           name the last flushed block, and cli.ml's boot reconciliation
+           cannot see it: it compares rdb_tip against chain_tip, and those
+           two still agree — only the DATA moved.  After a SIGKILL the node
+           restarts at the marker and re-connects blocks whose effects are
+           already on disk; the first dies on BIP-30 ("transaction has
+           duplicate txid in UTXO set") and it re-downloads forever.
+           Measured through THIS path on rung 91795->91825: one scantxoutset
+           then SIGKILL left getblockcount 91795 beside a UTXO set hashing to
+           rung 91825's commitment, 33 BIP-30 failures, tip never advanced.
+           This site predates 3ea57e5, so it was not a regression — but it is
+           the same live corruption trigger.
+
+           Mirror the IBD flush protocol ([flush_utxos] + [set_chain_tip],
+           sync.ml:3185/3193): flush WITH the height so rocksdb records it,
+           then advance the CF chain_tip to that height's block.  RDB-then-CF
+           ordering matches [apply_block_atomic]'s crash-window analysis, so
+           a crash can only leave RDB ahead of the authoritative CF
+           chain_tip — the safe direction the boot reconciliation detects.
+           [blocks_synced] is unchanged: the markers only catch up to coins
+           that are now genuinely on disk. *)
         (match ctx.utxo with
-         | Some u -> (try Utxo.OptimizedUtxoSet.flush u with _ -> ())
+         | Some u ->
+           (try
+              let h = ctx.chain.blocks_synced in
+              Utxo.OptimizedUtxoSet.flush ~tip_height:h u;
+              (match Storage.ChainDB.get_hash_at_height ctx.chain.db h with
+               | Some hash -> Storage.ChainDB.set_chain_tip ctx.chain.db hash h
+               | None -> ())
+            with _ -> ())
          | None -> ());
         let txouts = ref 0 in
         let total_amount = ref 0L in

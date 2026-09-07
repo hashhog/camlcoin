@@ -10478,49 +10478,17 @@ let handle_scantxoutset (ctx : rpc_context)
       match scantxoutset_resolve scanobjects with
       | Error e -> Error e
       | Ok needles ->
-        (* Flush any pending wallet-independent UTXO writes so the scan sees
-           the committed set. submit_block already drains via
-           persist_dirty_atomic into cf_chainstate (the column family
-           iterated below), so this is belt-and-suspenders for any path that
-           left dirty entries.
-
-           The flush MUST advance the durability markers with the coins —
-           same reasoning, same two lines, as [handle_gettxoutsetinfo]
-           (49aa827); see the long note there.  Core's ForceFlushStateToDisk
-           writes the coins and DB_BEST_BLOCK in ONE
-           CCoinsViewDB::BatchWrite, so on-disk coins are never ahead of the
-           on-disk best block.  A bare [flush u] persists every block
-           connected since the last periodic flush while BOTH markers still
-           name the last flushed block, and cli.ml's boot reconciliation
-           cannot see it: it compares rdb_tip against chain_tip, and those
-           two still agree — only the DATA moved.  After a SIGKILL the node
-           restarts at the marker and re-connects blocks whose effects are
-           already on disk; the first dies on BIP-30 ("transaction has
-           duplicate txid in UTXO set") and it re-downloads forever.
-           Measured through THIS path on rung 91795->91825: one scantxoutset
-           then SIGKILL left getblockcount 91795 beside a UTXO set hashing to
-           rung 91825's commitment, 33 BIP-30 failures, tip never advanced.
-           This site predates 3ea57e5, so it was not a regression — but it is
-           the same live corruption trigger.
-
-           Mirror the IBD flush protocol ([flush_utxos] + [set_chain_tip],
-           sync.ml:3185/3193): flush WITH the height so rocksdb records it,
-           then advance the CF chain_tip to that height's block.  RDB-then-CF
-           ordering matches [apply_block_atomic]'s crash-window analysis, so
-           a crash can only leave RDB ahead of the authoritative CF
-           chain_tip — the safe direction the boot reconciliation detects.
-           [blocks_synced] is unchanged: the markers only catch up to coins
-           that are now genuinely on disk. *)
-        (match ctx.utxo with
-         | Some u ->
-           (try
-              let h = ctx.chain.blocks_synced in
-              Utxo.OptimizedUtxoSet.flush ~tip_height:h u;
-              (match Storage.ChainDB.get_hash_at_height ctx.chain.db h with
-               | Some hash -> Storage.ChainDB.set_chain_tip ctx.chain.db hash h
-               | None -> ())
-            with _ -> ())
-         | None -> ());
+        (* NO force-flush here — deliberately (1.0.1 revert of e66171f and of
+           the older unmarked [flush u] it replaced; see
+           receipts/SECREV-CAMLCOIN-CRASH-2026-09-06.md).  Same reason as
+           [handle_gettxoutsetinfo]: the coins and the chain_tip marker live
+           in two RocksDB instances, so the flush was two batches with a
+           crash window between them that, under the default assume-valid
+           config, rewound the node to height 0 with no way back.  A
+           read-only RPC must not be able to wedge the datadir.  Do NOT
+           re-add one.  The scan below reads the on-disk cf_chainstate column
+           family, which during IBD lags the connected tip by up to
+           [utxo_flush_interval] blocks — a stale read, not a corruption. *)
         let txouts = ref 0 in
         let total_amount = ref 0L in
         let unspents = ref [] in
@@ -11138,63 +11106,30 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
                 Ok (`Assoc (base_fields @ hash_field))))
   end
   else begin
-      (* Core runs [active_chainstate.ForceFlushStateToDisk(wipe_cache=false)]
-         BEFORE it takes the coins cursor (rpc/blockchain.cpp:1075), because
-         [GetUTXOStats] reads [CoinsDB()] — the on-disk view — while the
-         freshly connected blocks' coins are still sitting in the in-memory
-         CCoinsViewCache.  camlcoin has exactly the same split: the loop
-         below iterates [Storage.ChainDB.iter_utxos] (the cf_chainstate
-         column family), but during IBD the connect path only touches
-         [OptimizedUtxoSet]'s dirty map and flushes it every
-         [utxo_flush_interval] (500) blocks.  Without this flush a range
-         shorter than the flush interval reported the tip's height and hash
-         next to the UTXO set of the LAST FLUSHED block — a mismatching but
-         entirely plausible pair, which reads exactly like a consensus
-         divergence.  A 30-block range run answered with the height-91795
-         snapshot base's set after connecting through 91825.
-         [handle_scantxoutset] already flushes here for the same reason;
-         errors are swallowed the same way, since a flush fault must not
-         turn a read-only RPC into a hard error.
+      (* NO force-flush here — deliberately (1.0.1 revert of the flush added
+         in 3ea57e5 and marker-wrapped in 49aa827; see
+         receipts/SECREV-CAMLCOIN-CRASH-2026-09-06.md).  Do NOT re-add one as
+         an "obvious improvement".
 
-         The flush MUST advance the durability markers with the coins.
-         Core's ForceFlushStateToDisk writes the coins and DB_BEST_BLOCK in
-         ONE CCoinsViewDB::BatchWrite (txdb.cpp), so Core's on-disk coins are
-         never ahead of its on-disk best block.  A bare
-         [OptimizedUtxoSet.flush u] — no [~tip_height], no [set_chain_tip] —
-         has no Core analogue: it persists the coins of every block connected
-         since the last periodic flush while BOTH markers still name the last
-         flushed block, i.e. the on-disk UTXO set runs AHEAD of the on-disk
-         chain tip.  That is the UNSAFE direction, and cli.ml's boot
-         reconciliation cannot see it: it compares rdb_tip against chain_tip,
-         and here the two still agree — only the DATA moved.  After a
-         SIGKILL the node restarts at the marker and re-connects blocks whose
-         effects are already on disk; the first one dies on BIP-30
-         ("transaction has duplicate txid in UTXO set") because its coinbase
-         output is already in the set, and the node re-downloads it forever.
-         Measured on this range: crash at 91825 left getblockcount 91795
-         beside a UTXO set hashing to rung 91825's commitment, and the node
-         never advanced again.
+         Core force-flushes before taking the coins cursor
+         (rpc/blockchain.cpp:1075) because its coins and DB_BEST_BLOCK land
+         in ONE CCoinsViewDB::BatchWrite.  camlcoin cannot do that: the coins
+         live in Rocksdb_store (<datadir>/rocksdb_utxo/) and the chain_tip
+         marker in Cf_chainstate (<datadir>/chainstate/chainstate-rocks/) —
+         two RocksDB instances, and a WriteBatch is per instance
+         (storage.ml:622-626).  The flush this site carried was therefore an
+         RDB batch and then a CF batch; a crash in the 1-9 ms between them
+         left rdb_tip ahead of chain_tip, and under the DEFAULT assume-valid
+         config there are no block bodies or undo data for that window, so
+         boot reconciliation rewound chain_tip to 0 and the gap filler never
+         resynced.  A read-only RPC must not be able to wedge the datadir.
 
-         So mirror what the IBD flush two lines apart already does
-         ([flush_utxos] + [set_chain_tip], sync.ml:3185/3193): flush WITH the
-         height so rocksdb records it, then advance the CF chain_tip to the
-         same block.  Ordering is RDB-then-CF, matching
-         [apply_block_atomic]'s crash-window analysis — a crash can only
-         leave RDB ahead of the authoritative CF chain_tip, the safe
-         direction the boot reconciliation is built to detect.  This does not
-         make the RPC advance validation state: [blocks_synced] is unchanged,
-         and the markers only catch up to coins that are now genuinely on
-         disk. *)
-      (match ctx.utxo with
-       | Some u ->
-         (try
-            let h = ctx.chain.blocks_synced in
-            Utxo.OptimizedUtxoSet.flush ~tip_height:h u;
-            (match Storage.ChainDB.get_hash_at_height ctx.chain.db h with
-             | Some hash -> Storage.ChainDB.set_chain_tip ctx.chain.db hash h
-             | None -> ())
-          with _ -> ())
-       | None -> ());
+         So this reports the ON-DISK set.  During IBD it lags the connected
+         tip by up to [utxo_flush_interval] (500) blocks, and the range
+         harness labels that STALE-UTXO-READ — the honest description.  The
+         real fixes (one instance; RDB-authoritative lockstep merge;
+         persisted per-window undo) are sized in the receipt's addendum, and
+         none is 1.0.1 work. *)
       (* Walk the UTXO set once, computing aggregate stats and (optionally)
          the requested commitment in a single pass. The MuHash accumulator
          is allocated lazily so callers asking for hash_type=none don't pay

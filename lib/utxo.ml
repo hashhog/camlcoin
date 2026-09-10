@@ -572,6 +572,79 @@ module OptimizedUtxoSet = struct
       !ops;
     Hashtbl.clear t.dirty
 
+  (* Walk the committed coin set: on-disk CF overlaid with [dirty], in
+     outpoint order.  Read-only — must not persist.
+
+     Core's gettxoutsetinfo hashes CoinsDB() after ForceFlushStateToDisk
+     (rpc/blockchain.cpp:1075) because coins and DB_BEST_BLOCK share one
+     CCoinsViewDB::BatchWrite.  camlcoin cannot: coins live in
+     Rocksdb_store and the chain_tip marker in Cf_chainstate — two
+     instances, and a WriteBatch is per instance (storage.ml:622-626).
+     Flushing from a read-only RPC is therefore an RDB batch then a CF
+     batch; a crash between them wedges a default assume-valid datadir
+     (receipts/SECREV-CAMLCOIN-CRASH-2026-09-06.md).
+
+     The connected coins sit in [dirty] until the periodic IBD flush
+     (Sync.utxo_flush_interval = 500).  Walking ChainDB.iter_utxos
+     alone reports the last flushed set — STALE-UTXO-READ on every
+     ladder range shorter than the interval.  This merge is the set
+     that flush would have hashed, without the two-instance write. *)
+  let iter_committed (t : t)
+      (f : Types.hash256 -> int -> string -> unit) : unit =
+    let n = Hashtbl.length t.dirty in
+    if n = 0 then
+      Storage.ChainDB.iter_utxos t.db f
+    else begin
+      let overlay = Array.make n ("", (None : string option)) in
+      let i = ref 0 in
+      Hashtbl.iter (fun k v ->
+        let payload =
+          match v with
+          | `Removed -> None
+          | `Added entry ->
+            let w = Serialize.writer_create () in
+            serialize_utxo_entry w entry;
+            Some (Cstruct.to_string (Serialize.writer_to_cstruct w))
+        in
+        overlay.(!i) <- (k, payload);
+        incr i
+      ) t.dirty;
+      Array.sort (fun (a, _) (b, _) -> String.compare a b) overlay;
+      let oi = ref 0 in
+      let emit key payload =
+        match payload with
+        | None -> ()
+        | Some data ->
+          let txid = Cstruct.of_string (String.sub key 0 32) in
+          let vout =
+            Char.code key.[32]
+            lor (Char.code key.[33] lsl 8)
+            lor (Char.code key.[34] lsl 16)
+            lor (Char.code key.[35] lsl 24)
+          in
+          f txid vout data
+      in
+      Storage.ChainDB.iter_utxos t.db (fun txid vout data ->
+        let key = utxo_key txid vout in
+        while !oi < n && String.compare (fst overlay.(!oi)) key < 0 do
+          let (k, p) = overlay.(!oi) in
+          emit k p;
+          incr oi
+        done;
+        if !oi < n && fst overlay.(!oi) = key then begin
+          let (k, p) = overlay.(!oi) in
+          emit k p;
+          incr oi
+        end else
+          f txid vout data
+      );
+      while !oi < n do
+        let (k, p) = overlay.(!oi) in
+        emit k p;
+        incr oi
+      done
+    end
+
   (* Get the number of pending dirty entries *)
   let dirty_count (t : t) : int =
     Hashtbl.length t.dirty
@@ -593,6 +666,16 @@ module OptimizedUtxoSet = struct
     Hashtbl.clear t.dirty;
     t.stats <- Perf.create_utxo_stats ()
 end
+
+(* Read-only walk of the committed UTXO set.  When [cache] is [Some],
+   overlays its dirty map on the on-disk CF in outpoint order; when
+   [None], this is [Storage.ChainDB.iter_utxos].  Never writes. *)
+let iter_committed_utxos (cache : OptimizedUtxoSet.t option)
+    (db : Storage.ChainDB.t)
+    (f : Types.hash256 -> int -> string -> unit) : unit =
+  match cache with
+  | Some t -> OptimizedUtxoSet.iter_committed t f
+  | None -> Storage.ChainDB.iter_utxos db f
 
 (* ============================================================================
    Batch Block Connection for IBD

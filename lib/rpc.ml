@@ -11124,18 +11124,19 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
          boot reconciliation rewound chain_tip to 0 and the gap filler never
          resynced.  A read-only RPC must not be able to wedge the datadir.
 
-         So this reports the ON-DISK set.  During IBD it lags the connected
-         tip by up to [utxo_flush_interval] (500) blocks, and the range
-         harness labels that STALE-UTXO-READ — the honest description.  The
-         real fixes (one instance; RDB-authoritative lockstep merge;
-         persisted per-window undo) are sized in the receipt's addendum, and
-         none is 1.0.1 work. *)
-      (* Walk the UTXO set once, computing aggregate stats and (optionally)
-         the requested commitment in a single pass. The MuHash accumulator
-         is allocated lazily so callers asking for hash_type=none don't pay
-         for it. The hash_serialized_3 path uses the same buffer-then-SHA256d
-         encoding [compute_utxo_hash_from_db] does — we replicate the loop
-         locally to avoid a second pass over the iterator. *)
+         The connected coins sit in OptimizedUtxoSet.dirty until the
+         periodic IBD flush ([utxo_flush_interval] = 500).  Walking
+         ChainDB.iter_utxos alone therefore reports the last flushed
+         set — STALE-UTXO-READ on every ladder range shorter than the
+         interval.  [Utxo.iter_committed_utxos] merges the dirty overlay
+         onto the on-disk CF in outpoint order, which is the set
+         ForceFlushStateToDisk would have hashed, with no write. *)
+      (* Walk the committed UTXO set once, computing aggregate stats and
+         (optionally) the requested commitment in a single pass. The
+         MuHash accumulator is allocated lazily so callers asking for
+         hash_type=none don't pay for it. The hash_serialized_3 path uses
+         the same buffer-then-SHA256d encoding [compute_utxo_hash_from_db]
+         does — we replicate the loop locally to avoid a second pass. *)
       let muhash_acc =
         if normalized = "muhash" then Some (Muhash.create ()) else None
       in
@@ -11156,7 +11157,7 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
          PRESENT and typed, not byte-equal to Core. *)
       let disk_size = ref 0L in
       let txid_set = Hashtbl.create 1024 in
-      Storage.ChainDB.iter_utxos ctx.chain.db (fun txid vout data ->
+      Utxo.iter_committed_utxos ctx.utxo ctx.chain.db (fun txid vout data ->
         let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
         let utxo = Utxo.deserialize_utxo_entry r in
         let outpoint = { Types.txid; vout = Int32.of_int vout } in

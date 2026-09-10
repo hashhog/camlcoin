@@ -4,6 +4,7 @@
 
 Changes since `v1.0.0`:
 
+- fix: gettxoutsetinfo hashes the committed UTXO set without flushing (STALE-UTXO-READ)
 - 5be08ee docs: say the cited paths are private before the claims that rest on them
 - fc8935d revert: stop the UTXO-reporting RPCs writing to disk
 - e66171f fix: scantxoutset's force-flush left the same unmarked UTXO set

@@ -59,3 +59,12 @@
 (executable
  (name test_hash_serialized_3)
  (libraries camlcoin alcotest))
+
+; Control for snapshot-boot header pointer (QUEUES.md item 0b). After
+; campaign --import-utxo, restore must leave headers_synced at the
+; assumeUTXO base, not 0. Revert of persist_assumeutxo_base_headers to a
+; no-op makes this fail. Not in the default test run:
+;   dune exec --no-buffer test/test_snapshot_header_boot.exe
+(executable
+ (name test_snapshot_header_boot)
+ (libraries camlcoin alcotest yojson))

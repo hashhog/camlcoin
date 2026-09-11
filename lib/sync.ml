@@ -1192,6 +1192,20 @@ let restore_chain_state (db : Storage.ChainDB.t)
        genesis itself is present to re-anchor on.  A normal restart (whose
        header_tip header bytes ARE on disk) sets [state.tip] in the loop and
        never enters this branch. *)
+    (* Campaign/assumeUTXO chainwork: the fixture pins the base's
+       nChainWork. Restore's height walk starts the tail at ~0 work
+       because the parent of the first tail header is not on disk, so
+       overwrite the in-memory tip once we have one. Must run BEFORE
+       the genesis re-anchor (which only fires when tip is still None). *)
+    (match Storage.ChainDB.get_assumeutxo_chainwork db, state.tip with
+     | Some w, Some t ->
+       let patched = { t with total_work = w } in
+       Hashtbl.replace state.headers (Cstruct.to_string t.hash) patched;
+       state.tip <- Some patched;
+       Logs.info (fun m ->
+         m "Restore: applied assumeutxo chainwork onto header tip at height %d"
+           t.height)
+     | _ -> ());
     let genesis_hash = Crypto.compute_block_hash network.genesis_header in
     let genesis_entry =
       Hashtbl.find_opt state.headers (Cstruct.to_string genesis_hash) in

@@ -570,6 +570,10 @@ let test_background_validation_states () =
     coins_count = 50L;
     coins_hash = Cstruct.create 32;
     chain_tx_count = 0L;
+    base_header = None;
+    base_tail_headers = [];
+    chainwork = None;
+    base_mtp = None;
   } in
   let bg = Assume_utxo.create_background_validation ~snapshot_params:params in
 
@@ -1978,6 +1982,10 @@ let test_b12_background_validation_median_time_hardcoded_zero () =
     coins_count = 0L;
     coins_hash = Cstruct.create 32;
     chain_tx_count = 0L;
+    base_header = None;
+    base_tail_headers = [];
+    chainwork = None;
+    base_mtp = None;
   } in
   let bg = Assume_utxo.create_background_validation ~snapshot_params:params in
   (* The target height is 5, which is a non-genesis height that should require

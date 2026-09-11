@@ -116,6 +116,19 @@ type assumeutxo_params = {
       [m_chain_tx_count] when loading the snapshot's chain index without
       having the historical block bodies on hand. *)
   chain_tx_count : int64;
+  (** 80-byte snapshot-base header when a campaign fixture (or a future
+      chainparams band) supplies it. Snapshot-first boot persists this so
+      [restore_chain_state] leaves [headers_synced] on the loaded base
+      instead of re-anchoring to genesis — the 825k header-sync stall. *)
+  base_header : Types.block_header option;
+  (** Ascending pre-base header band ending at the snapshot base
+      ([base_tail_headers] in the campaign fixture). Last element IS the
+      base header. Seeded so MTP / retarget walks see real ancestors. *)
+  base_tail_headers : Types.block_header list;
+  (** Cumulative nChainWork of the snapshot base, 32-byte LE, when known. *)
+  chainwork : Cstruct.t option;
+  (** Median time past at the snapshot base, when the fixture supplies it. *)
+  base_mtp : int32 option;
 }
 
 (* Helper: build an [assumeutxo_params] record from raw hex fields. The
@@ -139,6 +152,10 @@ let make_au ~height ~blockhash_display ~coins_count ~coins_hash_display
     coins_count;
     coins_hash = Types.hash256_of_hex (rev_hex coins_hash_display);
     chain_tx_count;
+    base_header = None;
+    base_tail_headers = [];
+    chainwork = None;
+    base_mtp = None;
   }
 
 (** Mainnet AssumeUTXO entries — verbatim from Bitcoin Core's
@@ -444,6 +461,10 @@ let resolve_assumeutxo_for_snapshot
            against this placeholder. *)
         coins_hash = Cstruct.create 32;
         chain_tx_count = 0L;
+        base_header = None;
+        base_tail_headers = [];
+        chainwork = None;
+        base_mtp = None;
       }, true)
 
 (* ============================================================================
@@ -459,16 +480,93 @@ let resolve_assumeutxo_for_snapshot
    separate file, named by this env var, read once at startup and merged
    into the in-memory allowlist only. *)
 
+(* Decode an 80-byte block header from a hex string (raw wire bytes, the
+   campaign-fixture convention). Not DISPLAY-reversed: the 80 bytes are
+   version/prev/merkle/time/bits/nonce exactly as they hash. *)
+let header_of_hex (s : string) : (Types.block_header, string) result =
+  let len = String.length s in
+  if len <> 160 then
+    Error (Printf.sprintf "header hex must be 160 chars (80 bytes), got %d" len)
+  else
+    try
+      let raw = Cstruct.create 80 in
+      for i = 0 to 79 do
+        Cstruct.set_uint8 raw i
+          (int_of_string ("0x" ^ String.sub s (i * 2) 2))
+      done;
+      let r = Serialize.reader_of_cstruct raw in
+      Ok (Serialize.deserialize_block_header r)
+    with _ -> Error "header hex is not valid"
+
+let rec last_header = function
+  | [] -> None
+  | [h] -> Some h
+  | _ :: rest -> last_header rest
+
+let headers_chain_ok (headers : Types.block_header list) : bool =
+  let rec go = function
+    | [] | [_] -> true
+    | a :: b :: rest ->
+      Cstruct.equal (Crypto.compute_block_hash a) b.Types.prev_block
+      && go (b :: rest)
+  in
+  go headers
+
+let parse_optional_header ~label json : (Types.block_header option, string) result =
+  match json with
+  | `Null -> Ok None
+  | `String s ->
+    (match header_of_hex s with
+     | Ok h -> Ok (Some h)
+     | Error e -> Error (label ^ ": " ^ e))
+  | _ -> Error (label ^ " must be a hex string")
+
+let parse_optional_header_list ~label json
+    : (Types.block_header list, string) result =
+  match json with
+  | `Null -> Ok []
+  | `List items ->
+    let rec go i acc = function
+      | [] -> Ok (List.rev acc)
+      | `String s :: rest ->
+        (match header_of_hex s with
+         | Ok h -> go (i + 1) (h :: acc) rest
+         | Error e ->
+           Error (Printf.sprintf "%s[%d]: %s" label i e))
+      | _ :: _ ->
+        Error (Printf.sprintf "%s[%d] must be a hex string" label i)
+    in
+    go 0 [] items
+  | _ -> Error (label ^ " must be an array of hex strings")
+
+let parse_optional_chainwork json : (Cstruct.t option, string) result =
+  match json with
+  | `Null -> Ok None
+  | `String s when String.length s = 64 ->
+    (try Ok (Some (Consensus.work_of_hex s))
+     with _ -> Error "chainwork is not valid hex")
+  | `String s ->
+    Error (Printf.sprintf "chainwork must be 64 hex chars, got %d"
+             (String.length s))
+  | _ -> Error "chainwork must be a hex string"
+
+let parse_optional_mtp json : (int32 option, string) result =
+  match json with
+  | `Null -> Ok None
+  | `Int n -> Ok (Some (Int32.of_int n))
+  | `Intlit s ->
+    (try Ok (Some (Int32.of_string s))
+     with _ -> Error "base_mtp is not an integer")
+  | _ -> Error "base_mtp must be an integer"
+
 (** Parse one JSON object from the campaign fixture schema into an
     [assumeutxo_params]. Required keys: "height" (int > 0), "blockhash" and
     "hash_serialized" (64 hex chars, Core DISPLAY order — converted to
     camlcoin's internal storage order by [make_au], exactly like the
-    hardcoded tables above), "m_chain_tx_count" (int). The schema's three
-    optional keys ("base_mtp", "base_header", "chainwork") are accepted but
-    not yet consumed — camlcoin's [assumeutxo_params] carries no MTP/header/
-    chainwork field and nothing on the snapshot-load path needs them today;
-    revisit if a campaign boundary reproduces rustoshi's post-snapshot
-    [bad-txns-nonfinal] wedge (CAMPAIGN-SNAPSHOT-TABLE-SPEC.md). *)
+    hardcoded tables above), "m_chain_tx_count" (int). Optional keys
+    ("base_mtp", "base_header", "chainwork", "base_tail_headers") are
+    consumed: the header band is persisted at snapshot load so header-sync
+    starts at the assumeUTXO base instead of genesis. *)
 let campaign_entry_of_json (j : Yojson.Safe.t) : (assumeutxo_params, string) result =
   let open Yojson.Safe.Util in
   try
@@ -487,8 +585,53 @@ let campaign_entry_of_json (j : Yojson.Safe.t) : (assumeutxo_params, string) res
                height)
     else
       (try
-         Ok (make_au ~height ~blockhash_display ~coins_count:0L
-               ~coins_hash_display:hash_serialized ~chain_tx_count)
+         let base = make_au ~height ~blockhash_display ~coins_count:0L
+               ~coins_hash_display:hash_serialized ~chain_tx_count in
+         match parse_optional_header ~label:"base_header"
+                 (member "base_header" j) with
+         | Error e -> Error (Printf.sprintf "campaign entry height %d: %s" height e)
+         | Ok base_header ->
+         match parse_optional_header_list ~label:"base_tail_headers"
+                 (member "base_tail_headers" j) with
+         | Error e -> Error (Printf.sprintf "campaign entry height %d: %s" height e)
+         | Ok tails ->
+         match parse_optional_chainwork (member "chainwork" j) with
+         | Error e -> Error (Printf.sprintf "campaign entry height %d: %s" height e)
+         | Ok chainwork ->
+         match parse_optional_mtp (member "base_mtp" j) with
+         | Error e -> Error (Printf.sprintf "campaign entry height %d: %s" height e)
+         | Ok base_mtp ->
+           let tails_ok =
+             tails = [] || headers_chain_ok tails in
+           if not tails_ok then
+             Error (Printf.sprintf
+                      "campaign entry height %d: base_tail_headers do not chain"
+                      height)
+           else
+             let effective_header =
+               match base_header, last_header tails with
+               | Some h, _ -> Some h
+               | None, Some h -> Some h
+               | None, None -> None
+             in
+             (match effective_header, last_header tails with
+              | Some h, Some last when not (Cstruct.equal
+                   (Crypto.compute_block_hash h)
+                   (Crypto.compute_block_hash last)) ->
+                Error (Printf.sprintf
+                         "campaign entry height %d: base_header does not match \
+                          last base_tail_headers entry" height)
+              | Some h, _ when not (Cstruct.equal
+                   (Crypto.compute_block_hash h) base.blockhash) ->
+                Error (Printf.sprintf
+                         "campaign entry height %d: base_header hash does not \
+                          equal blockhash" height)
+              | _ ->
+                Ok { base with
+                     base_header = effective_header;
+                     base_tail_headers = tails;
+                     chainwork;
+                     base_mtp })
        with
        | Invalid_argument msg | Failure msg ->
          Error (Printf.sprintf
@@ -1081,9 +1224,10 @@ type primary_load_result = {
     header + height->hash mapping, and sets the CF [chain_tip] to the base
     height. After this returns, the caller should fall through into normal
     node-run: [restore_chain_state] reads [chain_tip] -> [blocks_synced] =
-    base_height; P2P header sync from genesis (the locator gracefully skips
-    the sparse heights) drives the in-memory header tip past base_height;
-    then [start_ibd] downloads block base_height+1 onward.
+    base_height. When the assumeUTXO entry carries a header band,
+    restore leaves [headers_synced] on the base (locator anchored there);
+    otherwise it re-anchors header sync to genesis. Then [start_ibd]
+    downloads block base_height+1 onward.
 
     Coins are written ONLY to [Rocksdb_store] (not the cf_chainstate UTXO
     column family). This matches the established camlcoin convention that
@@ -1098,6 +1242,40 @@ type primary_load_result = {
     (per-txid-grouped, ScriptCompression-encoded coins). The metadata is
     validated against the hardcoded AssumeUTXO parameters before any coin
     is loaded; mismatches reject the snapshot up front. *)
+
+(** Persist the campaign/chainparams header band so [restore_chain_state]
+    finds real header bytes at the snapshot base and does NOT re-anchor
+    [headers_synced] to 0. Returns the number of headers written. No-op
+    when the entry carries no band (built-in Core heights today). *)
+let persist_assumeutxo_base_headers (db : Storage.ChainDB.t)
+    (params : assumeutxo_params) : int =
+  let headers =
+    match params.base_tail_headers, params.base_header with
+    | _ :: _ as tails, _ -> tails
+    | [], Some h -> [h]
+    | [], None -> []
+  in
+  match headers with
+  | [] -> 0
+  | hs ->
+    let n = List.length hs in
+    let start_height = params.height - (n - 1) in
+    if start_height < 0 then 0
+    else begin
+      List.iteri (fun i hdr ->
+        let height = start_height + i in
+        let hash = Crypto.compute_block_hash hdr in
+        Storage.ChainDB.store_block_header db hash hdr;
+        Storage.ChainDB.set_height_hash db height hash
+      ) hs;
+      (match params.chainwork with
+       | Some w -> Storage.ChainDB.set_assumeutxo_chainwork db w
+       | None -> ());
+      n
+    end
+
+(* See the ocamldoc on [primary_load_result] / the block above
+   [persist_assumeutxo_base_headers] for the accept-then-continue contract. *)
 let load_snapshot_into_primary
     ~(network : Consensus.network_config)
     ~(snapshot_path : string)
@@ -1208,14 +1386,25 @@ let load_snapshot_into_primary
                 network.genesis_header;
               Storage.ChainDB.set_height_hash db 0 genesis_hash
             end;
+            (* Persist the campaign/chainparams header band (base_header +
+               base_tail_headers + chainwork) BEFORE recording header_tip.
+               Without these bytes restore_chain_state re-anchors
+               headers_synced to 0 and the campaign harness reports
+               "header-sync STALLED at 0 < base". Hotbuns 52e0ba95 / rustoshi
+               put_base_tail_headers are the same stitch. Built-in Core
+               heights with no band still fall through to the genesis
+               re-anchor. *)
+            let n_hdrs = persist_assumeutxo_base_headers db params in
+            if n_hdrs > 0 then
+              Printf.eprintf
+                "[assumeutxo] persisted %d base-tail header(s) at height %d \
+                 so header-sync starts at the snapshot base, not 0\n%!"
+                n_hdrs params.height;
             (* Store the base block height->hash so the getheaders locator can
                anchor at base_height (build_locator_from_height gracefully
-               skips the unfilled intermediate heights). We only have the base
-               block's hash (from this network's hardcoded AssumeUTXO
-               whitelist), not its real header bytes — the UTXO snapshot
-               carries no headers — so the height->hash map is recorded but
-               the in-memory header entry for the base is left to the normal
-               P2P header sync from genesis. *)
+               skips the unfilled intermediate heights). When the campaign
+               fixture supplied a header band this is already written; the
+               extra put is idempotent. *)
             Storage.ChainDB.set_height_hash db params.height
               metadata.base_blockhash;
             (* Record the validated chain tip. restore_chain_state reads this
@@ -1232,17 +1421,13 @@ let load_snapshot_into_primary
                blocks_synced to 0. Setting header_tip here makes restore take
                the Some-branch, walk the (sparse) stored height->hash map, and
                then read chain_tip into blocks_synced = base_height.
-               We do NOT have the snapshot base block's real header bytes (the
-               UTXO snapshot carries no headers), so the restore loop's
-               [get_block_header base] miss leaves [state.tip = None] with
-               [headers_synced = base_height]; P2P header sync from genesis
-               then rebuilds the in-memory header chain forward past the base
-               (build_locator falls back to genesis when tip is None, and
-               every current network peer advertises best_height > base_height
-               so should_request_headers fires). Mirrors rustoshi
-               main.rs:2287-2289 (HeaderSync::new(genesis) +
-               set_best_header(snapshot_height, snapshot_hash)) and
-               blockbrew main.go:2083-2091 (SetChainState + SetBlockHeight). *)
+               When the campaign fixture supplied a header band, restore
+               finds those bytes and leaves headers_synced at the base
+               (no genesis re-anchor). Without a band this is the
+               historical shape: [get_block_header base] misses, tip is
+               None, and restore re-anchors header sync to genesis.
+               Mirrors rustoshi HeaderSync::set_best_header +
+               put_base_tail_headers and hotbuns seedHeader. *)
             Storage.ChainDB.set_header_tip db metadata.base_blockhash
               params.height;
             Ok {

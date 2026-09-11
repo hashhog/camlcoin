@@ -782,6 +782,20 @@ module ChainDB = struct
       Some (hash, height)
     | _ -> None
 
+  (* Cumulative nChainWork of an assumeUTXO snapshot base, 32-byte LE.
+     Written by [Assume_utxo.persist_assumeutxo_base_headers] from the
+     campaign fixture's "chainwork" field so restore can pin the in-memory
+     tip's total_work instead of summing work_from_bits over a sparse
+     tail (parent missing → ~0). *)
+  let set_assumeutxo_chainwork t (work : Cstruct.t) =
+    Cf_chainstate.put_chain_state t.cf "assumeutxo_chainwork"
+      (Cstruct.to_string work)
+
+  let get_assumeutxo_chainwork t : Cstruct.t option =
+    match Cf_chainstate.get_chain_state t.cf "assumeutxo_chainwork" with
+    | Some s when String.length s = 32 -> Some (Cstruct.of_string s)
+    | _ -> None
+
   (* Transaction index - map txid to (block_hash, tx_index) *)
   let store_tx_index t (txid : Types.hash256) (block_hash : Types.hash256) (tx_idx : int) =
     let w = Serialize.writer_create () in

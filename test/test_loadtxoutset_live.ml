@@ -331,6 +331,10 @@ let test_live_loadtxoutset_accept () =
       coins_count = 0L;
       coins_hash = snap_hash;
       chain_tx_count = Int64.of_int (n + 1);
+      base_header = None;
+      base_tail_headers = [];
+      chainwork = None;
+      base_mtp = None;
     };
 
     let (ctx, node_dir, db) = make_live_ctx blocks in
@@ -429,6 +433,10 @@ let test_live_loadtxoutset_reject () =
       coins_count = 0L;
       coins_hash = snap_hash;
       chain_tx_count = Int64.of_int (n + 1);
+      base_header = None;
+      base_tail_headers = [];
+      chainwork = None;
+      base_mtp = None;
     };
 
     let (ctx, node_dir, db) = make_live_ctx blocks in

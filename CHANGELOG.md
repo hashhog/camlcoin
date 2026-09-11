@@ -4,6 +4,7 @@
 
 Changes since `v1.0.0`:
 
+- fix: HASH_SERIALIZED emits coins in numeric vout order, not LE32 key order
 - fix: gettxoutsetinfo hashes the committed UTXO set without flushing (STALE-UTXO-READ)
 - 5be08ee docs: say the cited paths are private before the claims that rest on them
 - fc8935d revert: stop the UTXO-reporting RPCs writing to disk

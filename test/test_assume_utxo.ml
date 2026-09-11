@@ -656,29 +656,80 @@ let test_utxo_hash_multiple_coins () =
     test_failed name (Printexc.to_string e)
 
 let test_utxo_hash_order_matters () =
-  let name = "utxo hash order matters" in
+  let name = "utxo hash: txid order matters, vout order within txid does not" in
   try
+    let txid_a = Cstruct.create 32 in
+    let txid_b =
+      let b = Cstruct.create 32 in
+      Cstruct.set_uint8 b 0 1;
+      b
+    in
     let coin1 : Assume_utxo.snapshot_coin = {
-      outpoint = { Types.txid = Cstruct.create 32; vout = 0l };
+      outpoint = { Types.txid = txid_a; vout = 0l };
       value = 100L;
       script_pubkey = Cstruct.of_string "\x51";
       height = 1;
       is_coinbase = true;
     } in
     let coin2 : Assume_utxo.snapshot_coin = {
-      outpoint = { Types.txid = Cstruct.create 32; vout = 1l };
+      outpoint = { Types.txid = txid_a; vout = 1l };
       value = 200L;
       script_pubkey = Cstruct.of_string "\x52";
       height = 2;
+      is_coinbase = false;
+    } in
+    let coin_b : Assume_utxo.snapshot_coin = {
+      outpoint = { Types.txid = txid_b; vout = 0l };
+      value = 300L;
+      script_pubkey = Cstruct.of_string "\x53";
+      height = 3;
       is_coinbase = false;
     } in
     let hash_12 = Assume_utxo.compute_utxo_hash
         ~iter_coins:(fun f -> f coin1.outpoint coin1; f coin2.outpoint coin2) in
     let hash_21 = Assume_utxo.compute_utxo_hash
         ~iter_coins:(fun f -> f coin2.outpoint coin2; f coin1.outpoint coin1) in
-    (* Order should matter for deterministic hashing *)
-    if Cstruct.equal hash_12 hash_21 then
-      test_failed name "Hash should be order-dependent"
+    let hash_ab = Assume_utxo.compute_utxo_hash
+        ~iter_coins:(fun f -> f coin1.outpoint coin1; f coin_b.outpoint coin_b) in
+    let hash_ba = Assume_utxo.compute_utxo_hash
+        ~iter_coins:(fun f -> f coin_b.outpoint coin_b; f coin1.outpoint coin1) in
+    if not (Cstruct.equal hash_12 hash_21) then
+      test_failed name "same-txid vouts must hash in numeric order either way"
+    else if Cstruct.equal hash_ab hash_ba then
+      test_failed name "txid iteration order must still change the hash"
+    else
+      test_passed name
+  with e ->
+    test_failed name (Printexc.to_string e)
+
+(* Core HASH_SERIALIZED at 140k diverged because the UTXO CF key encodes
+   vout as LE32: vout 256 sorts before vout 1. This pair is the minimal
+   reproduction — Python/Core TxOutSer of vout=1 then vout=256. The LE32
+   cursor order hashes to 310c957a… and must NOT be accepted. *)
+let test_hash_serialized_vout_256_numeric () =
+  let name = "HASH_SERIALIZED: vout 1 then 256, not LE32 (256 then 1)" in
+  try
+    let txid = Types.hash256_of_hex (String.make 64 '1') in
+    let mk vout : Assume_utxo.snapshot_coin = {
+      outpoint = { Types.txid; vout = Int32.of_int vout };
+      value = 1000L;
+      script_pubkey = Cstruct.of_string "\x51";
+      height = 100;
+      is_coinbase = false;
+    } in
+    let c1 = mk 1 in
+    let c256 = mk 256 in
+    (* Feed in LE32 key order (256 before 1) — hasher must re-sort. *)
+    let got = Types.hash256_to_hex_display
+                (Assume_utxo.compute_utxo_hash
+                   ~iter_coins:(fun f ->
+                     f c256.outpoint c256; f c1.outpoint c1)) in
+    let want = "1bf5fd3c3e7b4266925b7d85418718358853084202838070cbf1197f0191ce25" in
+    let le32 = "310c957afea7f7f39626929ad4ef0374411083917732563ec2a586d3710de77a" in
+    if got = le32 then
+      test_failed name "hashed in LE32 key order (256 before 1)"
+    else if got <> want then
+      test_failed name (Printf.sprintf "got %s want %s" got want)
     else
       test_passed name
   with e ->
@@ -742,6 +793,31 @@ let put_test_utxo (db : Storage.ChainDB.t) ~txid_hex ~vout
   let cs = Serialize.writer_to_cstruct w in
   let txid = Types.hash256_of_hex txid_hex in
   Storage.ChainDB.store_utxo db txid vout (Cstruct.to_string cs)
+
+(* Production path: coins live under [txid || vout_le32] keys, so
+   iter_utxos yields 256 before 1. compute_utxo_hash_from_db must
+   still match Core's numeric order. *)
+let test_hash_serialized_from_db_vout_256 () =
+  let name = "HASH_SERIALIZED from DB: vout 256 does not precede vout 1" in
+  let txid_hex = String.make 64 '1' in
+  let dir = temp_dir () in
+  let db = Storage.ChainDB.create (Filename.concat dir "chain") in
+  put_test_utxo db ~txid_hex ~vout:1
+    ~value:1000L ~script:"\x51" ~height:100 ~is_coinbase:false;
+  put_test_utxo db ~txid_hex ~vout:256
+    ~value:1000L ~script:"\x51" ~height:100 ~is_coinbase:false;
+  let got = Types.hash256_to_hex_display
+              (Assume_utxo.compute_utxo_hash_from_db db) in
+  Storage.ChainDB.close db;
+  cleanup_dir dir;
+  let want = "1bf5fd3c3e7b4266925b7d85418718358853084202838070cbf1197f0191ce25" in
+  let le32 = "310c957afea7f7f39626929ad4ef0374411083917732563ec2a586d3710de77a" in
+  if got = le32 then
+    test_failed name "DB cursor hashed in LE32 key order"
+  else if got <> want then
+    test_failed name (Printf.sprintf "got %s want %s" got want)
+  else
+    test_passed name
 
 let test_muhash_empty_db () =
   let name = "muhash: empty UTXO set is canonical empty MuHash" in
@@ -2089,9 +2165,11 @@ let () =
   test_utxo_hash_single_coin ();
   test_utxo_hash_multiple_coins ();
   test_utxo_hash_order_matters ();
+  test_hash_serialized_vout_256_numeric ();
   test_coin_height_encoding ();
 
   (* MuHash3072 wiring tests *)
+  test_hash_serialized_from_db_vout_256 ();
   test_muhash_empty_db ();
   test_muhash_deterministic ();
   test_muhash_differs_from_sha256d ();

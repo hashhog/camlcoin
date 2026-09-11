@@ -11134,15 +11134,15 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
       (* Walk the committed UTXO set once, computing aggregate stats and
          (optionally) the requested commitment in a single pass. The
          MuHash accumulator is allocated lazily so callers asking for
-         hash_type=none don't pay for it. The hash_serialized_3 path uses
-         the same buffer-then-SHA256d encoding [compute_utxo_hash_from_db]
-         does — we replicate the loop locally to avoid a second pass. *)
+         hash_type=none don't pay for it. hash_serialized_3 uses
+         [hash_serialized_acc] (one txid group, numeric vouts, running
+         SHA256d) so LE32 key order cannot scramble HASH_SERIALIZED. *)
       let muhash_acc =
         if normalized = "muhash" then Some (Muhash.create ()) else None
       in
-      let hash_buffer =
+      let hash_acc =
         if normalized = "hash_serialized_3" then
-          Some (Buffer.create (1024 * 1024))
+          Some (Assume_utxo.hash_serialized_create ())
         else None
       in
       let txouts = ref 0 in
@@ -11184,9 +11184,9 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
                ~is_coinbase:utxo.is_coinbase
            in
            Muhash.add acc (Bytes.unsafe_to_string buf));
-        (match hash_buffer with
+        (match hash_acc with
          | None -> ()
-         | Some buf ->
+         | Some acc ->
            let coin : Assume_utxo.snapshot_coin = {
              outpoint;
              value = utxo.Utxo.value;
@@ -11194,10 +11194,7 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
              height = utxo.height;
              is_coinbase = utxo.is_coinbase;
            } in
-           let w = Serialize.writer_create () in
-           Assume_utxo.serialize_coin_for_hash w outpoint coin;
-           let cs = Serialize.writer_to_cstruct w in
-           Buffer.add_string buf (Cstruct.to_string cs)));
+           Assume_utxo.hash_serialized_add acc outpoint coin));
       (* Core reports [stats.nHeight] / [stats.hashBlock], which
          [GetUTXOStats] takes from the coins view's best block — the ACTIVE
          VALIDATED chainstate tip, never the header index.  Same correction
@@ -11211,15 +11208,14 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
            total_amount, transactions, disk_size.
          The hash field (when present) sits BETWEEN bogosize and total_amount. *)
       let hash_field =
-        match muhash_acc, hash_buffer with
+        match muhash_acc, hash_acc with
         | Some acc, _ ->
           let raw = Muhash.finalize acc in
           [("muhash",
               `String (Types.hash256_to_hex_display
                          (Cstruct.of_bytes raw)))]
-        | None, Some buf ->
-          let cs = Cstruct.of_string (Buffer.contents buf) in
-          let h = Crypto.sha256d cs in
+        | None, Some acc ->
+          let h = Assume_utxo.hash_serialized_finish acc in
           [("hash_serialized_3",
               `String (Types.hash256_to_hex_display h))]
         | None, None -> []

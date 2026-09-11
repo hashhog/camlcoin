@@ -805,24 +805,35 @@ let write_snapshot (path : string) (metadata : snapshot_metadata)
        serialize_metadata w metadata;
        output_string oc (Cstruct.to_string (Serialize.writer_to_cstruct w));
 
-       (* 2. Per-txid groups. We accumulate same-txid coins in a buffer and
-          flush them under a single txid prefix when the txid changes. *)
+       (* 2. Per-txid groups. Coins of one txid are collected, then written
+          in numeric vout order (Core WriteUTXOSnapshot / CompactSize vout
+          ascending). The UTXO CF key is [txid || vout_le32], so raw
+          iteration would emit 256 before 1; the file must not. *)
        let cur_txid : Types.hash256 option ref = ref None in
-       let group_buf = Buffer.create 1024 in
-       let group_count = ref 0 in
+       let group_coins : snapshot_coin list ref = ref [] in
        let flush_group () =
          match !cur_txid with
          | None -> ()
          | Some txid ->
+           let coins =
+             List.sort
+               (fun a b ->
+                 Int32.unsigned_compare a.outpoint.vout b.outpoint.vout)
+               !group_coins
+           in
            (* Header: txid (32) + coins_per_txid CompactSize. *)
            let hw = Serialize.writer_create () in
            Serialize.write_bytes hw txid;
-           Serialize.write_compact_size hw !group_count;
+           Serialize.write_compact_size hw (List.length coins);
            output_string oc (Cstruct.to_string (Serialize.writer_to_cstruct hw));
-           (* Body: pre-built per-coin entries. *)
-           output_string oc (Buffer.contents group_buf);
-           Buffer.clear group_buf;
-           group_count := 0
+           List.iter (fun coin ->
+             let cw = Serialize.writer_create () in
+             Serialize.write_compact_size cw (Int32.to_int coin.outpoint.vout);
+             serialize_coin_body cw coin;
+             output_string oc
+               (Cstruct.to_string (Serialize.writer_to_cstruct cw)))
+             coins;
+           group_coins := []
        in
        iter_coins (fun coin ->
          let coin_txid = coin.outpoint.Types.txid in
@@ -835,13 +846,7 @@ let write_snapshot (path : string) (metadata : snapshot_metadata)
            flush_group ();
            cur_txid := Some coin_txid
          end;
-         (* Append [vout : CompactSize] || coin body. *)
-         let cw = Serialize.writer_create () in
-         Serialize.write_compact_size cw (Int32.to_int coin.outpoint.vout);
-         serialize_coin_body cw coin;
-         Buffer.add_string group_buf
-           (Cstruct.to_string (Serialize.writer_to_cstruct cw));
-         incr group_count
+         group_coins := coin :: !group_coins
        );
        flush_group ();
        (* Durability: flush the user-space buffer and fsync the fd
@@ -1424,45 +1429,96 @@ let serialize_coin_for_hash w (outpoint : Types.outpoint) (coin : snapshot_coin)
   Serialize.write_compact_size w (Cstruct.length coin.script_pubkey);
   Serialize.write_bytes w coin.script_pubkey
 
+(* HASH_SERIALIZED (kernel/coinstats.cpp:46-56,87-93,161-163,182-184):
+   HashWriter streams TxOutSer of every coin. ComputeUTXOStats groups the
+   coins-DB cursor by txid into std::map<uint32_t, Coin>, so vouts are
+   numeric. camlcoin's UTXO key is [txid32 || vout_le32]: LE32(256) =
+   00 01 00 00 sorts before LE32(1) = 01 00 00 00, which first appears
+   on mainnet between 115k (max vout 98) and 140k (max vout 2001). A
+   hasher that emits cursor order therefore matches Core at 115k and
+   diverges at 140k on the same coin set.
+
+   The accumulator holds one txid group, sorts it by unsigned vout, and
+   feeds HashWriter (running SHA256; GetHash = SHA256d). *)
+
+type hash_serialized_acc = {
+  mutable ctx : Digestif.SHA256.ctx;
+  mutable prev_txid : string option;
+  mutable group : (int32 * string) list;
+}
+
+let hash_serialized_create () : hash_serialized_acc = {
+  ctx = Digestif.SHA256.empty;
+  prev_txid = None;
+  group = [];
+}
+
+let hash_serialized_flush (acc : hash_serialized_acc) : unit =
+  match acc.group with
+  | [] -> ()
+  | coins ->
+    (* [group] is consed, so reverse back to cursor order first. Core
+       then sorts by uint32 vout (std::map); skipping that sort is the
+       LE32-key bug (vout 256 hashed before vout 1). *)
+    let sorted =
+      List.sort
+        (fun (a, _) (b, _) -> Int32.unsigned_compare a b)
+        (List.rev coins)
+    in
+    List.iter (fun (_, ser) ->
+      acc.ctx <- Digestif.SHA256.feed_string acc.ctx ser)
+      sorted;
+    acc.group <- []
+
+let hash_serialized_add (acc : hash_serialized_acc)
+    (outpoint : Types.outpoint) (coin : snapshot_coin) : unit =
+  let txid_s = Cstruct.to_string outpoint.Types.txid in
+  (match acc.prev_txid with
+   | Some p when p <> txid_s -> hash_serialized_flush acc
+   | _ -> ());
+  acc.prev_txid <- Some txid_s;
+  let w = Serialize.writer_create () in
+  serialize_coin_for_hash w outpoint coin;
+  acc.group <-
+    (outpoint.Types.vout,
+     Cstruct.to_string (Serialize.writer_to_cstruct w))
+    :: acc.group
+
+let hash_serialized_finish (acc : hash_serialized_acc) : Types.hash256 =
+  hash_serialized_flush acc;
+  let inner = Digestif.SHA256.to_raw_string (Digestif.SHA256.get acc.ctx) in
+  let outer = Digestif.SHA256.digest_string inner in
+  Cstruct.of_string (Digestif.SHA256.to_raw_string outer)
+
+let snapshot_coin_of_utxo_entry (txid : Types.hash256) (vout : int)
+    (data : string) : Types.outpoint * snapshot_coin =
+  let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+  let utxo = Utxo.deserialize_utxo_entry r in
+  let outpoint = { Types.txid; vout = Int32.of_int vout } in
+  let coin = {
+    outpoint;
+    value = utxo.Utxo.value;
+    script_pubkey = utxo.script_pubkey;
+    height = utxo.height;
+    is_coinbase = utxo.is_coinbase;
+  } in
+  (outpoint, coin)
+
 (** Compute the UTXO set hash by iterating over all coins.
-    This matches Bitcoin Core's HASH_SERIALIZED hash type.
-    The hash is SHA256d of the concatenation of all serialized coins. *)
+    SHA256d of TxOutSer coins in iterator txid order, vouts numeric
+    within each txid — Bitcoin Core HASH_SERIALIZED. *)
 let compute_utxo_hash ~(iter_coins : (Types.outpoint -> snapshot_coin -> unit) -> unit)
     : Types.hash256 =
-  (* We use an incremental SHA256 approach: hash each coin individually,
-     then combine all coin hashes into a single hash using a Merkle-like structure.
-     For simplicity, we concatenate all serialized coins and hash once. *)
-  let buffer = Buffer.create (1024 * 1024) in  (* 1MB initial buffer *)
-  iter_coins (fun outpoint coin ->
-    let w = Serialize.writer_create () in
-    serialize_coin_for_hash w outpoint coin;
-    let data = Serialize.writer_to_cstruct w in
-    Buffer.add_string buffer (Cstruct.to_string data)
-  );
-  let data = Cstruct.of_string (Buffer.contents buffer) in
-  Crypto.sha256d data
+  let acc = hash_serialized_create () in
+  iter_coins (fun outpoint coin -> hash_serialized_add acc outpoint coin);
+  hash_serialized_finish acc
 
 (** Compute UTXO hash from a database by iterating all stored UTXOs *)
 let compute_utxo_hash_from_db (db : Storage.ChainDB.t) : Types.hash256 =
-  let buffer = Buffer.create (1024 * 1024) in
-  Storage.ChainDB.iter_utxos db (fun txid vout data ->
-    let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
-    let utxo = Utxo.deserialize_utxo_entry r in
-    let outpoint = { Types.txid; vout = Int32.of_int vout } in
-    let coin = {
-      outpoint;
-      value = utxo.Utxo.value;
-      script_pubkey = utxo.script_pubkey;
-      height = utxo.height;
-      is_coinbase = utxo.is_coinbase;
-    } in
-    let w = Serialize.writer_create () in
-    serialize_coin_for_hash w outpoint coin;
-    let coin_data = Serialize.writer_to_cstruct w in
-    Buffer.add_string buffer (Cstruct.to_string coin_data)
-  );
-  let data = Cstruct.of_string (Buffer.contents buffer) in
-  Crypto.sha256d data
+  compute_utxo_hash ~iter_coins:(fun f ->
+    Storage.ChainDB.iter_utxos db (fun txid vout data ->
+      let outpoint, coin = snapshot_coin_of_utxo_entry txid vout data in
+      f outpoint coin))
 
 (** Compute UTXO hash from a UTXO cache *)
 let compute_utxo_hash_from_cache (cache : Utxo.UtxoCache.t)

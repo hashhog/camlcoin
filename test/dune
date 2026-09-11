@@ -50,3 +50,12 @@
 (executable
  (name test_txospender_livereorg)
  (libraries camlcoin))
+
+; Control for HASH_SERIALIZED vout order (QUEUES.md item 0). Loads the
+; 140k soak snapshot into a scratch ChainDB and checks hash_serialized_3
+; against Core's dc9ded5c…. Revert of the numeric-vout sort makes this
+; fail (camlcoin then reports a361c92d…). Not in the default test run:
+;   dune exec --no-buffer test/test_hash_serialized_3.exe
+(executable
+ (name test_hash_serialized_3)
+ (libraries camlcoin alcotest))

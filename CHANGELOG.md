@@ -4,6 +4,7 @@
 
 Changes since `v1.0.0`:
 
+- fix: block download follows the snapshot base when headers race ahead (gap-fill GetAncestor, skip PRESYNC after assumeUTXO)
 - fix: loadtxoutset activates the snapshot tip and persists it (boot-smoke tip/restart)
 - fix: HASH_SERIALIZED emits coins in numeric vout order, not LE32 key order
 - fix: gettxoutsetinfo hashes the committed UTXO set without flushing (STALE-UTXO-READ)

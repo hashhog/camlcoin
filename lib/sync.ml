@@ -529,13 +529,25 @@ let process_presync_headers ~(ps : peer_header_sync)
 
 (* Check if peer should use low-work header sync (PRESYNC/REDOWNLOAD).
    Returns true if the peer's announced work is below minimum_chain_work
-   and we should use the anti-DoS mechanism. *)
+   and we should use the anti-DoS mechanism.
+
+   After an assumeUTXO snapshot (or any mid-chain restore) [blocks_synced]
+   is already past genesis: the snapshot base is a trusted chain, and
+   headers that connect to it are not a from-genesis difficulty-1 flood.
+   PRESYNC from that base to nMinimumChainWork (~938k on mainnet) is what
+   left the campaign 315k/340k ranges stuck at the base for 240s —
+   headers raced to tip via REDOWNLOAD while IBD never started. Core's
+   assumeUTXO snapshots sit above nMinimumChainWork, so this path is
+   campaign-specific but still correct: PoW/MTP/diffbits stay enforced
+   in [validate_header]. *)
 let needs_lowwork_sync ~(chain_state : chain_state) : bool =
-  let tip_work = match chain_state.tip with
-    | Some t -> t.total_work
-    | None -> Consensus.zero_work
-  in
-  Consensus.work_compare tip_work chain_state.network.minimum_chain_work < 0
+  if chain_state.blocks_synced > 0 then false
+  else
+    let tip_work = match chain_state.tip with
+      | Some t -> t.total_work
+      | None -> Consensus.zero_work
+    in
+    Consensus.work_compare tip_work chain_state.network.minimum_chain_work < 0
 
 
 (* Get header entry by height *)
@@ -613,6 +625,53 @@ let best_header_at_height (state : chain_state) (height : int)
     (match state.tip with
      | Some t when t.height >= height -> get_ancestor state t height
      | _ -> None)
+
+(* Hashes of the next [count] blocks after the validated tip, resolved
+   from the best-HEADER chain.
+
+   The previous at-tip gap-fill walked BACKWARD from [state.tip] with a
+   4096-header cap, collecting heights in [blocks_synced+1, +count].
+   When the header tip out-ran the block tip by more than 4096 (campaign
+   snapshot at 315k with headers at 596k: a 280k gap) the walk never
+   reached block_tip+1 and logged "FOUND NOTHING TO REQUEST".  Bitcoin
+   Core's FindNextBlocksToDownload walks forward from pindexLastCommonBlock
+   (net_processing.cpp), independent of how far pindexBestHeader is ahead.
+
+   One GetAncestor jump to [want_hi], then [count] prev_block steps down
+   to [want_lo].  Empty when the header tip is not ahead, or the ancestor
+   walk cannot resolve the front of the gap (a real hole in the in-memory
+   table). *)
+let next_blocks_to_download ?(count = 16) (state : chain_state)
+    : Types.hash256 list =
+  if count <= 0 then []
+  else
+    match state.tip with
+    | None -> []
+    | Some tip ->
+      let want_lo = state.blocks_synced + 1 in
+      if tip.height < want_lo then []
+      else
+        let want_hi = min tip.height (state.blocks_synced + count) in
+        match get_ancestor state tip want_hi with
+        | None -> []
+        | Some start ->
+          let acc = ref [] in
+          let cur = ref (Some start) in
+          let stop = ref false in
+          while not !stop do
+            match !cur with
+            | None -> stop := true
+            | Some e ->
+              if e.height < want_lo then stop := true
+              else begin
+                acc := e.hash :: !acc;
+                if e.height = want_lo then stop := true
+                else
+                  cur := Hashtbl.find_opt state.headers
+                           (Cstruct.to_string e.header.prev_block)
+              end
+          done;
+          !acc
 
 (* Compute the expected difficulty bits for a block at the given height.
    - Genesis block (height 0): use genesis header bits
@@ -2192,7 +2251,12 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
        Lwt.return_unit)
 
   and process_direct_acceptance state headers count =
-    match process_headers ~min_pow_checked:false state headers with
+    (* min_pow_checked=false applies the too-little-chainwork gate (a
+       from-genesis flood defence). After assumeUTXO the snapshot base is
+       already trusted, so skip that gate and still run PoW/MTP/diffbits
+       via validate_header. *)
+    let min_pow_checked = state.blocks_synced > 0 in
+    match process_headers ~min_pow_checked state headers with
     | Ok accepted ->
       Logs.info (fun m -> m "Accepted %d headers, tip at height %d"
         accepted state.headers_synced);
@@ -2213,13 +2277,17 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
       end
       else begin
         (* Got fewer than max — peer's tip reached.
-           Check minimum_chain_work before transitioning to block sync. *)
+           Check minimum_chain_work before transitioning to block sync,
+           unless we already have a trusted mid-chain (assumeUTXO) base:
+           nMinimumChainWork is ~block 938k, so a 315k snapshot would
+           otherwise NEVER leave header sync. *)
         let tip_work = match state.tip with
           | Some t -> t.total_work
           | None -> Consensus.zero_work
         in
-        if Consensus.work_compare tip_work
-             state.network.minimum_chain_work < 0 then begin
+        if state.blocks_synced = 0
+           && Consensus.work_compare tip_work
+                state.network.minimum_chain_work < 0 then begin
           Logs.warn (fun m ->
             m "Header chain work below minimum_chain_work, \
                not transitioning to block sync");
@@ -6063,6 +6131,28 @@ let run_ibd ?(shutdown_flag : bool ref option)
     fill_download_queue ibd;
     let qlen = Queue.length ibd.block_queue in
     if qlen = 0 && ibd.total_blocks_in_flight = 0 then begin
+      (* Header sync may still be running (catch-up IBD started while
+         SyncingHeaders). An empty queue then means "caught up to the
+         headers we have so far", not "IBD complete". Wait for more
+         headers instead of flipping FullySynced and exiting. *)
+      let header_ahead =
+        match ibd.chain.tip with
+        | Some t -> t.height > ibd.chain.blocks_synced
+        | None -> false
+      in
+      if header_ahead || ibd.chain.sync_state = SyncingHeaders then begin
+        let now = Unix.gettimeofday () in
+        if now -. !last_progress_log > 30.0 then begin
+          last_progress_log := now;
+          Logs.info (fun m ->
+            m "IBD waiting for headers: block tip %d, header tip %d, sync=%s"
+              ibd.chain.blocks_synced
+              (match ibd.chain.tip with Some t -> t.height | None -> 0)
+              (sync_state_to_string ibd.chain.sync_state))
+        end;
+        let%lwt () = Lwt_unix.sleep 0.25 in
+        loop ()
+      end else begin
       (* Flush any remaining UTXO updates *)
       flush_utxos ibd;
       (* Update chain tip *)
@@ -6085,6 +6175,7 @@ let run_ibd ?(shutdown_flag : bool ref option)
          worker Domains. *)
       (try Validation_worker.stop_script_pool ~leave_tip_pool:true () with _ -> ());
       Lwt.return_unit
+      end
     end else begin
       (* Periodic orphan expiry (cheap, runs ~once/loop) *)
       ignore (expire_orphan_blocks ibd);
@@ -6212,16 +6303,22 @@ let start_ibd ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
     ?(shutdown_flag : bool ref option)
     (state : chain_state) (get_peers : unit -> Peer.peer list)
     : unit Lwt.t =
-  if state.sync_state <> SyncingBlocks then
-    Lwt.return_unit
-  else begin
+  (* Catch-up IBD may start while header sync is still running
+     (SyncingHeaders): after assumeUTXO the header tip races ahead of
+     the snapshot base, and waiting for header sync to finish before
+     downloading blocks is what stalled the 315k/340k campaign ranges.
+     Idle still refuses — no headers, nothing to fetch. *)
+  match state.sync_state with
+  | Idle -> Lwt.return_unit
+  | SyncingHeaders | SyncingBlocks | FullySynced ->
     let tip_height = match state.tip with
       | Some t -> t.height
       | None -> 0
     in
     if state.blocks_synced >= tip_height then begin
       Logs.info (fun m -> m "Blocks already synced to tip");
-      state.sync_state <- FullySynced;
+      if state.sync_state <> SyncingHeaders then
+        state.sync_state <- FullySynced;
       Lwt.return_unit
     end else begin
       Logs.info (fun m ->
@@ -6234,7 +6331,6 @@ let start_ibd ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
        | None -> ());
       run_ibd ?shutdown_flag ibd get_peers
     end
-  end
 
 (* ============================================================================
    BIP-157 Startup Backfill

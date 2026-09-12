@@ -68,3 +68,12 @@
 (executable
  (name test_snapshot_header_boot)
  (libraries camlcoin alcotest yojson))
+
+; Control for at-tip gap-fill on a deep header-ahead gap (QUEUES.md item 0).
+; After assumeUTXO the header tip races past the snapshot base; a 4096-cap
+; walk from the header tip never reaches block_tip+1. Revert of
+; next_blocks_to_download to that walk makes this fail.
+;   dune exec --no-buffer test/test_gapfill_deep_header_gap.exe
+(executable
+ (name test_gapfill_deep_header_gap)
+ (libraries camlcoin alcotest))

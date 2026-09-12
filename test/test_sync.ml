@@ -856,6 +856,22 @@ let test_needs_lowwork_sync () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* After assumeUTXO, blocks_synced > 0: PRESYNC is the from-genesis
+   anti-DoS path and must not run. A 315k snapshot's chainwork is still
+   below nMinimumChainWork (~938k), so the work comparison alone would
+   keep PRESYNC on and stall block download. *)
+let test_needs_lowwork_skipped_after_snapshot () =
+  cleanup_test_db ();
+  let db = Storage.ChainDB.create test_db_path in
+  let chain = Sync.create_chain_state db Consensus.mainnet in
+  Alcotest.(check bool) "from-genesis mainnet needs PRESYNC" true
+    (Sync.needs_lowwork_sync ~chain_state:chain);
+  chain.Sync.blocks_synced <- 315000;
+  Alcotest.(check bool) "assumeUTXO base skips PRESYNC" false
+    (Sync.needs_lowwork_sync ~chain_state:chain);
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 (* Test PRESYNC memory footprint is constant (< 100 bytes per peer) *)
 let test_presync_memory_footprint () =
   cleanup_test_db ();
@@ -4719,6 +4735,8 @@ let () =
       test_case "build_redownload_locator" `Quick test_build_redownload_locator;
       test_case "should_request_more_headers" `Quick test_should_request_more_headers;
       test_case "needs_lowwork_sync" `Quick test_needs_lowwork_sync;
+      test_case "needs_lowwork_skipped_after_snapshot" `Quick
+        test_needs_lowwork_skipped_after_snapshot;
       test_case "presync_memory_footprint" `Quick test_presync_memory_footprint;
       test_case "presync_constants" `Quick test_presync_constants;
       (* W88 gates *)

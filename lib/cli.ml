@@ -2301,8 +2301,73 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
          Lwt.return_unit)
     | _ -> Lwt.return_unit);
 
-  (* Dynamic peer getter so IBD always sees the latest connected peers *)
+  (* Dynamic peer getter so IBD always sees the latest connected peers.
+     Download peers must already have a message loop: during header sync
+     the outbound sync peer is read directly by [Sync.sync_headers], so
+     GetData responses on that socket would be drained as non-headers
+     and dropped. Inbound peers loop from accept; after
+     [enable_message_loops] every peer qualifies. *)
   let get_peers () = Peer_manager.get_ready_peers peer_manager in
+  let get_download_peers () =
+    List.filter (fun p -> p.Peer.msg_loop_started) (get_peers ())
+  in
+
+  let misbehavior_handler peer_id infraction =
+    match Peer_manager.find_peer_by_id peer_manager peer_id with
+    | Some peer ->
+      (match Peer.record_misbehavior_for peer infraction with
+       | `Ok -> ()
+       | `Ban ->
+         Lwt.async (fun () -> Peer_manager.ban_peer peer_manager peer_id ())
+       | `DisconnectOnly ->
+         Lwt.async (fun () -> Peer_manager.remove_peer peer_manager peer_id))
+    | None -> ()
+  in
+
+  (* Start catch-up IBD as soon as the header tip is ahead of the
+     validated tip, even while header sync is still running. Core
+     FindNextBlocksToDownload does this from SendMessages regardless of
+     IBD state. Without it, assumeUTXO ranges sit at the snapshot base
+     until PRESYNC+REDOWNLOAD finish (longer than RANGE_STALL_SECS). *)
+  let catchup_ibd_started = ref false in
+  let catchup_ibd_launching = ref false in
+  let wire_ibd ibd =
+    catchup_ibd_started := true;
+    ibd_state_ref := Some ibd;
+    (match zmq_state with
+     | Some (notifier, _) -> Sync.set_zmq_notifier ibd notifier
+     | None -> ())
+  in
+  let ensure_catchup_ibd () =
+    if !ibd_state_ref = None && not !catchup_ibd_launching
+       && not !catchup_ibd_started
+       && chain.sync_state <> Sync.Idle then
+      match chain.tip with
+      | Some t when t.height > chain.blocks_synced
+                    && get_download_peers () <> [] ->
+        catchup_ibd_launching := true;
+        Logs.info (fun m ->
+          m "Starting catch-up block download (header tip %d, block tip %d)"
+            t.height chain.blocks_synced);
+        Lwt.async (fun () ->
+          let* () =
+            Lwt.catch
+              (fun () ->
+                 Sync.start_ibd ~utxo_set:optimized_utxo
+                   ~misbehavior_handler
+                   ~on_ibd_created:wire_ibd
+                   ~shutdown_flag:shutdown
+                   chain get_download_peers)
+              (fun exn ->
+                 Logs.err (fun m ->
+                   m "catch-up IBD raised: %s" (Printexc.to_string exn));
+                 Lwt.return_unit)
+          in
+          catchup_ibd_launching := false;
+          ibd_state_ref := None;
+          Lwt.return_unit)
+      | _ -> ()
+  in
 
   (* Sync thread - waits for first peer then syncs *)
   let sync_thread =
@@ -2376,33 +2441,30 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
          listener. This must happen AFTER sync_headers because it reads
          from the peer socket directly and would race with the loop. *)
       Peer_manager.enable_message_loops peer_manager;
-      (* Start block download if needed *)
-      if chain.sync_state = Sync.SyncingBlocks then begin
-        Logs.info (fun m -> m "Starting block download");
-        let misbehavior_handler peer_id infraction =
-          match Peer_manager.find_peer_by_id peer_manager peer_id with
-          | Some peer ->
-            (match Peer.record_misbehavior_for peer infraction with
-             | `Ok -> ()
-             | `Ban ->
-               Lwt.async (fun () -> Peer_manager.ban_peer peer_manager peer_id ())
-             | `DisconnectOnly ->
-               Lwt.async (fun () -> Peer_manager.remove_peer peer_manager peer_id))
-          | None -> ()
+      (* Start block download if needed. Catch-up IBD may already be
+         running (started from the status tick while headers were still
+         syncing); if so, just wait for it instead of a second loop. *)
+      if !ibd_state_ref <> None || !catchup_ibd_started
+         || !catchup_ibd_launching then begin
+        Logs.info (fun m ->
+          m "Block download already running (catch-up IBD); waiting for it");
+        let rec wait_catchup () =
+          if !ibd_state_ref <> None || !catchup_ibd_launching then
+            let* () = Lwt_unix.sleep 1.0 in
+            wait_catchup ()
+          else
+            Lwt.return_unit
         in
+        let* () = wait_catchup () in
+        ensure_post_ibd_worker ();
+        Lwt.return_unit
+      end else if chain.sync_state = Sync.SyncingBlocks then begin
+        Logs.info (fun m -> m "Starting block download");
         let* () = Sync.start_ibd ~utxo_set:optimized_utxo
           ~misbehavior_handler
-          ~on_ibd_created:(fun ibd ->
-            ibd_state_ref := Some ibd;
-            (* Wire ZMQ notifier into the IBD pipeline so block-connect
-               / block-disconnect events publish on rawblock / hashblock
-               / sequence topics. Mempool was wired earlier, before the
-               IBD started. *)
-            (match zmq_state with
-             | Some (notifier, _) -> Sync.set_zmq_notifier ibd notifier
-             | None -> ()))
+          ~on_ibd_created:wire_ibd
           ~shutdown_flag:shutdown
-          chain get_peers in
+          chain get_download_peers in
         (* Clear IBD state so post-IBD listeners take over *)
         ibd_state_ref := None;
         (* #135 step 3: spawn the persistent post-IBD validation worker now
@@ -2555,71 +2617,52 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
              rather than in one oversized getdata. *)
           let header_tip_height =
             match chain.tip with Some t -> t.Sync.height | None -> 0 in
+          (* Prefer catch-up IBD while headers are still racing (assumeUTXO
+             campaign: header tip hundreds of thousands ahead of the snapshot
+             base). The 16-block at-tip fill below is the post-IBD recovery
+             path (the 2026-08-17 2.9-day stall). *)
+          ensure_catchup_ibd ();
           if !ibd_state_ref = None && header_tip_height > block_height then begin
-            match Peer_manager.get_ready_peers peer_manager with
-            | [] -> ()
+            match get_download_peers () with
+            | [] ->
+              (match get_peers () with
+               | [] -> ()
+               | _ ->
+                 Logs.warn (fun m ->
+                   m "At-tip gap fill: header tip %d ahead of block tip %d but \
+                      no message-loop peer to request from"
+                     header_tip_height block_height))
             | peer :: _ ->
-              (* Collect the gap blocks nearest our validated tip by walking the
-                 HEADER chain back from the header tip.
-
-                 It has to be a walk. The height->hash index cannot answer this:
-                 [set_height_hash] is deliberately written only for the ACTIVE
-                 VALIDATED chain (sync.ml:1508 -- writing it on header accept
-                 let a lower-work side branch overwrite main-chain entries and
-                 corrupted BIP68/BIP113/BIP34, which all read that index). So
-                 every height inside the gap returns None, and asking it here
-                 would make this whole recovery a silent no-op.
-
-                 The walk is BOUNDED at [max_walk]. An unbounded ancestry walk
-                 on a periodic tick is how the lunarblock fork-floor fix hung
-                 that node twice on 2026-08-19 -- there the only termination
-                 guard was a cap that was math.huge on an archive node. A gap
-                 deeper than max_walk simply closes over several ticks. *)
-              let want_lo = block_height + 1 in
-              let want_hi = block_height + 16 in
-              let max_walk = 4096 in
-              let acc = ref [] in
-              let steps = ref 0 in
-              let cur = ref chain.tip in
-              let stop = ref false in
-              while not !stop do
-                match !cur with
-                | None -> stop := true
-                | Some (e : Sync.header_entry) ->
-                  if !steps >= max_walk || e.Sync.height < want_lo then
-                    stop := true
-                  else begin
-                    if e.Sync.height <= want_hi then
-                      acc := P2p.{ inv_type = InvWitnessBlock; hash = e.Sync.hash }
-                             :: !acc;
-                    incr steps;
-                    cur := Hashtbl.find_opt chain.Sync.headers
-                             (Cstruct.to_string e.Sync.header.Types.prev_block)
-                  end
-              done;
-              let reqs = !acc in
+              (* Resolve [block_tip+1 .. +16] from the best-header chain via
+                 GetAncestor, NOT a 4096-cap walk back from the header tip.
+                 The cap never reached block_tip+1 once headers out-ran the
+                 validated tip by more than 4096 (315k base, 596k headers). *)
+              let hashes = Sync.next_blocks_to_download ~count:16 chain in
+              let reqs =
+                List.map (fun hash ->
+                    P2p.{ inv_type = InvWitnessBlock; hash })
+                  hashes
+              in
               if reqs <> [] then begin
                 Logs.info (fun m ->
                   m "At-tip gap fill: block tip %d behind header tip %d; \
-                     requesting %d block(s) from peer %d (walked %d headers)"
+                     requesting %d block(s) from peer %d"
                     block_height header_tip_height (List.length reqs)
-                    peer.Peer.id !steps);
+                    peer.Peer.id);
                 Lwt.async (fun () ->
                   Lwt.catch
                     (fun () -> Peer.send_message peer (P2p.GetdataMsg reqs))
                     (fun _exn -> Lwt.return_unit))
               end else
-                (* Behind, but the walk yielded nothing to ask for. Say so
-                   LOUDLY rather than tick silently: a recovery path that
-                   quietly does nothing is indistinguishable from one that is
-                   not needed, which is precisely how this wedge went unnoticed
-                   for 2.9 days. Most likely cause is the header entry for a
-                   gap height not being resident in [chain.headers]. *)
+                (* Behind, but the ancestor walk yielded nothing to ask for.
+                   Say so LOUDLY rather than tick silently: a recovery path
+                   that quietly does nothing is indistinguishable from one
+                   that is not needed. *)
                 Logs.warn (fun m ->
                   m "At-tip gap fill FOUND NOTHING TO REQUEST: block tip %d, \
-                     header tip %d, walked %d header(s) (max %d) — gap is real \
-                     but no header entry was resolvable in that range"
-                    block_height header_tip_height !steps max_walk)
+                     header tip %d — gap is real but no header entry was \
+                     resolvable at block_tip+1"
+                    block_height header_tip_height)
           end;
           let prev_height = Peer_manager.get_height peer_manager in
           if Int32.of_int block_height > prev_height then

@@ -192,20 +192,23 @@ let dump_snapshot_for (blocks : built list)
    pinned to genesis with deliberately LOW work so the B7 work-vs-active-tip
    gate passes (the base header carries HIGH work) — mirroring the existing
    B5/B7 tests in test_assume_utxo.ml. *)
-let make_live_ctx (blocks : built list)
+let make_live_ctx ?(index_heights=true) (blocks : built list)
     : Rpc.rpc_context * string * Storage.ChainDB.t =
   let dir = unique_dir "node" in
   let db_path = Filename.concat dir "chain" in
   let db = Storage.ChainDB.create db_path in
   let utxo = Utxo.UtxoSet.create db in
   let chain = Sync.create_chain_state db regtest in
-  (* Seed block bodies + headers + the height index so get_block /
-     get_header_at_height resolve for the bg replay. *)
+  (* Seed block bodies + headers so get_block / the in-memory header
+     table resolve. The height index is optional: accept_header does
+     NOT write it (active-chain only), so the activation test leaves
+     it empty above genesis to prove loadtxoutset SetTip's it. *)
   let work = ref 1 in
   List.iter (fun b ->
     Storage.ChainDB.store_block db b.hash b.block;
     Storage.ChainDB.store_block_header db b.hash b.block.Types.header;
-    Storage.ChainDB.set_height_hash db b.height b.hash;
+    if index_heights then
+      Storage.ChainDB.set_height_hash db b.height b.hash;
     incr work;
     let tw = Cstruct.create 32 in
     (* Monotone increasing work per height (little-endian byte 0 is enough for
@@ -494,6 +497,87 @@ let test_live_loadtxoutset_reject () =
   | e -> Assume_utxo.clear_regtest_assumeutxo ();
          test_failed name (Printexc.to_string e)
 
+(* ── (3) SNAPSHOT ACTIVATION: after a successful loadtxoutset the live
+   tip must MOVE (getblockcount / getbestblockhash / getblockhash(base))
+   and persist across restore_chain_state. Revert of activate_loaded_snapshot
+   leaves getblockcount at 0 — the boot-smoke tip/restart FAIL. Headers
+   are stored by hash only (submitheader's accept_header does not write
+   the height index), so getblockhash(base) passing proves SetTip. *)
+let test_live_loadtxoutset_activates_tip () =
+  let name = "(3) LIVE loadtxoutset activates the snapshot tip and persists it" in
+  Assume_utxo.clear_regtest_assumeutxo ();
+  try
+    let n = 4 in
+    let blocks = build_chain n in
+    let (snap_path, snap_hash, base_hash, base_height, _) =
+      dump_snapshot_for blocks () in
+    Assume_utxo.register_regtest_assumeutxo {
+      Assume_utxo.height = base_height;
+      blockhash = base_hash;
+      coins_count = 0L;
+      coins_hash = snap_hash;
+      chain_tx_count = Int64.of_int (n + 1);
+      base_header = None;
+      base_tail_headers = [];
+      chainwork = None;
+      base_mtp = None;
+    };
+    let (ctx, node_dir, db) = make_live_ctx ~index_heights:false blocks in
+    let expect_hex = Types.hash256_to_hex_display base_hash in
+
+    (* Pre-load: genesis tip, getblockhash(base) out of range (no height index). *)
+    check name (Rpc.handle_getblockcount ctx = `Int 0)
+      "pre-load getblockcount must be 0";
+    (match Rpc.handle_getblockhash ctx [`Int base_height] with
+     | Error _ -> ()
+     | Ok _ -> failwith "pre-load getblockhash(base) must fail without SetTip");
+
+    let result = Rpc.handle_loadtxoutset ctx [`String snap_path] in
+    (match result with
+     | Error e -> failwith ("loadtxoutset returned Error: " ^ e)
+     | Ok _ -> ());
+
+    check name (Rpc.handle_getblockcount ctx = `Int base_height)
+      (Printf.sprintf "getblockcount must be %d after load, got %s"
+         base_height (Yojson.Safe.to_string (Rpc.handle_getblockcount ctx)));
+    check name (Rpc.handle_getbestblockhash ctx = `String expect_hex)
+      (Printf.sprintf "getbestblockhash must be %s, got %s"
+         expect_hex (Yojson.Safe.to_string (Rpc.handle_getbestblockhash ctx)));
+    (match Rpc.handle_getblockhash ctx [`Int base_height] with
+     | Ok (`String h) when h = expect_hex -> ()
+     | Ok v -> failwith ("getblockhash(base) wrong: " ^ Yojson.Safe.to_string v)
+     | Error e -> failwith ("getblockhash(base) failed: " ^ e));
+
+    (match ctx.Rpc.snapshot_activation with
+     | Some act ->
+       Storage.ChainDB.close act.Assume_utxo.background.Assume_utxo.db;
+       Storage.ChainDB.close act.Assume_utxo.snapshot.Assume_utxo.db
+     | None -> ());
+    Storage.ChainDB.close db;
+
+    (* Restart: restore_chain_state must read the persisted chain_tip. *)
+    let db_path = Filename.concat node_dir "chain" in
+    let db2 = Storage.ChainDB.create db_path in
+    let chain2 = Sync.restore_chain_state db2 regtest in
+    check name (chain2.Sync.blocks_synced = base_height)
+      (Printf.sprintf "restore blocks_synced=%d want %d"
+         chain2.Sync.blocks_synced base_height);
+    (match Storage.ChainDB.get_hash_at_height db2 base_height with
+     | Some h when Cstruct.equal h base_hash -> ()
+     | Some h ->
+       failwith ("restored getblockhash(base)="
+                 ^ Types.hash256_to_hex_display h)
+     | None -> failwith "restored height index missing the snapshot base");
+    Storage.ChainDB.close db2;
+    rm_rf node_dir;
+    rm_rf (Filename.dirname snap_path);
+    Assume_utxo.clear_regtest_assumeutxo ();
+    test_passed name
+  with
+  | Failure msg -> Assume_utxo.clear_regtest_assumeutxo (); test_failed name msg
+  | e -> Assume_utxo.clear_regtest_assumeutxo ();
+         test_failed name (Printexc.to_string e)
+
 let () =
   Random.self_init ();
   Printf.printf
@@ -501,6 +585,7 @@ let () =
   test_no_snapshot_default ();
   test_live_loadtxoutset_accept ();
   test_live_loadtxoutset_reject ();
+  test_live_loadtxoutset_activates_tip ();
   Printf.printf "\nLive loadtxoutset spec: %d passed, %d failed\n%!"
     !pass_count !fail_count;
   if !fail_count > 0 then exit 1

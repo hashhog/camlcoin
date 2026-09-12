@@ -9546,6 +9546,116 @@ let handle_getaddednodeinfo (ctx : rpc_context)
    ScriptCompression-encoded scriptPubKeys). The bespoke "HDOG" format is
    retired (2026-04-29) — see lib/compressor.ml + lib/assume_utxo.ml. *)
 
+(* Make an authenticated UTXO snapshot the live active chain tip and persist
+   it so a restart reloads it.
+
+   handle_loadtxoutset used to authenticate into an isolated
+   [chainstate_snapshot/] sibling and return success while [getblockcount]
+   stayed at genesis (success-without-activation). Core's ActivateSnapshot
+   + CChain::SetTip + WriteSnapshotBaseBlockhash (validation.cpp) make the
+   snapshot the ACTIVE chain. The CLI [--import-utxo] path already does this
+   via [load_snapshot_into_primary]; the RPC path did not. boot-smoke's
+   [tip] / [restart] cells are the gate: they read getblockcount /
+   getbestblockhash / getblockhash(base) after load and again after a clean
+   shutdown + relaunch.
+
+   [accept_header] does not write the height->hash index (that projects the
+   ACTIVE chain only — see sync.ml). After a submitheader ferry the headers
+   are known by hash but getblockhash(base) is "Block height out of range"
+   until we SetTip. *)
+let activate_loaded_snapshot (ctx : rpc_context)
+    ~(base_hash : Types.hash256)
+    ~(base_height : int)
+    ~(params : Assume_utxo.assumeutxo_params)
+    ~(snapshot : Assume_utxo.chainstate) : (unit, string) result =
+  try
+    (* Campaign entries may carry a header band; persist it so restore does
+       not re-anchor headers_synced to 0. No-op for built-in Core heights. *)
+    let _ = Assume_utxo.persist_assumeutxo_base_headers ctx.chain.db params in
+    (* Genesis must be in the header CF: restore walks 0..base, and a
+       fresh RPC-loaded datadir never ran create_chain_state's genesis
+       insert if header_tip was already set by submitheader. Idempotent. *)
+    let genesis_hash = ctx.network.Consensus.genesis_hash in
+    if not (Storage.ChainDB.has_block_header ctx.chain.db genesis_hash) then begin
+      Storage.ChainDB.store_block_header ctx.chain.db genesis_hash
+        ctx.network.Consensus.genesis_header;
+      Storage.ChainDB.set_height_hash ctx.chain.db 0 genesis_hash
+    end;
+    (* CChain::SetTip (chain.cpp): write height->hash from the snapshot
+       base back to genesis so getblockhash(h) and restore_chain_state see
+       the active chain. Prefer the in-memory header table (the
+       submitheader ferry populated it); fall back to a single base slot.
+       Iterative — a recursive walk overflows the stack at campaign
+       heights. *)
+    let batch = Storage.ChainDB.batch_create () in
+    (match Hashtbl.find_opt ctx.chain.Sync.headers
+             (Cstruct.to_string base_hash) with
+     | Some base_entry ->
+       let cursor = ref (Some base_entry) in
+       while !cursor <> None do
+         match !cursor with
+         | None -> ()
+         | Some e ->
+           Storage.ChainDB.batch_set_height_hash batch e.height e.hash;
+           if e.height <= 0 then cursor := None
+           else
+             cursor := Hashtbl.find_opt ctx.chain.Sync.headers
+                         (Cstruct.to_string e.header.prev_block)
+       done
+     | None ->
+       Storage.ChainDB.batch_set_height_hash batch base_height base_hash);
+    Storage.ChainDB.batch_set_chain_tip batch base_hash base_height;
+    (match Storage.ChainDB.get_header_tip ctx.chain.db with
+     | Some (_, h) when h >= base_height -> ()
+     | _ -> Storage.ChainDB.batch_set_header_tip batch base_hash base_height);
+    Storage.ChainDB.batch_write ctx.chain.db batch;
+    (* In-memory validated tip. getblockcount reads [blocks_synced];
+       getbestblockhash uses [Sync.block_tip], which prefers the active
+       chain at that height. Do not rewind [chain.tip] (best-work header)
+       if headers already lead the snapshot base. *)
+    ctx.chain.blocks_synced <- base_height;
+    (match Hashtbl.find_opt ctx.chain.Sync.headers
+             (Cstruct.to_string base_hash) with
+     | Some e ->
+       (match ctx.chain.tip with
+        | Some t when Consensus.work_compare t.total_work e.total_work >= 0 ->
+          ()
+        | _ ->
+          ctx.chain.tip <- Some e;
+          if ctx.chain.headers_synced < e.height then
+            ctx.chain.headers_synced <- e.height)
+     | None -> ());
+    (* Ingest snapshot coins into the live UTXO set so Cli.run's
+       rocksdb tip_height vs chain_tip check does not rewind the snapshot
+       on restart. Tests may have [utxo = None]; then we still persist
+       the CF tip, which restore_chain_state reads. Flush every million
+       coins so a mainnet-sized snapshot never accumulates the whole
+       dirty set (same bound as load_snapshot_into_primary). *)
+    (match ctx.utxo with
+     | Some utxo ->
+       let since_flush = ref 0 in
+       Assume_utxo.iter_chainstate_coins snapshot (fun coin ->
+         Utxo.OptimizedUtxoSet.add utxo
+           coin.outpoint.Types.txid
+           (Int32.to_int coin.outpoint.Types.vout)
+           { Utxo.value = coin.value;
+             script_pubkey = coin.script_pubkey;
+             height = coin.height;
+             is_coinbase = coin.is_coinbase };
+         incr since_flush;
+         if !since_flush >= 1_000_000 then begin
+           since_flush := 0;
+           Utxo.OptimizedUtxoSet.flush utxo
+         end);
+       Utxo.OptimizedUtxoSet.flush ~tip_height:base_height utxo
+     | None -> ());
+    Mempool.update_height ctx.mempool base_height;
+    Peer_manager.set_height ctx.peer_manager (Int32.of_int base_height);
+    Ok ()
+  with exn ->
+    Error (Printf.sprintf "snapshot activation failed: %s"
+             (Printexc.to_string exn))
+
 let handle_loadtxoutset (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
@@ -9756,6 +9866,18 @@ let handle_loadtxoutset (ctx : rpc_context)
                     ~db:cs.db ~expected:params.coins_hash) with
             | Error msg -> Error msg
             | Ok actual_hash ->
+              (* Promote the authenticated snapshot onto the LIVE chain
+                 before returning success. Without this, loadtxoutset
+                 answered coins_loaded while getblockcount stayed at
+                 genesis (boot-smoke tip/restart FAIL). A rejected
+                 snapshot (hash-gate Error above) does not move the tip. *)
+              (match activate_loaded_snapshot ctx
+                       ~base_hash:metadata.base_blockhash
+                       ~base_height:params.height
+                       ~params
+                       ~snapshot:cs with
+               | Error msg -> Error msg
+               | Ok () ->
               (* DUAL-CHAINSTATE ACTIVATION (Core ActivateSnapshot /
                  AddChainstate / MaybeValidateSnapshot, validation.cpp).
 
@@ -9860,7 +9982,7 @@ let handle_loadtxoutset (ctx : rpc_context)
                 ("tip_height", `Int cs.tip_height);
                 ("txoutset_hash",
                    `String (Types.hash256_to_hex_display actual_hash));
-              ]))
+              ])))
           )
         end))
   | _ ->

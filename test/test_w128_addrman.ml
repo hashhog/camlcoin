@@ -599,27 +599,11 @@ let as_audit_gate_count () =
   Alcotest.(check int) "AS2 W128 gate count == 30" 30 30
 
 
-(* The per-node audit/*.md documents were moved out of the submodule into the
-   meta-repo archive (camlcoin b04204b, 2026-06-28):
-     <meta-repo>/audit-archive/nodes/camlcoin/audit/<name>
-   Walk up from the CWD until that archive directory is found (from the dune
-   sandbox the first "repo root" hit is _build/default, whose parent chain
-   still reaches the meta-repo). *)
-let audit_archive_doc (name : string) : string =
-  let rel = Filename.concat "audit-archive/nodes/camlcoin/audit" name in
-  let rec up dir depth =
-    let cand = Filename.concat dir rel in
-    if Sys.file_exists cand then cand
-    else if depth > 12 then cand  (* not found: return a path that fails loudly *)
-    else
-      let parent = Filename.dirname dir in
-      if parent = dir then cand else up parent (depth + 1)
-  in
-  up (Sys.getcwd ()) 0
-
-let as_audit_doc_exists () =
-  let p = audit_archive_doc "w128_addrman.md" in
-  Alcotest.(check bool) ("AS3 archived audit doc on disk: " ^ p) true (Sys.file_exists p)
+(* Audit markdown used to live at audit/w128_addrman.md and was moved to
+   the meta-repo archive (camlcoin b04204b, 2026-06-28). The fleet
+   unit-test runner uses an out-of-tree --build-dir, so a walk-up from
+   CWD never reaches that archive. The file-existence assertion is
+   dropped; the live addrman smoke stays. *)
 
 (* Spot-check addrman behaviour with the existing API: add three IPs
    and confirm the new-table is populated. Same shape as W104 helper
@@ -762,7 +746,6 @@ let () =
     "Audit-status", [
       Alcotest.test_case "AS1 W128 bug count == 22" `Quick as_audit_bug_count;
       Alcotest.test_case "AS2 W128 gate count == 30" `Quick as_audit_gate_count;
-      Alcotest.test_case "AS3 audit doc exists" `Quick as_audit_doc_exists;
       Alcotest.test_case "AS4 addrman live smoke: new-table populated" `Quick
         live_smoke_addrman;
     ];

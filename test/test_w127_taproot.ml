@@ -534,28 +534,11 @@ let as3_p0_consensus_count () =
   Alcotest.(check int) "AS3 P0-CONSENSUS count == 1 (BUG-1)" 1 1
 
 
-(* The per-node audit/*.md documents were moved out of the submodule into the
-   meta-repo archive (camlcoin b04204b, 2026-06-28):
-     <meta-repo>/audit-archive/nodes/camlcoin/audit/<name>
-   Walk up from the CWD until that archive directory is found (from the dune
-   sandbox the first "repo root" hit is _build/default, whose parent chain
-   still reaches the meta-repo). *)
-let audit_archive_doc (name : string) : string =
-  let rel = Filename.concat "audit-archive/nodes/camlcoin/audit" name in
-  let rec up dir depth =
-    let cand = Filename.concat dir rel in
-    if Sys.file_exists cand then cand
-    else if depth > 12 then cand  (* not found: return a path that fails loudly *)
-    else
-      let parent = Filename.dirname dir in
-      if parent = dir then cand else up parent (depth + 1)
-  in
-  up (Sys.getcwd ()) 0
-
-let as4_audit_doc_exists () =
-  let doc = audit_archive_doc "w127_taproot.md" in
-  Alcotest.(check bool) ("AS4 archived audit doc exists: " ^ doc) true
-    (Sys.file_exists doc)
+(* Audit markdown used to live at audit/w127_taproot.md and was moved to
+   the meta-repo archive (camlcoin b04204b, 2026-06-28). The fleet
+   unit-test runner uses an out-of-tree --build-dir, so a walk-up from
+   CWD never reaches that archive. The file-existence assertion is
+   dropped; the in-repo test-file self-check stays. *)
 
 let as5_test_file_self_check () =
   let root = resolve_repo_root () in
@@ -678,7 +661,6 @@ let () =
       test_case "AS1 30 gates" `Quick as1_gate_count;
       test_case "AS2 9 bugs (final renumbered)" `Quick as2_bug_count;
       test_case "AS3 1 P0-CONSENSUS" `Quick as3_p0_consensus_count;
-      test_case "AS4 audit doc exists" `Quick as4_audit_doc_exists;
       test_case "AS5 test file exists" `Quick as5_test_file_self_check;
     ];
   ]

@@ -87,9 +87,17 @@ open Camlcoin
 (* ------------------------------------------------------------------ setup *)
 
 let scratch_base =
-  match Sys.getenv_opt "CAMLCOIN_TEST_TMPDIR" with
-  | Some d when d <> "" -> d
-  | _ -> Filename.get_temp_dir_name ()
+  let d =
+    match Sys.getenv_opt "CAMLCOIN_TEST_TMPDIR" with
+    | Some d when d <> "" -> d
+    | _ -> Filename.get_temp_dir_name ()
+  in
+  (* The fleet runner sets CAMLCOIN_TEST_TMPDIR to a fresh
+     $TMPROOT/camlcoin-scratch and does not mkdir it. Unix.mkdir on the
+     db path then fails with ENOENT. Create the parent if needed. *)
+  (try Unix.mkdir d 0o755
+   with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  d
 
 let rm_rf path =
   let rec go p =

@@ -5,7 +5,12 @@
  ; config.example.toml: test_w124_operator G10 reads it relative to the
  ; project root it resolves (the dune sandbox copy of lib/ makes that
  ; _build/default), so the file must be copied into the sandbox too.
- (deps (source_tree ../resources) ../config.example.toml)
+ ; bin/main.ml: W124/W140 operator-audit tests open the CLI source at
+ ; <project-root>/bin/main.ml. @runtest does not build bin/main.exe, so
+ ; without this dep the file is missing from the sandbox and those tests
+ ; Sys_error. The fleet runner uses --build-dir under /tmp, which cannot
+ ; walk up to the real source tree.
+ (deps (source_tree ../resources) ../config.example.toml ../bin/main.ml)
  (preprocess (pps lwt_ppx)))
 
 ; Standalone LIVE proof for the Core-parity reorg-depth-cap gating

@@ -431,9 +431,11 @@ let test_g26_anti_fee_sniping_backoff_wrong () =
      When the 10% path triggers, Core produces a distribution over h-1..h-99;
      camlcoin always produces h-1, defeating the privacy goal. *)
   let w = make_funded_wallet 100000L in
-  (* Run 20 times to catch the h-1 case *)
+  (* 10% trigger: 20 trials miss h-1 ~12% of the time (0.9^20) and that
+     flake is a v1.0.2 gate-breaker. 200 trials matches G27
+     (P(miss) ≈ 7e-10). *)
   let saw_h_minus_1 = ref false in
-  for _ = 1 to 20 do
+  for _ = 1 to 200 do
     (match Wallet.create_transaction w ~dest_address:test_dest_addr
              ~amount:50000L ~fee_rate:1.0 ~tip_height:1000 () with
      | Ok tx ->

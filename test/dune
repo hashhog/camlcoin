@@ -77,3 +77,12 @@
 (executable
  (name test_gapfill_deep_header_gap)
  (libraries camlcoin alcotest))
+
+; Control for snapshot-import RPC startup (QUEUES.md item 0). --import-utxo
+; runs synchronously before the cookie/RPC bind, so a GC-thrashing 12.7M-coin
+; load at base 315000 never answers getblockcount. Revert of LRU capacity-0
+; / write-only import cache makes the first three cases fail.
+;   dune exec --no-buffer test/test_snapshot_import_throughput.exe
+(executable
+ (name test_snapshot_import_throughput)
+ (libraries camlcoin alcotest))

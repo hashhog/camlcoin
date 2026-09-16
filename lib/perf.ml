@@ -82,22 +82,29 @@ module LRU = struct
       Some node.value
 
   let put t key value =
-    (match Hashtbl.find_opt t.table key with
-     | Some node ->
-       dll_remove t node;
-       node.value <- value;
-       dll_push_front t node
-     | None ->
-       if t.length >= t.capacity then begin
-         match t.tail with
-         | None -> ()
-         | Some evict_node ->
-           dll_remove t evict_node;
-           Hashtbl.remove t.table evict_node.key
-       end;
-       let node = { key; key_str = t.key_to_string key; value; prev = None; next = None } in
-       Hashtbl.replace t.table key node;
-       dll_push_front t node)
+    (* Capacity 0 is write-only: the old `length >= capacity` evict
+       branch no-ops when tail is None, then still pushes, so a disabled
+       cache retained 1 node and allocated a dll_node per put. Snapshot
+       import at base 315000 put 12.7M coins through that path before
+       RPC bound. *)
+    if t.capacity <= 0 then ()
+    else
+      (match Hashtbl.find_opt t.table key with
+       | Some node ->
+         dll_remove t node;
+         node.value <- value;
+         dll_push_front t node
+       | None ->
+         if t.length >= t.capacity then begin
+           match t.tail with
+           | None -> ()
+           | Some evict_node ->
+             dll_remove t evict_node;
+             Hashtbl.remove t.table evict_node.key
+         end;
+         let node = { key; key_str = t.key_to_string key; value; prev = None; next = None } in
+         Hashtbl.replace t.table key node;
+         dll_push_front t node)
 
   let remove t key =
     match Hashtbl.find_opt t.table key with

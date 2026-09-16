@@ -82,6 +82,13 @@ let test_lru_capacity () =
   let cache = Perf.LRU.create 10 in
   Alcotest.(check int) "capacity" 10 (Perf.LRU.capacity cache)
 
+let test_lru_capacity_zero_stores_nothing () =
+  let cache = Perf.LRU.create 0 in
+  Perf.LRU.put cache "k" 1;
+  Alcotest.(check int) "capacity 0 retains nothing" 0 (Perf.LRU.size cache);
+  Alcotest.(check (option int)) "capacity 0 get is a miss" None
+    (Perf.LRU.get cache "k")
+
 (* ============================================================================
    Timer Tests
    ============================================================================ *)
@@ -441,6 +448,8 @@ let () =
       test_case "clear" `Quick test_lru_clear;
       test_case "mem" `Quick test_lru_mem;
       test_case "capacity" `Quick test_lru_capacity;
+      test_case "capacity 0 stores nothing" `Quick
+        test_lru_capacity_zero_stores_nothing;
     ];
     "timer", [
       test_case "basic" `Quick test_timer_basic;

@@ -381,11 +381,15 @@ module OptimizedUtxoSet = struct
           Perf.LRU.put t.cache key entry;
           Some entry)
 
-  (* Add a UTXO entry to LRU cache and mark dirty. Does NOT write to disk. *)
+  (* Add a UTXO entry to LRU cache and mark dirty. Does NOT write to disk.
+     A capacity-0 cache (snapshot import) skips the LRU entirely: the
+     loader never reads back a coin it just wrote, and put+evict of
+     12.7M boxed dll nodes was the 315000 RPC-startup timeout. *)
   let add (t : t) (txid : Types.hash256) (vout : int)
       (entry : utxo_entry) : unit =
     let key = utxo_key txid vout in
-    Perf.LRU.put t.cache key entry;
+    if Perf.LRU.capacity t.cache > 0 then
+      Perf.LRU.put t.cache key entry;
     Hashtbl.replace t.dirty key (`Added entry)
 
   (* Remove a UTXO entry. Marks as Removed in dirty set, removes from LRU.

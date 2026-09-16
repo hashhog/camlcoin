@@ -1304,10 +1304,12 @@ let load_snapshot_into_primary
       else begin
         (* Write coins through OptimizedUtxoSet so the on-disk key format
            and per-coin serialization are byte-identical to what the IBD
-           reader ([Sync] via the same module) expects. A modest cache is
-           fine — we flush in bounded batches to keep RSS in check. *)
+           reader ([Sync] via the same module) expects. Import is
+           write-only: a 1M LRU put+evicted every coin of a 12.7M-coin
+           snapshot (base 315000) and RPC never bound inside the campaign
+           wait. Flush still bounds the dirty set. *)
         let utxo =
-          Utxo.OptimizedUtxoSet.create ~cache_size:1_000_000 ~rocksdb db in
+          Utxo.OptimizedUtxoSet.create ~cache_size:0 ~rocksdb db in
         let ic = open_in_bin snapshot_path in
         try
           let sr = Stream_reader.create ic
@@ -1340,7 +1342,13 @@ let load_snapshot_into_primary
               if !since_flush >= flush_every then begin
                 since_flush := 0;
                 (* No tip_height yet — only mutations. *)
-                Utxo.OptimizedUtxoSet.flush utxo
+                Utxo.OptimizedUtxoSet.flush utxo;
+                (* Import runs before Lwt/Gc_guard. A full major (not
+                   compact) reclaims the flushed dirty batch so a
+                   12.7M-coin load does not leave a GB-scale boxed
+                   heap for Cli.run to compact-stall on. RPC is not
+                   listening yet, so the STW is free. *)
+                Gc.major ()
               end;
               incr since_progress;
               if !since_progress >= progress_step then begin
@@ -1366,6 +1374,7 @@ let load_snapshot_into_primary
                [chain_tip.height]; both must equal base_height or the boot
                check rewinds blocks_synced to 0 and defeats the snapshot. *)
             Utxo.OptimizedUtxoSet.flush ~tip_height:params.height utxo;
+            Gc.major ();
             (* Seed the genesis header into the chainstate DB. On a fresh
                snapshot-bootstrapped datadir [create_chain_state] (which is
                what normally inserts genesis — sync.ml:704-718) is NEVER

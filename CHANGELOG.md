@@ -4,6 +4,7 @@
 
 Changes since `v1.0.0`:
 
+- fix: stall class (231 CRITICALs) — do not rotate peers during a header-ahead catch-up, ignore VERSION-height liars, keep the header tip on gap-fill connect, re-enter catch-up IBD after FullySynced. Control: `dune exec --no-buffer test/test_stall_class_231.exe`. Diagnosis: `docs/STALL-CLASS-231-CRITICALS.md`
 - fix: skip the UTXO LRU during snapshot import so RPC can bind at soak-315000
 - fix: block download follows the snapshot base when headers race ahead (gap-fill GetAncestor, skip PRESYNC after assumeUTXO)
 - fix: loadtxoutset activates the snapshot tip and persists it (boot-smoke tip/restart)

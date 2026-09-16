@@ -204,6 +204,7 @@ type t = {
   known_addrs : (string, peer_info) Hashtbl.t;
   mutable next_peer_id : int;
   mutable our_height : int32;
+  mutable header_height : int32;             (* best-header height; VERSION liars are scored against this, not our_height *)
   mutable running : bool;
   mutable listeners : (P2p.message_payload -> Peer.peer -> unit Lwt.t) list;
   mutable listener_fd : Lwt_unix.file_descr option;  (* TCP listen socket *)
@@ -317,6 +318,7 @@ let create ?(config = default_config) ?(asmap : bytes option = None) (network : 
     known_addrs = Hashtbl.create 1000;
     next_peer_id = 0;
     our_height = 0l;
+    header_height = 0l;
     running = false;
     listeners = [];
     listener_fd = None;
@@ -397,6 +399,39 @@ let set_mempool (pm : t) (mp : Mempool.mempool) : unit =
 (* Update our known blockchain height *)
 let set_height (pm : t) (height : int32) : unit =
   pm.our_height <- height
+
+(* Best-header height. Distinct from [our_height] (validated block tip).
+   Stale-tip "is this peer ahead?" must compare VERSION start_height to
+   THIS, not the block tip: a 128-header gap with block tip 967188 made
+   every peer reporting 967316 look 128 blocks ahead, and VERSION liars
+   at 972471 looked 5k ahead. *)
+let set_header_height (pm : t) (height : int32) : unit =
+  pm.header_height <- height
+
+let get_header_height (pm : t) : int32 =
+  pm.header_height
+
+(* One difficulty period (~2 weeks). A VERSION start_height more than this
+   above any header we have accepted is a liar, not a better tip. Live
+   2026-09-16: peer reports 972471 vs header tip 967316 (Δ 5155). *)
+let max_plausible_version_lead = 2016
+
+let version_height_is_plausible ~(our_header_height : int) (peer_best : int32) : bool =
+  (* VERSION start_height is not the network tip. A peer reporting more
+     than one difficulty period above any header we have accepted is a
+     liar (live: 972471 vs headers 967316). *)
+  Int32.to_int peer_best - our_header_height <= max_plausible_version_lead
+
+(* Rotate the longest-behind peer when the tip has been stale for 2× the
+   30-min eviction interval — but NEVER while catching up a header-ahead
+   gap. Rotation there kills in-flight getdata (22 h freeze at 967188). *)
+let should_rotate_stale_peer
+    ~(header_height : int) ~(block_height : int)
+    ~(time_since_update : float) ~(stale_tip_check_interval : float)
+    ~(has_plausibly_ahead_peer : bool) : bool =
+  has_plausibly_ahead_peer
+  && header_height <= block_height
+  && time_since_update > 2.0 *. stale_tip_check_interval
 
 let set_db (pm : t) (db : Storage.ChainDB.t) : unit =
   pm.db <- Some db
@@ -2622,9 +2657,15 @@ let check_stale_tip (pm : t) : unit Lwt.t =
   let now = Unix.gettimeofday () in
   let time_since_update = now -. pm.last_tip_update in
   let ready_peers = get_ready_peers pm in
-  (* Find peers reporting higher block heights than ours *)
+  let our_header_h =
+    let h = Int32.to_int pm.header_height in
+    if h > 0 then h else Int32.to_int pm.our_height
+  in
+  (* Find peers reporting higher block heights than our HEADER tip.
+     VERSION start_height is not the network tip — cap liars. *)
   let higher_peers = List.filter (fun p ->
-    p.Peer.best_height > pm.our_height
+    p.Peer.best_height > Int32.of_int our_header_h
+    && version_height_is_plausible ~our_header_height:our_header_h p.Peer.best_height
   ) ready_peers in
   (* Post-IBD bug fix: peer.best_height is only updated at VERSION handshake
      and on headers-received. INV block announcements do NOT update it, so
@@ -2688,8 +2729,12 @@ let check_stale_tip (pm : t) : unit Lwt.t =
        higher (not the polling-fallback case), disconnect longest-behind peer.
        Skip the rotation if we only have the fallback peer — peers may all
        legitimately be at our tip. *)
-    if higher_peers <> []
-       && time_since_update > 2.0 *. pm.stale_tip_check_interval then begin
+    if should_rotate_stale_peer
+         ~header_height:our_header_h
+         ~block_height:(Int32.to_int pm.our_height)
+         ~time_since_update
+         ~stale_tip_check_interval:pm.stale_tip_check_interval
+         ~has_plausibly_ahead_peer:(higher_peers <> []) then begin
       Log.info (fun m -> m "Tip severely stale (%.0fs), rotating longest-behind peer" time_since_update);
       (* Find peer that has been behind the longest *)
       let behind_peers = Hashtbl.fold (fun pid ts acc ->

@@ -116,6 +116,28 @@ type header_entry = {
   total_work : Cstruct.t;  (* cumulative proof-of-work, 32-byte LE *)
 }
 
+(* After connecting a gap-fill block, keep the best-work HEADER tip.
+   Rewinding [state.tip] to the just-connected block makes
+   [next_blocks_to_download] see no gap (W43/W44, 22 h freeze class). *)
+let header_tip_after_block_connect (current : header_entry option)
+    (connected : header_entry) : header_entry option =
+  match current with
+  | Some t when t.height > connected.height -> current
+  | _ -> Some connected
+
+(* Re-enter catch-up IBD when the header tip is ahead of the validated
+   tip. [already_started] is kept in the signature so callers can pass
+   the sticky flag; it must NOT suppress re-entry after the first IBD
+   (that was the FullySynced 16-block fire-and-forget path). *)
+let should_start_catchup_ibd
+    ~(ibd_running : bool) ~(already_started : bool)
+    ~(sync_state : sync_state)
+    ~(header_height : int) ~(block_height : int)
+    ~(has_download_peer : bool) : bool =
+  ignore already_started;
+  (not ibd_running) && sync_state <> Idle
+  && has_download_peer && header_height > block_height
+
 (* Chain state - tracks sync progress and header chain.
 
    NOTE on `tip` semantics: [tip] is the best-work *header* entry, updated
@@ -6857,7 +6879,7 @@ let rec connect_stored_blocks (state : chain_state) : int =
             ) tx.Types.outputs
           ) stored_block.transactions;
           state.blocks_synced <- next_height;
-          state.tip <- Some entry;
+          state.tip <- header_tip_after_block_connect state.tip entry;
           (* Wake the wait-family RPCs on this gap-fill / catch-up tip advance
              (Core KernelNotifications blockTip / WaitTipChanged).
              Best-effort: a notifier fault must never stall block connect. *)
@@ -6869,9 +6891,10 @@ let rec connect_stored_blocks (state : chain_state) : int =
              respond with already-known headers in an infinite loop. *)
           if next_height > state.headers_synced then
             state.headers_synced <- next_height;
+          let hdr_tip = match state.tip with Some t -> t | None -> entry in
           Storage.ChainDB.apply_block_atomic state.db
             ~tip_hash:entry.hash ~tip_height:next_height
-            ~header_tip_hash:entry.hash ~header_tip_height:next_height
+            ~header_tip_hash:hdr_tip.hash ~header_tip_height:hdr_tip.height
             (List.rev !ops);
           (* Store nTx for this block so getblockheader returns the correct
              count without needing the full block body. *)
@@ -7120,7 +7143,7 @@ let process_new_block ?(f_requested = false)
           (* Advance the chain tip atomically with UTXO deltas so that
              rdb_tip never lags chain_tip (the W47 945509 wedge). *)
           state.blocks_synced <- height;
-          state.tip <- Some entry;
+          state.tip <- header_tip_after_block_connect state.tip entry;
           (* Bug 8 fix (2026-04-26): mirror apply_block_atomic's
              header_tip_height update into the in-memory field; the
              locator builder reads in-memory state. Without this,
@@ -7130,9 +7153,10 @@ let process_new_block ?(f_requested = false)
              check, infinite loop. *)
           if height > state.headers_synced then
             state.headers_synced <- height;
+          let hdr_tip = match state.tip with Some t -> t | None -> entry in
           Storage.ChainDB.apply_block_atomic state.db
             ~tip_hash:hash ~tip_height:height
-            ~header_tip_hash:hash ~header_tip_height:height
+            ~header_tip_hash:hdr_tip.hash ~header_tip_height:hdr_tip.height
             (List.rev !ops);
           (* Wake the wait-family RPCs on this LIVE post-IBD tip advance (Core
              KernelNotifications blockTip / WaitTipChanged).  Placed AFTER the

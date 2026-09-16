@@ -78,6 +78,14 @@
  (name test_gapfill_deep_header_gap)
  (libraries camlcoin alcotest))
 
+; Control for the stall class (QUEUES.md item 3): VERSION-liar stale-tip
+; rotation during a header-ahead gap, header-tip rewind on gap-fill connect,
+; sticky catch-up IBD flag. Revert of those three helpers makes this fail.
+;   dune exec --no-buffer test/test_stall_class_231.exe
+(executable
+ (name test_stall_class_231)
+ (libraries camlcoin alcotest))
+
 ; Control for snapshot-import RPC startup (QUEUES.md item 0). --import-utxo
 ; runs synchronously before the cookie/RPC bind, so a GC-thrashing 12.7M-coin
 ; load at base 315000 never answers getblockcount. Revert of LRU capacity-0

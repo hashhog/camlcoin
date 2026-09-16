@@ -1106,6 +1106,8 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   Peer_manager.set_db peer_manager db;
   Peer_manager.set_height peer_manager
     (Int32.of_int chain.blocks_synced);
+  Peer_manager.set_header_height peer_manager
+    (Int32.of_int chain.headers_synced);
 
   (* Initialize wallet *)
   let wallet = if config.wallet_enabled then begin
@@ -2339,12 +2341,14 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
      | None -> ())
   in
   let ensure_catchup_ibd () =
-    if !ibd_state_ref = None && not !catchup_ibd_launching
-       && not !catchup_ibd_started
-       && chain.sync_state <> Sync.Idle then
-      match chain.tip with
-      | Some t when t.height > chain.blocks_synced
-                    && get_download_peers () <> [] ->
+    match chain.tip with
+    | Some t when Sync.should_start_catchup_ibd
+                    ~ibd_running:(!ibd_state_ref <> None || !catchup_ibd_launching)
+                    ~already_started:!catchup_ibd_started
+                    ~sync_state:chain.sync_state
+                    ~header_height:t.height
+                    ~block_height:chain.blocks_synced
+                    ~has_download_peer:(get_download_peers () <> []) ->
         catchup_ibd_launching := true;
         Logs.info (fun m ->
           m "Starting catch-up block download (header tip %d, block tip %d)"
@@ -2420,6 +2424,7 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         in
         Peer_manager.set_header_sync_active peer_manager false;
         Peer_manager.set_height peer_manager (Int32.of_int chain.headers_synced);
+        Peer_manager.set_header_height peer_manager (Int32.of_int chain.headers_synced);
         (* Reset the stale-tip clock after the (potentially multi-hour)
            header sync.  Without this, the very first stale-tip check
            after `set_header_sync_active false` would fire immediately
@@ -2667,6 +2672,7 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
           let prev_height = Peer_manager.get_height peer_manager in
           if Int32.of_int block_height > prev_height then
             Peer_manager.set_height peer_manager (Int32.of_int block_height);
+          Peer_manager.set_header_height peer_manager (Int32.of_int header_tip_height);
           Logs.info (fun m ->
             m "Status: peers=%d/%d height=%d mempool=%d txs (%d weight)"
               ready_count peer_count height mp_count mp_weight);

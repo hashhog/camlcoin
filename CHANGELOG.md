@@ -4,6 +4,7 @@
 
 Changes since `v1.0.0`:
 
+- fix: skip the UTXO LRU during snapshot import so RPC can bind at soak-315000
 - fix: block download follows the snapshot base when headers race ahead (gap-fill GetAncestor, skip PRESYNC after assumeUTXO)
 - fix: loadtxoutset activates the snapshot tip and persists it (boot-smoke tip/restart)
 - fix: HASH_SERIALIZED emits coins in numeric vout order, not LE32 key order

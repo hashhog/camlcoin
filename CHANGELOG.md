@@ -1,6 +1,19 @@
 # Changelog
 
-## v1.0.1 (unreleased)
+## v1.0.2 — 2026-09-17
+
+- 4ccdd13 test: hermetic @runtest for the v1.0.2 unit gate
+- df7708f fix: stall class — no VERSION-liar rotation during header-ahead catch-up
+- d3ec57c docs: CHANGELOG for write-only snapshot import
+- f70954a fix: skip the UTXO LRU during snapshot import so RPC can bind
+- 3dabf43 fix: request block_tip+1 when headers race past the snapshot base
+- 76d7a58 fix: loadtxoutset activates the snapshot tip and persists it
+- 472a487 fix: seed snapshot-base headers so header-sync starts at the assumeUTXO base
+- 79f9bc9 fix: HASH_SERIALIZED emits coins in numeric vout order
+- c48ff9b fix: gettxoutsetinfo hashes the committed UTXO set without flushing
+
+
+## v1.0.2 — 2026-09-17
 
 Changes since `v1.0.0`:
 

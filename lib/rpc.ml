@@ -36,6 +36,7 @@ let rpc_invalid_address = -5
 let rpc_wallet_error = -4
 let rpc_insufficient_funds = -6
 let rpc_invalid_parameter = -8
+let rpc_wallet_already_exists = -36
 (* Core reads every numeric RPC argument through UniValue::getInt<T>()
    (univalue.h), which runs std::from_chars INTO THE DESTINATION WIDTH.  The
    width check therefore lives INSIDE the conversion and fires BEFORE the
@@ -3555,6 +3556,141 @@ let handle_sendtoaddress (ctx : rpc_context)
   | _ ->
     Error "Invalid parameters: expected [address, amount]"
 
+(* send [outputs] ( conf_target estimate_mode fee_rate options version )
+   Core: wallet/rpc/spend.cpp send() → NormalizeOutputs / ParseOutputs /
+   FundTransaction / FinishTransaction.
+   Probes (tools/r5-probes.d/wallet.jsonl lane_order 110):
+     success-complete  [[{addr:0.5}], null, null, 10]  → {complete:true, txid}
+     invalid-address   [[{notanaddress:0.001}]]        → -5
+     no-outputs        [[]]                           → -8
+   "TX must have at least one output" is spend.cpp:679-680. *)
+let parse_send_outputs (network : Address.network) (outputs_param : Yojson.Safe.t)
+    : ((string * int64) list, int * string) result =
+  let module E = struct exception Rpc of int * string end in
+  let fail code msg = raise (E.Rpc (code, msg)) in
+  try
+    let fields = match outputs_param with
+      | `Null ->
+        fail rpc_invalid_parameter
+          "Invalid parameter, output argument must be non-null"
+      | `Assoc fs -> fs
+      | `List arr ->
+        List.concat_map (function
+          | `Assoc [kv] -> [kv]
+          | `Assoc _ ->
+            fail rpc_invalid_parameter
+              "Invalid parameter, key-value pair must contain exactly one key"
+          | _ ->
+            fail rpc_invalid_parameter
+              "Invalid parameter, key-value pair not an object as expected")
+          arr
+      | _ -> fail rpc_type_error "Expected type array or object for outputs"
+    in
+    if fields = [] then
+      fail rpc_invalid_parameter "TX must have at least one output";
+    let seen = Hashtbl.create 8 in
+    let recips = List.map (fun (name, amt) ->
+      if name = "data" then
+        fail rpc_invalid_parameter
+          "OP_RETURN (data) outputs are not supported by send"
+      else begin
+        (match Address.address_of_string name with
+         | Ok a when a.Address.network = network -> ()
+         | _ ->
+           fail rpc_invalid_address
+             (Printf.sprintf "Invalid Bitcoin address: %s" name));
+        if Hashtbl.mem seen name then
+          fail rpc_invalid_parameter
+            (Printf.sprintf "Invalid parameter, duplicated address: %s" name);
+        Hashtbl.replace seen name ();
+        let valstr = match amt with
+          | `Int i -> string_of_int i
+          | `Intlit s -> s
+          | `Float f -> Printf.sprintf "%.8f" f
+          | `String s -> s
+          | _ -> fail rpc_type_error "Amount is not a number or string"
+        in
+        let value = match Bip21.parse_amount valstr with
+          | Ok v -> v
+          | Error _ -> fail rpc_type_error "Invalid amount"
+        in
+        if not (Consensus.is_valid_money value) || Int64.compare value 0L <= 0 then
+          fail rpc_type_error "Amount out of range";
+        (name, value)
+      end)
+      fields
+    in
+    Ok recips
+  with E.Rpc (c, m) -> Error (c, m)
+
+let handle_send (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  match ctx.wallet with
+  | None -> Error (rpc_wallet_error, "Wallet not loaded")
+  | Some wallet ->
+    match params with
+    | [] ->
+      Error (rpc_invalid_params,
+             "send [outputs] (conf_target estimate_mode fee_rate options)")
+    | outputs_param :: rest ->
+      let network = network_to_address_network ctx.network in
+      match parse_send_outputs network outputs_param with
+      | Error e -> Error e
+      | Ok recips ->
+        let fee_rate =
+          let conf_target = match rest with
+            | (`Int n) :: _ -> Some n
+            | _ -> None
+          in
+          let fee_rate_param = match rest with
+            | _ :: _ :: fr :: _ -> Some fr
+            | _ -> None
+          in
+          match fee_rate_param with
+          | Some (`Int n) -> float_of_int n
+          | Some (`Float f) -> f
+          | Some (`Intlit s) -> (try float_of_string s with _ -> 1.0)
+          | _ ->
+            let target = Option.value conf_target ~default:6 in
+            match Fee_estimation.estimate_fee ctx.fee_estimator target with
+            | Some rate -> rate
+            | None -> 1.0
+        in
+        let current_height = match ctx.chain.tip with
+          | Some t -> Some t.height
+          | None -> None
+        in
+        let tx_r =
+          try
+            match recips with
+            | [(addr, amount)] ->
+              Wallet.create_transaction wallet ~dest_address:addr
+                ~amount ~fee_rate ?tip_height:current_height ()
+            | many ->
+              Wallet.create_transaction_multi wallet ~outputs:many
+                ~fee_rate ?tip_height:current_height ()
+          with Failure msg -> Error msg
+        in
+        match tx_r with
+        | Error e ->
+          let code =
+            if String.length e >= 18
+               && String.sub e 0 18 = "Insufficient funds"
+            then rpc_insufficient_funds
+            else rpc_wallet_error
+          in
+          Error (code, e)
+        | Ok tx ->
+          match Mempool.add_transaction ctx.mempool tx with
+          | Error msg -> Error (rpc_wallet_error, msg)
+          | Ok entry ->
+            Wallet.scan_transaction wallet tx;
+            Wallet.save_safe wallet;
+            Ok (`Assoc [
+              ("complete", `Bool true);
+              ("txid", `String (Types.hash256_to_hex_display entry.txid));
+            ])
+
 let handle_signrawtransactionwithwallet (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
@@ -4097,6 +4233,46 @@ let handle_unloadwallet (ctx : rpc_context)
     | Ok () ->
       Ok (`Assoc [("warning", `String "")])
     | Error e -> Error e
+
+(* backupwallet "destination"
+   Core wallet/rpc/backup.cpp: returns JSON null; missing parent dir → -4. *)
+let handle_backupwallet (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  match ctx.wallet with
+  | None -> Error (rpc_wallet_error, "Wallet not loaded")
+  | Some wallet ->
+    match params with
+    | `String dest :: _ ->
+      (match Wallet.backup_wallet wallet dest with
+       | Ok () -> Ok `Null
+       | Error e -> Error (rpc_wallet_error, e))
+    | _ ->
+      Error (rpc_invalid_params, "backupwallet \"destination\"")
+
+(* restorewallet "wallet_name" "backup_file" ( load_on_startup )
+   Core wallet.cpp RestoreWallet: missing backup → -8 (checked first);
+   destination already exists → -36. *)
+let handle_restorewallet (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  match ctx.wallet_manager with
+  | None -> Error (rpc_wallet_error, "Wallet manager not initialized")
+  | Some wm ->
+    match params with
+    | `String name :: `String backup_file :: _ ->
+      (match Wallet.restore_wallet wm ~name ~backup_file with
+       | Ok _wallet ->
+         Ok (`Assoc [("name", `String name)])
+       | Error Wallet.Backup_missing ->
+         Error (rpc_invalid_parameter, "Backup file does not exist")
+       | Error (Wallet.Already_exists path) ->
+         Error (rpc_wallet_already_exists,
+                Printf.sprintf
+                  "Failed to restore wallet. Database file exists '%s'." path)
+       | Error (Wallet.Restore_failed e) ->
+         Error (rpc_wallet_error, e))
+    | _ ->
+      Error (rpc_invalid_params,
+             "restorewallet \"wallet_name\" \"backup_file\" ( load_on_startup )")
 
 (* listwallets *)
 let handle_listwallets (ctx : rpc_context)
@@ -11851,6 +12027,9 @@ let handle_help (_ctx : rpc_context)
       "lockunspent unlock ( [{\"txid\":\"...\", \"vout\":n},...] persistent )";
       "listlockunspent";
       "sendtoaddress \"address\" amount";
+      "send [{\"address\":amount},...] ( conf_target \"estimate_mode\" fee_rate options )";
+      "backupwallet \"destination\"";
+      "restorewallet \"wallet_name\" \"backup_file\" ( load_on_startup )";
       "signrawtransactionwithwallet \"hexstring\"";
       "rescanblockchain ( start_height stop_height )";
       "importprivkey \"privkey\" ( \"label\" rescan )";
@@ -14854,6 +15033,12 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_sendtoaddress ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_wallet_error, msg))
+  | "send" ->
+    handle_send ctx params
+  | "backupwallet" ->
+    handle_backupwallet ctx params
+  | "restorewallet" ->
+    handle_restorewallet ctx params
   | "signrawtransactionwithwallet" ->
     (match handle_signrawtransactionwithwallet ctx params with
      | Ok r -> Ok r

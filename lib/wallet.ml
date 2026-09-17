@@ -3730,6 +3730,79 @@ let create_wallet (wm : wallet_manager) (name : string) ?(options = default_wall
     Ok wallet
   end
 
+(* Copy [src] onto [dest] through [atomic_write_file] so a crash cannot
+   leave a torn backup. *)
+let copy_wallet_file (src : string) (dest : string) : unit =
+  match read_file_opt src with
+  | None -> failwith "source wallet file missing"
+  | Some data -> atomic_write_file dest data
+
+(* backupwallet destination — Core wallet/rpc/backup.cpp + SQLite Backup.
+   Missing parent directory (or any copy failure) is RPC_WALLET_ERROR (-4)
+   "Error: Wallet backup failed!".  Destination may be a file path or an
+   existing directory (file lands at dest/<basename>). *)
+let backup_wallet (w : t) (dest : string) : (unit, string) result =
+  flush w;
+  let dest_is_dir =
+    try Sys.file_exists dest && Sys.is_directory dest with _ -> false
+  in
+  let final_dest =
+    if dest_is_dir then
+      let base =
+        if w.db_path = "" then "wallet.dat"
+        else Filename.basename w.db_path
+      in
+      Filename.concat dest base
+    else dest
+  in
+  let parent = Filename.dirname final_dest in
+  if parent <> "." && parent <> ""
+     && not (try Sys.file_exists parent && Sys.is_directory parent
+             with _ -> false) then
+    Error "Error: Wallet backup failed!"
+  else
+    try
+      if w.db_path <> "" && Sys.file_exists w.db_path then
+        copy_wallet_file w.db_path final_dest
+      else
+        atomic_write_file final_dest (Yojson.Safe.to_string (wallet_to_json w));
+      Ok ()
+    with _ -> Error "Error: Wallet backup failed!"
+
+type restore_error =
+  | Backup_missing
+  | Already_exists of string
+  | Restore_failed of string
+
+(* restorewallet — Core wallet.cpp RestoreWallet.
+   Missing backup file is checked FIRST (FAILED_INVALID_BACKUP_FILE → -8),
+   then an existing destination database (FAILED_ALREADY_EXISTS → -36).
+   On load failure the copied file is removed, matching Core's cleanup. *)
+let restore_wallet (wm : wallet_manager) ~(name : string) ~(backup_file : string)
+    : (t, restore_error) result =
+  if not (Sys.file_exists backup_file && not (Sys.is_directory backup_file)) then
+    Error Backup_missing
+  else
+    let path = wallet_path wm name in
+    if Sys.file_exists path then
+      Error (Already_exists path)
+    else begin
+      (try
+         if not (Sys.file_exists wm.wallets_dir) then
+           Unix.mkdir wm.wallets_dir 0o755
+       with _ -> ());
+      try
+        copy_wallet_file backup_file path;
+        match load_wallet wm name with
+        | Ok w -> Ok w
+        | Error e ->
+          (try Sys.remove path with _ -> ());
+          Error (Restore_failed e)
+      with exn ->
+        (try Sys.remove path with _ -> ());
+        Error (Restore_failed (Printexc.to_string exn))
+    end
+
 (* Get a wallet by name *)
 let get_wallet (wm : wallet_manager) (name : string) : t option =
   Hashtbl.find_opt wm.wallets name

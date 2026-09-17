@@ -2,6 +2,7 @@
 
 ## v1.0.2 — 2026-09-17
 
+- fix: after a restart that already restored a header chain, skip the blocking header-sync loop (it skip-waits a 2000-known getheaders reply and never enables message loops). A known batch after we sent getheaders is the reply, not a leftover. Control: `dune exec --no-buffer test/test_stale_locator.exe`. Live 2026-09-17 restart wedge at 967394 — do not bounce the mainnet pin this run.
 - fix: bind RPC before reloading mempool.dat; parse the dump from one Cstruct instead of copying the unread tail per tx. Control: `dune exec --no-buffer test/test_mempool_boot_load.exe`. Live 16–20 min boot stall was the quadratic Cstruct copy plus a synchronous load ahead of the RPC listener; do not bounce the mainnet pin to apply this.
 - fix: getheaders locator is GetLocator(pindexBestHeader), not the height-index row at the block tip. 2000-known replies rerequest from the tip instead of rotating. VERSION start_height is replaced by the observed headers height. Control: `dune exec --no-buffer test/test_stale_locator.exe`. Live wedge at 967188 — do not bounce the 7921e5a pin to apply this; promote, then `bash tools/stop_mainnet.sh camlcoin` only when a human asks. After that restart the tip must leave 967188 within 10 min.
 - docs: caveat the AssumeUTXO dual-chainstate claim; getchainstates is one chainstate

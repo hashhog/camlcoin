@@ -1805,6 +1805,36 @@ let build_locator (state : chain_state) : Types.hash256 list =
    A full 2000-known reply is the stale-locator signature, not catch-up. *)
 let headers_batch_is_progress ~accepted = accepted > 0
 
+(* True when every header in [headers] is already in the in-memory table. *)
+let headers_are_all_known (state : chain_state)
+    (headers : Types.block_header list) : bool =
+  headers <> []
+  && not
+       (List.exists
+          (fun hdr ->
+            let hash = Crypto.compute_block_hash hdr in
+            not (Hashtbl.mem state.headers (Cstruct.to_string hash)))
+          headers)
+
+(* The blocking header-sync loop drains "stale" (already-known) headers
+   messages as leftovers from a previous request, then waits for a fresh
+   one.  That is correct only BEFORE we have sent our own getheaders.
+   After we send, an all-known batch IS the peer's reply (typically
+   genesis..2000 because FindFork missed the locator).  Treating it as a
+   leftover skip-waits until headers_response_timeout and never enables
+   message loops — the live 2026-09-17 restart wedge at 967394. *)
+let headers_sync_is_leftover ~outstanding_getheaders (state : chain_state)
+    (headers : Types.block_header list) : bool =
+  headers_are_all_known state headers && not outstanding_getheaders
+
+(* Core has no blocking header-sync fiber that owns the peer socket.
+   GetHeaders lives in SendMessages, concurrent with everything else.
+   camlcoin's blocking loop is required only when we have no header chain
+   yet (from-genesis, or assumeUTXO re-anchor with headers_synced=0).
+   After a restart that restored headers, running it is how we wedge. *)
+let should_run_blocking_header_sync (state : chain_state) : bool =
+  state.headers_synced = 0
+
 (* After a headers batch that accepted nothing: if the peer sent a full
    MAX_HEADERS_RESULTS of already-known headers whose first prev_block
    is NOT our tip, the locator we sent did not start at pindexBestHeader.
@@ -1967,18 +1997,45 @@ let bip34_height_hash_for (state : chain_state) : Types.hash256 option =
    the main-chain [request_headers] (locator from headers tip) and the
    PRESYNC/REDOWNLOAD path (locator from the per-peer continue-from hash
    appended with the chain_start exponential backoff). *)
+(* Copy locator hashes into owned 32-byte buffers so a Cstruct view of a
+   reused RocksDB/string buffer cannot change between log and write. Drop
+   any hash that is not exactly 32 bytes (would shift the on-wire vector
+   and make FindForkInGlobalIndex miss locator[0]). *)
+let owned_locator (hashes : Types.hash256 list) : Types.hash256 list =
+  List.filter_map
+    (fun h ->
+      if Cstruct.length h = 32 then begin
+        let cs = Cstruct.create 32 in
+        Cstruct.blit h 0 cs 0 32;
+        Some cs
+      end else begin
+        Logs.warn (fun m ->
+          m "dropping locator hash of length %d (expected 32)"
+            (Cstruct.length h));
+        None
+      end)
+    hashes
+
+let hash_hex_both (h : Types.hash256) : string =
+  Printf.sprintf "internal=%s display=%s"
+    (Types.hash256_to_hex h) (Types.hash256_to_hex_display h)
+
 let send_getheaders_with_locator (peer : Peer.peer)
     (locator : Types.hash256 list) (tip_height : int) : unit Lwt.t =
+  let locator = owned_locator locator in
   (match locator with
-   | first :: _ ->
-     Logs.info (fun m -> m "Sending getheaders with %d locators, first=%s (tip=%d)"
-       (List.length locator)
-       (let buf = Buffer.create 64 in
-        for i = 0 to Cstruct.length first - 1 do
-          Buffer.add_string buf (Printf.sprintf "%02x" (Cstruct.get_uint8 first i))
-        done;
-        Buffer.contents buf)
-       tip_height)
+   | a :: rest ->
+     let b = match rest with x :: _ -> Some x | [] -> None in
+     let c = match rest with _ :: x :: _ -> Some x | _ -> None in
+     Logs.info (fun m ->
+       m "Sending getheaders with %d locators, first=%s (tip=%d) \
+          locator[0] %s locator[1] %s locator[2] %s"
+         (List.length locator)
+         (Types.hash256_to_hex a)
+         tip_height
+         (hash_hex_both a)
+         (match b with Some h -> hash_hex_both h | None -> "none")
+         (match c with Some h -> hash_hex_both h | None -> "none"))
    | [] -> Logs.info (fun m -> m "Sending getheaders with empty locator"));
   Peer.send_message peer
     (P2p.GetheadersMsg {
@@ -2110,6 +2167,14 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
   (* Drain stale responses from previous getheaders before we start. *)
   let* () = drain_queued_stale 0 in
 
+  (* Track how many getheaders we have sent without receiving a corresponding
+     fresh response.  Each send increments the counter; each fresh response
+     resets it to 0.  We only send a NEW getheaders when the counter is 0,
+     otherwise we just drain queued responses from earlier sends.  Declared
+     before [drain_stale_responses] so that function can tell leftover
+     pre-send traffic from the reply to an outstanding request. *)
+  let pending_getheaders = ref 0 in
+
   (* Read the next FRESH headers response, skipping stale responses where
      all headers are already known (leftover from previously queued
      getheaders replies).  Does NOT send a new getheaders — only reads. *)
@@ -2124,7 +2189,27 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
       | None -> Lwt.return_none
       | Some headers ->
         let count = List.length headers in
-        if count > 0 && not (has_new_headers headers) then begin
+        (match headers with
+         | h :: _ ->
+           let parent = get_header state h.Types.prev_block in
+           Logs.info (fun m ->
+             m "Headers response: %d headers, first prev %s, \
+                parent_in_memory=%s, our_tip=%s"
+               count
+               (hash_hex_both h.Types.prev_block)
+               (match parent with
+                | Some p -> Printf.sprintf "yes height=%d" p.height
+                | None -> "no")
+               (match state.tip with
+                | Some t ->
+                  Printf.sprintf "height=%d %s" t.height (hash_hex_both t.hash)
+                | None -> "none"))
+         | [] -> ());
+        if
+          headers_sync_is_leftover
+            ~outstanding_getheaders:(!pending_getheaders > 0)
+            state headers
+        then begin
           Logs.info (fun m ->
             m "Skipped stale response (%d known headers, %d skipped so far)"
               count (stale_count + 1));
@@ -2133,12 +2218,6 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
           Lwt.return_some headers
     end
   in
-
-  (* Track how many getheaders we have sent without receiving a corresponding
-     fresh response.  Each send increments the counter; each fresh response
-     resets it to 0.  We only send a NEW getheaders when the counter is 0,
-     otherwise we just drain queued responses from earlier sends. *)
-  let pending_getheaders = ref 0 in
 
   (* Main sync iteration: send getheaders (if none pending), drain stale
      responses, process fresh headers, repeat. *)

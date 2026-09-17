@@ -2493,13 +2493,54 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         end else
           Lwt.return_unit
     in
-    let* () = try_header_sync 1 in
+    (* After a restart that already restored a header chain, the blocking
+       loop owns the peer socket, skip-waits a 2000-known getheaders reply,
+       and never enables message loops — live wedge at 967394 on 2026-09-17.
+       Core has no such loop. Skip it when headers_synced > 0 (from-genesis
+       and assumeUTXO re-anchor still enter it). *)
+    let* () =
+      if not (Sync.should_run_blocking_header_sync chain) then begin
+        Logs.info (fun m ->
+          m "Skipping blocking header sync (header tip %d, block tip %d); \
+             enabling message loops so catch-up is the post-IBD path"
+            chain.headers_synced chain.blocks_synced);
+        if chain.headers_synced > chain.blocks_synced then
+          chain.sync_state <- Sync.SyncingBlocks
+        else
+          chain.sync_state <- Sync.FullySynced;
+        Peer_manager.notify_tip_updated peer_manager;
+        Lwt.return_unit
+      end else
+        try_header_sync 1
+    in
     let _ = () in
       (* Header sync is done. Now enable message loops for all peers so
          that incoming BlockMsg / NotfoundMsg are read and passed to the
          listener. This must happen AFTER sync_headers because it reads
          from the peer socket directly and would race with the loop. *)
       Peer_manager.enable_message_loops peer_manager;
+      (* Restart-at-tip: ask a ready peer for T+1 immediately instead of
+         waiting for the 2 min stale-tip poll. Harmless if header sync
+         already caught us up. *)
+      Lwt.async (fun () ->
+        let rec kick n =
+          if n >= 30 then Lwt.return_unit
+          else
+            match
+              List.find_opt
+                (fun p ->
+                  p.Peer.handshake_complete && p.Peer.state = Peer.Ready)
+                (get_peers ())
+            with
+            | Some peer ->
+              Lwt.catch
+                (fun () -> Sync.request_headers chain peer)
+                (fun _ -> Lwt.return_unit)
+            | None ->
+              let* () = Lwt_unix.sleep 1.0 in
+              kick (n + 1)
+        in
+        kick 0);
       (* Start block download if needed. Catch-up IBD may already be
          running (started from the status tick while headers were still
          syncing); if so, just wait for it instead of a second loop. *)

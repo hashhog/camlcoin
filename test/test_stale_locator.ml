@@ -309,6 +309,150 @@ let test_getheaders_locator_uses_builder () =
           true
           (Cstruct.equal head hashes.(n)))
 
+(* Persist in-memory headers 1..n the way accept_header + connect do, close,
+   restore. Caller must close the returned db and rm_rf the path. *)
+let persist_close_restore name n =
+  let db_path = test_db_base ^ "_" ^ name in
+  rm_rf db_path;
+  let db = Storage.ChainDB.create db_path in
+  let state = Sync.create_chain_state db Consensus.regtest in
+  let hashes = extend_headers state n in
+  state.Sync.blocks_synced <- n;
+  let rec persist_walk (e : Sync.header_entry) =
+    Storage.ChainDB.store_block_header db e.hash e.header;
+    Storage.ChainDB.set_height_hash db e.height e.hash;
+    if e.height > 0 then
+      match Sync.get_header state e.header.Types.prev_block with
+      | Some p -> persist_walk p
+      | None -> ()
+  in
+  (match state.Sync.tip with
+   | Some t ->
+     persist_walk t;
+     Storage.ChainDB.set_header_tip db t.hash t.height;
+     Storage.ChainDB.set_chain_tip db t.hash t.height
+   | None -> failwith "no tip to persist");
+  Storage.ChainDB.close db;
+  let db = Storage.ChainDB.create db_path in
+  let restored = Sync.restore_chain_state db Consensus.regtest in
+  (db, restored, hashes, db_path)
+
+let test_restart_does_not_block_on_header_sync () =
+  let db, state, hashes, path = persist_close_restore "restart_block" 32 in
+  Fun.protect
+    ~finally:(fun () ->
+      Storage.ChainDB.close db;
+      rm_rf path)
+    (fun () ->
+      Alcotest.(check int) "restored header tip" 32 state.Sync.headers_synced;
+      Alcotest.(check int) "restored block tip" 32 state.Sync.blocks_synced;
+      Alcotest.(check bool)
+        "restart with a restored header chain must not enter the blocking \
+         header-sync loop (that loop skip-deadlocks on 2000-known)"
+        false
+        (Sync.should_run_blocking_header_sync state);
+      match Sync.build_locator state with
+      | [] -> Alcotest.fail "empty locator after restore"
+      | head :: _ ->
+        Alcotest.(check bool) "locator[0] is restored tip" true
+          (Cstruct.equal head hashes.(32)))
+
+let test_outstanding_known_batch_is_the_reply_not_a_leftover () =
+  with_state "leftover" (fun _db state ->
+      ignore (extend_headers state 32);
+      state.Sync.blocks_synced <- 32;
+      let tip = Option.get state.Sync.tip in
+      let rec collect acc h =
+        if h < 1 then acc
+        else
+          match Sync.get_ancestor state tip h with
+          | Some e -> collect (e.Sync.header :: acc) (h - 1)
+          | None -> collect acc (h - 1)
+      in
+      let known = collect [] 32 in
+      Alcotest.(check int) "32 known headers" 32 (List.length known);
+      Alcotest.(check bool)
+        "pre-send leftover drain may skip already-known headers" true
+        (Sync.headers_sync_is_leftover ~outstanding_getheaders:false state known);
+      Alcotest.(check bool)
+        "after we sent getheaders, a known batch is the reply — do not wait"
+        false
+        (Sync.headers_sync_is_leftover ~outstanding_getheaders:true state known))
+
+(* QUEUES.md item 0 (2026-09-17 restart wedge): node at tip T, peer at T+k,
+   first getheaders AFTER A RESTART must accept k headers. Goes through the
+   on-wire CBlockLocator layout (int32 version + compact-size + 32-byte
+   hashes) so a byte-order or framing bug fails this, not just in-memory
+   locator construction. *)
+let test_restart_first_getheaders_accepts_k () =
+  let n = 32 in
+  let k = 8 in
+  let db, node, hashes, path = persist_close_restore "restart_k" n in
+  Fun.protect
+    ~finally:(fun () ->
+      Storage.ChainDB.close db;
+      rm_rf path)
+    (fun () ->
+      with_state "peer_k" (fun _db_peer peer ->
+          ignore (extend_headers peer n);
+          let prev = ref hashes.(n) in
+          for h = n + 1 to n + k do
+            let hdr, hash = mine_header ~prev:!prev ~height:h in
+            let work =
+              Consensus.work_add
+                (Option.get peer.Sync.tip).Sync.total_work
+                (Consensus.work_from_compact hdr.Types.bits)
+            in
+            let e : Sync.header_entry =
+              { header = hdr; hash; height = h; total_work = work }
+            in
+            Hashtbl.replace peer.Sync.headers (Cstruct.to_string hash) e;
+            peer.Sync.tip <- Some e;
+            peer.Sync.headers_synced <- h;
+            prev := hash
+          done;
+          let locator = Sync.build_locator node in
+          let msg =
+            P2p.serialize_message P2p.regtest_magic
+              (P2p.GetheadersMsg
+                 {
+                   version = Types.protocol_version;
+                   locator_hashes = locator;
+                   hash_stop = Types.zero_hash;
+                 })
+          in
+          let payload = Cstruct.shift msg P2p.message_header_size in
+          let r = Serialize.reader_of_cstruct payload in
+          let _ver = Serialize.read_int32_le r in
+          let count = Serialize.read_compact_size r in
+          let wire_hashes =
+            List.init count (fun _ -> Serialize.read_bytes r 32)
+          in
+          (match wire_hashes with
+           | [] -> Alcotest.fail "no hashes on the wire"
+           | h0 :: _ ->
+             Alcotest.(check bool)
+               "wire locator[0] is the restored tip (internal byte order)" true
+               (Cstruct.equal h0 hashes.(n));
+             let rev = Cstruct.create 32 in
+             for i = 0 to 31 do
+               Cstruct.set_uint8 rev i (Cstruct.get_uint8 hashes.(n) (31 - i))
+             done;
+             Alcotest.(check bool)
+               "wire locator[0] is NOT the display-reversed tip" false
+               (Cstruct.equal h0 rev));
+          let response = respond_getheaders peer wire_hashes in
+          Alcotest.(check int) "Core-style FindFork returns k new headers" k
+            (List.length response);
+          match Sync.process_headers node response with
+          | Ok accepted ->
+            Alcotest.(check int)
+              "node at T accepts k new headers on the first getheaders after restart"
+              k accepted;
+            Alcotest.(check int) "header tip is T+k" (n + k)
+              node.Sync.headers_synced
+          | Error e -> Alcotest.fail ("process_headers: " ^ e)))
+
 let () =
   Alcotest.run "stale_locator" [
     ( "locator from tip entry",
@@ -322,6 +466,18 @@ let () =
         Alcotest.test_case
           "peer_manager getheaders_locator uses Sync.build_locator" `Quick
           test_getheaders_locator_uses_builder;
+        Alcotest.test_case
+          "after restart, do not run the blocking header-sync loop" `Quick
+          test_restart_does_not_block_on_header_sync;
+        Alcotest.test_case
+          "node at T, peer at T+k: first getheaders after restart accepts k"
+          `Quick test_restart_first_getheaders_accepts_k;
+      ] );
+    ( "blocking header-sync leftover",
+      [
+        Alcotest.test_case
+          "outstanding getheaders: 2000-known is the reply, not a leftover"
+          `Quick test_outstanding_known_batch_is_the_reply_not_a_leftover;
       ] );
     ( "2000 known is not progress",
       [

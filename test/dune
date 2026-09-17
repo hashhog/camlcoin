@@ -107,3 +107,11 @@
 (executable
  (name test_readme_assumeutxo_caveat)
  (libraries unix str))
+
+; Control for the stale getheaders locator (QUEUES.md item 0, live
+; wedge at 967188). Revert of Sync.build_locator to height-index
+; lookup at blocks_synced makes the first two cases fail.
+;   dune exec --no-buffer test/test_stale_locator.exe
+(executable
+ (name test_stale_locator)
+ (libraries camlcoin alcotest))

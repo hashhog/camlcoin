@@ -215,6 +215,10 @@ type t = {
   mutable listen_addr : string option;           (* Our own listening address, if known *)
   chain_sync_behind_since : (int, float) Hashtbl.t; (* peer_id -> timestamp when first noticed behind *)
   mutable db : Storage.ChainDB.t option;            (* Chain database for building locators *)
+  mutable locator_builder : (unit -> Types.hash256 list) option;
+    (* Production getheaders locator: Sync.build_locator (GetLocator on
+       pindexBestHeader). When None, fall back to the height-index walk
+       (tests / before cli wires the chain). *)
   (* Eclipse protection: address bucketing *)
   mutable bucket_key : string;                    (* Random key for bucket hashing *)
   new_table : (int, string list) Hashtbl.t;       (* New address buckets: bucket_id -> addresses *)
@@ -329,6 +333,7 @@ let create ?(config = default_config) ?(asmap : bytes option = None) (network : 
     listen_addr = None;
     chain_sync_behind_since = Hashtbl.create 16;
     db = None;
+    locator_builder = None;
     bucket_key = generate_bucket_key ();
     new_table = Hashtbl.create new_bucket_count;
     tried_table = Hashtbl.create tried_bucket_count;
@@ -435,6 +440,15 @@ let should_rotate_stale_peer
 
 let set_db (pm : t) (db : Storage.ChainDB.t) : unit =
   pm.db <- Some db
+
+let set_locator_builder (pm : t) (f : unit -> Types.hash256 list) : unit =
+  pm.locator_builder <- Some f
+
+(* VERSION start_height is a hint, not the peer's chain. A headers batch
+   is ground truth: always take the observed height, even when it is
+   LOWER than VERSION (live: 972515 liar vs a 2000-known batch at
+   height ~2000). *)
+let best_height_after_headers ~version_height:_ ~observed_height = observed_height
 
 (* Get current blockchain height *)
 let get_height (pm : t) : int32 =
@@ -1441,11 +1455,12 @@ let on_headers_received (pm : t) (peer_id : int) ~(new_best_height : int32) : un
   state.last_header_time <- now;
   (* Reset chain sync state on successful header receipt *)
   state.chain_sync <- ChainSynced;
-  (* Update peer's best height if higher *)
+  (* Observed headers replace VERSION start_height (a hint, often a liar). *)
   match List.find_opt (fun p -> p.Peer.id = peer_id) pm.peers with
   | Some peer ->
-    if new_best_height > peer.Peer.best_height then
-      peer.best_height <- new_best_height
+    peer.best_height <-
+      best_height_after_headers ~version_height:peer.Peer.best_height
+        ~observed_height:new_best_height
   | None -> ()
 
 (** Called when we receive a block from a peer *)
@@ -2314,6 +2329,20 @@ let build_locator (db : Storage.ChainDB.t) (tip_height : int) : Types.hash256 li
   (* Result was built in reverse (prepending), so reverse to get tip first *)
   List.rev !result
 
+(* Locator for outgoing getheaders (stale-tip poll, ConsiderEviction
+   challenge). Core GetLocator(pindexBestHeader): never the height-index
+   row at our_height, which is what looped 2000-known replies at 967188. *)
+let getheaders_locator (pm : t) : Types.hash256 list =
+  match pm.locator_builder with
+  | Some f -> f ()
+  | None ->
+    (match pm.db with
+     | Some db ->
+       let hh = Int32.to_int pm.header_height in
+       let bh = Int32.to_int pm.our_height in
+       build_locator db (if hh > bh then hh else bh)
+     | None -> [])
+
 (** Check all peers for staleness and disconnect stale ones.
     Returns list of (peer_id, reason) for peers that were disconnected. *)
 let check_stale_peers (pm : t) : (int * string) list Lwt.t =
@@ -2364,9 +2393,7 @@ let check_stale_peers (pm : t) : (int * string) list Lwt.t =
         if needs_getheaders_challenge pm peer.Peer.id then begin
           let getheaders = P2p.GetheadersMsg {
             version = 70016l;
-            locator_hashes = (match pm.db with
-              | Some db -> build_locator db (Int32.to_int pm.our_height)
-              | None -> []);
+            locator_hashes = getheaders_locator pm;
             hash_stop = Types.zero_hash;
           } in
           (* #74 (2026-08-27): mark the challenge as sent ONLY when the
@@ -2712,14 +2739,13 @@ let check_stale_tip (pm : t) : unit Lwt.t =
   if time_since_update > pm.tip_poll_interval && poll_peer <> None then begin
     let best_peer = match poll_peer with Some p -> p | None -> assert false in
     Log.info (fun m -> m "Stale tip check (no update for %.0fs), \
-      polling peer %d (peer reports height %ld vs our %ld)"
-      time_since_update best_peer.Peer.id best_peer.Peer.best_height pm.our_height);
-    (* Send getheaders to the peer with the highest reported height *)
+      polling peer %d (peer reports height %ld vs our block %ld header %ld)"
+      time_since_update best_peer.Peer.id best_peer.Peer.best_height
+      pm.our_height pm.header_height);
+    (* Send getheaders anchored at pindexBestHeader, not the block tip. *)
     let getheaders = P2p.GetheadersMsg {
       version = 70016l;
-      locator_hashes = (match pm.db with
-        | Some db -> build_locator db (Int32.to_int pm.our_height)
-        | None -> []);
+      locator_hashes = getheaders_locator pm;
       hash_stop = Types.zero_hash;
     } in
     let* () = Lwt.catch

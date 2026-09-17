@@ -1108,6 +1108,10 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     (Int32.of_int chain.blocks_synced);
   Peer_manager.set_header_height peer_manager
     (Int32.of_int chain.headers_synced);
+  (* Stale-tip / ConsiderEviction getheaders must use GetLocator on the
+     header tip, not the height-index row at our_height (967188 wedge). *)
+  Peer_manager.set_locator_builder peer_manager (fun () ->
+      Sync.build_locator chain);
 
   (* Initialize wallet *)
   let wallet = if config.wallet_enabled then begin
@@ -1654,6 +1658,10 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         Lwt.return_unit
     | _ -> Lwt.return_unit);
 
+  (* One-shot guard: do not tight-loop getheaders at a liar that ignores
+     a tip-anchored locator and keeps sending genesis..2000. Reset when
+     a batch actually extends the header tip. *)
+  let last_stale_rerequest_tip = ref (None : Types.hash256 option) in
   (* Register a listener for headers received post-IBD.  When new headers
      arrive and extend our chain, process them and request the blocks. *)
   Peer_manager.add_listener peer_manager (fun msg peer ->
@@ -1676,9 +1684,58 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
          indefinitely.  The gap-fill target range depends only on
          [chain.tip] and [chain.blocks_synced], both already populated from
          prior IBD, so we run it unconditionally. *)
-      let _ = Sync.process_headers chain headers in
+      let accepted =
+        match Sync.process_headers chain headers with
+        | Ok n -> n
+        | Error _ -> 0
+      in
+      if accepted > 0 then last_stale_rerequest_tip := None;
+      (match List.rev headers with
+       | h :: _ ->
+         let hash = Crypto.compute_block_hash h in
+         let observed =
+           match Sync.get_header chain hash with
+           | Some e -> Some (Int32.of_int e.Sync.height)
+           | None -> (
+             match Sync.get_header chain h.Types.prev_block with
+             | Some p -> Some (Int32.of_int (p.Sync.height + 1))
+             | None -> None)
+         in
+         (match observed with
+          | Some hgt ->
+            Peer_manager.on_headers_received peer_manager peer.Peer.id
+              ~new_best_height:hgt
+          | None -> ())
+       | [] -> ());
       let tip_height = match chain.tip with
         | Some t -> t.height | None -> 0 in
+      (match chain.tip with
+       | Some t
+         when Sync.should_rerequest_from_tip ~accepted
+                ~received:(List.length headers) ~our_tip_hash:t.Sync.hash
+                headers
+              && not
+                   (match !last_stale_rerequest_tip with
+                    | Some h -> Cstruct.equal h t.Sync.hash
+                    | None -> false) ->
+         last_stale_rerequest_tip := Some t.Sync.hash;
+         Logs.warn (fun m ->
+           m "2000 known headers (accepted=0, first prev != tip) — \
+              re-requesting getheaders from header tip %d rather than rotating"
+             t.Sync.height);
+         let getheaders =
+           P2p.GetheadersMsg
+             {
+               version = 70016l;
+               locator_hashes = Sync.build_locator chain;
+               hash_stop = Types.zero_hash;
+             }
+         in
+         Lwt.async (fun () ->
+           Lwt.catch
+             (fun () -> Peer.send_message peer getheaders)
+             (fun _ -> Lwt.return_unit))
+       | _ -> ());
       let start_h = chain.blocks_synced + 1 in
       if start_h <= tip_height then begin
         let block_requests = ref [] in

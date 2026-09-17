@@ -1767,14 +1767,57 @@ let build_locator_from_height (state : chain_state) (start_height : int)
   else
     collect [] 1 start_height
 
-(* Build a block locator for getheaders request.
-   Returns exponentially spaced block hashes from tip back to genesis. *)
-let build_locator (state : chain_state) : Types.hash256 list =
-  let tip_height = match state.tip with
-    | Some t -> t.height
-    | None -> 0
+(* GetLocator(index) — Bitcoin Core chain.cpp::LocatorEntries.
+   First hash is [index.hash] (the CBlockIndex* itself), then exponential
+   steps back to genesis via GetAncestor. NEVER looks up locator[0] by
+   height in the active-chain index: that index is a projection of the
+   validated chain (fecf534) and was the live 967188 wedge — a poisoned
+   or stale row at blocks_synced made public peers fork at genesis and
+   re-send headers 1..2000 (`All 2000 headers were duplicates, locator
+   may be stale`). *)
+let build_locator_from_entry (state : chain_state) (index : header_entry)
+    : Types.hash256 list =
+  let rec loop have step (idx : header_entry) =
+    let have = idx.hash :: have in
+    if idx.height = 0 then List.rev have
+    else
+      let target = max 0 (idx.height - step) in
+      let step' = if List.length have > 10 then step * 2 else step in
+      match get_ancestor state idx target with
+      | Some anc -> loop have step' anc
+      | None ->
+        let rest = build_locator_from_height state target in
+        let have_fwd = List.rev have in
+        (match have, rest with
+         | last :: _, h :: tl when Cstruct.equal last h -> have_fwd @ tl
+         | _ -> have_fwd @ rest)
   in
-  build_locator_from_height state tip_height
+  loop [] 1 index
+
+(* Build a block locator for getheaders request.
+   Core: GetLocator(pindexBestHeader). Anchors on the tip ENTRY. *)
+let build_locator (state : chain_state) : Types.hash256 list =
+  match state.tip with
+  | Some t -> build_locator_from_entry state t
+  | None -> build_locator_from_height state 0
+
+(* A headers batch is progress only when at least one header was new.
+   A full 2000-known reply is the stale-locator signature, not catch-up. *)
+let headers_batch_is_progress ~accepted = accepted > 0
+
+(* After a headers batch that accepted nothing: if the peer sent a full
+   MAX_HEADERS_RESULTS of already-known headers whose first prev_block
+   is NOT our tip, the locator we sent did not start at pindexBestHeader.
+   Re-request from the tip. Do not rotate (rotation killed in-flight
+   getdata at 967188). If the first header does connect to our tip, we
+   already have the next 2000 — headers are caught up, do not loop. *)
+let should_rerequest_from_tip ~accepted ~received ~our_tip_hash
+    (headers : Types.block_header list) : bool =
+  accepted = 0
+  && received >= P2p.max_headers_count
+  && (match headers with
+      | h :: _ -> not (Cstruct.equal h.Types.prev_block our_tip_hash)
+      | [] -> false)
 
 (* Build the full getheaders locator for an in-flight PRESYNC/REDOWNLOAD sync.
 

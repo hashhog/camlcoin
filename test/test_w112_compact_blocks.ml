@@ -586,7 +586,7 @@ let test_g22_no_extra_txn_pool_bug () =
      Core: vExtraTxnForCompact stores recently-seen txns for reconstruction.
      Document: reconstruct_from_mempool only uses the live mempool. *)
   (* Test that reconstruction with empty mempool yields ReconstructNeedTxs *)
-  let path = Printf.sprintf "/tmp/camlcoin_w112_g22_%d" (Random.int 1_000_000) in
+  let path = Test_tmp.fresh ~label:"w112_g22" () in
   let db = Storage.ChainDB.create path in
   let utxo = Utxo.UtxoSet.create db in
   let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false

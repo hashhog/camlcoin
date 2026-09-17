@@ -35,7 +35,7 @@
 
 open Camlcoin
 
-let test_db_path = "/tmp/camlcoin_conv_before_lookup_test_db"
+let test_db_path = Test_tmp.register "/tmp/camlcoin_conv_before_lookup_test_db"
 
 let rec rm_rf path =
   if Sys.file_exists path then begin

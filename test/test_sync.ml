@@ -3,7 +3,7 @@
 open Camlcoin
 
 (* Test directory that gets cleaned up *)
-let test_db_path = "/tmp/camlcoin_test_sync_db"
+let test_db_path = Test_tmp.register "/tmp/camlcoin_test_sync_db"
 
 let cleanup_test_db () =
   let rec rm_rf path =
@@ -3442,7 +3442,7 @@ let test_unconnecting_headers_per_peer () =
 
    See commit body for the full bug list keyed back to these tests. *)
 
-let w97_db_path = "/tmp/camlcoin_test_w97_db"
+let w97_db_path = Test_tmp.register "/tmp/camlcoin_test_w97_db"
 
 let w97_cleanup_db () =
   let rec rm_rf path =
@@ -4179,7 +4179,7 @@ let test_w97_future_time_2h_constant () =
    Sanity test: h1 (the actual av block, an ancestor of itself) IS skipped
    when the best-header has enough equivalent-work burial. *)
 let test_w144_assumevalid_fork_not_skipped () =
-  let db_path = "/tmp/camlcoin_test_w144_av" in
+  let db_path = Test_tmp.register "/tmp/camlcoin_test_w144_av" in
   let rec rm_rf p =
     if Sys.file_exists p then begin
       if Sys.is_directory p then begin
@@ -4300,7 +4300,7 @@ let test_w144_assumevalid_fork_not_skipped () =
      compute_mtp_hash_linked state h1_main.hash picks up T1 via prev_block walk (correct).
    ============================================================================ *)
 let test_mtp_hash_linked_correct_under_height_index_corruption () =
-  let db_path = "/tmp/camlcoin_mtp_hash_linked_test" in
+  let db_path = Test_tmp.register "/tmp/camlcoin_mtp_hash_linked_test" in
   let rec rm_rf p =
     if Sys.file_exists p then begin
       if Sys.is_directory p then begin
@@ -4459,7 +4459,7 @@ let test_mtp_hash_linked_correct_under_height_index_corruption () =
    (get_ancestor state h1_main_entry 1 = h1_main_entry itself) → B_main.
    ------------------------------------------------------------------------- *)
 let test_w3f2_retarget_ancestry_correct_under_height_index_corruption () =
-  let db_path = "/tmp/camlcoin_test_w3f2_retarget_db" in
+  let db_path = Test_tmp.register "/tmp/camlcoin_test_w3f2_retarget_db" in
   let rec rm_rf p =
     if Sys.file_exists p then begin
       if Sys.is_directory p then begin

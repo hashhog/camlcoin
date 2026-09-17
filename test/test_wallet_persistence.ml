@@ -30,7 +30,7 @@
 
 open Camlcoin
 
-let test_root = "/tmp/camlcoin_test_wallet_persistence"
+let test_root = Test_tmp.register "/tmp/camlcoin_test_wallet_persistence"
 
 let rm_rf path =
   let rec go p =

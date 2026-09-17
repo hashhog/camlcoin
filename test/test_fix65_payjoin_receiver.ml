@@ -113,10 +113,7 @@ let make_funded_wallet ~(value : int64) : Wallet.t * Wallet.key_pair =
 (* Build an RPC context owning a wallet — used to exercise the
    payjoinreceive RPC dispatch surface. *)
 let make_rpc_ctx_with_wallet (w : Wallet.t) : Rpc.rpc_context =
-  let pid_seed =
-    Printf.sprintf "/tmp/camlcoin_fix65_db_%d_%f"
-      (Unix.getpid ()) (Unix.gettimeofday ())
-  in
+  let pid_seed = Test_tmp.fresh ~label:"fix65" () in
   let rec rm_rf path =
     if Sys.file_exists path then begin
       if Sys.is_directory path then begin

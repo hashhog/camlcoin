@@ -2,7 +2,7 @@
 
 open Camlcoin
 
-let tmp_root = "/tmp/camlcoin_cf_chainstate_test"
+let tmp_root = Test_tmp.register "/tmp/camlcoin_cf_chainstate_test"
 
 let cleanup_tmp () =
   let rec rm_rf path =

@@ -1,0 +1,9 @@
+; Shared /tmp/camlcoin_* lifecycle for every alcotest binary: register,
+; Fun.protect, one ChainDB per process, at_exit unlink. Lives in a
+; subdirectory so the parent (tests) / (executable) stanzas do not also
+; compile this module.
+(library
+ (name test_tmp)
+ (wrapped false)
+ (modules test_tmp)
+ (libraries unix camlcoin))

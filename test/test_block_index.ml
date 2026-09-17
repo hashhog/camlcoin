@@ -3,8 +3,8 @@
 open Camlcoin
 
 (* Test directories *)
-let test_filter_dir = "/tmp/camlcoin_test_filters"
-let test_height_dir = "/tmp/camlcoin_test_heights"
+let test_filter_dir = Test_tmp.register "/tmp/camlcoin_test_filters"
+let test_height_dir = Test_tmp.register "/tmp/camlcoin_test_heights"
 
 let cleanup_dir path =
   let rec rm_rf path =
@@ -476,7 +476,7 @@ let test_height_index_sparse () =
    BIP-157 Index Bundle Tests (high-level append + backfill + rewind)
    ============================================================================ *)
 
-let test_bip157_dir = "/tmp/camlcoin_test_bip157"
+let test_bip157_dir = Test_tmp.register "/tmp/camlcoin_test_bip157"
 
 let cleanup_bip157 () =
   cleanup_dir test_bip157_dir

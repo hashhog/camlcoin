@@ -14,11 +14,7 @@ let test_failed name msg =
   exit 1
 
 (* Create a temporary directory for test databases *)
-let temp_dir () =
-  let name = Printf.sprintf "/tmp/camlcoin_test_%d_%d"
-               (Unix.getpid ()) (Random.int 100000) in
-  Unix.mkdir name 0o755;
-  name
+let temp_dir () = Test_tmp.fresh ~label:"assume_utxo" ~mkdir:true ()
 
 (* Clean up a temporary directory *)
 let cleanup_dir path =
@@ -1115,8 +1111,9 @@ let cleanup_dump_test_ctx db dir =
   cleanup_dir dir
 
 let unique_dump_path label =
-  Printf.sprintf "/tmp/camlcoin_dump_%s_%d_%d.dat"
-    label (Unix.getpid ()) (Random.int 100000)
+  Test_tmp.register
+    (Printf.sprintf "/tmp/camlcoin_dump_%s_%d_%d.dat"
+       label (Unix.getpid ()) (Random.int 100000))
 
 let test_dump_rollback_latest_mode () =
   let name = "dumptxoutset: \"latest\" mode emits genesis tip metadata" in

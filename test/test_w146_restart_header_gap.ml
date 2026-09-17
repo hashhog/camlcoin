@@ -38,7 +38,7 @@ open Camlcoin
 (* Per-test db path: a failing assertion raises past [close db], and a
    shared rocksdb dir then poisons every later test in the run — so each
    test gets its own directory. *)
-let test_db_base = "/tmp/camlcoin_test_w146_restart_header_gap"
+let test_db_base = Test_tmp.register "/tmp/camlcoin_test_w146_restart_header_gap"
 let test_db_path = ref test_db_base
 
 let cleanup_test_db () =

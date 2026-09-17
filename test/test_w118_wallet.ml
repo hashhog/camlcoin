@@ -136,27 +136,11 @@ let empty_block_with txs : Types.block =
 
 (* RPC test context for the walletprocesspsbt envelope tests.
 
-   Each call wipes /tmp/camlcoin_w118_rpc_<pid>/ to keep a stable, isolated
-   ChainDB.  Matches the pattern in test_rpc.ml::create_test_context. *)
-let psbt_test_db_path () =
-  Printf.sprintf "/tmp/camlcoin_w118_psbt_db_%d_%f"
-    (Unix.getpid ()) (Unix.gettimeofday ())
-
+   ONE ChainDB per test binary — the handler only needs a wallet on the
+   context; the store is a throwaway.  Per-call dirs used to leak a
+   286 MiB WAL each onto the /tmp tmpfs. *)
 let make_psbt_test_ctx ~(wallet : Wallet.t) : Rpc.rpc_context =
-  let db_path = psbt_test_db_path () in
-  let rec rm_rf path =
-    if Sys.file_exists path then begin
-      if Sys.is_directory path then begin
-        Array.iter
-          (fun f -> rm_rf (Filename.concat path f))
-          (Sys.readdir path);
-        Unix.rmdir path
-      end else
-        Unix.unlink path
-    end
-  in
-  rm_rf db_path;
-  let db = Storage.ChainDB.create db_path in
+  let db = Test_tmp.chaindb () in
   let utxo = Utxo.UtxoSet.create db in
   let mp =
     Mempool.create ~network:Consensus.regtest

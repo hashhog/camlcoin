@@ -17,7 +17,7 @@
 open Camlcoin
 
 (* ── Minimal RPC context (handlers ignore it, but dispatch_rpc needs one) ── *)
-let test_db_path = "/tmp/camlcoin_test_w142_joinpsbts_db"
+let test_db_path = Test_tmp.register "/tmp/camlcoin_test_w142_joinpsbts_db"
 
 let cleanup_test_db () =
   let rec rm_rf path =

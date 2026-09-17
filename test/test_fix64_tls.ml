@@ -63,7 +63,7 @@ let ensure_self_signed_cert dir =
    and 83 leaked 286 MB datadirs from this harness filled the 63 GB /tmp
    tmpfs on 2026-09-01. *)
 let db_path_for_pid pid =
-  Printf.sprintf "/tmp/camlcoin_test_fix64_db_%d" pid
+  Test_tmp.register (Printf.sprintf "/tmp/camlcoin_test_fix64_db_%d" pid)
 
 let unique_db_path () =
   db_path_for_pid (Unix.getpid ())
@@ -330,7 +330,7 @@ let kill_child pid =
 
 (* Test 1: RPC over HTTPS — TLS handshake completes, request reaches auth. *)
 let test_rpc_https_roundtrip () =
-  let tmp_dir = "/tmp/camlcoin_fix64_certs" in
+  let tmp_dir = Test_tmp.register "/tmp/camlcoin_fix64_certs" in
   let cert, key = ensure_self_signed_cert tmp_dir in
   let port = pick_free_port () in
   let _ = wait_until_some in
@@ -375,8 +375,9 @@ let unique_parent_db_counter = ref 0
 
 let make_parent_only_ctx () =
   incr unique_parent_db_counter;
-  let path = Printf.sprintf "/tmp/camlcoin_test_fix64_parent_%d_%d"
-    (Unix.getpid ()) !unique_parent_db_counter in
+  let path = Test_tmp.register
+    (Printf.sprintf "/tmp/camlcoin_test_fix64_parent_%d_%d"
+       (Unix.getpid ()) !unique_parent_db_counter) in
   rm_rf path;
   let db = Storage.ChainDB.create path in
   let utxo = Utxo.UtxoSet.create db in
@@ -393,7 +394,7 @@ let make_parent_only_ctx () =
 
 (* Test 3: Cert without key — startup error. *)
 let test_rpc_tls_cert_without_key () =
-  let tmp_dir = "/tmp/camlcoin_fix64_certs" in
+  let tmp_dir = Test_tmp.register "/tmp/camlcoin_fix64_certs" in
   let cert, _key = ensure_self_signed_cert tmp_dir in
   let ctx, cleanup = make_parent_only_ctx () in
   let port = pick_free_port () in
@@ -419,7 +420,7 @@ let test_rpc_tls_cert_without_key () =
 
 (* Test 4: Key without cert — startup error. *)
 let test_rpc_tls_key_without_cert () =
-  let tmp_dir = "/tmp/camlcoin_fix64_certs" in
+  let tmp_dir = Test_tmp.register "/tmp/camlcoin_fix64_certs" in
   let _cert, key = ensure_self_signed_cert tmp_dir in
   let ctx, cleanup = make_parent_only_ctx () in
   let port = pick_free_port () in
@@ -469,7 +470,7 @@ let test_rpc_tls_missing_cert_file () =
 
 (* Test 6: REST HTTPS — symmetric with RPC test 1. *)
 let test_rest_https_roundtrip () =
-  let tmp_dir = "/tmp/camlcoin_fix64_certs" in
+  let tmp_dir = Test_tmp.register "/tmp/camlcoin_fix64_certs" in
   let cert, key = ensure_self_signed_cert tmp_dir in
   let port = pick_free_port () in
   let pid = spawn_server Rest_https ~port ~cert ~key in

@@ -3,7 +3,7 @@
 open Camlcoin
 
 (* Test directory that gets cleaned up *)
-let test_db_path = "/tmp/camlcoin_test_rpc_db"
+let test_db_path = Test_tmp.register "/tmp/camlcoin_test_rpc_db"
 
 let cleanup_test_db () =
   let rec rm_rf path =
@@ -1315,7 +1315,7 @@ let test_deriveaddresses_ranged_no_range () =
    On regtest, segwit_height = 0 and taproot_height = 0, so both should be
    "active" even with an empty chain (query_height = 0). *)
 let create_regtest_context () =
-  let db_path = "/tmp/camlcoin_test_deploymentinfo_db" in
+  let db_path = Test_tmp.register "/tmp/camlcoin_test_deploymentinfo_db" in
   let rec rm_rf path =
     if Sys.file_exists path then begin
       if Sys.is_directory path then begin
@@ -2020,8 +2020,9 @@ let test_bip22_bwmc_reason_parity () =
 
 let test_dumptxoutset_emits_muhash_txoutset_hash () =
   let (ctx, db, _utxo, _txid1, _txid2) = create_test_context () in
-  let path = Printf.sprintf "/tmp/camlcoin_dump_muhash_%d.dat"
-               (Unix.getpid ()) in
+  let path = Test_tmp.register
+               (Printf.sprintf "/tmp/camlcoin_dump_muhash_%d.dat"
+                  (Unix.getpid ())) in
   (try Sys.remove path with _ -> ());
   let result = Rpc.handle_dumptxoutset ctx [`String path] in
   (match result with

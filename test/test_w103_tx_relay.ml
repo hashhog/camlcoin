@@ -76,8 +76,7 @@ open Camlcoin
    Helpers
    ============================================================================ *)
 
-let unique_path label =
-  Printf.sprintf "/tmp/camlcoin_w103_%s_%d" label (Random.int 1_000_000)
+let unique_path label = Test_tmp.fresh ~label:("w103_" ^ label) ()
 
 let cleanup_dir path =
   let rec rm_rf p =

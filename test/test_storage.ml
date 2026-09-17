@@ -3,7 +3,7 @@
 open Camlcoin
 
 (* Test directory that gets cleaned up *)
-let test_db_path = "/tmp/camlcoin_test_db"
+let test_db_path = Test_tmp.register "/tmp/camlcoin_test_db"
 
 let cleanup_test_db () =
   let rec rm_rf path =
@@ -287,7 +287,7 @@ let test_height_encoding_order () =
    Flat File Storage Tests
    ============================================================================ *)
 
-let test_flat_file_path = "/tmp/camlcoin_test_flat_files"
+let test_flat_file_path = Test_tmp.register "/tmp/camlcoin_test_flat_files"
 
 let cleanup_flat_files () =
   let rec rm_rf path =
@@ -780,7 +780,7 @@ let backdate_file path age_seconds =
 
 (* Stale .tmp files older than the threshold should be removed. *)
 let test_cleanup_orphan_tmp_stale () =
-  let dir = "/tmp/camlcoin_cleanup_tmp_test_stale" in
+  let dir = Test_tmp.register "/tmp/camlcoin_cleanup_tmp_test_stale" in
   let rec rm_rf p =
     if Sys.file_exists p then begin
       if Sys.is_directory p then begin
@@ -812,7 +812,7 @@ let test_cleanup_orphan_tmp_stale () =
 (* Young .tmp files (< 60s by default) must be preserved — there might be
    an in-flight snapshot writer. *)
 let test_cleanup_orphan_tmp_young () =
-  let dir = "/tmp/camlcoin_cleanup_tmp_test_young" in
+  let dir = Test_tmp.register "/tmp/camlcoin_cleanup_tmp_test_young" in
   let rec rm_rf p =
     if Sys.file_exists p then begin
       if Sys.is_directory p then begin
@@ -835,7 +835,7 @@ let test_cleanup_orphan_tmp_young () =
 
 (* Non-.tmp files must NOT be touched by the cleanup. *)
 let test_cleanup_orphan_tmp_keeps_non_tmp () =
-  let dir = "/tmp/camlcoin_cleanup_tmp_test_keep" in
+  let dir = Test_tmp.register "/tmp/camlcoin_cleanup_tmp_test_keep" in
   let rec rm_rf p =
     if Sys.file_exists p then begin
       if Sys.is_directory p then begin
@@ -864,7 +864,7 @@ let test_cleanup_orphan_tmp_keeps_non_tmp () =
 
 (* Cleanup on a non-existent dir is a no-op (no exception). *)
 let test_cleanup_orphan_tmp_missing_dir () =
-  let dir = "/tmp/camlcoin_cleanup_tmp_test_does_not_exist_42" in
+  let dir = Test_tmp.register "/tmp/camlcoin_cleanup_tmp_test_does_not_exist_42" in
   (try
     if Sys.file_exists dir then Unix.rmdir dir
   with _ -> ());

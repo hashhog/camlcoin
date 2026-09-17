@@ -20,7 +20,7 @@
 
 open Camlcoin
 
-let test_root = "/tmp/camlcoin_test_stale_utxo_read"
+let test_root = Test_tmp.register "/tmp/camlcoin_test_stale_utxo_read"
 
 let rec rm_rf path =
   if Sys.file_exists path then begin

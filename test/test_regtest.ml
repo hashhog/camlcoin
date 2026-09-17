@@ -3,7 +3,8 @@
 open Camlcoin
 
 (* Test directory that gets cleaned up *)
-let test_db_path = "/tmp/camlcoin_test_regtest_db"
+let test_db_path = Test_tmp.register "/tmp/camlcoin_test_regtest_db"
+let test_rdb_path = Test_tmp.register (test_db_path ^ "_rocksdb_utxo")
 
 let cleanup_test_db () =
   let rec rm_rf path =
@@ -215,7 +216,7 @@ let test_mine_multiple_blocks_regtest () =
    snapshot with 0 coins. *)
 let test_submit_block_populates_chainstate_iter () =
   let (chain, db) = create_test_chain_state () in
-  let rocksdb_path = test_db_path ^ "_rocksdb_utxo" in
+  let rocksdb_path = test_rdb_path in
   (* clean up any prior run *)
   (try
     let rec rm_rf path =

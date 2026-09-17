@@ -26,7 +26,7 @@
 
 open Camlcoin
 
-let test_db_path = "/tmp/camlcoin_test_w116_db"
+let test_db_path = Test_tmp.register "/tmp/camlcoin_test_w116_db"
 
 let cleanup_test_db () =
   let rec rm_rf path =
@@ -503,7 +503,7 @@ let test_g22_bug10_process_orphans_with_cpfp_dead () =
 let test_g23_bug9_find_1p1c_stub () =
   let (_, _utxo, db, _, _, _) = create_test_mempool () in
   let mp2 =
-    let utxo2 = Utxo.UtxoSet.create (Storage.ChainDB.create "/tmp/camlcoin_test_w116_db2") in
+    let utxo2 = Utxo.UtxoSet.create (Storage.ChainDB.create (Test_tmp.register "/tmp/camlcoin_test_w116_db2")) in
     Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
       ~utxo:utxo2 ~current_height:100 ()
   in

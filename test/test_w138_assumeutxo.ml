@@ -159,11 +159,7 @@ let count_external_refs (symbol : string) : int =
   |> List.length
 
 (* Temp dir for tests that need filesystem state. *)
-let temp_dir () =
-  let name = Printf.sprintf "/tmp/camlcoin_w138_%d_%d"
-               (Unix.getpid ()) (Random.int 1_000_000) in
-  Unix.mkdir name 0o755;
-  name
+let temp_dir () = Test_tmp.fresh ~label:"w138" ~mkdir:true ()
 
 let cleanup_dir path =
   if Sys.file_exists path && Sys.is_directory path then begin

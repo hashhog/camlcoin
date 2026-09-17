@@ -799,7 +799,7 @@ let bug8_trailing_data_accepted () =
    a side branch, then verify ancestor walks resolve to the correct
    fork, NOT the active chain. *)
 
-let fix74_db_path = "/tmp/camlcoin_test_fix74_db"
+let fix74_db_path = Test_tmp.register "/tmp/camlcoin_test_fix74_db"
 
 let fix74_cleanup_db () =
   let rec rm_rf path =

@@ -103,9 +103,50 @@ type t = {
 let open_handles : (string, t) Hashtbl.t = Hashtbl.create 8
 let registry_lock = Mutex.create ()
 
+(* Datadirs opened under /tmp/camlcoin_* (the test-suite convention).
+   RocksDB fallocate()s the WAL to write_buffer_size — 256 MiB default —
+   which on tmpfs is RAM. Tests that skip teardown used to leak one of
+   those per case. Track every such datadir and unlink it at_exit. *)
+let tmp_datadirs : (string, unit) Hashtbl.t = Hashtbl.create 16
+
+let rec rm_rf path =
+  if Sys.file_exists path then begin
+    if Sys.is_directory path then begin
+      Array.iter
+        (fun n ->
+          if n <> "." && n <> ".." then rm_rf (Filename.concat path n))
+        (Sys.readdir path);
+      try Unix.rmdir path with _ -> ()
+    end else
+      try Unix.unlink path with _ -> ()
+  end
+
+let is_camlcoin_tmp_path path =
+  let has_prefix pfx =
+    let n = String.length pfx in
+    String.length path >= n && String.sub path 0 n = pfx
+  in
+  has_prefix "/tmp/camlcoin_"
+  || has_prefix (Filename.concat (Filename.get_temp_dir_name ()) "camlcoin_")
+
 let ensure_dir path =
   try Unix.mkdir path 0o755
   with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
+
+let record_tmp_datadir cf_path =
+  if is_camlcoin_tmp_path cf_path then begin
+    (* ChainDB.create opens <datadir>/chainstate-rocks; tests sometimes
+       open <datadir>/rocks. Unlink the datadir, never its parent — if
+       cf_path is itself /tmp/camlcoin_*, dirname is /tmp. *)
+    let parent = Filename.dirname cf_path in
+    let dir = if is_camlcoin_tmp_path parent then parent else cf_path in
+    Hashtbl.replace tmp_datadirs dir ();
+    try
+      let oc = open_out (Filename.concat dir ".camlcoin_test_pid") in
+      output_string oc (string_of_int (Unix.getpid ()));
+      close_out oc
+    with _ -> ()
+  end
 
 let close_unlocked (t : t) : unit =
   if not t.closed then begin
@@ -136,9 +177,26 @@ let close_unlocked (t : t) : unit =
 (* Open (or create) the chainstate at [path]. Creates all 11 CFs +
    the implicit default CF on first call. Subsequent opens require
    the CFs to exist on disk; missing CFs are created automatically
-   thanks to [create_missing_column_families = 1] in the C stub. *)
-let open_db ?(write_buffer_mb = 256) ?(block_cache_mb = 2048)
-    ?(bloom_bits = 10) (path : string) : t =
+   thanks to [create_missing_column_families = 1] in the C stub.
+
+   Paths under /tmp/camlcoin_* are the test-suite convention. They get a
+   1 MiB write buffer (production default is 256 MiB) so a forgotten
+   teardown cannot fallocate a 286 MiB WAL onto the tmpfs, and they are
+   unlinked at process exit. Explicit ~write_buffer_mb / ~block_cache_mb
+   still win. *)
+let open_db ?write_buffer_mb ?block_cache_mb ?(bloom_bits = 10)
+    (path : string) : t =
+  let test_path = is_camlcoin_tmp_path path in
+  let write_buffer_mb =
+    match write_buffer_mb with
+    | Some n -> n
+    | None -> if test_path then 1 else 256
+  in
+  let block_cache_mb =
+    match block_cache_mb with
+    | Some n -> n
+    | None -> if test_path then 8 else 2048
+  in
   ensure_dir path;
   Mutex.protect registry_lock (fun () ->
     (match Hashtbl.find_opt open_handles path with
@@ -149,7 +207,8 @@ let open_db ?(write_buffer_mb = 256) ?(block_cache_mb = 2048)
           down first. *)
        close_unlocked prior;
        Hashtbl.remove open_handles path
-     | _ -> ()));
+     | _ -> ());
+    record_tmp_datadir path);
   let db, cfhs =
     Rocksdb.open_cfs path all_cf_names
       write_buffer_mb block_cache_mb bloom_bits
@@ -185,6 +244,13 @@ let close (t : t) : unit =
     match Hashtbl.find_opt open_handles t.path with
     | Some t' when t' == t -> Hashtbl.remove open_handles t.path
     | _ -> ())
+
+let () =
+  at_exit (fun () ->
+    Mutex.protect registry_lock (fun () ->
+      Hashtbl.iter (fun _ t -> close_unlocked t) open_handles;
+      Hashtbl.clear open_handles);
+    Hashtbl.iter (fun dir () -> try rm_rf dir with _ -> ()) tmp_datadirs)
 
 (* --- Helpers ---------------------------------------------------------- *)
 

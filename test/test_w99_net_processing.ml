@@ -29,9 +29,9 @@ let make_test_peer ?(direction = Peer.Inbound) () =
   Peer.make_peer ~network:Consensus.mainnet ~addr:"1.2.3.4"
     ~port:8333 ~id:0 ~direction ~fd ()
 
-(* Unique temp-dir per test invocation to avoid RocksDB lock contention *)
-let unique_test_db_path label =
-  Printf.sprintf "/tmp/camlcoin_w99_%s_%d" label (Random.int 1_000_000)
+(* Unique temp-dir per test invocation to avoid RocksDB lock contention.
+   Registered with Test_tmp so a failing case cannot leak the dir. *)
+let unique_test_db_path label = Test_tmp.fresh ~label:("w99_" ^ label) ()
 
 let cleanup_dir path =
   let rec rm_rf p =

@@ -26,7 +26,7 @@
 
 open Camlcoin
 
-let test_root = "/tmp/camlcoin_test_atomicity_18a2f65"
+let test_root = Test_tmp.register "/tmp/camlcoin_test_atomicity_18a2f65"
 
 let cleanup () =
   let rec rm_rf path =

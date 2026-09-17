@@ -3,7 +3,7 @@
 open Camlcoin
 
 (* Test directory that gets cleaned up *)
-let test_db_path = "/tmp/camlcoin_test_mining_db"
+let test_db_path = Test_tmp.register "/tmp/camlcoin_test_mining_db"
 
 let cleanup_test_db () =
   let rec rm_rf path =

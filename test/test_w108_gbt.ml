@@ -47,7 +47,7 @@ open Camlcoin
    Helpers
    ============================================================================ *)
 
-let test_db_path = "/tmp/camlcoin_test_w108_gbt_db"
+let test_db_path = Test_tmp.register "/tmp/camlcoin_test_w108_gbt_db"
 
 let cleanup_test_db () =
   let rec rm_rf path =

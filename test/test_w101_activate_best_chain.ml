@@ -89,7 +89,7 @@
 
 open Camlcoin
 
-let w101_db_path = "/tmp/camlcoin_test_w101_db"
+let w101_db_path = Test_tmp.register "/tmp/camlcoin_test_w101_db"
 
 let w101_cleanup () =
   let rec rm_rf path =

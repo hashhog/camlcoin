@@ -3,7 +3,7 @@
 open Camlcoin
 
 (* Test directory that gets cleaned up *)
-let test_db_path = "/tmp/camlcoin_test_mempool_db"
+let test_db_path = Test_tmp.register "/tmp/camlcoin_test_mempool_db"
 
 let cleanup_test_db () =
   let rec rm_rf path =
@@ -3623,7 +3623,7 @@ let test_witness_standard_p2sh_empty_scriptsig () =
 
 (* Build a fresh mempool with one UTXO pre-loaded *)
 let create_sigops_mempool () =
-  let path = "/tmp/camlcoin_test_sigops_db" in
+  let path = Test_tmp.register "/tmp/camlcoin_test_sigops_db" in
   let rec rm_rf p =
     if Sys.file_exists p then begin
       if Sys.is_directory p then begin
@@ -4746,7 +4746,7 @@ let test_w96_accept_to_memory_pool_basic_ok () =
    would have failed before the fix because both mempools would have produced
    identical (regtest) flags. *)
 let test_network_config_propagates_to_script_flags () =
-  let path = "/tmp/camlcoin_test_network_config_mempool" in
+  let path = Test_tmp.register "/tmp/camlcoin_test_network_config_mempool" in
   let rm_rf p =
     let rec go f =
       if Sys.file_exists f then begin

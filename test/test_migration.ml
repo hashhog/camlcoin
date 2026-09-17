@@ -8,7 +8,7 @@ open Camlcoin
 module Log_reader = Migration.Log_reader
 module Log_writer = Migration.Log_writer
 
-let tmp_root = "/tmp/camlcoin_migration_test"
+let tmp_root = Test_tmp.register "/tmp/camlcoin_migration_test"
 
 let cleanup_tmp () =
   let rec rm_rf path =

@@ -141,8 +141,7 @@ let write_file path contents =
   close_out oc
 
 let temp_campaign_fixture ?(entries : string = "") () =
-  let path = Printf.sprintf "/tmp/camlcoin_campaign_test_%d_%d.json"
-      (Unix.getpid ()) (Random.int 1_000_000) in
+  let path = Test_tmp.fresh ~label:"campaign_test_json" () in
   write_file path (Printf.sprintf "[%s]" entries);
   path
 

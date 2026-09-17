@@ -188,7 +188,25 @@ open Camlcoin
    Test infrastructure
    ============================================================================ *)
 
-let test_db_root = "/tmp/camlcoin_w120_test_db"
+let test_db_root = Test_tmp.register "/tmp/camlcoin_w120_test_db"
+
+let () =
+  List.iter
+    (fun p -> ignore (Test_tmp.register p))
+    [
+      "/tmp/camlcoin_w120_g6";
+      "/tmp/camlcoin_w120_g10";
+      "/tmp/camlcoin_w120_g15a1";
+      "/tmp/camlcoin_w120_g15a2";
+      "/tmp/camlcoin_w120_g15a3";
+      "/tmp/camlcoin_w120_g18a";
+      "/tmp/camlcoin_w120_g18c";
+      "/tmp/camlcoin_w120_g18d";
+      "/tmp/camlcoin_w120_g26d";
+      "/tmp/camlcoin_w120_g26e";
+      "/tmp/camlcoin_w120_g26f";
+      "/tmp/camlcoin_w120_g26h";
+    ]
 
 let rec rm_rf path =
   if Sys.file_exists path then begin

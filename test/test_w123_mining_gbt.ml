@@ -66,7 +66,7 @@ let count_occurrences haystack needle =
   if nlen = 0 then 0 else go 0 0
 
 (* Light template helper, mirrors the W108 pattern. *)
-let test_db_path = "/tmp/camlcoin_test_w123_mining_db"
+let test_db_path = Test_tmp.register "/tmp/camlcoin_test_w123_mining_db"
 
 let cleanup_test_db () =
   let rec rm_rf path =

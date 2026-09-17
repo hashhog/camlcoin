@@ -23,35 +23,11 @@
 
 open Camlcoin
 
-(* Each make_ctx call gets its OWN db dir.  Reusing one path across tests
-   triggers RocksDB MANIFEST corruption when a freshly-created store is
-   reopened on top of a partially-removed directory, so we never reopen. *)
-let db_counter = ref 0
-
-let fresh_db_path () =
-  incr db_counter;
-  Printf.sprintf "/tmp/camlcoin_test_w14x_getnodeaddresses_db_%d_%d"
-    (Unix.getpid ()) !db_counter
-
-let rm_rf path =
-  let rec go path =
-    if Sys.file_exists path then begin
-      if Sys.is_directory path then begin
-        Array.iter (fun f -> go (Filename.concat path f)) (Sys.readdir path);
-        Unix.rmdir path
-      end else
-        Unix.unlink path
-    end
-  in
-  go path
-
-(* Build a minimal RPC context whose peer_manager we control directly.
-   getnodeaddresses only reaches into ctx.peer_manager, but the record is
-   total so we populate every field with a throwaway chain/mempool/utxo. *)
+(* ONE ChainDB per test binary.  getnodeaddresses only touches
+   ctx.peer_manager; the store is a throwaway to fill the total record.
+   Per-case dirs used to leak a 286 MiB WAL each onto the /tmp tmpfs. *)
 let make_ctx () =
-  let test_db_path = fresh_db_path () in
-  rm_rf test_db_path;
-  let db = Storage.ChainDB.create test_db_path in
+  let db = Test_tmp.chaindb () in
   let utxo = Utxo.UtxoSet.create db in
   let mp =
     Mempool.create ~network:Consensus.regtest

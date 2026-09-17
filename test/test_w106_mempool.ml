@@ -163,7 +163,7 @@ open Camlcoin
    Helpers
    ========================================================================= *)
 
-let test_db_path = "/tmp/camlcoin_test_w106_mempool_db"
+let test_db_path = Test_tmp.register "/tmp/camlcoin_test_w106_mempool_db"
 
 let cleanup () =
   let rec rm_rf path =

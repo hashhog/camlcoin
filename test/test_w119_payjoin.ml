@@ -151,7 +151,7 @@ open Camlcoin
    Test infrastructure
    ============================================================================ *)
 
-let test_db_root = "/tmp/camlcoin_w119_test_db"
+let test_db_root = Test_tmp.register "/tmp/camlcoin_w119_test_db"
 
 let rec rm_rf path =
   if Sys.file_exists path then begin

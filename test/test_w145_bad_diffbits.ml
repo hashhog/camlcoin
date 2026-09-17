@@ -36,7 +36,7 @@ let net_testnet4_shape =
     pow_no_retargeting = false;
     enforce_bip94 = true }
 
-let db_path = "/tmp/camlcoin_test_w145_db"
+let db_path = Test_tmp.register "/tmp/camlcoin_test_w145_db"
 
 let rm_rf path =
   let rec go p =

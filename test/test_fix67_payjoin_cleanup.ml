@@ -301,7 +301,7 @@ let test_g3_tls_info_surface () =
    RPC dispatch smoke tests for the FIX-67 RPCs
    ============================================================================ *)
 
-let test_db_root = "/tmp/camlcoin_fix67_test_db"
+let test_db_root = Test_tmp.register "/tmp/camlcoin_fix67_test_db"
 
 let rec rm_rf path =
   if Sys.file_exists path then begin

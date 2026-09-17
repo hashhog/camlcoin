@@ -630,11 +630,12 @@ let test_g28_no_psbtbumpfee_rpc () =
   in
   Alcotest.(check bool) "G28: psbtbumpfee RPC absent (BUG-W137-22)" false has
 
-(* G29: analyzepsbt estimated_vsize hard-coded 0; estimated_feerate
-   units wrong (BUG-W137-1 / BUG-W137-2 P0-CDIV). *)
+(* G29: analyzepsbt estimated_vsize hard-coded 0 (BUG-W137-1 P0-CDIV).
+   FIXED: omit estimated_vsize unless a real dummy-signed vsize exists
+   (Core node/psbt.cpp:138-145). The R5 analyze-exact probe is a no-UTXO
+   PSBT; Core omits the field, so a stub 0 failed the exact-check. *)
 let test_g29_analyzepsbt_estimated_vsize_stubbed () =
   let src = rpc_ml () in
-  (* estimated_vsize is the literal `Int 0 — pin via source. *)
   let has_zero =
     source_contains ~path:src
       ~needle:"estimated_vsize\", `Int 0"
@@ -642,23 +643,23 @@ let test_g29_analyzepsbt_estimated_vsize_stubbed () =
          ~needle:"\"estimated_vsize\", `Int 0"
   in
   Alcotest.(check bool)
-    "G29: analyzepsbt estimated_vsize hard-coded 0 (BUG-W137-1 P0-CDIV)"
-    true has_zero
+    "G29: analyzepsbt no longer hard-codes estimated_vsize 0 \
+     (BUG-W137-1 fixed)"
+    false has_zero
 
-(* G29-bis: estimated_feerate units — BTC, not BTC/kvB.  Pin the source
-   formula. *)
+(* G29-bis: estimated_feerate used to be fee/1e8 (BTC, not BTC/kvB).
+   FIXED: analyzepsbt no longer emits estimated_feerate from that
+   formula; fee (BTC) is the Core field when every input has a UTXO. *)
 let test_g29_analyzepsbt_estimated_feerate_units_wrong () =
   let src = rpc_ml () in
-  (* The current formula divides only by 100_000_000.0 (BTC, no vsize
-     factor).  A Core-correct version would multiply by 1000 / vsize. *)
   let has_naive =
     source_contains ~path:src
-      ~needle:"Int64.to_float fee /. 100_000_000.0"
+      ~needle:"(\"estimated_feerate\", `Float (Int64.to_float fee /. 100_000_000.0))"
   in
   Alcotest.(check bool)
-    "G29-bis: estimated_feerate is `fee / 1e8` (BTC) not BTC/kvB \
-     (BUG-W137-2 P0-CDIV)"
-    true has_naive
+    "G29-bis: analyzepsbt does not emit estimated_feerate as fee/1e8 \
+     (BUG-W137-2 fixed)"
+    false has_naive
 
 (* G30: No RemoveUnnecessaryTransactions analog (BUG-W137-24). *)
 let test_g30_no_remove_unnecessary_transactions () =
@@ -861,8 +862,8 @@ let () =
       Alcotest.test_case "G26: joinpsbts RPC absent (BUG-W137-20)" `Quick test_g26_no_joinpsbts_rpc;
       Alcotest.test_case "G27: descriptorprocesspsbt RPC absent (BUG-W137-21)" `Quick test_g27_no_descriptorprocesspsbt_rpc;
       Alcotest.test_case "G28: psbtbumpfee RPC absent (BUG-W137-22)" `Quick test_g28_no_psbtbumpfee_rpc;
-      Alcotest.test_case "G29: estimated_vsize hard-coded 0 (P0-CDIV BUG-W137-1)" `Quick test_g29_analyzepsbt_estimated_vsize_stubbed;
-      Alcotest.test_case "G29-bis: estimated_feerate units wrong (P0-CDIV BUG-W137-2)" `Quick test_g29_analyzepsbt_estimated_feerate_units_wrong;
+      Alcotest.test_case "G29: estimated_vsize not stubbed 0 (BUG-W137-1 fixed)" `Quick test_g29_analyzepsbt_estimated_vsize_stubbed;
+      Alcotest.test_case "G29-bis: estimated_feerate not fee/1e8 (BUG-W137-2 fixed)" `Quick test_g29_analyzepsbt_estimated_feerate_units_wrong;
       Alcotest.test_case "G30: no RemoveUnnecessaryTransactions (P2 BUG-W137-24)" `Quick test_g30_no_remove_unnecessary_transactions;
     ];
     "Invariant pins (preserve W47 / W41 / FIX-70)", [

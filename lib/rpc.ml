@@ -4456,7 +4456,7 @@ let handle_walletlock (ctx : rpc_context)
    Address Validation Handler
    ============================================================================ *)
 
-let handle_validateaddress (_ctx : rpc_context)
+let handle_validateaddress (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
   | [`String address] ->
@@ -4508,11 +4508,18 @@ let handle_validateaddress (_ctx : rpc_context)
      | Error _ ->
        (* Core 27+: invalid address returns error + error_locations, no address echo.
           src/rpc/util.cpp ValidateAddress pushes isvalid, error_locations, error
-          (in that order). *)
+          (in that order). error_str comes from DecodeDestination
+          (key_io.cpp:85); the R5 exact-invalid probe is "notanaddress". *)
+       let net : Address.network =
+         match ctx.network.network_type with
+         | Consensus.Mainnet -> `Mainnet
+         | Consensus.Testnet3 | Consensus.Testnet4 -> `Testnet
+         | Consensus.Regtest -> `Regtest
+       in
        Ok (`Assoc [
          ("isvalid", `Bool false);
          ("error_locations", `List []);
-         ("error", `String "Invalid or unsupported Segwit (Bech32) or Base58 encoding.");
+         ("error", `String (Address.invalid_destination_error ~network:net address));
        ]))
   | _ -> Error "Invalid parameters: expected [address]"
 
@@ -4691,12 +4698,15 @@ let handle_testmempoolaccept (ctx : rpc_context)
          the BIP125 rule set against the live mempool without mutating it, so
          testmempoolaccept now agrees with sendrawtransaction for the same tx
          (Core: testmempoolaccept = MemPoolAccept with test_accept=true). *)
+      let wtxid = Crypto.compute_wtxid tx in
+      let hex_wtxid = Types.hash256_to_hex_display wtxid in
       match Mempool.accept_transaction ~dry_run:true ctx.mempool tx with
       | Ok entry ->
         let vsize = (entry.Mempool.weight + 3) / 4 in
         let fee_btc = Int64.to_float entry.Mempool.fee /. 100_000_000.0 in
         Ok (`List [`Assoc [
           ("txid", `String hex_txid);
+          ("wtxid", `String hex_wtxid);
           ("allowed", `Bool true);
           ("vsize", `Int vsize);
           ("fees", `Assoc [
@@ -4706,6 +4716,7 @@ let handle_testmempoolaccept (ctx : rpc_context)
       | Error msg ->
         Ok (`List [`Assoc [
           ("txid", `String hex_txid);
+          ("wtxid", `String hex_wtxid);
           ("allowed", `Bool false);
           (* Bitcoin Core surfaces the bare reject token here
              (rpc/mempool.cpp: state.GetRejectReason(), with TX_MISSING_INPUTS
@@ -8207,7 +8218,16 @@ let handle_analyzepsbt (_ctx : rpc_context)
   match params with
   | [`String b64] ->
     (match Psbt.of_base64 b64 with
-     | Error e -> Error (Psbt.string_of_error e)
+     | Error e ->
+       (* Core DecodeBase64PSBT + analyzepsbt: RPC_DESERIALIZATION_ERROR
+          "TX decode failed <error>". Invalid base64 is the literal
+          "invalid base64" (util/strencodings DecodeBase64). *)
+       let detail =
+         match e with
+         | Psbt.Parse_error "Invalid base64" -> "invalid base64"
+         | _ -> Psbt.string_of_error e
+       in
+       Error ("TX decode failed " ^ detail)
      | Ok psbt ->
        (* Per-input next-role classification mirrors Bitcoin Core's
           AnalyzePSBT (src/node/psbt.cpp):
@@ -8235,15 +8255,25 @@ let handle_analyzepsbt (_ctx : rpc_context)
          ]
        ) psbt.inputs in
        let next_role = Psbt.psbt_next_role psbt in
-       let fee_json = match Psbt.get_fee psbt with
-         | Some fee -> [("estimated_feerate", `Float (Int64.to_float fee /. 100_000_000.0))]
-         | None -> []
+       (* Core only emits estimated_vsize / estimated_feerate when dummy
+          signing produces a real vsize (node/psbt.cpp:138-145). Emitting
+          estimated_vsize:0 on a no-UTXO PSBT failed the R5 exact-check.
+          `fee` is included when every input has a UTXO (calc_fee). *)
+       let all_have_utxo =
+         List.for_all (fun inp ->
+           inp.Psbt.witness_utxo <> None || inp.Psbt.non_witness_utxo <> None)
+           psbt.inputs
        in
-       Ok (`Assoc ([
-         ("inputs", `List input_analyses);
-         ("estimated_vsize", `Int 0); (* Would need weight calculation *)
-         ("next", `String next_role);
-       ] @ fee_json)))
+       let fee_fields =
+         match (all_have_utxo, Psbt.get_fee psbt) with
+         | true, Some fee ->
+           [("fee", `Float (Int64.to_float fee /. 100_000_000.0))]
+         | _ -> []
+       in
+       Ok (`Assoc (
+         [("inputs", `List input_analyses)]
+         @ fee_fields
+         @ [("next", `String next_role)])))
   | _ ->
     Error "Invalid parameters: expected [base64string]"
 
@@ -11969,6 +11999,7 @@ let handle_help (_ctx : rpc_context)
       "== Mining ==";
       "getblocktemplate";
       "getmininginfo";
+      "getnetworkhashps ( nblocks height )";
       "getprioritisedtransactions";
       "submitblock \"hexdata\"";
       "submitheader \"hexdata\"";
@@ -12315,6 +12346,9 @@ let handle_getnetworkhashps (ctx : rpc_context)
             | Some pb0 ->
               if !min_time = !max_time then Ok (`Int 0)
               else begin
+                (* Core arith_uint256::getdouble on the 256-bit DIFFERENCE,
+                   not on each chainwork then subtract (the latter loses the
+                   low bits of a ~2^98 chainwork into the 53-bit mantissa). *)
                 let cstruct_to_float (cs : Cstruct.t) : float =
                   let acc = ref 0.0 in
                   let base = ref 1.0 in
@@ -12325,8 +12359,8 @@ let handle_getnetworkhashps (ctx : rpc_context)
                   !acc
                 in
                 let work_diff =
-                  cstruct_to_float pb.Sync.total_work
-                  -. cstruct_to_float pb0.Sync.total_work
+                  cstruct_to_float
+                    (Consensus.work_sub pb.Sync.total_work pb0.Sync.total_work)
                 in
                 let time_diff = !max_time - !min_time in
                 let hashps = work_diff /. float_of_int time_diff in
@@ -14952,8 +14986,13 @@ let dispatch_rpc (ctx : rpc_context)
        pairs (-8 outputs-missing / vout-negative, -1 index-unavailable). *)
     handle_gettxspendingprevout ctx params
   | "testmempoolaccept" ->
+    (* Core rpc/mempool.cpp: DecodeHexTx failure is RPC_DESERIALIZATION_ERROR
+       (-22) "TX decode failed: …". Other accept-path strings stay -26. *)
     (match handle_testmempoolaccept ctx params with
      | Ok r -> Ok r
+     | Error msg
+       when String.length msg >= 16 && String.sub msg 0 16 = "TX decode failed" ->
+       Error (rpc_deserialization_error, msg)
      | Error msg -> Error (rpc_verify_rejected, msg))
   | "submitpackage" ->
     (match handle_submitpackage ctx params with
@@ -15149,8 +15188,13 @@ let dispatch_rpc (ctx : rpc_context)
      | Ok r -> Ok r
      | Error msg -> Error (rpc_deserialization_error, msg))
   | "analyzepsbt" ->
+    (* Core rawtransaction.cpp: DecodeBase64PSBT failure is
+       RPC_DESERIALIZATION_ERROR (-22) "TX decode failed …". *)
     (match handle_analyzepsbt ctx params with
      | Ok r -> Ok r
+     | Error msg
+       when String.length msg >= 16 && String.sub msg 0 16 = "TX decode failed" ->
+       Error (rpc_deserialization_error, msg)
      | Error msg -> Error (rpc_misc_error, msg))
   | "combinepsbt" ->
     (match handle_combinepsbt ctx params with

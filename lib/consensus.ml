@@ -1260,6 +1260,25 @@ let work_add (a : Cstruct.t) (b : Cstruct.t) : Cstruct.t =
   done;
   result
 
+(* a - b as 32-byte LE. Caller must ensure a >= b (chainwork is monotonic
+   along a parent walk). Mirrors arith_uint256 subtraction used by Core
+   GetNetworkHashPS (mining.cpp: workDiff = pb->nChainWork - pb0->nChainWork)
+   BEFORE converting the difference to double. *)
+let work_sub (a : Cstruct.t) (b : Cstruct.t) : Cstruct.t =
+  let result = Cstruct.create 32 in
+  let borrow = ref 0 in
+  for i = 0 to 31 do
+    let d = Cstruct.get_uint8 a i - Cstruct.get_uint8 b i - !borrow in
+    if d < 0 then begin
+      Cstruct.set_uint8 result i (d + 256);
+      borrow := 1
+    end else begin
+      Cstruct.set_uint8 result i d;
+      borrow := 0
+    end
+  done;
+  result
+
 (* ============================================================================
    BIP-30 canonical block hash tables
    ============================================================================ *)

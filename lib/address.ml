@@ -408,6 +408,50 @@ let address_of_string (s : string) : (address, string) result =
      | Error e -> Error e)
   | _ -> Error ("Unknown address format: " ^ s)
 
+(* Core key_io.cpp DecodeDestination error_str for a string that is NOT a
+   valid destination. Used by validateaddress's invalid branch.
+   For a non-Bech32-HRP string: DecodeBase58Check success with a matching
+   P2PKH/P2SH version but the wrong payload length is "Invalid length for
+   Base58 address (P2PKH or P2SH)"; any other successful Base58Check is
+   "Invalid or unsupported Base58-encoded address."; a raw Base58 decode
+   that still succeeds (the R5 exact-invalid probe, "notanaddress") is
+   "Invalid checksum or length of Base58 address (P2PKH or P2SH)";
+   otherwise the generic Segwit/Base58 encoding message. *)
+let invalid_destination_error ?(network = `Mainnet) (s : string) : string =
+  let hrp =
+    match network with
+    | `Mainnet -> "bc"
+    | `Testnet -> "tb"
+    | `Regtest -> "bcrt"
+  in
+  let pk_ver, sh_ver =
+    match network with
+    | `Mainnet -> (0x00, 0x05)
+    | `Testnet | `Regtest -> (0x6F, 0xC4)
+  in
+  let is_bech32 =
+    let n = String.length hrp in
+    String.length s >= n
+    && String.lowercase_ascii (String.sub s 0 n) = hrp
+  in
+  if is_bech32 then
+    "Invalid or unsupported Segwit (Bech32) or Base58 encoding."
+  else
+    match base58check_decode s with
+    | Ok data ->
+      if
+        Cstruct.length data >= 1
+        && (Cstruct.get_uint8 data 0 = pk_ver
+           || Cstruct.get_uint8 data 0 = sh_ver)
+      then "Invalid length for Base58 address (P2PKH or P2SH)"
+      else "Invalid or unsupported Base58-encoded address."
+    | Error _ -> (
+      try
+        ignore (base58_decode s);
+        "Invalid checksum or length of Base58 address (P2PKH or P2SH)"
+      with _ ->
+        "Invalid or unsupported Segwit (Bech32) or Base58 encoding.")
+
 (* Create address from public key *)
 let of_pubkey ?(network=`Mainnet) (addr_type : address_type) (pubkey : Cstruct.t) : address =
   match addr_type with

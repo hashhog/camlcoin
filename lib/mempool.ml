@@ -4399,40 +4399,53 @@ let save_mempool (mp : mempool) (path : string) : unit =
   );
   Sys.rename tmp path
 
-(* Streaming reader over a Buffer.contents-style raw payload string with an
-   internal cursor.  The caller pre-XOR-decodes the payload before passing it
-   in, so this just needs to walk a string. *)
+(* Streaming reader over the XOR-decoded payload. One Cstruct wraps the
+   whole dump; integer reads and Serialize.deserialize_transaction walk
+   that buffer in place. deserialize_transaction already copies field
+   slices out (serialize.ml read_bytes), so the dump can be GCed after
+   the load.
+
+   Do NOT wrap the unread tail in a fresh Cstruct per tx — that used to
+   memcpy the remaining payload on every iteration (O(n²); a 74 MB /
+   17164-tx dump spent 16–20 min in caml_blit_string_to_bigstring +
+   major GC and bound RPC only after it finished). *)
 type reader_state = {
   mutable r_pos : int;
-  r_data : string;
+  r_cs : Cstruct.t;
 }
 
 let r_remaining (r : reader_state) : int =
-  String.length r.r_data - r.r_pos
+  Cstruct.length r.r_cs - r.r_pos
 
 let r_read_u8 (r : reader_state) : int =
   if r_remaining r < 1 then failwith "mempool.dat truncated";
-  let c = Char.code r.r_data.[r.r_pos] in
+  let c = Cstruct.get_uint8 r.r_cs r.r_pos in
   r.r_pos <- r.r_pos + 1;
   c
 
 let r_read_bytes (r : reader_state) (n : int) : string =
   if r_remaining r < n then failwith "mempool.dat truncated";
-  let s = String.sub r.r_data r.r_pos n in
+  let s = Cstruct.to_string (Cstruct.sub r.r_cs r.r_pos n) in
   r.r_pos <- r.r_pos + n;
   s
 
 let r_read_uint16_le (r : reader_state) : int =
-  let s = r_read_bytes r 2 in
-  Cstruct.LE.get_uint16 (Cstruct.of_string s) 0
+  if r_remaining r < 2 then failwith "mempool.dat truncated";
+  let v = Cstruct.LE.get_uint16 r.r_cs r.r_pos in
+  r.r_pos <- r.r_pos + 2;
+  v
 
 let r_read_uint32_le (r : reader_state) : int32 =
-  let s = r_read_bytes r 4 in
-  Cstruct.LE.get_uint32 (Cstruct.of_string s) 0
+  if r_remaining r < 4 then failwith "mempool.dat truncated";
+  let v = Cstruct.LE.get_uint32 r.r_cs r.r_pos in
+  r.r_pos <- r.r_pos + 4;
+  v
 
 let r_read_int64_le (r : reader_state) : int64 =
-  let s = r_read_bytes r 8 in
-  Cstruct.LE.get_uint64 (Cstruct.of_string s) 0
+  if r_remaining r < 8 then failwith "mempool.dat truncated";
+  let v = Cstruct.LE.get_uint64 r.r_cs r.r_pos in
+  r.r_pos <- r.r_pos + 8;
+  v
 
 let r_read_compact_size (r : reader_state) : int =
   let first = r_read_u8 r in
@@ -4441,34 +4454,26 @@ let r_read_compact_size (r : reader_state) : int =
   else if first = 0xFE then Int32.to_int (r_read_uint32_le r)
   else Int64.to_int (r_read_int64_le r)
 
-(* Load mempool from a Bitcoin Core byte-compatible mempool.dat.  Returns the
-   number of transactions successfully accepted into the mempool.  Silently
-   returns 0 on malformed / unsupported / missing files (matches Core's
-   "Continuing anyway" loss-tolerant policy). *)
-let load_mempool (mp : mempool) (path : string) : int =
-  if not (Sys.file_exists path) then 0
-  else begin
-    let loaded = ref 0 in
-    (try
+(* Decode header + XOR payload. None on missing / truncated / unknown
+   version (Core "Continuing anyway"). *)
+let decode_mempool_file (path : string) : (reader_state * int) option =
+  if not (Sys.file_exists path) then None
+  else
+    try
       let ic = open_in_bin path in
       Fun.protect ~finally:(fun () -> close_in_noerr ic) (fun () ->
         let file_len = in_channel_length ic in
         if file_len < 8 then raise Exit;
         let hdr_v = Bytes.create 8 in
         really_input ic hdr_v 0 8;
-        let version = Cstruct.LE.get_uint64
-          (Cstruct.of_bytes hdr_v) 0 in
+        let version = Cstruct.LE.get_uint64 (Cstruct.of_bytes hdr_v) 0 in
         let key, payload_offset =
           if Int64.equal version 1L then
-            (* Legacy unobfuscated v1: zero key (no XOR) *)
             (Bytes.make 8 '\x00', 8)
           else if Int64.equal version mempool_dump_version then begin
             if file_len < 17 then raise Exit;
             let csize_buf = Bytes.create 1 in
             really_input ic csize_buf 0 1;
-            (* Core serializes the key as vector<byte>: compact-size length
-               followed by raw bytes.  For an 8-byte key this MUST be 0x08;
-               we also tolerate 0xFD-prefixed encodings just in case. *)
             let csize = Char.code (Bytes.get csize_buf 0) in
             let n =
               if csize < 0xFD then csize
@@ -4481,83 +4486,138 @@ let load_mempool (mp : mempool) (path : string) : int =
             if n <> 8 then raise Exit;
             let k = Bytes.create 8 in
             really_input ic k 0 8;
-            (* file offset now: 8 (version) + (1 csize byte) + 8 (key) = 17 *)
             (k, 17)
           end else
-            (* Unknown version (incl. legacy big-endian custom format) *)
             raise Exit
         in
-        (* Read the rest of the file as one chunk and XOR-decode. *)
         let payload_len = file_len - payload_offset in
         if payload_len <= 0 then raise Exit;
         let payload = Bytes.create payload_len in
         really_input ic payload 0 payload_len;
         xor_in_place ~key ~file_offset:payload_offset payload;
-        let r = { r_pos = 0; r_data = Bytes.unsafe_to_string payload } in
+        let r = { r_pos = 0; r_cs = Cstruct.of_bytes payload } in
         let total = r_read_int64_le r in
         if Int64.compare total 0L < 0 then raise Exit;
-        let total_int = Int64.to_int total in
-        for _i = 1 to total_int do
-          (* Build a sub-reader on the remaining payload so [Serialize] can
-             walk the variable-length transaction.  We use [Serialize]'s own
-             reader by handing it the remaining slice via Cstruct. *)
-          let remaining = r_remaining r in
-          if remaining <= 0 then raise Exit;
-          let cs = Cstruct.of_string ~off:r.r_pos ~len:remaining
-            r.r_data in
-          let sr = Serialize.reader_of_cstruct cs in
-          let tx = Serialize.deserialize_transaction sr in
-          (* Advance our cursor by however many bytes Serialize consumed. *)
-          r.r_pos <- r.r_pos + sr.pos;
-          let _n_time = r_read_int64_le r in   (* discarded — mempool re-times *)
-          let n_fee_delta = r_read_int64_le r in
-          (match add_transaction mp tx with
-           | Ok entry ->
-             incr loaded;
-             (* FIX-77: apply the per-entry inline nFeeDelta to map_deltas so
-                modified-fee, RBF Rule 3, and getmempoolentry "fees.modified"
-                pick it up.  Matches Core node/mempool_persist.cpp:99-102
-                (LoadMempool ApplyDelta on per-entry nFeeDelta).  We record
-                via prioritise_transaction so the delta survives eviction +
-                re-admission via the standard apply_delta lookup path. *)
-             if not (Int64.equal n_fee_delta 0L) then
-               prioritise_transaction mp entry.txid n_fee_delta
-           | Error _ ->
-             (* FIX-77: entry could not be admitted (e.g. UTXO missing on
-                fresh chain) — Core still records the standalone-delta path
-                so any future arrival picks up priority.  Per-entry deltas
-                for failed-admission txs are intentionally dropped (Core
-                applies only when the loop body sees a valid tx). *)
-             ())
-        done;
-        (* mapDeltas: FIX-77 — apply standalone deltas via
-           prioritise_transaction so txids that are NOT (yet) in the mempool
-           still get their delta recorded.  Matches Core
-           node/mempool_persist.cpp:125-132 — read the full
-           std::map<Txid, CAmount> mapDeltas and call PrioritiseTransaction
-           for each entry.  Core gates this on apply_fee_delta_priority
-           (default true on LoadMempool restart, false only on the
-           `importmempool` RPC). *)
-        let n_deltas = r_read_compact_size r in
-        for _i = 1 to n_deltas do
-          let txid_str = r_read_bytes r 32 in
-          let amount = r_read_int64_le r in
-          if not (Int64.equal amount 0L) then begin
-            let txid_cs = Cstruct.of_string txid_str in
-            prioritise_transaction mp txid_cs amount
-          end
-        done;
-        (* unbroadcast_txids: read + discard *)
-        let n_unbcast =
-          try r_read_compact_size r
-          with _ -> 0 in
-        for _i = 1 to n_unbcast do
-          let _txid = r_read_bytes r 32 in ()
-        done
-      )
+        Some (r, Int64.to_int total))
+    with _ -> None
+
+let apply_loaded_deltas (mp : mempool) (r : reader_state) : unit =
+  (* mapDeltas: FIX-77 — apply standalone deltas via
+     prioritise_transaction so txids that are NOT (yet) in the mempool
+     still get their delta recorded.  Matches Core
+     node/mempool_persist.cpp:125-132. *)
+  let n_deltas = r_read_compact_size r in
+  for _i = 1 to n_deltas do
+    let txid_str = r_read_bytes r 32 in
+    let amount = r_read_int64_le r in
+    if not (Int64.equal amount 0L) then begin
+      let txid_cs = Cstruct.of_string txid_str in
+      prioritise_transaction mp txid_cs amount
+    end
+  done;
+  let n_unbcast = try r_read_compact_size r with _ -> 0 in
+  for _i = 1 to n_unbcast do
+    let _txid = r_read_bytes r 32 in ()
+  done
+
+(* Load mempool from a Bitcoin Core byte-compatible mempool.dat.  Returns the
+   number of transactions successfully accepted into the mempool.  Silently
+   returns 0 on malformed / unsupported / missing files (matches Core's
+   "Continuing anyway" loss-tolerant policy). *)
+let load_mempool (mp : mempool) (path : string) : int =
+  match decode_mempool_file path with
+  | None -> 0
+  | Some (r, total) ->
+    let loaded = ref 0 in
+    (try
+      for i = 1 to total do
+        if r_remaining r <= 0 then raise Exit;
+        (* Walk the shared payload Cstruct. Serialize.reader.pos is an
+           offset into r_cs, not a copy of the unread tail. *)
+        let sr : Serialize.reader = { buf = r.r_cs; pos = r.r_pos } in
+        let tx = Serialize.deserialize_transaction sr in
+        r.r_pos <- sr.pos;
+        let _n_time = r_read_int64_le r in
+        let n_fee_delta = r_read_int64_le r in
+        (match add_transaction mp tx with
+         | Ok entry ->
+           incr loaded;
+           (* FIX-77: apply the per-entry inline nFeeDelta. *)
+           if not (Int64.equal n_fee_delta 0L) then
+             prioritise_transaction mp entry.txid n_fee_delta
+         | Error _ -> ());
+        if i = 1 || i mod 1000 = 0 || i = total then
+          Logs.info (fun m ->
+            m "Loading mempool.dat: %d/%d accepted=%d" i total !loaded)
+      done;
+      (* mapDeltas: FIX-77 — apply standalone deltas via
+         prioritise_transaction so txids that are NOT (yet) in the mempool
+         still get their delta recorded.  Matches Core
+         node/mempool_persist.cpp:125-132 — read the full
+         std::map<Txid, CAmount> mapDeltas and call PrioritiseTransaction
+         for each entry.  Core gates this on apply_fee_delta_priority
+         (default true on LoadMempool restart, false only on the
+         `importmempool` RPC). *)
+      let n_deltas = r_read_compact_size r in
+      for _i = 1 to n_deltas do
+        let txid_str = r_read_bytes r 32 in
+        let amount = r_read_int64_le r in
+        if not (Int64.equal amount 0L) then begin
+          let txid_cs = Cstruct.of_string txid_str in
+          prioritise_transaction mp txid_cs amount
+        end
+      done;
+      let n_unbcast = try r_read_compact_size r with _ -> 0 in
+      for _i = 1 to n_unbcast do
+        let _txid = r_read_bytes r 32 in ()
+      done
     with _ -> ());
     !loaded
-  end
+
+(* Lwt-yielding reload. One pause before the first tx lets Cli.run's
+   rpc_thread bind; then a pause every 64 txs keeps getblockcount
+   answerable while a large dump is admitted. Core: init.cpp
+   background_init_thread LoadMempool vs SetRPCWarmupFinished. *)
+let load_mempool_lwt (mp : mempool) (path : string) : int Lwt.t =
+  let open Lwt.Syntax in
+  let* () = Lwt.pause () in
+  match decode_mempool_file path with
+  | None -> Lwt.return 0
+  | Some (r, total) ->
+    let loaded = ref 0 in
+    let rec loop i =
+      if i > total then begin
+        (try apply_loaded_deltas mp r with _ -> ());
+        Lwt.return !loaded
+      end else
+        let ok =
+          try
+            if r_remaining r <= 0 then raise Exit;
+            let sr : Serialize.reader = { buf = r.r_cs; pos = r.r_pos } in
+            let tx = Serialize.deserialize_transaction sr in
+            r.r_pos <- sr.pos;
+            let _n_time = r_read_int64_le r in
+            let n_fee_delta = r_read_int64_le r in
+            (match add_transaction mp tx with
+             | Ok entry ->
+               incr loaded;
+               if not (Int64.equal n_fee_delta 0L) then
+                 prioritise_transaction mp entry.txid n_fee_delta
+             | Error _ -> ());
+            if i = 1 || i mod 1000 = 0 || i = total then
+              Logs.info (fun m ->
+                m "Loading mempool.dat: %d/%d accepted=%d" i total !loaded);
+            true
+          with _ -> false
+        in
+        if not ok then Lwt.return !loaded
+        else
+          let* () =
+            if i land 63 = 0 then Lwt.pause () else Lwt.return_unit
+          in
+          loop (i + 1)
+    in
+    loop 1
 
 (* ============================================================================
    Package Relay (BIP 331)

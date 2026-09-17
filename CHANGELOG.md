@@ -2,6 +2,7 @@
 
 ## v1.0.2 — 2026-09-17
 
+- fix: bind RPC before reloading mempool.dat; parse the dump from one Cstruct instead of copying the unread tail per tx. Control: `dune exec --no-buffer test/test_mempool_boot_load.exe`. Live 16–20 min boot stall was the quadratic Cstruct copy plus a synchronous load ahead of the RPC listener; do not bounce the mainnet pin to apply this.
 - fix: getheaders locator is GetLocator(pindexBestHeader), not the height-index row at the block tip. 2000-known replies rerequest from the tip instead of rotating. VERSION start_height is replaced by the observed headers height. Control: `dune exec --no-buffer test/test_stale_locator.exe`. Live wedge at 967188 — do not bounce the 7921e5a pin to apply this; promote, then `bash tools/stop_mainnet.sh camlcoin` only when a human asks. After that restart the tip must leave 967188 within 10 min.
 - docs: caveat the AssumeUTXO dual-chainstate claim; getchainstates is one chainstate
 - 4ccdd13 test: hermetic @runtest for the v1.0.2 unit gate
@@ -19,6 +20,7 @@
 
 Changes since `v1.0.0`:
 
+- fix: bind RPC before reloading mempool.dat; parse the dump from one Cstruct (no per-tx remaining-tail copy). Control: `dune exec --no-buffer test/test_mempool_boot_load.exe`
 - fix: getheaders locator is GetLocator(pindexBestHeader); 2000-known replies rerequest from the tip. Control: `dune exec --no-buffer test/test_stale_locator.exe`
 - docs: caveat the AssumeUTXO dual-chainstate claim; `getchainstates` reports a single chainstate (boot-smoke `bgval SKIP (single-chainstate)`). Control: `dune exec --no-buffer test/test_readme_assumeutxo_caveat.exe`
 - fix: stall class (231 CRITICALs) — do not rotate peers during a header-ahead catch-up, ignore VERSION-height liars, keep the header tip on gap-fill connect, re-enter catch-up IBD after FullySynced. Control: `dune exec --no-buffer test/test_stall_class_231.exe`. Diagnosis: `docs/STALL-CLASS-231-CRITICALS.md`

@@ -912,15 +912,12 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     end
   in
 
-  (* Load persisted mempool from previous session *)
+  (* mempool.dat is reloaded AFTER the RPC server is scheduled (see
+     load_mempool_task near the end of run). Core binds RPC in seconds
+     and LoadMempool on a background thread (init.cpp initload). A
+     synchronous load here used to stall the process 16–20 min on a
+     74 MB dump, with nothing listening. *)
   let mempool_path = Filename.concat config.data_dir "mempool.dat" in
-  (try
-    let loaded = Mempool.load_mempool mempool mempool_path in
-    if loaded > 0 then
-      Logs.info (fun m -> m "Loaded %d transactions from mempool.dat" loaded)
-  with exn ->
-    Logs.warn (fun m ->
-      m "Failed to load mempool.dat: %s" (Printexc.to_string exn)));
 
   (* Load persisted fee estimation data *)
   let fee_est_path = Filename.concat config.data_dir "fee_estimates.dat" in
@@ -3033,6 +3030,23 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       (fun exn ->
         Logs.warn (fun m ->
           m "rpc_thread exited: %s" (Printexc.to_string exn));
+        Lwt.return_unit));
+  (* Background mempool.dat reload. Scheduled AFTER rpc_thread so the
+     JSON-RPC port binds and answers getblockcount while this runs.
+     load_mempool_lwt pauses before the first tx and every 64 txs so a
+     large dump cannot stall the event loop. *)
+  Lwt.async (fun () ->
+    Lwt.catch
+      (fun () ->
+        Logs.info (fun m ->
+          m "Loading mempool.dat in the background (RPC already binding)");
+        let* n = Mempool.load_mempool_lwt mempool mempool_path in
+        if n > 0 then
+          Logs.info (fun m -> m "Loaded %d transactions from mempool.dat" n);
+        Lwt.return_unit)
+      (fun exn ->
+        Logs.warn (fun m ->
+          m "Failed to load mempool.dat: %s" (Printexc.to_string exn));
         Lwt.return_unit));
   Lwt.async (fun () ->
     Lwt.catch

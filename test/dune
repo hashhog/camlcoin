@@ -115,3 +115,11 @@
 (executable
  (name test_stale_locator)
  (libraries camlcoin alcotest))
+
+; Control for boot-time mempool.dat reload (QUEUES.md item 1). RPC must
+; bind before the dump is read, the reader must not copy the unread tail
+; per tx, and load_mempool on a ~24 MB fixture must finish under 60 s.
+;   dune exec --no-buffer test/test_mempool_boot_load.exe
+(executable
+ (name test_mempool_boot_load)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix str))

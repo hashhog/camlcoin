@@ -3337,46 +3337,153 @@ let handle_sethdseed (ctx : rpc_context)
       ])
     end
 
+(* listunspent ( minconf maxconf ["addresses",...] include_unsafe query_options )
+   Core: bitcoin-core/src/wallet/rpc/coins.cpp:456-690.
+
+   Argument parsing happens BEFORE the UTXO walk (and even if the wallet is
+   empty): an invalid address is RPC_INVALID_ADDRESS_OR_KEY (-5)
+   "Invalid Bitcoin address: <s>" (coins.cpp:542); a duplicate destination
+   is RPC_INVALID_PARAMETER (-8) "Invalid parameter, duplicated address: <s>"
+   (coins.cpp:545). minconf/maxconf default 1/9999999 and are inclusive.
+   Previously this handler ignored [params] entirely, so Core-rejecting
+   inputs succeeded and minconf never filtered. *)
 let handle_listunspent (ctx : rpc_context)
-    (_params : Yojson.Safe.t list) : Yojson.Safe.t =
-  match ctx.wallet with
-  | None -> `List []
-  | Some wallet ->
-    let utxos = Wallet.get_utxos wallet in
-    let tip_height = match ctx.chain.tip with
-      | Some t -> t.height
-      | None -> 0
-    in
-    `List (List.map (fun (wutxo : Wallet.wallet_utxo) ->
-      let confirmations =
-        if wutxo.confirmed then tip_height - wutxo.utxo.Utxo.height + 1
-        else 0
-      in
-      (* Core marks immature coinbase non-spendable in listunspent
-         (rpc/coins.cpp: "spendable").  We compute the same maturity flag so a
-         caller distinguishes mature (selectable) coins from immature coinbase.
-         A watch-only coin is NEVER spendable (no private key) — Core sets
-         spendable=false / solvable=false for it. *)
-      let mature = Wallet.is_spendable_at wutxo tip_height in
-      let spendable = mature && not wutxo.Wallet.watch_only in
-      let solvable = not wutxo.Wallet.watch_only in
-      let spk_hex = cstruct_to_hex wutxo.utxo.Utxo.script_pubkey in
-      let addr_fields =
-        match script_to_address wutxo.utxo.Utxo.script_pubkey
-                (network_to_address_network ctx.network) with
-        | Some a -> [("address", `String a)]
-        | None -> []
-      in
-      `Assoc (addr_fields @ [
-        ("txid", `String (Types.hash256_to_hex_display wutxo.outpoint.txid));
-        ("vout", `Int (Int32.to_int wutxo.outpoint.vout));
-        ("scriptPubKey", `String spk_hex);
-        ("amount", `Float (Int64.to_float wutxo.utxo.Utxo.value /. 100_000_000.0));
-        ("confirmations", `Int confirmations);
-        ("spendable", `Bool spendable);
-        ("solvable", `Bool solvable);
-      ])
-    ) utxos)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  let parse_opt_int default = function
+    | None | Some `Null -> Ok default
+    | Some (`Int n) ->
+      if not (core_in_int32 n) then Error (rpc_misc_error, core_json_int_range_msg)
+      else Ok n
+    | Some other ->
+      Error (rpc_type_error,
+        Printf.sprintf
+          "JSON value of type %s is not of expected type number"
+          (core_uvtype other))
+  in
+  let parse_opt_bool default = function
+    | None | Some `Null -> Ok default
+    | Some (`Bool b) -> Ok b
+    | Some other ->
+      Error (rpc_type_error,
+        Printf.sprintf
+          "JSON value of type %s is not of expected type bool"
+          (core_uvtype other))
+  in
+  let node_net = network_to_address_network ctx.network in
+  let rec parse_addresses seen acc = function
+    | [] -> Ok (List.rev acc)
+    | `String s :: rest ->
+      (match Address.address_of_string s with
+       | Error _ ->
+         Error (rpc_invalid_address, "Invalid Bitcoin address: " ^ s)
+       | Ok addr when addr.Address.network <> node_net ->
+         Error (rpc_invalid_address, "Invalid Bitcoin address: " ^ s)
+       | Ok addr ->
+         let canon = Address.address_to_string addr in
+         if List.mem canon seen then
+           Error (rpc_invalid_parameter,
+             "Invalid parameter, duplicated address: " ^ s)
+         else
+           parse_addresses (canon :: seen) (canon :: acc) rest)
+    | other :: _ ->
+      Error (rpc_type_error,
+        Printf.sprintf
+          "JSON value of type %s is not of expected type string"
+          (core_uvtype other))
+  in
+  match parse_opt_int 1 (List.nth_opt params 0) with
+  | Error e -> Error e
+  | Ok minconf ->
+  match parse_opt_int 9_999_999 (List.nth_opt params 1) with
+  | Error e -> Error e
+  | Ok maxconf ->
+  match (match List.nth_opt params 2 with
+         | None | Some `Null -> Ok []
+         | Some (`List items) -> parse_addresses [] [] items
+         | Some other ->
+           Error (rpc_type_error,
+             Printf.sprintf
+               "JSON value of type %s is not of expected type array"
+               (core_uvtype other)))
+  with
+  | Error e -> Error e
+  | Ok destinations ->
+  match parse_opt_bool true (List.nth_opt params 3) with
+  | Error e -> Error e
+  | Ok include_unsafe ->
+    (match ctx.wallet with
+     | None -> Ok (`List [])
+     | Some wallet ->
+       let tip_height = match ctx.chain.tip with
+         | Some t -> t.height
+         | None -> 0
+       in
+       let dest_set = destinations in
+       let entries =
+         List.filter_map (fun (wutxo : Wallet.wallet_utxo) ->
+           if Wallet.is_locked_coin wallet wutxo.outpoint then None
+           else
+           let confirmations =
+             if wutxo.confirmed then tip_height - wutxo.utxo.Utxo.height + 1
+             else 0
+           in
+           if confirmations < minconf || confirmations > maxconf then None
+           else
+           (* AvailableCoins drops immature coinbase unless
+              query_options.include_immature_coinbase (default false). *)
+           let mature = Wallet.is_spendable_at wutxo tip_height in
+           if wutxo.utxo.Utxo.is_coinbase && not mature then None
+           else
+           let safe = confirmations > 0 in
+           if not include_unsafe && not safe then None
+           else
+           let addr_opt =
+             script_to_address wutxo.utxo.Utxo.script_pubkey node_net
+           in
+           let dest_ok =
+             dest_set = [] ||
+             (match addr_opt with
+              | Some a -> List.mem a dest_set
+              | None -> false)
+           in
+           if not dest_ok then None
+           else
+           let spendable = mature && not wutxo.Wallet.watch_only in
+           let solvable = not wutxo.Wallet.watch_only in
+           let spk = wutxo.utxo.Utxo.script_pubkey in
+           let spk_hex = cstruct_to_hex spk in
+           let addr_fields = match addr_opt with
+             | Some a -> [("address", `String a); ("label", `String "")]
+             | None -> []
+           in
+           let desc_fields =
+             if not solvable then []
+             else
+               let payload = match addr_opt with
+                 | Some a -> "addr(" ^ a ^ ")"
+                 | None -> "raw(" ^ spk_hex ^ ")"
+               in
+               let desc = match Descriptor.add_checksum payload with
+                 | Some s -> s
+                 | None -> payload
+               in
+               [("desc", `String desc)]
+           in
+           Some (`Assoc (addr_fields @ [
+             ("txid", `String (Types.hash256_to_hex_display wutxo.outpoint.txid));
+             ("vout", `Int (Int32.to_int wutxo.outpoint.vout));
+             ("scriptPubKey", `String spk_hex);
+             ("amount", `Float (Int64.to_float wutxo.utxo.Utxo.value /. 100_000_000.0));
+             ("confirmations", `Int confirmations);
+             ("spendable", `Bool spendable);
+             ("solvable", `Bool solvable);
+           ] @ desc_fields @ [
+             ("parent_descs", `List []);
+             ("safe", `Bool safe);
+           ]))
+         ) (Wallet.get_utxos wallet)
+       in
+       Ok (`List entries))
 
 let handle_sendtoaddress (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
@@ -14742,7 +14849,7 @@ let dispatch_rpc (ctx : rpc_context)
      | Ok r -> Ok r
      | Error msg -> Error (rpc_invalid_address, msg))
   | "listunspent" ->
-    Ok (handle_listunspent ctx params)
+    handle_listunspent ctx params
   | "sendtoaddress" ->
     (match handle_sendtoaddress ctx params with
      | Ok r -> Ok r

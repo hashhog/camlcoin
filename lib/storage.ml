@@ -960,6 +960,48 @@ module ChainDB = struct
   let get_block_ntx t (hash : Types.hash256) : int option =
     Cf_chainstate.get_block_ntx t.cf hash
 
+  (* Cumulative m_chain_tx_count (Core chain.h). 8-byte LE int64. *)
+  let store_chain_tx_count t (hash : Types.hash256) (n : int64) =
+    Cf_chainstate.put_chain_tx_count t.cf hash n
+
+  let get_chain_tx_count t (hash : Types.hash256) : int64 option =
+    Cf_chainstate.get_chain_tx_count t.cf hash
+
+  (* nTx from the block body's CompactSize, without deserialising the
+     transactions. Block wire format is 80-byte header + CompactSize(nTx)
+     + txs (serialize.ml). Used when the ntx index is missing but the
+     body is on disk. *)
+  let get_block_ntx_from_body t (hash : Types.hash256) : int option =
+    match Cf_chainstate.get_block_data t.cf hash with
+    | None -> None
+    | Some data ->
+      if String.length data < 81 then None
+      else
+        (try
+           let cs = Cstruct.of_string data in
+           let r = Serialize.reader_of_cstruct (Cstruct.shift cs 80) in
+           Some (Serialize.read_compact_size r)
+         with _ -> None)
+
+  (* Connect-time write of per-block nTx AND cumulative m_chain_tx_count.
+     Mirrors ConnectTip assigning pindexNew->m_chain_tx_count =
+     nTx + (pprev ? pprev->m_chain_tx_count : 0) (validation.cpp).
+     Genesis passes [prev] = Types.zero_hash. If the parent cumulative
+     is not yet stored, we still write nTx and skip the cumulative so a
+     later reconstruct from an assumeUTXO anchor can fill it. *)
+  let record_connected_tx_counts t ~(hash : Types.hash256)
+      ~(prev : Types.hash256) ~(n_tx : int) : unit =
+    Cf_chainstate.put_block_ntx t.cf hash n_tx;
+    let parent_cum =
+      if Cstruct.equal prev Types.zero_hash then Some 0L
+      else Cf_chainstate.get_chain_tx_count t.cf prev
+    in
+    match parent_cum with
+    | None -> ()
+    | Some p ->
+      Cf_chainstate.put_chain_tx_count t.cf hash
+        (Int64.add p (Int64.of_int n_tx))
+
   (* Undo data storage - keyed by block hash for chain reorganizations.
      We append a sha256 checksum to the value (matching the legacy
      LogStorage layout) so corruption from a torn write surfaces as a

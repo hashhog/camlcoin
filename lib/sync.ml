@@ -1070,6 +1070,10 @@ let create_chain_state (db : Storage.ChainDB.t)
     Storage.ChainDB.set_height_hash state.db 0 genesis_hash;
     Storage.ChainDB.set_header_tip state.db genesis_hash 0
   end;
+  (* Genesis nChainTx = 1 (the coinbase). Core sets this on the genesis
+     CBlockIndex; getchaintxstats reads it rather than special-casing. *)
+  Storage.ChainDB.record_connected_tx_counts state.db
+    ~hash:genesis_hash ~prev:Types.zero_hash ~n_tx:1;
   state
 
 (* Restore chain state from database *)
@@ -4069,11 +4073,12 @@ let process_downloaded_blocks ?(max_blocks = 1)
            (try Tip_notifier.notify () with _ -> ());
            ibd.blocks_since_flush <- ibd.blocks_since_flush + 1;
            incr processed;
-           (* Store nTx for every connected block so getblockheader can
-              return the correct count without needing the full block body.
-              This fires on both assume-valid and full-validation paths. *)
-           Storage.ChainDB.store_block_ntx ibd.chain.db entry.hash
-             (List.length block.transactions);
+           (* Store nTx and m_chain_tx_count for every connected block so
+              getblockheader / getchaintxstats can read them without the
+              body. Fires on assume-valid and full-validation paths. *)
+           Storage.ChainDB.record_connected_tx_counts ibd.chain.db
+             ~hash:entry.hash ~prev:block.header.prev_block
+             ~n_tx:(List.length block.transactions);
            (* Prune old blocks if pruning is enabled *)
            prune_old_blocks ibd.chain height;
            (* Periodic UTXO flush — by block count or dirty set size.
@@ -5954,11 +5959,12 @@ let reorganize ?(allow_equal_work = false) (ibd : ibd_state)
                state and side effects after the commit so a crash
                between batch_write and these updates leaves only the
                state recoverable from disk on restart. *)
-            (* Store nTx for every reorg-connected block so getblockheader
-               returns a correct count even if the block body is absent. *)
+            (* Store nTx and m_chain_tx_count for every reorg-connected
+               block (parent before child). *)
             List.iter (fun ((entry : header_entry), (block : Types.block)) ->
-              Storage.ChainDB.store_block_ntx state.db entry.hash
-                (List.length block.transactions)
+              Storage.ChainDB.record_connected_tx_counts state.db
+                ~hash:entry.hash ~prev:entry.header.prev_block
+                ~n_tx:(List.length block.transactions)
             ) (List.rev !connected_blocks);
             state.tip <- Some new_tip;
             state.blocks_synced <- new_tip.height;
@@ -7046,10 +7052,11 @@ let rec connect_stored_blocks (state : chain_state) : int =
             ~tip_hash:entry.hash ~tip_height:next_height
             ~header_tip_hash:hdr_tip.hash ~header_tip_height:hdr_tip.height
             (List.rev !ops);
-          (* Store nTx for this block so getblockheader returns the correct
-             count without needing the full block body. *)
-          Storage.ChainDB.store_block_ntx state.db entry.hash
-            (List.length stored_block.transactions);
+          (* Store nTx and m_chain_tx_count so getblockheader /
+             getchaintxstats do not need the body. *)
+          Storage.ChainDB.record_connected_tx_counts state.db
+            ~hash:entry.hash ~prev:entry.header.prev_block
+            ~n_tx:(List.length stored_block.transactions);
           (* Feed the wallet from the gap-fill catch-up connect path too, so
              out-of-order blocks drained here also update + persist the wallet
              ledger.  Best-effort (see process_new_block). *)
@@ -7314,10 +7321,11 @@ let process_new_block ?(f_requested = false)
              authoritative DB tip observes the committed value.  Best-effort:
              a notifier fault must never roll back this connected block. *)
           (try Tip_notifier.notify () with _ -> ());
-          (* Store nTx for this newly-connected block so getblockheader
-             returns the correct count without needing the full block body. *)
-          Storage.ChainDB.store_block_ntx state.db hash
-            (List.length block.transactions);
+          (* Store nTx and m_chain_tx_count so getblockheader /
+             getchaintxstats do not need the body. *)
+          Storage.ChainDB.record_connected_tx_counts state.db
+            ~hash ~prev:entry.header.prev_block
+            ~n_tx:(List.length block.transactions);
           (* Feed the wallet from the LIVE P2P / IBD connect path (not just the
              mining/RPC path).  [run_wallet_scan_hook] credits/debits + durably
              persists the wallet ledger so a coin received over P2P survives an

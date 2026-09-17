@@ -356,20 +356,27 @@ let get_assumeutxo_for_hash ~network:(network : Consensus.network_config)
   in
   List.find_opt (fun p -> Cstruct.equal p.blockhash blockhash) candidates
 
+(** All hardcoded AssumeUTXO entries for [network]. Used to seed
+    m_chain_tx_count on snapshot bases (Core LoadBlockIndex /
+    ActivateSnapshot copies AssumeutxoData.m_chain_tx_count onto the
+    base CBlockIndex). *)
+let assumeutxo_params_list (network : Consensus.network_config)
+    : assumeutxo_params list =
+  match network.network_type with
+  | Consensus.Mainnet ->
+    if !campaign_au_data = [] then mainnet_au_data
+    else mainnet_au_data @ !campaign_au_data
+  | Consensus.Testnet4 ->
+    if !campaign_au_data = [] then testnet4_au_data
+    else testnet4_au_data @ !campaign_au_data
+  | Consensus.Regtest -> !regtest_au_data
+  | _ -> []
+
 (** All hardcoded AssumeUTXO heights for [network], smallest first.
     Mirrors Core's [GetAvailableSnapshotHeights]. *)
 let available_snapshot_heights (network : Consensus.network_config) : int list =
-  let candidates = match network.network_type with
-    | Consensus.Mainnet ->
-      if !campaign_au_data = [] then mainnet_au_data
-      else mainnet_au_data @ !campaign_au_data
-    | Consensus.Testnet4 ->
-      if !campaign_au_data = [] then testnet4_au_data
-      else testnet4_au_data @ !campaign_au_data
-    | Consensus.Regtest -> !regtest_au_data
-    | _ -> []
-  in
-  List.sort compare (List.map (fun p -> p.height) candidates)
+  List.sort compare
+    (List.map (fun p -> p.height) (assumeutxo_params_list network))
 
 (* ============================================================================
    Development-only whitelist escape — HASHHOG_UNSAFE_SNAPSHOT_HEIGHT
@@ -1439,6 +1446,11 @@ let load_snapshot_into_primary
                put_base_tail_headers and hotbuns seedHeader. *)
             Storage.ChainDB.set_header_tip db metadata.base_blockhash
               params.height;
+            (* Core ActivateSnapshot copies AssumeutxoData.m_chain_tx_count
+               onto the snapshot-base CBlockIndex so getchaintxstats is
+               defined without historical bodies. *)
+            Storage.ChainDB.store_chain_tx_count db metadata.base_blockhash
+              params.chain_tx_count;
             Ok {
               base_blockhash = metadata.base_blockhash;
               base_height = params.height;

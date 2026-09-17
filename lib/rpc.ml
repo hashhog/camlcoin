@@ -78,6 +78,20 @@ let rpc_deserialization_error = -22
 let rpc_verify_error = -25
 let rpc_verify_rejected = -26
 
+(* Test-only: when > 0, the synchronous dispatcher sleeps this many
+   seconds on non-monitoring methods so a concurrent-RPC control can
+   prove getblockcount is not blocked. Production leaves this at 0. *)
+let test_sync_sleep_s = ref 0.0
+
+let is_monitoring_rpc = function
+  | "getblockcount" | "getbestblockhash" | "uptime" | "getrpcinfo" ->
+    true
+  | _ -> false
+
+(* Serialises non-monitoring RPC handlers on the preemptive pool so two
+   writers cannot interleave, while getblockcount stays on the Lwt loop. *)
+let rpc_worker_mutex = Mutex.create ()
+
 (* Core uvTypeName (univalue.cpp:217-226): the wire type name used in
    "JSON value of type <type> is not of expected type ..." messages. *)
 let core_uvtype (v : Yojson.Safe.t) : string =
@@ -10249,6 +10263,8 @@ let activate_loaded_snapshot (ctx : rpc_context)
      | Some (_, h) when h >= base_height -> ()
      | _ -> Storage.ChainDB.batch_set_header_tip batch base_hash base_height);
     Storage.ChainDB.batch_write ctx.chain.db batch;
+    Storage.ChainDB.store_chain_tx_count ctx.chain.db base_hash
+      params.chain_tx_count;
     (* In-memory validated tip. getblockcount reads [blocks_synced];
        getbestblockhash uses [Sync.block_tip], which prefers the active
        chain at that height. Do not rewind [chain.tip] (best-work header)
@@ -13297,45 +13313,102 @@ let handle_checkpayjoinreplay (params : Yojson.Safe.t list)
 
 (* ----- getchaintxstats — chain transaction statistics ----- *)
 
-(* Core m_chain_tx_count analogue: the cumulative number of transactions in
-   the active chain from genesis up to and including [height].  Bitcoin Core
-   stores this as a running counter on each CBlockIndex (chain.h:129); we
-   reconstruct it on demand by summing the per-block tx count over the active
-   chain.  Every connected block records its tx count in the dedicated ntx
-   index (see [Storage.ChainDB.store_block_ntx], written on every IBD /
-   generate / submitblock connect), so this is an index lookup per height; if
-   the ntx index is missing for some height we fall back to counting the
-   stored block body.  Returns the cumulative count, exactly matching Core's
-   m_chain_tx_count for a standard (non-assumeutxo) chain. *)
-let chain_tx_count_at_height (ctx : rpc_context) (height : int) : int =
+(* Core m_chain_tx_count analogue (chain.h:129). Stored per block hash at
+   connect as parent.m_chain_tx_count + nTx (validation.cpp ConnectTip).
+   getchaintxstats is then an O(1) read. A 0..height walk of the sparse ntx
+   index was both wrong (historical bodies are often absent) and ~80 s on
+   mainnet. *)
+
+let json_count (n : int64) : Yojson.Safe.t =
+  if n >= Int64.of_int min_int && n <= Int64.of_int max_int then
+    `Int (Int64.to_int n)
+  else `Intlit (Int64.to_string n)
+
+let ntx_of_hash (db : Storage.ChainDB.t) (hash : Types.hash256) (height : int)
+    : int option =
+  match Storage.ChainDB.get_block_ntx db hash with
+  | Some n -> Some n
+  | None ->
+    (match Storage.ChainDB.get_block_ntx_from_body db hash with
+     | Some n -> Some n
+     | None -> if height = 0 then Some 1 else None)
+
+let seed_chain_tx_anchors (ctx : rpc_context) : unit =
   let db = ctx.chain.db in
-  let total = ref 0 in
-  for h = 0 to height do
-    match Sync.get_header_at_height ctx.chain h with
+  let genesis_hash = ctx.network.Consensus.genesis_hash in
+  (match Storage.ChainDB.get_chain_tx_count db genesis_hash with
+   | None -> Storage.ChainDB.store_chain_tx_count db genesis_hash 1L
+   | Some _ -> ());
+  List.iter
+    (fun (p : Assume_utxo.assumeutxo_params) ->
+      match Storage.ChainDB.get_chain_tx_count db p.blockhash with
+      | None ->
+        Storage.ChainDB.store_chain_tx_count db p.blockhash p.chain_tx_count
+      | Some _ -> ())
+    (Assume_utxo.assumeutxo_params_list ctx.network)
+
+let reconstruct_chain_tx (ctx : rpc_context) (target : Sync.header_entry)
+    : int64 option =
+  let db = ctx.chain.db in
+  seed_chain_tx_anchors ctx;
+  (match Storage.ChainDB.get_chain_tx_count db target.hash with
+   | Some n when n <> 0L -> Some n
+   | _ ->
+     let au_anchor =
+       Assume_utxo.assumeutxo_params_list ctx.network
+       |> List.filter (fun (p : Assume_utxo.assumeutxo_params) ->
+              p.height <= target.height)
+       |> List.sort (fun (a : Assume_utxo.assumeutxo_params)
+                         (b : Assume_utxo.assumeutxo_params) ->
+              compare b.height a.height)
+     in
+     let start_h, start_n =
+       match au_anchor with
+       | p :: _ ->
+         (match Storage.ChainDB.get_chain_tx_count db p.blockhash with
+          | Some n -> (p.height, n)
+          | None -> (p.height, p.chain_tx_count))
+       | [] -> (0, 1L)
+     in
+     if start_h = target.height then Some start_n
+     else begin
+       let acc = ref start_n in
+       for h = start_h + 1 to target.height do
+         match Storage.ChainDB.get_hash_at_height db h with
+         | None -> ()
+         | Some hash ->
+           (match Storage.ChainDB.get_chain_tx_count db hash with
+            | Some n when n <> 0L -> acc := n
+            | _ ->
+              let ntx =
+                match ntx_of_hash db hash h with
+                | Some n -> n
+                | None -> 0
+              in
+              acc := Int64.add !acc (Int64.of_int ntx);
+              Storage.ChainDB.store_chain_tx_count db hash !acc)
+       done;
+       Storage.ChainDB.store_chain_tx_count db target.hash !acc;
+       Some !acc
+     end)
+
+let chain_tx_count_at_entry (ctx : rpc_context) (entry : Sync.header_entry)
+    : int64 option =
+  match Storage.ChainDB.get_chain_tx_count ctx.chain.db entry.hash with
+  | Some n when n <> 0L -> Some n
+  | _ -> reconstruct_chain_tx ctx entry
+
+let sum_window_ntx (ctx : rpc_context) ~(from_h : int) ~(to_h : int) : int64 =
+  let acc = ref 0L in
+  for h = from_h to to_h do
+    match Storage.ChainDB.get_hash_at_height ctx.chain.db h with
     | None -> ()
-    | Some entry ->
-      let ntx =
-        match Storage.ChainDB.get_block_ntx db entry.hash with
-        | Some n -> n
-        | None ->
-          (match Storage.ChainDB.get_block db entry.hash with
-           | Some block ->
-             let n = List.length block.transactions in
-             (* Cache for subsequent calls *)
-             Storage.ChainDB.store_block_ntx db entry.hash n;
-             n
-           | None ->
-             (* Genesis (height 0) carries exactly one transaction — the
-                genesis coinbase — on every Bitcoin network, but its body is
-                never persisted to the block CF (only the header lives in
-                chainparams), so both the ntx index and the body lookup miss.
-                Core counts it in m_chain_tx_count (genesis nChainTx = 1),
-                so a faithful txcount must include it. *)
-             if h = 0 then 1 else 0)
-      in
-      total := !total + ntx
+    | Some hash ->
+      (match ntx_of_hash ctx.chain.db hash h with
+       | Some n -> acc := Int64.add !acc (Int64.of_int n)
+       | None -> ())
   done;
-  !total
+  !acc
 
 (* getchaintxstats ( nblocks "blockhash" )
    Faithful port of Bitcoin Core src/rpc/blockchain.cpp:1809-1898.
@@ -13431,31 +13504,43 @@ let handle_getchaintxstats (ctx : rpc_context)
        in
        (* time = the FINAL block's RAW header nTime (NOT mediantime). *)
        let final_time = Int32.to_int pindex.header.timestamp in
-       let txcount = chain_tx_count_at_height ctx pindex.height in
-       let past_txcount = match past_block with
-         | Some pb -> chain_tx_count_at_height ctx pb.height
-         | None -> 0
+       let txcount_opt = chain_tx_count_at_entry ctx pindex in
+       let past_txcount_opt =
+         match past_block with
+         | Some pb -> chain_tx_count_at_entry ctx pb
+         | None -> Some 0L
        in
-       let base = [
-         ("time", `Int final_time);
-         (* txcount is optional in Core (absent under assumeutxo); on a normal
-            chain it is always present. *)
-         ("txcount", `Int txcount);
-         ("window_final_block_hash",
-          `String (Types.hash256_to_hex_display pindex.hash));
-         ("window_final_block_height", `Int pindex.height);
-         ("window_block_count", `Int blockcount);
-       ] in
+       let base =
+         [ ("time", `Int final_time) ]
+         @ (match txcount_opt with
+            | Some n -> [ ("txcount", json_count n) ]
+            | None -> [])
+         @ [
+             ("window_final_block_hash",
+              `String (Types.hash256_to_hex_display pindex.hash));
+             ("window_final_block_height", `Int pindex.height);
+             ("window_block_count", `Int blockcount);
+           ]
+       in
        let fields =
          if blockcount > 0 then begin
            let f = base @ [("window_interval", `Int time_diff)] in
-           (* window_tx_count only when txcount exists for both ends. On a
-              normal chain both are known. *)
-           let window_tx_count = txcount - past_txcount in
-           let f = f @ [("window_tx_count", `Int window_tx_count)] in
-           (* txrate only when window_interval > 0. *)
+           let window_tx_count =
+             match (txcount_opt, past_txcount_opt) with
+             | Some a, Some b -> Int64.sub a b
+             | _ ->
+               sum_window_ntx ctx ~from_h:(past_height + 1)
+                 ~to_h:pindex.height
+           in
+           let f = f @ [("window_tx_count", json_count window_tx_count)] in
            if time_diff > 0 then
-             f @ [("txrate", `Float (float_of_int window_tx_count /. float_of_int time_diff))]
+             f
+             @ [
+                 ( "txrate",
+                   `Float
+                     (Int64.to_float window_tx_count /. float_of_int time_diff)
+                 );
+               ]
            else f
          end
          else base
@@ -15639,6 +15724,8 @@ let handle_single_request (ctx : rpc_context) (json : Yojson.Safe.t)
        | None -> `Null)
     | _ -> `Null
   in
+  if !test_sync_sleep_s > 0. && not (is_monitoring_rpc method_name) then
+    Unix.sleepf !test_sync_sleep_s;
   match dispatch_rpc ctx method_name params with
   | Ok r -> json_rpc_response ~id ~result:r
   | Error (code, message) -> json_rpc_error ~id ~code ~message
@@ -15682,8 +15769,19 @@ let handle_single_request_lwt (ctx : rpc_context) (json : Yojson.Safe.t)
       | Error (code, message) ->
         Lwt.return (json_rpc_error ~id ~code ~message))
   | None ->
-    (* Non-wait method: synchronous dispatch (unchanged behaviour). *)
-    Lwt.return (handle_single_request ctx json)
+    (* Monitoring RPCs stay on the Lwt loop so a slow handler cannot make
+       getblockcount look DOWN. Everything else runs on the preemptive
+       pool (Core -rpcthreads). *)
+    if is_monitoring_rpc method_name then
+      Lwt.return (handle_single_request ctx json)
+    else
+      Lwt_preemptive.detach
+        (fun () ->
+          Mutex.lock rpc_worker_mutex;
+          Fun.protect
+            ~finally:(fun () -> Mutex.unlock rpc_worker_mutex)
+            (fun () -> handle_single_request ctx json))
+        ()
 
 (* Handle a batch of JSON-RPC requests in parallel *)
 let handle_batch_request (ctx : rpc_context) (requests : Yojson.Safe.t list)

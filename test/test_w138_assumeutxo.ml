@@ -434,30 +434,23 @@ let test_g16_set_chain_tip_after_load () =
     "G16: load_snapshot sets chain_tip after bulk coin load"
     true src_has
 
-(* G17: m_chain_tx_count write-back — Core 5949 — absent (BUG-W138-5). *)
-let test_g17_chain_tx_count_writeback_absent () =
+(* G17: m_chain_tx_count write-back — Core ActivateSnapshot / 5949. *)
+let test_g17_chain_tx_count_writeback () =
   let src_has_field = source_contains ~path:(assume_utxo_ml ())
                         ~needle:"chain_tx_count" in
   let src_has_writeback = source_contains ~path:(assume_utxo_ml ())
                             ~needle:"params.chain_tx_count" in
-  (* rpc.ml now has its own m_chain_tx_count analogue
-     (chain_tx_count_at_height, a per-height recount for getchaintxstats);
-     the pin is about consulting the SNAPSHOT PARAMS' chain_tx_count, so
-     look for that field access specifically. *)
   let rpc_has_writeback = source_contains ~path:(rpc_ml ())
-                            ~needle:".chain_tx_count" in
+                            ~needle:"params.chain_tx_count" in
   Alcotest.(check bool)
-    "G17: assumeutxo_params.chain_tx_count field exists (W47 work)"
+    "G17: assumeutxo_params.chain_tx_count field exists"
     true src_has_field;
-  (* The field exists but is never propagated into the block index. *)
   Alcotest.(check bool)
-    "G17: load_snapshot does NOT write params.chain_tx_count into chain \
-     index (BUG-W138-5 P0-CDIV: getblockheader.nTx wrong for snapshot tip)"
-    false src_has_writeback;
+    "G17: load_snapshot writes params.chain_tx_count onto the snapshot base"
+    true src_has_writeback;
   Alcotest.(check bool)
-    "G17: rpc.ml does not consult chain_tx_count for getblockheader.nTx \
-     on snapshot-tip blocks"
-    false rpc_has_writeback
+    "G17: activate_loaded_snapshot writes params.chain_tx_count"
+    true rpc_has_writeback
 
 (* G18: BLOCK_OPT_WITNESS faking on snapshot chain index — absent
    (BUG-W138-6). camlcoin has no nStatus bitfield, so the immediate impact
@@ -806,8 +799,8 @@ let () =
     "g16_g20_post_load_finalization", [
       Alcotest.test_case "G16: set_chain_tip after bulk load" `Quick
         test_g16_set_chain_tip_after_load;
-      Alcotest.test_case "G17: chain_tx_count writeback absent (BUG-5 P0)" `Quick
-        test_g17_chain_tx_count_writeback_absent;
+      Alcotest.test_case "G17: chain_tx_count writeback present" `Quick
+        test_g17_chain_tx_count_writeback;
       Alcotest.test_case "G18: BLOCK_OPT_WITNESS faking absent (BUG-6)" `Quick
         test_g18_block_opt_witness_faking_absent;
       Alcotest.test_case "G19: base_blockhash sidecar absent (BUG-7)" `Quick

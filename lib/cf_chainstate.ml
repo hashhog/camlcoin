@@ -369,6 +369,41 @@ let get_block_ntx (t : t) (hash : Types.hash256) : int option =
     Some (b0 lor (b1 lsl 8) lor (b2 lsl 16) lor (b3 lsl 24))
   | Some _ -> None
 
+(* Core CBlockIndex.m_chain_tx_count analogue: cumulative transaction
+   count from genesis (or an assumeUTXO base) through this block,
+   keyed by "c:" + 32-byte raw block hash in the chain_state CF.
+   Written once at connect (parent.m_chain_tx_count + nTx) so
+   getchaintxstats is an O(1) read instead of a 0..height walk. *)
+let chain_tx_key (hash : Types.hash256) : string =
+  "c:" ^ Cstruct.to_string hash
+
+let put_chain_tx_count (t : t) (hash : Types.hash256) (n : int64) =
+  let buf = Bytes.create 8 in
+  let rec write i v =
+    if i < 8 then begin
+      Bytes.set buf i
+        (Char.chr (Int64.to_int (Int64.logand v 0xFFL)));
+      write (i + 1) (Int64.shift_right_logical v 8)
+    end
+  in
+  write 0 n;
+  Rocksdb.cf_put t.db t.cfh_chain_state (chain_tx_key hash)
+    (Bytes.to_string buf)
+
+let get_chain_tx_count (t : t) (hash : Types.hash256) : int64 option =
+  match Rocksdb.cf_get t.db t.cfh_chain_state (chain_tx_key hash) with
+  | None -> None
+  | Some s when String.length s >= 8 ->
+    let rec read i acc =
+      if i = 8 then acc
+      else
+        let b = Int64.of_int (Char.code s.[i]) in
+        read (i + 1)
+          (Int64.logor acc (Int64.shift_left b (8 * i)))
+    in
+    Some (read 0 0L)
+  | Some _ -> None
+
 (* Undo data, keyed by 32-byte block hash *)
 let put_undo_data (t : t) (hash : Types.hash256) (data : string) =
   Rocksdb.cf_put t.db t.cfh_undo_data (Cstruct.to_string hash) data

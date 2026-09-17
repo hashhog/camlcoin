@@ -490,6 +490,10 @@ type t = {
      CWallet::m_last_block_processed / GetLastBlockHeight in Bitcoin Core,
      which the wallet uses to drive the startup catch-up scan. *)
   mutable last_synced_height : int;
+  (* Manager-facing wallet name (createwallet / loadwallet argument).
+     Distinct from the "" default slot the same object may also occupy.
+     Surfaces as getwalletinfo.walletname. *)
+  mutable name : string;
 }
 
 (* ============================================================================
@@ -528,6 +532,7 @@ let create ~(network : [`Mainnet | `Testnet | `Regtest])
     disable_private_keys = false;
     blank = false;
     last_synced_height = -1;
+    name = "";
   }
 
 (* ============================================================================
@@ -2921,6 +2926,7 @@ let wallet_to_json (w : t) : Yojson.Safe.t =
      `List (List.map (fun s -> `String (cstruct_to_hex s)) w.watch_scripts));
     ("disable_private_keys", `Bool w.disable_private_keys);
     ("blank", `Bool w.blank);
+    ("name", `String w.name);
   ]
 
 (* Save wallet to file (unencrypted).  Atomic + durable: writes to a temp file,
@@ -3084,6 +3090,8 @@ let load_wallet_json (w : t) (network : [`Mainnet | `Testnet | `Regtest]) (json 
      | Some (`Bool b) -> w.disable_private_keys <- b | _ -> ());
     (match List.assoc_opt "blank" fields with
      | Some (`Bool b) -> w.blank <- b | _ -> ());
+    (match List.assoc_opt "name" fields with
+     | Some (`String n) -> w.name <- n | _ -> ());
 
     (* Load transaction history *)
     (match List.assoc_opt "tx_history" fields with
@@ -3673,6 +3681,7 @@ let load_wallet (wm : wallet_manager) (name : string) : (t, string) result =
     Error (Printf.sprintf "Wallet \"%s\" not found at %s" name path)
   else begin
     let wallet = load ~network:wm.network ~db_path:path in
+    wallet.name <- name;
     Hashtbl.replace wm.wallets name wallet;
     Ok wallet
   end
@@ -3688,6 +3697,7 @@ let load_wallet_encrypted (wm : wallet_manager) (name : string) ~(passphrase : s
   else
     match load_encrypted ~network:wm.network ~db_path:path ~passphrase with
     | Ok wallet ->
+      wallet.name <- name;
       Hashtbl.replace wm.wallets name wallet;
       Ok wallet
     | Error e -> Error e
@@ -3716,6 +3726,7 @@ let create_wallet (wm : wallet_manager) (name : string) ?(options = default_wall
        importdescriptors-privkey-rejection behave per WALLET_FLAG_*. *)
     wallet.disable_private_keys <- options.disable_private_keys;
     wallet.blank <- options.blank;
+    wallet.name <- name;
     (* Initialize with HD seed unless blank or private keys disabled *)
     if not options.blank && not options.disable_private_keys then begin
       let mnemonic = Bip39.generate_mnemonic ~strength:128 () in
@@ -3834,11 +3845,24 @@ type wallet_info = {
   scanning : bool;
   descriptors : bool;
   external_signer : bool;
+  blank : bool;
 }
+
+(* Core wallet.cpp:116-128 iterates bits 0..63 of GetWalletFlags and emits
+   WALLET_FLAG_TO_STRING names. camlcoin models the operator-visible subset
+   and emits them in that bit order. descriptor_wallet is always set:
+   createwallet refuses descriptors=false. *)
+let wallet_flag_names (w : t) : string list =
+  let flags = [] in
+  let flags =
+    if w.disable_private_keys then flags @ ["disable_private_keys"] else flags in
+  let flags = if w.blank then flags @ ["blank"] else flags in
+  flags @ ["descriptor_wallet"]
 
 let get_wallet_info (name : string) (w : t) : wallet_info =
   let confirmed, unconfirmed = get_balance w in
-  { wallet_name = name;
+  let wallet_name = if name <> "" then name else w.name in
+  { wallet_name;
     wallet_version = 169900;  (* Bitcoin Core 0.16.99 format *)
     format = "sqlite";
     tx_count = List.length w.tx_history;
@@ -3856,6 +3880,7 @@ let get_wallet_info (name : string) (w : t) : wallet_info =
     scanning = false;
     descriptors = true;
     external_signer = false;
+    blank = w.blank;
   }
 
 (* Shutdown wallet manager, flushing all wallets *)

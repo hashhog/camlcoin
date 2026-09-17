@@ -94,6 +94,11 @@
   "required": 0,
   "sig": "getaddrmaninfo"
  },
+ "getbalances": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getbalances"
+ },
  "getbestblockhash": {
   "declared": 0,
   "required": 0,
@@ -278,6 +283,11 @@
   "declared": 2,
   "required": 1,
   "sig": "gettxspendingprevout [{\"txid\":\"hex\",\"vout\":n},...] ( {\"mempool_only\":bool,\"return_spending_tx\":bool,...} )"
+ },
+ "getwalletinfo": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getwalletinfo"
  },
  "help": {
   "declared": 1,

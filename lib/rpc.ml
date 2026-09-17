@@ -4287,6 +4287,33 @@ let handle_listwallets (ctx : rpc_context)
     let names = Wallet.list_wallets wm in
     `List (List.map (fun n -> `String n) names)
 
+(* Core AppendLastProcessedBlock (wallet/rpc/util.cpp:159-166):
+   {hash, height} of CWallet::GetLastBlockHash/Height. After
+   BlockUntilSyncedToCurrentChain that is the chain tip; camlcoin's
+   last_synced_height is the same locator, falling back to the tip when
+   the wallet has not scanned yet. *)
+let last_processed_block_json (ctx : rpc_context) (wallet : Wallet.t)
+    : Yojson.Safe.t =
+  let tip_h, tip_hash = match ctx.chain.Sync.tip with
+    | Some t -> (t.Sync.height, t.Sync.hash)
+    | None -> (0, Types.zero_hash)
+  in
+  let height =
+    if wallet.Wallet.last_synced_height >= 0 then
+      min wallet.Wallet.last_synced_height tip_h
+    else tip_h
+  in
+  let hash =
+    if height = tip_h then tip_hash
+    else match Storage.ChainDB.get_hash_at_height ctx.chain.db height with
+      | Some h -> h
+      | None -> tip_hash
+  in
+  `Assoc [
+    ("hash", `String (Types.hash256_to_hex_display hash));
+    ("height", `Int height);
+  ]
+
 (* getwalletinfo - returns info about the currently selected wallet *)
 let handle_getwalletinfo (ctx : rpc_context)
     (wallet_name : string option) (_params : Yojson.Safe.t list)
@@ -4310,6 +4337,10 @@ let handle_getwalletinfo (ctx : rpc_context)
       ("scanning", `Bool info.scanning);
       ("descriptors", `Bool info.descriptors);
       ("external_signer", `Bool info.external_signer);
+      ("blank", `Bool info.blank);
+      ("flags", `List (List.map (fun s -> `String s)
+                         (Wallet.wallet_flag_names wallet)));
+      ("lastprocessedblock", last_processed_block_json ctx wallet);
     ])
 
 (* ============================================================================
@@ -11000,6 +11031,7 @@ let handle_getbalances (ctx : rpc_context)
         ("untrusted_pending", to_btc 0L);
         ("immature", to_btc 0L);
       ]);
+      ("lastprocessedblock", last_processed_block_json ctx wallet);
     ])
 
 let handle_scantxoutset (ctx : rpc_context)
@@ -12021,7 +12053,9 @@ let handle_help (_ctx : rpc_context)
       "";
       "== Wallet ==";
       "getbalance";
+      "getbalances";
       "getnewaddress";
+      "getwalletinfo";
       "listtransactions ( count skip )";
       "listunspent";
       "lockunspent unlock ( [{\"txid\":\"...\", \"vout\":n},...] persistent )";

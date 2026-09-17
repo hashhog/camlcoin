@@ -316,15 +316,16 @@ let g16_verify_error_NOT_routed () =
     (Printf.sprintf "G16 rpc_verify_error routed >= 1 time (Core rpc/mining.cpp RPC_VERIFY_ERROR -25), got %d" n)
     true (n >= 1)
 
-let g16_submitblock_routes_through_wrong_code () =
-  (* Confirm the BUG-3 mis-routing: submitblock uses
-     rpc_verify_rejected (-26) instead of rpc_verify_error (-25). *)
+let g16_submitblock_decode_is_deserialization () =
+  (* DecodeHexBlk failure is RPC_DESERIALIZATION_ERROR (-22)
+     "Block decode failed" (mining.cpp). Other submitblock errors stay
+     BIP-22 / rpc_verify_rejected. *)
   let src = rpc_ml () in
   Alcotest.(check bool)
-    "G16 BUG-3: submitblock currently routes Error -> rpc_verify_rejected"
+    "G16 submitblock decode-failed routes to rpc_deserialization_error"
     true
-    (contains_substring src
-       "\"submitblock\" ->\n    (match handle_submitblock ctx params with\n     | Ok r -> Ok r\n     | Error msg -> Error (rpc_verify_rejected,")
+    (contains_substring src "Error msg when msg = \"Block decode failed\""
+     && contains_substring src "rpc_deserialization_error")
 
 (* -- G17 RPC_VERIFY_REJECTED -26 PRESENT ------------------------------ *)
 
@@ -589,8 +590,8 @@ let () =
     "G16 RPC_VERIFY_ERROR -25 PARTIAL (BUG-3)", [
       test_case "declared" `Quick g16_verify_error_declared;
       test_case "NOT routed" `Quick g16_verify_error_NOT_routed;
-      test_case "submitblock currently uses wrong code" `Quick
-        g16_submitblock_routes_through_wrong_code;
+      test_case "submitblock decode-failed is -22" `Quick
+        g16_submitblock_decode_is_deserialization;
     ];
     "G17 RPC_VERIFY_REJECTED -26 PRESENT", [
       test_case "declared" `Quick g17_verify_rejected_declared;

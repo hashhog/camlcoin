@@ -610,7 +610,8 @@ let test_g26_no_joinpsbts_rpc () =
      (lib/rpc.ml handle_joinpsbts + dispatch; test_w142_joinpsbts covers it). *)
   Alcotest.(check bool) "G26: joinpsbts RPC present (BUG-W137-20 fixed)" true has
 
-(* G27: descriptorprocesspsbt RPC absent (BUG-W137-21). *)
+(* G27: descriptorprocesspsbt RPC (BUG-W137-21). Closed by the R5
+   error-code class: handle_descriptorprocesspsbt + dispatch + help. *)
 let test_g27_no_descriptorprocesspsbt_rpc () =
   let src = rpc_ml () in
   let has =
@@ -618,8 +619,8 @@ let test_g27_no_descriptorprocesspsbt_rpc () =
     || source_contains ~path:src ~needle:"\"descriptorprocesspsbt\""
   in
   Alcotest.(check bool)
-    "G27: descriptorprocesspsbt RPC absent (BUG-W137-21)"
-    false has
+    "G27: descriptorprocesspsbt RPC present (BUG-W137-21 fixed)"
+    true has
 
 (* G28: psbtbumpfee RPC absent (BUG-W137-22). *)
 let test_g28_no_psbtbumpfee_rpc () =

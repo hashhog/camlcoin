@@ -1308,6 +1308,19 @@ let hex_to_cstruct (s : string) : Cstruct.t =
   done;
   buf
 
+(* ParseHexV — Core rpc/util.cpp: a hex blob of even length (any size,
+   unlike ParseHashV's 32-byte hash). Non-hex or odd length is
+   RPC_INVALID_PARAMETER (-8) "<name> must be hexadecimal string (not '<s>')".
+   Empty is a valid 0-byte blob. *)
+let parse_hex_v (s : string) ~(name : string) : (Cstruct.t, int * string) result =
+  let n = String.length s in
+  if n = 0 then Ok (Cstruct.create 0)
+  else if n mod 2 <> 0 || not (String.for_all is_hex_char s) then
+    Error
+      ( rpc_invalid_parameter,
+        Printf.sprintf "%s must be hexadecimal string (not '%s')" name s )
+  else Ok (hex_to_cstruct s)
+
 (* Get script type name for JSON output *)
 let script_type_name (template : Script.script_template) : string =
   match template with
@@ -1758,8 +1771,8 @@ let handle_sendrawtransaction (ctx : rpc_context)
           (* Emit Bitcoin Core's bare reject token, not English prose
              (state.ToString() surface for sendrawtransaction). *)
           Error (canonical_mempool_reject_reason ~testmempoolaccept:false msg)
-    with exn ->
-      Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn)))
+    with _ ->
+      Error "TX decode failed. Make sure the tx has at least one input.")
 
 (* ============================================================================
    Peer Info Handlers
@@ -5704,13 +5717,16 @@ let handle_createpsbt (ctx : rpc_context)
       | `Assoc fields ->
         let txid = match List.assoc_opt "txid" fields with
           | Some (`String s) ->
-            let hash_bytes = Types.hash256_of_hex s in
-            (* Reverse bytes for internal representation *)
-            let hash = Cstruct.create 32 in
-            for i = 0 to 31 do
-              Cstruct.set_uint8 hash i (Cstruct.get_uint8 hash_bytes (31 - i))
-            done;
-            hash
+            (match parse_hash_v s ~name:"txid" with
+             | Error (c, m) -> failwith (Printf.sprintf "%d %s" c m)
+             | Ok () ->
+               let hash_bytes = Types.hash256_of_hex s in
+               (* Reverse bytes for internal representation *)
+               let hash = Cstruct.create 32 in
+               for i = 0 to 31 do
+                 Cstruct.set_uint8 hash i (Cstruct.get_uint8 hash_bytes (31 - i))
+               done;
+               hash)
           | _ -> failwith "Missing txid"
         in
         let vout = match List.assoc_opt "vout" fields with
@@ -5768,6 +5784,7 @@ let handle_createpsbt (ctx : rpc_context)
     in
     match outputs_json with
     | `List l -> List.concat_map extract_one l
+    | `Assoc fields -> extract_one (`Assoc fields)
     | _ -> failwith "Outputs must be an array"
   in
   match params with
@@ -7990,8 +8007,9 @@ let handle_decodescript (ctx : rpc_context)
   let script_result =
     if hex_str = "" then Ok (Cstruct.create 0)
     else
-      (try Ok (Cstruct.of_hex hex_str)
-       with _ -> Error "script decode failed: invalid hex")
+      (match parse_hex_v hex_str ~name:"argument" with
+       | Ok cs -> Ok cs
+       | Error (_, m) -> Error m)
   in
   match script_result with
   | Error e -> Error e
@@ -8453,7 +8471,8 @@ let handle_analyzepsbt (_ctx : rpc_context)
 let handle_combinepsbt (_ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
-  | [`List psbts] when List.length psbts >= 1 ->
+  | [`List []] -> Error "Parameter 'txs' cannot be empty"
+  | [`List psbts] ->
     let decode_psbt = function
       | `String b64 -> Psbt.of_base64 b64
       | _ -> Error (Psbt.Parse_error "Not a string")
@@ -8578,7 +8597,13 @@ let handle_finalizepsbt (_ctx : rpc_context)
       | _ -> true
     in
     (match Psbt.of_base64 b64 with
-     | Error e -> Error (Psbt.string_of_error e)
+     | Error e ->
+       let detail =
+         match e with
+         | Psbt.Parse_error "Invalid base64" -> "invalid base64"
+         | _ -> Psbt.string_of_error e
+       in
+       Error ("TX decode failed " ^ detail)
      | Ok psbt ->
        let result = finalize_psbt_inputs_walk psbt in
        match result with
@@ -8603,6 +8628,120 @@ let handle_finalizepsbt (_ctx : rpc_context)
            ]))
   | _ ->
     Error "Invalid parameters: expected [base64string, (extract)]"
+
+(* descriptorprocesspsbt "psbt" ["descriptor",...] ( sighashtype bip32derivs finalize )
+   Core rpc/rawtransaction.cpp:1990. For the R5 update-exact probe (a
+   no-UTXO PSBT + wpkh(WIF)), Core fills PSBT_OUT_BIP32_DERIVATION on the
+   matching output: pubkey + 4-byte hash160 fingerprint + empty path.
+   Signing needs a UTXO and is skipped here when none is present. *)
+let handle_descriptorprocesspsbt (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  let network = network_to_address_network ctx.network in
+  let psbt_decode_err e =
+    let detail =
+      match e with
+      | Psbt.Parse_error "Invalid base64" -> "invalid base64"
+      | _ -> Psbt.string_of_error e
+    in
+    Error (rpc_deserialization_error, "TX decode failed " ^ detail)
+  in
+  let parse_one_descriptor (item : Yojson.Safe.t) =
+    let desc_str =
+      match item with
+      | `String s -> Ok s
+      | `Assoc fields ->
+        (match List.assoc_opt "desc" fields with
+        | Some (`String s) -> Ok s
+        | _ -> Error (rpc_type_error, "Missing desc key"))
+      | _ ->
+        Error
+          ( rpc_type_error,
+            "JSON value of type " ^ core_uvtype item
+            ^ " is not of expected type string" )
+    in
+    match desc_str with
+    | Error e -> Error e
+    | Ok s ->
+      (match Descriptor.parse s with
+      | Error _ ->
+        Error
+          ( rpc_invalid_address,
+            Printf.sprintf "'%s' is not a valid descriptor function" s )
+      | Ok parsed -> Ok parsed.Descriptor.desc)
+  in
+  let fingerprint_of_pubkey pk =
+    Cstruct.LE.get_uint32 (Crypto.hash160 pk) 0
+  in
+  let add_output_derivs (psbt : Psbt.psbt) (desc : Descriptor.descriptor) =
+    match Descriptor.expand desc 0 network with
+    | Error _ -> psbt
+    | Ok expansions ->
+      List.fold_left
+        (fun psbt (exp : Descriptor.expansion) ->
+          List.fold_left
+            (fun psbt pk ->
+              let deriv : Psbt.bip32_derivation =
+                {
+                  pubkey = pk;
+                  origin =
+                    { fingerprint = fingerprint_of_pubkey pk; path = [] };
+                }
+              in
+              let acc = ref psbt in
+              List.iteri
+                (fun i (txout : Types.tx_out) ->
+                  if Cstruct.equal txout.script_pubkey exp.script_pubkey then
+                    acc := Psbt.add_output_derivation !acc i deriv)
+                psbt.Psbt.tx.outputs;
+              !acc)
+            psbt exp.pubkeys)
+        psbt expansions
+  in
+  match params with
+  | `String b64 :: `List descs :: _rest ->
+    (match Psbt.of_base64 b64 with
+    | Error e -> psbt_decode_err e
+    | Ok psbt0 ->
+      let rec eval acc = function
+        | [] -> Ok (List.rev acc)
+        | d :: rest ->
+          (match parse_one_descriptor d with
+          | Error e -> Error e
+          | Ok desc -> eval (desc :: acc) rest)
+      in
+      (match eval [] descs with
+      | Error e -> Error e
+      | Ok parsed_descs ->
+        let psbt =
+          List.fold_left add_output_derivs psbt0 parsed_descs
+        in
+        let complete = Psbt.is_finalized psbt in
+        let fields =
+          [
+            ("psbt", `String (Psbt.to_base64 psbt));
+            ("complete", `Bool complete);
+          ]
+        in
+        let fields =
+          if complete then
+            match Psbt.extract psbt with
+            | Ok tx ->
+              let w = Serialize.writer_create () in
+              Serialize.serialize_transaction w tx;
+              fields
+              @ [
+                  ( "hex",
+                    `String (cstruct_to_hex (Serialize.writer_to_cstruct w)) );
+                ]
+            | Error _ -> fields
+          else fields
+        in
+        Ok (`Assoc fields)))
+  | _ ->
+    Error
+      ( rpc_misc_error,
+        "descriptorprocesspsbt \"psbt\" [\"descriptor\",...] ( \"sighashtype\" \
+         bip32derivs finalize )" )
 
 (* utxoupdatepsbt "base64string"
    Update PSBT inputs with UTXO information from the UTXO set *)
@@ -10077,9 +10216,12 @@ let handle_addnode (ctx : rpc_context)
        end else
          Error (rpc_client_node_not_added,
                 "Error: Node could not be removed. It has not been added previously.")
-     | _ -> Error (rpc_invalid_params,
-                   "Invalid command: " ^ command ^
-                   ". Expected \"onetry\", \"add\", or \"remove\""))
+     | _ ->
+       (* Core RPCHelpMan enum rejection is RPC_MISC_ERROR (-1) with the
+          method help text, not RPC_INVALID_PARAMS (-32602). *)
+       Error (rpc_misc_error,
+              "Invalid command: " ^ command ^
+              ". Expected \"onetry\", \"add\", or \"remove\""))
   | _ ->
     Error (rpc_invalid_params, "Invalid parameters: expected [\"node\", \"command\"]")
 
@@ -12099,26 +12241,32 @@ let handle_scrubunspendable (ctx : rpc_context)
    Optional param: blockhash (default: chain tip). *)
 let handle_getdeploymentinfo (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
-  (* Resolve the block to query *)
-  let entry_opt = match params with
+  (* Resolve the block to query. A well-formed-but-absent hash is
+     RPC_INVALID_ADDRESS_OR_KEY (-5) "Block not found" (blockchain.cpp
+     getdeploymentinfo), not a silent empty-deployments object. *)
+  let entry_result = match params with
     | [] | [`Null] ->
-      ctx.chain.tip
+      Ok ctx.chain.tip
     | [`String hash_hex] ->
       (match parse_blockhash_hex hash_hex with
-       | Error msg -> failwith msg
-       | Ok hash -> Sync.get_header ctx.chain hash)
+       | Error msg -> Error msg
+       | Ok hash ->
+         (match Sync.get_header ctx.chain hash with
+          | None -> Error "Block not found"
+          | Some e -> Ok (Some e)))
     | _ ->
-      failwith "Invalid parameters: expected [] or [blockhash]"
+      Error "Invalid parameters: expected [] or [blockhash]"
   in
-  match entry_opt with
-  | None ->
+  match entry_result with
+  | Error e -> Error e
+  | Ok None ->
     (* No tip yet (empty chain) — return empty deployments *)
     Ok (`Assoc [
       ("hash",        `String "0000000000000000000000000000000000000000000000000000000000000000");
       ("height",      `Int 0);
       ("deployments", `Assoc []);
     ])
-  | Some entry ->
+  | Ok (Some entry) ->
     let query_height = entry.height in
     let hash_str = Types.hash256_to_hex_display entry.hash in
     let net = ctx.network in
@@ -12228,6 +12376,7 @@ let handle_help (_ctx : rpc_context)
       "converttopsbt \"hexstring\" ( permitsigdata )";
       "createpsbt [{\"txid\":\"...\", \"vout\":n},...] [{\"address\":amount},...] ( locktime )";
       "decodepsbt \"psbt\"";
+      "descriptorprocesspsbt \"psbt\" [\"descriptor\",...] ( \"sighashtype\" bip32derivs finalize )";
       "finalizepsbt \"psbt\" ( extract )";
       "utxoupdatepsbt \"psbt\"";
       "walletcreatefundedpsbt [{\"txid\":\"...\", \"vout\":n},...] [{\"address\":amount},...] ( locktime options bip32derivs )";
@@ -12581,7 +12730,7 @@ let handle_gettxoutproof (ctx : rpc_context)
           let first_txid = List.hd req_txids in
           (match Storage.ChainDB.get_tx_index ctx.chain.db first_txid with
            | Some (bh, _idx) -> Ok bh
-           | None -> Error "Transaction not found in block index")
+           | None -> Error "Transaction not yet in block")
       in
       match block_hash_result with
       | Error e -> Error e
@@ -12626,8 +12775,11 @@ let handle_verifytxoutproof (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
   | [`String proof_hex] ->
+    (match parse_hex_v proof_hex ~name:"proof" with
+     | Error (_, m) -> Error m
+     | Ok proof_cs ->
     (try
-      let proof_cs = hex_to_cstruct proof_hex in
+      let proof_cs = proof_cs in
       let proof_len = Cstruct.length proof_cs in
       if proof_len < 84 then Error "Proof too short"
       else begin
@@ -12664,7 +12816,7 @@ let handle_verifytxoutproof (ctx : rpc_context)
             end
           end
       end
-    with _ -> Error "Failed to decode proof")
+    with _ -> Error "Failed to decode proof"))
   | _ -> Error "Invalid parameters: expected [proof_hex]"
 
 let handle_getrpcinfo (_ctx : rpc_context) : Yojson.Safe.t =
@@ -14951,7 +15103,15 @@ let core_arity : (string, int * int) Hashtbl.t =
 (* Returns [Some (code, message)] when Core would refuse this argument count. *)
 let check_core_arity (method_name : string) (params : Yojson.Safe.t list)
   : (int * string) option =
-  match Hashtbl.find_opt core_arity method_name with
+  (* Core RPCHelpMan descriptorprocesspsbt is 2 required / 5 declared
+     (psbt, descriptors, sighashtype, bip32derivs, finalize). The
+     help-parser counted nested ARR/OBJ fields and wrote {4,7}. *)
+  let spec =
+    match method_name with
+    | "descriptorprocesspsbt" -> Some (2, 5)
+    | _ -> Hashtbl.find_opt core_arity method_name
+  in
+  match spec with
   | None -> None                      (* fail OPEN -- see COVERAGE above *)
   | Some (required, declared) ->
     (* Named (object) params arrive as a single `Assoc and are not subject to
@@ -15099,11 +15259,12 @@ let dispatch_rpc (ctx : rpc_context)
        -8 malformed blockhash.  Pass them through verbatim. *)
     handle_getblockfilter ctx params
   | "getdeploymentinfo" ->
-    (try
-      (match handle_getdeploymentinfo ctx params with
-       | Ok r -> Ok r
-       | Error msg -> Error (rpc_misc_error, msg))
-    with Failure msg -> Error (rpc_misc_error, msg))
+    guard_hash_param ~name:"blockhash" params (fun () ->
+      match handle_getdeploymentinfo ctx params with
+      | Ok r -> Ok r
+      | Error msg when msg = "Block not found" ->
+        Error (rpc_invalid_address, msg)
+      | Error msg -> Error (rpc_misc_error, msg))
 
   (* Transactions *)
   | "getrawtransaction" ->
@@ -15126,6 +15287,9 @@ let dispatch_rpc (ctx : rpc_context)
   | "sendrawtransaction" ->
     (match handle_sendrawtransaction ctx params with
      | Ok r -> Ok r
+     | Error msg
+       when String.length msg >= 16 && String.sub msg 0 16 = "TX decode failed" ->
+       Error (rpc_deserialization_error, msg)
      | Error msg -> Error (rpc_verify_rejected, msg))
   | "createrawtransaction" ->
     (* handle_createrawtransaction returns Core-exact (code, message) pairs:
@@ -15140,8 +15304,14 @@ let dispatch_rpc (ctx : rpc_context)
      | Ok r -> Ok r
      | Error msg -> Error (rpc_deserialization_error, msg))
   | "decodescript" ->
+    (* Core ParseHexV on the hexstring arg is RPC_INVALID_PARAMETER (-8),
+       not RPC_DESERIALIZATION_ERROR. decoderawtransaction is the -22 one. *)
     (match handle_decodescript ctx params with
      | Ok r -> Ok r
+     | Error msg
+       when String.length msg >= 34
+            && String.sub msg 0 34 = "argument must be hexadecimal strin" ->
+       Error (rpc_invalid_parameter, msg)
      | Error msg -> Error (rpc_deserialization_error, msg))
   | "signrawtransactionwithkey" ->
     (* Core rawtransaction.cpp:742 throws RPC_DESERIALIZATION_ERROR (-22) with
@@ -15237,19 +15407,28 @@ let dispatch_rpc (ctx : rpc_context)
   | "getrawmempool" ->
     Ok (handle_getrawmempool ctx params)
   | "getmempoolancestors" ->
-    (match handle_getmempoolancestors ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_invalid_params, msg))
+    guard_hash_param ~name:"txid" params (fun () ->
+      match handle_getmempoolancestors ctx params with
+      | Ok r -> Ok r
+      | Error msg when msg = "Transaction not in mempool" ->
+        Error (rpc_invalid_address, msg)
+      | Error msg -> Error (rpc_misc_error, msg))
   | "getmempooldescendants" ->
-    (match handle_getmempooldescendants ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_invalid_params, msg))
+    guard_hash_param ~name:"txid" params (fun () ->
+      match handle_getmempooldescendants ctx params with
+      | Ok r -> Ok r
+      | Error msg when msg = "Transaction not in mempool" ->
+        Error (rpc_invalid_address, msg)
+      | Error msg -> Error (rpc_misc_error, msg))
   | "getmempoolentry" ->
     (* Core ParseHashV on the txid arg -> malformed = -8 before lookup; a
-       well-formed-but-absent txid stays "Transaction not in mempool". *)
+       well-formed-but-absent txid is RPC_INVALID_ADDRESS_OR_KEY (-5)
+       "Transaction not in mempool". *)
     guard_hash_param ~name:"txid" params (fun () ->
       match handle_getmempoolentry ctx params with
       | Ok r -> Ok r
+      | Error msg when msg = "Transaction not in mempool" ->
+        Error (rpc_invalid_address, msg)
       | Error msg -> Error (rpc_misc_error, msg))
   | "getorphantxs" ->
     (* handle_getorphantxs already returns Core-exact (code, message) pairs:
@@ -15272,6 +15451,12 @@ let dispatch_rpc (ctx : rpc_context)
   | "submitpackage" ->
     (match handle_submitpackage ctx params with
      | Ok r -> Ok r
+     | Error msg
+       when String.length msg >= 16 && String.sub msg 0 16 = "TX decode failed" ->
+       Error (rpc_deserialization_error, msg)
+     | Error msg
+       when String.length msg >= 12 && String.sub msg 0 12 = "Array must c" ->
+       Error (rpc_invalid_parameter, msg)
      | Error msg -> Error (rpc_verify_rejected, msg))
   | "dumpmempool" | "savemempool" ->
     (match handle_dumpmempool ctx params with
@@ -15290,9 +15475,10 @@ let dispatch_rpc (ctx : rpc_context)
      they live in the mempool dispatch block here.
      Reference: bitcoin-core/src/rpc/mining.cpp:1153 register table. *)
   | "prioritisetransaction" ->
-    (match handle_prioritisetransaction ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_invalid_params, msg))
+    guard_hash_param ~name:"txid" params (fun () ->
+      match handle_prioritisetransaction ctx params with
+      | Ok r -> Ok r
+      | Error msg -> Error (rpc_invalid_parameter, msg))
   | "getprioritisedtransactions" ->
     Ok (handle_getprioritisedtransactions ctx)
 
@@ -15325,6 +15511,8 @@ let dispatch_rpc (ctx : rpc_context)
   | "verifymessage" ->
     (match handle_verifymessage ctx params with
      | Ok r -> Ok r
+     | Error msg when msg = "Malformed base64 encoding" ->
+       Error (rpc_type_error, msg)
      | Error msg -> Error (rpc_invalid_address, msg))
 
   (* Mining *)
@@ -15340,6 +15528,8 @@ let dispatch_rpc (ctx : rpc_context)
   | "submitblock" ->
     (match handle_submitblock ctx params with
      | Ok r -> Ok r
+     | Error msg when msg = "Block decode failed" ->
+       Error (rpc_deserialization_error, msg)
      | Error msg -> Error (rpc_verify_rejected, msg))
   | "submitheader" ->
     (* handle_submitheader already returns the Core-exact (code, message)
@@ -15476,6 +15666,11 @@ let dispatch_rpc (ctx : rpc_context)
   | "combinepsbt" ->
     (match handle_combinepsbt ctx params with
      | Ok r -> Ok r
+     | Error msg when msg = "Parameter 'txs' cannot be empty" ->
+       Error (rpc_invalid_parameter, msg)
+     | Error msg
+       when String.length msg >= 16 && String.sub msg 0 16 = "TX decode failed" ->
+       Error (rpc_deserialization_error, msg)
      | Error msg -> Error (rpc_misc_error, msg))
   | "joinpsbts" ->
     (match handle_joinpsbts ctx params with
@@ -15489,7 +15684,12 @@ let dispatch_rpc (ctx : rpc_context)
   | "finalizepsbt" ->
     (match handle_finalizepsbt ctx params with
      | Ok r -> Ok r
+     | Error msg
+       when String.length msg >= 16 && String.sub msg 0 16 = "TX decode failed" ->
+       Error (rpc_deserialization_error, msg)
      | Error msg -> Error (rpc_misc_error, msg))
+  | "descriptorprocesspsbt" ->
+    handle_descriptorprocesspsbt ctx params
   | "utxoupdatepsbt" ->
     (* Core rawtransaction.cpp:1065 throws RPC_DESERIALIZATION_ERROR (-22) with
        "TX decode failed <error>" when the PSBT fails to decode; route that
@@ -15537,7 +15737,7 @@ let dispatch_rpc (ctx : rpc_context)
   | "getdescriptorinfo" ->
     (match handle_getdescriptorinfo ctx params with
      | Ok r -> Ok r
-     | Error msg -> Error (rpc_misc_error, msg))
+     | Error msg -> Error (rpc_invalid_address, msg))
   | "deriveaddresses" ->
     (match handle_deriveaddresses ctx params with
      | Ok r -> Ok r
@@ -15554,6 +15754,12 @@ let dispatch_rpc (ctx : rpc_context)
   | "createmultisig" ->
     (match handle_createmultisig ctx params with
      | Ok r -> Ok r
+     | Error msg
+       when String.length msg >= 18 && String.sub msg 0 18 = "not enough keys su" ->
+       Error (rpc_invalid_parameter, msg)
+     | Error msg
+       when String.length msg >= 7 && String.sub msg 0 7 = "Pubkey " ->
+       Error (rpc_invalid_address, msg)
      | Error msg -> Error (rpc_misc_error, msg))
   | "listdescriptors" ->
     (match handle_listdescriptors ctx params with
@@ -15584,6 +15790,9 @@ let dispatch_rpc (ctx : rpc_context)
   | "scantxoutset" ->
     (match handle_scantxoutset ctx params with
      | Ok r -> Ok r
+     | Error msg
+       when String.length msg >= 16 && String.sub msg 0 16 = "Invalid action '" ->
+       Error (rpc_invalid_parameter, msg)
      | Error msg -> Error (rpc_invalid_params, msg))
   | "scanblocks" ->
     (* handle_scanblocks already returns Core-exact (code, message) pairs:
@@ -15627,13 +15836,18 @@ let dispatch_rpc (ctx : rpc_context)
         | Ok r -> Ok r
         | Error msg ->
           let code =
-            if msg = "Block not found" then rpc_invalid_address
+            if msg = "Block not found" || msg = "Transaction not yet in block"
+            then rpc_invalid_address
             else rpc_misc_error
           in
           Error (code, msg)))
   | "verifytxoutproof" ->
     (match handle_verifytxoutproof ctx params with
      | Ok r -> Ok r
+     | Error msg
+       when String.length msg >= 31
+            && String.sub msg 0 31 = "proof must be hexadecimal strin" ->
+       Error (rpc_invalid_parameter, msg)
      | Error msg -> Error (rpc_misc_error, msg))
   | "getrpcinfo" ->
     Ok (handle_getrpcinfo ctx)

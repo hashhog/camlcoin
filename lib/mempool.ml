@@ -4523,8 +4523,12 @@ let apply_loaded_deltas (mp : mempool) (r : reader_state) : unit =
 (* Load mempool from a Bitcoin Core byte-compatible mempool.dat.  Returns the
    number of transactions successfully accepted into the mempool.  Silently
    returns 0 on malformed / unsupported / missing files (matches Core's
-   "Continuing anyway" loss-tolerant policy). *)
-let load_mempool (mp : mempool) (path : string) : int =
+   "Continuing anyway" loss-tolerant policy).
+
+   [apply_fee_delta_priority] defaults true (boot LoadMempool). The
+   `importmempool` RPC passes false (mempool_persist.h ImportMempoolOptions). *)
+let load_mempool ?(apply_fee_delta_priority = true) (mp : mempool)
+    (path : string) : int =
   match decode_mempool_file path with
   | None -> 0
   | Some (r, total) ->
@@ -4543,7 +4547,7 @@ let load_mempool (mp : mempool) (path : string) : int =
          | Ok entry ->
            incr loaded;
            (* FIX-77: apply the per-entry inline nFeeDelta. *)
-           if not (Int64.equal n_fee_delta 0L) then
+           if apply_fee_delta_priority && not (Int64.equal n_fee_delta 0L) then
              prioritise_transaction mp entry.txid n_fee_delta
          | Error _ -> ());
         if i = 1 || i mod 1000 = 0 || i = total then
@@ -4562,7 +4566,7 @@ let load_mempool (mp : mempool) (path : string) : int =
       for _i = 1 to n_deltas do
         let txid_str = r_read_bytes r 32 in
         let amount = r_read_int64_le r in
-        if not (Int64.equal amount 0L) then begin
+        if apply_fee_delta_priority && not (Int64.equal amount 0L) then begin
           let txid_cs = Cstruct.of_string txid_str in
           prioritise_transaction mp txid_cs amount
         end
@@ -4573,6 +4577,17 @@ let load_mempool (mp : mempool) (path : string) : int =
       done
     with _ -> ());
     !loaded
+
+(* importmempool RPC: false if the file cannot be opened or decoded
+   (Core LoadMempool returns false → RPC_MISC_ERROR). Default options
+   match ImportMempoolOptions for the RPC, not the boot path. *)
+let import_mempool ?(apply_fee_delta_priority = false) (mp : mempool)
+    (path : string) : bool =
+  match decode_mempool_file path with
+  | None -> false
+  | Some _ ->
+    ignore (load_mempool ~apply_fee_delta_priority mp path);
+    true
 
 (* Lwt-yielding reload. One pause before the first tx lets Cli.run's
    rpc_thread bind; then a pause every 64 txs keeps getblockcount

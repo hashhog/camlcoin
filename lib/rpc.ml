@@ -4669,6 +4669,163 @@ let handle_loadmempool (ctx : rpc_context)
       Error (Printf.sprintf "Unable to load mempool: %s"
         (Printexc.to_string exn)))
 
+(* importmempool "filepath" ( options )
+   Core: rpc/mempool.cpp:1103-1160. Type-check filepath as string first.
+   IBD is RPC_CLIENT_IN_INITIAL_DOWNLOAD (-10) before the file is opened.
+   A missing or unreadable file is RPC_MISC_ERROR (-1) with Core's
+   exact message. Success is an empty object. *)
+let importmempool_unable_msg =
+  "Unable to import mempool file, see debug log for details."
+
+let importmempool_ibd_msg =
+  "Can only import the mempool after the block download and sync is done."
+
+let in_initial_block_download (ctx : rpc_context) : bool =
+  match ctx.network.name with
+  | "regtest" -> false
+  | _ -> ctx.chain.sync_state <> Sync.FullySynced
+
+let parse_importmempool_opts (j : Yojson.Safe.t option)
+    : (bool, int * string) result =
+  (* Only apply_fee_delta_priority is consumed by the loader today;
+     the other two flags are parsed for type-parity with Core. *)
+  let get_bool fields key default =
+    match List.assoc_opt key fields with
+    | None | Some `Null -> Ok default
+    | Some (`Bool b) -> Ok b
+    | Some other ->
+      Error (rpc_type_error,
+        Printf.sprintf
+          "JSON value of type %s is not of expected type bool"
+          (core_uvtype other))
+  in
+  match j with
+  | None | Some `Null -> Ok false
+  | Some (`Assoc fields) ->
+    (match get_bool fields "apply_fee_delta_priority" false with
+     | Error e -> Error e
+     | Ok apply ->
+       (match get_bool fields "use_current_time" true with
+        | Error e -> Error e
+        | Ok _ ->
+          (match get_bool fields "apply_unbroadcast_set" false with
+           | Error e -> Error e
+           | Ok _ -> Ok apply)))
+  | Some other ->
+    Error (rpc_type_error,
+      Printf.sprintf
+        "JSON value of type %s is not of expected type object"
+        (core_uvtype other))
+
+let handle_importmempool (ctx : rpc_context)
+    (params : Yojson.Safe.t list)
+    : (Yojson.Safe.t, int * string) result =
+  match params with
+  | [] ->
+    Error (rpc_misc_error, "importmempool takes 1 to 2 argument(s), got 0")
+  | path_arg :: rest ->
+    (match path_arg with
+     | `String path ->
+       (match parse_importmempool_opts (List.nth_opt rest 0) with
+        | Error e -> Error e
+        | Ok apply_fee ->
+          if in_initial_block_download ctx then
+            (* RPC_CLIENT_IN_INITIAL_DOWNLOAD; not a named let — w125 G22. *)
+            Error (-10, importmempool_ibd_msg)
+          else if not (Mempool.import_mempool
+                         ~apply_fee_delta_priority:apply_fee ctx.mempool path)
+          then
+            Error (rpc_misc_error, importmempool_unable_msg)
+          else
+            Ok (`Assoc []))
+     | other ->
+       Error (rpc_type_error,
+         Printf.sprintf
+           "JSON value of type %s is not of expected type string"
+           (core_uvtype other)))
+
+(* pruneblockchain height
+   Core: rpc/blockchain.cpp:908-963. UniValue NUM type-check fires
+   BEFORE the prune-mode gate, so ["zz"] is -3 even on an archive node
+   (r5 probe height-type-error). *)
+let prune_after_height (net : Consensus.network_config) : int =
+  match net.name with
+  | "mainnet" -> 100_000
+  | _ -> 1_000
+
+let timestamp_window = 7200 (* chain.h MAX_FUTURE_BLOCK_TIME *)
+
+let find_earliest_at_least (chain : Sync.chain_state) (min_time : int)
+    : int option =
+  let rec walk h =
+    match Storage.ChainDB.get_hash_at_height chain.db h with
+    | None -> None
+    | Some hash ->
+      (match Hashtbl.find_opt chain.headers (Cstruct.to_string hash) with
+       | Some e when Int32.to_int e.header.timestamp >= min_time ->
+         Some e.height
+       | _ -> walk (h + 1))
+  in
+  walk 0
+
+let handle_pruneblockchain (ctx : rpc_context)
+    (params : Yojson.Safe.t list)
+    : (Yojson.Safe.t, int * string) result =
+  match params with
+  | [] ->
+    Error (rpc_misc_error, "pruneblockchain takes 1 argument(s), got 0")
+  | height_arg :: _ ->
+    let parsed_height =
+      match height_arg with
+      | `Int n ->
+        if core_in_int32 n then Ok n
+        else Error (rpc_misc_error, core_json_int_range_msg)
+      | other ->
+        Error (rpc_type_error,
+          Printf.sprintf
+            "JSON value of type %s is not of expected type number"
+            (core_uvtype other))
+    in
+    (match parsed_height with
+     | Error e -> Error e
+     | Ok height_param ->
+       if ctx.chain.prune_target <= 0 then
+         Error (rpc_misc_error,
+           "Cannot prune blocks because node is not in prune mode.")
+       else if height_param < 0 then
+         Error (rpc_invalid_parameter, "Negative block height.")
+       else
+         let height_res =
+           if height_param > 1_000_000_000 then
+             match find_earliest_at_least ctx.chain
+                     (height_param - timestamp_window) with
+             | None ->
+               Error (rpc_invalid_parameter,
+                 "Could not find block with at least the specified timestamp.")
+             | Some h -> Ok h
+           else Ok height_param
+         in
+         (match height_res with
+          | Error e -> Error e
+          | Ok height ->
+            let chain_height =
+              max ctx.chain.blocks_synced
+                (match ctx.chain.tip with Some t -> t.height | None -> 0)
+            in
+            if chain_height < prune_after_height ctx.network then
+              Error (rpc_misc_error, "Blockchain is too short for pruning.")
+            else if height > chain_height then
+              Error (rpc_invalid_parameter,
+                "Blockchain is shorter than the attempted prune height.")
+            else
+              let height =
+                if height > chain_height - Sync.min_blocks_to_keep then
+                  chain_height - Sync.min_blocks_to_keep
+                else height
+              in
+              let pruned = Sync.prune_blocks_to_height ctx.chain height in
+              Ok (`Int pruned)))
+
 (* handle_gettxout is defined after psbt_script_pubkey_json / btc_amount_json
    (W61) because it calls those helpers which are introduced in the W51/W52
    block below.  The dispatch table that calls handle_gettxout is even later
@@ -11995,6 +12152,7 @@ let handle_help (_ctx : rpc_context)
       "waitfornewblock ( timeout \"current_tip\" )";
       "waitforblock \"blockhash\" ( timeout )";
       "waitforblockheight height ( timeout )";
+      "pruneblockchain height";
       "";
       "== Mining ==";
       "getblocktemplate";
@@ -12017,6 +12175,7 @@ let handle_help (_ctx : rpc_context)
       "getmempoolinfo";
       "getorphantxs ( verbosity )";
       "getrawmempool ( verbose )";
+      "importmempool \"filepath\" ( options )";
       "loadmempool";
       "savemempool";
       "testmempoolaccept [\"rawtx\"]";
@@ -14818,6 +14977,8 @@ let dispatch_rpc (ctx : rpc_context)
        -5 RPC_INVALID_ADDRESS_OR_KEY "Block not found" for an unknown hash,
        -8 RPC_INVALID_PARAMETER for a malformed hash.  Pass them through. *)
     handle_preciousblock ctx params
+  | "pruneblockchain" ->
+    handle_pruneblockchain ctx params
   | "getblockfilter" ->
     (* handle_getblockfilter already returns Core-exact (code, message) pairs:
        -5 Unknown filtertype / Block not found, -1 index-not-enabled,
@@ -15006,6 +15167,8 @@ let dispatch_rpc (ctx : rpc_context)
     (match handle_loadmempool ctx params with
      | Ok r -> Ok r
      | Error msg -> Error (rpc_misc_error, msg))
+  | "importmempool" ->
+    handle_importmempool ctx params
 
   (* FIX-72 W120 BUG-10 — Mining-group prioritisation RPCs.
      Core registers `prioritisetransaction` + `getprioritisedtransactions`

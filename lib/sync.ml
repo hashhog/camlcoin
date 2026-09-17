@@ -1375,6 +1375,10 @@ let run_mempool_remove_hook (state : chain_state) (block : Types.block)
    post-segwit mainnet (avg ~1.3 MB; matters only as a soft target). *)
 let avg_block_size_bytes = 1_500_000
 
+(* Bitcoin Core validation.h MIN_BLOCKS_TO_KEEP. Also the floor for
+   pruneblockchain's clamp to chainHeight - MIN_BLOCKS_TO_KEEP. *)
+let min_blocks_to_keep = 288
+
 (* Prune old block data to save disk space.
    [prune_target] is in BYTES (Bitcoin Core convention), or the literal
    sentinel value [1] for `--prune=1` manual mode (init.cpp:524 /
@@ -1395,7 +1399,7 @@ let prune_old_blocks (state : chain_state) (current_height : int) : unit =
        the only path that may advance prune_height. *)
     ()
   else
-    let min_keep = 288 in  (* Bitcoin Core MIN_BLOCKS_TO_KEEP *)
+    let min_keep = min_blocks_to_keep in
     let target_blocks = state.prune_target / avg_block_size_bytes in
     let keep_blocks = max target_blocks min_keep in
     let prune_below = current_height - keep_blocks in
@@ -1407,11 +1411,35 @@ let prune_old_blocks (state : chain_state) (current_height : int) : unit =
         | Some hash ->
           Storage.ChainDB.delete_block state.db hash;
           (* Also delete undo data for very old blocks *)
-          if h < current_height - keep_blocks - 288 then
+          if h < current_height - keep_blocks - min_blocks_to_keep then
             Storage.ChainDB.delete_undo_data state.db hash
       done;
       state.prune_height <- prune_below
     end
+
+(* Manual prune up to [height] (already clamped by pruneblockchain).
+   Returns the last pruned height, or -1 if nothing has been pruned
+   (Core GetPruneHeight → nullopt → -1). *)
+let prune_blocks_to_height (state : chain_state) (height : int) : int =
+  let current_height =
+    match state.tip with
+    | Some t -> max t.height state.blocks_synced
+    | None -> state.blocks_synced
+  in
+  if height <= state.prune_height then
+    if state.prune_height <= 0 then -1 else state.prune_height
+  else begin
+    for h = state.prune_height + 1 to height do
+      match Storage.ChainDB.get_hash_at_height state.db h with
+      | None -> ()
+      | Some hash ->
+        Storage.ChainDB.delete_block state.db hash;
+        if h < current_height - (2 * min_blocks_to_keep) then
+          Storage.ChainDB.delete_undo_data state.db hash
+    done;
+    state.prune_height <- height;
+    height
+  end
 
 (* Collect timestamps of the last n ancestors (including the given entry).
    Walks prev_block links in the in-memory header map. *)

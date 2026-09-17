@@ -200,7 +200,11 @@ let mainnet_au_data : assumeutxo_params list = [
       "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050"
     ~coins_count:0L
     ~chain_tx_count:1_305_397_408L;
-  (* height = 944183. *)
+  (* height = 944183 — hashhog-local (not in Core chainparams).
+     chain_tx_count is Core getchaintxstats at this hash, NOT the
+     1_334_000_000 "progress-display" placeholder which was 1_914_531
+     short and then became a constant deficit above this base. Live
+     Core 2026-09-17: txcount 1335914531. *)
   make_au
     ~height:944_183
     ~blockhash_display:
@@ -208,7 +212,7 @@ let mainnet_au_data : assumeutxo_params list = [
     ~coins_hash_display:
       "2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8"
     ~coins_count:165_095_935L
-    ~chain_tx_count:1_334_000_000L;
+    ~chain_tx_count:1_335_914_531L;
   (* height = 481823 — Track-B WINDOWED replay base (last pre-segwit block;
      segwit activates at 481824). coins_hash + coins_count + chain_tx_count from
      the boundary-snapshot result JSON (Core dumptxoutset rollback=481823);

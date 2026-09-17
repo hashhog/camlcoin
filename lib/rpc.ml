@@ -13333,69 +13333,98 @@ let ntx_of_hash (db : Storage.ChainDB.t) (hash : Types.hash256) (height : int)
      | Some n -> Some n
      | None -> if height = 0 then Some 1 else None)
 
+(* Walk start_h+1 .. to_h adding nTx at every height. Missing hash or
+   missing nTx is a gap: stop and return None. Never add 0 for a hole
+   (that was serving the neighbour assumeUTXO cumulative as if it
+   belonged to the queried height). Stores each successfully computed
+   step so a later O(1) read sees the connect-time invariant
+   m_chain_tx_count = parent + nTx (Core chain.h / validation.cpp). *)
+let accumulate_chain_tx (ctx : rpc_context) ~(start_h : int) ~(start_n : int64)
+    ~(to_h : int) : int64 option =
+  if to_h < start_h then None
+  else if to_h = start_h then Some start_n
+  else
+    let db = ctx.chain.db in
+    let rec walk h acc =
+      if h > to_h then Some acc
+      else
+        match Storage.ChainDB.get_hash_at_height db h with
+        | None -> None
+        | Some hash -> (
+          match ntx_of_hash db hash h with
+          | None -> None
+          | Some n_tx ->
+            let next = Int64.add acc (Int64.of_int n_tx) in
+            Storage.ChainDB.store_chain_tx_count db hash next;
+            walk (h + 1) next)
+    in
+    walk (start_h + 1) start_n
+
+let au_at_or_below network height =
+  Assume_utxo.assumeutxo_params_list network
+  |> List.filter (fun (p : Assume_utxo.assumeutxo_params) -> p.height <= height)
+  |> List.sort (fun (a : Assume_utxo.assumeutxo_params)
+                    (b : Assume_utxo.assumeutxo_params) ->
+         compare b.height a.height)
+
+let stored_is_borrowed network (entry : Sync.header_entry) (n : int64) =
+  match au_at_or_below network (entry.height - 1) with
+  | p :: _ when Int64.equal p.chain_tx_count n -> true
+  | _ -> false
+
 let seed_chain_tx_anchors (ctx : rpc_context) : unit =
   let db = ctx.chain.db in
   let genesis_hash = ctx.network.Consensus.genesis_hash in
   (match Storage.ChainDB.get_chain_tx_count db genesis_hash with
    | None -> Storage.ChainDB.store_chain_tx_count db genesis_hash 1L
    | Some _ -> ());
+  let corrected = ref [] in
   List.iter
     (fun (p : Assume_utxo.assumeutxo_params) ->
       match Storage.ChainDB.get_chain_tx_count db p.blockhash with
-      | None ->
-        Storage.ChainDB.store_chain_tx_count db p.blockhash p.chain_tx_count
-      | Some _ -> ())
-    (Assume_utxo.assumeutxo_params_list ctx.network)
+      | Some n when Int64.equal n p.chain_tx_count -> ()
+      | _ ->
+        Storage.ChainDB.store_chain_tx_count db p.blockhash p.chain_tx_count;
+        corrected := p :: !corrected)
+    (Assume_utxo.assumeutxo_params_list ctx.network);
+  (* A corrected seed (the 944183 placeholder → Core's 1_335_914_531)
+     poisons every descendant that stored parent+nTx from the old
+     figure. Rewalk from the highest corrected AU while nTx is known
+     so the first getchaintxstats after upgrade rewrites them. *)
+  match
+    List.sort
+      (fun (a : Assume_utxo.assumeutxo_params)
+           (b : Assume_utxo.assumeutxo_params) ->
+        compare b.height a.height)
+      !corrected
+  with
+  | [] -> ()
+  | p :: _ ->
+    ignore
+      (accumulate_chain_tx ctx ~start_h:p.height ~start_n:p.chain_tx_count
+         ~to_h:ctx.chain.blocks_synced)
 
 let reconstruct_chain_tx (ctx : rpc_context) (target : Sync.header_entry)
     : int64 option =
   let db = ctx.chain.db in
   seed_chain_tx_anchors ctx;
-  (match Storage.ChainDB.get_chain_tx_count db target.hash with
-   | Some n when n <> 0L -> Some n
-   | _ ->
-     let au_anchor =
-       Assume_utxo.assumeutxo_params_list ctx.network
-       |> List.filter (fun (p : Assume_utxo.assumeutxo_params) ->
-              p.height <= target.height)
-       |> List.sort (fun (a : Assume_utxo.assumeutxo_params)
-                         (b : Assume_utxo.assumeutxo_params) ->
-              compare b.height a.height)
-     in
-     let start_h, start_n =
-       match au_anchor with
-       | p :: _ ->
-         (match Storage.ChainDB.get_chain_tx_count db p.blockhash with
-          | Some n -> (p.height, n)
-          | None -> (p.height, p.chain_tx_count))
-       | [] -> (0, 1L)
-     in
-     if start_h = target.height then Some start_n
-     else begin
-       let acc = ref start_n in
-       for h = start_h + 1 to target.height do
-         match Storage.ChainDB.get_hash_at_height db h with
-         | None -> ()
-         | Some hash ->
-           (match Storage.ChainDB.get_chain_tx_count db hash with
-            | Some n when n <> 0L -> acc := n
-            | _ ->
-              let ntx =
-                match ntx_of_hash db hash h with
-                | Some n -> n
-                | None -> 0
-              in
-              acc := Int64.add !acc (Int64.of_int ntx);
-              Storage.ChainDB.store_chain_tx_count db hash !acc)
-       done;
-       Storage.ChainDB.store_chain_tx_count db target.hash !acc;
-       Some !acc
-     end)
+  match au_at_or_below ctx.network target.height with
+  | p :: _ when p.height = target.height ->
+    Storage.ChainDB.store_chain_tx_count db p.blockhash p.chain_tx_count;
+    Some p.chain_tx_count
+  | p :: _ ->
+    Storage.ChainDB.store_chain_tx_count db p.blockhash p.chain_tx_count;
+    accumulate_chain_tx ctx ~start_h:p.height ~start_n:p.chain_tx_count
+      ~to_h:target.height
+  | [] ->
+    accumulate_chain_tx ctx ~start_h:0 ~start_n:1L ~to_h:target.height
 
 let chain_tx_count_at_entry (ctx : rpc_context) (entry : Sync.header_entry)
     : int64 option =
+  seed_chain_tx_anchors ctx;
   match Storage.ChainDB.get_chain_tx_count ctx.chain.db entry.hash with
-  | Some n when n <> 0L -> Some n
+  | Some n when n <> 0L && not (stored_is_borrowed ctx.network entry n) ->
+    Some n
   | _ -> reconstruct_chain_tx ctx entry
 
 let sum_window_ntx (ctx : rpc_context) ~(from_h : int) ~(to_h : int) : int64 =

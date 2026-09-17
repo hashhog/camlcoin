@@ -125,9 +125,10 @@
  (libraries camlcoin test_tmp alcotest lwt lwt.unix unix str))
 
 ; Control for getchaintxstats wrong txcount + serial RPC (QUEUES.md item 0).
-; Stores m_chain_tx_count, omits ntx/bodies; the pre-fix walk returns 1
-; and blocks getblockcount. Revert of the O(1) read / Lwt_preemptive
-; detach makes the first and third cases fail.
+; Stores m_chain_tx_count, omits ntx/bodies; BETWEEN-anchor queries must
+; not return the lower AssumeUTXO neighbour; 944183 seed is Core's
+; 1335914531 not the 1334000000 placeholder. Revert of the honest-gap
+; reconstruct or the seed makes those cases fail.
 ;   dune exec --no-buffer test/test_getchaintxstats.exe
 (executable
  (name test_getchaintxstats)

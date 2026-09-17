@@ -1468,6 +1468,11 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   (* Mutable reference to current IBD state so the block listener can
      route incoming BlockMsg / NotfoundMsg to the download manager. *)
   let ibd_state_ref : Sync.ibd_state option ref = ref None in
+  (* Post-IBD getdata in-flight map. The HeadersMsg listener used to
+     re-ask the headers-sender on every duplicate-headers batch (live
+     651 s for two blocks, always peer 8). Catch-up IBD has its own
+     queue; this tracker covers the FullySynced path. *)
+  let gapfill = Sync.Gapfill.create () in
 
   (* #135 step 3: persistent Validation_worker Domain for post-IBD block
      validation. The IBD batch path has its own worker (sync.ml:3978) that
@@ -1516,14 +1521,31 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
      download queue. Without this, GetData responses are silently dropped. *)
   Peer_manager.add_listener peer_manager (fun msg peer ->
     match !ibd_state_ref with
-    | None -> Lwt.return_unit
+    | None ->
+      (match msg with
+       | P2p.NotfoundMsg items ->
+         List.iter
+           (fun (iv : P2p.inv_vector) ->
+             if iv.P2p.inv_type = P2p.InvBlock
+                || iv.P2p.inv_type = P2p.InvWitnessBlock then
+               Sync.Gapfill.note_notfound gapfill ~peer_id:peer.Peer.id
+                 iv.hash)
+           items;
+         Lwt.return_unit
+       | _ -> Lwt.return_unit)
     | Some ibd ->
       (match msg with
        | P2p.BlockMsg block ->
+         Sync.Gapfill.note_received gapfill
+           (Crypto.compute_block_hash block.Types.header);
          ignore (Sync.receive_block ibd block);
          Lwt.return_unit
        | P2p.NotfoundMsg items ->
          Sync.handle_notfound ibd peer.Peer.id items;
+         List.iter
+           (fun (iv : P2p.inv_vector) ->
+             Sync.Gapfill.note_notfound gapfill ~peer_id:peer.Peer.id iv.hash)
+           items;
          Lwt.return_unit
        | _ -> Lwt.return_unit));
 
@@ -1803,11 +1825,70 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
            done
          | _ -> ());
         if !block_requests <> [] then begin
-          let n_requests = List.length !block_requests in
-          Logs.info (fun m ->
-            m "Post-IBD gap-fill: requesting %d missing blocks [%d..%d] from peer %d"
-              n_requests start_h tip_height peer.Peer.id);
-          Peer.send_message peer (P2p.GetdataMsg (List.rev !block_requests))
+          (* Catch-up IBD's request_blocks already spreads getdata.
+             Double-asking the headers-sender from this listener is
+             how peer 8 got 14 of the last 40 requests. *)
+          if !ibd_state_ref <> None then
+            Lwt.return_unit
+          else
+            let%lwt () = Lwt.pause () in
+            let hashes =
+              List.map
+                (fun (iv : P2p.inv_vector) -> iv.hash)
+                (List.rev !block_requests)
+            in
+            let download_peers =
+              List.filter
+                (fun p ->
+                  p.Peer.msg_loop_started && p.Peer.state = Peer.Ready)
+                (Peer_manager.get_ready_peers peer_manager)
+            in
+            let peer_ids =
+              let rest =
+                List.filter_map
+                  (fun p ->
+                    if p.Peer.id = peer.Peer.id then None
+                    else Some p.Peer.id)
+                  download_peers
+              in
+              peer.Peer.id :: rest
+            in
+            match
+              Sync.Gapfill.assign gapfill ~now:(Unix.gettimeofday ())
+                ~peer_ids hashes
+            with
+            | None ->
+              Logs.debug (fun m ->
+                m "Post-IBD gap-fill: %d block(s) already in-flight, \
+                   not re-asking"
+                  (List.length hashes));
+              Lwt.return_unit
+            | Some asg ->
+              let dest =
+                match
+                  List.find_opt
+                    (fun p -> p.Peer.id = asg.Sync.Gapfill.peer_id)
+                    (peer :: download_peers)
+                with
+                | Some p -> p
+                | None -> peer
+              in
+              let n_requests = List.length asg.Sync.Gapfill.hashes in
+              let notes =
+                match asg.Sync.Gapfill.stall_notes with
+                | [] -> ""
+                | ns -> " (" ^ String.concat "; " ns ^ ")"
+              in
+              Logs.info (fun m ->
+                m "Post-IBD gap-fill: requesting %d missing blocks \
+                   [%d..%d] from peer %d%s"
+                  n_requests start_h tip_height dest.Peer.id notes);
+              let reqs =
+                List.map
+                  (fun hash -> { P2p.inv_type = P2p.InvWitnessBlock; hash })
+                  asg.Sync.Gapfill.hashes
+              in
+              Peer.send_message dest (P2p.GetdataMsg reqs)
         end else
           Lwt.return_unit
       end else
@@ -2063,6 +2144,7 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     | P2p.BlockMsg block when !ibd_state_ref = None
                               && chain.sync_state = Sync.FullySynced ->
       let hash = Crypto.compute_block_hash block.Types.header in
+      Sync.Gapfill.note_received gapfill hash;
       (* #135 step 3: pass post_ibd_worker so validation runs on its Domain
          and the Lwt main thread can serve RPC during the 0.5-3s window.
          Hold block_listener_mutex so two BlockMsg arrivals can't race on
@@ -2732,28 +2814,25 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
                    m "At-tip gap fill: header tip %d ahead of block tip %d but \
                       no message-loop peer to request from"
                      header_tip_height block_height))
-            | peer :: _ ->
+            | peers ->
               (* Resolve [block_tip+1 .. +16] from the best-header chain via
                  GetAncestor, NOT a 4096-cap walk back from the header tip.
                  The cap never reached block_tip+1 once headers out-ran the
-                 validated tip by more than 4096 (315k base, 596k headers). *)
+                 validated tip by more than 4096 (315k base, 596k headers).
+                 Rotate off a peer that withholds: the previous `peer :: _`
+                 always took get_download_peers's head. *)
               let hashes = Sync.next_blocks_to_download ~count:16 chain in
-              let reqs =
-                List.map (fun hash ->
-                    P2p.{ inv_type = InvWitnessBlock; hash })
-                  hashes
-              in
-              if reqs <> [] then begin
-                Logs.info (fun m ->
-                  m "At-tip gap fill: block tip %d behind header tip %d; \
-                     requesting %d block(s) from peer %d"
-                    block_height header_tip_height (List.length reqs)
-                    peer.Peer.id);
-                Lwt.async (fun () ->
-                  Lwt.catch
-                    (fun () -> Peer.send_message peer (P2p.GetdataMsg reqs))
-                    (fun _exn -> Lwt.return_unit))
-              end else
+              let peer_ids = List.map (fun p -> p.Peer.id) peers in
+              match
+                Sync.Gapfill.assign gapfill ~now:(Unix.gettimeofday ())
+                  ~peer_ids hashes
+              with
+              | None when hashes <> [] ->
+                Logs.debug (fun m ->
+                  m "At-tip gap fill: %d block(s) already in-flight, \
+                     not re-asking"
+                    (List.length hashes))
+              | None ->
                 (* Behind, but the ancestor walk yielded nothing to ask for.
                    Say so LOUDLY rather than tick silently: a recovery path
                    that quietly does nothing is indistinguishable from one
@@ -2763,6 +2842,33 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
                      header tip %d — gap is real but no header entry was \
                      resolvable at block_tip+1"
                     block_height header_tip_height)
+              | Some asg -> (
+                match
+                  List.find_opt
+                    (fun p -> p.Peer.id = asg.Sync.Gapfill.peer_id) peers
+                with
+                | None -> ()
+                | Some peer ->
+                  let notes =
+                    match asg.Sync.Gapfill.stall_notes with
+                    | [] -> ""
+                    | ns -> " (" ^ String.concat "; " ns ^ ")"
+                  in
+                  Logs.info (fun m ->
+                    m "At-tip gap fill: block tip %d behind header tip %d; \
+                       requesting %d block(s) from peer %d%s"
+                      block_height header_tip_height
+                      (List.length asg.Sync.Gapfill.hashes)
+                      peer.Peer.id notes);
+                  let reqs =
+                    List.map
+                      (fun hash -> P2p.{ inv_type = InvWitnessBlock; hash })
+                      asg.Sync.Gapfill.hashes
+                  in
+                  Lwt.async (fun () ->
+                    Lwt.catch
+                      (fun () -> Peer.send_message peer (P2p.GetdataMsg reqs))
+                      (fun _exn -> Lwt.return_unit)))
           end;
           let prev_height = Peer_manager.get_height peer_manager in
           if Int32.of_int block_height > prev_height then

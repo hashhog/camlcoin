@@ -132,3 +132,12 @@
 (executable
  (name test_getchaintxstats)
  (libraries camlcoin test_tmp alcotest lwt lwt.unix unix str))
+
+; Control for post-IBD gap-fill peer rotation (QUEUES.md item 0).
+; Live 2026-09-17: 651 s for two blocks, always peer 8, RPC unanswered.
+; Revert of Gapfill.assign to "always the first peer, always re-ask"
+; makes rotate cases fail.
+;   dune exec --no-buffer test/test_gapfill_peer_rotate.exe
+(executable
+ (name test_gapfill_peer_rotate)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix str))

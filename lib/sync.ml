@@ -695,6 +695,119 @@ let next_blocks_to_download ?(count = 16) (state : chain_state)
           done;
           !acc
 
+(* Post-IBD gap-fill download tracker.
+   Live 2026-09-17 on deployed dd22e29: headers at 967421, blocks at
+   967419 for ~18 min. The HeadersMsg listener logged
+     Post-IBD gap-fill: requesting 2 missing blocks [967420..967421]
+     from peer 8
+   over and over (14 of the last 40 requests to peer 8, 3 to peer 104)
+   and RPC was unanswered for 120 s. It did self-heal
+   (IBD complete … 2 blocks in 651.3s) — not an indefinite wedge, but
+   two blocks that eight connected peers already had must not take
+   minutes.
+
+   Core: FindNextBlocksToDownload spreads getdata across peers and
+   starts BLOCK_STALLING_TIMEOUT (2s default, net_processing.cpp) on a
+   peer that is the unique staller. We keep a per-hash in-flight map
+   so a duplicate-headers batch does not re-ask the same peer, and
+   after 2s we rotate to a peer that has not already failed the hash.
+   The HeadersMsg / at-tip callers pass the headers-sender first so
+   the first try is still the announcer. *)
+module Gapfill = struct
+  let stall_timeout = 2.0
+
+  type inflight = {
+    peer_id : int;
+    requested_at : float;
+  }
+
+  type t = {
+    inflight : (string, inflight) Hashtbl.t;
+    tried : (string, int list) Hashtbl.t;
+  }
+
+  let create () : t =
+    { inflight = Hashtbl.create 32; tried = Hashtbl.create 32 }
+
+  let hash_key (h : Types.hash256) = Cstruct.to_string h
+
+  let note_received (t : t) (hash : Types.hash256) : unit =
+    let k = hash_key hash in
+    Hashtbl.remove t.inflight k;
+    Hashtbl.remove t.tried k
+
+  let note_notfound (t : t) ~(peer_id : int) (hash : Types.hash256) : unit =
+    let k = hash_key hash in
+    Hashtbl.remove t.inflight k;
+    let prev =
+      match Hashtbl.find_opt t.tried k with Some ps -> ps | None -> []
+    in
+    if not (List.mem peer_id prev) then
+      Hashtbl.replace t.tried k (peer_id :: prev)
+
+  type assignment = {
+    peer_id : int;
+    hashes : Types.hash256 list;
+    stall_notes : string list;
+  }
+
+  (* First non-avoided candidate. Callers put the headers-sender first
+     so the initial try is the announcer; after a stall that id is in
+     [not_these] and we take the next connected peer. If every peer has
+     failed, fall back to the first id so we keep trying. *)
+  let prefer_peer (peer_ids : int list) ~(not_these : int list) : int option =
+    match List.filter (fun p -> not (List.mem p not_these)) peer_ids with
+    | p :: _ -> Some p
+    | [] -> (match peer_ids with [] -> None | p :: _ -> Some p)
+
+  let assign (t : t) ~(now : float) ~(peer_ids : int list)
+      (hashes : Types.hash256 list) : assignment option =
+    if hashes = [] || peer_ids = [] then None
+    else
+      let due = ref [] in
+      let notes = ref [] in
+      List.iter
+        (fun hash ->
+          let k = hash_key hash in
+          match Hashtbl.find_opt t.inflight k with
+          | Some inf when now -. inf.requested_at < stall_timeout -> ()
+          | Some inf ->
+            let waited = now -. inf.requested_at in
+            let note =
+              Printf.sprintf "peer %d unanswered for %.1fs" inf.peer_id waited
+            in
+            if not (List.mem note !notes) then notes := note :: !notes;
+            note_notfound t ~peer_id:inf.peer_id hash;
+            due := hash :: !due
+          | None -> due := hash :: !due)
+        hashes;
+      match List.rev !due with
+      | [] -> None
+      | due_hashes ->
+        let avoid =
+          List.fold_left
+            (fun acc h ->
+              match Hashtbl.find_opt t.tried (hash_key h) with
+              | Some ps -> List.rev_append ps acc
+              | None -> acc)
+            [] due_hashes
+        in
+        match prefer_peer peer_ids ~not_these:avoid with
+        | None -> None
+        | Some pid ->
+          List.iter
+            (fun h ->
+              Hashtbl.replace t.inflight (hash_key h)
+                { peer_id = pid; requested_at = now })
+            due_hashes;
+          Some
+            {
+              peer_id = pid;
+              hashes = due_hashes;
+              stall_notes = List.rev !notes;
+            }
+end
+
 (* Compute the expected difficulty bits for a block at the given height.
    - Genesis block (height 0): use genesis header bits
    - Regtest (pow_no_retargeting): use parent's bits (every block same difficulty)

@@ -77,6 +77,17 @@ let rpc_deserialization_error = -22
 let rpc_verify_error = -25
 let rpc_verify_rejected = -26
 
+(* Core uvTypeName (univalue.cpp:217-226): the wire type name used in
+   "JSON value of type <type> is not of expected type ..." messages. *)
+let core_uvtype (v : Yojson.Safe.t) : string =
+  match v with
+  | `Null -> "null"
+  | `Bool _ -> "bool"
+  | `Assoc _ -> "object"
+  | `List _ -> "array"
+  | `String _ -> "string"
+  | `Int _ | `Intlit _ | `Float _ -> "number"
+
 (* P2P client error codes (bitcoin-core/src/rpc/protocol.h:60-63). These are
    distinct from the JSON-RPC transport codes; Core raises them from the net
    RPCs (addnode / setban / disconnectnode) for operator-input failures. *)
@@ -2557,6 +2568,22 @@ let handle_getmininginfo (ctx : rpc_context) : Yojson.Safe.t =
 
 let handle_getblocktemplate (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  (* Core mining.cpp:854-857: GBT must be called with 'segwit' in rules.
+     An omitted/empty request object leaves setClientRules empty and Core
+     throws RPC_INVALID_PARAMETER (-8) before building a template. A node
+     that answers a template here is accepting input Core rejects. *)
+  let client_rules =
+    match params with
+    | `Assoc fields :: _ ->
+      (match List.assoc_opt "rules" fields with
+       | Some (`List items) ->
+         List.filter_map (function `String s -> Some s | _ -> None) items
+       | _ -> [])
+    | _ -> []
+  in
+  if not (List.mem "segwit" client_rules) then
+    Error "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})"
+  else
   (* Try to get coinbase_address from the first param object *)
   let coinbase_address_opt = match params with
     | (`Assoc fields) :: _ ->
@@ -4595,7 +4622,12 @@ let handle_submitpackage (ctx : rpc_context)
 let handle_signrawtransactionwithkey (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
-  | [`String hex_tx; `List wif_keys] | [`String hex_tx; `List wif_keys; _] ->
+  | `String hex_tx :: `List wif_keys :: rest ->
+    let prevtxs_json =
+      match rest with
+      | `List p :: _ -> p
+      | _ -> []
+    in
     (* Core rawtransaction.cpp:742 (signrawtransactionwithkey): a tx hex that
        fails DecodeHexTx throws RPC_DESERIALIZATION_ERROR (-22) with the exact
        message "TX decode failed. Make sure the tx has at least one input."
@@ -4610,25 +4642,70 @@ let handle_signrawtransactionwithkey (ctx : rpc_context)
        Error "TX decode failed. Make sure the tx has at least one input."
      | Some tx ->
     (try
-      (* Decode all WIF keys *)
-      let decoded_keys = List.filter_map (fun wif_json ->
-        match wif_json with
-        | `String wif ->
+      (* Decode all WIF keys. Core DecodeSecret: any invalid key is
+         RPC_INVALID_ADDRESS_OR_KEY (-5) "Invalid private key" — do not
+         skip and continue (the R5 bad-privkey probe). *)
+      let rec decode_keys acc = function
+        | [] -> Ok (List.rev acc)
+        | `String wif :: rest ->
           (match Address.wif_decode wif with
-           | Ok (privkey, _compressed, _network) ->
-             let pubkey = Crypto.derive_public_key ~compressed:true privkey in
+           | Error _ -> Error "Invalid private key"
+           | Ok (privkey, compressed, _network) ->
+             let pubkey = Crypto.derive_public_key ~compressed privkey in
              let pkh = Crypto.hash160 pubkey in
              let xonly = Crypto.derive_xonly_pubkey privkey in
-             Some (privkey, pubkey, pkh, xonly)
-           | Error _ -> None)
-        | _ -> None
-      ) wif_keys in
+             decode_keys ((privkey, pubkey, pkh, xonly) :: acc) rest)
+        | _ :: _ -> Error "Invalid private key"
+      in
+      match decode_keys [] wif_keys with
+      | Error e -> Error e
+      | Ok decoded_keys ->
+      (* ParsePrevouts overlay: {txid, vout, scriptPubKey, amount} fills
+         coins the chain UTXO set does not have. *)
+      let prevtx_map = Hashtbl.create 8 in
+      List.iter (function
+        | `Assoc fields ->
+          let txid_opt = match List.assoc_opt "txid" fields with
+            | Some (`String s) when String.length s = 64 ->
+              (try Some (parse_txid_param s) with _ -> None)
+            | _ -> None
+          in
+          let vout_opt = match List.assoc_opt "vout" fields with
+            | Some (`Int n) -> Some n
+            | _ -> None
+          in
+          let spk_opt = match List.assoc_opt "scriptPubKey" fields with
+            | Some (`String hex) ->
+              (try Some (hex_to_cstruct hex) with _ -> None)
+            | _ -> None
+          in
+          let amount =
+            match List.assoc_opt "amount" fields with
+            | Some (`Float f) ->
+              Int64.of_float (Float.round (f *. 100_000_000.0))
+            | Some (`Int i) -> Int64.mul (Int64.of_int i) 100_000_000L
+            | Some (`String s) ->
+              (match Bip21.parse_amount s with Ok v -> v | Error _ -> 0L)
+            | _ -> 0L
+          in
+          (match txid_opt, vout_opt, spk_opt with
+           | Some txid, Some vout, Some spk ->
+             Hashtbl.replace prevtx_map (Cstruct.to_string txid, vout)
+               { Utxo.value = amount; script_pubkey = spk;
+                 height = 0; is_coinbase = false }
+           | _ -> ())
+        | _ -> ()
+      ) prevtxs_json;
       (* Look up UTXO info for each input *)
       let utxo_set = Utxo.UtxoSet.create ctx.chain.db in
       let input_utxos = List.map (fun inp ->
         let prev = inp.Types.previous_output in
+        let vout = Int32.to_int prev.vout in
+        match Hashtbl.find_opt prevtx_map (Cstruct.to_string prev.txid, vout) with
+        | Some utxo -> Some utxo
+        | None ->
         (* Try chain UTXO set first *)
-        match Utxo.UtxoSet.get utxo_set prev.txid (Int32.to_int prev.vout) with
+        match Utxo.UtxoSet.get utxo_set prev.txid vout with
         | Some utxo -> Some utxo
         | None ->
           (* Try mempool *)
@@ -4845,8 +4922,48 @@ let feerate_percentiles_by_weight
     result
   end
 
+(* Core getblockstats (blockchain.cpp:2200-2210) ret_all keys. An unknown
+   name in the optional stats array is RPC_INVALID_PARAMETER (-8)
+   "Invalid selected statistic '<name>'" — the R5 invalid-stat probe. *)
+let blockstats_keys = [
+  "avgfee"; "avgfeerate"; "avgtxsize"; "blockhash"; "feerate_percentiles";
+  "height"; "ins"; "maxfee"; "maxfeerate"; "maxtxsize"; "medianfee";
+  "mediantime"; "mediantxsize"; "minfee"; "minfeerate"; "mintxsize";
+  "outs"; "subsidy"; "swtotal_size"; "swtotal_weight"; "swtxs"; "time";
+  "total_out"; "total_size"; "total_weight"; "totalfee"; "txs";
+  "utxo_increase"; "utxo_size_inc"; "utxo_increase_actual";
+  "utxo_size_inc_actual";
+]
+
 let handle_getblockstats (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  let stats_filter_r =
+    match params with
+    | _ :: `List items :: _ ->
+      let rec go acc = function
+        | [] -> Ok (Some (List.rev acc))
+        | `String s :: rest -> go (s :: acc) rest
+        | bad :: _ ->
+          Error (Printf.sprintf
+            "JSON value of type %s is not of expected type string"
+            (core_uvtype bad))
+      in go [] items
+    | _ :: `Null :: _ | [_] | [] -> Ok None
+    | _ :: bad :: _ ->
+      Error (Printf.sprintf
+        "JSON value of type %s is not of expected type array"
+        (core_uvtype bad))
+  in
+  match stats_filter_r with
+  | Error e -> Error e
+  | Ok stats_filter ->
+    (match stats_filter with
+     | Some names ->
+       List.find_opt (fun n -> not (List.mem n blockstats_keys)) names
+     | None -> None)
+    |> function
+    | Some n -> Error (Printf.sprintf "Invalid selected statistic '%s'" n)
+    | None ->
   let hash_opt = match params with
     | [`Int height] | [`Int height; _] ->
       Storage.ChainDB.get_hash_at_height ctx.chain.db height
@@ -4980,7 +5097,7 @@ let handle_getblockstats (ctx : rpc_context)
        let minfeerate_out = if !minfeerate = Int64.max_int then 0L else !minfeerate in
        let mintxsize_out = if !mintxsize = max_int then 0 else !mintxsize in
        (* Core ret_all (blockchain.cpp:2167) is in alphabetical pushKV order. *)
-       Ok (`Assoc [
+       let all_stats = [
          ("avgfee", `Int (Int64.to_int avgfee));
          ("avgfeerate", `Int (Int64.to_int avgfeerate));
          ("avgtxsize", `Int avgtxsize);
@@ -5014,7 +5131,11 @@ let handle_getblockstats (ctx : rpc_context)
          ("utxo_size_inc", `Int !utxo_size_inc);
          ("utxo_increase_actual", `Int (!utxos - !inputs));
          ("utxo_size_inc_actual", `Int !utxo_size_inc_actual);
-       ]))
+       ] in
+       Ok (`Assoc (match stats_filter with
+         | None -> all_stats
+         | Some names ->
+           List.map (fun n -> (n, List.assoc n all_stats)) names)))
 
 (* ============================================================================
    PSBT (BIP-174) Handlers
@@ -8895,34 +9016,54 @@ let handle_deriveaddresses (ctx : rpc_context)
     | "testnet" -> `Testnet
     | _ -> `Regtest
   in
+  (* Core output_script.cpp:315 Parse(..., require_checksum=true): a
+     descriptor with no #8-char checksum is RPC_INVALID_ADDRESS_OR_KEY
+     (-5) "Missing checksum". Range on an un-ranged descriptor is
+     RPC_INVALID_PARAMETER (-8). *)
+  let require_checksum desc_str =
+    match String.rindex_opt desc_str '#' with
+    | Some pos when String.length desc_str - pos - 1 = 8 -> Ok ()
+    | _ -> Error "Missing checksum"
+  in
+  let parse_or_err desc_str =
+    match require_checksum desc_str with
+    | Error e -> Error e
+    | Ok () -> Descriptor.parse desc_str
+  in
   match params with
   | [`String desc_str] ->
     (* No range specified - derive single address at index 0 *)
-    (match Descriptor.parse desc_str with
+    (match parse_or_err desc_str with
      | Error e -> Error e
      | Ok parsed ->
        if Descriptor.is_ranged parsed.desc then
-         Error "Descriptor is ranged; please specify a range"
+         Error "Range must be specified for a ranged descriptor"
        else
          match Descriptor.derive_addresses parsed.desc (0, 0) network with
          | Error e -> Error e
          | Ok addrs -> Ok (`List (List.map (fun a -> `String a) addrs)))
   | [`String desc_str; `List [`Int start_idx; `Int end_idx]] ->
     (* Range specified as [start, end] *)
-    (match Descriptor.parse desc_str with
+    (match parse_or_err desc_str with
      | Error e -> Error e
      | Ok parsed ->
-       match Descriptor.derive_addresses parsed.desc (start_idx, end_idx) network with
-       | Error e -> Error e
-       | Ok addrs -> Ok (`List (List.map (fun a -> `String a) addrs)))
+       if not (Descriptor.is_ranged parsed.desc) then
+         Error "Range should not be specified for an un-ranged descriptor"
+       else
+         match Descriptor.derive_addresses parsed.desc (start_idx, end_idx) network with
+         | Error e -> Error e
+         | Ok addrs -> Ok (`List (List.map (fun a -> `String a) addrs)))
   | [`String desc_str; `Int single_idx] ->
-    (* Single index *)
-    (match Descriptor.parse desc_str with
+    (* Single index — Core ParseDescriptorRange accepts a bare int as end. *)
+    (match parse_or_err desc_str with
      | Error e -> Error e
      | Ok parsed ->
-       match Descriptor.derive_addresses parsed.desc (single_idx, single_idx) network with
-       | Error e -> Error e
-       | Ok addrs -> Ok (`List (List.map (fun a -> `String a) addrs)))
+       if not (Descriptor.is_ranged parsed.desc) then
+         Error "Range should not be specified for an un-ranged descriptor"
+       else
+         match Descriptor.derive_addresses parsed.desc (single_idx, single_idx) network with
+         | Error e -> Error e
+         | Ok addrs -> Ok (`List (List.map (fun a -> `String a) addrs)))
   | _ ->
     Error "Invalid parameters: expected [descriptor, (range)]"
 
@@ -11795,43 +11936,88 @@ let w47b_parse_partial_merkle_tree (n_tx : int) (hash_list : Cstruct.t list)
   end
 
 let handle_getnetworkhashps (ctx : rpc_context)
-    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
-  let nblocks = match params with
-    | `Int n :: _ -> n
-    | _ -> 120
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  (* Core mining.cpp GetNetworkHashPS + Arg<int> nblocks/height.
+     A non-number nblocks (the R5 type-error probe passes "foo") is
+     RPC_TYPE_ERROR (-3) before any chain walk. nblocks default 120,
+     height default -1 (meaning the tip). *)
+  let parse_opt_int default = function
+    | None | Some `Null -> Ok default
+    | Some (`Int n) ->
+      if not (core_in_int32 n) then Error (rpc_misc_error, core_json_int_range_msg)
+      else Ok n
+    | Some other ->
+      Error (rpc_type_error,
+        Printf.sprintf
+          "JSON value of type %s is not of expected type number"
+          (core_uvtype other))
   in
-  let tip_height = ctx.chain.blocks_synced in
-  if tip_height < 2 then Ok (`Int 0)
-  else begin
-    let window = if nblocks <= 0 then 120 else min nblocks tip_height in
-    let hi = tip_height in
-    let lo = hi - window in
-    match Sync.get_header_at_height ctx.chain hi,
-          Sync.get_header_at_height ctx.chain lo with
-    | Some hi_e, Some lo_e ->
-      (* total_work is a 32-byte LE Cstruct.  Read bytes LE → float. *)
-      let cstruct_to_float (cs : Cstruct.t) : float =
-        let acc  = ref 0.0 in
-        let base = ref 1.0 in
-        for i = 0 to 31 do
-          acc  := !acc +. float_of_int (Cstruct.get_uint8 cs i) *. !base;
-          base := !base *. 256.0
-        done;
-        !acc
-      in
-      let work_diff = cstruct_to_float hi_e.Sync.total_work
-                   -. cstruct_to_float lo_e.Sync.total_work in
-      let time_diff = Int32.to_int hi_e.Sync.header.timestamp
-                    - Int32.to_int lo_e.Sync.header.timestamp in
-      if time_diff <= 0 then Ok (`Int 0)
-      else begin
-        let hashps = work_diff /. float_of_int time_diff in
-        if hashps < 9.007199254740992e15
-        then Ok (`Int (int_of_float hashps))
-        else Ok (`Float hashps)
-      end
-    | _ -> Ok (`Int 0)
-  end
+  match parse_opt_int 120 (List.nth_opt params 0) with
+  | Error e -> Error e
+  | Ok nblocks ->
+  match parse_opt_int (-1) (List.nth_opt params 1) with
+  | Error e -> Error e
+  | Ok height_arg ->
+    if nblocks < -1 || nblocks = 0 then
+      Error (rpc_invalid_parameter,
+        "Invalid nblocks. Must be a positive number or -1.")
+    else begin
+      let tip_height = ctx.chain.blocks_synced in
+      if height_arg < -1 || height_arg > tip_height then
+        Error (rpc_invalid_parameter, "Block does not exist at specified height")
+      else
+        let pb_height = if height_arg >= 0 then height_arg else tip_height in
+        (* Core: if (pb == nullptr || !pb->nHeight) return 0 *)
+        if pb_height < 1 then Ok (`Int 0)
+        else begin
+          let lookup =
+            if nblocks = -1 then
+              pb_height mod Consensus.difficulty_adjustment_interval + 1
+            else nblocks
+          in
+          let lookup = if lookup > pb_height then pb_height else lookup in
+          match Sync.get_header_at_height ctx.chain pb_height with
+          | None -> Ok (`Int 0)
+          | Some pb ->
+            let min_time = ref (Int32.to_int pb.Sync.header.timestamp) in
+            let max_time = ref !min_time in
+            let rec walk i (cur : Sync.header_entry) =
+              if i >= lookup then Some cur
+              else
+                match Sync.get_header_at_height ctx.chain (cur.Sync.height - 1) with
+                | None -> None
+                | Some e ->
+                  let t = Int32.to_int e.Sync.header.timestamp in
+                  if t < !min_time then min_time := t;
+                  if t > !max_time then max_time := t;
+                  walk (i + 1) e
+            in
+            match walk 0 pb with
+            | None -> Ok (`Int 0)
+            | Some pb0 ->
+              if !min_time = !max_time then Ok (`Int 0)
+              else begin
+                let cstruct_to_float (cs : Cstruct.t) : float =
+                  let acc = ref 0.0 in
+                  let base = ref 1.0 in
+                  for i = 0 to 31 do
+                    acc := !acc +. float_of_int (Cstruct.get_uint8 cs i) *. !base;
+                    base := !base *. 256.0
+                  done;
+                  !acc
+                in
+                let work_diff =
+                  cstruct_to_float pb.Sync.total_work
+                  -. cstruct_to_float pb0.Sync.total_work
+                in
+                let time_diff = !max_time - !min_time in
+                let hashps = work_diff /. float_of_int time_diff in
+                if hashps < 9.007199254740992e15
+                then Ok (`Int (int_of_float hashps))
+                else Ok (`Float hashps)
+              end
+        end
+    end
 
 let handle_gettxoutproof (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
@@ -12804,13 +12990,21 @@ let handle_getchaintxstats (ctx : rpc_context)
    error).  Empty / omitted arg = all running indexes. *)
 let handle_getindexinfo (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
-  let index_name =
-    match params with
-    | [] -> ""
-    | `String s :: _ -> s
-    | `Null :: _ -> ""
-    | _ -> ""
-  in
+  (* Core node.cpp:391 MaybeArg<std::string_view>("index_name"): a present
+     non-string (the R5 wrong-type-arg probe passes 123) is RPC_TYPE_ERROR
+     (-3) before any index lookup. Null / omitted means "all indexes". *)
+  match
+    (match params with
+     | [] | [`Null] -> Ok ""
+     | `String s :: _ -> Ok s
+     | bad :: _ ->
+       Error (rpc_type_error,
+         Printf.sprintf
+           "JSON value of type %s is not of expected type string"
+           (core_uvtype bad)))
+  with
+  | Error e -> Error e
+  | Ok index_name ->
   (* Core's SummaryToJSON: emit the entry only when the filter is empty or
      matches this index's name. Value object is EXACTLY {synced,
      best_block_height} in that order. *)
@@ -13190,17 +13384,6 @@ let handle_getaddrmaninfo (ctx : rpc_context) : Yojson.Safe.t =
    Pure read-only introspection of the daemon's own memory accounting: no side
    effects, no chain/mempool/peer locks. Safe at any lifecycle stage. *)
 
-(* Core uvTypeName (univalue.cpp:217-226): the wire type name used in
-   "JSON value of type <type> is not of expected type ..." messages. *)
-let core_uvtype (v : Yojson.Safe.t) : string =
-  match v with
-  | `Null -> "null"
-  | `Bool _ -> "bool"
-  | `Assoc _ -> "object"
-  | `List _ -> "array"
-  | `String _ -> "string"
-  | `Int _ | `Intlit _ | `Float _ -> "number"
-
 (* ============================================================================
    combinerawtransaction "[\"hexstring\",...]"
    Core: bitcoin-core/src/rpc/rawtransaction.cpp combinerawtransaction
@@ -13235,12 +13418,10 @@ let core_uvtype (v : Yojson.Safe.t) : string =
    that input's output is therefore NOT guaranteed byte-identical to Core. The
    per-input single-sig pick — the dominant case — IS byte-identical.
 
-   DEVIATION (flagged): Core resolves every input's prevout from its own UTXO +
-   mempool view and throws RPC_VERIFY_ERROR (-25) "Input not found or already
-   spent" for a missing/spent coin. This handler does NOT consult chainstate —
-   combine is a pure function of the provided variants — so it does NOT raise
-   -25 for unresolvable prevouts. The -22 empty / -22 decode-failure error paths
-   DO match Core byte-for-byte.
+   Prevout lookup: Core resolves every input from its UTXO + mempool view and
+   throws RPC_VERIFY_ERROR (-25) "Input not found or already spent" for a
+   missing/spent coin (rawtransaction.cpp:650-653). The R5 unknown-input
+   probe is that path.
 
    WITNESS re-serialization: Core re-encodes WITH witness (TX_WITH_WITNESS)
    unconditionally; Serialize.serialize_transaction emits the segwit marker/flag
@@ -13250,7 +13431,6 @@ let core_uvtype (v : Yojson.Safe.t) : string =
    when ANY picked input carries a non-empty witness, else leave it []. *)
 let handle_combinerawtransaction (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
-  ignore ctx;
   (* Core: request.params[0].get_array(); a non-array is a JSON type error (-3)
      raised by get_array() BEFORE any handler logic runs. *)
   let arr_r =
@@ -13311,6 +13491,31 @@ let handle_combinerawtransaction (ctx : rpc_context)
        (match variants with
         | [] -> Error (rpc_deserialization_error, "Missing transactions")
         | template :: _ ->
+          (* Core: AccessCoin on each mergedTx.vin prevout; spent/missing
+             -> -25 "Input not found or already spent". Same UTXO reader
+             as gettxout (UtxoSet over chain.db) plus the mempool. *)
+          let utxo_set = Utxo.UtxoSet.create ctx.chain.db in
+          let rec check_inputs = function
+            | [] -> Ok ()
+            | inp :: rest ->
+              let prev = inp.Types.previous_output in
+              let vout = Int32.to_int prev.vout in
+              let found =
+                match Utxo.UtxoSet.get utxo_set prev.txid vout with
+                | Some _ -> true
+                | None ->
+                  let txid_key = Cstruct.to_string prev.txid in
+                  match Hashtbl.find_opt ctx.mempool.entries txid_key with
+                  | Some parent when vout < List.length parent.tx.outputs -> true
+                  | _ -> false
+              in
+              if not found then
+                Error (rpc_verify_error, "Input not found or already spent")
+              else check_inputs rest
+          in
+          (match check_inputs template.Types.inputs with
+           | Error e -> Error e
+           | Ok () ->
           (* Helper: input i of a variant, if it has that index. *)
           let variant_input v i =
             match List.nth_opt v.Types.inputs i with
@@ -13392,7 +13597,7 @@ let handle_combinerawtransaction (ctx : rpc_context)
           let w = Serialize.writer_create () in
           Serialize.serialize_transaction w merged;
           let cs = Serialize.writer_to_cstruct w in
-          Ok (`String (cstruct_to_hex_early cs))))
+          Ok (`String (cstruct_to_hex_early cs)))))
 
 let handle_getmemoryinfo (_ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
@@ -14215,7 +14420,16 @@ let dispatch_rpc (ctx : rpc_context)
       match handle_getblockstats ctx params with
       | Ok r -> Ok r
       | Error msg ->
-        let code = if msg = "Block not found" then rpc_invalid_address else rpc_misc_error in
+        let code =
+          if msg = "Block not found" then rpc_invalid_address
+          else if String.length msg >= 26
+               && String.sub msg 0 26 = "Invalid selected statistic" then
+            rpc_invalid_parameter
+          else if String.length msg >= 16
+               && String.sub msg 0 16 = "JSON value of type" then
+            rpc_type_error
+          else rpc_misc_error
+        in
         Error (code, msg))
   | "getchaintxstats" ->
     handle_getchaintxstats ctx params
@@ -14317,18 +14531,17 @@ let dispatch_rpc (ctx : rpc_context)
      | Error msg
        when msg = "TX decode failed. Make sure the tx has at least one input." ->
        Error (rpc_deserialization_error, msg)
+     | Error msg when msg = "Invalid private key" ->
+       Error (rpc_invalid_address, msg)
      | Error msg -> Error (rpc_misc_error, msg))
   | "combinerawtransaction" ->
     (* handle_combinerawtransaction returns Core-exact (code, message) pairs:
        -22 (RPC_DESERIALIZATION_ERROR) "Missing transactions" for an empty
        array / -22 "TX decode failed for tx N. Make sure the tx has at least
        one input." for an undecodable element (N 0-based) / -3 (RPC_TYPE_ERROR)
-       non-array param or non-string element. Pass through verbatim. Returns the
-       witness-serialized hex of the merged tx (bare JSON string). SCOPE =
-       single-sig parity (see handler doc): the per-input non-empty-sig pick is
-       byte-identical to Core for P2PKH/P2WPKH/P2SH-P2WPKH; partial-multisig
-       merge within one input and the -25 unresolvable-prevout path are
-       documented out of scope (matches the ouroboros reference). *)
+       non-array param or non-string element / -25 (RPC_VERIFY_ERROR)
+       "Input not found or already spent" for an unresolvable prevout.
+       Pass through verbatim. *)
     handle_combinerawtransaction ctx params
 
   (* Network *)
@@ -14486,6 +14699,9 @@ let dispatch_rpc (ctx : rpc_context)
   | "getblocktemplate" ->
     (match handle_getblocktemplate ctx params with
      | Ok r -> Ok r
+     | Error msg
+       when msg = "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})" ->
+       Error (rpc_invalid_parameter, msg)
      | Error msg -> Error (rpc_misc_error, msg))
   | "submitblock" ->
     (match handle_submitblock ctx params with
@@ -14682,7 +14898,16 @@ let dispatch_rpc (ctx : rpc_context)
   | "deriveaddresses" ->
     (match handle_deriveaddresses ctx params with
      | Ok r -> Ok r
-     | Error msg -> Error (rpc_misc_error, msg))
+     | Error msg ->
+       let code =
+         if msg = "Missing checksum" || msg = "invalid checksum" then
+           rpc_invalid_address
+         else if msg = "Range should not be specified for an un-ranged descriptor"
+              || msg = "Range must be specified for a ranged descriptor" then
+           rpc_invalid_parameter
+         else rpc_misc_error
+       in
+       Error (code, msg))
   | "createmultisig" ->
     (match handle_createmultisig ctx params with
      | Ok r -> Ok r
@@ -14739,9 +14964,10 @@ let dispatch_rpc (ctx : rpc_context)
 
   (* Wave-47b *)
   | "getnetworkhashps" ->
-    (match handle_getnetworkhashps ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_misc_error, msg))
+    (* handle_getnetworkhashps returns Core-exact (code, message) pairs:
+       -3 type error on a non-number nblocks/height, -8 invalid nblocks /
+       height-out-of-range. Pass through. *)
+    handle_getnetworkhashps ctx params
   | "gettxoutproof" ->
     (* Core gettxoutproof: a malformed blockhash (the optional arg after the
        txid list) -> -8 RPC_INVALID_PARAMETER at the parse boundary (ParseHashV),

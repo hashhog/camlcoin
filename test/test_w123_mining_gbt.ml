@@ -472,9 +472,9 @@ let test_g27_getnetworkhashps_param_handling () =
     with Not_found -> ""
   in
   Alcotest.(check bool)
-    "BUG-5 (pre-fix): handle_getnetworkhashps body has no `-1` sentinel branch"
-    false (contains_substring getnetworkhashps_block "= -1" ||
-           contains_substring getnetworkhashps_block "nblocks_neg_one")
+    "G27: handle_getnetworkhashps honors nblocks=-1 sentinel"
+    true (contains_substring getnetworkhashps_block "= -1" ||
+          contains_substring getnetworkhashps_block "nblocks_neg_one")
 
 (* G28 — prioritisetransaction RPC PRESENT (FIX-72). *)
 let test_g28_prioritisetransaction_rpc_present () =

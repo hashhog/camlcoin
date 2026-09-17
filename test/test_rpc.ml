@@ -1260,7 +1260,10 @@ let test_getdescriptorinfo_invalid () =
 let test_deriveaddresses_single () =
   let (ctx, db, _, _, _) = create_test_context () in
   let pk = "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9" in
-  let desc = "wpkh(" ^ pk ^ ")" in
+  let desc_body = "wpkh(" ^ pk ^ ")" in
+  let desc = match Descriptor.add_checksum desc_body with
+    | Some s -> s | None -> desc_body
+  in
   let params = [`String desc] in
   let result = Rpc.handle_deriveaddresses ctx params in
   (match result with
@@ -1281,7 +1284,10 @@ let test_deriveaddresses_single () =
 let test_deriveaddresses_range () =
   let (ctx, db, _, _, _) = create_test_context () in
   let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8" in
-  let desc = "wpkh(" ^ xpub ^ "/0/*)" in
+  let desc_body = "wpkh(" ^ xpub ^ "/0/*)" in
+  let desc = match Descriptor.add_checksum desc_body with
+    | Some s -> s | None -> desc_body
+  in
   let params = [`String desc; `List [`Int 0; `Int 4]] in
   let result = Rpc.handle_deriveaddresses ctx params in
   (match result with
@@ -1300,7 +1306,10 @@ let test_deriveaddresses_range () =
 let test_deriveaddresses_ranged_no_range () =
   let (ctx, db, _, _, _) = create_test_context () in
   let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8" in
-  let desc = "wpkh(" ^ xpub ^ "/0/*)" in
+  let desc_body = "wpkh(" ^ xpub ^ "/0/*)" in
+  let desc = match Descriptor.add_checksum desc_body with
+    | Some s -> s | None -> desc_body
+  in
   let params = [`String desc] in
   let result = Rpc.handle_deriveaddresses ctx params in
   Alcotest.(check bool) "ranged without range error" true (Result.is_error result);

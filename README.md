@@ -69,6 +69,15 @@ before closing. Four real bugs were fixed and mutation-verified in that pass,
 including `f7d05a8`: before it, a wrong passphrase on an empty wallet could
 unlock it with a 47-byte garbage key.
 
+**AssumeUTXO is snapshot load, not dual chainstate.** `--import-utxo` and
+`loadtxoutset` accept a Core-format `dumptxoutset` after a hash gate against
+the hardcoded heights. `getchainstates` always returns a one-element
+`chainstates` array — there is no concurrent genesis-rooted background
+chainstate beside the snapshot, which is why the boot-smoke gate reports
+`bgval SKIP (single-chainstate)`. Background re-derivation of genesis→base
+exists on the RPC `loadtxoutset` path only; the CLI `--import-utxo` path the
+gate uses does not install a second chainstate.
+
 **Fleet-wide comparison:** `receipts/RELEASE-v1.0-SCORECARD.md` in the hashhog
 meta-repo, which is **not public** — see the note below.
 
@@ -132,7 +141,7 @@ dune exec camlcoin -- --network=testnet --debug
 - PSBT (BIP-174, all roles: creator/updater/signer/combiner/finalizer/extractor, taproot support)
 - Output descriptors (BIP-380-386, checksum, parsing, script generation, range expansion)
 - Miniscript (type system, script generation/decompilation, optimal satisfaction with DP, wsh integration)
-- AssumeUTXO (BIP-199, snapshot loading, dual chainstate, background validation)
+- AssumeUTXO (BIP-199, snapshot loading via `--import-utxo`/`loadtxoutset`; **not** Core dual-chainstate — `getchainstates` reports a single chainstate, so boot-smoke `bgval` is `SKIP (single-chainstate)`)
 - Block pruning (-prune=N, 550MB minimum, 288 block safety margin)
 - Block indexes (hash index, height index, BIP-157/158 compact block filters with GCS)
 - Flat file block storage (blk/rev files, block index, 128MB file rotation)
@@ -186,7 +195,7 @@ JSON-RPC modelled on Bitcoin Core's, with batch request support. Not behavioural
 | Descriptors | `deriveaddresses`, `getdescriptorinfo`, `listdescriptors` |
 | Util | `estimatesmartfee`, `validateaddress` |
 | Chain Mgmt | `invalidateblock`, `reconsiderblock` |
-| assumeUTXO | `loadtxoutset`, `dumptxoutset` |
+| assumeUTXO | `loadtxoutset`, `dumptxoutset`, `getchainstates` (always one chainstate) |
 | Control | `help`, `stop`, `uptime` |
 | Debug | `getperfstats` |
 

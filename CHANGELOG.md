@@ -2,6 +2,7 @@
 
 ## v1.0.2 — 2026-09-17
 
+- docs: caveat the AssumeUTXO dual-chainstate claim; getchainstates is one chainstate
 - 4ccdd13 test: hermetic @runtest for the v1.0.2 unit gate
 - df7708f fix: stall class — no VERSION-liar rotation during header-ahead catch-up
 - d3ec57c docs: CHANGELOG for write-only snapshot import
@@ -17,6 +18,7 @@
 
 Changes since `v1.0.0`:
 
+- docs: caveat the AssumeUTXO dual-chainstate claim; `getchainstates` reports a single chainstate (boot-smoke `bgval SKIP (single-chainstate)`). Control: `dune exec --no-buffer test/test_readme_assumeutxo_caveat.exe`
 - fix: stall class (231 CRITICALs) — do not rotate peers during a header-ahead catch-up, ignore VERSION-height liars, keep the header tip on gap-fill connect, re-enter catch-up IBD after FullySynced. Control: `dune exec --no-buffer test/test_stall_class_231.exe`. Diagnosis: `docs/STALL-CLASS-231-CRITICALS.md`
 - fix: skip the UTXO LRU during snapshot import so RPC can bind at soak-315000
 - fix: block download follows the snapshot base when headers race ahead (gap-fill GetAncestor, skip PRESYNC after assumeUTXO)

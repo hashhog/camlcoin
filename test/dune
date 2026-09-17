@@ -99,3 +99,11 @@
 (executable
  (name test_snapshot_import_throughput)
  (libraries camlcoin alcotest))
+
+; Control for README AssumeUTXO caveat (QUEUES.md item 4). The Features
+; bullet must not claim dual chainstate uncaveated while getchainstates
+; is a 1-element array (boot-smoke bgval SKIP:single-chainstate).
+;   dune exec --no-buffer test/test_readme_assumeutxo_caveat.exe
+(executable
+ (name test_readme_assumeutxo_caveat)
+ (libraries unix str))

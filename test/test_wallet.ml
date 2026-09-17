@@ -690,17 +690,26 @@ let test_get_new_address_p2tr () =
   Alcotest.(check bool) "regtest p2tr prefix" true
     (String.length addr > 6 && String.sub addr 0 6 = "bcrt1p")
 
+let test_get_new_address_p2sh_p2wpkh () =
+  let w = Wallet.create ~network:`Regtest ~db_path:"" in
+  let addr = Wallet.get_new_address_typed w Wallet.P2SH_P2WPKH in
+  (* Regtest P2SH addresses start with '2' *)
+  Alcotest.(check bool) "regtest p2sh-p2wpkh prefix" true
+    (String.length addr > 0 && addr.[0] = '2')
+
 let test_multiple_address_types () =
   let w = Wallet.create ~network:`Regtest ~db_path:"" in
   let _ = Wallet.get_new_address_typed w Wallet.P2PKH in
+  let _ = Wallet.get_new_address_typed w Wallet.P2SH_P2WPKH in
   let _ = Wallet.get_new_address_typed w Wallet.P2WPKH in
   let _ = Wallet.get_new_address_typed w Wallet.P2TR in
-  Alcotest.(check int) "three keys generated" 3 (Wallet.key_count w)
+  Alcotest.(check int) "four keys generated" 4 (Wallet.key_count w)
 
 let address_type_tests = [
   Alcotest.test_case "p2pkh address" `Quick test_get_new_address_p2pkh;
   Alcotest.test_case "p2wpkh address" `Quick test_get_new_address_p2wpkh;
   Alcotest.test_case "p2tr address" `Quick test_get_new_address_p2tr;
+  Alcotest.test_case "p2sh-p2wpkh address" `Quick test_get_new_address_p2sh_p2wpkh;
   Alcotest.test_case "multiple types" `Quick test_multiple_address_types;
 ]
 

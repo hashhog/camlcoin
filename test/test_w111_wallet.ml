@@ -3,7 +3,7 @@
    storage/encryption/keypool + signing + PSBT.
 
    Bugs found:
-     BUG-1 (P1 G6)  : BIP-49 m/49'/coin'/0' path absent entirely
+     BUG-1 (P1 G6)  : BIP-49 m/49'/coin'/0' path — CLOSED (derive_bip49_receive)
      BUG-2 (P1 G7)  : serialize_xprv/serialize_xpub always emit mainnet version bytes
      BUG-3 (P1 G8)  : All HD paths hardcode coin_type=0 (never 1 for testnet)
      BUG-4 (P0 G30) : psbt_highest_version=0 — BIP-370 PSBT v2 rejected
@@ -115,24 +115,18 @@ let test_g6_bip44_receive () =
    | Ok key ->
      Alcotest.(check int) "G6 bip44 key 32 bytes" 32 (Cstruct.length key))
 
-(* G6b: BUG-1 — BIP-49 path m/49'/0'/0'/0/n ABSENT
-   Confirms that there is no derive_bip49_receive function.
-   The wallet's P2SH-P2WPKH generation must use BIP-49 path;
-   without it, P2SH-P2WPKH addresses are either absent or use wrong derivation.
-   This test documents the gap: if BIP-49 existed it would exercise here. *)
-let test_g6b_bip49_absent () =
-  (* BIP-49 derivation function does not exist in wallet.ml.
-     We verify by checking that no BIP-49-derived key is reachable
-     through the typed key-generation API.  The wallet only supports
-     P2PKH (BIP-44), P2WPKH (BIP-84), and P2TR (BIP-86).  There is
-     no P2SH-P2WPKH address_type in the Wallet.address_type variant. *)
+(* G6b: BIP-49 path m/49'/0'/0'/0/n produces a P2SH-P2WPKH address. *)
+let test_g6b_bip49_receive () =
+  let master = Wallet.derive_master_key (test_seed ()) in
+  (match Wallet.derive_bip49_receive master 0 with
+   | Error e -> Alcotest.fail ("G6b bip49 receive failed: " ^ e)
+   | Ok key ->
+     Alcotest.(check int) "G6b bip49 key 32 bytes" 32 (Cstruct.length key));
   let w = Wallet.create ~network:`Mainnet ~db_path:"" in
-  (* P2WPKH is the closest; there is no P2SH_P2WPKH address_type
-     to pass to get_new_address_typed.  The test confirms this gap. *)
-  let addr = Wallet.get_new_address_typed w Wallet.P2WPKH in
-  (* A bc1q… address — NOT a 3… address from BIP-49 *)
-  Alcotest.(check bool) "G6b P2WPKH not BIP-49 (3...)" true
-    (String.length addr > 0 && addr.[0] <> '3')
+  Wallet.init_from_seed w (test_seed ());
+  let addr = Wallet.get_new_address_typed w Wallet.P2SH_P2WPKH in
+  Alcotest.(check bool) "G6b P2SH-P2WPKH starts with 3" true
+    (String.length addr > 0 && addr.[0] = '3')
 
 (* G7: BIP-84 receive path m/84'/0'/0'/0/n *)
 let test_g7_bip84_receive () =
@@ -860,7 +854,7 @@ let bip32_tests = [
 
 let hd_path_tests = [
   Alcotest.test_case "G6 BIP-44 receive"                   `Quick test_g6_bip44_receive;
-  Alcotest.test_case "G6b BIP-49 absent (BUG-1)"           `Quick test_g6b_bip49_absent;
+  Alcotest.test_case "G6b BIP-49 receive"                  `Quick test_g6b_bip49_receive;
   Alcotest.test_case "G7 BIP-84 receive"                   `Quick test_g7_bip84_receive;
   Alcotest.test_case "G7b xpub testnet version BUG-2"      `Quick test_g7b_xpub_testnet_version_bug;
   Alcotest.test_case "G8 BIP-86 receive"                   `Quick test_g8_bip86_receive;

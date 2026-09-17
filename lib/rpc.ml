@@ -3204,38 +3204,36 @@ let handle_getbalance (ctx : rpc_context)
     `Float (Int64.to_float total /. 100_000_000.0)
 
 let handle_getnewaddress (ctx : rpc_context)
-    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
   match ctx.wallet with
-  | None -> Error "Wallet not loaded"
+  | None -> Error (rpc_wallet_error, "Wallet not loaded")
   | Some wallet ->
     (* Core: a wallet with no available keys (disable_private_keys / blank,
        no keypool) cannot mint a receive address — RPC_WALLET_ERROR (-4)
        "Error: This wallet has no available keys" (addresses.cpp:46-48).
        Guard BEFORE deriving so a watch-only wallet never stores a key. *)
     if not (Wallet.can_get_addresses wallet) then
-      Error "Error: This wallet has no available keys"
+      Error (rpc_wallet_error, "Error: This wallet has no available keys")
     else begin
       (* Core getnewaddress( "label", "address_type" ): the OPTIONAL 2nd
          positional arg selects the output type (rpc/addresses.cpp
-         getnewaddress -> ParseOutputType). The previous handler ignored it and
-         always minted the default P2WPKH, so a "bech32m" request silently got a
-         v0 address — taproot receive was unreachable even though the wallet
-         derives BIP-86 P2TR keys (Wallet.generate_key_typed .. P2TR). Honour
-         the arg. Default (absent/null) follows Core's default -addresstype
-         "bech32" => P2WPKH. *)
+         getnewaddress -> ParseOutputType). Honour the four Core types
+         (legacy / p2sh-segwit / bech32 / bech32m). Default (absent/null)
+         follows Core's default -addresstype "bech32" => P2WPKH.
+         Unknown type is RPC_INVALID_ADDRESS_OR_KEY (-5)
+         "Unknown address type '%s'" (addresses.cpp:55-58), NOT
+         RPC_WALLET_ERROR (-4). *)
       let addr_type_result =
         match List.nth_opt params 1 with
         | None | Some `Null | Some (`String "") -> Ok Wallet.P2WPKH
         | Some (`String "bech32") -> Ok Wallet.P2WPKH
         | Some (`String "bech32m") -> Ok Wallet.P2TR
         | Some (`String "legacy") -> Ok Wallet.P2PKH
+        | Some (`String "p2sh-segwit") -> Ok Wallet.P2SH_P2WPKH
         | Some (`String other) ->
-          (* Core accepts "p2sh-segwit" too; camlcoin's wallet key model has no
-             P2SH-P2WPKH derivation path, so it is reported as unsupported here
-             rather than silently mislabelled. Mirrors Core's
-             RPC_INVALID_ADDRESS_OR_KEY "Unknown address type" surface. *)
-          Error (Printf.sprintf "Unknown address type '%s'" other)
-        | Some _ -> Error "Invalid address type argument"
+          Error (rpc_invalid_address,
+                 Printf.sprintf "Unknown address type '%s'" other)
+        | Some _ -> Error (rpc_type_error, "JSON value of type string is requested")
       in
       match addr_type_result with
       | Error e -> Error e
@@ -15048,9 +15046,7 @@ let dispatch_rpc (ctx : rpc_context)
   | "getbalance" ->
     Ok (handle_getbalance ctx params)
   | "getnewaddress" ->
-    (match handle_getnewaddress ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_wallet_error, msg))
+    handle_getnewaddress ctx params
   | "sethdseed" ->
     (match handle_sethdseed ctx params with
      | Ok r -> Ok r

@@ -273,6 +273,29 @@ let derive_bip44_change (master : extended_key) (n : int) : (Cstruct.t, string) 
   derive_normal change n >>= fun child ->
   Ok child.key
 
+(* Derive BIP-49 receive key: m/49'/0'/0'/0/n (P2SH-P2WPKH / p2sh-segwit).
+   Core's descriptor wallet mints sh(wpkh()) on the BIP-49 account. *)
+let derive_bip49_receive (master : extended_key) (n : int) : (Cstruct.t, string) result =
+  let open Result in
+  let ( >>= ) = bind in
+  derive_hardened master 49 >>= fun purpose ->
+  derive_hardened purpose 0 >>= fun coin_type ->
+  derive_hardened coin_type 0 >>= fun account ->
+  derive_normal account 0 >>= fun change ->
+  derive_normal change n >>= fun child ->
+  Ok child.key
+
+(* Derive BIP-49 change key: m/49'/0'/0'/1/n (P2SH-P2WPKH) *)
+let derive_bip49_change (master : extended_key) (n : int) : (Cstruct.t, string) result =
+  let open Result in
+  let ( >>= ) = bind in
+  derive_hardened master 49 >>= fun purpose ->
+  derive_hardened purpose 0 >>= fun coin_type ->
+  derive_hardened coin_type 0 >>= fun account ->
+  derive_normal account 1 >>= fun change ->
+  derive_normal change n >>= fun child ->
+  Ok child.key
+
 (* Derive BIP-86 receive key: m/86'/0'/0'/0/n (P2TR) *)
 let derive_bip86_receive (master : extended_key) (n : int) : (Cstruct.t, string) result =
   let open Result in
@@ -375,7 +398,7 @@ let deserialize_extended_key (s : string) : (extended_key * bool, string) result
    ============================================================================ *)
 
 (* Address type for key derivation *)
-type address_type = P2PKH | P2WPKH | P2TR
+type address_type = P2PKH | P2SH_P2WPKH | P2WPKH | P2TR
 
 (* A keypair for signing *)
 type key_pair = {
@@ -463,6 +486,8 @@ type t = {
   (* Separate indices for each address type *)
   mutable bip44_receive_index : int;  (* m/44'/0'/0'/0/n - P2PKH *)
   mutable bip44_change_index : int;   (* m/44'/0'/0'/1/n - P2PKH *)
+  mutable bip49_receive_index : int;  (* m/49'/0'/0'/0/n - P2SH-P2WPKH *)
+  mutable bip49_change_index : int;   (* m/49'/0'/0'/1/n - P2SH-P2WPKH *)
   mutable bip86_receive_index : int;  (* m/86'/0'/0'/0/n - P2TR *)
   mutable bip86_change_index : int;   (* m/86'/0'/0'/1/n - P2TR *)
   sent_transactions : (string, Types.transaction) Hashtbl.t;
@@ -515,6 +540,8 @@ let create ~(network : [`Mainnet | `Testnet | `Regtest])
     change_index = 0;
     bip44_receive_index = 0;
     bip44_change_index = 0;
+    bip49_receive_index = 0;
+    bip49_change_index = 0;
     bip86_receive_index = 0;
     bip86_change_index = 0;
     sent_transactions = Hashtbl.create 16;
@@ -577,6 +604,8 @@ let set_hd_seed (w : t) (seed : Cstruct.t) : unit =
   w.change_index <- 0;
   w.bip44_receive_index <- 0;
   w.bip44_change_index <- 0;
+  w.bip49_receive_index <- 0;
+  w.bip49_change_index <- 0;
   w.bip86_receive_index <- 0;
   w.bip86_change_index <- 0;
   (* Fresh-wallet ledger reset: re-deriving keys does not re-derive funds. *)
@@ -613,19 +642,51 @@ let list_find_index (pred : 'a -> bool) (lst : 'a list) : int option =
 let taproot_output_key_of_privkey (private_key : Cstruct.t) : Cstruct.t =
   Crypto.compute_taproot_output_key (Crypto.derive_xonly_pubkey private_key) None
 
+(* P2SH-P2WPKH redeemScript = OP_0 <hash160(pubkey)> (BIP-141 nested).
+   The address is P2SH of HASH160(redeemScript). Core OutputType::P2SH_SEGWIT
+   for a compressed pubkey (GetScriptForDestination(WitnessV0KeyHash)
+   then ScriptHash). Defined here so generate_key_typed / is_mine can use
+   it before build_p2wpkh_script is in scope. *)
+let p2wpkh_redeem_script (pubkey : Cstruct.t) : Cstruct.t =
+  let pkh = Crypto.hash160 pubkey in
+  let redeem = Cstruct.create 22 in
+  Cstruct.set_uint8 redeem 0 0x00;
+  Cstruct.set_uint8 redeem 1 0x14;
+  Cstruct.blit pkh 0 redeem 2 20;
+  redeem
+
+let p2sh_p2wpkh_address ~network (pubkey : Cstruct.t) : Address.address =
+  Address.of_script_hash ~network (Crypto.hash160 (p2wpkh_redeem_script pubkey))
+
+let address_of_typed_key ~network addr_type private_key public_key =
+  match addr_type with
+  | P2TR ->
+    (* P2TR address = BIP-86 TWEAKED output key (not the raw internal key). *)
+    let output_key = taproot_output_key_of_privkey private_key in
+    Address.of_pubkey ~network Address.P2TR output_key
+  | P2SH_P2WPKH ->
+    p2sh_p2wpkh_address ~network public_key
+  | P2PKH ->
+    Address.of_pubkey ~network Address.P2PKH public_key
+  | P2WPKH ->
+    Address.of_pubkey ~network Address.P2WPKH public_key
+
 (* Generate a new keypair with specified address type.
    If master_key is set, derive via appropriate BIP path; otherwise use random. *)
 let generate_key_typed (w : t) (addr_type : address_type) : key_pair =
-  let derivation_fn, get_index, set_index, addr_constructor = match addr_type with
+  let derivation_fn, get_index, set_index = match addr_type with
     | P2PKH ->
       (derive_bip44_receive, (fun () -> w.bip44_receive_index),
-       (fun idx -> w.bip44_receive_index <- idx + 1), Address.P2PKH)
+       (fun idx -> w.bip44_receive_index <- idx + 1))
+    | P2SH_P2WPKH ->
+      (derive_bip49_receive, (fun () -> w.bip49_receive_index),
+       (fun idx -> w.bip49_receive_index <- idx + 1))
     | P2WPKH ->
       (derive_bip84_receive, (fun () -> w.receive_index),
-       (fun idx -> w.receive_index <- idx + 1), Address.P2WPKH)
+       (fun idx -> w.receive_index <- idx + 1))
     | P2TR ->
       (derive_bip86_receive, (fun () -> w.bip86_receive_index),
-       (fun idx -> w.bip86_receive_index <- idx + 1), Address.P2TR)
+       (fun idx -> w.bip86_receive_index <- idx + 1))
   in
   let private_key = match w.master_key with
     | Some master ->
@@ -642,14 +703,7 @@ let generate_key_typed (w : t) (addr_type : address_type) : key_pair =
       Crypto.generate_private_key ()
   in
   let public_key = Crypto.derive_public_key ~compressed:true private_key in
-  let address = match addr_type with
-    | P2TR ->
-      (* P2TR address = BIP-86 TWEAKED output key (not the raw internal key). *)
-      let output_key = taproot_output_key_of_privkey private_key in
-      Address.of_pubkey ~network:w.network addr_constructor output_key
-    | _ ->
-      Address.of_pubkey ~network:w.network addr_constructor public_key
-  in
+  let address = address_of_typed_key ~network:w.network addr_type private_key public_key in
   let kp = { private_key; public_key; address; addr_type } in
   w.keys <- w.keys @ [kp];
   w.next_key_index <- w.next_key_index + 1;
@@ -662,16 +716,19 @@ let generate_key (w : t) : key_pair =
 
 (* Generate a change key with specified address type *)
 let generate_change_key_typed (w : t) (addr_type : address_type) : key_pair =
-  let derivation_fn, get_index, set_index, addr_constructor = match addr_type with
+  let derivation_fn, get_index, set_index = match addr_type with
     | P2PKH ->
       (derive_bip44_change, (fun () -> w.bip44_change_index),
-       (fun idx -> w.bip44_change_index <- idx + 1), Address.P2PKH)
+       (fun idx -> w.bip44_change_index <- idx + 1))
+    | P2SH_P2WPKH ->
+      (derive_bip49_change, (fun () -> w.bip49_change_index),
+       (fun idx -> w.bip49_change_index <- idx + 1))
     | P2WPKH ->
       (derive_bip84_change, (fun () -> w.change_index),
-       (fun idx -> w.change_index <- idx + 1), Address.P2WPKH)
+       (fun idx -> w.change_index <- idx + 1))
     | P2TR ->
       (derive_bip86_change, (fun () -> w.bip86_change_index),
-       (fun idx -> w.bip86_change_index <- idx + 1), Address.P2TR)
+       (fun idx -> w.bip86_change_index <- idx + 1))
   in
   let private_key = match w.master_key with
     | Some master ->
@@ -688,14 +745,7 @@ let generate_change_key_typed (w : t) (addr_type : address_type) : key_pair =
       Crypto.generate_private_key ()
   in
   let public_key = Crypto.derive_public_key ~compressed:true private_key in
-  let address = match addr_type with
-    | P2TR ->
-      (* P2TR change address = BIP-86 TWEAKED output key (see receive path). *)
-      let output_key = taproot_output_key_of_privkey private_key in
-      Address.of_pubkey ~network:w.network addr_constructor output_key
-    | _ ->
-      Address.of_pubkey ~network:w.network addr_constructor public_key
-  in
+  let address = address_of_typed_key ~network:w.network addr_type private_key public_key in
   let kp = { private_key; public_key; address; addr_type } in
   w.keys <- w.keys @ [kp];
   w.next_key_index <- w.next_key_index + 1;
@@ -743,6 +793,14 @@ let is_mine (w : t) (script_pubkey : Cstruct.t)
     List.find_opt (fun kp ->
       let output_key = taproot_output_key_of_privkey kp.private_key in
       Cstruct.equal output_key xonly_hash
+    ) w.keys
+  | Script.P2SH_script script_hash ->
+    (* Nested P2SH-P2WPKH (getnewaddress p2sh-segwit / BIP-49). Any owned
+       compressed pubkey whose HASH160(OP_0 <pkh>) equals the script hash
+       is ours — so scan_block credits coins sent to a nested wrap. *)
+    List.find_opt (fun kp ->
+      Cstruct.equal (Crypto.hash160 (p2wpkh_redeem_script kp.public_key))
+        script_hash
     ) w.keys
   | _ -> None
 
@@ -813,19 +871,7 @@ let import_wif (w : t) ?(addr_type = P2WPKH) (wif : string) : (key_pair, string)
   | Error e -> Error e
   | Ok (private_key, _compressed, _network) ->
     let public_key = Crypto.derive_public_key ~compressed:true private_key in
-    let address_constructor = match addr_type with
-      | P2PKH -> Address.P2PKH
-      | P2WPKH -> Address.P2WPKH
-      | P2TR -> Address.P2TR
-    in
-    let address = match addr_type with
-      | P2TR ->
-        (* P2TR imported key address = BIP-86 TWEAKED output key. *)
-        let output_key = taproot_output_key_of_privkey private_key in
-        Address.of_pubkey ~network:w.network address_constructor output_key
-      | _ ->
-        Address.of_pubkey ~network:w.network address_constructor public_key
-    in
+    let address = address_of_typed_key ~network:w.network addr_type private_key public_key in
     let kp = { private_key; public_key; address; addr_type } in
     w.keys <- w.keys @ [kp];
     w.next_key_index <- w.next_key_index + 1;
@@ -2810,12 +2856,14 @@ let hex_to_cstruct (s : string) : Cstruct.t =
 (* Convert address_type to string *)
 let addr_type_to_string = function
   | P2PKH -> "p2pkh"
+  | P2SH_P2WPKH -> "p2sh-p2wpkh"
   | P2WPKH -> "p2wpkh"
   | P2TR -> "p2tr"
 
 (* Convert string to address_type *)
 let addr_type_of_string = function
   | "p2pkh" -> P2PKH
+  | "p2sh-p2wpkh" -> P2SH_P2WPKH
   | "p2tr" -> P2TR
   | _ -> P2WPKH  (* default *)
 
@@ -2915,6 +2963,8 @@ let wallet_to_json (w : t) : Yojson.Safe.t =
     ("balance_unconfirmed", `String (Int64.to_string w.balance_unconfirmed));
     ("bip44_receive_index", `Int w.bip44_receive_index);
     ("bip44_change_index", `Int w.bip44_change_index);
+    ("bip49_receive_index", `Int w.bip49_receive_index);
+    ("bip49_change_index", `Int w.bip49_change_index);
     ("bip86_receive_index", `Int w.bip86_receive_index);
     ("bip86_change_index", `Int w.bip86_change_index);
     ("tx_history", `List history_json);
@@ -2981,19 +3031,7 @@ let load_wallet_json (w : t) (network : [`Mainnet | `Testnet | `Regtest]) (json 
                 | Some (`String s) -> addr_type_of_string s
                 | _ -> P2WPKH
               in
-              let addr_constructor = match addr_type with
-                | P2PKH -> Address.P2PKH
-                | P2WPKH -> Address.P2WPKH
-                | P2TR -> Address.P2TR
-              in
-              let address = match addr_type with
-                | P2TR ->
-                  (* P2TR address = BIP-86 TWEAKED output key. *)
-                  let output_key = taproot_output_key_of_privkey private_key in
-                  Address.of_pubkey ~network addr_constructor output_key
-                | _ ->
-                  Address.of_pubkey ~network addr_constructor public_key
-              in
+              let address = address_of_typed_key ~network addr_type private_key public_key in
               w.keys <- w.keys @ [{ private_key; public_key; address; addr_type }]
             | _ -> ())
          | _ -> ()
@@ -3067,6 +3105,10 @@ let load_wallet_json (w : t) (network : [`Mainnet | `Testnet | `Regtest]) (json 
      | Some (`Int n) -> w.bip44_receive_index <- n | _ -> ());
     (match List.assoc_opt "bip44_change_index" fields with
      | Some (`Int n) -> w.bip44_change_index <- n | _ -> ());
+    (match List.assoc_opt "bip49_receive_index" fields with
+     | Some (`Int n) -> w.bip49_receive_index <- n | _ -> ());
+    (match List.assoc_opt "bip49_change_index" fields with
+     | Some (`Int n) -> w.bip49_change_index <- n | _ -> ());
     (match List.assoc_opt "bip86_receive_index" fields with
      | Some (`Int n) -> w.bip86_receive_index <- n | _ -> ());
     (match List.assoc_opt "bip86_change_index" fields with
@@ -3343,6 +3385,7 @@ let ledger_fingerprint (w : t) : int =
     (List.length w.keys, List.length w.utxos, w.balance_confirmed,
      w.balance_unconfirmed, List.length w.tx_history,
      w.next_key_index, w.bip44_receive_index, w.bip44_change_index,
+     w.bip49_receive_index, w.bip49_change_index,
      w.bip86_receive_index, w.bip86_change_index)
 
 (* Periodic-flush throttle state: when a block-connect did NOT change the

@@ -2356,13 +2356,7 @@ let test_submitpackage_dispatcher () =
 let make_wallet_utxo (w : Wallet.t) ~txid ~vout ~value : Wallet.wallet_utxo =
   (* Generate a key the wallet owns so coin selection paths can sign. *)
   let kp = Wallet.generate_key w in
-  let script_pubkey = match kp.Wallet.addr_type with
-    | Wallet.P2WPKH -> Wallet.build_p2wpkh_script (Crypto.hash160 kp.public_key)
-    | Wallet.P2PKH -> Wallet.build_p2pkh_script (Crypto.hash160 kp.public_key)
-    | Wallet.P2TR ->
-      let xonly = Crypto.derive_xonly_pubkey kp.private_key in
-      Wallet.build_p2tr_script xonly
-  in
+  let script_pubkey = Wallet.build_output_script kp.Wallet.address in
   { Wallet.outpoint = { Types.txid; vout };
     utxo = { Utxo.value; script_pubkey; height = 1; is_coinbase = false };
     key_index = 0;

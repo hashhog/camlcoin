@@ -739,22 +739,30 @@ let deserialize (data : Cstruct.t) : (psbt, psbt_error) result =
 
             (match key_type with
              | t when t = psbt_global_unsigned_tx ->
+               (* BIP-174: the global unsigned tx is the OLD serialization
+                  (no witness). deserialize_transaction peeks at vin-count
+                  0x00 as a BIP-144 marker, so a 0-input PSBT (createpsbt
+                  with []) throws "need 4 bytes but only 2 remaining". *)
                let tx_r = Serialize.reader_of_cstruct value in
-               let parsed_tx = Serialize.deserialize_transaction tx_r in
-               (* Verify scriptSig and witness are empty *)
-               let has_script = List.exists (fun inp ->
-                 Cstruct.length inp.Types.script_sig > 0
-               ) parsed_tx.inputs in
-               let has_witness = parsed_tx.witnesses <> [] &&
-                 List.exists (fun wit -> wit.Types.items <> []) parsed_tx.witnesses in
-               if has_script then
-                 Error Invalid_tx_scriptSig_not_empty
-               else if has_witness then
-                 Error Invalid_tx_witness_not_empty
-               else begin
-                 tx := Some parsed_tx;
-                 read_global ()
-               end
+               (try
+                  let parsed_tx =
+                    Serialize.deserialize_transaction_no_witness tx_r
+                  in
+                  (* Verify scriptSig and witness are empty *)
+                  let has_script = List.exists (fun inp ->
+                    Cstruct.length inp.Types.script_sig > 0
+                  ) parsed_tx.inputs in
+                  let has_witness = parsed_tx.witnesses <> [] &&
+                    List.exists (fun wit -> wit.Types.items <> []) parsed_tx.witnesses in
+                  if has_script then
+                    Error Invalid_tx_scriptSig_not_empty
+                  else if has_witness then
+                    Error Invalid_tx_witness_not_empty
+                  else begin
+                    tx := Some parsed_tx;
+                    read_global ()
+                  end
+                with Failure msg -> Error (Parse_error msg))
 
              | t when t = psbt_global_xpub ->
                if Cstruct.length key_data = 78 then begin
@@ -1661,4 +1669,5 @@ let of_base64 (s : string) : (psbt, psbt_error) result =
   match Base64.decode s with
   | Error _ -> Error (Parse_error "Invalid base64")
   | Ok decoded ->
-    deserialize (Cstruct.of_string decoded)
+    try deserialize (Cstruct.of_string decoded)
+    with Failure msg -> Error (Parse_error msg)

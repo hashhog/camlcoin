@@ -279,6 +279,21 @@ let serialize_transaction_no_witness w (tx : Types.transaction) =
   List.iter (serialize_tx_out w) tx.outputs;
   write_int32_le w tx.locktime
 
+(* Deserialize the old (pre-segwit) transaction format. Matches Core
+   UnserializeTransaction with TX_NO_WITNESS (allow_witness=false):
+   version | vin | vout | nLockTime, never treating a 0x00 vin-count as a
+   BIP-144 marker. Required for PSBT global unsigned-tx (BIP-174: "Must
+   be in the old serialization format (no witness)"), including the
+   0-input createpsbt skeleton the R5 joinpsbts probe uses. *)
+let deserialize_transaction_no_witness r : Types.transaction =
+  let version = read_int32_le r in
+  let in_count = read_compact_size r in
+  let inputs = List.init in_count (fun _ -> deserialize_tx_in r) in
+  let out_count = read_compact_size r in
+  let outputs = List.init out_count (fun _ -> deserialize_tx_out r) in
+  let locktime = read_int32_le r in
+  { version; inputs; outputs; witnesses = []; locktime }
+
 (* Block header serialization - always exactly 80 bytes *)
 let serialize_block_header w (bh : Types.block_header) =
   write_int32_le w bh.version;

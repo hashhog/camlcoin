@@ -353,30 +353,29 @@ let resolve_debug_categories (raw : string list) : string list =
    REST / PKG-RELAY / PayJoin). The Logs library reports a `Debug`-level
    record for a source IFF that source's level is `Some Debug`
    (logs.mli:22-25), and `Logs.debug`/`Log.debug` re-reads `Src.level` on
-   EVERY call. So the live mask is just each source's own reporting level —
-   there is NO snapshot to go stale (the trap the ouroboros port called out):
-   we mutate the real `Logs.Src` the running node logs through, and the next
-   `Log.debug` honours it.
+   EVERY call. Enabling a mapped Core name mutates those sources, so there
+   is NO snapshot to go stale for the names we actually log through.
 
-   "Active" (== being debug logged, Core's `WillLogCategory`) is defined as
-   `Logs.Src.level src = Some Debug`. enable -> set the source to `Some Debug`
-   (its `Log.debug` calls start flowing); disable -> set it to `Some Info`
-   (Debug records are suppressed again while Info/Warn/Error survive, matching
-   Core where a non-debug category still emits at higher levels).
+   The RPC surface uses Core's LOG_CATEGORIES_BY_STR names (lowercase
+   `net`/`rpc`/`mempool`/`validation`/...), not the Logs.Src names. The R5
+   probe requires those four keys; operators copying a Core `logging`
+   snippet expect the rest. Unmapped Core names (tor, zmq, ...) are
+   accepted as no-ops and tracked in extra_rpc_enabled so they round-trip
+   in the status object. Internal Logs.Src names ("NET") are NOT accepted
+   as RPC inputs — Core rejects them with -8.
+
+   "Active" for a mapped name is `Logs.Src.level src = Some Debug` on any
+   mapped source (so a CLI `-debug=NET` is visible through the RPC). For
+   unmapped names it is extra_rpc_enabled. enable -> Some Debug (and/or
+   extra true); disable -> Some Info (Debug suppressed, higher levels
+   survive) and extra false.
 
    The application's default source (`Logs.default`) is intentionally
-   EXCLUDED from the category set: it is the unnamed catch-all, not a real
+   EXCLUDED from the source set: it is the unnamed catch-all, not a real
    Core-style debug category, and Core does not expose it either. *)
 
 (* camlcoin's OWN debug categories — the named `Logs.Src` each node module
-   registers (one per subsystem). This is the documented category set the
-   `logging` RPC exposes; it deliberately EXCLUDES (a) the unnamed default
-   application source and (b) the library-internal sources that linked deps
-   (cohttp / tls / x509 / mirage-crypto / bos / ca-certs / ...) create via
-   their own `Logs.Src.create`. Core only reports its own categories
-   (LOG_CATEGORIES_BY_STR), not the logging substrate's internals, so we do
-   the same: an allowlist keyed by the source NAME the camlcoin modules use.
-
+   registers (one per subsystem). Used to find the live sources we mutate.
    Keep this in sync with the `Logs.Src.create` calls across lib/*.ml:
      RPC          rpc.ml            REST       rest.ml
      NET          peer_manager.ml   PEER       peer.ml
@@ -387,6 +386,31 @@ let camlcoin_category_names : string list =
   [ "RPC"; "REST"; "NET"; "PEER"; "MEMPOOL"; "VALIDATION";
     "WALLET"; "MINING"; "PKG-RELAY"; "PayJoin" ]
 
+(* Core rpc/node.cpp logging() keys. bitcoin-core/src/logging.cpp
+   LOG_CATEGORIES_BY_STR, minus `lock` (DEBUG_LOCKCONTENTION only).
+   Alphabetical: Core iterates a std::map. *)
+let core_logging_categories : string list =
+  [ "addrman"; "bench"; "blockstorage"; "cmpctblock"; "coindb";
+    "estimatefee"; "http"; "i2p"; "ipc"; "kernel"; "leveldb"; "libevent";
+    "mempool"; "mempoolrej"; "net"; "privatebroadcast"; "proxy"; "prune";
+    "qt"; "rand"; "reindex"; "rpc"; "scan"; "selectcoins"; "tor";
+    "txpackages"; "txreconciliation"; "validation"; "walletdb"; "zmq" ]
+
+(* Core RPC name -> camlcoin Logs.Src names. Unmapped Core names are
+   tracked only in extra_rpc_enabled. *)
+let core_to_src_names : (string * string list) list =
+  [ "net", ["NET"; "PEER"];
+    "rpc", ["RPC"];
+    "mempool", ["MEMPOOL"];
+    "validation", ["VALIDATION"];
+    "http", ["REST"];
+    "walletdb", ["WALLET"];
+    "txpackages", ["PKG-RELAY"] ]
+
+(* Live mask for Core names that have no Logs.Src. Presence of `true`
+   means the RPC last enabled it. *)
+let extra_rpc_enabled : (string, bool) Hashtbl.t = Hashtbl.create 32
+
 (* The live `Logs.Src` objects for camlcoin's own categories (those present in
    the running source list whose name is in the allowlist). Discovered from
    the live list so we mutate the exact source the node logs through. *)
@@ -396,58 +420,83 @@ let logging_category_sources () : Logs.src list =
          (not (Logs.Src.equal src Logs.default))
          && List.mem (Logs.Src.name src) camlcoin_category_names)
 
-(* Category names, alphabetically sorted (Core iterates a std::map, so the
-   `logging` output is alphabetical and byte-stable). De-duplicated in the
-   unlikely event two modules share a source name. *)
-let logging_category_names () : string list =
-  logging_category_sources ()
-  |> List.map Logs.Src.name
-  |> List.sort_uniq String.compare
+(* Category names the `logging` RPC emits, alphabetically (Core std::map). *)
+let logging_category_names () : string list = core_logging_categories
 
-(* A category is "active" (being debug logged) iff its source reports Debug. *)
+(* A source is "active" (being debug logged) iff it reports Debug. *)
 let category_is_active (src : Logs.src) : bool =
   match Logs.Src.level src with
   | Some Logs.Debug -> true
   | _ -> false
 
-(* Look up a source by exact name (Core's category names are case-sensitive
-   lookups against LOG_CATEGORIES_BY_STR). Returns None for an unknown name so
-   the caller can raise Core's -8 "unknown logging category". *)
+let srcs_for_core_name (name : string) : Logs.src list =
+  match List.assoc_opt name core_to_src_names with
+  | Some src_names ->
+    logging_category_sources ()
+    |> List.filter (fun src -> List.mem (Logs.Src.name src) src_names)
+  | None -> []
+
+let is_known_logging_category (name : string) : bool =
+  List.mem name core_logging_categories
+
+(* Look up a source by exact Logs.Src name. Kept for CLI / tests. *)
 let find_category_source (name : string) : Logs.src option =
   List.find_opt
     (fun src -> Logs.Src.name src = name)
     (logging_category_sources ())
 
-(* Enable one category by name: source -> Some Debug (its Log.debug flows).
-   Returns false for an unknown name (Core EnableCategory contract). *)
+(* Enable one Core category name. Returns false for an unknown name
+   (Core EnableCategory contract). Internal Logs.Src names ("NET") are
+   unknown here — Core is case-sensitive against LOG_CATEGORIES_BY_STR. *)
 let enable_category (name : string) : bool =
-  match find_category_source name with
-  | Some src -> Logs.Src.set_level src (Some Logs.Debug); true
-  | None -> false
+  if not (is_known_logging_category name) then false
+  else begin
+    List.iter (fun src -> Logs.Src.set_level src (Some Logs.Debug))
+      (srcs_for_core_name name);
+    Hashtbl.replace extra_rpc_enabled name true;
+    true
+  end
 
-(* Disable one category by name: source -> Some Info (Debug suppressed, higher
-   levels survive). Returns false for an unknown name. *)
+(* Disable one Core category name. Returns false for an unknown name. *)
 let disable_category (name : string) : bool =
-  match find_category_source name with
-  | Some src -> Logs.Src.set_level src (Some Logs.Info); true
-  | None -> false
+  if not (is_known_logging_category name) then false
+  else begin
+    List.iter (fun src -> Logs.Src.set_level src (Some Logs.Info))
+      (srcs_for_core_name name);
+    Hashtbl.replace extra_rpc_enabled name false;
+    true
+  end
 
 (* Special tokens "all" / "1" (and "" / "none" / "0") — enable or disable the
    WHOLE mask in one shot, like Core's EnableCategory("all"). Always succeeds. *)
 let enable_all_categories () : unit =
   List.iter (fun src -> Logs.Src.set_level src (Some Logs.Debug))
-    (logging_category_sources ())
+    (logging_category_sources ());
+  List.iter (fun n -> Hashtbl.replace extra_rpc_enabled n true)
+    core_logging_categories
 
 let disable_all_categories () : unit =
   List.iter (fun src -> Logs.Src.set_level src (Some Logs.Info))
-    (logging_category_sources ())
+    (logging_category_sources ());
+  List.iter (fun n -> Hashtbl.replace extra_rpc_enabled n false)
+    core_logging_categories
 
-(* The full {category: active} snapshot, alphabetical — built fresh on each
-   call (never cached), so it always reflects the live source levels. *)
+(* Full {category: active} snapshot in Core key order. Mapped names
+   read the live Logs.Src (so CLI `-debug` is visible); unmapped names
+   read extra_rpc_enabled. Built fresh on each call, never cached. *)
 let logging_status_map () : (string * bool) list =
-  logging_category_sources ()
-  |> List.map (fun src -> (Logs.Src.name src, category_is_active src))
-  |> List.sort_uniq (fun (a, _) (b, _) -> String.compare a b)
+  List.map
+    (fun name ->
+      let srcs = srcs_for_core_name name in
+      let active =
+        if srcs <> [] then List.exists category_is_active srcs
+        else
+          match Hashtbl.find_opt extra_rpc_enabled name with
+          | Some b -> b
+          | None -> false
+      in
+      (name, active))
+    core_logging_categories
 
 (* ============================================================================
    Ready-fd handshake (--ready-fd=<N>)

@@ -12378,6 +12378,7 @@ let handle_help (_ctx : rpc_context)
       "decodepsbt \"psbt\"";
       "descriptorprocesspsbt \"psbt\" [\"descriptor\",...] ( \"sighashtype\" bip32derivs finalize )";
       "finalizepsbt \"psbt\" ( extract )";
+      "joinpsbts [\"psbt\",...]";
       "utxoupdatepsbt \"psbt\"";
       "walletcreatefundedpsbt [{\"txid\":\"...\", \"vout\":n},...] [{\"address\":amount},...] ( locktime options bip32derivs )";
       "fundrawtransaction \"hexstring\" ( options iswitness )";
@@ -14436,12 +14437,11 @@ let handle_getmemoryinfo (_ctx : rpc_context)
    expand to the whole mask; in the exclude slot "all"/"1" (and ""/"none"/"0")
    clear it. These mirror Core's EnableCategory("all") / the "none" effect.
 
-   Returns: a JSON OBJECT mapping every REAL category name -> bool (whether it
-   is currently being debug logged), in ascending alphabetical key order (Core
-   iterates a std::map; alphabetical is byte-stable). The category NAMES are
-   camlcoin's own `Logs.Src` names (PEER/NET/MEMPOOL/...) — the task permits
-   the names to differ per node; only the SHAPE, param-semantics and the -8
-   error must match Core.
+   Returns: a JSON OBJECT mapping every Core LOG_CATEGORIES_BY_STR name ->
+   bool (whether it is currently being debug logged), in ascending
+   alphabetical key order (Core iterates a std::map; alphabetical is
+   byte-stable). Keys are Core's lowercase names (`net`, `rpc`,
+   `mempool`, `validation`, ...), not camlcoin's Logs.Src names.
 
    Errors:
      - Unknown category in either array -> RPC_INVALID_PARAMETER (-8),

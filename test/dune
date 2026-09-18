@@ -160,3 +160,12 @@
 (executable
  (name test_block_download_timeout)
  (libraries camlcoin test_tmp alcotest lwt lwt.unix unix))
+
+; Control for the one-peer campaign HOL-cap stall (QUEUES.md item 0,
+; range 419311→450000 STALLED at 421316). Asserts a RATE, not eventual
+; completion. Revert of far-ahead eviction / max-weight timeout makes
+; cap+timeout+rate fail.
+;   dune exec --no-buffer test/test_campaign_hol_cap_wedge.exe
+(executable
+ (name test_campaign_hol_cap_wedge)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix))

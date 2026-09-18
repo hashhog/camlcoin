@@ -249,7 +249,7 @@ let test_stall_rotates_to_other_peer () =
       ps.blocks_in_flight <- 1;
       let peer1, ic1, _oc1, _ = make_pair ~id:1 in
       let peer2, ic2, _oc2, _ = make_pair ~id:2 in
-      let to_drop = Sync.check_stalled_downloads ibd in
+      let to_drop = Sync.check_stalled_downloads ~n_ready_peers:2 ibd in
       Alcotest.(check bool) "unique staller is named for disconnect" true
         (List.mem 1 to_drop);
       (match entry.Sync.download_state with
@@ -321,7 +321,13 @@ let test_mute_mid_body_tip_advances () =
         if Unix.gettimeofday () >= deadline || chain.Sync.blocks_synced >= 1
         then Lwt.return_unit
         else begin
-          let stalled = Sync.check_stalled_downloads ibd in
+          let n_ready =
+            List.length
+              (List.filter
+                 (fun p -> p.Peer.state = Peer.Ready)
+                 [ peer_a; peer_b ])
+          in
+          let stalled = Sync.check_stalled_downloads ~n_ready_peers:n_ready ibd in
           List.iter
             (fun pid ->
               List.iter

@@ -2994,12 +2994,23 @@ let txospender_disconnect_if_enabled
 (* IBD configuration constants *)
 let max_blocks_per_peer = 16           (* Max in-flight blocks per peer, matching Bitcoin Core MAX_BLOCKS_IN_TRANSIT_PER_PEER *)
 let max_total_blocks_in_flight = 128   (* Global cap on blocks in flight (8 peers × 16 per peer) *)
-let stall_timeout = 2.0                 (* Core BLOCK_STALLING_TIMEOUT — unique staller disconnect *)
-(* Core BLOCK_DOWNLOAD_TIMEOUT_BASE = 1 × nPowTargetSpacing (600s).  A
-   mute request must not sit in-flight that long; stall_timeout is the
-   bound that actually fires. *)
+let stall_timeout = 2.0                 (* Core BLOCK_STALLING_TIMEOUT — unique staller disconnect when another peer exists *)
+(* Head-of-window slots the in-order drain can advance on. ouroboros
+   HEAD_OF_WINDOW = 8; far-ahead in-flight behind these is the campaign
+   FIFO stall (range 419311 STALLED at 421316). *)
+let head_of_window = 8
+(* 4_000_000 serialized bytes at 32 KiB/s ≈ 122 s; blockbrew 09695ad
+   sized BaseStallTimeout at 128 s (4 MiB / 32 KiB/s). Core
+   BLOCK_DOWNLOAD_TIMEOUT_BASE is 600 s. A 1.54 MB near-max body at
+   32 KiB/s is 47 s — the old 60 s base / 2 s stall reset aborted a
+   healthy fetch. *)
+let min_live_block_throughput = 32768.0
+let max_block_serialized_size = 4_000_000
+let hol_fetch_timeout =
+  max 128.0
+    (float_of_int max_block_serialized_size /. min_live_block_throughput)
 let block_download_timeout_base = float_of_int Consensus.target_spacing
-let base_block_timeout = 60.0           (* 60s base timeout — matches Bitcoin Core's conservative approach *)
+let base_block_timeout = hol_fetch_timeout
 let max_block_timeout = 300.0           (* 5 min max timeout per block *)
 let max_stall_timeout = 1200.0          (* 20 min max stall — matches Bitcoin Core *)
 let max_consecutive_timeouts = 5        (* More forgiving before disconnect *)
@@ -3283,27 +3294,84 @@ let check_timeouts (ibd : ibd_state) : unit =
     | _ -> ()
   ) ibd.block_queue
 
+let is_head_of_window (ibd : ibd_state) (height : int) : bool =
+  height >= ibd.next_process_height
+  && height < ibd.next_process_height + head_of_window
+
+(* Drop every non-head in-flight request from [peer_id]. Evicting a single
+   far-ahead slot lets tip+1 fit under max_blocks_per_peer, but the remaining
+   15 keep older timestamps. A FIFO feeder — the campaign replay peer
+   included — then spends minutes serving those bodies before the connect
+   cursor. Clearing the far-ahead pipeline makes HOL the next delivery.
+   Do not record tried_peers: this is reordering, not a failure. *)
+let evict_far_ahead_from_peer (ibd : ibd_state) (peer_id : int) : int =
+  let n = ref 0 in
+  Queue.iter (fun entry ->
+    match entry.download_state with
+    | Requested { peer_id = pid; _ }
+      when pid = peer_id && not (is_head_of_window ibd entry.height) ->
+      entry.download_state <- NotRequested;
+      ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
+      let peer_state = get_peer_state ibd peer_id in
+      peer_state.blocks_in_flight <- max 0 (peer_state.blocks_in_flight - 1);
+      incr n
+    | _ -> ()
+  ) ibd.block_queue;
+  if !n > 0 then
+    Logs.info (fun m ->
+      m "evicted %d far-ahead in-flight from peer %d so the connect \
+         cursor is next on the wire"
+        !n peer_id);
+  !n
+
+let heads_covered (ibd : ibd_state) : bool =
+  let rec loop h =
+    if h >= ibd.next_process_height + head_of_window then true
+    else
+      match queue_find_by_height ibd h with
+      | None -> true
+      | Some e ->
+        (match e.download_state with
+         | NotRequested -> false
+         | _ -> loop (h + 1))
+  in
+  loop ibd.next_process_height
+
 (* Check for stalled block downloads with exponential backoff and peer disconnect.
-   Iterates block queue entries in Requested state. If the request has been pending
-   for > stall_timeout (2s) with no progress, reset to NotRequested so it can be
-   retried from a different peer. If the request has exceeded the full timeout,
-   apply exponential backoff and increment the peer's consecutive timeout counter.
-   Returns a list of peer IDs that should be disconnected
-   (those exceeding max_consecutive_timeouts). *)
-let check_stalled_downloads (ibd : ibd_state) : int list =
+   A max-weight body at 32 KiB/s needs [hol_fetch_timeout] (128s); the 2s
+   unique-staller disconnect is Core BLOCK_STALLING_TIMEOUT and only fires
+   for the connect-cursor when another download peer exists. On a one-peer
+   campaign rig, disconnecting the only peer is the stall.
+   Returns a list of peer IDs that should be disconnected. *)
+let check_stalled_downloads ?(n_ready_peers = 1) (ibd : ibd_state) : int list =
   let now = Unix.gettimeofday () in
   let peers_to_disconnect = Hashtbl.create 4 in
+  let release_request entry peer_id =
+    entry.download_state <- NotRequested;
+    if not (List.mem peer_id entry.tried_peers) then
+      entry.tried_peers <- peer_id :: entry.tried_peers;
+    ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
+    let peer_state = get_peer_state ibd peer_id in
+    peer_state.blocks_in_flight <- max 0 (peer_state.blocks_in_flight - 1);
+    peer_state
+  in
   Queue.iter (fun entry ->
     match entry.download_state with
     | Requested { peer_id; requested_at; timeout } ->
-      if now > requested_at +. timeout then begin
-        entry.download_state <- NotRequested;
-        (* W34: record that this peer failed — prefer-untried avoids re-pick *)
-        if not (List.mem peer_id entry.tried_peers) then
-          entry.tried_peers <- peer_id :: entry.tried_peers;
-        ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
-        let peer_state = get_peer_state ibd peer_id in
-        peer_state.blocks_in_flight <- max 0 (peer_state.blocks_in_flight - 1);
+      let elapsed = now -. requested_at in
+      let hol = entry.height = ibd.next_process_height in
+      let past_full = now > requested_at +. timeout in
+      (* Unique staller: HOL past BLOCK_STALLING_TIMEOUT, and either
+         another peer can take the slot or the max-weight budget has
+         elapsed (one-peer rig). Do not reset far-ahead at 2s — that
+         re-queues them behind a re-requested HOL and is the FIFO rate
+         bug. *)
+      let unique_staller =
+        hol && elapsed > stall_timeout
+        && (n_ready_peers > 1 || elapsed > hol_fetch_timeout)
+      in
+      if past_full then begin
+        let peer_state = release_request entry peer_id in
         peer_state.consecutive_timeouts <- peer_state.consecutive_timeouts + 1;
         peer_state.current_timeout <- min max_stall_timeout
           (peer_state.current_timeout *. 2.0);
@@ -3314,23 +3382,13 @@ let check_stalled_downloads (ibd : ibd_state) : int list =
             peer_state.consecutive_timeouts peer_state.current_timeout);
         if peer_state.consecutive_timeouts >= max_consecutive_timeouts then
           Hashtbl.replace peers_to_disconnect peer_id true
-      end else if now > requested_at +. stall_timeout then begin
-        entry.download_state <- NotRequested;
-        (* W34: record that this peer failed (stall) *)
-        if not (List.mem peer_id entry.tried_peers) then
-          entry.tried_peers <- peer_id :: entry.tried_peers;
-        ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
-        let peer_state = get_peer_state ibd peer_id in
-        peer_state.blocks_in_flight <- max 0 (peer_state.blocks_in_flight - 1);
+      end else if unique_staller then begin
+        ignore (release_request entry peer_id);
         Logs.debug (fun m ->
           m "Stall detected for height %d from peer %d (%.1fs), \
              re-requesting from another peer"
-            entry.height peer_id (now -. requested_at));
-        (* Unique staller: this request is the one the download window is
-           waiting on. Core disconnects after BLOCK_STALLING_TIMEOUT (2s)
-           rather than polling VERSION heights for 500+s. *)
-        if entry.height = ibd.next_process_height then
-          Hashtbl.replace peers_to_disconnect peer_id true
+            entry.height peer_id elapsed);
+        Hashtbl.replace peers_to_disconnect peer_id true
       end
     | _ -> ()
   ) ibd.block_queue;
@@ -3384,13 +3442,39 @@ let request_blocks (ibd : ibd_state) (peers : Peer.peer list)
        Storage.ChainDB.has_block ibd.chain.db entry.hash then
       entry.download_state <- Validated
   ) ibd.block_queue;
-  (* Filter to ready peers with capacity *)
+  (* Live peers first, then evict far-ahead so HOL is the next FIFO
+     delivery — not the 16th behind a full cap of older getdata.
+     Evict on the current HOL holder even if it is at cap. *)
+  let live_peers = List.filter (fun p ->
+    p.Peer.state = Peer.Ready && not (Peer.body_read_stalled p)
+  ) peers in
+  (* A mute/disconnected holder must not keep the connect cursor. The
+     socket layer disconnects on payload stall (2s) but the IBD map
+     would otherwise hold HOL until hol_fetch_timeout. *)
+  let live_id p = p.Peer.id in
+  Queue.iter (fun entry ->
+    match entry.download_state with
+    | Requested { peer_id; _ }
+      when not (List.exists (fun p -> live_id p = peer_id) live_peers) ->
+      entry.download_state <- NotRequested;
+      if not (List.mem peer_id entry.tried_peers) then
+        entry.tried_peers <- peer_id :: entry.tried_peers;
+      ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
+      let ps = get_peer_state ibd peer_id in
+      ps.blocks_in_flight <- max 0 (ps.blocks_in_flight - 1)
+    | _ -> ()
+  ) ibd.block_queue;
+  List.iter (fun p -> ignore (evict_far_ahead_from_peer ibd p.Peer.id))
+    live_peers;
+  (match queue_find_by_height ibd ibd.next_process_height with
+   | Some { download_state = Requested { peer_id; _ }; _ } ->
+     ignore (evict_far_ahead_from_peer ibd peer_id)
+   | _ -> ());
+  (* Filter to ready peers with capacity (after eviction). *)
   let ready_peers = List.filter (fun p ->
-    p.Peer.state = Peer.Ready &&
-    not (Peer.body_read_stalled p) &&
     let ps = get_peer_state ibd p.Peer.id in
     ps.blocks_in_flight < max_blocks_per_peer
-  ) peers in
+  ) live_peers in
   (* Build a single list of unrequested blocks, then partition across peers *)
   let unrequested = Queue.fold (fun acc entry ->
     if entry.download_state = NotRequested then entry :: acc else acc
@@ -3414,6 +3498,13 @@ let request_blocks (ibd : ibd_state) (peers : Peer.peer list)
       let idx = ref 0 in
       List.iter (fun entry ->
         if ibd.total_blocks_in_flight < max_total_blocks_in_flight then begin
+          (* Do not prefetch past an unfetched hole: if any head-of-window
+             slot is still NotRequested, tail_budget is 0 so the only
+             peer's pipeline stays on the connect cursor. *)
+          let skip_tail =
+            not (is_head_of_window ibd entry.height) && not (heads_covered ibd)
+          in
+          if skip_tail then () else
           (* W34: prefer peers that haven't failed this block yet.
              First pass only considers peers NOT in entry.tried_peers.
              If no untried peer has capacity, fall back to any peer with
@@ -6498,9 +6589,20 @@ let run_ibd ?(shutdown_flag : bool ref option)
     end else begin
       (* Periodic orphan expiry (cheap, runs ~once/loop) *)
       ignore (expire_orphan_blocks ibd);
-      (* Check for stalled downloads *)
-      let stalled_peers = check_stalled_downloads ibd in
       let live_peers = get_peers () in
+      (* Socket-layer mute disconnect must free in-flight slots; otherwise
+         a one-peer rig holds HOL on a dead peer until hol_fetch_timeout. *)
+      List.iter (fun p ->
+        match p.Peer.state with
+        | Peer.Disconnected | Peer.Disconnecting ->
+          release_inflight_from_peer ibd p.Peer.id
+        | _ -> ()) live_peers;
+      let n_ready =
+        List.length
+          (List.filter (fun p -> p.Peer.state = Peer.Ready) live_peers)
+      in
+      (* Check for stalled downloads *)
+      let stalled_peers = check_stalled_downloads ~n_ready_peers:n_ready ibd in
       List.iter (fun peer_id ->
         Logs.warn (fun m ->
           m "Disconnecting peer %d (block download stall / unique staller)"

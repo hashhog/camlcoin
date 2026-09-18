@@ -941,6 +941,41 @@ module ChainDB = struct
   let has_block_header t (hash : Types.hash256) : bool =
     Option.is_some (Cf_chainstate.get_block_header t.cf hash)
 
+  (** Lowest height of the contiguous tip-connected block-BODY range
+      when the node does not hold a body at height 1.
+
+      Bitcoin Core's block index is dense from genesis even on a pruned
+      node — [getblockhash(1)] always resolves, and [pruned]/[pruneheight]
+      describe missing *bodies*. Camlcoin snapshot-boot datadirs keep
+      genesis plus a suffix of bodies and nothing in [1..floor-1]. Live
+      mainnet (2026-09-17): getblock misses at 1 / 500000 / 900000 /
+      940000 and HAVEs from 960000, while getblockchaininfo claimed
+      [pruned:false].
+
+      Returns [None] if [tip = 0] or height 1 has a body (no prefix
+      hole). Otherwise the first height in [1..tip] whose body is
+      stored, or [tip] itself if even the tip body is missing.
+
+      Honest-limitation detector only — does not backfill genesis→floor. *)
+  let history_floor t ~(tip : int) : int option =
+    if tip <= 0 then None
+    else
+      let has_body height =
+        match get_hash_at_height t height with
+        | None -> false
+        | Some hash -> has_block t hash
+      in
+      if has_body 1 then None
+      else
+        let rec search lo hi =
+          if lo >= hi then lo
+          else
+            let mid = lo + ((hi - lo) / 2) in
+            if has_body mid then search lo mid
+            else search (mid + 1) hi
+        in
+        Some (search 1 tip)
+
   let delete_block t (hash : Types.hash256) =
     Cf_chainstate.delete_block_data t.cf hash
 

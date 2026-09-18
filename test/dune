@@ -142,3 +142,11 @@
 (executable
  (name test_gapfill_peer_rotate)
  (libraries camlcoin test_tmp alcotest lwt lwt.unix unix str))
+
+; Control for snapshot-boot / missing-history honesty (QUEUES.md item 0).
+; getblockchaininfo must report pruned:true + pruneheight while bodies
+; below that height are absent; getblockhash is -1 in-range / -8 OOR.
+;   dune exec --no-buffer test/test_pruned_history.exe
+(executable
+ (name test_pruned_history)
+ (libraries camlcoin test_tmp alcotest))

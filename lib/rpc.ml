@@ -33,6 +33,9 @@ let rpc_parse_error = -32700
 let rpc_misc_error = -1
 let rpc_type_error = -3
 let rpc_invalid_address = -5
+(* Core getblock / GetBlockChecked (rpc/blockchain.cpp:677): a known
+   hash whose body is gone is RPC_MISC_ERROR, not "Block not found". *)
+let block_pruned_data_msg = "Block not available (pruned data)"
 let rpc_wallet_error = -4
 let rpc_insufficient_funds = -6
 let rpc_invalid_parameter = -8
@@ -655,6 +658,41 @@ let best_block_hash_hex (ctx : rpc_context) : string =
        Types.hash256_to_hex_display hash
      | _ -> "0000000000000000000000000000000000000000000000000000000000000000")
 
+(* SNAPSHOT-BOOT HOLE: `-prune` off is not the same as "holds the full
+   chain". A datadir that does not retain bodies from height 1 must still
+   report pruned=true and pruneheight=first complete body. Do not invent
+   prune_target_size / automatic_pruning when `-prune` is off.
+   Core (rpc/blockchain.cpp): pruned is true whenever the node does not
+   hold the full chain; pruneheight is the first height with complete data. *)
+let prune_info (ctx : rpc_context)
+    : bool * int option * int option =
+  let floor =
+    Storage.ChainDB.history_floor ctx.chain.db ~tip:ctx.chain.blocks_synced
+  in
+  let prune_mode = ctx.chain.prune_target > 0 in
+  let pruned = prune_mode || Option.is_some floor in
+  let pruneheight =
+    if not pruned then None
+    else
+      Some
+        (match floor with
+         | None -> ctx.chain.prune_height
+         | Some f ->
+           if prune_mode then max ctx.chain.prune_height f else f)
+  in
+  let target = if prune_mode then Some ctx.chain.prune_target else None in
+  (pruned, pruneheight, target)
+
+let prune_fields (ctx : rpc_context) : (string * Yojson.Safe.t) list =
+  let pruned, pruneheight, target = prune_info ctx in
+  ("pruned", `Bool pruned)
+  :: (match pruneheight with
+     | Some h -> [ ("pruneheight", `Int h) ]
+     | None -> [])
+  @ (match target with
+    | Some t -> [ ("prune_target_size", `Int t) ]
+    | None -> [])
+
 let handle_getblockchaininfo (ctx : rpc_context)
     : Yojson.Safe.t =
   (* Core takes EVERY tip-derived field here from one index:
@@ -727,13 +765,7 @@ let handle_getblockchaininfo (ctx : rpc_context)
     ("initialblockdownload", `Bool is_ibd);
     ("chainwork", `String chainwork);
     ("size_on_disk", `Int (compute_size_on_disk ctx.data_dir));
-    ("pruned", `Bool (ctx.chain.prune_target > 0));
-  ] @
-  (if ctx.chain.prune_target > 0 then
-    [("pruneheight", `Int ctx.chain.prune_height);
-     ("prune_target_size", `Int ctx.chain.prune_target)]
-   else []) @
-  [
+  ] @ prune_fields ctx @ [
     ("warnings", `List []);
   ] in
   `Assoc base_fields
@@ -747,11 +779,22 @@ let handle_getblockhash (ctx : rpc_context)
   | [`Int height] when not (core_in_int32 height) ->
     Error core_json_int_range_msg
   | [`Int height] ->
-    (match Storage.ChainDB.get_hash_at_height ctx.chain.db height with
-     | Some hash ->
-       Ok (`String (Types.hash256_to_hex_display hash))
-     | None ->
-       Error "Block height out of range")
+    (* Core: nHeight < 0 || nHeight > active_chain.Height() → -8
+       "Block height out of range" (rpc/blockchain.cpp::getblockhash).
+       A height inside 0..=tip that we simply do not retain is NOT a
+       bad parameter — Core would still return the hash because its
+       index is dense. A snapshot-boot hole is the latter; -8 there
+       reads as "the caller asked for a height that cannot exist".
+       Use Core's pruned-data wording instead. *)
+    let tip = ctx.chain.blocks_synced in
+    if height < 0 || height > tip then
+      Error "Block height out of range"
+    else
+      (match Storage.ChainDB.get_hash_at_height ctx.chain.db height with
+       | Some hash ->
+         Ok (`String (Types.hash256_to_hex_display hash))
+       | None ->
+         Error block_pruned_data_msg)
   | _ ->
     Error "Invalid parameters: expected [height]"
 
@@ -6616,7 +6659,14 @@ let handle_getblock (ctx : rpc_context)
       Cstruct.set_uint8 hash i (Cstruct.get_uint8 hash_bytes (31 - i))
     done;
     match Storage.ChainDB.get_block ctx.chain.db hash with
-    | None -> Error "Block not found"
+    | None ->
+      (* Known in the header index but body gone (snapshot prefix, prune).
+         Core GetBlockChecked: RPC_MISC_ERROR "Block not available (pruned
+         data)", not -5 "Block not found". *)
+      if Storage.ChainDB.has_block_header ctx.chain.db hash
+         || Option.is_some (Sync.get_header ctx.chain hash) then
+        Error block_pruned_data_msg
+      else Error "Block not found"
     | Some block ->
       (* verbosity=0: return raw hex *)
       if verbosity = 0 then begin
@@ -15150,6 +15200,8 @@ let dispatch_rpc (ctx : rpc_context)
      | Ok r -> Ok r
      (* A failed getInt<int> CONVERSION is -1, not the handler's -8. *)
      | Error msg when msg = core_json_int_range_msg -> Error (rpc_misc_error, msg)
+     | Error msg when msg = block_pruned_data_msg ->
+       Error (rpc_misc_error, msg)
      | Error msg -> Error (rpc_invalid_parameter, msg))
   | "getblock" ->
     (* Core ParseHashV on the blockhash arg -> malformed = -8 before lookup;

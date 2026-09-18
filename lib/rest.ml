@@ -615,22 +615,24 @@ let handle_chaininfo (ctx : Rpc.rpc_context) (_req : Cohttp.Request.t)
       | Some t -> Types.hash256_to_hex_display t.total_work
       | None -> String.make 64 '0'
     in
-    let json = `Assoc [
-      ("chain", `String (Rpc.core_chain_name ctx.network.name));
-      ("blocks", `Int tip_height);
-      ("headers", `Int ctx.chain.headers_synced);
-      ("bestblockhash", `String tip_hash);
-      ("difficulty", `Float difficulty);
-      ("mediantime", `Int 0);
-      ("verificationprogress", `Float
-        (if ctx.chain.headers_synced = 0 then 0.0
-         else float_of_int tip_height /. float_of_int ctx.chain.headers_synced));
-      ("initialblockdownload", `Bool (ctx.chain.sync_state <> Sync.FullySynced));
-      ("chainwork", `String chainwork);
-      ("size_on_disk", `Int 0);
-      ("pruned", `Bool (ctx.chain.prune_target > 0));
-      ("warnings", `String "");
-    ] in
+    let json = `Assoc (
+      [
+        ("chain", `String (Rpc.core_chain_name ctx.network.name));
+        ("blocks", `Int tip_height);
+        ("headers", `Int ctx.chain.headers_synced);
+        ("bestblockhash", `String tip_hash);
+        ("difficulty", `Float difficulty);
+        ("mediantime", `Int 0);
+        ("verificationprogress", `Float
+          (if ctx.chain.headers_synced = 0 then 0.0
+           else float_of_int tip_height /. float_of_int ctx.chain.headers_synced));
+        ("initialblockdownload", `Bool (ctx.chain.sync_state <> Sync.FullySynced));
+        ("chainwork", `String chainwork);
+        ("size_on_disk", `Int 0);
+      ] @ Rpc.prune_fields ctx @ [
+        ("warnings", `String "");
+      ]
+    ) in
     respond_json (Yojson.Safe.to_string json)
   | _ ->
     respond_error `Not_found "output format not found (available: json)"

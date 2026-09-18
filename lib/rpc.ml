@@ -39,6 +39,12 @@ let block_pruned_data_msg = "Block not available (pruned data)"
 let rpc_wallet_error = -4
 let rpc_insufficient_funds = -6
 let rpc_invalid_parameter = -8
+(* Core protocol.h: RPC_WALLET_NOT_FOUND / ALREADY_LOADED / ALREADY_EXISTS.
+   loadwallet/unloadwallet surface these; createwallet's already-exists
+   path stays -4 (HandleWalletError overwrites FAILED_ALREADY_EXISTS with
+   FAILED_VERIFY). *)
+let rpc_wallet_not_found = -18
+let rpc_wallet_already_loaded = -35
 let rpc_wallet_already_exists = -36
 (* Core reads every numeric RPC argument through UniValue::getInt<T>()
    (univalue.h), which runs std::from_chars INTO THE DESTINATION WIDTH.  The
@@ -3554,8 +3560,29 @@ let handle_listunspent (ctx : rpc_context)
        in
        Ok (`List entries))
 
+(* AmountFromValue (rpc/util.cpp:98-108): not a number/string → -3
+   "Amount is not a number or string"; ParseFixedPoint fail → -3
+   "Invalid amount"; !MoneyRange → -3 "Amount out of range". *)
+let parse_rpc_amount (v : Yojson.Safe.t) : (int64, int * string) result =
+  let valstr = match v with
+    | `Int i -> Some (string_of_int i)
+    | `Intlit s -> Some s
+    | `Float f -> Some (Printf.sprintf "%.8f" f)
+    | `String s -> Some s
+    | _ -> None
+  in
+  match valstr with
+  | None -> Error (rpc_type_error, "Amount is not a number or string")
+  | Some s ->
+    match Bip21.parse_amount s with
+    | Error _ -> Error (rpc_type_error, "Invalid amount")
+    | Ok value ->
+      if not (Consensus.is_valid_money value) then
+        Error (rpc_type_error, "Amount out of range")
+      else Ok value
+
 let handle_sendtoaddress (ctx : rpc_context)
-    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
   (* Extract conf_target from params (index 6 in Bitcoin Core RPC) *)
   let conf_target = match List.nth_opt params 6 with
     | Some (`Int n) -> Some n
@@ -3572,57 +3599,47 @@ let handle_sendtoaddress (ctx : rpc_context)
        | Some rate -> rate
        | None -> 1.0)
   in
-  match params with
-  | `String address :: `Float amount_btc :: _ ->
-    (match ctx.wallet with
-     | None -> Error "Wallet not loaded"
-     | Some wallet ->
-       let current_height = match ctx.chain.tip with
-         | Some t -> Some t.height
-         | None -> None
-       in
-       let amount_sats = Int64.of_float (amount_btc *. 100_000_000.0) in
-       match Wallet.create_transaction wallet ~dest_address:address
-               ~amount:amount_sats ~fee_rate ?tip_height:current_height () with
+  match ctx.wallet with
+  | None -> Error (rpc_wallet_error, "Wallet not loaded")
+  | Some wallet ->
+    match params with
+    | `String address :: amount_j :: _ ->
+      (match parse_rpc_amount amount_j with
        | Error e -> Error e
-       | Ok tx ->
-         match Mempool.add_transaction ctx.mempool tx with
-         | Ok entry ->
-           (* Core's CWallet::CommitTransaction marks the spent coins used and
-              tracks the (unconfirmed) change so the funds cannot be selected
-              again before the tx confirms.  scan_transaction debits the spent
-              wallet inputs and credits any wallet-owned change as unconfirmed. *)
-           Wallet.scan_transaction wallet tx;
-           (* Save-on-mutation: persist the spent-input debit + unconfirmed
-              change credit so a crash before the next block does not let the
-              already-spent coins be re-selected (double-spend) on restart. *)
-           Wallet.save_safe wallet;
-           Ok (`String (Types.hash256_to_hex_display entry.txid))
-         | Error msg ->
-           Error msg)
-  | [`String address; `Int amount_sats_int] ->
-    (match ctx.wallet with
-     | None -> Error "Wallet not loaded"
-     | Some wallet ->
-       let current_height = match ctx.chain.tip with
-         | Some t -> Some t.height
-         | None -> None
-       in
-       let amount_btc = float_of_int amount_sats_int in
-       let amount_sats = Int64.of_float (amount_btc *. 100_000_000.0) in
-       match Wallet.create_transaction wallet ~dest_address:address
-               ~amount:amount_sats ~fee_rate ?tip_height:current_height () with
-       | Error e -> Error e
-       | Ok tx ->
-         match Mempool.add_transaction ctx.mempool tx with
-         | Ok entry ->
-           Wallet.scan_transaction wallet tx;
-           Wallet.save_safe wallet;  (* save-on-mutation: see above *)
-           Ok (`String (Types.hash256_to_hex_display entry.txid))
-         | Error msg ->
-           Error msg)
-  | _ ->
-    Error "Invalid parameters: expected [address, amount]"
+       | Ok amount_sats ->
+         let network = network_to_address_network ctx.network in
+         match Address.address_of_string address with
+         | Error _ ->
+           Error (rpc_invalid_address, "Invalid Bitcoin address: " ^ address)
+         | Ok addr when addr.Address.network <> network ->
+           Error (rpc_invalid_address, "Invalid Bitcoin address: " ^ address)
+         | Ok _ ->
+           let current_height = match ctx.chain.tip with
+             | Some t -> Some t.height
+             | None -> None
+           in
+           match Wallet.create_transaction wallet ~dest_address:address
+                   ~amount:amount_sats ~fee_rate ?tip_height:current_height () with
+           | Error e ->
+             let code =
+               if String.length e >= 18
+                  && String.sub e 0 18 = "Insufficient funds"
+               then rpc_insufficient_funds
+               else rpc_wallet_error
+             in
+             Error (code, e)
+           | Ok tx ->
+             match Mempool.add_transaction ctx.mempool tx with
+             | Ok entry ->
+               (* Core's CWallet::CommitTransaction marks the spent coins used
+                  and tracks the (unconfirmed) change so the funds cannot be
+                  selected again before the tx confirms. *)
+               Wallet.scan_transaction wallet tx;
+               Wallet.save_safe wallet;
+               Ok (`String (Types.hash256_to_hex_display entry.txid))
+             | Error msg -> Error (rpc_wallet_error, msg))
+    | _ ->
+      Error (rpc_invalid_params, "sendtoaddress \"address\" amount")
 
 (* send [outputs] ( conf_target estimate_mode fee_rate options version )
    Core: wallet/rpc/spend.cpp send() → NormalizeOutputs / ParseOutputs /
@@ -3996,44 +4013,72 @@ let hist_entry_json (ctx : rpc_context) (h : Wallet.tx_history_entry)
     [ ("confirmations", `Int confs) ] @ confirm_fields @
     [ ("txid", `String h.Wallet.hist_txid);
       ("time", `Int (int_of_float h.Wallet.hist_timestamp));
-      ("timereceived", `Int (int_of_float h.Wallet.hist_timestamp)) ])
+      ("timereceived", `Int (int_of_float h.Wallet.hist_timestamp));
+      (* Core ListTransactions always emits abandoned (transactions.cpp:334/372).
+         camlcoin does not yet track abandontransaction; confirmed (and
+         in-wallet) rows are not abandoned. *)
+      ("abandoned", `Bool false) ])
 
 (* listtransactions ( "label" count skip include_watchonly )
    Returns the most recent wallet transactions, newest first, Core-shaped.
    Core's positional layout is (label, count, skip, include_watchonly); for
    backward-compatibility a leading integer is also accepted as the count (the
-   pre-Core-shape camlcoin layout).  Default count=10, skip=0. *)
+   pre-Core-shape camlcoin layout).  Default count=10, skip=0.
+   Negative count/skip is RPC_INVALID_PARAMETER (-8) "Negative count" /
+   "Negative from" (transactions.cpp:489-492). *)
 let handle_listtransactions (ctx : rpc_context)
-    (params : Yojson.Safe.t list) : Yojson.Safe.t =
-  match ctx.wallet with
-  | None -> `List []
-  | Some wallet ->
-    (* Resolve count + skip across both the Core layout (label first) and the
-       legacy layout (count first). *)
-    let count, skip = match params with
-      | `Int c :: `Int s :: _ -> c, s            (* legacy: count, skip *)
-      | `Int c :: _ -> c, 0                       (* legacy: count *)
-      | _ :: `Int c :: `Int s :: _ -> c, s        (* Core: label, count, skip *)
-      | _ :: `Int c :: _ -> c, 0                  (* Core: label, count *)
-      | _ -> 10, 0
-    in
-    (* Newest first.  Confirmed entries sort by block height (then by recorded
-       time); unconfirmed (height 0) entries sort to the very top by their
-       wall-clock time — matching Core listing the most recent activity first
-       and keeping a just-broadcast send visible above older confirmed rows. *)
-    let sorted = List.sort (fun a b ->
-      let ha = a.Wallet.hist_block_height and hb = b.Wallet.hist_block_height in
-      let rank h = if h <= 0 then max_int else h in
-      let c = compare (rank hb) (rank ha) in
-      if c <> 0 then c
-      else compare b.Wallet.hist_timestamp a.Wallet.hist_timestamp
-    ) wallet.Wallet.tx_history in
-    let rec drop n lst = match n, lst with
-      | 0, l -> l | _, [] -> [] | n, _ :: rest -> drop (n - 1) rest in
-    let rec take n lst = match n, lst with
-      | 0, _ -> [] | _, [] -> [] | n, x :: rest -> x :: take (n - 1) rest in
-    let entries = take count (drop skip sorted) in
-    `List (List.map (hist_entry_json ctx) entries)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  let parse_n default = function
+    | None | Some `Null -> Ok default
+    | Some (`Int n) ->
+      if not (core_in_int32 n) then Error (rpc_misc_error, core_json_int_range_msg)
+      else Ok n
+    | Some other ->
+      Error (rpc_type_error,
+        Printf.sprintf
+          "JSON value of type %s is not of expected type number"
+          (core_uvtype other))
+  in
+  let count_skip =
+    match params with
+    | `Int _ :: _ ->
+      (match parse_n 10 (List.nth_opt params 0),
+             parse_n 0 (List.nth_opt params 1) with
+       | Ok c, Ok s -> Ok (c, s)
+       | Error e, _ | _, Error e -> Error e)
+    | _ ->
+      (match parse_n 10 (List.nth_opt params 1),
+             parse_n 0 (List.nth_opt params 2) with
+       | Ok c, Ok s -> Ok (c, s)
+       | Error e, _ | _, Error e -> Error e)
+  in
+  match count_skip with
+  | Error e -> Error e
+  | Ok (count, _) when count < 0 ->
+    Error (rpc_invalid_parameter, "Negative count")
+  | Ok (_, skip) when skip < 0 ->
+    Error (rpc_invalid_parameter, "Negative from")
+  | Ok (count, skip) ->
+    match ctx.wallet with
+    | None -> Ok (`List [])
+    | Some wallet ->
+      (* Newest first.  Confirmed entries sort by block height (then by recorded
+         time); unconfirmed (height 0) entries sort to the very top by their
+         wall-clock time — matching Core listing the most recent activity first
+         and keeping a just-broadcast send visible above older confirmed rows. *)
+      let sorted = List.sort (fun a b ->
+        let ha = a.Wallet.hist_block_height and hb = b.Wallet.hist_block_height in
+        let rank h = if h <= 0 then max_int else h in
+        let c = compare (rank hb) (rank ha) in
+        if c <> 0 then c
+        else compare b.Wallet.hist_timestamp a.Wallet.hist_timestamp
+      ) wallet.Wallet.tx_history in
+      let rec drop n lst = match n, lst with
+        | 0, l -> l | _, [] -> [] | n, _ :: rest -> drop (n - 1) rest in
+      let rec take n lst = match n, lst with
+        | 0, _ -> [] | _, [] -> [] | n, x :: rest -> x :: take (n - 1) rest in
+      let entries = take count (drop skip sorted) in
+      Ok (`List (List.map (hist_entry_json ctx) entries))
 
 (* gettransaction "txid" ( include_watchonly verbose )
    Returns detailed wallet information about an in-wallet transaction, Core-shaped
@@ -11398,14 +11443,48 @@ let handle_getaddressinfo (ctx : rpc_context)
             | Address.P2WPKH | Address.P2WSH | Address.P2TR
             | Address.WitnessUnknown _ -> true
             | _ -> false) in
-          Ok (`Assoc [
+          let witness_version = match addr.Address.addr_type with
+            | Address.P2WPKH | Address.P2WSH -> Some 0
+            | Address.P2TR -> Some 1
+            | Address.WitnessUnknown v -> Some v
+            | _ -> None
+          in
+          (* desc / parent_desc: Core InferDescriptor + GetDescriptorString
+             (addresses.cpp:454-476). Emitted only when solvable. The
+             checksummed addr() form is a valid descriptor for a known
+             script; parent_desc is the same until we persist ranged
+             wallet descriptors. *)
+          let desc_fields =
+            if not solvable then []
+            else
+              let payload = "addr(" ^ addr_str ^ ")" in
+              let desc = match Descriptor.add_checksum payload with
+                | Some s -> s
+                | None -> payload
+              in
+              [("desc", `String desc); ("parent_desc", `String desc)]
+          in
+          (* ScriptIsChange (addresses.cpp:483): receive addresses and
+             foreign scripts are not change. *)
+          let ischange = false in
+          let witness_fields = match witness_version with
+            | Some v ->
+              [ ("witness_version", `Int v);
+                ("witness_program", `String (cstruct_to_hex addr.Address.hash)) ]
+            | None -> []
+          in
+          Ok (`Assoc ([
             ("address", `String addr_str);
             ("scriptPubKey", `String (cstruct_to_hex script));
             ("ismine", `Bool ismine);
             ("solvable", `Bool solvable);
+          ] @ desc_fields @ [
             ("iswatchonly", `Bool false);
             ("iswitness", `Bool iswitness);
-          ]))
+            ("ischange", `Bool ischange);
+          ] @ witness_fields @ [
+            ("labels", `List []);
+          ])))
      | _ -> Error "Invalid parameters: expected [address]")
 
 (* getbalances — Core v31.99 has only a "mine" section (watched watch-only
@@ -12469,7 +12548,12 @@ let handle_help (_ctx : rpc_context)
       "getbalances";
       "getnewaddress";
       "getwalletinfo";
-      "listtransactions ( count skip )";
+      "getaddressinfo \"address\"";
+      "listwallets";
+      "createwallet \"wallet_name\" ( disable_private_keys blank \"passphrase\" avoid_reuse descriptors load_on_startup external_signer )";
+      "loadwallet \"filename\" ( load_on_startup )";
+      "unloadwallet ( \"wallet_name\" load_on_startup )";
+      "listtransactions ( \"label\" count skip include_watchonly )";
       "listunspent";
       "lockunspent unlock ( [{\"txid\":\"...\", \"vout\":n},...] persistent )";
       "listlockunspent";
@@ -15168,6 +15252,14 @@ let check_core_arity (method_name : string) (params : Yojson.Safe.t list)
   let spec =
     match method_name with
     | "descriptorprocesspsbt" -> Some (2, 5)
+    (* Wallet methods were absent from the embedded table (derived from a
+       wallet-disabled Core). listwallets is 0/0; createwallet is 1 required
+       / 8 declared (wallet.cpp). Missing name is HelpResult → -1. *)
+    | "listwallets" -> Some (0, 0)
+    | "createwallet" -> Some (1, 8)
+    (* Core stop's wait arg is hidden, so the help-parser wrote {0,0}.
+       The NUM type check still fires: a non-number wait is -3, not -1. *)
+    | "stop" -> Some (0, 1)
     | _ -> Hashtbl.find_opt core_arity method_name
   in
   match spec with
@@ -15619,7 +15711,7 @@ let dispatch_rpc (ctx : rpc_context)
      | Ok r -> Ok r
      | Error msg -> Error (rpc_wallet_error, msg))
   | "listtransactions" ->
-    Ok (handle_listtransactions ctx params)
+    handle_listtransactions ctx params
   | "gettransaction" ->
     (match handle_gettransaction ctx params with
      | Ok r -> Ok r
@@ -15627,9 +15719,7 @@ let dispatch_rpc (ctx : rpc_context)
   | "listunspent" ->
     handle_listunspent ctx params
   | "sendtoaddress" ->
-    (match handle_sendtoaddress ctx params with
-     | Ok r -> Ok r
-     | Error msg -> Error (rpc_wallet_error, msg))
+    handle_sendtoaddress ctx params
   | "send" ->
     handle_send ctx params
   | "backupwallet" ->
@@ -15675,11 +15765,35 @@ let dispatch_rpc (ctx : rpc_context)
   | "loadwallet" ->
     (match handle_loadwallet ctx params with
      | Ok r -> Ok r
-     | Error msg -> Error (rpc_wallet_error, msg))
+     | Error msg ->
+       (* Core util.cpp HandleWalletError: FAILED_NOT_FOUND → -18,
+          FAILED_ALREADY_LOADED → -35 (wallet.cpp loadwallet). *)
+       let has sub =
+         let n = String.length sub in
+         let rec loop i =
+           if i + n > String.length msg then false
+           else if String.sub msg i n = sub then true
+           else loop (i + 1)
+         in loop 0
+       in
+       if has "already loaded" then Error (rpc_wallet_already_loaded, msg)
+       else if has "not found" then Error (rpc_wallet_not_found, msg)
+       else Error (rpc_wallet_error, msg))
   | "unloadwallet" ->
     (match handle_unloadwallet ctx params with
      | Ok r -> Ok r
-     | Error msg -> Error (rpc_wallet_error, msg))
+     | Error msg ->
+       let has sub =
+         let n = String.length sub in
+         let rec loop i =
+           if i + n > String.length msg then false
+           else if String.sub msg i n = sub then true
+           else loop (i + 1)
+         in loop 0
+       in
+       if has "is not loaded" || has "not found" then
+         Error (rpc_wallet_not_found, msg)
+       else Error (rpc_wallet_error, msg))
   | "listwallets" ->
     Ok (handle_listwallets ctx params)
   | "getwalletinfo" ->
@@ -15775,7 +15889,24 @@ let dispatch_rpc (ctx : rpc_context)
   | "walletcreatefundedpsbt" ->
     (match handle_walletcreatefundedpsbt ctx params with
      | Ok r -> Ok r
-     | Error msg -> Error (rpc_wallet_error, msg))
+     | Error msg ->
+       (* Core ParseOutputs: empty outputs → -8 (spend.cpp:680
+          "TX must have at least one output"); invalid address → -5
+          (rawtransaction_util.cpp:121). The handler still returns a
+          string; map the two probe-visible messages here. *)
+       let has sub =
+         let n = String.length sub in
+         let rec loop i =
+           if i + n > String.length msg then false
+           else if String.sub msg i n = sub then true
+           else loop (i + 1)
+         in loop 0
+       in
+       if msg = "Cannot create PSBT with no outputs" || has "no outputs" then
+         Error (rpc_invalid_parameter, "TX must have at least one output")
+       else if has "Invalid address" then
+         Error (rpc_invalid_address, msg)
+       else Error (rpc_wallet_error, msg))
   | "fundrawtransaction" ->
     (match handle_fundrawtransaction ctx params with
      | Ok r -> Ok r
@@ -15836,7 +15967,15 @@ let dispatch_rpc (ctx : rpc_context)
 
   (* Control *)
   | "stop" ->
-    Ok (handle_stop ctx)
+    (match params with
+     | [] | [ `Null ] -> Ok (handle_stop ctx)
+     | [ `Int _ ] | [ `Intlit _ ] | [ `Float _ ] -> Ok (handle_stop ctx)
+     | [ other ] ->
+       Error (rpc_type_error,
+         Printf.sprintf
+           "JSON value of type %s is not of expected type number"
+           (core_uvtype other))
+     | _ -> Error (rpc_misc_error, "stop takes 0 to 1 argument(s), got 2"))
   | "uptime" ->
     Ok (handle_uptime ctx)
   | "help" ->

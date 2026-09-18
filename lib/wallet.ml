@@ -1799,7 +1799,18 @@ let process_psbt
   let tx = psbt.Psbt.tx in
   (* Collect the per-input UTXO (for value + scriptPubKey).  Prefer the
      witness_utxo when present (BIP-174 says it's authoritative for segwit
-     inputs); otherwise project the non_witness_utxo's vout. *)
+     inputs); otherwise project the non_witness_utxo's vout.  When the PSBT
+     carries neither — Core's createpsbt shape — FillPSBT grabs the prevout
+     from the wallet (wallet.cpp:2215-2224). *)
+  let wallet_tx_out (op : Types.outpoint) : Types.tx_out option =
+    match List.find_opt (fun u ->
+        Cstruct.equal u.outpoint.txid op.txid && u.outpoint.vout = op.vout)
+        w.utxos with
+    | None -> None
+    | Some u ->
+      Some { Types.value = u.utxo.Utxo.value;
+             script_pubkey = u.utxo.Utxo.script_pubkey }
+  in
   let prevout_at (inp : Psbt.psbt_input) (tx_in : Types.tx_in)
       : Types.tx_out option =
     match inp.witness_utxo with
@@ -1810,7 +1821,7 @@ let process_psbt
         let vout_idx = Int32.to_int tx_in.previous_output.vout in
         (try Some (List.nth prev_tx.outputs vout_idx)
          with _ -> None)
-      | None -> None
+      | None -> wallet_tx_out tx_in.previous_output
   in
   (* Compute the master fingerprint once (or 0 if no master key — same as
      Core when the wallet has no HD seed). *)

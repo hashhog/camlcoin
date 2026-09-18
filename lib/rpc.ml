@@ -9625,8 +9625,17 @@ let handle_walletprocesspsbt (ctx : rpc_context)
           else
             (match Psbt.of_base64 b64 with
              | Error e ->
-               Error (Printf.sprintf "TX decode failed: %s"
-                        (Psbt.string_of_error e))
+               (* Core spend.cpp:1614 DecodeBase64PSBT:
+                    JSONRPCError(RPC_DESERIALIZATION_ERROR,
+                      strprintf("TX decode failed %s", error))
+                  No colon; "Invalid base64" is reported as "invalid base64"
+                  to match finalizepsbt / joinpsbts. *)
+               let detail =
+                 match e with
+                 | Psbt.Parse_error "Invalid base64" -> "invalid base64"
+                 | _ -> Psbt.string_of_error e
+               in
+               Error (Printf.sprintf "TX decode failed %s" detail)
              | Ok psbt ->
                (* Run the wallet's PSBT signer (Updater + Signer roles). *)
                let (psbt, _signer_complete) =
@@ -15783,7 +15792,14 @@ let dispatch_rpc (ctx : rpc_context)
   | "walletprocesspsbt" ->
     (match handle_walletprocesspsbt ctx params with
      | Ok r -> Ok r
-     | Error msg -> Error (rpc_wallet_error, msg))
+     | Error msg ->
+       (* Core spend.cpp:1614: DecodeBase64PSBT failure is
+          RPC_DESERIALIZATION_ERROR (-22) "TX decode failed %s".
+          Everything else (locked wallet, missing params) stays
+          RPC_WALLET_ERROR (-4). *)
+       if String.length msg >= 16 && String.sub msg 0 16 = "TX decode failed"
+       then Error (rpc_deserialization_error, msg)
+       else Error (rpc_wallet_error, msg))
 
   (* Output Descriptors *)
   | "getdescriptorinfo" ->

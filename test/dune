@@ -150,3 +150,13 @@
 (executable
  (name test_pruned_history)
  (libraries camlcoin test_tmp alcotest))
+
+; Control for mute-mid-body block download timeout + peer rotation
+; (QUEUES.md item 0, live 500+s stall on block 967495). A ~4 M-weight
+; block from a peer that goes mute mid-body must time out, rotate, and
+; the tip must advance. Revert of payload-stall disconnect / unique
+; staller rotation makes payload+rotate+tip fail.
+;   dune exec --no-buffer test/test_block_download_timeout.exe
+(executable
+ (name test_block_download_timeout)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix))

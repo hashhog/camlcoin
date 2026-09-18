@@ -165,6 +165,11 @@ let read_timeout = 30.0        (* seconds *)
 let ping_interval = 120.0      (* 2 minutes between pings *)
 let ping_timeout = 20.0        (* 20 seconds to receive pong *)
 let handshake_timeout = 60.0   (* 60 seconds for version/verack handshake *)
+(* Core net_processing.cpp BLOCK_STALLING_TIMEOUT (2s): a body that stops
+   making progress is a stall, not a hang. Applied to the payload of an
+   already-started message (header wait stays idle-tolerant). *)
+let payload_stall_timeout = 2.0
+let send_timeout = 10.0
 
 (* BIP-324 v2 outbound probe deadline.  Bitcoin Core net.cpp uses ~30s; we
    mirror it so a stalled remote doesn't wedge the dialer for long. *)
@@ -311,6 +316,10 @@ type peer = {
                                         handshake onward); the flag makes loop-start idempotent and keeps
                                         the header-sync source selector from double-reading a looped peer. *)
   mutable pending_read : P2p.message_payload Lwt.t option;  (* In-flight read to prevent concurrent reads *)
+  (* Set when the header of a v1 message (or a v2 packet whose length is
+     known) has been read and the payload is still arriving.  None while
+     idle waiting for the next message — silence there is not a stall. *)
+  mutable reading_payload_since : float option;
   (* BIP-324 v2 transport.  None = legacy v1 path (the default).  Some
      (P2p.V2 state) = encrypted v2 transport; send/read dispatch on this. *)
   mutable transport : P2p.transport option;
@@ -443,6 +452,7 @@ let make_peer ~(network : Consensus.network_config) ~(addr : string)
     trickling_active = false;
     msg_loop_started = false;
     pending_read = None;
+    reading_payload_since = None;
     (* Default to v1 (= None).  The BIP-324 v2 dialer flips this to
        Some (P2p.V2 state) once the cipher handshake completes. *)
     transport = None;
@@ -451,6 +461,51 @@ let make_peer ~(network : Consensus.network_config) ~(addr : string)
        peer_manager.ml for the BIP-111 disconnect path. *)
     bloom_filter = None;
   }
+
+(* True when this peer has started a payload and made no progress for
+   payload_stall_timeout.  Request assignment must skip such peers — they
+   are the live 967495 mute-mid-body shape. *)
+let body_read_stalled ?(now = Unix.gettimeofday ()) (peer : peer) : bool =
+  match peer.reading_payload_since with
+  | None -> false
+  | Some t -> now -. t > payload_stall_timeout
+
+(* Read up to [len] bytes, or 0 if no byte arrives within
+   payload_stall_timeout.  Used only after a message header/length is
+   known so idle-wait for the next command is not a stall. *)
+let read_into_progress (ic : Lwt_io.input_channel) buf off len : int Lwt.t =
+  let open Lwt.Syntax in
+  let read = Lwt_io.read_into ic buf off len in
+  let stall =
+    let* () = Lwt_unix.sleep payload_stall_timeout in
+    Lwt.return 0
+  in
+  Lwt.pick [ read; stall ]
+
+let read_exactly_progress ?(on_progress : (int -> unit) option)
+    (ic : Lwt_io.input_channel) buf off len : unit Lwt.t =
+  let open Lwt.Syntax in
+  let rec loop got =
+    if got >= len then Lwt.return_unit
+    else
+      let* n = read_into_progress ic buf (off + got) (len - got) in
+      if n = 0 then
+        Lwt.fail
+          (Peer_protocol_error "no payload progress (peer mute mid-body)")
+      else begin
+        (match on_progress with Some f -> f n | None -> ());
+        loop (got + n)
+      end
+  in
+  loop 0
+
+let with_send_timeout (t : unit Lwt.t) : unit Lwt.t =
+  let open Lwt.Syntax in
+  let timeout =
+    let* () = Lwt_unix.sleep send_timeout in
+    Lwt.fail (Peer_protocol_error "send timeout")
+  in
+  Lwt.pick [ t; timeout ]
 
 (* Establish TCP connection to a peer with timeout.
    The socket fd is always closed on any failure path (timeout,
@@ -531,12 +586,23 @@ let read_message_v1 (peer : peer) : P2p.message_payload Lwt.t =
     else if length > P2p.max_message_size then
       Lwt.fail (Peer_protocol_error (Printf.sprintf "Message too large: %d bytes" length))
     else begin
-      (* Read payload *)
+      (* Read payload.  A peer that goes mute after the 24-byte header
+         (live 967495, 500+s in-flight) must fail here rather than
+         blocking read_into_exactly until TCP dies. *)
       let payload_buf = Bytes.create length in
       let* () =
-        if length > 0 then
-          Lwt_io.read_into_exactly peer.ic payload_buf 0 length
-        else Lwt.return_unit in
+        if length > 0 then begin
+          peer.reading_payload_since <- Some (Unix.gettimeofday ());
+          Lwt.finalize
+            (fun () ->
+              read_exactly_progress
+                ~on_progress:(fun _ ->
+                  peer.reading_payload_since <- Some (Unix.gettimeofday ()))
+                peer.ic payload_buf 0 length)
+            (fun () ->
+              peer.reading_payload_since <- None;
+              Lwt.return_unit)
+        end else Lwt.return_unit in
       let payload_cs = Cstruct.of_bytes payload_buf in
       (* Verify checksum *)
       let actual_checksum =
@@ -625,6 +691,7 @@ let read_message_v2 (peer : peer) (state : P2p.v2_state)
         | None ->
           Lwt.fail (Peer_protocol_error "v2: undecodable application packet")
         | Some msg ->
+          peer.reading_payload_since <- None;
           peer.msgs_received <- peer.msgs_received + 1;
           peer.last_seen <- Unix.gettimeofday ();
           Lwt.return msg.P2p.payload
@@ -632,15 +699,32 @@ let read_message_v2 (peer : peer) (state : P2p.v2_state)
                   && try_drain_buffer () then
         loop ()
       else begin
-        let* n = Lwt_io.read_into peer.ic chunk 0 chunk_size in
-        if n = 0 then Lwt.fail End_of_file
-        else begin
+        let in_body = state.recv_len_known in
+        if in_body && peer.reading_payload_since = None then
+          peer.reading_payload_since <- Some (Unix.gettimeofday ());
+        let* n =
+          if in_body then read_into_progress peer.ic chunk 0 chunk_size
+          else Lwt_io.read_into peer.ic chunk 0 chunk_size
+        in
+        if n = 0 then begin
+          peer.reading_payload_since <- None;
+          if in_body then
+            Lwt.fail
+              (Peer_protocol_error "no payload progress (peer mute mid-body)")
+          else Lwt.fail End_of_file
+        end else begin
+          if in_body then
+            peer.reading_payload_since <- Some (Unix.gettimeofday ());
           peer.bytes_received <- peer.bytes_received + n;
           let received = Cstruct.of_bytes ~len:n chunk in
           let ok = P2p.v2_receive_bytes state received in
           if not ok then
             Lwt.fail (Peer_protocol_error "v2: state machine rejected bytes")
-          else loop ()
+          else begin
+            if P2p.v2_message_complete state then
+              peer.reading_payload_since <- None;
+            loop ()
+          end
         end
       end
     in
@@ -746,9 +830,14 @@ let send_message_v1 (peer : peer)
      String.iter (fun c -> Buffer.add_string hex (Printf.sprintf "%02x" (Char.code c))) data_str;
      Logs.debug (fun m -> m "RAW getheaders bytes (%d): %s" (String.length data_str) (Buffer.contents hex))
    | _ -> ());
-  let* () = Lwt_io.write_from_string_exactly peer.oc
-    data_str 0 (String.length data_str) in
-  let* () = Lwt_io.flush peer.oc in
+  let* () =
+    with_send_timeout
+      (let* () =
+         Lwt_io.write_from_string_exactly peer.oc data_str 0
+           (String.length data_str)
+       in
+       Lwt_io.flush peer.oc)
+  in
   peer.bytes_sent <- peer.bytes_sent + Cstruct.length data;
   peer.msgs_sent <- peer.msgs_sent + 1;
   Lwt.return_unit
@@ -768,8 +857,11 @@ let send_message_v2 (peer : peer) (state : P2p.v2_state)
     if n = 0 then Lwt.return_unit
     else begin
       let s = Cstruct.to_string bytes in
-      let* () = Lwt_io.write_from_string_exactly peer.oc s 0 n in
-      let* () = Lwt_io.flush peer.oc in
+      let* () =
+        with_send_timeout
+          (let* () = Lwt_io.write_from_string_exactly peer.oc s 0 n in
+           Lwt_io.flush peer.oc)
+      in
       peer.bytes_sent <- peer.bytes_sent + n;
       peer.msgs_sent <- peer.msgs_sent + 1;
       Lwt.return_unit

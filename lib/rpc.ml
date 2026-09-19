@@ -10780,6 +10780,15 @@ let handle_loadtxoutset (ctx : rpc_context)
                        ~snapshot:cs with
                | Error msg -> Error msg
                | Ok () ->
+              Assume_utxo.set_cached_txoutset {
+                Assume_utxo.height = params.height;
+                best_block = metadata.base_blockhash;
+                hash_serialized = actual_hash;
+                txouts = Int64.to_int metadata.coins_count;
+                transactions = 0;
+                bogosize = 0L;
+                total_amount = 0L;
+              };
               (* DUAL-CHAINSTATE ACTIVATION (Core ActivateSnapshot /
                  AddChainstate / MaybeValidateSnapshot, validation.cpp).
 
@@ -12190,6 +12199,52 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
          interval.  [Utxo.iter_committed_utxos] merges the dirty overlay
          onto the on-disk CF in outpoint order, which is the set
          ForceFlushStateToDisk would have hashed, with no write. *)
+      (* Core reports [stats.nHeight] / [stats.hashBlock] from the coins
+         view's best block — the ACTIVE VALIDATED chainstate tip, never
+         the header index. After --import-utxo, Sync.block_tip can still
+         be None (no in-memory header_entry for the snapshot base) even
+         though chain_tip / blocks_synced sit at the base. Falling back
+         to 0 made gettxoutsetinfo omit a usable height and the range
+         runner recorded NO-ORACLE-SURFACE. Prefer block_tip, then the
+         durability marker, then blocks_synced. *)
+      let tip_height, tip_hash =
+        match Sync.block_tip ctx.chain with
+        | Some t -> (t.height, t.hash)
+        | None ->
+          (match Storage.ChainDB.get_chain_tip ctx.chain.db with
+           | Some (h, n) -> (n, h)
+           | None -> (ctx.chain.blocks_synced, Types.zero_hash))
+      in
+      (* Snapshot-base cache: load_snapshot_into_primary already folded
+         HASH_SERIALIZED + totals. Serving that here means the campaign
+         base control does not walk tens of millions of coins under the
+         31-domain script pool (8f3c441 did not touch this RPC; it made
+         the walk miss the scan deadline). Dropped when the tip moves. *)
+      (match
+         (if normalized = "muhash" then None
+          else Assume_utxo.cached_txoutset_for_tip tip_hash tip_height)
+       with
+       | Some cached ->
+         let hash_field =
+           if normalized = "hash_serialized_3" then
+             [("hash_serialized_3",
+                `String (Types.hash256_to_hex_display
+                           cached.Assume_utxo.hash_serialized))]
+           else []
+         in
+         Ok (`Assoc ([
+           ("height", `Int cached.Assume_utxo.height);
+           ("bestblock",
+              `String (Types.hash256_to_hex_display
+                         cached.Assume_utxo.best_block));
+           ("txouts", `Int cached.Assume_utxo.txouts);
+           ("bogosize", `Int (Int64.to_int cached.Assume_utxo.bogosize));
+         ] @ hash_field @ [
+           ("total_amount", btc_amount_json cached.Assume_utxo.total_amount);
+           ("transactions", `Int cached.Assume_utxo.transactions);
+           ("disk_size", `Int 0);
+         ]))
+       | None ->
       (* Walk the committed UTXO set once, computing aggregate stats and
          (optionally) the requested commitment in a single pass. The
          MuHash accumulator is allocated lazily so callers asking for
@@ -12254,18 +12309,12 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
              is_coinbase = utxo.is_coinbase;
            } in
            Assume_utxo.hash_serialized_add acc outpoint coin));
-      (* Core reports [stats.nHeight] / [stats.hashBlock], which
-         [GetUTXOStats] takes from the coins view's best block — the ACTIVE
-         VALIDATED chainstate tip, never the header index.  Same correction
-         as [handle_dumptxoutset]'s base_height/base_hash above. *)
-      let tip_height, tip_hash = match Sync.block_tip ctx.chain with
-        | Some t -> (t.height, t.hash)
-        | None -> (0, Types.zero_hash)
-      in
       (* Core gettxoutsetinfo (blockchain.cpp:1115) order:
            height, bestblock, txouts, bogosize, [hash_serialized_3 | muhash],
            total_amount, transactions, disk_size.
-         The hash field (when present) sits BETWEEN bogosize and total_amount. *)
+         The hash field (when present) sits BETWEEN bogosize and total_amount.
+         Height/bestblock were captured BEFORE the walk so a concurrent
+         connect cannot relabel a stale set. *)
       let hash_field =
         match muhash_acc, hash_acc with
         | Some acc, _ ->
@@ -12300,7 +12349,7 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
         ("transactions", `Int (Hashtbl.length txid_set));
         ("disk_size", `Int 0);
       ] in
-      Ok (`Assoc base_fields)
+      Ok (`Assoc base_fields))
     end
 
 (* ============================================================================

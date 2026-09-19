@@ -2,6 +2,7 @@
 
 ## v1.0.2 — 2026-09-17
 
+- fix: gettxoutsetinfo after --import-utxo reports the snapshot-base height without a second coins walk (campaign 419311 NO-ORACLE-SURFACE). 8f3c441 did not touch the RPC path; it started 31 extra script domains and the walk missed the scan deadline. Control: `dune exec --no-buffer test/test_snapshot_boot_txoutset.exe`.
 - feat: persistent ScriptCheckQueue (per-input, batch=128) + `--par` Core mapping (0=auto=every core, 1=serial; no 15-cap). ConnectBlock collects CScriptCheck jobs then drains the queue; lowest-index fail so worker count cannot change the decision. Control: `dune exec --no-buffer test/test_parallel_script.exe`.
 - fix: getblockchaininfo reports pruned:true + pruneheight when historical block bodies are missing (snapshot-boot prefix hole); getblockhash of an in-range unretained height is -1 "Block not available (pruned data)", not -8. Control: `dune exec --no-buffer test/test_pruned_history.exe`. Does not backfill genesis→floor; do not bounce the mainnet pin this run.
 - fix: after a restart that already restored a header chain, skip the blocking header-sync loop (it skip-waits a 2000-known getheaders reply and never enables message loops). A known batch after we sent getheaders is the reply, not a leftover. Control: `dune exec --no-buffer test/test_stale_locator.exe`. Live 2026-09-17 restart wedge at 967394 — do not bounce the mainnet pin this run.

@@ -177,3 +177,12 @@
 (executable
  (name test_parallel_script)
  (libraries camlcoin alcotest unix))
+
+; Control for snapshot-boot gettxoutsetinfo height (QUEUES.md item 0,
+; 2026-09-19). After --import-utxo the runner's first RPC must report
+; height==base as a JSON integer. Revert of the load-time cache seed
+; makes the wiped-CF case fail.
+;   dune exec --no-buffer test/test_snapshot_boot_txoutset.exe
+(executable
+ (name test_snapshot_boot_txoutset)
+ (libraries camlcoin alcotest unix yojson))

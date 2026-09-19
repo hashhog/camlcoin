@@ -732,6 +732,106 @@ type snapshot_coin = {
   is_coinbase : bool;
 }
 
+(** Serialize a coin for HASH_SERIALIZED (Core TxOutSer / HashWriter).
+    [outpoint:36][code:4][txout:var] where code = (height << 1) | is_coinbase. *)
+let serialize_coin_for_hash w (outpoint : Types.outpoint) (coin : snapshot_coin) =
+  Serialize.write_bytes w outpoint.txid;
+  Serialize.write_int32_le w outpoint.vout;
+  let code = Int32.of_int ((coin.height lsl 1) lor (if coin.is_coinbase then 1 else 0)) in
+  Serialize.write_int32_le w code;
+  Serialize.write_int64_le w coin.value;
+  Serialize.write_compact_size w (Cstruct.length coin.script_pubkey);
+  Serialize.write_bytes w coin.script_pubkey
+
+(* HASH_SERIALIZED (kernel/coinstats.cpp:46-56,87-93,161-163,182-184):
+   HashWriter streams TxOutSer of every coin. ComputeUTXOStats groups the
+   coins-DB cursor by txid into std::map<uint32_t, Coin>, so vouts are
+   numeric. camlcoin's UTXO key is [txid32 || vout_le32]: LE32(256) =
+   00 01 00 00 sorts before LE32(1) = 01 00 00 00. The accumulator holds
+   one txid group, sorts it by unsigned vout, and feeds HashWriter
+   (running SHA256; GetHash = SHA256d). *)
+
+type hash_serialized_acc = {
+  mutable ctx : Digestif.SHA256.ctx;
+  mutable prev_txid : string option;
+  mutable group : (int32 * string) list;
+}
+
+let hash_serialized_create () : hash_serialized_acc = {
+  ctx = Digestif.SHA256.empty;
+  prev_txid = None;
+  group = [];
+}
+
+let hash_serialized_flush (acc : hash_serialized_acc) : unit =
+  match acc.group with
+  | [] -> ()
+  | coins ->
+    let sorted =
+      List.sort
+        (fun (a, _) (b, _) -> Int32.unsigned_compare a b)
+        (List.rev coins)
+    in
+    List.iter (fun (_, ser) ->
+      acc.ctx <- Digestif.SHA256.feed_string acc.ctx ser)
+      sorted;
+    acc.group <- []
+
+let hash_serialized_add (acc : hash_serialized_acc)
+    (outpoint : Types.outpoint) (coin : snapshot_coin) : unit =
+  let txid_s = Cstruct.to_string outpoint.Types.txid in
+  (match acc.prev_txid with
+   | Some p when p <> txid_s -> hash_serialized_flush acc
+   | _ -> ());
+  acc.prev_txid <- Some txid_s;
+  let w = Serialize.writer_create () in
+  serialize_coin_for_hash w outpoint coin;
+  acc.group <-
+    (outpoint.Types.vout,
+     Cstruct.to_string (Serialize.writer_to_cstruct w))
+    :: acc.group
+
+let hash_serialized_finish (acc : hash_serialized_acc) : Types.hash256 =
+  hash_serialized_flush acc;
+  let inner = Digestif.SHA256.to_raw_string (Digestif.SHA256.get acc.ctx) in
+  let outer = Digestif.SHA256.digest_string inner in
+  Cstruct.of_string (Digestif.SHA256.to_raw_string outer)
+
+(* Snapshot-base gettxoutsetinfo cache. load_snapshot_into_primary folds
+   HASH_SERIALIZED + totals while streaming coins; handle_gettxoutsetinfo
+   serves this when the validated tip is still the loaded base so the
+   campaign runner does not walk tens of millions of coins (range
+   419311→450000 NO-ORACLE-SURFACE, utxo_hash="-1"). Dropped automatically
+   when the tip hash/height no longer match. *)
+type cached_txoutset = {
+  height : int;
+  best_block : Types.hash256;
+  hash_serialized : Types.hash256;
+  txouts : int;
+  transactions : int;
+  bogosize : int64;
+  total_amount : int64;
+}
+
+let cached_txoutset : cached_txoutset option ref = ref None
+
+let clear_cached_txoutset () : unit = cached_txoutset := None
+
+let set_cached_txoutset (s : cached_txoutset) : unit =
+  cached_txoutset := Some s
+
+let cached_txoutset_for_tip (tip_hash : Types.hash256) (tip_height : int)
+    : cached_txoutset option =
+  match !cached_txoutset with
+  | None -> None
+  | Some s ->
+    if s.height = tip_height && Cstruct.equal s.best_block tip_hash then
+      Some s
+    else begin
+      cached_txoutset := None;
+      None
+    end
+
 (** Serialize the body of a coin in Bitcoin Core's [Coin::Serialize] format
     (everything AFTER the outpoint key has been written by the caller).
 
@@ -1329,6 +1429,17 @@ let load_snapshot_into_primary
           let coins_loaded = ref 0L in
           let progress_step = 10_000 in
           let since_progress = ref 0 in
+          clear_cached_txoutset ();
+          (* Fold HASH_SERIALIZED + gettxoutsetinfo totals in this pass so
+             the campaign base control does not walk the set again. Snapshot
+             coins are already per-txid grouped; transactions increments
+             when the txid changes. *)
+          let hash_acc = hash_serialized_create () in
+          let txouts = ref 0 in
+          let transactions = ref 0 in
+          let last_txid = ref None in
+          let bogosize = ref 0L in
+          let total_amount = ref 0L in
           (* Bounded-memory flush: drain the dirty set to RocksDB every
              [flush_every] coins so a 165M-coin snapshot never accumulates
              the whole set in memory. The tip_height is recorded only on the
@@ -1348,6 +1459,16 @@ let load_snapshot_into_primary
                 coin.outpoint.Types.txid
                 (Int32.to_int coin.outpoint.Types.vout)
                 entry;
+              hash_serialized_add hash_acc coin.outpoint coin;
+              incr txouts;
+              total_amount := Int64.add !total_amount coin.value;
+              bogosize :=
+                Int64.add !bogosize
+                  (Int64.of_int (50 + Cstruct.length coin.script_pubkey));
+              let txid_s = Cstruct.to_string coin.outpoint.Types.txid in
+              (match !last_txid with
+               | Some p when p = txid_s -> ()
+               | _ -> incr transactions; last_txid := Some txid_s);
               coins_loaded := Int64.add !coins_loaded 1L;
               incr since_flush;
               if !since_flush >= flush_every then begin
@@ -1386,6 +1507,15 @@ let load_snapshot_into_primary
                check rewinds blocks_synced to 0 and defeats the snapshot. *)
             Utxo.OptimizedUtxoSet.flush ~tip_height:params.height utxo;
             Gc.major ();
+            set_cached_txoutset {
+              height = params.height;
+              best_block = metadata.base_blockhash;
+              hash_serialized = hash_serialized_finish hash_acc;
+              txouts = !txouts;
+              transactions = !transactions;
+              bogosize = !bogosize;
+              total_amount = !total_amount;
+            };
             (* Seed the genesis header into the chainstate DB. On a fresh
                snapshot-bootstrapped datadir [create_chain_state] (which is
                what normally inserts genesis — sync.ml:704-718) is NEVER
@@ -1622,83 +1752,6 @@ let dump_snapshot ~(chainstate : chainstate)
 (* ============================================================================
    UTXO Set Hash Computation
    ============================================================================ *)
-
-(** Serialize a coin for hash computation.
-    Format matches Bitcoin Core's TxOutSer:
-    [outpoint:36][code:4][txout:var]
-    where code = (height << 1) + is_coinbase *)
-let serialize_coin_for_hash w (outpoint : Types.outpoint) (coin : snapshot_coin) =
-  (* Outpoint: txid (32) + vout (4 LE) *)
-  Serialize.write_bytes w outpoint.txid;
-  Serialize.write_int32_le w outpoint.vout;
-  (* Code: (height << 1) | is_coinbase as uint32 *)
-  let code = Int32.of_int ((coin.height lsl 1) lor (if coin.is_coinbase then 1 else 0)) in
-  Serialize.write_int32_le w code;
-  (* TxOut: value (8 LE) + scriptPubKey (compact_size + bytes) *)
-  Serialize.write_int64_le w coin.value;
-  Serialize.write_compact_size w (Cstruct.length coin.script_pubkey);
-  Serialize.write_bytes w coin.script_pubkey
-
-(* HASH_SERIALIZED (kernel/coinstats.cpp:46-56,87-93,161-163,182-184):
-   HashWriter streams TxOutSer of every coin. ComputeUTXOStats groups the
-   coins-DB cursor by txid into std::map<uint32_t, Coin>, so vouts are
-   numeric. camlcoin's UTXO key is [txid32 || vout_le32]: LE32(256) =
-   00 01 00 00 sorts before LE32(1) = 01 00 00 00, which first appears
-   on mainnet between 115k (max vout 98) and 140k (max vout 2001). A
-   hasher that emits cursor order therefore matches Core at 115k and
-   diverges at 140k on the same coin set.
-
-   The accumulator holds one txid group, sorts it by unsigned vout, and
-   feeds HashWriter (running SHA256; GetHash = SHA256d). *)
-
-type hash_serialized_acc = {
-  mutable ctx : Digestif.SHA256.ctx;
-  mutable prev_txid : string option;
-  mutable group : (int32 * string) list;
-}
-
-let hash_serialized_create () : hash_serialized_acc = {
-  ctx = Digestif.SHA256.empty;
-  prev_txid = None;
-  group = [];
-}
-
-let hash_serialized_flush (acc : hash_serialized_acc) : unit =
-  match acc.group with
-  | [] -> ()
-  | coins ->
-    (* [group] is consed, so reverse back to cursor order first. Core
-       then sorts by uint32 vout (std::map); skipping that sort is the
-       LE32-key bug (vout 256 hashed before vout 1). *)
-    let sorted =
-      List.sort
-        (fun (a, _) (b, _) -> Int32.unsigned_compare a b)
-        (List.rev coins)
-    in
-    List.iter (fun (_, ser) ->
-      acc.ctx <- Digestif.SHA256.feed_string acc.ctx ser)
-      sorted;
-    acc.group <- []
-
-let hash_serialized_add (acc : hash_serialized_acc)
-    (outpoint : Types.outpoint) (coin : snapshot_coin) : unit =
-  let txid_s = Cstruct.to_string outpoint.Types.txid in
-  (match acc.prev_txid with
-   | Some p when p <> txid_s -> hash_serialized_flush acc
-   | _ -> ());
-  acc.prev_txid <- Some txid_s;
-  let w = Serialize.writer_create () in
-  serialize_coin_for_hash w outpoint coin;
-  acc.group <-
-    (outpoint.Types.vout,
-     Cstruct.to_string (Serialize.writer_to_cstruct w))
-    :: acc.group
-
-let hash_serialized_finish (acc : hash_serialized_acc) : Types.hash256 =
-  hash_serialized_flush acc;
-  let inner = Digestif.SHA256.to_raw_string (Digestif.SHA256.get acc.ctx) in
-  let outer = Digestif.SHA256.digest_string inner in
-  Cstruct.of_string (Digestif.SHA256.to_raw_string outer)
 
 let snapshot_coin_of_utxo_entry (txid : Types.hash256) (vout : int)
     (data : string) : Types.outpoint * snapshot_coin =

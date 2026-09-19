@@ -186,3 +186,12 @@
 (executable
  (name test_snapshot_boot_txoutset)
  (libraries camlcoin alcotest unix yojson))
+
+; Control: post-IBD gap-fill receives a batch and CONNECTS it (QUEUES.md
+; 2026-09-19). Range 419311→450000 requested 2289, was served 2289, connected
+; 0. Revert of the 16-cap / no-snapshot-hole request set, or of
+; connect_stored_blocks using the height index, makes count+drain+rate fail.
+;   dune exec --no-buffer test/test_gapfill_connect_none.exe
+(executable
+ (name test_gapfill_connect_none)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix))

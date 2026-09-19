@@ -1686,23 +1686,13 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   Peer_manager.add_listener peer_manager (fun msg peer ->
     match msg with
     | P2p.HeadersMsg headers when chain.sync_state = Sync.FullySynced ->
-      (* W33 post-IBD gap-fill fix:
-         Always scan the full [blocks_synced+1 .. tip_height] range, not just
-         the newly-accepted headers.  If prior block requests failed silently
-         (peer disconnect, notfound, etc.), the gap between blocks_synced and
-         the header chain tip persists indefinitely because no retry mechanism
-         existed.  Now the stale-tip check's periodic getheaders doubles as a
-         gap-fill trigger: any missing block with a known header gets
-         re-requested.
-
-         W39 fix: the scan must also run when [process_headers] returns
-         non-Ok.  Post-restart, peers frequently reply to our getheaders with
-         headers we already have; [process_headers] then returns an error
-         ("All N headers rejected / duplicates") and the gap-fill was being
-         skipped — so the node stayed stuck at blocks_synced < tip_height
-         indefinitely.  The gap-fill target range depends only on
-         [chain.tip] and [chain.blocks_synced], both already populated from
-         prior IBD, so we run it unconditionally. *)
+      (* W33 post-IBD gap-fill: request missing bodies when headers arrive
+         after FullySynced. W39: still run when process_headers returns
+         non-Ok (duplicate/stale locator batches). 2026-09-19: do NOT
+         getdata the whole [blocks_synced+1 .. header_tip] span — that
+         requested 2289 hashes (2000-header batch + 289 snapshot holes)
+         and connected none of them. Cap at max_blocks_per_peer from
+         block_tip+1; connect_stored_blocks drains the rest from disk. *)
       let accepted =
         match Sync.process_headers chain headers with
         | Ok n -> n
@@ -1757,74 +1747,13 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
        | _ -> ());
       let start_h = chain.blocks_synced + 1 in
       if start_h <= tip_height then begin
-        let block_requests = ref [] in
-        (* Resolve the best-header-chain entries for the whole
-           [start_h .. tip_height] gap in ONE downward prev_block walk from
-           the header tip.  The height->hash index only covers the ACTIVE
-           validated chain (fecf534), so [Sync.get_header_at_height] returns
-           [None] for every height above [blocks_synced] — which left this
-           gap-fill requesting NOTHING while the header tip ran ahead of the
-           block tip: the post-IBD frozen-block-tip bug
-           (receipts/camlcoin-repair-executed-2026-08-11.md).  Core resolves
-           these from pindexBestHeader->GetAncestor
-           (net_processing.cpp::FindNextBlocksToDownload). *)
-        let gap_entries : Sync.header_entry option array =
-          Array.make (tip_height - start_h + 1) None in
-        (match chain.tip with
-         | Some t ->
-           let cur = ref (Some t) in
-           let walking = ref true in
-           while !walking do
-             (match !cur with
-              | Some e when e.Sync.height >= start_h ->
-                if e.Sync.height <= tip_height then
-                  gap_entries.(e.Sync.height - start_h) <- Some e;
-                cur := Sync.get_header chain e.Sync.header.Types.prev_block
-              | _ -> walking := false)
-           done
-         | None -> ());
-        for h = start_h to tip_height do
-          match gap_entries.(h - start_h) with
-          | Some entry ->
-            if not (Storage.ChainDB.has_block db entry.Sync.hash) then
-              block_requests :=
-                { P2p.inv_type = P2p.InvWitnessBlock; hash = entry.Sync.hash }
-                :: !block_requests
-          | None -> ()
-        done;
-        (* Fork-below-tip fill.  The height-indexed scan above only covers
-           heights ABOVE [blocks_synced]; a heavier branch that FORKS BELOW the
-           validated tip has blocks at heights that collide with our current
-           active chain (whose bodies we already have), so those competing
-           blocks are never requested — the node then can never obtain the
-           bodies a reorg needs and stays stuck on the lighter chain.  Walk the
-           best-header chain ([chain.tip]) down from [blocks_synced] along its
-           true ancestry (get_ancestor follows prev_block links, not the
-           height->hash index, which [accept_header] has already repointed at
-           the heavier branch), requesting every block whose body we lack until
-           we reach one we already have (the fork point).  Bounded by
-           [max_reorg_depth].  Mirrors Bitcoin Core's FindNextBlocksToDownload,
-           which requests every BLOCK_HAVE_DATA=false block on the best-header
-           chain regardless of height. *)
-        (match chain.tip with
-         | Some tip when tip.height > chain.blocks_synced ->
-           let floor_h = min chain.blocks_synced tip.height in
-           let stop = ref false in
-           let h = ref floor_h in
-           let steps = ref 0 in
-           while not !stop && !h >= 1 && !steps <= Sync.max_reorg_depth do
-             (match Sync.get_ancestor chain tip !h with
-              | Some anc ->
-                if Storage.ChainDB.has_block db anc.hash then stop := true
-                else
-                  block_requests :=
-                    { P2p.inv_type = P2p.InvWitnessBlock; hash = anc.hash }
-                    :: !block_requests
-              | None -> stop := true);
-             decr h; incr steps
-           done
-         | _ -> ());
-        if !block_requests <> [] then begin
+        (* Cap at max_blocks_per_peer from block_tip+1. The previous walk
+           requested the whole [start_h..tip_height] span plus
+           max_reorg_depth+1 snapshot holes (live: 2289 for a 2000-height
+           header batch, 1.7 GB served, 0 connected). Core
+           FindNextBlocksToDownload is 16 in flight per peer. *)
+        let hashes = Sync.gapfill_blocks_to_download chain in
+        if hashes <> [] then begin
           (* Catch-up IBD's request_blocks already spreads getdata.
              Double-asking the headers-sender from this listener is
              how peer 8 got 14 of the last 40 requests. *)
@@ -1832,11 +1761,6 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
             Lwt.return_unit
           else
             let%lwt () = Lwt.pause () in
-            let hashes =
-              List.map
-                (fun (iv : P2p.inv_vector) -> iv.hash)
-                (List.rev !block_requests)
-            in
             let download_peers =
               List.filter
                 (fun p ->
@@ -1879,10 +1803,21 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
                 | [] -> ""
                 | ns -> " (" ^ String.concat "; " ns ^ ")"
               in
+              let lo, hi =
+                let hs =
+                  List.filter_map
+                    (fun h -> Sync.lookup_block_height chain h)
+                    asg.Sync.Gapfill.hashes
+                in
+                match hs with
+                | [] -> (start_h, tip_height)
+                | x :: xs ->
+                  List.fold_left min x xs, List.fold_left max x xs
+              in
               Logs.info (fun m ->
                 m "Post-IBD gap-fill: requesting %d missing blocks \
                    [%d..%d] from peer %d%s"
-                  n_requests start_h tip_height dest.Peer.id notes);
+                  n_requests lo hi dest.Peer.id notes);
               let reqs =
                 List.map
                   (fun hash -> { P2p.inv_type = P2p.InvWitnessBlock; hash })
@@ -2144,14 +2079,18 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     | P2p.BlockMsg block when !ibd_state_ref = None
                               && chain.sync_state = Sync.FullySynced ->
       let hash = Crypto.compute_block_hash block.Types.header in
+      let f_requested = Sync.Gapfill.is_requested gapfill hash in
       Sync.Gapfill.note_received gapfill hash;
       (* #135 step 3: pass post_ibd_worker so validation runs on its Domain
          and the Lwt main thread can serve RPC during the 0.5-3s window.
          Hold block_listener_mutex so two BlockMsg arrivals can't race on
-         chain_state mutations across the worker-await yield. *)
+         chain_state mutations across the worker-await yield.
+         f_requested: gap-fill getdata must not hit the 288-ahead drop
+         (G19c). Check inflight BEFORE note_received clears it. *)
       Lwt_mutex.with_lock block_listener_mutex (fun () ->
         let%lwt pnb_result =
-          Sync.process_new_block ?worker:!post_ibd_worker_ref chain block in
+          Sync.process_new_block ~f_requested
+            ?worker:!post_ibd_worker_ref chain block in
         (match pnb_result with
          | Ok () ->
            (* Feed the fee estimator with confirmed block data *)
@@ -2590,6 +2529,12 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
           chain.sync_state <- Sync.SyncingBlocks
         else
           chain.sync_state <- Sync.FullySynced;
+        (* Snapshot boot with header_tip == block_tip skips start_ibd, so
+           the IBD-complete worker spawn never runs. Post-IBD BlockMsg
+           then validates on the Lwt thread and the 30s catch-up tick
+           cannot fire while a 2000-block getdata is being ingested. *)
+        if chain.sync_state = Sync.FullySynced then
+          ensure_post_ibd_worker ();
         Peer_manager.notify_tip_updated peer_manager;
         Lwt.return_unit
       end else

@@ -736,6 +736,9 @@ module Gapfill = struct
     Hashtbl.remove t.inflight k;
     Hashtbl.remove t.tried k
 
+  let is_requested (t : t) (hash : Types.hash256) : bool =
+    Hashtbl.mem t.inflight (hash_key hash)
+
   let note_notfound (t : t) ~(peer_id : int) (hash : Types.hash256) : unit =
     let k = hash_key hash in
     Hashtbl.remove t.inflight k;
@@ -2115,6 +2118,22 @@ let block_tip (state : chain_state) : header_entry option =
     (* Fresh chain: [chain_tip] not yet persisted; genesis may only live in
        the in-memory Hashtbl.  Fall back to the index / state.tip. *)
     from_active_chain ()
+
+(* Hash of the validated tip, even when [block_tip] has no in-memory
+   header_entry (assumeUTXO snapshot base: chain_tip / blocks_synced sit
+   at the base, headers table may not). process_new_block and
+   connect_stored_blocks used to treat that as "does not extend tip" and
+   store-without-connect forever. *)
+let validated_tip_hash (state : chain_state) : Types.hash256 option =
+  match block_tip state with
+  | Some e -> Some e.hash
+  | None -> (
+    match Storage.ChainDB.get_chain_tip state.db with
+    | Some (h, _) -> Some h
+    | None -> (
+      match get_header_at_height state state.blocks_synced with
+      | Some e -> Some e.hash
+      | None -> None))
 
 (* W93 Bug 1 fix: provide the hash of the block at the network's
    BIP34Height so Bitcoin Core's BIP-30 skip optimization (Gate 4) can
@@ -4963,6 +4982,64 @@ let tx_index_erase_for_block (db : Storage.ChainDB.t)
    consensus with Core at any reorg depth. *)
 let max_reorg_depth = 288
 
+(* Post-IBD gap-fill targets. Extracted from the HeadersMsg listener so a
+   control can assert the request set, not just that IBD eventually
+   finishes.
+
+   Live 2026-09-19 on rebuilt 4c08fb4, range 419311→450000: the listener
+   logged `requesting 2289 missing blocks [419312..421311]`. That span is
+   2000 heights; the extra 289 are max_reorg_depth+1 bodies at or below
+   the validated tip, requested because a snapshot/prune datadir has no
+   historical bodies (has_block is false for the active chain itself).
+   The replay peer served all 2289 (1.7 GB) and the tip did not move.
+
+   Production: (1) start at block_tip+1 via next_blocks_to_download,
+   (2) cap at max_blocks_per_peer like Core FindNextBlocksToDownload,
+   (3) fork-below only for a competing hash, never the validated chain's
+   missing bodies. *)
+let gapfill_blocks_to_download ?(count = 16) (state : chain_state)
+    : Types.hash256 list =
+  if count <= 0 then []
+  else
+    let forward =
+      List.filter
+        (fun h -> not (Storage.ChainDB.has_block state.db h))
+        (next_blocks_to_download ~count state)
+    in
+    let room = count - List.length forward in
+    let fork_below =
+      if room <= 0 then []
+      else
+        match state.tip with
+        | Some tip when tip.height > state.blocks_synced ->
+          let acc = ref [] in
+          let stop = ref false in
+          let h = ref (min state.blocks_synced tip.height) in
+          let steps = ref 0 in
+          while
+            (not !stop) && !h >= 1 && !steps <= max_reorg_depth
+            && List.length !acc < room
+          do
+            (match get_ancestor state tip !h with
+            | Some anc ->
+              let on_active =
+                match get_header_at_height state anc.height with
+                | Some e -> Cstruct.equal e.hash anc.hash
+                | None -> false
+              in
+              if on_active then stop := true
+              else if Storage.ChainDB.has_block state.db anc.hash then
+                stop := true
+              else acc := anc.hash :: !acc
+            | None -> stop := true);
+            decr h;
+            incr steps
+          done;
+          List.rev !acc
+        | _ -> []
+    in
+    forward @ fork_below
+
 (* O(1) overlay used by the reorg connect-side [base_lookup] and by the
    undo-data construction loop. Mirrors the in-progress UTXO state held
    in [ibd.pending_utxo_updates] / [ibd.pending_utxo_deletes] (which
@@ -7173,16 +7250,21 @@ let maybe_activate_best_chain (state : chain_state) : bool =
    arrivals converge to a consistent tip. *)
 let rec connect_stored_blocks (state : chain_state) : int =
   let next_height = state.blocks_synced + 1 in
-  match get_header_at_height state next_height with
+  (* Best-HEADER chain, not the active height index. The index has no rows
+     above blocks_synced (fecf534), so get_header_at_height returns None
+     for every catch-up height — live 2026-09-19: 2289 bodies stored, 0
+     connected. Core walks pindexBestHeader->GetAncestor. *)
+  match best_header_at_height state next_height with
   | None -> 0
   | Some entry ->
     (* Verify this stored block extends the current BLOCK tip (not the header
        tip — see `chain_state` comment). *)
     let extends_tip =
       if state.blocks_synced = 0 && next_height = 0 then true
-      else match block_tip state with
+      else
+        match validated_tip_hash state with
         | None -> false
-        | Some bt -> Cstruct.equal entry.header.prev_block bt.hash
+        | Some prev -> Cstruct.equal entry.header.prev_block prev
     in
     if not extends_tip then 0
     else if not (Storage.ChainDB.has_block state.db entry.hash) then 0
@@ -7305,8 +7387,9 @@ let rec connect_stored_blocks (state : chain_state) : int =
              the mempool just like the at-tip path.  Best-effort. *)
           run_mempool_remove_hook state stored_block next_height;
           Logs.info (fun m ->
-            m "Connected stored block %s at height %d (catch-up from gap-fill)"
-              (Types.hash256_to_hex_display entry.hash) next_height);
+            m "UpdateTip: hash=%s height=%d nTx=%d (gap-fill drain)"
+              (Types.hash256_to_hex_display entry.hash) next_height
+              (List.length stored_block.transactions));
           (* Hot-path GC check (2026-06-09; non-STW slice + dedicated-domain
              backstop 2026-06-24): THE critical site.  This recursion is a
              fully-synchronous multi-block drain on the Lwt main thread — no
@@ -7388,9 +7471,10 @@ let process_new_block ?(f_requested = false)
       let connects_to_tip =
         if height <> state.blocks_synced + 1 then false
         else if state.blocks_synced = 0 && height = 0 then true
-        else match block_tip state with
+        else
+          match validated_tip_hash state with
           | None -> false
-          | Some bt -> Cstruct.equal block.header.prev_block bt.hash
+          | Some prev -> Cstruct.equal block.header.prev_block prev
       in
       if not connects_to_tip then begin
         Logs.debug (fun m ->
@@ -7563,6 +7647,10 @@ let process_new_block ?(f_requested = false)
           Storage.ChainDB.record_connected_tx_counts state.db
             ~hash ~prev:entry.header.prev_block
             ~n_tx:(List.length block.transactions);
+          Logs.info (fun m ->
+            m "UpdateTip: hash=%s height=%d nTx=%d"
+              (Types.hash256_to_hex_display hash) height
+              (List.length block.transactions));
           (* Feed the wallet from the LIVE P2P / IBD connect path (not just the
              mining/RPC path).  [run_wallet_scan_hook] credits/debits + durably
              persists the wallet ledger so a coin received over P2P survives an

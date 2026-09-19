@@ -324,6 +324,18 @@ let txindex_arg =
   Arg.(value & opt (some string) None &
     info ["txindex"] ~docv:"VAL" ~doc)
 
+let par_arg =
+  (* Bitcoin Core -par (init.cpp:513, chainstatemanager_args.cpp:53-60).
+     0 = auto = every core; 1 = serial; n = n threads including the
+     connecting thread; n<0 = leave |n| cores free. camlcoin does not
+     apply Core's MAX_SCRIPTCHECK_THREADS=15 cap. *)
+  let doc = "Set the number of script verification threads \
+             (0 = auto = every core, 1 = serial, n = n threads including \
+             the connecting thread, n<0 = leave that many cores free). \
+             Bitcoin Core -par (init.cpp:513)." in
+  Arg.(value & opt (some int) None &
+    info ["par"] ~docv:"N" ~doc)
+
 let txospenderindex_arg =
   (* Bitcoin Core's -txospenderindex flag (init.cpp /
      index/txospenderindex.cpp).  Accepts a boolean ('1'/'0' /
@@ -461,7 +473,7 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     rest_enabled rest_port rest_bind blockfilterindex asmap
     proxy onion_proxy i2psam i2p_private_key cjdnsreachable
     rpc_tls_cert rpc_tls_key rest_tls_cert rest_tls_key
-    coinstatsindex_cli txindex_cli txospenderindex_cli dbcache_cli =
+    coinstatsindex_cli txindex_cli txospenderindex_cli dbcache_cli par_cli =
   (* --txindex is accepted for Core CLI compatibility (camlcoin always
      maintains the tx index); validate its value but otherwise ignore it. *)
   ignore txindex_cli;
@@ -496,6 +508,16 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
   let conf_opts =
     try Camlcoin.Runtime_config.parse_conf_file ~network conf_path_resolved
     with _ -> [] in
+  (* --par / conf par=: Core -par (init.cpp:513). CLI wins. Default 0 = auto. *)
+  let eff_par =
+    match par_cli with
+    | Some n -> n
+    | None ->
+      (match Camlcoin.Runtime_config.get_int conf_opts "par" with
+       | Some n -> n
+       | None -> Camlcoin.Validation.default_scriptcheck_threads)
+  in
+  Camlcoin.Validation.set_par eff_par;
   (* Resolve effective values: CLI > conf > hard-coded base defaults. *)
   let eff_rpc_host =
     Camlcoin.Runtime_config.overlay_string
@@ -1072,7 +1094,8 @@ let cmd =
     $ coinstatsindex_arg
     $ txindex_arg
     $ txospenderindex_arg
-    $ dbcache_arg)
+    $ dbcache_arg
+    $ par_arg)
 
 (* ============================================================================
    Entry Point

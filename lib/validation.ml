@@ -1732,6 +1732,300 @@ let shutdown_pool (pool : script_check_pool) : unit =
    (at-tip / not-IBD / submitblock / regtest / tests). *)
 let script_check_pool : script_check_pool option ref = ref None
 
+(* ============================================================================
+   ScriptCheckQueue — persistent CCheckQueue (QUEUES.md 2026-09-19)
+
+   Bitcoin Core: -par (init.cpp:513), CCheckQueue (src/checkqueue.h),
+   CScriptCheck batched per-input in ConnectBlock (validation.cpp). Extra
+   worker Domains drain a bounded job array; the connecting thread joins as
+   the master; the block is accepted only if every check returns true.
+
+   Decision identity: we always finish every claimed job, then report the
+   LOWEST-INDEX failure (tx_idx, then input_idx via collection order). A
+   race-winner reason would be a chain-split under -par. Worker count must
+   not change validity. --par=1 is serial (0 extra workers).
+
+   We do not apply Core's MAX_SCRIPTCHECK_THREADS=15 cap: the point of this
+   change on a 32-core box is to use the cores. Extra workers still cannot
+   go negative.
+   ============================================================================ *)
+
+let default_scriptcheck_threads = 0
+let script_check_batch_size = 128
+
+(* Core DEFAULT_SCRIPTCHECK_THREADS = 0 (auto). Set from --par / conf par=. *)
+let configured_par : int ref = ref default_scriptcheck_threads
+let set_par n = configured_par := n
+let get_par () = !configured_par
+
+let cpu_count () =
+  let n = Domain.recommended_domain_count () in
+  if n < 1 then 1 else n
+
+(* Core node/chainstatemanager_args.cpp:53-60:
+     par=0  → auto: NumCPU()-1 extra workers (master + extras == every core)
+     par=1  → serial: 0 extra workers
+     par=n>1 → n-1 extra workers
+     par=-n → NumCPU()-n-1 extra workers (leave |n| cores free) *)
+let resolve_script_check_workers par =
+  let cores = cpu_count () in
+  let script_threads = if par <= 0 then par + cores else par in
+  let extra = script_threads - 1 in
+  if extra < 0 then 0 else extra
+
+type script_check_job = {
+  tx : Types.transaction;
+  tx_idx : int;
+  input_idx : int;
+  inp : Types.tx_in;
+  utxo : utxo;
+  prevouts : (int64 * Cstruct.t) list;
+  flags : int;
+  wtxid : Types.hash256;
+  mutable err : (int * string) option;
+}
+
+type script_check_result = {
+  ok : bool;
+  first_fail_index : int;    (* job index, -1 if ok *)
+  first_fail_tx_idx : int;
+  first_fail_reason : string;
+}
+
+type script_check_queue = {
+  mutex : Mutex.t;
+  work_cond : Condition.t;
+  done_cond : Condition.t;
+  control_mutex : Mutex.t;
+  extra_workers : int;
+  mutable stop : bool;
+  mutable generation : int;
+  mutable workers_done : int;
+  mutable jobs : script_check_job array;
+  next : int Atomic.t;
+  in_flight : int Atomic.t;
+  max_in_flight : int Atomic.t;
+  mutable workers : unit Domain.t array;
+}
+
+let extra_workers (q : script_check_queue) = q.extra_workers
+let has_threads (q : script_check_queue) = q.extra_workers > 0
+let max_in_flight (q : script_check_queue) = Atomic.get q.max_in_flight
+let job_array_is (q : script_check_queue) (jobs : script_check_job array) =
+  q.jobs == jobs
+
+let run_one_job (job : script_check_job) : unit =
+  let cache = Sig_cache.get_global () in
+  let r =
+    try
+      verify_one_input
+        ~tx:job.tx ~flags:job.flags ~prevouts:job.prevouts
+        ~wtxid:job.wtxid ~cache
+        job.input_idx job.inp job.utxo
+    with e -> Error (job.input_idx, Printexc.to_string e)
+  in
+  match r with
+  | Ok () -> ()
+  | Error (idx, msg) -> job.err <- Some (idx, msg)
+
+let bump_max_in_flight q cur =
+  let rec loop () =
+    let m = Atomic.get q.max_in_flight in
+    if cur <= m then ()
+    else if Atomic.compare_and_set q.max_in_flight m cur then ()
+    else loop ()
+  in
+  loop ()
+
+(* Workers + master claim batches of at most script_check_batch_size.
+   Core checkqueue.h:121
+     nNow = max(1, min(nBatchSize, queue.size() / (nTotal + nIdle + 1)))
+   nTotal = extra + master; nIdle is not tracked, so extra+2 matches Core's
+   +1 plus the master. In-flight is therefore bounded by
+   batch_size × (extra + 1), not by the job count. *)
+let claim_and_run (q : script_check_queue) (jobs : script_check_job array) : unit =
+  let n = Array.length jobs in
+  if n = 0 then () else
+  let extra = q.extra_workers in
+  let rec loop () =
+    let start = Atomic.get q.next in
+    if start >= n then ()
+    else begin
+      let remaining = n - start in
+      let denom = extra + 2 in
+      let n_now =
+        let x = remaining / denom in
+        let x = if x < 1 then 1 else x in
+        let x = if x > script_check_batch_size then script_check_batch_size else x in
+        if x > remaining then remaining else x
+      in
+      let got = Atomic.fetch_and_add q.next n_now in
+      if got >= n then ()
+      else begin
+        let batch_end = min n (got + n_now) in
+        let inflight = batch_end - got in
+        let old = Atomic.fetch_and_add q.in_flight inflight in
+        bump_max_in_flight q (old + inflight);
+        for i = got to batch_end - 1 do
+          run_one_job jobs.(i)
+        done;
+        ignore (Atomic.fetch_and_add q.in_flight (-inflight));
+        loop ()
+      end
+    end
+  in
+  loop ()
+
+let scan_first_fail (jobs : script_check_job array) : script_check_result =
+  let n = Array.length jobs in
+  let rec loop i =
+    if i >= n then
+      { ok = true; first_fail_index = -1; first_fail_tx_idx = -1;
+        first_fail_reason = "" }
+    else match jobs.(i).err with
+    | Some (_idx, msg) ->
+      { ok = false; first_fail_index = i; first_fail_tx_idx = jobs.(i).tx_idx;
+        first_fail_reason = msg }
+    | None -> loop (i + 1)
+  in
+  loop 0
+
+let script_check_worker_loop (q : script_check_queue) : unit =
+  let last_gen = ref 0 in
+  let continue = ref true in
+  while !continue do
+    Mutex.lock q.mutex;
+    while (not q.stop) && q.generation = !last_gen do
+      Condition.wait q.work_cond q.mutex
+    done;
+    if q.stop then begin
+      Mutex.unlock q.mutex;
+      continue := false
+    end else begin
+      let gen = q.generation in
+      let jobs = q.jobs in
+      Mutex.unlock q.mutex;
+      last_gen := gen;
+      claim_and_run q jobs;
+      Mutex.lock q.mutex;
+      q.workers_done <- q.workers_done + 1;
+      if q.workers_done = q.extra_workers then Condition.signal q.done_cond;
+      Mutex.unlock q.mutex
+    end
+  done
+
+let create_script_check_queue extra_workers : script_check_queue =
+  let extra = if extra_workers < 0 then 0 else extra_workers in
+  let q = {
+    mutex = Mutex.create ();
+    work_cond = Condition.create ();
+    done_cond = Condition.create ();
+    control_mutex = Mutex.create ();
+    extra_workers = extra;
+    stop = false;
+    generation = 0;
+    workers_done = 0;
+    jobs = [||];
+    next = Atomic.make 0;
+    in_flight = Atomic.make 0;
+    max_in_flight = Atomic.make 0;
+    workers = [||];
+  } in
+  if extra > 0 then
+    q.workers <- Array.init extra (fun _ ->
+      Domain.spawn (fun () -> script_check_worker_loop q));
+  q
+
+let shutdown_script_check_queue (q : script_check_queue) : unit =
+  Mutex.lock q.control_mutex;
+  Mutex.lock q.mutex;
+  q.stop <- true;
+  Condition.broadcast q.work_cond;
+  Mutex.unlock q.mutex;
+  Array.iter Domain.join q.workers;
+  q.workers <- [||];
+  Mutex.unlock q.control_mutex
+
+let run_script_check_queue (q : script_check_queue) (jobs : script_check_job array)
+    : script_check_result =
+  Mutex.lock q.control_mutex;
+  Fun.protect
+    ~finally:(fun () -> Mutex.unlock q.control_mutex)
+    (fun () ->
+      Atomic.set q.next 0;
+      Atomic.set q.in_flight 0;
+      Atomic.set q.max_in_flight 0;
+      Array.iter (fun j -> j.err <- None) jobs;
+      let extra = q.extra_workers in
+      Mutex.lock q.mutex;
+      q.jobs <- jobs;
+      if extra > 0 && not q.stop then begin
+        q.workers_done <- 0;
+        q.generation <- q.generation + 1;
+        Condition.broadcast q.work_cond
+      end;
+      Mutex.unlock q.mutex;
+      if Array.length jobs = 0 then
+        { ok = true; first_fail_index = -1; first_fail_tx_idx = -1;
+          first_fail_reason = "" }
+      else begin
+        claim_and_run q jobs;
+        if extra > 0 then begin
+          Mutex.lock q.mutex;
+          while q.workers_done < extra && not q.stop do
+            Condition.wait q.done_cond q.mutex
+          done;
+          Mutex.unlock q.mutex
+        end;
+        scan_first_fail jobs
+      end)
+
+(* Process-wide queue. None ⇒ ConnectBlock runs the serial master path
+   (tests / regtest / before start_script_check_queue). *)
+let script_check_queue : script_check_queue option ref = ref None
+
+let start_script_check_queue () : unit =
+  match !script_check_queue with
+  | Some _ -> ()
+  | None ->
+    let extra = resolve_script_check_workers !configured_par in
+    let q = create_script_check_queue extra in
+    script_check_queue := Some q;
+    Logs.info (fun m ->
+      m "Script verification uses %d additional threads (par=%d)"
+        extra !configured_par)
+
+let stop_script_check_queue () : unit =
+  match !script_check_queue with
+  | Some q ->
+    shutdown_script_check_queue q;
+    script_check_queue := None
+  | None -> ()
+
+let run_script_checks (jobs : script_check_job array) : script_check_result =
+  match !script_check_queue with
+  | Some q -> run_script_check_queue q jobs
+  | None ->
+    Array.iter (fun j -> j.err <- None; run_one_job j) jobs;
+    scan_first_fail jobs
+
+let append_script_jobs acc ~tx ~tx_idx ~flags ~prevouts ~utxos =
+  let wtxid = Crypto.compute_wtxid tx in
+  let rec loop j inps acc =
+    match inps with
+    | [] -> acc
+    | inp :: rest ->
+      let acc =
+        match utxos.(j) with
+        | None -> acc
+        | Some utxo ->
+          { tx; tx_idx; input_idx = j; inp; utxo; prevouts; flags; wtxid;
+            err = None } :: acc
+      in
+      loop (j + 1) rest acc
+  in
+  loop 0 tx.inputs acc
+
 (* Verify all inputs of a transaction.
    Reference: Bitcoin Core's CCheckQueue (src/checkqueue.h) which distributes
    CScriptCheck jobs across N-1 worker threads + the master thread.
@@ -2486,6 +2780,11 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
     let total_fees = ref 0L in
     let error = ref None in
     let spent_utxos = ref [] in
+    (* CScriptCheck jobs collected across the block, then drained by
+       ScriptCheckQueue after the tx loop (Core ConnectBlock). Collection
+       order is tx-index then input-index so the lowest-index failure is
+       the same as a serial left-to-right fold. *)
+    let script_jobs : script_check_job list ref = ref [] in
 
     List.iteri (fun i (tx : Types.transaction) ->
       if !error = None then begin
@@ -2613,22 +2912,13 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
                   error := Some (BlockTxValidationFailed (i, TxSequenceLocksFailed));
 
                 if !error = None then begin
-                (* Parallel script verification using OCaml 5 Domains.
-                   Reference: Bitcoin Core's CCheckQueue (src/checkqueue.h) —
-                   N-1 worker threads + master thread verify inputs concurrently.
-                   Here we spawn Domain.recommended_domain_count()-1 Domains and
-                   have the main domain process one partition.  Each Domain calls
-                   verify_one_input which serialises sig-cache access via
-                   sig_cache_mutex (OCaml Hashtbl is not Domain-safe).
-                   UTXO apply must have completed before entering this section. *)
-                let script_result =
-                  verify_scripts_parallel_domain
-                    ~tx ~flags ~prevouts ~utxos:resolved_utxos ()
-                in
-
-                match script_result with
-                | Error e -> error := Some (BlockTxValidationFailed (i, e))
-                | Ok () ->
+                (* Defer CScriptCheck jobs to the persistent ScriptCheckQueue
+                   (Core ConnectBlock: collect during the tx loop, Wait after).
+                   Prevouts are captured here so intra-block spends stay
+                   visible after we apply this tx's outputs. *)
+                script_jobs :=
+                  append_script_jobs !script_jobs ~tx ~tx_idx:i ~flags
+                    ~prevouts ~utxos:resolved_utxos;
 
                   if !error = None then begin
                     (* Calculate and accumulate fee *)
@@ -2686,6 +2976,14 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
     match !error with
     | Some e -> Error e
     | None ->
+      let jobs = Array.of_list (List.rev !script_jobs) in
+      let script_r = run_script_checks jobs in
+      if not script_r.ok then
+        let job = jobs.(script_r.first_fail_index) in
+        Error (BlockTxValidationFailed
+                 (script_r.first_fail_tx_idx,
+                  TxScriptFailed (job.input_idx, script_r.first_fail_reason)))
+      else
       (* Verify coinbase value <= subsidy + fees *)
       let coinbase = List.hd block.transactions in
       let coinbase_value = List.fold_left (fun acc out ->

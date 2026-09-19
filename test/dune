@@ -169,3 +169,11 @@
 (executable
  (name test_campaign_hol_cap_wedge)
  (libraries camlcoin test_tmp alcotest lwt lwt.unix unix))
+
+; Control for parallel script verification (QUEUES.md item 0, 2026-09-19).
+; Persistent CCheckQueue + --par Core mapping. 1-vs-N identity, injected
+; fail reason, measured 1/2/4/8 scaling, bounded in-flight.
+;   dune exec --no-buffer test/test_parallel_script.exe
+(executable
+ (name test_parallel_script)
+ (libraries camlcoin alcotest unix))

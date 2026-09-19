@@ -3975,38 +3975,23 @@ module Validation_worker = struct
     put_req t.req Shutdown;
     Domain.join t.domain
 
-  (* W143 / #8: bring up / tear down the persistent script-check worker pool.
-     During IBD the pool runs the FULL width (create_pool () = up to 15 Domains,
-     Core MAX_SCRIPTCHECK_THREADS).  At tip (#8 block-connect offload) we keep a
-     SMALL bounded pool alive (tip_script_pool_workers) so per-block script
-     verification parallelises on the post-IBD block-connect Domain instead of
-     running serial (the residual ~3-4s block-connect stall).  A small cap keeps
-     the FullySynced steady state to a handful of PARKED worker Domains (blocked
-     on a condvar, in a blocking section ⇒ they neither spin nor hold up STW GC),
-     unlike the old per-tx Domain.spawn churn that caused the documented at-tip
-     Gc.compact thrash. *)
-  let tip_script_pool_workers = 4
+  (* Persistent CCheckQueue (QUEUES.md 2026-09-19). Core keeps one queue for
+     the chainstate lifetime; parked extra workers sit on a condvar and do
+     not cause the old per-tx Domain.spawn Gc.compact thrash. Width is
+     --par (0 = auto = every core, no 15-cap). ConnectBlock drains this
+     queue; the legacy per-tx script_check_pool is only created by tests. *)
 
-  (* Ensure a small at-tip block-connect pool exists.  Idempotent: never
-     replaces an already-active pool (e.g. the full IBD pool during a re-IBD, or
-     an existing tip pool). *)
   let ensure_tip_script_pool () : unit =
-    match !Validation.script_check_pool with
-    | Some _ -> ()
-    | None ->
-      Validation.script_check_pool :=
-        Some (Validation.create_pool ~max_workers:tip_script_pool_workers ())
+    Validation.start_script_check_queue ()
 
   let start_script_pool () : unit =
-    match !Validation.script_check_pool with
-    | Some _ -> ()  (* already active — never double-create *)
-    | None -> Validation.script_check_pool := Some (Validation.create_pool ())
+    Validation.start_script_check_queue ()
 
-  (* [leave_tip_pool]: after tearing down the (IBD-width) pool, install the
-     small at-tip pool so post-IBD block-connect stays parallel.  Called with
-     ~leave_tip_pool:true at IBD completion; false (default) on shutdown, where
-     we want no lingering Domains. *)
+  (* [leave_tip_pool]: keep the ScriptCheckQueue (Core does not tear it
+     down at tip). Called with ~leave_tip_pool:true at IBD completion;
+     false (default) on shutdown. *)
   let stop_script_pool ?(leave_tip_pool = false) () : unit =
+    if not leave_tip_pool then Validation.stop_script_check_queue ();
     (match !Validation.script_check_pool with
      | Some p -> Validation.shutdown_pool p
      | None -> ());

@@ -1853,18 +1853,12 @@ let test_loadmempool_missing_file_zero () =
   cleanup_test_db ()
 
 (* ============================================================================
-   dumptxoutset / gettxoutsetinfo MuHash3072 wiring
+   dumptxoutset HASH_SERIALIZED / gettxoutsetinfo MuHash3072 wiring
 
-   The RPC-level wiring needs to (a) emit the MuHash3072 commitment as
-   [txoutset_hash] in the [dumptxoutset] response and (b) surface the
-   same value via the [gettxoutsetinfo "muhash"] handler. Both
-   handlers iterate the chainstate DB, so we populate the test
-   context's UTXO set, call the RPC, and compare against
-   [Assume_utxo.compute_utxo_muhash_from_db] computed directly. The
-   strict-mismatch path is exercised by [test_assume_utxo.ml] —
-   reproducing it here would require synthesising a snapshot file that
-   passes the chainparams whitelist, which has nothing to do with the
-   hash wiring itself.
+   dumptxoutset.txoutset_hash is HASH_SERIALIZED of the dumped set (Core
+   rpc/blockchain.cpp:3259, 3345). gettxoutsetinfo "muhash" still surfaces
+   MuHash3072. The dump test compares against compute_utxo_hash_from_db;
+   the muhash test against compute_utxo_muhash_from_db.
    ============================================================================ *)
 
 (* ============================================================================
@@ -2027,27 +2021,26 @@ let test_bip22_bwmc_reason_parity () =
     "bad-cb-length"
     (bip22 "transaction 0 validation failed: coinbase scriptSig length out of range (bad-cb-length)")
 
-let test_dumptxoutset_emits_muhash_txoutset_hash () =
+let test_dumptxoutset_emits_hash_serialized_txoutset_hash () =
   let (ctx, db, _utxo, _txid1, _txid2) = create_test_context () in
   let path = Test_tmp.register
-               (Printf.sprintf "/tmp/camlcoin_dump_muhash_%d.dat"
+               (Printf.sprintf "/tmp/camlcoin_dump_hser_%d.dat"
                   (Unix.getpid ())) in
   (try Sys.remove path with _ -> ());
   let result = Rpc.handle_dumptxoutset ctx [`String path] in
   (match result with
    | Ok (`Assoc fields) ->
-     (* Direct expected value: MuHash3072 over the same DB the handler
-        iterates. The test context is populated by create_test_context
-        with two UTXOs; this is enough to make MuHash deterministic
-        and non-trivial. *)
+     (* Core dumptxoutset.txoutset_hash is HASH_SERIALIZED of the dumped
+        set (rpc/blockchain.cpp:3259, 3345), the same value
+        gettxoutsetinfo hash_serialized_3 returns. *)
      let expected =
-       Assume_utxo.compute_utxo_muhash_from_db ctx.chain.db
+       Assume_utxo.compute_utxo_hash_from_db ctx.chain.db
      in
      let expected_hex = Types.hash256_to_hex_display expected in
      (match List.assoc_opt "txoutset_hash" fields with
       | Some (`String s) ->
         Alcotest.(check string)
-          "dumptxoutset txoutset_hash matches MuHash3072"
+          "dumptxoutset txoutset_hash matches HASH_SERIALIZED"
           expected_hex s
       | _ -> Alcotest.fail "dumptxoutset response missing txoutset_hash field")
    | Ok _ -> Alcotest.fail "expected `Assoc result"
@@ -3515,8 +3508,8 @@ let () =
       test_case "loadmempool missing file → 0" `Quick test_loadmempool_missing_file_zero;
     ];
     "snapshot_muhash_rpc", [
-      test_case "dumptxoutset emits MuHash3072 txoutset_hash" `Quick
-        test_dumptxoutset_emits_muhash_txoutset_hash;
+      test_case "dumptxoutset emits HASH_SERIALIZED txoutset_hash" `Quick
+        test_dumptxoutset_emits_hash_serialized_txoutset_hash;
       test_case "gettxoutsetinfo muhash matches direct compute" `Quick
         test_gettxoutsetinfo_muhash_matches_dump;
       test_case "gettxoutsetinfo rejects unknown hash_type" `Quick

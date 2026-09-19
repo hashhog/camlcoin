@@ -1833,43 +1833,39 @@ let test_b7_snapshot_work_vs_active_chainstate_checked () =
       test_failed name "expected Error, got Ok (B7 guard not firing)")
 
 (* -----------------------------------------------------------------------
-   B8 — G18+G25: dumptxoutset txoutset_hash uses MuHash3072, not HASH_SERIALIZED
+   B8 — dumptxoutset.txoutset_hash is HASH_SERIALIZED of the dumped set.
 
    Bitcoin Core blockchain.cpp:3345:
      result.pushKV("txoutset_hash", maybe_stats->hashSerialized.ToString())
    [hashSerialized is HASH_SERIALIZED = SHA256d of the serialized coins]
-
-   camlcoin blockchain.cpp-equivalent (rpc.ml:6840):
-     let txoutset_hash = Assume_utxo.compute_utxo_muhash_from_db _ctx.chain.db
-   This is MuHash3072, not HASH_SERIALIZED.  The operator sees a different
-   hash than Core produces for the same UTXO set.
-
-   The test demonstrates the divergence: for a non-empty DB, the MuHash3072
-   value and the SHA256d (HASH_SERIALIZED) value must differ.
    ----------------------------------------------------------------------- *)
 let test_b8_dumptxoutset_txoutset_hash_is_muhash_not_hash_serialized () =
   let name =
-    "B8: dumptxoutset txoutset_hash uses MuHash3072 instead of HASH_SERIALIZED"
+    "B8: dumptxoutset txoutset_hash is HASH_SERIALIZED"
   in
-  let dir = temp_dir () in
-  let db = Storage.ChainDB.create (Filename.concat dir "chain") in
-  put_test_utxo db
+  let (ctx, db, dir) = make_dump_test_ctx () in
+  put_test_utxo ctx.chain.db
     ~txid_hex:
       "aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd"
     ~vout:0 ~value:100_000L ~script:"\x51"
     ~height:1 ~is_coinbase:true;
-  let muhash = Assume_utxo.compute_utxo_muhash_from_db db in
-  let sha256d = Assume_utxo.compute_utxo_hash_from_db db in
-  Storage.ChainDB.close db;
-  cleanup_dir dir;
-  (* The two commitment schemes must differ on any non-empty set. *)
-  if Cstruct.equal muhash sha256d then
-    test_failed name "MuHash3072 and SHA256d collide — cannot pin B8"
-  else begin
-    (* Document: camlcoin uses MuHash, Core uses SHA256d for this field.
-       The test confirms the bug is observable (they differ). *)
-    test_passed name  (* B8 documented *)
-  end
+  let path = unique_dump_path "b8_hser" in
+  (try Sys.remove path with _ -> ());
+  let result = Rpc.handle_dumptxoutset ctx [`String path; `String "latest"] in
+  let want = Types.hash256_to_hex_display
+               (Assume_utxo.compute_utxo_hash_from_db ctx.chain.db) in
+  (try Sys.remove path with _ -> ());
+  cleanup_dump_test_ctx db dir;
+  match result with
+  | Error msg -> test_failed name ("dumptxoutset failed: " ^ msg)
+  | Ok (`Assoc fields) ->
+    (match List.assoc_opt "txoutset_hash" fields with
+     | Some (`String s) when s = want -> test_passed name
+     | Some (`String s) ->
+       test_failed name
+         (Printf.sprintf "txoutset_hash=%s want HASH_SERIALIZED %s" s want)
+     | _ -> test_failed name "txoutset_hash field missing")
+  | Ok _ -> test_failed name "expected Assoc response"
 
 (* -----------------------------------------------------------------------
    B9 — G21: dumptxoutset response missing `nchaintx` field
@@ -1900,29 +1896,19 @@ let test_b9_dumptxoutset_missing_nchaintx_field () =
   | Ok _ -> test_failed name "expected Assoc response"
 
 (* -----------------------------------------------------------------------
-   B10 — G21: dumptxoutset txoutset_hash computed from live DB (post-restore),
-   not the historical (rolled-back) state.
-
-   For "latest" mode there is no rollback so this is moot, but for "rollback"
-   mode the comment in rpc.ml:6833-6838 explicitly documents:
-     "after a successful rollback+dump+restore round-trip the DB is at
-      [original_tip], so this hash now reflects the live UTXO set, not the
-      dumped (historical) one."
-   Pinned as a documentation bug that affects snapshot reproducibility.
+   B10 — dumptxoutset.txoutset_hash is present and is HASH_SERIALIZED of
+   the dumped coins (folded during the write pass, not after restore).
    ----------------------------------------------------------------------- *)
 let test_b10_dumptxoutset_hash_computed_from_restored_not_historical_state () =
-  let name = "B10: dumptxoutset hash computed after restore (not during dump)" in
-  (* We cannot exercise the rollback path without real block data, but we can
-     verify the comment is still present in the code — absence of the comment
-     would indicate the issue was silently addressed.
-
-     Instead: confirm "latest" mode returns a txoutset_hash field (it does),
-     and document that this hash equals compute_utxo_muhash (not SHA256d) on
-     the current DB.  This ensures the field is testable at all. *)
+  let name = "B10: dumptxoutset hash is HASH_SERIALIZED of the dumped set" in
+  (* "latest" has no rewind; the field must still be present and equal
+     HASH_SERIALIZED of the current committed set. *)
   let (ctx, db, dir) = make_dump_test_ctx () in
   let path = unique_dump_path "b10_hist" in
   (try Sys.remove path with _ -> ());
   let result = Rpc.handle_dumptxoutset ctx [`String path; `String "latest"] in
+  let want = Types.hash256_to_hex_display
+               (Assume_utxo.compute_utxo_hash_from_db ctx.chain.db) in
   (try Sys.remove path with _ -> ());
   cleanup_dump_test_ctx db dir;
   match result with
@@ -1930,8 +1916,10 @@ let test_b10_dumptxoutset_hash_computed_from_restored_not_historical_state () =
   | Ok (`Assoc fields) ->
     (match List.assoc_opt "txoutset_hash" fields with
      | None -> test_failed name "txoutset_hash field missing"
-     | Some _ ->
-       test_passed name)  (* B10 documented: field present but wrong for rollback *)
+     | Some (`String s) when s = want -> test_passed name
+     | Some (`String s) ->
+       test_failed name (Printf.sprintf "txoutset_hash=%s want %s" s want)
+     | Some _ -> test_failed name "txoutset_hash is not a string")
   | Ok _ -> test_failed name "expected Assoc"
 
 (* -----------------------------------------------------------------------

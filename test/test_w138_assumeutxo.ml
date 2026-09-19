@@ -619,15 +619,19 @@ let test_g27_node_network_limited_swap_absent () =
   let _ = src_has_swap_in_load in
   ()
 
-(* G28: dumptxoutset.txoutset_hash reflects post-restore state — W102 B10
-   re-pinned (BUG-W138-16). The TODO at rpc.ml:7179 documents the gap. *)
+(* G28: dumptxoutset.txoutset_hash is HASH_SERIALIZED of the dumped set,
+   folded during the write pass (Core rpc/blockchain.cpp:3259, 3345).
+   The W47 TODO that hashed the post-restore CF with MuHash is gone. *)
 let test_g28_txoutset_hash_post_restore_drift () =
   let src_has_todo = source_contains ~path:(rpc_ml ())
                        ~needle:"TODO(W47-followup)" in
   Alcotest.(check bool)
-    "G28: rpc.ml has TODO acknowledging post-restore hash drift \
-     (BUG-W138-16 / W102 B10 re-pinned)"
-    true src_has_todo
+    "G28: post-restore MuHash TODO is gone"
+    false src_has_todo;
+  Alcotest.(check bool)
+    "G28: dumptxoutset folds HASH_SERIALIZED during the write pass"
+    true
+    (source_contains ~path:(rpc_ml ()) ~needle:"hash_serialized_finish")
 
 (* G29: dumptxoutset response omits nchaintx — W102 B9 re-pinned
    (BUG-W138-17). *)
@@ -825,7 +829,7 @@ let () =
         test_g26_getchainstates_rpc_absent;
       Alcotest.test_case "G27: NODE_NETWORK→LIMITED swap absent (BUG-15)" `Quick
         test_g27_node_network_limited_swap_absent;
-      Alcotest.test_case "G28: txoutset_hash post-restore drift (BUG-16)" `Quick
+      Alcotest.test_case "G28: txoutset_hash is HASH_SERIALIZED of dump" `Quick
         test_g28_txoutset_hash_post_restore_drift;
       Alcotest.test_case "G29: dumptxoutset.nchaintx field absent (BUG-17)" `Quick
         test_g29_dumptxoutset_nchaintx_field_absent;

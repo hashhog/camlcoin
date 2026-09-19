@@ -11991,30 +11991,46 @@ let handle_dumptxoutset (_ctx : rpc_context)
             let ibd = Sync.create_ibd_state _ctx.chain in
             Sync.reorganize ibd saved_tip
         in
-        (* Count total coins post-rollback. Single iterator pass. *)
+        (* Iterate the coins that belong in this dump.
+           Core ForceFlushStateToDisk then cursors CoinsDB
+           (rpc/blockchain.cpp PrepareUTXOSnapshot). camlcoin cannot
+           flush from a read-only RPC: coins and chain_tip live in two
+           RocksDB instances (SECREV-CAMLCOIN-CRASH-2026-09-06).
+
+           "latest" (no rewind): walk the committed overlay — on-disk CF
+           plus OptimizedUtxoSet.dirty. Walking the CF alone is the 293
+           coin dump bug at height 6299: gettxoutsetinfo (already on
+           iter_committed_utxos) reported 6028 / ladder HASH_SERIALIZED,
+           dumptxoutset wrote 5735 (last flushed window,
+           utxo_flush_interval=500).
+
+           rollback: disconnect_to_target rewrites the CF to the
+           historical set and leaves dirty holding LIVE unflushed
+           coins. Overlaying those would mix two heights. Walk the CF. *)
+        let rolled_back = Option.is_some !saved_tip_for_restore in
+        let iter_dump f =
+          if rolled_back then
+            Storage.ChainDB.iter_utxos _ctx.chain.db f
+          else
+            Utxo.iter_committed_utxos _ctx.utxo _ctx.chain.db f
+        in
         let total_coins = ref 0L in
-        Storage.ChainDB.iter_utxos _ctx.chain.db (fun _txid _vout _data ->
-          total_coins := Int64.add !total_coins 1L
-        );
+        iter_dump (fun _txid _vout _data ->
+          total_coins := Int64.add !total_coins 1L);
         let metadata : Assume_utxo.snapshot_metadata = {
           network_magic = _ctx.network.magic;
           base_blockhash = base_hash;
           coins_count = !total_coins;
         } in
         let coins_written = ref 0L in
+        let hash_acc = Assume_utxo.hash_serialized_create () in
         let res = Assume_utxo.write_snapshot path metadata
           ~iter_coins:(fun emit ->
-            Storage.ChainDB.iter_utxos _ctx.chain.db (fun txid vout data ->
-              let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
-              let utxo = Utxo.deserialize_utxo_entry r in
-              let coin : Assume_utxo.snapshot_coin = {
-                outpoint = { Types.txid; vout = Int32.of_int vout };
-                value = utxo.value;
-                script_pubkey = utxo.script_pubkey;
-                height = utxo.height;
-                is_coinbase = utxo.is_coinbase;
-              } in
+            iter_dump (fun txid vout data ->
+              let outpoint, coin =
+                Assume_utxo.snapshot_coin_of_utxo_entry txid vout data in
               emit coin;
+              Assume_utxo.hash_serialized_add hash_acc outpoint coin;
               coins_written := Int64.add !coins_written 1L))
         in
         (* Always attempt to restore the chain, even if the dump failed,
@@ -12035,24 +12051,19 @@ let handle_dumptxoutset (_ctx : rpc_context)
                     restore failed: %s. The chain is currently at the \
                     rollback height; restart the node to recover." rmsg)
         | Ok (), Ok () ->
-          (* Compute the MuHash3072 commitment over the dumped UTXO set so the
-             operator can record it alongside the snapshot. Matches Bitcoin
-             Core's [dumptxoutset] response field [txoutset_hash], which is the
-             MuHash3072 path of [CoinStatsHashType] in [kernel/coinstats.cpp].
-             We iterate the chain DB rather than the dump file so we never have
-             to re-deserialize the on-disk snapshot format here.
-
-             NOTE: after a successful rollback+dump+restore round-trip the
-             DB is at [original_tip], so this hash now reflects the live UTXO
-             set, not the dumped (historical) one. The dump file itself was
-             written from the historical state during the rolled-back window,
-             so [base_hash]/[base_height] in the response are still correct.
-             For a Core-faithful [txoutset_hash] of the dumped set we'd need
-             to compute the MuHash inside the iter_coins callback above —
-             TODO(W47-followup): wire that through Assume_utxo.write_snapshot. *)
-          let txoutset_hash =
-            Assume_utxo.compute_utxo_muhash_from_db _ctx.chain.db
-          in
+          (* txoutset_hash is HASH_SERIALIZED of the dumped coins, folded
+             during the write pass — Core PrepareUTXOSnapshot
+             GetUTXOStats(HASH_SERIALIZED) then
+             result.pushKV("txoutset_hash", maybe_stats->hashSerialized)
+             (rpc/blockchain.cpp:3259, 3345). Same value
+             gettxoutsetinfo hash_serialized_3 returns for that set.
+             Core CHECK_NONFATAL(written == coins_count). *)
+          if not (Int64.equal !coins_written !total_coins) then
+            Error (Printf.sprintf
+                     "dumptxoutset: coins_written %Ld != coins_count %Ld"
+                     !coins_written !total_coins)
+          else
+          let txoutset_hash = Assume_utxo.hash_serialized_finish hash_acc in
           Ok (`Assoc [
             ("coins_written", `Int (Int64.to_int !coins_written));
             ("base_hash", `String (Types.hash256_to_hex_display base_hash));

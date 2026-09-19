@@ -195,3 +195,12 @@
 (executable
  (name test_gapfill_connect_none)
  (libraries camlcoin test_tmp alcotest lwt lwt.unix unix))
+
+; Control: dumptxoutset.coins_written == gettxoutsetinfo.txouts (QUEUES.md
+; item 0, 2026-09-19). Live dump at 6299 wrote 5735 of 6028; gettxoutsetinfo
+; (committed overlay) was right. Revert of the dump overlay walk makes
+; dirty-only coins_written=0 and the net-plus case 2 vs txouts=3.
+;   dune exec --no-buffer test/test_dumptxoutset_coins_written.exe
+(executable
+ (name test_dumptxoutset_coins_written)
+ (libraries camlcoin test_tmp alcotest unix))

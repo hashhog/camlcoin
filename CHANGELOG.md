@@ -2,6 +2,7 @@
 
 ## v1.0.2 — 2026-09-17
 
+- fix: dumptxoutset walks the committed UTXO overlay (CF + dirty) so coins_written equals gettxoutsetinfo.txouts; txoutset_hash is HASH_SERIALIZED of the dumped set. Mid-flush-window dumps no longer drop the unflushed class (5735 of 6028 at height 6299). Control: `dune exec --no-buffer test/test_dumptxoutset_coins_written.exe`.
 - fix: gettxoutsetinfo after --import-utxo reports the snapshot-base height without a second coins walk (campaign 419311 NO-ORACLE-SURFACE). 8f3c441 did not touch the RPC path; it started 31 extra script domains and the walk missed the scan deadline. Control: `dune exec --no-buffer test/test_snapshot_boot_txoutset.exe`.
 - feat: persistent ScriptCheckQueue (per-input, batch=128) + `--par` Core mapping (0=auto=every core, 1=serial; no 15-cap). ConnectBlock collects CScriptCheck jobs then drains the queue; lowest-index fail so worker count cannot change the decision. Control: `dune exec --no-buffer test/test_parallel_script.exe`.
 - fix: getblockchaininfo reports pruned:true + pruneheight when historical block bodies are missing (snapshot-boot prefix hole); getblockhash of an in-range unretained height is -1 "Block not available (pruned data)", not -8. Control: `dune exec --no-buffer test/test_pruned_history.exe`. Does not backfill genesis→floor; do not bounce the mainnet pin this run.

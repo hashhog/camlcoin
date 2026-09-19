@@ -204,3 +204,12 @@
 (executable
  (name test_dumptxoutset_coins_written)
  (libraries camlcoin test_tmp alcotest unix))
+
+; Control: IBD process_downloaded_blocks emits UpdateTip per connected
+; block (QUEUES.md 2026-09-19). 907680c logged the first 16 (gap-fill
+; drain) then only "Processed N blocks" while the tip moved to 419983.
+; Revert of the IBD log makes n_updatetip=0 with tip=32.
+;   dune exec --no-buffer test/test_update_tip_log.exe
+(executable
+ (name test_update_tip_log)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix logs unix))

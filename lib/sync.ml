@@ -4018,6 +4018,19 @@ module Validation_worker = struct
     if leave_tip_pool then ensure_tip_script_pool ()
 end
 
+(* Core Chainstate::UpdateTip (validation.cpp UpdateTipLog). One INFO
+   line per connected block on the active chain, including IBD.
+   Core disables rate-limiting at this source so IBD stays visible; we
+   do the same. 907680c logged this from process_new_block and the
+   gap-fill drain only — process_downloaded_blocks (run_ibd) was silent,
+   so the 419311 campaign logged 16 lines then only the batch
+   "Processed N blocks" while the tip moved to 419983. *)
+let log_update_tip ?(note = "") ~hash ~height ~n_tx elapsed_s =
+  let suffix = if note = "" then "" else " (" ^ note ^ ")" in
+  Logs.info (fun m ->
+    m "UpdateTip: hash=%s height=%d nTx=%d elapsed=%.3fs%s"
+      (Types.hash256_to_hex_display hash) height n_tx elapsed_s suffix)
+
 (* Process downloaded blocks in height order.
    [max_blocks] caps how many blocks are processed in one call.
    When [worker] is provided, block validation (the CPU-heavy
@@ -4043,6 +4056,7 @@ let process_downloaded_blocks ?(max_blocks = 1)
       | Downloaded { block; peer_id } ->
         (* Validate the block *)
         let height = entry.height in
+        let t0 = Unix.gettimeofday () in
         (* Compute expected difficulty via the block's own parent ancestry
            (hash-linked walk), NEVER the active-chain height index: the index
            does not cover header-ahead-of-block heights during catch-up, so an
@@ -4315,6 +4329,9 @@ let process_downloaded_blocks ?(max_blocks = 1)
            Storage.ChainDB.record_connected_tx_counts ibd.chain.db
              ~hash:entry.hash ~prev:block.header.prev_block
              ~n_tx:(List.length block.transactions);
+           log_update_tip ~hash:entry.hash ~height
+             ~n_tx:(List.length block.transactions)
+             (Unix.gettimeofday () -. t0);
            (* Prune old blocks if pruning is enabled *)
            prune_old_blocks ibd.chain height;
            (* Periodic UTXO flush — by block count or dirty set size.
@@ -7271,6 +7288,7 @@ let rec connect_stored_blocks (state : chain_state) : int =
     else match Storage.ChainDB.get_block state.db entry.hash with
       | None -> 0
       | Some stored_block ->
+        let t0 = Unix.gettimeofday () in
         let expected_bits = compute_expected_bits state next_height stored_block.header in
         let median_time = compute_mtp_hash_linked state entry.header.prev_block in
         let prev_block_time = get_prev_block_time state next_height in
@@ -7386,10 +7404,10 @@ let rec connect_stored_blocks (state : chain_state) : int =
              catch-up drain too so out-of-order blocks connected here prune
              the mempool just like the at-tip path.  Best-effort. *)
           run_mempool_remove_hook state stored_block next_height;
-          Logs.info (fun m ->
-            m "UpdateTip: hash=%s height=%d nTx=%d (gap-fill drain)"
-              (Types.hash256_to_hex_display entry.hash) next_height
-              (List.length stored_block.transactions));
+          log_update_tip ~note:"gap-fill drain" ~hash:entry.hash
+            ~height:next_height
+            ~n_tx:(List.length stored_block.transactions)
+            (Unix.gettimeofday () -. t0);
           (* Hot-path GC check (2026-06-09; non-STW slice + dedicated-domain
              backstop 2026-06-24): THE critical site.  This recursion is a
              fully-synchronous multi-block drain on the Lwt main thread — no
@@ -7498,6 +7516,7 @@ let process_new_block ?(f_requested = false)
           ignore (connect_stored_blocks state);
         Lwt.return (Ok ())
       end else begin
+        let t0 = Unix.gettimeofday () in
         let expected_bits = compute_expected_bits state height block.header in
         let median_time = compute_mtp_hash_linked state block.header.prev_block in
         let prev_block_time = get_prev_block_time state height in
@@ -7647,10 +7666,9 @@ let process_new_block ?(f_requested = false)
           Storage.ChainDB.record_connected_tx_counts state.db
             ~hash ~prev:entry.header.prev_block
             ~n_tx:(List.length block.transactions);
-          Logs.info (fun m ->
-            m "UpdateTip: hash=%s height=%d nTx=%d"
-              (Types.hash256_to_hex_display hash) height
-              (List.length block.transactions));
+          log_update_tip ~hash ~height
+            ~n_tx:(List.length block.transactions)
+            (Unix.gettimeofday () -. t0);
           (* Feed the wallet from the LIVE P2P / IBD connect path (not just the
              mining/RPC path).  [run_wallet_scan_hook] credits/debits + durably
              persists the wallet ledger so a coin received over P2P survives an

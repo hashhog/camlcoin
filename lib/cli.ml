@@ -381,7 +381,16 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       Printf.eprintf "[camlcoin] reindex failed: %s\n%!" msg;
       exit 1
   end;
-  let db = Storage.ChainDB.create db_path in
+  let dbcache_block_cache_mb =
+    Rocksdb_store.block_cache_mb_of_dbcache config.dbcache_lru_entries in
+  let dbcache_write_buffer_mb =
+    Rocksdb_store.write_buffer_mb_of_dbcache config.dbcache_lru_entries in
+  let db =
+    Storage.ChainDB.create
+      ~block_cache_mb:dbcache_block_cache_mb
+      ~write_buffer_mb:dbcache_write_buffer_mb
+      db_path
+  in
 
   (* Get network config *)
   let network = match config.network with
@@ -519,10 +528,23 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   (* Initialize UTXO set *)
   let utxo = Utxo.UtxoSet.create db in
 
-  (* Open RocksDB for the UTXO set — replaces LogStorage's lseek+read *)
+  (* Open RocksDB for the UTXO set — replaces LogStorage's lseek+read.
+     Block cache + write buffer come from --dbcache so a campaign
+     `--dbcache 4194304` (~1 GiB LRU) cannot sit next to an 8 GiB SST
+     cache. 2026-09-20 slice 419311→450000 held 11.2 GB RSS against
+     that 1 GiB budget while this open used the hardcoded 8192 MiB. *)
   let rocksdb_path = Filename.concat config.data_dir "rocksdb_utxo" in
-  let rocksdb = Rocksdb_store.open_db rocksdb_path in
-  Logs.info (fun m -> m "Opened RocksDB UTXO store at %s" rocksdb_path);
+  let rocksdb =
+    Rocksdb_store.open_db
+      ~block_cache_mb:dbcache_block_cache_mb
+      ~write_buffer_mb:dbcache_write_buffer_mb
+      rocksdb_path
+  in
+  Logs.info (fun m ->
+    m "Opened RocksDB UTXO store at %s (block_cache=%d MiB \
+       write_buffer=%d MiB; --dbcache %d entries)"
+      rocksdb_path dbcache_block_cache_mb dbcache_write_buffer_mb
+      config.dbcache_lru_entries);
 
   (* Wire the RocksDB handle into ChainDB so [get_utxo] can fall back to
      RocksDB on a LogStorage miss.  Pre-assume-valid UTXOs live only in
@@ -841,11 +863,13 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   (* LRU cache of 4M entries (~1GB) avoids hammering RocksDB during IBD.
      Without this, every UTXO lookup during block validation is a disk read.
      Reduced from 8M: at 8M the dirty set + LRU + OCaml GC overhead pushed
-     RSS to 12+ GB.  4M keeps RSS under control while still caching the
-     hot working set.
+     RSS to 12+ GB.  4M keeps the OCaml heap under control while still
+     caching the hot working set. The RocksDB SST cache is sized from the
+     same --dbcache budget (see [dbcache_block_cache_mb] above); it used
+     to ignore the flag and open at 8192 MiB.
      The budget is now operator-tunable via --dbcache / dbcache= (config
      field [dbcache_lru_entries]); it defaults to 4_000_000 so absent the
-     flag behavior is unchanged. PERF only — see the field's GC/RSS
+     flag the LRU size is unchanged. PERF only — see the field's GC/RSS
      warning before raising it on the mainnet node. *)
   let optimized_utxo =
     Utxo.OptimizedUtxoSet.create

@@ -518,11 +518,12 @@ module ChainDB = struct
      here so callers don't have to mkdir before passing in a fresh
      chainstate path (matches the historical LogStorage.open_db
      behaviour). *)
-  let create path =
+  let create ?write_buffer_mb ?block_cache_mb path =
     (try Unix.mkdir path 0o755
      with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
     let cf_path = Filename.concat path "chainstate-rocks" in
-    { cf = Cf_chainstate.open_db cf_path; rocksdb_utxo = None;
+    { cf = Cf_chainstate.open_db ?write_buffer_mb ?block_cache_mb cf_path;
+      rocksdb_utxo = None;
       batch_write_count = 0 }
 
   let close t = Cf_chainstate.close t.cf

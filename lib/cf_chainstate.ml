@@ -180,22 +180,26 @@ let close_unlocked (t : t) : unit =
    thanks to [create_missing_column_families = 1] in the C stub.
 
    Paths under /tmp/camlcoin_* are the test-suite convention. They get a
-   1 MiB write buffer (production default is 256 MiB) so a forgotten
+   1 MiB write buffer (production default follows --dbcache) so a forgotten
    teardown cannot fallocate a 286 MiB WAL onto the tmpfs, and they are
    unlinked at process exit. Explicit ~write_buffer_mb / ~block_cache_mb
-   still win. *)
+   still win. Production fallback used to be a hardcoded 2048 MiB block
+   cache that ignored --dbcache; it now uses the same derived budget as
+   Rocksdb_store. *)
 let open_db ?write_buffer_mb ?block_cache_mb ?(bloom_bits = 10)
     (path : string) : t =
   let test_path = is_camlcoin_tmp_path path in
   let write_buffer_mb =
     match write_buffer_mb with
     | Some n -> n
-    | None -> if test_path then 1 else 256
+    | None ->
+      if test_path then 1 else Rocksdb_store.default_write_buffer_mb
   in
   let block_cache_mb =
     match block_cache_mb with
     | Some n -> n
-    | None -> if test_path then 8 else 2048
+    | None ->
+      if test_path then 8 else Rocksdb_store.default_block_cache_mb
   in
   ensure_dir path;
   Mutex.protect registry_lock (fun () ->

@@ -663,6 +663,10 @@ module OptimizedUtxoSet = struct
   (* Get cache size *)
   let cache_size t = Perf.LRU.size t.cache
 
+  let cache_capacity t = Perf.LRU.capacity t.cache
+
+  let rocksdb t = t.rocksdb
+
   (* Clear the in-memory cache and dirty set.
      WARNING: Unflushed dirty entries will be lost! Call flush first. *)
   let clear_cache t =

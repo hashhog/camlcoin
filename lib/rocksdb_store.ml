@@ -4,23 +4,76 @@
 
 type t = {
   db : Rocksdb.t;
+  block_cache_mb : int;
+  write_buffer_mb : int;
 }
 
+(* --dbcache N is ENTRIES. range-runner.sh converts MiB → entries as
+   [MiB * 4096], i.e. 256 bytes/entry, so the campaign's
+   `--dbcache 4194304` is a ~1 GiB budget. The OCaml LRU is sized in
+   those entries; the RocksDB SST cache used to ignore the flag and
+   open at 8192 MiB (plus the CF store at 2048 MiB). Slice 419311→450000
+   on 2da7d6b then held 11.2 GB RSS against that 1 GiB budget. *)
+let bytes_per_dbcache_entry = 256
+let default_dbcache_entries = 4_000_000
+
+let budget_mb entries =
+  max 0 (entries / 4096)
+
+(* 1/4 of the implied byte budget, min 32 MiB so a tiny --dbcache still
+   has an SST cache, cap 512 MiB so raising --dbcache cannot recreate
+   the 8 GiB side allocation. Campaign 4_194_304 → 256 MiB. *)
+let block_cache_mb_of_dbcache entries =
+  max 32 (min 512 (budget_mb entries / 4))
+
+(* 1/16 of the implied byte budget, min 16 MiB, cap 64 MiB.
+   Campaign 4_194_304 → 64 MiB (× max_write_buffer_number=3 in the stub). *)
+let write_buffer_mb_of_dbcache entries =
+  max 16 (min 64 (budget_mb entries / 16))
+
+let default_block_cache_mb =
+  block_cache_mb_of_dbcache default_dbcache_entries
+
+let default_write_buffer_mb =
+  write_buffer_mb_of_dbcache default_dbcache_entries
+
+let is_camlcoin_tmp_path path =
+  let has_prefix pfx =
+    let n = String.length pfx in
+    String.length path >= n && String.sub path 0 n = pfx
+  in
+  has_prefix "/tmp/camlcoin_"
+  || has_prefix (Filename.concat (Filename.get_temp_dir_name ()) "camlcoin_")
+
 (* Open (or create) a RocksDB database at [path].
-   Tuning: 256 MB write buffer, 8 GB block cache, 10-bit bloom filter.
-   The block cache was raised 2 GB -> 8 GB: profiling the mainnet sync showed
-   camlcoin disk-I/O bound (~40% of time in random RocksDB UTXO reads), so a
-   larger SST block cache cuts read amplification on the hot UTXO column. *)
-let open_db ?(write_buffer_mb=256) ?(block_cache_mb=8192) ?(bloom_bits=10)
+   Block cache and write buffer are derived from --dbcache (see
+   [block_cache_mb_of_dbcache]) unless the caller passes them. Paths
+   under /tmp/camlcoin_* keep the 1 MiB / 8 MiB test convention so a
+   forgotten teardown cannot pin hundreds of MiB on the tmpfs. *)
+let open_db ?write_buffer_mb ?block_cache_mb ?(bloom_bits=10)
     (path : string) : t =
-  (* Ensure parent directory exists *)
   (try Unix.mkdir path 0o755
    with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  let test_path = is_camlcoin_tmp_path path in
+  let write_buffer_mb =
+    match write_buffer_mb with
+    | Some n -> n
+    | None -> if test_path then 1 else default_write_buffer_mb
+  in
+  let block_cache_mb =
+    match block_cache_mb with
+    | Some n -> n
+    | None -> if test_path then 8 else default_block_cache_mb
+  in
   let db = Rocksdb.open_db path write_buffer_mb block_cache_mb bloom_bits in
-  { db }
+  { db; block_cache_mb; write_buffer_mb }
 
 let close (t : t) : unit =
   Rocksdb.close t.db
+
+let block_cache_mb (t : t) : int = t.block_cache_mb
+let write_buffer_mb (t : t) : int = t.write_buffer_mb
+let block_cache_bytes (t : t) : int = t.block_cache_mb * 1024 * 1024
 
 (* Raw key-value access — keys are the 36-byte outpoint strings
    already constructed by OptimizedUtxoSet.utxo_key *)

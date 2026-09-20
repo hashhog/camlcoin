@@ -1070,16 +1070,33 @@ let handle_getchaintips (ctx : rpc_context) : Yojson.Safe.t =
    is trivially "most-work last" with one element.
 
    Cache sizes are the node's GENUINE configured budgets (not fabricated):
-   - coins_db_cache_bytes  = the RocksDB UTXO-store block cache.  cli.ml opens
-     the coins DB via Rocksdb_store.open_db, whose default block_cache_mb is
-     8192 MiB (rocksdb_store.ml:14).
-   - coins_tip_cache_bytes = the in-memory coins-cache byte budget,
-     Utxo.default_max_cache_bytes = 1 GiB (utxo.ml:812).  The live LRU
-     (OptimizedUtxoSet) is sized in ENTRIES rather than a per-instance byte
-     budget, so we surface the canonical configured byte budget for the
-     in-memory coins tip cache (Core reports cs.m_coinstip_cache_size_bytes). *)
-let coins_db_cache_bytes = 8192 * 1024 * 1024   (* Rocksdb_store.open_db default block_cache_mb *)
-let coins_tip_cache_bytes = Utxo.default_max_cache_bytes  (* in-memory coins-cache byte budget *)
+   - coins_db_cache_bytes  = the RocksDB UTXO-store block cache, derived
+     from --dbcache (Rocksdb_store.block_cache_mb_of_dbcache). When the
+     live OptimizedUtxoSet carries a store, we report that instance's
+     capacity; otherwise the 4_000_000-entry default.
+   - coins_tip_cache_bytes = the in-memory LRU byte budget
+     (entries * 256). Core reports cs.m_coinstip_cache_size_bytes. *)
+let coins_db_cache_bytes_of_ctx (ctx : rpc_context) : int =
+  match ctx.utxo with
+  | Some u ->
+    (match Utxo.OptimizedUtxoSet.rocksdb u with
+     | Some r -> Rocksdb_store.block_cache_bytes r
+     | None ->
+       Rocksdb_store.block_cache_mb_of_dbcache
+         Rocksdb_store.default_dbcache_entries
+       * 1024 * 1024)
+  | None ->
+    Rocksdb_store.block_cache_mb_of_dbcache
+      Rocksdb_store.default_dbcache_entries
+    * 1024 * 1024
+
+let coins_tip_cache_bytes_of_ctx (ctx : rpc_context) : int =
+  match ctx.utxo with
+  | Some u ->
+    let cap = Utxo.OptimizedUtxoSet.cache_capacity u in
+    if cap <= 0 then Utxo.default_max_cache_bytes
+    else cap * Rocksdb_store.bytes_per_dbcache_entry
+  | None -> Utxo.default_max_cache_bytes
 
 let handle_getchainstates (ctx : rpc_context) : Yojson.Safe.t =
   (* Active chainstate tip — height / hash / difficulty from the validated tip.
@@ -1147,8 +1164,8 @@ let handle_getchainstates (ctx : rpc_context) : Yojson.Safe.t =
     ("target",               `String target_hex);
     ("verificationprogress", `Float verificationprogress);
   ] @ snapshot_field @ [
-    ("coins_db_cache_bytes",  `Int coins_db_cache_bytes);
-    ("coins_tip_cache_bytes", `Int coins_tip_cache_bytes);
+    ("coins_db_cache_bytes",  `Int (coins_db_cache_bytes_of_ctx ctx));
+    ("coins_tip_cache_bytes", `Int (coins_tip_cache_bytes_of_ctx ctx));
     ("validated",            `Bool snapshot_validated);
   ]) in
   (* headers = best-header height seen so far (-1 if none).  camlcoin always

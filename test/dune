@@ -213,3 +213,15 @@
 (executable
  (name test_update_tip_log)
  (libraries camlcoin test_tmp alcotest lwt lwt.unix logs unix))
+
+; Control: --dbcache must bound the RocksDB block cache (QUEUES.md
+; 2026-09-20). Campaign 419311→450000 on 2da7d6b with --dbcache 4194304
+; (~1 GB at 256 B/entry) held 11.2 GB RSS. LRU is bounded; rocksdb_store
+; defaulted to 8192 MiB and cf_chainstate to 2048 MiB, neither derived
+; from --dbcache. Revert of block_cache_mb_of_dbcache, or of cli.ml /
+; bin/main.ml not passing it, makes the 1M/4M/16M curve flat at 8192
+; and the campaign case 8192 instead of 256.
+;   dune exec --no-buffer test/test_dbcache_rss.exe
+(executable
+ (name test_dbcache_rss)
+ (libraries camlcoin test_tmp alcotest unix))

@@ -141,15 +141,15 @@ let metrics_port_arg =
 
 let dbcache_arg =
   (* PERF/config only — NOT consensus. Sizes the in-memory OptimizedUtxoSet
-     LRU (entries) that fronts RocksDB during IBD. *)
-  let doc = "UTXO LRU cache entries (default 4000000; PERF/IBD-opt-in only \
-             — raising it enlarges the heap & GC pauses; camlcoin is \
-             loopback-pinned). This is a pure read cache over the \
-             authoritative RocksDB UTXO store and changes IBD speed only, \
-             never any validation result. Omitting the flag keeps the \
-             4000000-entry (~1 GB) default. WARNING: 8000000 has been \
-             observed to push RSS past 12 GB; raise only for an IBD run, \
-             watch RSS, and return to the default for steady-state." in
+     LRU (entries) that fronts RocksDB during IBD, AND the RocksDB SST
+     block cache / write buffer derived from the same budget. *)
+  let doc = "UTXO LRU cache entries (default 4000000 ≈ 1 GiB at 256 B/entry; \
+             PERF/IBD-opt-in only). Also sizes the RocksDB UTXO and \
+             chainstate SST caches (1/4 of that budget, cap 512 MiB) so \
+             they cannot sit next to the LRU unbounded. Omitting the flag \
+             keeps the 4000000-entry default. A campaign --dbcache of \
+             4194304 previously opened an 8 GiB SST cache and held 11.2 GB \
+             RSS; the SST cache now tracks this flag." in
   Arg.(value & opt (some int) None &
     info ["dbcache"] ~docv:"ENTRIES" ~doc)
 
@@ -576,6 +576,28 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       ~cli:(if metrics_port = 9332 then None else Some metrics_port)
       ~conf:(Camlcoin.Runtime_config.get_int conf_opts "metricsport")
       ~default:metrics_port in
+  (* PERF/config: UTXO LRU entry budget. CLI > conf > base default.
+     Resolved once so --import-utxo and Cli.run share the same RocksDB
+     block-cache derivation (campaign --dbcache is entries, not bytes). *)
+  let eff_dbcache =
+    let resolved =
+      Camlcoin.Runtime_config.overlay_int
+        ~cli:dbcache_cli
+        ~conf:(Camlcoin.Runtime_config.get_int conf_opts "dbcache")
+        ~default:base.dbcache_lru_entries
+    in
+    if resolved <= 0 then begin
+      Printf.eprintf
+        "[camlcoin] Invalid --dbcache value: %d (must be a positive number of entries)\n%!"
+        resolved;
+      exit 1
+    end;
+    resolved
+  in
+  let dbcache_block_cache_mb =
+    Camlcoin.Rocksdb_store.block_cache_mb_of_dbcache eff_dbcache in
+  let dbcache_write_buffer_mb =
+    Camlcoin.Rocksdb_store.write_buffer_mb_of_dbcache eff_dbcache in
   let eff_peer_bloom =
     Camlcoin.Runtime_config.overlay_bool
       ~cli_set:false ~cli_value:peer_bloom_filters
@@ -693,8 +715,18 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
            overwrite; remove %s to re-bootstrap. Continuing with existing \
            chainstate.\n%!" h db_path
       | None ->
-        let db = Camlcoin.Storage.ChainDB.create db_path in
-        let rocksdb = Camlcoin.Rocksdb_store.open_db rocksdb_path in
+        let db =
+          Camlcoin.Storage.ChainDB.create
+            ~block_cache_mb:dbcache_block_cache_mb
+            ~write_buffer_mb:dbcache_write_buffer_mb
+            db_path
+        in
+        let rocksdb =
+          Camlcoin.Rocksdb_store.open_db
+            ~block_cache_mb:dbcache_block_cache_mb
+            ~write_buffer_mb:dbcache_write_buffer_mb
+            rocksdb_path
+        in
         (match Camlcoin.Assume_utxo.load_snapshot_into_primary
                  ~network:network_cfg
                  ~snapshot_path:utxo_path
@@ -733,10 +765,20 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       | `Regtest -> Camlcoin.Consensus.regtest
     in
     let db_path = Filename.concat data_dir "chainstate" in
-    let db = Camlcoin.Storage.ChainDB.create db_path in
+    let db =
+      Camlcoin.Storage.ChainDB.create
+        ~block_cache_mb:dbcache_block_cache_mb
+        ~write_buffer_mb:dbcache_write_buffer_mb
+        db_path
+    in
     let chain = Camlcoin.Sync.restore_chain_state db network_cfg in
     let rocksdb_path = Filename.concat data_dir "rocksdb_utxo" in
-    let rocksdb = Camlcoin.Rocksdb_store.open_db rocksdb_path in
+    let rocksdb =
+      Camlcoin.Rocksdb_store.open_db
+        ~block_cache_mb:dbcache_block_cache_mb
+        ~write_buffer_mb:dbcache_write_buffer_mb
+        rocksdb_path
+    in
     (* Consistency check: reset blocks_synced if RocksDB was wiped *)
     if chain.blocks_synced > 0 then begin
       match Camlcoin.Rocksdb_store.get_tip_height rocksdb with
@@ -829,24 +871,7 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
         reindex
         || (match Camlcoin.Runtime_config.get_bool conf_opts "reindex" with
             | Some b -> b | None -> false);
-      (* PERF/config: UTXO LRU entry budget. CLI > conf > base default
-         (base.dbcache_lru_entries = 4_000_000, default-preserving). A
-         non-positive value is rejected so a typo can't silently disable
-         the cache or crash Perf.LRU. *)
-      dbcache_lru_entries =
-        (let resolved =
-           Camlcoin.Runtime_config.overlay_int
-             ~cli:dbcache_cli
-             ~conf:(Camlcoin.Runtime_config.get_int conf_opts "dbcache")
-             ~default:base.dbcache_lru_entries
-         in
-         if resolved <= 0 then begin
-           Printf.eprintf
-             "[camlcoin] Invalid --dbcache value: %d (must be a positive number of entries)\n%!"
-             resolved;
-           exit 1
-         end;
-         resolved);
+      dbcache_lru_entries = eff_dbcache;
       rest_enabled =
         rest_enabled
         || (match Camlcoin.Runtime_config.get_bool conf_opts "rest" with

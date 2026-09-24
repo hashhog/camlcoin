@@ -2652,9 +2652,16 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
                   match opt with
                   | Some utxo ->
                     utxo_heights_arr.(j) <- utxo.height;
-                    utxo_mtps_arr.(j) <- (match get_mtp_at_height with
-                      | Some f -> f (max 0 (utxo.height - 1))
-                      | None -> median_time)
+                    (* Only the [None] fallback reads this array:
+                       check_sequence_locks calls [get_mtp_at_height] itself,
+                       lazily, for time-based inputs (Core CalculateSequenceLocks
+                       only reads GetAncestor()->GetMedianTimePast() for inputs
+                       with SEQUENCE_LOCKTIME_TYPE_FLAG, tx_verify.cpp:79-90).
+                       Precomputing it here for every input was 11 header
+                       reads per input whose result was discarded. *)
+                    (match get_mtp_at_height with
+                     | Some _ -> ()
+                     | None -> utxo_mtps_arr.(j) <- median_time)
                   | None -> ()
                 ) resolved_utxos;
                 if not (check_sequence_locks tx ~block_height:height
@@ -2901,9 +2908,12 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
                   match opt with
                   | Some utxo ->
                     utxo_heights.(j) <- utxo.height;
-                    utxo_mtps.(j) <- (match get_mtp_at_height with
-                      | Some f -> f (utxo.height - 1)
-                      | None -> median_time)
+                    (* See the fast path: with [Some f], check_sequence_locks
+                       evaluates [f] lazily for time-based inputs only and
+                       never reads this array (Core tx_verify.cpp:79-90). *)
+                    (match get_mtp_at_height with
+                     | Some _ -> ()
+                     | None -> utxo_mtps.(j) <- median_time)
                   | None -> ()
                 ) resolved_utxos;
                 if not (check_sequence_locks tx ~block_height:height

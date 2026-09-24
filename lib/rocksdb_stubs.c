@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <malloc.h>
+#include <pthread.h>
 
 /* Force glibc to return free heap at the top of its arenas to the OS.
    camlcoin's Cstruct-based validation churns millions of tiny transient
@@ -57,9 +58,38 @@ CAMLprim value caml_rocksdb_malloc_trim(value v_unit) {
 static rocksdb_readoptions_t  *g_read_options  = NULL;
 static rocksdb_writeoptions_t *g_write_options = NULL;
 
+/* Created exactly once: point reads now run concurrently on several OCaml 5
+   domains (block-input prefetch), so the lazy init must not race. */
+static pthread_once_t g_read_options_once = PTHREAD_ONCE_INIT;
+static void init_read_options(void) { g_read_options = rocksdb_readoptions_create(); }
 static rocksdb_readoptions_t *get_read_options(void) {
-  if (!g_read_options) g_read_options = rocksdb_readoptions_create();
+  pthread_once(&g_read_options_once, init_read_options);
   return g_read_options;
+}
+
+/* Point read with the OCaml runtime released for the RocksDB call.
+   A Get can block in pread() for milliseconds on a cache miss. Holding the
+   domain lock across it means every stop-the-world minor GC requested by ANY
+   other domain waits for the read (OCaml 5 STW needs every domain, or its
+   backup thread, to answer). The key is copied out of the OCaml heap first
+   because the GC may move/free it once the runtime is released. */
+static char *get_released(rocksdb_t *db, rocksdb_column_family_handle_t *cfh,
+                          value v_key, size_t *vallen, char **err) {
+  size_t klen = caml_string_length(v_key);
+  char stackbuf[128];
+  char *kbuf = klen <= sizeof(stackbuf) ? stackbuf : malloc(klen);
+  if (!kbuf) caml_raise_out_of_memory();
+  memcpy(kbuf, String_val(v_key), klen);
+  rocksdb_readoptions_t *ro = get_read_options();
+  char *val;
+  caml_release_runtime_system();
+  if (cfh)
+    val = rocksdb_get_cf(db, ro, cfh, kbuf, klen, vallen, err);
+  else
+    val = rocksdb_get(db, ro, kbuf, klen, vallen, err);
+  caml_acquire_runtime_system();
+  if (kbuf != stackbuf) free(kbuf);
+  return val;
 }
 
 static rocksdb_writeoptions_t *get_write_options(void) {
@@ -211,9 +241,7 @@ CAMLprim value caml_rocksdb_get(value v_db, value v_key) {
   char *err = NULL;
   size_t vallen = 0;
 
-  char *val = rocksdb_get(db, get_read_options(),
-      String_val(v_key), caml_string_length(v_key),
-      &vallen, &err);
+  char *val = get_released(db, NULL, v_key, &vallen, &err);
 
   if (err) {
     char msg[512];
@@ -545,9 +573,7 @@ CAMLprim value caml_rocksdb_cf_get(value v_db, value v_cfh, value v_key) {
   char *err = NULL;
   size_t vallen = 0;
 
-  char *val = rocksdb_get_cf(db, get_read_options(), cfh,
-      String_val(v_key), caml_string_length(v_key),
-      &vallen, &err);
+  char *val = get_released(db, cfh, v_key, &vallen, &err);
 
   if (err) {
     char msg[512];

@@ -1959,7 +1959,12 @@ let run_script_check_queue (q : script_check_queue) (jobs : script_check_job arr
       let extra = q.extra_workers in
       Mutex.lock q.mutex;
       q.jobs <- jobs;
-      if extra > 0 && not q.stop then begin
+      (* Never dispatch an EMPTY generation: the early return below does not
+         wait for workers_done, so workers woken for it could still be about
+         to increment workers_done after the NEXT run resets it to 0, letting
+         that run's master stop waiting while a worker is still executing a
+         claimed batch (and scan_first_fail miss its failure). *)
+      if extra > 0 && not q.stop && Array.length jobs > 0 then begin
         q.workers_done <- 0;
         q.generation <- q.generation + 1;
         Condition.broadcast q.work_cond

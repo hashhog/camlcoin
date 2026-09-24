@@ -225,3 +225,10 @@
 (executable
  (name test_dbcache_rss)
  (libraries camlcoin test_tmp alcotest unix))
+
+; Control: an EMPTY ScriptCheckQueue generation must not leave straggler
+; workers that short-count the next generation (a missed failing check).
+;   dune exec --no-buffer test/test_checkqueue_straggler.exe
+(executable
+ (name test_checkqueue_straggler)
+ (libraries camlcoin alcotest unix))

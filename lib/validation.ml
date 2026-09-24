@@ -1802,6 +1802,12 @@ type script_check_queue = {
   mutable generation : int;
   mutable workers_done : int;
   mutable jobs : script_check_job array;
+  (* What the current generation runs: index -> unit over [0, ntasks).
+     Script checks set it to [run_one_job jobs.(i)]; [parallel_for] (block
+     input prefetch) sets an arbitrary task.  Read by workers under [mutex]
+     at the generation bump. *)
+  mutable task : int -> unit;
+  mutable ntasks : int;
   next : int Atomic.t;
   in_flight : int Atomic.t;
   max_in_flight : int Atomic.t;
@@ -1843,8 +1849,8 @@ let bump_max_in_flight q cur =
    nTotal = extra + master; nIdle is not tracked, so extra+2 matches Core's
    +1 plus the master. In-flight is therefore bounded by
    batch_size × (extra + 1), not by the job count. *)
-let claim_and_run (q : script_check_queue) (jobs : script_check_job array) : unit =
-  let n = Array.length jobs in
+let claim_and_run_task (q : script_check_queue) (n : int) (task : int -> unit)
+    : unit =
   if n = 0 then () else
   let extra = q.extra_workers in
   let rec loop () =
@@ -1867,7 +1873,7 @@ let claim_and_run (q : script_check_queue) (jobs : script_check_job array) : uni
         let old = Atomic.fetch_and_add q.in_flight inflight in
         bump_max_in_flight q (old + inflight);
         for i = got to batch_end - 1 do
-          run_one_job jobs.(i)
+          task i
         done;
         ignore (Atomic.fetch_and_add q.in_flight (-inflight));
         loop ()
@@ -1875,6 +1881,9 @@ let claim_and_run (q : script_check_queue) (jobs : script_check_job array) : uni
     end
   in
   loop ()
+
+let claim_and_run (q : script_check_queue) (jobs : script_check_job array) : unit =
+  claim_and_run_task q (Array.length jobs) (fun i -> run_one_job jobs.(i))
 
 let scan_first_fail (jobs : script_check_job array) : script_check_result =
   let n = Array.length jobs in
@@ -1903,10 +1912,10 @@ let script_check_worker_loop (q : script_check_queue) : unit =
       continue := false
     end else begin
       let gen = q.generation in
-      let jobs = q.jobs in
+      let task = q.task and ntasks = q.ntasks in
       Mutex.unlock q.mutex;
       last_gen := gen;
-      claim_and_run q jobs;
+      claim_and_run_task q ntasks task;
       Mutex.lock q.mutex;
       q.workers_done <- q.workers_done + 1;
       if q.workers_done = q.extra_workers then Condition.signal q.done_cond;
@@ -1926,6 +1935,8 @@ let create_script_check_queue extra_workers : script_check_queue =
     generation = 0;
     workers_done = 0;
     jobs = [||];
+    task = (fun _ -> ());
+    ntasks = 0;
     next = Atomic.make 0;
     in_flight = Atomic.make 0;
     max_in_flight = Atomic.make 0;
@@ -1959,6 +1970,8 @@ let run_script_check_queue (q : script_check_queue) (jobs : script_check_job arr
       let extra = q.extra_workers in
       Mutex.lock q.mutex;
       q.jobs <- jobs;
+      q.task <- (fun i -> run_one_job jobs.(i));
+      q.ntasks <- Array.length jobs;
       (* Never dispatch an EMPTY generation: the early return below does not
          wait for workers_done, so workers woken for it could still be about
          to increment workers_done after the NEXT run resets it to 0, letting
@@ -1985,6 +1998,45 @@ let run_script_check_queue (q : script_check_queue) (jobs : script_check_job arr
         scan_first_fail jobs
       end)
 
+(* Generic parallel-for on the same persistent workers (block-input
+   prefetch).  [task] must be safe to run concurrently for distinct indices
+   and must not raise (an escaping exception would leave a worker short of
+   its done-count); it is wrapped defensively anyway and the first exception
+   is re-raised on the master after every worker has finished. *)
+let run_parallel_task (q : script_check_queue) (n : int) (task : int -> unit)
+    : unit =
+  Mutex.lock q.control_mutex;
+  Fun.protect
+    ~finally:(fun () -> Mutex.unlock q.control_mutex)
+    (fun () ->
+      let first_exn : exn option Atomic.t = Atomic.make None in
+      let task i =
+        try task i
+        with e -> ignore (Atomic.compare_and_set first_exn None (Some e))
+      in
+      Atomic.set q.next 0;
+      Atomic.set q.in_flight 0;
+      let extra = q.extra_workers in
+      Mutex.lock q.mutex;
+      q.task <- task;
+      q.ntasks <- n;
+      let dispatched = extra > 0 && not q.stop && n > 0 in
+      if dispatched then begin
+        q.workers_done <- 0;
+        q.generation <- q.generation + 1;
+        Condition.broadcast q.work_cond
+      end;
+      Mutex.unlock q.mutex;
+      claim_and_run_task q n task;
+      if dispatched then begin
+        Mutex.lock q.mutex;
+        while q.workers_done < extra && not q.stop do
+          Condition.wait q.done_cond q.mutex
+        done;
+        Mutex.unlock q.mutex
+      end;
+      match Atomic.get first_exn with Some e -> raise e | None -> ())
+
 (* Process-wide queue. None ⇒ ConnectBlock runs the serial master path
    (tests / regtest / before start_script_check_queue). *)
 let script_check_queue : script_check_queue option ref = ref None
@@ -2006,6 +2058,13 @@ let stop_script_check_queue () : unit =
     shutdown_script_check_queue q;
     script_check_queue := None
   | None -> ()
+
+(* Run [task i] for i in [0, n) across the ScriptCheckQueue's domains, or
+   serially when there is no queue (tests / regtest / --par=1). *)
+let parallel_for (n : int) (task : int -> unit) : unit =
+  match !script_check_queue with
+  | Some q when q.extra_workers > 0 && n > 1 -> run_parallel_task q n task
+  | _ -> for i = 0 to n - 1 do task i done
 
 let run_script_checks (jobs : script_check_job array) : script_check_result =
   match !script_check_queue with
@@ -2334,6 +2393,12 @@ let calculate_tx_fee (tx : Types.transaction) ~(lookup : utxo_lookup)
    Full Block Validation with UTXO Set
    ============================================================================ *)
 
+(* Batched base-view read for block-input prefetch: [prefetch ops] returns,
+   per index, [Some r] where [r] is exactly what [base_lookup ops.(i)] would
+   return now, or [None] when it did not resolve that outpoint (the caller then
+   falls back to [base_lookup]).  The implementation may read in parallel. *)
+type base_prefetch = Types.outpoint array -> utxo option option array
+
 (* Check BIP30: no unspent outputs exist with the same txid.
    We probe output indices 0 through n_outputs-1 in the UTXO set.
    Bitcoin Core validation.cpp:2468-2475 (ConnectBlock BIP30 loop). *)
@@ -2429,7 +2494,8 @@ let bip30_should_enforce
 let validate_block_with_utxos ~network:(network : Consensus.network_config) (block : Types.block) (height : int)
     ~(expected_bits : int32) ~(median_time : int32)
     ~(base_lookup : utxo_lookup) ~(flags : int)
-    ?(skip_scripts=false) ?(skip_pow=false) ?(prev_block_time = 0l) ?get_mtp_at_height ?bip34_height_hash ()
+    ?(skip_scripts=false) ?(skip_pow=false) ?(prev_block_time = 0l) ?get_mtp_at_height ?bip34_height_hash
+    ?(prefetch_base : base_prefetch option) ()
     : ((int64 * Types.hash256 array * (Types.outpoint * utxo) list), block_validation_error) result =
 
   (* W93 Bug 5/6 fix: BIP-68 SequenceLocks and BIP-113 IsFinalTx are
@@ -2766,6 +2832,81 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
     let local_utxos : (string * int32, utxo) Hashtbl.t = Hashtbl.create 64 in
     let spent_in_block : (string * int32, unit) Hashtbl.t = Hashtbl.create 64 in
 
+    (* Compute txids ONCE up front (Fix 1) *)
+    let n_txs = List.length block.transactions in
+    let txid_arr = Array.make n_txs Cstruct.empty in
+    List.iteri (fun i tx ->
+      txid_arr.(i) <- Crypto.compute_txid tx
+    ) block.transactions;
+
+    (* Compute block hash once for BIP-30 repeat-block check. *)
+    let block_hash_for_bip30 = Crypto.compute_block_hash block.header in
+
+    (* Block-input prefetch (perf only; see [base_prefetch]).  Every base-view
+       read this block can make — each non-coinbase prevout whose txid is not
+       created in this block, plus every (txid, vout) the BIP-30 loop probes
+       when BIP-30 is enforced — is resolved up front in one batched, parallel
+       call, then served from a memo.  The base view is not mutated while a
+       block validates (UTXO updates are applied by the caller after
+       accept_block returns), so a memoised answer equals the answer the
+       serial loop would have read at that point.  Anything the prefetch did
+       not resolve (including a read that raised) falls through to the live
+       [base_lookup] at the same point as before, so error behaviour is
+       unchanged too.  The tx loop below still makes every decision serially,
+       in Core's order (validation.cpp ConnectBlock: BIP-30 loop, then per-tx
+       view.HaveInputs / CheckTxInputs / SequenceLocks / CheckInputScripts). *)
+    let base_lookup =
+      match prefetch_base with
+      | None -> base_lookup
+      | Some prefetch ->
+        let enforce_bip30 =
+          bip30_should_enforce ~network ~height
+            ~block_hash:block_hash_for_bip30 ~bip34_height_hash in
+        let block_txids : (string, unit) Hashtbl.t = Hashtbl.create (2 * n_txs) in
+        Array.iter (fun t -> Hashtbl.replace block_txids (Cstruct.to_string t) ())
+          txid_arr;
+        let seen : (string * int32, unit) Hashtbl.t = Hashtbl.create 4096 in
+        let ops = ref [] in
+        let add (op : Types.outpoint) key =
+          if not (Hashtbl.mem seen key) then begin
+            Hashtbl.add seen key ();
+            ops := op :: !ops
+          end
+        in
+        List.iteri (fun i (tx : Types.transaction) ->
+          if enforce_bip30 then begin
+            let txid = txid_arr.(i) in
+            let txid_str = Cstruct.to_string txid in
+            List.iteri (fun vout _ ->
+              let v = Int32.of_int vout in
+              add { Types.txid; vout = v } (txid_str, v)
+            ) tx.outputs
+          end;
+          if i > 0 then
+            List.iter (fun (inp : Types.tx_in) ->
+              let op = inp.previous_output in
+              let txid_str = Cstruct.to_string op.Types.txid in
+              if not (Hashtbl.mem block_txids txid_str) then
+                add op (txid_str, op.Types.vout)
+            ) tx.inputs
+        ) block.transactions;
+        let ops = Array.of_list (List.rev !ops) in
+        let res = prefetch ops in
+        let memo : (string * int32, utxo option) Hashtbl.t =
+          Hashtbl.create (2 * Array.length ops + 1) in
+        Array.iteri (fun j (op : Types.outpoint) ->
+          match res.(j) with
+          | Some r ->
+            Hashtbl.replace memo (Cstruct.to_string op.txid, op.vout) r
+          | None -> ()
+        ) ops;
+        fun (outpoint : Types.outpoint) ->
+          match Hashtbl.find_opt memo
+                  (Cstruct.to_string outpoint.txid, outpoint.vout) with
+          | Some r -> r
+          | None -> base_lookup outpoint
+    in
+
     (* Lookup that checks local UTXOs first, then base *)
     let lookup outpoint =
       let key = (Cstruct.to_string outpoint.Types.txid, outpoint.Types.vout) in
@@ -2776,16 +2917,6 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
         | Some utxo -> Some utxo
         | None -> base_lookup outpoint
     in
-
-    (* Compute txids ONCE up front (Fix 1) *)
-    let n_txs = List.length block.transactions in
-    let txid_arr = Array.make n_txs Cstruct.empty in
-    List.iteri (fun i tx ->
-      txid_arr.(i) <- Crypto.compute_txid tx
-    ) block.transactions;
-
-    (* Compute block hash once for BIP-30 repeat-block check. *)
-    let block_hash_for_bip30 = Crypto.compute_block_hash block.header in
 
     (* Accumulate sigops during per-tx validation so intra-block UTXOs are visible *)
     let total_sigops_cost = ref 0 in
@@ -3070,12 +3201,13 @@ let accept_block
     ?(prev_block_time = 0l)
     ?get_mtp_at_height
     ?bip34_height_hash
+    ?prefetch_base
     ()
     : accept_block_result =
   match validate_block_with_utxos ~network block height
           ~expected_bits ~median_time ~prev_block_time
           ~base_lookup ~flags ~skip_scripts ~skip_pow
-          ?get_mtp_at_height ?bip34_height_hash () with
+          ?get_mtp_at_height ?bip34_height_hash ?prefetch_base () with
   | Ok (fees, txid_arr, spent_utxos) ->
     AB_ok (fees, txid_arr, spent_utxos)
   | Error e ->

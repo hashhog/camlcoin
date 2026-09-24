@@ -381,6 +381,58 @@ module OptimizedUtxoSet = struct
           Perf.LRU.put t.cache key entry;
           Some entry)
 
+  (* Split form of [get] for the batched block-input prefetch
+     (Validation.validate_block_with_utxos ?prefetch_base).  Composes back to
+     exactly [get]:
+       get t x v = match get_mem t x v with
+         | Mem_hit e -> Some e | Mem_removed -> None
+         | Mem_miss -> let r = read_db t x v in note_db_result t x v r; r
+     [get_mem] is steps 1-2 of [get] with the SAME side effects (stats, LRU
+     promotion, dirty re-add), so it must run on one domain.  [read_db] is
+     step 3's read ONLY — no LRU / stats mutation — so several domains may run
+     it at once provided nothing mutates [t] meanwhile (RocksDB Get is
+     thread-safe; the deserialiser is pure).  [note_db_result] replays step
+     3's side effects serially afterwards. *)
+  type mem_result = Mem_hit of utxo_entry | Mem_removed | Mem_miss
+
+  let get_mem (t : t) (txid : Types.hash256) (vout : int) : mem_result =
+    let key = utxo_key txid vout in
+    t.stats.lookups <- t.stats.lookups + 1;
+    match Perf.LRU.get t.cache key with
+    | Some entry ->
+      t.stats.cache_hits <- t.stats.cache_hits + 1;
+      Mem_hit entry
+    | None ->
+      match Hashtbl.find_opt t.dirty key with
+      | Some `Removed ->
+        t.stats.misses <- t.stats.misses + 1;
+        Mem_removed
+      | Some (`Added entry) ->
+        t.stats.cache_hits <- t.stats.cache_hits + 1;
+        Perf.LRU.put t.cache key entry;
+        Mem_hit entry
+      | None -> Mem_miss
+
+  let read_db (t : t) (txid : Types.hash256) (vout : int)
+      : utxo_entry option =
+    let db_result = match t.rocksdb with
+      | Some rdb -> Rocksdb_store.get rdb (utxo_key txid vout)
+      | None -> Storage.ChainDB.get_utxo t.db txid vout
+    in
+    match db_result with
+    | None -> None
+    | Some data ->
+      Some (deserialize_utxo_entry
+              (Serialize.reader_of_cstruct (Cstruct.of_string data)))
+
+  let note_db_result (t : t) (txid : Types.hash256) (vout : int)
+      (r : utxo_entry option) : unit =
+    match r with
+    | None -> t.stats.misses <- t.stats.misses + 1
+    | Some entry ->
+      t.stats.db_hits <- t.stats.db_hits + 1;
+      Perf.LRU.put t.cache (utxo_key txid vout) entry
+
   (* Add a UTXO entry to LRU cache and mark dirty. Does NOT write to disk.
      A capacity-0 cache (snapshot import) skips the LRU entirely: the
      loader never reads back a coin it just wrote, and put+evict of

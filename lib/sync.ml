@@ -3872,6 +3872,9 @@ module Validation_worker = struct
        BIP-30 skip optimization (Gate 4 of [bip30_should_enforce]).
        [None] falls through to the conservative enforce path. *)
     bip34_height_hash : Types.hash256 option;
+    (* Block-input prefetch over [lookup]'s base view (perf only;
+       Validation.base_prefetch).  [None] = serial lookups as before. *)
+    prefetch_base : Validation.base_prefetch option;
   }
 
   type validation_result =
@@ -3956,6 +3959,7 @@ module Validation_worker = struct
                      ~skip_scripts:j.skip_scripts
                      ?get_mtp_at_height:j.get_mtp_at_height
                      ?bip34_height_hash:j.bip34_height_hash
+                     ?prefetch_base:j.prefetch_base
                      () with
              | Validation.AB_ok (fees, txid_arr, spent) ->
                Ok (Ok (fees, txid_arr, spent))
@@ -4079,6 +4083,38 @@ let process_downloaded_blocks ?(max_blocks = 1)
            that is not yet flushed to the database, so it can resolve
            outputs created earlier in this IBD session.  Fall back to
            the raw DB lookup for entries written in a previous session. *)
+        let of_entry (outpoint : Types.outpoint) (e : Utxo.utxo_entry) =
+          Validation.{
+            txid = outpoint.Types.txid;
+            vout = outpoint.Types.vout;
+            value = e.Utxo.value;
+            script_pubkey = e.Utxo.script_pubkey;
+            height = e.Utxo.height;
+            is_coinbase = e.Utxo.is_coinbase;
+          }
+        in
+        (* Raw-DB fallback (pure read + parse; safe on any domain). *)
+        let raw_db_lookup (outpoint : Types.outpoint) =
+          let txid = outpoint.Types.txid in
+          let vout = Int32.to_int outpoint.Types.vout in
+          match Storage.ChainDB.get_utxo ibd.chain.db txid vout with
+          | None -> None
+          | Some data ->
+            let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+            let value = Serialize.read_int64_le r in
+            let script_len = Serialize.read_compact_size r in
+            let script = Serialize.read_bytes r script_len in
+            let stored_height = Int32.to_int (Serialize.read_int32_le r) in
+            let utxo_is_coinbase = Serialize.read_uint8 r = 1 in
+            Some Validation.{
+              txid;
+              vout = outpoint.Types.vout;
+              value;
+              script_pubkey = script;
+              height = stored_height;
+              is_coinbase = utxo_is_coinbase;
+            }
+        in
         let lookup outpoint =
           let txid = outpoint.Types.txid in
           let vout = Int32.to_int outpoint.Types.vout in
@@ -4090,34 +4126,73 @@ let process_downloaded_blocks ?(max_blocks = 1)
             | None -> None
           in
           match entry_opt with
-          | Some e ->
-            Some Validation.{
-              txid;
-              vout = outpoint.Types.vout;
-              value = e.Utxo.value;
-              script_pubkey = e.Utxo.script_pubkey;
-              height = e.Utxo.height;
-              is_coinbase = e.Utxo.is_coinbase;
-            }
+          | Some e -> Some (of_entry outpoint e)
           | None ->
             (* Fall back to raw DB *)
-            (match Storage.ChainDB.get_utxo ibd.chain.db txid vout with
-             | None -> None
-             | Some data ->
-               let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
-               let value = Serialize.read_int64_le r in
-               let script_len = Serialize.read_compact_size r in
-               let script = Serialize.read_bytes r script_len in
-               let stored_height = Int32.to_int (Serialize.read_int32_le r) in
-               let utxo_is_coinbase = Serialize.read_uint8 r = 1 in
-               Some Validation.{
-                 txid;
-                 vout = outpoint.Types.vout;
-                 value;
-                 script_pubkey = script;
-                 height = stored_height;
-                 is_coinbase = utxo_is_coinbase;
-               })
+            raw_db_lookup outpoint
+        in
+        (* Batched, parallel form of [lookup] for a whole block's inputs
+           (Validation.base_prefetch).  Per outpoint it returns exactly what
+           [lookup] would: OptimizedUtxoSet.get = get_mem (serial, keeps its
+           LRU/stat side effects) then read_db (parallel, pure) with the
+           side effects replayed serially by note_db_result; on a miss the
+           same raw-DB fallback.  Only the RocksDB point reads fan out across
+           the ScriptCheckQueue domains — those were ~48% of the validation
+           domain's busy samples on the live 419k/450k slices (2026-09-24
+           gdb sampling: prevout reads + BIP-30 probes), each a synchronous
+           pread on an LRU/block-cache miss.  A read that raises leaves its
+           slot unresolved so the serial loop re-issues it at the original
+           point.  Core analogue: ConnectBlock's view.AccessCoin/HaveCoin
+           reads (validation.cpp) served by a warmed CCoinsViewCache. *)
+        let prefetch_base (ops : Types.outpoint array)
+            : Validation.utxo option option array =
+          let n = Array.length ops in
+          let res : Validation.utxo option option array = Array.make n None in
+          let need = Array.make n 0 in  (* 0 resolved, 1 db then raw, 2 raw *)
+          (match ibd.utxo_set with
+           | Some u ->
+             Array.iteri (fun i (op : Types.outpoint) ->
+               match Utxo.OptimizedUtxoSet.get_mem u op.Types.txid
+                       (Int32.to_int op.Types.vout) with
+               | Utxo.OptimizedUtxoSet.Mem_hit e ->
+                 res.(i) <- Some (Some (of_entry op e))
+               | Utxo.OptimizedUtxoSet.Mem_removed -> need.(i) <- 2
+               | Utxo.OptimizedUtxoSet.Mem_miss -> need.(i) <- 1
+             ) ops
+           | None -> Array.fill need 0 n 2);
+          let idx =
+            let l = ref [] in
+            for i = n - 1 downto 0 do if need.(i) <> 0 then l := i :: !l done;
+            Array.of_list !l
+          in
+          let dbr : Utxo.utxo_entry option option array = Array.make n None in
+          Validation.parallel_for (Array.length idx) (fun k ->
+            let i = idx.(k) in
+            let op = ops.(i) in
+            try
+              if need.(i) = 1 then begin
+                let u = match ibd.utxo_set with Some u -> u | None -> assert false in
+                let r = Utxo.OptimizedUtxoSet.read_db u op.Types.txid
+                          (Int32.to_int op.Types.vout) in
+                dbr.(i) <- Some r;
+                match r with
+                | Some e -> res.(i) <- Some (Some (of_entry op e))
+                | None -> res.(i) <- Some (raw_db_lookup op)
+              end else
+                res.(i) <- Some (raw_db_lookup op)
+            with _ -> ());
+          (match ibd.utxo_set with
+           | Some u ->
+             Array.iteri (fun i r ->
+               match r with
+               | Some r ->
+                 let op = ops.(i) in
+                 Utxo.OptimizedUtxoSet.note_db_result u op.Types.txid
+                   (Int32.to_int op.Types.vout) r
+               | None -> ()
+             ) dbr
+           | None -> ());
+          res
         in
         (* Validate block with UTXO tracking *)
         let skip_scripts = is_assume_valid ibd.chain entry.hash height in
@@ -4137,6 +4212,8 @@ let process_downloaded_blocks ?(max_blocks = 1)
               network = ibd.chain.network;
               get_mtp_at_height = Some (get_mtp_for_height ibd.chain);
               bip34_height_hash = bip34_height_hash_for ibd.chain;
+              prefetch_base =
+                if skip_scripts then None else Some prefetch_base;
             } in
             Validation_worker.submit_lwt w job
           | None ->
@@ -7568,6 +7645,7 @@ let process_new_block ?(f_requested = false)
               network = state.network;
               get_mtp_at_height = Some (get_mtp_for_height state);
               bip34_height_hash = bip34_height_hash_for state;
+              prefetch_base = None;
             } in
             Validation_worker.submit_lwt w job
           | None ->

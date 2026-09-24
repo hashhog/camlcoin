@@ -232,3 +232,11 @@
 (executable
  (name test_checkqueue_straggler)
  (libraries camlcoin alcotest unix))
+
+; Control for block-input prefetch (perf/block-validation 2026-09-24):
+; decision identity serial/full/empty/parallel prefetch, memo reached (0 live
+; reads), parallel_for coverage + exception.
+;   dune exec --no-buffer test/test_block_prefetch.exe
+(executable
+ (name test_block_prefetch)
+ (libraries camlcoin alcotest unix))

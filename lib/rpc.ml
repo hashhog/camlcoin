@@ -12298,15 +12298,24 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
          is a non-zero, monotone-with-set-size Int — the test asserts it is
          PRESENT and typed, not byte-equal to Core. *)
       let disk_size = ref 0L in
-      let txid_set = Hashtbl.create 1024 in
+      (* [transactions] = number of distinct txids.  Counted the way Core
+         does (kernel/coinstats.cpp ComputeUTXOStats: nTransactions++ each
+         time the cursor's key.hash differs from prevkey): the walk is in
+         outpoint key order (txid32 ++ vout), so every output of one txid
+         is contiguous and a change of txid starts a new transaction.
+         This used to put a 64-char hex key for EVERY txid in a Hashtbl —
+         on mainnet ~10^8 live strings (>10 GB of OCaml heap) held for the
+         whole scan, on the Lwt main thread, against a 48G unit cap. *)
+      let n_transactions = ref 0 in
+      let prev_txid = ref Cstruct.empty in
       Utxo.iter_committed_utxos ctx.utxo ctx.chain.db (fun txid vout data ->
         let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
         let utxo = Utxo.deserialize_utxo_entry r in
         let outpoint = { Types.txid; vout = Int32.of_int vout } in
-        (* Track unique txids for the [transactions] field. *)
-        let key = Types.hash256_to_hex txid in
-        if not (Hashtbl.mem txid_set key) then
-          Hashtbl.add txid_set key ();
+        if !n_transactions = 0 || not (Cstruct.equal txid !prev_txid) then begin
+          incr n_transactions;
+          prev_txid := txid
+        end;
         incr txouts;
         total_amount := Int64.add !total_amount utxo.Utxo.value;
         (* Core's GetBogoSize: 32 + 4 + 4 + 8 + 2 + scriptPubKey.size *)
@@ -12374,7 +12383,7 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
               "N.NNNNNNNN" decimal so the field is byte-comparable against
               Core's gettxoutsetinfo output. *)
            btc_amount_json !total_amount);
-        ("transactions", `Int (Hashtbl.length txid_set));
+        ("transactions", `Int !n_transactions);
         ("disk_size", `Int 0);
       ] in
       Ok (`Assoc base_fields))

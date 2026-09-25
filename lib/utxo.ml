@@ -433,6 +433,25 @@ module OptimizedUtxoSet = struct
       t.stats.db_hits <- t.stats.db_hits + 1;
       Perf.LRU.put t.cache (utxo_key txid vout) entry
 
+  (* [get] that keeps "spent in this cache" distinct from "not in this
+     cache or the store".  Same reads and side effects as [get].  A
+     [Coin_spent] answer is AUTHORITATIVE: the coin was spent by a block
+     connected since the last flush and must not be looked up anywhere
+     else — the store still holds it until the next flush, so any fallback
+     read would resurrect a spent coin.  Core: CCoinsViewCache::FetchCoin
+     (coins.cpp) only consults [base] when the outpoint has no cache entry;
+     a spent-and-dirty entry answers HaveCoin = false. *)
+  type view_result = Coin_hit of utxo_entry | Coin_spent | Coin_miss
+
+  let get_view (t : t) (txid : Types.hash256) (vout : int) : view_result =
+    match get_mem t txid vout with
+    | Mem_hit e -> Coin_hit e
+    | Mem_removed -> Coin_spent
+    | Mem_miss ->
+      let r = read_db t txid vout in
+      note_db_result t txid vout r;
+      (match r with Some e -> Coin_hit e | None -> Coin_miss)
+
   (* Add a UTXO entry to LRU cache and mark dirty. Does NOT write to disk.
      A capacity-0 cache (snapshot import) skips the LRU entirely: the
      loader never reads back a coin it just wrote, and put+evict of

@@ -185,6 +185,49 @@ let test_memo_is_consulted () =
   Alcotest.(check bool) "serial path reads the base" true (serial_calls > 0);
   Alcotest.(check int) "prefetched path makes no live reads" 0 prefetched_calls
 
+(* The IBD dispatcher's own readers (Sync.ibd_base_readers): serial
+   [lookup] and batched [prefetch_base] must agree per outpoint, and a coin
+   the OptimizedUtxoSet holds as SPENT is missing to both — even though the
+   store still has it until the next flush.  f90bd03 kept the old
+   behaviour here on purpose (Mem_removed -> raw-store read, returning the
+   spent coin) to stay identical to [lookup]; both now treat the cache as
+   authoritative, as Core's CCoinsViewCache::FetchCoin does (coins.cpp).
+   QUEUES.md 2026-09-24 cross-block double spend. *)
+let test_ibd_readers_spent_is_authoritative () =
+  Test_tmp.with_dir ~label:"prefetch_readers" ~mkdir:true (fun path ->
+    let db = Storage.ChainDB.create path in
+    Fun.protect ~finally:(fun () -> try Storage.ChainDB.close db with _ -> ())
+      (fun () ->
+        let state = Sync.create_chain_state db Consensus.regtest in
+        let u = Utxo.OptimizedUtxoSet.create ~cache_size:100 db in
+        let ibd = Sync.create_ibd_state ~utxo_set:u state in
+        let e v = { Utxo.value = v; script_pubkey = op_true (); height = 5;
+                    is_coinbase = false } in
+        let disk = hash_n 201 and cache_only = hash_n 202
+        and spent = hash_n 203 and never = hash_n 204 in
+        Utxo.OptimizedUtxoSet.add u disk 0 (e 1L);
+        Utxo.OptimizedUtxoSet.add u spent 0 (e 3L);
+        Utxo.OptimizedUtxoSet.flush u;
+        Utxo.OptimizedUtxoSet.add u cache_only 0 (e 2L);
+        Utxo.OptimizedUtxoSet.remove_fast u spent 0;
+        Alcotest.(check bool) "precondition: spent coin still in the store"
+          true (Storage.ChainDB.get_utxo db spent 0 <> None);
+        let lookup, prefetch = Sync.ibd_base_readers ibd in
+        let ops = Array.map (fun t -> { Types.txid = t; vout = 0l })
+                    [| disk; cache_only; spent; never |] in
+        let show = function
+          | None -> "missing"
+          | Some (x : Validation.utxo) -> Int64.to_string x.value in
+        let serial = Array.map (fun o -> show (lookup o)) ops in
+        let batched = Array.map (function
+            | None -> "unresolved" | Some r -> show r) (prefetch ops) in
+        Printf.printf "  serial=[%s] prefetch=[%s]\n"
+          (String.concat "," (Array.to_list serial))
+          (String.concat "," (Array.to_list batched));
+        Alcotest.(check (array string)) "serial lookup"
+          [| "1"; "2"; "missing"; "missing" |] serial;
+        Alcotest.(check (array string)) "prefetch == serial" serial batched))
+
 let test_parallel_for () =
   Validation.start_script_check_queue ();
   Fun.protect ~finally:Validation.stop_script_check_queue (fun () ->
@@ -213,6 +256,8 @@ let () =
         test_decision_identity;
       Alcotest.test_case "memo is consulted (0 live reads)" `Quick
         test_memo_is_consulted;
+      Alcotest.test_case "IBD readers: cache-spent coin is missing" `Quick
+        test_ibd_readers_spent_is_authoritative;
     ];
     "queue", [
       Alcotest.test_case "parallel_for coverage + exception" `Quick test_parallel_for;

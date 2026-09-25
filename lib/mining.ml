@@ -850,23 +850,28 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
           let vout = Int32.to_int outpoint.Types.vout in
           (* Check the OptimizedUtxoSet in-memory cache first (mirrors
              sync.ml:1794-1809: IBD uses the same layered lookup). *)
+          (* A coin the cache holds as spent is authoritative — no disk
+             fallback (Core CCoinsViewCache::FetchCoin, coins.cpp; same
+             rule as Sync.ibd_base_readers). *)
           let entry_opt = match utxo with
             | Some utxo_set ->
-              (match Utxo.OptimizedUtxoSet.get utxo_set txid vout with
-               | Some e ->
-                 Some Validation.{
+              (match Utxo.OptimizedUtxoSet.get_view utxo_set txid vout with
+               | Utxo.OptimizedUtxoSet.Coin_hit e ->
+                 `Found Validation.{
                    txid; vout = outpoint.Types.vout;
                    value = e.Utxo.value;
                    script_pubkey = e.Utxo.script_pubkey;
                    height = e.Utxo.height;
                    is_coinbase = e.Utxo.is_coinbase;
                  }
-               | None -> None)
-            | None -> None
+               | Utxo.OptimizedUtxoSet.Coin_spent -> `Spent
+               | Utxo.OptimizedUtxoSet.Coin_miss -> `Miss)
+            | None -> `Miss
           in
           match entry_opt with
-          | Some _ as found -> found
-          | None ->
+          | `Found u -> Some u
+          | `Spent -> None
+          | `Miss ->
             (* Fall back to raw DB (cf_chainstate / rocksdb_utxo) *)
             (match Storage.ChainDB.get_utxo chain.db txid vout with
              | None -> None

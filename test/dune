@@ -239,4 +239,14 @@
 ;   dune exec --no-buffer test/test_block_prefetch.exe
 (executable
  (name test_block_prefetch)
- (libraries camlcoin alcotest unix))
+ (libraries camlcoin test_tmp alcotest unix))
+
+; Control: a coin spent earlier in the current UTXO flush window is MISSING
+; to later blocks — no fall-through to the on-disk store (QUEUES.md
+; 2026-09-24 cross-block double spend). Drives process_downloaded_blocks
+; inline and via Validation_worker (prefetch). Red on f90bd03: block 103
+; re-spending C connects (tip 103).
+;   dune exec --no-buffer test/test_ibd_cache_spent_no_fallback.exe
+(executable
+ (name test_ibd_cache_spent_no_fallback)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix))

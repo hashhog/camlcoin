@@ -248,3 +248,11 @@
 (executable
  (name test_gettxoutsetinfo_transactions)
  (libraries camlcoin test_tmp alcotest unix))
+
+; Multi-domain Logs reports must not corrupt the shared Format state
+; (mainnet: "[gc] backstop compaction raised: Stdlib.Queue.Empty").
+; Without Cli.Report_lock.install: thousands of Queue.Empty -> FAIL.
+;   dune exec --no-buffer test/test_log_reporter_domains.exe
+(executable
+ (name test_log_reporter_domains)
+ (libraries camlcoin unix logs))

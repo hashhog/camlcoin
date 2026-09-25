@@ -238,6 +238,43 @@ let config_for_network = function
    Logging Setup
    ============================================================================ *)
 
+(* One lock around every Logs report, reentrant per (domain, thread).
+
+   Logs_fmt.reporter () captures Format.std_formatter / err_formatter of
+   the domain that installs it; OCaml 5 Format state is NOT domain-safe,
+   and camlcoin reports from the Lwt main domain AND from other domains
+   (Gc_guard.Backstop's compaction line, Validation_worker, script pool).
+   Unsynchronised, the shared formatter's token queue is corrupted:
+   mainnet restart.log carries interleaved half-lines and
+   "[gc] backstop compaction raised: Stdlib.Queue.Empty" (the exception
+   escapes Format inside Logs.info on the Backstop domain) in both runs
+   that were oom-killed at 48G (2026-09-21, 2026-09-25).  A standalone
+   4-domain Logs_fmt repro throws Queue.Empty on ~50% of calls.
+   Logs.set_reporter_mutex is the library's hook for exactly this; the
+   lock is reentrant so a message closure that itself logs cannot
+   self-deadlock (an error-checking Mutex would raise EDEADLK). *)
+module Report_lock = struct
+  let m = Mutex.create ()
+  let owner : (int * int) option ref = ref None
+  let depth = ref 0
+  let me () = ((Domain.self () :> int), Thread.id (Thread.self ()))
+  let lock () =
+    let id = me () in
+    if !owner = Some id then incr depth
+    else begin
+      Mutex.lock m;
+      owner := Some id;
+      depth := 1
+    end
+  let unlock () =
+    decr depth;
+    if !depth = 0 then begin
+      owner := None;
+      Mutex.unlock m
+    end
+  let install () = Logs.set_reporter_mutex ~lock ~unlock
+end
+
 (* When [reporter_already_installed] is true the caller has already wired up
    a custom reporter (e.g. Runtime_config.install_log_file_reporter for
    --logfile output) and we must NOT clobber it with Logs_fmt.reporter. *)
@@ -248,6 +285,7 @@ let setup_logging ?(reporter_already_installed : bool = false)
   Logs.set_level (Some default_level);
   if not reporter_already_installed then
     Logs.set_reporter (Logs_fmt.reporter ());
+  Report_lock.install ();
   if categories <> [] then
     List.iter (fun src ->
       let name = Logs.Src.name src in

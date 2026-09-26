@@ -244,9 +244,12 @@ let test_g8_pre_verack_sendheaders_misbehaves () =
        falls to the `_, false -> misbehaving peer 10` catch-all.  We
        verify: SendheadersMsg pattern appears exactly once (the post-
        handshake arm) and no `P2p.SendheadersMsg, false` arm exists. *)
+    (* FIXED (handshake Core-parity): dispatch_message now has a
+       `SendheadersMsg, false` arm that records the preference, and the
+       post-VERSION catch-all no longer scores. *)
     Alcotest.(check bool)
-      "G8: BUG-W136-4 — no `SendheadersMsg, false` arm in dispatch_message"
-      false (string_contains s "SendheadersMsg, false")
+      "G8: BUG-W136-4 FIXED — `SendheadersMsg, false` arm in dispatch_message"
+      true (string_contains s "SendheadersMsg, false")
 
 (* G9: announce_block honours send_headers branch. *)
 let test_g9_announce_block_honours_send_headers () =
@@ -531,10 +534,11 @@ let test_g25_wtxidrelay_gated_on_witness_service () =
   | None ->
     Alcotest.(check bool) "G25: BUG-W136-16 PRESENT (documentary)" true true
   | Some s ->
-    (* The gate `peer.services.witness &&` in send_feature_negotiation. *)
+    (* FIXED (handshake Core-parity): send_feature_negotiation gates only
+       on the common version, like Core :3710. *)
     Alcotest.(check bool)
-      "G25: BUG-W136-16 — send_feature_negotiation gates on peer.services.witness"
-      true (string_contains s "peer.services.witness &&")
+      "G25: BUG-W136-16 FIXED — no peer.services.witness gate on wtxidrelay"
+      false (string_contains s "peer.services.witness &&")
 
 (* G25b: protocol version constant matches Core. *)
 let test_g25b_wtxid_relay_version_constant () =

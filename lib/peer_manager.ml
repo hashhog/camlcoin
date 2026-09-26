@@ -2133,6 +2133,7 @@ let get_stalling_peers (pm : t) : Peer.peer list =
 let get_available_download_peers (pm : t) : Peer.peer list =
   List.filter (fun peer ->
     peer.Peer.state = Peer.Ready &&
+    Peer.can_download_blocks_from peer &&
     (match Hashtbl.find_opt pm.stale_state peer.Peer.id with
      | Some state -> state.block_stall.stalling_since = None
      | None -> true)

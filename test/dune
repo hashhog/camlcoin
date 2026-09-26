@@ -266,3 +266,12 @@
 (executable
  (name test_log_reporter_domains)
  (libraries camlcoin unix logs))
+
+; Handshake Core-parity (inbound + outbound): MIN_PEER_PROTO_VERSION 31800,
+; desirable services only for outbound, pre-verack SENDHEADERS processed and
+; every other pre-verack message ignored.  Drives the real handshake over a
+; socketpair.
+(test
+ (name test_handshake_core_parity)
+ (modules test_handshake_core_parity)
+ (libraries camlcoin alcotest lwt lwt.unix cstruct))

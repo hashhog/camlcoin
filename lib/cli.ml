@@ -1771,7 +1771,11 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         else
           None
       ) items in
-      if block_hashes <> [] then begin
+      (* Core HeadersDirectFetchBlocks only fetches post-segwit blocks from a
+         peer that CanServeWitnesses.  Inbound peers without NODE_WITNESS are
+         now admitted (Core parity), so the announcer is no longer implied
+         to be able to serve the witness block we would ask for. *)
+      if block_hashes <> [] && peer.Peer.services.Peer.witness then begin
         let send_getdata () = Peer.send_message peer (P2p.GetdataMsg block_hashes) in
         (* Headers-first jump recovery (Bitcoin Core parity,
            net_processing.cpp:4065-4118): a block inv is Core's cue to send a
@@ -1907,7 +1911,8 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
             let download_peers =
               List.filter
                 (fun p ->
-                  p.Peer.msg_loop_started && p.Peer.state = Peer.Ready)
+                  p.Peer.msg_loop_started && p.Peer.state = Peer.Ready
+                  && Peer.can_download_blocks_from p)
                 (Peer_manager.get_ready_peers peer_manager)
             in
             let peer_ids =
@@ -1918,11 +1923,14 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
                     else Some p.Peer.id)
                   download_peers
               in
-              peer.Peer.id :: rest
+              if Peer.can_download_blocks_from peer then peer.Peer.id :: rest
+              else rest
             in
             match
-              Sync.Gapfill.assign gapfill ~now:(Unix.gettimeofday ())
-                ~peer_ids hashes
+              if peer_ids = [] then None
+              else
+                Sync.Gapfill.assign gapfill ~now:(Unix.gettimeofday ())
+                  ~peer_ids hashes
             with
             | None ->
               Logs.debug (fun m ->
@@ -2529,7 +2537,12 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
      [enable_message_loops] every peer qualifies. *)
   let get_peers () = Peer_manager.get_ready_peers peer_manager in
   let get_download_peers () =
-    List.filter (fun p -> p.Peer.msg_loop_started) (get_peers ())
+    (* Core downloads blocks only from peers that CanServeBlocks and have
+       NODE_WITNESS; inbound peers lacking them are kept connected but are
+       never block sources. *)
+    List.filter
+      (fun p -> p.Peer.msg_loop_started && Peer.can_download_blocks_from p)
+      (get_peers ())
   in
 
   let misbehavior_handler peer_id infraction =

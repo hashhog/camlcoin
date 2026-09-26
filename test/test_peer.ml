@@ -278,7 +278,8 @@ let test_handshake_timeout () =
 
 (* Test minimum protocol version constant *)
 let test_min_protocol_version () =
-  Alcotest.(check int32) "min_protocol_version = 70015" 70015l
+  (* Core MIN_PEER_PROTO_VERSION (node/protocol_version.h:18). *)
+  Alcotest.(check int32) "min_protocol_version = 31800" 31800l
     Peer.min_protocol_version
 
 (* Test dispatch_message rejects pre-handshake messages *)
@@ -379,8 +380,11 @@ let test_dispatch_feature_negotiation () =
   let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
     ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
-  (* Simulate VERSION received but not VERACK *)
+  (* Simulate VERSION(70016) received but not VERACK.  wtxidrelay is only
+     honoured at common version >= 70016 (Core net_processing.cpp WTXIDRELAY). *)
   peer.version_received <- true;
+  peer.version_msg <- Some { (Peer.make_version_msg peer 0l) with
+                             Types.protocol_version = 70016l };
   (* wtxidrelay should be accepted *)
   let result = Lwt_main.run (Peer.dispatch_message peer P2p.WtxidrelayMsg) in
   (match result with

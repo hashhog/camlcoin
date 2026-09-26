@@ -357,10 +357,20 @@ let deserialize_version_msg r : Types.version_msg =
   let services = read_int64_le r in
   let timestamp = read_int64_le r in
   let addr_recv = deserialize_net_addr r in
-  let addr_from = deserialize_net_addr r in
-  let nonce = read_int64_le r in
-  let user_agent = read_string r in
-  let start_height = read_int32_le r in
-  let relay = read_uint8 r <> 0 in
+  (* Core ProcessMessage(VERSION) (net_processing.cpp:3625-3642): everything
+     after addrMe is OPTIONAL — each group is read only "if (!vRecv.empty())",
+     and fRelay defaults to true.  Old peers (e.g. < 70001, no relay byte)
+     omit trailing fields; requiring them turned a valid VERSION into a
+     parse failure and a dropped connection. *)
+  let more () = Cstruct.length r.buf - r.pos > 0 in
+  let (addr_from, nonce) =
+    if more () then
+      let a = deserialize_net_addr r in
+      (a, read_int64_le r)
+    else ({ Types.services = 0L; addr = Cstruct.create 16; port = 0 }, 0L)
+  in
+  let user_agent = if more () then read_string r else "" in
+  let start_height = if more () then read_int32_le r else 0l in
+  let relay = if more () then read_uint8 r <> 0 else true in
   { protocol_version; services; timestamp; addr_recv; addr_from;
     nonce; user_agent; start_height; relay }

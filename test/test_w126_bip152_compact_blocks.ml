@@ -156,18 +156,17 @@ let g5_short_id_48_bit_mask () =
 
 let g6_sendcmpct_sent_unconditionally_bug () =
   let src = slurp_lib "peer.ml" in
-  (* Outbound + inbound handshake unconditionally send make_sendcmpct_msg. *)
+  (* BUG-5 FIXED (handshake Core-parity): both handshakes go through
+     send_post_handshake_features, which sends sendcmpct only when the
+     common version >= SHORT_IDS_BLOCKS_VERSION (Core net_processing.cpp
+     VERACK handler). *)
   Alcotest.(check bool)
-    "G6 baseline: outbound handshake sends sendcmpct"
+    "G6: handshake sends sendcmpct"
     true (contains_substring src
-            "let* () = send_message peer (P2p.make_sendcmpct_msg ~high_bandwidth:false) in");
-  (* BUG-5 pre-fix marker: no protocol-version gate around the send. *)
+            "send_message peer (P2p.make_sendcmpct_msg ~high_bandwidth:false)");
   Alcotest.(check bool)
-    "BUG-5 (pre-fix): handshake does NOT gate sendcmpct on SHORT_IDS_BLOCKS_VERSION"
-    false (contains_substring src "SHORT_IDS_BLOCKS_VERSION");
-  Alcotest.(check bool)
-    "BUG-5 (pre-fix): handshake does NOT gate sendcmpct on 70014"
-    false (contains_substring src ">= 70014" || contains_substring src "70014")
+    "BUG-5 FIXED: sendcmpct gated on Consensus.short_ids_blocks_version"
+    true (contains_substring src "if cv >= Consensus.short_ids_blocks_version then")
 
 (* ============================================================================
    G7: SENDCMPCT with v != 2 silently dropped — PRESENT (FIX-43)

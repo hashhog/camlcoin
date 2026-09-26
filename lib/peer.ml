@@ -247,8 +247,12 @@ let avg_feefilter_broadcast_interval = 600.0   (* Average 10 minutes between bro
 let max_feefilter_change_delay = 300.0         (* 5 minutes max delay after significant change *)
 let feefilter_version = 70013l                 (* Minimum protocol version for feefilter *)
 
-(* Minimum protocol version required (post-segwit) *)
-let min_protocol_version = 70015l
+(* Minimum peer protocol version: Core MIN_PEER_PROTO_VERSION = 31800
+   (node/protocol_version.h:18), checked for EVERY peer at
+   net_processing.cpp:3619.  This used to be 70015 ("post-segwit"), which
+   dropped inbound peers Core keeps.  Feature messages are gated on the
+   peer's version individually instead (see [common_version]). *)
+let min_protocol_version = Consensus.min_peer_proto_version
 
 (* Direction of a peer connection *)
 type peer_direction = Inbound | Outbound
@@ -881,6 +885,31 @@ let send_message (peer : peer)
   | None | Some (P2p.V1 _) -> send_message_v1 peer payload
   | Some (P2p.V2 state) -> send_message_v2 peer state payload
 
+(* Core HasAllDesirableServiceFlags (protocol.h): NODE_WITNESS plus
+   NODE_NETWORK (or NODE_NETWORK_LIMITED).  Required of OUTBOUND peers at
+   VERSION time, and of any peer we ask for blocks — never of an inbound
+   peer merely to stay connected. *)
+let has_desirable_services (s : peer_services) : bool =
+  s.witness && (s.network || s.network_limited)
+
+(* Core pfrom.GetCommonVersion(): min(their VERSION, our PROTOCOL_VERSION).
+   0 until VERSION is received.  Every feature message we send is gated on
+   this, because a peer may now be as old as MIN_PEER_PROTO_VERSION. *)
+let common_version (peer : peer) : int32 =
+  match peer.version_msg with
+  | Some v ->
+    if Int32.compare v.protocol_version Types.protocol_version < 0
+    then v.protocol_version else Types.protocol_version
+  | None -> 0l
+
+(* May we request blocks from this peer?  Core only downloads from peers
+   that CanServeBlocks (NODE_NETWORK | NODE_NETWORK_LIMITED) and, post-segwit,
+   have NODE_WITNESS (FindNextBlocksToDownload skips !fHaveWitness).  Before
+   inbound peers without these services were admitted this was implied by
+   the handshake; now the download-peer selectors must check it. *)
+let can_download_blocks_from (peer : peer) : bool =
+  has_desirable_services peer.services
+
 (* Helper: process a version message received from the remote peer *)
 let process_version_msg (peer : peer) (v : Types.version_msg) : unit Lwt.t =
   (* Check for duplicate VERSION message *)
@@ -895,19 +924,23 @@ let process_version_msg (peer : peer) (v : Types.version_msg) : unit Lwt.t =
     peer.best_height <- v.start_height;
     peer.relay <- v.relay;
     peer.time_offset <- Int64.sub v.timestamp (Int64.of_float (Unix.gettimeofday ()));
-    if v.protocol_version < min_protocol_version then
+    (* Core order (net_processing.cpp:3609-3623): desirable-services check
+       ONLY for connections we chose (ExpectServicesFromConn = outbound),
+       then MIN_PEER_PROTO_VERSION for every peer.  An inbound peer with an
+       old version or no NODE_WITNESS is kept. *)
+    if peer.direction = Outbound && not (has_desirable_services peer.services)
+    then
+      Lwt.fail_with (Printf.sprintf
+        "Outbound peer does not offer the expected services \
+         (NODE_WITNESS + NODE_NETWORK or NODE_NETWORK_LIMITED; offered %Lx)"
+        v.services)
+    else if v.protocol_version < min_protocol_version then
       Lwt.fail_with (Printf.sprintf
         "Peer protocol version too old: %ld (minimum: %ld)"
         v.protocol_version min_protocol_version)
     else if v.nonce = peer.our_nonce then
       (* Self-connection detection *)
       Lwt.fail_with "Connected to self (nonce collision)"
-    else if not peer.services.witness then
-      Lwt.fail_with "Peer does not support NODE_WITNESS (required)"
-    else if peer.direction = Outbound &&
-            not (peer.services.network || peer.services.network_limited) then
-      Lwt.fail_with
-        "Outbound peer does not support NODE_NETWORK or NODE_NETWORK_LIMITED"
     else
       Lwt.return_unit
   end
@@ -934,22 +967,55 @@ let make_version_msg (peer : peer) (our_height : int32) : Types.version_msg =
    BEFORE verack per the respective BIPs. *)
 let send_feature_negotiation (peer : peer) : unit Lwt.t =
   let open Lwt.Syntax in
-  (* Send wtxidrelay if peer supports witness (BIP-339) *)
+  let cv = common_version peer in
+  (* BIP-339 wtxidrelay: Core net_processing.cpp:3710 gates ONLY on
+     greatest_common_version >= WTXID_RELAY_VERSION (no service check). *)
   let* () =
-    if peer.services.witness &&
-       (match peer.version_msg with
-        | Some v -> v.protocol_version >= Consensus.wtxid_relay_version
-        | None -> false) then
+    if cv >= Consensus.wtxid_relay_version then
       send_message peer P2p.WtxidrelayMsg
     else Lwt.return_unit
   in
-  (* Send sendaddrv2 (BIP-155) *)
-  send_message peer P2p.SendaddrV2Msg
+  (* BIP-155 sendaddrv2: Core :3715 sends it only to peers >= 70016, as a
+     courtesy to implementations that reject unknown messages. *)
+  if cv >= 70016l then send_message peer P2p.SendaddrV2Msg
+  else Lwt.return_unit
 
-(* Read messages until verack arrives, accepting feature negotiation messages
-   (wtxidrelay, sendaddrv2, sendcmpct, feefilter, sendtxrcncl, sendpackages)
-   that arrive before verack.  Returns unit on success or fails on timeout /
-   unexpected messages.
+(* Post-VERACK feature announcements, each gated on the common version the
+   way Core gates them, so an old (>= 31800) peer is never sent a message it
+   cannot parse:
+     sendheaders  >= SENDHEADERS_VERSION 70012   (MaybeSendSendHeaders :5525)
+     sendcmpct    >= SHORT_IDS_BLOCKS_VERSION 70014 (VERACK handler :3864)
+     feefilter    >= FEEFILTER_VERSION 70013     (MaybeSendFeefilter :5543) *)
+let send_post_handshake_features (peer : peer) : unit Lwt.t =
+  let open Lwt.Syntax in
+  let cv = common_version peer in
+  (* Request headers announcements instead of inv (BIP-130) *)
+  let* () =
+    if cv >= Consensus.sendheaders_version then
+      send_message peer P2p.SendheadersMsg
+    else Lwt.return_unit
+  in
+  (* BIP 152: Send sendcmpct version 2 (segwit-aware) in low-bandwidth mode *)
+  let* () =
+    if cv >= Consensus.short_ids_blocks_version then
+      send_message peer (P2p.make_sendcmpct_msg ~high_bandwidth:false)
+    else Lwt.return_unit
+  in
+  (* BIP 133: advertise the fee rate our mempool actually enforces —
+     Mempool.min_relay_fee = 100L sat/kvB (mempool.ml:293, Core
+     policy/policy.h:70 DEFAULT_MIN_RELAY_TX_FEE, lowered from 1000).
+     This used to send 100_000L (= 100 sat/vB), 1000x Core, so under BIP-133
+     peers withheld essentially all transaction relay from us while our own
+     getmempoolinfo reported 100. *)
+  if cv >= feefilter_version then
+    send_message peer (P2p.FeefilterMsg 100L)
+  else Lwt.return_unit
+
+(* Read messages until verack arrives.  Mirrors Core's pre-verack rules:
+   feature negotiation (wtxidrelay, sendaddrv2, sendcmpct, sendheaders,
+   sendtxrcncl, sendpackages) is PROCESSED; every other message (ping, inv,
+   feefilter, getheaders, ...) is logged and ignored, never a disconnect.
+   Returns unit on success or fails on timeout.
 
    sendtxrcncl (BIP-330) and sendpackages (BIP-431) MUST be sent between
    VERSION and VERACK per their respective BIPs (see Bitcoin Core
@@ -976,7 +1042,14 @@ let read_until_verack (peer : peer) : unit Lwt.t =
       | None -> Lwt.fail_with "Timeout waiting for verack"
       | Some P2p.VerackMsg -> Lwt.return_unit
       | Some P2p.WtxidrelayMsg ->
-        peer.wtxid_relay <- true;
+        (* Core :3928 — honoured only when common version >= 70016,
+           otherwise ignored (never a disconnect). *)
+        if common_version peer >= Consensus.wtxid_relay_version then
+          peer.wtxid_relay <- true;
+        loop ()
+      | Some P2p.SendheadersMsg ->
+        (* Core :3896 processes SENDHEADERS before verack. *)
+        peer.send_headers <- true;
         loop ()
       | Some P2p.SendaddrV2Msg ->
         peer.sendaddrv2 <- true;
@@ -987,10 +1060,6 @@ let read_until_verack (peer : peer) : unit Lwt.t =
           peer.cmpct_high_bandwidth <- announce;
           peer.cmpct_version <- version
         end;
-        loop ()
-      | Some (P2p.FeefilterMsg feerate) ->
-        (* Accept feefilter during feature negotiation *)
-        peer.feefilter <- feerate;
         loop ()
       | Some (P2p.SendtxrcnclMsg _) ->
         (* BIP-330 Erlay tx reconciliation negotiation.  We don't implement
@@ -1007,7 +1076,14 @@ let read_until_verack (peer : peer) : unit Lwt.t =
         peer.pkg_max_count <- msg.pkg_max_count;
         peer.pkg_max_weight <- msg.pkg_max_weight;
         loop ()
-      | Some _ -> Lwt.fail_with "Unexpected message before verack"
+      | Some other ->
+        (* Core :4010 — every other message (ping, inv, feefilter,
+           getheaders, a redundant version, ...) is logged and IGNORED prior
+           to verack: no disconnect, no misbehaviour, no count cap.  The
+           overall handshake deadline still bounds the wait. *)
+        Log.debug (fun m -> m "Unsupported message \"%s\" prior to verack from peer=%d"
+          (P2p.command_to_string (P2p.payload_to_command other)) peer.id);
+        loop ()
     end
   in
   loop ()
@@ -1152,18 +1228,9 @@ let perform_handshake_inner (peer : peer) (our_height : int32) : unit Lwt.t =
   let* () = read_until_verack peer in
   (* Mark handshake as complete *)
   peer.handshake_complete <- true;
-  (* Post-handshake feature negotiation *)
-  (* Request headers announcements instead of inv (BIP-130) *)
-  let* () = send_message peer P2p.SendheadersMsg in
-  (* BIP 152: Send sendcmpct version 2 (segwit-aware) in low-bandwidth mode *)
-  let* () = send_message peer (P2p.make_sendcmpct_msg ~high_bandwidth:false) in
-  (* BIP 133: advertise the fee rate our mempool actually enforces —
-     Mempool.min_relay_fee = 100L sat/kvB (mempool.ml:293, Core
-     policy/policy.h:70 DEFAULT_MIN_RELAY_TX_FEE, lowered from 1000).
-     This used to send 100_000L (= 100 sat/vB), 1000x Core, so under BIP-133
-     peers withheld essentially all transaction relay from us while our own
-     getmempoolinfo reported 100. *)
-  let* () = send_message peer (P2p.FeefilterMsg 100L) in
+  (* Post-handshake feature negotiation (version-gated, see
+     [send_post_handshake_features]) *)
+  let* () = send_post_handshake_features peer in
   peer.state <- Ready;
   (* Reset last_ping so the message loop does not immediately fire a ping.
      Without this, last_ping=0.0 triggers needs_ping on the first iteration,
@@ -1215,17 +1282,9 @@ let perform_inbound_handshake_inner (peer : peer) (our_height : int32) : unit Lw
   let* () = read_until_verack peer in
   (* Mark handshake as complete *)
   peer.handshake_complete <- true;
-  (* Post-handshake feature negotiation *)
-  let* () = send_message peer P2p.SendheadersMsg in
-  (* BIP 152: Send sendcmpct version 2 (segwit-aware) in low-bandwidth mode *)
-  let* () = send_message peer (P2p.make_sendcmpct_msg ~high_bandwidth:false) in
-  (* BIP 133: advertise the fee rate our mempool actually enforces —
-     Mempool.min_relay_fee = 100L sat/kvB (mempool.ml:293, Core
-     policy/policy.h:70 DEFAULT_MIN_RELAY_TX_FEE, lowered from 1000).
-     This used to send 100_000L (= 100 sat/vB), 1000x Core, so under BIP-133
-     peers withheld essentially all transaction relay from us while our own
-     getmempoolinfo reported 100. *)
-  let* () = send_message peer (P2p.FeefilterMsg 100L) in
+  (* Post-handshake feature negotiation (version-gated, see
+     [send_post_handshake_features]) *)
+  let* () = send_post_handshake_features peer in
   peer.state <- Ready;
   peer.last_ping <- Unix.gettimeofday ();
   Lwt.return_unit
@@ -1735,7 +1794,19 @@ let dispatch_message (peer : peer) (msg : P2p.message_payload)
       let* () = misbehaving peer 10 "pre-handshake wtxidrelay" in
       Lwt.return (`PreHandshake "wtxidrelay before VERSION")
     end else begin
-      peer.wtxid_relay <- true;
+      (* Core :3928 — only honoured at common version >= 70016. *)
+      if common_version peer >= Consensus.wtxid_relay_version then
+        peer.wtxid_relay <- true;
+      Lwt.return `Continue
+    end
+
+  (* Core :3896 — SENDHEADERS is PROCESSED before verack (recorded). *)
+  | P2p.SendheadersMsg, false ->
+    if not peer.version_received then begin
+      let* () = misbehaving peer 10 "pre-handshake sendheaders" in
+      Lwt.return (`PreHandshake "sendheaders before VERSION")
+    end else begin
+      peer.send_headers <- true;
       Lwt.return `Continue
     end
 
@@ -1761,15 +1832,6 @@ let dispatch_message (peer : peer) (msg : P2p.message_payload)
       Lwt.return `Continue
     end
 
-  | P2p.FeefilterMsg feerate, false ->
-    if not peer.version_received then begin
-      let* () = misbehaving peer 10 "pre-handshake feefilter" in
-      Lwt.return (`PreHandshake "feefilter before VERSION")
-    end else begin
-      peer.feefilter <- feerate;
-      Lwt.return `Continue
-    end
-
   (* BIP-331 sendpackages: announced between VERSION and VERACK.  Capture the
      peer's package-relay limits so the listener-level handler can clamp our
      own [getpkgtxns] requests. *)
@@ -1785,7 +1847,12 @@ let dispatch_message (peer : peer) (msg : P2p.message_payload)
       Lwt.return `Continue
     end
 
-  (* Pre-handshake: Any other message - reject *)
+  (* Between VERSION and VERACK, every other message (ping, inv, feefilter,
+     getheaders, ...) is logged and IGNORED — Core net_processing.cpp:4010
+     "Unsupported message prior to verack": no disconnect, no misbehaviour,
+     no cap.  Before VERSION this node still scores the peer. *)
+  | _, false when peer.version_received ->
+    Lwt.return (`PreHandshake "Unsupported message prior to verack")
   | _, false ->
     let* () = misbehaving peer 10 "pre-handshake message" in
     Lwt.return (`PreHandshake "Message received before handshake complete")

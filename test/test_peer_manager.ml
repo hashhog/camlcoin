@@ -166,6 +166,37 @@ let test_get_candidates_respects_limit () =
   let candidates = Peer_manager.get_connection_candidates pm 3 in
   Alcotest.(check int) "limited to 3" 3 (List.length candidates)
 
+(* Regression (mainnet 0-peer wedge): one failed re-dial of a known-good
+   (TRIED) address must not bury it behind every never-attempted NEW entry.
+   Core Select_ draws 50/50 from tried/new with GetChance weighting; the old
+   lexicographic (failures asc) sort returned the tried address 0 times out
+   of 200 here because 500 NEW entries have failures = 0. *)
+let test_get_candidates_tried_not_buried_by_one_failure () =
+  let pm = Peer_manager.create Consensus.mainnet in
+  let now = Unix.gettimeofday () in
+  for i = 1 to 500 do
+    Peer_manager.add_known_addr pm {
+      address = Printf.sprintf "9.%d.%d.1" (i / 256) (i mod 256);
+      port = 8333; services = 9L;
+      last_connected = 0.0; last_attempt = 0.0; last_success = 0.0;
+      failures = 0; banned_until = 0.0;
+      source = Peer_manager.Addr; table_status = Peer_manager.NotInTable }
+  done;
+  Hashtbl.replace pm.known_addrs "8.8.4.4" {
+    address = "8.8.4.4"; port = 8333; services = 9L;
+    last_connected = now -. 300.0; last_attempt = now -. 120.0;
+    last_success = now -. 300.0; failures = 1; banned_until = 0.0;
+    source = Peer_manager.Addr; table_status = Peer_manager.InTried 0 };
+  let hits = ref 0 in
+  for _ = 1 to 200 do
+    match Peer_manager.get_connection_candidates pm 1 with
+    | [ c ] when c.address = "8.8.4.4" -> incr hits
+    | _ -> ()
+  done;
+  Alcotest.(check bool)
+    (Printf.sprintf "tried addr drawn in >=60/200 single-slot selections (got %d)" !hits)
+    true (!hits >= 60)
+
 (* Test fallback peers for mainnet *)
 let test_mainnet_fallback_peers () =
   let fallback = Peer_manager.get_fallback_peers Consensus.mainnet in
@@ -1027,6 +1058,8 @@ let () =
         test_get_candidates_returns_valid;
       Alcotest.test_case "get_candidates_respects_limit" `Quick
         test_get_candidates_respects_limit;
+      Alcotest.test_case "get_candidates_tried_not_buried_by_one_failure" `Quick
+        test_get_candidates_tried_not_buried_by_one_failure;
     ];
     "fallback_peers", [
       Alcotest.test_case "mainnet" `Quick test_mainnet_fallback_peers;

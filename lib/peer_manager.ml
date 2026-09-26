@@ -1622,7 +1622,30 @@ let get_available_download_peers (pm : t) : Peer.peer list =
      | None -> true)
   ) pm.peers
 
-(* Get candidate addresses for connection *)
+(* Core AddrInfo::GetChance (addrman.cpp:74): 0.01x if attempted in the last
+   10 min, times 0.66 per failed attempt (capped at 8, so a failure is a
+   deprioritisation, never a cliff). *)
+let addr_select_rng = Random.State.make_self_init ()
+
+let addr_select_chance ~(now : float) (info : peer_info) : float =
+  let recent = if now -. info.last_attempt < 600.0 then 0.01 else 1.0 in
+  recent *. (0.66 ** float_of_int (min info.failures 8))
+
+(* Get candidate addresses for connection.
+
+   Mirrors Core AddrMan::Select_ (addrman.cpp:693) as used by
+   ThreadOpenConnections: each slot is drawn 50/50 from the TRIED side
+   (addresses we have successfully connected to) or the NEW side, and within
+   a side an entry is picked with probability proportional to GetChance.
+
+   The previous implementation sorted the whole book lexicographically by
+   (failures asc, last_connected desc).  For gossiped/addpeeraddress entries
+   [last_connected] is the advertised nTime (≈ now), so never-attempted NEW
+   entries outranked the TRIED addresses we had actually connected to, and a
+   single failed re-dial buried a tried address behind every 0-failure NEW
+   entry.  The loop dials serially at ~10 s per black-holed address, so on
+   mainnet (16k NEW entries) the node sat at 0 peers after its outbound peers
+   dropped at once, dialing only dead NEW addresses. *)
 let get_connection_candidates (pm : t) (count : int) : peer_info list =
   let now = Unix.gettimeofday () in
   let candidates = Hashtbl.fold (fun _ info acc ->
@@ -1634,14 +1657,31 @@ let get_connection_candidates (pm : t) (count : int) : peer_info list =
     then info :: acc
     else acc
   ) pm.known_addrs [] in
-  (* Sort by: fewer failures first, more recent connections first *)
-  let sorted = List.sort (fun a b ->
-    let cmp = compare a.failures b.failures in
-    if cmp <> 0 then cmp
-    else compare b.last_connected a.last_connected
-  ) candidates in
-  (* Take first 'count' candidates *)
-  List.filteri (fun i _ -> i < count) sorted
+  let is_tried info =
+    (match info.table_status with InTried _ -> true | _ -> false)
+    || info.last_success > 0.0
+  in
+  (* Weighted random order without replacement (Efraimidis-Spirakis): key =
+     u^(1/w); the highest keys are an unbiased weighted sample. *)
+  let weighted_order infos =
+    List.map (fun info ->
+      let w = addr_select_chance ~now info in
+      (Random.State.float addr_select_rng 1.0 ** (1.0 /. w), info)) infos
+    |> List.sort (fun (a, _) (b, _) -> compare b a)
+    |> List.map snd
+  in
+  let tried, fresh = List.partition is_tried candidates in
+  let rec pick n tried fresh acc =
+    if n <= 0 then List.rev acc
+    else match tried, fresh with
+      | [], [] -> List.rev acc
+      | t :: tr, [] -> pick (n - 1) tr [] (t :: acc)
+      | [], f :: fr -> pick (n - 1) [] fr (f :: acc)
+      | t :: tr, f :: fr ->
+        if Random.State.bool addr_select_rng then pick (n - 1) tr fresh (t :: acc)
+        else pick (n - 1) tried fr (f :: acc)
+  in
+  pick count (weighted_order tried) (weighted_order fresh) []
 
 (* ===================================================================
    P2P anti-eclipse: feeler connections + getaddr anti-DoS guards.

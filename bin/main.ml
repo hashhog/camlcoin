@@ -71,6 +71,27 @@ let no_dnsseed_arg =
              while leaving addrman / fallback outbound dialing on." in
   Arg.(value & flag & info ["nodnsseed"] ~doc)
 
+let externalip_arg =
+  let doc = "Specify your own public address <ip>[:port] to advertise to \
+             peers (Bitcoin Core -externalip). Repeatable / comma-separated. \
+             A bare IP uses the P2P listen port. Implies --discover=0 \
+             unless --discover is given." in
+  Arg.(value & opt_all string [] & info ["externalip"] ~docv:"IP[:PORT]" ~doc)
+
+let discover_arg =
+  let doc = "Discover our own public address from what outbound peers \
+             report in VERSION (Bitcoin Core -discover). Default: 1 unless \
+             --externalip is set. Accepts 0/1/true/false; bare --discover \
+             means 1." in
+  let bool01 =
+    let parse s = match String.lowercase_ascii s with
+      | "1" | "true" | "yes" -> Ok true
+      | "0" | "false" | "no" -> Ok false
+      | _ -> Error (`Msg (Printf.sprintf "invalid --discover value %S" s)) in
+    Arg.conv (parse, Format.pp_print_bool) in
+  Arg.(value & opt ~vopt:(Some true) (some bool01) None &
+    info ["discover"] ~docv:"0|1" ~doc)
+
 let no_assume_valid_arg =
   let doc = "Disable the built-in assume-valid block (Bitcoin Core \
              -assumevalid=0). Forces full script verification of EVERY \
@@ -473,7 +494,8 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     rest_enabled rest_port rest_bind blockfilterindex asmap
     proxy onion_proxy i2psam i2p_private_key cjdnsreachable
     rpc_tls_cert rpc_tls_key rest_tls_cert rest_tls_key
-    coinstatsindex_cli txindex_cli txospenderindex_cli dbcache_cli par_cli =
+    coinstatsindex_cli txindex_cli txospenderindex_cli dbcache_cli par_cli
+    externalip_cli discover_cli =
   (* --txindex is accepted for Core CLI compatibility (camlcoin always
      maintains the tx index); validate its value but otherwise ignore it. *)
   ignore txindex_cli;
@@ -1002,6 +1024,13 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       rest_tls_key = (match rest_tls_key with
         | Some _ -> rest_tls_key
         | None -> Camlcoin.Runtime_config.get_string conf_opts "resttlskey");
+      (* Self-address advertisement (Core -externalip / -discover). CLI
+         values replace conf-file values. *)
+      externalip = (if externalip_cli <> [] then externalip_cli
+                    else Camlcoin.Runtime_config.get_all conf_opts "externalip");
+      discover = (match discover_cli with
+        | Some b -> Some b
+        | None -> Camlcoin.Runtime_config.get_bool conf_opts "discover");
     } in
     (* Ensure datadir exists so we can land the PID file there. *)
     (try Unix.mkdir resolved_datadir 0o755
@@ -1120,7 +1149,9 @@ let cmd =
     $ txindex_arg
     $ txospenderindex_arg
     $ dbcache_arg
-    $ par_arg)
+    $ par_arg
+    $ externalip_arg
+    $ discover_arg)
 
 (* ============================================================================
    Entry Point

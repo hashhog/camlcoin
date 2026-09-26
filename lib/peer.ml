@@ -366,17 +366,22 @@ let csprng_int_range (max_exclusive : int) : int =
   let masked = Int64.logand raw 0x3FFFFFFFFFFFFFFFL in
   Int64.to_int masked mod max_exclusive
 
-(* Create a local network address (IPv4-mapped IPv6 for 127.0.0.1) *)
+(* The VERSION addr_from field.  Bitcoin Core sends an EMPTY service here —
+   `CNetAddr::V1(CService{})`, i.e. 16 zero bytes and port 0, with our
+   services (net_processing.cpp PushNodeVersion) — and never its own
+   address: self-advertisement goes out as a separate addr/addrv2 after the
+   handshake (Peer_manager.maybe_send_local_addr).  This used to claim
+   ::ffff:127.0.0.1, which is not where anybody can reach us. *)
 let make_local_addr () : Types.net_addr =
   let addr = Cstruct.create 16 in
-  (* IPv4-mapped IPv6: ::ffff:127.0.0.1 *)
-  Cstruct.set_uint8 addr 10 0xFF;
-  Cstruct.set_uint8 addr 11 0xFF;
-  Cstruct.set_uint8 addr 12 127;
-  Cstruct.set_uint8 addr 13 0;
-  Cstruct.set_uint8 addr 14 0;
-  Cstruct.set_uint8 addr 15 1;
   { services = services_to_int64 (our_services ()); addr; port = 0 }
+
+(* The address the peer says it sees us at: its VERSION addr_recv (Core
+   CNode::GetAddrLocal / SetAddrLocal).  None before VERSION arrives. *)
+let addr_local (peer : peer) : Types.net_addr option =
+  match peer.version_msg with
+  | Some v -> Some v.addr_recv
+  | None -> None
 
 (* Poisson delay: returns exponentially distributed delay with given average.
    Uses the inverse CDF method: -ln(U) * avg where U is uniform (0,1).

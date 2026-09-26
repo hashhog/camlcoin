@@ -2027,7 +2027,13 @@ let handle_getnetworkinfo (ctx : rpc_context) : Yojson.Safe.t =
        `Float (Int64.to_float ctx.mempool.min_relay_fee /. 1e8));
     ("incrementalfee",
        `Float (Int64.to_float Mempool.incremental_relay_fee /. 1e8));
-    ("localaddresses", `List []);
+    (* localaddresses: our own advertised addresses (--externalip +
+       discovered), Core rpc/net.cpp getnetworkinfo: [{address, port, score}]. *)
+    ("localaddresses", `List (
+      List.map (fun (address, port, score) ->
+        `Assoc [ ("address", `String address); ("port", `Int port);
+                 ("score", `Int score) ])
+        (Peer_manager.local_addresses ctx.peer_manager)));
     ("warnings", `List []);
   ]
 

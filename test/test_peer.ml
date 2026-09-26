@@ -140,24 +140,17 @@ let test_peer_state_to_string () =
   Alcotest.(check string) "disconnected" "disconnected"
     (Peer.peer_state_to_string Peer.Disconnected)
 
-(* Test make_local_addr creates valid IPv4-mapped IPv6 address *)
+(* Test make_local_addr: the VERSION addr_from field is EMPTY, like Bitcoin
+   Core (CNetAddr::V1(CService{}): 16 zero bytes, port 0).  It used to claim
+   ::ffff:127.0.0.1; our real address goes out as a separate addr message. *)
 let test_make_local_addr () =
   Peer.set_peer_bloom_filters false;
   let addr = Peer.make_local_addr () in
-  (* Check IPv4-mapped prefix bytes *)
-  Alcotest.(check int) "byte 10 = 0xFF" 0xFF
-    (Cstruct.get_uint8 addr.addr 10);
-  Alcotest.(check int) "byte 11 = 0xFF" 0xFF
-    (Cstruct.get_uint8 addr.addr 11);
-  (* Check 127.0.0.1 *)
-  Alcotest.(check int) "byte 12 = 127" 127
-    (Cstruct.get_uint8 addr.addr 12);
-  Alcotest.(check int) "byte 13 = 0" 0
-    (Cstruct.get_uint8 addr.addr 13);
-  Alcotest.(check int) "byte 14 = 0" 0
-    (Cstruct.get_uint8 addr.addr 14);
-  Alcotest.(check int) "byte 15 = 1" 1
-    (Cstruct.get_uint8 addr.addr 15);
+  for i = 0 to 15 do
+    Alcotest.(check int) (Printf.sprintf "byte %d = 0" i) 0
+      (Cstruct.get_uint8 addr.addr i)
+  done;
+  Alcotest.(check int) "port = 0" 0 addr.port;
   (* Check services: with NODE_BLOOM off (Core default), bits are
      NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED = 1|8|1024 = 0x409.
      NODE_NETWORK_LIMITED is advertised unconditionally (Core init.cpp:863). *)

@@ -175,6 +175,13 @@ type config = {
        When unset, the REST listener serves plain HTTP. *)
   rest_tls_key : string option;
     (* --rest-tls-key=<PATH>.  PEM private key paired with --rest-tls-cert. *)
+  externalip : string list;
+    (* --externalip=<ip>[:port] (repeatable / comma-separated; Core
+       -externalip).  Our own public address(es), advertised to peers at
+       score LOCAL_MANUAL.  A bare IP uses the P2P listen port. *)
+  discover : bool option;
+    (* --discover / --discover=0 (Core -discover).  None = default: on,
+       unless --externalip is given (Core init.cpp soft-sets -discover=0). *)
 }
 
 (* ============================================================================
@@ -219,6 +226,8 @@ let default_config : config = {
   rpc_tls_key = None;
   rest_tls_cert = None;
   rest_tls_key = None;
+  externalip = [];
+  discover = None;
 }
 
 (* Network-specific configuration *)
@@ -325,6 +334,31 @@ let atmp_relay_max_inflight =
 
 let atmp_relay_gate : unit Lwt_pool.t =
   Lwt_pool.create atmp_relay_max_inflight (fun () -> Lwt.return_unit)
+
+(* Parse one --externalip value: "<ip>", "<ipv4>:<port>", "[<ipv6>]:<port>"
+   or a bare IPv6.  Returns (16-byte ip, port) with port 0 meaning "use the
+   listen port". *)
+let parse_externalip (v : string) : (string * int, string) result =
+  let v = String.trim v in
+  match Peer_manager.ip16_of_string v with
+  | Some ip -> Ok (ip, 0)
+  | None ->
+    let host, port_s =
+      match String.rindex_opt v ':' with
+      | Some i -> (String.sub v 0 i, String.sub v (i + 1) (String.length v - i - 1))
+      | None -> (v, "")
+    in
+    (match Peer_manager.ip16_of_string host, int_of_string_opt port_s with
+     | Some ip, Some p when p > 0 && p <= 65535 -> Ok (ip, p)
+     | None, _ -> Error (Printf.sprintf "invalid address %S" v)
+     | _ -> Error (Printf.sprintf "invalid port in %S" v))
+
+(* Core -discover resolution: explicit value wins; otherwise on, except
+   when -externalip is set (init.cpp: SoftSetBoolArg("-discover", false)). *)
+let effective_discover (config : config) : bool =
+  match config.discover with
+  | Some b -> b
+  | None -> config.externalip = []
 
 let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   let open Lwt.Syntax in
@@ -1112,6 +1146,53 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
               dns_seed = config.dns_seed }
     ~asmap:asmap_data
     network in
+
+  (* Self-address advertisement (Core -externalip / -discover /
+     MaybeSendAddr).  camlcoin always listens on [config.p2p_port]; set it
+     here, before any outbound dial, so the first handshakes can already
+     discover and advertise with the real listen port. *)
+  peer_manager.Peer_manager.listen_port <- config.p2p_port;
+  peer_manager.Peer_manager.discover <- effective_discover config;
+  List.iter (fun v ->
+    List.iter (fun v ->
+      if String.trim v <> "" then
+        match parse_externalip v with
+        | Error e ->
+          Logs.err (fun m -> m "--externalip: %s" e);
+          exit 1
+        | Ok (ip, port) ->
+          if Peer_manager.add_external_ip peer_manager ip port then
+            Logs.info (fun m -> m "externalip: advertising %s:%d"
+              (Peer_manager.ip16_to_string ip)
+              (if port = 0 then config.p2p_port else port))
+          else
+            Logs.warn (fun m -> m
+              "--externalip=%s is not publicly routable; ignored" v))
+      (String.split_on_char ',' v))
+    config.externalip;
+  (* IBD predicate for the self-announcement gate (Core
+     IsInitialBlockDownload, validation.cpp): latched false once cleared;
+     true while the validated tip is older than DEFAULT_MAX_TIP_AGE (24h),
+     and — outside regtest, whose minimum chain work is zero — while the
+     sync state machine has not reached FullySynced. *)
+  let ibd_latched_off = ref false in
+  peer_manager.Peer_manager.is_ibd <- (fun () ->
+    if !ibd_latched_off then false
+    else begin
+      let tip_recent = match Sync.block_tip chain with
+        | Some t ->
+          Int32.to_float t.Sync.header.Types.timestamp
+          >= Unix.gettimeofday () -. 86400.0
+        | None -> false
+      in
+      let synced = network.Consensus.name = "regtest"
+                   || chain.Sync.sync_state = Sync.FullySynced in
+      if tip_recent && synced then begin
+        ibd_latched_off := true;
+        Logs.info (fun m -> m "Leaving IBD: self-address advertisement enabled");
+        false
+      end else true
+    end);
 
   (* --connect peer pinning (Bitcoin Core -connect): when manual peers are
      given, pin the node to ONLY those peers. [set_connect_peers] makes

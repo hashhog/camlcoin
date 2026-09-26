@@ -196,6 +196,20 @@ type anchor_info = {
   anchor_services : int64;
 }
 
+(* One row of our own address table (Core net.cpp mapLocalHost /
+   LocalServiceInfo).  [la_ip] is the 16-byte wire form (IPv4-mapped for
+   IPv4) and is also the table key: like Core, keyed by IP only.  A manual
+   (--externalip) entry scores LOCAL_MANUAL; a discovered entry scores the
+   number of DISTINCT peer netgroups that reported it ([la_confirmers]), so
+   one peer — or one /16 — cannot talk us into advertising an address. *)
+type local_addr_entry = {
+  la_ip : string;
+  mutable la_port : int;
+  mutable la_manual : bool;
+  la_confirmers : (string, unit) Hashtbl.t;
+  mutable la_last_seen : float;
+}
+
 (* Peer manager state *)
 type t = {
   network : Consensus.network_config;
@@ -301,6 +315,23 @@ type t = {
      totals are also process-lifetime, not persisted). *)
   mutable disconnected_bytes_recv : int;
   mutable disconnected_bytes_sent : int;
+  (* ---- Self-address advertisement (Core mapLocalHost / MaybeSendAddr) ----
+     [local_addrs]: our own addresses, from --externalip and discovery.
+     [listen_port]: the port we accept P2P connections on (Core
+     GetListenPort); 0 = not listening, which disables advertisement exactly
+     like Core's fListen=false.  Set by [start_listener].
+     [discover]: Core -discover — learn our address from what outbound peers
+     report in VERSION addr_recv.  Default on; cli turns it off when
+     --externalip is given unless --discover was passed explicitly.
+     [is_ibd]: our address is not advertised during initial block download
+     (Core MaybeSendAddr); wired from cli to the node's IBD predicate.
+     [next_local_addr_send]: per-peer next self-announcement time (Core
+     Peer::m_next_local_addr_send); absent = not yet sent on this link. *)
+  local_addrs : (string, local_addr_entry) Hashtbl.t;
+  mutable listen_port : int;
+  mutable discover : bool;
+  mutable is_ibd : unit -> bool;
+  next_local_addr_send : (int, float) Hashtbl.t;
 }
 
 (* Generate a 256-bit eclipse-protection bucket key from /dev/urandom.
@@ -360,6 +391,11 @@ let create ?(config = default_config) ?(asmap : bytes option = None) (network : 
     network_active = true;
     disconnected_bytes_recv = 0;
     disconnected_bytes_sent = 0;
+    local_addrs = Hashtbl.create 8;
+    listen_port = 0;
+    discover = true;
+    is_ibd = (fun () -> false);
+    next_local_addr_send = Hashtbl.create 64;
   }
 
 (* Pin the node to a fixed set of --connect peers (Bitcoin Core -connect).
@@ -1065,6 +1101,479 @@ let maybe_add_fixed_seeds (pm : t) : bool =
       false
   end
 
+(* ========== Self-address advertisement (Bitcoin Core parity) ==========
+
+   A listening node must tell the network where it can be reached, or nobody
+   ever dials it: peers learn addresses only from addr/addrv2 gossip, and the
+   only gossip source for OUR address is us.  Core does it in three parts,
+   mirrored here (design follows blockbrew a255986, internal/p2p/localaddr.go):
+
+   1. A table of local addresses (Core net.cpp mapLocalHost / AddLocal /
+      SeenLocal).  Entries come from --externalip (score LOCAL_MANUAL = 4)
+      and from discovery: an OUTBOUND peer's VERSION carries addr_recv, the
+      address it sees us at.  A discovered entry's score is the number of
+      distinct peer netgroups that confirmed it; it must reach
+      [min_discovered_local_score] before it is advertised to OTHER peers,
+      and it ages out after [discovered_local_addr_ttl] without a fresh
+      confirmation, so a changed public IP replaces the old one.  Inbound
+      peers only score an entry we already have (Core SeenLocal).
+   2. The per-peer choice of what to advertise (Core GetLocalAddrForPeer,
+      net.cpp:240-268).
+   3. The send (Core net_processing.cpp MaybeSendAddr, ~5445-5479): only when
+      listening and out of IBD, one addr/addrv2 carrying just our address
+      right after the handshake, then again on a Poisson timer averaging 24h
+      (AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL).  Never to block-relay-only or
+      feeler connections (Core: m_addr_relay_enabled is false for them). *)
+
+(* Core net.h LOCAL_MANUAL: address explicitly specified (-externalip). *)
+let local_manual_score = 4
+
+(* Core net_processing.cpp AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL = 24h. *)
+let avg_local_address_broadcast_interval = 86400.0
+
+(* How often the timer looks for peers whose next announcement is due; coarse
+   is fine against a 24h mean.  Also bounds how long after leaving IBD the
+   first (IBD-suppressed) announcement goes out. *)
+let local_addr_check_interval = 60.0
+
+(* A discovered entry not re-confirmed for this long is dropped. *)
+let discovered_local_addr_ttl = 3.0 *. 3600.0
+
+(* Distinct peer netgroups that must confirm a discovered address before it
+   is advertised to other peers. *)
+let min_discovered_local_score = 2
+
+(* Cap on discovered entries (the weakest is evicted); peers cannot grow the
+   table without bound. *)
+let max_discovered_local_addrs = 8
+
+(* Cap on the per-entry confirmer set (score ceiling). *)
+let max_local_addr_confirmers = 64
+
+(* ---- 16-byte address helpers (wire form, IPv4-mapped for IPv4) ---- *)
+
+let ip16_is_v4 (b : string) : bool =
+  String.length b = 16
+  && String.sub b 0 10 = String.make 10 '\000'
+  && b.[10] = '\xff' && b.[11] = '\xff'
+
+let ip16_of_v4 (a : int) (b : int) (c : int) (d : int) : string =
+  let s = Bytes.make 16 '\000' in
+  Bytes.set s 10 '\xff'; Bytes.set s 11 '\xff';
+  Bytes.set s 12 (Char.chr a); Bytes.set s 13 (Char.chr b);
+  Bytes.set s 14 (Char.chr c); Bytes.set s 15 (Char.chr d);
+  Bytes.to_string s
+
+let parse_ipv4_octets (s : string) : (int * int * int * int) option =
+  match String.split_on_char '.' s with
+  | [a; b; c; d] ->
+    let oct x =
+      if x = "" || String.length x > 3
+         || not (String.for_all (fun ch -> ch >= '0' && ch <= '9') x)
+      then None
+      else (match int_of_string_opt x with
+          | Some v when v >= 0 && v <= 255 -> Some v
+          | _ -> None)
+    in
+    (match oct a, oct b, oct c, oct d with
+     | Some a, Some b, Some c, Some d -> Some (a, b, c, d)
+     | _ -> None)
+  | _ -> None
+
+(* Parse a textual IPv6 address ("2001:db8::1", "::ffff:1.2.3.4") to its 16
+   bytes.  No zone ids. *)
+let parse_ipv6 (s : string) : string option =
+  let hex_group g =
+    if g = "" || String.length g > 4 then None
+    else if not (String.for_all (fun c ->
+        (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+        || (c >= 'A' && c <= 'F')) g) then None
+    else Some (int_of_string ("0x" ^ g))
+  in
+  (* Groups of one side of "::"; a trailing dotted quad counts as 2 groups. *)
+  let side (part : string) : int list option =
+    if part = "" then Some []
+    else begin
+      let gs = String.split_on_char ':' part in
+      let n = List.length gs in
+      let rec go i acc = function
+        | [] -> Some (List.rev acc)
+        | [last] when i = n - 1 && String.contains last '.' ->
+          (match parse_ipv4_octets last with
+           | Some (a, b, c, d) ->
+             Some (List.rev_append acc [ (a lsl 8) lor b; (c lsl 8) lor d ])
+           | None -> None)
+        | g :: rest ->
+          (match hex_group g with
+           | Some v -> go (i + 1) (v :: acc) rest
+           | None -> None)
+      in
+      go 0 [] gs
+    end
+  in
+  let rec find_dc i =
+    if i + 1 >= String.length s then None
+    else if s.[i] = ':' && s.[i + 1] = ':' then Some i
+    else find_dc (i + 1)
+  in
+  let zeros k = List.init k (fun _ -> 0) in
+  let groups =
+    if not (String.contains s ':') then None
+    else match find_dc 0 with
+      | None ->
+        (match side s with
+         | Some l when List.length l = 8 -> Some l
+         | _ -> None)
+      | Some i ->
+        let a = String.sub s 0 i in
+        let b = String.sub s (i + 2) (String.length s - i - 2) in
+        (* A second "::" is invalid. *)
+        if (let rec has j = j + 1 < String.length b
+                            && ((b.[j] = ':' && b.[j + 1] = ':') || has (j + 1))
+            in has 0) then None
+        else (match side a, side b with
+            | Some l, Some r when List.length l + List.length r <= 7 ->
+              Some (l @ zeros (8 - List.length l - List.length r) @ r)
+            | _ -> None)
+  in
+  match groups with
+  | Some gs when List.length gs = 8 ->
+    let b = Bytes.create 16 in
+    List.iteri (fun i g ->
+      Bytes.set b (2 * i) (Char.chr ((g lsr 8) land 0xff));
+      Bytes.set b (2 * i + 1) (Char.chr (g land 0xff))) gs;
+    Some (Bytes.to_string b)
+  | _ -> None
+
+(* Parse an IP literal (dotted IPv4 or IPv6, optionally in brackets) to its
+   16-byte wire form.  Hostnames -> None. *)
+let ip16_of_string (s : string) : string option =
+  let n = String.length s in
+  let s = if n >= 2 && s.[0] = '[' && s.[n - 1] = ']'
+    then String.sub s 1 (n - 2) else s in
+  match parse_ipv4_octets s with
+  | Some (a, b, c, d) -> Some (ip16_of_v4 a b c d)
+  | None -> parse_ipv6 s
+
+(* Human form: dotted quad for IPv4(-mapped), compressed-less hex groups
+   (RFC 5952 zero compression) for IPv6. *)
+let ip16_to_string (b : string) : string =
+  if ip16_is_v4 b then
+    Printf.sprintf "%d.%d.%d.%d"
+      (Char.code b.[12]) (Char.code b.[13]) (Char.code b.[14]) (Char.code b.[15])
+  else begin
+    let g i = (Char.code b.[2 * i] lsl 8) lor Char.code b.[2 * i + 1] in
+    let groups = Array.init 8 g in
+    (* Longest run (>= 2) of zero groups gets "::". *)
+    let best_start = ref (-1) and best_len = ref 0 in
+    let i = ref 0 in
+    while !i < 8 do
+      if groups.(!i) = 0 then begin
+        let j = ref !i in
+        while !j < 8 && groups.(!j) = 0 do incr j done;
+        if !j - !i > !best_len then begin best_start := !i; best_len := !j - !i end;
+        i := !j
+      end else incr i
+    done;
+    let hex k = Printf.sprintf "%x" groups.(k) in
+    if !best_len < 2 then String.concat ":" (List.init 8 hex)
+    else begin
+      let left = List.init !best_start hex in
+      let right = List.init (8 - !best_start - !best_len)
+          (fun k -> hex (!best_start + !best_len + k)) in
+      String.concat ":" left ^ "::" ^ String.concat ":" right
+    end
+  end
+
+(* Core CNetAddr::IsRoutable for a 16-byte address.  IPv4(-mapped) reuses the
+   node's existing [is_routable] (RFC1918 / loopback / link-local / RFC2544 /
+   RFC6598 / RFC5737 ...).  IPv6 rejects: unspecified, loopback ::1,
+   IPv4-compatible ::/96, link-local fe80::/10 (RFC4862), unique-local
+   fc00::/7 (RFC4193), documentation 2001:db8::/32 (RFC3849), ORCHID
+   2001:10::/28 (RFC4843) and ORCHIDv2 2001:20::/28 (RFC7343), and
+   multicast ff00::/8. *)
+let is_routable_ip16 (b : string) : bool =
+  if String.length b <> 16 then false
+  else if ip16_is_v4 b then is_routable (ip16_to_string b)
+  else begin
+    let u i = Char.code b.[i] in
+    let prefix_zero n =
+      let ok = ref true in
+      for i = 0 to n - 1 do if u i <> 0 then ok := false done; !ok in
+    if prefix_zero 12 then false  (* ::, ::1, IPv4-compatible *)
+    else if u 0 = 0xfe && (u 1 land 0xc0) = 0x80 then false
+    else if (u 0 land 0xfe) = 0xfc then false
+    else if u 0 = 0x20 && u 1 = 0x01 && u 2 = 0x0d && u 3 = 0xb8 then false
+    else if u 0 = 0x20 && u 1 = 0x01 && u 2 = 0x00
+            && ((u 3 land 0xf0) = 0x10 || (u 3 land 0xf0) = 0x20) then false
+    else if u 0 = 0xff then false
+    else true
+  end
+
+(* A peer's address string (as stored on Peer.peer) is routable iff it is an
+   IP literal and routable.  Hostnames are not. *)
+let is_routable_ip_string (s : string) : bool =
+  match ip16_of_string s with
+  | Some b -> is_routable_ip16 b
+  | None -> false
+
+(* ---- The table ---- *)
+
+let local_entry_score (e : local_addr_entry) : int =
+  (if e.la_manual then local_manual_score else 0) + Hashtbl.length e.la_confirmers
+
+(* May this entry be advertised to arbitrary peers? *)
+let local_entry_usable (e : local_addr_entry) : bool =
+  e.la_manual || Hashtbl.length e.la_confirmers >= min_discovered_local_score
+
+let local_addrs_expire (pm : t) (now : float) : unit =
+  let dead = Hashtbl.fold (fun k e acc ->
+    if (not e.la_manual) && now -. e.la_last_seen > discovered_local_addr_ttl
+    then k :: acc else acc) pm.local_addrs [] in
+  List.iter (Hashtbl.remove pm.local_addrs) dead
+
+(* Evict the weakest (lowest score, then oldest) discovered entry when the
+   discovered set is full. *)
+let local_addrs_make_room (pm : t) : unit =
+  let n, worst = Hashtbl.fold (fun k e (n, worst) ->
+    if e.la_manual then (n, worst)
+    else begin
+      let worse = match worst with
+        | None -> true
+        | Some (_, w) ->
+          local_entry_score e < local_entry_score w
+          || (local_entry_score e = local_entry_score w
+              && e.la_last_seen < w.la_last_seen)
+      in
+      (n + 1, if worse then Some (k, e) else worst)
+    end) pm.local_addrs (0, None) in
+  match worst with
+  | Some (k, _) when n >= max_discovered_local_addrs ->
+    Hashtbl.remove pm.local_addrs k
+  | _ -> ()
+
+(* Record an operator-specified address (--externalip).  [port] 0 means the
+   listen port.  Returns false for a non-routable address (Core AddLocal
+   refuses those too). *)
+let add_external_ip (pm : t) (ip16 : string) (port : int) : bool =
+  if not (is_routable_ip16 ip16) then false
+  else begin
+    let port = if port = 0 then pm.listen_port else port in
+    (match Hashtbl.find_opt pm.local_addrs ip16 with
+     | Some e -> e.la_manual <- true; e.la_port <- port
+     | None ->
+       Hashtbl.replace pm.local_addrs ip16
+         { la_ip = ip16; la_port = port; la_manual = true;
+           la_confirmers = Hashtbl.create 4; la_last_seen = 0.0 });
+    true
+  end
+
+(* Record that a peer in netgroup [group] sees us at [ip16].  [create]=false
+   (inbound peers, Core SeenLocal) only scores an existing entry; true
+   (outbound addr_recv discovery) creates one with [port]. *)
+let local_addr_confirm (pm : t) ~(ip16 : string) ~(port : int)
+    ~(group : string) ~(create : bool) (now : float) : bool =
+  if not (is_routable_ip16 ip16) then false
+  else begin
+    local_addrs_expire pm now;
+    let entry = match Hashtbl.find_opt pm.local_addrs ip16 with
+      | Some e -> Some e
+      | None when create ->
+        local_addrs_make_room pm;
+        let e = { la_ip = ip16; la_port = port; la_manual = false;
+                  la_confirmers = Hashtbl.create 4; la_last_seen = now } in
+        Hashtbl.replace pm.local_addrs ip16 e;
+        Some e
+      | None -> None
+    in
+    match entry with
+    | None -> false
+    | Some e ->
+      if Hashtbl.length e.la_confirmers < max_local_addr_confirmers then
+        Hashtbl.replace e.la_confirmers group ();
+      e.la_last_seen <- now;
+      true
+  end
+
+(* Best usable local address for a peer (Core GetLocal): same address family
+   as the peer first, then highest score, then most recently confirmed.
+   Returns (ip16, port, score). *)
+let local_addr_best (pm : t) ?(peer_ip16 : string option) (now : float)
+    : (string * int * int) option =
+  local_addrs_expire pm now;
+  let reach e = match peer_ip16 with
+    | None -> 0
+    | Some p -> if ip16_is_v4 e.la_ip = ip16_is_v4 p then 1 else 0 in
+  let better e b =
+    reach e > reach b
+    || (reach e = reach b
+        && (local_entry_score e > local_entry_score b
+            || (local_entry_score e = local_entry_score b
+                && e.la_last_seen > b.la_last_seen)))
+  in
+  let best = Hashtbl.fold (fun _ e acc ->
+    if not (local_entry_usable e) then acc
+    else match acc with
+      | Some b when not (better e b) -> acc
+      | _ -> Some e) pm.local_addrs None in
+  Option.map (fun e -> (e.la_ip, e.la_port, local_entry_score e)) best
+
+(* getnetworkinfo.localaddresses: (address, port, score), highest score
+   first. *)
+let local_addresses (pm : t) : (string * int * int) list =
+  local_addrs_expire pm (Unix.gettimeofday ());
+  Hashtbl.fold (fun _ e acc ->
+    (ip16_to_string e.la_ip, e.la_port, local_entry_score e) :: acc)
+    pm.local_addrs []
+  |> List.sort (fun (a1, _, s1) (a2, _, s2) ->
+    if s1 <> s2 then compare s2 s1 else compare a1 a2)
+
+(* Is [s] (an IP string, e.g. from an incoming addr) one of our own
+   addresses?  Used to keep our own address out of addrman. *)
+let is_local_ip_string (pm : t) (s : string) : bool =
+  match ip16_of_string s with
+  | Some b -> Hashtbl.mem pm.local_addrs b
+  | None -> false
+
+let peer_ip16 (peer : Peer.peer) : string option = ip16_of_string peer.Peer.addr
+
+(* The peer's own view of us (VERSION addr_recv) as (ip16, port). *)
+let peer_addr_local (peer : Peer.peer) : (string * int) option =
+  match Peer.addr_local peer with
+  | Some na when Cstruct.length na.Types.addr = 16 ->
+    Some (Cstruct.to_string na.Types.addr, na.Types.port)
+  | _ -> None
+
+(* Handle a peer's VERSION addr_recv (Core ProcessMessage VERSION ->
+   SetAddrLocal / SeenLocal).  An OUTBOUND peer's view of us is a discovery
+   (only with --discover, only when both it and the peer are routable, Core
+   IsPeerAddrLocalGood), stored with OUR LISTEN PORT (the peer saw our
+   ephemeral source port, which is useless to anyone).  An inbound peer's
+   view only scores an address we already know. *)
+let note_version_addr_recv (pm : t) (peer : Peer.peer) (now : float) : unit =
+  if pm.discover && pm.listen_port <> 0 && is_routable_ip_string peer.Peer.addr then
+    match peer_addr_local peer with
+    | Some (ip16, _) when is_routable_ip16 ip16 ->
+      let group = netgroup_of_with_pm pm peer.Peer.addr in
+      let create = peer.Peer.direction = Peer.Outbound in
+      if local_addr_confirm pm ~ip16 ~port:pm.listen_port ~group ~create now
+      then Log.debug (fun m -> m "Peer %d (%s) sees us at %s"
+          peer.Peer.id peer.Peer.addr (ip16_to_string ip16))
+    | _ -> ()
+
+(* Pick the address to advertise to [peer] (Core GetLocalAddrForPeer,
+   net.cpp:240-268): the best table entry (or no IP + our listen port); if
+   the peer's own view of us is good (Core IsPeerAddrLocalGood), use it when
+   the table has nothing routable, else at 1/2 odds (1/8 when the best entry
+   scores above LOCAL_MANUAL).  For an inbound peer its view carries the
+   port it dialed — our listen port — so take IP+port; an outbound peer saw
+   our ephemeral port, so take only the IP. *)
+let local_addr_for_peer (pm : t) (peer : Peer.peer) (now : float)
+    : (string * int) option =
+  let best = local_addr_best pm ?peer_ip16:(peer_ip16 peer) now in
+  let ip, port, score = match best with
+    | Some (ip, port, score) -> (Some ip, port, score)
+    | None -> (None, pm.listen_port, 0)
+  in
+  let seen = peer_addr_local peer in
+  let peer_good = match seen with
+    | Some (sip, _) ->
+      pm.discover && is_routable_ip_string peer.Peer.addr && is_routable_ip16 sip
+    | None -> false
+  in
+  let ip, port =
+    match seen with
+    | Some (sip, sport) when peer_good
+                          && (ip = None
+                              || Random.int (if score > local_manual_score then 8 else 2) = 0) ->
+      if peer.Peer.direction = Peer.Inbound then (Some sip, sport) else (Some sip, port)
+    | _ -> (ip, port)
+  in
+  match ip with
+  | Some ip when is_routable_ip16 ip && port <> 0 -> Some (ip, port)
+  | _ -> None
+
+(* Build the one-entry self-announcement: addrv2 when the peer sent
+   sendaddrv2 (BIP-155), else legacy addr.  Services = what we sent in
+   VERSION, time = now, port = the advertised (listen) port. *)
+let build_local_addr_msg ~(sendaddrv2 : bool) ~(ip16 : string) ~(port : int)
+    ~(services : int64) ~(now : float) : P2p.message_payload =
+  let ts = Int32.of_float now in
+  if sendaddrv2 then begin
+    let v4 = ip16_is_v4 ip16 in
+    P2p.Addrv2Msg [ {
+      P2p.v2_time = ts;
+      v2_services = services;
+      v2_network_id = (if v4 then P2p.Addrv2_IPv4 else P2p.Addrv2_IPv6);
+      v2_addr = Cstruct.of_string (if v4 then String.sub ip16 12 4 else ip16);
+      v2_port = port } ]
+  end else
+    P2p.AddrMsg [ (ts, { Types.services; addr = Cstruct.of_string ip16; port }) ]
+
+(* Core MaybeSendAddr's self-announcement block, minus the send: decide
+   whether [peer] is due, advance its Poisson timer, and return the message
+   to send.  Gates: listening, handshake complete, not a block-relay-only
+   link (feelers never enter [pm.peers]), not in IBD.  The IBD gate leaves
+   the timer untouched, so the first announcement goes out on the first
+   timer tick after IBD ends. *)
+let local_addr_msg_for_peer (pm : t) (peer : Peer.peer) (now : float)
+    : P2p.message_payload option =
+  if pm.listen_port = 0 then None
+  else if not peer.Peer.handshake_complete then None
+  else if peer.Peer.block_relay_only then None
+  else if pm.is_ibd () then None
+  else begin
+    let due = match Hashtbl.find_opt pm.next_local_addr_send peer.Peer.id with
+      | None -> true
+      | Some t -> now >= t
+    in
+    if not due then None
+    else begin
+      Hashtbl.replace pm.next_local_addr_send peer.Peer.id
+        (now +. Peer.poisson_delay avg_local_address_broadcast_interval);
+      match local_addr_for_peer pm peer now with
+      | None -> None
+      | Some (ip16, port) ->
+        Some (build_local_addr_msg ~sendaddrv2:peer.Peer.sendaddrv2 ~ip16 ~port
+                ~services:(Peer.services_to_int64 (Peer.our_services ())) ~now)
+    end
+  end
+
+(* Send our address to [peer] if it is due.  Returns true when sent. *)
+let maybe_send_local_addr (pm : t) (peer : Peer.peer) (now : float) : bool Lwt.t =
+  match local_addr_msg_for_peer pm peer now with
+  | None -> Lwt.return_false
+  | Some msg ->
+    Log.debug (fun m -> m "Advertising our address to peer %d (%s)"
+      peer.Peer.id peer.Peer.addr);
+    Lwt.catch
+      (fun () -> Lwt.map (fun () -> true) (Peer.send_message peer msg))
+      (fun _ -> Lwt.return_false)
+
+(* Called once a peer's handshake has completed and it is in [pm.peers]:
+   learn from its addr_recv, then make the initial self-announcement. *)
+let on_peer_handshake (pm : t) (peer : Peer.peer) : unit =
+  let now = Unix.gettimeofday () in
+  note_version_addr_recv pm peer now;
+  Lwt.async (fun () ->
+    Lwt.map ignore (maybe_send_local_addr pm peer now))
+
+(* Re-announce our address to each peer on its Poisson timer (and deliver
+   the first announcement that IBD held back). *)
+let start_local_addr_timer (pm : t) : unit =
+  let rec loop () =
+    let open Lwt.Syntax in
+    let* () = Lwt_unix.sleep local_addr_check_interval in
+    if not pm.running then Lwt.return_unit
+    else begin
+      let now = Unix.gettimeofday () in
+      let* () = Lwt_list.iter_p (fun p ->
+        Lwt.map ignore (maybe_send_local_addr pm p now)) pm.peers in
+      loop ()
+    end
+  in
+  Lwt.async loop
+
 (* Check if connecting to this address would violate outbound netgroup diversity *)
 let would_violate_netgroup_diversity (pm : t) (addr : string) : bool =
   let netgroup = netgroup_of_with_pm pm addr in
@@ -1128,6 +1637,8 @@ let add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
       Lwt.async (fun () -> Peer.start_trickling peer);
       (* Start message loop if enabled (no-op before enable_message_loops) *)
       pm.start_msg_loop peer;
+      (* Self-address discovery + initial announcement (Core MaybeSendAddr). *)
+      on_peer_handshake pm peer;
       (* Move address to tried table (successful connection) *)
       let tried_bucket = move_to_tried_table pm addr in
       (* Update known_addrs with successful connection *)
@@ -1209,6 +1720,8 @@ let force_add_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
       Hashtbl.replace pm.outbound_netgroups (netgroup_of_with_pm pm addr) true;
       Lwt.async (fun () -> Peer.start_trickling peer);
       pm.start_msg_loop peer;
+      (* Self-address discovery + initial announcement (Core MaybeSendAddr). *)
+      on_peer_handshake pm peer;
       let tried_bucket = move_to_tried_table pm addr in
       (match Hashtbl.find_opt pm.known_addrs addr with
        | Some info ->
@@ -1290,6 +1803,8 @@ let add_block_relay_peer (pm : t) (addr : string) (port : int) : unit Lwt.t =
       Lwt.async (fun () -> Peer.start_trickling peer);
       (* Start message loop if enabled (no-op before enable_message_loops) *)
       pm.start_msg_loop peer;
+      (* Self-address discovery + initial announcement (Core MaybeSendAddr). *)
+      on_peer_handshake pm peer;
       let tried_bucket = move_to_tried_table pm addr in
       (match Hashtbl.find_opt pm.known_addrs addr with
        | Some info ->
@@ -1347,6 +1862,7 @@ let remove_peer (pm : t) (peer_id : int) : unit Lwt.t =
     (* Clean up getaddr one-shot guard + inbound-addr token bucket (anti-DoS). *)
     Hashtbl.remove pm.getaddr_recvd peer_id;
     Hashtbl.remove pm.addr_token peer_id;
+    Hashtbl.remove pm.next_local_addr_send peer_id;
     (* Clean up stale peer tracking *)
     Hashtbl.remove pm.stale_state peer_id;
     (* Remove from outbound netgroup tracking if outbound peer *)
@@ -2111,7 +2627,8 @@ let handle_addr (pm : t) (peer : Peer.peer) (addrs : (int32 * Types.net_addr) li
       (* Self-address filtering: don't store our own listening address *)
       if (match pm.listen_addr with
                | Some our_addr -> ip_str = our_addr
-               | None -> false) then
+               | None -> false)
+         || is_local_ip_string pm ip_str then
         ()  (* Skip our own address *)
       (* Routability filter (W104 G18): reject private/loopback/non-routable addrs *)
       else if not (is_routable ip_str) then
@@ -2171,8 +2688,8 @@ let handle_addrv2 (pm : t) (peer : Peer.peer) (entries : P2p.addrv2_addr list) :
         (Cstruct.get_uint8 entry.v2_addr 1)
         (Cstruct.get_uint8 entry.v2_addr 2)
         (Cstruct.get_uint8 entry.v2_addr 3) in
-      (* Routability filter (W104 G18) *)
-      if not (is_routable ip_str) then ()
+      (* Routability filter (W104 G18); never store our own address. *)
+      if not (is_routable ip_str) || is_local_ip_string pm ip_str then ()
       else if not (Hashtbl.mem pm.known_addrs ip_str) then begin
         let bucket = add_to_new_table pm ip_str in
         if bucket >= 0 then
@@ -3053,6 +3570,8 @@ let accept_inbound (pm : t) (client_fd : Lwt_unix.file_descr)
          looped peers ([Peer.msg_loop_started]) so [sync_headers] never
          double-reads the socket this loop now drains. *)
       ensure_msg_loop pm peer;
+      (* Self-address discovery + initial announcement (Core MaybeSendAddr). *)
+      on_peer_handshake pm peer;
       Lwt.return_unit
     ) (fun exn ->
       (* Handshake failed — log the reason and clean up *)
@@ -3078,6 +3597,9 @@ let start_listener (pm : t) (port : int) : unit Lwt.t =
   let* () = Lwt_unix.bind fd (Unix.ADDR_INET (Unix.inet_addr_any, port)) in
   Lwt_unix.listen fd 128;
   pm.listener_fd <- Some fd;
+  (* We accept connections on [port]: this is the port we advertise (Core
+     GetListenPort), never the ephemeral source port a peer saw. *)
+  pm.listen_port <- port;
   let rec accept_loop () =
     if not pm.running then Lwt.return_unit
     else begin
@@ -3162,6 +3684,8 @@ let start (pm : t) : unit Lwt.t =
   start_stale_check_timer pm;
   (* Start the ASMap health-check timer (every 3600 s; no-op if no asmap). *)
   start_asmap_health_check_timer pm;
+  (* Self-address re-announcement timer (Core MaybeSendAddr, 24h Poisson). *)
+  start_local_addr_timer pm;
   (* Return immediately, maintenance runs in background *)
   Lwt.async (fun () -> maintenance);
   Lwt.return_unit

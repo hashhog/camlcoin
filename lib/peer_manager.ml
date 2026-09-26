@@ -3387,7 +3387,10 @@ let maintain_connections (pm : t) : unit Lwt.t =
               if List.exists (fun p ->
                    p.Peer.addr = addr && p.Peer.port = port) pm.peers
               then Lwt.return_unit
-              else add_peer pm addr port
+              (* MANUAL connection (Core -connect): no netgroup-diversity or
+                 outbound-slot gate, or a second pinned peer in the same /16
+                 is never re-dialed either. *)
+              else force_add_peer pm addr port
             ) pm.connect_peers
           end else begin
             (* Last-resort fixed-seed fallback (Core net.cpp add_fixed_seeds):

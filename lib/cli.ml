@@ -1591,14 +1591,20 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         | [addr; port_str] ->
           (try
             let port = int_of_string port_str in
-            Peer_manager.add_peer peer_manager addr port
+            (* Core: -connect peers are ConnectionType::MANUAL, exempt from
+               the outbound-slot limit and the netgroup-diversity rule (net.cpp
+               ThreadOpenConnections connect path).  add_peer applied the
+               netgroup rule, so a second --connect peer in the same /16 (two
+               peers on 127.0.0.1, or two nodes on one LAN) was silently never
+               dialed (regtest relay test 2026-09-26). *)
+            Peer_manager.force_add_peer peer_manager addr port
           with _ ->
             Logs.warn (fun m ->
               m "Invalid peer address format: %s" addr_port);
             Lwt.return_unit)
         | [addr] ->
           (* Use default port for network *)
-          Peer_manager.add_peer peer_manager addr network.default_port
+          Peer_manager.force_add_peer peer_manager addr network.default_port
         | _ ->
           Logs.warn (fun m ->
             m "Invalid peer address format: %s" addr_port);

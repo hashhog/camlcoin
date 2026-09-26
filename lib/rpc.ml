@@ -13761,14 +13761,35 @@ let seed_chain_tx_anchors (ctx : rpc_context) : unit =
    | None -> Storage.ChainDB.store_chain_tx_count db genesis_hash 1L
    | Some _ -> ());
   let corrected = ref [] in
+  let was_wrong = ref [] in
   List.iter
     (fun (p : Assume_utxo.assumeutxo_params) ->
       match Storage.ChainDB.get_chain_tx_count db p.blockhash with
       | Some n when Int64.equal n p.chain_tx_count -> ()
-      | _ ->
+      | stored ->
         Storage.ChainDB.store_chain_tx_count db p.blockhash p.chain_tx_count;
-        corrected := p :: !corrected)
+        corrected := p :: !corrected;
+        if stored <> None then was_wrong := p :: !was_wrong)
     (Assume_utxo.assumeutxo_params_list ctx.network);
+  (* Every stored descendant of a seed that was WRONG (not merely absent)
+     was derived from the wrong figure: drop them all, then let the rewalk
+     below recompute what nTx allows. A gap (unknown nTx) must leave the
+     heights above it UNKNOWN — keeping their stale values served the old
+     deficit as a count (live mainnet 2026-09-25: 1,914,531 low). Core
+     never persists m_chain_tx_count; it recomputes it at load
+     (node/blockstorage.cpp:440-487) and omits txcount when unknown
+     (rpc/blockchain.cpp:1878). *)
+  List.iter
+    (fun (p : Assume_utxo.assumeutxo_params) ->
+      match Storage.ChainDB.get_hash_at_height db p.height with
+      | Some h when Cstruct.equal h p.blockhash ->
+        for h = p.height + 1 to ctx.chain.blocks_synced do
+          match Storage.ChainDB.get_hash_at_height db h with
+          | Some hash -> Storage.ChainDB.delete_chain_tx_count db hash
+          | None -> ()
+        done
+      | _ -> ())
+    !was_wrong;
   (* A corrected seed (the 944183 placeholder → Core's 1_335_914_531)
      poisons every descendant that stored parent+nTx from the old
      figure. Rewalk from the highest corrected AU while nTx is known

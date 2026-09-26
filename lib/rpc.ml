@@ -12520,165 +12520,242 @@ let handle_uptime (_ctx : rpc_context) : Yojson.Safe.t =
   (* Return seconds since start - simplified *)
   `Int 0
 
+(* The `help` table: one (category, signature lines) entry per section, in
+   the order the bare `help` listing prints them. Each line is the method's
+   one-line signature -- Core's exact first line of `help <method>` for every
+   method Core also has (bitcoin-core `help`, v31.99). `help <method>` looks
+   the method up HERE, so the listing and the per-command answer cannot drift.
+
+   Every method dispatch_rpc / dispatch_wait_rpc answers MUST have a line here:
+   R5 grades an answered-but-unlisted method as help-rot, and
+   test/test_help_parity.ml scans the dispatcher's source arms to enforce it.
+   (2026-09-26: 29 dispatched methods were unlisted -- gettxoutproof,
+   verifytxoutproof, prioritisetransaction, scantxoutset, decodescript,
+   combinerawtransaction, createmultisig, gettransaction, importdescriptors,
+   sethdseed, and the 19 BIP-78 PayJoin methods.) *)
+let help_sections : (string * string list) list = [
+  ("Blockchain", [
+    "getbestblockhash";
+    "getblock \"blockhash\" ( verbosity )";
+    "getblockchaininfo";
+    "getblockcount";
+    "getsyncstate";
+    "getblockhash height";
+    "getblockheader \"blockhash\" ( verbose )";
+    "getblockstats hash_or_height";
+    "getblockfilter \"blockhash\" ( filtertype )";
+    "scanblocks \"action\" ( [scanobjects,...] start_height stop_height \"filtertype\" options )";
+    "scantxoutset \"action\" ( [scanobjects,...] )";
+    "getdeploymentinfo ( \"blockhash\" )";
+    "getdifficulty";
+    "getchaintips";
+    "getchainstates";
+    "getchaintxstats ( nblocks \"blockhash\" )";
+    "getindexinfo ( \"index_name\" )";
+    "verifychain ( checklevel nblocks )";
+    "verifytxoutproof \"proof\"";
+    "waitfornewblock ( timeout \"current_tip\" )";
+    "waitforblock \"blockhash\" ( timeout )";
+    "waitforblockheight height ( timeout )";
+    "pruneblockchain height";
+    "gettxout \"txid\" vout";
+    "gettxoutproof [\"txid\",...] ( \"blockhash\" )";
+    "gettxspendingprevout [{\"txid\":\"hex\",\"vout\":n},...] ( {\"mempool_only\":bool,\"return_spending_tx\":bool,...} )";
+    "invalidateblock \"blockhash\"";
+    "reconsiderblock \"blockhash\"";
+    "preciousblock \"blockhash\"";
+  ]);
+  ("Mining", [
+    "getblocktemplate";
+    "getmininginfo";
+    "getnetworkhashps ( nblocks height )";
+    "getprioritisedtransactions";
+    "prioritisetransaction \"txid\" ( dummy ) fee_delta";
+    "submitblock \"hexdata\"";
+    "submitheader \"hexdata\"";
+  ]);
+  ("Regtest Mining", [
+    "generate nblocks (regtest only)";
+    "generatetoaddress nblocks \"address\" (regtest only)";
+    "generateblock \"output\" [\"rawtx\",...] (regtest only)";
+  ]);
+  ("Mempool", [
+    "dumpmempool";
+    "getmempoolancestors \"txid\"";
+    "getmempooldescendants \"txid\"";
+    "getmempoolentry \"txid\"";
+    "getmempoolinfo";
+    "getorphantxs ( verbosity )";
+    "getrawmempool ( verbose )";
+    "importmempool \"filepath\" ( options )";
+    "loadmempool";
+    "savemempool";
+    "testmempoolaccept [\"rawtx\"]";
+  ]);
+  ("Network", [
+    "addnode \"node\" \"add\"|\"remove\"|\"onetry\"";
+    "addpeeraddress \"address\" port ( tried )";
+    "clearbanned";
+    "disconnectnode \"address\"";
+    "getaddednodeinfo ( \"node\" )";
+    "getaddrmaninfo";
+    "getblockfrompeer \"blockhash\" peer_id";
+    "getconnectioncount";
+    "getnetworkinfo";
+    "getnettotals";
+    "getnodeaddresses ( count \"network\" )";
+    "getpeerinfo";
+    "listbanned";
+    "ping";
+    "setban \"address\" \"add\"|\"remove\" ( bantime )";
+    "setnetworkactive state";
+  ]);
+  ("Rawtransactions", [
+    "createrawtransaction [{\"txid\":\"id\",\"vout\":n},...] [{\"address\":amount},...] ( locktime replaceable )";
+    "combinerawtransaction [\"hexstring\",...]";
+    "decoderawtransaction \"hexstring\"";
+    "decodescript \"hexstring\"";
+    "getrawtransaction \"txid\" ( verbose )";
+    "sendrawtransaction \"hexstring\"";
+    "signrawtransactionwithkey \"hexstring\" [\"privkey\",...]";
+    "submitpackage [\"rawtx\",...] ( maxfeerate maxburnamount )";
+  ]);
+  ("PSBT", [
+    "analyzepsbt \"psbt\"";
+    "combinepsbt [\"psbt\",...]";
+    "converttopsbt \"hexstring\" ( permitsigdata )";
+    "createpsbt [{\"txid\":\"...\", \"vout\":n},...] [{\"address\":amount},...] ( locktime )";
+    "decodepsbt \"psbt\"";
+    "descriptorprocesspsbt \"psbt\" [\"descriptor\",...] ( \"sighashtype\" bip32derivs finalize )";
+    "finalizepsbt \"psbt\" ( extract )";
+    "joinpsbts [\"psbt\",...]";
+    "utxoupdatepsbt \"psbt\"";
+    "walletcreatefundedpsbt [{\"txid\":\"...\", \"vout\":n},...] [{\"address\":amount},...] ( locktime options bip32derivs )";
+    "fundrawtransaction \"hexstring\" ( options iswitness )";
+    "walletprocesspsbt \"psbt\" ( sign \"sighashtype\" bip32derivs finalize )";
+  ]);
+  ("Descriptors", [
+    "deriveaddresses \"descriptor\" ( range )";
+    "getdescriptorinfo \"descriptor\"";
+    "listdescriptors ( private )";
+  ]);
+  ("Util", [
+    "getmemoryinfo ( \"mode\" )";
+    "createmultisig nrequired [\"key\",...] ( \"address_type\" )";
+    "estimatesmartfee conf_target";
+    "estimaterawfee conf_target ( threshold )";
+    "signmessage \"address\" \"message\"";
+    "signmessagewithprivkey \"privkey\" \"message\"";
+    "verifymessage \"address\" \"signature\" \"message\"";
+    "validateaddress \"address\"";
+  ]);
+  ("Wallet", [
+    "getbalance";
+    "getbalances";
+    "getnewaddress";
+    "getwalletinfo";
+    "gettransaction \"txid\" ( include_watchonly verbose )";
+    "getaddressinfo \"address\"";
+    "importdescriptors requests";
+    "listwallets";
+    "createwallet \"wallet_name\" ( disable_private_keys blank \"passphrase\" avoid_reuse descriptors load_on_startup external_signer )";
+    "loadwallet \"filename\" ( load_on_startup )";
+    "unloadwallet ( \"wallet_name\" load_on_startup )";
+    "listtransactions ( \"label\" count skip include_watchonly )";
+    "listunspent";
+    "lockunspent unlock ( [{\"txid\":\"...\", \"vout\":n},...] persistent )";
+    "listlockunspent";
+    "sendtoaddress \"address\" amount";
+    "send [{\"address\":amount},...] ( conf_target \"estimate_mode\" fee_rate options )";
+    "backupwallet \"destination\"";
+    "restorewallet \"wallet_name\" \"backup_file\" ( load_on_startup )";
+    "signrawtransactionwithwallet \"hexstring\"";
+    "rescanblockchain ( start_height stop_height )";
+    "importprivkey \"privkey\" ( \"label\" rescan )";
+    "sethdseed ( newkeypool \"seed\" )";
+    "encryptwallet \"passphrase\"";
+    "walletpassphrase \"passphrase\" timeout";
+    "walletlock";
+  ]);
+  ("Control", [
+    "getrpcinfo";
+    "help ( \"command\" )";
+    "logging ( [\"include_category\",...] [\"exclude_category\",...] )";
+    "stop";
+    "uptime";
+  ]);
+  ("Performance", [
+    "getperfstats";
+  ]);
+  ("AssumeUTXO", [
+    "loadtxoutset \"path\"";
+    "dumptxoutset \"path\"";
+    "gettxoutsetinfo ( \"hash_type\" )";
+    "scrubunspendable";
+  ]);
+  ("Payjoin", [
+    "checkpayjoinreplay \"original_psbt\"";
+    "decodeoriginalpsbt \"original_psbt\" ( \"content_type\" )";
+    "expirepayjoinrequest \"session_id\"";
+    "getpayjoinerror";
+    "getpayjoinrequest amount_sat ( \"endpoint\" pjos )";
+    "getpayjointlsinfo";
+    "getpayjoinversion";
+    "listpayjoinsessions";
+    "payjoinadjustfee \"psbt\" fee_output_index extra_fee_sat ( max_contribution_sat )";
+    "payjoinaddinput";
+    "payjoinmodifyoutput \"psbt\" output_index new_value_sat";
+    "payjoinreceive \"original_psbt\" ( params )";
+    "receiveraddinputs";
+    "selectpayjoinutxos \"original_psbt\"";
+    "sendpayjoinrequest \"bip21_uri\" ( \"psbt\" params )";
+    "validatefeeoutputindex \"psbt\" output_index";
+    "validateoriginalpsbt \"original_psbt\"";
+    "validatepayjoincontenttype \"content_type\"";
+    "verifypayjoinnodouble \"session_id\" [outpoint,...]";
+  ]);
+]
+
+(* First token of a signature line with any "(" suffix stripped -- the same
+   rule tools/r5_probe.py help_lists() applies. *)
+let help_signature_name (line : string) : string =
+  let tok =
+    match String.split_on_char ' ' (String.trim line) with
+    | t :: _ -> t
+    | [] -> ""
+  in
+  match String.split_on_char '(' tok with
+  | h :: _ -> h
+  | [] -> tok
+
+let help_listing () : string =
+  String.concat "\n\n"
+    (List.map (fun (cat, lines) ->
+         String.concat "\n" (("== " ^ cat ^ " ==") :: lines))
+       help_sections)
+
+(* Core rpc/server.cpp help(): an unknown command yields the RESULT string
+   "help: unknown command: <cmd>" (not an error). A known one yields its help
+   text, which begins with the signature line; we follow it with the first
+   description paragraph (Rpc_help_text, harvested from Core). *)
+let help_for_command (cmd : string) : string =
+  let signature =
+    List.find_map (fun (_cat, lines) ->
+        List.find_opt (fun l -> help_signature_name l = cmd) lines)
+      help_sections
+  in
+  match signature with
+  | None -> "help: unknown command: " ^ cmd
+  | Some sig_line ->
+    (match Rpc_help_text.find cmd with
+     | Some d when d <> "" -> sig_line ^ "\n\n" ^ d
+     | _ -> sig_line)
+
 let handle_help (_ctx : rpc_context)
     (params : Yojson.Safe.t list) : Yojson.Safe.t =
   match params with
-  | [] ->
-    `String (String.concat "\n" [
-      "== Blockchain ==";
-      "getbestblockhash";
-      "getblock \"blockhash\" ( verbosity )";
-      "getblockchaininfo";
-      "getblockcount";
-      "getsyncstate";
-      "getblockhash height";
-      "getblockheader \"blockhash\" ( verbose )";
-      "getblockstats hash_or_height";
-      "getblockfilter \"blockhash\" ( filtertype )";
-      "scanblocks \"action\" ( [scanobjects,...] start_height stop_height \"filtertype\" options )";
-      "getdeploymentinfo ( \"blockhash\" )";
-      "getdifficulty";
-      "getchaintips";
-      "getchainstates";
-      "getchaintxstats ( nblocks \"blockhash\" )";
-      "getindexinfo ( \"index_name\" )";
-      "verifychain ( checklevel nblocks )";
-      "waitfornewblock ( timeout \"current_tip\" )";
-      "waitforblock \"blockhash\" ( timeout )";
-      "waitforblockheight height ( timeout )";
-      "pruneblockchain height";
-      "";
-      "== Mining ==";
-      "getblocktemplate";
-      "getmininginfo";
-      "getnetworkhashps ( nblocks height )";
-      "getprioritisedtransactions";
-      "submitblock \"hexdata\"";
-      "submitheader \"hexdata\"";
-      "";
-      "== Regtest Mining ==";
-      "generate nblocks (regtest only)";
-      "generatetoaddress nblocks \"address\" (regtest only)";
-      "generateblock \"output\" [\"rawtx\",...] (regtest only)";
-      "";
-      "== Mempool ==";
-      "dumpmempool";
-      "getmempoolancestors \"txid\"";
-      "getmempooldescendants \"txid\"";
-      "getmempoolentry \"txid\"";
-      "getmempoolinfo";
-      "getorphantxs ( verbosity )";
-      "getrawmempool ( verbose )";
-      "importmempool \"filepath\" ( options )";
-      "loadmempool";
-      "savemempool";
-      "testmempoolaccept [\"rawtx\"]";
-      "";
-      "== Network ==";
-      "addnode \"node\" \"add\"|\"remove\"|\"onetry\"";
-      "addpeeraddress \"address\" port ( tried )";
-      "clearbanned";
-      "disconnectnode \"address\"";
-      "getaddednodeinfo ( \"node\" )";
-      "getaddrmaninfo";
-      "getblockfrompeer \"blockhash\" peer_id";
-      "getconnectioncount";
-      "getnetworkinfo";
-      "getnettotals";
-      "getnodeaddresses ( count \"network\" )";
-      "getpeerinfo";
-      "listbanned";
-      "ping";
-      "setban \"address\" \"add\"|\"remove\" ( bantime )";
-      "setnetworkactive state";
-      "";
-      "== Rawtransactions ==";
-      "createrawtransaction [{\"txid\":\"id\",\"vout\":n},...] [{\"address\":amount},...] ( locktime replaceable )";
-      "decoderawtransaction \"hexstring\"";
-      "getrawtransaction \"txid\" ( verbose )";
-      "sendrawtransaction \"hexstring\"";
-      "signrawtransactionwithkey \"hexstring\" [\"privkey\",...]";
-      "submitpackage [\"rawtx\",...] ( maxfeerate maxburnamount )";
-      "";
-      "== PSBT ==";
-      "analyzepsbt \"psbt\"";
-      "combinepsbt [\"psbt\",...]";
-      "converttopsbt \"hexstring\" ( permitsigdata )";
-      "createpsbt [{\"txid\":\"...\", \"vout\":n},...] [{\"address\":amount},...] ( locktime )";
-      "decodepsbt \"psbt\"";
-      "descriptorprocesspsbt \"psbt\" [\"descriptor\",...] ( \"sighashtype\" bip32derivs finalize )";
-      "finalizepsbt \"psbt\" ( extract )";
-      "joinpsbts [\"psbt\",...]";
-      "utxoupdatepsbt \"psbt\"";
-      "walletcreatefundedpsbt [{\"txid\":\"...\", \"vout\":n},...] [{\"address\":amount},...] ( locktime options bip32derivs )";
-      "fundrawtransaction \"hexstring\" ( options iswitness )";
-      "walletprocesspsbt \"psbt\" ( sign \"sighashtype\" bip32derivs finalize )";
-      "";
-      "== Descriptors ==";
-      "deriveaddresses \"descriptor\" ( range )";
-      "getdescriptorinfo \"descriptor\"";
-      "listdescriptors ( private )";
-      "";
-      "== Blockchain ==";
-      "gettxout \"txid\" vout";
-      "gettxspendingprevout [{\"txid\":\"hex\",\"vout\":n},...] ( {\"mempool_only\":bool,\"return_spending_tx\":bool,...} )";
-      "invalidateblock \"blockhash\"";
-      "reconsiderblock \"blockhash\"";
-      "preciousblock \"blockhash\"";
-      "";
-      "== Util ==";
-      "getmemoryinfo ( \"mode\" )";
-      "estimatesmartfee conf_target";
-      "estimaterawfee conf_target ( threshold )";
-      "signmessage \"address\" \"message\"";
-      "signmessagewithprivkey \"privkey\" \"message\"";
-      "verifymessage \"address\" \"signature\" \"message\"";
-      "validateaddress \"address\"";
-      "";
-      "== Wallet ==";
-      "getbalance";
-      "getbalances";
-      "getnewaddress";
-      "getwalletinfo";
-      "getaddressinfo \"address\"";
-      "listwallets";
-      "createwallet \"wallet_name\" ( disable_private_keys blank \"passphrase\" avoid_reuse descriptors load_on_startup external_signer )";
-      "loadwallet \"filename\" ( load_on_startup )";
-      "unloadwallet ( \"wallet_name\" load_on_startup )";
-      "listtransactions ( \"label\" count skip include_watchonly )";
-      "listunspent";
-      "lockunspent unlock ( [{\"txid\":\"...\", \"vout\":n},...] persistent )";
-      "listlockunspent";
-      "sendtoaddress \"address\" amount";
-      "send [{\"address\":amount},...] ( conf_target \"estimate_mode\" fee_rate options )";
-      "backupwallet \"destination\"";
-      "restorewallet \"wallet_name\" \"backup_file\" ( load_on_startup )";
-      "signrawtransactionwithwallet \"hexstring\"";
-      "rescanblockchain ( start_height stop_height )";
-      "importprivkey \"privkey\" ( \"label\" rescan )";
-      "encryptwallet \"passphrase\"";
-      "walletpassphrase \"passphrase\" timeout";
-      "walletlock";
-      "";
-      "== Control ==";
-      "getrpcinfo";
-      "help ( \"command\" )";
-      "logging ( [\"include_category\",...] [\"exclude_category\",...] )";
-      "stop";
-      "uptime";
-      "";
-      "== Performance ==";
-      "getperfstats";
-      "";
-      "== AssumeUTXO ==";
-      "loadtxoutset \"path\"";
-      "dumptxoutset \"path\"";
-      "gettxoutsetinfo ( \"hash_type\" )";
-      "scrubunspendable";
-    ])
-  | [`String _cmd] ->
-    (* Could provide help for specific command *)
-    `String "Help for specific commands not implemented"
+  | [] | [`Null] -> `String (help_listing ())
+  | [`String cmd] -> `String (help_for_command cmd)
   | _ ->
     `String "Invalid parameters"
 

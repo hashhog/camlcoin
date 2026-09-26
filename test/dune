@@ -250,3 +250,19 @@
 (executable
  (name test_ibd_cache_spent_no_fallback)
  (libraries camlcoin test_tmp alcotest lwt lwt.unix unix))
+
+; gettxoutsetinfo.transactions counted Core-style (txid change in
+; outpoint order) instead of a Hashtbl of every txid (>10 GB on mainnet).
+; Restoring the Hashtbl fails the heap-growth bound.
+;   dune exec --no-buffer test/test_gettxoutsetinfo_transactions.exe
+(executable
+ (name test_gettxoutsetinfo_transactions)
+ (libraries camlcoin test_tmp alcotest unix))
+
+; Multi-domain Logs reports must not corrupt the shared Format state
+; (mainnet: "[gc] backstop compaction raised: Stdlib.Queue.Empty").
+; Without Cli.Report_lock.install: thousands of Queue.Empty -> FAIL.
+;   dune exec --no-buffer test/test_log_reporter_domains.exe
+(executable
+ (name test_log_reporter_domains)
+ (libraries camlcoin unix logs))

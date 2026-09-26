@@ -440,6 +440,142 @@ type script_error =
   | ScriptOk
   | ErrScript of string
 
+(* ---------------------------------------------------------------------------
+   Per-transaction precomputed sighash data.
+
+   Port of Bitcoin Core's PrecomputedTransactionData (script/interpreter.cpp,
+   PrecomputedTransactionData::Init).  The BIP-143 hashPrevouts / hashSequence /
+   hashOutputs and the BIP-341 sha_prevouts / sha_amounts / sha_scriptpubkeys /
+   sha_sequences / sha_outputs depend only on the transaction (and, for the
+   two BIP-341 spent-output hashes, on the full spent-output list), never on
+   the input being signed.  Recomputing them inside every sighash call
+   re-serialises and re-hashes ALL inputs/outputs once per input: O(n^2) per
+   transaction.  Core computes them once per transaction and hands the same
+   cache to every input's checker; this record does the same.
+
+   Values are computed LAZILY on first use and memoised, so a legacy-only
+   transaction never pays for them (Core decides eagerly by scanning the
+   witnesses; laziness is equivalent and needs no classification logic).
+
+   Domain safety (OCaml 5): one record is shared by every input of a
+   transaction, including inputs verified concurrently by ScriptCheckQueue /
+   script_check_pool worker Domains.  [Lazy.t] is NOT safe to force from two
+   Domains at once (it raises CamlinternalLazy.Undefined), so each slot is an
+   [Atomic.t] holding an option: a reader that sees [None] computes the value
+   and publishes it with [Atomic.set].  Two Domains racing on an empty slot
+   both compute the SAME bytes (the inputs are immutable) and either
+   publication is correct; the Atomic gives the happens-before edge that
+   makes the published Cstruct's contents visible to the other Domain.  The
+   published Cstructs are never mutated (they are only ever read by
+   Serialize.write_bytes).
+
+   The cache is bound to the exact [tx] and [prevouts] values it was built
+   from, checked with PHYSICAL equality at every use: if a caller hands a
+   mismatched cache the sighash functions ignore it and recompute from
+   scratch, so a wiring mistake can cost speed but never change a sighash.
+
+   The "single" hashes are single SHA256 (what BIP-341 uses directly); the
+   BIP-143 values are SHA256 of those (= SHA256d of the serialisation), exactly
+   as Core derives hashPrevouts = SHA256Uint256(m_prevouts_single_hash).
+   --------------------------------------------------------------------------- *)
+type precomputed_txdata = {
+  pt_tx : Types.transaction;
+  pt_prevouts : (int64 * Cstruct.t) list;
+  pt_n_inputs : int;
+  pt_n_prevouts : int;
+  (* Shared by BIP-143 and BIP-341 (single SHA256). *)
+  pt_prevouts_single : Cstruct.t option Atomic.t;
+  pt_sequences_single : Cstruct.t option Atomic.t;
+  pt_outputs_single : Cstruct.t option Atomic.t;
+  (* BIP-341 only (single SHA256 over the spent outputs). *)
+  pt_amounts_single : Cstruct.t option Atomic.t;
+  pt_scripts_single : Cstruct.t option Atomic.t;
+  (* BIP-143 only (SHA256 of the single hashes above = SHA256d). *)
+  pt_hash_prevouts : Cstruct.t option Atomic.t;
+  pt_hash_sequence : Cstruct.t option Atomic.t;
+  pt_hash_outputs : Cstruct.t option Atomic.t;
+}
+
+let make_txdata ?(prevouts = []) (tx : Types.transaction) : precomputed_txdata = {
+  pt_tx = tx;
+  pt_prevouts = prevouts;
+  pt_n_inputs = List.length tx.Types.inputs;
+  pt_n_prevouts = List.length prevouts;
+  pt_prevouts_single = Atomic.make None;
+  pt_sequences_single = Atomic.make None;
+  pt_outputs_single = Atomic.make None;
+  pt_amounts_single = Atomic.make None;
+  pt_scripts_single = Atomic.make None;
+  pt_hash_prevouts = Atomic.make None;
+  pt_hash_sequence = Atomic.make None;
+  pt_hash_outputs = Atomic.make None;
+}
+
+(* Domain-safe memoisation of one slot (see the comment above). *)
+let txdata_memo (cell : Cstruct.t option Atomic.t) (compute : unit -> Cstruct.t)
+    : Cstruct.t =
+  match Atomic.get cell with
+  | Some v -> v
+  | None ->
+    let v = compute () in
+    Atomic.set cell (Some v);
+    v
+
+(* Serialisations hashed by both schemes.  These are the ONLY definitions of
+   the preimages; the cached and uncached paths both call them. *)
+let ser_all_outpoints (tx : Types.transaction) : Cstruct.t =
+  let w = Serialize.writer_create () in
+  List.iter (fun inp -> Serialize.serialize_outpoint w inp.Types.previous_output)
+    tx.Types.inputs;
+  Serialize.writer_to_cstruct w
+
+let ser_all_sequences (tx : Types.transaction) : Cstruct.t =
+  let w = Serialize.writer_create () in
+  List.iter (fun inp -> Serialize.write_int32_le w inp.Types.sequence) tx.Types.inputs;
+  Serialize.writer_to_cstruct w
+
+let ser_all_outputs (tx : Types.transaction) : Cstruct.t =
+  let w = Serialize.writer_create () in
+  List.iter (Serialize.serialize_tx_out w) tx.Types.outputs;
+  Serialize.writer_to_cstruct w
+
+let ser_all_amounts (prevouts : (int64 * Cstruct.t) list) : Cstruct.t =
+  let w = Serialize.writer_create () in
+  List.iter (fun (amount, _) -> Serialize.write_int64_le w amount) prevouts;
+  Serialize.writer_to_cstruct w
+
+let ser_all_spent_scripts (prevouts : (int64 * Cstruct.t) list) : Cstruct.t =
+  let w = Serialize.writer_create () in
+  List.iter (fun (_, spk) ->
+    Serialize.write_compact_size w (Cstruct.length spk);
+    Serialize.write_bytes w spk
+  ) prevouts;
+  Serialize.writer_to_cstruct w
+
+(* Accessors: [Some d] only when [d] was built from this very [tx]. *)
+let txdata_for (txdata : precomputed_txdata option) (tx : Types.transaction)
+    : precomputed_txdata option =
+  match txdata with
+  | Some d when d.pt_tx == tx -> Some d
+  | _ -> None
+
+let prevouts_single_sha (d : precomputed_txdata) =
+  txdata_memo d.pt_prevouts_single (fun () -> Crypto.sha256 (ser_all_outpoints d.pt_tx))
+let sequences_single_sha (d : precomputed_txdata) =
+  txdata_memo d.pt_sequences_single (fun () -> Crypto.sha256 (ser_all_sequences d.pt_tx))
+let outputs_single_sha (d : precomputed_txdata) =
+  txdata_memo d.pt_outputs_single (fun () -> Crypto.sha256 (ser_all_outputs d.pt_tx))
+let amounts_single_sha (d : precomputed_txdata) =
+  txdata_memo d.pt_amounts_single (fun () -> Crypto.sha256 (ser_all_amounts d.pt_prevouts))
+let scripts_single_sha (d : precomputed_txdata) =
+  txdata_memo d.pt_scripts_single (fun () -> Crypto.sha256 (ser_all_spent_scripts d.pt_prevouts))
+let bip143_hash_prevouts (d : precomputed_txdata) =
+  txdata_memo d.pt_hash_prevouts (fun () -> Crypto.sha256 (prevouts_single_sha d))
+let bip143_hash_sequence (d : precomputed_txdata) =
+  txdata_memo d.pt_hash_sequence (fun () -> Crypto.sha256 (sequences_single_sha d))
+let bip143_hash_outputs (d : precomputed_txdata) =
+  txdata_memo d.pt_hash_outputs (fun () -> Crypto.sha256 (outputs_single_sha d))
+
 type eval_state = {
   mutable stack : Cstruct.t list;
   mutable altstack : Cstruct.t list;
@@ -457,10 +593,12 @@ type eval_state = {
   annex_hash : Cstruct.t option;         (* SHA256 of annex if present *)
   tapleaf_hash : Cstruct.t option;       (* tapleaf hash for script path *)
   mutable sigops_budget : int;           (* Tapscript validation weight budget *)
+  txdata : precomputed_txdata option;    (* per-tx sighash cache (shared across inputs) *)
 }
 
 let create_eval_state ~tx ~input_index ~amount ~flags ~sig_version
-    ?(prevouts=[]) ?(annex_hash=None) ?(tapleaf_hash=None) ?(sigops_budget=max_int) () =
+    ?(prevouts=[]) ?(annex_hash=None) ?(tapleaf_hash=None) ?(sigops_budget=max_int)
+    ?txdata () =
   {
     stack = [];
     altstack = [];
@@ -477,6 +615,7 @@ let create_eval_state ~tx ~input_index ~amount ~flags ~sig_version
     annex_hash;
     tapleaf_hash;
     sigops_budget;
+    txdata;
   }
 
 (* Stack operations *)
@@ -926,43 +1065,44 @@ let compute_sighash_legacy (tx : Types.transaction) (input_index : int)
     Crypto.sha256d (Serialize.writer_to_cstruct w)
   end
 
-(* BIP-143 segwit v0 sighash computation *)
-let compute_sighash_segwit (tx : Types.transaction) (input_index : int)
+(* BIP-143 segwit v0 sighash computation.
+
+   [?txdata]: the per-transaction precomputed data (see precomputed_txdata).
+   When supplied and built from this [tx], hashPrevouts / hashSequence /
+   hashOutputs come from it — exactly the three places Core reads
+   cache->hashPrevouts / hashSequence / hashOutputs in SignatureHash
+   (interpreter.cpp, `cacheready` branch).  The per-input SIGHASH_SINGLE output
+   hash is never cached (Core does not cache it either).  Without [txdata] the
+   hashes are computed from scratch, byte-for-byte as before. *)
+let compute_sighash_segwit ?txdata (tx : Types.transaction) (input_index : int)
     (script_code : Cstruct.t) (amount : int64) (hash_type : int) : Types.hash256 =
   let base_type = hash_type land 0x1f in
   let anyone_can_pay = hash_type land sighash_anyonecanpay <> 0 in
+  let cache = txdata_for txdata tx in
 
   (* hashPrevouts *)
   let hash_prevouts =
     if anyone_can_pay then Types.zero_hash
-    else begin
-      let w = Serialize.writer_create () in
-      List.iter (fun inp ->
-        Serialize.serialize_outpoint w inp.Types.previous_output
-      ) tx.inputs;
-      Crypto.sha256d (Serialize.writer_to_cstruct w)
-    end
+    else match cache with
+      | Some d -> bip143_hash_prevouts d
+      | None -> Crypto.sha256d (ser_all_outpoints tx)
   in
 
   (* hashSequence *)
   let hash_sequence =
     if anyone_can_pay || base_type = sighash_none || base_type = sighash_single
     then Types.zero_hash
-    else begin
-      let w = Serialize.writer_create () in
-      List.iter (fun inp ->
-        Serialize.write_int32_le w inp.Types.sequence
-      ) tx.inputs;
-      Crypto.sha256d (Serialize.writer_to_cstruct w)
-    end
+    else match cache with
+      | Some d -> bip143_hash_sequence d
+      | None -> Crypto.sha256d (ser_all_sequences tx)
   in
 
   (* hashOutputs *)
   let hash_outputs =
     if base_type <> sighash_none && base_type <> sighash_single then begin
-      let w = Serialize.writer_create () in
-      List.iter (Serialize.serialize_tx_out w) tx.outputs;
-      Crypto.sha256d (Serialize.writer_to_cstruct w)
+      match cache with
+      | Some d -> bip143_hash_outputs d
+      | None -> Crypto.sha256d (ser_all_outputs tx)
     end
     else if base_type = sighash_single && input_index < List.length tx.outputs then begin
       let w = Serialize.writer_create () in
@@ -1029,6 +1169,7 @@ let taproot_sighash_single_safe (hash_type : int) (input_index : int) (n_outputs
 
    prevouts is a list of (amount, scriptPubKey) for ALL inputs. *)
 let compute_sighash_taproot
+    ?txdata
     (tx : Types.transaction)
     (input_index : int)
     (prevouts : (int64 * Cstruct.t) list)
@@ -1051,8 +1192,20 @@ let compute_sighash_taproot
      Without this guard, a short or oversized list would silently produce a
      wrong sha_amounts / sha_scriptpubkeys, leaking a different sighash to
      callers that don't notice. *)
-  let n_inputs = List.length tx.Types.inputs in
-  let n_prevouts = List.length prevouts in
+  (* Per-tx precomputed data: the tx-level hashes need only [tx]; the two
+     spent-output hashes additionally need the cache to have been built from
+     this very [prevouts] list (physical equality) — otherwise recompute. *)
+  let cache = txdata_for txdata tx in
+  let spent_cache = match cache with
+    | Some d when d.pt_prevouts == prevouts -> Some d
+    | _ -> None
+  in
+  let n_inputs = match cache with
+    | Some d -> d.pt_n_inputs
+    | None -> List.length tx.Types.inputs in
+  let n_prevouts = match spent_cache with
+    | Some d -> d.pt_n_prevouts
+    | None -> List.length prevouts in
   if n_prevouts <> n_inputs then
     failwith (Printf.sprintf
                 "Taproot sighash: prevouts length %d does not match inputs length %d"
@@ -1087,33 +1240,22 @@ let compute_sighash_taproot
 
   (* If not ANYONECANPAY, compute and write shared input hashes *)
   if not anyone_can_pay then begin
-    (* sha_prevouts: SHA256 of all outpoints *)
-    let sha_prevouts =
-      let pw = Serialize.writer_create () in
-      List.iter (fun inp -> Serialize.serialize_outpoint pw inp.Types.previous_output) tx.inputs;
-      Crypto.sha256 (Serialize.writer_to_cstruct pw)
-    in
-    (* sha_amounts: SHA256 of all input amounts *)
-    let sha_amounts =
-      let pw = Serialize.writer_create () in
-      List.iter (fun (amount, _) -> Serialize.write_int64_le pw amount) prevouts;
-      Crypto.sha256 (Serialize.writer_to_cstruct pw)
-    in
-    (* sha_scriptpubkeys: SHA256 of all input scriptPubKeys with compact_size prefix *)
-    let sha_scriptpubkeys =
-      let pw = Serialize.writer_create () in
-      List.iter (fun (_, spk) ->
-        Serialize.write_compact_size pw (Cstruct.length spk);
-        Serialize.write_bytes pw spk
-      ) prevouts;
-      Crypto.sha256 (Serialize.writer_to_cstruct pw)
-    in
-    (* sha_sequences: SHA256 of all input sequences *)
-    let sha_sequences =
-      let pw = Serialize.writer_create () in
-      List.iter (fun inp -> Serialize.write_int32_le pw inp.Types.sequence) tx.inputs;
-      Crypto.sha256 (Serialize.writer_to_cstruct pw)
-    in
+    (* sha_prevouts / sha_amounts / sha_scriptpubkeys / sha_sequences:
+       single SHA256 of all outpoints / spent amounts / spent scriptPubKeys
+       (compact_size-prefixed) / sequences.  From the per-tx cache when one
+       was supplied (Core: cache.m_prevouts_single_hash etc.). *)
+    let sha_prevouts = match cache with
+      | Some d -> prevouts_single_sha d
+      | None -> Crypto.sha256 (ser_all_outpoints tx) in
+    let sha_amounts = match spent_cache with
+      | Some d -> amounts_single_sha d
+      | None -> Crypto.sha256 (ser_all_amounts prevouts) in
+    let sha_scriptpubkeys = match spent_cache with
+      | Some d -> scripts_single_sha d
+      | None -> Crypto.sha256 (ser_all_spent_scripts prevouts) in
+    let sha_sequences = match cache with
+      | Some d -> sequences_single_sha d
+      | None -> Crypto.sha256 (ser_all_sequences tx) in
     Serialize.write_bytes w sha_prevouts;
     Serialize.write_bytes w sha_amounts;
     Serialize.write_bytes w sha_scriptpubkeys;
@@ -1122,15 +1264,9 @@ let compute_sighash_taproot
 
   (* If hash_type base is not NONE and not SINGLE, write sha_outputs *)
   if base_type <> 2 && base_type <> 3 then begin
-    let sha_outputs =
-      let pw = Serialize.writer_create () in
-      List.iter (fun out ->
-        Serialize.write_int64_le pw out.Types.value;
-        Serialize.write_compact_size pw (Cstruct.length out.Types.script_pubkey);
-        Serialize.write_bytes pw out.Types.script_pubkey
-      ) tx.outputs;
-      Crypto.sha256 (Serialize.writer_to_cstruct pw)
-    in
+    let sha_outputs = match cache with
+      | Some d -> outputs_single_sha d
+      | None -> Crypto.sha256 (ser_all_outputs tx) in
     Serialize.write_bytes w sha_outputs
   end;
 
@@ -1949,7 +2085,7 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                   Error "Tapscript SIGHASH_SINGLE without matching output"
                 else begin
                   let sig_64 = Cstruct.sub sig_bytes 0 64 in
-                  let sighash = compute_sighash_taproot st.tx st.input_index st.prevouts hash_type
+                  let sighash = compute_sighash_taproot ?txdata:st.txdata st.tx st.input_index st.prevouts hash_type
                     ?annex_hash:st.annex_hash ?tapleaf_hash:st.tapleaf_hash
                     ~codesep_pos:st.codesep_pos () in
                   let valid = Crypto.schnorr_verify ~pubkey_x:pubkey ~msg:sighash ~signature:sig_64 in
@@ -1997,9 +2133,9 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                       let sighash = compute_sighash_legacy st.tx st.input_index cleaned hash_type in
                       Ok sighash
                   | SigVersionWitnessV0 ->
-                    Ok (compute_sighash_segwit st.tx st.input_index effective_script_code st.amount hash_type)
+                    Ok (compute_sighash_segwit ?txdata:st.txdata st.tx st.input_index effective_script_code st.amount hash_type)
                   | SigVersionTaproot | SigVersionTapscript ->
-                    Ok (compute_sighash_segwit st.tx st.input_index effective_script_code st.amount hash_type)
+                    Ok (compute_sighash_segwit ?txdata:st.txdata st.tx st.input_index effective_script_code st.amount hash_type)
                 in
                 match checksig_result with
                 | Error e -> Error e
@@ -2069,7 +2205,7 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                   Error "Tapscript SIGHASH_SINGLE without matching output"
                 else begin
                   let sig_64 = Cstruct.sub sig_bytes 0 64 in
-                  let sighash = compute_sighash_taproot st.tx st.input_index st.prevouts hash_type
+                  let sighash = compute_sighash_taproot ?txdata:st.txdata st.tx st.input_index st.prevouts hash_type
                     ?annex_hash:st.annex_hash ?tapleaf_hash:st.tapleaf_hash
                     ~codesep_pos:st.codesep_pos () in
                   let valid = Crypto.schnorr_verify ~pubkey_x:pubkey ~msg:sighash ~signature:sig_64 in
@@ -2115,9 +2251,9 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                       let sighash = compute_sighash_legacy st.tx st.input_index cleaned hash_type in
                       Ok sighash
                   | SigVersionWitnessV0 ->
-                    Ok (compute_sighash_segwit st.tx st.input_index effective_script_code st.amount hash_type)
+                    Ok (compute_sighash_segwit ?txdata:st.txdata st.tx st.input_index effective_script_code st.amount hash_type)
                   | SigVersionTaproot | SigVersionTapscript ->
-                    Ok (compute_sighash_segwit st.tx st.input_index effective_script_code st.amount hash_type)
+                    Ok (compute_sighash_segwit ?txdata:st.txdata st.tx st.input_index effective_script_code st.amount hash_type)
                 in
                 match checksig_result with
                 | Error e -> Error e
@@ -2245,9 +2381,9 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                               | SigVersionBase ->
                                 compute_sighash_legacy st.tx st.input_index cleaned_script hash_type
                               | SigVersionWitnessV0 ->
-                                compute_sighash_segwit st.tx st.input_index cleaned_script st.amount hash_type
+                                compute_sighash_segwit ?txdata:st.txdata st.tx st.input_index cleaned_script st.amount hash_type
                               | SigVersionTaproot | SigVersionTapscript ->
-                                compute_sighash_segwit st.tx st.input_index cleaned_script st.amount hash_type
+                                compute_sighash_segwit ?txdata:st.txdata st.tx st.input_index cleaned_script st.amount hash_type
                             in
                             let rec try_pubkeys = function
                               | [] -> Ok false
@@ -2455,7 +2591,7 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                       Error "OP_CHECKSIGADD SIGHASH_SINGLE without matching output"
                     else begin
                       let sig_64 = Cstruct.sub sig_bytes 0 64 in
-                      let sighash = compute_sighash_taproot st.tx st.input_index st.prevouts hash_type
+                      let sighash = compute_sighash_taproot ?txdata:st.txdata st.tx st.input_index st.prevouts hash_type
                         ?annex_hash:st.annex_hash ?tapleaf_hash:st.tapleaf_hash
                         ~codesep_pos:st.codesep_pos () in
                       let valid = Crypto.schnorr_verify ~pubkey_x:pubkey ~msg:sighash ~signature:sig_64 in
@@ -2599,7 +2735,20 @@ let check_stack_top (st : eval_state) : (bool, string) result =
 let verify_script ~(tx : Types.transaction) ~(input_index : int)
     ~(script_pubkey : Cstruct.t) ~(script_sig : Cstruct.t)
     ~(witness : Types.tx_witness) ~(amount : int64)
-    ~(flags : int) ?(prevouts=[]) () : (bool, string) result =
+    ~(flags : int) ?(prevouts=[]) ?txdata () : (bool, string) result =
+
+  (* Per-transaction precomputed sighash data (Core: the
+     PrecomputedTransactionData handed to every input's checker).  Callers
+     verifying several inputs of one tx pass ONE shared [txdata] built with
+     [make_txdata ~prevouts tx]; a missing or mismatched one (built from a
+     different tx / prevouts value) is replaced by a fresh per-call cache, which
+     is still correct and still shares work between the signature checks of
+     this one input (e.g. every CHECKMULTISIG signature). *)
+  let txdata =
+    match txdata with
+    | Some d when d.pt_tx == tx && d.pt_prevouts == prevouts -> d
+    | _ -> make_txdata ~prevouts tx
+  in
 
   let run_script st script =
     eval_script st script
@@ -2638,13 +2787,13 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
         Ok true  (* Unconditional success for unknown witness versions *)
     end else begin
       (* Witness flag not set, fall through to normal execution *)
-      let st_sig = create_eval_state ~tx ~input_index ~amount ~flags
+      let st_sig = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                      ~sig_version:SigVersionBase () in
       begin match run_script st_sig script_sig with
       | Error e -> Error e
       | Ok () ->
         let saved_stack = st_sig.stack in
-        let st_pub = create_eval_state ~tx ~input_index ~amount ~flags
+        let st_pub = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                        ~sig_version:SigVersionBase () in
         st_pub.stack <- saved_stack;
         begin match run_script st_pub script_pubkey with
@@ -2674,13 +2823,13 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
       Error "Unexpected witness data for non-witness script"
     else begin
       (* Legacy P2PKH: run scriptSig, then scriptPubKey with independent state *)
-      let st_sig = create_eval_state ~tx ~input_index ~amount ~flags
+      let st_sig = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                      ~sig_version:SigVersionBase () in
       begin match run_script st_sig script_sig with
       | Error e -> Error e
       | Ok () ->
         let saved_stack = st_sig.stack in
-        let st_pub = create_eval_state ~tx ~input_index ~amount ~flags
+        let st_pub = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                        ~sig_version:SigVersionBase () in
         st_pub.stack <- saved_stack;
         begin match run_script st_pub script_pubkey with
@@ -2698,13 +2847,13 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
     (* BIP-16 P2SH *)
     if flags land script_verify_p2sh = 0 then
       (* P2SH not enabled, treat as regular script *)
-      let st_sig = create_eval_state ~tx ~input_index ~amount ~flags
+      let st_sig = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                      ~sig_version:SigVersionBase () in
       begin match run_script st_sig script_sig with
       | Error e -> Error e
       | Ok () ->
         let saved_stack = st_sig.stack in
-        let st_pub = create_eval_state ~tx ~input_index ~amount ~flags
+        let st_pub = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                        ~sig_version:SigVersionBase () in
         st_pub.stack <- saved_stack;
         begin match run_script st_pub script_pubkey with
@@ -2723,7 +2872,7 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
         Error "SigPushOnly"
       else begin
       (* Run scriptSig *)
-      let st = create_eval_state ~tx ~input_index ~amount ~flags
+      let st = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                  ~sig_version:SigVersionBase () in
       begin match run_script st script_sig with
       | Error e -> Error e
@@ -2780,7 +2929,7 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                           Ok false
                         else begin
                           let implicit_script = build_p2pkh_script program in
-                          let st2 = create_eval_state ~tx ~input_index ~amount ~flags
+                          let st2 = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                                       ~sig_version:SigVersionWitnessV0 () in
                           st2.stack <- [wit_pubkey; wit_sig];
                           begin match run_script st2 implicit_script with
@@ -2820,7 +2969,7 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                         match check_witness_stack_item_sizes wit_stack with
                         | Error e -> Error e
                         | Ok () ->
-                        let st2 = create_eval_state ~tx ~input_index ~amount ~flags
+                        let st2 = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                                     ~sig_version:SigVersionWitnessV0 () in
                         st2.stack <- wit_stack;
                         begin match run_script st2 witness_script with
@@ -2866,7 +3015,7 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                   Error "Unexpected witness data for non-witness script"
                 else
                 (* Run redeem script with remaining stack *)
-                let st2 = create_eval_state ~tx ~input_index ~amount ~flags
+                let st2 = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                             ~sig_version:SigVersionBase () in
                 st2.stack <- List.tl stack_copy;
                 begin match run_script st2 redeem_script with
@@ -2919,7 +3068,7 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
             else begin
               (* Build implicit P2PKH script *)
               let implicit_script = build_p2pkh_script program in
-              let st = create_eval_state ~tx ~input_index ~amount ~flags
+              let st = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                          ~sig_version:SigVersionWitnessV0 () in
               st.stack <- [wit_pubkey; wit_sig];
               begin match run_script st implicit_script with
@@ -2965,7 +3114,7 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
             match check_witness_stack_item_sizes wit_stack with
             | Error e -> Error e
             | Ok () ->
-            let st = create_eval_state ~tx ~input_index ~amount ~flags
+            let st = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                        ~sig_version:SigVersionWitnessV0 () in
             st.stack <- wit_stack;
             begin match run_script st witness_script with
@@ -3047,7 +3196,7 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                 Error "Taproot SIGHASH_SINGLE without matching output"
               else begin
                 let sig_64 = Cstruct.sub sig_bytes 0 64 in
-                let sighash = compute_sighash_taproot tx input_index prevouts hash_type
+                let sighash = compute_sighash_taproot ~txdata tx input_index prevouts hash_type
                   ?annex_hash () in
                 if Crypto.schnorr_verify ~pubkey_x:program ~msg:sighash ~signature:sig_64 then
                   Ok true
@@ -3209,7 +3358,7 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
                         match check_witness_stack_item_sizes wit_stack with
                         | Error e -> Error e
                         | Ok () ->
-                          let st = create_eval_state ~tx ~input_index ~amount ~flags
+                          let st = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                                      ~sig_version:SigVersionTapscript
                                      ~prevouts ~annex_hash:(annex_hash)
                                      ~tapleaf_hash:(Some tapleaf_hash) ~sigops_budget () in
@@ -3253,13 +3402,13 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
       Error "Unexpected witness data for non-witness script"
     else begin
       (* Generic script execution with independent state per script *)
-      let st_sig = create_eval_state ~tx ~input_index ~amount ~flags
+      let st_sig = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                      ~sig_version:SigVersionBase () in
       begin match run_script st_sig script_sig with
       | Error e -> Error e
       | Ok () ->
         let saved_stack = st_sig.stack in
-        let st_pub = create_eval_state ~tx ~input_index ~amount ~flags
+        let st_pub = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                        ~sig_version:SigVersionBase () in
         st_pub.stack <- saved_stack;
         begin match run_script st_pub script_pubkey with

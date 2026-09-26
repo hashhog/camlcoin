@@ -2206,6 +2206,9 @@ let verify_tx_scripts (mp : mempool) (tx : Types.transaction)
     | Some entry -> (entry.Utxo.value, entry.Utxo.script_pubkey)
     | None -> (0L, Cstruct.empty)
   ) tx.inputs in
+  (* One per-tx sighash cache shared by every input (Core:
+     PrecomputedTransactionData). *)
+  let txdata = Script.make_txdata ~prevouts tx in
 
   List.iteri (fun i inp ->
     if !error = None then begin
@@ -2232,7 +2235,7 @@ let verify_tx_scripts (mp : mempool) (tx : Types.transaction)
                   ~script_sig:inp.Types.script_sig
                   ~witness
                   ~amount:utxo_entry.Utxo.value
-                  ~flags ~prevouts () with
+                  ~flags ~prevouts ~txdata () with
           | Error msg ->
             error := Some (Printf.sprintf "Script verification failed for input %d: %s" i msg)
           | Ok false ->

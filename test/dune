@@ -285,3 +285,20 @@
  (name test_getdata_wtx)
  (modules test_getdata_wtx)
  (libraries camlcoin test_tmp alcotest lwt lwt.unix cstruct))
+
+; Differential proof for the per-tx precomputed sighash data (perf: BIP-143 /
+; BIP-341 hashes computed once per tx).  Needs mainnet block dumps; see the
+; header of the .ml.  Invoke explicitly:
+;   dune exec test/test_sighash_precomp_diff.exe -- <blocks-dir> [bip341_wallet_vectors.json]
+(executable
+ (name test_sighash_precomp_diff)
+ (modules test_sighash_precomp_diff)
+ (libraries camlcoin yojson))
+
+; Script-verification CPU microbenchmark over the same block dumps (uses only
+; APIs present before and after the precomputed-txdata change).
+;   dune exec test/bench_script_verify.exe -- <blocks-dir> [runs]
+(executable
+ (name bench_script_verify)
+ (modules bench_script_verify)
+ (libraries camlcoin))

@@ -1345,6 +1345,10 @@ let validate_tx_inputs (tx : Types.transaction) ~(lookup : utxo_lookup)
 
       let total_in = ref 0L in
 
+      (* One per-tx sighash cache shared by every input (Core:
+         PrecomputedTransactionData). *)
+      let txdata = Script.make_txdata ~prevouts tx in
+
       (* Second pass: verify scripts with prevouts context *)
       List.iteri (fun i inp ->
         if !error = None then begin
@@ -1391,7 +1395,7 @@ let validate_tx_inputs (tx : Types.transaction) ~(lookup : utxo_lookup)
                         ~script_sig:inp.Types.script_sig
                         ~witness
                         ~amount:utxo.value
-                        ~flags ~prevouts () with
+                        ~flags ~prevouts ~txdata () with
                 | Error msg ->
                   error := Some (TxScriptFailed (i, msg))
                 | Ok false ->
@@ -1456,6 +1460,7 @@ let cache_clear_global () : unit =
    W159 BUG-17 / W160 BUG-1: cache key uses wtxid (witness-covering),
    NOT txid (no-witness), to prevent SegWit-malleability cache poisoning. *)
 let verify_one_input
+    ?txdata
     ~(tx : Types.transaction) ~(flags : int)
     ~(prevouts : (int64 * Cstruct.t) list)
     ~(wtxid : Types.hash256)
@@ -1476,7 +1481,7 @@ let verify_one_input
              ~script_sig:inp.Types.script_sig
              ~witness
              ~amount:utxo.value
-             ~flags ~prevouts () with
+             ~flags ~prevouts ?txdata () with
     | Error msg -> Error (i, msg)
     | Ok false -> Error (i, "Script returned false")
     | Ok true ->
@@ -1486,6 +1491,7 @@ let verify_one_input
 (* Verify a slice of (index, input, utxo) triples in the current domain.
    Returns the first error encountered, or Ok (). *)
 let verify_input_slice
+    ?txdata
     ~(tx : Types.transaction) ~(flags : int)
     ~(prevouts : (int64 * Cstruct.t) list)
     ~(wtxid : Types.hash256)
@@ -1495,7 +1501,7 @@ let verify_input_slice
   List.fold_left (fun acc (i, inp, utxo) ->
     match acc with
     | Error _ as e -> e
-    | Ok () -> verify_one_input ~tx ~flags ~prevouts ~wtxid ~cache i inp utxo
+    | Ok () -> verify_one_input ?txdata ~tx ~flags ~prevouts ~wtxid ~cache i inp utxo
   ) (Ok ()) tasks
 
 (* ----------------------------------------------------------------------------
@@ -1537,6 +1543,7 @@ type batch_params = {
   bp_prevouts : (int64 * Cstruct.t) list;
   bp_wtxid : Types.hash256;
   bp_cache : Sig_cache.t;
+  bp_txdata : Script.precomputed_txdata;  (* shared by all slices of the batch *)
 }
 
 type script_check_pool = {
@@ -1596,7 +1603,7 @@ let pool_worker_loop (pool : script_check_pool) (my_index : int) : unit =
           verify_input_slice
             ~tx:params.bp_tx ~flags:params.bp_flags
             ~prevouts:params.bp_prevouts ~wtxid:params.bp_wtxid
-            ~cache:params.bp_cache slice
+            ~cache:params.bp_cache ~txdata:params.bp_txdata slice
         with e ->
           (* Never let a worker exception deadlock the submitter: surface it as
              an Error so pending still reaches 0.  Index -1 marks "no specific
@@ -1632,7 +1639,7 @@ let partition_tasks (tasks : (int * Types.tx_in * utxo) list) (n : int)
 
 (* Submit one batch synchronously and return its first error (deterministic:
    scanned in worker-index then in-slice order, identical to a serial fold). *)
-let pool_submit (pool : script_check_pool)
+let pool_submit ?txdata (pool : script_check_pool)
     (tx : Types.transaction) (flags : int)
     (prevouts : (int64 * Cstruct.t) list)
     (wtxid : Types.hash256) (cache : Sig_cache.t)
@@ -1640,7 +1647,7 @@ let pool_submit (pool : script_check_pool)
     : (unit, int * string) result =
   if pool.nworkers = 0 then
     (* No Domains: run the whole batch serially in the calling thread. *)
-    verify_input_slice ~tx ~flags ~prevouts ~wtxid ~cache tasks
+    verify_input_slice ?txdata ~tx ~flags ~prevouts ~wtxid ~cache tasks
   else begin
     (* Serialise the whole batch: only ONE submitter may drive the shared
        slices/results/params/generation state at a time.  Held across the
@@ -1659,9 +1666,12 @@ let pool_submit (pool : script_check_pool)
         Mutex.unlock pool.pool_mutex;
         Mutex.unlock pool.submit_mutex)
       (fun () ->
+    let txdata = match txdata with
+      | Some d -> d
+      | None -> Script.make_txdata ~prevouts tx in
     let params = {
       bp_tx = tx; bp_flags = flags; bp_prevouts = prevouts;
-      bp_wtxid = wtxid; bp_cache = cache;
+      bp_wtxid = wtxid; bp_cache = cache; bp_txdata = txdata;
     } in
     let slices = partition_tasks tasks pool.nworkers in
     Mutex.lock pool.pool_mutex;
@@ -1782,6 +1792,10 @@ type script_check_job = {
   prevouts : (int64 * Cstruct.t) list;
   flags : int;
   wtxid : Types.hash256;
+  (* Per-tx sighash cache, ONE record shared by every job of the same tx
+     (built in append_script_jobs).  None ⇒ verify_script builds a per-input
+     one (correct, just no cross-input sharing). *)
+  txdata : Script.precomputed_txdata option;
   mutable err : (int * string) option;
 }
 
@@ -1824,7 +1838,7 @@ let run_one_job (job : script_check_job) : unit =
   let cache = Sig_cache.get_global () in
   let r =
     try
-      verify_one_input
+      verify_one_input ?txdata:job.txdata
         ~tx:job.tx ~flags:job.flags ~prevouts:job.prevouts
         ~wtxid:job.wtxid ~cache
         job.input_idx job.inp job.utxo
@@ -2075,6 +2089,7 @@ let run_script_checks (jobs : script_check_job array) : script_check_result =
 
 let append_script_jobs acc ~tx ~tx_idx ~flags ~prevouts ~utxos =
   let wtxid = Crypto.compute_wtxid tx in
+  let txdata = Some (Script.make_txdata ~prevouts tx) in
   let rec loop j inps acc =
     match inps with
     | [] -> acc
@@ -2084,7 +2099,7 @@ let append_script_jobs acc ~tx ~tx_idx ~flags ~prevouts ~utxos =
         | None -> acc
         | Some utxo ->
           { tx; tx_idx; input_idx = j; inp; utxo; prevouts; flags; wtxid;
-            err = None } :: acc
+            txdata; err = None } :: acc
       in
       loop (j + 1) rest acc
   in
@@ -2136,6 +2151,8 @@ let verify_scripts_parallel_domain
          from the canonical tx's wtxid → cache miss → re-verify → reject). *)
       let wtxid = Crypto.compute_wtxid tx in
       let cache = Sig_cache.get_global () in
+      (* One per-tx sighash cache shared by every input / worker slice. *)
+      let txdata = Script.make_txdata ~prevouts tx in
       (* Decide serial-in-thread vs pool submission.  USE the previously-dead
          min_inputs_for_parallel threshold (fixes audit G3): below it the pool
          hand-off costs more than the saved secp256k1 work.  Also fall back to
@@ -2152,10 +2169,10 @@ let verify_scripts_parallel_domain
              Domain dies ⇒ permanent deadlock (pending never reaches 0).  This
              was latent under the single IBD submitter; the #8 at-tip pool with a
              concurrent path (or back-to-back tip submits) exposes it. *)
-          pool_submit pool tx flags prevouts wtxid cache tasks
+          pool_submit ~txdata pool tx flags prevouts wtxid cache tasks
         | _ ->
           (* Serial fallback — no Domains spawned. *)
-          verify_input_slice ~tx ~flags ~prevouts ~wtxid ~cache tasks
+          verify_input_slice ~txdata ~tx ~flags ~prevouts ~wtxid ~cache tasks
       in
       match result with
       | Ok () -> Ok ()

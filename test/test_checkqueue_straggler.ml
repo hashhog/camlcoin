@@ -59,7 +59,7 @@ let test_empty_generation_no_straggler () =
                      Cstruct.blit wtxid 0 w 0 32;
                      Cstruct.set_uint8 w 0 (iter land 0xff);
                      Cstruct.set_uint8 w 1 (iter lsr 8); w);
-            err = None }) tx.inputs) in
+            txdata = None; err = None }) tx.inputs) in
         let r = Validation.run_script_check_queue q jobs in
         if r.ok then incr misses
       done;

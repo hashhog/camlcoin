@@ -95,7 +95,7 @@ let jobs_of_spks (spks : Cstruct.t list) : Validation.script_check_job array =
     | inp :: inps, utxo :: utxos ->
       zip (i + 1) inps utxos
         ({ Validation.tx; tx_idx = 0; input_idx = i; inp; utxo; prevouts;
-           flags = 0; wtxid; err = None } :: acc)
+           flags = 0; wtxid; txdata = None; err = None } :: acc)
     | _ -> assert false
   in
   Array.of_list (zip 0 tx.inputs utxos [])

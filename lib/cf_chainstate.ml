@@ -394,6 +394,9 @@ let put_chain_tx_count (t : t) (hash : Types.hash256) (n : int64) =
   Rocksdb.cf_put t.db t.cfh_chain_state (chain_tx_key hash)
     (Bytes.to_string buf)
 
+let delete_chain_tx_count (t : t) (hash : Types.hash256) =
+  Rocksdb.cf_delete t.db t.cfh_chain_state (chain_tx_key hash)
+
 let get_chain_tx_count (t : t) (hash : Types.hash256) : int64 option =
   match Rocksdb.cf_get t.db t.cfh_chain_state (chain_tx_key hash) with
   | None -> None

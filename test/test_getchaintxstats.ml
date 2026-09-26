@@ -474,6 +474,50 @@ let test_au_height_matches_core () =
       Alcotest.(check int) "944183 Core getchaintxstats" 1_335_914_531
         (field_int fields "txcount"))
 
+(* ---- 8/9. A corrected seed must not leave descendants poisoned ---- *)
+
+(* The live mainnet shape (R5 gaps 2026-09-25: txcount 1,444,689,297 vs Core
+   1,446,603,828 at 968594): the base was stored with the old placeholder and
+   every connected descendant stored parent + nTx on top of it. Core never
+   persists m_chain_tx_count — it recomputes it from nTx at load
+   (node/blockstorage.cpp:440-487) — so the stale descendants must be
+   recomputed from the corrected seed, or, past a gap where nTx is unknown,
+   reported as unknown (txcount omitted, rpc/blockchain.cpp:1878). *)
+let plant_poisoned ctx ~gap =
+  let hashes = plant_headers ctx ~tip_height:20 in
+  let placeholder = 900L in
+  Storage.ChainDB.store_chain_tx_count ctx.chain.db hashes.(10) placeholder;
+  for h = 11 to 20 do
+    if Some h <> gap then Storage.ChainDB.store_block_ntx ctx.chain.db hashes.(h) 3;
+    Storage.ChainDB.store_chain_tx_count ctx.chain.db hashes.(h)
+      (Int64.add placeholder (Int64.of_int (3 * (h - 10))))
+  done;
+  hashes
+
+let test_corrected_seed_rewrites_poisoned_descendants () =
+  with_ctx Consensus.regtest (fun ctx ->
+      let hashes = plant_poisoned ctx ~gap:None in
+      let p = au_params ~height:10 ~hash:hashes.(10) ~chain_tx_count:1000L in
+      with_extra_regtest_au p (fun () ->
+          let fields =
+            assoc (rpc_ok ctx "getchaintxstats" [ `Int 0; `String (display hashes.(20)) ])
+          in
+          Alcotest.(check int) "tip = corrected seed 1000 + 10*3" 1030
+            (field_int fields "txcount")))
+
+let test_corrected_seed_gap_leaves_unknown () =
+  with_ctx Consensus.regtest (fun ctx ->
+      let hashes = plant_poisoned ctx ~gap:(Some 15) in
+      let p = au_params ~height:10 ~hash:hashes.(10) ~chain_tx_count:1000L in
+      with_extra_regtest_au p (fun () ->
+          let at h =
+            txcount_of
+              (assoc (rpc_ok ctx "getchaintxstats" [ `Int 0; `String (display hashes.(h)) ]))
+          in
+          Alcotest.(check (option int)) "below the gap: corrected" (Some 1012) (at 14);
+          Alcotest.(check (option int))
+            "above the gap: unknown, never the poisoned 930" None (at 20)))
+
 let () =
   Alcotest.run "getchaintxstats stored cumulative + concurrent RPC"
     [
@@ -491,6 +535,10 @@ let () =
             test_944183_seed_is_core_not_placeholder;
           Alcotest.test_case "AU heights match Core" `Quick
             test_au_height_matches_core;
+          Alcotest.test_case "corrected seed rewrites poisoned descendants" `Quick
+            test_corrected_seed_rewrites_poisoned_descendants;
+          Alcotest.test_case "corrected seed past a gap is unknown" `Quick
+            test_corrected_seed_gap_leaves_unknown;
         ] );
       ( "latency",
         [

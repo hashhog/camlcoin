@@ -1003,6 +1003,9 @@ module ChainDB = struct
   let get_chain_tx_count t (hash : Types.hash256) : int64 option =
     Cf_chainstate.get_chain_tx_count t.cf hash
 
+  let delete_chain_tx_count t (hash : Types.hash256) =
+    Cf_chainstate.delete_chain_tx_count t.cf hash
+
   (* nTx from the block body's CompactSize, without deserialising the
      transactions. Block wire format is 80-byte header + CompactSize(nTx)
      + txs (serialize.ml). Used when the ntx index is missing but the

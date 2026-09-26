@@ -275,3 +275,13 @@
  (name test_handshake_core_parity)
  (modules test_handshake_core_parity)
  (libraries camlcoin alcotest lwt lwt.unix cstruct))
+
+; getdata serving decision per inv type (Core ProcessGetData parity):
+; MSG_WTX looked up by WTXID and served with witness, MSG_TX / MSG_BLOCK
+; served without witness, MSG_WITNESS_* with witness, misses batched into
+; one notfound.  Drives the real Peer.handle_getdata over a socketpair
+; against a real mempool.
+(test
+ (name test_getdata_wtx)
+ (modules test_getdata_wtx)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix cstruct))

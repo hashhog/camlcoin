@@ -1667,15 +1667,54 @@ let check_rate_limit (peer : peer) : bool =
     peer.msg_count_window <= 500
   end
 
+(* Witness-stripped copy of a tx: what Core puts on the wire for
+   TX_NO_WITNESS serialization (MSG_TX / MSG_BLOCK getdata). *)
+let strip_tx_witness (tx : Types.transaction) : Types.transaction =
+  if tx.Types.witnesses = [] then tx else { tx with Types.witnesses = [] }
+
+let strip_block_witness (b : Types.block) : Types.block =
+  { b with Types.transactions = List.map strip_tx_witness b.Types.transactions }
+
+(* The serving decision for a tx-class getdata item — Core
+   net_processing.cpp ProcessGetData / FindTxForGetData:
+     - MSG_WTX (5):              hash is a WTXID -> lookup by wtxid, WITH witness
+     - MSG_WITNESS_TX (0x40000001): hash is a txid -> lookup by txid, WITH witness
+     - MSG_TX (1):               hash is a txid -> lookup by txid, NO witness
+       ("WTX and WITNESS_TX imply we serialize with witness":
+        inv.IsMsgTx() ? TX_NO_WITNESS : TX_WITH_WITNESS)
+   Returns the tx exactly as it must be serialized, or None -> notfound.
+   Previously every type went through one txid-keyed lookup, so MSG_WTX for
+   any segwit tx (wtxid <> txid) always missed and camlcoin answered
+   notfound to every modern Core peer — no segwit tx relayed onward. *)
+let getdata_tx_response
+    ~(lookup_tx : Types.hash256 -> Types.transaction option)
+    ~(lookup_wtx : Types.hash256 -> Types.transaction option)
+    (iv : P2p.inv_vector) : Types.transaction option =
+  match iv.P2p.inv_type with
+  | P2p.InvWtx -> lookup_wtx iv.P2p.hash
+  | P2p.InvWitnessTx -> lookup_tx iv.P2p.hash
+  | P2p.InvTx -> Option.map strip_tx_witness (lookup_tx iv.P2p.hash)
+  | _ -> None
+
+(* Block serving decision: Core ProcessGetBlockData sends MSG_BLOCK with
+   TX_NO_WITNESS and MSG_WITNESS_BLOCK with TX_WITH_WITNESS. *)
+let getdata_block_payload (inv_type : P2p.inv_type) (b : Types.block)
+    : Types.block =
+  match inv_type with
+  | P2p.InvBlock -> strip_block_witness b
+  | _ -> b
+
 (* Getdata handler (Gap 11) — process inventory requests from peers.
-   lookup_block and lookup_tx return serialized data as Cstruct.t option;
+   lookup_block returns serialized data as Cstruct.t option; lookup_tx
+   (by txid) and lookup_wtx (by wtxid) return the mempool tx;
    the caller (higher-level code) owns storage/mempool access.
    tip_height is the current validated tip height (used for depth checks).
    lookup_block_height returns the height of a block given its hash (or None
    if unknown); used for MAX_CMPCTBLOCK_DEPTH and MAX_BLOCKTXN_DEPTH guards. *)
 let handle_getdata (peer : peer) (items : P2p.inv_vector list)
     ~(lookup_block : Types.hash256 -> Cstruct.t option)
-    ~(lookup_tx : Types.hash256 -> Cstruct.t option)
+    ~(lookup_tx : Types.hash256 -> Types.transaction option)
+    ~(lookup_wtx : Types.hash256 -> Types.transaction option)
     ~(tip_height : int)
     ~(lookup_block_height : Types.hash256 -> int option)
     : unit Lwt.t =
@@ -1693,17 +1732,15 @@ let handle_getdata (peer : peer) (items : P2p.inv_vector list)
         | Some data ->
           let r = Serialize.reader_of_cstruct data in
           let block = Serialize.deserialize_block r in
-          send_message peer (P2p.BlockMsg block)
+          send_message peer
+            (P2p.BlockMsg (getdata_block_payload iv.inv_type block))
         | None ->
           not_found := iv :: !not_found;
           Lwt.return_unit
         end
       | P2p.InvTx | P2p.InvWtx | P2p.InvWitnessTx ->
-        begin match lookup_tx iv.hash with
-        | Some data ->
-          let r = Serialize.reader_of_cstruct data in
-          let tx = Serialize.deserialize_transaction r in
-          send_message peer (P2p.TxMsg tx)
+        begin match getdata_tx_response ~lookup_tx ~lookup_wtx iv with
+        | Some tx -> send_message peer (P2p.TxMsg tx)
         | None ->
           not_found := iv :: !not_found;
           Lwt.return_unit

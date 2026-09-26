@@ -1740,19 +1740,16 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
              Some (Serialize.writer_to_cstruct w))
       in
       let lookup_tx hash =
-        match Mempool.get mempool hash with
-        | None -> None
-        | Some entry ->
-          let w = Serialize.writer_create () in
-          Serialize.serialize_transaction w entry.Mempool.tx;
-          Some (Serialize.writer_to_cstruct w)
+        Option.map (fun e -> e.Mempool.tx) (Mempool.get mempool hash) in
+      let lookup_wtx wtxid =
+        Option.map (fun e -> e.Mempool.tx) (Mempool.get_by_wtxid mempool wtxid)
       in
       let tip_height = match chain.tip with
         | Some t -> t.height
         | None   -> 0
       in
       let lookup_block_height hash = Sync.lookup_block_height chain hash in
-      Peer.handle_getdata peer items ~lookup_block ~lookup_tx
+      Peer.handle_getdata peer items ~lookup_block ~lookup_tx ~lookup_wtx
         ~tip_height ~lookup_block_height
     | _ -> Lwt.return_unit);
 
@@ -2354,13 +2351,21 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       end
     | P2p.InvMsg items when chain.sync_state = Sync.FullySynced ->
       (* Request unknown transactions announced via inv *)
+      (* Core (net_processing.cpp ToGenTxid / GetFetchFlags): a MSG_WTX inv
+         carries a WTXID and is fetched as MSG_WTX; a MSG_TX inv carries a
+         TXID and is fetched as MSG_WITNESS_TX.  Previously every tx inv was
+         re-requested as MSG_WTX with whatever hash it carried (a txid for
+         MSG_TX invs, which a Core peer then looks up as a wtxid), and the
+         already-have check was txid-keyed, so a segwit wtxid inv never
+         matched the mempool. *)
       let tx_requests = List.filter_map (fun (iv : P2p.inv_vector) ->
-        if (iv.inv_type = P2p.InvTx || iv.inv_type = P2p.InvWtx
-            || iv.inv_type = P2p.InvWitnessTx)
-           && not (Mempool.contains mempool iv.hash) then
+        match iv.inv_type with
+        | P2p.InvWtx when not (Mempool.contains_wtxid mempool iv.hash) ->
           Some { P2p.inv_type = P2p.InvWtx; hash = iv.hash }
-        else
-          None
+        | (P2p.InvTx | P2p.InvWitnessTx)
+          when not (Mempool.contains mempool iv.hash) ->
+          Some { P2p.inv_type = P2p.InvWitnessTx; hash = iv.hash }
+        | _ -> None
       ) items in
       (* Core: MAX_GETDATA_SZ = 1000 (protocol.h:482) — batch outgoing
          getdata to avoid sending oversized messages when a peer announces

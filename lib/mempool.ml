@@ -95,6 +95,12 @@ type mempool = {
   max_orphans : int;
   (* Spending index: outpoint (txid_str * vout) -> spending txid_str for O(1) conflict detection *)
   map_next_tx : (string * int32, string) Hashtbl.t;
+  (* wtxid_str -> txid_str secondary index over [entries], so a MSG_WTX
+     getdata (BIP-339: the hash IS a wtxid) can find a segwit tx.  Core looks
+     a GenTxid::Wtxid up via the mempool's wtxid index (txmempool.h
+     get_iter_from_wtxid).  Maintained wherever [entries] is inserted into /
+     removed from / cleared. *)
+  by_wtxid : (string, string) Hashtbl.t;
   (* Reverse parent->children index (#135 step 1): for each parent txid_key,
      a set (Hashtbl-as-set with unit values) of child txid_keys that depend
      on it. Maintained in add_transaction (insert) and remove_transaction
@@ -341,6 +347,7 @@ let create ?(require_standard=true) ?(verify_scripts=true)
     orphan_by_txid = Hashtbl.create 100;
     max_orphans = 100;
     map_next_tx = Hashtbl.create 10_000;
+    by_wtxid = Hashtbl.create 10_000;
     zmq_sequence = 0L;
     zmq_notifier;
     on_eviction;
@@ -364,6 +371,28 @@ let contains (mp : mempool) (txid : Types.hash256) : bool =
 (* Get a transaction from the mempool *)
 let get (mp : mempool) (txid : Types.hash256) : mempool_entry option =
   Hashtbl.find_opt mp.entries (Cstruct.to_string txid)
+
+(* Get a transaction from the mempool by WTXID (BIP-339 MSG_WTX).
+   Core: CTxMemPool::get / exists with a GenTxid::Wtxid (txmempool.h
+   get_iter_from_wtxid).  Uses the [by_wtxid] index; falls back to the txid
+   table because a non-witness tx has wtxid == txid (and covers entries
+   injected directly via [get_entries] in tests).  The entry's own wtxid is
+   re-checked so a stale index slot can never serve the wrong tx. *)
+let get_by_wtxid (mp : mempool) (wtxid : Types.hash256) : mempool_entry option =
+  let key = Cstruct.to_string wtxid in
+  let check = function
+    | Some e when Cstruct.equal e.wtxid wtxid -> Some e
+    | _ -> None
+  in
+  match Hashtbl.find_opt mp.by_wtxid key with
+  | Some txid_key ->
+    (match check (Hashtbl.find_opt mp.entries txid_key) with
+     | Some e -> Some e
+     | None -> check (Hashtbl.find_opt mp.entries key))
+  | None -> check (Hashtbl.find_opt mp.entries key)
+
+let contains_wtxid (mp : mempool) (wtxid : Types.hash256) : bool =
+  get_by_wtxid mp wtxid <> None
 
 (* ============================================================================
    UTXO Lookup (Chain + Mempool)
@@ -473,6 +502,10 @@ let rec remove_transaction (mp : mempool) (txid : Types.hash256) : unit =
         ) ancestor_entry.depends_on
     done;
     Hashtbl.remove mp.entries txid_key;
+    (let wk = Cstruct.to_string entry.wtxid in
+     match Hashtbl.find_opt mp.by_wtxid wk with
+     | Some tk when tk = txid_key -> Hashtbl.remove mp.by_wtxid wk
+     | _ -> ());
     (* #135 step 1: remove this tx from the children-set of each parent in
        the reverse children index. *)
     List.iter (fun parent_txid ->
@@ -2757,6 +2790,8 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
 
             if not dry_run then begin
               Hashtbl.replace mp.entries txid_key entry;
+              Hashtbl.replace mp.by_wtxid
+                (Cstruct.to_string entry.wtxid) txid_key;
               (* #135 step 1: register this tx as a child of each parent in
                  the reverse children index, so get_descendants is O(D). *)
               List.iter (fun parent_txid ->
@@ -4192,6 +4227,7 @@ let update_median_time (mp : mempool) (mtp : int32) : unit =
 
 let clear (mp : mempool) : unit =
   Hashtbl.clear mp.entries;
+  Hashtbl.clear mp.by_wtxid;
   mp.total_weight <- 0;
   mp.total_fee <- 0L
 

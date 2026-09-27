@@ -375,6 +375,22 @@ let backstop_due ~reason:_ =
   >= compact_heap_threshold_bytes
   && Unix.gettimeofday () -. !last_compact_time >= compact_min_interval_s
 
+(* IBD forward-sync compaction trigger (sync.ml run_ibd, checked every 16
+   connected blocks).  Due only when the major heap is over the backstop
+   ceiling AND at least twice its size right after the previous IBD
+   compaction: the second clause keeps a live set that is itself above the
+   ceiling (a large --dbcache) from compacting on every check. *)
+let ibd_post_compact_bytes = ref 0.0
+
+let ibd_compaction_due () =
+  let heap = float_of_int (Gc.quick_stat ()).Gc.heap_words *. 8.0 in
+  heap >= compact_heap_threshold_bytes
+  && heap >= 2.0 *. !ibd_post_compact_bytes
+
+let note_ibd_compacted () =
+  ibd_post_compact_bytes :=
+    float_of_int (Gc.quick_stat ()).Gc.heap_words *. 8.0
+
 (* Fire-and-forget ceiling backstop (non-Lwt callers / hot path). *)
 let maybe_backstop ~reason =
   if backstop_due ~reason then Backstop.request ~reason

@@ -6715,6 +6715,7 @@ let run_ibd ?(shutdown_flag : bool ref option)
   (* Height of the last heap compaction (see the compaction block in the
      progress logger below). *)
   let last_compact_height = ref 0 in
+  let last_trim_height = ref 0 in
   (* Spawn the persistent validation worker Domain (wave 11 option B).
      The worker runs block validation off the Lwt main thread; all ibd.*
      mutation remains on the Lwt thread. *)
@@ -6891,27 +6892,39 @@ let run_ibd ?(shutdown_flag : bool ref option)
            MALLOC_ARENA_MAX=2 + MALLOC_TRIM_THRESHOLD_=131072 so glibc returns
            that memory. With BOTH parts, forward-sync RSS holds flat ~17G (proven
            over height 946864->947044) vs the old unbounded 36G+. *)
-        let compact_interval = 16 in
-        if ibd.chain.blocks_synced - !last_compact_height >= compact_interval
+        (* 2026-09-26: the unconditional every-16-blocks Gc.compact is gone.
+           Measured on the 515000 slice it fired every ~20 blocks at 7-14 s
+           each (compact_stall + trim, ~600 s per 1000 blocks) and mostly
+           re-compacted the same ~3.5 GB live set: the 1024 parsed blocks the
+           download queue buffered (now capped, [max_blocks_buffered_ahead])
+           plus the UTXO LRU.  The incremental major GC (space_overhead, set in
+           bin/main.ml) already bounds the heap at a multiple of the live set;
+           compaction is now only a backstop when the major heap crosses the
+           Gc_guard ceiling (CAMLCOIN_COMPACT_THRESHOLD_MB, default 5000) AND
+           has at least doubled since the last compaction, so a live set above
+           the ceiling cannot make it fire every check.  The off-heap half of
+           the 2026-06-07 fix is kept on a coarser cadence: malloc_trim(0)
+           every [trim_interval] blocks returns freed glibc arena memory
+           (transient Bigarrays) to the OS.  Memory management only — no
+           effect on what is validated. *)
+        let check_interval = 16 and trim_interval = 256 in
+        if ibd.chain.blocks_synced - !last_compact_height >= check_interval
         then begin
           last_compact_height := ibd.chain.blocks_synced;
-          (* Gc.compact frees the OCaml-side proxies for the millions of
-             transient validation Bigarrays; malloc_trim(0) then returns that
-             now-unused glibc arena memory to the OS. Without this active trim,
-             glibc retains it (passive MALLOC_TRIM_THRESHOLD_ is not aggressive
-             enough), leaving a ~6MB/block off-heap RSS creep that would still
-             reach the cgroup cap before tip.
-             2026-06-09: routed through [Gc_guard.compact_now] (same
-             Gc.compact + Rocksdb.malloc_trim pair) so this cadence stamps
-             the SHARED [Gc_guard.last_compact_time] — the hot-path checks'
-             anti-thrash floor then prevents an IBD-cadence compact and a
-             hot-path compact from firing back-to-back. *)
-          Gc_guard.compact_now ~reason:"ibd-cadence";
-          let st = Gc.quick_stat () in
-          Logs.info (fun m ->
-            m "compacted heap at height %d: rss=%.0fMB ocaml_heap=%.0fMB"
-              ibd.chain.blocks_synced (Gc_guard.rss_mb ())
-              (Gc_guard.mb_of_words st.Gc.heap_words))
+          if Gc_guard.ibd_compaction_due () then begin
+            Connect_prof.span Connect_prof.p_compact (fun () ->
+              Gc_guard.compact_now ~reason:"ibd-heap-ceiling");
+            Gc_guard.note_ibd_compacted ();
+            let st = Gc.quick_stat () in
+            Logs.info (fun m ->
+              m "compacted heap at height %d: rss=%.0fMB ocaml_heap=%.0fMB"
+                ibd.chain.blocks_synced (Gc_guard.rss_mb ())
+                (Gc_guard.mb_of_words st.Gc.heap_words))
+          end else if ibd.chain.blocks_synced - !last_trim_height
+                      >= trim_interval then begin
+            last_trim_height := ibd.chain.blocks_synced;
+            Connect_prof.span Connect_prof.p_compact Rocksdb.malloc_trim
+          end
         end
       end else begin
         let now = Unix.gettimeofday () in

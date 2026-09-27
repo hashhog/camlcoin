@@ -1886,9 +1886,14 @@ let claim_and_run_task (q : script_check_queue) (n : int) (task : int -> unit)
         let inflight = batch_end - got in
         let old = Atomic.fetch_and_add q.in_flight inflight in
         bump_max_in_flight q (old + inflight);
+        let prof =
+          Connect_prof.enabled && Atomic.get Connect_prof.counting_scripts in
+        let tb = if prof then Connect_prof.mono_ns () else 0 in
         for i = got to batch_end - 1 do
           task i
         done;
+        if prof then
+          Connect_prof.add_script_busy_ns (Connect_prof.mono_ns () - tb);
         ignore (Atomic.fetch_and_add q.in_flight (-inflight));
         loop ()
       end
@@ -2842,7 +2847,9 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
      ==================================================================== *)
   else begin
   (* First do context-free + contextual header checks *)
-  match check_block ~network block height ~expected_bits ~median_time ~prev_block_time ~skip_pow () with
+  match Connect_prof.span Connect_prof.p_check_block (fun () ->
+          check_block ~network block height ~expected_bits ~median_time
+            ~prev_block_time ~skip_pow ()) with
   | Error e -> Error e
   | Ok () ->
     (* Build local UTXO set for intra-block spending *)
@@ -2852,9 +2859,10 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
     (* Compute txids ONCE up front (Fix 1) *)
     let n_txs = List.length block.transactions in
     let txid_arr = Array.make n_txs Cstruct.empty in
+    Connect_prof.span Connect_prof.p_txid (fun () ->
     List.iteri (fun i tx ->
       txid_arr.(i) <- Crypto.compute_txid tx
-    ) block.transactions;
+    ) block.transactions);
 
     (* Compute block hash once for BIP-30 repeat-block check. *)
     let block_hash_for_bip30 = Crypto.compute_block_hash block.header in
@@ -2873,6 +2881,7 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
        in Core's order (validation.cpp ConnectBlock: BIP-30 loop, then per-tx
        view.HaveInputs / CheckTxInputs / SequenceLocks / CheckInputScripts). *)
     let base_lookup =
+      Connect_prof.span Connect_prof.p_prefetch @@ fun () ->
       match prefetch_base with
       | None -> base_lookup
       | Some prefetch ->
@@ -2946,6 +2955,7 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
        the same as a serial left-to-right fold. *)
     let script_jobs : script_check_job list ref = ref [] in
 
+    let t_txloop = if Connect_prof.enabled then Connect_prof.now () else 0.0 in
     List.iteri (fun i (tx : Types.transaction) ->
       if !error = None then begin
         let txid = txid_arr.(i) in
@@ -3135,12 +3145,23 @@ let validate_block_with_utxos ~network:(network : Consensus.network_config) (blo
         end
       end
     ) block.transactions;
+    if Connect_prof.enabled then
+      Connect_prof.add Connect_prof.p_txloop (Connect_prof.now () -. t_txloop);
 
     match !error with
     | Some e -> Error e
     | None ->
       let jobs = Array.of_list (List.rev !script_jobs) in
-      let script_r = run_script_checks jobs in
+      if Connect_prof.enabled then
+        Connect_prof.script_jobs := !Connect_prof.script_jobs + Array.length jobs;
+      let script_r =
+        Connect_prof.span Connect_prof.p_scripts (fun () ->
+          if Connect_prof.enabled then Atomic.set Connect_prof.counting_scripts true;
+          Fun.protect
+            ~finally:(fun () ->
+              if Connect_prof.enabled then
+                Atomic.set Connect_prof.counting_scripts false)
+            (fun () -> run_script_checks jobs)) in
       if not script_r.ok then
         let job = jobs.(script_r.first_fail_index) in
         Error (BlockTxValidationFailed

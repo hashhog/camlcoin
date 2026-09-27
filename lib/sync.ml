@@ -4192,6 +4192,12 @@ let process_downloaded_blocks ?(max_blocks = 1)
         (* Validate the block *)
         let height = entry.height in
         let t0 = Unix.gettimeofday () in
+        let tp = ref t0 in
+        let mark id =
+          if Connect_prof.enabled then begin
+            let t = Unix.gettimeofday () in
+            Connect_prof.add id (t -. !tp); tp := t
+          end in
         (* Compute expected difficulty via the block's own parent ancestry
            (hash-linked walk), NEVER the active-chain height index: the index
            does not cover header-ahead-of-block heights during catch-up, so an
@@ -4216,6 +4222,7 @@ let process_downloaded_blocks ?(max_blocks = 1)
           if skip_scripts then 0
           else Consensus.get_block_script_flags ~block_hash:entry.hash height ibd.chain.network
         in
+        mark Connect_prof.p_pre;
         let%lwt vresult =
           match worker with
           | Some w ->
@@ -4246,6 +4253,7 @@ let process_downloaded_blocks ?(max_blocks = 1)
               | Validation.AB_ok (fees, txid_arr, spent) -> Ok (fees, txid_arr, spent)
               | Validation.AB_err e -> Error e)
         in
+        mark Connect_prof.p_validate;
         (match vresult with
          | Ok (_fees, txid_arr, spent_utxo_list) ->
            let ibd_mode = skip_scripts in
@@ -4271,10 +4279,12 @@ let process_downloaded_blocks ?(max_blocks = 1)
               spending tx] for every non-coinbase input. Mirrors Core's
               [TxoSpenderIndex::CustomAppend]. *)
            txospender_connect_if_enabled ibd.chain ~block ~height;
+           mark Connect_prof.p_misc;
            (* Fix 3: Skip block/undo storage during assume-valid IBD *)
            if not ibd_mode then begin
              (* Store block *)
              Storage.ChainDB.store_block ibd.chain.db entry.hash block;
+             mark Connect_prof.p_store;
              (* Build undo data from validation's spent_utxo_list (Fix 1) *)
              let spent_by_tx : (int, (Types.outpoint * Utxo.utxo_entry) list) Hashtbl.t =
                Hashtbl.create 16 in
@@ -4315,7 +4325,8 @@ let process_downloaded_blocks ?(max_blocks = 1)
              let uw = Serialize.writer_create () in
              Utxo.serialize_undo_data uw undo;
              Storage.ChainDB.store_undo_data ibd.chain.db entry.hash
-               (Serialize.writer_to_string uw)
+               (Serialize.writer_to_string uw);
+             mark Connect_prof.p_undo
            end;
            (* Update UTXOs - add new outputs, delete spent inputs *)
            (* Fix 2: Reuse txids from validation instead of recomputing *)
@@ -4395,6 +4406,7 @@ let process_downloaded_blocks ?(max_blocks = 1)
                end
              end
            ) block.transactions;
+           mark Connect_prof.p_utxo;
            (* Update chain state *)
            entry.download_state <- Validated;
            ibd.next_process_height <- ibd.next_process_height + 1;
@@ -4437,6 +4449,7 @@ let process_downloaded_blocks ?(max_blocks = 1)
              | Some utxo -> Utxo.OptimizedUtxoSet.dirty_count utxo > 500_000
              | None -> false
            in
+           mark Connect_prof.p_misc;
            if ibd.blocks_since_flush >= utxo_flush_interval || dirty_too_large then begin
              flush_utxos ibd;
              ibd.blocks_since_flush <- 0;
@@ -4448,12 +4461,26 @@ let process_downloaded_blocks ?(max_blocks = 1)
                 reclaim short-lived allocations without pausing for seconds. *)
              Gc.major ()
            end;
+           mark Connect_prof.p_flush;
            (* Notify ZMQ subscribers about block connect *)
            zmq_notify_block ibd block entry.hash true;
            (* Check for orphan blocks that depend on this one *)
            ignore (process_orphan_blocks ibd entry.hash);
            (* Remove validated entries from queue *)
            queue_remove_validated ibd;
+           mark Connect_prof.p_misc;
+           Connect_prof.block_done ~height
+             ~n_tx:(List.length block.transactions)
+             ~extra:(fun () ->
+               let dl = ref 0 and rq = ref 0 in
+               Queue.iter (fun e -> match e.download_state with
+                 | Downloaded _ -> incr dl | Requested _ -> incr rq | _ -> ())
+                 ibd.block_queue;
+               Printf.sprintf "queue=%d downloaded=%d requested=%d \
+                               in_flight=%d orphans=%d"
+                 (Queue.length ibd.block_queue) !dl !rq
+                 ibd.total_blocks_in_flight
+                 (Hashtbl.length ibd.orphan_blocks)) ();
            step ()
          | Error e ->
            let err_str = Validation.block_error_to_string e in

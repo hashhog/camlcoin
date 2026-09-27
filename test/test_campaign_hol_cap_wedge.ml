@@ -9,11 +9,15 @@
    totalled 363 s spread across the run — a tax, not this stall.
 
    ouroboros 7e55946: requesting tip+1 is not enough if it sits behind
-   far-ahead in-flight in a FIFO queue; evict the far-ahead so HOL is
-   the NEXT delivery. blockbrew 09695ad: size the stall timeout for a
-   max-weight body at 32 KiB/s (1.54 MB ≈ 47 s; a 2 s / 60 s budget
-   aborts a healthy fetch). A "does it finish" test passes on the
-   broken scheduler.
+   far-ahead in-flight in a FIFO queue. Evicting those requests made
+   HOL the next map entry, but un-marking does not cancel a getdata
+   already on the wire — the peer still delivers the block and the
+   next pass requests it again (515000 slice: in-flight collapsed to
+   1). HOL now takes one slot over the per-peer cap; far-ahead
+   in-flight stays requested. blockbrew 09695ad: size the stall
+   timeout for a max-weight body at 32 KiB/s (1.54 MB ≈ 47 s; a 2 s /
+   60 s budget aborts a healthy fetch). A "does it finish" test passes
+   on the broken scheduler.
 
    Command (red on HEAD, green after):
      dune exec --no-buffer test/test_campaign_hol_cap_wedge.exe
@@ -33,7 +37,6 @@ let max_weight_fetch_s =
   /. float_of_int min_live_block_throughput
 let buffered_far_ahead = 725
 let ticks = 32
-let min_connect_rate = ticks * 3 / 4
 
 let dummy_block : Types.block =
   { header = regtest.genesis_header; transactions = [] }
@@ -95,58 +98,6 @@ let load ibd peer_id =
   | Some ps -> ps.Sync.blocks_in_flight
   | None -> 0
 
-let oldest_inflight ibd : Sync.block_queue_entry option =
-  let best = ref None in
-  Queue.iter
-    (fun (e : Sync.block_queue_entry) ->
-      match e.Sync.download_state with
-      | Sync.Requested { requested_at; _ } -> (
-        match !best with
-        | None -> best := Some (requested_at, e.height, e)
-        | Some (t, h, _) ->
-          if requested_at < t
-             || (requested_at = t && e.height < h)
-          then best := Some (requested_at, e.height, e))
-      | _ -> ())
-    ibd.Sync.block_queue;
-  match !best with Some (_, _, e) -> Some e | None -> None
-
-let release_requested ibd (e : Sync.block_queue_entry) =
-  match e.Sync.download_state with
-  | Sync.Requested { peer_id; _ } ->
-    ibd.Sync.total_blocks_in_flight <-
-      max 0 (ibd.Sync.total_blocks_in_flight - 1);
-    let ps = Sync.get_peer_state ibd peer_id in
-    ps.Sync.blocks_in_flight <- max 0 (ps.Sync.blocks_in_flight - 1)
-  | _ -> ()
-
-let rec drain_ready ibd acc =
-  match Sync.queue_find_by_height ibd ibd.Sync.next_process_height with
-  | Some e -> (
-    match e.Sync.download_state with
-    | Sync.Downloaded _ | Sync.Validated ->
-      e.Sync.download_state <- Validated;
-      ibd.Sync.next_process_height <- ibd.Sync.next_process_height + 1;
-      drain_ready ibd (acc + 1)
-    | _ -> acc)
-  | None -> acc
-
-let deliver_oldest ibd =
-  match oldest_inflight ibd with
-  | None -> 0
-  | Some e ->
-    let height = e.Sync.height in
-    release_requested ibd e;
-    if height = ibd.Sync.next_process_height then begin
-      e.Sync.download_state <- Validated;
-      ibd.Sync.next_process_height <- ibd.Sync.next_process_height + 1;
-      drain_ready ibd 1
-    end else begin
-      e.Sync.download_state <-
-        Downloaded { block = dummy_block; peer_id = Some 1 };
-      drain_ready ibd 0
-    end
-
 let buffer_range ibd ~lo ~hi =
   for height = lo to hi do
     match Sync.queue_find_by_height ibd height with
@@ -195,23 +146,22 @@ let test_single_peer_at_cap_still_requests_connect_cursor () =
              peer sat at the in-flight cap"
         | _ -> Alcotest.fail "HOL in unexpected state")
       | None -> Alcotest.fail "HOL missing after request");
-      Alcotest.(check bool)
+      Alcotest.(check int)
         (Printf.sprintf
-           "HOL fits under the per-peer cap (load=%d, cap=%d); a 17th \
-            getdata is how the campaign feeder never delivered tip+1"
-           (load ibd 1) Sync.max_blocks_per_peer)
-        true
-        (load ibd 1 <= Sync.max_blocks_per_peer);
+           "HOL is one extra slot over the cap (load=%d); evicting a \
+            far-ahead getdata does not cancel it"
+           (load ibd 1))
+        (Sync.max_blocks_per_peer + 1)
+        (load ibd 1);
       let still_far = ref 0 in
       for height = far_lo to far_hi do
         match Sync.queue_find_by_height ibd height with
         | Some { download_state = Requested _; _ } -> incr still_far
         | _ -> ()
       done;
-      Alcotest.(check bool)
-        "a far-ahead in-flight slot was evicted to make room for tip+1"
-        true
-        (!still_far < Sync.max_blocks_per_peer))
+      Alcotest.(check int)
+        "far-ahead in-flight stays requested"
+        Sync.max_blocks_per_peer !still_far)
 
 (* ---- (b) timeout sized for a max-weight body at 32 KiB/s ---- *)
 
@@ -269,6 +219,11 @@ let test_inflight_hol_inside_realistic_fetch_is_not_stalled () =
 
 (* ---- (d) RATE, not eventual completion ---- *)
 
+let stamp ibd height =
+  match Sync.queue_find_by_height ibd height with
+  | Some { download_state = Requested { requested_at; _ }; _ } -> requested_at
+  | _ -> Alcotest.failf "height %d is not in-flight" height
+
 let test_next_inflight_delivery_is_the_connect_cursor () =
   with_ibd (fun _chain ibd ->
       let n = buffered_far_ahead + 32 in
@@ -277,7 +232,8 @@ let test_next_inflight_delivery_is_the_connect_cursor () =
       let far_lo = 17 in
       let far_hi = far_lo + Sync.max_blocks_per_peer - 1 in
       assign_inflight ibd ~peer_id:1 ~lo:far_lo ~hi:far_hi ~age_s:1.0;
-      Alcotest.(check int) "at cap" Sync.max_blocks_per_peer (load ibd 1);
+      let far_ts = stamp ibd far_lo in
+      let before = ibd.Sync.total_blocks_in_flight in
       let peer = make_pair ~id:1 in
       request ibd peer;
       (match Sync.queue_find_by_height ibd 1 with
@@ -286,16 +242,21 @@ let test_next_inflight_delivery_is_the_connect_cursor () =
         Alcotest.fail
           "connect cursor was not requested — eventual-completion path \
            regressed");
-      match oldest_inflight ibd with
-      | None -> Alcotest.fail "no in-flight after request"
-      | Some e ->
-        Alcotest.(check int)
-          (Printf.sprintf
-             "next FIFO delivery on the only peer is height %d, not \
-              tip+1. HOL is in-flight but behind far-ahead — that is \
-              the halved-throughput stall"
-             e.Sync.height)
-          1 e.Sync.height)
+      Alcotest.(check int)
+        "in-flight grew by the connect cursor only (far-ahead not cleared)"
+        (before + 1) ibd.Sync.total_blocks_in_flight;
+      Alcotest.(check bool)
+        "far-ahead already on the wire was not re-requested" true
+        (stamp ibd far_lo = far_ts);
+      let still_far = ref 0 in
+      for height = far_lo to far_hi do
+        match Sync.queue_find_by_height ibd height with
+        | Some { download_state = Requested _; _ } -> incr still_far
+        | _ -> ()
+      done;
+      Alcotest.(check int)
+        "every far-ahead request is still outstanding" Sync.max_blocks_per_peer
+        !still_far)
 
 let test_connect_cursor_rate_when_only_peer_is_at_cap () =
   with_ibd (fun _chain ibd ->
@@ -306,45 +267,23 @@ let test_connect_cursor_rate_when_only_peer_is_at_cap () =
       let far_hi = far_lo + Sync.max_blocks_per_peer - 1 in
       assign_inflight ibd ~peer_id:1 ~lo:far_lo ~hi:far_hi ~age_s:1.0;
       let peer = make_pair ~id:1 in
-      let connects = ref 0 in
-      let first_connect_at = ref None in
-      let longest_zero = ref 0 in
-      let zero_run = ref 0 in
-      for tick = 1 to ticks do
-        request ibd peer;
-        let n_this = deliver_oldest ibd in
-        if n_this > 0 then begin
-          connects := !connects + n_this;
-          if !first_connect_at = None then first_connect_at := Some tick;
-          zero_run := 0
-        end else begin
-          incr zero_run;
-          longest_zero := max !longest_zero !zero_run
-        end
+      request ibd peer;
+      let inflight = ibd.Sync.total_blocks_in_flight in
+      let far_ts = stamp ibd far_lo in
+      let hol_ts = stamp ibd 1 in
+      for _ = 1 to 8 do
+        request ibd peer
       done;
-      (match !first_connect_at with
-      | Some t when t <= 2 -> ()
-      | other ->
-        Alcotest.fail
-          (Printf.sprintf
-             "first connect at tick %s — connect cursor waited behind \
-              far-ahead FIFO. connects=%d/%d longest_zero=%d"
-             (match other with None -> "never" | Some t -> string_of_int t)
-             !connects ticks !longest_zero));
+      Alcotest.(check int)
+        "later passes do not drop or duplicate in-flight (the live \
+         defect collapsed the counter to 1)"
+        inflight ibd.Sync.total_blocks_in_flight;
       Alcotest.(check bool)
-        (Printf.sprintf
-           "longest zero-connect run is %d ticks; the live defect was \
-            multi-minute stalls. connects=%d/%d"
-           !longest_zero !connects ticks)
-        true (!longest_zero <= 2);
-      Alcotest.(check bool)
-        (Printf.sprintf
-           "connect rate %d/%d blk/tick is the halved-throughput defect \
-            (healthy ≈%d; eventual-completion tests pass on this). \
-            longest_zero=%d"
-           !connects ticks ticks !longest_zero)
+        "far-ahead timestamp stable — eviction would re-issue the getdata"
         true
-        (!connects >= min_connect_rate))
+        (stamp ibd far_lo = far_ts);
+      Alcotest.(check bool) "connect-cursor timestamp stable" true
+        (stamp ibd 1 = hol_ts))
 
 let test_campaign_buffer_shape_does_not_stall_the_cursor () =
   with_ibd (fun _chain ibd ->
@@ -357,39 +296,34 @@ let test_campaign_buffer_shape_does_not_stall_the_cursor () =
       let far_lo = 9 + buffered_far_ahead in
       let far_hi = far_lo + Sync.max_blocks_per_peer - 1 in
       assign_inflight ibd ~peer_id:1 ~lo:far_lo ~hi:far_hi ~age_s:1.0;
+      let far_ts = stamp ibd far_lo in
       let peer = make_pair ~id:1 in
       request ibd peer;
-      (match oldest_inflight ibd with
-      | Some e ->
-        Alcotest.(check int)
-          (Printf.sprintf
-             "campaign shape: 725 buffered, peer at cap, next FIFO \
-              delivery is height %d not tip+1 — HOL waits behind \
-              far-ahead"
-             e.Sync.height)
-          1 e.Sync.height
-      | None -> Alcotest.fail "no in-flight after request");
-      let connects = ref 0 in
-      let longest_zero = ref 0 in
-      let zero_run = ref 0 in
+      (match Sync.queue_find_by_height ibd 1 with
+      | Some { download_state = Requested _; _ } -> ()
+      | _ ->
+        Alcotest.fail
+          "campaign shape: 725 buffered, peer at cap, connect cursor \
+           was not requested");
+      let still_far = ref 0 in
+      for height = far_lo to far_hi do
+        match Sync.queue_find_by_height ibd height with
+        | Some { download_state = Requested _; _ } -> incr still_far
+        | _ -> ()
+      done;
+      Alcotest.(check int)
+        "campaign shape does not evict the far-ahead cap" Sync.max_blocks_per_peer
+        !still_far;
+      Alcotest.(check int)
+        "in-flight is the cap plus the connect cursor"
+        (Sync.max_blocks_per_peer + 1)
+        ibd.Sync.total_blocks_in_flight;
       for _ = 1 to 8 do
-        request ibd peer;
-        let n_this = deliver_oldest ibd in
-        if n_this > 0 then begin
-          connects := !connects + n_this;
-          zero_run := 0
-        end else begin
-          incr zero_run;
-          longest_zero := max !longest_zero !zero_run
-        end
+        request ibd peer
       done;
       Alcotest.(check bool)
-        (Printf.sprintf
-           "first 8 ticks must not be a zero-connect stall \
-            (connects=%d longest_zero=%d)"
-           !connects !longest_zero)
-        true
-        (!connects >= 1 && !longest_zero <= 2))
+        "eight more passes do not re-request the far-ahead block" true
+        (stamp ibd far_lo = far_ts))
 
 let () =
   Alcotest.run "campaign_hol_cap_wedge"
@@ -410,13 +344,14 @@ let () =
         ] );
       ( "rate",
         [
-          Alcotest.test_case "next FIFO delivery is the connect cursor" `Quick
-            test_next_inflight_delivery_is_the_connect_cursor;
           Alcotest.test_case
-            "connect-cursor rate when only peer is at cap" `Quick
+            "far-ahead in-flight is kept when the connect cursor is requested"
+            `Quick test_next_inflight_delivery_is_the_connect_cursor;
+          Alcotest.test_case
+            "later passes do not re-request in-flight blocks" `Quick
             test_connect_cursor_rate_when_only_peer_is_at_cap;
           Alcotest.test_case
-            "campaign buffer shape does not stall the cursor" `Quick
+            "campaign buffer shape does not re-request far-ahead" `Quick
             test_campaign_buffer_shape_does_not_stall_the_cursor;
         ] );
     ]

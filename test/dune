@@ -163,12 +163,26 @@
  (libraries camlcoin test_tmp alcotest lwt lwt.unix unix))
 
 ; Control for the one-peer campaign HOL-cap stall (QUEUES.md item 0,
-; range 419311→450000 STALLED at 421316). Asserts a RATE, not eventual
-; completion. Revert of far-ahead eviction / max-weight timeout makes
-; cap+timeout+rate fail.
+; range 419311→450000 STALLED at 421316). The connect cursor must still
+; be requested when the only peer is at cap. Far-ahead in-flight is NOT
+; evicted: un-marking a getdata does not cancel it, and the next pass
+; re-requested the block (515000 slice, in-flight collapsed to 1).
+; Putting that eviction back, or shrinking the max-weight timeout,
+; makes cap+timeout+rate fail.
 ;   dune exec --no-buffer test/test_campaign_hol_cap_wedge.exe
 (executable
  (name test_campaign_hol_cap_wedge)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix))
+
+; Control for the 515000-slice IBD stall (QUEUES.md 2026-09-26):
+; compaction every ~16 blocks, far-ahead eviction that re-requests blocks
+; already on the wire (in-flight collapses to 1), a 1024-block parsed
+; buffer, and one script-check domain per core. Revert of the 256-block
+; buffer, the no-evict request path, the duplicate-delivery guard, the
+; MAX_SCRIPTCHECK_THREADS clamp, or ibd_compaction_due makes this fail.
+;   dune exec --no-buffer test/test_ibd_pipeline.exe
+(executable
+ (name test_ibd_pipeline)
  (libraries camlcoin test_tmp alcotest lwt lwt.unix unix))
 
 ; Control for parallel script verification (QUEUES.md item 0, 2026-09-19).

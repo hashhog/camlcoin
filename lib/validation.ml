@@ -2060,11 +2060,26 @@ let run_parallel_task (q : script_check_queue) (n : int) (task : int -> unit)
    (tests / regtest / before start_script_check_queue). *)
 let script_check_queue : script_check_queue option ref = ref None
 
+(* Core validation.h:90 MAX_SCRIPTCHECK_THREADS; the queue is built with
+   std::clamp(worker_threads_num, 0, MAX_SCRIPTCHECK_THREADS)
+   (validation.cpp ChainstateManager ctor).  camlcoin had dropped the clamp
+   ("the 32-core box is why this exists"), which on OCaml 5 costs far more
+   than it buys: every minor collection is a stop-the-world rendezvous of
+   ALL domains, and a domain waiting at that barrier spins.  Measured
+   2026-09-26 over 1,499 real blocks from 515000 (concurrent arms, same
+   box): 31 extra domains used 1.33x the CPU per block of 15 extra
+   (2.6x over the first ~300) for no gain in wall time.
+   The accept/reject decision does not depend on the width
+   (test_parallel_script: 1-vs-N identity, lowest-index failure). *)
+let max_scriptcheck_threads = 15
+
 let start_script_check_queue () : unit =
   match !script_check_queue with
   | Some _ -> ()
   | None ->
-    let extra = resolve_script_check_workers !configured_par in
+    let extra =
+      min max_scriptcheck_threads
+        (resolve_script_check_workers !configured_par) in
     let q = create_script_check_queue extra in
     script_check_queue := Some q;
     Logs.info (fun m ->

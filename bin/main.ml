@@ -348,8 +348,9 @@ let txindex_arg =
 let par_arg =
   (* Bitcoin Core -par (init.cpp:513, chainstatemanager_args.cpp:53-60).
      0 = auto = every core; 1 = serial; n = n threads including the
-     connecting thread; n<0 = leave |n| cores free. camlcoin does not
-     apply Core's MAX_SCRIPTCHECK_THREADS=15 cap. *)
+     connecting thread; n<0 = leave |n| cores free.  As in Core the
+     resulting worker count is clamped to MAX_SCRIPTCHECK_THREADS=15
+     (Validation.max_scriptcheck_threads). *)
   let doc = "Set the number of script verification threads \
              (0 = auto = every core, 1 = serial, n = n threads including \
              the connecting thread, n<0 = leave that many cores free). \

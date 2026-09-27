@@ -3035,6 +3035,17 @@ let max_stall_timeout = 1200.0          (* 20 min max stall — matches Bitcoin 
 let max_consecutive_timeouts = 5        (* More forgiving before disconnect *)
 let utxo_flush_interval = 500          (* Flush UTXOs every N blocks — tuned for IBD throughput *)
 let block_download_window = 1024       (* Max blocks ahead to queue, matching Bitcoin Core BLOCK_DOWNLOAD_WINDOW *)
+(* How far past the connect cursor the IBD queue may run.  Core's 1024-block
+   BLOCK_DOWNLOAD_WINDOW bounds which heights may be requested, but Core
+   writes every received block to disk (blk*.dat) as it arrives; here a
+   downloaded-but-unconnected block is held in the OCaml heap as a parsed
+   [Types.block] (~2.5 MB of live heap per ~1 MB block in the 2018 era), so a
+   full 1024 window pinned ~2.5 GB of live heap that every major-GC cycle had
+   to mark and every compaction had to move (measured 2026-09-26: queue
+   downloaded=1023 on a local replay feed).  256 still covers the global
+   in-flight cap (max_total_blocks_in_flight = 128) twice over.  Download
+   scheduling only: which blocks are validated, and how, is unchanged. *)
+let max_blocks_buffered_ahead = min block_download_window 256
 
 (* Orphan block pool constants *)
 let max_orphan_blocks = 750
@@ -3241,7 +3252,7 @@ let fill_download_queue (ibd : ibd_state) : unit =
   | None -> ()
   | Some tip ->
     sync_download_path ibd tip;
-    let max_queue_size = block_download_window in
+    let max_queue_size = max_blocks_buffered_ahead in
     (* Drop path entries already below the download cursor (left over after
        a rebuild raced the cursor forward, or duplicated after a reorg). *)
     let dropping = ref true in
@@ -3316,32 +3327,6 @@ let check_timeouts (ibd : ibd_state) : unit =
 let is_head_of_window (ibd : ibd_state) (height : int) : bool =
   height >= ibd.next_process_height
   && height < ibd.next_process_height + head_of_window
-
-(* Drop every non-head in-flight request from [peer_id]. Evicting a single
-   far-ahead slot lets tip+1 fit under max_blocks_per_peer, but the remaining
-   15 keep older timestamps. A FIFO feeder — the campaign replay peer
-   included — then spends minutes serving those bodies before the connect
-   cursor. Clearing the far-ahead pipeline makes HOL the next delivery.
-   Do not record tried_peers: this is reordering, not a failure. *)
-let evict_far_ahead_from_peer (ibd : ibd_state) (peer_id : int) : int =
-  let n = ref 0 in
-  Queue.iter (fun entry ->
-    match entry.download_state with
-    | Requested { peer_id = pid; _ }
-      when pid = peer_id && not (is_head_of_window ibd entry.height) ->
-      entry.download_state <- NotRequested;
-      ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
-      let peer_state = get_peer_state ibd peer_id in
-      peer_state.blocks_in_flight <- max 0 (peer_state.blocks_in_flight - 1);
-      incr n
-    | _ -> ()
-  ) ibd.block_queue;
-  if !n > 0 then
-    Logs.info (fun m ->
-      m "evicted %d far-ahead in-flight from peer %d so the connect \
-         cursor is next on the wire"
-        !n peer_id);
-  !n
 
 let heads_covered (ibd : ibd_state) : bool =
   let rec loop h =
@@ -3461,9 +3446,6 @@ let request_blocks (ibd : ibd_state) (peers : Peer.peer list)
        Storage.ChainDB.has_block ibd.chain.db entry.hash then
       entry.download_state <- Validated
   ) ibd.block_queue;
-  (* Live peers first, then evict far-ahead so HOL is the next FIFO
-     delivery — not the 16th behind a full cap of older getdata.
-     Evict on the current HOL holder even if it is at cap. *)
   let live_peers = List.filter (fun p ->
     p.Peer.state = Peer.Ready && not (Peer.body_read_stalled p)
   ) peers in
@@ -3483,16 +3465,32 @@ let request_blocks (ibd : ibd_state) (peers : Peer.peer list)
       ps.blocks_in_flight <- max 0 (ps.blocks_in_flight - 1)
     | _ -> ()
   ) ibd.block_queue;
-  List.iter (fun p -> ignore (evict_far_ahead_from_peer ibd p.Peer.id))
-    live_peers;
-  (match queue_find_by_height ibd ibd.next_process_height with
-   | Some { download_state = Requested { peer_id; _ }; _ } ->
-     ignore (evict_far_ahead_from_peer ibd peer_id)
-   | _ -> ());
-  (* Filter to ready peers with capacity (after eviction). *)
+  (* No far-ahead eviction (removed 2026-09-26).  It un-marked blocks whose
+     getdata was already on the wire; un-marking does not cancel a getdata,
+     so the peer still delivered them and the next pass requested them again
+     — every far-ahead block fetched (and parsed) more than once, and each
+     stale second copy decremented total_blocks_in_flight a second time.
+     Core's FindNextBlocksToDownload never re-requests a block that has a
+     live in-flight request; only the stall/timeout paths above
+     (check_timeouts, check_stalled_downloads, the dead-peer release) take a
+     request back.  What the eviction was for — a peer sitting at
+     max_blocks_per_peer with far-ahead requests while the connect cursor
+     has NO live request — is covered by letting that one block take a slot
+     over the per-peer (and global) cap. *)
+  let hol_unrequested =
+    match queue_find_by_height ibd ibd.next_process_height with
+    | Some { download_state = NotRequested; _ } -> true
+    | _ -> false
+  in
+  let peer_cap_for height =
+    if hol_unrequested && height = ibd.next_process_height
+    then max_blocks_per_peer + 1 else max_blocks_per_peer
+  in
+  let any_cap = peer_cap_for ibd.next_process_height in
+  (* Filter to ready peers with capacity. *)
   let ready_peers = List.filter (fun p ->
     let ps = get_peer_state ibd p.Peer.id in
-    ps.blocks_in_flight < max_blocks_per_peer
+    ps.blocks_in_flight < any_cap
   ) live_peers in
   (* Build a single list of unrequested blocks, then partition across peers *)
   let unrequested = Queue.fold (fun acc entry ->
@@ -3504,7 +3502,7 @@ let request_blocks (ibd : ibd_state) (peers : Peer.peer list)
     let peer_batches : (Peer.peer * peer_download_state * block_queue_entry list ref) list =
       List.filter_map (fun peer ->
         let peer_state = get_peer_state ibd peer.Peer.id in
-        let available = max_blocks_per_peer - peer_state.blocks_in_flight in
+        let available = any_cap - peer_state.blocks_in_flight in
         if available > 0 then Some (peer, peer_state, ref [])
         else None
       ) ready_peers
@@ -3516,7 +3514,9 @@ let request_blocks (ibd : ibd_state) (peers : Peer.peer list)
       let n_peers = Array.length peer_arr in
       let idx = ref 0 in
       List.iter (fun entry ->
-        if ibd.total_blocks_in_flight < max_total_blocks_in_flight then begin
+        if ibd.total_blocks_in_flight < max_total_blocks_in_flight
+           || (hol_unrequested && entry.height = ibd.next_process_height)
+        then begin
           (* Do not prefetch past an unfetched hole: if any head-of-window
              slot is still NotRequested, tail_budget is 0 so the only
              peer's pipeline stays on the connect cursor. *)
@@ -3537,7 +3537,7 @@ let request_blocks (ibd : ibd_state) (peers : Peer.peer list)
             while not !found && !attempts < n_peers do
               let (peer, peer_state, batch_ref) = peer_arr.(!idx mod n_peers) in
               let peer_ok =
-                peer_state.blocks_in_flight < max_blocks_per_peer
+                peer_state.blocks_in_flight < peer_cap_for entry.height
                 && (not filter_tried
                     || not (List.mem peer.Peer.id entry.tried_peers))
               in
@@ -3632,14 +3632,22 @@ let receive_block (ibd : ibd_state) (block : Types.block)
         (Types.hash256_to_hex_display hash)
         (Hashtbl.length ibd.orphan_blocks));
     Ok ()
+  | Some { download_state = (Downloaded _ | Validated); _ } ->
+    (* A second copy of a block we already hold (a re-request raced the
+       first delivery).  It was not in flight any more: counting it again
+       drove total_blocks_in_flight below the real number of outstanding
+       requests. *)
+    Ok ()
   | Some entry ->
     (* Record which peer sent it for timeout decay *)
     let peer_id = match entry.download_state with
       | Requested { peer_id; _ } -> Some peer_id
       | _ -> None
     in
+    let was_in_flight = peer_id <> None in
     entry.download_state <- Downloaded { block; peer_id };
-    ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
+    if was_in_flight then
+      ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
     (* Decay timeout for successful download *)
     (match peer_id with
      | Some pid -> record_successful_download ibd pid

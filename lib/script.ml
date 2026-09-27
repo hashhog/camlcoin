@@ -1062,7 +1062,7 @@ let compute_sighash_legacy (tx : Types.transaction) (input_index : int)
     let w = Serialize.writer_create () in
     Serialize.serialize_transaction_no_witness w modified_tx;
     Serialize.write_int32_le w (Int32.of_int hash_type);
-    Crypto.sha256d (Serialize.writer_to_cstruct w)
+    Crypto.sha256d_string (Serialize.writer_to_string w)
   end
 
 (* BIP-143 segwit v0 sighash computation.
@@ -1107,7 +1107,7 @@ let compute_sighash_segwit ?txdata (tx : Types.transaction) (input_index : int)
     else if base_type = sighash_single && input_index < List.length tx.outputs then begin
       let w = Serialize.writer_create () in
       Serialize.serialize_tx_out w (List.nth tx.outputs input_index);
-      Crypto.sha256d (Serialize.writer_to_cstruct w)
+      Crypto.sha256d_string (Serialize.writer_to_string w)
     end
     else Types.zero_hash
   in
@@ -1126,7 +1126,7 @@ let compute_sighash_segwit ?txdata (tx : Types.transaction) (input_index : int)
   Serialize.write_bytes w hash_outputs;
   Serialize.write_int32_le w tx.locktime;
   Serialize.write_int32_le w (Int32.of_int hash_type);
-  Crypto.sha256d (Serialize.writer_to_cstruct w)
+  Crypto.sha256d_string (Serialize.writer_to_string w)
 
 (* BIP-341 valid Schnorr sighash type whitelist.
    Mirrors Bitcoin Core's check in script/interpreter.cpp SignatureHashSchnorr:

@@ -551,7 +551,7 @@ module ChainDB = struct
     let w = Serialize.writer_create () in
     Serialize.serialize_block_header w header;
     Cf_chainstate.put_block_header t.cf hash
-      (Cstruct.to_string (Serialize.writer_to_cstruct w))
+      (Serialize.writer_to_string w)
 
   let get_block_header t (hash : Types.hash256)
       : Types.block_header option =
@@ -566,7 +566,7 @@ module ChainDB = struct
     let w = Serialize.writer_create () in
     Serialize.serialize_block w block;
     Cf_chainstate.put_block_data t.cf hash
-      (Cstruct.to_string (Serialize.writer_to_cstruct w))
+      (Serialize.writer_to_string w)
 
   let get_block t (hash : Types.hash256) : Types.block option =
     match Cf_chainstate.get_block_data t.cf hash with
@@ -587,7 +587,7 @@ module ChainDB = struct
     let w = Serialize.writer_create () in
     Serialize.serialize_transaction w tx;
     Cf_chainstate.put_tx t.cf txid
-      (Cstruct.to_string (Serialize.writer_to_cstruct w))
+      (Serialize.writer_to_string w)
 
   let get_transaction t (txid : Types.hash256) : Types.transaction option =
     match Cf_chainstate.get_tx t.cf txid with
@@ -803,7 +803,7 @@ module ChainDB = struct
     Serialize.write_bytes w block_hash;
     Serialize.write_int32_le w (Int32.of_int tx_idx);
     Cf_chainstate.put_tx_index t.cf txid
-      (Cstruct.to_string (Serialize.writer_to_cstruct w))
+      (Serialize.writer_to_string w)
 
   let get_tx_index t (txid : Types.hash256) : (Types.hash256 * int) option =
     match Cf_chainstate.get_tx_index t.cf txid with
@@ -880,7 +880,7 @@ module ChainDB = struct
       (header : Types.block_header) =
     let w = Serialize.writer_create () in
     Serialize.serialize_block_header w header;
-    let data = Cstruct.to_string (Serialize.writer_to_cstruct w) in
+    let data = Serialize.writer_to_string w in
     queue_op batch (fun b ->
       Cf_chainstate.batch_put_block_header b hash data)
 
@@ -1088,7 +1088,7 @@ module ChainDB = struct
   let batch_store_block batch (hash : Types.hash256) (block : Types.block) =
     let w = Serialize.writer_create () in
     Serialize.serialize_block w block;
-    let data = Cstruct.to_string (Serialize.writer_to_cstruct w) in
+    let data = Serialize.writer_to_string w in
     queue_op batch (fun b ->
       Cf_chainstate.batch_put_block_data b hash data)
 
@@ -1107,7 +1107,7 @@ module ChainDB = struct
       (tx : Types.transaction) =
     let w = Serialize.writer_create () in
     Serialize.serialize_transaction w tx;
-    let data = Cstruct.to_string (Serialize.writer_to_cstruct w) in
+    let data = Serialize.writer_to_string w in
     queue_op batch (fun b ->
       Cf_chainstate.batch_put_tx b txid data)
 
@@ -1116,7 +1116,7 @@ module ChainDB = struct
     let w = Serialize.writer_create () in
     Serialize.write_bytes w block_hash;
     Serialize.write_int32_le w (Int32.of_int tx_idx);
-    let data = Cstruct.to_string (Serialize.writer_to_cstruct w) in
+    let data = Serialize.writer_to_string w in
     queue_op batch (fun b ->
       Cf_chainstate.batch_put_tx_index b txid data)
 

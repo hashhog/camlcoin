@@ -214,7 +214,7 @@ let serialize_record (rec_ : spender) : string =
   Serialize.write_bytes w rec_.block_hash;
   Serialize.write_compact_size w (Cstruct.length rec_.spending_tx_bytes);
   Serialize.write_bytes w rec_.spending_tx_bytes;
-  Cstruct.to_string (Serialize.writer_to_cstruct w)
+  Serialize.writer_to_string w
 
 let deserialize_record (data : string) : spender =
   let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in

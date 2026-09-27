@@ -107,25 +107,20 @@ let writer_create () = { buf = Buffer.create 256 }
 let write_uint8 w v =
   Buffer.add_char w.buf (Char.chr (v land 0xFF))
 
-let write_uint16_le w v =
-  let cs = Cstruct.create 2 in
-  Cstruct.LE.set_uint16 cs 0 v;
-  Buffer.add_string w.buf (Cstruct.to_string cs)
+(* The fixed-width writers append straight into the Buffer.  They used to
+   build a throwaway [Cstruct.create] (a malloc'd Bigarray custom block with a
+   finaliser) per field and copy it out with [Cstruct.to_string]; every
+   serialisation of a transaction (txid, wtxid, weight, block size, block
+   store, undo, UTXO flush) paid ~2 such mallocs per input/output.  Output
+   bytes are identical: Cstruct.{LE,BE}.set_uint16 store the low 16 bits and
+   set_uint32/set_uint64 the full int32/int64, exactly as Buffer.add_*. *)
+let write_uint16_le w v = Buffer.add_uint16_le w.buf (v land 0xFFFF)
 
-let write_uint16_be w v =
-  let cs = Cstruct.create 2 in
-  Cstruct.BE.set_uint16 cs 0 v;
-  Buffer.add_string w.buf (Cstruct.to_string cs)
+let write_uint16_be w v = Buffer.add_uint16_be w.buf (v land 0xFFFF)
 
-let write_int32_le w v =
-  let cs = Cstruct.create 4 in
-  Cstruct.LE.set_uint32 cs 0 v;
-  Buffer.add_string w.buf (Cstruct.to_string cs)
+let write_int32_le w v = Buffer.add_int32_le w.buf v
 
-let write_int64_le w v =
-  let cs = Cstruct.create 8 in
-  Cstruct.LE.set_uint64 cs 0 v;
-  Buffer.add_string w.buf (Cstruct.to_string cs)
+let write_int64_le w v = Buffer.add_int64_le w.buf v
 
 let write_bytes w cs =
   Buffer.add_string w.buf (Cstruct.to_string cs)
@@ -176,6 +171,9 @@ let write_string w s =
 
 let writer_to_cstruct w =
   Cstruct.of_string (Buffer.contents w.buf)
+
+(* The serialised bytes as a string (no Bigarray round trip). *)
+let writer_to_string w = Buffer.contents w.buf
 
 (* Outpoint serialization *)
 let serialize_outpoint w (op : Types.outpoint) =

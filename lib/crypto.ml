@@ -33,6 +33,17 @@ let sha256d (data : Cstruct.t) : Types.hash256 =
     let h2 = Digestif.SHA256.digest_string (Digestif.SHA256.to_raw_string h1) in
     Cstruct.of_string (Digestif.SHA256.to_raw_string h2)
 
+(* [sha256d] over bytes already held as a string (e.g. a serialiser's
+   Buffer contents): same digest, without the string -> Bigarray -> string
+   round trip [sha256d (Cstruct.of_string s)] would make. *)
+let sha256d_string (data : string) : Types.hash256 =
+  try
+    Cstruct.of_string (sha256d_accel data)
+  with _ ->
+    let h1 = Digestif.SHA256.digest_string data in
+    let h2 = Digestif.SHA256.digest_string (Digestif.SHA256.to_raw_string h1) in
+    Cstruct.of_string (Digestif.SHA256.to_raw_string h2)
+
 let sha256 (data : Cstruct.t) : Cstruct.t =
   try
     Cstruct.of_string (sha256_accel (Cstruct.to_string data))
@@ -343,13 +354,13 @@ let xonly_pubkey_tweak_add_check ~(internal_pk : Cstruct.t) ~(tweaked_pk : Cstru
 let compute_txid (tx : Types.transaction) : Types.hash256 =
   let w = Serialize.writer_create () in
   Serialize.serialize_transaction_no_witness w tx;
-  sha256d (Serialize.writer_to_cstruct w)
+  sha256d_string (Serialize.writer_to_string w)
 
 (* Compute block hash (double SHA-256 of serialized header) *)
 let compute_block_hash (header : Types.block_header) : Types.hash256 =
   let w = Serialize.writer_create () in
   Serialize.serialize_block_header w header;
-  sha256d (Serialize.writer_to_cstruct w)
+  sha256d_string (Serialize.writer_to_string w)
 
 (* Merkle root computation with CVE-2012-2459 mutation detection.
    Returns (root_hash, mutated) where mutated is true if any two adjacent
@@ -406,7 +417,7 @@ let compute_wtxid (tx : Types.transaction) : Types.hash256 =
   else begin
     let w = Serialize.writer_create () in
     Serialize.serialize_transaction w tx;
-    sha256d (Serialize.writer_to_cstruct w)
+    sha256d_string (Serialize.writer_to_string w)
   end
 
 (* Compute the witness merkle root from a list of transactions.

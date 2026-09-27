@@ -788,7 +788,7 @@ let hash_serialized_add (acc : hash_serialized_acc)
   serialize_coin_for_hash w outpoint coin;
   acc.group <-
     (outpoint.Types.vout,
-     Cstruct.to_string (Serialize.writer_to_cstruct w))
+     Serialize.writer_to_string w)
     :: acc.group
 
 let hash_serialized_finish (acc : hash_serialized_acc) : Types.hash256 =
@@ -1057,7 +1057,7 @@ let write_snapshot (path : string) (metadata : snapshot_metadata)
        (* 1. Metadata. *)
        let w = Serialize.writer_create () in
        serialize_metadata w metadata;
-       output_string oc (Cstruct.to_string (Serialize.writer_to_cstruct w));
+       output_string oc (Serialize.writer_to_string w);
 
        (* 2. Per-txid groups. Coins of one txid are collected, then written
           in numeric vout order (Core WriteUTXOSnapshot / CompactSize vout
@@ -1079,13 +1079,13 @@ let write_snapshot (path : string) (metadata : snapshot_metadata)
            let hw = Serialize.writer_create () in
            Serialize.write_bytes hw txid;
            Serialize.write_compact_size hw (List.length coins);
-           output_string oc (Cstruct.to_string (Serialize.writer_to_cstruct hw));
+           output_string oc (Serialize.writer_to_string hw);
            List.iter (fun coin ->
              let cw = Serialize.writer_create () in
              Serialize.write_compact_size cw (Int32.to_int coin.outpoint.vout);
              serialize_coin_body cw coin;
              output_string oc
-               (Cstruct.to_string (Serialize.writer_to_cstruct cw)))
+               (Serialize.writer_to_string cw))
              coins;
            group_coins := []
        in

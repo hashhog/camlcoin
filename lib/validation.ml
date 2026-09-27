@@ -121,12 +121,12 @@ let compute_tx_weight (tx : Types.transaction) : int =
   (* Serialize without witness to get base size *)
   let w_base = Serialize.writer_create () in
   Serialize.serialize_transaction_no_witness w_base tx;
-  let base_size = Cstruct.length (Serialize.writer_to_cstruct w_base) in
+  let base_size = Buffer.length w_base.Serialize.buf in
 
   (* Serialize with witness to get total size *)
   let w_total = Serialize.writer_create () in
   Serialize.serialize_transaction w_total tx;
-  let total_size = Cstruct.length (Serialize.writer_to_cstruct w_total) in
+  let total_size = Buffer.length w_total.Serialize.buf in
 
   (* weight = base_size * 3 + total_size *)
   base_size * (Consensus.witness_scale_factor - 1) + total_size
@@ -183,7 +183,7 @@ let get_virtual_transaction_size ~(weight : int) ~(sigop_cost : int)
 let compute_tx_size (tx : Types.transaction) : int =
   let w = Serialize.writer_create () in
   Serialize.serialize_transaction w tx;
-  Cstruct.length (Serialize.writer_to_cstruct w)
+  Buffer.length w.Serialize.buf
 
 (* ============================================================================
    Basic Transaction Validation
@@ -212,7 +212,7 @@ let check_transaction ?(is_coinbase = false) (tx : Types.transaction)
        matching Bitcoin Core's CheckTransaction in tx_check.cpp. *)
     let w_base = Serialize.writer_create () in
     Serialize.serialize_transaction_no_witness w_base tx;
-    let base_size = Cstruct.length (Serialize.writer_to_cstruct w_base) in
+    let base_size = Buffer.length w_base.Serialize.buf in
     let base_weight = base_size * Consensus.witness_scale_factor in
     if base_weight > Consensus.max_block_weight then
       Error (TxOversizeWeight base_weight)
@@ -744,7 +744,7 @@ let compute_wtxid (tx : Types.transaction) (is_cb : bool) : Types.hash256 =
   else begin
     let w = Serialize.writer_create () in
     Serialize.serialize_transaction w tx;
-    Crypto.sha256d (Serialize.writer_to_cstruct w)
+    Crypto.sha256d_string (Serialize.writer_to_string w)
   end
 
 (* Compute the witness merkle root from a list of transactions.
@@ -993,7 +993,7 @@ let check_block ~network:(network : Consensus.network_config) (block : Types.blo
                      Bitcoin Core's MAX_BLOCK_SERIALIZED_SIZE check. *)
                   let w_block = Serialize.writer_create () in
                   Serialize.serialize_block w_block block;
-                  let block_size = Cstruct.length (Serialize.writer_to_cstruct w_block) in
+                  let block_size = Buffer.length w_block.Serialize.buf in
                   if block_size > Consensus.max_block_serialized_size then
                     Error (BlockOversized block_size)
                   else

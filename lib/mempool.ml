@@ -1831,7 +1831,7 @@ let max_dust_outputs_per_tx = 1
 let compute_tx_nonwitness_size (tx : Types.transaction) : int =
   let w = Serialize.writer_create () in
   Serialize.serialize_transaction_no_witness w tx;
-  Cstruct.length (Serialize.writer_to_cstruct w)
+  Buffer.length w.Serialize.buf
 
 (* Check if a transaction passes IsStandard policy.
    Reference: Bitcoin Core IsStandardTx() in policy/policy.cpp.

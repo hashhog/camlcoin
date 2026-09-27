@@ -217,7 +217,7 @@ let compute_wtxid (tx : Types.transaction) (is_coinbase : bool) : Types.hash256 
   else begin
     let w = Serialize.writer_create () in
     Serialize.serialize_transaction w tx;
-    Crypto.sha256d (Serialize.writer_to_cstruct w)
+    Crypto.sha256d_string (Serialize.writer_to_string w)
   end
 
 (* Compute the witness merkle root from a list of transactions.
@@ -1003,7 +1003,7 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
                  let uw = Serialize.writer_create () in
                  Utxo.serialize_undo_data uw undo;
                  Storage.ChainDB.store_undo_data chain.db hash
-                   (Cstruct.to_string (Serialize.writer_to_cstruct uw));
+                   (Serialize.writer_to_string uw);
                  (* Flatten the per-tx spent outputs into the (outpoint,
                     utxo_entry) list shape expected by the BIP-157 filter
                     append helper. *)

@@ -3703,7 +3703,7 @@ let encode_utxo (value : int64) (script : Cstruct.t) (height : int)
   Serialize.write_bytes w script;
   Serialize.write_int32_le w (Int32.of_int height);
   Serialize.write_uint8 w (if is_coinbase then 1 else 0);
-  Cstruct.to_string (Serialize.writer_to_cstruct w)
+  Serialize.writer_to_string w
 
 (* Expire orphan blocks older than orphan_block_expire_seconds *)
 let expire_orphan_blocks (ibd : ibd_state) : int =
@@ -4315,7 +4315,7 @@ let process_downloaded_blocks ?(max_blocks = 1)
              let uw = Serialize.writer_create () in
              Utxo.serialize_undo_data uw undo;
              Storage.ChainDB.store_undo_data ibd.chain.db entry.hash
-               (Cstruct.to_string (Serialize.writer_to_cstruct uw))
+               (Serialize.writer_to_string uw)
            end;
            (* Update UTXOs - add new outputs, delete spent inputs *)
            (* Fix 2: Reuse txids from validation instead of recomputing *)
@@ -5735,7 +5735,7 @@ let connect_block_into_batch
        let uw = Serialize.writer_create () in
        Utxo.serialize_undo_data uw undo;
        Storage.ChainDB.batch_store_undo_data batch entry.hash
-         (Cstruct.to_string (Serialize.writer_to_cstruct uw));
+         (Serialize.writer_to_string uw);
        (* BIP-157 filter index append for the reorg-connect path. We
           flatten [tx_undos] into a single list of (outpoint, entry)
           pairs so [append_filter_if_enabled_from_entries] can extract
@@ -7271,7 +7271,7 @@ let store_block_undo_data
   let uw = Serialize.writer_create () in
   Utxo.serialize_undo_data uw undo;
   Storage.ChainDB.store_undo_data db block_hash
-    (Cstruct.to_string (Serialize.writer_to_cstruct uw))
+    (Serialize.writer_to_string uw)
 
 (* ActivateBestChain for the live-P2P block path (Bitcoin Core's
    ProcessNewBlock -> ActivateBestChain).  Before this, [process_new_block] /

@@ -104,7 +104,7 @@ module UtxoSet = struct
     let w = Serialize.writer_create () in
     serialize_utxo_entry w entry;
     Storage.ChainDB.store_utxo t.db txid vout
-      (Cstruct.to_string (Serialize.writer_to_cstruct w))
+      (Serialize.writer_to_string w)
 
   (* Remove a UTXO entry, returning the removed entry if it existed *)
   let remove (t : t) (txid : Types.hash256) (vout : int)
@@ -597,7 +597,7 @@ module OptimizedUtxoSet = struct
              let w = Serialize.writer_create () in
              serialize_utxo_entry w utxo;
              Storage.ChainDB.batch_store_utxo batch txid vout
-               (Cstruct.to_string (Serialize.writer_to_cstruct w))
+               (Serialize.writer_to_string w)
            | `Removed ->
              Storage.ChainDB.batch_delete_utxo batch txid vout
          ) t.dirty;
@@ -636,7 +636,7 @@ module OptimizedUtxoSet = struct
         | `Added utxo ->
           let w = Serialize.writer_create () in
           serialize_utxo_entry w utxo;
-          `Add (Cstruct.to_string (Serialize.writer_to_cstruct w))
+          `Add (Serialize.writer_to_string w)
         | `Removed -> `Del
       in
       ops := (txid, vout, op) :: !ops
@@ -679,7 +679,7 @@ module OptimizedUtxoSet = struct
           | `Added entry ->
             let w = Serialize.writer_create () in
             serialize_utxo_entry w entry;
-            Some (Cstruct.to_string (Serialize.writer_to_cstruct w))
+            Some (Serialize.writer_to_string w)
         in
         overlay.(!i) <- (k, payload);
         incr i
@@ -960,7 +960,7 @@ end = struct
     Serialize.write_bytes w c.txout.script_pubkey;
     Serialize.write_int32_le w (Int32.of_int c.height);
     Serialize.write_uint8 w (if c.is_coinbase then 1 else 0);
-    Cstruct.to_string (Serialize.writer_to_cstruct w)
+    Serialize.writer_to_string w
 
   (** Deserialize a coin from database storage *)
   let deserialize_coin (data : string) : coin =
@@ -1003,7 +1003,7 @@ let outpoint_to_key (op : Types.outpoint) : string =
   let w = Serialize.writer_create () in
   Serialize.write_bytes w op.txid;
   Serialize.write_int32_le w op.vout;
-  Cstruct.to_string (Serialize.writer_to_cstruct w)
+  Serialize.writer_to_string w
 
 (** Default max cache size: 1GB worth of entries.
     Assuming ~100 bytes per entry average, this is ~10M entries.

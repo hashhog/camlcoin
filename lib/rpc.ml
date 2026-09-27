@@ -13063,7 +13063,7 @@ let handle_gettxoutproof (ctx : rpc_context)
           (* 80-byte block header *)
           let w = Serialize.writer_create () in
           Serialize.serialize_block_header w block.header;
-          Buffer.add_string buf (Cstruct.to_string (Serialize.writer_to_cstruct w));
+          Buffer.add_string buf (Serialize.writer_to_string w);
           (* nTx uint32 LE *)
           w47b_write_le32 buf (Int32.of_int n_tx);
           (* hashes *)

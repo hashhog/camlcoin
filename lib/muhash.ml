@@ -222,4 +222,4 @@ let serialize_txout (outpoint : Types.outpoint) ~(value : int64)
   Serialize.write_int64_le w value;
   Serialize.write_compact_size w (Cstruct.length script_pubkey);
   Serialize.write_bytes w script_pubkey;
-  Bytes.of_string (Cstruct.to_string (Serialize.writer_to_cstruct w))
+  Bytes.of_string (Serialize.writer_to_string w)

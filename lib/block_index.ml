@@ -325,7 +325,7 @@ let build_filter params (elements : string list) : gcs_filter =
     (* Empty filter: just encode N=0 *)
     let w = Serialize.writer_create () in
     Serialize.write_compact_size w 0;
-    let encoded = Cstruct.to_string (Serialize.writer_to_cstruct w) in
+    let encoded = Serialize.writer_to_string w in
     { params; n; f; encoded }
   else begin
     (* Hash all elements and sort *)
@@ -338,7 +338,7 @@ let build_filter params (elements : string list) : gcs_filter =
     (* Write N as compact size *)
     let w = Serialize.writer_create () in
     Serialize.write_compact_size w n;
-    Buffer.add_string buf (Cstruct.to_string (Serialize.writer_to_cstruct w));
+    Buffer.add_string buf (Serialize.writer_to_string w);
 
     (* Write Golomb-Rice encoded deltas *)
     let bit_writer = GolombRice.create_writer () in

@@ -203,7 +203,7 @@ let serialize_snapshot (s : snapshot) : string =
   Serialize.write_int64_le w (Int64.of_int s.txouts);
   Serialize.write_int64_le w s.total_amount;
   Serialize.write_int64_le w s.bogo_size;
-  Cstruct.to_string (Serialize.writer_to_cstruct w)
+  Serialize.writer_to_string w
 
 let deserialize_snapshot (data : string) : snapshot =
   let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in

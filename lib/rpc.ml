@@ -387,214 +387,6 @@ let cstruct_to_hex_early (cs : Cstruct.t) : string =
 let json_difficulty (d : float) : Yojson.Safe.t =
   `Intlit (Printf.sprintf "%.16g" d)
 
-(* Query the local Bitcoin Core node for a block's nTx count.
-   Used as a fallback in getblockheader when the block body is absent
-   (assume-valid IBD does not store block bodies).  The result is
-   persisted into the ntx index so subsequent calls are instant.
-
-   Uses a plain Unix TCP socket for a synchronous HTTP/1.0 POST — no
-   Lwt dependency, no subprocess spawn.  Times out after ~2 s.
-   Returns None on any error (Core not running, auth failure, etc.). *)
-let ntx_from_core (db : Storage.ChainDB.t) (hash : Types.hash256)
-    (hash_hex : string) : int option =
-  let try_path p =
-    try
-      let ic = open_in p in
-      let s = input_line ic in
-      close_in ic;
-      Some s
-    with _ -> None
-  in
-  let cookie_opt =
-    match try_path "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie" with
-    | Some c -> Some (8332, c)
-    | None ->
-      (match try_path "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie" with
-       | Some c -> Some (8332, c)
-       | None -> None)
-  in
-  match cookie_opt with
-  | None -> None
-  | Some (port, cookie) ->
-    try
-      let sock = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-      (try
-        Unix.setsockopt_float sock Unix.SO_RCVTIMEO 3.0;
-        Unix.setsockopt_float sock Unix.SO_SNDTIMEO 3.0;
-        let addr = Unix.ADDR_INET (Unix.inet_addr_of_string "127.0.0.1", port) in
-        Unix.connect sock addr;
-        (* Use jsonrpc 1.0 — Bitcoin Core 22+ rejects "1.1" with 400 *)
-        let body = Printf.sprintf
-          {|{"jsonrpc":"1.0","method":"getblockheader","params":["%s",true],"id":1}|}
-          hash_hex in
-        let cred = Base64.encode_string ~alphabet:Base64.default_alphabet cookie in
-        let request = Printf.sprintf
-          "POST / HTTP/1.0\r\nHost: 127.0.0.1:%d\r\nContent-Type: application/json\r\nContent-Length: %d\r\nAuthorization: Basic %s\r\n\r\n%s"
-          port (String.length body) cred body in
-        let _ = Unix.send sock (Bytes.of_string request) 0 (String.length request) [] in
-        (* Read full response (header response is small; 8 KB is plenty) *)
-        let buf = Buffer.create 2048 in
-        let chunk = Bytes.create 2048 in
-        (try
-          let running = ref true in
-          while !running do
-            let n = Unix.recv sock chunk 0 2048 [] in
-            if n = 0 then running := false
-            else Buffer.add_subbytes buf chunk 0 n
-          done
-        with _ -> ());
-        Unix.close sock;
-        let resp = Buffer.contents buf in
-        if resp = "" then None
-        else begin
-          (* Find the JSON body after the HTTP headers (double CRLF) *)
-          let json_str =
-            (try
-              let idx = ref (-1) in
-              for i = 0 to String.length resp - 4 do
-                if !idx < 0
-                   && resp.[i] = '\r' && resp.[i+1] = '\n'
-                   && resp.[i+2] = '\r' && resp.[i+3] = '\n' then
-                  idx := i + 4
-              done;
-              if !idx >= 0 && !idx < String.length resp then
-                String.sub resp !idx (String.length resp - !idx)
-              else resp
-            with _ -> resp)
-          in
-          (match Yojson.Safe.from_string json_str with
-           | `Assoc fields ->
-             (match List.assoc_opt "result" fields with
-              | Some (`Assoc result) ->
-                (match List.assoc_opt "nTx" result with
-                 | Some (`Int n) ->
-                   (* Cache in the ntx index for future calls *)
-                   Storage.ChainDB.store_block_ntx db hash n;
-                   Some n
-                 | _ -> None)
-              | _ -> None)
-           | _ -> None
-           | exception _ -> None)
-        end
-      with exn ->
-        (try Unix.close sock with _ -> ());
-        ignore exn;
-        None)
-    with _ -> None
-
-(* Query the local Bitcoin Core node for all tx fees in a block.
-   Used as a second-level fallback in getblock verbosity=2 when undo data is
-   absent AND the tx index cannot resolve the creating tx (e.g. pre-txindex
-   historical blocks).  Makes ONE `getblock <hash> 2` RPC call and returns
-   a (txid → fee_satoshi) map.  Returns empty Hashtbl on any error.
-   Uses the same synchronous Unix TCP HTTP/1.0 approach as ntx_from_core.
-   Buffer size 32 MB to handle large blocks (~1000-tx blocks ~5 MB each). *)
-let fees_from_core (hash_hex : string) : (string, int64) Hashtbl.t =
-  let result : (string, int64) Hashtbl.t = Hashtbl.create 16 in
-  let try_path p =
-    try
-      let ic = open_in p in
-      let s = input_line ic in
-      close_in ic;
-      Some s
-    with _ -> None
-  in
-  let cookie_opt =
-    match try_path "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie" with
-    | Some c -> Some (8332, c)
-    | None ->
-      (match try_path "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie" with
-       | Some c -> Some (8332, c)
-       | None -> None)
-  in
-  (match cookie_opt with
-  | None -> ()
-  | Some (port, cookie) ->
-    (try
-      let sock = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-      (try
-        Unix.setsockopt_float sock Unix.SO_RCVTIMEO 30.0;
-        Unix.setsockopt_float sock Unix.SO_SNDTIMEO 30.0;
-        let addr = Unix.ADDR_INET (Unix.inet_addr_of_string "127.0.0.1", port) in
-        Unix.connect sock addr;
-        let body = Printf.sprintf
-          {|{"jsonrpc":"1.0","method":"getblock","params":["%s",2],"id":1}|}
-          hash_hex in
-        let cred = Base64.encode_string ~alphabet:Base64.default_alphabet cookie in
-        let request = Printf.sprintf
-          "POST / HTTP/1.0\r\nHost: 127.0.0.1:%d\r\nContent-Type: application/json\r\nContent-Length: %d\r\nAuthorization: Basic %s\r\n\r\n%s"
-          port (String.length body) cred body in
-        let _ = Unix.send sock (Bytes.of_string request) 0 (String.length request) [] in
-        (* Read full response; blocks can be large, use 32 MB buffer *)
-        let buf = Buffer.create (1024 * 1024) in
-        let chunk_size = 65536 in
-        let chunk = Bytes.create chunk_size in
-        (try
-          let running = ref true in
-          while !running do
-            let n = Unix.recv sock chunk 0 chunk_size [] in
-            if n = 0 then running := false
-            else Buffer.add_subbytes buf chunk 0 n
-          done
-        with _ -> ());
-        Unix.close sock;
-        let resp = Buffer.contents buf in
-        if resp <> "" then begin
-          let json_str =
-            (try
-              let idx = ref (-1) in
-              for i = 0 to String.length resp - 4 do
-                if !idx < 0
-                   && resp.[i] = '\r' && resp.[i+1] = '\n'
-                   && resp.[i+2] = '\r' && resp.[i+3] = '\n' then
-                  idx := i + 4
-              done;
-              if !idx >= 0 && !idx < String.length resp then
-                String.sub resp !idx (String.length resp - !idx)
-              else resp
-            with _ -> resp)
-          in
-          (try
-            match Yojson.Safe.from_string json_str with
-            | `Assoc fields ->
-              (match List.assoc_opt "result" fields with
-               | Some (`Assoc result_fields) ->
-                 (match List.assoc_opt "tx" result_fields with
-                  | Some (`List txs) ->
-                    List.iter (fun tx_json ->
-                      match tx_json with
-                      | `Assoc tx_fields ->
-                        let txid_opt = match List.assoc_opt "txid" tx_fields with
-                          | Some (`String s) -> Some s | _ -> None in
-                        let fee_opt = match List.assoc_opt "fee" tx_fields with
-                          | Some (`Float f) -> Some (Int64.of_float (Float.round (f *. 1e8)))
-                          | Some (`Int i)   -> Some (Int64.of_int i)
-                          | Some (`Intlit s) ->
-                            (* btc_amount_json format: "0.00012345" as Intlit *)
-                            (try
-                              let f = float_of_string s in
-                              Some (Int64.of_float (Float.round (f *. 1e8)))
-                            with _ -> None)
-                          | _ -> None
-                        in
-                        (match txid_opt, fee_opt with
-                         | Some txid, Some fee ->
-                           Hashtbl.replace result txid fee
-                         | _ -> ())
-                      | _ -> ()
-                    ) txs
-                  | _ -> ())
-               | _ -> ())
-            | _ -> ()
-            | exception _ -> ()
-          with _ -> ())
-        end
-      with exn ->
-        (try Unix.close sock with _ -> ());
-        ignore exn)
-    with _ -> ()));
-  result
-
 (* Convert compact bits to 64-char big-endian hex target string (Core format).
    compact_to_target returns little-endian (byte 0 = LSB); iterate 31..0 for
    MSB-first display order matching Bitcoin Core. *)
@@ -853,23 +645,24 @@ let handle_getblockheader (ctx : rpc_context)
           current block (Core src/chain.h:233). Use the display variant
           that starts at [height] (not [height-1] used for validation MTP). *)
        let median_time = Sync.compute_median_time_for_display ctx.chain height in
-       (* nTx: read from the dedicated ntx index first (populated for every
-          connected block including assume-valid IBD); fall back to counting
-          from the block body; last resort: query the local Bitcoin Core
-          node synchronously and cache the result for future calls. *)
+       (* nTx: read from the dedicated ntx index first (written at connect
+          for every block this node connected, including assume-valid IBD);
+          fall back to counting from the locally held block body.  When
+          neither exists — a header-only block, or a block below an
+          assumeUTXO snapshot base that this node never processed — the
+          answer is 0, exactly Core's CBlockIndex::nTx for a block whose
+          transactions were never received (chain.h: "nTx ... 0 if the
+          block's data has not been received").  R3: answer only from our
+          own state; never ask another node. *)
        let n_tx =
          match Storage.ChainDB.get_block_ntx ctx.chain.db hash with
          | Some n -> n
          | None ->
-           (match Storage.ChainDB.get_block ctx.chain.db hash with
-            | Some block ->
-              let n = List.length block.transactions in
+           (match Storage.ChainDB.get_block_ntx_from_body ctx.chain.db hash with
+            | Some n ->
               Storage.ChainDB.store_block_ntx ctx.chain.db hash n;
               n
-            | None ->
-              (match ntx_from_core ctx.chain.db hash hash_hex with
-               | Some n -> n
-               | None -> 0))
+            | None -> 0)
        in
        (* nextblockhash: Core's ComputeNextBlockAndDepth only sets pnext when
           THIS block is on the active chain (a fork tip has no "next").  Look
@@ -6921,18 +6714,10 @@ let handle_getblock (ctx : rpc_context)
               txindex_populated := true
             end;
             let _ = !txindex_populated in  (* prevent unused warning *)
-            (* Fee fallback via Bitcoin Core: if undo data is absent, query Core's
-               getblock v2 for the whole block and extract all fees in ONE RPC call.
-               This covers both cases: (a) txindex is empty, (b) txindex is partial
-               (some inputs' creating txs are pre-txindex historical blocks).
-               The core_fees map is keyed by txid hex string (as returned by Core).
-               Per-tx: use Core fee only if undo+txindex both fail for that tx. *)
-            let core_fees : (string, int64) Hashtbl.t =
-              if undo_opt = None then
-                fees_from_core hash_hex
-              else
-                Hashtbl.create 0
-            in
+            (* No further fallback: when neither undo data nor the local tx
+               index resolves a tx's inputs, the fee field is OMITTED, as
+               Core's BlockToJSON does when !have_undo (blockchain.cpp:227,
+               core_io.cpp TxToUniv).  R3: answer only from our own state. *)
             let tx_jsons = List.mapi (fun tx_idx tx ->
               (* Build base TxToUniv object (no hex) using shared helper.
                  Excludes chain-context fields (blockhash/confirmations/time/blocktime). *)
@@ -6994,23 +6779,6 @@ let handle_getblock (ctx : rpc_context)
                       else None
                     end
                   in
-                  (* Fallback 2: Bitcoin Core (keyed by txid hex) *)
-                  let from_core =
-                    if from_undo <> None || from_txindex <> None then None
-                    else if Hashtbl.length core_fees = 0 then None
-                    else begin
-                      let txid_hex = Types.hash256_to_hex_display (Crypto.compute_txid tx) in
-                      match Hashtbl.find_opt core_fees txid_hex with
-                      | None -> None
-                      | Some fee_sats -> Some (`Fee_from_core fee_sats)
-                    end
-                  in
-                  match from_core with
-                  | Some (`Fee_from_core fee_sats) ->
-                    if Int64.compare fee_sats 0L >= 0 then
-                      Some (btc_amount_json fee_sats)
-                    else None
-                  | _ ->
                     let amt_in_opt = match from_undo with
                       | Some v -> Some v
                       | None -> from_txindex
@@ -7104,118 +6872,6 @@ let handle_getblock (ctx : rpc_context)
    Reference: bitcoin-core/src/rpc/rawtransaction.cpp getrawtransaction()
               bitcoin-core/src/core_io.cpp TxToUniv SHOW_DETAILS_AND_PREVOUT
 *)
-
-(* Oracle fallback: call Bitcoin Core's getrawtransaction txid 2 blockhash and
-   extract per-vin prevout info.  Returns a list of prevout options parallel to
-   tx.inputs.  Used when undo data and txindex are both unavailable. *)
-let getrawtx2_prevouts_from_core
-    (txid_hex : string) (blockhash_hex : string)
-    : (bool * int * int64 * Cstruct.t) option list =
-  let try_path p =
-    try let ic = open_in p in let s = input_line ic in close_in ic; Some s
-    with _ -> None
-  in
-  let cookie_opt =
-    match try_path "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie" with
-    | Some c -> Some (8332, c)
-    | None ->
-      (match try_path "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie" with
-       | Some c -> Some (8332, c)
-       | None -> None)
-  in
-  match cookie_opt with
-  | None -> []
-  | Some (port, cookie) ->
-    (try
-      let sock = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-      let result = ref [] in
-      (try
-        Unix.setsockopt_float sock Unix.SO_RCVTIMEO 30.0;
-        Unix.setsockopt_float sock Unix.SO_SNDTIMEO 30.0;
-        let addr = Unix.ADDR_INET (Unix.inet_addr_of_string "127.0.0.1", port) in
-        Unix.connect sock addr;
-        let body = Printf.sprintf
-          {|{"jsonrpc":"1.0","method":"getrawtransaction","params":["%s",2,"%s"],"id":1}|}
-          txid_hex blockhash_hex in
-        let cred = Base64.encode_string ~alphabet:Base64.default_alphabet cookie in
-        let request = Printf.sprintf
-          "POST / HTTP/1.0\r\nHost: 127.0.0.1:%d\r\nContent-Type: application/json\r\nContent-Length: %d\r\nAuthorization: Basic %s\r\n\r\n%s"
-          port (String.length body) cred body in
-        let _ = Unix.send sock (Bytes.of_string request) 0 (String.length request) [] in
-        let buf = Buffer.create (1024 * 1024) in
-        let chunk_size = 65536 in
-        let chunk = Bytes.create chunk_size in
-        (try
-          let running = ref true in
-          while !running do
-            let n = Unix.recv sock chunk 0 chunk_size [] in
-            if n = 0 then running := false
-            else Buffer.add_subbytes buf chunk 0 n
-          done
-        with _ -> ());
-        Unix.close sock;
-        let resp = Buffer.contents buf in
-        if resp <> "" then begin
-          let json_str =
-            (try
-              let idx = ref (-1) in
-              for i = 0 to String.length resp - 4 do
-                if !idx < 0
-                   && resp.[i] = '\r' && resp.[i+1] = '\n'
-                   && resp.[i+2] = '\r' && resp.[i+3] = '\n' then
-                  idx := i + 4
-              done;
-              if !idx >= 0 && !idx < String.length resp then
-                String.sub resp !idx (String.length resp - !idx)
-              else resp
-            with _ -> resp)
-          in
-          (try
-            match Yojson.Safe.from_string json_str with
-            | `Assoc fields ->
-              (match List.assoc_opt "result" fields with
-               | Some (`Assoc res_fields) ->
-                 (match List.assoc_opt "vin" res_fields with
-                  | Some (`List vins) ->
-                    result := List.map (fun vin_json ->
-                      match vin_json with
-                      | `Assoc vin_fields ->
-                        (match List.assoc_opt "prevout" vin_fields with
-                         | Some (`Assoc po_fields) ->
-                           let generated = match List.assoc_opt "generated" po_fields with
-                             | Some (`Bool b) -> b | _ -> false in
-                           let height = match List.assoc_opt "height" po_fields with
-                             | Some (`Int h) -> h | _ -> 0 in
-                           let value_sats = match List.assoc_opt "value" po_fields with
-                             | Some (`Float f) ->
-                               Int64.of_float (Float.round (f *. 1e8))
-                             | Some (`Int i) -> Int64.of_int i
-                             | Some (`Intlit s) ->
-                               (try Int64.of_float (Float.round (float_of_string s *. 1e8))
-                                with _ -> 0L)
-                             | _ -> 0L in
-                           let script_cs = match List.assoc_opt "scriptPubKey" po_fields with
-                             | Some (`Assoc sp_fields) ->
-                               (match List.assoc_opt "hex" sp_fields with
-                                | Some (`String h) ->
-                                  (try Cstruct.of_hex h with _ -> Cstruct.empty)
-                                | _ -> Cstruct.empty)
-                             | _ -> Cstruct.empty in
-                           Some (generated, height, value_sats, script_cs)
-                         | _ -> None)
-                      | _ -> None
-                    ) vins
-                  | _ -> ())
-               | _ -> ())
-            | _ -> ()
-            | exception _ -> ()
-          with _ -> ())
-        end
-      with exn ->
-        (try Unix.close sock with _ -> ());
-        ignore exn);
-      !result
-    with _ -> [])
 
 (* Full implementation of getrawtransaction — verbosity=0/1/2.
    Shadows the earlier definition so the dispatch table picks this one.
@@ -7454,36 +7110,10 @@ let handle_getrawtransaction (ctx : rpc_context)
                      end
                    ) tx.inputs);
 
-                (* Phase 3: Bitcoin Core oracle for any still-missing inputs *)
+                (* No Phase 3.  An input neither undo data nor the local tx
+                   index resolves stays unresolved; see all_resolved below.
+                   R3: answer only from our own state. *)
                 let n_inputs = List.length tx.inputs in
-                let need_oracle =
-                  n_inputs > 0 &&
-                  let any_missing = ref false in
-                  for i = 0 to n_inputs - 1 do
-                    if not (Hashtbl.mem prevout_map i) then any_missing := true
-                  done;
-                  !any_missing
-                in
-                if need_oracle then begin
-                  let bh_hex = match blockhash_with_hex_opt with
-                    | Some (_, h) -> h
-                    | None ->
-                      (match block_hash_opt with
-                       | Some bh -> Types.hash256_to_hex_display bh
-                       | None -> "")
-                  in
-                  if bh_hex <> "" then begin
-                    let core_prevouts =
-                      getrawtx2_prevouts_from_core txid_hex bh_hex in
-                    List.iteri (fun i po_opt ->
-                      if not (Hashtbl.mem prevout_map i) then
-                        (match po_opt with
-                         | Some (gen, h, v, sc) ->
-                           Hashtbl.replace prevout_map i (gen, h, v, sc)
-                         | None -> ())
-                    ) core_prevouts
-                  end
-                end;
 
                 (* Compute fee: sum(prevouts) - sum(outputs) *)
                 let all_resolved =
@@ -7508,7 +7138,10 @@ let handle_getrawtransaction (ctx : rpc_context)
                     if Int64.compare fee 0L >= 0 then Some fee else None
                   end
                 in
-                (fee_opt, prevout_map)
+                (* Core emits prevout on EVERY input (have_undo) or on none
+                   (core_io.cpp TxToUniv): never a partial set. *)
+                (fee_opt,
+                 if all_resolved then prevout_map else Hashtbl.create 0)
               end
             end
           in

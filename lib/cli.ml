@@ -506,6 +506,15 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   Logs.info (fun m ->
     m "Chain state initialized, headers at height %d"
       chain.headers_synced);
+  (* One-time: drop nTx values that older builds borrowed from a co-located
+     Bitcoin Core and persisted (R3: answer only from our own state).
+     Marker-gated, so every later boot costs one point read. Never fatal. *)
+  Ntx_reconcile.run_at_startup ~db ~genesis_hash:network.Consensus.genesis_hash
+    ~tip:chain.blocks_synced
+    ~height_of:(fun raw ->
+      match Hashtbl.find_opt chain.Sync.headers raw with
+      | Some (e : Sync.header_entry) -> Some e.height
+      | None -> None);
 
   (* BIP-157 basic block filter index.  Mirrors Bitcoin Core's
      [-blockfilterindex=basic] (init.cpp + index/blockfilterindex.cpp).

@@ -1023,6 +1023,32 @@ module ChainDB = struct
   let get_block_ntx t (hash : Types.hash256) : int option =
     Cf_chainstate.get_block_ntx t.cf hash
 
+  let delete_block_ntx t (hash : Types.hash256) =
+    Rocksdb.cf_delete t.cf.Cf_chainstate.db t.cf.Cf_chainstate.cfh_chain_state
+      (Cf_chainstate.ntx_key hash)
+
+  (* One pass over the chain_state CF calling [f kind raw_hash value] for
+     every per-block nTx ('n') and cumulative m_chain_tx_count ('c') key.
+     [raw_hash] is the 32-byte internal-order hash as a plain string (no
+     Cstruct allocation per key: this walks ~2 entries per block).
+     Callers must not mutate the CF from inside [f]. *)
+  let iter_tx_count_keys t (f : char -> string -> string -> unit) : unit =
+    Rocksdb.cf_iter t.cf.Cf_chainstate.db t.cf.Cf_chainstate.cfh_chain_state
+      (fun key value ->
+        if String.length key = 34 && key.[1] = ':'
+           && (key.[0] = 'n' || key.[0] = 'c') then
+          f key.[0] (String.sub key 2 32) value)
+
+  let delete_chain_tx_count_raw t (raw_hash : string) =
+    Rocksdb.cf_delete t.cf.Cf_chainstate.db t.cf.Cf_chainstate.cfh_chain_state
+      ("c:" ^ raw_hash)
+
+  let get_meta t (key : string) : string option =
+    Cf_chainstate.get_chain_state t.cf key
+
+  let put_meta t (key : string) (value : string) =
+    Cf_chainstate.put_chain_state t.cf key value
+
   (* Cumulative m_chain_tx_count (Core chain.h). 8-byte LE int64. *)
   let store_chain_tx_count t (hash : Types.hash256) (n : int64) =
     Cf_chainstate.put_chain_tx_count t.cf hash n
@@ -1076,6 +1102,10 @@ module ChainDB = struct
     let checksum = Crypto.sha256 (Cstruct.of_string undo_data) in
     Cf_chainstate.put_undo_data t.cf block_hash
       (undo_data ^ Cstruct.to_string checksum)
+
+  (* Presence only — no checksum verification, no deserialisation. *)
+  let has_undo_data t (block_hash : Types.hash256) : bool =
+    Cf_chainstate.get_undo_data t.cf block_hash <> None
 
   let get_undo_data t (block_hash : Types.hash256) : string option =
     match Cf_chainstate.get_undo_data t.cf block_hash with

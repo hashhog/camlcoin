@@ -95,7 +95,11 @@
 ; Control for snapshot-import RPC startup (QUEUES.md item 0). --import-utxo
 ; runs synchronously before the cookie/RPC bind, so a GC-thrashing 12.7M-coin
 ; load at base 315000 never answers getblockcount. Revert of LRU capacity-0
-; / write-only import cache makes the first three cases fail.
+; / write-only import cache makes the first three cases fail. 2026-09-27
+; bulk loader: the two "== flush" cases fail if the WAL-less loader's rows
+; differ by one byte from the old OptimizedUtxoSet.flush path (sorted and
+; unsorted/duplicated input); "failed import leaves the incomplete marker
+; set" fails if the crash marker is not set.
 ;   dune exec --no-buffer test/test_snapshot_import_throughput.exe
 (executable
  (name test_snapshot_import_throughput)

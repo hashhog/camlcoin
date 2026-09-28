@@ -91,6 +91,15 @@ let delete (t : t) (key : string) : unit =
    the 36-byte outpoint keys (which are raw binary). *)
 let meta_key k = "__meta__" ^ k
 
+(* 4-byte little-endian tip_height value, as every writer below stores it. *)
+let encode_tip_height (h : int) : string =
+  let buf = Bytes.create 4 in
+  Bytes.set buf 0 (Char.chr (h land 0xff));
+  Bytes.set buf 1 (Char.chr ((h lsr 8) land 0xff));
+  Bytes.set buf 2 (Char.chr ((h lsr 16) land 0xff));
+  Bytes.set buf 3 (Char.chr ((h lsr 24) land 0xff));
+  Bytes.unsafe_to_string buf
+
 (* Atomic batch write.  Each element is (key, value_opt) where
    None means delete and Some v means put.
    When [tip_height] is provided it is included in the SAME WriteBatch

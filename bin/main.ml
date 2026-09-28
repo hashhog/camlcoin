@@ -725,12 +725,27 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
         Mirrors blockbrew main.go:785-789 (-load-snapshot ignored when the
         chainstate is not fresh). *)
      let probe_db = Camlcoin.Storage.ChainDB.create db_path in
+     let interrupted =
+       Camlcoin.Storage.ChainDB.snapshot_import_incomplete probe_db in
      let existing_tip =
        match Camlcoin.Storage.ChainDB.get_chain_tip probe_db with
-       | Some (_, h) when h > 0 -> Some h
+       | Some (_, h) when h > 0 && not interrupted -> Some h
        | _ -> None
      in
      Camlcoin.Storage.ChainDB.close probe_db;
+     (* A previous import died before it completed (its coins are written
+        WAL-less and the marker is cleared only after the final durable
+        flush and every tip pointer). Nothing in these stores is trusted:
+        discard both and import from scratch. *)
+     if interrupted then begin
+       Printf.eprintf
+         "[utxo-import] previous snapshot import did not complete \
+          (snapshot_import_incomplete marker set) — discarding %s and %s \
+          and re-importing\n%!"
+         (Filename.concat db_path "chainstate-rocks") rocksdb_path;
+       Camlcoin.Reindex.rm_rf (Filename.concat db_path "chainstate-rocks");
+       Camlcoin.Reindex.rm_rf rocksdb_path
+     end;
      (match existing_tip with
       | Some h ->
         Printf.eprintf
@@ -738,17 +753,29 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
            overwrite; remove %s to re-bootstrap. Continuing with existing \
            chainstate.\n%!" h db_path
       | None ->
-        let db =
-          Camlcoin.Storage.ChainDB.create
-            ~block_cache_mb:dbcache_block_cache_mb
-            ~write_buffer_mb:dbcache_write_buffer_mb
-            db_path
-        in
-        let rocksdb =
-          Camlcoin.Rocksdb_store.open_db
-            ~block_cache_mb:dbcache_block_cache_mb
-            ~write_buffer_mb:dbcache_write_buffer_mb
-            rocksdb_path
+        (* Import-only store options: 8 flush threads, 10 write buffers per
+           store, so the WAL-less loader's memtables drain in parallel (see
+           caml_rocksdb_set_bulk_load_open). Reset before anything else
+           opens a store; the node-run path below reopens both with the
+           normal options. *)
+        Camlcoin.Rocksdb.set_bulk_load_open 8 10;
+        let db, rocksdb =
+          Fun.protect
+            ~finally:(fun () -> Camlcoin.Rocksdb.set_bulk_load_open 0 0)
+            (fun () ->
+              let db =
+                Camlcoin.Storage.ChainDB.create
+                  ~block_cache_mb:dbcache_block_cache_mb
+                  ~write_buffer_mb:dbcache_write_buffer_mb
+                  db_path
+              in
+              let rocksdb =
+                Camlcoin.Rocksdb_store.open_db
+                  ~block_cache_mb:dbcache_block_cache_mb
+                  ~write_buffer_mb:dbcache_write_buffer_mb
+                  rocksdb_path
+              in
+              db, rocksdb)
         in
         (match Camlcoin.Assume_utxo.load_snapshot_into_primary
                  ~network:network_cfg

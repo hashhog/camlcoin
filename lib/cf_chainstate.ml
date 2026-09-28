@@ -90,6 +90,13 @@ type t = {
   mutable closed   : bool;
 }
 
+(* Every CF handle of [t] (bulk-load memtable flush). *)
+let all_handles (t : t) : Rocksdb.cf_handle list = [
+  t.cfh_default; t.cfh_block_header; t.cfh_block_data; t.cfh_tx;
+  t.cfh_utxo; t.cfh_block_height; t.cfh_tx_index; t.cfh_chain_state;
+  t.cfh_undo_data; t.cfh_invalidated; t.cfh_ban_list;
+]
+
 (* In-process registry of open DBs by absolute path. RocksDB acquires
    an OS file lock on each open; opening the same path twice from the
    same process fails with "lock hold by current process". Test

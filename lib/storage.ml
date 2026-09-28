@@ -747,6 +747,33 @@ module ChainDB = struct
       in
       if ops <> [] then Rocksdb_store.batch_write ~tip_height r ops
 
+  (* Snapshot-import-incomplete marker (chain_state CF).
+
+     [Assume_utxo.load_snapshot_into_primary] writes coins with the RocksDB
+     WAL disabled; they become durable only when the final memtable flush
+     returns. The marker is fsynced BEFORE the first such write and deleted
+     (fsynced) only AFTER the flush and every tip pointer is written, so a
+     crash anywhere in between leaves it set. While it is set the UTXO
+     stores are untrusted: the next --import-utxo discards the chainstate
+     and re-imports, and a plain boot refuses to start. *)
+  let snapshot_import_marker_key = "snapshot_import_incomplete"
+
+  let set_snapshot_import_incomplete t =
+    let b = Cf_chainstate.batch_create t.cf in
+    Cf_chainstate.batch_put_chain_state b snapshot_import_marker_key "1";
+    Rocksdb.write_batch_write_sync t.cf.Cf_chainstate.db b.Cf_chainstate.raw;
+    Rocksdb.write_batch_destroy b.Cf_chainstate.raw
+
+  let clear_snapshot_import_incomplete t =
+    let wb = Rocksdb.write_batch_create () in
+    Rocksdb.write_batch_delete_cf wb t.cf.Cf_chainstate.cfh_chain_state
+      snapshot_import_marker_key;
+    Rocksdb.write_batch_write_sync t.cf.Cf_chainstate.db wb;
+    Rocksdb.write_batch_destroy wb
+
+  let snapshot_import_incomplete t : bool =
+    Cf_chainstate.get_chain_state t.cf snapshot_import_marker_key <> None
+
   (* Chain state - tip hash and height (validated blocks) *)
   let set_chain_tip t (hash : Types.hash256) (height : int) =
     let batch = Cf_chainstate.batch_create t.cf in

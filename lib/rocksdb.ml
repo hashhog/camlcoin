@@ -85,3 +85,24 @@ external cf_iter : t -> cf_handle -> (string -> string -> unit) -> unit
 (* Iterate every key/value in a CF, calling [f key value] for each.
    Holds RocksDB resources (iterator) for the duration; caller's [f]
    must not call back into the same DB. *)
+
+(* --- Snapshot-import helpers --------------------------------------- *)
+
+external write_batch_write_sync : t -> batch -> unit
+  = "caml_rocksdb_writebatch_write_sync"
+(* Commit [batch] with the WAL fsynced before returning. *)
+
+external set_bulk_load_open : int -> int -> unit
+  = "caml_rocksdb_set_bulk_load_open"
+(* [set_bulk_load_open flush_threads write_buffers]: while non-zero, stores
+   opened by this process use that max_background_flushes and
+   max_write_buffer_number (see rocksdb_stubs.c). Snapshot import only;
+   reset with [0 0]. *)
+
+external write_batch_write_nowal : t -> batch -> unit
+  = "caml_rocksdb_writebatch_write_nowal"
+(* Commit [batch] with the WAL disabled (snapshot import only). *)
+
+external flush_memtables : t -> cf_handle array -> unit
+  = "caml_rocksdb_flush_memtables"
+(* Flush every CF in the array (default CF if empty) and wait. *)

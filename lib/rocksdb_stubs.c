@@ -143,6 +143,38 @@ static struct custom_operations writebatch_ops = {
   custom_fixed_length_default,
 };
 
+/* ---------- Bulk-load open tunables (snapshot import only) ------------- */
+/* While non-zero, every open in this process raises max_background_flushes
+   and max_write_buffer_number. bin/main.ml sets them around the two opens
+   --import-utxo does and resets them before the node-run reopen.
+
+   Why: the import is bound by how fast memtables reach disk. On the shared
+   NVMe each flush stream is throttled (writeback throttling, ext4 journal
+   waits), and a single flush thread per store left the loader parked in
+   "Stopping writes because we have 3 immutable memtables". Several flush
+   streams per store move the same bytes several times faster (A/B, 4M
+   coins, same moment, same disk: 1 thread x 3 buffers 148 s, 4 x 6 72 s,
+   8 x 10 55 s for load + final flush). Memtable memory is bounded by
+   write_buffer_size x max_write_buffer_number per store. */
+static int g_bulk_flush_threads = 0;  /* max_background_flushes */
+static int g_bulk_write_buffers = 0;  /* max_write_buffer_number */
+
+CAMLprim value caml_rocksdb_set_bulk_load_open(value v_flush_threads,
+                                               value v_write_buffers) {
+  g_bulk_flush_threads = Int_val(v_flush_threads);
+  g_bulk_write_buffers = Int_val(v_write_buffers);
+  return Val_unit;
+}
+
+static void apply_bulk_load_opts(rocksdb_options_t *opts) {
+  if (g_bulk_flush_threads > 0) {
+    rocksdb_options_set_max_background_flushes(opts, g_bulk_flush_threads);
+    rocksdb_options_set_max_background_jobs(opts, g_bulk_flush_threads + 3);
+  }
+  if (g_bulk_write_buffers > 0)
+    rocksdb_options_set_max_write_buffer_number(opts, g_bulk_write_buffers);
+}
+
 /* ---------- open -------------------------------------------------------- */
 
 CAMLprim value caml_rocksdb_open(value v_path,
@@ -168,6 +200,7 @@ CAMLprim value caml_rocksdb_open(value v_path,
   rocksdb_options_set_max_background_jobs(opts, 4);
   rocksdb_options_set_level_compaction_dynamic_level_bytes(opts, 1);
   rocksdb_options_set_compression(opts, rocksdb_no_compression);
+  apply_bulk_load_opts(opts);
 
   /* Cap the number of SST file descriptors RocksDB keeps open.
      RocksDB's default (max_open_files = -1) holds an FD open for every
@@ -487,6 +520,7 @@ CAMLprim value caml_rocksdb_open_cfs(value v_path,
   rocksdb_options_set_max_background_jobs(opts, 4);
   rocksdb_options_set_level_compaction_dynamic_level_bytes(opts, 1);
   rocksdb_options_set_compression(opts, rocksdb_no_compression);
+  apply_bulk_load_opts(opts);
   /* Bound the open-SST-fd count — see the ROCKSDB_MAX_OPEN_FILES define
      and caml_rocksdb_open for the full rationale. max_open_files is a
      DB-wide option, so setting it on the shared db_options here caps the
@@ -736,6 +770,97 @@ CAMLprim value caml_rocksdb_cf_iter(value v_db, value v_cfh, value v_f) {
   if (err) {
     char msg[512];
     snprintf(msg, sizeof(msg), "rocksdb_cf_iter: %s", err);
+    rocksdb_free(err);
+    caml_failwith(msg);
+  }
+  CAMLreturn(Val_unit);
+}
+
+/* ---------- Snapshot-import durability helpers ------------------------- */
+/* Write a batch with WAL on AND WriteOptions.sync = true (fsync the WAL
+   before returning). Used for the snapshot-import-incomplete marker and
+   the import's final tip_height, which must be on disk before the import
+   is declared complete. */
+CAMLprim value caml_rocksdb_writebatch_write_sync(value v_db, value v_wb) {
+  CAMLparam2(v_db, v_wb);
+  rocksdb_t *db = Rocksdb_val(v_db);
+  if (!db) caml_failwith("rocksdb_writebatch_write_sync: database is closed");
+  rocksdb_writebatch_t *wb = Writebatch_val(v_wb);
+  if (!wb) caml_failwith("rocksdb_writebatch_write_sync: batch is destroyed");
+  rocksdb_writeoptions_t *wopts = rocksdb_writeoptions_create();
+  rocksdb_writeoptions_set_sync(wopts, 1);
+  char *err = NULL;
+  caml_release_runtime_system();
+  rocksdb_write(db, wopts, wb, &err);
+  caml_acquire_runtime_system();
+  rocksdb_writeoptions_destroy(wopts);
+  if (err) {
+    char msg[512];
+    snprintf(msg, sizeof(msg), "rocksdb_writebatch_write_sync: %s", err);
+    rocksdb_free(err);
+    caml_failwith(msg);
+  }
+  CAMLreturn(Val_unit);
+}
+
+/* Write a batch with the WAL DISABLED (snapshot import only). The rows are
+   made durable by [caml_rocksdb_flush_memtables] before the import clears
+   its incomplete marker. The runtime lock is released for the write: the
+   batch lives outside the OCaml heap. */
+CAMLprim value caml_rocksdb_writebatch_write_nowal(value v_db, value v_wb) {
+  CAMLparam2(v_db, v_wb);
+  rocksdb_t *db = Rocksdb_val(v_db);
+  if (!db) caml_failwith("rocksdb_writebatch_write_nowal: database is closed");
+  rocksdb_writebatch_t *wb = Writebatch_val(v_wb);
+  if (!wb) caml_failwith("rocksdb_writebatch_write_nowal: batch is destroyed");
+  rocksdb_writeoptions_t *wopts = rocksdb_writeoptions_create();
+  rocksdb_writeoptions_disable_WAL(wopts, 1);
+  char *err = NULL;
+  caml_release_runtime_system();
+  rocksdb_write(db, wopts, wb, &err);
+  caml_acquire_runtime_system();
+  rocksdb_writeoptions_destroy(wopts);
+  if (err) {
+    char msg[512];
+    snprintf(msg, sizeof(msg), "rocksdb_writebatch_write_nowal: %s", err);
+    rocksdb_free(err);
+    caml_failwith(msg);
+  }
+  CAMLreturn(Val_unit);
+}
+
+/* Flush the memtable of every CF in [v_cfhs] (or the default CF when the
+   array is empty) and wait. RocksDB fsyncs the SSTs and the MANIFEST
+   before a waited flush returns. */
+CAMLprim value caml_rocksdb_flush_memtables(value v_db, value v_cfhs) {
+  CAMLparam2(v_db, v_cfhs);
+  rocksdb_t *db = Rocksdb_val(v_db);
+  if (!db) caml_failwith("rocksdb_flush_memtables: database is closed");
+  size_t n = Wosize_val(v_cfhs);
+  rocksdb_column_family_handle_t **hs = NULL;
+  if (n > 0) {
+    hs = malloc(sizeof(*hs) * n);
+    if (!hs) caml_raise_out_of_memory();
+    for (size_t i = 0; i < n; i++) {
+      hs[i] = Cfh_val(Field(v_cfhs, i));
+      if (!hs[i]) { free(hs); caml_failwith("rocksdb_flush_memtables: CF handle closed"); }
+    }
+  }
+  rocksdb_flushoptions_t *fo = rocksdb_flushoptions_create();
+  rocksdb_flushoptions_set_wait(fo, 1);
+  char *err = NULL;
+  caml_release_runtime_system();
+  if (n == 0)
+    rocksdb_flush(db, fo, &err);
+  else
+    for (size_t i = 0; i < n && !err; i++)
+      rocksdb_flush_cf(db, fo, hs[i], &err);
+  caml_acquire_runtime_system();
+  rocksdb_flushoptions_destroy(fo);
+  free(hs);
+  if (err) {
+    char msg[512];
+    snprintf(msg, sizeof(msg), "rocksdb_flush_memtables: %s", err);
     rocksdb_free(err);
     caml_failwith(msg);
   }

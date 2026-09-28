@@ -463,6 +463,21 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       ~write_buffer_mb:dbcache_write_buffer_mb
       db_path
   in
+  (* An interrupted --import-utxo leaves this marker set (see
+     Assume_utxo.load_snapshot_into_primary). The UTXO stores may be
+     partial, so never serve or extend them. *)
+  if Storage.ChainDB.snapshot_import_incomplete db then begin
+    Logs.err (fun m ->
+      m "chainstate holds an INCOMPLETE snapshot import; refusing to start");
+    Printf.eprintf
+      "[camlcoin] FATAL: a UTXO snapshot import into %s did not complete \
+       (snapshot_import_incomplete marker set). Its UTXO set may be \
+       partial. Re-run with --import-utxo=<snapshot> (which discards the \
+       partial chainstate and re-imports) or remove the datadir.\n%!"
+      db_path;
+    Storage.ChainDB.close db;
+    exit 1
+  end;
 
   (* Get network config *)
   let network = match config.network with

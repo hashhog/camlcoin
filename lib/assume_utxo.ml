@@ -1413,16 +1413,62 @@ let load_snapshot_into_primary
         Error (Printf.sprintf "Coins count mismatch: snapshot has %Ld, expected %Ld"
                  metadata.coins_count params.coins_count)
       else begin
-        (* Write coins through OptimizedUtxoSet so the on-disk key format
-           and per-coin serialization are byte-identical to what the IBD
-           reader ([Sync] via the same module) expects. Import is
-           write-only: a 1M LRU put+evicted every coin of a 12.7M-coin
-           snapshot (base 315000) and RPC never bound inside the campaign
-           wait. Flush still bounds the dirty set. *)
-        let utxo =
-          Utxo.OptimizedUtxoSet.create ~cache_size:0 ~rocksdb db in
+        (* Bulk load (2026-09-27). Coins go straight from the parser into two
+           RocksDB WriteBatches — the rocksdb_utxo store and the chainstate
+           CF [utxo] — with the SAME 36-byte key ([Cf_chainstate.utxo_key]
+           = OptimizedUtxoSet.utxo_key) and the SAME value bytes
+           ([Utxo.serialize_utxo_entry]) that OptimizedUtxoSet.flush wrote,
+           so every store row is byte-identical to the previous loader
+           (test_snapshot_import_throughput "bulk loader ==
+           OptimizedUtxoSet.flush", sorted and unsorted/duplicated input).
+
+           Profile (soak-550000, 50.07M coins, shared NVMe): parse ~0.35 us,
+           HASH_SERIALIZED fold ~0.45 us, old dirty-set add ~0.6 us and old
+           flush-side re-serialization ~2 us per coin — a few minutes of CPU
+           in a 71-min import. The rest was the store: the loader parked in
+           RocksDB write stalls ("3 immutable memtables, waiting for flush")
+           while ONE flush thread per store pushed 64 MiB memtables through
+           a throttled, journal-bound disk. So:
+           - batches are committed with the WAL DISABLED (every coin was
+             written twice per store). Durability comes from one waited
+             memtable flush of both stores at the end;
+           - bin/main.ml opens the two stores with several flush threads
+             and write buffers (Rocksdb.set_bulk_load_open), so memtables
+             drain in parallel streams;
+           - no OptimizedUtxoSet dirty Hashtbl, second serialized Hashtbl,
+             queued CF batch or forced Gc.major per million coins.
+           Crash safety: the chain_state marker [snapshot_import_incomplete]
+           is fsynced before the first coin and removed (fsynced) only after
+           the final flush AND every tip pointer is written. While it is
+           set the stores are untrusted: --import-utxo wipes and
+           re-imports, a plain boot refuses to start (bin/main.ml, Cli.run).
+           The per-coin HASH_SERIALIZED fold and gettxoutsetinfo totals are
+           unchanged. *)
+        let cf = db.Storage.ChainDB.cf in
+        let cf_db = cf.Cf_chainstate.db in
+        let cfh_utxo = cf.Cf_chainstate.cfh_utxo in
+        let rdb = rocksdb.Rocksdb_store.db in
+        let rdb_wb = ref (Rocksdb.write_batch_create ()) in
+        let cf_wb = ref (Rocksdb.write_batch_create ()) in
+        let batch_live = ref true in
+        let destroy_batches () =
+          if !batch_live then begin
+            batch_live := false;
+            Rocksdb.write_batch_destroy !rdb_wb;
+            Rocksdb.write_batch_destroy !cf_wb
+          end
+        in
+        let profile =
+          match Sys.getenv_opt "CAMLCOIN_IMPORT_PROFILE" with
+          | Some ("1" | "true" | "yes") -> true
+          | _ -> false
+        in
+        let t_start = Unix.gettimeofday () in
+        let t_f = ref 0. and t_hash = ref 0. and t_put = ref 0.
+        and t_commit = ref 0. and t_final = ref 0. in
         let ic = open_in_bin snapshot_path in
         try
+          Storage.ChainDB.set_snapshot_import_incomplete db;
           let sr = Stream_reader.create ic
                      ~start_offset:snapshot_body_offset in
           let total = metadata.coins_count in
@@ -1438,49 +1484,74 @@ let load_snapshot_into_primary
           let txouts = ref 0 in
           let transactions = ref 0 in
           let last_txid = ref None in
+          (* The parser hands every coin of one txid group the same txid
+             Cstruct, so a physical-equality hit skips the 32-byte string
+             copy; a miss still compares by value, exactly as before. *)
+          let last_txid_cs = ref (Cstruct.create 0) in
           let bogosize = ref 0L in
           let total_amount = ref 0L in
-          (* Bounded-memory flush: drain the dirty set to RocksDB every
-             [flush_every] coins so a 165M-coin snapshot never accumulates
-             the whole set in memory. The tip_height is recorded only on the
-             final flush below. *)
-          let flush_every = 1_000_000 in
-          let since_flush = ref 0 in
+          (* Commit cadence. Bounds the C++-side batch memory (~2 x 80 B
+             per coin) independent of snapshot size. *)
+          let commit_every = 500_000 in
+          let since_commit = ref 0 in
+          let vw = Serialize.writer_create () in
+          let commit () =
+            let a = if profile then Unix.gettimeofday () else 0. in
+            (* rocksdb_utxo first, then the CF — the same order as
+               OptimizedUtxoSet.flush / apply_block_atomic. *)
+            Rocksdb.write_batch_write_nowal rdb !rdb_wb;
+            Rocksdb.write_batch_destroy !rdb_wb;
+            rdb_wb := Rocksdb.write_batch_create ();
+            Rocksdb.write_batch_write_nowal cf_db !cf_wb;
+            Rocksdb.write_batch_destroy !cf_wb;
+            cf_wb := Rocksdb.write_batch_create ();
+            if profile then
+              t_commit := !t_commit +. (Unix.gettimeofday () -. a)
+          in
           let res = iter_snapshot_coins ~base_height:params.height sr
             ~coins_count:total
             ~f:(fun coin ->
-              let entry = {
+              let a = if profile then Unix.gettimeofday () else 0. in
+              let txid_cs = coin.outpoint.Types.txid in
+              let key =
+                Cf_chainstate.utxo_key txid_cs
+                  (Int32.to_int coin.outpoint.Types.vout) in
+              Buffer.clear vw.Serialize.buf;
+              Utxo.serialize_utxo_entry vw {
                 Utxo.value = coin.value;
                 script_pubkey = coin.script_pubkey;
                 height = coin.height;
                 is_coinbase = coin.is_coinbase;
-              } in
-              Utxo.OptimizedUtxoSet.add utxo
-                coin.outpoint.Types.txid
-                (Int32.to_int coin.outpoint.Types.vout)
-                entry;
+              };
+              let v = Serialize.writer_to_string vw in
+              Rocksdb.write_batch_put !rdb_wb key v;
+              Rocksdb.write_batch_put_cf !cf_wb cfh_utxo key v;
+              let b = if profile then Unix.gettimeofday () else 0. in
               hash_serialized_add hash_acc coin.outpoint coin;
+              let c = if profile then Unix.gettimeofday () else 0. in
               incr txouts;
               total_amount := Int64.add !total_amount coin.value;
               bogosize :=
                 Int64.add !bogosize
                   (Int64.of_int (50 + Cstruct.length coin.script_pubkey));
-              let txid_s = Cstruct.to_string coin.outpoint.Types.txid in
-              (match !last_txid with
-               | Some p when p = txid_s -> ()
-               | _ -> incr transactions; last_txid := Some txid_s);
+              if txid_cs != !last_txid_cs then begin
+                last_txid_cs := txid_cs;
+                let txid_s = Cstruct.to_string txid_cs in
+                (match !last_txid with
+                 | Some p when p = txid_s -> ()
+                 | _ -> incr transactions; last_txid := Some txid_s)
+              end;
               coins_loaded := Int64.add !coins_loaded 1L;
-              incr since_flush;
-              if !since_flush >= flush_every then begin
-                since_flush := 0;
-                (* No tip_height yet — only mutations. *)
-                Utxo.OptimizedUtxoSet.flush utxo;
-                (* Import runs before Lwt/Gc_guard. A full major (not
-                   compact) reclaims the flushed dirty batch so a
-                   12.7M-coin load does not leave a GB-scale boxed
-                   heap for Cli.run to compact-stall on. RPC is not
-                   listening yet, so the STW is free. *)
-                Gc.major ()
+              incr since_commit;
+              if !since_commit >= commit_every then begin
+                since_commit := 0;
+                commit ()
+              end;
+              if profile then begin
+                let d = Unix.gettimeofday () in
+                t_put := !t_put +. (b -. a);
+                t_hash := !t_hash +. (c -. b);
+                t_f := !t_f +. (d -. a)
               end;
               incr since_progress;
               if !since_progress >= progress_step then begin
@@ -1498,19 +1569,56 @@ let load_snapshot_into_primary
           in
           close_in ic;
           match res with
-          | Error msg -> Error msg
+          | Error msg -> destroy_batches (); Error msg
           | Ok _ ->
-            (* Final flush: drain any remaining dirty coins AND record the
-               RocksDB tip_height. The cli.ml:434 boot consistency check
-               compares [Rocksdb_store.get_tip_height] against
-               [chain_tip.height]; both must equal base_height or the boot
-               check rewinds blocks_synced to 0 and defeats the snapshot. *)
-            Utxo.OptimizedUtxoSet.flush ~tip_height:params.height utxo;
-            Gc.major ();
+            (* Final commit, then make every WAL-less row durable: a waited
+               memtable flush of rocksdb_utxo and of every chainstate CF
+               (RocksDB fsyncs the SSTs + MANIFEST before returning). Only
+               then record the RocksDB tip_height (fsynced). The cli.ml:434
+               boot consistency check compares [Rocksdb_store.get_tip_height]
+               against [chain_tip.height]; both must equal base_height or
+               the boot check rewinds blocks_synced to 0. *)
+            let a = Unix.gettimeofday () in
+            commit ();
+            destroy_batches ();
+            Rocksdb.flush_memtables rdb [||];
+            Rocksdb.flush_memtables cf_db
+              (Array.of_list (Cf_chainstate.all_handles cf));
+            let tip_wb = Rocksdb.write_batch_create () in
+            Rocksdb.write_batch_put tip_wb
+              (Rocksdb_store.meta_key "tip_height")
+              (Rocksdb_store.encode_tip_height params.height);
+            Rocksdb.write_batch_write_sync rdb tip_wb;
+            Rocksdb.write_batch_destroy tip_wb;
+            t_final := Unix.gettimeofday () -. a;
+            let elapsed = Unix.gettimeofday () -. t_start in
+            Printf.eprintf
+              "[utxo-import] %Ld coins written in %.1fs (%.0f coins/s; \
+               final flush %.1fs)\n%!"
+              !coins_loaded elapsed
+              (Int64.to_float !coins_loaded /. max elapsed 1e-6) !t_final;
+            if profile then
+              Printf.eprintf
+                "[utxo-import] profile: parse %.1fs, key+value+batch-put \
+                 %.1fs, hash %.1fs, batch-commit (incl. write stalls) \
+                 %.1fs, final flush %.1fs\n%!"
+                (elapsed -. !t_f -. !t_final) !t_put !t_hash !t_commit
+                !t_final;
+            let folded = hash_serialized_finish hash_acc in
+            (* Report only — this loader has never refused on the folded
+               hash (the campaign base control compares the served value);
+               the line makes the comparison visible in the node log. *)
+            Printf.eprintf
+              "[utxo-import] hash_serialized_3 %s (%s)\n%!"
+              (Types.hash256_to_hex_display folded)
+              (if Cstruct.equal folded params.coins_hash
+               then "matches the assumeutxo commitment"
+               else "DIFFERS from the assumeutxo commitment "
+                    ^ Types.hash256_to_hex_display params.coins_hash);
             set_cached_txoutset {
               height = params.height;
               best_block = metadata.base_blockhash;
-              hash_serialized = hash_serialized_finish hash_acc;
+              hash_serialized = folded;
               txouts = !txouts;
               transactions = !transactions;
               bogosize = !bogosize;
@@ -1585,16 +1693,24 @@ let load_snapshot_into_primary
                defined without historical bodies. *)
             Storage.ChainDB.store_chain_tx_count db metadata.base_blockhash
               params.chain_tx_count;
+            (* Last write of the import: every coin is in an SST and every
+               tip pointer is in the CF WAL, which this fsynced delete also
+               syncs. Until here a crash leaves the marker set. *)
+            Storage.ChainDB.clear_snapshot_import_incomplete db;
             Ok {
               base_blockhash = metadata.base_blockhash;
               base_height = params.height;
               coins_loaded = !coins_loaded;
             }
         with
-        | Failure msg -> close_in_noerr ic; Error msg
-        | End_of_file -> close_in_noerr ic; Error "Unexpected end of snapshot file"
+        | Failure msg ->
+          close_in_noerr ic; destroy_batches (); Error msg
+        | End_of_file ->
+          close_in_noerr ic; destroy_batches ();
+          Error "Unexpected end of snapshot file"
         | exn ->
           close_in_noerr ic;
+          destroy_batches ();
           Error (Printf.sprintf "Failed to load snapshot into primary chainstate: %s"
                    (Printexc.to_string exn))
       end

@@ -4358,7 +4358,8 @@ let process_downloaded_blocks ?(max_blocks = 1)
                     List.iteri (fun vout out ->
                       if not (Utxo.is_unspendable_script
                                 out.Types.script_pubkey) then
-                        Utxo.OptimizedUtxoSet.add utxo txid vout
+                        Utxo.OptimizedUtxoSet.add ~possible_overwrite:is_cb
+                          utxo txid vout
                           Utxo.{ value = out.Types.value;
                                  script_pubkey = out.Types.script_pubkey;
                                  height;
@@ -4375,7 +4376,8 @@ let process_downloaded_blocks ?(max_blocks = 1)
                        (txid, vout, data) :: ibd.pending_utxo_updates;
                      (match ibd.utxo_set with
                       | Some utxo ->
-                        Utxo.OptimizedUtxoSet.add utxo txid vout
+                        Utxo.OptimizedUtxoSet.add ~possible_overwrite:is_cb
+                          utxo txid vout
                           Utxo.{ value = out.Types.value;
                                  script_pubkey = out.Types.script_pubkey;
                                  height;
@@ -4609,6 +4611,74 @@ let collect_path (state : chain_state) (from_entry : header_entry)
   in
   collect [] to_entry
 
+(* The UTXO mutations that disconnect [block], IN APPLY ORDER, from its
+   stored undo data.  Mirrors Bitcoin Core's DisconnectBlock
+   (validation.cpp): transactions are walked in REVERSE, and for each one its
+   outputs are removed and THEN its own inputs are restored from its undo
+   record (inputs also in reverse).
+
+   The order is load-bearing.  camlcoin's undo carries one entry per input,
+   including inputs that spend an output created by an EARLIER tx in the SAME
+   block.  The disconnect loops used to remove ALL of the block's outputs
+   first and restore ALL undo prevouts afterwards, so for tx2 spending tx1:0
+   the final op on tx1:0 was the restore — a coin that never existed before
+   the block was resurrected into the UTXO set.  In reverse tx order tx2's
+   restore of tx1:0 comes first and tx1's own output removal then deletes it.
+
+   Every output is deleted (not only spendable ones): the connect path never
+   stores provably-unspendable outputs, so the delete is a no-op for them,
+   but older datadirs may hold OP_RETURN coins and dropping them is correct.
+
+   Errors when the undo shape does not match the block (Core:
+   "DisconnectBlock(): block and undo data inconsistent" /
+   "transaction and undo data inconsistent"). *)
+type disconnect_op =
+  | Disc_del of Types.hash256 * int
+  | Disc_put of Types.hash256 * int * Utxo.utxo_entry
+
+let block_disconnect_ops (block : Types.block) (undo : Utxo.undo_data)
+    : (disconnect_op list, string) result =
+  let txs = Array.of_list block.Types.transactions in
+  let undos = Array.of_list undo.Utxo.tx_undos in
+  let n = Array.length txs in
+  if n = 0 then Ok []
+  else if Array.length undos <> n - 1 then
+    Error (Printf.sprintf
+             "DisconnectBlock: block and undo data inconsistent \
+              (non-coinbase txs=%d undo groups=%d)" (n - 1)
+             (Array.length undos))
+  else begin
+    let ops = ref [] in           (* reversed apply order *)
+    let err = ref None in
+    let i = ref (n - 1) in
+    while !err = None && !i >= 0 do
+      let tx = txs.(!i) in
+      let txid = Crypto.compute_txid tx in
+      List.iteri (fun vout _ -> ops := Disc_del (txid, vout) :: !ops)
+        tx.Types.outputs;
+      if !i > 0 then begin
+        let inputs = Array.of_list tx.Types.inputs in
+        let spent = Array.of_list undos.(!i - 1).Utxo.spent_outputs in
+        if Array.length spent <> Array.length inputs then
+          err := Some (Printf.sprintf
+                         "DisconnectBlock: tx and undo inconsistent \
+                          (tx %d inputs=%d undos=%d)" !i
+                         (Array.length inputs) (Array.length spent))
+        else
+          for j = Array.length inputs - 1 downto 0 do
+            let prev = inputs.(j).Types.previous_output in
+            let (_, e) = spent.(j) in
+            ops := Disc_put (prev.Types.txid, Int32.to_int prev.Types.vout, e)
+                   :: !ops
+          done
+      end;
+      decr i
+    done;
+    match !err with
+    | Some e -> Error e
+    | None -> Ok (List.rev !ops)
+  end
+
 (* Disconnect blocks from current tip back to [target] (an ancestor of
    the current tip). Restores UTXOs spent on the disconnected blocks
    from each block's stored undo data and removes the outputs that the
@@ -4674,29 +4744,22 @@ let disconnect_to_target (state : chain_state) (target : header_entry)
                let r = Serialize.reader_of_cstruct
                          (Cstruct.of_string undo_raw) in
                let undo = Utxo.deserialize_undo_data r in
-               (* Remove outputs created by this block. Reverse tx order
-                  matches what [reorganize] does. *)
-               let txs = List.rev block.transactions in
-               List.iter (fun (tx : Types.transaction) ->
-                 let txid = Crypto.compute_txid tx in
-                 List.iteri (fun vout _out ->
+               match block_disconnect_ops block undo with
+               | Error msg ->
+                 Error (Printf.sprintf "%s at height %d" msg entry.height)
+               | Ok ops ->
+               (* Per-tx reverse order (Core DisconnectBlock).  The batch is
+                  applied in order and the LAST write to a key wins, so an
+                  intra-block-spent output restored by a later tx is then
+                  deleted by its creating tx — see [block_disconnect_ops]. *)
+               List.iter (function
+                 | Disc_del (txid, vout) ->
                    Storage.ChainDB.batch_delete_utxo batch txid vout
-                 ) tx.Types.outputs
-               ) txs;
-               (* Restore spent outputs from undo data. *)
-               List.iter (fun (tx_undo : Utxo.tx_undo) ->
-                 List.iter
-                   (fun (outpoint, (utxo_entry : Utxo.utxo_entry)) ->
-                     let data = encode_utxo utxo_entry.value
-                                  utxo_entry.script_pubkey
-                                  utxo_entry.height
-                                  utxo_entry.is_coinbase in
-                     Storage.ChainDB.batch_store_utxo batch
-                       outpoint.Types.txid
-                       (Int32.to_int outpoint.Types.vout)
-                       data
-                   ) tx_undo.spent_outputs
-               ) undo.tx_undos;
+                 | Disc_put (txid, vout, (e : Utxo.utxo_entry)) ->
+                   Storage.ChainDB.batch_store_utxo batch txid vout
+                     (encode_utxo e.value e.script_pubkey e.height
+                        e.is_coinbase)
+               ) ops;
                (* The undo data for this block is no longer valid:
                   [reorganize] will rebuild it on the connect path
                   when the chain is re-applied. *)
@@ -4802,24 +4865,26 @@ let disconnect_to_target_via_utxo (state : chain_state)
                 let r = Serialize.reader_of_cstruct
                           (Cstruct.of_string undo_raw) in
                 let undo = Utxo.deserialize_undo_data r in
-                (* Remove outputs this block created (reverse tx order). *)
-                let txs = List.rev block.transactions in
-                List.iter (fun (tx : Types.transaction) ->
-                  let txid = Crypto.compute_txid tx in
-                  List.iteri (fun vout _out ->
+                match block_disconnect_ops block undo with
+                | Error msg ->
+                  Error (Printf.sprintf "%s at height %d" msg entry.height)
+                | Ok ops ->
+                (* Per-tx reverse order (Core DisconnectBlock): remove each
+                   tx's outputs, then restore its own inputs.  A restore uses
+                   Core ApplyTxInUndo's [AddCoin(out, undo, !fClean)]: when
+                   the coin is already present the restore is unclean and
+                   must not be marked FRESH.  The cache itself also refuses
+                   FRESH over a pending (unflushed) spend — see
+                   [OptimizedUtxoSet.add]. *)
+                List.iter (function
+                  | Disc_del (txid, vout) ->
                     Utxo.OptimizedUtxoSet.remove_fast utxo txid vout
-                  ) tx.Types.outputs
-                ) txs;
-                (* Restore prevouts this block spent, from undo data. *)
-                List.iter (fun (tx_undo : Utxo.tx_undo) ->
-                  List.iter
-                    (fun (outpoint, (utxo_entry : Utxo.utxo_entry)) ->
-                      Utxo.OptimizedUtxoSet.add utxo
-                        outpoint.Types.txid
-                        (Int32.to_int outpoint.Types.vout)
-                        utxo_entry
-                    ) tx_undo.spent_outputs
-                ) undo.tx_undos;
+                  | Disc_put (txid, vout, e) ->
+                    let unclean =
+                      Utxo.OptimizedUtxoSet.exists utxo txid vout in
+                    Utxo.OptimizedUtxoSet.add ~possible_overwrite:unclean
+                      utxo txid vout e
+                ) ops;
                 Storage.ChainDB.delete_undo_data state.db entry.hash;
                 (* Tx-output spender index erase on the invalidateblock /
                    UTXO-aware disconnect path. RE-DERIVES this block's spend
@@ -4924,37 +4989,32 @@ let reconcile_rdb_to_chain_tip (state : chain_state)
                let r = Serialize.reader_of_cstruct
                          (Cstruct.of_string undo_raw) in
                let undo = Utxo.deserialize_undo_data r in
-               (* Remove outputs created by this block (skip provably-
-                  unspendable: they were never written to the UTXO set,
-                  matching apply_block_atomic's is_unspendable_script filter
-                  on the connect path). Deleting an absent UTXO is a no-op,
-                  so this is safe even for the partially-applied tip block. *)
-               List.iter (fun (tx : Types.transaction) ->
-                 let txid = Crypto.compute_txid tx in
-                 List.iteri (fun vout (out : Types.tx_out) ->
-                   if not (Utxo.is_unspendable_script out.Types.script_pubkey)
-                   then begin
-                     let key = Storage.ChainDB.rocksdb_utxo_key txid vout in
-                     rdb_ops := (key, None) :: !rdb_ops;
-                     Storage.ChainDB.batch_delete_utxo cf_batch txid vout
-                   end
-                 ) tx.Types.outputs
-               ) block.transactions;
-               (* Restore spent outputs from undo data. Re-adding an existing
-                  UTXO is an idempotent overwrite. *)
-               List.iter (fun (tx_undo : Utxo.tx_undo) ->
-                 List.iter
-                   (fun (outpoint, (e : Utxo.utxo_entry)) ->
-                     let data = encode_utxo e.Utxo.value e.Utxo.script_pubkey
-                                  e.Utxo.height e.Utxo.is_coinbase in
-                     let txid = outpoint.Types.txid in
-                     let vout = Int32.to_int outpoint.Types.vout in
-                     let key = Storage.ChainDB.rocksdb_utxo_key txid vout in
-                     rdb_ops := (key, Some data) :: !rdb_ops;
-                     Storage.ChainDB.batch_store_utxo cf_batch txid vout data
-                   ) tx_undo.spent_outputs
-               ) undo.tx_undos;
-               undo_to_delete := bhash :: !undo_to_delete)));
+               (* Per-tx reverse order (Core DisconnectBlock /
+                  RollbackBlock): each tx's outputs are removed, then its own
+                  inputs restored, so an output created and spent inside this
+                  block ends absent — see [block_disconnect_ops].  Deleting an
+                  absent UTXO and re-writing an existing one are both
+                  idempotent, so this is safe even for the partially-applied
+                  tip block.  [rdb_ops] is prepended here and reversed at
+                  commit, so within the block it is applied in [ops] order. *)
+               (match block_disconnect_ops block undo with
+                | Error msg ->
+                  error := Some (Printf.sprintf
+                    "reconcile: %s at window height %d" msg height)
+                | Ok ops ->
+                  List.iter (function
+                    | Disc_del (txid, vout) ->
+                      let key = Storage.ChainDB.rocksdb_utxo_key txid vout in
+                      rdb_ops := (key, None) :: !rdb_ops;
+                      Storage.ChainDB.batch_delete_utxo cf_batch txid vout
+                    | Disc_put (txid, vout, (e : Utxo.utxo_entry)) ->
+                      let data = encode_utxo e.Utxo.value e.Utxo.script_pubkey
+                                   e.Utxo.height e.Utxo.is_coinbase in
+                      let key = Storage.ChainDB.rocksdb_utxo_key txid vout in
+                      rdb_ops := (key, Some data) :: !rdb_ops;
+                      Storage.ChainDB.batch_store_utxo cf_batch txid vout data
+                  ) ops;
+                  undo_to_delete := bhash :: !undo_to_delete))));
       decr h
     done;
     match !error with

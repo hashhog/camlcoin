@@ -10193,7 +10193,9 @@ let activate_loaded_snapshot (ctx : rpc_context)
      | Some utxo ->
        let since_flush = ref 0 in
        Assume_utxo.iter_chainstate_coins snapshot (fun coin ->
-         Utxo.OptimizedUtxoSet.add utxo
+         (* Core loads snapshot coins with EmplaceCoinInternalDANGER:
+            DIRTY, never FRESH — the datadir may already hold them. *)
+         Utxo.OptimizedUtxoSet.add ~possible_overwrite:true utxo
            coin.outpoint.Types.txid
            (Int32.to_int coin.outpoint.Types.vout)
            { Utxo.value = coin.value;

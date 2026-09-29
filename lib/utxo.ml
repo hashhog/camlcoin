@@ -311,7 +311,15 @@ let compute_stats (utxo : UtxoSet.t) : utxo_stats =
    dramatically reduces disk I/O by batching writes. *)
 
 module OptimizedUtxoSet = struct
-  type dirty_entry = [ `Added of utxo_entry | `Removed ]
+  (* Dirty-set states, mirroring Core's CCoinsCacheEntry flags (coins.h):
+     - [`Added e]   DIRTY|FRESH: the coin is known NOT to be on disk, so a
+                    spend may drop the entry outright (no delete needed).
+     - [`Updated e] DIRTY, not FRESH: the coin MAY be on disk (it was
+                    re-added over a pending delete, over a clean cached coin,
+                    or with [~possible_overwrite]).  Flushed as a put; a spend
+                    must record [`Removed] so the on-disk copy is deleted.
+     - [`Removed]   spent, delete pending. *)
+  type dirty_entry = [ `Added of utxo_entry | `Updated of utxo_entry | `Removed ]
 
   type t = {
     db : Storage.ChainDB.t;
@@ -358,7 +366,7 @@ module OptimizedUtxoSet = struct
         (* Marked for deletion - does not exist *)
         t.stats.misses <- t.stats.misses + 1;
         None
-      | Some (`Added entry) ->
+      | Some (`Added entry | `Updated entry) ->
         (* In dirty set but evicted from LRU - re-add to cache *)
         t.stats.cache_hits <- t.stats.cache_hits + 1;
         Perf.LRU.put t.cache key entry;
@@ -407,7 +415,7 @@ module OptimizedUtxoSet = struct
       | Some `Removed ->
         t.stats.misses <- t.stats.misses + 1;
         Mem_removed
-      | Some (`Added entry) ->
+      | Some (`Added entry | `Updated entry) ->
         t.stats.cache_hits <- t.stats.cache_hits + 1;
         Perf.LRU.put t.cache key entry;
         Mem_hit entry
@@ -455,13 +463,36 @@ module OptimizedUtxoSet = struct
   (* Add a UTXO entry to LRU cache and mark dirty. Does NOT write to disk.
      A capacity-0 cache (snapshot import) skips the LRU entirely: the
      loader never reads back a coin it just wrote, and put+evict of
-     12.7M boxed dll nodes was the 315000 RPC-startup timeout. *)
-  let add (t : t) (txid : Types.hash256) (vout : int)
-      (entry : utxo_entry) : unit =
+     12.7M boxed dll nodes was the 315000 RPC-startup timeout.
+
+     FRESH ([`Added]) vs DIRTY-only ([`Updated]) follows Core's
+     CCoinsViewCache::AddCoin (coins.cpp): a coin may be marked FRESH
+     ("not on disk", so a later spend can simply drop the entry) ONLY when
+     [possible_overwrite] is false AND the cache holds no dirty entry for it
+     AND it is not cached as a clean (on-disk) coin.  An existing FRESH
+     entry stays FRESH (Core never clears the flag on re-add).  Everything
+     else becomes [`Updated]:
+       - over a pending [`Removed]: the delete has not been flushed, the coin
+         is STILL on disk.  Marking it FRESH made the next spend drop the
+         entry, losing the delete — the spent coin survived in both stores
+         (invalidateblock: undo restore then remove_fast; blockbrew ecfbd5f).
+       - over [`Updated]: still possibly on disk.
+       - over a clean LRU entry: it was read from, or flushed to, disk.
+       - [possible_overwrite] (Core AddCoins: coinbase; ApplyTxInUndo:
+         !fClean): the caller cannot rule out an on-disk copy. *)
+  let add ?(possible_overwrite = false) (t : t) (txid : Types.hash256)
+      (vout : int) (entry : utxo_entry) : unit =
     let key = utxo_key txid vout in
+    let fresh =
+      match Hashtbl.find_opt t.dirty key with
+      | Some (`Added _) -> true
+      | Some (`Updated _ | `Removed) -> false
+      | None -> not possible_overwrite && not (Perf.LRU.mem t.cache key)
+    in
     if Perf.LRU.capacity t.cache > 0 then
       Perf.LRU.put t.cache key entry;
-    Hashtbl.replace t.dirty key (`Added entry)
+    Hashtbl.replace t.dirty key
+      (if fresh then `Added entry else `Updated entry)
 
   (* Remove a UTXO entry. Marks as Removed in dirty set, removes from LRU.
      Does NOT delete from disk immediately.
@@ -475,7 +506,7 @@ module OptimizedUtxoSet = struct
       | Some entry -> Some entry
       | None ->
         match Hashtbl.find_opt t.dirty key with
-        | Some (`Added entry) -> Some entry
+        | Some (`Added entry | `Updated entry) -> Some entry
         | Some `Removed -> None
         | None ->
           let db_result = match t.rocksdb with
@@ -495,18 +526,19 @@ module OptimizedUtxoSet = struct
 
   (* Fast remove: mark as Removed without looking up the old entry.
      Used during IBD when the caller discards the return value.
-     Optimization: if the entry was Added in this flush window (not yet
-     on disk), we can remove it from the dirty set entirely — avoids a
-     pointless write+delete round-trip on the next flush. *)
+     Optimization: if the entry is FRESH ([`Added]: provably not on disk),
+     drop it from the dirty set entirely — avoids a pointless write+delete
+     round-trip on the next flush (Core SpendCoin: FRESH -> erase).  An
+     [`Updated] entry may be on disk, so it must record the deletion. *)
   let remove_fast (t : t) (txid : Types.hash256) (vout : int) : unit =
     let key = utxo_key txid vout in
     Perf.LRU.remove t.cache key;
     match Hashtbl.find_opt t.dirty key with
     | Some (`Added _) ->
-      (* Created and spent in same flush window — just remove both *)
+      (* FRESH: created and spent in same flush window — just remove both *)
       Hashtbl.remove t.dirty key
-    | _ ->
-      (* Entry is on disk from a previous flush — must record deletion *)
+    | Some (`Updated _ | `Removed) | None ->
+      (* Possibly on disk — must record deletion *)
       Hashtbl.replace t.dirty key `Removed
 
   (* Check if a UTXO exists *)
@@ -516,7 +548,7 @@ module OptimizedUtxoSet = struct
     else
       match Hashtbl.find_opt t.dirty key with
       | Some `Removed -> false
-      | Some (`Added _) -> true
+      | Some (`Added _ | `Updated _) -> true
       | None ->
         (match t.rocksdb with
          | Some rdb -> Option.is_some (Rocksdb_store.get rdb key)
@@ -539,7 +571,7 @@ module OptimizedUtxoSet = struct
            Hashtbl.create (Hashtbl.length t.dirty) in
          Hashtbl.iter (fun key entry ->
            match entry with
-           | `Added utxo ->
+           | `Added utxo | `Updated utxo ->
              let w = Serialize.writer_create () in
              serialize_utxo_entry w utxo;
              Hashtbl.replace serialized key (`Added (Serialize.writer_to_cstruct w))
@@ -593,7 +625,7 @@ module OptimizedUtxoSet = struct
            let txid = Cstruct.sub key_cs 0 32 in
            let vout = Int32.to_int (Cstruct.LE.get_uint32 key_cs 32) in
            match entry with
-           | `Added utxo ->
+           | `Added utxo | `Updated utxo ->
              let w = Serialize.writer_create () in
              serialize_utxo_entry w utxo;
              Storage.ChainDB.batch_store_utxo batch txid vout
@@ -633,7 +665,7 @@ module OptimizedUtxoSet = struct
       let txid = Cstruct.sub key_cs 0 32 in
       let vout = Int32.to_int (Cstruct.LE.get_uint32 key_cs 32) in
       let op = match entry with
-        | `Added utxo ->
+        | `Added utxo | `Updated utxo ->
           let w = Serialize.writer_create () in
           serialize_utxo_entry w utxo;
           `Add (Serialize.writer_to_string w)
@@ -676,7 +708,7 @@ module OptimizedUtxoSet = struct
         let payload =
           match v with
           | `Removed -> None
-          | `Added entry ->
+          | `Added entry | `Updated entry ->
             let w = Serialize.writer_create () in
             serialize_utxo_entry w entry;
             Some (Serialize.writer_to_string w)
@@ -836,7 +868,10 @@ let connect_block_optimized ?(network_type : Consensus.network = Consensus.Mainn
              dumptxoutset to emit a UTXO set that diverges from Core
              on every post-SegWit block. *)
           if not (is_unspendable_script out.Types.script_pubkey) then
-            OptimizedUtxoSet.add utxo txid vout {
+            (* Core AddCoins: possible_overwrite = fCoinbase (BIP30
+               duplicate coinbases may already be on disk). *)
+            OptimizedUtxoSet.add ~possible_overwrite:is_coinbase
+              utxo txid vout {
               value = out.Types.value;
               script_pubkey = out.script_pubkey;
               height;

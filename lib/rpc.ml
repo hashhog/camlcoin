@@ -11866,8 +11866,14 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
          ChainDB.iter_utxos alone therefore reports the last flushed
          set — STALE-UTXO-READ on every ladder range shorter than the
          interval.  [Utxo.iter_committed_utxos] merges the dirty overlay
-         onto the on-disk CF in outpoint order, which is the set
-         ForceFlushStateToDisk would have hashed, with no write. *)
+         onto the on-disk coin store in outpoint order, which is the set
+         ForceFlushStateToDisk would have hashed, with no write.
+
+         That store is Rocksdb_store (rocksdb_utxo/) -- the one
+         OptimizedUtxoSet.get and therefore block validation read -- NOT
+         the Cf_chainstate UTXO CF, which on a snapshot-bootstrapped
+         datadir holds only post-base coins (live mainnet 969284: 34.4M
+         txouts vs Core's 165.2M).  See OptimizedUtxoSet.iter_base. *)
       (* Core reports [stats.nHeight] / [stats.hashBlock] from the coins
          view's best block — the ACTIVE VALIDATED chainstate tip, never
          the header index. After --import-utxo, Sync.block_tip can still

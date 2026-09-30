@@ -87,6 +87,26 @@ let put (t : t) (key : string) (value : string) : unit =
 let delete (t : t) (key : string) : unit =
   Rocksdb.delete t.db key
 
+(* Walk every coin in the store, in outpoint-key order (txid32 ++ vout LE32,
+   bytewise -- the same order and layout as Cf_chainstate's UTXO CF, so
+   Storage.ChainDB.iter_utxos and this walk interleave identically).  The
+   store also holds [meta_key] entries ("__meta__tip_height", 18 bytes);
+   every coin key is exactly 36 bytes, so the length test skips metadata
+   without having to name each meta key.  Read-only; one point-in-time
+   RocksDB snapshot for the whole walk. *)
+let iter_utxos (t : t) (f : Types.hash256 -> int -> string -> unit) : unit =
+  Rocksdb.iter t.db (fun key value ->
+    if String.length key = 36 then begin
+      let txid = Cstruct.of_string (String.sub key 0 32) in
+      let vout =
+        Char.code key.[32]
+        lor (Char.code key.[33] lsl 8)
+        lor (Char.code key.[34] lsl 16)
+        lor (Char.code key.[35] lsl 24)
+      in
+      f txid vout value
+    end)
+
 (* Metadata key prefix — uses a prefix that cannot collide with
    the 36-byte outpoint keys (which are raw binary). *)
 let meta_key k = "__meta__" ^ k

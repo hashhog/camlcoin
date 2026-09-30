@@ -86,6 +86,12 @@ external cf_iter : t -> cf_handle -> (string -> string -> unit) -> unit
    Holds RocksDB resources (iterator) for the duration; caller's [f]
    must not call back into the same DB. *)
 
+external iter : t -> (string -> string -> unit) -> unit
+  = "caml_rocksdb_iter"
+(* Iterate every key/value in the DEFAULT column family, in bytewise key
+   order, over an implicit point-in-time snapshot.  [f] must not call back
+   into the same DB. *)
+
 (* --- Snapshot-import helpers --------------------------------------- *)
 
 external write_batch_write_sync : t -> batch -> unit

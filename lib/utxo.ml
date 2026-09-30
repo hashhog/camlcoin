@@ -679,8 +679,31 @@ module OptimizedUtxoSet = struct
       !ops;
     Hashtbl.clear t.dirty
 
-  (* Walk the committed coin set: on-disk CF overlaid with [dirty], in
-     outpoint order.  Read-only — must not persist.
+  (* The on-disk coin store [get] / [read_db] read: Rocksdb_store when one
+     is attached (every production node -- cli.ml wires it), else the CF.
+
+     This is the base [iter_committed] walks.  It used to be
+     Storage.ChainDB.iter_utxos -- the Cf_chainstate UTXO column family --
+     unconditionally.  That CF is NOT the coin set validation reads: the
+     snapshot import and every [flush] before 57ae4b0 (2026-09-05) wrote
+     coins to Rocksdb_store ONLY, and [get] never consults the CF.  On a
+     datadir bootstrapped from a snapshot the CF therefore holds only the
+     coins created after the base (plus whatever the mirrored writes added
+     later), and gettxoutsetinfo walked that: live mainnet at 969284
+     answered 34,404,890 txouts / 4,330,938.887 BTC against Core's
+     165,162,133 / 20,091,285.502 BTC, while gettxout and block validation
+     -- which read Rocksdb_store -- had every coin.  Walk the store the
+     node validates against.  Both stores key coins as txid32 ++ vout LE32
+     under the bytewise comparator, so the overlay merge below is
+     unchanged. *)
+  let iter_base (t : t) (f : Types.hash256 -> int -> string -> unit) : unit =
+    match t.rocksdb with
+    | Some rdb -> Rocksdb_store.iter_utxos rdb f
+    | None -> Storage.ChainDB.iter_utxos t.db f
+
+  (* Walk the committed coin set: the on-disk coin store ([iter_base])
+     overlaid with [dirty], in outpoint order.  Read-only — must not
+     persist.
 
      Core's gettxoutsetinfo hashes CoinsDB() after ForceFlushStateToDisk
      (rpc/blockchain.cpp:1075) because coins and DB_BEST_BLOCK share one
@@ -700,7 +723,7 @@ module OptimizedUtxoSet = struct
       (f : Types.hash256 -> int -> string -> unit) : unit =
     let n = Hashtbl.length t.dirty in
     if n = 0 then
-      Storage.ChainDB.iter_utxos t.db f
+      iter_base t f
     else begin
       let overlay = Array.make n ("", (None : string option)) in
       let i = ref 0 in
@@ -731,7 +754,7 @@ module OptimizedUtxoSet = struct
           in
           f txid vout data
       in
-      Storage.ChainDB.iter_utxos t.db (fun txid vout data ->
+      iter_base t (fun txid vout data ->
         let key = utxo_key txid vout in
         while !oi < n && String.compare (fst overlay.(!oi)) key < 0 do
           let (k, p) = overlay.(!oi) in
@@ -779,7 +802,8 @@ module OptimizedUtxoSet = struct
 end
 
 (* Read-only walk of the committed UTXO set.  When [cache] is [Some],
-   overlays its dirty map on the on-disk CF in outpoint order; when
+   overlays its dirty map on the coin store it reads
+   ([OptimizedUtxoSet.iter_base]) in outpoint order; when
    [None], this is [Storage.ChainDB.iter_utxos].  Never writes. *)
 let iter_committed_utxos (cache : OptimizedUtxoSet.t option)
     (db : Storage.ChainDB.t)

@@ -776,6 +776,49 @@ CAMLprim value caml_rocksdb_cf_iter(value v_db, value v_cfh, value v_f) {
   CAMLreturn(Val_unit);
 }
 
+/* Iterate every key/value in the DEFAULT column family of a plain
+   (non-CF) store opened with caml_rocksdb_open -- i.e. Rocksdb_store's
+   rocksdb_utxo, the coin store validation reads.  Keys arrive in bytewise
+   order.  The iterator is created without an explicit snapshot, so RocksDB
+   pins an implicit one: the walk sees one consistent point-in-time view
+   even if writes land while it runs.  An exception raised by [f] destroys
+   the iterator before it propagates (cf_iter above leaks it). */
+CAMLprim value caml_rocksdb_iter(value v_db, value v_f) {
+  CAMLparam2(v_db, v_f);
+  CAMLlocal3(v_key, v_val, v_res);
+
+  rocksdb_t *db = Rocksdb_val(v_db);
+  if (!db) caml_failwith("rocksdb_iter: database is closed");
+
+  rocksdb_iterator_t *it = rocksdb_create_iterator(db, get_read_options());
+  rocksdb_iter_seek_to_first(it);
+  while (rocksdb_iter_valid(it)) {
+    size_t klen = 0, vlen = 0;
+    const char *kp = rocksdb_iter_key(it, &klen);
+    const char *vp = rocksdb_iter_value(it, &vlen);
+
+    v_key = caml_alloc_initialized_string(klen, kp);
+    v_val = caml_alloc_initialized_string(vlen, vp);
+    v_res = caml_callback2_exn(v_f, v_key, v_val);
+    if (Is_exception_result(v_res)) {
+      rocksdb_iter_destroy(it);
+      caml_raise(Extract_exception(v_res));
+    }
+
+    rocksdb_iter_next(it);
+  }
+  char *err = NULL;
+  rocksdb_iter_get_error(it, &err);
+  rocksdb_iter_destroy(it);
+  if (err) {
+    char msg[512];
+    snprintf(msg, sizeof(msg), "rocksdb_iter: %s", err);
+    rocksdb_free(err);
+    caml_failwith(msg);
+  }
+  CAMLreturn(Val_unit);
+}
+
 /* ---------- Snapshot-import durability helpers ------------------------- */
 /* Write a batch with WAL on AND WriteOptions.sync = true (fsync the WAL
    before returning). Used for the snapshot-import-incomplete marker and

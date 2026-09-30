@@ -669,8 +669,19 @@ module ChainDB = struct
       (ops : (Types.hash256 * int * [ `Add of string | `Del ]) list)
       : unit =
     let cf_batch = Cf_chainstate.batch_create t.cf in
+    (* [ops] is in block order, so a coin created and spent inside the same
+       block appears as [`Add] then [`Del], and a WriteBatch applies its
+       records in order -- the last one wins.  The CF batch is filled in
+       [ops] order below.  [rdb_ops] must keep that order too: it used to be
+       the bare [List.rev_map] result, i.e. REVERSED, so Rocksdb_store saw
+       [Del] then [Add] and KEPT every intra-block-spent coin while the CF
+       deleted it.  Validation reads Rocksdb_store, so each one became a
+       spendable ghost: an offline copy of the live mainnet stores at 969302
+       held tens of millions of them, every sampled one created and spent
+       in the same block (2026-09-30).  The boot content check in cli.ml
+       already assumed "only the Del survives in RDB". *)
     let rdb_ops =
-      List.rev_map (fun (txid, vout, op) ->
+      List.rev @@ List.rev_map (fun (txid, vout, op) ->
         let rdb_key = rocksdb_utxo_key txid vout in
         (match op with
          | `Add data ->

@@ -107,6 +107,30 @@ let iter_utxos (t : t) (f : Types.hash256 -> int -> string -> unit) : unit =
       f txid vout value
     end)
 
+(* Explicit point-in-time view of the coin store, for a walk that runs
+   later and elsewhere (gettxoutsetinfo on its own domain).  Take it in the
+   same main-thread instant as any in-memory state the walk overlays. *)
+type snapshot = Rocksdb.snapshot
+
+let snapshot (t : t) : snapshot = Rocksdb.snapshot_create t.db
+
+let release_snapshot (s : snapshot) : unit = Rocksdb.snapshot_release s
+
+(* [iter_utxos] over [snap]: same order, same 36-byte key filter. *)
+let iter_utxos_at (snap : snapshot)
+    (f : Types.hash256 -> int -> string -> unit) : unit =
+  Rocksdb.iter_snapshot snap (fun key value ->
+    if String.length key = 36 then begin
+      let txid = Cstruct.of_string (String.sub key 0 32) in
+      let vout =
+        Char.code key.[32]
+        lor (Char.code key.[33] lsl 8)
+        lor (Char.code key.[34] lsl 16)
+        lor (Char.code key.[35] lsl 24)
+      in
+      f txid vout value
+    end)
+
 (* Metadata key prefix — uses a prefix that cannot collide with
    the 36-byte outpoint keys (which are raw binary). *)
 let meta_key k = "__meta__" ^ k

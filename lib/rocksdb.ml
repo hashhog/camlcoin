@@ -92,6 +92,21 @@ external iter : t -> (string -> string -> unit) -> unit
    order, over an implicit point-in-time snapshot.  [f] must not call back
    into the same DB. *)
 
+type snapshot
+
+external snapshot_create : t -> snapshot = "caml_rocksdb_snapshot_create"
+(* Pin a point-in-time view of the DEFAULT column family.  Must be released
+   with [snapshot_release] before the DB is closed. *)
+
+external snapshot_release : snapshot -> unit = "caml_rocksdb_snapshot_release"
+(* Idempotent. *)
+
+external iter_snapshot : snapshot -> (string -> string -> unit) -> unit
+  = "caml_rocksdb_iter_snapshot"
+(* [iter] over an explicit snapshot, releasing the OCaml runtime around each
+   cursor move.  Safe to call from a non-main domain.  [f] must not call
+   back into the same DB. *)
+
 (* --- Snapshot-import helpers --------------------------------------- *)
 
 external write_batch_write_sync : t -> batch -> unit

@@ -11745,8 +11745,160 @@ let handle_dumptxoutset (_ctx : rpc_context)
    ("Querying specific block heights is not supported") because we do not
    maintain a coinstats index. *)
 
-let handle_gettxoutsetinfo (ctx : rpc_context)
-    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+(* A gettxoutsetinfo full walk, captured and ready to run.  [tw_view] and
+   the tip come from the SAME main-thread instant (see [Utxo.OptimizedUtxoSet.
+   capture_view]); the reported height/bestblock therefore always describe the
+   set that is hashed.  Without an OptimizedUtxoSet (tests) the walk reads the
+   CF directly. *)
+type txoutset_job = {
+  tw_normalized : string;
+  tw_height : int;
+  tw_hash : Types.hash256;
+  tw_view : [ `View of Utxo.OptimizedUtxoSet.view | `Db of Storage.ChainDB.t ];
+}
+
+(* Test hook: when > 0, the domain-side walk spins (CPU, holding its own
+   domain's runtime) this many seconds before walking, so a test can prove
+   RPC and block connection stay live during a long walk. *)
+let test_txoutset_walk_spin_s = ref 0.0
+
+(* The gettxoutsetinfo walk + response, over a coin iterator handed in by
+   the caller.  Touches nothing but [iter] and its own accumulators, so it can
+   run on a separate domain (see [handle_gettxoutsetinfo_lwt]). *)
+let txoutset_walk_json ~(normalized : string) ~(tip_height : int)
+    ~(tip_hash : Types.hash256)
+    (iter : (Types.hash256 -> int -> string -> unit) -> unit) : Yojson.Safe.t =
+  (* Walk the committed UTXO set once, computing aggregate stats and
+     (optionally) the requested commitment in a single pass. The
+     MuHash accumulator is allocated lazily so callers asking for
+     hash_type=none don't pay for it. hash_serialized_3 uses
+     [hash_serialized_acc] (one txid group, numeric vouts, running
+     SHA256d) so LE32 key order cannot scramble HASH_SERIALIZED. *)
+  let muhash_acc =
+    if normalized = "muhash" then Some (Muhash.create ()) else None
+  in
+  let hash_acc =
+    if normalized = "hash_serialized_3" then
+      Some (Assume_utxo.hash_serialized_create ())
+    else None
+  in
+  let txouts = ref 0 in
+  let bogosize = ref 0L in
+  let total_amount = ref 0L in
+  (* disk_size is "impl-specific" in Core (LevelDB EstimateSize). We
+     have no equivalent estimator on the RocksDB CF backend, so we
+     approximate the on-disk chainstate footprint by summing the raw
+     key+value bytes of each coin entry (key = txid32 + vout4 = 36,
+     value = serialized utxo entry) during the single pass below. This
+     is a non-zero, monotone-with-set-size Int — the test asserts it is
+     PRESENT and typed, not byte-equal to Core. *)
+  let disk_size = ref 0L in
+  (* [transactions] = number of distinct txids.  Counted the way Core
+     does (kernel/coinstats.cpp ComputeUTXOStats: nTransactions++ each
+     time the cursor's key.hash differs from prevkey): the walk is in
+     outpoint key order (txid32 ++ vout), so every output of one txid
+     is contiguous and a change of txid starts a new transaction.
+     This used to put a 64-char hex key for EVERY txid in a Hashtbl —
+     on mainnet ~10^8 live strings (>10 GB of OCaml heap) held for the
+     whole scan, on the Lwt main thread, against a 48G unit cap. *)
+  let n_transactions = ref 0 in
+  let prev_txid = ref Cstruct.empty in
+  iter (fun txid vout data ->
+    let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+    let utxo = Utxo.deserialize_utxo_entry r in
+    let outpoint = { Types.txid; vout = Int32.of_int vout } in
+    if !n_transactions = 0 || not (Cstruct.equal txid !prev_txid) then begin
+      incr n_transactions;
+      prev_txid := txid
+    end;
+    incr txouts;
+    total_amount := Int64.add !total_amount utxo.Utxo.value;
+    (* Core's GetBogoSize: 32 + 4 + 4 + 8 + 2 + scriptPubKey.size *)
+    let spk_len = Cstruct.length utxo.script_pubkey in
+    bogosize := Int64.add !bogosize (Int64.of_int (50 + spk_len));
+    (* Impl-specific disk-size estimate: 36-byte key + value bytes. *)
+    disk_size :=
+      Int64.add !disk_size (Int64.of_int (36 + String.length data));
+    (match muhash_acc with
+     | None -> ()
+     | Some acc ->
+       let buf =
+         Muhash.serialize_txout outpoint
+           ~value:utxo.Utxo.value
+           ~script_pubkey:utxo.script_pubkey
+           ~height:utxo.height
+           ~is_coinbase:utxo.is_coinbase
+       in
+       Muhash.add acc (Bytes.unsafe_to_string buf));
+    (match hash_acc with
+     | None -> ()
+     | Some acc ->
+       let coin : Assume_utxo.snapshot_coin = {
+         outpoint;
+         value = utxo.Utxo.value;
+         script_pubkey = utxo.script_pubkey;
+         height = utxo.height;
+         is_coinbase = utxo.is_coinbase;
+       } in
+       Assume_utxo.hash_serialized_add acc outpoint coin));
+  (* Core gettxoutsetinfo (blockchain.cpp:1115) order:
+       height, bestblock, txouts, bogosize, [hash_serialized_3 | muhash],
+       total_amount, transactions, disk_size.
+     The hash field (when present) sits BETWEEN bogosize and total_amount.
+     Height/bestblock were captured BEFORE the walk so a concurrent
+     connect cannot relabel a stale set. *)
+  let hash_field =
+    match muhash_acc, hash_acc with
+    | Some acc, _ ->
+      let raw = Muhash.finalize acc in
+      [("muhash",
+          `String (Types.hash256_to_hex_display
+                     (Cstruct.of_bytes raw)))]
+    | None, Some acc ->
+      let h = Assume_utxo.hash_serialized_finish acc in
+      [("hash_serialized_3",
+          `String (Types.hash256_to_hex_display h))]
+    | None, None -> []
+  in
+  (* disk_size: Core reports the chainstate LevelDB EstimateSize, which is
+     0 for an unflushed (in-memory) regtest chainstate. Our [disk_size]
+     accumulator is a bogosize-like estimate, not the on-disk LevelDB size;
+     emit 0 to match Core's unflushed-regtest report. *)
+  let _ = disk_size in
+  let base_fields = [
+    ("height", `Int tip_height);
+    ("bestblock",
+       `String (Types.hash256_to_hex_display tip_hash));
+    ("txouts", `Int !txouts);
+    ("bogosize", `Int (Int64.to_int !bogosize));
+  ] @ hash_field @ [
+    ("total_amount",
+       (* Core formats total_amount as a fixed-precision BTC decimal
+          via ValueFromAmount (blockchain.cpp:1126). Emit the same
+          "N.NNNNNNNN" decimal so the field is byte-comparable against
+          Core's gettxoutsetinfo output. *)
+       btc_amount_json !total_amount);
+    ("transactions", `Int !n_transactions);
+    ("disk_size", `Int 0);
+  ] in
+  `Assoc base_fields
+
+let run_txoutset_job (j : txoutset_job) : Yojson.Safe.t =
+  match j.tw_view with
+  | `Db db ->
+    txoutset_walk_json ~normalized:j.tw_normalized ~tip_height:j.tw_height
+      ~tip_hash:j.tw_hash (Storage.ChainDB.iter_utxos db)
+  | `View v ->
+    Fun.protect
+      ~finally:(fun () -> Utxo.OptimizedUtxoSet.release_view v)
+      (fun () ->
+        txoutset_walk_json ~normalized:j.tw_normalized
+          ~tip_height:j.tw_height ~tip_hash:j.tw_hash
+          (Utxo.OptimizedUtxoSet.iter_view v))
+
+let gettxoutsetinfo_prepare (ctx : rpc_context)
+    (params : Yojson.Safe.t list)
+    : ([ `Json of Yojson.Safe.t | `Walk of txoutset_job ], string) result =
   let hash_type, extra_args =
     match params with
     | [] -> ("hash_serialized_3", [])
@@ -11840,7 +11992,7 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
                                       s.Coinstats_index.s_muhash)))]
                   else []
                 in
-                Ok (`Assoc (base_fields @ hash_field))))
+                Ok (`Json (`Assoc (base_fields @ hash_field)))))
   end
   else begin
       (* NO force-flush here — deliberately (1.0.1 revert of the flush added
@@ -11907,7 +12059,7 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
                            cached.Assume_utxo.hash_serialized))]
            else []
          in
-         Ok (`Assoc ([
+         Ok (`Json (`Assoc ([
            ("height", `Int cached.Assume_utxo.height);
            ("bestblock",
               `String (Types.hash256_to_hex_display
@@ -11918,123 +12070,66 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
            ("total_amount", btc_amount_json cached.Assume_utxo.total_amount);
            ("transactions", `Int cached.Assume_utxo.transactions);
            ("disk_size", `Int 0);
-         ]))
+         ])))
        | None ->
-      (* Walk the committed UTXO set once, computing aggregate stats and
-         (optionally) the requested commitment in a single pass. The
-         MuHash accumulator is allocated lazily so callers asking for
-         hash_type=none don't pay for it. hash_serialized_3 uses
-         [hash_serialized_acc] (one txid group, numeric vouts, running
-         SHA256d) so LE32 key order cannot scramble HASH_SERIALIZED. *)
-      let muhash_acc =
-        if normalized = "muhash" then Some (Muhash.create ()) else None
+      (* Capture the tip and a frozen view of the coin set in ONE
+         non-yielding step; the walk itself runs later, possibly on another
+         domain, over that view only (Core: ComputeUTXOStats walks a cursor
+         snapshot without holding cs_main). *)
+      let view =
+        match ctx.utxo with
+        | Some u -> `View (Utxo.OptimizedUtxoSet.capture_view u)
+        | None -> `Db ctx.chain.db
       in
-      let hash_acc =
-        if normalized = "hash_serialized_3" then
-          Some (Assume_utxo.hash_serialized_create ())
-        else None
-      in
-      let txouts = ref 0 in
-      let bogosize = ref 0L in
-      let total_amount = ref 0L in
-      (* disk_size is "impl-specific" in Core (LevelDB EstimateSize). We
-         have no equivalent estimator on the RocksDB CF backend, so we
-         approximate the on-disk chainstate footprint by summing the raw
-         key+value bytes of each coin entry (key = txid32 + vout4 = 36,
-         value = serialized utxo entry) during the single pass below. This
-         is a non-zero, monotone-with-set-size Int — the test asserts it is
-         PRESENT and typed, not byte-equal to Core. *)
-      let disk_size = ref 0L in
-      (* [transactions] = number of distinct txids.  Counted the way Core
-         does (kernel/coinstats.cpp ComputeUTXOStats: nTransactions++ each
-         time the cursor's key.hash differs from prevkey): the walk is in
-         outpoint key order (txid32 ++ vout), so every output of one txid
-         is contiguous and a change of txid starts a new transaction.
-         This used to put a 64-char hex key for EVERY txid in a Hashtbl —
-         on mainnet ~10^8 live strings (>10 GB of OCaml heap) held for the
-         whole scan, on the Lwt main thread, against a 48G unit cap. *)
-      let n_transactions = ref 0 in
-      let prev_txid = ref Cstruct.empty in
-      Utxo.iter_committed_utxos ctx.utxo ctx.chain.db (fun txid vout data ->
-        let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
-        let utxo = Utxo.deserialize_utxo_entry r in
-        let outpoint = { Types.txid; vout = Int32.of_int vout } in
-        if !n_transactions = 0 || not (Cstruct.equal txid !prev_txid) then begin
-          incr n_transactions;
-          prev_txid := txid
-        end;
-        incr txouts;
-        total_amount := Int64.add !total_amount utxo.Utxo.value;
-        (* Core's GetBogoSize: 32 + 4 + 4 + 8 + 2 + scriptPubKey.size *)
-        let spk_len = Cstruct.length utxo.script_pubkey in
-        bogosize := Int64.add !bogosize (Int64.of_int (50 + spk_len));
-        (* Impl-specific disk-size estimate: 36-byte key + value bytes. *)
-        disk_size :=
-          Int64.add !disk_size (Int64.of_int (36 + String.length data));
-        (match muhash_acc with
-         | None -> ()
-         | Some acc ->
-           let buf =
-             Muhash.serialize_txout outpoint
-               ~value:utxo.Utxo.value
-               ~script_pubkey:utxo.script_pubkey
-               ~height:utxo.height
-               ~is_coinbase:utxo.is_coinbase
-           in
-           Muhash.add acc (Bytes.unsafe_to_string buf));
-        (match hash_acc with
-         | None -> ()
-         | Some acc ->
-           let coin : Assume_utxo.snapshot_coin = {
-             outpoint;
-             value = utxo.Utxo.value;
-             script_pubkey = utxo.script_pubkey;
-             height = utxo.height;
-             is_coinbase = utxo.is_coinbase;
-           } in
-           Assume_utxo.hash_serialized_add acc outpoint coin));
-      (* Core gettxoutsetinfo (blockchain.cpp:1115) order:
-           height, bestblock, txouts, bogosize, [hash_serialized_3 | muhash],
-           total_amount, transactions, disk_size.
-         The hash field (when present) sits BETWEEN bogosize and total_amount.
-         Height/bestblock were captured BEFORE the walk so a concurrent
-         connect cannot relabel a stale set. *)
-      let hash_field =
-        match muhash_acc, hash_acc with
-        | Some acc, _ ->
-          let raw = Muhash.finalize acc in
-          [("muhash",
-              `String (Types.hash256_to_hex_display
-                         (Cstruct.of_bytes raw)))]
-        | None, Some acc ->
-          let h = Assume_utxo.hash_serialized_finish acc in
-          [("hash_serialized_3",
-              `String (Types.hash256_to_hex_display h))]
-        | None, None -> []
-      in
-      (* disk_size: Core reports the chainstate LevelDB EstimateSize, which is
-         0 for an unflushed (in-memory) regtest chainstate. Our [disk_size]
-         accumulator is a bogosize-like estimate, not the on-disk LevelDB size;
-         emit 0 to match Core's unflushed-regtest report. *)
-      let _ = disk_size in
-      let base_fields = [
-        ("height", `Int tip_height);
-        ("bestblock",
-           `String (Types.hash256_to_hex_display tip_hash));
-        ("txouts", `Int !txouts);
-        ("bogosize", `Int (Int64.to_int !bogosize));
-      ] @ hash_field @ [
-        ("total_amount",
-           (* Core formats total_amount as a fixed-precision BTC decimal
-              via ValueFromAmount (blockchain.cpp:1126). Emit the same
-              "N.NNNNNNNN" decimal so the field is byte-comparable against
-              Core's gettxoutsetinfo output. *)
-           btc_amount_json !total_amount);
-        ("transactions", `Int !n_transactions);
-        ("disk_size", `Int 0);
-      ] in
-      Ok (`Assoc base_fields))
+      Ok (`Walk { tw_normalized = normalized; tw_height = tip_height;
+                  tw_hash = tip_hash; tw_view = view }))
     end
+
+(* Synchronous form: capture and walk inline (batch requests, tests). *)
+let handle_gettxoutsetinfo (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match gettxoutsetinfo_prepare ctx params with
+  | Error e -> Error e
+  | Ok (`Json j) -> Ok j
+  | Ok (`Walk job) -> Ok (run_txoutset_job job)
+
+(* Single-request form used by the HTTP server.  Called on the Lwt main
+   thread, so [gettxoutsetinfo_prepare] captures tip + coin view atomically
+   with respect to block connection (which mutates them only on this thread,
+   without yielding mid-block).  The walk then runs on a fresh DOMAIN, parked
+   behind [Lwt_preemptive.detach] and outside [rpc_worker_mutex]:
+
+   - It used to run on the preemptive pool's systhread inside the MAIN
+     domain.  Systhreads of one domain share that domain's runtime lock, and
+     a 35-55 min CPU-bound walk only drops it at the 50 ms tick, so the Lwt
+     loop (getblockcount, P2P, block connection) got the lock in slivers and
+     the node froze for the whole walk (live mainnet, 2026-10-01).
+   - It held [rpc_worker_mutex] for the whole walk, so every other
+     non-monitoring RPC queued behind it.
+   - It read [OptimizedUtxoSet.dirty] from that systhread while the Lwt
+     thread mutated it, and the RocksDB iterator pinned its implicit
+     snapshot at walk start, not when the tip was read. *)
+let handle_gettxoutsetinfo_lwt (ctx : rpc_context)
+    (params : Yojson.Safe.t list)
+    : (Yojson.Safe.t, string) result Lwt.t =
+  match gettxoutsetinfo_prepare ctx params with
+  | Error e -> Lwt.return (Error e)
+  | Ok (`Json j) -> Lwt.return (Ok j)
+  | Ok (`Walk job) ->
+    let spin = !test_txoutset_walk_spin_s in
+    Lwt_preemptive.detach
+      (fun () ->
+        let d =
+          Domain.spawn (fun () ->
+            if spin > 0. then begin
+              let t0 = Unix.gettimeofday () in
+              while Unix.gettimeofday () -. t0 < spin do () done
+            end;
+            run_txoutset_job job)
+        in
+        Ok (Domain.join d))
+      ()
+
 
 (* ============================================================================
    scrubunspendable Handler
@@ -16049,6 +16144,23 @@ let handle_single_request_lwt (ctx : rpc_context) (json : Yojson.Safe.t)
       | Ok r -> Lwt.return (json_rpc_response ~id ~result:r)
       | Error (code, message) ->
         Lwt.return (json_rpc_error ~id ~code ~message))
+  | None when method_name = "gettxoutsetinfo" ->
+    (* Capture on this (Lwt main) thread, walk on its own domain; see
+       [handle_gettxoutsetinfo_lwt].  Same arity gate and -8 mapping as the
+       synchronous dispatch_rpc entry. *)
+    (match check_core_arity method_name params with
+     | Some (code, message) -> Lwt.return (json_rpc_error ~id ~code ~message)
+     | None ->
+       Lwt.catch
+         (fun () ->
+           Lwt.map (function
+             | Ok r -> json_rpc_response ~id ~result:r
+             | Error msg ->
+               json_rpc_error ~id ~code:rpc_invalid_parameter ~message:msg)
+             (handle_gettxoutsetinfo_lwt ctx params))
+         (fun exn ->
+           Lwt.return (json_rpc_error ~id ~code:rpc_misc_error
+                         ~message:(Printexc.to_string exn))))
   | None ->
     (* Monitoring RPCs stay on the Lwt loop so a slow handler cannot make
        getblockcount look DOWN. Everything else runs on the preemptive

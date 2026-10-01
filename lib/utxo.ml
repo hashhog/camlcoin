@@ -719,11 +719,12 @@ module OptimizedUtxoSet = struct
      alone reports the last flushed set — STALE-UTXO-READ on every
      ladder range shorter than the interval.  This merge is the set
      that flush would have hashed, without the two-instance write. *)
-  let iter_committed (t : t)
+  let merge_overlay dirty
+      (base : (Types.hash256 -> int -> string -> unit) -> unit)
       (f : Types.hash256 -> int -> string -> unit) : unit =
-    let n = Hashtbl.length t.dirty in
+    let n = Hashtbl.length dirty in
     if n = 0 then
-      iter_base t f
+      base f
     else begin
       let overlay = Array.make n ("", (None : string option)) in
       let i = ref 0 in
@@ -738,7 +739,7 @@ module OptimizedUtxoSet = struct
         in
         overlay.(!i) <- (k, payload);
         incr i
-      ) t.dirty;
+      ) dirty;
       Array.sort (fun (a, _) (b, _) -> String.compare a b) overlay;
       let oi = ref 0 in
       let emit key payload =
@@ -754,7 +755,7 @@ module OptimizedUtxoSet = struct
           in
           f txid vout data
       in
-      iter_base t (fun txid vout data ->
+      base (fun txid vout data ->
         let key = utxo_key txid vout in
         while !oi < n && String.compare (fst overlay.(!oi)) key < 0 do
           let (k, p) = overlay.(!oi) in
@@ -774,6 +775,51 @@ module OptimizedUtxoSet = struct
         incr oi
       done
     end
+
+  let iter_committed (t : t)
+      (f : Types.hash256 -> int -> string -> unit) : unit =
+    merge_overlay t.dirty (iter_base t) f
+
+  (* A frozen copy of the committed coin set: a private copy of [dirty] plus
+     an explicit RocksDB snapshot of the coin store, taken together.  Built
+     on the Lwt main thread in one non-yielding step -- the only thread that
+     mutates [dirty], flushes, or advances the tip -- so the overlay, the
+     on-disk base and the tip the caller reads next to it all describe ONE
+     chain state.  The walk over it ([iter_view]) touches neither [t] nor
+     anything the main thread mutates, so it can run on another domain while
+     blocks keep connecting (gettxoutsetinfo, Core's ComputeUTXOStats over a
+     cursor snapshot without cs_main).
+
+     [Hashtbl.copy] is a shallow O(n) copy; the entries are immutable.  The
+     overlay is serialised and sorted by the walk, off the main thread.
+
+     Without a Rocksdb_store (tests only) the base is the live CF, read at
+     walk time: not snapshot-isolated. *)
+  type view = {
+    v_dirty : (string, dirty_entry) Hashtbl.t;
+    v_base : [ `Rdb of Rocksdb_store.snapshot | `Cf of Storage.ChainDB.t ];
+  }
+
+  let capture_view (t : t) : view =
+    { v_dirty = Hashtbl.copy t.dirty;
+      v_base =
+        (match t.rocksdb with
+         | Some rdb -> `Rdb (Rocksdb_store.snapshot rdb)
+         | None -> `Cf t.db) }
+
+  let release_view (v : view) : unit =
+    match v.v_base with
+    | `Rdb s -> Rocksdb_store.release_snapshot s
+    | `Cf _ -> ()
+
+  let iter_view (v : view)
+      (f : Types.hash256 -> int -> string -> unit) : unit =
+    let base g =
+      match v.v_base with
+      | `Rdb s -> Rocksdb_store.iter_utxos_at s g
+      | `Cf db -> Storage.ChainDB.iter_utxos db g
+    in
+    merge_overlay v.v_dirty base f
 
   (* Get the number of pending dirty entries *)
   let dirty_count (t : t) : int =

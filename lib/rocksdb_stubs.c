@@ -819,6 +819,112 @@ CAMLprim value caml_rocksdb_iter(value v_db, value v_f) {
   CAMLreturn(Val_unit);
 }
 
+/* ---------- Explicit point-in-time snapshots ---------------------------- */
+/* gettxoutsetinfo must hash ONE state and label it with that state's tip.
+   [caml_rocksdb_iter] pins an implicit snapshot when the iterator is
+   CREATED, which is too late once the walk runs on another domain: the
+   dirty overlay and the tip are captured on the Lwt main thread, and a
+   flush landing between that capture and the iterator's creation would
+   hash coins the overlay already holds (or miss ones it dropped).  So the
+   snapshot is taken explicitly, in the same main-thread instant as the
+   overlay copy, and the walk later iterates THAT snapshot.
+
+   The custom block owns {db, snapshot, readoptions}.  Release is explicit
+   ([snapshot_release]) because the finalizer could run after the DB was
+   closed at shutdown; an unreleased snapshot only pins old SST files. */
+typedef struct {
+  rocksdb_t *db;
+  const rocksdb_snapshot_t *snap;
+  rocksdb_readoptions_t *ro;
+} caml_rdb_snapshot;
+
+#define Rdbsnap_val(v) ((caml_rdb_snapshot *)Data_custom_val(v))
+
+static struct custom_operations rdbsnap_ops = {
+  "camlcoin.rocksdb.snapshot",
+  custom_finalize_default,
+  custom_compare_default,
+  custom_hash_default,
+  custom_serialize_default,
+  custom_deserialize_default,
+  custom_compare_ext_default,
+  custom_fixed_length_default,
+};
+
+CAMLprim value caml_rocksdb_snapshot_create(value v_db) {
+  CAMLparam1(v_db);
+  CAMLlocal1(v_snap);
+  rocksdb_t *db = Rocksdb_val(v_db);
+  if (!db) caml_failwith("rocksdb_snapshot_create: database is closed");
+  v_snap = caml_alloc_custom(&rdbsnap_ops, sizeof(caml_rdb_snapshot), 0, 1);
+  caml_rdb_snapshot *s = Rdbsnap_val(v_snap);
+  s->db = db;
+  s->snap = rocksdb_create_snapshot(db);
+  s->ro = rocksdb_readoptions_create();
+  rocksdb_readoptions_set_snapshot(s->ro, s->snap);
+  /* A full walk must not evict the hot working set validation relies on. */
+  rocksdb_readoptions_set_fill_cache(s->ro, 0);
+  CAMLreturn(v_snap);
+}
+
+CAMLprim value caml_rocksdb_snapshot_release(value v_snap) {
+  CAMLparam1(v_snap);
+  caml_rdb_snapshot *s = Rdbsnap_val(v_snap);
+  if (s->snap) {
+    rocksdb_readoptions_destroy(s->ro);
+    rocksdb_release_snapshot(s->db, s->snap);
+    s->snap = NULL;
+    s->ro = NULL;
+  }
+  CAMLreturn(Val_unit);
+}
+
+/* Like [caml_rocksdb_iter] but over an explicit snapshot, and with the
+   runtime RELEASED around every RocksDB cursor move: a seek/next can block
+   in pread() on a cache miss, and while this domain holds its runtime lock
+   every stop-the-world minor GC of every other domain (the Lwt main domain
+   included) waits for it.  The key/value bytes are copied into the OCaml
+   heap only after the runtime is re-acquired; RocksDB owns them until the
+   next cursor move. */
+CAMLprim value caml_rocksdb_iter_snapshot(value v_snap, value v_f) {
+  CAMLparam2(v_snap, v_f);
+  CAMLlocal3(v_key, v_val, v_res);
+
+  caml_rdb_snapshot *s = Rdbsnap_val(v_snap);
+  if (!s->snap) caml_failwith("rocksdb_iter_snapshot: snapshot released");
+  rocksdb_iterator_t *it = rocksdb_create_iterator(s->db, s->ro);
+  caml_release_runtime_system();
+  rocksdb_iter_seek_to_first(it);
+  caml_acquire_runtime_system();
+  while (rocksdb_iter_valid(it)) {
+    size_t klen = 0, vlen = 0;
+    const char *kp = rocksdb_iter_key(it, &klen);
+    const char *vp = rocksdb_iter_value(it, &vlen);
+
+    v_key = caml_alloc_initialized_string(klen, kp);
+    v_val = caml_alloc_initialized_string(vlen, vp);
+    v_res = caml_callback2_exn(v_f, v_key, v_val);
+    if (Is_exception_result(v_res)) {
+      rocksdb_iter_destroy(it);
+      caml_raise(Extract_exception(v_res));
+    }
+
+    caml_release_runtime_system();
+    rocksdb_iter_next(it);
+    caml_acquire_runtime_system();
+  }
+  char *err = NULL;
+  rocksdb_iter_get_error(it, &err);
+  rocksdb_iter_destroy(it);
+  if (err) {
+    char msg[512];
+    snprintf(msg, sizeof(msg), "rocksdb_iter_snapshot: %s", err);
+    rocksdb_free(err);
+    caml_failwith(msg);
+  }
+  CAMLreturn(Val_unit);
+}
+
 /* ---------- Snapshot-import durability helpers ------------------------- */
 /* Write a batch with WAL on AND WriteOptions.sync = true (fsync the WAL
    before returning). Used for the snapshot-import-incomplete marker and

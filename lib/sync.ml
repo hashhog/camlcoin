@@ -3116,6 +3116,17 @@ let create_ibd_state ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
     download_path = Queue.create ();
     download_path_tip = None }
 
+(* The node's one shared OptimizedUtxoSet (cli.ml creates it and registers it
+   here).  [reorganize] must keep it coherent even when the caller did not
+   thread it (the live-P2P ActivateBestChain path builds a bare ibd_state):
+   its LRU outlives the reorg and is read by later submitblock / IBD connects. *)
+let shared_utxo_set : Utxo.OptimizedUtxoSet.t option ref = ref None
+
+let reorg_utxo_set (ibd : ibd_state) : Utxo.OptimizedUtxoSet.t option =
+  match ibd.utxo_set with
+  | Some u -> Some u
+  | None -> !shared_utxo_set
+
 let set_mempool (ibd : ibd_state) (mp : Mempool.mempool) =
   ibd.mempool <- Some mp
 
@@ -5961,22 +5972,37 @@ let stage_pending_utxos_into_batch
     Storage.ChainDB.batch_delete_utxo batch txid vout;
     rdb_dels := (txid, vout) :: !rdb_dels
   ) view.view_deletes;
-  (* Dual-store consistency for the DB-direct reorg (no OptimizedUtxoSet
-     threaded, i.e. the live-P2P path).  The CF batch above is not enough:
-     [get_utxo] reads CF-first then FALLS BACK to the separate rocksdb_utxo
-     store, so a CF-only delete of a coin still present in rocksdb_utxo (every
-     coin connected via [apply_block_atomic] is) would be resurrected via the
-     fallback — leaving the reverted branch's coins reachable by [gettxout]
-     and by validation input lookups.  Mirror the net delta into rocksdb_utxo
-     (RDB-first, before the caller's CF [batch_write]), exactly as
-     [apply_block_atomic] does on the forward path.  Skipped when an
-     OptimizedUtxoSet is threaded (submitblock / mining), which manages
-     rocksdb_utxo through its own flush — that path is left untouched. *)
-  (match ibd.utxo_set, tip_height with
-   | None, Some th ->
+  (* Dual-store consistency: the CF batch above is not enough.  [get_utxo]
+     reads CF-first then FALLS BACK to the separate rocksdb_utxo store, and
+     OptimizedUtxoSet.get -- the read block validation uses on the
+     submitblock / mining / IBD paths -- reads LRU -> dirty -> rocksdb_utxo and
+     never the CF.  Mirror the net delta into rocksdb_utxo (RDB-first, before
+     the caller's CF [batch_write]), exactly as [apply_block_atomic] does on
+     the forward path, and drop every touched outpoint from the shared
+     OptimizedUtxoSet's cache so its next read comes from the store.
+
+     2026-10-01: this mirror used to be skipped whenever an OptimizedUtxoSet
+     was threaded (submitblock), on the theory that the set "manages
+     rocksdb_utxo through its own flush".  Nothing in the reorg path ever
+     touched the set, so after a submitblock reorg rocksdb_utxo and the LRU
+     still held the ABANDONED branch: regtest 200A->201B left 486 txouts vs
+     Core's 455 (coins spent on B still present) and 202B was rejected
+     "Missing UTXO" (a coin created on B was not in the set validation
+     reads).  Core has one coin view (CoinsTip); DisconnectBlock and
+     ConnectBlock both write through it (validation.cpp ActivateBestChainStep
+     -> DisconnectTip / ConnectTip -> view.Flush()). *)
+  (match tip_height with
+   | Some th ->
      Storage.ChainDB.batch_apply_utxo_rocksdb ibd.chain.db
        ~tip_height:th !rdb_puts !rdb_dels
-   | _ -> ());
+   | None -> ());
+  (match reorg_utxo_set ibd with
+   | Some u ->
+     List.iter (fun (txid, vout, _) ->
+       Utxo.OptimizedUtxoSet.forget u txid vout) !rdb_puts;
+     List.iter (fun (txid, vout) ->
+       Utxo.OptimizedUtxoSet.forget u txid vout) !rdb_dels
+   | None -> ());
   ibd.pending_utxo_updates <- [];
   ibd.pending_utxo_deletes <- []
 
@@ -6329,6 +6355,16 @@ let reorganize ?(allow_equal_work = false) (ibd : ibd_state)
         Logs.info (fun m ->
           m "Reorganizing from height %d to %d (fork at %d)"
             current_tip.height new_tip.height fork_point.height);
+        (* The disconnect/connect halves read coins from the on-disk stores
+           ([Storage.ChainDB.get_utxo] under the [reorg_view] overlay).  Any
+           coin change still pending in the shared OptimizedUtxoSet's dirty
+           set is invisible there, so persist it first: the reorg must start
+           from the coin set of [current_tip] (Core: the reorg runs on
+           CoinsTip, which already holds every unflushed change). *)
+        (match reorg_utxo_set ibd with
+         | Some u when Utxo.OptimizedUtxoSet.dirty_count u > 0 ->
+           Utxo.OptimizedUtxoSet.flush ~tip_height:current_tip.height u
+         | _ -> ());
         let to_disconnect = collect_path state fork_point current_tip in
         let to_connect = collect_path state fork_point new_tip in
         let batch = Storage.ChainDB.batch_create () in
@@ -6581,6 +6617,45 @@ let reorganize ?(allow_equal_work = false) (ibd : ibd_state)
    [accept_header] (which assumes the new entry extends the active
    header chain — calling it for a side-branch would break [block_tip]
    and break getblock-by-height for the active chain). *)
+(* Look a header up in the in-memory index, loading it (and any missing
+   ancestors) from the on-disk header CF when it is not there.  Boot
+   ([restore_chain_state]) loads only the ACTIVE chain's headers, but
+   [register_side_branch_header] persists side-branch headers too.  Without
+   this, a restart lost every stored side branch: re-submitting B1 hit the
+   "already stored" no-op and B2 was rejected "parent ... not in block index"
+   (crash-restart harness gate 4, 2026-10-01: kill mid-reorg 200A->201B, then
+   177B rejected).  Core's LoadBlockIndex loads the whole header tree; this
+   is the lazy equivalent, walking prev links back to a loaded ancestor. *)
+let find_or_load_header (state : chain_state) (hash : Types.hash256)
+    : header_entry option =
+  match Hashtbl.find_opt state.headers (Cstruct.to_string hash) with
+  | Some e -> Some e
+  | None ->
+    let max_walk = 100_000 in
+    let rec walk acc cursor n =
+      if n > max_walk then None
+      else
+        match Hashtbl.find_opt state.headers (Cstruct.to_string cursor) with
+        | Some anchor -> Some (anchor, acc)
+        | None ->
+          (match Storage.ChainDB.get_block_header state.db cursor with
+           | None -> None
+           | Some hdr -> walk ((cursor, hdr) :: acc) hdr.Types.prev_block (n + 1))
+    in
+    (match walk [] hash 0 with
+     | None -> None
+     | Some (anchor, chain) ->
+       let last =
+         List.fold_left (fun (parent : header_entry) (h, (hdr : Types.block_header)) ->
+           let e = { header = hdr; hash = h; height = parent.height + 1;
+                     total_work =
+                       Consensus.work_add parent.total_work
+                         (work_from_bits hdr.bits) } in
+           Hashtbl.replace state.headers (Cstruct.to_string h) e;
+           e) anchor chain
+       in
+       Some last)
+
 let register_side_branch_header (state : chain_state) (entry : header_entry)
     : unit =
   let hash_key = Cstruct.to_string entry.hash in

@@ -791,8 +791,7 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
            lib/sync.ml::try_attach_side_branch_and_reorg.
            Pre-fix this returned "Block does not build on validated tip",
            which the diff-test corpus surfaced as ctx-rej-h113. *)
-        let parent_key = Cstruct.to_string block.header.prev_block in
-        match Hashtbl.find_opt chain.headers parent_key with
+        match Sync.find_or_load_header chain block.header.prev_block with
         | None ->
           (* Truly orphan — neither the validated tip nor any known
              header. Mirror Core's BIP-22 "rejected" result; the

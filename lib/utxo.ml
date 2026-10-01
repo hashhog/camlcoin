@@ -541,6 +541,17 @@ module OptimizedUtxoSet = struct
       (* Possibly on disk — must record deletion *)
       Hashtbl.replace t.dirty key `Removed
 
+  (* Drop any cached copy (LRU and dirty) of one outpoint, so the next read
+     goes to the on-disk store.  Used by [Sync.reorganize], which writes the
+     reorg's coin delta straight to BOTH on-disk stores: a clean LRU entry
+     left behind would keep answering with the abandoned branch's coin (or
+     hide a coin the new branch created).  Only call with an empty dirty set
+     (reorganize flushes first), so no pending write is lost. *)
+  let forget (t : t) (txid : Types.hash256) (vout : int) : unit =
+    let key = utxo_key txid vout in
+    Perf.LRU.remove t.cache key;
+    Hashtbl.remove t.dirty key
+
   (* Check if a UTXO exists *)
   let exists (t : t) (txid : Types.hash256) (vout : int) : bool =
     let key = utxo_key txid vout in

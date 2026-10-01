@@ -971,6 +971,7 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     Utxo.OptimizedUtxoSet.create
       ~cache_size:config.dbcache_lru_entries ~rocksdb db
   in
+  Sync.shared_utxo_set := Some optimized_utxo;
 
   (* -reindex post-open replay. With cf_chain_state cleared, restore
      above set blocks_synced = 0 (no tip on disk). Headers were

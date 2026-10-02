@@ -12249,7 +12249,24 @@ let handle_getdeploymentinfo (ctx : rpc_context)
    Control Handlers
    ============================================================================ *)
 
+(* RPC [stop] -> the SIGTERM shutdown path (Core rpc/server.cpp stop ->
+   StartShutdown(); the process exits exactly as on SIGTERM).
+   lib/cli.ml installs [Lwt_unix.on_signal Sys.sigterm] which wakes the
+   shutdown waiter and runs the phased graceful shutdown; raising SIGTERM in
+   our own process after a short delay (so the "stopping" reply is written
+   first) makes [stop] and an operator's [kill -TERM] one identical path.
+   Before gate 5 [handle_stop] only returned the string and the node kept
+   running (crash-restart-harness: rpc-stop-ignored). *)
+let request_node_shutdown () : unit =
+  Lwt.async (fun () ->
+    let open Lwt.Infix in
+    Lwt_unix.sleep 0.1 >>= fun () ->
+    Logs.info (fun m -> m "RPC stop: requesting shutdown (SIGTERM to self)");
+    (try Unix.kill (Unix.getpid ()) Sys.sigterm with _ -> ());
+    Lwt.return_unit)
+
 let handle_stop (_ctx : rpc_context) : Yojson.Safe.t =
+  request_node_shutdown ();
   `String "CamlCoin server stopping"
 
 let handle_uptime (_ctx : rpc_context) : Yojson.Safe.t =

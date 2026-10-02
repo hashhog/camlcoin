@@ -608,18 +608,28 @@ let g21_sighup_action_lag_partial () =
      contains src "Runtime_config.drain_pending_sighup")
 
 (* ============================================================================
-   Gate G22: `stop` RPC is a stub (BUG-1, PARTIAL).
+   Gate G22: `stop` RPC requests shutdown via the SIGTERM path (gate 5 FIX).
+   Before: handle_stop only returned the string; the node kept running and
+   tools/crash-restart-harness.py reported rpc-stop-ignored.
    ============================================================================ *)
-let g22_stop_rpc_partial () =
+let g22_stop_rpc_fixed () =
   let src = read_file "lib/rpc.ml" in
-  Alcotest.(check bool) "BUG-1: handle_stop returns constant string only" true
-    (contains src "let handle_stop (_ctx : rpc_context) : Yojson.Safe.t =\n  `String \"CamlCoin server stopping\"");
-  (* The dispatcher case is registered (so `stop` looks supported)
-     but the handler doesn't trigger shutdown. *)
-  Alcotest.(check bool) "BUG-1: \"stop\" dispatcher case present" true
-    (contains src "| \"stop\" ->\n    Ok (handle_stop ctx)");
-  Alcotest.(check bool) "BUG-1: handle_stop body does NOT raise shutdown" false
-    (contains src "shutdown_request" || contains src "wake_shutdown")
+  Alcotest.(check bool) "handle_stop calls request_node_shutdown" true
+    (contains src "let handle_stop (_ctx : rpc_context) : Yojson.Safe.t =\n  request_node_shutdown ();");
+  Alcotest.(check bool) "request_node_shutdown raises SIGTERM in-process" true
+    (contains src "Unix.kill (Unix.getpid ()) Sys.sigterm");
+  (* Behavioural: install a SIGTERM handler the way lib/cli.ml does
+     (Lwt_unix.on_signal waking a waiter), call the helper handle_stop uses,
+     and the handler must fire within 5 s. *)
+  let fired, wake = Lwt.wait () in
+  let id = Lwt_unix.on_signal Sys.sigterm (fun _ ->
+    if Lwt.is_sleeping fired then Lwt.wakeup_later wake true) in
+  Camlcoin.Rpc.request_node_shutdown ();
+  let got = Lwt_main.run (Lwt.pick [
+    fired;
+    Lwt.map (fun () -> false) (Lwt_unix.sleep 5.0) ]) in
+  Lwt_unix.disable_signal_handler id;
+  Alcotest.(check bool) "SIGTERM handler fired after request_node_shutdown" true got
 
 (* ============================================================================
    Gate G23: `uptime` RPC is a stub (BUG-2, PARTIAL).
@@ -771,8 +781,8 @@ let () =
         g21_sighup_action_lag_partial;
     ];
     "G22-G27 control RPCs + readiness", [
-      Alcotest.test_case "G22 `stop` RPC is a stub (BUG-1 PARTIAL)" `Quick
-        g22_stop_rpc_partial;
+      Alcotest.test_case "G22 `stop` RPC requests shutdown (gate 5 FIX)" `Quick
+        g22_stop_rpc_fixed;
       Alcotest.test_case "G23 `uptime` RPC is a stub (BUG-2 PARTIAL)" `Quick
         g23_uptime_rpc_partial;
       Alcotest.test_case "G24 `getrpcinfo` empty fields (BUG-3 PARTIAL)" `Quick

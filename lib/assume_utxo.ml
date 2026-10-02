@@ -345,16 +345,31 @@ let get_assumeutxo_params_mainnet (height : int) : assumeutxo_params option =
 let get_assumeutxo_params_testnet4 (height : int) : assumeutxo_params option =
   List.find_opt (fun p -> p.height = height) testnet4_au_data
 
+(** [overlay_campaign builtin] is the effective table for a non-regtest
+    network: [builtin] with every row that a campaign entry CONFIRMED
+    (identical height + blockhash; the loader has already proven the whole
+    commitment identical) replaced in place by that merged campaign row, then
+    the campaign rows that confirm nothing appended. A confirming row is
+    therefore never listed twice, and lookups by hash see the merged row
+    (built-in commitment + the campaign's supplemental header band) instead
+    of the header-less built-in. Empty campaign table => [builtin] itself. *)
+let overlay_campaign (builtin : assumeutxo_params list) : assumeutxo_params list =
+  match !campaign_au_data with
+  | [] -> builtin
+  | campaign ->
+    let same a b = a.height = b.height && Cstruct.equal a.blockhash b.blockhash in
+    List.map (fun b ->
+        match List.find_opt (fun c -> same b c) campaign with
+        | Some c -> c
+        | None -> b) builtin
+    @ List.filter (fun c -> not (List.exists (fun b -> same b c) builtin)) campaign
+
 (** Lookup assumeUTXO params by block hash for the network *)
 let get_assumeutxo_for_hash ~network:(network : Consensus.network_config)
     (blockhash : Types.hash256) : assumeutxo_params option =
   let candidates = match network.network_type with
-    | Consensus.Mainnet ->
-      if !campaign_au_data = [] then mainnet_au_data
-      else mainnet_au_data @ !campaign_au_data
-    | Consensus.Testnet4 ->
-      if !campaign_au_data = [] then testnet4_au_data
-      else testnet4_au_data @ !campaign_au_data
+    | Consensus.Mainnet -> overlay_campaign mainnet_au_data
+    | Consensus.Testnet4 -> overlay_campaign testnet4_au_data
     | Consensus.Regtest -> !regtest_au_data
     | _ -> []
   in
@@ -367,12 +382,8 @@ let get_assumeutxo_for_hash ~network:(network : Consensus.network_config)
 let assumeutxo_params_list (network : Consensus.network_config)
     : assumeutxo_params list =
   match network.network_type with
-  | Consensus.Mainnet ->
-    if !campaign_au_data = [] then mainnet_au_data
-    else mainnet_au_data @ !campaign_au_data
-  | Consensus.Testnet4 ->
-    if !campaign_au_data = [] then testnet4_au_data
-    else testnet4_au_data @ !campaign_au_data
+  | Consensus.Mainnet -> overlay_campaign mainnet_au_data
+  | Consensus.Testnet4 -> overlay_campaign testnet4_au_data
   | Consensus.Regtest -> !regtest_au_data
   | _ -> []
 
@@ -651,6 +662,103 @@ let campaign_entry_of_json (j : Yojson.Safe.t) : (assumeutxo_params, string) res
   | Type_error (msg, _) -> Error ("campaign entry malformed: " ^ msg)
   | Yojson.Json_error msg -> Error ("campaign entry malformed: " ^ msg)
 
+(** [check_campaign_entry ~existing ~seen p] decides what the loader does
+    with campaign entry [p], given the network's existing (built-in or
+    already-loaded) rows and the entries earlier in the same file.
+
+    - [Ok (`New p)]: no existing row at [p]'s height or blockhash — append.
+    - [Ok (`Confirms merged)]: an existing row has the IDENTICAL commitment
+      (height, blockhash, hash_serialized, m_chain_tx_count). That is a second
+      source agreeing with the first, not an override (Core keys
+      m_assumeutxo_data by height+blockhash and checks the snapshot against
+      its hash_serialized; a byte-identical row adds no new trust). R4's rung
+      at 910,000 was minted by dumping a Core clone there and came out equal
+      to Core's own hardcoded anchor. [merged] is the existing row with its
+      commitment (and coins_count) KEPT and only the supplemental fields it
+      lacks (base_header, base_tail_headers, chainwork, base_mtp) filled from
+      [p] — the built-in 910k row has no header band, without which snapshot
+      boot re-anchors header sync at genesis. A supplemental value that
+      contradicts one the row already pins refuses.
+    - [Error _]: same height or same blockhash with any commitment field
+      different; or a duplicate (height or blockhash) within the file. *)
+let check_campaign_entry ~(existing : assumeutxo_params list)
+    ~(seen : assumeutxo_params list) (p : assumeutxo_params)
+  : ([ `New of assumeutxo_params | `Confirms of assumeutxo_params ], string) result =
+  let hits q = q.height = p.height || Cstruct.equal q.blockhash p.blockhash in
+  if List.exists hits seen then
+    Error (Printf.sprintf
+             "campaign entry height=%d duplicates an earlier entry (same height \
+              or blockhash) in the same campaign file — refusing to start"
+             p.height)
+  else
+    match List.find_opt hits existing with
+    | None -> Ok (`New p)
+    | Some q ->
+      let identical =
+        q.height = p.height
+        && Cstruct.equal q.blockhash p.blockhash
+        && Cstruct.equal q.coins_hash p.coins_hash
+        && Int64.equal q.chain_tx_count p.chain_tx_count
+      in
+      if not identical then
+        Error (Printf.sprintf
+                 "campaign entry height=%d collides with a built-in/already-\
+                  loaded assumeutxo entry for this network (height %d; \
+                  blockhash/hash_serialized/m_chain_tx_count differ) — refusing \
+                  to start (campaign data may never override a production hash)"
+                 p.height q.height)
+      else begin
+        let hdr_hash h = Crypto.compute_block_hash h in
+        let contra =
+          (match q.base_header, p.base_header with
+           | Some a, Some b when not (Cstruct.equal (hdr_hash a) (hdr_hash b)) ->
+             Some "base_header"
+           | _ -> None)
+        in
+        let contra = match contra with
+          | Some _ -> contra
+          | None ->
+            (match q.base_tail_headers, p.base_tail_headers with
+             | (_ :: _ as a), (_ :: _ as b)
+               when List.length a <> List.length b
+                    || not (List.for_all2
+                              (fun x y -> Cstruct.equal (hdr_hash x) (hdr_hash y))
+                              a b) -> Some "base_tail_headers"
+             | _ -> None)
+        in
+        let contra = match contra with
+          | Some _ -> contra
+          | None ->
+            (match q.chainwork, p.chainwork with
+             | Some a, Some b when not (Cstruct.equal a b) -> Some "chainwork"
+             | _ -> None)
+        in
+        let contra = match contra with
+          | Some _ -> contra
+          | None ->
+            (match q.base_mtp, p.base_mtp with
+             | Some a, Some b when not (Int32.equal a b) -> Some "base_mtp"
+             | _ -> None)
+        in
+        match contra with
+        | Some field ->
+          Error (Printf.sprintf
+                   "campaign entry height=%d matches the existing commitment \
+                    but its %s contradicts the existing row — refusing to start"
+                   p.height field)
+        | None ->
+          let pick a b = match a with Some _ -> a | None -> b in
+          Ok (`Confirms
+                { q with
+                  base_header = pick q.base_header p.base_header;
+                  base_tail_headers =
+                    (match q.base_tail_headers with
+                     | [] -> p.base_tail_headers
+                     | l -> l);
+                  chainwork = pick q.chainwork p.chainwork;
+                  base_mtp = pick q.base_mtp p.base_mtp })
+      end
+
 (** [load_campaign_assumeutxo_from_env ~network ()] reads
     [HASHHOG_CAMPAIGN_ASSUMEUTXO] exactly once and, if set to a non-empty
     path, parses + validates its JSON array and merges every entry into
@@ -698,25 +806,40 @@ let load_campaign_assumeutxo_from_env
       | Consensus.Regtest -> !regtest_au_data
       | _ -> []
     in
-    List.iter (fun p ->
-      if List.exists
-           (fun q -> q.height = p.height || Cstruct.equal q.blockhash p.blockhash)
-           existing_for_network
-      then
-        fail (Printf.sprintf
-                "campaign entry height=%d collides with a built-in/already-\
-                 loaded assumeutxo entry for this network — refusing to \
-                 start (campaign data may never override a production hash)"
-                p.height);
+    (* Decide every entry before registering any, so a refusal leaves the
+       tables untouched. *)
+    let decided, _seen =
+      List.fold_left (fun (acc, seen) p ->
+          match check_campaign_entry ~existing:existing_for_network ~seen p with
+          | Error msg -> fail msg
+          | Ok d -> (d :: acc, p :: seen))
+        ([], []) parsed
+    in
+    let decided = List.rev decided in
+    let confirmed = ref [] in
+    List.iter (fun d ->
+      let p = match d with
+        | `New p -> p
+        | `Confirms m ->
+          confirmed := m.height :: !confirmed;
+          Printf.eprintf
+            "[CAMPAIGN-ASSUMEUTXO] entry height %d is IDENTICAL to the existing \
+             assumeutxo commitment (blockhash, hash_serialized, \
+             m_chain_tx_count) -- accepted as a confirmation; commitment kept, \
+             header band/chainwork/base_mtp gaps filled\n%!" m.height;
+          m
+      in
       (match network.network_type with
        | Consensus.Regtest -> register_regtest_assumeutxo p
        | _ -> register_campaign_assumeutxo p)
-    ) parsed;
+    ) decided;
     Printf.eprintf
-      "[CAMPAIGN-ASSUMEUTXO] loaded %d entries from %s heights=[%s]\n%!"
+      "[CAMPAIGN-ASSUMEUTXO] loaded %d entries from %s heights=[%s] \
+       (confirming existing: [%s])\n%!"
       (List.length parsed) path
       (String.concat ", "
          (List.map (fun p -> string_of_int p.height) parsed))
+      (String.concat ", " (List.rev_map string_of_int !confirmed))
 
 (* ============================================================================
    Snapshot Coin Entry

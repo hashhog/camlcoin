@@ -259,6 +259,109 @@ let test_change2_collision_with_builtin_refuses_to_start () =
       | Unix.WSTOPPED n ->
         test_failed name (Printf.sprintf "child stopped by signal %d" n)))
 
+
+(* ============================================================================
+   Campaign entry IDENTICAL to a built-in row (R4 slice 910000-920000)
+   ============================================================================
+
+   The soak-910000 rung was minted by dumping a Core clone at 910,000 and its
+   commitment equals Core's hardcoded m_assumeutxo_data row (mirrored in
+   [mainnet_au_data]). Such an entry is a confirmation: accepted, commitment
+   kept, header band filled. A DIFFERENT commitment at that height still
+   refuses. Values below are the real soak-910000 campaign-entry.json fields. *)
+
+let h910_blockhash = "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821"
+let h910_hash_serialized = "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568"
+let h910_chain_tx_count = 1_226_586_151L
+let h910_base_header =
+  "00a0572be06d4f01a2ed2228dec965539cc8b96512ccde7d2824010000000000000000006f28c30dc748f6b1430fb2b9a5a94b5b34a5df6e318c6cc5c310a1a35b432b59a3ab9d68b32c021719d103e9"
+let h910_chainwork = "0000000000000000000000000000000000000000da15bcbf68ad7fed795c504f"
+
+let h910_entry_json ?(hash_serialized = h910_hash_serialized)
+    ?(chain_tx_count = h910_chain_tx_count) () =
+  Printf.sprintf
+    {|{"height": 910000, "blockhash": "%s", "hash_serialized": "%s", "m_chain_tx_count": %Ld, "base_mtp": 1755159732, "base_header": "%s", "chainwork": "%s"}|}
+    h910_blockhash hash_serialized chain_tx_count h910_base_header h910_chainwork
+
+let rev_display_hex (h : string) : string =
+  let buf = Buffer.create 64 in
+  for i = 31 downto 0 do Buffer.add_string buf (String.sub h (i * 2) 2) done;
+  Buffer.contents buf
+
+(* Run [load_campaign_assumeutxo_from_env] on mainnet in a forked child (the
+   refusal path calls [exit 1]). The child runs [after_load] and exits 0 iff
+   it returns true, 3 if it returns false. Returns the child's status. *)
+let run_campaign_child ~(entries : string) (after_load : unit -> bool) =
+  let path = temp_campaign_fixture ~entries () in
+  flush stdout;
+  match Unix.fork () with
+  | 0 ->
+    (try
+       let devnull = Unix.openfile "/dev/null" [Unix.O_WRONLY] 0o644 in
+       Unix.dup2 devnull Unix.stderr;
+       Unix.close devnull
+     with _ -> ());
+    Assume_utxo.clear_campaign_assumeutxo ();
+    Unix.putenv "HASHHOG_CAMPAIGN_ASSUMEUTXO" path;
+    Assume_utxo.load_campaign_assumeutxo_from_env ~network:Consensus.mainnet ();
+    exit (if after_load () then 0 else 3)
+  | child_pid ->
+    let (_, status) = Unix.waitpid [] child_pid in
+    (try Sys.remove path with _ -> ());
+    status
+
+let status_str = function
+  | Unix.WEXITED n -> Printf.sprintf "exited %d" n
+  | Unix.WSIGNALED n -> Printf.sprintf "signal %d" n
+  | Unix.WSTOPPED n -> Printf.sprintf "stopped %d" n
+
+let test_campaign_identical_to_builtin_accepted () =
+  let name = "Campaign-910k: entry IDENTICAL to built-in 910000 is accepted as a confirmation (header band filled, listed once)" in
+  let status = run_campaign_child ~entries:(h910_entry_json ()) (fun () ->
+      let bh = Types.hash256_of_hex (rev_display_hex h910_blockhash) in
+      let heights = Assume_utxo.available_snapshot_heights Consensus.mainnet in
+      match Assume_utxo.get_assumeutxo_for_hash ~network:Consensus.mainnet bh with
+      | None -> false
+      | Some p ->
+        p.height = 910_000
+        && Int64.equal p.chain_tx_count h910_chain_tx_count
+        && Cstruct.equal p.coins_hash
+             (Types.hash256_of_hex (rev_display_hex h910_hash_serialized))
+        && p.base_header <> None
+        && p.chainwork <> None
+        && p.base_mtp = Some 1755159732l
+        && List.length (List.filter (( = ) 910_000) heights) = 1)
+  in
+  match status with
+  | Unix.WEXITED 0 -> test_passed name
+  | s -> test_failed name ("child " ^ status_str s ^ ", expected exited 0")
+
+let test_campaign_different_hash_at_builtin_height_refused () =
+  let name = "Campaign-910k: DIFFERENT hash_serialized at built-in height 910000 refuses to start (exit 1)" in
+  let status = run_campaign_child
+      ~entries:(h910_entry_json ~hash_serialized:(dummy_hash_display 0x11) ())
+      (fun () -> true) in
+  match status with
+  | Unix.WEXITED 1 -> test_passed name
+  | s -> test_failed name ("child " ^ status_str s ^ ", expected exited 1")
+
+let test_campaign_different_chain_tx_count_at_builtin_height_refused () =
+  let name = "Campaign-910k: DIFFERENT m_chain_tx_count at built-in height 910000 refuses to start (exit 1)" in
+  let status = run_campaign_child
+      ~entries:(h910_entry_json ~chain_tx_count:1_226_586_152L ())
+      (fun () -> true) in
+  match status with
+  | Unix.WEXITED 1 -> test_passed name
+  | s -> test_failed name ("child " ^ status_str s ^ ", expected exited 1")
+
+let test_campaign_duplicate_in_file_refused () =
+  let name = "Campaign-910k: the identical 910000 entry twice in one file refuses (in-file duplicate)" in
+  let e = h910_entry_json () in
+  let status = run_campaign_child ~entries:(e ^ "," ^ e) (fun () -> true) in
+  match status with
+  | Unix.WEXITED 1 -> test_passed name
+  | s -> test_failed name ("child " ^ status_str s ^ ", expected exited 1")
+
 (* ============================================================================
    Runner
    ============================================================================ *)
@@ -275,4 +378,9 @@ let () =
   test_change2_campaign_appends_mainnet ();
   test_change2_campaign_regtest_routes_via_register_regtest ();
   test_change2_collision_with_builtin_refuses_to_start ();
+  Printf.printf "== Campaign entry identical to a built-in (910000) ==\n";
+  test_campaign_identical_to_builtin_accepted ();
+  test_campaign_different_hash_at_builtin_height_refused ();
+  test_campaign_different_chain_tx_count_at_builtin_height_refused ();
+  test_campaign_duplicate_in_file_refused ();
   Printf.printf "All porter-wave assumeutxo tests passed!\n"

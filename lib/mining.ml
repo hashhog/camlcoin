@@ -841,9 +841,11 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
            competing header chains — see block_tip's doc comment).
            Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4088-4089,
                       pow.cpp GetNextWorkRequired. *)
-        let expected_bits =
-          Sync.compute_expected_bits ~parent_entry:vtip chain height block.header
-        in
+        (* Fail closed: an unresolvable ancestor is reported as an error,
+           never judged against a placeholder (Sync.resolve_expected_bits). *)
+        match Sync.resolve_expected_bits ~parent_entry:vtip chain height block.header with
+        | Error msg -> Error msg
+        | Ok expected_bits ->
         let base_lookup (outpoint : Types.outpoint) : Validation.utxo option =
           let txid = outpoint.Types.txid in
           let vout = Int32.to_int outpoint.Types.vout in

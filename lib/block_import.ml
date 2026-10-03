@@ -89,7 +89,16 @@ let run ~(ic : in_channel) ~(db : Storage.ChainDB.t)
         Sync.compute_expected_bits ~parent_entry:parent ~ancestry_incomplete
           chain height block.header
       in
-      if not (!ancestry_incomplete || block.header.bits = expected_bits) then begin
+      if !ancestry_incomplete then begin
+        (* Fail closed: an unresolvable ancestor is not a verdict either way
+           (Core asserts it exists, pow.cpp:42-45).  Previously this admitted
+           the block without a difficulty check. *)
+        Printf.eprintf
+          "\nancestry-incomplete at height %d: an ancestor needed for the \
+           required nBits is missing from the header table — aborting import\n%!"
+          height;
+        running := false
+      end else if block.header.bits <> expected_bits then begin
         Printf.eprintf
           "\nbad-diffbits at height %d: header 0x%08lx does not match the \
            difficulty its parent requires — aborting import\n%!"

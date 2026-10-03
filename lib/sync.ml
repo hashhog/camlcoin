@@ -918,6 +918,72 @@ let compute_expected_bits ?parent_entry ?ancestry_incomplete
     | None -> network.pow_limit
   end
 
+(* Fail-closed nBits resolution for a BLOCK being connected.
+
+   [compute_expected_bits] substitutes a placeholder ([(0, pow_limit)],
+   [genesis_header], [pow_limit]) when an ancestor lookup misses.  Bitcoin
+   Core can never reach that state — GetNextWorkRequired asserts the
+   period-first ancestor exists (pow.cpp:42-45) because its block index is
+   complete by construction — so ANY consumer that compares the result
+   against a block's nBits must treat a miss as "cannot judge", never as a
+   verdict.  Live 2026-10-03: a Core-snapshot datadir restarted with the
+   pre-base headers absent from the in-memory table; at the first retarget
+   after the base (969696) the period-first lookup (967680) missed, the
+   timespan was computed from timestamp 0, and every honest copy of the
+   block was rejected as "block does not meet difficulty target" — 55
+   times, scoring 55 honest peers.
+
+   The parent is resolved by HASH ([block_header.prev_block]), never by the
+   height index, and every ancestor via [get_ancestor]'s prev_block walk
+   (Core pindexLast->GetAncestor, pow.cpp:44,72).  A missing parent, a
+   parent whose height is not [height - 1], or an incomplete walk returns
+   [Error] tagged [ancestry-incomplete]: a LOCAL state defect.  Callers must
+   neither connect the block nor mark it invalid nor score the peer. *)
+let ancestry_incomplete_tag = "ancestry-incomplete"
+
+let resolve_expected_bits ?parent_entry (state : chain_state) (height : int)
+    (block_header : Types.block_header) : (int32, string) result =
+  if height = 0 then Ok state.network.genesis_header.bits
+  else
+    let parent =
+      match parent_entry with
+      | Some _ as p -> p
+      | None ->
+        Hashtbl.find_opt state.headers
+          (Cstruct.to_string block_header.prev_block)
+    in
+    match parent with
+    | None ->
+      Error (Printf.sprintf
+        "%s: parent %s of the block at height %d is not in the header table; \
+         required nBits cannot be computed"
+        ancestry_incomplete_tag
+        (Types.hash256_to_hex_display block_header.prev_block) height)
+    | Some pe when pe.height <> height - 1 ->
+      Error (Printf.sprintf
+        "%s: parent %s has height %d, expected %d; required nBits cannot be \
+         computed"
+        ancestry_incomplete_tag (Types.hash256_to_hex_display pe.hash)
+        pe.height (height - 1))
+    | Some pe ->
+      let incomplete = ref false in
+      let bits =
+        compute_expected_bits ~parent_entry:pe ~ancestry_incomplete:incomplete
+          state height block_header
+      in
+      if !incomplete then
+        Error (Printf.sprintf
+          "%s: an ancestor of the block at height %d is missing from the \
+           header table (Core asserts it exists, pow.cpp:42-45); required \
+           nBits cannot be computed"
+          ancestry_incomplete_tag height)
+      else Ok bits
+
+let is_ancestry_incomplete (msg : string) : bool =
+  let t = ancestry_incomplete_tag in
+  String.length msg >= String.length t
+  && String.sub msg 0 (String.length t) = t
+
 (* Process headers during REDOWNLOAD phase.
    These headers are validated, stored in a buffer, and released to permanent
    storage only once the buffer is deep enough (commitment safety margin).
@@ -1228,27 +1294,102 @@ let restore_chain_state (db : Storage.ChainDB.t)
   (* Check for stored header tip *)
   match Storage.ChainDB.get_header_tip db with
   | Some (_tip_hash, tip_height) ->
-    (* Load headers from genesis up to tip into memory *)
-    for h = 0 to tip_height do
-      match Storage.ChainDB.get_hash_at_height db h with
-      | Some hash ->
-        (match Storage.ChainDB.get_block_header db hash with
-         | Some header ->
-           let parent_work = if h = 0 then Consensus.zero_work else
-             match Hashtbl.find_opt state.headers
-                 (Cstruct.to_string header.prev_block) with
-             | Some parent -> parent.total_work
-             | None -> Consensus.zero_work
-           in
-           let entry = {
-             header; hash; height = h;
-             total_work = Consensus.work_add parent_work (work_from_bits header.bits);
-           } in
-           Hashtbl.replace state.headers (Cstruct.to_string hash) entry;
-           if h = tip_height then state.tip <- Some entry
-         | None -> ())
+    (* Load headers from genesis up to tip into memory.  Returns the number
+       of heights <= the validated chain tip that had NO height->hash row. *)
+    let chain_tip_height =
+      match Storage.ChainDB.get_chain_tip db with
+      | Some (_, h) -> h
+      | None -> -1
+    in
+    let load_from_index () =
+      let holes = ref 0 in
+      for h = 0 to tip_height do
+        match Storage.ChainDB.get_hash_at_height db h with
+        | Some hash ->
+          (match Storage.ChainDB.get_block_header db hash with
+           | Some header ->
+             let parent_work = if h = 0 then Consensus.zero_work else
+               match Hashtbl.find_opt state.headers
+                   (Cstruct.to_string header.prev_block) with
+               | Some parent -> parent.total_work
+               | None -> Consensus.zero_work
+             in
+             let entry = {
+               header; hash; height = h;
+               total_work = Consensus.work_add parent_work (work_from_bits header.bits);
+             } in
+             Hashtbl.replace state.headers (Cstruct.to_string hash) entry;
+             if h = tip_height then state.tip <- Some entry
+           | None -> ())
+        | None -> if h <= chain_tip_height then incr holes
+      done;
+      !holes
+    in
+    let holes = load_from_index () in
+    (* ---- Pre-snapshot-base height-index self-heal (2026-10-03) ----
+       A datadir bootstrapped from a UTXO snapshot (Core dumptxoutset) gets
+       height->hash rows only for genesis and [base, tip]: the import writes
+       the base row, and the from-genesis header sync that follows stores
+       every pre-base header's BYTES (accept_header) but, by design, no index
+       row.  While that first process runs the in-memory table holds them
+       with correct heights; after any restart the loop above reloads only
+       the indexed heights, so the whole (0, base) band vanishes from memory.
+       The first retarget after the base then cannot resolve its period-first
+       ancestor (live: 969696 needs 967680) and every honest block is
+       rejected as bad-difficulty; MTP / BIP-68 / getblockheader below the
+       base break the same way.  Core has no such gap: the snapshot's header
+       chain is part of chainActive and LoadBlockIndex rebuilds the full tree.
+
+       Heal: when heights at or below the VALIDATED tip have no row, walk the
+       validated tip's ancestry down by prev_block through the block_header
+       CF; if the walk reaches genesis at height 0, write every missing (or
+       disagreeing) row — these are the active chain's own ancestors — and
+       reload.  If the walk breaks (header bytes genuinely absent, e.g. header
+       sync has not reached the base yet) nothing is written. *)
+    if holes > 0 then begin
+      match Storage.ChainDB.get_chain_tip db with
       | None -> ()
-    done;
+      | Some (ct_hash, ct_height) ->
+        let genesis_hash = Crypto.compute_block_hash network.genesis_header in
+        let rows = ref [] in
+        let cur = ref ct_hash and h = ref ct_height and broke = ref false in
+        while !h >= 0 && not !broke do
+          match Storage.ChainDB.get_block_header db !cur with
+          | None -> broke := true
+          | Some hdr ->
+            rows := (!h, !cur) :: !rows;
+            if !h > 0 then cur := hdr.Types.prev_block;
+            decr h
+        done;
+        let reached_genesis =
+          (not !broke)
+          && (match !rows with
+              | (0, g) :: _ -> Cstruct.equal g genesis_hash
+              | _ -> false)
+        in
+        if not reached_genesis then
+          Logs.warn (fun m ->
+            m "Restore: %d height-index hole(s) at or below the validated tip \
+               %d, but its ancestry does not reach genesis through stored \
+               headers — index left untouched" holes ct_height)
+        else begin
+          let fixed = ref 0 in
+          List.iter (fun (hh, hash) ->
+            match Storage.ChainDB.get_hash_at_height db hh with
+            | Some c when Cstruct.equal c hash -> ()
+            | _ -> Storage.ChainDB.set_height_hash db hh hash; incr fixed
+          ) !rows;
+          Storage.ChainDB.sync db;
+          Hashtbl.reset state.headers;
+          state.tip <- None;
+          let remaining = load_from_index () in
+          Logs.warn (fun m ->
+            m "Restore: healed %d height->hash row(s) below the validated tip \
+               %d from stored headers (%d hole(s) before, %d after); \
+               pre-snapshot-base headers are back in the header table"
+              !fixed ct_height holes remaining)
+        end
+    end;
     state.headers_synced <- tip_height;
     (* Restore validated block height from chain_tip (separate from header_tip).
        chain_tip is only written after successful UTXO flush, so it always
@@ -1399,7 +1540,10 @@ let restore_chain_state (db : Storage.ChainDB.t)
        overwrite the in-memory tip once we have one. Must run BEFORE
        the genesis re-anchor (which only fires when tip is still None). *)
     (match Storage.ChainDB.get_assumeutxo_chainwork db, state.tip with
-     | Some w, Some t ->
+     (* Only when the walked work is BELOW the pinned base work: once the
+        pre-base band is loaded (or healed) the walk from genesis already
+        carries the real, larger work and must not be lowered. *)
+     | Some w, Some t when Consensus.work_compare t.total_work w < 0 ->
        let patched = { t with total_work = w } in
        Hashtbl.replace state.headers (Cstruct.to_string t.hash) patched;
        state.tip <- Some patched;
@@ -3828,6 +3972,31 @@ let compute_mtp_hash_linked (state : chain_state) (prev_block : Types.hash256) :
     let timestamps = collect_ancestor_timestamps state parent 11 in
     Consensus.median_time_past timestamps
 
+(* Fail-closed BIP113 MTP for a block at [height] whose parent is
+   [prev_block].  [compute_mtp_hash_linked] returns 0 (accept any time) on a
+   missing parent and a SHORT median when the walk breaks early; both are
+   placeholders Core cannot produce (CBlockIndex::GetMedianTimePast walks
+   pprev, which always exists).  Require min(11, height) timestamps. *)
+let resolve_mtp_hash_linked (state : chain_state) ~(height : int)
+    (prev_block : Types.hash256) : (int32, string) result =
+  if height <= 0 then Ok 0l
+  else
+    match Hashtbl.find_opt state.headers (Cstruct.to_string prev_block) with
+    | None ->
+      Error (Printf.sprintf
+        "%s: parent %s of the block at height %d is not in the header table; \
+         median-time-past cannot be computed"
+        ancestry_incomplete_tag (Types.hash256_to_hex_display prev_block) height)
+    | Some parent ->
+      let ts = collect_ancestor_timestamps state parent 11 in
+      let need = min 11 height in
+      if List.length ts < need then
+        Error (Printf.sprintf
+          "%s: only %d of %d median-time-past ancestors of the block at \
+           height %d are in the header table"
+          ancestry_incomplete_tag (List.length ts) need height)
+      else Ok (Consensus.median_time_past ts)
+
 (* Compute the median time past FOR DISPLAY in getblockheader/getblock RPC,
    which mirrors Bitcoin Core's CBlockIndex::GetMedianTimePast() that starts
    at the CURRENT block (inclusive):
@@ -4223,15 +4392,28 @@ let process_downloaded_blocks ?(max_blocks = 1)
            unguarded lookup mis-resolves the retarget ancestor and fails every
            gap block (W146 reengage fix).  Mirrors Core pindexLast->GetAncestor
            (pow.cpp:44,72); same pattern as the reorg + submitblock paths. *)
-        let parent_entry = get_header ibd.chain block.header.prev_block in
-        let expected_bits =
-          match parent_entry with
-          | Some pe -> compute_expected_bits ~parent_entry:pe ibd.chain height block.header
-          | None -> compute_expected_bits ibd.chain height block.header
+        (* Fail closed on an incomplete ancestry (see [resolve_expected_bits]):
+           the block stays Downloaded, is NOT judged, and the peer is NOT
+           scored — the defect is ours, not the peer's. *)
+        let pre =
+          match resolve_expected_bits ibd.chain height block.header with
+          | Error _ as e -> e
+          | Ok bits ->
+            (* MTP via hash-linked parent walk (immune to height-index
+               contamination).  Reference: bitcoin-core/src/chain.h:233-245. *)
+            (match resolve_mtp_hash_linked ibd.chain ~height block.header.prev_block with
+             | Error _ as e -> e
+             | Ok mtp -> Ok (bits, mtp))
         in
-        (* Compute MTP via hash-linked parent walk (immune to height-index contamination
-           from side-branch headers).  Reference: bitcoin-core/src/chain.h:233-245. *)
-        let median_time = compute_mtp_hash_linked ibd.chain block.header.prev_block in
+        begin match pre with
+        | Error msg ->
+          Logs.err (fun m ->
+            m "Block at height %d (%s) NOT validated: %s — local header-table \
+               defect; block kept, not marked invalid, peer not scored"
+              height (Types.hash256_to_hex_display entry.hash) msg);
+          continue := false;
+          Lwt.return_unit
+        | Ok (expected_bits, median_time) ->
         (* BIP-94: parent block timestamp for timewarp check *)
         let prev_block_time = get_prev_block_time ibd.chain height in
         let lookup, prefetch_base = ibd_base_readers ibd in
@@ -4552,6 +4734,7 @@ let process_downloaded_blocks ?(max_blocks = 1)
            entry.download_state <- NotRequested;
            continue := false;
            Lwt.return_unit)
+        end
       | NotRequested | Requested _ ->
         continue := false;  (* Waiting for download *)
         Lwt.return_unit
@@ -5713,15 +5896,17 @@ let connect_block_into_batch
        the height index still reflects the pre-reorg chain; using get_ancestor
        on the parent entry mirrors Core's pindexLast->GetAncestor(nHeightFirst)
        (pow.cpp:44,72) and avoids false-accepts/-rejects on the incoming fork. *)
-    let parent_entry = get_header state entry.header.prev_block in
-    let expected_bits =
-      match parent_entry with
-      | Some pe -> compute_expected_bits ~parent_entry:pe state height block.header
-      | None -> compute_expected_bits state height block.header
-    in
+    (* Fail closed on an incomplete ancestry ([resolve_expected_bits]). *)
+    match resolve_expected_bits state height block.header with
+    | Error msg ->
+      Error (Printf.sprintf "reorg connect at height %d: %s" height msg)
+    | Ok expected_bits ->
     (* Hash-linked MTP: during a reorg the height->hash index still reflects the
        pre-reorg chain; use prev_block links to get the true side-branch MTP. *)
-    let median_time = compute_mtp_hash_linked state entry.header.prev_block in
+    match resolve_mtp_hash_linked state ~height entry.header.prev_block with
+    | Error msg ->
+      Error (Printf.sprintf "reorg connect at height %d: %s" height msg)
+    | Ok median_time ->
     let prev_block_time = get_prev_block_time state height in
     (* Lookup that reads through the overlay first, then disk. Used by
        [accept_block] for input resolution and below for undo-data
@@ -6142,9 +6327,17 @@ let verify_chain (state : chain_state) ~(checklevel : int) ~(nblocks : int)
                   height (Types.hash256_to_hex_display entry.hash));
               ok := false
             | Some block ->
-              let expected_bits =
-                compute_expected_bits state height block.header in
-              let median_time = compute_mtp_hash_linked state entry.header.prev_block in
+              (* Fail closed: an unresolvable ancestor is a verifychain
+                 failure, never a placeholder verdict. *)
+              match resolve_expected_bits state height block.header,
+                    resolve_mtp_hash_linked state ~height entry.header.prev_block
+              with
+              | Error msg, _ | _, Error msg ->
+                Logs.err (fun m ->
+                  m "verifychain: cannot check block at %d, hash=%s (%s)"
+                    height (Types.hash256_to_hex_display entry.hash) msg);
+                ok := false
+              | Ok expected_bits, Ok median_time ->
               let prev_block_time = get_prev_block_time state height in
               (* Level 1: CheckBlock (header sanity, merkle root, coinbase,
                  weight/sigops, witness commitment, dup-txid, IsFinalTx). PoW
@@ -6732,12 +6925,15 @@ let try_attach_side_branch_and_reorg
            prev_block links rather than the active height->hash index, which may point
            at the competing chain during a reorg or when a side-branch header arrived
            before the block body. *)
-        let expected_bits =
-          if state.network.pow_no_retargeting then parent.header.bits
+        let expected_bits_r =
+          if state.network.pow_no_retargeting then Ok parent.header.bits
           else if height mod Consensus.difficulty_adjustment_interval = 0
-          then compute_expected_bits ~parent_entry:parent state height block.header
-          else parent.header.bits
+          then resolve_expected_bits ~parent_entry:parent state height block.header
+          else Ok parent.header.bits
         in
+        match expected_bits_r with
+        | Error msg -> Error msg
+        | Ok expected_bits ->
         if header.bits <> expected_bits then
           Error (Printf.sprintf
                    "Header difficulty mismatch (got 0x%lx expected 0x%lx)"
@@ -7565,8 +7761,19 @@ let rec connect_stored_blocks (state : chain_state) : int =
       | None -> 0
       | Some stored_block ->
         let t0 = Unix.gettimeofday () in
-        let expected_bits = compute_expected_bits state next_height stored_block.header in
-        let median_time = compute_mtp_hash_linked state entry.header.prev_block in
+        (* Fail closed ([resolve_expected_bits]): an unresolvable ancestor
+           leaves the stored block unconnected and NOT invalidated. *)
+        match resolve_expected_bits state next_height stored_block.header,
+              resolve_mtp_hash_linked state ~height:next_height
+                entry.header.prev_block
+        with
+        | Error msg, _ | _, Error msg ->
+          Logs.err (fun m ->
+            m "Stored block at height %d (%s) NOT validated: %s — local \
+               header-table defect; block kept, not marked invalid"
+              next_height (Types.hash256_to_hex_display entry.hash) msg);
+          0
+        | Ok expected_bits, Ok median_time ->
         let prev_block_time = get_prev_block_time state next_height in
         let lookup outpoint =
           let vout = Int32.to_int outpoint.Types.vout in
@@ -7793,8 +8000,19 @@ let process_new_block ?(f_requested = false)
         Lwt.return (Ok ())
       end else begin
         let t0 = Unix.gettimeofday () in
-        let expected_bits = compute_expected_bits state height block.header in
-        let median_time = compute_mtp_hash_linked state block.header.prev_block in
+        (* Fail closed ([resolve_expected_bits]): an unresolvable ancestor is
+           a LOCAL defect — do not judge the block, do not mark it invalid,
+           do not score the peer. *)
+        match resolve_expected_bits state height block.header,
+              resolve_mtp_hash_linked state ~height block.header.prev_block
+        with
+        | Error msg, _ | _, Error msg ->
+          Logs.err (fun m ->
+            m "Block %s at height %d NOT validated: %s — local header-table \
+               defect; not marked invalid, peer not scored"
+              (Types.hash256_to_hex_display hash) height msg);
+          Lwt.return (Error msg)
+        | Ok expected_bits, Ok median_time ->
         let prev_block_time = get_prev_block_time state height in
         let lookup outpoint =
           let vout = Int32.to_int outpoint.Types.vout in

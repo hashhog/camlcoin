@@ -1097,9 +1097,9 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
         (Printexc.get_backtrace ())
     );
     Lwt_main.run (Camlcoin.Cli.run ?ready_fd:eff_ready_fd config);
-    (* Graceful shutdown complete: exit 0 deterministically.  The 30s
-       watchdog inside Cli.run will have already called exit 1 if the
-       graceful path stalled, so reaching this point means success. *)
+    (* Graceful shutdown complete: exit 0 deterministically.  A stalled
+       shutdown never returns here — the deadline pthread inside Cli.run
+       has already called _exit(0). *)
     Camlcoin.Runtime_config.remove_pid_file ();
     exit 0
   end

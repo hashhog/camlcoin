@@ -4,6 +4,11 @@
    run loop that ties together all components: P2P networking, sync, mempool,
    RPC server, and wallet. *)
 
+(* Raw pthread: see lib/shutdown_stubs.c.  An OCaml Thread cannot run
+   Unix._exit while rocksdb_close holds the runtime lock. *)
+external arm_shutdown_deadline_thread : int -> bool
+  = "camlcoin_arm_shutdown_deadline"
+
 (* ============================================================================
    CLI Configuration Type
    ============================================================================ *)
@@ -1480,24 +1485,47 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
 
   (* Set up signal handlers for graceful shutdown.
      We use Lwt_unix.on_signal so that the signal wakes the Lwt event loop
-     rather than racing with it from an OCaml signal handler.  A second
-     signal during shutdown escalates immediately to a forced exit, matching
-     Bitcoin Core init.cpp semantics. *)
+     rather than racing with it from an OCaml signal handler.  Further
+     signals are idempotent, matching Bitcoin Core's HandleSIGTERM (it only
+     calls g_shutdown()).  A second SIGTERM used to `exit 1`, which systemd
+     records as result 'exit-code' and which Restart=on-failure relaunches. *)
   let shutdown_wakener, shutdown_waiter =
     let (w, u) = Lwt.wait () in (u, w) in
   let shutdown = ref false in
+  (* Seconds before a stalled shutdown self-exits 0.  Default sits under
+     stop_mainnet's camlcoin SIGKILL grace (180s) and above the clean
+     mainnet flushes that already reach "exit" (the 30s Lwt watchdog could
+     not preempt a blocking RocksDB close, so the supervisor's SIGKILL
+     became journald result 'signal' / status=9/KILL).  Override with
+     CAMLCOIN_SHUTDOWN_DEADLINE_S for tests. *)
+  let shutdown_deadline_s () =
+    match Sys.getenv_opt "CAMLCOIN_SHUTDOWN_DEADLINE_S" with
+    | None -> 150
+    | Some s ->
+      (match int_of_string s with
+       | n when n >= 1 -> n
+       | _ -> 150
+       | exception Failure _ -> 150)
+  in
+  let deadline_armed = ref false in
+  let arm_shutdown_deadline () =
+    if not !deadline_armed then begin
+      deadline_armed := true;
+      let secs = shutdown_deadline_s () in
+      if not (arm_shutdown_deadline_thread secs) then
+        Logs.warn (fun m -> m "failed to arm shutdown deadline thread")
+    end
+  in
   let handle_signal name =
     if not !shutdown then begin
       Logs.info (fun m -> m "received %s" name);
       shutdown := true;
+      arm_shutdown_deadline ();
       Lwt.wakeup_later shutdown_wakener ()
-    end else begin
-      (* Second signal: escalate to immediate forced exit. *)
-      Logs.warn (fun m ->
-        m "received second %s during shutdown — forcing exit" name);
-      Printf.eprintf "[camlcoin] second %s — forcing exit\n%!" name;
-      exit 1
-    end
+    end else
+      (* Already shutting down.  Do not exit 1: that is a failed unit. *)
+      Logs.info (fun m ->
+        m "received %s during shutdown — already shutting down" name)
   in
   let _sig_int = Lwt_unix.on_signal Sys.sigint (fun _signum ->
     handle_signal "SIGINT") in
@@ -3146,8 +3174,7 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
        quiet before we close the databases. zmq_ctx_term blocks on
        in-flight sends; LINGER=0 was set on the socket so close returns
        immediately. Best-effort: a hung ZMQ teardown cannot block the
-       graceful path beyond this point because the whole shutdown path
-       is wrapped by the 30s watchdog. *)
+       process past the shutdown-deadline systhread armed on SIGTERM. *)
     (match zmq_state with
      | None -> ()
      | Some (notifier, publisher) ->
@@ -3209,31 +3236,13 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     Lwt.return_unit
   in
 
-  (* 30-second hard-deadline watchdog.  Armed when the shutdown signal fires.
-     If graceful_shutdown has not completed within 30s, we best-effort close
-     the databases and call exit(1).  This prevents any single blocking step
-     (RocksDB compaction, UTXO flush, peer shutdown) from stranding the
-     process and forcing the supervisor to escalate to SIGKILL. *)
-  let watchdog () =
-    let* () = shutdown_waiter in
-    let* () = Lwt_unix.sleep 30.0 in
-    Logs.err (fun m ->
-      m "shutdown watchdog: graceful shutdown exceeded 30s — forcing exit");
-    Printf.eprintf
-      "[camlcoin] shutdown watchdog: graceful shutdown exceeded 30s — forcing exit\n%!";
-    (* Best-effort close of DBs so the next start isn't stuck on a lock. *)
-    (try Rocksdb_store.close rocksdb with _ -> ());
-    (try Storage.ChainDB.close db with _ -> ());
-    exit 1
-  in
-
   (* Main event loop - waits for shutdown signal, then runs graceful_shutdown
-     and returns.  Using Lwt.pick against the watchdog guarantees that
-     whichever completes first wins: either graceful returns normally, or
-     the watchdog process-exits. *)
+     and returns.  A stall inside this (blocking RocksDB close) is ended by
+     [arm_shutdown_deadline], which was started from the signal handler and
+     does not share this domain's Lwt scheduler. *)
   let event_loop () =
     let* () = shutdown_waiter in
-    Lwt.pick [ graceful_shutdown (); watchdog () ]
+    graceful_shutdown ()
   in
 
   (* Prevent uncaught Lwt.async exceptions from crashing the process.
@@ -3306,8 +3315,9 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
      resolves their promise), so we must not wait on them via Lwt.join — we
      would hang forever on shutdown.  Instead the event_loop promise is the
      single source of truth for when the process should return from
-     Lwt_main.run: event_loop resolves when graceful_shutdown finishes, and
-     the 30s watchdog inside it guarantees bounded exit time. *)
+     Lwt_main.run: event_loop resolves when graceful_shutdown finishes.
+     If a phase blocks in C, the SIGTERM deadline systhread Unix._exit 0
+     bounds the wait so the supervisor does not have to SIGKILL. *)
   Lwt.async (fun () ->
     Lwt.catch
       (fun () -> rpc_thread)

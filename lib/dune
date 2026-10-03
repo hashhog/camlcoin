@@ -29,7 +29,7 @@
             x509 domain-name)
  (foreign_stubs
   (language c)
-  (names schnorr_stubs sha256_accel_stubs rocksdb_stubs zmq_stubs)
+  (names schnorr_stubs sha256_accel_stubs rocksdb_stubs zmq_stubs shutdown_stubs)
   (flags (:standard))
   (include_dirs ../vendor/secp256k1/src ../vendor/secp256k1/include))
  (c_library_flags (-lcrypto -lrocksdb -l:libzmq.so.5 -lstdc++))

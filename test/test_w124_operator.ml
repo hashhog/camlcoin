@@ -122,17 +122,18 @@
                       undefined behaviour.
                       Reference: lib/runtime_config.ml:357-361.
 
-     BUG-9  (P1 G3) : Second SIGTERM during graceful shutdown
-                      forces immediate `exit 1` from
-                      `handle_signal` (cli.ml:660-664), but does NOT
-                      attempt the best-effort RocksDB close that
-                      the 30s watchdog runs (cli.ml:1763-1764).
-                      So a quick second-signal escalation leaves
-                      RocksDB in a state requiring repair on next
-                      boot.  Core's HandleSIGTERM is idempotent
-                      (only flips SignalInterrupt once) and lets
-                      the main thread continue Shutdown().
-                      Reference: lib/cli.ml:653-664.
+     BUG-9  (P1 G3) : WAS: second SIGTERM called `exit 1` from
+                      `handle_signal` and systemd recorded
+                      result 'exit-code' (Restart=on-failure
+                      relaunched).  Core's HandleSIGTERM is
+                      idempotent.  Fixed: a repeat signal logs
+                      "already shutting down" and does not exit.
+                      A stalled close is ended by a systhread
+                      deadline (`Unix._exit 0`), not by the old
+                      Lwt 30s watchdog (which cannot preempt a
+                      blocking rocksdb_close, so the supervisor
+                      SIGKILL became journald result 'signal').
+                      Reference: lib/cli.ml handle_signal.
 
      BUG-10 (P2 G7) : `data_dir` default lookup uses `Sys.getenv "HOME"`
                       (cli.ml:137, 176, 180) which raises
@@ -318,34 +319,35 @@ let g2_sigpipe_present () =
     (contains src "Sys.set_signal Sys.sigpipe Sys.Signal_ignore")
 
 (* ============================================================================
-   Gate G3: Second SIGTERM forces immediate exit but skips best-effort DB
-   close (BUG-9, PARTIAL).
+   Gate G3: A second SIGTERM/SIGINT during shutdown is idempotent (Core
+   HandleSIGTERM).  It must not `exit 1` — systemd records that as
+   result 'exit-code' and Restart=on-failure relaunches the unit.
    ============================================================================ *)
-let g3_second_signal_escalation_partial () =
+let g3_second_signal_idempotent () =
   let src = read_file "lib/cli.ml" in
-  (* Second signal handler exists and calls exit 1 *)
   Alcotest.(check bool)
-    "second-signal escalation present in handle_signal"
+    "second signal logs already shutting down and does not exit"
     true
-    (contains src "second %s during shutdown — forcing exit");
-  (* But the escalation path (cli.ml ~660-664) does NOT close DBs first
-     unlike the 30s watchdog (cli.ml ~1755-1765). Document the gap by
-     asserting the escalation block does NOT contain Rocksdb_store.close. *)
-  let escalation_idx =
+    (contains src "received %s during shutdown — already shutting down");
+  Alcotest.(check bool)
+    "forcing-exit escalation removed"
+    false
+    (contains src "forcing exit");
+  let idx =
     try Some (
       Str.search_forward
-        (Str.regexp_string "second %s during shutdown — forcing exit")
+        (Str.regexp_string "already shutting down")
         src 0)
     with Not_found -> None
   in
-  match escalation_idx with
-  | None -> Alcotest.fail "escalation block not found"
+  match idx with
+  | None -> Alcotest.fail "idempotent second-signal arm not found"
   | Some i ->
-    let snippet = String.sub src i (min 400 (String.length src - i)) in
+    let snippet = String.sub src i (min 200 (String.length src - i)) in
     Alcotest.(check bool)
-      "BUG-9: escalation path does NOT call Rocksdb_store.close before exit"
+      "second-signal arm does not call exit"
       false
-      (contains snippet "Rocksdb_store.close")
+      (contains snippet "exit")
 
 (* ============================================================================
    Gate G4: Graceful shutdown is phased (P2P → wallet → chainstate → DB → PID)
@@ -365,14 +367,23 @@ let g4_phased_shutdown_present () =
     (contains src "Phase 5: remove PID file")
 
 (* ============================================================================
-   Gate G5: 30s shutdown watchdog forces exit 1 if graceful stalls (PRESENT)
+   Gate G5: a systhread deadline Unix._exit 0 if graceful shutdown stalls.
+   The old Lwt 30s watchdog called exit 1 and could not preempt a blocking
+   rocksdb_close, so stop_mainnet's SIGKILL was journald result 'signal'.
    ============================================================================ *)
-let g5_shutdown_watchdog_present () =
+let g5_shutdown_deadline_present () =
   let src = read_file "lib/cli.ml" in
-  Alcotest.(check bool) "30s shutdown watchdog present" true
-    (contains src "shutdown watchdog: graceful shutdown exceeded 30s");
-  Alcotest.(check bool) "watchdog races graceful_shutdown via Lwt.pick" true
-    (contains src "Lwt.pick [ graceful_shutdown (); watchdog () ]")
+  let stub = read_file "lib/shutdown_stubs.c" in
+  Alcotest.(check bool) "shutdown deadline env override present" true
+    (contains src "CAMLCOIN_SHUTDOWN_DEADLINE_S");
+  Alcotest.(check bool) "signal path arms the C deadline thread" true
+    (contains src "camlcoin_arm_shutdown_deadline");
+  Alcotest.(check bool) "deadline is armed from the signal path" true
+    (contains src "arm_shutdown_deadline ()");
+  Alcotest.(check bool) "C thread _exit(0)s without the runtime lock" true
+    (contains stub "_exit(0)");
+  Alcotest.(check bool) "Lwt 30s exit-1 watchdog removed" false
+    (contains src "shutdown watchdog: graceful shutdown exceeded 30s")
 
 (* ============================================================================
    Gate G6: Async-exception hook installed to prevent single-peer crash from
@@ -735,12 +746,12 @@ let () =
         g1_sigterm_present;
       Alcotest.test_case "G2 SIGPIPE ignored (PRESENT)" `Quick
         g2_sigpipe_present;
-      Alcotest.test_case "G3 second-signal escalation skips DB close (BUG-9 PARTIAL)" `Quick
-        g3_second_signal_escalation_partial;
+      Alcotest.test_case "G3 second signal is idempotent (PRESENT)" `Quick
+        g3_second_signal_idempotent;
       Alcotest.test_case "G4 phased graceful shutdown (PRESENT)" `Quick
         g4_phased_shutdown_present;
-      Alcotest.test_case "G5 30s shutdown watchdog (PRESENT)" `Quick
-        g5_shutdown_watchdog_present;
+      Alcotest.test_case "G5 shutdown deadline thread (PRESENT)" `Quick
+        g5_shutdown_deadline_present;
       Alcotest.test_case "G6 async-exception hook (PRESENT, W78)" `Quick
         g6_async_exn_hook_present;
     ];

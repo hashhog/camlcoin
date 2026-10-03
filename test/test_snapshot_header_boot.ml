@@ -143,33 +143,30 @@ let test_fixture_headers_leave_pointer_at_base () =
 
   let db = Storage.ChainDB.create !test_db_path in
   let state = Sync.restore_chain_state db Consensus.regtest in
+  (* 2026-10-03 (932256): a band whose lowest header's parent is not held is
+     an ISLAND, and validating past the base from it decided BIP68 coin
+     times from a partial window (or 0).  Core has the full header chain
+     before it uses a snapshot, so restore now re-syncs headers from genesis
+     and keeps the band only on disk (rows + bytes), with blocks_synced at
+     the base.  test_snapshot_prebase_headers drives the re-sync through. *)
   (match state.Sync.tip with
-   | None -> Alcotest.fail "restore left state.tip = None (re-anchored)"
+   | None -> Alcotest.fail "restore left state.tip = None"
    | Some t ->
-     Alcotest.(check int) "tip height is the snapshot base" 10 t.Sync.height;
-     Alcotest.(check bool) "tip hash is the snapshot base" true
-       (Cstruct.equal t.Sync.hash base_hash);
-     Alcotest.(check bool) "fixture chainwork pinned on the tip" true
-       (Cstruct.equal t.Sync.total_work (Consensus.work_of_hex chainwork_hex)));
-  Alcotest.(check int) "headers_synced is the base, not 0"
-    10 state.Sync.headers_synced;
+     Alcotest.(check int) "band island re-anchors header sync at genesis"
+       0 t.Sync.height);
+  Alcotest.(check int) "headers_synced 0: blocking from-genesis header sync"
+    0 state.Sync.headers_synced;
   Alcotest.(check int) "blocks_synced preserved at the snapshot base"
     10 state.Sync.blocks_synced;
-  (match Sync.build_locator state with
-   | [] -> Alcotest.fail "empty locator"
-   | head :: _ ->
-     Alcotest.(check bool)
-       "getheaders locator anchors at the snapshot base, not genesis" true
-       (Cstruct.equal head base_hash));
+  (match Storage.ChainDB.get_hash_at_height db 10 with
+   | Some h -> Alcotest.(check bool) "base row stays on disk" true
+                 (Cstruct.equal h base_hash)
+   | None -> Alcotest.fail "base row lost");
+  Alcotest.(check bool) "band header bytes stay on disk" true
+    (Storage.ChainDB.has_block_header db base_hash);
   (match Sync.best_header_at_height state 0 with
    | None -> Alcotest.fail "genesis missing after snapshot-boot"
    | Some e -> Alcotest.(check int) "genesis stays at height 0" 0 e.Sync.height);
-  (match Sync.best_header_at_height state 8,
-         Sync.best_header_at_height state 10 with
-   | Some lo, Some hi ->
-     Alcotest.(check bool) "tail band is in the in-memory header table" true
-       (lo.Sync.height = 8 && hi.Sync.height = 10)
-   | _ -> Alcotest.fail "tail band missing from in-memory headers");
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
@@ -209,7 +206,7 @@ let () =
         "bare snapshot (no fixture headers) still re-anchors to 0"
         `Quick test_bare_snapshot_still_reanchors;
       Alcotest.test_case
-        "campaign fixture headers leave the pointer on the base, not 0"
+        "campaign band island re-syncs headers from genesis (2026-10-03)"
         `Quick test_fixture_headers_leave_pointer_at_base;
       Alcotest.test_case
         "load_snapshot_into_primary calls persist_assumeutxo_base_headers"

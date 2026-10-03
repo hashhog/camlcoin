@@ -170,16 +170,38 @@ let test_absent_ancestry_fails_closed () =
   let next = next_header hashes in
   let want = oracle_bits headers next in
   let db = Storage.ChainDB.create !test_db_path in
+  (* The unguarded function still produces a placeholder value on a table
+     missing the period-first ancestor — the hazard the resolver contains.
+     Shown on the raw indexed shape, before restore's gap handling. *)
+  let raw = Sync.create_chain_state db net in
+  let prev = ref None in
+  for h = base_height to tip_height do
+    match Storage.ChainDB.get_hash_at_height db h with
+    | Some hash ->
+      (match Storage.ChainDB.get_block_header db hash with
+       | Some header ->
+         let e = Sync.{ header; hash; height = h; total_work = Consensus.zero_work } in
+         Hashtbl.replace raw.Sync.headers (Cstruct.to_string hash) e;
+         prev := Some e
+       | None -> ())
+    | None -> ()
+  done;
+  let parent = match !prev with Some p -> p | None -> Alcotest.fail "no raw tip" in
+  let placeholder =
+    Sync.compute_expected_bits ~parent_entry:parent raw (tip_height + 1) next in
+  Alcotest.(check bool) "unguarded value is wrong" true (placeholder <> want);
+  (match Sync.resolve_expected_bits raw (tip_height + 1) next with
+   | Ok b -> Alcotest.failf "resolver returned a verdict 0x%08lx on absent ancestry" b
+   | Error e ->
+     Alcotest.(check bool) "tagged ancestry-incomplete (raw table)" true
+       (Sync.is_ancestry_incomplete e));
+  (* restore: the header chain [base, tip] does not reach genesis, so the
+     island is dropped and header sync re-anchors at genesis (2026-10-03,
+     test_snapshot_prebase_headers); nothing past it can be judged. *)
   let state = Sync.restore_chain_state db net in
   Alcotest.(check bool) "nothing healed: 2016 still absent" true
     (Sync.get_header state hashes.(2016) = None);
-  (* The unguarded function still produces a placeholder value — that is the
-     hazard the resolver exists to contain. *)
-  let parent = match Sync.get_header state hashes.(tip_height) with
-    | Some p -> p | None -> Alcotest.fail "tip missing" in
-  let placeholder =
-    Sync.compute_expected_bits ~parent_entry:parent state (tip_height + 1) next in
-  Alcotest.(check bool) "unguarded value is wrong" true (placeholder <> want);
+  Alcotest.(check int) "island re-anchored at genesis" 0 state.Sync.headers_synced;
   (match Sync.resolve_expected_bits state (tip_height + 1) next with
    | Ok b -> Alcotest.failf "resolver returned a verdict 0x%08lx on absent ancestry" b
    | Error e ->
@@ -187,7 +209,7 @@ let test_absent_ancestry_fails_closed () =
        (Sync.is_ancestry_incomplete e));
   (match Sync.resolve_mtp_hash_linked state ~height:(base_height + 1)
            hashes.(base_height) with
-   | Ok _ -> Alcotest.fail "MTP resolved with only 1 of 11 ancestors"
+   | Ok _ -> Alcotest.fail "MTP resolved with an absent ancestry"
    | Error e -> Alcotest.(check bool) "MTP tagged" true (Sync.is_ancestry_incomplete e));
   (* Unknown parent. *)
   let orphan = { next with Types.prev_block = Types.zero_hash } in

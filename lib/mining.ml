@@ -892,13 +892,22 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
         let validation_flags =
           Consensus.get_block_script_flags ~block_hash:hash height chain.network
         in
-        (match Validation.accept_block
+        let coin_mtp, coin_mtp_failed =
+          Sync.checked_coin_mtp_lookup chain ~prev_block:block.header.prev_block in
+        let vres =
+          Validation.accept_block
                  ~network:chain.network ~block ~height
                  ~expected_bits ~median_time ~prev_block_time
                  ~base_lookup ~flags:validation_flags
                  ~skip_scripts:false
-                 ~get_mtp_at_height:(Sync.get_mtp_for_height chain)
-                 ?bip34_height_hash:(Sync.bip34_height_hash_for chain) () with
+                 ~get_mtp_at_height:coin_mtp
+                 ?bip34_height_hash:(Sync.bip34_height_hash_for chain) () in
+        (* Fail closed (Sync.checked_coin_mtp_lookup): an unresolvable BIP68
+           coin time is reported as an error, never judged. *)
+        (match coin_mtp_failed () with
+         | Some msg -> Error msg
+         | None ->
+        match vres with
         | Validation.AB_err e -> Error (Validation.block_error_to_string e)
         | Validation.AB_ok (_fees, txid_arr, _spent_utxos) ->
         (* Write tx_index entries for every tx in this submitblock-

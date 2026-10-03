@@ -1566,6 +1566,78 @@ let restore_chain_state (db : Storage.ChainDB.t)
        state.headers_synced <- 0
        (* blocks_synced intentionally left at the snapshot base. *)
      | _ -> ());
+    (* ---- Pre-snapshot-base header GAP: obtain the full header chain ----
+       A campaign/assumeutxo entry with a header band (base_tail_headers,
+       ~2,027 headers ending at the base) leaves the in-memory table as an
+       ISLAND: the lowest band header's parent is absent, so nothing below
+       the band root exists.  Consensus reads below the root then came from
+       a partial window or a default: BIP68 time locks need
+       GetAncestor(coin_height - 1)->GetMedianTimePast() (Core
+       consensus/tx_verify.cpp CalculateSequenceLocks), retargets need the
+       period-first header (pow.cpp:42-45).  R4 slice 930000-940000: band
+       root 927974, coin height 927979 -> median of 5 headers 1765808303
+       instead of Core's 1765804000 -> valid block 932256 rejected
+       (BIP68, short_by=2009s).  Coins below the root got median([]) = 0
+       (every time lock satisfied — fail-open).
+
+       Bitcoin Core never reaches this state: headers-first sync builds the
+       full header tree before anything validates, and loadtxoutset refuses
+       a snapshot whose base header is not already in the block index.
+
+       So: if the best header's ancestry does not reach genesis, drop the
+       island from memory (its bytes and height rows stay on disk) and
+       re-anchor header sync at genesis, exactly as the bare-snapshot path
+       above does.  The from-genesis sync re-derives every header with full
+       contextual checks (PoW, exact nBits, MTP, checkpoints), real heights
+       and real chainwork.  It is hash-linked to the snapshot by
+       construction: the block at base+1 connects only on top of the
+       header whose hash is the snapshot base ([block_tip] reads the base
+       row the import wrote; [resolve_expected_bits] resolves the parent by
+       hash), so a peer chain that does not contain the base can never
+       connect a block.  Until the sync passes the base, the base is not in
+       the table and no block past it can connect (fill_download_queue is
+       gated on the header tip; every connect path fails closed with
+       [ancestry-incomplete]).  After a restart, the 297ab99 heal above
+       finds the stored pre-base header bytes and restores the rows, so
+       this fires only while the chain is genuinely incomplete. *)
+    (match state.tip with
+     | Some t when t.height > 0 ->
+       let rec lowest (e : header_entry) =
+         if e.height = 0 then None
+         else
+           match Hashtbl.find_opt state.headers
+                   (Cstruct.to_string e.header.prev_block) with
+           | Some p when p.height = e.height - 1 -> lowest p
+           | _ -> Some e
+       in
+       (match lowest t with
+        | None -> ()
+        | Some root ->
+          let gen =
+            match Hashtbl.find_opt state.headers
+                    (Cstruct.to_string genesis_hash) with
+            | Some g -> g
+            | None ->
+              { header = network.genesis_header; hash = genesis_hash;
+                height = 0;
+                total_work = work_from_bits network.genesis_header.bits }
+          in
+          let dropped = Hashtbl.length state.headers in
+          Logs.warn (fun m ->
+            m "Pre-snapshot-base header gap: the best header %d (%s) descends \
+               from %d (%s) whose parent is not held — the header chain \
+               0..%d is missing.  Re-syncing headers from genesis (full \
+               header validation, real chainwork) before any block past the \
+               validated tip %d connects; %d in-memory header(s) dropped \
+               (bytes + height rows stay on disk)."
+              t.height (Types.hash256_to_hex_display t.hash)
+              root.height (Types.hash256_to_hex_display root.hash)
+              (root.height - 1) state.blocks_synced dropped);
+          Hashtbl.reset state.headers;
+          Hashtbl.replace state.headers (Cstruct.to_string genesis_hash) gen;
+          state.tip <- Some gen;
+          state.headers_synced <- 0)
+     | _ -> ());
     (* Load invalidated blocks from database *)
     List.iter (fun hash ->
       Hashtbl.replace state.invalidated_blocks (Cstruct.to_string hash) ()
@@ -4017,6 +4089,100 @@ let compute_median_time_for_display (state : chain_state) (height : int) : int32
 let get_mtp_for_height (state : chain_state) (h : int) : int32 =
   compute_median_time_past state h
 
+(* Fail-closed BIP68 coin time, resolved through the ancestry of the block
+   being connected.  Core consensus/tx_verify.cpp CalculateSequenceLocks:
+
+     nCoinTime = block.GetAncestor(std::max(nCoinHeight - 1, 0))
+                      ->GetMedianTimePast();
+
+   i.e. the median of the 11 headers ending at coin_height - 1 ON THIS
+   BLOCK'S CHAIN.  [get_mtp_for_height] collects by the active-chain height
+   index and silently returns the median of however many of those 11 rows
+   exist (or 0 for none).  On a snapshot-booted node holding only a header
+   band below the base, that was a partial median for coins near the band
+   root — mainnet 932256 (coin 927979, band root 927974): 5 headers,
+   1765808303 vs Core's 1765804000, a valid block rejected — and 0 (every
+   time lock satisfied, fail-open) for any older coin.
+
+   [parent] is the block's parent entry.  The anchor is found through the
+   active-chain index only when [parent] is itself on the active chain
+   (then every index row at or below it is its ancestor), otherwise by the
+   prev_block walk ([get_ancestor]); the window is the prev_block walk from
+   the anchor and must hold min(11, anchor + 1) headers, as Core's always
+   does.  Anything less is [Error "ancestry-incomplete: ..."]. *)
+let resolve_coin_mtp (state : chain_state) ~(parent : header_entry)
+    (coin_height : int) : (int32, string) result =
+  let anchor_h = max (coin_height - 1) 0 in
+  if anchor_h > parent.height then
+    Error (Printf.sprintf
+      "%s: coin height %d is above the parent %d of the spending block"
+      ancestry_incomplete_tag coin_height parent.height)
+  else begin
+    let on_active_chain =
+      match Storage.ChainDB.get_hash_at_height state.db parent.height with
+      | Some h -> Cstruct.equal h parent.hash
+      | None -> false
+    in
+    let anchor =
+      let via_index =
+        if on_active_chain then
+          match get_header_at_height state anchor_h with
+          | Some e when e.height = anchor_h -> Some e
+          | _ -> None
+        else None
+      in
+      match via_index with
+      | Some _ as x -> x
+      | None -> get_ancestor state parent anchor_h
+    in
+    match anchor with
+    | None ->
+      Error (Printf.sprintf
+        "%s: header at height %d (BIP68 coin time for a coin created at %d) \
+         is not in the header table"
+        ancestry_incomplete_tag anchor_h coin_height)
+    | Some a ->
+      let ts = collect_ancestor_timestamps state a 11 in
+      let need = min 11 (anchor_h + 1) in
+      if List.length ts < need then
+        Error (Printf.sprintf
+          "%s: only %d of %d median-time-past headers ending at %d are in \
+           the header table (BIP68 coin time for a coin created at %d)"
+          ancestry_incomplete_tag (List.length ts) need anchor_h coin_height)
+      else Ok (Consensus.median_time_past ts)
+  end
+
+(* A [get_mtp_at_height] callback for [Validation.accept_block] that fails
+   CLOSED, plus a probe the caller MUST consult before acting on the
+   validation result.  On a miss the callback records the reason and
+   returns 0xFFFFFFFF (an MTP so late the time lock reads as unsatisfied,
+   so even a caller that forgot the probe cannot accept); the caller then
+   treats the block as [ancestry-incomplete] — not connected, not marked
+   invalid, peer not scored — because the verdict was never ours to give.
+   The block's parent is resolved by HASH ([prev_block]); a missing parent
+   fails every lookup. *)
+let checked_coin_mtp_lookup (state : chain_state)
+    ~(prev_block : Types.hash256) : (int -> int32) * (unit -> string option) =
+  let failed : string option Atomic.t = Atomic.make None in
+  let parent = Hashtbl.find_opt state.headers (Cstruct.to_string prev_block) in
+  let fail msg =
+    ignore (Atomic.compare_and_set failed None (Some msg));
+    (-1l)
+  in
+  let f coin_height =
+    match parent with
+    | None ->
+      fail (Printf.sprintf
+        "%s: parent %s of the spending block is not in the header table \
+         (BIP68 coin time)"
+        ancestry_incomplete_tag (Types.hash256_to_hex_display prev_block))
+    | Some p ->
+      (match resolve_coin_mtp state ~parent:p coin_height with
+       | Ok v -> v
+       | Error msg -> fail msg)
+  in
+  (f, fun () -> Atomic.get failed)
+
 (* Return the timestamp of the block at height-1 (the parent), used for
    BIP-94 timewarp check.  Returns 0l when height=0 (genesis has no parent).
    Reference: bitcoin-core/src/validation.cpp ContextualCheckBlockHeader:4101. *)
@@ -4424,6 +4590,12 @@ let process_downloaded_blocks ?(max_blocks = 1)
           else Consensus.get_block_script_flags ~block_hash:entry.hash height ibd.chain.network
         in
         mark Connect_prof.p_pre;
+        (* BIP68 coin time through this block's ancestry, fail closed
+           ([checked_coin_mtp_lookup]); [coin_mtp_failed] is consulted
+           before the validation result is acted on. *)
+        let coin_mtp, coin_mtp_failed =
+          checked_coin_mtp_lookup ibd.chain ~prev_block:block.header.prev_block
+        in
         let%lwt vresult =
           match worker with
           | Some w ->
@@ -4434,7 +4606,7 @@ let process_downloaded_blocks ?(max_blocks = 1)
               flags = validation_flags;
               skip_scripts;
               network = ibd.chain.network;
-              get_mtp_at_height = Some (get_mtp_for_height ibd.chain);
+              get_mtp_at_height = Some coin_mtp;
               bip34_height_hash = bip34_height_hash_for ibd.chain;
               prefetch_base =
                 if skip_scripts then None else Some prefetch_base;
@@ -4449,12 +4621,24 @@ let process_downloaded_blocks ?(max_blocks = 1)
                       ~network:ibd.chain.network ~block ~height
                       ~expected_bits ~median_time ~prev_block_time ~base_lookup:lookup
                       ~flags:validation_flags ~skip_scripts
-                      ~get_mtp_at_height:(get_mtp_for_height ibd.chain)
+                      ~get_mtp_at_height:coin_mtp
                       ?bip34_height_hash:(bip34_height_hash_for ibd.chain) () with
               | Validation.AB_ok (fees, txid_arr, spent) -> Ok (fees, txid_arr, spent)
               | Validation.AB_err e -> Error e)
         in
         mark Connect_prof.p_validate;
+        match coin_mtp_failed () with
+        | Some msg ->
+          (* Same contract as the [pre] miss above: the verdict is not ours
+             to give — block kept Downloaded, not marked invalid, peer not
+             scored, nothing applied. *)
+          Logs.err (fun m ->
+            m "Block at height %d (%s) NOT validated: %s — local header-table \
+               defect; block kept, not marked invalid, peer not scored"
+              height (Types.hash256_to_hex_display entry.hash) msg);
+          continue := false;
+          Lwt.return_unit
+        | None ->
         (match vresult with
          | Ok (_fees, txid_arr, spent_utxo_list) ->
            let ibd_mode = skip_scripts in
@@ -5946,12 +6130,21 @@ let connect_block_into_batch
        differential harness can drive [connect_block_into_batch] over
        crafted-synthetic blocks whose nonce was not mined to the network
        target. *)
-    (match Validation.accept_block
+    let coin_mtp, coin_mtp_failed =
+      checked_coin_mtp_lookup state ~prev_block:entry.header.prev_block in
+    let vres =
+      Validation.accept_block
              ~network:state.network ~block ~height
              ~expected_bits ~median_time ~prev_block_time ~base_lookup:lookup
              ~flags:validation_flags ~skip_scripts ~skip_pow
-             ~get_mtp_at_height:(get_mtp_for_height state)
-             ?bip34_height_hash:(bip34_height_hash_for state) () with
+             ~get_mtp_at_height:coin_mtp
+             ?bip34_height_hash:(bip34_height_hash_for state) () in
+    match coin_mtp_failed () with
+    | Some msg ->
+      (* Fail closed: same contract as the [resolve_*] misses above. *)
+      Error (Printf.sprintf "reorg connect at height %d: %s" height msg)
+    | None ->
+    (match vres with
      | Validation.AB_err e ->
        (match ibd.misbehavior_handler with
         | Some _handler ->
@@ -7801,12 +7994,24 @@ let rec connect_stored_blocks (state : chain_state) : int =
         (* accept_block: unified ProcessNewBlock check pipeline.
            Same sequence as process_new_block and submit_block.
            Reference: bitcoin-core/src/validation.cpp ProcessNewBlock. *)
-        match Validation.accept_block
+        let coin_mtp, coin_mtp_failed =
+          checked_coin_mtp_lookup state ~prev_block:entry.header.prev_block in
+        let vres =
+          Validation.accept_block
                 ~network:state.network ~block:stored_block ~height:next_height
                 ~expected_bits ~median_time ~prev_block_time ~base_lookup:lookup
                 ~flags:validation_flags ~skip_scripts:false
-                ~get_mtp_at_height:(get_mtp_for_height state)
-                ?bip34_height_hash:(bip34_height_hash_for state) () with
+                ~get_mtp_at_height:coin_mtp
+                ?bip34_height_hash:(bip34_height_hash_for state) () in
+        match coin_mtp_failed () with
+        | Some msg ->
+          Logs.err (fun m ->
+            m "Stored block at height %d (%s) NOT validated: %s — local \
+               header-table defect; block kept, not marked invalid"
+              next_height (Types.hash256_to_hex_display entry.hash) msg);
+          0
+        | None ->
+        match vres with
         | Validation.AB_ok (_fees, txid_arr, spent_utxos) ->
           (* Persist undo data so a later [reorganize] can DISCONNECT this
              block (Core writes an undo record on every ConnectTip). Without
@@ -8050,6 +8255,8 @@ let process_new_block ?(f_requested = false)
            submit_block paths that don't carry a worker), fall back to
            the synchronous accept_block call wrapped in Lwt.return.
            Mirrors the IBD pattern at sync.ml:2402-2429. *)
+        let coin_mtp, coin_mtp_failed =
+          checked_coin_mtp_lookup state ~prev_block:block.header.prev_block in
         let%lwt vresult =
           match worker with
           | Some w ->
@@ -8060,7 +8267,7 @@ let process_new_block ?(f_requested = false)
               flags = validation_flags;
               skip_scripts = false;
               network = state.network;
-              get_mtp_at_height = Some (get_mtp_for_height state);
+              get_mtp_at_height = Some coin_mtp;
               bip34_height_hash = bip34_height_hash_for state;
               prefetch_base = None;
             } in
@@ -8071,11 +8278,19 @@ let process_new_block ?(f_requested = false)
                       ~network:state.network ~block ~height
                       ~expected_bits ~median_time ~prev_block_time ~base_lookup:lookup
                       ~flags:validation_flags ~skip_scripts:false
-                      ~get_mtp_at_height:(get_mtp_for_height state)
+                      ~get_mtp_at_height:coin_mtp
                       ?bip34_height_hash:(bip34_height_hash_for state) () with
               | Validation.AB_ok (fees, txid_arr, spent) -> Ok (fees, txid_arr, spent)
               | Validation.AB_err e -> Error e)
         in
+        match coin_mtp_failed () with
+        | Some msg ->
+          Logs.err (fun m ->
+            m "Block %s at height %d NOT validated: %s — local header-table \
+               defect; not marked invalid, peer not scored"
+              (Types.hash256_to_hex_display hash) height msg);
+          Lwt.return (Error msg)
+        | None ->
         match vresult with
         | Ok (_fees, txid_arr, spent_utxos) ->
           (* Store the block *)

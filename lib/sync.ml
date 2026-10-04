@@ -2176,7 +2176,8 @@ let process_headers ?(min_pow_checked = true) (state : chain_state)
     let rejected = ref 0 in
     let first_error = ref None in
     let error = ref None in
-    List.iter (fun header ->
+    let error_index = ref (-1) in
+    List.iteri (fun i header ->
       if !error = None then
         match validate_header state header with
         | Ok entry ->
@@ -2198,6 +2199,7 @@ let process_headers ?(min_pow_checked = true) (state : chain_state)
                     entry.total_work state.network) then begin
             if !first_error = None then
               first_error := Some "too-little-chainwork";
+            error_index := i;
             error := Some "too-little-chainwork"
           end else begin
             accept_header state entry;
@@ -2207,8 +2209,20 @@ let process_headers ?(min_pow_checked = true) (state : chain_state)
           incr rejected
         | Error e ->
           if !first_error = None then first_error := Some e;
+          error_index := i;
           error := Some e
     ) headers;
+    (* A mid-batch failure after an accepted prefix used to return Ok with
+       no trace: the 950000->958794 slice accepted 1853 of 2000 at the
+       replay store's 963853 two-block tie and nothing said why. Core
+       rejects a non-continuous batch outright (CheckHeadersAreContinuous);
+       we keep the valid prefix but say where it stopped. *)
+    (match !error with
+     | Some e when !accepted > 0 ->
+       Logs.warn (fun m ->
+         m "Headers batch: accepted %d of %d, stopped at #%d: %s"
+           !accepted (List.length headers) !error_index e)
+     | _ -> ());
     if !rejected > 0 && !accepted = 0 then begin
       Logs.warn (fun m -> m "All %d headers rejected (%d known, first_err=%s)"
         (List.length headers) !rejected
@@ -2655,6 +2669,31 @@ let getheaders_responder_ref
 (* Main header sync loop - requests headers repeatedly until caught up.
    Enforces headers_download_timeout (15 min total) and uses
    read_message_with_timeout for per-response timeout (2 min). *)
+(* Where the blocking header-sync loop goes when it cannot advance (peer's
+   next batch does not connect, a header fails validation, the peer times
+   out). Core never gates block download on header sync finishing:
+   FindNextBlocksToDownload walks whatever headers we hold toward the
+   peer's best known block, while HandleUnconnectingHeaders just sends one
+   getheaders. camlcoin exited this loop only on a short batch, so a peer
+   whose chain stops connecting ABOVE a perfectly good header tip (the
+   replay store served a stale sibling at 963853, then main 963854+) sent
+   us round the loop forever and block 950001 was never requested. When we
+   already hold headers past the block tip that are trusted for download
+   (assumeUTXO base, or work >= minimum_chain_work — the same gate as the
+   short-batch exit), start block download instead. *)
+let header_sync_can_download (state : chain_state) : bool =
+  let tip_work = match state.tip with
+    | Some t -> t.total_work
+    | None -> Consensus.zero_work
+  in
+  state.headers_synced > state.blocks_synced
+  && (state.blocks_synced > 0
+      || Consensus.work_compare tip_work
+           state.network.minimum_chain_work >= 0)
+
+let header_sync_stalled_next_state (state : chain_state) : sync_state =
+  if header_sync_can_download state then SyncingBlocks else Idle
+
 let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
   let open Lwt.Syntax in
   state.sync_state <- SyncingHeaders;
@@ -2796,7 +2835,7 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
     let elapsed = Unix.gettimeofday () -. sync_start_time in
     if elapsed > headers_download_timeout then begin
       Logs.err (fun m -> m "Header sync timed out after %.0fs" elapsed);
-      state.sync_state <- Idle;
+      state.sync_state <- header_sync_stalled_next_state state;
       Lwt.return_unit
     end else begin
       (* Only send a new getheaders if we have no outstanding request *)
@@ -2814,7 +2853,7 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
         (* Reset pending counter — peer did not respond, so the outstanding
            request is effectively dead. *)
         pending_getheaders := 0;
-        state.sync_state <- Idle;
+        state.sync_state <- header_sync_stalled_next_state state;
         Lwt.return_unit
       | Some headers ->
         (* Got a fresh response — clear the pending counter so the next
@@ -3013,6 +3052,18 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
           Lwt.return_unit
         end
       end
+    | Error e when e = "Unknown parent header"
+                   && header_sync_can_download state ->
+      (* Core HandleUnconnectingHeaders: one getheaders, no block-download
+         gate. Re-sending the same locator here got the same unconnecting
+         batch 10x per attempt, forever (354 rounds in the slice log). *)
+      Logs.warn (fun m ->
+        m "Unconnecting headers from peer %d above header tip %d (block tip \
+           %d) — starting block download; header sync continues on the \
+           message-loop path"
+          peer.Peer.id state.headers_synced state.blocks_synced);
+      state.sync_state <- SyncingBlocks;
+      Lwt.return_unit
     | Error e when e = "Unknown parent header" ->
       (* Bitcoin Core (net_processing.cpp::ProcessHeadersMessage)
          tolerates up to MAX_NUM_UNCONNECTING_HEADERS_MSGS=10
@@ -3029,7 +3080,7 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
           m "Peer %d exceeded MAX_NUM_UNCONNECTING_HEADERS_MSGS=%d, dropping sync_peer"
             peer.Peer.id max_num_unconnecting_headers_msgs);
         reset_unconnecting_headers state peer.Peer.id;
-        state.sync_state <- Idle;
+        state.sync_state <- header_sync_stalled_next_state state;
         Lwt.return_unit
       end else begin
         let count = unconnecting_headers_count state peer.Peer.id in
@@ -3045,7 +3096,7 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
       end
     | Error e ->
       Logs.err (fun m -> m "Header validation failed: %s" e);
-      state.sync_state <- Idle;
+      state.sync_state <- header_sync_stalled_next_state state;
       Lwt.return_unit
   in
   sync_iteration ()

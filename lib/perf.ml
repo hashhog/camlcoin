@@ -81,6 +81,12 @@ module LRU = struct
       dll_push_front t node;
       Some node.value
 
+  (* [get] without the recency promotion: no mutation of [t]. *)
+  let peek t key =
+    match Hashtbl.find_opt t.table key with
+    | None -> None
+    | Some node -> Some node.value
+
   let put t key value =
     (* Capacity 0 is write-only: the old `length >= capacity` evict
        branch no-ops when tail is None, then still pushes, so a disabled

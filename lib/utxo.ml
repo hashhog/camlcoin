@@ -421,6 +421,20 @@ module OptimizedUtxoSet = struct
         Mem_hit entry
       | None -> Mem_miss
 
+  (* Steps 1-2 of [get] with NO side effects (no stats, no LRU promotion,
+     no dirty re-add), so the at-tip connect paths can snapshot this
+     cache's answers for a block's inputs without perturbing it.  The
+     answer is the same as [get_mem]'s. *)
+  let peek_mem (t : t) (txid : Types.hash256) (vout : int) : mem_result =
+    let key = utxo_key txid vout in
+    match Perf.LRU.peek t.cache key with
+    | Some entry -> Mem_hit entry
+    | None ->
+      match Hashtbl.find_opt t.dirty key with
+      | Some `Removed -> Mem_removed
+      | Some (`Added entry | `Updated entry) -> Mem_hit entry
+      | None -> Mem_miss
+
   let read_db (t : t) (txid : Types.hash256) (vout : int)
       : utxo_entry option =
     let db_result = match t.rocksdb with
@@ -547,6 +561,14 @@ module OptimizedUtxoSet = struct
      left behind would keep answering with the abandoned branch's coin (or
      hide a coin the new branch created).  Only call with an empty dirty set
      (reorganize flushes first), so no pending write is lost. *)
+  (* Also used by the at-tip connect paths ([Sync.process_new_block],
+     the stored-block drain) after [Storage.ChainDB.apply_block_atomic]
+     wrote a block's delta to both stores: the store now holds the
+     authoritative post-block state of every touched outpoint, so any
+     LRU copy or pending dirty entry for those keys is superseded — a
+     pending [`Added]/[`Updated] for a coin the block spent would otherwise
+     re-put it at the next flush, a pending [`Removed] for a coin it
+     created would delete it. *)
   let forget (t : t) (txid : Types.hash256) (vout : int) : unit =
     let key = utxo_key txid vout in
     Perf.LRU.remove t.cache key;

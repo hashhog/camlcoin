@@ -3580,6 +3580,74 @@ let create_ibd_state ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
    its LRU outlives the reorg and is read by later submitblock / IBD connects. *)
 let shared_utxo_set : Utxo.OptimizedUtxoSet.t option ref = ref None
 
+(* ONE COIN VIEW for the at-tip connect paths (P0 2026-10-04, QUEUES
+   camlcoin item 0).  [process_new_block] and the stored-block drain read
+   coins from the store and commit with Storage.ChainDB.apply_block_atomic;
+   the catch-up IBD reads and writes through [shared_utxo_set] (LRU ->
+   dirty -> store) and flushes every 500 blocks / at session end.  The two
+   views diverged both ways:
+     - a coin the LRU held CLEAN and the at-tip path spent stayed unspent
+       in the LRU, so the next catch-up session accepted a block spending
+       it again (test/test_two_coin_views.exe: tip 103, ACCEPT-invalid);
+     - a coin a catch-up session spent but had not flushed was still in
+       the store, so an at-tip connect could spend it again.
+   Core has one CCoinsViewCache (CoinsTip) over the DB for every connect
+   path.  Here: the at-tip lookup consults the shared cache first (a
+   spent-in-cache answer is authoritative, coins.cpp FetchCoin), and after
+   the at-tip commit every touched outpoint is dropped from the cache so
+   its next read comes from the store that commit just wrote.
+
+   The snapshot is taken on the calling (Lwt) domain with side-effect-free
+   [peek_mem]; the lookup closure may run on the Validation_worker domain
+   and then only reads the immutable snapshot and the store. *)
+let at_tip_cache_snapshot (block : Types.block)
+    : (string, Utxo.utxo_entry option) Hashtbl.t option =
+  match !shared_utxo_set with
+  | None -> None
+  | Some u ->
+    let tbl = Hashtbl.create 64 in
+    List.iteri (fun i (tx : Types.transaction) ->
+      if i > 0 then
+        List.iter (fun (inp : Types.tx_in) ->
+          let op = inp.Types.previous_output in
+          let vout = Int32.to_int op.Types.vout in
+          let key = Utxo.OptimizedUtxoSet.utxo_key op.Types.txid vout in
+          match Utxo.OptimizedUtxoSet.peek_mem u op.Types.txid vout with
+          | Utxo.OptimizedUtxoSet.Mem_hit e -> Hashtbl.replace tbl key (Some e)
+          | Utxo.OptimizedUtxoSet.Mem_removed -> Hashtbl.replace tbl key None
+          | Utxo.OptimizedUtxoSet.Mem_miss -> ())
+          tx.Types.inputs)
+      block.Types.transactions;
+    Some tbl
+
+let at_tip_lookup
+    (snapshot : (string, Utxo.utxo_entry option) Hashtbl.t option)
+    (store_lookup : Types.outpoint -> Validation.utxo option)
+    (outpoint : Types.outpoint) : Validation.utxo option =
+  let from_store () = store_lookup outpoint in
+  match snapshot with
+  | None -> from_store ()
+  | Some tbl ->
+    let key =
+      Utxo.OptimizedUtxoSet.utxo_key outpoint.Types.txid
+        (Int32.to_int outpoint.Types.vout) in
+    match Hashtbl.find_opt tbl key with
+    | Some None -> None   (* spent in the shared cache: authoritative *)
+    | Some (Some e) ->
+      Some Validation.{
+        txid = outpoint.Types.txid; vout = outpoint.Types.vout;
+        value = e.Utxo.value; script_pubkey = e.Utxo.script_pubkey;
+        height = e.Utxo.height; is_coinbase = e.Utxo.is_coinbase }
+    | None -> from_store ()
+
+let at_tip_commit_invalidate
+    (ops : (Types.hash256 * int * [ `Add of string | `Del ]) list) : unit =
+  match !shared_utxo_set with
+  | None -> ()
+  | Some u ->
+    List.iter (fun (txid, vout, _) ->
+      Utxo.OptimizedUtxoSet.forget u txid vout) ops
+
 let reorg_utxo_set (ibd : ibd_state) : Utxo.OptimizedUtxoSet.t option =
   match ibd.utxo_set with
   | Some u -> Some u
@@ -8388,7 +8456,7 @@ let rec connect_stored_blocks
           0
         | Ok expected_bits, Ok median_time ->
         let prev_block_time = get_prev_block_time state next_height in
-        let lookup outpoint =
+        let store_lookup outpoint =
           let vout = Int32.to_int outpoint.Types.vout in
           match Storage.ChainDB.get_utxo state.db outpoint.Types.txid vout with
           | None -> None
@@ -8408,6 +8476,8 @@ let rec connect_stored_blocks
               is_coinbase = utxo_is_coinbase;
             }
         in
+        (* one coin view with the catch-up IBD: see [at_tip_cache_snapshot] *)
+        let lookup = at_tip_lookup (at_tip_cache_snapshot stored_block) store_lookup in
         let validation_flags =
           Consensus.get_block_script_flags ~block_hash:entry.hash next_height state.network
         in
@@ -8497,6 +8567,7 @@ let rec connect_stored_blocks
             ~tip_hash:entry.hash ~tip_height:next_height
             ~header_tip_hash:hdr_tip.hash ~header_tip_height:hdr_tip.height
             (List.rev !ops);
+          at_tip_commit_invalidate !ops;
           (* Store nTx and m_chain_tx_count so getblockheader /
              getchaintxstats do not need the body. *)
           Storage.ChainDB.record_connected_tx_counts state.db
@@ -8667,7 +8738,7 @@ let process_new_block ?(f_requested = false)
           Lwt.return (Error msg)
         | Ok expected_bits, Ok median_time ->
         let prev_block_time = get_prev_block_time state height in
-        let lookup outpoint =
+        let store_lookup outpoint =
           let vout = Int32.to_int outpoint.Types.vout in
           match Storage.ChainDB.get_utxo state.db outpoint.Types.txid vout with
           | None -> None
@@ -8687,6 +8758,8 @@ let process_new_block ?(f_requested = false)
               is_coinbase = utxo_is_coinbase;
             }
         in
+        (* one coin view with the catch-up IBD: see [at_tip_cache_snapshot] *)
+        let lookup = at_tip_lookup (at_tip_cache_snapshot block) store_lookup in
         let validation_flags =
           Consensus.get_block_script_flags ~block_hash:hash height state.network
         in
@@ -8842,6 +8915,7 @@ let process_new_block ?(f_requested = false)
             ~tip_hash:hash ~tip_height:height
             ~header_tip_hash:hdr_tip.hash ~header_tip_height:hdr_tip.height
             (List.rev !ops);
+          at_tip_commit_invalidate !ops;
           (* Wake the wait-family RPCs on this LIVE post-IBD tip advance (Core
              KernelNotifications blockTip / WaitTipChanged).  Placed AFTER the
              atomic chainstate commit so a waiter that wakes and re-reads the

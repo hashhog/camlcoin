@@ -35,7 +35,7 @@ let remine (block : Types.block) : Types.block =
 
 (* [fee] > 0 overpays the coinbase: bad-cb-amount, a consensus verdict.
    [tag] makes siblings at the same height distinct. *)
-let build_block ?(fee = 0L) ?(tag = 0) ~(prev_hash : Types.hash256)
+let build_block ?(fee = 0L) ?(tag = 0) ?(txs = []) ~(prev_hash : Types.hash256)
     ~(height : int) ~(prev_time : int32) () : Types.block =
   let extra_nonce = Cstruct.create 8 in
   Cstruct.LE.set_uint64 extra_nonce 0 (Int64.of_int ((tag * 1_000_000) + height));
@@ -43,15 +43,16 @@ let build_block ?(fee = 0L) ?(tag = 0) ~(prev_hash : Types.hash256)
     Mining.create_coinbase ~height ~total_fee:fee ~payout_script:op_true
       ~extra_nonce ~witness_root:wr ~network_type:Consensus.Regtest ()
   in
-  let witness_root = Mining.compute_witness_merkle_root [ mk None ] in
+  let witness_root = Mining.compute_witness_merkle_root (mk None :: txs) in
   let coinbase = mk (Some witness_root) in
-  let merkle_root, _ = Crypto.merkle_root [ Crypto.compute_txid coinbase ] in
+  let all = coinbase :: txs in
+  let merkle_root, _ = Crypto.merkle_root (List.map Crypto.compute_txid all) in
   remine
     { Types.header =
         { version = 4l; prev_block = prev_hash; merkle_root;
           timestamp = Int32.add prev_time 600l;
           bits = Consensus.regtest.pow_limit; nonce = 0l };
-      transactions = [ coinbase ] }
+      transactions = all }
 
 let hash_of (b : Types.block) = Crypto.compute_block_hash b.Types.header
 
@@ -227,6 +228,77 @@ let test_ancestry_incomplete_not_marked () =
       (is_invalid state b1);
     Alcotest.(check (list (pair int string))) "peer not scored" [] !punished)
 
+(* NON-verdict 3: fdcee86's fail-closed BIP68 coin time.  The block spends
+   a coin with a TIME-based relative lock (BIP68); the coin's MTP window
+   (heights 0..coin_height-1) is resolved through the spending block's
+   ancestry by [Sync.checked_coin_mtp_lookup].  With a header of that
+   window missing from the table the lookup returns 0xFFFFFFFF (lock reads
+   unsatisfied -> accept_block says TxSequenceLocksFailed) AND sets the
+   probe.  The probe must win: the block is NOT marked failed, the peer is
+   NOT scored, and once the header is back the same block connects.  If a
+   connect path misclassified the probe miss as a verdict, this block would
+   be marked bad-txns-nonfinal for good — a valid block rejected forever. *)
+let test_bip68_coin_time_missing_header_not_marked () =
+  Test_tmp.with_dir ~label:"invalid_block_p2p_bip68" ~mkdir:true (fun path ->
+    let db = Storage.ChainDB.create path in
+    Fun.protect
+      ~finally:(fun () -> try Storage.ChainDB.close db with _ -> ())
+      (fun () ->
+        let state = Sync.create_chain_state db Consensus.regtest in
+        state.Sync.sync_state <- Sync.FullySynced;
+        let genesis = Option.get state.Sync.tip in
+        let coin_height = 5 in
+        let tip_h = coin_height + 100 in   (* coinbase maturity *)
+        let prev = ref (genesis.Sync.hash, genesis.Sync.header.Types.timestamp) in
+        let coin_cb = ref None in
+        for h = 1 to tip_h do
+          let b = build_block ~prev_hash:(fst !prev) ~height:h
+              ~prev_time:(snd !prev) () in
+          if h = coin_height then coin_cb := Some (List.hd b.Types.transactions);
+          accept_hdr state b;
+          (match deliver state b with
+           | Ok () -> ()
+           | Error e -> Alcotest.failf "prefix block %d: %s" h e);
+          prev := (hash_of b, b.Types.header.Types.timestamp)
+        done;
+        let cb = Option.get !coin_cb in
+        let spend : Types.transaction = {
+          Types.version = 2l;
+          inputs = [ { Types.previous_output =
+                         { Types.txid = Crypto.compute_txid cb; vout = 0l };
+                       script_sig = Cstruct.empty;
+                       (* type flag (1 lsl 22) | 1 unit = 512 s *)
+                       sequence = 0x00400001l } ];
+          outputs = [ { Types.value = 49_00000000L; script_pubkey = op_true } ];
+          witnesses = []; locktime = 0l } in
+        let b = build_block ~txs:[ spend ] ~prev_hash:(fst !prev)
+            ~height:(tip_h + 1) ~prev_time:(snd !prev) () in
+        accept_hdr state b;
+        (* Drop the header at height 2 (inside the coin's MTP window 0..4,
+           far below the block's own 11-header MTP window). *)
+        let tip_e = Option.get (Sync.get_header state (fst !prev)) in
+        let h2 = Option.get (Sync.get_ancestor state tip_e 2) in
+        let h2_key = Cstruct.to_string h2.Sync.hash in
+        Hashtbl.remove state.Sync.headers h2_key;
+        let punished = ref [] in
+        let handler pid reason = punished := (pid, reason) :: !punished in
+        (match deliver ~peer_id:x ~misbehavior_handler:handler state b with
+         | Error e when Sync.is_ancestry_incomplete e -> ()
+         | Error e -> Alcotest.failf "expected ancestry-incomplete, got %s" e
+         | Ok () -> Alcotest.fail "connected without the coin's MTP window");
+        Alcotest.(check bool) "BIP68 coin-time miss did NOT mark the block" false
+          (is_invalid state b);
+        Alcotest.(check (list (pair int string))) "peer not scored" [] !punished;
+        Alcotest.(check bool) "best header still the block (retry target)" true
+          (Cstruct.equal (tip_hash state) (hash_of b));
+        (* Retry: header back, the same block connects (lock satisfied). *)
+        Hashtbl.replace state.Sync.headers h2_key h2;
+        (match deliver ~peer_id:x ~misbehavior_handler:handler state b with
+         | Ok () -> ()
+         | Error e -> Alcotest.failf "retry after header restored: %s" e);
+        Alcotest.(check int) "retry connected the block" (tip_h + 1)
+          state.Sync.blocks_synced))
+
 let () =
   Alcotest.run "invalid_block_p2p"
     [ ( "verdict",
@@ -238,4 +310,6 @@ let () =
         [ Alcotest.test_case "mutated body is not marked" `Quick
             test_mutated_not_marked;
           Alcotest.test_case "ancestry-incomplete is not marked" `Quick
-            test_ancestry_incomplete_not_marked ] ) ]
+            test_ancestry_incomplete_not_marked;
+          Alcotest.test_case "BIP68 coin-time missing header is not marked"
+            `Quick test_bip68_coin_time_missing_header_not_marked ] ) ]

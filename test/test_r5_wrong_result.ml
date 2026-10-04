@@ -31,6 +31,31 @@
 
 open Camlcoin
 
+let with_ctx_net network f =
+  Test_tmp.with_chaindb (fun db ->
+      let utxo = Utxo.UtxoSet.create db in
+      let mp =
+        Mempool.create ~network ~require_standard:false ~verify_scripts:false
+          ~utxo ~current_height:0 ()
+      in
+      let chain = Sync.create_chain_state db network in
+      let ctx : Rpc.rpc_context =
+        {
+          chain;
+          mempool = mp;
+          peer_manager = Peer_manager.create network;
+          wallet = None;
+          wallet_manager = None;
+          fee_estimator = Fee_estimation.create ();
+          network;
+          filter_index = None;
+          utxo = None;
+          data_dir = None;
+          snapshot_activation = None;
+        }
+      in
+      f ctx)
+
 let with_ctx f =
   Test_tmp.with_chaindb (fun db ->
       let utxo = Utxo.UtxoSet.create db in
@@ -248,6 +273,82 @@ let test_getnetworkhashps_listed_in_help () =
       | Ok j ->
         Alcotest.failf "help: expected string, got %s" (Yojson.Safe.to_string j))
 
+(* getnetworkhashps VALUE — Core rpc/mining.cpp GetNetworkHashPS (:65-104).
+   A deterministic 110-block regtest chain: block h has
+   time = 1296688602 + 600*h + (h*7919 mod 300), every block (genesis too)
+   bits 0x207fffff so chainwork(h) = 2*(h+1). The expected values were read
+   from a scratch regtest Core v31.99 that mined exactly this chain under
+   setmocktime (2026-10-04). Before the fix every row returned 0: the
+   rate was ~3.3e-3 and int_of_float truncated anything below 2^53. *)
+let regtest_hashps_chain (ctx : Rpc.rpc_context) =
+  let genesis =
+    match Sync.get_header_at_height ctx.chain 0 with
+    | Some e -> e
+    | None -> Alcotest.fail "no genesis"
+  in
+  let work n =
+    let cs = Cstruct.create 32 in
+    Cstruct.LE.set_uint32 cs 0 (Int32.of_int n);
+    cs
+  in
+  Alcotest.(check int32) "regtest genesis time" 1296688602l
+    genesis.Sync.header.Types.timestamp;
+  let prev = ref genesis in
+  for h = 1 to 110 do
+    let hash = Cstruct.create 32 in
+    Cstruct.LE.set_uint32 hash 0 (Int32.of_int h);
+    Cstruct.set_uint8 hash 4 0xA5;
+    let header =
+      { !prev.Sync.header with
+        Types.prev_block = !prev.Sync.hash;
+        timestamp = Int32.of_int (1296688602 + 600 * h + (h * 7919) mod 300) }
+    in
+    let e : Sync.header_entry =
+      { header; hash; height = h; total_work = work (2 * (h + 1)) } in
+    Hashtbl.replace ctx.chain.Sync.headers (Cstruct.to_string hash) e;
+    Storage.ChainDB.set_height_hash ctx.chain.db h hash;
+    prev := e
+  done;
+  ctx.chain.Sync.blocks_synced <- 110;
+  ctx.chain.Sync.headers_synced <- 110;
+  ctx.chain.Sync.tip <- Some !prev
+
+let core_hashps_vectors = [
+  (120, -1, 0.00332376491917208);     (* lookup clamps to 110: walks to genesis *)
+  (120, 50, 0.003305785123966942);    (* the R5 probe shape: nblocks >= height *)
+  (50, 50, 0.003305785123966942);
+  (49, 50, 0.003318546612034811);
+  (10, 50, 0.00333889816360601);
+  (1, 1, 0.002781641168289291);
+  (-1, -1, 0.00332376491917208);
+  (-1, 30, 0.003284072249589491);
+  (1000, 110, 0.00332376491917208);
+  (110, 110, 0.00332376491917208);
+  (109, 110, 0.003329718501321196);
+  (3, 100, 0.003231017770597738);
+]
+
+let test_getnetworkhashps_core_values () =
+  with_ctx_net Consensus.regtest (fun ctx ->
+      regtest_hashps_chain ctx;
+      List.iter
+        (fun (nb, ht, want) ->
+          let label = Printf.sprintf "getnetworkhashps %d %d" nb ht in
+          match Rpc.dispatch_rpc ctx "getnetworkhashps" [ `Int nb; `Int ht ] with
+          | Error (c, m) -> Alcotest.failf "%s: error (%d) %s" label c m
+          | Ok (`Float f) ->
+            if Float.abs (f -. want) > 1e-15 *. Float.abs want then
+              Alcotest.failf "%s: got %.17g, Core %.17g" label f want
+          | Ok j ->
+            Alcotest.failf "%s: got %s, Core %.17g" label
+              (Yojson.Safe.to_string j) want)
+        core_hashps_vectors;
+      (* height 0: Core returns the integer 0 (pb->nHeight == 0) *)
+      match Rpc.dispatch_rpc ctx "getnetworkhashps" [ `Int 120; `Int 0 ] with
+      | Ok (`Int 0) -> ()
+      | Ok j -> Alcotest.failf "height 0: got %s" (Yojson.Safe.to_string j)
+      | Error (c, m) -> Alcotest.failf "height 0: error (%d) %s" c m)
+
 let () =
   let open Alcotest in
   run "R5 wrong-result (Core probe vectors)"
@@ -276,5 +377,7 @@ let () =
         [
           test_case "listed in help" `Quick
             test_getnetworkhashps_listed_in_help;
+          test_case "Core values on a regtest chain" `Quick
+            test_getnetworkhashps_core_values;
         ] );
     ]

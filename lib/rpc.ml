@@ -12738,13 +12738,21 @@ let handle_getnetworkhashps (ctx : rpc_context)
               else begin
                 (* Core arith_uint256::getdouble on the 256-bit DIFFERENCE,
                    not on each chainwork then subtract (the latter loses the
-                   low bits of a ~2^98 chainwork into the 53-bit mantissa). *)
+                   low bits of a ~2^98 chainwork into the 53-bit mantissa).
+                   Same accumulation order as Core's getdouble: 32-bit limbs,
+                   least significant first (work_sub's Cstruct is LE). *)
                 let cstruct_to_float (cs : Cstruct.t) : float =
                   let acc = ref 0.0 in
-                  let base = ref 1.0 in
-                  for i = 0 to 31 do
-                    acc := !acc +. float_of_int (Cstruct.get_uint8 cs i) *. !base;
-                    base := !base *. 256.0
+                  let fact = ref 1.0 in
+                  for w = 0 to 7 do
+                    let limb =
+                      Int64.to_float
+                        (Int64.logand
+                           (Int64.of_int32 (Cstruct.LE.get_uint32 cs (w * 4)))
+                           0xFFFFFFFFL)
+                    in
+                    acc := !acc +. !fact *. limb;
+                    fact := !fact *. 4294967296.0
                   done;
                   !acc
                 in
@@ -12754,7 +12762,13 @@ let handle_getnetworkhashps (ctx : rpc_context)
                 in
                 let time_diff = !max_time - !min_time in
                 let hashps = work_diff /. float_of_int time_diff in
-                if hashps < 9.007199254740992e15
+                (* Core returns this as a double. The old code sent anything
+                   below 2^53 through int_of_float, which TRUNCATED it: a
+                   lookup that reaches genesis on regtest/testnet (work ~2e2
+                   over a ~5e8 s span from the 2011 genesis timestamp) came out
+                   as 0 instead of ~4e-7, and any fractional rate lost its
+                   fraction. Only an integral value may print as an Int. *)
+                if Float.is_integer hashps && Float.abs hashps < 9.007199254740992e15
                 then Ok (`Int (int_of_float hashps))
                 else Ok (`Float hashps)
               end

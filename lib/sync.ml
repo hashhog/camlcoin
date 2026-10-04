@@ -1259,6 +1259,166 @@ let create_chain_state (db : Storage.ChainDB.t)
   state
 
 (* Restore chain state from database *)
+(* Boot reconciliation: a BLOCK_FAILED mark on a block of the ACTIVE
+   validated chain is a contradiction — Core's InvalidBlockFound is only
+   reached for a block that failed to connect, and invalidateblock
+   disconnects the block before it marks it, so CheckBlockIndex holds
+   "no active-chain block is BLOCK_FAILED_*".  The live 2026-10-04 wedge
+   (a8e8f30) persisted exactly that state: block 969874 connected, then a
+   stale concurrent validation of the same block marked it failed, so the
+   best header fell back to 969873 and every child header was rejected
+   "bad-prevblk" — and a restart reloaded the mark.
+
+   For every marked block that is the active-chain block at its height
+   (<= blocks_synced, height->hash index): clear the mark, and the marks of
+   its marked descendants (BLOCK_FAILED_CHILD of a block that is not failed;
+   a genuinely invalid descendant is re-judged when it is next delivered).
+   Then raise the best header to the validated tip if the tip has more
+   work, so header tip >= block tip.  Idempotent; a healthy datadir logs
+   nothing and writes nothing. *)
+let repair_failed_marks_on_active_chain (state : chain_state) : unit =
+  let marked =
+    Hashtbl.fold (fun k () acc -> k :: acc) state.invalidated_blocks [] in
+  (* Stored-header ancestry of [hash] down to the first block held in the
+     in-memory table, bounded.  Returns [(anchor, band)] where [band] lists
+     (hash, header) from the anchor's child up to [hash].  A block marked
+     failed pulled the persisted best header BELOW it (mark_block_failed ->
+     set_header_tip), and restore loads headers only up to that best header,
+     so the marked tip itself is absent from memory after a restart. *)
+  let max_walk = 4032 in
+  let stored_band (hash : Types.hash256) =
+    let rec walk cur band steps =
+      if steps > max_walk then None
+      else
+        match Storage.ChainDB.get_block_header state.db cur with
+        | None -> None
+        | Some (hdr : Types.block_header) ->
+          let band = (cur, hdr) :: band in
+          match Hashtbl.find_opt state.headers
+                  (Cstruct.to_string hdr.prev_block) with
+          | Some anchor -> Some (anchor, band)
+          | None -> walk hdr.prev_block band (steps + 1)
+    in
+    walk hash [] 0
+  in
+  let index_matches (h : int) (hash : Types.hash256) =
+    h <= state.blocks_synced
+    && (match Storage.ChainDB.get_hash_at_height state.db h with
+        | Some x -> Cstruct.equal x hash
+        | None -> false)
+  in
+  (* The header_entry of a marked block that is on the ACTIVE validated
+     chain, loading its stored band into memory when it is absent (every
+     band block is an ancestor of an active block, hence active too: each
+     is checked against the height index before anything is inserted). *)
+  let active_entry key : header_entry option =
+    match Hashtbl.find_opt state.headers key with
+    | Some (e : header_entry) ->
+      if index_matches e.height e.hash then Some e else None
+    | None ->
+      (match stored_band (Cstruct.of_string key) with
+       | None -> None
+       | Some (anchor, band) ->
+         let entries, _ =
+           List.fold_left (fun (acc, (prev : header_entry)) (hash, header) ->
+             let e = { header; hash; height = prev.height + 1;
+                       total_work = Consensus.work_add prev.total_work
+                           (work_from_bits header.Types.bits) } in
+             (e :: acc, e)) ([], anchor) band
+         in
+         if entries <> []
+            && List.for_all (fun (e : header_entry) -> index_matches e.height e.hash)
+                 entries
+         then begin
+           List.iter (fun (e : header_entry) ->
+             Hashtbl.replace state.headers (Cstruct.to_string e.hash) e)
+             entries;
+           Some (List.hd entries)
+         end else None)
+  in
+  let cleared = ref 0 in
+  let clear (hash : Types.hash256) =
+    Hashtbl.remove state.invalidated_blocks (Cstruct.to_string hash);
+    Storage.ChainDB.clear_block_invalidated state.db hash;
+    incr cleared
+  in
+  let cleared_active = ref [] in
+  List.iter (fun key ->
+    match active_entry key with
+    | None -> ()
+    | Some e ->
+      Logs.warn (fun m ->
+        m "Boot repair: block %s at height %d is on the active validated \
+           chain (tip %d) but was marked BLOCK_FAILED — clearing the mark \
+           (an active-chain block cannot be failed; Core CheckBlockIndex)"
+          (Types.hash256_to_hex_display e.hash) e.height state.blocks_synced);
+      clear e.hash;
+      cleared_active := e :: !cleared_active
+  ) marked;
+  (* Descendant marks (BLOCK_FAILED_CHILD of a block that is not failed):
+     a remaining mark whose stored ancestry passes through a cleared block.
+     A genuinely invalid descendant is re-judged when next delivered. *)
+  if !cleared_active <> [] then begin
+    let is_cleared (h : Types.hash256) =
+      List.exists (fun (c : header_entry) -> Cstruct.equal c.hash h)
+        !cleared_active in
+    List.iter (fun key ->
+      if Hashtbl.mem state.invalidated_blocks key then begin
+        let rec descends cur steps =
+          if steps > max_walk then false
+          else
+            match Storage.ChainDB.get_block_header state.db cur with
+            | None -> false
+            | Some (hdr : Types.block_header) ->
+              if is_cleared hdr.prev_block then true
+              else descends hdr.prev_block (steps + 1)
+        in
+        let hash = Cstruct.of_string key in
+        if descends hash 0 then begin
+          Logs.warn (fun m ->
+            m "Boot repair: clearing descendant mark %s"
+              (Types.hash256_to_hex_display hash));
+          clear hash
+        end
+      end
+    ) marked
+  end;
+  (* header tip >= block tip: the best header must never be below a
+     connected block (Core: pindexBestHeader is at least m_chain.Tip()).
+     mark_block_failed persisted the fallen-back best header, so it must be
+     raised again here.  Only after a repair: the snapshot-boot paths above
+     deliberately leave the best header at genesis (re-anchored header sync)
+     below the validated base, and that must stand. *)
+  if !cleared_active <> [] then begin
+    let vtip =
+      match Storage.ChainDB.get_hash_at_height state.db state.blocks_synced with
+      | Some h -> Hashtbl.find_opt state.headers (Cstruct.to_string h)
+      | None -> None
+    in
+    (match vtip, state.tip with
+     | Some v, Some t
+       when Consensus.work_compare v.total_work t.total_work > 0 ->
+       Logs.warn (fun m ->
+         m "Boot repair: best header %d (%s) is below the validated tip %d \
+            (%s); raising the best header to the validated tip"
+           t.height (Types.hash256_to_hex_display t.hash)
+           v.height (Types.hash256_to_hex_display v.hash));
+       state.tip <- Some v;
+       state.headers_synced <- v.height;
+       Storage.ChainDB.set_header_tip state.db v.hash v.height
+     | Some v, None ->
+       state.tip <- Some v;
+       state.headers_synced <- v.height;
+       Storage.ChainDB.set_header_tip state.db v.hash v.height
+     | _ -> ());
+    Logs.warn (fun m ->
+      m "Boot repair: cleared %d BLOCK_FAILED mark(s) on/under the active \
+         chain; best header now %s"
+        !cleared
+        (match state.tip with
+         | Some t -> string_of_int t.height | None -> "none"))
+  end
+
 let restore_chain_state (db : Storage.ChainDB.t)
     (network : Consensus.network_config) : chain_state =
   (* Defense-in-depth: same BIP9/buried-deployment parity check as
@@ -1642,6 +1802,7 @@ let restore_chain_state (db : Storage.ChainDB.t)
     List.iter (fun hash ->
       Hashtbl.replace state.invalidated_blocks (Cstruct.to_string hash) ()
     ) (Storage.ChainDB.get_all_invalidated_blocks db);
+    repair_failed_marks_on_active_chain state;
     state
   | None ->
     (* No stored state, create fresh with genesis *)
@@ -2355,6 +2516,31 @@ let validated_tip_hash (state : chain_state) : Types.hash256 option =
       match get_header_at_height state state.blocks_synced with
       | Some e -> Some e.hash
       | None -> None))
+
+(* Does a block at [height] with parent [prev] extend the validated tip
+   RIGHT NOW?  Re-evaluated after every validation await: the block-connect
+   paths (post-IBD [process_new_block] and the catch-up IBD
+   [process_downloaded_blocks]) each validate on their own worker Domain and
+   yield to Lwt while they wait, so the validated tip can move under a
+   validation that is already in flight.  Core never has this window: it
+   holds cs_main across ConnectBlock, and ConnectBlock asserts
+   hashPrevBlock == view.GetBestBlock() (validation.cpp ConnectBlock). *)
+let block_extends_validated_tip (state : chain_state) ~(height : int)
+    ~(prev : Types.hash256) : bool =
+  height = state.blocks_synced + 1
+  && (match validated_tip_hash state with
+      | Some p -> Cstruct.equal p prev
+      | None -> false)
+
+(* Is [hash] the active-chain block at [height] (connected, <= the validated
+   tip)?  Reads the height->hash index, which projects the ACTIVE chain only
+   (see [block_tip]). *)
+let block_on_active_chain (state : chain_state) ~(hash : Types.hash256)
+    ~(height : int) : bool =
+  height <= state.blocks_synced
+  && (match Storage.ChainDB.get_hash_at_height state.db height with
+      | Some h -> Cstruct.equal h hash
+      | None -> false)
 
 (* W93 Bug 1 fix: provide the hash of the block at the network's
    BIP34Height so Bitcoin Core's BIP-30 skip optimization (Gate 4) can
@@ -4644,6 +4830,33 @@ let process_downloaded_blocks ?(max_blocks = 1)
           continue := false;
           Lwt.return_unit
         | None ->
+        (* The validated tip may have moved while the worker ran (another
+           connect path — the post-IBD BlockMsg listener — connected a block
+           during the await).  The result was computed against a coin view
+           that is no longer the parent's: it is neither a connect nor a
+           verdict.  Core holds cs_main across ConnectBlock, so it never
+           sees this. *)
+        if not (block_extends_validated_tip ibd.chain ~height
+                  ~prev:block.header.prev_block) then begin
+          if block_on_active_chain ibd.chain ~hash:entry.hash ~height then begin
+            Logs.info (fun m ->
+              m "Block at height %d (%s) was connected by another path while \
+                 this validation was in flight; result discarded"
+                height (Types.hash256_to_hex_display entry.hash));
+            entry.download_state <- Validated;
+            ibd.next_process_height <- ibd.next_process_height + 1;
+            step ()
+          end else begin
+            Logs.warn (fun m ->
+              m "Block at height %d (%s): validated tip moved to %d during \
+                 validation; result discarded (not a verdict, not marked, \
+                 peer not scored)"
+                height (Types.hash256_to_hex_display entry.hash)
+                ibd.chain.blocks_synced);
+            continue := false;
+            Lwt.return_unit
+          end
+        end else
         (match vresult with
          | Ok (_fees, txid_arr, spent_utxo_list) ->
            let ibd_mode = skip_scripts in
@@ -8475,6 +8688,35 @@ let process_new_block ?(f_requested = false)
               (Types.hash256_to_hex_display hash) height msg);
           Lwt.return (Error msg)
         | None ->
+        (* Re-check after the validation await (the LIVE 969874 wedge,
+           2026-10-04): the post-IBD gap-fill copy of a block started
+           validating here while the catch-up IBD connected the SAME block
+           on its own worker.  This validation then read a coin view that
+           already had the block applied — "transaction 3305 ... missing
+           inputs" — and the Error arm below marked the CONNECTED tip
+           BLOCK_FAILED (persisted), so every child header was "bad-prevblk"
+           and the node stopped following the chain, across restarts.  A
+           result computed against a coin view that is not this block's
+           parent is not a verdict: Core holds cs_main across ConnectBlock
+           and asserts hashPrevBlock == view.GetBestBlock(). *)
+        if not (block_extends_validated_tip state ~height
+                  ~prev:block.header.prev_block) then begin
+          if block_on_active_chain state ~hash ~height then begin
+            Logs.info (fun m ->
+              m "Block %s at height %d was connected by another path while \
+                 this validation was in flight; result discarded"
+                (Types.hash256_to_hex_display hash) height);
+            Lwt.return (Ok ())
+          end else begin
+            Logs.warn (fun m ->
+              m "Block %s at height %d: validated tip moved to %d during \
+                 validation; result discarded (not a verdict, not marked, \
+                 peer not scored)"
+                (Types.hash256_to_hex_display hash) height
+                state.blocks_synced);
+            Lwt.return (Error "tip-moved-during-validation")
+          end
+        end else
         match vresult with
         | Ok (_fees, txid_arr, spent_utxos) ->
           (* Store the block *)

@@ -3637,17 +3637,18 @@ let test_w97_g6_bad_prevblk_not_detected () =
                 ~bits:parent_header.bits () in
   let result = Sync.validate_header state child in
   Storage.ChainDB.close db; w97_cleanup_db ();
-  (* SPEC: Core rejects with bad-prevblk.
-     Camlcoin: silently ACCEPTS (no gate). Documented as BUG-6. *)
+  (* SPEC: Core rejects with bad-prevblk.  FIXED 2026-10-03 (invalid block
+     over P2P): validate_header consults state.invalidated_blocks for the
+     parent.  This test used to PIN the bug (it passed only while the child
+     was accepted, and its "fixed" arm compared a 12-char prefix against the
+     11-char "bad-prevblk", so it could never fire). *)
   match result with
-  | Error e when (String.length e >= 12 && String.sub e 0 12 = "bad-prevblk") ->
-    ()  (* fixed: gate present *)
-  | _ ->
-    (* Confirm the current divergence: child of invalid parent passes. *)
-    Alcotest.(check bool)
-      "G6: BUG — child of BLOCK_FAILED_VALID parent passes validate_header \
+  | Error "bad-prevblk" -> ()
+  | Error e -> Alcotest.failf "G6: wrong rejection class: %s" e
+  | Ok _ ->
+    Alcotest.fail
+      "G6: child of BLOCK_FAILED_VALID parent passes validate_header \
        (Core: rejects with bad-prevblk)"
-      true (result <> Error "bad-prevblk")
 
 (* G7 — ContextualCheckBlockHeader with pindexPrev: difficulty bits gate.
    Core: ContextualCheckBlockHeader checks expected nBits against
@@ -4817,7 +4818,7 @@ let () =
         test_w97_g4_check_block_header_pow_gate;
       test_case "G5: prev-blk-not-found mapping" `Quick
         test_w97_g5_prev_block_not_found;
-      test_case "G6: BUG — bad-prevblk gate missing" `Quick
+      test_case "G6: bad-prevblk gate (fixed 2026-10-03)" `Quick
         test_w97_g6_bad_prevblk_not_detected;
       test_case "G7: BUG — difficulty bits not checked at header time" `Quick
         test_w97_g7_header_difficulty_not_checked;

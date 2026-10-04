@@ -1813,6 +1813,11 @@ let validate_header (state : chain_state) (header : Types.block_header)
     let parent_key = Cstruct.to_string header.prev_block in
     match Hashtbl.find_opt state.headers parent_key with
     | None -> Error "Unknown parent header"
+    | Some _ when Hashtbl.mem state.invalidated_blocks parent_key ->
+      (* Core AcceptBlockHeader: a child of a BLOCK_FAILED block is
+         BLOCK_INVALID_PREV "bad-prevblk" and never enters the index, so
+         it can never become the best header / a download target. *)
+      Error "bad-prevblk"
     | Some parent ->
       (* Check proof of work — use check_proof_of_work (not hash_meets_target) so
          that nBits with negative/overflow/zero/above-pow_limit is also rejected,
@@ -6054,6 +6059,113 @@ let disconnect_block_into_batch
            Ok (txs_for_mempool, result))
       end
 
+(* ---- Invalid block over P2P (2026-10-03) ----
+   Core's split between a VERDICT on a block and a NON-verdict.
+
+   BLOCK_MUTATED (CheckBlock: bad-txnmrklroot, bad-txns-duplicate,
+   bad-witness-merkle-match, bad-witness-nonce-size, unexpected-witness)
+   says only that THESE BYTES are not the block the header commits to;
+   the header may still name a perfectly valid block.  Core's
+   InvalidBlockFound (validation.cpp ~1988) therefore never sets
+   BLOCK_FAILED_VALID for it.  Everything else [accept_block] reports is
+   a consensus verdict on the block itself. *)
+let is_block_mutation_error (e : Validation.block_validation_error) : bool =
+  match e with
+  | Validation.BlockBadMerkleRoot
+  | Validation.BlockMutatedMerkle
+  | Validation.BlockDuplicateTx
+  | Validation.BlockBadWitnessCommitment
+  | Validation.BlockBadWitnessNonceSize
+  | Validation.BlockUnexpectedWitness -> true
+  | _ -> false
+
+(* Which peer delivered a block body we stored without validating (a
+   side-branch block), so the peer can be punished when a later
+   ActivateBestChain finds it invalid.  Core's mapBlockSource
+   (net_processing.cpp, read by BlockChecked ~2208).  Entries are removed
+   when the block is judged; the table is reset if it ever grows past
+   [block_source_cap] (side-branch blocks that are never judged), so it is
+   bounded. *)
+let block_source : (string, int) Hashtbl.t = Hashtbl.create 64
+let block_source_cap = 1024
+
+let note_block_source (hash : Types.hash256) (peer_id : int option) : unit =
+  match peer_id with
+  | None -> ()
+  | Some pid ->
+    if Hashtbl.length block_source >= block_source_cap then
+      Hashtbl.reset block_source;
+    Hashtbl.replace block_source (Cstruct.to_string hash) pid
+
+let take_block_source (hash : Types.hash256) : int option =
+  let k = Cstruct.to_string hash in
+  let r = Hashtbl.find_opt block_source k in
+  Hashtbl.remove block_source k;
+  r
+
+(* Mark [failed] BLOCK_FAILED_VALID and every known descendant
+   BLOCK_FAILED_CHILD (persisted), then, if the best header is now
+   failed, move it back to the most-work header that is not
+   (RecalculateBestHeader).  Core: Chainstate::InvalidBlockFound ->
+   InvalidChainFound -> SetBlockFailureFlags (validation.cpp ~1988).
+
+   Without the best-header step [state.tip] keeps pointing at the failed
+   block, so [next_blocks_to_download] keeps asking peers for it (live
+   instrument 2026-10-03: B1 requested 5 times) and the valid sibling is
+   never the download target.
+
+   Callers must pass only consensus verdicts: never a mutation
+   ([is_block_mutation_error]), a missing body, an ancestry-incomplete
+   resolve error, or a local DB error.  Returns the number of descendants
+   marked. *)
+let mark_block_failed (state : chain_state) (failed : header_entry) : int =
+  let mark (h : Types.hash256) =
+    Hashtbl.replace state.invalidated_blocks (Cstruct.to_string h) ();
+    Storage.ChainDB.set_block_invalidated state.db h
+  in
+  mark failed.hash;
+  let children = ref [] in
+  Hashtbl.iter (fun key (e : header_entry) ->
+    if e.height > failed.height
+       && not (Hashtbl.mem state.invalidated_blocks key) then
+      match get_ancestor state e failed.height with
+      | Some a when Cstruct.equal a.hash failed.hash ->
+        children := e.hash :: !children
+      | _ -> ()
+  ) state.headers;
+  List.iter mark !children;
+  (match state.tip with
+   | Some t when Hashtbl.mem state.invalidated_blocks
+                   (Cstruct.to_string t.hash) ->
+     (* Ties go to the validated tip (Core: the first-received block
+        sorts first among equal-work candidates). *)
+     let best = ref (match block_tip state with
+       | Some v when not (Hashtbl.mem state.invalidated_blocks
+                            (Cstruct.to_string v.hash)) -> Some v
+       | _ -> None) in
+     Hashtbl.iter (fun key (e : header_entry) ->
+       if not (Hashtbl.mem state.invalidated_blocks key) then
+         match !best with
+         | Some b when Consensus.work_compare e.total_work b.total_work <= 0 -> ()
+         | _ -> best := Some e
+     ) state.headers;
+     (match !best with
+      | Some b ->
+        state.tip <- Some b;
+        state.headers_synced <- b.height;
+        Storage.ChainDB.set_header_tip state.db b.hash b.height
+      | None -> ())
+   | _ -> ());
+  Logs.warn (fun m ->
+    m "InvalidBlockFound: %s at height %d marked failed (+%d descendant(s)); \
+       best header now %s"
+      (Types.hash256_to_hex_display failed.hash) failed.height
+      (List.length !children)
+      (match state.tip with
+       | Some t -> Printf.sprintf "height %d" t.height
+       | None -> "none"));
+  List.length !children
+
 (* Connect-side accumulator: the symmetric counterpart of
    [disconnect_block_into_batch]. Validates the new chain's block,
    then stages its block body, undo data, tx_index, and UTXO delta
@@ -6064,6 +6176,7 @@ let disconnect_block_into_batch
    without an intermediate disk flush. *)
 let connect_block_into_batch
     ?(skip_pow = false)
+    ?(on_invalid : (Validation.block_validation_error -> unit) option)
     (ibd : ibd_state) (batch : Storage.ChainDB.batch)
     (view : reorg_view)
     (entry : header_entry)
@@ -6146,6 +6259,7 @@ let connect_block_into_batch
     | None ->
     (match vres with
      | Validation.AB_err e ->
+       (match on_invalid with Some f -> f e | None -> ());
        (match ibd.misbehavior_handler with
         | Some _handler ->
           Logs.warn (fun m ->
@@ -6675,7 +6789,9 @@ let verify_chain (state : chain_state) ~(checklevel : int) ~(nblocks : int)
 (* Perform chain reorganization to new tip.  D-FULL atomicity: all
    disk writes from BOTH halves of the reorg land in ONE [batch_write].
    See the comment block above [max_reorg_depth] for the rationale. *)
-let reorganize ?(allow_equal_work = false) (ibd : ibd_state)
+let reorganize ?(allow_equal_work = false)
+    ?(on_block_failed : (header_entry -> unit) option)
+    (ibd : ibd_state)
     (new_tip : header_entry)
     : (unit, string) result =
   let state = ibd.chain in
@@ -6813,9 +6929,27 @@ let reorganize ?(allow_equal_work = false) (ibd : ibd_state)
           (* Connect side: iterate fork-forward-to-new-tip. *)
           let connect_error = ref None in
           let connected_blocks = ref [] in
+          (* The entry whose connect returned a consensus VERDICT (not a
+             mutation, not a missing body / ancestry-incomplete / DB miss,
+             which come back as Error without [on_invalid] firing). *)
+          let failed_verdict = ref None in
           List.iter (fun (entry : header_entry) ->
             if !connect_error = None then
-              match connect_block_into_batch ibd batch view entry with
+              match connect_block_into_batch
+                      ~on_invalid:(fun e ->
+                        (* TxMissingInputs is not marked here: the reorg
+                           resolves inputs through the disconnect overlay,
+                           and a local miss must never persist a FAILED
+                           mark on a valid block (same exemption as the IBD
+                           connect path). *)
+                        let local_miss = match e with
+                          | Validation.BlockTxValidationFailed
+                              (_, Validation.TxMissingInputs) -> true
+                          | _ -> false
+                        in
+                        if not (is_block_mutation_error e || local_miss) then
+                          failed_verdict := Some entry)
+                      ibd batch view entry with
               | Error e -> connect_error := Some e
               | Ok block ->
                 connected_blocks := (entry, block) :: !connected_blocks
@@ -6825,6 +6959,14 @@ let reorganize ?(allow_equal_work = false) (ibd : ibd_state)
             Logs.err (fun m -> m "Reorg aborted during connect: %s" e);
             ibd.pending_utxo_updates <- [];
             ibd.pending_utxo_deletes <- [];
+            (* Core ActivateBestChainStep: a ConnectTip failure calls
+               InvalidBlockFound on that block, so the failed branch is
+               never selected (or downloaded) again. *)
+            (match !failed_verdict with
+             | Some fe ->
+               ignore (mark_block_failed state fe);
+               (match on_block_failed with Some f -> f fe | None -> ())
+             | None -> ());
             (* No batch_write happened; the on-disk image is unchanged
                from the pre-reorg state. *)
             Error e
@@ -7863,7 +8005,9 @@ let store_block_undo_data
    Robust to out-of-order block arrival: it activates whenever the full heavier
    branch has landed, regardless of which block completed it.  Returns [true]
    iff a reorg was committed. *)
-let maybe_activate_best_chain (state : chain_state) : bool =
+let rec maybe_activate_best_chain
+    ?(on_block_failed : (header_entry -> unit) option)
+    (state : chain_state) : bool =
   match block_tip state, state.tip with
   | Some validated, Some best_hdr ->
     (* Cheap gate: only a best-header chain that strictly out-works the
@@ -7904,7 +8048,13 @@ let maybe_activate_best_chain (state : chain_state) : bool =
       | None -> false  (* heavier branch not fully downloaded yet — wait *)
       | Some cand when Cstruct.equal cand.hash validated.hash -> false
       | Some cand ->
-        (match reorganize (create_ibd_state state) cand with
+        let marked = ref false in
+        let note_failed (fe : header_entry) =
+          marked := true;
+          match on_block_failed with Some f -> f fe | None -> ()
+        in
+        (match reorganize ~on_block_failed:note_failed
+                 (create_ibd_state state) cand with
          | Ok () ->
            Logs.info (fun m ->
              m "P2P ActivateBestChain: reorged active chain to height %d \
@@ -7914,7 +8064,11 @@ let maybe_activate_best_chain (state : chain_state) : bool =
            Logs.warn (fun m ->
              m "P2P ActivateBestChain: reorg to height %d failed: %s"
                cand.height e);
-           false)
+           (* A block on that branch was marked failed: like Core's
+              ActivateBestChain loop, try the next most-work VALID
+              candidate.  Terminates: each pass marks >= 1 more block. *)
+           if !marked then maybe_activate_best_chain ?on_block_failed state
+           else false)
     end
   | _ -> false
 
@@ -7930,7 +8084,9 @@ let maybe_activate_best_chain (state : chain_state) : bool =
    forward from the current tip, processing each stored block that extends
    the tip.  Called at the end of process_new_block so that out-of-order
    arrivals converge to a consistent tip. *)
-let rec connect_stored_blocks (state : chain_state) : int =
+let rec connect_stored_blocks
+    ?(on_block_failed : (header_entry -> unit) option)
+    (state : chain_state) : int =
   let next_height = state.blocks_synced + 1 in
   (* Best-HEADER chain, not the active height index. The index has no rows
      above blocks_synced (fecf534), so get_header_at_height returns None
@@ -8113,7 +8269,7 @@ let rec connect_stored_blocks (state : chain_state) : int =
              anti-thrash floor. *)
           Gc_guard.maybe_keep_up ~reason:"hot-path:drain";
           Gc_guard.maybe_backstop ~reason:"hot-path:drain";
-          1 + connect_stored_blocks state
+          1 + connect_stored_blocks ?on_block_failed state
         | Validation.AB_err e ->
           let msg = Validation.block_error_to_string e in
           Logs.warn (fun m ->
@@ -8124,9 +8280,15 @@ let rec connect_stored_blocks (state : chain_state) : int =
              sets pindex->nStatus |= BLOCK_FAILED_VALID
              (validation.cpp:1988).  Without this mark the same block is
              retried on every gap-fill round and every restart. *)
-          let block_hash_key = Cstruct.to_string entry.hash in
-          Hashtbl.replace state.invalidated_blocks block_hash_key ();
-          Storage.ChainDB.set_block_invalidated state.db entry.hash;
+          if is_block_mutation_error e then
+            (* BLOCK_MUTATED: these bytes are not the committed block.  Do
+               not mark the header failed; drop the bad body so a correct
+               copy can be fetched (Core never stores a mutated block). *)
+            Storage.ChainDB.delete_block state.db entry.hash
+          else begin
+            ignore (mark_block_failed state entry);
+            (match on_block_failed with Some f -> f entry | None -> ())
+          end;
           0
 
 let process_new_block ?(f_requested = false)
@@ -8137,10 +8299,31 @@ let process_new_block ?(f_requested = false)
     (block : Types.block) : (unit, string) result Lwt.t =
   let hash = Crypto.compute_block_hash block.header in
   let hash_key = Cstruct.to_string hash in
+  (* A block found invalid on any connect path below is reported here so
+     the peer that DELIVERED it is punished: this block's sender, or the
+     recorded source of an earlier stored side-branch block (Core
+     BlockChecked -> MaybePunishNodeForBlock, BLOCK_CONSENSUS). *)
+  let on_block_failed (fe : header_entry) =
+    let src =
+      if Cstruct.equal fe.hash hash then begin
+        ignore (take_block_source fe.hash); peer_id
+      end else take_block_source fe.hash
+    in
+    match src, misbehavior_handler with
+    | Some pid, Some handler -> handler pid "invalid_block"
+    | _ -> ()
+  in
+  (* BLOCK_CACHED_INVALID: already judged invalid (or a descendant of an
+     invalid block).  Core AcceptBlock returns "duplicate" without
+     re-validating; an inbound peer that merely relays it is not punished.
+     Before this check the same invalid block was fully re-validated on
+     every delivery. *)
+  if Hashtbl.mem state.invalidated_blocks hash_key then
+    Lwt.return (Error "duplicate-invalid")
   (* Ignore blocks we already have — but still try to advance from stored
      out-of-order blocks in case a recent fill brought us what we needed. *)
-  if Storage.ChainDB.has_block state.db hash then begin
-    let _ = connect_stored_blocks state in
+  else if Storage.ChainDB.has_block state.db hash then begin
+    let _ = connect_stored_blocks ~on_block_failed state in
     Lwt.return (Ok ())
   end else begin
     (* The block's header must already be known (via headers-first sync). If
@@ -8188,10 +8371,11 @@ let process_new_block ?(f_requested = false)
             (Types.hash256_to_hex_display hash) height);
         (* Store block data for later use but don't connect *)
         Storage.ChainDB.store_block state.db hash block;
+        note_block_source hash peer_id;
         (* The incoming block may be the first of a gap-fill batch; even if
            it doesn't extend the tip itself, its arrival means peers are
            responding and earlier stored blocks may now be drainable. *)
-        let connected = connect_stored_blocks state in
+        let connected = connect_stored_blocks ~on_block_failed state in
         if connected > 0 then
           Logs.info (fun m ->
             m "Connected %d stored blocks after gap-fill store, tip now at %d"
@@ -8200,8 +8384,8 @@ let process_new_block ?(f_requested = false)
            validated tip; if it now completes a heavier branch forking below
            that tip, [reorganize] to it (see [maybe_activate_best_chain]).
            Then drain any further stored blocks that now extend the new tip. *)
-        if maybe_activate_best_chain state then
-          ignore (connect_stored_blocks state);
+        if maybe_activate_best_chain ~on_block_failed state then
+          ignore (connect_stored_blocks ~on_block_failed state);
         Lwt.return (Ok ())
       end else begin
         let t0 = Unix.gettimeofday () in
@@ -8400,7 +8584,7 @@ let process_new_block ?(f_requested = false)
           (* W34 fix: try to connect any subsequent stored blocks that were
              received out-of-order by the gap-fill but couldn't be processed
              because their parent wasn't yet connected. *)
-          let connected = connect_stored_blocks state in
+          let connected = connect_stored_blocks ~on_block_failed state in
           if connected > 0 then
             Logs.info (fun m ->
               m "Connected %d additional stored blocks, tip now at %d"
@@ -8429,27 +8613,29 @@ let process_new_block ?(f_requested = false)
              (validation.cpp:1988).  Without this mark the same invalid
              block is re-submitted via submitblock or gap-fill and will
              re-run full validation every time. *)
-          let is_mutated = match e with
+          (* BLOCK_MUTATED (incl. bad merkle root / duplicate-tx mutation,
+             which this used to mark failed) is not a verdict on the block
+             the header names: never marked. *)
+          let is_mutated = is_block_mutation_error e in
+          if not is_mutated then
+            (* +descendants and best-header recalculation, so gap-fill
+               fetches the valid sibling instead of this block again. *)
+            ignore (mark_block_failed state entry);
+          (* G16/G17 fix: Misbehaving on BLOCK_INVALID_HEADER and BLOCK_FAILED_VALID
+             (matching Bitcoin Core's InvalidBlockFound / MaybePunishNodeForBlock).
+             Witness mutations (witness commitment, nonce-size, unexpected-witness)
+             are NOT scored — the peer may have received a legitimately stripped block
+             and is not at fault.  All other validation failures (including a bad
+             merkle root, which Core also punishes on a full-block delivery) are
+             penalised at score 100 — unchanged scoring; only the mark changed.
+             Reference: bitcoin-core/src/net_processing.cpp MaybePunishNodeForBlock. *)
+          let is_witness_mutation = match e with
             | Validation.BlockBadWitnessCommitment
             | Validation.BlockBadWitnessNonceSize
             | Validation.BlockUnexpectedWitness -> true
             | _ -> false
           in
-          if not is_mutated then begin
-            Hashtbl.replace state.invalidated_blocks hash_key ();
-            Storage.ChainDB.set_block_invalidated state.db hash
-          end;
-          (* G16/G17 fix: Misbehaving on BLOCK_INVALID_HEADER and BLOCK_FAILED_VALID
-             (matching Bitcoin Core's InvalidBlockFound / MaybePunishNodeForBlock).
-             BLOCK_MUTATED errors (witness commitment, nonce-size, unexpected-witness)
-             are NOT scored — the peer may have received a legitimately stripped block
-             and is not at fault.  All other validation failures indicate the peer
-             sent a provably invalid block and should be penalised at score 100.
-             Reference: bitcoin-core/src/net_processing.cpp MaybePunishNodeForBlock. *)
-          if not is_mutated then
-            (match peer_id, misbehavior_handler with
-             | Some pid, Some handler -> handler pid "invalid_block"
-             | _ -> ());
+          if not is_witness_mutation then on_block_failed entry;
           Lwt.return (Error msg)
       end
   end

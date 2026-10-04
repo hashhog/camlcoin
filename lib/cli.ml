@@ -1819,7 +1819,10 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     | P2p.InvMsg items ->
       let block_hashes = List.filter_map (fun (iv : P2p.inv_vector) ->
         if (iv.inv_type = P2p.InvBlock || iv.inv_type = P2p.InvWitnessBlock)
-           && not (Storage.ChainDB.has_block db iv.hash) then
+           && not (Storage.ChainDB.has_block db iv.hash)
+           (* Core never fetches a BLOCK_FAILED block (or descendant) again,
+              whoever announces it (BLOCK_CACHED_INVALID). *)
+           && not (Sync.is_block_invalid chain iv.hash) then
           (* Always request with witness data so we can validate the witness
              commitment.  Using InvBlock strips all witness data from the
              response, breaking check_witness_commitment on segwit blocks. *)
@@ -2279,9 +2282,24 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       bip157_disconnect peer reason
     | _ -> Lwt.return_unit);
 
+  (* Score a peer and disconnect/ban it at the threshold.  A local, manual
+     or NoBan peer is disconnected but not banned (Core
+     MaybeDiscourageAndDisconnect). *)
+  let misbehavior_handler peer_id infraction =
+    match Peer_manager.find_peer_by_id peer_manager peer_id with
+    | Some peer ->
+      (match Peer.record_misbehavior_for peer infraction with
+       | `Ok -> ()
+       | `Ban ->
+         Lwt.async (fun () -> Peer_manager.ban_peer peer_manager peer_id ())
+       | `DisconnectOnly ->
+         Lwt.async (fun () -> Peer_manager.remove_peer peer_manager peer_id))
+    | None -> ()
+  in
+
   (* Register a listener for blocks received post-IBD (when ibd_state is None).
      This handles unsolicited blocks and blocks requested via inv/getdata. *)
-  Peer_manager.add_listener peer_manager (fun msg _peer ->
+  Peer_manager.add_listener peer_manager (fun msg peer ->
     match msg with
     | P2p.BlockMsg block when !ibd_state_ref = None
                               && chain.sync_state = Sync.FullySynced ->
@@ -2296,7 +2314,11 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
          (G19c). Check inflight BEFORE note_received clears it. *)
       Lwt_mutex.with_lock block_listener_mutex (fun () ->
         let%lwt pnb_result =
+          (* peer + handler: a consensus-invalid block punishes the peer
+             that delivered it (Core BlockChecked -> MaybePunishNodeForBlock
+             BLOCK_CONSENSUS).  Without them this path never scored anyone. *)
           Sync.process_new_block ~f_requested
+            ~peer_id:peer.Peer.id ~misbehavior_handler
             ?worker:!post_ibd_worker_ref chain block in
         (match pnb_result with
          | Ok () ->
@@ -2607,18 +2629,6 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     List.filter
       (fun p -> p.Peer.msg_loop_started && Peer.can_download_blocks_from p)
       (get_peers ())
-  in
-
-  let misbehavior_handler peer_id infraction =
-    match Peer_manager.find_peer_by_id peer_manager peer_id with
-    | Some peer ->
-      (match Peer.record_misbehavior_for peer infraction with
-       | `Ok -> ()
-       | `Ban ->
-         Lwt.async (fun () -> Peer_manager.ban_peer peer_manager peer_id ())
-       | `DisconnectOnly ->
-         Lwt.async (fun () -> Peer_manager.remove_peer peer_manager peer_id))
-    | None -> ()
   in
 
   (* Start catch-up IBD as soon as the header tip is ahead of the

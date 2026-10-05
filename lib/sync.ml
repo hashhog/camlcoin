@@ -3492,6 +3492,36 @@ let max_block_timeout = 300.0           (* 5 min max timeout per block *)
 let max_stall_timeout = 1200.0          (* 20 min max stall — matches Bitcoin Core *)
 let max_consecutive_timeouts = 5        (* More forgiving before disconnect *)
 let utxo_flush_interval = 500          (* Flush UTXOs every N blocks — tuned for IBD throughput *)
+
+(* ARCH-2 (roadmap 2026-10-04 §3.5-1): the IBD connect loop
+   ([process_downloaded_blocks]) applies every block's coin delta to the
+   one shared OptimizedUtxoSet only — add, then [remove_fast] — on BOTH
+   the assume-valid and the scripts-on path.  Core does the same:
+   ConnectBlock -> UpdateCoins (validation.cpp) spends and adds on the one
+   CCoinsViewCache; SpendCoin (coins.cpp) erases a FRESH entry outright, so
+   a coin created and spent inside one flush window never reaches the DB.
+
+   Before this, the scripts-on path ALSO queued every output and input on
+   [pending_utxo_updates] / [pending_utxo_deletes] (a second CF batch at
+   flush) and spent with [remove], which records [`Removed] even for a
+   FRESH coin and reads the store on a cache miss: ~4 RocksDB ops for a
+   coin Core never writes.  The pending lists carried nothing the dirty
+   set did not already carry ([OptimizedUtxoSet.flush] writes the same
+   delta to the RDB and mirrors it into the CF).
+
+   F0 (a6748ea): both calls the fast path makes, [OptimizedUtxoSet.add]
+   and [remove_fast], take the set's [lock] and bump its [epoch], so a
+   store read the worker started before this block's spend is never
+   installed afterwards ([note_db_result ~epoch]); the fast path performs
+   no store read of its own (the old [remove] did, outside the lock).
+
+   [CAMLCOIN_SLOW_UTXO_PATH=1] restores the old scripts-on behaviour; it
+   exists for the A/B negative-control arm only (a ref so the unit test
+   can run both arms in one process). *)
+let force_slow_utxo_path =
+  ref (match Sys.getenv_opt "CAMLCOIN_SLOW_UTXO_PATH" with
+       | Some ("1" | "true" | "yes") -> true
+       | _ -> false)
 let block_download_window = 1024       (* Max blocks ahead to queue, matching Bitcoin Core BLOCK_DOWNLOAD_WINDOW *)
 (* How far past the connect cursor the IBD queue may run.  Core's 1024-block
    BLOCK_DOWNLOAD_WINDOW bounds which heights may be requested, but Core
@@ -5034,6 +5064,10 @@ let process_downloaded_blocks ?(max_blocks = 1)
         (match vresult with
          | Ok (_fees, txid_arr, spent_utxo_list) ->
            let ibd_mode = skip_scripts in
+           (* Coin delta through the shared cache only (see
+              [force_slow_utxo_path]).  Independent of [ibd_mode], which
+              still decides whether the body and undo are stored. *)
+           let utxo_fast = ibd_mode || not !force_slow_utxo_path in
            (* BIP-157 filter index append. Done in BOTH the assume-valid
               fast-path AND the full-validation slow-path because the
               REST blockfilter handler must serve filters for every
@@ -5113,7 +5147,7 @@ let process_downloaded_blocks ?(max_blocks = 1)
              let is_cb = (tx_idx = 0) in
              (* Add outputs as new UTXOs (skip genesis coinbase) *)
              if not (Consensus.is_genesis_coinbase height txid) then begin
-               if ibd_mode then begin
+               if utxo_fast then begin
                  (* IBD: only OptimizedUtxoSet. Skip provably-unspendable
                     outputs (OP_RETURN, oversized scripts) to match Core's
                     [CCoinsViewCache::AddCoin] early-return on
@@ -5158,9 +5192,12 @@ let process_downloaded_blocks ?(max_blocks = 1)
              end;
              (* Delete spent inputs (non-coinbase only) *)
              if not is_cb then begin
-               if ibd_mode then begin
+               if utxo_fast then begin
                  (* IBD: only OptimizedUtxoSet — use remove_fast since we
-                    don't need the old entry value *)
+                    don't need the old entry value (the undo record is
+                    built from validation's [spent_utxo_list] above).  A
+                    FRESH coin is dropped from the dirty set: never
+                    written, never deleted (Core SpendCoin). *)
                  (match ibd.utxo_set with
                   | Some utxo ->
                     List.iter (fun inp ->

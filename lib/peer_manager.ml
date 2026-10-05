@@ -2455,13 +2455,22 @@ let add_peer_address (pm : t) ~(address : string) ~(port : int)
   end
 
 (* Send a message to all ready peers *)
+(* Fan a send out to [peers] WITHOUT making the caller wait on any of them
+   (Core never blocks one peer's processing on another's socket).  Each send
+   is independent; a failed/stalled one disconnects that peer (see Peer.send_encoded). *)
+let send_detached (peers : Peer.peer list) (msg_for : Peer.peer -> P2p.message_payload option) : unit =
+  List.iter (fun peer ->
+    match msg_for peer with
+    | None -> ()
+    | Some msg ->
+      Lwt.async (fun () ->
+        Lwt.catch (fun () -> Peer.send_message peer msg)
+          (fun _exn -> Lwt.return_unit))
+  ) peers
+
 let broadcast (pm : t) (payload : P2p.message_payload) : unit Lwt.t =
-  let ready = get_ready_peers pm in
-  Lwt_list.iter_p (fun peer ->
-    Lwt.catch
-      (fun () -> Peer.send_message peer payload)
-      (fun _exn -> Lwt.return_unit)
-  ) ready
+  send_detached (get_ready_peers pm) (fun _ -> Some payload);
+  Lwt.return_unit
 
 (* Send a message to a specific peer. Best-effort: failures are LOGGED but
    not reported (the unit return means callers structurally cannot check —
@@ -2483,24 +2492,21 @@ let send_to_peer (pm : t) (peer_id : int) (payload : P2p.message_payload) : unit
    Peers that opted in via sendheaders receive the header directly;
    others receive an inv containing the block hash. *)
 let announce_block (pm : t) (header : Types.block_header) (hash : Types.hash256) : unit Lwt.t =
-  let ready = get_ready_peers pm in
-  Lwt_list.iter_p (fun peer ->
-    Lwt.catch (fun () ->
-      if peer.Peer.send_headers then
-        Peer.send_message peer (P2p.HeadersMsg [header])
-      else
-        Peer.send_message peer (P2p.InvMsg [{ P2p.inv_type = P2p.InvBlock; hash }])
-    ) (fun _exn -> Lwt.return_unit)
-  ) ready
+  send_detached (get_ready_peers pm) (fun peer ->
+    if peer.Peer.send_headers then Some (P2p.HeadersMsg [header])
+    else Some (P2p.InvMsg [{ P2p.inv_type = P2p.InvBlock; hash }]));
+  Lwt.return_unit
 
 (* Announce a new transaction to all connected peers via inv.
    Uses inventory trickling: transactions are queued per-peer and sent
    on a Poisson-distributed schedule (5s average for inbound, 2s for outbound).
    This improves privacy and reduces bandwidth. *)
 let announce_tx (pm : t) ~(txid : Types.hash256) ~(wtxid : Types.hash256)
-    ~(fee_rate : int64) ?(tx : Types.transaction option = None) () : unit Lwt.t =
+    ~(fee_rate : int64) ?(tx : Types.transaction option = None)
+    ?(except_id : int option) () : unit Lwt.t =
   let ready = get_ready_peers pm in
   List.iter (fun peer ->
+    if Some peer.Peer.id <> except_id then
     (* BIP-37: if this peer has a bloom filter loaded, only announce the tx
        if it matches the filter (IsRelevantAndUpdate).  Mirrors Core's
        net_processing.cpp PeerHasFilter + IsRelevantAndUpdate gate.
@@ -3426,12 +3432,15 @@ let maintain_connections (pm : t) : unit Lwt.t =
           end
         in
         (* Ping idle peers *)
-        let* () = Lwt_list.iter_p (fun peer ->
+        (* Detached: a peer that stopped reading must not hold the
+           maintenance loop (reconnects, dead-peer reaping) for its send
+           timeout.  A failed ping send disconnects that peer. *)
+        List.iter (fun peer ->
           if Peer.needs_ping peer then
-            Peer.send_ping peer
-          else
-            Lwt.return_unit
-        ) pm.peers in
+            Lwt.async (fun () ->
+              Lwt.catch (fun () -> Peer.send_ping peer)
+                (fun _ -> Lwt.return_unit))
+        ) pm.peers;
         (* Remove dead peers *)
         let now = Unix.gettimeofday () in
         let dead = List.filter (fun p ->
@@ -4453,13 +4462,9 @@ let gossip_addresses (pm : t) : unit Lwt.t =
   if addrs = [] then Lwt.return_unit
   else begin
     let msg = P2p.AddrMsg addrs in
-    Lwt_list.iter_p (fun peer ->
-      if peer.Peer.state = Peer.Ready then
-        Lwt.catch
-          (fun () -> Peer.send_message peer msg)
-          (fun _exn -> Lwt.return_unit)
-      else Lwt.return_unit
-    ) pm.peers
+    send_detached pm.peers (fun peer ->
+      if peer.Peer.state = Peer.Ready then Some msg else None);
+    Lwt.return_unit
   end
 
 (* ============================================================================
@@ -4579,14 +4584,9 @@ let relay_compact_block (pm : t) (block : Types.block)
   let cb = P2p.create_compact_block block in
   let msg = P2p.CmpctblockMsg cb in
   let hb_peers = get_hb_compact_peers pm in
-  Lwt_list.iter_p (fun peer ->
-    if peer_has_header peer prev_hash then
-      Lwt.catch
-        (fun () -> Peer.send_message peer msg)
-        (fun _exn -> Lwt.return_unit)
-    else
-      Lwt.return_unit
-  ) hb_peers
+  send_detached hb_peers (fun peer ->
+    if peer_has_header peer prev_hash then Some msg else None);
+  Lwt.return_unit
 
 (* Create a transaction lookup table from mempool for compact block reconstruction *)
 let create_mempool_lookup (pm : t) ~(k0 : int64) ~(k1 : int64)

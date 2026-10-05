@@ -337,3 +337,11 @@
  (name test_bip68_mempool_mtp)
  (modules test_bip68_mempool_mtp)
  (libraries camlcoin test_tmp alcotest cstruct unix))
+
+; Send-stall: a peer that stops reading is dropped (send bounded by
+; no-progress, not swallowed) and broadcasts never wait on it; slow-but-
+; reading peers are kept.  Real Peer / Peer_manager over socketpairs.
+(test
+ (name test_send_stall_no_wedge)
+ (modules test_send_stall_no_wedge)
+ (libraries camlcoin alcotest lwt lwt.unix cstruct unix))

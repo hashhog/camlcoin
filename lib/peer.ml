@@ -169,6 +169,8 @@ let handshake_timeout = 60.0   (* 60 seconds for version/verack handshake *)
    making progress is a stall, not a hang. Applied to the payload of an
    already-started message (header wait stays idle-tolerant). *)
 let payload_stall_timeout = 2.0
+(* No-progress bound for one send chunk (see send_encoded): a peer whose
+   socket accepts nothing for this long is disconnected. *)
 let send_timeout = 10.0
 
 (* BIP-324 v2 outbound probe deadline.  Bitcoin Core net.cpp uses ~30s; we
@@ -312,6 +314,7 @@ type peer = {
   our_nonce : int64;                 (* Our nonce for self-connection detection *)
   (* Inventory trickling state *)
   inv_queue : inv_entry Queue.t;     (* Pending tx inventory to announce *)
+  send_lock : Lwt_mutex.t;           (* One message on the wire at a time (chunked sends) *)
   mutable next_inv_send : float;     (* Next time to flush inv queue *)
   mutable trickling_active : bool;   (* Whether the trickle timer is running *)
   mutable msg_loop_started : bool;   (* Whether peer_message_loop is already draining this peer's socket.
@@ -457,6 +460,7 @@ let make_peer ~(network : Consensus.network_config) ~(addr : string)
     our_nonce = random_nonce ();  (* Generate nonce for self-connection detection *)
     (* Initialize inventory trickling state *)
     inv_queue = Queue.create ();
+    send_lock = Lwt_mutex.create ();
     next_inv_send = Unix.gettimeofday () +. poisson_delay avg_interval;
     trickling_active = false;
     msg_loop_started = false;
@@ -827,55 +831,103 @@ let read_message_with_timeout (peer : peer) (timeout_sec : float)
     let* () = Lwt.pause () in
     Lwt.return None
 
+(* ----------------------------------------------------------------------------
+   Sending.  Core never blocks on a socket (net.cpp: per-peer vSendMsg queue,
+   SocketSendData, pause-recv when the queue is large; InactivityCheck drops a
+   dead peer).  camlcoin awaits its sends, so a send must be BOUNDED and a peer
+   that stops reading must be DROPPED, not merely skipped:
+
+   - a message is written in [send_chunk_size] pieces and the [send_timeout]
+     clock restarts on every piece the kernel accepts, so a slow-but-reading
+     peer is never cut off while it keeps draining; a peer that makes NO
+     progress for [send_timeout] fails the send;
+   - any failed send (stall, EPIPE, reset) marks the peer Disconnected and
+     shuts the socket down.  A cancelled write may have left a partial message
+     on the wire, so the stream is unusable anyway; the shutdown wakes the
+     peer's own pending read (EOF), and peer_message_loop then sees
+     Disconnected and calls remove_peer — the same path the read side uses.
+     Before this, the timeout was swallowed by every broadcaster and the stuck
+     peer stayed Ready, costing every later send to it another 10 s;
+   - [send_lock] keeps messages whole on the wire (and v2 encryption order ==
+     wire order) now that a message is several writes.
+   ---------------------------------------------------------------------------- *)
+let send_chunk_size = 16384
+
+let abort_on_send_failure (peer : peer) (reason : string) : unit =
+  if peer.state <> Disconnected && peer.state <> Disconnecting then begin
+    Log.warn (fun m ->
+      m "[%s:%d] send to peer %d failed (%s) — disconnecting"
+        peer.addr peer.port peer.id reason);
+    peer.state <- Disconnected;
+    (try Lwt_unix.shutdown peer.fd Unix.SHUTDOWN_ALL with _ -> ())
+  end
+
+let write_with_progress (peer : peer) (data : string) : unit Lwt.t =
+  let open Lwt.Syntax in
+  let n = String.length data in
+  let rec loop off =
+    if off >= n then Lwt.return_unit
+    else begin
+      let len = min send_chunk_size (n - off) in
+      let* () =
+        with_send_timeout
+          (let* () = Lwt_io.write_from_string_exactly peer.oc data off len in
+           Lwt_io.flush peer.oc)
+      in
+      loop (off + len)
+    end
+  in
+  loop 0
+
+(* [encode] runs under the lock (v2: encrypt in wire order); it returns the
+   bytes to put on the wire, or "" for nothing. *)
+let send_encoded (peer : peer) (encode : unit -> string) : unit Lwt.t =
+  let open Lwt.Syntax in
+  Lwt_mutex.with_lock peer.send_lock (fun () ->
+    if peer.state = Disconnected || peer.state = Disconnecting then
+      Lwt.fail (Peer_protocol_error "send to a disconnected peer")
+    else begin
+      let data = encode () in
+      if data = "" then Lwt.return_unit
+      else
+        Lwt.catch
+          (fun () ->
+            let* () = write_with_progress peer data in
+            peer.bytes_sent <- peer.bytes_sent + String.length data;
+            peer.msgs_sent <- peer.msgs_sent + 1;
+            Lwt.return_unit)
+          (fun exn ->
+            abort_on_send_failure peer
+              (match exn with
+               | Peer_protocol_error m -> m
+               | e -> Printexc.to_string e);
+            Lwt.fail exn)
+    end)
+
 (* Send a v1 (legacy plaintext) message to the peer. *)
 let send_message_v1 (peer : peer)
     (payload : P2p.message_payload) : unit Lwt.t =
-  let open Lwt.Syntax in
-  let data = P2p.serialize_message peer.network.magic payload in
-  let data_str = Cstruct.to_string data in
-  (match payload with
-   | P2p.GetheadersMsg _ ->
-     let hex = Buffer.create 200 in
-     String.iter (fun c -> Buffer.add_string hex (Printf.sprintf "%02x" (Char.code c))) data_str;
-     Logs.debug (fun m -> m "RAW getheaders bytes (%d): %s" (String.length data_str) (Buffer.contents hex))
-   | _ -> ());
-  let* () =
-    with_send_timeout
-      (let* () =
-         Lwt_io.write_from_string_exactly peer.oc data_str 0
-           (String.length data_str)
-       in
-       Lwt_io.flush peer.oc)
-  in
-  peer.bytes_sent <- peer.bytes_sent + Cstruct.length data;
-  peer.msgs_sent <- peer.msgs_sent + 1;
-  Lwt.return_unit
+  send_encoded peer (fun () ->
+    let data = P2p.serialize_message peer.network.magic payload in
+    let data_str = Cstruct.to_string data in
+    (match payload with
+     | P2p.GetheadersMsg _ ->
+       Logs.debug (fun m ->
+         let hex = Buffer.create 200 in
+         String.iter (fun c -> Buffer.add_string hex (Printf.sprintf "%02x" (Char.code c))) data_str;
+         m "RAW getheaders bytes (%d): %s" (String.length data_str) (Buffer.contents hex))
+     | _ -> ());
+    data_str)
 
 (* Send an application message over a v2 (BIP-324) transport whose cipher
    handshake has completed.  Encrypts via [v2_set_message] and flushes the
    resulting ciphertext via [v2_get_bytes_to_send]. *)
 let send_message_v2 (peer : peer) (state : P2p.v2_state)
     (payload : P2p.message_payload) : unit Lwt.t =
-  let open Lwt.Syntax in
-  let queued = P2p.v2_set_message state payload in
-  if not queued then
-    Lwt.fail (Peer_protocol_error "v2: cannot encrypt before handshake complete")
-  else begin
-    let bytes = P2p.v2_get_bytes_to_send state in
-    let n = Cstruct.length bytes in
-    if n = 0 then Lwt.return_unit
-    else begin
-      let s = Cstruct.to_string bytes in
-      let* () =
-        with_send_timeout
-          (let* () = Lwt_io.write_from_string_exactly peer.oc s 0 n in
-           Lwt_io.flush peer.oc)
-      in
-      peer.bytes_sent <- peer.bytes_sent + n;
-      peer.msgs_sent <- peer.msgs_sent + 1;
-      Lwt.return_unit
-    end
-  end
+  send_encoded peer (fun () ->
+    if not (P2p.v2_set_message state payload) then
+      raise (Peer_protocol_error "v2: cannot encrypt before handshake complete");
+    Cstruct.to_string (P2p.v2_get_bytes_to_send state))
 
 (* Top-level send_message: dispatch on transport.  V1 is the default;
    the v2 path is only active after the cipher handshake completes. *)

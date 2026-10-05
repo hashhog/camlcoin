@@ -1168,6 +1168,61 @@ let process_reorg (j : Yojson.Safe.t) : string =
           { Sync.header = block.Types.header; hash; height;
             total_work = Cstruct.create 32 }
         in
+        (* Seed the header table with the connecting block's ancestry.
+
+           A real node only ever connects a block whose header is already in
+           its block index with the full ancestry behind it: Core's
+           AcceptBlockHeader rejects a header whose pprev is unknown
+           ("prev-blk-not-found", validation.cpp) and runs
+           ContextualCheckBlockHeader against that pprev before ConnectBlock
+           can ever see the block; GetNextWorkRequired asserts the
+           period-first ancestor exists (pow.cpp).  camlcoin's connect path
+           enforces the same invariant since 297ab99: a block whose parent
+           (by hash, at height-1) or MTP window is missing from the header
+           table is "ancestry-incomplete" — a local-state non-verdict, never
+           connected.
+
+           The committed reorg corpus is crafted-synthetic: every connect
+           block carries prev_block = 0x00..00 and is not hash-linked to its
+           predecessor, and the op had never registered any header.  Before
+           297ab99 the connect path silently fell back to placeholders, so the
+           op worked; after it, every connect was an ancestry non-verdict.
+           Supply what a real node holds instead: a hash-linked header chain
+           from the network's genesis to height-1, whose height-1 entry is
+           keyed by the block's own prev_block.  Bits are the genesis bits
+           (regtest: no retargeting, so the node's own expected-bits rule
+           still runs and must match the block's nBits); timestamps are
+           genesis_time + 600*i, so the MTP is a real 11-header median.
+           The node's ancestry gate itself is untouched. *)
+        let synth_key (i : int) : Types.hash256 =
+          let c = Cstruct.create 32 in
+          Cstruct.blit_from_string "camlcoin-reorg-synthetic-hdr" 0 c 0 28;
+          Cstruct.LE.set_uint32 c 28 (Int32.of_int i);
+          c
+        in
+        let seed_ancestry (prev_block : Types.hash256) (height : int) : unit =
+          let pkey = Cstruct.to_string prev_block in
+          match Hashtbl.find_opt state.Sync.headers pkey with
+          | Some pe when pe.Sync.height = height - 1 -> ()
+          | _ when height <= 0 -> ()
+          | _ ->
+            let g = network.Consensus.genesis_header in
+            let ghash = Crypto.compute_block_hash g in
+            Hashtbl.replace state.Sync.headers (Cstruct.to_string ghash)
+              { Sync.header = g; hash = ghash; height = 0;
+                total_work = Cstruct.create 32 };
+            let prev = ref ghash in
+            for i = 1 to height - 1 do
+              let key = if i = height - 1 then prev_block else synth_key i in
+              let hdr = { g with Types.prev_block = !prev;
+                                 timestamp = Int32.add g.Types.timestamp
+                                     (Int32.of_int (600 * i)) } in
+              Hashtbl.replace state.Sync.headers (Cstruct.to_string key)
+                { Sync.header = hdr; hash = key; height = i;
+                  total_work = Cstruct.create 32 };
+              prev := key
+            done
+        in
         let view = Sync.reorg_view_create () in
         let batch = Storage.ChainDB.batch_create () in
         (* --- (3) DISCONNECT phase (tip-first, as given) --- *)
@@ -1204,6 +1259,11 @@ let process_reorg (j : Yojson.Safe.t) : string =
                  let bh = to_hex (sm "block_hex") in
                  let h = to_int (sm "height") in
                  let entry = entry_of_block_hex bh h None in
+                 seed_ancestry entry.Sync.header.Types.prev_block h;
+                 (* the block's own header joins the table, as it would after
+                    AcceptBlockHeader on a real node *)
+                 Hashtbl.replace state.Sync.headers
+                   (Cstruct.to_string entry.Sync.hash) entry;
                  match Sync.connect_block_into_batch ~skip_pow:true ibd batch view entry with
                  | Ok _block -> incr connected
                  | Error e -> conn_error := Some e

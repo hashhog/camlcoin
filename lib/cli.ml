@@ -1014,6 +1014,13 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     ~on_eviction:(Some (fun txid ->
       Fee_estimation.record_eviction fee_estimator txid))
     () in
+  (* BIP68/BIP113 time source for the mempool: the active chain's MTPs
+     (Core CheckFinalTxAtTip / CalculateLockPointsAtTip).  Without it the
+     mempool read current_median_time, which nothing ever set (0): every
+     time-based nLockTime tx was non-final and every time-based relative
+     lock unsatisfiable. *)
+  Mempool.set_mtp_provider mempool
+    (Some (fun h -> Sync.get_mtp_for_height_strict chain h));
 
   (* ZMQ notifier setup. Parses Bitcoin-Core-style "-zmqpub<topic>=<addr>"
      options into endpoint configs, opens a real PUB socket per address

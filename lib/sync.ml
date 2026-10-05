@@ -4400,6 +4400,27 @@ let compute_median_time_for_display (state : chain_state) (height : int) : int32
   let timestamps = collect [] height 11 in
   Consensus.median_time_past timestamps
 
+(* Fail-closed variant for the mempool (Core CheckFinalTxAtTip /
+   CalculateLockPointsAtTip): the MTP of the active-chain block at h-1, or
+   None when fewer than min(11, h) of the window's headers are resolvable
+   (e.g. a snapshot-booted node's coin below its header band) — a partial
+   median is a value Core can never produce.  [h] may be tip+1 (=> the tip's
+   MTP, the BIP113 time of the next block). *)
+let get_mtp_for_height_strict (state : chain_state) (h : int) : int32 option =
+  if h <= 0 then Some 0l
+  else begin
+    let want = min 11 h in
+    let rec collect acc hh count =
+      if count <= 0 || hh < 0 then Some acc
+      else match get_header_at_height state hh with
+        | Some entry -> collect (entry.header.timestamp :: acc) (hh - 1) (count - 1)
+        | None -> None
+    in
+    match collect [] (h - 1) want with
+    | Some ts when List.length ts = want -> Some (Consensus.median_time_past ts)
+    | _ -> None
+  end
+
 (* Compute MTP for a given height - used as callback for BIP-68 validation *)
 let get_mtp_for_height (state : chain_state) (h : int) : int32 =
   compute_median_time_past state h

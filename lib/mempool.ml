@@ -85,6 +85,13 @@ type mempool = {
   mutable current_height : int;
   mutable network : Consensus.network_config;
   mutable current_median_time : int32;
+  (* BIP68/BIP113 time source (Core CheckFinalTxAtTip / CalculateLockPointsAtTip).
+     [f h] = MTP of the block at h-1 (GetAncestor(h-1)->GetMedianTimePast()),
+     None when the 11-header window is incomplete (fail closed).  So
+     [f (tip+1)] is the tip's MTP, and [f coin_height] is Core's nCoinTime.
+     Wired from cli.ml to Sync.get_mtp_for_height_strict.  When unset the
+     mempool falls back to [current_median_time] (the pre-wiring behaviour). *)
+  mutable mtp_provider : (int -> int32 option) option;
   (* Policy flags — can be relaxed for testing or regtest *)
   require_standard : bool;    (* enforce IsStandard checks *)
   verify_scripts : bool;      (* enforce script verification *)
@@ -341,6 +348,7 @@ let create ?(require_standard=true) ?(verify_scripts=true)
     current_height;
     network;
     current_median_time = 0l;
+    mtp_provider = None;
     require_standard;
     verify_scripts;
     orphans = Hashtbl.create 100;
@@ -429,6 +437,16 @@ let lookup_utxo (mp : mempool) (outpoint : Types.outpoint)
           is_coinbase = false;
         }
       end else None
+
+let set_mtp_provider (mp : mempool) (f : (int -> int32 option) option) : unit =
+  mp.mtp_provider <- f
+
+(* MTP of the current tip (the BIP113 cutoff for a block at tip+1).  None
+   when a provider is wired but cannot resolve a full window. *)
+let tip_mtp (mp : mempool) : int32 option =
+  match mp.mtp_provider with
+  | Some f -> f (mp.current_height + 1)
+  | None -> Some mp.current_median_time
 
 (* Check if a UTXO is confirmed (in chain UTXO set, not just mempool) *)
 let is_confirmed_utxo (mp : mempool) (outpoint : Types.outpoint) : bool =
@@ -2546,9 +2564,17 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
 
     (* Task 5: Locktime enforcement *)
     else
+    (* Core CheckFinalTxAtTip: nBlockTime = tip MTP (BIP113).  Only a
+       time-based nLockTime reads it, so resolve it only then (a provider
+       lookup is up to 11 header reads).  Unresolvable -> 0, i.e. not final
+       (fail closed). *)
     if not (Validation.is_tx_final tx
               ~block_height:(mp.current_height + 1)
-              ~block_time:mp.current_median_time) then
+              ~block_time:(
+                if Int64.logand (Int64.of_int32 tx.locktime) 0xFFFFFFFFL
+                   >= 500_000_000L
+                then Option.value (tip_mtp mp) ~default:0l
+                else mp.current_median_time)) then
       Error "Transaction is not final (locktime not reached)"
 
     else begin
@@ -2558,6 +2584,7 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
       let error = ref None in
       let utxo_heights = Array.make (List.length tx.inputs) 0 in
       let utxo_mtps = Array.make (List.length tx.inputs) 0l in
+      let mtp_unresolved = ref false in
 
       List.iteri (fun i inp ->
         if !error = None then begin
@@ -2597,7 +2624,24 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
                 error := Some "bad-txns-inputvalues-outofrange"
               else begin
                 utxo_heights.(i) <- entry.height;
-                utxo_mtps.(i) <- mp.current_median_time;
+                (* Core CalculateSequenceLocks nCoinTime =
+                   GetAncestor(max(coin_height-1,0))->GetMedianTimePast();
+                   the provider's [f coin_height] is exactly that (and for a
+                   mempool coin, height tip+1, it is the tip MTP).  Resolved
+                   only for an input that carries an active TIME-based lock;
+                   unresolvable -> the tx is rejected below (fail closed). *)
+                let seq = inp.Types.sequence in
+                utxo_mtps.(i) <-
+                  (if Validation.bip68_version_active tx.version
+                      && Int32.logand seq 0x80000000l = 0l
+                      && Int32.logand seq 0x00400000l <> 0l then
+                     (match mp.mtp_provider with
+                      | None -> mp.current_median_time
+                      | Some f ->
+                        (match f entry.height with
+                         | Some t -> t
+                         | None -> mtp_unresolved := true; 0l))
+                   else mp.current_median_time);
                 (* Track mempool dependencies *)
                 if Hashtbl.mem mp.entries (Cstruct.to_string prev.txid) then
                   depends := prev.txid :: !depends
@@ -2618,9 +2662,22 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
            block-VALIDATION site does pass one; see the tombstone in
            validation.ml above the sigop-counting section. *)
         let flags = Consensus.get_block_script_flags (mp.current_height + 1) mp.network in
-        if not (Validation.check_sequence_locks tx
+        (* Core CheckSequenceLocksAtTip: the lock is evaluated for a block at
+           tip+1 whose BIP113 time is the tip's MTP.  Resolved only when an
+           input carries a time-based lock (a height-only tx never reads it). *)
+        let has_time_lock =
+          Validation.bip68_version_active tx.version
+          && List.exists (fun inp ->
+               let seq = inp.Types.sequence in
+               Int32.logand seq 0x80000000l = 0l
+               && Int32.logand seq 0x00400000l <> 0l) tx.inputs
+        in
+        let seq_median_time =
+          if has_time_lock then tip_mtp mp else Some mp.current_median_time in
+        if !mtp_unresolved || seq_median_time = None
+           || not (Validation.check_sequence_locks tx
                   ~block_height:(mp.current_height + 1)
-                  ~median_time:mp.current_median_time
+                  ~median_time:(Option.value seq_median_time ~default:0l)
                   ~utxo_heights ~utxo_mtps ~flags ()) then
           Error "Transaction sequence locks not satisfied (BIP68)"
         else begin
@@ -4241,6 +4298,7 @@ let update_height (mp : mempool) (height : int) : unit =
 
 let update_median_time (mp : mempool) (mtp : int32) : unit =
   mp.current_median_time <- mtp
+
 
 (* ============================================================================
    Clear Mempool

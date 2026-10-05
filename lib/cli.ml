@@ -8,6 +8,10 @@
    Unix._exit while rocksdb_close holds the runtime lock. *)
 external arm_shutdown_deadline_thread : int -> bool
   = "camlcoin_arm_shutdown_deadline"
+(* Gate 6: a shutdown started by AbortNode must end with exit 1 even if the
+   deadline thread has to cut it short. *)
+external set_deadline_exit_code : int -> unit
+  = "camlcoin_set_shutdown_exit_code"
 
 (* ============================================================================
    CLI Configuration Type
@@ -1527,6 +1531,15 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       Logs.info (fun m ->
         m "received %s during shutdown — already shutting down" name)
   in
+  (* Gate 6 AbortNode -> graceful shutdown.  [Fatal.abort_node] may run on
+     a validation worker domain; an Lwt notification is the thread-safe way
+     to reach this scheduler. *)
+  let fatal_notification =
+    Lwt_unix.make_notification ~once:true (fun () ->
+      set_deadline_exit_code 1;
+      handle_signal "FATAL (AbortNode)") in
+  Fatal.shutdown_request :=
+    (fun () -> Lwt_unix.send_notification fatal_notification);
   let _sig_int = Lwt_unix.on_signal Sys.sigint (fun _signum ->
     handle_signal "SIGINT") in
   let _sig_term = Lwt_unix.on_signal Sys.sigterm (fun _signum ->
@@ -3157,6 +3170,15 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     with exn ->
       Logs.warn (fun m ->
         m "Failed to save addrman: %s" (Printexc.to_string exn)));
+    (* Gate 6: after AbortNode the in-memory coins cache / tip may be ahead
+       of or torn against disk.  Core discards the cache on a fatal error;
+       flushing it here would persist exactly the state the fault left
+       behind (and stamp rdb_tip with a height the coins never reached). *)
+    if Fatal.is_latched () then
+      Logs.err (fun m ->
+        m "FATAL latched (%s): SKIPPING the chainstate/UTXO flush"
+          (Fatal.reason ()))
+    else
     (try
       let dirty = Utxo.OptimizedUtxoSet.dirty_count optimized_utxo in
       if dirty > 0 then begin
@@ -3243,6 +3265,12 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
        file's disappearance only sees it after databases are flushed. *)
     Runtime_config.remove_pid_file ();
     Logs.info (fun m -> m "exit");
+    if Fatal.is_latched () then
+      (* Core AbortNode: exit_status = EXIT_FAILURE -- bin/main.ml exits 1
+         once Lwt_main.run returns (not here: exit inside Lwt_main.run
+         would re-enter Lwt's at_exit hooks). *)
+      Logs.err (fun m ->
+        m "fatal error latched (%s): process will exit 1" (Fatal.reason ()));
     Lwt.return_unit
   in
 

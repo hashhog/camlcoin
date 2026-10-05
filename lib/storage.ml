@@ -668,6 +668,7 @@ module ChainDB = struct
       ~(header_tip_hash : Types.hash256) ~(header_tip_height : int)
       (ops : (Types.hash256 * int * [ `Add of string | `Del ]) list)
       : unit =
+    Fatal.fire_write_hook "apply_block_atomic";
     let cf_batch = Cf_chainstate.batch_create t.cf in
     (* [ops] is in block order, so a coin created and spent inside the same
        block appears as [`Add] then [`Del], and a WriteBatch applies its
@@ -946,6 +947,7 @@ module ChainDB = struct
       Cf_chainstate.batch_put_chain_state b "header_tip_height" h)
 
   let batch_write t (batch : batch) : unit =
+    Fatal.fire_write_hook "batch_write";
     with_batch_for batch t (fun _b -> ());
     (match batch.inner with
      | None -> ()  (* empty batch, nothing to commit *)

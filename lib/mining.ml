@@ -739,7 +739,10 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
     ?(network_type : Consensus.network = Consensus.Mainnet)
     (block : Types.block) (chain : Sync.chain_state)
     (mp : Mempool.mempool) : (unit, string) result =
-
+  (* Gate 6: after AbortNode nothing connects (rpc.ml answers -25). *)
+  if Fatal.is_latched () then
+    Error (Fatal.rpc_prefix ^ "node halted: " ^ Fatal.reason ())
+  else
   let hash = Crypto.compute_block_hash block.header in
 
   (* Validate the block header (DeriveTarget bounds: negative/overflow/above-pow_limit) *)
@@ -995,8 +998,24 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
           (* Connect through the atomic UTXO path when available *)
           let utxo_result = match utxo with
             | Some utxo_set ->
-              (match Utxo.connect_block_optimized ~network_type utxo_set block height with
-               | Ok undo ->
+              (* Gate 6: [connect_block_optimized] mutates the shared coins
+                 cache before anything is durable.  If the undo write or the
+                 chainstate commit then fails (retried once), the cache is
+                 ahead of disk and cannot be rolled back here: AbortNode, and
+                 the shutdown path skips the flush that would persist the
+                 torn cache (Core: FatalError, cache discarded). *)
+              let torn what f =
+                try f () with
+                | Fatal.System_fault _ as e -> raise e
+                | e ->
+                  let msg = Printf.sprintf "submitblock %s failed after the \
+                      coins cache was updated: %s" what (Printexc.to_string e) in
+                  Fatal.abort_node msg;
+                  raise (Fatal.System_fault msg)
+              in
+              (match torn "connect" (fun () ->
+                       Utxo.connect_block_optimized ~network_type utxo_set block height) with
+               | Ok undo -> torn "commit" (fun () ->
                  (* Persist undo data so [Sync.reorganize] (and any
                     submitblock-driven side-branch promotion below)
                     can roll back this block on the disconnect path.
@@ -1032,10 +1051,11 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
                     The atomic write also advances tip_hash / tip_height /
                     header_tip in the same RocksDB batch, replacing the
                     separate [set_chain_tip] call below. *)
-                 Utxo.OptimizedUtxoSet.persist_dirty_atomic utxo_set
-                   ~tip_hash:hash ~tip_height:height
-                   ~header_tip_hash:hash ~header_tip_height:height;
-                 Ok ()
+                 Fatal.run_write ~what:"chainstate commit (submitblock)" (fun () ->
+                   Utxo.OptimizedUtxoSet.persist_dirty_atomic utxo_set
+                     ~tip_hash:hash ~tip_height:height
+                     ~header_tip_hash:hash ~header_tip_height:height);
+                 Ok ())
                | Error e -> Error e)
             | None ->
               (* Legacy path: no UTXO validation (unsafe).  Without an

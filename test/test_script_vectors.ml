@@ -341,6 +341,19 @@ let () =
   let error_count = ref 0 in
   let total = ref 0 in
   let witness_total = ref 0 in
+  (* Gate 6 instrument: an exception escaping Script.verify_script is, by
+     construction, classified as a SYSTEM fault (not a verdict).  Over
+     Core's vectors -- malformed scripts included -- it must be 0: every
+     malformed input has to come back as a script error.  [script_exn]
+     counts the deterministic interpreter exceptions that verify_script
+     converted to script errors (is_script_exn), for the record. *)
+  let internal_count = ref 0 in
+  (* Negative control for the counter itself: GATE6_NEGCTRL=1 injects an
+     allocation failure into every signature check, so INTERNAL must be
+     > 0 (and the run must fail). *)
+  if Sys.getenv_opt "GATE6_NEGCTRL" = Some "1" then
+    Crypto.fault_hook := Some (fun () -> raise Out_of_memory);
+  let script_exn_count = ref 0 in
 
   (* Helper to run a single test case and update counters *)
   let run_one_test idx ~script_sig_asm ~script_pubkey_asm ~flags_str ~expected
@@ -359,11 +372,27 @@ let () =
       let tx = make_spending_tx crediting_tx script_sig
                  ~locktime:0l ~sequence:0xFFFFFFFFl ~witnesses () in
 
-      let result = Script.verify_script
-        ~tx ~input_index:0
-        ~script_pubkey ~script_sig
-        ~witness ~amount
-        ~flags () in
+      let result =
+        match Script.verify_script
+                ~tx ~input_index:0
+                ~script_pubkey ~script_sig
+                ~witness ~amount
+                ~flags () with
+        | r -> r
+        | exception e ->
+          incr internal_count;
+          Printf.printf "INTERNAL test %d: %s\n" idx (Printexc.to_string e);
+          raise e
+      in
+      (match result with
+       | Error m when m = "Script execution error"
+                      || String.length m >= 8
+                         && (String.sub m 0 8 = "Failure("
+                             || String.sub m 0 8 = "Invalid_"
+                             || String.sub m 0 8 = "Not_foun"
+                             || String.sub m 0 8 = "Division") ->
+         incr script_exn_count
+       | _ -> ());
 
       let got_ok = match result with
         | Ok true -> true
@@ -546,8 +575,12 @@ let () =
   Printf.printf "  FAIL:  %d\n" !fail_count;
   Printf.printf "  ERROR: %d\n" !error_count;
   Printf.printf "  Skipped: %d\n" !skip_count;
+  Printf.printf "  INTERNAL (system-fault-classified exceptions): %d\n"
+    !internal_count;
+  Printf.printf "  script errors converted from interpreter exceptions: %d\n"
+    !script_exn_count;
 
-  if !fail_count > 0 || !error_count > 0 then
+  if !fail_count > 0 || !error_count > 0 || !internal_count > 0 then
     exit 1
   else
     exit 0

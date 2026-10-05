@@ -2683,6 +2683,23 @@ let check_minimal_push (script : Cstruct.t) : (unit, string) result =
   | Some msg -> Error msg
   | None -> Ok ()
 
+(* Gate 6: the exceptions that are a DETERMINISTIC consequence of the
+   script / witness bytes (a bounds check on malformed input, a
+   [failwith] the interpreter uses as a consensus error).  These are
+   SCRIPT errors -- the same bytes fail the same way on every node and on
+   every retry -- and keep their verdict.  Everything else (allocation
+   failure, stack exhaustion, a secp256k1 context / FFI fault surfaced as
+   [Fatal.System_fault], an I/O or mutex [Sys_error], an assertion) is NOT
+   a property of the bytes: it propagates as a system fault, so the caller
+   retries or halts and never judges the block.  Allow-list: an exception
+   not named here is never a verdict.
+   [Failure] is safe to keep here because the crypto layer converts its
+   own FFI [Failure]s into [Fatal.System_fault] (crypto.ml). *)
+let is_script_exn (e : exn) : bool =
+  match e with
+  | Failure _ | Invalid_argument _ | Not_found | Division_by_zero -> true
+  | _ -> false
+
 (* Execute a script and return success/failure for execution only.
    The stack-top truthiness check is done separately by the caller (verify_script).
    This matches Bitcoin Core's EvalScript behavior. *)
@@ -2708,7 +2725,10 @@ let eval_script (st : eval_state) (script : Cstruct.t) : (unit, string) result =
     exec ops
   with
   | Failure msg -> Error msg
-  | _ -> Error "Script execution error"
+  | e when is_script_exn e -> Error "Script execution error"
+  (* Anything else -- Out_of_memory, Stack_overflow, Fatal.System_fault
+     (a secp256k1 context / FFI fault), Sys_error, ... -- means the check
+     could not be COMPLETED.  It propagates: gate 6, never a verdict. *)
 
 (* ============================================================================
    Script Verification (Full Transaction Input Verification)
@@ -2732,7 +2752,7 @@ let check_stack_top (st : eval_state) : (bool, string) result =
   | top :: _ -> Ok (is_true top)
 
 (* Verify a transaction input's script *)
-let verify_script ~(tx : Types.transaction) ~(input_index : int)
+let verify_script_unguarded ~(tx : Types.transaction) ~(input_index : int)
     ~(script_pubkey : Cstruct.t) ~(script_sig : Cstruct.t)
     ~(witness : Types.tx_witness) ~(amount : int64)
     ~(flags : int) ?(prevouts=[]) ?txdata () : (bool, string) result =
@@ -2760,7 +2780,7 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
       try
         let ops = parse_script script_sig in
         List.for_all is_push_opcode ops
-      with _ -> false
+      with e when is_script_exn e -> false
     else true
   in
   if not sigpushonly_ok then
@@ -3421,3 +3441,20 @@ let verify_script ~(tx : Types.transaction) ~(input_index : int)
         end
       end
     end
+
+(* Verify a transaction input's script: three outcomes (gate 6).
+     Ok true / Ok false / Error msg  -- the check COMPLETED (verdict input);
+     an exception                    -- it did NOT complete (system fault).
+   A deterministic exception raised by the interpreter on malformed bytes
+   ([is_script_exn]) is a script error, reported with the same text the
+   block / mempool callers used to synthesise from it.  Every other
+   exception propagates so no caller can turn it into a reject or (via a
+   swallowed [false] under OP_NOT) an accept. *)
+let verify_script ~(tx : Types.transaction) ~(input_index : int)
+    ~(script_pubkey : Cstruct.t) ~(script_sig : Cstruct.t)
+    ~(witness : Types.tx_witness) ~(amount : int64)
+    ~(flags : int) ?(prevouts=[]) ?txdata () : (bool, string) result =
+  try
+    verify_script_unguarded ~tx ~input_index ~script_pubkey ~script_sig
+      ~witness ~amount ~flags ~prevouts ?txdata ()
+  with e when is_script_exn e -> Error (Printexc.to_string e)

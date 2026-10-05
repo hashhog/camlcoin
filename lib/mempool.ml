@@ -3901,6 +3901,12 @@ let accept_to_memory_pool ?(test_accept=false) (mp : mempool) (tx : Types.transa
   in
   let safe_run () : (mempool_entry * Types.hash256 list, string) result Lwt.t =
     Lwt.catch (fun () ->
+      (* Gate 6: after AbortNode the mempool refuses everything with a
+         non-verdict reason (camlcoin keeps no recent-rejects filter, so
+         nothing is cached; the prefix also keeps any future one away). *)
+      if Fatal.is_latched () then
+        Lwt.return (Error (Fatal.rpc_prefix ^ "node halted: " ^ Fatal.reason ()))
+      else
       if test_accept then
         (* dry_run path never mutates — no real evictions possible. *)
         let%lwt r = accept_transaction_lwt ~dry_run:true mp tx in
@@ -3917,8 +3923,12 @@ let accept_to_memory_pool ?(test_accept=false) (mp : mempool) (tx : Types.transa
       | Not_found ->
         Lwt.return (Error "atmp-exception: Not_found")
       | exn ->
+        (* Gate 6: a check that could not complete (OOM, a secp256k1
+           context fault, an I/O error) is not a reason to refuse the tx as
+           invalid: it is reported as a system fault (non-verdict), never
+           with a consensus/policy reject token. *)
         Lwt.return (Error
-          (Printf.sprintf "atmp-exception: %s" (Printexc.to_string exn))))
+          (Printf.sprintf "%s%s" Fatal.rpc_prefix (Printexc.to_string exn))))
   in
   let%lwt outcome = safe_run () in
   let result = match outcome with

@@ -16,6 +16,35 @@
    been removed so there is exactly one secp256k1 implementation linked into
    the binary. See "drop duplicate secp256k1 source" commit. *)
 
+(* ---- Gate 6: secp256k1 faults are system faults, never "invalid" ----
+   Core creates the secp256k1 context once at init (ECC_Start, key.cpp) and
+   aborts if that fails; CheckECDSASignature / CheckSchnorrSignature
+   (script/interpreter.cpp) can only answer valid / invalid -- there is no
+   path on which an allocation or context failure reads as "invalid".
+   camlcoin's wrappers used to catch EVERY exception and return [false], so
+   a failed context, an OOM in a Bigstring copy, or an FFI fault while
+   checking a VALID signature made [<sig> <pk> CHECKSIG NOT] PASS (wrong
+   ACCEPT) and [CHECKSIGVERIFY] fail (wrong reject).  Now: the C stubs only
+   raise for system faults (they return false for unparsable keys/sigs),
+   so a [Failure] from them becomes [Fatal.System_fault] and anything else
+   (Out_of_memory, Stack_overflow) propagates untouched. *)
+external secp_init_raw : unit -> unit = "caml_secp_init"
+
+(* Eager context creation at module init (Core ECC_Start): a failure aborts
+   the process at boot instead of surfacing mid-validation, and no worker
+   domain can race the lazy init. *)
+let () = secp_init_raw ()
+
+let secp_fault (m : string) = raise (Fatal.System_fault ("secp256k1: " ^ m))
+
+(* Test hook (inert in production: [None]).  Fired inside every consensus
+   signature / key check, where a real FFI or allocation fault would
+   surface. *)
+let fault_hook : (unit -> unit) option ref = ref None
+
+let[@inline] fire_fault_hook () =
+  match !fault_hook with None -> () | Some f -> f ()
+
 (* Hardware-accelerated SHA-256 via OpenSSL C stubs *)
 external sha256_accel : string -> string = "caml_sha256_accel"
 external sha256d_accel : string -> string = "caml_sha256d_accel"
@@ -171,9 +200,10 @@ external ecdsa_signature_is_low_s_raw : Bigstring.t -> bool
 
 let is_low_der_s (sig_bytes : Cstruct.t) : bool =
   try
+    fire_fault_hook ();
     let sig_bs = cstruct_to_bigstring sig_bytes in
     ecdsa_signature_is_low_s_raw sig_bs
-  with _ -> false
+  with Failure m -> secp_fault m
 
 (* ECDSA verify (strict DER parsing, no low-S normalize, mirrors the
    historical Sign.verify_exn semantics).  Routed through the same
@@ -187,8 +217,9 @@ let verify (pubkey_bytes : public_key) (msg_hash : Types.hash256) (sig_bytes : s
     let pk_bs = cstruct_to_bigstring pubkey_bytes in
     let msg_bs = cstruct_to_bigstring msg_hash in
     let sig_bs = cstruct_to_bigstring sig_bytes in
+    fire_fault_hook ();
     verify_ecdsa_strict_raw pk_bs msg_bs sig_bs
-  with _ -> false
+  with Failure m -> secp_fault m
 
 (* ============================================================================
    Compact Recoverable ECDSA signatures (Bitcoin Core "signmessage" format)
@@ -288,11 +319,12 @@ let schnorr_verify ~(pubkey_x : Cstruct.t) ~(msg : Cstruct.t) ~(signature : Cstr
     false
   else
     try
+      fire_fault_hook ();
       schnorr_verify_raw
         (cstruct_to_bigstring pubkey_x)
         (cstruct_to_bigstring msg)
         (cstruct_to_bigstring signature)
-    with _ -> false
+    with Failure m -> secp_fault m
 
 (* Schnorr signature creation (BIP-340) *)
 external schnorr_sign_raw : Bigstring.t -> Bigstring.t -> Bigstring.t
@@ -343,12 +375,13 @@ let xonly_pubkey_tweak_add_check ~(internal_pk : Cstruct.t) ~(tweaked_pk : Cstru
     false
   else
     try
+      fire_fault_hook ();
       xonly_tweak_add_check_raw
         (cstruct_to_bigstring internal_pk)
         (cstruct_to_bigstring tweaked_pk)
         tweaked_parity
         (cstruct_to_bigstring tweak)
-    with _ -> false
+    with Failure m -> secp_fault m
 
 (* Compute transaction ID (double SHA-256 of serialized tx without witness) *)
 let compute_txid (tx : Types.transaction) : Types.hash256 =
@@ -642,11 +675,12 @@ let verify_ecdsa_fast ~(pubkey : Cstruct.t) ~(msg32 : Cstruct.t) ~(signature : C
   else if Cstruct.length pubkey <> 33 && Cstruct.length pubkey <> 65 then false
   else
     try
+      fire_fault_hook ();
       ecdsa_verify_raw
         (cstruct_to_bigstring pubkey)
         (cstruct_to_bigstring msg32)
         (cstruct_to_bigstring signature)
-    with _ -> false
+    with Failure m -> secp_fault m
 
 (* ECDSA verification with automatic low-S normalization.
    This is useful for verifying legacy signatures that may have high-S values. *)
@@ -655,11 +689,12 @@ let verify_ecdsa_normalized ~(pubkey : Cstruct.t) ~(msg32 : Cstruct.t) ~(signatu
   else if Cstruct.length pubkey <> 33 && Cstruct.length pubkey <> 65 then false
   else
     try
+      fire_fault_hook ();
       ecdsa_verify_normalized_raw
         (cstruct_to_bigstring pubkey)
         (cstruct_to_bigstring msg32)
         (cstruct_to_bigstring signature)
-    with _ -> false
+    with Failure m -> secp_fault m
 
 (* Raw FFI binding for ECDSA verification with lax DER parsing *)
 external ecdsa_verify_lax_raw : Bigstring.t -> Bigstring.t -> Bigstring.t -> bool
@@ -676,11 +711,12 @@ let verify_lax (pubkey_bytes : public_key) (msg_hash : Types.hash256) (sig_bytes
   else if pk_len <> 33 && pk_len <> 65 then false
   else
     try
+      fire_fault_hook ();
       ecdsa_verify_lax_raw
         (cstruct_to_bigstring pubkey_bytes)
         (cstruct_to_bigstring msg_hash)
         (cstruct_to_bigstring sig_bytes)
-    with _ -> false
+    with Failure m -> secp_fault m
 
 (* ============================================================================
    Batch Schnorr Verification
@@ -721,8 +757,9 @@ let schnorr_verify_batch (items : (Cstruct.t * Cstruct.t * Cstruct.t) list) : bo
         Bigstring.blit sig_bs 0 sigs (i * 64) 64
       ) items;
       try
+        fire_fault_hook ();
         schnorr_verify_batch_raw pubkeys msgs sigs count
-      with _ -> false
+      with Failure m -> secp_fault m
     end
   end
 
@@ -744,8 +781,9 @@ let is_valid_pubkey (pubkey : Cstruct.t) : bool =
   if len <> 33 && len <> 65 then false
   else
     try
+      fire_fault_hook ();
       pubkey_parse_check_raw (cstruct_to_bigstring pubkey)
-    with _ -> false
+    with Failure m -> secp_fault m
 
 (* Compress an uncompressed public key (65 bytes -> 33 bytes) *)
 let compress_pubkey (pubkey : Cstruct.t) : Cstruct.t option =

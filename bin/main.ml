@@ -1101,6 +1101,13 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
        shutdown never returns here — the deadline pthread inside Cli.run
        has already called _exit(0). *)
     Camlcoin.Runtime_config.remove_pid_file ();
+    (* Gate 6: a shutdown started by AbortNode exits 1 (Core: exit_status =
+       EXIT_FAILURE), so the supervisor records a failure and restarts. *)
+    if Camlcoin.Fatal.is_latched () then begin
+      Printf.eprintf "[camlcoin] exiting 1 after fatal error: %s\n%!"
+        (Camlcoin.Fatal.reason ());
+      exit 1
+    end;
     exit 0
   end
   end

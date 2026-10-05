@@ -2724,6 +2724,12 @@ let handle_submitblock (ctx : rpc_context)
               ~network_type:ctx.network.network_type
               block ctx.chain ctx.mempool with
       | Ok () -> Ok `Null
+      (* Gate 6: a system fault is not a validation result.  Core answers
+         a ProcessNewBlock failure that is not a BlockValidationState
+         verdict with JSONRPCError(RPC_VERIFY_ERROR, ...) -- never a
+         BIP-22 token.  The dispatcher maps the prefix to -25. *)
+      | Error msg when String.starts_with ~prefix:Fatal.rpc_prefix msg ->
+        Error msg
       (* Return canonical BIP-22 string in result field (not as an error).
          Bitcoin Core BIP22ValidationResult() returns the string as a
          successful JSON-RPC result, not a JSON-RPC error object. *)
@@ -2741,12 +2747,15 @@ let handle_submitblock (ctx : rpc_context)
         Logs.warn (fun m -> m "submitblock rejected: %s" msg);
         Ok (`String (bip22_of_submitblock_error msg))
     with exn ->
-      (* Unexpected exception from the validate/connect path (the decode
-         now has its own arm above).  BIP-22 catch-all, matching Core's
-         BIP22ValidationResult default of "rejected". *)
+      (* Gate 6: an exception out of the validate/connect path (the decode
+         has its own arm above) means the block was NOT judged -- a coins
+         read error, a script check that could not complete, a failed
+         chainstate write.  It used to be answered with the BIP-22
+         "rejected" token, i.e. reported as a verdict.  Core: RPC_VERIFY_ERROR. *)
       Logs.warn (fun m ->
-        m "submitblock failed: %s" (Printexc.to_string exn));
-      Ok (`String "rejected")))
+        m "submitblock failed (system fault, not a verdict): %s"
+          (Printexc.to_string exn));
+      Error (Fatal.rpc_prefix ^ Printexc.to_string exn)))
   | _ ->
     Error "Invalid parameters: expected [hexdata]"
 
@@ -15640,6 +15649,8 @@ let dispatch_rpc (ctx : rpc_context)
      | Ok r -> Ok r
      | Error msg when msg = "Block decode failed" ->
        Error (rpc_deserialization_error, msg)
+     | Error msg when String.starts_with ~prefix:Fatal.rpc_prefix msg ->
+       Error (rpc_verify_error, msg)
      | Error msg -> Error (rpc_verify_rejected, msg))
   | "submitheader" ->
     (* handle_submitheader already returns the Core-exact (code, message)

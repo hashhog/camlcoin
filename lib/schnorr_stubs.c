@@ -76,6 +76,17 @@ static void ensure_ctx(void) {
     }
 }
 
+/* caml_secp_init(unit) -> unit
+   Eager context creation at startup (Core ECC_Start, key.cpp).  Raises
+   Failure if the context cannot be created / randomized, so the process
+   aborts at boot rather than reading the failure as "signature invalid"
+   in the middle of validation (gate 6). */
+CAMLprim value caml_secp_init(value v_unit) {
+    CAMLparam1(v_unit);
+    ensure_ctx();
+    CAMLreturn(Val_unit);
+}
+
 /* caml_schnorr_verify(pubkey_x_32bytes, msg_32bytes, sig_64bytes) -> bool */
 CAMLprim value caml_schnorr_verify(value v_pubkey, value v_msg, value v_sig) {
     CAMLparam3(v_pubkey, v_msg, v_sig);

@@ -15,16 +15,24 @@
 #include <stdio.h>
 #include <unistd.h>
 
+/* Gate 6: set to 1 when the shutdown was started by AbortNode. */
+static volatile int shutdown_exit_code = 0;
+
+CAMLprim value camlcoin_set_shutdown_exit_code(value v_code) {
+  shutdown_exit_code = Int_val(v_code);
+  return Val_unit;
+}
+
 static void *deadline_thread(void *arg) {
   int secs = (int)(intptr_t)arg;
   if (secs < 1) secs = 150;
   sleep((unsigned)secs);
   fprintf(stderr,
-          "[camlcoin] shutdown deadline %ds exceeded — exiting 0 so the "
+          "[camlcoin] shutdown deadline %ds exceeded — exiting %d so the "
           "supervisor does not SIGKILL\n",
-          secs);
+          secs, shutdown_exit_code);
   fflush(stderr);
-  _exit(0);
+  _exit(shutdown_exit_code);
   return NULL;
 }
 

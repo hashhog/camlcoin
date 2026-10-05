@@ -1,5 +1,6 @@
 module Types = Types
 module Serialize = Serialize
+module Fatal = Fatal
 module Crypto = Crypto
 module Address = Address
 module Script = Script

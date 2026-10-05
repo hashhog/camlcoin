@@ -4226,7 +4226,8 @@ let flush_utxos (ibd : ibd_state) : unit =
     List.iter (fun (txid, vout) ->
       Storage.ChainDB.batch_delete_utxo batch txid vout
     ) ibd.pending_utxo_deletes;
-    Storage.ChainDB.batch_write ibd.chain.db batch;
+    Fatal.run_write ~what:"IBD pending-UTXO flush" (fun () ->
+      Storage.ChainDB.batch_write ibd.chain.db batch);
     ibd.pending_utxo_updates <- [];
     ibd.pending_utxo_deletes <- [];
     Logs.debug (fun m -> m "Flushed UTXO updates to disk")
@@ -4234,9 +4235,13 @@ let flush_utxos (ibd : ibd_state) : unit =
   (* Also flush the OptimizedUtxoSet dirty entries if one is attached.
      Pass the current blocks_synced height so RocksDB records it for
      consistency checking on restart. *)
+  (* Gate 6: Core FlushStateToDisk failure is FatalError.  [flush] clears
+     its dirty set only after both stores were written (write-before-
+     forget), so a retry re-writes the same delta; a second failure halts. *)
   match ibd.utxo_set with
   | Some utxo ->
-    Utxo.OptimizedUtxoSet.flush ~tip_height:ibd.chain.blocks_synced utxo
+    Fatal.run_write ~what:"IBD UTXO cache flush" (fun () ->
+      Utxo.OptimizedUtxoSet.flush ~tip_height:ibd.chain.blocks_synced utxo)
   | None -> ()
 
 (* Encode UTXO data for storage *)
@@ -4846,6 +4851,11 @@ let process_downloaded_blocks ?(max_blocks = 1)
   let error = ref None in
   let continue = ref true in
   let rec step () : unit Lwt.t =
+    if Fatal.is_latched () then begin
+      (* Gate 6: after AbortNode nothing connects. *)
+      error := Some (Fatal.rpc_prefix ^ "node halted: " ^ Fatal.reason ());
+      Lwt.return_unit
+    end else
     if not !continue || !error <> None || !processed >= max_blocks then
       Lwt.return_unit
     else
@@ -6409,7 +6419,22 @@ let is_block_mutation_error (e : Validation.block_validation_error) : bool =
   | Validation.BlockBadWitnessCommitment
   | Validation.BlockBadWitnessNonceSize
   | Validation.BlockUnexpectedWitness -> true
-  | _ -> false
+  (* Gate 6: exhaustive, no wildcard -- a new [block_validation_error]
+     constructor must be classified here explicitly (the compiler refuses
+     otherwise).  Every constructor below is a COMPLETED consensus check;
+     system faults never reach this type (they propagate as exceptions,
+     see Fatal / Validation.resolve_job_faults). *)
+  | Validation.BlockEmptyTransactions
+  | Validation.BlockNoCoinbase
+  | Validation.BlockBadTimestamp
+  | Validation.BlockBadDifficulty
+  | Validation.BlockOverweight _
+  | Validation.BlockOversized _
+  | Validation.BlockTooManySigops
+  | Validation.BlockBadCoinbaseValue _
+  | Validation.BlockTxValidationFailed _
+  | Validation.BlockBadVersion _
+  | Validation.BlockTimeWarpAttack -> false
 
 (* Which peer delivered a block body we stored without validating (a
    side-branch block), so the peer can be punished when a later
@@ -7126,6 +7151,9 @@ let reorganize ?(allow_equal_work = false)
     (ibd : ibd_state)
     (new_tip : header_entry)
     : (unit, string) result =
+  if Fatal.is_latched () then
+    Error (Fatal.rpc_prefix ^ "node halted: " ^ Fatal.reason ())
+  else
   let state = ibd.chain in
   (* The reorg SOURCE is the VALIDATED tip (the block whose UTXO set is
      currently live), NOT [state.tip].  On the live-P2P path [state.tip]
@@ -7195,9 +7223,12 @@ let reorganize ?(allow_equal_work = false)
            set is invisible there, so persist it first: the reorg must start
            from the coin set of [current_tip] (Core: the reorg runs on
            CoinsTip, which already holds every unflushed change). *)
+        (* Gate 6: a failed pre-reorg flush must not let the reorg run
+           against a stale disk (retry once, then AbortNode). *)
         (match reorg_utxo_set ibd with
          | Some u when Utxo.OptimizedUtxoSet.dirty_count u > 0 ->
-           Utxo.OptimizedUtxoSet.flush ~tip_height:current_tip.height u
+           Fatal.run_write ~what:"pre-reorg UTXO flush" (fun () ->
+             Utxo.OptimizedUtxoSet.flush ~tip_height:current_tip.height u)
          | _ -> ());
         let to_disconnect = collect_path state fork_point current_tip in
         let to_connect = collect_path state fork_point new_tip in
@@ -7265,7 +7296,11 @@ let reorganize ?(allow_equal_work = false)
              mutation, not a missing body / ancestry-incomplete / DB miss,
              which come back as Error without [on_invalid] firing). *)
           let failed_verdict = ref None in
-          List.iter (fun (entry : header_entry) ->
+          (* Gate 6: an exception out of the connect half (a coins read
+             error, a script check that could not complete) is NOT a
+             verdict: [failed_verdict] is only set by [on_invalid] on a
+             completed check.  Drop the staged delta and re-raise. *)
+          (try List.iter (fun (entry : header_entry) ->
             if !connect_error = None then
               match connect_block_into_batch
                       ~on_invalid:(fun e ->
@@ -7285,7 +7320,11 @@ let reorganize ?(allow_equal_work = false)
               | Error e -> connect_error := Some e
               | Ok block ->
                 connected_blocks := (entry, block) :: !connected_blocks
-          ) to_connect;
+          ) to_connect
+           with e ->
+             ibd.pending_utxo_updates <- [];
+             ibd.pending_utxo_deletes <- [];
+             raise e);
           match !connect_error with
           | Some e ->
             Logs.err (fun m -> m "Reorg aborted during connect: %s" e);
@@ -7334,7 +7373,8 @@ let reorganize ?(allow_equal_work = false)
             done;
             Storage.ChainDB.batch_set_chain_tip batch new_tip.hash
               new_tip.height;
-            Storage.ChainDB.batch_write state.db batch;
+            Fatal.run_write ~what:"reorg chainstate commit" (fun () ->
+              Storage.ChainDB.batch_write state.db batch);
             (* BIP-157 reorg-fsync. The rewind + per-block appends above
                only mutated the in-memory bundle. Persist them now,
                matching the LSM commit we just performed for the
@@ -8419,6 +8459,8 @@ let rec maybe_activate_best_chain
 let rec connect_stored_blocks
     ?(on_block_failed : (header_entry -> unit) option)
     (state : chain_state) : int =
+  (* Gate 6: after AbortNode nothing connects. *)
+  if Fatal.is_latched () then 0 else
   let next_height = state.blocks_synced + 1 in
   (* Best-HEADER chain, not the active height index. The index has no rows
      above blocks_synced (fecf534), so get_header_at_height returns None
@@ -8549,12 +8591,21 @@ let rec connect_stored_blocks
                 ops := (txid, vout, `Add data) :: !ops
             ) tx.Types.outputs
           ) stored_block.transactions;
+          (* Gate 6, write-before-forget (Core: the coins cache and the tip
+             move only after the chainstate batch is written; a failed write
+             is FatalError).  The in-memory tip used to advance FIRST, so a
+             failed [apply_block_atomic] (ENOSPC / EIO) left memory one block
+             ahead of disk: the next block then read this block's outputs as
+             missing -> "missing inputs" verdict, marked + peer punished. *)
+          let new_tip = header_tip_after_block_connect state.tip entry in
+          let hdr_tip = match new_tip with Some t -> t | None -> entry in
+          Fatal.run_write ~what:"chainstate commit (gap-fill drain)" (fun () ->
+            Storage.ChainDB.apply_block_atomic state.db
+              ~tip_hash:entry.hash ~tip_height:next_height
+              ~header_tip_hash:hdr_tip.hash ~header_tip_height:hdr_tip.height
+              (List.rev !ops));
           state.blocks_synced <- next_height;
-          state.tip <- header_tip_after_block_connect state.tip entry;
-          (* Wake the wait-family RPCs on this gap-fill / catch-up tip advance
-             (Core KernelNotifications blockTip / WaitTipChanged).
-             Best-effort: a notifier fault must never stall block connect. *)
-          (try Tip_notifier.notify () with _ -> ());
+          state.tip <- new_tip;
           (* Bug 8 fix (2026-04-26): keep in-memory headers_synced in sync
              with state.tip. apply_block_atomic persists header_tip to DB,
              but the locator builder reads the in-memory field; without
@@ -8562,11 +8613,10 @@ let rec connect_stored_blocks
              respond with already-known headers in an infinite loop. *)
           if next_height > state.headers_synced then
             state.headers_synced <- next_height;
-          let hdr_tip = match state.tip with Some t -> t | None -> entry in
-          Storage.ChainDB.apply_block_atomic state.db
-            ~tip_hash:entry.hash ~tip_height:next_height
-            ~header_tip_hash:hdr_tip.hash ~header_tip_height:hdr_tip.height
-            (List.rev !ops);
+          (* Wake the wait-family RPCs on this gap-fill / catch-up tip advance
+             (Core KernelNotifications blockTip / WaitTipChanged).
+             Best-effort: a notifier fault must never stall block connect. *)
+          (try Tip_notifier.notify () with _ -> ());
           at_tip_commit_invalidate !ops;
           (* Store nTx and m_chain_tx_count so getblockheader /
              getchaintxstats do not need the body. *)
@@ -8653,7 +8703,10 @@ let process_new_block ?(f_requested = false)
      re-validating; an inbound peer that merely relays it is not punished.
      Before this check the same invalid block was fully re-validated on
      every delivery. *)
-  if Hashtbl.mem state.invalidated_blocks hash_key then
+  if Fatal.is_latched () then
+    (* Gate 6: after AbortNode nothing connects, nothing is judged. *)
+    Lwt.return (Error (Fatal.rpc_prefix ^ "node halted: " ^ Fatal.reason ()))
+  else if Hashtbl.mem state.invalidated_blocks hash_key then
     Lwt.return (Error "duplicate-invalid")
   (* Ignore blocks we already have — but still try to advance from stored
      out-of-order blocks in case a recent fill brought us what we needed. *)
@@ -8898,9 +8951,20 @@ let process_new_block ?(f_requested = false)
             ) tx.Types.outputs
           ) block.transactions;
           (* Advance the chain tip atomically with UTXO deltas so that
-             rdb_tip never lags chain_tip (the W47 945509 wedge). *)
+             rdb_tip never lags chain_tip (the W47 945509 wedge).
+             Gate 6, write-before-forget: the DURABLE commit first, the
+             in-memory tip only after it returned (see
+             [connect_stored_blocks]); a commit that fails twice is
+             AbortNode -- the exception leaves this block unjudged. *)
+          let new_tip = header_tip_after_block_connect state.tip entry in
+          let hdr_tip = match new_tip with Some t -> t | None -> entry in
+          Fatal.run_write ~what:"chainstate commit (block connect)" (fun () ->
+            Storage.ChainDB.apply_block_atomic state.db
+              ~tip_hash:hash ~tip_height:height
+              ~header_tip_hash:hdr_tip.hash ~header_tip_height:hdr_tip.height
+              (List.rev !ops));
           state.blocks_synced <- height;
-          state.tip <- header_tip_after_block_connect state.tip entry;
+          state.tip <- new_tip;
           (* Bug 8 fix (2026-04-26): mirror apply_block_atomic's
              header_tip_height update into the in-memory field; the
              locator builder reads in-memory state. Without this,
@@ -8910,11 +8974,6 @@ let process_new_block ?(f_requested = false)
              check, infinite loop. *)
           if height > state.headers_synced then
             state.headers_synced <- height;
-          let hdr_tip = match state.tip with Some t -> t | None -> entry in
-          Storage.ChainDB.apply_block_atomic state.db
-            ~tip_hash:hash ~tip_height:height
-            ~header_tip_hash:hdr_tip.hash ~header_tip_height:hdr_tip.height
-            (List.rev !ops);
           at_tip_commit_invalidate !ops;
           (* Wake the wait-family RPCs on this LIVE post-IBD tip advance (Core
              KernelNotifications blockTip / WaitTipChanged).  Placed AFTER the

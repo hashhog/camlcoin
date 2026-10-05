@@ -549,7 +549,11 @@ let extract_last_push_data (script : Cstruct.t) : Cstruct.t option =
       end
     done;
     !last
-  with _ -> None
+  (* Every read above is bounds-checked; only a malformed-length slice can
+     raise, and that is a property of the bytes (Core GetOp fails -> 0
+     sigops).  An allocation failure is NOT: it propagates (gate 6) instead
+     of under-counting P2SH sigops (a fail-open). *)
+  with Invalid_argument _ -> None
 
 (* Count witness sigops for a specific witness program version.
    Returns the number of sigops (not weighted - witness sigops cost 1 each).
@@ -1428,17 +1432,17 @@ let min_inputs_for_parallel = 16
 let sig_cache_mutex : Mutex.t = Mutex.create ()
 
 (* Thread-safe sig-cache lookup.  Returns Some true if cached, None otherwise. *)
+(* Mutex.protect: a raise inside the critical section (OOM growing the
+   table) must not leave the lock held -- the next lock would then raise
+   Sys_error "Mutex.lock: Resource deadlock avoided" on this domain or
+   deadlock another, and before gate 6 that Sys_error became a script
+   failure verdict. *)
 let cache_lookup (cache : Sig_cache.t) (key : Sig_cache.cache_key) : bool option =
-  Mutex.lock sig_cache_mutex;
-  let r = Sig_cache.lookup cache key in
-  Mutex.unlock sig_cache_mutex;
-  r
+  Mutex.protect sig_cache_mutex (fun () -> Sig_cache.lookup cache key)
 
 (* Thread-safe sig-cache insert (only called for successful verifications). *)
 let cache_insert (cache : Sig_cache.t) (key : Sig_cache.cache_key) (v : bool) : unit =
-  Mutex.lock sig_cache_mutex;
-  Sig_cache.insert cache key v;
-  Mutex.unlock sig_cache_mutex
+  Mutex.protect sig_cache_mutex (fun () -> Sig_cache.insert cache key v)
 
 (* Thread-safe global sig-cache clear (called on reorg by sync.ml).
    W165 (un-pin deep fix): with the at-tip mempool-verify pool
@@ -1450,9 +1454,7 @@ let cache_insert (cache : Sig_cache.t) (key : Sig_cache.cache_key) (v : bool) : 
    same table).  Routing clear through sig_cache_mutex closes it.  Cost is one
    uncontended lock on the reorg path (rare). *)
 let cache_clear_global () : unit =
-  Mutex.lock sig_cache_mutex;
-  Sig_cache.clear_global ();
-  Mutex.unlock sig_cache_mutex
+  Mutex.protect sig_cache_mutex Sig_cache.clear_global
 
 (* Verify a single input.  Returns Ok () on success, Error (index, msg) on
    failure.  Safe to call from any Domain — sig-cache access is serialised.
@@ -1565,6 +1567,8 @@ type script_check_pool = {
   mutable slices : (int * Types.tx_in * utxo) list array;
   (* Per-worker result for the current batch. *)
   mutable results : (unit, int * string) result array;
+  (* Per-worker exception (gate 6: a check that did not complete). *)
+  mutable faults : exn option array;
   (* Current batch parameters (None between batches). *)
   mutable params : batch_params option;
   mutable generation : int;  (* bumped once per submitted batch *)
@@ -1605,10 +1609,10 @@ let pool_worker_loop (pool : script_check_pool) (my_index : int) : unit =
             ~prevouts:params.bp_prevouts ~wtxid:params.bp_wtxid
             ~cache:params.bp_cache ~txdata:params.bp_txdata slice
         with e ->
-          (* Never let a worker exception deadlock the submitter: surface it as
-             an Error so pending still reaches 0.  Index -1 marks "no specific
-             input" (the submitter's first-error scan still reports it). *)
-          Error (-1, Printexc.to_string e)
+          (* Never let a worker exception deadlock the submitter: record it
+             so pending still reaches 0.  It is NOT a script failure (gate
+             6): [pool_submit] re-raises it on the submitter. *)
+          (pool.faults.(my_index) <- Some e; Ok ())
       in
       Mutex.lock pool.pool_mutex;
       pool.results.(my_index) <- r;
@@ -1677,6 +1681,7 @@ let pool_submit ?txdata (pool : script_check_pool)
     Mutex.lock pool.pool_mutex;
     pool.slices <- slices;
     pool.results <- Array.make pool.nworkers (Ok ());
+    pool.faults <- Array.make pool.nworkers None;
     pool.params <- Some params;
     pool.pending <- pool.nworkers;
     pool.generation <- pool.generation + 1;
@@ -1687,8 +1692,10 @@ let pool_submit ?txdata (pool : script_check_pool)
     (* Snapshot results before releasing the lock; clear params so a leaked
        reference cannot pin the batch's tx/prevouts. *)
     let results = Array.copy pool.results in
+    let faults = Array.copy pool.faults in
     pool.params <- None;
     Mutex.unlock pool.pool_mutex;
+    Array.iter (function Some e -> raise e | None -> ()) faults;
     (* First error in deterministic order (worker-index then in-slice, which is
        input-index order because partition_tasks keeps slices contiguous). *)
     let rec scan i =
@@ -1717,6 +1724,7 @@ let create_pool ?(max_workers = 15) () : script_check_pool =
     nworkers;
     slices = [||];
     results = [||];
+    faults = [||];
     params = None;
     generation = 0;
     pending = 0;
@@ -1797,6 +1805,10 @@ type script_check_job = {
      one (correct, just no cross-input sharing). *)
   txdata : Script.precomputed_txdata option;
   mutable err : (int * string) option;
+  (* Gate 6, third outcome: the check did not COMPLETE (an exception that
+     is not a script error -- see [Script.verify_script]).  Never a
+     verdict: [run_script_checks] re-runs it once, then halts. *)
+  mutable fault : exn option;
 }
 
 type script_check_result = {
@@ -1834,19 +1846,26 @@ let max_in_flight (q : script_check_queue) = Atomic.get q.max_in_flight
 let job_array_is (q : script_check_queue) (jobs : script_check_job array) =
   q.jobs == jobs
 
+(* Test hook (inert in production: [None]): called at the start of every
+   script-check job, where a dead worker / OOM / killed check surfaces. *)
+let job_fault_hook : (int -> unit) option ref = ref None
+
 let run_one_job (job : script_check_job) : unit =
   let cache = Sig_cache.get_global () in
-  let r =
-    try
-      verify_one_input ?txdata:job.txdata
-        ~tx:job.tx ~flags:job.flags ~prevouts:job.prevouts
-        ~wtxid:job.wtxid ~cache
-        job.input_idx job.inp job.utxo
-    with e -> Error (job.input_idx, Printexc.to_string e)
-  in
-  match r with
+  match
+    (match !job_fault_hook with None -> () | Some f -> f job.input_idx);
+    verify_one_input ?txdata:job.txdata
+      ~tx:job.tx ~flags:job.flags ~prevouts:job.prevouts
+      ~wtxid:job.wtxid ~cache
+      job.input_idx job.inp job.utxo
+  with
   | Ok () -> ()
   | Error (idx, msg) -> job.err <- Some (idx, msg)
+  (* Not a verdict: [Script.verify_script] already turned every
+     deterministic script exception into [Error].  Recorded so the batch
+     still completes (a raise here would leave a worker short of its
+     done-count) and resolved by the master in [resolve_job_faults]. *)
+  | exception e -> job.fault <- Some e
 
 let bump_max_in_flight q cur =
   let rec loop () =
@@ -1903,6 +1922,35 @@ let claim_and_run_task (q : script_check_queue) (n : int) (task : int -> unit)
 
 let claim_and_run (q : script_check_queue) (jobs : script_check_job array) : unit =
   claim_and_run_task q (Array.length jobs) (fun i -> run_one_job jobs.(i))
+
+(* Gate 6: resolve every job whose check did not complete BEFORE the first
+   failure is chosen, so the reported verdict is the same one a fault-free
+   run gives (lowest index).  Core: a CScriptCheck either returns a
+   ScriptError or the node aborts (bad_alloc terminates); no third state
+   reaches ConnectBlock.  One serial re-run on the master (a transient
+   fault: a worker's allocation, a failed thread); a second fault on the
+   same job is AbortNode -- nothing is marked, no peer is punished, the
+   exception escapes accept_block and the node shuts down (exit 1). *)
+let resolve_job_faults (jobs : script_check_job array) : unit =
+  Array.iter (fun job ->
+    match job.fault with
+    | None -> ()
+    | Some e1 ->
+      job.fault <- None;
+      Logs.warn (fun m ->
+        m "script check tx %d input %d did not complete (%s) -- re-running \
+           once serially (not a verdict)"
+          job.tx_idx job.input_idx (Printexc.to_string e1));
+      run_one_job job;
+      (match job.fault with
+       | None -> ()
+       | Some e2 ->
+         let msg = Printf.sprintf
+             "script check tx %d input %d failed to complete twice: %s"
+             job.tx_idx job.input_idx (Printexc.to_string e2) in
+         Fatal.abort_node msg;
+         raise (Fatal.System_fault msg))
+  ) jobs
 
 let scan_first_fail (jobs : script_check_job array) : script_check_result =
   let n = Array.length jobs in
@@ -1985,7 +2033,7 @@ let run_script_check_queue (q : script_check_queue) (jobs : script_check_job arr
       Atomic.set q.next 0;
       Atomic.set q.in_flight 0;
       Atomic.set q.max_in_flight 0;
-      Array.iter (fun j -> j.err <- None) jobs;
+      Array.iter (fun j -> j.err <- None; j.fault <- None) jobs;
       let extra = q.extra_workers in
       Mutex.lock q.mutex;
       q.jobs <- jobs;
@@ -2014,6 +2062,7 @@ let run_script_check_queue (q : script_check_queue) (jobs : script_check_job arr
           done;
           Mutex.unlock q.mutex
         end;
+        resolve_job_faults jobs;
         scan_first_fail jobs
       end)
 
@@ -2104,7 +2153,8 @@ let run_script_checks (jobs : script_check_job array) : script_check_result =
   match !script_check_queue with
   | Some q -> run_script_check_queue q jobs
   | None ->
-    Array.iter (fun j -> j.err <- None; run_one_job j) jobs;
+    Array.iter (fun j -> j.err <- None; j.fault <- None; run_one_job j) jobs;
+    resolve_job_faults jobs;
     scan_first_fail jobs
 
 let append_script_jobs acc ~tx ~tx_idx ~flags ~prevouts ~utxos =
@@ -2119,7 +2169,7 @@ let append_script_jobs acc ~tx ~tx_idx ~flags ~prevouts ~utxos =
         | None -> acc
         | Some utxo ->
           { tx; tx_idx; input_idx = j; inp; utxo; prevouts; flags; wtxid;
-            txdata; err = None } :: acc
+            txdata; err = None; fault = None } :: acc
       in
       loop (j + 1) rest acc
   in
@@ -2251,7 +2301,9 @@ module Mempool_verify_pool = struct
     j_utxos : utxo option array;
     j_mutex : Mutex.t;
     j_cond : Condition.t;
-    mutable j_result : (unit, tx_validation_error) result option;
+    (* [Error exn]: the check did not complete (gate 6) -- re-raised on the
+       submitter, never reported as a script failure. *)
+    mutable j_result : ((unit, tx_validation_error) result, exn) result option;
   }
 
   type t = {
@@ -2282,12 +2334,11 @@ module Mempool_verify_pool = struct
         Mutex.unlock t.q_mutex;
         let r =
           try
-            verify_scripts_parallel_domain
-              ~use_pool:false
-              ~tx:job.j_tx ~flags:job.j_flags
-              ~prevouts:job.j_prevouts ~utxos:job.j_utxos ()
-          with e ->
-            Error (TxScriptFailed (-1, Printexc.to_string e))
+            Ok (verify_scripts_parallel_domain
+                  ~use_pool:false
+                  ~tx:job.j_tx ~flags:job.j_flags
+                  ~prevouts:job.j_prevouts ~utxos:job.j_utxos ())
+          with e -> Error e
         in
         Mutex.lock job.j_mutex;
         job.j_result <- Some r;
@@ -2337,7 +2388,7 @@ module Mempool_verify_pool = struct
     while job.j_result = None do Condition.wait job.j_cond job.j_mutex done;
     let r = match job.j_result with Some v -> v | None -> assert false in
     Mutex.unlock job.j_mutex;
-    r
+    match r with Ok v -> v | Error e -> raise e
 end
 
 (* Number of at-tip mempool-verify worker Domains.  0 ⇒ pool disabled ⇒

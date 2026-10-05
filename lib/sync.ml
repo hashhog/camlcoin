@@ -3580,6 +3580,20 @@ let create_ibd_state ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
    its LRU outlives the reorg and is read by later submitblock / IBD connects. *)
 let shared_utxo_set : Utxo.OptimizedUtxoSet.t option ref = ref None
 
+(* The mempool's and gettxout's coin reads (Utxo.UtxoSet.get) go through
+   the chain's coin view: [shared_utxo_set]'s cache (side-effect-free
+   [peek_mem]) over the store.  See [Utxo.UtxoSet.tip_view]. *)
+let () =
+  Atomic.set Utxo.UtxoSet.tip_view
+    (Some (fun txid vout ->
+       match !shared_utxo_set with
+       | None -> Utxo.UtxoSet.Tip_miss
+       | Some u ->
+         (match Utxo.OptimizedUtxoSet.peek_mem u txid vout with
+          | Utxo.OptimizedUtxoSet.Mem_hit e -> Utxo.UtxoSet.Tip_hit e
+          | Utxo.OptimizedUtxoSet.Mem_removed -> Utxo.UtxoSet.Tip_spent
+          | Utxo.OptimizedUtxoSet.Mem_miss -> Utxo.UtxoSet.Tip_miss)))
+
 (* ONE COIN VIEW for the at-tip connect paths (P0 2026-10-04, QUEUES
    camlcoin item 0).  [process_new_block] and the stored-block drain read
    coins from the store and commit with Storage.ChainDB.apply_block_atomic;

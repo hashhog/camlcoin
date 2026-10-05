@@ -83,18 +83,44 @@ module UtxoSet = struct
     Bytes.set buf 35 (Char.chr ((vout lsr 24) land 0xff));
     Bytes.unsafe_to_string buf
 
-  (* Get a UTXO entry, checking cache first then database *)
+  (* The chain's coin view over the store (Core CoinsTip()).  Registered
+     by [Sync] at module init over [Sync.shared_utxo_set]: the catch-up IBD
+     connects into that cache and flushes it to the store only every 500
+     blocks / at session end, so until then the STORE still holds coins
+     the active chain spent and lacks coins it created.  The readers of
+     this module — the mempool (Mempool.lookup_utxo / is_confirmed_utxo)
+     and the gettxout / RPC coin lookups — must see the chain, not the
+     store: reading the store accepted mempool txs spending coins the
+     chain had already spent (test/test_f0_mempool_tip_view.ml).  Core:
+     CCoinsViewMemPool sits on CoinsTip() and gettxout reads CoinsTip(),
+     the cache with its DIRTY-spent entries, never the bare DB. *)
+  type tip_answer = Tip_hit of utxo_entry | Tip_spent | Tip_miss
+
+  let tip_view : (Types.hash256 -> int -> tip_answer) option Atomic.t =
+    Atomic.make None
+
+  (* Get a UTXO entry: the chain's coin view first (a coin it holds as
+     spent is authoritative — no store fallback), then the store. *)
   let get (t : t) (txid : Types.hash256) (vout : int)
       : utxo_entry option =
-    (* Direct DB read — no in-process caching.  RocksDB's own block
-       cache handles hot-path reads. Eliminating the OCaml-side cache
-       prevents unbounded GC heap growth. *)
-    match Storage.ChainDB.get_utxo t.db txid vout with
-    | None -> None
-    | Some data ->
-      let r = Serialize.reader_of_cstruct
-        (Cstruct.of_string data) in
-      Some (deserialize_utxo_entry r)
+    let from_store () =
+      (* Direct DB read — no in-process caching.  RocksDB's own block
+         cache handles hot-path reads. Eliminating the OCaml-side cache
+         prevents unbounded GC heap growth. *)
+      match Storage.ChainDB.get_utxo t.db txid vout with
+      | None -> None
+      | Some data ->
+        let r = Serialize.reader_of_cstruct
+          (Cstruct.of_string data) in
+        Some (deserialize_utxo_entry r)
+    in
+    match Atomic.get tip_view with
+    | None -> from_store ()
+    | Some view ->
+      (match view txid vout with
+       | Tip_hit e -> Some e
+       | Tip_spent -> None
+       | Tip_miss -> from_store ())
 
   (* Add a UTXO entry to both cache and database (write-through) *)
   let add (t : t) (txid : Types.hash256) (vout : int)

@@ -4807,6 +4807,16 @@ let ibd_base_readers (ibd : ibd_state)
     let n = Array.length ops in
     let res : Validation.utxo option option array = Array.make n None in
     let need = Array.make n 0 in  (* 0 resolved, 1 db then raw, 2 raw *)
+    (* F0: the view's epoch BEFORE any probe.  The parallel store reads
+       below are installed by [note_db_result] only if no spend / at-tip
+       commit / flush touched the view meanwhile — the Lwt main thread runs
+       while this worker reads (receipts/arch-f6-f7-design-2026-10-05.md
+       §0; test/test_f0_coin_resurrection.ml). *)
+    let epoch0 =
+      match ibd.utxo_set with
+      | Some u -> Utxo.OptimizedUtxoSet.read_epoch u
+      | None -> 0
+    in
     (match ibd.utxo_set with
      | Some u ->
        Array.iteri (fun i (op : Types.outpoint) ->
@@ -4847,7 +4857,7 @@ let ibd_base_readers (ibd : ibd_state)
          match r with
          | Some r ->
            let op = ops.(i) in
-           Utxo.OptimizedUtxoSet.note_db_result u op.Types.txid
+           Utxo.OptimizedUtxoSet.note_db_result ~epoch:epoch0 u op.Types.txid
              (Int32.to_int op.Types.vout) r
          | None -> ()
        ) dbr

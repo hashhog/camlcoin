@@ -321,12 +321,34 @@ module OptimizedUtxoSet = struct
      - [`Removed]   spent, delete pending. *)
   type dirty_entry = [ `Added of utxo_entry | `Updated of utxo_entry | `Removed ]
 
+  (* ONE OWNER RULE (F0, receipts/arch-f6-f7-design-2026-10-05.md §0).
+     This set is shared by the catch-up IBD's Validation_worker domain
+     (get_mem / read_db / note_db_result / get_view for a block's inputs)
+     and the Lwt main thread (the at-tip connect paths' snapshot and
+     [forget], submitblock's [get_view] / [persist_dirty_atomic], the
+     catch-up's own add / remove / flush).  [lock] serialises every access
+     to [cache] / [dirty] / [stats]: Perf.LRU and Hashtbl are not
+     domain-safe, and a lookup racing a resize can miss a [`Removed]
+     tombstone, a promotion racing [forget] can lose the forget.
+
+     [epoch] makes populate-after-miss safe.  It is bumped (under [lock])
+     by every mutation of the view and by every writer that changed the
+     store under it ([forget] after an at-tip commit, [flush],
+     [persist_dirty_atomic], [clear_cache]).  A store read is installed in
+     the LRU only if the epoch it was started under is still current, so a
+     read that a spend or a commit raced is dropped instead of putting the
+     pre-spend coin back as CLEAN/unspent.  Core: CCoinsViewCache::FetchCoin
+     (coins.cpp) can never install a stale base read because cs_main is
+     held from the miss to the emplace; a spent entry stays DIRTY-spent
+     until BatchWrite and is never looked up in the base. *)
   type t = {
     db : Storage.ChainDB.t;
     rocksdb : Rocksdb_store.t option;
     cache : (string, utxo_entry) Perf.LRU.t;
     dirty : (string, dirty_entry) Hashtbl.t;
     mutable stats : Perf.utxo_cache_stats;
+    lock : Mutex.t;
+    mutable epoch : int;
   }
 
   let create ?(cache_size=0) ?rocksdb db = {
@@ -335,7 +357,19 @@ module OptimizedUtxoSet = struct
     cache = Perf.LRU.create cache_size;
     dirty = Hashtbl.create 10_000;
     stats = Perf.create_utxo_stats ();
+    lock = Mutex.create ();
+    epoch = 0;
   }
+
+  let locked t f = Mutex.protect t.lock f
+
+  (* Caller holds [lock]. *)
+  let bump t = t.epoch <- t.epoch + 1
+
+  (* The epoch a populate-after-miss read must carry to [note_db_result].
+     Take it BEFORE the [get_mem] that missed (or atomically with it, as
+     [get_mem_epoch] does). *)
+  let read_epoch t = locked t (fun () -> t.epoch)
 
   (* Create a cache key from txid and output index.
      Directly builds a 36-byte string without intermediate allocations. *)
@@ -347,47 +381,6 @@ module OptimizedUtxoSet = struct
     Bytes.set buf 34 (Char.chr ((vout lsr 16) land 0xff));
     Bytes.set buf 35 (Char.chr ((vout lsr 24) land 0xff));
     Bytes.unsafe_to_string buf
-
-  (* Get a UTXO entry: check LRU cache, then dirty set, then database *)
-  let get (t : t) (txid : Types.hash256) (vout : int)
-      : utxo_entry option =
-    let key = utxo_key txid vout in
-    t.stats.lookups <- t.stats.lookups + 1;
-    (* 1. Check LRU cache first *)
-    match Perf.LRU.get t.cache key with
-    | Some entry ->
-      t.stats.cache_hits <- t.stats.cache_hits + 1;
-      Some entry
-    | None ->
-      (* 2. Check dirty set - it may have entries not yet in cache
-             (e.g. evicted from LRU but not yet flushed) *)
-      match Hashtbl.find_opt t.dirty key with
-      | Some `Removed ->
-        (* Marked for deletion - does not exist *)
-        t.stats.misses <- t.stats.misses + 1;
-        None
-      | Some (`Added entry | `Updated entry) ->
-        (* In dirty set but evicted from LRU - re-add to cache *)
-        t.stats.cache_hits <- t.stats.cache_hits + 1;
-        Perf.LRU.put t.cache key entry;
-        Some entry
-      | None ->
-        (* 3. Fall through to database (RocksDB if available, else LogStorage) *)
-        let db_result = match t.rocksdb with
-          | Some rdb -> Rocksdb_store.get rdb key
-          | None -> Storage.ChainDB.get_utxo t.db txid vout
-        in
-        (match db_result with
-        | None ->
-          t.stats.misses <- t.stats.misses + 1;
-          None
-        | Some data ->
-          t.stats.db_hits <- t.stats.db_hits + 1;
-          let r = Serialize.reader_of_cstruct
-            (Cstruct.of_string data) in
-          let entry = deserialize_utxo_entry r in
-          Perf.LRU.put t.cache key entry;
-          Some entry)
 
   (* Split form of [get] for the batched block-input prefetch
      (Validation.validate_block_with_utxos ?prefetch_base).  Composes back to
@@ -403,7 +396,9 @@ module OptimizedUtxoSet = struct
      3's side effects serially afterwards. *)
   type mem_result = Mem_hit of utxo_entry | Mem_removed | Mem_miss
 
-  let get_mem (t : t) (txid : Types.hash256) (vout : int) : mem_result =
+  (* Caller holds [lock]. *)
+  let get_mem_unlocked (t : t) (txid : Types.hash256) (vout : int)
+      : mem_result =
     let key = utxo_key txid vout in
     t.stats.lookups <- t.stats.lookups + 1;
     match Perf.LRU.get t.cache key with
@@ -421,19 +416,32 @@ module OptimizedUtxoSet = struct
         Mem_hit entry
       | None -> Mem_miss
 
+  let get_mem (t : t) (txid : Types.hash256) (vout : int) : mem_result =
+    locked t (fun () -> get_mem_unlocked t txid vout)
+
+  (* [get_mem] and the epoch it answered under, in one critical section:
+     a [Mem_miss] read started under that epoch may be installed only if
+     no mutation intervened ([note_db_result ~epoch]). *)
+  let get_mem_epoch (t : t) (txid : Types.hash256) (vout : int)
+      : mem_result * int =
+    locked t (fun () ->
+      let r = get_mem_unlocked t txid vout in
+      (r, t.epoch))
+
   (* Steps 1-2 of [get] with NO side effects (no stats, no LRU promotion,
      no dirty re-add), so the at-tip connect paths can snapshot this
      cache's answers for a block's inputs without perturbing it.  The
      answer is the same as [get_mem]'s. *)
   let peek_mem (t : t) (txid : Types.hash256) (vout : int) : mem_result =
     let key = utxo_key txid vout in
-    match Perf.LRU.peek t.cache key with
-    | Some entry -> Mem_hit entry
-    | None ->
-      match Hashtbl.find_opt t.dirty key with
-      | Some `Removed -> Mem_removed
-      | Some (`Added entry | `Updated entry) -> Mem_hit entry
-      | None -> Mem_miss
+    locked t (fun () ->
+      match Perf.LRU.peek t.cache key with
+      | Some entry -> Mem_hit entry
+      | None ->
+        match Hashtbl.find_opt t.dirty key with
+        | Some `Removed -> Mem_removed
+        | Some (`Added entry | `Updated entry) -> Mem_hit entry
+        | None -> Mem_miss)
 
   (* Test-only interleaving point: called with the outpoint key right after
      [read_db]'s store read returned, on whichever domain did the read (the
@@ -456,13 +464,30 @@ module OptimizedUtxoSet = struct
       Some (deserialize_utxo_entry
               (Serialize.reader_of_cstruct (Cstruct.of_string data)))
 
-  let note_db_result (t : t) (txid : Types.hash256) (vout : int)
-      (r : utxo_entry option) : unit =
-    match r with
-    | None -> t.stats.misses <- t.stats.misses + 1
-    | Some entry ->
-      t.stats.db_hits <- t.stats.db_hits + 1;
-      Perf.LRU.put t.cache (utxo_key txid vout) entry
+  (* Replay a store read's side effects.  The coin is installed CLEAN in
+     the LRU only if the view's epoch is still the one the read started
+     under ([~epoch], from [read_epoch] / [get_mem_epoch] taken before the
+     miss).  Otherwise a spend, an at-tip commit ([forget]) or a flush ran
+     while the read was in flight and the result may be the PRE-spend
+     coin: drop it (the next lookup re-reads; dropping a fill is always
+     safe, installing a stale one is a double spend).  The CALLER's use of
+     [r] for the current lookup is unaffected: a verdict computed against a
+     view the tip moved under is discarded by the connect paths' tip
+     re-check. *)
+  let note_db_result ~(epoch : int) (t : t) (txid : Types.hash256)
+      (vout : int) (r : utxo_entry option) : unit =
+    locked t (fun () ->
+      match r with
+      | None -> t.stats.misses <- t.stats.misses + 1
+      | Some entry ->
+        t.stats.db_hits <- t.stats.db_hits + 1;
+        if epoch = t.epoch then begin
+          (* Belt and braces: a key the view holds (dirty or cached) is
+             never overwritten by a store read. *)
+          let key = utxo_key txid vout in
+          if not (Hashtbl.mem t.dirty key) && not (Perf.LRU.mem t.cache key)
+          then Perf.LRU.put t.cache key entry
+        end)
 
   (* [get] that keeps "spent in this cache" distinct from "not in this
      cache or the store".  Same reads and side effects as [get].  A
@@ -475,13 +500,21 @@ module OptimizedUtxoSet = struct
   type view_result = Coin_hit of utxo_entry | Coin_spent | Coin_miss
 
   let get_view (t : t) (txid : Types.hash256) (vout : int) : view_result =
-    match get_mem t txid vout with
-    | Mem_hit e -> Coin_hit e
-    | Mem_removed -> Coin_spent
-    | Mem_miss ->
+    match get_mem_epoch t txid vout with
+    | Mem_hit e, _ -> Coin_hit e
+    | Mem_removed, _ -> Coin_spent
+    | Mem_miss, epoch ->
       let r = read_db t txid vout in
-      note_db_result t txid vout r;
+      note_db_result ~epoch t txid vout r;
       (match r with Some e -> Coin_hit e | None -> Coin_miss)
+
+  (* Get a UTXO entry: LRU cache, then dirty set, then the store (the
+     store read installed under the epoch rule, see [note_db_result]). *)
+  let get (t : t) (txid : Types.hash256) (vout : int)
+      : utxo_entry option =
+    match get_view t txid vout with
+    | Coin_hit e -> Some e
+    | Coin_spent | Coin_miss -> None
 
   (* Add a UTXO entry to LRU cache and mark dirty. Does NOT write to disk.
      A capacity-0 cache (snapshot import) skips the LRU entirely: the
@@ -506,16 +539,18 @@ module OptimizedUtxoSet = struct
   let add ?(possible_overwrite = false) (t : t) (txid : Types.hash256)
       (vout : int) (entry : utxo_entry) : unit =
     let key = utxo_key txid vout in
-    let fresh =
-      match Hashtbl.find_opt t.dirty key with
-      | Some (`Added _) -> true
-      | Some (`Updated _ | `Removed) -> false
-      | None -> not possible_overwrite && not (Perf.LRU.mem t.cache key)
-    in
-    if Perf.LRU.capacity t.cache > 0 then
-      Perf.LRU.put t.cache key entry;
-    Hashtbl.replace t.dirty key
-      (if fresh then `Added entry else `Updated entry)
+    locked t (fun () ->
+      let fresh =
+        match Hashtbl.find_opt t.dirty key with
+        | Some (`Added _) -> true
+        | Some (`Updated _ | `Removed) -> false
+        | None -> not possible_overwrite && not (Perf.LRU.mem t.cache key)
+      in
+      if Perf.LRU.capacity t.cache > 0 then
+        Perf.LRU.put t.cache key entry;
+      Hashtbl.replace t.dirty key
+        (if fresh then `Added entry else `Updated entry);
+      bump t)
 
   (* Remove a UTXO entry. Marks as Removed in dirty set, removes from LRU.
      Does NOT delete from disk immediately.
@@ -523,29 +558,39 @@ module OptimizedUtxoSet = struct
   let remove (t : t) (txid : Types.hash256) (vout : int)
       : utxo_entry option =
     let key = utxo_key txid vout in
-    (* Try to find existing entry: LRU cache, dirty set, then DB *)
-    let existing =
-      match Perf.LRU.get t.cache key with
-      | Some entry -> Some entry
-      | None ->
-        match Hashtbl.find_opt t.dirty key with
-        | Some (`Added entry | `Updated entry) -> Some entry
-        | Some `Removed -> None
-        | None ->
-          let db_result = match t.rocksdb with
-            | Some rdb -> Rocksdb_store.get rdb key
-            | None -> Storage.ChainDB.get_utxo t.db txid vout
-          in
-          (match db_result with
-          | None -> None
-          | Some data ->
-            let r = Serialize.reader_of_cstruct
-              (Cstruct.of_string data) in
-            Some (deserialize_utxo_entry r))
+    (* Try to find existing entry: LRU cache, dirty set, then DB.  The
+       tombstone is recorded in the same critical section as the cache
+       probe; the store read for the return value (a coin not cached) runs
+       after it, outside the lock, and installs nothing. *)
+    let cached =
+      locked t (fun () ->
+        let c =
+          match Perf.LRU.get t.cache key with
+          | Some entry -> `Found (Some entry)
+          | None ->
+            match Hashtbl.find_opt t.dirty key with
+            | Some (`Added entry | `Updated entry) -> `Found (Some entry)
+            | Some `Removed -> `Found None
+            | None -> `Store
+        in
+        Perf.LRU.remove t.cache key;
+        Hashtbl.replace t.dirty key `Removed;
+        bump t;
+        c)
     in
-    Perf.LRU.remove t.cache key;
-    Hashtbl.replace t.dirty key `Removed;
-    existing
+    match cached with
+    | `Found e -> e
+    | `Store ->
+      let db_result = match t.rocksdb with
+        | Some rdb -> Rocksdb_store.get rdb key
+        | None -> Storage.ChainDB.get_utxo t.db txid vout
+      in
+      (match db_result with
+       | None -> None
+       | Some data ->
+         let r = Serialize.reader_of_cstruct
+           (Cstruct.of_string data) in
+         Some (deserialize_utxo_entry r))
 
   (* Fast remove: mark as Removed without looking up the old entry.
      Used during IBD when the caller discards the return value.
@@ -555,14 +600,16 @@ module OptimizedUtxoSet = struct
      [`Updated] entry may be on disk, so it must record the deletion. *)
   let remove_fast (t : t) (txid : Types.hash256) (vout : int) : unit =
     let key = utxo_key txid vout in
-    Perf.LRU.remove t.cache key;
-    match Hashtbl.find_opt t.dirty key with
-    | Some (`Added _) ->
-      (* FRESH: created and spent in same flush window — just remove both *)
-      Hashtbl.remove t.dirty key
-    | Some (`Updated _ | `Removed) | None ->
-      (* Possibly on disk — must record deletion *)
-      Hashtbl.replace t.dirty key `Removed
+    locked t (fun () ->
+      Perf.LRU.remove t.cache key;
+      (match Hashtbl.find_opt t.dirty key with
+       | Some (`Added _) ->
+         (* FRESH: created and spent in same flush window — just remove both *)
+         Hashtbl.remove t.dirty key
+       | Some (`Updated _ | `Removed) | None ->
+         (* Possibly on disk — must record deletion *)
+         Hashtbl.replace t.dirty key `Removed);
+      bump t)
 
   (* Drop any cached copy (LRU and dirty) of one outpoint, so the next read
      goes to the on-disk store.  Used by [Sync.reorganize], which writes the
@@ -578,23 +625,35 @@ module OptimizedUtxoSet = struct
      pending [`Added]/[`Updated] for a coin the block spent would otherwise
      re-put it at the next flush, a pending [`Removed] for a coin it
      created would delete it. *)
+  (* The epoch bump is what keeps a store read that started BEFORE the
+     caller's store write from installing the pre-write coin after this
+     forget (F0): every direct store writer calls [forget] for each key it
+     wrote, after the write. *)
   let forget (t : t) (txid : Types.hash256) (vout : int) : unit =
     let key = utxo_key txid vout in
-    Perf.LRU.remove t.cache key;
-    Hashtbl.remove t.dirty key
+    locked t (fun () ->
+      Perf.LRU.remove t.cache key;
+      Hashtbl.remove t.dirty key;
+      bump t)
 
   (* Check if a UTXO exists *)
   let exists (t : t) (txid : Types.hash256) (vout : int) : bool =
     let key = utxo_key txid vout in
-    if Perf.LRU.mem t.cache key then true
-    else
-      match Hashtbl.find_opt t.dirty key with
-      | Some `Removed -> false
-      | Some (`Added _ | `Updated _) -> true
-      | None ->
-        (match t.rocksdb with
-         | Some rdb -> Option.is_some (Rocksdb_store.get rdb key)
-         | None -> Option.is_some (Storage.ChainDB.get_utxo t.db txid vout))
+    let mem =
+      locked t (fun () ->
+        if Perf.LRU.mem t.cache key then Some true
+        else
+          match Hashtbl.find_opt t.dirty key with
+          | Some `Removed -> Some false
+          | Some (`Added _ | `Updated _) -> Some true
+          | None -> None)
+    in
+    match mem with
+    | Some b -> b
+    | None ->
+      (match t.rocksdb with
+       | Some rdb -> Option.is_some (Rocksdb_store.get rdb key)
+       | None -> Option.is_some (Storage.ChainDB.get_utxo t.db txid vout))
 
   (* Flush all dirty entries to disk in a single atomic batch transaction.
      This writes all Added entries and deletes all Removed entries, then
@@ -602,6 +661,7 @@ module OptimizedUtxoSet = struct
      When [tip_height] is provided, also stores it in RocksDB so that
      startup can detect a chainstate / UTXO store mismatch. *)
   let flush ?(tip_height : int option) (t : t) : unit =
+    locked t @@ fun () ->
     let count = Hashtbl.length t.dirty in
     if count > 0 || tip_height <> None then begin
       (match t.rocksdb with
@@ -677,6 +737,7 @@ module OptimizedUtxoSet = struct
          ) t.dirty;
          Storage.ChainDB.batch_write t.db batch);
       Hashtbl.clear t.dirty;
+      bump t;
       if count > 0 then
         Logs.debug (fun m -> m "Flushed %d dirty UTXO entries to disk" count)
     end
@@ -700,6 +761,7 @@ module OptimizedUtxoSet = struct
       ~(tip_hash : Types.hash256) ~(tip_height : int)
       ~(header_tip_hash : Types.hash256) ~(header_tip_height : int)
       : unit =
+    locked t @@ fun () ->
     let ops : (Types.hash256 * int * [ `Add of string | `Del ]) list ref =
       ref [] in
     Hashtbl.iter (fun key entry ->
@@ -719,7 +781,8 @@ module OptimizedUtxoSet = struct
       ~tip_hash ~tip_height
       ~header_tip_hash ~header_tip_height
       !ops;
-    Hashtbl.clear t.dirty
+    Hashtbl.clear t.dirty;
+    bump t
 
   (* The on-disk coin store [get] / [read_db] read: Rocksdb_store when one
      is attached (every production node -- cli.ml wires it), else the CF.
@@ -843,6 +906,7 @@ module OptimizedUtxoSet = struct
   }
 
   let capture_view (t : t) : view =
+    locked t @@ fun () ->
     { v_dirty = Hashtbl.copy t.dirty;
       v_base =
         (match t.rocksdb with
@@ -884,9 +948,11 @@ module OptimizedUtxoSet = struct
   (* Clear the in-memory cache and dirty set.
      WARNING: Unflushed dirty entries will be lost! Call flush first. *)
   let clear_cache t =
-    Perf.LRU.clear t.cache;
-    Hashtbl.clear t.dirty;
-    t.stats <- Perf.create_utxo_stats ()
+    locked t (fun () ->
+      Perf.LRU.clear t.cache;
+      Hashtbl.clear t.dirty;
+      t.stats <- Perf.create_utxo_stats ();
+      bump t)
 end
 
 (* Read-only walk of the committed UTXO set.  When [cache] is [Some],

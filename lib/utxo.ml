@@ -435,12 +435,21 @@ module OptimizedUtxoSet = struct
       | Some (`Added entry | `Updated entry) -> Mem_hit entry
       | None -> Mem_miss
 
+  (* Test-only interleaving point: called with the outpoint key right after
+     [read_db]'s store read returned, on whichever domain did the read (the
+     validation worker / prefetch domains).  Production never sets it.  A
+     test parks the reader here to commit a block on the main thread in the
+     window between a populate-after-miss read and its install
+     (test/test_f0_coin_resurrection.ml). *)
+  let after_db_read_hook : (string -> unit) Atomic.t = Atomic.make (fun _ -> ())
+
   let read_db (t : t) (txid : Types.hash256) (vout : int)
       : utxo_entry option =
     let db_result = match t.rocksdb with
       | Some rdb -> Rocksdb_store.get rdb (utxo_key txid vout)
       | None -> Storage.ChainDB.get_utxo t.db txid vout
     in
+    (Atomic.get after_db_read_hook) (utxo_key txid vout);
     match db_result with
     | None -> None
     | Some data ->

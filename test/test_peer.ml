@@ -730,7 +730,11 @@ let test_inv_batching () =
 
 (* Test max 1000 items per flush *)
 let test_inv_batch_max_1000 () =
-  let fd = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  (* A connected socketpair (the 36 KB inv fits its buffer): a send that
+     FAILS now disconnects the peer (Peer.send_encoded), so an unconnected
+     socket would leave nothing Ready for the second flush. *)
+  let (a, _b) = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let fd = Lwt_unix.of_unix_file_descr ~blocking:false a in
   let peer = Peer.make_peer ~network:Consensus.mainnet ~addr:"127.0.0.1"
     ~port:8333 ~id:0 ~direction:Peer.Outbound ~fd () in
   peer.state <- Peer.Ready;

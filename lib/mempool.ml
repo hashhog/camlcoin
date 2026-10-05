@@ -414,10 +414,18 @@ let lookup_utxo (mp : mempool) (outpoint : Types.outpoint)
       let vout = Int32.to_int outpoint.vout in
       if vout < List.length parent_entry.tx.outputs then begin
         let out = List.nth parent_entry.tx.outputs vout in
+        (* An unconfirmed coin counts at height tip+1 — the earliest block
+           that could include it.  Core: CCoinsViewMemPool marks such coins
+           MEMPOOL_HEIGHT and CalculateLockPointsAtTip
+           (validation.cpp ~207-215) replaces that with tip->nHeight + 1
+           before CheckSequenceLocksAtTip.  Using the tip height here made a
+           child with a relative height lock of N spendable one block early
+           (accepted at tip+N instead of tip+N+1) — and the child could then
+           reach a block template that is invalid. *)
         Some {
           Utxo.value = out.Types.value;
           script_pubkey = out.script_pubkey;
-          height = mp.current_height;
+          height = mp.current_height + 1;
           is_coinbase = false;
         }
       end else None

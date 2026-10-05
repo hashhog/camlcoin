@@ -322,3 +322,11 @@
  (name bench_script_verify)
  (modules bench_script_verify)
  (libraries camlcoin))
+
+; BIP68 relative height locks on coins from a MEMPOOL parent count at tip+1
+; (Core CalculateLockPointsAtTip).  Drives the real Mempool.add_transaction;
+; controls: lock 0, coins confirmed at the tip, parent confirmed.
+(test
+ (name test_bip68_mempool_parent)
+ (modules test_bip68_mempool_parent)
+ (libraries camlcoin test_tmp alcotest cstruct unix))

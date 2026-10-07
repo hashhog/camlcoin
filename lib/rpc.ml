@@ -11681,7 +11681,7 @@ let handle_dumptxoutset (_ctx : rpc_context)
            Error (Printf.sprintf "rollback failed: pre-rollback flush: %s" e)
          | Ok () ->
         match
-           (try Sync.disconnect_to_target _ctx.chain target
+           (try Sync.disconnect_to_target ~from_validated_tip:true _ctx.chain target
             with e -> Error (Printexc.to_string e))
          with
          | Error e ->

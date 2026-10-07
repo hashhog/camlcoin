@@ -581,6 +581,32 @@ let test_dump_rollback_race () =
       Alcotest.(check bool) "coin set == reference set at the final tip" true
         (set_hash live = set_hash ref_tip)))
 
+(* Headers ahead of blocks (routine at tip: a cmpctblock announces its
+   header first).  Core rolls back the ACTIVE chain; the rollback must not
+   try to disconnect blocks that were never connected. *)
+let test_dump_rollback_headers_ahead () =
+  with_fx ~label:"cl_dump_hdr" ~cache:10_000 (fun fx ->
+    for h = 102 to 105 do connect_now fx (build fx ~tag:1 h []) done;
+    let b106 = build fx ~tag:1 106 [] in
+    (match Sync.validate_header fx.state b106.Types.header with
+     | Ok e -> Sync.accept_header fx.state e
+     | Error e -> Alcotest.failf "header 106: %s" e);
+    Test_tmp.with_dir ~label:"cl_dumpfile2" ~mkdir:true (fun dir ->
+      let path = Filename.concat dir "utxo.dat" in
+      let r = Lwt_main.run (Rpc.handle_single_request_lwt fx.ctx
+                (json_req "dumptxoutset" [ `String path; `String "";
+                   `Assoc [ ("rollback", `Int 103) ] ])) in
+      let s = show_resp r in
+      Printf.printf "  headers ahead (hdr 106, blocks 105): %s\n  tip after: %d\n%!"
+        (if String.length s > 200 then String.sub s 0 200 else s)
+        fx.state.Sync.blocks_synced;
+      let ok = match r with
+        | `Assoc fs -> (match List.assoc_opt "result" fs with
+            | Some (`Assoc _) -> true | _ -> false)
+        | _ -> false in
+      Alcotest.(check bool) "rollback dump succeeds" true ok;
+      Alcotest.(check int) "tip restored to 105" 105 fx.state.Sync.blocks_synced))
+
 (* Every connect path honours the NetworkDisable flag (deterministic: the
    flag is set directly, no race).  Core: network activity is disabled
    for the whole rollback, so no block connects. *)
@@ -670,6 +696,8 @@ let () =
     "CC-1b dumptxoutset rollback", [
       Alcotest.test_case "P2P block mid-rollback" `Quick
         test_dump_rollback_race;
+      Alcotest.test_case "rollback with headers ahead of blocks" `Quick
+        test_dump_rollback_headers_ahead;
       Alcotest.test_case "every connect path honours the pause" `Quick
         test_pause_honoured;
     ];

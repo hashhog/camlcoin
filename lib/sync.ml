@@ -5542,14 +5542,21 @@ let block_disconnect_ops (block : Types.block) (undo : Utxo.undo_data)
    ([src/rpc/blockchain.cpp:3157]). The caller is responsible for
    re-applying the chain afterwards (e.g. via [reorganize new_tip])
    if it does not want to leave the chainstate at [target]. *)
-let disconnect_to_target (state : chain_state) (target : header_entry)
+let disconnect_to_target ?(from_validated_tip = false)
+    (state : chain_state) (target : header_entry)
     : (unit, string) result =
-  (* Disconnect from the ACTIVE validated tip (Core DisconnectTip walks
-     m_chain), not the best-work header: with headers ahead of blocks --
-     routine at tip, a cmpctblock announces its header first -- walking from
-     [state.tip] tried to disconnect blocks that were never connected
-     ("Missing block ... during rollback disconnect"). *)
-  match (match block_tip state with Some _ as t -> t | None -> state.tip) with
+  (* [~from_validated_tip:true] (dumptxoutset rollback): disconnect from the
+     ACTIVE validated tip (Core DisconnectTip walks m_chain), not the
+     best-work header: with headers ahead of blocks -- routine at tip, a
+     cmpctblock announces its header first -- walking from [state.tip]
+     tried to disconnect blocks that were never connected ("Missing block
+     ... during rollback disconnect").  The invalidate_block fallback keeps
+     its header-tip walk (test_w101 G11 pins it). *)
+  let current =
+    if from_validated_tip then
+      (match block_tip state with Some _ as t -> t | None -> state.tip)
+    else state.tip in
+  match current with
   | None -> Error "No current tip"
   | Some current_tip when current_tip.height < target.height ->
     Error (Printf.sprintf

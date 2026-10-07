@@ -345,3 +345,11 @@
  (name test_send_stall_no_wedge)
  (modules test_send_stall_no_wedge)
  (libraries camlcoin alcotest lwt lwt.unix cstruct unix))
+
+; RPC latency under a sync-connect loop (chain-lock receipt instrument).
+; Not part of the default run:
+;   dune exec --no-buffer test/bench_rpc_latency.exe -- [blocks] [txs/block]
+(executable
+ (name bench_rpc_latency)
+ (modules bench_rpc_latency)
+ (libraries camlcoin test_tmp lwt lwt.unix unix))

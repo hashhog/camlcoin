@@ -121,6 +121,9 @@ let rpc_lwt_mutex = Lwt_mutex.create ()
    Read-only methods stay on the pool (a slow read must not stall the loop).
    dumptxoutset stays on the pool too -- its walk takes minutes -- and hands
    its chain mutations (pause + rollback, restore) to the main thread itself.
+   scrubunspendable stays on the pool: it walks the whole coin set and only
+   deletes provably-unspendable records, which no connect path reads or
+   writes (AddCoin skips them) and which carry no tip marker.
    Long wallet rescans (rescanblockchain, import* with rescan) are on the
    main thread for correctness: the block-connect wallet hook mutates the
    same wallet there; see the receipt's open items. *)
@@ -128,7 +131,7 @@ let is_chain_writer_rpc = function
   (* chain *)
   | "submitblock" | "submitheader" | "generate" | "generatetoaddress"
   | "generateblock" | "invalidateblock" | "reconsiderblock" | "preciousblock"
-  | "pruneblockchain" | "loadtxoutset" | "scrubunspendable"
+  | "pruneblockchain" | "loadtxoutset"
   (* mempool (ATMP under cs_main; GBT reads mempool + tip as one view) *)
   | "sendrawtransaction" | "submitpackage" | "testmempoolaccept"
   | "prioritisetransaction" | "loadmempool" | "importmempool"

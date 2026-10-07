@@ -4258,6 +4258,54 @@ let flush_utxos (ibd : ibd_state) : unit =
       Utxo.OptimizedUtxoSet.flush ~tip_height:ibd.chain.blocks_synced utxo)
   | None -> ()
 
+(* The catch-up session that last connected a block through the coin
+   cache; its coin changes (the shared cache's dirty set and, on the
+   scripts-on path, its pending lists) may still be unflushed. *)
+let unflushed_catchup : ibd_state option ref = ref None
+
+(* CC-3 (audit 2026-10-07): a durable best-block marker must never be
+   ahead of the coins.  Catch-up keeps up to [utxo_flush_interval] blocks
+   of coin changes in memory and writes coins + chain_tip together; the
+   at-tip paths (process_new_block -- BlockMsg / cmpctblock / blocktxn --,
+   the stored-block drain, submitblock, reorganize) commit their block with
+   tip=H+1 in both stores.  Run during an unflushed catch-up window, that
+   made tip H+1 durable over coins of the last flush F < H: after a kill -9
+   the node booted at H+1 with blocks F+1..H's spends undone and outputs
+   missing -- it accepted a block re-spending a spent coin and rejected a
+   valid one (test/test_cc3_tip_durability.exe).  It also left the
+   session's pending lists to re-put, at its next flush, coins the at-tip
+   block had spent.
+
+   Core: one CCoinsViewCache; FlushStateToDisk writes the coins, then
+   DB_BEST_BLOCK (CCoinsViewDB::BatchWrite, txdb.cpp).  Here: before any
+   tip commit, flush every unflushed coin change at the CURRENT validated
+   tip and mark that tip durable; the block's own commit then moves both
+   from H to H+1.  A crash between the two leaves a consistent H.  Main
+   thread only (every caller is a connect path). *)
+let flush_coins_before_tip_commit (state : chain_state) : unit =
+  let pending = match !unflushed_catchup with
+    | Some ibd ->
+      ibd.pending_utxo_updates <> [] || ibd.pending_utxo_deletes <> []
+    | None -> false in
+  let dirty = match !shared_utxo_set with
+    | Some u -> Utxo.OptimizedUtxoSet.dirty_count u > 0
+    | None -> false in
+  if pending || dirty then begin
+    (match !unflushed_catchup with
+     | Some ibd -> flush_utxos ibd; ibd.blocks_since_flush <- 0
+     | None -> ());
+    (match !shared_utxo_set with
+     | Some u when Utxo.OptimizedUtxoSet.dirty_count u > 0 ->
+       Fatal.run_write ~what:"pre-commit coin flush" (fun () ->
+         Utxo.OptimizedUtxoSet.flush ~tip_height:state.blocks_synced u)
+     | _ -> ());
+    match validated_tip_hash state with
+    | Some h ->
+      Fatal.run_write ~what:"pre-commit chain tip" (fun () ->
+        Storage.ChainDB.set_chain_tip state.db h state.blocks_synced)
+    | None -> ()
+  end
+
 (* Encode UTXO data for storage *)
 let encode_utxo (value : int64) (script : Cstruct.t) (height : int)
     (is_coinbase : bool) : string =
@@ -5209,6 +5257,8 @@ let process_downloaded_blocks ?(max_blocks = 1)
            entry.download_state <- Validated;
            ibd.next_process_height <- ibd.next_process_height + 1;
            ibd.chain.blocks_synced <- height;
+           (* This session now holds unflushed coin changes (CC-3). *)
+           unflushed_catchup := Some ibd;
            (* Write the active-chain height->hash index for this connected block
               (Core ConnectTip -> CChain::SetTip, chain.cpp:16).  The IBD
               download-connect path advanced blocks_synced + the UTXO set but
@@ -7289,6 +7339,8 @@ let reorganize ?(allow_equal_work = false)
            CoinsTip, which already holds every unflushed change). *)
         (* Gate 6: a failed pre-reorg flush must not let the reorg run
            against a stale disk (retry once, then AbortNode). *)
+        (* CC-3: the catch-up session's pending lists too, and the marker. *)
+        flush_coins_before_tip_commit state;
         (match reorg_utxo_set ibd with
          | Some u when Utxo.OptimizedUtxoSet.dirty_count u > 0 ->
            Fatal.run_write ~what:"pre-reorg UTXO flush" (fun () ->
@@ -7875,6 +7927,9 @@ let run_ibd ?(shutdown_flag : bool ref option)
       end else begin
       (* Flush any remaining UTXO updates *)
       flush_utxos ibd;
+      (match !unflushed_catchup with
+       | Some i when i == ibd -> unflushed_catchup := None
+       | _ -> ());
       (* Update chain tip *)
       (match get_header_at_height ibd.chain ibd.chain.blocks_synced with
        | Some entry ->
@@ -8663,6 +8718,8 @@ let rec connect_stored_blocks
              missing -> "missing inputs" verdict, marked + peer punished. *)
           let new_tip = header_tip_after_block_connect state.tip entry in
           let hdr_tip = match new_tip with Some t -> t | None -> entry in
+          (* CC-3: catch-up's unflushed coins become durable first. *)
+          flush_coins_before_tip_commit state;
           Fatal.run_write ~what:"chainstate commit (gap-fill drain)" (fun () ->
             Storage.ChainDB.apply_block_atomic state.db
               ~tip_hash:entry.hash ~tip_height:next_height
@@ -9022,6 +9079,8 @@ let process_new_block ?(f_requested = false)
              AbortNode -- the exception leaves this block unjudged. *)
           let new_tip = header_tip_after_block_connect state.tip entry in
           let hdr_tip = match new_tip with Some t -> t | None -> entry in
+          (* CC-3: catch-up's unflushed coins become durable first. *)
+          flush_coins_before_tip_commit state;
           Fatal.run_write ~what:"chainstate commit (block connect)" (fun () ->
             Storage.ChainDB.apply_block_atomic state.db
               ~tip_hash:hash ~tip_height:height

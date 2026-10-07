@@ -1024,6 +1024,9 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
                   Fatal.abort_node msg;
                   raise (Fatal.System_fault msg)
               in
+              (* CC-3: unflushed catch-up coins become durable at the current
+                 tip before this block's dirty set is committed with tip H. *)
+              Sync.flush_coins_before_tip_commit chain;
               (match torn "connect" (fun () ->
                        Utxo.connect_block_optimized ~network_type utxo_set block height) with
                | Ok undo -> torn "commit" (fun () ->

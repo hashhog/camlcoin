@@ -4970,7 +4970,12 @@ let process_downloaded_blocks ?(max_blocks = 1)
     end else
     if not !continue || !error <> None || !processed >= max_blocks then
       Lwt.return_unit
-    else
+    else if ibd.chain.block_submission_paused then begin
+      (* NetworkDisable (dumptxoutset rollback): nothing connects; the
+         block stays Downloaded and is processed after the pause. *)
+      continue := false;
+      Lwt.return_unit
+    end else
     match queue_find_by_height ibd ibd.next_process_height with
     | Some entry -> begin
       match entry.download_state with
@@ -5077,6 +5082,12 @@ let process_downloaded_blocks ?(max_blocks = 1)
            that is no longer the parent's: it is neither a connect nor a
            verdict.  Core holds cs_main across ConnectBlock, so it never
            sees this. *)
+        if ibd.chain.block_submission_paused then begin
+          (* A NetworkDisable pause began during the await: not a verdict,
+             nothing applied; the block stays Downloaded. *)
+          continue := false;
+          Lwt.return_unit
+        end else
         if not (block_extends_validated_tip ibd.chain ~height
                   ~prev:block.header.prev_block) then begin
           if block_on_active_chain ibd.chain ~hash:entry.hash ~height then begin
@@ -5533,7 +5544,12 @@ let block_disconnect_ops (block : Types.block) (undo : Utxo.undo_data)
    if it does not want to leave the chainstate at [target]. *)
 let disconnect_to_target (state : chain_state) (target : header_entry)
     : (unit, string) result =
-  match state.tip with
+  (* Disconnect from the ACTIVE validated tip (Core DisconnectTip walks
+     m_chain), not the best-work header: with headers ahead of blocks --
+     routine at tip, a cmpctblock announces its header first -- walking from
+     [state.tip] tried to disconnect blocks that were never connected
+     ("Missing block ... during rollback disconnect"). *)
+  match (match block_tip state with Some _ as t -> t | None -> state.tip) with
   | None -> Error "No current tip"
   | Some current_tip when current_tip.height < target.height ->
     Error (Printf.sprintf
@@ -8499,6 +8515,8 @@ let store_block_undo_data
 let rec maybe_activate_best_chain
     ?(on_block_failed : (header_entry -> unit) option)
     (state : chain_state) : bool =
+  (* NetworkDisable (dumptxoutset rollback): no reorg while paused. *)
+  if state.block_submission_paused then false else
   match block_tip state, state.tip with
   | Some validated, Some best_hdr ->
     (* Cheap gate: only a best-header chain that strictly out-works the
@@ -8580,6 +8598,9 @@ let rec connect_stored_blocks
     (state : chain_state) : int =
   (* Gate 6: after AbortNode nothing connects. *)
   if Fatal.is_latched () then 0 else
+  (* NetworkDisable (dumptxoutset rollback, CC-1b): nothing connects while
+     paused; the drain runs again when the pause lifts. *)
+  if state.block_submission_paused then 0 else
   let next_height = state.blocks_synced + 1 in
   (* Best-HEADER chain, not the active height index. The index has no rows
      above blocks_synced (fecf534), so get_header_at_height returns None
@@ -8863,7 +8884,14 @@ let process_new_block ?(f_requested = false)
       let f_too_far_ahead = height > state.blocks_synced + min_blocks_to_keep in
       if (not f_requested) && f_too_far_ahead then
         Lwt.return (Error "too-far-ahead")
-      else
+      else if state.block_submission_paused then begin
+        (* NetworkDisable (dumptxoutset rollback, CC-1b; Core disables the
+           network for the whole TemporaryRollback).  Keep the body so the
+           drain connects it when the pause lifts; judge nothing now. *)
+        Storage.ChainDB.store_block state.db hash block;
+        note_block_source hash peer_id;
+        Lwt.return (Error "block-submission-paused")
+      end else
       (* Only connect blocks that extend the current BLOCK tip (see
          `chain_state` comment on why `state.tip` is not used here). *)
       let connects_to_tip =
@@ -8997,6 +9025,13 @@ let process_new_block ?(f_requested = false)
            result computed against a coin view that is not this block's
            parent is not a verdict: Core holds cs_main across ConnectBlock
            and asserts hashPrevBlock == view.GetBestBlock(). *)
+        if state.block_submission_paused then begin
+          (* A NetworkDisable pause began during the await: not a verdict.
+             Keep the body for the post-pause drain. *)
+          Storage.ChainDB.store_block state.db hash block;
+          note_block_source hash peer_id;
+          Lwt.return (Error "block-submission-paused")
+        end else
         if not (block_extends_validated_tip state ~height
                   ~prev:block.header.prev_block) then begin
           if block_on_active_chain state ~hash ~height then begin

@@ -742,6 +742,9 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
   (* Gate 6: after AbortNode nothing connects (rpc.ml answers -25). *)
   if Fatal.is_latched () then
     Error (Fatal.rpc_prefix ^ "node halted: " ^ Fatal.reason ())
+  else if chain.Sync.block_submission_paused then
+    (* NetworkDisable (dumptxoutset rollback): nothing connects. *)
+    Error "block submission paused (dumptxoutset rollback in progress)"
   else
   let hash = Crypto.compute_block_hash block.header in
 

@@ -2657,6 +2657,9 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   in
   let ensure_catchup_ibd () =
     match chain.tip with
+    | Some _ when chain.Sync.block_submission_paused ->
+      (* NetworkDisable (dumptxoutset rollback): start nothing. *)
+      ()
     | Some t when Sync.should_start_catchup_ibd
                     ~ibd_running:(!ibd_state_ref <> None || !catchup_ibd_launching)
                     ~already_started:!catchup_ibd_started
@@ -2989,7 +2992,8 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
              base). The 16-block at-tip fill below is the post-IBD recovery
              path (the 2026-08-17 2.9-day stall). *)
           ensure_catchup_ibd ();
-          if !ibd_state_ref = None && header_tip_height > block_height then begin
+          if !ibd_state_ref = None && header_tip_height > block_height
+             && not chain.Sync.block_submission_paused then begin
             match get_download_peers () with
             | [] ->
               (match get_peers () with

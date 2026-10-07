@@ -11600,191 +11600,216 @@ let handle_dumptxoutset (_ctx : rpc_context)
                "%s already exists. If you are sure this is what you want, \
                 move it out of the way first." path)
     else
-    match parse_dumptxoutset_target _ctx snapshot_type options with
-    | Error e -> Error e
-    | Ok target_opt ->
+    (* CC-1b (audit 2026-10-07): this handler runs on an RPC pool thread
+       for the whole dump.  Everything that READS-THEN-MUTATES the chain --
+       the target resolution, NetworkDisable, the rollback, the capture of
+       the dumped view with its base label, and the restore -- runs on the
+       Lwt main thread ([Main_thread.run], the cs_main equivalent), so no
+       connect path can interleave with it.  Only the walk runs here, on a
+       frozen view (latest: a RocksDB snapshot + a copy of the dirty set;
+       rollback: the coin CF, which nothing writes while the pause holds:
+       every connect path honours [block_submission_paused]).
+
+       Before this the rollback ran on this thread while P2P kept
+       connecting: a block connected mid-rollback kept its coin changes
+       while disconnect_to_target's tip write erased it, the dump labelled
+       "rollback height" carried that block's coins, and on re-delivery the
+       block was judged against its own spends and MARKED INVALID
+       (test/test_chain_lock.exe).  Core: NetworkDisable + TemporaryRollback
+       (rpc/blockchain.cpp dumptxoutset), InvalidateBlock under cs_main. *)
+    let begin_step () =
+      match parse_dumptxoutset_target _ctx snapshot_type options with
+      | Error e -> Error e
+      | Ok target_opt ->
       (* Core: [tip = chainman.ActiveChain().Tip()] — the ACTIVE VALIDATED
          chain tip (blockchain.cpp:3112), which is what "latest" dumps
          ([target_index = tip], blockchain.cpp:3126-3127) and what the
          "do we need to roll back at all?" test compares against
          (blockchain.cpp:3161).  NOT [_ctx.chain.tip], the best-work HEADER
-         entry — see the "NOTE on `tip` semantics" at sync.ml:118 and the
-         same correction already made in [handle_getbestblockhash] and in
-         loadtxoutset's work comparison. *)
+         entry — see the "NOTE on `tip` semantics" at sync.ml:118. *)
       let original_tip = Sync.block_tip _ctx.chain in
-      (* Pruned-mode pre-check (Bitcoin Core
-         [rpc/blockchain.cpp:dumptxoutset]):
-             if (IsPruneMode() &&
-                 target_index->nHeight <
-                 m_blockman.GetFirstBlock()->nHeight)
-                 throw "Block height N not available (pruned data).
-                        Use a height after M.";
-         Camlcoin tracks the prune horizon via [chain.prune_height]
-         (see [handle_getblockchaininfo]), populated by the storage prune
-         sweep. We fail fast so a pruned datadir does not begin a
-         disconnect that is guaranteed to fail when undo data is missing. *)
-      let prune_check : (unit, string) result =
-        match target_opt with
-        | Some target
-          when _ctx.chain.prune_target > 0
-            && target.height < _ctx.chain.prune_height ->
-          Error (Printf.sprintf
-                   "Block height %d not available (pruned data). \
-                    Use a height after %d."
-                   target.height (_ctx.chain.prune_height - 1))
-        | _ -> Ok ()
-      in
-      match prune_check with
-      | Error msg -> Error msg
-      | Ok () ->
-      (* NetworkDisable RAII (Bitcoin Core
-         [src/rpc/blockchain.cpp::NetworkDisable] around
-         [TemporaryRollback]). Pause inbound block acceptance for the
-         duration of the rewind→dump→replay dance and restore on every
-         exit path. We only activate when there's actual rewind work
-         (a "latest" dump doesn't need the gate). Restoration is wrapped
-         in [finally_restore_pause] so a partway-through error does not
-         strand the flag set. *)
-      let pause_active =
+      (* Pruned-mode pre-check (Bitcoin Core [rpc/blockchain.cpp:dumptxoutset]):
+         fail fast so a pruned datadir does not begin a disconnect that is
+         guaranteed to fail when undo data is missing. *)
+      match target_opt with
+      | Some target
+        when _ctx.chain.prune_target > 0
+          && target.height < _ctx.chain.prune_height ->
+        Error (Printf.sprintf
+                 "Block height %d not available (pruned data). \
+                  Use a height after %d."
+                 target.height (_ctx.chain.prune_height - 1))
+      | _ ->
+      (* NetworkDisable (Core [NetworkDisable] RAII around
+         [TemporaryRollback]): only when there is rewind work. *)
+      let rollback =
         match target_opt, original_tip with
         | Some target, Some tip when not (Cstruct.equal target.hash tip.hash) ->
-          true
-        | _ -> false
+          Some (target, tip)
+        | _ -> None
       in
-      if pause_active then
+      let base () =
+        match Sync.block_tip _ctx.chain with
+        | Some t -> (t.height, t.hash)
+        | None -> (0, Types.zero_hash)
+      in
+      match rollback with
+      | None ->
+        let view =
+          match _ctx.utxo with
+          | Some u -> `View (Utxo.OptimizedUtxoSet.capture_view u)
+          | None -> `Cf
+        in
+        let bh, bhash = base () in
+        Ok (view, None, bh, bhash)
+      | Some (target, tip) ->
+        let saved_header_tip = _ctx.chain.tip in
         _ctx.chain.block_submission_paused <- true;
-      let finally_restore_pause () =
-        if pause_active then
-          _ctx.chain.block_submission_paused <- false
-      in
-      (* Optionally rewind to the rollback target before dumping. We
-         restore the chain afterwards in [finally_restore]. *)
-      let saved_tip_for_restore : Sync.header_entry option ref = ref None in
-      let rollback_step : (unit, string) result =
-        match target_opt, original_tip with
-        | Some target, Some tip when not (Cstruct.equal target.hash tip.hash) ->
-          (match Sync.disconnect_to_target _ctx.chain target with
-           | Ok () ->
-             saved_tip_for_restore := Some tip;
-             Ok ()
-           | Error e ->
-             finally_restore_pause ();
-             Error e)
-        | _ -> Ok ()
-      in
-      match rollback_step with
-      | Error msg ->
-        finally_restore_pause ();
-        Error (Printf.sprintf "rollback failed: %s" msg)
-      | Ok () ->
-        (* Resolve the base block (post-rollback tip) used in metadata.
-           The VALIDATED tip: this is the block the dumped UTXO set
-           actually corresponds to, and it is what Core reports as
-           base_height/base_hash (WriteUTXOSnapshot is handed the tip from
-           [PrepareUTXOSnapshot(ActiveChainstate())], blockchain.cpp:3211).
-           Reading [_ctx.chain.tip] here stamped the snapshot — both the
-           RPC response AND the on-disk file header — with the best-work
-           HEADER height, which on a node whose peers serve headers ahead
-           of blocks is an arbitrary height far above the chain the coins
-           came from. *)
-        let base_height, base_hash =
-          match Sync.block_tip _ctx.chain with
-          | Some t -> (t.height, t.hash)
-          | None -> (0, Types.zero_hash)
-        in
-        let finally_restore () =
-          (* Re-apply the original tip if we rewound. We use [reorganize]
-             with a freshly-constructed [ibd_state] — that's the same
-             primitive [Sync.run_ibd] uses to advance tip and it's the
-             cleanest way to drive UTXO reapplication + undo-data
-             rebuild via the existing connect path. *)
-          match !saved_tip_for_restore with
+        (* Core ForceFlushStateToDisk: the rollback rewrites the coin CF
+           from undo data, so it must start from the coins of [tip], not the
+           last catch-up flush (unflushed coins would be mixed back in by the
+           restore's pre-reorg flush). *)
+        (match
+           (try Sync.flush_coins_before_tip_commit _ctx.chain; Ok ()
+            with e -> Error (Printexc.to_string e))
+         with
+         | Error e ->
+           _ctx.chain.block_submission_paused <- false;
+           Error (Printf.sprintf "rollback failed: pre-rollback flush: %s" e)
+         | Ok () ->
+        match
+           (try Sync.disconnect_to_target _ctx.chain target
+            with e -> Error (Printexc.to_string e))
+         with
+         | Error e ->
+           _ctx.chain.block_submission_paused <- false;
+           Error (Printf.sprintf "rollback failed: %s" e)
+         | Ok () ->
+           let bh, bhash = base () in
+           Ok (`Cf, Some (tip, saved_header_tip), bh, bhash))
+    in
+    match Main_thread.run begin_step with
+    | Error e -> Error e
+    | Ok (view, rolled_back, base_height, base_hash) ->
+    (* Restore on the main thread, then lift the pause there too, so no
+       connect can run between the replay and the unpause.  The best HEADER
+       is restored as well: Core's TemporaryRollback leaves
+       pindexBestHeader alone, but disconnect_to_target / reorganize set
+       [state.tip] to the block they stop at, which hid every header that
+       arrived meanwhile from the stored-block drain. *)
+    let restore_step () =
+      Fun.protect
+        ~finally:(fun () ->
+          (match view with
+           | `View v -> Utxo.OptimizedUtxoSet.release_view v
+           | `Cf -> ());
+          _ctx.chain.block_submission_paused <- false)
+        (fun () ->
+          match rolled_back with
           | None -> Ok ()
-          | Some saved_tip ->
+          | Some ((saved_tip : Sync.header_entry), saved_header_tip) ->
+            let header_before_restore = _ctx.chain.tip in
             let ibd = Sync.create_ibd_state _ctx.chain in
-            Sync.reorganize ibd saved_tip
-        in
-        (* Iterate the coins that belong in this dump.
-           Core ForceFlushStateToDisk then cursors CoinsDB
-           (rpc/blockchain.cpp PrepareUTXOSnapshot). camlcoin cannot
-           flush from a read-only RPC: coins and chain_tip live in two
-           RocksDB instances (SECREV-CAMLCOIN-CRASH-2026-09-06).
-
-           "latest" (no rewind): walk the committed overlay — on-disk CF
-           plus OptimizedUtxoSet.dirty. Walking the CF alone is the 293
-           coin dump bug at height 6299: gettxoutsetinfo (already on
-           iter_committed_utxos) reported 6028 / ladder HASH_SERIALIZED,
-           dumptxoutset wrote 5735 (last flushed window,
-           utxo_flush_interval=500).
-
-           rollback: disconnect_to_target rewrites the CF to the
-           historical set and leaves dirty holding LIVE unflushed
-           coins. Overlaying those would mix two heights. Walk the CF. *)
-        let rolled_back = Option.is_some !saved_tip_for_restore in
-        let iter_dump f =
-          if rolled_back then
-            Storage.ChainDB.iter_utxos _ctx.chain.db f
-          else
-            Utxo.iter_committed_utxos _ctx.utxo _ctx.chain.db f
-        in
-        let total_coins = ref 0L in
-        iter_dump (fun _txid _vout _data ->
-          total_coins := Int64.add !total_coins 1L);
-        let metadata : Assume_utxo.snapshot_metadata = {
-          network_magic = _ctx.network.magic;
-          base_blockhash = base_hash;
-          coins_count = !total_coins;
-        } in
-        let coins_written = ref 0L in
-        let hash_acc = Assume_utxo.hash_serialized_create () in
-        let res = Assume_utxo.write_snapshot path metadata
-          ~iter_coins:(fun emit ->
-            iter_dump (fun txid vout data ->
-              let outpoint, coin =
-                Assume_utxo.snapshot_coin_of_utxo_entry txid vout data in
-              emit coin;
-              Assume_utxo.hash_serialized_add hash_acc outpoint coin;
-              coins_written := Int64.add !coins_written 1L))
-        in
-        (* Always attempt to restore the chain, even if the dump failed,
-           so we never leave the node sitting on a rolled-back tip. *)
-        let restore_res = finally_restore () in
-        (* Restore the NetworkDisable flag now that the rewind+dump+replay
-           dance is complete (success or failure). Done BEFORE returning so
-           subsequent submitblock requests in the same process don't see a
-           stale pause. *)
-        finally_restore_pause ();
-        (match res, restore_res with
-        | Error msg, _ -> Error msg
-        | Ok (), Error rmsg ->
-          (* Dump succeeded but restore failed — this is a state-inconsistent
-             outcome the operator must know about. *)
-          Error (Printf.sprintf
-                   "dumptxoutset: dump completed but post-dump rollback \
-                    restore failed: %s. The chain is currently at the \
-                    rollback height; restart the node to recover." rmsg)
-        | Ok (), Ok () ->
-          (* txoutset_hash is HASH_SERIALIZED of the dumped coins, folded
-             during the write pass — Core PrepareUTXOSnapshot
-             GetUTXOStats(HASH_SERIALIZED) then
-             result.pushKV("txoutset_hash", maybe_stats->hashSerialized)
-             (rpc/blockchain.cpp:3259, 3345). Same value
-             gettxoutsetinfo hash_serialized_3 returns for that set.
-             Core CHECK_NONFATAL(written == coins_count). *)
-          if not (Int64.equal !coins_written !total_coins) then
-            Error (Printf.sprintf
-                     "dumptxoutset: coins_written %Ld != coins_count %Ld"
-                     !coins_written !total_coins)
-          else
-          let txoutset_hash = Assume_utxo.hash_serialized_finish hash_acc in
-          Ok (`Assoc [
-            ("coins_written", `Int (Int64.to_int !coins_written));
-            ("base_hash", `String (Types.hash256_to_hex_display base_hash));
-            ("base_height", `Int base_height);
-            ("path", `String path);
-            ("txoutset_hash",
-               `String (Types.hash256_to_hex_display txoutset_hash));
-          ]))
+            let r =
+              try Sync.reorganize ibd saved_tip
+              with e -> Error (Printexc.to_string e)
+            in
+            let more_work (a : Sync.header_entry option)
+                (b : Sync.header_entry option) =
+              match a, b with
+              | Some x, Some y ->
+                if Consensus.work_compare x.Sync.total_work y.Sync.total_work
+                   >= 0 then a else b
+              | Some _, None -> a
+              | None, _ -> b
+            in
+            _ctx.chain.tip <-
+              more_work _ctx.chain.tip
+                (more_work header_before_restore saved_header_tip);
+            r)
+    in
+    let after_restore () =
+      (* Blocks that arrived during the pause were stored, not connected
+         (Core: the network was off).  Drain them now, still on the main
+         thread, before any new P2P message is processed. *)
+      if rolled_back <> None then
+        ignore (try Sync.connect_stored_blocks _ctx.chain with _ -> 0)
+    in
+    let walk f =
+      match view with
+      | `View v -> Utxo.OptimizedUtxoSet.iter_view v f
+      | `Cf -> Storage.ChainDB.iter_utxos _ctx.chain.db f
+    in
+    let dump () =
+      let total_coins = ref 0L in
+      walk (fun _txid _vout _data -> total_coins := Int64.add !total_coins 1L);
+      let metadata : Assume_utxo.snapshot_metadata = {
+        network_magic = _ctx.network.magic;
+        base_blockhash = base_hash;
+        coins_count = !total_coins;
+      } in
+      let coins_written = ref 0L in
+      let hash_acc = Assume_utxo.hash_serialized_create () in
+      let res = Assume_utxo.write_snapshot path metadata
+        ~iter_coins:(fun emit ->
+          walk (fun txid vout data ->
+            let outpoint, coin =
+              Assume_utxo.snapshot_coin_of_utxo_entry txid vout data in
+            emit coin;
+            Assume_utxo.hash_serialized_add hash_acc outpoint coin;
+            coins_written := Int64.add !coins_written 1L))
+      in
+      (res, !total_coins, !coins_written,
+       Assume_utxo.hash_serialized_finish hash_acc)
+    in
+    (* The walk is CPU-bound for minutes on mainnet.  On a pool systhread
+       it would hold the main domain's runtime lock between 50 ms ticks and
+       starve the loop (see handle_gettxoutsetinfo_lwt); give it its own
+       domain.  It touches only the frozen view and the output file. *)
+    let dump_result =
+      try
+        Ok (if Main_thread.is_main () then dump ()
+            else Domain.join (Domain.spawn dump))
+      with e -> Error (Printexc.to_string e)
+    in
+    (* Always restore, even if the dump failed, so the node never stays on
+       a rolled-back tip. *)
+    let restore_res =
+      Main_thread.run (fun () ->
+        let r =
+          try restore_step () with e -> Error (Printexc.to_string e) in
+        after_restore ();
+        r)
+    in
+    match dump_result, restore_res with
+    | Error msg, _ -> Error msg
+    | Ok (Error msg, _, _, _), _ -> Error msg
+    | Ok (Ok (), _, _, _), Error rmsg ->
+      Error (Printf.sprintf
+               "dumptxoutset: dump completed but post-dump rollback \
+                restore failed: %s. The chain is currently at the \
+                rollback height; restart the node to recover." rmsg)
+    | Ok (Ok (), total_coins, coins_written, txoutset_hash), Ok () ->
+      (* txoutset_hash is HASH_SERIALIZED of the dumped coins, folded
+         during the write pass — Core PrepareUTXOSnapshot
+         GetUTXOStats(HASH_SERIALIZED) then
+         result.pushKV("txoutset_hash", maybe_stats->hashSerialized)
+         (rpc/blockchain.cpp:3259, 3345). Same value
+         gettxoutsetinfo hash_serialized_3 returns for that set.
+         Core CHECK_NONFATAL(written == coins_count). *)
+      if not (Int64.equal coins_written total_coins) then
+        Error (Printf.sprintf
+                 "dumptxoutset: coins_written %Ld != coins_count %Ld"
+                 coins_written total_coins)
+      else
+        Ok (`Assoc [
+          ("coins_written", `Int (Int64.to_int coins_written));
+          ("base_hash", `String (Types.hash256_to_hex_display base_hash));
+          ("base_height", `Int base_height);
+          ("path", `String path);
+          ("txoutset_hash",
+             `String (Types.hash256_to_hex_display txoutset_hash));
+        ])
 
 (* ============================================================================
    gettxoutsetinfo Handler

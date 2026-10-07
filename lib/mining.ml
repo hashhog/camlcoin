@@ -912,6 +912,17 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
          | None ->
         match vres with
         | Validation.AB_err e -> Error (Validation.block_error_to_string e)
+        | Validation.AB_ok _
+          when not (Sync.block_extends_validated_tip chain ~height
+                      ~prev:block.header.prev_block) ->
+          (* CC-1a (audit 2026-10-07): the verdict was computed against
+             [vtip]'s coin view; if the validated tip moved since, it is not
+             a verdict on this chain and nothing may be applied.  submit_block
+             runs on the Lwt main thread (Rpc.is_chain_writer_rpc), so this
+             cannot happen through the RPC; it guards any other caller.
+             Core: ConnectBlock asserts hashPrevBlock == view.GetBestBlock()
+             under cs_main. *)
+          Error "tip-moved-during-validation"
         | Validation.AB_ok (_fees, txid_arr, _spent_utxos) ->
         (* Write tx_index entries for every tx in this submitblock-
            accepted block (Pattern C0 closure 2026-05-05). Mirrors

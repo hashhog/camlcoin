@@ -1096,6 +1096,12 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
         (Printexc.to_string exn)
         (Printexc.get_backtrace ())
     );
+    (* Lwt_preemptive defaults to (0, 4) threads.  RPC handlers now take at
+       most one pool thread at a time (Rpc.rpc_lwt_mutex) and block
+       validation uses none (Validation_worker notifications), but the GC
+       backstop, the mempool verify pool and gettxoutsetinfo's walk still
+       detach: 16 keeps one slow user from queueing the others (CC-2). *)
+    Lwt_preemptive.set_bounds (0, 16);
     Lwt_main.run (Camlcoin.Cli.run ?ready_fd:eff_ready_fd config);
     (* Graceful shutdown complete: exit 0 deterministically.  A stalled
        shutdown never returns here — the deadline pthread inside Cli.run

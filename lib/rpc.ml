@@ -87,9 +87,10 @@ let rpc_deserialization_error = -22
 let rpc_verify_error = -25
 let rpc_verify_rejected = -26
 
-(* Test-only: when > 0, the synchronous dispatcher sleeps this many
-   seconds on non-monitoring methods so a concurrent-RPC control can
-   prove getblockcount is not blocked. Production leaves this at 0. *)
+(* Test-only: when > 0, a non-monitoring, non-writer RPC sleeps this many
+   seconds on its pool thread so a concurrent-RPC control can prove
+   getblockcount (and block connect, CC-2) is not blocked. Production
+   leaves this at 0. *)
 let test_sync_sleep_s = ref 0.0
 
 let is_monitoring_rpc = function
@@ -97,9 +98,54 @@ let is_monitoring_rpc = function
     true
   | _ -> false
 
-(* Serialises non-monitoring RPC handlers on the preemptive pool so two
-   writers cannot interleave, while getblockcount stays on the Lwt loop. *)
-let rpc_worker_mutex = Mutex.create ()
+(* Serialises non-monitoring RPC handlers so two handlers never interleave,
+   while getblockcount stays on the Lwt loop.  An Lwt_mutex, taken on the
+   Lwt side BEFORE a pool thread is used (CC-2): with the old OS Mutex taken
+   inside the pool thread, every queued RPC held one of Lwt_preemptive's
+   (default 4) threads while it waited, and block validation's worker
+   handoff and the mempool verify pool starved behind them. *)
+let rpc_lwt_mutex = Lwt_mutex.create ()
+
+(* Chain, coin-cache, mempool, wallet, peer-manager and Lwt writers: these
+   run on the Lwt MAIN thread (Main_thread, the cs_main equivalent), so they
+   are atomic with respect to every connect path, P2P ATMP and the Lwt
+   primitives they call (Lwt.async sends, Tip_notifier).  Since 34cd72c they
+   ran on Lwt_preemptive systhreads, preempted at any allocation, with no
+   chain lock (audit CC-1 / CC-1a / CC-1c / CC-1d / CC-1e, 2026-10-07):
+   submitblock was applied on top of a sibling a P2P connect committed while
+   it validated, and sendrawtransaction inserted a tx after the block that
+   spent its input had evicted conflicts.  Core runs all of these under
+   cs_main (validation.cpp ProcessNewBlock / ActivateBestChain /
+   InvalidateBlock; AcceptToMemoryPool LOCK(cs_main)).
+
+   Read-only methods stay on the pool (a slow read must not stall the loop).
+   dumptxoutset stays on the pool too -- its walk takes minutes -- and hands
+   its chain mutations (pause + rollback, restore) to the main thread itself.
+   Long wallet rescans (rescanblockchain, import* with rescan) are on the
+   main thread for correctness: the block-connect wallet hook mutates the
+   same wallet there; see the receipt's open items. *)
+let is_chain_writer_rpc = function
+  (* chain *)
+  | "submitblock" | "submitheader" | "generate" | "generatetoaddress"
+  | "generateblock" | "invalidateblock" | "reconsiderblock" | "preciousblock"
+  | "pruneblockchain" | "loadtxoutset" | "scrubunspendable"
+  (* mempool (ATMP under cs_main; GBT reads mempool + tip as one view) *)
+  | "sendrawtransaction" | "submitpackage" | "testmempoolaccept"
+  | "prioritisetransaction" | "loadmempool" | "importmempool"
+  | "getblocktemplate"
+  (* wallet *)
+  | "getnewaddress" | "sethdseed" | "sendtoaddress" | "send" | "lockunspent"
+  | "createwallet" | "loadwallet" | "unloadwallet" | "restorewallet"
+  | "backupwallet" | "encryptwallet" | "walletpassphrase" | "walletlock"
+  | "getwalletinfo" | "walletcreatefundedpsbt" | "fundrawtransaction"
+  | "importprivkey" | "importdescriptors" | "rescanblockchain"
+  | "getpayjoinrequest"
+  (* peer manager / Lwt.async *)
+  | "addnode" | "disconnectnode" | "setban" | "clearbanned"
+  | "setnetworkactive" | "ping" | "getblockfrompeer" | "addpeeraddress"
+  | "stop" ->
+    true
+  | _ -> false
 
 (* Core uvTypeName (univalue.cpp:217-226): the wire type name used in
    "JSON value of type <type> is not of expected type ..." messages. *)
@@ -12106,14 +12152,14 @@ let handle_gettxoutsetinfo (ctx : rpc_context)
    thread, so [gettxoutsetinfo_prepare] captures tip + coin view atomically
    with respect to block connection (which mutates them only on this thread,
    without yielding mid-block).  The walk then runs on a fresh DOMAIN, parked
-   behind [Lwt_preemptive.detach] and outside [rpc_worker_mutex]:
+   behind [Lwt_preemptive.detach] and outside [rpc_lwt_mutex]:
 
    - It used to run on the preemptive pool's systhread inside the MAIN
      domain.  Systhreads of one domain share that domain's runtime lock, and
      a 35-55 min CPU-bound walk only drops it at the 50 ms tick, so the Lwt
      loop (getblockcount, P2P, block connection) got the lock in slivers and
      the node froze for the whole walk (live mainnet, 2026-10-01).
-   - It held [rpc_worker_mutex] for the whole walk, so every other
+   - It held the RPC mutex for the whole walk, so every other
      non-monitoring RPC queued behind it.
    - It read [OptimizedUtxoSet.dirty] from that systhread while the Lwt
      thread mutated it, and the RocksDB iterator pinned its implicit
@@ -16142,8 +16188,6 @@ let handle_single_request (ctx : rpc_context) (json : Yojson.Safe.t)
        | None -> `Null)
     | _ -> `Null
   in
-  if !test_sync_sleep_s > 0. && not (is_monitoring_rpc method_name) then
-    Unix.sleepf !test_sync_sleep_s;
   match dispatch_rpc ctx method_name params with
   | Ok r -> json_rpc_response ~id ~result:r
   | Error (code, message) -> json_rpc_error ~id ~code ~message
@@ -16210,13 +16254,16 @@ let handle_single_request_lwt (ctx : rpc_context) (json : Yojson.Safe.t)
     if is_monitoring_rpc method_name then
       Lwt.return (handle_single_request ctx json)
     else
-      Lwt_preemptive.detach
-        (fun () ->
-          Mutex.lock rpc_worker_mutex;
-          Fun.protect
-            ~finally:(fun () -> Mutex.unlock rpc_worker_mutex)
-            (fun () -> handle_single_request ctx json))
-        ()
+      Lwt_mutex.with_lock rpc_lwt_mutex (fun () ->
+        if is_chain_writer_rpc method_name then
+          (* cs_main: on the Lwt thread, atomic w.r.t. every connect path. *)
+          Lwt.return (handle_single_request ctx json)
+        else
+          Lwt_preemptive.detach
+            (fun () ->
+              if !test_sync_sleep_s > 0. then Unix.sleepf !test_sync_sleep_s;
+              handle_single_request ctx json)
+            ())
 
 (* Handle a batch of JSON-RPC requests in parallel *)
 let handle_batch_request (ctx : rpc_context) (requests : Yojson.Safe.t list)

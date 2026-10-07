@@ -4586,7 +4586,9 @@ module Validation_worker = struct
       * (Types.outpoint * Validation.utxo) list),
      Validation.block_validation_error) result
 
-  type message = Validate of job | Shutdown
+  (* [Validate (job, note)]: [note], when present, is an Lwt notification
+     the worker sends once the result is in the response slot (CC-2). *)
+  type message = Validate of job * Lwt_unix.notification option | Shutdown
 
   (* Two typed single-slot channels (request + response).  Plain
      Mutex+Condition — works on both the worker Domain and (wrapped in
@@ -4645,7 +4647,7 @@ module Validation_worker = struct
     let rec loop () =
       match take_req req with
       | Shutdown -> ()
-      | Validate j ->
+      | Validate (j, note) ->
         (* accept_block: unified ProcessNewBlock check pipeline.
            Same sequence as process_new_block, connect_stored_blocks, and
            submit_block. Using accept_block here ensures the IBD worker
@@ -4672,6 +4674,9 @@ module Validation_worker = struct
           with exn -> Error exn
         in
         put_resp resp r;
+        (match note with
+         | Some n -> Lwt_unix.send_notification n
+         | None -> ());
         loop ()
     in
     loop ()
@@ -4684,17 +4689,31 @@ module Validation_worker = struct
     let domain = Domain.spawn (fun () -> worker_loop req resp) in
     { req; resp; domain }
 
-  (* Lwt-side submit: enqueue job, park Lwt scheduler (via
-     Lwt_preemptive.detach) while the worker Domain runs.
-     Crucially, the Lwt main thread is parked on Lwt_preemptive — it does
-     not hold the OCaml runtime lock while the worker is running — so
-     other Lwt callbacks CAN run, but the IBD invariant is preserved
-     because process_downloaded_blocks defers all ibd.* mutation until
-     AFTER this call returns and we're back on the Lwt thread. *)
+  (* Lwt-side submit: enqueue the job and wait for the worker's
+     notification.  The Lwt thread keeps running while the worker Domain
+     validates; process_downloaded_blocks / process_new_block apply nothing
+     until this resolves and they have re-checked the tip.
+
+     CC-2 (audit 2026-10-07): this used to be two [Lwt_preemptive.detach]
+     calls (put, then a BLOCKING take held for the whole validation), so
+     each block connect needed Lwt_preemptive pool threads -- the same
+     default-4 pool every non-monitoring RPC took a thread from.  Four slow
+     or queued RPCs, or one 4-request JSON batch, made block connection wait
+     for an RPC to finish (3.0 s behind four 3 s RPCs,
+     test/test_chain_lock.exe).  The request slot is empty here: each worker
+     has one caller at a time (catch-up is serial; the post-IBD worker runs
+     under block_listener_mutex), so [put_req] does not block; the response
+     is in its slot when the notification fires, so [take_resp] does not
+     block either.  No pool thread is used.  The promise is not cancelable
+     ([Lwt.wait]), so a response is never left unclaimed. *)
   let submit_lwt (t : t) (j : job) : validation_result Lwt.t =
-    let%lwt () = Lwt_preemptive.detach (fun () -> put_req t.req (Validate j)) () in
-    let%lwt r = Lwt_preemptive.detach (fun () -> take_resp t.resp) () in
-    match r with
+    let waiter, wakener = Lwt.wait () in
+    let note =
+      Lwt_unix.make_notification ~once:true
+        (fun () -> Lwt.wakeup_later wakener ()) in
+    put_req t.req (Validate (j, Some note));
+    let%lwt () = waiter in
+    match take_resp t.resp with
     | Ok v -> Lwt.return v
     | Error exn -> Lwt.fail exn
 

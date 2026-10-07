@@ -131,7 +131,7 @@ let test_race () =
               get_mtp_at_height = None; bip34_height_hash = None;
               prefetch_base = None } in
             Sync.Validation_worker.put_req w.Sync.Validation_worker.req
-              (Sync.Validation_worker.Validate blocker);
+              (Sync.Validation_worker.Validate (blocker, None));
             let deadline = Unix.gettimeofday () +. 30.0 in
             while not (Atomic.get entered) && Unix.gettimeofday () < deadline do
               Unix.sleepf 0.005

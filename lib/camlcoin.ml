@@ -43,3 +43,4 @@ module Muhash = Muhash
 module Coinstats_index = Coinstats_index
 module Bloom = Bloom
 module Ntx_reconcile = Ntx_reconcile
+module Swiftsync = Swiftsync

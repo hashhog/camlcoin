@@ -249,9 +249,18 @@ let test_stall_rotates_to_other_peer () =
       ps.blocks_in_flight <- 1;
       let peer1, ic1, _oc1, _ = make_pair ~id:1 in
       let peer2, ic2, _oc2, _ = make_pair ~id:2 in
+      (* Core (CC-4, chain-lock branch): one block outstanding never blocks
+         the download window, so a 2 s-slow holder is NOT a staller... *)
       let to_drop = Sync.check_stalled_downloads ~n_ready_peers:2 ibd in
-      Alcotest.(check bool) "unique staller is named for disconnect" true
-        (List.mem 1 to_drop);
+      Alcotest.(check (list int))
+        "window not blocked: no stall disconnect at 2 s (Core)" [] to_drop;
+      (* ...the per-block download timeout takes the request back. *)
+      entry.Sync.download_state <-
+        Sync.Requested
+          { peer_id = 1;
+            requested_at = Unix.gettimeofday () -. Sync.base_block_timeout -. 1.0;
+            timeout = Sync.base_block_timeout };
+      ignore (Sync.check_stalled_downloads ~n_ready_peers:2 ibd);
       (match entry.Sync.download_state with
       | Sync.NotRequested -> ()
       | _ -> Alcotest.fail "stall did not release the in-flight request");

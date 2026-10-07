@@ -3898,8 +3898,48 @@ let heads_covered (ibd : ibd_state) : bool =
    for the connect-cursor when another download peer exists. On a one-peer
    campaign rig, disconnecting the only peer is the stall.
    Returns a list of peer IDs that should be disconnected. *)
+(* CC-4 (audit 2026-10-07; live stall 2026-10-07 ~19:50Z at 970381-970382):
+   Core's stalling detection (net_processing.cpp SendMessages /
+   FindNextBlocksToDownload).  A peer is a staller only while the download
+   WINDOW cannot move because of it -- here: the queue is filled to its
+   buffer cap past the connect cursor, so nothing further can be requested
+   -- for longer than [block_stalling_timeout], which starts at
+   BLOCK_STALLING_TIMEOUT_DEFAULT (2 s), doubles after every stall
+   disconnect up to BLOCK_STALLING_TIMEOUT_MAX (64 s) "so that we don't
+   disconnect multiple peers if our own bandwidth is insufficient", and
+   decays by 0.85 per connected block (PeerManagerImpl::BlockConnected).
+   At tip the window never blocks, so a slow head-of-line holder is left to
+   the per-block download timeout ([past_full] below).
+
+   It used to be a FIXED 2 s on the HOL whenever another peer existed,
+   window or not: under load no peer delivered a 1.5 MB block in 2 s, each
+   re-request went to a fresh peer that was disconnected 2 s later, and
+   the node sat at 970382 with ~5 disconnects a minute
+   (test/test_cc4_staller.exe). *)
+let block_stalling_timeout_max = 64.0
+let block_stalling_timeout = ref stall_timeout
+(* When the window was last seen blocked (0. = not blocked). *)
+let stalling_since = ref 0.0
+
+let download_window_blocked (ibd : ibd_state) : bool =
+  ibd.next_download_height - ibd.next_process_height
+  >= max_blocks_buffered_ahead
+  && not (Queue.fold (fun acc e ->
+      acc || e.download_state = NotRequested) false ibd.block_queue)
+
+(* Core BlockConnected: slowly back to the default after a doubling. *)
+let note_block_connected_for_stalling () : unit =
+  if !block_stalling_timeout > stall_timeout then
+    block_stalling_timeout :=
+      Float.max stall_timeout (!block_stalling_timeout *. 0.85)
+
 let check_stalled_downloads ?(n_ready_peers = 1) (ibd : ibd_state) : int list =
   let now = Unix.gettimeofday () in
+  let window_blocked = download_window_blocked ibd in
+  if not window_blocked then stalling_since := 0.0
+  else if !stalling_since = 0.0 then stalling_since := now;
+  let stalled_for = if window_blocked then now -. !stalling_since else 0.0 in
+  let staller_found = ref false in
   let peers_to_disconnect = Hashtbl.create 4 in
   let release_request entry peer_id =
     entry.download_state <- NotRequested;
@@ -3922,7 +3962,8 @@ let check_stalled_downloads ?(n_ready_peers = 1) (ibd : ibd_state) : int list =
          re-queues them behind a re-requested HOL and is the FIFO rate
          bug. *)
       let unique_staller =
-        hol && elapsed > stall_timeout
+        hol && window_blocked
+        && stalled_for > !block_stalling_timeout
         && (n_ready_peers > 1 || elapsed > hol_fetch_timeout)
       in
       if past_full then begin
@@ -3939,14 +3980,21 @@ let check_stalled_downloads ?(n_ready_peers = 1) (ibd : ibd_state) : int list =
           Hashtbl.replace peers_to_disconnect peer_id true
       end else if unique_staller then begin
         ignore (release_request entry peer_id);
-        Logs.debug (fun m ->
-          m "Stall detected for height %d from peer %d (%.1fs), \
-             re-requesting from another peer"
-            entry.height peer_id elapsed);
+        Logs.info (fun m ->
+          m "Peer %d is stalling block download at height %d (window \
+             blocked %.1fs > %.0fs); re-requesting from another peer"
+            peer_id entry.height stalled_for !block_stalling_timeout);
+        staller_found := true;
         Hashtbl.replace peers_to_disconnect peer_id true
       end
     | _ -> ()
   ) ibd.block_queue;
+  if !staller_found then begin
+    (* Core: double for the next peer; its clock starts afresh. *)
+    block_stalling_timeout :=
+      Float.min block_stalling_timeout_max (2.0 *. !block_stalling_timeout);
+    stalling_since := 0.0
+  end;
   Hashtbl.fold (fun peer_id _ acc -> peer_id :: acc) peers_to_disconnect []
 
 (* Release every in-flight request assigned to [peer_id] (peer dropped or
@@ -5270,6 +5318,7 @@ let process_downloaded_blocks ?(max_blocks = 1)
            ibd.chain.blocks_synced <- height;
            (* This session now holds unflushed coin changes (CC-3). *)
            unflushed_catchup := Some ibd;
+           note_block_connected_for_stalling ();
            (* Write the active-chain height->hash index for this connected block
               (Core ConnectTip -> CChain::SetTip, chain.cpp:16).  The IBD
               download-connect path advanced blocks_synced + the UTXO set but
@@ -8782,6 +8831,7 @@ let rec connect_stored_blocks
              catch-up drain too so out-of-order blocks connected here prune
              the mempool just like the at-tip path.  Best-effort. *)
           run_mempool_remove_hook state stored_block next_height;
+          note_block_connected_for_stalling ();
           log_update_tip ~note:"gap-fill drain" ~hash:entry.hash
             ~height:next_height
             ~n_tx:(List.length stored_block.transactions)
@@ -9151,6 +9201,7 @@ let process_new_block ?(f_requested = false)
           Storage.ChainDB.record_connected_tx_counts state.db
             ~hash ~prev:entry.header.prev_block
             ~n_tx:(List.length block.transactions);
+          note_block_connected_for_stalling ();
           log_update_tip ~hash ~height
             ~n_tx:(List.length block.transactions)
             (Unix.gettimeofday () -. t0);

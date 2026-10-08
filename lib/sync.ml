@@ -9420,6 +9420,19 @@ let handle_mempool_msg (ibd : ibd_state) (peer : Peer.peer) : unit Lwt.t =
 let is_block_invalid (state : chain_state) (hash : Types.hash256) : bool =
   Hashtbl.mem state.invalidated_blocks (Cstruct.to_string hash)
 
+(* Is [hash] a block of the ACTIVE validated chain (Core
+   [m_chain.Contains(pindex)])?  The on-disk height->hash index projects the
+   active chain only (see [block_tip]); a height above [blocks_synced] is
+   not connected yet. *)
+let is_on_active_chain (state : chain_state) (hash : Types.hash256) : bool =
+  match Hashtbl.find_opt state.headers (Cstruct.to_string hash) with
+  | None -> false
+  | Some e ->
+    e.height <= state.blocks_synced
+    && (match Storage.ChainDB.get_hash_at_height state.db e.height with
+        | Some h -> Cstruct.equal h hash
+        | None -> false)
+
 (* Find all descendants of a block in the headers table *)
 let find_descendants (state : chain_state) (target_hash : Types.hash256)
     : header_entry list =
@@ -9753,8 +9766,9 @@ let peer_has_header (_peer : Peer.peer) (_hash : Types.hash256) : bool =
 (* Reconsider a previously invalidated block.
    Clears the invalid flag from the block and all its descendants/ancestors,
    then triggers chain selection to potentially reorg to a better chain. *)
-let reconsider_block (state : chain_state) (hash : Types.hash256)
-    : (int, string) result =
+let reconsider_block (state : chain_state)
+    ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
+    (hash : Types.hash256) : (int, string) result =
   let hash_key = Cstruct.to_string hash in
   match Hashtbl.find_opt state.headers hash_key with
   | None -> Error "Block not found"
@@ -9788,16 +9802,31 @@ let reconsider_block (state : chain_state) (hash : Types.hash256)
       m "Cleared invalid flags from %d descendant blocks"
         (List.length descendants));
     (* Find the best valid chain - may now include the reconsidered block *)
+    (* Core ReconsiderBlock -> ResetBlockFailureFlags, then the RPC runs
+       ActivateBestChain.  This used to report the best candidate's height
+       and change nothing ("caller would need to handle full reorg"), so the
+       node stayed on the invalidate's parent even after a re-announce.
+       Activate through [reorganize] (pure connect when the candidate extends
+       the validated tip; disconnect + connect across a fork), which also
+       keeps the mempool consistent (removeForBlock / refill). *)
     match find_best_valid_tip state with
     | Some best when
         (match state.tip with
          | Some tip -> Consensus.work_compare best.total_work tip.total_work > 0
          | None -> true) ->
       Logs.info (fun m ->
-        m "Reconsidered chain has more work, new best tip at height %d"
+        m "Reconsidered chain has more work, activating best tip at height %d"
           best.height);
-      (* Update tip - caller would need to handle full reorg with UTXO updates *)
-      Ok best.height
+      let ibd = create_ibd_state ?utxo_set state in
+      (match reorganize ibd best with
+       | Ok () -> Ok best.height
+       | Error e ->
+         Logs.warn (fun m ->
+           m "reconsiderblock: activation to height %d failed: %s"
+             best.height e);
+         (match state.tip with
+          | Some t -> Ok t.height
+          | None -> Ok 0))
     | _ ->
       match state.tip with
       | Some tip -> Ok tip.height

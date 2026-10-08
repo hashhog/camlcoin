@@ -1153,7 +1153,7 @@ let handle_reconsiderblock (ctx : rpc_context)
     (match parse_blockhash_hex blockhash_hex with
      | Error msg -> Error msg
      | Ok hash ->
-       match Sync.reconsider_block ctx.chain hash with
+       match Sync.reconsider_block ctx.chain ?utxo_set:ctx.utxo hash with
        | Ok _new_height -> Ok `Null
        | Error msg -> Error msg)
   | _ ->
@@ -2585,6 +2585,12 @@ let bip22_of_submitblock_error (msg : string) : string =
      already renders BlockBadVersion as the exact token "bad-version(0x........)";
      surface it verbatim (extract the token in case a "transaction N ..." prefix
      is present, so the dynamic hex survives). *)
+  (* Index-state answers that are already Core's exact BIP-22 tokens
+     (Mining.submit_block: AcceptBlockHeader "duplicate-invalid" /
+     "bad-prevblk", submitblock "duplicate").  Exact match: the substring
+     rules below would turn "duplicate" into a duplicate-transaction token. *)
+  if msg = "duplicate-invalid" || msg = "duplicate" || msg = "bad-prevblk"
+  then msg else
   match find_sub "bad-version(0x" with
   | Some start ->
     (match String.index_from_opt msg start ')' with

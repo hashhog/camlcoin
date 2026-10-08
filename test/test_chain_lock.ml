@@ -708,6 +708,61 @@ let test_pause_honoured () =
     Alcotest.(check int) "after the pause the chain advances" 103
       fx.state.Sync.blocks_synced)
 
+(* ------------------------- INV-SUBMIT / reconsider (fleet-conformance) *)
+
+(* Core: submitblock of an invalidated block answers "duplicate-invalid"
+   and never reconnects it (AcceptBlockHeader BLOCK_FAILED_MASK ->
+   BLOCK_CACHED_INVALID); a child of it "bad-prevblk"; a block already on
+   the active chain "duplicate"; reconsiderblock clears the flags and runs
+   ActivateBestChain (the chain is back at once).  Deployed b6ae562: the
+   invalidated block extends the validated tip, so submitblock CONNECTED it
+   (answer null) and reconsiderblock left the chain at the parent. *)
+let test_invalidated_submit () =
+  with_fx ~label:"cl_invsubmit" ~cache:10_000 (fun fx ->
+    let call m params =
+      Lwt_main.run (Rpc.handle_single_request_lwt fx.ctx (json_req m params)) in
+    let result r = match r with
+      | `Assoc l -> (try List.assoc "result" l with Not_found -> `Null)
+      | _ -> `Null in
+    let hx b = `String (Types.hash256_to_hex_display (hash_of b)) in
+    let b102 = build fx ~tag:1 102 [] in
+    let b103 = build fx ~tag:1 103 [] in
+    let b104 = build fx ~tag:1 104 [] in
+    ignore (call "submitblock" [ `String (block_hex b102) ]);
+    ignore (call "submitblock" [ `String (block_hex b103) ]);
+    Alcotest.(check int) "102, 103 connected" 103 fx.state.Sync.blocks_synced;
+    ignore (call "invalidateblock" [ hx b103 ]);
+    Alcotest.(check int) "invalidated -> 102" 102 fx.state.Sync.blocks_synced;
+    let r_inv = result (call "submitblock" [ `String (block_hex b103) ]) in
+    let r_child = result (call "submitblock" [ `String (block_hex b104) ]) in
+    let r_dup = result (call "submitblock" [ `String (block_hex b102) ]) in
+    Printf.printf "  submitblock: invalidated=%s child=%s active=%s tip=%d\n%!"
+      (show_resp r_inv) (show_resp r_child) (show_resp r_dup)
+      fx.state.Sync.blocks_synced;
+    Alcotest.(check string) "invalidated block -> duplicate-invalid"
+      "\"duplicate-invalid\"" (show_resp r_inv);
+    Alcotest.(check string) "child of invalidated -> bad-prevblk"
+      "\"bad-prevblk\"" (show_resp r_child);
+    Alcotest.(check string) "active block -> duplicate"
+      "\"duplicate\"" (show_resp r_dup);
+    Alcotest.(check int) "tip held at 102" 102 fx.state.Sync.blocks_synced;
+    Alcotest.(check bool) "103's coinbase not in the coin set" false
+      (coin fx fx.cb.(103) 0);
+    ignore (call "reconsiderblock" [ hx b103 ]);
+    Printf.printf "  reconsiderblock -> tip %d\n%!" fx.state.Sync.blocks_synced;
+    Alcotest.(check int) "reconsider activates 103 at once" 103
+      fx.state.Sync.blocks_synced;
+    Alcotest.(check bool) "103 is the active block at 103" true
+      (match active_at fx 103 with
+       | Some h -> Cstruct.equal h (hash_of b103) | None -> false);
+    Alcotest.(check bool) "103's coinbase back in the coin set" true
+      (coin fx fx.cb.(103) 0);
+    let r_after = result (call "submitblock" [ `String (block_hex b103) ]) in
+    Alcotest.(check string) "reconsidered block -> duplicate"
+      "\"duplicate\"" (show_resp r_after);
+    ignore (call "submitblock" [ `String (block_hex b104) ]);
+    Alcotest.(check int) "104 connects on top" 104 fx.state.Sync.blocks_synced)
+
 (* -------------------------------------------------- CC-2: pool starvation *)
 
 (* Four slow RPCs, then a block delivered to the at-tip path with the
@@ -772,6 +827,10 @@ let () =
         `Quick test_dump_rollback_spends;
       Alcotest.test_case "every connect path honours the pause" `Quick
         test_pause_honoured;
+    ];
+    "INV-SUBMIT", [
+      Alcotest.test_case "submitblock of an invalidated block; reconsider"
+        `Quick test_invalidated_submit;
     ];
     "CC-2 pool", [
       Alcotest.test_case "4 slow RPCs do not starve block connect" `Slow

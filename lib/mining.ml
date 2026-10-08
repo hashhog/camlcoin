@@ -773,6 +773,22 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
     else if not (Cstruct.equal computed_merkle block.header.merkle_root) then
       Error (Validation.block_error_to_string Validation.BlockBadMerkleRoot)
     else
+    (* Core ProcessNewBlock -> AcceptBlock -> AcceptBlockHeader on a block
+       the index already knows (validation.cpp AcceptBlockHeader: "if
+       (pindex->nStatus & BLOCK_FAILED_MASK) return state.Invalid(
+       BLOCK_CACHED_INVALID, "duplicate-invalid")"; a child of a failed
+       block is BLOCK_INVALID_PREV "bad-prevblk"; a block already connected
+       is !new_block && accepted -> rpc/mining.cpp submitblock "duplicate").
+       Without this an invalidated block whose parent is the validated tip
+       fell straight into the extends-tip connect below and was RECONNECTED
+       (fleet-conformance INV-SUBMIT, 2026-10-08: tip 294 -> 295, answer
+       null).  Runs on the main thread (cs_main, Main_thread.run_in_main via
+       Rpc.is_chain_writer_rpc), so invalidate/reconsider cannot interleave. *)
+    if Sync.is_block_invalid chain hash then Error "duplicate-invalid"
+    else if Sync.is_block_invalid chain block.header.prev_block then
+      Error "bad-prevblk"
+    else if Sync.is_on_active_chain chain hash then Error "duplicate"
+    else
     (* For submitblock we must compare against the validated-block tip, not
        the header tip (which may lead `blocks_synced` post-IBD).  Use the
        `Sync.block_tip` helper instead of reading `chain.tip` directly. *)

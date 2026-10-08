@@ -1153,7 +1153,7 @@ let handle_reconsiderblock (ctx : rpc_context)
     (match parse_blockhash_hex blockhash_hex with
      | Error msg -> Error msg
      | Ok hash ->
-       match Sync.reconsider_block ctx.chain hash with
+       match Sync.reconsider_block ctx.chain ?utxo_set:ctx.utxo hash with
        | Ok _new_height -> Ok `Null
        | Error msg -> Error msg)
   | _ ->

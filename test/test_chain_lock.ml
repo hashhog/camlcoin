@@ -442,12 +442,11 @@ let test_writer_thread_sweep () =
         let r4 = call "reconsiderblock" [ hx b103 ] in
         let r5 = call "testmempoolaccept" [ `List [ `String (tx_hex t2) ] ] in
         let r6 = call "sendrawtransaction" [ `String (tx_hex t) ] in
-        (* reconsiderblock only clears the failure flags here: camlcoin's
-           reconsider_block does not run ActivateBestChain (a separate,
-           pre-existing gap: Core reconnects the block).  It writes nothing
-           the probes can see, so it is reported but not counted. *)
-        ignore r4;
-        let rows = [ r1; r2; r3; r5; r6 ] in
+        (* reconsiderblock now runs ActivateBestChain (Core reconnects the
+           block), so it writes the chainstate too and is counted. *)
+        Alcotest.(check int) "reconsiderblock reconnected 103" 103
+          fx.state.Sync.blocks_synced;
+        let rows = [ r1; r2; r3; r4; r5; r6 ] in
         Printf.printf "  rows counted: %d (each must show >= 1 event)\n%!"
           (List.length rows);
         List.iter (fun (m, n, off) ->

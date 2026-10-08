@@ -323,6 +323,15 @@ type chain_state = {
      runner is a no-op.  Best-effort: a mempool-side failure must never roll
      back an already-validated, already-connected block (Core runs
      removeForBlock after the chainstate flush). *)
+  mutable chain_mempool : Mempool.mempool option;
+  (* The live mempool, for the paths that move the tip BACKWARD or ACROSS a
+     fork (reorganize, invalidateblock): Core's DisconnectTip feeds a
+     DisconnectedBlockTransactions pool and MaybeUpdateMempoolForReorg
+     re-accepts it under cs_main.  Every reorg path builds its own bare
+     ibd_state ([create_ibd_state] leaves [ibd.mempool = None]) — the P2P
+     ActivateBestChain reorg, invalidateblock's post-rewind activation —
+     so the mempool hangs off the chain, set once by cli.ml.  None in tests
+     that build a chain without a mempool. *)
 }
 
 (* Header flood prevention: reject new headers when this limit is reached
@@ -1235,6 +1244,7 @@ let create_chain_state (db : Storage.ChainDB.t)
     wallet_scan_hook = None;
     wallet_unscan_hook = None;
     mempool_remove_hook = None;
+    chain_mempool = None;
   } in
   (* Insert genesis block header *)
   let genesis_hash = Crypto.compute_block_hash network.genesis_header in
@@ -1450,6 +1460,7 @@ let restore_chain_state (db : Storage.ChainDB.t)
     wallet_scan_hook = None;
     wallet_unscan_hook = None;
     mempool_remove_hook = None;
+    chain_mempool = None;
   } in
   (* Check for stored header tip *)
   match Storage.ChainDB.get_header_tip db with
@@ -1850,6 +1861,41 @@ let run_wallet_unscan_hook (state : chain_state) (block : Types.block)
 let set_mempool_remove_hook (state : chain_state)
     (f : (Types.block -> int -> unit) option) : unit =
   state.mempool_remove_hook <- f
+
+let set_chain_mempool (state : chain_state)
+    (mp : Mempool.mempool option) : unit =
+  state.chain_mempool <- mp
+
+(* Core MaybeUpdateMempoolForReorg after a disconnect: [disconnected] holds
+   the disconnected blocks' txs earliest-confirmed first; any tx confirmed by
+   a block in [connected] is dropped from that pool first (Core removes it
+   from the disconnect pool in removeForBlock).  Best-effort like the
+   connect hook: a mempool fault never rolls back a committed chain move. *)
+let update_mempool_for_reorg (mp : Mempool.mempool)
+    ~(disconnected : Types.transaction list)
+    ~(connected : Types.block list) : unit =
+  try
+    let confirmed = Hashtbl.create 64 in
+    List.iter (fun (b : Types.block) ->
+      List.iter (fun tx ->
+        Hashtbl.replace confirmed
+          (Cstruct.to_string (Crypto.compute_txid tx)) ()
+      ) b.transactions
+    ) connected;
+    let pool =
+      if Hashtbl.length confirmed = 0 then disconnected
+      else List.filter (fun tx ->
+        not (Hashtbl.mem confirmed
+               (Cstruct.to_string (Crypto.compute_txid tx)))) disconnected
+    in
+    let n = Mempool.update_for_reorg mp ~disconnected:pool in
+    Logs.info (fun m ->
+      m "Mempool updated for reorg: %d of %d disconnected txs re-accepted, \
+         pool now %d" n (List.length pool) (Mempool.count mp))
+  with exn ->
+    Logs.warn (fun m ->
+      m "mempool update for reorg raised (ignored): %s"
+        (Printexc.to_string exn))
 
 (* Invoke the mempool block-connect eviction hook for a freshly-connected
    block, if one is installed.  Best-effort: a mempool-side exception is logged
@@ -5318,6 +5364,12 @@ let process_downloaded_blocks ?(max_blocks = 1)
            ibd.chain.blocks_synced <- height;
            (* This session now holds unflushed coin changes (CC-3). *)
            unflushed_catchup := Some ibd;
+           (* Core ConnectTip -> removeForBlock runs for EVERY connected block.
+              The catch-up path (also the one that runs at tip whenever the
+              header tip is ahead) never told the mempool, so a confirmed tx
+              (or a tx conflicting with one) stayed in the pool and the pool's
+              tip height never moved.  Free on an empty pool (IBD). *)
+           run_mempool_remove_hook ibd.chain block height;
            note_block_connected_for_stalling ();
            (* Write the active-chain height->hash index for this connected block
               (Core ConnectTip -> CChain::SetTip, chain.cpp:16).  The IBD
@@ -5732,6 +5784,7 @@ let disconnect_to_target ?(from_validated_tip = false)
    index is off).  Mirrors Bitcoin Core's [InvalidateBlock] -> [DisconnectTip]
    loop operating on the active Chainstate's CoinsTip ([validation.cpp]). *)
 let disconnect_to_target_via_utxo ?(from_validated_tip = false)
+    ?(on_disconnected : (Types.block -> unit) option)
     (state : chain_state)
     (utxo : Utxo.OptimizedUtxoSet.t) (target : header_entry)
     : (unit, string) result =
@@ -5813,6 +5866,9 @@ let disconnect_to_target_via_utxo ?(from_validated_tip = false)
                    --txospenderindex is off. *)
                 txospender_disconnect_if_enabled state ~block
                   ~height:entry.height;
+                (match on_disconnected with
+                 | Some f -> f block
+                 | None -> ());
                 disconnect rest)
        in
        (match disconnect (List.rev to_disconnect) with
@@ -7619,27 +7675,6 @@ let reorganize ?(allow_equal_work = false)
             (* Clear sig cache so stale results from the abandoned chain
                don't leak into post-reorg validation. *)
             Validation.cache_clear_global ();
-            (* Mempool refill: re-add disconnected non-coinbase txs.
-               W96 Bug 14: pass ~bypass_fee_check:true and ~bypass_limits:true
-               so the refill path matches Core's args.m_bypass_limits=true for
-               reorg-driven re-acceptance (validation.cpp ProcessNewBlock →
-               UpdateMempoolForReorg).  Without these, txs whose original
-               feerate was at or just above floor (now subject to a raised
-               dynamic floor due to mempool churn) and TRUC chains valid
-               under the old chain but with parents not yet re-accepted would
-               be wrongly dropped. *)
-            (match ibd.mempool with
-             | Some mp ->
-               List.iter (fun tx ->
-                 ignore (Mempool.add_transaction
-                           ~bypass_fee_check:true
-                           ~bypass_limits:true
-                           mp tx)
-               ) !disconnected_txs;
-               Logs.debug (fun m ->
-                 m "Re-added %d disconnected transactions to mempool"
-                   (List.length !disconnected_txs))
-             | None -> ());
             (* Per-connect-block side effects: mempool eviction, prune,
                ZMQ notify. [connected_blocks] is in reverse iteration
                order; List.rev_iter style preserves connect order so
@@ -7656,10 +7691,32 @@ let reorganize ?(allow_equal_work = false)
             ) (List.rev to_disconnect);
             (* Connect-side effects (mempool eviction, prune, ZMQ
                connect) iterated in fork-forward order. *)
+            (* Mempool (Core ConnectTip -> removeForBlock for EVERY connected
+               block, then MaybeUpdateMempoolForReorg once at the end of
+               ActivateBestChainStep): confirmed txs and their conflicts go
+               first, then the disconnected txs are re-accepted earliest
+               first, failures removeRecursive'd, and removeForReorg drops
+               what is non-final / sequence-locked / immature at tip+1.  The
+               refill used to run BEFORE removeForBlock and only when the
+               caller's ibd_state carried a mempool — the P2P reorg's bare
+               ibd_state never did, so a P2P reorg neither refilled nor
+               removed anything.  Runs here, on the main thread (the chain
+               lock), after the commit + tip flip and before any RPC can
+               observe the new tip, so the pool never lags the chain. *)
+            let reorg_mp = match ibd.mempool with
+              | Some _ as m -> m
+              | None -> state.chain_mempool in
+            (match reorg_mp with
+             | Some mp ->
+               List.iter (fun ((entry : header_entry), (block : Types.block)) ->
+                 Mempool.remove_for_block mp block entry.height
+               ) (List.rev !connected_blocks);
+               if to_disconnect <> [] then
+                 update_mempool_for_reorg mp
+                   ~disconnected:!disconnected_txs
+                   ~connected:(List.map snd !connected_blocks)
+             | None -> ());
             List.iter (fun ((entry : header_entry), (block : Types.block)) ->
-              (match ibd.mempool with
-               | Some mp -> Mempool.remove_for_block mp block entry.height
-               | None -> ());
               prune_old_blocks state entry.height;
               zmq_notify_block ibd block entry.hash true
             ) (List.rev !connected_blocks);
@@ -9528,14 +9585,35 @@ let invalidate_block (state : chain_state)
            same primitive [dumptxoutset rollback] uses).  Mirrors Bitcoin
            Core's [InvalidateBlock] -> [DisconnectTip] loop operating on the
            active Chainstate's CoinsTip ([validation.cpp]). *)
+        (* Core DisconnectTip -> disconnectpool.AddTransactionsFromBlock:
+           blocks arrive tip-first, so prepending each block's non-coinbase
+           txs leaves the pool earliest-confirmed first. *)
+        let disconnected_txs = ref [] in
+        let on_disconnected (block : Types.block) =
+          match block.transactions with
+          | _cb :: txs -> disconnected_txs := txs @ !disconnected_txs
+          | [] -> ()
+        in
         let disconnect_result =
           match utxo_set with
-          | Some utxo -> disconnect_to_target_via_utxo state utxo parent_entry
+          | Some utxo ->
+            disconnect_to_target_via_utxo ~on_disconnected state utxo
+              parent_entry
           | None -> disconnect_to_target state parent_entry
         in
         (match disconnect_result with
          | Error e -> Error e
          | Ok () ->
+           (* Core InvalidateBlock: MaybeUpdateMempoolForReorg after the
+              disconnect, under cs_main, before ActivateBestChain — so the
+              pool holds the disconnected txs that are valid at the new tip
+              and nothing that is non-final / sequence-locked / immature
+              there (txs of the invalidated blocks included). *)
+           (match state.chain_mempool with
+            | Some mp ->
+              update_mempool_for_reorg mp ~disconnected:!disconnected_txs
+                ~connected:[]
+            | None -> ());
            (* After the rewind, try to activate the best remaining valid
               chain (a side-branch already on disk with more work). Mirrors
               Core's [ActivateBestChain] firing at the end of
@@ -9753,8 +9831,9 @@ let peer_has_header (_peer : Peer.peer) (_hash : Types.hash256) : bool =
 (* Reconsider a previously invalidated block.
    Clears the invalid flag from the block and all its descendants/ancestors,
    then triggers chain selection to potentially reorg to a better chain. *)
-let reconsider_block (state : chain_state) (hash : Types.hash256)
-    : (int, string) result =
+let reconsider_block (state : chain_state)
+    ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
+    (hash : Types.hash256) : (int, string) result =
   let hash_key = Cstruct.to_string hash in
   match Hashtbl.find_opt state.headers hash_key with
   | None -> Error "Block not found"
@@ -9788,16 +9867,31 @@ let reconsider_block (state : chain_state) (hash : Types.hash256)
       m "Cleared invalid flags from %d descendant blocks"
         (List.length descendants));
     (* Find the best valid chain - may now include the reconsidered block *)
+    (* Core ReconsiderBlock -> ResetBlockFailureFlags, then the RPC runs
+       ActivateBestChain.  This used to report the best candidate's height
+       and change nothing ("caller would need to handle full reorg"), so the
+       node stayed on the invalidate's parent even after a re-announce.
+       Activate through [reorganize] (pure connect when the candidate extends
+       the validated tip; disconnect + connect across a fork), which also
+       keeps the mempool consistent (removeForBlock / refill). *)
     match find_best_valid_tip state with
     | Some best when
         (match state.tip with
          | Some tip -> Consensus.work_compare best.total_work tip.total_work > 0
          | None -> true) ->
       Logs.info (fun m ->
-        m "Reconsidered chain has more work, new best tip at height %d"
+        m "Reconsidered chain has more work, activating best tip at height %d"
           best.height);
-      (* Update tip - caller would need to handle full reorg with UTXO updates *)
-      Ok best.height
+      let ibd = create_ibd_state ?utxo_set state in
+      (match reorganize ibd best with
+       | Ok () -> Ok best.height
+       | Error e ->
+         Logs.warn (fun m ->
+           m "reconsiderblock: activation to height %d failed: %s"
+             best.height e);
+         (match state.tip with
+          | Some t -> Ok t.height
+          | None -> Ok 0))
     | _ ->
       match state.tip with
       | Some tip -> Ok tip.height

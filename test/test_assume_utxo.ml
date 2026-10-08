@@ -1878,7 +1878,7 @@ let test_b8_dumptxoutset_txoutset_hash_is_muhash_not_hash_serialized () =
    will fail.
    ----------------------------------------------------------------------- *)
 let test_b9_dumptxoutset_missing_nchaintx_field () =
-  let name = "B9: dumptxoutset response missing nchaintx field" in
+  let name = "B9: dumptxoutset response carries nchaintx (fixed)" in
   let (ctx, db, dir) = make_dump_test_ctx () in
   let path = unique_dump_path "b9_nchaintx" in
   (try Sys.remove path with _ -> ());
@@ -1888,11 +1888,13 @@ let test_b9_dumptxoutset_missing_nchaintx_field () =
   match result with
   | Error msg -> test_failed name ("dumptxoutset failed: " ^ msg)
   | Ok (`Assoc fields) ->
+    (* FIXED (dumptxoutset-fix): Core pushes nchaintx =
+       m_chain_tx_count of the base -- genesis-only chain -> 1. *)
     (match List.assoc_opt "nchaintx" fields with
-     | Some _ ->
-       test_failed name "nchaintx present — B9 may be fixed; remove test"
-     | None ->
-       test_passed name)  (* B9 confirmed — field absent *)
+     | Some (`Int 1) -> test_passed name
+     | Some j -> test_failed name ("nchaintx = " ^ Yojson.Safe.to_string j
+                                   ^ ", want 1 (genesis m_chain_tx_count)")
+     | None -> test_failed name "nchaintx absent (Core always reports it)")
   | Ok _ -> test_failed name "expected Assoc response"
 
 (* -----------------------------------------------------------------------

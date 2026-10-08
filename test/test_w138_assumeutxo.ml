@@ -638,10 +638,12 @@ let test_g28_txoutset_hash_post_restore_drift () =
 let test_g29_dumptxoutset_nchaintx_field_absent () =
   let src_has = source_contains ~path:(rpc_ml ())
                   ~needle:"\"nchaintx\"" in
+  (* FIXED (dumptxoutset-fix): the response now carries nchaintx; the
+     behavioural pin is test_assume_utxo B9 + test_chain_lock. *)
   Alcotest.(check bool)
-    "G29: rpc.ml dumptxoutset response omits 'nchaintx' field \
-     (BUG-W138-17 / W102 B9 re-pinned)"
-    false src_has
+    "G29: rpc.ml dumptxoutset response carries 'nchaintx' \
+     (BUG-W138-17 fixed)"
+    true src_has
 
 (* G30: pruned-mode dumptxoutset precondition (Core 3164-3170 parity). *)
 let test_g30_dumptxoutset_pruned_mode_check () =

@@ -384,11 +384,13 @@ let test_g21_bip22_result_strings () =
     true (contains_substring src "\"high-hash\"" &&
           contains_substring src "\"bad-txnmrklroot\"" &&
           contains_substring src "\"bad-cb-amount\"");
-  (* W108 BUG-15 carry: no duplicate / duplicate-invalid arm. *)
+  (* W108 BUG-15 carry, FIXED (invalidated-submit, 2026-10-08): submitblock
+     answers Core's "duplicate" / "duplicate-invalid" (Mining.submit_block
+     index-state check; behaviour pinned in test_chain_lock "INV-SUBMIT"). *)
   Alcotest.(check bool)
-    "G21 (pre-fix): no `duplicate` BIP-22 token (W108 BUG-15)"
-    false (contains_substring src "\"duplicate\"" &&
-           contains_substring src "\"duplicate-invalid\"")
+    "G21 (fixed): `duplicate` / `duplicate-invalid` BIP-22 tokens (W108 BUG-15)"
+    true (contains_substring src "\"duplicate\"" &&
+          contains_substring src "\"duplicate-invalid\"")
 
 (* G22 — submitblock side-branch / reorg path. *)
 let test_g22_submitblock_side_branch_path () =

@@ -169,10 +169,19 @@ let build fx ?fee ?tag h txs =
 
 (* 101 blocks through the catch-up path, flushed; then FullySynced.  The
    coin cache holds 50 entries so the low coinbases are store-only. *)
-let with_fx ~label ?(cache = 50) f =
+let with_fx ~label ?(cache = 50) ?(dual = false) f =
   Test_tmp.with_dir ~label ~mkdir:true (fun path ->
-    let db = Storage.ChainDB.create path in
+    let db = Storage.ChainDB.create (Filename.concat path "chain") in
+    (* [~dual:true]: the live node's layout -- coins in rocksdb_utxo, which
+       the OptimizedUtxoSet reads, mirrored into the CF (cli.ml). *)
+    let rdb =
+      if dual then begin
+        let r = Rocksdb_store.open_db (Filename.concat path "rocksdb") in
+        Storage.ChainDB.attach_rocksdb_utxo db r;
+        Some r
+      end else None in
     Fun.protect ~finally:(fun () ->
+        (match rdb with Some r -> (try Rocksdb_store.close r with _ -> ()) | None -> ());
         Atomic.set Utxo.OptimizedUtxoSet.after_db_read_hook (fun _ -> ());
         Fatal.write_fault_hook := None;
         Rpc.test_sync_sleep_s := 0.0;
@@ -181,7 +190,7 @@ let with_fx ~label ?(cache = 50) f =
       (fun () ->
         let state = Sync.create_chain_state db Consensus.regtest in
         let genesis = Option.get state.Sync.tip in
-        let utxo = Utxo.OptimizedUtxoSet.create ~cache_size:cache db in
+        let utxo = Utxo.OptimizedUtxoSet.create ~cache_size:cache ?rocksdb:rdb db in
         Sync.shared_utxo_set := Some utxo;
         let mp_utxo = Utxo.UtxoSet.create db in
         let network = Consensus.regtest in
@@ -607,6 +616,67 @@ let test_dump_rollback_headers_ahead () =
       Alcotest.(check bool) "rollback dump succeeds" true ok;
       Alcotest.(check int) "tip restored to 105" 105 fx.state.Sync.blocks_synced))
 
+(* Rollback deeper than one block with spends in the rolled-back blocks
+   (no race).  Core TemporaryRollback: dump at the base, live chain back at
+   the tip, the coin set the tip's.  Deployed 1d582b1 rewound only the CF
+   coins (DB-direct disconnect_to_target) while validation reads the live
+   OptimizedUtxoSet: the restore re-connected base+1 against the tip's coins
+   -> "duplicate txid in UTXO set (BIP30)", node left at the base height
+   with the tip's coins.  Then a block spending an output created in the
+   restored tip must connect (the coins really are the tip's). *)
+let test_dump_rollback_spends () =
+  List.iter (fun depth ->
+    with_fx ~label:(Printf.sprintf "cl_dump_sp%d" depth) ~cache:10_000 ~dual:true
+      (fun fx ->
+      connect_now fx (build fx ~tag:1 102 []);
+      connect_now fx (build fx ~tag:1 103 []);
+      let t104 = spend ~tag:4 fx.cb.(1) subsidy in
+      connect_now fx (build fx ~fee:1000L ~tag:1 104 [ t104 ]);
+      let t105 = spend ~tag:5 fx.cb.(2) subsidy in
+      connect_now fx (build fx ~fee:1000L ~tag:1 105 [ t105 ]);
+      let base = 105 - depth in
+      let ref_base = reference_set fx.blocks base in
+      let ref105 = reference_set fx.blocks 105 in
+      Test_tmp.with_dir ~label:"cl_dumpfile_sp" ~mkdir:true (fun dir ->
+        let path = Filename.concat dir "utxo.dat" in
+        let r = Lwt_main.run (Rpc.handle_single_request_lwt fx.ctx
+                  (json_req "dumptxoutset" [ `String path; `String "rollback";
+                     `Assoc [ ("rollback", `Int base) ] ])) in
+        let res = match r with
+          | `Assoc fs -> (match List.assoc_opt "result" fs with
+              | Some (`Assoc r) -> Some r | _ -> None)
+          | _ -> None in
+        let s = show_resp r in
+        Printf.printf "  depth %d: %s\n  tip after: %d\n%!" depth
+          (if String.length s > 240 then String.sub s 0 240 else s)
+          fx.state.Sync.blocks_synced;
+        (match res with
+         | None -> Alcotest.failf "depth %d: dumptxoutset failed: %s" depth s
+         | Some r ->
+           let i k = match List.assoc_opt k r with Some (`Int n) -> n | _ -> -1 in
+           Alcotest.(check int) "base_height" base (i "base_height");
+           Alcotest.(check int) "coins_written == set at base"
+             (List.length ref_base) (i "coins_written");
+           ignore i);
+        Alcotest.(check int) "tip restored to 105" 105 fx.state.Sync.blocks_synced;
+        Alcotest.(check bool) "CF coin set == reference at 105" true
+          (set_hash (cf_set fx.db) = set_hash ref105);
+        Alcotest.(check bool) "live set: t105's output present" true
+          (coin fx (Crypto.compute_txid t105) 0);
+        (* A block spending t105:0 connects on the restored tip. *)
+        let b106 = build fx ~fee:1000L ~tag:1 106
+            [ spend ~tag:6 (Crypto.compute_txid t105) (Int64.sub subsidy 1000L) ] in
+        connect_now fx b106;
+        Alcotest.(check int) "106 connects on the restored chain" 106
+          fx.state.Sync.blocks_synced;
+        (match res with
+         | Some r ->
+           (* genesis + 1 tx per block + the spends at/below the base *)
+           Alcotest.(check (option int)) "nchaintx = m_chain_tx_count of the base"
+             (Some (1 + base + (if base >= 104 then 1 else 0)))
+             (match List.assoc_opt "nchaintx" r with Some (`Int n) -> Some n | _ -> None)
+         | None -> ())))) [1; 2; 3]
+
 (* Every connect path honours the NetworkDisable flag (deterministic: the
    flag is set directly, no race).  Core: network activity is disabled
    for the whole rollback, so no block connects. *)
@@ -698,6 +768,8 @@ let () =
         test_dump_rollback_race;
       Alcotest.test_case "rollback with headers ahead of blocks" `Quick
         test_dump_rollback_headers_ahead;
+      Alcotest.test_case "rollback depth 1-3 with spends restores the tip"
+        `Quick test_dump_rollback_spends;
       Alcotest.test_case "every connect path honours the pause" `Quick
         test_pause_honoured;
     ];

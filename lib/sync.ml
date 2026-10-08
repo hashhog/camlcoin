@@ -5731,10 +5731,18 @@ let disconnect_to_target ?(from_validated_tip = false)
    Also rewinds the coin-stats index to [target.height] (no-op when the
    index is off).  Mirrors Bitcoin Core's [InvalidateBlock] -> [DisconnectTip]
    loop operating on the active Chainstate's CoinsTip ([validation.cpp]). *)
-let disconnect_to_target_via_utxo (state : chain_state)
+let disconnect_to_target_via_utxo ?(from_validated_tip = false)
+    (state : chain_state)
     (utxo : Utxo.OptimizedUtxoSet.t) (target : header_entry)
     : (unit, string) result =
-  match state.tip with
+  (* [~from_validated_tip:true] (dumptxoutset rollback): walk from the
+     ACTIVE validated tip (Core DisconnectTip on m_chain), not the best-work
+     header -- same reasoning as [disconnect_to_target]. *)
+  let current =
+    if from_validated_tip then
+      (match block_tip state with Some _ as t -> t | None -> state.tip)
+    else state.tip in
+  match current with
   | None -> Error "No current tip"
   | Some current_tip when current_tip.height < target.height ->
     Error (Printf.sprintf

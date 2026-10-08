@@ -11680,16 +11680,49 @@ let handle_dumptxoutset (_ctx : rpc_context)
            _ctx.chain.block_submission_paused <- false;
            Error (Printf.sprintf "rollback failed: pre-rollback flush: %s" e)
          | Ok () ->
+        (* Rewind the coins the node actually validates against.  The
+           DB-direct [disconnect_to_target] rewrites only cf_chainstate, but
+           the live [OptimizedUtxoSet] (what [reorganize] / every connect
+           reads) is backed by the separate rocksdb_utxo store: the restore
+           then re-connected base+1 against the TIP's coins and failed
+           "duplicate txid in UTXO set (BIP30)", leaving the node at the base
+           height with the tip's coins (dumptxoutset-rollback-sweep, every
+           depth).  Core TemporaryRollback = InvalidateBlock -> DisconnectTip
+           on the one CoinsTip (validation.cpp), so rewind through the live
+           set, which persists both stores and the tip atomically. *)
         match
-           (try Sync.disconnect_to_target ~from_validated_tip:true _ctx.chain target
+           (try
+              match _ctx.utxo with
+              | Some u ->
+                Sync.disconnect_to_target_via_utxo ~from_validated_tip:true
+                  _ctx.chain u target
+              | None ->
+                Sync.disconnect_to_target ~from_validated_tip:true
+                  _ctx.chain target
             with e -> Error (Printexc.to_string e))
          with
          | Error e ->
+           (* Partial rewind: put the chain back before reporting (Core's
+              TemporaryRollback destructor reconsiders on every exit). *)
+           let ibd = Sync.create_ibd_state _ctx.chain in
+           (match Sync.block_tip _ctx.chain with
+            | Some t when not (Cstruct.equal t.hash tip.hash) ->
+              ignore (try Sync.reorganize ibd tip
+                      with ex -> Error (Printexc.to_string ex))
+            | _ -> ());
+           _ctx.chain.tip <- saved_header_tip;
            _ctx.chain.block_submission_paused <- false;
            Error (Printf.sprintf "rollback failed: %s" e)
          | Ok () ->
            let bh, bhash = base () in
-           Ok (`Cf, Some (tip, saved_header_tip), bh, bhash))
+           (* One frozen view at the base (Core PrepareUTXOSnapshot takes a
+              cursor under cs_main): the same store validation reads. *)
+           let view =
+             match _ctx.utxo with
+             | Some u -> `View (Utxo.OptimizedUtxoSet.capture_view u)
+             | None -> `Cf
+           in
+           Ok (view, Some (tip, saved_header_tip), bh, bhash))
     in
     match Main_thread.run begin_step with
     | Error e -> Error e
@@ -11805,14 +11838,19 @@ let handle_dumptxoutset (_ctx : rpc_context)
                  "dumptxoutset: coins_written %Ld != coins_count %Ld"
                  coins_written total_coins)
       else
-        Ok (`Assoc [
+        Ok (`Assoc ([
           ("coins_written", `Int (Int64.to_int coins_written));
           ("base_hash", `String (Types.hash256_to_hex_display base_hash));
           ("base_height", `Int base_height);
           ("path", `String path);
           ("txoutset_hash",
              `String (Types.hash256_to_hex_display txoutset_hash));
-        ])
+        ] @ (
+          (* Core result.pushKV("nchaintx", tip->m_chain_tx_count)
+             (rpc/blockchain.cpp WriteUTXOSnapshot). *)
+          match Storage.ChainDB.get_chain_tx_count _ctx.chain.db base_hash with
+          | Some n -> [("nchaintx", `Int (Int64.to_int n))]
+          | None -> [])))
 
 (* ============================================================================
    gettxoutsetinfo Handler

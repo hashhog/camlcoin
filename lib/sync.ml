@@ -2691,6 +2691,21 @@ let header_sync_can_download (state : chain_state) : bool =
       || Consensus.work_compare tip_work
            state.network.minimum_chain_work >= 0)
 
+(* Which HeadersMsg the cli listener handles.  After FullySynced every peer
+   qualifies.  Before that the blocking [sync_headers] loop owns the socket of
+   a peer WITHOUT a message loop, so only a looped peer's headers reach the
+   listener -- and with no outbound peer (inbound-only node) nothing else will
+   ever consume them while we are Idle.  Core processes headers from any
+   handshaked peer regardless of direction (net_processing.cpp ProcessMessage
+   HEADERS -> ProcessHeadersMessage).  SyncingHeaders is excluded: the
+   blocking loop is running and a second consumer would race it. *)
+let accepts_looped_peer_headers ~(sync_state : sync_state)
+    ~(msg_loop_started : bool) : bool =
+  match sync_state with
+  | FullySynced -> true
+  | Idle -> msg_loop_started
+  | SyncingHeaders | SyncingBlocks -> false
+
 let header_sync_stalled_next_state (state : chain_state) : sync_state =
   if header_sync_can_download state then SyncingBlocks else Idle
 

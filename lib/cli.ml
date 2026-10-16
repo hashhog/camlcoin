@@ -1911,7 +1911,10 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
      arrive and extend our chain, process them and request the blocks. *)
   Peer_manager.add_listener peer_manager (fun msg peer ->
     match msg with
-    | P2p.HeadersMsg headers when chain.sync_state = Sync.FullySynced ->
+    | P2p.HeadersMsg headers
+      when Sync.accepts_looped_peer_headers
+             ~sync_state:chain.sync_state
+             ~msg_loop_started:peer.Peer.msg_loop_started ->
       (* W33 post-IBD gap-fill: request missing bodies when headers arrive
          after FullySynced. W39: still run when process_headers returns
          non-Ok (duplicate/stale locator batches). 2026-09-19: do NOT
@@ -1925,6 +1928,21 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         | Error _ -> 0
       in
       if accepted > 0 then last_stale_rerequest_tip := None;
+      (* Nothing is driving header sync (the blocking loop only reads from
+         a peer WITHOUT a message loop, so an inbound-only node never runs
+         it).  Core takes headers from any handshaked peer and walks them
+         toward that peer's best block; hand the accepted headers to the
+         catch-up IBD (status tick) the same way, and ask for the next batch
+         when this one was full. *)
+      if chain.sync_state = Sync.Idle && accepted > 0 then begin
+        if Sync.header_sync_can_download chain then
+          chain.sync_state <- Sync.SyncingBlocks;
+        if List.length headers >= P2p.max_headers_count then
+          Lwt.async (fun () ->
+            Lwt.catch
+              (fun () -> Sync.request_headers chain peer)
+              (fun _ -> Lwt.return_unit))
+      end;
       (match List.rev headers with
        | h :: _ ->
          let hash = Crypto.compute_block_hash h in

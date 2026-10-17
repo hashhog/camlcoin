@@ -1922,8 +1922,16 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
          requested 2289 hashes (2000-header batch + 289 snapshot holes)
          and connected none of them. Cap at max_blocks_per_peer from
          block_tip+1; connect_stored_blocks drains the rest from disk. *)
+      let syncing = chain.sync_state <> Sync.FullySynced in
+      let outcome =
+        if syncing then
+          Sync.process_looped_peer_headers chain ~peer_id:peer.Peer.id headers
+        else
+          { Sync.looped_result = Sync.process_headers chain headers;
+            via_lowwork = false; request_more = false }
+      in
       let accepted =
-        match Sync.process_headers chain headers with
+        match outcome.Sync.looped_result with
         | Ok n -> n
         | Error _ -> 0
       in
@@ -1933,11 +1941,12 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
          it).  Core takes headers from any handshaked peer and walks them
          toward that peer's best block; hand the accepted headers to the
          catch-up IBD (status tick) the same way, and ask for the next batch
-         when this one was full. *)
-      if chain.sync_state = Sync.Idle && accepted > 0 then begin
-        if Sync.header_sync_can_download chain then
+         when this one was full (or PRESYNC needs the next one). *)
+      if syncing then begin
+        if chain.sync_state = Sync.Idle && accepted > 0
+           && Sync.header_sync_can_download chain then
           chain.sync_state <- Sync.SyncingBlocks;
-        if List.length headers >= P2p.max_headers_count then
+        if outcome.Sync.request_more then
           Lwt.async (fun () ->
             Lwt.catch
               (fun () -> Sync.request_headers chain peer)
@@ -1964,7 +1973,8 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         | Some t -> t.height | None -> 0 in
       (match chain.tip with
        | Some t
-         when Sync.should_rerequest_from_tip ~accepted
+         when (not outcome.Sync.via_lowwork)
+              && Sync.should_rerequest_from_tip ~accepted
                 ~received:(List.length headers) ~our_tip_hash:t.Sync.hash
                 headers
               && not

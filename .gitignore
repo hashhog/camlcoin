@@ -15,3 +15,15 @@ _opam/
 # Project-meta audit artifacts live in the meta-repo (audit-archive/).
 audit/
 CORE-PARITY-AUDIT/
+
+# Local run state, logs and crash dumps (never commit these)
+*.log
+*.crashdump
+erl_crash.dump
+anchors.dat
+peers.dat
+peers.json
+mempool.dat
+fee_estimates.dat
+.cookie
+rebar.lock

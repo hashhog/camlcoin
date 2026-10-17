@@ -1,56 +1,49 @@
-# Security Policy — camlcoin
+# Security policy
 
-camlcoin is a from-scratch Bitcoin full-node implementation in OCaml, part of the
-[hashhog](https://github.com/hashhog) fleet of ten independent nodes that
-cross-validate each other and Bitcoin Core.
-
-## Project maturity — read this first
-
-camlcoin is a **pre-release validator**: a node you can build and run *beside*
-Bitcoin Core with `consensus-diff` as a live divergence alarm. It has NOT
-completed an independent `--assumevalid=0` genesis→tip validation, and it
-currently runs loopback-pinned to a Core peer in the fleet.
-
-**It is NOT fund-capable.** Do not custody funds on it. There are no fund-grade
-guarantees. Run from a pinned commit or tag.
+camlcoin is an experimental, from-scratch Bitcoin full node in OCaml, one of the ten
+[hashhog](https://github.com/hashhog) nodes. It is for research and testing. Do not use
+it with real funds: the wallet has not been audited and there are no fund-safety
+guarantees.
 
 ## Supported versions
 
 | Version | Supported |
-|---------|-----------|
-| `v0.1.0-beta1` | Best-effort; no security SLA until a final `v1.0.0` |
-| pre-release (`master`) | Best-effort |
+|---|---|
+| latest tag | best effort |
+| `master` | best effort |
 
-Release-signing key fingerprint: to be published with v1.0.0.
+There is no security SLA and no release-signing key yet.
 
 ## Reporting a vulnerability
 
-**Please do NOT open a public GitHub issue** for anything in the consensus, P2P, or
-wallet paths — a public report could put real Bitcoin nodes or funds at risk.
+Do not open a public GitHub issue for problems in consensus, P2P or wallet code: a public
+report could put other nodes or users at risk.
 
-Report privately to the maintainer:
+Report privately by email to `max@dockyard.navy`.
 
-- **Email:** `max@dockyard.navy`  <!-- TODO(max): confirm or replace with a dedicated security alias -->
+Include the affected code, a reproduction (a regtest script, a malformed message, or a
+block or transaction), the impact, and a suggested fix if you have one. We will agree a
+fix and disclosure timeline with you and credit you if you wish.
 
-Include the affected path, a deterministic reproduction (a diff-test corpus entry,
-regtest script, or malformed message), impact, and any suggested fix. We coordinate
-a fix + disclosure timeline and credit you if you wish.
+## In scope
 
-## In scope (highest priority)
-
-- **Consensus divergence** — camlcoin accepting a block/tx Core rejects, or vice-versa.
-- **Remotely-triggerable crashes / OOM / resource exhaustion** in the P2P or
-  block/tx decode paths, including GC-pressure amplification.
-- **Wallet funds-safety** — wrong-key signing, a spend the node reports valid that
-  the network rejects, un-recoverable backups, fee miscalculation.
-- **Chainstate corruption on crash** (WAL-backed recovery; regressions are in scope).
+- Consensus divergence: camlcoin accepting a block or transaction that Bitcoin Core
+  rejects, or rejecting one that Core accepts.
+- Remotely triggerable crashes, hangs, or memory or CPU exhaustion in P2P message
+  handling or block and transaction decoding.
+- Wallet safety: signing with the wrong key, spends the network rejects, backups that
+  cannot be restored, wrong fees.
+- Chainstate corruption after a crash or an unclean shutdown.
 
 ## Out of scope
 
-- IBD/sync performance characteristics.
-- Issues requiring an already-compromised host.
+- Sync speed.
+- Problems that need an already compromised host.
+- The default RPC credentials (`camlcoin`/`camlcoin`): they are documented, and RPC
+  binds to `127.0.0.1` by default. Set your own if the port is reachable by others.
 
-## Disclosure
+## Fixing
 
-Coordinated disclosure. Consensus fixes are verified with `../tools/verify-fix.sh` and
-gated through the differential corpus before they are considered landed.
+Consensus fixes come with a test that fails before the fix and passes after it, and with
+evidence that the new behaviour matches Bitcoin Core (see
+[CONTRIBUTING.md](CONTRIBUTING.md#consensus-changes)).

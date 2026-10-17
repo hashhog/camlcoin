@@ -2691,6 +2691,101 @@ let header_sync_can_download (state : chain_state) : bool =
       || Consensus.work_compare tip_work
            state.network.minimum_chain_work >= 0)
 
+(* Which HeadersMsg the cli listener handles.  After FullySynced every peer
+   qualifies.  Before that the blocking [sync_headers] loop owns the socket of
+   a peer WITHOUT a message loop, so only a looped peer's headers reach the
+   listener -- and with no outbound peer (inbound-only node) nothing else will
+   ever consume them while we are Idle.  Core processes headers from any
+   handshaked peer regardless of direction (net_processing.cpp ProcessMessage
+   HEADERS -> ProcessHeadersMessage).  SyncingHeaders is excluded: the
+   blocking loop is running and a second consumer would race it.
+   SyncingBlocks is included: [sync_headers] sets SyncingHeaders for as long
+   as it runs, so in SyncingBlocks nothing else reads headers, and the reply
+   to the getheaders we sent after a full batch (which is what flipped us
+   from Idle to SyncingBlocks) must still be taken or an inbound-only peer
+   more than one batch ahead is never followed past it. *)
+let accepts_looped_peer_headers ~(sync_state : sync_state)
+    ~(msg_loop_started : bool) : bool =
+  match sync_state with
+  | FullySynced -> true
+  | Idle | SyncingBlocks -> msg_loop_started
+  | SyncingHeaders -> false
+
+(* What a looped peer's HEADERS batch did before FullySynced. *)
+type looped_headers_outcome = {
+  looped_result : (int, string) result;
+  (* As [process_headers]: headers written to the header tree. *)
+  via_lowwork : bool;
+  (* The batch went to the PRESYNC/REDOWNLOAD pipeline, not the tree. *)
+  request_more : bool;
+  (* Send this peer the next getheaders. *)
+}
+
+(* A looped peer's headers while we are not FullySynced, routed exactly as
+   [sync_headers] routes them: below minimum_chain_work with no blocks
+   (from-genesis) every non-empty batch goes through PRESYNC/REDOWNLOAD
+   (Core TryLowWorkHeadersSync), so nothing is stored until the peer's chain
+   has proven the work; otherwise [process_headers] with the too-little-
+   chainwork gate on unless an assumeUTXO base is already trusted.  Without
+   this an inbound peer could fill a fresh node's header tree with a cheap
+   chain the blocking loop would never have stored. *)
+let process_looped_peer_headers (state : chain_state) ~(peer_id : int)
+    (headers : Types.block_header list) : looped_headers_outcome =
+  let full = List.length headers >= P2p.max_headers_count in
+  let direct () =
+    let r =
+      process_headers ~min_pow_checked:(state.blocks_synced > 0) state headers
+    in
+    { looped_result = r; via_lowwork = false;
+      request_more = full && (match r with Ok n -> n > 0 | Error _ -> false) }
+  in
+  let ps =
+    if headers = [] || not (needs_lowwork_sync ~chain_state:state) then None
+    else
+      match get_peer_headers_sync state peer_id with
+      | Some existing when existing.state <> Synced -> Some existing
+      | _ ->
+        (match state.tip with
+         | None -> None
+         | Some chain_start ->
+           let fresh = create_presync_state ~peer_id ~chain_start in
+           Hashtbl.replace state.peer_headers_sync peer_id fresh;
+           Logs.info (fun m ->
+             m "Started PRESYNC for looped peer %d at chain_start height=%d \
+                (tip_work < minimum_chain_work)" peer_id chain_start.height);
+           Some fresh)
+  in
+  match ps with
+  | None -> direct ()
+  | Some ps ->
+    let fail e =
+      Logs.warn (fun m ->
+        m "PRESYNC/REDOWNLOAD failure for looped peer %d: %s — dropping state"
+          peer_id e);
+      cleanup_peer_headers_sync state peer_id;
+      { looped_result = Error e; via_lowwork = true; request_more = false }
+    in
+    (match get_header_sync_phase ps with
+     | `Presync ->
+       (match process_presync_headers ~ps ~headers ~network:state.network with
+        | Ok _ ->
+          reset_unconnecting_headers state peer_id;
+          (* A full batch continues PRESYNC; reaching the work threshold
+             starts REDOWNLOAD, which needs its own request. *)
+          { looped_result = Ok 0; via_lowwork = true;
+            request_more = full || get_header_sync_phase ps = `Redownload }
+        | Error e -> fail e)
+     | `Redownload ->
+       (match process_redownload_headers ~ps ~headers ~chain_state:state with
+        | Ok released ->
+          reset_unconnecting_headers state peer_id;
+          { looped_result = Ok (List.length released); via_lowwork = true;
+            request_more = full }
+        | Error e -> fail e)
+     | `Synced ->
+       cleanup_peer_headers_sync state peer_id;
+       direct ())
+
 let header_sync_stalled_next_state (state : chain_state) : sync_state =
   if header_sync_can_download state then SyncingBlocks else Idle
 

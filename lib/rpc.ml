@@ -692,8 +692,17 @@ let handle_getblockheader (ctx : rpc_context)
        in
        (* mediantime in RPC output = GetMedianTimePast() which INCLUDES the
           current block (Core src/chain.h:233). Use the display variant
-          that starts at [height] (not [height-1] used for validation MTP). *)
-       let median_time = Sync.compute_median_time_for_display ctx.chain height in
+          that starts at [height] (not [height-1] used for validation MTP).
+          Off the active chain (headers-only, fork) the height index has no
+          entry for this block -- only connected blocks are indexed -- and
+          that walk answered 0; Core walks pprev, so walk the parents. *)
+       let median_time =
+         match entry with
+         | Some e when not in_active_chain ->
+           Consensus.median_time_past
+             (Sync.collect_ancestor_timestamps ctx.chain e 11)
+         | _ -> Sync.compute_median_time_for_display ctx.chain height
+       in
        (* nTx: read from the dedicated ntx index first (written at connect
           for every block this node connected, including assume-valid IBD);
           fall back to counting from the locally held block body.  When

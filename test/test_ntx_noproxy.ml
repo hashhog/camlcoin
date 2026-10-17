@@ -214,6 +214,58 @@ let test_getblockheader_header_only_ntx_zero () =
     | Ok j -> Alcotest.failf "unexpected %s" (Yojson.Safe.to_string j)
     | Error (c, m) -> Alcotest.failf "error %d %s" c m)
 
+(* getblockheader mediantime for a header we hold but have not connected.
+   Core's CBlockIndex::GetMedianTimePast walks pprev from this block, so a
+   headers-only entry has a real mediantime.  camlcoin walked the
+   height->hash index, which only connected blocks populate, and answered 0
+   (Core v31.1 regtest warden_invalidated_submit/p2p-header/valid:mediantime:
+   core=1700000204 node=0, once camlcoin stored the P2P-delivered header). *)
+let test_getblockheader_header_only_mediantime () =
+  Test_tmp.with_chaindb (fun db ->
+    let network = Consensus.regtest in
+    let chain = Sync.create_chain_state db network in
+    let utxo = Utxo.UtxoSet.create db in
+    let mempool =
+      Mempool.create ~network ~require_standard:false ~verify_scripts:false
+        ~utxo ~current_height:0 ()
+    in
+    let ctx : Rpc.rpc_context = {
+      chain; mempool; peer_manager = Peer_manager.create network;
+      wallet = None; wallet_manager = None;
+      fee_estimator = Fee_estimation.create (); network;
+      filter_index = None; utxo = None; data_dir = None;
+      snapshot_activation = None;
+    } in
+    let g = network.Consensus.genesis_header in
+    let mine prev ts =
+      let rec go nonce =
+        let h = { g with Types.prev_block = prev; timestamp = ts; nonce } in
+        if Consensus.hash_meets_target (Crypto.compute_block_hash h) h.bits
+        then h else go (Int32.add nonce 1l)
+      in
+      go 0l
+    in
+    (* genesis, +600, +1200, +1800: median of the four (Core sorts and
+       takes element n/2) is genesis+1200. *)
+    let h1 = mine network.Consensus.genesis_hash (Int32.add g.Types.timestamp 600l) in
+    let h2 = mine (Crypto.compute_block_hash h1) (Int32.add g.Types.timestamp 1200l) in
+    let h3 = mine (Crypto.compute_block_hash h2) (Int32.add g.Types.timestamp 1800l) in
+    (match Sync.process_headers chain [h1; h2; h3] with
+     | Ok 3 -> ()
+     | Ok n -> Alcotest.failf "stored %d of 3 headers" n
+     | Error e -> Alcotest.failf "headers rejected: %s" e);
+    let hex = Types.hash256_to_hex_display (Crypto.compute_block_hash h3) in
+    match Rpc.dispatch_rpc ctx "getblockheader" [`String hex] with
+    | Ok (`Assoc fs) ->
+      Alcotest.(check bool) "headers-only: not on the active chain" true
+        (List.assoc_opt "confirmations" fs = Some (`Int (-1)));
+      Alcotest.(check (option int)) "mediantime walks the parents (Core pprev)"
+        (Some (Int32.to_int (Int32.add g.Types.timestamp 1200l)))
+        (match List.assoc_opt "mediantime" fs with
+         | Some (`Int v) -> Some v | _ -> None)
+    | Ok j -> Alcotest.failf "unexpected %s" (Yojson.Safe.to_string j)
+    | Error (c, m) -> Alcotest.failf "error %d %s" c m)
+
 let () =
   Alcotest.run "R3 no-proxy (camlcoin)" [
     "source_guard", [
@@ -229,5 +281,7 @@ let () =
         test_second_run_skipped ];
     "getblockheader", [
       Alcotest.test_case "header-only block -> nTx 0, no oracle" `Quick
-        test_getblockheader_header_only_ntx_zero ];
+        test_getblockheader_header_only_ntx_zero;
+      Alcotest.test_case "header-only block -> mediantime from parents" `Quick
+        test_getblockheader_header_only_mediantime ];
   ]

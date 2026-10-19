@@ -9563,10 +9563,72 @@ let find_best_valid_tip (state : chain_state) : header_entry option =
   ) state.headers;
   !best
 
+(* Make [best] the best header: in memory ([tip], getblockchaininfo
+   "headers") and the persisted header_tip that restore loads headers up to. *)
+let set_best_header (state : chain_state) (best : header_entry) : unit =
+  state.tip <- Some best;
+  state.headers_synced <- best.height;
+  Storage.ChainDB.set_header_tip state.db best.hash best.height
+
+(* Core ChainstateManager::RecalculateBestHeader (validation.cpp): start at
+   the active tip and take any header with strictly more work that is not
+   marked failed. *)
+let recalculate_best_header (state : chain_state) : unit =
+  match block_tip state with
+  | None -> ()
+  | Some active ->
+    let best = ref active in
+    Hashtbl.iter (fun key (e : header_entry) ->
+      if not (Hashtbl.mem state.invalidated_blocks key)
+         && Consensus.work_compare e.total_work !best.total_work > 0
+      then best := e
+    ) state.headers;
+    set_best_header state !best
+
 (* Invalidate a block and all its descendants.
    If the block is on the active chain, rewind to its parent and switch to
-   the next best valid chain. Returns the new chain tip height. *)
-let invalidate_block (state : chain_state)
+   the next best valid chain. Returns the new chain tip height.
+
+   The best header follows Core's InvalidChainFound: when it descends from
+   the invalidated block it is recalculated once the active chain has
+   settled; otherwise it is left where it was.  The rewind below lowers it
+   to the parent (in memory and on disk), and a post-invalidate reorg onto
+   a side branch only moves the in-memory pointer, so without this the
+   persisted best header could sit below the active tip and a restart
+   would not load the tip's header at all.
+
+   The rewind also left the height->hash rows of the disconnected blocks
+   in place above the new tip (reorganize only truncates above the tip it
+   started from).  Restore loads headers through those rows up to the
+   persisted best header, so once the best header can sit above the
+   active tip a stale row would hand the invalidated block back as the
+   chain at that height.  Core's CChain::SetTip shrinks vChain to the new
+   tip; drop the rows above the settled active tip the same way. *)
+let rec invalidate_block (state : chain_state)
+    ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
+    (hash : Types.hash256) : (int, string) result =
+  let prev_best = state.tip in
+  let prev_active_height = state.blocks_synced in
+  let result = invalidate_block_inner state ?utxo_set hash in
+  (match result with
+   | Error _ -> ()
+   | Ok _ ->
+     if prev_active_height > state.blocks_synced then begin
+       let batch = Storage.ChainDB.batch_create () in
+       for h = state.blocks_synced + 1 to prev_active_height do
+         Storage.ChainDB.batch_delete_height_hash batch h
+       done;
+       Storage.ChainDB.batch_write state.db batch
+     end;
+     (match prev_best with
+      | Some pb
+        when not (Hashtbl.mem state.invalidated_blocks
+                    (Cstruct.to_string pb.hash)) ->
+        set_best_header state pb
+      | _ -> recalculate_best_header state));
+  result
+
+and invalidate_block_inner (state : chain_state)
     ?(utxo_set : Utxo.OptimizedUtxoSet.t option)
     (hash : Types.hash256) : (int, string) result =
   let hash_key = Cstruct.to_string hash in

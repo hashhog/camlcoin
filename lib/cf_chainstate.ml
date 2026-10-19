@@ -286,6 +286,10 @@ let put_block_header (t : t) (hash : Types.hash256) (data : string) =
 let get_block_header (t : t) (hash : Types.hash256) : string option =
   Rocksdb.cf_get t.db t.cfh_block_header (Cstruct.to_string hash)
 
+(* Every stored header: raw 32-byte hash key, serialized header value. *)
+let iter_block_headers (t : t) (f : string -> string -> unit) =
+  Rocksdb.cf_iter t.db t.cfh_block_header f
+
 (* Block bodies, keyed by 32-byte hash *)
 let put_block_data (t : t) (hash : Types.hash256) (data : string) =
   Rocksdb.cf_put t.db t.cfh_block_data (Cstruct.to_string hash) data

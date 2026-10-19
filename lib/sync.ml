@@ -1419,6 +1419,53 @@ let repair_failed_marks_on_active_chain (state : chain_state) : unit =
          | Some t -> string_of_int t.height | None -> "none"))
   end
 
+(* Load every stored header that the height-index walk left out: side
+   branches stored by submitblock or P2P, and blocks a reorg or
+   invalidateblock displaced from the active chain.  Core's LoadBlockIndex
+   (node/blockstorage.cpp) rebuilds the whole block tree, so after a
+   restart reconsiderblock, getblockheader and chain selection see the
+   same blocks they saw before it.  Each header gets its height and
+   chainwork from the in-memory entry its stored ancestry reaches; a
+   header whose ancestry never reaches one (a parent that was never
+   stored) is left out.  The best header and the active chain are not
+   touched.  Returns how many headers were added. *)
+let load_side_branch_headers (state : chain_state) : int =
+  let pending : (string, Types.block_header) Hashtbl.t = Hashtbl.create 64 in
+  Storage.ChainDB.iter_block_headers state.db
+    ~want:(fun key -> not (Hashtbl.mem state.headers key))
+    (fun key header -> Hashtbl.replace pending key header);
+  let orphan : (string, unit) Hashtbl.t = Hashtbl.create 16 in
+  let added = ref 0 in
+  (* Walk parent links through [pending] down to an in-memory entry.
+     [band] is the path from the anchor's child up to [key]. *)
+  let rec walk key band =
+    match Hashtbl.find_opt state.headers key with
+    | Some anchor -> `Anchored (anchor, band)
+    | None ->
+      if Hashtbl.mem orphan key then `Orphan band
+      else
+        match Hashtbl.find_opt pending key with
+        | None -> `Orphan band
+        | Some (header : Types.block_header) ->
+          walk (Cstruct.to_string header.prev_block) ((key, header) :: band)
+  in
+  Hashtbl.iter (fun key _ ->
+    if not (Hashtbl.mem state.headers key) && not (Hashtbl.mem orphan key) then
+      match walk key [] with
+      | `Orphan band ->
+        List.iter (fun (k, _) -> Hashtbl.replace orphan k ()) band
+      | `Anchored (anchor, band) ->
+        ignore (List.fold_left (fun (parent : header_entry) (k, header) ->
+          let e = { header; hash = Cstruct.of_string k;
+                    height = parent.height + 1;
+                    total_work = Consensus.work_add parent.total_work
+                        (work_from_bits header.Types.bits) } in
+          Hashtbl.replace state.headers k e;
+          incr added;
+          e) anchor band)
+  ) pending;
+  !added
+
 let restore_chain_state (db : Storage.ChainDB.t)
     (network : Consensus.network_config) : chain_state =
   (* Defense-in-depth: same BIP9/buried-deployment parity check as
@@ -1798,6 +1845,15 @@ let restore_chain_state (db : Storage.ChainDB.t)
           state.tip <- Some gen;
           state.headers_synced <- 0)
      | _ -> ());
+    (* Side branches and displaced blocks.  Not after a snapshot re-anchor
+       (best header put back at genesis below a validated base): that
+       header chain is re-synced from peers with full header checks. *)
+    if not (state.headers_synced = 0 && state.blocks_synced > 0) then begin
+      let n = load_side_branch_headers state in
+      if n > 0 then
+        Logs.info (fun m ->
+          m "Restore: loaded %d stored header(s) off the active chain" n)
+    end;
     (* Load invalidated blocks from database *)
     List.iter (fun hash ->
       Hashtbl.replace state.invalidated_blocks (Cstruct.to_string hash) ()

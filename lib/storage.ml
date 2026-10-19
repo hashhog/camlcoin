@@ -561,6 +561,16 @@ module ChainDB = struct
       let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
       Some (Serialize.deserialize_block_header r)
 
+  (* Every stored header, keyed by the raw 32-byte hash string.  Headers
+     whose key fails [want] are skipped without being decoded. *)
+  let iter_block_headers ?(want = fun (_ : string) -> true) t
+      (f : string -> Types.block_header -> unit) =
+    Cf_chainstate.iter_block_headers t.cf (fun key data ->
+      if want key then begin
+        let r = Serialize.reader_of_cstruct (Cstruct.of_string data) in
+        f key (Serialize.deserialize_block_header r)
+      end)
+
   (* Full block storage *)
   let store_block t (hash : Types.hash256) (block : Types.block) =
     let w = Serialize.writer_create () in

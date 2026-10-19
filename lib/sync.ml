@@ -9701,28 +9701,47 @@ and invalidate_block_inner (state : chain_state)
               heavier replacement chain has not been received yet — it
               arrives via submitblock / P2P afterwards and triggers
               [reorganize]). *)
-           (match find_best_valid_tip state with
-            | Some best
-              when Consensus.work_compare best.total_work parent_entry.total_work > 0
-                   && not (Cstruct.equal best.hash parent_entry.hash) ->
-              Logs.info (fun m ->
-                m "Found better valid chain at height %d after invalidate, \
-                   activating..." best.height);
-              let ibd = create_ibd_state ?utxo_set state in
-              (match reorganize ibd best with
-               | Ok () -> Ok best.height
-               | Error e ->
-                 (* Reorg to the alternate chain failed; we are still
-                    cleanly at the parent of the invalidated block (the
-                    disconnect already committed). Surface the parent
-                    height rather than the error so the node is in a
-                    consistent state. *)
-                 Logs.warn (fun m ->
-                   m "Post-invalidate reorg to height %d failed: %s \
-                      (staying at parent height %d)"
-                     best.height e parent_entry.height);
-                 Ok parent_entry.height)
-            | _ -> Ok parent_entry.height))
+           (* Core's ActivateBestChain loops: when ConnectTip fails a
+              block, InvalidBlockFound marks it (and its descendants)
+              failed and FindMostWorkChain picks the next candidate, so a
+              valid prefix of a branch whose last block is bad still wins
+              when it has more work than the parent.  The reorg here is
+              all-or-nothing, so retry with the next candidate after each
+              failure.  A failure that marked nothing new (a local fault,
+              missing data) stops the loop: the candidate set would not
+              shrink. *)
+           let rec activate () =
+             match find_best_valid_tip state with
+             | Some best
+               when Consensus.work_compare best.total_work parent_entry.total_work > 0
+                    && not (Cstruct.equal best.hash parent_entry.hash) ->
+               Logs.info (fun m ->
+                 m "Found better valid chain at height %d after invalidate, \
+                    activating..." best.height);
+               let failed_before = Hashtbl.length state.invalidated_blocks in
+               let ibd = create_ibd_state ?utxo_set state in
+               (match reorganize ibd best with
+                | Ok () -> Ok best.height
+                | Error e when Hashtbl.length state.invalidated_blocks
+                               > failed_before ->
+                  Logs.warn (fun m ->
+                    m "Post-invalidate reorg to height %d failed: %s \
+                       (trying the next candidate)" best.height e);
+                  activate ()
+                | Error e ->
+                  (* Reorg to the alternate chain failed; we are still
+                     cleanly at the parent of the invalidated block (the
+                     disconnect already committed). Surface the parent
+                     height rather than the error so the node is in a
+                     consistent state. *)
+                  Logs.warn (fun m ->
+                    m "Post-invalidate reorg to height %d failed: %s \
+                       (staying at parent height %d)"
+                      best.height e parent_entry.height);
+                  Ok parent_entry.height)
+             | _ -> Ok parent_entry.height
+           in
+           activate ())
     end else begin
       (* Block not on active chain, just mark as invalid *)
       match state.tip with

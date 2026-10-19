@@ -682,8 +682,11 @@ let template_to_json (template : block_template) : Yojson.Safe.t =
           (Consensus.block_subsidy_for_network template.network_type template.height)
           template.total_fee)));
     ("longpollid", longpollid_json);
+    (* Core rpc/mining.cpp:1003 pushKV("target", hashTarget.GetHex()):
+       most significant byte first.  [template.target] is the 32-byte
+       little-endian arith_uint256, so it needs the reversed (display) form. *)
     ("target",
-      `String (Types.hash256_to_hex template.target));
+      `String (Types.hash256_to_hex_display template.target));
     (* Core rpc/mining.cpp:1004 pushKV("mintime", GetMinimumTime(pindexPrev, ...)) *)
     ("mintime",
       `Int (Int32.to_int template.min_time));

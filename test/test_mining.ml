@@ -418,6 +418,28 @@ let test_template_to_json () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* Core rpc/mining.cpp pushKV("target", hashTarget.GetHex()): the 256-bit
+   target as a big-endian number, most significant byte first.  Regtest
+   nBits 0x207fffff is 0x7fffff * 256^29, so the hex starts "7fffff". *)
+let test_template_target_is_core_gethex () =
+  let (chain, db) = create_test_chain_state () in
+  let utxo = Utxo.UtxoSet.create db in
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false ~utxo ~current_height:0 () in
+  let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
+  let template = Mining.create_block_template ~chain ~mp ~payout_script in
+  let target =
+    match Mining.template_to_json template with
+    | `Assoc a ->
+      (match List.assoc_opt "target" a with
+       | Some (`String s) -> s
+       | _ -> Alcotest.fail "target missing or not a string")
+    | _ -> Alcotest.fail "expected assoc"
+  in
+  Alcotest.(check string) "target = Core GetHex of nBits 0x207fffff"
+    ("7fffff" ^ String.make 58 '0') target;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 let test_template_to_json_simple () =
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
@@ -729,6 +751,8 @@ let () =
     "json", [
       test_case "template to json" `Quick test_template_to_json;
       test_case "template to json simple" `Quick test_template_to_json_simple;
+      test_case "template target is Core GetHex" `Quick
+        test_template_target_is_core_gethex;
     ];
     "witness", [
       test_case "witness merkle root" `Quick test_witness_merkle_root;

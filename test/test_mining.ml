@@ -308,6 +308,63 @@ let test_create_block_template_with_transactions () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* Core rpc/mining.cpp entry.pushKV("sigops", pblocktemplate->vTxSigOpsCost[i]):
+   the BIP-141 sigop cost from GetTransactionSigOpCost, which counts the
+   witness program of every spent output.  A P2WPKH spend costs 1 (witness
+   sigops are not scaled), for a confirmed prevout and for a prevout that is
+   an unconfirmed parent in the same template alike. *)
+let test_template_sigops_count_witness_inputs () =
+  let (chain, db) = create_test_chain_state () in
+  let utxo = Utxo.UtxoSet.create db in
+  let p2wpkh = Cstruct.of_string ("\x00\x14" ^ String.make 20 '\x11') in
+  let funding = Types.hash256_of_hex
+    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b" in
+  Utxo.UtxoSet.add utxo funding 0 Utxo.{
+    value = 1_000_000L;
+    script_pubkey = p2wpkh;
+    height = 0;
+    is_coinbase = false;
+  };
+  let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false
+      ~verify_scripts:false ~utxo ~current_height:0 () in
+  let wpkh_witness = Types.{
+    items = [Cstruct.of_string (String.make 72 '\x30');
+             Cstruct.of_string ("\x02" ^ String.make 32 '\x22')] } in
+  let spend prev value = Types.{
+    version = 2l;
+    inputs = [{ previous_output = { txid = prev; vout = 0l };
+                script_sig = Cstruct.empty;
+                sequence = 0xFFFFFFFDl }];
+    outputs = [{ value; script_pubkey = p2wpkh }];
+    witnesses = [wpkh_witness];
+    locktime = 0l;
+  } in
+  let parent = spend funding 990_000L in
+  let child = spend (Crypto.compute_txid parent) 980_000L in
+  (match Mempool.add_transaction mp parent with
+   | Ok _ -> () | Error e -> Alcotest.fail ("parent: " ^ e));
+  (match Mempool.add_transaction mp child with
+   | Ok _ -> () | Error e -> Alcotest.fail ("child: " ^ e));
+  let payout_script = Cstruct.of_string "\x76\xa9\x14test\x88\xac" in
+  let template = Mining.create_block_template ~chain ~mp ~payout_script in
+  let sigops =
+    match Mining.template_to_json template with
+    | `Assoc a ->
+      (match List.assoc_opt "transactions" a with
+       | Some (`List txs) ->
+         List.map (function
+           | `Assoc t ->
+             (match List.assoc_opt "sigops" t with
+              | Some (`Int n) -> n
+              | _ -> Alcotest.fail "sigops missing")
+           | _ -> Alcotest.fail "tx not an object") txs
+       | _ -> Alcotest.fail "transactions missing")
+    | _ -> Alcotest.fail "expected assoc"
+  in
+  Alcotest.(check (list int)) "P2WPKH parent and child each cost 1" [1; 1] sigops;
+  Storage.ChainDB.close db;
+  cleanup_test_db ()
+
 let test_block_template_header_valid () =
   let (chain, db) = create_test_chain_state () in
   let utxo = Utxo.UtxoSet.create db in
@@ -743,6 +800,8 @@ let () =
       test_case "empty mempool template" `Quick test_create_block_template_empty_mempool;
       test_case "template with transactions" `Quick test_create_block_template_with_transactions;
       test_case "header valid" `Quick test_block_template_header_valid;
+      test_case "sigops count witness inputs" `Quick
+        test_template_sigops_count_witness_inputs;
     ];
     "mining", [
       test_case "mine regtest block" `Slow test_mine_block_regtest;

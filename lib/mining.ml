@@ -28,6 +28,11 @@ type block_template = {
   coinbase_tx : Types.transaction;
   transactions : Types.transaction list;
   tx_fees : int64 list;  (* per-transaction fees, same order as transactions *)
+  tx_sigops : int list;
+    (* per-transaction BIP-141 sigop cost, same order as transactions; Core
+       pblocktemplate->vTxSigOpsCost.  Counted against the mempool view, so
+       witness and P2SH sigops of every prevout (confirmed or an in-template
+       parent) are included. *)
   total_fee : int64;
   total_weight : int;
   height : int;
@@ -388,6 +393,8 @@ let create_block_template ~(chain : Sync.chain_state)
   (* Extract transactions and per-transaction fees *)
   let selected_txs = List.map fst selected in
   let tx_fees = List.map snd selected in
+  let tx_sigops =
+    List.map (fun tx -> Mempool.count_tx_sigops_cost tx mp) selected_txs in
 
   (* Create extra nonce (8 bytes of random data) *)
   let extra_nonce = Cstruct.create 8 in
@@ -496,6 +503,7 @@ let create_block_template ~(chain : Sync.chain_state)
     coinbase_tx;
     transactions = selected_txs;
     tx_fees;
+    tx_sigops;
     total_fee;
     total_weight;
     height;
@@ -604,8 +612,14 @@ let template_to_json (template : block_template) : Yojson.Safe.t =
       ("hash", `String (Types.hash256_to_hex_display (Crypto.compute_wtxid tx)));
       ("fee", `Int (Int64.to_int fee));
       ("depends", `List (List.map (fun i -> `Int i) depends));
-      ("sigops", `Int (Validation.count_tx_sigops_cost_simple tx
-                         ~prev_script_pubkey_lookup:(fun _ -> None)));
+      (* Core rpc/mining.cpp: entry.pushKV("sigops", vTxSigOpsCost[index]).
+         Without prevouts only legacy sigops can be counted, so P2WPKH /
+         P2WSH / P2SH spends read 0; use the cost taken at selection. *)
+      ("sigops", `Int (match List.nth_opt template.tx_sigops _i with
+                       | Some n -> n
+                       | None ->
+                         Validation.count_tx_sigops_cost_simple tx
+                           ~prev_script_pubkey_lookup:(fun _ -> None)));
       ("weight", `Int (Validation.compute_tx_weight tx));
     ]
   ) template.transactions in

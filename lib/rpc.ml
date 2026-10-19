@@ -3122,6 +3122,7 @@ let handle_generateblock (ctx : rpc_context)
              coinbase_tx;
              transactions;
              tx_fees = [];
+             tx_sigops = [];
              total_fee;
              total_weight = 0;
              height;

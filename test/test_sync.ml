@@ -2767,23 +2767,23 @@ let test_invalidate_reorg_reconsider () =
   Alcotest.(check bool) "block2 invalidation persisted" true
     (Storage.ChainDB.is_block_invalidated db block2_entry.hash);
 
-  (* Now reconsider block1 - should clear invalidity *)
+  (* Now reconsider block1.  Core: ResetBlockFailureFlags clears block1 and
+     its descendants, then ActivateBestChain re-validates the branch.  This
+     fixture's bodies are not valid regtest blocks (version-1 headers built
+     for header-only tests), so the connect returns a consensus verdict and
+     InvalidBlockFound marks block1 and its descendant failed again; the
+     active chain stays at genesis.  (Before reconsiderblock ran
+     ActivateBestChain the flags simply stayed cleared with the tip at
+     genesis; test_mempool_reorg covers reconsider re-activating a VALID
+     branch.) *)
   let reconsider_result = Sync.reconsider_block state block1_entry.hash in
   Alcotest.(check bool) "reconsider succeeds" true (Result.is_ok reconsider_result);
-
-  (* Verify block1 is no longer invalid *)
-  Alcotest.(check bool) "block1 no longer invalid" false
+  Alcotest.(check int) "active chain stays at genesis (branch invalid)" 0
+    state.blocks_synced;
+  Alcotest.(check bool) "block1 re-marked failed by ActivateBestChain" true
     (Sync.is_block_invalid state block1_entry.hash);
-
-  (* Verify block2 is also no longer invalid (descendants cleared) *)
-  Alcotest.(check bool) "block2 no longer invalid" false
+  Alcotest.(check bool) "block2 re-marked (descendant)" true
     (Sync.is_block_invalid state block2_entry.hash);
-
-  (* Verify invalidation is cleared in storage *)
-  Alcotest.(check bool) "block1 invalidation cleared" false
-    (Storage.ChainDB.is_block_invalidated db block1_entry.hash);
-  Alcotest.(check bool) "block2 invalidation cleared" false
-    (Storage.ChainDB.is_block_invalidated db block2_entry.hash);
 
   Storage.ChainDB.close db;
   cleanup_test_db ()

@@ -346,40 +346,46 @@ let test_p2p_reorg () =
    invalidateblock 111 -> Core v31.1 keeps P and C_1..C_63, drops C_0 (the
    cheapest).  The re-add runs with bypass_limits and the cluster gate runs
    before the children are linked, so only the trim can enforce the bound. *)
+(* P <- cb1 with [n] outputs, confirmed at 111; C_i <- P:i with fee
+   (i+1)*[fee_unit] and a [pad]-byte OP_RETURN, admitted at 111 (each a singleton
+   cluster while P is confirmed); then invalidateblock 111. *)
+let parent_children_invalidate fx ~n ~pad ~fee_unit =
+  let pfee = 10_000L in
+  let each = Int64.div (Int64.sub subsidy pfee) (Int64.of_int n) in
+  let parent =
+    { Types.version = 2l;
+      inputs = [ { Types.previous_output = { Types.txid = fx.cb.(1); vout = 0l };
+                   script_sig = Cstruct.create 0; sequence = 0xFFFFFFFFl } ];
+      outputs = List.init n (fun _ ->
+          { Types.value = each; Types.script_pubkey = op_true });
+      witnesses = []; locktime = 0l } in
+  let child i =
+    let data = Cstruct.create (pad + 1) in
+    Cstruct.set_uint8 data 0 0x6a;
+    Cstruct.set_uint8 data 1 i;
+    { Types.version = 2l;
+      inputs = [ { Types.previous_output =
+                     { Types.txid = txid parent; vout = Int32.of_int i };
+                   script_sig = Cstruct.create 0; sequence = 0xFFFFFFFFl } ];
+      outputs = [ { Types.value = Int64.sub each (Int64.of_int ((i + 1) * fee_unit));
+                    script_pubkey = op_true };
+                  { Types.value = 0L; script_pubkey = data } ];
+      witnesses = []; locktime = 0l } in
+  let children = List.init n child in
+  let b111 = build fx ~fee:pfee ~tag:0 111 [ parent ] in
+  connect fx b111;
+  List.iter (sendraw fx) children;
+  Alcotest.(check int) "all children in the pool at 111" n (Mempool.count fx.mp);
+  ignore (rpc_ok fx "invalidateblock" [ hx b111 ]);
+  Alcotest.(check int) "tip 110" 110 fx.state.Sync.blocks_synced;
+  let names = ("P", parent)
+              :: List.mapi (fun i c -> (Printf.sprintf "C%02d" i, c)) children in
+  parent, names
+
 let test_invalidate_trims_oversized_cluster () =
   with_fx ~label:"mr_trim" (fun fx ->
-    let n = 64 in
-    let pfee = 10_000L in
-    let each = Int64.div (Int64.sub subsidy pfee) (Int64.of_int n) in
-    let parent =
-      { Types.version = 2l;
-        inputs = [ { Types.previous_output = { Types.txid = fx.cb.(1); vout = 0l };
-                     script_sig = Cstruct.create 0; sequence = 0xFFFFFFFFl } ];
-        outputs = List.init n (fun _ ->
-            { Types.value = each; Types.script_pubkey = op_true });
-        witnesses = []; locktime = 0l } in
-    let child i =
-      let pad = Cstruct.create 22 in
-      Cstruct.set_uint8 pad 0 0x6a; Cstruct.set_uint8 pad 1 0x14;
-      Cstruct.set_uint8 pad 2 i;
-      { Types.version = 2l;
-        inputs = [ { Types.previous_output =
-                       { Types.txid = txid parent; vout = Int32.of_int i };
-                     script_sig = Cstruct.create 0; sequence = 0xFFFFFFFFl } ];
-        outputs = [ { Types.value = Int64.sub each (Int64.of_int ((i + 1) * 1000));
-                      script_pubkey = op_true };
-                    { Types.value = 0L; script_pubkey = pad } ];
-        witnesses = []; locktime = 0l } in
-    let children = List.init n child in
-    let b111 = build fx ~fee:pfee ~tag:0 111 [ parent ] in
-    connect fx b111;
-    List.iter (sendraw fx) children;
-    Alcotest.(check int) "64 children in the pool at 111" n (Mempool.count fx.mp);
-    ignore (rpc_ok fx "invalidateblock" [ hx b111 ]);
-    Alcotest.(check int) "tip 110" 110 fx.state.Sync.blocks_synced;
-    let names = ("P", parent)
-                :: List.mapi (fun i c -> (Printf.sprintf "C%02d" i, c)) children in
-    let expected = "P" :: List.init (n - 1) (fun i -> Printf.sprintf "C%02d" (i + 1)) in
+    let parent, names = parent_children_invalidate fx ~n:64 ~pad:20 ~fee_unit:1000 in
+    let expected = "P" :: List.init 63 (fun i -> Printf.sprintf "C%02d" (i + 1)) in
     check_pool "pool after invalidateblock 111 (Core: P + C01..C63)"
       expected (pool fx names);
     Alcotest.(check int) "P's cluster is at the 64-tx limit" 64
@@ -389,6 +395,26 @@ let test_invalidate_trims_oversized_cluster () =
      | Some e ->
        Alcotest.(check int) "P descendant_count = 64 (self + 63)" 64
          e.Mempool.descendant_count))
+
+(* The same Trim on the WEIGHT bound: 5 children of ~96_400 weight (a
+   24_000-byte OP_RETURN, fee (i+1)*30_000) each fit alone, but P + 5 children is ~483_000 >
+   404_000; P + 4 is ~387_000.  Trim keeps P and the 4 highest-feerate
+   children and drops C_0. *)
+let test_invalidate_trims_overweight_cluster () =
+  with_fx ~label:"mr_trimw" (fun fx ->
+    let parent, names = parent_children_invalidate fx ~n:5 ~pad:24_000 ~fee_unit:30_000 in
+    check_pool "pool after invalidateblock 111 (Core: P + C01..C04)"
+      [ "P"; "C01"; "C02"; "C03"; "C04" ] (pool fx names);
+    let weight =
+      List.fold_left (fun acc (_, tx) ->
+        match Mempool.get fx.mp (txid tx) with
+        | Some e -> acc + e.Mempool.weight | None -> acc) 0 names in
+    Printf.printf "  cluster weight after trim: %d (limit %d)\n%!" weight
+      Mempool.max_cluster_size_weight;
+    Alcotest.(check bool) "P's cluster weight within 404000" true
+      (weight <= Mempool.max_cluster_size_weight);
+    Alcotest.(check int) "P's cluster is 5 txs" 5
+      (Mempool.get_cluster_size fx.mp (txid parent)))
 
 (* Core InvalidateBlock: MaybeUpdateMempoolForReorg(disconnectpool,
    fAddToMempool = ++disconnected <= 10), once per DisconnectTip, tip
@@ -423,6 +449,8 @@ let () =
         test_p2p_reorg;
       Alcotest.test_case "invalidateblock: Trim an oversized cluster" `Quick
         test_invalidate_trims_oversized_cluster;
+      Alcotest.test_case "invalidateblock: Trim an overweight cluster" `Quick
+        test_invalidate_trims_overweight_cluster;
       Alcotest.test_case "invalidateblock: re-add only the top 10 blocks" `Quick
         test_deep_invalidate_caps_readd;
     ];

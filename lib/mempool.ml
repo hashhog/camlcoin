@@ -44,7 +44,11 @@ type mempool_entry = {
   fee_rate : float;           (* satoshis per weight unit *)
   time_added : float;
   height_added : int;
-  depends_on : Types.hash256 list;  (* parent txids in mempool *)
+  (* parent txids in mempool.  Mutable for the reorg refill: a tx returned
+     to the pool from a disconnected block becomes the parent of in-pool
+     children that were admitted while it was confirmed (Core
+     UpdateTransactionsFromBlock). *)
+  mutable depends_on : Types.hash256 list;
   (* Cached ancestor/descendant stats for O(1) limit checks after initial computation *)
   mutable ancestor_count : int;     (* number of ancestors including self *)
   mutable ancestor_size : int;      (* total vsize of ancestors including self *)
@@ -92,6 +96,14 @@ type mempool = {
      Wired from cli.ml to Sync.get_mtp_for_height_strict.  When unset the
      mempool falls back to [current_median_time] (the pre-wiring behaviour). *)
   mutable mtp_provider : (int -> int32 option) option;
+  (* Active-chain tip height (Core: m_chain.Height(), read at admission).
+     [current_height] is a cached copy that only some connect paths
+     refreshed (remove_for_block); the IBD/catch-up connect path never did,
+     so a node that synced its chain over P2P kept the boot value (0 on a
+     fresh datadir) and rejected every mature coinbase spend as
+     premature.  When wired (cli.ml: chain.blocks_synced) the mempool reads
+     the tip from the chain instead.  None in tests -> [current_height]. *)
+  mutable tip_height_provider : (unit -> int) option;
   (* Policy flags — can be relaxed for testing or regtest *)
   require_standard : bool;    (* enforce IsStandard checks *)
   verify_scripts : bool;      (* enforce script verification *)
@@ -349,6 +361,7 @@ let create ?(require_standard=true) ?(verify_scripts=true)
     network;
     current_median_time = 0l;
     mtp_provider = None;
+    tip_height_provider = None;
     require_standard;
     verify_scripts;
     orphans = Hashtbl.create 100;
@@ -406,6 +419,16 @@ let contains_wtxid (mp : mempool) (wtxid : Types.hash256) : bool =
    UTXO Lookup (Chain + Mempool)
    ============================================================================ *)
 
+(* The active-chain tip height the mempool evaluates against (Core
+   m_chain.Height()); the next block is [cur_height mp + 1]. *)
+let cur_height (mp : mempool) : int =
+  match mp.tip_height_provider with
+  | Some f -> f ()
+  | None -> mp.current_height
+
+let set_tip_height_provider (mp : mempool) (f : (unit -> int) option) : unit =
+  mp.tip_height_provider <- f
+
 (* Look up a UTXO considering both chain state and mempool *)
 let lookup_utxo (mp : mempool) (outpoint : Types.outpoint)
     : Utxo.utxo_entry option =
@@ -433,7 +456,7 @@ let lookup_utxo (mp : mempool) (outpoint : Types.outpoint)
         Some {
           Utxo.value = out.Types.value;
           script_pubkey = out.script_pubkey;
-          height = mp.current_height + 1;
+          height = (cur_height mp) + 1;
           is_coinbase = false;
         }
       end else None
@@ -445,7 +468,7 @@ let set_mtp_provider (mp : mempool) (f : (int -> int32 option) option) : unit =
    when a provider is wired but cannot resolve a full window. *)
 let tip_mtp (mp : mempool) : int32 option =
   match mp.mtp_provider with
-  | Some f -> f (mp.current_height + 1)
+  | Some f -> f ((cur_height mp) + 1)
   | None -> Some mp.current_median_time
 
 (* Check if a UTXO is confirmed (in chain UTXO set, not just mempool) *)
@@ -2222,7 +2245,7 @@ let verify_tx_scripts (mp : mempool) (tx : Types.transaction)
   (* Mempool uses standard (policy) flags — stricter than consensus block flags.
      This rejects non-standard txs at acceptance time while still accepting all
      consensus-valid txs during block validation. *)
-  let flags = Consensus.get_standard_policy_flags (mp.current_height + 1) mp.network in
+  let flags = Consensus.get_standard_policy_flags ((cur_height mp) + 1) mp.network in
   let error = ref None in
 
   (* Build prevouts list for Taproot sighash *)
@@ -2316,7 +2339,7 @@ let verify_tx_scripts (mp : mempool) (tx : Types.transaction)
 let verify_tx_scripts_lwt (mp : mempool) (tx : Types.transaction)
     : (unit, string) result Lwt.t =
   let flags =
-    Consensus.get_standard_policy_flags (mp.current_height + 1) mp.network in
+    Consensus.get_standard_policy_flags ((cur_height mp) + 1) mp.network in
 
   (* 2026-07-02 at-tip RPC-stall fix (un-pin soak #4 — see
      CORE-PARITY-AUDIT/_camlcoin-gc-rpc-stall-rootcause-2026-06-24.md follow-up):
@@ -2569,7 +2592,7 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
        lookup is up to 11 header reads).  Unresolvable -> 0, i.e. not final
        (fail closed). *)
     if not (Validation.is_tx_final tx
-              ~block_height:(mp.current_height + 1)
+              ~block_height:((cur_height mp) + 1)
               ~block_time:(
                 if Int64.logand (Int64.of_int32 tx.locktime) 0xFFFFFFFFL
                    >= 500_000_000L
@@ -2603,7 +2626,7 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
                at tip-100 was rejected when Core would accept it on the next
                block.  Reference: validation.cpp:892 (Height()+1 passed to
                CheckTxInputs), consensus/tx_verify.cpp:88. *)
-            let spend_height = mp.current_height + 1 in
+            let spend_height = (cur_height mp) + 1 in
             if entry.is_coinbase &&
                spend_height - entry.height < Consensus.coinbase_maturity then
               error := Some "Spending immature coinbase"
@@ -2661,7 +2684,7 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
            blocks).  Do NOT "fix" this by inventing a hash — every real
            block-VALIDATION site does pass one; see the tombstone in
            validation.ml above the sigop-counting section. *)
-        let flags = Consensus.get_block_script_flags (mp.current_height + 1) mp.network in
+        let flags = Consensus.get_block_script_flags ((cur_height mp) + 1) mp.network in
         (* Core CheckSequenceLocksAtTip: the lock is evaluated for a block at
            tip+1 whose BIP113 time is the tip's MTP.  Resolved only when an
            input carries a time-based lock (a height-only tx never reads it). *)
@@ -2676,7 +2699,7 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
           if has_time_lock then tip_mtp mp else Some mp.current_median_time in
         if !mtp_unresolved || seq_median_time = None
            || not (Validation.check_sequence_locks tx
-                  ~block_height:(mp.current_height + 1)
+                  ~block_height:((cur_height mp) + 1)
                   ~median_time:(Option.value seq_median_time ~default:0l)
                   ~utxo_heights ~utxo_mtps ~flags ()) then
           Error "Transaction sequence locks not satisfied (BIP68)"
@@ -2848,7 +2871,7 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
               sigops_cost;
               fee_rate;
               time_added = Unix.gettimeofday ();
-              height_added = mp.current_height;
+              height_added = (cur_height mp);
               depends_on = !depends;
               ancestor_count = anc_count;
               ancestor_size = anc_size;
@@ -2936,6 +2959,39 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
    Block Processing
    ============================================================================ *)
 
+(* Remove a tx a connected block CONFIRMED (Core removeForBlock ->
+   removeUnchecked, NOT removeRecursive): its in-pool children stay — their
+   input is now a chain coin.  They lose the in-pool parent link and every
+   descendant's cached ancestor stats drop by this tx.  [remove_transaction]
+   cascades to children, which evicted every child of a confirmed parent:
+   a CPFP child after its parent was mined, or the tx returned to the pool
+   by invalidateblock whose block was then reconnected by reconsiderblock. *)
+let remove_confirmed (mp : mempool) (txid : Types.hash256) : unit =
+  let txid_key = Cstruct.to_string txid in
+  match Hashtbl.find_opt mp.entries txid_key with
+  | None -> ()
+  | Some entry ->
+    let vsize = Validation.get_virtual_transaction_size ~weight:entry.weight
+        ~sigop_cost:entry.sigops_cost
+        ~bytes_per_sigop:Consensus.default_bytes_per_sigop in
+    List.iter (fun (d : mempool_entry) ->
+      d.ancestor_count <- max 1 (d.ancestor_count - 1);
+      d.ancestor_size <- max 0 (d.ancestor_size - vsize)
+    ) (get_descendants mp txid);
+    (match Hashtbl.find_opt mp.children txid_key with
+     | None -> ()
+     | Some set ->
+       Hashtbl.iter (fun ck () ->
+         match Hashtbl.find_opt mp.entries ck with
+         | Some ce ->
+           ce.depends_on <-
+             List.filter (fun p -> not (Cstruct.equal p txid)) ce.depends_on
+         | None -> ()
+       ) set;
+       Hashtbl.remove mp.children txid_key);
+    (* No children left in the index: removes only this entry. *)
+    remove_transaction mp txid
+
 (* Remove confirmed transactions after a block is mined.
    Collects txids to remove before mutating the Hashtbl.
    Also resets the rolling fee decay timer so the floor can begin decaying.
@@ -2946,9 +3002,12 @@ let remove_for_block (mp : mempool) (block : Types.block) (height : int)
     : unit =
   mp.current_height <- height;
 
+  (* An empty pool has nothing confirmed and nothing in conflict: skip the
+     per-tx txid hashing (every catch-up / IBD connect runs this). *)
+  if Hashtbl.length mp.entries > 0 then
   List.iter (fun tx ->
     let txid = Crypto.compute_txid tx in
-    remove_transaction mp txid;
+    remove_confirmed mp txid;
 
     (* Evict any mempool tx that double-spends an input now spent by this block
        tx.  W165 un-pin fix (#9): each outpoint is spent by AT MOST ONE mempool
@@ -2979,6 +3038,182 @@ let remove_for_block (mp : mempool) (block : Types.block) (height : int)
      Reference: Core txmempool.cpp:426-427 *)
   mp.last_rolling_fee_update <- Unix.gettimeofday ();
   mp.block_since_last_rolling_fee_bump <- true
+
+(* ============================================================================
+   Reorg: MaybeUpdateMempoolForReorg (validation.cpp:294-386)
+   ============================================================================ *)
+
+(* Core CTxMemPool::removeRecursive: remove [tx] and every in-pool
+   descendant.  When [tx] itself is not in the pool (a disconnected tx that
+   failed re-acceptance), its in-pool spenders are found through mapNextTx
+   on its outputs — e.g. a child admitted while its parent was confirmed. *)
+let remove_recursive (mp : mempool) (tx : Types.transaction)
+    (txid : Types.hash256) : unit =
+  if contains mp txid then remove_transaction mp txid
+  else begin
+    let k = Cstruct.to_string txid in
+    List.iteri (fun i _ ->
+      match Hashtbl.find_opt mp.map_next_tx (k, Int32.of_int i) with
+      | None -> ()
+      | Some child_key ->
+        (match Hashtbl.find_opt mp.entries child_key with
+         | Some ce -> remove_transaction mp ce.txid
+         | None -> ())
+    ) tx.Types.outputs
+  end
+
+(* removeForReorg's filter (validation.cpp:345-383 check_final_and_mature):
+   an entry stays only if, for a block at tip+1, it is final (BIP113,
+   CheckFinalTxAtTip), its sequence locks are met (BIP68,
+   CheckSequenceLocksAtTip) and it spends no immature coinbase.  An input
+   that resolves nowhere (lock points cannot be computed) also fails. *)
+let entry_final_and_mature (mp : mempool) (e : mempool_entry) : bool =
+  let tx = e.tx in
+  let next = cur_height mp + 1 in
+  let final_ok =
+    Validation.is_tx_final tx ~block_height:next
+      ~block_time:(
+        if Int64.logand (Int64.of_int32 tx.Types.locktime) 0xFFFFFFFFL
+           >= 500_000_000L
+        then Option.value (tip_mtp mp) ~default:0l
+        else mp.current_median_time)
+  in
+  final_ok && begin
+    let n = List.length tx.Types.inputs in
+    let utxo_heights = Array.make n 0 in
+    let utxo_mtps = Array.make n 0l in
+    let ok = ref true in
+    let bip68 = Validation.bip68_version_active tx.Types.version in
+    let time_locked seq =
+      bip68 && Int32.logand seq 0x80000000l = 0l
+      && Int32.logand seq 0x00400000l <> 0l in
+    List.iteri (fun i inp ->
+      if !ok then
+        match lookup_utxo mp inp.Types.previous_output with
+        | None -> ok := false
+        | Some c ->
+          if c.Utxo.is_coinbase
+             && next - c.Utxo.height < Consensus.coinbase_maturity then
+            ok := false
+          else begin
+            utxo_heights.(i) <- c.Utxo.height;
+            utxo_mtps.(i) <-
+              (if time_locked inp.Types.sequence then
+                 (match mp.mtp_provider with
+                  | None -> mp.current_median_time
+                  | Some f ->
+                    (match f c.Utxo.height with
+                     | Some t -> t
+                     | None -> ok := false; 0l))
+               else mp.current_median_time)
+          end
+    ) tx.Types.inputs;
+    !ok && begin
+      let has_time_lock =
+        List.exists (fun inp -> time_locked inp.Types.sequence) tx.Types.inputs in
+      let seq_median_time =
+        if has_time_lock then tip_mtp mp else Some mp.current_median_time in
+      match seq_median_time with
+      | None -> false
+      | Some mt ->
+        Validation.check_sequence_locks tx ~block_height:next ~median_time:mt
+          ~utxo_heights ~utxo_mtps
+          ~flags:(Consensus.get_block_script_flags next mp.network) ()
+    end
+  end
+
+(* Core CTxMemPool::removeForReorg (txmempool.cpp:360): drop every entry
+   (with its descendants) that cannot go in a block at tip+1. *)
+let remove_for_reorg (mp : mempool) : unit =
+  let doomed = Hashtbl.fold (fun _ e acc ->
+    if entry_final_and_mature mp e then acc else e.txid :: acc
+  ) mp.entries [] in
+  List.iter (fun txid -> remove_transaction mp txid) doomed
+
+(* Core CTxMemPool::UpdateTransactionsFromBlock: a tx returned to the pool
+   from a disconnected block may already have in-pool children (admitted
+   while it was confirmed, so they recorded no in-pool parent).  Link them —
+   depends_on + the children index — and recompute the cached
+   ancestor/descendant stats of everything whose sets changed: the re-added
+   tx, its ancestors and its descendants. *)
+let update_transactions_from_block (mp : mempool)
+    (readded : Types.hash256 list) : unit =
+  let touched = ref [] in
+  List.iter (fun ptxid ->
+    let pk = Cstruct.to_string ptxid in
+    match Hashtbl.find_opt mp.entries pk with
+    | None -> ()
+    | Some pe ->
+      List.iteri (fun i _ ->
+        match Hashtbl.find_opt mp.map_next_tx (pk, Int32.of_int i) with
+        | None -> ()
+        | Some ck ->
+          (match Hashtbl.find_opt mp.entries ck with
+           | Some ce
+             when not (List.exists (Cstruct.equal ptxid) ce.depends_on) ->
+             ce.depends_on <- ptxid :: ce.depends_on;
+             let set = match Hashtbl.find_opt mp.children pk with
+               | Some st -> st
+               | None ->
+                 let st = Hashtbl.create 4 in
+                 Hashtbl.replace mp.children pk st; st in
+             Hashtbl.replace set ck ();
+             touched := ptxid :: !touched
+           | _ -> ())
+      ) pe.tx.Types.outputs
+  ) readded;
+  if !touched <> [] then begin
+    let affected = Hashtbl.create 32 in
+    let add (e : mempool_entry) =
+      Hashtbl.replace affected (Cstruct.to_string e.txid) e in
+    List.iter (fun ptxid ->
+      (match get mp ptxid with Some e -> add e | None -> ());
+      List.iter add (get_ancestors mp ptxid);
+      List.iter add (get_descendants mp ptxid)
+    ) !touched;
+    let vsize (e : mempool_entry) =
+      Validation.get_virtual_transaction_size ~weight:e.weight
+        ~sigop_cost:e.sigops_cost
+        ~bytes_per_sigop:Consensus.default_bytes_per_sigop in
+    Hashtbl.iter (fun _ (e : mempool_entry) ->
+      let anc = get_ancestors mp e.txid in
+      let desc = get_descendants mp e.txid in
+      let sum l = List.fold_left (fun a x -> a + vsize x) (vsize e) l in
+      e.ancestor_count <- 1 + List.length anc;
+      e.ancestor_size <- sum anc;
+      e.descendant_count <- 1 + List.length desc;
+      e.descendant_size <- sum desc
+    ) affected
+  end
+
+(* Core MaybeUpdateMempoolForReorg(disconnectpool, fAddToMempool=true).
+   [disconnected] = the non-coinbase txs of the disconnected blocks,
+   EARLIEST-CONFIRMED FIRST, minus any tx a newly connected block confirmed
+   (Core drops those from the disconnect pool in removeForBlock).  The
+   caller runs it on the main thread (the chain lock) after the chain is at
+   its new tip, so [cur_height] / the coin view are the new tip's.
+   1. Re-accept each tx with bypass_limits (no fee floor / size limit, every
+      other check); a tx that fails is removeRecursive'd.
+   2. UpdateTransactionsFromBlock.
+   3. removeForReorg (non-final / sequence-locked / immature at tip+1).
+   4. LimitMempoolSize.
+   Returns the number of txs re-accepted. *)
+let update_for_reorg (mp : mempool) ~(disconnected : Types.transaction list)
+    : int =
+  let readded = ref [] in
+  List.iter (fun tx ->
+    if not (Validation.is_coinbase_tx tx) then begin
+      let txid = Crypto.compute_txid tx in
+      match add_transaction ~bypass_fee_check:true ~bypass_limits:true mp tx with
+      | Ok _ -> readded := txid :: !readded
+      | Error _ ->
+        if not (contains mp txid) then remove_recursive mp tx txid
+    end
+  ) disconnected;
+  update_transactions_from_block mp (List.rev !readded);
+  remove_for_reorg mp;
+  if mp.total_weight > mp.max_size_bytes then evict_by_chunks mp;
+  List.length !readded
 
 (* ============================================================================
    Block Template Construction
@@ -3378,7 +3613,7 @@ let check_improves_feerate_diagram
     sigops_cost    = 0;
     fee_rate       = new_fee_rate;
     time_added     = 0.0;
-    height_added   = mp.current_height;
+    height_added   = (cur_height mp);
     depends_on     = depends_after_eviction;
     ancestor_count = 1;
     ancestor_size  = new_vsize;
@@ -5054,7 +5289,7 @@ let accept_package_with_replaced (mp : mempool) (txs : Types.transaction list)
               Hashtbl.replace package_utxos key Utxo.{
                 value = out.Types.value;
                 script_pubkey = out.Types.script_pubkey;
-                height = mp.current_height;
+                height = (cur_height mp);
                 is_coinbase = false;
               }
             ) tx.Types.outputs;

@@ -1922,6 +1922,10 @@ let set_chain_mempool (state : chain_state)
     (mp : Mempool.mempool option) : unit =
   state.chain_mempool <- mp
 
+(* Core InvalidateBlock: fAddToMempool = (++disconnected <= 10) — a deeper
+   invalidation does not resurrect the txs of the blocks below the top 10. *)
+let max_invalidate_readd_blocks = 10
+
 (* Core MaybeUpdateMempoolForReorg after a disconnect: [disconnected] holds
    the disconnected blocks' txs earliest-confirmed first; any tx confirmed by
    a block in [connected] is dropped from that pool first (Core removes it
@@ -1929,6 +1933,7 @@ let set_chain_mempool (state : chain_state)
    connect hook: a mempool fault never rolls back a committed chain move. *)
 let update_mempool_for_reorg (mp : Mempool.mempool)
     ~(disconnected : Types.transaction list)
+    ~(dropped : Types.transaction list)
     ~(connected : Types.block list) : unit =
   try
     let confirmed = Hashtbl.create 64 in
@@ -1944,7 +1949,7 @@ let update_mempool_for_reorg (mp : Mempool.mempool)
         not (Hashtbl.mem confirmed
                (Cstruct.to_string (Crypto.compute_txid tx)))) disconnected
     in
-    let n = Mempool.update_for_reorg mp ~disconnected:pool in
+    let n = Mempool.update_for_reorg mp ~disconnected:pool ~dropped in
     Logs.info (fun m ->
       m "Mempool updated for reorg: %d of %d disconnected txs re-accepted, \
          pool now %d" n (List.length pool) (Mempool.count mp))
@@ -7863,8 +7868,10 @@ let reorganize ?(allow_equal_work = false)
                  Mempool.remove_for_block mp block entry.height
                ) (List.rev !connected_blocks);
                if to_disconnect <> [] then
+                 (* ActivateBestChainStep: fAddToMempool = true for every
+                    disconnected block (no depth cap, unlike InvalidateBlock). *)
                  update_mempool_for_reorg mp
-                   ~disconnected:!disconnected_txs
+                   ~disconnected:!disconnected_txs ~dropped:[]
                    ~connected:(List.map snd !connected_blocks)
              | None -> ());
             List.iter (fun ((entry : header_entry), (block : Types.block)) ->
@@ -9813,11 +9820,21 @@ and invalidate_block_inner (state : chain_state)
            active Chainstate's CoinsTip ([validation.cpp]). *)
         (* Core DisconnectTip -> disconnectpool.AddTransactionsFromBlock:
            blocks arrive tip-first, so prepending each block's non-coinbase
-           txs leaves the pool earliest-confirmed first. *)
+           txs leaves the pool earliest-confirmed first.  Core runs
+           MaybeUpdateMempoolForReorg after every DisconnectTip with
+           fAddToMempool = (++disconnected <= 10): only the txs of the 10
+           blocks nearest the old tip are re-accepted, those of deeper
+           blocks are removeRecursive'd ([dropped_txs]). *)
         let disconnected_txs = ref [] in
+        let dropped_txs = ref [] in
+        let n_disconnected = ref 0 in
         let on_disconnected (block : Types.block) =
+          incr n_disconnected;
           match block.transactions with
-          | _cb :: txs -> disconnected_txs := txs @ !disconnected_txs
+          | _cb :: txs ->
+            if !n_disconnected <= max_invalidate_readd_blocks then
+              disconnected_txs := txs @ !disconnected_txs
+            else dropped_txs := txs @ !dropped_txs
           | [] -> ()
         in
         let disconnect_result =
@@ -9838,7 +9855,7 @@ and invalidate_block_inner (state : chain_state)
            (match state.chain_mempool with
             | Some mp ->
               update_mempool_for_reorg mp ~disconnected:!disconnected_txs
-                ~connected:[]
+                ~dropped:!dropped_txs ~connected:[]
             | None -> ());
            (* After the rewind, try to activate the best remaining valid
               chain (a side-branch already on disk with more work). Mirrors

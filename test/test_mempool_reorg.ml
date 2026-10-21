@@ -337,6 +337,81 @@ let test_p2p_reorg () =
     check_pool "(c) pool after the P2P reorg"
       [ "B"; "IMM"; "LT"; "M1" ] (pool fx (("X", x) :: ("Z", z) :: v.names)))
 
+(* Core UpdateTransactionsFromBlock ends with m_txgraph->Trim(): linking a
+   re-added tx to its in-pool children can grow a cluster past the limits
+   (64 txs / 404000 weight), and Trim removes txs (with descendants) until
+   every cluster fits, keeping the highest-chunk-feerate ones (a merge of the
+   old linearizations).  warden_e: P <- cb1 with 64 outputs, confirmed at
+   111; children C_i <- P:i with fee (i+1)*1000, admitted at 111;
+   invalidateblock 111 -> Core v31.1 keeps P and C_1..C_63, drops C_0 (the
+   cheapest).  The re-add runs with bypass_limits and the cluster gate runs
+   before the children are linked, so only the trim can enforce the bound. *)
+let test_invalidate_trims_oversized_cluster () =
+  with_fx ~label:"mr_trim" (fun fx ->
+    let n = 64 in
+    let pfee = 10_000L in
+    let each = Int64.div (Int64.sub subsidy pfee) (Int64.of_int n) in
+    let parent =
+      { Types.version = 2l;
+        inputs = [ { Types.previous_output = { Types.txid = fx.cb.(1); vout = 0l };
+                     script_sig = Cstruct.create 0; sequence = 0xFFFFFFFFl } ];
+        outputs = List.init n (fun _ ->
+            { Types.value = each; Types.script_pubkey = op_true });
+        witnesses = []; locktime = 0l } in
+    let child i =
+      let pad = Cstruct.create 22 in
+      Cstruct.set_uint8 pad 0 0x6a; Cstruct.set_uint8 pad 1 0x14;
+      Cstruct.set_uint8 pad 2 i;
+      { Types.version = 2l;
+        inputs = [ { Types.previous_output =
+                       { Types.txid = txid parent; vout = Int32.of_int i };
+                     script_sig = Cstruct.create 0; sequence = 0xFFFFFFFFl } ];
+        outputs = [ { Types.value = Int64.sub each (Int64.of_int ((i + 1) * 1000));
+                      script_pubkey = op_true };
+                    { Types.value = 0L; script_pubkey = pad } ];
+        witnesses = []; locktime = 0l } in
+    let children = List.init n child in
+    let b111 = build fx ~fee:pfee ~tag:0 111 [ parent ] in
+    connect fx b111;
+    List.iter (sendraw fx) children;
+    Alcotest.(check int) "64 children in the pool at 111" n (Mempool.count fx.mp);
+    ignore (rpc_ok fx "invalidateblock" [ hx b111 ]);
+    Alcotest.(check int) "tip 110" 110 fx.state.Sync.blocks_synced;
+    let names = ("P", parent)
+                :: List.mapi (fun i c -> (Printf.sprintf "C%02d" i, c)) children in
+    let expected = "P" :: List.init (n - 1) (fun i -> Printf.sprintf "C%02d" (i + 1)) in
+    check_pool "pool after invalidateblock 111 (Core: P + C01..C63)"
+      expected (pool fx names);
+    Alcotest.(check int) "P's cluster is at the 64-tx limit" 64
+      (Mempool.get_cluster_size fx.mp (txid parent));
+    (match Mempool.get fx.mp (txid parent) with
+     | None -> Alcotest.fail "P missing"
+     | Some e ->
+       Alcotest.(check int) "P descendant_count = 64 (self + 63)" 64
+         e.Mempool.descendant_count))
+
+(* Core InvalidateBlock: MaybeUpdateMempoolForReorg(disconnectpool,
+   fAddToMempool = ++disconnected <= 10), once per DisconnectTip, tip
+   first.  Only the 10 blocks nearest the old tip are resurrected; the txs of
+   deeper blocks are removeRecursive'd, which takes their in-pool spenders.
+   Blocks 111..121 each confirm T_k <- cb(k-110); M <- T_1:0 is admitted at
+   121.  invalidateblock 111 disconnects 11 blocks: T_2..T_11 come back, T_1
+   (11th disconnected) does not, and M goes with it. *)
+let test_deep_invalidate_caps_readd () =
+  with_fx ~label:"mr_depth" (fun fx ->
+    let ts = List.init 11 (fun k -> spend ~tag:(20 + k) fx.cb.(k + 1) subsidy) in
+    let blocks = List.mapi (fun k t -> build fx ~fee ~tag:0 (111 + k) [ t ]) ts in
+    List.iter (connect fx) blocks;
+    Alcotest.(check int) "tip 121" 121 fx.state.Sync.blocks_synced;
+    let t1 = List.hd ts in
+    let m = spend ~tag:40 (txid t1) (Int64.sub subsidy fee) in
+    sendraw fx m;
+    ignore (rpc_ok fx "invalidateblock" [ hx (List.hd blocks) ]);
+    Alcotest.(check int) "tip 110" 110 fx.state.Sync.blocks_synced;
+    let names = ("M", m) :: List.mapi (fun k t -> (Printf.sprintf "T%02d" (k + 1), t)) ts in
+    check_pool "pool after an 11-block invalidate (Core: T02..T11)"
+      (List.init 10 (fun k -> Printf.sprintf "T%02d" (k + 2))) (pool fx names))
+
 let () =
   Alcotest.run "mempool_reorg" [
     "mempool vs chain", [
@@ -346,5 +421,9 @@ let () =
         test_invalidate_reconsider;
       Alcotest.test_case "P2P reorg: refill, conflicts, descendants" `Quick
         test_p2p_reorg;
+      Alcotest.test_case "invalidateblock: Trim an oversized cluster" `Quick
+        test_invalidate_trims_oversized_cluster;
+      Alcotest.test_case "invalidateblock: re-add only the top 10 blocks" `Quick
+        test_deep_invalidate_caps_readd;
     ];
   ]

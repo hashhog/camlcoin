@@ -3130,15 +3130,187 @@ let remove_for_reorg (mp : mempool) : unit =
   ) mp.entries [] in
   List.iter (fun txid -> remove_transaction mp txid) doomed
 
+(* Core TxGraphImpl::Trim (txgraph.cpp), called by
+   UpdateTransactionsFromBlock once the re-added txs are linked to their
+   in-pool children.  The links can merge clusters past the limits (64 txs /
+   404_000 sigop-adjusted weight): the re-add ran with bypass_limits and the
+   cluster gate in [add_transaction] measured the re-added tx before any
+   child was linked, so nothing else brings the cluster back under.
+
+   Per oversized component, Core builds a rudimentary linearization of the
+   would-be cluster — a merge of the OLD clusters' linearizations (each tx
+   depends on its predecessor there) respecting the NEW dependencies — by
+   repeatedly picking, among the txs whose dependencies are all included,
+   the one with the highest chunk feerate in its old cluster.  A tx whose
+   inclusion would push the partition it joins over either limit is skipped;
+   a skipped tx never satisfies its dependants, so it is removed together
+   with all its (would-be) descendants.  Core's heap orders by chunk feerate
+   only and leaves ties unspecified; here ties go to the lower txid so the
+   result is deterministic.  [new_edges] holds the (parent, child) links
+   just added.  Returns the txids removed. *)
+let trim_clusters (mp : mempool)
+    ~(new_edges : (string * string, unit) Hashtbl.t)
+    (seeds : string list) : Types.hash256 list =
+  let adj_weight (e : mempool_entry) =
+    Validation.get_sigops_adjusted_weight ~weight:e.weight
+      ~sigop_cost:e.sigops_cost
+      ~bytes_per_sigop:Consensus.default_bytes_per_sigop in
+  let parents_in key (e : mempool_entry) set =
+    List.filter_map (fun p ->
+      let pk = Cstruct.to_string p in
+      if pk <> key && Hashtbl.mem set pk then Some pk else None
+    ) e.depends_on in
+  let trim_component (comp : (string * mempool_entry) list) : string list =
+    let n = List.length comp in
+    let arr = Array.of_list comp in
+    let index = Hashtbl.create (2 * n) in
+    Array.iteri (fun i (k, _) -> Hashtbl.replace index k i) arr;
+    (* Old clusters: components without the new links. *)
+    let uf = Array.init n (fun i -> i) in
+    let rec find i = if uf.(i) = i then i else begin
+        let r = find uf.(i) in uf.(i) <- r; r end in
+    Array.iteri (fun i (k, e) ->
+      List.iter (fun pk ->
+        if not (Hashtbl.mem new_edges (pk, k)) then begin
+          let a = find i and b = find (Hashtbl.find index pk) in
+          if a <> b then uf.(a) <- b
+        end
+      ) (parents_in k e index)
+    ) arr;
+    let groups = Hashtbl.create 16 in
+    Array.iteri (fun i (_, e) ->
+      let r = find i in
+      Hashtbl.replace groups r
+        (e :: (try Hashtbl.find groups r with Not_found -> []))
+    ) arr;
+    (* Per tx: chunk feerate in its old cluster, and its dependencies
+       (linearization predecessor + new-link parents). *)
+    let feerate = Array.make n 0.0 in
+    let deps = Array.make n [] in
+    Hashtbl.iter (fun _ txs ->
+      let chunks =
+        linearize_cluster
+          { txs; total_fee = 0L; total_vsize = 0; fee_rate = 0.0 } mp in
+      let prev = ref None in
+      List.iter (fun (c : chunk) ->
+        (* chunk_txs is unordered: emit it parents-first. *)
+        let inside = Hashtbl.create 16 in
+        List.iter (fun (e : mempool_entry) ->
+          Hashtbl.replace inside (Cstruct.to_string e.txid) ()) c.chunk_txs;
+        let emitted = Hashtbl.create 16 in
+        let rec emit pending =
+          if pending <> [] then begin
+            let ready, rest = List.partition (fun (e : mempool_entry) ->
+              let k = Cstruct.to_string e.txid in
+              List.for_all (fun pk -> Hashtbl.mem emitted pk)
+                (parents_in k e inside)) pending in
+            let ready, rest =
+              if ready = [] then [ List.hd rest ], List.tl rest
+              else ready, rest in
+            List.iter (fun (e : mempool_entry) ->
+              let k = Cstruct.to_string e.txid in
+              let i = Hashtbl.find index k in
+              Hashtbl.replace emitted k ();
+              feerate.(i) <- c.chunk_fee_rate;
+              (match !prev with Some j -> deps.(i) <- j :: deps.(i) | None -> ());
+              prev := Some i
+            ) ready;
+            emit rest
+          end in
+        emit c.chunk_txs
+      ) chunks
+    ) groups;
+    Array.iteri (fun i (k, e) ->
+      List.iter (fun pk ->
+        if Hashtbl.mem new_edges (pk, k) then
+          deps.(i) <- Hashtbl.find index pk :: deps.(i)
+      ) (parents_in k e index)
+    ) arr;
+    let children = Array.make n [] in
+    let deps_left = Array.make n 0 in
+    Array.iteri (fun i ds ->
+      let ds = List.sort_uniq compare ds in
+      deps.(i) <- ds;
+      deps_left.(i) <- List.length ds;
+      List.iter (fun j -> children.(j) <- i :: children.(j)) ds
+    ) deps;
+    let size = Array.map (fun (_, e) -> adj_weight e) arr in
+    let included = Array.make n false in
+    (* Partitions of the included txs: union-find with count / weight. *)
+    let puf = Array.init n (fun i -> i) in
+    let pcount = Array.make n 1 and psize = Array.copy size in
+    let rec pfind i = if puf.(i) = i then i else begin
+        let r = pfind puf.(i) in puf.(i) <- r; r end in
+    let eligible = ref [] in
+    Array.iteri (fun i _ ->
+      if deps_left.(i) = 0 && size.(i) <= max_cluster_size_weight then
+        eligible := i :: !eligible) arr;
+    let better i j =
+      feerate.(i) > feerate.(j)
+      || (feerate.(i) = feerate.(j) && fst arr.(i) < fst arr.(j)) in
+    while !eligible <> [] do
+      let best = List.fold_left (fun b i -> if better i b then i else b)
+          (List.hd !eligible) !eligible in
+      eligible := List.filter (fun i -> i <> best) !eligible;
+      let reps = List.sort_uniq compare (List.map pfind deps.(best)) in
+      let cnt = List.fold_left (fun a r -> a + pcount.(r)) 1 reps in
+      let wt = List.fold_left (fun a r -> a + psize.(r)) size.(best) reps in
+      if cnt <= max_cluster_count && wt <= max_cluster_size_weight then begin
+        List.iter (fun r -> puf.(r) <- best) reps;
+        pcount.(best) <- cnt; psize.(best) <- wt;
+        included.(best) <- true;
+        List.iter (fun c ->
+          deps_left.(c) <- deps_left.(c) - 1;
+          if deps_left.(c) = 0 && size.(c) <= max_cluster_size_weight then
+            eligible := c :: !eligible
+        ) children.(best)
+      end
+    done;
+    List.filteri (fun i _ -> not included.(i)) (List.map fst comp)
+  in
+  let seen = Hashtbl.create 64 in
+  let doomed = ref [] in
+  List.iter (fun seed ->
+    if Hashtbl.mem mp.entries seed && not (Hashtbl.mem seen seed) then begin
+      let comp = ref [] and count = ref 0 and weight = ref 0 in
+      let queue = Queue.create () in
+      Hashtbl.replace seen seed (); Queue.push seed queue;
+      while not (Queue.is_empty queue) do
+        let k = Queue.pop queue in
+        match Hashtbl.find_opt mp.entries k with
+        | None -> ()
+        | Some e ->
+          comp := (k, e) :: !comp; incr count;
+          weight := !weight + adj_weight e;
+          let visit nk =
+            if Hashtbl.mem mp.entries nk && not (Hashtbl.mem seen nk) then begin
+              Hashtbl.replace seen nk (); Queue.push nk queue end in
+          List.iter (fun p -> visit (Cstruct.to_string p)) e.depends_on;
+          (match Hashtbl.find_opt mp.children k with
+           | Some set -> Hashtbl.iter (fun ck () -> visit ck) set
+           | None -> ())
+      done;
+      if !count > max_cluster_count || !weight > max_cluster_size_weight then
+        doomed := trim_component (List.rev !comp) @ !doomed
+    end
+  ) seeds;
+  List.filter_map (fun k ->
+    match Hashtbl.find_opt mp.entries k with
+    | Some e -> remove_transaction mp e.txid; Some e.txid
+    | None -> None
+  ) !doomed
+
 (* Core CTxMemPool::UpdateTransactionsFromBlock: a tx returned to the pool
    from a disconnected block may already have in-pool children (admitted
    while it was confirmed, so they recorded no in-pool parent).  Link them —
-   depends_on + the children index — and recompute the cached
-   ancestor/descendant stats of everything whose sets changed: the re-added
-   tx, its ancestors and its descendants. *)
+   depends_on + the children index — recompute the cached
+   ancestor/descendant stats of everything whose sets changed (the re-added
+   tx, its ancestors and its descendants), then Trim the clusters the links
+   pushed over the limits ([trim_clusters]). *)
 let update_transactions_from_block (mp : mempool)
     (readded : Types.hash256 list) : unit =
   let touched = ref [] in
+  let new_edges = Hashtbl.create 16 in
   List.iter (fun ptxid ->
     let pk = Cstruct.to_string ptxid in
     match Hashtbl.find_opt mp.entries pk with
@@ -3158,6 +3330,7 @@ let update_transactions_from_block (mp : mempool)
                  let st = Hashtbl.create 4 in
                  Hashtbl.replace mp.children pk st; st in
              Hashtbl.replace set ck ();
+             Hashtbl.replace new_edges (pk, ck) ();
              touched := ptxid :: !touched
            | _ -> ())
       ) pe.tx.Types.outputs
@@ -3183,7 +3356,9 @@ let update_transactions_from_block (mp : mempool)
       e.ancestor_size <- sum anc;
       e.descendant_count <- 1 + List.length desc;
       e.descendant_size <- sum desc
-    ) affected
+    ) affected;
+    ignore (trim_clusters mp ~new_edges
+              (List.map Cstruct.to_string !touched))
   end
 
 (* Core MaybeUpdateMempoolForReorg(disconnectpool, fAddToMempool=true).
@@ -3197,9 +3372,11 @@ let update_transactions_from_block (mp : mempool)
    2. UpdateTransactionsFromBlock.
    3. removeForReorg (non-final / sequence-locked / immature at tip+1).
    4. LimitMempoolSize.
+   [dropped] = txs of blocks Core disconnects with fAddToMempool = false
+   (InvalidateBlock deeper than 10 blocks): removeRecursive'd, not re-added.
    Returns the number of txs re-accepted. *)
 let update_for_reorg (mp : mempool) ~(disconnected : Types.transaction list)
-    : int =
+    ~(dropped : Types.transaction list) : int =
   let readded = ref [] in
   List.iter (fun tx ->
     if not (Validation.is_coinbase_tx tx) then begin
@@ -3210,6 +3387,12 @@ let update_for_reorg (mp : mempool) ~(disconnected : Types.transaction list)
         if not (contains mp txid) then remove_recursive mp tx txid
     end
   ) disconnected;
+  (* fAddToMempool = false (InvalidateBlock below its 10th block): the tx is
+     not re-accepted and its in-pool spenders go with it. *)
+  List.iter (fun tx ->
+    if not (Validation.is_coinbase_tx tx) then
+      remove_recursive mp tx (Crypto.compute_txid tx)
+  ) dropped;
   update_transactions_from_block mp (List.rev !readded);
   remove_for_reorg mp;
   if mp.total_weight > mp.max_size_bytes then evict_by_chunks mp;

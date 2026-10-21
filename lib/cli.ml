@@ -1379,6 +1379,14 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
      26k-stuck-tx bug). *)
   Sync.set_mempool_remove_hook chain
     (Some (fun block height -> Mempool.remove_for_block mempool block height));
+  (* Reorg / invalidateblock mempool update (Core MaybeUpdateMempoolForReorg)
+     reaches the live mempool through the chain, whatever ibd_state the
+     reorg path built.  The mempool reads the active tip height from the
+     chain (Core m_chain.Height()) rather than a cached copy that only some
+     connect paths refreshed. *)
+  Sync.set_chain_mempool chain (Some mempool);
+  Mempool.set_tip_height_provider mempool
+    (Some (fun () -> chain.Sync.blocks_synced));
 
   (* Create RPC context. The [filter_index] field of [rpc_context]
      is the inner [Block_index.filter_index] sub-handle (used by

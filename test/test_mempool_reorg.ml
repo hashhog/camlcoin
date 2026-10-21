@@ -337,6 +337,46 @@ let test_p2p_reorg () =
     check_pool "(c) pool after the P2P reorg"
       [ "B"; "IMM"; "LT"; "M1" ] (pool fx (("X", x) :: ("Z", z) :: v.names)))
 
+(* A mempool fault after the reorg's commit must not escape [reorganize]:
+   its callers (process_new_block's P2P reorg, submitblock's side branch,
+   reconsiderblock, invalidateblock's activate loop) match on the result and
+   do not catch, and the tip is already on disk.  Same reorg as (c), with
+   removeForBlock raising for every connected block: the reorg still returns
+   Ok at 113b, and the refill still runs (B, IMM, LT come back). *)
+let test_p2p_reorg_remove_raises () =
+  with_fx ~label:"mr_p2p_raise" (fun fx ->
+    let fork_hash = fx.prev_hash and fork_time = fx.prev_time in
+    let v = build_vec fx in
+    connect fx v.b111; connect fx v.b112;
+    sendraw fx v.m1;
+    check_pool "pool at 112" [ "M1" ] (pool fx v.names);
+    fx.prev_hash <- fork_hash; fx.prev_time <- fork_time;
+    let b111b = build fx ~tag:1 111 [] in
+    let b112b = build fx ~tag:1 112 [] in
+    let b113b = build fx ~tag:1 113 [] in
+    let raised = ref 0 in
+    let saved = !Sync.reorg_remove_for_block in
+    Sync.reorg_remove_for_block := (fun _ _ _ -> incr raised; failwith "injected");
+    Fun.protect ~finally:(fun () -> Sync.reorg_remove_for_block := saved)
+      (fun () ->
+        List.iter (fun b ->
+            accept_hdr fx b;
+            match Lwt_main.run
+                    (Sync.process_new_block ~f_requested:true fx.state b) with
+            | Ok () -> ()
+            | Error e -> Alcotest.failf "branch block: %s" e
+            | exception exn ->
+              Alcotest.failf "reorg raised: %s" (Printexc.to_string exn))
+          [ b111b; b112b; b113b ]);
+    Alcotest.(check bool) "removeForBlock was called and raised" true
+      (!raised > 0);
+    Alcotest.(check int) "reorged to 113b" 113 fx.state.Sync.blocks_synced;
+    Alcotest.(check bool) "active 113 is 113b" true
+      (match Storage.ChainDB.get_hash_at_height fx.db 113 with
+       | Some h -> Cstruct.equal h (hash_of b113b) | None -> false);
+    check_pool "pool after the reorg (refill ran)"
+      [ "A"; "B"; "IMM"; "LT"; "M1" ] (pool fx v.names))
+
 (* Core UpdateTransactionsFromBlock ends with m_txgraph->Trim(): linking a
    re-added tx to its in-pool children can grow a cluster past the limits
    (64 txs / 404000 weight), and Trim removes txs (with descendants) until
@@ -447,6 +487,8 @@ let () =
         test_invalidate_reconsider;
       Alcotest.test_case "P2P reorg: refill, conflicts, descendants" `Quick
         test_p2p_reorg;
+      Alcotest.test_case "P2P reorg: removeForBlock raises after commit" `Quick
+        test_p2p_reorg_remove_raises;
       Alcotest.test_case "invalidateblock: Trim an oversized cluster" `Quick
         test_invalidate_trims_oversized_cluster;
       Alcotest.test_case "invalidateblock: Trim an overweight cluster" `Quick

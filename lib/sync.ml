@@ -1973,6 +1973,13 @@ let run_mempool_remove_hook (state : chain_state) (block : Types.block)
         m "mempool remove_for_block raised at height %d (ignored): %s"
           height (Printexc.to_string exn)))
 
+(* [Mempool.remove_for_block] as [reorganize] calls it for each connected
+   block.  A ref only so a test can make it raise and check that the reorg
+   still returns [Ok] at the new tip with the refill done. *)
+let reorg_remove_for_block :
+    (Mempool.mempool -> Types.block -> int -> unit) ref =
+  ref Mempool.remove_for_block
+
 (* Average block size used to convert a byte-denominated [prune_target] into
    a block-count keep window. 1.5 MB matches lunarblock's AVG_BLOCK_SIZE
    (src/prune.lua:41) and is a conservative-on-the-keep-side estimate for
@@ -7864,8 +7871,17 @@ let reorganize ?(allow_equal_work = false)
               | None -> state.chain_mempool in
             (match reorg_mp with
              | Some mp ->
+               (* Best-effort per block, like [run_mempool_remove_hook] on the
+                  connect path: the chain move is already committed, so a
+                  mempool fault must neither escape [reorganize] (its callers
+                  match on the result and do not catch) nor skip the refill
+                  below. *)
                List.iter (fun ((entry : header_entry), (block : Types.block)) ->
-                 Mempool.remove_for_block mp block entry.height
+                 try !reorg_remove_for_block mp block entry.height
+                 with exn ->
+                   Logs.warn (fun m ->
+                     m "reorg: mempool remove_for_block raised at height %d \
+                        (ignored): %s" entry.height (Printexc.to_string exn))
                ) (List.rev !connected_blocks);
                if to_disconnect <> [] then
                  (* ActivateBestChainStep: fAddToMempool = true for every

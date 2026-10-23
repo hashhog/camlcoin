@@ -478,6 +478,159 @@ let test_deep_invalidate_caps_readd () =
     check_pool "pool after an 11-block invalidate (Core: T02..T11)"
       (List.init 10 (fun k -> Printf.sprintf "T%02d" (k + 2))) (pool fx names))
 
+(* ------------------------------------------- entry fields (entryToJSON) *)
+
+(* getmempoolentry's result object for [tx]. *)
+let entry_json fx (tx : Types.transaction) : (string * Yojson.Safe.t) list =
+  match rpc_ok fx "getmempoolentry"
+          [ `String (Types.hash256_to_hex_display (txid tx)) ] with
+  | `Assoc kv -> (match List.assoc_opt "result" kv with
+      | Some (`Assoc e) -> e
+      | _ -> Alcotest.fail "getmempoolentry: no result object")
+  | _ -> Alcotest.fail "getmempoolentry: not an object"
+
+let field_int e k = match List.assoc_opt k e with
+  | Some (`Int n) -> n
+  | _ -> Alcotest.failf "entry field %s not an int" k
+
+let chunk_fee_sats e = match List.assoc_opt "fees" e with
+  | Some (`Assoc f) -> (match List.assoc_opt "chunk" f with
+      | Some (`Float x) -> Int64.of_float (Float.round (x *. 1e8))
+      | Some (`Int n) -> Int64.mul (Int64.of_int n) 100_000_000L
+      | _ -> Alcotest.fail "fees.chunk missing")
+  | _ -> Alcotest.fail "fees missing"
+
+let spentby e = match List.assoc_opt "spentby" e with
+  | Some (`List l) -> List.map (function `String s -> s | _ -> "?") l
+  | _ -> Alcotest.fail "spentby missing"
+
+let pool_entry fx tx = match Mempool.get fx.mp (txid tx) with
+  | Some e -> e | None -> Alcotest.fail "tx not in pool"
+
+(* Core entryToJSON spentby = GetChildren, sorted by CompareIteratorByHash
+   (uint256 operator<: the internal byte order, which is the displayed hex
+   reversed).  warden_e: P with 63 in-pool children after the invalidate
+   refill.  Deployed: the children came out in hash-table order. *)
+let test_spentby_txid_order () =
+  with_fx ~label:"mr_spentby" (fun fx ->
+    let parent, names = parent_children_invalidate fx ~n:64 ~pad:20 ~fee_unit:1000 in
+    let kids = List.filter_map (fun (n, tx) ->
+        if n <> "P" && Mempool.contains fx.mp (txid tx) then Some (txid tx)
+        else None) names in
+    Alcotest.(check int) "63 children in the pool" 63 (List.length kids);
+    let core_order =
+      List.map Types.hash256_to_hex_display (List.sort Cstruct.compare kids) in
+    Alcotest.(check (list string)) "P spentby in Core's GetChildren order"
+      core_order (spentby (entry_json fx parent)))
+
+(* Core GetMainChunkFeerate: chunkweight / fees.chunk are the chunk's, not
+   the tx's.  P (fee 10k) <- C0 (fee 100k), C1 (fee 200k), re-added by the
+   invalidate refill.  The linearization chunks P with C1 (P+C1 has a higher
+   feerate than P, and C0 alone is below P+C1), so P and C1 report the
+   P+C1 weight and fees, and C0 its own.  Deployed: every entry reported its
+   own weight and modified fee (Core regtest reorg/seed_mempool_reorg rows:
+   node 340 vs Core 680). *)
+let test_chunk_feerate_cpfp () =
+  with_fx ~label:"mr_chunk" (fun fx ->
+    let parent, names = parent_children_invalidate fx ~n:2 ~pad:20 ~fee_unit:100_000 in
+    let c0 = List.assoc "C00" names and c1 = List.assoc "C01" names in
+    let p = pool_entry fx parent and e0 = pool_entry fx c0
+    and e1 = pool_entry fx c1 in
+    let rate (f : int64) w = Int64.to_float f /. float_of_int w in
+    let pc1_fee = Int64.add p.Mempool.fee e1.Mempool.fee
+    and pc1_w = p.Mempool.weight + e1.Mempool.weight in
+    (* The fixture's premise: C1 lifts P, C0 does not join P+C1. *)
+    Alcotest.(check bool) "fixture: P+C1 above P" true
+      (rate pc1_fee pc1_w > rate p.Mempool.fee p.Mempool.weight);
+    Alcotest.(check bool) "fixture: C0 below P+C1" true
+      (rate e0.Mempool.fee e0.Mempool.weight < rate pc1_fee pc1_w);
+    let jp = entry_json fx parent and j0 = entry_json fx c0
+    and j1 = entry_json fx c1 in
+    Alcotest.(check int) "P chunkweight = P+C1" pc1_w (field_int jp "chunkweight");
+    Alcotest.(check int64) "P fees.chunk = P+C1" pc1_fee (chunk_fee_sats jp);
+    Alcotest.(check int) "C1 chunkweight = P+C1" pc1_w (field_int j1 "chunkweight");
+    Alcotest.(check int64) "C1 fees.chunk = P+C1" pc1_fee (chunk_fee_sats j1);
+    Alcotest.(check int) "C0 chunkweight = C0" e0.Mempool.weight
+      (field_int j0 "chunkweight");
+    Alcotest.(check int64) "C0 fees.chunk = C0" e0.Mempool.fee (chunk_fee_sats j0);
+    (* getrawmempool verbose (shared per-cluster memo) agrees. *)
+    let verbose = match rpc_ok fx "getrawmempool" [ `Bool true ] with
+      | `Assoc kv -> (match List.assoc_opt "result" kv with
+          | Some (`Assoc m) -> m | _ -> Alcotest.fail "no verbose result")
+      | _ -> Alcotest.fail "getrawmempool" in
+    List.iter (fun (tx, w) ->
+        match List.assoc_opt (Types.hash256_to_hex_display (txid tx)) verbose with
+        | Some (`Assoc e) ->
+          Alcotest.(check int) "getrawmempool chunkweight" w (field_int e "chunkweight")
+        | _ -> Alcotest.fail "entry missing from getrawmempool")
+      [ parent, pc1_w; c1, pc1_w; c0, e0.Mempool.weight ])
+
+(* The warden_e shape: P with 63 children of rising fee.  The optimal chunk
+   for P takes children by feerate, highest first, while each one is
+   strictly above the running chunk feerate (Core v31.1: 23107 weight,
+   0.01625 BTC on warden_e; deployed: P's own 8249 / 0.0001). *)
+let test_chunk_feerate_star () =
+  with_fx ~label:"mr_chunk_star" (fun fx ->
+    let parent, names = parent_children_invalidate fx ~n:64 ~pad:20 ~fee_unit:1000 in
+    let p = pool_entry fx parent in
+    let kids = List.filter_map (fun (n, tx) ->
+        if n <> "P" then Mempool.get fx.mp (txid tx) else None) names in
+    let by_rate = List.sort (fun (a : Mempool.mempool_entry) b ->
+        compare (Int64.to_float b.fee /. float_of_int b.weight)
+          (Int64.to_float a.fee /. float_of_int a.weight)) kids in
+    let rec grow f w = function
+      | (k : Mempool.mempool_entry) :: rest
+        when Int64.to_float k.fee /. float_of_int k.weight
+             > Int64.to_float f /. float_of_int w ->
+        grow (Int64.add f k.fee) (w + k.weight) rest
+      | _ -> (f, w) in
+    let f, w = grow p.Mempool.fee p.Mempool.weight by_rate in
+    Printf.printf "  P own %d wu, expected chunk %d wu / %Ld sat\n%!"
+      p.Mempool.weight w f;
+    Alcotest.(check bool) "fixture: P's chunk includes children" true
+      (w > p.Mempool.weight);
+    let jp = entry_json fx parent in
+    Alcotest.(check int) "P chunkweight" w (field_int jp "chunkweight");
+    Alcotest.(check int64) "P fees.chunk" f (chunk_fee_sats jp))
+
+(* The chunk comparison is exact: fee * weight overflows int64 for a
+   whole-supply fee, and equal feerates never merge (strictly higher only,
+   as in ChunkLinearization). *)
+let test_feerate_gt_exact () =
+  let big = 2_100_000_000_000_000L in
+  Alcotest.(check bool) "big fee, lower rate" false
+    (Mempool.feerate_gt (big, 4_000_000) (Int64.sub big 1L, 3_999_999));
+  Alcotest.(check bool) "big fee, higher rate" true
+    (Mempool.feerate_gt (Int64.sub big 1L, 3_999_999) (big, 4_000_000));
+  Alcotest.(check bool) "equal rate is not higher" false
+    (Mempool.feerate_gt (2L, 4) (1L, 2));
+  Alcotest.(check bool) "negative modified fee below zero" true
+    (Mempool.feerate_gt (0L, 400) (-5L, 400));
+  Alcotest.(check bool) "two negatives" true
+    (Mempool.feerate_gt (-1L, 400) (-5L, 400))
+
+(* warden_d: a chain T0 <- cb1, T1 <- T0, T2 <- T1 confirmed at 111, 112,
+   113; invalidateblock 111.  Core re-accepts after each DisconnectTip, so
+   T2 enters at tip 112, T1 at 111, T0 at 110.  Deployed: all three at the
+   final tip 110 (Core regtest warden_d rows: node 101 vs Core 102 / 103). *)
+let test_invalidate_entry_height () =
+  with_fx ~label:"mr_height" (fun fx ->
+    let t0 = spend ~tag:50 fx.cb.(1) subsidy in
+    let t1 = spend ~tag:51 (txid t0) (Int64.sub subsidy fee) in
+    let t2 = spend ~tag:52 (txid t1) (Int64.sub subsidy (Int64.mul 2L fee)) in
+    let blocks = List.mapi (fun k t -> build fx ~fee ~tag:0 (111 + k) [ t ])
+        [ t0; t1; t2 ] in
+    List.iter (connect fx) blocks;
+    Alcotest.(check int) "tip 113" 113 fx.state.Sync.blocks_synced;
+    ignore (rpc_ok fx "invalidateblock" [ hx (List.hd blocks) ]);
+    Alcotest.(check int) "tip 110" 110 fx.state.Sync.blocks_synced;
+    check_pool "pool after invalidateblock 111" [ "T0"; "T1"; "T2" ]
+      (pool fx [ "T0", t0; "T1", t1; "T2", t2 ]);
+    List.iter (fun (name, tx, h) ->
+        Alcotest.(check int) (name ^ " entry height") h
+          (field_int (entry_json fx tx) "height"))
+      [ "T0", t0, 110; "T1", t1, 111; "T2", t2, 112 ])
+
 let () =
   Alcotest.run "mempool_reorg" [
     "mempool vs chain", [
@@ -495,5 +648,17 @@ let () =
         test_invalidate_trims_overweight_cluster;
       Alcotest.test_case "invalidateblock: re-add only the top 10 blocks" `Quick
         test_deep_invalidate_caps_readd;
+    ];
+    "entry fields", [
+      Alcotest.test_case "spentby in Core's GetChildren (txid) order" `Quick
+        test_spentby_txid_order;
+      Alcotest.test_case "chunkweight / fees.chunk: CPFP chunk" `Quick
+        test_chunk_feerate_cpfp;
+      Alcotest.test_case "chunkweight / fees.chunk: parent with 63 children" `Quick
+        test_chunk_feerate_star;
+      Alcotest.test_case "chunk feerate comparison is exact" `Quick
+        test_feerate_gt_exact;
+      Alcotest.test_case "invalidateblock re-add: entry height per block" `Quick
+        test_invalidate_entry_height;
     ];
   ]

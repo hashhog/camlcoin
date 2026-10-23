@@ -1944,19 +1944,23 @@ let handle_getmempoolinfo (ctx : rpc_context) : Yojson.Safe.t =
      depends, spentby, bip125-replaceable, unbroadcast
 
    Notes:
-   - chunkweight: Core uses cluster-linearisation chunk weight; we approximate
-     as entry.weight (exact when the tx is its own chunk, which is the common
-     case for single-tx chains).
+   - chunkweight / fees.chunk: Core's GetMainChunkFeerate, the adjusted
+     weight and modified fee of the chunk holding the tx in its cluster's
+     linearization (Mempool.main_chunk_feerate).  A CPFP parent reports the
+     parent+child chunk, not its own weight.  [chunk_memo] shares the
+     per-cluster linearization across the entries of one getrawmempool.
    - spentby: we don't maintain a child index in O(1); iterate mempool to find
      entries whose depends_on includes this txid. This is O(mempool_size) but
-     rare (only called on explicit entry queries).
+     rare (only called on explicit entry queries).  Core's GetChildren sorts
+     by txid (CompareIteratorByHash: uint256 operator<, i.e. the internal
+     byte order, not the displayed hex), so sort the raw txids.
    - bip125-replaceable: use Mempool.signals_rbf_with_ancestors so the
      reported flag matches Core's BIP-125 inheritable opt-in (entryToJSON
      calls IsRBFOptIn(it, mp) which walks the in-mempool ancestor set).
      A child whose own nSequence is final (0xFFFFFFFF) but whose parent
      signals RBF is still reported replaceable. *)
-let mempool_entry_to_json (mp : Mempool.mempool) (entry : Mempool.mempool_entry)
-    : Yojson.Safe.t =
+let mempool_entry_to_json ?chunk_memo (mp : Mempool.mempool)
+    (entry : Mempool.mempool_entry) : Yojson.Safe.t =
   let fee_btc = Int64.to_float entry.fee /. 100_000_000.0 in
   (* FIX-72 W120 BUG-10: modified fee = base + prioritisetransaction delta.
      Core (entryToJSON, rpc/mempool.cpp:529) emits both:
@@ -1993,10 +1997,14 @@ let mempool_entry_to_json (mp : Mempool.mempool) (entry : Mempool.mempool_entry)
       if List.exists (fun dep ->
            Cstruct.to_string dep = txid_key
          ) e.depends_on
-      then `String (Types.hash256_to_hex_display e.txid) :: acc
+      then e.txid :: acc
       else acc
     ) mp.entries []
+    |> List.sort Cstruct.compare
+    |> List.map (fun t -> `String (Types.hash256_to_hex_display t))
   in
+  let chunk_fee, chunk_weight =
+    Mempool.main_chunk_feerate ?memo:chunk_memo mp entry in
   `Assoc [
     ("vsize",           `Int ((entry.weight + 3) / 4));
     ("weight",          `Int entry.weight);
@@ -2007,13 +2015,13 @@ let mempool_entry_to_json (mp : Mempool.mempool) (entry : Mempool.mempool_entry)
     ("ancestorcount",   `Int entry.ancestor_count);
     ("ancestorsize",    `Int entry.ancestor_size);
     ("wtxid",           `String wtxid_hex);
-    ("chunkweight",     `Int entry.weight);
+    ("chunkweight",     `Int chunk_weight);
     ("fees", `Assoc [
       ("base",       `Float fee_btc);
       ("modified",   `Float modified_fee_btc);
       ("ancestor",   `Float ancestorfees_btc);
       ("descendant", `Float descendantfees_btc);
-      ("chunk",      `Float modified_fee_btc);
+      ("chunk",      `Float (Int64.to_float chunk_fee /. 100_000_000.0));
     ]);
     ("depends",   `List (List.map (fun dep ->
       `String (Types.hash256_to_hex_display dep)
@@ -2030,9 +2038,10 @@ let handle_getrawmempool (ctx : rpc_context)
     | _ -> false
   in
   if verbose then begin
+    let chunk_memo = Hashtbl.create 64 in
     let entries = Hashtbl.fold (fun _ entry acc ->
       let txid = Types.hash256_to_hex_display entry.Mempool.txid in
-      let info = mempool_entry_to_json ctx.mempool entry in
+      let info = mempool_entry_to_json ~chunk_memo ctx.mempool entry in
       (txid, info) :: acc
     ) ctx.mempool.entries [] in
     `Assoc entries
@@ -2075,9 +2084,10 @@ let handle_getmempoolancestors (ctx : rpc_context)
     else begin
       let ancestors = Mempool.get_ancestors ctx.mempool txid in
       if verbose then
+        let chunk_memo = Hashtbl.create 64 in
         Ok (`Assoc (List.map (fun (entry : Mempool.mempool_entry) ->
           let k = Types.hash256_to_hex_display entry.txid in
-          (k, mempool_entry_to_json ctx.mempool entry)
+          (k, mempool_entry_to_json ~chunk_memo ctx.mempool entry)
         ) ancestors))
       else
         Ok (`List (List.map (fun (entry : Mempool.mempool_entry) ->
@@ -2104,9 +2114,10 @@ let handle_getmempooldescendants (ctx : rpc_context)
     else begin
       let descendants = Mempool.get_descendants ctx.mempool txid in
       if verbose then
+        let chunk_memo = Hashtbl.create 64 in
         Ok (`Assoc (List.map (fun (entry : Mempool.mempool_entry) ->
           let k = Types.hash256_to_hex_display entry.txid in
-          (k, mempool_entry_to_json ctx.mempool entry)
+          (k, mempool_entry_to_json ~chunk_memo ctx.mempool entry)
         ) descendants))
       else
         Ok (`List (List.map (fun (entry : Mempool.mempool_entry) ->

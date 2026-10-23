@@ -212,6 +212,68 @@ let test_getrawtransaction_mempool_v2 () =
         let vin0 = List.hd (j |> member "vin" |> to_list) in
         Alcotest.(check bool) "no prevout" true (member "prevout" vin0 = `Null))
 
+(* ---- network-dependent encodings on regtest ---- *)
+
+let tpub =
+  "tpubD6NzVbkrYhZ4XgiXtGrdW5XDAPFCL9h7we1vwNCpn8tGbBcgfVYjXyhWo4E1xkh56hjod1RhGjxbaTLV3X4FyWuejifB9jusQ46QzG87VKp"
+
+(* Core echoes the key as given: a tpub stays a tpub (r5-remeasure-2026-10-04:
+   the node returned an xpub on regtest). *)
+let test_getdescriptorinfo_keeps_tpub () =
+  with_ctx (fun ctx ->
+      let open Yojson.Safe.Util in
+      match Rpc.dispatch_rpc ctx "getdescriptorinfo"
+              [ `String ("wpkh(" ^ tpub ^ "/0/*)") ] with
+      | Error (c, m) -> Alcotest.failf "getdescriptorinfo: (%d) %s" c m
+      | Ok j ->
+        Alcotest.(check string) "descriptor"
+          ("wpkh(" ^ tpub ^ "/0/*)")
+          (let d = j |> member "descriptor" |> to_string in
+           match String.index_opt d '#' with
+           | Some i -> String.sub d 0 i
+           | None -> d))
+
+let psbt_b64 =
+  "cHNidP8BAFICAAAAAaqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqAAAAAAD9////\
+   AaCGAQAAAAAAFgAUdR526BmRltRUlBxF0bOjI/FDO9YAAAAAAAAA"
+
+(* decodepsbt encodes addresses for the node's own network: bcrt1 on regtest. *)
+let test_decodepsbt_regtest_hrp () =
+  with_ctx (fun ctx ->
+      let open Yojson.Safe.Util in
+      match Rpc.dispatch_rpc ctx "decodepsbt" [ `String psbt_b64 ] with
+      | Error (c, m) -> Alcotest.failf "decodepsbt: (%d) %s" c m
+      | Ok j ->
+        let vout0 = List.hd (j |> member "tx" |> member "vout" |> to_list) in
+        Alcotest.(check string) "address"
+          "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
+          (vout0 |> member "scriptPubKey" |> member "address" |> to_string))
+
+(* A mainnet address is not valid on regtest (Core DecodeDestination checks
+   the chain's prefixes). *)
+let test_validateaddress_wrong_network () =
+  with_ctx (fun ctx ->
+      let open Yojson.Safe.Util in
+      let check addr err =
+        match Rpc.dispatch_rpc ctx "validateaddress" [ `String addr ] with
+        | Error (c, m) -> Alcotest.failf "validateaddress: (%d) %s" c m
+        | Ok j ->
+          Alcotest.(check bool) (addr ^ " isvalid") false
+            (j |> member "isvalid" |> to_bool);
+          Alcotest.(check string) (addr ^ " error") err
+            (j |> member "error" |> to_string)
+      in
+      check "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        "Invalid or unsupported prefix for Segwit (Bech32) address \
+         (expected bcrt, got bc).";
+      check "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
+        "Invalid or unsupported Base58-encoded address.";
+      (match Rpc.dispatch_rpc ctx "validateaddress"
+               [ `String "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080" ] with
+       | Ok j -> Alcotest.(check bool) "regtest address valid" true
+                   (j |> member "isvalid" |> to_bool)
+       | Error (c, m) -> Alcotest.failf "validateaddress: (%d) %s" c m))
+
 let () =
   Alcotest.run "rpc_format_rows"
     [ ("scantxoutset",
@@ -224,6 +286,13 @@ let () =
            test_unbroadcast_cleared_when_served;
          Alcotest.test_case "getmempoolinfo bytes sums per-tx vsize" `Quick
            test_info_bytes_sums_vsize ]);
+      ("network",
+       [ Alcotest.test_case "getdescriptorinfo keeps tpub" `Quick
+           test_getdescriptorinfo_keeps_tpub;
+         Alcotest.test_case "decodepsbt uses the regtest hrp" `Quick
+           test_decodepsbt_regtest_hrp;
+         Alcotest.test_case "validateaddress rejects other-network address" `Quick
+           test_validateaddress_wrong_network ]);
       ("operator",
        [ Alcotest.test_case "decoderawtransaction message" `Quick
            test_decoderawtransaction_message;

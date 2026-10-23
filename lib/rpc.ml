@@ -4477,7 +4477,40 @@ let handle_validateaddress (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
   | [`String address] ->
+    let net : Address.network =
+      match ctx.network.network_type with
+      | Consensus.Mainnet -> `Mainnet
+      | Consensus.Testnet3 | Consensus.Testnet4 -> `Testnet
+      | Consensus.Regtest -> `Regtest
+    in
+    (* Core DecodeDestination checks the address against THIS chain's
+       prefixes: a Bech32 address with another HRP, or a Base58 address with
+       another version byte, is invalid here.  Testnet and regtest share the
+       Base58 versions, so only the Bech32 HRP tells them apart. *)
+    let wrong_network (addr : Address.address) : string option =
+      let lower = String.lowercase_ascii address in
+      let is_bech32 =
+        String.length lower > 0 && (lower.[0] = 'b' || lower.[0] = 't')
+        && String.contains lower '1' in
+      let want_hrp = match net with
+        | `Mainnet -> "bc" | `Testnet -> "tb" | `Regtest -> "bcrt" in
+      if is_bech32 then begin
+        let sep = String.rindex lower '1' in
+        let hrp = String.sub lower 0 sep in
+        if hrp = want_hrp then None
+        else Some (Printf.sprintf
+          "Invalid or unsupported prefix for Segwit (Bech32) address \
+           (expected %s, got %s)." want_hrp hrp)
+      end else if (addr.Address.network = `Mainnet) = (net = `Mainnet) then None
+      else Some "Invalid or unsupported Base58-encoded address."
+    in
     (match Address.address_of_string address with
+     | Ok addr when wrong_network addr <> None ->
+       Ok (`Assoc [
+         ("isvalid", `Bool false);
+         ("error_locations", `List []);
+         ("error", `String (Option.get (wrong_network addr)));
+       ])
      | Ok addr ->
        let script_pubkey = Wallet.build_output_script addr in
        let is_witness = match addr.Address.addr_type with
@@ -7956,7 +7989,7 @@ let handle_decodescript (ctx : rpc_context)
      7. tx: hash + size/vsize/weight added
      8. psbt inputs/outputs: index field removed (Core emits {} when empty)
    Reference: bitcoin-core/src/rpc/rawtransaction.cpp decodepsbt. *)
-let handle_decodepsbt (_ctx : rpc_context)
+let handle_decodepsbt (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
   | [`String b64] ->
@@ -7964,7 +7997,7 @@ let handle_decodepsbt (_ctx : rpc_context)
      | Error e -> Error (Psbt.string_of_error e)
      | Ok psbt ->
        let tx      = psbt.tx in
-       let network : Address.network = `Mainnet in  (* decodepsbt is network-agnostic; use mainnet for addr encoding *)
+       let network = network_to_address_network ctx.network in
        let txid    = Crypto.compute_txid tx in
        let wtxid   = Crypto.compute_wtxid tx in
        (* tx.vin: scriptSig {asm, hex} + sequence as uint32 *)

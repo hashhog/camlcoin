@@ -1826,10 +1826,16 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
              Serialize.serialize_block w block;
              Some (Serialize.writer_to_cstruct w))
       in
+      (* Serving a tx to a peer ends its "unbroadcast" state (Core
+         ProcessGetData -> RemoveUnbroadcastTx). *)
       let lookup_tx hash =
-        Option.map (fun e -> e.Mempool.tx) (Mempool.get mempool hash) in
+        Option.map (fun e ->
+          Mempool.remove_unbroadcast mempool e.Mempool.txid; e.Mempool.tx)
+          (Mempool.get mempool hash) in
       let lookup_wtx wtxid =
-        Option.map (fun e -> e.Mempool.tx) (Mempool.get_by_wtxid mempool wtxid)
+        Option.map (fun e ->
+          Mempool.remove_unbroadcast mempool e.Mempool.txid; e.Mempool.tx)
+          (Mempool.get_by_wtxid mempool wtxid)
       in
       let tip_height = match chain.tip with
         | Some t -> t.height

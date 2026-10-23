@@ -1675,6 +1675,7 @@ let handle_sendrawtransaction (ctx : rpc_context)
           end
           else begin
             ignore replaced_txids;
+            Mempool.add_unbroadcast ctx.mempool entry.txid;
             (* Relay to peers *)
             let wtxid = Crypto.compute_wtxid tx in
             let fee_rate = Int64.div entry.fee (Int64.of_int (max 1 (entry.weight / 4))) in
@@ -1916,14 +1917,14 @@ let handle_getmempoolinfo (ctx : rpc_context) : Yojson.Safe.t =
   `Assoc [
     ("loaded", `Bool true);
     ("size", `Int count);
-    ("bytes", `Int (weight / 4));
+    ("bytes", `Int (Mempool.total_vsize ctx.mempool));
     ("usage", `Int weight);
     ("total_fee", `Float (Int64.to_float fees /. 100_000_000.0));
     ("maxmempool", `Int ctx.mempool.max_size_bytes);
     ("mempoolminfee", `Float mempoolminfee_btc);
     ("minrelaytxfee", `Float minrelaytxfee_btc);
     ("incrementalrelayfee", `Float incrementalrelayfee_btc);
-    ("unbroadcastcount", `Int 0);
+    ("unbroadcastcount", `Int (Mempool.unbroadcast_count ctx.mempool));
     ("fullrbf", `Bool true);
     ("permitbaremultisig", `Bool true);
     ("maxdatacarriersize", `Int 100000);
@@ -2028,7 +2029,7 @@ let mempool_entry_to_json ?chunk_memo (mp : Mempool.mempool)
     ) entry.depends_on));
     ("spentby",   `List spentby);
     ("bip125-replaceable", `Bool (Mempool.signals_rbf_with_ancestors mp entry.tx));
-    ("unbroadcast",        `Bool false);
+    ("unbroadcast",        `Bool (Mempool.is_unbroadcast mp entry.txid));
   ]
 
 let handle_getrawmempool (ctx : rpc_context)
@@ -5064,6 +5065,7 @@ let handle_submitpackage (ctx : rpc_context)
                    /. 100_000.0
                  else 0.0
                in
+               Mempool.add_unbroadcast ctx.mempool e.Mempool.txid;
                (* Announce to peers (best-effort) *)
                let fee_rate =
                  Int64.div e.Mempool.fee

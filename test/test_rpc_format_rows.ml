@@ -202,6 +202,25 @@ let test_getblock_bool_verbosity () =
 let test_getrawtransaction_mempool_v2 () =
   with_ctx (fun ctx ->
       let tx = submit ctx in
+      (* Give the spent coin a creating block + tx index entry, the source the
+         old code used to invent fee/prevout for a mempool tx. *)
+      let creating : Types.transaction =
+        { Types.version = 2l;
+          inputs = [ { Types.previous_output =
+                         { Types.txid = Cstruct.create 32; vout = 0xFFFFFFFFl };
+                       script_sig = Cstruct.of_string "\x01\x01";
+                       sequence = 0xFFFFFFFFl } ];
+          outputs = [ { Types.value = 5_000_000_000L; script_pubkey = op_true } ];
+          witnesses = []; locktime = 0l } in
+      let header : Types.block_header =
+        { version = 4l; prev_block = Cstruct.create 32;
+          merkle_root = Cstruct.create 32; timestamp = 1l; bits = 0x207fffffl;
+          nonce = 1l } in
+      let bh = Crypto.compute_block_hash header in
+      Storage.ChainDB.store_block ctx.chain.db bh
+        { Types.header; transactions = [ creating ] };
+      Storage.ChainDB.store_tx_index ctx.chain.db
+        (Cstruct.of_string (String.make 32 '\x07')) bh 0;
       let txid = Types.hash256_to_hex_display (Crypto.compute_txid tx) in
       let open Yojson.Safe.Util in
       match Rpc.dispatch_rpc ctx "getrawtransaction"

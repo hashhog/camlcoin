@@ -14,19 +14,8 @@ commit. At height 958,794 the UTXO set's `hash_serialized_3` was
 29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0   (166,180,925 coins)
 ```
 
-which is what Bitcoin Core reports at that height. The 48-range run above is not a single
-build, and no single, uninterrupted node run from genesis to that height has been recorded.
-
-A separate check used one build, `camlcoin swiftsync-pass` at commit `e54cf90` (binary
-sha256 `959914fb…6b87`). It validated every block from 1 to 958,794 with script checks on
-(3,429,543,565 inputs, each handed to the script checker) in 24 ranges run in parallel,
-and the resulting set closed on the same hash and coin count as above on 2026-10-08. This
-is a SwiftSync-style pass (draft BIP 457): spent coins come from Bitcoin Core's undo data,
-checked against a salted hash aggregate, and no UTXO set is kept. It exercises the block
-validation rules (`Validation.accept_block` with scripts on). It does not exercise the
-node's UTXO cache, flush, undo writer, assume-valid gate or BIP30 lookup. The receipt
-(commands, negative controls, result files) is in the hashhog meta-repo, which is private,
-so this paragraph is a claim you cannot verify from this repository.
+which is what Bitcoin Core reports at that height. No single, uninterrupted run from
+genesis to that height has been recorded.
 
 To reproduce it in one run (this takes days and about 1 TB of disk):
 

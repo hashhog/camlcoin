@@ -8,7 +8,7 @@ A Bitcoin full node written from scratch in OCaml. One of the ten [hashhog](http
 
 | Area | State |
 |---|---|
-| Mainnet validation | Validated mainnet from genesis to height 958,794 with script checks on, in 48 consecutive ranges (each range starts from the UTXO set the previous one ended with). The final UTXO set matched Bitcoin Core's `gettxoutsetinfo` `hash_serialized_3` there (`29692050…6e7af0`, 166,180,925 coins). A second, single-build check (SwiftSync-verified, 2026-10-08) re-ran every block 1 to 958,794 with scripts on and closed on the same hash; it exercises the validation rules, not the UTXO store, and its receipt is in the project's private meta-repo, so you cannot check it from here. How to reproduce: [docs/status.md](docs/status.md). |
+| Mainnet validation | Validated mainnet from genesis to height 958,794 with script checks on, in 48 consecutive ranges (each range starts from the UTXO set the previous one ended with). The final UTXO set matched Bitcoin Core's `gettxoutsetinfo` `hash_serialized_3` there (`29692050…6e7af0`, 166,180,925 coins). How to reproduce: [docs/status.md](docs/status.md). |
 | Consensus vectors | Passes all 1,222 entries of Bitcoin Core's `script_tests.json` and Core's `sighash.json` vectors. See [docs/status.md](docs/status.md#cores-test-vectors). |
 | RPC | 152 JSON-RPC methods: 126 with Core's names, plus 26 of camlcoin's own (most of them BIP-78 payjoin). Optional read-only REST. See [docs/rpc.md](docs/rpc.md). |
 | P2P | Headers-first sync, parallel block download, BIP-324 v2 transport, BIP-152 compact blocks, BIP-155 addrv2, SOCKS5/Tor/I2P outbound. |

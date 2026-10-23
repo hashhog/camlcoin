@@ -1376,7 +1376,7 @@ let lookup_transaction (ctx : rpc_context) (txid : Cstruct.t)
         (* Try getting transaction directly (may be in storage without index) *)
         match Storage.ChainDB.get_transaction ctx.chain.db txid with
         | Some tx -> Ok (tx, None) (* No block info available *)
-        | None -> Error "No such mempool or blockchain transaction. Use -txindex or provide a block hash"
+        | None -> Error "No such mempool or blockchain transaction. Use gettransaction for wallet transactions."
 
 (* Get block height from block hash *)
 let get_block_height (ctx : rpc_context) (block_hash : Cstruct.t) : int option =
@@ -1579,6 +1579,11 @@ let canonical_mempool_reject_reason ~testmempoolaccept (msg : string) : string =
       (if testmempoolaccept then "missing-inputs"
        else "bad-txns-inputs-missingorspent")
     else if has_prefix "transaction exceeds max weight" then "bad-txns-oversize"
+    (* RBF feerate-diagram failure: token "replacement-failed", detail text in
+       the debug message; sendrawtransaction shows state.ToString(). *)
+    else if has_prefix "insufficient feerate" then
+      (if testmempoolaccept then "replacement-failed"
+       else "replacement-failed, " ^ msg)
     else if contains "has negative value" then "bad-txns-vout-negative"
     else if contains "value exceeds MAX_MONEY" then "bad-txns-vout-toolarge"
     else
@@ -1722,6 +1727,11 @@ let handle_getpeerinfo (ctx : rpc_context) : Yojson.Safe.t =
       ("id", `Int stats.Peer.stat_id);
       ("addr", `String (Printf.sprintf "%s:%d"
         stats.stat_addr stats.stat_port));
+    ] @ (match stats.Peer.stat_addrbind with
+         | Some a -> [ ("addrbind", `String a) ] | None -> [])
+      @ (match stats.Peer.stat_addrlocal with
+         | Some a -> [ ("addrlocal", `String a) ] | None -> [])
+      @ [
       ("network", `String network_str);
       ("services", `String (Printf.sprintf "%016Lx" svc));
       ("servicesnames", `List (List.map (fun s -> `String s) svc_names));
@@ -4885,6 +4895,13 @@ let handle_pruneblockchain (ctx : rpc_context)
    testmempoolaccept Handler
    ============================================================================ *)
 
+(* Core CFeeRate::GetFeePerK -> ValueFromAmount: effective-feerate is the
+   integer sat/kvB (fee * 1000 / vsize, floored) rendered in BTC/kvB. *)
+let feerate_btc_per_kvb (fee_sats : int64) (vsize : int) : float =
+  if vsize <= 0 then 0.0
+  else Int64.to_float (Int64.div (Int64.mul fee_sats 1000L) (Int64.of_int vsize))
+       /. 100_000_000.0
+
 let handle_testmempoolaccept (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
@@ -4918,10 +4935,13 @@ let handle_testmempoolaccept (ctx : rpc_context)
           ("vsize", `Int vsize);
           ("fees", `Assoc [
             ("base", `Float fee_btc);
+            ("effective-feerate",
+             `Float (feerate_btc_per_kvb entry.Mempool.fee vsize));
+            ("effective-includes", `List [`String hex_wtxid]);
           ]);
         ]])
       | Error msg ->
-        Ok (`List [`Assoc [
+        Ok (`List [`Assoc ([ 
           ("txid", `String hex_txid);
           ("wtxid", `String hex_wtxid);
           ("allowed", `Bool false);
@@ -4930,7 +4950,10 @@ let handle_testmempoolaccept (ctx : rpc_context)
              remapped to the literal "missing-inputs"). *)
           ("reject-reason",
            `String (canonical_mempool_reject_reason ~testmempoolaccept:true msg));
-        ]])
+        ] @ (if String.length msg >= 21
+                && String.sub msg 0 21 = "insufficient feerate:"
+             then [ ("reject-details", `String ("replacement-failed, " ^ msg)) ]
+             else []))])
     with exn ->
       Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn)))
   | _ ->
@@ -5080,6 +5103,41 @@ let handle_submitpackage (ctx : rpc_context)
                package_msg := "max-fee-exceeded"
            end;
 
+           (* Core AcceptPackage: a tx that cannot stand alone (below the
+              mempool floor, or spending a package member that could not)
+              is validated together with those members; each of them then
+              reports the package feerate and the whole group as
+              effective-includes.  Every other tx reports its own. *)
+           let floor_rate =
+             max (Mempool.effective_min_fee ctx.mempool)
+               ctx.mempool.min_relay_fee in
+           let group_txids : (string, unit) Hashtbl.t = Hashtbl.create 8 in
+           let group = ref [] in
+           List.iter (fun (tx : Types.transaction) ->
+             let wk = Cstruct.to_string (Crypto.compute_wtxid tx) in
+             match Hashtbl.find_opt entry_by_wtxid_key wk with
+             | None -> ()
+             | Some e ->
+               let vsize = (e.Mempool.weight + 3) / 4 in
+               let low =
+                 Int64.compare (Int64.div (Int64.mul e.Mempool.fee 1000L)
+                                  (Int64.of_int (max 1 vsize))) floor_rate < 0 in
+               let on_group = List.exists (fun (i : Types.tx_in) ->
+                 Hashtbl.mem group_txids
+                   (Cstruct.to_string i.Types.previous_output.Types.txid)
+               ) tx.Types.inputs in
+               if low || on_group then begin
+                 Hashtbl.replace group_txids (Cstruct.to_string e.Mempool.txid) ();
+                 group := !group @ [ (tx, e) ]
+               end
+           ) txs;
+           let group_fee = List.fold_left (fun a (_, e) ->
+             Int64.add a e.Mempool.fee) 0L !group in
+           let group_vsize = List.fold_left (fun a (_, e) ->
+             a + (e.Mempool.weight + 3) / 4) 0 !group in
+           let group_wtxids = List.map (fun (tx, _) ->
+             `String (Types.hash256_to_hex_display (Crypto.compute_wtxid tx))
+           ) !group in
            (* Build tx-results map and announce accepted txs to peers *)
            let tx_results = List.map (fun tx ->
              let txid = Crypto.compute_txid tx in
@@ -5091,12 +5149,10 @@ let handle_submitpackage (ctx : rpc_context)
              | Some e ->
                let vsize = (e.Mempool.weight + 3) / 4 in
                let fee_btc = Int64.to_float e.Mempool.fee /. 100_000_000.0 in
+               let in_group = Hashtbl.mem group_txids (Cstruct.to_string e.Mempool.txid) in
                let effective_feerate_btc_per_kvb =
-                 if vsize > 0 then
-                   Int64.to_float e.Mempool.fee
-                   /. float_of_int vsize
-                   /. 100_000.0
-                 else 0.0
+                 if in_group then feerate_btc_per_kvb group_fee group_vsize
+                 else feerate_btc_per_kvb e.Mempool.fee vsize
                in
                Mempool.add_unbroadcast ctx.mempool e.Mempool.txid;
                (* Announce to peers (best-effort) *)
@@ -5113,7 +5169,9 @@ let handle_submitpackage (ctx : rpc_context)
                  ("fees", `Assoc [
                    ("base", `Float fee_btc);
                    ("effective-feerate", `Float effective_feerate_btc_per_kvb);
-                   ("effective-includes", `List [`String wtxid_hex]);
+                   ("effective-includes",
+                    `List (if in_group then group_wtxids
+                           else [`String wtxid_hex]));
                  ]);
                ])
              | None ->
@@ -6925,6 +6983,37 @@ let handle_getblock (ctx : rpc_context)
                  | Some f -> [("fee", f)]
                  | None -> [])
                 @ [("hex", `String hex_str)]
+              in
+              (* verbosity=3: each non-coinbase input also carries its prevout
+                 {generated, height, value, scriptPubKey}, from the undo data
+                 (Core TxToUniv have_undo, pushed before "sequence"). *)
+              let base_fields =
+                match undo_opt with
+                | Some (bu : Utxo.undo_data) when verbosity >= 3 && tx_idx > 0
+                                                  && tx_idx - 1 < List.length bu.tx_undos ->
+                  let tx_undo : Utxo.tx_undo = List.nth bu.tx_undos (tx_idx - 1) in
+                  let prevouts = Array.of_list
+                    (List.map snd tx_undo.spent_outputs) in
+                  List.map (fun (k, v) ->
+                    match k, v with
+                    | "vin", `List ins ->
+                      ("vin", `List (List.mapi (fun i inp ->
+                        match inp with
+                        | `Assoc fs when i < Array.length prevouts ->
+                          let (e : Utxo.utxo_entry) = prevouts.(i) in
+                          let prevout = `Assoc [
+                            ("generated", `Bool e.is_coinbase);
+                            ("height", `Int e.height);
+                            ("value", btc_amount_json e.value);
+                            ("scriptPubKey",
+                             psbt_script_pubkey_json e.script_pubkey network);
+                          ] in
+                          `Assoc (List.concat_map (fun (fk, fv) ->
+                            if fk = "sequence" then [ ("prevout", prevout); (fk, fv) ]
+                            else [ (fk, fv) ]) fs)
+                        | other -> other) ins))
+                    | _ -> (k, v)) base_fields
+                | _ -> base_fields
               in
               `Assoc (base_fields @ extra)
             ) block.transactions in

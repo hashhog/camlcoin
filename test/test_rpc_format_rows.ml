@@ -274,6 +274,125 @@ let test_validateaddress_wrong_network () =
                    (j |> member "isvalid" |> to_bool)
        | Error (c, m) -> Alcotest.failf "validateaddress: (%d) %s" c m))
 
+(* getblock verbosity 3: non-coinbase inputs carry prevout from the undo data
+   (operator/getblock/bad-verbosity:tx[N].vin[0].prevout). *)
+let test_getblock_verbosity3_prevout () =
+  with_ctx (fun ctx ->
+      let spend = seeded_spend () in
+      let cb : Types.transaction =
+        { Types.version = 2l;
+          inputs = [ { Types.previous_output =
+                         { Types.txid = Cstruct.create 32; vout = 0xFFFFFFFFl };
+                       script_sig = Cstruct.of_string "\x01\x01";
+                       sequence = 0xFFFFFFFFl } ];
+          outputs = [ { Types.value = 1L; script_pubkey = op_true } ];
+          witnesses = []; locktime = 0l } in
+      let header : Types.block_header =
+        { version = 4l; prev_block = Cstruct.create 32;
+          merkle_root = Cstruct.create 32; timestamp = 1l; bits = 0x207fffffl;
+          nonce = 0l } in
+      let block = { Types.header; transactions = [ cb; spend ] } in
+      let hash = Crypto.compute_block_hash header in
+      Storage.ChainDB.store_block ctx.chain.db hash block;
+      let entry : Utxo.utxo_entry =
+        { value = 5_000_000_000L; script_pubkey = op_true; height = 7;
+          is_coinbase = true } in
+      let undo : Utxo.undo_data =
+        { height = 1;
+          tx_undos = [ { spent_outputs =
+                           [ (List.hd spend.inputs).previous_output, entry ] } ] } in
+      let w = Serialize.writer_create () in
+      Utxo.serialize_undo_data w undo;
+      Storage.ChainDB.store_undo_data ctx.chain.db hash
+        (Serialize.writer_to_string w);
+      let open Yojson.Safe.Util in
+      match Rpc.dispatch_rpc ctx "getblock"
+              [ `String (Types.hash256_to_hex_display hash); `Int 3 ] with
+      | Error (c, m) -> Alcotest.failf "getblock: (%d) %s" c m
+      | Ok j ->
+        let tx1 = List.nth (j |> member "tx" |> to_list) 1 in
+        let prevout = List.hd (tx1 |> member "vin" |> to_list) |> member "prevout" in
+        Alcotest.(check bool) "generated" true (prevout |> member "generated" |> to_bool);
+        Alcotest.(check int) "height" 7 (prevout |> member "height" |> to_int);
+        Alcotest.(check string) "hex" "51"
+          (prevout |> member "scriptPubKey" |> member "hex" |> to_string);
+        (* verbosity 2 stays prevout-free *)
+        (match Rpc.dispatch_rpc ctx "getblock"
+                 [ `String (Types.hash256_to_hex_display hash); `Int 2 ] with
+         | Error (c, m) -> Alcotest.failf "getblock v2: (%d) %s" c m
+         | Ok j2 ->
+           let v = List.hd (List.nth (j2 |> member "tx" |> to_list) 1
+                            |> member "vin" |> to_list) in
+           Alcotest.(check bool) "v2 has no prevout" true
+             (member "prevout" v = `Null)))
+
+(* getrawtransaction / testmempoolaccept / submitpackage fee fields. *)
+let test_feerate_floor_and_testmempoolaccept () =
+  with_ctx (fun ctx ->
+      put_utxo ~coinbase:false ctx ~vout:0 "51";
+      let tx = seeded_spend () in
+      let open Yojson.Safe.Util in
+      match Rpc.dispatch_rpc ctx "testmempoolaccept"
+              [ `List [ `String (tx_hex tx) ] ] with
+      | Error (c, m) -> Alcotest.failf "testmempoolaccept: (%d) %s" c m
+      | Ok j ->
+        let r = List.hd (to_list j) in
+        let fees = r |> member "fees" in
+        let vsize = r |> member "vsize" |> to_int in
+        (* Core: integer sat/kvB = 10000 * 1000 / vsize, shown in BTC/kvB *)
+        let want = Float.of_int (10_000_000 / vsize) /. 1e8 in
+        Alcotest.(check (float 1e-12)) "effective-feerate" want
+          (fees |> member "effective-feerate" |> to_float);
+        Alcotest.(check (list string)) "effective-includes"
+          [ r |> member "wtxid" |> to_string ]
+          (fees |> member "effective-includes" |> to_list |> List.map to_string))
+
+(* Core AcceptPackage: a zero-fee parent is only accepted together with its
+   child; both then report the package feerate and both wtxids in
+   effective-includes (package/submit/cpfp, seed_submitpackage/valid-cpfp). *)
+let test_submitpackage_cpfp_effective () =
+  with_ctx (fun ctx ->
+      put_utxo ~coinbase:false ctx ~vout:0 "51";
+      let pad = Cstruct.of_string ("\x6a\x14" ^ String.make 20 'x') in
+      let mk prev value : Types.transaction =
+        { Types.version = 2l;
+          inputs = [ { Types.previous_output = { Types.txid = prev; vout = 0l };
+                       script_sig = Cstruct.create 0; sequence = 0xFFFFFFFFl } ];
+          outputs = [ { Types.value = value; script_pubkey = op_true };
+                      { Types.value = 0L; script_pubkey = pad } ];
+          witnesses = []; locktime = 0l } in
+      let parent = mk (Cstruct.of_string (String.make 32 '\x07')) 4_999_999_999L in
+      let child = mk (Crypto.compute_txid parent) 4_999_989_999L in
+      let open Yojson.Safe.Util in
+      match Rpc.dispatch_rpc ctx "submitpackage"
+              [ `List [ `String (tx_hex parent); `String (tx_hex child) ] ] with
+      | Error (c, m) -> Alcotest.failf "submitpackage: (%d) %s" c m
+      | Ok j ->
+        Alcotest.(check string) "package_msg" "success"
+          (j |> member "package_msg" |> to_string);
+        let ws = List.map (fun t ->
+          Types.hash256_to_hex_display (Crypto.compute_wtxid t)) [ parent; child ] in
+        let vsize t = (Validation.compute_tx_weight t + 3) / 4 in
+        let want = Float.of_int ((1 + 10_000) * 1000 / (vsize parent + vsize child))
+                   /. 1e8 in
+        List.iter (fun w ->
+          let fees = j |> member "tx-results" |> member w |> member "fees" in
+          Alcotest.(check (list string)) "includes" ws
+            (fees |> member "effective-includes" |> to_list |> List.map to_string);
+          Alcotest.(check (float 1e-12)) "package feerate" want
+            (fees |> member "effective-feerate" |> to_float)) ws)
+
+(* RBF feerate-diagram failure (rbf/diagram rows): testmempoolaccept answers the
+   token "replacement-failed" and the detail separately; sendrawtransaction
+   shows "token, detail" (Core state.ToString()). *)
+let test_replacement_failed_token () =
+  let msg = "insufficient feerate: does not improve feerate diagram" in
+  Alcotest.(check string) "testmempoolaccept" "replacement-failed"
+    (Rpc.canonical_mempool_reject_reason ~testmempoolaccept:true msg);
+  Alcotest.(check string) "sendrawtransaction"
+    ("replacement-failed, " ^ msg)
+    (Rpc.canonical_mempool_reject_reason ~testmempoolaccept:false msg)
+
 let () =
   Alcotest.run "rpc_format_rows"
     [ ("scantxoutset",
@@ -293,6 +412,15 @@ let () =
            test_decodepsbt_regtest_hrp;
          Alcotest.test_case "validateaddress rejects other-network address" `Quick
            test_validateaddress_wrong_network ]);
+      ("fees",
+       [ Alcotest.test_case "getblock verbosity 3 carries prevout" `Quick
+           test_getblock_verbosity3_prevout;
+         Alcotest.test_case "testmempoolaccept effective-feerate/includes" `Quick
+           test_feerate_floor_and_testmempoolaccept;
+         Alcotest.test_case "replacement-failed token / detail split" `Quick
+           test_replacement_failed_token;
+         Alcotest.test_case "submitpackage cpfp reports the package feerate" `Quick
+           test_submitpackage_cpfp_effective ]);
       ("operator",
        [ Alcotest.test_case "decoderawtransaction message" `Quick
            test_decoderawtransaction_message;

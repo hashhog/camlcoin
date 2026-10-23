@@ -1225,4 +1225,9 @@ let () =
     space_overhead = 120;
     max_overhead = 500;
   };
+  (* `camlcoin swiftsync-pass ...`: the fully-validating SwiftSync batch pass
+     (lib/swiftsync.ml).  Same binary, same GC settings as the node; it opens
+     no datadir and starts no network. *)
+  if Array.length Sys.argv >= 2 && Sys.argv.(1) = "swiftsync-pass" then
+    exit (Camlcoin.Swiftsync.main (List.tl (List.tl (Array.to_list Sys.argv))));
   exit (Cmd.eval cmd)

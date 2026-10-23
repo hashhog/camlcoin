@@ -1931,7 +1931,7 @@ let max_invalidate_readd_blocks = 10
    a block in [connected] is dropped from that pool first (Core removes it
    from the disconnect pool in removeForBlock).  Best-effort like the
    connect hook: a mempool fault never rolls back a committed chain move. *)
-let update_mempool_for_reorg (mp : Mempool.mempool)
+let update_mempool_for_reorg ?entry_height (mp : Mempool.mempool)
     ~(disconnected : Types.transaction list)
     ~(dropped : Types.transaction list)
     ~(connected : Types.block list) : unit =
@@ -1949,7 +1949,7 @@ let update_mempool_for_reorg (mp : Mempool.mempool)
         not (Hashtbl.mem confirmed
                (Cstruct.to_string (Crypto.compute_txid tx)))) disconnected
     in
-    let n = Mempool.update_for_reorg mp ~disconnected:pool ~dropped in
+    let n = Mempool.update_for_reorg ?entry_height mp ~disconnected:pool ~dropped in
     Logs.info (fun m ->
       m "Mempool updated for reorg: %d of %d disconnected txs re-accepted, \
          pool now %d" n (List.length pool) (Mempool.count mp))
@@ -5947,7 +5947,7 @@ let disconnect_to_target ?(from_validated_tip = false)
    index is off).  Mirrors Bitcoin Core's [InvalidateBlock] -> [DisconnectTip]
    loop operating on the active Chainstate's CoinsTip ([validation.cpp]). *)
 let disconnect_to_target_via_utxo ?(from_validated_tip = false)
-    ?(on_disconnected : (Types.block -> unit) option)
+    ?(on_disconnected : (Types.block -> int -> unit) option)
     (state : chain_state)
     (utxo : Utxo.OptimizedUtxoSet.t) (target : header_entry)
     : (unit, string) result =
@@ -6030,7 +6030,7 @@ let disconnect_to_target_via_utxo ?(from_validated_tip = false)
                 txospender_disconnect_if_enabled state ~block
                   ~height:entry.height;
                 (match on_disconnected with
-                 | Some f -> f block
+                 | Some f -> f block entry.height
                  | None -> ());
                 disconnect rest)
        in
@@ -9840,16 +9840,25 @@ and invalidate_block_inner (state : chain_state)
            MaybeUpdateMempoolForReorg after every DisconnectTip with
            fAddToMempool = (++disconnected <= 10): only the txs of the 10
            blocks nearest the old tip are re-accepted, those of deeper
-           blocks are removeRecursive'd ([dropped_txs]). *)
+           blocks are removeRecursive'd ([dropped_txs]).  Because Core
+           re-accepts right after each DisconnectTip, a tx of the block at
+           height h enters the pool with entry height h-1 ([readd_height]);
+           the single refill below records that height. *)
         let disconnected_txs = ref [] in
         let dropped_txs = ref [] in
+        let readd_height = Hashtbl.create 64 in
         let n_disconnected = ref 0 in
-        let on_disconnected (block : Types.block) =
+        let on_disconnected (block : Types.block) (height : int) =
           incr n_disconnected;
           match block.transactions with
           | _cb :: txs ->
-            if !n_disconnected <= max_invalidate_readd_blocks then
+            if !n_disconnected <= max_invalidate_readd_blocks then begin
+              List.iter (fun tx ->
+                Hashtbl.replace readd_height
+                  (Cstruct.to_string (Crypto.compute_txid tx)) (height - 1)
+              ) txs;
               disconnected_txs := txs @ !disconnected_txs
+            end
             else dropped_txs := txs @ !dropped_txs
           | [] -> ()
         in
@@ -9872,6 +9881,8 @@ and invalidate_block_inner (state : chain_state)
             | Some mp ->
               update_mempool_for_reorg mp ~disconnected:!disconnected_txs
                 ~dropped:!dropped_txs ~connected:[]
+                ~entry_height:(fun txid ->
+                  Hashtbl.find_opt readd_height (Cstruct.to_string txid))
             | None -> ());
            (* After the rewind, try to activate the best remaining valid
               chain (a side-branch already on disk with more work). Mirrors

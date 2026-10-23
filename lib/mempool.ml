@@ -43,7 +43,10 @@ type mempool_entry = {
   sigops_cost : int;
   fee_rate : float;           (* satoshis per weight unit *)
   time_added : float;
-  height_added : int;
+  (* Tip height when the tx entered the pool (Core CTxMemPoolEntry
+     entryHeight).  Mutable for the invalidateblock refill, which re-adds
+     each disconnected block's txs at the tip just below that block. *)
+  mutable height_added : int;
   (* parent txids in mempool.  Mutable for the reorg refill: a tx returned
      to the pool from a disconnected block becomes the parent of in-pool
      children that were admitted while it was confirmed (Core
@@ -3374,15 +3377,27 @@ let update_transactions_from_block (mp : mempool)
    4. LimitMempoolSize.
    [dropped] = txs of blocks Core disconnects with fAddToMempool = false
    (InvalidateBlock deeper than 10 blocks): removeRecursive'd, not re-added.
+   [entry_height txid], when given, is the entry height to record for a
+   re-accepted tx in place of the current tip: Core's InvalidateBlock runs
+   MaybeUpdateMempoolForReorg after EACH DisconnectTip, so a tx confirmed at
+   height h re-enters the pool at tip h-1, not at the final tip.
    Returns the number of txs re-accepted. *)
-let update_for_reorg (mp : mempool) ~(disconnected : Types.transaction list)
+let update_for_reorg ?(entry_height : (Types.hash256 -> int option) option)
+    (mp : mempool) ~(disconnected : Types.transaction list)
     ~(dropped : Types.transaction list) : int =
   let readded = ref [] in
   List.iter (fun tx ->
     if not (Validation.is_coinbase_tx tx) then begin
       let txid = Crypto.compute_txid tx in
       match add_transaction ~bypass_fee_check:true ~bypass_limits:true mp tx with
-      | Ok _ -> readded := txid :: !readded
+      | Ok _ ->
+        (match entry_height with
+         | None -> ()
+         | Some f ->
+           (match f txid, get mp txid with
+            | Some h, Some e -> e.height_added <- h
+            | _ -> ()));
+        readded := txid :: !readded
       | Error _ ->
         if not (contains mp txid) then remove_recursive mp tx txid
     end

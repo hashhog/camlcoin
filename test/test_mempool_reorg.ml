@@ -609,6 +609,28 @@ let test_feerate_gt_exact () =
   Alcotest.(check bool) "two negatives" true
     (Mempool.feerate_gt (-1L, 400) (-5L, 400))
 
+(* warden_d: a chain T0 <- cb1, T1 <- T0, T2 <- T1 confirmed at 111, 112,
+   113; invalidateblock 111.  Core re-accepts after each DisconnectTip, so
+   T2 enters at tip 112, T1 at 111, T0 at 110.  Deployed: all three at the
+   final tip 110 (Core regtest warden_d rows: node 101 vs Core 102 / 103). *)
+let test_invalidate_entry_height () =
+  with_fx ~label:"mr_height" (fun fx ->
+    let t0 = spend ~tag:50 fx.cb.(1) subsidy in
+    let t1 = spend ~tag:51 (txid t0) (Int64.sub subsidy fee) in
+    let t2 = spend ~tag:52 (txid t1) (Int64.sub subsidy (Int64.mul 2L fee)) in
+    let blocks = List.mapi (fun k t -> build fx ~fee ~tag:0 (111 + k) [ t ])
+        [ t0; t1; t2 ] in
+    List.iter (connect fx) blocks;
+    Alcotest.(check int) "tip 113" 113 fx.state.Sync.blocks_synced;
+    ignore (rpc_ok fx "invalidateblock" [ hx (List.hd blocks) ]);
+    Alcotest.(check int) "tip 110" 110 fx.state.Sync.blocks_synced;
+    check_pool "pool after invalidateblock 111" [ "T0"; "T1"; "T2" ]
+      (pool fx [ "T0", t0; "T1", t1; "T2", t2 ]);
+    List.iter (fun (name, tx, h) ->
+        Alcotest.(check int) (name ^ " entry height") h
+          (field_int (entry_json fx tx) "height"))
+      [ "T0", t0, 110; "T1", t1, 111; "T2", t2, 112 ])
+
 let () =
   Alcotest.run "mempool_reorg" [
     "mempool vs chain", [
@@ -636,5 +658,7 @@ let () =
         test_chunk_feerate_star;
       Alcotest.test_case "chunk feerate comparison is exact" `Quick
         test_feerate_gt_exact;
+      Alcotest.test_case "invalidateblock re-add: entry height per block" `Quick
+        test_invalidate_entry_height;
     ];
   ]

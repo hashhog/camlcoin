@@ -1360,7 +1360,7 @@ let lookup_transaction (ctx : rpc_context) (txid : Cstruct.t)
        in
        match find_tx 0 block.transactions with
        | Some (tx, idx) -> Ok (tx, Some (InBlock (block_hash, idx)))
-       | None -> Error "No such transaction found in the provided block")
+       | None -> Error "No such transaction found in the provided block. Use gettransaction for wallet transactions.")
   | None ->
     (* Check mempool first *)
     match Hashtbl.find_opt ctx.mempool.entries txid_key with
@@ -6587,6 +6587,7 @@ let handle_getblock (ctx : rpc_context)
     | [`String h]              -> (h, 1)
     | [`String h; `Int v]      -> (h, v)
     | [`String h; `Float v]    -> (h, int_of_float v)
+    | [`String h; `Bool b]     -> (h, if b then 1 else 0)
     | _ -> ("", -1)
   in
   if verbosity <> -1 && not (core_in_int32 verbosity) then
@@ -7102,7 +7103,9 @@ let handle_getrawtransaction (ctx : rpc_context)
              Last resort: Bitcoin Core oracle.
              Reference: bitcoin-core/src/core_io.cpp TxToUniv have_undo path. *)
           let (fee_opt, prevout_map) =
-            if verbosity < 2 then (None, Hashtbl.create 0)
+            (* Core fills fee/prevout from the block's undo data, so a
+               mempool transaction (no block context) gets neither. *)
+            if verbosity < 2 || block_hash_opt = None then (None, Hashtbl.create 0)
             else begin
               let is_coinbase_tx =
                 tx.inputs <> [] && is_coinbase_input (List.hd tx.inputs)
@@ -7340,13 +7343,18 @@ let handle_decoderawtransaction (ctx : rpc_context)
   let network = network_to_address_network ctx.network in
   match params with
   | [`String hex] | [`String hex; `Bool _] ->
+    (* Core DecodeHexTx: the whole string must be one transaction.  With
+       iswitness=false only the legacy serialization is tried, so a tx that
+       carries witness data does not decode. *)
+    let iswitness = match params with [_; `Bool b] -> b | _ -> true in
     (try
       let data = Cstruct.of_hex hex in
       let r = Serialize.reader_of_cstruct data in
       let tx = Serialize.deserialize_transaction r in
+      if r.Serialize.pos <> Cstruct.length data then failwith "trailing data";
+      if (not iswitness) && tx.Types.witnesses <> [] then failwith "witness";
       Ok (build_non_witness_utxo_json tx network)
-    with exn ->
-      Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn)))
+    with _ -> Error "TX decode failed")
   | _ ->
     Error "Invalid parameters: expected [hexstring]"
 
@@ -12418,7 +12426,7 @@ let request_node_shutdown () : unit =
 
 let handle_stop (_ctx : rpc_context) : Yojson.Safe.t =
   request_node_shutdown ();
-  `String "CamlCoin server stopping"
+  `String "Bitcoin Core stopping"
 
 let handle_uptime (_ctx : rpc_context) : Yojson.Safe.t =
   (* Return seconds since start - simplified *)
@@ -15534,7 +15542,7 @@ let dispatch_rpc (ctx : rpc_context)
        (-5), not the generic RPC_MISC_ERROR (-1).
        Reference: bitcoin-core/src/rpc/rawtransaction.cpp:292,303,329.
        A MALFORMED txid hits ParseHashV first -> -8 before any lookup. *)
-    guard_hash_param ~name:"txid" params (fun () ->
+    guard_hash_param ~name:"parameter 1" params (fun () ->
       match handle_getrawtransaction ctx params with
       | Ok r -> Ok r
       | Error msg ->

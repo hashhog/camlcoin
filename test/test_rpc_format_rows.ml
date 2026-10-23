@@ -143,6 +143,75 @@ let test_info_bytes_sums_vsize () =
         Alcotest.(check int) "bytes" ((weight + 3) / 4)
           (j |> member "bytes" |> to_int))
 
+(* ---- operator rows: error text and argument forms ---- *)
+
+let err_of = function
+  | Error (c, m) -> (c, m)
+  | Ok j -> Alcotest.failf "expected error, got Ok %s" (Yojson.Safe.to_string j)
+
+let check_err ~label ~code ~msg r =
+  let c, m = err_of r in
+  Alcotest.(check int) (label ^ ": code") code c;
+  Alcotest.(check string) (label ^ ": message") msg m
+
+(* Core: DecodeHexTx failures are the bare "TX decode failed" (-22); operator/
+   decoderawtransaction/{empty,not-hex,one-byte,truncated}:message. *)
+let test_decoderawtransaction_message () =
+  with_ctx (fun ctx ->
+      List.iter (fun hex ->
+          check_err ~label:("decode " ^ hex) ~code:(-22) ~msg:"TX decode failed"
+            (Rpc.dispatch_rpc ctx "decoderawtransaction" [ `String hex ]))
+        [ ""; "zz"; "02"; "0200000001" ])
+
+(* Core rejects a hex string with bytes left over after the transaction
+   (operator/decoderawtransaction/trailing:$ -> -22), and iswitness=false on a
+   witness-serialized tx (segwit-iswitness-false:$ -> -22). *)
+let test_decoderawtransaction_trailing_and_iswitness () =
+  with_ctx (fun ctx ->
+      let tx = seeded_spend () in
+      let hex = tx_hex tx in
+      (match Rpc.dispatch_rpc ctx "decoderawtransaction" [ `String hex ] with
+       | Ok _ -> ()
+       | Error (c, m) -> Alcotest.failf "plain decode: (%d) %s" c m);
+      check_err ~label:"trailing" ~code:(-22) ~msg:"TX decode failed"
+        (Rpc.dispatch_rpc ctx "decoderawtransaction" [ `String (hex ^ "00") ]);
+      check_err ~label:"iswitness=false" ~code:(-22) ~msg:"TX decode failed"
+        (Rpc.dispatch_rpc ctx "decoderawtransaction"
+           [ `String hex; `Bool false ]))
+
+(* Core getrawtransaction names the txid argument "parameter 1" and appends the
+   wallet hint to the not-in-block message. *)
+let test_getrawtransaction_messages () =
+  with_ctx (fun ctx ->
+      check_err ~label:"short txid" ~code:(-8)
+        ~msg:"parameter 1 must be of length 64 (not 2, for '00')"
+        (Rpc.dispatch_rpc ctx "getrawtransaction" [ `String "00" ]))
+
+(* getblock accepts the boolean verbosity (true -> 1, false -> 0): an absent
+   block is -5, not an argument-shape error (operator/getblock/{true,false}). *)
+let test_getblock_bool_verbosity () =
+  with_ctx (fun ctx ->
+      let absent = String.make 64 'a' in
+      List.iter (fun b ->
+          let c, _ = err_of (Rpc.dispatch_rpc ctx "getblock"
+                               [ `String absent; `Bool b ]) in
+          Alcotest.(check int) "code" (-5) c) [ true; false ])
+
+(* Core only fills fee/prevout from a block's undo data: a mempool tx at
+   verbosity 2 carries neither. *)
+let test_getrawtransaction_mempool_v2 () =
+  with_ctx (fun ctx ->
+      let tx = submit ctx in
+      let txid = Types.hash256_to_hex_display (Crypto.compute_txid tx) in
+      let open Yojson.Safe.Util in
+      match Rpc.dispatch_rpc ctx "getrawtransaction"
+              [ `String txid; `Int 2 ] with
+      | Error (c, m) -> Alcotest.failf "getrawtransaction: (%d) %s" c m
+      | Ok j ->
+        Alcotest.(check bool) "no fee" true (member "fee" j = `Null);
+        let vin0 = List.hd (j |> member "vin" |> to_list) in
+        Alcotest.(check bool) "no prevout" true (member "prevout" vin0 = `Null))
+
 let () =
   Alcotest.run "rpc_format_rows"
     [ ("scantxoutset",
@@ -154,4 +223,15 @@ let () =
          Alcotest.test_case "serving the tx clears unbroadcast" `Quick
            test_unbroadcast_cleared_when_served;
          Alcotest.test_case "getmempoolinfo bytes sums per-tx vsize" `Quick
-           test_info_bytes_sums_vsize ]) ]
+           test_info_bytes_sums_vsize ]);
+      ("operator",
+       [ Alcotest.test_case "decoderawtransaction message" `Quick
+           test_decoderawtransaction_message;
+         Alcotest.test_case "decoderawtransaction trailing / iswitness" `Quick
+           test_decoderawtransaction_trailing_and_iswitness;
+         Alcotest.test_case "getrawtransaction parameter 1" `Quick
+           test_getrawtransaction_messages;
+         Alcotest.test_case "getblock boolean verbosity" `Quick
+           test_getblock_bool_verbosity;
+         Alcotest.test_case "getrawtransaction mempool v2 no fee/prevout" `Quick
+           test_getrawtransaction_mempool_v2 ]) ]

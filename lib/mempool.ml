@@ -3871,6 +3871,139 @@ let apply_delta (mp : mempool) (txid : Types.hash256) (base_fee : int64)
 let get_modified_fee (mp : mempool) (entry : mempool_entry) : int64 =
   apply_delta mp entry.txid entry.fee
 
+(* ============================================================================
+   Chunk feerate of an entry (Core CTxMemPool::GetMainChunkFeerate)
+
+   entryToJSON reports "chunkweight" and "fees.chunk" from the chunk that
+   holds the tx in its cluster's linearization (rpc/mempool.cpp:524), in
+   FeePerWeight units: modified fee over sigops-adjusted weight
+   (CTxMemPoolEntry::GetAdjustedWeight).  A low-fee parent with a CPFP child
+   shares one chunk with it, so both report the pair's weight and fees.
+
+   Linearization: repeatedly take the remaining ancestor set with the
+   highest feerate (ties: smaller weight, then lower txid), then chunk the
+   result the way ChunkLinearization does (cluster_linearize.h): each tx
+   opens a chunk, merged into the previous chunk while its feerate is
+   strictly higher.  That is optimal for a parent with any number of
+   children (the shape a reorg refill produces), and a good linearization in
+   general; Core's own may differ on clusters where ancestor sets are not
+   enough.
+   ============================================================================ *)
+
+(* f1/w1 > f2/w2 for w1, w2 > 0, exact: compare f1*w2 with f2*w1 without
+   overflowing (|fee| < 2^62, weight < 2^31). *)
+let feerate_gt ((f1 : int64), (w1 : int)) ((f2 : int64), (w2 : int)) : bool =
+  let mask = (1 lsl 31) - 1 in
+  (* f*w as (high, low) in base 2^31, for f >= 0. *)
+  let wide f w =
+    let hi = f lsr 31 and lo = f land mask in
+    let lw = lo * w in
+    (hi * w + (lw lsr 31), lw land mask) in
+  let f1 = Int64.to_int f1 and f2 = Int64.to_int f2 in
+  if (f1 < 0) <> (f2 < 0) then f2 < 0
+  else if f1 >= 0 then compare (wide f1 w2) (wide f2 w1) > 0
+  else compare (wide (- f1) w2) (wide (- f2) w1) < 0
+
+(* The in-pool connected component holding [entry]. *)
+let cluster_entries (mp : mempool) (entry : mempool_entry) : mempool_entry list =
+  let seen = Hashtbl.create 16 in
+  let out = ref [] in
+  let rec visit key =
+    if not (Hashtbl.mem seen key) then
+      match Hashtbl.find_opt mp.entries key with
+      | None -> ()
+      | Some e ->
+        Hashtbl.replace seen key ();
+        out := e :: !out;
+        List.iter (fun p -> visit (Cstruct.to_string p)) e.depends_on;
+        (match Hashtbl.find_opt mp.children key with
+         | Some kids -> Hashtbl.iter (fun ck () -> visit ck) kids
+         | None -> ())
+  in
+  visit (Cstruct.to_string entry.txid);
+  !out
+
+(* Chunk feerate (modified fee, adjusted weight) of every tx of [entry]'s
+   cluster, keyed by raw txid. *)
+let cluster_chunk_feerates (mp : mempool) (entry : mempool_entry)
+    : (string, int64 * int) Hashtbl.t =
+  let txs = cluster_entries mp entry in
+  let info = Hashtbl.create 16 in
+  List.iter (fun (e : mempool_entry) ->
+    let w = Validation.get_sigops_adjusted_weight ~weight:e.weight
+        ~sigop_cost:e.sigops_cost
+        ~bytes_per_sigop:Consensus.default_bytes_per_sigop in
+    Hashtbl.replace info (Cstruct.to_string e.txid) (e, get_modified_fee mp e, w)
+  ) txs;
+  let remaining = Hashtbl.copy info in
+  (* Ancestor set of [key] within [remaining], parents before children. *)
+  let ancestors key =
+    let seen = Hashtbl.create 8 in
+    let order = ref [] in
+    let rec visit k =
+      if Hashtbl.mem remaining k && not (Hashtbl.mem seen k) then begin
+        Hashtbl.replace seen k ();
+        let (e, _, _) = Hashtbl.find remaining k in
+        List.iter (fun p -> visit (Cstruct.to_string p)) e.depends_on;
+        order := k :: !order
+      end in
+    visit key;
+    List.rev !order in
+  let set_rate keys =
+    List.fold_left (fun (f, w) k ->
+      let (_, kf, kw) = Hashtbl.find info k in (Int64.add f kf, w + kw))
+      (0L, 0) keys in
+  let better (ka, (fa, wa)) (kb, (fb, wb)) =
+    feerate_gt (fa, wa) (fb, wb)
+    || (not (feerate_gt (fb, wb) (fa, wa))
+        && (wa < wb || (wa = wb && compare ka kb < 0))) in
+  (* Linearize: best ancestor set first, appended parents-first. *)
+  let lin = ref [] in
+  while Hashtbl.length remaining > 0 do
+    let best = Hashtbl.fold (fun k _ acc ->
+        let set = ancestors k in
+        let cand = (k, set_rate set), set in
+        match acc with
+        | None -> Some cand
+        | Some (b, _) when better (fst cand) b -> Some cand
+        | Some _ -> acc) remaining None in
+    match best with
+    | None -> Hashtbl.reset remaining
+    | Some (_, set) ->
+      List.iter (fun k -> Hashtbl.remove remaining k; lin := k :: !lin) set
+  done;
+  (* ChunkLinearization: a stack of (members, fee, weight). *)
+  let stack = ref [] in
+  List.iter (fun k ->
+    let (_, f, w) = Hashtbl.find info k in
+    let rec merge (ks, f, w) = function
+      | (pks, pf, pw) :: rest when feerate_gt (f, w) (pf, pw) ->
+        merge (ks @ pks, Int64.add f pf, w + pw) rest
+      | st -> (ks, f, w) :: st in
+    stack := merge ([k], f, w) !stack
+  ) (List.rev !lin);
+  let out = Hashtbl.create (Hashtbl.length info) in
+  List.iter (fun (ks, f, w) ->
+    List.iter (fun k -> Hashtbl.replace out k (f, w)) ks) !stack;
+  out
+
+(* (fee, weight) of the chunk holding [entry]: entryToJSON's fees.chunk and
+   chunkweight.  [memo] lets a caller that reports many entries
+   (getrawmempool verbose) linearize each cluster once. *)
+let main_chunk_feerate ?memo (mp : mempool) (entry : mempool_entry)
+    : int64 * int =
+  let key = Cstruct.to_string entry.txid in
+  match memo with
+  | Some m when Hashtbl.mem m key -> Hashtbl.find m key
+  | _ ->
+    let rates = cluster_chunk_feerates mp entry in
+    (match memo with
+     | Some m -> Hashtbl.iter (Hashtbl.replace m) rates
+     | None -> ());
+    (match Hashtbl.find_opt rates key with
+     | Some r -> r
+     | None -> (get_modified_fee mp entry, entry.weight))
+
 (* prioritise_transaction txid delta_sats
    Apply a signed fee delta to a txid's mapDeltas slot.  If the delta
    accumulates to exactly 0, the entry is removed from the map entirely

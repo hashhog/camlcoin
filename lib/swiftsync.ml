@@ -1,12 +1,8 @@
-(* `camlcoin swiftsync-pass` -- a fully-validating SwiftSync batch pass.
-
-   Hashhog meta-repo design: receipts/swiftsync-design-2026-10-05.md
-   (§1.2 protocol P, §2 soundness, §2.4 controls, §3 "How nodes consume it"),
-   ratified as TRUST-ANCHOR "SwiftSync-verified" (2026-10-05); draft BIP 457.
-   The reference driver is rustoshi's `swiftsync-pass` (receipts/
-   swiftsync-step2-rustoshi-2026-10-07.md): same pack readers, same coin hash,
-   same result.json contract, same controls, so tools/swiftsync-run.py,
-   swiftsync-combine.py and swiftsync-close.py consume this output unchanged.
+(* `camlcoin swiftsync-pass` -- a fully-validating SwiftSync batch pass
+   (draft BIP 457).  The input layout is described in the comment above
+   [open_pack];
+   test/test_swiftsync_pass.ml builds a regtest pack from scratch and runs
+   the pass on it.
 
    The pass validates a height range WITHOUT a UTXO set.  Spent coins come
    from Bitcoin Core's undo data (undo.pack, untrusted); which outputs survive
@@ -17,9 +13,9 @@
      Agg_out = sum H(salt | code | amount | script | outpoint)  every created,
                spendable, NOT-hinted output
 
-   Hinted outputs go to a spill (TxOutSer records); the close tool requires
+   Hinted outputs go to a spill (TxOutSer records).  Closing requires
    Agg_in = Agg_out, scripts_run = sum(inputs) and the spill's
-   hash_serialized_3 = the commitment.
+   hash_serialized_3 = the expected UTXO-set commitment.
 
    PATH IDENTITY -- camlcoin's production connect, with supplied coins.
    Every block goes through exactly the calls of the live IBD connect loop
@@ -46,18 +42,32 @@
    calls before every script check (production leaves it None), so it counts
    inputs handed to the node's script checker, signature-cache hits included.
 
-   The three mandatory soundness extensions (TRUST-ANCHOR ruling 1):
+   The three mandatory soundness extensions:
    - P-ORD: a supplied coin's height must be < h, or = h with the prevout
      created by an EARLIER tx of this block with identical data;
    - completeness: every height of the range processed exactly once;
    - BIP30: coinbase outputs of 91722 and 91812 unspendable, coinbase txids
      below BIP34 unique (Consensus.is_bip30_repeat exemptions); the txids are
-     written out so swiftsync-combine.py checks uniqueness ACROSS ranges.
+     written out so a combine step can check uniqueness ACROSS ranges.
 
    Parallelism: D validation domains per process claim heights from an atomic
    cursor (out of order); each keeps its own partial aggregates, merged mod
-   2^256 at the end.  Ranges sharing one salt compose; a range given
-   --start-snapshot (the set at from-1) is standalone. *)
+   2^256 at the end.
+
+   Standalone vs composing.  A range that starts at 0 (or is given
+   --start-snapshot, the set at from-1) and ends at the hints height is
+   standalone and complete: its verdict requires Agg_in = Agg_out, and
+   result.json says "closed": true.  Any other range is a composing SLICE:
+   its PASS means only that the per-block checks passed.  The aggregate
+   check is NOT applied to a slice (it cannot balance on its own), so a
+   dropped or extra hint, a coin supplied twice across two blocks' undo
+   data, or a supplied coin whose altered data still passes the block's
+   checks (a lowered height that still clears maturity, an amount the
+   signature does not commit to) is invisible to it; so is a duplicate
+   coinbase txid created outside the slice.  Those are caught only
+   when slices sharing one salt are summed and the sum closes.  A slice
+   reports "closed": false and is not, by itself, a validation of the
+   chain. *)
 
 let bip30_overwritten_mainnet = [ 91_722; 91_812 ]
 let max_script_size = 10_000
@@ -161,8 +171,26 @@ let parse_controls (s : string) : controls =
     no_controls (String.split_on_char ',' s)
 
 (* ------------------------------------------------------------------------ *)
-(* pack readers (formats: tools/swiftsync-gen.py docstring)                  *)
+(* pack readers                                                              *)
 (* ------------------------------------------------------------------------ *)
+
+(* Formats (all integers little-endian):
+   blocks.idx  64-byte header "HHSSB1\0\0" | ver u32 | H u32 | xor[8] |
+               base_hash[32] (internal order) | 8 zero bytes; then (H+1) x
+               64-byte rows: hash[32] | blk_file u32 | blk_pos u32 (block
+               data start) | blk_size u32 | rev_file u32 | rev_pos u32 |
+               rev_size u32 | nTx u32 | status u32.
+   undo.pack   CBlockUndo bytes for heights from..H (Core undo.h
+               TxInUndoFormatter: VARINT code | [VARINT dummy if height>0] |
+               VARINT compressed amount | ScriptCompression).
+   undo.idx    32-byte header "HHSSU1\0\0" | ver u32 | H u32 | from u32 |
+               12 zero bytes; then per height from..H: offset u64 | len u32 |
+               n_inputs u32.
+   hints.pack  36-byte records txid[32] (internal) | vout u32: the outputs
+               unspent at the hints height, grouped by creation height.
+   hints.idx   32-byte header "HHSSH1\0\0" | ver u32 | H u32 | total u64 |
+               8 zero bytes; then (H+2) x u64 cumulative record starts
+               (group h = [s[h], s[h+1])). *)
 
 type pack = {
   ph : int;              (* pack height H *)
@@ -330,8 +358,8 @@ let agg_hex (a : agg) : string = String.concat "" (List.init 8 (fun i -> Printf.
 let agg_is_zero (a : agg) = Array.for_all (fun x -> x = 0) a
 
 (* H(c) = SHA256(salt | code u32 | amount i64 | CompactSize(len) | script | txid | vout u32),
-   code = height*2 + coinbase: every Coin field plus the outpoint (design §1.2),
-   byte-identical to tools/swiftsync-refval.py and rustoshi's coin_hash. *)
+   code = height*2 + coinbase: every Coin field plus the outpoint,
+   byte-identical to rustoshi's coin_hash. *)
 let coin_hash (b : Buffer.t) (salt : string) (code : int) (amount : int64) (script : Cstruct.t)
     (txid : string) (vout : int) : string =
   Buffer.clear b;
@@ -344,7 +372,7 @@ let coin_hash (b : Buffer.t) (salt : string) (code : int) (amount : int64) (scri
   Buffer.add_int32_le b (Int32.of_int (vout land 0xffffffff));
   Crypto.sha256_accel (Buffer.contents b)
 
-(* TxOutSer record (kernel/coinstats.cpp), the spill format swiftsync-close.py reads. *)
+(* TxOutSer record (Core kernel/coinstats.cpp), the spill format. *)
 let txoutser (out : Buffer.t) (txid : string) (vout : int) (code : int) (amount : int64) (script : Cstruct.t) =
   Buffer.add_string out txid;
   Buffer.add_int32_le out (Int32.of_int vout);
@@ -1119,6 +1147,14 @@ let run_inner (a : args) : bool =
     then fired @ [ "script-count" ] else fired
   in
   let verdict = if fired = [] then "PASS" else "FAIL" in
+  (* Only a standalone, complete range ran the aggregate check; a slice's
+     PASS is per-block only (see the module comment). *)
+  let closed = verdict = "PASS" && standalone && complete_to_hints in
+  if verdict = "PASS" && not closed then
+    Printf.eprintf
+      "swiftsync-pass: range %d..%d is a composing slice: PASS covers the per-block checks only; \
+       the aggregate is not checked and the chain is not validated until the slices are summed\n%!"
+      a.from a.to_;
   let total_s = Unix.gettimeofday () -. t0 in
   let res =
     `Assoc [
@@ -1142,6 +1178,7 @@ let run_inner (a : args) : bool =
       ("hints_dir", `String hints_dir);
       ("standalone", `Bool standalone);
       ("composes", `Bool (not standalone));
+      ("closed", `Bool closed);
       ("control", if a.control = "" then `Null else `String a.control);
       ("block_file", `List (List.map (fun s -> `String s) a.block_file));
       ("control_applied", `List (List.rev_map (fun s -> `String s) ctx.applied));
@@ -1191,6 +1228,7 @@ let run_inner (a : args) : bool =
   print_endline
     (Yojson.Safe.to_string
        (`Assoc [ ("range", `List [ `Int a.from; `Int a.to_ ]); ("verdict", `String verdict);
+                 ("closed", `Bool closed);
                  ("fired", `List (List.map (fun s -> `String s) fired)); ("agg_equal", `Bool agg_equal);
                  ("scripts_run", `Int scripts_run); ("inputs", `Int part.inputs);
                  ("expected_inputs_undo_idx", `Int expected_inputs); ("n_errors", `Int n_errors);

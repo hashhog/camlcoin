@@ -478,6 +478,37 @@ let test_deep_invalidate_caps_readd () =
     check_pool "pool after an 11-block invalidate (Core: T02..T11)"
       (List.init 10 (fun k -> Printf.sprintf "T%02d" (k + 2))) (pool fx names))
 
+(* ------------------------------------------- entry fields (entryToJSON) *)
+
+(* getmempoolentry's result object for [tx]. *)
+let entry_json fx (tx : Types.transaction) : (string * Yojson.Safe.t) list =
+  match rpc_ok fx "getmempoolentry"
+          [ `String (Types.hash256_to_hex_display (txid tx)) ] with
+  | `Assoc kv -> (match List.assoc_opt "result" kv with
+      | Some (`Assoc e) -> e
+      | _ -> Alcotest.fail "getmempoolentry: no result object")
+  | _ -> Alcotest.fail "getmempoolentry: not an object"
+
+let spentby e = match List.assoc_opt "spentby" e with
+  | Some (`List l) -> List.map (function `String s -> s | _ -> "?") l
+  | _ -> Alcotest.fail "spentby missing"
+
+(* Core entryToJSON spentby = GetChildren, sorted by CompareIteratorByHash
+   (uint256 operator<: the internal byte order, which is the displayed hex
+   reversed).  warden_e: P with 63 in-pool children after the invalidate
+   refill.  Deployed: the children came out in hash-table order. *)
+let test_spentby_txid_order () =
+  with_fx ~label:"mr_spentby" (fun fx ->
+    let parent, names = parent_children_invalidate fx ~n:64 ~pad:20 ~fee_unit:1000 in
+    let kids = List.filter_map (fun (n, tx) ->
+        if n <> "P" && Mempool.contains fx.mp (txid tx) then Some (txid tx)
+        else None) names in
+    Alcotest.(check int) "63 children in the pool" 63 (List.length kids);
+    let core_order =
+      List.map Types.hash256_to_hex_display (List.sort Cstruct.compare kids) in
+    Alcotest.(check (list string)) "P spentby in Core's GetChildren order"
+      core_order (spentby (entry_json fx parent)))
+
 let () =
   Alcotest.run "mempool_reorg" [
     "mempool vs chain", [
@@ -495,5 +526,9 @@ let () =
         test_invalidate_trims_overweight_cluster;
       Alcotest.test_case "invalidateblock: re-add only the top 10 blocks" `Quick
         test_deep_invalidate_caps_readd;
+    ];
+    "entry fields", [
+      Alcotest.test_case "spentby in Core's GetChildren (txid) order" `Quick
+        test_spentby_txid_order;
     ];
   ]

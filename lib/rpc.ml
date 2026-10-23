@@ -1949,7 +1949,9 @@ let handle_getmempoolinfo (ctx : rpc_context) : Yojson.Safe.t =
      case for single-tx chains).
    - spentby: we don't maintain a child index in O(1); iterate mempool to find
      entries whose depends_on includes this txid. This is O(mempool_size) but
-     rare (only called on explicit entry queries).
+     rare (only called on explicit entry queries).  Core's GetChildren sorts
+     by txid (CompareIteratorByHash: uint256 operator<, i.e. the internal
+     byte order, not the displayed hex), so sort the raw txids.
    - bip125-replaceable: use Mempool.signals_rbf_with_ancestors so the
      reported flag matches Core's BIP-125 inheritable opt-in (entryToJSON
      calls IsRBFOptIn(it, mp) which walks the in-mempool ancestor set).
@@ -1993,9 +1995,11 @@ let mempool_entry_to_json (mp : Mempool.mempool) (entry : Mempool.mempool_entry)
       if List.exists (fun dep ->
            Cstruct.to_string dep = txid_key
          ) e.depends_on
-      then `String (Types.hash256_to_hex_display e.txid) :: acc
+      then e.txid :: acc
       else acc
     ) mp.entries []
+    |> List.sort Cstruct.compare
+    |> List.map (fun t -> `String (Types.hash256_to_hex_display t))
   in
   `Assoc [
     ("vsize",           `Int ((entry.weight + 3) / 4));

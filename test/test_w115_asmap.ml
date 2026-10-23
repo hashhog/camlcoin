@@ -257,6 +257,8 @@ let test_fix50_peer_stats_mapped_as () =
     stat_protocol_version = 0l;
     stat_time_offset = 0L;
     stat_mapped_as = 0l;
+    stat_addrbind = None;
+    stat_addrlocal = None;
   } in
   Alcotest.(check int32) "FIX-50: peer_stats.stat_mapped_as field default = 0l"
     0l dummy.Peer.stat_mapped_as

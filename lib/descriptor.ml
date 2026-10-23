@@ -56,6 +56,7 @@ type key_expr =
       path : derivation_path;
       derive : derive_type;
       is_private : bool;  (* was parsed from xprv *)
+      testnet : bool;     (* tpub/tprv version bytes: echoed back as tpub *)
     }
   | WithOrigin of key_origin * key_expr  (* wrapped with origin info *)
 
@@ -355,7 +356,8 @@ let parse_key_inner (s : string) (ctx : [`Top | `P2SH | `P2WSH | `P2TR])
     else begin
       match Wallet.deserialize_extended_key base_key with
       | Ok (extkey, is_private) ->
-        Ok (Xpub { extkey; path; derive; is_private })
+        Ok (Xpub { extkey; path; derive; is_private;
+                   testnet = String.length base_key > 0 && base_key.[0] = 't' })
       | Error _ ->
         (* Try as WIF *)
         match Address.base58check_decode base_key with
@@ -619,7 +621,7 @@ let derive_key_at (key : key_expr) (index : int) : (Cstruct.t, string) result =
     | ConstPrivkey priv ->
       Ok (Crypto.derive_public_key ~compressed:true priv)
     | WithOrigin (_, inner) -> derive inner
-    | Xpub { extkey; path; derive = dt; is_private = _ } ->
+    | Xpub { extkey; path; derive = dt; is_private = _; testnet = _ } ->
       (* Derive along the path *)
       let rec derive_path ek = function
         | [] -> Ok ek
@@ -1058,8 +1060,8 @@ let rec key_to_string (key : key_expr) : string =
       cstruct_to_hex pk
   | ConstPrivkey _ ->
     "<private>"  (* don't expose private keys *)
-  | Xpub { extkey; path; derive; is_private = _ } ->
-    let base = Wallet.serialize_xpub extkey in
+  | Xpub { extkey; path; derive; is_private = _; testnet } ->
+    let base = Wallet.serialize_xpub ~testnet extkey in
     let path_str = path_to_string path in
     let wildcard = match derive with
       | NonRanged -> ""

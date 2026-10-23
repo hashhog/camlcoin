@@ -652,7 +652,7 @@ let handle_mempool_info (ctx : Rpc.rpc_context) (_req : Cohttp.Request.t)
     let json = `Assoc [
       ("loaded", `Bool true);
       ("size", `Int count);
-      ("bytes", `Int bytes_approx);
+      ("bytes", `Int (Mempool.total_vsize ctx.mempool));
       ("usage", `Int bytes_approx);
       ("maxmempool", `Int 300_000_000);  (* default 300 MB *)
       (* sat/kvB -> BTC/kvB is /. 1e8 (was /. 100_000.0, a real unit bug:
@@ -661,7 +661,7 @@ let handle_mempool_info (ctx : Rpc.rpc_context) (_req : Cohttp.Request.t)
       ("mempoolminfee", `Float (Int64.to_float (Mempool.effective_min_fee ctx.mempool) /. 1e8));
       ("minrelaytxfee", `Float (Int64.to_float ctx.mempool.min_relay_fee /. 1e8));
       ("incrementalrelayfee", `Float (Int64.to_float Mempool.incremental_relay_fee /. 1e8));
-      ("unbroadcastcount", `Int 0);
+      ("unbroadcastcount", `Int (Mempool.unbroadcast_count ctx.mempool));
       ("fullrbf", `Bool true);
       ("totalfee", `Float (Int64.to_float total_fee /. 100_000_000.0));
     ] in

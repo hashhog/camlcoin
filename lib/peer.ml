@@ -2035,9 +2035,32 @@ type peer_stats = {
   stat_protocol_version : int32;
   stat_time_offset : int64;
   stat_mapped_as : int32;  (* ASN from asmap lookup; 0 = unknown / no asmap *)
+  stat_addrbind : string option;   (* local socket address, "ip:port" *)
+  stat_addrlocal : string option;  (* our address as the peer saw it (version addr_recv) *)
 }
 
 let get_stats (peer : peer) : peer_stats =
+  let addrbind =
+    try
+      match Lwt_unix.getsockname peer.fd with
+      | Unix.ADDR_INET (ip, port) ->
+        Some (Printf.sprintf "%s:%d" (Unix.string_of_inet_addr ip) port)
+      | _ -> None
+    with _ -> None
+  in
+  (* addr_recv is 16 bytes, IPv4 as ::ffff:a.b.c.d; all-zero = peer did not
+     know our address (Core then omits addrlocal). *)
+  let addrlocal =
+    match peer.version_msg with
+    | Some v when Cstruct.length v.addr_recv.addr = 16
+                  && Cstruct.get_uint8 v.addr_recv.addr 10 = 0xff
+                  && Cstruct.get_uint8 v.addr_recv.addr 11 = 0xff
+                  && Cstruct.BE.get_uint32 v.addr_recv.addr 12 <> 0l ->
+      let b i = Cstruct.get_uint8 v.addr_recv.addr i in
+      Some (Printf.sprintf "%d.%d.%d.%d:%d" (b 12) (b 13) (b 14) (b 15)
+              v.addr_recv.port)
+    | _ -> None
+  in
   { stat_id = peer.id;
     stat_addr = peer.addr;
     stat_port = peer.port;
@@ -2061,6 +2084,8 @@ let get_stats (peer : peer) : peer_stats =
       | None -> 0l);
     stat_time_offset = peer.time_offset;
     stat_mapped_as = 0l;
+    stat_addrbind = addrbind;
+    stat_addrlocal = addrlocal;
   }
 
 (* Pretty print peer info *)

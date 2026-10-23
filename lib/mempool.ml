@@ -154,6 +154,11 @@ type mempool = {
      txmempool.cpp:657 (`ApplyDelta`),
      node/mempool_persist.cpp:99-102 + 125-132 (LoadMempool ApplyDelta). *)
   map_deltas : (string, int64) Hashtbl.t;
+  (* Core CTxMemPool::m_unbroadcast_txids: transactions submitted locally
+     (sendrawtransaction / submitpackage) that no peer has fetched yet.
+     Keyed like [entries] (binary txid string).  Cleared when a peer's
+     getdata is served for the tx, or when the tx leaves the mempool. *)
+  unbroadcast : (string, unit) Hashtbl.t;
 }
 
 (* ============================================================================
@@ -377,6 +382,7 @@ let create ?(require_standard=true) ?(verify_scripts=true)
     on_eviction;
     (* FIX-72: prioritisetransaction deltas, in-memory only. *)
     map_deltas = Hashtbl.create 64;
+    unbroadcast = Hashtbl.create 16;
     (* #135 step 1: reverse parent→children index, sized for typical mempool. *)
     children = Hashtbl.create 10_000; }
 
@@ -512,11 +518,31 @@ let zmq_notify_tx (mp : mempool) (txid : Types.hash256) (tx : Types.transaction)
 (* Remove a transaction and its dependents recursively.
    Collects dependent txids before removal to avoid mutating Hashtbl during iteration.
    Updates cached descendant counts of ancestors using BFS. *)
+(* Core CTxMemPool::AddUnbroadcastTx / RemoveUnbroadcastTx / GetUnbroadcastTxs. *)
+let add_unbroadcast (mp : mempool) (txid : Types.hash256) : unit =
+  let k = Cstruct.to_string txid in
+  if Hashtbl.mem mp.entries k then Hashtbl.replace mp.unbroadcast k ()
+
+let remove_unbroadcast (mp : mempool) (txid : Types.hash256) : unit =
+  Hashtbl.remove mp.unbroadcast (Cstruct.to_string txid)
+
+let is_unbroadcast (mp : mempool) (txid : Types.hash256) : bool =
+  Hashtbl.mem mp.unbroadcast (Cstruct.to_string txid)
+
+(* Core CTxMemPool::GetTotalTxSize: the sum of each entry's vsize (rounded up
+   per transaction), not total weight / 4. *)
+let total_vsize (mp : mempool) : int =
+  Hashtbl.fold (fun _ (e : mempool_entry) acc -> acc + (e.weight + 3) / 4)
+    mp.entries 0
+
+let unbroadcast_count (mp : mempool) : int = Hashtbl.length mp.unbroadcast
+
 let rec remove_transaction (mp : mempool) (txid : Types.hash256) : unit =
   let txid_key = Cstruct.to_string txid in
   match Hashtbl.find_opt mp.entries txid_key with
   | None -> ()
   | Some entry ->
+    Hashtbl.remove mp.unbroadcast txid_key;
     (* Notify ZMQ subscribers about removal *)
     zmq_notify_tx mp entry.txid entry.tx false;
     (* Notify fee estimator — mirrors Core's TransactionRemovedFromMempool hook.

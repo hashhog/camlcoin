@@ -341,10 +341,10 @@ let serialize_xprv (ek : extended_key) : string =
   Address.base58check_encode buf
 
 (* Serialize extended public key to xpub Base58Check string *)
-let serialize_xpub (ek : extended_key) : string =
+let serialize_xpub ?(testnet = false) (ek : extended_key) : string =
   let buf = Cstruct.create 78 in
-  (* Version: mainnet xpub = 0x0488B21E *)
-  Cstruct.BE.set_uint32 buf 0 0x0488B21El;
+  (* Version: mainnet xpub = 0x0488B21E, testnet/regtest tpub = 0x043587CF *)
+  Cstruct.BE.set_uint32 buf 0 (if testnet then 0x043587CFl else 0x0488B21El);
   (* Depth *)
   Cstruct.set_uint8 buf 4 ek.depth;
   (* Parent fingerprint *)

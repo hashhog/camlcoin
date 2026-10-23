@@ -11318,7 +11318,7 @@ let handle_scantxoutset (ctx : rpc_context)
             Cstruct.equal spk utxo.Utxo.script_pubkey) needles
           with
           | None -> ()
-          | Some (_, desc) ->
+          | Some _ ->
             total_amount := Int64.add !total_amount utxo.Utxo.value;
             (* blockhash = hash of the block at the coin's height
                (big-endian display hex); confirmations = tip_height -
@@ -11337,7 +11337,8 @@ let handle_scantxoutset (ctx : rpc_context)
               ("vout", `Int vout);
               ("scriptPubKey",
                  `String (cstruct_to_hex utxo.Utxo.script_pubkey));
-              ("desc", `String desc);
+              ("desc", `String (infer_descriptor utxo.Utxo.script_pubkey
+                                  (network_to_address_network ctx.network)));
               ("amount", btc_amount_json utxo.Utxo.value);
               ("coinbase", `Bool utxo.Utxo.is_coinbase);
               ("height", `Int coin_height);

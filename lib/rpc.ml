@@ -5068,7 +5068,8 @@ let handle_submitpackage (ctx : rpc_context)
                   (Cstruct.to_string e.Mempool.wtxid) e
               ) entries
             | Mempool.PackagePartial { accepted; rejected } ->
-              package_msg := "package-partial-accept";
+              (* Core: PCKG_TX failure -> "transaction failed". *)
+              package_msg := "transaction failed";
               List.iter (fun e ->
                 Hashtbl.replace entry_by_wtxid_key
                   (Cstruct.to_string e.Mempool.wtxid) e
@@ -5076,7 +5077,8 @@ let handle_submitpackage (ctx : rpc_context)
               List.iter (fun (tx, msg) ->
                 let wtxid = Crypto.compute_wtxid tx in
                 Hashtbl.replace error_by_wtxid_key
-                  (Cstruct.to_string wtxid) msg
+                  (Cstruct.to_string wtxid)
+                  (canonical_mempool_reject_reason ~testmempoolaccept:false msg)
               ) rejected
             | Mempool.PackageRejected msg ->
               package_msg := msg);
@@ -5178,7 +5180,18 @@ let handle_submitpackage (ctx : rpc_context)
                let err_msg =
                  match Hashtbl.find_opt error_by_wtxid_key wtxid_key with
                  | Some msg -> msg
-                 | None -> "package-not-validated"
+                 | None ->
+                   (* Never evaluated because a package parent failed: Core
+                      reports the child's input as missing. *)
+                   let parent_failed = List.exists (fun (i : Types.tx_in) ->
+                     List.exists (fun (p : Types.transaction) ->
+                       Cstruct.equal (Crypto.compute_txid p)
+                         i.Types.previous_output.Types.txid
+                       && Hashtbl.mem error_by_wtxid_key
+                            (Cstruct.to_string (Crypto.compute_wtxid p))) txs
+                   ) tx.Types.inputs in
+                   if parent_failed then "bad-txns-inputs-missingorspent"
+                   else "package-not-validated"
                in
                (wtxid_hex, `Assoc [
                  ("txid", `String txid_hex);

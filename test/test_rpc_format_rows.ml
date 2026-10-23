@@ -393,6 +393,29 @@ let test_replacement_failed_token () =
     ("replacement-failed, " ^ msg)
     (Rpc.canonical_mempool_reject_reason ~testmempoolaccept:false msg)
 
+(* A package member that cannot be admitted: package_msg "transaction failed"
+   and the bare token for the failing tx (package/submit/missing-input). *)
+let test_submitpackage_failed_member () =
+  with_ctx (fun ctx ->
+      put_utxo ~coinbase:false ctx ~vout:0 "51";
+      let good = seeded_spend () in
+      let bad : Types.transaction =
+        { good with
+          inputs = [ { Types.previous_output =
+                         { Types.txid = Crypto.compute_txid good; vout = 5l };
+                       script_sig = Cstruct.create 0; sequence = 0xFFFFFFFFl } ];
+          witnesses = [] } in
+      let open Yojson.Safe.Util in
+      match Rpc.dispatch_rpc ctx "submitpackage"
+              [ `List [ `String (tx_hex good); `String (tx_hex bad) ] ] with
+      | Error (c, m) -> Alcotest.failf "submitpackage: (%d) %s" c m
+      | Ok j ->
+        Alcotest.(check string) "package_msg" "transaction failed"
+          (j |> member "package_msg" |> to_string);
+        let w = Types.hash256_to_hex_display (Crypto.compute_wtxid bad) in
+        Alcotest.(check string) "error" "bad-txns-inputs-missingorspent"
+          (j |> member "tx-results" |> member w |> member "error" |> to_string))
+
 let () =
   Alcotest.run "rpc_format_rows"
     [ ("scantxoutset",
@@ -419,6 +442,8 @@ let () =
            test_feerate_floor_and_testmempoolaccept;
          Alcotest.test_case "replacement-failed token / detail split" `Quick
            test_replacement_failed_token;
+         Alcotest.test_case "submitpackage failed member message/token" `Quick
+           test_submitpackage_failed_member;
          Alcotest.test_case "submitpackage cpfp reports the package feerate" `Quick
            test_submitpackage_cpfp_effective ]);
       ("operator",

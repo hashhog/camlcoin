@@ -71,12 +71,69 @@ type orphan_entry = {
 }
 
 (* ============================================================================
+   Memory usage accounting (-maxmempool)
+   ============================================================================ *)
+
+(* Core bounds the pool by DynamicMemoryUsage() — the heap bytes of its C++
+   structures — not by serialized size or weight (txmempool.cpp:868 TrimToSize
+   loops while DynamicMemoryUsage() > sizelimit).  A -maxmempool of N MB
+   therefore holds far fewer bytes of transaction than N MB, and matching which
+   transactions survive a given limit needs the same yardstick.
+
+   [tx_dynamic_usage] estimates it from the transaction's shape.  The terms
+   follow core_memusage.h RecursiveDynamicUsage(CTransaction) with
+   memusage::MallocUsage (memusage.h:52, 64-bit):
+     vin  vector     MallocUsage(n_in  * sizeof(CTxIn)=96)
+     vout vector     MallocUsage(n_out * sizeof(CTxOut)=40)
+     per input       witness-stack vector MallocUsage(24 * capacity), capacity
+                     = items rounded up to a power of two (vector growth),
+                     plus one MallocUsage(len) per item; a scriptSig over 28
+                     bytes is heap-allocated (prevector), shorter ones inline
+     per output      a scriptPubKey over 28 bytes is heap-allocated
+     per input       one mapNextTx node, MallocUsage(48) = 64
+   The per-entry term (CTxMemPoolEntry + TxGraph share) is not modelled
+   structurally; [usage_entry_fixed] is calibrated against Core v31.1
+   getmempoolinfo "usage" as measured by tools/core-regtest: a 1-input,
+   1-output P2WSH spend (witness items 80, 80, 3 bytes) = 1272 bytes, and the
+   same shape with 800 inputs = 397512 bytes per tx (steady increments in the
+   warden_invalidated_submit pressure phase).  The estimate reproduces 1272
+   exactly and 397512 within 0.02%; it is an estimate of Core's allocator
+   accounting, not a copy of it. *)
+let malloc_usage (alloc : int) : int =
+  if alloc = 0 then 0 else ((alloc + 31) lsr 4) lsl 4
+
+let usage_entry_fixed = 696    (* CTxMemPoolEntry + TxGraph per-tx share *)
+let usage_map_next_tx = 64     (* one mapNextTx std::map node per input *)
+
+let tx_dynamic_usage (tx : Types.transaction) : int =
+  let n_in = List.length tx.Types.inputs in
+  let n_out = List.length tx.Types.outputs in
+  let prevector_heap (s : Cstruct.t) =
+    let l = Cstruct.length s in if l > 28 then malloc_usage l else 0 in
+  let ins = List.fold_left (fun acc (i : Types.tx_in) ->
+    acc + prevector_heap i.Types.script_sig + usage_map_next_tx) 0 tx.Types.inputs in
+  let outs = List.fold_left (fun acc (o : Types.tx_out) ->
+    acc + prevector_heap o.Types.script_pubkey) 0 tx.Types.outputs in
+  let wit = List.fold_left (fun acc (w : Types.tx_witness) ->
+    let items = w.Types.items in
+    if items = [] then acc
+    else
+      let n = List.length items in
+      let cap = let rec p c = if c >= n then c else p (c * 2) in p 1 in
+      acc + malloc_usage (24 * cap)
+      + List.fold_left (fun a it -> a + malloc_usage (Cstruct.length it)) 0 items)
+    0 tx.Types.witnesses in
+  usage_entry_fixed + malloc_usage (n_in * 96) + malloc_usage (n_out * 40)
+  + ins + outs + wit
+
+(* ============================================================================
    Mempool State
    ============================================================================ *)
 
 type mempool = {
   mutable entries : (string, mempool_entry) Hashtbl.t;
   mutable total_weight : int;
+  mutable total_usage : int;  (* estimate of Core's DynamicMemoryUsage(); what -maxmempool bounds *)
   mutable total_fee : int64;
   max_size_bytes : int;       (* default 300 MB = 300_000_000 bytes (SI, matching Core) *)
   min_relay_fee : int64;      (* minimum fee rate in sat/kvB *)
@@ -344,15 +401,19 @@ let truc_descendant_limit = 2     (* max unconfirmed descendants including self 
 let create ?(require_standard=true) ?(verify_scripts=true)
     ?(zmq_notifier : Zmq_notify.t option)
     ?(on_eviction : (Types.hash256 -> unit) option = None)
+    ?(max_size_mb = 300)
     ~(network : Consensus.network_config)
     ~(utxo : Utxo.UtxoSet.t) ~(current_height : int) () : mempool =
   { entries = Hashtbl.create 10_000;
     total_weight = 0;
+    total_usage = 0;
     total_fee = 0L;
     (* DEFAULT_MAX_MEMPOOL_SIZE_MB * 1_000_000 — SI megabytes, not MiB.
        Reference: bitcoin-core/src/kernel/mempool_options.h:40
        Previous value was 300 * 1024 * 1024 = 314,572,800 (too large by ~4.9%). *)
-    max_size_bytes = 300 * 1_000_000;
+    (* -maxmempool=<MB> (default 300).  Core: init.cpp
+       `max_size_bytes = args.GetIntArg("-maxmempool", DEFAULT_MAX_MEMPOOL_SIZE_MB) * 1000000`. *)
+    max_size_bytes = max_size_mb * 1_000_000;
     (* DEFAULT_MIN_RELAY_TX_FEE = 100 sat/kvB.
        Reference: bitcoin-core/src/policy/policy.h:70.
        Previous value was 1000 sat/kvB (10x Core's default). The dust
@@ -595,6 +656,7 @@ let rec remove_transaction (mp : mempool) (txid : Types.hash256) : unit =
         if Hashtbl.length s = 0 then Hashtbl.remove mp.children parent_key
     ) entry.depends_on;
     mp.total_weight <- mp.total_weight - entry.weight;
+    mp.total_usage <- mp.total_usage - tx_dynamic_usage entry.tx;
     mp.total_fee <- Int64.sub mp.total_fee entry.fee;
     List.iter (fun inp ->
       let out_key = (Cstruct.to_string inp.Types.previous_output.txid,
@@ -982,7 +1044,7 @@ let get_min_fee (mp : mempool) : int64 =
       (* Apply exponential decay with conditional halflife adjustment.
          Reference: txmempool.cpp:836-843 *)
       let halflife =
-        let usage = mp.total_weight in
+        let usage = mp.total_usage in
         let limit = mp.max_size_bytes in
         if usage < limit / 4 then rolling_fee_halflife /. 4.0
         else if usage < limit / 2 then rolling_fee_halflife /. 2.0
@@ -1038,12 +1100,12 @@ let get_min_fee (mp : mempool) : int64 =
    skipped (remove_transaction on a missing txid is a no-op; the floor is only
    bumped for chunks that still evict something). *)
 let evict_by_chunks (mp : mempool) : unit =
-  if mp.total_weight > mp.max_size_bytes then begin
+  if mp.total_usage > mp.max_size_bytes then begin
     (* Single structure rebuild per trim; get_all_chunks sorts descending, so
        walk the reversed list (worst chunk first). *)
     let worst_first = List.rev (get_all_chunks mp) in
     let rec evict_loop chunks =
-      if mp.total_weight <= mp.max_size_bytes then ()
+      if mp.total_usage <= mp.max_size_bytes then ()
       else match chunks with
         | [] -> ()
         | chunk :: rest ->
@@ -1056,9 +1118,21 @@ let evict_by_chunks (mp : mempool) : unit =
               chunk.chunk_txs
           in
           if live <> [] then begin
-            (* chunk_fee_rate is in sat/weight-unit; convert to sat/kvB for the
-               rolling fee.  1 sat/wu * 4 wu/vB * 1000 vB/kvB. *)
-            let evicted_fee_rate_kvb = chunk.chunk_fee_rate *. 4.0 *. 1000.0 in
+            (* The floor is the evicted chunk's feerate in sat/kvB, over the
+               sigop-adjusted vsize Core ranks by (policy.cpp GetVirtualTransactionSize
+               via CTxMemPoolEntry::GetTxSize).  [chunk_fee_rate] is sat/vB over
+               the unadjusted vsize, and the previous `*. 4.0 *. 1000.0`
+               treated it as sat/weight-unit: a floor 4x too high, and
+               blind to sigop-heavy transactions. *)
+            let (fee_sum, vsize_sum) =
+              List.fold_left (fun (f, v) (e : mempool_entry) ->
+                (Int64.add f e.fee,
+                 v + Validation.get_virtual_transaction_size
+                       ~weight:e.weight ~sigop_cost:e.sigops_cost
+                       ~bytes_per_sigop:Consensus.default_bytes_per_sigop))
+                (0L, 0) live in
+            let evicted_fee_rate_kvb =
+              Int64.to_float fee_sum *. 1000.0 /. float_of_int (max 1 vsize_sum) in
             (* Add incremental_relay_fee before updating the floor, so the floor
                is strictly above the just-evicted rate (Core txmempool.cpp:877-878). *)
             let floor_rate = evicted_fee_rate_kvb +. incremental_relay_fee_float in
@@ -1275,7 +1349,7 @@ let evict_lowest_feerate (mp : mempool) : unit =
   let rec evict = function
     | [] -> ()
     | entry :: rest ->
-      if mp.total_weight <= target then ()
+      if mp.total_usage <= target then ()
       else begin
         remove_transaction mp entry.txid;
         evict rest
@@ -2927,6 +3001,7 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
                 Hashtbl.replace children_set txid_key ()
               ) !depends;
               mp.total_weight <- mp.total_weight + weight;
+              mp.total_usage <- mp.total_usage + tx_dynamic_usage tx;
               mp.total_fee <- Int64.add mp.total_fee fee;
               List.iter (fun inp ->
                 let out_key = (Cstruct.to_string inp.Types.previous_output.txid,
@@ -2971,7 +3046,7 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
                  public-flood churn that stalled RPC — see evict_by_chunks).
                  Each trim still evicts back down to max_size_bytes exactly;
                  memory is bounded by cap + slack. *)
-              if mp.total_weight > mp.max_size_bytes + eviction_trigger_slack mp then
+              if mp.total_usage > mp.max_size_bytes + eviction_trigger_slack mp then
                 evict_by_chunks mp;
 
               (* Notify ZMQ subscribers about new transaction *)
@@ -3436,7 +3511,7 @@ let update_for_reorg ?(entry_height : (Types.hash256 -> int option) option)
   ) dropped;
   update_transactions_from_block mp (List.rev !readded);
   remove_for_reorg mp;
-  if mp.total_weight > mp.max_size_bytes then evict_by_chunks mp;
+  if mp.total_usage > mp.max_size_bytes then evict_by_chunks mp;
   List.length !readded
 
 (* ============================================================================
@@ -3478,6 +3553,9 @@ let select_for_block (mp : mempool) ~(max_weight : int)
 (* ============================================================================
    Mempool Info
    ============================================================================ *)
+
+(* Estimated DynamicMemoryUsage() of the pool — getmempoolinfo "usage". *)
+let get_usage (mp : mempool) : int = mp.total_usage
 
 (* Get mempool statistics *)
 let get_info (mp : mempool) : (int * int * int64) =
@@ -4900,6 +4978,7 @@ let clear (mp : mempool) : unit =
   Hashtbl.clear mp.entries;
   Hashtbl.clear mp.by_wtxid;
   mp.total_weight <- 0;
+  mp.total_usage <- 0;
   mp.total_fee <- 0L
 
 (* ============================================================================
@@ -5882,7 +5961,8 @@ let count (mp : mempool) : int =
 (* set_total_weight_for_testing — inject an arbitrary total_weight for eviction
    threshold tests without needing to add real transactions. *)
 let set_total_weight_for_testing (mp : mempool) (w : int) : unit =
-  mp.total_weight <- w
+  mp.total_weight <- w;
+  mp.total_usage <- w
 
 (* evict_by_chunks_for_testing — public wrapper so tests can call the eviction
    loop directly. *)

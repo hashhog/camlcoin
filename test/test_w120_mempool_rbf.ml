@@ -395,16 +395,18 @@ let test_g7_descendant_eviction_present () =
     (file_has_marker "lib/mempool.ml" "get_descendants mp conflict_entry.txid")
 
 (* ============================================================================
-   G8 — Package-RBF (BIP-431) — MISSING
+   G8 — Package-RBF (BIP-431) — CLOSED (done-camlcoin-package-rbf)
    ============================================================================ *)
 
 let test_g8_package_rbf_missing () =
-  (* BUG-7 P0.  accept_package runs per-tx ATMP but has no package-effective-
-     feerate replacement check (BIP-431 §"Package RBF"). *)
-  Alcotest.(check bool) "BUG-7: no 'PackageRBF' symbol in mempool.ml" false
-    (file_has_marker "lib/mempool.ml" "PackageRBF");
-  Alcotest.(check bool) "BUG-7: no 'package_rbf' helper in mempool.ml" false
-    (file_has_marker "lib/mempool.ml" "package_rbf")
+  (* BUG-7 P0, closed.  accept_package_full evaluates a 1-parent-1-child
+     package as one replacement (Core PackageRBFChecks) when its txs fail on
+     their own; behaviour is covered by test/test_package_rbf.ml.  This guard
+     pins that the step stays wired into the package path. *)
+  Alcotest.(check bool) "BUG-7: PackageRBFChecks port present in mempool.ml" true
+    (file_has_marker "lib/mempool.ml" "let package_rbf (mp : mempool)");
+  Alcotest.(check bool) "BUG-7: accept_package_full runs package_rbf" true
+    (file_has_marker "lib/mempool.ml" "Some (package_rbf mp need_validation)")
 
 (* ============================================================================
    G9-G10 — conflicts order + replaceability surface
@@ -649,8 +651,12 @@ let test_g17_error_strings_not_aligned_to_core () =
   (* Core mnemonics that camlcoin SHOULD use but does not: *)
   Alcotest.(check bool) "BUG-13: 'replacement-adds-unconfirmed' missing" false
     (file_has_marker "lib/mempool.ml" "replacement-adds-unconfirmed");
-  Alcotest.(check bool) "BUG-13: 'too many potential replacements' missing" false
-    (file_has_marker "lib/mempool.ml" "too many potential replacements");
+  (* The package-RBF path now uses Core's "package RBF failed: too many
+     potential replacements", so the bare literal no longer tells the paths
+     apart.  The single-tx rule-5 text is still camlcoin's own: *)
+  Alcotest.(check bool) "BUG-13: single-tx rule 5 still not Core's text" true
+    (file_has_marker "lib/mempool.ml"
+       "\"rejecting replacement; too many conflicting clusters (%d > %d)\"");
   Alcotest.(check bool) "BUG-13: 'replacement-spends-conflicting-tx' missing" false
     (file_has_marker "lib/mempool.ml" "replacement-spends-conflicting-tx")
 
@@ -1324,7 +1330,7 @@ let graph_tests = [
 ]
 
 let package_tests = [
-  Alcotest.test_case "G8  package-RBF (BIP-431) MISSING (BUG-7, P0)" `Quick test_g8_package_rbf_missing;
+  Alcotest.test_case "G8  package-RBF (BIP-431) present (BUG-7, P0)" `Quick test_g8_package_rbf_missing;
 ]
 
 let conflicts_tests = [

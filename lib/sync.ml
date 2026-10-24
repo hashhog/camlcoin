@@ -7992,10 +7992,34 @@ let register_side_branch_header (state : chain_state) (entry : header_entry)
      chain-only. *)
   Storage.ChainDB.store_block_header state.db entry.hash entry.header
 
+(* Is [hash] a block of the ACTIVE validated chain (Core
+   [m_chain.Contains(pindex)])?  The on-disk height->hash index projects the
+   active chain only (see [block_tip]); a height above [blocks_synced] is
+   not connected yet. *)
+let is_on_active_chain (state : chain_state) (hash : Types.hash256) : bool =
+  match Hashtbl.find_opt state.headers (Cstruct.to_string hash) with
+  | None -> false
+  | Some e ->
+    e.height <= state.blocks_synced
+    && (match Storage.ChainDB.get_hash_at_height state.db e.height with
+        | Some h -> Cstruct.equal h hash
+        | None -> false)
+
+(* What [submitblock] may say about a side-branch block it did not reject.
+   Core rpc/mining.cpp submitblock answers from a submitblock_StateCatcher
+   on the block's hash: it is set only when BlockChecked fires for that
+   block (it was connected, or failed a check).  A block AcceptBlock stores
+   on a branch with no more work than the tip is never connected, nothing
+   is caught, and Core answers "inconclusive" -- not null, which BIP-22
+   defines as "accepted". *)
+type side_branch_outcome =
+  | Side_accepted      (* connected (now on the active chain), or a no-op *)
+  | Side_inconclusive  (* stored but not connected: no verdict *)
+
 (* Pattern Y closure: accept a block whose parent is in the index but is
    not the validated tip (side-branch / heavier-fork acceptance via
-   [submitblock]). Returns Ok () on stored — with optional reorg if the
-   side-branch is now strictly heavier than the active header tip — and
+   [submitblock]). Returns Ok Side_accepted when the reorg connected it,
+   Ok Side_inconclusive when it was stored without being connected, and
    Error on rejection.
 
    Mirrors Bitcoin Core's [ProcessNewBlock] -> [AcceptBlock] code path
@@ -8011,14 +8035,16 @@ let try_attach_side_branch_and_reorg
     ?(mempool : Mempool.mempool option)
     ?(misbehavior_handler : (int -> string -> unit) option)
     (state : chain_state) (block : Types.block) (parent : header_entry)
-    : (unit, string) result =
+    : (side_branch_outcome, string) result =
   let hash = Crypto.compute_block_hash block.header in
-  (* Idempotency: if we already have this block on disk, don't reprocess. *)
+  (* Idempotency: if we already have this block on disk, don't reprocess.
+     (Core answers "duplicate" here -- AcceptBlock's fAlreadyHave leaves
+     new_block false; not changed by this path yet.) *)
   if Storage.ChainDB.has_block state.db hash then begin
     Logs.debug (fun m ->
       m "submitblock side-branch: block %s already stored — no-op"
         (Types.hash256_to_hex_display hash));
-    Ok ()
+    Ok Side_accepted
   end else begin
     let height = parent.height + 1 in
     let header = block.header in
@@ -8138,18 +8164,20 @@ let try_attach_side_branch_and_reorg
                match reorganize ibd entry with
                | Ok () ->
                  Storage.ChainDB.set_header_tip state.db entry.hash entry.height;
-                 Ok ()
+                 (* Accepted only if this block itself was connected. *)
+                 if is_on_active_chain state hash then Ok Side_accepted
+                 else Ok Side_inconclusive
                | Error e ->
                  Logs.err (fun m ->
                    m "submitblock side-branch: reorganize failed: %s" e);
                  Error e
              end else begin
-               (* Side-branch stored but not activated — the equivalent
-                  of Core's "inconclusive" return from submitblock. *)
+               (* Side-branch stored but not activated: never connected,
+                  so never judged -- Core's "inconclusive". *)
                Logs.info (fun m ->
                  m "submitblock side-branch: stored at h=%d but not \
                     heavier than active tip (no reorg)" height);
-               Ok ()
+               Ok Side_inconclusive
              end)
         end
       end
@@ -9650,19 +9678,6 @@ let handle_mempool_msg (ibd : ibd_state) (peer : Peer.peer) : unit Lwt.t =
 (* Check if a block hash is marked as invalid (either directly or as a descendant) *)
 let is_block_invalid (state : chain_state) (hash : Types.hash256) : bool =
   Hashtbl.mem state.invalidated_blocks (Cstruct.to_string hash)
-
-(* Is [hash] a block of the ACTIVE validated chain (Core
-   [m_chain.Contains(pindex)])?  The on-disk height->hash index projects the
-   active chain only (see [block_tip]); a height above [blocks_synced] is
-   not connected yet. *)
-let is_on_active_chain (state : chain_state) (hash : Types.hash256) : bool =
-  match Hashtbl.find_opt state.headers (Cstruct.to_string hash) with
-  | None -> false
-  | Some e ->
-    e.height <= state.blocks_synced
-    && (match Storage.ChainDB.get_hash_at_height state.db e.height with
-        | Some h -> Cstruct.equal h hash
-        | None -> false)
 
 (* Find all descendants of a block in the headers table *)
 let find_descendants (state : chain_state) (target_hash : Types.hash256)

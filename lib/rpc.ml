@@ -2826,10 +2826,14 @@ let handle_submitblock (ctx : rpc_context)
      | None -> Error "Block decode failed"
      | Some block ->
     (try
-      match Mining.submit_block ?utxo:ctx.utxo
+      match Mining.submit_block_outcome ?utxo:ctx.utxo
               ~network_type:ctx.network.network_type
               block ctx.chain ctx.mempool with
-      | Ok () -> Ok `Null
+      | Ok Sync.Side_accepted -> Ok `Null
+      (* Stored on a side branch, never connected: Core's
+         submitblock_StateCatcher saw no BlockChecked for it, so
+         rpc/mining.cpp answers "inconclusive" (null would claim valid). *)
+      | Ok Sync.Side_inconclusive -> Ok (`String "inconclusive")
       (* Gate 6: a system fault is not a validation result.  Core answers
          a ProcessNewBlock failure that is not a BlockValidationState
          verdict with JSONRPCError(RPC_VERIFY_ERROR, ...) -- never a

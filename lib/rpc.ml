@@ -1903,6 +1903,26 @@ let handle_getnetworkinfo (ctx : rpc_context) : Yojson.Safe.t =
    Mempool Handlers
    ============================================================================ *)
 
+(* setmocktime timestamp -- Core rpc/node.cpp setmocktime (-regtest only).
+   0 returns to the system time.  Negative / non-integer-range values are
+   RPC_INVALID_PARAMETER; a non-regtest chain is a plain runtime_error (-1). *)
+let handle_setmocktime (ctx : rpc_context) (params : Yojson.Safe.t list)
+  : (Yojson.Safe.t, int * string) result =
+  if ctx.network.name <> "regtest" then
+    Error (rpc_misc_error,
+           "setmocktime is for regression testing (-regtest mode) only")
+  else
+    match params with
+    | [ `Int t ] when t >= 0 && t <= 9223372036 ->
+      Node_clock.set_mock_time (Int64.of_int t); Ok `Null
+    | [ `Intlit s ] ->
+      Error (rpc_invalid_parameter,
+             Printf.sprintf "Mocktime must be in the range [0, 9223372036], not %s." s)
+    | [ `Int t ] ->
+      Error (rpc_invalid_parameter,
+             Printf.sprintf "Mocktime must be in the range [0, 9223372036], not %d." t)
+    | _ -> Error (rpc_misc_error, "JSON value of type is not an integer as expected")
+
 let handle_getmempoolinfo (ctx : rpc_context) : Yojson.Safe.t =
   let (count, weight, fees) = Mempool.get_info ctx.mempool in
   (* Core MempoolInfoToJSON (mempool.cpp:1043) order:
@@ -12728,6 +12748,7 @@ let help_sections : (string * string list) list = [
     "getrpcinfo";
     "help ( \"command\" )";
     "logging ( [\"include_category\",...] [\"exclude_category\",...] )";
+    "setmocktime timestamp";
     "stop";
     "uptime";
   ]);
@@ -15806,6 +15827,7 @@ let dispatch_rpc (ctx : rpc_context)
     handle_getaddednodeinfo ctx params
 
   (* Mempool *)
+  | "setmocktime" -> handle_setmocktime ctx params
   | "getmempoolinfo" ->
     Ok (handle_getmempoolinfo ctx)
   | "getrawmempool" ->

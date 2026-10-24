@@ -263,6 +263,8 @@ Examples of output descriptors are:
 Requires wallet passphrase to be set with walletpassphrase call if wallet is encrypted.|});
   ("setban", {|Attempts to add or remove an IP/Subnet from the banned list.|});
   ("sethdseed", {|Set or generate a new HD wallet seed. (Legacy-wallet RPC; removed from Bitcoin Core.) The seed may be hex (16..64 bytes) or a BIP-39 mnemonic.|});
+  ("setmocktime", {|Set the local time to given timestamp (-regtest only)
+Pass 0 to go back to using the system time.|});
   ("setnetworkactive", {|Disable/enable all p2p network activity.|});
   ("signmessage", {|Sign a message with the private key of an address
 Requires wallet passphrase to be set with walletpassphrase call if wallet is encrypted.|});

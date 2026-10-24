@@ -1619,18 +1619,9 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     if not config.rest_enabled then
       Lwt.return_unit
     else if rest_port = config.rpc_port && rest_host = config.rpc_host then begin
-      (* Same host:port as the JSON-RPC server. The Cohttp-based RPC
-         listener already routes paths starting with "/" — but the RPC
-         dispatcher only honors POST and JSON-RPC bodies. Mounting the
-         REST router on the same socket would require teaching the RPC
-         server to delegate /rest/* to dispatch_rest. Today we instead
-         emit a clear log line and refuse to bind a duplicate listener,
-         keeping the cli observable rather than failing silently. *)
-      Logs.warn (fun m ->
-        m "REST enabled but --restport (%d) matches --rpcport; \
-           REST endpoints are NOT served. Set --restport=<distinct \
-           port> to enable."
-          rest_port);
+      (* Same host:port as the JSON-RPC server (Core's layout): mount the
+         REST router on the RPC listener rather than binding twice. *)
+      Rpc.rest_hook := Some Rest.dispatch_rest;
       Lwt.return_unit
     end else begin
       Logs.info (fun m ->

@@ -13,6 +13,7 @@ module Peer = Peer
 module Peer_manager = Peer_manager
 module Sync = Sync
 module Mempool = Mempool
+module Node_clock = Node_clock
 module Fee_estimation = Fee_estimation
 module Mining = Mining
 module Rpc = Rpc

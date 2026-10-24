@@ -362,7 +362,7 @@ let create ?(require_standard=true) ?(verify_scripts=true)
     min_relay_fee = 100L;
     dynamic_min_fee = 0L;
     rolling_min_fee_rate = 0.0;
-    last_rolling_fee_update = Unix.gettimeofday ();
+    last_rolling_fee_update = Node_clock.now ();
     block_since_last_rolling_fee_bump = false;
     utxo;
     current_height;
@@ -977,7 +977,7 @@ let get_min_fee (mp : mempool) : int64 =
     (* No decay active: return the current rolling rate directly (rounded). *)
     Int64.of_float (Float.round mp.rolling_min_fee_rate)
   else begin
-    let now = Unix.gettimeofday () in
+    let now = Node_clock.now () in
     if now > mp.last_rolling_fee_update +. 10.0 then begin
       (* Apply exponential decay with conditional halflife adjustment.
          Reference: txmempool.cpp:836-843 *)
@@ -2899,7 +2899,7 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
               weight;
               sigops_cost;
               fee_rate;
-              time_added = Unix.gettimeofday ();
+              time_added = Node_clock.now ();
               height_added = (cur_height mp);
               depends_on = !depends;
               ancestor_count = anc_count;
@@ -3065,7 +3065,7 @@ let remove_for_block (mp : mempool) (block : Types.block) (height : int)
   (* Reset rolling fee update timestamp and mark block-since-last-bump so the
      exponential decay starts running from this point forward.
      Reference: Core txmempool.cpp:426-427 *)
-  mp.last_rolling_fee_update <- Unix.gettimeofday ();
+  mp.last_rolling_fee_update <- Node_clock.now ();
   mp.block_since_last_rolling_fee_bump <- true
 
 (* ============================================================================
@@ -4652,7 +4652,7 @@ let add_orphan (mp : mempool) (tx : Types.transaction) : unit =
       orphan_tx = tx;
       orphan_txid = txid;
       orphan_wtxid = wtxid;
-      orphan_time = Unix.gettimeofday ();
+      orphan_time = Node_clock.now ();
     } in
     Hashtbl.replace mp.orphans wtxid_key entry;
     (* Secondary index: txid_str → wtxid_str for parent-arrival lookups *)
@@ -4859,7 +4859,7 @@ let orphan_count (mp : mempool) : int =
 
 (* Gap 7: Expire mempool transactions older than 14 days *)
 let expire_old_transactions (mp : mempool) : int =
-  let now = Unix.gettimeofday () in
+  let now = Node_clock.now () in
   let max_age = 1_209_600.0 in (* 14 days in seconds *)
   let to_remove = Hashtbl.fold (fun _k entry acc ->
     if now -. entry.time_added > max_age then entry.txid :: acc else acc
@@ -4869,7 +4869,7 @@ let expire_old_transactions (mp : mempool) : int =
 
 (* Gap 9: Expire orphan transactions older than 20 minutes *)
 let expire_orphans (mp : mempool) : int =
-  let now = Unix.gettimeofday () in
+  let now = Node_clock.now () in
   let max_age = orphan_expire_seconds in (* 20 minutes — shared with getorphantxs *)
   let to_remove = Hashtbl.fold (fun k entry acc ->
     if now -. entry.orphan_time > max_age then (k, entry) :: acc else acc
@@ -4979,7 +4979,7 @@ let random_xor_key () : bytes =
     buf
   with _ ->
     let k = Bytes.create 8 in
-    let t = Unix.gettimeofday () in
+    let t = Node_clock.now () in
     let bits = Int64.bits_of_float t in
     for i = 0 to 7 do
       Bytes.set_uint8 k i

@@ -668,9 +668,11 @@ let test_g18_submitpackage_replaces_field_hardcoded_empty () =
   (* FIX-73: hardcoded literal MUST be absent *)
   Alcotest.(check bool) "BUG-4 FIX-73: hardcoded empty list literal removed" false
     (file_has_marker "lib/rpc.ml" "(\"replaced-transactions\", `List [])");
-  (* FIX-73: handler dispatches through the _with_replaced variant *)
+  (* FIX-73: handler dispatches through a variant that returns the replaced
+     set ([accept_package_full] = [accept_package_with_replaced] plus the
+     package-RBF per-tx results) *)
   Alcotest.(check bool) "BUG-4 FIX-73: accept_package_with_replaced wired in" true
-    (file_has_marker "lib/rpc.ml" "Mempool.accept_package_with_replaced ctx.mempool txs");
+    (file_has_marker "lib/rpc.ml" "Mempool.accept_package_full ctx.mempool txs");
   (* FIX-73: replaced_json shape exists in the handler *)
   Alcotest.(check bool) "BUG-4 FIX-73: replaced_json list constructed from replaced_txids" true
     (file_has_marker "lib/rpc.ml" "let replaced_json");

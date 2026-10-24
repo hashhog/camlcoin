@@ -5584,6 +5584,318 @@ let calc_tx_fee_vsize (mp : mempool) (tx : Types.transaction)
       Ok (fee, vsize)
     end
 
+(* ============================================================================
+   Package RBF — Core v31 MemPoolAccept::PackageRBFChecks (validation.cpp)
+
+   AcceptPackage first tries every package tx on its own.  A tx that fails
+   only on fee grounds (TX_RECONSIDERABLE: below the floor, RBF rules 3/4,
+   feerate diagram) or on a missing input (its parent is a package tx that
+   failed on fee) is re-evaluated together with the others in
+   AcceptMultipleTransactionsInternal.  When any of those txs conflicts with
+   the pool, PackageRBFChecks treats the package as one replacement:
+
+     - exactly one parent and one child ("package must be 1-parent-1-child");
+     - neither may have in-mempool parents ("new transaction cannot have
+       mempool ancestors");
+     - Rule 5 over the union of both txs' direct conflicts;
+     - PaysForRBF with the package's total modified fees and total
+       sigop-adjusted vsize, errors attributed to the child;
+     - package feerate must exceed the parent's feerate;
+     - the post-eviction cluster (the parent and child alone) within
+       -limitclustersize / -limitclustercount ("too-large-cluster");
+     - the replacement must improve the feerate diagram.
+
+   A failure is a package-wide PCKG_POLICY state; each tx then reports the
+   result of its individual attempt.  Policy only: nothing here is reached
+   from block validation.
+   ============================================================================ *)
+
+(* Core FormatMoney (util/moneystr.cpp): "%d.%08d", trailing zeros trimmed
+   down to two decimals. *)
+let format_money (n : int64) : string =
+  let a = Int64.abs n in
+  let s = Printf.sprintf "%Ld.%08Ld" (Int64.div a 100_000_000L)
+      (Int64.rem a 100_000_000L) in
+  let is_digit c = c >= '0' && c <= '9' in
+  let len = ref (String.length s) in
+  while s.[!len - 1] = '0' && is_digit s.[!len - 3] do decr len done;
+  (if n < 0L then "-" else "") ^ String.sub s 0 !len
+
+(* Core CFeeRate(fee, vsize).ToString() — BTC/kvB with eight decimals. *)
+let format_feerate_btc_kvb (fee : int64) (vsize : int) : string =
+  let per_k =
+    if vsize <= 0 then 0L
+    else Int64.div (Int64.mul fee 1000L) (Int64.of_int vsize) in
+  Printf.sprintf "%Ld.%08Ld BTC/kvB" (Int64.div per_k 100_000_000L)
+    (Int64.rem per_k 100_000_000L)
+
+(* PaysForRBF (policy/rbf.cpp) debug strings.  [replacement_fees] and
+   [replacement_vsize] are the candidate's (the package's, for package RBF);
+   [txid] is the tx the error is attributed to. *)
+let pays_for_rbf ~(original_fees : int64) ~(replacement_fees : int64)
+    ~(replacement_vsize : int) ~(txid : Types.hash256) : (unit, string) result =
+  let txid_hex = Types.hash256_to_hex_display txid in
+  if replacement_fees < original_fees then
+    Error (Printf.sprintf
+             "rejecting replacement %s, less fees than conflicting txs; %s < %s"
+             txid_hex (format_money replacement_fees) (format_money original_fees))
+  else begin
+    let additional = Int64.sub replacement_fees original_fees in
+    let relay =
+      Int64.div (Int64.mul incremental_relay_fee (Int64.of_int replacement_vsize))
+        1000L in
+    if additional < relay then
+      Error (Printf.sprintf
+               "rejecting replacement %s, not enough additional fees to relay; %s < %s"
+               txid_hex (format_money additional) (format_money relay))
+    else Ok ()
+  end
+
+(* The single-tx RBF path ([replace_by_fee_with_replaced]) words its rule 3/4
+   failures without the txid and in satoshis.  In a submitpackage result Core
+   prints the individual failure as state.ToString():
+     "insufficient fee, rejecting replacement <txid>, ...; <BTC> < <BTC>". *)
+let core_individual_rbf_error ~(txid : Types.hash256) (msg : string) : string option =
+  let reword fmt kind =
+    try
+      Some (Scanf.sscanf msg fmt (fun a b ->
+          Printf.sprintf "insufficient fee, rejecting replacement %s, %s; %s < %s"
+            (Types.hash256_to_hex_display txid) kind (format_money a)
+            (format_money b)))
+    with Scanf.Scan_failure _ | Failure _ | End_of_file -> None
+  in
+  match reword "rejecting replacement, less fees than conflicting txs; %Ld < %Ld%!"
+          "less fees than conflicting txs" with
+  | Some s -> Some s
+  | None ->
+    reword "rejecting replacement, not enough additional fees to relay; %Ld < %Ld%!"
+      "not enough additional fees to relay"
+
+(* TX_RECONSIDERABLE or TX_MISSING_INPUTS: the individual failures AcceptPackage
+   retries as a package (validation.cpp AcceptPackage). *)
+let package_reconsiderable (msg : string) : bool =
+  let has_prefix p =
+    String.length msg >= String.length p
+    && String.sub msg 0 (String.length p) = p in
+  has_prefix "Fee below minimum relay fee"
+  || has_prefix "Missing input"
+  || has_prefix "rejecting replacement, less fees than conflicting txs"
+  || has_prefix "rejecting replacement, not enough additional fees to relay"
+  || has_prefix "insufficient feerate"
+
+(* Feerate diagram check for a replacement made of several new txs (the
+   package).  Same construction as [check_improves_feerate_diagram], with one
+   synthetic entry per new tx; [deps] gives each one's in-package parents. *)
+let check_package_improves_feerate_diagram (mp : mempool)
+    ~(evicted_set : (string, mempool_entry) Hashtbl.t)
+    ~(replacements : (Types.transaction * int64 * int) list)
+    : (unit, string) result =
+  let affected : (string, mempool_entry) Hashtbl.t = Hashtbl.create 64 in
+  List.iter (fun (tx, _, _) ->
+    List.iter (fun e -> Hashtbl.replace affected (Cstruct.to_string e.txid) e)
+      (collect_affected_cluster_entries mp ~evicted_set ~replacement_tx:tx)
+  ) replacements;
+  let affected_entries = Hashtbl.fold (fun _ e acc -> e :: acc) affected [] in
+  let before_diag = chunks_to_diagram (linearize_entries mp affected_entries) in
+  let remaining =
+    List.filter (fun e -> not (Hashtbl.mem evicted_set (Cstruct.to_string e.txid)))
+      affected_entries in
+  let new_keys : (string, unit) Hashtbl.t = Hashtbl.create 4 in
+  List.iter (fun (tx, _, _) ->
+    Hashtbl.replace new_keys (Cstruct.to_string (Crypto.compute_txid tx)) ()
+  ) replacements;
+  let synthetic = List.map (fun (tx, fee, weight) ->
+    let vsize = max 1 ((weight + 3) / 4) in
+    let depends_on = List.filter_map (fun inp ->
+      let k = Cstruct.to_string inp.Types.previous_output.txid in
+      if Hashtbl.mem new_keys k
+         || (Hashtbl.mem mp.entries k && not (Hashtbl.mem evicted_set k))
+      then Some inp.Types.previous_output.txid else None
+    ) tx.Types.inputs in
+    { tx; txid = Crypto.compute_txid tx; wtxid = Crypto.compute_wtxid tx;
+      fee; weight; sigops_cost = 0;
+      fee_rate = Int64.to_float fee /. float_of_int vsize;
+      time_added = 0.0; height_added = cur_height mp; depends_on;
+      ancestor_count = 1; ancestor_size = vsize;
+      descendant_count = 1; descendant_size = vsize }
+  ) replacements in
+  let after_diag =
+    chunks_to_diagram (linearize_entries mp (synthetic @ remaining)) in
+  match compare_feerate_diagrams ~before:before_diag ~after:after_diag with
+  | Strictly_better -> Ok ()
+  | Not_better -> Error "insufficient feerate: does not improve feerate diagram"
+
+(* Re-insert entries removed by a package replacement whose commit failed,
+   parents before children. *)
+let restore_evicted (mp : mempool) (evicted : mempool_entry list) : unit =
+  let pending = ref evicted in
+  let progress = ref true in
+  while !pending <> [] && !progress do
+    progress := false;
+    pending := List.filter (fun e ->
+      let blocked = List.exists (fun p ->
+        List.exists (fun o -> Cstruct.equal o.txid p) !pending
+        && not (Cstruct.equal p e.txid)) e.depends_on in
+      if blocked then true
+      else begin
+        progress := true;
+        ignore (add_transaction ~bypass_fee_check:true ~bypass_limits:true
+                  ~skip_verify_scripts:true mp e.tx);
+        false
+      end
+    ) !pending
+  done
+
+type package_rbf_outcome =
+  | Package_rbf_accepted of mempool_entry list * Types.hash256 list
+  | Package_rbf_failed of string
+
+(* PackageRBFChecks + SubmitPackage for the txs AcceptPackage re-evaluates
+   together ([eval], topologically sorted).  Called only when every one of
+   them failed on its own with a reconsiderable error and at least one
+   conflicts with the pool, so the pool is still unchanged. *)
+let package_rbf (mp : mempool) (eval : Types.transaction list)
+    : package_rbf_outcome =
+  match eval with
+  | [ parent; child ] when
+      List.exists (fun inp ->
+        Cstruct.equal inp.Types.previous_output.txid (Crypto.compute_txid parent))
+        child.Types.inputs ->
+    let parent_txid = Crypto.compute_txid parent in
+    let child_txid = Crypto.compute_txid child in
+    let parent_key = Cstruct.to_string parent_txid in
+    let has_mempool_parent tx =
+      List.exists (fun inp ->
+        let k = Cstruct.to_string inp.Types.previous_output.txid in
+        k <> parent_key && Hashtbl.mem mp.entries k) tx.Types.inputs in
+    if has_mempool_parent parent || has_mempool_parent child then
+      Package_rbf_failed
+        "package RBF failed: new transaction cannot have mempool ancestors"
+    else begin
+      (* Coins the child spends from the parent. *)
+      let parent_outs = Hashtbl.create 8 in
+      List.iteri (fun i out ->
+        Hashtbl.replace parent_outs i out) parent.Types.outputs;
+      let lookup (op : Types.outpoint) =
+        if Cstruct.equal op.txid parent_txid then
+          Option.map (fun (o : Types.tx_out) -> o.script_pubkey)
+            (Hashtbl.find_opt parent_outs (Int32.to_int op.vout))
+        else Option.map (fun e -> e.Utxo.script_pubkey) (lookup_utxo mp op)
+      in
+      let value_of (op : Types.outpoint) =
+        if Cstruct.equal op.txid parent_txid then
+          Option.map (fun (o : Types.tx_out) -> o.value)
+            (Hashtbl.find_opt parent_outs (Int32.to_int op.vout))
+        else Option.map (fun e -> e.Utxo.value) (lookup_utxo mp op)
+      in
+      let measure tx =
+        let ins = List.map (fun i -> value_of i.Types.previous_output) tx.Types.inputs in
+        if List.mem None ins then None
+        else begin
+          let in_sum = List.fold_left (fun a v -> Int64.add a (Option.get v)) 0L ins in
+          let out_sum = List.fold_left (fun a o -> Int64.add a o.Types.value) 0L
+              tx.Types.outputs in
+          let weight = Validation.compute_tx_weight tx in
+          let sigop_cost =
+            Validation.count_tx_sigops_cost tx ~prev_script_pubkey_lookup:lookup
+              ~flags:(Script.script_verify_p2sh lor Script.script_verify_witness) in
+          let adj_weight = Validation.get_sigops_adjusted_weight ~weight ~sigop_cost
+              ~bytes_per_sigop:Consensus.default_bytes_per_sigop in
+          let vsize = Validation.get_virtual_transaction_size ~weight ~sigop_cost
+              ~bytes_per_sigop:Consensus.default_bytes_per_sigop in
+          let fee = Int64.sub in_sum out_sum in
+          Some (fee, apply_delta mp (Crypto.compute_txid tx) fee, weight,
+                adj_weight, vsize)
+        end
+      in
+      match measure parent, measure child with
+      | None, _ | _, None -> Package_rbf_failed "transaction failed"
+      | Some (p_fee, p_mod, p_weight, p_adj, p_vsize),
+        Some (c_fee, c_mod, c_weight, c_adj, c_vsize) ->
+        let total_mod = Int64.add p_mod c_mod in
+        let total_vsize = p_vsize + c_vsize in
+        (* CheckFeeRate on the package feerate (m_package_feerates). *)
+        let min_fee =
+          Int64.div (Int64.mul (effective_min_fee mp) (Int64.of_int total_vsize))
+            1000L in
+        if total_mod < min_fee then Package_rbf_failed "transaction failed"
+        else begin
+          let direct = find_all_conflicts mp parent @ find_all_conflicts mp child in
+          (* Rule 5: distinct clusters among the direct conflicts. *)
+          let n_clusters =
+            let uf = build_clusters_uf mp in
+            let roots = Hashtbl.create 8 in
+            List.iter (fun e ->
+              Hashtbl.replace roots (uf_find uf (Cstruct.to_string e.txid)) ())
+              direct;
+            Hashtbl.length roots in
+          if n_clusters > max_replacement_candidates then
+            Package_rbf_failed (Printf.sprintf
+              "package RBF failed: too many potential replacements, rejecting \
+               replacement %s; too many conflicting clusters (%d > %d)"
+              (Types.hash256_to_hex_display child_txid) n_clusters
+              max_replacement_candidates)
+          else begin
+            let evicted_set : (string, mempool_entry) Hashtbl.t = Hashtbl.create 16 in
+            List.iter (fun e ->
+              List.iter (fun d -> Hashtbl.replace evicted_set (Cstruct.to_string d.txid) d)
+                (e :: get_descendants mp e.txid)) direct;
+            let conflicting_fees = Hashtbl.fold (fun _ e acc ->
+              Int64.add acc (get_modified_fee mp e)) evicted_set 0L in
+            match pays_for_rbf ~original_fees:conflicting_fees
+                    ~replacement_fees:total_mod ~replacement_vsize:total_vsize
+                    ~txid:child_txid with
+            | Error e ->
+              Package_rbf_failed ("package RBF failed: insufficient anti-DoS fees, " ^ e)
+            | Ok () ->
+              (* CFeeRate compares the exact fee/vsize fractions
+                 (FeeRateCompare), not the rounded per-kvB values. *)
+              if Int64.mul total_mod (Int64.of_int p_vsize)
+                 <= Int64.mul p_mod (Int64.of_int total_vsize) then
+                Package_rbf_failed (Printf.sprintf
+                  "package RBF failed: package feerate is less than or equal to \
+                   parent feerate, package feerate %s <= parent feerate is %s"
+                  (format_feerate_btc_kvb total_mod total_vsize)
+                  (format_feerate_btc_kvb p_mod p_vsize))
+              (* CheckMemPoolPolicyLimits: with no mempool parents and every
+                 conflict staged for removal, the new cluster is the parent and
+                 the child alone. *)
+              else if 2 > max_cluster_count
+                   || p_adj + c_adj > max_cluster_size_weight then
+                Package_rbf_failed too_large_cluster
+              else match check_package_improves_feerate_diagram mp ~evicted_set
+                           ~replacements:[ (parent, p_mod, p_weight);
+                                           (child, c_mod, c_weight) ] with
+              | Error e -> Package_rbf_failed ("package RBF failed: " ^ e)
+              | Ok () ->
+                ignore (p_fee, c_fee);
+                (* Remaining per-tx gates on the parent against the
+                   post-eviction pool, before anything is removed. *)
+                match add_transaction ~dry_run:true ~bypass_fee_check:true
+                        ~staged_removals:evicted_set mp parent with
+                | Error _ -> Package_rbf_failed "transaction failed"
+                | Ok _ ->
+                  let evicted =
+                    Hashtbl.fold (fun _ e acc -> e :: acc) evicted_set [] in
+                  List.iter (fun e -> remove_transaction mp e.txid) direct;
+                  let rollback added =
+                    List.iter (fun e -> remove_transaction mp e.txid) added;
+                    restore_evicted mp evicted;
+                    Package_rbf_failed "transaction failed" in
+                  match add_transaction ~bypass_fee_check:true mp parent with
+                  | Error _ -> rollback []
+                  | Ok p_entry ->
+                    match add_transaction ~bypass_fee_check:true mp child with
+                    | Error _ -> rollback [ p_entry ]
+                    | Ok c_entry ->
+                      Package_rbf_accepted
+                        ([ p_entry; c_entry ], List.map (fun e -> e.txid) evicted)
+          end
+        end
+    end
+  | _ ->
+    Package_rbf_failed "package RBF failed: package must be 1-parent-1-child"
+
 (* Accept a package of transactions.
    Validates topologically (parents before children).
    Computes package fee rate as total_fees / total_vsize.
@@ -5597,15 +5909,29 @@ let calc_tx_fee_vsize (mp : mempool) (tx : Types.transaction)
    (validation.cpp:760, rpc/mempool.cpp:1500).  The legacy [accept_package]
    wrapper returns only the package_result so the existing test suite +
    net-processing call sites stay source-compatible. *)
-let accept_package_with_replaced (mp : mempool) (txs : Types.transaction list)
-    : package_result * Types.hash256 list =
+type package_outcome = {
+  pkg_result : package_result;
+  pkg_replaced : Types.hash256 list;
+  (* Individual results AcceptPackage reports when the package-wide
+     evaluation (package RBF) failed: each tx's own failure. *)
+  pkg_tx_errors : (Types.transaction * string) list;
+  (* Txids admitted by the package-wide evaluation (package RBF); their
+     effective feerate is the package feerate. *)
+  pkg_eval : Types.hash256 list;
+}
+
+let accept_package_full (mp : mempool) (txs : Types.transaction list)
+    : package_outcome =
+  let plain (r, replaced) =
+    { pkg_result = r; pkg_replaced = replaced; pkg_tx_errors = [];
+      pkg_eval = [] } in
   (* Validate well-formedness *)
   match is_well_formed_package txs with
-  | Error msg -> (PackageRejected msg, [])
+  | Error msg -> plain (PackageRejected msg, [])
   | Ok () ->
     (* Topologically sort *)
     match topo_sort txs with
-    | Error msg -> (PackageRejected msg, [])
+    | Error msg -> plain (PackageRejected msg, [])
     | Ok sorted ->
       (* BUG-6 fix: enforce IsChildWithParentsTree topology for multi-tx packages.
          Core rejects any package that is not child-with-parents-tree before
@@ -5613,7 +5939,7 @@ let accept_package_with_replaced (mp : mempool) (txs : Types.transaction list)
          Single-tx packages are exempted (equivalent to plain ATMP). *)
       let n_sorted = List.length sorted in
       (match (if n_sorted >= 2 then is_child_with_parents_tree sorted else Ok ()) with
-       | Error msg -> (PackageRejected msg, [])
+       | Error msg -> plain (PackageRejected msg, [])
        | Ok () ->
       (* Track UTXOs created by earlier transactions in the package *)
       let package_utxos = Hashtbl.create 16 in
@@ -5729,6 +6055,31 @@ let accept_package_with_replaced (mp : mempool) (txs : Types.transaction list)
           end
       ) fees_vsizes;
 
+      (* Package RBF (Core AcceptPackage -> AcceptMultipleTransactionsInternal
+         -> PackageRBFChecks).  The loop above is the individual pass.  When
+         every tx that needed validation failed there with a reconsiderable
+         error (so the pool is unchanged) and one of them conflicts with the
+         pool, evaluate them together as a single replacement. *)
+      let need_validation = List.filter_map (function
+        | `NeedValidation (tx, _, _) -> Some tx
+        | _ -> None) fees_vsizes in
+      let package_rbf_case =
+        List.length need_validation >= 2
+        && not (List.exists (function `Error _ -> true | _ -> false) fees_vsizes)
+        && List.length !rejected = List.length need_validation
+        && List.for_all (fun (_, msg) -> package_reconsiderable msg) !rejected
+        && List.exists (fun tx -> find_all_conflicts mp tx <> []) need_validation
+      in
+      let package_rbf_outcome =
+        if package_rbf_case then Some (package_rbf mp need_validation) else None in
+      (match package_rbf_outcome with
+       | Some (Package_rbf_accepted (entries, evicted)) ->
+         rejected := [];
+         accepted := List.rev_append entries !accepted;
+         List.iter (fun (txid : Types.hash256) ->
+           Hashtbl.replace evicted_union (Cstruct.to_string txid) txid) evicted
+       | Some (Package_rbf_failed _) | None -> ());
+
       let accepted_list = List.rev !accepted in
       let rejected_list = List.rev !rejected in
       let evicted_list =
@@ -5762,8 +6113,22 @@ let accept_package_with_replaced (mp : mempool) (txs : Types.transaction list)
          sites). *)
       Gc_guard.maybe_keep_up ~reason:"hot-path:package";
       Gc_guard.maybe_backstop ~reason:"hot-path:package";
-      (pkg_result, evicted_list)
+      (match package_rbf_outcome with
+       | Some (Package_rbf_failed msg) ->
+         { pkg_result = PackageRejected msg; pkg_replaced = [];
+           pkg_tx_errors = rejected_list; pkg_eval = [] }
+       | Some (Package_rbf_accepted (entries, _)) ->
+         { pkg_result; pkg_replaced = evicted_list; pkg_tx_errors = [];
+           pkg_eval = List.map (fun e -> e.txid) entries }
+       | None ->
+         { pkg_result; pkg_replaced = evicted_list; pkg_tx_errors = [];
+           pkg_eval = [] })
       )  (* end is_child_with_parents_tree match *)
+
+let accept_package_with_replaced (mp : mempool) (txs : Types.transaction list)
+    : package_result * Types.hash256 list =
+  let o = accept_package_full mp txs in
+  (o.pkg_result, o.pkg_replaced)
 
 (* Thin discard-wrapper: legacy [accept_package] callers (test suite +
    net-processing) that don't surface the evicted-txid list. *)

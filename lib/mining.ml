@@ -748,14 +748,16 @@ let template_to_json_simple (template : block_template) : Yojson.Safe.t =
    ============================================================================ *)
 
 (* Submit a mined block to the network.
-   Returns Ok() if the block is valid and was accepted.
+   Returns Ok Side_accepted if the block is valid and was connected,
+   Ok Side_inconclusive if it was stored on a side branch without being
+   connected (Core submitblock's "inconclusive"), Error on rejection.
    When [utxo] is provided, the block is connected through the atomic
    [connect_block_optimized] path so that UTXO mutations and the tip
    height are written in a single RocksDB WriteBatch. *)
-let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
+let submit_block_outcome ?(utxo : Utxo.OptimizedUtxoSet.t option)
     ?(network_type : Consensus.network = Consensus.Mainnet)
     (block : Types.block) (chain : Sync.chain_state)
-    (mp : Mempool.mempool) : (unit, string) result =
+    (mp : Mempool.mempool) : (Sync.side_branch_outcome, string) result =
   (* Gate 6: after AbortNode nothing connects (rpc.ml answers -25). *)
   if Fatal.is_latched () then
     Error (Fatal.rpc_prefix ^ "node halted: " ^ Fatal.reason ())
@@ -823,9 +825,8 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
            to a later [ActivateBestChain]. If the new chain has more
            work than the active tip, [reorganize] flips the tip;
            otherwise the side-branch is stored-but-inactive and the
-           BIP-22 result is "inconclusive" (rendered as Ok () here;
-           [bip22_of_submitblock_error] is not consulted on the
-           accept path).
+           BIP-22 result is "inconclusive" (Ok Side_inconclusive; the
+           RPC handler renders it).
            Counterpart to rustoshi 68a422b — see
            lib/sync.ml::try_attach_side_branch_and_reorg.
            Pre-fix this returned "Block does not build on validated tip",
@@ -1200,5 +1201,12 @@ let submit_block ?(utxo : Utxo.OptimizedUtxoSet.t option)
                 already-accepted block. *)
              (try Tip_notifier.notify () with _ -> ());
 
-             Ok ()))
+             Ok Sync.Side_accepted))
       end
+
+(* [submit_block_outcome] for callers that only need accepted-or-rejected
+   (generate*, generateblock, tests): a stored-but-unconnected side block
+   is not a rejection. *)
+let submit_block ?utxo ?network_type block chain mp : (unit, string) result =
+  Result.map (fun (_ : Sync.side_branch_outcome) -> ())
+    (submit_block_outcome ?utxo ?network_type block chain mp)

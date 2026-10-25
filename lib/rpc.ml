@@ -93,6 +93,11 @@ let rpc_verify_rejected = -26
    leaves this at 0. *)
 let test_sync_sleep_s = ref 0.0
 
+(* Test-only: seconds of CPU-bound-looking work (a blocking sleep) charged to
+   every block rescanblockchain visits, standing in for the per-block scan
+   cost of a mainnet-sized block.  Production leaves this at 0. *)
+let test_rescan_block_cost_s = ref 0.0
+
 let is_monitoring_rpc = function
   | "getblockcount" | "getbestblockhash" | "uptime" | "getrpcinfo" ->
     true
@@ -1590,6 +1595,149 @@ let canonical_mempool_reject_reason ~testmempoolaccept (msg : string) : string =
       (* Already a bare token or a token-prefixed detail string: pass through. *)
       msg
 
+(* Core ScriptErrorString (script/script_error.cpp) for the interpreter's own
+   error messages (lib/script.ml).  An unrecognised message is kept as is. *)
+let core_script_error_string (msg : string) : string =
+  let has_prefix p =
+    String.length msg >= String.length p
+    && String.sub msg 0 (String.length p) = p in
+  match msg with
+  | "Script returned false" | "P2SH: empty stack" ->
+    "Script evaluated without error but finished with a false/empty top stack element"
+  | "OP_VERIFY failed" -> "Script failed an OP_VERIFY operation"
+  | "OP_EQUALVERIFY failed" -> "Script failed an OP_EQUALVERIFY operation"
+  | "OP_CHECKMULTISIGVERIFY failed" ->
+    "Script failed an OP_CHECKMULTISIGVERIFY operation"
+  | "OP_CHECKSIGVERIFY failed" | "OP_CHECKSIGVERIFY failed (empty sig)"
+  | "OP_CHECKSIGVERIFY failed (empty sig in tapscript)" ->
+    "Script failed an OP_CHECKSIGVERIFY operation"
+  | "OP_NUMEQUALVERIFY failed" -> "Script failed an OP_NUMEQUALVERIFY operation"
+  | "Push data exceeds maximum size"
+  | "Witness item exceeds maximum element size" -> "Push value size limit exceeded"
+  | "Opcode limit exceeded" -> "Operation limit exceeded"
+  | "Stack overflow" | "Alt stack overflow" | "Tapscript initial stack too large" ->
+    "Stack size limit exceeded"
+  | "Invalid signature count" ->
+    "Signature count negative or greater than pubkey count"
+  | "Invalid pubkey count" -> "Pubkey count negative or limit exceeded"
+  | "Reserved opcode" | "OP_CHECKSIGADD is only valid in tapscript" ->
+    "Opcode missing or not understood"
+  | "Disabled opcode" -> "Attempted to use a disabled opcode"
+  | "Stack empty" | "Stack underflow" | "Invalid stack index" ->
+    "Operation not valid with the current stack size"
+  | "Alt stack empty" -> "Operation not valid with the current altstack size"
+  | "OP_RETURN" -> "OP_RETURN was encountered"
+  | "Unbalanced IF" | "OP_ELSE without OP_IF" | "OP_ENDIF without OP_IF" ->
+    "Invalid OP_IF construction"
+  | "Negative locktime" | "Negative sequence" -> "Negative locktime"
+  | "CLTV not satisfied" | "CLTV type mismatch" | "CLTV with final sequence"
+  | "CSV not satisfied" | "CSV type mismatch" | "CSV on disabled input"
+  | "CSV requires tx version >= 2" -> "Locktime requirement not satisfied"
+  | "CLTV argument too long" | "CSV argument too long" ->
+    "Script number overflowed or is non-minimally encoded"
+  | "Invalid hash type" -> "Signature hash type missing or not understood"
+  | "Non-strict DER signature" -> "Non-canonical DER signature"
+  | "Non-minimal push" -> "Data push larger than necessary"
+  | "SigPushOnly" | "scriptSig contains non-push opcode" ->
+    "Only push operators allowed in signatures"
+  | "Non-low-S signature" -> "Non-canonical signature: S value is unnecessarily high"
+  | "NULLDUMMY violation" -> "Dummy CHECKMULTISIG argument must be zero"
+  | "MINIMALIF: argument must be empty or 0x01" -> "OP_IF/NOTIF argument must be minimal"
+  | "Upgradable NOP used" -> "NOPx reserved for soft-fork upgrades"
+  | "Upgradable witness program used" | "Upgradable witness program in P2SH" ->
+    "Witness version reserved for soft-fork upgrades"
+  | "Discouraged unknown taproot leaf version" ->
+    "Taproot version reserved for soft-fork upgrades"
+  | "Discouraged OP_SUCCESS opcode in tapscript" ->
+    "OP_SUCCESSx reserved for soft-fork upgrades"
+  | "Discouraged unknown public key type in tapscript" ->
+    "Public key version reserved for soft-fork upgrades"
+  | "Invalid public key encoding" -> "Public key is neither compressed or uncompressed"
+  | "Cleanstack" | "Stack not clean after execution" ->
+    "Stack size must be exactly one after execution"
+  | "Witness v0 program must be exactly 20 or 32 bytes" ->
+    "Witness program has incorrect length"
+  | "Empty witness for P2WSH" | "Empty witness for taproot" ->
+    "Witness program was passed an empty witness"
+  | "P2WPKH requires exactly 2 witness items"
+  | "Taproot commitment verification failed" -> "Witness program hash mismatch"
+  | "scriptSig must be empty for native witness" | "scriptSig must be empty for taproot"
+  | "scriptSig must be empty for witness" | "scriptSig must be empty for witness program" ->
+    "Witness requires empty scriptSig"
+  | "WITNESS_MALLEATED: scriptSig is not a single push of redeemScript" ->
+    "Witness requires only-redeemscript scriptSig"
+  | "Unexpected witness data for non-witness script" ->
+    "Witness provided for non-witness script"
+  | "Witness requires compressed pubkey" | "Witness v0 requires compressed public key" ->
+    "Using non-compressed keys in segwit"
+  | "Invalid taproot key path signature length" | "Invalid tapscript signature length" ->
+    "Invalid Schnorr signature size"
+  | "Invalid hash_type 0x00 in 65-byte tapscript sig"
+  | "Invalid hash_type in 65-byte tapscript sig"
+  | "Invalid taproot hash type 0x00 in 65-byte signature"
+  | "Invalid taproot hash type in 65-byte signature"
+  | "OP_CHECKSIGADD SIGHASH_SINGLE without matching output"
+  | "Taproot SIGHASH_SINGLE without matching output"
+  | "Tapscript SIGHASH_SINGLE without matching output" ->
+    "Invalid Schnorr signature hash type"
+  | "OP_CHECKSIGADD Schnorr verification failed"
+  | "Taproot key path signature verification failed"
+  | "Tapscript OP_CHECKSIG Schnorr verification failed"
+  | "Tapscript OP_CHECKSIGVERIFY Schnorr verification failed" ->
+    "Invalid Schnorr signature"
+  | "Invalid control block size" | "Control block path too long" ->
+    "Invalid Taproot control block size"
+  | "Tapscript validation weight budget exceeded" ->
+    "Too much signature validation relative to witness weight"
+  | "OP_CHECKMULTISIG(VERIFY) is disabled in tapscript" ->
+    "OP_CHECKMULTISIG(VERIFY) is not available in tapscript"
+  | "Empty pubkey in tapscript OP_CHECKSIG" | "Empty pubkey in tapscript OP_CHECKSIGADD"
+  | "Empty pubkey in tapscript OP_CHECKSIGVERIFY" -> "Empty public key in tapscript"
+  | "CONST_SCRIPTCODE: OP_CODESEPARATOR in legacy script" ->
+    "Using OP_CODESEPARATOR in non-witness script"
+  | "CONST_SCRIPTCODE: find_and_delete modified scriptCode" ->
+    "Signature is found in scriptCode"
+  | _ ->
+    if has_prefix "NULLFAIL:" then
+      "Signature must be zero for failed CHECK(MULTI)SIG operation"
+    else if has_prefix "Bad opcode:" || has_prefix "Invalid opcode 0x" then
+      "Opcode missing or not understood"
+    else if has_prefix "Disabled opcode 0x" then "Attempted to use a disabled opcode"
+    else msg
+
+(* A mempool script failure in Core's form (validation.cpp CheckInputScripts
+   with the standard flags, which always include STANDARD_NOT_MANDATORY):
+   reason "mempool-script-verify-flag-failed (<ScriptErrorString>)", debug
+   "input N of <txid> (wtxid <wtxid>), spending <prevtxid>:<n>" (CScriptCheck).
+   Returns (GetRejectReason, ToString) for a script failure message of
+   Mempool.verify_tx_scripts, None for any other message. *)
+let core_script_reject (tx : Types.transaction) (msg : string)
+    : (string * string) option =
+  let strip p m =
+    let lp = String.length p in
+    if String.length m >= lp && String.sub m 0 lp = p
+    then String.sub m lp (String.length m - lp) else m in
+  let m = strip "witness-stripped: " msg in
+  let parsed =
+    try Some (Scanf.sscanf m "Script verification failed for input %d: %s@\n"
+                (fun i e -> (i, e)))
+    with _ ->
+      (try Some (Scanf.sscanf m "Script returned false for input %d%!"
+                   (fun i -> (i, "Script returned false")))
+       with _ -> None) in
+  match parsed with
+  | Some (i, err) when i >= 0 && i < List.length tx.Types.inputs ->
+    let reason = Printf.sprintf "mempool-script-verify-flag-failed (%s)"
+        (core_script_error_string err) in
+    let prev = (List.nth tx.Types.inputs i).Types.previous_output in
+    Some (reason,
+          Printf.sprintf "%s, input %d of %s (wtxid %s), spending %s:%ld"
+            reason i
+            (Types.hash256_to_hex_display (Crypto.compute_txid tx))
+            (Types.hash256_to_hex_display (Crypto.compute_wtxid tx))
+            (Types.hash256_to_hex_display prev.Types.txid) prev.Types.vout)
+  | _ -> None
+
 (* Default constants for sendrawtransaction *)
 let default_max_raw_tx_fee_rate = 0.10  (* 0.10 BTC/kvB *)
 let default_max_burn_amount = 0L        (* 0 BTC by default *)
@@ -1771,7 +1919,10 @@ let handle_getpeerinfo (ctx : rpc_context) : Yojson.Safe.t =
       ("minfeefilter", `Float 0.0);
       ("bytessent_per_msg", `Assoc []);
       ("bytesrecv_per_msg", `Assoc []);
-      ("connection_type", `String (if is_inbound then "inbound" else "outbound-full-relay"));
+      ("connection_type", `String (
+        match Peer_manager.find_peer_by_id ctx.peer_manager stats.Peer.stat_id with
+        | Some p -> Peer_manager.connection_type_of_peer p
+        | None -> if is_inbound then "inbound" else "outbound-full-relay"));
       ("transport_protocol_type", `String "v1");
       ("session_id", `String "");
     ] in
@@ -1903,8 +2054,28 @@ let handle_getnetworkinfo (ctx : rpc_context) : Yojson.Safe.t =
    Mempool Handlers
    ============================================================================ *)
 
+(* setmocktime timestamp -- Core rpc/node.cpp setmocktime (-regtest only).
+   0 returns to the system time.  Negative / non-integer-range values are
+   RPC_INVALID_PARAMETER; a non-regtest chain is a plain runtime_error (-1). *)
+let handle_setmocktime (ctx : rpc_context) (params : Yojson.Safe.t list)
+  : (Yojson.Safe.t, int * string) result =
+  if ctx.network.name <> "regtest" then
+    Error (rpc_misc_error,
+           "setmocktime is for regression testing (-regtest mode) only")
+  else
+    match params with
+    | [ `Int t ] when t >= 0 && t <= 9223372036 ->
+      Node_clock.set_mock_time (Int64.of_int t); Ok `Null
+    | [ `Intlit s ] ->
+      Error (rpc_invalid_parameter,
+             Printf.sprintf "Mocktime must be in the range [0, 9223372036], not %s." s)
+    | [ `Int t ] ->
+      Error (rpc_invalid_parameter,
+             Printf.sprintf "Mocktime must be in the range [0, 9223372036], not %d." t)
+    | _ -> Error (rpc_misc_error, "JSON value of type is not an integer as expected")
+
 let handle_getmempoolinfo (ctx : rpc_context) : Yojson.Safe.t =
-  let (count, weight, fees) = Mempool.get_info ctx.mempool in
+  let (count, _, fees) = Mempool.get_info ctx.mempool in
   (* Core MempoolInfoToJSON (mempool.cpp:1043) order:
        loaded, size, bytes, usage, total_fee, maxmempool, mempoolminfee,
        minrelaytxfee, incrementalrelayfee, unbroadcastcount, fullrbf,
@@ -1928,7 +2099,7 @@ let handle_getmempoolinfo (ctx : rpc_context) : Yojson.Safe.t =
     ("loaded", `Bool true);
     ("size", `Int count);
     ("bytes", `Int (Mempool.total_vsize ctx.mempool));
-    ("usage", `Int weight);
+    ("usage", `Int (Mempool.get_usage ctx.mempool));
     ("total_fee", `Float (Int64.to_float fees /. 100_000_000.0));
     ("maxmempool", `Int ctx.mempool.max_size_bytes);
     ("mempoolminfee", `Float mempoolminfee_btc);
@@ -2806,10 +2977,14 @@ let handle_submitblock (ctx : rpc_context)
      | None -> Error "Block decode failed"
      | Some block ->
     (try
-      match Mining.submit_block ?utxo:ctx.utxo
+      match Mining.submit_block_outcome ?utxo:ctx.utxo
               ~network_type:ctx.network.network_type
               block ctx.chain ctx.mempool with
-      | Ok () -> Ok `Null
+      | Ok Sync.Side_accepted -> Ok `Null
+      (* Stored on a side branch, never connected: Core's
+         submitblock_StateCatcher saw no BlockChecked for it, so
+         rpc/mining.cpp answers "inconclusive" (null would claim valid). *)
+      | Ok Sync.Side_inconclusive -> Ok (`String "inconclusive")
       (* Gate 6: a system fault is not a validation result.  Core answers
          a ProcessNewBlock failure that is not a BlockValidationState
          verdict with JSONRPCError(RPC_VERIFY_ERROR, ...) -- never a
@@ -4902,6 +5077,100 @@ let feerate_btc_per_kvb (fee_sats : int64) (vsize : int) : float =
   else Int64.to_float (Int64.div (Int64.mul fee_sats 1000L) (Int64.of_int vsize))
        /. 100_000_000.0
 
+(* testmempoolaccept with 2..MAX_PACKAGE_COUNT transactions: Core
+   rpc/mempool.cpp hands them to ProcessNewPackage(test_accept=true)
+   (Mempool.test_accept_package) and walks the results in array order.  A
+   package-wide PCKG_POLICY failure adds "package-error" to every entry; a tx
+   without a result (validation stopped earlier, or a preceding tx exceeded
+   maxfeerate) reports only txid and wtxid. *)
+let testmempoolaccept_package (ctx : rpc_context) (hexes : string list)
+    : (Yojson.Safe.t, string) result =
+  let rec decode acc = function
+    | [] -> Ok (List.rev acc)
+    | h :: rest ->
+      (match (try
+                let r = Serialize.reader_of_cstruct (Cstruct.of_hex h) in
+                Some (Serialize.deserialize_transaction r)
+              with _ -> None) with
+       | Some tx -> decode (tx :: acc) rest
+       | None ->
+         Error ("TX decode failed: " ^ h
+                ^ " Make sure the tx has at least one input."))
+  in
+  match decode [] hexes with
+  | Error e -> Error e
+  | Ok txs ->
+    let ids tx =
+      [ ("txid", `String (Types.hash256_to_hex_display (Crypto.compute_txid tx)));
+        ("wtxid", `String (Types.hash256_to_hex_display (Crypto.compute_wtxid tx))) ]
+    in
+    match Mempool.test_accept_package ctx.mempool txs with
+    | Error pkg_err ->
+      Ok (`List (List.map (fun tx ->
+          `Assoc (ids tx @ [ ("package-error", `String pkg_err) ])) txs))
+    | Ok outcomes ->
+      (* DEFAULT_MAX_RAW_TX_FEE_RATE (0.10 BTC/kvB), as CFeeRate::GetFee. *)
+      let max_fee_for vsize =
+        Int64.of_float (default_max_raw_tx_fee_rate *. 100_000_000.0)
+        |> fun per_kvb -> Int64.div (Int64.mul per_kvb (Int64.of_int vsize)) 1000L
+      in
+      let exit_early = ref false in
+      Ok (`List (List.map2 (fun tx outcome ->
+          if !exit_early then `Assoc (ids tx)
+          else match outcome with
+            | Mempool.TestUnfinished -> `Assoc (ids tx)
+            | Mempool.TestAccepted e ->
+              let vsize = (e.Mempool.weight + 3) / 4 in
+              let max_fee = max_fee_for vsize in
+              if max_fee > 0L && e.Mempool.fee > max_fee then begin
+                exit_early := true;
+                `Assoc (ids tx @ [ ("allowed", `Bool false);
+                                   ("reject-reason", `String "max-fee-exceeded") ])
+              end else
+                let wtxid_hex =
+                  Types.hash256_to_hex_display (Crypto.compute_wtxid tx) in
+                `Assoc (ids tx @ [
+                    ("allowed", `Bool true);
+                    ("vsize", `Int vsize);
+                    ("fees", `Assoc [
+                        ("base", `Float (Int64.to_float e.Mempool.fee /. 100_000_000.0));
+                        ("effective-feerate",
+                         `Float (feerate_btc_per_kvb e.Mempool.fee vsize));
+                        ("effective-includes", `List [`String wtxid_hex]);
+                      ]);
+                  ])
+            | Mempool.TestRejected msg ->
+              let reject =
+                match core_script_reject tx msg with
+                | Some (reason, details) ->
+                  [ ("reject-reason", `String reason);
+                    ("reject-details", `String details) ]
+                | None ->
+                  let fee_reason =
+                    List.find_opt (fun p ->
+                        String.length msg > String.length p
+                        && String.sub msg 0 (String.length p) = p)
+                      [ "min relay fee not met, "; "mempool min fee not met, " ] in
+                  (match fee_reason with
+                   | Some p ->
+                     [ ("reject-reason",
+                        `String (String.sub p 0 (String.length p - 2)));
+                       ("reject-details", `String msg) ]
+                   | None ->
+                     let reason =
+                       canonical_mempool_reject_reason ~testmempoolaccept:true msg in
+                     (* TX_MISSING_INPUTS: the bare literal, no details. *)
+                     if reason = "missing-inputs" then
+                       [ ("reject-reason", `String reason) ]
+                     else
+                       [ ("reject-reason", `String reason);
+                         ("reject-details",
+                          `String (canonical_mempool_reject_reason
+                                     ~testmempoolaccept:false msg)) ])
+              in
+              `Assoc (ids tx @ (("allowed", `Bool false) :: reject))
+        ) txs outcomes))
+
 let handle_testmempoolaccept (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
@@ -4940,6 +5209,15 @@ let handle_testmempoolaccept (ctx : rpc_context)
             ("effective-includes", `List [`String hex_wtxid]);
           ]);
         ]])
+      | Error msg when core_script_reject tx msg <> None ->
+        let (reason, details) = Option.get (core_script_reject tx msg) in
+        Ok (`List [`Assoc [
+          ("txid", `String hex_txid);
+          ("wtxid", `String hex_wtxid);
+          ("allowed", `Bool false);
+          ("reject-reason", `String reason);
+          ("reject-details", `String details);
+        ]])
       | Error msg ->
         Ok (`List [`Assoc ([ 
           ("txid", `String hex_txid);
@@ -4956,6 +5234,11 @@ let handle_testmempoolaccept (ctx : rpc_context)
              else []))])
     with exn ->
       Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn)))
+  | [`List ((_ :: _ :: _) as raw)]
+    when List.length raw <= Mempool.max_package_count
+      && List.for_all (function `String _ -> true | _ -> false) raw ->
+    testmempoolaccept_package ctx
+      (List.map (function `String h -> h | _ -> assert false) raw)
   | _ ->
     Error "Invalid parameters: expected [[rawtx]]"
 
@@ -5053,8 +5336,15 @@ let handle_submitpackage (ctx : rpc_context)
               evicted-txid union surfaces back into this handler — matches
               Core's PackageMempoolAcceptResult::m_replaced_transactions
               (validation.cpp:760, rpc/mempool.cpp:1500). *)
-           let (pkg_result, replaced_txids) =
-             Mempool.accept_package_with_replaced ctx.mempool txs in
+           let (pkg_result, replaced_txids, all_failed) =
+             Mempool.accept_package_detailed ctx.mempool txs in
+           (* Core MempoolAcceptResult::m_state.ToString() for a per-tx
+              failure: a script failure carries its input detail. *)
+           let tx_error_text tx msg =
+             match core_script_reject tx msg with
+             | Some (_, details) -> details
+             | None -> canonical_mempool_reject_reason ~testmempoolaccept:false msg
+           in
            (* Build a wtxid -> entry-or-error lookup *)
            let entry_by_wtxid_key : (string, Mempool.mempool_entry) Hashtbl.t =
              Hashtbl.create n in
@@ -5077,9 +5367,17 @@ let handle_submitpackage (ctx : rpc_context)
               List.iter (fun (tx, msg) ->
                 let wtxid = Crypto.compute_wtxid tx in
                 Hashtbl.replace error_by_wtxid_key
-                  (Cstruct.to_string wtxid)
-                  (canonical_mempool_reject_reason ~testmempoolaccept:false msg)
+                  (Cstruct.to_string wtxid) (tx_error_text tx msg)
               ) rejected
+            | Mempool.PackageRejected _ when all_failed <> [] ->
+              (* Every tx failed on its own: still PCKG_TX, and each one
+                 reports its own error (Core fills every m_tx_results). *)
+              package_msg := "transaction failed";
+              List.iter (fun (tx, msg) ->
+                Hashtbl.replace error_by_wtxid_key
+                  (Cstruct.to_string (Crypto.compute_wtxid tx))
+                  (tx_error_text tx msg)
+              ) all_failed
             | Mempool.PackageRejected msg ->
               package_msg := msg);
 
@@ -11012,8 +11310,10 @@ let scantxoutset_resolve (scanobjects : Yojson.Safe.t list)
 
    Returns: { "start_height", "stop_height" } (Core shape), having credited
    every wallet-owned output found in the range. *)
-let handle_rescanblockchain (ctx : rpc_context)
-    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+(* Validate rescanblockchain's arguments.  Shared by the synchronous handler
+   and the sliced Lwt one, so the two cannot drift apart. *)
+let rescan_prepare (ctx : rpc_context) (params : Yojson.Safe.t list)
+    : (Wallet.t * int * int, string) result =
   match ctx.wallet with
   | None -> Error "Wallet not loaded"
   | Some wallet ->
@@ -11047,32 +11347,125 @@ let handle_rescanblockchain (ctx : rpc_context)
         Error "Invalid stop_height"
       else if stop_height < start_height then
         Error "stop_height must be greater than start_height"
-      else begin
-        (* A from-scratch rescan (start at genesis) rebuilds the whole ledger:
-           clear the chain-derived UTXO/history state first so re-applying the
-           range does not double-count. A partial rescan (start_height > 0)
-           leaves the existing ledger in place and relies on scan_block's
-           {txid,vout} idempotency. *)
-        if start_height = 0 then Wallet.clear_for_rescan wallet;
-        (* Walk the active chain by height, re-applying each block through the
-           same scan logic the block-connect hook uses. Heights with no block
-           body persisted (assume-valid IBD does not store bodies) are skipped;
-           on regtest / a fully-synced node every block body is present. *)
-        for h = start_height to stop_height do
-          match Sync.get_header_at_height ctx.chain h with
-          | None -> ()
-          | Some entry ->
-            (match Storage.ChainDB.get_block ctx.chain.db entry.Sync.hash with
-             | None -> ()
-             | Some block -> Wallet.scan_block wallet block h)
-        done;
-        (* Persist the rebuilt ledger so it survives restart. *)
-        (try Wallet.save wallet with _ -> ());
-        Ok (`Assoc [
-          ("start_height", `Int start_height);
-          ("stop_height", `Int stop_height);
-        ])
-      end
+      else Ok (wallet, start_height, stop_height)
+
+(* Walk the active chain by height, re-applying one block through the same
+   scan logic the block-connect hook uses.  Heights with no block body
+   persisted (assume-valid IBD does not store bodies) are skipped; on regtest
+   / a fully-synced node every block body is present.  Returns the hash of
+   the block scanned, if any. *)
+let rescan_one (ctx : rpc_context) (wallet : Wallet.t) (h : int)
+    : Types.hash256 option =
+  if !test_rescan_block_cost_s > 0. then
+    Unix.sleepf !test_rescan_block_cost_s;
+  match Sync.get_header_at_height ctx.chain h with
+  | None -> None
+  | Some entry ->
+    (match Storage.ChainDB.get_block ctx.chain.db entry.Sync.hash with
+     | None -> None
+     | Some block -> Wallet.scan_block wallet block h; Some entry.Sync.hash)
+
+let rescan_result start_height stop_height =
+  `Assoc [
+    ("start_height", `Int start_height);
+    ("stop_height", `Int stop_height);
+  ]
+
+let handle_rescanblockchain (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match rescan_prepare ctx params with
+  | Error e -> Error e
+  | Ok (wallet, start_height, stop_height) ->
+    (* A from-scratch rescan (start at genesis) rebuilds the whole ledger:
+       clear the chain-derived UTXO/history state first so re-applying the
+       range does not double-count. A partial rescan (start_height > 0)
+       leaves the existing ledger in place and relies on scan_block's
+       {txid,vout} idempotency.  Nothing can interleave: this runs in one
+       synchronous step. *)
+    if start_height = 0 then Wallet.clear_for_rescan wallet;
+    for h = start_height to stop_height do
+      ignore (rescan_one ctx wallet h)
+    done;
+    (* Persist the rebuilt ledger so it survives restart. *)
+    (try Wallet.save wallet with _ -> ());
+    Ok (rescan_result start_height stop_height)
+
+(* Wall-clock a rescan slice may hold the Lwt main thread before yielding to
+   P2P handling, validation and the monitoring RPCs. *)
+let rescan_slice_s = 0.020
+
+(* The same scan, sliced: it runs on the Lwt main thread (it is a chain-lock
+   writer, holding [rpc_lwt_mutex], so no other RPC interleaves) but yields
+   every [rescan_slice_s].  The block-connect hooks and the startup reconcile
+   do run between slices, so the scan rebuilds a shadow ledger
+   ([Wallet.rescan_begin]) and the live wallet stays whole and keeps following
+   the chain until the shadow is committed:
+   - the range [start, stop] is fixed by [rescan_prepare]; blocks connected
+     above stop meanwhile are replayed onto the shadow, in order, at commit;
+   - a slice is atomic (no yield inside it); before each one the last block
+     scanned is re-checked against the active chain, and the hooks flag any
+     disconnect at a scanned height.  Either way (reorg: every height above
+     the fork changes with it) the shadow is dropped and the rescan returns
+     an error rather than installing a mix of two branches;
+   - [Wallet.rebuild_lock] keeps the startup reconcile, which writes the live
+     ledger in place, from running while the shadow is being built. *)
+let handle_rescanblockchain_lwt (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result Lwt.t =
+  match rescan_prepare ctx params with
+  | Error e -> Lwt.return (Error e)
+  | Ok (wallet, start_height, stop_height) ->
+    Lwt_mutex.with_lock (Wallet.rebuild_lock wallet) @@ fun () ->
+    let rs = Wallet.rescan_begin wallet ~start_height ~stop_height in
+    let is_active = function
+      | Some (lh, lhash) ->
+        (match Storage.ChainDB.get_hash_at_height ctx.chain.db lh with
+         | Some cur -> Cstruct.equal cur lhash
+         | None -> false)
+      | None -> true in
+    let reorg_error h =
+      Error (Printf.sprintf
+               "Chain reorganized during rescan (height %d changed); \
+                rerun rescanblockchain" h) in
+    let rec go h last =
+      let failed_at =
+        match rs.Wallet.rs_stale with
+        | Some sh -> Some sh
+        | None when not (is_active last) ->
+          (match last with Some (lh, _) -> Some lh | None -> Some h)
+        | None -> None in
+      match failed_at with
+      | Some fh ->
+        Wallet.rescan_unregister rs;
+        Lwt.return (reorg_error fh)
+      | None when h > stop_height ->
+        (match Wallet.rescan_commit rs ~still_active:(is_active last) with
+         | Ok () ->
+           (try Wallet.save wallet with _ -> ());
+           Lwt.return (Ok (rescan_result start_height stop_height))
+         | Error fh ->
+           let fh = match fh, last with
+             | Some fh, _ -> fh | None, Some (lh, _) -> lh | None, None -> h in
+           Lwt.return (reorg_error fh))
+      | None ->
+        Wallet.rescan_sync_ownership rs;
+        let t0 = Unix.gettimeofday () in
+        let rec slice h last =
+          if h > stop_height then (h, last)
+          else begin
+            let last =
+              match rescan_one ctx rs.Wallet.rs_ledger h with
+              | Some hash -> Some (h, hash)
+              | None -> last in
+            Wallet.rescan_advance rs (h + 1);
+            if Unix.gettimeofday () -. t0 >= rescan_slice_s then (h + 1, last)
+            else slice (h + 1) last
+          end in
+        let (h', last') = slice h last in
+        if h' > stop_height then go h' last'
+        else Lwt.bind (Lwt.pause ()) (fun () -> go h' last')
+    in
+    Lwt.catch (fun () -> go start_height None)
+      (fun exn -> Wallet.rescan_unregister rs; Lwt.fail exn)
 
 (* ============================================================================
    importprivkey "privkey" ( "label" rescan )
@@ -12728,6 +13121,7 @@ let help_sections : (string * string list) list = [
     "getrpcinfo";
     "help ( \"command\" )";
     "logging ( [\"include_category\",...] [\"exclude_category\",...] )";
+    "setmocktime timestamp";
     "stop";
     "uptime";
   ]);
@@ -15806,6 +16200,7 @@ let dispatch_rpc (ctx : rpc_context)
     handle_getaddednodeinfo ctx params
 
   (* Mempool *)
+  | "setmocktime" -> handle_setmocktime ctx params
   | "getmempoolinfo" ->
     Ok (handle_getmempoolinfo ctx)
   | "getrawmempool" ->
@@ -16486,6 +16881,24 @@ let handle_single_request_lwt (ctx : rpc_context) (json : Yojson.Safe.t)
          (fun exn ->
            Lwt.return (json_rpc_error ~id ~code:rpc_misc_error
                          ~message:(Printexc.to_string exn))))
+  | None when method_name = "rescanblockchain" ->
+    (* Chain-lock writer, but it walks the whole chain: run it on the Lwt
+       thread in slices (handle_rescanblockchain_lwt), holding the RPC mutex
+       so it stays serialised against every other handler. *)
+    (match check_core_arity method_name params with
+     | Some (code, message) -> Lwt.return (json_rpc_error ~id ~code ~message)
+     | None ->
+       Lwt_mutex.with_lock rpc_lwt_mutex (fun () ->
+         Lwt.catch
+           (fun () ->
+             Lwt.map (function
+               | Ok r -> json_rpc_response ~id ~result:r
+               | Error msg ->
+                 json_rpc_error ~id ~code:rpc_misc_error ~message:msg)
+               (handle_rescanblockchain_lwt ctx params))
+           (fun exn ->
+             Lwt.return (json_rpc_error ~id ~code:rpc_misc_error
+                           ~message:(Printexc.to_string exn)))))
   | None ->
     (* Monitoring RPCs stay on the Lwt loop so a slow handler cannot make
        getblockcount look DOWN. Everything else runs on the preemptive

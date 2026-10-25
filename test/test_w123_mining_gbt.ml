@@ -235,10 +235,16 @@ let test_g9d_eviction_uses_raw_chunk_fee_rate () =
      once per trim and evict worst-first from it (GC-churn fix), so the
      binding is now [chunk] inside the batch loop rather than [worst_chunk].
      The documented BUG-1 property is unchanged: the rolling-min-fee bump
-     still reads the RAW chunk_fee_rate (not the modified fee). *)
+     still reads the RAW fee (e.fee, not the modified fee).  -maxmempool work
+     replaced the `chunk_fee_rate *. 4.0 *. 1000.0` conversion (sat/vB treated
+     as sat/WU, 4x too high) with sum(e.fee) over the sigop-adjusted vsize. *)
   Alcotest.(check bool)
-    "BUG-1.9d (pre-fix): rolling-min-fee bump reads chunk.chunk_fee_rate"
+    "BUG-1.9d (pre-fix): rolling-min-fee bump reads raw e.fee"
     true (contains_substring src
+            "Int64.to_float fee_sum *. 1000.0 /. float_of_int (max 1 vsize_sum)");
+  Alcotest.(check bool)
+    "BUG-1.9d: the 4x sat/WU conversion is gone"
+    false (contains_substring src
             "let evicted_fee_rate_kvb = chunk.chunk_fee_rate *. 4.0 *. 1000.0 in")
 
 (* 9e — informational: template_to_json per-tx `fee` field IS raw fee,

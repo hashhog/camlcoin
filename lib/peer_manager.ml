@@ -513,10 +513,20 @@ let peer_count (pm : t) : int =
 let ready_peer_count (pm : t) : int =
   List.length (get_ready_peers pm)
 
-(* Count outbound peers *)
+(* Count FULL-RELAY outbound peers.  Block-relay-only peers are a separate
+   budget (Core net.h MAX_OUTBOUND_FULL_RELAY_CONNECTIONS = 8,
+   MAX_BLOCK_RELAY_ONLY_CONNECTIONS = 2, counted independently in
+   ThreadOpenConnections).  Counting them here made the 2 block-relay slots
+   eat 2 of the 8 full-relay slots, so mainnet held 6 full-relay + 2 BRO. *)
 let outbound_peer_count (pm : t) : int =
   List.length (List.filter (fun p ->
-    p.Peer.direction = Peer.Outbound) pm.peers)
+    p.Peer.direction = Peer.Outbound && not p.Peer.block_relay_only) pm.peers)
+
+(* getpeerinfo connection_type (Core ConnectionTypeAsString). *)
+let connection_type_of_peer (p : Peer.peer) : string =
+  if p.Peer.direction = Peer.Inbound then "inbound"
+  else if p.Peer.block_relay_only then "block-relay-only"
+  else "outbound-full-relay"
 
 (* Count inbound peers *)
 let inbound_peer_count (pm : t) : int =
@@ -3408,6 +3418,7 @@ let maintain_connections (pm : t) : unit Lwt.t =
             (* Count active outbound connections *)
             let active_outbound = List.filter (fun p ->
               p.Peer.state = Peer.Ready && p.Peer.direction = Peer.Outbound
+              && not p.Peer.block_relay_only
             ) pm.peers in
             let needed = pm.config.max_outbound - List.length active_outbound in
             (* Try to connect to more peers if needed *)

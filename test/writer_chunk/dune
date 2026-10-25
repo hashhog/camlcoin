@@ -1,0 +1,5 @@
+; Writer RPCs chunked off the Lwt main thread (camlcoin-writer-rpcs-off-lwt).
+; Own directory so the shared test/dune names list is untouched.
+(test
+ (name test_writer_chunk)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix))

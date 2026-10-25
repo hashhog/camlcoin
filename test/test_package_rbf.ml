@@ -95,11 +95,16 @@ let tx_hex (t : Types.transaction) =
 let conflict_fee = 20_000L
 let descendant_fee = 1_000L
 
-(* O (600 cheap outputs, fee 20_000) and D (O's child, fee 1_000). *)
+(* OP_HASH160 <20 bytes> OP_EQUAL: the harness pays O's outputs to a P2SH
+   script, 32 bytes per output, which sets O's feerate (~1.04 sat/vB). *)
+let p2sh =
+  Cstruct.of_string ("\xa9\x14" ^ String.make 20 '\x00' ^ "\x87")
+
+(* O (600 cheap P2SH outputs, fee 20_000) and D (O's child, fee 1_000). *)
 let conflict_pair ~coin =
   let o_change = Int64.sub coin_value
       (Int64.add conflict_fee (Int64.mul 600L output_sats)) in
-  let o = tx ~ins:[ (coin, 0) ] ~change:o_change ~spk:op_true ~n:600 in
+  let o = tx ~ins:[ (coin, 0) ] ~change:o_change ~spk:p2sh ~n:600 in
   let d = tx ~ins:[ (txid o, 0) ] ~change:(Int64.sub o_change descendant_fee)
       ~spk:op_true ~n:0 in
   (o, d)

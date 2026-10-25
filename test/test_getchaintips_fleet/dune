@@ -1,0 +1,6 @@
+; getchaintips parity with Core (fleet item done-fleet-regtest-getchaintips).
+; Own directory and stanza so it does not touch the shared names list in
+; test/dune.
+(test
+ (name test_getchaintips_fleet)
+ (libraries camlcoin test_tmp alcotest yojson cstruct))

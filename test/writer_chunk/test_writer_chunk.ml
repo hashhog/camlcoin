@@ -220,8 +220,10 @@ let test_connect_mid_rescan () =
         Lwt.map (fun r -> resp := r)
           (Rpc.handle_single_request_lwt fx.ctx (rescan_json ())) in
       let connect =
-        let* () = Lwt_unix.sleep 0.1 in   (* rescan is under way *)
-        let t0 = Unix.gettimeofday () in
+        (* due 0.1 s in, while the rescan is under way; latency is counted
+           from when it was DUE, so a loop the rescan holds shows up *)
+        let t0 = Unix.gettimeofday () +. 0.1 in
+        let* () = Lwt_unix.sleep 0.1 in
         let* r = Sync.process_new_block ~f_requested:true fx.state b in
         connect_dt := Unix.gettimeofday () -. t0;
         (match r with Ok () -> () | Error e -> Alcotest.failf "connect: %s" e);

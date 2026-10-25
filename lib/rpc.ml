@@ -93,6 +93,11 @@ let rpc_verify_rejected = -26
    leaves this at 0. *)
 let test_sync_sleep_s = ref 0.0
 
+(* Test-only: seconds of CPU-bound-looking work (a blocking sleep) charged to
+   every block rescanblockchain visits, standing in for the per-block scan
+   cost of a mainnet-sized block.  Production leaves this at 0. *)
+let test_rescan_block_cost_s = ref 0.0
+
 let is_monitoring_rpc = function
   | "getblockcount" | "getbestblockhash" | "uptime" | "getrpcinfo" ->
     true
@@ -11352,6 +11357,8 @@ let handle_rescanblockchain (ctx : rpc_context)
            body persisted (assume-valid IBD does not store bodies) are skipped;
            on regtest / a fully-synced node every block body is present. *)
         for h = start_height to stop_height do
+          if !test_rescan_block_cost_s > 0. then
+            Unix.sleepf !test_rescan_block_cost_s;
           match Sync.get_header_at_height ctx.chain h with
           | None -> ()
           | Some entry ->

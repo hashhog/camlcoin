@@ -11310,9 +11310,8 @@ let scantxoutset_resolve (scanobjects : Yojson.Safe.t list)
 
    Returns: { "start_height", "stop_height" } (Core shape), having credited
    every wallet-owned output found in the range. *)
-(* Validate rescanblockchain's arguments and clear the ledger for a
-   from-genesis scan.  Shared by the synchronous handler and the sliced Lwt
-   one, so the two cannot drift apart. *)
+(* Validate rescanblockchain's arguments.  Shared by the synchronous handler
+   and the sliced Lwt one, so the two cannot drift apart. *)
 let rescan_prepare (ctx : rpc_context) (params : Yojson.Safe.t list)
     : (Wallet.t * int * int, string) result =
   match ctx.wallet with
@@ -11348,15 +11347,7 @@ let rescan_prepare (ctx : rpc_context) (params : Yojson.Safe.t list)
         Error "Invalid stop_height"
       else if stop_height < start_height then
         Error "stop_height must be greater than start_height"
-      else begin
-        (* A from-scratch rescan (start at genesis) rebuilds the whole ledger:
-           clear the chain-derived UTXO/history state first so re-applying the
-           range does not double-count. A partial rescan (start_height > 0)
-           leaves the existing ledger in place and relies on scan_block's
-           {txid,vout} idempotency. *)
-        if start_height = 0 then Wallet.clear_for_rescan wallet;
-        Ok (wallet, start_height, stop_height)
-      end
+      else Ok (wallet, start_height, stop_height)
 
 (* Walk the active chain by height, re-applying one block through the same
    scan logic the block-connect hook uses.  Heights with no block body
@@ -11385,6 +11376,13 @@ let handle_rescanblockchain (ctx : rpc_context)
   match rescan_prepare ctx params with
   | Error e -> Error e
   | Ok (wallet, start_height, stop_height) ->
+    (* A from-scratch rescan (start at genesis) rebuilds the whole ledger:
+       clear the chain-derived UTXO/history state first so re-applying the
+       range does not double-count. A partial rescan (start_height > 0)
+       leaves the existing ledger in place and relies on scan_block's
+       {txid,vout} idempotency.  Nothing can interleave: this runs in one
+       synchronous step. *)
+    if start_height = 0 then Wallet.clear_for_rescan wallet;
     for h = start_height to stop_height do
       ignore (rescan_one ctx wallet h)
     done;
@@ -11397,61 +11395,77 @@ let handle_rescanblockchain (ctx : rpc_context)
 let rescan_slice_s = 0.020
 
 (* The same scan, sliced: it runs on the Lwt main thread (it is a chain-lock
-   writer, so wallet mutation stays atomic w.r.t. every connect path) but
-   yields every [rescan_slice_s].  Consistency between slices:
-   - the range [start, stop] is fixed by [rescan_prepare] at the first slice,
-     so a block connecting meanwhile is not part of it; the block-connect
-     wallet hook scans that block itself, and scan_block is idempotent on
-     {txid,vout}, so nothing is missed or double-credited;
-   - the caller holds [rpc_lwt_mutex] for the whole scan, so no other RPC
-     sees the half-rebuilt wallet or mutates it;
+   writer, holding [rpc_lwt_mutex], so no other RPC interleaves) but yields
+   every [rescan_slice_s].  The block-connect hooks and the startup reconcile
+   do run between slices, so the scan rebuilds a shadow ledger
+   ([Wallet.rescan_begin]) and the live wallet stays whole and keeps following
+   the chain until the shadow is committed:
+   - the range [start, stop] is fixed by [rescan_prepare]; blocks connected
+     above stop meanwhile are replayed onto the shadow, in order, at commit;
    - a slice is atomic (no yield inside it); before each one the last block
-     scanned is re-checked against the active chain, and if it is no longer
-     there (reorg: every height above the fork changes with it) the rescan
-     stops with an error rather than scanning a mix of two branches. *)
+     scanned is re-checked against the active chain, and the hooks flag any
+     disconnect at a scanned height.  Either way (reorg: every height above
+     the fork changes with it) the shadow is dropped and the rescan returns
+     an error rather than installing a mix of two branches;
+   - [Wallet.rebuild_lock] keeps the startup reconcile, which writes the live
+     ledger in place, from running while the shadow is being built. *)
 let handle_rescanblockchain_lwt (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result Lwt.t =
   match rescan_prepare ctx params with
   | Error e -> Lwt.return (Error e)
   | Ok (wallet, start_height, stop_height) ->
-    let rec go h last =
-      if h > stop_height then begin
-        (try Wallet.save wallet with _ -> ());
-        Lwt.return (Ok (rescan_result start_height stop_height))
-      end else begin
-        let stale =
-          match last with
-          | Some (lh, lhash) ->
-            (match Storage.ChainDB.get_hash_at_height ctx.chain.db lh with
-             | Some cur -> not (Cstruct.equal cur lhash)
-             | None -> true)
-          | None -> false
-        in
-        if stale then
-          Lwt.return (Error
-            (Printf.sprintf
+    Lwt_mutex.with_lock (Wallet.rebuild_lock wallet) @@ fun () ->
+    let rs = Wallet.rescan_begin wallet ~start_height ~stop_height in
+    let is_active = function
+      | Some (lh, lhash) ->
+        (match Storage.ChainDB.get_hash_at_height ctx.chain.db lh with
+         | Some cur -> Cstruct.equal cur lhash
+         | None -> false)
+      | None -> true in
+    let reorg_error h =
+      Error (Printf.sprintf
                "Chain reorganized during rescan (height %d changed); \
-                rerun rescanblockchain" (match last with
-                                         | Some (lh, _) -> lh | None -> h)))
-        else begin
-          let t0 = Unix.gettimeofday () in
-          let rec slice h last =
-            if h > stop_height then (h, last)
-            else begin
-              let last =
-                match rescan_one ctx wallet h with
-                | Some hash -> Some (h, hash)
-                | None -> last in
-              if Unix.gettimeofday () -. t0 >= rescan_slice_s then (h + 1, last)
-              else slice (h + 1) last
-            end in
-          let (h', last') = slice h last in
-          if h' > stop_height then go h' last'
-          else Lwt.bind (Lwt.pause ()) (fun () -> go h' last')
-        end
-      end
+                rerun rescanblockchain" h) in
+    let rec go h last =
+      let failed_at =
+        match rs.Wallet.rs_stale with
+        | Some sh -> Some sh
+        | None when not (is_active last) ->
+          (match last with Some (lh, _) -> Some lh | None -> Some h)
+        | None -> None in
+      match failed_at with
+      | Some fh ->
+        Wallet.rescan_unregister rs;
+        Lwt.return (reorg_error fh)
+      | None when h > stop_height ->
+        (match Wallet.rescan_commit rs ~still_active:(is_active last) with
+         | Ok () ->
+           (try Wallet.save wallet with _ -> ());
+           Lwt.return (Ok (rescan_result start_height stop_height))
+         | Error fh ->
+           let fh = match fh, last with
+             | Some fh, _ -> fh | None, Some (lh, _) -> lh | None, None -> h in
+           Lwt.return (reorg_error fh))
+      | None ->
+        Wallet.rescan_sync_ownership rs;
+        let t0 = Unix.gettimeofday () in
+        let rec slice h last =
+          if h > stop_height then (h, last)
+          else begin
+            let last =
+              match rescan_one ctx rs.Wallet.rs_ledger h with
+              | Some hash -> Some (h, hash)
+              | None -> last in
+            Wallet.rescan_advance rs (h + 1);
+            if Unix.gettimeofday () -. t0 >= rescan_slice_s then (h + 1, last)
+            else slice (h + 1) last
+          end in
+        let (h', last') = slice h last in
+        if h' > stop_height then go h' last'
+        else Lwt.bind (Lwt.pause ()) (fun () -> go h' last')
     in
-    go start_height None
+    Lwt.catch (fun () -> go start_height None)
+      (fun exn -> Wallet.rescan_unregister rs; Lwt.fail exn)
 
 (* ============================================================================
    importprivkey "privkey" ( "label" rescan )

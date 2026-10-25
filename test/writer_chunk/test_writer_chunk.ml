@@ -216,19 +216,21 @@ let test_connect_mid_rescan () =
     let resp = ref `Null in
     Lwt_main.run (
       let open Lwt.Syntax in
+      (* The connect's timer is armed BEFORE the rescan is started: the
+         rescan call runs synchronously up to its first yield, so on a build
+         that never yields it holds the loop past the due time.  Latency is
+         counted from when the connect was DUE. *)
+      let t_due = Unix.gettimeofday () +. 0.1 in
+      let connect =
+        let* () = Lwt_unix.sleep 0.1 in
+        let* r = Sync.process_new_block ~f_requested:true fx.state b in
+        connect_dt := Unix.gettimeofday () -. t_due;
+        (match r with Ok () -> () | Error e -> Alcotest.failf "connect: %s" e);
+        Lwt.return_unit in
       let rescan =
         Lwt.map (fun r -> resp := r)
           (Rpc.handle_single_request_lwt fx.ctx (rescan_json ())) in
-      let connect =
-        (* due 0.1 s in, while the rescan is under way; latency is counted
-           from when it was DUE, so a loop the rescan holds shows up *)
-        let t0 = Unix.gettimeofday () +. 0.1 in
-        let* () = Lwt_unix.sleep 0.1 in
-        let* r = Sync.process_new_block ~f_requested:true fx.state b in
-        connect_dt := Unix.gettimeofday () -. t0;
-        (match r with Ok () -> () | Error e -> Alcotest.failf "connect: %s" e);
-        Lwt.return_unit in
-      Lwt.join [ rescan; connect ]);
+      Lwt.join [ connect; rescan ]);
     Printf.printf "  P2P connect mid-rescan: %.3fs\n%!" !connect_dt;
     Alcotest.(check int) "block connected" (n_blocks + 1)
       fx.state.Sync.blocks_synced;

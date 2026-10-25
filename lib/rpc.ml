@@ -1590,6 +1590,149 @@ let canonical_mempool_reject_reason ~testmempoolaccept (msg : string) : string =
       (* Already a bare token or a token-prefixed detail string: pass through. *)
       msg
 
+(* Core ScriptErrorString (script/script_error.cpp) for the interpreter's own
+   error messages (lib/script.ml).  An unrecognised message is kept as is. *)
+let core_script_error_string (msg : string) : string =
+  let has_prefix p =
+    String.length msg >= String.length p
+    && String.sub msg 0 (String.length p) = p in
+  match msg with
+  | "Script returned false" | "P2SH: empty stack" ->
+    "Script evaluated without error but finished with a false/empty top stack element"
+  | "OP_VERIFY failed" -> "Script failed an OP_VERIFY operation"
+  | "OP_EQUALVERIFY failed" -> "Script failed an OP_EQUALVERIFY operation"
+  | "OP_CHECKMULTISIGVERIFY failed" ->
+    "Script failed an OP_CHECKMULTISIGVERIFY operation"
+  | "OP_CHECKSIGVERIFY failed" | "OP_CHECKSIGVERIFY failed (empty sig)"
+  | "OP_CHECKSIGVERIFY failed (empty sig in tapscript)" ->
+    "Script failed an OP_CHECKSIGVERIFY operation"
+  | "OP_NUMEQUALVERIFY failed" -> "Script failed an OP_NUMEQUALVERIFY operation"
+  | "Push data exceeds maximum size"
+  | "Witness item exceeds maximum element size" -> "Push value size limit exceeded"
+  | "Opcode limit exceeded" -> "Operation limit exceeded"
+  | "Stack overflow" | "Alt stack overflow" | "Tapscript initial stack too large" ->
+    "Stack size limit exceeded"
+  | "Invalid signature count" ->
+    "Signature count negative or greater than pubkey count"
+  | "Invalid pubkey count" -> "Pubkey count negative or limit exceeded"
+  | "Reserved opcode" | "OP_CHECKSIGADD is only valid in tapscript" ->
+    "Opcode missing or not understood"
+  | "Disabled opcode" -> "Attempted to use a disabled opcode"
+  | "Stack empty" | "Stack underflow" | "Invalid stack index" ->
+    "Operation not valid with the current stack size"
+  | "Alt stack empty" -> "Operation not valid with the current altstack size"
+  | "OP_RETURN" -> "OP_RETURN was encountered"
+  | "Unbalanced IF" | "OP_ELSE without OP_IF" | "OP_ENDIF without OP_IF" ->
+    "Invalid OP_IF construction"
+  | "Negative locktime" | "Negative sequence" -> "Negative locktime"
+  | "CLTV not satisfied" | "CLTV type mismatch" | "CLTV with final sequence"
+  | "CSV not satisfied" | "CSV type mismatch" | "CSV on disabled input"
+  | "CSV requires tx version >= 2" -> "Locktime requirement not satisfied"
+  | "CLTV argument too long" | "CSV argument too long" ->
+    "Script number overflowed or is non-minimally encoded"
+  | "Invalid hash type" -> "Signature hash type missing or not understood"
+  | "Non-strict DER signature" -> "Non-canonical DER signature"
+  | "Non-minimal push" -> "Data push larger than necessary"
+  | "SigPushOnly" | "scriptSig contains non-push opcode" ->
+    "Only push operators allowed in signatures"
+  | "Non-low-S signature" -> "Non-canonical signature: S value is unnecessarily high"
+  | "NULLDUMMY violation" -> "Dummy CHECKMULTISIG argument must be zero"
+  | "MINIMALIF: argument must be empty or 0x01" -> "OP_IF/NOTIF argument must be minimal"
+  | "Upgradable NOP used" -> "NOPx reserved for soft-fork upgrades"
+  | "Upgradable witness program used" | "Upgradable witness program in P2SH" ->
+    "Witness version reserved for soft-fork upgrades"
+  | "Discouraged unknown taproot leaf version" ->
+    "Taproot version reserved for soft-fork upgrades"
+  | "Discouraged OP_SUCCESS opcode in tapscript" ->
+    "OP_SUCCESSx reserved for soft-fork upgrades"
+  | "Discouraged unknown public key type in tapscript" ->
+    "Public key version reserved for soft-fork upgrades"
+  | "Invalid public key encoding" -> "Public key is neither compressed or uncompressed"
+  | "Cleanstack" | "Stack not clean after execution" ->
+    "Stack size must be exactly one after execution"
+  | "Witness v0 program must be exactly 20 or 32 bytes" ->
+    "Witness program has incorrect length"
+  | "Empty witness for P2WSH" | "Empty witness for taproot" ->
+    "Witness program was passed an empty witness"
+  | "P2WPKH requires exactly 2 witness items"
+  | "Taproot commitment verification failed" -> "Witness program hash mismatch"
+  | "scriptSig must be empty for native witness" | "scriptSig must be empty for taproot"
+  | "scriptSig must be empty for witness" | "scriptSig must be empty for witness program" ->
+    "Witness requires empty scriptSig"
+  | "WITNESS_MALLEATED: scriptSig is not a single push of redeemScript" ->
+    "Witness requires only-redeemscript scriptSig"
+  | "Unexpected witness data for non-witness script" ->
+    "Witness provided for non-witness script"
+  | "Witness requires compressed pubkey" | "Witness v0 requires compressed public key" ->
+    "Using non-compressed keys in segwit"
+  | "Invalid taproot key path signature length" | "Invalid tapscript signature length" ->
+    "Invalid Schnorr signature size"
+  | "Invalid hash_type 0x00 in 65-byte tapscript sig"
+  | "Invalid hash_type in 65-byte tapscript sig"
+  | "Invalid taproot hash type 0x00 in 65-byte signature"
+  | "Invalid taproot hash type in 65-byte signature"
+  | "OP_CHECKSIGADD SIGHASH_SINGLE without matching output"
+  | "Taproot SIGHASH_SINGLE without matching output"
+  | "Tapscript SIGHASH_SINGLE without matching output" ->
+    "Invalid Schnorr signature hash type"
+  | "OP_CHECKSIGADD Schnorr verification failed"
+  | "Taproot key path signature verification failed"
+  | "Tapscript OP_CHECKSIG Schnorr verification failed"
+  | "Tapscript OP_CHECKSIGVERIFY Schnorr verification failed" ->
+    "Invalid Schnorr signature"
+  | "Invalid control block size" | "Control block path too long" ->
+    "Invalid Taproot control block size"
+  | "Tapscript validation weight budget exceeded" ->
+    "Too much signature validation relative to witness weight"
+  | "OP_CHECKMULTISIG(VERIFY) is disabled in tapscript" ->
+    "OP_CHECKMULTISIG(VERIFY) is not available in tapscript"
+  | "Empty pubkey in tapscript OP_CHECKSIG" | "Empty pubkey in tapscript OP_CHECKSIGADD"
+  | "Empty pubkey in tapscript OP_CHECKSIGVERIFY" -> "Empty public key in tapscript"
+  | "CONST_SCRIPTCODE: OP_CODESEPARATOR in legacy script" ->
+    "Using OP_CODESEPARATOR in non-witness script"
+  | "CONST_SCRIPTCODE: find_and_delete modified scriptCode" ->
+    "Signature is found in scriptCode"
+  | _ ->
+    if has_prefix "NULLFAIL:" then
+      "Signature must be zero for failed CHECK(MULTI)SIG operation"
+    else if has_prefix "Bad opcode:" || has_prefix "Invalid opcode 0x" then
+      "Opcode missing or not understood"
+    else if has_prefix "Disabled opcode 0x" then "Attempted to use a disabled opcode"
+    else msg
+
+(* A mempool script failure in Core's form (validation.cpp CheckInputScripts
+   with the standard flags, which always include STANDARD_NOT_MANDATORY):
+   reason "mempool-script-verify-flag-failed (<ScriptErrorString>)", debug
+   "input N of <txid> (wtxid <wtxid>), spending <prevtxid>:<n>" (CScriptCheck).
+   Returns (GetRejectReason, ToString) for a script failure message of
+   Mempool.verify_tx_scripts, None for any other message. *)
+let core_script_reject (tx : Types.transaction) (msg : string)
+    : (string * string) option =
+  let strip p m =
+    let lp = String.length p in
+    if String.length m >= lp && String.sub m 0 lp = p
+    then String.sub m lp (String.length m - lp) else m in
+  let m = strip "witness-stripped: " msg in
+  let parsed =
+    try Some (Scanf.sscanf m "Script verification failed for input %d: %s@\n"
+                (fun i e -> (i, e)))
+    with _ ->
+      (try Some (Scanf.sscanf m "Script returned false for input %d%!"
+                   (fun i -> (i, "Script returned false")))
+       with _ -> None) in
+  match parsed with
+  | Some (i, err) when i >= 0 && i < List.length tx.Types.inputs ->
+    let reason = Printf.sprintf "mempool-script-verify-flag-failed (%s)"
+        (core_script_error_string err) in
+    let prev = (List.nth tx.Types.inputs i).Types.previous_output in
+    Some (reason,
+          Printf.sprintf "%s, input %d of %s (wtxid %s), spending %s:%ld"
+            reason i
+            (Types.hash256_to_hex_display (Crypto.compute_txid tx))
+            (Types.hash256_to_hex_display (Crypto.compute_wtxid tx))
+            (Types.hash256_to_hex_display prev.Types.txid) prev.Types.vout)
+  | _ -> None
+
 (* Default constants for sendrawtransaction *)
 let default_max_raw_tx_fee_rate = 0.10  (* 0.10 BTC/kvB *)
 let default_max_burn_amount = 0L        (* 0 BTC by default *)
@@ -4925,6 +5068,100 @@ let feerate_btc_per_kvb (fee_sats : int64) (vsize : int) : float =
   else Int64.to_float (Int64.div (Int64.mul fee_sats 1000L) (Int64.of_int vsize))
        /. 100_000_000.0
 
+(* testmempoolaccept with 2..MAX_PACKAGE_COUNT transactions: Core
+   rpc/mempool.cpp hands them to ProcessNewPackage(test_accept=true)
+   (Mempool.test_accept_package) and walks the results in array order.  A
+   package-wide PCKG_POLICY failure adds "package-error" to every entry; a tx
+   without a result (validation stopped earlier, or a preceding tx exceeded
+   maxfeerate) reports only txid and wtxid. *)
+let testmempoolaccept_package (ctx : rpc_context) (hexes : string list)
+    : (Yojson.Safe.t, string) result =
+  let rec decode acc = function
+    | [] -> Ok (List.rev acc)
+    | h :: rest ->
+      (match (try
+                let r = Serialize.reader_of_cstruct (Cstruct.of_hex h) in
+                Some (Serialize.deserialize_transaction r)
+              with _ -> None) with
+       | Some tx -> decode (tx :: acc) rest
+       | None ->
+         Error ("TX decode failed: " ^ h
+                ^ " Make sure the tx has at least one input."))
+  in
+  match decode [] hexes with
+  | Error e -> Error e
+  | Ok txs ->
+    let ids tx =
+      [ ("txid", `String (Types.hash256_to_hex_display (Crypto.compute_txid tx)));
+        ("wtxid", `String (Types.hash256_to_hex_display (Crypto.compute_wtxid tx))) ]
+    in
+    match Mempool.test_accept_package ctx.mempool txs with
+    | Error pkg_err ->
+      Ok (`List (List.map (fun tx ->
+          `Assoc (ids tx @ [ ("package-error", `String pkg_err) ])) txs))
+    | Ok outcomes ->
+      (* DEFAULT_MAX_RAW_TX_FEE_RATE (0.10 BTC/kvB), as CFeeRate::GetFee. *)
+      let max_fee_for vsize =
+        Int64.of_float (default_max_raw_tx_fee_rate *. 100_000_000.0)
+        |> fun per_kvb -> Int64.div (Int64.mul per_kvb (Int64.of_int vsize)) 1000L
+      in
+      let exit_early = ref false in
+      Ok (`List (List.map2 (fun tx outcome ->
+          if !exit_early then `Assoc (ids tx)
+          else match outcome with
+            | Mempool.TestUnfinished -> `Assoc (ids tx)
+            | Mempool.TestAccepted e ->
+              let vsize = (e.Mempool.weight + 3) / 4 in
+              let max_fee = max_fee_for vsize in
+              if max_fee > 0L && e.Mempool.fee > max_fee then begin
+                exit_early := true;
+                `Assoc (ids tx @ [ ("allowed", `Bool false);
+                                   ("reject-reason", `String "max-fee-exceeded") ])
+              end else
+                let wtxid_hex =
+                  Types.hash256_to_hex_display (Crypto.compute_wtxid tx) in
+                `Assoc (ids tx @ [
+                    ("allowed", `Bool true);
+                    ("vsize", `Int vsize);
+                    ("fees", `Assoc [
+                        ("base", `Float (Int64.to_float e.Mempool.fee /. 100_000_000.0));
+                        ("effective-feerate",
+                         `Float (feerate_btc_per_kvb e.Mempool.fee vsize));
+                        ("effective-includes", `List [`String wtxid_hex]);
+                      ]);
+                  ])
+            | Mempool.TestRejected msg ->
+              let reject =
+                match core_script_reject tx msg with
+                | Some (reason, details) ->
+                  [ ("reject-reason", `String reason);
+                    ("reject-details", `String details) ]
+                | None ->
+                  let fee_reason =
+                    List.find_opt (fun p ->
+                        String.length msg > String.length p
+                        && String.sub msg 0 (String.length p) = p)
+                      [ "min relay fee not met, "; "mempool min fee not met, " ] in
+                  (match fee_reason with
+                   | Some p ->
+                     [ ("reject-reason",
+                        `String (String.sub p 0 (String.length p - 2)));
+                       ("reject-details", `String msg) ]
+                   | None ->
+                     let reason =
+                       canonical_mempool_reject_reason ~testmempoolaccept:true msg in
+                     (* TX_MISSING_INPUTS: the bare literal, no details. *)
+                     if reason = "missing-inputs" then
+                       [ ("reject-reason", `String reason) ]
+                     else
+                       [ ("reject-reason", `String reason);
+                         ("reject-details",
+                          `String (canonical_mempool_reject_reason
+                                     ~testmempoolaccept:false msg)) ])
+              in
+              `Assoc (ids tx @ (("allowed", `Bool false) :: reject))
+        ) txs outcomes))
+
 let handle_testmempoolaccept (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
   match params with
@@ -4963,6 +5200,15 @@ let handle_testmempoolaccept (ctx : rpc_context)
             ("effective-includes", `List [`String hex_wtxid]);
           ]);
         ]])
+      | Error msg when core_script_reject tx msg <> None ->
+        let (reason, details) = Option.get (core_script_reject tx msg) in
+        Ok (`List [`Assoc [
+          ("txid", `String hex_txid);
+          ("wtxid", `String hex_wtxid);
+          ("allowed", `Bool false);
+          ("reject-reason", `String reason);
+          ("reject-details", `String details);
+        ]])
       | Error msg ->
         Ok (`List [`Assoc ([ 
           ("txid", `String hex_txid);
@@ -4979,6 +5225,11 @@ let handle_testmempoolaccept (ctx : rpc_context)
              else []))])
     with exn ->
       Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn)))
+  | [`List ((_ :: _ :: _) as raw)]
+    when List.length raw <= Mempool.max_package_count
+      && List.for_all (function `String _ -> true | _ -> false) raw ->
+    testmempoolaccept_package ctx
+      (List.map (function `String h -> h | _ -> assert false) raw)
   | _ ->
     Error "Invalid parameters: expected [[rawtx]]"
 
@@ -5076,8 +5327,15 @@ let handle_submitpackage (ctx : rpc_context)
               evicted-txid union surfaces back into this handler — matches
               Core's PackageMempoolAcceptResult::m_replaced_transactions
               (validation.cpp:760, rpc/mempool.cpp:1500). *)
-           let (pkg_result, replaced_txids) =
-             Mempool.accept_package_with_replaced ctx.mempool txs in
+           let (pkg_result, replaced_txids, all_failed) =
+             Mempool.accept_package_detailed ctx.mempool txs in
+           (* Core MempoolAcceptResult::m_state.ToString() for a per-tx
+              failure: a script failure carries its input detail. *)
+           let tx_error_text tx msg =
+             match core_script_reject tx msg with
+             | Some (_, details) -> details
+             | None -> canonical_mempool_reject_reason ~testmempoolaccept:false msg
+           in
            (* Build a wtxid -> entry-or-error lookup *)
            let entry_by_wtxid_key : (string, Mempool.mempool_entry) Hashtbl.t =
              Hashtbl.create n in
@@ -5100,9 +5358,17 @@ let handle_submitpackage (ctx : rpc_context)
               List.iter (fun (tx, msg) ->
                 let wtxid = Crypto.compute_wtxid tx in
                 Hashtbl.replace error_by_wtxid_key
-                  (Cstruct.to_string wtxid)
-                  (canonical_mempool_reject_reason ~testmempoolaccept:false msg)
+                  (Cstruct.to_string wtxid) (tx_error_text tx msg)
               ) rejected
+            | Mempool.PackageRejected _ when all_failed <> [] ->
+              (* Every tx failed on its own: still PCKG_TX, and each one
+                 reports its own error (Core fills every m_tx_results). *)
+              package_msg := "transaction failed";
+              List.iter (fun (tx, msg) ->
+                Hashtbl.replace error_by_wtxid_key
+                  (Cstruct.to_string (Crypto.compute_wtxid tx))
+                  (tx_error_text tx msg)
+              ) all_failed
             | Mempool.PackageRejected msg ->
               package_msg := msg);
 

@@ -159,6 +159,12 @@ type mempool = {
      Keyed like [entries] (binary txid string).  Cleared when a peer's
      getdata is served for the tx, or when the tx leaves the mempool. *)
   unbroadcast : (string, unit) Hashtbl.t;
+  (* Package test-accept coin view (Core: m_viewmempool.PackageAddTransaction
+     in AcceptMultipleTransactions).  Transactions of the package under
+     evaluation whose outputs later package members may spend, keyed like
+     [entries].  Only [test_accept_package] fills it, and it empties it again
+     before returning; it is empty at every other time. *)
+  package_view : (string, Types.transaction) Hashtbl.t;
 }
 
 (* ============================================================================
@@ -383,6 +389,7 @@ let create ?(require_standard=true) ?(verify_scripts=true)
     (* FIX-72: prioritisetransaction deltas, in-memory only. *)
     map_deltas = Hashtbl.create 64;
     unbroadcast = Hashtbl.create 16;
+    package_view = Hashtbl.create 4;
     (* #135 step 1: reverse parent→children index, sized for typical mempool. *)
     children = Hashtbl.create 10_000; }
 
@@ -448,12 +455,17 @@ let lookup_utxo (mp : mempool) (outpoint : Types.outpoint)
   | None ->
     (* Check mempool for unconfirmed parent *)
     let txid_key = Cstruct.to_string outpoint.txid in
-    match Hashtbl.find_opt mp.entries txid_key with
+    let parent_tx =
+      match Hashtbl.find_opt mp.entries txid_key with
+      | Some parent_entry -> Some parent_entry.tx
+      | None -> Hashtbl.find_opt mp.package_view txid_key
+    in
+    match parent_tx with
     | None -> None
-    | Some parent_entry ->
+    | Some parent_tx ->
       let vout = Int32.to_int outpoint.vout in
-      if vout < List.length parent_entry.tx.outputs then begin
-        let out = List.nth parent_entry.tx.outputs vout in
+      if vout < List.length parent_tx.outputs then begin
+        let out = List.nth parent_tx.outputs vout in
         (* An unconfirmed coin counts at height tip+1 — the earliest block
            that could include it.  Core: CCoinsViewMemPool marks such coins
            MEMPOOL_HEIGHT and CalculateLockPointsAtTip
@@ -5597,15 +5609,22 @@ let calc_tx_fee_vsize (mp : mempool) (tx : Types.transaction)
    (validation.cpp:760, rpc/mempool.cpp:1500).  The legacy [accept_package]
    wrapper returns only the package_result so the existing test suite +
    net-processing call sites stay source-compatible. *)
-let accept_package_with_replaced (mp : mempool) (txs : Types.transaction list)
-    : package_result * Types.hash256 list =
+(* [accept_package_detailed] additionally returns, when every package
+   transaction failed on its own (the [PackageRejected] carrying the first
+   per-tx message), each of those per-tx rejections.  Core reports a per-tx
+   error for every member in that case (PCKG_TX "transaction failed"); for a
+   package-wide rejection (well-formedness, topology, ephemeral spends) the
+   list is empty and every member is "package-not-validated". *)
+let accept_package_detailed (mp : mempool) (txs : Types.transaction list)
+    : package_result * Types.hash256 list
+      * (Types.transaction * string) list =
   (* Validate well-formedness *)
   match is_well_formed_package txs with
-  | Error msg -> (PackageRejected msg, [])
+  | Error msg -> (PackageRejected msg, [], [])
   | Ok () ->
     (* Topologically sort *)
     match topo_sort txs with
-    | Error msg -> (PackageRejected msg, [])
+    | Error msg -> (PackageRejected msg, [], [])
     | Ok sorted ->
       (* BUG-6 fix: enforce IsChildWithParentsTree topology for multi-tx packages.
          Core rejects any package that is not child-with-parents-tree before
@@ -5613,7 +5632,7 @@ let accept_package_with_replaced (mp : mempool) (txs : Types.transaction list)
          Single-tx packages are exempted (equivalent to plain ATMP). *)
       let n_sorted = List.length sorted in
       (match (if n_sorted >= 2 then is_child_with_parents_tree sorted else Ok ()) with
-       | Error msg -> (PackageRejected msg, [])
+       | Error msg -> (PackageRejected msg, [], [])
        | Ok () ->
       (* Track UTXOs created by earlier transactions in the package *)
       let package_utxos = Hashtbl.create 16 in
@@ -5762,14 +5781,157 @@ let accept_package_with_replaced (mp : mempool) (txs : Types.transaction list)
          sites). *)
       Gc_guard.maybe_keep_up ~reason:"hot-path:package";
       Gc_guard.maybe_backstop ~reason:"hot-path:package";
-      (pkg_result, evicted_list)
+      let all_failed =
+        if accepted_list = [] && rejected_list <> [] then rejected_list
+        else [] in
+      (pkg_result, evicted_list, all_failed)
       )  (* end is_child_with_parents_tree match *)
+
+let accept_package_with_replaced (mp : mempool) (txs : Types.transaction list)
+    : package_result * Types.hash256 list =
+  let (r, evicted, _) = accept_package_detailed mp txs in
+  (r, evicted)
 
 (* Thin discard-wrapper: legacy [accept_package] callers (test suite +
    net-processing) that don't surface the evicted-txid list. *)
 let accept_package (mp : mempool) (txs : Types.transaction list)
     : package_result =
   fst (accept_package_with_replaced mp txs)
+
+(* ============================================================================
+   Package test-accept (testmempoolaccept with more than one transaction)
+
+   Core rpc/mempool.cpp testmempoolaccept hands an array of 2+ txs to
+   ProcessNewPackage(test_accept=true), i.e. AcceptMultipleTransactions with
+   ATMPArgs::PackageTestAccept (validation.cpp):
+     - IsWellFormedPackage first (policy/packages.cpp); a failure there is a
+       package-wide PCKG_POLICY error and no tx is evaluated;
+     - PreChecks for every tx in order, each one's outputs then made visible
+       to the later ones (m_viewmempool.PackageAddTransaction); the first
+       failure stops the package and is the only per-tx result;
+     - PolicyScriptChecks for every tx in order; the txs before the first
+       failure are reported valid, the failed one invalid, the rest have no
+       result;
+     - no replacement (m_allow_replacement=false: a mempool conflict is
+       "bip125-replacement-disallowed"), no package feerates (each tx must
+       pay its own fee), and nothing is added to the pool.
+   Not modelled: package-wide TRUC, cluster-size and ephemeral-dust checks
+   (camlcoin's per-tx checks still run against the pool without the
+   package's own parents).
+   ============================================================================ *)
+
+type package_test_outcome =
+  | TestAccepted of mempool_entry
+  | TestRejected of string
+  | TestUnfinished
+
+(* IsWellFormedPackage, with Core's reject tokens. *)
+let check_well_formed_package_core (txs : Types.transaction list)
+    : (unit, string) result =
+  let n = List.length txs in
+  let total_weight =
+    List.fold_left (fun a tx -> a + Validation.compute_tx_weight tx) 0 txs in
+  let txid_keys =
+    List.map (fun tx -> Cstruct.to_string (Crypto.compute_txid tx)) txs in
+  let later = Hashtbl.create (max 1 n) in
+  List.iter (fun k -> Hashtbl.replace later k ()) txid_keys;
+  let outpoint_key (i : Types.tx_in) =
+    (Cstruct.to_string i.Types.previous_output.Types.txid,
+     i.Types.previous_output.Types.vout) in
+  if n > max_package_count then Error "package-too-many-transactions"
+  else if n > 1 && total_weight > max_package_weight then
+    Error "package-too-large"
+  else if Hashtbl.length later <> n then Error "package-contains-duplicates"
+  else if not (List.for_all2 (fun (tx : Types.transaction) k ->
+      let ok = not (List.exists (fun (i : Types.tx_in) ->
+          Hashtbl.mem later
+            (Cstruct.to_string i.Types.previous_output.Types.txid))
+          tx.Types.inputs) in
+      Hashtbl.remove later k;
+      ok) txs txid_keys)
+  then Error "package-not-sorted"
+  else begin
+    (* IsConsistentPackage: inputs are added a tx at a time, so a duplicate
+       input inside one tx is left to CheckTransaction. *)
+    let seen = Hashtbl.create 16 in
+    let consistent = List.for_all (fun (tx : Types.transaction) ->
+        tx.Types.inputs <> []
+        && not (List.exists (fun i -> Hashtbl.mem seen (outpoint_key i))
+                  tx.Types.inputs)
+        && (List.iter (fun i -> Hashtbl.replace seen (outpoint_key i) ())
+              tx.Types.inputs; true)) txs in
+    if consistent then Ok () else Error "conflict-in-package"
+  end
+
+(* PreChecks of one package tx (no script checks).  A fee-floor failure is
+   rewritten to Core's CheckFeeRate text, "<reason>, <fee> < <min fee>". *)
+let package_test_precheck (mp : mempool) (tx : Types.transaction)
+    : (mempool_entry, string) result =
+  let in_pool = Hashtbl.mem mp.entries (Cstruct.to_string (Crypto.compute_txid tx)) in
+  if (not in_pool) && find_all_conflicts mp tx <> [] then
+    match Validation.check_transaction tx with
+    | Error e -> Error (Validation.tx_error_to_string e)
+    | Ok () ->
+      if Validation.is_coinbase_tx tx then Error "coinbase"
+      else Error "bip125-replacement-disallowed"
+  else
+    match add_transaction ~dry_run:true ~skip_verify_scripts:true mp tx with
+    | Error "Fee below minimum relay fee" as err ->
+      (match add_transaction ~dry_run:true ~skip_verify_scripts:true
+               ~bypass_fee_check:true mp tx with
+       | Ok e ->
+         let vsize = Validation.get_virtual_transaction_size
+             ~weight:e.weight ~sigop_cost:e.sigops_cost
+             ~bytes_per_sigop:Consensus.default_bytes_per_sigop in
+         let fee_for rate = Int64.div (Int64.mul rate (Int64.of_int vsize)) 1000L in
+         let pool_floor = fee_for (get_min_fee mp) in
+         if pool_floor > 0L && e.fee < pool_floor then
+           Error (Printf.sprintf "mempool min fee not met, %Ld < %Ld" e.fee pool_floor)
+         else
+           Error (Printf.sprintf "min relay fee not met, %Ld < %Ld"
+                    e.fee (fee_for mp.min_relay_fee))
+       | Error _ -> err)
+    | r -> r
+
+let test_accept_package (mp : mempool) (txs : Types.transaction list)
+    : (package_test_outcome list, string) result =
+  match check_well_formed_package_core txs with
+  | Error e -> Error e
+  | Ok () ->
+    let arr = Array.of_list txs in
+    let n = Array.length arr in
+    let out = Array.make n TestUnfinished in
+    Hashtbl.reset mp.package_view;
+    Fun.protect ~finally:(fun () -> Hashtbl.reset mp.package_view) (fun () ->
+        let rec prechecks i =
+          if i >= n then true
+          else
+            match package_test_precheck mp arr.(i) with
+            | Error e -> out.(i) <- TestRejected e; false
+            | Ok entry ->
+              out.(i) <- TestAccepted entry;
+              Hashtbl.replace mp.package_view
+                (Cstruct.to_string entry.txid) arr.(i);
+              prechecks (i + 1)
+        in
+        if not (prechecks 0) then
+          (* Only the failed tx has a result. *)
+          Ok (Array.to_list (Array.map (function
+              | TestRejected _ as r -> r
+              | _ -> TestUnfinished) out))
+        else begin
+          let rec scripts i =
+            if i < n then
+              match (if mp.verify_scripts then verify_tx_scripts mp arr.(i)
+                     else Ok ()) with
+              | Error e ->
+                out.(i) <- TestRejected e;
+                Array.fill out (i + 1) (n - i - 1) TestUnfinished
+              | Ok () -> scripts (i + 1)
+          in
+          scripts 0;
+          Ok (Array.to_list out)
+        end)
 
 (* Find a 1p1c package for an orphan transaction.
    When an orphan's parent arrives but is rejected for low fee,

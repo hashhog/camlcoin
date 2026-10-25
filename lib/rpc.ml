@@ -2070,7 +2070,7 @@ let handle_setmocktime (ctx : rpc_context) (params : Yojson.Safe.t list)
     | _ -> Error (rpc_misc_error, "JSON value of type is not an integer as expected")
 
 let handle_getmempoolinfo (ctx : rpc_context) : Yojson.Safe.t =
-  let (count, weight, fees) = Mempool.get_info ctx.mempool in
+  let (count, _, fees) = Mempool.get_info ctx.mempool in
   (* Core MempoolInfoToJSON (mempool.cpp:1043) order:
        loaded, size, bytes, usage, total_fee, maxmempool, mempoolminfee,
        minrelaytxfee, incrementalrelayfee, unbroadcastcount, fullrbf,
@@ -2094,7 +2094,7 @@ let handle_getmempoolinfo (ctx : rpc_context) : Yojson.Safe.t =
     ("loaded", `Bool true);
     ("size", `Int count);
     ("bytes", `Int (Mempool.total_vsize ctx.mempool));
-    ("usage", `Int weight);
+    ("usage", `Int (Mempool.get_usage ctx.mempool));
     ("total_fee", `Float (Int64.to_float fees /. 100_000_000.0));
     ("maxmempool", `Int ctx.mempool.max_size_bytes);
     ("mempoolminfee", `Float mempoolminfee_btc);

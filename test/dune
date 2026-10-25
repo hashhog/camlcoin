@@ -353,3 +353,8 @@
  (name bench_rpc_latency)
  (modules bench_rpc_latency)
  (libraries camlcoin test_tmp lwt lwt.unix unix))
+
+(test
+ (name test_maxmempool)
+ (modules test_maxmempool)
+ (libraries camlcoin test_tmp alcotest))

@@ -160,6 +160,13 @@ let metrics_port_arg =
   Arg.(value & opt int 9332 &
     info ["metricsport"] ~docv:"PORT" ~doc)
 
+let maxmempool_arg =
+  let doc = "Keep the transaction memory pool below <n> megabytes \
+             (default 300; Bitcoin Core -maxmempool). Lowest-feerate chunks \
+             are evicted past the limit and the rolling minimum fee rises." in
+  Arg.(value & opt int 300 &
+    info ["maxmempool"] ~docv:"MB" ~doc)
+
 let dbcache_arg =
   (* PERF/config only — NOT consensus. Sizes the in-memory OptimizedUtxoSet
      LRU (entries) that fronts RocksDB during IBD, AND the RocksDB SST
@@ -489,7 +496,7 @@ let rest_tls_key_arg =
 
 let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     p2p_port max_outbound max_inbound connect no_dnsseed no_assume_valid debug no_wallet prune benchmark
-    import_blocks import_utxo metrics_port peer_bloom_filters
+    import_blocks import_utxo metrics_port maxmempool peer_bloom_filters
     migrate_logstorage daemon_mode pid_path conf_path debug_cats
     logfile printtoconsole ready_fd zmq_pub reindex
     rest_enabled rest_port rest_bind blockfilterindex asmap
@@ -599,6 +606,15 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       ~cli:(if metrics_port = 9332 then None else Some metrics_port)
       ~conf:(Camlcoin.Runtime_config.get_int conf_opts "metricsport")
       ~default:metrics_port in
+  let eff_maxmempool =
+    Camlcoin.Runtime_config.overlay_int
+      ~cli:(if maxmempool = 300 then None else Some maxmempool)
+      ~conf:(Camlcoin.Runtime_config.get_int conf_opts "maxmempool")
+      ~default:maxmempool in
+  if eff_maxmempool < 1 then begin
+    Printf.eprintf "Error: -maxmempool must be at least 1 MB\n";
+    exit 1
+  end;
   (* PERF/config: UTXO LRU entry budget. CLI > conf > base default.
      Resolved once so --import-utxo and Cli.run share the same RocksDB
      block-cache derivation (campaign --dbcache is entries, not bytes). *)
@@ -904,6 +920,7 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       prune = eff_prune;
       log_categories = eff_debug_cats;
       metrics_port = eff_metrics_port;
+      maxmempool_mb = eff_maxmempool;
       peer_bloom_filters = eff_peer_bloom;
       zmq_pub_options = (
         (* The cmdliner option strips the leading flag; users typed
@@ -1161,6 +1178,7 @@ let cmd =
     $ import_blocks_arg
     $ import_utxo_arg
     $ metrics_port_arg
+    $ maxmempool_arg
     $ peer_bloom_filters_arg
     $ migrate_logstorage_arg
     $ daemon_arg

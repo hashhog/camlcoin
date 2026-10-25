@@ -1914,7 +1914,10 @@ let handle_getpeerinfo (ctx : rpc_context) : Yojson.Safe.t =
       ("minfeefilter", `Float 0.0);
       ("bytessent_per_msg", `Assoc []);
       ("bytesrecv_per_msg", `Assoc []);
-      ("connection_type", `String (if is_inbound then "inbound" else "outbound-full-relay"));
+      ("connection_type", `String (
+        match Peer_manager.find_peer_by_id ctx.peer_manager stats.Peer.stat_id with
+        | Some p -> Peer_manager.connection_type_of_peer p
+        | None -> if is_inbound then "inbound" else "outbound-full-relay"));
       ("transport_protocol_type", `String "v1");
       ("session_id", `String "");
     ] in

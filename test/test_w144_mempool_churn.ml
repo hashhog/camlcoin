@@ -250,7 +250,10 @@ let test_cluster_check_matches_reference () =
 (* ── 4. Eviction: fills past cap+slack, trims to <= cap, worst-feerate-first,
    rolling floor raised. *)
 let test_eviction_trims_to_cap () =
-  let cap = 200_000 in
+  (* Caps bound tx_dynamic_usage (~950 B for these 1-in/1-out txs), not weight
+     (~340 WU): scaled x2.8 from the former 200_000 WU so the pool still holds
+     the same ~575 txs the fee ramp below is tuned for. *)
+  let cap = 560_000 in
   let n = 700 in
   let (mp, db) = create_pool ~max_size_bytes:cap ~n_utxos:n () in
   let slack = Mempool.eviction_trigger_slack mp in
@@ -273,14 +276,14 @@ let test_eviction_trims_to_cap () =
   (* The pool never exceeds cap + slack (trims trigger past the slack)... *)
   Alcotest.(check bool)
     (Printf.sprintf "bounded by cap+slack (weight=%d cap=%d slack=%d)"
-       mp.Mempool.total_weight cap slack)
-    true (mp.Mempool.total_weight <= cap + slack);
+       mp.Mempool.total_usage cap slack)
+    true (mp.Mempool.total_usage <= cap + slack);
   (* ...and an explicit trim lands exactly at or under the cap. *)
   Mempool.evict_by_chunks_for_testing mp;
   Alcotest.(check bool)
     (Printf.sprintf "trimmed to cap (weight=%d cap=%d)"
-       mp.Mempool.total_weight cap)
-    true (mp.Mempool.total_weight <= cap);
+       mp.Mempool.total_usage cap)
+    true (mp.Mempool.total_usage <= cap);
   (* Worst-feerate-first: the highest-fee tx must have survived, the
      lowest-fee tx must be gone (evictions happened, so some were dropped). *)
   let count = Hashtbl.length mp.Mempool.entries in
@@ -306,7 +309,9 @@ let test_eviction_trims_to_cap () =
    batched trim.  Thresholds are deliberately loose (shared CI box) but far
    below the pre-fix profile. *)
 let test_at_cap_accept_cost_bounded () =
-  let cap = 1_000_000 in
+  (* Usage-denominated (see test_eviction_trims_to_cap): x2.8 of the former
+     1_000_000 WU keeps the ~2900-tx capacity. *)
+  let cap = 2_800_000 in
   let n_fill = 3_200 in
   let n_bench = 200 in
   let (mp, db) = create_pool ~max_size_bytes:cap ~n_utxos:(n_fill + n_bench) () in
@@ -321,7 +326,7 @@ let test_at_cap_accept_cost_bounded () =
      | Ok _ -> () | Error e -> Alcotest.failf "fill %d rejected: %s" i e)
   done;
   Alcotest.(check bool) "pool is at/above cap for the benchmark"
-    true (mp.Mempool.total_weight > cap - cap / 10);
+    true (mp.Mempool.total_usage > cap - cap / 10);
   (* Benchmark: accepts into the full pool with high fees (beat the rolling
      floor raised by trims). *)
   let stat0 = Gc.quick_stat () in
@@ -347,10 +352,10 @@ let test_at_cap_accept_cost_bounded () =
     "[w144-bench] %d at-cap accepts: mean %.3f ms/accept, max %.1f ms, \
      major alloc %.1f kwords/accept, pool weight %d (cap %d)\n%!"
     n_bench per_accept_ms (!max_single *. 1000.0)
-    per_accept_major_kw mp.Mempool.total_weight cap;
+    per_accept_major_kw mp.Mempool.total_usage cap;
   (* Memory bound holds. *)
   Alcotest.(check bool) "bounded by cap+slack" true
-    (mp.Mempool.total_weight <= cap + Mempool.eviction_trigger_slack mp);
+    (mp.Mempool.total_usage <= cap + Mempool.eviction_trigger_slack mp);
   (* Mean cost bounds: pre-fix this was O(pool) per accept (>= several ms and
      >= 10^5 words each); post-fix must stay well under. *)
   Alcotest.(check bool)

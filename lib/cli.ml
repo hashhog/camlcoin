@@ -56,6 +56,7 @@ type config = {
        Values 2..549 are rejected at CLI parse. *)
   log_categories : string list;  (* empty = all enabled *)
   metrics_port : int;  (* Prometheus metrics port, 0 = disabled *)
+  maxmempool_mb : int;  (* -maxmempool: mempool size limit in MB (SI), default 300 *)
   peer_bloom_filters : bool;
     (* Advertise NODE_BLOOM (BIP-35 / BIP-111).  Defaults to [false] to
        match Bitcoin Core's DEFAULT_PEERBLOOMFILTERS (net_processing.h:44);
@@ -215,6 +216,7 @@ let default_config : config = {
   prune = 0;
   log_categories = [];
   metrics_port = 9332;
+  maxmempool_mb = 300;
   peer_bloom_filters = false;  (* Mirrors Core DEFAULT_PEERBLOOMFILTERS *)
   zmq_pub_options = [];
   reindex = false;
@@ -1011,6 +1013,7 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
      tx removed without confirmation (eviction, expiry, RBF) updates the
      fee estimator's leftmempool stats.  Fixes W114 G12 dead-helper. *)
   let mempool = Mempool.create ~network ~utxo ~current_height
+    ~max_size_mb:config.maxmempool_mb
     ~on_eviction:(Some (fun txid ->
       Fee_estimation.record_eviction fee_estimator txid))
     () in

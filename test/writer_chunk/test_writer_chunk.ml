@@ -253,8 +253,10 @@ let test_reorg_mid_rescan () =
       let reorg =
         let* () = Lwt_unix.sleep 0.1 in
         (* the active block at an already-scanned height changes *)
-        Storage.ChainDB.set_height_hash fx.state.Sync.db 5
-          (Crypto.sha256 (Cstruct.of_string "other branch"));
+        for h = 5 to n_blocks do
+          Storage.ChainDB.set_height_hash fx.state.Sync.db h
+            (Crypto.sha256 (Cstruct.of_string "other branch"))
+        done;
         Lwt.return_unit in
       Lwt.join [ rescan; reorg ]);
     let s = Yojson.Safe.to_string !resp in

@@ -676,7 +676,8 @@ let test_g18_submitpackage_replaces_field_hardcoded_empty () =
     (file_has_marker "lib/rpc.ml" "(\"replaced-transactions\", `List [])");
   (* FIX-73: handler dispatches through a variant that returns the replaced
      set ([accept_package_full] = [accept_package_with_replaced] plus the
-     package-RBF per-tx results) *)
+     package-RBF per-tx results and the per-tx rejections of an
+     all-failed package) *)
   Alcotest.(check bool) "BUG-4 FIX-73: accept_package_with_replaced wired in" true
     (file_has_marker "lib/rpc.ml" "Mempool.accept_package_full ctx.mempool txs");
   (* FIX-73: replaced_json shape exists in the handler *)

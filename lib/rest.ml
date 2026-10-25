@@ -646,15 +646,13 @@ let handle_mempool_info (ctx : Rpc.rpc_context) (_req : Cohttp.Request.t)
   let rf, _ = parse_data_format uri_part in
   match rf with
   | JSON ->
-    let (count, total_weight, total_fee) = Mempool.get_info ctx.mempool in
-    (* Weight is approximate bytes for mempool size estimation *)
-    let bytes_approx = total_weight / 4 in  (* weight to vbytes *)
+    let (count, _, total_fee) = Mempool.get_info ctx.mempool in
     let json = `Assoc [
       ("loaded", `Bool true);
       ("size", `Int count);
       ("bytes", `Int (Mempool.total_vsize ctx.mempool));
-      ("usage", `Int bytes_approx);
-      ("maxmempool", `Int 300_000_000);  (* default 300 MB *)
+      ("usage", `Int (Mempool.get_usage ctx.mempool));
+      ("maxmempool", `Int ctx.mempool.max_size_bytes);
       (* sat/kvB -> BTC/kvB is /. 1e8 (was /. 100_000.0, a real unit bug:
          it rendered 100 sat/kvB as 0.001 instead of 0.00000100). Read the
          live floor + module incremental constant, matching the RPC. *)

@@ -5685,7 +5685,11 @@ let package_reconsiderable (msg : string) : bool =
 
 (* Feerate diagram check for a replacement made of several new txs (the
    package).  Same construction as [check_improves_feerate_diagram], with one
-   synthetic entry per new tx; [deps] gives each one's in-package parents. *)
+   synthetic entry per new tx; [deps] gives each one's in-package parents.
+   Every tx, before and after, is sized by its sigop-adjusted weight, as in
+   Core's ImprovesFeerateDiagram (FeePerWeight over GetSigOpsAdjustedWeight):
+   [replacements] carry adjusted weights, and pool entries are copied with
+   [weight] replaced by theirs, since [linearize_entries] reads [weight]. *)
 let check_package_improves_feerate_diagram (mp : mempool)
     ~(evicted_set : (string, mempool_entry) Hashtbl.t)
     ~(replacements : (Types.transaction * int64 * int) list)
@@ -5695,7 +5699,13 @@ let check_package_improves_feerate_diagram (mp : mempool)
     List.iter (fun e -> Hashtbl.replace affected (Cstruct.to_string e.txid) e)
       (collect_affected_cluster_entries mp ~evicted_set ~replacement_tx:tx)
   ) replacements;
-  let affected_entries = Hashtbl.fold (fun _ e acc -> e :: acc) affected [] in
+  let adjusted (e : mempool_entry) =
+    { e with weight = Validation.get_sigops_adjusted_weight ~weight:e.weight
+                 ~sigop_cost:e.sigops_cost
+                 ~bytes_per_sigop:Consensus.default_bytes_per_sigop;
+             sigops_cost = 0 } in
+  let affected_entries =
+    Hashtbl.fold (fun _ e acc -> adjusted e :: acc) affected [] in
   let before_diag = chunks_to_diagram (linearize_entries mp affected_entries) in
   let remaining =
     List.filter (fun e -> not (Hashtbl.mem evicted_set (Cstruct.to_string e.txid)))
@@ -5804,14 +5814,14 @@ let package_rbf (mp : mempool) (eval : Types.transaction list)
           let vsize = Validation.get_virtual_transaction_size ~weight ~sigop_cost
               ~bytes_per_sigop:Consensus.default_bytes_per_sigop in
           let fee = Int64.sub in_sum out_sum in
-          Some (fee, apply_delta mp (Crypto.compute_txid tx) fee, weight,
-                adj_weight, vsize)
+          Some (fee, apply_delta mp (Crypto.compute_txid tx) fee, adj_weight,
+                vsize)
         end
       in
       match measure parent, measure child with
       | None, _ | _, None -> Package_rbf_failed "transaction failed"
-      | Some (p_fee, p_mod, p_weight, p_adj, p_vsize),
-        Some (c_fee, c_mod, c_weight, c_adj, c_vsize) ->
+      | Some (p_fee, p_mod, p_adj, p_vsize),
+        Some (c_fee, c_mod, c_adj, c_vsize) ->
         let total_mod = Int64.add p_mod c_mod in
         let total_vsize = p_vsize + c_vsize in
         (* CheckFeeRate on the package feerate (m_package_feerates). *)
@@ -5864,8 +5874,8 @@ let package_rbf (mp : mempool) (eval : Types.transaction list)
                    || p_adj + c_adj > max_cluster_size_weight then
                 Package_rbf_failed too_large_cluster
               else match check_package_improves_feerate_diagram mp ~evicted_set
-                           ~replacements:[ (parent, p_mod, p_weight);
-                                           (child, c_mod, c_weight) ] with
+                           ~replacements:[ (parent, p_mod, p_adj);
+                                           (child, c_mod, c_adj) ] with
               | Error e -> Package_rbf_failed ("package RBF failed: " ^ e)
               | Ok () ->
                 ignore (p_fee, c_fee);

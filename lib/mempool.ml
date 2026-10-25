@@ -2585,7 +2585,7 @@ let verify_tx_scripts_lwt (mp : mempool) (tx : Types.transaction)
    taken the conflicts out of [mp], so the live pool is already the
    post-eviction graph and no set is needed. *)
 let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=false)
-    ?(skip_verify_scripts=false) ?staged_removals
+    ?(skip_verify_scripts=false) ?(defer_trim=false) ?staged_removals
     (mp : mempool) (tx : Types.transaction)
     : (mempool_entry, string) result =
   let txid = Crypto.compute_txid tx in
@@ -3057,8 +3057,13 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
                  running on EVERY accept once the pool sits at the cap (the
                  public-flood churn that stalled RPC — see evict_by_chunks).
                  Each trim still evicts back down to max_size_bytes exactly;
-                 memory is bounded by cap + slack. *)
-              if mp.total_usage > mp.max_size_bytes + eviction_trigger_slack mp then
+                 memory is bounded by cap + slack.
+                 [defer_trim]: the caller is adding several txs as one unit
+                 (package RBF) and trims once they are all in, as Core's
+                 AcceptPackage calls LimitMempoolSize only after the whole
+                 package (validation.cpp:1731). *)
+              if (not defer_trim)
+                 && mp.total_usage > mp.max_size_bytes + eviction_trigger_slack mp then
                 evict_by_chunks mp;
 
               (* Notify ZMQ subscribers about new transaction *)
@@ -5671,7 +5676,22 @@ let calc_tx_fee_vsize (mp : mempool) (tx : Types.transaction)
     else begin
       let fee = Int64.sub !input_sum output_sum in
       let weight = Validation.compute_tx_weight tx in
-      let vsize = (weight + 3) / 4 in
+      (* Sigop-adjusted vsize (GetVirtualTransactionSize), the size Core's
+         package feerate is taken over (validation.cpp m_total_vsize sums
+         ws.m_vsize).  Raw (weight+3)/4 let a sigop-heavy child lift the
+         package over the floor, and the individual pass then admitted the
+         parent with ~bypass_fee_check. *)
+      let prev_script_pubkey_lookup (op : Types.outpoint) =
+        let key = Printf.sprintf "%s:%ld" (Types.hash256_to_hex op.txid) op.vout in
+        match Hashtbl.find_opt package_utxos key with
+        | Some e -> Some e.Utxo.script_pubkey
+        | None -> Option.map (fun e -> e.Utxo.script_pubkey) (lookup_utxo mp op)
+      in
+      let sigop_cost =
+        Validation.count_tx_sigops_cost tx ~prev_script_pubkey_lookup
+          ~flags:(Script.script_verify_p2sh lor Script.script_verify_witness) in
+      let vsize = Validation.get_virtual_transaction_size ~weight ~sigop_cost
+          ~bytes_per_sigop:Consensus.default_bytes_per_sigop in
       Ok (fee, vsize)
     end
 
@@ -5827,7 +5847,9 @@ let check_package_improves_feerate_diagram (mp : mempool)
   | Not_better -> Error "insufficient feerate: does not improve feerate diagram"
 
 (* Re-insert entries removed by a package replacement whose commit failed,
-   parents before children. *)
+   parents before children.  No trim: the pool goes back to exactly the state
+   it was in before the attempt (Core discards the changeset), so neither the
+   contents nor the rolling fee floor may move. *)
 let restore_evicted (mp : mempool) (evicted : mempool_entry list) : unit =
   let pending = ref evicted in
   let progress = ref true in
@@ -5841,7 +5863,7 @@ let restore_evicted (mp : mempool) (evicted : mempool_entry list) : unit =
       else begin
         progress := true;
         ignore (add_transaction ~bypass_fee_check:true ~bypass_limits:true
-                  ~skip_verify_scripts:true mp e.tx);
+                  ~skip_verify_scripts:true ~defer_trim:true mp e.tx);
         false
       end
     ) !pending
@@ -5970,6 +5992,15 @@ let package_rbf (mp : mempool) (eval : Types.transaction list)
               | Error e -> Package_rbf_failed ("package RBF failed: " ^ e)
               | Ok () ->
                 ignore (p_fee, c_fee);
+                (* CheckEphemeralSpends runs after PackageRBFChecks and before
+                   anything is committed (validation.cpp
+                   AcceptMultipleTransactionsInternal), so a child that leaves
+                   the parent's dust unspent refuses the package with the pool
+                   untouched. *)
+                match check_ephemeral_spends mp eval with
+                | Error (msg, _) ->
+                  Package_rbf_failed ("missing-ephemeral-spends: " ^ msg)
+                | Ok () ->
                 (* Remaining per-tx gates on the parent against the
                    post-eviction pool, before anything is removed. *)
                 match add_transaction ~dry_run:true ~bypass_fee_check:true
@@ -5979,18 +6010,34 @@ let package_rbf (mp : mempool) (eval : Types.transaction list)
                   let evicted =
                     Hashtbl.fold (fun _ e acc -> e :: acc) evicted_set [] in
                   List.iter (fun e -> remove_transaction mp e.txid) direct;
+                  (* Both txs go in untrimmed: the parent alone is the
+                     low-feerate tx, and a trim between the two adds would
+                     rank it (and raise the rolling floor) on its own feerate
+                     instead of the package's.  A failure puts the pool back
+                     as it was, again without a trim. *)
                   let rollback added =
                     List.iter (fun e -> remove_transaction mp e.txid) added;
                     restore_evicted mp evicted;
                     Package_rbf_failed "transaction failed" in
-                  match add_transaction ~bypass_fee_check:true mp parent with
+                  match add_transaction ~bypass_fee_check:true ~defer_trim:true
+                          mp parent with
                   | Error _ -> rollback []
                   | Ok p_entry ->
-                    match add_transaction ~bypass_fee_check:true mp child with
+                    match add_transaction ~bypass_fee_check:true ~defer_trim:true
+                            mp child with
                     | Error _ -> rollback [ p_entry ]
                     | Ok c_entry ->
-                      Package_rbf_accepted
-                        ([ p_entry; c_entry ], List.map (fun e -> e.txid) evicted)
+                      (* LimitMempoolSize once the whole package is in
+                         (validation.cpp:1731); a package the trim removes is
+                         "mempool full" (validation.cpp:1744). *)
+                      if mp.total_usage > mp.max_size_bytes + eviction_trigger_slack mp
+                      then evict_by_chunks mp;
+                      if Hashtbl.mem mp.entries (Cstruct.to_string parent_txid)
+                         && Hashtbl.mem mp.entries (Cstruct.to_string child_txid)
+                      then
+                        Package_rbf_accepted
+                          ([ p_entry; c_entry ], List.map (fun e -> e.txid) evicted)
+                      else Package_rbf_failed "mempool full"
           end
         end
     end

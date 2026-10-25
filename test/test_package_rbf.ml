@@ -17,13 +17,17 @@
 
 open Camlcoin
 
-let with_ctx f =
+let with_ctx ?(verify_scripts = false) ?cap f =
   Test_tmp.with_chaindb (fun db ->
       let utxo = Utxo.UtxoSet.create db in
       let mp =
         Mempool.create ~network:Consensus.regtest ~require_standard:false
-          ~verify_scripts:false ~utxo ~current_height:0 ()
+          ~verify_scripts ~utxo ~current_height:0 ()
       in
+      (* -maxmempool in bytes (the create argument is whole MB). *)
+      let mp = match cap with
+        | Some c -> { mp with Mempool.max_size_bytes = c }
+        | None -> mp in
       let chain = Sync.create_chain_state db Consensus.regtest in
       let ctx : Rpc.rpc_context =
         {
@@ -306,6 +310,159 @@ let test_parent_alone_replaces () =
          |> List.map to_string);
       Alcotest.(check (list string)) "pool = P, C" (ids [ p; c ]) (pool ctx))
 
+(* ---- Review points on camlcoin#26 (Warden, attempt 4) ---- *)
+
+(* A small conflict S (92 vB, fee 2_000) and 80 unrelated fillers F1..F80
+   (92 vB each, fees 1_020..2_600, ~11-28 sat/vB).  The package parent P
+   double-spends S with 20 outputs (292 vB) and pays 1_000 (~3.4 sat/vB,
+   below every filler); its child C (92 vB) pays 60_000, so the package
+   (~159 sat/vB) ranks above every filler. *)
+let n_fillers = 80
+
+let small_conflict ~coin =
+  tx ~ins:[ (coin, 0) ] ~change:(Int64.sub coin_value 2_000L) ~spk:op_true ~n:0
+
+let filler i =
+  tx ~ins:[ (coin_txid (i + 1), 0) ]
+    ~change:(Int64.sub coin_value (Int64.of_int (1_000 + (20 * i))))
+    ~spk:op_true ~n:0
+
+let slack_band_package () =
+  replacement ~coin:(coin_txid 1) ~p_fee:1_000L ~p_outs:20 ~p_spk:op_true
+    ~c_fee:60_000L ~c_outs:0 ()
+
+let usage = Mempool.tx_dynamic_usage
+
+(* -maxmempool chosen so that S + fillers sit inside the 1/64 overshoot slack
+   (no trim while the pool is filled) but the pool with P in place of S is
+   past the trigger: a trim after the parent alone would rank P on its own
+   feerate. *)
+let slack_band_cap ~p =
+  let s = small_conflict ~coin:(coin_txid 1) in
+  let u0 = usage s
+           + List.fold_left (fun a i -> a + usage (filler i)) 0
+               (List.init n_fillers (fun i -> i + 1)) in
+  let trigger = u0 - usage s + usage p - 1 in
+  let cap = trigger * 64 / 65 in
+  assert (cap + (cap / 64) <= trigger);
+  assert (u0 <= cap + (cap / 64));
+  assert (u0 > cap);
+  cap
+
+let fill (ctx : Rpc.rpc_context) =
+  for i = 1 to n_fillers + 1 do put_coin ctx i done;
+  let s = small_conflict ~coin:(coin_txid 1) in
+  send ctx s;
+  let fillers = List.init n_fillers (fun i -> filler (i + 1)) in
+  List.iter (send ctx) fillers;
+  Alcotest.(check int) "setup: nothing trimmed while filling"
+    (n_fillers + 1) (Hashtbl.length ctx.mempool.Mempool.entries);
+  (s, fillers)
+
+(* Point 1: the trim waits for the whole package.  Core's AcceptPackage calls
+   LimitMempoolSize only after both txs are in (validation.cpp:1731), where
+   P and C form one ~159 sat/vB chunk.  The package is accepted, S is
+   replaced, and the trim back to -maxmempool removes only the lowest
+   fillers, no more than it needs: the remaining pool fits and putting back
+   the last filler it removed would not.  The rolling floor follows that
+   filler (> 11 sat/vB), not P's own ~3.4 sat/vB. *)
+let test_trim_waits_for_package () =
+  let p, c = slack_band_package () in
+  let cap = slack_band_cap ~p in
+  with_ctx ~cap (fun ctx ->
+      let s, fillers = fill ctx in
+      let j = submitpackage ctx [ p; c ] in
+      Alcotest.(check string) "package_msg" "success" (package_msg j);
+      let in_pool = pool ctx in
+      Alcotest.(check bool) "P stays" true (List.mem (txid_hex p) in_pool);
+      Alcotest.(check bool) "C stays" true (List.mem (txid_hex c) in_pool);
+      Alcotest.(check bool) "S replaced" false (List.mem (txid_hex s) in_pool);
+      let evicted =
+        List.filter (fun f -> not (List.mem (txid_hex f) in_pool)) fillers in
+      let k = List.length evicted in
+      Alcotest.(check bool) "the post-package trim ran" true (k > 0);
+      Alcotest.(check (list string)) "only the lowest-fee fillers go"
+        (ids (List.filteri (fun i _ -> i < k) fillers)) (ids evicted);
+      Alcotest.(check int) "pool = P + C + kept fillers" (2 + n_fillers - k)
+        (List.length in_pool);
+      let mp = ctx.mempool in
+      Alcotest.(check bool) "trimmed to -maxmempool" true
+        (mp.Mempool.total_usage <= cap);
+      if k > 0 then
+        Alcotest.(check bool) "no more than needed" true
+          (mp.Mempool.total_usage + usage (List.nth fillers (k - 1)) > cap);
+      Alcotest.(check bool) "rolling floor follows the fillers, not P" true
+        (Mempool.get_rolling_min_fee_rate mp > 10_000.0))
+
+(* Point 1, failing child: the same package with a child whose scriptSig
+   fails (OP_RETURN).  The parent is added, the child is refused, the parent
+   comes out and S goes back: the pool and the rolling floor are exactly as
+   before the attempt. *)
+let test_failed_child_leaves_pool_and_floor () =
+  let p, c = slack_band_package () in
+  let c =
+    { c with
+      Types.inputs =
+        List.map (fun (i : Types.tx_in) ->
+            { i with Types.script_sig = Cstruct.of_string "\x6a" })
+          c.Types.inputs } in
+  let cap = slack_band_cap ~p in
+  with_ctx ~verify_scripts:true ~cap (fun ctx ->
+      let _s, _fillers = fill ctx in
+      let before = pool ctx in
+      let floor_before = Mempool.get_rolling_min_fee_rate ctx.mempool in
+      let usage_before = ctx.mempool.Mempool.total_usage in
+      let j = submitpackage ctx [ p; c ] in
+      Alcotest.(check bool) "package refused" true (package_msg j <> "success");
+      Alcotest.(check (list string)) "pool unchanged" before (pool ctx);
+      Alcotest.(check (float 0.0)) "rolling floor unchanged" floor_before
+        (Mempool.get_rolling_min_fee_rate ctx.mempool);
+      Alcotest.(check int) "usage unchanged" usage_before
+        ctx.mempool.Mempool.total_usage)
+
+(* Point 2: the package feerate of the individual pass is taken over the
+   sigop-adjusted vsize.  No conflicts.  P pays 0; C pays 200 and carries 10
+   bare multisig outputs (800 sigop cost, adjusted vsize 4_000).  By raw
+   weight the package is ~650 vB, ~0.3 sat/vB, over the 0.1 sat/vB floor; by
+   adjusted vsize it is ~4_100 vB, ~0.05 sat/vB, under it.  Core (and this
+   node's testmempoolaccept) refuses P below the floor; nothing enters. *)
+let test_package_floor_uses_adjusted_vsize () =
+  with_ctx (fun ctx ->
+      put_coin ctx 1;
+      let p = tx ~ins:[ (coin_txid 1, 0) ] ~change:coin_value ~spk:op_true ~n:0 in
+      let c_change =
+        Int64.sub coin_value (Int64.add 200L (Int64.mul 10L output_sats)) in
+      let c = tx ~ins:[ (txid p, 0) ] ~change:c_change ~spk:multisig ~n:10 in
+      let j = submitpackage ctx [ p; c ] in
+      Alcotest.(check bool) "package refused" true (package_msg j <> "success");
+      Alcotest.(check (list string)) "pool unchanged" [] (pool ctx))
+
+(* Point 3: a package RBF whose child leaves the parent's ephemeral dust
+   unspent.  CheckEphemeralSpends runs before anything is committed
+   (validation.cpp AcceptMultipleTransactionsInternal): the package is
+   refused, the conflict S stays and neither package tx enters. *)
+let test_unspent_dust_restores_conflict () =
+  with_ctx (fun ctx ->
+      put_coin ctx 1;
+      let coin = coin_txid 1 in
+      let s = small_conflict ~coin in
+      send ctx s;
+      let p0 = tx ~ins:[ (coin, 0) ] ~change:coin_value ~spk:op_true ~n:0 in
+      (* P pays 0 and carries a zero-value OP_TRUE output: ephemeral dust. *)
+      let p =
+        { p0 with
+          Types.outputs =
+            p0.Types.outputs @ [ { Types.value = 0L; script_pubkey = op_true } ] }
+      in
+      let c = tx ~ins:[ (txid p, 0) ]
+          ~change:(Int64.sub coin_value 50_000L) ~spk:op_true ~n:0 in
+      let j = submitpackage ctx [ p; c ] in
+      let msg = package_msg j in
+      let prefix = "missing-ephemeral-spends" in
+      Alcotest.(check string) "package_msg prefix" prefix
+        (String.sub msg 0 (min (String.length msg) (String.length prefix)));
+      Alcotest.(check (list string)) "pool = S" (ids [ s ]) (pool ctx))
+
 let () =
   Alcotest.run "package_rbf"
     [ ( "package-rbf",
@@ -321,4 +478,12 @@ let () =
           Alcotest.test_case "mempool ancestor refused" `Quick
             test_mempool_ancestor_refused;
           Alcotest.test_case "parent alone replaces" `Quick
-            test_parent_alone_replaces ] ) ]
+            test_parent_alone_replaces;
+          Alcotest.test_case "trim waits for package" `Quick
+            test_trim_waits_for_package;
+          Alcotest.test_case "failed child leaves pool and floor" `Quick
+            test_failed_child_leaves_pool_and_floor;
+          Alcotest.test_case "package floor uses adjusted vsize" `Quick
+            test_package_floor_uses_adjusted_vsize;
+          Alcotest.test_case "unspent dust restores conflict" `Quick
+            test_unspent_dust_restores_conflict ] ) ]

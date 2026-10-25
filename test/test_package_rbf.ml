@@ -176,6 +176,30 @@ let test_at_limit_replaces () =
         [ (p, 0.00006); (c, 0.002) ];
       Alcotest.(check (list string)) "pool = P, C" (ids [ p; c ]) (pool ctx))
 
+(* The feerate diagram must size each tx by its sigop-adjusted weight, as
+   Core's ImprovesFeerateDiagram does (GetSigOpsAdjustedWeight).  Same shape
+   as at-limit but the child pays 40_000: by raw weight the package (~11.6k
+   vB, 46_000 sat) beats O + D (~6.1k vB, 21_000 sat) at every point, but by
+   adjusted weight it is 100_800 vB and falls below O + D's diagram.  Core
+   v31.1: "package RBF failed: insufficient feerate: does not improve feerate
+   diagram"; O and D stay. *)
+let test_diagram_uses_adjusted_weight () =
+  with_ctx (fun ctx ->
+      put_coin ctx 1;
+      let coin = coin_txid 1 in
+      let o, d = conflict_pair ~coin in
+      send ctx o; send ctx d;
+      let p, c = replacement ~coin ~p_fee:6_000L ~p_outs:126 ~p_spk:multisig
+          ~c_fee:40_000L ~c_outs:126 () in
+      let j = submitpackage ctx [ p; c ] in
+      Alcotest.(check string) "package_msg"
+        "package RBF failed: insufficient feerate: does not improve feerate \
+         diagram"
+        (package_msg j);
+      Alcotest.(check (list string)) "nothing replaced" []
+        (j |> member "replaced-transactions" |> to_list |> List.map to_string);
+      Alcotest.(check (list string)) "pool = O, D" (ids [ o; d ]) (pool ctx))
+
 (* package_rbf/over: 127 + 126 outputs, 404_800 > 404_000.  Core:
    too-large-cluster; each tx reports its individual failure; O and D stay. *)
 let test_over_too_large_cluster () =
@@ -281,6 +305,8 @@ let () =
   Alcotest.run "package_rbf"
     [ ( "package-rbf",
         [ Alcotest.test_case "at-limit replaces" `Quick test_at_limit_replaces;
+          Alcotest.test_case "diagram uses adjusted weight" `Quick
+            test_diagram_uses_adjusted_weight;
           Alcotest.test_case "over too-large-cluster" `Quick
             test_over_too_large_cluster;
           Alcotest.test_case "insufficient package fees" `Quick

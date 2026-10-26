@@ -5336,15 +5336,32 @@ let handle_submitpackage (ctx : rpc_context)
               evicted-txid union surfaces back into this handler — matches
               Core's PackageMempoolAcceptResult::m_replaced_transactions
               (validation.cpp:760, rpc/mempool.cpp:1500). *)
-           let (pkg_result, replaced_txids, all_failed) =
-             Mempool.accept_package_detailed ctx.mempool txs in
-           (* Core MempoolAcceptResult::m_state.ToString() for a per-tx
-              failure: a script failure carries its input detail. *)
-           let tx_error_text tx msg =
-             match core_script_reject tx msg with
-             | Some (_, details) -> details
-             | None -> canonical_mempool_reject_reason ~testmempoolaccept:false msg
+           let outcome = Mempool.accept_package_full ctx.mempool txs in
+           let pkg_result = outcome.Mempool.pkg_result in
+           (* Core prints the replaced set from a std::set<Txid>: ascending
+              by the txid's internal bytes. *)
+           let replaced_txids =
+             List.sort (fun a b ->
+               compare (Cstruct.to_string a) (Cstruct.to_string b))
+               outcome.Mempool.pkg_replaced in
+           let all_failed = outcome.Mempool.pkg_all_failed in
+           (* A failed tx's error is Core's state.ToString(): the single-tx
+              RBF fee failures carry the txid and BTC amounts there, and a
+              script failure carries its input detail. *)
+           let tx_error_text (tx : Types.transaction) msg =
+             match Mempool.core_individual_rbf_error
+                     ~txid:(Crypto.compute_txid tx) msg with
+             | Some s -> s
+             | None ->
+               match core_script_reject tx msg with
+               | Some (_, details) -> details
+               | None -> canonical_mempool_reject_reason ~testmempoolaccept:false msg
            in
+           (* Core's vsize is GetVirtualTransactionSize: sigop-adjusted. *)
+           let entry_vsize (e : Mempool.mempool_entry) =
+             Validation.get_virtual_transaction_size ~weight:e.Mempool.weight
+               ~sigop_cost:e.Mempool.sigops_cost
+               ~bytes_per_sigop:Consensus.default_bytes_per_sigop in
            (* Build a wtxid -> entry-or-error lookup *)
            let entry_by_wtxid_key : (string, Mempool.mempool_entry) Hashtbl.t =
              Hashtbl.create n in
@@ -5379,13 +5396,18 @@ let handle_submitpackage (ctx : rpc_context)
                   (tx_error_text tx msg)
               ) all_failed
             | Mempool.PackageRejected msg ->
-              package_msg := msg);
+              package_msg := msg;
+              (* Package RBF failed: each tx reports its individual result. *)
+              List.iter (fun (tx, m) ->
+                Hashtbl.replace error_by_wtxid_key
+                  (Cstruct.to_string (Crypto.compute_wtxid tx)) (tx_error_text tx m)
+              ) outcome.Mempool.pkg_tx_errors);
 
            (* maxfeerate post-check on accepted entries; evict + flag if exceeded *)
            if max_fee_rate > 0.0 then begin
              let exceed_keys = ref [] in
              Hashtbl.iter (fun key e ->
-               let vsize = (e.Mempool.weight + 3) / 4 in
+               let vsize = entry_vsize e in
                let max_fee_sats =
                  Int64.of_float
                    (max_fee_rate *. 100_000_000.0 /. 1000.0
@@ -5418,7 +5440,7 @@ let handle_submitpackage (ctx : rpc_context)
              match Hashtbl.find_opt entry_by_wtxid_key wk with
              | None -> ()
              | Some e ->
-               let vsize = (e.Mempool.weight + 3) / 4 in
+               let vsize = entry_vsize e in
                let low =
                  Int64.compare (Int64.div (Int64.mul e.Mempool.fee 1000L)
                                   (Int64.of_int (max 1 vsize))) floor_rate < 0 in
@@ -5426,7 +5448,10 @@ let handle_submitpackage (ctx : rpc_context)
                  Hashtbl.mem group_txids
                    (Cstruct.to_string i.Types.previous_output.Types.txid)
                ) tx.Types.inputs in
-               if low || on_group then begin
+               let package_eval = List.exists (Cstruct.equal e.Mempool.txid)
+                   outcome.Mempool.pkg_eval in
+               if package_eval || ((outcome.Mempool.pkg_eval = []) && (low || on_group))
+               then begin
                  Hashtbl.replace group_txids (Cstruct.to_string e.Mempool.txid) ();
                  group := !group @ [ (tx, e) ]
                end
@@ -5434,7 +5459,7 @@ let handle_submitpackage (ctx : rpc_context)
            let group_fee = List.fold_left (fun a (_, e) ->
              Int64.add a e.Mempool.fee) 0L !group in
            let group_vsize = List.fold_left (fun a (_, e) ->
-             a + (e.Mempool.weight + 3) / 4) 0 !group in
+             a + entry_vsize e) 0 !group in
            let group_wtxids = List.map (fun (tx, _) ->
              `String (Types.hash256_to_hex_display (Crypto.compute_wtxid tx))
            ) !group in
@@ -5447,7 +5472,7 @@ let handle_submitpackage (ctx : rpc_context)
              let wtxid_hex = Types.hash256_to_hex_display wtxid in
              match Hashtbl.find_opt entry_by_wtxid_key wtxid_key with
              | Some e ->
-               let vsize = (e.Mempool.weight + 3) / 4 in
+               let vsize = entry_vsize e in
                let fee_btc = Int64.to_float e.Mempool.fee /. 100_000_000.0 in
                let in_group = Hashtbl.mem group_txids (Cstruct.to_string e.Mempool.txid) in
                let effective_feerate_btc_per_kvb =

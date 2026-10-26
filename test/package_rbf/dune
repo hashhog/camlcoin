@@ -1,0 +1,5 @@
+; submitpackage package RBF (camlcoin#26). Own directory so the shared
+; test/dune names list is untouched and sibling merges do not conflict.
+(test
+ (name test_package_rbf)
+ (libraries camlcoin test_tmp alcotest))

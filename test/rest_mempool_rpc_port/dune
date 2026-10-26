@@ -1,0 +1,5 @@
+; REST mempool endpoints on the RPC port. Own directory so the shared
+; test/dune names list is untouched.
+(test
+ (name test_rest_mempool_rpc_port)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix yojson))

@@ -93,6 +93,11 @@ let rpc_verify_rejected = -26
    leaves this at 0. *)
 let test_sync_sleep_s = ref 0.0
 
+(* Test-only: seconds of CPU-bound-looking work (a blocking sleep) charged to
+   every block rescanblockchain visits, standing in for the per-block scan
+   cost of a mainnet-sized block.  Production leaves this at 0. *)
+let test_rescan_block_cost_s = ref 0.0
+
 let is_monitoring_rpc = function
   | "getblockcount" | "getbestblockhash" | "uptime" | "getrpcinfo" ->
     true
@@ -2972,10 +2977,14 @@ let handle_submitblock (ctx : rpc_context)
      | None -> Error "Block decode failed"
      | Some block ->
     (try
-      match Mining.submit_block ?utxo:ctx.utxo
+      match Mining.submit_block_outcome ?utxo:ctx.utxo
               ~network_type:ctx.network.network_type
               block ctx.chain ctx.mempool with
-      | Ok () -> Ok `Null
+      | Ok Sync.Side_accepted -> Ok `Null
+      (* Stored on a side branch, never connected: Core's
+         submitblock_StateCatcher saw no BlockChecked for it, so
+         rpc/mining.cpp answers "inconclusive" (null would claim valid). *)
+      | Ok Sync.Side_inconclusive -> Ok (`String "inconclusive")
       (* Gate 6: a system fault is not a validation result.  Core answers
          a ProcessNewBlock failure that is not a BlockValidationState
          verdict with JSONRPCError(RPC_VERIFY_ERROR, ...) -- never a
@@ -11326,8 +11335,10 @@ let scantxoutset_resolve (scanobjects : Yojson.Safe.t list)
 
    Returns: { "start_height", "stop_height" } (Core shape), having credited
    every wallet-owned output found in the range. *)
-let handle_rescanblockchain (ctx : rpc_context)
-    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+(* Validate rescanblockchain's arguments.  Shared by the synchronous handler
+   and the sliced Lwt one, so the two cannot drift apart. *)
+let rescan_prepare (ctx : rpc_context) (params : Yojson.Safe.t list)
+    : (Wallet.t * int * int, string) result =
   match ctx.wallet with
   | None -> Error "Wallet not loaded"
   | Some wallet ->
@@ -11361,32 +11372,125 @@ let handle_rescanblockchain (ctx : rpc_context)
         Error "Invalid stop_height"
       else if stop_height < start_height then
         Error "stop_height must be greater than start_height"
-      else begin
-        (* A from-scratch rescan (start at genesis) rebuilds the whole ledger:
-           clear the chain-derived UTXO/history state first so re-applying the
-           range does not double-count. A partial rescan (start_height > 0)
-           leaves the existing ledger in place and relies on scan_block's
-           {txid,vout} idempotency. *)
-        if start_height = 0 then Wallet.clear_for_rescan wallet;
-        (* Walk the active chain by height, re-applying each block through the
-           same scan logic the block-connect hook uses. Heights with no block
-           body persisted (assume-valid IBD does not store bodies) are skipped;
-           on regtest / a fully-synced node every block body is present. *)
-        for h = start_height to stop_height do
-          match Sync.get_header_at_height ctx.chain h with
-          | None -> ()
-          | Some entry ->
-            (match Storage.ChainDB.get_block ctx.chain.db entry.Sync.hash with
-             | None -> ()
-             | Some block -> Wallet.scan_block wallet block h)
-        done;
-        (* Persist the rebuilt ledger so it survives restart. *)
-        (try Wallet.save wallet with _ -> ());
-        Ok (`Assoc [
-          ("start_height", `Int start_height);
-          ("stop_height", `Int stop_height);
-        ])
-      end
+      else Ok (wallet, start_height, stop_height)
+
+(* Walk the active chain by height, re-applying one block through the same
+   scan logic the block-connect hook uses.  Heights with no block body
+   persisted (assume-valid IBD does not store bodies) are skipped; on regtest
+   / a fully-synced node every block body is present.  Returns the hash of
+   the block scanned, if any. *)
+let rescan_one (ctx : rpc_context) (wallet : Wallet.t) (h : int)
+    : Types.hash256 option =
+  if !test_rescan_block_cost_s > 0. then
+    Unix.sleepf !test_rescan_block_cost_s;
+  match Sync.get_header_at_height ctx.chain h with
+  | None -> None
+  | Some entry ->
+    (match Storage.ChainDB.get_block ctx.chain.db entry.Sync.hash with
+     | None -> None
+     | Some block -> Wallet.scan_block wallet block h; Some entry.Sync.hash)
+
+let rescan_result start_height stop_height =
+  `Assoc [
+    ("start_height", `Int start_height);
+    ("stop_height", `Int stop_height);
+  ]
+
+let handle_rescanblockchain (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  match rescan_prepare ctx params with
+  | Error e -> Error e
+  | Ok (wallet, start_height, stop_height) ->
+    (* A from-scratch rescan (start at genesis) rebuilds the whole ledger:
+       clear the chain-derived UTXO/history state first so re-applying the
+       range does not double-count. A partial rescan (start_height > 0)
+       leaves the existing ledger in place and relies on scan_block's
+       {txid,vout} idempotency.  Nothing can interleave: this runs in one
+       synchronous step. *)
+    if start_height = 0 then Wallet.clear_for_rescan wallet;
+    for h = start_height to stop_height do
+      ignore (rescan_one ctx wallet h)
+    done;
+    (* Persist the rebuilt ledger so it survives restart. *)
+    (try Wallet.save wallet with _ -> ());
+    Ok (rescan_result start_height stop_height)
+
+(* Wall-clock a rescan slice may hold the Lwt main thread before yielding to
+   P2P handling, validation and the monitoring RPCs. *)
+let rescan_slice_s = 0.020
+
+(* The same scan, sliced: it runs on the Lwt main thread (it is a chain-lock
+   writer, holding [rpc_lwt_mutex], so no other RPC interleaves) but yields
+   every [rescan_slice_s].  The block-connect hooks and the startup reconcile
+   do run between slices, so the scan rebuilds a shadow ledger
+   ([Wallet.rescan_begin]) and the live wallet stays whole and keeps following
+   the chain until the shadow is committed:
+   - the range [start, stop] is fixed by [rescan_prepare]; blocks connected
+     above stop meanwhile are replayed onto the shadow, in order, at commit;
+   - a slice is atomic (no yield inside it); before each one the last block
+     scanned is re-checked against the active chain, and the hooks flag any
+     disconnect at a scanned height.  Either way (reorg: every height above
+     the fork changes with it) the shadow is dropped and the rescan returns
+     an error rather than installing a mix of two branches;
+   - [Wallet.rebuild_lock] keeps the startup reconcile, which writes the live
+     ledger in place, from running while the shadow is being built. *)
+let handle_rescanblockchain_lwt (ctx : rpc_context)
+    (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result Lwt.t =
+  match rescan_prepare ctx params with
+  | Error e -> Lwt.return (Error e)
+  | Ok (wallet, start_height, stop_height) ->
+    Lwt_mutex.with_lock (Wallet.rebuild_lock wallet) @@ fun () ->
+    let rs = Wallet.rescan_begin wallet ~start_height ~stop_height in
+    let is_active = function
+      | Some (lh, lhash) ->
+        (match Storage.ChainDB.get_hash_at_height ctx.chain.db lh with
+         | Some cur -> Cstruct.equal cur lhash
+         | None -> false)
+      | None -> true in
+    let reorg_error h =
+      Error (Printf.sprintf
+               "Chain reorganized during rescan (height %d changed); \
+                rerun rescanblockchain" h) in
+    let rec go h last =
+      let failed_at =
+        match rs.Wallet.rs_stale with
+        | Some sh -> Some sh
+        | None when not (is_active last) ->
+          (match last with Some (lh, _) -> Some lh | None -> Some h)
+        | None -> None in
+      match failed_at with
+      | Some fh ->
+        Wallet.rescan_unregister rs;
+        Lwt.return (reorg_error fh)
+      | None when h > stop_height ->
+        (match Wallet.rescan_commit rs ~still_active:(is_active last) with
+         | Ok () ->
+           (try Wallet.save wallet with _ -> ());
+           Lwt.return (Ok (rescan_result start_height stop_height))
+         | Error fh ->
+           let fh = match fh, last with
+             | Some fh, _ -> fh | None, Some (lh, _) -> lh | None, None -> h in
+           Lwt.return (reorg_error fh))
+      | None ->
+        Wallet.rescan_sync_ownership rs;
+        let t0 = Unix.gettimeofday () in
+        let rec slice h last =
+          if h > stop_height then (h, last)
+          else begin
+            let last =
+              match rescan_one ctx rs.Wallet.rs_ledger h with
+              | Some hash -> Some (h, hash)
+              | None -> last in
+            Wallet.rescan_advance rs (h + 1);
+            if Unix.gettimeofday () -. t0 >= rescan_slice_s then (h + 1, last)
+            else slice (h + 1) last
+          end in
+        let (h', last') = slice h last in
+        if h' > stop_height then go h' last'
+        else Lwt.bind (Lwt.pause ()) (fun () -> go h' last')
+    in
+    Lwt.catch (fun () -> go start_height None)
+      (fun exn -> Wallet.rescan_unregister rs; Lwt.fail exn)
 
 (* ============================================================================
    importprivkey "privkey" ( "label" rescan )
@@ -16802,6 +16906,24 @@ let handle_single_request_lwt (ctx : rpc_context) (json : Yojson.Safe.t)
          (fun exn ->
            Lwt.return (json_rpc_error ~id ~code:rpc_misc_error
                          ~message:(Printexc.to_string exn))))
+  | None when method_name = "rescanblockchain" ->
+    (* Chain-lock writer, but it walks the whole chain: run it on the Lwt
+       thread in slices (handle_rescanblockchain_lwt), holding the RPC mutex
+       so it stays serialised against every other handler. *)
+    (match check_core_arity method_name params with
+     | Some (code, message) -> Lwt.return (json_rpc_error ~id ~code ~message)
+     | None ->
+       Lwt_mutex.with_lock rpc_lwt_mutex (fun () ->
+         Lwt.catch
+           (fun () ->
+             Lwt.map (function
+               | Ok r -> json_rpc_response ~id ~result:r
+               | Error msg ->
+                 json_rpc_error ~id ~code:rpc_misc_error ~message:msg)
+               (handle_rescanblockchain_lwt ctx params))
+           (fun exn ->
+             Lwt.return (json_rpc_error ~id ~code:rpc_misc_error
+                           ~message:(Printexc.to_string exn)))))
   | None ->
     (* Monitoring RPCs stay on the Lwt loop so a slow handler cannot make
        getblockcount look DOWN. Everything else runs on the preemptive
@@ -16903,6 +17025,14 @@ let context_with_wallet (ctx : rpc_context) (wallet_name : string option) : rpc_
 
    Mirrors Bitcoin Core's BIP-78 §"Protocol" TLS-only payment server
    requirement.  Reference: bitcoin-core/src/httpserver.cpp. *)
+(* Core mounts the REST handlers on the JSON-RPC listener when -rest is set
+   (httpserver.cpp: one "/rest/" prefix handler on the shared HTTP server).
+   Rest depends on Rpc, so Cli installs the dispatcher here at boot. Unset
+   (the default) keeps the listener POST-only. *)
+let rest_hook :
+  (rpc_context -> Cohttp.Request.t -> string ->
+   (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t) option ref = ref None
+
 let start_rpc_server ~(ctx : rpc_context)
     ~(host : string) ~(port : int)
     ~(rpc_user : string) ~(rpc_password : string)
@@ -16937,6 +17067,15 @@ let start_rpc_server ~(ctx : rpc_context)
     let wallet_name = extract_wallet_from_uri uri in
     let request_ctx = context_with_wallet ctx wallet_name in
 
+    (* REST (GET under /rest/) is unauthenticated in Core and shares this listener
+       when -rest is enabled. *)
+    let path = Uri.path uri in
+    let rest_handler =
+      if meth = `GET && String.length path >= 6 && String.sub path 0 6 = "/rest/"
+      then !rest_hook else None in
+    match rest_handler with
+    | Some h -> h ctx req path
+    | None ->
     (* Only accept POST requests *)
     if meth <> `POST then begin
       let response_headers = Cohttp.Header.init_with

@@ -3409,6 +3409,137 @@ let save_flush_interval = 30.0
 let last_flush_time = ref 0.0
 let last_flush_fingerprint = ref min_int
 
+(* ============================================================================
+   Sliced rescan: a shadow ledger beside the live one
+   ============================================================================
+
+   rescanblockchain's Lwt handler yields between slices, so the block-connect
+   hooks ([scan_block_and_persist] / [unscan_block_and_persist]) and the
+   startup reconcile can run in the middle of it.  If the rescan rebuilt the
+   LIVE ledger in place, a block connecting before the slice reached the
+   output it spends would be applied to a cleared ledger: [scan_block] debits
+   an input only when the outpoint is already tracked, so the spend would be
+   dropped and the later rescan of the creating block would credit the spent
+   coin again — and the hook would persist that partial ledger with
+   [last_synced_height] at the tip.
+
+   So the rescan rebuilds a SHADOW copy of the chain-derived ledger (utxos,
+   balances, history) while the live wallet keeps serving, and keeps being
+   moved by, the hooks.  The hooks report each block to the shadow:
+     - above the rescan's stop height: deferred, replayed in order onto the
+       shadow once the scan is done (the range ends at stop; these blocks
+       build on it);
+     - at or below stop, at a height the shadow has already scanned: the
+       chain changed under the scan, the shadow is stale;
+     - at or below stop, not yet scanned: a connect is picked up when the
+       slice reaches that height (it reads the active chain); a disconnect
+       is unscanned from the shadow too, which matters for a start > 0
+       rescan whose shadow began as a copy of the live ledger.
+   [rescan_commit] installs the shadow into the live wallet only if it is
+   not stale; otherwise the live ledger (which already followed the reorg)
+   is left alone.  The live ledger and [last_synced_height] are never
+   cleared or rewound by the rescan, so nothing partial is ever persisted. *)
+
+type rescan_event =
+  | Rescan_connect of Types.block * int
+  | Rescan_disconnect of Types.block * int
+
+type rescan_shadow = {
+  rs_live : t;
+  rs_ledger : t;                      (* the ledger being rebuilt *)
+  rs_stop : int;
+  mutable rs_next : int;              (* lowest height not yet scanned *)
+  mutable rs_stale : int option;      (* scanned height the chain changed at *)
+  mutable rs_deferred : rescan_event list;  (* above stop, newest first *)
+}
+
+(* Every sliced rescan in flight, keyed physically by its live wallet. *)
+let active_rescans : rescan_shadow list ref = ref []
+
+(* Start a sliced rescan of [start_height .. stop_height] for [w].  A start-0
+   rescan rebuilds from an empty ledger (as [clear_for_rescan] would); a
+   partial one starts from a copy of the live ledger and relies on
+   [scan_block]'s {txid,vout} idempotency, exactly like the synchronous
+   handler. *)
+let rescan_begin (w : t) ~(start_height : int) ~(stop_height : int)
+    : rescan_shadow =
+  let ledger =
+    if start_height = 0 then
+      { w with utxos = []; balance_confirmed = 0L; balance_unconfirmed = 0L;
+               tx_history = [] }
+    else
+      { w with utxos = w.utxos } in
+  let rs = { rs_live = w; rs_ledger = ledger; rs_stop = stop_height;
+             rs_next = start_height; rs_stale = None; rs_deferred = [] } in
+  active_rescans := rs :: !active_rescans;
+  rs
+
+(* Ownership is the live wallet's: a key or watch script added while the
+   rescan runs must count for the shadow too.  Called before each slice. *)
+let rescan_sync_ownership (rs : rescan_shadow) : unit =
+  rs.rs_ledger.keys <- rs.rs_live.keys;
+  rs.rs_ledger.watch_scripts <- rs.rs_live.watch_scripts
+
+(* Record that every height below [next] has been scanned into the shadow. *)
+let rescan_advance (rs : rescan_shadow) (next : int) : unit =
+  rs.rs_next <- next
+
+let rescan_unregister (rs : rescan_shadow) : unit =
+  active_rescans := List.filter (fun r -> r != rs) !active_rescans
+
+let rescan_observe (w : t) (ev : rescan_event) : unit =
+  List.iter (fun rs ->
+    if rs.rs_live == w then begin
+      let h = match ev with Rescan_connect (_, h) | Rescan_disconnect (_, h) -> h in
+      if h > rs.rs_stop then rs.rs_deferred <- ev :: rs.rs_deferred
+      else if h < rs.rs_next then begin
+        if rs.rs_stale = None then rs.rs_stale <- Some h
+      end else
+        match ev with
+        | Rescan_disconnect (b, h) -> unscan_block rs.rs_ledger b h
+        | Rescan_connect _ -> ()
+    end) !active_rescans
+
+(* Finish a sliced rescan.  [still_active] is the caller's check that the
+   last height it scanned still holds the block it scanned (a block fixes all
+   of its ancestors, so that one check covers every scanned height).  On
+   success the deferred above-stop blocks are replayed in order onto the
+   shadow and the shadow's ledger replaces the live one; [last_synced_height]
+   is left as the hooks maintained it.  On failure returns the height that
+   changed and leaves the live wallet untouched. *)
+let rescan_commit (rs : rescan_shadow) ~(still_active : bool)
+    : (unit, int option) result =
+  rescan_unregister rs;
+  match rs.rs_stale with
+  | Some h -> Error (Some h)
+  | None when not still_active -> Error None
+  | None ->
+    rescan_sync_ownership rs;
+    List.iter (function
+      | Rescan_connect (b, h) -> scan_block rs.rs_ledger b h
+      | Rescan_disconnect (b, h) -> unscan_block rs.rs_ledger b h)
+      (List.rev rs.rs_deferred);
+    let live = rs.rs_live and s = rs.rs_ledger in
+    live.utxos <- s.utxos;
+    live.balance_confirmed <- s.balance_confirmed;
+    live.balance_unconfirmed <- s.balance_unconfirmed;
+    live.tx_history <- s.tx_history;
+    Ok ()
+
+(* Ledger rebuilds that yield (the startup [reconcile_to_tip_lwt] and the
+   sliced rescan) take this per-wallet lock so they never interleave: the
+   reconcile writes the live ledger in place and would re-credit coins the
+   committed shadow had already seen spent. *)
+let rebuild_locks : (t * Lwt_mutex.t) list ref = ref []
+
+let rebuild_lock (w : t) : Lwt_mutex.t =
+  match List.assq_opt w !rebuild_locks with
+  | Some m -> m
+  | None ->
+    let m = Lwt_mutex.create () in
+    rebuild_locks := (w, m) :: !rebuild_locks;
+    m
+
 (* Fold a single connected block into the ledger AND persist the result, and
    advance [last_synced_height].  This is the block-connect choke point the
    live P2P/IBD loop and the mining path both call (wired in cli.ml).  Bundling
@@ -3426,6 +3557,7 @@ let last_flush_fingerprint = ref min_int
 let scan_block_and_persist (w : t) (block : Types.block) (height : int) : unit =
   let fp_before = ledger_fingerprint w in
   scan_block w block height;
+  rescan_observe w (Rescan_connect (block, height));
   if height > w.last_synced_height then w.last_synced_height <- height;
   let fp_after = ledger_fingerprint w in
   let now = Unix.gettimeofday () in
@@ -3441,6 +3573,7 @@ let scan_block_and_persist (w : t) (block : Types.block) (height : int) : unit =
 (* Reverse a block on a reorg AND persist. *)
 let unscan_block_and_persist (w : t) (block : Types.block) (height : int) : unit =
   unscan_block w block height;
+  rescan_observe w (Rescan_disconnect (block, height));
   (* A disconnect rewinds the synced frontier to the parent height so the
      reconcile re-applies the new active-chain block at [height]. *)
   if w.last_synced_height >= height then w.last_synced_height <- height - 1;
@@ -3513,6 +3646,7 @@ let reconcile_to_tip (w : t)
 let reconcile_to_tip_lwt (w : t)
     ~(tip_height : int)
     ~(get_block_at : int -> Types.block option) : unit Lwt.t =
+  Lwt_mutex.with_lock (rebuild_lock w) @@ fun () ->
   let start = w.last_synced_height + 1 in
   if start > tip_height then Lwt.return_unit  (* at/ahead of tip: nothing to do *)
   else begin

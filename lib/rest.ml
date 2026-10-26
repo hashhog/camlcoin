@@ -646,23 +646,9 @@ let handle_mempool_info (ctx : Rpc.rpc_context) (_req : Cohttp.Request.t)
   let rf, _ = parse_data_format uri_part in
   match rf with
   | JSON ->
-    let (count, _, total_fee) = Mempool.get_info ctx.mempool in
-    let json = `Assoc [
-      ("loaded", `Bool true);
-      ("size", `Int count);
-      ("bytes", `Int (Mempool.total_vsize ctx.mempool));
-      ("usage", `Int (Mempool.get_usage ctx.mempool));
-      ("maxmempool", `Int ctx.mempool.max_size_bytes);
-      (* sat/kvB -> BTC/kvB is /. 1e8 (was /. 100_000.0, a real unit bug:
-         it rendered 100 sat/kvB as 0.001 instead of 0.00000100). Read the
-         live floor + module incremental constant, matching the RPC. *)
-      ("mempoolminfee", `Float (Int64.to_float (Mempool.effective_min_fee ctx.mempool) /. 1e8));
-      ("minrelaytxfee", `Float (Int64.to_float ctx.mempool.min_relay_fee /. 1e8));
-      ("incrementalrelayfee", `Float (Int64.to_float Mempool.incremental_relay_fee /. 1e8));
-      ("unbroadcastcount", `Int (Mempool.unbroadcast_count ctx.mempool));
-      ("fullrbf", `Bool true);
-      ("totalfee", `Float (Int64.to_float total_fee /. 100_000_000.0));
-    ] in
+    (* Core rest_mempool/info is MempoolInfoToJSON, the same object as the
+       getmempoolinfo RPC. *)
+    let json = Rpc.handle_getmempoolinfo ctx in
     respond_json (Yojson.Safe.to_string json)
   | _ ->
     respond_error `Not_found "output format not found (available: json)"
@@ -680,43 +666,9 @@ let handle_mempool_contents (ctx : Rpc.rpc_context) (req : Cohttp.Request.t)
       | Some "false" -> false
       | _ -> true
     in
-    (* Get all transactions from mempool *)
-    let txs = Mempool.get_all_transactions ctx.mempool in
-    let json =
-      if verbose then
-        `Assoc (List.map (fun tx ->
-          let txid = Crypto.compute_txid tx in
-          let txid_str = Types.hash256_to_hex_display txid in
-          match Mempool.get ctx.mempool txid with
-          | None -> (txid_str, `Null)
-          | Some entry ->
-            let weight = Validation.compute_tx_weight entry.tx in
-            let vsize = (weight + 3) / 4 in
-            let fees = entry.fee in
-            let ancestors = Mempool.get_ancestors ctx.mempool txid in
-            let descendants = Mempool.get_descendants ctx.mempool txid in
-            (txid_str, `Assoc [
-              ("vsize", `Int vsize);
-              ("weight", `Int (Validation.compute_tx_weight entry.tx));
-              ("fee", `Float (Int64.to_float fees /. 100_000_000.0));
-              ("time", `Float entry.time_added);
-              ("height", `Int entry.height_added);
-              ("descendantcount", `Int (List.length descendants + 1));
-              ("descendantsize", `Int vsize);
-              ("ancestorcount", `Int (List.length ancestors + 1));
-              ("ancestorsize", `Int vsize);
-              ("depends", `List (List.map (fun (e : Mempool.mempool_entry) ->
-                `String (Types.hash256_to_hex_display e.txid)) ancestors));
-              ("spentby", `List (List.map (fun (e : Mempool.mempool_entry) ->
-                `String (Types.hash256_to_hex_display e.txid)) descendants));
-            ])
-        ) txs)
-      else
-        `List (List.map (fun tx ->
-          let txid = Crypto.compute_txid tx in
-          `String (Types.hash256_to_hex_display txid)
-        ) txs)
-    in
+    (* Core rest_mempool/contents is MempoolToJSON, the same object as
+       getrawmempool(verbose). *)
+    let json = Rpc.handle_getrawmempool ctx [`Bool verbose] in
     respond_json (Yojson.Safe.to_string json)
   | _ ->
     respond_error `Not_found "output format not found (available: json)"

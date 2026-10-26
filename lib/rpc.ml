@@ -17000,6 +17000,14 @@ let context_with_wallet (ctx : rpc_context) (wallet_name : string option) : rpc_
 
    Mirrors Bitcoin Core's BIP-78 §"Protocol" TLS-only payment server
    requirement.  Reference: bitcoin-core/src/httpserver.cpp. *)
+(* Core mounts the REST handlers on the JSON-RPC listener when -rest is set
+   (httpserver.cpp: one "/rest/" prefix handler on the shared HTTP server).
+   Rest depends on Rpc, so Cli installs the dispatcher here at boot. Unset
+   (the default) keeps the listener POST-only. *)
+let rest_hook :
+  (rpc_context -> Cohttp.Request.t -> string ->
+   (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t) option ref = ref None
+
 let start_rpc_server ~(ctx : rpc_context)
     ~(host : string) ~(port : int)
     ~(rpc_user : string) ~(rpc_password : string)
@@ -17034,6 +17042,15 @@ let start_rpc_server ~(ctx : rpc_context)
     let wallet_name = extract_wallet_from_uri uri in
     let request_ctx = context_with_wallet ctx wallet_name in
 
+    (* REST (GET under /rest/) is unauthenticated in Core and shares this listener
+       when -rest is enabled. *)
+    let path = Uri.path uri in
+    let rest_handler =
+      if meth = `GET && String.length path >= 6 && String.sub path 0 6 = "/rest/"
+      then !rest_hook else None in
+    match rest_handler with
+    | Some h -> h ctx req path
+    | None ->
     (* Only accept POST requests *)
     if meth <> `POST then begin
       let response_headers = Cohttp.Header.init_with

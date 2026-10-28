@@ -46,7 +46,7 @@ let tx ~ins ~outs ~wit =
           witnesses = List.map (fun _ -> wit ()) ins;
           locktime = 0l }
 
-let with_mempool f =
+let with_mempool_utxo f =
   rm_rf test_db_path;
   let db = Storage.ChainDB.create test_db_path in
   let utxo = Utxo.UtxoSet.create db in
@@ -58,7 +58,9 @@ let with_mempool f =
   let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false
              ~verify_scripts:false ~utxo ~current_height:200 () in
   Fun.protect ~finally:(fun () -> Storage.ChainDB.close db; rm_rf test_db_path)
-    (fun () -> f mp)
+    (fun () -> f mp utxo)
+
+let with_mempool f = with_mempool_utxo (fun mp _ -> f mp)
 
 let add mp t =
   match Mempool.add_transaction mp t with
@@ -132,6 +134,70 @@ let test_pressure () =
     Alcotest.(check int) "pool size" 14 (Hashtbl.length mp.Mempool.entries);
     usage "12 heavy + cluster" 4_773_160 mp)
 
+(* warden_e / seed_warden_e: a confirmed parent's 64 outputs are spent by 64
+   in-pool children, then invalidateblock returns the parent.  Core's refill
+   puts all 65 in one cluster, trims the cheapest child (child 0) to the
+   64-transaction limit, and is left with one 64-transaction cluster.  It
+   chunks that cluster's linearization (parent, then the children by
+   descending feerate) with ChunkLinearization, so the parent absorbs every
+   child whose feerate beats the chunk so far: 30 chunks for warden_e's fees
+   and 19 for seed_warden_e's, each one m_main_chunkindex node.
+   txns_randomized grew to 128 at 65 entries and does not shrink at 64. *)
+let fan_out ~parent_outs ~parent_fee ~child_fee ~script ~script_sig ~wit k =
+  with_mempool_utxo (fun mp utxo ->
+    let with_sig t =
+      { t with Types.inputs =
+          List.map (fun i -> { i with Types.script_sig }) t.Types.inputs } in
+    let parent_tx =
+      with_sig (tx ~ins:[ (coin 0, 0) ]
+                  ~outs:(List.map (fun v -> (v, script)) parent_outs) ~wit) in
+    assert (Int64.add (List.fold_left Int64.add 0L parent_outs) parent_fee = coin_value);
+    let ptxid = Crypto.compute_txid parent_tx in
+    (* the parent is confirmed: its outputs are coins *)
+    List.iteri (fun i value ->
+      Utxo.UtxoSet.add utxo ptxid i
+        Utxo.{ value; script_pubkey = script; height = 2; is_coinbase = false })
+      parent_outs;
+    let children = List.init 64 (fun i ->
+      with_sig (tx ~ins:[ (ptxid, i) ]
+                  ~outs:[ (Int64.sub (List.nth parent_outs i) (child_fee i), script) ]
+                  ~wit)) in
+    List.iter (add mp) children;
+    (* invalidateblock: the parent's coins go away and it is re-accepted *)
+    List.iteri (fun i _ -> ignore (Utxo.UtxoSet.remove utxo ptxid i)) parent_outs;
+    let readded =
+      Mempool.update_for_reorg mp ~disconnected:[ parent_tx ] ~dropped:[] in
+    Alcotest.(check int) "parent re-accepted" 1 readded;
+    Alcotest.(check int) "pool size" 64 (Hashtbl.length mp.Mempool.entries);
+    Alcotest.(check bool) "parent in pool" true (Mempool.contains mp ptxid);
+    Alcotest.(check bool) "child 0 trimmed" false
+      (Mempool.contains mp (Crypto.compute_txid (List.hd children)));
+    k mp)
+
+(* row warden_e/e-invalidate/info:usage: P2WPKH parent into 64 P2WPKH
+   outputs, fee 10000; child i pays (i + 1) * 1000 *)
+let test_warden_e () =
+  let spendable = Int64.sub coin_value 10_000L in
+  let each = Int64.div spendable 64L in
+  let rem = Int64.sub spendable (Int64.mul each 64L) in
+  let outs = List.init 64 (fun i -> if i = 0 then Int64.add each rem else each) in
+  fan_out ~parent_outs:outs ~parent_fee:10_000L
+    ~child_fee:(fun i -> Int64.of_int ((i + 1) * 1000))
+    ~script:p2wpkh ~script_sig:Cstruct.empty ~wit:wpkh_witness
+    (usage "64-tx fan-out cluster, 30 chunks" 75_288)
+
+(* row seed_warden_e/invalidate/info:usage: P2SH(OP_TRUE) parent into 64
+   outputs of 200000 plus change, fee 10000; child i pays 5000 + 200 * i *)
+let test_seed_warden_e () =
+  let p2sh = Cstruct.of_string ("\xa9\x14" ^ String.make 20 '\x33' ^ "\x87") in
+  let change = Int64.sub coin_value (Int64.of_int ((64 * 200_000) + 10_000)) in
+  let outs = List.init 64 (fun _ -> 200_000L) @ [ change ] in
+  fan_out ~parent_outs:outs ~parent_fee:10_000L
+    ~child_fee:(fun i -> Int64.of_int (5_000 + (i * 200)))
+    ~script:p2sh ~script_sig:(Cstruct.of_string "\x01\x51")
+    ~wit:(fun () -> Types.{ items = [] })
+    (usage "64-tx P2SH fan-out cluster, 19 chunks" 60_296)
+
 let () =
   Alcotest.run "mempool_usage_core" [
     "usage", [
@@ -141,5 +207,7 @@ let () =
       Alcotest.test_case "parent/child cluster matches Core" `Quick test_chain;
       Alcotest.test_case "drained pool matches Core" `Quick test_drained;
       Alcotest.test_case "pressure pool matches Core" `Quick test_pressure;
+      Alcotest.test_case "warden_e fan-out cluster matches Core" `Quick test_warden_e;
+      Alcotest.test_case "seed_warden_e fan-out cluster matches Core" `Quick test_seed_warden_e;
     ]
   ]

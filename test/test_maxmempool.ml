@@ -74,8 +74,10 @@ let test_limit_is_configurable () =
   Alcotest.(check int) "Cli default_config" 300 Cli.default_config.maxmempool_mb
 
 (* Core v31.1 getmempoolinfo "usage" for the core-regtest P2WSH-drop spend
-   (witness items 80, 80, 3 bytes; one 22-byte output): 1272 with 1 input,
-   397512 with 800. *)
+   (witness items 80, 80, 3 bytes; one 22-byte output): 1272 for a pool of one
+   such tx with 1 input, of which 64 is the pool's txns_randomized vector and
+   1208 the transaction's own share; 397512 per tx with 800 inputs.  The pool
+   total is checked in test/mempool_usage_core. *)
 let drop_spend n_in =
   Types.{ version = 2l;
           inputs = List.init n_in (fun i ->
@@ -92,8 +94,8 @@ let test_usage_matches_core () =
   let close name want got tol =
     Alcotest.(check bool) (Printf.sprintf "%s: want %d got %d" name want got)
       true (abs (want - got) <= tol) in
-  close "1 input" 1272 (Mempool.tx_dynamic_usage (drop_spend 1)) 5;
-  close "800 inputs" 397_512 (Mempool.tx_dynamic_usage (drop_spend 800)) 100
+  close "1 input" 1208 (Mempool.tx_dynamic_usage (drop_spend 1)) 0;
+  close "800 inputs" 397_512 (Mempool.tx_dynamic_usage (drop_spend 800)) 0
 
 let test_eviction_at_limit () =
   with_mempool ~max_size_mb:1 (fun mp ->

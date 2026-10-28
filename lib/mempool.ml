@@ -80,51 +80,65 @@ type orphan_entry = {
    therefore holds far fewer bytes of transaction than N MB, and matching which
    transactions survive a given limit needs the same yardstick.
 
-   [tx_dynamic_usage] estimates it from the transaction's shape.  The terms
-   follow core_memusage.h RecursiveDynamicUsage(CTransaction) with
-   memusage::MallocUsage (memusage.h:52, 64-bit):
-     vin  vector     MallocUsage(n_in  * sizeof(CTxIn)=96)
-     vout vector     MallocUsage(n_out * sizeof(CTxOut)=40)
-     per input       witness-stack vector MallocUsage(24 * capacity), capacity
-                     = items rounded up to a power of two (vector growth),
-                     plus one MallocUsage(len) per item; a scriptSig over 28
-                     bytes is heap-allocated (prevector), shorter ones inline
-     per output      a scriptPubKey over 28 bytes is heap-allocated
-     per input       one mapNextTx node, MallocUsage(48) = 64
-   The per-entry term (CTxMemPoolEntry + TxGraph share) is not modelled
-   structurally; [usage_entry_fixed] is calibrated against Core v31.1
-   getmempoolinfo "usage" as measured by tools/core-regtest: a 1-input,
-   1-output P2WSH spend (witness items 80, 80, 3 bytes) = 1272 bytes, and the
-   same shape with 800 inputs = 397512 bytes per tx (steady increments in the
-   warden_invalidated_submit pressure phase).  The estimate reproduces 1272
-   exactly and 397512 within 0.02%; it is an estimate of Core's allocator
-   accounting, not a copy of it. *)
+   Core v31.1 CTxMemPool::DynamicMemoryUsage (txmempool.cpp:778) is
+     MallocUsage(sizeof(CTxMemPoolEntry) + 9 pointers) per entry   mapTx
+   + MallocUsage(48) per input                                      mapNextTx
+   + MallocUsage(40 * txns_randomized.capacity())                   txns_randomized
+   + m_txgraph->GetMainMemoryUsage()                                TxGraph
+   + sum of entry nUsageSize = RecursiveDynamicUsage(CTransactionRef)
+   with memusage::MallocUsage (memusage.h:52, 64-bit) rounding each heap block.
+   The sizes are those of the v31.1 x86_64 build: CTxMemPoolEntry 136,
+   CTransaction 128, CTxIn 112, CTxOut 48, TxGraphImpl::Entry 80,
+   SingletonClusterImpl 48, GenericClusterImpl 104, DepGraph entry 32; CScript
+   is a prevector<36> (scripts up to 36 bytes are stored inline).
+
+   [tx_dynamic_usage] is the part one transaction adds on its own, as if it
+   were a singleton cluster with one chunk: everything above except the
+   txns_randomized vector, which [get_usage] adds from its tracked capacity,
+   and the difference a multi-transaction cluster makes, which [get_usage]
+   adds from the pool's clusters.  -maxmempool trimming compares
+   [total_usage], the sum of [tx_dynamic_usage]; both omitted terms are a few
+   dozen bytes per transaction. *)
 let malloc_usage (alloc : int) : int =
   if alloc = 0 then 0 else ((alloc + 31) lsr 4) lsl 4
 
-let usage_entry_fixed = 696    (* CTxMemPoolEntry + TxGraph per-tx share *)
-let usage_map_next_tx = 64     (* one mapNextTx std::map node per input *)
+let usage_map_tx_entry = malloc_usage (136 + (9 * 8))     (* 224 *)
+let usage_tx_ref = malloc_usage 128 + malloc_usage 24     (* shared_ptr<CTransaction> + control block *)
+let usage_graph_entry = 80                                (* TxGraphImpl::Entry *)
+let usage_singleton_cluster = malloc_usage 48 + 8         (* SingletonClusterImpl + m_clusters slot *)
+let usage_chunk_index = malloc_usage (32 + 8)             (* one m_main_chunkindex std::set node *)
+let usage_map_next_tx = malloc_usage 48                   (* one mapNextTx node per input *)
+let usage_randomized_elem = 40                            (* pair<Wtxid, txiter> *)
 
-let tx_dynamic_usage (tx : Types.transaction) : int =
-  let n_in = List.length tx.Types.inputs in
-  let n_out = List.length tx.Types.outputs in
-  let prevector_heap (s : Cstruct.t) =
-    let l = Cstruct.length s in if l > 28 then malloc_usage l else 0 in
+(* core_memusage.h RecursiveDynamicUsage(CTransaction).  Deserialization
+   reserves vectors to their exact size, so capacity = length. *)
+let tx_recursive_usage (tx : Types.transaction) : int =
+  let script (s : Cstruct.t) =
+    let l = Cstruct.length s in if l > 36 then malloc_usage l else 0 in
   let ins = List.fold_left (fun acc (i : Types.tx_in) ->
-    acc + prevector_heap i.Types.script_sig + usage_map_next_tx) 0 tx.Types.inputs in
+    acc + script i.Types.script_sig) 0 tx.Types.inputs in
   let outs = List.fold_left (fun acc (o : Types.tx_out) ->
-    acc + prevector_heap o.Types.script_pubkey) 0 tx.Types.outputs in
+    acc + script o.Types.script_pubkey) 0 tx.Types.outputs in
   let wit = List.fold_left (fun acc (w : Types.tx_witness) ->
     let items = w.Types.items in
-    if items = [] then acc
-    else
-      let n = List.length items in
-      let cap = let rec p c = if c >= n then c else p (c * 2) in p 1 in
-      acc + malloc_usage (24 * cap)
-      + List.fold_left (fun a it -> a + malloc_usage (Cstruct.length it)) 0 items)
+    acc + malloc_usage (24 * List.length items)
+    + List.fold_left (fun a it -> a + malloc_usage (Cstruct.length it)) 0 items)
     0 tx.Types.witnesses in
-  usage_entry_fixed + malloc_usage (n_in * 96) + malloc_usage (n_out * 40)
+  malloc_usage (List.length tx.Types.inputs * 112)
+  + malloc_usage (List.length tx.Types.outputs * 48)
   + ins + outs + wit
+
+let tx_dynamic_usage (tx : Types.transaction) : int =
+  usage_map_tx_entry + usage_tx_ref + usage_graph_entry
+  + usage_singleton_cluster + usage_chunk_index
+  + (List.length tx.Types.inputs * usage_map_next_tx)
+  + tx_recursive_usage tx
+
+(* GenericClusterImpl::TotalMemoryUsage (txgraph.cpp:915) for a compacted
+   cluster of [n] transactions: m_mapping and m_linearization (uint32 each),
+   the DepGraph entries, the cluster object and its m_clusters slot. *)
+let generic_cluster_usage (n : int) : int =
+  (2 * malloc_usage (4 * n)) + malloc_usage (32 * n) + malloc_usage 104 + 8
 
 (* ============================================================================
    Mempool State
@@ -133,7 +147,8 @@ let tx_dynamic_usage (tx : Types.transaction) : int =
 type mempool = {
   mutable entries : (string, mempool_entry) Hashtbl.t;
   mutable total_weight : int;
-  mutable total_usage : int;  (* estimate of Core's DynamicMemoryUsage(); what -maxmempool bounds *)
+  mutable total_usage : int;  (* sum of tx_dynamic_usage; what -maxmempool bounds *)
+  mutable randomized_cap : int;  (* capacity Core's txns_randomized vector would have *)
   mutable total_fee : int64;
   max_size_bytes : int;       (* default 300 MB = 300_000_000 bytes (SI, matching Core) *)
   min_relay_fee : int64;      (* minimum fee rate in sat/kvB *)
@@ -413,6 +428,7 @@ let create ?(require_standard=true) ?(verify_scripts=true)
   { entries = Hashtbl.create 10_000;
     total_weight = 0;
     total_usage = 0;
+    randomized_cap = 0;
     total_fee = 0L;
     (* DEFAULT_MAX_MEMPOOL_SIZE_MB * 1_000_000 — SI megabytes, not MiB.
        Reference: bitcoin-core/src/kernel/mempool_options.h:40
@@ -669,6 +685,10 @@ let rec remove_transaction (mp : mempool) (txid : Types.hash256) : unit =
     ) entry.depends_on;
     mp.total_weight <- mp.total_weight - entry.weight;
     mp.total_usage <- mp.total_usage - tx_dynamic_usage entry.tx;
+    (* txns_randomized: swap-and-pop, shrink_to_fit once under half full;
+       the last removal clear()s and keeps the capacity (txmempool.cpp:289). *)
+    (let n = Hashtbl.length mp.entries in
+     if n > 0 && n * 2 < mp.randomized_cap then mp.randomized_cap <- n);
     mp.total_fee <- Int64.sub mp.total_fee entry.fee;
     List.iter (fun inp ->
       let out_key = (Cstruct.to_string inp.Types.previous_output.txid,
@@ -3014,6 +3034,10 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
               ) !depends;
               mp.total_weight <- mp.total_weight + weight;
               mp.total_usage <- mp.total_usage + tx_dynamic_usage tx;
+              (* txns_randomized.emplace_back: libstdc++ doubles a full vector *)
+              (let before = Hashtbl.length mp.entries - 1 in
+               if before >= mp.randomized_cap then
+                 mp.randomized_cap <- (if before = 0 then 1 else 2 * before));
               mp.total_fee <- Int64.add mp.total_fee fee;
               List.iter (fun inp ->
                 let out_key = (Cstruct.to_string inp.Types.previous_output.txid,
@@ -3571,8 +3595,30 @@ let select_for_block (mp : mempool) ~(max_weight : int)
    Mempool Info
    ============================================================================ *)
 
-(* Estimated DynamicMemoryUsage() of the pool — getmempoolinfo "usage". *)
-let get_usage (mp : mempool) : int = mp.total_usage
+(* DynamicMemoryUsage() of the pool — getmempoolinfo "usage".  [total_usage]
+   counts every transaction as a singleton cluster with one chunk; replace
+   that with the real TxGraph terms for each multi-transaction cluster (one
+   GenericClusterImpl, one chunk-index node per chunk) and add the
+   txns_randomized vector. *)
+let get_usage (mp : mempool) : int =
+  let clustered =
+    Hashtbl.fold (fun _ (e : mempool_entry) acc ->
+      acc || List.exists (fun p -> Hashtbl.mem mp.entries (Cstruct.to_string p))
+               e.depends_on) mp.entries false in
+  let cluster_delta =
+    if not clustered then 0
+    else
+      List.fold_left (fun acc (c : cluster) ->
+        let n = List.length c.txs in
+        if n < 2 then acc
+        else
+          acc + generic_cluster_usage n
+          + (usage_chunk_index * List.length (linearize_cluster c mp))
+          - (n * (usage_singleton_cluster + usage_chunk_index)))
+        0 (get_clusters mp)
+  in
+  mp.total_usage + cluster_delta
+  + malloc_usage (usage_randomized_elem * mp.randomized_cap)
 
 (* Get mempool statistics *)
 let get_info (mp : mempool) : (int * int * int64) =

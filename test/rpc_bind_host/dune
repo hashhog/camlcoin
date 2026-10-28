@@ -1,0 +1,5 @@
+; RPC listener honours --rpchost (fix-camlcoin-rpc-bind-loopback). Own
+; directory so the shared test/dune names list is untouched.
+(test
+ (name test_rpc_bind_host)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix))

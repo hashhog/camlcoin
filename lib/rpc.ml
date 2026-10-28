@@ -17165,6 +17165,13 @@ let start_rpc_server ~(ctx : rpc_context)
   in
 
   let server = Cohttp_lwt_unix.Server.make ~callback () in
+  (* Conduit's [`TCP (`Port p)] and [`TLS (..., `Port p)] modes carry no
+     address: the listener binds [ctx.src], and INADDR_ANY when that is unset.
+     Passing no ctx put the RPC on every interface while the log above said
+     127.0.0.1.  Core binds only -rpcbind, loopback by default
+     (httpserver.cpp HTTPBindAddresses). *)
+  let* conduit_ctx = Conduit_lwt_unix.init ~src:host () in
+  let ctx = Cohttp_lwt_unix.Net.init ~ctx:conduit_ctx () in
   let mode : Conduit_lwt_unix.server =
     match tls_cert_path, tls_key_path with
     | None, None ->
@@ -17202,7 +17209,7 @@ let start_rpc_server ~(ctx : rpc_context)
            Both must be provided together for HTTPS.");
       failwith "RPC TLS: key provided without cert"
   in
-  Cohttp_lwt_unix.Server.create ~mode server
+  Cohttp_lwt_unix.Server.create ~ctx ~mode server
 
 (* ============================================================================
    Server Creation Helpers

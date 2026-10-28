@@ -3595,6 +3595,22 @@ let select_for_block (mp : mempool) ~(max_weight : int)
    Mempool Info
    ============================================================================ *)
 
+(* Number of chunks Core's ChunkLinearization (cluster_linearize.h:448)
+   makes of a linearization: each next piece absorbs the chunks before it
+   while its feerate is strictly higher.  [linearize_cluster]'s greedy
+   pieces are ancestor sets and are never merged, so a parent with many
+   high-feerate children comes out as one chunk per child where Core folds
+   every child that beats the running chunk feerate into the parent's.
+   Only the chunk count is used, for the m_main_chunkindex term. *)
+let chunk_count (pieces : chunk list) : int =
+  let merged = List.fold_left (fun acc (c : chunk) ->
+    let rec absorb (fee, size) = function
+      | (pf, ps) :: rest when fee * ps > pf * size -> absorb (fee + pf, size + ps) rest
+      | stack -> (fee, size) :: stack
+    in
+    absorb (Int64.to_int c.chunk_fee, c.chunk_vsize) acc) [] pieces in
+  List.length merged
+
 (* DynamicMemoryUsage() of the pool — getmempoolinfo "usage".  [total_usage]
    counts every transaction as a singleton cluster with one chunk; replace
    that with the real TxGraph terms for each multi-transaction cluster (one
@@ -3613,7 +3629,7 @@ let get_usage (mp : mempool) : int =
         if n < 2 then acc
         else
           acc + generic_cluster_usage n
-          + (usage_chunk_index * List.length (linearize_cluster c mp))
+          + (usage_chunk_index * chunk_count (linearize_cluster c mp))
           - (n * (usage_singleton_cluster + usage_chunk_index)))
         0 (get_clusters mp)
   in

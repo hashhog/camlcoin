@@ -305,8 +305,8 @@ let fallbackfee_arg =
      sendtoaddress/send only when the fee estimator has no answer. *)
   let doc = "Fee rate (in BTC/kvB) the wallet uses when fee estimation has \
              no data (Bitcoin Core -fallbackfee). Default 0: disabled, so \
-             sendtoaddress/send fail with -6 'Fee estimation failed. \
-             Fallbackfee is disabled' until the estimator has data." in
+             sendtoaddress (-6) and send (-4) fail with 'Fee estimation \
+             failed. Fallbackfee is disabled' until the estimator has data." in
   Arg.(value & opt (some string) None &
     info ["fallbackfee"] ~docv:"BTC/KVB" ~doc)
 

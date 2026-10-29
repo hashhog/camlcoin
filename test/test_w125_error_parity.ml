@@ -265,7 +265,7 @@ let g11_insufficient_funds_declared () =
   assert_code_declared ~name:"rpc_insufficient_funds" ~value:(-6)
 
 let g11_insufficient_funds_NOT_routed () =
-  (* Flipped by done-camlcoin-fallbackfee: wallet_fee_rate now returns
+  (* Flipped by done-camlcoin-fallbackfee: sendtoaddress now returns
      Error (rpc_insufficient_funds, ...) for Core's "Fallbackfee is disabled"
      failure (SendMoney maps CreateTransaction errors to -6), so the code is
      routed by a literal Error (...) at least once. *)

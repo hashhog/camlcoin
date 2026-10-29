@@ -3651,15 +3651,20 @@ let parse_rpc_amount (v : Yojson.Safe.t) : (int64, int * string) result =
 
 (* Core wallet/fees.cpp GetMinimumFeeRate + wallet/spend.cpp
    CreateTransactionInternal: the estimator's answer for conf_target; with no
-   answer, -fallbackfee; with that disabled (0) the spend fails.  SendMoney
-   maps every CreateTransaction failure to RPC_WALLET_INSUFFICIENT_FUNDS.
-   Result is sat/vB, floored at the 1 sat/vB min relay / -mintxfee. *)
+   answer, -fallbackfee; with that disabled (0) the spend fails (the caller
+   picks the code: SendMoney/sendtoaddress -6, the send RPC -4).  A non-zero
+   rate is raised to the mempool minimum fee, then to the required fee
+   GetRequiredFeeRate = max(-mintxfee, relay minimum).  Result is sat/vB. *)
 let fallbackfee_disabled_msg =
   "Fee estimation failed. Fallbackfee is disabled. \
    Wait a few blocks or enable -fallbackfee."
 
+(* Core wallet/wallet.h DEFAULT_TRANSACTION_MINFEE (-mintxfee), sat/kvB.
+   camlcoin has no -mintxfee, so the default always applies. *)
+let wallet_min_fee_sat_per_kvb = 1000L
+
 let wallet_fee_rate (ctx : rpc_context) (conf_target : int)
-  : (float, int * string) result =
+  : (float, string) result =
   let rate =
     match Fee_estimation.estimate_fee ctx.fee_estimator conf_target with
     | Some r -> Some r
@@ -3668,8 +3673,13 @@ let wallet_fee_rate (ctx : rpc_context) (conf_target : int)
       then Some !Fee_estimation.fallback_fee_sat_per_vb else None
   in
   match rate with
-  | Some r -> Ok (Float.max r 1.0)
-  | None -> Error (rpc_insufficient_funds, fallbackfee_disabled_msg)
+  | None -> Error fallbackfee_disabled_msg
+  | Some r ->
+    let kvb x = Int64.to_float x /. 1000.0 in
+    let mempool_min = kvb (Mempool.get_min_fee ctx.mempool) in
+    let required =
+      kvb (Int64.max wallet_min_fee_sat_per_kvb ctx.mempool.min_relay_fee) in
+    Ok (Float.max (Float.max r mempool_min) required)
 
 let handle_sendtoaddress (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
@@ -3695,7 +3705,7 @@ let handle_sendtoaddress (ctx : rpc_context)
            Error (rpc_invalid_address, "Invalid Bitcoin address: " ^ address)
          | Ok _ ->
            match wallet_fee_rate ctx target with
-           | Error e -> Error e
+           | Error m -> Error (rpc_insufficient_funds, m)
            | Ok fee_rate ->
            let current_height = match ctx.chain.tip with
              | Some t -> Some t.height
@@ -3822,7 +3832,7 @@ let handle_send (ctx : rpc_context)
             wallet_fee_rate ctx (Option.value conf_target ~default:6)
         in
         match fee_rate with
-        | Error e -> Error e
+        | Error m -> Error (rpc_wallet_error, m)
         | Ok fee_rate ->
         let current_height = match ctx.chain.tip with
           | Some t -> Some t.height

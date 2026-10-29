@@ -265,12 +265,13 @@ let g11_insufficient_funds_declared () =
   assert_code_declared ~name:"rpc_insufficient_funds" ~value:(-6)
 
 let g11_insufficient_funds_NOT_routed () =
-  (* PARTIAL: declared at line 37 but never routed by the dispatcher.
-     sendtoaddress/walletcreatefundedpsbt fall through to -4. *)
+  (* Flipped by done-camlcoin-fallbackfee: wallet_fee_rate now returns
+     Error (rpc_insufficient_funds, ...) for Core's "Fallbackfee is disabled"
+     failure (SendMoney maps CreateTransaction errors to -6), so the code is
+     routed by a literal Error (...) at least once. *)
   let n = count_routes ~name:"rpc_insufficient_funds" in
-  Alcotest.(check int)
-    "G11 rpc_insufficient_funds PARTIAL: routed 0 times (declared, never used)"
-    0 n
+  Alcotest.(check bool)
+    "G11 rpc_insufficient_funds routed by wallet_fee_rate" true (n >= 1)
 
 (* -- G12 RPC_OUT_OF_MEMORY -7 MISSING --------------------------------- *)
 

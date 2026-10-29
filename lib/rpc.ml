@@ -3649,6 +3649,28 @@ let parse_rpc_amount (v : Yojson.Safe.t) : (int64, int * string) result =
         Error (rpc_type_error, "Amount out of range")
       else Ok value
 
+(* Core wallet/fees.cpp GetMinimumFeeRate + wallet/spend.cpp
+   CreateTransactionInternal: the estimator's answer for conf_target; with no
+   answer, -fallbackfee; with that disabled (0) the spend fails.  SendMoney
+   maps every CreateTransaction failure to RPC_WALLET_INSUFFICIENT_FUNDS.
+   Result is sat/vB, floored at the 1 sat/vB min relay / -mintxfee. *)
+let fallbackfee_disabled_msg =
+  "Fee estimation failed. Fallbackfee is disabled. \
+   Wait a few blocks or enable -fallbackfee."
+
+let wallet_fee_rate (ctx : rpc_context) (conf_target : int)
+  : (float, int * string) result =
+  let rate =
+    match Fee_estimation.estimate_fee ctx.fee_estimator conf_target with
+    | Some r -> Some r
+    | None ->
+      if !Fee_estimation.fallback_fee_sat_per_vb > 0.0
+      then Some !Fee_estimation.fallback_fee_sat_per_vb else None
+  in
+  match rate with
+  | Some r -> Ok (Float.max r 1.0)
+  | None -> Error (rpc_insufficient_funds, fallbackfee_disabled_msg)
+
 let handle_sendtoaddress (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
   (* Extract conf_target from params (index 6 in Bitcoin Core RPC) *)
@@ -3656,17 +3678,7 @@ let handle_sendtoaddress (ctx : rpc_context)
     | Some (`Int n) -> Some n
     | _ -> None
   in
-  (* Determine fee rate: use estimator with conf_target, fall back to 1.0 sat/vB *)
-  let fee_rate = match conf_target with
-    | Some target ->
-      (match Fee_estimation.estimate_fee ctx.fee_estimator target with
-       | Some rate -> rate
-       | None -> 1.0)
-    | None ->
-      (match Fee_estimation.estimate_fee ctx.fee_estimator 6 with
-       | Some rate -> rate
-       | None -> 1.0)
-  in
+  let target = Option.value conf_target ~default:6 in
   match ctx.wallet with
   | None -> Error (rpc_wallet_error, "Wallet not loaded")
   | Some wallet ->
@@ -3682,6 +3694,9 @@ let handle_sendtoaddress (ctx : rpc_context)
          | Ok addr when addr.Address.network <> network ->
            Error (rpc_invalid_address, "Invalid Bitcoin address: " ^ address)
          | Ok _ ->
+           match wallet_fee_rate ctx target with
+           | Error e -> Error e
+           | Ok fee_rate ->
            let current_height = match ctx.chain.tip with
              | Some t -> Some t.height
              | None -> None
@@ -3800,15 +3815,15 @@ let handle_send (ctx : rpc_context)
             | _ -> None
           in
           match fee_rate_param with
-          | Some (`Int n) -> float_of_int n
-          | Some (`Float f) -> f
-          | Some (`Intlit s) -> (try float_of_string s with _ -> 1.0)
+          | Some (`Int n) -> Ok (float_of_int n)
+          | Some (`Float f) -> Ok f
+          | Some (`Intlit s) -> Ok (try float_of_string s with _ -> 1.0)
           | _ ->
-            let target = Option.value conf_target ~default:6 in
-            match Fee_estimation.estimate_fee ctx.fee_estimator target with
-            | Some rate -> rate
-            | None -> 1.0
+            wallet_fee_rate ctx (Option.value conf_target ~default:6)
         in
+        match fee_rate with
+        | Error e -> Error e
+        | Ok fee_rate ->
         let current_height = match ctx.chain.tip with
           | Some t -> Some t.height
           | None -> None

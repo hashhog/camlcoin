@@ -1072,6 +1072,11 @@ module ChainDB = struct
   let put_meta t (key : string) (value : string) =
     Cf_chainstate.put_chain_state t.cf key value
 
+  (* Was [hash] ever connected (Core IsValid(BLOCK_VALID_SCRIPTS))?  Set by
+     [record_connected_tx_counts]; never cleared. *)
+  let has_block_valid_scripts t (hash : Types.hash256) : bool =
+    Cf_chainstate.has_valid_scripts t.cf hash
+
   (* Cumulative m_chain_tx_count (Core chain.h). 8-byte LE int64. *)
   let store_chain_tx_count t (hash : Types.hash256) (n : int64) =
     Cf_chainstate.put_chain_tx_count t.cf hash n
@@ -1107,6 +1112,10 @@ module ChainDB = struct
   let record_connected_tx_counts t ~(hash : Types.hash256)
       ~(prev : Types.hash256) ~(n_tx : int) : unit =
     Cf_chainstate.put_block_ntx t.cf hash n_tx;
+    (* Every connect site calls this after the block is connected, so it
+       is also where the block reaches BLOCK_VALID_SCRIPTS (Core
+       ConnectTip -> RaiseValidity).  getchaintips reads the mark. *)
+    Cf_chainstate.put_valid_scripts t.cf hash;
     let parent_cum =
       if Cstruct.equal prev Types.zero_hash then Some 0L
       else Cf_chainstate.get_chain_tx_count t.cf prev

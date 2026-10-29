@@ -422,6 +422,22 @@ let get_chain_tx_count (t : t) (hash : Types.hash256) : int64 option =
     Some (read 0 0L)
   | Some _ -> None
 
+(* Core BLOCK_VALID_SCRIPTS analogue: the block was connected at least once
+   (ConnectBlock succeeded and the tip moved onto it).  Keyed by "v:" +
+   32-byte raw block hash in the chain_state CF, constant value "1".
+   Written at connect and never cleared on disconnect, exactly as Core
+   keeps the validity level of a block a reorg or invalidateblock displaced.
+   Read only by getchaintips ("valid-fork" vs "valid-headers"); no
+   validation or chain-selection decision reads it. *)
+let valid_scripts_key (hash : Types.hash256) : string =
+  "v:" ^ Cstruct.to_string hash
+
+let put_valid_scripts (t : t) (hash : Types.hash256) =
+  Rocksdb.cf_put t.db t.cfh_chain_state (valid_scripts_key hash) "1"
+
+let has_valid_scripts (t : t) (hash : Types.hash256) : bool =
+  Rocksdb.cf_get t.db t.cfh_chain_state (valid_scripts_key hash) <> None
+
 (* Undo data, keyed by 32-byte block hash *)
 let put_undo_data (t : t) (hash : Types.hash256) (data : string) =
   Rocksdb.cf_put t.db t.cfh_undo_data (Cstruct.to_string hash) data

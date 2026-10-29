@@ -1,0 +1,6 @@
+; getmempoolinfo "usage" parity with Core v31.1 DynamicMemoryUsage().
+; Own directory and stanza so it does not touch the shared names list in
+; test/dune.
+(test
+ (name test_mempool_usage_core)
+ (libraries camlcoin test_tmp alcotest cstruct))

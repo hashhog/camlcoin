@@ -105,6 +105,12 @@ let default_max_tx_age = 14.0 *. 24.0 *. 3600.0
    the clamp applies only to estimateSmartFee path.  We correct the
    min_confirm_target constant used by estimate_fee (the SmartFee path). *)
 let min_confirm_target = 2
+
+(* Core -fallbackfee (wallet/wallet.h DEFAULT_FALLBACK_FEE = 0, i.e. disabled),
+   in sat/vB.  Used by the wallet send RPCs only when the estimator has no
+   answer (wallet/fees.cpp GetMinimumFeeRate).  Set once at startup from
+   --fallbackfee (BTC/kvB). *)
+let fallback_fee_sat_per_vb : float ref = ref 0.0
 let max_confirm_target = 1008
 
 (* ============================================================================

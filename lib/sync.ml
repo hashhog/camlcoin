@@ -10402,29 +10402,46 @@ let reconsider_block (state : chain_state)
        Selection is Core's candidate order, not work alone: a reconsidered
        block with the SAME work as the tip wins when its data was received
        first (lower nSequenceId), so invalidateblock X; reconsiderblock X
-       returns to X when the branch it fell back to only ties it. *)
-    match find_best_candidate state with
-    | Some best when
-        (match state.tip with
-         | Some tip -> candidate_compare state best tip > 0
-         | None -> true) ->
-      Logs.info (fun m ->
-        m "Reconsidered chain sorts ahead of the tip, activating best tip at \
-           height %d" best.height);
-      let ibd = create_ibd_state ?utxo_set state in
-      (match reorganize ~allow_equal_work:true ibd best with
-       | Ok () -> Ok best.height
-       | Error e ->
-         Logs.warn (fun m ->
-           m "reconsiderblock: activation to height %d failed: %s"
-             best.height e);
-         (match state.tip with
-          | Some t -> Ok t.height
-          | None -> Ok 0))
-    | _ ->
+       returns to X when the branch it fell back to only ties it.
+       Core's ActivateBestChain loops: a candidate that fails ConnectBlock
+       is marked failed (InvalidBlockFound) and the next one is tried, so a
+       failed equal-work cousin received first cannot keep a valid heavier
+       block off the tip.  The reorg here is all-or-nothing, so retry after
+       each failure that marked a new block failed; a failure that marked
+       nothing (a local fault, missing data) stops the loop, since the
+       candidate set would not shrink. *)
+    let current_height () =
       match state.tip with
-      | Some tip -> Ok tip.height
+      | Some t -> Ok t.height
       | None -> Ok 0
+    in
+    let rec activate () =
+      match find_best_candidate state with
+      | Some best when
+          (match state.tip with
+           | Some tip -> candidate_compare state best tip > 0
+           | None -> true) ->
+        Logs.info (fun m ->
+          m "Reconsidered chain sorts ahead of the tip, activating best tip \
+             at height %d" best.height);
+        let failed_before = Hashtbl.length state.invalidated_blocks in
+        let ibd = create_ibd_state ?utxo_set state in
+        (match reorganize ~allow_equal_work:true ibd best with
+         | Ok () -> Ok best.height
+         | Error e when Hashtbl.length state.invalidated_blocks
+                        > failed_before ->
+           Logs.warn (fun m ->
+             m "reconsiderblock: activation to height %d failed: %s \
+                (trying the next candidate)" best.height e);
+           activate ()
+         | Error e ->
+           Logs.warn (fun m ->
+             m "reconsiderblock: activation to height %d failed: %s"
+               best.height e);
+           current_height ())
+      | _ -> current_height ()
+    in
+    activate ()
 
 (* preciousblock RPC entry point.  Returns the active chain height on success
    (the RPC layer discards it and returns JSON null, matching Core which

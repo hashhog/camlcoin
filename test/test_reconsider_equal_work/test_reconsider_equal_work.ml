@@ -261,6 +261,37 @@ let test_reconsider_never_activates_failed_equal_work_block () =
       check_tips "s4bad failed again"
         [tip a4 4 0 "active"; tip s4bad 4 2 "invalid"] ctx))
 
+(* After a failed equal-work attempt, chain selection must try the next
+   candidate (Core ActivateBestChain loops after InvalidBlockFound).  Same
+   blocks as above, then: invalidateblock a4 falls back to a3 (s4bad still
+   failed), and reconsiderblock 2 clears both flags.  s4bad and a4 tie on
+   work and s4bad was received first, so s4bad is tried first: s3 connects,
+   s4bad fails bad-cb-amount again.  The next candidate, a4, sorts ahead of
+   a3 and must become the tip, with s4bad invalid. *)
+let test_reconsider_tries_next_candidate_after_failure () =
+  Test_tmp.with_dir ~label:"rcw_next" ~mkdir:true (fun path ->
+    fresh_node path (fun ctx ->
+      let a1 = make_block ~prev:None ~height:1 ~tag:1 () in
+      let a2 = make_block ~prev:(Some a1) ~height:2 ~tag:1 () in
+      let a3 = make_block ~prev:(Some a2) ~height:3 ~tag:1 () in
+      let s3 = make_block ~prev:(Some a2) ~height:3 ~tag:2 () in
+      let s4bad = make_block ~overpay:Consensus.coin ~prev:(Some s3)
+          ~height:4 ~tag:2 () in
+      let a4 = make_block ~prev:(Some a3) ~height:4 ~tag:1 () in
+      List.iter (submit_ok ctx) [a1; a2; a3];
+      Alcotest.(check string) "s3 stored" "inconclusive" (submit ctx s3);
+      Alcotest.(check string) "s4bad rejected" "bad-cb-amount" (submit ctx s4bad);
+      submit_ok ctx a4;
+      Alcotest.(check string) "a4 is the tip" (hex_of a4) (best ctx);
+      invalidate ctx a4;
+      Alcotest.(check string) "invalidate a4: on a3" (hex_of a3) (best ctx);
+      reconsider ctx a2;
+      Alcotest.(check string) "reconsider 2: a4 restored" (hex_of a4) (best ctx);
+      Alcotest.(check int) "height 4" 4
+        (match Rpc.handle_getblockcount ctx with `Int n -> n | _ -> -1);
+      check_tips "s4bad failed, a4 active"
+        [tip a4 4 0 "active"; tip s4bad 4 2 "invalid"] ctx))
+
 let () =
   Alcotest.run "reconsider_equal_work" [
     "reconsiderblock", [
@@ -272,5 +303,7 @@ let () =
         test_reconsider_after_restart_keeps_loaded_tip;
       Alcotest.test_case "never activates a failed equal-work block" `Quick
         test_reconsider_never_activates_failed_equal_work_block;
+      Alcotest.test_case "tries the next candidate after a failed attempt"
+        `Quick test_reconsider_tries_next_candidate_after_failure;
     ];
   ]

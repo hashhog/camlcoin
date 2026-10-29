@@ -141,6 +141,9 @@ let is_chain_writer_rpc = function
   | "sendrawtransaction" | "submitpackage" | "testmempoolaccept"
   | "prioritisetransaction" | "loadmempool" | "importmempool"
   | "getblocktemplate"
+  (* getchaintips walks the whole header table, which the connect and
+     header paths mutate on this thread (Core: LOCK(cs_main)) *)
+  | "getchaintips"
   (* wallet *)
   | "getnewaddress" | "sethdseed" | "sendtoaddress" | "send" | "lockunspent"
   | "createwallet" | "loadwallet" | "unloadwallet" | "restorewallet"
@@ -866,42 +869,20 @@ let handle_getdifficulty (ctx : rpc_context) : Yojson.Safe.t =
   | Some t -> json_difficulty (Consensus.difficulty_from_bits t.header.bits)
   | None -> json_difficulty 1.0
 
-(* getchaintips — return the set of chain tips known to this node.
-   Camlcoin only tracks the active chain, so we always return exactly
-   one entry with status "active" and branchlen 0 (same as beamchain).
-   Bitcoin Core: src/rpc/blockchain.cpp::getchaintips *)
+(* getchaintips — every known tip of the block tree.
+   Bitcoin Core: src/rpc/blockchain.cpp::getchaintips.  The tip set and
+   each tip's branchlen/status come from [Sync.chain_tips]: the active tip
+   is the VALIDATED tip ([block_tip]), never [chain.tip] (the best-work
+   header, #43 header-tip-as-active); side branches, failed blocks and
+   headers ahead of the tip are reported as Core does. *)
 let handle_getchaintips (ctx : rpc_context) : Yojson.Safe.t =
-  (* The ACTIVE tip is the VALIDATED tip ([block_tip], advanced only by an
-     actual block connect/reorg), NOT [chain.tip] — which [accept_header]
-     re-points to the best-WORK HEADER chain the moment heavier competing
-     headers arrive over P2P, long before those blocks are validated
-     (#43 header-tip-as-active; Core keeps CChain separate from the
-     best-header pointer). *)
-  match Sync.block_tip ctx.chain with
-  | None -> `List []
-  | Some validated ->
-    let active =
-      `Assoc [
-        ("height",    `Int validated.height);
-        ("hash",      `String (Types.hash256_to_hex_display validated.hash));
-        ("branchlen", `Int 0);
-        ("status",    `String "active");
-      ]
-    in
-    (* If the best-header tip is ahead of the validated tip (headers-first
-       sync / bodies pending), report it as a distinct "headers-only" tip. *)
-    let extra =
-      match ctx.chain.tip with
-      | Some h when h.height > validated.height ->
-        [`Assoc [
-          ("height",    `Int h.height);
-          ("hash",      `String (Types.hash256_to_hex_display h.hash));
-          ("branchlen", `Int (h.height - validated.height));
-          ("status",    `String "headers-only");
-        ]]
-      | _ -> []
-    in
-    `List (active :: extra)
+  `List (List.map (fun (t : Sync.chain_tip) ->
+    `Assoc [
+      ("height",    `Int t.ct_entry.height);
+      ("hash",      `String (Types.hash256_to_hex_display t.ct_entry.hash));
+      ("branchlen", `Int t.ct_branchlen);
+      ("status",    `String (Sync.chain_tip_status_to_string t.ct_status));
+    ]) (Sync.chain_tips ctx.chain))
 
 (* getchainstates — return information about this node's chainstates.
 

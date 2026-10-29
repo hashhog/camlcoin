@@ -8005,6 +8005,122 @@ let is_on_active_chain (state : chain_state) (hash : Types.hash256) : bool =
         | Some h -> Cstruct.equal h hash
         | None -> false)
 
+(* ---- getchaintips (Core rpc/blockchain.cpp getchaintips) ----
+   A tip is every block-index entry that is not on the active chain and has
+   no child in the index, plus the active tip itself.  For each:
+     branchlen = height - height of the fork point with the active chain
+     status    = "active"        on the active chain
+                 "invalid"       BLOCK_FAILED_* on the block or an ancestor
+                 "headers-only"  nChainTx == 0: the block or an ancestor
+                                 has no data
+                 "valid-fork"    IsValid(BLOCK_VALID_SCRIPTS): was connected
+                 "valid-headers" data for the whole branch, never connected
+   Pure read of [state.headers], [state.invalidated_blocks], block data
+   presence and the connected-once mark; nothing here feeds validation. *)
+type chain_tip_status =
+  | Tip_active
+  | Tip_invalid
+  | Tip_headers_only
+  | Tip_valid_fork
+  | Tip_valid_headers
+
+let chain_tip_status_to_string = function
+  | Tip_active -> "active"
+  | Tip_invalid -> "invalid"
+  | Tip_headers_only -> "headers-only"
+  | Tip_valid_fork -> "valid-fork"
+  | Tip_valid_headers -> "valid-headers"
+
+type chain_tip = {
+  ct_entry : header_entry;
+  ct_branchlen : int;
+  ct_status : chain_tip_status;
+}
+
+let chain_tips (state : chain_state) : chain_tip list =
+  match block_tip state with
+  | None -> []
+  | Some active ->
+    let on_active (e : header_entry) =
+      Cstruct.equal e.hash active.hash
+      || (e.height < active.height
+          && (match Storage.ChainDB.get_hash_at_height state.db e.height with
+              | Some h -> Cstruct.equal h e.hash
+              | None -> false))
+    in
+    (* Entries per height.  A height that holds a single entry needs no
+       further look: at or below the active tip it is the active block, and
+       strictly between the active tip and the best header it is an
+       ancestor of the best header (whose whole chain is in the table), so
+       it has a child and is not a tip.  Only the few remaining entries are
+       candidates, which keeps this small even mid-IBD with a long header
+       chain ahead of the validated tip. *)
+    let max_h = Hashtbl.fold (fun _ (e : header_entry) m -> max m e.height)
+        state.headers active.height in
+    let per_height = Array.make (max_h + 1) 0 in
+    Hashtbl.iter (fun _ (e : header_entry) ->
+      if e.height >= 0 then
+        per_height.(e.height) <- per_height.(e.height) + 1) state.headers;
+    let best_header_height = match state.tip with
+      | Some t when Hashtbl.mem state.headers (Cstruct.to_string t.hash) ->
+        t.height
+      | _ -> active.height in
+    let off_active = Hashtbl.fold (fun _ (e : header_entry) acc ->
+      if e.height < 0 then acc
+      else if per_height.(e.height) = 1
+              && (e.height <= active.height || e.height < best_header_height)
+      then acc
+      else if on_active e then acc
+      else e :: acc) state.headers [] in
+    (* The best header is always in the table on a live node; keep it a
+       candidate even if it is not, so a header tip ahead of the validated
+       tip is never dropped from the answer. *)
+    let off_active = match state.tip with
+      | Some t when not (Hashtbl.mem state.headers (Cstruct.to_string t.hash))
+                    && not (on_active t) -> t :: off_active
+      | _ -> off_active in
+    let parents = Hashtbl.create 16 in
+    List.iter (fun (e : header_entry) ->
+      Hashtbl.replace parents (Cstruct.to_string e.header.prev_block) ())
+      off_active;
+    let leaves = List.filter (fun (e : header_entry) ->
+      not (Hashtbl.mem parents (Cstruct.to_string e.hash))) off_active in
+    let classify (tip : header_entry) : chain_tip =
+      (* Walk the branch down to the fork point. *)
+      let rec walk (e : header_entry) invalid missing =
+        if on_active e then (e.height, invalid, missing)
+        else
+          let invalid =
+            invalid || Hashtbl.mem state.invalidated_blocks
+                         (Cstruct.to_string e.hash) in
+          let missing =
+            missing || (e.height > 0
+                        && not (Storage.ChainDB.has_block state.db e.hash)) in
+          match Hashtbl.find_opt state.headers
+                  (Cstruct.to_string e.header.prev_block) with
+          | Some p -> walk p invalid missing
+          | None -> (e.height - 1, invalid, missing)
+      in
+      let fork_height, invalid, missing = walk tip false false in
+      let status =
+        if invalid then Tip_invalid
+        else if missing then Tip_headers_only
+        else if Storage.ChainDB.has_block_valid_scripts state.db tip.hash
+        then Tip_valid_fork
+        else Tip_valid_headers
+      in
+      { ct_entry = tip; ct_branchlen = tip.height - fork_height;
+        ct_status = status }
+    in
+    let tips =
+      { ct_entry = active; ct_branchlen = 0; ct_status = Tip_active }
+      :: List.map classify leaves in
+    (* Core orders the set by height, highest first. *)
+    List.stable_sort (fun a b ->
+      match compare b.ct_entry.height a.ct_entry.height with
+      | 0 -> Cstruct.compare a.ct_entry.hash b.ct_entry.hash
+      | c -> c) tips
+
 (* What [submitblock] may say about a side-branch block it did not reject.
    Core rpc/mining.cpp submitblock answers from a submitblock_StateCatcher
    on the block's hash: it is set only when BlockChecked fires for that

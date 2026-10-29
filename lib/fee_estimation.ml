@@ -105,6 +105,54 @@ let default_max_tx_age = 14.0 *. 24.0 *. 3600.0
    the clamp applies only to estimateSmartFee path.  We correct the
    min_confirm_target constant used by estimate_fee (the SmartFee path). *)
 let min_confirm_target = 2
+
+(* Core -fallbackfee (wallet/wallet.h DEFAULT_FALLBACK_FEE = 0, i.e. disabled),
+   in sat/vB.  Used by the wallet send RPCs only when the estimator has no
+   answer (wallet/fees.cpp GetMinimumFeeRate).  Set once at startup from
+   --fallbackfee (BTC/kvB). *)
+let fallback_fee_sat_per_vb : float ref = ref 0.0
+
+(* Core util/moneystr.cpp ParseMoney: BTC amount -> satoshis.  Surrounding
+   whitespace is trimmed; then only digits with at most one '.' and at most
+   8 decimals, no sign, at most 10 whole digits, and 0..MAX_MONEY. *)
+let parse_money (raw : string) : int64 option =
+  let is_space c =
+    c = ' ' || c = '\t' || c = '\n' || c = '\r' || c = '\011' || c = '\012' in
+  let is_digit c = c >= '0' && c <= '9' in
+  let n = String.length raw in
+  let i = ref 0 and j = ref n in
+  while !i < n && is_space raw.[!i] do incr i done;
+  while !j > !i && is_space raw.[!j - 1] do decr j done;
+  let s = String.sub raw !i (!j - !i) in
+  if s = "" || String.contains raw '\000' then None
+  else
+    let whole, frac = match String.index_opt s '.' with
+      | None -> s, ""
+      | Some k -> String.sub s 0 k, String.sub s (k + 1) (String.length s - k - 1)
+    in
+    let all_digits str = String.for_all is_digit str in
+    if not (all_digits whole && all_digits frac)
+    || String.length frac > 8 || String.length whole > 10 then None
+    else
+      let w = if whole = "" then 0L else Int64.of_string whole in
+      let f = Int64.of_string ("0" ^ frac ^ String.make (8 - String.length frac) '0') in
+      let v = Int64.add (Int64.mul w 100_000_000L) f in
+      if v < 0L || v > 2_100_000_000_000_000L then None else Some v
+
+(* Core wallet/wallet.h HIGH_TX_FEE_PER_KB = COIN / 100, in sat/kvB. *)
+let high_tx_fee_per_kb = 1_000_000L
+
+(* Core wallet/wallet.cpp CWallet::Create: a -fallbackfee value (BTC/kvB) to
+   (sat/kvB, startup warning).  An unparsable amount refuses to start; a
+   value above HIGH_TX_FEE_PER_KB is kept but warned about. *)
+let parse_fallbackfee (raw : string) : (int64 * string option, string) result =
+  match parse_money raw with
+  | None ->
+    Error (Printf.sprintf "Invalid amount for -fallbackfee=<amount>: '%s'" raw)
+  | Some v when v > high_tx_fee_per_kb ->
+    Ok (v, Some "-fallbackfee is set very high! This is the transaction fee \
+                 you may pay when fee estimates are not available.")
+  | Some v -> Ok (v, None)
 let max_confirm_target = 1008
 
 (* ============================================================================

@@ -299,6 +299,17 @@ let rest_bind_arg =
   Arg.(value & opt (some string) None &
     info ["restbind"] ~docv:"HOST" ~doc)
 
+let fallbackfee_arg =
+  (* Bitcoin Core -fallbackfee (wallet/init.cpp, DEFAULT_FALLBACK_FEE = 0:
+     disabled). BTC/kvB, parsed like Core's ParseMoney. Used by
+     sendtoaddress/send only when the fee estimator has no answer. *)
+  let doc = "Fee rate (in BTC/kvB) the wallet uses when fee estimation has \
+             no data (Bitcoin Core -fallbackfee). Default 0: disabled, so \
+             sendtoaddress (-6) and send (-4) fail with 'Fee estimation \
+             failed. Fallbackfee is disabled' until the estimator has data." in
+  Arg.(value & opt (some string) None &
+    info ["fallbackfee"] ~docv:"BTC/KVB" ~doc)
+
 let blockfilterindex_arg =
   (* Bitcoin Core's -blockfilterindex flag (init.cpp / index/blockfilterindex.cpp).
      Accepts either a boolean ('1'/'0' / 'true'/'false') or the literal
@@ -503,7 +514,7 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     proxy onion_proxy i2psam i2p_private_key cjdnsreachable
     rpc_tls_cert rpc_tls_key rest_tls_cert rest_tls_key
     coinstatsindex_cli txindex_cli txospenderindex_cli dbcache_cli par_cli
-    externalip_cli discover_cli =
+    externalip_cli discover_cli fallbackfee_cli =
   (* --txindex is accepted for Core CLI compatibility (camlcoin always
      maintains the tx index); validate its value but otherwise ignore it. *)
   ignore txindex_cli;
@@ -538,6 +549,21 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
   let conf_opts =
     try Camlcoin.Runtime_config.parse_conf_file ~network conf_path_resolved
     with _ -> [] in
+  (* -fallbackfee (CLI > conf): BTC/kvB -> sat/vB (1 sat/kvB = 0.001 sat/vB).
+     A bad amount refuses to start with Core's text (wallet/wallet.cpp). *)
+  (match (match fallbackfee_cli with
+          | Some v -> Some v
+          | None -> Camlcoin.Runtime_config.get_string conf_opts "fallbackfee") with
+   | None -> ()
+   | Some v ->
+     (match Camlcoin.Fee_estimation.parse_fallbackfee v with
+      | Ok (sats, warning) ->
+        Option.iter (Printf.eprintf "Warning: %s\n") warning;
+        Camlcoin.Fee_estimation.fallback_fee_sat_per_vb :=
+          Int64.to_float sats /. 1000.0
+      | Error msg ->
+        Printf.eprintf "Error: %s\n" msg;
+        exit 1));
   (* --par / conf par=: Core -par (init.cpp:513). CLI wins. Default 0 = auto. *)
   let eff_par =
     match par_cli with
@@ -1210,7 +1236,8 @@ let cmd =
     $ dbcache_arg
     $ par_arg
     $ externalip_arg
-    $ discover_arg)
+    $ discover_arg
+    $ fallbackfee_arg)
 
 (* ============================================================================
    Entry Point

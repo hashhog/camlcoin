@@ -1,0 +1,5 @@
+; Core-style -fallbackfee for sendtoaddress/send (done-camlcoin-fallbackfee).
+; Own directory so the shared test/dune names list is untouched.
+(test
+ (name test_fallbackfee)
+ (libraries camlcoin test_tmp alcotest unix))

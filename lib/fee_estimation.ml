@@ -111,6 +111,13 @@ let min_confirm_target = 2
    answer (wallet/fees.cpp GetMinimumFeeRate).  Set once at startup from
    --fallbackfee (BTC/kvB). *)
 let fallback_fee_sat_per_vb : float ref = ref 0.0
+
+(* Parse a -fallbackfee value (BTC/kvB) to (sat/kvB, startup warning). *)
+let parse_fallbackfee (raw : string) : (int64 * string option, string) result =
+  match Bip21.parse_amount raw with
+  | Ok sats -> Ok (sats, None)
+  | Error _ ->
+    Error (Printf.sprintf "Invalid amount for -fallbackfee=<amount>: '%s'" raw)
 let max_confirm_target = 1008
 
 (* ============================================================================

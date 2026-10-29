@@ -556,12 +556,13 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
           | None -> Camlcoin.Runtime_config.get_string conf_opts "fallbackfee") with
    | None -> ()
    | Some v ->
-     (match Camlcoin.Bip21.parse_amount v with
-      | Ok sats ->
+     (match Camlcoin.Fee_estimation.parse_fallbackfee v with
+      | Ok (sats, warning) ->
+        Option.iter (Printf.eprintf "Warning: %s\n") warning;
         Camlcoin.Fee_estimation.fallback_fee_sat_per_vb :=
           Int64.to_float sats /. 1000.0
-      | Error _ ->
-        Printf.eprintf "Error: Invalid amount for -fallbackfee=<amount>: '%s'\n" v;
+      | Error msg ->
+        Printf.eprintf "Error: %s\n" msg;
         exit 1));
   (* --par / conf par=: Core -par (init.cpp:513). CLI wins. Default 0 = auto. *)
   let eff_par =

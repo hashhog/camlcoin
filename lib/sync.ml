@@ -125,17 +125,35 @@ let header_tip_after_block_connect (current : header_entry option)
   | Some t when t.height > connected.height -> current
   | _ -> Some connected
 
+(* Blocks one post-IBD gap-fill getdata covers (Core
+   MAX_BLOCKS_IN_TRANSIT_PER_PEER); the HeadersMsg listener and the at-tip
+   status tick both ask for this many. *)
+let at_tip_gapfill_window = 16
+
 (* Re-enter catch-up IBD when the header tip is ahead of the validated
    tip. [already_started] is kept in the signature so callers can pass
    the sticky flag; it must NOT suppress re-entry after the first IBD
-   (that was the FullySynced 16-block fire-and-forget path). *)
+   (that was the FullySynced 16-block fire-and-forget path, a 128-block
+   gap in test_stall_class_231).
+
+   A FullySynced gap that fits one gap-fill batch is the ordinary "a block
+   was just announced" case and stays with gap-fill, which asks the
+   announcer and rotates after 2 s. Opening an IBD session for it switched
+   gap-fill off and left the next blocks on the IBD per-block timeout:
+   mainnet 2026-10-30, "Starting catch-up block download (header tip
+   973809, block tip 973808)" then "IBD complete at height 973811 (2
+   blocks in 975.6s)" (test/tip_follow_catchup). *)
 let should_start_catchup_ibd
     ~(ibd_running : bool) ~(already_started : bool)
     ~(sync_state : sync_state)
     ~(header_height : int) ~(block_height : int)
     ~(has_download_peer : bool) : bool =
   ignore already_started;
-  (not ibd_running) && sync_state <> Idle
+  let at_tip_gap =
+    sync_state = FullySynced
+    && header_height - block_height <= at_tip_gapfill_window
+  in
+  (not ibd_running) && sync_state <> Idle && not at_tip_gap
   && has_download_peer && header_height > block_height
 
 (* Chain state - tracks sync progress and header chain.

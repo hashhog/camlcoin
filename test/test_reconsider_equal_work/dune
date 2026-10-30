@@ -1,0 +1,6 @@
+; reconsiderblock equal-work tie-break (fleet item
+; fix-camlcoin-failed-reorg-tips-36ee4cd0).  Own directory and stanza so it
+; does not touch the shared names list in test/dune.
+(test
+ (name test_reconsider_equal_work)
+ (libraries camlcoin test_tmp alcotest yojson cstruct))

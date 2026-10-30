@@ -571,8 +571,32 @@ module ChainDB = struct
         f key (Serialize.deserialize_block_header r)
       end)
 
+  (* Core's nSequenceId for blocks whose data arrived in this process
+     (ReceivedBlockTransactions, validation.cpp): a counter that starts at
+     SEQ_ID_INIT_FROM_DISK + 1 = 2 and is stamped once, when the block's
+     data is first stored.  Blocks already on disk at startup have no entry
+     here; chain selection gives them 1 (0 on the chain loaded as active).
+     It breaks equal-work ties in chain selection (first received wins), so
+     it is process-local like Core's: [reset_received_sequence] runs on
+     restore. *)
+  let received_sequence : (string, int) Hashtbl.t = Hashtbl.create 64
+  let next_received_sequence = ref 2
+
+  let reset_received_sequence () =
+    Hashtbl.reset received_sequence;
+    next_received_sequence := 2
+
+  let received_sequence_id (hash : Types.hash256) : int option =
+    Hashtbl.find_opt received_sequence (Cstruct.to_string hash)
+
   (* Full block storage *)
   let store_block t (hash : Types.hash256) (block : Types.block) =
+    let key = Cstruct.to_string hash in
+    (if not (Hashtbl.mem received_sequence key)
+        && Option.is_none (Cf_chainstate.get_block_data t.cf hash) then begin
+       Hashtbl.replace received_sequence key !next_received_sequence;
+       incr next_received_sequence
+     end);
     let w = Serialize.writer_create () in
     Serialize.serialize_block w block;
     Cf_chainstate.put_block_data t.cf hash

@@ -1,0 +1,5 @@
+; At-tip follow latency (done-camlcoin-tip-follow-latency).
+; Own directory so the shared test/dune names list is untouched.
+(test
+ (name test_tip_follow_catchup)
+ (libraries camlcoin alcotest))

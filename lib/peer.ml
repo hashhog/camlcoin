@@ -276,6 +276,7 @@ type peer = {
   mutable services : peer_services;
   mutable best_height : int32;
   mutable last_seen : float;
+  connected_at : float;  (* set once at connect; getpeerinfo conntime (Core CNode::m_connected) *)
   mutable last_ping : float;
   mutable ping_nonce : int64 option;
   mutable latency : float;
@@ -426,6 +427,7 @@ let make_peer ~(network : Consensus.network_config) ~(addr : string)
     services = empty_services;
     best_height = 0l;
     last_seen = Unix.gettimeofday ();
+    connected_at = Unix.gettimeofday ();
     last_ping = 0.0;
     ping_nonce = None;
     latency = 0.0;
@@ -2028,6 +2030,7 @@ type peer_stats = {
   stat_msgs_sent : int;
   stat_msgs_received : int;
   stat_last_seen : float;
+  stat_conn_time : float;
   stat_user_agent : string;
   stat_direction : peer_direction;
   stat_misbehavior : int;
@@ -2073,6 +2076,7 @@ let get_stats (peer : peer) : peer_stats =
     stat_msgs_sent = peer.msgs_sent;
     stat_msgs_received = peer.msgs_received;
     stat_last_seen = peer.last_seen;
+    stat_conn_time = peer.connected_at;
     stat_user_agent = (match peer.version_msg with
       | Some v -> v.user_agent
       | None -> "");

@@ -250,6 +250,7 @@ let test_fix50_peer_stats_mapped_as () =
     stat_msgs_sent = 0;
     stat_msgs_received = 0;
     stat_last_seen = 0.0;
+    stat_conn_time = 0.0;
     stat_user_agent = "";
     stat_direction = Peer.Outbound;
     stat_misbehavior = 0;

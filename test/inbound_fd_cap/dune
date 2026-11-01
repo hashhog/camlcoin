@@ -1,8 +1,10 @@
 ; Idle inbound sockets cannot kill the node (fix-camlcoin-sec-c2). Own
-; directory so the shared test/dune names list is untouched. The cases boot
-; the real CLI (bin/main.exe) on regtest and hold idle TCP sockets against
-; its P2P and RPC ports, the way the audit's repro_idle_fds.py does.
-(test
- (name test_inbound_fd_cap)
+; directory so the shared test/dune names list is untouched.
+; test_inbound_fd_cap boots the real CLI (bin/main.exe) on regtest and holds
+; idle TCP sockets against its P2P and RPC ports, the way the audit's
+; repro_idle_fds.py does; it uses no camlcoin module, so it also builds on
+; the pre-fix tree. test_poll_engine checks Poll_engine directly.
+(tests
+ (names test_inbound_fd_cap test_poll_engine)
  (deps ../../bin/main.exe)
- (libraries test_tmp alcotest unix base64))
+ (libraries camlcoin test_tmp alcotest unix base64 lwt lwt.unix))

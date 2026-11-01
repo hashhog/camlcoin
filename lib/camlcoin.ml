@@ -45,3 +45,4 @@ module Coinstats_index = Coinstats_index
 module Bloom = Bloom
 module Ntx_reconcile = Ntx_reconcile
 module Swiftsync = Swiftsync
+module Poll_engine = Poll_engine

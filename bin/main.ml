@@ -1145,7 +1145,13 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
        backstop, the mempool verify pool and gettxoutsetinfo's walk still
        detach: 16 keeps one slow user from queueing the others (CC-2). *)
     Lwt_preemptive.set_bounds (0, 16);
-    Lwt_main.run (Camlcoin.Cli.run ?ready_fd:eff_ready_fd config);
+    (* poll(2) instead of Lwt's default select(2): select raised EINVAL out
+       of Lwt_main.run, ending the process, as soon as any socket reached
+       fd 1024 (audit C2: ~1,000 idle P2P sockets did it).  run_main logs
+       an exception from the event loop itself and keeps running instead
+       of exiting. *)
+    Camlcoin.Poll_engine.install ();
+    Camlcoin.Poll_engine.run_main (Camlcoin.Cli.run ?ready_fd:eff_ready_fd config);
     (* Graceful shutdown complete: exit 0 deterministically.  A stalled
        shutdown never returns here — the deadline pthread inside Cli.run
        has already called _exit(0). *)

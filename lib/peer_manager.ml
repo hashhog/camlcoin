@@ -305,6 +305,11 @@ type t = {
      Health / dead-peer / stale-tip / eviction sweeps keep running.  Not
      persisted; resets to enabled on restart. *)
   mutable network_active : bool;
+  (* Inbound sockets accepted but still in the v1/v2 handshake (not yet in
+     [peers]).  Core creates the CNode at accept, so a handshaking socket
+     already counts against m_max_inbound (net.cpp AcceptConnection);
+     [accept_inbound] counts these next to the finished inbound peers. *)
+  mutable inbound_pending : int;
   (* Node-global cumulative P2P byte totals across ALL connections,
      including peers that have since disconnected (Core CConnman
      m_total_bytes_recv / m_total_bytes_sent, surfaced by getnettotals via
@@ -391,6 +396,7 @@ let create ?(config = default_config) ?(asmap : bytes option = None) (network : 
     addr_token = Hashtbl.create 64;
     added_nodes = [];
     network_active = true;
+    inbound_pending = 0;
     disconnected_bytes_recv = 0;
     disconnected_bytes_sent = 0;
     local_addrs = Hashtbl.create 8;
@@ -539,6 +545,17 @@ let connection_type_of_peer (p : Peer.peer) : string =
 let inbound_peer_count (pm : t) : int =
   List.length (List.filter (fun p ->
     p.Peer.direction = Peer.Inbound) pm.peers)
+
+(* Global cap on inbound sockets still in the handshake, whatever
+   --maxinbound says.  Each one is an fd held for up to the 60 s handshake
+   timeout before it has proved anything, so a large --maxinbound must not
+   turn into that many idle sockets. *)
+let max_pending_inbound = 64
+
+(* Inbound slots in use for the accept check: finished inbound peers plus
+   sockets still handshaking. *)
+let inbound_slots_used (pm : t) : int =
+  inbound_peer_count pm + pm.inbound_pending
 
 (* Count block-relay-only outbound peers *)
 let block_relay_only_count (pm : t) : int =
@@ -3543,14 +3560,27 @@ let accept_inbound (pm : t) (client_fd : Lwt_unix.file_descr)
       (fun () -> Lwt_unix.close client_fd)
       (fun _ -> Lwt.return_unit)
   end else
-  (* Check inbound limits - try eviction before rejecting *)
+  (* Too many sockets already in the handshake: refuse before anything
+     else, and without evicting an established peer for an idle socket. *)
+  if pm.inbound_pending >= max_pending_inbound then begin
+    Log.debug (fun m ->
+      m "connection from %s:%d dropped: %d inbound handshakes pending"
+        addr_str port pm.inbound_pending);
+    Lwt.catch
+      (fun () -> Lwt_unix.close client_fd)
+      (fun _ -> Lwt.return_unit)
+  end else
+  (* Check inbound limits - try eviction before rejecting.  Sockets still
+     handshaking count against max_inbound (Core AcceptConnection counts
+     every inbound CNode, and a CNode exists from accept on); counting only
+     finished handshakes let ~1,000 silent connections through. *)
   let* () =
-    if inbound_peer_count pm >= pm.config.max_inbound then
+    if inbound_slots_used pm >= pm.config.max_inbound then
       evict_inbound_peer pm
     else
       Lwt.return_unit
   in
-  if inbound_peer_count pm >= pm.config.max_inbound then begin
+  if inbound_slots_used pm >= pm.config.max_inbound then begin
     let* () = Lwt.catch
       (fun () -> Lwt_unix.close client_fd)
       (fun _ -> Lwt.return_unit) in
@@ -3585,8 +3615,19 @@ let accept_inbound (pm : t) (client_fd : Lwt_unix.file_descr)
          responder).  Falls through to perform_inbound_handshake when the
          peer sends a v1 VERSION header or when CAMLCOIN_BIP324_V2_INBOUND
          is OFF (the default). *)
-      let* () = Peer.perform_inbound_handshake_negotiated peer pm.our_height in
-      pm.peers <- peer :: pm.peers;
+      (* Hold a slot from here until the peer is in [peers] or the
+         handshake fails; nothing yields between the checks above and this
+         increment, so concurrent accepts cannot overshoot. *)
+      pm.inbound_pending <- pm.inbound_pending + 1;
+      let* () = Lwt.finalize
+        (fun () ->
+          let* () =
+            Peer.perform_inbound_handshake_negotiated peer pm.our_height in
+          pm.peers <- peer :: pm.peers;
+          Lwt.return_unit)
+        (fun () ->
+          pm.inbound_pending <- pm.inbound_pending - 1;
+          Lwt.return_unit) in
       (* Track connection time for eviction algorithm *)
       Hashtbl.replace pm.peer_connected_time peer.Peer.id now;
       (* Initialize stale peer tracking *)

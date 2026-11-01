@@ -2519,95 +2519,108 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     Package_relay.dispatch mempool msg peer);
 
   (* BIP 152: Register a listener for compact block messages.
-     When we receive a cmpctblock, attempt reconstruction from our mempool.
-     If reconstruction fails (missing transactions), send getblocktxn to the peer.
-     When we receive blocktxn, complete the reconstruction and process the block.
+     A cmpctblock's header is validated first (Compact_relay.on_cmpctblock:
+     known parent, anti-DoS work, PoW / nBits / MTP, more work than the tip,
+     at most tip+2); only then is the mempool matched.  An incomplete block
+     is kept per (peer, hash), capped per peer and per block, expired, and
+     dropped on disconnect; blocktxn completes only the asking peer's entry.
      When we receive getblocktxn, respond with the requested transactions. *)
-  let compact_pending :
-    (Types.hash256, P2p.compact_block * Types.transaction option array * int list) Hashtbl.t =
-    Hashtbl.create 16 in
+  let compact_pending = Compact_relay.create () in
+  Peer_manager.add_peer_removed_hook peer_manager (fun peer_id ->
+    ignore (Compact_relay.remove_peer compact_pending peer_id));
+  let connect_compact_block (block : Types.block) header_hash =
+    Lwt_mutex.with_lock block_listener_mutex (fun () ->
+      let%lwt pnb_result =
+        Sync.process_new_block ~f_requested:true
+          ?worker:!post_ibd_worker_ref chain block in
+      (match pnb_result with
+       | Ok () ->
+         Compact_relay.remove_block compact_pending header_hash;
+         (try Fee_estimation.process_block fee_estimator block chain.blocks_synced
+          with _ -> ());
+         Lwt.async (fun () ->
+           Peer_manager.announce_block peer_manager block.Types.header header_hash);
+         Lwt.return_unit
+       | Error e ->
+         Logs.debug (fun m -> m "Reconstructed compact block rejected: %s" e);
+         Lwt.return_unit))
+  in
+  let getdata_block peer hash =
+    Lwt.catch
+      (fun () ->
+        Peer.send_message peer
+          (P2p.GetdataMsg [ { P2p.inv_type = P2p.InvWitnessBlock; hash } ]))
+      (fun _exn -> Lwt.return_unit)
+  in
   Peer_manager.add_listener peer_manager (fun msg peer ->
     match msg with
     | P2p.CmpctblockMsg cb when chain.sync_state = Sync.FullySynced ->
       let header_hash = Crypto.compute_block_hash cb.header in
-      Logs.info (fun m ->
+      Logs.debug (fun m ->
         m "Received cmpctblock from peer %d: %s (%d short_ids, %d prefilled)"
           peer.Peer.id (Types.hash256_to_hex header_hash)
           (List.length cb.short_ids) (List.length cb.prefilled_txs));
-      (* Attempt reconstruction using mempool *)
-      let result = Peer_manager.reconstruct_from_mempool peer_manager cb in
-      (match result with
-       | P2p.ReconstructComplete block ->
-         (* All transactions found *)
+      (match
+         Compact_relay.on_cmpctblock compact_pending chain
+           ~peer_id:peer.Peer.id ~peer_hb:peer.Peer.cmpct_high_bandwidth
+           ~now:(Unix.gettimeofday ())
+           ~reconstruct:(Peer_manager.reconstruct_from_mempool peer_manager)
+           cb
+       with
+       | Compact_relay.Connect block ->
          Logs.info (fun m ->
            m "Compact block fully reconstructed: %s" (Types.hash256_to_hex header_hash));
-         Lwt_mutex.with_lock block_listener_mutex (fun () ->
-           let%lwt pnb_result =
-             Sync.process_new_block ~f_requested:true
-               ?worker:!post_ibd_worker_ref chain block in
-           (match pnb_result with
-            | Ok () ->
-              (try Fee_estimation.process_block fee_estimator block chain.blocks_synced
-               with _ -> ());
-              Lwt.async (fun () ->
-                Peer_manager.announce_block peer_manager block.Types.header header_hash);
-              Lwt.return_unit
-            | Error e ->
-              Logs.debug (fun m -> m "Reconstructed compact block rejected: %s" e);
-              Lwt.return_unit))
-       | P2p.ReconstructNeedTxs (partial_txs, missing) ->
-         (* Store partial state and request missing transactions.
-            partial_txs already has the prefilled AND mempool-matched slots
-            filled (from reconstruct_block); storing it as-is — rather than
-            rebuilding from prefilled only — means the blocktxn fill needs only
-            the truly-missing txs, so reconstruction completes even when the
-            mempool held some of the block's txs (previously that left those
-            slots None and fill_missing_txs failed "not all filled"). *)
+         connect_compact_block block header_hash
+       | Compact_relay.Request_txns req ->
          Logs.info (fun m ->
            m "Compact block %s missing %d txns, sending getblocktxn"
-             (Types.hash256_to_hex header_hash) (List.length missing));
-         Hashtbl.replace compact_pending header_hash (cb, partial_txs, missing);
-         let req = P2p.make_getblocktxn_request header_hash missing in
-         let getblocktxn_msg = P2p.make_getblocktxn_msg req in
+             (Types.hash256_to_hex header_hash)
+             (List.length req.P2p.indexes));
          Lwt.catch
-           (fun () -> Peer.send_message peer getblocktxn_msg)
+           (fun () -> Peer.send_message peer (P2p.make_getblocktxn_msg req))
            (fun _exn -> Lwt.return_unit)
-       | P2p.ReconstructFailed reason ->
-         Logs.warn (fun m ->
-           m "Compact block reconstruction failed: %s" reason);
+       | Compact_relay.Request_block hash ->
+         Logs.info (fun m ->
+           m "Compact block %s failed to reconstruct, requesting full block"
+             (Types.hash256_to_hex header_hash));
+         getdata_block peer hash
+       | Compact_relay.Send_getheaders ->
+         (* Core: a cmpctblock that does not connect gets a getheaders. *)
+         let tip_h = match chain.tip with Some t -> t.height | None -> 0 in
+         Lwt.catch
+           (fun () ->
+             Sync.send_getheaders_with_locator peer (Sync.build_locator chain) tip_h)
+           (fun _exn -> Lwt.return_unit)
+       | Compact_relay.Invalid_header reason ->
+         Logs.info (fun m ->
+           m "Invalid header via cmpctblock from peer %d: %s" peer.Peer.id reason);
+         misbehavior_handler peer.Peer.id "invalid_header";
+         Lwt.return_unit
+       | Compact_relay.Ignore reason ->
+         Logs.debug (fun m ->
+           m "Ignoring cmpctblock %s from peer %d: %s"
+             (Types.hash256_to_hex header_hash) peer.Peer.id reason);
          Lwt.return_unit)
     | P2p.BlocktxnMsg resp ->
       let hash_hex = Types.hash256_to_hex resp.block_hash in
       Logs.info (fun m ->
         m "Received blocktxn from peer %d: %s (%d txns)"
           peer.Peer.id hash_hex (List.length resp.txs));
-      (match Hashtbl.find_opt compact_pending resp.block_hash with
-       | Some (cb, partial_txs, missing_indices) ->
-         Hashtbl.remove compact_pending resp.block_hash;
-         let fill_result = P2p.fill_missing_txs cb partial_txs missing_indices resp.txs in
-         (match fill_result with
-          | Ok block ->
-            Logs.info (fun m ->
-              m "Compact block reconstructed from blocktxn: %s" hash_hex);
-            Lwt_mutex.with_lock block_listener_mutex (fun () ->
-              let%lwt pnb_result =
-                Sync.process_new_block ~f_requested:true
-                  ?worker:!post_ibd_worker_ref chain block in
-              (match pnb_result with
-               | Ok () ->
-                 (try Fee_estimation.process_block fee_estimator block chain.blocks_synced
-                  with _ -> ());
-                 Lwt.async (fun () ->
-                   Peer_manager.announce_block peer_manager block.Types.header resp.block_hash);
-                 Lwt.return_unit
-               | Error e ->
-                 Logs.debug (fun m -> m "Reconstructed block rejected: %s" e);
-                 Lwt.return_unit))
-          | Error reason ->
-            Logs.warn (fun m -> m "blocktxn fill failed for %s: %s" hash_hex reason);
-            Lwt.return_unit)
-       | None ->
-         Logs.debug (fun m -> m "Unexpected blocktxn (no pending compact block): %s" hash_hex);
+      (match
+         Compact_relay.on_blocktxn compact_pending ~peer_id:peer.Peer.id
+           ~now:(Unix.gettimeofday ()) resp
+       with
+       | Compact_relay.Txn_connect block ->
+         Logs.info (fun m ->
+           m "Compact block reconstructed from blocktxn: %s" hash_hex);
+         connect_compact_block block resp.block_hash
+       | Compact_relay.Txn_request_block reason ->
+         Logs.warn (fun m -> m "blocktxn fill failed for %s: %s" hash_hex reason);
+         getdata_block peer resp.block_hash
+       | Compact_relay.Unexpected ->
+         Logs.debug (fun m ->
+           m "Unexpected blocktxn from peer %d (no pending compact block): %s"
+             peer.Peer.id hash_hex);
          Lwt.return_unit)
     | P2p.GetblocktxnMsg req ->
       Logs.info (fun m ->

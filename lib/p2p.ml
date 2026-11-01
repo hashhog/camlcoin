@@ -1460,6 +1460,16 @@ let reconstruct_block (cb : compact_block) (lookup : tx_lookup)
     ) cb.prefilled_txs;
     if not !prefill_ok then
       ReconstructFailed "compact block prefilled index out of range"
+    else if
+      (* Core InitData (blockencodings.cpp): two equal short ids in one
+         compact block are READ_STATUS_FAILED and the block is fetched in
+         full; matching them would fill two slots from one tx. *)
+      (let seen = Hashtbl.create (List.length cb.short_ids) in
+       List.exists (fun id ->
+         Hashtbl.mem seen id || (Hashtbl.replace seen id (); false))
+         cb.short_ids)
+    then
+      ReconstructFailed "compact block has duplicate short ids"
     else begin
       (* Fill in transactions from short IDs using array for O(1) access.
          Bug #2 fix: track which slots were matched from the lookup so that a
@@ -1513,10 +1523,12 @@ let fill_missing_txs (cb : compact_block) (partial_txs : Types.transaction optio
   if List.length missing_indices <> List.length received_txs then
     Error "received transaction count mismatch"
   else begin
-    (* Fill in the missing transactions *)
+    (* Fill in the missing transactions.  An array, not List.nth: with
+       65,535 txs the nth walk was ~2x10^9 list steps on the event loop. *)
+    let received = Array.of_list received_txs in
     List.iteri (fun i idx ->
-      if idx < Array.length partial_txs then
-        partial_txs.(idx) <- Some (List.nth received_txs i)
+      if idx >= 0 && idx < Array.length partial_txs then
+        partial_txs.(idx) <- Some received.(i)
     ) missing_indices;
 
     (* Check all slots are filled *)

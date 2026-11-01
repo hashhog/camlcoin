@@ -97,6 +97,7 @@ only when the chainstate is empty.
 | `--rest-tls-cert=PATH`, `--rest-tls-key=PATH` | none | Serve REST over HTTPS. |
 | `--zmqpub=OPT` | none | ZeroMQ publisher, e.g. `--zmqpub=hashblock=tcp://127.0.0.1:28332`. Topics: `hashblock`, `hashtx`, `rawblock`, `rawtx`, `sequence`. Repeatable. |
 | `--metricsport=PORT` | `9332` | Prometheus metrics port; `0` disables it. |
+| `--metricsbind=ADDR` | `127.0.0.1` | Address the metrics listener binds. It has no authentication; use `0.0.0.0` only on a trusted network. |
 
 ### Logging
 
@@ -124,7 +125,7 @@ Keys read from the file: `rpchost`, `rpcport`, `rpcuser`, `rpcpassword`, `port`,
 `asmap`, `proxy`, `onion`, `i2psam`, `i2pprivatekey`, `cjdnsreachable`, `rest`,
 `restport`, `restbind`, `rpctlscert`, `rpctlskey`, `resttlscert`, `resttlskey`,
 `blockfilterindex`, `coinstatsindex`, `txospenderindex`, `zmqpub`, `reindex`,
-`metricsport`, `debug` (a category list), `logfile`, `printtoconsole`, `pid`, `daemon`.
+`metricsport`, `metricsbind`, `debug` (a category list), `logfile`, `printtoconsole`, `pid`, `daemon`.
 
 `config.example.toml` in the repository root is not in this format and is not read.
 
@@ -167,7 +168,8 @@ about 1 GiB of that by default, and OCaml's heap adds overhead during initial sy
 
 ## Monitoring
 
-The metrics server listens on all interfaces, port 9332 (`--metricsport`). Any path
-returns three Prometheus gauges:
+The metrics server listens on `127.0.0.1`, port 9332 (`--metricsbind`, `--metricsport`).
+It has no authentication, closes each connection after 10 seconds, and serves at most 8
+connections at once; more are closed on accept. Any path returns three Prometheus gauges:
 `bitcoin_blocks_total`, `bitcoin_peers_connected` and `bitcoin_mempool_size`. For more,
 poll `getblockchaininfo`, `getpeerinfo`, `getmempoolinfo` and `getnetworkinfo` over RPC.

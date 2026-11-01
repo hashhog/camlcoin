@@ -160,6 +160,13 @@ let metrics_port_arg =
   Arg.(value & opt int 9332 &
     info ["metricsport"] ~docv:"PORT" ~doc)
 
+let metrics_bind_arg =
+  let doc = "Address the Prometheus metrics listener binds (default \
+             127.0.0.1). The endpoint has no authentication; use 0.0.0.0 \
+             only on a trusted network." in
+  Arg.(value & opt string Camlcoin.Metrics_server.default_host &
+    info ["metricsbind"] ~docv:"ADDR" ~doc)
+
 let maxmempool_arg =
   let doc = "Keep the transaction memory pool below <n> megabytes \
              (default 300; Bitcoin Core -maxmempool). Lowest-feerate chunks \
@@ -507,7 +514,7 @@ let rest_tls_key_arg =
 
 let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     p2p_port max_outbound max_inbound connect no_dnsseed no_assume_valid debug no_wallet prune benchmark
-    import_blocks import_utxo metrics_port maxmempool peer_bloom_filters
+    import_blocks import_utxo metrics_port metrics_bind maxmempool peer_bloom_filters
     migrate_logstorage daemon_mode pid_path conf_path debug_cats
     logfile printtoconsole ready_fd zmq_pub reindex
     rest_enabled rest_port rest_bind blockfilterindex asmap
@@ -632,6 +639,12 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       ~cli:(if metrics_port = 9332 then None else Some metrics_port)
       ~conf:(Camlcoin.Runtime_config.get_int conf_opts "metricsport")
       ~default:metrics_port in
+  let eff_metrics_bind =
+    Camlcoin.Runtime_config.overlay_string
+      ~cli:(if metrics_bind = Camlcoin.Metrics_server.default_host then None
+            else Some metrics_bind)
+      ~conf:(Camlcoin.Runtime_config.get_string conf_opts "metricsbind")
+      ~default:metrics_bind in
   let eff_maxmempool =
     Camlcoin.Runtime_config.overlay_int
       ~cli:(if maxmempool = 300 then None else Some maxmempool)
@@ -946,6 +959,7 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       prune = eff_prune;
       log_categories = eff_debug_cats;
       metrics_port = eff_metrics_port;
+      metrics_host = eff_metrics_bind;
       maxmempool_mb = eff_maxmempool;
       peer_bloom_filters = eff_peer_bloom;
       zmq_pub_options = (
@@ -1204,6 +1218,7 @@ let cmd =
     $ import_blocks_arg
     $ import_utxo_arg
     $ metrics_port_arg
+    $ metrics_bind_arg
     $ maxmempool_arg
     $ peer_bloom_filters_arg
     $ migrate_logstorage_arg

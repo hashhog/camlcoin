@@ -1,0 +1,8 @@
+; REST listener binds --restbind, caps request bodies at 32 MiB, and serves
+; POST /payjoin only with --restpayjoin (fix-camlcoin-sec-h2). Own directory
+; so the shared test/dune names list is untouched. Every case boots the real
+; CLI (bin/main.exe) on regtest with --rest on a separate --restport.
+(test
+ (name test_rest_bind)
+ (deps ../../bin/main.exe)
+ (libraries test_tmp alcotest base64 unix))

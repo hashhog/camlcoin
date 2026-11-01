@@ -823,26 +823,86 @@ let dispatch_rest (ctx : Rpc.rpc_context) (req : Cohttp.Request.t)
    REST Server
    ============================================================================ *)
 
+(* Request bodies are capped at Core's MAX_SIZE (32 MiB), the limit its HTTP
+   server sets with evhttp_set_max_body_size (httpserver.cpp).  POST /payjoin
+   is the only route that reads a body; it used to read the whole body into
+   memory with Body.to_string before any check, on an unauthenticated port. *)
+let max_body_size = 0x02000000
+
+(* Stop reading the request.  cohttp drains an unread body in a finalizer
+   before it writes the response, so a 413 for a declared multi-gigabyte body
+   would otherwise wait for (and read) all of it, the way Body.to_string did.
+   Shutting the receive side makes that drain hit EOF at once. *)
+let stop_reading (flow : Conduit_lwt_unix.flow) =
+  match flow with
+  | Conduit_lwt_unix.TCP { fd; _ } ->
+    (try Lwt_unix.shutdown fd Unix.SHUTDOWN_RECEIVE
+     with Unix.Unix_error _ -> ())
+  | _ -> ()
+
+let respond_too_large flow =
+  stop_reading flow;
+  let headers = Cohttp.Header.of_list
+      [ "Content-Type", "text/plain"; "Connection", "close" ] in
+  Cohttp_lwt_unix.Server.respond_string ~status:`Request_entity_too_large
+    ~headers ~body:"Request body too large\r\n" ()
+
+(* The declared Content-Length, if any.  A malformed value counts as too
+   large: the body is not read either way. *)
+let declared_length (req : Cohttp.Request.t) =
+  match Cohttp.Header.get (Cohttp.Request.headers req) "content-length" with
+  | None -> `None
+  | Some v ->
+    (match Int64.of_string_opt (String.trim v) with
+     | Some n when n >= 0L && n <= Int64.of_int max_body_size -> `Ok
+     | _ -> `Too_large)
+
+(* Read at most [max_body_size] bytes; [None] as soon as the body goes over
+   (a chunked body declares no length). *)
+let read_body_capped body =
+  let buf = Buffer.create 4096 in
+  let stream = Cohttp_lwt.Body.to_stream body in
+  let rec loop () =
+    Lwt.bind (Lwt_stream.get stream) (function
+      | None -> Lwt.return (Some (Buffer.contents buf))
+      | Some chunk ->
+        if Buffer.length buf + String.length chunk > max_body_size then
+          Lwt.return None
+        else (Buffer.add_string buf chunk; loop ()))
+  in
+  loop ()
+
 (* W119 / FIX-64: optional HTTPS/TLS termination on the REST listener.
-   Semantics match Rpc.start_rpc_server. *)
+   Semantics match Rpc.start_rpc_server.
+
+   [payjoin] (--restpayjoin, default off) routes the unauthenticated BIP-78
+   receiver at POST /payjoin.  Core has no such endpoint, and a public REST
+   port should not take request bodies unless the operator asked for it. *)
 let start_rest_server ~(ctx : Rpc.rpc_context)
     ~(host : string) ~(port : int)
     ?(tls_cert_path : string option = None)
     ?(tls_key_path : string option = None)
+    ?(payjoin = false)
     () : unit Lwt.t =
-  let callback _conn req body =
+  let callback (flow, _conn) req body =
     let meth = Cohttp.Request.meth req in
     let uri = Cohttp.Request.uri req in
     let path = Uri.path uri in
 
+    if declared_length req = `Too_large then respond_too_large flow
     (* FIX-65: BIP-78 PayJoin receiver — POST /payjoin only.  Routed
        before the REST GET-only guard so the POST path is reachable. *)
-    if meth = `POST && (path = "/payjoin" || path = "/payjoin/") then
-      Lwt.bind (Cohttp_lwt.Body.to_string body) (fun body_str ->
-        handle_payjoin ctx req body_str)
-    (* REST only accepts GET requests *)
-    else if meth <> `GET then
+    else if payjoin && meth = `POST
+            && (path = "/payjoin" || path = "/payjoin/") then
+      Lwt.bind (read_body_capped body) (function
+        | None -> respond_too_large flow
+        | Some body_str -> handle_payjoin ctx req body_str)
+    (* REST only accepts GET requests.  Nothing reads the body, so stop
+       cohttp draining it (a chunked one has no length to stop at). *)
+    else if meth <> `GET then begin
+      stop_reading flow;
       respond_error `Method_not_allowed "Method not allowed"
+    end
     (* Only handle /rest/* paths *)
     else if String.length path < 6 || String.sub path 0 6 <> "/rest/" then
       respond_error `Not_found "Not found"
@@ -881,7 +941,12 @@ let start_rest_server ~(ctx : Rpc.rpc_context)
         m "--rest-tls-key was set but --rest-tls-cert was not.");
       failwith "REST TLS: key provided without cert"
   in
-  Cohttp_lwt_unix.Server.create ~mode server
+  (* Conduit binds [`TCP (`Port p)] to ctx.src, INADDR_ANY when unset, so
+     without a ctx --restbind was only a log line and REST listened on every
+     interface.  Same fix as Rpc.start_rpc_server. *)
+  Lwt.bind (Conduit_lwt_unix.init ~src:host ()) (fun conduit_ctx ->
+    let ctx = Cohttp_lwt_unix.Net.init ~ctx:conduit_ctx () in
+    Cohttp_lwt_unix.Server.create ~ctx ~mode server)
 
 (* Default REST port *)
 let default_port () = 8080

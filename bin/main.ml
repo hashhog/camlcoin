@@ -501,6 +501,14 @@ let rest_tls_key_arg =
   Arg.(value & opt (some string) None &
     info ["rest-tls-key"] ~docv:"PATH" ~doc)
 
+let rest_payjoin_arg =
+  let doc = "Serve the BIP-78 PayJoin receiver at POST /payjoin on the \
+             REST listener (needs --rest and a separate --restport). The \
+             endpoint is unauthenticated, so it is off by default; Bitcoin \
+             Core has no such endpoint. Request bodies are capped at \
+             32 MiB either way." in
+  Arg.(value & flag & info ["restpayjoin"] ~doc)
+
 (* ============================================================================
    Main Command
    ============================================================================ *)
@@ -514,7 +522,7 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     proxy onion_proxy i2psam i2p_private_key cjdnsreachable
     rpc_tls_cert rpc_tls_key rest_tls_cert rest_tls_key
     coinstatsindex_cli txindex_cli txospenderindex_cli dbcache_cli par_cli
-    externalip_cli discover_cli fallbackfee_cli =
+    externalip_cli discover_cli fallbackfee_cli rest_payjoin_cli =
   (* --txindex is accepted for Core CLI compatibility (camlcoin always
      maintains the tx index); validate its value but otherwise ignore it. *)
   ignore txindex_cli;
@@ -1095,6 +1103,10 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       rest_tls_key = (match rest_tls_key with
         | Some _ -> rest_tls_key
         | None -> Camlcoin.Runtime_config.get_string conf_opts "resttlskey");
+      rest_payjoin =
+        rest_payjoin_cli
+        || (match Camlcoin.Runtime_config.get_bool conf_opts "restpayjoin" with
+            | Some b -> b | None -> false);
       (* Self-address advertisement (Core -externalip / -discover). CLI
          values replace conf-file values. *)
       externalip = (if externalip_cli <> [] then externalip_cli
@@ -1237,7 +1249,8 @@ let cmd =
     $ par_arg
     $ externalip_arg
     $ discover_arg
-    $ fallbackfee_arg)
+    $ fallbackfee_arg
+    $ rest_payjoin_arg)
 
 (* ============================================================================
    Entry Point

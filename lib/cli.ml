@@ -185,6 +185,10 @@ type config = {
        When unset, the REST listener serves plain HTTP. *)
   rest_tls_key : string option;
     (* --rest-tls-key=<PATH>.  PEM private key paired with --rest-tls-cert. *)
+  rest_payjoin : bool;
+    (* --restpayjoin.  Serve the unauthenticated BIP-78 receiver at
+       POST /payjoin on a separate --restport.  Default off: Core has no
+       such endpoint, and it is the only REST route that reads a body. *)
   externalip : string list;
     (* --externalip=<ip>[:port] (repeatable / comma-separated; Core
        -externalip).  Our own public address(es), advertised to peers at
@@ -238,6 +242,7 @@ let default_config : config = {
   rpc_tls_key = None;
   rest_tls_cert = None;
   rest_tls_key = None;
+  rest_payjoin = false;
   externalip = [];
   discover = None;
 }
@@ -1636,6 +1641,7 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         ~port:rest_port
         ~tls_cert_path:config.rest_tls_cert
         ~tls_key_path:config.rest_tls_key
+        ~payjoin:config.rest_payjoin
         ()
     end
   in

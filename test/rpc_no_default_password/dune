@@ -1,0 +1,9 @@
+; No built-in RPC login (fix-camlcoin-sec-c1). Own directory so the shared
+; test/dune names list is untouched. The node cases boot the real CLI
+; (bin/main.exe) on regtest, so the defaults under test are the ones an
+; operator gets with no --rpcpassword and no camlcoin.conf.
+(test
+ (name test_rpc_no_default_password)
+ (deps ../../bin/main.exe)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix base64
+            cohttp-lwt-unix))

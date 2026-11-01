@@ -10,9 +10,10 @@ method names, positional and named parameters, result shapes and error codes. JS
 HTTP Basic auth, with either
 
 - the cookie: `<datadir>/.cookie` holds `__cookie__:<random>`, rewritten at every start;
-- or `--rpcuser`/`--rpcpassword` (config keys `rpcuser`/`rpcpassword`). Both default to
-  `camlcoin`, and the default is accepted, so set your own if anyone else can reach the
-  port.
+- or `--rpcuser`/`--rpcpassword` (config keys `rpcuser`/`rpcpassword`), only when a
+  password is set. There is no default password: with none set, only the cookie works.
+
+A wrong `Authorization` header is answered with 401 after 250 ms, as in Core.
 
 ```bash
 curl -s --user "$(cat "$DATADIR/.cookie")" \

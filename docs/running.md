@@ -88,8 +88,8 @@ only when the chainstate is empty.
 |---|---|---|
 | `--rpchost=HOST` | `127.0.0.1` | RPC bind address. |
 | `--rpcport=PORT` | per network | RPC port. |
-| `--rpcuser=USER` | `camlcoin` | RPC user name. |
-| `--rpcpassword=PASS` | `camlcoin` | RPC password. Change it; the default is accepted. |
+| `--rpcuser=USER` | none | RPC user name. Used only with `--rpcpassword`. |
+| `--rpcpassword=PASS` | none | RPC password. Unset means cookie-only RPC. |
 | `--rpc-tls-cert=PATH`, `--rpc-tls-key=PATH` | none | Serve RPC over HTTPS. Both are required. |
 | `--rest` | off | Enable the read-only REST interface. Needs `--restport` too. |
 | `--restport=PORT` | RPC port | REST port. It must differ from the RPC port: if they are equal, no REST endpoints are served (a warning is logged). |

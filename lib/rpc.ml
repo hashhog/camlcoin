@@ -17049,19 +17049,24 @@ let start_rpc_server ~(ctx : rpc_context)
     : unit Lwt.t =
   let open Lwt.Syntax in
 
-  let check_auth headers =
-    match Cohttp.Header.get headers "authorization" with
+  (* No built-in login: an empty [rpc_password] means cookie-only, as in
+     Core httprpc.cpp InitRPCAuthentication. rpcuser:rpcpassword is accepted
+     only when an rpcpassword is configured. Unlike Core, the cookie stays
+     valid next to it, because fleet tooling reads .cookie. Each
+     candidate is compared with Eqaf.equal (Core TimingResistantEqual) and the
+     fold does not short-circuit, so timing does not tell which one matched. *)
+  let accepted =
+    (match cookie_password with
+     | Some cp -> ["Basic " ^ Base64.encode_string ("__cookie__:" ^ cp)]
+     | None -> [])
+    @ (if rpc_password = "" then []
+       else ["Basic " ^ Base64.encode_string (rpc_user ^ ":" ^ rpc_password)])
+  in
+  let check_auth = function
     | None -> false
     | Some auth ->
-      let expected_user = "Basic " ^
-        Base64.encode_string (rpc_user ^ ":" ^ rpc_password) in
-      if String.equal auth expected_user then true
-      else match cookie_password with
-        | None -> false
-        | Some cp ->
-          let expected_cookie = "Basic " ^
-            Base64.encode_string ("__cookie__:" ^ cp) in
-          String.equal auth expected_cookie
+      List.fold_left (fun ok expected -> Eqaf.equal auth expected || ok)
+        false accepted
   in
 
   let callback _conn req body =
@@ -17091,8 +17096,14 @@ let start_rpc_server ~(ctx : rpc_context)
         ~headers:response_headers
         ~body:"{\"error\": \"Method not allowed\"}" ()
     end
-    (* Check authentication *)
-    else if not (check_auth headers) then begin
+    (* Check authentication. A wrong Authorization header is answered after
+       250 ms to slow brute forcing; a missing one at once (Core httprpc.cpp
+       HTTPReq_JSONRPC). *)
+    else if not (check_auth (Cohttp.Header.get headers "authorization"))
+    then begin
+      let* () =
+        if Cohttp.Header.mem headers "authorization" then Lwt_unix.sleep 0.25
+        else Lwt.return_unit in
       let response_headers = Cohttp.Header.init_with
         "WWW-Authenticate" "Basic realm=\"jsonrpc\"" in
       Cohttp_lwt_unix.Server.respond_string

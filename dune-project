@@ -26,6 +26,7 @@
   (bigstring (>= 0.2))
   (bigstringaf (>= 0.9.0))
   (base64 (>= 3.5.0))
+  (eqaf (>= 0.9))
   (alcotest (and (>= 1.6.0) :with-test))
   (qcheck (and (>= 0.20) :with-test))
   (qcheck-alcotest (and (>= 0.20) :with-test))

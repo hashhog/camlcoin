@@ -42,9 +42,9 @@
        G12 -rpccookieperms flag               MISSING (BUG-4, P1)
        G13 DeleteAuthCookie on shutdown       MISSING (BUG-10, P2)
      [C] Auth response surface (4)
-       G14 TimingResistantEqual               MISSING (BUG-1, P0-SEC)
+       G14 TimingResistantEqual               PRESENT (Eqaf.equal)
        G15 WWW-Authenticate Basic realm       PARTIAL
-       G16 250ms brute-force sleep            MISSING (BUG-8, P1)
+       G16 250ms brute-force sleep            PRESENT
        G17 401 empty body                     PARTIAL (BUG-14, P2)
      [D] JSON-RPC dispatch correctness (8)
        G18 POST-only                          PRESENT
@@ -344,26 +344,21 @@ let g13_no_delete_auth_cookie_on_shutdown () =
    [C] Auth response surface (4 gates)
    ============================================================================ *)
 
-(* -- G14 TimingResistantEqual constant-time compare — MISSING (BUG-1, P0-SEC) *)
+(* -- G14 TimingResistantEqual constant-time compare — PRESENT ------------ *)
 
 let g14_String_equal_is_variable_time () =
-  (* SEC issue: rpc.ml line ~9069 uses String.equal for auth comparison.
-     Variable-time, leaks prefix length to network attacker.  Verify
-     String.equal IS the comparator in the check_auth body. *)
+  (* check_auth used String.equal (variable-time, leaks the matching prefix
+     length).  It now uses Eqaf.equal (fix-camlcoin-sec-c1). *)
   let rpc = rpc_ml () in
   Alcotest.(check bool)
-    "G14 (P0-SEC BUG-1) check_auth uses String.equal (variable-time)"
-    true (contains_substring rpc "String.equal auth expected_user")
+    "G14 (BUG-1 fixed) check_auth no longer uses String.equal"
+    false (contains_substring rpc "String.equal auth expected")
 
 let g14_no_constant_time_compare_for_auth () =
   let rpc = rpc_ml () in
   Alcotest.(check bool)
-    "G14 (BUG-1) no constant_time_eq / TimingResistantEqual for auth"
-    false
-    (contains_substring rpc "constant_time_eq"
-     || contains_substring rpc "TimingResistantEqual"
-     || contains_substring rpc "ct_eq"
-     || contains_substring rpc "Eqaf.equal")
+    "G14 (BUG-1 fixed) check_auth compares with Eqaf.equal"
+    true (contains_substring rpc "Eqaf.equal auth expected")
 
 (* -- G15 WWW-Authenticate Basic realm="jsonrpc" — PARTIAL --------------- *)
 
@@ -379,15 +374,16 @@ let g15_basic_realm_jsonrpc () =
     "G15 Basic realm=\"jsonrpc\" realm name matches Core"
     true (contains_substring rpc "Basic realm=\\\"jsonrpc\\\"")
 
-(* -- G16 250ms brute-force deterrent sleep — MISSING (BUG-8, P1) -------- *)
+(* -- G16 250ms brute-force deterrent sleep — PRESENT -------------------- *)
 
 let g16_no_sleep_on_auth_failure () =
+  (* Behaviour is pinned in test/rpc_no_default_password; this is the
+     source-level gate. *)
   let rpc = rpc_ml () in
   Alcotest.(check bool)
-    "G16 (BUG-8) no Lwt_unix.sleep 0.25 on auth failure path"
-    false
-    ((contains_substring rpc "Lwt_unix.sleep 0.25"
-      || contains_substring rpc "UninterruptibleSleep")
+    "G16 (BUG-8 fixed) Lwt_unix.sleep 0.25 on auth failure path"
+    true
+    (contains_substring rpc "Lwt_unix.sleep 0.25"
      && contains_substring rpc "check_auth")
 
 (* -- G17 401 body — PARTIAL (BUG-14, P2: literal "Unauthorized" body) --- *)
@@ -655,15 +651,15 @@ let () =
         g13_no_delete_auth_cookie_on_shutdown;
     ];
     "[C] Auth response surface", [
-      test_case "G14 String.equal used (P0-SEC BUG-1)" `Quick
+      test_case "G14 String.equal not used (BUG-1 fixed)" `Quick
         g14_String_equal_is_variable_time;
-      test_case "G14 no constant-time compare (BUG-1)" `Quick
+      test_case "G14 Eqaf constant-time compare (BUG-1 fixed)" `Quick
         g14_no_constant_time_compare_for_auth;
       test_case "G15 WWW-Authenticate header emitted" `Quick
         g15_www_authenticate_header_emitted;
       test_case "G15 Basic realm=\"jsonrpc\"" `Quick
         g15_basic_realm_jsonrpc;
-      test_case "G16 no 250ms sleep on auth failure (BUG-8)" `Quick
+      test_case "G16 250ms sleep on auth failure (BUG-8 fixed)" `Quick
         g16_no_sleep_on_auth_failure;
       test_case "G17 401 body 'Unauthorized' literal (BUG-14)" `Quick
         g17_401_body_is_unauthorized_literal;

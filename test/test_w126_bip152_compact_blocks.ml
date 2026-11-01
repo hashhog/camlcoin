@@ -457,10 +457,12 @@ let g22_no_extra_txn_pool_bug () =
     false (contains_substring src_pm "extra_txn_for_compact"
         || contains_substring src_pm "vExtraTxnForCompact"
         || contains_substring src_pm "extra_compact_tx");
+  (* fix-camlcoin-sec-c3: the call moved into Compact_relay.on_cmpctblock's
+     [~reconstruct] argument; it still passes only the compact block. *)
   Alcotest.(check bool)
     "BUG-6 (pre-fix): cli.ml reconstruct call only consults mempool"
     true (contains_substring src_cli
-            "Peer_manager.reconstruct_from_mempool peer_manager cb");
+            "~reconstruct:(Peer_manager.reconstruct_from_mempool peer_manager)");
   (* Functional check: reconstruct_from_mempool API takes only the
      compact block, not an extra_txn list parameter. *)
   let src = slurp_lib "peer_manager.ml" in
@@ -475,14 +477,18 @@ let g22_no_extra_txn_pool_bug () =
    ============================================================================ *)
 
 let g23_reconstruct_round_trip () =
+  (* fix-camlcoin-sec-c3: the decision moved to Compact_relay (which also
+     stores the entry under the asking peer); cli.ml sends the request. *)
+  let relay = slurp_lib "compact_relay.ml" in
   let src = slurp_lib "cli.ml" in
   Alcotest.(check bool)
     "G23: ReconstructNeedTxs branch makes getblocktxn request"
-    true (contains_substring src
-            "let req = P2p.make_getblocktxn_request header_hash missing");
+    true (contains_substring relay
+            "Request_txns (P2p.make_getblocktxn_request hash missing)");
   Alcotest.(check bool)
     "G23: getblocktxn message sent to source peer"
-    true (contains_substring src "let getblocktxn_msg = P2p.make_getblocktxn_msg req")
+    true (contains_substring src
+            "Peer.send_message peer (P2p.make_getblocktxn_msg req)")
 
 (* ============================================================================
    G24: InvCompactBlock served via getdata within MAX_CMPCTBLOCK_DEPTH=5 —

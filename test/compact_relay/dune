@@ -1,0 +1,6 @@
+; Compact_relay unit tests (fix-camlcoin-sec-c3): the bounded BIP 152
+; partial-block table and its header gate, in process. Own directory so the
+; shared test/dune names list is untouched.
+(test
+ (name test_compact_relay)
+ (libraries camlcoin test_tmp alcotest cstruct lwt lwt.unix))

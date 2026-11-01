@@ -1,0 +1,9 @@
+; cmpctblock must not fill an unbounded table (fix-camlcoin-sec-c3). Own
+; directory so the shared test/dune names list is untouched. Boots the real
+; CLI (bin/main.exe) on regtest and talks to it as a v1 P2P peer, so the
+; listener under test is the one cli.ml registers.
+(test
+ (name test_cmpctblock_pending)
+ (deps ../../bin/main.exe)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix base64
+            cohttp-lwt-unix yojson))

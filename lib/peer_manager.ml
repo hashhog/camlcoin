@@ -221,6 +221,7 @@ type t = {
   mutable header_height : int32;             (* best-header height; VERSION liars are scored against this, not our_height *)
   mutable running : bool;
   mutable listeners : (P2p.message_payload -> Peer.peer -> unit Lwt.t) list;
+  mutable peer_removed_hooks : (int -> unit) list;  (* run by [remove_peer] *)
   mutable listener_fd : Lwt_unix.file_descr option;  (* TCP listen socket *)
   mutable last_tip_update : float;           (* Timestamp of last chain tip update *)
   stale_tip_check_interval : float;          (* Default 1800.0 = 30 minutes — peer-eviction threshold *)
@@ -356,6 +357,7 @@ let create ?(config = default_config) ?(asmap : bytes option = None) (network : 
     header_height = 0l;
     running = false;
     listeners = [];
+    peer_removed_hooks = [];
     listener_fd = None;
     last_tip_update = Unix.gettimeofday ();
     stale_tip_check_interval = 1800.0;
@@ -500,6 +502,11 @@ let notify_tip_updated (pm : t) : unit =
 (* Add a message listener *)
 let add_listener (pm : t) (listener : P2p.message_payload -> Peer.peer -> unit Lwt.t) : unit =
   pm.listeners <- listener :: pm.listeners
+
+(* Run [hook peer_id] whenever [remove_peer] drops a peer, so per-peer state
+   kept outside this module (BIP 152 partial blocks) goes with it. *)
+let add_peer_removed_hook (pm : t) (hook : int -> unit) : unit =
+  pm.peer_removed_hooks <- hook :: pm.peer_removed_hooks
 
 (* Get all connected peers in Ready state *)
 let get_ready_peers (pm : t) : Peer.peer list =
@@ -1880,6 +1887,7 @@ let remove_peer (pm : t) (peer_id : int) : unit Lwt.t =
       Hashtbl.remove pm.outbound_netgroups (netgroup_of_with_pm pm peer.Peer.addr);
     (* Remove from high-bandwidth compact block list (BIP 152) *)
     pm.hb_compact_peers <- List.filter ((<>) peer_id) pm.hb_compact_peers;
+    List.iter (fun hook -> try hook peer_id with _ -> ()) pm.peer_removed_hooks;
     Lwt.return_unit
 
 (* Ban a peer *)

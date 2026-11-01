@@ -1,0 +1,6 @@
+; BIP-324 receive buffer must not be re-copied per read, and decoys before
+; the version packet must be bounded (fix-camlcoin-sec-h3). Own directory so
+; the shared test/dune names list is untouched.
+(test
+ (name test_v2_recv_buffer)
+ (libraries camlcoin alcotest cstruct))

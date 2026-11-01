@@ -1,0 +1,6 @@
+; A tip-extending block that fails ContextualCheckBlock/ConnectBlock stays in
+; the block index as failed (item batch5-camlcoin-consensus).  Own directory
+; and stanza so it does not touch the shared names list in test/dune.
+(test
+ (name test_submitblock_failed_tip_retained)
+ (libraries camlcoin test_tmp alcotest yojson cstruct))

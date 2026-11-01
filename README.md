@@ -78,8 +78,9 @@ All flags, the config file, the data directory layout and logging are in
 
 camlcoin aims to match Bitcoin Core's JSON-RPC interface: same method names, parameters,
 result shapes and error codes. It accepts HTTP Basic auth with the `.cookie` file written
-to the data directory at startup, or with `--rpcuser`/`--rpcpassword` (both default to
-`camlcoin`; change them if the RPC port is reachable by anyone else):
+to the data directory at startup. `--rpcuser`/`--rpcpassword` (or `rpcuser=`/`rpcpassword=`
+in `camlcoin.conf`) add a second login; there is no built-in password, so with
+`--rpcpassword` unset only the cookie works, as in Bitcoin Core:
 
 ```bash
 curl -s --user "$(cat "$DATADIR/.cookie")" \

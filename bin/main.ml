@@ -33,13 +33,13 @@ let rpc_port_arg =
     info ["rpcport"] ~docv:"PORT" ~doc)
 
 let rpc_user_arg =
-  let doc = "RPC username." in
-  Arg.(value & opt string "camlcoin" &
+  let doc = "RPC username. Used only together with --rpcpassword." in
+  Arg.(value & opt string "" &
     info ["rpcuser"] ~docv:"USER" ~doc)
 
 let rpc_password_arg =
-  let doc = "RPC password." in
-  Arg.(value & opt string "camlcoin" &
+  let doc = "RPC password. Unset by default: RPC then accepts only the cookie in <datadir>/.cookie (Bitcoin Core behaviour). There is no built-in password." in
+  Arg.(value & opt string "" &
     info ["rpcpassword"] ~docv:"PASS" ~doc)
 
 let p2p_port_arg =
@@ -582,12 +582,12 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
       ~default:rpc_host in
   let eff_rpc_user =
     Camlcoin.Runtime_config.overlay_string
-      ~cli:(if rpc_user = "camlcoin" then None else Some rpc_user)
+      ~cli:(if rpc_user = "" then None else Some rpc_user)
       ~conf:(Camlcoin.Runtime_config.get_string conf_opts "rpcuser")
       ~default:rpc_user in
   let eff_rpc_password =
     Camlcoin.Runtime_config.overlay_string
-      ~cli:(if rpc_password = "camlcoin" then None else Some rpc_password)
+      ~cli:(if rpc_password = "" then None else Some rpc_password)
       ~conf:(Camlcoin.Runtime_config.get_string conf_opts "rpcpassword")
       ~default:rpc_password in
   let eff_max_outbound =

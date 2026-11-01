@@ -203,8 +203,9 @@ let default_config : config = {
   data_dir = Filename.concat (Sys.getenv "HOME") ".camlcoin";
   rpc_host = "127.0.0.1";
   rpc_port = 8332;
-  rpc_user = "camlcoin";
-  rpc_password = "camlcoin";
+  (* No built-in login: an empty rpc_password means cookie-only RPC. *)
+  rpc_user = "";
+  rpc_password = "";
   p2p_port = 8333;
   max_outbound = 8;
   max_inbound = 117;

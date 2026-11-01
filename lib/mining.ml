@@ -948,7 +948,29 @@ let submit_block_outcome ?(utxo : Utxo.OptimizedUtxoSet.t option)
          | Some msg -> Error msg
          | None ->
         match vres with
-        | Validation.AB_err e -> Error (Validation.block_error_to_string e)
+        | Validation.AB_err e ->
+          (* Core AcceptBlock: the header is in m_block_index before
+             ContextualCheckBlock and ConnectBlock run, and either failure
+             calls InvalidBlockFound (BLOCK_FAILED_VALID), so the block stays
+             known as failed: getchaintips "invalid", resubmit
+             "duplicate-invalid", child "bad-prevblk".  Header, CheckBlock
+             and mutation failures leave no entry
+             ([Sync.is_retained_block_failure]).  The verdict is on [vtip]'s
+             coin view, which is the block's parent (checked above), so it is
+             a verdict on this block. *)
+          if Sync.is_retained_block_failure e
+             && Sync.block_extends_validated_tip chain ~height
+                  ~prev:block.header.prev_block then begin
+            let entry = match Sync.validate_header chain block.header with
+              | Ok entry -> Sync.accept_header chain entry; Some entry
+              | Error "Header already known" -> Sync.get_header chain hash
+              | Error _ -> None
+            in
+            match entry with
+            | Some entry -> ignore (Sync.mark_block_failed chain entry)
+            | None -> ()
+          end;
+          Error (Validation.block_error_to_string e)
         | Validation.AB_ok _
           when not (Sync.block_extends_validated_tip chain ~height
                       ~prev:block.header.prev_block) ->

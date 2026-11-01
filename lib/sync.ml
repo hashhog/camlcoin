@@ -6876,6 +6876,71 @@ let is_block_mutation_error (e : Validation.block_validation_error) : bool =
   | Validation.BlockBadVersion _
   | Validation.BlockTimeWarpAttack -> false
 
+(* Does Core keep a block that failed with [e] in its block index, marked
+   BLOCK_FAILED_VALID?  Only when the failure came from ContextualCheckBlock
+   (AcceptBlock -> InvalidBlockFound, validation.cpp:4350) or ConnectBlock
+   (ConnectTip -> InvalidBlockFound, validation.cpp:1988).  A header failure
+   (AcceptBlockHeader) never creates the entry, and ProcessNewBlock runs the
+   context-free CheckBlock before AcceptBlock, so a CheckBlock failure leaves
+   none either.  For a submitted block whose header is not yet indexed, this
+   decides whether the failed block is recorded (getchaintips "invalid", a
+   resubmit "duplicate-invalid", a child "bad-prevblk") or forgotten.
+
+   A camlcoin error that Core can raise from both CheckBlock and a later
+   stage (bad-blk-sigops, bad-cb-*, an output-range or witness error) is
+   kept on the forgotten side: forgetting a failed block only costs the
+   index entry, recording a block Core would not record changes later
+   verdicts on it.  Exhaustive by design, as [is_block_mutation_error]. *)
+let is_retained_block_failure (e : Validation.block_validation_error) : bool =
+  match e with
+  (* ContextualCheckBlock: bad-blk-weight. *)
+  | Validation.BlockOverweight _
+  (* ConnectBlock: bad-cb-amount. *)
+  | Validation.BlockBadCoinbaseValue _ -> true
+  | Validation.BlockTxValidationFailed (_, tx_err) ->
+    (match tx_err with
+     (* ContextualCheckBlock: bad-txns-nonfinal. *)
+     | Validation.TxNonFinalLocktime
+     (* ConnectBlock / CheckTxInputs: bad-txns-inputs-missingorspent,
+        bad-txns-premature-spend-of-coinbase, bad-txns-in-belowout,
+        bad-txns-nonfinal (BIP68), bad-txns-BIP30, script failures. *)
+     | Validation.TxMissingInputs
+     | Validation.TxCoinbaseMaturity _
+     | Validation.TxInsufficientFee
+     | Validation.TxSequenceLocksFailed
+     | Validation.TxDuplicateTxid
+     | Validation.TxScriptFailed _ -> true
+     (* CheckTransaction (inside CheckBlock), or raised from both. *)
+     | Validation.TxEmptyInputs
+     | Validation.TxEmptyOutputs
+     | Validation.TxOversizeWeight _
+     | Validation.TxNegativeOutput _
+     | Validation.TxOutputTooLarge _
+     | Validation.TxOutputOverflow
+     | Validation.TxDuplicateInputs
+     | Validation.TxBadCoinbase
+     | Validation.TxCoinbaseScriptSigTooLong
+     | Validation.TxInvalidWitness
+     | Validation.TxUnexpectedCoinbase
+     | Validation.TxNullPrevout -> false)
+  (* AcceptBlockHeader. *)
+  | Validation.BlockBadTimestamp
+  | Validation.BlockBadDifficulty
+  | Validation.BlockBadVersion _
+  | Validation.BlockTimeWarpAttack
+  (* CheckBlock, or raised from both. *)
+  | Validation.BlockEmptyTransactions
+  | Validation.BlockNoCoinbase
+  | Validation.BlockOversized _
+  | Validation.BlockTooManySigops
+  (* BLOCK_MUTATED: never marked (InvalidBlockFound skips it). *)
+  | Validation.BlockBadMerkleRoot
+  | Validation.BlockMutatedMerkle
+  | Validation.BlockDuplicateTx
+  | Validation.BlockBadWitnessCommitment
+  | Validation.BlockBadWitnessNonceSize
+  | Validation.BlockUnexpectedWitness -> false
+
 (* Which peer delivered a block body we stored without validating (a
    side-branch block), so the peer can be punished when a later
    ActivateBestChain finds it invalid.  Core's mapBlockSource

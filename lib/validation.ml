@@ -909,6 +909,28 @@ let check_block ~network:(network : Consensus.network_config) (block : Types.blo
     : (unit, block_validation_error) result =
   let txs = block.transactions in
 
+  (* Merkle root and mutation first.  Core CheckBlock (validation.cpp):
+     "All potential-corruption validation must be done before we do any
+     transaction validation, as otherwise we may mark the header as invalid
+     because we receive the wrong transactions for it."  Every error this
+     block returns before the root matches is a BLOCK_MUTATED class error
+     (Sync.is_block_mutation_error), so a peer that sends a real header with
+     a body it made up (no transactions, a non-coinbase first tx, a coinbase
+     with the wrong BIP34 height) cannot get the honest block marked failed.
+     Once the root matches, the txids are the ones the header commits to and
+     every later failure is a verdict on the block itself.
+     Security audit 2026-10-31, C4. *)
+  let txids = List.map Crypto.compute_txid txs in
+  let (computed_merkle, mutated) = Crypto.merkle_root txids in
+  if mutated then
+    Error BlockMutatedMerkle
+  else if not (Cstruct.equal computed_merkle block.header.merkle_root) then
+    Error BlockBadMerkleRoot
+  else
+  match check_duplicate_txids txs with
+  | Error e -> Error e
+  | Ok () ->
+
   (* Block must have at least one transaction *)
   if txs = [] then
     Error BlockEmptyTransactions
@@ -970,18 +992,22 @@ let check_block ~network:(network : Consensus.network_config) (block : Types.blo
                            ~network) then
               Error BlockTimeWarpAttack
             else begin
-              (* Verify merkle root *)
-              let txids = List.map Crypto.compute_txid txs in
-              let (computed_merkle, mutated) = Crypto.merkle_root txids in
-              if mutated then
-                Error BlockMutatedMerkle
-              else if not (Cstruct.equal computed_merkle block.header.merkle_root) then
-                Error BlockBadMerkleRoot
-              else begin
-                (* Check for duplicate txids *)
-                match check_duplicate_txids txs with
-                | Error e -> Error e
-                | Ok () ->
+              (* Witness malleation before anything that reads witness
+                 bytes (the serialized-size and weight limits below).  The
+                 merkle root covers txids only, so until the commitment
+                 matches, the witnesses may still be someone else's: a real
+                 block with its coinbase witness inflated past 4 MB must come
+                 back mutated (bad-witness-*, unexpected-witness, not
+                 marked), not BlockOversized (marked).  The coinbase is
+                 known to be first here.  Gated on segwit activation as
+                 Core's CheckWitnessMalleation(expect_witness_commitment=
+                 DeploymentActiveAfter(..., DEPLOYMENT_SEGWIT)) in
+                 ContextualCheckBlock, validation.cpp:4169. *)
+              let segwit_active = height >= network.segwit_height in
+              match check_witness_commitment ~segwit_active block with
+              | Error e -> Error e
+              | Ok () ->
+              begin
                   (* Context-free legacy sigops check (fast early rejection).
                      This underestimates sigops because it doesn't count
                      P2SH or witness sigops, but catches obviously invalid blocks
@@ -1037,15 +1063,8 @@ let check_block ~network:(network : Consensus.network_config) (block : Types.blo
                       match !error with
                       | Some e -> Error e
                       | None ->
-                        (* Task 6: Verify witness commitment.
-                           Gate on segwit activation height, matching Core's
-                           CheckWitnessMalleation(expect_witness_commitment=
-                             DeploymentActiveAfter(..., DEPLOYMENT_SEGWIT))
-                           in ContextualCheckBlock, validation.cpp:4169. *)
-                        let segwit_active = height >= network.segwit_height in
-                        match check_witness_commitment ~segwit_active block with
-                        | Error e -> Error e
-                        | Ok () ->
+                        (* Task 6 (witness commitment) runs before the size
+                           and weight limits, above. *)
                           (* Task 7: ContextualCheckBlock — IsFinalTx for every tx.
                              Bitcoin Core validation.cpp:4146 enforces this even when
                              scripts are skipped (assumevalid only skips script verify).

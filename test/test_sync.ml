@@ -1632,7 +1632,7 @@ let test_get_all_invalidated_blocks () =
   cleanup_test_db ()
 
 (* Helper to create a valid regtest header that meets proof-of-work requirements *)
-let mine_test_header ?(merkle_marker : int32 = 0l) ~prev_block ~prev_height ~bits () =
+let mine_test_header ?(merkle_marker : int32 = 0l) ?merkle_root ~prev_block ~prev_height ~bits () =
   let rec find_valid_nonce nonce =
     if nonce > 1_000_000l then
       failwith "Could not find valid nonce for test header"
@@ -1643,8 +1643,13 @@ let mine_test_header ?(merkle_marker : int32 = 0l) ~prev_block ~prev_height ~bit
          side-branch tests). Without this, mine_test_header for two
          calls with the same prev_block and same wallclock second
          returns identical headers. *)
-      let merkle = Cstruct.create 32 in
-      Cstruct.LE.set_uint32 merkle 28 merkle_marker;
+      let merkle = match merkle_root with
+        | Some m -> m
+        | None ->
+          let m = Cstruct.create 32 in
+          Cstruct.LE.set_uint32 m 28 merkle_marker;
+          m
+      in
       let header = Types.{
         version = 1l;
         prev_block;
@@ -2681,23 +2686,29 @@ let test_invalidate_reorg_reconsider () =
     | None -> failwith "Genesis not found"
   in
 
-  (* Build a chain: genesis -> block1 -> block2 *)
-  let block1_entry = mine_test_header
-    ~prev_block:genesis_hash
-    ~prev_height:0
-    ~bits:Consensus.regtest.genesis_header.bits () in
-
   (* Manually add block1 to state.  invalidate_block rewinds the active
      chain through Sync.disconnect_to_target (Core InvalidateBlock ->
      DisconnectTip), which needs each connected block's BODY and UNDO data on
      disk — so store a coinbase-only body plus an empty undo record for every
-     block this fixture puts on the active chain. *)
+     block this fixture puts on the active chain.  The headers commit to that
+     body (merkle root), so a failed connect is a verdict on the block and
+     not a mismatched body (check_block reports a merkle mismatch first and
+     such a body is never marked). *)
+  let body_txs =
+    (make_coinbase_only_block ~prev_block:genesis_hash ~ts:0l ~nc:0l
+       ~output_value:50_00000000L
+       ~output_script:(Cstruct.of_string "\x51")).Types.transactions in
+  let body_merkle =
+    fst (Crypto.merkle_root (List.map Crypto.compute_txid body_txs)) in
+
+  (* Build a chain: genesis -> block1 -> block2 *)
+  let block1_entry = mine_test_header ~merkle_root:body_merkle
+    ~prev_block:genesis_hash
+    ~prev_height:0
+    ~bits:Consensus.regtest.genesis_header.bits () in
+
   let store_body (entry : Sync.header_entry) =
-    let body = make_coinbase_only_block
-      ~prev_block:entry.header.prev_block ~ts:entry.header.timestamp
-      ~nc:entry.header.nonce ~output_value:50_00000000L
-      ~output_script:(Cstruct.of_string "\x51") in
-    let body = { body with Types.header = entry.header } in
+    let body = { Types.header = entry.header; transactions = body_txs } in
     Storage.ChainDB.store_block state.db entry.hash body;
     let undo : Utxo.undo_data = { height = entry.height; tx_undos = [] } in
     let uw = Serialize.writer_create () in
@@ -2723,7 +2734,7 @@ let test_invalidate_reorg_reconsider () =
   Storage.ChainDB.set_chain_tip state.db block1_entry.hash block1_entry.height;
 
   (* Build block2 on top of block1 *)
-  let block2_entry = mine_test_header
+  let block2_entry = mine_test_header ~merkle_root:body_merkle
     ~prev_block:block1_entry.hash
     ~prev_height:1
     ~bits:Consensus.regtest.genesis_header.bits () in

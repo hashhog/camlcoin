@@ -1,0 +1,7 @@
+; check_block runs the merkle-root / mutation and witness-malleation checks
+; before any check whose answer depends on the body (item fix-camlcoin-sec-c4).
+; Own directory and stanza so it does not touch the shared names list in
+; test/dune.
+(test
+ (name test_checkblock_merkle_first)
+ (libraries camlcoin test_tmp alcotest cstruct lwt.unix))

@@ -17049,9 +17049,10 @@ let start_rpc_server ~(ctx : rpc_context)
     : unit Lwt.t =
   let open Lwt.Syntax in
 
-  (* Core httprpc.cpp InitRPCAuthentication: the cookie is always accepted,
-     and rpcuser:rpcpassword only when an rpcpassword is configured. There is
-     no built-in login: an empty [rpc_password] means cookie-only. Each
+  (* No built-in login: an empty [rpc_password] means cookie-only, as in
+     Core httprpc.cpp InitRPCAuthentication. rpcuser:rpcpassword is accepted
+     only when an rpcpassword is configured. Unlike Core, the cookie stays
+     valid next to it, because fleet tooling reads .cookie. Each
      candidate is compared with Eqaf.equal (Core TimingResistantEqual) and the
      fold does not short-circuit, so timing does not tell which one matched. *)
   let accepted =

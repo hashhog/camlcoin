@@ -104,7 +104,6 @@ comments in `test/dune` say how to run them.
 - The fee estimator is simpler than Core's, so `estimatesmartfee` can differ.
 - The default RPC user and password (`camlcoin`/`camlcoin`) are accepted. Set your own,
   or use the cookie, if the RPC port is reachable by others.
-- The Prometheus metrics port (9332) listens on all interfaces.
 - `config.example.toml` and the `Dockerfile` are out of date: the first is not in the
   format camlcoin reads, and the second passes a network name camlcoin rejects.
 - Memory use on mainnet is high (OCaml heap plus the UTXO cache); give it 32 GB or more.

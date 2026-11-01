@@ -19,6 +19,7 @@ module Fee_estimation = Fee_estimation
 module Mining = Mining
 module Rpc = Rpc
 module Rest = Rest
+module Metrics_server = Metrics_server
 module Bip39 = Bip39
 module Bip21 = Bip21
 module Wallet = Wallet

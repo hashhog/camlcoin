@@ -63,8 +63,9 @@ per-network subdirectory, so give each network its own. Defaults are `~/.camlcoi
 | testnet (testnet4) | 18333 | 18332 |
 | regtest | 18444 | 18443 |
 
-RPC binds to `127.0.0.1`. A Prometheus metrics endpoint listens on all interfaces, port 9332
-(`--metricsport=0` turns it off; a busy port only logs a warning).
+RPC binds to `127.0.0.1`. A Prometheus metrics endpoint listens on `127.0.0.1`, port 9332
+(`--metricsbind` changes the address, `--metricsport=0` turns it off; a busy port only logs a
+warning).
 
 A full mainnet node keeps every block: plan for about 1 TB of fast disk, or use
 `--prune=550` (or larger, in MiB). Give it at least 32 GB of RAM. `--dbcache=<entries>`

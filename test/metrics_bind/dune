@@ -1,0 +1,9 @@
+; Metrics listener binds --metricsbind (loopback by default), with a timeout
+; and a connection cap (fix-camlcoin-sec-h1). Own directory so the shared
+; test/dune names list is untouched. Every case boots the real CLI
+; (bin/main.exe) on regtest, so the defaults under test are the ones an
+; operator gets with no --metricsbind.
+(test
+ (name test_metrics_bind)
+ (deps ../../bin/main.exe)
+ (libraries test_tmp alcotest base64 unix))

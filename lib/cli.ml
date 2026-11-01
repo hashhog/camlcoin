@@ -56,6 +56,7 @@ type config = {
        Values 2..549 are rejected at CLI parse. *)
   log_categories : string list;  (* empty = all enabled *)
   metrics_port : int;  (* Prometheus metrics port, 0 = disabled *)
+  metrics_host : string;  (* --metricsbind: metrics listen address *)
   maxmempool_mb : int;  (* -maxmempool: mempool size limit in MB (SI), default 300 *)
   peer_bloom_filters : bool;
     (* Advertise NODE_BLOOM (BIP-35 / BIP-111).  Defaults to [false] to
@@ -217,6 +218,7 @@ let default_config : config = {
   prune = 0;
   log_categories = [];
   metrics_port = 9332;
+  metrics_host = Metrics_server.default_host;
   maxmempool_mb = 300;
   peer_bloom_filters = false;  (* Mirrors Core DEFAULT_PEERBLOOMFILTERS *)
   zmq_pub_options = [];
@@ -3373,13 +3375,14 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   let metrics_thread =
     if config.metrics_port > 0 then begin
       Logs.info (fun m ->
-        m "Starting Prometheus metrics server on port %d" config.metrics_port);
-      let callback _conn _req _body =
+        m "Starting Prometheus metrics server on %s:%d"
+          config.metrics_host config.metrics_port);
+      let body () =
         let height = match rpc_ctx.chain.tip with
           | Some t -> t.height | None -> 0 in
         let peers = Peer_manager.peer_count peer_manager in
         let mp_count = Hashtbl.length rpc_ctx.mempool.entries in
-        let body = Printf.sprintf
+        Printf.sprintf
           "# HELP bitcoin_blocks_total Current block height\n\
            # TYPE bitcoin_blocks_total gauge\n\
            bitcoin_blocks_total %d\n\
@@ -3389,15 +3392,10 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
            # HELP bitcoin_mempool_size Mempool transaction count\n\
            # TYPE bitcoin_mempool_size gauge\n\
            bitcoin_mempool_size %d\n"
-          height peers mp_count in
-        let response_headers = Cohttp.Header.init_with
-          "Content-Type" "text/plain; version=0.0.4; charset=utf-8" in
-        Cohttp_lwt_unix.Server.respond_string
-          ~status:`OK ~headers:response_headers ~body ()
+          height peers mp_count
       in
-      let server = Cohttp_lwt_unix.Server.make ~callback () in
-      let mode = `TCP (`Port config.metrics_port) in
-      Cohttp_lwt_unix.Server.create ~mode server
+      Metrics_server.start ~host:config.metrics_host
+        ~port:config.metrics_port ~body ()
     end else
       Lwt.return_unit
   in

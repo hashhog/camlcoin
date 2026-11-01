@@ -2594,7 +2594,10 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
        | Compact_relay.Invalid_header reason ->
          Logs.info (fun m ->
            m "Invalid header via cmpctblock from peer %d: %s" peer.Peer.id reason);
-         misbehavior_handler peer.Peer.id "invalid_header";
+         (* Core MaybePunishNodeForBlock: BLOCK_TIME_FUTURE is not punished
+            (the header may become valid as our clock catches up). *)
+         if reason <> "Header timestamp too far in future" then
+           misbehavior_handler peer.Peer.id "invalid_header";
          Lwt.return_unit
        | Compact_relay.Ignore reason ->
          Logs.debug (fun m ->

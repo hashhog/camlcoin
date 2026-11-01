@@ -798,8 +798,12 @@ let test_check_block_no_coinbase () =
     ~outputs:[make_output ~value:1000L ()]
     ()
   in
+  (* The header commits to the body (merkle root): check_block compares the
+     merkle root before anything else, so a body the header does not commit
+     to comes back BlockBadMerkleRoot (a mutation), not BlockNoCoinbase. *)
+  let (merkle_root, _) = Crypto.merkle_root [Crypto.compute_txid regular_tx] in
   let block = {
-    Types.header = make_header ();
+    Types.header = make_header ~merkle_root ();
     transactions = [regular_tx];
   } in
   match Validation.check_block ~network:Consensus.regtest block 0 ~expected_bits:0x207fffffl ~median_time:0l () with

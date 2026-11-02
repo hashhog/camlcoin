@@ -2316,16 +2316,46 @@ let claimed_headers_work (state : chain_state)
           Consensus.work_add acc (work_from_bits h.bits))
           prev.total_work headers)
 
-(* [min_pow_checked=false]: the batch came from a peer and must claim at
-   least [anti_dos_work] (default: the network's minimum chain work), the
-   gate Core's ProcessHeadersMessage applies before it calls
-   ProcessNewBlockHeaders with min_pow_checked=true.  Like Core it is
-   judged on the whole batch (CalculateClaimedHeadersWork over the batch,
-   from the first header's parent), not per header, so a heavier fork whose
-   early headers sit below the threshold still lands in one batch, and it
-   is skipped when the batch's last header is already known (Core's
-   already_validated_work).  Network callers use [process_network_headers],
-   which passes [anti_dos_work_threshold]. *)
+(* Core CheckHeadersAreContinuous: each header's prev_block is the hash of
+   the header before it in the batch. *)
+let headers_are_continuous (headers : Types.block_header list) : bool =
+  let rec go prev_hash = function
+    | [] -> true
+    | (h : Types.block_header) :: rest ->
+      Cstruct.equal h.prev_block prev_hash
+      && go (Crypto.compute_block_hash h) rest
+  in
+  match headers with
+  | [] -> true
+  | first :: rest -> go (Crypto.compute_block_hash first) rest
+
+(* Core CheckHeadersPoW: every header's hash meets the target its own nBits
+   claims (and nBits is in range). *)
+let headers_pow_ok (state : chain_state)
+    (headers : Types.block_header list) : bool =
+  List.for_all (fun (h : Types.block_header) ->
+      Consensus.check_proof_of_work (Crypto.compute_block_hash h) h.bits
+        state.network)
+    headers
+
+(* [min_pow_checked=false]: the batch came from a peer.  As in Core's
+   ProcessHeadersMessage, before anything is stored:
+   - the batch must be continuous (CheckHeadersAreContinuous) and every
+     header must meet its own target (CheckHeadersPoW), so the claimed work
+     below is work actually done, not just nBits a peer wrote down;
+   - unless every header is already known (Core's already_validated_work),
+     the batch must claim at least [anti_dos_work] (default: the network's
+     minimum chain work), judged on the whole batch
+     (CalculateClaimedHeadersWork from the first header's parent), not per
+     header, so a heavier fork whose early headers sit below the threshold
+     still lands in one batch.
+   The headers are then validated into the in-memory table first and
+   written only once the batch is judged: if a header fails part-way, the
+   valid prefix is kept only when the prefix on its own reaches
+   [anti_dos_work]; otherwise nothing from the batch is stored (a prefix
+   must not ride in on work a later, invalid header claimed).
+   Network callers use [process_network_headers], which passes
+   [anti_dos_work_threshold]. *)
 let process_headers ?(min_pow_checked = true) ?anti_dos_work
     (state : chain_state)
     (headers : Types.block_header list) : (int, string) result =
@@ -2335,29 +2365,32 @@ let process_headers ?(min_pow_checked = true) ?anti_dos_work
     | Some t -> t.total_work
     | None -> Consensus.zero_work
   in
+  let threshold = match anti_dos_work with
+    | Some w -> w
+    | None -> state.network.minimum_chain_work
+  in
+  let all_known () =
+    List.for_all (fun h ->
+        Hashtbl.mem state.headers
+          (Cstruct.to_string (Crypto.compute_block_hash h)))
+      headers
+  in
   let low_work_batch () =
-    if min_pow_checked then false
+    if min_pow_checked || all_known () then false
     else
-      let last_known =
-        match List.rev headers with
-        | last :: _ ->
-          Hashtbl.mem state.headers
-            (Cstruct.to_string (Crypto.compute_block_hash last))
-        | [] -> true
-      in
-      if last_known then false
-      else
-        let threshold = match anti_dos_work with
-          | Some w -> w
-          | None -> state.network.minimum_chain_work
-        in
-        match claimed_headers_work state headers with
-        | Some claimed -> Consensus.work_compare claimed threshold < 0
-        | None -> false
+      match claimed_headers_work state headers with
+      | Some claimed -> Consensus.work_compare claimed threshold < 0
+      | None -> false
   in
   if Hashtbl.length state.headers >= max_headers_in_memory
      && Consensus.work_compare tip_work state.network.minimum_chain_work < 0 then
     Error "Header flood: too many headers with insufficient chain work"
+  else if (not min_pow_checked) && not (headers_are_continuous headers) then
+    (* Core: Misbehaving "non-continuous headers sequence"; nothing stored. *)
+    Error "non-continuous headers sequence"
+  else if (not min_pow_checked) && not (headers_pow_ok state headers) then
+    (* Core: Misbehaving "header with invalid proof of work". *)
+    Error "header with invalid proof of work"
   else if low_work_batch () then begin
     (* Core: "Ignoring low-work chain"; nothing from the batch is stored. *)
     Logs.debug (fun m ->
@@ -2370,6 +2403,9 @@ let process_headers ?(min_pow_checked = true) ?anti_dos_work
     let first_error = ref None in
     let error = ref None in
     let error_index = ref (-1) in
+    (* Network batches are staged in [state.headers] (validate_header only
+       reads that table) and committed with [accept_header] once judged. *)
+    let staged = ref [] in
     List.iteri (fun i header ->
       if !error = None then
         match validate_header state header with
@@ -2378,7 +2414,11 @@ let process_headers ?(min_pow_checked = true) ?anti_dos_work
              (Core validation.cpp AcceptBlockHeader is reached only with
              min_pow_checked=true once ProcessHeadersMessage has checked
              the batch's claimed work). *)
-          accept_header state entry;
+          if min_pow_checked then accept_header state entry
+          else begin
+            Hashtbl.replace state.headers (Cstruct.to_string entry.hash) entry;
+            staged := entry :: !staged
+          end;
           incr accepted
         | Error "Header already known" ->
           incr rejected
@@ -2387,6 +2427,23 @@ let process_headers ?(min_pow_checked = true) ?anti_dos_work
           error_index := i;
           error := Some e
     ) headers;
+    let keep_staged =
+      match !error, !staged with
+      | None, _ | _, [] -> true
+      | Some _, last :: _ ->
+        Consensus.work_compare last.total_work threshold >= 0
+    in
+    if keep_staged then
+      List.iter (fun entry -> accept_header state entry) (List.rev !staged)
+    else begin
+      List.iter (fun (entry : header_entry) ->
+          Hashtbl.remove state.headers (Cstruct.to_string entry.hash))
+        !staged;
+      Logs.debug (fun m ->
+        m "Headers batch: dropped %d staged headers, prefix below the \
+           anti-DoS work (stopped at #%d)" (List.length !staged) !error_index);
+      accepted := 0
+    end;
     (* A mid-batch failure after an accepted prefix used to return Ok with
        no trace: the 950000->958794 slice accepted 1853 of 2000 at the
        replay store's 963853 two-block tie and nothing said why. Core

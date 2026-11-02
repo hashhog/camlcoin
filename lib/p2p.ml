@@ -2182,7 +2182,17 @@ type v2_state = {
   mutable our_privkey : Cstruct.t;
   mutable our_ellswift_pubkey : Cstruct.t;
   mutable cipher : bip324_cipher option;
+  (* Received bytes not yet consumed by the state machine.  A view onto
+     [recv_store]; new bytes are written into the spare room after the view
+     (see [v2_recv_append]), never into bytes that are or were part of a
+     view, so earlier sub-views (AAD, decoded contents) stay valid. *)
   mutable recv_buffer : Cstruct.t;
+  (* Backing buffer owned by this state.  Only ever written past the end of
+     [recv_buffer]; replaced (not compacted in place) when out of room. *)
+  mutable recv_store : Cstruct.buffer;
+  (* Ciphertext bytes of decoy packets accepted while waiting for the
+     version packet; bounded by [max_v2_version_decoy_bytes]. *)
+  mutable recv_version_decoy_bytes : int;
   mutable recv_len : int;                    (* Decrypted length, valid in RecvVersion/App *)
   (* True iff [recv_len] has been decrypted for the in-flight packet but
      the payload has not yet been fully received.  Disambiguates the
@@ -2314,6 +2324,8 @@ let create_v2_transport ~(initiating : bool) ~(magic : int32) : transport =
     our_ellswift_pubkey = ellswift;
     cipher = None;
     recv_buffer = Cstruct.empty;
+    recv_store = Cstruct.empty.Cstruct.buffer;
+    recv_version_decoy_bytes = 0;
     recv_len = 0;
     recv_len_known = false;
     recv_aad = Cstruct.empty;
@@ -2345,9 +2357,64 @@ let looks_like_v1_prefix (data : Cstruct.t) (magic : int32) : bool =
     end
   end
 
+(* Most bytes the receive buffer is grown by beyond what has been received,
+   while a packet of known length is arriving.  Core net.cpp
+   V2Transport::ReceivedBytes MAX_RESERVE_AHEAD: a peer that declares a 4 MB
+   length and then trickles cannot make us allocate the 4 MB up front. *)
+let v2_max_reserve_ahead = 256 * 1024
+
+(* Total ciphertext bytes of decoy packets accepted before the version
+   packet.  BIP-324 lets a sender put decoys before version, but Core sends
+   none and an honest peer has no reason to send megabytes of them; without
+   a bound a peer can make us decrypt an endless stream and never send
+   version (audit 2026-10-31 H3).  Core has no such bound. *)
+let max_v2_version_decoy_bytes = max_message_size
+
+(* Append [data] to [state.recv_buffer].  Writes into the spare room of
+   [state.recv_store] when it fits; otherwise moves the unconsumed bytes to
+   a new store that is at least twice their size (or, mid-packet, sized up
+   to the end of the packet but at most [v2_max_reserve_ahead] past the
+   bytes in hand).  Each received byte is therefore copied O(1) times
+   amortised, instead of the whole buffer being re-copied on every read
+   (the old [Cstruct.concat [recv_buffer; data]] cost ~2 GB of copying for
+   one 4 MB packet delivered in 4 KiB reads). *)
+let v2_recv_append (state : v2_state) (data : Cstruct.t) : unit =
+  let n = Cstruct.length data in
+  if n > 0 then begin
+    let cur = state.recv_buffer in
+    let len = Cstruct.length cur in
+    let store_dim = Bigarray.Array1.dim state.recv_store in
+    let owned = cur.Cstruct.buffer == state.recv_store || len = 0 in
+    let end_off = if len = 0 then store_dim else cur.Cstruct.off + len in
+    if owned && len > 0 && end_off + n <= store_dim then begin
+      Cstruct.blit data 0 (Cstruct.of_bigarray state.recv_store) end_off n;
+      state.recv_buffer <-
+        Cstruct.of_bigarray state.recv_store ~off:cur.Cstruct.off ~len:(len + n)
+    end else begin
+      let want = len + n in
+      let packet_end =
+        match state.recv_state with
+        | (V2RecvVersion | V2RecvApp) when state.recv_len_known ->
+          Some (state.recv_len + Bip324.header_len + Bip324.poly1305_tag_len)
+        | _ -> None
+      in
+      let cap =
+        match packet_end with
+        | Some total ->
+          max want (min total (max (2 * len) (want + v2_max_reserve_ahead)))
+        | None -> max want (max (2 * len) 4096)
+      in
+      let fresh = Cstruct.create_unsafe cap in
+      Cstruct.blit cur 0 fresh 0 len;
+      Cstruct.blit data 0 fresh len n;
+      state.recv_store <- fresh.Cstruct.buffer;
+      state.recv_buffer <- Cstruct.sub fresh 0 want
+    end
+  end
+
 (* Process received bytes for V2 transport *)
 let v2_receive_bytes (state : v2_state) (data : Cstruct.t) : bool =
-  state.recv_buffer <- Cstruct.concat [state.recv_buffer; data];
+  v2_recv_append state data;
 
   let rec process () =
     match state.recv_state with
@@ -2517,10 +2584,14 @@ let v2_receive_bytes (state : v2_state) (data : Cstruct.t) : bool =
             if ignore_flag then begin
               (* Decoy packet, continue reading *)
               if state.recv_state = V2RecvVersion then begin
-                state.recv_state <- V2RecvVersion;  (* More version packets may follow *)
                 state.recv_aad <- Cstruct.empty;    (* Clear AAD after first packet *)
+                state.recv_version_decoy_bytes <-
+                  state.recv_version_decoy_bytes + needed
               end;
-              process ()
+              if state.recv_version_decoy_bytes > max_v2_version_decoy_bytes then
+                false  (* Too many decoy bytes before version: disconnect *)
+              else
+                process ()
             end else begin
               if state.recv_state = V2RecvVersion then begin
                 (* Version packet received (contents ignored per BIP324) *)

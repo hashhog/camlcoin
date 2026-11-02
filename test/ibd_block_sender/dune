@@ -1,0 +1,10 @@
+; IBD block bodies are bound to the peer they are in flight with
+; (fix-camlcoin-sec-h6).  Own directory so the shared test/dune names list is
+; untouched.  Boots the real CLI (bin/main.exe) on regtest from genesis and
+; drives its IBD with two v1 P2P peers, so the BlockMsg listener under test is
+; the one cli.ml registers.  Uses only APIs that exist on the pre-fix tree.
+(test
+ (name test_ibd_block_sender)
+ (deps ../../bin/main.exe)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix base64
+            cohttp-lwt-unix yojson))

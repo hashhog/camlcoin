@@ -4433,8 +4433,18 @@ let request_blocks (ibd : ibd_state) (peers : Peer.peer list)
    Block Receipt and Processing
    ============================================================================ *)
 
-(* Process a received block *)
-let receive_block (ibd : ibd_state) (block : Types.block)
+(* Process a received block.
+
+   [sender] is the peer the body arrived from (None for bodies that were
+   not delivered by a peer, e.g. compact-block reconstruction or orphan
+   replay).  A body for a slot that is in flight with a different peer is
+   dropped: matching on hash alone let any peer fill a slot requested from
+   another, and when that body failed validation the requested (honest)
+   peer was scored for it and banned (security audit 2026-10-31 H6).  Core
+   only marks a block as received from the peer it is in flight with
+   (net_processing.cpp RemoveBlockRequest takes the from_peer) and blames
+   the actual sender (mapBlockSource / BlockChecked). *)
+let receive_block ?sender (ibd : ibd_state) (block : Types.block)
     : (unit, string) result =
   let hash = Crypto.compute_block_hash block.header in
   let hash_key = Cstruct.to_string hash in
@@ -4473,18 +4483,33 @@ let receive_block (ibd : ibd_state) (block : Types.block)
        drove total_blocks_in_flight below the real number of outstanding
        requests. *)
     Ok ()
+  | Some { download_state = Requested { peer_id = requested; _ }; _ }
+    when (match sender with Some s -> s <> requested | None -> false) ->
+    (* In flight with another peer: not ours to fill.  The requested peer
+       still delivers it (or times out and the slot is re-requested). *)
+    Logs.debug (fun m ->
+      m "Ignoring block %s from peer %d: in flight with peer %d"
+        (Types.hash256_to_hex_display hash)
+        (Option.value sender ~default:(-1)) requested);
+    Ok ()
   | Some entry ->
     (* Record which peer sent it for timeout decay *)
-    let peer_id = match entry.download_state with
+    let requested_from = match entry.download_state with
       | Requested { peer_id; _ } -> Some peer_id
       | _ -> None
     in
-    let was_in_flight = peer_id <> None in
+    let was_in_flight = requested_from <> None in
+    (* Blame the actual sender when we know it; otherwise the peer it was
+       requested from (the two agree whenever both are known). *)
+    let peer_id = match sender with
+      | Some _ -> sender
+      | None -> requested_from
+    in
     entry.download_state <- Downloaded { block; peer_id };
     if was_in_flight then
       ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
     (* Decay timeout for successful download *)
-    (match peer_id with
+    (match requested_from with
      | Some pid -> record_successful_download ibd pid
      | None -> ());
     Ok ()

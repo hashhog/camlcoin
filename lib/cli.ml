@@ -1765,7 +1765,7 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
        | P2p.BlockMsg block ->
          Sync.Gapfill.note_received gapfill
            (Crypto.compute_block_hash block.Types.header);
-         ignore (Sync.receive_block ibd block);
+         ignore (Sync.receive_block ~sender:peer.Peer.id ibd block);
          Lwt.return_unit
        | P2p.NotfoundMsg items ->
          Sync.handle_notfound ibd peer.Peer.id items;

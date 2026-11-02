@@ -5115,6 +5115,30 @@ let handle_pruneblockchain (ctx : rpc_context)
 
 (* Core CFeeRate::GetFeePerK -> ValueFromAmount: effective-feerate is the
    integer sat/kvB (fee * 1000 / vsize, floored) rendered in BTC/kvB. *)
+(* Core DecodeHexTx (core_io.cpp): the hex must be well-formed and the
+   deserialization must consume every byte; any failure is
+   RPC_DESERIALIZATION_ERROR "TX decode failed: <hex> Make sure the tx has at
+   least one input." with the caller's hex echoed back. *)
+let core_decode_hex_tx (hex : string) : (Types.transaction, string) result =
+  let fail () =
+    Error ("TX decode failed: " ^ hex
+           ^ " Make sure the tx has at least one input.") in
+  let ok_hex =
+    String.length hex mod 2 = 0
+    && (let ok = ref true in
+        String.iter (fun c -> if not (is_hex_char c) then ok := false) hex;
+        !ok) in
+  if not ok_hex then fail ()
+  else
+    match (try
+             let data = Cstruct.of_hex hex in
+             let r = Serialize.reader_of_cstruct data in
+             let tx = Serialize.deserialize_transaction r in
+             if r.Serialize.pos = Cstruct.length data then Some tx else None
+           with _ -> None) with
+    | Some tx -> Ok tx
+    | None -> fail ()
+
 let feerate_btc_per_kvb (fee_sats : int64) (vsize : int) : float =
   if vsize <= 0 then 0.0
   else Int64.to_float (Int64.div (Int64.mul fee_sats 1000L) (Int64.of_int vsize))
@@ -5132,14 +5156,9 @@ let testmempoolaccept_package ?(max_fee_rate = default_max_raw_tx_fee_rate)
   let rec decode acc = function
     | [] -> Ok (List.rev acc)
     | h :: rest ->
-      (match (try
-                let r = Serialize.reader_of_cstruct (Cstruct.of_hex h) in
-                Some (Serialize.deserialize_transaction r)
-              with _ -> None) with
-       | Some tx -> decode (tx :: acc) rest
-       | None ->
-         Error ("TX decode failed: " ^ h
-                ^ " Make sure the tx has at least one input."))
+      (match core_decode_hex_tx h with
+       | Ok tx -> decode (tx :: acc) rest
+       | Error e -> Error e)
   in
   match decode [] hexes with
   | Error e -> Error e
@@ -5229,10 +5248,10 @@ let handle_testmempoolaccept (ctx : rpc_context)
   in
   match params with
   | [`List [`String hex_tx]] ->
+    (match core_decode_hex_tx hex_tx with
+     | Error e -> Error e
+     | Ok tx ->
     (try
-      let data = Cstruct.of_hex hex_tx in
-      let r = Serialize.reader_of_cstruct data in
-      let tx = Serialize.deserialize_transaction r in
       let txid = Crypto.compute_txid tx in
       let hex_txid = Types.hash256_to_hex_display txid in
       (* W120 BUG-RBF-DRYRUN fix: evaluate the FULL acceptance path, including
@@ -5299,12 +5318,21 @@ let handle_testmempoolaccept (ctx : rpc_context)
              then [ ("reject-details", `String ("replacement-failed, " ^ msg)) ]
              else []))])
     with exn ->
-      Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn)))
+      Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn))))
   | [`List ((_ :: _ :: _) as raw)]
     when List.length raw <= Mempool.max_package_count
       && List.for_all (function `String _ -> true | _ -> false) raw ->
     testmempoolaccept_package ~max_fee_rate ctx
       (List.map (function `String h -> h | _ -> assert false) raw)
+  | `List raw :: _
+    when raw = [] || List.length raw > Mempool.max_package_count ->
+    Error (Printf.sprintf "Array must contain between 1 and %d transactions."
+             Mempool.max_package_count)
+  | v :: _ when (match v with `List _ -> false | _ -> true) ->
+    (* Core RPCTypeCheck: RPC_TYPE_ERROR "Wrong type passed:..." *)
+    Error (Printf.sprintf
+             "Wrong type passed:\n{\n    \"Position 1 (rawtxs)\": \"JSON value of type %s is not of expected type array\"\n}"
+             (core_uvtype v))
   | _ ->
     Error "Invalid parameters: expected [[rawtx]]"
 
@@ -16337,6 +16365,12 @@ let dispatch_rpc (ctx : rpc_context)
      | Error msg
        when String.length msg >= 16 && String.sub msg 0 16 = "TX decode failed" ->
        Error (rpc_deserialization_error, msg)
+     | Error msg
+       when String.length msg >= 12 && String.sub msg 0 12 = "Array must c" ->
+       Error (rpc_invalid_parameter, msg)
+     | Error msg
+       when String.length msg >= 17 && String.sub msg 0 17 = "Wrong type passed" ->
+       Error (rpc_type_error, msg)
      | Error msg -> Error (rpc_verify_rejected, msg))
   | "submitpackage" ->
     (match handle_submitpackage ctx params with

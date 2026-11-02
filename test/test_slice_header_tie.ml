@@ -159,9 +159,17 @@ let state_name = Sync.sync_state_to_string
 
 (* (a) The slice shape: tie at T, block tip far below it. Must leave the
    loop for block download after the first unconnecting batch, with the
-   valid prefix kept. *)
+   headers already accepted kept.
+
+   The tie sits on the last header of the first batch, as in the slice
+   (the node accepted 962001..963853(stale) and the NEXT batch did not
+   connect).  A tie inside a batch makes that batch non-continuous, and
+   like Core (CheckHeadersPoW -> CheckHeadersAreContinuous) camlcoin now
+   stores nothing from a network batch whose headers do not link
+   (camlcoin#45 review). *)
 let test_tie_above_header_tip_starts_block_download () =
-  let base = 10 and tie = 1500 and n = 2600 in
+  let base = 10 and n = 2600 in
+  let tie = base + P2p.max_headers_count in
   let s = build_served ~n ~tie:(Some tie) in
   Test_tmp.with_chaindb (fun db ->
       let state = Sync.create_chain_state db regtest in
@@ -197,13 +205,26 @@ let test_nothing_to_download_keeps_idle () =
       let foreign = build_served ~n:2600 ~tie:None in
       let junk = Cstruct.create 32 in
       Cstruct.memset junk 0x5a;
-      let fh, _ = mine ~prev:junk ~height:base ~salt:7 in
+      let fh, fhash = mine ~prev:junk ~height:base ~salt:7 in
       foreign.hdrs.(base + 1) <- fh;
+      (* the rest of the foreign chain links to [fh]: a continuous batch
+         that does not connect (Core HandleUnconnectingHeaders), not a
+         non-continuous one, which Core and camlcoin refuse outright *)
+      let prev = ref fhash in
+      for h = base + 2 to Array.length foreign.hdrs - 1 do
+        let hd, hh = mine ~prev:!prev ~height:h ~salt:7 in
+        foreign.hdrs.(h) <- hd;
+        prev := hh
+      done;
       Hashtbl.reset foreign.hash2h;
-      (* unknown locator -> start at height 0+1; serve from base+1 instead *)
+      (* unknown locator -> [serve] starts at index 0 (1 + -1); slice so
+         index 0 is [fh] (base+1).  Slicing at [base] served main's own
+         header [base] first, then [fh]: a batch that does not link,
+         which Core refuses outright (CheckHeadersAreContinuous). *)
       let served =
         { foreign with
-          hdrs = Array.sub foreign.hdrs base (Array.length foreign.hdrs - base) }
+          hdrs = Array.sub foreign.hdrs (base + 1)
+              (Array.length foreign.hdrs - base - 1) }
       in
       let outcome, gh = run_sync state served in
       Alcotest.(check bool) "sync_headers returned" true (outcome = `Returned);

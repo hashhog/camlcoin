@@ -275,7 +275,8 @@ let test_sendrawtransaction_burn_amount_within_limit () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
-(* Test: duplicate transaction is rejected *)
+(* Test: re-sending a tx already in the mempool returns its txid (Core
+   BroadcastTransaction skips AcceptToMemoryPool for a mempool tx) *)
 let test_sendrawtransaction_duplicate_rejected () =
   let (ctx, db, _, txid1, _) = create_test_context () in
   let tx = make_regular_tx
@@ -287,9 +288,10 @@ let test_sendrawtransaction_duplicate_rejected () =
   (* First submission succeeds *)
   let result1 = Rpc.handle_sendrawtransaction ctx params in
   Alcotest.(check bool) "first submission ok" true (Result.is_ok result1);
-  (* Second submission fails (duplicate) *)
+  (* Second submission returns the same txid, not an error *)
   let result2 = Rpc.handle_sendrawtransaction ctx params in
-  Alcotest.(check bool) "duplicate rejected" true (Result.is_error result2);
+  Alcotest.(check bool) "duplicate returns txid" true
+    (Result.is_ok result2 && result2 = result1);
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
@@ -3410,7 +3412,7 @@ let () =
       test_case "zero maxfeerate bypasses" `Quick test_sendrawtransaction_feerate_zero_bypasses;
       test_case "burn exceeded rejected" `Quick test_sendrawtransaction_burn_amount_exceeded;
       test_case "burn within limit accepted" `Quick test_sendrawtransaction_burn_amount_within_limit;
-      test_case "duplicate rejected" `Quick test_sendrawtransaction_duplicate_rejected;
+      test_case "duplicate returns txid" `Quick test_sendrawtransaction_duplicate_rejected;
       test_case "param formats" `Quick test_sendrawtransaction_param_formats;
     ];
     "broadcast", [

@@ -1780,6 +1780,11 @@ let handle_sendrawtransaction (ctx : rpc_context)
         Error (Printf.sprintf
           "Unspendable output exceeds maximum: %Ld > %Ld satoshis"
           burn_amount max_burn_amount)
+      else if Mempool.contains ctx.mempool (Crypto.compute_txid tx) then
+        (* Core BroadcastTransaction (node/transaction.cpp): a tx already in
+           the mempool skips AcceptToMemoryPool and is simply re-relayed, so
+           the RPC returns the txid rather than a self-conflict error. *)
+        Ok (`String (Types.hash256_to_hex_display (Crypto.compute_txid tx)))
       else
         (* W120 BUG-RBF-SENDRAW fix: route sendrawtransaction through the
            RBF-aware acceptance path ([accept_transaction_with_replaced]) rather
@@ -5121,7 +5126,8 @@ let feerate_btc_per_kvb (fee_sats : int64) (vsize : int) : float =
    package-wide PCKG_POLICY failure adds "package-error" to every entry; a tx
    without a result (validation stopped earlier, or a preceding tx exceeded
    maxfeerate) reports only txid and wtxid. *)
-let testmempoolaccept_package (ctx : rpc_context) (hexes : string list)
+let testmempoolaccept_package ?(max_fee_rate = default_max_raw_tx_fee_rate)
+    (ctx : rpc_context) (hexes : string list)
     : (Yojson.Safe.t, string) result =
   let rec decode acc = function
     | [] -> Ok (List.rev acc)
@@ -5149,7 +5155,7 @@ let testmempoolaccept_package (ctx : rpc_context) (hexes : string list)
     | Ok outcomes ->
       (* DEFAULT_MAX_RAW_TX_FEE_RATE (0.10 BTC/kvB), as CFeeRate::GetFee. *)
       let max_fee_for vsize =
-        Int64.of_float (default_max_raw_tx_fee_rate *. 100_000_000.0)
+        Int64.of_float (max_fee_rate *. 100_000_000.0)
         |> fun per_kvb -> Int64.div (Int64.mul per_kvb (Int64.of_int vsize)) 1000L
       in
       let exit_early = ref false in
@@ -5211,6 +5217,16 @@ let testmempoolaccept_package (ctx : rpc_context) (hexes : string list)
 
 let handle_testmempoolaccept (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
+  (* Core: testmempoolaccept rawtxs [maxfeerate=0.10] (BTC/kvB; 0 = no cap).
+     A tx whose fee exceeds the cap is reported allowed=false with
+     reject-reason "max-fee-exceeded". *)
+  let max_fee_rate, params =
+    match params with
+    | [a; `Float f] -> (f, [a])
+    | [a; `Int i] -> (float_of_int i, [a])
+    | [a; `Intlit s] -> (float_of_string s, [a])
+    | _ -> (default_max_raw_tx_fee_rate, params)
+  in
   match params with
   | [`List [`String hex_tx]] ->
     (try
@@ -5232,6 +5248,18 @@ let handle_testmempoolaccept (ctx : rpc_context)
       let wtxid = Crypto.compute_wtxid tx in
       let hex_wtxid = Types.hash256_to_hex_display wtxid in
       match Mempool.accept_transaction ~dry_run:true ctx.mempool tx with
+      | Ok entry
+        when max_fee_rate > 0.0
+          && entry.Mempool.fee >
+             Int64.div
+               (Int64.mul (Int64.of_float (max_fee_rate *. 100_000_000.0))
+                  (Int64.of_int ((entry.Mempool.weight + 3) / 4))) 1000L ->
+        Ok (`List [`Assoc [
+          ("txid", `String hex_txid);
+          ("wtxid", `String hex_wtxid);
+          ("allowed", `Bool false);
+          ("reject-reason", `String "max-fee-exceeded");
+        ]])
       | Ok entry ->
         let vsize = (entry.Mempool.weight + 3) / 4 in
         let fee_btc = Int64.to_float entry.Mempool.fee /. 100_000_000.0 in
@@ -5275,7 +5303,7 @@ let handle_testmempoolaccept (ctx : rpc_context)
   | [`List ((_ :: _ :: _) as raw)]
     when List.length raw <= Mempool.max_package_count
       && List.for_all (function `String _ -> true | _ -> false) raw ->
-    testmempoolaccept_package ctx
+    testmempoolaccept_package ~max_fee_rate ctx
       (List.map (function `String h -> h | _ -> assert false) raw)
   | _ ->
     Error "Invalid parameters: expected [[rawtx]]"

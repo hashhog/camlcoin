@@ -1,0 +1,7 @@
+; invalidateblock / disconnect-to-target must not delete undo data or leave
+; the live dirty set rolled back when the disconnect fails before its commit
+; (security audit 2026-10-31 H13).  Own directory and stanza so it does not
+; touch the shared names list in test/dune.
+(test
+ (name test_disconnect_undo_in_batch)
+ (libraries camlcoin test_tmp alcotest cstruct))

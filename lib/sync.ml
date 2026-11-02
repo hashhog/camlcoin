@@ -5850,9 +5850,10 @@ let block_disconnect_ops (block : Types.block) (undo : Utxo.undo_data)
    from each block's stored undo data and removes the outputs that the
    disconnected blocks created. Block bodies and headers are preserved
    on disk so the chain can be re-applied later via [reorganize].
-   Undo data for the disconnected blocks is deleted (matching what
-   [reorganize] does on its disconnect path); on re-apply, [reorganize]
-   rebuilds undo data fresh from the recovered UTXO set.
+   Undo data for the disconnected blocks is deleted in the same batch as
+   the coin delta (matching what [reorganize] does on its disconnect path);
+   on re-apply, [reorganize] rebuilds undo data fresh from the recovered
+   UTXO set.  On Error nothing is written.
 
    Mirrors Bitcoin Core's [TemporaryRollback] used by [dumptxoutset]
    ([src/rpc/blockchain.cpp:3157]). The caller is responsible for
@@ -5903,6 +5904,7 @@ let disconnect_to_target ?(from_validated_tip = false)
           mutations into a single batch so the disconnect is atomic
           relative to a crash partway through. *)
        let batch = Storage.ChainDB.batch_create () in
+       let disconnected = ref [] in
        let rec disconnect = function
          | [] -> Ok ()
          | (entry : header_entry) :: rest ->
@@ -5940,19 +5942,28 @@ let disconnect_to_target ?(from_validated_tip = false)
                ) ops;
                (* The undo data for this block is no longer valid:
                   [reorganize] will rebuild it on the connect path
-                  when the chain is re-applied. *)
-               Storage.ChainDB.delete_undo_data state.db entry.hash;
-               (* Tx-output spender index erase (DB-direct disconnect path,
-                  e.g. dumptxoutset rollback / invalidateblock without a
-                  threaded UTXO set). RE-DERIVES this block's spend keys and
-                  erases them. No-op when --txospenderindex is off. *)
-               txospender_disconnect_if_enabled state ~block
-                 ~height:entry.height;
+                  when the chain is re-applied.  Staged in the coin+tip
+                  batch, not deleted here: a deeper block failing below
+                  (or a crash before the commit) would otherwise leave
+                  this still-connected block with no undo, so it could
+                  never be disconnected again (audit H13; Core's
+                  DisconnectTip never erases undo). *)
+               Storage.ChainDB.batch_delete_undo_data batch entry.hash;
+               disconnected := (block, entry.height) :: !disconnected;
                disconnect rest
        in
        (match disconnect (List.rev to_disconnect) with
         | Error _ as e -> e
         | Ok () ->
+          (* Tx-output spender index erase (DB-direct disconnect path,
+             e.g. dumptxoutset rollback / invalidateblock without a
+             threaded UTXO set). RE-DERIVES each block's spend keys and
+             erases them, tip-first. Only once every block disconnected:
+             a failed disconnect leaves the chain where it was, so its
+             keys must stay. No-op when --txospenderindex is off. *)
+          List.iter (fun (block, height) ->
+            txospender_disconnect_if_enabled state ~block ~height
+          ) (List.rev !disconnected);
           Storage.ChainDB.batch_write state.db batch;
           (* Clear sig cache: stale validation results from the
              disconnected segment must not leak forward. *)
@@ -6034,6 +6045,10 @@ let disconnect_to_target_via_utxo ?(from_validated_tip = false)
      | Ok _ ->
        (* tip-first disconnect order. *)
        let to_disconnect = collect_path state target current_tip in
+       let disconnected = ref [] in
+       (* Every live-view key the loop touches, newest first, so a failure
+          on a deeper block can put the view back as it was. *)
+       let saved = ref [] in
        let rec disconnect = function
          | [] -> Ok ()
          | (entry : header_entry) :: rest ->
@@ -6065,35 +6080,68 @@ let disconnect_to_target_via_utxo ?(from_validated_tip = false)
                    [OptimizedUtxoSet.add]. *)
                 List.iter (function
                   | Disc_del (txid, vout) ->
+                    saved := Utxo.OptimizedUtxoSet.save_key utxo txid vout
+                             :: !saved;
                     Utxo.OptimizedUtxoSet.remove_fast utxo txid vout
                   | Disc_put (txid, vout, e) ->
+                    saved := Utxo.OptimizedUtxoSet.save_key utxo txid vout
+                             :: !saved;
                     let unclean =
                       Utxo.OptimizedUtxoSet.exists utxo txid vout in
                     Utxo.OptimizedUtxoSet.add ~possible_overwrite:unclean
                       utxo txid vout e
                 ) ops;
-                Storage.ChainDB.delete_undo_data state.db entry.hash;
-                (* Tx-output spender index erase on the invalidateblock /
-                   UTXO-aware disconnect path. RE-DERIVES this block's spend
-                   keys and erases them, mirroring Core's
-                   [TxoSpenderIndex::CustomRemove] following
-                   [InvalidateBlock] -> [DisconnectTip]. No-op when
-                   --txospenderindex is off. *)
-                txospender_disconnect_if_enabled state ~block
-                  ~height:entry.height;
-                (match on_disconnected with
-                 | Some f -> f block entry.height
-                 | None -> ());
+                disconnected := (block, entry) :: !disconnected;
                 disconnect rest)
        in
-       (match disconnect (List.rev to_disconnect) with
-        | Error _ as e -> e
+       (* Nothing is committed before the loop finishes and the tip has not
+          moved: on failure drop the partial rollback from the live view,
+          or the next flush would persist it under the old tip (audit
+          H13).  A corrupt undo record raises from the deserialiser rather
+          than returning Error. *)
+       let result =
+         try disconnect (List.rev to_disconnect)
+         with ex ->
+           Utxo.OptimizedUtxoSet.restore_saved utxo !saved;
+           raise ex
+       in
+       (match result with
+        | Error _ as e ->
+          Utxo.OptimizedUtxoSet.restore_saved utxo !saved;
+          e
         | Ok () ->
+          let disconnected = List.rev !disconnected in   (* tip-first *)
+          (* Tx-output spender index erase on the invalidateblock /
+             UTXO-aware disconnect path. RE-DERIVES each block's spend
+             keys and erases them, mirroring Core's
+             [TxoSpenderIndex::CustomRemove] following
+             [InvalidateBlock] -> [DisconnectTip]. Only once every block
+             disconnected: a failed disconnect leaves the chain where it
+             was. No-op when --txospenderindex is off. *)
+          List.iter (fun (block, (entry : header_entry)) ->
+            txospender_disconnect_if_enabled state ~block
+              ~height:entry.height;
+            (match on_disconnected with
+             | Some f -> f block entry.height
+             | None -> ())
+          ) disconnected;
           (* Commit the rolled-back UTXO delta + the new (lower) tip to BOTH
              stores atomically. *)
           Utxo.OptimizedUtxoSet.persist_dirty_atomic utxo
             ~tip_hash:target.hash ~tip_height:target.height
             ~header_tip_hash:target.hash ~header_tip_height:target.height;
+          (* Only now is the disconnected blocks' undo stale.  Deleting it
+             inside the loop left still-connected blocks without undo when
+             a deeper block failed or the process died before the commit
+             (audit H13).  A crash between the commit above and this
+             delete only leaves stale undo for blocks off the active
+             chain, which a later reconnect overwrites (Core's
+             DisconnectTip never erases undo at all). *)
+          let undo_batch = Storage.ChainDB.batch_create () in
+          List.iter (fun (_, (entry : header_entry)) ->
+            Storage.ChainDB.batch_delete_undo_data undo_batch entry.hash
+          ) disconnected;
+          Storage.ChainDB.batch_write state.db undo_batch;
           Validation.cache_clear_global ();
           coinstats_rewind_if_enabled state ~target_height:target.height;
           state.tip <- Some target;

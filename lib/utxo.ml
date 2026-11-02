@@ -662,6 +662,36 @@ module OptimizedUtxoSet = struct
       Hashtbl.remove t.dirty key;
       bump t)
 
+  (* The view's state for one outpoint (dirty entry and LRU copy), taken
+     before a mutation that may have to be abandoned.  A multi-block
+     disconnect mutates the live view block by block and commits only at
+     the end; when a deeper block fails, [restore_saved] puts every touched
+     key back so the next flush cannot persist a partial rollback (audit
+     H13).  Core gets this from DisconnectTip's child CCoinsViewCache,
+     flushed only on DISCONNECT_OK. *)
+  type saved_key = string * dirty_entry option * utxo_entry option
+
+  let save_key (t : t) (txid : Types.hash256) (vout : int) : saved_key =
+    let key = utxo_key txid vout in
+    locked t (fun () ->
+      (key, Hashtbl.find_opt t.dirty key, Perf.LRU.peek t.cache key))
+
+  (* [saved] newest first, as built by prepending each [save_key]: a key
+     saved twice is restored to its OLDEST saved state, which is applied
+     last. *)
+  let restore_saved (t : t) (saved : saved_key list) : unit =
+    locked t (fun () ->
+      List.iter (fun (key, d, c) ->
+        (match d with
+         | Some e -> Hashtbl.replace t.dirty key e
+         | None -> Hashtbl.remove t.dirty key);
+        (match c with
+         | Some e when Perf.LRU.capacity t.cache > 0 ->
+           Perf.LRU.put t.cache key e
+         | _ -> Perf.LRU.remove t.cache key)
+      ) saved;
+      bump t)
+
   (* Check if a UTXO exists *)
   let exists (t : t) (txid : Types.hash256) (vout : int) : bool =
     let key = utxo_key txid vout in

@@ -12,6 +12,7 @@ module P2p = P2p
 module Peer = Peer
 module Peer_manager = Peer_manager
 module Compact_relay = Compact_relay
+module Package_relay = Package_relay
 module Sync = Sync
 module Mempool = Mempool
 module Node_clock = Node_clock

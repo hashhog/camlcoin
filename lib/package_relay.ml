@@ -43,22 +43,53 @@ let handle_getpkgtxns (mp : Mempool.mempool) (peer : Peer.peer)
     Peer.send_message peer (P2p.PkgtxnsMsg { pkg_txs = txs })
   end
 
+(* Package relay is negotiated only when BOTH sides sent sendpackages
+   between VERSION and VERACK (BIP-331).  A peer's own sendpackages is not
+   enough: camlcoin does not announce sendpackages, so [sendpackages_sent]
+   is never set and no peer is negotiated. *)
+let negotiated (peer : Peer.peer) : bool =
+  peer.sendpackages_sent && peer.sendpackages_received
+
 (* Handle an incoming [pkgtxns]: validate the package via the cluster mempool
    accept-package routine.  Logs the outcome; partial acceptance keeps the
    accepted txs and discards the rejected ones.  We do not echo back any
    inv/tx — relay is driven by the existing [TxMsg] listener once individual
-   transactions are accepted into the mempool. *)
-let handle_pkgtxns (mp : Mempool.mempool) (peer : Peer.peer)
+   transactions are accepted into the mempool.
+
+   Security audit 2026-10-31 H8: this used to run [Mempool.accept_package]
+   (synchronous script verification on the Lwt loop) for every pkgtxns from
+   any peer, with no negotiation check and outside the tx listener's
+   [Peer.check_rate_limit] and ATMP gate.  Now:
+     - un-negotiated pkgtxns is ignored (Core ignores messages for features
+       that were not negotiated);
+     - a negotiated one counts against the same per-peer budget as [tx]
+       messages and runs inside [gate] ([Cli.atmp_relay_gate]), so packages
+       and relay txs share one bound on concurrent accepts. *)
+let handle_pkgtxns ?gate (mp : Mempool.mempool) (peer : Peer.peer)
     (msg : P2p.pkgtxns_msg) : unit Lwt.t =
   let n = List.length msg.pkg_txs in
-  if n = 0 then Lwt.return_unit
+  if not (negotiated peer) then begin
+    Log.debug (fun m ->
+      m "pkgtxns from peer %d without sendpackages negotiation, ignoring"
+        peer.id);
+    Lwt.return_unit
+  end else if n = 0 then Lwt.return_unit
   else if n > Mempool.max_package_count then begin
     Log.warn (fun m ->
       m "pkgtxns from peer %d exceeds max_package_count (%d > %d), ignoring"
         peer.id n Mempool.max_package_count);
     Lwt.return_unit
+  end else if not (Peer.check_rate_limit peer) then begin
+    Log.debug (fun m ->
+      m "pkgtxns from peer %d over the per-peer rate limit, ignoring" peer.id);
+    Lwt.return_unit
   end else begin
-    let result = Mempool.accept_package mp msg.pkg_txs in
+    let accept () =
+      let%lwt () = Lwt.pause () in
+      Lwt.return (Mempool.accept_package mp msg.pkg_txs) in
+    let%lwt result = match gate with
+      | Some g -> Lwt_pool.use g accept
+      | None -> accept () in
     (match result with
      | Mempool.PackageAccepted entries ->
        Log.info (fun m ->
@@ -77,9 +108,9 @@ let handle_pkgtxns (mp : Mempool.mempool) (peer : Peer.peer)
 (* Convenience: dispatch any P2P message to the right handler.  Non-package
    messages return [Lwt.return_unit].  Wire as a peer_manager listener in
    [Cli.run]. *)
-let dispatch (mp : Mempool.mempool) (msg : P2p.message_payload)
+let dispatch ?gate (mp : Mempool.mempool) (msg : P2p.message_payload)
     (peer : Peer.peer) : unit Lwt.t =
   match msg with
   | P2p.GetpkgtxnsMsg m -> handle_getpkgtxns mp peer m
-  | P2p.PkgtxnsMsg m -> handle_pkgtxns mp peer m
+  | P2p.PkgtxnsMsg m -> handle_pkgtxns ?gate mp peer m
   | _ -> Lwt.return_unit

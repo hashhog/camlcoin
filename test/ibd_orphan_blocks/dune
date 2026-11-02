@@ -1,0 +1,19 @@
+; Unrequested IBD block bodies are not retained (fix-camlcoin-sec-h7).  Own
+; directory so the shared test/dune names list is untouched.
+;
+;   test_ibd_orphan_blocks     unit cases on Sync.receive_block
+;   test_ibd_orphan_blocks_e2e boots bin/main.exe on regtest and floods an
+;                              in-IBD node with unrequested ~3.5 MB blocks
+;
+; Both use only APIs that exist on the pre-fix tree, so they build there too.
+(test
+ (name test_ibd_orphan_blocks)
+ (modules test_ibd_orphan_blocks)
+ (libraries camlcoin test_tmp alcotest))
+
+(test
+ (name test_ibd_orphan_blocks_e2e)
+ (modules test_ibd_orphan_blocks_e2e)
+ (deps ../../bin/main.exe)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix base64
+            cohttp-lwt-unix yojson))

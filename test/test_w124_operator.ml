@@ -483,8 +483,8 @@ let g11_daemonize_present () =
     (contains src "Unix.setsid");
   Alcotest.(check bool) "chdir to / so we don't pin a mountpoint" true
     (contains src "Unix.chdir \"/\"");
-  Alcotest.(check bool) "umask tightened" true
-    (contains src "Unix.umask 0o027");
+  Alcotest.(check bool) "umask tightened to 077 (Core SetupEnvironment)" true
+    (contains src "Unix.umask 0o077");
   Alcotest.(check bool) "stdio redirected to /dev/null" true
     (contains src "redirect_stdio_to_devnull")
 

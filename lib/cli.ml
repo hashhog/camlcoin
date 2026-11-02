@@ -186,6 +186,10 @@ type config = {
        When unset, the REST listener serves plain HTTP. *)
   rest_tls_key : string option;
     (* --rest-tls-key=<PATH>.  PEM private key paired with --rest-tls-cert. *)
+  rest_payjoin : bool;
+    (* --restpayjoin.  Serve the unauthenticated BIP-78 receiver at
+       POST /payjoin on a separate --restport.  Default off: Core has no
+       such endpoint, and it is the only REST route that reads a body. *)
   externalip : string list;
     (* --externalip=<ip>[:port] (repeatable / comma-separated; Core
        -externalip).  Our own public address(es), advertised to peers at
@@ -240,6 +244,7 @@ let default_config : config = {
   rpc_tls_key = None;
   rest_tls_cert = None;
   rest_tls_key = None;
+  rest_payjoin = false;
   externalip = [];
   discover = None;
 }
@@ -1638,6 +1643,7 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         ~port:rest_port
         ~tls_cert_path:config.rest_tls_cert
         ~tls_key_path:config.rest_tls_key
+        ~payjoin:config.rest_payjoin
         ()
     end
   in
@@ -1765,7 +1771,7 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
        | P2p.BlockMsg block ->
          Sync.Gapfill.note_received gapfill
            (Crypto.compute_block_hash block.Types.header);
-         ignore (Sync.receive_block ibd block);
+         ignore (Sync.receive_block ~sender:peer.Peer.id ibd block);
          Lwt.return_unit
        | P2p.NotfoundMsg items ->
          Sync.handle_notfound ibd peer.Peer.id items;
@@ -2163,58 +2169,63 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
        | None ->
          (* FIX-78: Core net_processing.cpp:3286 — unknown stop_hash sets
             node.fDisconnect = true. *)
-         Lwt.async (fun () ->
-           bip157_disconnect peer
-             (Printf.sprintf "getcfilters unknown stop_hash %s"
-                (Types.hash256_to_hex_display stop_hash)))
+         bip157_disconnect peer
+           (Printf.sprintf "getcfilters unknown stop_hash %s"
+              (Types.hash256_to_hex_display stop_hash))
        | Some stop_index ->
          let stop_h = stop_index.Sync.height in
          if start_h > stop_h then
            (* FIX-78: Core net_processing.cpp:3296: node.fDisconnect = true *)
-           Lwt.async (fun () ->
-             bip157_disconnect peer
-               (Printf.sprintf "getcfilters invalid range start=%d > stop=%d"
-                  start_h stop_h))
+           bip157_disconnect peer
+             (Printf.sprintf "getcfilters invalid range start=%d > stop=%d"
+                start_h stop_h)
          else if stop_h - start_h >= max_getcfilters_size then
            (* FIX-78: Core net_processing.cpp:3302: node.fDisconnect = true *)
-           Lwt.async (fun () ->
-             bip157_disconnect peer
-               (Printf.sprintf "getcfilters range %d too large (max %d)"
-                  (stop_h - start_h + 1) max_getcfilters_size))
+           bip157_disconnect peer
+             (Printf.sprintf "getcfilters range %d too large (max %d)"
+                (stop_h - start_h + 1) max_getcfilters_size)
          else begin
            (* Walk parent chain from stop_index, sending one cfilter per
               height in [start_h..stop_h].  Filter lookup is by the
-              ancestor's block_hash, NOT by active-chain block-at-h. *)
-           let all_ok = ref true in
-           let h = ref start_h in
-           while !h <= stop_h && !all_ok do
-             (match Sync.get_ancestor chain stop_index !h with
-              | None ->
-                Logs.debug (fun m ->
-                  m "BIP-157 getcfilters: ancestor missing at height %d" !h);
-                all_ok := false
-              | Some anc ->
-                (match Block_index.read_filter idx.Block_index.filter_idx
-                         anc.Sync.hash with
-                 | None ->
-                   Logs.debug (fun m ->
-                     m "BIP-157 getcfilters: filter missing at height %d" !h);
-                   all_ok := false
-                 | Some bf ->
-                   let filter_cstruct =
-                     Cstruct.of_string bf.Block_index.filter.Block_index.encoded
-                   in
-                   Lwt.async (fun () ->
-                     Peer.send_message peer
-                       (P2p.CfilterMsg {
-                          filter_type = 0;
-                          block_hash = bf.Block_index.block_hash;
-                          filter_data = filter_cstruct;
-                        }))));
-             incr h
-           done
-         end);
-      Lwt.return_unit
+              ancestor's block_hash, NOT by active-chain block-at-h.
+
+              H9 (security audit 2026-10-31): each send is awaited, and so
+              is this listener by peer_message_loop, so the loop reads no
+              further request from a peer until it has taken this reply.
+              Firing them with Lwt.async let a peer that never reads queue
+              1,000 sends per 37-byte request without bound.  Core stops
+              processing a peer whose send queue is over the send buffer
+              (net.cpp fPauseSend); handle_getdata awaits its sends too. *)
+           let rec serve h =
+             if h > stop_h then Lwt.return_unit
+             else
+               match Sync.get_ancestor chain stop_index h with
+               | None ->
+                 Logs.debug (fun m ->
+                   m "BIP-157 getcfilters: ancestor missing at height %d" h);
+                 Lwt.return_unit
+               | Some anc ->
+                 (match Block_index.read_filter idx.Block_index.filter_idx
+                          anc.Sync.hash with
+                  | None ->
+                    Logs.debug (fun m ->
+                      m "BIP-157 getcfilters: filter missing at height %d" h);
+                    Lwt.return_unit
+                  | Some bf ->
+                    let%lwt () =
+                      Peer.send_message peer
+                        (P2p.CfilterMsg {
+                           filter_type = 0;
+                           block_hash = bf.Block_index.block_hash;
+                           filter_data =
+                             Cstruct.of_string
+                               bf.Block_index.filter.Block_index.encoded;
+                         })
+                    in
+                    serve (h + 1))
+           in
+           serve start_h
+         end)
     | P2p.GetcfheadersMsg { filter_type = 0; start_height; stop_hash }, Some idx ->
       (* BIP-157 §getcfheaders: send cfheaders for the range.
 
@@ -2225,24 +2236,21 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
        | None ->
          (* FIX-78: Core net_processing.cpp:3286 — unknown stop_hash sets
             node.fDisconnect = true. *)
-         Lwt.async (fun () ->
-           bip157_disconnect peer
-             (Printf.sprintf "getcfheaders unknown stop_hash %s"
-                (Types.hash256_to_hex_display stop_hash)))
+         bip157_disconnect peer
+           (Printf.sprintf "getcfheaders unknown stop_hash %s"
+              (Types.hash256_to_hex_display stop_hash))
        | Some stop_index ->
          let stop_h = stop_index.Sync.height in
          if start_h > stop_h then
            (* FIX-78: Core net_processing.cpp:3296: node.fDisconnect = true *)
-           Lwt.async (fun () ->
-             bip157_disconnect peer
-               (Printf.sprintf "getcfheaders invalid range start=%d > stop=%d"
-                  start_h stop_h))
+           bip157_disconnect peer
+             (Printf.sprintf "getcfheaders invalid range start=%d > stop=%d"
+                start_h stop_h)
          else if stop_h - start_h >= max_getcfheaders_size then
            (* FIX-78: Core net_processing.cpp:3302: node.fDisconnect = true *)
-           Lwt.async (fun () ->
-             bip157_disconnect peer
-               (Printf.sprintf "getcfheaders range %d too large (max %d)"
-                  (stop_h - start_h + 1) max_getcfheaders_size))
+           bip157_disconnect peer
+             (Printf.sprintf "getcfheaders range %d too large (max %d)"
+                (stop_h - start_h + 1) max_getcfheaders_size)
          else begin
            (* prev_filter_header is the filter header of the block at
               start_h - 1 along the stop_hash ancestry, or zero for
@@ -2272,18 +2280,17 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
                   | None -> all_ok := false
                   | Some entry -> hashes := entry.Block_index.filter_hash :: !hashes)
            done;
-           if !all_ok then begin
-             Lwt.async (fun () ->
-               Peer.send_message peer
-                 (P2p.CfheadersMsg {
-                    filter_type = 0;
-                    stop_hash;
-                    prev_filter_header = prev_fh;
-                    filter_hashes = List.rev !hashes;
-                  }))
-           end
-         end);
-      Lwt.return_unit
+           (* H9: awaited, like the cfilter sends above. *)
+           if !all_ok then
+             Peer.send_message peer
+               (P2p.CfheadersMsg {
+                  filter_type = 0;
+                  stop_hash;
+                  prev_filter_header = prev_fh;
+                  filter_hashes = List.rev !hashes;
+                })
+           else Lwt.return_unit
+         end)
     | P2p.GetcfcheckptMsg { filter_type = 0; stop_hash }, Some idx ->
       (* BIP-157 §getcfcheckpt: send filter headers at every CFCHECKPT_INTERVAL.
 
@@ -2293,10 +2300,9 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
        | None ->
          (* FIX-78: Core net_processing.cpp:3286 — unknown stop_hash sets
             node.fDisconnect = true. *)
-         Lwt.async (fun () ->
-           bip157_disconnect peer
-             (Printf.sprintf "getcfcheckpt unknown stop_hash %s"
-                (Types.hash256_to_hex_display stop_hash)))
+         bip157_disconnect peer
+           (Printf.sprintf "getcfcheckpt unknown stop_hash %s"
+              (Types.hash256_to_hex_display stop_hash))
        | Some stop_index ->
          let stop_h = stop_index.Sync.height in
          let n_checkpts = stop_h / cfcheckpt_interval in
@@ -2313,15 +2319,15 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
                 | Some h -> headers := h :: !headers)
            end
          done;
+         (* H9: awaited, like the cfilter sends above. *)
          if !all_ok then
-           Lwt.async (fun () ->
-             Peer.send_message peer
-               (P2p.CfcheckptMsg {
-                  filter_type = 0;
-                  stop_hash;
-                  filter_headers = List.rev !headers;
-                })));
-      Lwt.return_unit
+           Peer.send_message peer
+             (P2p.CfcheckptMsg {
+                filter_type = 0;
+                stop_hash;
+                filter_headers = List.rev !headers;
+              })
+         else Lwt.return_unit)
     | P2p.GetcfiltersMsg { filter_type; _ }, _
     | P2p.GetcfheadersMsg { filter_type; _ }, _
     | P2p.GetcfcheckptMsg { filter_type; _ }, _ ->

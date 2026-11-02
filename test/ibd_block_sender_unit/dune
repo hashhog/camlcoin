@@ -1,0 +1,6 @@
+; Unit cases for Sync.receive_block ~sender (fix-camlcoin-sec-h6).  Separate
+; from test/ibd_block_sender because it uses the new ~sender argument, which
+; the pre-fix tree does not have; the end-to-end test there builds on both.
+(test
+ (name test_ibd_block_sender_unit)
+ (libraries camlcoin test_tmp alcotest))

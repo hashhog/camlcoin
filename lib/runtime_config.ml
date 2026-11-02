@@ -205,8 +205,8 @@ let daemonize () : unit =
    | _ -> exit 0);
   (* chdir / so we don't pin a mountpoint. *)
   (try Unix.chdir "/" with _ -> ());
-  (* Tighten umask. *)
-  let _ = Unix.umask 0o027 in
+  (* Keep main's umask (Core: umask(077) in SetupEnvironment). *)
+  let _ = Unix.umask 0o077 in
   redirect_stdio_to_devnull ()
 
 (* ============================================================================

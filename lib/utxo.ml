@@ -662,6 +662,36 @@ module OptimizedUtxoSet = struct
       Hashtbl.remove t.dirty key;
       bump t)
 
+  (* The view's state for one outpoint (dirty entry and LRU copy), taken
+     before a mutation that may have to be abandoned.  A multi-block
+     disconnect mutates the live view block by block and commits only at
+     the end; when a deeper block fails, [restore_saved] puts every touched
+     key back so the next flush cannot persist a partial rollback (audit
+     H13).  Core gets this from DisconnectTip's child CCoinsViewCache,
+     flushed only on DISCONNECT_OK. *)
+  type saved_key = string * dirty_entry option * utxo_entry option
+
+  let save_key (t : t) (txid : Types.hash256) (vout : int) : saved_key =
+    let key = utxo_key txid vout in
+    locked t (fun () ->
+      (key, Hashtbl.find_opt t.dirty key, Perf.LRU.peek t.cache key))
+
+  (* [saved] newest first, as built by prepending each [save_key]: a key
+     saved twice is restored to its OLDEST saved state, which is applied
+     last. *)
+  let restore_saved (t : t) (saved : saved_key list) : unit =
+    locked t (fun () ->
+      List.iter (fun (key, d, c) ->
+        (match d with
+         | Some e -> Hashtbl.replace t.dirty key e
+         | None -> Hashtbl.remove t.dirty key);
+        (match c with
+         | Some e when Perf.LRU.capacity t.cache > 0 ->
+           Perf.LRU.put t.cache key e
+         | _ -> Perf.LRU.remove t.cache key)
+      ) saved;
+      bump t)
+
   (* Check if a UTXO exists *)
   let exists (t : t) (txid : Types.hash256) (vout : int) : bool =
     let key = utxo_key txid vout in
@@ -686,9 +716,25 @@ module OptimizedUtxoSet = struct
      clears the dirty set.
      When [tip_height] is provided, also stores it in RocksDB so that
      startup can detect a chainstate / UTXO store mismatch. *)
-  let flush ?(tip_height : int option) (t : t) : unit =
+  (* [tip] = (hash, height) is the commit of an IBD flush: rocksdb_utxo
+     gets [tip_height] AND the head marker (see [Rocksdb_store.head_blocks])
+     in its batch, and the chainstate tip goes into the SAME chainstate
+     batch as the coin mirror, so each store commits coins and tip together
+     and boot can tell by hash whether the second commit happened.  Plain
+     [tip_height] keeps the old behaviour (the caller sets the chainstate
+     tip itself) and drops the head marker. *)
+  let flush ?(tip_height : int option) ?(tip : (Types.hash256 * int) option)
+      (t : t) : unit =
     locked t @@ fun () ->
     let count = Hashtbl.length t.dirty in
+    let tip_height, head = match tip with
+      | Some (hash, height) ->
+        (Some height, Some (Storage.ChainDB.head_for t.db hash))
+      | None -> (tip_height, None) in
+    let stage_cf_tip cf_batch = match tip with
+      | Some (hash, height) ->
+        Storage.ChainDB.batch_set_chain_tip cf_batch hash height
+      | None -> () in
     if count > 0 || tip_height <> None then begin
       (match t.rocksdb with
        | Some rdb ->
@@ -706,7 +752,7 @@ module OptimizedUtxoSet = struct
            | `Removed ->
              Hashtbl.replace serialized key `Removed
          ) t.dirty;
-         Rocksdb_store.flush_dirty ?tip_height rdb serialized;
+         Rocksdb_store.flush_dirty ?tip_height ?head rdb serialized;
          (* Mirror the SAME deltas into the cf_chainstate UTXO column
             family.  [Storage.ChainDB] keeps two physical UTXO backends and
             every other writer keeps them in step: [apply_block_atomic]
@@ -729,10 +775,10 @@ module OptimizedUtxoSet = struct
             snapshot with 0 coins.  RocksDB is committed FIRST and the CF
             SECOND, matching [apply_block_atomic]'s crash-window ordering
             (RocksDB ahead of the authoritative CF chain_tip is the safe
-            direction).  No tip pointer is written here — [flush] only ever
-            recorded the RocksDB tip_height marker, and callers set the CF
-            chain_tip themselves. *)
+            direction).  With [tip] the CF chain_tip rides in this batch
+            too; without it callers set the CF chain_tip themselves. *)
          let cf_batch = Storage.ChainDB.batch_create () in
+         stage_cf_tip cf_batch;
          Hashtbl.iter (fun key entry ->
            let key_cs = Cstruct.of_string key in
            let txid = Cstruct.sub key_cs 0 32 in
@@ -748,6 +794,7 @@ module OptimizedUtxoSet = struct
        | None ->
          (* Legacy LogStorage path *)
          let batch = Storage.ChainDB.batch_create () in
+         stage_cf_tip batch;
          Hashtbl.iter (fun key entry ->
            let key_cs = Cstruct.of_string key in
            let txid = Cstruct.sub key_cs 0 32 in

@@ -1,0 +1,9 @@
+; Wallet file modes (fix-camlcoin-sec-h10). Own directory so the shared
+; test/dune names list is untouched. The node case boots the real CLI
+; (bin/main.exe) on regtest under a loose umask, so the umask under test is
+; the one main sets, not the one the test runner happened to inherit.
+(test
+ (name test_wallet_file_modes)
+ (deps ../../bin/main.exe)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix base64
+            yojson str cohttp-lwt-unix))

@@ -498,6 +498,37 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     exit 1
   end;
 
+  (* Open RocksDB for the UTXO set — replaces LogStorage's lseek+read.
+     Block cache + write buffer come from --dbcache so a campaign
+     `--dbcache 4194304` (~1 GiB LRU) cannot sit next to an 8 GiB SST
+     cache. 2026-09-20 slice 419311→450000 held 11.2 GB RSS against
+     that 1 GiB budget while this open used the hardcoded 8192 MiB. *)
+  let rocksdb_path = Filename.concat config.data_dir "rocksdb_utxo" in
+  let rocksdb =
+    Rocksdb_store.open_db
+      ~block_cache_mb:dbcache_block_cache_mb
+      ~write_buffer_mb:dbcache_write_buffer_mb
+      rocksdb_path
+  in
+  Logs.info (fun m ->
+    m "Opened RocksDB UTXO store at %s (block_cache=%d MiB \
+       write_buffer=%d MiB; --dbcache %d entries)"
+      rocksdb_path dbcache_block_cache_mb dbcache_write_buffer_mb
+      config.dbcache_lru_entries);
+
+  (* Wire the RocksDB handle into ChainDB so [get_utxo] can fall back to
+     RocksDB on a LogStorage miss.  Pre-assume-valid UTXOs live only in
+     RocksDB because assume-valid IBD writes through OptimizedUtxoSet;
+     without this fallback, any post-IBD block that spends a pre-AV
+     output fails validation with TxMissingInputs. *)
+  Storage.ChainDB.attach_rocksdb_utxo db rocksdb;
+
+  (* Finish a chainstate commit that died between its rocksdb_utxo half and
+     its chainstate half (audit H11/H12; Core ReplayBlocks).  Runs before
+     restore_chain_state so the in-memory chain loads from the repaired
+     tip and height index.  See [Chainstate_heads]. *)
+  ignore (Chainstate_heads.recover_on_boot ~db ~rdb:rocksdb);
+
   (* Get network config *)
   let network = match config.network with
     | `Mainnet -> Consensus.mainnet
@@ -643,30 +674,6 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   (* Initialize UTXO set *)
   let utxo = Utxo.UtxoSet.create db in
 
-  (* Open RocksDB for the UTXO set — replaces LogStorage's lseek+read.
-     Block cache + write buffer come from --dbcache so a campaign
-     `--dbcache 4194304` (~1 GiB LRU) cannot sit next to an 8 GiB SST
-     cache. 2026-09-20 slice 419311→450000 held 11.2 GB RSS against
-     that 1 GiB budget while this open used the hardcoded 8192 MiB. *)
-  let rocksdb_path = Filename.concat config.data_dir "rocksdb_utxo" in
-  let rocksdb =
-    Rocksdb_store.open_db
-      ~block_cache_mb:dbcache_block_cache_mb
-      ~write_buffer_mb:dbcache_write_buffer_mb
-      rocksdb_path
-  in
-  Logs.info (fun m ->
-    m "Opened RocksDB UTXO store at %s (block_cache=%d MiB \
-       write_buffer=%d MiB; --dbcache %d entries)"
-      rocksdb_path dbcache_block_cache_mb dbcache_write_buffer_mb
-      config.dbcache_lru_entries);
-
-  (* Wire the RocksDB handle into ChainDB so [get_utxo] can fall back to
-     RocksDB on a LogStorage miss.  Pre-assume-valid UTXOs live only in
-     RocksDB because assume-valid IBD writes through OptimizedUtxoSet;
-     without this fallback, any post-IBD block that spends a pre-AV
-     output fails validation with TxMissingInputs. *)
-  Storage.ChainDB.attach_rocksdb_utxo db rocksdb;
 
   (* Consistency check: detect when RocksDB was wiped but chainstate still
      has a non-zero chain_tip.  Without this, the node would skip blocks
@@ -720,6 +727,18 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         | Some h -> (h, target)
         | None -> (Cstruct.create 32, 0)
     in
+    (* A rewind to genesis re-syncs from block 1, so it must start from an
+       empty coin set: rocksdb_utxo kept the coins of the old tip (audit
+       H11) and every re-synced block then met its own coins as BIP30
+       duplicates or its inputs as already spent.  The wipe goes first; if
+       the process dies before the tip write, the next boot sees no RDB tip
+       under a non-zero chain_tip and rewinds again. *)
+    if new_height = 0 then begin
+      let n_rdb, n_cf = Storage.ChainDB.wipe_utxo_stores db in
+      Logs.warn (fun m ->
+        m "chainstate rewind to genesis: wiped both coin stores \
+           (%d rocksdb_utxo keys, %d chainstate coins)" n_rdb n_cf)
+    end;
     chain.blocks_synced <- new_height;
     Storage.ChainDB.set_chain_tip db new_hash new_height;
     if reason <> "" then
@@ -1771,7 +1790,7 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
        | P2p.BlockMsg block ->
          Sync.Gapfill.note_received gapfill
            (Crypto.compute_block_hash block.Types.header);
-         ignore (Sync.receive_block ibd block);
+         ignore (Sync.receive_block ~sender:peer.Peer.id ibd block);
          Lwt.return_unit
        | P2p.NotfoundMsg items ->
          Sync.handle_notfound ibd peer.Peer.id items;
@@ -2168,58 +2187,63 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
        | None ->
          (* FIX-78: Core net_processing.cpp:3286 — unknown stop_hash sets
             node.fDisconnect = true. *)
-         Lwt.async (fun () ->
-           bip157_disconnect peer
-             (Printf.sprintf "getcfilters unknown stop_hash %s"
-                (Types.hash256_to_hex_display stop_hash)))
+         bip157_disconnect peer
+           (Printf.sprintf "getcfilters unknown stop_hash %s"
+              (Types.hash256_to_hex_display stop_hash))
        | Some stop_index ->
          let stop_h = stop_index.Sync.height in
          if start_h > stop_h then
            (* FIX-78: Core net_processing.cpp:3296: node.fDisconnect = true *)
-           Lwt.async (fun () ->
-             bip157_disconnect peer
-               (Printf.sprintf "getcfilters invalid range start=%d > stop=%d"
-                  start_h stop_h))
+           bip157_disconnect peer
+             (Printf.sprintf "getcfilters invalid range start=%d > stop=%d"
+                start_h stop_h)
          else if stop_h - start_h >= max_getcfilters_size then
            (* FIX-78: Core net_processing.cpp:3302: node.fDisconnect = true *)
-           Lwt.async (fun () ->
-             bip157_disconnect peer
-               (Printf.sprintf "getcfilters range %d too large (max %d)"
-                  (stop_h - start_h + 1) max_getcfilters_size))
+           bip157_disconnect peer
+             (Printf.sprintf "getcfilters range %d too large (max %d)"
+                (stop_h - start_h + 1) max_getcfilters_size)
          else begin
            (* Walk parent chain from stop_index, sending one cfilter per
               height in [start_h..stop_h].  Filter lookup is by the
-              ancestor's block_hash, NOT by active-chain block-at-h. *)
-           let all_ok = ref true in
-           let h = ref start_h in
-           while !h <= stop_h && !all_ok do
-             (match Sync.get_ancestor chain stop_index !h with
-              | None ->
-                Logs.debug (fun m ->
-                  m "BIP-157 getcfilters: ancestor missing at height %d" !h);
-                all_ok := false
-              | Some anc ->
-                (match Block_index.read_filter idx.Block_index.filter_idx
-                         anc.Sync.hash with
-                 | None ->
-                   Logs.debug (fun m ->
-                     m "BIP-157 getcfilters: filter missing at height %d" !h);
-                   all_ok := false
-                 | Some bf ->
-                   let filter_cstruct =
-                     Cstruct.of_string bf.Block_index.filter.Block_index.encoded
-                   in
-                   Lwt.async (fun () ->
-                     Peer.send_message peer
-                       (P2p.CfilterMsg {
-                          filter_type = 0;
-                          block_hash = bf.Block_index.block_hash;
-                          filter_data = filter_cstruct;
-                        }))));
-             incr h
-           done
-         end);
-      Lwt.return_unit
+              ancestor's block_hash, NOT by active-chain block-at-h.
+
+              H9 (security audit 2026-10-31): each send is awaited, and so
+              is this listener by peer_message_loop, so the loop reads no
+              further request from a peer until it has taken this reply.
+              Firing them with Lwt.async let a peer that never reads queue
+              1,000 sends per 37-byte request without bound.  Core stops
+              processing a peer whose send queue is over the send buffer
+              (net.cpp fPauseSend); handle_getdata awaits its sends too. *)
+           let rec serve h =
+             if h > stop_h then Lwt.return_unit
+             else
+               match Sync.get_ancestor chain stop_index h with
+               | None ->
+                 Logs.debug (fun m ->
+                   m "BIP-157 getcfilters: ancestor missing at height %d" h);
+                 Lwt.return_unit
+               | Some anc ->
+                 (match Block_index.read_filter idx.Block_index.filter_idx
+                          anc.Sync.hash with
+                  | None ->
+                    Logs.debug (fun m ->
+                      m "BIP-157 getcfilters: filter missing at height %d" h);
+                    Lwt.return_unit
+                  | Some bf ->
+                    let%lwt () =
+                      Peer.send_message peer
+                        (P2p.CfilterMsg {
+                           filter_type = 0;
+                           block_hash = bf.Block_index.block_hash;
+                           filter_data =
+                             Cstruct.of_string
+                               bf.Block_index.filter.Block_index.encoded;
+                         })
+                    in
+                    serve (h + 1))
+           in
+           serve start_h
+         end)
     | P2p.GetcfheadersMsg { filter_type = 0; start_height; stop_hash }, Some idx ->
       (* BIP-157 §getcfheaders: send cfheaders for the range.
 
@@ -2230,24 +2254,21 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
        | None ->
          (* FIX-78: Core net_processing.cpp:3286 — unknown stop_hash sets
             node.fDisconnect = true. *)
-         Lwt.async (fun () ->
-           bip157_disconnect peer
-             (Printf.sprintf "getcfheaders unknown stop_hash %s"
-                (Types.hash256_to_hex_display stop_hash)))
+         bip157_disconnect peer
+           (Printf.sprintf "getcfheaders unknown stop_hash %s"
+              (Types.hash256_to_hex_display stop_hash))
        | Some stop_index ->
          let stop_h = stop_index.Sync.height in
          if start_h > stop_h then
            (* FIX-78: Core net_processing.cpp:3296: node.fDisconnect = true *)
-           Lwt.async (fun () ->
-             bip157_disconnect peer
-               (Printf.sprintf "getcfheaders invalid range start=%d > stop=%d"
-                  start_h stop_h))
+           bip157_disconnect peer
+             (Printf.sprintf "getcfheaders invalid range start=%d > stop=%d"
+                start_h stop_h)
          else if stop_h - start_h >= max_getcfheaders_size then
            (* FIX-78: Core net_processing.cpp:3302: node.fDisconnect = true *)
-           Lwt.async (fun () ->
-             bip157_disconnect peer
-               (Printf.sprintf "getcfheaders range %d too large (max %d)"
-                  (stop_h - start_h + 1) max_getcfheaders_size))
+           bip157_disconnect peer
+             (Printf.sprintf "getcfheaders range %d too large (max %d)"
+                (stop_h - start_h + 1) max_getcfheaders_size)
          else begin
            (* prev_filter_header is the filter header of the block at
               start_h - 1 along the stop_hash ancestry, or zero for
@@ -2277,18 +2298,17 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
                   | None -> all_ok := false
                   | Some entry -> hashes := entry.Block_index.filter_hash :: !hashes)
            done;
-           if !all_ok then begin
-             Lwt.async (fun () ->
-               Peer.send_message peer
-                 (P2p.CfheadersMsg {
-                    filter_type = 0;
-                    stop_hash;
-                    prev_filter_header = prev_fh;
-                    filter_hashes = List.rev !hashes;
-                  }))
-           end
-         end);
-      Lwt.return_unit
+           (* H9: awaited, like the cfilter sends above. *)
+           if !all_ok then
+             Peer.send_message peer
+               (P2p.CfheadersMsg {
+                  filter_type = 0;
+                  stop_hash;
+                  prev_filter_header = prev_fh;
+                  filter_hashes = List.rev !hashes;
+                })
+           else Lwt.return_unit
+         end)
     | P2p.GetcfcheckptMsg { filter_type = 0; stop_hash }, Some idx ->
       (* BIP-157 §getcfcheckpt: send filter headers at every CFCHECKPT_INTERVAL.
 
@@ -2298,10 +2318,9 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
        | None ->
          (* FIX-78: Core net_processing.cpp:3286 — unknown stop_hash sets
             node.fDisconnect = true. *)
-         Lwt.async (fun () ->
-           bip157_disconnect peer
-             (Printf.sprintf "getcfcheckpt unknown stop_hash %s"
-                (Types.hash256_to_hex_display stop_hash)))
+         bip157_disconnect peer
+           (Printf.sprintf "getcfcheckpt unknown stop_hash %s"
+              (Types.hash256_to_hex_display stop_hash))
        | Some stop_index ->
          let stop_h = stop_index.Sync.height in
          let n_checkpts = stop_h / cfcheckpt_interval in
@@ -2318,15 +2337,15 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
                 | Some h -> headers := h :: !headers)
            end
          done;
+         (* H9: awaited, like the cfilter sends above. *)
          if !all_ok then
-           Lwt.async (fun () ->
-             Peer.send_message peer
-               (P2p.CfcheckptMsg {
-                  filter_type = 0;
-                  stop_hash;
-                  filter_headers = List.rev !headers;
-                })));
-      Lwt.return_unit
+           Peer.send_message peer
+             (P2p.CfcheckptMsg {
+                filter_type = 0;
+                stop_hash;
+                filter_headers = List.rev !headers;
+              })
+         else Lwt.return_unit)
     | P2p.GetcfiltersMsg { filter_type; _ }, _
     | P2p.GetcfheadersMsg { filter_type; _ }, _
     | P2p.GetcfcheckptMsg { filter_type; _ }, _ ->
@@ -3245,13 +3264,13 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       let dirty = Utxo.OptimizedUtxoSet.dirty_count optimized_utxo in
       if dirty > 0 then begin
         Logs.info (fun m -> m "Flushing %d dirty UTXO entries to disk" dirty);
-        Utxo.OptimizedUtxoSet.flush
-          ~tip_height:chain.blocks_synced optimized_utxo;
         let bs = chain.blocks_synced in
         (match Sync.get_header_at_height chain bs with
          | Some entry ->
-           Storage.ChainDB.set_chain_tip db entry.hash bs
-         | None -> ())
+           (* coins, tip and head marker together (audit H11) *)
+           Utxo.OptimizedUtxoSet.flush ~tip:(entry.hash, bs) optimized_utxo
+         | None ->
+           Utxo.OptimizedUtxoSet.flush ~tip_height:bs optimized_utxo)
       end else begin
         (* W47 fix: in FullySynced mode, dirty is always 0 because
            [process_new_block] bypasses OptimizedUtxoSet.  Without this
@@ -3259,7 +3278,10 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
            flush height while chain_tip (in LogStorage) has advanced with
            every post-IBD block — producing the 945509 wedge on next boot.
            Always align rdb_tip with blocks_synced at shutdown. *)
-        Rocksdb_store.set_tip_height rocksdb chain.blocks_synced
+        let head = match Storage.ChainDB.get_chain_tip db with
+          | Some (h, n) when n = chain.blocks_synced -> Some (h, h)
+          | _ -> None in
+        Rocksdb_store.set_tip_height ?head rocksdb chain.blocks_synced
       end
     with exn ->
       Logs.warn (fun m ->

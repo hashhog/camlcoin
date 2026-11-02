@@ -4433,39 +4433,33 @@ let request_blocks (ibd : ibd_state) (peers : Peer.peer list)
    Block Receipt and Processing
    ============================================================================ *)
 
-(* Process a received block *)
-let receive_block (ibd : ibd_state) (block : Types.block)
+(* Process a received block.
+
+   [sender] is the peer the body arrived from (None for bodies that were
+   not delivered by a peer, e.g. compact-block reconstruction or orphan
+   replay).  A body for a slot that is in flight with a different peer is
+   dropped: matching on hash alone let any peer fill a slot requested from
+   another, and when that body failed validation the requested (honest)
+   peer was scored for it and banned (security audit 2026-10-31 H6).  Core
+   only marks a block as received from the peer it is in flight with
+   (net_processing.cpp RemoveBlockRequest takes the from_peer) and blames
+   the actual sender (mapBlockSource / BlockChecked). *)
+let receive_block ?sender (ibd : ibd_state) (block : Types.block)
     : (unit, string) result =
   let hash = Crypto.compute_block_hash block.header in
   let hash_key = Cstruct.to_string hash in
   match queue_find_by_hash ibd hash_key with
   | None ->
-    (* Unrequested block - store as orphan if pool isn't full *)
-    let prev_hash = block.header.prev_block in
-    let orphan_entry = {
-      block;
-      hash;
-      prev_hash;
-      received_time = Unix.gettimeofday ();
-    } in
-    if Hashtbl.length ibd.orphan_blocks >= max_orphan_blocks then begin
-      (* Pool is full - evict the oldest entry *)
-      let oldest_key = ref "" in
-      let oldest_time = ref infinity in
-      Hashtbl.iter (fun key entry ->
-        if entry.received_time < !oldest_time then begin
-          oldest_time := entry.received_time;
-          oldest_key := key
-        end
-      ) ibd.orphan_blocks;
-      if !oldest_key <> "" then
-        Hashtbl.remove ibd.orphan_blocks !oldest_key
-    end;
-    Hashtbl.replace ibd.orphan_blocks hash_key orphan_entry;
+    (* Unrequested block: drop it.  It used to go into [orphan_blocks]
+       (750 entries, each up to a 4 MB message, with no header, PoW or size
+       check), so a single peer could pin ~3 GB of heap during IBD
+       (security audit 2026-10-31 H7).  Core keeps no orphan blocks: an
+       unrequested block without a known header is not stored
+       (validation.cpp AcceptBlock returns early when !fRequested).  Every
+       block we need is in the queue and is requested when its turn comes. *)
     Logs.debug (fun m ->
-      m "Stored orphan block %s (pool size: %d)"
-        (Types.hash256_to_hex_display hash)
-        (Hashtbl.length ibd.orphan_blocks));
+      m "Ignoring unrequested block %s during IBD"
+        (Types.hash256_to_hex_display hash));
     Ok ()
   | Some { download_state = (Downloaded _ | Validated); _ } ->
     (* A second copy of a block we already hold (a re-request raced the
@@ -4473,18 +4467,33 @@ let receive_block (ibd : ibd_state) (block : Types.block)
        drove total_blocks_in_flight below the real number of outstanding
        requests. *)
     Ok ()
+  | Some { download_state = Requested { peer_id = requested; _ }; _ }
+    when (match sender with Some s -> s <> requested | None -> false) ->
+    (* In flight with another peer: not ours to fill.  The requested peer
+       still delivers it (or times out and the slot is re-requested). *)
+    Logs.debug (fun m ->
+      m "Ignoring block %s from peer %d: in flight with peer %d"
+        (Types.hash256_to_hex_display hash)
+        (Option.value sender ~default:(-1)) requested);
+    Ok ()
   | Some entry ->
     (* Record which peer sent it for timeout decay *)
-    let peer_id = match entry.download_state with
+    let requested_from = match entry.download_state with
       | Requested { peer_id; _ } -> Some peer_id
       | _ -> None
     in
-    let was_in_flight = peer_id <> None in
+    let was_in_flight = requested_from <> None in
+    (* Blame the actual sender when we know it; otherwise the peer it was
+       requested from (the two agree whenever both are known). *)
+    let peer_id = match sender with
+      | Some _ -> sender
+      | None -> requested_from
+    in
     entry.download_state <- Downloaded { block; peer_id };
     if was_in_flight then
       ibd.total_blocks_in_flight <- max 0 (ibd.total_blocks_in_flight - 1);
     (* Decay timeout for successful download *)
-    (match peer_id with
+    (match requested_from with
      | Some pid -> record_successful_download ibd pid
      | None -> ());
     Ok ()
@@ -4513,7 +4522,10 @@ let handle_notfound (ibd : ibd_state) (peer_id : int)
   ) items
 
 (* Flush pending UTXO updates to database *)
-let flush_utxos (ibd : ibd_state) : unit =
+(* [tip] = (hash, height): commit the chainstate tip with the coins (see
+   [Utxo.OptimizedUtxoSet.flush]); without a coin cache the tip is written
+   after the pending-list batch, as before. *)
+let flush_utxos ?(tip : (Types.hash256 * int) option) (ibd : ibd_state) : unit =
   if ibd.pending_utxo_updates <> [] || ibd.pending_utxo_deletes <> [] then begin
     let batch = Storage.ChainDB.batch_create () in
     (* Add new UTXOs *)
@@ -4539,8 +4551,14 @@ let flush_utxos (ibd : ibd_state) : unit =
   match ibd.utxo_set with
   | Some utxo ->
     Fatal.run_write ~what:"IBD UTXO cache flush" (fun () ->
-      Utxo.OptimizedUtxoSet.flush ~tip_height:ibd.chain.blocks_synced utxo)
-  | None -> ()
+      Utxo.OptimizedUtxoSet.flush ~tip_height:ibd.chain.blocks_synced ?tip
+        utxo)
+  | None ->
+    (match tip with
+     | Some (hash, height) ->
+       Fatal.run_write ~what:"IBD chain tip" (fun () ->
+         Storage.ChainDB.set_chain_tip ibd.chain.db hash height)
+     | None -> ())
 
 (* The catch-up session that last connected a block through the coin
    cache; its coin changes (the shared cache's dirty set and, on the
@@ -4575,13 +4593,15 @@ let flush_coins_before_tip_commit (state : chain_state) : unit =
     | Some u -> Utxo.OptimizedUtxoSet.dirty_count u > 0
     | None -> false in
   if pending || dirty then begin
+    let tip = Option.map (fun h -> (h, state.blocks_synced))
+        (validated_tip_hash state) in
     (match !unflushed_catchup with
-     | Some ibd -> flush_utxos ibd; ibd.blocks_since_flush <- 0
+     | Some ibd -> flush_utxos ?tip ibd; ibd.blocks_since_flush <- 0
      | None -> ());
     (match !shared_utxo_set with
      | Some u when Utxo.OptimizedUtxoSet.dirty_count u > 0 ->
        Fatal.run_write ~what:"pre-commit coin flush" (fun () ->
-         Utxo.OptimizedUtxoSet.flush ~tip_height:state.blocks_synced u)
+         Utxo.OptimizedUtxoSet.flush ~tip_height:state.blocks_synced ?tip u)
      | _ -> ());
     match validated_tip_hash state with
     | Some h ->
@@ -5601,10 +5621,13 @@ let process_downloaded_blocks ?(max_blocks = 1)
            in
            mark Connect_prof.p_misc;
            if ibd.blocks_since_flush >= utxo_flush_interval || dirty_too_large then begin
-             flush_utxos ibd;
+             (* The chain tip commits WITH the coins, in each store's own
+                batch, and rocksdb_utxo records the head marker (audit H11:
+                a crash between two separate writes here left rdb_tip ahead
+                and, with no bodies stored under assumevalid, boot rewound
+                to genesis over a full rocksdb_utxo). *)
+             flush_utxos ~tip:(entry.hash, height) ibd;
              ibd.blocks_since_flush <- 0;
-             (* Also update chain tip in DB *)
-             Storage.ChainDB.set_chain_tip ibd.chain.db entry.hash height;
              (* Run a major GC slice to keep heap from growing unbounded.
                 Gc.compact is far too expensive (full heap compaction + scan);
                 Gc.major runs one full major cycle which is sufficient to
@@ -5825,9 +5848,10 @@ let block_disconnect_ops (block : Types.block) (undo : Utxo.undo_data)
    from each block's stored undo data and removes the outputs that the
    disconnected blocks created. Block bodies and headers are preserved
    on disk so the chain can be re-applied later via [reorganize].
-   Undo data for the disconnected blocks is deleted (matching what
-   [reorganize] does on its disconnect path); on re-apply, [reorganize]
-   rebuilds undo data fresh from the recovered UTXO set.
+   Undo data for the disconnected blocks is deleted in the same batch as
+   the coin delta (matching what [reorganize] does on its disconnect path);
+   on re-apply, [reorganize] rebuilds undo data fresh from the recovered
+   UTXO set.  On Error nothing is written.
 
    Mirrors Bitcoin Core's [TemporaryRollback] used by [dumptxoutset]
    ([src/rpc/blockchain.cpp:3157]). The caller is responsible for
@@ -5878,6 +5902,7 @@ let disconnect_to_target ?(from_validated_tip = false)
           mutations into a single batch so the disconnect is atomic
           relative to a crash partway through. *)
        let batch = Storage.ChainDB.batch_create () in
+       let disconnected = ref [] in
        let rec disconnect = function
          | [] -> Ok ()
          | (entry : header_entry) :: rest ->
@@ -5915,19 +5940,28 @@ let disconnect_to_target ?(from_validated_tip = false)
                ) ops;
                (* The undo data for this block is no longer valid:
                   [reorganize] will rebuild it on the connect path
-                  when the chain is re-applied. *)
-               Storage.ChainDB.delete_undo_data state.db entry.hash;
-               (* Tx-output spender index erase (DB-direct disconnect path,
-                  e.g. dumptxoutset rollback / invalidateblock without a
-                  threaded UTXO set). RE-DERIVES this block's spend keys and
-                  erases them. No-op when --txospenderindex is off. *)
-               txospender_disconnect_if_enabled state ~block
-                 ~height:entry.height;
+                  when the chain is re-applied.  Staged in the coin+tip
+                  batch, not deleted here: a deeper block failing below
+                  (or a crash before the commit) would otherwise leave
+                  this still-connected block with no undo, so it could
+                  never be disconnected again (audit H13; Core's
+                  DisconnectTip never erases undo). *)
+               Storage.ChainDB.batch_delete_undo_data batch entry.hash;
+               disconnected := (block, entry.height) :: !disconnected;
                disconnect rest
        in
        (match disconnect (List.rev to_disconnect) with
         | Error _ as e -> e
         | Ok () ->
+          (* Tx-output spender index erase (DB-direct disconnect path,
+             e.g. dumptxoutset rollback / invalidateblock without a
+             threaded UTXO set). RE-DERIVES each block's spend keys and
+             erases them, tip-first. Only once every block disconnected:
+             a failed disconnect leaves the chain where it was, so its
+             keys must stay. No-op when --txospenderindex is off. *)
+          List.iter (fun (block, height) ->
+            txospender_disconnect_if_enabled state ~block ~height
+          ) (List.rev !disconnected);
           Storage.ChainDB.batch_write state.db batch;
           (* Clear sig cache: stale validation results from the
              disconnected segment must not leak forward. *)
@@ -6009,6 +6043,10 @@ let disconnect_to_target_via_utxo ?(from_validated_tip = false)
      | Ok _ ->
        (* tip-first disconnect order. *)
        let to_disconnect = collect_path state target current_tip in
+       let disconnected = ref [] in
+       (* Every live-view key the loop touches, newest first, so a failure
+          on a deeper block can put the view back as it was. *)
+       let saved = ref [] in
        let rec disconnect = function
          | [] -> Ok ()
          | (entry : header_entry) :: rest ->
@@ -6040,35 +6078,68 @@ let disconnect_to_target_via_utxo ?(from_validated_tip = false)
                    [OptimizedUtxoSet.add]. *)
                 List.iter (function
                   | Disc_del (txid, vout) ->
+                    saved := Utxo.OptimizedUtxoSet.save_key utxo txid vout
+                             :: !saved;
                     Utxo.OptimizedUtxoSet.remove_fast utxo txid vout
                   | Disc_put (txid, vout, e) ->
+                    saved := Utxo.OptimizedUtxoSet.save_key utxo txid vout
+                             :: !saved;
                     let unclean =
                       Utxo.OptimizedUtxoSet.exists utxo txid vout in
                     Utxo.OptimizedUtxoSet.add ~possible_overwrite:unclean
                       utxo txid vout e
                 ) ops;
-                Storage.ChainDB.delete_undo_data state.db entry.hash;
-                (* Tx-output spender index erase on the invalidateblock /
-                   UTXO-aware disconnect path. RE-DERIVES this block's spend
-                   keys and erases them, mirroring Core's
-                   [TxoSpenderIndex::CustomRemove] following
-                   [InvalidateBlock] -> [DisconnectTip]. No-op when
-                   --txospenderindex is off. *)
-                txospender_disconnect_if_enabled state ~block
-                  ~height:entry.height;
-                (match on_disconnected with
-                 | Some f -> f block entry.height
-                 | None -> ());
+                disconnected := (block, entry) :: !disconnected;
                 disconnect rest)
        in
-       (match disconnect (List.rev to_disconnect) with
-        | Error _ as e -> e
+       (* Nothing is committed before the loop finishes and the tip has not
+          moved: on failure drop the partial rollback from the live view,
+          or the next flush would persist it under the old tip (audit
+          H13).  A corrupt undo record raises from the deserialiser rather
+          than returning Error. *)
+       let result =
+         try disconnect (List.rev to_disconnect)
+         with ex ->
+           Utxo.OptimizedUtxoSet.restore_saved utxo !saved;
+           raise ex
+       in
+       (match result with
+        | Error _ as e ->
+          Utxo.OptimizedUtxoSet.restore_saved utxo !saved;
+          e
         | Ok () ->
+          let disconnected = List.rev !disconnected in   (* tip-first *)
+          (* Tx-output spender index erase on the invalidateblock /
+             UTXO-aware disconnect path. RE-DERIVES each block's spend
+             keys and erases them, mirroring Core's
+             [TxoSpenderIndex::CustomRemove] following
+             [InvalidateBlock] -> [DisconnectTip]. Only once every block
+             disconnected: a failed disconnect leaves the chain where it
+             was. No-op when --txospenderindex is off. *)
+          List.iter (fun (block, (entry : header_entry)) ->
+            txospender_disconnect_if_enabled state ~block
+              ~height:entry.height;
+            (match on_disconnected with
+             | Some f -> f block entry.height
+             | None -> ())
+          ) disconnected;
           (* Commit the rolled-back UTXO delta + the new (lower) tip to BOTH
              stores atomically. *)
           Utxo.OptimizedUtxoSet.persist_dirty_atomic utxo
             ~tip_hash:target.hash ~tip_height:target.height
             ~header_tip_hash:target.hash ~header_tip_height:target.height;
+          (* Only now is the disconnected blocks' undo stale.  Deleting it
+             inside the loop left still-connected blocks without undo when
+             a deeper block failed or the process died before the commit
+             (audit H13).  A crash between the commit above and this
+             delete only leaves stale undo for blocks off the active
+             chain, which a later reconnect overwrites (Core's
+             DisconnectTip never erases undo at all). *)
+          let undo_batch = Storage.ChainDB.batch_create () in
+          List.iter (fun (_, (entry : header_entry)) ->
+            Storage.ChainDB.batch_delete_undo_data undo_batch entry.hash
+          ) disconnected;
+          Storage.ChainDB.batch_write state.db undo_batch;
           Validation.cache_clear_global ();
           coinstats_rewind_if_enabled state ~target_height:target.height;
           state.tip <- Some target;
@@ -6200,7 +6271,10 @@ let reconcile_rdb_to_chain_tip (state : chain_state)
          created Y); applying N+1 after N+2 yields the correct "Y absent at
          chain_tip" result.  Without the rev, N+2's restore would win and leak
          a phantom Y into the rolled-back set. *)
-      Rocksdb_store.batch_write ~tip_height:target_height rocksdb
+      let head =
+        Option.map (fun h -> (h, h))
+          (Storage.ChainDB.get_hash_at_height state.db target_height) in
+      Rocksdb_store.batch_write ~tip_height:target_height ?head rocksdb
         (List.rev !rdb_ops);
       (* Mirror into the CF utxo column so a CF-side reader sees the same
          rolled-back set. *)
@@ -7039,6 +7113,7 @@ let mark_block_failed (state : chain_state) (failed : header_entry) : int =
 let connect_block_into_batch
     ?(skip_pow = false)
     ?(on_invalid : (Validation.block_validation_error -> unit) option)
+    ?(undo_sink : (Types.hash256 * string) list ref option)
     (ibd : ibd_state) (batch : Storage.ChainDB.batch)
     (view : reorg_view)
     (entry : header_entry)
@@ -7194,8 +7269,11 @@ let connect_block_into_batch
        let undo : Utxo.undo_data = { height; tx_undos } in
        let uw = Serialize.writer_create () in
        Utxo.serialize_undo_data uw undo;
-       Storage.ChainDB.batch_store_undo_data batch entry.hash
-         (Serialize.writer_to_string uw);
+       let undo_bytes = Serialize.writer_to_string uw in
+       Storage.ChainDB.batch_store_undo_data batch entry.hash undo_bytes;
+       (match undo_sink with
+        | Some r -> r := (entry.hash, undo_bytes) :: !r
+        | None -> ());
        (* BIP-157 filter index append for the reorg-connect path. We
           flatten [tx_undos] into a single list of (outpoint, entry)
           pairs so [append_filter_if_enabled_from_entries] can extract
@@ -7302,7 +7380,7 @@ let connect_block_into_batch
    path has its own [flush_utxos] commit that still uses those
    lists (forward-only path, no put/delete collisions, no view). *)
 let stage_pending_utxos_into_batch
-    ?(tip_height : int option)
+    ?(tip : (Types.hash256 * int) option)
     (ibd : ibd_state) (batch : Storage.ChainDB.batch)
     (view : reorg_view) : unit =
   let decode_key (k : string) : Types.hash256 * int =
@@ -7345,10 +7423,10 @@ let stage_pending_utxos_into_batch
      reads).  Core has one coin view (CoinsTip); DisconnectBlock and
      ConnectBlock both write through it (validation.cpp ActivateBestChainStep
      -> DisconnectTip / ConnectTip -> view.Flush()). *)
-  (match tip_height with
-   | Some th ->
+  (match tip with
+   | Some (tip_hash, tip_height) ->
      Storage.ChainDB.batch_apply_utxo_rocksdb ibd.chain.db
-       ~tip_height:th !rdb_puts !rdb_dels
+       ~tip_height ~tip_hash !rdb_puts !rdb_dels
    | None -> ());
   (match reorg_utxo_set ibd with
    | Some u ->
@@ -7735,7 +7813,8 @@ let reorganize ?(allow_equal_work = false)
         (match reorg_utxo_set ibd with
          | Some u when Utxo.OptimizedUtxoSet.dirty_count u > 0 ->
            Fatal.run_write ~what:"pre-reorg UTXO flush" (fun () ->
-             Utxo.OptimizedUtxoSet.flush ~tip_height:current_tip.height u)
+             Utxo.OptimizedUtxoSet.flush
+               ~tip:(current_tip.hash, current_tip.height) u)
          | _ -> ());
         let to_disconnect = collect_path state fork_point current_tip in
         let to_connect = collect_path state fork_point new_tip in
@@ -7799,6 +7878,7 @@ let reorganize ?(allow_equal_work = false)
           (* Connect side: iterate fork-forward-to-new-tip. *)
           let connect_error = ref None in
           let connected_blocks = ref [] in
+          let connected_undo = ref [] in
           (* The entry whose connect returned a consensus VERDICT (not a
              mutation, not a missing body / ancestry-incomplete / DB miss,
              which come back as Error without [on_invalid] firing). *)
@@ -7809,7 +7889,7 @@ let reorganize ?(allow_equal_work = false)
              completed check.  Drop the staged delta and re-raise. *)
           (try List.iter (fun (entry : header_entry) ->
             if !connect_error = None then
-              match connect_block_into_batch
+              match connect_block_into_batch ~undo_sink:connected_undo
                       ~on_invalid:(fun e ->
                         (* TxMissingInputs is not marked here: the reorg
                            resolves inputs through the disconnect overlay,
@@ -7853,8 +7933,23 @@ let reorganize ?(allow_equal_work = false)
                The [view] is the source of truth (it correctly
                resolves put/delete collisions across the reorg's
                disconnect+connect halves). *)
-            stage_pending_utxos_into_batch ~tip_height:new_tip.height
-              ibd batch view;
+            (* The new branch's undo data goes to disk BEFORE the coins
+               (audit H12).  The coins commit to rocksdb_utxo first and the
+               chainstate batch (tip, height index, undo) second; if the
+               process dies between them, boot rolls the chainstate forward
+               to the new branch ([Chainstate_heads.recover_on_boot]), and
+               that branch must still be disconnectable later.  Undo is keyed
+               by block hash, so an orphaned record from a crash before the
+               coins commit is harmless: the connect path rewrites it. *)
+            if !connected_undo <> [] then begin
+              let ub = Storage.ChainDB.batch_create () in
+              List.iter (fun (h, u) ->
+                Storage.ChainDB.batch_store_undo_data ub h u) !connected_undo;
+              Fatal.run_write ~what:"reorg undo pre-commit" (fun () ->
+                Storage.ChainDB.batch_write state.db ub)
+            end;
+            stage_pending_utxos_into_batch
+              ~tip:(new_tip.hash, new_tip.height) ibd batch view;
             (* Update the active-chain height->hash index so getblockhash /
                getbestblockhash (both read the height->hash CF via
                get_hash_at_height / block_tip) reflect the new chain.
@@ -8472,13 +8567,16 @@ let run_ibd ?(shutdown_flag : bool ref option)
         let%lwt () = Lwt_unix.sleep 0.25 in
         loop ()
       end else begin
-      (* Flush any remaining UTXO updates *)
-      flush_utxos ibd;
+      (* Flush any remaining UTXO updates, with the chain tip *)
+      let tip_entry = get_header_at_height ibd.chain ibd.chain.blocks_synced in
+      flush_utxos
+        ?tip:(Option.map (fun (e : header_entry) -> (e.hash, e.height)) tip_entry)
+        ibd;
       (match !unflushed_catchup with
        | Some i when i == ibd -> unflushed_catchup := None
        | _ -> ());
       (* Update chain tip *)
-      (match get_header_at_height ibd.chain ibd.chain.blocks_synced with
+      (match tip_entry with
        | Some entry ->
          Storage.ChainDB.set_chain_tip ibd.chain.db entry.hash entry.height
        | None -> ());

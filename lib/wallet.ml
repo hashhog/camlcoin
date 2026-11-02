@@ -2865,8 +2865,13 @@ let addr_type_of_string = function
    SIGKILL / OOM / power loss could leave half-written and unparseable. *)
 let atomic_write_file (path : string) (contents : string) : unit =
   let tmp = path ^ ".tmp" in
-  (let oc = open_out_bin tmp in
+  (* 0600 whatever the umask: the contents hold plaintext private keys.
+     fchmod too, because O_CREAT keeps the mode of a stale [.tmp] an older
+     build left behind, and the rename would carry that mode onto [path]. *)
+  (let oc = open_out_gen [Open_wronly; Open_creat; Open_trunc; Open_binary]
+       0o600 tmp in
    Fun.protect ~finally:(fun () -> close_out_noerr oc) (fun () ->
+     Unix.fchmod (Unix.descr_of_out_channel oc) 0o600;
      output_string oc contents;
      flush oc;
      (try Unix.fsync (Unix.descr_of_out_channel oc)
@@ -3993,7 +3998,7 @@ type wallet_manager = {
 (* Create a new wallet manager *)
 let create_wallet_manager ~(wallets_dir : string) ~(network : [`Mainnet | `Testnet | `Regtest]) : wallet_manager =
   if not (Sys.file_exists wallets_dir) then
-    Unix.mkdir wallets_dir 0o755;
+    Unix.mkdir wallets_dir 0o700;
   { wallets = Hashtbl.create 16;
     wallets_dir;
     network }
@@ -4139,7 +4144,7 @@ let restore_wallet (wm : wallet_manager) ~(name : string) ~(backup_file : string
     else begin
       (try
          if not (Sys.file_exists wm.wallets_dir) then
-           Unix.mkdir wm.wallets_dir 0o755
+           Unix.mkdir wm.wallets_dir 0o700
        with _ -> ());
       try
         copy_wallet_file backup_file path;

@@ -244,6 +244,50 @@ let test_via_utxo_error_committed_blocks () =
     Alcotest.check coins "Rocksdb_store unchanged" disk_before
       (rdb_snapshot fx.rdb))
 
+(* Consensus edge: one coin touched by TWO blocks of the failed loop.
+     b1: A spends P -> X   (committed)
+     b2: B spends X -> Y   (committed: Y on disk)
+     b3: C spends Y -> Z   (NOT committed: Y is a pending delete)
+     b4: cb4               (NOT committed)
+   Disconnecting b3 restores Y, disconnecting b2 deletes it again, then b1
+   fails.  Y must end as it was, SPENT: restoring the newer saved state
+   last would resurrect it and let a block double-spend it. *)
+let test_via_utxo_key_touched_twice () =
+  with_fixture "h13_twice" (fun fx ->
+    let txa = spend_tx ~prev_txid:p_txid ~tag:0xa1 ~value:900_000_000L in
+    let x_id = Crypto.compute_txid txa in
+    let txb = spend_tx ~prev_txid:x_id ~tag:0xb1 ~value:800_000_000L in
+    let y_id = Crypto.compute_txid txb in
+    let txc = spend_tx ~prev_txid:y_id ~tag:0xd1 ~value:700_000_000L in
+    let z_id = Crypto.compute_txid txc in
+    let b1 = connect fx ~parent:fx.genesis ~nonce:1
+        ~txs:[coinbase_tx ~height:1 ~tag:0xc1; txa] ~commit:true in
+    let b2 = connect fx ~parent:b1 ~nonce:2
+        ~txs:[coinbase_tx ~height:2 ~tag:0xc2; txb] ~commit:true in
+    let b3 = connect fx ~parent:b2 ~nonce:3
+        ~txs:[coinbase_tx ~height:3 ~tag:0xc3; txc] ~commit:false in
+    let b4 = connect fx ~parent:b3 ~nonce:4
+        ~txs:[coinbase_tx ~height:4 ~tag:0xc4] ~commit:false in
+    let view_before = committed_view fx.utxo in
+    let _ = take_undo fx.db b1 in
+    (match Sync.disconnect_to_target_via_utxo fx.chain fx.utxo fx.genesis with
+     | Ok () -> Alcotest.fail "disconnect must fail: b1 has no undo"
+     | Error _ -> ());
+    Alcotest.(check bool) "Y still spent" true
+      (Utxo.OptimizedUtxoSet.get fx.utxo y_id 0 = None);
+    Alcotest.(check bool) "X still spent" true
+      (Utxo.OptimizedUtxoSet.get fx.utxo x_id 0 = None);
+    Alcotest.(check bool) "Z still unspent" true
+      (Utxo.OptimizedUtxoSet.get fx.utxo z_id 0 <> None);
+    Alcotest.check coins "live coin view == pre-call view" view_before
+      (committed_view fx.utxo);
+    persist fx.utxo ~hash:b4.hash ~height:4;
+    Alcotest.(check bool) "Y not on disk after the next flush" true
+      (Rocksdb_store.get fx.rdb (Storage.ChainDB.rocksdb_utxo_key y_id 0)
+       = None);
+    Alcotest.check coins "flushed Rocksdb_store == pre-call view"
+      view_before (rdb_snapshot fx.rdb))
+
 (* DB-direct primitive (invalidateblock without a UTXO set, dumptxoutset
    rollback). *)
 let test_db_direct_error_keeps_undo () =
@@ -396,6 +440,8 @@ let () =
         test_via_utxo_error_changes_nothing;
       Alcotest.test_case "via_utxo: failed disconnect over flushed blocks"
         `Quick test_via_utxo_error_committed_blocks;
+      Alcotest.test_case "via_utxo: coin touched twice stays spent" `Quick
+        test_via_utxo_key_touched_twice;
       Alcotest.test_case "db-direct: failed disconnect keeps undo" `Quick
         test_db_direct_error_keeps_undo;
       Alcotest.test_case "control: clean disconnect drops undo" `Quick

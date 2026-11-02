@@ -3358,6 +3358,11 @@ let handle_getnewaddress (ctx : rpc_context)
        Guard BEFORE deriving so a watch-only wallet never stores a key. *)
     if not (Wallet.can_get_addresses wallet) then
       Error (rpc_wallet_error, "Error: This wallet has no available keys")
+    (* A locked encrypted wallet cannot encrypt a new key, so the key could
+       not be saved: Core's answer when a locked wallet's keypool is empty,
+       RPC_WALLET_KEYPOOL_RAN_OUT (-12). *)
+    else if Wallet.has_key_crypto wallet && Wallet.is_locked wallet then
+      Error ((-12) (* RPC_WALLET_KEYPOOL_RAN_OUT *), Wallet.keypool_ran_out_msg)
     else begin
       (* Core getnewaddress( "label", "address_type" ): the OPTIONAL 2nd
          positional arg selects the output type (rpc/addresses.cpp
@@ -3659,6 +3664,17 @@ let fallbackfee_disabled_msg =
   "Fee estimation failed. Fallbackfee is disabled. \
    Wait a few blocks or enable -fallbackfee."
 
+(* The change key for fundrawtransaction / walletcreatefundedpsbt.  Core's
+   FundTransaction does not ask for the passphrase: a locked wallet funds a
+   changeless transaction, and when it needs a change key it cannot make,
+   CreateTransactionInternal (wallet/spend.cpp) fails RPC_WALLET_ERROR with
+   this message followed by the keypool error. *)
+let funding_change_key (wallet : Wallet.t) : Wallet.keypair =
+  try Wallet.generate_change_key wallet
+  with Failure m when m = Wallet.keypool_ran_out_msg ->
+    failwith ("Transaction needs a change address, but we can't generate \
+               it. " ^ m)
+
 (* Core wallet/wallet.h DEFAULT_TRANSACTION_MINFEE (-mintxfee), sat/kvB.
    camlcoin has no -mintxfee, so the default always applies. *)
 let wallet_min_fee_sat_per_kvb = 1000L
@@ -3704,6 +3720,11 @@ let handle_sendtoaddress (ctx : rpc_context)
          | Ok addr when addr.Address.network <> network ->
            Error (rpc_invalid_address, "Invalid Bitcoin address: " ^ address)
          | Ok _ ->
+           (* Core sendtoaddress: EnsureWalletIsUnlocked before the fee
+              estimate and the change key (wallet/rpc/spend.cpp) *)
+           if Wallet.has_key_crypto wallet && Wallet.is_locked wallet then
+             Error ((-13) (* RPC_WALLET_UNLOCK_NEEDED *), Wallet.wallet_locked_msg)
+           else
            match wallet_fee_rate ctx target with
            | Error m -> Error (rpc_insufficient_funds, m)
            | Ok fee_rate ->
@@ -3718,6 +3739,7 @@ let handle_sendtoaddress (ctx : rpc_context)
                if String.length e >= 18
                   && String.sub e 0 18 = "Insufficient funds"
                then rpc_insufficient_funds
+               else if e = Wallet.wallet_locked_msg then (-13) (* RPC_WALLET_UNLOCK_NEEDED *)
                else rpc_wallet_error
              in
              Error (code, e)
@@ -3855,6 +3877,7 @@ let handle_send (ctx : rpc_context)
             if String.length e >= 18
                && String.sub e 0 18 = "Insufficient funds"
             then rpc_insufficient_funds
+            else if e = Wallet.wallet_locked_msg then (-13) (* RPC_WALLET_UNLOCK_NEEDED *)
             else rpc_wallet_error
           in
           Error (code, e)
@@ -4568,6 +4591,15 @@ let handle_getwalletinfo (ctx : rpc_context)
      - walletlock
          Immediately re-locks an unlocked wallet. *)
 
+(* The wallet the request names: /wallet/<name> is already resolved into
+   [ctx.wallet] by [context_with_wallet], as for every other wallet RPC.
+   These three used to ask the manager for the default wallet instead, so
+   encryptwallet sent to /wallet/w1 encrypted a different wallet. *)
+let encryption_wallet (ctx : rpc_context) : (Wallet.t, string) result =
+  match ctx.wallet with
+  | Some w -> Ok w
+  | None -> get_wallet_for_request ctx None
+
 (* encryptwallet "passphrase" *)
 let handle_encryptwallet (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
@@ -4576,7 +4608,7 @@ let handle_encryptwallet (ctx : rpc_context)
     if String.length passphrase = 0 then
       Error "passphrase can not be empty"
     else begin
-      match get_wallet_for_request ctx None with
+      match encryption_wallet ctx with
       | Error e -> Error e
       | Ok wallet ->
         if Wallet.is_encrypted wallet then
@@ -4615,7 +4647,7 @@ let handle_walletpassphrase (ctx : rpc_context)
     else begin
       (* Core caps the unlock timeout at 100,000,000 seconds. *)
       let timeout = min timeout 100_000_000.0 in
-      match get_wallet_for_request ctx None with
+      match encryption_wallet ctx with
       | Error e -> Error e
       | Ok wallet ->
         if not (Wallet.is_encrypted wallet) then
@@ -4650,7 +4682,7 @@ let handle_walletpassphrase (ctx : rpc_context)
 (* walletlock *)
 let handle_walletlock (ctx : rpc_context)
     (_params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
-  match get_wallet_for_request ctx None with
+  match encryption_wallet ctx with
   | Error e -> Error e
   | Ok wallet ->
     if not (Wallet.is_encrypted wallet) then
@@ -9473,7 +9505,7 @@ let handle_walletcreatefundedpsbt (ctx : rpc_context)
                  Address.address_to_script a
                | _ -> failwith (Printf.sprintf "Invalid changeAddress: %s" addr_str))
             | None ->
-              let kp = Wallet.generate_change_key wallet in
+              let kp = funding_change_key wallet in
               let dest_script = match outputs with
                 | first :: _ -> first.Types.script_pubkey
                 | [] -> Cstruct.empty
@@ -9737,7 +9769,7 @@ let handle_fundrawtransaction (ctx : rpc_context)
                   | _ -> failwith
                       (Printf.sprintf "Change address must be a valid bitcoin address: %s" addr_str))
                | None ->
-                 let kp = Wallet.generate_change_key wallet in
+                 let kp = funding_change_key wallet in
                  let dest_script = match existing_outputs with
                    | first :: _ -> first.Types.script_pubkey
                    | [] -> Cstruct.empty
@@ -16853,7 +16885,14 @@ let handle_single_request (ctx : rpc_context) (json : Yojson.Safe.t)
        | None -> `Null)
     | _ -> `Null
   in
-  match dispatch_rpc ctx method_name params with
+  (* Wallet.refuse_mint_if_locked raises from any path that would mint a
+     key on a locked encrypted wallet (generate, a change key in
+     fundrawtransaction / walletcreatefundedpsbt, ...): Core's -12. *)
+  match
+    (try dispatch_rpc ctx method_name params
+     with Failure m when m = Wallet.keypool_ran_out_msg ->
+       Error ((-12) (* RPC_WALLET_KEYPOOL_RAN_OUT *), m))
+  with
   | Ok r -> json_rpc_response ~id ~result:r
   | Error (code, message) -> json_rpc_error ~id ~code ~message
 

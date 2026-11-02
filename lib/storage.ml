@@ -653,6 +653,18 @@ module ChainDB = struct
      | None -> ()
      | Some r -> Rocksdb_store.delete r (rocksdb_utxo_key txid vout))
 
+  (* The (new, old) pair for [Rocksdb_store]'s head marker: the block the
+     coins are being moved to and the chainstate tip they move away from
+     (zero hash when there is none yet).  Read before the chainstate half
+     of the commit, so [old] is the tip a crash would leave on disk. *)
+  let head_for t (new_hash : Types.hash256) : Types.hash256 * Types.hash256 =
+    let old_hash =
+      match Cf_chainstate.get_chain_state t.cf "tip_hash" with
+      | Some h when String.length h = 32 -> Cstruct.of_string h
+      | _ -> Types.zero_hash
+    in
+    (new_hash, old_hash)
+
   (* Atomically apply a block's UTXO delta and advance both backends' tips.
      CF batch:        UTXO puts + deletes + chain_tip + header_tip
      RocksDB batch:   UTXO puts + deletes + tip_height (via batch_write)
@@ -760,7 +772,9 @@ module ChainDB = struct
        there is no rocksdb_utxo attached is the same no-op as before. *)
     (match t.rocksdb_utxo with
      | None -> ()
-     | Some r -> Rocksdb_store.batch_write ~tip_height r rdb_ops);
+     | Some r ->
+       Rocksdb_store.batch_write ~tip_height ~head:(head_for t tip_hash) r
+         rdb_ops);
     Cf_chainstate.batch_write cf_batch
 
   (* Apply a UTXO delta DIRECTLY to the rocksdb_utxo store (no-op when it is
@@ -778,7 +792,10 @@ module ChainDB = struct
      does on the forward path.  Committed RDB-first (before the caller's CF
      [batch_write]) so the crash window matches [apply_block_atomic]'s SAFE
      direction (RDB ahead, authoritative chain_tip in CF still lower). *)
-  let batch_apply_utxo_rocksdb t ~(tip_height : int)
+  (* [tip_hash] goes into the head marker with [tip_height]; the batch is
+     written even when the delta is empty so the marker always names the
+     tip the caller is about to commit. *)
+  let batch_apply_utxo_rocksdb t ~(tip_height : int) ~(tip_hash : Types.hash256)
       (puts : (Types.hash256 * int * string) list)
       (deletes : (Types.hash256 * int) list) : unit =
     match t.rocksdb_utxo with
@@ -791,7 +808,44 @@ module ChainDB = struct
           (List.rev_map (fun (txid, vout) ->
              (rocksdb_utxo_key txid vout, None)) deletes)
       in
-      if ops <> [] then Rocksdb_store.batch_write ~tip_height r ops
+      Rocksdb_store.batch_write ~tip_height ~head:(head_for t tip_hash) r ops
+
+  (* Wipe both coin stores: every key of rocksdb_utxo (coins, tip_height,
+     head marker) and the chainstate's UTXO column family.  For a rewind of
+     the chainstate to genesis, which must start from an empty coin set.
+     rocksdb_utxo goes first: if the process dies part-way, the next boot
+     sees no RDB tip under a non-zero chain_tip and rewinds (and wipes)
+     again. *)
+  let wipe_utxo_stores t : int * int =
+    let n_rdb = match t.rocksdb_utxo with
+      | Some r -> Rocksdb_store.clear r
+      | None -> 0 in
+    let n_cf = Cf_chainstate.cf_clear_utxo t.cf in
+    (n_rdb, n_cf)
+
+  (* Replace the chainstate's UTXO column family with a copy of
+     rocksdb_utxo, the coin set block validation reads.  Boot recovery uses
+     it when a commit died after rocksdb_utxo and the blocks in between have
+     no bodies on disk to replay (assumevalid IBD stores none).  Idempotent:
+     a crash part-way leaves the chainstate tip unmoved, so the next boot
+     runs it again.  Returns the number of coins copied. *)
+  let rebuild_utxo_mirror_from_rocksdb t : int =
+    match t.rocksdb_utxo with
+    | None -> 0
+    | Some r ->
+      ignore (Cf_chainstate.cf_clear_utxo t.cf);
+      let n = ref 0 and pending = ref 0 in
+      let b = ref (Cf_chainstate.batch_create t.cf) in
+      Rocksdb_store.iter_utxos r (fun txid vout data ->
+        Cf_chainstate.batch_put_utxo !b txid vout data;
+        incr n; incr pending;
+        if !pending >= 10_000 then begin
+          Cf_chainstate.batch_write !b;
+          b := Cf_chainstate.batch_create t.cf;
+          pending := 0
+        end);
+      if !pending > 0 then Cf_chainstate.batch_write !b;
+      !n
 
   (* Snapshot-import-incomplete marker (chain_state CF).
 

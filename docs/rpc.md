@@ -103,6 +103,10 @@ serves no REST endpoints. REST needs no authentication and binds to `--rpchost` 
 
 Core's `/rest/getutxos` is not implemented.
 
+Request bodies over 32 MiB (Core's limit) get `413` without being read. The BIP-78
+PayJoin receiver at `POST /payjoin` has no authentication, so it is served only with
+`--restpayjoin` (`restpayjoin=1` in the config file); without it the route answers `405`.
+
 ```bash
 camlcoin --network=regtest --datadir="$DATADIR" --rest --restport=18445 --metricsport=0 > "$DATADIR/node.log" 2>&1 &
 sleep 5

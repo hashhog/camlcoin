@@ -1,0 +1,12 @@
+; Crash between the rocksdb_utxo commit and the chainstate commit must boot
+; to a consistent tip (item fix-camlcoin-sec-h11, audit H11 + H12). Own
+; directory so the shared test/dune names list is untouched. The crashed
+; datadirs come from a forked child running the library's own IBD flush and
+; reorg paths up to a SIGKILL; every check then boots the real CLI
+; (bin/main.exe) on them, so the recovery under test is the one an operator
+; gets at startup.
+(test
+ (name test_two_db_commit_marker)
+ (deps ../../bin/main.exe)
+ (libraries camlcoin test_tmp alcotest cstruct lwt lwt.unix unix base64
+            yojson))

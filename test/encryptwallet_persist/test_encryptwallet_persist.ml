@@ -432,6 +432,89 @@ let test_node_locked_mint_restart () =
           (k = zero_hex))
       (key_table w))
 
+(* Funding on a locked wallet, in Core's terms.  Core's FundTransaction and
+   send never call EnsureWalletIsUnlocked: a locked fund that needs no change
+   output returns the funded transaction (wallet_fundrawtransaction.py
+   test_locked_wallet asserts changepos -1), one that needs a change key
+   fails -4 "Transaction needs a change address, but we can't generate it."
+   (wallet/spend.cpp CreateTransactionInternal), and a locked send with no
+   fee estimate and -fallbackfee off fails -4 on the fee before anything
+   about the lock.  None of them may add a key to the file. *)
+let test_node_locked_funding () =
+  Test_tmp.with_dir ~label:"ewp_node_fund" ~mkdir:true (fun root ->
+    let datadir = Filename.concat root "node" in
+    let w1 = "/wallet/w1" in
+    let wfile = Filename.concat datadir "wallets/w1" in
+    let n_keys_in_file () =
+      match Yojson.Safe.from_string (read_file wfile) with
+      | `Assoc l ->
+        (match List.assoc_opt "keys" l with
+         | Some (`List ks) -> List.length ks | _ -> 0)
+      | _ -> 0 in
+    let error_message r =
+      match field "message" (field "error" r) with `String m -> m | _ -> "" in
+    let change_msg =
+      "Transaction needs a change address, but we can't generate it." in
+    let starts_with ~prefix s =
+      String.length s >= String.length prefix
+      && String.sub s 0 (String.length prefix) = prefix in
+    let open Lwt.Syntax in
+    with_node root datadir ~run:1 (fun rpc ->
+      let* r = rpc "createwallet" [`String "w1"] in
+      ignore (result_ok "createwallet" r);
+      let* r = rpc ~path:w1 "getnewaddress" [] in
+      let addr = match result_ok "getnewaddress" r with
+        | `String a -> a | _ -> failwith "getnewaddress: no address" in
+      (* one mature 50 BTC coinbase *)
+      let* r = rpc "generatetoaddress" [`Int 101; `String addr] in
+      ignore (result_ok "generatetoaddress" r);
+      let* r = rpc ~path:w1 "encryptwallet" [`String "s3cret"] in
+      ignore (result_ok "encryptwallet" r);
+      let* r = rpc ~path:w1 "walletlock" [] in
+      ignore (result_ok "walletlock" r);
+      let n_keys = n_keys_in_file () in
+      Alcotest.(check bool) "instrument: the wallet file lists keys" true
+        (n_keys > 0);
+      let fee = `Assoc ["fee_rate", `Int 1] in
+      (* 1 BTC out of a 50 BTC coin: needs a change key *)
+      let* r = rpc ~path:w1 "createrawtransaction"
+          [`List []; `Assoc [addr, `Float 1.0]] in
+      let raw = result_ok "createrawtransaction" r in
+      let* r = rpc ~path:w1 "fundrawtransaction" [raw; fee] in
+      Alcotest.(check int) "locked fundrawtransaction needing change (-4)"
+        (-4) (error_code r);
+      Alcotest.(check bool)
+        ("fundrawtransaction: Core's change message, got: "
+         ^ error_message r) true
+        (starts_with ~prefix:change_msg (error_message r));
+      let* r = rpc ~path:w1 "walletcreatefundedpsbt"
+          [`List []; `List [`Assoc [addr, `Float 1.0]]; `Int 0; fee] in
+      Alcotest.(check int) "locked walletcreatefundedpsbt needing change (-4)"
+        (-4) (error_code r);
+      Alcotest.(check bool)
+        ("walletcreatefundedpsbt: Core's change message, got: "
+         ^ error_message r) true
+        (starts_with ~prefix:change_msg (error_message r));
+      (* all but 600 sat of the coin: the leftover after a 1 sat/vB fee is
+         dust, so no change output and no key are needed *)
+      let* r = rpc ~path:w1 "createrawtransaction"
+          [`List []; `Assoc [addr, `Float 49.999994]] in
+      let raw = result_ok "createrawtransaction" r in
+      let* r = rpc ~path:w1 "fundrawtransaction" [raw; fee] in
+      let funded = result_ok "locked changeless fundrawtransaction" r in
+      Alcotest.(check string) "changeless fund: changepos -1" "-1"
+        (Yojson.Safe.to_string (field "changepos" funded));
+      (* send, no estimate, -fallbackfee off: the fee fails first *)
+      let* r = rpc ~path:w1 "send" [`List [`Assoc [addr, `Float 1.0]]] in
+      Alcotest.(check int) "locked send without a fee: -4 on the fee" (-4)
+        (error_code r);
+      Alcotest.(check bool)
+        ("locked send: fee estimation message, got: " ^ error_message r) true
+        (starts_with ~prefix:"Fee estimation failed" (error_message r));
+      Alcotest.(check int) "no key added by the locked calls" n_keys
+        (n_keys_in_file ());
+      Lwt.return_unit))
+
 let () =
   Alcotest.run "encryptwallet_persist" [
     "library", [
@@ -453,5 +536,7 @@ let () =
         test_node_restart;
       Alcotest.test_case "locked generate refused across a restart" `Slow
         test_node_locked_mint_restart;
+      Alcotest.test_case "locked funding: Core's -4, no key" `Slow
+        test_node_locked_funding;
     ];
   ]

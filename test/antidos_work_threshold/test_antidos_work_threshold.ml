@@ -380,6 +380,97 @@ let test_batch_reaching_threshold_stored () =
     (header_known f.node (hash_of (List.nth fork (List.length fork - 1))));
   Alcotest.(check int) "tip unchanged" chain_len (block_count f.node)
 
+(* Warden review of #45, point 1: a valid fork header off height 10
+   followed by a header that links to it but whose hash does not meet its
+   own (much harder) nBits.  The batch's CLAIMED work is huge, but Core runs
+   CheckHeadersPoW before the anti-DoS threshold and stores nothing from a
+   batch that fails it; the valid first header must not get in on the
+   second header's unearned claim. *)
+let test_bad_pow_tail_stores_nothing () =
+  let f = Lazy.force fixture in
+  let a = List.hd (fork_blocks f ~fork:10 ~n:1 ~tag:6) in
+  let bad =
+    { a.Types.header with
+      Types.prev_block = hash_of a;
+      timestamp = Int32.add a.Types.header.Types.timestamp 600l;
+      bits = 0x1d00ffffl; nonce = 0l } in
+  Alcotest.(check bool) "control: second header really fails its own target"
+    false (Consensus.hash_meets_target (Crypto.compute_block_hash bad) bad.bits);
+  let fd = connect_peer f.node in
+  send fd (P2p.HeadersMsg [ a.Types.header; bad ]);
+  ignore (collect fd 2.0);
+  Unix.close fd;
+  Alcotest.(check bool) "fork header before a bad-PoW header not stored" false
+    (header_known f.node (hash_of a));
+  Alcotest.(check bool) "bad-PoW header not stored" false
+    (header_known f.node (Crypto.compute_block_hash bad));
+  Alcotest.(check int) "tip unchanged" chain_len (block_count f.node)
+
+(* Warden review of #45, point 2: a fork header off height 10 followed by
+   the node's own (known) tip header.  The batch does not link, so it is
+   not the already-validated-work case: nothing from it may be stored. *)
+let test_known_last_header_does_not_skip_gate () =
+  let f = Lazy.force fixture in
+  let a = List.hd (fork_blocks f ~fork:10 ~n:1 ~tag:7) in
+  let tip = f.main.(chain_len - 1) in
+  Alcotest.(check bool) "control: last header is known" true
+    (header_known f.node (hash_of tip));
+  let fd = connect_peer f.node in
+  send fd (P2p.HeadersMsg [ a.Types.header; tip.Types.header ]);
+  ignore (collect fd 2.0);
+  Unix.close fd;
+  Alcotest.(check bool) "fork header before a known tip header not stored"
+    false (header_known f.node (hash_of a));
+  Alcotest.(check int) "tip unchanged" chain_len (block_count f.node)
+
+(* [n] blocks on top of main height [fork] where block [bad] (0-based) has a
+   timestamp far below its parent's median time past; every block, the bad
+   one included, meets its own target and links to the one before. *)
+let fork_with_bad_time f ~fork ~n ~tag ~bad =
+  let prev = ref (main_hash f fork, main_time f fork) in
+  List.init n (fun i ->
+    let pt = if i = bad then Int32.sub (snd !prev) 100_000l else snd !prev in
+    let b = build_block ~tag ~prev_hash:(fst !prev) ~height:(fork + i + 1)
+        ~prev_time:pt () in
+    prev := (hash_of b, b.Types.header.Types.timestamp);
+    b)
+
+(* The batch as a whole claims enough work (it is the batch of
+   [test_batch_reaching_threshold_stored]) and is continuous with valid
+   PoW, but its second header fails validation (time-too-old).  The one
+   valid header before it is far below the threshold on its own, so it must
+   not be kept on work only the later, rejected headers claimed. *)
+let test_low_work_prefix_of_failing_batch_not_kept () =
+  let f = Lazy.force fixture in
+  let fork = fork_with_bad_time f ~fork:(chain_len - 150) ~n:140 ~tag:8 ~bad:1 in
+  let fd = connect_peer f.node in
+  send fd (headers_msg fork);
+  ignore (collect fd 2.0);
+  Unix.close fd;
+  Alcotest.(check bool) "low-work valid prefix of a failing batch not stored"
+    false (header_known f.node (hash_of (List.hd fork)));
+  Alcotest.(check bool) "invalid header not stored" false
+    (header_known f.node (hash_of (List.nth fork 1)))
+
+(* Control for the case above: the same shape, but the bad header comes
+   late, after a valid prefix that reaches the threshold on its own.  That
+   prefix is kept (Core ProcessNewBlockHeaders keeps the headers accepted
+   before the first invalid one). *)
+let test_threshold_prefix_of_failing_batch_kept () =
+  let f = Lazy.force fixture in
+  let fork = fork_with_bad_time f ~fork:(chain_len - 150) ~n:140 ~tag:9 ~bad:130 in
+  let fd = connect_peer f.node in
+  send fd (headers_msg fork);
+  ignore (collect fd 2.0);
+  Unix.close fd;
+  Alcotest.(check bool) "first header of a threshold-reaching prefix stored"
+    true (header_known f.node (hash_of (List.hd fork)));
+  Alcotest.(check bool) "last valid header stored" true
+    (header_known f.node (hash_of (List.nth fork 129)));
+  Alcotest.(check bool) "invalid header not stored" false
+    (header_known f.node (hash_of (List.nth fork 130)));
+  Alcotest.(check int) "tip unchanged" chain_len (block_count f.node)
+
 (* Consensus positive control: a legitimate higher-work fork (off tip-5,
    eight blocks) still lands.  Its first blocks have less work than the tip,
    so they connect only because the node requested them after the headers
@@ -431,5 +522,13 @@ let () =
           `Slow test_unsolicited_less_work_than_tip_not_written;
         Alcotest.test_case "batch reaching the threshold stored whole" `Slow
           test_batch_reaching_threshold_stored;
+        Alcotest.test_case "bad-PoW tail: nothing from the batch stored" `Slow
+          test_bad_pow_tail_stores_nothing;
+        Alcotest.test_case "known last header does not skip the gate" `Slow
+          test_known_last_header_does_not_skip_gate;
+        Alcotest.test_case "low-work prefix of a failing batch not kept" `Slow
+          test_low_work_prefix_of_failing_batch_not_kept;
+        Alcotest.test_case "threshold-reaching prefix of a failing batch kept"
+          `Slow test_threshold_prefix_of_failing_batch_kept;
         Alcotest.test_case "higher-work reorg still lands" `Slow
           test_higher_work_reorg_lands ] ]

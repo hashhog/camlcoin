@@ -1,0 +1,9 @@
+; encryptwallet persistence (fix-camlcoin-sec-h14). Own directory so the
+; shared test/dune names list is untouched. The node case boots the real CLI
+; (bin/main.exe) on regtest and runs the audit's sequence over RPC:
+; createwallet, getnewaddress, encryptwallet, rescanblockchain, restart.
+(test
+ (name test_encryptwallet_persist)
+ (deps ../../bin/main.exe)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix base64
+            yojson str cohttp-lwt-unix))

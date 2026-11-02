@@ -1,0 +1,5 @@
+; testmempoolaccept argument and decode errors (item batch5-camlcoin-rpc).
+; Own directory so test/dune is untouched.
+(test
+ (name test_tma_param_rows)
+ (libraries camlcoin test_tmp alcotest))

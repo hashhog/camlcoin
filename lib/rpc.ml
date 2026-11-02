@@ -3358,6 +3358,11 @@ let handle_getnewaddress (ctx : rpc_context)
        Guard BEFORE deriving so a watch-only wallet never stores a key. *)
     if not (Wallet.can_get_addresses wallet) then
       Error (rpc_wallet_error, "Error: This wallet has no available keys")
+    (* A locked encrypted wallet cannot encrypt a new key, so the key could
+       not be saved: Core's answer when a locked wallet's keypool is empty,
+       RPC_WALLET_KEYPOOL_RAN_OUT (-12). *)
+    else if Wallet.has_key_crypto wallet && Wallet.is_locked wallet then
+      Error (-12, "Error: Keypool ran out, please call keypoolrefill first")
     else begin
       (* Core getnewaddress( "label", "address_type" ): the OPTIONAL 2nd
          positional arg selects the output type (rpc/addresses.cpp
@@ -4568,6 +4573,15 @@ let handle_getwalletinfo (ctx : rpc_context)
      - walletlock
          Immediately re-locks an unlocked wallet. *)
 
+(* The wallet the request names: /wallet/<name> is already resolved into
+   [ctx.wallet] by [context_with_wallet], as for every other wallet RPC.
+   These three used to ask the manager for the default wallet instead, so
+   encryptwallet sent to /wallet/w1 encrypted a different wallet. *)
+let encryption_wallet (ctx : rpc_context) : (Wallet.t, string) result =
+  match ctx.wallet with
+  | Some w -> Ok w
+  | None -> get_wallet_for_request ctx None
+
 (* encryptwallet "passphrase" *)
 let handle_encryptwallet (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
@@ -4576,7 +4590,7 @@ let handle_encryptwallet (ctx : rpc_context)
     if String.length passphrase = 0 then
       Error "passphrase can not be empty"
     else begin
-      match get_wallet_for_request ctx None with
+      match encryption_wallet ctx with
       | Error e -> Error e
       | Ok wallet ->
         if Wallet.is_encrypted wallet then
@@ -4615,7 +4629,7 @@ let handle_walletpassphrase (ctx : rpc_context)
     else begin
       (* Core caps the unlock timeout at 100,000,000 seconds. *)
       let timeout = min timeout 100_000_000.0 in
-      match get_wallet_for_request ctx None with
+      match encryption_wallet ctx with
       | Error e -> Error e
       | Ok wallet ->
         if not (Wallet.is_encrypted wallet) then
@@ -4650,7 +4664,7 @@ let handle_walletpassphrase (ctx : rpc_context)
 (* walletlock *)
 let handle_walletlock (ctx : rpc_context)
     (_params : Yojson.Safe.t list) : (Yojson.Safe.t, string) result =
-  match get_wallet_for_request ctx None with
+  match encryption_wallet ctx with
   | Error e -> Error e
   | Ok wallet ->
     if not (Wallet.is_encrypted wallet) then

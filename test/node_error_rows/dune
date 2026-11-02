@@ -1,0 +1,5 @@
+; sendrawtransaction of an in-mempool tx and testmempoolaccept maxfeerate
+; (item batch5-camlcoin-node_error). Own directory so test/dune is untouched.
+(test
+ (name test_node_error_rows)
+ (libraries camlcoin test_tmp alcotest))

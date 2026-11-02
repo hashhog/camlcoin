@@ -119,27 +119,91 @@ let test_unlocked_key_survives () =
     check_no_plaintext db_path before;
     ignore (check_reload ~passphrase:"pw1" db_path before))
 
-(* A key minted while locked (a regtest generate, a change key) has no
-   ciphertext: it must never reach disk as plaintext, a lock must not
-   destroy it, and the next unlock encrypts it so it survives a reload. *)
-let test_locked_key_encrypted_at_unlock () =
+(* A key minted while locked (a regtest generate, a change key) could only
+   be saved with no secret and no ciphertext: a restart before the next
+   unlock would load it as a zero key, ismine but unspendable.  So no path
+   may mint one while locked (Core: keypool ran out / unlock needed), and
+   the refusal leaves the wallet and its file unchanged. *)
+let test_locked_mint_refused () =
   Test_tmp.with_dir ~label:"ewp_lockedkey" ~mkdir:true (fun root ->
     let db_path, w, before = encrypted_wallet root in
-    let kp = Wallet.generate_key w in
-    let secret = Wallet.cstruct_to_hex kp.Wallet.private_key in
-    let before =
-      before @ [ (Address.address_to_string kp.Wallet.address, secret) ] in
+    let file_before = read_file db_path in
+    let refused what f =
+      (match f () with
+       | exception Failure _ -> ()
+       | _ -> Alcotest.fail (what ^ ": minted a key while locked"));
+      Alcotest.(check int) (what ^ ": no key added")
+        (List.length before) (List.length w.Wallet.keys) in
+    refused "generate_key" (fun () -> ignore (Wallet.generate_key w));
+    refused "generate_key_typed legacy"
+      (fun () -> ignore (Wallet.generate_key_typed w Wallet.P2PKH));
+    refused "generate_change_key"
+      (fun () -> ignore (Wallet.generate_change_key w));
+    refused "get_new_address" (fun () -> ignore (Wallet.get_new_address w));
+    (match Wallet.create_transaction w
+             ~dest_address:(fst (List.hd before)) ~amount:10_000L
+             ~fee_rate:1.0 () with
+     | Error e ->
+       Alcotest.(check string) "create_transaction: unlock needed"
+         "Error: Please enter the wallet passphrase with walletpassphrase \
+          first." e
+     | Ok _ -> Alcotest.fail "create_transaction while locked");
+    Alcotest.(check int) "create_transaction: no change key added"
+      (List.length before) (List.length w.Wallet.keys);
     Wallet.save w;
-    check_no_plaintext db_path before;
-    Wallet.wallet_lock w;
-    Alcotest.(check string) "lock keeps the unencrypted new key" secret
-      (Wallet.cstruct_to_hex kp.Wallet.private_key);
+    Alcotest.(check string) "a refused mint leaves the file unchanged"
+      file_before (read_file db_path);
+    (* unlocked, minting works again and the key is saved encrypted *)
     ok_or_fail "unlock" (Wallet.wallet_passphrase w ~passphrase:"pw1"
                            ~timeout:60.);
+    ignore (Wallet.generate_key w);
+    let before = key_table w in
     Wallet.wallet_lock w;
     Wallet.save w;
     check_no_plaintext db_path before;
     ignore (check_reload ~passphrase:"pw1" ~wrong:"nope" db_path before))
+
+(* [load] copies the wallet file to [.bak] on every clean load, so a wallet
+   loaded and then encrypted had its plaintext keys beside the encrypted
+   file, and a later unparseable file made [load] restore that copy and
+   drop the encryption.  After encrypt_wallet, no file next to the wallet
+   may hold a plaintext key. *)
+let test_load_encrypt_backup_scrubbed () =
+  Test_tmp.with_dir ~label:"ewp_bak" ~mkdir:true (fun root ->
+    let db_path = Filename.concat root "wallet.json" in
+    let w = Wallet.create ~network:`Regtest ~db_path in
+    Wallet.init_from_mnemonic w mnemonic ();
+    List.iter (fun t -> ignore (Wallet.get_new_address_typed w t))
+      [ Wallet.P2WPKH; Wallet.P2PKH; Wallet.P2SH_P2WPKH; Wallet.P2TR ];
+    Wallet.save w;
+    let before = key_table w in
+    let w = Wallet.load ~network:`Regtest ~db_path in
+    let bak = db_path ^ ".bak" and tmp = db_path ^ ".tmp" in
+    (* instrument: the load wrote a .bak, and it holds the keys in clear *)
+    Alcotest.(check bool) "instrument: load wrote .bak" true
+      (Sys.file_exists bak);
+    Alcotest.(check bool) "instrument: .bak holds a key's hex" true
+      (contains (read_file bak) (snd (List.hd before)));
+    ok_or_fail "encrypt_wallet" (Wallet.encrypt_wallet w ~passphrase:"pw1");
+    List.iter (fun p ->
+        if Sys.file_exists p then begin
+          let data = read_file p in
+          Alcotest.(check bool) (Filename.basename p ^ ": no private_key")
+            false (contains data "\"private_key\"");
+          List.iter (fun (a, k) ->
+              Alcotest.(check bool)
+                (Printf.sprintf "%s: key of %s absent"
+                   (Filename.basename p) a) false (contains data k))
+            before
+        end)
+      [ db_path; bak; tmp ];
+    Alcotest.(check bool) "no .tmp left" false (Sys.file_exists tmp);
+    (* the fallback path: an unparseable wallet file recovers from .bak,
+       which must give back the encrypted wallet, not the plaintext one *)
+    let oc = open_out_bin db_path in
+    output_string oc "{\"truncated"; close_out oc;
+    ignore (check_reload ~passphrase:"pw1" ~wrong:"nope" db_path before);
+    check_no_plaintext db_path before)
 
 let test_passphrase_change_persists () =
   Test_tmp.with_dir ~label:"ewp_change" ~mkdir:true (fun root ->
@@ -290,6 +354,84 @@ let test_node_restart () =
         (Yojson.Safe.to_string (result_ok "verifymessage" r));
       Lwt.return_unit))
 
+(* The locked mint over RPC, with a restart between it and the unlock:
+   a regtest generate on the locked wallet must be refused (-12) and a
+   sendtoaddress, whose change key is minted the same way, must be refused
+   (-13), so nothing reaches disk without a ciphertext.  After the restart
+   the unlocked wallet mints and mines normally, and every key in the file
+   decrypts to a real secret. *)
+let test_node_locked_mint_restart () =
+  Test_tmp.with_dir ~label:"ewp_node_mint" ~mkdir:true (fun root ->
+    let datadir = Filename.concat root "node" in
+    let w1 = "/wallet/w1" in
+    let addr = ref "" in
+    let open Lwt.Syntax in
+    with_node root datadir ~run:1 (fun rpc ->
+      let* r = rpc "createwallet" [`String "w1"] in
+      ignore (result_ok "createwallet" r);
+      let* r = rpc ~path:w1 "getnewaddress" [] in
+      addr := (match result_ok "getnewaddress" r with
+          | `String a -> a | _ -> failwith "getnewaddress: no address");
+      let* r = rpc ~path:w1 "encryptwallet" [`String "s3cret"] in
+      ignore (result_ok "encryptwallet" r);
+      Lwt.return_unit);
+    let wfile = Filename.concat datadir "wallets/w1" in
+    let keys_in_file () =
+      match Yojson.Safe.from_string (read_file wfile) with
+      | `Assoc l ->
+        (match List.assoc_opt "keys" l with Some (`List ks) -> ks | _ -> [])
+      | _ -> [] in
+    let n_keys = List.length (keys_in_file ()) in
+    Alcotest.(check bool) "instrument: the wallet file lists keys" true
+      (n_keys > 0);
+    with_node root datadir ~run:2 (fun rpc ->
+      let* r = rpc "loadwallet" [`String "w1"] in
+      (match field "error" r with
+       | `Null -> ()
+       | _ when error_code r = -35 -> ()
+       | e -> failwith ("loadwallet -> " ^ Yojson.Safe.to_string e));
+      let* r = rpc ~path:w1 "walletlock" [] in
+      ignore (result_ok "walletlock" r);
+      let* r = rpc ~path:w1 "generate" [`Int 1] in
+      Alcotest.(check int) "locked generate refused (-12)" (-12)
+        (error_code r);
+      let* r = rpc ~path:w1 "sendtoaddress" [`String !addr; `Float 0.001] in
+      Alcotest.(check int) "locked sendtoaddress refused (-13)" (-13)
+        (error_code r);
+      Lwt.return_unit);
+    let keys = keys_in_file () in
+    Alcotest.(check int) "no key added by the locked calls" n_keys
+      (List.length keys);
+    List.iter (fun k ->
+        Alcotest.(check bool) "every key on disk has a ciphertext" true
+          (field "crypted_key" k <> `Null))
+      keys;
+    with_node root datadir ~run:3 (fun rpc ->
+      let* r = rpc "loadwallet" [`String "w1"] in
+      (match field "error" r with
+       | `Null -> ()
+       | _ when error_code r = -35 -> ()
+       | e -> failwith ("loadwallet -> " ^ Yojson.Safe.to_string e));
+      let* r = rpc ~path:w1 "walletpassphrase" [`String "s3cret"; `Int 60] in
+      ignore (result_ok "walletpassphrase" r);
+      let* r = rpc ~path:w1 "generate" [`Int 1] in
+      ignore (result_ok "unlocked generate" r);
+      Lwt.return_unit);
+    let keys = keys_in_file () in
+    Alcotest.(check int) "the unlocked generate minted one key" (n_keys + 1)
+      (List.length keys);
+    List.iter (fun k ->
+        Alcotest.(check bool) "every key on disk has a ciphertext" true
+          (field "crypted_key" k <> `Null))
+      keys;
+    let w = Wallet.load ~network:`Regtest ~db_path:wfile in
+    ok_or_fail "walletpassphrase on the file"
+      (Wallet.wallet_passphrase w ~passphrase:"s3cret" ~timeout:60.);
+    List.iter (fun (a, k) ->
+        Alcotest.(check bool) (Printf.sprintf "key of %s decrypts" a) false
+          (k = zero_hex))
+      (key_table w))
+
 let () =
   Alcotest.run "encryptwallet_persist" [
     "library", [
@@ -299,13 +441,17 @@ let () =
         test_locked_save;
       Alcotest.test_case "key made while unlocked survives lock" `Quick
         test_unlocked_key_survives;
-      Alcotest.test_case "key made while locked encrypted at unlock" `Quick
-        test_locked_key_encrypted_at_unlock;
+      Alcotest.test_case "no key minted while locked" `Quick
+        test_locked_mint_refused;
+      Alcotest.test_case "load, encrypt: no plaintext in .bak or .tmp" `Quick
+        test_load_encrypt_backup_scrubbed;
       Alcotest.test_case "walletpassphrasechange persists" `Quick
         test_passphrase_change_persists;
     ];
     "node", [
       Alcotest.test_case "encrypt, rescan, restart, unlock, sign" `Slow
         test_node_restart;
+      Alcotest.test_case "locked generate refused across a restart" `Slow
+        test_node_locked_mint_restart;
     ];
   ]

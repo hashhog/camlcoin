@@ -1,0 +1,21 @@
+; BIP-331 pkgtxns must not reach the mempool without sendpackages negotiation
+; (fix-camlcoin-sec-h8). Own directory so the shared test/dune names list is
+; untouched.
+;
+; test_pkgtxns_gating boots the real CLI (bin/main.exe) on regtest and sends
+; pkgtxns to it as a v1 P2P peer, so the listener under test is the one
+; cli.ml registers. It uses only API master already has: it builds on master
+; and fails there by name.
+(test
+ (name test_pkgtxns_gating)
+ (modules test_pkgtxns_gating)
+ (deps ../../bin/main.exe)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix base64
+            cohttp-lwt-unix yojson))
+
+; The negotiated path the fix adds: the per-peer rate limit and the ATMP gate.
+(test
+ (name test_pkgtxns_gating_negotiated)
+ (modules test_pkgtxns_gating_negotiated)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix)
+ (preprocess (pps lwt_ppx)))

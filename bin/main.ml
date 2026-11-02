@@ -1265,6 +1265,11 @@ let cmd =
    ============================================================================ *)
 
 let () =
+  (* Files and directories we create are private to our user: wallet files
+     hold plaintext private keys.  Core does the same, umask(077) in
+     SetupEnvironment (common/system.cpp), before anything opens the
+     datadir. *)
+  ignore (Unix.umask 0o077);
   (* Tune the OCaml GC for a large-heap server process.
      - minor_heap_size: 4M words (32MB) reduces minor collections during
        block validation which allocates many short-lived Cstruct/string

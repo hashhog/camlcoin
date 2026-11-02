@@ -1963,7 +1963,8 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         if syncing then
           Sync.process_looped_peer_headers chain ~peer_id:peer.Peer.id headers
         else
-          { Sync.looped_result = Sync.process_headers chain headers;
+          (* Anti-DoS work gate on every network batch (audit H5). *)
+          { Sync.looped_result = Sync.process_network_headers chain headers;
             via_lowwork = false; request_more = false }
       in
       let accepted =
@@ -2542,9 +2543,11 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   (* BIP 331: Register a listener for package relay messages.  This handles
      getpkgtxns (peer asks for txs by wtxid) and pkgtxns (peer delivers a
      package for validation).  Sendpackages negotiation is captured in
-     Peer.dispatch_message before this listener fires. *)
+     Peer.dispatch_message before this listener fires; pkgtxns is dropped
+     unless it was negotiated both ways, and otherwise shares the tx
+     listener's per-peer rate limit and [atmp_relay_gate]. *)
   Peer_manager.add_listener peer_manager (fun msg peer ->
-    Package_relay.dispatch mempool msg peer);
+    Package_relay.dispatch ~gate:atmp_relay_gate mempool msg peer);
 
   (* BIP 152: Register a listener for compact block messages.
      A cmpctblock's header is validated first (Compact_relay.on_cmpctblock:

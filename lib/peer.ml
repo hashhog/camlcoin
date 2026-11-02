@@ -305,6 +305,11 @@ type peer = {
   is_manual : bool;                  (* Manually-added peer — never ban, only disconnect *)
   (* BIP-331 package relay: peer announced sendpackages support. *)
   mutable sendpackages_received : bool;
+  (* BIP-331: WE announced sendpackages to this peer.  Package relay is
+     negotiated only when both this and [sendpackages_received] hold.
+     camlcoin does not announce sendpackages, so this stays false and
+     [Package_relay] ignores every pkgtxns (audit 2026-10-31 H8). *)
+  mutable sendpackages_sent : bool;
   mutable pkg_relay_version : int64;
   mutable pkg_max_count : int32;
   mutable pkg_max_weight : int32;
@@ -452,6 +457,7 @@ let make_peer ~(network : Consensus.network_config) ~(addr : string)
     cmpct_version = 0L;
     block_relay_only = false;
     sendpackages_received = false;
+    sendpackages_sent = false;
     pkg_relay_version = 0L;
     pkg_max_count = 0l;
     pkg_max_weight = 0l;

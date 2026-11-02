@@ -671,9 +671,43 @@ let address_of_typed_key ~network addr_type private_key public_key =
   | P2WPKH ->
     Address.of_pubkey ~network Address.P2WPKH public_key
 
+(* Check if wallet is locked *)
+let is_locked (w : t) : bool =
+  match w.encryption.lock_state with
+  | Locked -> true
+  | Unlocked { expires; _ } ->
+    let now = Unix.gettimeofday () in
+    if now >= expires then begin
+      (* Expired, transition to locked state *)
+      w.encryption.lock_state <- Locked;
+      true
+    end else
+      false
+
+(* True for a wallet encrypted by [encrypt_wallet]: it holds an encrypted
+   master key and one ciphertext per key, and that is what [wallet_to_json]
+   writes.  A wallet made by createwallet with a passphrase ([save_encrypted],
+   whole-file encryption) is encrypted but has none of this. *)
+let has_key_crypto (w : t) : bool =
+  Option.is_some w.encryption.encrypted_master_key
+
+(* Core's answers when a locked wallet is asked for a new key or a send. *)
+let keypool_ran_out_msg =
+  "Error: Keypool ran out, please call keypoolrefill first"
+let wallet_locked_msg =
+  "Error: Please enter the wallet passphrase with walletpassphrase first."
+
+(* An [encrypt_wallet] wallet that is locked cannot encrypt a new key, and
+   a key saved with neither its secret nor a ciphertext comes back from a
+   restart as a zero key: ismine, unspendable.  So no key is minted while
+   locked; every mint below goes through this before it touches [w.keys]. *)
+let refuse_mint_if_locked (w : t) : unit =
+  if has_key_crypto w && is_locked w then failwith keypool_ran_out_msg
+
 (* Generate a new keypair with specified address type.
    If master_key is set, derive via appropriate BIP path; otherwise use random. *)
 let generate_key_typed (w : t) (addr_type : address_type) : key_pair =
+  refuse_mint_if_locked w;
   let derivation_fn, get_index, set_index = match addr_type with
     | P2PKH ->
       (derive_bip44_receive, (fun () -> w.bip44_receive_index),
@@ -716,6 +750,7 @@ let generate_key (w : t) : key_pair =
 
 (* Generate a change key with specified address type *)
 let generate_change_key_typed (w : t) (addr_type : address_type) : key_pair =
+  refuse_mint_if_locked w;
   let derivation_fn, get_index, set_index = match addr_type with
     | P2PKH ->
       (derive_bip44_change, (fun () -> w.bip44_change_index),
@@ -867,6 +902,7 @@ let find_by_pubkey_hash (w : t) (pkh : Types.hash160) : key_pair option =
 
 (* Import a private key in WIF format *)
 let import_wif (w : t) ?(addr_type = P2WPKH) (wif : string) : (key_pair, string) result =
+  if has_key_crypto w && is_locked w then Error wallet_locked_msg else
   match Address.wif_decode wif with
   | Error e -> Error e
   | Ok (private_key, _compressed, _network) ->
@@ -2094,6 +2130,8 @@ let create_transaction (w : t) ~(dest_address : string)
     ~(amount : int64) ~(fee_rate : float)
     ?tip_height
     () : (Types.transaction, string) result =
+  (* Core EnsureWalletIsUnlocked: signing and the change key need it *)
+  if has_key_crypto w && is_locked w then Error wallet_locked_msg else
 
   (* Parse destination address *)
   match Address.address_of_string dest_address with
@@ -2194,6 +2232,7 @@ let create_transaction_multi (w : t)
     ~(outputs : (string * int64) list) ~(fee_rate : float)
     ?tip_height
     () : (Types.transaction, string) result =
+  if has_key_crypto w && is_locked w then Error wallet_locked_msg else
 
   (* Calculate total amount needed *)
   let total_amount = List.fold_left (fun acc (_, amt) ->
@@ -2305,6 +2344,7 @@ let create_transaction_multi (w : t)
    and re-signs. *)
 let bump_fee (w : t) ~(txid : Types.hash256) ~(new_fee_rate : float)
     : (Types.transaction, string) result =
+  if has_key_crypto w && is_locked w then Error wallet_locked_msg else
   let txid_hex = cstruct_to_hex txid in
   match Hashtbl.find_opt w.sent_transactions txid_hex with
   | None -> Error "Transaction not found in wallet history"
@@ -2644,19 +2684,6 @@ let aes_256_cbc_decrypt ~(key : Cstruct.t) ~(iv : Cstruct.t) (ciphertext : Cstru
    Wallet Passphrase Lock/Unlock
    ============================================================================ *)
 
-(* Check if wallet is locked *)
-let is_locked (w : t) : bool =
-  match w.encryption.lock_state with
-  | Locked -> true
-  | Unlocked { expires; _ } ->
-    let now = Unix.gettimeofday () in
-    if now >= expires then begin
-      (* Expired, transition to locked state *)
-      w.encryption.lock_state <- Locked;
-      true
-    end else
-      false
-
 (* Check if wallet is encrypted *)
 let is_encrypted (w : t) : bool =
   w.encryption.encrypted
@@ -2689,13 +2716,6 @@ let decrypt_private_key ~(master_key : Cstruct.t) ~(public_key : Cstruct.t)
   match aes_256_cbc_decrypt ~key:master_key ~iv encrypted with
   | Some secret when Cstruct.length secret = 32 -> Some secret
   | Some _ | None -> None
-
-(* True for a wallet encrypted by [encrypt_wallet]: it holds an encrypted
-   master key and one ciphertext per key, and that is what [wallet_to_json]
-   writes.  A wallet made by createwallet with a passphrase ([save_encrypted],
-   whole-file encryption) is encrypted but has none of this. *)
-let has_key_crypto (w : t) : bool =
-  Option.is_some w.encryption.encrypted_master_key
 
 (* Encrypted, but with no per-key material: only [save_encrypted] with the
    passphrase can write it, so a plain save must not. *)
@@ -2746,7 +2766,7 @@ let wallet_passphrase (w : t) ~(passphrase : string) ~(timeout : float)
        | Some master_key ->
          (* Verify the master key by decrypting one private key *)
          (* Check against a key that has a ciphertext: the first key may
-            have none (minted while locked), and "assume valid" would then
+            have none (loaded without one), and "assume valid" would then
             unlock on any passphrase. *)
          let crypted kp =
            Hashtbl.find_opt w.encryption.encrypted_keys
@@ -2793,7 +2813,8 @@ let wallet_passphrase (w : t) ~(passphrase : string) ~(timeout : float)
 let wallet_lock (w : t) : unit =
   (* Clear private keys from memory.  A key with no ciphertext could not be
      restored by the next unlock, so it is encrypted first, and one that
-     still has none (minted while locked) is kept rather than destroyed. *)
+     still has none is kept rather than destroyed (no key is minted while
+     locked: see [refuse_mint_if_locked]). *)
   if w.encryption.encrypted then begin
     encrypt_new_keys w;
     List.iter (fun kp ->
@@ -2891,9 +2912,10 @@ let atomic_write_file (path : string) (contents : string) : unit =
    [last_synced_height] for the startup reconcile. *)
 let wallet_to_json (w : t) : Yojson.Safe.t =
   (* An [encrypt_wallet] wallet writes each key as its public key plus its
-     ciphertext, never the secret (Core WalletBatch::WriteCryptedKey).  A key
-     that has no ciphertext yet was minted while locked: it is written public
-     only, and gets its ciphertext at the next unlock. *)
+     ciphertext, never the secret (Core WalletBatch::WriteCryptedKey).  No
+     key is minted while locked ([refuse_mint_if_locked]), so every key has
+     its ciphertext by the time it is written; one that still has none is
+     written public only, never with its secret. *)
   let crypto = has_key_crypto w in
   if crypto then encrypt_new_keys w;
   let keys_json = List.map (fun kp ->
@@ -3443,6 +3465,23 @@ let save_safe (w : t) : unit =
         m "wallet save failed (state kept in memory): %s"
           (Printexc.to_string exn))
 
+(* [load] copies the wallet file to [db_path.bak] on every clean load, so
+   once the keys are encrypted that copy is the last plaintext one on disk,
+   and the one [load] restores if the wallet file ever fails to parse.
+   Replace it with the encrypted file just written; if that cannot be
+   written, remove it; if neither works, raise.  ([atomic_write_file]
+   leaves no [.tmp] behind on success.) *)
+let scrub_backup (w : t) : unit =
+  let bak = w.db_path ^ ".bak" in
+  if Sys.file_exists bak then
+    try
+      match read_file_opt w.db_path with
+      | Some data -> atomic_write_file bak data
+      | None -> failwith ("cannot read back " ^ w.db_path)
+    with exn ->
+      (try Sys.remove (bak ^ ".tmp") with _ -> ());
+      (try Sys.remove bak with _ -> raise exn)
+
 (* Encrypt the wallet with a passphrase.
    This encrypts all private keys and stores the encrypted master key, then
    writes the ciphertexts and the encrypted master key to disk before the
@@ -3481,7 +3520,7 @@ let encrypt_wallet (w : t) ~(passphrase : string) : (unit, string) result =
     w.encryption.encrypted_master_key <- Some encrypted_master;
     w.encryption.lock_state <- Locked;
 
-    match (if w.db_path <> "" then save w) with
+    match (if w.db_path <> "" then begin save w; scrub_backup w end) with
     | exception exn ->
       Log.err (fun m ->
         m "encryptwallet: could not write the encrypted wallet: %s"
@@ -3492,6 +3531,9 @@ let encrypt_wallet (w : t) ~(passphrase : string) : (unit, string) result =
       w.encryption.encrypted_master_key <- None;
       w.encryption.lock_state <- unencrypted_state;
       Hashtbl.reset w.encryption.encrypted_keys;
+      (* the encrypted file may already be in place (only the backup
+         failed): put back the wallet this call leaves in memory *)
+      if w.db_path <> "" then save_safe w;
       Error "Error: Failed to encrypt the wallet."
     | () ->
       (* Clear unencrypted private keys from memory (for security, replace with zeroes) *)

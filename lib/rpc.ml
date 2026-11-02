@@ -46,6 +46,9 @@ let rpc_invalid_parameter = -8
 let rpc_wallet_not_found = -18
 let rpc_wallet_already_loaded = -35
 let rpc_wallet_already_exists = -36
+(* Core protocol.h: RPC_WALLET_KEYPOOL_RAN_OUT / RPC_WALLET_UNLOCK_NEEDED *)
+let rpc_wallet_keypool_ran_out = -12
+let rpc_wallet_unlock_needed = -13
 (* Core reads every numeric RPC argument through UniValue::getInt<T>()
    (univalue.h), which runs std::from_chars INTO THE DESTINATION WIDTH.  The
    width check therefore lives INSIDE the conversion and fires BEFORE the
@@ -3362,7 +3365,7 @@ let handle_getnewaddress (ctx : rpc_context)
        not be saved: Core's answer when a locked wallet's keypool is empty,
        RPC_WALLET_KEYPOOL_RAN_OUT (-12). *)
     else if Wallet.has_key_crypto wallet && Wallet.is_locked wallet then
-      Error (-12, "Error: Keypool ran out, please call keypoolrefill first")
+      Error (rpc_wallet_keypool_ran_out, Wallet.keypool_ran_out_msg)
     else begin
       (* Core getnewaddress( "label", "address_type" ): the OPTIONAL 2nd
          positional arg selects the output type (rpc/addresses.cpp
@@ -3709,6 +3712,11 @@ let handle_sendtoaddress (ctx : rpc_context)
          | Ok addr when addr.Address.network <> network ->
            Error (rpc_invalid_address, "Invalid Bitcoin address: " ^ address)
          | Ok _ ->
+           (* Core sendtoaddress: EnsureWalletIsUnlocked before the fee
+              estimate and the change key (wallet/rpc/spend.cpp) *)
+           if Wallet.has_key_crypto wallet && Wallet.is_locked wallet then
+             Error (rpc_wallet_unlock_needed, Wallet.wallet_locked_msg)
+           else
            match wallet_fee_rate ctx target with
            | Error m -> Error (rpc_insufficient_funds, m)
            | Ok fee_rate ->
@@ -3723,6 +3731,7 @@ let handle_sendtoaddress (ctx : rpc_context)
                if String.length e >= 18
                   && String.sub e 0 18 = "Insufficient funds"
                then rpc_insufficient_funds
+               else if e = Wallet.wallet_locked_msg then rpc_wallet_unlock_needed
                else rpc_wallet_error
              in
              Error (code, e)
@@ -3860,6 +3869,7 @@ let handle_send (ctx : rpc_context)
             if String.length e >= 18
                && String.sub e 0 18 = "Insufficient funds"
             then rpc_insufficient_funds
+            else if e = Wallet.wallet_locked_msg then rpc_wallet_unlock_needed
             else rpc_wallet_error
           in
           Error (code, e)
@@ -16867,7 +16877,14 @@ let handle_single_request (ctx : rpc_context) (json : Yojson.Safe.t)
        | None -> `Null)
     | _ -> `Null
   in
-  match dispatch_rpc ctx method_name params with
+  (* Wallet.refuse_mint_if_locked raises from any path that would mint a
+     key on a locked encrypted wallet (generate, a change key in
+     fundrawtransaction / walletcreatefundedpsbt, ...): Core's -12. *)
+  match
+    (try dispatch_rpc ctx method_name params
+     with Failure m when m = Wallet.keypool_ran_out_msg ->
+       Error (rpc_wallet_keypool_ran_out, m))
+  with
   | Ok r -> json_rpc_response ~id ~result:r
   | Error (code, message) -> json_rpc_error ~id ~code ~message
 

@@ -3664,6 +3664,17 @@ let fallbackfee_disabled_msg =
   "Fee estimation failed. Fallbackfee is disabled. \
    Wait a few blocks or enable -fallbackfee."
 
+(* The change key for fundrawtransaction / walletcreatefundedpsbt.  Core's
+   FundTransaction does not ask for the passphrase: a locked wallet funds a
+   changeless transaction, and when it needs a change key it cannot make,
+   CreateTransactionInternal (wallet/spend.cpp) fails RPC_WALLET_ERROR with
+   this message followed by the keypool error. *)
+let funding_change_key (wallet : Wallet.t) : Wallet.keypair =
+  try Wallet.generate_change_key wallet
+  with Failure m when m = Wallet.keypool_ran_out_msg ->
+    failwith ("Transaction needs a change address, but we can't generate \
+               it. " ^ m)
+
 (* Core wallet/wallet.h DEFAULT_TRANSACTION_MINFEE (-mintxfee), sat/kvB.
    camlcoin has no -mintxfee, so the default always applies. *)
 let wallet_min_fee_sat_per_kvb = 1000L
@@ -9494,7 +9505,7 @@ let handle_walletcreatefundedpsbt (ctx : rpc_context)
                  Address.address_to_script a
                | _ -> failwith (Printf.sprintf "Invalid changeAddress: %s" addr_str))
             | None ->
-              let kp = Wallet.generate_change_key wallet in
+              let kp = funding_change_key wallet in
               let dest_script = match outputs with
                 | first :: _ -> first.Types.script_pubkey
                 | [] -> Cstruct.empty
@@ -9758,7 +9769,7 @@ let handle_fundrawtransaction (ctx : rpc_context)
                   | _ -> failwith
                       (Printf.sprintf "Change address must be a valid bitcoin address: %s" addr_str))
                | None ->
-                 let kp = Wallet.generate_change_key wallet in
+                 let kp = funding_change_key wallet in
                  let dest_script = match existing_outputs with
                    | first :: _ -> first.Types.script_pubkey
                    | [] -> Cstruct.empty

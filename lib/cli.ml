@@ -498,6 +498,37 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     exit 1
   end;
 
+  (* Open RocksDB for the UTXO set — replaces LogStorage's lseek+read.
+     Block cache + write buffer come from --dbcache so a campaign
+     `--dbcache 4194304` (~1 GiB LRU) cannot sit next to an 8 GiB SST
+     cache. 2026-09-20 slice 419311→450000 held 11.2 GB RSS against
+     that 1 GiB budget while this open used the hardcoded 8192 MiB. *)
+  let rocksdb_path = Filename.concat config.data_dir "rocksdb_utxo" in
+  let rocksdb =
+    Rocksdb_store.open_db
+      ~block_cache_mb:dbcache_block_cache_mb
+      ~write_buffer_mb:dbcache_write_buffer_mb
+      rocksdb_path
+  in
+  Logs.info (fun m ->
+    m "Opened RocksDB UTXO store at %s (block_cache=%d MiB \
+       write_buffer=%d MiB; --dbcache %d entries)"
+      rocksdb_path dbcache_block_cache_mb dbcache_write_buffer_mb
+      config.dbcache_lru_entries);
+
+  (* Wire the RocksDB handle into ChainDB so [get_utxo] can fall back to
+     RocksDB on a LogStorage miss.  Pre-assume-valid UTXOs live only in
+     RocksDB because assume-valid IBD writes through OptimizedUtxoSet;
+     without this fallback, any post-IBD block that spends a pre-AV
+     output fails validation with TxMissingInputs. *)
+  Storage.ChainDB.attach_rocksdb_utxo db rocksdb;
+
+  (* Finish a chainstate commit that died between its rocksdb_utxo half and
+     its chainstate half (audit H11/H12; Core ReplayBlocks).  Runs before
+     restore_chain_state so the in-memory chain loads from the repaired
+     tip and height index.  See [Chainstate_heads]. *)
+  ignore (Chainstate_heads.recover_on_boot ~db ~rdb:rocksdb);
+
   (* Get network config *)
   let network = match config.network with
     | `Mainnet -> Consensus.mainnet
@@ -643,30 +674,6 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   (* Initialize UTXO set *)
   let utxo = Utxo.UtxoSet.create db in
 
-  (* Open RocksDB for the UTXO set — replaces LogStorage's lseek+read.
-     Block cache + write buffer come from --dbcache so a campaign
-     `--dbcache 4194304` (~1 GiB LRU) cannot sit next to an 8 GiB SST
-     cache. 2026-09-20 slice 419311→450000 held 11.2 GB RSS against
-     that 1 GiB budget while this open used the hardcoded 8192 MiB. *)
-  let rocksdb_path = Filename.concat config.data_dir "rocksdb_utxo" in
-  let rocksdb =
-    Rocksdb_store.open_db
-      ~block_cache_mb:dbcache_block_cache_mb
-      ~write_buffer_mb:dbcache_write_buffer_mb
-      rocksdb_path
-  in
-  Logs.info (fun m ->
-    m "Opened RocksDB UTXO store at %s (block_cache=%d MiB \
-       write_buffer=%d MiB; --dbcache %d entries)"
-      rocksdb_path dbcache_block_cache_mb dbcache_write_buffer_mb
-      config.dbcache_lru_entries);
-
-  (* Wire the RocksDB handle into ChainDB so [get_utxo] can fall back to
-     RocksDB on a LogStorage miss.  Pre-assume-valid UTXOs live only in
-     RocksDB because assume-valid IBD writes through OptimizedUtxoSet;
-     without this fallback, any post-IBD block that spends a pre-AV
-     output fails validation with TxMissingInputs. *)
-  Storage.ChainDB.attach_rocksdb_utxo db rocksdb;
 
   (* Consistency check: detect when RocksDB was wiped but chainstate still
      has a non-zero chain_tip.  Without this, the node would skip blocks
@@ -720,6 +727,18 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         | Some h -> (h, target)
         | None -> (Cstruct.create 32, 0)
     in
+    (* A rewind to genesis re-syncs from block 1, so it must start from an
+       empty coin set: rocksdb_utxo kept the coins of the old tip (audit
+       H11) and every re-synced block then met its own coins as BIP30
+       duplicates or its inputs as already spent.  The wipe goes first; if
+       the process dies before the tip write, the next boot sees no RDB tip
+       under a non-zero chain_tip and rewinds again. *)
+    if new_height = 0 then begin
+      let n_rdb, n_cf = Storage.ChainDB.wipe_utxo_stores db in
+      Logs.warn (fun m ->
+        m "chainstate rewind to genesis: wiped both coin stores \
+           (%d rocksdb_utxo keys, %d chainstate coins)" n_rdb n_cf)
+    end;
     chain.blocks_synced <- new_height;
     Storage.ChainDB.set_chain_tip db new_hash new_height;
     if reason <> "" then
@@ -3245,13 +3264,13 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       let dirty = Utxo.OptimizedUtxoSet.dirty_count optimized_utxo in
       if dirty > 0 then begin
         Logs.info (fun m -> m "Flushing %d dirty UTXO entries to disk" dirty);
-        Utxo.OptimizedUtxoSet.flush
-          ~tip_height:chain.blocks_synced optimized_utxo;
         let bs = chain.blocks_synced in
         (match Sync.get_header_at_height chain bs with
          | Some entry ->
-           Storage.ChainDB.set_chain_tip db entry.hash bs
-         | None -> ())
+           (* coins, tip and head marker together (audit H11) *)
+           Utxo.OptimizedUtxoSet.flush ~tip:(entry.hash, bs) optimized_utxo
+         | None ->
+           Utxo.OptimizedUtxoSet.flush ~tip_height:bs optimized_utxo)
       end else begin
         (* W47 fix: in FullySynced mode, dirty is always 0 because
            [process_new_block] bypasses OptimizedUtxoSet.  Without this
@@ -3259,7 +3278,10 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
            flush height while chain_tip (in LogStorage) has advanced with
            every post-IBD block — producing the 945509 wedge on next boot.
            Always align rdb_tip with blocks_synced at shutdown. *)
-        Rocksdb_store.set_tip_height rocksdb chain.blocks_synced
+        let head = match Storage.ChainDB.get_chain_tip db with
+          | Some (h, n) when n = chain.blocks_synced -> Some (h, h)
+          | _ -> None in
+        Rocksdb_store.set_tip_height ?head rocksdb chain.blocks_synced
       end
     with exn ->
       Logs.warn (fun m ->

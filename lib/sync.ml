@@ -4522,7 +4522,10 @@ let handle_notfound (ibd : ibd_state) (peer_id : int)
   ) items
 
 (* Flush pending UTXO updates to database *)
-let flush_utxos (ibd : ibd_state) : unit =
+(* [tip] = (hash, height): commit the chainstate tip with the coins (see
+   [Utxo.OptimizedUtxoSet.flush]); without a coin cache the tip is written
+   after the pending-list batch, as before. *)
+let flush_utxos ?(tip : (Types.hash256 * int) option) (ibd : ibd_state) : unit =
   if ibd.pending_utxo_updates <> [] || ibd.pending_utxo_deletes <> [] then begin
     let batch = Storage.ChainDB.batch_create () in
     (* Add new UTXOs *)
@@ -4548,8 +4551,14 @@ let flush_utxos (ibd : ibd_state) : unit =
   match ibd.utxo_set with
   | Some utxo ->
     Fatal.run_write ~what:"IBD UTXO cache flush" (fun () ->
-      Utxo.OptimizedUtxoSet.flush ~tip_height:ibd.chain.blocks_synced utxo)
-  | None -> ()
+      Utxo.OptimizedUtxoSet.flush ~tip_height:ibd.chain.blocks_synced ?tip
+        utxo)
+  | None ->
+    (match tip with
+     | Some (hash, height) ->
+       Fatal.run_write ~what:"IBD chain tip" (fun () ->
+         Storage.ChainDB.set_chain_tip ibd.chain.db hash height)
+     | None -> ())
 
 (* The catch-up session that last connected a block through the coin
    cache; its coin changes (the shared cache's dirty set and, on the
@@ -4584,13 +4593,15 @@ let flush_coins_before_tip_commit (state : chain_state) : unit =
     | Some u -> Utxo.OptimizedUtxoSet.dirty_count u > 0
     | None -> false in
   if pending || dirty then begin
+    let tip = Option.map (fun h -> (h, state.blocks_synced))
+        (validated_tip_hash state) in
     (match !unflushed_catchup with
-     | Some ibd -> flush_utxos ibd; ibd.blocks_since_flush <- 0
+     | Some ibd -> flush_utxos ?tip ibd; ibd.blocks_since_flush <- 0
      | None -> ());
     (match !shared_utxo_set with
      | Some u when Utxo.OptimizedUtxoSet.dirty_count u > 0 ->
        Fatal.run_write ~what:"pre-commit coin flush" (fun () ->
-         Utxo.OptimizedUtxoSet.flush ~tip_height:state.blocks_synced u)
+         Utxo.OptimizedUtxoSet.flush ~tip_height:state.blocks_synced ?tip u)
      | _ -> ());
     match validated_tip_hash state with
     | Some h ->
@@ -5610,10 +5621,13 @@ let process_downloaded_blocks ?(max_blocks = 1)
            in
            mark Connect_prof.p_misc;
            if ibd.blocks_since_flush >= utxo_flush_interval || dirty_too_large then begin
-             flush_utxos ibd;
+             (* The chain tip commits WITH the coins, in each store's own
+                batch, and rocksdb_utxo records the head marker (audit H11:
+                a crash between two separate writes here left rdb_tip ahead
+                and, with no bodies stored under assumevalid, boot rewound
+                to genesis over a full rocksdb_utxo). *)
+             flush_utxos ~tip:(entry.hash, height) ibd;
              ibd.blocks_since_flush <- 0;
-             (* Also update chain tip in DB *)
-             Storage.ChainDB.set_chain_tip ibd.chain.db entry.hash height;
              (* Run a major GC slice to keep heap from growing unbounded.
                 Gc.compact is far too expensive (full heap compaction + scan);
                 Gc.major runs one full major cycle which is sufficient to
@@ -6257,7 +6271,10 @@ let reconcile_rdb_to_chain_tip (state : chain_state)
          created Y); applying N+1 after N+2 yields the correct "Y absent at
          chain_tip" result.  Without the rev, N+2's restore would win and leak
          a phantom Y into the rolled-back set. *)
-      Rocksdb_store.batch_write ~tip_height:target_height rocksdb
+      let head =
+        Option.map (fun h -> (h, h))
+          (Storage.ChainDB.get_hash_at_height state.db target_height) in
+      Rocksdb_store.batch_write ~tip_height:target_height ?head rocksdb
         (List.rev !rdb_ops);
       (* Mirror into the CF utxo column so a CF-side reader sees the same
          rolled-back set. *)
@@ -7096,6 +7113,7 @@ let mark_block_failed (state : chain_state) (failed : header_entry) : int =
 let connect_block_into_batch
     ?(skip_pow = false)
     ?(on_invalid : (Validation.block_validation_error -> unit) option)
+    ?(undo_sink : (Types.hash256 * string) list ref option)
     (ibd : ibd_state) (batch : Storage.ChainDB.batch)
     (view : reorg_view)
     (entry : header_entry)
@@ -7251,8 +7269,11 @@ let connect_block_into_batch
        let undo : Utxo.undo_data = { height; tx_undos } in
        let uw = Serialize.writer_create () in
        Utxo.serialize_undo_data uw undo;
-       Storage.ChainDB.batch_store_undo_data batch entry.hash
-         (Serialize.writer_to_string uw);
+       let undo_bytes = Serialize.writer_to_string uw in
+       Storage.ChainDB.batch_store_undo_data batch entry.hash undo_bytes;
+       (match undo_sink with
+        | Some r -> r := (entry.hash, undo_bytes) :: !r
+        | None -> ());
        (* BIP-157 filter index append for the reorg-connect path. We
           flatten [tx_undos] into a single list of (outpoint, entry)
           pairs so [append_filter_if_enabled_from_entries] can extract
@@ -7359,7 +7380,7 @@ let connect_block_into_batch
    path has its own [flush_utxos] commit that still uses those
    lists (forward-only path, no put/delete collisions, no view). *)
 let stage_pending_utxos_into_batch
-    ?(tip_height : int option)
+    ?(tip : (Types.hash256 * int) option)
     (ibd : ibd_state) (batch : Storage.ChainDB.batch)
     (view : reorg_view) : unit =
   let decode_key (k : string) : Types.hash256 * int =
@@ -7402,10 +7423,10 @@ let stage_pending_utxos_into_batch
      reads).  Core has one coin view (CoinsTip); DisconnectBlock and
      ConnectBlock both write through it (validation.cpp ActivateBestChainStep
      -> DisconnectTip / ConnectTip -> view.Flush()). *)
-  (match tip_height with
-   | Some th ->
+  (match tip with
+   | Some (tip_hash, tip_height) ->
      Storage.ChainDB.batch_apply_utxo_rocksdb ibd.chain.db
-       ~tip_height:th !rdb_puts !rdb_dels
+       ~tip_height ~tip_hash !rdb_puts !rdb_dels
    | None -> ());
   (match reorg_utxo_set ibd with
    | Some u ->
@@ -7792,7 +7813,8 @@ let reorganize ?(allow_equal_work = false)
         (match reorg_utxo_set ibd with
          | Some u when Utxo.OptimizedUtxoSet.dirty_count u > 0 ->
            Fatal.run_write ~what:"pre-reorg UTXO flush" (fun () ->
-             Utxo.OptimizedUtxoSet.flush ~tip_height:current_tip.height u)
+             Utxo.OptimizedUtxoSet.flush
+               ~tip:(current_tip.hash, current_tip.height) u)
          | _ -> ());
         let to_disconnect = collect_path state fork_point current_tip in
         let to_connect = collect_path state fork_point new_tip in
@@ -7856,6 +7878,7 @@ let reorganize ?(allow_equal_work = false)
           (* Connect side: iterate fork-forward-to-new-tip. *)
           let connect_error = ref None in
           let connected_blocks = ref [] in
+          let connected_undo = ref [] in
           (* The entry whose connect returned a consensus VERDICT (not a
              mutation, not a missing body / ancestry-incomplete / DB miss,
              which come back as Error without [on_invalid] firing). *)
@@ -7866,7 +7889,7 @@ let reorganize ?(allow_equal_work = false)
              completed check.  Drop the staged delta and re-raise. *)
           (try List.iter (fun (entry : header_entry) ->
             if !connect_error = None then
-              match connect_block_into_batch
+              match connect_block_into_batch ~undo_sink:connected_undo
                       ~on_invalid:(fun e ->
                         (* TxMissingInputs is not marked here: the reorg
                            resolves inputs through the disconnect overlay,
@@ -7910,8 +7933,23 @@ let reorganize ?(allow_equal_work = false)
                The [view] is the source of truth (it correctly
                resolves put/delete collisions across the reorg's
                disconnect+connect halves). *)
-            stage_pending_utxos_into_batch ~tip_height:new_tip.height
-              ibd batch view;
+            (* The new branch's undo data goes to disk BEFORE the coins
+               (audit H12).  The coins commit to rocksdb_utxo first and the
+               chainstate batch (tip, height index, undo) second; if the
+               process dies between them, boot rolls the chainstate forward
+               to the new branch ([Chainstate_heads.recover_on_boot]), and
+               that branch must still be disconnectable later.  Undo is keyed
+               by block hash, so an orphaned record from a crash before the
+               coins commit is harmless: the connect path rewrites it. *)
+            if !connected_undo <> [] then begin
+              let ub = Storage.ChainDB.batch_create () in
+              List.iter (fun (h, u) ->
+                Storage.ChainDB.batch_store_undo_data ub h u) !connected_undo;
+              Fatal.run_write ~what:"reorg undo pre-commit" (fun () ->
+                Storage.ChainDB.batch_write state.db ub)
+            end;
+            stage_pending_utxos_into_batch
+              ~tip:(new_tip.hash, new_tip.height) ibd batch view;
             (* Update the active-chain height->hash index so getblockhash /
                getbestblockhash (both read the height->hash CF via
                get_hash_at_height / block_tip) reflect the new chain.
@@ -8529,13 +8567,16 @@ let run_ibd ?(shutdown_flag : bool ref option)
         let%lwt () = Lwt_unix.sleep 0.25 in
         loop ()
       end else begin
-      (* Flush any remaining UTXO updates *)
-      flush_utxos ibd;
+      (* Flush any remaining UTXO updates, with the chain tip *)
+      let tip_entry = get_header_at_height ibd.chain ibd.chain.blocks_synced in
+      flush_utxos
+        ?tip:(Option.map (fun (e : header_entry) -> (e.hash, e.height)) tip_entry)
+        ibd;
       (match !unflushed_catchup with
        | Some i when i == ibd -> unflushed_catchup := None
        | _ -> ());
       (* Update chain tip *)
-      (match get_header_at_height ibd.chain ibd.chain.blocks_synced with
+      (match tip_entry with
        | Some entry ->
          Storage.ChainDB.set_chain_tip ibd.chain.db entry.hash entry.height
        | None -> ());

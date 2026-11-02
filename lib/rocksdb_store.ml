@@ -144,11 +144,67 @@ let encode_tip_height (h : int) : string =
   Bytes.set buf 3 (Char.chr ((h lsr 24) land 0xff));
   Bytes.unsafe_to_string buf
 
+(* Head marker (Core DB_HEAD_BLOCKS, txdb.cpp).  The coins live in this
+   store AND in the chainstate column families (Storage.ChainDB), which
+   also hold the tip.  They are two RocksDB instances, so no WriteBatch
+   spans both: every commit writes this store first and the chainstate
+   second.  A crash between the two leaves [tip_height] here ahead of, or
+   (after a reorg) on another branch from, the chainstate tip, and heights
+   alone cannot say which block this coin set belongs to.
+
+   So every batch that moves [tip_height] also records, in the SAME batch,
+   the block hash the coins are now at ([head_new]) and the chainstate tip
+   they moved away from ([head_old]), with the height.  At boot,
+   [Chainstate_heads.recover_on_boot] compares [head_new] with the
+   chainstate tip by hash and, if the second commit is missing, replays it.
+   A batch that moves [tip_height] without a hash deletes the marker, so a
+   stale marker can never describe a newer coin set; boot then falls back
+   to the height checks in cli.ml. *)
+let head_blocks_key = meta_key "head_blocks"
+
+type head_blocks = {
+  head_new : Types.hash256;
+  head_old : Types.hash256;
+  head_height : int;
+}
+
+let encode_head_blocks ~(new_hash : Types.hash256) ~(old_hash : Types.hash256)
+    (height : int) : string =
+  Cstruct.to_string new_hash ^ Cstruct.to_string old_hash
+  ^ encode_tip_height height
+
+let decode_head_blocks (s : string) : head_blocks option =
+  if String.length s <> 68 then None
+  else
+    let b i = Char.code s.[64 + i] in
+    Some { head_new = Cstruct.of_string (String.sub s 0 32);
+           head_old = Cstruct.of_string (String.sub s 32 32);
+           head_height = b 0 lor (b 1 lsl 8) lor (b 2 lsl 16) lor (b 3 lsl 24) }
+
+let get_head_blocks (t : t) : head_blocks option =
+  match Rocksdb.get t.db head_blocks_key with
+  | None -> None
+  | Some s -> decode_head_blocks s
+
+(* Stage [tip_height] and the head marker into [wb]. *)
+let batch_put_tip wb ~(tip_height : int option)
+    ~(head : (Types.hash256 * Types.hash256) option) =
+  match tip_height with
+  | None -> ()
+  | Some h ->
+    Rocksdb.write_batch_put wb (meta_key "tip_height") (encode_tip_height h);
+    (match head with
+     | Some (new_hash, old_hash) ->
+       Rocksdb.write_batch_put wb head_blocks_key
+         (encode_head_blocks ~new_hash ~old_hash h)
+     | None -> Rocksdb.write_batch_delete wb head_blocks_key)
+
 (* Atomic batch write.  Each element is (key, value_opt) where
    None means delete and Some v means put.
    When [tip_height] is provided it is included in the SAME WriteBatch
-   so that UTXO mutations and the recorded tip are always consistent. *)
-let batch_write ?(tip_height : int option) (t : t)
+   so that UTXO mutations and the recorded tip are always consistent;
+   [head] is the (new, old) block hash pair for the head marker above. *)
+let batch_write ?(tip_height : int option) ?head (t : t)
     (ops : (string * string option) list) : unit =
   let wb = Rocksdb.write_batch_create () in
   List.iter (fun (key, v_opt) ->
@@ -156,34 +212,19 @@ let batch_write ?(tip_height : int option) (t : t)
     | Some v -> Rocksdb.write_batch_put wb key v
     | None   -> Rocksdb.write_batch_delete wb key
   ) ops;
-  (* Include tip_height in the same atomic batch *)
-  (match tip_height with
-   | Some h ->
-     let buf = Bytes.create 4 in
-     Bytes.set buf 0 (Char.chr (h land 0xff));
-     Bytes.set buf 1 (Char.chr ((h lsr 8) land 0xff));
-     Bytes.set buf 2 (Char.chr ((h lsr 16) land 0xff));
-     Bytes.set buf 3 (Char.chr ((h lsr 24) land 0xff));
-     Rocksdb.write_batch_put wb (meta_key "tip_height")
-       (Bytes.unsafe_to_string buf)
-   | None -> ());
+  batch_put_tip wb ~tip_height ~head;
   Rocksdb.write_batch_write t.db wb;
   Rocksdb.write_batch_destroy wb
 
 (* Store the UTXO tip height so we can detect inconsistency with
    the chainstate's chain_tip on startup. *)
-let set_tip_height (t : t) (height : int) : unit =
-  let buf = Bytes.create 4 in
-  Bytes.set buf 0 (Char.chr (height land 0xff));
-  Bytes.set buf 1 (Char.chr ((height lsr 8) land 0xff));
-  Bytes.set buf 2 (Char.chr ((height lsr 16) land 0xff));
-  Bytes.set buf 3 (Char.chr ((height lsr 24) land 0xff));
-  Rocksdb.put t.db (meta_key "tip_height") (Bytes.unsafe_to_string buf)
+let set_tip_height ?head (t : t) (height : int) : unit =
+  batch_write ~tip_height:height ?head t []
 
 (* Flush a dirty hashtable directly into a WriteBatch, avoiding the
    intermediate list allocation that batch_write requires.
    Each dirty entry is serialized and added to the batch in-place. *)
-let flush_dirty ?(tip_height : int option) (t : t)
+let flush_dirty ?(tip_height : int option) ?head (t : t)
     (dirty : (string, [ `Added of Cstruct.t | `Removed ]) Hashtbl.t) : unit =
   let wb = Rocksdb.write_batch_create () in
   Hashtbl.iter (fun key entry ->
@@ -191,18 +232,33 @@ let flush_dirty ?(tip_height : int option) (t : t)
     | `Added data -> Rocksdb.write_batch_put wb key (Cstruct.to_string data)
     | `Removed -> Rocksdb.write_batch_delete wb key
   ) dirty;
-  (match tip_height with
-   | Some h ->
-     let buf = Bytes.create 4 in
-     Bytes.set buf 0 (Char.chr (h land 0xff));
-     Bytes.set buf 1 (Char.chr ((h lsr 8) land 0xff));
-     Bytes.set buf 2 (Char.chr ((h lsr 16) land 0xff));
-     Bytes.set buf 3 (Char.chr ((h lsr 24) land 0xff));
-     Rocksdb.write_batch_put wb (meta_key "tip_height")
-       (Bytes.unsafe_to_string buf)
-   | None -> ());
+  batch_put_tip wb ~tip_height ~head;
   Rocksdb.write_batch_write t.db wb;
   Rocksdb.write_batch_destroy wb
+
+(* Delete every key: all coins, [tip_height] and the head marker.  For a
+   rewind of the chainstate to genesis: a coin set left behind would meet
+   every block of the re-sync as a duplicate (BIP30) or a spent input.
+   Deleted in batches while iterating (the iterator reads a snapshot, as
+   in [Cf_chainstate.cf_clear]).  Returns the number of keys deleted. *)
+let clear ?(batch_size = 10_000) (t : t) : int =
+  let count = ref 0 in
+  let pending = ref [] and n = ref 0 in
+  let flush () =
+    if !pending <> [] then begin
+      let wb = Rocksdb.write_batch_create () in
+      List.iter (fun k -> Rocksdb.write_batch_delete wb k) !pending;
+      Rocksdb.write_batch_write t.db wb;
+      Rocksdb.write_batch_destroy wb;
+      pending := []; n := 0
+    end
+  in
+  Rocksdb.iter t.db (fun key _value ->
+    pending := key :: !pending;
+    incr n; incr count;
+    if !n >= batch_size then flush ());
+  flush ();
+  !count
 
 let get_tip_height (t : t) : int option =
   match Rocksdb.get t.db (meta_key "tip_height") with

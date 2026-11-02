@@ -98,23 +98,8 @@ type cmpct_action =
   | Request_txns of P2p.block_txns_request (* entry stored; send getblocktxn *)
   | Request_block of Types.hash256         (* fall back to getdata *)
 
-let zero_work = Cstruct.create 32
-
-(* Core GetAntiDoSWorkThreshold: the larger of minimum chain work and the
-   active tip's work less 144 blocks of the tip's proof. *)
-let anti_dos_work_threshold (chain : Sync.chain_state) : Cstruct.t =
-  let min_work = chain.Sync.network.Consensus.minimum_chain_work in
-  let near_tip =
-    match Sync.block_tip chain with
-    | None -> zero_work
-    | Some tip ->
-      let proof = Sync.work_from_bits tip.Sync.header.Types.bits in
-      let back = ref zero_work in
-      for _ = 1 to 144 do back := Consensus.work_add !back proof done;
-      if Consensus.work_compare !back tip.Sync.total_work >= 0 then zero_work
-      else Consensus.work_sub tip.Sync.total_work !back
-  in
-  if Consensus.work_compare near_tip min_work >= 0 then near_tip else min_work
+(* Core GetAntiDoSWorkThreshold, shared with the header and block paths. *)
+let anti_dos_work_threshold = Sync.anti_dos_work_threshold
 
 (* Decide what to do with [cb] from [peer_id].  [peer_hb] is true when the
    peer asked us for high-bandwidth relay (Core m_bip152_highbandwidth_to).
@@ -150,7 +135,7 @@ let on_cmpctblock t (chain : Sync.chain_state) ~peer_id ~peer_hb ~now
         let tip_work, tip_height =
           match Sync.block_tip chain with
           | Some tip -> tip.Sync.total_work, tip.Sync.height
-          | None -> zero_work, chain.Sync.blocks_synced
+          | None -> Consensus.zero_work, chain.Sync.blocks_synced
         in
         if Sync.is_block_invalid chain hash then Ignore "block marked invalid"
         else if Storage.ChainDB.has_block chain.Sync.db hash then

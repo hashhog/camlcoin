@@ -1938,7 +1938,8 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
         if syncing then
           Sync.process_looped_peer_headers chain ~peer_id:peer.Peer.id headers
         else
-          { Sync.looped_result = Sync.process_headers chain headers;
+          (* Anti-DoS work gate on every network batch (audit H5). *)
+          { Sync.looped_result = Sync.process_network_headers chain headers;
             via_lowwork = false; request_more = false }
       in
       let accepted =

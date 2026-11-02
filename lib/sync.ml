@@ -2301,7 +2301,33 @@ let get_peer_headers_sync (state : chain_state) (peer_id : int)
 let cleanup_peer_headers_sync (state : chain_state) (peer_id : int) : unit =
   Hashtbl.remove state.peer_headers_sync peer_id
 
-let process_headers ?(min_pow_checked = true) (state : chain_state)
+(* Core CalculateClaimedHeadersWork on top of the first header's parent:
+   the chain work the batch claims to reach, or [None] when the parent is
+   not known (the batch does not connect; [validate_header] rejects it). *)
+let claimed_headers_work (state : chain_state)
+    (headers : Types.block_header list) : Cstruct.t option =
+  match headers with
+  | [] -> None
+  | first :: _ ->
+    match Hashtbl.find_opt state.headers (Cstruct.to_string first.prev_block) with
+    | None -> None
+    | Some prev ->
+      Some (List.fold_left (fun acc (h : Types.block_header) ->
+          Consensus.work_add acc (work_from_bits h.bits))
+          prev.total_work headers)
+
+(* [min_pow_checked=false]: the batch came from a peer and must claim at
+   least [anti_dos_work] (default: the network's minimum chain work), the
+   gate Core's ProcessHeadersMessage applies before it calls
+   ProcessNewBlockHeaders with min_pow_checked=true.  Like Core it is
+   judged on the whole batch (CalculateClaimedHeadersWork over the batch,
+   from the first header's parent), not per header, so a heavier fork whose
+   early headers sit below the threshold still lands in one batch, and it
+   is skipped when the batch's last header is already known (Core's
+   already_validated_work).  Network callers use [process_network_headers],
+   which passes [anti_dos_work_threshold]. *)
+let process_headers ?(min_pow_checked = true) ?anti_dos_work
+    (state : chain_state)
     (headers : Types.block_header list) : (int, string) result =
   (* Header flood prevention: reject if we already have too many headers
      and chain work is below the minimum *)
@@ -2309,10 +2335,36 @@ let process_headers ?(min_pow_checked = true) (state : chain_state)
     | Some t -> t.total_work
     | None -> Consensus.zero_work
   in
+  let low_work_batch () =
+    if min_pow_checked then false
+    else
+      let last_known =
+        match List.rev headers with
+        | last :: _ ->
+          Hashtbl.mem state.headers
+            (Cstruct.to_string (Crypto.compute_block_hash last))
+        | [] -> true
+      in
+      if last_known then false
+      else
+        let threshold = match anti_dos_work with
+          | Some w -> w
+          | None -> state.network.minimum_chain_work
+        in
+        match claimed_headers_work state headers with
+        | Some claimed -> Consensus.work_compare claimed threshold < 0
+        | None -> false
+  in
   if Hashtbl.length state.headers >= max_headers_in_memory
      && Consensus.work_compare tip_work state.network.minimum_chain_work < 0 then
     Error "Header flood: too many headers with insufficient chain work"
-  else begin
+  else if low_work_batch () then begin
+    (* Core: "Ignoring low-work chain"; nothing from the batch is stored. *)
+    Logs.debug (fun m ->
+      m "Ignoring low-work headers batch (%d headers, too-little-chainwork)"
+        (List.length headers));
+    Error "too-little-chainwork"
+  end else begin
     let accepted = ref 0 in
     let rejected = ref 0 in
     let first_error = ref None in
@@ -2322,30 +2374,12 @@ let process_headers ?(min_pow_checked = true) (state : chain_state)
       if !error = None then
         match validate_header state header with
         | Ok entry ->
-          (* G8: per-header minimum-chain-work gate.
-             Core: bitcoin-core/src/validation.cpp:4229 —
-               if (!min_pow_checked)
-                 return state.Invalid(BLOCK_HEADER_LOW_WORK,
-                                      "too-little-chainwork");
-             When min_pow_checked=false (i.e. headers arrive from an
-             untrusted peer that has not yet been verified to be on a
-             chain meeting nMinimumChainWork), reject any header whose
-             accumulated chain work falls below the network minimum.
-             This prevents a peer from feeding us a long low-work fork
-             header-by-header to consume memory.  Default true (safe:
-             gate skipped) so that submitblock and internal callers are
-             unaffected. *)
-          if (not min_pow_checked) &&
-             not (Consensus.meets_minimum_chain_work
-                    entry.total_work state.network) then begin
-            if !first_error = None then
-              first_error := Some "too-little-chainwork";
-            error_index := i;
-            error := Some "too-little-chainwork"
-          end else begin
-            accept_header state entry;
-            incr accepted
-          end
+          (* The too-little-chainwork gate ran on the whole batch above
+             (Core validation.cpp AcceptBlockHeader is reached only with
+             min_pow_checked=true once ProcessHeadersMessage has checked
+             the batch's claimed work). *)
+          accept_header state entry;
+          incr accepted
         | Error "Header already known" ->
           incr rejected
         | Error e ->
@@ -2656,6 +2690,61 @@ let block_tip (state : chain_state) : header_entry option =
        the in-memory Hashtbl.  Fall back to the index / state.tip. *)
     from_active_chain ()
 
+(* The validated tip's work less 144 blocks of the tip's proof (zero when
+   the tip is shallower than that): the near-tip half of Core's
+   GetAntiDoSWorkThreshold. *)
+let near_tip_work (state : chain_state) : Cstruct.t =
+  match block_tip state with
+  | None -> Consensus.zero_work
+  | Some tip ->
+    let proof = work_from_bits tip.header.bits in
+    let back = ref Consensus.zero_work in
+    for _ = 1 to 144 do back := Consensus.work_add !back proof done;
+    if Consensus.work_compare !back tip.total_work >= 0 then Consensus.zero_work
+    else Consensus.work_sub tip.total_work !back
+
+(* Core GetAntiDoSWorkThreshold (net_processing.cpp): the larger of the
+   minimum chain work and the active tip's work less 144 blocks of the
+   tip's proof.  A peer's headers or block must claim at least this much
+   work before anything from it is stored. *)
+let anti_dos_work_threshold (state : chain_state) : Cstruct.t =
+  let min_work = state.network.minimum_chain_work in
+  let near_tip = near_tip_work state in
+  if Consensus.work_compare near_tip min_work >= 0 then near_tip else min_work
+
+(* The threshold the network header paths use.  It is Core's, except on a
+   chain whose validated tip sits on a trusted base below the minimum
+   chain work (an assumeUTXO / campaign slice base, [blocks_synced > 0]):
+   there the minimum is dropped and only the near-tip term applies, as the
+   pre-fix [min_pow_checked:(blocks_synced > 0)] callers intended — headers
+   from such a base cannot reach the minimum in one batch.  A fork off an
+   old height is still refused there. *)
+let trusted_base_below_min_work (state : chain_state) : bool =
+  state.blocks_synced > 0
+  && (match block_tip state with
+      | Some t ->
+        Consensus.work_compare t.total_work
+          state.network.minimum_chain_work < 0
+      | None -> true)
+
+let network_headers_work_threshold (state : chain_state) : Cstruct.t =
+  if trusted_base_below_min_work state then near_tip_work state
+  else anti_dos_work_threshold state
+
+(* Headers from a peer (security audit 2026-10-31 H5).  Before this every
+   post-IBD path ran [process_headers] with the gate off, so any peer could
+   store a cheap fork off an old height.  Core runs every network header
+   batch through GetAntiDoSWorkThreshold (low-work batches are ignored, or
+   handed to PRESYNC when full).  camlcoin's PRESYNC runs only from genesis
+   ([needs_lowwork_sync]), so a full low-work batch after IBD is refused
+   here too: a competing chain must reach the threshold within one
+   2000-header batch, which any fork from less than ~1850 blocks below the
+   tip does. *)
+let process_network_headers (state : chain_state)
+    (headers : Types.block_header list) : (int, string) result =
+  process_headers ~min_pow_checked:false
+    ~anti_dos_work:(network_headers_work_threshold state) state headers
+
 (* Hash of the validated tip, even when [block_tip] has no in-memory
    header_entry (assumeUTXO snapshot base: chain_tip / blocks_synced sit
    at the base, headers table may not). process_new_block and
@@ -2866,8 +2955,8 @@ type looped_headers_outcome = {
    [sync_headers] routes them: below minimum_chain_work with no blocks
    (from-genesis) every non-empty batch goes through PRESYNC/REDOWNLOAD
    (Core TryLowWorkHeadersSync), so nothing is stored until the peer's chain
-   has proven the work; otherwise [process_headers] with the too-little-
-   chainwork gate on unless an assumeUTXO base is already trusted.  Without
+   has proven the work; otherwise [process_network_headers] (the too-little-
+   chainwork gate; near-tip term only on a trusted assumeUTXO base).  Without
    this an inbound peer could fill a fresh node's header tree with a cheap
    chain the blocking loop would never have stored. *)
 let process_looped_peer_headers (state : chain_state) ~(peer_id : int)
@@ -2875,7 +2964,7 @@ let process_looped_peer_headers (state : chain_state) ~(peer_id : int)
   let full = List.length headers >= P2p.max_headers_count in
   let direct () =
     let r =
-      process_headers ~min_pow_checked:(state.blocks_synced > 0) state headers
+      process_network_headers state headers
     in
     { looped_result = r; via_lowwork = false;
       request_more = full && (match r with Ok n -> n > 0 | Error _ -> false) }
@@ -3002,7 +3091,7 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
         (* Oops — this is actually fresh.  Process it immediately. *)
         if count > 0 then
           Logs.info (fun m -> m "Pre-drained %d stale responses, found fresh batch" count);
-        let _r = process_headers ~min_pow_checked:false state headers in
+        let _r = process_network_headers state headers in
         drain_queued_stale count
       end else begin
         Logs.debug (fun m -> m "Pre-drain: discarded stale response (%d headers)" (List.length headers));
@@ -3241,12 +3330,11 @@ let sync_headers (state : chain_state) (peer : Peer.peer) : unit Lwt.t =
        Lwt.return_unit)
 
   and process_direct_acceptance state headers count =
-    (* min_pow_checked=false applies the too-little-chainwork gate (a
-       from-genesis flood defence). After assumeUTXO the snapshot base is
-       already trusted, so skip that gate and still run PoW/MTP/diffbits
-       via validate_header. *)
-    let min_pow_checked = state.blocks_synced > 0 in
-    match process_headers ~min_pow_checked state headers with
+    (* The too-little-chainwork gate (Core GetAntiDoSWorkThreshold).  On a
+       trusted assumeUTXO base below the minimum chain work only its
+       near-tip term applies ([network_headers_work_threshold]);
+       PoW/MTP/diffbits still run in validate_header. *)
+    match process_network_headers state headers with
     | Ok accepted ->
       Logs.info (fun m -> m "Accepted %d headers, tip at height %d"
         accepted state.headers_synced);
@@ -9391,18 +9479,43 @@ let process_new_block ?(f_requested = false)
     (* The block's header must already be known (via headers-first sync). If
        not, accept the header first so we know the height. *)
     let header_entry = match Hashtbl.find_opt state.headers hash_key with
-      | Some e -> Some e
+      | Some e -> Ok e
       | None ->
-        (* Try to accept the header on the fly *)
-        (match validate_header state block.header with
-         | Ok entry -> accept_header state entry; Some entry
-         | Error _ -> None)
+        (* Accept the header on the fly, but only if it claims the anti-DoS
+           work (Core BLOCK: min_pow_checked is set only when prev work +
+           the header's proof >= GetAntiDoSWorkThreshold; otherwise
+           AcceptBlockHeader answers too-little-chainwork and nothing is
+           stored).  Audit 2026-10-31 H5. *)
+        (match claimed_headers_work state [block.header] with
+         | Some claimed
+           when Consensus.work_compare claimed
+                  (network_headers_work_threshold state) < 0 ->
+           Error "too-little-chainwork"
+         | _ ->
+           (match validate_header state block.header with
+            | Ok entry -> accept_header state entry; Ok entry
+            | Error _ -> Error "Unknown header and failed to validate"))
     in
     match header_entry with
-    | None ->
-      Lwt.return (Error "Unknown header and failed to validate")
-    | Some entry ->
+    | Error e -> Lwt.return (Error e)
+    | Ok entry ->
       let height = entry.height in
+      (* Core AcceptBlock: a block we did not ask for is not processed (so
+         not written) unless it has at least the active tip's work and the
+         minimum chain work.  Before this an unsolicited side-branch body
+         up to 288 above the tip was stored whatever its work (audit
+         2026-10-31 H5).  Requested blocks (gap-fill, which also fetches
+         the fork-below blocks of a heavier header chain, and compact
+         blocks) skip this, as in Core. *)
+      let unrequested_low_work =
+        (not f_requested)
+        && ((match block_tip state with
+             | Some t -> Consensus.work_compare entry.total_work t.total_work < 0
+             | None -> false)
+            || ((not (trusted_base_below_min_work state))
+                && not (Consensus.meets_minimum_chain_work entry.total_work
+                          state.network)))
+      in
       (* G19c — fTooFarAhead anti-DoS gate.
          Core: bitcoin-core/src/validation.cpp:4325 — when !fRequested and
          pindex->nHeight > ActiveHeight() + MIN_BLOCKS_TO_KEEP (288), drop
@@ -9414,7 +9527,9 @@ let process_new_block ?(f_requested = false)
          AcceptBlock (W97 G19c). *)
       let min_blocks_to_keep = 288 in
       let f_too_far_ahead = height > state.blocks_synced + min_blocks_to_keep in
-      if (not f_requested) && f_too_far_ahead then
+      if unrequested_low_work then
+        Lwt.return (Error "unrequested-low-work")
+      else if (not f_requested) && f_too_far_ahead then
         Lwt.return (Error "too-far-ahead")
       else if state.block_submission_paused then begin
         (* NetworkDisable (dumptxoutset rollback, CC-1b; Core disables the

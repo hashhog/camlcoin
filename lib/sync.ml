@@ -4450,32 +4450,16 @@ let receive_block ?sender (ibd : ibd_state) (block : Types.block)
   let hash_key = Cstruct.to_string hash in
   match queue_find_by_hash ibd hash_key with
   | None ->
-    (* Unrequested block - store as orphan if pool isn't full *)
-    let prev_hash = block.header.prev_block in
-    let orphan_entry = {
-      block;
-      hash;
-      prev_hash;
-      received_time = Unix.gettimeofday ();
-    } in
-    if Hashtbl.length ibd.orphan_blocks >= max_orphan_blocks then begin
-      (* Pool is full - evict the oldest entry *)
-      let oldest_key = ref "" in
-      let oldest_time = ref infinity in
-      Hashtbl.iter (fun key entry ->
-        if entry.received_time < !oldest_time then begin
-          oldest_time := entry.received_time;
-          oldest_key := key
-        end
-      ) ibd.orphan_blocks;
-      if !oldest_key <> "" then
-        Hashtbl.remove ibd.orphan_blocks !oldest_key
-    end;
-    Hashtbl.replace ibd.orphan_blocks hash_key orphan_entry;
+    (* Unrequested block: drop it.  It used to go into [orphan_blocks]
+       (750 entries, each up to a 4 MB message, with no header, PoW or size
+       check), so a single peer could pin ~3 GB of heap during IBD
+       (security audit 2026-10-31 H7).  Core keeps no orphan blocks: an
+       unrequested block without a known header is not stored
+       (validation.cpp AcceptBlock returns early when !fRequested).  Every
+       block we need is in the queue and is requested when its turn comes. *)
     Logs.debug (fun m ->
-      m "Stored orphan block %s (pool size: %d)"
-        (Types.hash256_to_hex_display hash)
-        (Hashtbl.length ibd.orphan_blocks));
+      m "Ignoring unrequested block %s during IBD"
+        (Types.hash256_to_hex_display hash));
     Ok ()
   | Some { download_state = (Downloaded _ | Validated); _ } ->
     (* A second copy of a block we already hold (a re-request raced the

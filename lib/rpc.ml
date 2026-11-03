@@ -1768,6 +1768,10 @@ let handle_sendrawtransaction (ctx : rpc_context)
       let data = Cstruct.of_hex hex in
       let r = Serialize.reader_of_cstruct data in
       let tx = Serialize.deserialize_transaction r in
+      (* Core's DecodeHexTx (core_io.cpp) requires the whole hex to be
+         consumed: trailing bytes are RPC_DESERIALIZATION_ERROR (-22). *)
+      if r.Serialize.pos <> Cstruct.length data then
+        failwith "trailing bytes after transaction";
 
       (* Check burn amount before mempool validation *)
       let burn_amount = sum_burn_amount tx in

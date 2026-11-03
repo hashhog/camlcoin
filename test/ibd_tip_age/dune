@@ -1,0 +1,6 @@
+; getblockchaininfo.initialblockdownload follows Core's tip-age latch on
+; regtest (item refill-20261102-camlcoin-consensus).  Own directory and
+; stanza so it does not touch the shared names list in test/dune.
+(test
+ (name test_ibd_tip_age)
+ (libraries camlcoin test_tmp alcotest yojson cstruct))

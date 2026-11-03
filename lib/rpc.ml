@@ -589,14 +589,9 @@ let handle_getblockchaininfo (ctx : rpc_context)
     | Some t -> Int32.to_int (Sync.compute_median_time_for_display ctx.chain t.height)
     | None -> 0
   in
-  (* initialblockdownload: Core's IsInitialBlockDownload() returns false on a
-     non-empty regtest chain (min-chain-work is 0 and the stale-tip gate passes
-     under mocktime). Keep the real sync-state gate on mainnet/testnet so a
-     still-syncing node is never falsely reported as caught up. *)
-  let is_ibd = match ctx.network.name with
-    | "regtest" -> false
-    | _ -> ctx.chain.sync_state <> Sync.FullySynced
-  in
+  (* initialblockdownload: Core's IsInitialBlockDownload(), tip-age latch
+     included, with no regtest exemption (see [Sync.is_initial_block_download]). *)
+  let is_ibd = Sync.is_initial_block_download ctx.chain in
   (* Core v31.99 getblockchaininfo field order (blockchain.cpp:1418):
        chain, blocks, headers, bestblockhash, bits, target, difficulty, time,
        mediantime, verificationprogress, initialblockdownload, chainwork,

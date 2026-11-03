@@ -227,6 +227,10 @@ type chain_state = {
        CORE-PARITY-AUDIT/_nimrod-presync-part2-2026-05-27.md and
        _nimrod-presync-part3-2026-05-28.md. *)
   mutable block_submission_paused : bool;
+  mutable ibd_latched_off : bool;
+  (* Core [ChainstateManager::m_cached_is_ibd] inverted: set once the node
+     has left initial block download, never cleared.  Read and set only by
+     [is_initial_block_download]. *)
   (* NetworkDisable flag (Bitcoin Core
      [src/rpc/blockchain.cpp::NetworkDisable] around [TemporaryRollback]).
      When true, [submitblock] and any P2P block-handler callsite that
@@ -1256,6 +1260,7 @@ let create_chain_state (db : Storage.ChainDB.t)
     invalidated_blocks = Hashtbl.create 16;
     peer_headers_sync = Hashtbl.create 16;
     block_submission_paused = false;
+    ibd_latched_off = false;
     bip157_index = None;
     coinstatsindex = None;
     txospenderindex = None;
@@ -1525,6 +1530,7 @@ let restore_chain_state (db : Storage.ChainDB.t)
     invalidated_blocks = Hashtbl.create 16;
     peer_headers_sync = Hashtbl.create 16;
     block_submission_paused = false;
+    ibd_latched_off = false;
     bip157_index = None;
     coinstatsindex = None;
     txospenderindex = None;
@@ -2750,6 +2756,41 @@ let block_tip (state : chain_state) : header_entry option =
 (* The validated tip's work less 144 blocks of the tip's proof (zero when
    the tip is shallower than that): the near-tip half of Core's
    GetAntiDoSWorkThreshold. *)
+(* Core [ChainstateManager::IsInitialBlockDownload] (validation.cpp
+   UpdateIBDStatus + chain.h CChain::IsTipRecent): the node stays in IBD
+   until the active tip has at least [minimum_chain_work] and a time no older
+   than max_tip_age (DEFAULT_MAX_TIP_AGE, 24 h) before GetTime(); leaving
+   latches for the life of the process.  GetTime() honours setmocktime, so
+   this reads [Node_clock.now].  Regtest is NOT exempt: its minimum chain
+   work is zero, but a tip with an old timestamp keeps it in IBD, exactly as
+   Core reports for a regtest chain built on fixed past times.
+
+   Off regtest camlcoin additionally waits for the sync state machine to
+   reach [FullySynced] before latching, so a node that is still fetching
+   headers is never reported as caught up on the strength of a recent block.
+
+   Core latches inside SetTip; camlcoin evaluates when asked (RPC, REST, the
+   self-advertisement gate).  The answers agree except when a recent tip is
+   replaced by an old one with no query in between. *)
+let max_tip_age = 86400.0
+
+let is_initial_block_download (state : chain_state) : bool =
+  if state.ibd_latched_off then false
+  else begin
+    let tip_recent = match block_tip state with
+      | Some t ->
+        Consensus.work_compare t.total_work state.network.minimum_chain_work >= 0
+        && Int32.to_float t.header.timestamp >= Node_clock.now () -. max_tip_age
+      | None -> false
+    in
+    let synced = state.network.name = "regtest"
+                 || state.sync_state = FullySynced in
+    if tip_recent && synced then begin
+      state.ibd_latched_off <- true;
+      false
+    end else true
+  end
+
 let near_tip_work (state : chain_state) : Cstruct.t =
   match block_tip state with
   | None -> Consensus.zero_work

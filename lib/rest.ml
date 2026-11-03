@@ -626,7 +626,7 @@ let handle_chaininfo (ctx : Rpc.rpc_context) (_req : Cohttp.Request.t)
         ("verificationprogress", `Float
           (if ctx.chain.headers_synced = 0 then 0.0
            else float_of_int tip_height /. float_of_int ctx.chain.headers_synced));
-        ("initialblockdownload", `Bool (ctx.chain.sync_state <> Sync.FullySynced));
+        ("initialblockdownload", `Bool (Sync.is_initial_block_download ctx.chain));
         ("chainwork", `String chainwork);
         ("size_on_disk", `Int 0);
       ] @ Rpc.prune_fields ctx @ [

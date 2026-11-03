@@ -1242,28 +1242,16 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       (String.split_on_char ',' v))
     config.externalip;
   (* IBD predicate for the self-announcement gate (Core
-     IsInitialBlockDownload, validation.cpp): latched false once cleared;
-     true while the validated tip is older than DEFAULT_MAX_TIP_AGE (24h),
-     and — outside regtest, whose minimum chain work is zero — while the
-     sync state machine has not reached FullySynced. *)
-  let ibd_latched_off = ref false in
+     IsInitialBlockDownload, validation.cpp): [Sync.is_initial_block_download],
+     the same latched answer getblockchaininfo reports. *)
+  let ibd_logged = ref false in
   peer_manager.Peer_manager.is_ibd <- (fun () ->
-    if !ibd_latched_off then false
-    else begin
-      let tip_recent = match Sync.block_tip chain with
-        | Some t ->
-          Int32.to_float t.Sync.header.Types.timestamp
-          >= Unix.gettimeofday () -. 86400.0
-        | None -> false
-      in
-      let synced = network.Consensus.name = "regtest"
-                   || chain.Sync.sync_state = Sync.FullySynced in
-      if tip_recent && synced then begin
-        ibd_latched_off := true;
-        Logs.info (fun m -> m "Leaving IBD: self-address advertisement enabled");
-        false
-      end else true
-    end);
+    let ibd = Sync.is_initial_block_download chain in
+    if not ibd && not !ibd_logged then begin
+      ibd_logged := true;
+      Logs.info (fun m -> m "Leaving IBD: self-address advertisement enabled")
+    end;
+    ibd);
 
   (* --connect peer pinning (Bitcoin Core -connect): when manual peers are
      given, pin the node to ONLY those peers. [set_connect_peers] makes

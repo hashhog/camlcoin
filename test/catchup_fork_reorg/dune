@@ -1,0 +1,8 @@
+; Catch-up IBD session reorgs off an orphaned tip
+; (fix-camlcoin-stuck-on-orphan-974400).  Own directory so the shared
+; test/dune names list is untouched.  Uses only APIs that exist on the
+; pre-fix tree, so it builds there too.
+(test
+ (name test_catchup_fork_reorg)
+ (modules test_catchup_fork_reorg)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix logs))

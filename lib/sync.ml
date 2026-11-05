@@ -8502,14 +8502,15 @@ let chain_tips (state : chain_state) : chain_tip list =
    is caught, and Core answers "inconclusive" -- not null, which BIP-22
    defines as "accepted". *)
 type side_branch_outcome =
-  | Side_accepted      (* connected (now on the active chain), or a no-op *)
+  | Side_accepted      (* connected (now on the active chain) *)
   | Side_inconclusive  (* stored but not connected: no verdict *)
 
 (* Pattern Y closure: accept a block whose parent is in the index but is
    not the validated tip (side-branch / heavier-fork acceptance via
    [submitblock]). Returns Ok Side_accepted when the reorg connected it,
-   Ok Side_inconclusive when it was stored without being connected, and
-   Error on rejection.
+   Ok Side_inconclusive when it was stored without being connected,
+   Error "duplicate" when the block was already stored, and Error on
+   rejection.
 
    Mirrors Bitcoin Core's [ProcessNewBlock] -> [AcceptBlock] code path
    for non-best-chain blocks: header chain validation + CheckBlock +
@@ -8526,14 +8527,20 @@ let try_attach_side_branch_and_reorg
     (state : chain_state) (block : Types.block) (parent : header_entry)
     : (side_branch_outcome, string) result =
   let hash = Crypto.compute_block_hash block.header in
-  (* Idempotency: if we already have this block on disk, don't reprocess.
-     (Core answers "duplicate" here -- AcceptBlock's fAlreadyHave leaves
-     new_block false; not changed by this path yet.) *)
+  (* Idempotency: if we already have this block on disk, don't reprocess,
+     and answer "duplicate" as Core does.  ChainstateManager::AcceptBlock
+     (validation.cpp:4302,4329) clears *fNewBlock and returns true at
+     "if (fAlreadyHave) return true;" for an index entry with
+     BLOCK_HAVE_DATA, and rpc/mining.cpp submitblock (:1097) turns
+     accepted && !new_block into "duplicate".  Ok Side_accepted rendered
+     null -- BIP-22 "accepted" -- for a block that was never connected.
+     Invalid/failed blocks and blocks on the active chain never reach
+     here: Mining.submit_block_outcome answers them first. *)
   if Storage.ChainDB.has_block state.db hash then begin
     Logs.debug (fun m ->
-      m "submitblock side-branch: block %s already stored — no-op"
+      m "submitblock side-branch: block %s already stored — duplicate"
         (Types.hash256_to_hex_display hash));
-    Ok Side_accepted
+    Error "duplicate"
   end else begin
     let height = parent.height + 1 in
     let header = block.header in

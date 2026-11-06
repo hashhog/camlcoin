@@ -4589,7 +4589,15 @@ let accept_transaction_with_replaced ?(dry_run=false)
     : (mempool_entry * Types.hash256 list, string) result =
   let result =
     (* First check if there are conflicts *)
-    let conflicts = find_all_conflicts mp tx in
+    let conflicts =
+      (* Core PreChecks rejects a tx whose txid/wtxid is already pooled
+         ("txn-already-in-mempool") BEFORE it looks for conflicts.  A pooled
+         tx conflicts with itself (same inputs), which sent it down the RBF
+         path and answered a feerate error instead.  Send it to
+         [add_transaction], which reports the duplicate token. *)
+      if Hashtbl.mem mp.entries (Cstruct.to_string (Crypto.compute_txid tx))
+      then []
+      else find_all_conflicts mp tx in
     match conflicts with
     | [] ->
       (* No conflicts, use normal add_transaction — empty replaced list *)

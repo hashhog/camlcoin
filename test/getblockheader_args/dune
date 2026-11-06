@@ -1,0 +1,5 @@
+; getblockheader argument errors vs Core (item refill-20261105-camlcoin-rpc).
+; Own directory so test/dune is untouched.
+(test
+ (name test_getblockheader_args)
+ (libraries camlcoin test_tmp alcotest))

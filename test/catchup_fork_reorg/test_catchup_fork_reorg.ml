@@ -32,6 +32,23 @@
      invalid_tip     B5 overpays its coinbase: no reorg, O4 stays, B5 failed
      invalid_below   B4 overpays (B5 valid on top): no reorg, O4 stays
 
+   Mutated bodies (Warden on camlcoin#59): a body that does not match its
+   header (bad merkle root, or a witness-only change that breaks the witness
+   commitment) must be refused BEFORE it is stored (Core: ProcessNewBlock runs
+   CheckBlock, and AcceptBlock runs CheckBlock + ContextualCheckBlock, before
+   WriteBlock; validation.cpp), must not mark the header failed (BLOCK_MUTATED
+   never reaches InvalidBlockFound), and must not stop the honest branch from
+   connecting later.
+     mutated_merkle    first delivery of B4 is a coinbase that does not match
+                       B4's merkle root; a later session gets the real B4
+     mutated_witness   same with a witness-only mutation of B4
+     stored_mutated    a mutated B4 body is already on disk when the
+                       session starts (an older binary stored it)
+     reorg_mutated     [reorganize] to B5 over a stored mutated B4 fails and
+                       drops that body, without marking B4 failed
+     nonfinal_below    B4 matches its header but its coinbase is non-final
+                       (ContextualCheckBlock): marked failed, never stored
+
      dune exec --no-buffer test/catchup_fork_reorg/test_catchup_fork_reorg.exe
 *)
 
@@ -54,8 +71,8 @@ let remine (block : Types.block) : Types.block =
 
 (* Coinbase-only block.  [overpay] adds that many sats to the coinbase with
    no fees to cover it: bad-cb-amount. *)
-let make_block ~prev_hash ~prev_time ~height ?(overpay = 0L) ~tag ()
-    : Types.block =
+let make_block ~prev_hash ~prev_time ~height ?(overpay = 0L)
+    ?(nonfinal = false) ~tag () : Types.block =
   let extra_nonce = Cstruct.create 8 in
   Cstruct.LE.set_uint64 extra_nonce 0 (Int64.of_int (height + (tag lsl 32)));
   let mk wr =
@@ -64,6 +81,16 @@ let make_block ~prev_hash ~prev_time ~height ?(overpay = 0L) ~tag ()
   in
   let wr = Mining.compute_witness_merkle_root [ mk None ] in
   let coinbase = mk (Some wr) in
+  (* [nonfinal]: nLockTime at a far height with a non-final sequence, so
+     IsFinalTx fails (ContextualCheckBlock bad-txns-nonfinal, a verdict
+     Core records). *)
+  let coinbase =
+    if not nonfinal then coinbase
+    else { coinbase with
+           Types.locktime = 1_000_000l;
+           inputs = List.map (fun (i : Types.tx_in) ->
+               { i with Types.sequence = 0l }) coinbase.Types.inputs }
+  in
   let merkle_root, _ = Crypto.merkle_root [ Crypto.compute_txid coinbase ] in
   remine { Types.header = { version = 4l; prev_block = prev_hash; merkle_root;
                             timestamp = Int32.add prev_time 600l;
@@ -118,7 +145,7 @@ type world = {
   b5 : Types.block;
 }
 
-let build ?(b4_overpay = 0L) ?(b5_overpay = 0L) state =
+let build ?(b4_overpay = 0L) ?(b5_overpay = 0L) ?(b4_nonfinal = false) state =
   let genesis = Option.get state.Sync.tip in
   let prev = ref genesis.Sync.hash
   and ptime = ref genesis.Sync.header.Types.timestamp in
@@ -130,7 +157,7 @@ let build ?(b4_overpay = 0L) ?(b5_overpay = 0L) state =
     end) in
   let o4 = make_block ~prev_hash:!prev ~prev_time:!ptime ~height:4 ~tag:1 () in
   let b4 = make_block ~prev_hash:!prev ~prev_time:!ptime ~height:4 ~tag:2
-             ~overpay:b4_overpay () in
+             ~overpay:b4_overpay ~nonfinal:b4_nonfinal () in
   let b5 = make_block ~prev_hash:(bhash b4)
              ~prev_time:b4.Types.header.Types.timestamp ~height:5 ~tag:2
              ~overpay:b5_overpay () in
@@ -224,13 +251,14 @@ let test_restart_reorg () =
         run_session state utxo (table [ w.b4; w.b5 ]) ~stray:[];
         check_on_b5 db state w))
 
-let stays_on_o4 ?(b4_overpay = 0L) ?(b5_overpay = 0L) ~with_b5 label =
+let stays_on_o4 ?(b4_overpay = 0L) ?(b5_overpay = 0L) ?(b4_nonfinal = false)
+    ?(while_open = fun _ _ _ -> ()) ~with_b5 label =
   with_db label (fun path ->
     let db, utxo = open_node path in
     Fun.protect ~finally:(fun () -> try Storage.ChainDB.close db with _ -> ())
       (fun () ->
         let state = Sync.create_chain_state db Consensus.regtest in
-        let w = build ~b4_overpay ~b5_overpay state in
+        let w = build ~b4_overpay ~b5_overpay ~b4_nonfinal state in
         follow_orphan state utxo w;
         accept state w.b4;
         if with_b5 then accept state w.b5;
@@ -243,7 +271,117 @@ let stays_on_o4 ?(b4_overpay = 0L) ?(b5_overpay = 0L) ~with_b5 label =
           (Storage.ChainDB.get_utxo db (cbtxid w.o4) 0 <> None);
         Alcotest.(check bool) "B4's coinbase was never applied" true
           (Storage.ChainDB.get_utxo db (cbtxid w.b4) 0 = None);
+        while_open db state w;
         (state, w)))
+
+(* A body under B4's header that is not B4: the coinbase pays one satoshi
+   less, so its txid (and the merkle root) no longer match the header. *)
+let mutate_merkle (b : Types.block) : Types.block =
+  match b.Types.transactions with
+  | cb :: rest ->
+    let outs = match cb.Types.outputs with
+      | o :: os -> { o with Types.value = Int64.sub o.Types.value 1L } :: os
+      | [] -> []
+    in
+    { b with Types.transactions = { cb with Types.outputs = outs } :: rest }
+  | [] -> b
+
+(* Witness-only mutation: the coinbase witness reserved value changes, the
+   txid (and so the merkle root) does not, the witness commitment fails. *)
+let mutate_witness (b : Types.block) : Types.block =
+  match b.Types.transactions with
+  | cb :: rest ->
+    let w = { Types.items = [ Cstruct.of_string (String.make 32 '\x01') ] } in
+    { b with Types.transactions = { cb with Types.witnesses = [ w ] } :: rest }
+  | [] -> b
+
+let is_marked state (b : Types.block) =
+  Hashtbl.mem state.Sync.invalidated_blocks (Cstruct.to_string (bhash b))
+
+let mutated_then_honest ~mutate label =
+  with_db label (fun path ->
+    let db, utxo = open_node path in
+    Fun.protect ~finally:(fun () -> try Storage.ChainDB.close db with _ -> ())
+      (fun () ->
+        let state = Sync.create_chain_state db Consensus.regtest in
+        let w = build state in
+        follow_orphan state utxo w;
+        accept state w.b4; accept state w.b5;
+        let bad = mutate w.b4 in
+        Alcotest.(check string) "precondition: mutated body keeps B4's header"
+          (hex (bhash w.b4)) (hex (bhash bad));
+        (* First session: the peer answers B4 with the mutated body. *)
+        run_session state utxo (table [ bad; w.b5 ]) ~stray:[];
+        Alcotest.(check string) "mutated B4: validated tip stays O4"
+          (hex (bhash w.o4)) (tip_hash state);
+        Alcotest.(check bool) "mutated B4 body was not stored" false
+          (Storage.ChainDB.has_block db (bhash w.b4));
+        Alcotest.(check bool) "B4 is not marked failed (mutation is no verdict)"
+          false (is_marked state w.b4);
+        (* A later session is offered the real B4 and B5. *)
+        run_session state utxo (table [ w.b4; w.b5 ]) ~stray:[];
+        check_on_b5 db state w;
+        Alcotest.(check bool) "B4 not marked failed after connecting" false
+          (is_marked state w.b4)))
+
+let test_mutated_merkle_then_honest () =
+  mutated_then_honest ~mutate:mutate_merkle "catchup_fork_mut_merkle"
+
+let test_mutated_witness_then_honest () =
+  mutated_then_honest ~mutate:mutate_witness "catchup_fork_mut_witness"
+
+let test_stored_mutated_body () =
+  with_db "catchup_fork_stored_mut" (fun path ->
+    let db, utxo = open_node path in
+    Fun.protect ~finally:(fun () -> try Storage.ChainDB.close db with _ -> ())
+      (fun () ->
+        let state = Sync.create_chain_state db Consensus.regtest in
+        let w = build state in
+        follow_orphan state utxo w;
+        accept state w.b4; accept state w.b5;
+        Storage.ChainDB.store_block db (bhash w.b4) (mutate_merkle w.b4);
+        run_session state utxo (table [ w.b4; w.b5 ]) ~stray:[];
+        check_on_b5 db state w))
+
+(* A B4 body that matches its header but is invalid by ContextualCheckBlock
+   (non-final coinbase): Core's AcceptBlock refuses it before WriteBlock and
+   InvalidBlockFound marks it.  No reorg, B4 (and B5 on it) marked failed,
+   and the body is never written. *)
+let test_nonfinal_below_not_stored () =
+  let state, w =
+    stays_on_o4 ~b4_nonfinal:true ~with_b5:true "catchup_fork_nonfinal"
+      ~while_open:(fun db _ w ->
+        Alcotest.(check bool) "nonfinal B4 body was not stored" false
+          (Storage.ChainDB.has_block db (bhash w.b4)))
+  in
+  Alcotest.(check bool) "nonfinal B4 is marked failed" true (is_marked state w.b4)
+
+let test_reorganize_drops_mutated_body () =
+  with_db "catchup_fork_reorg_mut" (fun path ->
+    let db, utxo = open_node path in
+    Fun.protect ~finally:(fun () -> try Storage.ChainDB.close db with _ -> ())
+      (fun () ->
+        let state = Sync.create_chain_state db Consensus.regtest in
+        let w = build state in
+        follow_orphan state utxo w;
+        accept state w.b4; accept state w.b5;
+        Storage.ChainDB.store_block db (bhash w.b4) (mutate_merkle w.b4);
+        Storage.ChainDB.store_block db (bhash w.b5) w.b5;
+        let b5e = Option.get (Sync.get_header state (bhash w.b5)) in
+        let ibd = Sync.create_ibd_state ~utxo_set:utxo state in
+        (match Sync.reorganize ibd b5e with
+         | Ok () -> Alcotest.fail "reorganize over a mutated B4 succeeded"
+         | Error _ -> ());
+        Alcotest.(check string) "failed reorg: validated tip stays O4"
+          (hex (bhash w.o4)) (tip_hash state);
+        Alcotest.(check bool) "failed reorg dropped the mutated B4 body" false
+          (Storage.ChainDB.has_block db (bhash w.b4));
+        Alcotest.(check bool) "B4 is not marked failed" false
+          (is_marked state w.b4);
+        Alcotest.(check bool) "B5 is not marked failed" false
+          (is_marked state w.b5);
+        run_session state utxo (table [ w.b4; w.b5 ]) ~stray:[];
+        check_on_b5 db state w))
 
 let test_equal_work_keeps_first_seen () =
   ignore (stays_on_o4 ~with_b5:false "catchup_fork_equal")
@@ -281,4 +419,15 @@ let () =
           Alcotest.test_case "invalid branch tip: no reorg" `Quick
             test_invalid_tip_no_reorg;
           Alcotest.test_case "invalid fork-below block: no reorg" `Quick
-            test_invalid_below_no_reorg ] ) ]
+            test_invalid_below_no_reorg ] );
+      ( "mutated bodies",
+        [ Alcotest.test_case "bad merkle B4 refused, honest B4+B5 connect"
+            `Quick test_mutated_merkle_then_honest;
+          Alcotest.test_case "bad witness B4 refused, honest B4+B5 connect"
+            `Quick test_mutated_witness_then_honest;
+          Alcotest.test_case "stored mutated B4 does not block the reorg"
+            `Quick test_stored_mutated_body;
+          Alcotest.test_case "reorganize drops a mutated stored body"
+            `Quick test_reorganize_drops_mutated_body;
+          Alcotest.test_case "nonfinal B4 marked failed and not stored"
+            `Quick test_nonfinal_below_not_stored ] ) ]

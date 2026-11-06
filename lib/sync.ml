@@ -5437,6 +5437,77 @@ let ibd_base_readers (ibd : ibd_state)
   in
   (lookup, prefetch_base)
 
+(* ActivateBestChain for the catch-up IBD session.
+
+   The session downloads the best-HEADER chain by height from
+   [blocks_synced + 1] and only ever EXTENDED the validated tip.  When the
+   best header chain forks BELOW the validated tip (the tip block was
+   orphaned), nothing in the session could switch branches: the competing
+   branch's block at the tip height was never queued (an unrequested body is
+   dropped by [receive_block]), and the next block, whose parent is that
+   branch's block, failed [block_extends_validated_tip] after every
+   validation and was discarded ("validated tip moved to N during
+   validation; result discarded") for as long as the process ran.  Mainnet
+   2026-11-03: camlcoin sat on the orphan 974400 (000…5c1f…be6c) while Core
+   and the header chain moved on from 000…8b7c…a823, until a watchdog
+   restarted it — and every restart rebuilt the same session.
+
+   Core downloads from the last common ancestor of the best header chain
+   and the active chain (net_processing.cpp FindNextBlocksToDownload,
+   [pindexLastCommonBlock]) and, after every block, runs ActivateBestChain
+   (validation.cpp ActivateBestChain -> FindMostWorkChain ->
+   ActivateBestChainStep), which disconnects to the fork and connects the
+   heavier branch once its blocks are on disk.  [ibd_activate_fork] is that
+   step for the session; it is defined after [reorganize] and installed in
+   this ref. *)
+type ibd_fork_outcome =
+  | Fork_reorged              (* validated tip is now this block *)
+  | Fork_need_blocks of int   (* fork-point height: branch bodies missing *)
+  | Fork_stored               (* stored; branch not heavier than the tip yet *)
+  | Fork_failed of string     (* not connected (reorg failed / bad body) *)
+
+let ibd_activate_fork_ref
+    : (ibd_state -> Types.hash256 -> Types.block -> ibd_fork_outcome) ref =
+  ref (fun _ _ _ -> Fork_failed "ibd_activate_fork not installed")
+
+(* Core runs CheckBlock (ProcessNewBlock) and then CheckBlock +
+   ContextualCheckBlock (AcceptBlock) BEFORE WriteBlock stores a body
+   (validation.cpp ChainstateManager::ProcessNewBlock / AcceptBlock).  A
+   competing-branch body the catch-up session stores without connecting goes
+   through the same gate: [accept_competing_block], defined after
+   [mark_block_failed] and installed in this ref.
+     Competing_stored    passed; the body is on disk
+     Competing_rejected  not the committed block (BLOCK_MUTATED) or a
+                         CheckBlock failure Core does not record: dropped
+                         (also from disk), header NOT marked, re-fetch it
+     Competing_invalid   ContextualCheckBlock verdict Core records
+                         (InvalidBlockFound): dropped, header marked failed *)
+type competing_store_outcome =
+  | Competing_stored
+  | Competing_rejected of string
+  | Competing_invalid of string
+
+let accept_competing_block_ref
+    : (chain_state -> Types.hash256 -> Types.block
+       -> competing_store_outcome) ref =
+  ref (fun _ _ _ -> Competing_rejected "accept_competing_block not installed")
+
+(* Restart the session's download/processing cursor at [to_height + 1]
+   (Core: pindexLastCommonBlock moved back to the fork point).  The queue
+   and in-flight accounting are dropped; blocks already stored on disk are
+   reloaded by [fill_download_queue] instead of being fetched again. *)
+let rewind_ibd_session (ibd : ibd_state) ~(to_height : int) : unit =
+  Queue.clear ibd.block_queue;
+  Hashtbl.reset ibd.queue_by_hash;
+  Hashtbl.reset ibd.queue_by_height;
+  ibd.total_blocks_in_flight <- 0;
+  Hashtbl.iter (fun _ (ps : peer_download_state) -> ps.blocks_in_flight <- 0)
+    ibd.peer_states;
+  ibd.next_download_height <- to_height + 1;
+  ibd.next_process_height <- to_height + 1;
+  Queue.clear ibd.download_path;
+  ibd.download_path_tip <- None
+
 (* Process downloaded blocks in height order.
    [max_blocks] caps how many blocks are processed in one call.
    When [worker] is provided, block validation (the CPU-heavy
@@ -5469,6 +5540,79 @@ let process_downloaded_blocks ?(max_blocks = 1)
     match queue_find_by_height ibd ibd.next_process_height with
     | Some entry -> begin
       match entry.download_state with
+      | Downloaded { block; _ }
+        when entry.height <= ibd.chain.blocks_synced ->
+        (* At or below the validated tip: queued after a rewind to a fork
+           point (see [ibd_activate_fork_ref]).  An active-chain block is
+           already connected; a competing-branch block is only STORED here
+           (Core AcceptBlock) — it is connected when [reorganize] connects
+           its branch, never against this tip's coin view.  It is stored
+           only after CheckBlock + ContextualCheckBlock pass, as Core's
+           AcceptBlock does: a body that does not match its header would
+           otherwise be reloaded from disk by every later session and make
+           every reorg onto the branch fail (camlcoin#59 review). *)
+        if block_on_active_chain ibd.chain ~hash:entry.hash
+             ~height:entry.height then begin
+          entry.download_state <- Validated;
+          ibd.next_process_height <- ibd.next_process_height + 1;
+          step ()
+        end else begin
+          match !accept_competing_block_ref ibd.chain entry.hash block with
+          | Competing_stored ->
+            entry.download_state <- Validated;
+            ibd.next_process_height <- ibd.next_process_height + 1;
+            step ()
+          | Competing_rejected msg ->
+            (* Not a verdict on the block: fetch the body again. *)
+            Logs.warn (fun m ->
+              m "Competing block at height %d (%s) refused before storing: \
+                 %s — re-requesting it"
+                entry.height (Types.hash256_to_hex_display entry.hash) msg);
+            entry.download_state <- NotRequested;
+            continue := false;
+            Lwt.return_unit
+          | Competing_invalid msg ->
+            Logs.warn (fun m ->
+              m "Competing block at height %d (%s) is invalid: %s"
+                entry.height (Types.hash256_to_hex_display entry.hash) msg);
+            rewind_ibd_session ibd ~to_height:ibd.chain.blocks_synced;
+            continue := false;
+            Lwt.return_unit
+        end
+      | Downloaded { block; _ }
+        when not (block_extends_validated_tip ibd.chain ~height:entry.height
+                    ~prev:block.header.prev_block) ->
+        (* Above the validated tip but not on it: the best header chain
+           forks below the tip.  Validating against this tip's coins would
+           be meaningless, so hand it to ActivateBestChain. *)
+        (match !ibd_activate_fork_ref ibd entry.hash block with
+         | Fork_reorged ->
+           entry.download_state <- Validated;
+           ibd.next_process_height <- ibd.chain.blocks_synced + 1;
+           incr processed;
+           step ()
+         | Fork_stored ->
+           entry.download_state <- Validated;
+           ibd.next_process_height <- ibd.next_process_height + 1;
+           step ()
+         | Fork_need_blocks fork_height ->
+           Logs.info (fun m ->
+             m "Block at height %d (%s) is on a branch forking at %d below \
+                the validated tip %d; rewinding the download to the fork \
+                point to fetch the branch"
+               entry.height (Types.hash256_to_hex_display entry.hash)
+               fork_height ibd.chain.blocks_synced);
+           rewind_ibd_session ibd ~to_height:fork_height;
+           continue := false;
+           Lwt.return_unit
+         | Fork_failed msg ->
+           Logs.warn (fun m ->
+             m "Block at height %d (%s) on a competing branch was not \
+                connected: %s"
+               entry.height (Types.hash256_to_hex_display entry.hash) msg);
+           rewind_ibd_session ibd ~to_height:ibd.chain.blocks_synced;
+           continue := false;
+           Lwt.return_unit)
       | Downloaded { block; peer_id } ->
         (* Validate the block *)
         let height = entry.height in
@@ -8069,6 +8213,12 @@ let reorganize ?(allow_equal_work = false)
              mutation, not a missing body / ancestry-incomplete / DB miss,
              which come back as Error without [on_invalid] firing). *)
           let failed_verdict = ref None in
+          (* The entry whose stored body came back BLOCK_MUTATED: not the
+             block its header commits to.  Core never stores such a body;
+             left on disk it would be reloaded for every later attempt and
+             the branch could never connect (camlcoin#59 review).  Dropped
+             below, header not marked, so the next download fetches it. *)
+          let mutated_body = ref None in
           (* Gate 6: an exception out of the connect half (a coins read
              error, a script check that could not complete) is NOT a
              verdict: [failed_verdict] is only set by [on_invalid] on a
@@ -8087,7 +8237,9 @@ let reorganize ?(allow_equal_work = false)
                               (_, Validation.TxMissingInputs) -> true
                           | _ -> false
                         in
-                        if not (is_block_mutation_error e || local_miss) then
+                        if is_block_mutation_error e then
+                          mutated_body := Some entry
+                        else if not local_miss then
                           failed_verdict := Some entry)
                       ibd batch view entry with
               | Error e -> connect_error := Some e
@@ -8110,6 +8262,15 @@ let reorganize ?(allow_equal_work = false)
              | Some fe ->
                ignore (mark_block_failed state fe);
                (match on_block_failed with Some f -> f fe | None -> ())
+             | None -> ());
+            (match !mutated_body with
+             | Some me ->
+               Logs.warn (fun m ->
+                 m "Reorg: dropping the stored body of %s at height %d \
+                    (not the block its header commits to); it will be \
+                    fetched again"
+                   (Types.hash256_to_hex_display me.hash) me.height);
+               Storage.ChainDB.delete_block state.db me.hash
              | None -> ());
             (* No batch_write happened; the on-disk image is unchanged
                from the pre-reorg state. *)
@@ -8281,6 +8442,122 @@ let reorganize ?(allow_equal_work = false)
             Ok ()
       end
   end
+
+(* See [accept_competing_block_ref].  [hash]/[block] is a body for a
+   header on a branch that is not the active chain.  Core AcceptBlock
+   (validation.cpp): CheckBlock + ContextualCheckBlock against the block's
+   OWN parent before WriteBlock; a failure that is not BLOCK_MUTATED goes
+   through InvalidBlockFound.  ProcessNewBlock runs CheckBlock first and
+   never marks on its failure, which [is_retained_block_failure] encodes.
+   Either way the body is never written, so a body already on disk (stored
+   by an older binary, or reloaded by [fill_download_queue]) is deleted:
+   left there, every session would reload the same bytes and every reorg
+   onto the branch would fail on them. *)
+let accept_competing_block (state : chain_state) (hash : Types.hash256)
+    (block : Types.block) : competing_store_outcome =
+  let drop () =
+    if Storage.ChainDB.has_block state.db hash then
+      Storage.ChainDB.delete_block state.db hash
+  in
+  match Hashtbl.find_opt state.headers (Cstruct.to_string hash),
+        Hashtbl.find_opt state.headers
+          (Cstruct.to_string block.header.prev_block) with
+  | None, _ ->
+    drop (); Competing_rejected "block header not in the header index"
+  | _, None ->
+    drop (); Competing_rejected "parent header not in the header index"
+  | Some entry, Some parent ->
+    match resolve_expected_bits ~parent_entry:parent state entry.height
+            block.header with
+    | Error msg ->
+      (* Ancestry incomplete: no verdict, keep nothing. *)
+      drop (); Competing_rejected msg
+    | Ok expected_bits ->
+      let median_time =
+        Consensus.median_time_past
+          (collect_ancestor_timestamps state parent 11) in
+      match Validation.check_block ~network:state.network block entry.height
+              ~expected_bits ~median_time
+              ~prev_block_time:parent.header.timestamp () with
+      | Ok () ->
+        Storage.ChainDB.store_block state.db hash block;
+        Competing_stored
+      | Error e ->
+        let msg = Validation.block_error_to_string e in
+        drop ();
+        if is_retained_block_failure e then begin
+          ignore (mark_block_failed state entry);
+          Competing_invalid msg
+        end else
+          Competing_rejected msg
+
+let () = accept_competing_block_ref := accept_competing_block
+
+(* See [ibd_activate_fork_ref].  [hash]/[block] is a downloaded block on the
+   best header chain whose parent is not the validated tip.  Store it (it was
+   requested: Core AcceptBlock writes it), then, if every block from the fork
+   point to it is on disk and it out-works the validated tip, [reorganize] to
+   it — the same undo-driven disconnect/connect, failure marking and mempool
+   handling as the submitblock and live-P2P reorg paths. *)
+let ibd_activate_fork (ibd : ibd_state) (hash : Types.hash256)
+    (block : Types.block) : ibd_fork_outcome =
+  let state = ibd.chain in
+  let key = Cstruct.to_string hash in
+  if Hashtbl.mem state.invalidated_blocks key then
+    Fork_failed "block is marked invalid"
+  else
+  match Hashtbl.find_opt state.headers key, block_tip state with
+  | None, _ -> Fork_failed "block header not in the header index"
+  | _, None -> Fork_failed "validated tip not in the header index"
+  | Some cand, Some validated ->
+    match find_fork_point state validated cand with
+    | Error e -> Fork_failed e
+    | Ok fork ->
+      (* Only a body that passes CheckBlock + ContextualCheckBlock is
+         written ([accept_competing_block], Core AcceptBlock): a made-up
+         body under a real header would otherwise be reloaded from disk by
+         every later session. *)
+      match accept_competing_block state hash block with
+      | Competing_rejected msg | Competing_invalid msg -> Fork_failed msg
+      | Competing_stored -> begin
+        let path = collect_path state fork cand in
+        if not (List.for_all
+                  (fun (e : header_entry) ->
+                     Storage.ChainDB.has_block state.db e.hash) path)
+        then Fork_need_blocks fork.height
+        else if Consensus.work_compare cand.total_work validated.total_work
+                <= 0
+        then Fork_stored
+        else begin
+          (* [reorganize] leaves [state.tip] at its target; the best header
+             may be further along the same branch, and the session needs it
+             to keep downloading (W43/W44). *)
+          let best_header = state.tip in
+          Logs.info (fun m ->
+            m "Catch-up ActivateBestChain: branch at height %d (%s) forks at \
+               %d below the validated tip %d (%s) and has more work; \
+               reorganizing"
+              cand.height (Types.hash256_to_hex_display cand.hash)
+              fork.height validated.height
+              (Types.hash256_to_hex_display validated.hash));
+          match reorganize ibd cand with
+          | Error e -> Fork_failed ("reorganize: " ^ e)
+          | Ok () ->
+            (match best_header with
+             | Some b
+               when Consensus.work_compare b.total_work cand.total_work > 0
+                    && not (Hashtbl.mem state.invalidated_blocks
+                              (Cstruct.to_string b.hash))
+                    && (match get_ancestor state b cand.height with
+                        | Some a -> Cstruct.equal a.hash cand.hash
+                        | None -> false) ->
+               state.tip <- best_header
+             | _ -> ());
+            Fork_reorged
+        end
+      end
+
+let () = ibd_activate_fork_ref := ibd_activate_fork
 
 (* ============================================================================
    Side-branch acceptance (Pattern Y closure 2026-05-05)

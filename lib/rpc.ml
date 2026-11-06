@@ -1758,6 +1758,12 @@ let handle_sendrawtransaction (ctx : rpc_context)
     | [`String hex; `Int maxfeerate; `Int maxburn] ->
       let maxburn_sats = Int64.mul (Int64.of_int maxburn) 100_000_000L in
       Ok (hex, float_of_int maxfeerate, maxburn_sats)
+    (* Core ParseFeeRate -> AmountFromValue: a non-numeric maxfeerate or
+       maxburnamount is -3 "Invalid amount". *)
+    | `String _ :: (`String _ | `Bool _ | `List _ | `Assoc _) :: _ ->
+      Error "Invalid amount"
+    | [`String _; (`Int _ | `Float _); (`String _ | `Bool _ | `List _ | `Assoc _)] ->
+      Error "Invalid amount"
     | _ ->
       Error "Invalid parameters: expected [hexstring] or [hexstring, maxfeerate] or [hexstring, maxfeerate, maxburnamount]"
   in
@@ -1768,6 +1774,10 @@ let handle_sendrawtransaction (ctx : rpc_context)
       let data = Cstruct.of_hex hex in
       let r = Serialize.reader_of_cstruct data in
       let tx = Serialize.deserialize_transaction r in
+      (* Core's DecodeHexTx (core_io.cpp) requires the whole hex to be
+         consumed: trailing bytes are RPC_DESERIALIZATION_ERROR (-22). *)
+      if r.Serialize.pos <> Cstruct.length data then
+        failwith "trailing bytes after transaction";
 
       (* Check burn amount before mempool validation *)
       let burn_amount = sum_burn_amount tx in
@@ -16202,6 +16212,15 @@ let dispatch_rpc (ctx : rpc_context)
      | Error msg
        when String.length msg >= 16 && String.sub msg 0 16 = "TX decode failed" ->
        Error (rpc_deserialization_error, msg)
+     (* Core JSONRPCTransactionError (core_io / rpc/util.cpp):
+        ALREADY_IN_UTXO_SET -> -27 with a fixed message,
+        MISSING_INPUTS      -> -25 (RPC_TRANSACTION_ERROR),
+        bad maxfeerate type -> -3 from AmountFromValue. *)
+     | Error "txn-already-known" ->
+       Error (-27, "Transaction outputs already in utxo set")
+     | Error "bad-txns-inputs-missingorspent" ->
+       Error (rpc_verify_error, "bad-txns-inputs-missingorspent")
+     | Error "Invalid amount" -> Error (-3, "Invalid amount")
      | Error msg -> Error (rpc_verify_rejected, msg))
   | "createrawtransaction" ->
     (* handle_createrawtransaction returns Core-exact (code, message) pairs:

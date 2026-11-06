@@ -1,0 +1,5 @@
+; sendrawtransaction must reject trailing bytes after the tx (item
+; refill-20261103-camlcoin-node_error). Own directory so test/dune is untouched.
+(test
+ (name test_sendraw_trailing)
+ (libraries camlcoin test_tmp alcotest))

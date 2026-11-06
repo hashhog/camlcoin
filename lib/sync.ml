@@ -5470,6 +5470,28 @@ let ibd_activate_fork_ref
     : (ibd_state -> Types.hash256 -> Types.block -> ibd_fork_outcome) ref =
   ref (fun _ _ _ -> Fork_failed "ibd_activate_fork not installed")
 
+(* Core runs CheckBlock (ProcessNewBlock) and then CheckBlock +
+   ContextualCheckBlock (AcceptBlock) BEFORE WriteBlock stores a body
+   (validation.cpp ChainstateManager::ProcessNewBlock / AcceptBlock).  A
+   competing-branch body the catch-up session stores without connecting goes
+   through the same gate: [accept_competing_block], defined after
+   [mark_block_failed] and installed in this ref.
+     Competing_stored    passed; the body is on disk
+     Competing_rejected  not the committed block (BLOCK_MUTATED) or a
+                         CheckBlock failure Core does not record: dropped
+                         (also from disk), header NOT marked, re-fetch it
+     Competing_invalid   ContextualCheckBlock verdict Core records
+                         (InvalidBlockFound): dropped, header marked failed *)
+type competing_store_outcome =
+  | Competing_stored
+  | Competing_rejected of string
+  | Competing_invalid of string
+
+let accept_competing_block_ref
+    : (chain_state -> Types.hash256 -> Types.block
+       -> competing_store_outcome) ref =
+  ref (fun _ _ _ -> Competing_rejected "accept_competing_block not installed")
+
 (* Restart the session's download/processing cursor at [to_height + 1]
    (Core: pindexLastCommonBlock moved back to the fork point).  The queue
    and in-flight accounting are dropped; blocks already stored on disk are
@@ -5523,14 +5545,40 @@ let process_downloaded_blocks ?(max_blocks = 1)
         (* At or below the validated tip: queued after a rewind to a fork
            point (see [ibd_activate_fork_ref]).  An active-chain block is
            already connected; a competing-branch block is only STORED here
-           (Core AcceptBlock) — it is validated when [reorganize] connects
-           its branch, never against this tip's coin view. *)
-        if not (block_on_active_chain ibd.chain ~hash:entry.hash
-                  ~height:entry.height) then
-          Storage.ChainDB.store_block ibd.chain.db entry.hash block;
-        entry.download_state <- Validated;
-        ibd.next_process_height <- ibd.next_process_height + 1;
-        step ()
+           (Core AcceptBlock) — it is connected when [reorganize] connects
+           its branch, never against this tip's coin view.  It is stored
+           only after CheckBlock + ContextualCheckBlock pass, as Core's
+           AcceptBlock does: a body that does not match its header would
+           otherwise be reloaded from disk by every later session and make
+           every reorg onto the branch fail (camlcoin#59 review). *)
+        if block_on_active_chain ibd.chain ~hash:entry.hash
+             ~height:entry.height then begin
+          entry.download_state <- Validated;
+          ibd.next_process_height <- ibd.next_process_height + 1;
+          step ()
+        end else begin
+          match !accept_competing_block_ref ibd.chain entry.hash block with
+          | Competing_stored ->
+            entry.download_state <- Validated;
+            ibd.next_process_height <- ibd.next_process_height + 1;
+            step ()
+          | Competing_rejected msg ->
+            (* Not a verdict on the block: fetch the body again. *)
+            Logs.warn (fun m ->
+              m "Competing block at height %d (%s) refused before storing: \
+                 %s — re-requesting it"
+                entry.height (Types.hash256_to_hex_display entry.hash) msg);
+            entry.download_state <- NotRequested;
+            continue := false;
+            Lwt.return_unit
+          | Competing_invalid msg ->
+            Logs.warn (fun m ->
+              m "Competing block at height %d (%s) is invalid: %s"
+                entry.height (Types.hash256_to_hex_display entry.hash) msg);
+            rewind_ibd_session ibd ~to_height:ibd.chain.blocks_synced;
+            continue := false;
+            Lwt.return_unit
+        end
       | Downloaded { block; _ }
         when not (block_extends_validated_tip ibd.chain ~height:entry.height
                     ~prev:block.header.prev_block) ->
@@ -8165,6 +8213,12 @@ let reorganize ?(allow_equal_work = false)
              mutation, not a missing body / ancestry-incomplete / DB miss,
              which come back as Error without [on_invalid] firing). *)
           let failed_verdict = ref None in
+          (* The entry whose stored body came back BLOCK_MUTATED: not the
+             block its header commits to.  Core never stores such a body;
+             left on disk it would be reloaded for every later attempt and
+             the branch could never connect (camlcoin#59 review).  Dropped
+             below, header not marked, so the next download fetches it. *)
+          let mutated_body = ref None in
           (* Gate 6: an exception out of the connect half (a coins read
              error, a script check that could not complete) is NOT a
              verdict: [failed_verdict] is only set by [on_invalid] on a
@@ -8183,7 +8237,9 @@ let reorganize ?(allow_equal_work = false)
                               (_, Validation.TxMissingInputs) -> true
                           | _ -> false
                         in
-                        if not (is_block_mutation_error e || local_miss) then
+                        if is_block_mutation_error e then
+                          mutated_body := Some entry
+                        else if not local_miss then
                           failed_verdict := Some entry)
                       ibd batch view entry with
               | Error e -> connect_error := Some e
@@ -8206,6 +8262,15 @@ let reorganize ?(allow_equal_work = false)
              | Some fe ->
                ignore (mark_block_failed state fe);
                (match on_block_failed with Some f -> f fe | None -> ())
+             | None -> ());
+            (match !mutated_body with
+             | Some me ->
+               Logs.warn (fun m ->
+                 m "Reorg: dropping the stored body of %s at height %d \
+                    (not the block its header commits to); it will be \
+                    fetched again"
+                   (Types.hash256_to_hex_display me.hash) me.height);
+               Storage.ChainDB.delete_block state.db me.hash
              | None -> ());
             (* No batch_write happened; the on-disk image is unchanged
                from the pre-reorg state. *)
@@ -8378,6 +8443,56 @@ let reorganize ?(allow_equal_work = false)
       end
   end
 
+(* See [accept_competing_block_ref].  [hash]/[block] is a body for a
+   header on a branch that is not the active chain.  Core AcceptBlock
+   (validation.cpp): CheckBlock + ContextualCheckBlock against the block's
+   OWN parent before WriteBlock; a failure that is not BLOCK_MUTATED goes
+   through InvalidBlockFound.  ProcessNewBlock runs CheckBlock first and
+   never marks on its failure, which [is_retained_block_failure] encodes.
+   Either way the body is never written, so a body already on disk (stored
+   by an older binary, or reloaded by [fill_download_queue]) is deleted:
+   left there, every session would reload the same bytes and every reorg
+   onto the branch would fail on them. *)
+let accept_competing_block (state : chain_state) (hash : Types.hash256)
+    (block : Types.block) : competing_store_outcome =
+  let drop () =
+    if Storage.ChainDB.has_block state.db hash then
+      Storage.ChainDB.delete_block state.db hash
+  in
+  match Hashtbl.find_opt state.headers (Cstruct.to_string hash),
+        Hashtbl.find_opt state.headers
+          (Cstruct.to_string block.header.prev_block) with
+  | None, _ ->
+    drop (); Competing_rejected "block header not in the header index"
+  | _, None ->
+    drop (); Competing_rejected "parent header not in the header index"
+  | Some entry, Some parent ->
+    match resolve_expected_bits ~parent_entry:parent state entry.height
+            block.header with
+    | Error msg ->
+      (* Ancestry incomplete: no verdict, keep nothing. *)
+      drop (); Competing_rejected msg
+    | Ok expected_bits ->
+      let median_time =
+        Consensus.median_time_past
+          (collect_ancestor_timestamps state parent 11) in
+      match Validation.check_block ~network:state.network block entry.height
+              ~expected_bits ~median_time
+              ~prev_block_time:parent.header.timestamp () with
+      | Ok () ->
+        Storage.ChainDB.store_block state.db hash block;
+        Competing_stored
+      | Error e ->
+        let msg = Validation.block_error_to_string e in
+        drop ();
+        if is_retained_block_failure e then begin
+          ignore (mark_block_failed state entry);
+          Competing_invalid msg
+        end else
+          Competing_rejected msg
+
+let () = accept_competing_block_ref := accept_competing_block
+
 (* See [ibd_activate_fork_ref].  [hash]/[block] is a downloaded block on the
    best header chain whose parent is not the validated tip.  Store it (it was
    requested: Core AcceptBlock writes it), then, if every block from the fork
@@ -8398,16 +8513,13 @@ let ibd_activate_fork (ibd : ibd_state) (hash : Types.hash256)
     match find_fork_point state validated cand with
     | Error e -> Fork_failed e
     | Ok fork ->
-      (* Only a body that matches its header is written: a made-up body
-         under a real header would otherwise be reloaded from disk by every
-         later session (Core CheckBlock's merkle/mutation test runs before
-         AcceptBlock writes anything). *)
-      let txids = List.map Crypto.compute_txid block.transactions in
-      let (root, mutated) = Crypto.merkle_root txids in
-      if mutated || not (Cstruct.equal root block.header.merkle_root) then
-        Fork_failed "body does not match the header merkle root (mutated)"
-      else begin
-        Storage.ChainDB.store_block state.db hash block;
+      (* Only a body that passes CheckBlock + ContextualCheckBlock is
+         written ([accept_competing_block], Core AcceptBlock): a made-up
+         body under a real header would otherwise be reloaded from disk by
+         every later session. *)
+      match accept_competing_block state hash block with
+      | Competing_rejected msg | Competing_invalid msg -> Fork_failed msg
+      | Competing_stored -> begin
         let path = collect_path state fork cand in
         if not (List.for_all
                   (fun (e : header_entry) ->

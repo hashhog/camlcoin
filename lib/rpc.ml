@@ -16088,10 +16088,28 @@ let dispatch_rpc (ctx : rpc_context)
     (* Core: a blockhash not in the index -> RPC_INVALID_ADDRESS_OR_KEY (-5)
        "Block not found" (bitcoin-core/src/rpc/blockchain.cpp:654-656).
        A MALFORMED blockhash hits ParseHashV first -> -8 before lookup. *)
-    guard_hash_param ~name:"blockhash" params (fun () ->
-      match handle_getblockheader ctx params with
-      | Ok r -> Ok r
-      | Error msg -> Error (rpc_invalid_address, msg))
+    (* Core checks argument types (RPCTypeCheck) before the body runs, so a
+       non-bool verbose is -3 "Wrong type passed" even when the hash is bad
+       or absent.  An explicit null verbose means "default" (true).  The
+       first argument is named "hash" in Core's help, so ParseHashV says
+       "hash must be ...". *)
+    let wrong_type pos name v expected =
+      Error (rpc_type_error, Printf.sprintf
+        "Wrong type passed:\n{\n    \"Position %d (%s)\": \"JSON value of type %s is not of expected type %s\"\n}"
+        pos name (core_uvtype v) expected) in
+    (match params with
+     | v :: _ when (match v with `String _ -> false | _ -> true) ->
+       wrong_type 1 "hash" v "string"
+     | [_; v] when (match v with `Bool _ | `Null -> false | _ -> true) ->
+       wrong_type 2 "verbose" v "bool"
+     | _ ->
+       let params = match params with
+         | [h; `Null] -> [h]
+         | p -> p in
+       guard_hash_param ~name:"hash" params (fun () ->
+         match handle_getblockheader ctx params with
+         | Ok r -> Ok r
+         | Error msg -> Error (rpc_invalid_address, msg)))
   | "getblockcount" ->
     Ok (handle_getblockcount ctx)
   | "getbestblockhash" ->

@@ -5321,7 +5321,14 @@ let handle_testmempoolaccept (ctx : rpc_context)
         ] @ (if String.length msg >= 21
                 && String.sub msg 0 21 = "insufficient feerate:"
              then [ ("reject-details", `String ("replacement-failed, " ^ msg)) ]
-             else []))])
+             else
+               (* Core always sets reject-details = state.ToString(); for the
+                  duplicate tokens (no debug message) that is the token. *)
+               (match canonical_mempool_reject_reason ~testmempoolaccept:true msg with
+                | ("txn-already-in-mempool" | "txn-already-known"
+                  | "txn-same-nonwitness-data-in-mempool") as r ->
+                  [ ("reject-details", `String r) ]
+                | _ -> [])))])
     with exn ->
       Error (Printf.sprintf "TX decode failed: %s" (Printexc.to_string exn))))
   | [`List ((_ :: _ :: _) as raw)]

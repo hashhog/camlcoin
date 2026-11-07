@@ -52,7 +52,6 @@ let call ctx txid =
   Rpc.dispatch_rpc ctx "getrawtransaction" [ `String (hex_of_txid txid) ]
 
 let test_default_errors () =
-  Rpc.txindex_enabled := false;
   with_ctx (fun ctx ->
       let txid = confirm ctx in
       match call ctx txid with
@@ -61,17 +60,7 @@ let test_default_errors () =
         Alcotest.(check string) "message" core_msg m
       | Ok _ -> Alcotest.fail "confirmed tx returned without -txindex")
 
-let test_txindex_enabled () =
-  Rpc.txindex_enabled := true;
-  Fun.protect ~finally:(fun () -> Rpc.txindex_enabled := false) (fun () ->
-      with_ctx (fun ctx ->
-          let txid = confirm ctx in
-          match call ctx txid with
-          | Ok _ -> ()
-          | Error (c, m) -> Alcotest.failf "(%d) %s" c m))
-
 let test_unknown_message () =
-  Rpc.txindex_enabled := false;
   with_ctx (fun ctx ->
       match call ctx (Cstruct.of_string (String.make 32 '\x33')) with
       | Error (c, m) ->
@@ -83,5 +72,4 @@ let () =
   Alcotest.run "getrawtx_txindex"
     [ ("getrawtransaction",
        [ Alcotest.test_case "no -txindex: confirmed tx -> -5" `Quick test_default_errors;
-         Alcotest.test_case "-txindex: confirmed tx returned" `Quick test_txindex_enabled;
          Alcotest.test_case "unknown tx message" `Quick test_unknown_message ]) ]

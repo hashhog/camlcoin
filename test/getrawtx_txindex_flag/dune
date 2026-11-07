@@ -1,0 +1,4 @@
+; -txindex lets getrawtransaction find a confirmed tx without a blockhash.
+(test
+ (name test_getrawtx_txindex_flag)
+ (libraries camlcoin test_tmp alcotest))

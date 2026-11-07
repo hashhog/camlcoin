@@ -643,6 +643,9 @@ let test_getorphantxs_invalid_verbosity () =
 
 (* Test: getrawtransaction for confirmed transaction includes block info *)
 let test_getrawtransaction_confirmed_has_block_info () =
+  (* Core finds a confirmed tx without a blockhash only under -txindex. *)
+  Rpc.txindex_enabled := true;
+  Fun.protect ~finally:(fun () -> Rpc.txindex_enabled := false) @@ fun () ->
   cleanup_test_db ();
   let db = Storage.ChainDB.create test_db_path in
   let utxo = Utxo.UtxoSet.create db in

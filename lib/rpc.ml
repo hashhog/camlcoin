@@ -2783,6 +2783,7 @@ let bip22_of_submitblock_error (msg : string) : string =
      "bad-prevblk", submitblock "duplicate").  Exact match: the substring
      rules below would turn "duplicate" into a duplicate-transaction token. *)
   if msg = "duplicate-invalid" || msg = "duplicate" || msg = "bad-prevblk"
+     || msg = "prev-blk-not-found"
   then msg else
   match find_sub "bad-version(0x" with
   | Some start ->

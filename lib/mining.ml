@@ -838,10 +838,13 @@ let submit_block_outcome ?(utxo : Utxo.OptimizedUtxoSet.t option)
              previous error string ("Block does not build on validated
              tip") is no longer accurate when the parent is also
              unknown. *)
-          Error (Printf.sprintf
-                   "Block %s parent %s not in block index"
-                   (Types.hash256_to_hex_display hash)
-                   (Types.hash256_to_hex_display block.header.prev_block))
+          (* Core AcceptBlockHeader: BLOCK_MISSING_PREV "prev-blk-not-found"
+             (validation.cpp), surfaced verbatim by BIP22ValidationResult. *)
+          Logs.debug (fun m ->
+            m "submitblock: block %s parent %s not in block index"
+              (Types.hash256_to_hex_display hash)
+              (Types.hash256_to_hex_display block.header.prev_block));
+          Error "prev-blk-not-found"
         | Some parent ->
           (* Delegate to the side-branch / reorg path. *)
           Sync.try_attach_side_branch_and_reorg

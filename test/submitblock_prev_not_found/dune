@@ -1,0 +1,7 @@
+; submitblock of a block whose parent is unknown answers Core's
+; "prev-blk-not-found" (core-regtest row chain/submit/prev-not-found).
+; Own directory so the shared test/dune names list is untouched.
+(test
+ (name test_submitblock_prev_not_found)
+ (modules test_submitblock_prev_not_found)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix logs))

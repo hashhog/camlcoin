@@ -1,0 +1,5 @@
+; getrawtransaction of a confirmed tx without a blockhash must fail like Core
+; without -txindex (item refill-20261107-camlcoin-node_error).
+(test
+ (name test_getrawtx_txindex)
+ (libraries camlcoin test_tmp alcotest))

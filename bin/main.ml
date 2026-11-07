@@ -363,9 +363,10 @@ let txindex_arg =
      compatibility (Core operators and tooling pass -txindex=1 alongside
      -coinstatsindex=1) and is otherwise a no-op. Default off (the index is
      present regardless). *)
-  let doc = "Accepted for Bitcoin Core CLI compatibility. camlcoin always \
-             maintains the transaction index (getrawtransaction works \
-             without this flag), so this option is a no-op. \
+  let doc = "Bitcoin Core -txindex: let getrawtransaction look up confirmed \
+             transactions without a blockhash. camlcoin always maintains \
+             the index; without this flag getrawtransaction answers like \
+             Core without -txindex (-5, mempool only). \
              Accepted values: '0' / 'false' / '1' / 'true'." in
   Arg.(value & opt (some string) None &
     info ["txindex"] ~docv:"VAL" ~doc)
@@ -532,7 +533,8 @@ let run_cmd network datadir rpc_host rpc_port rpc_user rpc_password
     externalip_cli discover_cli fallbackfee_cli rest_payjoin_cli =
   (* --txindex is accepted for Core CLI compatibility (camlcoin always
      maintains the tx index); validate its value but otherwise ignore it. *)
-  ignore txindex_cli;
+  Camlcoin.Rpc.txindex_enabled :=
+    (match txindex_cli with Some v -> v <> "0" && v <> "false" | None -> false);
   (* HASHHOG_CAMPAIGN_ASSUMEUTXO — read exactly once here, at the very top of
      the single entry point every subcommand below (migrate / benchmark /
      --import-utxo / normal node-run via Cli.run) funnels through, right

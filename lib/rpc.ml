@@ -1319,7 +1319,12 @@ type tx_location =
   | InMempool
   | InBlock of Types.hash256 * int (* block_hash, tx_index *)
 
-let lookup_transaction (ctx : rpc_context) (txid : Cstruct.t)
+(* Core's getrawtransaction reads confirmed txs without a blockhash only when
+   -txindex is on (rpc/rawtransaction.cpp, g_txindex). camlcoin always
+   maintains the index, so this flag only gates what the RPC exposes. *)
+let txindex_enabled = ref false
+
+let lookup_transaction ?(use_index = !txindex_enabled) (ctx : rpc_context) (txid : Cstruct.t)
     (blockhash_opt : Cstruct.t option) : (Types.transaction * tx_location option, string) result =
   let txid_key = Cstruct.to_string txid in
 
@@ -1346,6 +1351,8 @@ let lookup_transaction (ctx : rpc_context) (txid : Cstruct.t)
     (* Check mempool first *)
     match Hashtbl.find_opt ctx.mempool.entries txid_key with
     | Some entry -> Ok (entry.tx, Some InMempool)
+    | None when not use_index ->
+      Error "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions."
     | None ->
       (* Check txindex for confirmed tx *)
       match Storage.ChainDB.get_tx_index ctx.chain.db txid with
@@ -4297,7 +4304,7 @@ let handle_gettransaction (ctx : rpc_context)
             | None ->
               (match internal_txid_cs with
                | Some cs ->
-                 (match lookup_transaction ctx cs None with
+                 (match lookup_transaction ~use_index:true ctx cs None with
                   | Ok (tx, _) -> Some (tx_to_hex tx)
                   | Error _ -> None)
                | None -> None)

@@ -67,8 +67,8 @@ let chain_headers n =
   arr
 
 (* A chain_state holding headers [1..upto] in memory (blocks_synced = upto). *)
-let with_state ~label (chain : (Types.block_header * Types.hash256) array)
-    ~upto f =
+let with_state ?blocks ~label
+    (chain : (Types.block_header * Types.hash256) array) ~upto f =
   Test_tmp.with_dir ~label (fun path ->
       let db = Storage.ChainDB.create path in
       Fun.protect
@@ -91,7 +91,7 @@ let with_state ~label (chain : (Types.block_header * Types.hash256) array)
             st.Sync.headers_synced <- h;
             prev := e
           done;
-          st.Sync.blocks_synced <- upto;
+          st.Sync.blocks_synced <- Option.value blocks ~default:upto;
           f st))
 
 (* Core ProcessGetHeaders: FindForkInGlobalIndex (first locator hash we
@@ -112,8 +112,11 @@ let core_respond (peer : Sync.chain_state) (locator : Types.hash256 list) =
       Option.map (fun e -> e.Sync.header) (Sync.get_ancestor peer tip h))
     (List.init (max 0 (tip.Sync.height - fork)) (fun i -> fork + 1 + i))
 
-(* cli.ml HeadersMsg listener: a non-empty batch raises the sender's best
-   height to the height of its last header; an empty one does nothing. *)
+(* The part of cli.ml's HeadersMsg listener that matters here: a non-empty
+   batch whose last header we know raises the sender's best height to that
+   header's height; an empty batch does nothing. (The listener also
+   resolves an unknown last header through its prev_block; replies here
+   are always headers the node holds.) *)
 let deliver_headers pm (node : Sync.chain_state) peer_id headers =
   match List.rev headers with
   | [] -> ()
@@ -126,18 +129,20 @@ let deliver_headers pm (node : Sync.chain_state) peer_id headers =
 
 let n = 30
 
-(* The node is at [n]; the outbound peer last sent headers 21+ minutes ago
-   and its recorded best height is n-1 (it announced block n by inv /
-   cmpctblock, which does not touch best_height). The peer really holds
-   headers up to [peer_upto]. Returns (getheaders locator sent, evicted?). *)
-let run_challenge ~peer_upto =
+(* The node holds headers up to [n] and has connected blocks up to
+   [blocks] (default n: header tip = block tip). The outbound peer last sent
+   headers 21+ minutes ago and its recorded best height is blocks-1 (it
+   announced our tip block by inv / cmpctblock, which does not touch
+   best_height). The peer really holds headers up to [peer_upto]. Returns
+   (getheaders locator sent, evicted?, chain). *)
+let run_challenge ?(blocks = n) ~peer_upto () =
   let chain = chain_headers n in
-  with_state ~label:"ce_node" chain ~upto:n (fun node ->
+  with_state ~blocks ~label:"ce_node" chain ~upto:n (fun node ->
       with_state ~label:"ce_peer" chain ~upto:peer_upto (fun peer_chain ->
           let pm = Peer_manager.create Consensus.regtest in
           Peer_manager.set_locator_builder pm (fun () ->
               Sync.build_locator node);
-          Peer_manager.set_height pm (Int32.of_int n);
+          Peer_manager.set_height pm (Int32.of_int blocks);
           Peer_manager.set_header_height pm (Int32.of_int n);
           let a, b = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
           let ours =
@@ -146,7 +151,7 @@ let run_challenge ~peer_upto =
               ~fd:(Lwt_unix.of_unix_file_descr a) ()
           in
           ours.Peer.state <- Peer.Ready;
-          ours.Peer.best_height <- Int32.of_int (n - 1);
+          ours.Peer.best_height <- Int32.of_int (blocks - 1);
           let remote =
             Peer.make_peer ~network:Consensus.regtest ~addr:"198.51.100.8"
               ~port:18444 ~id:8 ~direction:Peer.Inbound
@@ -178,7 +183,7 @@ let run_challenge ~peer_upto =
              Lwt.return (locator, evicted, chain))))
 
 let test_locator_starts_at_tip_parent () =
-  let locator, _, chain = run_challenge ~peer_upto:n in
+  let locator, _, chain = run_challenge ~peer_upto:n () in
   match locator with
   | [] -> Alcotest.fail "empty locator"
   | head :: _ ->
@@ -188,7 +193,7 @@ let test_locator_starts_at_tip_parent () =
       (Cstruct.equal head (snd chain.(n - 1)))
 
 let test_peer_at_our_tip_is_not_evicted () =
-  let _, evicted, _ = run_challenge ~peer_upto:n in
+  let _, evicted, _ = run_challenge ~peer_upto:n () in
   Alcotest.(check bool)
     "a Core peer at our tip answers the challenge with our tip header and is \
      kept"
@@ -197,8 +202,34 @@ let test_peer_at_our_tip_is_not_evicted () =
 (* Negative control: a peer that really is behind (3 blocks) and stays
    behind must still be evicted once the response window has passed. *)
 let test_peer_behind_is_still_evicted () =
-  let _, evicted, _ = run_challenge ~peer_upto:(n - 3) in
+  let _, evicted, _ = run_challenge ~peer_upto:(n - 3) () in
   Alcotest.(check bool) "a peer 3 blocks behind is still evicted" true evicted
+
+(* Header tip one ahead of the block tip (the next block's header is in,
+   the block is still being fetched or connected). Core's challenge is
+   GetLocator(ActiveChain().Tip()->pprev), so a peer that is exactly at
+   our BLOCK tip and does not have the newer header must still answer
+   with our block tip header and be kept. *)
+let test_header_ahead_locator_starts_at_block_tip_parent () =
+  let locator, _, chain = run_challenge ~blocks:(n - 1) ~peer_upto:(n - 1) () in
+  match locator with
+  | [] -> Alcotest.fail "empty locator"
+  | head :: _ ->
+    Alcotest.(check bool)
+      "header tip ahead: locator starts at the BLOCK tip's parent" true
+      (Cstruct.equal head (snd chain.(n - 2)))
+
+let test_header_ahead_peer_at_block_tip_is_not_evicted () =
+  let _, evicted, _ = run_challenge ~blocks:(n - 1) ~peer_upto:(n - 1) () in
+  Alcotest.(check bool)
+    "header tip ahead: a peer at our block tip is kept" false evicted
+
+(* Negative control for the header-ahead shape: a peer 3 blocks behind our
+   block tip is still evicted. *)
+let test_header_ahead_peer_behind_is_still_evicted () =
+  let _, evicted, _ = run_challenge ~blocks:(n - 1) ~peer_upto:(n - 4) () in
+  Alcotest.(check bool)
+    "header tip ahead: a peer 3 blocks behind is still evicted" true evicted
 
 let () =
   Alcotest.run "considereviction_challenge"
@@ -211,5 +242,11 @@ let () =
             test_peer_at_our_tip_is_not_evicted;
           Alcotest.test_case "peer behind is still evicted" `Quick
             test_peer_behind_is_still_evicted;
+          Alcotest.test_case "header ahead: locator at block tip parent"
+            `Quick test_header_ahead_locator_starts_at_block_tip_parent;
+          Alcotest.test_case "header ahead: peer at block tip kept" `Quick
+            test_header_ahead_peer_at_block_tip_is_not_evicted;
+          Alcotest.test_case "header ahead: peer behind still evicted" `Quick
+            test_header_ahead_peer_behind_is_still_evicted;
         ] );
     ]

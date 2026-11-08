@@ -2952,13 +2952,27 @@ let getheaders_locator (pm : t) : Types.hash256 list =
    two minutes later. Mainnet 2026-11-07/08: 75 outbound peers evicted
    this way in 24 h, up to 10 at once.
 
-   The locator from the tip's parent is the tip locator without its head
-   (the next entries are tip-1, tip-2, ... as Core's GetLocator(pprev)
-   starts). A genesis-only locator is kept as is. *)
+   m_work_header is the ACTIVE (validated) tip, our_height here, while
+   getheaders_locator is headed by the best HEADER (header_height), which
+   can lead the block tip while a block is being fetched or connected.
+   The first entries of that locator are one per height (header_height,
+   header_height-1, ..., at least 10 of them, Sync.build_locator_from_entry
+   and build_locator above), so skipping header_height - our_height + 1
+   entries starts it at height our_height-1: the parent of our block tip
+   whenever the best header extends the active chain. The skip is capped
+   at 10 so it never leaves the single-step prefix; if the header tip is
+   further ahead, the locator starts lower and an in-sync peer simply
+   replies with more headers. A genesis-only locator is kept as is. *)
 let challenge_locator (pm : t) : Types.hash256 list =
-  match getheaders_locator pm with
-  | _tip :: (_ :: _ as from_parent) -> from_parent
-  | l -> l
+  let ahead =
+    Int32.to_int pm.header_height - Int32.to_int pm.our_height
+  in
+  let skip = 1 + max 0 (min 9 ahead) in
+  let rec drop n = function
+    | _ :: (_ :: _ as rest) when n > 0 -> drop (n - 1) rest
+    | l -> l
+  in
+  drop skip (getheaders_locator pm)
 
 (** Check all peers for staleness and disconnect stale ones.
     Returns list of (peer_id, reason) for peers that were disconnected. *)

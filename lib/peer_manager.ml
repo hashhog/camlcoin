@@ -2942,6 +2942,24 @@ let getheaders_locator (pm : t) : Types.hash256 list =
        build_locator db (if hh > bh then hh else bh)
      | None -> [])
 
+(* Locator for the ConsiderEviction getheaders challenge. Core sends
+   GetLocator(m_chain_sync.m_work_header->pprev) (net_processing.cpp
+   ConsiderEviction), NOT a locator headed by our tip: a peer that has our
+   tip then answers with at least that tip header, which raises its best
+   known block and clears the challenge. Headed by our tip, an in-sync
+   peer's FindForkInGlobalIndex lands on the tip itself and the reply is an
+   EMPTY headers message, which proves nothing, so the peer was evicted
+   two minutes later. Mainnet 2026-11-07/08: 75 outbound peers evicted
+   this way in 24 h, up to 10 at once.
+
+   The locator from the tip's parent is the tip locator without its head
+   (the next entries are tip-1, tip-2, ... as Core's GetLocator(pprev)
+   starts). A genesis-only locator is kept as is. *)
+let challenge_locator (pm : t) : Types.hash256 list =
+  match getheaders_locator pm with
+  | _tip :: (_ :: _ as from_parent) -> from_parent
+  | l -> l
+
 (** Check all peers for staleness and disconnect stale ones.
     Returns list of (peer_id, reason) for peers that were disconnected. *)
 let check_stale_peers (pm : t) : (int * string) list Lwt.t =
@@ -2992,7 +3010,7 @@ let check_stale_peers (pm : t) : (int * string) list Lwt.t =
         if needs_getheaders_challenge pm peer.Peer.id then begin
           let getheaders = P2p.GetheadersMsg {
             version = 70016l;
-            locator_hashes = getheaders_locator pm;
+            locator_hashes = challenge_locator pm;
             hash_stop = Types.zero_hash;
           } in
           (* #74 (2026-08-27): mark the challenge as sent ONLY when the

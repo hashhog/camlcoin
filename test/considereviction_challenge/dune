@@ -1,0 +1,6 @@
+; ConsiderEviction getheaders challenge locator (peers-camlcoin-outbound).
+; Own directory so the shared test/dune names list is untouched.
+(test
+ (name test_considereviction_challenge)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix)
+ (preprocess (pps lwt_ppx)))

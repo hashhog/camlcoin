@@ -2961,8 +2961,8 @@ let getheaders_locator (pm : t) : Types.hash256 list =
    entries starts it at height our_height-1: the parent of our block tip
    whenever the best header extends the active chain. The skip is capped
    at 10 so it never leaves the single-step prefix; if the header tip is
-   further ahead, the locator starts lower and an in-sync peer simply
-   replies with more headers. A genesis-only locator is kept as is. *)
+   more than 9 blocks ahead, the locator still starts above our block tip
+   (as before this fix). A genesis-only locator is kept as is. *)
 let challenge_locator (pm : t) : Types.hash256 list =
   let ahead =
     Int32.to_int pm.header_height - Int32.to_int pm.our_height

@@ -2942,6 +2942,38 @@ let getheaders_locator (pm : t) : Types.hash256 list =
        build_locator db (if hh > bh then hh else bh)
      | None -> [])
 
+(* Locator for the ConsiderEviction getheaders challenge. Core sends
+   GetLocator(m_chain_sync.m_work_header->pprev) (net_processing.cpp
+   ConsiderEviction), NOT a locator headed by our tip: a peer that has our
+   tip then answers with at least that tip header, which raises its best
+   known block and clears the challenge. Headed by our tip, an in-sync
+   peer's FindForkInGlobalIndex lands on the tip itself and the reply is an
+   EMPTY headers message, which proves nothing, so the peer was evicted
+   two minutes later. Mainnet 2026-11-07/08: 75 outbound peers evicted
+   this way in 24 h, up to 10 at once.
+
+   m_work_header is the ACTIVE (validated) tip, our_height here, while
+   getheaders_locator is headed by the best HEADER (header_height), which
+   can lead the block tip while a block is being fetched or connected.
+   The first entries of that locator are one per height (header_height,
+   header_height-1, ..., at least 10 of them, Sync.build_locator_from_entry
+   and build_locator above), so skipping header_height - our_height + 1
+   entries starts it at height our_height-1: the parent of our block tip
+   whenever the best header extends the active chain. The skip is capped
+   at 10 so it never leaves the single-step prefix; if the header tip is
+   more than 9 blocks ahead, the locator still starts above our block tip
+   (as before this fix). A genesis-only locator is kept as is. *)
+let challenge_locator (pm : t) : Types.hash256 list =
+  let ahead =
+    Int32.to_int pm.header_height - Int32.to_int pm.our_height
+  in
+  let skip = 1 + max 0 (min 9 ahead) in
+  let rec drop n = function
+    | _ :: (_ :: _ as rest) when n > 0 -> drop (n - 1) rest
+    | l -> l
+  in
+  drop skip (getheaders_locator pm)
+
 (** Check all peers for staleness and disconnect stale ones.
     Returns list of (peer_id, reason) for peers that were disconnected. *)
 let check_stale_peers (pm : t) : (int * string) list Lwt.t =
@@ -2992,7 +3024,7 @@ let check_stale_peers (pm : t) : (int * string) list Lwt.t =
         if needs_getheaders_challenge pm peer.Peer.id then begin
           let getheaders = P2p.GetheadersMsg {
             version = 70016l;
-            locator_hashes = getheaders_locator pm;
+            locator_hashes = challenge_locator pm;
             hash_stop = Types.zero_hash;
           } in
           (* #74 (2026-08-27): mark the challenge as sent ONLY when the

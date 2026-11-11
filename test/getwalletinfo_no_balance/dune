@@ -1,0 +1,5 @@
+; Core-parity: getwalletinfo has no balance fields (cause B).
+; Own directory so the shared test/dune names list is untouched.
+(test
+ (name test_getwalletinfo_no_balance)
+ (libraries camlcoin test_tmp alcotest unix yojson))

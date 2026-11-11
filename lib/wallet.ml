@@ -4216,16 +4216,14 @@ let list_wallets (wm : wallet_manager) : string list =
 let is_wallet_loaded (wm : wallet_manager) (name : string) : bool =
   Hashtbl.mem wm.wallets name
 
-(* Get wallet info as JSON-like structure *)
+(* Get wallet info as JSON-like structure.  No balance fields: Core's
+   getwalletinfo has none (balances come from getbalances / getbalance). *)
 type wallet_info = {
   wallet_name : string;
   wallet_version : int;
   format : string;
   tx_count : int;
   keypoolsize : int;
-  balance : float;
-  unconfirmed_balance : float;
-  immature_balance : float;
   private_keys_enabled : bool;
   avoid_reuse : bool;
   scanning : bool;
@@ -4246,16 +4244,12 @@ let wallet_flag_names (w : t) : string list =
   flags @ ["descriptor_wallet"]
 
 let get_wallet_info (name : string) (w : t) : wallet_info =
-  let confirmed, unconfirmed = get_balance w in
   let wallet_name = if name <> "" then name else w.name in
   { wallet_name;
     wallet_version = 169900;  (* Bitcoin Core 0.16.99 format *)
     format = "sqlite";
     tx_count = List.length w.tx_history;
     keypoolsize = List.length w.keys;
-    balance = Int64.to_float confirmed /. 100_000_000.0;
-    unconfirmed_balance = Int64.to_float unconfirmed /. 100_000_000.0;
-    immature_balance = 0.0;  (* TODO: track immature coinbase *)
     (* WALLET_FLAG_DISABLE_PRIVATE_KEYS forces private_keys_enabled=false
        regardless of any (watch-only) keys/scripts.  Otherwise: enabled if the
        wallet has a master key or any non-empty private key. *)

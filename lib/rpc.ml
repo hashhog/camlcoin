@@ -4567,9 +4567,6 @@ let handle_getwalletinfo (ctx : rpc_context)
       ("walletname", `String info.Wallet.wallet_name);
       ("walletversion", `Int info.wallet_version);
       ("format", `String info.format);
-      ("balance", `Float info.balance);
-      ("unconfirmed_balance", `Float info.unconfirmed_balance);
-      ("immature_balance", `Float info.immature_balance);
       ("txcount", `Int info.tx_count);
       ("keypoolsize", `Int info.keypoolsize);
       ("private_keys_enabled", `Bool info.private_keys_enabled);

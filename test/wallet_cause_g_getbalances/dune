@@ -1,0 +1,5 @@
+; wallet cause G: getbalances.mine.immature / trusted split.  Own directory so
+; the shared test/dune names list is untouched.
+(test
+ (name test_wallet_cause_g_getbalances)
+ (libraries camlcoin test_tmp alcotest yojson))

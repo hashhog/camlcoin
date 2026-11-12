@@ -1069,7 +1069,7 @@ let scan_block (w : t) (block : Types.block) (height : int) : unit =
        can no longer find it; the promotion here is the authoritative path. *)
     if Hashtbl.mem w.sent_transactions txid_hex then
       w.tx_history <- List.map (fun h ->
-        if h.hist_txid = txid_display && h.hist_category = `Send
+        if h.hist_txid = txid_display && h.hist_category <> `Generate
            && h.hist_block_height = 0
         then { h with
                hist_block_hash = block_hash_hex;
@@ -2223,6 +2223,16 @@ let create_transaction (w : t) ~(dest_address : string)
         hist_block_height = 0;
         hist_timestamp = Unix.gettimeofday ();
       } in
+      (* Core CachedTxGetAmounts: a payment to one of our own scripts is ALSO a
+         receive entry (change is in neither list).  tx_history is newest
+         first, so push the receive first: details then read send, receive,
+         the order of Core's ListTransactions. *)
+      (match is_mine w dest_script with
+       | Some _ ->
+         w.tx_history <- { hist_entry with
+                           hist_category = `Receive; hist_fee = 0L }
+                         :: w.tx_history
+       | None -> ());
       w.tx_history <- hist_entry :: w.tx_history;
 
       Ok signed_tx
@@ -2329,6 +2339,14 @@ let create_transaction_multi (w : t)
         hist_block_height = 0;
         hist_timestamp = Unix.gettimeofday ();
       } in
+      (* Core CachedTxGetAmounts: an owned non-change output is also a
+         receive (pushed first so details read send, receive). *)
+      (match Address.address_of_string addr_str with
+       | Ok dest_addr when is_mine w (build_output_script dest_addr) <> None ->
+         w.tx_history <- { hist_entry with
+                           hist_category = `Receive; hist_fee = 0L }
+                         :: w.tx_history
+       | _ -> ());
       w.tx_history <- hist_entry :: w.tx_history
     ) outputs;
 

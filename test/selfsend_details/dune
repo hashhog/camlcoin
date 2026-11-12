@@ -1,0 +1,5 @@
+; Core-parity: gettransaction.details for a send-to-self (cause D).
+; Own directory so the shared test/dune names list is untouched.
+(test
+ (name test_selfsend_details)
+ (libraries camlcoin test_tmp alcotest unix yojson))

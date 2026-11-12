@@ -11924,12 +11924,21 @@ let handle_getbalances (ctx : rpc_context)
         if Wallet.is_spendable_at u tip_height
         then Int64.add acc u.utxo.Utxo.value else acc)
         0L (Wallet.get_utxos wallet) in
+    (* mine.immature = confirmed coinbase outputs still short of maturity
+       (Core GetBalance: m_mine_immature via IsTxImmatureCoinBase, i.e. the
+       complement of the matured coinbases counted in trusted). *)
+    let immature =
+      List.fold_left (fun acc (u : Wallet.wallet_utxo) ->
+        if u.confirmed && u.utxo.Utxo.is_coinbase
+           && not (Wallet.is_spendable_at u tip_height)
+        then Int64.add acc u.utxo.Utxo.value else acc)
+        0L (Wallet.get_utxos wallet) in
     let to_btc v = `Float (Int64.to_float v /. 100_000_000.0) in
     Ok (`Assoc [
       ("mine", `Assoc [
         ("trusted", to_btc trusted);
         ("untrusted_pending", to_btc 0L);
-        ("immature", to_btc 0L);
+        ("immature", to_btc immature);
       ]);
       ("lastprocessedblock", last_processed_block_json ctx wallet);
     ])

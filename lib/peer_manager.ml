@@ -39,7 +39,7 @@ type config = {
   ban_duration : float;  (* Default ban duration in seconds *)
   ping_interval : float; (* Seconds between pings *)
   dead_timeout : float;  (* Seconds before peer considered dead *)
-  chain_sync_timeout : float; (* Seconds before evicting outbound peer behind our tip *)
+  chain_sync_timeout : float; (* Unused since the duplicate behind-tip eviction was dropped; kept for config compatibility *)
   max_block_relay_only_anchors : int; (* Max anchor connections to persist, default 2 *)
   max_block_relay_only : int; (* Max dedicated block-relay-only outbound connections, default 2 *)
   proxy_config : P2p.proxy_config;
@@ -3518,20 +3518,25 @@ let maintain_connections (pm : t) : unit Lwt.t =
         let* () = Lwt_list.iter_s (fun p ->
           remove_peer pm p.Peer.id
         ) dead in
-        (* Evict outbound peers behind our chain tip for too long *)
-        let* () =
+        (* Track how long each outbound peer has looked behind our tip.
+           This is bookkeeping only (check_stale_tip uses it to pick the
+           longest-behind peer to rotate).  It deliberately does NOT evict:
+           best_height moves only on headers/VERSION, so a peer that
+           announced the tip by cmpctblock/inv/block looks behind forever.
+           Core has one chain-sync eviction (ConsiderEviction), which
+           challenges with getheaders first; that is check_stale_peers /
+           check_headers_timeout. *)
+        let () =
           let our_h = Int32.to_int pm.our_height in
           let behind = List.filter (fun p ->
             p.Peer.state = Peer.Ready &&
             p.Peer.direction = Peer.Outbound &&
             Int32.to_int p.Peer.best_height < our_h - 1
           ) pm.peers in
-          (* Track when each outbound peer first fell behind *)
           List.iter (fun p ->
             if not (Hashtbl.mem pm.chain_sync_behind_since p.Peer.id) then
               Hashtbl.replace pm.chain_sync_behind_since p.Peer.id now
           ) behind;
-          (* Clear tracking for peers that caught up *)
           let caught_up_ids = Hashtbl.fold (fun pid _ts acc ->
             match List.find_opt (fun p -> p.Peer.id = pid) behind with
             | Some _ -> acc
@@ -3539,17 +3544,7 @@ let maintain_connections (pm : t) : unit Lwt.t =
           ) pm.chain_sync_behind_since [] in
           List.iter (fun pid ->
             Hashtbl.remove pm.chain_sync_behind_since pid
-          ) caught_up_ids;
-          (* Disconnect peers behind for longer than chain_sync_timeout *)
-          let to_evict = Hashtbl.fold (fun pid ts acc ->
-            if now -. ts > pm.config.chain_sync_timeout then pid :: acc
-            else acc
-          ) pm.chain_sync_behind_since [] in
-          Lwt_list.iter_s (fun pid ->
-            Log.info (fun m -> m "Evicting outbound peer %d: behind our tip for >%.0fs"
-              pid pm.config.chain_sync_timeout);
-            remove_peer pm pid
-          ) to_evict
+          ) caught_up_ids
         in
         (* Check for stale chain tip *)
         let* () = check_stale_tip pm in

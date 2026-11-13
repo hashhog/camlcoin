@@ -1,0 +1,7 @@
+; maintain_connections must not run a second, challenge-less behind-tip
+; eviction (drop-duplicate-behind-tip-eviction). Own directory so the shared
+; test/dune names list is untouched.
+(test
+ (name test_drop_behind_tip_eviction)
+ (libraries camlcoin alcotest lwt lwt.unix unix)
+ (preprocess (pps lwt_ppx)))

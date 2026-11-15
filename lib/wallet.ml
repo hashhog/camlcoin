@@ -519,6 +519,12 @@ type t = {
      Distinct from the "" default slot the same object may also occupy.
      Surfaces as getwalletinfo.walletname. *)
   mutable name : string;
+  (* Address book: encoded address -> label.  Core's getnewaddress writes an
+     entry for every receive address it hands out (CWallet::GetNewDestination
+     -> SetAddressBook(dest, label, AddressPurpose::RECEIVE)), with label ""
+     when none is given, and getaddressinfo reports [labels] from it.  Change
+     addresses get no entry.  Persisted as "address_book". *)
+  address_book : (string, string) Hashtbl.t;
 }
 
 (* ============================================================================
@@ -560,6 +566,7 @@ let create ~(network : [`Mainnet | `Testnet | `Regtest])
     blank = false;
     last_synced_height = -1;
     name = "";
+    address_book = Hashtbl.create 16;
   }
 
 (* ============================================================================
@@ -883,6 +890,14 @@ let mine_kind (w : t) (script_pubkey : Cstruct.t) : [`Key of key_pair | `Watched
 let can_get_addresses (w : t) : bool =
   if w.disable_private_keys then false
   else (Option.is_some w.master_key) || (w.keys <> [])
+
+(* Address book (see [t.address_book]).  Keyed by the canonical encoding so
+   a lookup through any spelling of the same destination finds the entry. *)
+let set_address_label (w : t) (addr : Address.address) (label : string) : unit =
+  Hashtbl.replace w.address_book (Address.address_to_string addr) label
+
+let address_label (w : t) (addr : Address.address) : string option =
+  Hashtbl.find_opt w.address_book (Address.address_to_string addr)
 
 (* Find keypair by address string *)
 let find_by_address (w : t) (addr_str : string) : key_pair option =
@@ -3032,6 +3047,10 @@ let wallet_to_json (w : t) : Yojson.Safe.t =
     ("disable_private_keys", `Bool w.disable_private_keys);
     ("blank", `Bool w.blank);
     ("name", `String w.name);
+    ("address_book",
+     `Assoc (Hashtbl.fold (fun a l acc -> (a, `String l) :: acc)
+               w.address_book []
+             |> List.sort compare));
   ] @ encryption_json)
 
 (* Save wallet to file.  Atomic + durable: writes to a temp file, fsyncs,
@@ -3221,6 +3240,15 @@ let load_wallet_json (w : t) (network : [`Mainnet | `Testnet | `Regtest]) (json 
      | Some (`Bool b) -> w.blank <- b | _ -> ());
     (match List.assoc_opt "name" fields with
      | Some (`String n) -> w.name <- n | _ -> ());
+    (* Absent in wallet files written before the address book existed:
+       those addresses keep an empty labels list. *)
+    (match List.assoc_opt "address_book" fields with
+     | Some (`Assoc entries) ->
+       Hashtbl.reset w.address_book;
+       List.iter (function
+         | (a, `String l) -> Hashtbl.replace w.address_book a l
+         | _ -> ()) entries
+     | _ -> ());
     (* Written by an [encrypt_wallet] wallet: it loads encrypted and locked. *)
     (match List.assoc_opt "encryption" fields with
      | Some (`Assoc ef) ->

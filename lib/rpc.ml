@@ -3399,6 +3399,13 @@ let handle_getnewaddress (ctx : rpc_context)
       | Error e -> Error e
       | Ok addr_type ->
         let kp = Wallet.generate_key_typed wallet addr_type in
+        (* Core GetNewDestination writes an address-book entry for every
+           receive address, label "" when the label argument is absent or
+           null (LabelFromValue), so getaddressinfo then lists it. *)
+        let label = match params with
+          | `String l :: _ -> l
+          | _ -> "" in
+        Wallet.set_address_label wallet kp.Wallet.address label;
         (* Save-on-mutation: a freshly derived address (keypool/index advance)
            must survive an unclean restart, else funds sent to it before the
            next clean shutdown become unrecoverable without a manual reseed. *)
@@ -11862,7 +11869,24 @@ let handle_getaddressinfo (ctx : rpc_context)
             | Address.P2WPKH | Address.P2WSH | Address.P2TR
             | Address.WitnessUnknown _ -> true
             | _ -> false) in
+          (* Core DescribeAddress (rpc/util.cpp): isscript is false for
+             PKHash / WitnessV0KeyHash, true for ScriptHash /
+             WitnessV0ScriptHash / WitnessV1Taproot / PayToAnchor, and
+             absent for WitnessUnknown.  PayToAnchor (v1, program 0x4e73)
+             also carries no witness_version / witness_program. *)
+          let is_anchor = match addr.Address.addr_type with
+            | Address.WitnessUnknown 1 ->
+              Cstruct.length addr.Address.hash = 2
+              && Cstruct.get_uint8 addr.Address.hash 0 = 0x4e
+              && Cstruct.get_uint8 addr.Address.hash 1 = 0x73
+            | _ -> false in
+          let isscript = match addr.Address.addr_type with
+            | Address.P2PKH | Address.P2WPKH -> Some false
+            | Address.P2SH | Address.P2WSH | Address.P2TR -> Some true
+            | Address.WitnessUnknown _ -> if is_anchor then Some true else None
+          in
           let witness_version = match addr.Address.addr_type with
+            | _ when is_anchor -> None
             | Address.P2WPKH | Address.P2WSH -> Some 0
             | Address.P2TR -> Some 1
             | Address.WitnessUnknown v -> Some v
@@ -11892,6 +11916,16 @@ let handle_getaddressinfo (ctx : rpc_context)
                 ("witness_program", `String (cstruct_to_hex addr.Address.hash)) ]
             | None -> []
           in
+          (* labels: the address-book entry's label, if any
+             (addresses.cpp: FindAddressBookEntry -> labels.push_back). *)
+          let labels = match Wallet.address_label wallet addr with
+            | Some l -> [`String l]
+            | None -> [] in
+          let isscript_field = match isscript with
+            | Some b -> [("isscript", `Bool b)]
+            | None -> [] in
+          (* Core order: iswatchonly, then DescribeWalletAddress (isscript,
+             iswitness, witness_version, witness_program), ischange, labels. *)
           Ok (`Assoc ([
             ("address", `String addr_str);
             ("scriptPubKey", `String (cstruct_to_hex script));
@@ -11899,10 +11933,11 @@ let handle_getaddressinfo (ctx : rpc_context)
             ("solvable", `Bool solvable);
           ] @ desc_fields @ [
             ("iswatchonly", `Bool false);
+          ] @ isscript_field @ [
             ("iswitness", `Bool iswitness);
-            ("ischange", `Bool ischange);
           ] @ witness_fields @ [
-            ("labels", `List []);
+            ("ischange", `Bool ischange);
+            ("labels", `List labels);
           ])))
      | _ -> Error "Invalid parameters: expected [address]")
 

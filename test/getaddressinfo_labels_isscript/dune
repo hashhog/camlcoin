@@ -1,0 +1,5 @@
+; Core-parity: getaddressinfo isscript + labels (wallet cause H).
+; Own directory so the shared test/dune names list is untouched.
+(test
+ (name test_getaddressinfo_labels_isscript)
+ (libraries camlcoin test_tmp alcotest unix yojson))

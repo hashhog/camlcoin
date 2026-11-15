@@ -1435,12 +1435,11 @@ let select_coins (w : t) (target : int64) (fee_rate : float)
         change;
       }
     | None ->
-      let total_available = List.fold_left (fun acc u ->
-        Int64.add acc u.utxo.Utxo.value
-      ) 0L available in
-      Error (Printf.sprintf
-        "Insufficient funds: have %Ld satoshis, need %Ld"
-        total_available target_with_fee)
+      (* Core CreateTransactionInternal (wallet/spend.cpp): a selection
+         failure with no specific reason is util::Error{_("Insufficient
+         funds")}, and sendtoaddress raises exactly that text with -6.  The
+         have/need amounts stay out of the message, as in Core. *)
+      Error "Insufficient funds"
 
 (* Primary coin selection interface: BnB with SRD fallback.
    As specified: try_bnb target fee_rate utxos |> Option.value ~default:(srd target fee_rate utxos) *)

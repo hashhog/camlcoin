@@ -105,6 +105,25 @@ let test_change_address_unlabelled () =
       let a = Address.address_to_string kp.Wallet.address in
       Alcotest.check slist "labels of a change address" [] (labels (info ctx a)))
 
+(* Core LabelFromValue: "*" is -11 "Invalid label name", a non-string label
+   fails RPCHelpMan's type check with -3, and neither mints a key. *)
+let test_label_argument_errors () =
+  with_ctx (fun ctx w ->
+      let keys_before = List.length w.Wallet.keys in
+      (match Rpc.dispatch_rpc ctx "getnewaddress" [`String "*"] with
+       | Error (c, m) ->
+         Alcotest.(check int) "\"*\" label code" (-11) c;
+         Alcotest.(check string) "\"*\" label message" "Invalid label name" m
+       | Ok j -> Alcotest.failf "\"*\" label accepted: %s" (Yojson.Safe.to_string j));
+      (match Rpc.dispatch_rpc ctx "getnewaddress" [`Int 5] with
+       | Error (c, m) ->
+         Alcotest.(check int) "number label code" (-3) c;
+         Alcotest.(check string) "number label message"
+           "JSON value of type number is not of expected type string" m
+       | Ok j -> Alcotest.failf "number label accepted: %s" (Yojson.Safe.to_string j));
+      Alcotest.(check int) "no key minted by a rejected label" keys_before
+        (List.length w.Wallet.keys))
+
 (* Core's field order: iswatchonly, isscript, iswitness, witness_version,
    witness_program, ischange, labels. *)
 let test_field_order () =
@@ -135,6 +154,8 @@ let () =
       Alcotest.test_case "isscript per address type" `Quick test_isscript_per_type;
       Alcotest.test_case "change address has no label" `Quick
         test_change_address_unlabelled;
+      Alcotest.test_case "getnewaddress label errors follow LabelFromValue"
+        `Quick test_label_argument_errors;
       Alcotest.test_case "field order follows Core" `Quick test_field_order;
       Alcotest.test_case "label persists across save/load" `Quick
         test_label_persists;

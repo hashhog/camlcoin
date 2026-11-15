@@ -3360,15 +3360,31 @@ let handle_getbalance (ctx : rpc_context)
 
 let handle_getnewaddress (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  (* The label argument is RPCArg::Type::STR: RPCHelpMan type-checks it
+     before the handler runs (RPCArg::MatchesType, rpc/util.cpp), -3. *)
+  match params with
+  | v :: _ when (match v with `Null | `String _ -> false | _ -> true) ->
+    Error (rpc_type_error,
+           Printf.sprintf "JSON value of type %s is not of expected type string"
+             (core_uvtype v))
+  | _ ->
   match ctx.wallet with
   | None -> Error (rpc_wallet_error, "Wallet not loaded")
   | Some wallet ->
+    (* Core LabelFromValue (wallet/rpc/util.cpp), parsed before any key is
+       generated: absent or null is the default label "", and "*" is
+       RPC_WALLET_INVALID_LABEL_NAME (-11). *)
+    let label = match params with
+      | `String l :: _ -> l
+      | _ -> "" in
     (* Core: a wallet with no available keys (disable_private_keys / blank,
        no keypool) cannot mint a receive address — RPC_WALLET_ERROR (-4)
        "Error: This wallet has no available keys" (addresses.cpp:46-48).
        Guard BEFORE deriving so a watch-only wallet never stores a key. *)
     if not (Wallet.can_get_addresses wallet) then
       Error (rpc_wallet_error, "Error: This wallet has no available keys")
+    else if label = "*" then
+      Error ((-11) (* RPC_WALLET_INVALID_LABEL_NAME *), "Invalid label name")
     (* A locked encrypted wallet cannot encrypt a new key, so the key could
        not be saved: Core's answer when a locked wallet's keypool is empty,
        RPC_WALLET_KEYPOOL_RAN_OUT (-12). *)
@@ -3400,11 +3416,8 @@ let handle_getnewaddress (ctx : rpc_context)
       | Ok addr_type ->
         let kp = Wallet.generate_key_typed wallet addr_type in
         (* Core GetNewDestination writes an address-book entry for every
-           receive address, label "" when the label argument is absent or
-           null (LabelFromValue), so getaddressinfo then lists it. *)
-        let label = match params with
-          | `String l :: _ -> l
-          | _ -> "" in
+           receive address it hands out, so getaddressinfo then lists the
+           label. *)
         Wallet.set_address_label wallet kp.Wallet.address label;
         (* Save-on-mutation: a freshly derived address (keypool/index advance)
            must survive an unclean restart, else funds sent to it before the
@@ -11871,22 +11884,14 @@ let handle_getaddressinfo (ctx : rpc_context)
             | _ -> false) in
           (* Core DescribeAddress (rpc/util.cpp): isscript is false for
              PKHash / WitnessV0KeyHash, true for ScriptHash /
-             WitnessV0ScriptHash / WitnessV1Taproot / PayToAnchor, and
-             absent for WitnessUnknown.  PayToAnchor (v1, program 0x4e73)
-             also carries no witness_version / witness_program. *)
-          let is_anchor = match addr.Address.addr_type with
-            | Address.WitnessUnknown 1 ->
-              Cstruct.length addr.Address.hash = 2
-              && Cstruct.get_uint8 addr.Address.hash 0 = 0x4e
-              && Cstruct.get_uint8 addr.Address.hash 1 = 0x73
-            | _ -> false in
+             WitnessV0ScriptHash / WitnessV1Taproot, and absent for
+             WitnessUnknown. *)
           let isscript = match addr.Address.addr_type with
             | Address.P2PKH | Address.P2WPKH -> Some false
             | Address.P2SH | Address.P2WSH | Address.P2TR -> Some true
-            | Address.WitnessUnknown _ -> if is_anchor then Some true else None
+            | Address.WitnessUnknown _ -> None
           in
           let witness_version = match addr.Address.addr_type with
-            | _ when is_anchor -> None
             | Address.P2WPKH | Address.P2WSH -> Some 0
             | Address.P2TR -> Some 1
             | Address.WitnessUnknown v -> Some v

@@ -106,7 +106,7 @@ let test_change_address_unlabelled () =
       Alcotest.check slist "labels of a change address" [] (labels (info ctx a)))
 
 (* Core LabelFromValue: "*" is -11 "Invalid label name", a non-string label
-   fails RPCHelpMan's type check with -3, and neither mints a key. *)
+   fails RPCHelpMan's type check with -3 "Wrong type passed", and neither mints a key. *)
 let test_label_argument_errors () =
   with_ctx (fun ctx w ->
       let keys_before = List.length w.Wallet.keys in
@@ -119,7 +119,8 @@ let test_label_argument_errors () =
        | Error (c, m) ->
          Alcotest.(check int) "number label code" (-3) c;
          Alcotest.(check string) "number label message"
-           "JSON value of type number is not of expected type string" m
+           "Wrong type passed:\n{\n    \"Position 1 (label)\": \"JSON value of type number is not of expected type string\"\n}"
+           m
        | Ok j -> Alcotest.failf "number label accepted: %s" (Yojson.Safe.to_string j));
       Alcotest.(check int) "no key minted by a rejected label" keys_before
         (List.length w.Wallet.keys))

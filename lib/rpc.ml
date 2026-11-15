@@ -3360,13 +3360,14 @@ let handle_getbalance (ctx : rpc_context)
 
 let handle_getnewaddress (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
-  (* The label argument is RPCArg::Type::STR: RPCHelpMan type-checks it
-     before the handler runs (RPCArg::MatchesType, rpc/util.cpp), -3. *)
+  (* The label argument is RPCArg::Type::STR: RPCHelpMan::HandleRequest
+     type-checks it before the handler runs (rpc/util.cpp, MatchesType) and
+     throws RPC_TYPE_ERROR (-3) "Wrong type passed:" with the mismatch. *)
   match params with
   | v :: _ when (match v with `Null | `String _ -> false | _ -> true) ->
-    Error (rpc_type_error,
-           Printf.sprintf "JSON value of type %s is not of expected type string"
-             (core_uvtype v))
+    Error (rpc_type_error, Printf.sprintf
+      "Wrong type passed:\n{\n    \"Position 1 (label)\": \"JSON value of type %s is not of expected type string\"\n}"
+      (core_uvtype v))
   | _ ->
   match ctx.wallet with
   | None -> Error (rpc_wallet_error, "Wallet not loaded")

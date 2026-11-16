@@ -3360,15 +3360,32 @@ let handle_getbalance (ctx : rpc_context)
 
 let handle_getnewaddress (ctx : rpc_context)
     (params : Yojson.Safe.t list) : (Yojson.Safe.t, int * string) result =
+  (* The label argument is RPCArg::Type::STR: RPCHelpMan::HandleRequest
+     type-checks it before the handler runs (rpc/util.cpp, MatchesType) and
+     throws RPC_TYPE_ERROR (-3) "Wrong type passed:" with the mismatch. *)
+  match params with
+  | v :: _ when (match v with `Null | `String _ -> false | _ -> true) ->
+    Error (rpc_type_error, Printf.sprintf
+      "Wrong type passed:\n{\n    \"Position 1 (label)\": \"JSON value of type %s is not of expected type string\"\n}"
+      (core_uvtype v))
+  | _ ->
   match ctx.wallet with
   | None -> Error (rpc_wallet_error, "Wallet not loaded")
   | Some wallet ->
+    (* Core LabelFromValue (wallet/rpc/util.cpp), parsed before any key is
+       generated: absent or null is the default label "", and "*" is
+       RPC_WALLET_INVALID_LABEL_NAME (-11). *)
+    let label = match params with
+      | `String l :: _ -> l
+      | _ -> "" in
     (* Core: a wallet with no available keys (disable_private_keys / blank,
        no keypool) cannot mint a receive address — RPC_WALLET_ERROR (-4)
        "Error: This wallet has no available keys" (addresses.cpp:46-48).
        Guard BEFORE deriving so a watch-only wallet never stores a key. *)
     if not (Wallet.can_get_addresses wallet) then
       Error (rpc_wallet_error, "Error: This wallet has no available keys")
+    else if label = "*" then
+      Error ((-11) (* RPC_WALLET_INVALID_LABEL_NAME *), "Invalid label name")
     (* A locked encrypted wallet cannot encrypt a new key, so the key could
        not be saved: Core's answer when a locked wallet's keypool is empty,
        RPC_WALLET_KEYPOOL_RAN_OUT (-12). *)
@@ -3399,6 +3416,10 @@ let handle_getnewaddress (ctx : rpc_context)
       | Error e -> Error e
       | Ok addr_type ->
         let kp = Wallet.generate_key_typed wallet addr_type in
+        (* Core GetNewDestination writes an address-book entry for every
+           receive address it hands out, so getaddressinfo then lists the
+           label. *)
+        Wallet.set_address_label wallet kp.Wallet.address label;
         (* Save-on-mutation: a freshly derived address (keypool/index advance)
            must survive an unclean restart, else funds sent to it before the
            next clean shutdown become unrecoverable without a manual reseed. *)
@@ -11862,6 +11883,15 @@ let handle_getaddressinfo (ctx : rpc_context)
             | Address.P2WPKH | Address.P2WSH | Address.P2TR
             | Address.WitnessUnknown _ -> true
             | _ -> false) in
+          (* Core DescribeAddress (rpc/util.cpp): isscript is false for
+             PKHash / WitnessV0KeyHash, true for ScriptHash /
+             WitnessV0ScriptHash / WitnessV1Taproot, and absent for
+             WitnessUnknown. *)
+          let isscript = match addr.Address.addr_type with
+            | Address.P2PKH | Address.P2WPKH -> Some false
+            | Address.P2SH | Address.P2WSH | Address.P2TR -> Some true
+            | Address.WitnessUnknown _ -> None
+          in
           let witness_version = match addr.Address.addr_type with
             | Address.P2WPKH | Address.P2WSH -> Some 0
             | Address.P2TR -> Some 1
@@ -11892,6 +11922,16 @@ let handle_getaddressinfo (ctx : rpc_context)
                 ("witness_program", `String (cstruct_to_hex addr.Address.hash)) ]
             | None -> []
           in
+          (* labels: the address-book entry's label, if any
+             (addresses.cpp: FindAddressBookEntry -> labels.push_back). *)
+          let labels = match Wallet.address_label wallet addr with
+            | Some l -> [`String l]
+            | None -> [] in
+          let isscript_field = match isscript with
+            | Some b -> [("isscript", `Bool b)]
+            | None -> [] in
+          (* Core order: iswatchonly, then DescribeWalletAddress (isscript,
+             iswitness, witness_version, witness_program), ischange, labels. *)
           Ok (`Assoc ([
             ("address", `String addr_str);
             ("scriptPubKey", `String (cstruct_to_hex script));
@@ -11899,10 +11939,11 @@ let handle_getaddressinfo (ctx : rpc_context)
             ("solvable", `Bool solvable);
           ] @ desc_fields @ [
             ("iswatchonly", `Bool false);
+          ] @ isscript_field @ [
             ("iswitness", `Bool iswitness);
-            ("ischange", `Bool ischange);
           ] @ witness_fields @ [
-            ("labels", `List []);
+            ("ischange", `Bool ischange);
+            ("labels", `List labels);
           ])))
      | _ -> Error "Invalid parameters: expected [address]")
 

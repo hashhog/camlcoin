@@ -1,0 +1,5 @@
+; Core-parity: sendtoaddress insufficient-funds message text (wallet cause J).
+; Own directory so the shared test/dune names list is untouched.
+(test
+ (name test_sendtoaddress_insufficient_message)
+ (libraries camlcoin test_tmp alcotest unix yojson))

@@ -407,10 +407,10 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
       (if config.peer_bloom_filters then "enabled (-peerbloomfilters=1)"
        else "disabled (Core default)"));
 
-  (* BIP-159: advertise NODE_NETWORK_LIMITED when prune mode is on.
-     Mirrors Core init.cpp `nLocalServices |= NODE_NETWORK_LIMITED`
-     gated on `IsPruneMode()`.  Set BEFORE any peer/handshake work for
-     the same reason as the bloom flag. *)
+  (* Pruned node: drop NODE_NETWORK from the advertised services (Core
+     init.cpp ~1947-1950; NODE_NETWORK_LIMITED is always on).  Also arms the
+     deep-getdata disconnect in Peer.handle_getdata.  Set BEFORE any
+     peer/handshake work for the same reason as the bloom flag. *)
   Peer.set_prune_mode_advertise (config.prune > 0);
   Logs.info (fun m ->
     m "NODE_NETWORK_LIMITED (BIP-159) advertisement: %s"

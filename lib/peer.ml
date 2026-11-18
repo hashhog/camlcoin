@@ -80,15 +80,12 @@ let peer_bloom_filters : bool ref = ref false
 let set_peer_bloom_filters (b : bool) : unit =
   peer_bloom_filters := b
 
-(* BIP-159 NODE_NETWORK_LIMITED advertisement gate.  Set at startup by
-   [Cli.run] from [config.prune > 0].  Retained for callers/diagnostics,
-   but NO LONGER gates the advertised NODE_NETWORK_LIMITED bit:
-   Bitcoin Core advertises NODE_NETWORK_LIMITED UNCONDITIONALLY for a full
-   node (init.cpp:863 — `g_local_services = ServiceFlags(NODE_NETWORK_LIMITED
-   | NODE_WITNESS)`), because every full node serves at least the recent
-   ~288-block window.  A pruned node advertises the SAME bit and simply
-   omits NODE_NETWORK; it is NOT the trigger for NODE_NETWORK_LIMITED.
-   So [our_services ()] now sets [network_limited = true] unconditionally. *)
+(* Pruned-node gate.  Set at startup by [Cli.run] from [config.prune > 0].
+   NODE_NETWORK_LIMITED is advertised UNCONDITIONALLY (Core init.cpp:863
+   seeds g_local_services = NETWORK_LIMITED | WITNESS), but NODE_NETWORK is
+   ORed in only when NOT pruning (init.cpp ~1947-1950), so when this ref is
+   true [our_services ()] omits NODE_NETWORK.  Also selects the Core
+   ProcessGetBlockData deep-block disconnect in [handle_getdata]. *)
 let prune_mode_advertise : bool ref = ref false
 
 let set_prune_mode_advertise (b : bool) : unit =
@@ -97,10 +94,9 @@ let set_prune_mode_advertise (b : bool) : unit =
 (* [our_services] (defined below) returns our node's advertised service flags:
    full node with witness support and NODE_NETWORK_LIMITED, plus NODE_BLOOM iff
    [peer_bloom_filters] is set, plus NODE_P2P_V2 iff BIP-324 v2 is enabled.
-   NODE_NETWORK_LIMITED is advertised UNCONDITIONALLY (Core init.cpp:863:
-   `g_local_services = ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS)`),
-   not gated on prune mode — a full node serves the recent ~288-block window
-   regardless.  It returns a fresh record on every call so callers see the
+   NODE_NETWORK_LIMITED is advertised UNCONDITIONALLY (Core init.cpp:863);
+   NODE_NETWORK only when not pruning.  It returns a fresh record on every
+   call so callers see the
    current values of the flags. *)
 (* Whether to advertise NODE_COMPACT_FILTERS (bit 6 = 64).
    Set to true by [enable_compact_filters ()] when the operator passes
@@ -148,9 +144,12 @@ let bip324_v2_inbound_enabled () : bool =
    on GetLocalServices() & NODE_P2P_V2, so the bit must never be advertised
    without the capability being on the wire (and vice versa).  With the v2
    default-on flip the steady-state localservices is 0xc09 (NETWORK | WITNESS |
-   NETWORK_LIMITED | P2P_V2); an explicit opt-out drops it back to 0x409. *)
+   NETWORK_LIMITED | P2P_V2); an explicit opt-out drops it back to 0x409.
+   A PRUNED node (-prune > 0) omits NODE_NETWORK (0x1) and advertises only
+   NETWORK_LIMITED (0x400): 0xc08 / 0x408. *)
 let our_services () : peer_services = {
-  network = true;
+  (* Core init.cpp ~1947-1950: NODE_NETWORK is ORed in only when NOT pruning. *)
+  network = not !prune_mode_advertise;
   getutxo = false;
   bloom = !peer_bloom_filters;
   witness = true;
@@ -1764,6 +1763,14 @@ let getdata_block_payload (inv_type : P2p.inv_type) (b : Types.block)
   | P2p.InvBlock -> strip_block_witness b
   | _ -> b
 
+(* Core ProcessGetBlockData (net_processing.cpp ~2383-2391): a pruned node
+   (NETWORK_LIMITED without NETWORK) disconnects a non-NoBan peer that asks
+   for a block deeper than NODE_NETWORK_LIMITED_MIN_BLOCKS (288) + 2 below
+   our tip. *)
+let pruned_getdata_should_disconnect ~(pruned : bool) ~(no_ban : bool)
+    ~(tip_height : int) ~(block_height : int) : bool =
+  pruned && not no_ban && tip_height - block_height > 288 + 2
+
 (* Getdata handler (Gap 11) — process inventory requests from peers.
    lookup_block returns serialized data as Cstruct.t option; lookup_tx
    (by txid) and lookup_wtx (by wtxid) return the mempool tx;
@@ -1780,12 +1787,29 @@ let handle_getdata (peer : peer) (items : P2p.inv_vector list)
     : unit Lwt.t =
   let open Lwt.Syntax in
   let max_getdata_items = 1000 in
+  let pruned = !prune_mode_advertise in
   if List.length items > max_getdata_items then begin
     let _result = record_misbehavior_for peer "spam" in
     Lwt.return_unit
   end else
     let not_found = ref [] in
+    let disconnected = ref false in
     let* () = Lwt_list.iter_s (fun (iv : P2p.inv_vector) ->
+      let too_deep_for_pruned () =
+        pruned
+        && (iv.inv_type = P2p.InvBlock || iv.inv_type = P2p.InvWitnessBlock
+            || iv.inv_type = P2p.InvCompactBlock)
+        && (match lookup_block_height iv.hash with
+            | Some h ->
+              pruned_getdata_should_disconnect ~pruned ~no_ban:peer.no_ban
+                ~tip_height ~block_height:h
+            | None -> false)
+      in
+      if !disconnected then Lwt.return_unit
+      else if too_deep_for_pruned () then begin
+        disconnected := true;
+        disconnect peer
+      end else
       match iv.inv_type with
       | P2p.InvBlock | P2p.InvWitnessBlock ->
         begin match lookup_block iv.hash with
@@ -1841,7 +1865,8 @@ let handle_getdata (peer : peer) (items : P2p.inv_vector list)
         Lwt.return_unit
     ) items in
     (* Send notfound for items we couldn't provide *)
-    if !not_found <> [] then
+    if !disconnected then Lwt.return_unit
+    else if !not_found <> [] then
       send_message peer (P2p.NotfoundMsg (List.rev !not_found))
     else
       Lwt.return_unit

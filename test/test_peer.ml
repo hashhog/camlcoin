@@ -112,8 +112,11 @@ let test_our_services_advertised_bitset () =
   List.iter (fun prune ->
     Peer.set_prune_mode_advertise prune;
     let bits = Peer.services_to_int64 (Peer.our_services ()) in
-    (* 0xC09 = 0x409 | NODE_P2P_V2; Core net.h:101 DEFAULT_V2_TRANSPORT = true *)
-    Alcotest.(check int64) "advertised bitset == 0xC09" 0xC09L bits;
+    (* 0xC09 = 0x409 | NODE_P2P_V2; Core net.h:101 DEFAULT_V2_TRANSPORT = true.
+       A pruned node omits NODE_NETWORK (0x1): Core init.cpp ~1947-1950. *)
+    let expected = if prune then 0xC08L else 0xC09L in
+    Alcotest.(check int64) "advertised bitset == 0xC09 (0xC08 pruned)"
+      expected bits;
     (* NODE_NETWORK_LIMITED (0x400) set *)
     Alcotest.(check bool) "NODE_NETWORK_LIMITED set"
       true (Int64.logand bits 0x400L <> 0L);

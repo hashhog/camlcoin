@@ -525,7 +525,7 @@ let prune_info (ctx : rpc_context)
     Storage.ChainDB.history_floor ctx.chain.db ~tip:ctx.chain.blocks_synced
   in
   let prune_mode = ctx.chain.prune_target > 0 in
-  let pruned = prune_mode || Option.is_some floor in
+  let pruned = Sync.node_is_pruned ctx.chain in
   let pruneheight =
     if not pruned then None
     else

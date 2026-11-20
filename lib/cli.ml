@@ -379,10 +379,14 @@ let effective_discover (config : config) : bool =
   | Some b -> b
   | None -> config.externalip = []
 
-(* BASE STUB: old behaviour (flag only) so the new test compiles on master *)
 let apply_prune_advertisement (chain : Sync.chain_state) : bool =
-  let pruned = chain.Sync.prune_target > 0 in
-  Peer.set_prune_mode_advertise pruned; pruned
+  let pruned = Sync.node_is_pruned chain in
+  Peer.set_prune_mode_advertise pruned;
+  Logs.info (fun m ->
+    m "NODE_NETWORK advertisement: %s"
+      (if pruned then "off (node is pruned; NODE_NETWORK_LIMITED only)"
+       else "on"));
+  pruned
 
 let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   let open Lwt.Syntax in
@@ -411,16 +415,6 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
     m "NODE_BLOOM (BIP-35) advertisement: %s"
       (if config.peer_bloom_filters then "enabled (-peerbloomfilters=1)"
        else "disabled (Core default)"));
-
-  (* Pruned node: drop NODE_NETWORK from the advertised services (Core
-     init.cpp ~1947-1950; NODE_NETWORK_LIMITED is always on).  Also arms the
-     deep-getdata disconnect in Peer.handle_getdata.  Set BEFORE any
-     peer/handshake work for the same reason as the bloom flag. *)
-  Peer.set_prune_mode_advertise (config.prune > 0);
-  Logs.info (fun m ->
-    m "NODE_NETWORK_LIMITED (BIP-159) advertisement: %s"
-      (if config.prune > 0 then "enabled (--prune > 0)"
-       else "disabled"));
 
   (* Ensure data directory exists *)
   (try Unix.mkdir config.data_dir 0o755
@@ -558,6 +552,13 @@ let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   (* Initialize or restore chain state *)
   let chain = Sync.restore_chain_state db network in
   chain.prune_target <- config.prune;
+  (* Pruned node: drop NODE_NETWORK from the advertised services (Core
+     init.cpp ~1947-1950; NODE_NETWORK_LIMITED is always on).  Decided from
+     the ACTUAL prune state (the same predicate getblockchaininfo.pruned
+     uses), so a pruned datadir without --prune is covered.  Also arms the
+     deep-getdata disconnect in Peer.handle_getdata.  Set BEFORE any
+     peer/handshake work. *)
+  ignore (apply_prune_advertisement chain);
   Logs.info (fun m ->
     m "Chain state initialized, headers at height %d"
       chain.headers_synced);

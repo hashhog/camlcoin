@@ -2013,6 +2013,17 @@ let reorg_remove_for_block :
     (Mempool.mempool -> Types.block -> int -> unit) ref =
   ref Mempool.remove_for_block
 
+(* Single source of truth for "is this node pruned": -prune is configured
+   (from the command line OR a config file, both land in [prune_target]) or
+   the datadir does not hold bodies from height 1 (existing pruned datadir,
+   snapshot boot).  Core derives both getblockchaininfo.pruned and the
+   NODE_NETWORK service bit from actual prune state, never from the flag
+   spelling.  [Rpc.prune_info] and the P2P service-bit decision share this. *)
+let node_is_pruned (chain : chain_state) : bool =
+  chain.prune_target > 0
+  || Option.is_some
+       (Storage.ChainDB.history_floor chain.db ~tip:chain.blocks_synced)
+
 (* Average block size used to convert a byte-denominated [prune_target] into
    a block-count keep window. 1.5 MB matches lunarblock's AVG_BLOCK_SIZE
    (src/prune.lua:41) and is a conservative-on-the-keep-side estimate for

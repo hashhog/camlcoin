@@ -379,6 +379,11 @@ let effective_discover (config : config) : bool =
   | Some b -> b
   | None -> config.externalip = []
 
+(* BASE STUB: old behaviour (flag only) so the new test compiles on master *)
+let apply_prune_advertisement (chain : Sync.chain_state) : bool =
+  let pruned = chain.Sync.prune_target > 0 in
+  Peer.set_prune_mode_advertise pruned; pruned
+
 let run ?(ready_fd : int option) (config : config) : unit Lwt.t =
   let open Lwt.Syntax in
 

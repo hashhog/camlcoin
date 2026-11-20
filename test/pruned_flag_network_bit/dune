@@ -1,0 +1,5 @@
+; NODE_NETWORK bit follows actual prune state, not the --prune spelling
+; (item fix-camlcoin-pruned-flag-network-bit). Own directory.
+(test
+ (name test_pruned_flag_network_bit)
+ (libraries camlcoin test_tmp alcotest))

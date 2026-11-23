@@ -579,7 +579,13 @@ let bip143_hash_outputs (d : precomputed_txdata) =
 type eval_state = {
   mutable stack : Cstruct.t list;
   mutable altstack : Cstruct.t list;
-  mutable if_stack : bool list;  (* Track nested IF execution state *)
+  (* Nested IF execution state, as Core's ConditionStack
+     (script/interpreter.cpp): the depth of the implied stack of booleans
+     and the position of its first false entry (cond_no_false if none).
+     Every operation is O(1); a list walked per opcode made a tapscript
+     leaf of N nested IFs (no opcode or size cap there) cost O(N^2). *)
+  mutable cond_size : int;
+  mutable cond_first_false : int;
   mutable op_count : int;
   mutable codesep_pos : int;     (* Position of last OP_CODESEPARATOR *)
   mutable current_op_idx : int;  (* Current opcode index during execution *)
@@ -602,7 +608,8 @@ let create_eval_state ~tx ~input_index ~amount ~flags ~sig_version
   {
     stack = [];
     altstack = [];
-    if_stack = [];
+    cond_size = 0;
+    cond_first_false = max_int;
     op_count = 0;
     codesep_pos = 0xFFFFFFFF;  (* Initialize to 0xFFFFFFFF per Bitcoin Core *)
     current_op_idx = -1;
@@ -639,9 +646,33 @@ let stack_push st v =
 
 let stack_size st = List.length st.stack
 
+(* ConditionStack operations (Core script/interpreter.cpp ConditionStack) *)
+let cond_no_false = max_int
+
+let cond_empty st = st.cond_size = 0
+
+let cond_push st (f : bool) =
+  if st.cond_first_false = cond_no_false && not f then
+    st.cond_first_false <- st.cond_size;
+  st.cond_size <- st.cond_size + 1
+
+(* Caller ensures the stack is non-empty. *)
+let cond_pop st =
+  st.cond_size <- st.cond_size - 1;
+  if st.cond_first_false = st.cond_size then
+    st.cond_first_false <- cond_no_false
+
+(* Caller ensures the stack is non-empty.  Toggling any entry above the
+   first false one is unobservable, so only the first false moves. *)
+let cond_toggle_top st =
+  if st.cond_first_false = cond_no_false then
+    st.cond_first_false <- st.cond_size - 1
+  else if st.cond_first_false = st.cond_size - 1 then
+    st.cond_first_false <- cond_no_false
+
 (* Check if we're currently executing (not in a false IF branch) *)
 let is_executing st =
-  List.for_all (fun b -> b) st.if_stack
+  st.cond_first_false = cond_no_false
 
 (* Check if a stack element is "true" (non-zero) *)
 let is_true (data : Cstruct.t) : bool =
@@ -1421,32 +1452,28 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
           else begin
             let cond = is_true top in
             let cond = match op with OP_NOTIF -> not cond | _ -> cond in
-            st.if_stack <- cond :: st.if_stack;
+            cond_push st cond;
             Ok ()
           end
         end else begin
           let cond = is_true top in
           let cond = match op with OP_NOTIF -> not cond | _ -> cond in
-          st.if_stack <- cond :: st.if_stack;
+          cond_push st cond;
           Ok ()
         end
     end else begin
       (* Not executing: still track nesting *)
-      st.if_stack <- false :: st.if_stack;
+      cond_push st false;
       Ok ()
     end
 
   | OP_ELSE ->
-    begin match st.if_stack with
-    | [] -> Error "OP_ELSE without OP_IF"
-    | b :: rest -> st.if_stack <- (not b) :: rest; Ok ()
-    end
+    if cond_empty st then Error "OP_ELSE without OP_IF"
+    else begin cond_toggle_top st; Ok () end
 
   | OP_ENDIF ->
-    begin match st.if_stack with
-    | [] -> Error "OP_ENDIF without OP_IF"
-    | _ :: rest -> st.if_stack <- rest; Ok ()
-    end
+    if cond_empty st then Error "OP_ENDIF without OP_IF"
+    else begin cond_pop st; Ok () end
 
   | OP_INVALID n when is_disabled_opcode n ->
     (* Disabled opcodes fail unconditionally, even in non-executing branches *)
@@ -2712,7 +2739,7 @@ let eval_script (st : eval_state) (script : Cstruct.t) : (unit, string) result =
     let ops = parse_script ~sig_version:st.sig_version script in
     let rec exec = function
       | [] ->
-        if st.if_stack <> [] then
+        if not (cond_empty st) then
           Error "Unbalanced IF"
         else
           Ok ()

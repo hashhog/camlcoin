@@ -1,0 +1,8 @@
+; Tapscript OP_IF nesting must cost O(1) per opcode, like Core's
+; ConditionStack (cffix-camlcoin-tapscript-conditionstack).  Own directory so
+; the shared test/dune names list is untouched.  Uses only APIs that exist on
+; the pre-fix tree, so it builds there too.
+(test
+ (name test_tapscript_conditionstack)
+ (modules test_tapscript_conditionstack)
+ (libraries camlcoin alcotest unix))

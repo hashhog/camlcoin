@@ -1,0 +1,8 @@
+; BIP-94 timewarp on a reorg-connected retarget block reads its own parent's
+; time (cffix-camlcoin-bip94-reorg-prev-time).  Own directory so the shared
+; test/dune names list is untouched.  Uses only APIs that exist on the
+; pre-fix tree, so it builds there too.
+(test
+ (name test_bip94_reorg_prev_time)
+ (modules test_bip94_reorg_prev_time)
+ (libraries camlcoin test_tmp alcotest logs))

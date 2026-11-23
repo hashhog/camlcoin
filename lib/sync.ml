@@ -7482,7 +7482,27 @@ let connect_block_into_batch
     | Error msg ->
       Error (Printf.sprintf "reorg connect at height %d: %s" height msg)
     | Ok median_time ->
-    let prev_block_time = get_prev_block_time state height in
+    (* BIP-94 parent time by HASH, like expected_bits and MTP above: the
+       height->hash index still holds the abandoned branch at height-1 until
+       [reorganize] rewrites it after the connect loop, so
+       [get_prev_block_time] would compare a retarget block with the wrong
+       block.  Core: ContextualCheckBlockHeader uses pindexPrev->GetBlockTime()
+       (validation.cpp:4101).  Fail closed when the parent is unknown. *)
+    match
+      (if height <= 0 then Ok 0l
+       else match Hashtbl.find_opt state.headers
+                    (Cstruct.to_string entry.header.prev_block) with
+         | Some parent -> Ok parent.header.timestamp
+         | None ->
+           Error (Printf.sprintf
+             "%s: parent %s of the block at height %d is not in the header \
+              table; BIP-94 parent time cannot be read"
+             ancestry_incomplete_tag
+             (Types.hash256_to_hex_display entry.header.prev_block) height))
+    with
+    | Error msg ->
+      Error (Printf.sprintf "reorg connect at height %d: %s" height msg)
+    | Ok prev_block_time ->
     (* Lookup that reads through the overlay first, then disk. Used by
        [accept_block] for input resolution and below for undo-data
        construction. *)

@@ -1,0 +1,8 @@
+; is_assume_valid must answer in O(1) per block and give exactly the answers
+; of the prev_block walk it replaces (perf-fix-camlcoin-assumevalid-ancestor).
+; Own directory so the shared test/dune names list is untouched.  Uses only
+; APIs that exist on the pre-fix tree, so it builds there too.
+(test
+ (name test_assumevalid_ancestor)
+ (modules test_assumevalid_ancestor)
+ (libraries camlcoin test_tmp alcotest unix))

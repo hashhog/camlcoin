@@ -156,6 +156,51 @@ let should_start_catchup_ibd
   (not ibd_running) && sync_state <> Idle && not at_tip_gap
   && has_download_peer && header_height > block_height
 
+(* Height-indexed copy of the best-HEADER chain, for [is_assume_valid].
+
+   [is_assume_valid] runs for every connected block and needs
+   GetAncestor(height) from the assumevalid block and from the best header.
+   [get_ancestor] answers that by following [prev_block] one Hashtbl hop at a
+   time: ~1.9M hops per block at the start of a mainnet IBD.  This index
+   holds [get_ancestor state tip h] for every [bci_floor <= h <= bci_top],
+   so the per-block check is two array reads (Core gets the same from
+   CChain / pskip; see chain.cpp GetAncestor).
+
+   Kept lazily: [best_chain_sync] compares the tip it was built for with
+   [state.tip] and, when the best header moved, walks back from the new tip
+   only until it meets the old chain (Core CChain::SetTip), so a header
+   batch or a reorg costs the new blocks only.  Header ancestry is fixed by
+   the hashes, so the only thing that can make the index wrong is a header
+   leaving the table: every [Hashtbl.remove]/[Hashtbl.reset] of
+   [state.headers] calls [invalidate_best_chain_index], and a different
+   [headers] table is detected by physical equality.
+
+   One mutable record behind an immutable field so a [{ state with .. }]
+   copy shares it instead of forking half of it.  Main Lwt thread only,
+   like the rest of [chain_state]. *)
+type best_chain_index = {
+  mutable bci_tbl : (string, header_entry) Hashtbl.t option;
+    (* the [headers] table the index was built against *)
+  mutable bci_tip : header_entry option;   (* best header it reflects *)
+  mutable bci_arr : header_entry array;
+  mutable bci_top : int;                   (* = bci_tip height; -1 empty *)
+  mutable bci_floor : int;
+    (* lowest height reached from bci_tip through the table with heights
+       stepping by one; below it [get_ancestor] answers *)
+  mutable bci_epoch : int;                 (* bumped on every change *)
+  mutable bci_av : header_entry option;    (* assumevalid entry ... *)
+  mutable bci_av_epoch : int;              (* ... at this epoch ... *)
+  mutable bci_av_fork : int;
+    (* ... meets the index at this height (its last common ancestor with
+       the best header); -1 = not reached, answer by walking *)
+}
+
+let new_best_chain_index () : best_chain_index = {
+  bci_tbl = None; bci_tip = None; bci_arr = [||]; bci_top = -1;
+  bci_floor = 0; bci_epoch = 0; bci_av = None; bci_av_epoch = -1;
+  bci_av_fork = -1;
+}
+
 (* Chain state - tracks sync progress and header chain.
 
    NOTE on `tip` semantics: [tip] is the best-work *header* entry, updated
@@ -354,6 +399,9 @@ type chain_state = {
      ActivateBestChain reorg, invalidateblock's post-rewind activation —
      so the mempool hangs off the chain, set once by cli.ml.  None in tests
      that build a chain without a mempool. *)
+  best_chain : best_chain_index;
+  (* Best-header chain by height, for [is_assume_valid]; see
+     [best_chain_index]. *)
 }
 
 (* Header flood prevention: reject new headers when this limit is reached
@@ -653,6 +701,114 @@ let get_ancestor (state : chain_state) (idx : header_entry) (height : int)
         | None -> None
     in
     walk idx
+
+(* --- best-header chain index ([best_chain_index]) ----------------------- *)
+
+let invalidate_best_chain_index (state : chain_state) : unit =
+  let c = state.best_chain in
+  c.bci_tbl <- None;
+  c.bci_tip <- None;
+  c.bci_arr <- [||];
+  c.bci_top <- -1;
+  c.bci_floor <- 0;
+  c.bci_av <- None;
+  c.bci_epoch <- c.bci_epoch + 1
+
+let best_chain_set (c : best_chain_index) (h : int) (e : header_entry) =
+  let len = Array.length c.bci_arr in
+  if h >= len then begin
+    let a = Array.make (max (h + 1) (max 1024 (2 * len))) e in
+    Array.blit c.bci_arr 0 a 0 len;
+    c.bci_arr <- a
+  end;
+  c.bci_arr.(h) <- e
+
+let best_chain_has (c : best_chain_index) (e : header_entry) : bool =
+  e.height >= c.bci_floor && e.height <= c.bci_top
+  && Cstruct.equal c.bci_arr.(e.height).hash e.hash
+
+(* Bring the index to [tip].  Afterwards, for floor <= h <= tip.height,
+   [bci_arr.(h)] is the entry [get_ancestor state tip h] returns.  Walks
+   from [tip] down until it meets the indexed chain (amortised: the blocks
+   the best header gained), genesis, or a step [get_ancestor] could not
+   take the same way (parent missing, or a parent whose height is not one
+   less), which becomes the new floor. *)
+let best_chain_sync (state : chain_state) (tip : header_entry) : unit =
+  let c = state.best_chain in
+  (match c.bci_tbl with
+   | Some t when t == state.headers -> ()
+   | _ -> invalidate_best_chain_index state; c.bci_tbl <- Some state.headers);
+  match c.bci_tip with
+  | Some t when t.height = tip.height && Cstruct.equal t.hash tip.hash -> ()
+  | _ ->
+    let rec walk (e : header_entry) =
+      if best_chain_has c e then ()
+      else begin
+        best_chain_set c e.height e;
+        if e.height = 0 then c.bci_floor <- 0
+        else
+          match Hashtbl.find_opt state.headers
+                  (Cstruct.to_string e.header.prev_block) with
+          | Some p when p.height = e.height - 1 -> walk p
+          | _ -> c.bci_floor <- e.height
+      end
+    in
+    if tip.height < 0 then invalidate_best_chain_index state
+    else begin
+      walk tip;
+      c.bci_top <- tip.height;
+      c.bci_tip <- Some tip;
+      c.bci_epoch <- c.bci_epoch + 1
+    end
+
+(* A hole below the floor may have been filled since (a header that was
+   missing arrived).  Continue the walk down from the floor; one lookup when
+   the hole is still there. *)
+let best_chain_extend_floor (state : chain_state) : unit =
+  let c = state.best_chain in
+  let rec walk (e : header_entry) =
+    if e.height = 0 then c.bci_floor <- 0
+    else
+      match Hashtbl.find_opt state.headers
+              (Cstruct.to_string e.header.prev_block) with
+      | Some p when p.height = e.height - 1 ->
+        best_chain_set c p.height p;
+        c.bci_floor <- p.height;
+        walk p
+      | _ -> ()
+  in
+  if c.bci_floor > 0 && c.bci_floor <= c.bci_top then begin
+    let before = c.bci_floor in
+    walk c.bci_arr.(c.bci_floor);
+    if c.bci_floor < before then c.bci_epoch <- c.bci_epoch + 1
+  end
+
+(* Height at which [av]'s ancestry meets the indexed best chain (their last
+   common ancestor), or -1 when the walk leaves the index's range or the
+   table first.  Cached per (av, epoch): O(1) while av is on the best chain,
+   O(av.height - fork) once per best-header move otherwise. *)
+let best_chain_av_fork (state : chain_state) (av : header_entry) : int =
+  let c = state.best_chain in
+  match c.bci_av with
+  | Some a when c.bci_av_epoch = c.bci_epoch
+             && a.height = av.height && Cstruct.equal a.hash av.hash ->
+    c.bci_av_fork
+  | _ ->
+    let rec walk (e : header_entry) =
+      if e.height < c.bci_floor then -1
+      else if best_chain_has c e then e.height
+      else if e.height = 0 then -1
+      else
+        match Hashtbl.find_opt state.headers
+                (Cstruct.to_string e.header.prev_block) with
+        | Some p when p.height = e.height - 1 -> walk p
+        | _ -> -1
+    in
+    let f = walk av in
+    c.bci_av <- Some av;
+    c.bci_av_epoch <- c.bci_epoch;
+    c.bci_av_fork <- f;
+    f
 
 (* Resolve the best-HEADER-chain entry at [height].
 
@@ -1268,6 +1424,7 @@ let create_chain_state (db : Storage.ChainDB.t)
     wallet_unscan_hook = None;
     mempool_remove_hook = None;
     chain_mempool = None;
+    best_chain = new_best_chain_index ();
   } in
   (* Insert genesis block header *)
   let genesis_hash = Crypto.compute_block_hash network.genesis_header in
@@ -1538,6 +1695,7 @@ let restore_chain_state (db : Storage.ChainDB.t)
     wallet_unscan_hook = None;
     mempool_remove_hook = None;
     chain_mempool = None;
+    best_chain = new_best_chain_index ();
   } in
   (* Check for stored header tip *)
   match Storage.ChainDB.get_header_tip db with
@@ -1629,6 +1787,7 @@ let restore_chain_state (db : Storage.ChainDB.t)
           ) !rows;
           Storage.ChainDB.sync db;
           Hashtbl.reset state.headers;
+          invalidate_best_chain_index state;
           state.tip <- None;
           let remaining = load_from_index () in
           Logs.warn (fun m ->
@@ -1882,6 +2041,7 @@ let restore_chain_state (db : Storage.ChainDB.t)
               root.height (Types.hash256_to_hex_display root.hash)
               (root.height - 1) state.blocks_synced dropped);
           Hashtbl.reset state.headers;
+          invalidate_best_chain_index state;
           Hashtbl.replace state.headers (Cstruct.to_string genesis_hash) gen;
           state.tip <- Some gen;
           state.headers_synced <- 0)
@@ -2456,6 +2616,10 @@ let process_headers ?(min_pow_checked = true) ?anti_dos_work
       List.iter (fun (entry : header_entry) ->
           Hashtbl.remove state.headers (Cstruct.to_string entry.hash))
         !staged;
+      (* Staged headers were new to the table and never the best header,
+         so none can be in the best-chain index; checked, not assumed. *)
+      if List.exists (best_chain_has state.best_chain) !staged then
+        invalidate_best_chain_index state;
       Logs.debug (fun m ->
         m "Headers batch: dropped %d staged headers, prefix below the \
            anti-DoS work (stopped at #%d)" (List.length !staged) !error_index);
@@ -3674,7 +3838,24 @@ let get_block_proof_equivalent_time
       (DoS defense against forcing script-skip of recently-mined blocks).
 
    This gate is STRICTLY NARROWER than the old height-only check so it can
-   only ever verify MORE scripts, never fewer. *)
+   only ever verify MORE scripts, never fewer.
+
+   Conditions 3a+3b read the best-header index ([best_chain_index]): both
+   hold iff [height] is at or below the height where av's ancestry meets
+   the best chain and the best chain's entry at [height] is this block.
+   Where the index cannot say (a hole in the header ancestry below its
+   floor, or av's ancestry not reaching it), the two [get_ancestor] walks
+   answer, as before.  test/assumevalid_ancestor checks both against the
+   walk on random forked trees. *)
+let ancestry_by_walk (state : chain_state) (av_entry : header_entry)
+    (best : header_entry) (block_hash : Types.hash256) (height : int) : bool =
+  (match get_ancestor state av_entry height with
+   | Some anc -> Cstruct.equal anc.hash block_hash
+   | None -> false)
+  && (match get_ancestor state best height with
+      | Some b -> Cstruct.equal b.hash block_hash
+      | None -> false)
+
 let is_assume_valid (state : chain_state) (block_hash : Types.hash256)
     (height : int) : bool =
   let two_weeks_secs = 60 * 60 * 24 * 7 * 2 in  (* 1 209 600 s *)
@@ -3690,29 +3871,39 @@ let is_assume_valid (state : chain_state) (block_hash : Types.hash256)
       (match Hashtbl.find_opt state.headers (Cstruct.to_string block_hash) with
       | None -> false  (* block not in index; cannot confirm ancestry *)
       | Some this_entry ->
-        (* Condition 3a: this block must be an ancestor of the av block.
-           get_ancestor returns the entry at [height] on av_entry's ancestry
-           chain.  If that entry's hash differs from block_hash, this block is
-           on a fork and scripts must be verified. *)
-        (match get_ancestor state av_entry height with
+        (match state.tip with
         | None -> false
-        | Some anc when not (Cstruct.equal anc.hash block_hash) -> false
-        | _ ->
-          (* Condition 3b: this block must be on the best-header chain *)
-          (match state.tip with
-          | None -> false
-          | Some best ->
-            (match get_ancestor state best height with
-            | None -> false
-            | Some best_anc when not (Cstruct.equal best_anc.hash block_hash) -> false
-            | _ ->
-              (* Condition 4: best-header chainwork >= minimum_chain_work *)
-              Consensus.work_compare best.total_work
-                state.network.minimum_chain_work >= 0
-              &&
-              (* Condition 5: this block has > 2 weeks of equivalent-work burial
-                 behind the best header *)
-              get_block_proof_equivalent_time best this_entry > two_weeks_secs)))))
+        | Some best ->
+          (* Condition 3a: this block is av_entry.GetAncestor(height).
+             Condition 3b: this block is best.GetAncestor(height).
+             GetAncestor is None outside [0, idx.height]. *)
+          let on_both_chains =
+            if height < 0 || height > av_entry.height || height > best.height
+            then false
+            else begin
+              best_chain_sync state best;
+              let c = state.best_chain in
+              if height < c.bci_floor then best_chain_extend_floor state;
+              let fork =
+                if height < c.bci_floor then -1
+                else best_chain_av_fork state av_entry
+              in
+              if fork < 0 then
+                ancestry_by_walk state av_entry best block_hash height
+              else
+                height <= fork
+                && Cstruct.equal c.bci_arr.(height).hash block_hash
+            end
+          in
+          on_both_chains
+          &&
+          (* Condition 4: best-header chainwork >= minimum_chain_work *)
+          Consensus.work_compare best.total_work
+            state.network.minimum_chain_work >= 0
+          &&
+          (* Condition 5: this block has > 2 weeks of equivalent-work burial
+             behind the best header *)
+          get_block_proof_equivalent_time best this_entry > two_weeks_secs)))
 
 (* ============================================================================
    BIP-157 filter index helpers

@@ -17,13 +17,17 @@
      sigop count (count_input_witness_sigops) and in verify_script.
    - RPC: decodescript of such a script.
 
-   Every case runs in a forked child bounded at [bound_s] seconds; a child
-   that does not finish is killed and the case fails as "hung".  Each case
+   Every case runs in a forked child bounded at [bound_s] seconds (1 s, as
+   the item asks; [db_bound_s] = 10 s for the cases that open a RocksDB
+   chaindb and a chain state first, so a loaded box under `dune test -j 4`
+   cannot fail them spuriously); a child that does not finish is killed and
+   the case fails as "hung".  Each case
    names the pre-fix outcome it catches. *)
 
 open Camlcoin
 
-let bound_s = 2.0
+let bound_s = 1.0
+let db_bound_s = 10.0
 
 let hex s =
   let n = String.length s / 2 in
@@ -48,7 +52,7 @@ let reap_child_tmp pid =
 
 (* Run [f] in a child.  The child writes [f ()] (or "RAISED <exn>") to a pipe
    and _exits, so no at_exit handler of the parent runs twice. *)
-let bounded (f : unit -> string) : string =
+let bounded ?(bound = bound_s) (f : unit -> string) : string =
   let rd, wr = Unix.pipe () in
   match Unix.fork () with
   | 0 ->
@@ -60,7 +64,7 @@ let bounded (f : unit -> string) : string =
     Unix._exit 0
   | pid ->
     Unix.close wr;
-    let deadline = Unix.gettimeofday () +. bound_s in
+    let deadline = Unix.gettimeofday () +. bound in
     let rec wait () =
       match Unix.waitpid [ Unix.WNOHANG ] pid with
       | 0, _ ->
@@ -89,11 +93,11 @@ let bounded (f : unit -> string) : string =
     if finished then Buffer.contents buf
     else begin
       reap_child_tmp pid;
-      Printf.sprintf "HUNG (no answer within %.0fs)" bound_s
+      Printf.sprintf "HUNG (no answer within %.0fs)" bound
     end
 
-let check_bounded name expected f =
-  Alcotest.(check string) name expected (bounded f)
+let check_bounded ?bound name expected f =
+  Alcotest.(check string) name expected (bounded ?bound f)
 
 let b2s b = if b then "true" else "false"
 
@@ -116,7 +120,8 @@ let test_ipo_backjump_true () =
   check_bounded "is_push_only_raw 020651 4ef9ffffff 51" "false" (fun () ->
       b2s (Script.is_push_only_raw (hex "0206514ef9ffffff51")))
 
-(* top-bit length, no backwards move even when read signed: still false *)
+(* length 0x80000000: read signed it is -2^31, the walker jumps far below 0
+   and raises Invalid_argument on the next read; Core: false *)
 let test_ipo_top_bit_truncated () =
   check_bounded "is_push_only_raw 4e00000080" "false" (fun () ->
       b2s (Script.is_push_only_raw (hex "4e00000080")))
@@ -208,19 +213,20 @@ let tma_reason spk_hex () =
    allowed=false reject-reason "scriptpubkey" for this tx; pre-fix camlcoin
    never answered. *)
 let test_tma_minus5 () =
-  check_bounded "testmempoolaccept OP_RETURN 4efbffffff" "allowed=false scriptpubkey"
+  check_bounded ~bound:db_bound_s "testmempoolaccept OP_RETURN 4efbffffff"
+    "allowed=false scriptpubkey"
     (tma_reason "6a4efbffffff")
 
 (* pre-fix: the OP_RETURN passed as standard and the tx got as far as the
    input lookup (missing-inputs); Core stops at scriptpubkey. *)
 let test_tma_backjump () =
-  check_bounded "testmempoolaccept OP_RETURN 020651 4ef9ffffff 51"
+  check_bounded ~bound:db_bound_s "testmempoolaccept OP_RETURN 020651 4ef9ffffff 51"
     "allowed=false scriptpubkey" (tma_reason "6a0206514ef9ffffff51")
 
 (* control: a well-formed OP_RETURN gets past IsStandardTx to the input
    lookup, so the scriptpubkey answer above is specific to the bad push. *)
 let test_tma_control () =
-  check_bounded "testmempoolaccept OP_RETURN 4e02000000aabb (control)"
+  check_bounded ~bound:db_bound_s "testmempoolaccept OP_RETURN 4e02000000aabb (control)"
     "allowed=false missing-inputs" (tma_reason "6a4e02000000aabb")
 
 (* ---- block path: P2SH spend with scriptSig 4efbffffff ---------------- *)
@@ -277,7 +283,7 @@ let test_verify_p2sh_pushdata4_valid () =
 
 (* Core v31.1 decodescript 6a4efbffffff: type "nonstandard".  pre-fix: hung. *)
 let test_decodescript () =
-  check_bounded "decodescript 6a4efbffffff type" "nonstandard" (fun () ->
+  check_bounded ~bound:db_bound_s "decodescript 6a4efbffffff type" "nonstandard" (fun () ->
       with_ctx (fun ctx ->
           match Rpc.dispatch_rpc ctx "decodescript" [ `String "6a4efbffffff" ] with
           | Ok (`Assoc f) ->

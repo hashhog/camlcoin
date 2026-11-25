@@ -1,0 +1,8 @@
+; Legacy CHECKMULTISIG / CHECKSIG FindAndDelete parity with Core
+; (psweep-camlcoin-multisig-findanddelete-empty-sig).  Own directory so the
+; shared test/dune names list is untouched.  Uses only APIs that exist on the
+; pre-fix tree, so it builds there and fails on its assertions.
+(test
+ (name test_multisig_findanddelete_empty_sig)
+ (modules test_multisig_findanddelete_empty_sig)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix yojson))

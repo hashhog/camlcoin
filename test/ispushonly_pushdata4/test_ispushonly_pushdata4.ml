@@ -71,14 +71,15 @@ let bounded ?(bound = bound_s) (f : unit -> string) : string =
         if Unix.gettimeofday () > deadline then begin
           (try Unix.kill pid Sys.sigkill with _ -> ());
           ignore (Unix.waitpid [] pid);
-          false
+          None
         end else begin
           Unix.sleepf 0.02;
           wait ()
         end
-      | _ -> true
+      | _, st -> Some st
     in
-    let finished = wait () in
+    let status = wait () in
+    let finished = status <> None in
     let buf = Buffer.create 64 in
     let chunk = Bytes.create 4096 in
     let rec drain () =
@@ -90,8 +91,13 @@ let bounded ?(bound = bound_s) (f : unit -> string) : string =
     in
     if finished then drain ();
     Unix.close rd;
-    if finished then Buffer.contents buf
-    else begin
+    match status with
+    | Some (Unix.WEXITED 0) -> Buffer.contents buf
+    (* a child that died any other way is never a pass, even when an empty
+       answer is the expected one *)
+    | Some (Unix.WEXITED c) -> Printf.sprintf "CHILD EXITED %d" c
+    | Some (Unix.WSIGNALED n | Unix.WSTOPPED n) -> Printf.sprintf "CHILD KILLED by signal %d" n
+    | None -> begin
       reap_child_tmp pid;
       Printf.sprintf "HUNG (no answer within %.0fs)" bound
     end
@@ -320,9 +326,23 @@ let test_subscript () =
   check_bounded "compute_subscript_from_pos 4e100000005151 2 (control)" "" (fun () ->
       to_hex (Script.compute_subscript_from_pos (hex "4e100000005151") 2))
 
+(* ---- the harness itself ---------------------------------------------- *)
+(* Instrument check: a child that dies before answering must not read as an
+   (empty) pass, and one that never answers must read as hung.  Passes on
+   any tree; it guards the helper the cases above depend on. *)
+let test_harness () =
+  check_bounded "child killed by a signal" "CHILD KILLED by signal -7" (fun () ->
+      Unix.kill (Unix.getpid ()) Sys.sigkill;
+      "");
+  check_bounded "child that never answers" "HUNG (no answer within 1s)" (fun () ->
+      let rec spin n = if n < 0 then "" else spin (n + 1) in
+      spin 0)
+
 let () =
   Alcotest.run "ispushonly_pushdata4"
-    [ ("is_push_only_raw",
+    [ ("harness",
+       [ Alcotest.test_case "crash and hang are failures, not passes" `Quick test_harness ]);
+      ("is_push_only_raw",
        [ Alcotest.test_case "4efbffffff is not push-only and returns" `Quick test_ipo_minus5;
          Alcotest.test_case "4ef0ffffff is not push-only, no raise" `Quick test_ipo_minus16;
          Alcotest.test_case "negative length cannot jump back to a true verdict" `Quick

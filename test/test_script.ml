@@ -842,9 +842,12 @@ let test_discourage_nop10 () =
 (* -- DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM -- *)
 
 let test_discourage_witness_v2 () =
-  (* A witness v2 program: OP_2 <20 bytes> = 5214 + 20 zero bytes *)
+  (* A witness v2 program: OP_2 <20 bytes> = 5214 01 + 19 zero bytes.  The
+     program must be non-zero: an all-zero program is FALSE and Core fails it
+     with EVAL_FALSE before the witness-program check is reached
+     (test/cffix_witprog_evalfalse). *)
   let tx = make_test_tx () in
-  let script_pubkey = hex_to_cstruct ("5214" ^ String.make 40 '0') in
+  let script_pubkey = hex_to_cstruct ("521401" ^ String.make 38 '0') in
   let witness = { Types.items = [] } in
   let flags = Script.script_verify_witness lor Script.script_verify_discourage_upgradable_witness in
   match Script.verify_script ~tx ~input_index:0 ~script_pubkey
@@ -853,8 +856,9 @@ let test_discourage_witness_v2 () =
   | Ok _ -> Alcotest.fail "Witness v2 should be discouraged"
 
 let test_witness_v2_allowed_without_flag () =
+  (* Non-zero program, as above: a v2 program of 20 zero bytes is EVAL_FALSE. *)
   let tx = make_test_tx () in
-  let script_pubkey = hex_to_cstruct ("5214" ^ String.make 40 '0') in
+  let script_pubkey = hex_to_cstruct ("521401" ^ String.make 38 '0') in
   let witness = { Types.items = [] } in
   let flags = Script.script_verify_witness in
   match Script.verify_script ~tx ~input_index:0 ~script_pubkey

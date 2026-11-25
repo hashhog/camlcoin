@@ -2814,6 +2814,38 @@ let verify_script_unguarded ~(tx : Types.transaction) ~(input_index : int)
     Error "scriptSig contains non-push opcode"
   else
 
+  (* Core VerifyScript order (interpreter.cpp): EvalScript(scriptSig), then
+     EvalScript(scriptPubKey) on that stack, and EVAL_FALSE on an empty or
+     false top -- all BEFORE IsWitnessProgram is looked at.  Evaluating
+     "<OP_n> <program>" leaves <program> on top, so a program whose bytes are
+     all zero (or negative zero) fails here, whatever its version.  The witness
+     arms below never evaluate the scriptPubKey themselves (several return
+     [Ok true] outright for upgradable versions), so this must run first.  A
+     non-empty scriptSig is evaluated too, exactly as Core does, so a malleated
+     scriptSig with a false program is EVAL_FALSE, not WITNESS_MALLEATED. *)
+  let witprog_spk_ok =
+    match get_witness_program script_pubkey with
+    | None -> Ok true
+    | Some _ ->
+      let st_sig = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
+                     ~sig_version:SigVersionBase () in
+      begin match run_script st_sig script_sig with
+      | Error e -> Error e
+      | Ok () ->
+        let st_pub = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
+                       ~sig_version:SigVersionBase () in
+        st_pub.stack <- st_sig.stack;
+        begin match run_script st_pub script_pubkey with
+        | Error e -> Error e
+        | Ok () -> check_stack_top st_pub
+        end
+      end
+  in
+  match witprog_spk_ok with
+  | Error e -> Error e
+  | Ok false -> Ok false
+  | Ok true ->
+
   match get_witness_program script_pubkey with
   | Some (1, program) when Cstruct.length program <> 32 && not (is_p2a script_pubkey) &&
                            flags land script_verify_witness <> 0 ->
@@ -2946,6 +2978,30 @@ let verify_script_unguarded ~(tx : Types.transaction) ~(input_index : int)
             if not (Cstruct.equal redeem_hash hash) then
               Ok false
             else begin
+              (* Core VerifyScript P2SH branch: EvalScript(pubKey2) on the
+                 rest of the scriptSig stack, EVAL_FALSE on an empty or false
+                 top, and only then pubKey2.IsWitnessProgram.  The witness
+                 arms below never run the redeemScript, so a FALSE program
+                 (all-zero / negative-zero bytes) must be caught here, before
+                 the WITNESS_MALLEATED check.  A non-witness redeemScript is
+                 evaluated once, by the [_] arm, as before. *)
+              let redeem_witprog_ok =
+                if flags land script_verify_witness = 0 then Ok true
+                else match get_witness_program redeem_script with
+                  | None -> Ok true
+                  | Some _ ->
+                    let st_rs = create_eval_state ~txdata ~tx ~input_index ~amount
+                                  ~flags ~sig_version:SigVersionBase () in
+                    st_rs.stack <- List.tl stack_copy;
+                    begin match run_script st_rs redeem_script with
+                    | Error e -> Error e
+                    | Ok () -> check_stack_top st_rs
+                    end
+              in
+              match redeem_witprog_ok with
+              | Error e -> Error e
+              | Ok false -> Ok false
+              | Ok true ->
               match get_witness_program redeem_script with
               | Some (0, program) when Cstruct.length program = 20 &&
                                        flags land script_verify_witness <> 0 ->

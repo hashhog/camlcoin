@@ -1,0 +1,8 @@
+; cffix-camlcoin-witprog-evalfalse: a witness program whose program bytes are
+; FALSE (all zero / negative zero) must fail with EVAL_FALSE before any witness
+; dispatch, as Core's VerifyScript does.  Own directory so the shared
+; test/dune names list is untouched.  Uses only APIs present on master.
+(test
+ (name test_cffix_witprog_evalfalse)
+ (modules test_cffix_witprog_evalfalse)
+ (libraries camlcoin alcotest))

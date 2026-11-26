@@ -57,7 +57,7 @@ let rm_rf path =
 
 let mine ~prev_block ~ts =
   let rec loop nonce =
-    let h = { Types.version = 1l; prev_block; merkle_root = Types.zero_hash;
+    let h = { Types.version = 4l; prev_block; merkle_root = Types.zero_hash;
               timestamp = ts; bits = Consensus.regtest.genesis_header.bits;
               nonce } in
     if Consensus.hash_meets_target (Crypto.compute_block_hash h) h.bits then h

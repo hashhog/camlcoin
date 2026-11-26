@@ -2280,6 +2280,17 @@ let get_header (state : chain_state) (hash : Types.hash256)
 
 (* Validate a header against the current chain state.
    Checks: not duplicate, parent exists, proof-of-work valid, timestamp, MTP *)
+(* Core ContextualCheckBlockHeader (validation.cpp): nVersion is a signed
+   int32, compared against 2/3/4 once BIP34/BIP66/BIP65 are active at
+   [height]; the reject reason prints nVersion as 8 hex digits. *)
+let header_version_error (network : Consensus.network_config) ~(height : int)
+    (version : int32) : string option =
+  if (Int32.compare version 2l < 0 && height >= network.Consensus.bip34_height)
+  || (Int32.compare version 3l < 0 && height >= network.Consensus.bip66_height)
+  || (Int32.compare version 4l < 0 && height >= network.Consensus.bip65_height)
+  then Some (Printf.sprintf "bad-version(0x%08lx)" version)
+  else None
+
 let validate_header (state : chain_state) (header : Types.block_header)
     : (header_entry, string) result =
   let hash = Crypto.compute_block_hash header in
@@ -2376,6 +2387,14 @@ let validate_header (state : chain_state) (header : Types.block_header)
                     ~network:state.network) then
             Error "time-timewarp-attack"
           else
+          (* Outdated version at the buried BIP34/66/65 heights.  Core rejects
+             the HEADER here (ContextualCheckBlockHeader, validation.cpp:
+             "bad-version(0x%08x)"), so a v1..v3 header never enters the block
+             index, never becomes the best header and is never fetched.  The
+             same rule is checked again on the body by [Validation.check_block]. *)
+          match header_version_error state.network ~height header.version with
+          | Some e -> Error e
+          | None ->
           (* Checkpoint enforcement: if this height has a checkpoint,
              the header hash must match the expected checkpoint hash *)
           match Consensus.verify_checkpoint height hash state.network with
@@ -9080,11 +9099,17 @@ let try_attach_side_branch_and_reorg
            prev_block links rather than the active height->hash index, which may point
            at the competing chain during a reorg or when a side-branch header arrived
            before the block body. *)
+        (* Every height, not only retarget boundaries: between boundaries
+           testnet3/testnet4 have the 20-minute min-difficulty rule and its
+           walk-back (Core GetNextWorkRequired, pow.cpp), which Core applies
+           to a side-branch block exactly as to a tip block
+           (ContextualCheckBlockHeader "bad-diffbits").  Using the parent's
+           bits there rejected a valid min-difficulty side block and accepted
+           a side block that repeats the min-difficulty after a min-difficulty
+           parent.  [resolve_expected_bits] is the same rule validate_header
+           uses, walked through the side block's own ancestry. *)
         let expected_bits_r =
-          if state.network.pow_no_retargeting then Ok parent.header.bits
-          else if height mod Consensus.difficulty_adjustment_interval = 0
-          then resolve_expected_bits ~parent_entry:parent state height block.header
-          else Ok parent.header.bits
+          resolve_expected_bits ~parent_entry:parent state height block.header
         in
         match expected_bits_r with
         | Error msg -> Error msg

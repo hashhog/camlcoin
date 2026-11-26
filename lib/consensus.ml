@@ -949,6 +949,17 @@ let script_verify_nullfail              = 1 lsl 12  (* BIP-146 *)
 let script_verify_witness_pubkeytype    = 1 lsl 14  (* BIP-141 compressed keys *)
 let script_verify_taproot               = 1 lsl 17  (* BIP-341/342 *)
 
+(* Policy-only flags.  The bit values are camlcoin's own (see Script) and must
+   stay equal to Script's, since the interpreter reads these bits. *)
+let script_verify_strictenc             = 1 lsl 1
+let script_verify_discourage_upgradable_nops = 1 lsl 8
+let script_verify_minimalif             = 1 lsl 13
+let script_verify_const_scriptcode      = 1 lsl 15
+let script_verify_discourage_upgradable_witness_program = 1 lsl 16
+let script_verify_discourage_op_success = 1 lsl 18
+let script_verify_discourage_upgradable_taproot_version = 1 lsl 19
+let script_verify_discourage_upgradable_pubkeytype = 1 lsl 20
+
 (* ============================================================================
    Script-flag exception tables (Bitcoin Core GetBlockScriptFlags exceptions)
    ============================================================================ *)
@@ -1078,7 +1089,16 @@ let get_block_script_flags ?(block_hash = Types.zero_hash) (height : int) (netwo
 
 (* Add the mempool/relay policy flags on top of the consensus flags.
    These are STANDARD_SCRIPT_VERIFY_FLAGS additions per Bitcoin Core
-   policy/policy.h:119-132.  Do NOT call this from the block-connect path. *)
+   policy/policy.h:119-132.  Do NOT call this from the block-connect path.
+   Core's set is STRICTENC, MINIMALDATA, DISCOURAGE_UPGRADABLE_NOPS,
+   CLEANSTACK, MINIMALIF, NULLFAIL, LOW_S,
+   DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, WITNESS_PUBKEYTYPE,
+   CONST_SCRIPTCODE, DISCOURAGE_UPGRADABLE_TAPROOT_VERSION,
+   DISCOURAGE_OP_SUCCESS and DISCOURAGE_UPGRADABLE_PUBKEYTYPE.  Without the
+   upgrade-hook flags the mempool accepted (and relayed and mined) spends
+   Core reserves for soft forks: OP_SUCCESSx, unknown leaf versions and
+   tapscript pubkey types, NOPx, witness v1+ in P2SH.  All of these are
+   consensus-valid, so block validation is unaffected. *)
 let get_standard_policy_flags (height : int) (network : network_config) : int =
   let base = get_block_script_flags height network in
   let extra = ref 0 in
@@ -1088,7 +1108,15 @@ let get_standard_policy_flags (height : int) (network : network_config) : int =
     extra := !extra lor script_verify_nullfail;
     extra := !extra lor script_verify_low_s;
     extra := !extra lor script_verify_minimaldata;
-    extra := !extra lor script_verify_witness_pubkeytype
+    extra := !extra lor script_verify_witness_pubkeytype;
+    extra := !extra lor script_verify_strictenc;
+    extra := !extra lor script_verify_discourage_upgradable_nops;
+    extra := !extra lor script_verify_minimalif;
+    extra := !extra lor script_verify_const_scriptcode;
+    extra := !extra lor script_verify_discourage_upgradable_witness_program;
+    extra := !extra lor script_verify_discourage_op_success;
+    extra := !extra lor script_verify_discourage_upgradable_taproot_version;
+    extra := !extra lor script_verify_discourage_upgradable_pubkeytype
   end;
   base lor !extra
 

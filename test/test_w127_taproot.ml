@@ -463,20 +463,18 @@ let g28_checksigadd_only_in_tapscript () =
     "G28b OP_CHECKSIGADD increments n on success" true
     (contains_substring s "bytes_of_script_num (Int64.add n 1L)")
 
-(* G28 BUG-2: n decoded without require_minimal *)
+(* G28 BUG-2 (fixed): Core decodes n with fRequireMinimal
+   ("const CScriptNum num(stacktop(-2), fRequireMinimal);"), so neither
+   CHECKSIGADD decode site may use the bare form any more.  This test used to
+   assert that the bare form was present.  The behaviour itself is pinned in
+   test/verify_neon_script_flags. *)
 let g28_BUG2_no_minimaldata () =
   let s = script_ml () in
-  (* Both decode sites use plain `script_num_of_bytes n_bytes` with no
-     `~require_minimal` keyword argument. Find lines that say
-     `script_num_of_bytes n_bytes in` (without the require_minimal kwarg
-     visible on the same line). We approximate by searching for the
-     bare form. The well-formed pattern elsewhere is
-     `script_num_of_bytes ~require_minimal:(...)`. *)
   let bare_form = "let n = script_num_of_bytes n_bytes in" in
   let n = count_substring s bare_form in
-  Alcotest.(check bool)
-    "G28 BUG-2: at least one CHECKSIGADD num decode lacks ~require_minimal"
-    true (n >= 1)
+  Alcotest.(check int)
+    "G28: every CHECKSIGADD num decode passes ~require_minimal"
+    0 n
 
 (* G29 (PARTIAL — BUG-8): VALIDATION_WEIGHT_OFFSET hardcoded *)
 let g29_validation_weight_offset () =
@@ -638,7 +636,7 @@ let () =
     ];
     "G28 OP_CHECKSIGADD only in tapscript", [
       test_case "PRESENT" `Quick g28_checksigadd_only_in_tapscript;
-      test_case "BUG-2 PARTIAL: n decoded without MINIMALDATA" `Quick
+      test_case "BUG-2 fixed: n decoded with MINIMALDATA" `Quick
         g28_BUG2_no_minimaldata;
     ];
     "G29 VALIDATION_WEIGHT_OFFSET = 50 (init)", [

@@ -953,7 +953,7 @@ CAMLprim value caml_ecdsa_sign_der(value v_seckey, value v_msg) {
 /* caml_ecdsa_signature_is_low_s(sig_der_bytes) -> bool
    Parses a DER-encoded ECDSA signature (no hash type byte) and returns true
    iff its S value is already in low-S form.  Returns false if the signature
-   cannot be parsed. Mirrors libsecp256k1_internal's Sign.normalize semantics:
+   cannot be parsed (lax DER, as Core's CheckLowS). Mirrors libsecp256k1_internal's Sign.normalize semantics:
    normalize returns Some _ when the input was high-S, None when already low-S;
    we use signature_normalize's return value in the same way. */
 CAMLprim value caml_ecdsa_signature_is_low_s(value v_sig) {
@@ -963,8 +963,12 @@ CAMLprim value caml_ecdsa_signature_is_low_s(value v_sig) {
     unsigned char *sig_data = (unsigned char *)Caml_ba_data_val(v_sig);
     size_t sig_len = Caml_ba_array_val(v_sig)->dim[0];
 
+    /* Core CPubKey::CheckLowS (pubkey.cpp) parses with the LAX parser, which
+       replaces the whole signature with zeros when R or S overflows the group
+       order, so e.g. R = N with a high S counts as low-S.  The strict parser
+       zeroes only the overflowing R and keeps the high S. */
     secp256k1_ecdsa_signature sig;
-    if (!secp256k1_ecdsa_signature_parse_der(schnorr_ctx, &sig, sig_data, sig_len)) {
+    if (!ecdsa_signature_parse_der_lax(schnorr_ctx, &sig, sig_data, sig_len)) {
         CAMLreturn(Val_false);
     }
 

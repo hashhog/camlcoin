@@ -2400,7 +2400,23 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                           match check_sig_encoding sig_bytes with
                           | Error e -> Error e
                           | Ok () ->
-                          if Cstruct.length sig_bytes = 0 then Ok false
+                          if Cstruct.length sig_bytes = 0 then begin
+                            (* Core runs CheckPubKeyEncoding on every key it
+                               tries, also for an empty signature (which can
+                               never verify), until fewer keys than sigs are
+                               left (interpreter.cpp OP_CHECKMULTISIG loop). *)
+                            let rec check_keys = function
+                              | [] -> Ok false
+                              | pk :: rest_pks ->
+                                if List.length rest_pks + 1 < n_sigs_left then
+                                  Ok false
+                                else
+                                match check_pubkey_encoding pk st.flags st.sig_version with
+                                | Error e -> Error e
+                                | Ok () -> check_keys rest_pks
+                            in
+                            check_keys pubkeys
+                          end
                           else begin
                             let hash_type = get_signature_hash_type sig_bytes in
                             let sig_der = strip_hash_type sig_bytes in
@@ -2453,13 +2469,11 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
 
   (* Locktime operations *)
   | OP_CHECKLOCKTIMEVERIFY ->
-    if st.flags land script_verify_checklocktimeverify = 0 then begin
-      (* Treat as NOP2 if CLTV not enabled *)
-      if st.flags land script_verify_discourage_upgradable_nops <> 0 then
-        Error "Upgradable NOP used"
-      else
-        Ok ()
-    end
+    if st.flags land script_verify_checklocktimeverify = 0 then
+      (* Not enabled: a plain NOP2.  Core does not apply
+         DISCOURAGE_UPGRADABLE_NOPS here (interpreter.cpp: "not enabled;
+         treat as a NOP2" -> break). *)
+      Ok ()
     else begin
       match stack_top st with
       | Error e -> Error e
@@ -2492,13 +2506,10 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
     end
 
   | OP_CHECKSEQUENCEVERIFY ->
-    if st.flags land script_verify_checksequenceverify = 0 then begin
-      (* Treat as NOP3 if CSV not enabled *)
-      if st.flags land script_verify_discourage_upgradable_nops <> 0 then
-        Error "Upgradable NOP used"
-      else
-        Ok ()
-    end
+    if st.flags land script_verify_checksequenceverify = 0 then
+      (* Not enabled: a plain NOP3, never DISCOURAGE_UPGRADABLE_NOPS
+         (interpreter.cpp: "not enabled; treat as a NOP3" -> break). *)
+      Ok ()
     else begin
       match stack_top st with
       | Error e -> Error e
@@ -2578,7 +2589,9 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
               if st.flags land script_verify_discourage_upgradable_pubkeytype <> 0 then
                 Error "Discouraged unknown public key type in tapscript"
               else begin
-                let n = script_num_of_bytes n_bytes in
+                let n = script_num_of_bytes
+                    ~require_minimal:(st.flags land script_verify_minimaldata <> 0)
+                    n_bytes in
                 let sig_nonempty = Cstruct.length sig_bytes > 0 in
                 if sig_nonempty then begin
                   st.sigops_budget <- st.sigops_budget - 50;
@@ -2591,7 +2604,9 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
               end
             end
             else begin
-              let n = script_num_of_bytes n_bytes in
+              let n = script_num_of_bytes
+                  ~require_minimal:(st.flags land script_verify_minimaldata <> 0)
+                  n_bytes in
               if Cstruct.length sig_bytes = 0 then
                 stack_push st (bytes_of_script_num n)
               else begin

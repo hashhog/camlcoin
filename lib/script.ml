@@ -1401,6 +1401,24 @@ let strip_hash_type (sig_bytes : Cstruct.t) : Cstruct.t =
   if len = 0 then sig_bytes
   else Cstruct.sub sig_bytes 0 (len - 1)
 
+(* Check ECDSA signature encoding.
+   Mirrors Bitcoin Core's CheckSignatureEncoding (script/interpreter.cpp): an
+   empty signature passes; otherwise strict DER (DERSIG/LOW_S/STRICTENC),
+   then low S (LOW_S), then a defined hash type (STRICTENC).  Core runs it
+   BEFORE CheckPubKeyEncoding, so when both fail the signature error wins. *)
+let check_signature_encoding (sig_bytes : Cstruct.t) (flags : int) : (unit, string) result =
+  if Cstruct.length sig_bytes = 0 then Ok ()
+  else if flags land (script_verify_dersig lor script_verify_low_s lor script_verify_strictenc) <> 0 &&
+          not (Crypto.is_valid_signature_encoding sig_bytes) then
+    Error "Non-strict DER signature"
+  else if flags land script_verify_low_s <> 0 &&
+          not (Crypto.is_low_der_s (strip_hash_type sig_bytes)) then
+    Error "Non-low-S signature"
+  else if flags land script_verify_strictenc <> 0 &&
+          not (is_defined_hash_type (get_signature_hash_type sig_bytes)) then
+    Error "Invalid hash type"
+  else Ok ()
+
 (* Build P2PKH script from pubkey hash *)
 let build_p2pkh_script (hash : Types.hash160) : Cstruct.t =
   let w = Serialize.writer_create () in
@@ -2160,7 +2178,12 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                      else script_code) sig_bytes) then
             Error "CONST_SCRIPTCODE: find_and_delete modified scriptCode"
           else
-          (* Check pubkey encoding *)
+          (* Core EvalChecksigPreTapscript: CheckSignatureEncoding, then
+             CheckPubKeyEncoding, so a bad signature is reported before a
+             bad key. *)
+          match check_signature_encoding sig_bytes st.flags with
+          | Error e -> Error e
+          | Ok () ->
           match check_pubkey_encoding pubkey st.flags st.sig_version with
           | Error e -> Error e
           | Ok () ->
@@ -2168,18 +2191,9 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
             stack_push st (bool_to_stack false)
           else begin
             let sig_der = strip_hash_type sig_bytes in
-            if st.flags land (script_verify_dersig lor script_verify_low_s lor script_verify_strictenc) <> 0 &&
-               not (Crypto.is_valid_signature_encoding sig_bytes) then
-              Error "Non-strict DER signature"
-            else if st.flags land script_verify_low_s <> 0 &&
-                    not (Crypto.is_low_der_s sig_der) then
-              Error "Non-low-S signature"
-            else begin
+            begin
               let hash_type = get_signature_hash_type sig_bytes in
-              if st.flags land script_verify_strictenc <> 0 &&
-                 not (is_defined_hash_type hash_type) then
-                Error "Invalid hash type"
-              else begin
+              begin
                 let effective_script_code =
                   if st.codesep_pos <> 0xFFFFFFFF then
                     compute_subscript_from_pos script_code (st.codesep_pos + 1)
@@ -2290,7 +2304,12 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                      else script_code) sig_bytes) then
             Error "CONST_SCRIPTCODE: find_and_delete modified scriptCode"
           else
-          (* Check pubkey encoding *)
+          (* Core EvalChecksigPreTapscript: CheckSignatureEncoding, then
+             CheckPubKeyEncoding, so a bad signature is reported before a
+             bad key. *)
+          match check_signature_encoding sig_bytes st.flags with
+          | Error e -> Error e
+          | Ok () ->
           match check_pubkey_encoding pubkey st.flags st.sig_version with
           | Error e -> Error e
           | Ok () ->
@@ -2298,18 +2317,9 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
             Error "OP_CHECKSIGVERIFY failed (empty sig)"
           else begin
             let sig_der = strip_hash_type sig_bytes in
-            if st.flags land (script_verify_dersig lor script_verify_low_s lor script_verify_strictenc) <> 0 &&
-               not (Crypto.is_valid_signature_encoding sig_bytes) then
-              Error "Non-strict DER signature"
-            else if st.flags land script_verify_low_s <> 0 &&
-                    not (Crypto.is_low_der_s sig_der) then
-              Error "Non-low-S signature"
-            else begin
+            begin
               let hash_type = get_signature_hash_type sig_bytes in
-              if st.flags land script_verify_strictenc <> 0 &&
-                 not (is_defined_hash_type hash_type) then
-                Error "Invalid hash type"
-              else begin
+              begin
                 let effective_script_code =
                   if st.codesep_pos <> 0xFFFFFFFF then
                     compute_subscript_from_pos script_code (st.codesep_pos + 1)

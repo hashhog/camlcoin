@@ -1,0 +1,9 @@
+; r3fix-camlcoin-p2pk-multisig-input-standard: spends of bare P2PK and bare
+; multisig prevouts are standard INPUTS (Core v31.1 AreInputsStandard rejects
+; only NONSTANDARD / WITNESS_UNKNOWN; Solver returns PUBKEY / MULTISIG for
+; them).  Own directory so the shared test/dune names list is untouched.
+; Uses only APIs that exist on the pre-fix tree, so it builds there too.
+(test
+ (name test_r3fix_p2pk_multisig_input_standard)
+ (modules test_r3fix_p2pk_multisig_input_standard core_solver_vectors)
+ (libraries camlcoin test_tmp alcotest))

@@ -1477,20 +1477,112 @@ let is_push_only_script_sig (script_sig : Cstruct.t) : bool =
     with _ -> false
   end
 
+(* CPubKey::ValidSize (Core v31.1 src/pubkey.h:60-79, ValidSize at :77): non-empty and the
+   length implied by the header byte (GetLen) equals the actual length.
+   GetLen: 0x02/0x03 -> 33, 0x04/0x06/0x07 -> 65, anything else -> 0. *)
+let pubkey_valid_size (data : Cstruct.t) : bool =
+  let len = Cstruct.length data in
+  len > 0 &&
+  (match Cstruct.get_uint8 data 0 with
+   | 0x02 | 0x03 -> len = 33
+   | 0x04 | 0x06 | 0x07 -> len = 65
+   | _ -> false)
+
 (* Check if a script is a P2PK (bare pubkey) output.
    Format: <33 or 65 byte pubkey> OP_CHECKSIG (0xac).
-   Core: MatchPayToPubkey in solver.cpp — pubkey must be 33 (compressed)
-   or 65 (uncompressed) bytes. *)
+   Core v31.1 MatchPayToPubkey (src/script/solver.cpp:36-47): the script is
+   0x41 <65 bytes> 0xac or 0x21 <33 bytes> 0xac AND the pushed key passes
+   CPubKey::ValidSize, so the header byte must match the length (0x02/0x03
+   for 33 bytes, 0x04/0x06/0x07 for 65).  A wrong header is NONSTANDARD. *)
 let is_p2pk_script (script : Cstruct.t) : bool =
   let len = Cstruct.length script in
+  let key_ok n = pubkey_valid_size (Cstruct.sub script 1 n) in
   (* Compressed: 35 bytes total — 0x21 <33 bytes> 0xac *)
   ((len = 35 &&
     Cstruct.get_uint8 script 0 = 0x21 &&
-    Cstruct.get_uint8 script 34 = 0xac) ||
+    Cstruct.get_uint8 script 34 = 0xac && key_ok 33) ||
    (* Uncompressed: 67 bytes total — 0x41 <65 bytes> 0xac *)
    (len = 67 &&
     Cstruct.get_uint8 script 0 = 0x41 &&
-    Cstruct.get_uint8 script 66 = 0xac))
+    Cstruct.get_uint8 script 66 = 0xac && key_ok 65))
+
+(* Core v31.1 MatchMultisig (src/script/solver.cpp:85-105), used by Solver to
+   return TxoutType::MULTISIG.  Returns Some (required_sigs, num_keys).
+
+     - last byte is OP_CHECKMULTISIG;
+     - first op is a script number in [1, MAX_PUBKEYS_PER_MULTISIG=20]
+       (GetScriptNumber: OP_1..OP_16, or a minimal push of a minimal
+       CScriptNum);
+     - then every op whose pushed data passes CPubKey::ValidSize is a key
+       (any push opcode, PUSHDATA1/2/4 included);
+     - the op that ends the key run is a script number in
+       [required_sigs, 20] equal to the number of keys;
+     - exactly one byte (the OP_CHECKMULTISIG) follows it.
+
+   No n <= 3 limit here: that is IsStandard's OUTPUT rule, and it stays in
+   [decode_bare_multisig] / [is_standard_output].  RELAY policy only. *)
+let match_multisig (script : Cstruct.t) : (int * int) option =
+  let len = Cstruct.length script in
+  if len < 1 || Cstruct.get_uint8 script (len - 1) <> 0xae then None
+  else
+    (* CheckMinimalPush (src/script/script.cpp:373-396) for a push opcode
+       carrying [data]. *)
+    let minimal_push opbyte data =
+      let n = Cstruct.length data in
+      if n = 0 then false (* only OP_0 may push empty; OP_0 is handled apart *)
+      else if n = 1 && (let b = Cstruct.get_uint8 data 0 in
+                        (b >= 1 && b <= 16) || b = 0x81) then false
+      else if n <= 75 then opbyte = n
+      else if n <= 255 then opbyte = 0x4c
+      else if n <= 65535 then opbyte = 0x4d
+      else true
+    in
+    (* GetScriptNumber (solver.cpp:66-83). *)
+    let script_number op ~min ~max =
+      let v =
+        match op with
+        | Script.OP_0 -> Some 0
+        | Script.OP_1 -> Some 1   | Script.OP_2 -> Some 2
+        | Script.OP_3 -> Some 3   | Script.OP_4 -> Some 4
+        | Script.OP_5 -> Some 5   | Script.OP_6 -> Some 6
+        | Script.OP_7 -> Some 7   | Script.OP_8 -> Some 8
+        | Script.OP_9 -> Some 9   | Script.OP_10 -> Some 10
+        | Script.OP_11 -> Some 11 | Script.OP_12 -> Some 12
+        | Script.OP_13 -> Some 13 | Script.OP_14 -> Some 14
+        | Script.OP_15 -> Some 15 | Script.OP_16 -> Some 16
+        | Script.OP_PUSHDATA (opbyte, data) ->
+          if not (minimal_push opbyte data) then None
+          else (try
+                  Some (Int64.to_int
+                          (Script.script_num_of_bytes ~require_minimal:true
+                             ~max_bytes:4 data))
+                with _ -> None)
+        | _ -> None
+      in
+      match v with
+      | Some c when c >= min && c <= max -> Some c
+      | _ -> None
+    in
+    (* parse_script fails on a truncated push; Core's GetOp would fail at the
+       same op, and every failing path of MatchMultisig returns false. *)
+    match (try Some (Script.parse_script script) with _ -> None) with
+    | None | Some [] -> None
+    | Some (first :: rest) ->
+      match script_number first ~min:1 ~max:20 with
+      | None -> None
+      | Some m ->
+        let rec take_keys k = function
+          | Script.OP_PUSHDATA (_, data) :: tl when pubkey_valid_size data ->
+            take_keys (k + 1) tl
+          | tl -> (k, tl)
+        in
+        let (keys, tl) = take_keys 0 rest in
+        match tl with
+        | n_op :: [ Script.OP_CHECKMULTISIG ] ->
+          (match script_number n_op ~min:m ~max:20 with
+           | Some n when n = keys -> Some (m, n)
+           | _ -> None)
+        | _ -> None
 
 (* Decode bare multisig (m-of-n OP_CHECKMULTISIG) output.
    Returns Some (m, n) where m is the minimum required signatures and n is the
@@ -1740,9 +1832,18 @@ let validate_inputs_standardness
               error := Some (Printf.sprintf
                 "bad-txns-nonstandard-inputs: input %d witness program is undefined" i)
             | None ->
-              (* Gate 1: genuinely nonstandard scriptPubKey. *)
-              error := Some (Printf.sprintf
-                "bad-txns-nonstandard-inputs: input %d script unknown" i)
+              (* classify_script has no PUBKEY or MULTISIG template, but Core's
+                 Solver does (solver.cpp:189-207) and AreInputsStandard
+                 (policy.cpp:213-249, :228) rejects only NONSTANDARD / WITNESS_UNKNOWN.
+                 So a bare P2PK or bare multisig prevout (any 1..20-key shape
+                 MatchMultisig accepts — the n <= 3 limit is output-only) is a
+                 standard input and goes on to the script checks. *)
+              if is_p2pk_script prev_script
+                 || match_multisig prev_script <> None then ()
+              else
+                (* Gate 1: genuinely nonstandard scriptPubKey. *)
+                error := Some (Printf.sprintf
+                  "bad-txns-nonstandard-inputs: input %d script unknown" i)
             end
           | Script.P2SH_script _ ->
             (* Gate 3: P2SH — extract redeemScript (last push of scriptSig)

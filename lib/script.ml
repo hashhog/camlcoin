@@ -998,16 +998,29 @@ let check_pubkey_encoding (pk : Cstruct.t) (flags : int) (sig_version : sig_vers
   end
 
 (* FindAndDelete: Remove all occurrences of a signature from script
-   Only used for legacy sighash, NOT for witness v0 or tapscript *)
+   Only used for legacy sighash, NOT for witness v0 or tapscript.
+
+   Core (interpreter.cpp) deletes [CScript() << vchSig] for EVERY signature,
+   the empty one included: the pattern is CScript::operator<<(valtype)'s
+   minimal push -- a single size byte for 0-75 bytes (so an empty sig is the
+   byte 0x00, OP_0), 4c <len8> for 76-255, 4d <len16> for 256-65535,
+   4e <len32> beyond.  Matching is at opcode boundaries only. *)
 let find_and_delete (script : Cstruct.t) (sig_data : Cstruct.t) : Cstruct.t * bool =
   let sig_len = Cstruct.length sig_data in
-  if sig_len = 0 then (script, false)
-  else
-    let push_encoded =
-      let w = Serialize.writer_create () in
-      serialize_opcode w (OP_PUSHDATA (Cstruct.length sig_data, sig_data));
-      Serialize.writer_to_cstruct w
+  let push_encoded =
+    let opbyte =
+      if sig_len < 0x4c then sig_len
+      else if sig_len <= 0xff then 0x4c
+      else if sig_len <= 0xffff then 0x4d
+      else 0x4e
     in
+    if opbyte = 0 then Cstruct.of_string "\x00"
+    else begin
+      let w = Serialize.writer_create () in
+      serialize_opcode w (OP_PUSHDATA (opbyte, sig_data));
+      Serialize.writer_to_cstruct w
+    end
+  in
     let push_len = Cstruct.length push_encoded in
     let script_len = Cstruct.length script in
     let result = Buffer.create script_len in
@@ -2135,6 +2148,18 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
           end
         end else begin
           (* Legacy / SegWit v0 OP_CHECKSIG: ECDSA verification *)
+          (* Core EvalChecksigPreTapscript: FindAndDelete runs first, for
+             every signature including the empty one, and under
+             CONST_SCRIPTCODE a hit fails SIG_FINDANDDELETE before any
+             signature or pubkey encoding check. *)
+          if st.sig_version = SigVersionBase &&
+             st.flags land script_verify_const_scriptcode <> 0 &&
+             snd (find_and_delete
+                    (if st.codesep_pos <> 0xFFFFFFFF then
+                       compute_subscript_from_pos script_code (st.codesep_pos + 1)
+                     else script_code) sig_bytes) then
+            Error "CONST_SCRIPTCODE: find_and_delete modified scriptCode"
+          else
           (* Check pubkey encoding *)
           match check_pubkey_encoding pubkey st.flags st.sig_version with
           | Error e -> Error e
@@ -2253,6 +2278,18 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
           end
         end else begin
           (* Legacy / SegWit v0 OP_CHECKSIGVERIFY *)
+          (* Core EvalChecksigPreTapscript: FindAndDelete runs first, for
+             every signature including the empty one, and under
+             CONST_SCRIPTCODE a hit fails SIG_FINDANDDELETE before any
+             signature or pubkey encoding check. *)
+          if st.sig_version = SigVersionBase &&
+             st.flags land script_verify_const_scriptcode <> 0 &&
+             snd (find_and_delete
+                    (if st.codesep_pos <> 0xFFFFFFFF then
+                       compute_subscript_from_pos script_code (st.codesep_pos + 1)
+                     else script_code) sig_bytes) then
+            Error "CONST_SCRIPTCODE: find_and_delete modified scriptCode"
+          else
           (* Check pubkey encoding *)
           match check_pubkey_encoding pubkey st.flags st.sig_version with
           | Error e -> Error e
@@ -2364,12 +2401,12 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
                       let cleaned_script =
                         if st.sig_version = SigVersionBase then begin
                           let any_removed = ref false in
+                          (* Core deletes every signature, the empty one
+                             (OP_0) included. *)
                           let result = List.fold_left (fun sc sig_bytes ->
-                            if Cstruct.length sig_bytes > 0 then begin
-                              let (result, removed) = find_and_delete sc sig_bytes in
-                              if removed then any_removed := true;
-                              result
-                            end else sc
+                            let (result, removed) = find_and_delete sc sig_bytes in
+                            if removed then any_removed := true;
+                            result
                           ) effective_script_code sigs in
                           if !any_removed && st.flags land script_verify_const_scriptcode <> 0 then
                             None

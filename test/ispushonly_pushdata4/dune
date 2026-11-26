@@ -1,0 +1,11 @@
+; OP_PUSHDATA4 lengths with the top bit set must be read unsigned, like
+; Core's GetScriptOp (ReadLE32), in every raw-script walker
+; (psweep-camlcoin-ispushonly-pushdata4-signed-loop).  On the pre-fix tree a
+; signed read made is_push_only_raw loop forever on `4e fb ff ff ff`, so each
+; case runs in a forked child with a wall-clock bound and a hang is reported
+; as that case's failure.  Own directory so the shared test/dune names list
+; is untouched; uses only APIs that exist on the pre-fix tree.
+(test
+ (name test_ispushonly_pushdata4)
+ (modules test_ispushonly_pushdata4)
+ (libraries camlcoin test_tmp alcotest unix))

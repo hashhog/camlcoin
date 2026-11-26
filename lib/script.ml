@@ -727,6 +727,15 @@ let is_p2a (script : Cstruct.t) : bool =
    Any opcode > OP_16 (0x60), or a push whose data runs past end-of-script,
    causes the function to return false.  An empty script returns true.
    Placed here because classify_script needs it for the OP_RETURN branch. *)
+(* The OP_PUSHDATA4 length at [off], read UNSIGNED like Core's
+   GetScriptOp (ReadLE32 into an unsigned int).  Cstruct.LE.get_uint32
+   returns an int32, and Int32.to_int sign-extends it, so a length with the
+   top bit set (`4e fb ff ff ff`) came out negative and moved the walkers
+   below backwards: is_push_only_raw looped forever on it.  On a 64-bit
+   OCaml int the masked value is the full 0..2^32-1 range, always >= 0. *)
+let pushdata4_len (script : Cstruct.t) (off : int) : int =
+  Int32.to_int (Cstruct.LE.get_uint32 script off) land 0xffff_ffff
+
 let is_push_only_raw (script : Cstruct.t) : bool =
   let len = Cstruct.length script in
   let rec check pos =
@@ -749,7 +758,7 @@ let is_push_only_raw (script : Cstruct.t) : bool =
           end
           else if op = 0x4e then begin
             if pos + 4 >= len then len + 1
-            else pos + 5 + Int32.to_int (Cstruct.LE.get_uint32 script (pos + 1))
+            else pos + 5 + pushdata4_len script (pos + 1)
           end
           else pos + 1
         in
@@ -879,7 +888,7 @@ let strip_codeseparator (script : Cstruct.t) : Cstruct.t =
     end else if b = 0x4e then begin
       (* OP_PUSHDATA4 *)
       if !i + 4 < len then begin
-        let data_len = Int32.to_int (Cstruct.LE.get_uint32 script (!i + 1)) in
+        let data_len = pushdata4_len script (!i + 1) in
         let chunk_len = 5 + data_len in
         let safe_len = min chunk_len (len - !i) in
         for j = 0 to safe_len - 1 do
@@ -926,7 +935,7 @@ let compute_subscript_from_pos (script : Cstruct.t) (after_op_idx : int) : Cstru
         i := !i + 1
     end else if b = 0x4e then begin
       if !i + 4 < len then begin
-        let data_len = Int32.to_int (Cstruct.LE.get_uint32 script (!i + 1)) in
+        let data_len = pushdata4_len script (!i + 1) in
         i := !i + 5 + data_len
       end else
         i := !i + 1
@@ -1015,7 +1024,7 @@ let find_and_delete (script : Cstruct.t) (sig_data : Cstruct.t) : Cstruct.t * bo
           if !i + 2 < script_len then 3 + Cstruct.LE.get_uint16 script (!i + 1)
           else 1
         else if b = 0x4e then
-          if !i + 4 < script_len then 5 + Int32.to_int (Cstruct.LE.get_uint32 script (!i + 1))
+          if !i + 4 < script_len then 5 + pushdata4_len script (!i + 1)
           else 1
         else 1
       in

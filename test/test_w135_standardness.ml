@@ -21,6 +21,7 @@
 
    BUG-1  (P0-CDIV, G6):   is_p2pk_script accepts P2PK with invalid pubkey header
                             (no CPubKey::ValidSize check).  mempool.ml:987-996.
+                            FIXED (r3fix-camlcoin-p2pk-multisig-input-standard).
    BUG-2  (P0-CDIV, G9):   decode_bare_multisig accepts bare-multisig with
                             invalid pubkey header(s).  mempool.ml:1003-1050.
    BUG-3  (P1, G14):       -permitbaremultisig runtime flag absent.
@@ -327,9 +328,11 @@ let test_g5_per_output_standard () =
    G6-G10: Solver-equivalent classification + multisig limits
    ============================================================================ *)
 
-(* G6: BUG-W135-1 — is_p2pk_script doesn't validate pubkey header.
-   A 33-byte body with header 0x00 is INVALID in Core (GetLen(0x00)=0) but
-   recognised as P2PK in camlcoin.  Same for 65-byte uncompressed. *)
+(* G6: BUG-W135-1 (FIXED, r3fix-camlcoin-p2pk-multisig-input-standard) —
+   is_p2pk_script now applies CPubKey::ValidSize (Core v31.1
+   MatchPayToPubkey, solver.cpp:36-47).  A 33-byte body with header 0x00 is
+   INVALID in Core (GetLen(0x00)=0), so the script is NONSTANDARD.  Same for
+   65-byte uncompressed. *)
 let test_g6_p2pk_no_header_check () =
   (* Header 0x02 / 0x03 / 0x04 are valid; 0x00 / 0x05 / 0xff are invalid. *)
   let valid_p2pk_02            = mk_p2pk_compressed ~header:0x02 in
@@ -343,22 +346,22 @@ let test_g6_p2pk_no_header_check () =
     true (Mempool.is_standard_output valid_p2pk_02);
   Alcotest.(check bool) "G6b: 0x03 header recognised (correct)"
     true (Mempool.is_standard_output valid_p2pk_03);
-  (* BUG-W135-1: camlcoin says these are standard; Core says NONSTANDARD. *)
+  (* Core says NONSTANDARD for every bad header. *)
   Alcotest.(check bool)
-    "G6c: BUG-W135-1 — compressed 0x00 header passes is_p2pk_script (Core: NONSTANDARD)"
-    true (Mempool.is_standard_output invalid_p2pk_00);
+    "G6c: compressed 0x00 header is NONSTANDARD (Core: NONSTANDARD)"
+    false (Mempool.is_standard_output invalid_p2pk_00);
   Alcotest.(check bool)
-    "G6d: BUG-W135-1 — compressed 0x05 header passes is_p2pk_script (Core: NONSTANDARD)"
-    true (Mempool.is_standard_output invalid_p2pk_05);
+    "G6d: compressed 0x05 header is NONSTANDARD (Core: NONSTANDARD)"
+    false (Mempool.is_standard_output invalid_p2pk_05);
   Alcotest.(check bool)
-    "G6e: BUG-W135-1 — compressed 0xff header passes is_p2pk_script (Core: NONSTANDARD)"
-    true (Mempool.is_standard_output invalid_p2pk_ff);
+    "G6e: compressed 0xff header is NONSTANDARD (Core: NONSTANDARD)"
+    false (Mempool.is_standard_output invalid_p2pk_ff);
   Alcotest.(check bool)
-    "G6f: BUG-W135-1 — uncompressed 0x00 header passes (Core: NONSTANDARD)"
-    true (Mempool.is_standard_output invalid_p2pk_unc_00);
+    "G6f: uncompressed 0x00 header is NONSTANDARD (Core: NONSTANDARD)"
+    false (Mempool.is_standard_output invalid_p2pk_unc_00);
   Alcotest.(check bool)
-    "G6g: BUG-W135-1 — uncompressed 0x05 header passes (Core: NONSTANDARD)"
-    true (Mempool.is_standard_output invalid_p2pk_unc_05)
+    "G6g: uncompressed 0x05 header is NONSTANDARD (Core: NONSTANDARD)"
+    false (Mempool.is_standard_output invalid_p2pk_unc_05)
 
 (* G7: P2PKH recognition matches Core's MatchPayToPubkeyHash.
    Format: 0x76 0xa9 0x14 <20 bytes> 0x88 0xac (25 bytes). *)
@@ -834,7 +837,7 @@ let () =
       Alcotest.test_case "G5: per-output IsStandard" `Quick test_g5_per_output_standard;
     ];
     "G6-G10 Solver classification + multisig", [
-      Alcotest.test_case "G6: P2PK no header check (BUG-W135-1 P0-CDIV)" `Quick test_g6_p2pk_no_header_check;
+      Alcotest.test_case "G6: P2PK header check (BUG-W135-1 fixed)" `Quick test_g6_p2pk_no_header_check;
       Alcotest.test_case "G7: P2PKH recognised" `Quick test_g7_p2pkh_recognised;
       Alcotest.test_case "G8: P2SH recognised" `Quick test_g8_p2sh_recognised;
       Alcotest.test_case "G9: bare-multisig no header check (BUG-W135-2 P0-CDIV)" `Quick test_g9_bare_multisig_no_header_check;

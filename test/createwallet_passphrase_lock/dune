@@ -1,0 +1,10 @@
+; createwallet with a passphrase ends encrypted and locked
+; (cffix-camlcoin-createwallet-passphrase-lock).  Own directory so the shared
+; test/dune names list is untouched.  The node case boots the real CLI
+; (bin/main.exe) on regtest and drives createwallet, sendtoaddress,
+; walletlock, walletpassphrase and a restart over RPC.
+(test
+ (name test_createwallet_passphrase_lock)
+ (deps ../../bin/main.exe)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix base64
+            yojson str cohttp-lwt-unix))

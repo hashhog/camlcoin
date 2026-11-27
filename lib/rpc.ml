@@ -17267,6 +17267,7 @@ let start_rpc_server ~(ctx : rpc_context)
     ~(cookie_password : string option)
     ?(tls_cert_path : string option = None)
     ?(tls_key_path : string option = None)
+    ?(timeout = Http_listener.default_timeout_s)
     ()
     : unit Lwt.t =
   let open Lwt.Syntax in
@@ -17448,7 +17449,10 @@ let start_rpc_server ~(ctx : rpc_context)
            Both must be provided together for HTTPS.");
       failwith "RPC TLS: key provided without cert"
   in
-  Cohttp_lwt_unix.Server.create ~ctx ~mode server
+  (* Core's -rpcservertimeout I/O timeout (default 30 s) and its 8 KiB
+     request-head cap (httpserver.cpp InitHTTPServer).  Plain Server.create
+     had neither: an idle connection held its fd for ever. *)
+  Http_listener.serve ~timeout ~ctx ~mode server
 
 (* ============================================================================
    Server Creation Helpers

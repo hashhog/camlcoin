@@ -1,0 +1,10 @@
+; r3fix-camlcoin-drop-p2wsh-heuristic: IsStandardTx must not apply the P2WSH
+; witness limits to a witness it has not matched to a P2WSH prevout (tapscript
+; leaves > 80 B, > 100 tapscript stack items, control blocks > 3600 B are
+; standard in Core v31.1).  The prevout-aware is_witness_standard still has
+; to enforce the real P2WSH and tapscript limits.  Own directory so the
+; shared test/dune names list is untouched.
+(test
+ (name test_r3fix_drop_p2wsh_heuristic)
+ (modules test_r3fix_drop_p2wsh_heuristic)
+ (libraries camlcoin test_tmp alcotest))

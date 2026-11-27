@@ -1676,56 +1676,6 @@ let count_tx_sigops_cost_for_mempool (tx : Types.transaction)
 let count_tx_sigops_cost (tx : Types.transaction) (mp : mempool) : int =
   count_tx_sigops_cost_for_mempool tx mp
 
-(* Gap 2: Check P2WSH witness policy limits *)
-let check_p2wsh_witness_limits (tx : Types.transaction) : (unit, string) result =
-  let error = ref None in
-  List.iteri (fun i witness ->
-    if !error = None then begin
-      let items = witness.Types.items in
-      let n = List.length items in
-      if n >= 2 then begin
-        (* Last item is potentially the witness script *)
-        let last_item = List.nth items (n - 1) in
-        let last_len = Cstruct.length last_item in
-        if last_len > 1 then begin
-          (* Heuristic: this looks like a P2WSH input *)
-          (* Check witness script size *)
-          if last_len > Consensus.max_standard_p2wsh_script_size then
-            error := Some (Printf.sprintf
-              "P2WSH witness script too large at input %d (%d > %d)"
-              i last_len Consensus.max_standard_p2wsh_script_size)
-          else begin
-            (* Check number of stack items excluding the script *)
-            let stack_item_count = n - 1 in
-            if stack_item_count > Consensus.max_standard_p2wsh_stack_items then
-              error := Some (Printf.sprintf
-                "Too many P2WSH witness stack items at input %d (%d > %d)"
-                i stack_item_count Consensus.max_standard_p2wsh_stack_items)
-            else begin
-              (* Check each non-script witness item size *)
-              let bad_item = ref None in
-              List.iteri (fun j item ->
-                if !bad_item = None && j < n - 1 then begin
-                  let item_len = Cstruct.length item in
-                  if item_len > Consensus.max_standard_p2wsh_stack_item_size then
-                    bad_item := Some (Printf.sprintf
-                      "P2WSH witness stack item too large at input %d, item %d (%d > %d)"
-                      i j item_len Consensus.max_standard_p2wsh_stack_item_size)
-                end
-              ) items;
-              match !bad_item with
-              | Some e -> error := Some e
-              | None -> ()
-            end
-          end
-        end
-      end
-    end
-  ) tx.witnesses;
-  match !error with
-  | Some e -> Error e
-  | None -> Ok ()
-
 (* ValidateInputsStandardness — per-input prevout-type and P2SH-sigops check.
    Reference: Bitcoin Core policy/policy.cpp:214-263.
 
@@ -2071,7 +2021,11 @@ let compute_tx_nonwitness_size (tx : Types.transaction) : int =
    4. per-input: scriptSig ≤ MAX_STANDARD_SCRIPTSIG_SIZE (1650) + IsPushOnly
    5. per-output: standard scriptPubKey; cumulative OP_RETURN ≤ 100,000 bytes
    6. dust: at most MAX_DUST_OUTPUTS_PER_TX (1) dust outputs
-   7. P2WSH witness policy limits (check_p2wsh_witness_limits) *)
+
+   There is no witness check here, as in Core: the P2WSH and tapscript
+   witness limits depend on the prevout's witness program, so they live in
+   is_witness_standard (Core IsWitnessStandard, policy.cpp:251-342), which
+   add_transaction runs after ValidateInputsStandardness. *)
 (* The first parameter is kept for call-site stability (tests pass a feerate
    positionally) but is no longer consulted: the dust gate below uses the
    dedicated module constant dust_relay_fee (3000), decoupled from the relay
@@ -2156,13 +2110,7 @@ let is_standard_tx (_min_relay_fee : int64) (tx : Types.transaction) : (unit, st
               Error (Printf.sprintf
                 "dust: transaction has %d dust outputs (max %d)"
                 dust_count max_dust_outputs_per_tx)
-            else begin
-              (* Gate 7: P2WSH witness policy limits (stack item count/size).
-                 This is a heuristic pre-check that does not require prevout lookup.
-                 The full per-prevout check (including P2TR, annex, P2SH unwrapping)
-                 is performed by is_witness_standard, called from add_transaction. *)
-              check_p2wsh_witness_limits tx
-            end
+            else Ok ()
       end
     end
   end

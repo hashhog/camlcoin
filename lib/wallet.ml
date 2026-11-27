@@ -469,6 +469,11 @@ type encryption_state = {
   mutable lock_state : lock_state;
   (* Encrypted private keys: address -> encrypted key ciphertext *)
   mutable encrypted_keys : (string, Cstruct.t) Hashtbl.t;
+  (* The HD master's private key, encrypted with the master key.  While the
+     wallet is locked, [master_key] holds only the HD master's public key
+     ([strip_hd_key]); [restore_hd_key] puts the secret back on unlock.
+     Memory only, like [master_key] itself (the wallet file has no seed). *)
+  mutable encrypted_hd_key : Cstruct.t option;
 }
 
 (* Wallet state *)
@@ -559,6 +564,7 @@ let create ~(network : [`Mainnet | `Testnet | `Regtest])
       encrypted_master_key = None;
       lock_state = Unlocked { master_key = Cstruct.empty; expires = infinity };
       encrypted_keys = Hashtbl.create 16;
+      encrypted_hd_key = None;
     };
     locked_coins = Hashtbl.create 16;
     watch_scripts = [];
@@ -577,6 +583,7 @@ let create ~(network : [`Mainnet | `Testnet | `Regtest])
 let init_from_seed (w : t) (seed : Cstruct.t) : unit =
   let master = derive_master_key seed in
   w.master_key <- Some master;
+  w.encryption.encrypted_hd_key <- None;
   w.receive_index <- 0;
   w.change_index <- 0
 
@@ -605,6 +612,7 @@ let init_from_mnemonic (w : t) (mnemonic : string) ?(passphrase = "") () : unit 
 let set_hd_seed (w : t) (seed : Cstruct.t) : unit =
   let master = derive_master_key seed in
   w.master_key <- Some master;
+  w.encryption.encrypted_hd_key <- None;
   w.keys <- [];
   w.next_key_index <- 0;
   w.receive_index <- 0;
@@ -736,6 +744,9 @@ let generate_key_typed (w : t) (addr_type : address_type) : key_pair =
        (fun idx -> w.bip86_receive_index <- idx + 1))
   in
   let private_key = match w.master_key with
+    | Some master when Cstruct.length master.key <> 32 ->
+      (* locked: only the HD master's public key is in memory *)
+      failwith keypool_ran_out_msg
     | Some master ->
       let rec try_derive idx =
         match derivation_fn master idx with
@@ -779,6 +790,9 @@ let generate_change_key_typed (w : t) (addr_type : address_type) : key_pair =
        (fun idx -> w.bip86_change_index <- idx + 1))
   in
   let private_key = match w.master_key with
+    | Some master when Cstruct.length master.key <> 32 ->
+      (* locked: only the HD master's public key is in memory *)
+      failwith keypool_ran_out_msg
     | Some master ->
       let rec try_derive idx =
         match derivation_fn master idx with
@@ -2773,6 +2787,61 @@ let encrypt_new_keys (w : t) : unit =
       ) w.keys
     | _ -> ()
 
+(* The HD master (BIP-32 key + chain code) is what every wallet key derives
+   from, so it is locked like them (Core: a locked descriptor wallet holds
+   its descriptor keys only encrypted).  Its secret is encrypted with the
+   master key, IV from its public key as for [encrypt_private_key]. *)
+let hd_public_key (ek : extended_key) : Cstruct.t =
+  if Cstruct.length ek.key = 32 then
+    Crypto.derive_public_key ~compressed:true ek.key
+  else ek.key
+
+let hd_key_iv (pub : Cstruct.t) : Cstruct.t =
+  Cstruct.sub (Crypto.sha256d pub) 0 16
+
+(* Store the ciphertext of the HD secret, if the secret is in memory. *)
+let encrypt_hd_key ~(master_key : Cstruct.t) (w : t) : unit =
+  match w.master_key with
+  | Some ek when Cstruct.length ek.key = 32 ->
+    w.encryption.encrypted_hd_key <-
+      Some (aes_256_cbc_encrypt ~key:master_key
+              ~iv:(hd_key_iv (hd_public_key ek)) ek.key)
+  | _ -> ()
+
+(* Zero the HD secret and keep only its public key, which is all that
+   serialize_xpub and fingerprint_of_key need. *)
+let strip_hd_key (w : t) : unit =
+  match w.master_key with
+  | Some ek when Cstruct.length ek.key = 32 ->
+    let pub = hd_public_key ek in
+    for i = 0 to Cstruct.length ek.key - 1 do
+      Cstruct.set_uint8 ek.key i 0
+    done;
+    w.master_key <- Some { ek with key = pub }
+  | _ -> ()
+
+(* The HD secret under [master_key], if it decrypts to the secret of the
+   public key kept while locked.  [None] for no locked HD key. *)
+let decrypt_hd_key ~(master_key : Cstruct.t) (w : t)
+    : (extended_key, unit) result option =
+  match w.master_key, w.encryption.encrypted_hd_key with
+  | Some ek, Some c when Cstruct.length ek.key = 33 ->
+    (match aes_256_cbc_decrypt ~key:master_key ~iv:(hd_key_iv ek.key) c with
+     | Some sk when Cstruct.length sk = 32
+                 && Cstruct.equal
+                      (Crypto.derive_public_key ~compressed:true sk) ek.key ->
+       Some (Ok { ek with key = sk })
+     | _ -> Some (Error ()))
+  | _ -> None
+
+(* Put the HD secret back from its ciphertext. *)
+let restore_hd_key ~(master_key : Cstruct.t) (w : t) : unit =
+  match decrypt_hd_key ~master_key w with
+  | Some (Ok ek) -> w.master_key <- Some ek
+  | Some (Error ()) ->
+    Log.warn (fun m -> m "wallet HD key did not decrypt; it stays locked")
+  | None -> ()
+
 (* Unlock the wallet with a passphrase for a specified timeout (seconds).
    Private keys become accessible until the timeout expires. *)
 let wallet_passphrase (w : t) ~(passphrase : string) ~(timeout : float)
@@ -2815,7 +2884,12 @@ let wallet_passphrase (w : t) ~(passphrase : string) ~(timeout : float)
                 let derived_pub = Crypto.derive_public_key ~compressed:true decrypted in
                 Cstruct.equal derived_pub kp.public_key
               | None -> false)
-           | None -> true  (* no ciphertext to check: the 32-byte test above *)
+           | None ->
+             (* no key ciphertext: check the HD master's, if there is one,
+                else the 32-byte test above is all there is *)
+             (match decrypt_hd_key ~master_key w with
+              | Some (Error ()) -> false
+              | Some (Ok _) | None -> true)
          in
          if valid then begin
            (* Decrypt all private keys and restore them *)
@@ -2834,6 +2908,9 @@ let wallet_passphrase (w : t) ~(passphrase : string) ~(timeout : float)
            let expires = Unix.gettimeofday () +. timeout in
            w.encryption.lock_state <- Unlocked { master_key; expires };
            encrypt_new_keys w;
+           restore_hd_key ~master_key w;
+           (* a seed set since the last lock has no ciphertext yet *)
+           encrypt_hd_key ~master_key w;
            Ok ()
          end else
            Error "Error: The wallet passphrase entered was incorrect"
@@ -2858,7 +2935,16 @@ let wallet_lock (w : t) : unit =
         for i = 0 to Cstruct.length kp.private_key - 1 do
           Cstruct.set_uint8 kp.private_key i 0
         done
-    ) w.keys
+    ) w.keys;
+    (* the HD master the same way: encrypted while the master key is at
+       hand, then zeroed if it can come back *)
+    (match w.encryption.lock_state with
+     | Unlocked { master_key; _ } when Cstruct.length master_key = 32 ->
+       encrypt_hd_key ~master_key w
+     | _ -> ());
+    if not (has_key_crypto w)
+       || Option.is_some w.encryption.encrypted_hd_key then
+      strip_hd_key w
   end;
   w.encryption.lock_state <- Locked
 
@@ -3556,6 +3642,9 @@ let encrypt_wallet (w : t) ~(passphrase : string) : (unit, string) result =
       Hashtbl.replace w.encryption.encrypted_keys addr_str encrypted
     ) w.keys;
 
+    (* The HD master too: Core encrypts every descriptor key *)
+    encrypt_hd_key ~master_key w;
+
     (* Encrypt the master key with the derived key *)
     let encrypted_master = aes_256_cbc_encrypt ~key:derived_key ~iv:derived_iv master_key in
 
@@ -3578,6 +3667,7 @@ let encrypt_wallet (w : t) ~(passphrase : string) : (unit, string) result =
       w.encryption.encrypted_master_key <- None;
       w.encryption.lock_state <- unencrypted_state;
       Hashtbl.reset w.encryption.encrypted_keys;
+      w.encryption.encrypted_hd_key <- None;
       (* the encrypted file may already be in place (only the backup
          failed): put back the wallet this call leaves in memory *)
       if w.db_path <> "" then save_safe w;
@@ -3589,6 +3679,7 @@ let encrypt_wallet (w : t) ~(passphrase : string) : (unit, string) result =
           Cstruct.set_uint8 kp.private_key i 0
         done
       ) w.keys;
+      strip_hd_key w;
       Ok ()
   end
 

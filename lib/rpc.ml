@@ -4646,8 +4646,12 @@ let handle_encryptwallet (ctx : rpc_context)
           match Wallet.encrypt_wallet wallet ~passphrase with
           | Error e -> Error e
           | Ok () ->
+            (* Core's reply says the keypool was flushed and a new HD seed
+               generated, because its EncryptWallet does that.  camlcoin
+               keeps the wallet's keys and HD seed (now encrypted), so it
+               must not claim either. *)
             Ok (`String
-              "wallet encrypted; The keypool has been flushed and a new HD seed was generated (if you are using HD). You need to make a new backup.")
+              "wallet encrypted; The existing keys and HD seed are kept and are now encrypted. You need to make a new backup.")
         end
     end
   | _ ->
@@ -4696,7 +4700,11 @@ let handle_walletpassphrase (ctx : rpc_context)
               (* Only lock if the wallet is still unlocked AND the current
                  unlock state matches our timer (i.e. nobody extended it). *)
               (match wallet.Wallet.encryption.lock_state with
-               | Wallet.Locked -> ()
+               | Wallet.Locked ->
+                 (* an expired unlock is marked Locked lazily by
+                    [Wallet.is_locked], which zeroes nothing; finish the
+                    lock so every secret that has a ciphertext is zeroed *)
+                 Wallet.wallet_lock wallet
                | Wallet.Unlocked { expires; _ } ->
                  if expires <= our_deadline +. 0.5 then
                    Wallet.wallet_lock wallet);
@@ -10279,6 +10287,16 @@ let handle_listdescriptors (ctx : rpc_context)
   in
   match ctx.wallet with
   | None -> Error "Wallet not loaded"
+  | Some wallet
+    when include_private
+         && ((Wallet.is_encrypted wallet && Wallet.is_locked wallet)
+             (* only the public half of the HD master is in memory *)
+             || (match wallet.Wallet.master_key with
+                 | Some ek -> Cstruct.length ek.Wallet.key <> 32
+                 | None -> false)) ->
+    (* Core listdescriptors: EnsureWalletIsUnlocked for private=true
+       (wallet/rpc/backup.cpp), RPC_WALLET_UNLOCK_NEEDED *)
+    Error Wallet.wallet_locked_msg
   | Some wallet ->
     (* Generate implicit descriptors from wallet's master key *)
     let descriptors = match wallet.Wallet.master_key with
@@ -16823,6 +16841,8 @@ let dispatch_rpc (ctx : rpc_context)
   | "listdescriptors" ->
     (match handle_listdescriptors ctx params with
      | Ok r -> Ok r
+     | Error msg when msg = Wallet.wallet_locked_msg ->
+       Error ((-13) (* RPC_WALLET_UNLOCK_NEEDED *), msg)
      | Error msg -> Error (rpc_wallet_error, msg))
 
   (* Control *)

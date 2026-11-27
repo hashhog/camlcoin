@@ -406,7 +406,9 @@ let g29_mempool_disabled_NOT_declared () =
 (* -- G30 RPC_WALLET_* cluster PARTIAL -------------------------------- *)
 
 (* Remaining wallet sub-codes still undeclared. -18/-35/-36 are now
-   declared (loadwallet/unloadwallet/restorewallet vs Core protocol.h). *)
+   declared (loadwallet/unloadwallet/restorewallet vs Core protocol.h), and
+   -19 (rpc_wallet_not_specified: a base-path wallet RPC with several
+   wallets loaded, Rpc.context_with_wallet). *)
 let g30_wallet_cluster_all_missing () =
   let cluster_codes = [
     "rpc_wallet_invalid_label_name";   (* -11 *)
@@ -416,7 +418,6 @@ let g30_wallet_cluster_all_missing () =
     "rpc_wallet_wrong_enc_state";      (* -15 *)
     "rpc_wallet_encryption_failed";    (* -16 *)
     "rpc_wallet_already_unlocked";     (* -17 *)
-    "rpc_wallet_not_specified";        (* -19 *)
   ] in
   let src = rpc_ml () in
   List.iter (fun code ->
@@ -509,11 +510,11 @@ let as2_missing_distinct_codes () =
     let pat = Printf.sprintf "let %s =" c in
     if contains_substring src pat then acc else acc + 1
   ) 0 missing in
-  (* 27 baseline - 9 now-declared (G13 -8, G23 -23, G24 -24, G25 -29,
-     G26 -30, G27 -31, plus wallet -18/-35/-36) = 18 still missing. *)
+  (* 27 baseline - 10 now-declared (G13 -8, G23 -23, G24 -24, G25 -29,
+     G26 -30, G27 -31, plus wallet -18/-19/-35/-36) = 17 still missing. *)
   Alcotest.(check int)
-    "AS2: 18 of the original 27 W125-missing Core codes remain undeclared"
-    18 still_missing
+    "AS2: 17 of the original 27 W125-missing Core codes remain undeclared"
+    17 still_missing
 
 (* Bug count: 22 catalogued in audit/w125_rpc_error_parity.md.  This
    assertion encodes the audit-time count via a sentinel constant. *)

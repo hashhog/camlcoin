@@ -4346,6 +4346,13 @@ let handle_gettransaction (ctx : rpc_context)
 (* Helper: get wallet by name from wallet manager, or fall back to legacy wallet *)
 let get_wallet_for_request (ctx : rpc_context) (wallet_name : string option)
     : (Wallet.t, string) result =
+  match wallet_name, ctx.wallet with
+  | None, Some w ->
+    (* The endpoint's wallet, already resolved into ctx.wallet by
+       context_with_wallet.  Asking the manager for "" first made
+       getwalletinfo on /wallet/<name> describe the default wallet. *)
+    Ok w
+  | _ ->
   match ctx.wallet_manager with
   | Some wm ->
     let name = Option.value wallet_name ~default:"" in
@@ -17042,6 +17049,103 @@ let dispatch_rpc (ctx : rpc_context)
    HTTP Server
    ============================================================================ *)
 
+(* Extract wallet name from URI path: /wallet/<name> or /.
+   Core GetWalletNameFromJSONRPCRequest: any URI starting "/wallet/" is the
+   wallet endpoint, the rest URL-decoded is the name ("/wallet/" is the
+   name ""). Uri.path is the encoded path, so decode it here. *)
+let extract_wallet_from_uri (uri : Uri.t) : string option =
+  let path = Uri.path uri in
+  if String.length path >= 8 && String.sub path 0 8 = "/wallet/" then
+    Some (Uri.pct_decode (String.sub path 8 (String.length path - 8)))
+  else
+    None  (* "/" (or anything else): no wallet endpoint *)
+
+let rpc_wallet_not_specified = -19
+
+(* The RPCs camlcoin dispatches that call GetWalletForJSONRPCRequest in Core
+   v31.1 (src/wallet/rpc/{addresses,backup,coins,encrypt,signmessage,spend,
+   transactions,wallet}.cpp), plus camlcoin's legacy importprivkey and
+   sethdseed, which act on one wallet the same way.  Core wallet RPCs that
+   camlcoin does not implement (bumpfee, sendmany, listsinceblock, ...) are
+   left out: they answer -32601 on every endpoint.  A wallet RPC added to
+   dispatch_rpc must be added here too.  createwallet, loadwallet,
+   unloadwallet, restorewallet and listwallets do not take a wallet from the
+   endpoint this way. *)
+let wallet_scoped_rpcs = [
+  "backupwallet"; "encryptwallet"; "fundrawtransaction"; "getaddressinfo";
+  "getbalance"; "getbalances"; "getnewaddress"; "gettransaction";
+  "getwalletinfo"; "importdescriptors"; "listdescriptors";
+  "listlockunspent"; "listtransactions"; "listunspent"; "lockunspent";
+  "rescanblockchain"; "send"; "sendtoaddress"; "signmessage";
+  "signrawtransactionwithwallet"; "walletcreatefundedpsbt"; "walletlock";
+  "walletpassphrase"; "walletprocesspsbt";
+  (* camlcoin legacy single-wallet RPCs *)
+  "importprivkey"; "sethdseed";
+]
+
+let is_wallet_scoped_rpc (method_name : string) : bool =
+  List.mem method_name wallet_scoped_rpcs
+
+(* Resolve the wallet a request is for, as Core GetWalletForJSONRPCRequest
+   (wallet/rpc/util.cpp) does:
+   - /wallet/<name> (Some name) with a manager: that wallet, or -18
+     "Requested wallet does not exist or is not loaded".  It used to return
+     the context unchanged, so the RPC ran on the boot/default wallet.
+   - / (None) with a manager: the manager's DEFAULT wallet (key "") when
+     there is one.  camlcoin keeps this extra rule: Cli registers the boot
+     wallet as "" and createwallet promotes the new wallet to "", so
+     base-path RPCs follow the most recently created wallet.  Without a
+     default, Core's rule: the sole loaded wallet; none loaded is -18 "No
+     wallet is loaded. ..."; several is -19 RPC_WALLET_NOT_SPECIFIED.  Both
+     used to return the context unchanged, which still held the boot wallet
+     even after it had been unloaded.
+   - No manager: legacy single-wallet mode, ctx.wallet untouched.
+   The error is only reported for [is_wallet_scoped_rpc] methods; every
+   other RPC answers on any endpoint, as in Core. *)
+let context_with_wallet (ctx : rpc_context) (wallet_name : string option)
+    : (rpc_context, int * string) result =
+  match wallet_name, ctx.wallet_manager with
+  | None, None -> Ok ctx  (* legacy single-wallet mode *)
+  | None, Some wm ->
+    (match Wallet.get_default_wallet wm with
+     | Some w -> Ok { ctx with wallet = Some w }
+     | None ->
+       (match Wallet.list_wallets wm with
+        | [only] ->
+          (match Wallet.get_wallet wm only with
+           | Some w -> Ok { ctx with wallet = Some w }
+           | None -> Error (rpc_wallet_not_found,
+                            "Requested wallet does not exist or is not loaded"))
+        | [] ->
+          Error (rpc_wallet_not_found,
+                 "No wallet is loaded. Load a wallet using loadwallet or \
+                  create a new one with createwallet. (Note: A default \
+                  wallet is no longer automatically created)")
+        | _ ->
+          Error (rpc_wallet_not_specified,
+                 "Multiple wallets are loaded. Please select which wallet \
+                  to use by requesting the RPC through the \
+                  /wallet/<walletname> URI path.")))
+  | Some name, Some wm ->
+    (match Wallet.get_wallet wm name with
+     | Some w -> Ok { ctx with wallet = Some w }
+     | None -> Error (rpc_wallet_not_found,
+                      "Requested wallet does not exist or is not loaded"))
+  | Some _, None -> Ok ctx  (* No manager, use existing *)
+
+(* The refusal for a wallet RPC whose endpoint did not resolve, after the
+   argument-count check (Core's RPCHelpMan checks arguments before the
+   handler body asks for the wallet). *)
+let wallet_route_refusal ~(wallet_route_error : (int * string) option)
+    ~(id : Yojson.Safe.t) (method_name : string) (params : Yojson.Safe.t list)
+    : Yojson.Safe.t option =
+  match wallet_route_error with
+  | Some (code, message)
+    when is_wallet_scoped_rpc method_name
+      && check_core_arity method_name params = None ->
+    Some (json_rpc_error ~id ~code ~message)
+  | _ -> None
+
 (* Handle a single JSON-RPC request object, returning the response *)
 let handle_single_request (ctx : rpc_context) (json : Yojson.Safe.t)
     : Yojson.Safe.t =
@@ -17086,7 +17190,8 @@ let handle_single_request (ctx : rpc_context) (json : Yojson.Safe.t)
    This wrapper routes those three methods through [dispatch_wait_rpc] (Lwt)
    and falls back to the synchronous dispatcher for every other method,
    keeping a single shared response-encoding path. *)
-let handle_single_request_lwt (ctx : rpc_context) (json : Yojson.Safe.t)
+let handle_single_request_lwt ?(wallet_route_error : (int * string) option)
+    (ctx : rpc_context) (json : Yojson.Safe.t)
     : Yojson.Safe.t Lwt.t =
   let method_name = match json with
     | `Assoc fields ->
@@ -17111,6 +17216,9 @@ let handle_single_request_lwt (ctx : rpc_context) (json : Yojson.Safe.t)
        | None -> `Null)
     | _ -> `Null
   in
+  match wallet_route_refusal ~wallet_route_error ~id method_name params with
+  | Some refusal -> Lwt.return refusal
+  | None ->
   match dispatch_wait_rpc ctx method_name params with
   | Some result_lwt ->
     Lwt.bind result_lwt (function
@@ -17171,12 +17279,13 @@ let handle_single_request_lwt (ctx : rpc_context) (json : Yojson.Safe.t)
             ())
 
 (* Handle a batch of JSON-RPC requests in parallel *)
-let handle_batch_request (ctx : rpc_context) (requests : Yojson.Safe.t list)
+let handle_batch_request ?(wallet_route_error : (int * string) option)
+    (ctx : rpc_context) (requests : Yojson.Safe.t list)
     : Yojson.Safe.t list Lwt.t =
   Lwt_list.map_p (fun req ->
     (* Each request is processed independently - errors in one don't affect others *)
     Lwt.catch
-      (fun () -> handle_single_request_lwt ctx req)
+      (fun () -> handle_single_request_lwt ?wallet_route_error ctx req)
       (fun exn ->
         (* Extract id from malformed request if possible *)
         let id = match req with
@@ -17189,57 +17298,6 @@ let handle_batch_request (ctx : rpc_context) (requests : Yojson.Safe.t list)
         Lwt.return (json_rpc_error ~id ~code:rpc_parse_error
                       ~message:(Printexc.to_string exn)))
   ) requests
-
-(* Extract wallet name from URI path: /wallet/<name> or / *)
-let extract_wallet_from_uri (uri : Uri.t) : string option =
-  let path = Uri.path uri in
-  if String.length path > 8 && String.sub path 0 8 = "/wallet/" then
-    Some (String.sub path 8 (String.length path - 8))
-  else if path = "/" || path = "" then
-    None  (* Use default wallet *)
-  else
-    None
-
-(* Create a context with wallet override for specific wallet routing.
-
-   Resolution rules (mirrors Bitcoin Core GetWalletForJSONRPCRequest, which
-   keys off the /wallet/<name> URL endpoint):
-   - /wallet/<name> (Some name) with a manager: route to that named wallet.
-   - / (None, global routing) with a manager: route to the manager's DEFAULT
-     wallet (key "").  This is the wallet createwallet of a watch-only wallet
-     registers itself as, so a globally-routed importdescriptors / listunspent
-     / getaddressinfo / getwalletinfo / sendtoaddress / getnewaddress all
-     operate on the most-recently-created watch-only wallet rather than the
-     stale boot wallet captured at context-build time.  Falls back to the
-     boot ctx.wallet when the manager has no default.
-   - No manager: legacy single-wallet mode — leave ctx.wallet untouched. *)
-let context_with_wallet (ctx : rpc_context) (wallet_name : string option) : rpc_context =
-  match wallet_name, ctx.wallet_manager with
-  | None, None -> ctx  (* legacy single-wallet mode *)
-  | None, Some wm ->
-    (match Wallet.get_default_wallet wm with
-     | Some w -> { ctx with wallet = Some w }
-     | None ->
-       (* Core GetWalletForJSONRPCRequest (wallet/rpc/util.cpp): with NO
-          /wallet/<name> in the URL and EXACTLY ONE wallet loaded, the request
-          routes to that sole wallet. Only when zero or many are loaded does it
-          fall back / error. Previously a normal (keyed) createwallet — which is
-          NOT promoted to the "" default (that promotion is watch-only-only) —
-          left base-"/" routing pointing at the stale keyless boot wallet
-          captured at context-build time, so getnewaddress on the freshly
-          created single wallet failed "no available keys". *)
-       (match Wallet.list_wallets wm with
-        | [only] ->
-          (match Wallet.get_wallet wm only with
-           | Some w -> { ctx with wallet = Some w }
-           | None -> ctx)
-        | _ -> ctx))
-  | Some name, Some wm ->
-    (* Override wallet in context with specific wallet from manager *)
-    (match Wallet.get_wallet wm name with
-     | Some w -> { ctx with wallet = Some w }
-     | None -> ctx)
-  | Some _, None -> ctx  (* No manager, use existing *)
 
 (* W119 / FIX-64: optional HTTPS/TLS termination.
 
@@ -17298,7 +17356,15 @@ let start_rpc_server ~(ctx : rpc_context)
 
     (* Extract wallet name from URI for multi-wallet routing *)
     let wallet_name = extract_wallet_from_uri uri in
-    let request_ctx = context_with_wallet ctx wallet_name in
+    (* An endpoint that names no loaded wallet (or a base path with no
+       default and zero or several wallets) leaves the request with no
+       wallet; wallet RPCs answer the routing error instead of running on
+       the boot/default wallet, the rest answer as usual. *)
+    let request_ctx, wallet_route_error =
+      match context_with_wallet ctx wallet_name with
+      | Ok c -> (c, None)
+      | Error e -> ({ ctx with wallet = None }, Some e)
+    in
 
     (* REST (GET under /rest/) is unauthenticated in Core and shares this listener
        when -rest is enabled. *)
@@ -17354,7 +17420,8 @@ let start_rpc_server ~(ctx : rpc_context)
           end
           else begin
             (* Process batch requests in parallel *)
-            let* responses = handle_batch_request request_ctx requests in
+            let* responses = handle_batch_request request_ctx requests
+                ?wallet_route_error in
             let response_body = Yojson.Safe.to_string (`List responses) in
             let response_headers = Cohttp.Header.init_with
               "Content-Type" "application/json" in
@@ -17369,7 +17436,9 @@ let start_rpc_server ~(ctx : rpc_context)
           (* Lwt path so the wait-family RPCs (waitfornewblock /
              waitforblock / waitforblockheight) can block the request
              coroutine on a tip change without stalling the event loop. *)
-          let* result = handle_single_request_lwt request_ctx single_request in
+          let* result =
+            handle_single_request_lwt request_ctx single_request
+              ?wallet_route_error in
           let response_body = Yojson.Safe.to_string result in
           let response_headers = Cohttp.Header.init_with
             "Content-Type" "application/json" in

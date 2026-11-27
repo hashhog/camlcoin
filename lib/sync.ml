@@ -1171,199 +1171,6 @@ let is_ancestry_incomplete (msg : string) : bool =
   String.length msg >= String.length t
   && String.sub msg 0 (String.length t) = t
 
-(* Process headers during REDOWNLOAD phase.
-   These headers are validated, stored in a buffer, and released to permanent
-   storage only once the buffer is deep enough (commitment safety margin).
-
-   Bug 2 fix: now verifies commitment bits against stored PRESYNC commitments.
-   Bug 6 fix: calls permitted_difficulty_transition.
-   Bug 7 fix: uses redownload_buffer_size before releasing to acceptance.
-   Bug 10 fix: implements process_all_remaining flag.
-   Bug 9 fix: the REDOWNLOAD locator resumes from the cursor, not genesis
-   (now built by build_presync_locator_full). *)
-let process_redownload_headers ~(ps : peer_header_sync)
-    ~(headers : Types.block_header list)
-    ~(chain_state : chain_state)
-    : (Types.block_header list, string) result =
-  match ps.state with
-  | Redownload rd_data ->
-    let error = ref None in
-    let rd = ref rd_data in
-    List.iter (fun (header : Types.block_header) ->
-      if !error = None then begin
-        let next_height = !rd.redownload_last_height + 1 in
-        (* Check prev_block continuity — mirrors Core headerssync.cpp:224-227. *)
-        if not (Cstruct.equal header.prev_block !rd.redownload_last_hash) then
-          error := Some (Printf.sprintf
-            "REDOWNLOAD: non-continuous headers at height %d (peer %d)" next_height ps.peer_id)
-        else begin
-          (* Bug 6: check difficulty transition — mirrors Core headerssync.cpp:230-240.
-             previous_nBits = back of buffer's nBits, or chain_start_bits if buffer empty. *)
-          let previous_nBits =
-            if Queue.is_empty !rd.buffer then ps.chain_start_bits
-            else begin
-              let last = ref ps.chain_start_bits in
-              Queue.iter (fun ((h : Types.block_header), _) -> last := h.bits) !rd.buffer;
-              !last
-            end
-          in
-          if not (Consensus.permitted_difficulty_transition ~network:chain_state.network
-                    ~height:next_height ~old_nbits:previous_nBits ~new_nbits:header.bits) then
-            error := Some (Printf.sprintf
-              "REDOWNLOAD: invalid difficulty transition at height %d (peer %d)" next_height ps.peer_id)
-          else begin
-            (* Track work on redownloaded chain — mirrors Core headerssync.cpp:243-248. *)
-            let new_chain_work = Consensus.work_add !rd.redownload_chain_work
-                (Consensus.work_from_compact header.bits) in
-            let process_all =
-              !rd.process_all_remaining ||
-              Consensus.work_compare new_chain_work chain_state.network.minimum_chain_work >= 0
-            in
-            (* Bug 2: verify commitment bit if applicable.
-               Mirrors Core headerssync.cpp:256-269.
-               Skip commitment check once process_all is set — peer may have
-               extended its chain since PRESYNC so commitments can run out. *)
-            let hash = Crypto.compute_block_hash header in
-            if not process_all &&
-               next_height mod header_commitment_period = ps.commit_offset then begin
-              if Queue.is_empty ps.header_commitments then
-                error := Some (Printf.sprintf
-                  "REDOWNLOAD: commitment overrun at height %d (peer %d)" next_height ps.peer_id)
-              else begin
-                let expected_bit = Queue.pop ps.header_commitments in
-                let actual_bit = commitment_bit ~k0:ps.hasher_k0 ~k1:ps.hasher_k1 ~hash in
-                if actual_bit <> expected_bit then
-                  error := Some (Printf.sprintf
-                    "REDOWNLOAD: commitment mismatch at height %d (peer %d)" next_height ps.peer_id)
-              end
-            end;
-            if !error = None then begin
-              (* Store in buffer — mirrors Core m_redownloaded_headers.emplace_back *)
-              Queue.push (header, hash) !rd.buffer;
-              rd := { !rd with
-                redownload_last_height = next_height;
-                redownload_last_hash = hash;
-                redownload_chain_work = new_chain_work;
-                process_all_remaining = process_all;
-                headers_received = !rd.headers_received + 1;
-              }
-            end
-          end
-        end
-      end
-    ) headers;
-    begin match !error with
-    | Some e -> Error e
-    | None ->
-      (* Release headers ready for acceptance (buffer deep enough or process_all).
-         Mirrors Core's PopHeadersReadyForAcceptance call in ProcessNextHeaders. *)
-      let ready = ref [] in
-      let first_prev = ref !rd.redownload_first_prev_hash in
-      let keep_going = ref true in
-      while !keep_going && not (Queue.is_empty !rd.buffer) do
-        if Queue.length !rd.buffer > redownload_buffer_size || !rd.process_all_remaining then begin
-          let ((hdr : Types.block_header), _) = Queue.pop !rd.buffer in
-          let full_hdr = Types.{ hdr with prev_block = !first_prev } in
-          first_prev := Crypto.compute_block_hash full_hdr;
-          ready := full_hdr :: !ready
-        end else
-          keep_going := false
-      done;
-      (* Update first_prev_hash in rd state *)
-      rd := { !rd with redownload_first_prev_hash = !first_prev };
-      ps.state <- Redownload !rd;
-      let released = List.rev !ready in
-      (* Now store all released headers into chain state (permanent storage).
-         This is the equivalent of the caller processing pow_validated_headers. *)
-      List.iter (fun (header : Types.block_header) ->
-        let hash = Crypto.compute_block_hash header in
-        let hash_key = Cstruct.to_string hash in
-        if not (Hashtbl.mem chain_state.headers hash_key) then begin
-          let parent_key = Cstruct.to_string header.prev_block in
-          match Hashtbl.find_opt chain_state.headers parent_key with
-          | None -> () (* skip if parent not known yet; will be linked later *)
-          | Some parent ->
-            let height = parent.height + 1 in
-            (* bad-diffbits exact gate (poison-immune).  GATE 4 coverage: this
-               REDOWNLOAD release loop is the point at which anti-DoS
-               header-sync headers become permanent in [chain_state.headers] /
-               tip — the caller (see the [`Redownload] arm of the sync loop)
-               does NOT re-run [validate_header] on them, so the exact
-               GetNextWorkRequired check (Core ContextualCheckBlockHeader,
-               validation.cpp:4086-4089) would otherwise never run on this
-               path.  The buffering-phase [permitted_difficulty_transition]
-               (above) is only Core's looser headerssync.cpp bound, not this
-               exact check.  [~parent_entry:parent] is LOAD-BEARING: it makes
-               [compute_expected_bits] walk prev_block links through
-               [chain_state.headers] (Core pindexPrev->GetAncestor, pow.cpp:44,72)
-               rather than the active-chain height->hash index — the very
-               structure the difficulty-1 header attack poisoned.  Without it the
-               header-ahead-of-tip fallback returns [network.pow_limit]
-               (0x1d00ffff on mainnet), rejecting honest headers and rubber-
-               stamping the attack.  [~ancestry_incomplete] guards Core's
-               asserted-against case (pow.cpp:42-45): if an ancestor is genuinely
-               absent we log and skip rather than judge against a placeholder. *)
-            let ancestry_incomplete = ref false in
-            let expected_bits =
-              compute_expected_bits ~parent_entry:parent ~ancestry_incomplete
-                chain_state height header
-            in
-            if !ancestry_incomplete then
-              Logs.err (fun m ->
-                m "REDOWNLOAD bad-diffbits check SKIPPED at height %d (peer %d): \
-                   ancestor missing from the in-memory header table; header %s \
-                   admitted without a difficulty check."
-                  height ps.peer_id (Types.hash256_to_hex_display hash));
-            if (not !ancestry_incomplete) && header.bits <> expected_bits then
-              Logs.err (fun m ->
-                m "REDOWNLOAD bad-diffbits at height %d (peer %d): got 0x%08lx \
-                   expected 0x%08lx — refusing to store header %s"
-                  height ps.peer_id header.bits expected_bits
-                  (Types.hash256_to_hex_display hash))
-            else begin
-            let work = Consensus.work_add parent.total_work
-                (Consensus.work_from_compact header.bits) in
-            let entry = { header; hash; height; total_work = work } in
-            Hashtbl.replace chain_state.headers hash_key entry;
-            (* No [set_height_hash] here — same rule as [accept_header]:
-               the height->hash index projects the ACTIVE VALIDATED chain,
-               not the header chain.  This is the anti-DoS header
-               REDOWNLOAD path, which by construction processes headers
-               that may never become active, so writing the index here
-               was the same contamination bug in a second place. *)
-            Storage.ChainDB.store_block_header chain_state.db hash header;
-            let is_new_tip = match chain_state.tip with
-              | None -> true
-              | Some tip -> Consensus.work_compare work tip.total_work > 0
-            in
-            if is_new_tip then begin
-              chain_state.tip <- Some entry;
-              Storage.ChainDB.set_header_tip chain_state.db hash height;
-              chain_state.headers_synced <- height
-            end
-            end
-        end
-      ) released;
-      (* Check if REDOWNLOAD is complete (buffer drained and process_all set,
-         or we've hit the target hash). *)
-      let final_rd = match ps.state with
-        | Redownload r -> r
-        | _ -> !rd
-      in
-      let complete =
-        Queue.is_empty final_rd.buffer && final_rd.process_all_remaining
-      in
-      if complete then begin
-        Logs.info (fun m ->
-          m "REDOWNLOAD complete for peer %d: height=%d, %d headers stored"
-            ps.peer_id final_rd.redownload_last_height final_rd.headers_received);
-        ps.state <- Synced
-      end;
-      Ok released
-    end
-  | Presync _ | Synced ->
-    Error "process_redownload_headers called in wrong state"
-
 (* Determine which state a header sync message should be processed in.
    Used by the sync loop to dispatch to the correct handler. *)
 let get_header_sync_phase (ps : peer_header_sync) : [`Presync | `Redownload | `Synced] =
@@ -2533,6 +2340,199 @@ let headers_pow_ok (state : chain_state)
       Consensus.check_proof_of_work (Crypto.compute_block_hash h) h.bits
         state.network)
     headers
+
+(* Process headers during REDOWNLOAD phase.
+   These headers are validated, stored in a buffer, and released to permanent
+   storage only once the buffer is deep enough (commitment safety margin).
+
+   Bug 2 fix: now verifies commitment bits against stored PRESYNC commitments.
+   Bug 6 fix: calls permitted_difficulty_transition.
+   Bug 7 fix: uses redownload_buffer_size before releasing to acceptance.
+   Bug 10 fix: implements process_all_remaining flag.
+   Bug 9 fix: the REDOWNLOAD locator resumes from the cursor, not genesis
+   (now built by build_presync_locator_full). *)
+let process_redownload_headers ~(ps : peer_header_sync)
+    ~(headers : Types.block_header list)
+    ~(chain_state : chain_state)
+    : (Types.block_header list, string) result =
+  match ps.state with
+  | Redownload rd_data ->
+    let error = ref None in
+    let rd = ref rd_data in
+    List.iter (fun (header : Types.block_header) ->
+      if !error = None then begin
+        let next_height = !rd.redownload_last_height + 1 in
+        (* Check prev_block continuity — mirrors Core headerssync.cpp:224-227. *)
+        if not (Cstruct.equal header.prev_block !rd.redownload_last_hash) then
+          error := Some (Printf.sprintf
+            "REDOWNLOAD: non-continuous headers at height %d (peer %d)" next_height ps.peer_id)
+        else begin
+          (* Bug 6: check difficulty transition — mirrors Core headerssync.cpp:230-240.
+             previous_nBits = back of buffer's nBits, or chain_start_bits if buffer empty. *)
+          let previous_nBits =
+            if Queue.is_empty !rd.buffer then ps.chain_start_bits
+            else begin
+              let last = ref ps.chain_start_bits in
+              Queue.iter (fun ((h : Types.block_header), _) -> last := h.bits) !rd.buffer;
+              !last
+            end
+          in
+          if not (Consensus.permitted_difficulty_transition ~network:chain_state.network
+                    ~height:next_height ~old_nbits:previous_nBits ~new_nbits:header.bits) then
+            error := Some (Printf.sprintf
+              "REDOWNLOAD: invalid difficulty transition at height %d (peer %d)" next_height ps.peer_id)
+          else begin
+            (* Track work on redownloaded chain — mirrors Core headerssync.cpp:243-248. *)
+            let new_chain_work = Consensus.work_add !rd.redownload_chain_work
+                (Consensus.work_from_compact header.bits) in
+            let process_all =
+              !rd.process_all_remaining ||
+              Consensus.work_compare new_chain_work chain_state.network.minimum_chain_work >= 0
+            in
+            (* Bug 2: verify commitment bit if applicable.
+               Mirrors Core headerssync.cpp:256-269.
+               Skip commitment check once process_all is set — peer may have
+               extended its chain since PRESYNC so commitments can run out. *)
+            let hash = Crypto.compute_block_hash header in
+            if not process_all &&
+               next_height mod header_commitment_period = ps.commit_offset then begin
+              if Queue.is_empty ps.header_commitments then
+                error := Some (Printf.sprintf
+                  "REDOWNLOAD: commitment overrun at height %d (peer %d)" next_height ps.peer_id)
+              else begin
+                let expected_bit = Queue.pop ps.header_commitments in
+                let actual_bit = commitment_bit ~k0:ps.hasher_k0 ~k1:ps.hasher_k1 ~hash in
+                if actual_bit <> expected_bit then
+                  error := Some (Printf.sprintf
+                    "REDOWNLOAD: commitment mismatch at height %d (peer %d)" next_height ps.peer_id)
+              end
+            end;
+            if !error = None then begin
+              (* Store in buffer — mirrors Core m_redownloaded_headers.emplace_back *)
+              Queue.push (header, hash) !rd.buffer;
+              rd := { !rd with
+                redownload_last_height = next_height;
+                redownload_last_hash = hash;
+                redownload_chain_work = new_chain_work;
+                process_all_remaining = process_all;
+                headers_received = !rd.headers_received + 1;
+              }
+            end
+          end
+        end
+      end
+    ) headers;
+    begin match !error with
+    | Some e -> Error e
+    | None ->
+      (* Release headers ready for acceptance (buffer deep enough or process_all).
+         Mirrors Core's PopHeadersReadyForAcceptance call in ProcessNextHeaders. *)
+      let ready = ref [] in
+      let first_prev = ref !rd.redownload_first_prev_hash in
+      let keep_going = ref true in
+      while !keep_going && not (Queue.is_empty !rd.buffer) do
+        if Queue.length !rd.buffer > redownload_buffer_size || !rd.process_all_remaining then begin
+          let ((hdr : Types.block_header), _) = Queue.pop !rd.buffer in
+          let full_hdr = Types.{ hdr with prev_block = !first_prev } in
+          first_prev := Crypto.compute_block_hash full_hdr;
+          ready := full_hdr :: !ready
+        end else
+          keep_going := false
+      done;
+      (* Update first_prev_hash in rd state *)
+      rd := { !rd with redownload_first_prev_hash = !first_prev };
+      ps.state <- Redownload !rd;
+      let released = List.rev !ready in
+      (* Now store all released headers into chain state (permanent storage).
+         This is the equivalent of the caller processing pow_validated_headers. *)
+      List.iter (fun (header : Types.block_header) ->
+        let hash = Crypto.compute_block_hash header in
+        let hash_key = Cstruct.to_string hash in
+        if not (Hashtbl.mem chain_state.headers hash_key) then begin
+          let parent_key = Cstruct.to_string header.prev_block in
+          match Hashtbl.find_opt chain_state.headers parent_key with
+          | None -> () (* skip if parent not known yet; will be linked later *)
+          | Some parent ->
+            let height = parent.height + 1 in
+            (* bad-diffbits exact gate (poison-immune).  GATE 4 coverage: this
+               REDOWNLOAD release loop is the point at which anti-DoS
+               header-sync headers become permanent in [chain_state.headers] /
+               tip — the caller (see the [`Redownload] arm of the sync loop)
+               does NOT re-run [validate_header] on them, so the exact
+               GetNextWorkRequired check (Core ContextualCheckBlockHeader,
+               validation.cpp:4086-4089) would otherwise never run on this
+               path.  The buffering-phase [permitted_difficulty_transition]
+               (above) is only Core's looser headerssync.cpp bound, not this
+               exact check.  [~parent_entry:parent] is LOAD-BEARING: it makes
+               [compute_expected_bits] walk prev_block links through
+               [chain_state.headers] (Core pindexPrev->GetAncestor, pow.cpp:44,72)
+               rather than the active-chain height->hash index — the very
+               structure the difficulty-1 header attack poisoned.  Without it the
+               header-ahead-of-tip fallback returns [network.pow_limit]
+               (0x1d00ffff on mainnet), rejecting honest headers and rubber-
+               stamping the attack.  [~ancestry_incomplete] guards Core's
+               asserted-against case (pow.cpp:42-45): if an ancestor is genuinely
+               absent we log and skip rather than judge against a placeholder. *)
+            let ancestry_incomplete = ref false in
+            let expected_bits =
+              compute_expected_bits ~parent_entry:parent ~ancestry_incomplete
+                chain_state height header
+            in
+            if !ancestry_incomplete then
+              Logs.err (fun m ->
+                m "REDOWNLOAD bad-diffbits check SKIPPED at height %d (peer %d): \
+                   ancestor missing from the in-memory header table; header %s \
+                   admitted without a difficulty check."
+                  height ps.peer_id (Types.hash256_to_hex_display hash));
+            if (not !ancestry_incomplete) && header.bits <> expected_bits then
+              Logs.err (fun m ->
+                m "REDOWNLOAD bad-diffbits at height %d (peer %d): got 0x%08lx \
+                   expected 0x%08lx — refusing to store header %s"
+                  height ps.peer_id header.bits expected_bits
+                  (Types.hash256_to_hex_display hash))
+            else begin
+            let work = Consensus.work_add parent.total_work
+                (Consensus.work_from_compact header.bits) in
+            let entry = { header; hash; height; total_work = work } in
+            Hashtbl.replace chain_state.headers hash_key entry;
+            (* No [set_height_hash] here — same rule as [accept_header]:
+               the height->hash index projects the ACTIVE VALIDATED chain,
+               not the header chain.  This is the anti-DoS header
+               REDOWNLOAD path, which by construction processes headers
+               that may never become active, so writing the index here
+               was the same contamination bug in a second place. *)
+            Storage.ChainDB.store_block_header chain_state.db hash header;
+            let is_new_tip = match chain_state.tip with
+              | None -> true
+              | Some tip -> Consensus.work_compare work tip.total_work > 0
+            in
+            if is_new_tip then begin
+              chain_state.tip <- Some entry;
+              Storage.ChainDB.set_header_tip chain_state.db hash height;
+              chain_state.headers_synced <- height
+            end
+            end
+        end
+      ) released;
+      (* Check if REDOWNLOAD is complete (buffer drained and process_all set,
+         or we've hit the target hash). *)
+      let final_rd = match ps.state with
+        | Redownload r -> r
+        | _ -> !rd
+      in
+      let complete =
+        Queue.is_empty final_rd.buffer && final_rd.process_all_remaining
+      in
+      if complete then begin
+        Logs.info (fun m ->
+          m "REDOWNLOAD complete for peer %d: height=%d, %d headers stored"
+            ps.peer_id final_rd.redownload_last_height final_rd.headers_received);
+        ps.state <- Synced
+      end;
+      Ok released
+    end
+  | Presync _ | Synced ->
+    Error "process_redownload_headers called in wrong state"
 
 (* [min_pow_checked=false]: the batch came from a peer.  As in Core's
    ProcessHeadersMessage, before anything is stored:

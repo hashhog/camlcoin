@@ -6432,6 +6432,15 @@ let accept_package_full (mp : mempool) (txs : Types.transaction list)
       List.iter (function
         | `AlreadyInMempool _ -> ()  (* Already handled *)
         | `Error (tx, msg) ->
+          (* A member that could not even be priced (missing input, outputs
+             above inputs) but spends a group member is part of Core's
+             package evaluation (TX_MISSING_INPUTS alone), and fails it. *)
+          if use_package_feerate
+             && List.exists (fun inp ->
+                  Hashtbl.mem group_keys
+                    (Cstruct.to_string inp.Types.previous_output.txid))
+                  tx.Types.inputs
+          then group_failed := true;
           rejected := (tx, msg) :: !rejected
         | `NeedValidation (tx, fee, vsize) ->
           let txid = Crypto.compute_txid tx in
@@ -6536,7 +6545,11 @@ let accept_package_full (mp : mempool) (txs : Types.transaction list)
             | None when Hashtbl.mem group_keys k ->
               (match add_transaction ~dry_run:true ~skip_verify_scripts:true mp tx with
                | Error msg -> Some (tx, msg)
-               | Ok _ -> Some (tx, "Fee below minimum relay fee"))
+               (* Unreachable: a group member is below the floor or spends
+                  one that is not in the pool, so it cannot pass alone.
+                  Not a reconsiderable text, so it cannot steer the
+                  package RBF case below. *)
+               | Ok _ -> Some (tx, "transaction failed"))
             | None -> None
         ) fees_vsizes)
       end else if !group_added <> [] then begin

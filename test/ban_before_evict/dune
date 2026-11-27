@@ -1,0 +1,6 @@
+; A banned address must be refused before inbound eviction runs
+; (cffix-camlcoin-ban-before-evict). Own directory so the shared test/dune
+; names list is untouched.
+(test
+ (name test_ban_before_evict)
+ (libraries camlcoin alcotest lwt lwt.unix unix))

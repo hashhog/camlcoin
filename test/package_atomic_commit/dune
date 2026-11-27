@@ -1,0 +1,6 @@
+; submitpackage commits the package-feerate group all-or-nothing
+; (cffix-camlcoin-package-atomic-commit).  Own directory so the shared
+; test/dune names list is untouched and sibling merges do not conflict.
+(test
+ (name test_package_atomic_commit)
+ (libraries camlcoin test_tmp alcotest))

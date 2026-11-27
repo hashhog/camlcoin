@@ -18,13 +18,17 @@
 
 open Camlcoin
 
-let with_ctx f =
+let with_ctx ?min_relay f =
   Test_tmp.with_chaindb (fun db ->
       let utxo = Utxo.UtxoSet.create db in
       let mp =
         Mempool.create ~network:Consensus.regtest ~require_standard:false
           ~verify_scripts:true ~utxo ~current_height:0 ()
       in
+      (* -minrelaytxfee in sat/kvB; the incremental relay fee stays 100. *)
+      let mp = match min_relay with
+        | Some r -> { mp with Mempool.min_relay_fee = r }
+        | None -> mp in
       let chain = Sync.create_chain_state db Consensus.regtest in
       let ctx : Rpc.rpc_context =
         {
@@ -70,13 +74,19 @@ let filler =
   { Types.value = 0L;
     script_pubkey = Cstruct.of_string ("\x6a\x14" ^ String.make 20 'x') }
 
+(* [pad] adds a zero-value OP_RETURN output of that many bytes, to size a
+   tx without touching its fee. *)
 let tx ~(ins : (Types.hash256 * int) list) ?(script_sig = Cstruct.create 0)
-    ~value ~spk () : Types.transaction =
+    ?(pad = 0) ~value ~spk () : Types.transaction =
   { Types.version = 2l;
     inputs = List.map (fun (txid, vout) ->
         { Types.previous_output = { Types.txid; vout = Int32.of_int vout };
           script_sig; sequence = 0xFFFFFFFDl }) ins;
-    outputs = [ { Types.value; script_pubkey = spk }; filler ];
+    outputs = [ { Types.value; script_pubkey = spk }; filler ]
+              @ (if pad = 0 then []
+                 else [ { Types.value = 0L;
+                          script_pubkey =
+                            Cstruct.of_string ("\x6a" ^ String.make pad 'x') } ]);
     witnesses = [];
     locktime = 0l }
 
@@ -225,6 +235,71 @@ let test_self_paying_parent_kept () =
       Alcotest.(check bool) "self-paying parent has no error" true
         (result j p1 |> member "error" = `Null))
 
+let vsize t = (Validation.compute_tx_weight t + 3) / 4
+
+(* After the rollback, the group is exactly what Core's AcceptPackage hands
+   to AcceptSubPackage, so a group that conflicts with the pool goes on to
+   package RBF (PackageRBFChecks), as in Core.  Floor 1 sat/vB
+   (-minrelaytxfee=0.00001), incremental relay fee 0.1 sat/vB.  The pool
+   holds X (~1000 vB, about 1 sat/vB) spending coin 1.  The package is
+   P0 (coin 2, half the floor) and C (P0:0 and coin 1, so it conflicts
+   with X), paying X's fee plus [c_extra].  Fees do not change sizes, so
+   the sizes are measured first. *)
+let rbf_after_rollback ctx ~c_extra =
+  put_coin ctx 1;
+  put_coin ctx 2;
+  let x_of fee = tx ~ins:[ (coin_txid 1, 0) ] ~pad:900
+      ~value:(Int64.sub coin_value fee) ~spk:op_true () in
+  let x_fee = Int64.of_int (vsize (x_of 0L) + 10) in
+  let x = x_of x_fee in
+  (match Mempool.accept_transaction ctx.Rpc.mempool x with
+   | Ok _ -> ()
+   | Error e -> Alcotest.failf "setup: X rejected: %s" e);
+  let p0_of fee = tx ~ins:[ (coin_txid 2, 0) ]
+      ~value:(Int64.sub coin_value fee) ~spk:op_true () in
+  let p0_fee = Int64.of_int (vsize (p0_of 0L) / 2) in
+  let p0 = p0_of p0_fee in
+  let p0_out = Int64.sub coin_value p0_fee in
+  let c_fee = Int64.add x_fee c_extra in
+  let c = tx ~ins:[ (txid p0, 0); (coin_txid 1, 0) ]
+      ~value:(Int64.sub (Int64.add p0_out coin_value) c_fee) ~spk:op_true () in
+  (x, p0, c, x_fee, p0_fee, c_fee)
+
+(* C alone pays X's fee + 1: rule 4 fails for it (1 < 0.1 sat/vB of its
+   vsize), a reconsiderable failure.  With P0 the package pays P0's fee
+   more, which covers 0.1 sat/vB of the package, and its feerate beats X's,
+   so package RBF admits P0 and C and replaces X.  Master kept P0 (admitted
+   on the package feerate) after C failed and answered PackagePartial. *)
+let test_rollback_then_package_rbf_accepts () =
+  with_ctx ~min_relay:1000L (fun ctx ->
+      let x, p0, c, x_fee, p0_fee, _ = rbf_after_rollback ctx ~c_extra:1L in
+      (* the scenario's premises *)
+      Alcotest.(check bool) "P0 below the floor alone" true
+        (Int64.to_int p0_fee < vsize p0);
+      Alcotest.(check bool) "C alone fails rule 4" true
+        (1 * 1000 < 100 * vsize c);
+      Alcotest.(check bool) "package pays rule 4" true
+        (Int64.to_int p0_fee + 1 >= 100 * (vsize p0 + vsize c) / 1000);
+      ignore x_fee;
+      let j = submitpackage ctx [ p0; c ] in
+      Alcotest.(check string) "package_msg" "success" (package_msg j);
+      Alcotest.(check (list string)) "pool = P0, C" (ids [ p0; c ]) (pool ctx);
+      Alcotest.(check (list string)) "replaced-transactions = X" [ txid_hex x ]
+        (j |> member "replaced-transactions" |> to_list |> List.map to_string))
+
+(* C alone pays 50 sat less than X (rule 3); with P0 the package still pays
+   less than X.  Package RBF refuses it: X stays, P0 is not left behind. *)
+let test_rollback_then_package_rbf_refuses () =
+  with_ctx ~min_relay:1000L (fun ctx ->
+      let x, p0, c, _, _, _ = rbf_after_rollback ctx ~c_extra:(-50L) in
+      let j = submitpackage ctx [ p0; c ] in
+      Alcotest.(check bool)
+        (Printf.sprintf "package RBF refusal (got %S)" (package_msg j))
+        true (starts_with ~prefix:"package RBF failed: insufficient anti-DoS fees"
+                (package_msg j));
+      Alcotest.(check (list string)) "pool = X only" (ids [ x ]) (pool ctx);
+      Alcotest.(check bool) "P0 not in the mempool" false (in_pool ctx p0))
+
 let () =
   Alcotest.run "package_atomic_commit"
     [ ( "submitpackage",
@@ -235,4 +310,8 @@ let () =
           Alcotest.test_case "good child still CPFPs (control)" `Quick
             test_good_child_still_cpfp;
           Alcotest.test_case "self-paying parent kept" `Quick
-            test_self_paying_parent_kept ] ) ]
+            test_self_paying_parent_kept;
+          Alcotest.test_case "rollback then package RBF accepts" `Quick
+            test_rollback_then_package_rbf_accepts;
+          Alcotest.test_case "rollback then package RBF refuses" `Quick
+            test_rollback_then_package_rbf_refuses ] ) ]

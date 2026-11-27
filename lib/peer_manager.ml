@@ -3597,6 +3597,18 @@ let accept_inbound (pm : t) (client_fd : Lwt_unix.file_descr)
       (fun () -> Lwt_unix.close client_fd)
       (fun _ -> Lwt.return_unit)
   end else
+  (* Banned address: refuse before the inbound-limit check, so a banned host
+     reconnecting while our slots are full cannot make us evict a good peer
+     and then be refused anyway.  Core CreateNodeFromAcceptedSocket checks
+     IsBanned (net.cpp:1804-1810) before AttemptToEvictConnection
+     (net.cpp:1820-1827). *)
+  if is_banned pm addr_str then begin
+    Log.debug (fun m ->
+      m "connection from %s:%d dropped (banned)" addr_str port);
+    Lwt.catch
+      (fun () -> Lwt_unix.close client_fd)
+      (fun _ -> Lwt.return_unit)
+  end else
   (* Check inbound limits - try eviction before rejecting.  Sockets still
      handshaking count against max_inbound (Core AcceptConnection counts
      every inbound CNode, and a CNode exists from accept on); counting only
@@ -3608,13 +3620,6 @@ let accept_inbound (pm : t) (client_fd : Lwt_unix.file_descr)
       Lwt.return_unit
   in
   if inbound_slots_used pm >= pm.config.max_inbound then begin
-    let* () = Lwt.catch
-      (fun () -> Lwt_unix.close client_fd)
-      (fun _ -> Lwt.return_unit) in
-    Lwt.return_unit
-  end
-  (* Check if banned *)
-  else if is_banned pm addr_str then begin
     let* () = Lwt.catch
       (fun () -> Lwt_unix.close client_fd)
       (fun _ -> Lwt.return_unit) in

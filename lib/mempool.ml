@@ -841,6 +841,50 @@ let get_cluster_size (mp : mempool) (txid : Types.hash256) : int =
   | None -> 0
   | Some cluster -> List.length cluster.txs
 
+(* Number of distinct clusters the in-pool [conflicts] belong to — RBF rule 5.
+   Core: GetEntriesForConflicts (policy/rbf.cpp:69) ->
+   CTxMemPool::GetUniqueClusterCount (txmempool.h:413) ->
+   TxGraph::CountDistinctClusters, which touches only the given entries.
+
+   This used to build a union-find over the WHOLE pool (build_clusters_uf) on
+   every conflicting tx, before any fee rule ran, so a peer resending a cheap
+   conflict made each attempt O(pool).  A cluster is the connected component
+   of the parent/child graph, so walking the component of each not-yet-seen
+   conflict over [depends_on] and the [mp.children] reverse index — the same
+   walk [check_cluster_size_limit] does — gives the identical count in
+   O(size of the conflicts' clusters), which the cluster limit bounds at
+   64 txs each.  Every component is walked to the end (no early exit), so the
+   count, which the reject reason prints, is the same as before. *)
+let count_conflict_clusters (mp : mempool) (conflicts : mempool_entry list)
+    : int =
+  let seen : (string, unit) Hashtbl.t = Hashtbl.create 64 in
+  let queue = Queue.create () in
+  let push key =
+    if Hashtbl.mem mp.entries key && not (Hashtbl.mem seen key) then begin
+      Hashtbl.replace seen key ();
+      Queue.push key queue
+    end
+  in
+  let clusters = ref 0 in
+  List.iter (fun (conflict : mempool_entry) ->
+    let key = Cstruct.to_string conflict.txid in
+    if Hashtbl.mem mp.entries key && not (Hashtbl.mem seen key) then begin
+      incr clusters;
+      push key;
+      while not (Queue.is_empty queue) do
+        let k = Queue.pop queue in
+        (match Hashtbl.find_opt mp.entries k with
+         | None -> ()
+         | Some e ->
+           List.iter (fun p -> push (Cstruct.to_string p)) e.depends_on);
+        (match Hashtbl.find_opt mp.children k with
+         | None -> ()
+         | Some s -> Hashtbl.iter (fun c () -> push c) s)
+      done
+    end
+  ) conflicts;
+  !clusters
+
 (* ============================================================================
    Cluster Linearization
 
@@ -4309,22 +4353,6 @@ let replace_by_fee_with_replaced ?(dry_run=false) ?(skip_verify_scripts=false)
         let new_vsize = max 1 ((new_weight + 3) / 4) in
         let new_feerate = Int64.to_float new_fee /. float_of_int new_vsize in
 
-        (* Collect the full set of transactions that would be evicted
-           (conflicts + all their descendants), deduplicated by txid. This set
-           is what the replacement actually displaces and is used downstream;
-           it is NOT what Rule #5 bounds — see the cluster gate below. *)
-        let evicted_set : (string, mempool_entry) Hashtbl.t = Hashtbl.create 16 in
-        List.iter (fun conflict_entry ->
-          let key = Cstruct.to_string conflict_entry.txid in
-          if not (Hashtbl.mem evicted_set key) then
-            Hashtbl.replace evicted_set key conflict_entry;
-          let desc = get_descendants mp conflict_entry.txid in
-          List.iter (fun d ->
-            let dk = Cstruct.to_string d.txid in
-            if not (Hashtbl.mem evicted_set dk) then
-              Hashtbl.replace evicted_set dk d
-          ) desc
-        ) conflicts;
         (* Rule #5 (Gate 3) — Core v31 policy/rbf.cpp:63-74.
 
            Core bounds the number of DISTINCT CLUSTERS the direct conflicts
@@ -4348,17 +4376,15 @@ let replace_by_fee_with_replaced ?(dry_run=false) ?(skip_verify_scripts=false)
            All descendants of a conflict live in that conflict's cluster by
            construction, so counting over the direct conflicts (as Core does)
            and over the full eviction set agree; we mirror Core and use the
-           direct conflicts. *)
-        let conflict_cluster_count =
-          let uf = build_clusters_uf mp in
-          let roots : (string, unit) Hashtbl.t = Hashtbl.create 16 in
-          List.iter (fun conflict_entry ->
-            let key = Cstruct.to_string conflict_entry.txid in
-            if Hashtbl.mem mp.entries key then
-              Hashtbl.replace roots (uf_find uf key) ()
-          ) conflicts;
-          Hashtbl.length roots
-        in
+           direct conflicts.
+
+           The count walks only the conflicts' own clusters
+           ([count_conflict_clusters]), like Core's GetUniqueClusterCount; it
+           used to build a union-find over the whole pool here, so every
+           conflicting tx cost O(pool) before a fee rule could reject it.
+           Rule 5 stays ahead of rules 3/4, as in Core, so a tx failing both
+           keeps Core's reject reason. *)
+        let conflict_cluster_count = count_conflict_clusters mp conflicts in
 
         if conflict_cluster_count > max_replacement_candidates then
           Error (Printf.sprintf
@@ -4366,6 +4392,24 @@ let replace_by_fee_with_replaced ?(dry_run=false) ?(skip_verify_scripts=false)
             conflict_cluster_count max_replacement_candidates)
 
         else begin
+          (* Collect the full set of transactions that would be evicted
+             (conflicts + all their descendants), deduplicated by txid. This
+             set is what the replacement actually displaces and is used
+             downstream; it is NOT what Rule #5 bounds — see the cluster gate
+             above.  Built after Rule #5, as Core's GetEntriesForConflicts
+             runs CalculateDescendants only once the cluster count passed. *)
+          let evicted_set : (string, mempool_entry) Hashtbl.t = Hashtbl.create 16 in
+          List.iter (fun conflict_entry ->
+            let key = Cstruct.to_string conflict_entry.txid in
+            if not (Hashtbl.mem evicted_set key) then
+              Hashtbl.replace evicted_set key conflict_entry;
+            let desc = get_descendants mp conflict_entry.txid in
+            List.iter (fun d ->
+              let dk = Cstruct.to_string d.txid in
+              if not (Hashtbl.mem evicted_set dk) then
+                Hashtbl.replace evicted_set dk d
+            ) desc
+          ) conflicts;
           (* Build set of conflict txids for the disjoint check below *)
           let conflict_txid_set : (string, unit) Hashtbl.t = Hashtbl.create 8 in
           List.iter (fun ce ->
@@ -6014,14 +6058,10 @@ let package_rbf (mp : mempool) (eval : Types.transaction list)
         if total_mod < min_fee then Package_rbf_failed "transaction failed"
         else begin
           let direct = find_all_conflicts mp parent @ find_all_conflicts mp child in
-          (* Rule 5: distinct clusters among the direct conflicts. *)
-          let n_clusters =
-            let uf = build_clusters_uf mp in
-            let roots = Hashtbl.create 8 in
-            List.iter (fun e ->
-              Hashtbl.replace roots (uf_find uf (Cstruct.to_string e.txid)) ())
-              direct;
-            Hashtbl.length roots in
+          (* Rule 5: distinct clusters among the direct conflicts, walked from
+             the conflicts only (Core GetUniqueClusterCount), not a
+             union-find over the whole pool. *)
+          let n_clusters = count_conflict_clusters mp direct in
           if n_clusters > max_replacement_candidates then
             Package_rbf_failed (Printf.sprintf
               "package RBF failed: too many potential replacements, rejecting \

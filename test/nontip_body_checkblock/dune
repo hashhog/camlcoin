@@ -1,0 +1,6 @@
+; process_new_block runs CheckBlock before it writes a body it does not
+; connect (item cffix-camlcoin-nontip-body-checkblock).  Own directory and
+; stanza so the shared names list in test/dune is untouched.
+(test
+ (name test_nontip_body_checkblock)
+ (libraries camlcoin test_tmp alcotest cstruct lwt.unix))

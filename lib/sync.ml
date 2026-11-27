@@ -10165,6 +10165,61 @@ let rec connect_stored_blocks
           end;
           0
 
+(* Core ProcessNewBlock runs CheckBlock before AcceptBlock, and AcceptBlock
+   runs ContextualCheckBlock before WriteBlock (validation.cpp
+   ProcessNewBlock / AcceptBlock), so a body is never written unchecked.
+   [process_new_block] wrote the body of a block that does not extend the
+   tip, and of any block while [block_submission_paused], with no check at
+   all: a peer holding a real header could store header || junk under the
+   real hash, and the has_block early return, the cmpctblock path and
+   gap-fill then all skipped the honest copy until the drain reached the
+   junk and deleted it (audit record
+   camlcoin:sync:process_new_block-stores-unchecked-nontip-body).
+
+   The same CheckBlock + ContextualCheckBlock [accept_competing_block] runs,
+   against the block's own header ancestry (by hash, not the active chain),
+   so it does not depend on the coin view and is valid while paused.  nBits
+   and MTP come from the fail-closed resolvers the at-tip path uses.
+   [Pre_store_unjudged]: the ancestry needed for nBits / MTP is incomplete;
+   a local defect, not a verdict (see [resolve_expected_bits]). *)
+type pre_store_check =
+  | Pre_store_ok
+  | Pre_store_unjudged of string
+  | Pre_store_invalid of Validation.block_validation_error
+
+let check_body_before_store (state : chain_state) (entry : header_entry)
+    (block : Types.block) : pre_store_check =
+  match Hashtbl.find_opt state.headers
+          (Cstruct.to_string block.header.prev_block) with
+  | None ->
+    Pre_store_unjudged
+      (ancestry_incomplete_tag ^ ": parent header not in the header index")
+  | Some parent ->
+    (* Both fail closed: a missing ancestor is [Pre_store_unjudged], never
+       a placeholder nBits or a short median (which could make a valid
+       block look non-final and get it marked). *)
+    match resolve_expected_bits ~parent_entry:parent state entry.height
+            block.header,
+          resolve_mtp_hash_linked state ~height:entry.height
+            block.header.prev_block with
+    | Error msg, _ | _, Error msg -> Pre_store_unjudged msg
+    | Ok expected_bits, Ok median_time ->
+      match Validation.check_block ~network:state.network block entry.height
+              ~expected_bits ~median_time
+              ~prev_block_time:parent.header.timestamp () with
+      | Ok () -> Pre_store_ok
+      | Error e -> Pre_store_invalid e
+
+(* Witness-class BLOCK_MUTATED: the peer may have relayed a block whose
+   witnesses were stripped or altered in transit; the at-tip path does not
+   score it either. *)
+let is_witness_mutation_error (e : Validation.block_validation_error) : bool =
+  match e with
+  | Validation.BlockBadWitnessCommitment
+  | Validation.BlockBadWitnessNonceSize
+  | Validation.BlockUnexpectedWitness -> true
+  | _ -> false
+
 let process_new_block ?(f_requested = false)
     ?(peer_id : int option)
     ?(misbehavior_handler : (int -> string -> unit) option)
@@ -10254,6 +10309,22 @@ let process_new_block ?(f_requested = false)
          AcceptBlock (W97 G19c). *)
       let min_blocks_to_keep = 288 in
       let f_too_far_ahead = height > state.blocks_synced + min_blocks_to_keep in
+      (* A body [check_body_before_store] refuses is not written.  The
+         sender is scored as at the tip (Core BlockChecked ->
+         MaybePunishNodeForBlock), except for a witness mutation.  [judge]:
+         mark a failure Core's AcceptBlock would mark
+         ([is_retained_block_failure]); a CheckBlock-class failure or a
+         mutation is never marked. *)
+      let refuse_body ~judge (e : Validation.block_validation_error) =
+        let msg = Validation.block_error_to_string e in
+        Logs.warn (fun m ->
+          m "Block %s at height %d failed CheckBlock, body not stored: %s"
+            (Types.hash256_to_hex_display hash) height msg);
+        if judge && is_retained_block_failure e then
+          ignore (mark_block_failed state entry);
+        if not (is_witness_mutation_error e) then on_block_failed entry;
+        Lwt.return (Error msg)
+      in
       if unrequested_low_work then
         Lwt.return (Error "unrequested-low-work")
       else if (not f_requested) && f_too_far_ahead then
@@ -10261,10 +10332,16 @@ let process_new_block ?(f_requested = false)
       else if state.block_submission_paused then begin
         (* NetworkDisable (dumptxoutset rollback, CC-1b; Core disables the
            network for the whole TemporaryRollback).  Keep the body so the
-           drain connects it when the pause lifts; judge nothing now. *)
-        Storage.ChainDB.store_block state.db hash block;
-        note_block_source hash peer_id;
-        Lwt.return (Error "block-submission-paused")
+           drain connects it when the pause lifts — only one that passes
+           CheckBlock, so junk cannot shadow the honest copy — and mark
+           nothing now. *)
+        match check_body_before_store state entry block with
+        | Pre_store_ok ->
+          Storage.ChainDB.store_block state.db hash block;
+          note_block_source hash peer_id;
+          Lwt.return (Error "block-submission-paused")
+        | Pre_store_unjudged msg -> Lwt.return (Error msg)
+        | Pre_store_invalid e -> refuse_body ~judge:false e
       end else
       (* Only connect blocks that extend the current BLOCK tip (see
          `chain_state` comment on why `state.tip` is not used here). *)
@@ -10277,10 +10354,20 @@ let process_new_block ?(f_requested = false)
           | Some prev -> Cstruct.equal block.header.prev_block prev
       in
       if not connects_to_tip then begin
+        match check_body_before_store state entry block with
+        | Pre_store_unjudged msg ->
+          Logs.err (fun m ->
+            m "Block %s at height %d NOT checked: %s — local header-table \
+               defect; body not stored, not marked invalid, peer not scored"
+              (Types.hash256_to_hex_display hash) height msg);
+          Lwt.return (Error msg)
+        | Pre_store_invalid e -> refuse_body ~judge:true e
+        | Pre_store_ok ->
         Logs.debug (fun m ->
           m "Received block %s at height %d does not extend tip, storing"
             (Types.hash256_to_hex_display hash) height);
-        (* Store block data for later use but don't connect *)
+        (* Store block data for later use but don't connect.  CheckBlock
+           passed, so these are the bytes the header commits to. *)
         Storage.ChainDB.store_block state.db hash block;
         note_block_source hash peer_id;
         (* The incoming block may be the first of a gap-fill batch; even if
@@ -10401,10 +10488,15 @@ let process_new_block ?(f_requested = false)
            and asserts hashPrevBlock == view.GetBestBlock(). *)
         if state.block_submission_paused then begin
           (* A NetworkDisable pause began during the await: not a verdict.
-             Keep the body for the post-pause drain. *)
-          Storage.ChainDB.store_block state.db hash block;
-          note_block_source hash peer_id;
-          Lwt.return (Error "block-submission-paused")
+             Keep the body for the post-pause drain — unless accept_block's
+             CheckBlock already found it is not the block the header
+             commits to (a mutation does not depend on the coin view). *)
+          match vresult with
+          | Error e when is_block_mutation_error e -> refuse_body ~judge:false e
+          | _ ->
+            Storage.ChainDB.store_block state.db hash block;
+            note_block_source hash peer_id;
+            Lwt.return (Error "block-submission-paused")
         end else
         if not (block_extends_validated_tip state ~height
                   ~prev:block.header.prev_block) then begin

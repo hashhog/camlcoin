@@ -1,0 +1,8 @@
+; The MAX_STACK_SIZE check must be O(1) per push, like Core's
+; stack.size() + altstack.size() (cffix-camlcoin-stack-depth-counter).  Own
+; directory so the shared test/dune names list is untouched.  Uses only APIs
+; that exist on the pre-fix tree, so it builds there too.
+(test
+ (name test_stack_depth_counter)
+ (modules test_stack_depth_counter)
+ (libraries camlcoin alcotest unix))

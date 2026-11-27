@@ -883,6 +883,7 @@ let start_rest_server ~(ctx : Rpc.rpc_context)
     ?(tls_cert_path : string option = None)
     ?(tls_key_path : string option = None)
     ?(payjoin = false)
+    ?(timeout = Http_listener.default_timeout_s)
     () : unit Lwt.t =
   let callback (flow, _conn) req body =
     let meth = Cohttp.Request.meth req in
@@ -943,10 +944,12 @@ let start_rest_server ~(ctx : Rpc.rpc_context)
   in
   (* Conduit binds [`TCP (`Port p)] to ctx.src, INADDR_ANY when unset, so
      without a ctx --restbind was only a log line and REST listened on every
-     interface.  Same fix as Rpc.start_rpc_server. *)
+     interface.  Same fix as Rpc.start_rpc_server.
+     Http_listener adds Core's -rpcservertimeout I/O timeout and its 8 KiB
+     request-head cap; plain Server.create had neither. *)
   Lwt.bind (Conduit_lwt_unix.init ~src:host ()) (fun conduit_ctx ->
     let ctx = Cohttp_lwt_unix.Net.init ~ctx:conduit_ctx () in
-    Cohttp_lwt_unix.Server.create ~ctx ~mode server)
+    Http_listener.serve ~timeout ~ctx ~mode server)
 
 (* Default REST port *)
 let default_port () = 8080

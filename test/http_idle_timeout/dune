@@ -1,0 +1,9 @@
+; JSON-RPC and REST listeners close idle connections after Core's
+; -rpcservertimeout (30 s), also when a client stops reading (plain and
+; TLS), and cap the request head at 8 KiB (cffix-camlcoin-http-idle-timeout).
+; Own directory so the shared test/dune names list is untouched. The
+; servers run in-process on loopback.
+(test
+ (name test_http_idle_timeout)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix str tls tls-lwt
+            mirage-crypto-rng.unix))

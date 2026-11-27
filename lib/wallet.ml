@@ -691,10 +691,16 @@ let is_locked (w : t) : bool =
     end else
       false
 
+(* Check if wallet is encrypted *)
+let is_encrypted (w : t) : bool =
+  w.encryption.encrypted
+
 (* True for a wallet encrypted by [encrypt_wallet]: it holds an encrypted
    master key and one ciphertext per key, and that is what [wallet_to_json]
-   writes.  A wallet made by createwallet with a passphrase ([save_encrypted],
-   whole-file encryption) is encrypted but has none of this. *)
+   writes.  createwallet with a passphrase takes this path too.  Only a
+   whole-file-encrypted file ([save_encrypted], written by older builds'
+   createwallet) is encrypted without it; the unlock gates key on
+   [is_encrypted], so they hold for both. *)
 let has_key_crypto (w : t) : bool =
   Option.is_some w.encryption.encrypted_master_key
 
@@ -709,7 +715,7 @@ let wallet_locked_msg =
    restart as a zero key: ismine, unspendable.  So no key is minted while
    locked; every mint below goes through this before it touches [w.keys]. *)
 let refuse_mint_if_locked (w : t) : unit =
-  if has_key_crypto w && is_locked w then failwith keypool_ran_out_msg
+  if is_encrypted w && is_locked w then failwith keypool_ran_out_msg
 
 (* Generate a new keypair with specified address type.
    If master_key is set, derive via appropriate BIP path; otherwise use random. *)
@@ -917,7 +923,7 @@ let find_by_pubkey_hash (w : t) (pkh : Types.hash160) : key_pair option =
 
 (* Import a private key in WIF format *)
 let import_wif (w : t) ?(addr_type = P2WPKH) (wif : string) : (key_pair, string) result =
-  if has_key_crypto w && is_locked w then Error wallet_locked_msg else
+  if is_encrypted w && is_locked w then Error wallet_locked_msg else
   match Address.wif_decode wif with
   | Error e -> Error e
   | Ok (private_key, _compressed, _network) ->
@@ -2145,7 +2151,7 @@ let create_transaction (w : t) ~(dest_address : string)
     ?tip_height
     () : (Types.transaction, string) result =
   (* Core EnsureWalletIsUnlocked: signing and the change key need it *)
-  if has_key_crypto w && is_locked w then Error wallet_locked_msg else
+  if is_encrypted w && is_locked w then Error wallet_locked_msg else
 
   (* Parse destination address *)
   match Address.address_of_string dest_address with
@@ -2256,7 +2262,7 @@ let create_transaction_multi (w : t)
     ~(outputs : (string * int64) list) ~(fee_rate : float)
     ?tip_height
     () : (Types.transaction, string) result =
-  if has_key_crypto w && is_locked w then Error wallet_locked_msg else
+  if is_encrypted w && is_locked w then Error wallet_locked_msg else
 
   (* Calculate total amount needed *)
   let total_amount = List.fold_left (fun acc (_, amt) ->
@@ -2376,7 +2382,7 @@ let create_transaction_multi (w : t)
    and re-signs. *)
 let bump_fee (w : t) ~(txid : Types.hash256) ~(new_fee_rate : float)
     : (Types.transaction, string) result =
-  if has_key_crypto w && is_locked w then Error wallet_locked_msg else
+  if is_encrypted w && is_locked w then Error wallet_locked_msg else
   let txid_hex = cstruct_to_hex txid in
   match Hashtbl.find_opt w.sent_transactions txid_hex with
   | None -> Error "Transaction not found in wallet history"
@@ -2715,10 +2721,6 @@ let aes_256_cbc_decrypt ~(key : Cstruct.t) ~(iv : Cstruct.t) (ciphertext : Cstru
 (* ============================================================================
    Wallet Passphrase Lock/Unlock
    ============================================================================ *)
-
-(* Check if wallet is encrypted *)
-let is_encrypted (w : t) : bool =
-  w.encryption.encrypted
 
 (* Generate a random master key for encryption *)
 let generate_master_key () : Cstruct.t =
@@ -4163,13 +4165,32 @@ let create_wallet (wm : wallet_manager) (name : string) ?(options = default_wall
       let mnemonic = Bip39.generate_mnemonic ~strength:128 () in
       init_from_mnemonic wallet mnemonic ()
     end;
-    (* Save to disk *)
-    (match options.passphrase with
-     | Some pass when pass <> "" -> save_encrypted wallet ~passphrase:pass
-     | _ -> save wallet);
-    (* Register in manager *)
-    Hashtbl.replace wm.wallets name wallet;
-    Ok wallet
+    (* Save to disk.  With a passphrase, Core CreateWallet runs
+       EncryptWallet(passphrase) and ends with the wallet locked
+       (wallet/wallet.cpp:432-454).  [encrypt_wallet] is that path: it
+       gives the wallet an encrypted master key and a ciphertext per key,
+       writes them (never a plaintext key), and leaves the wallet locked,
+       so the unlock gates hold until walletpassphrase. *)
+    let saved =
+      match options.passphrase with
+      | Some pass when pass <> "" && not options.disable_private_keys ->
+        (match encrypt_wallet wallet ~passphrase:pass with
+         | Ok () -> wallet_lock wallet; Ok ()
+         | Error e ->
+           Log.err (fun m -> m "createwallet %s: encryption failed: %s" name e);
+           (* nothing usable may be left behind, least of all the
+              plaintext file encrypt_wallet restores on failure *)
+           List.iter (fun p -> try Sys.remove p with _ -> ())
+             [ path; path ^ ".tmp"; path ^ ".bak" ];
+           Error "Error: Wallet created but failed to encrypt.")
+      | _ -> save wallet; Ok ()
+    in
+    match saved with
+    | Error e -> Error e
+    | Ok () ->
+      (* Register in manager *)
+      Hashtbl.replace wm.wallets name wallet;
+      Ok wallet
   end
 
 (* Copy [src] onto [dest] through [atomic_write_file] so a crash cannot

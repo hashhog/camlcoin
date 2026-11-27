@@ -47,7 +47,7 @@ let genesis_ts = Consensus.regtest.genesis_header.Types.timestamp
 let make_header ~prev ~height ~nonce =
   Types.
     {
-      version = 1l;
+      version = 4l;
       prev_block = prev;
       merkle_root = Types.zero_hash;
       timestamp = Int32.add genesis_ts (Int32.of_int (height * 600));

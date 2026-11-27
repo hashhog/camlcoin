@@ -20,7 +20,7 @@ let cleanup_test_db () =
 (* Helper to create a test block header with valid PoW for regtest *)
 let make_test_header ~prev_block ~ts ~nc =
   Types.{
-    version = 1l;
+    version = 4l;
     prev_block;
     merkle_root = Types.zero_hash;
     timestamp = ts;
@@ -1651,7 +1651,7 @@ let mine_test_header ?(merkle_marker : int32 = 0l) ?merkle_root ~prev_block ~pre
           m
       in
       let header = Types.{
-        version = 1l;
+        version = 4l;
         prev_block;
         merkle_root = merkle;
         timestamp = Int32.of_float (Unix.gettimeofday () +. (Int32.to_float nonce));
@@ -3468,7 +3468,7 @@ let w97_cleanup_db () =
   rm_rf w97_db_path
 
 (* Mine a regtest header that satisfies hash_meets_target for given bits. *)
-let w97_mine_header ?(version=1l) ~prev_block ~merkle_root ~ts ~bits () =
+let w97_mine_header ?(version=4l) ~prev_block ~merkle_root ~ts ~bits () =
   let rec loop nonce =
     if nonce > 1_000_000l then
       failwith "w97_mine_header: failed to find nonce"

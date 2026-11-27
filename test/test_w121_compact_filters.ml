@@ -819,7 +819,7 @@ let fix74_mine_header ~prev_block ~merkle_root ~ts ~bits () =
       failwith "fix74_mine_header: failed to find nonce"
     else
       let h : Types.block_header =
-        { Types.version = 1l; prev_block; merkle_root;
+        { Types.version = 4l; prev_block; merkle_root;
           timestamp = ts; bits; nonce }
       in
       let hash = Crypto.compute_block_hash h in

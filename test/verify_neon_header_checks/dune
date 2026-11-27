@@ -1,0 +1,9 @@
+; verify-neon-camlcoin-findings (Neon audit findings 18 and 16): header
+; version and side-branch min-difficulty checks, Core v31.1 parity.  Own
+; directory so the shared test/dune names list is untouched.  Uses only APIs
+; that exist on the pre-fix tree, so it builds there and fails on the
+; assertions.
+(test
+ (name test_verify_neon_header_checks)
+ (modules test_verify_neon_header_checks)
+ (libraries camlcoin test_tmp alcotest yojson))

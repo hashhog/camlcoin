@@ -239,7 +239,7 @@ let test_getblockheader_header_only_mediantime () =
     let g = network.Consensus.genesis_header in
     let mine prev ts =
       let rec go nonce =
-        let h = { g with Types.prev_block = prev; timestamp = ts; nonce } in
+        let h = { g with Types.version = 4l; prev_block = prev; timestamp = ts; nonce } in
         if Consensus.hash_meets_target (Crypto.compute_block_hash h) h.bits
         then h else go (Int32.add nonce 1l)
       in

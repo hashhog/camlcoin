@@ -52,7 +52,7 @@ let mine ~prev_block ~ts ~bits =
   let rec loop nonce =
     if nonce > 20_000_000l then failwith "w145: mining failed"
     else
-      let h = { Types.version = 1l; prev_block; merkle_root = Types.zero_hash;
+      let h = { Types.version = 4l; prev_block; merkle_root = Types.zero_hash;
                 timestamp = ts; bits; nonce } in
       if Consensus.hash_meets_target (Crypto.compute_block_hash h) bits then h
       else loop (Int32.add nonce 1l)

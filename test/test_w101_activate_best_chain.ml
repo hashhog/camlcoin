@@ -108,7 +108,7 @@ let w101_mine ~prev_block ~ts ~bits =
   let rec loop nonce =
     if nonce > 2_000_000l then failwith "w101_mine: exhausted nonce space"
     else
-      let h = { Types.version = 1l; prev_block;
+      let h = { Types.version = 4l; prev_block;
                 merkle_root = Types.zero_hash;
                 timestamp = ts; bits; nonce } in
       let hash = Crypto.compute_block_hash h in

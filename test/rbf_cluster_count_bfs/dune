@@ -1,0 +1,7 @@
+; RBF rule 5 counts conflict clusters by a bounded walk from the direct
+; conflicts, not a union-find over the whole pool
+; (item cffix-camlcoin-rbf-cluster-count-bfs).  Own directory so the shared
+; test/dune names list is untouched and sibling merges do not conflict.
+(test
+ (name test_rbf_cluster_count_bfs)
+ (libraries camlcoin test_tmp alcotest))

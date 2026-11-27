@@ -6413,16 +6413,39 @@ let accept_package_full (mp : mempool) (txs : Types.transaction list)
       (* If package fee rate is sufficient, accept txs even if individual is below min *)
       let use_package_feerate = package_feerate >= min_feerate in
 
+      (* The package-feerate group: the txs Core's AcceptPackage cannot admit
+         on their own and evaluates together (txns_package_eval) — those below
+         the floor, and those spending one of them (TX_MISSING_INPUTS when
+         tried alone).  Core runs every member's checks before SubmitPackage
+         writes any of them (AcceptMultipleTransactionsInternal), so the group
+         is all-or-nothing: a member that fails (a child whose script check
+         fails) must not leave the members admitted on the strength of its fee
+         in the pool.  Members are added as the loop reaches them and taken
+         out again if any member fails.  A tx that pays its own way is not in
+         the group: Core admits it in the individual pass and keeps it. *)
+      let group_keys : (string, unit) Hashtbl.t = Hashtbl.create 8 in
+      let group_added = ref [] in    (* group entries now in the pool, newest first *)
+      let group_evicted = ref [] in  (* pool entries a group member's RBF removed *)
+      let group_failed = ref false in
+
       (* Second pass: actually add transactions *)
       List.iter (function
         | `AlreadyInMempool _ -> ()  (* Already handled *)
         | `Error (tx, msg) ->
           rejected := (tx, msg) :: !rejected
         | `NeedValidation (tx, fee, vsize) ->
-          let _txid = Crypto.compute_txid tx in
+          let txid = Crypto.compute_txid tx in
           (* Check individual fee rate *)
           let individual_feerate = Int64.to_float fee *. 1000.0 /. float_of_int vsize in
           let passes_feerate = individual_feerate >= min_feerate || use_package_feerate in
+          let in_group =
+            use_package_feerate
+            && (individual_feerate < min_feerate
+                || List.exists (fun inp ->
+                     Hashtbl.mem group_keys
+                       (Cstruct.to_string inp.Types.previous_output.txid))
+                     tx.Types.inputs) in
+          if in_group then Hashtbl.replace group_keys (Cstruct.to_string txid) ();
 
           if not passes_feerate then
             rejected := (tx, "Fee below minimum relay fee (not enough CPFP)") :: !rejected
@@ -6441,9 +6464,23 @@ let accept_package_full (mp : mempool) (txs : Types.transaction list)
                (treating the whole package as one replacement unit per BIP-431
                §"RBF for packages") is still missing and tracked separately. *)
             let conflicts_for_tx = find_all_conflicts mp tx in
+            (* What a group member's replacement would remove, kept so a
+               rollback can put it back. *)
+            let pre_evict =
+              if in_group then
+                List.concat_map (fun e -> e :: get_descendants mp e.txid)
+                  conflicts_for_tx
+              else [] in
             let add_result =
               if conflicts_for_tx = [] then
-                (match add_transaction ~bypass_fee_check:use_package_feerate mp tx with
+                (* Group members go in untrimmed: a trim between two adds
+                   would rank the low-feerate parent on its own feerate, and
+                   could evict pool txs a rollback cannot restore.  The group
+                   is trimmed once, below, after every member is in (Core
+                   calls LimitMempoolSize after the package,
+                   validation.cpp:1731). *)
+                (match add_transaction ~bypass_fee_check:use_package_feerate
+                         ~defer_trim:in_group mp tx with
                  | Ok e -> Ok (e, [])
                  | Error s -> Error s)
               else
@@ -6452,14 +6489,71 @@ let accept_package_full (mp : mempool) (txs : Types.transaction list)
             match add_result with
             | Ok (entry, evicted) ->
               accepted := entry :: !accepted;
+              if in_group then begin
+                group_added := entry :: !group_added;
+                group_evicted :=
+                  List.filter (fun e ->
+                    List.exists (Cstruct.equal e.txid) evicted) pre_evict
+                  @ !group_evicted
+              end;
               List.iter (fun (txid : Types.hash256) ->
                 let k = Cstruct.to_string txid in
                 if not (Hashtbl.mem evicted_union k) then
                   Hashtbl.replace evicted_union k txid
               ) evicted
-            | Error msg -> rejected := (tx, msg) :: !rejected
+            | Error msg ->
+              if in_group then group_failed := true;
+              rejected := (tx, msg) :: !rejected
           end
       ) fees_vsizes;
+
+      (* Commit or roll back the package-feerate group. *)
+      let group_key (t : Types.hash256) = Hashtbl.mem group_keys (Cstruct.to_string t) in
+      if !group_failed then begin
+        (* Newest first, so children leave before their parents; then the
+           txs a member's replacement evicted come back.  No trim either
+           way: the pool returns to the state before the group. *)
+        List.iter (fun e -> remove_transaction mp e.txid) !group_added;
+        restore_evicted mp !group_evicted;
+        List.iter (fun e ->
+          Hashtbl.remove evicted_union (Cstruct.to_string e.txid)) !group_evicted;
+        accepted := List.filter (fun e -> not (group_key e.txid)) !accepted;
+        (* A member that did not fail itself reports its individual result,
+           as Core's does (individual_results_nonfinal): its own fee
+           failure, or the missing input of a parent that is not in the
+           pool.  Package order is kept. *)
+        let failed_msg : (string, string) Hashtbl.t = Hashtbl.create 8 in
+        List.iter (fun (tx, msg) ->
+          Hashtbl.replace failed_msg (Cstruct.to_string (Crypto.compute_txid tx)) msg
+        ) !rejected;
+        rejected := List.rev (List.filter_map (function
+          | `AlreadyInMempool _ -> None
+          | `Error (tx, msg) -> Some (tx, msg)
+          | `NeedValidation (tx, _, _) ->
+            let k = Cstruct.to_string (Crypto.compute_txid tx) in
+            match Hashtbl.find_opt failed_msg k with
+            | Some msg -> Some (tx, msg)
+            | None when Hashtbl.mem group_keys k ->
+              (match add_transaction ~dry_run:true ~skip_verify_scripts:true mp tx with
+               | Error msg -> Some (tx, msg)
+               | Ok _ -> Some (tx, "Fee below minimum relay fee"))
+            | None -> None
+        ) fees_vsizes)
+      end else if !group_added <> [] then begin
+        if mp.total_usage > mp.max_size_bytes + eviction_trigger_slack mp then
+          evict_by_chunks mp;
+        (* A group member the trim removed is "mempool full"
+           (validation.cpp:1744). *)
+        let trimmed = List.filter (fun e ->
+          not (Hashtbl.mem mp.entries (Cstruct.to_string e.txid))) !group_added in
+        if trimmed <> [] then begin
+          accepted := List.filter (fun e ->
+            not (List.exists (fun t -> Cstruct.equal t.txid e.txid) trimmed))
+            !accepted;
+          List.iter (fun e -> rejected := (e.tx, "mempool full") :: !rejected)
+            (List.rev trimmed)
+        end
+      end;
 
       (* Package RBF (Core AcceptPackage -> AcceptMultipleTransactionsInternal
          -> PackageRBFChecks).  The loop above is the individual pass.  When

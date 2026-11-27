@@ -579,6 +579,15 @@ let bip143_hash_outputs (d : precomputed_txdata) =
 type eval_state = {
   mutable stack : Cstruct.t list;
   mutable altstack : Cstruct.t list;
+  (* Element counts of [stack] and [altstack], kept in step with every
+     write so the MAX_STACK_SIZE check is O(1), like Core's
+     stack.size() + altstack.size() (script/interpreter.cpp).  Walking
+     both lists on every push made a tapscript leaf (no opcode or size
+     cap) that pushes and drops at depth ~1000 cost ~1000x Core per push.
+     Write the lists only through set_stack / set_altstack or code that
+     adjusts these counters by the same amount. *)
+  mutable stack_len : int;
+  mutable altstack_len : int;
   (* Nested IF execution state, as Core's ConditionStack
      (script/interpreter.cpp): the depth of the implied stack of booleans
      and the position of its first false entry (cond_no_false if none).
@@ -608,6 +617,8 @@ let create_eval_state ~tx ~input_index ~amount ~flags ~sig_version
   {
     stack = [];
     altstack = [];
+    stack_len = 0;
+    altstack_len = 0;
     cond_size = 0;
     cond_first_false = max_int;
     op_count = 0;
@@ -634,17 +645,28 @@ let stack_top st =
 let stack_pop st =
   match st.stack with
   | [] -> Error "Stack underflow"
-  | x :: rest -> st.stack <- rest; Ok x
+  | x :: rest -> st.stack <- rest; st.stack_len <- st.stack_len - 1; Ok x
+
+(* Combined depth of the main and alt stacks, the quantity Core bounds by
+   MAX_STACK_SIZE.  O(1). *)
+let stack_depth st = st.stack_len + st.altstack_len
 
 let stack_push st v =
-  if List.length st.stack + List.length st.altstack >= max_stack_size then
+  if stack_depth st >= max_stack_size then
     Error "Stack overflow"
   else begin
     st.stack <- v :: st.stack;
+    st.stack_len <- st.stack_len + 1;
     Ok ()
   end
 
-let stack_size st = List.length st.stack
+let stack_size st = st.stack_len
+
+(* Replace a whole stack (scriptSig -> scriptPubKey hand-off, P2SH
+   redeem stack, witness stack setup, altstack clear).  O(length), once
+   per script, never per opcode. *)
+let set_stack st l = st.stack <- l; st.stack_len <- List.length l
+let set_altstack st l = st.altstack <- l; st.altstack_len <- List.length l
 
 (* ConditionStack operations (Core script/interpreter.cpp ConditionStack) *)
 let cond_no_false = max_int
@@ -1598,10 +1620,11 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
     begin match stack_pop st with
     | Error e -> Error e
     | Ok v ->
-      if List.length st.stack + List.length st.altstack >= max_stack_size then
+      if stack_depth st >= max_stack_size then
         Error "Alt stack overflow"
       else begin
         st.altstack <- v :: st.altstack;
+        st.altstack_len <- st.altstack_len + 1;
         Ok ()
       end
     end
@@ -1611,6 +1634,7 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
     | [] -> Error "Alt stack empty"
     | v :: rest ->
       st.altstack <- rest;
+      st.altstack_len <- st.altstack_len - 1;
       stack_push st v
     end
 
@@ -1640,7 +1664,7 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
   | OP_NIP ->
     begin match st.stack with
     | [] | [_] -> Error "Stack underflow"
-    | a :: _ :: rest -> st.stack <- a :: rest; Ok ()
+    | a :: _ :: rest -> st.stack <- a :: rest; st.stack_len <- st.stack_len - 1; Ok ()
     end
 
   | OP_OVER ->
@@ -1671,7 +1695,7 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
         let v = List.nth st.stack n in
         let before = List.filteri (fun i _ -> i < n) st.stack in
         let after = List.filteri (fun i _ -> i > n) st.stack in
-        st.stack <- v :: (before @ after);
+        st.stack <- v :: (before @ after);  (* same depth: one popped, one moved *)
         Ok ()
       end
     end
@@ -1692,7 +1716,8 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
     begin match st.stack with
     | a :: b :: rest ->
       st.stack <- a :: b :: a :: rest;
-      if List.length st.stack + List.length st.altstack > max_stack_size then
+      st.stack_len <- st.stack_len + 1;
+      if stack_depth st > max_stack_size then
         Error "Stack overflow"
       else
         Ok ()
@@ -1701,7 +1726,7 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
 
   | OP_2DROP ->
     begin match st.stack with
-    | _ :: _ :: rest -> st.stack <- rest; Ok ()
+    | _ :: _ :: rest -> st.stack <- rest; st.stack_len <- st.stack_len - 2; Ok ()
     | _ -> Error "Stack underflow"
     end
 
@@ -1709,7 +1734,8 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
     begin match st.stack with
     | a :: b :: _ ->
       st.stack <- a :: b :: st.stack;
-      if List.length st.stack + List.length st.altstack > max_stack_size then
+      st.stack_len <- st.stack_len + 2;
+      if stack_depth st > max_stack_size then
         Error "Stack overflow"
       else
         Ok ()
@@ -1720,7 +1746,8 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
     begin match st.stack with
     | a :: b :: c :: _ ->
       st.stack <- a :: b :: c :: st.stack;
-      if List.length st.stack + List.length st.altstack > max_stack_size then
+      st.stack_len <- st.stack_len + 3;
+      if stack_depth st > max_stack_size then
         Error "Stack overflow"
       else
         Ok ()
@@ -1731,7 +1758,8 @@ and exec_opcode_inner (st : eval_state) (op : opcode) (script_code : Cstruct.t)
     begin match st.stack with
     | _ :: _ :: c :: d :: _ ->
       st.stack <- c :: d :: st.stack;
-      if List.length st.stack + List.length st.altstack > max_stack_size then
+      st.stack_len <- st.stack_len + 2;
+      if stack_depth st > max_stack_size then
         Error "Stack overflow"
       else
         Ok ()
@@ -2895,7 +2923,7 @@ let verify_script_unguarded ~(tx : Types.transaction) ~(input_index : int)
       | Ok () ->
         let st_pub = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                        ~sig_version:SigVersionBase () in
-        st_pub.stack <- st_sig.stack;
+        set_stack st_pub st_sig.stack;
         begin match run_script st_pub script_pubkey with
         | Error e -> Error e
         | Ok () -> check_stack_top st_pub
@@ -2935,7 +2963,7 @@ let verify_script_unguarded ~(tx : Types.transaction) ~(input_index : int)
         let saved_stack = st_sig.stack in
         let st_pub = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                        ~sig_version:SigVersionBase () in
-        st_pub.stack <- saved_stack;
+        set_stack st_pub saved_stack;
         begin match run_script st_pub script_pubkey with
         | Error e -> Error e
         | Ok () ->
@@ -2971,7 +2999,7 @@ let verify_script_unguarded ~(tx : Types.transaction) ~(input_index : int)
         let saved_stack = st_sig.stack in
         let st_pub = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                        ~sig_version:SigVersionBase () in
-        st_pub.stack <- saved_stack;
+        set_stack st_pub saved_stack;
         begin match run_script st_pub script_pubkey with
         | Error e -> Error e
         | Ok () ->
@@ -2995,7 +3023,7 @@ let verify_script_unguarded ~(tx : Types.transaction) ~(input_index : int)
         let saved_stack = st_sig.stack in
         let st_pub = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                        ~sig_version:SigVersionBase () in
-        st_pub.stack <- saved_stack;
+        set_stack st_pub saved_stack;
         begin match run_script st_pub script_pubkey with
         | Error e -> Error e
         | Ok () ->
@@ -3020,7 +3048,7 @@ let verify_script_unguarded ~(tx : Types.transaction) ~(input_index : int)
         (* Save stack before running P2SH redeem script check *)
         let stack_copy = st.stack in
         (* Clear altstack between scriptSig and scriptPubKey *)
-        st.altstack <- [];
+        set_altstack st [];
         (* Run scriptPubKey (OP_HASH160 <hash> OP_EQUAL) *)
         begin match run_script st script_pubkey with
         | Error e -> Error e
@@ -3053,7 +3081,7 @@ let verify_script_unguarded ~(tx : Types.transaction) ~(input_index : int)
                   | Some _ ->
                     let st_rs = create_eval_state ~txdata ~tx ~input_index ~amount
                                   ~flags ~sig_version:SigVersionBase () in
-                    st_rs.stack <- List.tl stack_copy;
+                    set_stack st_rs (List.tl stack_copy);
                     begin match run_script st_rs redeem_script with
                     | Error e -> Error e
                     | Ok () -> check_stack_top st_rs
@@ -3095,7 +3123,7 @@ let verify_script_unguarded ~(tx : Types.transaction) ~(input_index : int)
                           let implicit_script = build_p2pkh_script program in
                           let st2 = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                                       ~sig_version:SigVersionWitnessV0 () in
-                          st2.stack <- [wit_pubkey; wit_sig];
+                          set_stack st2 [wit_pubkey; wit_sig];
                           begin match run_script st2 implicit_script with
                           | Error e -> Error e
                           | Ok () ->
@@ -3135,7 +3163,7 @@ let verify_script_unguarded ~(tx : Types.transaction) ~(input_index : int)
                         | Ok () ->
                         let st2 = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                                     ~sig_version:SigVersionWitnessV0 () in
-                        st2.stack <- wit_stack;
+                        set_stack st2 wit_stack;
                         begin match run_script st2 witness_script with
                         | Error e -> Error e
                         | Ok () ->
@@ -3181,7 +3209,7 @@ let verify_script_unguarded ~(tx : Types.transaction) ~(input_index : int)
                 (* Run redeem script with remaining stack *)
                 let st2 = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                             ~sig_version:SigVersionBase () in
-                st2.stack <- List.tl stack_copy;
+                set_stack st2 (List.tl stack_copy);
                 begin match run_script st2 redeem_script with
                 | Error e -> Error e
                 | Ok () ->
@@ -3234,7 +3262,7 @@ let verify_script_unguarded ~(tx : Types.transaction) ~(input_index : int)
               let implicit_script = build_p2pkh_script program in
               let st = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                          ~sig_version:SigVersionWitnessV0 () in
-              st.stack <- [wit_pubkey; wit_sig];
+              set_stack st [wit_pubkey; wit_sig];
               begin match run_script st implicit_script with
               | Error e -> Error e
               | Ok () ->
@@ -3280,7 +3308,7 @@ let verify_script_unguarded ~(tx : Types.transaction) ~(input_index : int)
             | Ok () ->
             let st = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                        ~sig_version:SigVersionWitnessV0 () in
-            st.stack <- wit_stack;
+            set_stack st wit_stack;
             begin match run_script st witness_script with
             | Error e -> Error e
             | Ok () ->
@@ -3526,7 +3554,7 @@ let verify_script_unguarded ~(tx : Types.transaction) ~(input_index : int)
                                      ~sig_version:SigVersionTapscript
                                      ~prevouts ~annex_hash:(annex_hash)
                                      ~tapleaf_hash:(Some tapleaf_hash) ~sigops_budget () in
-                          st.stack <- wit_stack;
+                          set_stack st wit_stack;
                           begin match run_script st tap_script with
                           | Error e -> Error e
                           | Ok () ->
@@ -3574,7 +3602,7 @@ let verify_script_unguarded ~(tx : Types.transaction) ~(input_index : int)
         let saved_stack = st_sig.stack in
         let st_pub = create_eval_state ~txdata ~tx ~input_index ~amount ~flags
                        ~sig_version:SigVersionBase () in
-        st_pub.stack <- saved_stack;
+        set_stack st_pub saved_stack;
         begin match run_script st_pub script_pubkey with
         | Error e -> Error e
         | Ok () ->

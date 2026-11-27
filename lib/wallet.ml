@@ -686,6 +686,13 @@ let address_of_typed_key ~network addr_type private_key public_key =
   | P2WPKH ->
     Address.of_pubkey ~network Address.P2WPKH public_key
 
+(* What an unlock that has run out does.  Set to [wallet_lock] once that is
+   defined (below): a lapsed unlock must zero the keys like walletlock, not
+   only flip lock_state (Core: CWallet::Lock is the one way to become
+   locked, and the relock timer skips a wallet that is already Locked). *)
+let expire_unlock : (t -> unit) ref =
+  ref (fun w -> w.encryption.lock_state <- Locked)
+
 (* Check if wallet is locked *)
 let is_locked (w : t) : bool =
   match w.encryption.lock_state with
@@ -693,8 +700,9 @@ let is_locked (w : t) : bool =
   | Unlocked { expires; _ } ->
     let now = Unix.gettimeofday () in
     if now >= expires then begin
-      (* Expired, transition to locked state *)
-      w.encryption.lock_state <- Locked;
+      (* Expired: lock it, zeroing the keys, while the master key is still
+         at hand to encrypt any key minted during the unlock *)
+      !expire_unlock w;
       true
     end else
       false
@@ -2955,6 +2963,8 @@ let wallet_unlock_remaining (w : t) : float =
   | Unlocked { expires; _ } ->
     let now = Unix.gettimeofday () in
     max 0.0 (expires -. now)
+
+let () = expire_unlock := wallet_lock
 
 (* ============================================================================
    Wallet Persistence

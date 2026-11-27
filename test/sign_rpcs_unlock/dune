@@ -1,0 +1,6 @@
+; signrawtransactionwithwallet / signmessage on a locked wallet, and the
+; lazy unlock expiry in Wallet.is_locked (cffix-camlcoin-sign-rpcs-unlock).
+; Own directory so the shared test/dune names list is untouched.
+(test
+ (name test_sign_rpcs_unlock)
+ (libraries camlcoin test_tmp alcotest unix yojson))

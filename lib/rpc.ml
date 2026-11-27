@@ -3389,7 +3389,7 @@ let handle_getnewaddress (ctx : rpc_context)
     (* A locked encrypted wallet cannot encrypt a new key, so the key could
        not be saved: Core's answer when a locked wallet's keypool is empty,
        RPC_WALLET_KEYPOOL_RAN_OUT (-12). *)
-    else if Wallet.has_key_crypto wallet && Wallet.is_locked wallet then
+    else if Wallet.is_encrypted wallet && Wallet.is_locked wallet then
       Error ((-12) (* RPC_WALLET_KEYPOOL_RAN_OUT *), Wallet.keypool_ran_out_msg)
     else begin
       (* Core getnewaddress( "label", "address_type" ): the OPTIONAL 2nd
@@ -3754,7 +3754,7 @@ let handle_sendtoaddress (ctx : rpc_context)
          | Ok _ ->
            (* Core sendtoaddress: EnsureWalletIsUnlocked before the fee
               estimate and the change key (wallet/rpc/spend.cpp) *)
-           if Wallet.has_key_crypto wallet && Wallet.is_locked wallet then
+           if Wallet.is_encrypted wallet && Wallet.is_locked wallet then
              Error ((-13) (* RPC_WALLET_UNLOCK_NEEDED *), Wallet.wallet_locked_msg)
            else
            match wallet_fee_rate ctx target with

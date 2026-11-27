@@ -159,6 +159,13 @@ let test_getwalletinfo_blank_true () =
        | Error (c, m) ->
          Alcotest.failf "createwallet blank: (%d) %s" c m
        | Ok _ -> ());
+      (* Each HTTP request resolves its wallet afresh (context_with_wallet in
+         the server callback); ctx from before createwallet still holds the
+         old wallet, and getwalletinfo reports the request's wallet. *)
+      let ctx = match Rpc.context_with_wallet ctx None with
+        | Ok c -> c
+        | Error (c, m) -> Alcotest.failf "route after createwallet: (%d) %s" c m
+      in
       match Rpc.dispatch_rpc ctx "getwalletinfo" [] with
       | Error (c, m) ->
         Alcotest.failf "getwalletinfo blank-true: error (%d) %s" c m

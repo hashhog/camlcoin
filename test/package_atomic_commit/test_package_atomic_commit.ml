@@ -130,6 +130,11 @@ let starts_with ~prefix s =
   String.length s >= String.length prefix
   && String.sub s 0 (String.length prefix) = prefix
 
+let contains ~sub s =
+  let n = String.length sub and m = String.length s in
+  let rec go i = i + n <= m && (String.sub s i n = sub || go (i + 1)) in
+  go 0
+
 let child_fee = 100_000L
 
 (* Parent P spends a confirmed OP_TRUE coin and pays nothing, its output
@@ -162,8 +167,7 @@ let test_bad_child_does_not_commit_parent () =
         true (starts_with ~prefix:"min relay fee not met" (error j p));
       Alcotest.(check bool)
         (Printf.sprintf "child reports a script failure (got %S)" (error j c))
-        true (error j c <> "<no error>"
-              && not (starts_with ~prefix:"min relay fee" (error j c))))
+        true (contains ~sub:"script-verify-flag-failed" (error j c)))
 
 (* Same failure through the mempool entry point the RPC and pkgtxns relay
    share: nothing is accepted, both txs are rejected. *)
@@ -234,6 +238,32 @@ let test_self_paying_parent_kept () =
         true (starts_with ~prefix:"min relay fee not met" (error j p0));
       Alcotest.(check bool) "self-paying parent has no error" true
         (result j p1 |> member "error" = `Null))
+
+(* The child fails before any fee is known: it also spends a coin that does
+   not exist.  P1 pays a high fee on its own, so the fees of the members
+   that could be priced still clear the floor and P0 is admitted on them.
+   Core: P0 fails on fee, P1 is admitted alone, C (missing inputs) is
+   evaluated with P0 and fails, so P0 is not admitted. *)
+let test_unpriced_child_fails_group () =
+  with_ctx (fun ctx ->
+      put_coin ctx 1;
+      put_coin ctx 2;
+      let p0 = tx ~ins:[ (coin_txid 1, 0) ] ~value:coin_value ~spk:op_true () in
+      let p1 = tx ~ins:[ (coin_txid 2, 0) ]
+          ~value:(Int64.sub coin_value 100_000L) ~spk:op_true () in
+      let c = tx ~ins:[ (txid p0, 0); (txid p1, 0); (coin_txid 9, 0) ]
+          ~value:coin_value ~spk:op_true () in
+      let j = submitpackage ctx [ p0; p1; c ] in
+      Alcotest.(check bool) "zero-fee parent not in the mempool" false
+        (in_pool ctx p0);
+      Alcotest.(check (list string)) "pool = the self-paying parent only"
+        (ids [ p1 ]) (pool ctx);
+      Alcotest.(check string) "package_msg" "transaction failed"
+        (package_msg j);
+      Alcotest.(check bool)
+        (Printf.sprintf "zero-fee parent reports its fee failure (got %S)"
+           (error j p0))
+        true (starts_with ~prefix:"min relay fee not met" (error j p0)))
 
 let vsize t = (Validation.compute_tx_weight t + 3) / 4
 
@@ -311,6 +341,8 @@ let () =
             test_good_child_still_cpfp;
           Alcotest.test_case "self-paying parent kept" `Quick
             test_self_paying_parent_kept;
+          Alcotest.test_case "unpriced child fails the group" `Quick
+            test_unpriced_child_fails_group;
           Alcotest.test_case "rollback then package RBF accepts" `Quick
             test_rollback_then_package_rbf_accepts;
           Alcotest.test_case "rollback then package RBF refuses" `Quick

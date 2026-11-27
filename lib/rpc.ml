@@ -3935,6 +3935,11 @@ let handle_signrawtransactionwithwallet (ctx : rpc_context)
          let data = Cstruct.of_hex hex in
          let r = Serialize.reader_of_cstruct data in
          let tx = Serialize.deserialize_transaction r in
+         (* Core: EnsureWalletIsUnlocked after DecodeHexTx, before any
+            input is looked at (wallet/rpc/spend.cpp) *)
+         if Wallet.is_encrypted wallet && Wallet.is_locked wallet then
+           Error Wallet.wallet_locked_msg
+         else
          (* Build wallet_utxo list for inputs we can sign *)
          let wallet_utxos = Wallet.get_utxos wallet in
          let input_utxos = List.map (fun inp ->
@@ -4873,6 +4878,11 @@ let handle_signmessage (ctx : rpc_context)
        (* Wallet-scoped path: look up the address in the loaded wallet. *)
        match ctx.wallet with
        | None -> Error "Method not found: no wallet is loaded."
+       | Some wallet
+         when Wallet.is_encrypted wallet && Wallet.is_locked wallet ->
+         (* Core signmessage: EnsureWalletIsUnlocked before the address is
+            parsed (wallet/rpc/signmessage.cpp) *)
+         Error Wallet.wallet_locked_msg
        | Some wallet ->
          match Address.address_of_string addr_or_wif with
          | Error _ -> Error "Invalid address"
@@ -16514,6 +16524,8 @@ let dispatch_rpc (ctx : rpc_context)
   | "signmessage" ->
     (match handle_signmessage ctx params with
      | Ok r -> Ok r
+     | Error msg when msg = Wallet.wallet_locked_msg ->
+       Error ((-13) (* RPC_WALLET_UNLOCK_NEEDED *), msg)
      | Error msg -> Error (rpc_invalid_address, msg))
   | "signmessagewithprivkey" ->
     (match handle_signmessagewithprivkey ctx params with
@@ -16589,6 +16601,8 @@ let dispatch_rpc (ctx : rpc_context)
   | "signrawtransactionwithwallet" ->
     (match handle_signrawtransactionwithwallet ctx params with
      | Ok r -> Ok r
+     | Error msg when msg = Wallet.wallet_locked_msg ->
+       Error ((-13) (* RPC_WALLET_UNLOCK_NEEDED *), msg)
      | Error msg -> Error (rpc_wallet_error, msg))
   | "lockunspent" ->
     (match handle_lockunspent ctx params with

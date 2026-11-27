@@ -1155,6 +1155,23 @@ let test_w88_max_commitments_bound () =
   Storage.ChainDB.close db;
   cleanup_test_db ()
 
+(* A regtest header that passes [Sync.validate_header] on top of [prev]:
+   version 4, timestamp [ts], nonce searched until the hash meets the
+   target.  The REDOWNLOAD release path stores headers only through
+   [validate_header] (Core AcceptBlockHeader), so the W88 buffer tests
+   below must feed headers Core would accept; they used to feed version-1
+   headers with an unmined nonce 0 and a buffer of 14,306 copies of one
+   header. *)
+let w88_mine_header ~(prev : Types.hash256) ~(ts : int32) : Types.block_header =
+  let rec go n =
+    let h = Types.{ version = 4l; prev_block = prev;
+                    merkle_root = Types.zero_hash; timestamp = ts;
+                    bits = 0x207fffffl; nonce = n } in
+    if Consensus.hash_meets_target (Crypto.compute_block_hash h) h.bits then h
+    else go (Int32.add n 1l)
+  in
+  go 0l
+
 (* W88 Bug 7: redownload buffer — headers not released until buffer exceeds
    redownload_buffer_size OR process_all_remaining is set.
 
@@ -1196,14 +1213,8 @@ let test_w88_redownload_buffer_not_released_early () =
     headers_received = 0;
     buffer = Queue.create ();
   };
-  let h1 = Types.{
-    version = 1l;
-    prev_block = genesis_hash;
-    merkle_root = Types.zero_hash;
-    timestamp = Int32.add genesis_entry.header.timestamp 1l;
-    bits = 0x207fffffl;
-    nonce = 0l;
-  } in
+  let h1 = w88_mine_header ~prev:genesis_hash
+      ~ts:(Int32.add genesis_entry.header.timestamp 1l) in
   let result = Sync.process_redownload_headers ~ps ~headers:[h1] ~chain_state:chain in
   (* On regtest: work(h1) > 0 >= minimum_chain_work(0), so process_all fires and
      the buffer immediately drains.  released_count should be >= 0 (OK path). *)
@@ -1218,14 +1229,24 @@ let test_w88_redownload_buffer_not_released_early () =
      We bypass process_all_remaining by making the buffer huge. *)
   let ps2 = Sync.create_presync_state ~peer_id:2 ~chain_start:genesis_entry in
   let big_buf = Queue.create () in
-  (* Push redownload_buffer_size + 2 dummy entries *)
-  for _ = 1 to Sync.redownload_buffer_size + 2 do
-    Queue.push (h1, genesis_hash) big_buf
+  (* Buffer redownload_buffer_size + 2 headers of one real chain from
+     genesis (h1 first), then feed the next header of that chain. *)
+  let prev = ref genesis_hash in
+  for i = 1 to Sync.redownload_buffer_size + 2 do
+    let h = if i = 1 then h1 else
+        w88_mine_header ~prev:!prev
+          ~ts:(Int32.add genesis_entry.header.timestamp (Int32.of_int i)) in
+    let hh = Crypto.compute_block_hash h in
+    Queue.push (h, hh) big_buf;
+    prev := hh
   done;
+  let next = w88_mine_header ~prev:!prev
+      ~ts:(Int32.add genesis_entry.header.timestamp
+             (Int32.of_int (Sync.redownload_buffer_size + 3))) in
   ps2.state <- Sync.Redownload {
     target_hash = genesis_hash;
-    redownload_last_hash = genesis_hash;
-    redownload_last_height = 0;
+    redownload_last_hash = !prev;
+    redownload_last_height = Sync.redownload_buffer_size + 2;
     redownload_first_prev_hash = genesis_hash;
     redownload_chain_work = Cstruct.create 32;
     process_all_remaining = false;  (* NOT set *)
@@ -1233,7 +1254,7 @@ let test_w88_redownload_buffer_not_released_early () =
     buffer = big_buf;
   };
   (* Feed one more header — the existing buffer (> redownload_buffer_size) causes release *)
-  let result2 = Sync.process_redownload_headers ~ps:ps2 ~headers:[h1] ~chain_state:chain in
+  let result2 = Sync.process_redownload_headers ~ps:ps2 ~headers:[next] ~chain_state:chain in
   let released2 = match result2 with
     | Ok rel -> List.length rel
     | Error _ -> -1
@@ -1257,16 +1278,10 @@ let test_w88_process_all_remaining_drains_buffer () =
   let genesis_hash = genesis_entry.hash in
 
   (* Simulate: buffer has 3 headers, process_all_remaining = true *)
-  let h1 = Types.{
-    version = 1l; prev_block = genesis_hash; merkle_root = Types.zero_hash;
-    timestamp = Int32.add genesis_entry.header.timestamp 1l;
-    bits = 0x207fffffl; nonce = 1l;
-  } in
-  let h2 = Types.{
-    version = 1l; prev_block = genesis_hash; merkle_root = Types.zero_hash;
-    timestamp = Int32.add genesis_entry.header.timestamp 2l;
-    bits = 0x207fffffl; nonce = 2l;
-  } in
+  let h1 = w88_mine_header ~prev:genesis_hash
+      ~ts:(Int32.add genesis_entry.header.timestamp 1l) in
+  let h2 = w88_mine_header ~prev:(Crypto.compute_block_hash h1)
+      ~ts:(Int32.add genesis_entry.header.timestamp 2l) in
   let buf = Queue.create () in
   Queue.push (h1, Crypto.compute_block_hash h1) buf;
   Queue.push (h2, Crypto.compute_block_hash h2) buf;

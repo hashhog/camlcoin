@@ -98,17 +98,29 @@ let test_in_mempool () =
       check_reject "in-mempool" ~reason:"txn-already-in-mempool"
         (tmpa ctx [ `List [ `String (tx_hex tx) ] ]))
 
-(* Core: an output already in the UTXO set is "txn-already-known"
-   (operator/testmempoolaccept/confirmed). *)
+(* Core: an output already in the coins cache is "txn-already-known"
+   (operator/testmempoolaccept/confirmed).  Core probes the outputs only
+   once an input is missing, so the tx is confirmed by a connected block
+   that spent its input (validation.cpp:855-866). *)
 let test_confirmed () =
   with_ctx ~verify_scripts:false (fun ctx ->
-      let tx = tx_ok ctx in
-      let txid = Crypto.compute_txid tx in
-      let e : Utxo.utxo_entry =
-        { value = 1L; script_pubkey = op_true; height = 1; is_coinbase = false } in
-      let w = Serialize.writer_create () in
-      Utxo.serialize_utxo_entry w e;
-      Storage.ChainDB.store_utxo ctx.chain.db txid 0 (Serialize.writer_to_string w);
+      let tx = spend ~prev_txid:coin_txid ~prev_vout:0
+          ~value:(Int64.sub coin_value 10_000L) ~spk:op_true () in
+      let coinbase : Types.transaction =
+        { Types.version = 2l;
+          inputs = [ { Types.previous_output =
+                         { Types.txid = Types.zero_hash; vout = -1l };
+                       script_sig = Cstruct.of_string "\x01\x01\x00";
+                       sequence = 0xFFFFFFFFl } ];
+          outputs = [ { Types.value = 0L; script_pubkey = op_true } ];
+          witnesses = []; locktime = 0l } in
+      Mempool.remove_for_block ctx.mempool
+        { Types.header = { Types.version = 0x20000000l;
+                           prev_block = Types.zero_hash;
+                           merkle_root = Types.zero_hash; timestamp = 0l;
+                           bits = 0x207fffffl; nonce = 0l };
+          transactions = [ coinbase; tx ] }
+        1;
       check_reject "confirmed" ~reason:"txn-already-known"
         (tmpa ctx [ `List [ `String (tx_hex tx) ] ]))
 

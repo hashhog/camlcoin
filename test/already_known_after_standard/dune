@@ -1,0 +1,6 @@
+; txn-already-known after standardness, on a missing input, from memory only
+; (item cffix-camlcoin-already-known-after-standard).
+; Own directory so test/dune is untouched.
+(test
+ (name test_already_known_after_standard)
+ (libraries camlcoin test_tmp alcotest))

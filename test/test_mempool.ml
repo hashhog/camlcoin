@@ -4330,34 +4330,30 @@ let test_w96_same_nonwitness_data_in_mempool () =
 (* W96 Bug 4: txn-already-known — when a tx's outputs are already in
    the chain coins cache, the tx is already confirmed and ATMP should
    short-circuit with "txn-already-known".  Core uses this to avoid
-   rebroadcasting confirmed txs. *)
+   rebroadcasting confirmed txs.  Core probes the outputs only once an
+   input is missing (validation.cpp:855-866), so the setup is a real
+   confirmation: the block that confirmed the tx spent its input, and the
+   tx's coins are the in-memory ones of that connected block. *)
 let test_w96_already_known_via_confirmed_outputs () =
   cleanup_test_db ();
   let db = Storage.ChainDB.create test_db_path in
   let utxo = Utxo.UtxoSet.create db in
   let prev_txid = Types.hash256_of_hex
     "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b" in
-  Utxo.UtxoSet.add utxo prev_txid 0 Utxo.{
-    value = 1_000_000L;
-    script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac";
-    height = 0;
-    is_coinbase = false;
-  };
   let mp = Mempool.create ~network:Consensus.regtest ~require_standard:false ~verify_scripts:false
              ~utxo ~current_height:100 () in
   let tx = make_regular_tx
     [make_test_input prev_txid 0l]
     [make_test_output 990_000L]
   in
-  (* Pre-populate the UTXO set with THIS tx's output — simulating that the
-     tx has been confirmed already. *)
-  let new_txid = Crypto.compute_txid tx in
-  Utxo.UtxoSet.add utxo new_txid 0 Utxo.{
-    value = 990_000L;
-    script_pubkey = Cstruct.of_string "\x76\xa9\x14test\x88\xac";
-    height = 101;
-    is_coinbase = false;
-  };
+  (* Connect the block that confirmed THIS tx (and spent its input). *)
+  Mempool.remove_for_block mp
+    { Types.header = { Types.version = 0x20000000l;
+                       prev_block = Types.zero_hash;
+                       merkle_root = Types.zero_hash; timestamp = 0l;
+                       bits = 0x207fffffl; nonce = 0l };
+      transactions = [ make_coinbase_tx 101 [make_test_output 0L]; tx ] }
+    101;
   let result = Mempool.add_transaction mp tx in
   Alcotest.(check bool) "txn-already-known short-circuited" true
     (Result.is_error result);

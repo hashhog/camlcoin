@@ -1,0 +1,7 @@
+; /wallet/<name> routing: a miss is -18, an ambiguous base path is -19
+; (cffix-camlcoin-rpc-wallet-not-found). Own directory so the shared
+; test/dune names list is untouched.
+(test
+ (name test_rpc_wallet_not_found)
+ (libraries camlcoin test_tmp alcotest lwt lwt.unix unix yojson base64
+            cohttp-lwt-unix))

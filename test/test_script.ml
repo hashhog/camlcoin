@@ -2246,14 +2246,17 @@ let test_cltv_nop2_without_flag () =
   | Ok () -> ()
   | Error e -> Alcotest.fail ("CLTV as NOP2 should succeed: " ^ e)
 
-(* Gate 1: CLTV flag disabled but DISCOURAGE_UPGRADABLE_NOPS set → fail *)
-(* Reference: interpreter.cpp:524-527 (NOP path still subject to discouragement) *)
+(* Gate 1: CLTV flag disabled, DISCOURAGE_UPGRADABLE_NOPS set → still a plain
+   NOP2.  Core: "if (!(flags & SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY)) { // not
+   enabled; treat as a NOP2  break; }" — DISCOURAGE_UPGRADABLE_NOPS is only
+   checked for NOP1 and NOP4..NOP10 (interpreter.cpp).  This test used to
+   assert a failure, which is not Core's behaviour. *)
 let test_cltv_nop2_discourage () =
   let flags = Script.script_verify_discourage_upgradable_nops in
   let arg = Script.bytes_of_script_num 100L in
   match run_cltv ~tx_locktime:0l ~input_seq:0xFFFFFFFFl ~script_arg_bytes:arg ~flags with
-  | Error _ -> ()  (* Expected: discouraged NOP *)
-  | Ok () -> Alcotest.fail "CLTV without flag + DISCOURAGE should fail"
+  | Ok () -> ()
+  | Error e -> Alcotest.fail ("disabled CLTV is a NOP2 even with DISCOURAGE (Core): " ^ e)
 
 (* Gate 2: empty stack → SCRIPT_ERR_INVALID_STACK_OPERATION *)
 (* Reference: interpreter.cpp:529-530 *)
@@ -2461,7 +2464,7 @@ let test_cltv_does_not_pop_stack () =
 
 let cltv_gate_tests = [
   Alcotest.test_case "Gate1: no CLTV flag → NOP2 succeeds" `Quick test_cltv_nop2_without_flag;
-  Alcotest.test_case "Gate1: no flag + DISCOURAGE_NOPS → fails" `Quick test_cltv_nop2_discourage;
+  Alcotest.test_case "Gate1: no flag + DISCOURAGE_NOPS → NOP2, succeeds" `Quick test_cltv_nop2_discourage;
   Alcotest.test_case "Gate2: empty stack → error" `Quick test_cltv_empty_stack;
   Alcotest.test_case "Gate3: arg > 5 bytes → error" `Quick test_cltv_arg_too_long;
   Alcotest.test_case "Gate4: negative arg → error" `Quick test_cltv_negative_arg;
@@ -2530,14 +2533,16 @@ let test_csv_nop3_without_flag () =
   | Ok () -> ()
   | Error e -> Alcotest.fail ("CSV as NOP3 should succeed: " ^ e)
 
-(* Gate 1: CSV flag disabled but DISCOURAGE_UPGRADABLE_NOPS → fail *)
+(* Gate 1: CSV flag disabled, DISCOURAGE_UPGRADABLE_NOPS set → still a plain
+   NOP3 (Core: "not enabled; treat as a NOP3" -> break).  This test used to
+   assert a failure, which is not Core's behaviour. *)
 let test_csv_nop3_discourage () =
   let flags = Script.script_verify_discourage_upgradable_nops in
   let arg = encode_script_num 100 in
   let tx_seq = 50l in
   match run_csv ~tx_version:2l ~input_seq:tx_seq ~script_arg_bytes:arg ~flags with
-  | Error _ -> ()  (* Expected: discouraged NOP *)
-  | Ok () -> Alcotest.fail "CSV without flag + DISCOURAGE should fail"
+  | Ok () -> ()
+  | Error e -> Alcotest.fail ("disabled CSV is a NOP3 even with DISCOURAGE (Core): " ^ e)
 
 (* Gate 2: empty stack → error *)
 let test_csv_empty_stack () =
@@ -2680,7 +2685,7 @@ let test_csv_tx_seq_bit31_unsigned () =
 
 let csv_gate_tests = [
   Alcotest.test_case "Gate1: no CSV flag → NOP3 succeeds" `Quick test_csv_nop3_without_flag;
-  Alcotest.test_case "Gate1: no flag + DISCOURAGE_NOPS → fails" `Quick test_csv_nop3_discourage;
+  Alcotest.test_case "Gate1: no flag + DISCOURAGE_NOPS → NOP3, succeeds" `Quick test_csv_nop3_discourage;
   Alcotest.test_case "Gate2: empty stack → error" `Quick test_csv_empty_stack;
   Alcotest.test_case "Gate4: negative arg → error" `Quick test_csv_negative_arg;
   Alcotest.test_case "Gate5: disable bit on arg → NOP" `Quick test_csv_disable_flag_on_arg;

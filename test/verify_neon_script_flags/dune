@@ -1,0 +1,8 @@
+; verify-neon-camlcoin-findings (Neon audit findings 6-9): script-interpreter
+; flag parity with Core v31.1.  Own directory so the shared test/dune names
+; list is untouched.  Uses only APIs that exist on the pre-fix tree, so it
+; builds there and fails on the assertions.
+(test
+ (name test_verify_neon_script_flags)
+ (modules test_verify_neon_script_flags)
+ (libraries camlcoin alcotest))

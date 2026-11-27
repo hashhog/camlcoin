@@ -1,0 +1,9 @@
+; REDOWNLOAD runs Core's header checks (PoW, continuity, MTP, future time,
+; bad-prevblk) before storing a released header
+; (cffix-camlcoin-redownload-header-pow).  Own directory so the shared
+; test/dune names list is untouched.  Uses only APIs that exist on the
+; pre-fix tree, so it builds there too.
+(test
+ (name test_redownload_header_pow)
+ (modules test_redownload_header_pow)
+ (libraries camlcoin test_tmp alcotest logs unix))

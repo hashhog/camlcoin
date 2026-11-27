@@ -144,6 +144,25 @@ let generic_cluster_usage (n : int) : int =
    Mempool State
    ============================================================================ *)
 
+(* One recently connected block, for the txn-already-known probe.  Its coin
+   index (outpoint keys it created and spent) is built lazily, the first time
+   a probe needs it, so connecting a block costs one header hash and no
+   per-tx txid hashing (catch-up / IBD connects stay as cheap as before). *)
+type recent_block = {
+  rb_hash : string;                    (* block hash, for chain linkage *)
+  rb_block : Types.block;
+  mutable rb_index :
+    ((string, unit) Hashtbl.t * (string, unit) Hashtbl.t) option;
+    (* (created, spent) outpoint keys, Utxo.UtxoSet.utxo_key *)
+}
+
+(* How many connected blocks the already-known probe remembers.  Core keeps a
+   confirmed tx's coins in CoinsTip until the next flush; camlcoin's at-tip
+   connect writes them to the store and drops them from the shared cache, so
+   this is the in-memory record of the newest coins.  Bounded so the
+   retention is at most this many blocks. *)
+let recent_block_depth = 6
+
 type mempool = {
   mutable entries : (string, mempool_entry) Hashtbl.t;
   mutable total_weight : int;
@@ -179,6 +198,10 @@ type mempool = {
      premature.  When wired (cli.ml: chain.blocks_synced) the mempool reads
      the tip from the chain instead.  None in tests -> [current_height]. *)
   mutable tip_height_provider : (unit -> int) option;
+  (* The last [recent_block_depth] connected blocks, newest first (fed by
+     [remove_for_block], cleared on a reorg).  Read only by
+     [have_coin_in_cache]. *)
+  mutable recent_blocks : recent_block list;
   (* Policy flags — can be relaxed for testing or regtest *)
   require_standard : bool;    (* enforce IsStandard checks *)
   verify_scripts : bool;      (* enforce script verification *)
@@ -453,6 +476,7 @@ let create ?(require_standard=true) ?(verify_scripts=true)
     current_median_time = 0l;
     mtp_provider = None;
     tip_height_provider = None;
+    recent_blocks = [];
     require_standard;
     verify_scripts;
     orphans = Hashtbl.create 100;
@@ -575,6 +599,70 @@ let is_confirmed_utxo (mp : mempool) (outpoint : Types.outpoint) : bool =
           (Int32.to_int outpoint.vout) with
   | Some _ -> true
   | None -> false
+
+(* Remember a connected block for [have_coin_in_cache].  A block that does
+   not extend the newest remembered one (a reorg, or a gap) resets the list:
+   forgetting is safe, it only makes the probe answer "missing" (Core's
+   optimistic check can do the same after a cache flush). *)
+let note_connected_block (mp : mempool) (block : Types.block) : unit =
+  let hash = Cstruct.to_string (Crypto.compute_block_hash block.header) in
+  let prev = Cstruct.to_string block.header.Types.prev_block in
+  let kept =
+    match mp.recent_blocks with
+    | newest :: _ when newest.rb_hash = prev -> mp.recent_blocks
+    | _ -> []
+  in
+  let rb = { rb_hash = hash; rb_block = block; rb_index = None } in
+  mp.recent_blocks <-
+    List.filteri (fun i _ -> i < recent_block_depth) (rb :: kept)
+
+(* Blocks were disconnected: the remembered coins may no longer exist. *)
+let forget_recent_blocks (mp : mempool) : unit = mp.recent_blocks <- []
+
+let recent_block_index (rb : recent_block)
+    : (string, unit) Hashtbl.t * (string, unit) Hashtbl.t =
+  match rb.rb_index with
+  | Some idx -> idx
+  | None ->
+    let created = Hashtbl.create 1024 and spent = Hashtbl.create 1024 in
+    List.iter (fun (tx : Types.transaction) ->
+      let txid = Crypto.compute_txid tx in
+      List.iteri (fun n _ ->
+        Hashtbl.replace created (Utxo.UtxoSet.utxo_key txid n) ()) tx.outputs;
+      if not (Validation.is_coinbase_tx tx) then
+        List.iter (fun (inp : Types.tx_in) ->
+          let op = inp.previous_output in
+          Hashtbl.replace spent
+            (Utxo.UtxoSet.utxo_key op.txid (Int32.to_int op.vout)) ())
+          tx.inputs
+    ) rb.rb_block.transactions;
+    let idx = (created, spent) in
+    rb.rb_index <- Some idx;
+    idx
+
+(* Core CCoinsViewCache::HaveCoinInCache for the txn-already-known probe:
+   is [outpoint] an unspent chain coin that is held IN MEMORY?  Never reads
+   the store.  Two in-memory sources:
+   - the chain's shared coin cache (Utxo.UtxoSet.peek_cache): a coin it holds
+     spent is authoritative;
+   - the coins of the last [recent_block_depth] connected blocks, newest
+     first: a spend is seen before the creation it follows. *)
+let have_coin_in_cache (mp : mempool) (outpoint : Types.outpoint) : bool =
+  let vout = Int32.to_int outpoint.vout in
+  match Utxo.UtxoSet.peek_cache outpoint.txid vout with
+  | Utxo.UtxoSet.Tip_hit _ -> true
+  | Utxo.UtxoSet.Tip_spent -> false
+  | Utxo.UtxoSet.Tip_miss ->
+    let key = Utxo.UtxoSet.utxo_key outpoint.txid vout in
+    let rec scan = function
+      | [] -> false
+      | rb :: older ->
+        let (created, spent) = recent_block_index rb in
+        if Hashtbl.mem spent key then false
+        else if Hashtbl.mem created key then true
+        else scan older
+    in
+    scan mp.recent_blocks
 
 (* ============================================================================
    Transaction Removal
@@ -2733,22 +2821,9 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
       Error "txn-same-nonwitness-data-in-mempool"
   | None ->
 
-  (* W96 Bug 4: txn-already-known — tx outputs already in the chain coins
-     cache means the tx is already CONFIRMED.  Core: validation.cpp:858-863.
-     If ANY output of (txid, n) is already a UTXO, the tx is known. *)
-  let already_known =
-    let found = ref false in
-    List.iteri (fun i _out ->
-      if not !found then begin
-        let op = { Types.txid; vout = Int32.of_int i } in
-        if is_confirmed_utxo mp op then found := true
-      end
-    ) tx.outputs;
-    !found
-  in
-  if already_known then
-    Error "txn-already-known"
-  else
+  (* txn-already-known is decided at the missing-input check below, after
+     the standardness checks, from in-memory coins only (Core PreChecks,
+     validation.cpp:847-866). *)
 
   (* Check for mempool input conflicts (double-spends) *)
   let conflict = if not dry_run then check_conflict mp tx else None in
@@ -2842,10 +2917,25 @@ let add_transaction ?(dry_run=false) ?(bypass_fee_check=false) ?(bypass_limits=f
           let prev = inp.Types.previous_output in
           match lookup_utxo mp prev with
           | None ->
-            error := Some (Printf.sprintf
-              "Missing input: %s:%ld"
-              (Types.hash256_to_hex_display prev.txid)
-              prev.vout)
+            (* W96 Bug 4: are the inputs missing because the tx is already
+               confirmed?  Core validation.cpp:855-866: only once an input
+               is missing, and only HaveCoinInCache per output — never a
+               store read, so a many-output tx cannot buy DB point reads. *)
+            let already_known =
+              let rec probe n = function
+                | [] -> false
+                | _ :: rest ->
+                  have_coin_in_cache mp { Types.txid; vout = Int32.of_int n }
+                  || probe (n + 1) rest
+              in
+              probe 0 tx.outputs
+            in
+            error := Some (
+              if already_known then "txn-already-known"
+              else Printf.sprintf
+                "Missing input: %s:%ld"
+                (Types.hash256_to_hex_display prev.txid)
+                prev.vout)
           | Some entry ->
             (* W96 Bug 5: coinbase maturity off-by-one.  Core CheckTxInputs uses
                nSpendHeight = active_chainstate.m_chain.Height() + 1 (the next
@@ -3239,6 +3329,7 @@ let remove_confirmed (mp : mempool) (txid : Types.hash256) : unit =
 let remove_for_block (mp : mempool) (block : Types.block) (height : int)
     : unit =
   mp.current_height <- height;
+  note_connected_block mp block;
 
   (* An empty pool has nothing confirmed and nothing in conflict: skip the
      per-tx txid hashing (every catch-up / IBD connect runs this). *)
@@ -3620,6 +3711,7 @@ let update_transactions_from_block (mp : mempool)
 let update_for_reorg ?(entry_height : (Types.hash256 -> int option) option)
     (mp : mempool) ~(disconnected : Types.transaction list)
     ~(dropped : Types.transaction list) : int =
+  forget_recent_blocks mp;
   let readded = ref [] in
   List.iter (fun tx ->
     if not (Validation.is_coinbase_tx tx) then begin

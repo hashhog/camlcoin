@@ -122,6 +122,15 @@ module UtxoSet = struct
        | Tip_spent -> None
        | Tip_miss -> from_store ())
 
+  (* The chain coin view's IN-MEMORY answer only; never reads the store.
+     Core CCoinsViewCache::HaveCoinInCache: the mempool's txn-already-known
+     probe (validation.cpp PreChecks) asks the cache, not the DB, so a
+     relayed tx with many outputs costs no DB point reads. *)
+  let peek_cache (txid : Types.hash256) (vout : int) : tip_answer =
+    match Atomic.get tip_view with
+    | None -> Tip_miss
+    | Some view -> view txid vout
+
   (* Add a UTXO entry to both cache and database (write-through) *)
   let add (t : t) (txid : Types.hash256) (vout : int)
       (entry : utxo_entry) : unit =

@@ -1,0 +1,9 @@
+; r3fix-camlcoin-standard-script-verify-flags: the mempool script checks must
+; use Core v31.1's full STANDARD_SCRIPT_VERIFY_FLAGS (policy/policy.h:119-132),
+; including the 8 standard-only flags camlcoin's interpreter implements but
+; get_standard_policy_flags never set.  Own directory so the shared test/dune
+; names list is untouched.
+(test
+ (name test_r3fix_standard_script_verify_flags)
+ (modules test_r3fix_standard_script_verify_flags)
+ (libraries camlcoin test_tmp alcotest))
